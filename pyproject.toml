@@ -3,19 +3,32 @@ requires = ["setuptools>=64.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name="mxframe"
-requires-python=">=3.9"
+name = "mxframe"
+version = "0.0.1"
+requires-python = ">=3.9"
 keywords = ["mojo", "max-engine", "pyarrow", "gpu", "dataframe", "zero-copy"]
-dynamic = ["version", "dependencies", "optional-dependencies", "readme", "classifiers"]
 description = "max charged data frame."
 license = "Apache-2.0"
 authors = [{name = "Abhishek Sreesaila", email = "abhishek.sreesaila@gmail.com"}]
+readme = "README.md"
+dependencies = ["fastcore", "pyarrow", "numpy"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 
 [project.urls]
 Homepage = "https://abhisheksreesaila.github.io/mxframe"
 Repository = "https://github.com/abhisheksreesaila/mxframe"
 
-[tool.setuptools.dynamic]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mxframe*"]
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "settings.ini" }, { file = "setup.py" }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "settings.ini" }]
