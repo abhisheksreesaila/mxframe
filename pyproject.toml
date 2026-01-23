@@ -6,9 +6,14 @@ build-backend = "setuptools.build_meta"
 name="mxframe"
 requires-python=">=3.9"
 keywords = ["mojo", "max-engine", "pyarrow", "gpu", "dataframe", "zero-copy"]
-dynamic = ["version", "dependencies", "optional-dependencies", "readme", "authors", "classifiers", "entry-points", "scripts", "urls"]
+dynamic = ["version", "dependencies", "optional-dependencies", "readme", "classifiers"]
 description = "max charged data frame."
 license = "Apache-2.0"
+authors = [{name = "Abhishek Sreesaila", email = "abhishek.sreesaila@gmail.com"}]
+
+[project.urls]
+Homepage = "https://abhisheksreesaila.github.io/mxframe"
+Repository = "https://github.com/abhisheksreesaila/mxframe"
 
 [tool.setuptools.dynamic]
 
