@@ -19,29 +19,29 @@ This initial release provides the **core zero-copy bridge**:
 
 <table>
 <thead>
-<tr class="header">
+<tr>
 <th>Feature</th>
 <th>Description</th>
 </tr>
 </thead>
 <tbody>
-<tr class="odd">
+<tr>
 <td><code>MXFrame</code> class</td>
 <td>DataFrame wrapper backed by PyArrow</td>
 </tr>
-<tr class="even">
+<tr>
 <td><code>arrow_to_max_tensor()</code></td>
 <td>Zero-copy Arrow → MAX Tensor bridge</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>CPU Support</td>
 <td>True zero-copy (same memory)</td>
 </tr>
-<tr class="even">
+<tr>
 <td>GPU Support</td>
 <td>Automatic device transfer</td>
 </tr>
-<tr class="odd">
+<tr>
 <td>Dtype Support</td>
 <td>int8-64, uint8-64, float32/64, date32</td>
 </tr>

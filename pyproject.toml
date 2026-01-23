@@ -6,7 +6,10 @@ build-backend = "setuptools.build_meta"
 name="mxframe"
 requires-python=">=3.9"
 keywords = ["mojo", "max-engine", "pyarrow", "gpu", "dataframe", "zero-copy"]
-dynamic = ["description", "version", "dependencies", "optional-dependencies", "readme", "license", "authors", "classifiers", "entry-points", "scripts", "urls"]
+dynamic = ["version", "dependencies", "optional-dependencies", "readme", "license", "authors", "classifiers", "entry-points", "scripts", "urls"]
+description = "max charged data frame."
+
+[tool.setuptools.dynamic]
 
 [tool.uv]
 cache-keys = [{ file = "pyproject.toml" }, { file = "settings.ini" }, { file = "setup.py" }]

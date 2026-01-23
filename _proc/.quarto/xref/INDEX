@@ -1,10 +1,11 @@
 {
   "index.ipynb": {
-    "index.html": "6d0ca4b2",
-    "index.html.md": "cb12f3d5"
+    "index.html": "fc401940",
+    "index.html.md": "0beeae53",
+    "README.md": "8825ebfd"
   },
   "01_core_bridge.ipynb": {
-    "core_bridge.html": "d495dde0",
-    "core_bridge.html.md": "131119c9"
+    "core_bridge.html": "2cad5a0b",
+    "core_bridge.html.md": "9763159f"
   }
 }

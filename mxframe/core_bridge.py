@@ -12,6 +12,9 @@ import numpy as np
 from typing import Dict, Optional, Union, Literal
 from max import driver
 from max.dtype import DType
+import datetime
+import time
+from nbdev.showdoc import show_doc
 
 # %% ../nbs/01_core_bridge.ipynb 4
 ARROW_TO_MAX_DTYPE: Dict[pa.DataType, DType] = {
@@ -55,21 +58,11 @@ def get_numpy_dtype(arrow_type: pa.DataType) -> np.dtype:
         return ARROW_TO_NUMPY_DTYPE[arrow_type]
     raise TypeError(f"Unsupported Arrow type: {arrow_type}")
 
-# %% ../nbs/01_core_bridge.ipynb 6
-def arrow_to_numpy_view(arr: Union[pa.Array, pa.ChunkedArray]) -> np.ndarray:
-    """
-    Get a zero-copy NumPy view of an Arrow array.
-    
-    Args:
-        arr: PyArrow Array or ChunkedArray (primitive type, no nulls)
-        
-    Returns:
-        NumPy ndarray viewing the same memory
-        
-    Raises:
-        ValueError: If array has nulls or isn't contiguous
-        TypeError: If type isn't supported for zero-copy
-    """
+# %% ../nbs/01_core_bridge.ipynb 12
+def arrow_to_numpy_view(
+    arr: Union[pa.Array, pa.ChunkedArray]  # PyArrow array (primitive type, no nulls)
+) -> np.ndarray:  # NumPy view over same memory
+    """Get zero-copy NumPy view of an Arrow array."""
     # Handle ChunkedArray - combine if needed
     if isinstance(arr, pa.ChunkedArray):
         if arr.num_chunks == 1:
@@ -92,31 +85,12 @@ def arrow_to_numpy_view(arr: Union[pa.Array, pa.ChunkedArray]) -> np.ndarray:
             return np.frombuffer(data_buffer, dtype=np.int32)
         raise TypeError(f"Cannot create zero-copy view for {arr.type}")
 
-# %% ../nbs/01_core_bridge.ipynb 7
+# %% ../nbs/01_core_bridge.ipynb 17
 def arrow_to_max_tensor(
-    arr: Union[pa.Array, pa.ChunkedArray],
-    device: Optional[driver.Device] = None
-) -> driver.Tensor:
-    """
-    Zero-copy bridge from PyArrow array to MAX Tensor.
-    
-    Path: Arrow → NumPy view → MAX Tensor
-    
-    On CPU: True zero-copy (same memory) via from_numpy
-    On GPU: Copies to device memory (unavoidable)
-    
-    Args:
-        arr: PyArrow Array or ChunkedArray
-        device: Target device (None = CPU)
-        
-    Returns:
-        MAX Tensor ready for graph execution
-        
-    Example:
-        >>> arr = pa.array([1.0, 2.0, 3.0])
-        >>> tensor = arrow_to_max_tensor(arr)
-        >>> # tensor shares memory with arr on CPU
-    """
+    arr: Union[pa.Array, pa.ChunkedArray],  # PyArrow array to convert
+    device: Optional[driver.Device] = None  # Target device (`None` = CPU)
+) -> driver.Tensor:  # MAX Tensor (zero-copy on CPU, copied on GPU)
+    """Zero-copy bridge from PyArrow array to MAX Tensor."""
     # Get zero-copy NumPy view
     np_view = arrow_to_numpy_view(arr)
     
@@ -129,29 +103,16 @@ def arrow_to_max_tensor(
     
     return tensor
 
-# %% ../nbs/01_core_bridge.ipynb 9
+# %% ../nbs/01_core_bridge.ipynb 20
 DeviceType = Literal["cpu", "gpu", "auto"]
 
 class MXFrame:
-    """
-    PyArrow-backed DataFrame with zero-copy MAX Engine integration.
+    """PyArrow-backed DataFrame with zero-copy MAX Engine integration."""
     
-    Stores data in PyArrow format and provides zero-copy access
-    to MAX tensors for GPU/CPU compute.
-    
-    Example:
-        >>> df = MXFrame({'price': [10.0, 20.0], 'qty': [1, 2]})
-        >>> tensor = df.to_max_tensor('price')
-        >>> # tensor shares memory with underlying Arrow buffer
-    """
-    
-    def __init__(self, data: Union[pa.Table, Dict[str, list]]):
-        """
-        Create MXFrame from Arrow Table or dict of lists.
-        
-        Args:
-            data: PyArrow Table or dict of column_name -> values
-        """
+    def __init__(self, 
+                 data: Union[pa.Table, Dict[str, list]]  # Arrow Table or dict of lists
+                ):
+        """Create MXFrame from Arrow Table or dict."""
         if isinstance(data, pa.Table):
             self._table = data
         elif isinstance(data, dict):
@@ -181,17 +142,21 @@ class MXFrame:
         return self._table.num_columns
     
     def __len__(self) -> int:
+        """Number of rows."""
         return self.num_rows
     
     def __repr__(self) -> str:
+        """String representation."""
         return f"MXFrame({self.num_rows} rows, {self.columns})"
     
-    def column(self, name: str) -> pa.ChunkedArray:
+    def column(self, 
+               name: str  # Column name
+              ) -> pa.ChunkedArray:  # Arrow column
         """Get Arrow column by name."""
         return self._table.column(name)
     
     def __getitem__(self, name: str) -> pa.ChunkedArray:
-        """Get Arrow column by name."""
+        """Get Arrow column by name via `df['col']`."""
         return self.column(name)
     
     def to_arrow(self) -> pa.Table:
@@ -200,35 +165,25 @@ class MXFrame:
     
     # ========== Zero-Copy Bridge Methods ==========
     
-    def to_numpy(self, column: str) -> np.ndarray:
-        """
-        Get zero-copy NumPy view of column.
-        
-        Caches the view to keep memory reference alive.
-        """
+    def to_numpy(self, 
+                 column: str  # Column name
+                ) -> np.ndarray:  # Zero-copy NumPy view
+        """Get zero-copy NumPy view of column (cached)."""
         if column not in self._numpy_cache:
             self._numpy_cache[column] = arrow_to_numpy_view(self._table.column(column))
         return self._numpy_cache[column]
     
-    def to_max_tensor(self, column: str, device: Optional[driver.Device] = None) -> driver.Tensor:
-        """
-        Get zero-copy MAX Tensor for column.
-        
-        Args:
-            column: Column name
-            device: Target device (None = CPU)
-            
-        Returns:
-            MAX Tensor (zero-copy on CPU)
-        """
+    def to_max_tensor(self, 
+                      column: str,  # Column name
+                      device: Optional[driver.Device] = None  # Target device (`None` = CPU)
+                     ) -> driver.Tensor:  # MAX Tensor
+        """Get MAX Tensor for column (zero-copy on CPU)."""
         return arrow_to_max_tensor(self._table.column(column), device)
     
-    def get_buffer_address(self, column: str) -> int:
-        """
-        Get memory address of column's data buffer.
-        
-        Useful for verifying zero-copy.
-        """
+    def get_buffer_address(self, 
+                           column: str  # Column name
+                          ) -> int:  # Memory address
+        """Get memory address of column's data buffer (for zero-copy verification)."""
         arr = self._table.column(column)
         if isinstance(arr, pa.ChunkedArray):
             arr = arr.chunk(0) if arr.num_chunks == 1 else arr.combine_chunks()
