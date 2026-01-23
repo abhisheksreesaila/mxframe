@@ -16,7 +16,7 @@ import datetime
 import time
 from nbdev.showdoc import show_doc
 
-# %% ../nbs/01_core_bridge.ipynb 4
+# %% ../nbs/01_core_bridge.ipynb 3
 ARROW_TO_MAX_DTYPE: Dict[pa.DataType, DType] = {
     pa.int8(): DType.int8,
     pa.int16(): DType.int16,
@@ -58,7 +58,7 @@ def get_numpy_dtype(arrow_type: pa.DataType) -> np.dtype:
         return ARROW_TO_NUMPY_DTYPE[arrow_type]
     raise TypeError(f"Unsupported Arrow type: {arrow_type}")
 
-# %% ../nbs/01_core_bridge.ipynb 12
+# %% ../nbs/01_core_bridge.ipynb 7
 def arrow_to_numpy_view(
     arr: Union[pa.Array, pa.ChunkedArray]  # PyArrow array (primitive type, no nulls)
 ) -> np.ndarray:  # NumPy view over same memory
@@ -85,7 +85,7 @@ def arrow_to_numpy_view(
             return np.frombuffer(data_buffer, dtype=np.int32)
         raise TypeError(f"Cannot create zero-copy view for {arr.type}")
 
-# %% ../nbs/01_core_bridge.ipynb 17
+# %% ../nbs/01_core_bridge.ipynb 10
 def arrow_to_max_tensor(
     arr: Union[pa.Array, pa.ChunkedArray],  # PyArrow array to convert
     device: Optional[driver.Device] = None  # Target device (`None` = CPU)
@@ -103,7 +103,7 @@ def arrow_to_max_tensor(
     
     return tensor
 
-# %% ../nbs/01_core_bridge.ipynb 20
+# %% ../nbs/01_core_bridge.ipynb 12
 DeviceType = Literal["cpu", "gpu", "auto"]
 
 class MXFrame:
