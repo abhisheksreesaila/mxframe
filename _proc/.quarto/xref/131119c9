@@ -1,0 +1,1 @@
+{"headings":["dtype-mapping","get_numpy_dtype","get_max_dtype","zero-copy-bridge-functions","memory-flow","constraints","arrow_to_numpy_view","arrow_to_max_tensor","mxframe-class","design-principles","api-overview","mxframe","tests-verify-zero-copy"],"entries":[]}

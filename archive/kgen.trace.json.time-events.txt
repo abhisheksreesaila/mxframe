@@ -1,0 +1,10 @@
+Thread   Start(us)  B/E     Dur(us)  Name/Detail
+------  ----------  ---  ----------  ------------------------------
+327851     1319168  BEG        4393  LowerSemanticCF
+327851     1323562  END        4393  LowerSemanticCF
+327851     1323564  BEG       32977  CheckLifetimes
+327851     1356541  END       32977  CheckLifetimes
+327851     1356545  BEG        3084  AnnotateKernels
+327851     1359629  END        3084  AnnotateKernels
+327851     1359631  BEG         433  VerifyKernels
+327851     1360065  END         433  VerifyKernels

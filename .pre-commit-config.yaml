@@ -1,0 +1,13 @@
+repos:
+- repo: local
+  hooks:
+  - id: nbdev_clean
+    name: nbdev_clean
+    entry: nbdev_clean
+    language: system
+    pass_filenames: false
+  - id: nbdev_export
+    name: nbdev_export
+    entry: nbdev_export
+    language: system
+    pass_filenames: false

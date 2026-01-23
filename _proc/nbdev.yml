@@ -1,0 +1,9 @@
+project:
+  output-dir: _docs
+
+website:
+  title: "mxframe"
+  site-url: "https://abhisheksreesaila.github.io/mxframe"
+  description: "max charged data frame."
+  repo-branch: main
+  repo-url: "https://github.com/abhisheksreesaila/mxframe"
