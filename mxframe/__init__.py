@@ -2,25 +2,30 @@
 
 __version__ = "0.0.1"
 
-# Core bridge - zero-copy PyArrow to MAX
-from .core_bridge import (
-    MXFrame,
-    arrow_to_numpy_view,
-    arrow_to_max_tensor,
-    get_max_dtype,
-    get_numpy_dtype,
-    ARROW_TO_MAX_DTYPE,
-    ARROW_TO_NUMPY_DTYPE,
+# Lazy expression layer
+from .lazy_expr import Expr, col, lit
+
+# Lazy frame & logical plan
+from .lazy_frame import (
+    LogicalPlan, Scan, Filter, Project, Aggregate,
+    LazyFrame, LazyGroupBy,
     DeviceType,
 )
 
+# Compiler
+from .compiler import GraphCompiler
+
+# Custom ops compiler
+from .custom_ops import CustomOpsCompiler, KERNELS_PATH
+
 __all__ = [
-    "MXFrame",
-    "arrow_to_numpy_view", 
-    "arrow_to_max_tensor",
-    "get_max_dtype",
-    "get_numpy_dtype",
-    "ARROW_TO_MAX_DTYPE",
-    "ARROW_TO_NUMPY_DTYPE",
-    "DeviceType",
+    # lazy_expr
+    "Expr", "col", "lit",
+    # lazy_frame
+    "LogicalPlan", "Scan", "Filter", "Project", "Aggregate",
+    "LazyFrame", "LazyGroupBy", "DeviceType",
+    # compiler
+    "GraphCompiler",
+    # custom_ops
+    "CustomOpsCompiler", "KERNELS_PATH",
 ]

@@ -1,0 +1,17 @@
+{
+    // Python: use pixi environment
+    "python.defaultInterpreterPath": "${workspaceFolder}/.pixi/envs/default/bin/python",
+
+    // Jupyter: pin the kernel to the pixi environment so VS Code
+    // doesn't hang searching for other interpreters
+    "jupyter.notebookFileRoot": "${workspaceFolder}",
+
+    // Speed up notebook opening by skipping auto kernel-start
+    "notebook.output.scrolling": true,
+
+    // Mojo extension — keep it enabled; point to pixi's modular install
+    "mojo.modularHomePath": "${workspaceFolder}/.pixi/envs/default",
+    "jupyter.kernels.excludePythonEnvironments": [
+        "${workspaceFolder}/.pixi/envs/default/bin/python"
+    ]
+}

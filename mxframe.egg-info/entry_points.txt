@@ -1,2 +1,0 @@
-[nbdev]
-mxframe = mxframe._modidx:d
