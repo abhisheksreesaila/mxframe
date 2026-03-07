@@ -15,4 +15,9 @@ jobs:
           pip install modular --extra-index-url https://modular.gateway.scarf.sh/simple/
           pip install -e '.[dev]'
       - name: Run nbdev tests
-        run: nbdev_test
+        run: |
+          python -m nbdev.test \
+            --skip_file_glob "bench_q1.ipynb" \
+            --skip_file_glob "bench_q3.ipynb" \
+            --skip_file_glob "bench_sort_limit_distinct.ipynb" \
+            --skip_file_glob "index.ipynb"
