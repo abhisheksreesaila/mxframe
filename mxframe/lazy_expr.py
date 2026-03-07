@@ -72,6 +72,13 @@ class Expr:
         """Count the number of rows. After a filter, reflects filtered row count."""
         return Expr("count", self)
 
+    def signature(self) -> tuple:
+        """Return a hashable structural signature for graph caching."""
+        child_sigs = tuple(
+            a.signature() if isinstance(a, Expr) else a for a in self.args
+        )
+        return (self.op, child_sigs)
+
     def __repr__(self) -> str:
         args_str = ", ".join(repr(a) for a in self.args)
         alias_str = f" AS {self._alias}" if self._alias else ""

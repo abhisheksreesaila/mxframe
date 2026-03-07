@@ -14,7 +14,7 @@ from max import engine, driver
 from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
-from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate
+from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join
 
 # %% ../nbs/03_compiler.ipynb 4
 # ── dtype helpers ────────────────────────────────────────────────────────
@@ -71,12 +71,13 @@ class GraphCompiler:
     Key design:
     - All Filter nodes are evaluated eagerly in PyArrow *before* the graph is built
       (_strip_filters). This correctly removes rows and makes count() trivially correct.
-    - Supports: Scan, Project, Filter (pre-applied), Aggregate (global sum/min/max/mean/count).
+    - Supports: Scan, Project, Filter (pre-applied), Aggregate, Sort, Limit, Distinct.
+    - Sort/Limit/Distinct are stored as post-ops and applied after graph execution.
     - device: "cpu" | "gpu" | "auto"
-        "cpu"  — always use CPU (default)
-        "gpu"  — require a MAX-compatible GPU; raises RuntimeError if unavailable or
+        "cpu"  -- always use CPU (default)
+        "gpu"  -- require a MAX-compatible GPU; raises RuntimeError if unavailable or
                  if the GPU is not supported by the installed MAX version.
-        "auto" — use GPU if MAX-compatible, else fall back to CPU silently
+        "auto" -- use GPU if MAX-compatible, else fall back to CPU silently
     """
 
     def __init__(self, device: str = "cpu"):
@@ -115,7 +116,7 @@ class GraphCompiler:
                         self._has_gpu = True
                         self._session_device = "gpu"
                     else:
-                        # GPU present but not supported by MAX — silently use CPU
+                        # GPU present but not supported by MAX -- silently use CPU
                         self._driver_device = driver.CPU()
                         self._device_ref = DeviceRef.CPU()
                         self._session_device = "cpu"
@@ -134,10 +135,48 @@ class GraphCompiler:
 
         self.session = engine.InferenceSession(devices=[self._driver_device])
 
+    # ── Post-op extraction ───────────────────────────────────────────
+    @classmethod
+    def _extract_post_ops(cls, plan):
+        """Peel off Sort/Limit/Distinct from the top of the plan tree.
+
+        Returns (core_plan, post_ops) where post_ops is a list of
+        nodes in application order (innermost first).
+        """
+        post_ops = []
+        while isinstance(plan, (Sort, Limit, Distinct)):
+            post_ops.append(plan)
+            plan = plan.input
+        post_ops.reverse()  # innermost first = correct application order
+        return plan, post_ops
+
+    @classmethod
+    def _apply_post_ops(cls, table: pa.Table, post_ops: list) -> pa.Table:
+        """Apply Sort/Limit/Distinct operations on the Arrow result table.
+
+        This is a fallback for the basic GraphCompiler. The CustomOpsCompiler
+        overrides this to use MAX Graph ops + Mojo kernels instead.
+        """
+        for node in post_ops:
+            if isinstance(node, Sort):
+                sort_keys = [(e.args[0], "descending" if d else "ascending")
+                             for e, d in zip(node.by, node.descending)]
+                idx = pc.sort_indices(table, sort_keys=sort_keys)
+                table = table.take(idx)
+            elif isinstance(node, Limit):
+                table = table.slice(0, node.n)
+            elif isinstance(node, Distinct):
+                cols = node.subset or table.column_names
+                table = table.group_by(cols).aggregate([])
+        return table
+
     def compile_and_run(self, plan) -> pa.Table:
         """Apply filters eagerly in PyArrow, then compile the rest to a MAX Graph."""
-        plan = self._strip_filters(plan)
-        scan = self._find_scan(plan)
+        # Peel off Sort/Limit/Distinct from top of plan
+        core_plan, post_ops = self._extract_post_ops(plan)
+
+        core_plan = self._strip_filters(core_plan)
+        scan = self._find_scan(core_plan)
         col_names = scan.table.column_names
         col_arrays = {name: np.array(scan.table[name]) for name in col_names}
 
@@ -149,14 +188,20 @@ class GraphCompiler:
         graph = Graph(name="mxframe_query", input_types=input_types)
         with graph:
             input_nodes = {name: graph.inputs[i] for i, name in enumerate(col_names)}
-            result_nodes = self._visit_plan(plan, input_nodes)
+            result_nodes = self._visit_plan(core_plan, input_nodes)
             graph.output(*result_nodes.values())
 
         model = self.session.load(graph)
         output_vals = model.execute(*[col_arrays[n] for n in col_names])
         result_names = list(result_nodes.keys())
         arrays = [pa.array(t.to_numpy()) for t in output_vals]
-        return pa.Table.from_arrays(arrays, names=result_names)
+        result_table = pa.Table.from_arrays(arrays, names=result_names)
+
+        # Apply Sort/Limit/Distinct as post-ops
+        if post_ops:
+            result_table = self._apply_post_ops(result_table, post_ops)
+
+        return result_table
 
     @staticmethod
     def _eval_predicate(expr, table: pa.Table):
@@ -177,6 +222,9 @@ class GraphCompiler:
     def _strip_filters(cls, plan):
         """Recursively remove all Filter nodes, applying them eagerly to the Scan."""
         if isinstance(plan, Scan): return plan
+        if isinstance(plan, Join):
+            return Join(cls._strip_filters(plan.left), cls._strip_filters(plan.right),
+                        plan.left_on, plan.right_on, plan.how)
         if isinstance(plan, Filter):
             clean_inner = cls._strip_filters(plan.input)
             scan = cls._find_scan_static(clean_inner)
@@ -187,6 +235,12 @@ class GraphCompiler:
             return Project(cls._strip_filters(plan.input), plan.exprs)
         if isinstance(plan, Aggregate):
             return Aggregate(cls._strip_filters(plan.input), plan.group_by, plan.aggs)
+        if isinstance(plan, Sort):
+            return Sort(cls._strip_filters(plan.input), plan.by, plan.descending)
+        if isinstance(plan, Limit):
+            return Limit(cls._strip_filters(plan.input), plan.n)
+        if isinstance(plan, Distinct):
+            return Distinct(cls._strip_filters(plan.input), plan.subset)
         if hasattr(plan, "input"):
             plan.input = cls._strip_filters(plan.input)
         return plan
@@ -195,14 +249,21 @@ class GraphCompiler:
     def _replace_scan(cls, plan, new_scan):
         """Replace the Scan leaf in a plan tree."""
         if isinstance(plan, Scan): return new_scan
+        if isinstance(plan, Join):
+            raise ValueError("_replace_scan: Join should have been materialized before this point")
         if isinstance(plan, Project): return Project(cls._replace_scan(plan.input, new_scan), plan.exprs)
         if isinstance(plan, Aggregate): return Aggregate(cls._replace_scan(plan.input, new_scan), plan.group_by, plan.aggs)
+        if isinstance(plan, Sort): return Sort(cls._replace_scan(plan.input, new_scan), plan.by, plan.descending)
+        if isinstance(plan, Limit): return Limit(cls._replace_scan(plan.input, new_scan), plan.n)
+        if isinstance(plan, Distinct): return Distinct(cls._replace_scan(plan.input, new_scan), plan.subset)
         if hasattr(plan, "input"): plan.input = cls._replace_scan(plan.input, new_scan)
         return plan
 
     @staticmethod
     def _find_scan_static(plan):
         if isinstance(plan, Scan): return plan
+        if isinstance(plan, Join):
+            raise ValueError("_find_scan: Join should have been materialized before this point")
         if hasattr(plan, "input"): return GraphCompiler._find_scan_static(plan.input)
         raise ValueError(f"No Scan found in plan: {type(plan)}")
 
@@ -210,6 +271,8 @@ class GraphCompiler:
 
     def _visit_plan(self, plan, nodes):
         if isinstance(plan, Scan): return nodes
+        elif isinstance(plan, Join):
+            raise NotImplementedError("Join must be materialized before graph compilation")
         elif isinstance(plan, Project): return self._visit_project(plan, nodes)
         elif isinstance(plan, Filter): return self._visit_filter(plan, nodes)
         elif isinstance(plan, Aggregate): return self._visit_aggregate(plan, nodes)

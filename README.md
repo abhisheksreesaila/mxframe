@@ -15,60 +15,85 @@ format and MAX Engine’s accelerated kernels, we enable:
 
 ### 🚀 What’s in v0.0.1
 
-This initial release provides the **core zero-copy bridge**:
+This initial release provides a **lazy DataFrame engine** with compiled
+execution:
 
-| Feature                 | Description                           |
-|-------------------------|---------------------------------------|
-| `MXFrame` class         | DataFrame wrapper backed by PyArrow   |
-| `arrow_to_max_tensor()` | Zero-copy Arrow → MAX Tensor bridge   |
-| CPU Support             | True zero-copy (same memory)          |
-| GPU Support             | Automatic device transfer             |
-| Dtype Support           | int8-64, uint8-64, float32/64, date32 |
-
-**Benchmarked**: 10M elements at **4.4 GB/s** throughput — proves
-zero-copy.
+| Feature | Description |
+|----|----|
+| `LazyFrame` class | Lazy DataFrame backed by PyArrow with logical plan |
+| `col()` / `lit()` | Expression DSL for filters, projections, aggregations |
+| Filter / Join / GroupBy | Core relational operators |
+| Sort / Limit / Distinct | Query shaping operators |
+| CPU & GPU execution | `.compute(device="cpu")` or `device="gpu"` |
+| Custom Mojo kernels | Compiled joins and aggregations via MAX Engine |
 
 ## ⚡ Quick Start
 
 ``` python
-from mxframe import MXFrame
+import pyarrow as pa
+from mxframe.lazy_expr import col, lit
+from mxframe.lazy_frame import LazyFrame
 
-# Create from dictionary
-df = MXFrame({
-    'price': [10.5, 20.3, 15.8, 42.0],
-    'quantity': [100, 200, 150, 50],
+# Create a LazyFrame from a PyArrow table
+table = pa.table({
+    'price': [10.5, 20.3, 15.8, 42.0, 8.9],
+    'quantity': [100, 200, 150, 50, 300],
+    'category': ['A', 'B', 'A', 'B', 'A'],
 })
-print(df)
+lf = LazyFrame(table)
+
+# Filter + compute
+result = lf.filter(col("price") > lit(10.0)).compute()
+print(result.to_pandas())
 ```
 
-### Zero-Copy to MAX Tensors
+       price  quantity category
+    0   10.5       100        A
+    1   20.3       200        B
+    2   15.8       150        A
+    3   42.0        50        B
 
-The key feature: convert columns to MAX tensors **without copying
-data**:
+### GroupBy + Aggregation
+
+Lazy expressions for groupby aggregations:
 
 ``` python
-# Get a MAX tensor (zero-copy on CPU!)
-price_tensor = df.to_max_tensor('price')
-print(f"Tensor: {price_tensor.to_numpy()}")
-
-# Verify same memory address
-print(f"Same memory: {df.get_buffer_address('price') == df.to_numpy('price').ctypes.data}")
+# GroupBy aggregation
+result = (
+    lf.groupby("category")
+      .agg(col("price").sum().alias("total_price"),
+           col("quantity").sum().alias("total_qty"))
+      .compute()
+)
+print(result.to_pandas())
 ```
 
-### 🎮 GPU Acceleration
+      category  total_price  total_qty
+    0        A    35.199997      550.0
+    1        B    62.299999      250.0
 
-Transfer to GPU when you need accelerated compute:
+### Join + Sort + Limit
+
+Combine two tables with a join, then sort and limit:
 
 ``` python
-from max import driver
+# Join two tables
+orders = pa.table({"oid": [1, 2, 3], "cid": [10, 20, 10], "amount": [100.0, 200.0, 150.0]})
+customers = pa.table({"cid": [10, 20], "name": ["Alice", "Bob"]})
 
-if driver.accelerator_count() > 0:
-    gpu = driver.Accelerator()
-    gpu_tensor = df.to_max_tensor('price', device=gpu)
-    print(f"GPU tensor: {gpu_tensor.shape}")
-else:
-    print("No GPU available")
+result = (
+    LazyFrame(orders)
+    .join(LazyFrame(customers), on="cid")
+    .sort("amount", descending=True)
+    .limit(2)
+    .compute()
+)
+print(result.to_pandas())
 ```
+
+       oid  cid  amount   name
+    0    2   20   200.0    Bob
+    1    3   10   150.0  Alice
 
 ## 📦 Installation
 
@@ -114,10 +139,13 @@ nbdev_prepare
 
 ## 🗺️ Roadmap
 
-- [ ] GPU-accelerated aggregations (sum, mean, min, max)
-- [ ] Custom Mojo kernels for TPC-H queries  
-- [ ] GroupBy operations on GPU
-- [ ] Lazy evaluation and query optimization
+- [x] Lazy evaluation and query optimization
+- [x] Filter / Join / GroupBy / Sort / Limit / Distinct
+- [x] CPU & GPU execution via MAX Engine
+- [x] Custom Mojo kernels for TPC-H queries
+- [ ] Multi-threaded CPU execution
+- [ ] Window functions
+- [ ] I/O connectors (Parquet, CSV)
 
 ## 📄 License
 

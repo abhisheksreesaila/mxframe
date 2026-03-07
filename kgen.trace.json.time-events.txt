@@ -1,32 +1,282 @@
 Thread   Start(us)  B/E     Dur(us)  Name/Detail
 ------  ----------  ---  ----------  ------------------------------
- 36048     1285354  BEG           9  AnnotateKernels
- 36048     1285363  END           9  AnnotateKernels
- 36048     1285364  BEG           0  VerifyKernels
- 36048     1285365  END           0  VerifyKernels
- 36048     1285366  BEG           0  LowerSemanticCF
- 36048     1285366  END           0  LowerSemanticCF
- 36048     1285367  BEG           8  CheckLifetimes
- 36048     1285370  BEG           5  (A) SymbolTableAnalysis
- 36048     1285376  END           5  (A) SymbolTableAnalysis
- 36048     1285376  END           8  CheckLifetimes
- 36048     2833186  BEG        9938  AnnotateKernels
- 36048     2843124  END        9938  AnnotateKernels
- 36048     2843130  BEG        2193  VerifyKernels
- 36048     2845324  END        2193  VerifyKernels
- 36048     2845327  BEG       15468  LowerSemanticCF
- 36048     2860795  END       15468  LowerSemanticCF
- 36048     2860801  BEG      127458  CheckLifetimes
- 36048     2867656  BEG          31  (A) SymbolTableAnalysis
- 36048     2867687  END          31  (A) SymbolTableAnalysis
- 36048     2988259  END      127458  CheckLifetimes
- 36048    64217320  BEG        3064  AnnotateKernels
- 36048    64220385  END        3064  AnnotateKernels
- 36048    64220387  BEG         399  VerifyKernels
- 36048    64220786  END         399  VerifyKernels
- 36048    64220787  BEG        5553  LowerSemanticCF
- 36048    64226341  END        5553  LowerSemanticCF
- 36048    64226342  BEG       58394  CheckLifetimes
- 36048    64227838  BEG          11  (A) SymbolTableAnalysis
- 36048    64227850  END          11  (A) SymbolTableAnalysis
- 36048    64284737  END       58394  CheckLifetimes
+114090      546052  BEG          10  AnnotateKernels
+114090      546063  END          10  AnnotateKernels
+114090      546064  BEG           0  VerifyKernels
+114090      546065  END           0  VerifyKernels
+114090      546066  BEG           0  LowerSemanticCF
+114090      546067  END           0  LowerSemanticCF
+114090      546068  BEG          23  CheckLifetimes
+114090      546084  BEG           6  (A) SymbolTableAnalysis
+114090      546090  END           6  (A) SymbolTableAnalysis
+114090      546091  END          23  CheckLifetimes
+114090     2571168  BEG        9379  AnnotateKernels
+114090     2580547  END        9379  AnnotateKernels
+114090     2580552  BEG        1975  VerifyKernels
+114090     2582527  END        1975  VerifyKernels
+114090     2582530  BEG       11371  LowerSemanticCF
+114090     2593901  END       11371  LowerSemanticCF
+114090     2593906  BEG      127578  CheckLifetimes
+114090     2598573  BEG          16  (A) SymbolTableAnalysis
+114090     2598589  END          16  (A) SymbolTableAnalysis
+114090     2721485  END      127578  CheckLifetimes
+114090  1433252133  BEG        3342  AnnotateKernels
+114090  1433255475  END        3342  AnnotateKernels
+114090  1433255477  BEG         428  VerifyKernels
+114090  1433255905  END         428  VerifyKernels
+114090  1433255906  BEG        9971  LowerSemanticCF
+114090  1433265877  END        9971  LowerSemanticCF
+114090  1433265881  BEG       76675  CheckLifetimes
+114090  1433268754  BEG          13  (A) SymbolTableAnalysis
+114090  1433268768  END          13  (A) SymbolTableAnalysis
+114090  1433342556  END       76675  CheckLifetimes
+114090  1691197274  BEG           4  AnnotateKernels
+114090  1691197278  END           4  AnnotateKernels
+114090  1691197279  BEG           1  VerifyKernels
+114090  1691197281  END           1  VerifyKernels
+114090  1691197281  BEG           1  LowerSemanticCF
+114090  1691197283  END           1  LowerSemanticCF
+114090  1691197284  BEG           9  CheckLifetimes
+114090  1691197287  BEG           6  (A) SymbolTableAnalysis
+114090  1691197293  END           6  (A) SymbolTableAnalysis
+114090  1691197294  END           9  CheckLifetimes
+114090  1692199483  BEG           3  AnnotateKernels
+114090  1692199487  END           3  AnnotateKernels
+114090  1692199488  BEG           1  VerifyKernels
+114090  1692199489  END           1  VerifyKernels
+114090  1692199490  BEG           1  LowerSemanticCF
+114090  1692199491  END           1  LowerSemanticCF
+114090  1692199492  BEG           8  CheckLifetimes
+114090  1692199494  BEG           5  (A) SymbolTableAnalysis
+114090  1692199499  END           5  (A) SymbolTableAnalysis
+114090  1692199500  END           8  CheckLifetimes
+114090  1693525416  BEG        3945  AnnotateKernels
+114090  1693529361  END        3945  AnnotateKernels
+114090  1693529365  BEG        1401  VerifyKernels
+114090  1693530766  END        1401  VerifyKernels
+114090  1693530768  BEG        6646  LowerSemanticCF
+114090  1693537415  END        6646  LowerSemanticCF
+114090  1693537417  BEG       97732  CheckLifetimes
+114090  1693539141  BEG          12  (A) SymbolTableAnalysis
+114090  1693539154  END          12  (A) SymbolTableAnalysis
+114090  1693635149  END       97732  CheckLifetimes
+114090  1697091431  BEG        4614  AnnotateKernels
+114090  1697096045  END        4614  AnnotateKernels
+114090  1697096048  BEG         454  VerifyKernels
+114090  1697096502  END         454  VerifyKernels
+114090  1697096503  BEG       10471  LowerSemanticCF
+114090  1697106974  END       10471  LowerSemanticCF
+114090  1697106979  BEG       94537  CheckLifetimes
+114090  1697111483  BEG          22  (A) SymbolTableAnalysis
+114090  1697111506  END          22  (A) SymbolTableAnalysis
+114090  1697201517  END       94537  CheckLifetimes
+114090  1698497155  BEG        3787  AnnotateKernels
+114090  1698500943  END        3787  AnnotateKernels
+114090  1698500946  BEG         719  VerifyKernels
+114090  1698501665  END         719  VerifyKernels
+114090  1698501667  BEG        6689  LowerSemanticCF
+114090  1698508357  END        6689  LowerSemanticCF
+114090  1698508358  BEG       74460  CheckLifetimes
+114090  1698509967  BEG          12  (A) SymbolTableAnalysis
+114090  1698509979  END          12  (A) SymbolTableAnalysis
+114090  1698582819  END       74460  CheckLifetimes
+114090  1797290599  BEG           3  AnnotateKernels
+114090  1797290603  END           3  AnnotateKernels
+114090  1797290604  BEG           1  VerifyKernels
+114090  1797290605  END           1  VerifyKernels
+114090  1797290606  BEG           1  LowerSemanticCF
+114090  1797290608  END           1  LowerSemanticCF
+114090  1797290609  BEG          10  CheckLifetimes
+114090  1797290611  BEG           6  (A) SymbolTableAnalysis
+114090  1797290618  END           6  (A) SymbolTableAnalysis
+114090  1797290619  END          10  CheckLifetimes
+114090  1798437746  BEG           3  AnnotateKernels
+114090  1798437750  END           3  AnnotateKernels
+114090  1798437751  BEG           1  VerifyKernels
+114090  1798437752  END           1  VerifyKernels
+114090  1798437753  BEG           1  LowerSemanticCF
+114090  1798437755  END           1  LowerSemanticCF
+114090  1798437756  BEG           9  CheckLifetimes
+114090  1798437758  BEG           6  (A) SymbolTableAnalysis
+114090  1798437764  END           6  (A) SymbolTableAnalysis
+114090  1798437765  END           9  CheckLifetimes
+114090  1814500157  BEG           3  AnnotateKernels
+114090  1814500160  END           3  AnnotateKernels
+114090  1814500161  BEG           1  VerifyKernels
+114090  1814500162  END           1  VerifyKernels
+114090  1814500163  BEG           1  LowerSemanticCF
+114090  1814500164  END           1  LowerSemanticCF
+114090  1814500165  BEG           8  CheckLifetimes
+114090  1814500167  BEG           5  (A) SymbolTableAnalysis
+114090  1814500173  END           5  (A) SymbolTableAnalysis
+114090  1814500173  END           8  CheckLifetimes
+114090  1815711368  BEG           3  AnnotateKernels
+114090  1815711372  END           3  AnnotateKernels
+114090  1815711373  BEG           1  VerifyKernels
+114090  1815711374  END           1  VerifyKernels
+114090  1815711375  BEG           1  LowerSemanticCF
+114090  1815711377  END           1  LowerSemanticCF
+114090  1815711377  BEG           8  CheckLifetimes
+114090  1815711379  BEG           6  (A) SymbolTableAnalysis
+114090  1815711386  END           6  (A) SymbolTableAnalysis
+114090  1815711386  END           8  CheckLifetimes
+114090  1816799831  BEG        3485  AnnotateKernels
+114090  1816803316  END        3485  AnnotateKernels
+114090  1816803318  BEG         446  VerifyKernels
+114090  1816803765  END         446  VerifyKernels
+114090  1816803766  BEG        7140  LowerSemanticCF
+114090  1816810906  END        7140  LowerSemanticCF
+114090  1816810909  BEG       83410  CheckLifetimes
+114090  1816813197  BEG          12  (A) SymbolTableAnalysis
+114090  1816813210  END          12  (A) SymbolTableAnalysis
+114090  1816894320  END       83410  CheckLifetimes
+114090  6701594249  BEG           4  AnnotateKernels
+114090  6701594253  END           4  AnnotateKernels
+114090  6701594254  BEG           1  VerifyKernels
+114090  6701594255  END           1  VerifyKernels
+114090  6701594256  BEG           1  LowerSemanticCF
+114090  6701594257  END           1  LowerSemanticCF
+114090  6701594258  BEG          11  CheckLifetimes
+114090  6701594261  BEG           7  (A) SymbolTableAnalysis
+114090  6701594269  END           7  (A) SymbolTableAnalysis
+114090  6701594270  END          11  CheckLifetimes
+114090  6702544835  BEG           5  AnnotateKernels
+114090  6702544840  END           5  AnnotateKernels
+114090  6702544841  BEG           1  VerifyKernels
+114090  6702544842  END           1  VerifyKernels
+114090  6702544843  BEG           1  LowerSemanticCF
+114090  6702544845  END           1  LowerSemanticCF
+114090  6702544846  BEG          10  CheckLifetimes
+114090  6702544849  BEG           7  (A) SymbolTableAnalysis
+114090  6702544856  END           7  (A) SymbolTableAnalysis
+114090  6702544857  END          10  CheckLifetimes
+114090  6703599320  BEG           3  AnnotateKernels
+114090  6703599324  END           3  AnnotateKernels
+114090  6703599325  BEG           1  VerifyKernels
+114090  6703599326  END           1  VerifyKernels
+114090  6703599327  BEG           1  LowerSemanticCF
+114090  6703599328  END           1  LowerSemanticCF
+114090  6703599329  BEG           8  CheckLifetimes
+114090  6703599331  BEG           6  (A) SymbolTableAnalysis
+114090  6703599337  END           6  (A) SymbolTableAnalysis
+114090  6703599338  END           8  CheckLifetimes
+114090  6704424802  BEG           3  AnnotateKernels
+114090  6704424805  END           3  AnnotateKernels
+114090  6704424806  BEG           1  VerifyKernels
+114090  6704424808  END           1  VerifyKernels
+114090  6704424808  BEG           1  LowerSemanticCF
+114090  6704424810  END           1  LowerSemanticCF
+114090  6704424811  BEG           7  CheckLifetimes
+114090  6704424812  BEG           5  (A) SymbolTableAnalysis
+114090  6704424818  END           5  (A) SymbolTableAnalysis
+114090  6704424819  END           7  CheckLifetimes
+114090  7765068278  BEG        5066  AnnotateKernels
+114090  7765073345  END        5066  AnnotateKernels
+114090  7765073348  BEG         457  VerifyKernels
+114090  7765073805  END         457  VerifyKernels
+114090  7765073807  BEG        6066  LowerSemanticCF
+114090  7765079874  END        6066  LowerSemanticCF
+114090  7765079876  BEG       95848  CheckLifetimes
+114090  7765081464  BEG          12  (A) SymbolTableAnalysis
+114090  7765081476  END          12  (A) SymbolTableAnalysis
+114090  7765175725  END       95848  CheckLifetimes
+114090  17698984844  BEG        4411  AnnotateKernels
+114090  17698989256  END        4411  AnnotateKernels
+114090  17698989267  BEG         586  VerifyKernels
+114090  17698989854  END         586  VerifyKernels
+114090  17698989855  BEG        7075  LowerSemanticCF
+114090  17698996931  END        7075  LowerSemanticCF
+114090  17698996933  BEG       76001  CheckLifetimes
+114090  17698999863  BEG          14  (A) SymbolTableAnalysis
+114090  17698999877  END          14  (A) SymbolTableAnalysis
+114090  17699072935  END       76001  CheckLifetimes
+114090  20319094031  BEG        3846  AnnotateKernels
+114090  20319097878  END        3846  AnnotateKernels
+114090  20319097880  BEG         511  VerifyKernels
+114090  20319098392  END         511  VerifyKernels
+114090  20319098393  BEG        7203  LowerSemanticCF
+114090  20319105596  END        7203  LowerSemanticCF
+114090  20319105599  BEG       74785  CheckLifetimes
+114090  20319108276  BEG          13  (A) SymbolTableAnalysis
+114090  20319108289  END          13  (A) SymbolTableAnalysis
+114090  20319180384  END       74785  CheckLifetimes
+114090  22965937147  BEG           4  AnnotateKernels
+114090  22965937151  END           4  AnnotateKernels
+114090  22965937153  BEG           1  VerifyKernels
+114090  22965937154  END           1  VerifyKernels
+114090  22965937156  BEG           1  LowerSemanticCF
+114090  22965937157  END           1  LowerSemanticCF
+114090  22965937200  BEG          11  CheckLifetimes
+114090  22965937203  BEG           7  (A) SymbolTableAnalysis
+114090  22965937211  END           7  (A) SymbolTableAnalysis
+114090  22965937212  END          11  CheckLifetimes
+114090  22967379739  BEG           3  AnnotateKernels
+114090  22967379742  END           3  AnnotateKernels
+114090  22967379743  BEG           1  VerifyKernels
+114090  22967379744  END           1  VerifyKernels
+114090  22967379745  BEG           1  LowerSemanticCF
+114090  22967379747  END           1  LowerSemanticCF
+114090  22967379748  BEG           9  CheckLifetimes
+114090  22967379750  BEG           7  (A) SymbolTableAnalysis
+114090  22967379757  END           7  (A) SymbolTableAnalysis
+114090  22967379758  END           9  CheckLifetimes
+114090  22998034159  BEG           3  AnnotateKernels
+114090  22998034163  END           3  AnnotateKernels
+114090  22998034164  BEG           1  VerifyKernels
+114090  22998034165  END           1  VerifyKernels
+114090  22998034165  BEG           1  LowerSemanticCF
+114090  22998034167  END           1  LowerSemanticCF
+114090  22998034167  BEG           8  CheckLifetimes
+114090  22998034169  BEG           6  (A) SymbolTableAnalysis
+114090  22998034176  END           6  (A) SymbolTableAnalysis
+114090  22998034176  END           8  CheckLifetimes
+114090  22999189678  BEG           3  AnnotateKernels
+114090  22999189682  END           3  AnnotateKernels
+114090  22999189683  BEG           1  VerifyKernels
+114090  22999189684  END           1  VerifyKernels
+114090  22999189685  BEG           1  LowerSemanticCF
+114090  22999189687  END           1  LowerSemanticCF
+114090  22999189688  BEG           9  CheckLifetimes
+114090  22999189690  BEG           6  (A) SymbolTableAnalysis
+114090  22999189697  END           6  (A) SymbolTableAnalysis
+114090  22999189697  END           9  CheckLifetimes
+114090  23015096734  BEG           3  AnnotateKernels
+114090  23015096737  END           3  AnnotateKernels
+114090  23015096738  BEG           1  VerifyKernels
+114090  23015096739  END           1  VerifyKernels
+114090  23015096740  BEG           1  LowerSemanticCF
+114090  23015096741  END           1  LowerSemanticCF
+114090  23015096777  BEG          12  CheckLifetimes
+114090  23015096780  BEG           8  (A) SymbolTableAnalysis
+114090  23015096788  END           8  (A) SymbolTableAnalysis
+114090  23015096789  END          12  CheckLifetimes
+114090  26381231415  BEG        3759  AnnotateKernels
+114090  26381235175  END        3759  AnnotateKernels
+114090  26381235176  BEG         488  VerifyKernels
+114090  26381235665  END         488  VerifyKernels
+114090  26381235666  BEG        7678  LowerSemanticCF
+114090  26381243344  END        7678  LowerSemanticCF
+114090  26381243348  BEG       73001  CheckLifetimes
+114090  26381245575  BEG          13  (A) SymbolTableAnalysis
+114090  26381245589  END          13  (A) SymbolTableAnalysis
+114090  26381316349  END       73001  CheckLifetimes
+114090  26407758891  BEG        4933  AnnotateKernels
+114090  26407763825  END        4933  AnnotateKernels
+114090  26407763830  BEG        1147  VerifyKernels
+114090  26407764977  END        1147  VerifyKernels
+114090  26407764980  BEG        6573  LowerSemanticCF
+114090  26407771553  END        6573  LowerSemanticCF
+114090  26407771554  BEG       71434  CheckLifetimes
+114090  26407773263  BEG          12  (A) SymbolTableAnalysis
+114090  26407773276  END          12  (A) SymbolTableAnalysis
+114090  26407842989  END       71434  CheckLifetimes
+114090  26433340874  BEG        6629  AnnotateKernels
+114090  26433347504  END        6629  AnnotateKernels
+114090  26433347508  BEG         626  VerifyKernels
+114090  26433348134  END         626  VerifyKernels
+114090  26433348170  BEG        8138  LowerSemanticCF
+114090  26433356309  END        8138  LowerSemanticCF
+114090  26433356313  BEG       90038  CheckLifetimes
+114090  26433359165  BEG          14  (A) SymbolTableAnalysis
+114090  26433359179  END          14  (A) SymbolTableAnalysis
+114090  26433446352  END       90038  CheckLifetimes

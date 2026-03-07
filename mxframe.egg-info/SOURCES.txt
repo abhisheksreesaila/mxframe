@@ -6,7 +6,10 @@ settings.ini
 setup.py
 mxframe/__init__.py
 mxframe/_modidx.py
-mxframe/core_bridge.py
+mxframe/compiler.py
+mxframe/custom_ops.py
+mxframe/lazy_expr.py
+mxframe/lazy_frame.py
 mxframe.egg-info/PKG-INFO
 mxframe.egg-info/SOURCES.txt
 mxframe.egg-info/dependency_links.txt

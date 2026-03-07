@@ -57,15 +57,28 @@ assert abs(d4["a"] - 6.0) < 1e-6, f"Filtered sum for a should be 6.0: {d4}"
 assert abs(d4["b"] - 6.0) < 1e-6, f"Filtered sum for b should be 6.0: {d4}"
 print("✅ Test 4: filter removes rows before grouped aggregation")
 
-# ── Test 5: grouped min/max/mean raise NotImplementedError ───────────────────
-table5 = pa.table({"g": ["x", "x", "y"], "v": [1.0, 2.0, 3.0]})
+# ── Test 5: grouped min/max/mean now work (kernels exist) ────────────────────
+table5 = pa.table({"g": ["x", "x", "y"], "v": pa.array([1.0, 2.0, 3.0], type=pa.float32())})
 lf5 = LazyFrame(Scan(table5))
-for bad_agg in [col("v").min(), col("v").max(), col("v").mean()]:
-    try:
-        compiler.compile_and_run(lf5.groupby("g").agg(bad_agg).plan)
-        assert False, f"Should have raised NotImplementedError for {bad_agg}"
-    except NotImplementedError as e:
-        assert "Phase 1" in str(e), f"Error should mention Phase 1: {e}"
-print("✅ Test 5: grouped min/max/mean raise NotImplementedError (Phase 1)")
+
+# min
+r_min = compiler.compile_and_run(lf5.groupby("g").agg(col("v").min().alias("mn")).plan)
+d_min = dict(zip(r_min.column("g").to_pylist(), r_min.column("mn").to_pylist()))
+assert abs(d_min["x"] - 1.0) < 1e-5, f"min(x) should be 1.0: {d_min}"
+assert abs(d_min["y"] - 3.0) < 1e-5, f"min(y) should be 3.0: {d_min}"
+
+# max
+r_max = compiler.compile_and_run(lf5.groupby("g").agg(col("v").max().alias("mx")).plan)
+d_max = dict(zip(r_max.column("g").to_pylist(), r_max.column("mx").to_pylist()))
+assert abs(d_max["x"] - 2.0) < 1e-5, f"max(x) should be 2.0: {d_max}"
+assert abs(d_max["y"] - 3.0) < 1e-5, f"max(y) should be 3.0: {d_max}"
+
+# mean
+r_mean = compiler.compile_and_run(lf5.groupby("g").agg(col("v").mean().alias("av")).plan)
+d_mean = dict(zip(r_mean.column("g").to_pylist(), r_mean.column("av").to_pylist()))
+assert abs(d_mean["x"] - 1.5) < 1e-5, f"mean(x) should be 1.5: {d_mean}"
+assert abs(d_mean["y"] - 3.0) < 1e-5, f"mean(y) should be 3.0: {d_mean}"
+
+print("✅ Test 5: grouped min/max/mean produce correct results")
 
 print("\nAll CustomOpsCompiler (Phase 0) tests passed! 🎉")
