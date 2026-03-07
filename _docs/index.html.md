@@ -15,9 +15,14 @@ format and MAX Engine’s accelerated kernels, we enable:
 
 ### 🚀 What’s in v0.0.1
 
-This initial release provides the **core zero-copy bridge**:
+This initial release provides a **lazy DataFrame engine** with compiled
+execution:
 
 <table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 59%" />
+</colgroup>
 <thead>
 <tr>
 <th>Feature</th>
@@ -26,72 +31,100 @@ This initial release provides the **core zero-copy bridge**:
 </thead>
 <tbody>
 <tr>
-<td><code>MXFrame</code> class</td>
-<td>DataFrame wrapper backed by PyArrow</td>
+<td><code>LazyFrame</code> class</td>
+<td>Lazy DataFrame backed by PyArrow with logical plan</td>
 </tr>
 <tr>
-<td><code>arrow_to_max_tensor()</code></td>
-<td>Zero-copy Arrow → MAX Tensor bridge</td>
+<td><code>col()</code> / <code>lit()</code></td>
+<td>Expression DSL for filters, projections, aggregations</td>
 </tr>
 <tr>
-<td>CPU Support</td>
-<td>True zero-copy (same memory)</td>
+<td>Filter / Join / GroupBy</td>
+<td>Core relational operators</td>
 </tr>
 <tr>
-<td>GPU Support</td>
-<td>Automatic device transfer</td>
+<td>Sort / Limit / Distinct</td>
+<td>Query shaping operators</td>
 </tr>
 <tr>
-<td>Dtype Support</td>
-<td>int8-64, uint8-64, float32/64, date32</td>
+<td>CPU &amp; GPU execution</td>
+<td><code>.compute(device="cpu")</code> or
+<code>device="gpu"</code></td>
+</tr>
+<tr>
+<td>Custom Mojo kernels</td>
+<td>Compiled joins and aggregations via MAX Engine</td>
 </tr>
 </tbody>
 </table>
 
-**Benchmarked**: 10M elements at **4.4 GB/s** throughput — proves
-zero-copy.
-
 ## ⚡ Quick Start
 
 ``` python
-from mxframe import MXFrame
+import pyarrow as pa
+from mxframe.lazy_expr import col, lit
+from mxframe.lazy_frame import LazyFrame
 
-# Create from dictionary
-df = MXFrame({
-    'price': [10.5, 20.3, 15.8, 42.0],
-    'quantity': [100, 200, 150, 50],
+# Create a LazyFrame from a PyArrow table
+table = pa.table({
+    'price': [10.5, 20.3, 15.8, 42.0, 8.9],
+    'quantity': [100, 200, 150, 50, 300],
+    'category': ['A', 'B', 'A', 'B', 'A'],
 })
-print(df)
+lf = LazyFrame(table)
+
+# Filter + compute
+result = lf.filter(col("price") > lit(10.0)).compute()
+print(result.to_pandas())
 ```
 
-### Zero-Copy to MAX Tensors
+       price  quantity category
+    0   10.5       100        A
+    1   20.3       200        B
+    2   15.8       150        A
+    3   42.0        50        B
 
-The key feature: convert columns to MAX tensors **without copying
-data**:
+### GroupBy + Aggregation
+
+Lazy expressions for groupby aggregations:
 
 ``` python
-# Get a MAX tensor (zero-copy on CPU!)
-price_tensor = df.to_max_tensor('price')
-print(f"Tensor: {price_tensor.to_numpy()}")
-
-# Verify same memory address
-print(f"Same memory: {df.get_buffer_address('price') == df.to_numpy('price').ctypes.data}")
+# GroupBy aggregation
+result = (
+    lf.groupby("category")
+      .agg(col("price").sum().alias("total_price"),
+           col("quantity").sum().alias("total_qty"))
+      .compute()
+)
+print(result.to_pandas())
 ```
 
-### 🎮 GPU Acceleration
+      category  total_price  total_qty
+    0        A    35.199997      550.0
+    1        B    62.299999      250.0
 
-Transfer to GPU when you need accelerated compute:
+### Join + Sort + Limit
+
+Combine two tables with a join, then sort and limit:
 
 ``` python
-from max import driver
+# Join two tables
+orders = pa.table({"oid": [1, 2, 3], "cid": [10, 20, 10], "amount": [100.0, 200.0, 150.0]})
+customers = pa.table({"cid": [10, 20], "name": ["Alice", "Bob"]})
 
-if driver.accelerator_count() > 0:
-    gpu = driver.Accelerator()
-    gpu_tensor = df.to_max_tensor('price', device=gpu)
-    print(f"GPU tensor: {gpu_tensor.shape}")
-else:
-    print("No GPU available")
+result = (
+    LazyFrame(orders)
+    .join(LazyFrame(customers), on="cid")
+    .sort("amount", descending=True)
+    .limit(2)
+    .compute()
+)
+print(result.to_pandas())
 ```
+
+       oid  cid  amount   name
+    0    2   20   200.0    Bob
+    1    3   10   150.0  Alice
 
 ## 📦 Installation
 
@@ -137,10 +170,13 @@ nbdev_prepare
 
 ## 🗺️ Roadmap
 
-- ☐ GPU-accelerated aggregations (sum, mean, min, max)
-- ☐ Custom Mojo kernels for TPC-H queries  
-- ☐ GroupBy operations on GPU
-- ☐ Lazy evaluation and query optimization
+- ☒ Lazy evaluation and query optimization
+- ☒ Filter / Join / GroupBy / Sort / Limit / Distinct
+- ☒ CPU & GPU execution via MAX Engine
+- ☒ Custom Mojo kernels for TPC-H queries
+- ☐ Multi-threaded CPU execution
+- ☐ Window functions
+- ☐ I/O connectors (Parquet, CSV)
 
 ## 📄 License
 

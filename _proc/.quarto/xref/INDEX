@@ -1,5 +1,35 @@
 {
   "index.ipynb": {
-    "README.md": "2fffe5bd"
+    "README.md": "2fffe5bd",
+    "index.html": "594ea6b0",
+    "index.html.md": "cc615dc5"
+  },
+  "bench_q3.ipynb": {
+    "bench_q3.html": "c3eda4e5",
+    "bench_q3.html.md": "f517b729"
+  },
+  "bench_q1.ipynb": {
+    "bench_q1.html": "4956e87e",
+    "bench_q1.html.md": "5f207d01"
+  },
+  "bench_sort_limit_distinct.ipynb": {
+    "bench_sort_limit_distinct.html": "8ef71bfa",
+    "bench_sort_limit_distinct.html.md": "955f39a9"
+  },
+  "02_lazy_frame.ipynb": {
+    "lazy_frame.html": "52aeba4d",
+    "lazy_frame.html.md": "3911347f"
+  },
+  "03_compiler.ipynb": {
+    "compiler.html": "f941a80c",
+    "compiler.html.md": "a1ca700a"
+  },
+  "01_lazy_expr.ipynb": {
+    "lazy_expr.html": "bfe44265",
+    "lazy_expr.html.md": "d24960c7"
+  },
+  "04_custom_ops.ipynb": {
+    "custom_ops.html": "86fa0832",
+    "custom_ops.html.md": "7a193dda"
   }
 }

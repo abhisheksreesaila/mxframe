@@ -6,9 +6,9 @@
 
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
-<meta name="description" content="⚡ Zero-copy bridge between PyArrow and MAX Engine — unlock GPU acceleration for your DataFrames.">
+<meta name="description" content="Closeout benchmark for Phase 2 on active MXFrame lazy APIs.">
 
-<title>mxframe</title>
+<title>Phase 2 Benchmark: TPC-H Q1 + Q6 – mxframe</title>
 <style>
 code{white-space: pre-wrap;}
 span.smallcaps{font-variant: small-caps;}
@@ -20,41 +20,6 @@ ul.task-list li input[type="checkbox"] {
   width: 0.8em;
   margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
   vertical-align: middle;
-}
-/* CSS for syntax highlighting */
-html { -webkit-text-size-adjust: 100%; }
-pre > code.sourceCode { white-space: pre; position: relative; }
-pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
-pre > code.sourceCode > span:empty { height: 1.2em; }
-.sourceCode { overflow: visible; }
-code.sourceCode > span { color: inherit; text-decoration: inherit; }
-div.sourceCode { margin: 1em 0; }
-pre.sourceCode { margin: 0; }
-@media screen {
-div.sourceCode { overflow: auto; }
-}
-@media print {
-pre > code.sourceCode { white-space: pre-wrap; }
-pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
-}
-pre.numberSource code
-  { counter-reset: source-line 0; }
-pre.numberSource code > span
-  { position: relative; left: -4em; counter-increment: source-line; }
-pre.numberSource code > span > a:first-child::before
-  { content: counter(source-line);
-    position: relative; left: -1em; text-align: right; vertical-align: baseline;
-    border: none; display: inline-block;
-    -webkit-touch-callout: none; -webkit-user-select: none;
-    -khtml-user-select: none; -moz-user-select: none;
-    -ms-user-select: none; user-select: none;
-    padding: 0 4px; width: 4em;
-  }
-pre.numberSource { margin-left: 3em;  padding-left: 4px; }
-div.sourceCode
-  {   }
-@media screen {
-pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
 }
 </style>
 
@@ -107,11 +72,11 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 
 
 <link rel="stylesheet" href="styles.css">
-<meta property="og:title" content="mxframe">
-<meta property="og:description" content="⚡ Zero-copy bridge between PyArrow and MAX Engine — unlock GPU acceleration for your DataFrames.">
+<meta property="og:title" content="Phase 2 Benchmark: TPC-H Q1 + Q6 – mxframe">
+<meta property="og:description" content="Closeout benchmark for Phase 2 on active MXFrame lazy APIs.">
 <meta property="og:site_name" content="mxframe">
-<meta name="twitter:title" content="mxframe">
-<meta name="twitter:description" content="⚡ Zero-copy bridge between PyArrow and MAX Engine — unlock GPU acceleration for your DataFrames.">
+<meta name="twitter:title" content="Phase 2 Benchmark: TPC-H Q1 + Q6 – mxframe">
+<meta name="twitter:description" content="Closeout benchmark for Phase 2 on active MXFrame lazy APIs.">
 <meta name="twitter:card" content="summary">
 </head>
 
@@ -136,7 +101,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
       <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
         <i class="bi bi-layout-text-sidebar-reverse"></i>
       </button>
-        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./index.html">mxframe</a></li></ol></nav>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./bench_q1.html">Phase 2 Benchmark: TPC-H Q1 + Q6</a></li></ol></nav>
         <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
         </a>
     </div>
@@ -150,7 +115,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <ul class="list-unstyled mt-1">
         <li class="sidebar-item">
   <div class="sidebar-item-container"> 
-  <a href="./index.html" class="sidebar-item-text sidebar-link active">
+  <a href="./index.html" class="sidebar-item-text sidebar-link">
  <span class="menu-text">mxframe</span></a>
   </div>
 </li>
@@ -180,7 +145,7 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 </li>
         <li class="sidebar-item">
   <div class="sidebar-item-container"> 
-  <a href="./bench_q1.html" class="sidebar-item-text sidebar-link">
+  <a href="./bench_q1.html" class="sidebar-item-text sidebar-link active">
  <span class="menu-text">Phase 2 Benchmark: TPC-H Q1 + Q6</span></a>
   </div>
 </li>
@@ -206,37 +171,26 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
     <h2 id="toc-title">On this page</h2>
    
   <ul>
-  <li><a href="#vision" id="toc-vision" class="nav-link active" data-scroll-target="#vision">🎯 Vision</a>
-  <ul class="collapse">
-  <li><a href="#whats-in-v0.0.1" id="toc-whats-in-v0.0.1" class="nav-link" data-scroll-target="#whats-in-v0.0.1">🚀 What’s in v0.0.1</a></li>
-  </ul></li>
-  <li><a href="#quick-start" id="toc-quick-start" class="nav-link" data-scroll-target="#quick-start">⚡ Quick Start</a>
-  <ul class="collapse">
-  <li><a href="#groupby-aggregation" id="toc-groupby-aggregation" class="nav-link" data-scroll-target="#groupby-aggregation">GroupBy + Aggregation</a></li>
-  <li><a href="#join-sort-limit" id="toc-join-sort-limit" class="nav-link" data-scroll-target="#join-sort-limit">Join + Sort + Limit</a></li>
-  </ul></li>
-  <li><a href="#installation" id="toc-installation" class="nav-link" data-scroll-target="#installation">📦 Installation</a>
-  <ul class="collapse">
-  <li><a href="#requirements" id="toc-requirements" class="nav-link" data-scroll-target="#requirements">Requirements</a></li>
-  </ul></li>
-  <li><a href="#developer-guide" id="toc-developer-guide" class="nav-link" data-scroll-target="#developer-guide">🛠️ Developer Guide</a></li>
-  <li><a href="#documentation" id="toc-documentation" class="nav-link" data-scroll-target="#documentation">📚 Documentation</a></li>
-  <li><a href="#roadmap" id="toc-roadmap" class="nav-link" data-scroll-target="#roadmap">🗺️ Roadmap</a></li>
-  <li><a href="#license" id="toc-license" class="nav-link" data-scroll-target="#license">📄 License</a></li>
+  <li><a href="#synthetic-lineitem-data" id="toc-synthetic-lineitem-data" class="nav-link active" data-scroll-target="#synthetic-lineitem-data">1) Synthetic lineitem data</a></li>
+  <li><a href="#query-implementations-mxframe-polars-pandas" id="toc-query-implementations-mxframe-polars-pandas" class="nav-link" data-scroll-target="#query-implementations-mxframe-polars-pandas">2) Query implementations (MXFrame, Polars, Pandas)</a></li>
+  <li><a href="#baseline-previews" id="toc-baseline-previews" class="nav-link" data-scroll-target="#baseline-previews">3) Baseline previews</a></li>
+  <li><a href="#correctness-checks-q1-q6" id="toc-correctness-checks-q1-q6" class="nav-link" data-scroll-target="#correctness-checks-q1-q6">4) Correctness checks (Q1 + Q6)</a></li>
+  <li><a href="#benchmark-setup" id="toc-benchmark-setup" class="nav-link" data-scroll-target="#benchmark-setup">5) Benchmark setup</a></li>
+  <li><a href="#benchmark-q1-q6-cold-hot-polars" id="toc-benchmark-q1-q6-cold-hot-polars" class="nav-link" data-scroll-target="#benchmark-q1-q6-cold-hot-polars">6) Benchmark: Q1 + Q6 — Cold / Hot / Polars</a></li>
   </ul>
-<div class="toc-actions"><ul><li><a href="https://github.com/abhisheksreesaila/mxframe/issues/new" class="toc-action"><i class="bi bi-github"></i>Report an issue</a></li></ul></div><div class="quarto-alternate-formats"><h2>Other Formats</h2><ul><li><a href="index.html.md"><i class="bi bi-file-code"></i>CommonMark</a></li></ul></div></nav>
+<div class="toc-actions"><ul><li><a href="https://github.com/abhisheksreesaila/mxframe/issues/new" class="toc-action"><i class="bi bi-github"></i>Report an issue</a></li></ul></div><div class="quarto-alternate-formats"><h2>Other Formats</h2><ul><li><a href="bench_q1.html.md"><i class="bi bi-file-code"></i>CommonMark</a></li></ul></div></nav>
     </div>
 <!-- main -->
 <main class="content" id="quarto-document-content">
 
 <header id="title-block-header" class="quarto-title-block default">
 <div class="quarto-title">
-<h1 class="title">mxframe</h1>
+<h1 class="title">Phase 2 Benchmark: TPC-H Q1 + Q6</h1>
 </div>
 
 <div>
   <div class="description">
-    ⚡ Zero-copy bridge between PyArrow and MAX Engine — unlock GPU acceleration for your DataFrames.
+    Closeout benchmark for Phase 2 on active MXFrame lazy APIs.
   </div>
 </div>
 
@@ -254,176 +208,27 @@ pre > code.sourceCode > span > a:first-child::before { text-decoration: underlin
 
 
 <!-- WARNING: THIS FILE WAS AUTOGENERATED! DO NOT EDIT! -->
-<section id="vision" class="level2">
-<h2 class="anchored" data-anchor-id="vision">🎯 Vision</h2>
-<p><strong>mxframe</strong> bridges the gap between Python DataFrames and high-performance GPU compute. By leveraging PyArrow’s columnar memory format and MAX Engine’s accelerated kernels, we enable:</p>
+<section id="synthetic-lineitem-data" class="level2">
+<h2 class="anchored" data-anchor-id="synthetic-lineitem-data">1) Synthetic lineitem data</h2>
+</section>
+<section id="query-implementations-mxframe-polars-pandas" class="level2">
+<h2 class="anchored" data-anchor-id="query-implementations-mxframe-polars-pandas">2) Query implementations (MXFrame, Polars, Pandas)</h2>
+</section>
+<section id="baseline-previews" class="level2">
+<h2 class="anchored" data-anchor-id="baseline-previews">3) Baseline previews</h2>
+</section>
+<section id="correctness-checks-q1-q6" class="level2">
+<h2 class="anchored" data-anchor-id="correctness-checks-q1-q6">4) Correctness checks (Q1 + Q6)</h2>
+</section>
+<section id="benchmark-setup" class="level2">
+<h2 class="anchored" data-anchor-id="benchmark-setup">5) Benchmark setup</h2>
+</section>
+<section id="benchmark-q1-q6-cold-hot-polars" class="level2">
+<h2 class="anchored" data-anchor-id="benchmark-q1-q6-cold-hot-polars">6) Benchmark: Q1 + Q6 — Cold / Hot / Polars</h2>
 <ul>
-<li><strong>Zero-copy data sharing</strong> between PyArrow and MAX tensors</li>
-<li><strong>Seamless CPU/GPU execution</strong> with a unified API<br>
-</li>
-<li><strong>Production-ready performance</strong> without leaving Python</li>
+<li><strong>Cold</strong> = <code>clear_cache()</code> before every timed run (includes JIT compilation of MAX graph + Mojo kernels)</li>
+<li><strong>Hot</strong> = graph already compiled, reuse cached model (this is the steady-state for repeated queries)</li>
 </ul>
-<section id="whats-in-v0.0.1" class="level3">
-<h3 class="anchored" data-anchor-id="whats-in-v0.0.1">🚀 What’s in v0.0.1</h3>
-<p>This initial release provides a <strong>lazy DataFrame engine</strong> with compiled execution:</p>
-<table class="caption-top table">
-<colgroup>
-<col style="width: 40%">
-<col style="width: 59%">
-</colgroup>
-<thead>
-<tr class="header">
-<th>Feature</th>
-<th>Description</th>
-</tr>
-</thead>
-<tbody>
-<tr class="odd">
-<td><code>LazyFrame</code> class</td>
-<td>Lazy DataFrame backed by PyArrow with logical plan</td>
-</tr>
-<tr class="even">
-<td><code>col()</code> / <code>lit()</code></td>
-<td>Expression DSL for filters, projections, aggregations</td>
-</tr>
-<tr class="odd">
-<td>Filter / Join / GroupBy</td>
-<td>Core relational operators</td>
-</tr>
-<tr class="even">
-<td>Sort / Limit / Distinct</td>
-<td>Query shaping operators</td>
-</tr>
-<tr class="odd">
-<td>CPU &amp; GPU execution</td>
-<td><code>.compute(device="cpu")</code> or <code>device="gpu"</code></td>
-</tr>
-<tr class="even">
-<td>Custom Mojo kernels</td>
-<td>Compiled joins and aggregations via MAX Engine</td>
-</tr>
-</tbody>
-</table>
-</section>
-</section>
-<section id="quick-start" class="level2">
-<h2 class="anchored" data-anchor-id="quick-start">⚡ Quick Start</h2>
-<div id="02016d1e" class="cell">
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pyarrow <span class="im">as</span> pa</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> mxframe.lazy_expr <span class="im">import</span> col, lit</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="im">from</span> mxframe.lazy_frame <span class="im">import</span> LazyFrame</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Create a LazyFrame from a PyArrow table</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>table <span class="op">=</span> pa.table({</span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">'price'</span>: [<span class="fl">10.5</span>, <span class="fl">20.3</span>, <span class="fl">15.8</span>, <span class="fl">42.0</span>, <span class="fl">8.9</span>],</span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">'quantity'</span>: [<span class="dv">100</span>, <span class="dv">200</span>, <span class="dv">150</span>, <span class="dv">50</span>, <span class="dv">300</span>],</span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">'category'</span>: [<span class="st">'A'</span>, <span class="st">'B'</span>, <span class="st">'A'</span>, <span class="st">'B'</span>, <span class="st">'A'</span>],</span>
-<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>})</span>
-<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>lf <span class="op">=</span> LazyFrame(table)</span>
-<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co"># Filter + compute</span></span>
-<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> lf.<span class="bu">filter</span>(col(<span class="st">"price"</span>) <span class="op">&gt;</span> lit(<span class="fl">10.0</span>)).compute()</span>
-<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(result.to_pandas())</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<div class="cell-output cell-output-stdout">
-<pre><code>   price  quantity category
-0   10.5       100        A
-1   20.3       200        B
-2   15.8       150        A
-3   42.0        50        B</code></pre>
-</div>
-</div>
-<section id="groupby-aggregation" class="level3">
-<h3 class="anchored" data-anchor-id="groupby-aggregation">GroupBy + Aggregation</h3>
-<p>Lazy expressions for groupby aggregations:</p>
-<div id="ee2e36ce" class="cell">
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb3"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="co"># GroupBy aggregation</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> (</span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    lf.groupby(<span class="st">"category"</span>)</span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>      .agg(col(<span class="st">"price"</span>).<span class="bu">sum</span>().alias(<span class="st">"total_price"</span>),</span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>           col(<span class="st">"quantity"</span>).<span class="bu">sum</span>().alias(<span class="st">"total_qty"</span>))</span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>      .compute()</span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>)</span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(result.to_pandas())</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<div class="cell-output cell-output-stdout">
-<pre><code>  category  total_price  total_qty
-0        A    35.199997      550.0
-1        B    62.299999      250.0</code></pre>
-</div>
-</div>
-</section>
-<section id="join-sort-limit" class="level3">
-<h3 class="anchored" data-anchor-id="join-sort-limit">Join + Sort + Limit</h3>
-<p>Combine two tables with a join, then sort and limit:</p>
-<div id="fca5a61f" class="cell">
-<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb5"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Join two tables</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>orders <span class="op">=</span> pa.table({<span class="st">"oid"</span>: [<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>], <span class="st">"cid"</span>: [<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">10</span>], <span class="st">"amount"</span>: [<span class="fl">100.0</span>, <span class="fl">200.0</span>, <span class="fl">150.0</span>]})</span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>customers <span class="op">=</span> pa.table({<span class="st">"cid"</span>: [<span class="dv">10</span>, <span class="dv">20</span>], <span class="st">"name"</span>: [<span class="st">"Alice"</span>, <span class="st">"Bob"</span>]})</span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> (</span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    LazyFrame(orders)</span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    .join(LazyFrame(customers), on<span class="op">=</span><span class="st">"cid"</span>)</span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    .sort(<span class="st">"amount"</span>, descending<span class="op">=</span><span class="va">True</span>)</span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    .limit(<span class="dv">2</span>)</span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    .compute()</span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>)</span>
-<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="bu">print</span>(result.to_pandas())</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<div class="cell-output cell-output-stdout">
-<pre><code>   oid  cid  amount   name
-0    2   20   200.0    Bob
-1    3   10   150.0  Alice</code></pre>
-</div>
-</div>
-</section>
-</section>
-<section id="installation" class="level2">
-<h2 class="anchored" data-anchor-id="installation">📦 Installation</h2>
-<p>Install from <a href="https://pypi.org/project/mxframe/">PyPI</a>:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb7"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install mxframe</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<p>Or install latest from GitHub:</p>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install git+https://github.com/abhisheksreesaila/mxframe.git</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-<section id="requirements" class="level3">
-<h3 class="anchored" data-anchor-id="requirements">Requirements</h3>
-<ul>
-<li>Python 3.10+</li>
-<li>PyArrow</li>
-<li>MAX Engine SDK</li>
-</ul>
-</section>
-</section>
-<section id="developer-guide" class="level2">
-<h2 class="anchored" data-anchor-id="developer-guide">🛠️ Developer Guide</h2>
-<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Clone the repository</span></span>
-<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/abhisheksreesaila/mxframe.git</span>
-<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="bu">cd</span> mxframe</span>
-<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co"># Install in development mode</span></span>
-<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="ex">pip</span> install <span class="at">-e</span> .</span>
-<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="co"># Make changes under nbs/ directory, then compile</span></span>
-<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="ex">nbdev_prepare</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
-</section>
-<section id="documentation" class="level2">
-<h2 class="anchored" data-anchor-id="documentation">📚 Documentation</h2>
-<ul>
-<li><strong><a href="https://abhisheksreesaila.github.io/mxframe/">API Reference</a></strong> - Full documentation</li>
-<li><strong><a href="https://abhisheksreesaila.github.io/mxframe/core_bridge.html">Core Bridge</a></strong> - Zero-copy bridge internals</li>
-</ul>
-</section>
-<section id="roadmap" class="level2">
-<h2 class="anchored" data-anchor-id="roadmap">🗺️ Roadmap</h2>
-<ul class="task-list">
-<li><label><input type="checkbox" checked="">Lazy evaluation and query optimization</label></li>
-<li><label><input type="checkbox" checked="">Filter / Join / GroupBy / Sort / Limit / Distinct</label></li>
-<li><label><input type="checkbox" checked="">CPU &amp; GPU execution via MAX Engine</label></li>
-<li><label><input type="checkbox" checked="">Custom Mojo kernels for TPC-H queries</label></li>
-<li><label><input type="checkbox">Multi-threaded CPU execution</label></li>
-<li><label><input type="checkbox">Window functions</label></li>
-<li><label><input type="checkbox">I/O connectors (Parquet, CSV)</label></li>
-</ul>
-</section>
-<section id="license" class="level2">
-<h2 class="anchored" data-anchor-id="license">📄 License</h2>
-<p>Apache 2.0</p>
 
 
 </section>

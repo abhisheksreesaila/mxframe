@@ -1,11 +1,35 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
-    <loc>https://abhisheksreesaila.github.io/mxframe/core_bridge.html</loc>
-    <lastmod>2026-01-23T05:54:08.257Z</lastmod>
+    <loc>https://abhisheksreesaila.github.io/mxframe/index.html</loc>
+    <lastmod>2026-03-07T09:40:18.195Z</lastmod>
   </url>
   <url>
-    <loc>https://abhisheksreesaila.github.io/mxframe/index.html</loc>
-    <lastmod>2026-01-23T05:54:08.173Z</lastmod>
+    <loc>https://abhisheksreesaila.github.io/mxframe/lazy_expr.html</loc>
+    <lastmod>2026-03-07T09:40:18.078Z</lastmod>
+  </url>
+  <url>
+    <loc>https://abhisheksreesaila.github.io/mxframe/lazy_frame.html</loc>
+    <lastmod>2026-03-07T09:40:18.373Z</lastmod>
+  </url>
+  <url>
+    <loc>https://abhisheksreesaila.github.io/mxframe/bench_q1.html</loc>
+    <lastmod>2026-03-07T09:40:18.173Z</lastmod>
+  </url>
+  <url>
+    <loc>https://abhisheksreesaila.github.io/mxframe/bench_q3.html</loc>
+    <lastmod>2026-03-07T09:40:18.221Z</lastmod>
+  </url>
+  <url>
+    <loc>https://abhisheksreesaila.github.io/mxframe/bench_sort_limit_distinct.html</loc>
+    <lastmod>2026-03-07T09:40:18.143Z</lastmod>
+  </url>
+  <url>
+    <loc>https://abhisheksreesaila.github.io/mxframe/compiler.html</loc>
+    <lastmod>2026-03-07T09:40:19.643Z</lastmod>
+  </url>
+  <url>
+    <loc>https://abhisheksreesaila.github.io/mxframe/custom_ops.html</loc>
+    <lastmod>2026-03-07T09:40:43.042Z</lastmod>
   </url>
 </urlset>
