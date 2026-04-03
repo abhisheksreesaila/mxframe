@@ -39,6 +39,35 @@ def warmup(device: str = "auto"):
     CustomOpsCompiler(device=device)
 
 
+
+
+# ── I/O & conversion helpers (Phase 7) ─────────────────────── #
+
+import pyarrow.csv as _pa_csv
+import pyarrow.parquet as _pq
+
+
+def from_arrow(table) -> "LazyFrame":
+    return LazyFrame(Scan(table))
+
+
+def from_pandas(df) -> "LazyFrame":
+    import pandas as _pd
+    import pyarrow as _pa
+    return LazyFrame(Scan(_pa.Table.from_pandas(df, preserve_index=False)))
+
+
+def from_polars(df) -> "LazyFrame":
+    return LazyFrame(Scan(df.to_arrow()))
+
+
+def read_csv(path: str, **kwargs) -> "LazyFrame":
+    return LazyFrame(Scan(_pa_csv.read_csv(path, **kwargs)))
+
+
+def read_parquet(path: str, **kwargs) -> "LazyFrame":
+    return LazyFrame(Scan(_pq.read_table(path, **kwargs)))
+
 __all__ = [
     # lazy_expr
     "Expr", "col", "lit",
@@ -56,4 +85,6 @@ __all__ = [
     "CustomOpsCompiler", "KERNELS_PATH",
     # caching
     "clear_cache", "warmup",
+    # I/O
+    "from_arrow", "from_pandas", "from_polars", "read_csv", "read_parquet",
 ]

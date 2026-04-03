@@ -252,6 +252,20 @@ class LazyFrame:
         sub = list(subset) if subset else None
         return LazyFrame(Distinct(self.plan, sub))
 
+    def head(self, n: int = 5):
+        return self.limit(n)
+
+    def to_pandas(self):
+        return self.compute().to_pandas()
+
+    def to_polars(self):
+        import polars as pl
+        return pl.from_arrow(self.compute())
+
+    def to_arrow(self):
+        return self.compute()
+
+
     def to_gpu(self) -> 'GPUFrame':
         """Upload all numeric columns to GPU once and return a GPUFrame.
 
@@ -440,6 +454,17 @@ class GPUFrame:
     def to_arrow(self) -> pa.Table:
         """Alias for ``compute()`` — explicit pull of result to CPU."""
         return self.compute()
+
+    def head(self, n: int = 5):
+        return self.limit(n)
+
+    def to_pandas(self):
+        return self.compute().to_pandas()
+
+    def to_polars(self):
+        import polars as pl
+        return pl.from_arrow(self.compute())
+
 
     def __repr__(self) -> str:
         return (f"GPUFrame(rows={self._table.num_rows}, "

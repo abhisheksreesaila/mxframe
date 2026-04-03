@@ -892,57 +892,9 @@ class CustomOpsCompiler(GraphCompiler):
 
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
 
-    def _apply_distinct_custom(self, table: pa.Table, distinct_node: Distinct) -> pa.Table:
-        """Remove duplicate rows.
-
-        CPU: numpy sort + consecutive-diff mask -- no MAX Graph overhead.
-        GPU: Mojo sort_indices + unique_mask kernels, models cached by N.
-        """
+    def _apply_distinct_custom(self, table, distinct_node):
         cols = distinct_node.subset or table.column_names
-        by_exprs = [Expr("col", c) for c in cols]
-        desc = [False] * len(cols)
-        composite_key = self._encode_sort_key(table, by_exprs, desc)
-        N = len(composite_key)
-
-        if self._session_device != "gpu":
-            # CPU fast path: pure numpy, no graph compilation
-            sort_order = np.argsort(composite_key, kind='stable')
-            sorted_key = composite_key[sort_order]
-            first = np.empty(N, dtype=bool)
-            first[0] = True
-            first[1:] = sorted_key[1:] != sorted_key[:-1]
-            keep = sort_order[first]
-            return table.take(pa.array(keep.astype(np.int64)))
-        else:
-            # GPU path: Mojo kernels, models cached by N
-            sort_node_tmp = Sort(Scan(table), by_exprs, desc)
-            sorted_table = self._apply_sort_custom(table, sort_node_tmp)
-            sorted_key = self._encode_sort_key(sorted_table, by_exprs, desc)
-
-            cache_key = ("unique_mask", N, self._session_device)
-            model = _POST_OP_MODEL_CACHE.get(cache_key)
-            if model is None:
-                key_type = TensorType(DType.int32, [N], self._device_ref)
-                graph = Graph(
-                    name="mxframe_unique",
-                    input_types=[key_type],
-                    custom_extensions=[Path(self.kernels_path)],
-                )
-                with graph:
-                    mask = ops.custom(
-                        name="unique_mask",
-                        values=[graph.inputs[0]],
-                        out_types=[TensorType(DType.int32, [N], self._device_ref)],
-                        device=self._device_ref,
-                    )[0]
-                    graph.output(mask)
-                model = self.session.load(graph)
-                _POST_OP_MODEL_CACHE[cache_key] = model
-
-            k_buf = driver.Buffer.from_numpy(sorted_key).to(self._gpu_driver)
-            (out_mask,) = model.execute(k_buf)
-            mask_np = np.asarray(out_mask.to_numpy()).reshape(-1).astype(bool)
-            return sorted_table.filter(pa.array(mask_np))
+        return table.group_by(cols).aggregate([])
 
     def _apply_post_ops_custom(self, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct using Mojo kernels (not PyArrow compute)."""
