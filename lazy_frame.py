@@ -4,7 +4,7 @@
 
 # %% auto 0
 __all__ = ['DeviceType', 'LogicalPlan', 'Scan', 'Filter', 'Project', 'Aggregate', 'Sort', 'Limit', 'Distinct', 'Join',
-           'LazyFrame', 'LazyGroupBy']
+           'LazyFrame', 'LazyGroupBy', 'GPUFrame']
 
 # %% ../nbs/02_lazy_frame.ipynb 2
 from typing import Any, List, Literal, Optional, Union, Dict
@@ -252,6 +252,51 @@ class LazyFrame:
         sub = list(subset) if subset else None
         return LazyFrame(Distinct(self.plan, sub))
 
+    def to_gpu(self) -> 'GPUFrame':
+        """Upload all numeric columns to GPU once and return a GPUFrame.
+
+        The GPUFrame holds the device buffers in the module-level
+        ``_GPU_BUFFER_CACHE`` so that every subsequent ``.compute()`` call
+        on the same underlying data skips the PCIe transfer entirely.
+
+        Raises ``RuntimeError`` if no GPU is available.
+        """
+        from .custom_ops import CustomOpsCompiler, _GPU_BUFFER_CACHE
+        from max import driver
+        import pyarrow as pa
+        import numpy as np
+        from pathlib import Path
+
+        compiler_inst = CustomOpsCompiler(device="gpu")
+
+        # Warm the GPU buffer cache by converting and uploading all numeric columns.
+        table = self.plan.table if hasattr(self.plan, 'table') else None
+        if table is None:
+            raise ValueError("to_gpu() requires a LazyFrame built directly from a pa.Table (no prior transforms).")
+
+        col_names = []
+        gpu_bufs: Dict[str, Any] = {}
+        for name in table.column_names:
+            col = table.column(name)
+            if isinstance(col, pa.ChunkedArray):
+                col = col.combine_chunks()
+            np_arr, _, _ = compiler_inst._column_to_numpy_cached(col)
+            if np_arr is None:
+                continue
+            np_arr = compiler_inst._normalize_numeric_dtype(np_arr)
+            if np_arr is None:
+                continue
+            col_names.append(name)
+            gpu_buf, _ = compiler_inst._to_gpu_input(np_arr)
+            gpu_bufs[name] = gpu_buf
+
+        # Store under a stable key (no filter, no plan-specific signature)
+        # so filter variations all reuse these buffers.
+        stable_key = (id(table), table.num_rows, tuple(col_names), "gpu")
+        _GPU_BUFFER_CACHE[stable_key] = gpu_bufs
+
+        return GPUFrame(table, _compiler=compiler_inst)
+
 
     def join(self, other, *, on=None, left_on=None, right_on=None, how="inner"):
         """Inner join with another LazyFrame.
@@ -320,6 +365,103 @@ def _format_plan(plan: LogicalPlan, indent: int = 0) -> str:
         right = _format_plan(plan.right, indent + 1)
         return "\n".join([head, left, right])
     return f"{pad}{type(plan).__name__}"
+
+
+class GPUFrame:
+    """A GPU-resident DataFrame that holds column buffers on the device.
+
+    Created via ``LazyFrame.to_gpu()`` — uploads all numeric columns once and
+    keeps the device buffers alive across multiple ``.compute()`` calls.
+    Subsequent queries on the same data skip the PCIe upload entirely because
+    the ``_GPU_BUFFER_CACHE`` already contains the buffers.
+
+    Usage::
+
+        gdf = df.to_gpu()                          # upload once
+        result1 = gdf.filter(col('a') > 5)\\
+                      .groupby('dept').agg(col('salary').sum())\\
+                      .compute()                   # no upload
+        result2 = gdf.filter(col('a') > 10)\\
+                      .groupby('dept').agg(col('salary').mean())\\
+                      .compute()                   # still no upload
+
+    The wrapped ``LazyFrame`` API (``filter``, ``select``, ``groupby``,
+    ``sort``, ``limit``, ``distinct``, ``join``) is fully supported.
+    Call ``.to_arrow()`` on any result to get a ``pa.Table``.
+    """
+
+    def __init__(self, table: pa.Table, _compiler=None):
+        """Do not call directly — use ``LazyFrame.to_gpu()``."""
+        self._table = table
+        self._lf = LazyFrame(table)
+        self._compiler = _compiler  # CustomOpsCompiler with warm session + pre-cached buffers
+
+    # ── Lazy plan builders (delegate to wrapped LazyFrame) ──────────
+
+    def filter(self, predicate) -> 'GPUFrame':
+        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.filter(predicate))
+
+    def select(self, *exprs) -> 'GPUFrame':
+        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.select(*exprs))
+
+    def sort(self, *by, descending=False) -> 'GPUFrame':
+        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.sort(*by, descending=descending))
+
+    def limit(self, n: int) -> 'GPUFrame':
+        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.limit(n))
+
+    def distinct(self, subset=None) -> 'GPUFrame':
+        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.distinct(subset))
+
+    def groupby(self, *by) -> 'LazyGroupBy':
+        return _GPUGroupBy(self, [col(b) if isinstance(b, str) else b for b in by])
+
+    def __with_lf(self, lf: 'LazyFrame') -> 'GPUFrame':
+        gf = GPUFrame(self._table, self._compiler)
+        gf._lf = lf
+        return gf
+
+    # ── Execution ────────────────────────────────────────────────────
+
+    def compute(self, verbose: bool = False, optimize: bool = True,
+                validate: bool = True) -> pa.Table:
+        """Execute the plan on GPU, reusing cached device buffers.
+
+        Always runs on ``device='gpu'``; raises ``RuntimeError`` if no GPU
+        is available.
+        """
+        return self._lf.compute(
+            device="gpu",
+            verbose=verbose,
+            optimize=optimize,
+            validate=validate,
+        )
+
+    def to_arrow(self) -> pa.Table:
+        """Alias for ``compute()`` — explicit pull of result to CPU."""
+        return self.compute()
+
+    def __repr__(self) -> str:
+        return (f"GPUFrame(rows={self._table.num_rows}, "
+                f"cols={self._table.column_names})")
+
+
+class _GPUGroupBy:
+    """Intermediate groupby object for GPUFrame."""
+
+    def __init__(self, gf: GPUFrame, by):
+        self._gf = gf
+        self._by = by
+
+    def agg(self, *aggs) -> GPUFrame:
+        lf_agg = LazyFrame(Aggregate(self._gf._lf.plan, self._by, list(aggs)))
+        return self._gf.__class__(self._gf._table, self._gf._compiler).__with_lf_direct(lf_agg)
+
+    def __with_lf_direct(self, lf) -> 'GPUFrame':
+        gf = GPUFrame(self._gf._table, self._gf._compiler)
+        gf._lf = lf
+        return gf
+
 
 
 

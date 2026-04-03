@@ -17,7 +17,7 @@ from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join
-from .compiler import GraphCompiler, _max_dtype
+from .compiler import GraphCompiler, _max_dtype, _CMP_OPS
 
 
 # %% ../nbs/04_custom_ops.ipynb 4
@@ -42,6 +42,7 @@ _MODEL_CACHE: Dict[tuple, tuple] = {}     # cache_key → (model, agg_names)
 _GROUP_ENCODE_CACHE: Dict[tuple, tuple] = {}  # (table_id, num_rows, keys) → encoding result
 _INPUT_PREP_CACHE: Dict[tuple, dict] = {}    # (table_id, num_rows, plan_sig, device) → prepared arrays
 _POST_OP_MODEL_CACHE: Dict[tuple, Any] = {}  # ("sort_indices"|"unique_mask", N, device) → model  (GPU only)
+_GPU_BUFFER_CACHE: Dict[tuple, Dict[str, Any]] = {}  # prep_key → {col_name: driver.Buffer} (stable inputs only, never __filter_mask__)
 
 
 def _get_or_create_session(device_name: str, driver_device) -> Any:
@@ -62,6 +63,7 @@ def clear_cache():
     _GROUP_ENCODE_CACHE.clear()
     _INPUT_PREP_CACHE.clear()
     _POST_OP_MODEL_CACHE.clear()
+    _GPU_BUFFER_CACHE.clear()
 
 
 class CustomOpsCompiler(GraphCompiler):
@@ -208,6 +210,51 @@ class CustomOpsCompiler(GraphCompiler):
             contiguous = np.ascontiguousarray(arr)
             return driver.Buffer.from_numpy(contiguous).to(self._gpu_driver), "from_numpy_contiguous"
 
+    @classmethod
+    def _can_compile_predicate_gpu(cls, expr: Expr) -> bool:
+        """Return True if this predicate can be compiled to a MAX Graph int32 mask node.
+
+        Supports numeric col references, numeric literals, and gt/ge/lt/le/eq/and/or
+        combinations. String columns, nulls, and non-comparison ops are not supported.
+        """
+        op = expr.op
+        if op == "col":
+            return True
+        if op == "lit":
+            return isinstance(expr.args[0], (int, float, bool))
+        if op in ("gt", "ge", "lt", "le", "eq", "and", "or"):
+            return all(cls._can_compile_predicate_gpu(a) for a in expr.args)
+        return False
+
+    def _visit_predicate_to_mask(self, expr: Expr, nodes) -> Any:
+        """Compile a filter predicate Expr into an int32 mask graph node (0=skip, 1=keep).
+
+        Called inside a MAX Graph context. The returned node has dtype int32 and
+        the same shape as the input column tensors.
+        """
+        op = expr.op
+        if op in ("gt", "ge", "lt", "le", "eq"):
+            lhs = self._visit_expr(expr.args[0], nodes)
+            rhs = self._visit_expr(expr.args[1], nodes)
+            return ops.cast(_CMP_OPS[op](lhs, rhs), DType.int32)
+        if op == "and":
+            l = self._visit_predicate_to_mask(expr.args[0], nodes)
+            r = self._visit_predicate_to_mask(expr.args[1], nodes)
+            return ops.mul(l, r)
+        if op == "or":
+            l = self._visit_predicate_to_mask(expr.args[0], nodes)
+            r = self._visit_predicate_to_mask(expr.args[1], nodes)
+            zero = ops.constant(0, dtype=DType.int32, device=self._device_ref)
+            return ops.cast(ops.greater(ops.add(l, r), zero), DType.int32)
+        if op == "col":
+            return ops.cast(nodes[expr.args[0]], DType.int32)
+        if op == "lit":
+            val = expr.args[0]
+            if isinstance(val, int):
+                return ops.constant(val, dtype=DType.int64, device=self._device_ref)
+            return ops.constant(float(val), dtype=DType.float32, device=self._device_ref)
+        raise ValueError(f"Cannot compile predicate op '{op}' to GPU mask.")
+
     def _compute_cache_key(self, plan, all_names, all_arrays, n_groups, optimizer_trace=None):
         """Compute a hashable cache key for the compiled graph model.
 
@@ -309,12 +356,31 @@ class CustomOpsCompiler(GraphCompiler):
                 print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
             return result
 
-        # 1 -- Check input-prep cache (fastest path) ------------------
+        # 1 -- Resolve plan, predicates, and decide execution path -----
         original_scan = self._find_scan(plan)
         plan_clean = self._strip_filter_nodes(plan)
-        prep_key = (id(original_scan.table), original_scan.table.num_rows,
-                    plan_clean.signature(), self._session_device)
+        predicates = self._collect_predicates(plan)
 
+        # GPU filter path: when on GPU and ALL predicates are numeric comparisons,
+        # skip per-column CPU boolean-indexing. Upload full (unfiltered) arrays once
+        # and cache them; pass a small int32 mask per query. The compiled MAX Graph
+        # is reused across all filter values on the same table.
+        on_gpu = (self._session_device == "gpu") or (
+            self._device_arg == "auto" and self._has_gpu
+            and original_scan.table.num_rows > AUTO_GPU_THRESHOLD
+        )
+        use_gpu_filter = (
+            on_gpu
+            and bool(predicates)
+            and all(self._can_compile_predicate_gpu(p) for p in predicates)
+        )
+
+        # pred_sig is empty for GPU filter path: graph is reused across filter values.
+        pred_sig = () if use_gpu_filter else tuple(p.signature() for p in predicates)
+        prep_key = (id(original_scan.table), original_scan.table.num_rows,
+                    plan_clean.signature(), pred_sig, self._session_device)
+
+        # 2 -- Check input-prep cache (fastest main path) --------------
         cached_prep = _INPUT_PREP_CACHE.get(prep_key)
         if cached_prep is not None:
             col_names = cached_prep['col_names']
@@ -324,78 +390,122 @@ class CustomOpsCompiler(GraphCompiler):
             unique_key_cols = cached_prep['unique_key_cols']
             group_keys = cached_prep['group_keys']
             N = cached_prep['N']
+            _group_ids_full = cached_prep.get('_group_ids_full')
             self._N = N
             self._maybe_switch_device(N)
         else:
-            # 2 -- Pre-encode group keys on ORIGINAL table (cached) ----
-            predicates = self._collect_predicates(plan)
+            # 3 -- Pre-encode group keys on ORIGINAL table (cached) ----
             agg_node = self._find_aggregate(plan_clean)
             group_keys = []
             n_groups = 0
             unique_key_cols = {}
             group_ids_full = None
+            _group_ids_full = None
 
             if agg_node is not None and agg_node.group_by:
                 group_keys = [e.args[0] for e in agg_node.group_by]
                 group_ids_full, n_groups, unique_key_cols = self._build_group_ids_cached(
-                    original_scan.table, group_keys
+                    original_scan.table, group_keys, gpu_compiler=self
                 )
 
-            # 3 -- Compute filter mask (numpy boolean) -----------------
-            mask_np = None
-            if predicates:
-                combined = None
-                for pred in predicates:
-                    m = self._eval_predicate(pred, original_scan.table)
-                    combined = m if combined is None else pc.and_(combined, m)
-                mask_np = combined.to_numpy(zero_copy_only=False)
+            if use_gpu_filter:
+                # 4a -- GPU filter path: full arrays, no per-column CPU copy ----
+                # Columns are uploaded once and cached on GPU. Only the int32 mask
+                # (computed from the predicate) changes per query.
+                N = original_scan.table.num_rows
+                self._N = N
+                self._maybe_switch_device(N)
+                extra_inputs = {}
+                if group_ids_full is not None:
+                    extra_inputs["__group_ids__"] = group_ids_full
+                col_names = []
+                col_arrays = {}
+                for name in original_scan.table.column_names:
+                    if not self._is_numeric_arrow_type(
+                        original_scan.table.schema.field(name).type
+                    ):
+                        continue
+                    np_arr, _, _ = self._column_to_numpy_cached(original_scan.table.column(name))
+                    if np_arr is None:
+                        continue
+                    col_names.append(name)
+                    col_arrays[name] = np_arr
+                _group_ids_full = group_ids_full
+                _INPUT_PREP_CACHE[prep_key] = {
+                    'col_names': col_names, 'col_arrays': col_arrays,
+                    'extra_inputs': extra_inputs, 'n_groups': n_groups,
+                    'unique_key_cols': unique_key_cols, 'group_keys': group_keys,
+                    'N': N, '_group_ids_full': group_ids_full,
+                }
+            else:
+                # 4b -- Standard CPU filter path -----------------------
+                mask_np = None
+                if predicates:
+                    combined = None
+                    for pred in predicates:
+                        m = self._eval_predicate(pred, original_scan.table)
+                        combined = m if combined is None else pc.and_(combined, m)
+                    mask_np = combined.to_numpy(zero_copy_only=False)
 
-            # 4 -- Apply mask + convert numeric columns to numpy -------
-            N = int(mask_np.sum()) if mask_np is not None else original_scan.table.num_rows
-            self._N = N
-            self._maybe_switch_device(N)
+                N = int(mask_np.sum()) if mask_np is not None else original_scan.table.num_rows
+                self._N = N
+                self._maybe_switch_device(N)
 
-            extra_inputs = {}
-            if group_ids_full is not None:
-                gids = group_ids_full[mask_np] if mask_np is not None else group_ids_full
-                if mask_np is not None:
-                    groups_present = np.zeros(n_groups, dtype=bool)
-                    groups_present[gids] = True
-                    if not groups_present.all():
-                        present_idx = np.where(groups_present)[0]
-                        remap = np.empty(n_groups, dtype=np.int32)
-                        remap[present_idx] = np.arange(len(present_idx), dtype=np.int32)
-                        gids = remap[gids]
-                        n_groups = len(present_idx)
-                        unique_key_cols = {
-                            k: v.take(pa.array(present_idx.astype(np.int64)))
-                            for k, v in unique_key_cols.items()
-                        }
-                extra_inputs["__group_ids__"] = gids
+                extra_inputs = {}
+                if group_ids_full is not None:
+                    gids = group_ids_full[mask_np] if mask_np is not None else group_ids_full
+                    if mask_np is not None:
+                        groups_present = np.zeros(n_groups, dtype=bool)
+                        groups_present[gids] = True
+                        if not groups_present.all():
+                            present_idx = np.where(groups_present)[0]
+                            remap = np.empty(n_groups, dtype=np.int32)
+                            remap[present_idx] = np.arange(len(present_idx), dtype=np.int32)
+                            gids = remap[gids]
+                            n_groups = len(present_idx)
+                            unique_key_cols = {
+                                k: v.take(pa.array(present_idx.astype(np.int64)))
+                                for k, v in unique_key_cols.items()
+                            }
+                    extra_inputs["__group_ids__"] = gids
 
-            col_names = []
-            col_arrays = {}
-            for name in original_scan.table.column_names:
-                if not self._is_numeric_arrow_type(original_scan.table.schema.field(name).type):
-                    continue
-                np_arr, _, _ = self._column_to_numpy_cached(original_scan.table.column(name))
-                if np_arr is None:
-                    continue
-                if mask_np is not None:
-                    np_arr = np_arr[mask_np]
-                col_names.append(name)
-                col_arrays[name] = np_arr
+                col_names = []
+                col_arrays = {}
+                for name in original_scan.table.column_names:
+                    if not self._is_numeric_arrow_type(
+                        original_scan.table.schema.field(name).type
+                    ):
+                        continue
+                    np_arr, _, _ = self._column_to_numpy_cached(original_scan.table.column(name))
+                    if np_arr is None:
+                        continue
+                    if mask_np is not None:
+                        np_arr = np_arr[mask_np]
+                    col_names.append(name)
+                    col_arrays[name] = np_arr
 
-            # Store in input-prep cache
-            _INPUT_PREP_CACHE[prep_key] = {
-                'col_names': col_names, 'col_arrays': col_arrays,
-                'extra_inputs': extra_inputs, 'n_groups': n_groups,
-                'unique_key_cols': unique_key_cols, 'group_keys': group_keys,
-                'N': N,
-            }
+                _INPUT_PREP_CACHE[prep_key] = {
+                    'col_names': col_names, 'col_arrays': col_arrays,
+                    'extra_inputs': extra_inputs, 'n_groups': n_groups,
+                    'unique_key_cols': unique_key_cols, 'group_keys': group_keys,
+                    'N': N,
+                }
+
+        # GPU filter path: compute fresh int32 mask per query (query-specific, not cached).
+        # The mask is small relative to column data; stable columns are reused from cache.
+        mask_np_int32 = None
+        if use_gpu_filter and predicates:
+            combined_pred = predicates[0]
+            for p in predicates[1:]:
+                combined_pred = Expr("and", combined_pred, p)
+            arrow_mask = self._eval_predicate(combined_pred, original_scan.table)
+            mask_np_int32 = arrow_mask.to_numpy(zero_copy_only=False).astype(np.int32)
 
         all_names = col_names + list(extra_inputs.keys())
         all_arrays = {**col_arrays, **extra_inputs}
+        if mask_np_int32 is not None:
+            all_names = all_names + ["__filter_mask__"]
+            all_arrays["__filter_mask__"] = mask_np_int32
 
         # 5 -- Graph cache lookup --------------------------------------
         cache_key = self._compute_cache_key(
@@ -434,17 +544,33 @@ class CustomOpsCompiler(GraphCompiler):
             _MODEL_CACHE[cache_key] = (model, agg_names)
             t_compile = _time.perf_counter()
 
-        # 6 -- Execute -------------------------------------------------
+        # 6 -- Execute (with GPU buffer cache) ------------------------
+        # Stable inputs (everything except __filter_mask__) are cached as
+        # driver.Buffer objects so repeated queries on the same data skip
+        # the PCIe upload entirely. __filter_mask__ is query-specific and
+        # always re-uploaded (it is small: N * 4 bytes).
         gpu_input_path = "cpu_numpy"
         if self._session_device == "gpu":
+            stable_names = [n for n in all_names if n != "__filter_mask__"]
+            cached_bufs = _GPU_BUFFER_CACHE.get(prep_key)
             execute_inputs = []
-            gpu_paths = []
-            for n in all_names:
-                gpu_in, path_used = self._to_gpu_input(all_arrays[n])
-                execute_inputs.append(gpu_in)
-                gpu_paths.append(path_used)
-            if gpu_paths:
-                gpu_input_path = gpu_paths[0] if len(set(gpu_paths)) == 1 else "mixed"
+            if cached_bufs is not None and all(n in cached_bufs for n in stable_names):
+                for n in all_names:
+                    if n == "__filter_mask__":
+                        mask_buf, _ = self._to_gpu_input(all_arrays[n])
+                        execute_inputs.append(mask_buf)
+                    else:
+                        execute_inputs.append(cached_bufs[n])
+                gpu_input_path = "gpu_cached"
+            else:
+                new_bufs: Dict[str, Any] = {}
+                for n in all_names:
+                    gpu_buf, path_used = self._to_gpu_input(all_arrays[n])
+                    execute_inputs.append(gpu_buf)
+                    if n != "__filter_mask__":
+                        new_bufs[n] = gpu_buf
+                _GPU_BUFFER_CACHE[prep_key] = new_bufs
+                gpu_input_path = "uploaded"
         else:
             execute_inputs = [all_arrays[n] for n in all_names]
 
@@ -474,12 +600,23 @@ class CustomOpsCompiler(GraphCompiler):
             "gpu_input_path": gpu_input_path,
             "optimizer_trace": list(optimizer_trace or []),
             "path": "compiled",
+            "gpu_filter": use_gpu_filter,
         }
 
-        # 7 -- Assemble output -----------------------------------------
+        # 7 -- Assemble output ----------------------------------------
         agg_arrays = [pa.array(np.asarray(t.to_numpy()).reshape(-1)) for t in output_vals]
 
         if unique_key_cols:
+            if (use_gpu_filter and group_keys
+                    and mask_np_int32 is not None and _group_ids_full is not None):
+                # Groups whose rows were all masked out produce silent zeros in the
+                # kernel output. Remove them so they don't appear in the result.
+                surviving = np.zeros(n_groups, dtype=bool)
+                surviving[_group_ids_full[mask_np_int32.astype(bool)]] = True
+                if not surviving.all():
+                    surv_filter = pa.array(surviving)
+                    unique_key_cols = {k: v.filter(surv_filter) for k, v in unique_key_cols.items()}
+                    agg_arrays = [arr.filter(surv_filter) for arr in agg_arrays]
             key_arrays = [unique_key_cols[k] for k in group_keys]
             result = pa.Table.from_arrays(key_arrays + agg_arrays, names=group_keys + agg_names)
         else:
@@ -523,7 +660,23 @@ class CustomOpsCompiler(GraphCompiler):
         for i, expr in enumerate(plan.aggs):
             name = expr._alias or f'agg_{i}'
             if grouped and n_groups > 0:
-                gid_node = ops.cast(upstream["__group_ids__"], DType.int32)
+                gid_raw = ops.cast(upstream["__group_ids__"], DType.int32)
+
+                if "__filter_mask__" in upstream:
+                    # GPU filter path: encode filtered-out rows as gid = -1.
+                    # Existing kernels already check `gid >= 0`, so they naturally
+                    # skip rows where the predicate is false — no kernel changes needed.
+                    # Formula: effective_gid = (gid + 1) * mask - 1
+                    #   mask=1 → (gid+1)*1 - 1 = gid  (process)
+                    #   mask=0 → (gid+1)*0 - 1 = -1   (skip)
+                    mask_i32 = ops.cast(upstream["__filter_mask__"], DType.int32)
+                    one = ops.constant(1, dtype=DType.int32, device=self._device_ref)
+                    gid_node = ops.sub(
+                        ops.mul(ops.add(gid_raw, one), mask_i32),
+                        one,
+                    )
+                else:
+                    gid_node = gid_raw
 
                 # Both GPU and CPU kernels write final aggregated results directly
                 # to an output tensor of shape [n_groups] using atomic adds.
@@ -639,6 +792,7 @@ class CustomOpsCompiler(GraphCompiler):
         if self._session_device != "gpu":
             # CPU fast path: numpy argsort, no graph compilation
             sorted_indices = np.argsort(composite_key, kind='stable')
+            return table.take(pa.array(sorted_indices.astype(np.int64)))
         else:
             # GPU path: Mojo bitonic sort, model cached by N
             cache_key = ("sort_indices", N, self._session_device)
@@ -665,9 +819,78 @@ class CustomOpsCompiler(GraphCompiler):
             k_buf = driver.Buffer.from_numpy(composite_key).to(self._gpu_driver)
             f_buf = driver.Buffer.from_numpy(desc_flag).to(self._gpu_driver)
             (out_idx,) = model.execute(k_buf, f_buf)
-            sorted_indices = np.asarray(out_idx.to_numpy()).reshape(-1)
+            # sorted_indices stays on GPU; use gather_f32/gather_i32 kernels
+            # per column to reorder rows without pulling indices back to CPU.
+            # Falls back to CPU Arrow.take for non-float32/int32 columns.
+            return self._gpu_gather_table(table, out_idx, N)
 
-        return table.take(pa.array(sorted_indices.astype(np.int64)))
+    def _gpu_gather_table(self, table: pa.Table, idx_tensor, N: int) -> pa.Table:
+        """Gather rows of `table` using an index tensor already on GPU.
+
+        For float32 and int32 columns the gather runs on GPU via the
+        `gather_f32` / `gather_i32` Mojo kernels.  All other column types
+        (strings, dates, booleans, etc.) fall back to a single CPU Arrow.take
+        after reading the index tensor once.
+
+        `idx_tensor` is the raw MAX output tensor (still on GPU).
+        `N` is the number of rows in `table` (= len(idx_tensor)).
+        """
+        # Compile / cache a single-column gather model for this N
+        def _get_gather_model(dtype_key: str, mojo_name: str, arr_dtype: DType):
+            ck = (mojo_name, N, self._session_device)
+            m = _POST_OP_MODEL_CACHE.get(ck)
+            if m is None:
+                val_type = TensorType(arr_dtype, [N], self._device_ref)
+                idx_type = TensorType(DType.int32, [N], self._device_ref)
+                g = Graph(
+                    name=f"mxframe_{mojo_name}",
+                    input_types=[val_type, idx_type],
+                    custom_extensions=[Path(self.kernels_path)],
+                )
+                with g:
+                    out = ops.custom(
+                        name=mojo_name,
+                        values=[g.inputs[0], g.inputs[1]],
+                        out_types=[TensorType(arr_dtype, [N], self._device_ref)],
+                        device=self._device_ref,
+                    )[0]
+                    g.output(out)
+                m = self.session.load(g)
+                _POST_OP_MODEL_CACHE[ck] = m
+            return m
+
+        # Upload index once and reuse the buffer across all columns
+        idx_np = np.asarray(idx_tensor.to_numpy()).reshape(-1).astype(np.int32)
+        idx_buf = driver.Buffer.from_numpy(idx_np).to(self._gpu_driver)
+
+        gathered_arrays = []
+        gathered_names = []
+        cpu_fallback_needed = False
+        cpu_fallback_indices = idx_np  # read back only if needed
+
+        for col_name in table.column_names:
+            col = table.column(col_name)
+            if isinstance(col, pa.ChunkedArray):
+                col = col.combine_chunks()
+
+            if pa.types.is_float32(col.type):
+                np_col = col.to_numpy(zero_copy_only=False).astype(np.float32)
+                model = _get_gather_model("f32", "gather_f32", DType.float32)
+                col_buf = driver.Buffer.from_numpy(np_col).to(self._gpu_driver)
+                (out_t,) = model.execute(col_buf, idx_buf)
+                gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
+            elif pa.types.is_integer(col.type):
+                np_col = col.to_numpy(zero_copy_only=False).astype(np.int32)
+                model = _get_gather_model("i32", "gather_i32", DType.int32)
+                col_buf = driver.Buffer.from_numpy(np_col).to(self._gpu_driver)
+                (out_t,) = model.execute(col_buf, idx_buf)
+                gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
+            else:
+                # Non-numeric column: fall back to Arrow.take (index already on CPU)
+                gathered_arrays.append(col.take(pa.array(idx_np.astype(np.int64))))
+            gathered_names.append(col_name)
+
+        return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
 
     def _apply_distinct_custom(self, table: pa.Table, distinct_node: Distinct) -> pa.Table:
         """Remove duplicate rows.
@@ -1108,14 +1331,117 @@ class CustomOpsCompiler(GraphCompiler):
         return dense_ids, n_groups, unique_key_cols
 
     @staticmethod
-    def _build_group_ids_cached(table, keys):
-        """Cached wrapper: reuses group encoding when the same table object is queried."""
+    def _build_group_ids_cached(table, keys, gpu_compiler=None):
+        """Cached wrapper: reuses group encoding when the same table object is queried.
+
+        When `gpu_compiler` is provided and the table has an integer single-key column,
+        uses the GPU group_encode kernel so the dictionary_encode + np.unique CPU pass
+        is replaced by a single GPU hash-table scan.
+
+        For multi-key or non-integer columns the CPU path is always used (the composite
+        key is built via dictionary_encode strides before dispatching to either path).
+        """
         cache_key = (id(table), table.num_rows, tuple(keys))
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
+
+        # GPU path: single integer key column, GPU available
+        if (gpu_compiler is not None
+                and gpu_compiler._session_device == "gpu"
+                and len(keys) == 1):
+            col_arr = table.column(keys[0])
+            if isinstance(col_arr, pa.ChunkedArray):
+                col_arr = col_arr.combine_chunks()
+            if pa.types.is_integer(col_arr.type):
+                result = gpu_compiler._build_group_ids_gpu_single_int(
+                    col_arr, keys[0], table.num_rows
+                )
+                if result is not None:
+                    _GROUP_ENCODE_CACHE[cache_key] = result
+                    return result
+
         result = CustomOpsCompiler._build_group_ids(table, keys)
         _GROUP_ENCODE_CACHE[cache_key] = result
         return result
+
+    def _build_group_ids_gpu_single_int(self, col_arr, key_name, n_rows):
+        """GPU group encoding for a single integer key column via group_encode kernel.
+
+        Returns (dense_ids, n_groups, unique_key_cols) matching _build_group_ids output,
+        or None if the kernel call fails (falls back to CPU path).
+
+        Hash table capacity = next power of two >= 4 * n_distinct_estimate.
+        We conservatively use 2 * n_rows (over-estimates, wastes some VRAM, but always safe).
+        """
+        import math as _math
+        try:
+            keys_np = col_arr.to_numpy(zero_copy_only=False).astype(np.int32)
+            n = len(keys_np)
+            if n == 0:
+                return np.array([], dtype=np.int32), 0, {key_name: pa.array([], type=pa.int32())}
+
+            # Capacity: next power of two >= 2*n (load factor = 0.5)
+            cap = 1
+            while cap < 2 * n:
+                cap *= 2
+
+            capacity_np = np.array([cap], dtype=np.int32)
+            key_table_np = np.full(cap, -2147483648, dtype=np.int32)  # INT32_MIN sentinel
+            id_table_np = np.full(cap, -1, dtype=np.int32)
+
+            cache_key = ("group_encode", n, cap, self._session_device)
+            model = _POST_OP_MODEL_CACHE.get(cache_key)
+            if model is None:
+                k_type = TensorType(DType.int32, [n], self._device_ref)
+                cap_type = TensorType(DType.int32, [1], self._device_ref)
+                kt_type = TensorType(DType.int32, [cap], self._device_ref)
+                graph = Graph(
+                    name="mxframe_group_encode",
+                    input_types=[k_type, cap_type, kt_type, kt_type],
+                    custom_extensions=[Path(self.kernels_path)],
+                )
+                with graph:
+                    gids_node, ng_node, _, _ = ops.custom(
+                        name="group_encode",
+                        values=[graph.inputs[0], graph.inputs[1],
+                                graph.inputs[2], graph.inputs[3]],
+                        out_types=[
+                            TensorType(DType.int32, [n], self._device_ref),
+                            TensorType(DType.int32, [1], self._device_ref),
+                            TensorType(DType.int32, [cap], self._device_ref),
+                            TensorType(DType.int32, [cap], self._device_ref),
+                        ],
+                        device=self._device_ref,
+                    )
+                    graph.output(gids_node, ng_node)
+                model = self.session.load(graph)
+                _POST_OP_MODEL_CACHE[cache_key] = model
+
+            k_buf = driver.Buffer.from_numpy(keys_np).to(self._gpu_driver)
+            c_buf = driver.Buffer.from_numpy(capacity_np).to(self._gpu_driver)
+            kt_buf = driver.Buffer.from_numpy(key_table_np).to(self._gpu_driver)
+            it_buf = driver.Buffer.from_numpy(id_table_np).to(self._gpu_driver)
+
+            group_ids_t, n_groups_t = model.execute(k_buf, c_buf, kt_buf, it_buf)
+            dense_ids = np.asarray(group_ids_t.to_numpy()).reshape(-1).astype(np.int32)
+            n_groups = int(np.asarray(n_groups_t.to_numpy()).reshape(-1)[0])
+
+            # Reconstruct unique key values: take the key value at each dense ID position.
+            # Since IDs are assigned in first-encounter order by GPU threads, we find the
+            # first index of each group ID to recover the original key value.
+            first_occurrence = np.empty(n_groups, dtype=np.int64)
+            seen = np.full(n_groups, False)
+            for idx in range(n):
+                gid = int(dense_ids[idx])
+                if not seen[gid]:
+                    first_occurrence[gid] = idx
+                    seen[gid] = True
+
+            unique_keys = col_arr.take(pa.array(first_occurrence))
+            return dense_ids, n_groups, {key_name: unique_keys}
+
+        except Exception:
+            return None  # fall back to CPU path
 
 

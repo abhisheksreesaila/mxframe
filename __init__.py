@@ -9,7 +9,7 @@ from .lazy_expr import Expr, col, lit
 from .lazy_frame import (
     LogicalPlan, Scan, Filter, Project, Aggregate,
     Sort, Limit, Distinct, Join,
-    LazyFrame, LazyGroupBy,
+    LazyFrame, LazyGroupBy, GPUFrame,
     DeviceType,
 )
 
@@ -45,7 +45,7 @@ __all__ = [
     # lazy_frame
     "LogicalPlan", "Scan", "Filter", "Project", "Aggregate",
     "Sort", "Limit", "Distinct", "Join",
-    "LazyFrame", "LazyGroupBy", "DeviceType",
+    "LazyFrame", "LazyGroupBy", "GPUFrame", "DeviceType",
     # compiler
     "GraphCompiler",
     # optimizer
