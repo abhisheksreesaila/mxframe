@@ -1334,33 +1334,14 @@ class CustomOpsCompiler(GraphCompiler):
     def _build_group_ids_cached(table, keys, gpu_compiler=None):
         """Cached wrapper: reuses group encoding when the same table object is queried.
 
-        When `gpu_compiler` is provided and the table has an integer single-key column,
-        uses the GPU group_encode kernel so the dictionary_encode + np.unique CPU pass
-        is replaced by a single GPU hash-table scan.
-
-        For multi-key or non-integer columns the CPU path is always used (the composite
-        key is built via dictionary_encode strides before dispatching to either path).
+        gpu_compiler is accepted for API compatibility but GPU group encoding via
+        group_encode.mojo requires compare_exchange_weak which is not available in
+        Mojo 26.1. Falls through to the CPU dictionary_encode path always.
         """
         cache_key = (id(table), table.num_rows, tuple(keys))
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
-
-        # GPU path: single integer key column, GPU available
-        if (gpu_compiler is not None
-                and gpu_compiler._session_device == "gpu"
-                and len(keys) == 1):
-            col_arr = table.column(keys[0])
-            if isinstance(col_arr, pa.ChunkedArray):
-                col_arr = col_arr.combine_chunks()
-            if pa.types.is_integer(col_arr.type):
-                result = gpu_compiler._build_group_ids_gpu_single_int(
-                    col_arr, keys[0], table.num_rows
-                )
-                if result is not None:
-                    _GROUP_ENCODE_CACHE[cache_key] = result
-                    return result
-
         result = CustomOpsCompiler._build_group_ids(table, keys)
         _GROUP_ENCODE_CACHE[cache_key] = result
         return result

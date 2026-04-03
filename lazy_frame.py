@@ -455,11 +455,8 @@ class _GPUGroupBy:
 
     def agg(self, *aggs) -> GPUFrame:
         lf_agg = LazyFrame(Aggregate(self._gf._lf.plan, self._by, list(aggs)))
-        return self._gf.__class__(self._gf._table, self._gf._compiler).__with_lf_direct(lf_agg)
-
-    def __with_lf_direct(self, lf) -> 'GPUFrame':
         gf = GPUFrame(self._gf._table, self._gf._compiler)
-        gf._lf = lf
+        gf._lf = lf_agg
         return gf
 
 

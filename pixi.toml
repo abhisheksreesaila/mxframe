@@ -1,0 +1,37 @@
+[workspace]
+authors = ["Abhishek Sreesaila <abhisheksreesaila@users.noreply.github.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "mxdf_v2"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+# Creates the mxframe → mxdf_v2 symlink in site-packages.
+# Run this once after `pixi install`, or if the symlink disappears.
+setup-mxframe = "ln -sfn $(pwd) .pixi/envs/default/lib/python3.12/site-packages/mxframe"
+
+# Run any script: pixi run python scripts/my_script.py
+# Run benchmarks: pixi run bench
+bench    = { cmd = "python scripts/benchmark_gpu_first.py",   depends-on = ["setup-mxframe"] }
+test0    = { cmd = "python scripts/_test_phase0_compiler.py", depends-on = ["setup-mxframe"] }
+test1    = { cmd = "python scripts/_test_phase1.py",          depends-on = ["setup-mxframe"] }
+test4    = { cmd = "python scripts/_test_phase4.py",          depends-on = ["setup-mxframe"] }
+test5    = { cmd = "python scripts/_test_phase5.py",          depends-on = ["setup-mxframe"] }
+test-all = { depends-on = ["test0", "test1", "test4", "test5"] }
+check-gpu = { cmd = "python scripts/_check_gpu.py",           depends-on = ["setup-mxframe"] }
+
+[dependencies]
+python = "3.12.*"
+pyarrow = ">=22.0.0,<23"
+modular = "26.1.*"
+matplotlib = ">=3.10.8,<4"
+duckdb = ">=1.4.3,<2"
+nbdev = ">=2.4.10,<3"
+pre-commit = ">=4.5.1,<5"
+nbconvert = ">=7.17.0,<8"
+pandas = ">=3.0.1,<4"
+
+[pypi-dependencies]
+polars = ">=1.29, <1.35"
+sqlglot = ">=28.6.0, <29"
+mxdf_v2 = { path = ".", editable = true }

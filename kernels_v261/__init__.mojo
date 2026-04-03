@@ -4,7 +4,6 @@ from .group_min import *
 from .group_max import *
 from .group_count import *
 from .group_mean import *
-from .group_encode import *
 from .gather_rows import *
 from .sort_indices import *
 from .unique_mask import *

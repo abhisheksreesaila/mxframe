@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mxdf_v2"
+version = "0.0.1"
+requires-python = ">=3.9"
+
+[tool.setuptools.package-dir]
+# Map the "mxframe" import name to the root of this directory (mxdf_v2/).
+# After `pip install -e .`, `import mxframe` loads from here.
+mxframe = "."
+
+[tool.setuptools.packages]
+find = {}
+
