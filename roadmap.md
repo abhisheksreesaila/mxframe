@@ -202,13 +202,15 @@ Every phase unlocks new TPC-H queries. We run them as **validation gates** — i
 | Phase | What it unlocks | TPC-H Queries to Test | Pass Criteria |
 |-------|----------------|----------------------|---------------|
 | **Phase 0+1** | Correct filter + grouped agg (CPU) | **Q6** (filter+sum), **Q1** (grouped agg) | Correct results vs DuckDB |
-| **Phase 2** | GPU execution | Re-run **Q1, Q6** on GPU | Same results, faster than CPU |
-| **Phase 3** | Date ops, boolean combinators | **Q1, Q6** benchmarked | Beat pandas, track vs Polars |
-| **Phase 4** | Sort, limit, distinct | **Q1** with ORDER BY, **Q6** verified | Full Q1 including sort |
-| **Phase 5** | Joins | **Q3** (3-way join), **Q12** (2-way), **Q14** (2-way) | Correct results, benchmark |
-| **Phase 5+** | More joins | **Q5** (6-way), **Q10** (4-way) | Correct results |
-| **Phase 6** | SQL frontend | Re-run **Q1, Q6** via SQL | Same results as DataFrame API |
-| **Phase 7+** | I/O, subqueries, string ops | **Q4**, **Q13**, **Q16** | Expanding coverage |
+| **Phase 2** | GPU execution | Re-run **Q1, Q6** on GPU | ✅ Same results, faster than CPU |
+| **Phase 3** | Date ops, boolean combinators | **Q1, Q6** benchmarked | ✅ Beat pandas, competitive with Polars |
+| **Phase 4** | Sort, limit, distinct | **Q1** with ORDER BY, **Q6** verified | ✅ Full Q1 including sort |
+| **Phase 5** | Joins | **Q3** (3-way join), **Q12** (2-way), **Q14** (2-way) | ✅ Correct results, benchmark |
+| **Phase 5+** | CASE WHEN + isin + startswith | **Q12, Q14** with CASE WHEN | ✅ Exact match DuckDB |
+| **Phase 5+** | More joins | **Q5** (6-way), **Q10** (4-way) | ✅ Correct results vs DuckDB |
+| **Phase 6** | SQL frontend | **Q1, Q6, Q3, Q12, Q14** via `mx.sql()` | ✅ All match DuckDB |
+| **Phase 7** | I/O | `read_csv`, `read_parquet`, `from_pandas` | ✅ Done |
+| **Phase 8** | Polish & Release | README, PyPI, scoreboard | ⬜ Next |
 
 ### Running TPC-H Validation
 
@@ -257,16 +259,21 @@ This gets updated every time we pass a new query. It's both motivation and proof
 ## Summary Timeline
 
 ```
-Phase 0: Foundation Fixes          ██░░░░░░░░░░░░░░░░░░  ← YOU ARE HERE
-Phase 1: Grouped Aggregation (CPU) ░░██░░░░░░░░░░░░░░░░  → validate Q6
-Phase 2: GPU Path                  ░░░░██░░░░░░░░░░░░░░  → re-run Q1, Q6 on GPU
-Phase 3: TPC-H Q1 & Q6            ░░░░░░██░░░░░░░░░░░░  ← First benchmarks
-Phase 4: Sort / Limit / Distinct   ░░░░░░░░██░░░░░░░░░░  → full Q1 with ORDER BY
-Phase 5: Joins                     ░░░░░░░░░░████░░░░░░  → Q3, Q12, Q14, Q5, Q10
-Phase 6: SQL Frontend              ░░░░░░░░░░░░░░██░░░░  → Q1, Q6 via SQL
-Phase 7: I/O & Usability           ░░░░░░░░░░░░░░░░██░░  → Q4, Q13
-Phase 8: Polish & Release          ░░░░░░░░░░░░░░░░░░██  ← v1.0, scoreboard
+Phase 0: Foundation Fixes          ████████████████████  ✅ DONE
+Phase 1: Grouped Aggregation (CPU) ████████████████████  ✅ DONE — Q6, Q1
+Phase 2: GPU Path                  ████████████████████  ✅ DONE — GPU Q1/Q6
+Phase 3: TPC-H Q1 & Q6            ████████████████████  ✅ DONE — benchmarks
+Phase 4: Sort / Limit / Distinct   ████████████████████  ✅ DONE — full Q1 ORDER BY
+Phase 5: Joins                     ████████████████████  ✅ DONE — Q3,Q12,Q14,Q5,Q10
+Phase 5+: Tier 2 CASE WHEN/isin   ████████████████████  ✅ DONE — Q12/Q14 CASE WHEN
+Phase 6: SQL Frontend              ████████████████████  ✅ DONE — Q1,Q6,Q3,Q12,Q14 via SQL
+Phase 7: I/O & Usability           ████████████████████  ✅ DONE — read_csv/parquet/pandas
+Phase 8: Polish & Release          ░░░░░░░░░░░░░░░░░░░░  ← NEXT — README, scoreboard, PyPI
 ```
+
+> **Status as of 2026-04-04:** All feature phases (0–7) are complete. Full TPC-H Tier 1, 2, and 3
+> pass (Q1, Q3, Q5, Q6, Q10, Q12, Q14) with correct results vs DuckDB ground truth.
+> SQL frontend (`mx.sql()`) supports SELECT/JOIN/WHERE/CASE WHEN/IN/LIKE/GROUP BY/ORDER BY/LIMIT.
 
 ---
 
