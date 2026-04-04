@@ -25,6 +25,9 @@ from .plan_validation import PlanValidationError, validate_plan, validate_plan_o
 # Custom ops compiler
 from .custom_ops import CustomOpsCompiler, KERNELS_PATH, clear_cache
 
+# SQL frontend
+from .sql_frontend import sql
+
 
 def warmup(device: str = "auto"):
     """Pre-initialize MAX runtime and InferenceSession for the given device.
@@ -87,4 +90,6 @@ __all__ = [
     "clear_cache", "warmup",
     # I/O
     "from_arrow", "from_pandas", "from_polars", "read_csv", "read_parquet",
+    # SQL
+    "sql",
 ]

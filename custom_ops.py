@@ -1152,10 +1152,11 @@ class CustomOpsCompiler(GraphCompiler):
                 s *= sizes[j]
             strides.append(s)
 
-        composite = np.zeros(len(table), dtype=np.int32)
+        # Use int64 to avoid overflow when strides are large (many-column groupby)
+        composite = np.zeros(len(table), dtype=np.int64)
         for i, enc in enumerate(encodings):
-            idx = enc.indices.to_numpy(zero_copy_only=False)
-            composite += (idx * strides[i]).astype(np.int32)
+            idx = enc.indices.to_numpy(zero_copy_only=False).astype(np.int64)
+            composite += idx * np.int64(strides[i])
         return composite
 
     def _hash_join_mojo_cpu(self, left_keys, right_keys):
