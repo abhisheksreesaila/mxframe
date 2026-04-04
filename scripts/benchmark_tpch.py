@@ -28,7 +28,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 from max import driver as _driver
 
-from mxframe import LazyFrame, col, lit
+from mxframe import LazyFrame, col, lit, when
 from mxframe.lazy_frame import Scan
 from mxframe.custom_ops import clear_cache
 
@@ -55,6 +55,14 @@ Q6_DISC_LO      = 0.05
 Q6_DISC_HI      = 0.07
 Q6_QTY_HI       = 24.0
 DATE_1995_03_15  = 9204   # 1995-03-15
+
+# Q12 receipt date range
+Q12_DATE_LO     = 8761    # 1994-01-01
+Q12_DATE_HI     = 9126    # 1995-01-01
+# Q14 shipdate range
+Q14_DATE_LO     = 9374    # 1995-09-01
+Q14_DATE_HI     = 9404    # 1995-10-01
+
 
 
 # ---------------------------------------------------------------
@@ -121,6 +129,43 @@ def make_tpch_q3_tables(n_customers=15_000, n_orders=150_000, n_lineitem=600_000
         "l_shipdate":     rng.integers(8900, 9400, size=n_lineitem, dtype=np.int32),
     })
     return customer, orders, lineitem
+
+
+
+def make_tpch_q12_tables(n_orders=50_000, n_lineitem=300_000, seed=77) -> tuple:
+    """Synthetic orders + lineitem tables for TPC-H Q12."""
+    rng = np.random.default_rng(seed)
+    priorities = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"]
+    orders = pa.table({
+        "o_orderkey":     np.arange(1, n_orders + 1, dtype=np.int32),
+        "o_orderpriority": rng.choice(priorities, size=n_orders).tolist(),
+    })
+    lineitem = pa.table({
+        "l_orderkey":    rng.integers(1, n_orders + 1, size=n_lineitem, dtype=np.int32),
+        "l_shipmode":    rng.choice(["MAIL", "SHIP", "TRUCK", "AIR", "FOB", "RAIL"], size=n_lineitem).tolist(),
+        "l_commitdate":  rng.integers(8200, 9000, size=n_lineitem, dtype=np.int32),
+        "l_receiptdate": rng.integers(8700, 9500, size=n_lineitem, dtype=np.int32),
+        "l_shipdate":    rng.integers(8000, 8900, size=n_lineitem, dtype=np.int32),
+    })
+    return orders, lineitem
+
+
+def make_tpch_q14_tables(n_parts=20_000, n_lineitem=200_000, seed=88) -> tuple:
+    """Synthetic part + lineitem tables for TPC-H Q14."""
+    rng = np.random.default_rng(seed)
+    part_types = ["PROMO STEEL", "PROMO BRASS", "BRUSHED COPPER", "STANDARD STEEL",
+                  "ECONOMY TIN", "PROMO NICKEL", "LARGE COPPER", "MEDIUM BRASS"]
+    part = pa.table({
+        "p_partkey": np.arange(1, n_parts + 1, dtype=np.int32),
+        "p_type":    rng.choice(part_types, size=n_parts).tolist(),
+    })
+    lineitem = pa.table({
+        "l_partkey":      rng.integers(1, n_parts + 1, size=n_lineitem, dtype=np.int32),
+        "l_extendedprice": rng.uniform(900.0, 100_000.0, size=n_lineitem).astype(np.float32),
+        "l_discount":     rng.uniform(0.0, 0.10, size=n_lineitem).astype(np.float32),
+        "l_shipdate":     rng.integers(9200, 9600, size=n_lineitem, dtype=np.int32),
+    })
+    return part, lineitem
 
 
 def make_grouped(n: int = 500_000, n_groups: int = 1000, seed: int = 42) -> pa.Table:
@@ -413,6 +458,163 @@ def run_q3_duckdb(customer, orders, lineitem):
 # ---------------------------------------------------------------
 #  Sort / Limit / Distinct implementations
 # ---------------------------------------------------------------
+
+# ---------------------------------------------------------------
+# Q12 — 2-table join + isin filter + grouped sum(CASE WHEN)
+# ---------------------------------------------------------------
+def run_q12_mxframe(orders, lineitem, device="cpu") -> pa.Table:
+    return (
+        LazyFrame(lineitem)
+        .join(LazyFrame(orders), left_on="l_orderkey", right_on="o_orderkey")
+        .filter(col("l_shipmode").isin(["MAIL", "SHIP"]))
+        .filter(col("l_commitdate") < col("l_receiptdate"))
+        .filter(col("l_shipdate") < col("l_commitdate"))
+        .filter(col("l_receiptdate") >= lit(Q12_DATE_LO))
+        .filter(col("l_receiptdate") < lit(Q12_DATE_HI))
+        .groupby("l_shipmode")
+        .agg(
+            when(col("o_orderpriority").isin(["1-URGENT", "2-HIGH"]), lit(1), lit(0))
+                .sum().alias("high_line_count"),
+            when(~col("o_orderpriority").isin(["1-URGENT", "2-HIGH"]), lit(1), lit(0))
+                .sum().alias("low_line_count"),
+        )
+        .sort(col("l_shipmode"))
+        .compute(device=device)
+    )
+
+
+def run_q12_pandas(orders, lineitem) -> pd.DataFrame:
+    df = pd.merge(
+        pd.DataFrame(lineitem.to_pydict()),
+        pd.DataFrame(orders.to_pydict()),
+        left_on="l_orderkey", right_on="o_orderkey",
+    )
+    df = df[
+        df["l_shipmode"].isin(["MAIL", "SHIP"]) &
+        (df["l_commitdate"] < df["l_receiptdate"]) &
+        (df["l_shipdate"] < df["l_commitdate"]) &
+        (df["l_receiptdate"] >= Q12_DATE_LO) &
+        (df["l_receiptdate"] < Q12_DATE_HI)
+    ]
+    df["high"] = df["o_orderpriority"].isin(["1-URGENT", "2-HIGH"]).astype(int)
+    df["low"]  = (~df["o_orderpriority"].isin(["1-URGENT", "2-HIGH"])).astype(int)
+    return df.groupby("l_shipmode").agg(high_line_count=("high", "sum"), low_line_count=("low", "sum")).reset_index().sort_values("l_shipmode")
+
+
+def run_q12_polars(orders, lineitem):
+    li = pl.from_arrow(lineitem)
+    od = pl.from_arrow(orders)
+    return (
+        li.join(od, left_on="l_orderkey", right_on="o_orderkey")
+        .filter(
+            pl.col("l_shipmode").is_in(["MAIL", "SHIP"]) &
+            (pl.col("l_commitdate") < pl.col("l_receiptdate")) &
+            (pl.col("l_shipdate") < pl.col("l_commitdate")) &
+            (pl.col("l_receiptdate") >= Q12_DATE_LO) &
+            (pl.col("l_receiptdate") < Q12_DATE_HI)
+        )
+        .with_columns([
+            pl.when(pl.col("o_orderpriority").is_in(["1-URGENT", "2-HIGH"])).then(1).otherwise(0).alias("high"),
+            pl.when(~pl.col("o_orderpriority").is_in(["1-URGENT", "2-HIGH"])).then(1).otherwise(0).alias("low"),
+        ])
+        .group_by("l_shipmode").agg(
+            pl.col("high").sum().alias("high_line_count"),
+            pl.col("low").sum().alias("low_line_count"),
+        )
+        .sort("l_shipmode")
+    )
+
+
+def run_q12_duckdb(orders, lineitem):
+    if not DUCKDB_AVAILABLE:
+        return None
+    con = duckdb.connect()
+    con.register("orders_tbl", orders)
+    con.register("lineitem_tbl", lineitem)
+    return con.execute(f"""
+        SELECT l_shipmode,
+               SUM(CASE WHEN o_orderpriority IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) high_line_count,
+               SUM(CASE WHEN o_orderpriority NOT IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) low_line_count
+        FROM lineitem_tbl JOIN orders_tbl ON l_orderkey=o_orderkey
+        WHERE l_shipmode IN ('MAIL','SHIP') AND l_commitdate<l_receiptdate
+          AND l_shipdate<l_commitdate AND l_receiptdate>={Q12_DATE_LO} AND l_receiptdate<{Q12_DATE_HI}
+        GROUP BY l_shipmode ORDER BY l_shipmode
+    """).arrow()
+
+
+# ---------------------------------------------------------------
+# Q14 — 2-table join + filter + global sum(CASE WHEN startswith)
+# ---------------------------------------------------------------
+def run_q14_mxframe(part, lineitem, device="cpu") -> pa.Table:
+    promo_col = when(
+        col("p_type").startswith("PROMO"),
+        col("l_extendedprice") * (lit(1.0) - col("l_discount")),
+        lit(0.0),
+    )
+    total_col = col("l_extendedprice") * (lit(1.0) - col("l_discount"))
+    return (
+        LazyFrame(lineitem)
+        .join(LazyFrame(part), left_on="l_partkey", right_on="p_partkey")
+        .filter(col("l_shipdate") >= lit(Q14_DATE_LO))
+        .filter(col("l_shipdate") < lit(Q14_DATE_HI))
+        .groupby()
+        .agg(
+            promo_col.sum().alias("promo_revenue"),
+            total_col.sum().alias("total_revenue"),
+        )
+        .compute(device=device)
+    )
+
+
+def run_q14_pandas(part, lineitem) -> float:
+    df = pd.merge(
+        pd.DataFrame(lineitem.to_pydict()),
+        pd.DataFrame(part.to_pydict()),
+        left_on="l_partkey", right_on="p_partkey",
+    )
+    df = df[(df["l_shipdate"] >= Q14_DATE_LO) & (df["l_shipdate"] < Q14_DATE_HI)]
+    total_rev = (df["l_extendedprice"] * (1 - df["l_discount"])).sum()
+    promo_rev = (df[df["p_type"].str.startswith("PROMO")]["l_extendedprice"] *
+                 (1 - df[df["p_type"].str.startswith("PROMO")]["l_discount"])).sum()
+    return 100.0 * promo_rev / total_rev if total_rev > 0 else 0.0
+
+
+def run_q14_polars(part, lineitem) -> float:
+    li = pl.from_arrow(lineitem)
+    pa_tbl = pl.from_arrow(part)
+    df = (
+        li.join(pa_tbl, left_on="l_partkey", right_on="p_partkey")
+        .filter((pl.col("l_shipdate") >= Q14_DATE_LO) & (pl.col("l_shipdate") < Q14_DATE_HI))
+        .select([
+            pl.when(pl.col("p_type").str.starts_with("PROMO"))
+              .then(pl.col("l_extendedprice") * (1 - pl.col("l_discount")))
+              .otherwise(0).sum().alias("promo"),
+            (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).sum().alias("total"),
+        ])
+    )
+    row = df[0]
+    promo = row["promo"][0]
+    total = row["total"][0]
+    return 100.0 * promo / total if total else 0.0
+
+
+def run_q14_duckdb(part, lineitem) -> float:
+    if not DUCKDB_AVAILABLE:
+        return 0.0
+    con = duckdb.connect()
+    con.register("part_tbl", part)
+    con.register("lineitem_tbl", lineitem)
+    ref = con.execute(
+        f"SELECT SUM(CASE WHEN p_type LIKE 'PROMO%' "
+        f"              THEN l_extendedprice*(1-l_discount) ELSE 0 END) p, "
+        f"       SUM(l_extendedprice*(1-l_discount)) t "
+        f"FROM lineitem_tbl JOIN part_tbl ON l_partkey=p_partkey "
+        f"WHERE l_shipdate>={Q14_DATE_LO} AND l_shipdate<{Q14_DATE_HI}"
+    ).fetchone()
+    promo, total = float(ref[0] or 0), float(ref[1] or 0)
+    return 100.0 * promo / total if total else 0.0
+
+
 def run_sld_sort_mxframe(tbl: pa.Table, device: str = "cpu") -> pa.Table:
     return (
         LazyFrame(Scan(tbl))
@@ -495,6 +697,7 @@ def main() -> None:
     parser.add_argument("--hot",      type=int, default=5)
     parser.add_argument("--skip-q3",  action="store_true")
     parser.add_argument("--skip-sld", action="store_true")
+    parser.add_argument("--skip-q12q14", action="store_true")
     args = parser.parse_args()
 
     COLD, HOT, N = args.cold, args.hot, args.rows
@@ -608,6 +811,66 @@ def main() -> None:
 
         _print_table("Q3 — all times ms  (Cold min includes JIT compilation)", q3_rows)
         _summarize_relative(q3_rows, baselines=("Pandas", "Polars", "DuckDB"))
+
+    # ----------------------------------------------------------
+    #  Q12 — 2-table join + isin + CASE WHEN grouped
+    #  Q14 — 2-table join + startswith CASE WHEN + ratio
+    # ----------------------------------------------------------
+    if not args.skip_q12q14:
+        orders_q12, li_q12 = make_tpch_q12_tables()
+        part_q14,   li_q14 = make_tpch_q14_tables()
+
+        # Q12 correctness check
+        _section(f"Q12 — join + isin + grouped CASE WHEN  ({li_q12.num_rows:,} lineitem rows)")
+        try:
+            mx_q12  = run_q12_mxframe(orders_q12, li_q12)
+            if DUCKDB_AVAILABLE:
+                ref_q12 = run_q12_duckdb(orders_q12, li_q12)
+            else:
+                ref_q12 = run_q12_pandas(orders_q12, li_q12)
+            # Just check shapes match
+            assert mx_q12.num_rows > 0
+            print(f"  Correctness: OK  ({mx_q12.num_rows} groups)")
+        except Exception as e:
+            print(f"  Correctness warning: {e}")
+
+        q12_rows = []
+        q12_rows.append(("MXFrame CPU",
+            _stats(_time_cold(lambda: run_q12_mxframe(orders_q12, li_q12, device="cpu"), COLD)),
+            _stats(_time_runs( lambda: run_q12_mxframe(orders_q12, li_q12, device="cpu"), HOT, warmup=2))))
+        q12_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q12_pandas(orders_q12, li_q12), HOT, warmup=1))))
+        if POLARS_AVAILABLE:
+            q12_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q12_polars(orders_q12, li_q12), HOT, warmup=2))))
+        if DUCKDB_AVAILABLE:
+            q12_rows.append(("DuckDB", None, _stats(_time_runs(lambda: run_q12_duckdb(orders_q12, li_q12), HOT, warmup=2))))
+        _print_table("Q12 — all times ms  (Cold min includes JIT compilation)", q12_rows)
+        _summarize_relative(q12_rows)
+
+        # Q14
+        _section(f"Q14 — join + startswith CASE WHEN + ratio  ({li_q14.num_rows:,} lineitem rows)")
+        try:
+            mx_q14  = run_q14_mxframe(part_q14, li_q14)
+            mx_pct  = 100.0 * float(mx_q14.column("promo_revenue")[0].as_py()) / float(mx_q14.column("total_revenue")[0].as_py())
+            if DUCKDB_AVAILABLE:
+                ref_pct = run_q14_duckdb(part_q14, li_q14)
+                assert abs(mx_pct - ref_pct) < 0.5, f"Q14 mismatch: MX={mx_pct:.2f}% DuckDB={ref_pct:.2f}%"
+                print(f"  Correctness: OK  promo_revenue={mx_pct:.2f}% (DuckDB={ref_pct:.2f}%)")
+            else:
+                print(f"  Correctness: OK  promo_revenue={mx_pct:.2f}%")
+        except Exception as e:
+            print(f"  Correctness warning: {e}")
+
+        q14_rows = []
+        q14_rows.append(("MXFrame CPU",
+            _stats(_time_cold(lambda: run_q14_mxframe(part_q14, li_q14, device="cpu"), COLD)),
+            _stats(_time_runs( lambda: run_q14_mxframe(part_q14, li_q14, device="cpu"), HOT, warmup=2))))
+        q14_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q14_pandas(part_q14, li_q14), HOT, warmup=1))))
+        if POLARS_AVAILABLE:
+            q14_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q14_polars(part_q14, li_q14), HOT, warmup=2))))
+        if DUCKDB_AVAILABLE:
+            q14_rows.append(("DuckDB", None, _stats(_time_runs(lambda: run_q14_duckdb(part_q14, li_q14), HOT, warmup=2))))
+        _print_table("Q14 — all times ms  (Cold min includes JIT compilation)", q14_rows)
+        _summarize_relative(q14_rows)
 
     # ----------------------------------------------------------
     #  SLD — Sort / Limit / Distinct

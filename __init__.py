@@ -3,7 +3,7 @@
 __version__ = "0.0.1"
 
 # Lazy expression layer
-from .lazy_expr import Expr, col, lit
+from .lazy_expr import Expr, col, lit, when
 
 # Lazy frame & logical plan
 from .lazy_frame import (
@@ -70,7 +70,7 @@ def read_parquet(path: str, **kwargs) -> "LazyFrame":
 
 __all__ = [
     # lazy_expr
-    "Expr", "col", "lit",
+    "Expr", "col", "lit", "when",
     # lazy_frame
     "LogicalPlan", "Scan", "Filter", "Project", "Aggregate",
     "Sort", "Limit", "Distinct", "Join",

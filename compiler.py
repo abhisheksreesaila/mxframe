@@ -37,6 +37,7 @@ _PC_CMP_OPS = {
     "lt":  pc.less,
     "le":  pc.less_equal,
     "eq":  pc.equal,
+    "ne":  pc.not_equal,
     "and": pc.and_,
     "or":  pc.or_,
 }
@@ -216,6 +217,19 @@ class GraphCompiler:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
             return _PC_CMP_OPS[op](lhs, rhs)
+        if op == "not":
+            return pc.invert(GraphCompiler._eval_predicate(args[0], table))
+        if op == "isin":
+            col_arr = GraphCompiler._eval_predicate(args[0], table)
+            return pc.is_in(col_arr, value_set=pa.array(args[1]))
+        if op == "startswith":
+            col_arr = GraphCompiler._eval_predicate(args[0], table)
+            return pc.starts_with(col_arr, pattern=args[1])
+        if op == "case_when":
+            cond = GraphCompiler._eval_predicate(args[0], table)
+            then = GraphCompiler._eval_predicate(args[1], table)
+            else_ = GraphCompiler._eval_predicate(args[2], table)
+            return pc.if_else(cond, then, else_)
         raise NotImplementedError(f"Cannot evaluate predicate op '{op}' in PyArrow.")
 
     @classmethod
@@ -326,5 +340,31 @@ class GraphCompiler:
             col_node = self._visit_expr(args[0], nodes)
             n = col_node.type.shape[0]
             return ops.constant(np.array([int(n)], dtype=np.int64), dtype=DType.int64, device=self._device_ref)
+        if op == "ne":
+            lhs = self._visit_expr(args[0], nodes)
+            rhs = self._visit_expr(args[1], nodes)
+            # ne = 1 - eq (bool→int32)
+            eq_node = ops.cast(ops.equal(lhs, rhs), DType.int32)
+            one = ops.constant(np.array([1], dtype=np.int32), dtype=DType.int32, device=self._device_ref)
+            return ops.sub(one, eq_node)
+        if op == "not":
+            inner = ops.cast(self._visit_expr(args[0], nodes), DType.int32)
+            one = ops.constant(np.array([1], dtype=np.int32), dtype=DType.int32, device=self._device_ref)
+            return ops.sub(one, inner)
+        if op == "case_when":
+            cond  = ops.cast(self._visit_expr(args[0], nodes), DType.float32)
+            then  = ops.cast(self._visit_expr(args[1], nodes), DType.float32)
+            else_ = ops.cast(self._visit_expr(args[2], nodes), DType.float32)
+            one  = ops.constant(np.array([1.0], dtype=np.float32), dtype=DType.float32, device=self._device_ref)
+            # cond * then + (1 - cond) * else_
+            return ops.add(
+                ops.mul(cond, then),
+                ops.mul(ops.sub(one, cond), else_),
+            )
+        if op in ("isin", "startswith"):
+            raise NotImplementedError(
+                f"op '{op}' involves strings — pre-compute as a derived column "
+                "before passing to the MAX graph."
+            )
         raise NotImplementedError(f"Unsupported expression op: '{op}'")
 

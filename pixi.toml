@@ -18,7 +18,8 @@ test0    = { cmd = "python scripts/_test_phase0_compiler.py", depends-on = ["set
 test1    = { cmd = "python scripts/_test_phase1.py",          depends-on = ["setup-mxframe"] }
 test4    = { cmd = "python scripts/_test_phase4.py",          depends-on = ["setup-mxframe"] }
 test5    = { cmd = "python scripts/_test_phase5.py",          depends-on = ["setup-mxframe"] }
-test-all = { depends-on = ["test0", "test1", "test4", "test5"] }
+test6    = { cmd = "python scripts/_test_phase6_tpch_tier2.py", depends-on = ["setup-mxframe"] }
+test-all = { depends-on = ["test0", "test1", "test4", "test5", "test6"] }
 check-gpu = { cmd = "python scripts/_check_gpu.py",           depends-on = ["setup-mxframe"] }
 
 [dependencies]

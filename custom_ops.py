@@ -17,7 +17,7 @@ from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join
-from .compiler import GraphCompiler, _max_dtype, _CMP_OPS
+from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS
 
 
 # %% ../nbs/04_custom_ops.ipynb 4
@@ -222,8 +222,9 @@ class CustomOpsCompiler(GraphCompiler):
             return True
         if op == "lit":
             return isinstance(expr.args[0], (int, float, bool))
-        if op in ("gt", "ge", "lt", "le", "eq", "and", "or"):
+        if op in ("gt", "ge", "lt", "le", "eq", "ne", "and", "or"):
             return all(cls._can_compile_predicate_gpu(a) for a in expr.args)
+        # isin, startswith, case_when, not -> need PyArrow eval -> CPU path only
         return False
 
     def _visit_predicate_to_mask(self, expr: Expr, nodes) -> Any:
@@ -237,6 +238,12 @@ class CustomOpsCompiler(GraphCompiler):
             lhs = self._visit_expr(expr.args[0], nodes)
             rhs = self._visit_expr(expr.args[1], nodes)
             return ops.cast(_CMP_OPS[op](lhs, rhs), DType.int32)
+        if op == "ne":
+            lhs = self._visit_expr(expr.args[0], nodes)
+            rhs = self._visit_expr(expr.args[1], nodes)
+            eq_node = ops.cast(ops.equal(lhs, rhs), DType.int32)
+            one = ops.constant(np.array([1], dtype=np.int32), dtype=DType.int32, device=self._device_ref)
+            return ops.sub(one, eq_node)
         if op == "and":
             l = self._visit_predicate_to_mask(expr.args[0], nodes)
             r = self._visit_predicate_to_mask(expr.args[1], nodes)
@@ -254,6 +261,107 @@ class CustomOpsCompiler(GraphCompiler):
                 return ops.constant(val, dtype=DType.int64, device=self._device_ref)
             return ops.constant(float(val), dtype=DType.float32, device=self._device_ref)
         raise ValueError(f"Cannot compile predicate op '{op}' to GPU mask.")
+
+
+    # -- Derived-column pre-computation (case_when / isin / startswith) ----
+
+    @staticmethod
+    def _needs_precompute(expr) -> bool:
+        """True if expr contains case_when, isin, or startswith anywhere."""
+        if expr.op in ("case_when", "isin", "startswith", "not"):
+            return True
+        from .lazy_expr import Expr as _Expr
+        return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
+                   for a in expr.args)
+
+    def _eval_expr_arrow(self, expr, table):
+        """Evaluate expr on an Arrow table, returning a pa.Array."""
+        from .lazy_expr import Expr as _Expr
+        op, args = expr.op, expr.args
+        if op == "col":
+            col_arr = table.column(args[0])
+            return col_arr.combine_chunks() if isinstance(col_arr, pa.ChunkedArray) else col_arr
+        if op == "lit":
+            val = args[0]
+            n = len(table)
+            if isinstance(val, (int, float)):
+                return pa.array(np.full(n, val, dtype=np.float32))
+            return pa.array([val] * n)
+        if op in ("add", "sub", "mul", "div"):
+            lhs = self._eval_expr_arrow(args[0], table)
+            rhs = self._eval_expr_arrow(args[1], table)
+            fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
+            return fn(lhs, rhs)
+        if op in _PC_CMP_OPS:
+            lhs = self._eval_expr_arrow(args[0], table)
+            rhs = self._eval_expr_arrow(args[1], table)
+            return _PC_CMP_OPS[op](lhs, rhs)
+        if op == "not":
+            return pc.invert(self._eval_expr_arrow(args[0], table))
+        if op == "isin":
+            col_arr = self._eval_expr_arrow(args[0], table)
+            return pc.is_in(col_arr, value_set=pa.array(args[1]))
+        if op == "startswith":
+            col_arr = self._eval_expr_arrow(args[0], table)
+            return pc.starts_with(col_arr, pattern=args[1])
+        if op == "case_when":
+            cond  = self._eval_expr_arrow(args[0], table)
+            then  = self._eval_expr_arrow(args[1], table)
+            else_ = self._eval_expr_arrow(args[2], table)
+            result = pc.if_else(cond, then, else_)
+            return result.cast(pa.float32()) if result.type != pa.float32() else result
+        raise NotImplementedError(f"_eval_expr_arrow: unsupported op '{op}'")
+
+    def _extract_derived_cols(self, plan):
+        """Rewrite case_when/isin/startswith in agg/project exprs as derived col refs.
+
+        Returns (rewritten_plan, derived_specs) where derived_specs is a list of
+        (col_name, original_expr) pairs to be evaluated in PyArrow before the graph.
+        """
+        from .lazy_expr import Expr as _Expr
+        derived_specs = []
+
+        def _rewrite_expr(expr):
+            if not CustomOpsCompiler._needs_precompute(expr):
+                return expr
+            if expr.op in ("case_when", "isin", "startswith"):
+                name = f"__cw_{len(derived_specs)}__"
+                derived_specs.append((name, expr))
+                new_expr = _Expr("col", name)
+                new_expr._alias = expr._alias
+                return new_expr
+            new_args = [
+                _rewrite_expr(a) if isinstance(a, _Expr) else a
+                for a in expr.args
+            ]
+            new_expr = _Expr(expr.op, *new_args)
+            new_expr._alias = expr._alias
+            return new_expr
+
+        def _rewrite_plan(p):
+            if isinstance(p, Scan): return p
+            if isinstance(p, Aggregate):
+                new_aggs = [_rewrite_expr(e) for e in p.aggs]
+                return Aggregate(_rewrite_plan(p.input), p.group_by, new_aggs)
+            if isinstance(p, Project):
+                new_exprs = [_rewrite_expr(e) for e in p.exprs]
+                return Project(_rewrite_plan(p.input), new_exprs)
+            if isinstance(p, Filter):
+                return Filter(_rewrite_plan(p.input), p.predicate)
+            if isinstance(p, (Sort, Limit, Distinct)):
+                import copy
+                new_node = copy.copy(p)
+                new_node.input = _rewrite_plan(p.input)
+                return new_node
+            if isinstance(p, Join):
+                return Join(_rewrite_plan(p.left), _rewrite_plan(p.right),
+                            p.left_on, p.right_on, p.how)
+            if hasattr(p, "input"):
+                p.input = _rewrite_plan(p.input)
+            return p
+
+        new_plan = _rewrite_plan(plan)
+        return new_plan, derived_specs
 
     def _compute_cache_key(self, plan, all_names, all_arrays, n_groups, optimizer_trace=None):
         """Compute a hashable cache key for the compiled graph model.
@@ -361,6 +469,9 @@ class CustomOpsCompiler(GraphCompiler):
         plan_clean = self._strip_filter_nodes(plan)
         predicates = self._collect_predicates(plan)
 
+        # 1b -- Rewrite case_when/isin/startswith as derived col refs (before prep_key).
+        plan_clean, derived_specs = self._extract_derived_cols(plan_clean)
+
         # GPU filter path: when on GPU and ALL predicates are numeric comparisons,
         # skip per-column CPU boolean-indexing. Upload full (unfiltered) arrays once
         # and cache them; pass a small int32 mask per query. The compiled MAX Graph
@@ -430,6 +541,11 @@ class CustomOpsCompiler(GraphCompiler):
                         continue
                     col_names.append(name)
                     col_arrays[name] = np_arr
+                # 4a-derived: pre-compute case_when/isin/startswith (unmasked on GPU)
+                for deriv_name, deriv_expr in derived_specs:
+                    arr = self._eval_expr_arrow(deriv_expr, original_scan.table)
+                    col_arrays[deriv_name] = arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                    col_names.append(deriv_name)
                 _group_ids_full = group_ids_full
                 _INPUT_PREP_CACHE[prep_key] = {
                     'col_names': col_names, 'col_arrays': col_arrays,
@@ -483,6 +599,15 @@ class CustomOpsCompiler(GraphCompiler):
                         np_arr = np_arr[mask_np]
                     col_names.append(name)
                     col_arrays[name] = np_arr
+
+                # 4b-derived: pre-compute case_when/isin/startswith, then apply mask
+                for deriv_name, deriv_expr in derived_specs:
+                    arr = self._eval_expr_arrow(deriv_expr, original_scan.table)
+                    np_arr = arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                    if mask_np is not None:
+                        np_arr = np_arr[mask_np]
+                    col_arrays[deriv_name] = np_arr
+                    col_names.append(deriv_name)
 
                 _INPUT_PREP_CACHE[prep_key] = {
                     'col_names': col_names, 'col_arrays': col_arrays,
