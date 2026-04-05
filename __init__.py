@@ -29,17 +29,50 @@ from .custom_ops import CustomOpsCompiler, KERNELS_PATH, clear_cache
 from .sql_frontend import sql
 
 
-def warmup(device: str = "auto"):
-    """Pre-initialize MAX runtime and InferenceSession for the given device.
+def warmup(device: str = "auto") -> float:
+    """Pre-initialize MAX runtime and pre-compile a canonical graph for fast first-query.
 
-    Call at application startup to move the one-time MAX runtime init cost
-    out of the first query.  The session is cached and reused by all
-    subsequent .compute() calls.
+    Call once at application startup (or at the top of a notebook) to absorb the
+    one-time JIT / framework-bootstrap cost before running real workloads.
+
+    Steps performed:
+      1. Create and cache the InferenceSession  (GPU context init, kernel library load).
+      2. Run a tiny synthetic groupby-sum computation (~1 K rows) through the full
+         MAX Graph compile-and-execute pipeline.  This triggers MLIR / LLVM / CUDA JIT
+         bootstrapping so the first real query experiences no cold-start penalty.
 
     Args:
         device: "auto" (default), "cpu", or "gpu".
+
+    Returns:
+        Wall-clock seconds consumed by warmup (diagnostic; can be ignored).
     """
+    import time as _t
+    import pyarrow as _pa
+    import numpy as _np
+
+    t0 = _t.perf_counter()
+
+    # Step 1: session init (cached -- effectively free on repeat calls)
     CustomOpsCompiler(device=device)
+
+    # Step 2: synthetic groupby-sum to trigger MAX JIT bootstrap.
+    # 1 024-row table, 8 groups, one float32 value column.
+    _N = 1024
+    _rng = _np.random.default_rng(0)
+    _tiny = _pa.table({
+        "g": _pa.array((_rng.integers(0, 8, size=_N)).astype(_np.int32)),
+        "v": _pa.array(_rng.uniform(0.0, 1.0, size=_N).astype(_np.float32)),
+    })
+    try:
+        (LazyFrame(Scan(_tiny))
+         .groupby("g")
+         .agg(col("v").sum().alias("s"))
+         .compute(device=device))
+    except Exception:
+        pass  # best-effort; never block user code on warmup failure
+
+    return _t.perf_counter() - t0
 
 
 
