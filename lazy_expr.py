@@ -71,6 +71,10 @@ class Expr:
         """True for rows where this string column starts with *prefix*."""
         return Expr("startswith", self, prefix)
 
+    def year(self) -> 'Expr':
+        """Extract the year from an integer YYYYMMDD date column (or Arrow date32)."""
+        return Expr("year", self)
+
     def sum(self) -> 'Expr':
         return Expr("sum", self)
 

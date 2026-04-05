@@ -96,8 +96,8 @@ def validate_plan(plan: LogicalPlan) -> List[PlanValidationError]:
             return
 
         if isinstance(node, Join):
-            if node.how != "inner":
-                errors.append(PlanValidationError(path, "Only inner joins are currently supported"))
+            if node.how not in ("inner", "left"):
+                errors.append(PlanValidationError(path, f"Unsupported join type '{node.how}'; use 'inner' or 'left'"))
             if not node.left_on or not node.right_on:
                 errors.append(PlanValidationError(path, "Join key lists cannot be empty"))
             if len(node.left_on) != len(node.right_on):

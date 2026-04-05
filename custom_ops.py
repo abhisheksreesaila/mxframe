@@ -271,7 +271,7 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, or startswith anywhere."""
-        if expr.op in ("case_when", "isin", "startswith", "not"):
+        if expr.op in ("case_when", "isin", "startswith", "not", "year"):
             return True
         from .lazy_expr import Expr as _Expr
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
@@ -474,10 +474,20 @@ class CustomOpsCompiler(GraphCompiler):
         # 0 -- Extract post-ops (Sort/Limit/Distinct) -----------------
         plan, post_ops = self._extract_post_ops(plan)
 
+        # 0a -- Extract HAVING filter: a Filter wrapping an Aggregate is HAVING,
+        # not a pre-scan WHERE.  Pull it out and apply after aggregation.
+        having_pred = None
+        if isinstance(plan, Filter):
+            inner_no_filt = self._strip_filter_nodes(plan.input)
+            if self._find_aggregate(inner_no_filt) is not None:
+                having_pred = plan.predicate
+                plan = plan.input
+
         # 0b -- No-compute shortcut: when plan has no Aggregate/Project,
         # process in PyArrow (preserving all column types including strings).
         plan_no_filters = self._strip_filter_nodes(plan)
-        if self._find_aggregate(plan_no_filters) is None and not isinstance(plan_no_filters, Project):
+        if self._find_aggregate(plan_no_filters) is None:
+            # No Aggregate: use PyArrow path (handles strings, year, Project, Filter)
             result = self._plan_to_table(plan)
             if post_ops:
                 result = self._apply_post_ops_custom(result, post_ops)
@@ -803,7 +813,12 @@ class CustomOpsCompiler(GraphCompiler):
         else:
             result = pa.Table.from_arrays(agg_arrays, names=agg_names)
 
-        # 8 -- Apply post-ops (Sort/Limit/Distinct via Mojo kernels) ---
+        # 8 -- Apply HAVING filter (post-aggregation predicate) -------
+        if having_pred is not None:
+            having_mask = self._eval_predicate(having_pred, result)
+            result = result.filter(having_mask)
+
+        # 9 -- Apply post-ops (Sort/Limit/Distinct via Mojo kernels) ---
         if post_ops:
             result = self._apply_post_ops_custom(result, post_ops)
 
@@ -1199,6 +1214,7 @@ class CustomOpsCompiler(GraphCompiler):
                 join_cache_key = (
                     left_key, right_key,
                     tuple(plan.left_on), tuple(plan.right_on),
+                    plan.how,
                 )
                 cached_join = _JOIN_RESULT_CACHE.get(join_cache_key)
                 if cached_join is not None:
@@ -1207,7 +1223,7 @@ class CustomOpsCompiler(GraphCompiler):
             left_table = self._plan_to_table(left_plan)
             right_table = self._plan_to_table(right_plan)
             joined = self._execute_hash_join(
-                left_table, right_table, plan.left_on, plan.right_on
+                left_table, right_table, plan.left_on, plan.right_on, how=plan.how
             )
             if join_cache_key is not None:
                 _JOIN_RESULT_CACHE[join_cache_key] = joined
@@ -1229,35 +1245,48 @@ class CustomOpsCompiler(GraphCompiler):
         return plan
 
     def _plan_to_table(self, plan) -> pa.Table:
-        """Resolve a join-free plan subtree to a concrete pa.Table.
+        """Resolve a plan subtree (no Aggregate) to a concrete pa.Table via PyArrow.
 
         Handles:
         - Scan: return table directly
-        - Filter → ... → Scan: apply predicates eagerly
-        - Complex plans with Aggregate/Project: delegate to compile_and_run
+        - Filter → ... → Scan: apply predicates eagerly in PyArrow
+        - Project: evaluate all exprs via _eval_expr_arrow (handles strings, year, etc.)
+        - Anything complex: delegate to compile_and_run
         """
         if isinstance(plan, Scan):
             return plan.table
-        # For Filter → Scan chains, apply predicates in PyArrow
         if isinstance(plan, Filter):
             inner_table = self._plan_to_table(plan.input)
             mask = self._eval_predicate(plan.predicate, inner_table)
             return inner_table.filter(mask)
-        # For anything more complex, use the full compiler
+        if isinstance(plan, Project):
+            inner_table = self._plan_to_table(plan.input)
+            arrays, names = [], []
+            for expr in plan.exprs:
+                arr = self._eval_expr_arrow(expr, inner_table)
+                name = expr._alias or (expr.args[0] if expr.op == "col" else f"col_{len(arrays)}")
+                arrays.append(arr)
+                names.append(name)
+            return pa.Table.from_arrays(arrays, names=names)
+        # For anything more complex (Aggregate etc.), use the full compiler
         return self.compile_and_run(plan)
 
-    def _execute_hash_join(self, left_table, right_table, left_on, right_on):
-        """Execute an inner hash join using Mojo kernels (GPU) or numpy (CPU).
+    def _execute_hash_join(self, left_table, right_table, left_on, right_on, how="inner"):
+        """Execute a hash join: inner via Mojo, left outer via PyArrow.
 
-        Kernel selection: session device determines the join kernel (GPU or CPU Mojo).
-        Gather strategy: for GPU sessions with large join results (> GPU_JOIN_THRESHOLD
-        rows) numeric columns (float32/int32) are gathered on-GPU via the gather_f32 /
-        gather_i32 Mojo kernels, reducing re-upload overhead before aggregation.
-        For smaller results or CPU sessions, fast PyArrow .take() is used.
-
-        Returns the joined pa.Table with all left columns + non-key right columns.
+        how="inner": Mojo GPU/CPU kernels, all matching rows.
+        how="left":  PyArrow left outer; unmatched left rows get null right cols.
         """
-        # Encode join keys as int32 arrays
+        if how == "left":
+            right_cols = [c for c in right_table.column_names if c not in right_on]
+            joined = left_table.join(
+                right_table, keys=left_on, right_keys=right_on,
+                join_type="left outer", right_suffix="_right", coalesce_keys=True,
+            )
+            keep = [c for c in left_table.column_names + right_cols if c in joined.column_names]
+            return joined.select(keep)
+
+        # inner join via Mojo kernels
         left_keys = self._encode_join_keys(left_table, left_on)
         right_keys = self._encode_join_keys(right_table, right_on)
 

@@ -230,6 +230,15 @@ class GraphCompiler:
             then = GraphCompiler._eval_predicate(args[1], table)
             else_ = GraphCompiler._eval_predicate(args[2], table)
             return pc.if_else(cond, then, else_)
+        if op == "year":
+            col_arr = GraphCompiler._eval_predicate(args[0], table)
+            if col_arr.type in (pa.int32(), pa.int64()):
+                return pc.cast(pc.divide(col_arr, pa.scalar(10000, type=pa.int32())), pa.int32())
+            return pc.year(col_arr)
+        if op in ("and", "or", "__and__", "__or__"):
+            lhs = GraphCompiler._eval_predicate(args[0], table)
+            rhs = GraphCompiler._eval_predicate(args[1], table)
+            return pc.and_(lhs, rhs) if "and" in op else pc.or_(lhs, rhs)
         raise NotImplementedError(f"Cannot evaluate predicate op '{op}' in PyArrow.")
 
     @classmethod
