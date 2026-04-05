@@ -1716,6 +1716,180 @@ def _check_q3(mx, ref, label: str) -> None:
         f"{label}: revenue mismatch"
 
 
+
+# ============================================================
+#  Q16 -- Part/Supplier Relationship  (distinct count + anti-join)
+# ============================================================
+Q16_BRAND       = "Brand#45"
+Q16_TYPE_PREFIX = "MEDIUM POLISHED"
+Q16_SIZES       = [49, 14, 23, 45, 19, 3, 36, 9]
+_Q16_BRANDS = ["Brand#11","Brand#22","Brand#33","Brand#44","Brand#55"]
+
+
+def make_tpch_q16_tables(n_parts=10_000, n_suppliers=2_000, seed=16):
+    rng = np.random.default_rng(seed)
+    p_brands = [_Q16_BRANDS[i % 5] for i in range(n_parts)]
+    type_pfx = ["STANDARD","SMALL","MEDIUM POLISHED","LARGE","ECONOMY"]
+    type_suf = ["ANODIZED STEEL","BURNISHED COPPER","PLATED BRASS","POLISHED TIN","BRUSHED NICKEL"]
+    p_types  = [f"{type_pfx[i%5]} {type_suf[i%5]}" for i in range(n_parts)]
+    p_sizes  = rng.integers(1, 51, n_parts, dtype=np.int32)
+    part = pa.table({
+        "p_partkey": pa.array(np.arange(n_parts, dtype=np.int32)),
+        "p_brand":   pa.array(p_brands),
+        "p_type":    pa.array(p_types),
+        "p_size":    pa.array(p_sizes),
+    })
+    s_comment = ["Complaints from Customer" if i % 20 == 0 else "ok" for i in range(n_suppliers)]
+    supplier = pa.table({
+        "s_suppkey": pa.array(np.arange(n_suppliers, dtype=np.int32)),
+        "s_comment": pa.array(s_comment),
+    })
+    ps_partkey = np.repeat(np.arange(n_parts, dtype=np.int32), 4)
+    ps_suppkey = (ps_partkey + np.tile(np.arange(4, dtype=np.int32), n_parts)) % n_suppliers
+    partsupp = pa.table({
+        "ps_partkey": pa.array(ps_partkey),
+        "ps_suppkey": pa.array(ps_suppkey.astype(np.int32)),
+    })
+    return part, supplier, partsupp
+
+
+def run_q16_mxframe(part, supplier, partsupp, device="cpu") -> pa.Table:
+    # Thin PyArrow: identify complaint supplier keys (small table)
+    complaint_keys = pc.unique(
+        supplier.filter(pc.match_substring(supplier.column("s_comment"), pattern="Complaints")).column("s_suppkey")
+    ).to_pylist()
+    # Mojo: join + filter + distinct + groupby count
+    joined = (
+        LazyFrame(Scan(part))
+        .filter(
+            (col("p_brand") != lit(Q16_BRAND)) &
+            (~col("p_type").startswith(Q16_TYPE_PREFIX)) &
+            col("p_size").isin(Q16_SIZES)
+        )
+        .join(LazyFrame(Scan(partsupp)), left_on="p_partkey", right_on="ps_partkey")
+        .filter(~col("ps_suppkey").isin(complaint_keys))
+        .compute(device=device)
+    )
+    deduped = (
+        LazyFrame(Scan(joined))
+        .select("p_brand", "p_type", "p_size", "ps_suppkey")
+        .distinct()
+        .compute(device=device)
+    )
+    return (
+        LazyFrame(Scan(deduped))
+        .groupby("p_brand", "p_type", "p_size")
+        .agg(col("ps_suppkey").count().alias("supplier_cnt"))
+        .sort(col("supplier_cnt"), descending=True)
+        .compute(device=device)
+    )
+
+
+def run_q16_pandas(part, supplier, partsupp) -> pd.DataFrame:
+    p, s, ps = part.to_pandas(), supplier.to_pandas(), partsupp.to_pandas()
+    ck = set(s[s.s_comment.str.contains("Complaints")]["s_suppkey"])
+    p_f = p[(p.p_brand != Q16_BRAND) & (~p.p_type.str.startswith(Q16_TYPE_PREFIX)) & (p.p_size.isin(Q16_SIZES))]
+    j = ps.merge(p_f, left_on="ps_partkey", right_on="p_partkey")
+    j = j[~j.ps_suppkey.isin(ck)]
+    d = j[["p_brand","p_type","p_size","ps_suppkey"]].drop_duplicates()
+    return (d.groupby(["p_brand","p_type","p_size"]).size().reset_index(name="supplier_cnt")
+             .sort_values("supplier_cnt", ascending=False).reset_index(drop=True))
+
+
+def run_q16_polars(part, supplier, partsupp):
+    if not POLARS_AVAILABLE:
+        return None
+    p_f = pl.from_arrow(part).filter(
+        (pl.col("p_brand") != Q16_BRAND) &
+        (~pl.col("p_type").str.starts_with(Q16_TYPE_PREFIX)) &
+        pl.col("p_size").is_in(Q16_SIZES))
+    complaint_keys = (pl.from_arrow(supplier)
+                        .filter(pl.col("s_comment").str.contains("Complaints"))
+                        .select("s_suppkey"))
+    ps = pl.from_arrow(partsupp)
+    # Join partsupp with part, then anti-join to remove complaint suppliers
+    j  = (ps.join(p_f, left_on="ps_partkey", right_on="p_partkey")
+            .join(complaint_keys, left_on="ps_suppkey", right_on="s_suppkey", how="anti"))
+    d  = j.select(["p_brand","p_type","p_size","ps_suppkey"]).unique()
+    return (d.group_by(["p_brand","p_type","p_size"]).agg(pl.len().alias("supplier_cnt"))
+              .sort("supplier_cnt", descending=True))
+
+
+# ============================================================
+#  Q17 -- Small-Quantity Order Revenue  (2-pass correlated avg)
+# ============================================================
+Q17_BRAND     = "Brand#23"
+Q17_CONTAINER = "MED BOX"
+
+
+def make_tpch_q17_tables(n_parts=5_000, n_lineitem=200_000, seed=17):
+    rng = np.random.default_rng(seed)
+    brands     = ["Brand#11","Brand#22","Brand#23","Brand#33","Brand#44"]
+    containers = ["SM BOX","MED BOX","LG BOX","SM PACK","MED PACK","LG PACK"]
+    part = pa.table({
+        "p_partkey":  pa.array(np.arange(n_parts, dtype=np.int32)),
+        "p_brand":    pa.array([brands[i % len(brands)] for i in range(n_parts)]),
+        "p_container":pa.array([containers[i % len(containers)] for i in range(n_parts)]),
+    })
+    lineitem = pa.table({
+        "l_partkey":       pa.array(rng.integers(0, n_parts, n_lineitem, dtype=np.int32)),
+        "l_extendedprice": pa.array(rng.uniform(10.0, 1000.0, n_lineitem).astype(np.float32)),
+        "l_quantity":      pa.array(rng.uniform(1.0, 50.0, n_lineitem).astype(np.float32)),
+    })
+    return part, lineitem
+
+
+def run_q17_mxframe(part, lineitem, device="cpu") -> float:
+    # Thin PyArrow: filter small part table
+    target_parts = part.filter(
+        pc.and_(pc.equal(part.column("p_brand"), pa.scalar(Q17_BRAND)),
+                pc.equal(part.column("p_container"), pa.scalar(Q17_CONTAINER)))
+    )
+    # Pass 1 (Mojo): avg quantity per qualifying part
+    avg_qty = (
+        LazyFrame(Scan(lineitem))
+        .join(LazyFrame(Scan(target_parts)), left_on="l_partkey", right_on="p_partkey")
+        .groupby("l_partkey")
+        .agg(col("l_quantity").mean().alias("avg_qty"))
+        .compute(device=device)
+    )
+    avg_table = pa.table({
+        "ap_partkey": avg_qty.column("l_partkey"),
+        "avg_qty":    avg_qty.column("avg_qty"),
+    })
+    # Pass 2 (Mojo): join back, filter qty < 0.2*avg, sum price per part
+    result = (
+        LazyFrame(Scan(lineitem))
+        .join(LazyFrame(Scan(target_parts)), left_on="l_partkey", right_on="p_partkey")
+        .join(LazyFrame(Scan(avg_table)),    left_on="l_partkey", right_on="ap_partkey")
+        .filter(col("l_quantity") < lit(0.2) * col("avg_qty"))
+        .groupby("l_partkey")
+        .agg(col("l_extendedprice").sum().alias("total_price"))
+        .compute(device=device)
+    )
+    total = float(pc.sum(result.column("total_price")).as_py() or 0.0)
+    return round(total / 7.0, 2)
+
+
+def run_q17_pandas(part, lineitem) -> float:
+    p, li = part.to_pandas(), lineitem.to_pandas()
+    p_f = p[(p.p_brand == Q17_BRAND) & (p.p_container == Q17_CONTAINER)]
+    m = li.merge(p_f[["p_partkey"]], left_on="l_partkey", right_on="p_partkey")
+    avg = m.groupby("l_partkey")["l_quantity"].mean().rename("avg_qty").reset_index()
+    m2 = m.merge(avg, on="l_partkey")
+    return round(m2[m2.l_quantity < 0.2 * m2.avg_qty]["l_extendedprice"].sum() / 7.0, 2)
+
+
+def run_q17_polars(part, lineitem):
+    if not POLARS_AVAILABLE:
+        return None
+    p_f = pl.from_arrow(part).filter((pl.col("p_brand") == Q17_BRAND) & (pl.col("p_container") == Q17_CONTAINER))
+    li  = pl.from_arrow(lineitem)
+    m   = li.join(p_f.select("p_partkey"), left_on="l_partkey", right_on="p_partkey")
+    avg = m.group_by("l_partkey").agg(pl.col("l_quantity").mean().alias("avg_qty"))
+    m2  = m.join(avg, on="l_partkey").filter(pl.col("l_quantity") < 0.2 * pl.col("avg_qty"))
+    return round(float(m2.select(pl.col("l_extendedprice").sum()).item()) / 7.0, 2)
+
 # ---------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------
@@ -1731,6 +1905,8 @@ def main() -> None:
                         help="Skip Q5/Q10/Q7/Q8/Q13/Q19 (new Phase 11 queries)")
     parser.add_argument("--skip-q4-q18",  action="store_true",
                         help="Skip Q4/Q9/Q11/Q18 (Phase 12 queries)")
+    parser.add_argument("--skip-q16-q17", action="store_true",
+                        help="Skip Q16/Q17 (Phase 14 queries)")
     args = parser.parse_args()
 
     COLD, HOT, N = args.cold, args.hot, args.rows
@@ -1762,6 +1938,13 @@ def main() -> None:
         q9_nation, q9_sup, q9_ps, q9_part, q9_orders, q9_li = make_tpch_q9_tables()
         q11_nation, q11_sup, q11_ps = make_tpch_q11_tables()
         q18_cust, q18_orders, q18_li = make_tpch_q18_tables()
+        print("done")
+
+    SKIP_Q16_Q17 = args.skip_q16_q17
+    if not SKIP_Q16_Q17:
+        print("Generating Q16/Q17 data ... ", end="", flush=True)
+        q16_part, q16_sup, q16_ps = make_tpch_q16_tables()
+        q17_part, q17_li          = make_tpch_q17_tables()
         print("done")
 
     # ----------------------------------------------------------
@@ -2250,6 +2433,56 @@ def main() -> None:
             q18_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q18_polars(q18_cust, q18_orders, q18_li), HOT, warmup=2))))
         _print_table("Q18", q18_rows)
         _summarize_relative(q18_rows)
+
+    # Q16 / Q17
+    if not SKIP_Q16_Q17:
+        _section(f"Q16 (part={q16_part.num_rows:,}  ps={q16_ps.num_rows:,}  distinct suppkey count)")
+        mx16 = run_q16_mxframe(q16_part, q16_sup, q16_ps)
+        pd16 = run_q16_pandas(q16_part, q16_sup, q16_ps)
+        print(f"  Rows: MXFrame={mx16.num_rows}  Pandas={len(pd16)}")
+        q16_rows = [(
+            "MXFrame CPU",
+            _stats(_time_cold(lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps), COLD)),
+            _stats(_time_runs( lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps), HOT, warmup=2)),
+        )]
+        if GPU_READY:
+            try:
+                q16_rows.append((
+                    "MXFrame GPU",
+                    _stats(_time_cold(lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps, device="gpu"), COLD)),
+                    _stats(_time_runs( lambda: run_q16_mxframe(q16_part, q16_sup, q16_ps, device="gpu"), HOT, warmup=2)),
+                ))
+            except Exception as e:
+                print(f"  GPU Q16 skipped: {e}")
+        q16_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q16_pandas(q16_part, q16_sup, q16_ps), HOT, warmup=1))))
+        if POLARS_AVAILABLE:
+            q16_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q16_polars(q16_part, q16_sup, q16_ps), HOT, warmup=2))))
+        _print_table("Q16", q16_rows)
+        _summarize_relative(q16_rows)
+
+        _section(f"Q17 (part={q17_part.num_rows:,}  l={q17_li.num_rows:,}  2-pass avg)")
+        mx17 = run_q17_mxframe(q17_part, q17_li)
+        pd17 = run_q17_pandas(q17_part, q17_li)
+        print(f"  avg_yearly: MXFrame={mx17}  Pandas={pd17}")
+        q17_rows = [(
+            "MXFrame CPU",
+            _stats(_time_cold(lambda: run_q17_mxframe(q17_part, q17_li), COLD)),
+            _stats(_time_runs( lambda: run_q17_mxframe(q17_part, q17_li), HOT, warmup=2)),
+        )]
+        if GPU_READY:
+            try:
+                q17_rows.append((
+                    "MXFrame GPU",
+                    _stats(_time_cold(lambda: run_q17_mxframe(q17_part, q17_li, device="gpu"), COLD)),
+                    _stats(_time_runs( lambda: run_q17_mxframe(q17_part, q17_li, device="gpu"), HOT, warmup=2)),
+                ))
+            except Exception as e:
+                print(f"  GPU Q17 skipped: {e}")
+        q17_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q17_pandas(q17_part, q17_li), HOT, warmup=1))))
+        if POLARS_AVAILABLE:
+            q17_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q17_polars(q17_part, q17_li), HOT, warmup=2))))
+        _print_table("Q17", q17_rows)
+        _summarize_relative(q17_rows)
 
     print(f"\n{'='*68}")
     print("  Done.")

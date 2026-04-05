@@ -242,6 +242,23 @@ class GraphCompiler:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
             return pc.and_(lhs, rhs) if "and" in op else pc.or_(lhs, rhs)
+        # Arithmetic ops inside predicates (e.g. lit(0.2) * col("avg_qty") as RHS of comparison)
+        if op == "mul":
+            lhs = GraphCompiler._eval_predicate(args[0], table)
+            rhs = GraphCompiler._eval_predicate(args[1], table)
+            return pc.multiply(lhs, rhs)
+        if op == "add":
+            lhs = GraphCompiler._eval_predicate(args[0], table)
+            rhs = GraphCompiler._eval_predicate(args[1], table)
+            return pc.add(lhs, rhs)
+        if op == "sub":
+            lhs = GraphCompiler._eval_predicate(args[0], table)
+            rhs = GraphCompiler._eval_predicate(args[1], table)
+            return pc.subtract(lhs, rhs)
+        if op == "div":
+            lhs = GraphCompiler._eval_predicate(args[0], table)
+            rhs = GraphCompiler._eval_predicate(args[1], table)
+            return pc.divide(lhs, rhs)
         raise NotImplementedError(f"Cannot evaluate predicate op '{op}' in PyArrow.")
 
     @classmethod
