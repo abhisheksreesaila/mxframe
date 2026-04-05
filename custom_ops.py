@@ -1314,13 +1314,15 @@ class CustomOpsCompiler(GraphCompiler):
         how="left":  PyArrow left outer; unmatched left rows get null right cols.
         """
         if how == "left":
-            right_cols = [c for c in right_table.column_names if c not in right_on]
-            joined = left_table.join(
-                right_table, keys=left_on, right_keys=right_on,
-                join_type="left outer", right_suffix="_right", coalesce_keys=True,
-            )
-            keep = [c for c in left_table.column_names + right_cols if c in joined.column_names]
-            return joined.select(keep)
+            # Mojo left-outer join: join_count_left + join_scatter_left kernels.
+            left_keys  = self._encode_join_keys(left_table, left_on)
+            right_keys = self._encode_join_keys(right_table, right_on)
+            if self._session_device == "gpu":
+                left_idx, right_idx = self._hash_join_left_mojo_gpu(left_keys, right_keys)
+            else:
+                left_idx, right_idx = self._hash_join_left_mojo_cpu(left_keys, right_keys)
+            return self._assemble_left_outer(left_table, right_table, right_on,
+                                             left_idx, right_idx)
 
         # inner join via Mojo kernels
         left_keys = self._encode_join_keys(left_table, left_on)
@@ -1399,6 +1401,176 @@ class CustomOpsCompiler(GraphCompiler):
             idx = enc.indices.to_numpy(zero_copy_only=False).astype(np.int64)
             composite += idx * np.int64(strides[i])
         return composite
+
+    def _assemble_left_outer(self, left_table, right_table, right_on, left_idx, right_idx):
+        """Assemble left-outer result. right_idx==-1 means no match (null right cols)."""
+        li64 = pa.array(left_idx.astype(np.int64))
+        left_take = left_table.take(li64)
+        has_match = (right_idx >= 0)
+        safe_right = right_idx.copy()
+        safe_right[~has_match] = 0
+        ri64 = pa.array(safe_right.astype(np.int64))
+        null_mask_arr = pa.array(~has_match)
+        arrays, names = [], []
+        for col_name in left_table.column_names:
+            arrays.append(left_take.column(col_name))
+            names.append(col_name)
+        right_take = right_table.take(ri64)
+        for col_name in right_table.column_names:
+            if col_name in right_on:
+                continue
+            col_arr = right_take.column(col_name)
+            if not has_match.all():
+                col_arr = pc.if_else(pc.invert(null_mask_arr), col_arr, None)
+            arrays.append(col_arr)
+            names.append(col_name)
+        return pa.Table.from_arrays(arrays, names=names)
+
+    def _hash_join_left_mojo_cpu(self, left_keys, right_keys):
+        """CPU left-outer hash join via join_count_left_cpu + join_scatter_left_cpu."""
+        n_left  = len(left_keys)
+        n_right = len(right_keys)
+        if n_left == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        lk = left_keys.astype(np.int32)
+        rk = right_keys.astype(np.int32) if n_right > 0 else np.array([], dtype=np.int32)
+        # Pass 1: count
+        ck1 = ("join_count_left_cpu", n_left, n_right, self._session_device)
+        m1 = _POST_OP_MODEL_CACHE.get(ck1)
+        if m1 is None:
+            g = Graph(
+                name="mxframe_jcl_cpu",
+                input_types=[TensorType(DType.int32, [n_left], self._device_ref),
+                              TensorType(DType.int32, [max(n_right,1)], self._device_ref)],
+                custom_extensions=[Path(self.kernels_path)],
+            )
+            with g:
+                mc = ops.custom("join_count_left_cpu",
+                                values=[g.inputs[0], g.inputs[1]],
+                                out_types=[TensorType(DType.int32, [n_left], self._device_ref)],
+                                device=self._device_ref)[0]
+                g.output(mc)
+            m1 = self.session.load(g)
+            _POST_OP_MODEL_CACHE[ck1] = m1
+        rk_in = rk if n_right > 0 else np.zeros(1, dtype=np.int32)
+        (mc_t,) = m1.execute(lk, rk_in)
+        mc = np.asarray(mc_t.to_numpy()).reshape(-1).astype(np.int32)
+        total = int(mc.sum())
+        offsets = np.zeros(n_left, dtype=np.int32)
+        if n_left > 1:
+            np.cumsum(mc[:-1], out=offsets[1:])
+        # Pass 2: scatter
+        ck2 = ("join_scatter_left_cpu", n_left, n_right, total, self._session_device)
+        m2 = _POST_OP_MODEL_CACHE.get(ck2)
+        if m2 is None:
+            g = Graph(
+                name="mxframe_jsl_cpu",
+                input_types=[TensorType(DType.int32, [n_left], self._device_ref),
+                              TensorType(DType.int32, [max(n_right,1)], self._device_ref),
+                              TensorType(DType.int32, [n_left], self._device_ref)],
+                custom_extensions=[Path(self.kernels_path)],
+            )
+            with g:
+                lo, ro = ops.custom("join_scatter_left_cpu",
+                                    values=[g.inputs[0], g.inputs[1], g.inputs[2]],
+                                    out_types=[TensorType(DType.int32, [total], self._device_ref),
+                                               TensorType(DType.int32, [total], self._device_ref)],
+                                    device=self._device_ref)
+                g.output(lo, ro)
+            m2 = self.session.load(g)
+            _POST_OP_MODEL_CACHE[ck2] = m2
+        lo_t, ro_t = m2.execute(lk, rk_in, offsets)
+        left_idx  = np.asarray(lo_t.to_numpy()).reshape(-1).astype(np.int32)
+        right_idx = np.asarray(ro_t.to_numpy()).reshape(-1).astype(np.int32)
+        return left_idx, right_idx
+
+    def _hash_join_left_mojo_gpu(self, left_keys, right_keys):
+        """GPU left-outer join. Falls back to CPU Mojo on error."""
+        try:
+            return self._hash_join_left_mojo_gpu_impl(left_keys, right_keys)
+        except Exception:
+            return self._hash_join_left_mojo_cpu(left_keys, right_keys)
+
+    def _hash_join_left_mojo_gpu_impl(self, left_keys, right_keys):
+        n_left  = len(left_keys)
+        n_right = len(right_keys)
+        if n_left == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        lk = left_keys.astype(np.int32)
+        rk = right_keys.astype(np.int32) if n_right > 0 else np.array([], dtype=np.int32)
+        all_keys = np.concatenate([lk, rk]) if n_right > 0 else lk
+        max_key = int(all_keys.max())
+        table_size = max_key + 1
+        max_key_arr = np.array([max_key], dtype=np.int32)
+        rk_in = rk if n_right > 0 else np.zeros(1, dtype=np.int32)
+        n_right_in = max(n_right, 1)
+        # Pass 1
+        ck1 = ("join_count_left_gpu", n_left, n_right, table_size, self._session_device)
+        m1 = _POST_OP_MODEL_CACHE.get(ck1)
+        if m1 is None:
+            g = Graph(
+                name="mxframe_jcl_gpu",
+                input_types=[TensorType(DType.int32, [n_left], self._device_ref),
+                              TensorType(DType.int32, [n_right_in], self._device_ref),
+                              TensorType(DType.int32, [1], self._device_ref)],
+                custom_extensions=[Path(self.kernels_path)],
+            )
+            with g:
+                mc, _ = ops.custom("join_count_left_gpu",
+                                   values=[g.inputs[0], g.inputs[1], g.inputs[2]],
+                                   out_types=[TensorType(DType.int32, [n_left], self._device_ref),
+                                              TensorType(DType.int32, [table_size], self._device_ref)],
+                                   device=self._device_ref)
+                g.output(mc)
+            m1 = self.session.load(g)
+            _POST_OP_MODEL_CACHE[ck1] = m1
+        (mc_t,) = m1.execute(lk, rk_in, max_key_arr)
+        mc = np.asarray(mc_t.to_numpy()).reshape(-1).astype(np.int32)
+        total = int(mc.sum())
+        offsets = np.zeros(n_left, dtype=np.int32)
+        if n_left > 1:
+            np.cumsum(mc[:-1], out=offsets[1:])
+        # Build sorted right arrays
+        right_count = np.zeros(table_size, dtype=np.int32)
+        if n_right > 0:
+            np.add.at(right_count, rk.clip(0, table_size - 1), 1)
+        right_key_starts = np.zeros(table_size, dtype=np.int32)
+        np.cumsum(right_count[:-1], out=right_key_starts[1:])
+        cursor = right_key_starts.copy()
+        right_sorted_idx = np.zeros(max(n_right, 1), dtype=np.int32)
+        for i, k_v in enumerate(rk):
+            k_i = int(k_v)
+            right_sorted_idx[cursor[k_i]] = i
+            cursor[k_i] += 1
+        # Pass 2
+        ck2 = ("join_scatter_left_gpu", n_left, n_right, total, table_size, self._session_device)
+        m2 = _POST_OP_MODEL_CACHE.get(ck2)
+        if m2 is None:
+            g = Graph(
+                name="mxframe_jsl_gpu",
+                input_types=[
+                    TensorType(DType.int32, [n_left],      self._device_ref),
+                    TensorType(DType.int32, [n_right_in],  self._device_ref),
+                    TensorType(DType.int32, [n_left],      self._device_ref),
+                    TensorType(DType.int32, [n_right_in],  self._device_ref),
+                    TensorType(DType.int32, [table_size],  self._device_ref),
+                    TensorType(DType.int32, [table_size],  self._device_ref),
+                ],
+                custom_extensions=[Path(self.kernels_path)],
+            )
+            with g:
+                lo, ro = ops.custom("join_scatter_left_gpu",
+                                    values=[g.inputs[i] for i in range(6)],
+                                    out_types=[TensorType(DType.int32, [total], self._device_ref),
+                                               TensorType(DType.int32, [total], self._device_ref)],
+                                    device=self._device_ref)
+                g.output(lo, ro)
+            m2 = self.session.load(g)
+            _POST_OP_MODEL_CACHE[ck2] = m2
+        lo_t, ro_t = m2.execute(lk, rk_in, offsets, right_sorted_idx, right_key_starts, right_count)
+        left_idx  = np.asarray(lo_t.to_numpy()).reshape(-1).astype(np.int32)
+        right_idx = np.asarray(ro_t.to_numpy()).reshape(-1).astype(np.int32)
+        return left_idx, right_idx
 
     @staticmethod
     def _hash_join_numpy(left_keys: np.ndarray, right_keys: np.ndarray):
@@ -1691,18 +1863,139 @@ class CustomOpsCompiler(GraphCompiler):
 
         return dense_ids, n_groups, unique_key_cols
 
+    def _build_group_ids_multikey_mojo(self, table, keys):
+        """Multi-key group ID encoding using the Mojo group_composite kernel.
+
+        Phase 16: replaces the NumPy per-key loop
+            composite += enc.indices.to_numpy() * stride
+        with a single fused Mojo kernel pass over all key columns simultaneously.
+        This improves cache efficiency (one memory pass vs K passes) for
+        multi-column groupby (Q7, Q8, Q9, Q10).
+
+        Returns (dense_ids, n_groups, unique_key_cols) or None on failure.
+        """
+        try:
+            # Dictionary-encode each key column (PyArrow SIMD — not replicated in Mojo)
+            encodings = []
+            for k in keys:
+                arr = table.column(k)
+                if isinstance(arr, pa.ChunkedArray):
+                    arr = arr.combine_chunks()
+                encodings.append(arr.dictionary_encode())
+
+            sizes = [len(e.dictionary) for e in encodings]
+            strides_list = []
+            for i in range(len(sizes)):
+                s = 1
+                for j in range(i + 1, len(sizes)):
+                    s *= sizes[j]
+                strides_list.append(s)
+            max_groups = strides_list[0] * sizes[0]
+            n_rows = len(table)
+
+            # Extract int32 index arrays from dictionary encoding
+            key_arrs = [
+                e.indices.to_numpy(zero_copy_only=False).astype(np.int32)
+                for e in encodings
+            ]
+            # Pad to exactly 4 key slots with zero arrays
+            while len(key_arrs) < 4:
+                key_arrs.append(np.zeros(n_rows, dtype=np.int32))
+            strides_padded = list(strides_list) + [0] * (4 - len(strides_list))
+            strides_i64 = np.array(strides_padded[:4], dtype=np.int64)
+
+            # Mojo kernel: fused composite key computation (single memory pass)
+            composite = self._run_group_composite_kernel(
+                key_arrs[0], key_arrs[1], key_arrs[2], key_arrs[3], strides_i64
+            )  # int64 array of length n_rows
+
+            # Fast path: dense cartesian product (max_groups small enough for bitmask)
+            if max_groups <= 1024:
+                present_mask = np.zeros(max_groups, dtype=bool)
+                present_mask[composite] = True
+                present = np.where(present_mask)[0]
+                n_groups = len(present)
+                if n_groups == max_groups:
+                    dense_ids = composite.astype(np.int32)
+                else:
+                    remap = np.empty(max_groups, dtype=np.int32)
+                    remap[present] = np.arange(n_groups, dtype=np.int32)
+                    dense_ids = remap[composite.astype(np.int32)]
+                unique_key_cols = {}
+                for i, k in enumerate(keys):
+                    key_idx = (present // strides_list[i]) % sizes[i]
+                    unique_key_cols[k] = encodings[i].dictionary.take(
+                        pa.array(key_idx.astype(np.int64))
+                    )
+                return dense_ids, n_groups, unique_key_cols
+
+            # Sparse path: numpy sort-based densification
+            unique_composite, dense_inv = np.unique(composite, return_inverse=True)
+            dense_ids = dense_inv.astype(np.int32)
+            n_groups = len(unique_composite)
+            unique_key_cols = {}
+            for i, k in enumerate(keys):
+                key_idx = ((unique_composite // strides_list[i]) % sizes[i]).astype(np.int64)
+                unique_key_cols[k] = encodings[i].dictionary.take(pa.array(key_idx))
+            return dense_ids, n_groups, unique_key_cols
+        except Exception:
+            return None
+
+    def _run_group_composite_kernel(self, k0, k1, k2, k3, strides_i64):
+        """Execute group_composite Mojo kernel on CPU path.
+
+        Inputs: k0..k3 are int32 numpy arrays of length n_rows.
+                strides_i64 is an int64 numpy array of length 4.
+        Returns: int64 numpy array of length n_rows.
+        """
+        n_rows = len(k0)
+        cache_key = ("group_composite", n_rows, self._session_device)
+        model = _POST_OP_MODEL_CACHE.get(cache_key)
+        if model is None:
+            k_type = TensorType(DType.int32, [n_rows], self._device_ref)
+            s_type = TensorType(DType.int64, [4], self._device_ref)
+            out_type = TensorType(DType.int64, [n_rows], self._device_ref)
+            graph = Graph(
+                name="mxframe_group_composite",
+                input_types=[k_type, k_type, k_type, k_type, s_type],
+                custom_extensions=[Path(self.kernels_path)],
+            )
+            with graph:
+                out_node = ops.custom(
+                    name="group_composite",
+                    values=[
+                        graph.inputs[0], graph.inputs[1],
+                        graph.inputs[2], graph.inputs[3],
+                        graph.inputs[4],
+                    ],
+                    out_types=[out_type],
+                    device=self._device_ref,
+                )[0]
+                graph.output(out_node)
+            model = self.session.load(graph)
+            _POST_OP_MODEL_CACHE[cache_key] = model
+        (out,) = model.execute(k0, k1, k2, k3, strides_i64)
+        return np.asarray(out.to_numpy()).reshape(-1)
+
     @staticmethod
     def _build_group_ids_cached(table, keys, gpu_compiler=None):
         """Cached wrapper: reuses group encoding when the same table object is queried.
 
-        gpu_compiler is accepted for API compatibility but GPU group encoding via
-        group_encode.mojo requires compare_exchange_weak which is not available in
-        Mojo 26.1. Falls through to the CPU dictionary_encode path always.
+        Phase 16: when gpu_compiler (the CustomOpsCompiler instance) is available,
+        uses the Mojo group_composite kernel for multi-key groupby to fuse the
+        composite-key computation into a single vectorized pass.
+        Single-key encoding still uses PyArrow dictionary_encode (fastest path).
         """
         cache_key = (id(table), table.num_rows, tuple(keys))
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
+        # Mojo path for multi-key groupby: fused composite key computation
+        if gpu_compiler is not None and len(keys) > 1:
+            result = gpu_compiler._build_group_ids_multikey_mojo(table, keys)
+            if result is not None:
+                _GROUP_ENCODE_CACHE[cache_key] = result
+                return result
         result = CustomOpsCompiler._build_group_ids(table, keys)
         _GROUP_ENCODE_CACHE[cache_key] = result
         return result
