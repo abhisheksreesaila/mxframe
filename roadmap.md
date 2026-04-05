@@ -211,6 +211,7 @@ Every phase unlocks new TPC-H queries. We run them as **validation gates** — i
 | **Phase 6** | SQL frontend | **Q1, Q6, Q3, Q12, Q14** via `mx.sql()` | ✅ All match DuckDB |
 | **Phase 7** | I/O | `read_csv`, `read_parquet`, `from_pandas` | ✅ Done |
 | **Phase 8** | Polish & Release | README, PyPI, scoreboard | ⬜ Next |
+| **Phase 9** | GPU Performance | GPU-native join gather, warm-start caching | ✅ Done |
 
 ### Running TPC-H Validation
 
@@ -268,6 +269,7 @@ Phase 5: Joins                     ███████████████
 Phase 5+: Tier 2 CASE WHEN/isin   ████████████████████  ✅ DONE — Q12/Q14 CASE WHEN
 Phase 6: SQL Frontend              ████████████████████  ✅ DONE — Q1,Q6,Q3,Q12,Q14 via SQL
 Phase 7: I/O & Usability           ████████████████████  ✅ DONE — read_csv/parquet/pandas
+Phase 9: GPU Join Gather + Warmup  ████████████████████  ✅ DONE — GPU gather, mx.warmup()
 Phase 8: Polish & Release          ░░░░░░░░░░░░░░░░░░░░  ← NEXT — README, scoreboard, PyPI
 ```
 
