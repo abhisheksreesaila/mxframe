@@ -271,7 +271,7 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, or startswith anywhere."""
-        if expr.op in ("case_when", "isin", "startswith", "not", "year"):
+        if expr.op in ("case_when", "isin", "startswith", "contains", "not", "year"):
             return True
         from .lazy_expr import Expr as _Expr
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
@@ -307,6 +307,9 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "startswith":
             col_arr = self._eval_expr_arrow(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])
+        if op == "contains":
+            col_arr = self._eval_expr_arrow(args[0], table)
+            return pc.match_substring(col_arr, pattern=args[1])
         if op == "case_when":
             cond  = self._eval_expr_arrow(args[0], table)
             then  = self._eval_expr_arrow(args[1], table)
@@ -327,7 +330,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith"):
+            if expr.op in ("case_when", "isin", "startswith", "contains"):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)

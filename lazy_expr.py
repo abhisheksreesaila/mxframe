@@ -71,6 +71,10 @@ class Expr:
         """True for rows where this string column starts with *prefix*."""
         return Expr("startswith", self, prefix)
 
+    def contains(self, pattern: str) -> 'Expr':
+        """True for rows where this string column contains *pattern* (substring match)."""
+        return Expr("contains", self, pattern)
+
     def year(self) -> 'Expr':
         """Extract the year from an integer YYYYMMDD date column (or Arrow date32)."""
         return Expr("year", self)

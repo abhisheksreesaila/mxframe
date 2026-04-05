@@ -225,6 +225,9 @@ class GraphCompiler:
         if op == "startswith":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])
+        if op == "contains":
+            col_arr = GraphCompiler._eval_predicate(args[0], table)
+            return pc.match_substring(col_arr, pattern=args[1])
         if op == "case_when":
             cond = GraphCompiler._eval_predicate(args[0], table)
             then = GraphCompiler._eval_predicate(args[1], table)
