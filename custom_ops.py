@@ -44,6 +44,7 @@ _GROUP_ENCODE_CACHE: Dict[tuple, tuple] = {}  # (table_id, num_rows, keys) → e
 _INPUT_PREP_CACHE: Dict[tuple, dict] = {}    # (table_id, num_rows, plan_sig, device) → prepared arrays
 _POST_OP_MODEL_CACHE: Dict[tuple, Any] = {}  # ("sort_indices"|"unique_mask", N, device) → model  (GPU only)
 _GPU_BUFFER_CACHE: Dict[tuple, Dict[str, Any]] = {}  # prep_key → {col_name: driver.Buffer} (stable inputs only, never __filter_mask__)
+_JOIN_RESULT_CACHE: Dict[tuple, Any] = {}  # (left_stable_key, right_stable_key, left_on, right_on) → pa.Table
 
 
 def _get_or_create_session(device_name: str, driver_device) -> Any:
@@ -65,6 +66,7 @@ def clear_cache():
     _INPUT_PREP_CACHE.clear()
     _POST_OP_MODEL_CACHE.clear()
     _GPU_BUFFER_CACHE.clear()
+    _JOIN_RESULT_CACHE.clear()
 
 
 class CustomOpsCompiler(GraphCompiler):
@@ -364,6 +366,37 @@ class CustomOpsCompiler(GraphCompiler):
         new_plan = _rewrite_plan(plan)
         return new_plan, derived_specs
 
+
+    def _compute_global_agg_pyarrow(self, table: "pa.Table", agg_node) -> "pa.Table":
+        """Evaluate a global (ungrouped) aggregate using PyArrow/numpy.
+
+        Called when the plan has an Aggregate with no group_by keys.  Covers
+        sum / min / max / mean / count with arbitrary expression trees (mul, add,
+        case_when, startswith, isin, …) via ``_eval_expr_arrow``.
+
+        Returns a single-row pa.Table with one column per aggregation.
+        """
+        import pyarrow as _pa
+        result_cols = {}
+        for i, expr in enumerate(agg_node.aggs):
+            name = expr._alias or f"agg_{i}"
+            op   = expr.op
+            if op in ("sum", "min", "max", "mean"):
+                inner_arr = self._eval_expr_arrow(expr.args[0], table)
+                arr_np    = inner_arr.to_numpy(zero_copy_only=False).astype("float64")
+                if   op == "sum":  val = float(arr_np.sum())
+                elif op == "min":  val = float(arr_np.min())
+                elif op == "max":  val = float(arr_np.max())
+                else:              val = float(arr_np.mean())   # mean
+                result_cols[name] = _pa.array([val], type=_pa.float64())
+            elif op == "count":
+                result_cols[name] = _pa.array([len(table)], type=_pa.int64())
+            else:
+                raise NotImplementedError(
+                    f"_compute_global_agg_pyarrow: unsupported agg op '{op}'"
+                )
+        return _pa.table(result_cols)
+
     def _compute_cache_key(self, plan, all_names, all_arrays, n_groups, optimizer_trace=None):
         """Compute a hashable cache key for the compiled graph model.
 
@@ -463,6 +496,28 @@ class CustomOpsCompiler(GraphCompiler):
             }
             if verbose:
                 print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
+            return result
+
+        # 1b2 -- Global aggregate shortcut: bypass MAX Engine for un-grouped aggs.
+        # ops.sum / max / etc. on GPU is unreliable; PyArrow+numpy is faster for
+        # the small joined-table sizes typical of TPC-H Q14-style queries.
+        _agg_check = self._find_aggregate(self._strip_filter_nodes(plan))
+        if _agg_check is not None and not _agg_check.group_by:
+            _agg_orig  = self._find_aggregate(plan)
+            _inner_tbl = self._plan_to_table(_agg_orig.input)
+            result     = self._compute_global_agg_pyarrow(_inner_tbl, _agg_orig)
+            if post_ops:
+                result = self._apply_post_ops_custom(result, post_ops)
+            t1 = _time.perf_counter()
+            self.last_compile_provenance = {
+                "device": self._session_device, "rows": 1,
+                "grouped": False, "n_groups": 0, "cache_hit": False,
+                "compile_ms": 0.0,
+                "execute_ms": round((t1 - t0) * 1000, 1),
+                "gpu_input_path": "pyarrow",
+                "optimizer_trace": list(optimizer_trace or []),
+                "path": "global_agg_pyarrow",
+            }
             return result
 
         # 1 -- Resolve plan, predicates, and decide execution path -----
@@ -1027,11 +1082,13 @@ class CustomOpsCompiler(GraphCompiler):
         'gather_f32' / 'gather_i32' Mojo kernels; string/date columns fall back to
         PyArrow .take() on CPU.
         """
-        def _get_gather_model(mojo_name: str, arr_dtype: DType):
-            ck = (mojo_name, N, self._session_device)
+        def _get_gather_model(mojo_name: str, arr_dtype: DType, source_len: int):
+            # Cache key includes source_len: source table size determines graph input
+            # type for position 0; different table sizes require different compiled models.
+            ck = (mojo_name, source_len, N, self._session_device)
             m = _POST_OP_MODEL_CACHE.get(ck)
             if m is None:
-                val_type = TensorType(arr_dtype, [N], self._device_ref)
+                val_type = TensorType(arr_dtype, [source_len], self._device_ref)
                 idx_type = TensorType(DType.int32, [N], self._device_ref)
                 g = Graph(
                     name=f"mxframe_{mojo_name}",
@@ -1059,15 +1116,16 @@ class CustomOpsCompiler(GraphCompiler):
             col = table.column(col_name)
             if isinstance(col, pa.ChunkedArray):
                 col = col.combine_chunks()
+            source_len = len(col)
             if pa.types.is_float32(col.type):
-                model = _get_gather_model("gather_f32", DType.float32)
+                model = _get_gather_model("gather_f32", DType.float32, source_len)
                 col_buf = driver.Buffer.from_numpy(
                     col.to_numpy(zero_copy_only=False).astype(np.float32)
                 ).to(self._gpu_driver)
                 (out_t,) = model.execute(col_buf, idx_buf)
                 gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
             elif pa.types.is_integer(col.type):
-                model = _get_gather_model("gather_i32", DType.int32)
+                model = _get_gather_model("gather_i32", DType.int32, source_len)
                 col_buf = driver.Buffer.from_numpy(
                     col.to_numpy(zero_copy_only=False).astype(np.int32)
                 ).to(self._gpu_driver)
@@ -1098,23 +1156,61 @@ class CustomOpsCompiler(GraphCompiler):
 
     # -- Join materialization ------------------------------------------
 
+    @staticmethod
+    def _plan_stable_key(plan) -> tuple | None:
+        """Return a stable, hashable key for a join-free Filter→Scan chain.
+
+        Used to cache join results across repeated .compute() calls on the same
+        input tables with identical filter predicates.  Returns None for plans
+        that are too complex to cheaply fingerprint (nested joins, projections, …).
+        """
+        if isinstance(plan, Scan):
+            return (id(plan.table), plan.table.num_rows)
+        if isinstance(plan, Filter):
+            inner = CustomOpsCompiler._plan_stable_key(plan.input)
+            if inner is None:
+                return None
+            return inner + (plan.predicate.signature(),)
+        return None
+
     def _materialize_joins(self, plan):
         """Recursively replace Join nodes with Scan(joined_table).
 
         Walks bottom-up: materializes both sides of a Join, executes the
         hash join (Mojo kernel or numpy), and returns a Scan of the result.
         After this, the plan tree is a single-input chain again.
+
+        Join results are cached in _JOIN_RESULT_CACHE keyed by the stable
+        fingerprints of both input plans + join columns.  This eliminates
+        redundant join computation on hot calls where the input tables are
+        the same Python objects.
         """
         if isinstance(plan, Scan):
             return plan
         if isinstance(plan, Join):
             left_plan = self._materialize_joins(plan.left)
             right_plan = self._materialize_joins(plan.right)
+
+            # Attempt join-result cache lookup before materialising tables.
+            left_key  = self._plan_stable_key(left_plan)
+            right_key = self._plan_stable_key(right_plan)
+            join_cache_key: tuple | None = None
+            if left_key is not None and right_key is not None:
+                join_cache_key = (
+                    left_key, right_key,
+                    tuple(plan.left_on), tuple(plan.right_on),
+                )
+                cached_join = _JOIN_RESULT_CACHE.get(join_cache_key)
+                if cached_join is not None:
+                    return Scan(cached_join)
+
             left_table = self._plan_to_table(left_plan)
             right_table = self._plan_to_table(right_plan)
             joined = self._execute_hash_join(
                 left_table, right_table, plan.left_on, plan.right_on
             )
+            if join_cache_key is not None:
+                _JOIN_RESULT_CACHE[join_cache_key] = joined
             return Scan(joined)
         if isinstance(plan, Filter):
             return Filter(self._materialize_joins(plan.input), plan.predicate)

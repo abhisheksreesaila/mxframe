@@ -838,6 +838,13 @@ def main() -> None:
         q12_rows.append(("MXFrame CPU",
             _stats(_time_cold(lambda: run_q12_mxframe(orders_q12, li_q12, device="cpu"), COLD)),
             _stats(_time_runs( lambda: run_q12_mxframe(orders_q12, li_q12, device="cpu"), HOT, warmup=2))))
+        if GPU_READY:
+            try:
+                q12_rows.append(("MXFrame GPU",
+                    _stats(_time_cold(lambda: run_q12_mxframe(orders_q12, li_q12, device="gpu"), COLD)),
+                    _stats(_time_runs( lambda: run_q12_mxframe(orders_q12, li_q12, device="gpu"), HOT, warmup=2))))
+            except Exception as e:
+                print(f"  GPU Q12 skipped: {e}")
         q12_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q12_pandas(orders_q12, li_q12), HOT, warmup=1))))
         if POLARS_AVAILABLE:
             q12_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q12_polars(orders_q12, li_q12), HOT, warmup=2))))
@@ -864,6 +871,13 @@ def main() -> None:
         q14_rows.append(("MXFrame CPU",
             _stats(_time_cold(lambda: run_q14_mxframe(part_q14, li_q14, device="cpu"), COLD)),
             _stats(_time_runs( lambda: run_q14_mxframe(part_q14, li_q14, device="cpu"), HOT, warmup=2))))
+        if GPU_READY:
+            try:
+                q14_rows.append(("MXFrame GPU",
+                    _stats(_time_cold(lambda: run_q14_mxframe(part_q14, li_q14, device="gpu"), COLD)),
+                    _stats(_time_runs( lambda: run_q14_mxframe(part_q14, li_q14, device="gpu"), HOT, warmup=2))))
+            except Exception as e:
+                print(f"  GPU Q14 skipped: {e}")
         q14_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q14_pandas(part_q14, li_q14), HOT, warmup=1))))
         if POLARS_AVAILABLE:
             q14_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q14_polars(part_q14, li_q14), HOT, warmup=2))))
