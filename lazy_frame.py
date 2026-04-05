@@ -114,6 +114,23 @@ class LazyFrame:
         parsed_exprs = [col(e) if isinstance(e, str) else e for e in exprs]
         return LazyFrame(Project(self.plan, parsed_exprs))
 
+    def with_columns(self, *exprs):
+        """Add or replace columns preserving all existing ones.
+
+        Numeric arithmetic is compiled to MAX Graph ops (Mojo); case_when/isin/
+        string ops fall through to the engine thin PyArrow pre-compute layer.
+        """
+        new_aliases = {e._alias for e in exprs if e._alias}
+        def _scan_cols(p):
+            if isinstance(p, Scan):
+                return list(p.table.column_names)
+            if hasattr(p, "input"):
+                return _scan_cols(p.input)
+            return []
+        existing = _scan_cols(self.plan)
+        passthrough = [col(c) for c in existing if c not in new_aliases]
+        return LazyFrame(Project(self.plan, passthrough + list(exprs)))
+
     def filter(self, predicate):
         """Filter rows based on a condition."""
         return LazyFrame(Filter(self.plan, predicate))

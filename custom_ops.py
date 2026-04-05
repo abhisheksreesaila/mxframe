@@ -310,6 +310,17 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "contains":
             col_arr = self._eval_expr_arrow(args[0], table)
             return pc.match_substring(col_arr, pattern=args[1])
+        if op == "year":
+            col_arr = self._eval_expr_arrow(args[0], table)
+            if col_arr.type in (pa.int32(), pa.int64()):
+                return pc.cast(pc.divide(col_arr, pa.scalar(10000, type=pa.int32())), pa.int32())
+            return pc.year(col_arr)
+        if op in ("and", "__and__"):
+            return pc.and_(self._eval_expr_arrow(args[0], table),
+                           self._eval_expr_arrow(args[1], table))
+        if op in ("or", "__or__"):
+            return pc.or_(self._eval_expr_arrow(args[0], table),
+                          self._eval_expr_arrow(args[1], table))
         if op == "case_when":
             cond  = self._eval_expr_arrow(args[0], table)
             then  = self._eval_expr_arrow(args[1], table)
@@ -583,7 +594,24 @@ class CustomOpsCompiler(GraphCompiler):
             _group_ids_full = None
 
             if agg_node is not None and agg_node.group_by:
-                group_keys = [e.args[0] for e in agg_node.group_by]
+                # Resolve group keys: plain col("name") → string; Expr (e.g. year()) → pre-eval.
+                # For Expr keys, evaluate them via thin PyArrow (integer SIMD ops like date//10000)
+                # and inject as synthetic columns into the scan table.  The actual groupby
+                # aggregation (group_sum / group_count kernels) still runs entirely in Mojo.
+                group_keys = []
+                _gk_table = original_scan.table
+                for _e in agg_node.group_by:
+                    if _e.op == "col":
+                        group_keys.append(_e.args[0])
+                    else:
+                        # Derived key (e.g. year(col("l_shipdate")).alias("l_year"))
+                        _col_name = _e._alias or f"__gk_{len(group_keys)}__"
+                        if _col_name not in _gk_table.column_names:
+                            _arr = self._eval_expr_arrow(_e, _gk_table)
+                            _gk_table = _gk_table.append_column(_col_name, _arr)
+                        group_keys.append(_col_name)
+                if _gk_table is not original_scan.table:
+                    original_scan = Scan(_gk_table)
                 group_ids_full, n_groups, unique_key_cols = self._build_group_ids_cached(
                     original_scan.table, group_keys, gpu_compiler=self
                 )
@@ -833,6 +861,11 @@ class CustomOpsCompiler(GraphCompiler):
         elif isinstance(plan, Project):
             upstream = self._visit_plan_custom(plan.input, nodes, n_groups=n_groups)
             out = {}
+            # Pass through internal engine slots (e.g. __group_ids__) so that
+            # an Aggregate above a with_columns Project can still find them.
+            for _k, _v in upstream.items():
+                if _k.startswith("__") and _k.endswith("__"):
+                    out[_k] = _v
             for i, expr in enumerate(plan.exprs):
                 name = expr._alias or f'col_{i}'
                 out[name] = self._visit_expr(expr, upstream)

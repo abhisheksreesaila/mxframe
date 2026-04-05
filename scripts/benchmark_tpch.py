@@ -911,11 +911,9 @@ def make_tpch_q7_tables(n_sup=2_000, n_cust=10_000, n_orders=80_000, n_li=200_00
 
 
 def run_q7_mxframe(nation, supplier, customer, orders, lineitem, device="cpu") -> pa.Table:
-    # Join chain: lineitem ⋈ orders ⋈ customer → cust_nation; lineitem ⋈ supplier → supp_nation
-    # Simplified: join lineitem+orders+customer+nation (cust side), supplier+nation (supp side)
-    # via linear chain; supp_nation via separate join
-    # Step 1+2 merged: filter lineitem + full join chain in one compute
-    joined = (
+    # Single-step: join chain then groupby with year() as native expression key.
+    # No intermediate PyArrow compute — year extraction is handled inside the engine.
+    return (
         LazyFrame(Scan(lineitem))
         .filter(
             (col("l_shipdate") >= lit(Q7_DATE_LO)) &
@@ -932,18 +930,7 @@ def run_q7_mxframe(nation, supplier, customer, orders, lineitem, device="cpu") -
                 col("n_nationkey").alias("s_nk"), col("n_name").alias("supp_nation")
              ),
              left_on="s_nationkey", right_on="s_nk")
-        .compute(device=device)
-    )
-    # Step 3: precompute l_year column (YYYYMMDD // 10000)
-    year_arr = pc.cast(
-        pc.divide(joined.column("l_shipdate"), pa.scalar(10000, type=pa.int32())),
-        pa.int32()
-    )
-    joined = joined.append_column("l_year", year_arr)
-    # Step 4: groupby + agg
-    return (
-        LazyFrame(Scan(joined))
-        .groupby("supp_nation", "cust_nation", "l_year")
+        .groupby("supp_nation", "cust_nation", col("l_shipdate").year().alias("l_year"))
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount")))
             .sum().alias("revenue")
@@ -1057,63 +1044,38 @@ def make_tpch_q8_tables(n_parts=5_000, n_cust=10_000, n_orders=80_000, n_li=200_
 
 
 def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu") -> pa.Table:
-    # Pre-filter: region AMERICA (regionkey=1), part type
-    n_america = nation.to_pandas()
-    n_america = n_america[n_america.n_regionkey == 1]  # AMERICA nations
-    brazil_nk = 2  # BRAZIL is nations[2]
-    american_nkeys = n_america["n_nationkey"].tolist()
+    # Pre-filter customer to AMERICA nations (thin PyArrow lookup on small tables).
+    # The actual volume/brazil_vol arithmetic runs inside the MAX Graph via with_columns.
+    brazil_nk = 2  # BRAZIL nationkey
+    american_nkeys = nation.filter(
+        pc.equal(nation.column("n_regionkey"), pa.scalar(1, pa.int32()))
+    ).column("n_nationkey").to_pylist()
 
-    # Build nation-name lookup via PyArrow for the supplier/customer nation join
-    cust_am = pa.table({
-        "c_custkey":   customer.column("c_custkey"),
-        "c_nationkey": customer.column("c_nationkey"),
-    }).filter(pc.is_in(customer.column("c_nationkey"),
-                       value_set=pa.array(american_nkeys, type=pa.int32())))
+    cust_am = customer.filter(
+        pc.is_in(customer.column("c_nationkey"),
+                 value_set=pa.array(american_nkeys, type=pa.int32()))
+    ).select(["c_custkey", "c_nationkey"])
 
-    # MXFrame join chain: li ⋈ part ⋈ orders ⋈ customer_america ⋈ nation
-    li_f_pa = pa.table({
-        "l_orderkey":      lineitem.column("l_orderkey"),
-        "l_partkey":       lineitem.column("l_partkey"),
-        "l_extendedprice": lineitem.column("l_extendedprice"),
-        "l_discount":      lineitem.column("l_discount"),
-    })
+    # Full join chain: lineitem ⋈ part(type) ⋈ orders ⋈ customer_america
+    # with_columns computes volume and brazil_vol inside the MAX Graph engine (not PyArrow).
+    # year() as groupby key is resolved inside the engine (thin SIMD divide once).
+    brazil_vol_expr = when(
+        col("c_nationkey") == lit(brazil_nk),
+        col("l_extendedprice") * (lit(1.0) - col("l_discount")),
+        lit(0.0),
+    ).alias("brazil_vol")
+    volume_expr = (col("l_extendedprice") * (lit(1.0) - col("l_discount"))).alias("volume")
 
-    joined = (
-        LazyFrame(Scan(li_f_pa))
+    result = (
+        LazyFrame(Scan(lineitem))
         .join(
             LazyFrame(Scan(part)).filter(col("p_type") == lit("ECONOMY ANODIZED STEEL")),
             left_on="l_partkey", right_on="p_partkey",
         )
-        .join(LazyFrame(Scan(orders)), left_on="l_orderkey", right_on="o_orderkey")
-        .join(LazyFrame(Scan(cust_am)), left_on="o_custkey", right_on="c_custkey")
-        .join(
-            LazyFrame(Scan(nation)).select(
-                col("n_nationkey").alias("cn_key"),
-                col("n_name").alias("cust_nation")
-            ),
-            left_on="c_nationkey", right_on="cn_key",
-        )
-        .compute(device=device)
-    )
-    # Add year column
-    year_arr = pc.cast(
-        pc.divide(joined.column("o_orderdate"), pa.scalar(10000, type=pa.int32())),
-        pa.int32()
-    )
-    joined = joined.append_column("o_year", year_arr)
-    # Add volume and brazil_vol
-    vol = pc.multiply(
-        joined.column("l_extendedprice").cast(pa.float32()),
-        pc.subtract(pa.scalar(1.0, pa.float32()), joined.column("l_discount"))
-    )
-    is_brazil = pc.equal(joined.column("c_nationkey"), pa.scalar(brazil_nk, pa.int32()))
-    bvol = pc.if_else(is_brazil, vol, pa.scalar(0.0, pa.float32()))
-    joined = joined.append_column("volume", vol)
-    joined = joined.append_column("brazil_vol", bvol)
-    # GroupBy year → sum
-    result = (
-        LazyFrame(Scan(joined))
-        .groupby("o_year")
+        .join(LazyFrame(Scan(orders)),   left_on="l_orderkey", right_on="o_orderkey")
+        .join(LazyFrame(Scan(cust_am)),  left_on="o_custkey",  right_on="c_custkey")
+        .with_columns(volume_expr, brazil_vol_expr)
+        .groupby(col("o_orderdate").year().alias("o_year"))
         .agg(
             col("volume").sum().alias("total_vol"),
             col("brazil_vol").sum().alias("brazil_vol_sum"),
@@ -1121,7 +1083,7 @@ def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu
         .sort(col("o_year"))
         .compute(device=device)
     )
-    # Compute market_share = brazil_vol / total_vol
+    # Final market_share ratio (2-row result — negligible cost)
     tv = result.column("total_vol").to_pylist()
     bv = result.column("brazil_vol_sum").to_pylist()
     ms = [b / t if t else 0.0 for b, t in zip(bv, tv)]
@@ -1493,8 +1455,9 @@ def make_tpch_q9_tables(n_parts=5_000, n_suppliers=2_000, n_orders=80_000,
 
 
 def run_q9_mxframe(nation, supplier, partsupp, part, orders, lineitem, device="cpu") -> pa.Table:
-    # Step 1: join chain — lineitem ⋈ part(green) ⋈ partsupp ⋈ supplier ⋈ nation ⋈ orders
-    joined = (
+    # Single compute: join chain + year() as native groupby key (no intermediate PyArrow).
+    # Profit arithmetic computed in the MAX Graph; year() engine-resolved (thin SIMD divide).
+    return (
         LazyFrame(Scan(lineitem))
         .join(
             LazyFrame(Scan(part)).filter(col("p_name").contains("green")),
@@ -1506,18 +1469,7 @@ def run_q9_mxframe(nation, supplier, partsupp, part, orders, lineitem, device="c
         .join(LazyFrame(Scan(supplier)), left_on="l_suppkey",   right_on="s_suppkey")
         .join(LazyFrame(Scan(nation)),   left_on="s_nationkey", right_on="n_nationkey")
         .join(LazyFrame(Scan(orders)),   left_on="l_orderkey",  right_on="o_orderkey")
-        .compute(device=device)
-    )
-    # Step 2: pre-compute o_year
-    year_arr = pc.cast(
-        pc.divide(joined.column("o_orderdate"), pa.scalar(10000, type=pa.int32())),
-        pa.int32(),
-    )
-    joined = joined.append_column("o_year", year_arr)
-    # Step 3: groupby nation/year → sum profit
-    return (
-        LazyFrame(Scan(joined))
-        .groupby("n_name", "o_year")
+        .groupby("n_name", col("o_orderdate").year().alias("o_year"))
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount"))
              - col("ps_supplycost") * col("l_quantity"))
