@@ -14,6 +14,7 @@ setup-mxframe = "ln -sfn $(pwd) .pixi/envs/default/lib/python3.12/site-packages/
 # Run benchmarks: pixi run bench
 bench      = { cmd = "python scripts/benchmark_gpu_first.py",   depends-on = ["setup-mxframe"] }
 bench-tpch = { cmd = "python scripts/benchmark_tpch.py",        depends-on = ["setup-mxframe"] }
+demo       = { cmd = "python scripts/demo.py",                   depends-on = ["setup-mxframe"] }
 test0    = { cmd = "python scripts/_test_phase0_compiler.py", depends-on = ["setup-mxframe"] }
 test1    = { cmd = "python scripts/_test_phase1.py",          depends-on = ["setup-mxframe"] }
 test4    = { cmd = "python scripts/_test_phase4.py",          depends-on = ["setup-mxframe"] }
