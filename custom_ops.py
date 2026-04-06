@@ -1209,11 +1209,11 @@ class CustomOpsCompiler(GraphCompiler):
 
     @staticmethod
     def _plan_stable_key(plan) -> tuple | None:
-        """Return a stable, hashable key for a join-free Filter→Scan chain.
+        """Return a stable, hashable key for a Filter|Project→Scan chain.
 
         Used to cache join results across repeated .compute() calls on the same
-        input tables with identical filter predicates.  Returns None for plans
-        that are too complex to cheaply fingerprint (nested joins, projections, …).
+        input tables with identical filter/projection predicates.  Returns None
+        for plans that are too complex to cheaply fingerprint (nested joins, …).
         """
         if isinstance(plan, Scan):
             return (id(plan.table), plan.table.num_rows)
@@ -1222,6 +1222,11 @@ class CustomOpsCompiler(GraphCompiler):
             if inner is None:
                 return None
             return inner + (plan.predicate.signature(),)
+        if isinstance(plan, Project):
+            inner = CustomOpsCompiler._plan_stable_key(plan.input)
+            if inner is None:
+                return None
+            return inner + ("project", tuple(e.signature() for e in plan.exprs))
         return None
 
     def _materialize_joins(self, plan):
@@ -1263,6 +1268,12 @@ class CustomOpsCompiler(GraphCompiler):
             )
             if join_cache_key is not None:
                 _JOIN_RESULT_CACHE[join_cache_key] = joined
+                # Evict oldest half when cache exceeds 24 entries to prevent
+                # unbounded memory accumulation across long benchmark runs.
+                if len(_JOIN_RESULT_CACHE) > 24:
+                    evict_n = 12
+                    for _old_k in list(_JOIN_RESULT_CACHE.keys())[:evict_n]:
+                        del _JOIN_RESULT_CACHE[_old_k]
             return Scan(joined)
         if isinstance(plan, Filter):
             return Filter(self._materialize_joins(plan.input), plan.predicate)
