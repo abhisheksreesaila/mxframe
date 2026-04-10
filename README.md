@@ -1,10 +1,21 @@
 # mxframe
 
-## 🎯 Vision
+## 🔭 Vision & Differentiators
 
-**mxframe** bridges the gap between Python DataFrames and
-high-performance GPU compute. By leveraging PyArrow’s columnar memory
-format and MAX Engine’s accelerated kernels, we enable:
+**mxframe** is the **best GPU-powered DataFrame framework that exists today**, built natively on the Modular MAX Graph and Mojo. 
+
+It aims to be as easy to use as pandas/polars, but with a fundamentally different engine: **every operation compiles to optimized Mojo code that runs on CPU *or* GPU** — no CUDA, no Rapids retrofit, and no Python interpreter in the hot path.
+
+### Why does mxframe exist?
+
+| Library | The Problem | How mxframe differs |
+|---------|-------------|-------------------|
+| **pandas** | Eager execution, single-threaded, CPU-only, and notoriously **incapable of running full TPC-H benchmarks** smoothly. | **Lazy by default**, compiled execution, GPU-capable from day one, effortlessly handles TPC-H workloads. |
+| **Polars** | Rust-based, amazing on CPU, but GPU execution requires bolting on plugins (like `cudf-polars`). | **Mojo-based**, GPU and CPU native via a single unified execution graph. No plugins needed. |
+| **cuDF/Rapids** | Requires the heavy NVIDIA Rapids ecosystem, specific CUDA toolkit setups, and often complex environment gymnastics. | ZERO CUDA tooling required. **`pixi install`** handles everything via Modular MAX. |
+| **Spark** | Distributed overhead, JVM-heavy, high initial latency before data even moves. | Single-node, **zero-overhead**, instant PyArrow memory pointer compilation via Mojo. |
+
+By leveraging PyArrow’s columnar memory format and MAX Engine’s accelerated kernels, we enable:
 
 - **Zero-copy data sharing** between PyArrow and MAX tensors
 - **Seamless CPU/GPU execution** with a unified API  
@@ -125,11 +136,7 @@ pip install -e .
 
 For more detailed developer instructions, architecture, and guidelines, please refer to our **[Developer Guide](DEVELOPER.md)** adjacent to this README.
 
-## 📚 Documentation
-
-> *API Reference and detailed documentation are currently being migrated from our initial prototypes to a new format and will be available soon.*
-
-## 🗺️ Roadmap
+## 🗺️ Roadmap [Complete]
 
 - [x] Lazy evaluation and query optimization
 - [x] Filter / Join / GroupBy / Sort / Limit / Distinct
