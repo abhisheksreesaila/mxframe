@@ -18,9 +18,10 @@ jobs:
       with:
         pixi-version: v0.41.4
         
-    - name: Install Pytest
+    - name: Install Package and Pytest
       run: |
         pixi add pytest
+        pixi run pip install -e .
         
     - name: Test with Pytest
       run: |
