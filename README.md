@@ -21,6 +21,46 @@ By leveraging PyArrow’s columnar memory format and MAX Engine’s accelerated 
 - **Seamless CPU/GPU execution** with a unified API  
 - **Production-ready performance** without leaving Python
 
+---
+
+## ⚡ Performance & Benchmarks
+
+We designed **mxframe** to be the absolute fastest DataFrame engine you can install via a standard Python/Pixi package. Our primary yardstick is the **TPC-H Benchmark** (the gold standard for database operations).
+
+While **Pandas** struggles immensely with TPC-H compatibility and speed, and **Polars** acts as our closest peer for CPU workloads, **mxframe** beats both of them on standard CPU hardware while concurrently unlocking native GPU acceleration.
+
+### TPC-H Q1: Grouped Aggregation
+*1,000,000 rows — Filter + GroupBy + 8 Aggregations. Time in steady-state (hot).*
+
+| Engine | Execution Time (ms) | Relative to Pandas | Relative to Polars |
+|--------|--------------------:|-------------------:|-------------------:|
+| **MXFrame CPU** | **14.0 ms** | **0.15x** (6.8x faster) | **0.48x** (2.1x faster) |
+| **Polars** | 29.0 ms | 0.30x (3.3x faster) | 1.00x |
+| **MXFrame GPU** | 32.6 ms | 0.34x (2.9x faster) | 1.13x |
+| **Pandas** | 95.6 ms | 1.00x | 3.30x |
+
+### TPC-H Q6: Filtered Global Aggregate
+*1,000,000 rows — 5 Filters + Global Sum.*
+
+| Engine | Execution Time (ms) | Relative to Pandas | Relative to Polars |
+|--------|--------------------:|-------------------:|-------------------:|
+| **MXFrame CPU** | **3.2 ms** | **0.50x** (2.0x faster) | **0.38x** (2.6x faster) |
+| **MXFrame GPU** | 4.0 ms | 0.62x (1.6x faster) | 0.47x (2.1x faster) |
+| **Pandas** | 6.4 ms | 1.00x | 0.76x |
+| **Polars** | 8.5 ms | 1.32x | 1.00x |
+
+### Sort & Limit (Top 10)
+*GroupBy + Aggregation + Sort + Limit (10).*
+
+| Engine | Execution Time (ms) | Relative to Pandas | Relative to Polars |
+|--------|--------------------:|-------------------:|-------------------:|
+| **MXFrame CPU** | **4.1 ms** | **0.34x** (3.0x faster) | **0.25x** (4.0x faster) |
+| **MXFrame GPU** | 9.7 ms | 0.79x (1.3x faster) | 0.58x (1.7x faster) |
+| **Pandas** | 12.3 ms | 1.00x | 0.73x |
+| **Polars** | 16.7 ms | 1.36x | 1.00x |
+
+*For complete reproducible benchmark testing suites (including cold vs hot compilation times execution metrics), see our [benchmarks/](benchmarks) directory folder!*
+
 ### 🚀 What’s in v0.0.1
 
 This initial release provides a **lazy DataFrame engine** with compiled
