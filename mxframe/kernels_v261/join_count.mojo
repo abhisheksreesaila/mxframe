@@ -65,7 +65,9 @@ fn _join_count_gpu(
     comptime BLOCK_SIZE = 256
     var n_left = left_keys.dim_size(0)
     var n_right = right_keys.dim_size(0)
-    var table_size = Int(max_key_buf[0]) + 1
+    # Derive table_size from the buffer dimension — NOT from max_key_buf data,
+    # because max_key_buf lives in GPU memory and cannot be read from host code.
+    var table_size = right_count_buf.dim_size(0)
 
     if n_left == 0:
         return

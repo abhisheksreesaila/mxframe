@@ -97,7 +97,6 @@ class Join(LogicalPlan):
 
 
 # %% ../nbs/02_lazy_frame.ipynb 6
-# Device type used by compute()
 DeviceType = Literal["cpu", "gpu", "auto"]
 
 
@@ -107,6 +106,8 @@ class LazyFrame:
         if isinstance(plan, pa.Table):
             plan = Scan(plan)
         self.plan = plan
+        self._last_compile_provenance = None
+        self._last_optimizer_trace = []
 
     def select(self, *exprs):
         """Select columns or compute new ones."""
@@ -122,7 +123,13 @@ class LazyFrame:
         parsed_by = [col(b) if isinstance(b, str) else b for b in by]
         return LazyGroupBy(self, parsed_by)
 
-    def compute(self, device: DeviceType = "cpu", verbose: bool = False) -> pa.Table:
+    def compute(
+        self,
+        device: DeviceType = "cpu",
+        verbose: bool = False,
+        optimize: bool = True,
+        validate: bool = True,
+    ) -> pa.Table:
         """Execute the logical plan and return the result.
 
         Args:
@@ -131,9 +138,90 @@ class LazyFrame:
                 "gpu"  — run on GPU; raises RuntimeError if no GPU is available.
                 "auto" — use GPU when available and N > 100K rows, else CPU.
             verbose: if True, print compile/execute timing and cache status.
+            optimize: if True (default), run logical plan optimization passes first.
+            validate: if True (default), validate logical plan invariants before execution.
         """
         from mxframe.custom_ops import CustomOpsCompiler
-        return CustomOpsCompiler(device=device).compile_and_run(self.plan, verbose=verbose)
+        plan = self.plan
+        optimizer_trace = None
+
+        if validate:
+            from .plan_validation import validate_plan_or_raise
+            validate_plan_or_raise(plan)
+
+        if optimize:
+            from .optimizer import optimize_plan
+            opt = optimize_plan(self.plan)
+            plan = opt.plan
+            optimizer_trace = opt.trace
+            if validate:
+                from .plan_validation import validate_plan_or_raise
+                validate_plan_or_raise(plan)
+            if verbose and opt.trace:
+                print("[mxframe] optimizer passes:")
+                for line in opt.trace:
+                    print(f"  - {line}")
+
+        compiler = CustomOpsCompiler(device=device)
+        result = compiler.compile_and_run(
+            plan,
+            verbose=verbose,
+            optimizer_trace=optimizer_trace,
+        )
+        self._last_compile_provenance = dict(compiler.last_compile_provenance or {})
+        self._last_optimizer_trace = list(optimizer_trace or [])
+        return result
+
+    def explain(
+        self,
+        optimized: bool = True,
+        validate: bool = False,
+        include_runtime: bool = False,
+    ) -> str:
+        """Return a readable plan explanation.
+
+        Args:
+            optimized: if True (default), include optimizer pass trace and optimized plan.
+            validate: if True, include validation summaries for shown plans.
+            include_runtime: if True, include last compile provenance from compute().
+        """
+        trace = []
+        original_plan = self.plan
+        plan = original_plan
+        title = "LogicalPlan"
+        if optimized:
+            from .optimizer import optimize_plan
+            opt = optimize_plan(self.plan)
+            plan = opt.plan
+            trace = opt.trace
+            title = "OptimizedPlan"
+
+        lines = [title, _format_plan(plan)]
+        if validate:
+            from .plan_validation import validate_plan
+            shown_errors = validate_plan(plan)
+            lines.append("Validation")
+            lines.append("ok" if not shown_errors else f"errors={len(shown_errors)}")
+            if optimized:
+                orig_errors = validate_plan(original_plan)
+                lines.append("OriginalValidation")
+                lines.append("ok" if not orig_errors else f"errors={len(orig_errors)}")
+        if optimized:
+            lines.append("PassTrace")
+            lines.extend(trace if trace else ["no-op"])
+        if include_runtime:
+            lines.append("LastCompileProvenance")
+            if self._last_compile_provenance:
+                for k, v in self._last_compile_provenance.items():
+                    lines.append(f"{k}={v}")
+            else:
+                lines.append("none (run compute() first)")
+        return "\n".join(lines)
+
+    @property
+    def last_compile_provenance(self) -> dict:
+        """Return last compile/execute provenance captured during compute()."""
+        return dict(self._last_compile_provenance or {})
 
 
     def sort(self, *by, descending=False):
@@ -197,4 +285,41 @@ class LazyGroupBy:
     def agg(self, *aggs) -> LazyFrame:
         """Compute aggregations for each group."""
         return LazyFrame(Aggregate(self.df.plan, self.by, list(aggs)))
+
+
+def _format_plan(plan: LogicalPlan, indent: int = 0) -> str:
+    """Pretty-print a logical plan tree."""
+    pad = "  " * indent
+    if isinstance(plan, Scan):
+        return f"{pad}Scan(columns={list(plan.table.column_names)})"
+    if isinstance(plan, Filter):
+        head = f"{pad}Filter(predicate={plan.predicate.signature()})"
+        return "\n".join([head, _format_plan(plan.input, indent + 1)])
+    if isinstance(plan, Project):
+        exprs = [e.signature() for e in plan.exprs]
+        head = f"{pad}Project(exprs={exprs})"
+        return "\n".join([head, _format_plan(plan.input, indent + 1)])
+    if isinstance(plan, Aggregate):
+        group_by = [e.signature() for e in plan.group_by]
+        aggs = [e.signature() for e in plan.aggs]
+        head = f"{pad}Aggregate(group_by={group_by}, aggs={aggs})"
+        return "\n".join([head, _format_plan(plan.input, indent + 1)])
+    if isinstance(plan, Sort):
+        by = [e.signature() for e in plan.by]
+        head = f"{pad}Sort(by={by}, descending={plan.descending})"
+        return "\n".join([head, _format_plan(plan.input, indent + 1)])
+    if isinstance(plan, Limit):
+        head = f"{pad}Limit(n={plan.n})"
+        return "\n".join([head, _format_plan(plan.input, indent + 1)])
+    if isinstance(plan, Distinct):
+        head = f"{pad}Distinct(subset={plan.subset})"
+        return "\n".join([head, _format_plan(plan.input, indent + 1)])
+    if isinstance(plan, Join):
+        head = f"{pad}Join(how={plan.how}, left_on={plan.left_on}, right_on={plan.right_on})"
+        left = _format_plan(plan.left, indent + 1)
+        right = _format_plan(plan.right, indent + 1)
+        return "\n".join([head, left, right])
+    return f"{pad}{type(plan).__name__}"
+
+
 

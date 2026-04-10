@@ -1,13 +1,15 @@
 import compiler
 from math import ceildiv
-from gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
+from gpu.memory import AddressSpace
+from memory import stack_allocation
 from os.atomic import Atomic
 from runtime.asyncrt import DeviceContextPtr
 from tensor import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime dtype = DType.float32
 comptime FLOAT32_MAX: Scalar[dtype] = 3.4028234663852886e+38
-comptime MAX_GROUPS = 64
+comptime MAX_GROUPS = 8192
 
 
 fn _group_min_cpu(
@@ -35,76 +37,70 @@ fn _group_min_gpu(
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
+    comptime COARSE_FACTOR = 4
     var size = values.dim_size(0)
-    var out_len = output.dim_size(0)
+    var ng = output.dim_size(0)
 
-    if size == 0:
-        @parameter
-        fn empty_kernel(out_len: Int):
-            var tid = block_dim.x * block_idx.x + thread_idx.x
-            if tid < UInt(out_len):
-                output[Int(tid)] = FLOAT32_MAX
+    if ng <= 0 or ng > MAX_GROUPS:
+        raise Error("group_min: n_groups must be in [1, MAX_GROUPS]")
 
-        if out_len > 0:
-            var blocks = ceildiv(out_len, BLOCK_SIZE)
-            ctx.get_device_context().enqueue_function_experimental[empty_kernel](
-                out_len,
-                grid_dim=blocks,
-                block_dim=BLOCK_SIZE,
-            )
-        return
-
-    var num_warps = ceildiv(size, WARP_SIZE)
-    if num_warps <= 0:
-        raise Error("group_min: invalid num_warps (must be > 0)")
-    if out_len % num_warps != 0:
-        raise Error("group_min: output length must be divisible by num_warps")
-
-    var ng = out_len // num_warps
-    if ng <= 0:
-        raise Error("group_min: inferred n_groups must be > 0")
-    if ng > MAX_GROUPS:
-        raise Error("group_min: inferred n_groups exceeds MAX_GROUPS")
-
+    # Fill global output with identity (FLOAT32_MAX)
     @parameter
-    fn fill_max_kernel(out_len: Int):
+    fn fill_kernel(ng: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(out_len):
+        if tid < UInt(ng):
             output[Int(tid)] = FLOAT32_MAX
 
-    if out_len > 0:
-        var fill_blocks = ceildiv(out_len, BLOCK_SIZE)
-        ctx.get_device_context().enqueue_function_experimental[fill_max_kernel](
-            out_len,
-            grid_dim=fill_blocks,
-            block_dim=BLOCK_SIZE,
-        )
+    var fill_blocks = ceildiv(ng, BLOCK_SIZE)
+    ctx.get_device_context().enqueue_function_experimental[fill_kernel](
+        ng,
+        grid_dim=fill_blocks,
+        block_dim=BLOCK_SIZE,
+    )
 
-    var total_threads = num_warps * WARP_SIZE
+    if size == 0:
+        return
+
+    var num_blocks = ceildiv(size, BLOCK_SIZE * COARSE_FACTOR)
 
     @parameter
-    fn min_kernel(size: Int, ng: Int, total_threads: Int):
-        var tid_u = block_dim.x * block_idx.x + thread_idx.x
-        var tid = Int(tid_u)
-        if tid >= total_threads:
-            return
+    fn min_kernel(size: Int, ng: Int):
+        # Shared memory private bins for this block
+        var shared_bins = stack_allocation[
+            MAX_GROUPS,
+            Scalar[dtype],
+            address_space=AddressSpace.SHARED,
+        ]()
 
-        var warp_idx = tid // WARP_SIZE
-        var base = warp_idx * ng
+        # Initialize shared bins to identity (FLOAT32_MAX)
+        var t = Int(thread_idx.x)
+        while t < MAX_GROUPS:
+            shared_bins[t] = FLOAT32_MAX
+            t += BLOCK_SIZE
+        barrier()
 
-        var i = tid
-        while i < size:
-            var gid = Int(group_ids[i])
-            if gid >= 0 and gid < ng:
-                var out_ptr = output.unsafe_ptr() + (base + gid)
-                _ = Atomic.min(out_ptr, values[i])
-            i += total_threads
+        # Each thread processes COARSE_FACTOR elements
+        var block_start = Int(block_idx.x) * BLOCK_SIZE * COARSE_FACTOR
+        var tid = block_start + Int(thread_idx.x)
+        for c in range(COARSE_FACTOR):
+            var i = tid + c * BLOCK_SIZE
+            if i < size:
+                var gid = Int(group_ids[i])
+                if gid >= 0 and gid < ng:
+                    _ = Atomic.min(shared_bins + gid, values[i])
+        barrier()
 
-    var num_blocks = ceildiv(total_threads, BLOCK_SIZE)
+        # Merge shared bins to global output
+        t = Int(thread_idx.x)
+        while t < ng:
+            var sval = shared_bins[t]
+            if sval < FLOAT32_MAX:
+                _ = Atomic.min(output.unsafe_ptr() + t, sval)
+            t += BLOCK_SIZE
+
     ctx.get_device_context().enqueue_function_experimental[min_kernel](
         size,
         ng,
-        total_threads,
         grid_dim=num_blocks,
         block_dim=BLOCK_SIZE,
     )

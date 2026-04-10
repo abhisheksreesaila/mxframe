@@ -16,6 +16,12 @@ from .lazy_frame import (
 # Compiler
 from .compiler import GraphCompiler
 
+# Optimizer
+from .optimizer import PlanOptimizer, OptimizationResult, optimize_plan
+
+# Plan validation
+from .plan_validation import PlanValidationError, validate_plan, validate_plan_or_raise
+
 # Custom ops compiler
 from .custom_ops import CustomOpsCompiler, KERNELS_PATH, clear_cache
 
@@ -42,6 +48,10 @@ __all__ = [
     "LazyFrame", "LazyGroupBy", "DeviceType",
     # compiler
     "GraphCompiler",
+    # optimizer
+    "PlanOptimizer", "OptimizationResult", "optimize_plan",
+    # plan validation
+    "PlanValidationError", "validate_plan", "validate_plan_or_raise",
     # custom_ops
     "CustomOpsCompiler", "KERNELS_PATH",
     # caching

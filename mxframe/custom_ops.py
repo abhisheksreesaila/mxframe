@@ -206,7 +206,7 @@ class CustomOpsCompiler(GraphCompiler):
             contiguous = np.ascontiguousarray(arr)
             return driver.Buffer.from_numpy(contiguous).to(self._gpu_driver), "from_numpy_contiguous"
 
-    def _compute_cache_key(self, plan, all_names, all_arrays, n_groups):
+    def _compute_cache_key(self, plan, all_names, all_arrays, n_groups, optimizer_trace=None):
         """Compute a hashable cache key for the compiled graph model.
 
         Key components:
@@ -219,7 +219,8 @@ class CustomOpsCompiler(GraphCompiler):
         input_sig = tuple(
             (n, str(all_arrays[n].dtype), all_arrays[n].shape[0]) for n in all_names
         )
-        return (plan_sig, input_sig, n_groups, self._session_device)
+        optimizer_sig = tuple(optimizer_trace or ())
+        return (plan_sig, input_sig, n_groups, self._session_device, optimizer_sig)
 
     @classmethod
     def _collect_predicates(cls, plan):
@@ -260,7 +261,7 @@ class CustomOpsCompiler(GraphCompiler):
             plan.input = cls._strip_filter_nodes(plan.input)
         return plan
 
-    def compile_and_run(self, plan, verbose=False) -> pa.Table:
+    def compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
         """Optimized execution with three-tier caching + post-ops.
 
         Pipeline:
@@ -290,6 +291,18 @@ class CustomOpsCompiler(GraphCompiler):
             if post_ops:
                 result = self._apply_post_ops_custom(result, post_ops)
             t1 = _time.perf_counter()
+            self.last_compile_provenance = {
+                "device": self._session_device,
+                "rows": int(result.num_rows),
+                "grouped": False,
+                "n_groups": 0,
+                "cache_hit": None,
+                "compile_ms": 0.0,
+                "execute_ms": round((t1 - t0) * 1000, 1),
+                "gpu_input_path": "pyarrow",
+                "optimizer_trace": list(optimizer_trace or []),
+                "path": "pyarrow_shortcut",
+            }
             if verbose:
                 print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
             return result
@@ -383,7 +396,13 @@ class CustomOpsCompiler(GraphCompiler):
         all_arrays = {**col_arrays, **extra_inputs}
 
         # 5 -- Graph cache lookup --------------------------------------
-        cache_key = self._compute_cache_key(plan_clean, all_names, all_arrays, n_groups)
+        cache_key = self._compute_cache_key(
+            plan_clean,
+            all_names,
+            all_arrays,
+            n_groups,
+            optimizer_trace=optimizer_trace,
+        )
         cache_hit = cache_key in _MODEL_CACHE
 
         if cache_hit:
@@ -451,6 +470,8 @@ class CustomOpsCompiler(GraphCompiler):
             "compile_ms": round((t_compile - t0) * 1000, 1),
             "execute_ms": round((t_exec - t_compile) * 1000, 1),
             "gpu_input_path": gpu_input_path,
+            "optimizer_trace": list(optimizer_trace or []),
+            "path": "compiled",
         }
 
         # 7 -- Assemble output -----------------------------------------
@@ -1133,4 +1154,5 @@ class CustomOpsCompiler(GraphCompiler):
         result = CustomOpsCompiler._build_group_ids(table, keys)
         _GROUP_ENCODE_CACHE[cache_key] = result
         return result
+
 

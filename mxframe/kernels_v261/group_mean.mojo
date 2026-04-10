@@ -3,7 +3,7 @@ from runtime.asyncrt import DeviceContextPtr
 from tensor import InputTensor, OutputTensor
 
 alias dtype = DType.float32
-alias MAX_GROUPS = 64
+alias MAX_GROUPS = 8192
 
 
 @compiler.register("group_mean")
