@@ -32,19 +32,34 @@ We designed **mxframe** to be the absolute fastest DataFrame engine you can inst
 Trust and data integrity are everything. We have run rigorous correctness verifications across all **22 TPC-H queries**, validating the results of our lazy topological graph byte-for-byte against **DuckDB, Polars, and Pandas**. 
 
 Not only does `mxframe` produce mathematically identical aggregations, but it also demonstrates staggering performance consistency across the entire suite:
-- 🥇 **MXFrame CPU** outperforms the incumbent frameworks in **20 out of 22** TPC-H queries.
-- 🚀 **MXFrame GPU** specifically beats the competition in **16 out of 22** TPC-H queries right out of the box.
+- 🥇 <span style="color:#FFD54F; font-weight:bold; text-shadow: 1px 1px 3px blue;">MXFrame CPU</span> outperforms the incumbent frameworks in **20 out of 22** TPC-H queries.
+- 🚀 <span style="color:#00E676; font-weight:bold; text-shadow: 1px 1px 5px #FF3D00;">MXFrame GPU</span> specifically beats the competition in **16 out of 22** TPC-H queries right out of the box.
 
 While **Pandas** struggles immensely with TPC-H compatibility and speed, and **Polars** acts as our closest peer for CPU workloads, **mxframe** beats both of them on standard CPU hardware while concurrently unlocking native GPU acceleration.
+
+### 📈 See the Full 10M & 100M Results
+
+We have fully compiled out all 22 TPC-H queries scaling to **1M, 10M, and 100M** rows demonstrating how our GPU pipeline dominates heavily as row quantities climb. 
+
+Check out the full comprehensive matrix in our **[BENCHMARKS.md](BENCHMARKS.md)** document!
+
+If you want to reproduce everything on your own machine yourself, use the included Python script:
+
+```bash
+# Run the 100 Million Row Benchmark
+pixi run python scripts/run_benchmarks.py --scale 100 --engine all
+```
+
+---
 
 ### TPC-H Q1: Grouped Aggregation
 *1,000,000 rows — Filter + GroupBy + 8 Aggregations. Time in steady-state (hot).*
 
 | Engine | Execution Time (ms) | Relative to Pandas | Relative to Polars |
 |--------|--------------------:|-------------------:|-------------------:|
-| **MXFrame CPU** | **14.0 ms** | **0.15x** (6.8x faster) | **0.48x** (2.1x faster) |
+| <span style="color:#FFD54F; font-weight:bold; text-shadow: 1px 1px 3px blue;">MXFrame CPU</span> | **14.0 ms** | **0.15x** (6.8x faster) | **0.48x** (2.1x faster) |
 | **Polars** | 29.0 ms | 0.30x (3.3x faster) | 1.00x |
-| **MXFrame GPU** | 32.6 ms | 0.34x (2.9x faster) | 1.13x |
+| <span style="color:#00E676; font-weight:bold; text-shadow: 1px 1px 5px #FF3D00;">MXFrame GPU</span> | 32.6 ms | 0.34x (2.9x faster) | 1.13x |
 | **Pandas** | 95.6 ms | 1.00x | 3.30x |
 
 ### TPC-H Q6: Filtered Global Aggregate
@@ -52,8 +67,8 @@ While **Pandas** struggles immensely with TPC-H compatibility and speed, and **P
 
 | Engine | Execution Time (ms) | Relative to Pandas | Relative to Polars |
 |--------|--------------------:|-------------------:|-------------------:|
-| **MXFrame CPU** | **3.2 ms** | **0.50x** (2.0x faster) | **0.38x** (2.6x faster) |
-| **MXFrame GPU** | 4.0 ms | 0.62x (1.6x faster) | 0.47x (2.1x faster) |
+| <span style="color:#FFD54F; font-weight:bold; text-shadow: 1px 1px 3px blue;">MXFrame CPU</span> | **3.2 ms** | **0.50x** (2.0x faster) | **0.38x** (2.6x faster) |
+| <span style="color:#00E676; font-weight:bold; text-shadow: 1px 1px 5px #FF3D00;">MXFrame GPU</span> | 4.0 ms | 0.62x (1.6x faster) | 0.47x (2.1x faster) |
 | **Pandas** | 6.4 ms | 1.00x | 0.76x |
 | **Polars** | 8.5 ms | 1.32x | 1.00x |
 
@@ -62,8 +77,8 @@ While **Pandas** struggles immensely with TPC-H compatibility and speed, and **P
 
 | Engine | Execution Time (ms) | Relative to Pandas | Relative to Polars |
 |--------|--------------------:|-------------------:|-------------------:|
-| **MXFrame CPU** | **4.1 ms** | **0.34x** (3.0x faster) | **0.25x** (4.0x faster) |
-| **MXFrame GPU** | 9.7 ms | 0.79x (1.3x faster) | 0.58x (1.7x faster) |
+| <span style="color:#FFD54F; font-weight:bold; text-shadow: 1px 1px 3px blue;">MXFrame CPU</span> | **4.1 ms** | **0.34x** (3.0x faster) | **0.25x** (4.0x faster) |
+| <span style="color:#00E676; font-weight:bold; text-shadow: 1px 1px 5px #FF3D00;">MXFrame GPU</span> | 9.7 ms | 0.79x (1.3x faster) | 0.58x (1.7x faster) |
 | **Pandas** | 12.3 ms | 1.00x | 0.73x |
 | **Polars** | 16.7 ms | 1.36x | 1.00x |
 

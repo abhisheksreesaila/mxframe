@@ -12,9 +12,9 @@ comptime MAX_GROUPS = 8192
 
 
 fn _group_sum_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1],
-    values: ManagedTensorSlice[dtype=dtype, rank=1],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, static_spec=...],
+    values: ManagedTensorSlice[dtype=dtype, rank=1, static_spec=...],
+    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, static_spec=...],
 ):
     var size = values.dim_size(0)
     var ng = output.dim_size(0)
@@ -29,9 +29,9 @@ fn _group_sum_cpu(
 
 
 fn _group_sum_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1],
-    values: ManagedTensorSlice[dtype=dtype, rank=1],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, static_spec=...],
+    values: ManagedTensorSlice[dtype=dtype, rank=1, static_spec=...],
+    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, static_spec=...],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -127,9 +127,9 @@ struct GroupSum:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=1],
-        values: InputTensor[dtype=dtype, rank=1],
-        group_ids: InputTensor[dtype=DType.int32, rank=1],
+        output: OutputTensor[dtype=dtype, rank=1, static_spec=...],
+        values: InputTensor[dtype=dtype, rank=1, static_spec=...],
+        group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=...],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

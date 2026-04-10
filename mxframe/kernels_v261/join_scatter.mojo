@@ -12,11 +12,11 @@ comptime idx_dtype = DType.int32
 # -- CPU: direct-address scatter for join index pair emission ---------------
 
 fn _join_scatter_cpu(
-    left_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    right_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1],
+    left_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, static_spec=...],
+    right_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, static_spec=...],
+    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, static_spec=...],
+    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, static_spec=...],
+    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, static_spec=...],
 ):
     """Emit (left_index, right_index) pairs for an inner join.
 
@@ -83,14 +83,14 @@ fn _join_scatter_cpu(
 # -- GPU: scatter for join index pair emission ------------------------------
 
 fn _join_scatter_gpu(
-    left_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    right_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1],
-    right_sorted_idx: ManagedTensorSlice[dtype=idx_dtype, rank=1],
-    right_key_starts: ManagedTensorSlice[dtype=idx_dtype, rank=1],
-    right_key_counts: ManagedTensorSlice[dtype=idx_dtype, rank=1],
+    left_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, static_spec=...],
+    right_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, static_spec=...],
+    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, static_spec=...],
+    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, static_spec=...],
+    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, static_spec=...],
+    right_sorted_idx: ManagedTensorSlice[dtype=idx_dtype, rank=1, static_spec=...],
+    right_key_starts: ManagedTensorSlice[dtype=idx_dtype, rank=1, static_spec=...],
+    right_key_counts: ManagedTensorSlice[dtype=idx_dtype, rank=1, static_spec=...],
     ctx: DeviceContextPtr,
 ) raises:
     """GPU scatter: uses pre-built right-side position arrays.
@@ -139,11 +139,11 @@ struct JoinScatterCPU:
     fn execute[
         target: StaticString,
     ](
-        left_out: OutputTensor[dtype=idx_dtype, rank=1],
-        right_out: OutputTensor[dtype=idx_dtype, rank=1],
-        left_keys: InputTensor[dtype=key_dtype, rank=1],
-        right_keys: InputTensor[dtype=key_dtype, rank=1],
-        offsets: InputTensor[dtype=idx_dtype, rank=1],
+        left_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        right_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=...],
+        right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=...],
+        offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=...],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter
@@ -161,14 +161,14 @@ struct JoinScatterGPU:
     fn execute[
         target: StaticString,
     ](
-        left_out: OutputTensor[dtype=idx_dtype, rank=1],
-        right_out: OutputTensor[dtype=idx_dtype, rank=1],
-        left_keys: InputTensor[dtype=key_dtype, rank=1],
-        right_keys: InputTensor[dtype=key_dtype, rank=1],
-        offsets: InputTensor[dtype=idx_dtype, rank=1],
-        right_sorted_idx: InputTensor[dtype=idx_dtype, rank=1],
-        right_key_starts: InputTensor[dtype=idx_dtype, rank=1],
-        right_key_counts: InputTensor[dtype=idx_dtype, rank=1],
+        left_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        right_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=...],
+        right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=...],
+        offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        right_sorted_idx: InputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        right_key_starts: InputTensor[dtype=idx_dtype, rank=1, static_spec=...],
+        right_key_counts: InputTensor[dtype=idx_dtype, rank=1, static_spec=...],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

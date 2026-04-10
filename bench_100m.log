@@ -1,0 +1,17 @@
+Generating synthetic PyArrow data for 100,000,000 rows...
+
+=============================================
+    MXFRAME BENCHMARK RUNNER (Rows: 100,000,000)    
+=============================================
+
+--- Running Q1 on mxframe_cpu ---
+Completed in 13796.45 ms
+
+--- Running Q1 on mxframe_gpu ---
+Completed in 8268.85 ms
+
+--- Running Q1 on pandas ---
+Completed in 13432.79 ms
+
+--- Running Q1 on polars ---
+Completed in 5686.22 ms

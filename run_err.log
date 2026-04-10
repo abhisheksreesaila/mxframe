@@ -1,0 +1,382 @@
+ERROR:root:Error compiling Mojo at /home/ablearn/mxdf/mxframe/kernels_v261. Command: package /home/ablearn/mxdf/mxframe/kernels_v261 -o /tmp/.modular_1000/mojo_pkg/mojo_pkg_f265e5393ba3afaf78865b5fafa8e380.mojopkg
+
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/debug_write_one.mojo:6:1: warning: 'alias' is deprecated, use 'comptime' instead
+alias dtype = DType.float32
+^~~~~
+comptime
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:5:1: warning: 'alias' is deprecated, use 'comptime' instead
+alias dtype = DType.float32
+^~~~~
+comptime
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:6:1: warning: 'alias' is deprecated, use 'comptime' instead
+alias MAX_GROUPS = 8192
+^~~~~
+comptime
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/debug_write_one.mojo:2:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from runtime.asyncrt import DeviceContextPtr
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/debug_write_one.mojo:4:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from utils.index import IndexList
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:2:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from math import ceildiv
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:3:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:5:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from memory import stack_allocation
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:6:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from os.atomic import Atomic
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:15:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    output: ManagedTensorSlice[mut=True, dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:16:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    values: ManagedTensorSlice[dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:17:34: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    group_ids: ManagedTensorSlice[dtype=DType.int32],
+                                 ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:32:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    output: ManagedTensorSlice[mut=True, dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:33:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    values: ManagedTensorSlice[dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:34:34: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    group_ids: ManagedTensorSlice[dtype=DType.int32],
+                                 ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:132:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_max.mojo:120:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:23:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:30:64: error: no matching function in initialization
+            var counts = InlineArray[Scalar[dtype], MAX_GROUPS](0)
+                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: expected at most 0 positional arguments, got 1
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'uninitialized'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'unsafe_assume_initialized'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'fill'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: '__list_literal__'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'storage'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'copy'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'take'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_min.mojo:120:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:135:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_count.mojo:139:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_count.mojo:161:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_scatter.mojo:149:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_scatter.mojo:174:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/sort_indices.mojo:172:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/unique_mask.mojo:81:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+/home/ablearn/.local/lib/python3.12/site-packages/modular/bin/mojo: error: failed to parse the provided Mojo source module
+
+Traceback (most recent call last):
+  File "/home/ablearn/.local/lib/python3.12/site-packages/mojo/paths.py", line 167, in _build_mojo_source_package
+    package_result = subprocess_run_mojo(
+                     ^^^^^^^^^^^^^^^^^^^^
+  File "/home/ablearn/.local/lib/python3.12/site-packages/mojo/run.py", line 74, in subprocess_run_mojo
+    return subprocess.run(
+           ^^^^^^^^^^^^^^^
+  File "/home/ablearn/mxdf/.pixi/envs/default/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['/home/ablearn/.local/lib/python3.12/site-packages/modular/bin/mojo', 'package', '/home/ablearn/mxdf/mxframe/kernels_v261', '-o', '/tmp/.modular_1000/mojo_pkg/mojo_pkg_f265e5393ba3afaf78865b5fafa8e380.mojopkg']' returned non-zero exit status 1.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ablearn/mxdf/scripts/run_benchmarks.py", line 98, in <module>
+    run_q1(table, eng)
+  File "/home/ablearn/mxdf/scripts/run_benchmarks.py", line 43, in run_q1
+    .compute(device="cpu")
+     ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ablearn/mxdf/mxframe/lazy_frame.py", line 166, in compute
+    result = compiler.compile_and_run(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ablearn/mxdf/mxframe/custom_ops.py", line 420, in compile_and_run
+    graph = Graph(
+            ^^^^^^
+  File "/home/ablearn/.local/lib/python3.12/site-packages/max/graph/graph.py", line 481, in __init__
+    self._import_kernels(custom_extensions)
+  File "/home/ablearn/.local/lib/python3.12/site-packages/max/graph/graph.py", line 1193, in _import_kernels
+    self._kernel_library.load_paths(paths)
+  File "/home/ablearn/.local/lib/python3.12/site-packages/max/graph/graph.py", line 200, in load_paths
+    self.add_path(_build_mojo_source_package(ext_path))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ablearn/.local/lib/python3.12/site-packages/mojo/paths.py", line 173, in _build_mojo_source_package
+    raise error from e
+mojo.paths.MojoCompilationError: Error compiling Mojo at /home/ablearn/mxdf/mxframe/kernels_v261. Command: package /home/ablearn/mxdf/mxframe/kernels_v261 -o /tmp/.modular_1000/mojo_pkg/mojo_pkg_f265e5393ba3afaf78865b5fafa8e380.mojopkg
+
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/debug_write_one.mojo:6:1: warning: 'alias' is deprecated, use 'comptime' instead
+alias dtype = DType.float32
+^~~~~
+comptime
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:5:1: warning: 'alias' is deprecated, use 'comptime' instead
+alias dtype = DType.float32
+^~~~~
+comptime
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:6:1: warning: 'alias' is deprecated, use 'comptime' instead
+alias MAX_GROUPS = 8192
+^~~~~
+comptime
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/debug_write_one.mojo:2:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from runtime.asyncrt import DeviceContextPtr
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/debug_write_one.mojo:4:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from utils.index import IndexList
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:2:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from math import ceildiv
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:3:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:5:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from memory import stack_allocation
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:6:6: warning: Implicit standard library imports are deprecated and will be removed in a future release; fully qualify with 'std.' instead
+from os.atomic import Atomic
+     ^
+     std.
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:15:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    output: ManagedTensorSlice[mut=True, dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:16:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    values: ManagedTensorSlice[dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:17:34: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    group_ids: ManagedTensorSlice[dtype=DType.int32],
+                                 ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:32:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    output: ManagedTensorSlice[mut=True, dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:33:31: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    values: ManagedTensorSlice[dtype=dtype],
+                              ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:34:34: error: 'ManagedTensorSlice' failed to infer parameter 'io_spec', specify the parameter or use '_' or '...' to unbind the parameter explicitly
+    group_ids: ManagedTensorSlice[dtype=DType.int32],
+                                 ^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: 'ManagedTensorSlice' declared here
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_count.mojo:132:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_max.mojo:120:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:23:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_mean.mojo:30:64: error: no matching function in initialization
+            var counts = InlineArray[Scalar[dtype], MAX_GROUPS](0)
+                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: expected at most 0 positional arguments, got 1
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'uninitialized'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'unsafe_assume_initialized'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'fill'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: '__list_literal__'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'storage'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'copy'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+/home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:1: note: candidate not viable: missing 1 required keyword-only argument: 'take'
+# Mojo kernel package - exports kernels used by current GPU custom-op path
+^
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_min.mojo:120:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/group_sum.mojo:135:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_count.mojo:139:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_count.mojo:161:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_scatter.mojo:149:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/join_scatter.mojo:174:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/sort_indices.mojo:172:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+Included from /home/ablearn/mxdf/mxframe/kernels_v261/__init__.mojo:1:
+/home/ablearn/mxdf/mxframe/kernels_v261/unique_mask.mojo:81:9: warning: '@parameter if' is deprecated, use 'comptime if' instead
+        @parameter
+        ^~~~~~~~~~
+        comptime 
+/home/ablearn/.local/lib/python3.12/site-packages/modular/bin/mojo: error: failed to parse the provided Mojo source module
+
