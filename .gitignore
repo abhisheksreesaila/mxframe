@@ -19,7 +19,11 @@ build/
 kernels_aot/*.so
 kernels_aot/*.dylib
 kernels_aot/*.dll
+# Exception: ship pre-built GPU .so (cannot be built in CI without GPU hardware)
+!kernels_aot/libmxkernels_aot_gpu.so
 *.mojopkg
+# Exception: ship AOT kernels package
+!kernels.mojopkg
 repro_kernels/
 repro_kernels.mojopkg
 

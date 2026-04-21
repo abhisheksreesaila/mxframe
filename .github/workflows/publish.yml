@@ -39,11 +39,14 @@ jobs:
           echo "Built libmxkernels_aot.so:"
           ls -lh kernels_aot/libmxkernels_aot.so
 
-      - name: Build AOT GPU kernels
+      - name: Verify pre-built GPU kernel
+        # GPU .so is committed to the repo because ubuntu-latest runners
+        # have no GPU and mojo build requires a detectable GPU architecture.
+        # Rebuild locally (on a machine with a GPU) and commit before releasing.
         run: |
-          pixi run mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo \
-            -o kernels_aot/libmxkernels_aot_gpu.so
-          echo "Built libmxkernels_aot_gpu.so:"
+          test -f kernels_aot/libmxkernels_aot_gpu.so \
+            || (echo "::error::kernels_aot/libmxkernels_aot_gpu.so missing. Rebuild locally and commit before releasing." && exit 1)
+          echo "Pre-built libmxkernels_aot_gpu.so:"
           ls -lh kernels_aot/libmxkernels_aot_gpu.so
 
       - name: Set up Python
