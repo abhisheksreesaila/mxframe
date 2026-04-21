@@ -11,8 +11,8 @@ comptime mask_dtype = DType.int32
 # ── CPU: mark first occurrence of each unique value in a SORTED array ────────
 
 fn _unique_mask_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=mask_dtype, rank=1],
-    sorted_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
+    sorted_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
 ):
     """Given a sorted key array, output[i] = 1 if sorted_keys[i] is the first
     occurrence of that value, else 0.
@@ -36,8 +36,8 @@ fn _unique_mask_cpu(
 # ── GPU: parallel adjacent-difference to detect unique boundaries ────────────
 
 fn _unique_mask_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=mask_dtype, rank=1],
-    sorted_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
+    sorted_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -74,8 +74,8 @@ struct UniqueMask:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=mask_dtype, rank=1],
-        sorted_keys: InputTensor[dtype=key_dtype, rank=1],
+        output: OutputTensor[dtype=mask_dtype, rank=1, static_spec=_],
+        sorted_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

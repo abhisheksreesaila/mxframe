@@ -1,0 +1,86 @@
+name: 🧪 Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-cpu:
+    name: CPU Tests (Ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: true
+
+      - name: Install dependencies
+        run: pixi install
+
+      - name: Setup mxframe symlink
+        run: pixi run setup-mxframe
+
+      - name: Download pre-built AOT kernels
+        run: |
+          # In CI, download the pre-built .so files from a release artifact
+          # or build them if the Mojo toolchain is available
+          if pixi run which mojo > /dev/null 2>&1; then
+            echo "Mojo available — building AOT kernels"
+            pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
+              -o kernels_aot/libmxkernels_aot.so
+          else
+            echo "Using pre-built libmxkernels_aot.so from repository"
+          fi
+
+      - name: Smoke tests — AOT kernels
+        run: pixi run python3 scripts/_test_aot_smoke.py
+
+      - name: Phase 0 — Compiler tests
+        run: pixi run python3 scripts/_test_phase0_compiler.py
+
+      - name: Phase 1 — GroupBy tests
+        run: pixi run python3 scripts/_test_phase1.py
+
+      - name: Phase 4 — Join tests
+        run: pixi run python3 scripts/_test_phase4.py
+
+      - name: Phase 5 — Sort/Limit/Distinct tests
+        run: pixi run python3 scripts/_test_phase5.py
+
+      - name: Phase 6 — TPC-H tier 2 queries
+        run: pixi run python3 scripts/_test_phase6_tpch_tier2.py
+
+      - name: SQL frontend tests
+        run: pixi run python3 scripts/_test_phase_sql.py
+
+      - name: Q5/Q10 tests
+        run: pixi run python3 scripts/_test_phase_q5_q10.py
+
+  benchmark-cpu:
+    name: CPU Benchmark (sanity check)
+    runs-on: ubuntu-latest
+    needs: test-cpu
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: true
+
+      - run: pixi install && pixi run setup-mxframe
+
+      - name: Quick benchmark (100K rows)
+        run: |
+          pixi run python3 scripts/bench_simple.py \
+            --rows 100000 --runs 2 \
+            --queries 1,3,5,6,7,9,12,22

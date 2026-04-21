@@ -13,9 +13,9 @@ comptime MAX_GROUPS = 8192
 
 
 fn _group_max_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1],
-    values: ManagedTensorSlice[dtype=dtype, rank=1],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=dtype, rank=1, io_spec=_, static_spec=_],
+    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
 ):
     var size = values.dim_size(0)
     var ng = output.dim_size(0)
@@ -31,9 +31,9 @@ fn _group_max_cpu(
 
 
 fn _group_max_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1],
-    values: ManagedTensorSlice[dtype=dtype, rank=1],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=dtype, rank=1, io_spec=_, static_spec=_],
+    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -112,9 +112,9 @@ struct GroupMax:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=1],
-        values: InputTensor[dtype=dtype, rank=1],
-        group_ids: InputTensor[dtype=DType.int32, rank=1],
+        output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        values: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

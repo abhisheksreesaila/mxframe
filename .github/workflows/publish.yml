@@ -1,0 +1,118 @@
+name: 📦 Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+jobs:
+  build-wheel:
+    name: Build wheel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pixi
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: latest
+          cache: true
+
+      - name: Install dependencies
+        run: pixi install
+
+      - name: Build AOT CPU kernels
+        run: |
+          pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
+            -o kernels_aot/libmxkernels_aot.so
+          echo "Built libmxkernels_aot.so:"
+          ls -lh kernels_aot/libmxkernels_aot.so
+
+      - name: Build AOT GPU kernels
+        run: |
+          pixi run mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo \
+            -o kernels_aot/libmxkernels_aot_gpu.so
+          echo "Built libmxkernels_aot_gpu.so:"
+          ls -lh kernels_aot/libmxkernels_aot_gpu.so
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Check distribution
+        run: twine check dist/*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-testpypi:
+    name: Publish → TestPyPI
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.target == 'testpypi'
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/mxframe
+
+    permissions:
+      id-token: write   # OIDC trusted publishing
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish → PyPI
+    needs: build-wheel
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' &&
+       github.event.inputs.target == 'pypi')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mxframe
+
+    permissions:
+      id-token: write   # OIDC trusted publishing
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -12,8 +12,8 @@ struct DebugWriteOne:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=1],
-        input: InputTensor[dtype=dtype, rank=1],
+        output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        input: InputTensor[dtype=dtype, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

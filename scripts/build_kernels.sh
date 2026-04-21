@@ -32,6 +32,7 @@ cp "$SRC_DIR/filter_gather.mojo" "$STAGE_DIR/filter_gather.mojo"
 cp "$SRC_DIR/join_count_left.mojo" "$STAGE_DIR/join_count_left.mojo"
 cp "$SRC_DIR/join_scatter_left.mojo" "$STAGE_DIR/join_scatter_left.mojo"
 cp "$SRC_DIR/group_composite.mojo" "$STAGE_DIR/group_composite.mojo"
+cp "$SRC_DIR/masked_global_agg.mojo" "$STAGE_DIR/masked_global_agg.mojo"
 cp "$SRC_DIR/debug_write_one.mojo" "$STAGE_DIR/debug_write_one.mojo"
 
 echo "── Building kernels from staged subset ──"

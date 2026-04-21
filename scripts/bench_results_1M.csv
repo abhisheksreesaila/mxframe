@@ -1,0 +1,23 @@
+Q,Description,MX-CPU(ms),MX-GPU(ms),Polars(ms),Pandas(ms)
+Q1,Filter+8Agg,405.4,34662.6,78.5,470.3
+Q6,Masked GlobalAgg,10.6,22.0,13.8,29.8
+Q3,3-Table Join+Agg,20.9,18445.6,23.8,22.6
+Q12,2-Table Join+Agg,9272.4,28067.5,29.4,1060.8
+Q14,Promo Revenue,6.8,1.9,7.9,257.3
+Q5,Multi-Join+GroupBy,19.9,9158.1,25.3,30.0
+Q10,Customer Revenue,19.9,18485.8,32.1,25.1
+Q7,Shipping Volume,16.9,27672.8,31.7,316.8
+Q8,Market Share,9938.8,19934.1,24.9,16.1
+Q13,Customer Distrib,257.9,18513.1,29.9,34.0
+Q19,Discounted Revenue,213.3,11.6,23.7,34.4
+Q4,Order Priority,17.7,28555.7,17.2,34.0
+Q9,Product Profit,429.6,28782.6,46.7,321.1
+Q11,Important Stock,1.7,3.6,6.5,3.6
+Q18,Large Volume Cust,11.4,20581.5,36.9,20.7
+Q16,Part/Supplier Rel,207.4,31073.5,18.5,316.0
+Q17,Small Qty Order,3.2,3.4,9.1,7.0
+Q2,Min Cost Supplier,7.7,49066.4,18.5,450.3
+Q15,Top Supplier Revenue,9.2,63399.5,8.0,7.5
+Q20,Potential Part Promo,335.6,18.0,34.5,11.0
+Q21,Suppliers Who Kept,16.9,81112.5,29.9,24.4
+Q22,Global Sales Oppty,212.7,11345.4,27.9,53.4

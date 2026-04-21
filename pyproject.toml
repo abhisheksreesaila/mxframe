@@ -1,17 +1,58 @@
 [build-system]
-requires = ["setuptools>=42"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mxdf_v2"
-version = "0.0.1"
-requires-python = ">=3.9"
+name = "mxframe"
+version = "0.1.0"
+description = "GPU-accelerated DataFrame engine: Python ergonomics + Mojo AOT kernels, cross-vendor (NVIDIA/AMD/Apple)."
+readme = "docs/vision-and-architecture.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [
+    { name = "Abhishek Sreesaila", email = "abhisheksreesaila@users.noreply.github.com" },
+]
+keywords = ["dataframe", "gpu", "mojo", "arrow", "analytics", "tpch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Database",
+]
 
-[tool.setuptools.package-dir]
-# Map the "mxframe" import name to the root of this directory (mxdf_v2/).
-# After `pip install -e .`, `import mxframe` loads from here.
-mxframe = "."
+dependencies = [
+    "pyarrow>=14.0",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
 
-[tool.setuptools.packages]
-find = {}
+[project.optional-dependencies]
+polars = ["polars>=0.20"]
+sql   = ["sqlglot>=25.0"]
+dev   = [
+    "pytest>=7.0",
+    "polars>=0.20",
+    "sqlglot>=25.0",
+    "duckdb>=0.9",
+]
+
+[project.urls]
+Homepage   = "https://github.com/abhisheksreesaila/mxframe"
+Repository = "https://github.com/abhisheksreesaila/mxframe"
+
+[tool.setuptools]
+# Declare the root package explicitly so setuptools does not treat docs/, scripts/
+# and llm-ctx/ as implicit namespace packages.
+package-dir = { "mxframe" = "." }
+packages = ["mxframe", "mxframe.kernels_aot"]
+
+[tool.setuptools.package-data]
+# Ship the pre-compiled AOT .so files and the Mojo package.
+"mxframe" = [
+    "kernels.mojopkg",
+]
+"mxframe.kernels_aot" = ["*.so"]
 

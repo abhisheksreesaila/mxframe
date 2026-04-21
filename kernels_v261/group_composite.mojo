@@ -21,12 +21,12 @@ from tensor import InputTensor, ManagedTensorSlice, OutputTensor
 
 
 fn _group_composite_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.int64, rank=1],
-    k0: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    k1: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    k2: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    k3: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    strides: ManagedTensorSlice[dtype=DType.int64, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
+    k0: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    k1: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    k2: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    k3: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    strides: ManagedTensorSlice[dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
 ):
     var n = k0.dim_size(0)
     var s0 = strides[0]
@@ -40,12 +40,12 @@ fn _group_composite_cpu(
 
 
 fn _group_composite_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.int64, rank=1],
-    k0: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    k1: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    k2: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    k3: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    strides: ManagedTensorSlice[dtype=DType.int64, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
+    k0: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    k1: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    k2: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    k3: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    strides: ManagedTensorSlice[dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -77,12 +77,12 @@ struct GroupComposite:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=DType.int64, rank=1],
-        k0: InputTensor[dtype=DType.int32, rank=1],
-        k1: InputTensor[dtype=DType.int32, rank=1],
-        k2: InputTensor[dtype=DType.int32, rank=1],
-        k3: InputTensor[dtype=DType.int32, rank=1],
-        strides: InputTensor[dtype=DType.int64, rank=1],
+        output: OutputTensor[dtype=DType.int64, rank=1, static_spec=_],
+        k0: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+        k1: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+        k2: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+        k3: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+        strides: InputTensor[dtype=DType.int64, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

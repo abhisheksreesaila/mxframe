@@ -9,9 +9,9 @@ comptime key_dtype = DType.int32
 comptime out_dtype = DType.int32
 
 fn _join_count_left_cpu(
-    match_counts: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
+    match_counts: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1, io_spec=_, static_spec=_],
+    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
 ):
     var n_left = left_keys.dim_size(0)
     var n_right = right_keys.dim_size(0)
@@ -38,11 +38,11 @@ fn _join_count_left_cpu(
         match_counts[i] = Int32(cnt if cnt > 0 else 1)
 
 fn _join_count_left_gpu(
-    match_counts: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    max_key_buf: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    right_count_buf: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1],
+    match_counts: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1, io_spec=_, static_spec=_],
+    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+    max_key_buf: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+    right_count_buf: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -88,9 +88,9 @@ fn _join_count_left_gpu(
 struct JoinCountLeftCPU:
     @staticmethod
     fn execute[target: StaticString](
-        match_counts: OutputTensor[dtype=out_dtype, rank=1],
-        left_keys: InputTensor[dtype=key_dtype, rank=1],
-        right_keys: InputTensor[dtype=key_dtype, rank=1],
+        match_counts: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
+        left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+        right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter
@@ -103,11 +103,11 @@ struct JoinCountLeftCPU:
 struct JoinCountLeftGPU:
     @staticmethod
     fn execute[target: StaticString](
-        match_counts: OutputTensor[dtype=out_dtype, rank=1],
-        right_count_buf: OutputTensor[dtype=out_dtype, rank=1],
-        left_keys: InputTensor[dtype=key_dtype, rank=1],
-        right_keys: InputTensor[dtype=key_dtype, rank=1],
-        max_key_buf: InputTensor[dtype=key_dtype, rank=1],
+        match_counts: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
+        right_count_buf: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
+        left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+        right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+        max_key_buf: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

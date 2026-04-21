@@ -17,6 +17,7 @@ from mxframe.lazy_frame import (
     Sort,
     Limit,
     Distinct,
+    Tail,
     Join,
 )
 
@@ -92,6 +93,12 @@ def validate_plan(plan: LogicalPlan) -> List[PlanValidationError]:
         if isinstance(node, Distinct):
             if node.subset is not None and len(node.subset) != len(set(node.subset)):
                 errors.append(PlanValidationError(path, "Distinct.subset contains duplicates"))
+            walk(node.input, f"{path}.input")
+            return
+
+        if isinstance(node, Tail):
+            if node.n < 0:
+                errors.append(PlanValidationError(path, "Tail.n must be >= 0"))
             walk(node.input, f"{path}.input")
             return
 

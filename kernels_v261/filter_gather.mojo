@@ -39,8 +39,8 @@ comptime idx_dtype = DType.int32
 # ─────────────────────────────────────────────────────────────────────────────
 
 fn _prefix_sum_count_cpu(
-    offsets: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1],
+    offsets: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
 ):
     var n = mask.dim_size(0)
     offsets[0] = 0
@@ -49,8 +49,8 @@ fn _prefix_sum_count_cpu(
 
 
 fn _prefix_sum_count_gpu(
-    offsets: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1],
+    offsets: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     """Single-pass exclusive prefix sum using a block-level scan + global fixup.
@@ -166,8 +166,8 @@ struct PrefixSumCount:
     fn execute[
         target: StaticString,
     ](
-        offsets: OutputTensor[dtype=idx_dtype, rank=1],
-        mask: InputTensor[dtype=idx_dtype, rank=1],
+        offsets: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+        mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter
@@ -188,10 +188,10 @@ struct PrefixSumCount:
 # ─────────────────────────────────────────────────────────────────────────────
 
 fn _filter_gather_f32_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
+    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
 ):
     var n = values.dim_size(0)
     for i in range(n):
@@ -200,10 +200,10 @@ fn _filter_gather_f32_cpu(
 
 
 fn _filter_gather_f32_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
+    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -231,10 +231,10 @@ struct FilterGatherF32:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=val_dtype, rank=1],
-        values: InputTensor[dtype=val_dtype, rank=1],
-        mask: InputTensor[dtype=idx_dtype, rank=1],
-        offsets: InputTensor[dtype=idx_dtype, rank=1],
+        output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+        values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+        mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+        offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

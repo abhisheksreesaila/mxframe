@@ -17,6 +17,7 @@ from mxframe.lazy_frame import (
     Sort,
     Limit,
     Distinct,
+    Tail,
     Join,
 )
 
@@ -85,6 +86,8 @@ class PlanOptimizer:
                 return Limit(walk(node.input), node.n)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input), node.n)
             if isinstance(node, Join):
                 return Join(
                     walk(node.left),
@@ -118,6 +121,8 @@ class PlanOptimizer:
                 return Sort(walk(node.input), node.by, node.descending)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input), node.n)
             if isinstance(node, Join):
                 return Join(
                     walk(node.left),
@@ -155,6 +160,8 @@ class PlanOptimizer:
                 return Limit(walk(node.input), node.n)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input), node.n)
             if isinstance(node, Join):
                 return Join(
                     walk(node.left),
@@ -188,6 +195,8 @@ class PlanOptimizer:
                 return Limit(walk(node.input), node.n)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input), node.n)
             if isinstance(node, Join):
                 return Join(
                     walk(node.left),

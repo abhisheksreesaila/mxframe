@@ -1,9 +1,9 @@
 """mxframe - GPU-accelerated DataFrames with MAX Engine"""
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 # Lazy expression layer
-from .lazy_expr import Expr, col, lit, when
+from .lazy_expr import Expr, col, lit, when, row_number
 
 # Lazy frame & logical plan
 from .lazy_frame import (
@@ -106,7 +106,7 @@ def read_parquet(path: str, **kwargs) -> "LazyFrame":
 
 __all__ = [
     # lazy_expr
-    "Expr", "col", "lit", "when",
+    "Expr", "col", "lit", "when", "row_number",
     # lazy_frame
     "LogicalPlan", "Scan", "Filter", "Project", "Aggregate",
     "Sort", "Limit", "Distinct", "Join",

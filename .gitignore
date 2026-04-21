@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# Pixi / conda environments
+.pixi/
+.conda/
+
+# Compiled Mojo / native artifacts
+kernels_aot/*.so
+kernels_aot/*.dylib
+kernels_aot/*.dll
+*.mojopkg
+repro_kernels/
+repro_kernels.mojopkg
+
+# TPC-H generated data (can be reproduced with gen_tpch_parquet.py)
+data/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+scripts/*.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Backup files
+*.bak
+*.orig
+
+# Windows reserved names and NTFS streams
+NUL
+*:Zone.Identifier

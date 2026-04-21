@@ -11,9 +11,9 @@ comptime idx_dtype = DType.int32
 # ── CPU: merge sort producing sorted index permutation ───────────────────────
 
 fn _sort_indices_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    descending_flag: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+    descending_flag: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
 ):
     """Produce sorted index permutation of `keys`.
 
@@ -44,8 +44,8 @@ fn _sort_indices_cpu(
 
 
 fn _merge(
-    idx: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
+    idx: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
     left: Int, mid: Int, right: Int,
     desc: Bool,
 ):
@@ -77,9 +77,9 @@ fn _merge(
 # ── GPU: bitonic sort producing sorted index permutation ─────────────────────
 
 fn _sort_indices_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1],
-    keys: ManagedTensorSlice[dtype=key_dtype, rank=1],
-    descending_flag: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+    keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+    descending_flag: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -164,9 +164,9 @@ struct SortIndices:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=idx_dtype, rank=1],
-        keys: InputTensor[dtype=key_dtype, rank=1],
-        descending_flag: InputTensor[dtype=DType.int32, rank=1],
+        output: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+        keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+        descending_flag: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

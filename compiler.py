@@ -14,7 +14,7 @@ from max import engine, driver
 from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
-from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join
+from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 
 # %% ../nbs/03_compiler.ipynb 4
 # ── dtype helpers ────────────────────────────────────────────────────────
@@ -145,7 +145,7 @@ class GraphCompiler:
         nodes in application order (innermost first).
         """
         post_ops = []
-        while isinstance(plan, (Sort, Limit, Distinct)):
+        while isinstance(plan, (Sort, Limit, Distinct, Tail)):
             post_ops.append(plan)
             plan = plan.input
         post_ops.reverse()  # innermost first = correct application order
@@ -169,6 +169,8 @@ class GraphCompiler:
             elif isinstance(node, Distinct):
                 cols = node.subset or table.column_names
                 table = table.group_by(cols).aggregate([])
+            elif isinstance(node, Tail):
+                table = table.slice(max(0, table.num_rows - node.n), node.n)
         return table
 
     def compile_and_run(self, plan) -> pa.Table:
@@ -210,7 +212,12 @@ class GraphCompiler:
         op, args = expr.op, expr.args
         if op == "col":
             arr = table.column(args[0])
-            return arr.combine_chunks() if isinstance(arr, pa.ChunkedArray) else arr
+            if isinstance(arr, pa.ChunkedArray):
+                # Single-chunk: return Array directly, no 50ms copy from combine_chunks.
+                if len(arr.chunks) == 1:
+                    return arr.chunks[0]
+                return arr.combine_chunks()
+            return arr
         if op == "lit":
             return args[0]
         if op in _PC_CMP_OPS:
@@ -284,6 +291,8 @@ class GraphCompiler:
             return Limit(cls._strip_filters(plan.input), plan.n)
         if isinstance(plan, Distinct):
             return Distinct(cls._strip_filters(plan.input), plan.subset)
+        if isinstance(plan, Tail):
+            return Tail(cls._strip_filters(plan.input), plan.n)
         if hasattr(plan, "input"):
             plan.input = cls._strip_filters(plan.input)
         return plan
@@ -299,6 +308,7 @@ class GraphCompiler:
         if isinstance(plan, Sort): return Sort(cls._replace_scan(plan.input, new_scan), plan.by, plan.descending)
         if isinstance(plan, Limit): return Limit(cls._replace_scan(plan.input, new_scan), plan.n)
         if isinstance(plan, Distinct): return Distinct(cls._replace_scan(plan.input, new_scan), plan.subset)
+        if isinstance(plan, Tail): return Tail(cls._replace_scan(plan.input, new_scan), plan.n)
         if hasattr(plan, "input"): plan.input = cls._replace_scan(plan.input, new_scan)
         return plan
 

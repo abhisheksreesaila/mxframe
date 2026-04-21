@@ -1,0 +1,188 @@
+* Creating isolated environment: venv+pip...
+* Installing packages in isolated environment:
+  - setuptools>=77
+  - wheel
+* Getting build dependencies for sdist...
+running egg_info
+writing mxframe.egg-info\PKG-INFO
+writing dependency_links to mxframe.egg-info\dependency_links.txt
+writing requirements to mxframe.egg-info\requires.txt
+writing top-level names to mxframe.egg-info\top_level.txt
+reading manifest file 'mxframe.egg-info\SOURCES.txt'
+reading manifest template 'MANIFEST.in'
+no previously-included directories found matching 'llm-ctx'
+no previously-included directories found matching 'scripts'
+no previously-included directories found matching 'kernels_v261'
+warning: no previously-included files matching '__pycache__' found anywhere in distribution
+warning: no previously-included files matching '*.py[cod]' found anywhere in distribution
+writing manifest file 'mxframe.egg-info\SOURCES.txt'
+* Building sdist...
+running sdist
+running egg_info
+writing mxframe.egg-info\PKG-INFO
+writing dependency_links to mxframe.egg-info\dependency_links.txt
+writing requirements to mxframe.egg-info\requires.txt
+writing top-level names to mxframe.egg-info\top_level.txt
+reading manifest file 'mxframe.egg-info\SOURCES.txt'
+reading manifest template 'MANIFEST.in'
+no previously-included directories found matching 'llm-ctx'
+no previously-included directories found matching 'scripts'
+no previously-included directories found matching 'kernels_v261'
+warning: no previously-included files matching '__pycache__' found anywhere in distribution
+warning: no previously-included files matching '*.py[cod]' found anywhere in distribution
+writing manifest file 'mxframe.egg-info\SOURCES.txt'
+running check
+creating mxframe-0.1.1
+creating mxframe-0.1.1\kernels_aot
+creating mxframe-0.1.1\docs
+creating mxframe-0.1.1\mxframe.egg-info
+copying files to mxframe-0.1.1...
+copying CHANGELOG.md -> mxframe-0.1.1
+copying MANIFEST.in -> mxframe-0.1.1
+copying README.md -> mxframe-0.1.1
+copying __init__.py -> mxframe-0.1.1
+copying _modidx.py -> mxframe-0.1.1
+copying aot_kernels.py -> mxframe-0.1.1
+copying compiler.py -> mxframe-0.1.1
+copying custom_ops.py -> mxframe-0.1.1
+copying kernels.mojopkg -> mxframe-0.1.1
+copying lazy_expr.py -> mxframe-0.1.1
+copying lazy_frame.py -> mxframe-0.1.1
+copying optimizer.py -> mxframe-0.1.1
+copying plan_validation.py -> mxframe-0.1.1
+copying pyproject.toml -> mxframe-0.1.1
+copying setup.py -> mxframe-0.1.1
+copying sql_frontend.py -> mxframe-0.1.1
+copying .\__init__.py -> mxframe-0.1.1\.
+copying .\_modidx.py -> mxframe-0.1.1\.
+copying .\aot_kernels.py -> mxframe-0.1.1\.
+copying .\compiler.py -> mxframe-0.1.1\.
+copying .\custom_ops.py -> mxframe-0.1.1\.
+copying .\kernels.mojopkg -> mxframe-0.1.1\.
+copying .\lazy_expr.py -> mxframe-0.1.1\.
+copying .\lazy_frame.py -> mxframe-0.1.1\.
+copying .\optimizer.py -> mxframe-0.1.1\.
+copying .\plan_validation.py -> mxframe-0.1.1\.
+copying .\setup.py -> mxframe-0.1.1\.
+copying .\sql_frontend.py -> mxframe-0.1.1\.
+copying .\kernels_aot\__init__.py -> mxframe-0.1.1\.\kernels_aot
+copying .\kernels_aot\libgpu_spike.so -> mxframe-0.1.1\.\kernels_aot
+copying .\kernels_aot\libmxkernels_aot.so -> mxframe-0.1.1\.\kernels_aot
+copying .\kernels_aot\libmxkernels_aot_gpu.so -> mxframe-0.1.1\.\kernels_aot
+copying docs\vision-and-architecture.md -> mxframe-0.1.1\docs
+copying kernels_aot\__init__.py -> mxframe-0.1.1\kernels_aot
+copying kernels_aot\libgpu_spike.so -> mxframe-0.1.1\kernels_aot
+copying kernels_aot\libmxkernels_aot.so -> mxframe-0.1.1\kernels_aot
+copying kernels_aot\libmxkernels_aot_gpu.so -> mxframe-0.1.1\kernels_aot
+copying mxframe.egg-info\PKG-INFO -> mxframe-0.1.1\mxframe.egg-info
+copying mxframe.egg-info\SOURCES.txt -> mxframe-0.1.1\mxframe.egg-info
+copying mxframe.egg-info\dependency_links.txt -> mxframe-0.1.1\mxframe.egg-info
+copying mxframe.egg-info\requires.txt -> mxframe-0.1.1\mxframe.egg-info
+copying mxframe.egg-info\top_level.txt -> mxframe-0.1.1\mxframe.egg-info
+copying mxframe.egg-info\SOURCES.txt -> mxframe-0.1.1\mxframe.egg-info
+Writing mxframe-0.1.1\setup.cfg
+Creating tar archive
+removing 'mxframe-0.1.1' (and everything under it)
+* Building wheel from sdist
+* Creating isolated environment: venv+pip...
+* Installing packages in isolated environment:
+  - setuptools>=77
+  - wheel
+* Getting build dependencies for wheel...
+running egg_info
+writing mxframe.egg-info\PKG-INFO
+writing dependency_links to mxframe.egg-info\dependency_links.txt
+writing requirements to mxframe.egg-info\requires.txt
+writing top-level names to mxframe.egg-info\top_level.txt
+reading manifest file 'mxframe.egg-info\SOURCES.txt'
+reading manifest template 'MANIFEST.in'
+no previously-included directories found matching 'llm-ctx'
+no previously-included directories found matching 'scripts'
+no previously-included directories found matching 'kernels_v261'
+warning: no previously-included files matching '__pycache__' found anywhere in distribution
+warning: no previously-included files matching '*.py[cod]' found anywhere in distribution
+writing manifest file 'mxframe.egg-info\SOURCES.txt'
+* Building wheel...
+running bdist_wheel
+running build
+running build_py
+creating build\lib\mxframe
+copying .\aot_kernels.py -> build\lib\mxframe
+copying .\compiler.py -> build\lib\mxframe
+copying .\custom_ops.py -> build\lib\mxframe
+copying .\lazy_expr.py -> build\lib\mxframe
+copying .\lazy_frame.py -> build\lib\mxframe
+copying .\optimizer.py -> build\lib\mxframe
+copying .\plan_validation.py -> build\lib\mxframe
+copying .\setup.py -> build\lib\mxframe
+copying .\sql_frontend.py -> build\lib\mxframe
+copying .\_modidx.py -> build\lib\mxframe
+copying .\__init__.py -> build\lib\mxframe
+creating build\lib\mxframe\kernels_aot
+copying .\kernels_aot\__init__.py -> build\lib\mxframe\kernels_aot
+running egg_info
+writing mxframe.egg-info\PKG-INFO
+writing dependency_links to mxframe.egg-info\dependency_links.txt
+writing requirements to mxframe.egg-info\requires.txt
+writing top-level names to mxframe.egg-info\top_level.txt
+reading manifest file 'mxframe.egg-info\SOURCES.txt'
+reading manifest template 'MANIFEST.in'
+no previously-included directories found matching 'llm-ctx'
+no previously-included directories found matching 'scripts'
+no previously-included directories found matching 'kernels_v261'
+warning: no previously-included files matching '__pycache__' found anywhere in distribution
+warning: no previously-included files matching '*.py[cod]' found anywhere in distribution
+writing manifest file 'mxframe.egg-info\SOURCES.txt'
+copying .\kernels.mojopkg -> build\lib\mxframe
+copying .\kernels_aot\libgpu_spike.so -> build\lib\mxframe\kernels_aot
+copying .\kernels_aot\libmxkernels_aot.so -> build\lib\mxframe\kernels_aot
+copying .\kernels_aot\libmxkernels_aot_gpu.so -> build\lib\mxframe\kernels_aot
+installing to build\bdist.win-amd64\wheel
+running install
+running install_lib
+creating build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib
+creating build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\aot_kernels.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\compiler.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\custom_ops.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\kernels.mojopkg -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+creating build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe\kernels_aot
+copying build\lib\mxframe\kernels_aot\libgpu_spike.so -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe\kernels_aot
+copying build\lib\mxframe\kernels_aot\libmxkernels_aot.so -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe\kernels_aot
+copying build\lib\mxframe\kernels_aot\libmxkernels_aot_gpu.so -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe\kernels_aot
+copying build\lib\mxframe\kernels_aot\__init__.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe\kernels_aot
+copying build\lib\mxframe\lazy_expr.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\lazy_frame.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\optimizer.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\plan_validation.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\setup.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\sql_frontend.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\_modidx.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+copying build\lib\mxframe\__init__.py -> build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe
+running install_egg_info
+Copying mxframe.egg-info to build\bdist.win-amd64\wheel\mxframe-0.1.1.data\purelib\mxframe-0.1.1-py3.13.egg-info
+running install_scripts
+creating build\bdist.win-amd64\wheel\mxframe-0.1.1.dist-info\WHEEL
+creating '\\\\wsl.localhost\\Ubuntu-24.04\\home\\ablearn\\mxdf_v2\\dist\\.tmp-1gj_idhl\\mxframe-0.1.1-py3-none-win_amd64.whl' and adding 'build\\bdist.win-amd64\\wheel' to it
+adding 'mxframe-0.1.1.data/purelib/mxframe/__init__.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/_modidx.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/aot_kernels.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/compiler.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/custom_ops.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/kernels.mojopkg'
+adding 'mxframe-0.1.1.data/purelib/mxframe/lazy_expr.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/lazy_frame.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/optimizer.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/plan_validation.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/setup.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/sql_frontend.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/kernels_aot/__init__.py'
+adding 'mxframe-0.1.1.data/purelib/mxframe/kernels_aot/libgpu_spike.so'
+adding 'mxframe-0.1.1.data/purelib/mxframe/kernels_aot/libmxkernels_aot.so'
+adding 'mxframe-0.1.1.data/purelib/mxframe/kernels_aot/libmxkernels_aot_gpu.so'
+adding 'mxframe-0.1.1.dist-info/METADATA'
+adding 'mxframe-0.1.1.dist-info/WHEEL'
+adding 'mxframe-0.1.1.dist-info/top_level.txt'
+adding 'mxframe-0.1.1.dist-info/RECORD'
+removing build\bdist.win-amd64\wheel
+Successfully built mxframe-0.1.1.tar.gz and mxframe-0.1.1-py3-none-win_amd64.whl

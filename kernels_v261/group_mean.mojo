@@ -12,9 +12,9 @@ struct GroupMean:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=dtype, rank=1],
-        values: InputTensor[dtype=dtype, rank=1],
-        group_ids: InputTensor[dtype=DType.int32, rank=1],
+        output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+        values: InputTensor[dtype=dtype, rank=1, static_spec=_],
+        group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         var size = Int(values.spec().shape[0])
@@ -27,7 +27,7 @@ struct GroupMean:
             var out_ptr = output.unsafe_ptr()
             var val_ptr = values.unsafe_ptr()
             var gid_ptr = group_ids.unsafe_ptr()
-            var counts = InlineArray[Scalar[dtype], MAX_GROUPS](0)
+            var counts = InlineArray[Scalar[dtype], MAX_GROUPS](fill=0)
 
             for i in range(ng):
                 out_ptr[i] = 0.0

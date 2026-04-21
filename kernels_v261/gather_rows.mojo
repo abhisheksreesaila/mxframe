@@ -26,9 +26,9 @@ from tensor import InputTensor, ManagedTensorSlice, OutputTensor
 # ── float32 gather ───────────────────────────────────────────────────────────
 
 fn _gather_f32_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.float32, rank=1],
-    values: ManagedTensorSlice[dtype=DType.float32, rank=1],
-    indices: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
+    indices: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
 ):
     var m = indices.dim_size(0)
     for i in range(m):
@@ -36,9 +36,9 @@ fn _gather_f32_cpu(
 
 
 fn _gather_f32_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.float32, rank=1],
-    values: ManagedTensorSlice[dtype=DType.float32, rank=1],
-    indices: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
+    indices: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -65,9 +65,9 @@ struct GatherF32:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=DType.float32, rank=1],
-        values: InputTensor[dtype=DType.float32, rank=1],
-        indices: InputTensor[dtype=DType.int32, rank=1],
+        output: OutputTensor[dtype=DType.float32, rank=1, static_spec=_],
+        values: InputTensor[dtype=DType.float32, rank=1, static_spec=_],
+        indices: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter
@@ -82,9 +82,9 @@ struct GatherF32:
 # ── int32 gather ─────────────────────────────────────────────────────────────
 
 fn _gather_i32_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.int32, rank=1],
-    values: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    indices: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    indices: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
 ):
     var m = indices.dim_size(0)
     for i in range(m):
@@ -92,9 +92,9 @@ fn _gather_i32_cpu(
 
 
 fn _gather_i32_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.int32, rank=1],
-    values: ManagedTensorSlice[dtype=DType.int32, rank=1],
-    indices: ManagedTensorSlice[dtype=DType.int32, rank=1],
+    output: ManagedTensorSlice[mut=True, dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    values: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+    indices: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
     ctx: DeviceContextPtr,
 ) raises:
     comptime BLOCK_SIZE = 256
@@ -121,9 +121,9 @@ struct GatherI32:
     fn execute[
         target: StaticString,
     ](
-        output: OutputTensor[dtype=DType.int32, rank=1],
-        values: InputTensor[dtype=DType.int32, rank=1],
-        indices: InputTensor[dtype=DType.int32, rank=1],
+        output: OutputTensor[dtype=DType.int32, rank=1, static_spec=_],
+        values: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+        indices: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         ctx: DeviceContextPtr,
     ) raises:
         @parameter

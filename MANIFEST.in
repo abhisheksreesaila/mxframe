@@ -1,0 +1,20 @@
+include pyproject.toml
+include setup.py
+include CHANGELOG.md
+include docs/vision-and-architecture.md
+include __init__.py
+include _modidx.py
+include aot_kernels.py
+include compiler.py
+include custom_ops.py
+include lazy_expr.py
+include lazy_frame.py
+include optimizer.py
+include plan_validation.py
+include sql_frontend.py
+include kernels.mojopkg
+recursive-include kernels_aot *.py *.so
+prune llm-ctx
+prune scripts
+prune kernels_v261
+global-exclude __pycache__ *.py[cod]
