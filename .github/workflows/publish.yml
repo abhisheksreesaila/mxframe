@@ -55,10 +55,20 @@ jobs:
           python-version: "3.12"
 
       - name: Install build tools
-        run: pip install build twine
+        run: pip install build twine wheel
 
       - name: Build wheel and sdist
         run: python -m build
+
+      - name: Retag wheel as manylinux
+        # PyPI rejects raw "linux_x86_64" tag; it requires manylinux*/musllinux*.
+        # Mojo runtime requires modern glibc anyway, so manylinux_2_34 (≈Ubuntu 22.04+) is safe.
+        run: |
+          cd dist
+          orig=$(ls mxframe-*-linux_x86_64.whl)
+          echo "Retagging $orig"
+          python -m wheel tags --platform-tag manylinux_2_34_x86_64 --remove "$orig"
+          ls -lh
 
       - name: Check distribution
         run: twine check dist/*
