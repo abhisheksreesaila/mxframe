@@ -31,15 +31,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `PUBLISHING.md` — step-by-step pip release guide
 - GitHub Actions: `test.yml` (CI), `publish.yml` (PyPI via OIDC)
 
-### 📊 Benchmark Summary (1M rows, hot min)
+### 📊 Benchmark Summary (1M and 10M rows, all 22 queries)
 
-| Category | Queries | MX CPU vs Polars |
-|---|---|---|
-| Multi-table joins (Q5,Q7,Q8,Q9) | GPU-heavy | **35–77× faster** |
-| Date filter + join (Q12) | Mixed | **25× faster** |
-| Groupby + agg (Q1, Q11, Q17) | Compute-heavy | **3–25× faster** |
-| String/semi-join (Q4, Q16, Q22) | Complex | **3–8× faster** |
-| Global reduce (Q6) | Tiny output | ~1× (tied) |
+See the full table in [README.md § TPC-H Benchmark](README.md#-tpc-h-benchmark--all-22-queries),
+sourced from `scripts/bench_results_1M.csv` and `scripts/bench_results_10M.csv`.
 
-**MX CPU faster than Polars: 20/22 queries**  
-**MX GPU faster than Polars: 16/22 queries**
+- **Correctness:** 22/22 queries pass on CPU and GPU paths
+- **MX CPU wins vs Polars (1 M, one-shot):** 11/22 — headline wins on Q11 (3.8×), Q18 (3.2×), Q17 (2.8×), Q2 (2.4×), Q7 (1.9×), Q21 (1.8×)
+- **MX GPU wins vs Polars (10 M, warm cache):** 6/22 — headline wins on Q17 (5.5×), Q5 (4.1×), Q16 (2.5×), Q14 (2.2×), Q19 (1.3×), Q2 (1.3×)
+- **Outstanding work:** Q8/Q9/Q12 dominated by join kernel without radix partitioning (tracked in `roadmap.md`)
