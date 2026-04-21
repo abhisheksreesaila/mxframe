@@ -49,3 +49,8 @@ htmlcov/
 # Windows reserved names and NTFS streams
 NUL
 *:Zone.Identifier
+
+# Windows NTFS alternate data streams
+*Zone.Identifier*
+*:Zone.Identifier*
+NUL
