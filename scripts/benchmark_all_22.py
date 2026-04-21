@@ -44,11 +44,21 @@ from scripts.benchmark_tpch import (
 )
 
 
-def t(fn):
-    t0 = time.perf_counter()
+def t(fn, warmup=1, runs=3):
+    """Warm up (discard), then time `runs` invocations and return the median (ms).
+    All engines get the same warmup treatment, so results reflect steady state
+    with compiled kernels — no JIT compile cost bleeds into the measurement.
+    """
     try:
-        fn()
-        return round((time.perf_counter() - t0) * 1000, 1)
+        for _ in range(warmup):
+            fn()
+        samples = []
+        for _ in range(runs):
+            t0 = time.perf_counter()
+            fn()
+            samples.append((time.perf_counter() - t0) * 1000.0)
+        samples.sort()
+        return round(samples[len(samples) // 2], 1)
     except Exception as e:
         return f"ERR:{str(e)[:40]}"
 
@@ -124,7 +134,7 @@ def bench_scale(N, s=1):
 
     df = pd.DataFrame(rows).set_index("Q")
     print(f"\n{'='*75}")
-    print(f"Results: {N:,} rows — one-shot timing (ms)")
+    print(f"Results: {N:,} rows — warm median of 3 runs (ms)")
     print(f"{'='*75}")
     pd.set_option('display.max_columns', None); pd.set_option('display.width', 120)
     print(df[["Description","MX-CPU(ms)","MX-GPU(ms)","Polars(ms)","Pandas(ms)"]].to_string())

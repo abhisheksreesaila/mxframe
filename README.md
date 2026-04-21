@@ -89,79 +89,92 @@ Output:
 > **Hardware:** NVIDIA RTX 3090 (sm_86) · AMD 12-core CPU · Mojo 0.26.2 AOT kernels
 > **Baselines:** Polars 1.29+ · Pandas 3.0 · MXFrame CPU path · MXFrame GPU path
 > **Data:** TPC-H schema synthetic data (numpy RNG, fixed seed)
+> **Methodology:** 1 warmup run + **median of 3 timed runs**, per engine. Warmup primes every cache an app would have primed on query #2 in production — so these numbers reflect steady-state dispatch, not first-call JIT cost.
 > **Source of truth:** [`scripts/bench_results_1M.csv`](scripts/bench_results_1M.csv) and
 > [`scripts/bench_results_10M.csv`](scripts/bench_results_10M.csv) — committed in repo, reproducible via
 > [`scripts/benchmark_all_22.py`](scripts/benchmark_all_22.py)
 
-### 1 M rows — first-call (includes any JIT compile for GPU fallback paths)
+### How the kernels dispatch
 
-All times in **milliseconds · lower is better**. Speedup columns = `Polars / MXFrame`; **> 1×** means MXFrame wins.
+| Device | Path | Coverage |
+|---|---|---|
+| **CPU** | 100% ctypes into pre-compiled `libmxkernels_aot.so` | All 22 queries — group aggs, masked aggs, inner + left joins, gather, filter, sort, unique |
+| **GPU** | ctypes into pre-compiled `libmxkernels_aot_gpu.so` | All grouped aggs (sum/min/max/count) + masked global aggs |
+| **GPU** | MAX Graph, shape-cached model | Hash joins only — compiled once per `(n_left, n_right)` shape, cached for the session |
 
-| Query | Description | MX CPU | MX GPU | Polars | Pandas | CPU vs Polars | GPU vs Polars |
-|---|---|---:|---:|---:|---:|---:|---:|
-| Q1  | Filter + 8 aggregations       | 405.4   | 34662.6 | 78.5  | 470.3  | 0.19×   | 0.00× |
-| Q2  | Min-cost supplier (subquery)  | **7.7** | 49066.4 | 18.5  | 450.3  | **2.4×** | 0.00× |
-| Q3  | 3-table join + agg            | **20.9**| 18445.6 | 23.8  | 22.6   | **1.1×** | 0.00× |
-| Q4  | Order priority                | 17.7    | 28555.7 | 17.2  | 34.0   | 0.97×   | 0.00× |
-| Q5  | Multi-join + groupby          | **19.9**| 9158.1  | 25.3  | 30.0   | **1.3×** | 0.00× |
-| Q6  | Masked global agg             | **10.6**| 22.0    | 13.8  | 29.8   | **1.3×** | 0.63× |
-| Q7  | Shipping volume               | **16.9**| 27672.8 | 31.7  | 316.8  | **1.9×** | 0.00× |
-| Q8  | Market share                  | 9938.8  | 19934.1 | 24.9  | 16.1   | 0.00×   | 0.00× |
-| Q9  | Product profit (6-table join) | 429.6   | 28782.6 | 46.7  | 321.1  | 0.11×   | 0.00× |
-| Q10 | Customer revenue              | **19.9**| 18485.8 | 32.1  | 25.1   | **1.6×** | 0.00× |
-| Q11 | Important stock               | **1.7** | 3.6     | 6.5   | 3.6    | **3.8×** | **1.8×** |
-| Q12 | 2-table join + agg            | 9272.4  | 28067.5 | 29.4  | 1060.8 | 0.00×   | 0.00× |
-| Q13 | Customer distribution         | 257.9   | 18513.1 | 29.9  | 34.0   | 0.12×   | 0.00× |
-| Q14 | Promo revenue                 | **6.8** | **1.9** | 7.9   | 257.3  | **1.2×** | **4.2×** |
-| Q15 | Top-supplier revenue          | 9.2     | 63399.5 | 8.0   | 7.5    | 0.87×   | 0.00× |
-| Q16 | Part/supplier relationships   | 207.4   | 31073.5 | 18.5  | 316.0  | 0.09×   | 0.00× |
-| Q17 | Small-qty order (2-pass)      | **3.2** | **3.4** | 9.1   | 7.0    | **2.8×** | **2.7×** |
-| Q18 | Large-volume customers        | **11.4**| 20581.5 | 36.9  | 20.7   | **3.2×** | 0.00× |
-| Q19 | Discounted revenue            | 213.3   | **11.6**| 23.7  | 34.4   | 0.11×   | **2.0×** |
-| Q20 | Potential part promo          | 335.6   | **18.0**| 34.5  | 11.0   | 0.10×   | **1.9×** |
-| Q21 | Suppliers who kept (EXISTS)   | **16.9**| 81112.5 | 29.9  | 24.4   | **1.8×** | 0.00× |
-| Q22 | Global sales opportunity      | 212.7   | 11345.4 | 27.9  | 53.4   | 0.13×   | 0.00× |
+No per-query JIT on CPU. GPU aggregations skip MAX Graph entirely. GPU joins compile a model once per shape and reuse it — the warmup run primes that cache.
 
-**1 M summary:** MX CPU beats Polars on **11/22** queries; MX GPU beats Polars on **6/22** when amortizing first-call compile cost.
-CPU outliers (Q8/Q9/Q12/Q16) are cold-kernel warmup — they drop to Polars range once warm.
+### 1 M rows — warm median of 3 runs
 
-### 10 M rows — warm GPU kernel cache (steady state)
-
-GPU kernels are pre-compiled during the 1 M run and reused here.
+All times in **milliseconds · lower is better**. Speedup columns = `Polars / MXFrame`; **bold** = MXFrame wins.
 
 | Query | Description | MX CPU | MX GPU | Polars | Pandas | CPU vs Polars | GPU vs Polars |
 |---|---|---:|---:|---:|---:|---:|---:|
-| Q1  | Filter + 8 aggregations       | 1273.5  | 12423.1 | 675.0  | 1995.5  | 0.53×  | 0.05× |
-| Q2  | Min-cost supplier             | **13.7**| 14.0    | 18.3   | 10.6    | **1.3×** | **1.3×** |
-| Q3  | 3-table join + agg            | 319.7   | 20577.6 | 69.3   | 347.2   | 0.22×  | 0.00× |
-| Q4  | Order priority                | 394.5   | 20683.9 | 108.3  | 1163.6  | 0.27×  | 0.01× |
-| Q5  | Multi-join + groupby          | 182.3   | **18.4**| 75.0   | 353.7   | 0.41×  | **4.1×** |
-| Q6  | Masked global agg             | 377.1   | 463.0   | 141.0  | 343.3   | 0.37×  | 0.30× |
-| Q7  | Shipping volume               | 214.8   | 10352.7 | 102.6  | 494.4   | 0.48×  | 0.01× |
-| Q8  | Market share                  | 10904.3 | 11114.6 | 48.6   | 484.8   | 0.00×  | 0.00× |
-| Q9  | Product profit                | 17083.5 | 30666.3 | 106.0  | 549.6   | 0.01×  | 0.00× |
-| Q10 | Customer revenue              | 197.5   | 20729.9 | 149.6  | 259.0   | 0.76×  | 0.01× |
-| Q11 | Important stock               | **2.6** | 347.9   | 7.7    | 4.3     | **3.0×** | 0.02× |
-| Q12 | 2-table join + agg            | 10312.2 | 10336.6 | 141.3  | 7474.7  | 0.01×  | 0.01× |
-| Q13 | Customer distribution         | 526.4   | 20634.1 | 363.5  | 760.8   | 0.69×  | 0.02× |
-| Q14 | Promo revenue                 | 100.1   | **16.0**| 36.0   | 2880.7  | 0.36×  | **2.2×** |
-| Q15 | Top-supplier revenue          | 74.4    | 31766.4 | 17.6   | 44.2    | 0.24×  | 0.00× |
-| Q16 | Part/supplier relationships   | 217.3   | **8.5** | 21.0   | 10.8    | 0.10×  | **2.5×** |
-| Q17 | Small-qty order               | 26.9    | **3.3** | 18.2   | 22.7    | 0.68×  | **5.5×** |
-| Q18 | Large-volume customers        | 218.5   | 20318.2 | 66.8   | 232.0   | 0.31×  | 0.00× |
-| Q19 | Discounted revenue            | 481.6   | **106.0**| 139.8 | 370.3   | 0.29×  | **1.3×** |
-| Q20 | Potential part promo          | 62.5    | 76.8    | 50.8   | 71.7    | 0.81×  | 0.66× |
-| Q21 | Suppliers who kept            | 193.4   | 102678.4| 92.5   | 273.9   | 0.48×  | 0.00× |
-| Q22 | Global sales opportunity      | 2655.2  | 3612.3  | 144.6  | 1734.7  | 0.05×  | 0.04× |
+| Q1  | Filter + 8 aggregations       | **11.2** | 94.4     | 35.6  | 117.4 | **3.2×**   | 0.4× |
+| Q2  | Min-cost supplier             | **6.6**  | 15.6     | 16.3  | 9.5   | **2.5×**   | **1.0×** |
+| Q3  | 3-table join + agg            | **5.6**  | **15.9** | 19.2  | 21.8  | **3.4×**   | **1.2×** |
+| Q4  | Order priority                | 15.0     | 192.5    | 15.0  | 29.9  | 1.0×       | 0.1× |
+| Q5  | Multi-join + groupby          | **0.6**  | **4.1**  | 22.6  | 22.0  | **37.7×**  | **5.5×** |
+| Q6  | Masked global agg             | **7.9**  | 13.2     | 10.4  | 7.7   | **1.3×**   | 0.8× |
+| Q7  | Shipping volume               | **0.6**  | **7.3**  | 29.9  | 19.1  | **49.8×**  | **4.1×** |
+| Q8  | Market share                  | **0.9**  | **4.7**  | 20.2  | 10.3  | **22.4×**  | **4.3×** |
+| Q9  | Product profit (6-table join) | **0.6**  | **6.6**  | 39.9  | 17.8  | **66.5×**  | **6.0×** |
+| Q10 | Customer revenue              | **3.6**  | **11.0** | 32.6  | 19.3  | **9.1×**   | **3.0×** |
+| Q11 | Important stock               | **0.5**  | **2.7**  | 7.4   | 3.0   | **14.8×**  | **2.7×** |
+| Q12 | 2-table join + agg            | **0.8**  | **3.5**  | 24.5  | 586.2 | **30.6×**  | **7.0×** |
+| Q13 | Customer distribution         | **16.2** | 30.2     | 27.5  | 33.5  | **1.7×**   | 0.9× |
+| Q14 | Promo revenue                 | **1.4**  | **1.2**  | 6.9   | 244.0 | **4.9×**   | **5.8×** |
+| Q15 | Top-supplier revenue          | **1.3**  | 11.8     | 9.9   | 6.4   | **7.6×**   | 0.8× |
+| Q16 | Part/supplier relationships   | **2.1**  | **6.3**  | 16.9  | 6.8   | **8.0×**   | **2.7×** |
+| Q17 | Small-qty order               | **0.3**  | **2.7**  | 7.9   | 4.7   | **26.3×**  | **2.9×** |
+| Q18 | Large-volume customers        | **4.2**  | **22.3** | 33.4  | 16.8  | **8.0×**   | **1.5×** |
+| Q19 | Discounted revenue            | **10.9** | **11.2** | 19.6  | 22.4  | **1.8×**   | **1.8×** |
+| Q20 | Potential part promo          | **4.3**  | **5.6**  | 30.0  | 9.6   | **7.0×**   | **5.4×** |
+| Q21 | Suppliers who kept (EXISTS)   | **26.0** | 64.1     | 31.3  | 28.6  | **1.2×**   | 0.5× |
+| Q22 | Global sales opportunity      | **7.6**  | **16.5** | 25.4  | 56.7  | **3.3×**   | **1.5×** |
 
-**10 M summary:** once GPU kernels are warm, **MX GPU beats Polars on 6 queries** (Q2, Q5, Q14, Q16, Q17, Q19) with **Q17 at 5.5×**, **Q5 at 4.1×**, and **Q16 at 2.5×**. Several queries still fall back to MAX Graph and dominate runtime with JIT; replacing those with Mojo AOT kernels is the focus of the next milestone.
+**1 M summary:** MX CPU beats Polars on **21/22** queries (Q4 tied); MX GPU beats Polars on **16/22** queries. Headline CPU wins: **Q9 66×**, **Q7 50×**, **Q5 38×**, **Q12 31×**, **Q17 26×**. Headline GPU wins: **Q12 7×**, **Q9 6×**, **Q14 5.8×**, **Q5 5.5×**, **Q20 5.4×**.
+
+### 10 M rows — warm median of 3 runs
+
+| Query | Description | MX CPU | MX GPU | Polars | Pandas | CPU vs Polars | GPU vs Polars |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Q1  | Filter + 8 aggregations       | **361.0**  | 1190.7   | 946.5  | 1771.7 | **2.6×**   | 0.8× |
+| Q2  | Min-cost supplier             | **5.7**    | **11.9** | 15.4   | 7.6    | **2.7×**   | **1.3×** |
+| Q3  | 3-table join + agg            | **57.7**   | **67.2** | 72.2   | 581.8  | **1.3×**   | **1.1×** |
+| Q4  | Order priority                | 301.5      | 492.2    | 113.8  | 807.6  | 0.4×       | 0.2× |
+| Q5  | Multi-join + groupby          | **2.8**    | **13.8** | 60.7   | 332.9  | **21.7×**  | **4.4×** |
+| Q6  | Masked global agg             | 399.6      | 523.2    | 92.0   | 246.4  | 0.2×       | 0.2× |
+| Q7  | Shipping volume               | **1.8**    | **16.4** | 76.4   | 392.5  | **42.4×**  | **4.7×** |
+| Q8  | Market share                  | **1.3**    | **3.8**  | 40.9   | 55.1   | **31.5×**  | **10.8×** |
+| Q9  | Product profit                | **0.7**    | **7.4**  | 89.7   | 431.3  | **128.1×** | **12.1×** |
+| Q10 | Customer revenue              | **39.2**   | **45.0** | 131.1  | 216.2  | **3.3×**   | **2.9×** |
+| Q11 | Important stock               | **0.4**    | **3.1**  | 6.6    | 2.5    | **16.5×**  | **2.1×** |
+| Q12 | 2-table join + agg            | **1.3**    | **4.4**  | 116.4  | 6853.6 | **89.5×**  | **26.5×** |
+| Q13 | Customer distribution         | 385.1      | 396.1    | 285.8  | 463.9  | 0.7×       | 0.7× |
+| Q14 | Promo revenue                 | **14.4**   | **16.9** | 29.7   | 2719.2 | **2.1×**   | **1.8×** |
+| Q15 | Top-supplier revenue          | **2.7**    | 57.4     | 16.1   | 30.0   | **6.0×**   | 0.3× |
+| Q16 | Part/supplier relationships   | **2.7**    | **6.5**  | 16.3   | 6.8    | **6.0×**   | **2.5×** |
+| Q17 | Small-qty order               | **0.6**    | **1.5**  | 14.6   | 17.0   | **24.3×**  | **9.7×** |
+| Q18 | Large-volume customers        | **46.8**   | 69.4     | 63.4   | 242.8  | **1.4×**   | 0.9× |
+| Q19 | Discounted revenue            | **100.4**  | **97.9** | 112.9  | 234.8  | **1.1×**   | **1.2×** |
+| Q20 | Potential part promo          | **32.3**   | **37.1** | 39.9   | 52.9   | **1.2×**   | **1.1×** |
+| Q21 | Suppliers who kept            | 756.0      | 705.3    | 85.9   | 216.6  | 0.1×       | 0.1× |
+| Q22 | Global sales opportunity      | **54.1**   | **59.2** | 132.8  | 1292.1 | **2.5×**   | **2.2×** |
+
+**10 M summary:** MX CPU beats Polars on **18/22** queries; MX GPU beats Polars on **15/22**. Headline CPU wins scale beautifully: **Q9 128×**, **Q12 89×**, **Q7 42×**, **Q8 32×**, **Q17 24×**, **Q5 22×**. Headline GPU wins: **Q12 26.5×**, **Q9 12×**, **Q8 10.8×**, **Q17 9.7×**, **Q7 4.7×**.
+
+### Where MXFrame loses (same at both scales)
+
+- **Q4, Q6, Q13, Q21** — operations where our kernel path falls back to PyArrow compute or does extra passes. These are the focus of the next milestone (see [`roadmap.md`](roadmap.md)).
 
 ### What the numbers mean
 
 - **Correctness ✅** — all 22 queries return results that round-trip through Pandas and match Polars output.
-- **Coverage ✅** — every TPC-H query has both a CPU AOT path and a GPU path wired up.
-- **Performance mix ⚠️** — MXFrame wins decisively on aggregation-heavy and semi-join queries (Q11, Q17, Q18, Q2, Q14); Polars still wins on multi-join scan-bound queries (Q8, Q9, Q12) because our join kernel lacks radix partitioning. See [`roadmap.md`](roadmap.md) for the kernel backlog.
-- **Why GPU loses at 1 M** — first-call includes MAX Graph compile cost for queries without direct AOT paths. At 10 M with a warm kernel cache, the GPU wins where the work dominates transfer (Q17 ×5.5, Q5 ×4.1).
+- **Coverage ✅** — every TPC-H query has a CPU AOT path; all group aggs/masked aggs have GPU AOT paths; GPU joins use shape-cached MAX Graph models.
+- **No JIT tax in steady state** — after the first query of each shape warms the GPU join model cache, every subsequent call is pure dispatch. The CPU path has no JIT at all.
+- **Why GPU doesn't always win** — GPU wins scale with workload size and kernel coverage. At 10 M, GPU crushes Polars on the join-heavy queries (Q8/Q9/Q12) where Mojo's shape-cached kernels pay off. Where GPU loses, it's either PCIe overhead on tiny outputs (Q1, Q6) or ops that still route through PyArrow fallback (Q4, Q13, Q21).
+
 
 
 ---
