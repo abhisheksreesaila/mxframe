@@ -12,9 +12,13 @@ import argparse
 import os
 import sys
 import time
+import faulthandler
 import numpy as np
 import pyarrow as pa
 from max import driver as _driver
+
+# Enable faulthandler so SIGILL/SIGSEGV produce a Python traceback in CI.
+faulthandler.enable()
 
 # ── Import all query functions from the existing benchmark file ────────────
 sys.path.insert(0, os.path.dirname(__file__))
@@ -83,28 +87,32 @@ def main():
     print(f"GPU: {'ready' if GPU_READY else 'not available'}\n")
 
     # ── Generate data ──────────────────────────────────────────────────────
-    print("Generating data ...", end=" ", flush=True)
-    lineitem = bm.make_lineitem(N)
-    cust_q3, ord_q3, li_q3 = bm.make_tpch_q3_tables()
-    ord_q12, li_q12         = bm.make_tpch_q12_tables()
-    part_q14, li_q14        = bm.make_tpch_q14_tables()
-    nat_q5, cust_q5, ord_q5, li_q5 = bm.make_tpch_q5_tables()
-    nat_q10, cust_q10, ord_q10, li_q10 = bm.make_tpch_q10_tables()
-    nat_q7, sup_q7, cust_q7, ord_q7, li_q7 = bm.make_tpch_q7_tables()
-    nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8 = bm.make_tpch_q8_tables()
-    cust_q13, ord_q13       = bm.make_tpch_q13_tables()
-    part_q19, li_q19        = bm.make_tpch_q19_tables()
-    ord_q4, li_q4           = bm.make_tpch_q4_tables()
-    nat_q9, sup_q9, ps_q9, part_q9, ord_q9, li_q9 = bm.make_tpch_q9_tables()
-    nat_q11, sup_q11, ps_q11 = bm.make_tpch_q11_tables()
-    cust_q18, ord_q18, li_q18 = bm.make_tpch_q18_tables()
-    part_q16, sup_q16, ps_q16 = bm.make_tpch_q16_tables()
-    part_q17, li_q17          = bm.make_tpch_q17_tables()
-    nat_q2, reg_q2, part_q2, sup_q2, ps_q2 = bm.make_tpch_q2_tables()
-    sup_q15, li_q15           = bm.make_tpch_q15_tables()
-    nat_q20, part_q20, sup_q20, ps_q20, li_q20 = bm.make_tpch_q20_tables()
-    nat_q21, sup_q21, ord_q21, li_q21 = bm.make_tpch_q21_tables()
-    cust_q22, ord_q22         = bm.make_tpch_q22_tables()
+    print("Generating data ...", flush=True)
+    def _gen(label, fn):
+        print(f"  {label} ...", flush=True)
+        return fn()
+
+    lineitem = _gen("lineitem", lambda: bm.make_lineitem(N))
+    cust_q3, ord_q3, li_q3 = _gen("q3", bm.make_tpch_q3_tables)
+    ord_q12, li_q12         = _gen("q12", bm.make_tpch_q12_tables)
+    part_q14, li_q14        = _gen("q14", bm.make_tpch_q14_tables)
+    nat_q5, cust_q5, ord_q5, li_q5 = _gen("q5", bm.make_tpch_q5_tables)
+    nat_q10, cust_q10, ord_q10, li_q10 = _gen("q10", bm.make_tpch_q10_tables)
+    nat_q7, sup_q7, cust_q7, ord_q7, li_q7 = _gen("q7", bm.make_tpch_q7_tables)
+    nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8 = _gen("q8", bm.make_tpch_q8_tables)
+    cust_q13, ord_q13       = _gen("q13", bm.make_tpch_q13_tables)
+    part_q19, li_q19        = _gen("q19", bm.make_tpch_q19_tables)
+    ord_q4, li_q4           = _gen("q4", bm.make_tpch_q4_tables)
+    nat_q9, sup_q9, ps_q9, part_q9, ord_q9, li_q9 = _gen("q9", bm.make_tpch_q9_tables)
+    nat_q11, sup_q11, ps_q11 = _gen("q11", bm.make_tpch_q11_tables)
+    cust_q18, ord_q18, li_q18 = _gen("q18", bm.make_tpch_q18_tables)
+    part_q16, sup_q16, ps_q16 = _gen("q16", bm.make_tpch_q16_tables)
+    part_q17, li_q17          = _gen("q17", bm.make_tpch_q17_tables)
+    nat_q2, reg_q2, part_q2, sup_q2, ps_q2 = _gen("q2", bm.make_tpch_q2_tables)
+    sup_q15, li_q15           = _gen("q15", bm.make_tpch_q15_tables)
+    nat_q20, part_q20, sup_q20, ps_q20, li_q20 = _gen("q20", bm.make_tpch_q20_tables)
+    nat_q21, sup_q21, ord_q21, li_q21 = _gen("q21", bm.make_tpch_q21_tables)
+    cust_q22, ord_q22         = _gen("q22", bm.make_tpch_q22_tables)
     print("done\n")
 
     def skip(n): return only is not None and n not in only
