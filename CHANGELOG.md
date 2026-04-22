@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.1.1] — 2026-04-22
+
+### 🛠 Fixed
+- Packaging: `readme` now points to `README.md` so PyPI shows the full project page with benchmarks and quickstart (was accidentally showing the internal vision/architecture doc)
+- CI: `AOTKernelsGPU` init no longer hard-fails on CPU-only runners (`CUDA driver unavailable` is caught, `self._aot_gpu` falls back to `None`)
+- CI: `_find_kernels_path()` uses `Path(__file__).resolve().parent` directly, removing the stale `/home/ablearn/mxdf/…` dev fallback that surfaced in installed wheels
+- Bug: `NameError: cache_key_count` in `_hash_join_mojo_cpu` MAX Graph fallback
+- Tests: `scripts/_test_phase0_custom_ops.py` and `_test_phase1.py` no longer hard-code a developer's kernels path; they use the auto-detected default
+
+---
+
 ## [0.1.0] — 2026-04-20
 
 ### ✨ Added

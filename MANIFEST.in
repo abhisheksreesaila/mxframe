@@ -1,5 +1,6 @@
 include pyproject.toml
 include setup.py
+include README.md
 include CHANGELOG.md
 include docs/vision-and-architecture.md
 include __init__.py
