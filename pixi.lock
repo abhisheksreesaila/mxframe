@@ -4102,8 +4102,8 @@ packages:
   timestamp: 1749895533014
 - pypi: ./
   name: mxframe
-  version: 0.1.0
-  sha256: b81a0441e56ae37586cad7b925b5dca776b45cfdc9ac5232052e9fad7502c22f
+  version: 0.1.1
+  sha256: bf45ae0bc57a591e33845a051fd72009358b9a29f4845328af62d4acfff6cb6c
   requires_dist:
   - pyarrow>=14.0
   - numpy>=1.24
