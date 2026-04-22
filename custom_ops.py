@@ -135,7 +135,15 @@ class CustomOpsCompiler(GraphCompiler):
         else:
             self.session = _get_or_create_session(self._session_device, self._driver_device)
         self._aot = AOTKernels() if AOT_AVAILABLE else None
-        self._aot_gpu = AOTKernelsGPU() if GPU_AOT_AVAILABLE else None
+        # GPU AOT init can fail at runtime even when the .so exists (e.g. no CUDA
+        # driver in a CPU-only CI runner). Fall back gracefully to CPU-only.
+        if GPU_AOT_AVAILABLE:
+            try:
+                self._aot_gpu = AOTKernelsGPU()
+            except Exception:
+                self._aot_gpu = None
+        else:
+            self._aot_gpu = None
 
     def _maybe_switch_device(self, N: int) -> None:
         """For device='auto': re-evaluate CPU vs GPU based on row count.
