@@ -30,13 +30,18 @@ except Exception:
 # %% ../nbs/04_custom_ops.ipynb 4
 def _find_kernels_path() -> str:
     """Prefer pre-compiled kernels.mojopkg over source; search relative to this file."""
-    import sys as _sys
-    _module_file = _sys.modules[__name__].__file__
-    _here = Path(_module_file).parent if _module_file else Path("/home/ablearn/mxdf/mxframe")
+    _here = Path(__file__).resolve().parent
     _pkg = _here / "kernels.mojopkg"
     if _pkg.exists():
         return str(_pkg)
-    return str(_here / "kernels_v261")
+    _src = _here / "kernels_v261"
+    if _src.exists():
+        return str(_src)
+    # Last resort: raise a clear error instead of returning a stale hardcoded path.
+    raise FileNotFoundError(
+        f"mxframe: could not locate kernels.mojopkg or kernels_v261/ next to {__file__}. "
+        "The installed package is missing its Mojo kernels."
+    )
 
 KERNELS_PATH = _find_kernels_path()
 
