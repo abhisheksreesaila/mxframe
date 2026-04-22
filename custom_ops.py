@@ -2330,6 +2330,7 @@ class CustomOpsCompiler(GraphCompiler):
         # ── AOT not available: fall back to MAX Graph join_count_cpu / join_scatter_cpu ──
         left_keys_i32 = lk
         right_keys_i32 = rk
+        cache_key_count = ("join_count_cpu", n_left, n_right, self._session_device)
         model_count = _POST_OP_MODEL_CACHE.get(cache_key_count)
         if model_count is None:
             lk_type = TensorType(DType.int32, [n_left], self._device_ref)
