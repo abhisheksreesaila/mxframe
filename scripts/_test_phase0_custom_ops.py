@@ -5,8 +5,7 @@ from mxframe.lazy_expr import col, lit
 from mxframe.lazy_frame import LazyFrame, Scan
 from mxframe.custom_ops import CustomOpsCompiler
 
-kernels_path = str(Path("/home/ablearn/mxdf/mxframe/kernels.mojopkg"))
-compiler = CustomOpsCompiler(kernels_path)
+compiler = CustomOpsCompiler()
 
 # ── Test 1: projection ───────────────────────────────────────────────────────
 table = pa.table({"a": [1, 2, 3], "b": [4, 5, 6]})
