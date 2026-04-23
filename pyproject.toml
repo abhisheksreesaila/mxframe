@@ -24,16 +24,20 @@ classifiers = [
 ]
 
 dependencies = [
-    "modular>=25.5",
     "pyarrow>=14.0",
     "numpy>=1.24",
     "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
-polars = ["polars>=0.20"]
-sql   = ["sqlglot>=25.0"]
-dev   = [
+# `modular` provides the MAX engine & driver used by mxframe's compiler.
+# It lives on PyPI *and* in Modular's conda channel. Pixi users get it from conda
+# and should NOT install this extra (it will conflict). Pure-pip users should:
+#   pip install "mxframe[runtime]"
+runtime = ["modular>=25.5"]
+polars  = ["polars>=0.20"]
+sql     = ["sqlglot>=25.0"]
+dev     = [
     "pytest>=7.0",
     "polars>=0.20",
     "sqlglot>=25.0",

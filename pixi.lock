@@ -4102,12 +4102,13 @@ packages:
   timestamp: 1749895533014
 - pypi: ./
   name: mxframe
-  version: 0.1.1
-  sha256: bf45ae0bc57a591e33845a051fd72009358b9a29f4845328af62d4acfff6cb6c
+  version: 0.1.2
+  sha256: b2eb9d1cfb8443b6a839ece4b50786420edf1264e89fe4e3a06564cd67c606e5
   requires_dist:
   - pyarrow>=14.0
   - numpy>=1.24
   - pandas>=2.0
+  - modular>=25.5 ; extra == 'runtime'
   - polars>=0.20 ; extra == 'polars'
   - sqlglot>=25.0 ; extra == 'sql'
   - pytest>=7.0 ; extra == 'dev'
