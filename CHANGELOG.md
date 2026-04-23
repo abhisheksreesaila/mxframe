@@ -5,6 +5,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.1.2] — 2026-04-22
+
+### 🛠 Fixed
+- `pip install mxframe` now works end-to-end: added `modular>=25.5` to required dependencies (provides the `max` engine/driver that `compiler.py` imports at module load).
+- `sqlglot` import in `mxframe.sql_frontend` is now lazy: `import mxframe` no longer requires the `[sql]` extra. Calling `mxframe.sql(…)` without `sqlglot` installed raises a clear `ImportError` with the install hint.
+- `__init__.py` `__version__` now matches `pyproject.toml`.
+
+---
+
 ## [0.1.1] — 2026-04-22
 
 ### 🛠 Fixed

@@ -1,6 +1,6 @@
 """mxframe - GPU-accelerated DataFrames with MAX Engine"""
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 # Lazy expression layer
 from .lazy_expr import Expr, col, lit, when, row_number
@@ -25,8 +25,16 @@ from .plan_validation import PlanValidationError, validate_plan, validate_plan_o
 # Custom ops compiler
 from .custom_ops import CustomOpsCompiler, KERNELS_PATH, clear_cache
 
-# SQL frontend
-from .sql_frontend import sql
+# SQL frontend (optional; requires `sqlglot`).
+# Imported lazily so `pip install mxframe` works without the sql extra.
+try:
+    from .sql_frontend import sql
+except ImportError:
+    def sql(*args, **kwargs):  # type: ignore[misc]
+        raise ImportError(
+            "mxframe.sql requires the optional `sqlglot` dependency. "
+            "Install with: pip install 'mxframe[sql]'"
+        )
 
 
 def warmup(device: str = "auto") -> float:
