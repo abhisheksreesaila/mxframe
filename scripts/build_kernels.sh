@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SRC_DIR="$REPO_ROOT/kernels_v261"
+SRC_DIR="$REPO_ROOT/kernels"
 OUT_PKG="$REPO_ROOT/kernels.mojopkg"
 STAGE_DIR="$(mktemp -d)"
 
@@ -22,18 +22,15 @@ cp "$SRC_DIR/group_sum.mojo" "$STAGE_DIR/group_sum.mojo"
 cp "$SRC_DIR/group_min.mojo" "$STAGE_DIR/group_min.mojo"
 cp "$SRC_DIR/group_max.mojo" "$STAGE_DIR/group_max.mojo"
 cp "$SRC_DIR/group_count.mojo" "$STAGE_DIR/group_count.mojo"
-cp "$SRC_DIR/group_mean.mojo" "$STAGE_DIR/group_mean.mojo"
 cp "$SRC_DIR/sort_indices.mojo" "$STAGE_DIR/sort_indices.mojo"
 cp "$SRC_DIR/unique_mask.mojo" "$STAGE_DIR/unique_mask.mojo"
 cp "$SRC_DIR/join_count.mojo" "$STAGE_DIR/join_count.mojo"
 cp "$SRC_DIR/join_scatter.mojo" "$STAGE_DIR/join_scatter.mojo"
-cp "$SRC_DIR/gather_rows.mojo" "$STAGE_DIR/gather_rows.mojo"
 cp "$SRC_DIR/filter_gather.mojo" "$STAGE_DIR/filter_gather.mojo"
 cp "$SRC_DIR/join_count_left.mojo" "$STAGE_DIR/join_count_left.mojo"
 cp "$SRC_DIR/join_scatter_left.mojo" "$STAGE_DIR/join_scatter_left.mojo"
 cp "$SRC_DIR/group_composite.mojo" "$STAGE_DIR/group_composite.mojo"
 cp "$SRC_DIR/masked_global_agg.mojo" "$STAGE_DIR/masked_global_agg.mojo"
-cp "$SRC_DIR/debug_write_one.mojo" "$STAGE_DIR/debug_write_one.mojo"
 
 echo "── Building kernels from staged subset ──"
 if command -v mojo >/dev/null 2>&1; then

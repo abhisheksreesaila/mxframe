@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MXFrame — Query to GPU Kernel</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: #0b0d14;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    /* Neon glow helpers */
+    .glow-green { box-shadow: 0 0 12px rgba(0,255,136,0.35); }
+    .glow-blue  { box-shadow: 0 0 12px rgba(56,189,248,0.35); }
+    .glow-orange{ box-shadow: 0 0 12px rgba(251,146,60,0.35); }
+    .glow-purple{ box-shadow: 0 0 12px rgba(167,139,250,0.35); }
+
+    /* Token colours for the code panel */
+    .tok-kw   { color:#c792ea; }
+    .tok-fn   { color:#82aaff; }
+    .tok-str  { color:#c3e88d; }
+    .tok-num  { color:#f78c6c; }
+    .tok-col  { color:#89ddff; }
+    .tok-op   { color:#89ddff; }
+    .tok-cm   { color:#546e7a; font-style:italic; }
+    .tok-alias{ color:#ffcb6b; }
+
+    /* animated underline on active code line */
+    @keyframes slideIn {
+      from { opacity:0; transform:translateX(-8px); }
+      to   { opacity:1; transform:translateX(0); }
+    }
+    .line-enter { animation: slideIn 0.3s ease forwards; }
+
+    /* Plan tree node pulse */
+    @keyframes nodePop {
+      0%  { transform:scale(0.7); opacity:0; }
+      60% { transform:scale(1.08); }
+      100%{ transform:scale(1);   opacity:1; }
+    }
+    .node-enter { animation: nodePop 0.4s ease forwards; }
+
+    /* GPU thread flash */
+    @keyframes threadFire {
+      0%  { background:#111; color:#555; }
+      50% { background:#00ff88; color:#000; box-shadow:0 0 8px #00ff88; }
+      100%{ background:#1a3d28; color:#00ff88; }
+    }
+    .thread-fire { animation: threadFire 0.5s ease forwards; }
+    @keyframes threadFade {
+      from { opacity:1; } to { opacity:0.25; }
+    }
+
+    /* Dispatch ribbon */
+    @keyframes arrowSlide {
+      from { width:0; opacity:0; }
+      to   { opacity:1; }
+    }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ─── Query data ────────────────────────────────────────────────────────────
+const QUERIES = {
+  Q1: {
+    label: "Q1 — Grouped Aggregation",
+    emoji: "📊",
+    subtitle: "filter → groupby → 8 aggs → sort",
+    code: [
+      { txt: "# TPC-H Q1: grouped revenue summary", cls:"tok-cm" },
+      { txt: "LazyFrame(lineitem)", cls:"" },
+      { txt: "  .filter(", cls:"tok-fn" },
+      { txt: "    col(\"l_shipdate\") <= lit(", cls:"tok-col", extra:"<span class='tok-num'>10471</span>)" },
+      { txt: "  )", cls:"" },
+      { txt: "  .groupby(\"l_returnflag\", \"l_linestatus\")", cls:"tok-fn" },
+      { txt: "  .agg(", cls:"tok-fn" },
+      { txt: "    col(\"l_quantity\").sum().alias(\"sum_qty\"),", cls:"tok-col" },
+      { txt: "    col(\"l_extendedprice\").sum().alias(\"sum_base_price\"),", cls:"tok-col" },
+      { txt: "    col(\"l_quantity\").mean().alias(\"avg_qty\"),", cls:"tok-col" },
+      { txt: "    col(\"l_quantity\").count().alias(\"count_order\")", cls:"tok-col" },
+      { txt: "  )", cls:"" },
+      { txt: "  .sort(\"l_returnflag\", \"l_linestatus\")", cls:"tok-fn" },
+      { txt: "  .compute(device=\"gpu\")", cls:"tok-fn" },
+    ],
+    tree: [
+      { id:"sort",  label:"Sort",       color:"#a78bfa", icon:"↕", detail:"by: returnflag, linestatus",  children:["agg"] },
+      { id:"agg",   label:"Aggregate",  color:"#38bdf8", icon:"Σ", detail:"group_by: [returnflag, linestatus]\naggs: sum, mean, count×4", children:["filt"] },
+      { id:"filt",  label:"Filter",     color:"#fb923c", icon:"σ", detail:"l_shipdate ≤ 10471",           children:["scan"] },
+      { id:"scan",  label:"Scan",       color:"#4ade80", icon:"▤", detail:"lineitem  ·  7 columns\n~1 000 000 rows", children:[] },
+    ],
+    optimizer: { passes:["merge_adjacent_filters → no-op"], note:"Plan already optimal" },
+    dispatch: [
+      { label:"dict_encode keys",      where:"CPU (PyArrow SIMD)",  color:"#fb923c", note:"returnflag×linestatus → int32 ids (6 groups)" },
+      { label:"filter mask",           where:"CPU (PyArrow)",        color:"#fb923c", note:"boolean mask, ~900K pass" },
+      { label:"group_sum_f32_gpu ×4",  where:"🟢 GPU AOT kernel",    color:"#00ff88", note:"AOTKernelsGPU.group_sum_f32 — 256 threads, warp reduce" },
+      { label:"group_count_f32_gpu",   where:"🟢 GPU AOT kernel",    color:"#00ff88", note:"AOTKernelsGPU.group_count_f32" },
+      { label:"sort (post-op)",        where:"CPU (numpy argsort)",  color:"#fb923c", note:"6 rows — trivially small" },
+    ],
+    provenance: "cpu_aot → gpu_aot (GPU session)",
+    kernel: { name:"group_sum_f32_gpu", groups:6, N:900000,
+              note:"Each thread i: out[labels[i]] += vals[i]  (atomicAdd, shared-mem privatisation)" },
+    result: { rows:6, cols:["returnflag","linestatus","sum_qty","sum_base_price","avg_qty","count_order"] },
+  },
+
+  Q6: {
+    label: "Q6 — Masked Global Sum",
+    emoji: "🎯",
+    subtitle: "5-predicate filter → single fused sum",
+    code: [
+      { txt: "# TPC-H Q6: revenue with multi-predicate filter", cls:"tok-cm" },
+      { txt: "LazyFrame(lineitem)", cls:"" },
+      { txt: "  .filter(", cls:"tok-fn" },
+      { txt: "    (col(\"l_shipdate\") >= lit(8766)) &", cls:"tok-col" },
+      { txt: "    (col(\"l_shipdate\") <  lit(9131)) &", cls:"tok-col" },
+      { txt: "    (col(\"l_discount\") >= lit(0.05)) &", cls:"tok-col" },
+      { txt: "    (col(\"l_discount\") <= lit(0.07)) &", cls:"tok-col" },
+      { txt: "    (col(\"l_quantity\") <  lit(24.0))", cls:"tok-col" },
+      { txt: "  )", cls:"" },
+      { txt: "  .groupby()", cls:"tok-fn" },
+      { txt: "  .agg(", cls:"tok-fn" },
+      { txt: "    (col(\"l_extendedprice\") * col(\"l_discount\"))", cls:"tok-col" },
+      { txt: "      .sum().alias(\"revenue\")", cls:"tok-alias" },
+      { txt: "  )", cls:"" },
+      { txt: "  .compute(device=\"gpu\")", cls:"tok-fn" },
+    ],
+    tree: [
+      { id:"agg",   label:"Aggregate",  color:"#38bdf8", icon:"Σ", detail:"group_by: []  (global)\nagg: sum(price × discount)", children:["filt"] },
+      { id:"filt",  label:"Filter",     color:"#fb923c", icon:"σ", detail:"5 numeric predicates merged\nby optimizer into 1 AND-node", children:["scan"] },
+      { id:"scan",  label:"Scan",       color:"#4ade80", icon:"▤", detail:"lineitem  ·  7 columns",  children:[] },
+    ],
+    optimizer: { passes:["merge_adjacent_filters → combined AND predicate"], note:"5 filters collapsed to 1 Filter node" },
+    dispatch: [
+      { label:"_compute_masked_global_agg",   where:"Fast-path check",       color:"#a78bfa", note:"Detects: global agg + simple filter — special case!" },
+      { label:"eval_predicate (mask)",         where:"CPU (PyArrow)",         color:"#fb923c", note:"int32 mask of length N, only small cost" },
+      { label:"masked_global_sum_product_gpu", where:"🟢 GPU AOT kernel",     color:"#00ff88", note:"SINGLE PASS: sum(price × disc) where mask=1, zero allocation" },
+    ],
+    provenance: "masked_global_agg_mojo (GPU session)",
+    kernel: { name:"masked_global_sum_product_f32_gpu", groups:1, N:1000000,
+              note:"Single-pass: each thread reads val_a[i], val_b[i], mask[i] → atomicAdd if mask\nZero intermediate array allocation" },
+    result: { rows:1, cols:["revenue"] },
+  },
+
+  Q3: {
+    label: "Q3 — 3-Table Join + Agg",
+    emoji: "🔗",
+    subtitle: "join → join → groupby → sort → limit",
+    code: [
+      { txt: "# TPC-H Q3: top 10 orders by revenue", cls:"tok-cm" },
+      { txt: "lf_c = LazyFrame(customer)", cls:"" },
+      { txt: "  .filter(col(\"c_mktsegment\") == lit(\"BUILDING\"))", cls:"tok-fn" },
+      { txt: "lf_o = LazyFrame(orders)", cls:"" },
+      { txt: "  .filter(col(\"o_orderdate\") < lit(DATE_95_03_15))", cls:"tok-fn" },
+      { txt: "lf_l = LazyFrame(lineitem)", cls:"" },
+      { txt: "  .filter(col(\"l_shipdate\") > lit(DATE_95_03_15))", cls:"tok-fn" },
+      { txt: "result = (lf_o", cls:"" },
+      { txt: "  .join(lf_c, left_on=\"o_custkey\",", cls:"tok-fn" },
+      { txt: "           right_on=\"c_custkey\")", cls:"" },
+      { txt: "  .join(lf_l, left_on=\"o_orderkey\",", cls:"tok-fn" },
+      { txt: "           right_on=\"l_orderkey\")", cls:"" },
+      { txt: "  .groupby(\"o_orderkey\",\"o_orderdate\",\"o_shippriority\")", cls:"tok-fn" },
+      { txt: "  .agg((col(\"l_extendedprice\")*(lit(1)-col(\"l_discount\")))", cls:"tok-col" },
+      { txt: "       .sum().alias(\"revenue\"))", cls:"tok-alias" },
+      { txt: "  .sort(\"revenue\", descending=True).limit(10)", cls:"tok-fn" },
+      { txt: "  .compute(device=\"gpu\"))", cls:"tok-fn" },
+    ],
+    tree: [
+      { id:"limit", label:"Limit 10",   color:"#f472b6", icon:"✂", detail:"take first 10 rows",            children:["sort"] },
+      { id:"sort",  label:"Sort",       color:"#a78bfa", icon:"↕", detail:"revenue DESC",                   children:["agg"] },
+      { id:"agg",   label:"Aggregate",  color:"#38bdf8", icon:"Σ", detail:"group_by: [orderkey, date, prio]\nagg: sum(price*(1-disc))", children:["j2"] },
+      { id:"j2",    label:"Join ②",     color:"#f59e0b", icon:"⋈", detail:"orders ⋈ lineitem\nleft_on=orderkey",  children:["j1","fl"] },
+      { id:"j1",    label:"Join ①",     color:"#f59e0b", icon:"⋈", detail:"orders ⋈ customer\nleft_on=custkey",   children:["fo","fc"] },
+      { id:"fo",    label:"Filter",     color:"#fb923c", icon:"σ", detail:"orderdate < DATE",     children:[] },
+      { id:"fc",    label:"Filter",     color:"#fb923c", icon:"σ", detail:"mktsegment='BUILDING'", children:[] },
+      { id:"fl",    label:"Filter",     color:"#fb923c", icon:"σ", detail:"shipdate > DATE",       children:[] },
+    ],
+    optimizer: { passes:["predicate_pushdown → filters already at leaves", "join_reorder (no-op)"], note:"Plan already optimal for hash join" },
+    dispatch: [
+      { label:"join_count_gpu + join_scatter_gpu",  where:"🟢 GPU AOT kernel",   color:"#00ff88", note:"2-pass hash join; index pairs on GPU" },
+      { label:"gather_f32_gpu, gather_i32_gpu",      where:"🟢 GPU AOT kernel",   color:"#00ff88", note:"numeric cols gathered on GPU; strings via Arrow.take" },
+      { label:"group_encode_i32_gpu (Phase 3)",      where:"🟢 GPU AOT kernel",   color:"#00ff88", note:"integer key → dense group IDs via GPU hash table" },
+      { label:"group_sum_f32_gpu",                   where:"🟢 GPU AOT kernel",   color:"#00ff88", note:"fused grouped sum on GPU" },
+      { label:"sort + limit (post-op)",              where:"CPU (numpy argsort)", color:"#fb923c", note:"10 rows — trivially small; GPU overkill here" },
+    ],
+    provenance: "cpu_aot → gpu_aot (GPU session)",
+    kernel: { name:"join_count_gpu → join_scatter_gpu → group_sum_f32_gpu", groups:null, N:600000,
+              note:"Step 1 – join_count: count matching right rows per left key\nStep 2 – join_scatter: emit (left_idx, right_idx) pairs\nStep 3 – group_sum: aggregate revenue per (orderkey, date, prio)" },
+    result: { rows:10, cols:["o_orderkey","o_orderdate","o_shippriority","revenue"] },
+  },
+
+  Q14: {
+    label: "Q14 — Complex Expr Global Sum",
+    emoji: "🧮",
+    subtitle: "join → case_when expr → global fused sum",
+    code: [
+      { txt: "# TPC-H Q14: promo revenue %", cls:"tok-cm" },
+      { txt: "promo = when(", cls:"tok-fn" },
+      { txt: "    col(\"p_type\").startswith(\"PROMO\"),", cls:"tok-col" },
+      { txt: "    col(\"l_extendedprice\") * (lit(1.0) - col(\"l_discount\")),", cls:"tok-col" },
+      { txt: "    lit(0.0)", cls:"tok-num" },
+      { txt: ")", cls:"" },
+      { txt: "total = col(\"l_extendedprice\") * (lit(1.0) - col(\"l_discount\"))", cls:"tok-col" },
+      { txt: "result = (LazyFrame(lineitem)", cls:"" },
+      { txt: "  .join(LazyFrame(part), left_on=\"l_partkey\",", cls:"tok-fn" },
+      { txt: "                         right_on=\"p_partkey\")", cls:"" },
+      { txt: "  .filter(col(\"l_shipdate\") >= lit(DATE_LO))", cls:"tok-fn" },
+      { txt: "  .filter(col(\"l_shipdate\") <  lit(DATE_HI))", cls:"tok-fn" },
+      { txt: "  .groupby()", cls:"tok-fn" },
+      { txt: "  .agg(", cls:"tok-fn" },
+      { txt: "    promo.sum().alias(\"promo_revenue\"),", cls:"tok-alias" },
+      { txt: "    total.sum().alias(\"total_revenue\")", cls:"tok-alias" },
+      { txt: "  ).compute(device=\"gpu\"))", cls:"tok-fn" },
+    ],
+    tree: [
+      { id:"agg",  label:"Aggregate",  color:"#38bdf8", icon:"Σ", detail:"group_by: []  (global)\nagg[0]: sum(case_when(startswith,…))\nagg[1]: sum(price*(1-disc))", children:["filt"] },
+      { id:"filt", label:"Filter",     color:"#fb923c", icon:"σ", detail:"DATE_LO ≤ shipdate < DATE_HI\n(merged by optimizer)",       children:["join"] },
+      { id:"join", label:"Join",       color:"#f59e0b", icon:"⋈", detail:"lineitem ⋈ part\nleft_on=l_partkey",                         children:[] },
+    ],
+    optimizer: { passes:["merge_adjacent_filters → DATE_LO ≤ shipdate < DATE_HI"], note:"Two date filters merged into 1 AND node" },
+    dispatch: [
+      { label:"join_count_gpu + join_scatter_gpu",     where:"🟢 GPU AOT kernel",  color:"#00ff88", note:"Inner hash join: lineitem ⋈ part" },
+      { label:"_compute_masked_global_agg",            where:"Fast-path check",    color:"#a78bfa", note:"Phase 2 extension: handles ANY inner expression!" },
+      { label:"_eval_expr_arrow (case_when)",          where:"CPU (PyArrow)",      color:"#fb923c", note:"case_when/startswith evaluated in Arrow — result is float32[N]" },
+      { label:"eval_predicate → mask",                 where:"CPU (PyArrow)",      color:"#fb923c", note:"date filter → int32 mask" },
+      { label:"masked_global_sum_f32_gpu × 2",         where:"🟢 GPU AOT kernel",  color:"#00ff88", note:"SUM reduction on GPU for both expressions\nExpression eval in Arrow, aggregation in Mojo" },
+    ],
+    provenance: "masked_global_agg_mojo (GPU session)",
+    kernel: { name:"masked_global_sum_f32_gpu", groups:1, N:200000,
+              note:"After Arrow evaluates case_when → float32[N], the GPU kernel sums it with the mask in one pass.\nThis is Phase 2: _compute_masked_global_agg handles complex inner expressions." },
+    result: { rows:1, cols:["promo_revenue","total_revenue"] },
+  },
+};
+
+// ─── Tree layout helper ────────────────────────────────────────────────────
+function buildTree(nodes) {
+  const map = {};
+  nodes.forEach(n => { map[n.id] = {...n, _children: n.children.map(c => map[c] || null).filter(Boolean)}; });
+  // Find root (not referenced as child of anything)
+  const childIds = new Set(nodes.flatMap(n => n.children));
+  return nodes.find(n => !childIds.has(n.id));
+}
+
+// ─── Components ───────────────────────────────────────────────────────────
+
+function CodePanel({ lines, visibleCount }) {
+  return (
+    <div className="mono" style={{
+      background:"#161b22", borderRadius:10, padding:"16px 18px",
+      fontSize:13, lineHeight:"1.9", height:"100%", overflow:"auto",
+      border:"1px solid #30363d"
+    }}>
+      <div style={{color:"#8b949e",fontSize:11,marginBottom:10,letterSpacing:1}}>
+        PYTHON · LazyFrame API
+      </div>
+      {lines.map((l, i) => (
+        <div key={i} className={i < visibleCount ? "line-enter" : ""}
+          style={{
+            opacity: i < visibleCount ? 1 : 0.12,
+            background: i === visibleCount-1 && visibleCount > 0
+              ? "rgba(0,255,136,0.06)" : "transparent",
+            borderLeft: i === visibleCount-1 && visibleCount > 0
+              ? "2px solid #00ff88" : "2px solid transparent",
+            paddingLeft: 8, borderRadius: 3, transition:"opacity 0.3s"
+          }}>
+          <span className={l.cls} dangerouslySetInnerHTML={{
+            __html: l.extra ? l.txt.replace(")", "") + l.extra : escapeHtml(l.txt)
+          }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+// Recursive tree renderer
+function TreeNode({ node, nodeMap, visibleIds, depth=0 }) {
+  if (!node) return null;
+  const visible = visibleIds.has(node.id);
+  const nodeColor = node.color;
+  return (
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", minWidth:90 }}>
+      <div className={visible ? "node-enter" : ""}
+        style={{
+          opacity: visible ? 1 : 0,
+          background: visible ? nodeColor+"22" : "transparent",
+          border: `2px solid ${visible ? nodeColor : "#333"}`,
+          borderRadius: 8,
+          padding: "6px 12px",
+          textAlign:"center",
+          fontSize: 12,
+          minWidth: 80,
+          position:"relative",
+          transition:"border-color 0.3s",
+          boxShadow: visible ? `0 0 10px ${nodeColor}44` : "none"
+        }}>
+        <div style={{fontSize:18, marginBottom:2}}>{node.icon}</div>
+        <div style={{fontWeight:700, color: nodeColor, fontSize:11}}>{node.label}</div>
+        {visible && (
+          <div style={{
+            fontSize:9.5, color:"#94a3b8", marginTop:3, whiteSpace:"pre-line",
+            fontFamily:"'JetBrains Mono', monospace"
+          }}>{node.detail}</div>
+        )}
+      </div>
+      {node._children && node._children.length > 0 && (
+        <>
+          <div style={{width:2,height:18,background:"#334155"}} />
+          <div style={{display:"flex", gap:12, alignItems:"flex-start"}}>
+            {node._children.map((child, ci) => (
+              <div key={ci} style={{display:"flex", flexDirection:"column", alignItems:"center"}}>
+                {node._children.length > 1 && (
+                  <div style={{width:"100%",height:2,background:"#334155",marginBottom:0}} />
+                )}
+                <TreeNode node={child} nodeMap={nodeMap} visibleIds={visibleIds} depth={depth+1} />
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TreePanel({ query, visibleNodeIds }) {
+  const nodeMap = {};
+  query.tree.forEach(n => nodeMap[n.id] = n);
+  query.tree.forEach(n => n._children = n.children.map(c=>nodeMap[c]).filter(Boolean));
+  const childIds = new Set(query.tree.flatMap(n=>n.children));
+  const root = query.tree.find(n => !childIds.has(n.id));
+  const visSet = new Set(visibleNodeIds);
+  return (
+    <div style={{
+      background:"#161b22", borderRadius:10, padding:"16px 12px",
+      border:"1px solid #30363d", height:"100%", overflow:"auto",
+      display:"flex", flexDirection:"column", alignItems:"center"
+    }}>
+      <div style={{color:"#8b949e",fontSize:11,marginBottom:14,letterSpacing:1,alignSelf:"flex-start"}}>
+        LOGICAL PLAN TREE
+      </div>
+      <div style={{display:"flex", justifyContent:"center", flex:1, paddingTop:8}}>
+        <TreeNode node={root} nodeMap={nodeMap} visibleIds={visSet} />
+      </div>
+    </div>
+  );
+}
+
+function DispatchPanel({ dispatch, visibleCount, provenance }) {
+  return (
+    <div style={{
+      background:"#161b22", borderRadius:10, padding:"16px 14px",
+      border:"1px solid #30363d", height:"100%", overflow:"auto"
+    }}>
+      <div style={{color:"#8b949e",fontSize:11,marginBottom:14,letterSpacing:1}}>
+        DISPATCH PIPELINE
+      </div>
+      {dispatch.map((d,i) => {
+        const active = i < visibleCount;
+        return (
+          <div key={i} style={{
+            display:"flex", alignItems:"flex-start", gap:10, marginBottom:10,
+            opacity: active ? 1 : 0.1, transition:"opacity 0.4s"
+          }}>
+            <div style={{
+              width:10, height:10, borderRadius:"50%", marginTop:4, flexShrink:0,
+              background: active ? d.color : "#333",
+              boxShadow: active ? `0 0 8px ${d.color}` : "none",
+              transition:"all 0.4s"
+            }} />
+            <div>
+              <div style={{
+                fontSize:12, fontWeight:600, color: active ? d.color : "#444",
+                fontFamily:"'JetBrains Mono', monospace"
+              }}>{d.label}</div>
+              <div style={{fontSize:10, color:"#64748b", margin:"2px 0"}}>{d.where}</div>
+              <div style={{fontSize:10, color:"#94a3b8", fontStyle:"italic"}}>{d.note}</div>
+            </div>
+          </div>
+        );
+      })}
+      {visibleCount >= dispatch.length && (
+        <div style={{
+          marginTop:14, padding:"8px 12px", borderRadius:6,
+          background:"rgba(0,255,136,0.07)", border:"1px solid #00ff8855",
+          fontSize:11, color:"#00ff88", fontFamily:"'JetBrains Mono',monospace"
+        }}>
+          provenance: <strong>{provenance}</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Algorithm visualizations (one per query) ────────────────────────────
+
+// GROUP_SUM — scatter to 6 shared-memory bins (Q1)
+function GroupSumViz({ sub }) {
+  const COLS = ["#00ff88","#38bdf8","#f59e0b","#a78bfa","#fb923c","#f472b6"];
+  const LABS = ["A×F","A×O","N×F","N×O","R×F","R×O"];
+  const data = [
+    {v:2.1,g:0},{v:3.2,g:1},{v:1.5,g:2},{v:3.8,g:3},{v:1.9,g:4},{v:4.1,g:5},
+    {v:4.3,g:0},{v:2.9,g:1},{v:4.7,g:2},{v:2.1,g:3},{v:3.3,g:4},{v:1.6,g:5},
+    {v:1.8,g:0},{v:5.1,g:1},{v:2.2,g:2},{v:4.5,g:3},{v:2.7,g:4},{v:3.9,g:5},
+  ];
+  const sums = [0,1,2,3,4,5].map(g=>data.filter(d=>d.g===g).reduce((a,d)=>a+d.v,0).toFixed(1));
+
+  return (
+    <div>
+      <div style={{fontSize:9,color:"#64748b",marginBottom:6,fontFamily:"mono",minHeight:24}}>
+        {sub===0&&"Click \u25b6 to start — 256 threads ready"}
+        {sub===1&&"Step 1: all threads read  val[i]  +  gid[i]  simultaneously"}
+        {sub===2&&"Step 2: atomicAdd(shmem[gid], val)  — values scatter to bins"}
+        {sub===3&&"Step 3: barrier() ✓  → shmem flush to global output buffer"}
+      </div>
+      {/* 18 data bubbles, 6 per row */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:3,marginBottom:6}}>
+        {data.map((d,i)=>(
+          <div key={i} style={{
+            padding:"3px 1px",borderRadius:4,textAlign:"center",
+            border:`1.5px solid ${sub>=1?COLS[d.g]:"#1e293b"}`,
+            background:sub>=1?COLS[d.g]+"18":"#111827",
+            opacity:sub>=2?0.35:1,
+            transition:`all 0.3s ${i*18}ms`
+          }}>
+            <div style={{fontSize:9,color:sub>=1?COLS[d.g]:"#475569",fontWeight:700}}>{d.v}</div>
+            <div style={{fontSize:6,color:"#475569"}}>g{d.g}</div>
+          </div>
+        ))}
+      </div>
+      {sub>=2&&<div style={{textAlign:"center",fontSize:10,color:"#334155",marginBottom:4}}>↓ atomicAdd</div>}
+      {/* 6 bins */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:3}}>
+        {[0,1,2,3,4,5].map(g=>(
+          <div key={g} style={{
+            border:`2px solid ${sub>=2?COLS[g]:"#1e293b"}`,
+            borderRadius:6,padding:"4px 2px",textAlign:"center",
+            background:sub>=2?COLS[g]+"0d":"#111827",
+            boxShadow:sub>=3?`0 0 8px ${COLS[g]}55`:"",
+            transition:"all 0.5s"
+          }}>
+            <div style={{fontSize:7,color:COLS[g],fontWeight:700,marginBottom:2}}>{LABS[g]}</div>
+            <div style={{fontSize:12,fontWeight:700,fontFamily:"mono",
+              color:sub>=3?COLS[g]:"#334155",transition:"color 0.4s 0.4s"}}>
+              {sub>=3?sums[g]:"···"}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// MASKED_SUM — filter rows + warp tree-reduce (Q6)
+function MaskedSumViz({ sub }) {
+  const pairs = [
+    {p:45,d:0.06,pass:true},{p:78,d:0.04,pass:false},{p:32,d:0.07,pass:true},
+    {p:91,d:0.03,pass:false},{p:55,d:0.06,pass:true},{p:67,d:0.05,pass:true},
+    {p:42,d:0.04,pass:false},{p:83,d:0.07,pass:true},{p:29,d:0.05,pass:true},
+    {p:71,d:0.06,pass:false},{p:48,d:0.03,pass:false},{p:62,d:0.07,pass:true},
+  ];
+  const passing = pairs.filter(p=>p.pass);
+  const prods = passing.map(p=>(p.p*p.d).toFixed(2));
+  const half1 = passing.slice(0,3).reduce((a,p)=>a+p.p*p.d,0).toFixed(2);
+  const half2 = passing.slice(3,6).reduce((a,p)=>a+p.p*p.d,0).toFixed(2);
+  const total = passing.reduce((a,p)=>a+p.p*p.d,0).toFixed(2);
+
+  return (
+    <div>
+      <div style={{fontSize:9,color:"#64748b",marginBottom:6,fontFamily:"mono",minHeight:24}}>
+        {sub===0&&"Click ▶ to start — 256 threads ready"}
+        {sub===1&&"Step 1: mask[i] = (date∈window) ∧ (0.05 ≤ disc ≤ 0.07) ∧ (qty < 24)"}
+        {sub===2&&"Step 2: active threads  →  shmem[tid] = price[i] × discount[i]"}
+        {sub===3&&"Step 3: warp tree-reduce (12→6→3→1)  →  atomicAdd(out, block_sum)"}
+      </div>
+      {/* Input grid */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:3,marginBottom:6}}>
+        {pairs.map((p,i)=>(
+          <div key={i} style={{
+            padding:"3px 1px",borderRadius:4,textAlign:"center",
+            border:`1.5px solid ${sub>=1?(p.pass?"#00ff88":"#1e293b"):"#1e293b"}`,
+            background:sub>=1?(p.pass?"#00ff8811":"#0d1117"):"#111827",
+            opacity:sub>=1&&!p.pass?0.2:1,
+            transition:`all 0.3s ${i*25}ms`
+          }}>
+            <div style={{fontSize:8,fontWeight:700,color:sub>=1?(p.pass?"#00ff88":"#334155"):"#475569"}}>{p.p}k</div>
+            <div style={{fontSize:7,color:"#475569"}}>d={p.d}</div>
+            {sub>=1&&<div style={{fontSize:8,color:p.pass?"#00ff88":"#334155"}}>{p.pass?"✓":"✗"}</div>}
+          </div>
+        ))}
+      </div>
+      {/* Products */}
+      {sub>=2&&(
+        <div style={{marginBottom:8}}>
+          <div style={{fontSize:8,color:"#64748b",marginBottom:3,fontFamily:"mono"}}>shmem: price×disc (active only)</div>
+          <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+            {prods.map((v,i)=>(
+              <div key={i} style={{
+                padding:"2px 5px",borderRadius:3,
+                background:"#00ff8811",border:"1px solid #00ff8830",
+                fontSize:9,color:"#00ff88",fontFamily:"mono"
+              }}>{v}</div>
+            ))}
+          </div>
+        </div>
+      )}
+      {/* Tree */}
+      {sub>=3&&(
+        <div>
+          <div style={{fontSize:8,color:"#64748b",fontFamily:"mono",marginBottom:4}}>tree-reduce:</div>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"center",gap:6,flexWrap:"wrap"}}>
+            <div style={{padding:"3px 7px",borderRadius:4,background:"#38bdf811",border:"1px solid #38bdf833",
+              fontSize:10,fontFamily:"mono",color:"#38bdf8"}}>{half1}</div>
+            <div style={{padding:"3px 7px",borderRadius:4,background:"#38bdf811",border:"1px solid #38bdf833",
+              fontSize:10,fontFamily:"mono",color:"#38bdf8"}}>{half2}</div>
+            <span style={{color:"#334155",fontSize:12}}>→</span>
+            <div style={{padding:"5px 12px",borderRadius:6,
+              background:"#00ff8822",border:"2px solid #00ff88",
+              fontSize:13,fontWeight:700,fontFamily:"mono",color:"#00ff88",
+              boxShadow:"0 0 10px #00ff8844"}}>{total}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// JOIN — hash table probe + scatter (Q3)
+function JoinViz({ sub, active }) {
+  const [probeIdx, setProbeIdx] = useState(-1);
+  const htab = [
+    {key:1,cnt:3},{key:null},{key:3,cnt:1},{key:null},
+    {key:5,cnt:2},{key:null},{key:2,cnt:1},{key:8,cnt:1}
+  ];
+  const probes = [
+    {okey:1,slot:0,cnt:3},{okey:5,slot:4,cnt:2},{okey:3,slot:2,cnt:1},
+    {okey:8,slot:7,cnt:1},{okey:2,slot:6,cnt:1},{okey:7,slot:-1,cnt:0},
+  ];
+  const totalPairs = probes.reduce((a,p)=>a+p.cnt,0);
+
+  // Reset when kernel deactivates
+  useEffect(()=>{ setProbeIdx(-1); },[active]);
+
+  // Auto-run probe animation when user clicks to sub=2 (shows parallel GPU probing)
+  useEffect(()=>{
+    if(sub !== 2){ if(sub<2) setProbeIdx(-1); return; }
+    setProbeIdx(-1);
+    let i=0; const iv=setInterval(()=>{setProbeIdx(i++); if(i>=probes.length)clearInterval(iv);},220);
+    return()=>clearInterval(iv);
+  },[sub]);
+
+  return (
+    <div>
+      <div style={{fontSize:9,color:"#64748b",marginBottom:6,fontFamily:"mono",minHeight:24}}>
+        {sub===0&&"Click ▶ to start — GPU join kernels ready"}
+        {sub===1&&"join_count: build hash table from right side (lineitem orderkeys)"}
+        {sub===2&&"Each thread probes: left_key → hash table slot → record match count"}
+        {sub===3&&"join_scatter: emit (left_idx, right_idx) pairs → group_sum_f32_gpu"}
+      </div>
+      {/* Hash table */}
+      <div style={{marginBottom:8}}>
+        <div style={{fontSize:8,color:"#f59e0b",fontFamily:"mono",marginBottom:3}}>hash_table[8] (right keys):</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(8,1fr)",gap:2}}>
+          {htab.map((slot,i)=>{
+            const pi = probes.findIndex(p=>p.slot===i);
+            const hit = sub>=2 && probeIdx>pi && pi>=0;
+            return (
+              <div key={i} style={{
+                padding:"3px 1px",borderRadius:4,textAlign:"center",
+                border:`1.5px solid ${hit?"#00ff88":slot.key!=null?"#f59e0b33":"#1e293b"}`,
+                background:hit?"#00ff8811":slot.key!=null?"#f59e0b07":"#111827",
+                boxShadow:hit?"0 0 5px #00ff8844":"",
+                transition:"all 0.3s"
+              }}>
+                <div style={{fontSize:8,fontFamily:"mono",color:slot.key!=null?"#f59e0b":"#334155"}}>
+                  {slot.key!=null?`k${slot.key}`:"—"}
+                </div>
+                {slot.cnt&&<div style={{fontSize:6,color:"#64748b"}}>n={slot.cnt}</div>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {/* Probe results */}
+      <div style={{marginBottom:6}}>
+        <div style={{fontSize:8,color:"#38bdf8",fontFamily:"mono",marginBottom:3}}>left table probes:</div>
+        <div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+          {probes.map((p,i)=>(
+            <div key={i} style={{
+              padding:"2px 5px",borderRadius:4,fontSize:9,fontFamily:"mono",
+              border:`1.5px solid ${sub>=2&&probeIdx>=i?(p.cnt>0?"#00ff88":"#fb923c"):"#1e293b"}`,
+              background:sub>=2&&probeIdx>=i?(p.cnt>0?"#00ff8811":"#fb923c11"):"#111827",
+              color:sub>=2&&probeIdx>=i?(p.cnt>0?"#00ff88":"#fb923c"):"#475569",
+              transition:`all 0.3s ${i*30}ms`
+            }}>
+              o={p.okey}{sub>=2&&probeIdx>=i&&(p.cnt>0?`→${p.cnt}`:"→∅")}
+            </div>
+          ))}
+        </div>
+      </div>
+      {sub>=3&&(
+        <div style={{padding:"5px 8px",borderRadius:5,background:"rgba(0,255,136,0.05)",
+          border:"1px solid #00ff8833",fontSize:9,color:"#00ff88",fontFamily:"mono"}}>
+          ✓ {totalPairs} index pairs emitted → group_sum accumulates revenue
+        </div>
+      )}
+    </div>
+  );
+}
+
+// EXPR → SUM — CPU Arrow expr then GPU sum (Q14)
+function ExprSumViz({ sub }) {
+  const rows = [
+    {type:"PROMO BRASS",  p:45.2,d:0.06},
+    {type:"MEDIUM COPPER",p:67.1,d:0.04},
+    {type:"PROMO NICKEL", p:38.9,d:0.07},
+    {type:"BRUSHED TIN",  p:82.3,d:0.05},
+    {type:"PROMO STEEL",  p:51.7,d:0.06},
+    {type:"LARGE BRASS",  p:43.8,d:0.03},
+  ];
+  const isPromo = r => r.type.startsWith("PROMO");
+  const exprV = rows.map(r=>isPromo(r)?(r.p*(1-r.d)).toFixed(1):"0.0");
+  const totalV = rows.map(r=>(r.p*(1-r.d)).toFixed(1));
+  const promoSum = rows.filter(isPromo).reduce((a,r)=>a+r.p*(1-r.d),0).toFixed(1);
+  const totSum   = rows.reduce((a,r)=>a+r.p*(1-r.d),0).toFixed(1);
+
+  return (
+    <div>
+      <div style={{fontSize:9,color:"#64748b",marginBottom:6,fontFamily:"mono",minHeight:28}}>
+        {sub===0&&"Click ▶ to start — Arrow + GPU ready"}
+        {sub===1&&"CPU · Arrow: case_when(p_type.startswith('PROMO'), price×(1−disc), 0.0)"}
+        {sub===2&&"CPU → GPU: float32[N] arrays uploaded, date-range mask computed"}
+        {sub===3&&"GPU · masked_global_sum_f32 → 2 scalar outputs (one pass each)"}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+        {/* CPU side */}
+        <div style={{
+          border:`1px solid ${sub>=1?"#fb923c44":"#1e293b"}`,
+          borderRadius:6,padding:"6px",
+          background:sub>=1?"rgba(251,146,60,0.04)":"#111827",
+          transition:"all 0.5s"
+        }}>
+          <div style={{fontSize:8,color:"#fb923c",marginBottom:4,letterSpacing:1,fontWeight:700}}>CPU · Arrow</div>
+          <div style={{fontSize:7,color:"#64748b",fontFamily:"mono",marginBottom:4}}>case_when(startswith…)</div>
+          {rows.map((r,i)=>(
+            <div key={i} style={{
+              display:"flex",justifyContent:"space-between",padding:"1px 2px",
+              borderRadius:2,marginBottom:1,
+              background:sub>=1&&isPromo(r)?"rgba(251,146,60,0.07)":"transparent",
+              transition:`all 0.3s ${i*60}ms`
+            }}>
+              <span style={{fontSize:7,fontFamily:"mono",maxWidth:75,overflow:"hidden",
+                textOverflow:"ellipsis",whiteSpace:"nowrap",
+                color:sub>=1&&isPromo(r)?"#fb923c":"#475569"}}>
+                {r.type}
+              </span>
+              <span style={{fontSize:8,fontFamily:"mono",fontWeight:700,
+                color:sub>=1?(isPromo(r)?"#fb923c":"#334155"):"#475569"}}>
+                {sub>=1?exprV[i]:"·"}
+              </span>
+            </div>
+          ))}
+        </div>
+        {/* GPU side */}
+        <div style={{
+          border:`1px solid ${sub>=2?"#00ff8833":"#1e293b"}`,
+          borderRadius:6,padding:"6px",
+          background:sub>=2?"rgba(0,255,136,0.04)":"#111827",
+          transition:"all 0.5s"
+        }}>
+          <div style={{fontSize:8,color:"#00ff88",marginBottom:4,letterSpacing:1,fontWeight:700}}>GPU · Mojo</div>
+          <div style={{fontSize:7,color:"#64748b",fontFamily:"mono",marginBottom:4}}>masked_global_sum_f32</div>
+          {rows.map((r,i)=>(
+            <div key={i} style={{
+              display:"flex",justifyContent:"space-between",padding:"1px 2px",
+              borderRadius:2,marginBottom:1,
+              opacity:sub>=2?1:0.2,transition:`opacity 0.3s ${i*60}ms`
+            }}>
+              <span style={{fontSize:7,color:"#64748b",fontFamily:"mono"}}>T{i}:</span>
+              <span style={{fontSize:8,fontFamily:"mono",color:sub>=2?"#00ff88":"#475569"}}>
+                {sub>=2?totalV[i]:"·"}
+              </span>
+            </div>
+          ))}
+          {sub>=3&&(
+            <div style={{borderTop:"1px solid #1e293b",paddingTop:4,marginTop:2}}>
+              <div style={{fontSize:9,fontFamily:"mono",color:"#a78bfa",marginBottom:1}}>promo: {promoSum}</div>
+              <div style={{fontSize:9,fontFamily:"mono",color:"#00ff88",fontWeight:700}}>total: {totSum}</div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KernelAlgoViz({ qid, active, sub }) {
+  if (qid==="Q1")  return <GroupSumViz sub={sub} />;
+  if (qid==="Q6")  return <MaskedSumViz sub={sub} />;
+  if (qid==="Q3")  return <JoinViz sub={sub} active={active} />;
+  if (qid==="Q14") return <ExprSumViz sub={sub} />;
+  return <div style={{fontSize:10,color:"#334155",fontStyle:"italic",padding:"8px 0"}}>
+    {active?"GPU kernel dispatched":"Waiting for dispatch"}
+  </div>;
+}
+
+// ─── Kernel panel (replaces the old thread-grid version) ──────────────────
+function KernelPanel({ qid, kernel, active, resultRows, resultCols }) {
+  const [sub, setSub] = useState(0);
+  const [resultReady, setResultReady] = useState(false);
+  const MAX_SUB = 3;
+
+  // Reset sub and result whenever the active step changes
+  useEffect(()=>{
+    setSub(0);
+    setResultReady(false);
+  },[active, kernel.name]);
+
+  // Show result after the final sub-step is reached
+  useEffect(()=>{
+    if(!active || sub < MAX_SUB) return;
+    const t = setTimeout(()=>setResultReady(true), 500);
+    return()=>clearTimeout(t);
+  },[sub, active]);
+
+  return (
+    <div style={{
+      background:"#0d1117", borderRadius:10, padding:"16px 14px",
+      border:`2px solid ${active?"#00ff88":"#1a2030"}`,
+      height:"100%", overflow:"auto",
+      boxShadow:active?"0 0 20px rgba(0,255,136,0.15)":"none",
+      transition:"all 0.5s"
+    }}>
+      <div style={{color:"#546e7a",fontSize:11,marginBottom:8,letterSpacing:1}}>
+        MOJO GPU KERNEL
+      </div>
+      {/* Kernel name */}
+      <div style={{
+        fontFamily:"'JetBrains Mono',monospace",fontSize:10,
+        color:active?"#00ff88":"#334155",marginBottom:10,
+        padding:"5px 8px",background:"#111827",borderRadius:5,
+        border:"1px solid #1e293b",overflow:"hidden",textOverflow:"ellipsis",
+        whiteSpace:"nowrap",transition:"color 0.5s"
+      }}>{kernel.name}</div>
+
+      {/* Algorithm visualization */}
+      <div style={{
+        minHeight:210,marginBottom:8,
+        opacity:active?1:0.12,transition:"opacity 0.5s"
+      }}>
+        <KernelAlgoViz qid={qid} active={active} sub={sub} />
+      </div>
+
+      {/* Sub-step button — only visible when kernel is active */}
+      {active && (
+        <div style={{marginBottom:8}}>
+          {sub < MAX_SUB ? (
+            <button
+              onClick={()=>setSub(s=>Math.min(s+1, MAX_SUB))}
+              style={{
+                width:"100%",padding:"7px 0",borderRadius:6,cursor:"pointer",
+                border:"1.5px solid #00ff88",
+                background:"rgba(0,255,136,0.10)",
+                color:"#00ff88",fontWeight:700,fontSize:12,
+                transition:"all 0.15s"
+              }}
+            >
+              ▶ Step {sub+1} / {MAX_SUB}
+            </button>
+          ) : (
+            <div style={{
+              textAlign:"center",fontSize:10,color:"#1a5c3a",
+              padding:"5px 0",fontFamily:"mono"
+            }}>✓ All {MAX_SUB} steps shown</div>
+          )}
+        </div>
+      )}
+
+      {/* Stats bar */}
+      <div style={{
+        fontSize:9,color:"#475569",fontFamily:"'JetBrains Mono',monospace",
+        marginBottom:8,padding:"3px 6px",background:"#111827",borderRadius:4,
+        opacity:active?0.9:0.25
+      }}>
+        {kernel.N.toLocaleString()} rows · {kernel.groups||1} group{kernel.groups!==1?"s":""} · 256 threads/block
+      </div>
+
+      {/* Result */}
+      <div style={{
+        opacity:resultReady?1:0,transition:"opacity 0.5s",
+        padding:"8px 10px",borderRadius:8,
+        background:"rgba(0,255,136,0.06)",border:"1px solid #00ff8833"
+      }}>
+        <div style={{fontSize:10,color:"#00ff88",marginBottom:4}}>✓ RESULT → Python Arrow Table</div>
+        <div style={{fontSize:10,color:"#64748b",fontFamily:"'JetBrains Mono',monospace"}}>
+          {resultRows} row{resultRows!==1?"s":""} × {resultCols.length} columns
+        </div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:3,marginTop:4}}>
+          {resultCols.map(c=>(
+            <span key={c} style={{fontSize:8,padding:"1px 5px",borderRadius:10,
+              background:"#1e293b",color:"#94a3b8",fontFamily:"mono"}}>{c}</span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ─── Step definitions ──────────────────────────────────────────────────────
+function getSteps(qid) {
+  const q = QUERIES[qid];
+  const nodeIds = q.tree.map(n=>n.id);
+  const allNodeIds = [...nodeIds];
+  // Build reveal order: leaves first (bottom of tree), then up
+  const childOf = {};
+  q.tree.forEach(n=>{
+    n.children.forEach(c=>{ childOf[c] = n.id; });
+  });
+  const orphans = q.tree.filter(n=>!q.tree.some(m=>m.children.includes(n.id)));
+  const order = [];
+  function addOrder(id) {
+    const node = q.tree.find(n=>n.id===id);
+    if (!node) return;
+    node.children.forEach(addOrder);
+    if (!order.includes(id)) order.push(id);
+  }
+  if (orphans.length) addOrder(orphans[0].id);
+  else order.push(...nodeIds);
+
+  return [
+    {
+      label:"The Query",
+      desc:"You write a Polars-style lazy DataFrame API. No SQL, no schema declarations — MXFrame infers the plan.",
+      code: 0,                // show no lines yet (act as intro)
+      nodeIds: [],
+      dispatchCount: 0,
+      kernelActive: false,
+    },
+    {
+      label:"Python API → Code",
+      desc:"Each method call adds a node to the lazy plan. Nothing executes yet — it's just building a tree description of intent.",
+      code: q.code.length,
+      nodeIds: [],
+      dispatchCount: 0,
+      kernelActive: false,
+    },
+    ...order.map((id,i)=>({
+      label:`Plan node: ${q.tree.find(n=>n.id===id)?.label}`,
+      desc: `${q.tree.find(n=>n.id===id)?.label}: ${q.tree.find(n=>n.id===id)?.detail?.split("\n")[0]}`,
+      code: q.code.length,
+      nodeIds: order.slice(0, i+1),
+      dispatchCount: 0,
+      kernelActive: false,
+    })),
+    {
+      label:"Optimizer",
+      desc:`Optimizer passes: ${q.optimizer.passes.join(" | ")}. ${q.optimizer.note}.`,
+      code: q.code.length,
+      nodeIds: allNodeIds,
+      dispatchCount: 0,
+      kernelActive: false,
+    },
+    ...q.dispatch.map((_,i)=>({
+      label:`Dispatch: ${q.dispatch[i].label}`,
+      desc: q.dispatch[i].note,
+      code: q.code.length,
+      nodeIds: allNodeIds,
+      dispatchCount: i+1,
+      kernelActive: false,
+    })),
+    {
+      label:"Mojo GPU Kernel fires 🔥",
+      desc:`${q.kernel.name} — ${q.kernel.N.toLocaleString()} input rows, ${q.kernel.groups||1} output group${q.kernel.groups!==1?"s":""}. Watch the threads light up!`,
+      code: q.code.length,
+      nodeIds: allNodeIds,
+      dispatchCount: q.dispatch.length,
+      kernelActive: true,
+    },
+    {
+      label:"Result in Python",
+      desc:`Done! ${q.result.rows} row${q.result.rows!==1?"s":""} returned as a PyArrow table. MXFrame did the heavy lifting on GPU.`,
+      code: q.code.length,
+      nodeIds: allNodeIds,
+      dispatchCount: q.dispatch.length,
+      kernelActive: true,
+    },
+  ];
+}
+
+// ─── Main App ──────────────────────────────────────────────────────────────
+function App() {
+  const [qid, setQid] = useState("Q1");
+  const [step, setStep] = useState(0);
+  const steps = getSteps(qid);
+  const cur = steps[step] || steps[0];
+  const q = QUERIES[qid];
+
+  function changeQuery(id) {
+    setQid(id);
+    setStep(0);
+  }
+
+  return (
+    <div style={{minHeight:"100vh", display:"flex", flexDirection:"column"}}>
+      {/* ── Header ── */}
+      <div style={{
+        background:"#0d1117", borderBottom:"1px solid #21262d",
+        padding:"14px 28px", display:"flex", alignItems:"center", gap:20, flexWrap:"wrap"
+      }}>
+        <div>
+          <span style={{fontWeight:900, fontSize:20, color:"#00ff88", letterSpacing:1}}>
+            MXFrame
+          </span>
+          <span style={{fontSize:13, color:"#8b949e", marginLeft:10}}>
+            Query → Logical Plan → GPU Kernel
+          </span>
+        </div>
+        <div style={{display:"flex", gap:8, flexWrap:"wrap", marginLeft:"auto"}}>
+          {Object.entries(QUERIES).map(([id,q])=>(
+            <button key={id} onClick={()=>changeQuery(id)} style={{
+              padding:"6px 14px", borderRadius:20, fontSize:12, cursor:"pointer",
+              border:`1.5px solid ${qid===id?"#00ff88":"#30363d"}`,
+              background: qid===id?"rgba(0,255,136,0.12)":"transparent",
+              color: qid===id?"#00ff88":"#8b949e",
+              fontWeight: qid===id?700:400, transition:"all 0.2s"
+            }}>
+              {q.emoji} {id}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* ── Query subtitle ── */}
+      <div style={{
+        padding:"10px 28px", background:"#111827", borderBottom:"1px solid #1e293b",
+        fontSize:12, color:"#94a3b8"
+      }}>
+        <span style={{color:"#e2e8f0", fontWeight:600}}>{q.label}</span>
+        <span style={{marginLeft:10}}>{q.subtitle}</span>
+      </div>
+
+      {/* ── Three-column layout ── */}
+      <div style={{
+        flex:1, display:"grid",
+        gridTemplateColumns:"1fr 1fr 1fr 1fr",
+        gap:12, padding:"12px 16px",
+        minHeight:0
+      }}>
+        {/* Code */}
+        <div style={{gridColumn:"1/2", minHeight:480}}>
+          <CodePanel lines={q.code} visibleCount={cur.code || 0} />
+        </div>
+        {/* Plan tree */}
+        <div style={{gridColumn:"2/3", minHeight:480}}>
+          <TreePanel query={q} visibleNodeIds={cur.nodeIds||[]} />
+        </div>
+        {/* Dispatch */}
+        <div style={{gridColumn:"3/4", minHeight:480}}>
+          <DispatchPanel
+            dispatch={q.dispatch}
+            visibleCount={cur.dispatchCount||0}
+            provenance={q.provenance}
+          />
+        </div>
+        {/* Kernel */}
+        <div style={{gridColumn:"4/5", minHeight:480}}>
+          <KernelPanel
+            qid={qid}
+            kernel={q.kernel}
+            active={cur.kernelActive||false}
+            resultRows={q.result.rows}
+            resultCols={q.result.cols}
+          />
+        </div>
+      </div>
+
+      {/* ── Step status bar + controls ── */}
+      <div style={{
+        background:"#0d1117", borderTop:"1px solid #21262d",
+        padding:"12px 28px", display:"flex", alignItems:"center", gap:16, flexWrap:"wrap"
+      }}>
+        {/* Progress dots */}
+        <div style={{display:"flex", gap:5, alignItems:"center"}}>
+          {steps.map((_,i)=>(
+            <div key={i}
+              onClick={()=>setStep(i)}
+              style={{
+                width: i===step ? 22 : 7,
+                height:7, borderRadius:4, cursor:"pointer",
+                background: i<step?"#1a5c3a" : i===step?"#00ff88":"#1e293b",
+                transition:"all 0.3s"
+              }}
+            />
+          ))}
+        </div>
+
+        {/* Step info */}
+        <div style={{flex:1}}>
+          <div style={{fontWeight:700, color:"#e2e8f0", fontSize:13}}>
+            Step {step+1}/{steps.length} — {cur.label}
+          </div>
+          <div style={{fontSize:11, color:"#64748b", marginTop:2}}>{cur.desc}</div>
+        </div>
+
+        {/* Nav buttons */}
+        <div style={{display:"flex", gap:10}}>
+          <button onClick={()=>setStep(s=>Math.max(0,s-1))} disabled={step===0}
+            style={{
+              padding:"8px 22px", borderRadius:20, cursor:step===0?"default":"pointer",
+              border:"1.5px solid #30363d", background:"transparent",
+              color: step===0?"#334155":"#e2e8f0", fontWeight:600, fontSize:13
+            }}>◀ Prev</button>
+          <button onClick={()=>setStep(s=>Math.min(steps.length-1,s+1))} disabled={step===steps.length-1}
+            style={{
+              padding:"8px 22px", borderRadius:20, cursor:step===steps.length-1?"default":"pointer",
+              border:`1.5px solid ${step===steps.length-1?"#1a5c3a":"#00ff88"}`,
+              background: step===steps.length-1?"transparent":"rgba(0,255,136,0.12)",
+              color: step===steps.length-1?"#1a5c3a":"#00ff88",
+              fontWeight:700, fontSize:13
+            }}>Next ▶</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>

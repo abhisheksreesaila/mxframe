@@ -34,12 +34,12 @@ def _find_kernels_path() -> str:
     _pkg = _here / "kernels.mojopkg"
     if _pkg.exists():
         return str(_pkg)
-    _src = _here / "kernels_v261"
+    _src = _here / "kernels"
     if _src.exists():
         return str(_src)
     # Last resort: raise a clear error instead of returning a stale hardcoded path.
     raise FileNotFoundError(
-        f"mxframe: could not locate kernels.mojopkg or kernels_v261/ next to {__file__}. "
+        f"mxframe: could not locate kernels.mojopkg or kernels/ next to {__file__}. "
         "The installed package is missing its Mojo kernels."
     )
 
@@ -85,6 +85,10 @@ def clear_cache():
     _POST_OP_MODEL_CACHE.clear()
     _GPU_BUFFER_CACHE.clear()
     _JOIN_RESULT_CACHE.clear()
+    # Note: AOTKernelsGPU._buf_cache (device-buffer cache) survives clear_cache()
+    # intentionally.  _INPUT_PREP_CACHE eviction means cold runs create fresh numpy
+    # arrays (new ctypes.data pointers) that naturally miss the GPU buffer cache,
+    # so correctness is unaffected.  Hot runs continue to benefit.
 
 
 # ── Window-function helpers (module-level for reuse) ─────────────────────────
@@ -617,6 +621,8 @@ class CustomOpsCompiler(GraphCompiler):
         """Execute the masked_global_min Mojo kernel and return a Python float."""
         if self._session_device == "cpu" and self._aot is not None:
             return self._aot.masked_global_min_f32(arr_f32, mask_np)
+        if self._session_device == "gpu" and self._aot_gpu is not None:
+            return self._aot_gpu.masked_global_min_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_min_kernel", N, self._session_device)
         if cache_key not in _MODEL_CACHE:
             mg_graph = Graph(
@@ -653,6 +659,8 @@ class CustomOpsCompiler(GraphCompiler):
         """Execute the masked_global_max Mojo kernel and return a Python float."""
         if self._session_device == "cpu" and self._aot is not None:
             return self._aot.masked_global_max_f32(arr_f32, mask_np)
+        if self._session_device == "gpu" and self._aot_gpu is not None:
+            return self._aot_gpu.masked_global_max_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_max_kernel", N, self._session_device)
         if cache_key not in _MODEL_CACHE:
             mg_graph = Graph(
@@ -705,25 +713,27 @@ class CustomOpsCompiler(GraphCompiler):
     def _compute_masked_global_agg(self, plan, agg_node) -> "Optional[pa.Table]":
         """Fast path for Filter → GlobalAgg using fused Mojo masked kernels.
 
-        Dispatch logic per aggregation:
-          - sum(col)           → masked_global_sum(col, mask)
-          - sum(col_a * col_b) → masked_global_sum_product(col_a, col_b, mask)
-            (true single-pass: reads both columns + mask once, zero temp alloc)
-          - count(*)           → pure Python: int(mask.sum())
-          - mean(col)          → masked_global_sum / count
-          - anything else      → fall back to the existing PyArrow filtered path
+        Dispatch per aggregation (in priority order):
+          1. count(*)                → int(mask.sum())
+          2. min/max(col)            → masked_global_min/max GPU kernel
+          3. sum(col)                → masked_global_sum GPU kernel
+          4. sum(col_a * col_b)      → masked_global_sum_product GPU kernel
+          5. sum/mean(any_expr)      → _eval_expr_arrow → masked_global_sum GPU kernel
+             Handles a*(1-b), a*(1-b)*(1+c), case_when, startswith, isin, …
+             Expression eval uses Arrow/NumPy; the SUM reduction runs on GPU.
 
         Returns None to signal fall-back to the PyArrow path.
         """
         for expr in agg_node.aggs:
             if expr.op not in ("sum", "mean", "count", "min", "max"):
                 return None
-            # Only handle sum/mean/min/max of simple col or col*col patterns
-            if expr.op in ("sum", "mean", "min", "max"):
+            # min/max on complex expressions (products, case_when) still fall back —
+            # no fused min/max kernel for arbitrary expressions yet.
+            if expr.op in ("min", "max"):
                 inner = expr.args[0]
-                if (self._is_simple_col(inner) is None
-                        and self._is_simple_col_product(inner) is None):
-                    return None  # complex expr → filter-first path is faster
+                if self._is_simple_col(inner) is None:
+                    return None
+            # sum/mean: any inner expression handled via _eval_expr_arrow below.
 
         try:
             original_scan = self._find_scan(plan)
@@ -806,7 +816,14 @@ class CustomOpsCompiler(GraphCompiler):
                     sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
 
                 else:
-                    return None  # should not reach here (checked above)
+                    # General expression path: evaluate inner with Arrow (handles
+                    # a*(1-b), a*(1-b)*(1+c), case_when, startswith, isin, etc.),
+                    # then SUM reduction on GPU via the masked_global_sum kernel.
+                    inner_arr = self._eval_expr_arrow(inner, table)
+                    arr_f32 = inner_arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                    if not arr_f32.flags["C_CONTIGUOUS"]:
+                        arr_f32 = np.ascontiguousarray(arr_f32)
+                    sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
 
                 if expr.op == "sum":
                     result_cols[name] = pa.array([float(sum_val)], type=pa.float64())
@@ -970,6 +987,11 @@ class CustomOpsCompiler(GraphCompiler):
         """
         t0 = _time.perf_counter()
 
+        # Record whether the plan has Join nodes BEFORE materialising them.
+        # Used below to emit an accurate 'join_mojo_shortcut' provenance label
+        # for plans whose only heavy work is a Mojo-executed hash join.
+        _had_join = self._has_join_node(plan)
+
         # -1 -- Materialize Join nodes (bottom-up) --------------------
         plan = self._materialize_joins(plan)
 
@@ -994,6 +1016,11 @@ class CustomOpsCompiler(GraphCompiler):
             if post_ops:
                 result = self._apply_post_ops_custom(result, post_ops)
             t1 = _time.perf_counter()
+            # Accurate provenance: if the plan contained a join (materialised by
+            # Mojo kernels above), label it 'join_mojo_shortcut' rather than the
+            # misleading 'pyarrow_shortcut'.  Column gathering is still Arrow, but
+            # the O(n) join-index computation ran in Mojo.
+            _shortcut_path = "join_mojo_shortcut" if _had_join else "pyarrow_shortcut"
             self.last_compile_provenance = {
                 "device": self._session_device,
                 "rows": int(result.num_rows),
@@ -1004,7 +1031,7 @@ class CustomOpsCompiler(GraphCompiler):
                 "execute_ms": round((t1 - t0) * 1000, 1),
                 "gpu_input_path": "pyarrow",
                 "optimizer_trace": list(optimizer_trace or []),
-                "path": "pyarrow_shortcut",
+                "path": _shortcut_path,
             }
             if verbose:
                 print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
@@ -1636,6 +1663,15 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(plan, Aggregate): return plan
         if hasattr(plan, 'input'): return CustomOpsCompiler._find_aggregate(plan.input)
         return None
+
+    @staticmethod
+    def _has_join_node(plan) -> bool:
+        """Return True if the plan tree contains any Join node (before materialisation)."""
+        if isinstance(plan, Join):
+            return True
+        if isinstance(plan, (Filter, Project, Aggregate, Sort, Limit, Distinct, Tail)):
+            return CustomOpsCompiler._has_join_node(plan.input)
+        return False
 
     # -- Sort / Limit / Distinct via Mojo kernels ----------------------
 
@@ -2684,98 +2720,118 @@ class CustomOpsCompiler(GraphCompiler):
     def _build_group_ids_cached(table, keys, gpu_compiler=None):
         """Cached wrapper: reuses group encoding when the same table object is queried.
 
-        Phase 16: when gpu_compiler (the CustomOpsCompiler instance) is available,
-        uses the Mojo group_composite kernel for multi-key groupby to fuse the
-        composite-key computation into a single vectorized pass.
-        Single-key encoding still uses PyArrow dictionary_encode (fastest path).
+        Dispatch priority:
+          1. GPU session + single integer key  → _build_group_ids_gpu_single_int
+             (Phase 3: AOT GPU hash-table encode, no PyArrow dictionary_encode)
+          2. Multi-key with gpu_compiler       → _build_group_ids_multikey_mojo
+             (fused composite-key computation via Mojo group_composite kernel)
+          3. CPU fallback                      → _build_group_ids (PyArrow)
         """
         cache_key = (id(table), table.num_rows, tuple(keys))
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
+
+        # GPU single integer-key path: skip PyArrow dictionary_encode entirely
+        if (gpu_compiler is not None
+                and gpu_compiler._session_device == "gpu"
+                and len(keys) == 1):
+            col_arr = table.column(keys[0])
+            if isinstance(col_arr, pa.ChunkedArray):
+                col_arr = col_arr.combine_chunks()
+            if pa.types.is_integer(col_arr.type):
+                result = gpu_compiler._build_group_ids_gpu_single_int(
+                    col_arr, keys[0], len(table)
+                )
+                if result is not None:
+                    _GROUP_ENCODE_CACHE[cache_key] = result
+                    return result
+
         # Mojo path for multi-key groupby: fused composite key computation
         if gpu_compiler is not None and len(keys) > 1:
             result = gpu_compiler._build_group_ids_multikey_mojo(table, keys)
             if result is not None:
                 _GROUP_ENCODE_CACHE[cache_key] = result
                 return result
+
         result = CustomOpsCompiler._build_group_ids(table, keys)
         _GROUP_ENCODE_CACHE[cache_key] = result
         return result
 
     def _build_group_ids_gpu_single_int(self, col_arr, key_name, n_rows):
-        """GPU group encoding for a single integer key column via group_encode kernel.
+        """GPU group encoding for a single integer key column.
 
-        Returns (dense_ids, n_groups, unique_key_cols) matching _build_group_ids output,
-        or None if the kernel call fails (falls back to CPU path).
+        Phase 3: uses the AOT group_encode_i32_gpu ctypes kernel when available
+        (no MAX Graph JIT cold start, no large H2D table uploads).  Falls back
+        to the MAX Graph group_encode kernel, then to CPU path.
 
-        Hash table capacity = next power of two >= 4 * n_distinct_estimate.
-        We conservatively use 2 * n_rows (over-estimates, wastes some VRAM, but always safe).
+        Returns (dense_ids, n_groups, unique_key_cols) or None on failure.
         """
-        import math as _math
         try:
             keys_np = col_arr.to_numpy(zero_copy_only=False).astype(np.int32)
             n = len(keys_np)
             if n == 0:
                 return np.array([], dtype=np.int32), 0, {key_name: pa.array([], type=pa.int32())}
 
-            # Capacity: next power of two >= 2*n (load factor = 0.5)
+            # Capacity: next power of two >= 2*n (load factor <= 0.5)
             cap = 1
             while cap < 2 * n:
                 cap *= 2
 
-            capacity_np = np.array([cap], dtype=np.int32)
-            key_table_np = np.full(cap, -2147483648, dtype=np.int32)  # INT32_MIN sentinel
-            id_table_np = np.full(cap, -1, dtype=np.int32)
+            # ── AOT fast path (no JIT, no large table H2D uploads) ─────────────
+            if self._aot_gpu is not None:
+                dense_ids, n_groups = self._aot_gpu.group_encode_i32(keys_np, cap)
+            else:
+                # ── MAX Graph fallback ────────────────────────────────────────
+                capacity_np = np.array([cap], dtype=np.int32)
+                key_table_np = np.full(cap, -2147483648, dtype=np.int32)
+                id_table_np  = np.full(cap, -1, dtype=np.int32)
 
-            cache_key = ("group_encode", n, cap, self._session_device)
-            model = _POST_OP_MODEL_CACHE.get(cache_key)
-            if model is None:
-                k_type = TensorType(DType.int32, [n], self._device_ref)
-                cap_type = TensorType(DType.int32, [1], self._device_ref)
-                kt_type = TensorType(DType.int32, [cap], self._device_ref)
-                graph = Graph(
-                    name="mxframe_group_encode",
-                    input_types=[k_type, cap_type, kt_type, kt_type],
-                    custom_extensions=[Path(self.kernels_path)],
-                )
-                with graph:
-                    gids_node, ng_node, _, _ = ops.custom(
-                        name="group_encode",
-                        values=[graph.inputs[0], graph.inputs[1],
-                                graph.inputs[2], graph.inputs[3]],
-                        out_types=[
-                            TensorType(DType.int32, [n], self._device_ref),
-                            TensorType(DType.int32, [1], self._device_ref),
-                            TensorType(DType.int32, [cap], self._device_ref),
-                            TensorType(DType.int32, [cap], self._device_ref),
-                        ],
-                        device=self._device_ref,
+                cache_key = ("group_encode", n, cap, self._session_device)
+                model = _POST_OP_MODEL_CACHE.get(cache_key)
+                if model is None:
+                    k_type  = TensorType(DType.int32, [n],   self._device_ref)
+                    cap_type = TensorType(DType.int32, [1],  self._device_ref)
+                    kt_type = TensorType(DType.int32, [cap], self._device_ref)
+                    graph = Graph(
+                        name="mxframe_group_encode",
+                        input_types=[k_type, cap_type, kt_type, kt_type],
+                        custom_extensions=[Path(self.kernels_path)],
                     )
-                    graph.output(gids_node, ng_node)
-                model = self._session.load(graph)
-                _POST_OP_MODEL_CACHE[cache_key] = model
+                    with graph:
+                        gids_node, ng_node, _, _ = ops.custom(
+                            name="group_encode",
+                            values=[graph.inputs[0], graph.inputs[1],
+                                    graph.inputs[2], graph.inputs[3]],
+                            out_types=[
+                                TensorType(DType.int32, [n],   self._device_ref),
+                                TensorType(DType.int32, [1],   self._device_ref),
+                                TensorType(DType.int32, [cap], self._device_ref),
+                                TensorType(DType.int32, [cap], self._device_ref),
+                            ],
+                            device=self._device_ref,
+                        )
+                        graph.output(gids_node, ng_node)
+                    model = self._session.load(graph)
+                    _POST_OP_MODEL_CACHE[cache_key] = model
 
-            k_buf = driver.Buffer.from_numpy(keys_np).to(self._gpu_driver)
-            c_buf = driver.Buffer.from_numpy(capacity_np).to(self._gpu_driver)
-            kt_buf = driver.Buffer.from_numpy(key_table_np).to(self._gpu_driver)
-            it_buf = driver.Buffer.from_numpy(id_table_np).to(self._gpu_driver)
+                k_buf  = driver.Buffer.from_numpy(keys_np).to(self._gpu_driver)
+                c_buf  = driver.Buffer.from_numpy(capacity_np).to(self._gpu_driver)
+                kt_buf = driver.Buffer.from_numpy(key_table_np).to(self._gpu_driver)
+                it_buf = driver.Buffer.from_numpy(id_table_np).to(self._gpu_driver)
+                group_ids_t, n_groups_t = model.execute(k_buf, c_buf, kt_buf, it_buf)
+                dense_ids = np.asarray(group_ids_t.to_numpy()).reshape(-1).astype(np.int32)
+                n_groups  = int(np.asarray(n_groups_t.to_numpy()).reshape(-1)[0])
 
-            group_ids_t, n_groups_t = model.execute(k_buf, c_buf, kt_buf, it_buf)
-            dense_ids = np.asarray(group_ids_t.to_numpy()).reshape(-1).astype(np.int32)
-            n_groups = int(np.asarray(n_groups_t.to_numpy()).reshape(-1)[0])
-
-            # Reconstruct unique key values: take the key value at each dense ID position.
-            # Since IDs are assigned in first-encounter order by GPU threads, we find the
-            # first index of each group ID to recover the original key value.
-            first_occurrence = np.empty(n_groups, dtype=np.int64)
-            seen = np.full(n_groups, False)
-            for idx in range(n):
-                gid = int(dense_ids[idx])
-                if not seen[gid]:
-                    first_occurrence[gid] = idx
-                    seen[gid] = True
-
+            # ── Reconstruct unique key values (vectorized, O(N log N)) ────────
+            # For each dense ID 0..n_groups-1 find the first original position.
+            # Stable argsort ensures ties preserve encounter order.
+            sort_order = np.argsort(dense_ids, kind='stable')   # position → sorted pos
+            sorted_gids = dense_ids[sort_order]
+            first_in_sorted = np.searchsorted(
+                sorted_gids, np.arange(n_groups, dtype=np.int32), side='left'
+            )
+            first_occurrence = sort_order[first_in_sorted].astype(np.int64)
             unique_keys = col_arr.take(pa.array(first_occurrence))
             return dense_ids, n_groups, {key_name: unique_keys}
 

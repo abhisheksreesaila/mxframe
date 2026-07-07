@@ -17,5 +17,5 @@ include kernels.mojopkg
 recursive-include kernels_aot *.py *.so
 prune llm-ctx
 prune scripts
-prune kernels_v261
+prune kernels
 global-exclude __pycache__ *.py[cod]

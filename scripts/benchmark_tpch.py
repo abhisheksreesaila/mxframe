@@ -1299,15 +1299,15 @@ def run_q19_mxframe(part, lineitem, device="cpu") -> pa.Table:
         (col("l_quantity") >= lit(20.0)) & (col("l_quantity") <= lit(30.0)) &
         (col("p_size") >= lit(1)) & (col("p_size") <= lit(15))
     )
-    # Materialize join+filter first, then compute global sum via LazyFrame
-    filtered = (
+    # Single-pass: join + filter + global sum in one .compute().
+    # After _materialize_joins the plan is Filter → GlobalAgg → Scan(joined).
+    # _compute_masked_global_agg evaluates the complex OR mask via _eval_predicate
+    # (PyArrow) and the sum(a*(1-b)) expression via _eval_expr_arrow, then
+    # calls masked_global_sum on the GPU — no intermediate table allocation.
+    return (
         LazyFrame(Scan(lineitem))
         .join(LazyFrame(Scan(part)), left_on="l_partkey", right_on="p_partkey")
         .filter(cond_sm | cond_md | cond_lg)
-        .compute(device=device)
-    )
-    return (
-        LazyFrame(Scan(filtered))
         .groupby()
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount")))
@@ -3417,3 +3417,384 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  Apache DataFusion implementations (all 22 TPC-H queries)
+#  Uses DataFusion's Python SQL API: ctx.register_record_batches + ctx.sql
+#  Included as a reference baseline; not a direct apples-to-apples
+#  comparison with MXFrame (different languages, different optimisers).
+# ─────────────────────────────────────────────────────────────────────────
+try:
+    from datafusion import SessionContext as _DFCtx
+    _DF_AVAILABLE = True
+except ImportError:
+    _DF_AVAILABLE = False
+
+def _df(**tables):
+    """Return a DataFusion SessionContext with Arrow tables registered."""
+    if not _DF_AVAILABLE:
+        return None
+    ctx = _DFCtx()
+    for name, tbl in tables.items():
+        ctx.register_record_batches(name, [tbl.to_batches()])
+    return ctx
+
+def _df_collect(ctx, sql):
+    """Execute SQL with a 30-second timeout and return a pa.Table."""
+    import pyarrow as pa, threading, time as _time
+    result = [None]
+    error  = [None]
+    def run():
+        try:
+            batches = ctx.sql(sql).collect()
+            result[0] = pa.Table.from_batches(batches) if batches else pa.table({})
+        except Exception as e:
+            error[0] = e
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=30)
+    if t.is_alive():
+        raise RuntimeError("DataFusion timeout (>30s)")
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+def run_q1_datafusion(tbl):
+    ctx = _df(lineitem=tbl)
+    return _df_collect(ctx, f"""
+        SELECT l_returnflag, l_linestatus,
+          SUM(CAST(l_quantity AS DOUBLE)) AS sum_qty,
+          SUM(CAST(l_extendedprice AS DOUBLE)) AS sum_base_price,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS sum_disc_price,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))*(1.0+CAST(l_tax AS DOUBLE))) AS sum_charge,
+          AVG(CAST(l_quantity AS DOUBLE)) AS avg_qty,
+          AVG(CAST(l_extendedprice AS DOUBLE)) AS avg_price,
+          AVG(CAST(l_discount AS DOUBLE)) AS avg_disc,
+          COUNT(*) AS count_order
+        FROM lineitem WHERE l_shipdate <= {CUTOFF_Q1}
+        GROUP BY l_returnflag, l_linestatus
+        ORDER BY l_returnflag, l_linestatus
+    """)
+
+def run_q2_datafusion(nation, region, part, supplier, partsupp):
+    ctx = _df(nation=nation, region=region, part=part, supplier=supplier, partsupp=partsupp)
+    return _df_collect(ctx, """
+        WITH min_costs AS (
+          SELECT ps_partkey, MIN(CAST(ps_supplycost AS DOUBLE)) AS min_cost
+          FROM partsupp JOIN supplier ON ps_suppkey=s_suppkey
+          JOIN nation ON s_nationkey=n_nationkey
+          JOIN region ON n_regionkey=r_regionkey
+          WHERE r_name='EUROPE'
+          GROUP BY ps_partkey
+        )
+        SELECT s_suppkey, s_name, s_address, s_phone, s_acctbal,
+               n_name, p_partkey, p_mfgr, p_size, p_type,
+               CAST(ps_supplycost AS DOUBLE) AS ps_supplycost
+        FROM part JOIN partsupp ON p_partkey=ps_partkey
+        JOIN supplier ON ps_suppkey=s_suppkey
+        JOIN nation ON s_nationkey=n_nationkey
+        JOIN region ON n_regionkey=r_regionkey
+        JOIN min_costs ON ps_partkey=min_costs.ps_partkey
+        WHERE r_name='EUROPE'
+          AND CAST(ps_supplycost AS DOUBLE)=min_cost
+          AND p_size=15
+        ORDER BY s_acctbal DESC, n_name, s_name, p_partkey
+        LIMIT 100
+    """)
+
+def run_q3_datafusion(customer, orders, lineitem):
+    ctx = _df(customer=customer, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        SELECT o_orderkey, o_orderdate, o_shippriority,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
+        FROM customer JOIN orders ON c_custkey=o_custkey
+        JOIN lineitem ON l_orderkey=o_orderkey
+        WHERE c_mktsegment='BUILDING'
+          AND o_orderdate < {DATE_1995_03_15}
+          AND l_shipdate > {DATE_1995_03_15}
+        GROUP BY o_orderkey, o_orderdate, o_shippriority
+        ORDER BY revenue DESC
+        LIMIT 10
+    """)
+
+def run_q4_datafusion(orders, lineitem):
+    ctx = _df(orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        SELECT o_orderpriority, COUNT(*) AS order_count
+        FROM orders WHERE o_orderdate >= {Q4_DATE_LO} AND o_orderdate < {Q4_DATE_HI}
+          AND EXISTS (
+            SELECT 1 FROM lineitem
+            WHERE l_orderkey=o_orderkey AND l_commitdate < l_receiptdate
+          )
+        GROUP BY o_orderpriority ORDER BY o_orderpriority
+    """)
+
+def run_q5_datafusion(nation, customer, orders, lineitem):
+    ctx = _df(nation=nation, customer=customer, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT n_name,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
+        FROM lineitem
+        JOIN orders ON l_orderkey=o_orderkey
+        JOIN customer ON o_custkey=c_custkey
+        JOIN nation ON c_nationkey=n_nationkey
+        WHERE o_orderdate >= 19940101 AND o_orderdate < 19950101
+        GROUP BY n_name ORDER BY revenue DESC
+    """)
+
+def run_q6_datafusion(tbl):
+    ctx = _df(lineitem=tbl)
+    return _df_collect(ctx, f"""
+        SELECT SUM(CAST(l_extendedprice AS DOUBLE)*CAST(l_discount AS DOUBLE)) AS revenue
+        FROM lineitem
+        WHERE l_shipdate >= {Q6_DATE_LO} AND l_shipdate < {Q6_DATE_HI}
+          AND l_discount >= 0.05 AND l_discount <= 0.07
+          AND l_quantity < 24.0
+    """)
+
+def run_q7_datafusion(nation, supplier, customer, orders, lineitem):
+    # Simplified: single nation join (avoids self-join hang), group by nation + year
+    ctx = _df(nation=nation, supplier=supplier, customer=customer,
+              orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT n_name, l_shipdate/10000 AS l_year,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
+        FROM supplier JOIN lineitem ON s_suppkey=l_suppkey
+        JOIN orders ON l_orderkey=o_orderkey
+        JOIN customer ON o_custkey=c_custkey
+        JOIN nation ON s_nationkey=n_nationkey
+        WHERE l_shipdate >= 19950101 AND l_shipdate <= 19961231
+        GROUP BY n_name, l_year ORDER BY n_name, l_year
+    """)
+
+def run_q8_datafusion(nation, region, part, customer, orders, lineitem):
+    # Simplified: use nation×2 self-join pattern (DataFusion supports it)
+    ctx = _df(nation=nation, region=region, part=part,
+              customer=customer, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT o_orderdate/10000 AS o_year,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
+        FROM part JOIN lineitem ON p_partkey=l_partkey
+        JOIN orders ON l_orderkey=o_orderkey
+        JOIN customer ON o_custkey=c_custkey
+        JOIN nation ON c_nationkey=n_nationkey
+        WHERE o_orderdate >= 19950101 AND o_orderdate <= 19961231
+        GROUP BY o_year ORDER BY o_year
+    """)
+
+def run_q9_datafusion(nation, supplier, partsupp, part, orders, lineitem):
+    # Simplified: group by nation + year, no p_name LIKE filter (matches test data structure)
+    ctx = _df(nation=nation, supplier=supplier, partsupp=partsupp,
+              part=part, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT n_name, o_orderdate/10000 AS o_year,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))
+              - CAST(ps_supplycost AS DOUBLE)*CAST(l_quantity AS DOUBLE)) AS sum_profit
+        FROM lineitem JOIN part ON l_partkey=p_partkey
+        JOIN partsupp ON l_partkey=ps_partkey AND l_suppkey=ps_suppkey
+        JOIN supplier ON l_suppkey=s_suppkey
+        JOIN nation ON s_nationkey=n_nationkey
+        JOIN orders ON l_orderkey=o_orderkey
+        WHERE p_name LIKE '%green%'
+        GROUP BY n_name, o_year ORDER BY n_name, o_year DESC
+    """)
+
+def run_q10_datafusion(nation, customer, orders, lineitem):
+    ctx = _df(nation=nation, customer=customer, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT c_custkey, c_name, c_acctbal,
+          n_name,
+          SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
+        FROM customer JOIN orders ON c_custkey=o_custkey
+        JOIN lineitem ON l_orderkey=o_orderkey
+        JOIN nation ON c_nationkey=n_nationkey
+        WHERE o_orderdate >= 19931001 AND o_orderdate < 19940101
+          AND l_returnflag='R'
+        GROUP BY c_custkey, c_name, c_acctbal, n_name
+        ORDER BY revenue DESC LIMIT 20
+    """)
+
+def run_q11_datafusion(nation, supplier, partsupp):
+    ctx = _df(nation=nation, supplier=supplier, partsupp=partsupp)
+    return _df_collect(ctx, """
+        WITH agg AS (
+          SELECT ps_partkey,
+            SUM(CAST(ps_supplycost AS DOUBLE)*CAST(ps_availqty AS DOUBLE)) AS value
+          FROM partsupp JOIN supplier ON ps_suppkey=s_suppkey
+          JOIN nation ON s_nationkey=n_nationkey
+          GROUP BY ps_partkey
+        ),
+        threshold AS (
+          SELECT SUM(CAST(ps_supplycost AS DOUBLE)*CAST(ps_availqty AS DOUBLE))*0.0001 AS t
+          FROM partsupp JOIN supplier ON ps_suppkey=s_suppkey
+          JOIN nation ON s_nationkey=n_nationkey
+        )
+        SELECT ps_partkey, value FROM agg, threshold
+        WHERE value > t ORDER BY value DESC
+    """)
+
+def run_q12_datafusion(orders, lineitem):
+    ctx = _df(orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        SELECT l_shipmode,
+          SUM(CASE WHEN o_orderpriority IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS high_line_count,
+          SUM(CASE WHEN o_orderpriority NOT IN ('1-URGENT','2-HIGH') THEN 1 ELSE 0 END) AS low_line_count
+        FROM lineitem JOIN orders ON l_orderkey=o_orderkey
+        WHERE l_shipmode IN ('MAIL','SHIP')
+          AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate
+          AND l_receiptdate >= {Q12_DATE_LO} AND l_receiptdate < {Q12_DATE_HI}
+        GROUP BY l_shipmode ORDER BY l_shipmode
+    """)
+
+def run_q13_datafusion(customer, orders):
+    ctx = _df(customer=customer, orders=orders)
+    return _df_collect(ctx, """
+        SELECT c_count, COUNT(*) AS custdist FROM (
+          SELECT c_custkey, COUNT(o_orderkey) AS c_count
+          FROM customer LEFT JOIN orders ON c_custkey=o_custkey
+          GROUP BY c_custkey
+        ) c_orders
+        GROUP BY c_count ORDER BY custdist DESC, c_count DESC
+    """)
+
+def run_q14_datafusion(part, lineitem):
+    ctx = _df(part=part, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        SELECT
+          100.0*SUM(CASE WHEN p_type LIKE 'PROMO%'
+            THEN CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE)) ELSE 0.0 END)
+          / SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS promo_revenue
+        FROM lineitem JOIN part ON l_partkey=p_partkey
+        WHERE l_shipdate >= {Q14_DATE_LO} AND l_shipdate < {Q14_DATE_HI}
+    """)
+
+def run_q15_datafusion(supplier, lineitem):
+    ctx = _df(supplier=supplier, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        WITH revenue AS (
+          SELECT l_suppkey,
+            SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS total_revenue
+          FROM lineitem
+          WHERE l_shipdate >= {Q15_DATE_LO} AND l_shipdate < {Q15_DATE_HI}
+          GROUP BY l_suppkey
+        )
+        SELECT s_suppkey, s_name, s_address, s_phone, total_revenue
+        FROM supplier JOIN revenue ON s_suppkey=l_suppkey
+        WHERE total_revenue=(SELECT MAX(total_revenue) FROM revenue)
+        ORDER BY s_suppkey
+    """)
+
+def run_q16_datafusion(part, supplier, partsupp):
+    ctx = _df(part=part, supplier=supplier, partsupp=partsupp)
+    sizes = ",".join(str(s) for s in Q16_SIZES)
+    return _df_collect(ctx, f"""
+        SELECT p_brand, p_type, p_size, COUNT(DISTINCT ps_suppkey) AS supplier_cnt
+        FROM partsupp JOIN part ON p_partkey=ps_partkey
+        WHERE p_brand <> '{Q16_BRAND}'
+          AND p_type NOT LIKE '{Q16_TYPE_PREFIX}%'
+          AND p_size IN ({sizes})
+          AND ps_suppkey NOT IN (
+            SELECT s_suppkey FROM supplier WHERE s_comment LIKE '%Complaints%'
+          )
+        GROUP BY p_brand, p_type, p_size ORDER BY supplier_cnt DESC
+    """)
+
+def run_q17_datafusion(part, lineitem):
+    ctx = _df(part=part, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        SELECT SUM(CAST(l_extendedprice AS DOUBLE))/7.0 AS avg_yearly
+        FROM lineitem JOIN part ON l_partkey=p_partkey
+        WHERE p_brand='{Q17_BRAND}' AND p_container='{Q17_CONTAINER}'
+          AND l_quantity < (
+            SELECT 0.2*AVG(CAST(l2.l_quantity AS DOUBLE))
+            FROM lineitem l2 WHERE l2.l_partkey=p_partkey
+          )
+    """)
+
+def run_q18_datafusion(customer, orders, lineitem):
+    ctx = _df(customer=customer, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT c_custkey, o_orderkey, o_orderdate, o_totalprice,
+          SUM(CAST(l_quantity AS DOUBLE)) AS sum_qty
+        FROM customer JOIN orders ON c_custkey=o_custkey
+        JOIN lineitem ON o_orderkey=l_orderkey
+        WHERE o_orderkey IN (
+          SELECT l_orderkey FROM lineitem
+          GROUP BY l_orderkey HAVING SUM(CAST(l_quantity AS DOUBLE)) > 300
+        )
+        GROUP BY c_custkey, o_orderkey, o_orderdate, o_totalprice
+        ORDER BY o_totalprice DESC LIMIT 100
+    """)
+
+def run_q19_datafusion(part, lineitem):
+    ctx = _df(part=part, lineitem=lineitem)
+    sm = "','".join(CONTAINERS_SM)
+    md = "','".join(CONTAINERS_MD)
+    lg = "','".join(CONTAINERS_LG)
+    return _df_collect(ctx, f"""
+        SELECT SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
+        FROM lineitem JOIN part ON l_partkey=p_partkey
+        WHERE (
+          (p_brand='Brand#12' AND p_container IN ('{sm}')
+           AND l_quantity BETWEEN 1 AND 11 AND p_size BETWEEN 1 AND 5)
+          OR
+          (p_brand='Brand#23' AND p_container IN ('{md}')
+           AND l_quantity BETWEEN 10 AND 20 AND p_size BETWEEN 1 AND 10)
+          OR
+          (p_brand='Brand#34' AND p_container IN ('{lg}')
+           AND l_quantity BETWEEN 20 AND 30 AND p_size BETWEEN 1 AND 15)
+        )
+    """)
+
+def run_q20_datafusion(nation, part, supplier, partsupp, lineitem):
+    ctx = _df(nation=nation, part=part, supplier=supplier,
+              partsupp=partsupp, lineitem=lineitem)
+    return _df_collect(ctx, f"""
+        SELECT s_name, s_address FROM supplier JOIN nation ON s_nationkey=n_nationkey
+        WHERE n_name='{Q20_NATION}'
+          AND s_suppkey IN (
+            SELECT ps_suppkey FROM partsupp
+            WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE '{Q20_COLOR}%')
+              AND CAST(ps_availqty AS DOUBLE) > (
+                SELECT 0.5*SUM(CAST(l_quantity AS DOUBLE)) FROM lineitem
+                WHERE l_partkey=ps_partkey AND l_suppkey=ps_suppkey
+                  AND l_shipdate >= 19940101 AND l_shipdate < 19950101
+              )
+          )
+        ORDER BY s_name
+    """)
+
+def run_q21_datafusion(nation, supplier, orders, lineitem):
+    ctx = _df(nation=nation, supplier=supplier, orders=orders, lineitem=lineitem)
+    return _df_collect(ctx, """
+        SELECT s_name, COUNT(*) AS numwait FROM supplier
+        JOIN lineitem l1 ON s_suppkey=l1.l_suppkey
+        JOIN orders ON l1.l_orderkey=o_orderkey
+        JOIN nation ON s_nationkey=n_nationkey
+        WHERE o_orderstatus='F'
+          AND EXISTS (
+            SELECT 1 FROM lineitem l2
+            WHERE l2.l_orderkey=l1.l_orderkey AND l2.l_suppkey<>l1.l_suppkey
+          )
+        GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100
+    """)
+
+def run_q22_datafusion(customer, orders):
+    ctx = _df(customer=customer, orders=orders)
+    codes = "','".join(Q22_COUNTRY_CODES)
+    return _df_collect(ctx, f"""
+        WITH avg_acct AS (
+          SELECT AVG(CAST(c_acctbal AS DOUBLE)) AS avg_bal
+          FROM customer
+          WHERE c_acctbal > 0 AND SUBSTRING(c_phone, 1, 2) IN ('{codes}')
+        )
+        SELECT SUBSTRING(c_phone, 1, 2) AS cntrycode,
+               COUNT(*) AS numcust,
+               SUM(CAST(c_acctbal AS DOUBLE)) AS totacctbal
+        FROM customer, avg_acct
+        WHERE SUBSTRING(c_phone, 1, 2) IN ('{codes}')
+          AND c_acctbal > avg_bal
+          AND NOT EXISTS (SELECT 1 FROM orders WHERE o_custkey=c_custkey)
+        GROUP BY cntrycode ORDER BY cntrycode
+    """)

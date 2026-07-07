@@ -54,7 +54,7 @@ At runtime — `ctypes.CDLL()` takes ~1 ms. No JIT, no MLIR graph build, no reco
 ├── plan_validation.py       Pre-run sanity checks
 ├── sql_frontend.py          sqlglot → LogicalPlan
 │
-├── kernels_v261/            Mojo kernel SOURCE (not shipped in wheel)
+├── kernels/                 Mojo kernel SOURCE (not shipped in wheel)
 │   ├── __init__.mojo
 │   ├── group_sum.mojo        scatter-add by group label (CPU + GPU)
 │   ├── group_min.mojo        scatter-min
@@ -92,7 +92,7 @@ At runtime — `ctypes.CDLL()` takes ~1 ms. No JIT, no MLIR graph build, no reco
 
 ### 1. Setup
 
-```bash
+```sh
 git clone https://github.com/abhisheksreesaila/mxframe
 cd mxframe
 pixi install          # installs Python + Mojo + all deps into .pixi/envs/default/
@@ -104,7 +104,7 @@ pixi run setup-mxframe   # creates mxframe symlink in site-packages
 Edit any of the `.py` files directly (compiler, lazy_frame, custom_ops, etc.).  
 The editable install means changes take effect immediately — no reinstall needed.
 
-```bash
+```sh
 # Verify your change with smoke tests
 pixi run python3 scripts/_test_aot_smoke.py
 
@@ -121,7 +121,7 @@ See the [Kernel Writing Guide](#-writing-a-new-mojo-kernel) below.
 
 After writing the kernel:
 
-```bash
+```sh
 # Rebuild the CPU .so
 pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
     -o kernels_aot/libmxkernels_aot.so
@@ -136,7 +136,7 @@ pixi run python3 scripts/_test_aot_smoke.py
 
 ### 4. Run the Full Test Suite
 
-```bash
+```sh
 # Unit tests (AOT kernel smoke)
 pixi run python3 scripts/_test_aot_smoke.py
 
@@ -158,7 +158,7 @@ pixi run python3 scripts/_check_gpu.py
 
 ### 5. Benchmark Before/After
 
-```bash
+```sh
 # Full 22 queries, 1M rows, 3 hot runs
 pixi run python3 scripts/bench_simple.py --rows 1000000 --runs 3
 
@@ -170,9 +170,9 @@ pixi run python3 scripts/bench_simple.py --rows 1000000 --runs 3 --queries 1,6,2
 
 ## ✏️ Writing a New Mojo Kernel
 
-### Step 1 — Write the kernel in `kernels_v261/`
+### Step 1 — Write the kernel in `kernels/`
 
-Create `kernels_v261/my_kernel.mojo`:
+Create `kernels/my_kernel.mojo`:
 
 ```mojo
 from math import ceildiv
@@ -267,7 +267,7 @@ def my_kernel(self, inp: np.ndarray) -> np.ndarray:
 
 ### Step 5 — Rebuild and test
 
-```bash
+```sh
 pixi run mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo \
     -o kernels_aot/libmxkernels_aot_gpu.so
 pixi run python3 scripts/_test_aot_smoke.py

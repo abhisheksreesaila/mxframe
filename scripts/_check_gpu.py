@@ -19,7 +19,7 @@ def _safe_getattr(obj, name: str) -> str:
 
 def _print_kernel_pkg_info() -> None:
     repo_root = Path(__file__).resolve().parents[1]
-    kernels_dir = repo_root / "mxframe" / "kernels_v261"
+    kernels_dir = repo_root / "mxframe" / "kernels"
     pkg_path = repo_root / "mxframe" / "kernels.mojopkg"
     print(f"kernels_dir_path: {kernels_dir}")
     print(f"kernels_dir_exists: {str(kernels_dir.exists()).lower()}")

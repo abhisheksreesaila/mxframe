@@ -357,6 +357,175 @@ fn filter_gather_i64_gpu(
         ctx.synchronize()
     except: pass
 
+# ── masked_global_min ─────────────────────────────────────────────────────
+@export
+fn masked_global_min_f32_gpu(
+    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
+):
+    @parameter
+    fn init_out(nout: Int):
+        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if t < nout: _f32(out_addr)[t] = F32_MAX
+
+    @parameter
+    fn min_kernel(n_: Int):
+        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var gid = Int(block_idx.x) * BLOCK + tid
+        var v: Float32 = F32_MAX
+        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
+        shmem[tid] = v
+        barrier()
+        var s = BLOCK >> 1
+        while s > 0:
+            if tid < s:
+                if shmem[tid + s] < shmem[tid]: shmem[tid] = shmem[tid + s]
+            barrier(); s = s >> 1
+        if tid == 0: _ = Atomic.min(_f32(out_addr), shmem[0])
+
+    try:
+        var ctx = DeviceContext()
+        ctx.enqueue_function_experimental[init_out](
+            1, grid_dim=1, block_dim=BLOCK)
+        if n > 0:
+            ctx.enqueue_function_experimental[min_kernel](
+                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.synchronize()
+    except: pass
+
+# ── masked_global_max ─────────────────────────────────────────────────────
+@export
+fn masked_global_max_f32_gpu(
+    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
+):
+    @parameter
+    fn init_out(nout: Int):
+        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if t < nout: _f32(out_addr)[t] = F32_MIN
+
+    @parameter
+    fn max_kernel(n_: Int):
+        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var gid = Int(block_idx.x) * BLOCK + tid
+        var v: Float32 = F32_MIN
+        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
+        shmem[tid] = v
+        barrier()
+        var s = BLOCK >> 1
+        while s > 0:
+            if tid < s:
+                if shmem[tid + s] > shmem[tid]: shmem[tid] = shmem[tid + s]
+            barrier(); s = s >> 1
+        if tid == 0: _ = Atomic.max(_f32(out_addr), shmem[0])
+
+    try:
+        var ctx = DeviceContext()
+        ctx.enqueue_function_experimental[init_out](
+            1, grid_dim=1, block_dim=BLOCK)
+        if n > 0:
+            ctx.enqueue_function_experimental[max_kernel](
+                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.synchronize()
+    except: pass
+
+# ── group_encode_i32 ──────────────────────────────────────────────────────
+# Open-addressing linear-probing hash table: assign dense int32 group IDs
+# to an int32 key array.  INT32_MIN (-2147483648) is the empty-slot sentinel;
+# callers must ensure no key equals that value.
+#
+# Algorithm per thread i:
+#   h = murmur_hash(keys[i]) % cap
+#   expected = EMPTY
+#   loop:
+#     won = CAS(htab[h], expected, keys[i])   — expected is updated on miss
+#     if won:
+#       new_id = atomicAdd(out_ng, 1)          — monotone counter
+#       htid[h] = new_id; out_ids[i] = new_id; return
+#     if expected == keys[i]:
+#       spin until htid[h] != -1; out_ids[i] = htid[h]; return
+#     h = (h+1)%cap; expected = EMPTY          — linear probe
+#
+# Inputs:  keys[n] int32, cap (power-of-2 >= 2*n)
+# Outputs: out_ids[n] dense group IDs, out_ng[1] n_groups found
+# Scratch: htab[cap], htid[cap]  (kernel initialises them internally)
+@export
+fn group_encode_i32_gpu(
+    keys_addr: Int,
+    out_ids_addr: Int,
+    out_ng_addr: Int,
+    htab_addr: Int,
+    htid_addr: Int,
+    n: Int,
+    cap: Int,
+):
+    # Pass 1: initialise hash table slots and counter atomically
+    @parameter
+    fn init_tables(cap_: Int):
+        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if t < cap_:
+            _i32(htab_addr)[t] = Int32(-2147483648)  # EMPTY sentinel
+            _i32(htid_addr)[t] = Int32(-1)
+        if t == 0:
+            _i32(out_ng_addr)[0] = Int32(0)
+
+    # Pass 2: each thread claims its key slot, assigns a dense ID
+    @parameter
+    fn insert(n_: Int, cap_: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i >= n_: return
+
+        var k = _i32(keys_addr)[i]
+        var EMPTY = Int32(-2147483648)
+
+        # Murmur-inspired 32-bit avalanche hash
+        var kk = UInt32(Int(k))
+        kk ^= kk >> 16
+        kk ^= UInt32(0x45d9f3b)
+        kk ^= kk >> 16
+        kk ^= kk >> 4
+        kk ^= UInt32(0x27d4eb2f)
+        kk ^= kk >> 15
+        var h = Int(kk) % cap_
+
+        var expected = EMPTY
+        while True:
+            # Atomic CAS: try to install our key in slot h.
+            # On miss, `expected` is updated to the current slot value.
+            var won = Atomic.compare_exchange(
+                _i32(htab_addr) + h,
+                expected,
+                k,
+            )
+            if won:
+                # Slot claimed: get a fresh dense ID (atomicAdd returns old value = new ID)
+                var new_id = Atomic.fetch_add(_i32(out_ng_addr), Int32(1))
+                _i32(htid_addr)[h] = new_id
+                _i32(out_ids_addr)[i] = new_id
+                return
+            if expected == k:
+                # Another thread already claimed this key; spin until it writes the ID
+                var gid = _i32(htid_addr)[h]
+                while gid == Int32(-1):
+                    gid = _i32(htid_addr)[h]
+                _i32(out_ids_addr)[i] = gid
+                return
+            # Collision with a different key: linear probe to next slot
+            h = (h + 1) % cap_
+            expected = EMPTY  # reset for the next CAS attempt
+
+    try:
+        var ctx = DeviceContext()
+        ctx.enqueue_function_experimental[init_tables](
+            cap, grid_dim=ceildiv(cap, BLOCK), block_dim=BLOCK)
+        if n > 0:
+            ctx.enqueue_function_experimental[insert](
+                n, cap, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.synchronize()
+    except: pass
+
 # ── unique_mask ────────────────────────────────────────────────────────────
 # Mark out[i]=1 where sorted keys[i] != keys[i-1] (first in run).
 @export
