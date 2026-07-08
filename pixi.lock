@@ -99,7 +99,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/fsspec-2026.3.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gdk-pixbuf-2.44.6-h2b0a6b4_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/gflags-2.2.2-h5888daf_1005.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/gguf-0.17.1-pyhc364b38_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/gguf-0.17.1-pyhc364b38_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/ghapi-1.0.13-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/glog-0.7.1-hbabe93e_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/glslang-16.2.0-h96af755_1.conda
@@ -1671,9 +1671,9 @@ packages:
   purls: []
   size: 119654
   timestamp: 1726600001928
-- conda: https://conda.anaconda.org/conda-forge/noarch/gguf-0.17.1-pyhc364b38_1.conda
-  sha256: db9153390627023f88c83e8fca87825a67bde3080dca91554be83b8db369e75e
-  md5: 99d5d8bfe8def56f3514c82bfe840315
+- conda: https://conda.anaconda.org/conda-forge/noarch/gguf-0.17.1-pyhc364b38_2.conda
+  sha256: c5e8c59a372a87b0ed153e270c25c5d26e64de3e208f430f598d6d3bb52ce320
+  md5: 68516b4f63cbbc20872a002ef2114621
   depends:
   - python >=3.8
   - numpy >=1.17
@@ -1684,8 +1684,8 @@ packages:
   license_family: MIT
   purls:
   - pkg:pypi/gguf?source=hash-mapping
-  size: 92302
-  timestamp: 1770223049607
+  size: 91321
+  timestamp: 1780157164670
 - conda: https://conda.anaconda.org/conda-forge/noarch/ghapi-1.0.13-pyhcf101f3_0.conda
   sha256: d56473873a43be4d09af6b31fa6181b42d4f1e6b4c3413a6443201237337f267
   md5: e604a729da91d2fdd8f09c3928c94dd9
