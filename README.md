@@ -280,25 +280,32 @@ That is a real cost and Phase 4 reduces it for join-heavy queries.
 
 ## 🗺️ Roadmap: Remaining Mojo Work
 
-The table below lists what remains to make MXFrame fully GPU-native.
-Items are ordered by performance impact, not difficulty.
+The table below tracks the GPU-native kernel work.  Completed phases are
+shipped in v0.2.x releases; items are ordered by performance impact.
 
 | Phase | What | Queries affected | Status |
 |---|---|---|---|
-| **Phase 4** | **Device-resident join pipeline** — after `gather_f32/i32_gpu` produces gathered columns keep them as device buffers; feed directly into `group_sum_f32_gpu` without `pa.Table.from_arrays` round-trip | Q3, Q5, Q7, Q8, Q9, Q10, Q18, Q21 | 🔲 Planned |
-| **Phase 5** | **GPU top-k kernel** — `ORDER BY … LIMIT n` via per-block heap; avoids full bitonic sort of large intermediates before the final slice | Q3, Q5, Q8, Q9, Q20, Q21 | 🔲 Planned |
+| **Phase 4** | **Device-resident join pipeline** — AOT `join_count_i32_gpu` + `join_scatter_i32_gpu` replace MAX Graph JIT for GPU inner joins; `gather_table` chains column gathering with a single device-resident index upload | Q3, Q5, Q7, Q8, Q9, Q10, Q18, Q21 | ✅ **v0.2.3** |
+| **Phase 5** | **GPU sort + top-k kernel** — `sort_topk_i32_gpu` AOT bitonic sort; `ORDER BY … LIMIT k` fuses sort+limit in one kernel call; fixes a crash in the previous MAX Graph gather path | Q3, Q5, Q8, Q9, Q20, Q21 | ✅ **v0.2.3** |
+| **Phase 3** | **GPU key encoding** — `group_encode_i32_gpu` hash table for integer group keys (v0.2.0); vectorised rank mapping in `_encode_sort_key` removes Python for-loop (v0.2.3, 1.5× speedup) | Q1–Q22 | ✅ **Partial** — string/float encoding is future Phase 6 |
 | **Phase 6** | **GPU string/category encoding** — open-addressing hash table for variable-length keys, replaces PyArrow `dictionary_encode` for string group-by columns | Q1, Q4, Q5, Q7, Q8, Q9, Q12 | 🔭 Future |
 | **Phase 7** | **GPU string predicate evaluation** — `isin`, `startswith`, `contains` on GPU; eliminates PyArrow boolean mask for string filters | Q4, Q12, Q16, Q19 | 🔭 Future |
 | **Phase 8** | **GPU window functions** — `rank`, `dense_rank`, `lag`, `lead`, `cum_sum` | Non-TPC-H workloads | 🔭 Future |
 
-### Why Phases 4–5 are the highest ROI
+### What Phases 4–5 delivered (v0.2.3)
 
-Phases 4 and 5 target the **cold-run** round-trip: the CPU `pa.Table` that currently sits between a join and its downstream aggregation.
-On hot runs this round-trip is already eliminated by the join-result cache — so steady-state benchmark numbers are unaffected.
-On cold runs (fresh process, first query of a new shape), removing `pa.Table.from_arrays` + re-upload can save 20–80 ms for 1M-row join intermediates.
+**Phase 4 — AOT GPU join pipeline:**
+- GPU inner joins now bypass MAX Graph JIT entirely. Cold-start latency dropped from ~300 ms (MAX session init) to ~70 ms (AOT ctypes direct).
+- `AOTKernelsGPU.hash_join()` chains `join_count_i32_gpu` + `join_scatter_i32_gpu` with `_cached_upload` so repeated hot calls skip the PCIe copy.
+- `AOTKernelsGPU.gather_table()` gathers all numeric columns with a single index H2D upload shared across every column, replacing per-column MAX Graph model executions.
 
-Phases 6 and 7 target operations that are **already SIMD-fast in PyArrow C++** and **already cached** after the first call.
-They matter most for workloads that constantly see new table instances (streaming, per-request analytics) where the cache cannot absorb the encoding cost.
+**Phase 5 — AOT GPU sort + top-k:**
+- Fixes a crash: the previous GPU sort path called `gather_f32` as a MAX Graph custom op — that kernel was never registered in the mojopkg.
+- `sort_topk_i32_gpu` AOT bitonic sort: `ORDER BY … LIMIT k` fuses sort + limit into one kernel call. Downloads only `k × 4` bytes instead of `N × 4`.
+- `_apply_post_ops_custom` now peek-ahead: a `Sort` immediately followed by a `Limit` passes `topk=k` directly to the sort kernel.
+
+**Phase 3 vectorised rank (v0.2.3):**
+- `_encode_sort_key` replaced the per-unique-value Python for-loop with a single vectorised NumPy scatter: `rank_of[sorted_order] = np.arange(n_unique)`. ~1.5× speedup for sort-key encoding.
 
 > **Current GPU coverage:** `python scripts/audit_gpu_paths.py --device gpu --min-gpu-coverage 0.8`
 > exits 0 with **22/22 queries GPU-CLEAN (100%)** — every computationally heavy operator
