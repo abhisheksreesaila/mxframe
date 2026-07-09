@@ -20,13 +20,12 @@ Both kernels are dispatched via ops.custom().
 """
 
 import compiler
-from math import ceildiv
-from gpu import block_dim, block_idx, thread_idx, barrier
-from gpu.memory import AddressSpace
-from memory import stack_allocation
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import block_dim, block_idx, thread_idx, barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime val_dtype = DType.float32
 comptime idx_dtype = DType.int32
@@ -38,9 +37,9 @@ comptime idx_dtype = DType.int32
 #    Output: offsets[N+1] int32, exclusive prefix sum; offsets[N] = total count
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _prefix_sum_count_cpu(
-    offsets: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+def _prefix_sum_count_cpu(
+    offsets: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
 ):
     var n = mask.dim_size(0)
     offsets[0] = 0
@@ -48,10 +47,10 @@ fn _prefix_sum_count_cpu(
         offsets[i + 1] = offsets[i] + mask[i]
 
 
-fn _prefix_sum_count_gpu(
-    offsets: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _prefix_sum_count_gpu(
+    offsets: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     """Single-pass exclusive prefix sum using a block-level scan + global fixup.
 
@@ -73,7 +72,7 @@ fn _prefix_sum_count_gpu(
 
     # Pass 1: each block writes local exclusive prefix sum into offsets[1..n].
     @parameter
-    fn block_scan_kernel(n: Int, num_blocks: Int):
+    def block_scan_kernel(n: Int, num_blocks: Int):
         comptime BSIZE = 256
         var shared = stack_allocation[BSIZE, Scalar[idx_dtype], address_space=AddressSpace.SHARED]()
 
@@ -113,7 +112,7 @@ fn _prefix_sum_count_gpu(
             if tid == last_active:
                 offsets[0] = 0  # will be fixed below
 
-    ctx.get_device_context().enqueue_function_experimental[block_scan_kernel](
+    ctx.enqueue_function[block_scan_kernel](
         n,
         num_blocks,
         grid_dim=num_blocks,
@@ -124,7 +123,7 @@ fn _prefix_sum_count_gpu(
     # After pass 1, offsets[bid*BLOCK+1 .. (bid+1)*BLOCK] contain block-local
     # exclusive prefix sums.  We need to add the sum of all prior blocks.
     @parameter
-    fn fixup_kernel(n: Int, num_blocks: Int):
+    def fixup_kernel(n: Int, num_blocks: Int):
         comptime BSIZE = 256
         var bid = Int(block_idx.x)
         var tid = Int(thread_idx.x)
@@ -140,7 +139,7 @@ fn _prefix_sum_count_gpu(
                 prior_sum = offsets[last_idx]
         offsets[gid + 1] = offsets[gid + 1] + prior_sum
 
-    ctx.get_device_context().enqueue_function_experimental[fixup_kernel](
+    ctx.enqueue_function[fixup_kernel](
         n,
         num_blocks,
         grid_dim=num_blocks,
@@ -149,11 +148,11 @@ fn _prefix_sum_count_gpu(
 
     # offsets[0] is always 0 (guaranteed by exclusive-scan semantics).
     @parameter
-    fn zero_first(_n: Int):
+    def zero_first(_n: Int):
         if Int(block_idx.x) == 0 and Int(thread_idx.x) == 0:
             offsets[0] = 0
 
-    ctx.get_device_context().enqueue_function_experimental[zero_first](
+    ctx.enqueue_function[zero_first](
         n,
         grid_dim=1,
         block_dim=1,
@@ -163,14 +162,14 @@ fn _prefix_sum_count_gpu(
 @compiler.register("prefix_sum_count")
 struct PrefixSumCount:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         offsets: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _prefix_sum_count_cpu(offsets, mask)
         elif target == "gpu":
@@ -187,11 +186,11 @@ struct PrefixSumCount:
 #    Output: output  [N]   float32  (output[offsets[N]] is the last valid element)
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _filter_gather_f32_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+def _filter_gather_f32_cpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
 ):
     var n = values.dim_size(0)
     for i in range(n):
@@ -199,26 +198,26 @@ fn _filter_gather_f32_cpu(
             output[Int(offsets[i])] = values[i]
 
 
-fn _filter_gather_f32_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _filter_gather_f32_gpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     var n = values.dim_size(0)
     var num_blocks = ceildiv(n, BLOCK_SIZE)
 
     @parameter
-    fn gather_kernel(n: Int):
+    def gather_kernel(n: Int):
         var gid = Int(block_dim.x) * Int(block_idx.x) + Int(thread_idx.x)
         if gid >= n:
             return
         if mask[gid] == 1:
             output[Int(offsets[gid])] = values[gid]
 
-    ctx.get_device_context().enqueue_function_experimental[gather_kernel](
+    ctx.enqueue_function[gather_kernel](
         n,
         grid_dim=num_blocks,
         block_dim=BLOCK_SIZE,
@@ -228,16 +227,16 @@ fn _filter_gather_f32_gpu(
 @compiler.register("filter_gather_f32")
 struct FilterGatherF32:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
         values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
         mask: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _filter_gather_f32_cpu(output, values, mask, offsets)
         elif target == "gpu":

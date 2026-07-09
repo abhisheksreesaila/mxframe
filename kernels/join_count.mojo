@@ -1,9 +1,9 @@
 import compiler
-from math import ceildiv
-from gpu import WARP_SIZE, block_dim, block_idx, thread_idx
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from ._atomic import Atomic
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
 comptime out_dtype = DType.int32
@@ -11,10 +11,10 @@ comptime out_dtype = DType.int32
 
 # -- CPU: direct-address count-based join match counting --------------------
 
-fn _join_count_cpu(
-    match_counts: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1, io_spec=_, static_spec=_],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+def _join_count_cpu(
+    match_counts: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
+    left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
 ):
     """Count how many right rows match each left row's key."""
     var n_left = left_keys.dim_size(0)
@@ -53,13 +53,13 @@ fn _join_count_cpu(
 
 # -- GPU: direct-address count-based join match counting --------------------
 
-fn _join_count_gpu(
-    match_counts: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1, io_spec=_, static_spec=_],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    max_key_buf: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    right_count_buf: ManagedTensorSlice[mut=True, dtype=out_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _join_count_gpu(
+    match_counts: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
+    left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    max_key_buf: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    right_count_buf: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     """GPU join count: uses pre-allocated right_count buffer."""
     comptime BLOCK_SIZE = 256
@@ -76,23 +76,23 @@ fn _join_count_gpu(
     var buf_size = right_count_buf.dim_size(0)
 
     @parameter
-    fn zero_kernel(buf_size: Int):
+    def zero_kernel(buf_size: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(buf_size):
+        if Int(tid) < buf_size:
             right_count_buf[Int(tid)] = 0
 
     if buf_size > 0:
         var zero_blocks = ceildiv(buf_size, BLOCK_SIZE)
-        ctx.get_device_context().enqueue_function_experimental[zero_kernel](
+        ctx.enqueue_function[zero_kernel](
             buf_size,
             grid_dim=zero_blocks, block_dim=BLOCK_SIZE,
         )
 
     # Phase 2: Count right-side key frequencies (atomic add)
     @parameter
-    fn count_right_kernel(n_right: Int, table_size: Int):
+    def count_right_kernel(n_right: Int, table_size: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(n_right):
+        if Int(tid) < n_right:
             var k = Int(right_keys[Int(tid)])
             if k >= 0 and k < table_size:
                 var ptr = right_count_buf.unsafe_ptr() + k
@@ -100,16 +100,16 @@ fn _join_count_gpu(
 
     if n_right > 0:
         var blocks_r = ceildiv(n_right, BLOCK_SIZE)
-        ctx.get_device_context().enqueue_function_experimental[count_right_kernel](
+        ctx.enqueue_function[count_right_kernel](
             n_right, table_size,
             grid_dim=blocks_r, block_dim=BLOCK_SIZE,
         )
 
     # Phase 3: Probe -- each left row looks up its match count
     @parameter
-    fn probe_kernel(n_left: Int, table_size: Int):
+    def probe_kernel(n_left: Int, table_size: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(n_left):
+        if Int(tid) < n_left:
             var k = Int(left_keys[Int(tid)])
             if k >= 0 and k < table_size:
                 match_counts[Int(tid)] = right_count_buf[k]
@@ -117,7 +117,7 @@ fn _join_count_gpu(
                 match_counts[Int(tid)] = 0
 
     var blocks_l = ceildiv(n_left, BLOCK_SIZE)
-    ctx.get_device_context().enqueue_function_experimental[probe_kernel](
+    ctx.enqueue_function[probe_kernel](
         n_left, table_size,
         grid_dim=blocks_l, block_dim=BLOCK_SIZE,
     )
@@ -128,15 +128,15 @@ struct JoinCountCPU:
     """CPU-only join count kernel (3 inputs, 1 output)."""
 
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         match_counts: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
         left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _join_count_cpu(match_counts, left_keys, right_keys)
         else:
@@ -148,7 +148,7 @@ struct JoinCountGPU:
     """GPU join count kernel with pre-allocated right_count buffer."""
 
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         match_counts: OutputTensor[dtype=out_dtype, rank=1, static_spec=_],
@@ -156,9 +156,9 @@ struct JoinCountGPU:
         left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         max_key_buf: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "gpu":
             _join_count_gpu(match_counts, left_keys, right_keys, max_key_buf, right_count_buf, ctx)
         else:

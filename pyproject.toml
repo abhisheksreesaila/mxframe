@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mxframe"
-version = "0.2.1"
+version = "0.2.2"
 description = "GPU-accelerated DataFrame engine: Python ergonomics + Mojo AOT kernels, cross-vendor (NVIDIA/AMD/Apple)."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -34,7 +34,7 @@ dependencies = [
 # It lives on PyPI *and* in Modular's conda channel. Pixi users get it from conda
 # and should NOT install this extra (it will conflict). Pure-pip users should:
 #   pip install "mxframe[runtime]"
-runtime = ["modular>=25.5"]
+runtime = ["modular>=26.4"]
 polars  = ["polars>=0.20"]
 sql     = ["sqlglot>=25.0"]
 dev     = [

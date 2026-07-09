@@ -1,20 +1,20 @@
 import compiler
-from math import ceildiv
-from gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
-from gpu.memory import AddressSpace
-from memory import stack_allocation
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
+from ._atomic import Atomic
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime dtype = DType.float32
 comptime MAX_GROUPS = 8192
 
 
-fn _group_sum_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+def _group_sum_cpu(
+    output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=dtype, rank=1, static_spec=_],
+    group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
 ):
     var size = values.dim_size(0)
     var ng = output.dim_size(0)
@@ -28,11 +28,11 @@ fn _group_sum_cpu(
             output[gid] += values[i]
 
 
-fn _group_sum_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _group_sum_gpu(
+    output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=dtype, rank=1, static_spec=_],
+    group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     comptime COARSE_FACTOR = 4
@@ -44,13 +44,13 @@ fn _group_sum_gpu(
 
     # Zero global output
     @parameter
-    fn zero_kernel(ng: Int):
+    def zero_kernel(ng: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(ng):
+        if Int(tid) < ng:
             output[Int(tid)] = 0.0
 
     var zero_blocks = ceildiv(ng, BLOCK_SIZE)
-    ctx.get_device_context().enqueue_function_experimental[zero_kernel](
+    ctx.enqueue_function[zero_kernel](
         ng,
         grid_dim=zero_blocks,
         block_dim=BLOCK_SIZE,
@@ -64,7 +64,7 @@ fn _group_sum_gpu(
     if ng <= MAX_GROUPS:
         # Fast path: shared-memory privatization
         @parameter
-        fn sum_kernel_shared(size: Int, ng: Int):
+        def sum_kernel_shared(size: Int, ng: Int):
             var shared_bins = stack_allocation[
                 MAX_GROUPS,
                 Scalar[dtype],
@@ -94,7 +94,7 @@ fn _group_sum_gpu(
                     _ = Atomic.fetch_add(output.unsafe_ptr() + t, sval)
                 t += BLOCK_SIZE
 
-        ctx.get_device_context().enqueue_function_experimental[sum_kernel_shared](
+        ctx.enqueue_function[sum_kernel_shared](
             size,
             ng,
             grid_dim=num_blocks,
@@ -103,7 +103,7 @@ fn _group_sum_gpu(
     else:
         # Fallback: global-memory atomics (no shared-memory limit)
         @parameter
-        fn sum_kernel_global(size: Int, ng: Int):
+        def sum_kernel_global(size: Int, ng: Int):
             var block_start = Int(block_idx.x) * BLOCK_SIZE * COARSE_FACTOR
             var tid = block_start + Int(thread_idx.x)
             for c in range(COARSE_FACTOR):
@@ -113,7 +113,7 @@ fn _group_sum_gpu(
                     if gid >= 0 and gid < ng:
                         _ = Atomic.fetch_add(output.unsafe_ptr() + gid, values[i])
 
-        ctx.get_device_context().enqueue_function_experimental[sum_kernel_global](
+        ctx.enqueue_function[sum_kernel_global](
             size,
             ng,
             grid_dim=num_blocks,
@@ -124,15 +124,15 @@ fn _group_sum_gpu(
 @compiler.register("group_sum")
 struct GroupSum:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
         values: InputTensor[dtype=dtype, rank=1, static_spec=_],
         group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _group_sum_cpu(output, values, group_ids)
         elif target == "gpu":

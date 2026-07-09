@@ -1,21 +1,21 @@
 import compiler
-from math import ceildiv
-from gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
-from gpu.memory import AddressSpace
-from memory import stack_allocation
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
+from ._atomic import Atomic
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime dtype = DType.float32
 comptime FLOAT32_MIN: Scalar[dtype] = -3.4028234663852886e+38
 comptime MAX_GROUPS = 8192
 
 
-fn _group_max_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+def _group_max_cpu(
+    output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=dtype, rank=1, static_spec=_],
+    group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
 ):
     var size = values.dim_size(0)
     var ng = output.dim_size(0)
@@ -30,11 +30,11 @@ fn _group_max_cpu(
             output[gid] = value_i
 
 
-fn _group_max_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=dtype, rank=1, io_spec=_, static_spec=_],
-    group_ids: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _group_max_gpu(
+    output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=dtype, rank=1, static_spec=_],
+    group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     comptime COARSE_FACTOR = 4
@@ -46,13 +46,13 @@ fn _group_max_gpu(
 
     # Fill global output with identity (FLOAT32_MIN)
     @parameter
-    fn fill_kernel(ng: Int):
+    def fill_kernel(ng: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(ng):
+        if Int(tid) < ng:
             output[Int(tid)] = FLOAT32_MIN
 
     var fill_blocks = ceildiv(ng, BLOCK_SIZE)
-    ctx.get_device_context().enqueue_function_experimental[fill_kernel](
+    ctx.enqueue_function[fill_kernel](
         ng,
         grid_dim=fill_blocks,
         block_dim=BLOCK_SIZE,
@@ -64,7 +64,7 @@ fn _group_max_gpu(
     var num_blocks = ceildiv(size, BLOCK_SIZE * COARSE_FACTOR)
 
     @parameter
-    fn max_kernel(size: Int, ng: Int):
+    def max_kernel(size: Int, ng: Int):
         # Shared memory private bins for this block
         var shared_bins = stack_allocation[
             MAX_GROUPS,
@@ -98,7 +98,7 @@ fn _group_max_gpu(
                 _ = Atomic.max(output.unsafe_ptr() + t, sval)
             t += BLOCK_SIZE
 
-    ctx.get_device_context().enqueue_function_experimental[max_kernel](
+    ctx.enqueue_function[max_kernel](
         size,
         ng,
         grid_dim=num_blocks,
@@ -109,15 +109,15 @@ fn _group_max_gpu(
 @compiler.register("group_max")
 struct GroupMax:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=dtype, rank=1, static_spec=_],
         values: InputTensor[dtype=dtype, rank=1, static_spec=_],
         group_ids: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _group_max_cpu(output, values, group_ids)
         elif target == "gpu":

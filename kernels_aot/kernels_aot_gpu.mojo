@@ -3,7 +3,7 @@ from std.math import ceildiv
 from std.gpu import thread_idx, block_idx, block_dim, barrier
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
-from std.os.atomic import Atomic
+from _atomic import Atomic
 
 comptime BLOCK: Int = 256
 comptime COARSE: Int = 4
@@ -12,29 +12,29 @@ comptime F32_MAX: Float32 = 3.4028235e38
 comptime F32_MIN: Float32 = -3.4028235e38
 
 @always_inline
-fn _f32(addr: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
+def _f32(addr: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
     return UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=addr)
 
 @always_inline
-fn _i32(addr: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
+def _i32(addr: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
     return UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=addr)
 
 @always_inline
-fn _i64(addr: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
+def _i64(addr: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
     return UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=addr)
 
 # ── group_sum ──────────────────────────────────────────────────────────────
 @export
-fn group_sum_f32_gpu(
+def group_sum_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ):
     @parameter
-    fn zero_out(ng: Int):
+    def zero_out(ng: Int):
         var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if tid < ng: _f32(out_addr)[tid] = 0.0
 
     @parameter
-    fn sum_shared(n: Int, ng: Int):
+    def sum_shared(n: Int, ng: Int):
         var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var t = Int(thread_idx.x)
@@ -56,7 +56,7 @@ fn group_sum_f32_gpu(
             t += BLOCK
 
     @parameter
-    fn sum_global(n: Int, ng: Int):
+    def sum_global(n: Int, ng: Int):
         var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
         for c in range(COARSE):
             var i = base + c * BLOCK
@@ -82,16 +82,16 @@ fn group_sum_f32_gpu(
 
 # ── group_min ──────────────────────────────────────────────────────────────
 @export
-fn group_min_f32_gpu(
+def group_min_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ):
     @parameter
-    fn init_out(ng: Int):
+    def init_out(ng: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < ng: _f32(out_addr)[t] = F32_MAX
 
     @parameter
-    fn min_kernel(n: Int, ng: Int):
+    def min_kernel(n: Int, ng: Int):
         var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var t = Int(thread_idx.x)
@@ -124,16 +124,16 @@ fn group_min_f32_gpu(
 
 # ── group_max ──────────────────────────────────────────────────────────────
 @export
-fn group_max_f32_gpu(
+def group_max_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ):
     @parameter
-    fn init_out(ng: Int):
+    def init_out(ng: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < ng: _f32(out_addr)[t] = F32_MIN
 
     @parameter
-    fn max_kernel(n: Int, ng: Int):
+    def max_kernel(n: Int, ng: Int):
         var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var t = Int(thread_idx.x)
@@ -166,16 +166,16 @@ fn group_max_f32_gpu(
 
 # ── group_count ────────────────────────────────────────────────────────────
 @export
-fn group_count_f32_gpu(
+def group_count_f32_gpu(
     out_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ):
     @parameter
-    fn zero_out(ng: Int):
+    def zero_out(ng: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < ng: _f32(out_addr)[t] = 0.0
 
     @parameter
-    fn count_kernel(n: Int, ng: Int):
+    def count_kernel(n: Int, ng: Int):
         var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
         for c in range(COARSE):
             var i = base + c * BLOCK
@@ -197,16 +197,16 @@ fn group_count_f32_gpu(
 
 # ── masked_global_sum ──────────────────────────────────────────────────────
 @export
-fn masked_global_sum_f32_gpu(
+def masked_global_sum_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
 ):
     @parameter
-    fn zero_out(nout: Int):
+    def zero_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < nout: _f32(out_addr)[t] = 0.0
 
     @parameter
-    fn sum_kernel(n_: Int):
+    def sum_kernel(n_: Int):
         var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -233,16 +233,16 @@ fn masked_global_sum_f32_gpu(
 
 # ── masked_global_sum_product ──────────────────────────────────────────────
 @export
-fn masked_global_sum_product_f32_gpu(
+def masked_global_sum_product_f32_gpu(
     out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int
 ):
     @parameter
-    fn zero_out(nout: Int):
+    def zero_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < nout: _f32(out_addr)[t] = 0.0
 
     @parameter
-    fn sum_kernel(n_: Int):
+    def sum_kernel(n_: Int):
         var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -270,9 +270,9 @@ fn masked_global_sum_product_f32_gpu(
 
 # ── gather ─────────────────────────────────────────────────────────────────
 @export
-fn gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
+def gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _f32(out_addr)[i] = _f32(src_addr)[Int(_i32(idx_addr)[i])]
     try:
@@ -283,9 +283,9 @@ fn gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     except: pass
 
 @export
-fn gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
+def gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _i32(out_addr)[i] = _i32(src_addr)[Int(_i32(idx_addr)[i])]
     try:
@@ -296,9 +296,9 @@ fn gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     except: pass
 
 @export
-fn gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
+def gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _i64(out_addr)[i] = _i64(src_addr)[Int(_i32(idx_addr)[i])]
     try:
@@ -310,11 +310,11 @@ fn gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
 
 # ── filter_gather ──────────────────────────────────────────────────────────
 @export
-fn filter_gather_f32_gpu(
+def filter_gather_f32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
 ):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_ and _i32(mask_addr)[i] != 0:
             _f32(out_addr)[Int(_i32(offsets_addr)[i])] = _f32(src_addr)[i]
@@ -326,11 +326,11 @@ fn filter_gather_f32_gpu(
     except: pass
 
 @export
-fn filter_gather_i32_gpu(
+def filter_gather_i32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
 ):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_ and _i32(mask_addr)[i] != 0:
             _i32(out_addr)[Int(_i32(offsets_addr)[i])] = _i32(src_addr)[i]
@@ -342,11 +342,11 @@ fn filter_gather_i32_gpu(
     except: pass
 
 @export
-fn filter_gather_i64_gpu(
+def filter_gather_i64_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
 ):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_ and _i32(mask_addr)[i] != 0:
             _i64(out_addr)[Int(_i32(offsets_addr)[i])] = _i64(src_addr)[i]
@@ -359,16 +359,16 @@ fn filter_gather_i64_gpu(
 
 # ── masked_global_min ─────────────────────────────────────────────────────
 @export
-fn masked_global_min_f32_gpu(
+def masked_global_min_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
 ):
     @parameter
-    fn init_out(nout: Int):
+    def init_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < nout: _f32(out_addr)[t] = F32_MAX
 
     @parameter
-    fn min_kernel(n_: Int):
+    def min_kernel(n_: Int):
         var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -396,16 +396,16 @@ fn masked_global_min_f32_gpu(
 
 # ── masked_global_max ─────────────────────────────────────────────────────
 @export
-fn masked_global_max_f32_gpu(
+def masked_global_max_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
 ):
     @parameter
-    fn init_out(nout: Int):
+    def init_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < nout: _f32(out_addr)[t] = F32_MIN
 
     @parameter
-    fn max_kernel(n_: Int):
+    def max_kernel(n_: Int):
         var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -452,7 +452,7 @@ fn masked_global_max_f32_gpu(
 # Outputs: out_ids[n] dense group IDs, out_ng[1] n_groups found
 # Scratch: htab[cap], htid[cap]  (kernel initialises them internally)
 @export
-fn group_encode_i32_gpu(
+def group_encode_i32_gpu(
     keys_addr: Int,
     out_ids_addr: Int,
     out_ng_addr: Int,
@@ -463,7 +463,7 @@ fn group_encode_i32_gpu(
 ):
     # Pass 1: initialise hash table slots and counter atomically
     @parameter
-    fn init_tables(cap_: Int):
+    def init_tables(cap_: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < cap_:
             _i32(htab_addr)[t] = Int32(-2147483648)  # EMPTY sentinel
@@ -473,7 +473,7 @@ fn group_encode_i32_gpu(
 
     # Pass 2: each thread claims its key slot, assigns a dense ID
     @parameter
-    fn insert(n_: Int, cap_: Int):
+    def insert(n_: Int, cap_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i >= n_: return
 
@@ -529,9 +529,9 @@ fn group_encode_i32_gpu(
 # ── unique_mask ────────────────────────────────────────────────────────────
 # Mark out[i]=1 where sorted keys[i] != keys[i-1] (first in run).
 @export
-fn unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
+def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
     @parameter
-    fn kernel(n_: Int):
+    def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_:
             if i == 0:

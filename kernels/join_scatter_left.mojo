@@ -1,20 +1,19 @@
 import compiler
-from math import ceildiv
-from gpu import WARP_SIZE, block_dim, block_idx, thread_idx
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
 comptime idx_dtype = DType.int32
-alias LEFT_NO_MATCH = Int32(-1)
+comptime LEFT_NO_MATCH = Int32(-1)
 
-fn _join_scatter_left_cpu(
-    left_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    right_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
+def _join_scatter_left_cpu(
+    left_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    right_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
 ):
     var n_left = left_keys.dim_size(0)
     var n_right = right_keys.dim_size(0)
@@ -62,25 +61,25 @@ fn _join_scatter_left_cpu(
                 left_out[base_offset + j] = Int32(i)
                 right_out[base_offset + j] = right_positions[rs + j]
 
-fn _join_scatter_left_gpu(
-    left_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    right_out: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    left_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    right_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    offsets: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    right_sorted_idx: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    right_key_starts: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    right_key_counts: ManagedTensorSlice[dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _join_scatter_left_gpu(
+    left_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    right_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    right_sorted_idx: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    right_key_starts: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    right_key_counts: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     var n_left = left_keys.dim_size(0)
     if n_left == 0:
         return
     @parameter
-    fn scatter_kernel(n_left: Int):
+    def scatter_kernel(n_left: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid >= UInt(n_left):
+        if Int(tid) >= n_left:
             return
         var i = Int(tid)
         var k = Int(left_keys[i])
@@ -94,7 +93,7 @@ fn _join_scatter_left_gpu(
             for j in range(rc):
                 left_out[base_offset + j]  = Int32(i)
                 right_out[base_offset + j] = right_sorted_idx[rs + j]
-    ctx.get_device_context().enqueue_function_experimental[scatter_kernel](
+    ctx.enqueue_function[scatter_kernel](
         n_left,
         grid_dim=ceildiv(n_left, BLOCK_SIZE),
         block_dim=BLOCK_SIZE,
@@ -103,15 +102,15 @@ fn _join_scatter_left_gpu(
 @compiler.register("join_scatter_left_cpu")
 struct JoinScatterLeftCPU:
     @staticmethod
-    fn execute[target: StaticString](
+    def execute[target: StaticString](
         left_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         right_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         right_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         offsets: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _join_scatter_left_cpu(left_out, right_out, left_keys, right_keys, offsets)
         else:
@@ -120,7 +119,7 @@ struct JoinScatterLeftCPU:
 @compiler.register("join_scatter_left_gpu")
 struct JoinScatterLeftGPU:
     @staticmethod
-    fn execute[target: StaticString](
+    def execute[target: StaticString](
         left_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         right_out: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         left_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
@@ -129,9 +128,9 @@ struct JoinScatterLeftGPU:
         right_sorted_idx: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         right_key_starts: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         right_key_counts: InputTensor[dtype=idx_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "gpu":
             _join_scatter_left_gpu(
                 left_out, right_out, left_keys, right_keys,

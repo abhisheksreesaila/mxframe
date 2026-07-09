@@ -1,8 +1,8 @@
 import compiler
-from math import ceildiv
-from gpu import WARP_SIZE, block_dim, block_idx, thread_idx
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
 comptime idx_dtype = DType.int32
@@ -10,10 +10,10 @@ comptime idx_dtype = DType.int32
 
 # ── CPU: merge sort producing sorted index permutation ───────────────────────
 
-fn _sort_indices_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    descending_flag: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
+def _sort_indices_cpu(
+    output: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    descending_flag: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
 ):
     """Produce sorted index permutation of `keys`.
 
@@ -43,9 +43,9 @@ fn _sort_indices_cpu(
         width *= 2
 
 
-fn _merge(
-    idx: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+def _merge(
+    idx: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
     left: Int, mid: Int, right: Int,
     desc: Bool,
 ):
@@ -76,11 +76,11 @@ fn _merge(
 
 # ── GPU: bitonic sort producing sorted index permutation ─────────────────────
 
-fn _sort_indices_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=idx_dtype, rank=1, io_spec=_, static_spec=_],
-    keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    descending_flag: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _sort_indices_gpu(
+    output: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
+    keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    descending_flag: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     var n = keys.dim_size(0)
@@ -90,13 +90,13 @@ fn _sort_indices_gpu(
 
     # 1. Initialise output indices
     @parameter
-    fn init_kernel(n: Int):
+    def init_kernel(n: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(n):
+        if Int(tid) < n:
             output[Int(tid)] = Int32(Int(tid))
 
     var init_blocks = ceildiv(n, BLOCK_SIZE)
-    ctx.get_device_context().enqueue_function_experimental[init_kernel](
+    ctx.enqueue_function[init_kernel](
         n,
         grid_dim=init_blocks,
         block_dim=BLOCK_SIZE,
@@ -114,7 +114,7 @@ fn _sort_indices_gpu(
         var j = k >> 1
         while j > 0:
             @parameter
-            fn bitonic_step_kernel(n: Int, k_val: Int, j_val: Int):
+            def bitonic_step_kernel(n: Int, k_val: Int, j_val: Int):
                 var tid = block_dim.x * block_idx.x + thread_idx.x
                 var i = Int(tid)
                 if i >= n:
@@ -147,7 +147,7 @@ fn _sort_indices_gpu(
                     output[partner] = Int32(idx_i)
 
             var step_blocks = ceildiv(n, BLOCK_SIZE)
-            ctx.get_device_context().enqueue_function_experimental[bitonic_step_kernel](
+            ctx.enqueue_function[bitonic_step_kernel](
                 n,
                 k,
                 j,
@@ -161,15 +161,15 @@ fn _sort_indices_gpu(
 @compiler.register("sort_indices")
 struct SortIndices:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=idx_dtype, rank=1, static_spec=_],
         keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
         descending_flag: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _sort_indices_cpu(output, keys, descending_flag)
         elif target == "gpu":

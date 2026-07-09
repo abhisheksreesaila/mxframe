@@ -1,8 +1,8 @@
 import compiler
-from math import ceildiv
-from gpu import block_dim, block_idx, thread_idx
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
 comptime mask_dtype = DType.int32
@@ -10,9 +10,9 @@ comptime mask_dtype = DType.int32
 
 # ── CPU: mark first occurrence of each unique value in a SORTED array ────────
 
-fn _unique_mask_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
-    sorted_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
+def _unique_mask_cpu(
+    output: OutputTensor[dtype=mask_dtype, rank=1, static_spec=_],
+    sorted_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
 ):
     """Given a sorted key array, output[i] = 1 if sorted_keys[i] is the first
     occurrence of that value, else 0.
@@ -35,10 +35,10 @@ fn _unique_mask_cpu(
 
 # ── GPU: parallel adjacent-difference to detect unique boundaries ────────────
 
-fn _unique_mask_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
-    sorted_keys: ManagedTensorSlice[dtype=key_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _unique_mask_gpu(
+    output: OutputTensor[dtype=mask_dtype, rank=1, static_spec=_],
+    sorted_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     var n = sorted_keys.dim_size(0)
@@ -47,9 +47,9 @@ fn _unique_mask_gpu(
         return
 
     @parameter
-    fn unique_kernel(n: Int):
+    def unique_kernel(n: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid >= UInt(n):
+        if Int(tid) >= n:
             return
         var i = Int(tid)
         if i == 0:
@@ -61,7 +61,7 @@ fn _unique_mask_gpu(
                 output[i] = 0
 
     var blocks = ceildiv(n, BLOCK_SIZE)
-    ctx.get_device_context().enqueue_function_experimental[unique_kernel](
+    ctx.enqueue_function[unique_kernel](
         n,
         grid_dim=blocks,
         block_dim=BLOCK_SIZE,
@@ -71,14 +71,14 @@ fn _unique_mask_gpu(
 @compiler.register("unique_mask")
 struct UniqueMask:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=mask_dtype, rank=1, static_spec=_],
         sorted_keys: InputTensor[dtype=key_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _unique_mask_cpu(output, sorted_keys)
         elif target == "gpu":

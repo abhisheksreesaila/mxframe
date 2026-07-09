@@ -27,15 +27,15 @@ comptime F32_MIN: Float32 = -3.4028234663852886e+38
 # ─────────────────────────────────────────────────────────────────────────────
 
 @always_inline
-fn _f32(addr: Int) -> UnsafePointer[F32, MutAnyOrigin]:
+def _f32(addr: Int) -> UnsafePointer[F32, MutAnyOrigin]:
     return UnsafePointer[F32, MutAnyOrigin](unsafe_from_address=addr)
 
 @always_inline
-fn _i32(addr: Int) -> UnsafePointer[I32, MutAnyOrigin]:
+def _i32(addr: Int) -> UnsafePointer[I32, MutAnyOrigin]:
     return UnsafePointer[I32, MutAnyOrigin](unsafe_from_address=addr)
 
 @always_inline
-fn _i64(addr: Int) -> UnsafePointer[I64, MutAnyOrigin]:
+def _i64(addr: Int) -> UnsafePointer[I64, MutAnyOrigin]:
     return UnsafePointer[I64, MutAnyOrigin](unsafe_from_address=addr)
 
 
@@ -44,7 +44,7 @@ fn _i64(addr: Int) -> UnsafePointer[I64, MutAnyOrigin]:
 # out[labels[i]] += values[i]  for i in 0..n_rows
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_sum_f32(
+def group_sum_f32(
     out_addr:    Int,
     values_addr: Int,
     labels_addr: Int,
@@ -66,7 +66,7 @@ fn group_sum_f32(
 # group_sum_i64
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_sum_i64(
+def group_sum_i64(
     out_addr:    Int,
     values_addr: Int,
     labels_addr: Int,
@@ -89,7 +89,7 @@ fn group_sum_i64(
 # out[labels[i]] = min(out[labels[i]], values[i])
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_min_f32(
+def group_min_f32(
     out_addr:    Int,
     values_addr: Int,
     labels_addr: Int,
@@ -113,7 +113,7 @@ fn group_min_f32(
 # group_max_f32
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_max_f32(
+def group_max_f32(
     out_addr:    Int,
     values_addr: Int,
     labels_addr: Int,
@@ -139,7 +139,7 @@ fn group_max_f32(
 # out_sum[g] receives the mean; out_count (scratch) is int-sized counts.
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_mean_f32(
+def group_mean_f32(
     out_addr:      Int,
     count_addr:    Int,   # scratch: Int32 counts, length n_groups
     values_addr:   Int,
@@ -168,7 +168,7 @@ fn group_mean_f32(
 # group_count_f32  (output is float32 counts for consistency with MAX Graph)
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_count_f32(
+def group_count_f32(
     out_addr:    Int,
     labels_addr: Int,
     n_rows:      Int,
@@ -189,7 +189,7 @@ fn group_count_f32(
 # out[i] = k0[i]*s0 + k1[i]*s1 + k2[i]*s2 + k3[i]*s3  (int64)
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn group_composite(
+def group_composite(
     out_addr:     Int,
     k0_addr:      Int,
     k1_addr:      Int,
@@ -217,7 +217,7 @@ fn group_composite(
 # result[0] = sum(values[i] where mask[i] != 0)
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn masked_global_sum_f32(
+def masked_global_sum_f32(
     out_addr:    Int,
     values_addr: Int,
     mask_addr:   Int,
@@ -237,7 +237,7 @@ fn masked_global_sum_f32(
 # masked_global_min_f32
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn masked_global_min_f32(
+def masked_global_min_f32(
     out_addr:    Int,
     values_addr: Int,
     mask_addr:   Int,
@@ -259,7 +259,7 @@ fn masked_global_min_f32(
 # masked_global_max_f32
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn masked_global_max_f32(
+def masked_global_max_f32(
     out_addr:    Int,
     values_addr: Int,
     mask_addr:   Int,
@@ -282,7 +282,7 @@ fn masked_global_max_f32(
 # result[0] = sum(values_a[i] * values_b[i] where mask[i] != 0)
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn masked_global_sum_product_f32(
+def masked_global_sum_product_f32(
     out_addr:      Int,
     values_a_addr: Int,
     values_b_addr: Int,
@@ -304,7 +304,7 @@ fn masked_global_sum_product_f32(
 # gather_f32   output[i] = values[indices[i]]
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn gather_f32(
+def gather_f32(
     out_addr:     Int,
     values_addr:  Int,
     indices_addr: Int,
@@ -321,7 +321,7 @@ fn gather_f32(
 # gather_i32
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn gather_i32(
+def gather_i32(
     out_addr:     Int,
     values_addr:  Int,
     indices_addr: Int,
@@ -338,7 +338,7 @@ fn gather_i32(
 # gather_i64
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn gather_i64(
+def gather_i64(
     out_addr:     Int,
     values_addr:  Int,
     indices_addr: Int,
@@ -357,7 +357,7 @@ fn gather_i64(
 # descending: 0 = ascending, 1 = descending
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _merge_sort(idx: UnsafePointer[I32, MutAnyOrigin],
+def _merge_sort(idx: UnsafePointer[I32, MutAnyOrigin],
                keys: UnsafePointer[I32, MutAnyOrigin],
                left: Int, mid: Int, right: Int, desc: Bool):
     """In-place stable merge of idx[left..mid) and idx[mid..right)."""
@@ -383,7 +383,7 @@ fn _merge_sort(idx: UnsafePointer[I32, MutAnyOrigin],
         i += 1
 
 @export
-fn sort_indices(
+def sort_indices(
     out_addr:   Int,
     keys_addr:  Int,
     n:          Int,
@@ -414,7 +414,7 @@ fn sort_indices(
 # output[i] = 1 if sorted_keys[i] is the first occurrence of that value, else 0
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn unique_mask(
+def unique_mask(
     out_addr:  Int,
     keys_addr: Int,
     n:         Int,
@@ -437,7 +437,7 @@ fn unique_mask(
 # offsets[n] = total count.
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn prefix_sum_count(
+def prefix_sum_count(
     offsets_addr: Int,   # int32[n+1]
     mask_addr:    Int,   # int32[n]
     n:            Int,
@@ -454,7 +454,7 @@ fn prefix_sum_count(
 # output[offsets[i]] = values[i]  where mask[i] == 1
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn filter_gather_f32(
+def filter_gather_f32(
     out_addr:     Int,
     values_addr:  Int,
     mask_addr:    Int,
@@ -474,7 +474,7 @@ fn filter_gather_f32(
 # filter_gather_i32
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn filter_gather_i32(
+def filter_gather_i32(
     out_addr:     Int,
     values_addr:  Int,
     mask_addr:    Int,
@@ -494,7 +494,7 @@ fn filter_gather_i32(
 # filter_gather_i64
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn filter_gather_i64(
+def filter_gather_i64(
     out_addr:     Int,
     values_addr:  Int,
     mask_addr:    Int,
@@ -515,7 +515,7 @@ fn filter_gather_i64(
 # For each left row: match_counts[i] = number of right rows with same key
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn join_count(
+def join_count(
     match_counts_addr: Int,   # int32[n_left]
     left_keys_addr:    Int,   # int32[n_left]
     right_keys_addr:   Int,   # int32[n_right]
@@ -547,7 +547,7 @@ fn join_count(
 # Emit (left_index, right_index) pairs given prefix-sum offsets
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn join_scatter(
+def join_scatter(
     left_out_addr:   Int,   # int32[total_matches]
     right_out_addr:  Int,   # int32[total_matches]
     left_keys_addr:  Int,   # int32[n_left]
@@ -606,7 +606,7 @@ fn join_scatter(
 # match_counts[i] = max(1, number of right matches) — unmatched left rows get 1
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn join_count_left(
+def join_count_left(
     match_counts_addr: Int,
     left_keys_addr:    Int,
     right_keys_addr:   Int,
@@ -638,7 +638,7 @@ fn join_count_left(
 # Like join_scatter but unmatched left rows emit right_index = -1
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-fn join_scatter_left(
+def join_scatter_left(
     left_out_addr:   Int,
     right_out_addr:  Int,
     left_keys_addr:  Int,

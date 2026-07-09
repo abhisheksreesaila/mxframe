@@ -1,8 +1,8 @@
 import compiler
-from math import ceildiv
-from gpu import block_dim, block_idx, thread_idx
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 # ── Fused composite group-key encoding ───────────────────────────────────────
 #
@@ -20,13 +20,13 @@ from tensor import InputTensor, ManagedTensorSlice, OutputTensor
 # achieving 4x better memory bandwidth utilisation.
 
 
-fn _group_composite_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
-    k0: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    k1: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    k2: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    k3: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    strides: ManagedTensorSlice[dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
+def _group_composite_cpu(
+    output: OutputTensor[dtype=DType.int64, rank=1, static_spec=_],
+    k0: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    k1: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    k2: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    k3: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    strides: InputTensor[dtype=DType.int64, rank=1, static_spec=_],
 ):
     var n = k0.dim_size(0)
     var s0 = strides[0]
@@ -39,14 +39,14 @@ fn _group_composite_cpu(
         output[i] = v
 
 
-fn _group_composite_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
-    k0: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    k1: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    k2: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    k3: ManagedTensorSlice[dtype=DType.int32, rank=1, io_spec=_, static_spec=_],
-    strides: ManagedTensorSlice[dtype=DType.int64, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _group_composite_gpu(
+    output: OutputTensor[dtype=DType.int64, rank=1, static_spec=_],
+    k0: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    k1: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    k2: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    k3: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
+    strides: InputTensor[dtype=DType.int64, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     comptime BLOCK_SIZE = 256
     var n = k0.dim_size(0)
@@ -56,15 +56,15 @@ fn _group_composite_gpu(
     var s3 = strides[3]
 
     @parameter
-    fn composite_kernel(n: Int):
+    def composite_kernel(n: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid >= UInt(n):
+        if Int(tid) >= n:
             return
         var i = Int(tid)
         output[i] = Int64(k0[i]) * s0 + Int64(k1[i]) * s1 + Int64(k2[i]) * s2 + Int64(k3[i]) * s3
 
     var blocks = ceildiv(n, BLOCK_SIZE)
-    ctx.get_device_context().enqueue_function_experimental[composite_kernel](
+    ctx.enqueue_function[composite_kernel](
         n,
         grid_dim=blocks,
         block_dim=BLOCK_SIZE,
@@ -74,7 +74,7 @@ fn _group_composite_gpu(
 @compiler.register("group_composite")
 struct GroupComposite:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=DType.int64, rank=1, static_spec=_],
@@ -83,9 +83,9 @@ struct GroupComposite:
         k2: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         k3: InputTensor[dtype=DType.int32, rank=1, static_spec=_],
         strides: InputTensor[dtype=DType.int64, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _group_composite_cpu(output, k0, k1, k2, k3, strides)
         elif target == "gpu":

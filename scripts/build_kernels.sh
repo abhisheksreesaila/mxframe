@@ -18,6 +18,7 @@ trap cleanup EXIT
 
 echo "── Staging kernels in $STAGE_DIR ──"
 cp "$SRC_DIR/__init__.mojo" "$STAGE_DIR/__init__.mojo"
+cp "$SRC_DIR/_atomic.mojo" "$STAGE_DIR/_atomic.mojo"
 cp "$SRC_DIR/group_sum.mojo" "$STAGE_DIR/group_sum.mojo"
 cp "$SRC_DIR/group_min.mojo" "$STAGE_DIR/group_min.mojo"
 cp "$SRC_DIR/group_max.mojo" "$STAGE_DIR/group_max.mojo"

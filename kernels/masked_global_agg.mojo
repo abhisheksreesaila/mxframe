@@ -14,13 +14,13 @@ Registered ops:
 """
 
 import compiler
-from math import ceildiv
-from gpu import block_dim, block_idx, thread_idx, barrier
-from gpu.memory import AddressSpace
-from memory import stack_allocation
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import InputTensor, ManagedTensorSlice, OutputTensor
+from std.math import ceildiv
+from std.gpu import block_dim, block_idx, thread_idx, barrier
+from std.gpu.memory import AddressSpace
+from std.memory import stack_allocation
+from ._atomic import Atomic
+from std.gpu.host import DeviceContext
+from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime val_dtype = DType.float32
 comptime mask_dtype = DType.int32
@@ -33,10 +33,10 @@ comptime BLOCK_SIZE = 256
 # GPU: per-block tree reduction, blocks atomically add partial sums to output[0].
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _masked_global_sum_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
+def _masked_global_sum_cpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
 ):
     var n = values.dim_size(0)
     var acc: Scalar[val_dtype] = 0.0
@@ -46,23 +46,23 @@ fn _masked_global_sum_cpu(
     output[0] = acc
 
 
-fn _masked_global_sum_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _masked_global_sum_gpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     var n = values.dim_size(0)
 
     # Zero the single-element output before block reductions add into it.
     # Follows the zero_kernel pattern from group_sum.mojo (takes a launch arg).
     @parameter
-    fn zero_out(n_out: Int):
+    def zero_out(n_out: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(n_out):
+        if Int(tid) < n_out:
             output[Int(tid)] = Scalar[val_dtype](0.0)
 
-    ctx.get_device_context().enqueue_function_experimental[zero_out](
+    ctx.enqueue_function[zero_out](
         1, grid_dim=1, block_dim=BLOCK_SIZE
     )
 
@@ -72,7 +72,7 @@ fn _masked_global_sum_gpu(
     var num_blocks = ceildiv(n, BLOCK_SIZE)
 
     @parameter
-    fn sum_kernel(n: Int):
+    def sum_kernel(n: Int):
         var shared = stack_allocation[
             BLOCK_SIZE, Scalar[val_dtype], address_space=AddressSpace.SHARED
         ]()
@@ -98,7 +98,7 @@ fn _masked_global_sum_gpu(
         if tid == 0:
             _ = Atomic.fetch_add(output.unsafe_ptr(), shared[0])
 
-    ctx.get_device_context().enqueue_function_experimental[sum_kernel](
+    ctx.enqueue_function[sum_kernel](
         n, grid_dim=num_blocks, block_dim=BLOCK_SIZE
     )
 
@@ -106,15 +106,15 @@ fn _masked_global_sum_gpu(
 @compiler.register("masked_global_sum")
 struct MaskedGlobalSum:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
         values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
         mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _masked_global_sum_cpu(output, values, mask)
         elif target == "gpu":
@@ -129,10 +129,10 @@ struct MaskedGlobalSum:
 # For rare global-min queries this is acceptable; sum is the primary hot path.
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _masked_global_min_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
+def _masked_global_min_cpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
 ):
     var n = values.dim_size(0)
     # 3.4028235e+38 is the maximum finite float32 value.
@@ -146,13 +146,13 @@ fn _masked_global_min_cpu(
 @compiler.register("masked_global_min")
 struct MaskedGlobalMin:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
         values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
         mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
         # Both paths use the CPU sequential loop (correct on all targets).
         _masked_global_min_cpu(output, values, mask)
@@ -163,10 +163,10 @@ struct MaskedGlobalMin:
 # CPU-only fast path; same rationale as masked_global_min.
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _masked_global_max_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    values: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
+def _masked_global_max_cpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
 ):
     var n = values.dim_size(0)
     # -3.4028235e+38 is the minimum finite float32 value.
@@ -180,13 +180,13 @@ fn _masked_global_max_cpu(
 @compiler.register("masked_global_max")
 struct MaskedGlobalMax:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
         values: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
         mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
         # Both paths use the CPU sequential loop (correct on all targets).
         _masked_global_max_cpu(output, values, mask)
@@ -203,11 +203,11 @@ struct MaskedGlobalMax:
 # Usage: for plans of the form  sum(col_a * col_b)  filtered by a WHERE clause.
 # ─────────────────────────────────────────────────────────────────────────────
 
-fn _masked_global_sum_product_cpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    col_a: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    col_b: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
+def _masked_global_sum_product_cpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    col_a: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    col_b: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
 ):
     var n = col_a.dim_size(0)
     var acc: Scalar[val_dtype] = 0.0
@@ -217,22 +217,22 @@ fn _masked_global_sum_product_cpu(
     output[0] = acc
 
 
-fn _masked_global_sum_product_gpu(
-    output: ManagedTensorSlice[mut=True, dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    col_a: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    col_b: ManagedTensorSlice[dtype=val_dtype, rank=1, io_spec=_, static_spec=_],
-    mask: ManagedTensorSlice[dtype=mask_dtype, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
+def _masked_global_sum_product_gpu(
+    output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    col_a: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    col_b: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
+    mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
+    ctx: DeviceContext,
 ) raises:
     var n = col_a.dim_size(0)
 
     @parameter
-    fn zero_out(n_out: Int):
+    def zero_out(n_out: Int):
         var tid = block_dim.x * block_idx.x + thread_idx.x
-        if tid < UInt(n_out):
+        if Int(tid) < n_out:
             output[Int(tid)] = Scalar[val_dtype](0.0)
 
-    ctx.get_device_context().enqueue_function_experimental[zero_out](
+    ctx.enqueue_function[zero_out](
         1, grid_dim=1, block_dim=BLOCK_SIZE
     )
 
@@ -242,7 +242,7 @@ fn _masked_global_sum_product_gpu(
     var num_blocks = ceildiv(n, BLOCK_SIZE)
 
     @parameter
-    fn sum_product_kernel(n: Int):
+    def sum_product_kernel(n: Int):
         var shared = stack_allocation[
             BLOCK_SIZE, Scalar[val_dtype], address_space=AddressSpace.SHARED
         ]()
@@ -265,7 +265,7 @@ fn _masked_global_sum_product_gpu(
         if tid == 0:
             _ = Atomic.fetch_add(output.unsafe_ptr(), shared[0])
 
-    ctx.get_device_context().enqueue_function_experimental[sum_product_kernel](
+    ctx.enqueue_function[sum_product_kernel](
         n, grid_dim=num_blocks, block_dim=BLOCK_SIZE
     )
 
@@ -273,16 +273,16 @@ fn _masked_global_sum_product_gpu(
 @compiler.register("masked_global_sum_product")
 struct MaskedGlobalSumProduct:
     @staticmethod
-    fn execute[
+    def execute[
         target: StaticString,
     ](
         output: OutputTensor[dtype=val_dtype, rank=1, static_spec=_],
         col_a: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
         col_b: InputTensor[dtype=val_dtype, rank=1, static_spec=_],
         mask: InputTensor[dtype=mask_dtype, rank=1, static_spec=_],
-        ctx: DeviceContextPtr,
+        ctx: DeviceContext,
     ) raises:
-        @parameter
+        comptime
         if target == "cpu":
             _masked_global_sum_product_cpu(output, col_a, col_b, mask)
         elif target == "gpu":
