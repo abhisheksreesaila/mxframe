@@ -1719,49 +1719,66 @@ class CustomOpsCompiler(GraphCompiler):
             composite += idx * strides[i]
         return composite
 
-    def _apply_sort_custom(self, table: pa.Table, sort_node: Sort) -> pa.Table:
+    def _apply_sort_custom(self, table: pa.Table, sort_node: Sort, topk: int = None) -> pa.Table:
         """Sort an Arrow table by integer composite key.
 
         CPU: pure numpy argsort -- no MAX Graph overhead.
-        GPU: Mojo bitonic sort kernel via MAX Graph, model cached by N.
+        GPU (Phase 5): AOT bitonic sort kernel (sort_topk_i32_gpu) + AOT gather.
+          Falls back to MAX Graph sort_indices kernel when _aot_gpu is None.
+
+        topk: if set, only return the first topk sorted rows (ORDER BY ... LIMIT topk).
         """
         composite_key = self._encode_sort_key(table, sort_node.by, sort_node.descending)
         N = len(composite_key)
+        k = topk if topk is not None and topk < N else N
 
         if self._session_device != "gpu":
             # CPU fast path: numpy argsort, no graph compilation
-            sorted_indices = np.argsort(composite_key, kind='stable')
+            if k < N:
+                # Partial sort: np.argpartition + sort of k elements
+                part_idx = np.argpartition(composite_key, k)[:k]
+                sorted_indices = part_idx[np.argsort(composite_key[part_idx], kind='stable')]
+            else:
+                sorted_indices = np.argsort(composite_key, kind='stable')
             return table.take(pa.array(sorted_indices.astype(np.int64)))
-        else:
-            # GPU path: Mojo bitonic sort, model cached by N
-            cache_key = ("sort_indices", N, self._session_device)
-            model = _POST_OP_MODEL_CACHE.get(cache_key)
-            if model is None:
-                key_type = TensorType(DType.int32, [N], self._device_ref)
-                flag_type = TensorType(DType.int32, [1], self._device_ref)
-                graph = Graph(
-                    name="mxframe_sort",
-                    input_types=[key_type, flag_type],
-                    custom_extensions=[Path(self.kernels_path)],
-                )
-                with graph:
-                    indices = ops.custom(
-                        name="sort_indices",
-                        values=[graph.inputs[0], graph.inputs[1]],
-                        out_types=[TensorType(DType.int32, [N], self._device_ref)],
-                        device=self._device_ref,
-                    )[0]
-                    graph.output(indices)
-                model = self._session.load(graph)
-                _POST_OP_MODEL_CACHE[cache_key] = model
-            desc_flag = np.array([0], dtype=np.int32)
-            k_buf = driver.Buffer.from_numpy(composite_key).to(self._gpu_driver)
-            f_buf = driver.Buffer.from_numpy(desc_flag).to(self._gpu_driver)
-            (out_idx,) = model.execute(k_buf, f_buf)
-            # sorted_indices stays on GPU; use gather_f32/gather_i32 kernels
-            # per column to reorder rows without pulling indices back to CPU.
-            # Falls back to CPU Arrow.take for non-float32/int32 columns.
-            return self._gpu_gather_table(table, out_idx, N)
+
+        # ── GPU path ────────────────────────────────────────────────────────
+        # Phase 5: prefer AOT GPU sort (no JIT, cached key array, AOT gather)
+        if self._aot_gpu is not None:
+            sorted_indices = self._aot_gpu.sort_topk(
+                composite_key, k=k,
+                descending=False,  # _encode_sort_key already flips keys for descending
+            )
+            return self._aot_gpu.gather_table(table, sorted_indices)
+
+        # Fallback: MAX Graph bitonic sort + numpy gather
+        cache_key = ("sort_indices", N, self._session_device)
+        model = _POST_OP_MODEL_CACHE.get(cache_key)
+        if model is None:
+            key_type = TensorType(DType.int32, [N], self._device_ref)
+            flag_type = TensorType(DType.int32, [1], self._device_ref)
+            graph = Graph(
+                name="mxframe_sort",
+                input_types=[key_type, flag_type],
+                custom_extensions=[Path(self.kernels_path)],
+            )
+            with graph:
+                indices = ops.custom(
+                    name="sort_indices",
+                    values=[graph.inputs[0], graph.inputs[1]],
+                    out_types=[TensorType(DType.int32, [N], self._device_ref)],
+                    device=self._device_ref,
+                )[0]
+                graph.output(indices)
+            model = self._session.load(graph)
+            _POST_OP_MODEL_CACHE[cache_key] = model
+        desc_flag = np.array([0], dtype=np.int32)
+        k_buf = driver.Buffer.from_numpy(composite_key).to(self._gpu_driver)
+        f_buf = driver.Buffer.from_numpy(desc_flag).to(self._gpu_driver)
+        (out_idx,) = model.execute(k_buf, f_buf)
+        # Download indices and gather on CPU (original MAX Graph gather was broken)
+        idx_np = np.asarray(out_idx.to_numpy()).reshape(-1).astype(np.int32)
+        return table.take(pa.array(idx_np.astype(np.int64)))
 
     def _gpu_gather_table(self, table: pa.Table, idx_tensor, N: int) -> pa.Table:
         """Gather rows of `table` using an index tensor already on GPU.
@@ -1902,15 +1919,29 @@ class CustomOpsCompiler(GraphCompiler):
 
     def _apply_post_ops_custom(self, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct using Mojo kernels (not PyArrow compute)."""
-        for node in post_ops:
+        i = 0
+        while i < len(post_ops):
+            node = post_ops[i]
             if isinstance(node, Sort):
-                table = self._apply_sort_custom(table, node)
+                # Peek ahead: if next op is a Limit, pass k to sort_topk (Phase 5)
+                next_node = post_ops[i + 1] if i + 1 < len(post_ops) else None
+                k = next_node.n if isinstance(next_node, Limit) else None
+                table = self._apply_sort_custom(table, node, topk=k)
+                i += 1
+                # If we pre-applied the limit via topk, skip the Limit node
+                if k is not None and isinstance(next_node, Limit):
+                    i += 1   # consume the Limit — sort already returned k rows
             elif isinstance(node, Limit):
                 table = table.slice(0, node.n)
+                i += 1
             elif isinstance(node, Distinct):
                 table = self._apply_distinct_custom(table, node)
+                i += 1
             elif isinstance(node, Tail):
                 table = table.slice(max(0, table.num_rows - node.n), node.n)
+                i += 1
+            else:
+                i += 1
         return table
 
 

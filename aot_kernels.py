@@ -475,6 +475,10 @@ class AOTKernelsGPU:
         _js  = [_P64, _P64, _P64, _P64, _P64, _P64, _P64, _I64, _I64]
         self._join_count_gpu   = _bind_gpu(L, "join_count_i32_gpu",   _jc)
         self._join_scatter_gpu = _bind_gpu(L, "join_scatter_i32_gpu", _js)
+        # sort (Phase 5 — GPU bitonic sort for ORDER BY ... LIMIT)
+        # sort_topk: (out_idx, keys, n, desc_flag)
+        _st  = [_P64, _P64, _I64, _I64]
+        self._sort_topk_gpu = _bind_gpu(L, "sort_topk_i32_gpu", _st)
 
     # ── GPU memory helpers ──────────────────────────────────────────────────
 
@@ -850,6 +854,42 @@ class AOTKernelsGPU:
 
         self._cu.free(idx_dev)
         return pa.Table.from_arrays(arrays, names=names)
+
+    def sort_topk(
+        self,
+        keys: np.ndarray,
+        k: int,
+        descending: bool = False,
+    ) -> np.ndarray:
+        """GPU bitonic sort → return top-k sorted row indices as int32 numpy array.
+
+        Runs a full GPU bitonic sort of the key array, then downloads the first k
+        indices.  For large N (>100K), the GPU sort is significantly faster than
+        CPU NumPy argsort.
+
+        Args:
+            keys:       int32 sort-key array of length N
+            k:          number of top elements to return (1 ≤ k ≤ N)
+            descending: if True, return indices of the k *largest* keys
+
+        Returns:
+            int32 numpy array of length k: row indices in sorted order.
+        """
+        keys_i32 = self._c(keys, np.int32)
+        n = len(keys_i32)
+        k = min(k, n)
+        keys_dev = self._cached_upload(keys_i32)
+        out_dev   = self._cu.malloc(n * 4)
+        self._sort_topk_gpu(
+            self._ptr(out_dev), self._ptr(keys_dev),
+            n, int(descending),
+        )
+        self._cu.sync()
+        # Download only the first k indices to minimize D2H bandwidth.
+        # After a full ascending sort the smallest k values are at [0..k-1].
+        top_k = self._download(out_dev, np.int32, k)
+        self._cu.free(out_dev)
+        return top_k
 
     def filter_gather_f32(self, src: np.ndarray, mask: np.ndarray,
                            offsets: np.ndarray, n_out: int) -> np.ndarray:

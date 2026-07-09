@@ -545,8 +545,68 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
         ctx.synchronize()
     except: pass
 
-# ── join_count_i32 ─────────────────────────────────────────────────────────
-# Two-pass GPU hash join — Phase 1: count right-key matches per left row.
+# ── sort_topk_i32 ─────────────────────────────────────────────────────────
+# Full GPU bitonic sort producing a sorted index permutation.
+# Caller takes out_addr[0..k-1] for top-k, or the full array for full sort.
+#
+# out_addr  int32[n]   output: sorted row indices
+# keys_addr int32[n]   input:  sort keys
+# n                    number of elements
+# desc_flag            0 = ascending, 1 = descending
+@export
+def sort_topk_i32_gpu(
+    out_addr:  Int,
+    keys_addr: Int,
+    n:         Int,
+    desc_flag: Int,
+):
+    @parameter
+    def init_kernel(n_: Int):
+        var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if tid < n_:
+            _i32(out_addr)[tid] = Int32(tid)
+
+    @parameter
+    def bitonic_step(n_: Int, k_val: Int, j_val: Int, desc_: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i >= n_:
+            return
+        var partner = i ^ j_val
+        if partner <= i or partner >= n_:
+            return
+        # Ascending in first half of each k-block; flip if descending requested
+        var want_asc = ((i & k_val) == 0)
+        if desc_ != 0:
+            want_asc = not want_asc
+        var idx_i = Int(_i32(out_addr)[i])
+        var idx_p = Int(_i32(out_addr)[partner])
+        var ki = _i32(keys_addr)[idx_i]
+        var kp = _i32(keys_addr)[idx_p]
+        if (want_asc and ki > kp) or (not want_asc and ki < kp):
+            _i32(out_addr)[i]       = Int32(idx_p)
+            _i32(out_addr)[partner] = Int32(idx_i)
+
+    try:
+        var ctx = DeviceContext()
+        ctx.enqueue_function_experimental[init_kernel](
+            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        # Find next power of 2 >= n
+        var padded = 1
+        while padded < n:
+            padded *= 2
+        var k = 2
+        while k <= padded:
+            var j = k >> 1
+            while j > 0:
+                ctx.enqueue_function_experimental[bitonic_step](
+                    n, k, j, desc_flag,
+                    grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+                j >>= 1
+            k <<= 1
+        ctx.synchronize()
+    except: pass
+
+# ── join_count_i32 ─────────────────────────────────────────────────────────# Two-pass GPU hash join — Phase 1: count right-key matches per left row.
 #
 # Algorithm:
 #  1. Atomically increment table[right_key[j]] for each j in 0..n_right.
