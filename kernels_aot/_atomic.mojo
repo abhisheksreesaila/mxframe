@@ -1,128 +1,95 @@
 """
 _atomic.mojo — Mojo 26.4 drop-in for `from os.atomic import Atomic`.
+Uses MLIR llvm.atomicrmw / llvm.cmpxchg — works in both mojo package
+and mojo build --emit shared-lib (including GPU shared memory via addrspacecast).
 
-std.os.atomic is absent from the MAX 26.4 consumer build.
-This shim uses vendor-specific LLVM/PTX intrinsics dispatched at compile time.
+AtomicBinOp: add=1(int), fadd=11, fmax=13, fmin=14
+AtomicOrdering: monotonic=2, seq_cst=7
 """
 
-from std.sys import is_nvidia_gpu, is_amd_gpu
 from std.gpu.memory import AddressSpace
 from std.memory import UnsafePointer
-from std.sys.intrinsics import llvm_intrinsic
+
+
+@always_inline
+def _to_llvm_ptr[space: AddressSpace](ptr_addr: __mlir_type.`!kgen.pointer<scalar<f32>>`) -> __mlir_type.`!llvm.ptr`:
+    """Convert kgen.pointer → !llvm.ptr, handling shared memory via addrspacecast."""
+    comptime if space == AddressSpace.SHARED:
+        var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr_addr)
+        return __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
+    else:
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr_addr)
 
 
 struct Atomic:
 
     @staticmethod
     @always_inline
-    def fetch_add[
-        T: DType,
-        space: AddressSpace = AddressSpace.GENERIC,
-    ](
-        ptr: UnsafePointer[Scalar[T], MutAnyOrigin, address_space=space],
-        val: Scalar[T],
-    ) -> Scalar[T]:
-        """Atomic add: *ptr += val, returns the old value."""
-        comptime if T == DType.float32:
-            comptime if space == AddressSpace.SHARED:
-                comptime if is_nvidia_gpu():
-                    return llvm_intrinsic["llvm.nvvm.atomic.load.add.f32.p3f32", Scalar[T], has_side_effect=True](ptr, val)
-                elif is_amd_gpu():
-                    return llvm_intrinsic["llvm.amdgcn.ds.fadd", Scalar[T], has_side_effect=True](ptr, val)
-                else:
-                    var old = ptr[]
-                    ptr[] = old + val
-                    return old
-            else:
-                comptime if is_nvidia_gpu():
-                    return llvm_intrinsic["llvm.nvvm.atomic.load.add.f32.p0f32", Scalar[T], has_side_effect=True](ptr, val)
-                elif is_amd_gpu():
-                    return llvm_intrinsic["llvm.amdgcn.flat.atomic.fadd.f32.p0.f32", Scalar[T], has_side_effect=True](ptr, val)
-                else:
-                    var old = ptr[]
-                    ptr[] = old + val
-                    return old
-        elif T == DType.int32:
-            comptime if space == AddressSpace.SHARED:
-                comptime if is_nvidia_gpu():
-                    return llvm_intrinsic["llvm.nvvm.atomic.load.add.i32.p3i32", Scalar[T], has_side_effect=True](ptr, val)
-                elif is_amd_gpu():
-                    return llvm_intrinsic["llvm.amdgcn.ds.add.i32", Scalar[T], has_side_effect=True](ptr, val)
-                else:
-                    var old = ptr[]
-                    ptr[] = old + val
-                    return old
-            else:
-                comptime if is_nvidia_gpu():
-                    return llvm_intrinsic["llvm.nvvm.atomic.load.add.i32.p0i32", Scalar[T], has_side_effect=True](ptr, val)
-                elif is_amd_gpu():
-                    return llvm_intrinsic["llvm.amdgcn.flat.atomic.add.i32.p0.i32", Scalar[T], has_side_effect=True](ptr, val)
-                else:
-                    var old = ptr[]
-                    ptr[] = old + val
-                    return old
-        else:
-            return val
-
-    @staticmethod
-    @always_inline
-    def min[
-        space: AddressSpace = AddressSpace.GENERIC,
-    ](
+    def fetch_add[space: AddressSpace = AddressSpace.GENERIC](
         ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
         val: Float32,
     ) -> Float32:
-        """Atomic min: *ptr = min(*ptr, val), returns the old value."""
+        """Atomic float add via MLIR llvm.atomicrmw (fadd=11)."""
+        var p: __mlir_type.`!llvm.ptr`
         comptime if space == AddressSpace.SHARED:
-            comptime if is_nvidia_gpu():
-                return llvm_intrinsic["llvm.nvvm.atomic.min.f32.p3f32", Float32, has_side_effect=True](ptr, val)
-            elif is_amd_gpu():
-                return llvm_intrinsic["llvm.amdgcn.ds.fmin.f32", Float32, has_side_effect=True](ptr, val)
-            else:
-                var old = ptr[]
-                if val < old:
-                    ptr[] = val
-                return old
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
         else:
-            comptime if is_nvidia_gpu():
-                return llvm_intrinsic["llvm.nvvm.atomic.min.f32.p0f32", Float32, has_side_effect=True](ptr, val)
-            elif is_amd_gpu():
-                return llvm_intrinsic["llvm.amdgcn.flat.atomic.fmin.f32.p0.f32", Float32, has_side_effect=True](ptr, val)
-            else:
-                var old = ptr[]
-                if val < old:
-                    ptr[] = val
-                return old
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f32](val)
+        var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`11 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.f32](p, v)
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
     @always_inline
-    def max[
-        space: AddressSpace = AddressSpace.GENERIC,
-    ](
+    def fetch_add[space: AddressSpace = AddressSpace.GENERIC](
+        ptr: UnsafePointer[Int32, MutAnyOrigin, address_space=space],
+        val: Int32,
+    ) -> Int32:
+        """Atomic int32 add via MLIR llvm.atomicrmw (add=1)."""
+        var p: __mlir_type.`!llvm.ptr`
+        comptime if space == AddressSpace.SHARED:
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
+        else:
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](val)
+        var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.i32](p, v)
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Int32]](r)
+
+    @staticmethod
+    @always_inline
+    def min[space: AddressSpace = AddressSpace.GENERIC](
         ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
         val: Float32,
     ) -> Float32:
-        """Atomic max: *ptr = max(*ptr, val), returns the old value."""
+        """Atomic float min via MLIR llvm.atomicrmw (fmin=14)."""
+        var p: __mlir_type.`!llvm.ptr`
         comptime if space == AddressSpace.SHARED:
-            comptime if is_nvidia_gpu():
-                return llvm_intrinsic["llvm.nvvm.atomic.max.f32.p3f32", Float32, has_side_effect=True](ptr, val)
-            elif is_amd_gpu():
-                return llvm_intrinsic["llvm.amdgcn.ds.fmax.f32", Float32, has_side_effect=True](ptr, val)
-            else:
-                var old = ptr[]
-                if val > old:
-                    ptr[] = val
-                return old
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
         else:
-            comptime if is_nvidia_gpu():
-                return llvm_intrinsic["llvm.nvvm.atomic.max.f32.p0f32", Float32, has_side_effect=True](ptr, val)
-            elif is_amd_gpu():
-                return llvm_intrinsic["llvm.amdgcn.flat.atomic.fmax.f32.p0.f32", Float32, has_side_effect=True](ptr, val)
-            else:
-                var old = ptr[]
-                if val > old:
-                    ptr[] = val
-                return old
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f32](val)
+        var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`14 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.f32](p, v)
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
+
+    @staticmethod
+    @always_inline
+    def max[space: AddressSpace = AddressSpace.GENERIC](
+        ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
+        val: Float32,
+    ) -> Float32:
+        """Atomic float max via MLIR llvm.atomicrmw (fmax=13)."""
+        var p: __mlir_type.`!llvm.ptr`
+        comptime if space == AddressSpace.SHARED:
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
+        else:
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f32](val)
+        var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`13 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.f32](p, v)
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
     @always_inline
@@ -131,22 +98,18 @@ struct Atomic:
         mut expected: Int32,
         desired: Int32,
     ) -> Bool:
-        """CAS on global (generic, p0) int32 memory.
-        Returns True on success; updates expected with current value on failure.
-        """
-        var old: Int32
-        comptime if is_nvidia_gpu():
-            old = llvm_intrinsic["llvm.nvvm.atomic.cas.i32.p0", Int32, has_side_effect=True](ptr, expected, desired)
-        elif is_amd_gpu():
-            old = llvm_intrinsic["llvm.amdgcn.atomic.cmpxchg.i32.p0", Int32, has_side_effect=True](ptr, expected, desired)
-        else:
-            old = ptr[]
-            if old == expected:
-                ptr[] = desired
-                return True
-            expected = old
-            return False
-        var ok = old == expected
+        """True CAS on global int32 memory via MLIR llvm.cmpxchg."""
+        var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        var cmp = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](expected)
+        var new = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](desired)
+        var result = __mlir_op.`llvm.cmpxchg`[
+            success_ordering = __mlir_attr.`7 : i64`,
+            failure_ordering = __mlir_attr.`2 : i64`,
+            _type = __mlir_type.`!llvm.struct<(i32, i1)>`,
+        ](p, cmp, new)
+        var old_i32 = __mlir_op.`llvm.extractvalue`[position = __mlir_attr.`array<i64: 0>`, _type = __mlir_type.i32](result)
+        var suc_i1  = __mlir_op.`llvm.extractvalue`[position = __mlir_attr.`array<i64: 1>`, _type = __mlir_type.`i1`](result)
+        var ok = Bool(__mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`i1`](suc_i1))
         if not ok:
-            expected = old
+            expected = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Int32]](old_i32)
         return ok
