@@ -2052,7 +2052,10 @@ class CustomOpsCompiler(GraphCompiler):
 
         # Route by session device: GPU join kernels for GPU sessions,
         # CPU join kernels for CPU sessions.
-        if self._session_device == "gpu":
+        # Phase 4: AOT GPU path (no MAX Graph JIT, buffer caching, device-resident gather)
+        if self._session_device == "gpu" and self._aot_gpu is not None:
+            left_idx, right_idx = self._aot_gpu.hash_join(left_keys, right_keys)
+        elif self._session_device == "gpu":
             left_idx, right_idx = self._hash_join_mojo_gpu(left_keys, right_keys)
         else:
             left_idx, right_idx = self._hash_join_mojo_cpu(left_keys, right_keys)
@@ -2060,10 +2063,12 @@ class CustomOpsCompiler(GraphCompiler):
         n_result = len(left_idx)
 
         # Assemble joined table.
-        # For GPU sessions with large results: use GPU gather kernels for float32/int32
-        # columns to keep numeric data on-device and reduce re-upload before aggregation.
-        # For CPU sessions or small results: fast PyArrow .take().
-        if self._session_device == "gpu" and n_result > GPU_JOIN_THRESHOLD:
+        # Phase 4: AOT GPU gather (single index H2D, cached source columns).
+        # Fallback: GPU MAX Graph gather for large results, PyArrow for small.
+        if self._session_device == "gpu" and self._aot_gpu is not None and n_result > 0:
+            left_take  = self._aot_gpu.gather_table(left_table,  left_idx)
+            right_take = self._aot_gpu.gather_table(right_table, right_idx)
+        elif self._session_device == "gpu" and n_result > GPU_JOIN_THRESHOLD:
             left_take = self._gpu_gather_table_np(left_table, left_idx, n_result)
             right_take = self._gpu_gather_table_np(right_table, right_idx, n_result)
         else:

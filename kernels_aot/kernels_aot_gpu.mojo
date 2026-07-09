@@ -544,3 +544,93 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
             n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
+
+# ── join_count_i32 ─────────────────────────────────────────────────────────
+# Two-pass GPU hash join — Phase 1: count right-key matches per left row.
+#
+# Algorithm:
+#  1. Atomically increment table[right_key[j]] for each j in 0..n_right.
+#  2. For each i in 0..n_left: counts[i] = table[left_key[i]].
+#
+# Caller must pre-zero table_addr (size = table_size * 4 bytes).
+@export
+def join_count_i32_gpu(
+    counts_addr: Int,   # out: int32[n_left]  per-row match counts
+    table_addr:  Int,   # work: int32[table_size]  must be pre-zeroed
+    left_addr:   Int,   # in: int32[n_left]
+    right_addr:  Int,   # in: int32[n_right]
+    n_left:      Int,
+    n_right:     Int,
+    table_size:  Int,
+):
+    @parameter
+    def count_right(n_r: Int, ts: Int):
+        var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if tid < n_r:
+            var k = Int(_i32(right_addr)[tid])
+            if k >= 0 and k < ts:
+                _ = Atomic.fetch_add(_i32(table_addr) + k, Int32(1))
+
+    @parameter
+    def probe_left(n_l: Int, ts: Int):
+        var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if tid < n_l:
+            var k = Int(_i32(left_addr)[tid])
+            _i32(counts_addr)[tid] = _i32(table_addr)[k] if k >= 0 and k < ts else Int32(0)
+
+    try:
+        var ctx = DeviceContext()
+        ctx.enqueue_function_experimental[count_right](
+            n_right, table_size,
+            grid_dim=ceildiv(n_right, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function_experimental[probe_left](
+            n_left, table_size,
+            grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
+        ctx.synchronize()
+    except: pass
+
+# ── join_scatter_i32 ───────────────────────────────────────────────────────
+# Two-pass GPU hash join — Phase 2: scatter (left_idx, right_idx) pairs.
+#
+# Inputs (all device pointers):
+#   left_addr       int32[n_left]       left key array
+#   offsets_addr    int32[n_left]       prefix-sum of match counts (from Phase 1)
+#   right_order_addr int32[n_right]     argsort of right_keys
+#   right_starts_addr int32[table_size] per-key start index in right_order
+#   right_count_addr  int32[table_size] per-key match count
+#
+# Outputs:
+#   left_out_addr   int32[total]        left row indices
+#   right_out_addr  int32[total]        right row indices
+@export
+def join_scatter_i32_gpu(
+    left_out_addr:    Int,  # out: int32[total]
+    right_out_addr:   Int,  # out: int32[total]
+    left_addr:        Int,  # in: int32[n_left]
+    offsets_addr:     Int,  # in: int32[n_left]
+    right_order_addr: Int,  # in: int32[n_right]
+    right_starts_addr:Int,  # in: int32[table_size]
+    right_count_addr: Int,  # in: int32[table_size]
+    n_left:           Int,
+    table_size:       Int,
+):
+    @parameter
+    def scatter(n_l: Int, ts: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i < n_l:
+            var k = Int(_i32(left_addr)[i])
+            if k >= 0 and k < ts:
+                var cnt     = Int(_i32(right_count_addr)[k])
+                var rs      = Int(_i32(right_starts_addr)[k])
+                var out_pos = Int(_i32(offsets_addr)[i])
+                for j in range(cnt):
+                    _i32(left_out_addr) [out_pos + j] = Int32(i)
+                    _i32(right_out_addr)[out_pos + j] = _i32(right_order_addr)[rs + j]
+
+    try:
+        var ctx = DeviceContext()
+        ctx.enqueue_function_experimental[scatter](
+            n_left, table_size,
+            grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
+        ctx.synchronize()
+    except: pass

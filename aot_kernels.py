@@ -468,6 +468,13 @@ class AOTKernelsGPU:
         self._fg_i32 = _bind_gpu(L, "filter_gather_i32_gpu", _fg)
         self._fg_i64 = _bind_gpu(L, "filter_gather_i64_gpu", _fg)
         self._unique_mask  = _bind_gpu(L, "unique_mask_gpu", _um)
+        # join kernels (Phase 4 — device-resident join pipeline)
+        # join_count: (counts, table, left, right, n_left, n_right, table_size)
+        _jc  = [_P64, _P64, _P64, _P64, _I64, _I64, _I64]
+        # join_scatter: (left_out, right_out, left, offsets, right_order, right_starts, right_count, n_left, table_size)
+        _js  = [_P64, _P64, _P64, _P64, _P64, _P64, _P64, _I64, _I64]
+        self._join_count_gpu   = _bind_gpu(L, "join_count_i32_gpu",   _jc)
+        self._join_scatter_gpu = _bind_gpu(L, "join_scatter_i32_gpu", _js)
 
     # ── GPU memory helpers ──────────────────────────────────────────────────
 
@@ -697,6 +704,152 @@ class AOTKernelsGPU:
         res = self._download(out, np.int64, len(idx))
         self._free(s, i, out)
         return res
+
+    # ── Phase 4: device-resident join pipeline ───────────────────────────────
+
+    def hash_join(
+        self, left_keys: np.ndarray, right_keys: np.ndarray
+    ) -> "tuple[np.ndarray, np.ndarray]":
+        """GPU two-pass hash join using AOT kernels (no MAX Graph JIT).
+
+        Returns (left_idx, right_idx) as int32 numpy arrays.
+        Key arrays are uploaded with _cached_upload so repeated calls with the
+        same arrays avoid redundant PCIe copies.
+        """
+        n_left  = len(left_keys)
+        n_right = len(right_keys)
+        if n_left == 0 or n_right == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+        lk = self._c(left_keys,  np.int32)
+        rk = self._c(right_keys, np.int32)
+        table_size = int(max(lk.max(), rk.max())) + 1 if len(lk) and len(rk) else 1
+
+        lk_dev = self._cached_upload(lk)
+        rk_dev = self._cached_upload(rk)
+
+        # Work buffer: per-key right count table (pre-zeroed)
+        table_np   = np.zeros(table_size, dtype=np.int32)
+        table_dev  = self._upload(table_np)
+        counts_dev = self._cu.malloc(n_left * 4)
+
+        # Phase 1 — count
+        self._join_count_gpu(
+            self._ptr(counts_dev), self._ptr(table_dev),
+            self._ptr(lk_dev),     self._ptr(rk_dev),
+            n_left, n_right, table_size,
+        )
+        self._cu.sync()
+        match_counts = self._download(counts_dev, np.int32, n_left)
+        self._cu.free(counts_dev)
+        self._cu.free(table_dev)
+
+        total = int(match_counts.sum())
+        if total == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+
+        # Python bridge: offsets + right auxiliary arrays (small; stays on CPU)
+        offsets = np.zeros(n_left, dtype=np.int32)
+        np.cumsum(match_counts[:-1], out=offsets[1:])
+
+        right_count  = np.bincount(rk, minlength=table_size).astype(np.int32)
+        right_order  = np.argsort(rk, kind='stable').astype(np.int32)
+        right_starts = np.zeros(table_size, dtype=np.int32)
+        np.cumsum(right_count[:-1], out=right_starts[1:])
+
+        offsets_dev      = self._upload(offsets)
+        right_order_dev  = self._upload(right_order)
+        right_starts_dev = self._upload(right_starts)
+        right_count_dev  = self._upload(right_count)
+        left_out_dev     = self._cu.malloc(total * 4)
+        right_out_dev    = self._cu.malloc(total * 4)
+
+        # Phase 2 — scatter
+        self._join_scatter_gpu(
+            self._ptr(left_out_dev),    self._ptr(right_out_dev),
+            self._ptr(lk_dev),          self._ptr(offsets_dev),
+            self._ptr(right_order_dev), self._ptr(right_starts_dev),
+            self._ptr(right_count_dev),
+            n_left, table_size,
+        )
+        self._cu.sync()
+
+        left_idx  = self._download(left_out_dev,  np.int32, total)
+        right_idx = self._download(right_out_dev, np.int32, total)
+        self._free(offsets_dev, right_order_dev, right_starts_dev,
+                   right_count_dev, left_out_dev, right_out_dev)
+        return left_idx, right_idx
+
+    def gather_table(
+        self,
+        table: "pa.Table",
+        idx: np.ndarray,
+    ) -> "pa.Table":
+        """Gather all columns of *table* by *idx* using AOT GPU kernels.
+
+        float32, int32, int64 columns are gathered on GPU with _cached_upload
+        for source data (stable input) and a single index upload shared across
+        all columns.  Other types (string, date, …) fall back to PyArrow CPU.
+
+        Returns a new pa.Table with the same schema.
+        """
+        import pyarrow as pa
+        n = len(idx)
+        idx32 = np.ascontiguousarray(idx.astype(np.int32))
+        idx_dev = self._upload(idx32)   # single H2D for index array
+
+        arrays = []
+        names  = []
+        for col_name in table.column_names:
+            col = table.column(col_name)
+            if isinstance(col, pa.ChunkedArray):
+                col = col.combine_chunks()
+            src_len = len(col)
+            if pa.types.is_float32(col.type):
+                src_np = np.ascontiguousarray(
+                    col.to_numpy(zero_copy_only=False).astype(np.float32))
+                s = self._cached_upload(src_np)
+                out = self._cu.malloc(n * 4)
+                self._gather_f32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
+                self._cu.sync()
+                arrays.append(pa.array(self._download(out, np.float32, n)))
+                self._cu.free(out)
+            elif pa.types.is_float64(col.type):
+                # downcast float64→float32 for GPU, restore type after
+                src_np = np.ascontiguousarray(
+                    col.to_numpy(zero_copy_only=False).astype(np.float32))
+                s = self._cached_upload(src_np)
+                out = self._cu.malloc(n * 4)
+                self._gather_f32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
+                self._cu.sync()
+                arrays.append(pa.array(
+                    self._download(out, np.float32, n).astype(np.float64)))
+                self._cu.free(out)
+            elif pa.types.is_integer(col.type) and col.type.bit_width == 64:
+                src_np = np.ascontiguousarray(
+                    col.to_numpy(zero_copy_only=False).astype(np.int64))
+                s = self._cached_upload(src_np)
+                out = self._cu.malloc(n * 8)
+                self._gather_i64(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
+                self._cu.sync()
+                arrays.append(pa.array(self._download(out, np.int64, n)))
+                self._cu.free(out)
+            elif pa.types.is_integer(col.type):
+                src_np = np.ascontiguousarray(
+                    col.to_numpy(zero_copy_only=False).astype(np.int32))
+                s = self._cached_upload(src_np)
+                out = self._cu.malloc(n * 4)
+                self._gather_i32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
+                self._cu.sync()
+                arrays.append(pa.array(self._download(out, np.int32, n)))
+                self._cu.free(out)
+            else:
+                # Non-numeric fallback: PyArrow CPU take
+                arrays.append(col.take(pa.array(idx32.astype(np.int64))))
+            names.append(col_name)
+
+        self._cu.free(idx_dev)
+        return pa.Table.from_arrays(arrays, names=names)
 
     def filter_gather_f32(self, src: np.ndarray, mask: np.ndarray,
                            offsets: np.ndarray, n_out: int) -> np.ndarray:
