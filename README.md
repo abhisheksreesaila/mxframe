@@ -163,10 +163,12 @@ These live in the AOT shared libraries (`libmxkernels_aot.so` / `libmxkernels_ao
 
 ---
 
-### 1 M rows — warm median of 3 runs *(as of July 7 2026)*
+### 1 M rows — warm median of 3 runs *(v0.2.0 baseline, July 7 2026)*
 
 All times in **milliseconds · lower is better**. 🟢 = faster than Polars baseline; **bold** = MXFrame wins.
 Q1–Q7 and Q10 measured July 7 2026; remaining rows measured April 20 2026 — same hardware, same methodology.
+
+> **v0.2.3 note:** These numbers reflect steady-state (hot-cache) performance from v0.2.0. The v0.2.3 improvements (Phase 4 AOT GPU join, Phase 5 GPU sort fix, Phase 3 vectorised rank) primarily reduce **cold-start latency** (GPU join: 300 ms → 70 ms first call) and **fix a GPU sort crash** — the hot-path throughput numbers below are not materially changed.
 
 | Query | Description | MX CPU | MX GPU | Polars | Pandas | CPU vs Polars | GPU vs Polars |
 |---|---|---:|---:|---:|---:|---:|---:|
