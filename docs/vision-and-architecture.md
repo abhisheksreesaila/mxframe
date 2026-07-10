@@ -271,11 +271,11 @@ TPC-H has 22 queries. We target them incrementally:
 
 ## 5. Success Criteria
 
-| Milestone | Definition of Done |
-|-----------|-------------------|
-| **v0.1 — Core Pipeline** | `filter` + `select` + `groupby` + `sum/min/max/mean/count` all compile to MAX Graph and produce correct results on CPU |
-
-| **v0.2 — GPU Path** | Same ops run on GPU with automatic device selection || **v1.0 — Public Release** | 10+ TPC-H queries, docs site, pip-installable, benchmarks published |
-
-| **v0.3 — TPC-H Q1 & Q6** | Both queries run correctly and beat pandas in speed || **v0.5 — TPC-H Q3** | 3-way join query runs correctly |
-| **v0.4 — Joins & Sort** | Hash join, sort, limit plan nodes working |
+| Milestone | Definition of Done | Status |
+|-----------|-------------------|--------|
+| **v0.1 — Core Pipeline** | `filter` + `select` + `groupby` + `sum/min/max/mean/count` compile to MAX Graph, correct results on CPU | ✅ Done |
+| **v0.2 — GPU Path** | Same ops run on GPU with automatic device selection | ✅ Done |
+| **v0.3 — TPC-H Q1 & Q6** | Both queries run correctly and beat pandas in speed | ✅ Done |
+| **v0.4 — Joins & Sort** | Hash join, sort, limit plan nodes working | ✅ Done |
+| **v0.5 — TPC-H Q3** | 3-way join query runs correctly | ✅ Done |
+| **v1.0 — Public Release** | 22/22 TPC-H queries, docs site, pip-installable, benchmarks published | ✅ **v0.2.3** (22/22 queries, all docs live) |
