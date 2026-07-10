@@ -1508,7 +1508,20 @@ class CustomOpsCompiler(GraphCompiler):
         # derived columns (e.g. __cw_0__, __cw_1__ from case_when substitution).
         # Engine slots (__group_ids__, __filter_mask__) live in extra_inputs, not
         # col_arrays, so no exclusion filter is needed here.
-        mini_cols = {k: pa.array(v) for k, v in col_arrays.items()}
+        # Perf: skip string/object dtype columns — they are group keys, not agg
+        # values; converting numpy object arrays (800K strings) to pa.array is O(N)
+        # slow and would dominate hot-call time.
+        mini_cols = {}
+        for k, v in col_arrays.items():
+            if v.dtype.kind in ("f", "i", "u"):   # float, int, uint only
+                mini_cols[k] = pa.array(v)
+            else:
+                # String/object columns: preserve as-is via zero-copy pa.array
+                # (stays as dictionary/string type, no Python iteration needed)
+                try:
+                    mini_cols[k] = pa.array(v, from_pandas=True)
+                except Exception:
+                    pass  # skip columns that can't be converted
         mini_table = pa.table(mini_cols) if mini_cols else None
 
         agg_names: list = []

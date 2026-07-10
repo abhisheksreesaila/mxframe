@@ -174,8 +174,32 @@ def group_count_f32_gpu(
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < ng: _f32(out_addr)[t] = 0.0
 
+    # Fast path: shared-memory privatisation (same pattern as group_sum)
     @parameter
-    def count_kernel(n: Int, ng: Int):
+    def count_shared(n: Int, ng: Int):
+        var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
+            address_space=AddressSpace.SHARED]()
+        var t = Int(thread_idx.x)
+        while t < MAX_GROUPS:
+            shmem[t] = 0.0; t += BLOCK
+        barrier()
+        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
+        for c in range(COARSE):
+            var i = base + c * BLOCK
+            if i < n:
+                var gid = Int(_i32(lab_addr)[i])
+                if gid >= 0 and gid < ng:
+                    _ = Atomic.fetch_add(shmem + gid, Float32(1.0))
+        barrier()
+        t = Int(thread_idx.x)
+        while t < ng:
+            var sv = shmem[t]
+            if sv != 0.0: _ = Atomic.fetch_add(_f32(out_addr) + t, sv)
+            t += BLOCK
+
+    # Slow path: direct global atomics (used when n_groups > MAX_GROUPS)
+    @parameter
+    def count_global(n: Int, ng: Int):
         var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
         for c in range(COARSE):
             var i = base + c * BLOCK
@@ -189,9 +213,13 @@ def group_count_f32_gpu(
         ctx.enqueue_function_experimental[zero_out](
             n_groups, grid_dim=ceildiv(n_groups, BLOCK), block_dim=BLOCK)
         if n_rows > 0:
-            ctx.enqueue_function_experimental[count_kernel](
-                n_rows, n_groups,
-                grid_dim=ceildiv(n_rows, BLOCK * COARSE), block_dim=BLOCK)
+            var nb = ceildiv(n_rows, BLOCK * COARSE)
+            if n_groups <= MAX_GROUPS:
+                ctx.enqueue_function_experimental[count_shared](
+                    n_rows, n_groups, grid_dim=nb, block_dim=BLOCK)
+            else:
+                ctx.enqueue_function_experimental[count_global](
+                    n_rows, n_groups, grid_dim=nb, block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
