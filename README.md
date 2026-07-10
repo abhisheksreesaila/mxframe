@@ -75,7 +75,7 @@ print(result.to_pandas())
 
 ---
 
-## 📊 Performance — TPC-H at 1 M rows *(v0.2.3)*
+## 📊 Performance — TPC-H at 1 M rows *(v0.3.0)*
 
 MX CPU beats Polars on **20/22** queries. GPU advantage compounds at 10 M+ rows where kernel parallelism dominates PCIe upload cost.
 

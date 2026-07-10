@@ -5,6 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.0] — 2026-07-10
+
+### 📚 Docs & Benchmarks
+- README restructured: 543 lines → 119 lines. Intro, quick start, and 4-row teaser only — all detail moved to dedicated docs.
+- New `docs/benchmarks.md`: full 22-query TPC-H tables (1 M + 10 M rows), Mojo kernel catalogue, current limitations, roadmap, and reproduce instructions.
+- New `docs/api.md`: LazyFrame method reference, expression syntax, SQL frontend, supported operations, project structure.
+- `docs/vision-and-architecture.md`: fixed garbled sections 2.5/2.6/3; success criteria table repaired; all milestones marked ✅.
+- `docs/archive/` added to `.gitignore` — old dev notes moved there, not published.
+- All stale `Mojo 0.26.2` / `MAX Graph shape-cached join` references updated to reflect v0.2.3 reality (Mojo 26.4, AOT ctypes everywhere).
+
+### 📊 Benchmark updates
+- Q5/Q7/Q8/Q10/Q13/Q19 re-measured with per-run join-cache clearing (fresh-join). Previous v0.2.0 numbers for those queries were warm join-cache hits.
+- Summary corrected: CPU 20/22 (Q13 loses fresh-join), GPU 12/22 (Q5/Q7 no longer win at 1 M without cache warmup).
+- Q8 GPU marked `—` (MAX Graph `year()` groupby JIT too slow to benchmark; Phase 6 target).
+
+### 🔨 Infrastructure
+- `modular >= 26.4` requirement added to `pyproject.toml` runtime deps and Dependencies table in README.
+- `docs/archive/` gitignored; previously committed archive files removed from history.
+
+---
+
 ## [0.2.3] — 2026-07-09
 
 ### ⚡ Performance
