@@ -182,47 +182,24 @@ LogicalPlan tree  ←── identical to what DataFrame API builds
     │
     ▼  (compiler compiles)
 
-MAX Graph → Mojo kernels → result### 3.1 Syntax — Polars-Inspired, Simplified
-
+MAX Graph → Mojo kernels → result
 ```
 
-## 3. API Design Philosophy
+We use [`sqlglot`](https://github.com/tobymao/sqlglot) for parsing. It handles SQL dialects, produces a clean AST, and we translate from `sqlglot.Expression` → our `LogicalPlan` nodes.
 
-We use [`sqlglot`](https://github.com/tobymao/sqlglot) (already in `pixi.toml`) for parsing.
-
-It handles SQL dialects, produces a clean AST, and we only need to write a---
-
-translator from `sqlglot.Expression` → our `LogicalPlan` nodes.
-
-- **Session caching** — compiled graphs are cached, subsequent runs are instant
-
-**Why this works:** Our `LogicalPlan` is the universal intermediate representation.- **Mixed ops** — combine built-in MAX ops with custom Mojo kernels in one graph
-
-Whether the user writes:- **Device placement** — the graph runtime handles CPU↔GPU data transfers
-
-- **Fusion opportunities** — MAX can fuse adjacent ops into single kernel launches
-
-```python- **Automatic memory management** — tensors flow through the graph, no manual alloc/free
-
-# DataFrame APIMAX Graph provides:
-
-df.filter(col('x') > 30).groupby('y').agg(col('z').sum().alias('total')).compute()
+**Why this works:** Our `LogicalPlan` is the universal intermediate representation. Whether the user writes DataFrame API or SQL, both produce the same plan tree — the compiler is completely unaware of which frontend was used.
 
 ### 2.6 Why MAX Graph (Not Direct Mojo FFI)?
 
-# SQL API
+MAX Graph provides:
+- **Session caching** — compiled graphs are cached, subsequent runs are instant
+- **Mixed ops** — combine built-in MAX ops with custom Mojo kernels in one graph
+- **Device placement** — the graph runtime handles CPU↔GPU data transfers
+- **Fusion opportunities** — MAX can fuse adjacent ops into single kernel launches
 
-mx.sql("SELECT y, sum(z) AS total FROM t WHERE x > 30 GROUP BY y", t=table)completely unaware of which frontend was used.
+## 3. API Design Philosophy
 
-```The compiler, the Mojo kernels, the GPU dispatch — everything downstream is
-
-
-
-Both produce:```
-
-```        └─ Scan(table)
-
-Aggregate(group_by=[col('y')], aggs=[sum(col('z')).alias('total')])    └─ Filter(predicate=col('x') > lit(30))
+### 3.1 Syntax — Polars-Inspired, Simplified
 
 ```python
 import mxframe as mx
@@ -297,8 +274,8 @@ TPC-H has 22 queries. We target them incrementally:
 | Milestone | Definition of Done |
 |-----------|-------------------|
 | **v0.1 — Core Pipeline** | `filter` + `select` + `groupby` + `sum/min/max/mean/count` all compile to MAX Graph and produce correct results on CPU |
-| **v0.2 — GPU Path** | Same ops run on GPU with automatic device selection |
-| **v0.3 — TPC-H Q1 & Q6** | Both queries run correctly and beat pandas in speed |
+
+| **v0.2 — GPU Path** | Same ops run on GPU with automatic device selection || **v1.0 — Public Release** | 10+ TPC-H queries, docs site, pip-installable, benchmarks published |
+
+| **v0.3 — TPC-H Q1 & Q6** | Both queries run correctly and beat pandas in speed || **v0.5 — TPC-H Q3** | 3-way join query runs correctly |
 | **v0.4 — Joins & Sort** | Hash join, sort, limit plan nodes working |
-| **v0.5 — TPC-H Q3** | 3-way join query runs correctly |
-| **v1.0 — Public Release** | 10+ TPC-H queries, docs site, pip-installable, benchmarks published |
