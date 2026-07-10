@@ -50,7 +50,7 @@ def group_sum_f32(
     labels_addr: Int,
     n_rows:      Int,
     n_groups:    Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var values = _f32(values_addr)
     var labels = _i32(labels_addr)
@@ -72,7 +72,7 @@ def group_sum_i64(
     labels_addr: Int,
     n_rows:      Int,
     n_groups:    Int,
-):
+) abi("C"):
     var out    = _i64(out_addr)
     var values = _i64(values_addr)
     var labels = _i32(labels_addr)
@@ -95,7 +95,7 @@ def group_min_f32(
     labels_addr: Int,
     n_rows:      Int,
     n_groups:    Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var values = _f32(values_addr)
     var labels = _i32(labels_addr)
@@ -119,7 +119,7 @@ def group_max_f32(
     labels_addr: Int,
     n_rows:      Int,
     n_groups:    Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var values = _f32(values_addr)
     var labels = _i32(labels_addr)
@@ -146,7 +146,7 @@ def group_mean_f32(
     labels_addr:   Int,
     n_rows:        Int,
     n_groups:      Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var cnt    = _i32(count_addr)
     var values = _f32(values_addr)
@@ -173,7 +173,7 @@ def group_count_f32(
     labels_addr: Int,
     n_rows:      Int,
     n_groups:    Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var labels = _i32(labels_addr)
     for g in range(n_groups):
@@ -197,7 +197,7 @@ def group_composite(
     k3_addr:      Int,
     strides_addr: Int,   # int64[4]: s0,s1,s2,s3
     n_rows:       Int,
-):
+) abi("C"):
     var out     = _i64(out_addr)
     var k0      = _i32(k0_addr)
     var k1      = _i32(k1_addr)
@@ -222,7 +222,7 @@ def masked_global_sum_f32(
     values_addr: Int,
     mask_addr:   Int,
     n:           Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var values = _f32(values_addr)
     var mask   = _i32(mask_addr)
@@ -242,7 +242,7 @@ def masked_global_min_f32(
     values_addr: Int,
     mask_addr:   Int,
     n:           Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var values = _f32(values_addr)
     var mask   = _i32(mask_addr)
@@ -264,7 +264,7 @@ def masked_global_max_f32(
     values_addr: Int,
     mask_addr:   Int,
     n:           Int,
-):
+) abi("C"):
     var out    = _f32(out_addr)
     var values = _f32(values_addr)
     var mask   = _i32(mask_addr)
@@ -288,7 +288,7 @@ def masked_global_sum_product_f32(
     values_b_addr: Int,
     mask_addr:     Int,
     n:             Int,
-):
+) abi("C"):
     var out      = _f32(out_addr)
     var values_a = _f32(values_a_addr)
     var values_b = _f32(values_b_addr)
@@ -309,7 +309,7 @@ def gather_f32(
     values_addr:  Int,
     indices_addr: Int,
     m:            Int,   # length of output / indices
-):
+) abi("C"):
     var out     = _f32(out_addr)
     var values  = _f32(values_addr)
     var indices = _i32(indices_addr)
@@ -326,7 +326,7 @@ def gather_i32(
     values_addr:  Int,
     indices_addr: Int,
     m:            Int,
-):
+) abi("C"):
     var out     = _i32(out_addr)
     var values  = _i32(values_addr)
     var indices = _i32(indices_addr)
@@ -343,7 +343,7 @@ def gather_i64(
     values_addr:  Int,
     indices_addr: Int,
     m:            Int,
-):
+) abi("C"):
     var out     = _i64(out_addr)
     var values  = _i64(values_addr)
     var indices = _i32(indices_addr)
@@ -388,7 +388,7 @@ def sort_indices(
     keys_addr:  Int,
     n:          Int,
     descending: Int,   # 0=asc, 1=desc
-):
+) abi("C"):
     var idx  = _i32(out_addr)
     var keys = _i32(keys_addr)
     var desc = descending > 0
@@ -418,7 +418,7 @@ def unique_mask(
     out_addr:  Int,
     keys_addr: Int,
     n:         Int,
-):
+) abi("C"):
     var out  = _i32(out_addr)
     var keys = _i32(keys_addr)
     if n == 0:
@@ -441,7 +441,7 @@ def prefix_sum_count(
     offsets_addr: Int,   # int32[n+1]
     mask_addr:    Int,   # int32[n]
     n:            Int,
-):
+) abi("C"):
     var offsets = _i32(offsets_addr)
     var mask    = _i32(mask_addr)
     offsets[0] = I32(0)
@@ -460,7 +460,7 @@ def filter_gather_f32(
     mask_addr:    Int,
     offsets_addr: Int,
     n:            Int,
-):
+) abi("C"):
     var out     = _f32(out_addr)
     var values  = _f32(values_addr)
     var mask    = _i32(mask_addr)
@@ -480,7 +480,7 @@ def filter_gather_i32(
     mask_addr:    Int,
     offsets_addr: Int,
     n:            Int,
-):
+) abi("C"):
     var out     = _i32(out_addr)
     var values  = _i32(values_addr)
     var mask    = _i32(mask_addr)
@@ -500,7 +500,7 @@ def filter_gather_i64(
     mask_addr:    Int,
     offsets_addr: Int,
     n:            Int,
-):
+) abi("C"):
     var out     = _i64(out_addr)
     var values  = _i64(values_addr)
     var mask    = _i32(mask_addr)
@@ -522,7 +522,7 @@ def join_count(
     n_left:            Int,
     n_right:           Int,
     max_key:           Int,   # caller provides max(max(left), max(right))
-):
+) abi("C"):
     var match_counts = _i32(match_counts_addr)
     var left_keys    = _i32(left_keys_addr)
     var right_keys   = _i32(right_keys_addr)
@@ -556,7 +556,7 @@ def join_scatter(
     n_left:          Int,
     n_right:         Int,
     max_key:         Int,
-):
+) abi("C"):
     var left_out   = _i32(left_out_addr)
     var right_out  = _i32(right_out_addr)
     var left_keys  = _i32(left_keys_addr)
@@ -613,7 +613,7 @@ def join_count_left(
     n_left:            Int,
     n_right:           Int,
     max_key:           Int,
-):
+) abi("C"):
     var match_counts = _i32(match_counts_addr)
     var left_keys    = _i32(left_keys_addr)
     var right_keys   = _i32(right_keys_addr)
@@ -647,7 +647,7 @@ def join_scatter_left(
     n_left:          Int,
     n_right:         Int,
     max_key:         Int,
-):
+) abi("C"):
     var left_out   = _i32(left_out_addr)
     var right_out  = _i32(right_out_addr)
     var left_keys  = _i32(left_keys_addr)

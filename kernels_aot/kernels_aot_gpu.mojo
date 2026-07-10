@@ -27,7 +27,7 @@ def _i64(addr: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
 @export
 def group_sum_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-):
+) abi("C"):
     @parameter
     def zero_out(ng: Int):
         var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -84,7 +84,7 @@ def group_sum_f32_gpu(
 @export
 def group_min_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-):
+) abi("C"):
     @parameter
     def init_out(ng: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -126,7 +126,7 @@ def group_min_f32_gpu(
 @export
 def group_max_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-):
+) abi("C"):
     @parameter
     def init_out(ng: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -168,7 +168,7 @@ def group_max_f32_gpu(
 @export
 def group_count_f32_gpu(
     out_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-):
+) abi("C"):
     @parameter
     def zero_out(ng: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -199,7 +199,7 @@ def group_count_f32_gpu(
 @export
 def masked_global_sum_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def zero_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -235,7 +235,7 @@ def masked_global_sum_f32_gpu(
 @export
 def masked_global_sum_product_f32_gpu(
     out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def zero_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -312,7 +312,7 @@ def gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
 @export
 def filter_gather_f32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -328,7 +328,7 @@ def filter_gather_f32_gpu(
 @export
 def filter_gather_i32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -344,7 +344,7 @@ def filter_gather_i32_gpu(
 @export
 def filter_gather_i64_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def kernel(n_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -361,7 +361,7 @@ def filter_gather_i64_gpu(
 @export
 def masked_global_min_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def init_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -398,7 +398,7 @@ def masked_global_min_f32_gpu(
 @export
 def masked_global_max_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-):
+) abi("C"):
     @parameter
     def init_out(nout: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -460,7 +460,7 @@ def group_encode_i32_gpu(
     htid_addr: Int,
     n: Int,
     cap: Int,
-):
+) abi("C"):
     # Pass 1: initialise hash table slots and counter atomically
     @parameter
     def init_tables(cap_: Int):
@@ -559,7 +559,7 @@ def sort_topk_i32_gpu(
     keys_addr: Int,
     n:         Int,
     desc_flag: Int,
-):
+) abi("C"):
     @parameter
     def init_kernel(n_: Int):
         var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -622,7 +622,7 @@ def join_count_i32_gpu(
     n_left:      Int,
     n_right:     Int,
     table_size:  Int,
-):
+) abi("C"):
     @parameter
     def count_right(n_r: Int, ts: Int):
         var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
@@ -673,7 +673,7 @@ def join_scatter_i32_gpu(
     right_count_addr: Int,  # in: int32[table_size]
     n_left:           Int,
     table_size:       Int,
-):
+) abi("C"):
     @parameter
     def scatter(n_l: Int, ts: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
