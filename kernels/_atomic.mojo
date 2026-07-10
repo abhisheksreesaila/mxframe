@@ -24,7 +24,6 @@ def _to_llvm_ptr[space: AddressSpace](ptr_addr: __mlir_type.`!kgen.pointer<scala
 struct Atomic:
 
     @staticmethod
-    @always_inline
     def fetch_add[space: AddressSpace = AddressSpace.GENERIC](
         ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
         val: Float32,
@@ -41,7 +40,6 @@ struct Atomic:
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
-    @always_inline
     def fetch_add[space: AddressSpace = AddressSpace.GENERIC](
         ptr: UnsafePointer[Int32, MutAnyOrigin, address_space=space],
         val: Int32,
@@ -58,7 +56,6 @@ struct Atomic:
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Int32]](r)
 
     @staticmethod
-    @always_inline
     def min[space: AddressSpace = AddressSpace.GENERIC](
         ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
         val: Float32,
@@ -75,7 +72,6 @@ struct Atomic:
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
-    @always_inline
     def max[space: AddressSpace = AddressSpace.GENERIC](
         ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
         val: Float32,
@@ -92,7 +88,6 @@ struct Atomic:
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
-    @always_inline
     def compare_exchange(
         ptr: UnsafePointer[Int32, MutAnyOrigin],
         mut expected: Int32,
