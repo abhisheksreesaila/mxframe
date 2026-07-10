@@ -58,3 +58,6 @@ NUL
 *Zone.Identifier*
 *:Zone.Identifier*
 NUL
+
+# Local-only archive — not published
+docs/archive/
