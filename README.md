@@ -30,7 +30,7 @@ Kernels are compiled **once** to a `.so` at build time — loaded in ~1 ms, then
 
 ## ⚡ Quick Start
 
-```bash
+```sh
 # 1. Install pixi (Modular's package manager)
 curl -fsSL https://pixi.sh/install.sh | bash
 
