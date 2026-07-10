@@ -1504,11 +1504,11 @@ class CustomOpsCompiler(GraphCompiler):
 
         # Build a mini PyArrow table so _eval_expr_arrow can evaluate expressions
         # like col_a * (1 - col_b) on the already-filtered column arrays.
-        mini_cols = {
-            k: pa.array(v)
-            for k, v in col_arrays.items()
-            if not (k.startswith("__") and k.endswith("__"))
-        }
+        # Note: col_arrays contains only numeric source columns and pre-computed
+        # derived columns (e.g. __cw_0__, __cw_1__ from case_when substitution).
+        # Engine slots (__group_ids__, __filter_mask__) live in extra_inputs, not
+        # col_arrays, so no exclusion filter is needed here.
+        mini_cols = {k: pa.array(v) for k, v in col_arrays.items()}
         mini_table = pa.table(mini_cols) if mini_cols else None
 
         agg_names: list = []
