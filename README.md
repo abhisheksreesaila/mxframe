@@ -92,7 +92,7 @@ Output:
 
 ## 📊 TPC-H Benchmark — all 22 queries
 
-> **Hardware:** NVIDIA RTX 3090 (sm_86) · AMD 12-core CPU · Mojo 0.26.2 AOT kernels
+> **Hardware:** NVIDIA RTX 3090 (sm_86) · AMD 12-core CPU · Mojo 26.4 (1.0.0b2) AOT kernels
 > **Baselines:** Polars 1.29+ · Pandas 3.0 · MXFrame CPU path · MXFrame GPU path
 > **Data:** TPC-H schema synthetic data (numpy RNG, fixed seed)
 > **Methodology:** 1 warmup run + **median of 3 timed runs**, per engine. Warmup primes every cache an app would have primed on query #2 in production — so these numbers reflect steady-state dispatch, not first-call JIT cost.
@@ -105,10 +105,9 @@ Output:
 | Device | Path | Coverage |
 |---|---|---|
 | **CPU** | 100% ctypes into pre-compiled `libmxkernels_aot.so` | All 22 queries — group aggs, masked aggs, inner + left joins, gather, filter, sort, unique |
-| **GPU** | ctypes into pre-compiled `libmxkernels_aot_gpu.so` | All grouped aggs (sum/min/max/count) + masked global aggs |
-| **GPU** | MAX Graph, shape-cached model | Hash joins only — compiled once per `(n_left, n_right)` shape, cached for the session |
+| **GPU** | ctypes into pre-compiled `libmxkernels_aot_gpu.so` | All grouped aggs (sum/min/max/count) + masked global aggs + hash joins + sort/top-k — every hot operator is AOT, zero session overhead |
 
-No per-query JIT on CPU. GPU aggregations skip MAX Graph entirely. GPU joins compile a model once per shape and reuse it — the warmup run primes that cache.
+No per-query JIT on CPU or GPU. All GPU operators dispatch directly to AOT ctypes — no MAX Graph session needed for any hot-path operation.
 
 ### 🔥 Mojo Kernel Catalogue
 
@@ -159,8 +158,13 @@ These live in the AOT shared libraries (`libmxkernels_aot.so` / `libmxkernels_ao
 |---|---|
 | `group_encode_i32_gpu` | GPU open-addressing hash table: assigns dense `int32` group IDs to an integer key column, replacing PyArrow `dictionary_encode` |
 | `masked_global_{min,max}_f32_gpu` | GPU block-reduction min/max for masked global aggregations (added Phase 1) |
+| `group_count_f32_gpu` | Per-group row count via shared-memory privatisation (up to 8 192 groups) + global-atomic fallback; fixed in v0.2.3 to match the shared-mem design of sum/min/max |
+| `masked_global_{min,max}_f32_gpu` | GPU block-reduction min/max for masked global aggregations |
 | `gather_{f32,i32,i64}_gpu` | Coalesced GPU gather — used after join and sort to reorder columns on-device |
-
+| `join_count_i32_gpu` | Phase 1 of AOT GPU inner hash join — counts matching right rows for each left key; replaces MAX Graph JIT join (v0.2.3) |
+| `join_scatter_i32_gpu` | Phase 2 of AOT GPU inner hash join — emits `(left_idx, right_idx)` index pairs into pre-allocated output buffers |
+| `sort_topk_i32_gpu` | Full bitonic sort with optional top-k truncation — `ORDER BY … LIMIT k` fuses sort+limit in one kernel, downloads only `k×4` bytes (v0.2.3) |
+All times in **milliseconds · lower is better**. 🟢 = faster than Polars baseline; **bold** = MXFrame wins.
 ---
 
 ### 1 M rows — warm median of 3 runs *(v0.2.3, July 10 2026)*
@@ -194,9 +198,9 @@ Q1, Q3, Q5–Q8, Q10, Q13, Q19, Sort/Limit/Distinct re-measured July 10 2026 (v0
 | Q20 | Potential part promo          | 🟢 **4.3**  | 🟢 **5.6**  | 30.0 | 9.6  | **7.0×**   | **5.4×** |
 | Q21 | Suppliers who kept (EXISTS)   | 🟢 **26.0** | 64.1        | 31.3 | 28.6 | **1.2×**   | 0.5× |
 | Q22 | Global sales opportunity      | 🟢 **7.6**  | 🟢 **16.5** | 25.4 | 56.7 | **3.3×**   | **1.5×** |
-
+### 10 M rows — warm median of 3 runs *(as of April 20 2026)*
 **1 M summary (v0.2.3):** MX CPU beats Polars on **20/22** queries; MX GPU beats Polars on **12/22** queries. Headline CPU wins: **Q9 67×**, **Q12 46×**, **Q17 26×**, **Q3 9×**, **Q8 3.4×**. Headline GPU wins: **Q9 6.0×**, **Q12 6.8×**, **Q20 5.4×**, **Q3 2.7×**. v0.2.3 GPU highlights: Q1 87 ms → 42 ms (group_count shared-mem path); Q3 23 ms → 8.7 ms (Phase 4 AOT join). *(Q5/Q7/Q8/Q10/Q13/Q19 updated to fresh-join measurements; previous v0.2.0 numbers were warm join-cache hits.)*
-
+All times in **milliseconds · lower is better**. 🟢 = faster than Polars baseline; **bold** = MXFrame wins.
 
 
 ### 10 M rows — warm median of 3 runs *(as of April 20 2026)*
@@ -231,22 +235,22 @@ At 10M rows the join-heavy queries show the biggest wins — the GPU kernel adva
 
 **10 M summary:** MX CPU beats Polars on **18/22** queries; MX GPU beats Polars on **15/22**. 🟢 Join-heavy queries scale dramatically: **Q9 128×**, **Q12 89×**, **Q7 42×**, **Q8 31×**, **Q17 24×**, **Q5 22×** CPU vs Polars. GPU join wins: **Q12 26.5×**, **Q9 12×**, **Q8 10.8×**, **Q17 9.7×**. At 10M, Q4/Q6/Q13/Q21 show Polars' strength on pure CPU-vectorised operations — these are Phase 6 targets (GPU string encoding + device-resident joins).
 ### Where MXFrame loses (same at both scales)
-
+- **Correctness ✅** — all 22 queries return results that round-trip through Pandas and match Polars output.
 - **Q4, Q6, Q13, Q21** — operations where our kernel path falls back to PyArrow compute or does extra passes. These are the focus of the next milestone (see [`roadmap.md`](roadmap.md)).
-
+- **Coverage ✅** — every TPC-H query has a CPU AOT path; all group aggs, masked aggs, joins, and sort/top-k have GPU AOT paths; no MAX Graph session required for any hot-path operation.
 ### What the numbers mean
 
 - **Correctness ✅** — all 22 queries return results that round-trip through Pandas and match Polars output.
-- **Coverage ✅** — every TPC-H query has a CPU AOT path; all group aggs/masked aggs have GPU AOT paths; GPU joins use shape-cached MAX Graph models.
-- **No JIT tax in steady state** — after the first query of each shape warms the GPU join model cache, every subsequent call is pure dispatch. The CPU path has no JIT at all.
-- **Why GPU doesn't always win** — GPU wins scale with workload size and kernel coverage. At 10 M, GPU crushes Polars on the join-heavy queries (Q8/Q9/Q12) where Mojo's shape-cached kernels pay off. Where GPU loses, it's either PCIe overhead on tiny outputs (Q1, Q6) or ops that still route through PyArrow fallback (Q4, Q13, Q21).
+- **Coverage ✅** — every TPC-H query has a CPU AOT path; all group aggs, masked aggs, joins, and sort/top-k have GPU AOT paths; no MAX Graph session required for any hot-path operation.
+- **No JIT tax** — CPU has no JIT at all. GPU dispatches directly to AOT ctypes for every hot operator. The only MAX Graph usage is for non-hot-path ops (string predicates, date extraction) which are negligible.
+- **Why GPU doesn't always win** — GPU wins scale with workload size and kernel coverage. At 10 M, GPU crushes Polars on the join-heavy queries (Q8/Q9/Q12) where Mojo's AOT kernels pay off. Where GPU loses, it's either PCIe overhead on small outputs (Q1, Q6) or ops that still route through PyArrow fallback (Q4, Q13, Q21).
+## ⚠️ Current Limitations: Where PyArrow and NumPy Still Run
 
-
-
+MXFrame is **not 100% Mojo end-to-end** — and that is a deliberate, documented trade-off, not a hack.
 ---
 
 ## ⚠️ Current Limitations: Where PyArrow and NumPy Still Run
-
+### What still runs in PyArrow / NumPy
 MXFrame is **not 100% Mojo end-to-end** — and that is a deliberate, documented trade-off, not a hack.
 The computational hot path (aggregation, joins, sort, gather) is fully Mojo-compiled.
 Certain orchestration steps still use PyArrow or NumPy for specific technical reasons explained below.
@@ -267,7 +271,7 @@ Certain orchestration steps still use PyArrow or NumPy for specific technical re
 
 The benchmark methodology uses **1 warmup run + median of 3 timed runs**.
 The warmup run primes three caches:
-
+After warmup, the 3 timed runs do **zero PyArrow encoding** and **zero re-upload** of stable column data.
 - **`_GROUP_ENCODE_CACHE`** — group-key dictionary encoding result (PyArrow SIMD, runs once per unique `(table, keys)` pair)
 - **`_INPUT_PREP_CACHE`** — column array preparation and filter masking
 - **`_JOIN_RESULT_CACHE`** — join output `pa.Table` (same input tables → same result)
@@ -277,7 +281,7 @@ They measure pure kernel dispatch + GPU execution — which is the steady-state 
 
 Cold-run numbers (first query after `clear_cache()`) are higher because encoding and upload happen once.
 That is a real cost and Phase 4 reduces it for join-heavy queries.
-
+The table below tracks the GPU-native kernel work.  Completed phases are
 ---
 
 ## 🗺️ Roadmap: Remaining Mojo Work
@@ -313,13 +317,12 @@ shipped in v0.2.x releases; items are ordered by performance impact.
 > exits 0 with **22/22 queries GPU-CLEAN (100%)** — every computationally heavy operator
 > reaches a Mojo GPU kernel. The remaining PyArrow code is orchestration and string handling,
 > not the reduction or join bottleneck.
-
+To run the benchmark with **official TPC-H data** (generated by DuckDB's
 ---
 
-## 🔁 Reproducing the Benchmark
+## 🔁 Reproducing the Benchmarkfaithful port of the TPC-H `dbgen` tool):
 
 To run the benchmark with **official TPC-H data** (generated by DuckDB's
-faithful port of the TPC-H `dbgen` tool):
 
 ```sh
 # Step 1 — generate TPC-H data (requires: pip install duckdb)
@@ -523,7 +526,7 @@ pixi run python3 scripts/bench_simple.py --rows 1000000 --runs 3
 | `pyarrow >= 14` | ✅ | Column storage, zero-copy NumPy bridge |
 | `numpy >= 1.24` | ✅ | Vectorized pre/post processing |
 | `pandas >= 2.0` | ✅ | Reference implementations, Pandas bridge |
-| `modular >= 26.2` | GPU only | MAX Engine runtime, Mojo GPU dispatch |
+| `modular >= 26.4` | GPU only | MAX Engine runtime, Mojo GPU dispatch |
 | `polars >= 0.20` | optional | Polars bridge + benchmark comparison |
 | `sqlglot >= 25` | optional | SQL frontend parsing |
 
