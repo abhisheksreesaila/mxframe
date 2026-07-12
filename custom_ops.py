@@ -367,6 +367,23 @@ class CustomOpsCompiler(GraphCompiler):
             rhs = self._eval_expr_arrow(args[1], table)
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
             return fn(lhs, rhs)
+        if op in ("eq", "ne"):
+            lhs_expr, rhs_expr = args[0], args[1]
+            if (self._session_device == "gpu" and self._aot_gpu is not None
+                    and lhs_expr.op == "col" and rhs_expr.op == "lit"
+                    and isinstance(rhs_expr.args[0], str)):
+                col_arr = self._eval_expr_arrow(lhs_expr, table)
+                if pa.types.is_string(col_arr.type):
+                    mask = self._aot_gpu.utf8_equal_mask(col_arr, rhs_expr.args[0])
+                    bool_mask = mask.astype(np.bool_, copy=False)
+                    if op == "ne":
+                        bool_mask = np.logical_not(bool_mask)
+                        if col_arr.null_count:
+                            bool_mask &= col_arr.is_valid().to_numpy(zero_copy_only=False)
+                    return pa.array(bool_mask, type=pa.bool_())
+            lhs = self._eval_expr_arrow(args[0], table)
+            rhs = self._eval_expr_arrow(args[1], table)
+            return _PC_CMP_OPS[op](lhs, rhs)
         if op in _PC_CMP_OPS:
             lhs = self._eval_expr_arrow(args[0], table)
             rhs = self._eval_expr_arrow(args[1], table)
@@ -375,12 +392,25 @@ class CustomOpsCompiler(GraphCompiler):
             return pc.invert(self._eval_expr_arrow(args[0], table))
         if op == "isin":
             col_arr = self._eval_expr_arrow(args[0], table)
+            if (self._session_device == "gpu" and self._aot_gpu is not None
+                    and pa.types.is_string(col_arr.type) and args[1]
+                    and all(isinstance(value, str) for value in args[1])):
+                mask = self._aot_gpu.utf8_isin_mask(col_arr, args[1])
+                return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.is_in(col_arr, value_set=pa.array(args[1]))
         if op == "startswith":
             col_arr = self._eval_expr_arrow(args[0], table)
+            if (self._session_device == "gpu" and self._aot_gpu is not None
+                    and pa.types.is_string(col_arr.type)):
+                mask = self._aot_gpu.utf8_startswith_mask(col_arr, args[1])
+                return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.starts_with(col_arr, pattern=args[1])
         if op == "contains":
             col_arr = self._eval_expr_arrow(args[0], table)
+            if (self._session_device == "gpu" and self._aot_gpu is not None
+                    and pa.types.is_string(col_arr.type)):
+                mask = self._aot_gpu.utf8_contains_mask(col_arr, args[1])
+                return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.match_substring(col_arr, pattern=args[1])
         if op == "year":
             col_arr = self._eval_expr_arrow(args[0], table)
@@ -530,6 +560,45 @@ class CustomOpsCompiler(GraphCompiler):
         if expr.op == "col":
             return expr.args[0]
         return None
+
+    @staticmethod
+    def _flatten_and(expr) -> list:
+        if expr.op == "and":
+            return (CustomOpsCompiler._flatten_and(expr.args[0])
+                    + CustomOpsCompiler._flatten_and(expr.args[1]))
+        return [expr]
+
+    @classmethod
+    def _range5_product_spec(cls, predicates, agg_node):
+        """Recognize a five-comparison range filter feeding sum(col * col)."""
+        if len(agg_node.aggs) != 1 or agg_node.aggs[0].op != "sum":
+            return None
+        product = cls._is_simple_col_product(agg_node.aggs[0].args[0])
+        if product is None:
+            return None
+        terms = []
+        for predicate in predicates:
+            terms.extend(cls._flatten_and(predicate))
+        comparisons = {}
+        for term in terms:
+            if term.op not in ("ge", "gt", "le", "lt"):
+                return None
+            lhs, rhs = term.args
+            if lhs.op != "col" or rhs.op != "lit" or not isinstance(rhs.args[0], (int, float)):
+                return None
+            comparisons[(lhs.args[0], term.op)] = rhs.args[0]
+        columns = {name for name, _ in comparisons}
+        ranged = [name for name in columns if (name, "ge") in comparisons and (name, "lt") in comparisons]
+        float_ranged = [name for name in columns if (name, "ge") in comparisons and (name, "le") in comparisons]
+        upper = [name for name in columns if (name, "lt") in comparisons and name not in ranged]
+        if len(ranged) != 1 or len(float_ranged) != 1 or len(upper) != 1 or len(terms) != 5:
+            return None
+        return (
+            product,
+            ranged[0], comparisons[(ranged[0], "ge")], comparisons[(ranged[0], "lt")],
+            float_ranged[0], comparisons[(float_ranged[0], "ge")], comparisons[(float_ranged[0], "le")],
+            upper[0], comparisons[(upper[0], "lt")],
+        )
 
     def _run_masked_global_sum(
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
@@ -744,6 +813,26 @@ class CustomOpsCompiler(GraphCompiler):
         N = table.num_rows
 
         predicates = self._collect_predicates(plan)
+
+        range5_spec = self._range5_product_spec(predicates, agg_node)
+        if (range5_spec is not None and self._session_device == "gpu"
+                and self._aot_gpu is not None):
+            try:
+                (product, int_name, int_lo, int_hi, float_name, float_lo,
+                 float_hi, upper_name, upper_hi) = range5_spec
+                value = self._aot_gpu.range5_sum_product_f32(
+                    self._get_col_as_f32(product[0], table),
+                    self._get_col_as_f32(product[1], table),
+                    np.ascontiguousarray(
+                        table.column(int_name).to_numpy(zero_copy_only=False), dtype=np.int32),
+                    self._get_col_as_f32(float_name, table),
+                    self._get_col_as_f32(upper_name, table),
+                    int(int_lo), int(int_hi), float(float_lo), float(float_hi), float(upper_hi),
+                )
+                name = agg_node.aggs[0]._alias or "agg_0"
+                return pa.table({name: pa.array([value], type=pa.float64())})
+            except Exception:
+                pass
 
         # Compute mask as int32 numpy — no .filter() allocation.
         mask_np: Optional[np.ndarray] = None
@@ -2081,8 +2170,9 @@ class CustomOpsCompiler(GraphCompiler):
         """
         if how == "left":
             # Mojo left-outer join: join_count_left + join_scatter_left kernels.
-            left_keys  = self._encode_join_keys(left_table, left_on, self._aot_gpu)
-            right_keys = self._encode_join_keys(right_table, right_on, self._aot_gpu)
+            left_keys, right_keys = self._encode_join_key_pair(
+                left_table, right_table, left_on, right_on
+            )
             if self._session_device == "gpu":
                 left_idx, right_idx = self._hash_join_left_mojo_gpu(left_keys, right_keys)
             else:
@@ -2091,8 +2181,9 @@ class CustomOpsCompiler(GraphCompiler):
                                              left_idx, right_idx)
 
         # inner join via Mojo kernels
-        left_keys = self._encode_join_keys(left_table, left_on, self._aot_gpu)
-        right_keys = self._encode_join_keys(right_table, right_on, self._aot_gpu)
+        left_keys, right_keys = self._encode_join_key_pair(
+            left_table, right_table, left_on, right_on
+        )
 
         # Route by session device: GPU join kernels for GPU sessions,
         # CPU join kernels for CPU sessions.
@@ -2133,51 +2224,70 @@ class CustomOpsCompiler(GraphCompiler):
         return pa.Table.from_arrays(arrays, names=names)
 
     @staticmethod
-    def _encode_join_keys(table, key_cols, aot_gpu=None):
-        """Encode join key columns into a single int32 numpy array.
+    def _encode_join_key_pair(left_table, right_table, left_cols, right_cols):
+        """Encode both join sides into one shared dense int32 key space.
 
-        Phase 3: for non-integer single keys on GPU device, uses group_encode_i32_gpu
-        (AOT hash table) instead of PyArrow dictionary_encode — up to 30x faster.
-        For integer single keys: direct cast (always fast).
-        For multi-key: composite encoding via dictionary_encode (unchanged).
+        Encoding each table independently is incorrect for strings because Arrow
+        assigns dictionary IDs in encounter order. A single dictionary over both
+        sides guarantees that equal values receive equal IDs. Multi-column keys
+        are then jointly densified, avoiding mixed-radix overflow and keeping the
+        AOT hash table compact. Nulls receive side-specific IDs and never match.
         """
-        if len(key_cols) == 1:
-            arr = table.column(key_cols[0])
-            if isinstance(arr, pa.ChunkedArray):
-                arr = arr.combine_chunks()
-            # Integer type: direct cast, no encoding needed
-            if pa.types.is_integer(arr.type):
-                return arr.to_numpy(zero_copy_only=False).astype(np.int32)
+        if len(left_cols) != len(right_cols) or not left_cols:
+            raise ValueError("join key column lists must be non-empty and equal length")
 
-            # Non-integer (float, string, date, ...): PyArrow dictionary encode.
-            # GPU hash encoding for float keys is avoided: 5M-unique float columns
-            # saturate the hash table and hang. Integer join keys (the common case)
-            # are already handled above via direct cast.
-            enc = arr.dictionary_encode()
-            return enc.indices.to_numpy(zero_copy_only=False).astype(np.int32)
+        n_left = len(left_table)
+        paired_codes = []
+        for left_name, right_name in zip(left_cols, right_cols):
+            left_arr = left_table.column(left_name).combine_chunks()
+            right_arr = right_table.column(right_name).combine_chunks()
+            if left_arr.type != right_arr.type:
+                raise TypeError(
+                    f"join key types differ: {left_name}={left_arr.type}, "
+                    f"{right_name}={right_arr.type}"
+                )
 
-        # Multi-key: composite encoding (unchanged — dictionary encode per column)
-        encodings = []
-        for k in key_cols:
-            arr = table.column(k)
-            if isinstance(arr, pa.ChunkedArray):
-                arr = arr.combine_chunks()
-            encodings.append(arr.dictionary_encode())
+            if (
+                len(left_cols) == 1
+                and pa.types.is_integer(left_arr.type)
+                and left_arr.null_count == 0
+                and right_arr.null_count == 0
+            ):
+                left_np = left_arr.to_numpy(zero_copy_only=False)
+                right_np = right_arr.to_numpy(zero_copy_only=False)
+                all_keys = np.concatenate([left_np, right_np])
+                if len(all_keys) == 0:
+                    return (
+                        np.empty(n_left, dtype=np.int32),
+                        np.empty(len(right_table), dtype=np.int32),
+                    )
+                max_key = int(all_keys.max())
+                if int(all_keys.min()) >= 0 and max_key <= max(1024, 4 * len(all_keys)):
+                    return (
+                        np.ascontiguousarray(left_np.astype(np.int32)),
+                        np.ascontiguousarray(right_np.astype(np.int32)),
+                    )
 
-        sizes = [len(e.dictionary) for e in encodings]
-        strides = []
-        for i in range(len(sizes)):
-            s = 1
-            for j in range(i + 1, len(sizes)):
-                s *= sizes[j]
-            strides.append(s)
+            encoded = pa.concat_arrays([left_arr, right_arr]).dictionary_encode()
+            codes = encoded.indices.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
+            nulls = codes < 0
+            if nulls.any():
+                next_code = len(encoded.dictionary)
+                codes[:n_left][nulls[:n_left]] = next_code
+                codes[n_left:][nulls[n_left:]] = next_code + 1
+            paired_codes.append(codes)
 
-        # Use int64 to avoid overflow when strides are large (many-column groupby)
-        composite = np.zeros(len(table), dtype=np.int64)
-        for i, enc in enumerate(encodings):
-            idx = enc.indices.to_numpy(zero_copy_only=False).astype(np.int64)
-            composite += idx * np.int64(strides[i])
-        return composite
+        if len(paired_codes) == 1:
+            dense = paired_codes[0]
+        else:
+            matrix = np.column_stack(paired_codes)
+            _, dense = np.unique(matrix, axis=0, return_inverse=True)
+
+        dense = dense.astype(np.int32, copy=False)
+        return (
+            np.ascontiguousarray(dense[:n_left]),
+            np.ascontiguousarray(dense[n_left:]),
+        )
 
     def _assemble_left_outer(self, left_table, right_table, right_on, left_idx, right_idx):
         """Assemble left-outer result. right_idx==-1 means no match (null right cols)."""

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mxframe"
-version = "0.3.0"
-description = "GPU-accelerated DataFrame engine: Python ergonomics + Mojo AOT kernels, cross-vendor (NVIDIA/AMD/Apple)."
+version = "0.5.0"
+description = "GPU-accelerated DataFrame engine with Python ergonomics and Mojo AOT kernels."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -38,10 +38,12 @@ runtime = ["modular>=26.4"]
 polars  = ["polars>=0.20"]
 sql     = ["sqlglot>=25.0"]
 dev     = [
+    "build>=1.2",
     "pytest>=7.0",
     "polars>=0.20",
     "sqlglot>=25.0",
     "duckdb>=0.9",
+    "twine>=6.0",
 ]
 
 [project.urls]

@@ -5,9 +5,10 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mxframe import LazyFrame, col, lit, when
+from mxframe.aot_kernels import AOTKernelsGPU
 from mxframe.custom_ops import clear_cache
 
-DEVICE = "cpu"
+DEVICE = os.environ.get("MXFRAME_TEST_DEVICE", "cpu")
 
 
 def reset():
@@ -39,6 +40,21 @@ def test_startswith_filter():
     print("OK Test 2: startswith() filter predicate")
 
 
+def test_contains_filter():
+    reset()
+    tbl = pa.table({
+        "name": ["forest green", "blue", None, "evergreen", "GREEN"],
+        "val": [1.0, 2.0, 4.0, 8.0, 16.0],
+    })
+    r = (LazyFrame(tbl)
+         .filter(col("name").contains("green"))
+         .groupby()
+         .agg(col("val").sum().alias("s"))
+         .compute(device=DEVICE))
+    assert float(r.column("s")[0].as_py()) == 9.0
+    print("OK Test 3: contains() filter predicate")
+
+
 def test_invert_isin():
     reset()
     tbl = pa.table({"mode": ["MAIL", "SHIP", "TRUCK", "AIR"], "val": [1.0, 2.0, 3.0, 4.0]})
@@ -48,7 +64,7 @@ def test_invert_isin():
          .agg(col("val").sum().alias("s"))
          .compute(device=DEVICE))
     assert float(r.column("s")[0].as_py()) == 7.0
-    print("OK Test 3: ~isin (logical NOT) filter")
+    print("OK Test 4: ~isin (logical NOT) filter")
 
 
 def test_ne_filter():
@@ -60,7 +76,35 @@ def test_ne_filter():
          .agg(col("y").sum().alias("s"))
          .compute(device=DEVICE))
     assert float(r.column("s")[0].as_py()) == 40.0
-    print("OK Test 4: ne (!=) filter")
+    print("OK Test 5: ne (!=) filter")
+
+
+def test_utf8_equal_ne_and_isin_edges():
+    reset()
+    values = pa.array(["", "MAIL", None, "étoile", "SHIP", "MAIL"])
+    table = pa.table({"value": values, "weight": [1.0, 2.0, 4.0, 8.0, 16.0, 32.0]})
+    equal_result = (LazyFrame(table)
+                    .filter(col("value") == lit("MAIL"))
+                    .groupby().agg(col("weight").sum().alias("s"))
+                    .compute(device=DEVICE))
+    ne_result = (LazyFrame(table)
+                 .filter(col("value") != lit("MAIL"))
+                 .groupby().agg(col("weight").sum().alias("s"))
+                 .compute(device=DEVICE))
+    assert float(equal_result.column("s")[0].as_py()) == 34.0
+    assert float(ne_result.column("s")[0].as_py()) == 25.0
+
+    if DEVICE == "gpu":
+        gpu = AOTKernelsGPU()
+        sliced = values.slice(1, 4)
+        expected_equal = np.array([1, 0, 0, 0], dtype=np.int32)
+        expected_isin = np.array([1, 0, 1, 0], dtype=np.int32)
+        np.testing.assert_array_equal(gpu.utf8_equal_mask(sliced, "MAIL"), expected_equal)
+        np.testing.assert_array_equal(
+            gpu.utf8_isin_mask(sliced, ["MAIL", "MAIL", "étoile", ""]), expected_isin)
+        np.testing.assert_array_equal(
+            gpu.utf8_isin_mask(sliced, []), np.zeros(len(sliced), dtype=np.int32))
+    print("OK Test 6: UTF-8 eq/ne/isin edge semantics")
 
 
 def test_case_when_numeric():
@@ -71,7 +115,7 @@ def test_case_when_numeric():
          .agg(when(col("x") > lit(4.0), lit(1.0), lit(0.0)).sum().alias("high"))
          .compute(device=DEVICE))
     assert float(r.column("high")[0].as_py()) == 2.0
-    print("OK Test 5: when() with numeric condition")
+    print("OK Test 7: when() with numeric condition")
 
 
 def test_case_when_isin():
@@ -87,7 +131,7 @@ def test_case_when_isin():
          .compute(device=DEVICE))
     assert float(r.column("high")[0].as_py()) == 3.0, str(r)
     assert float(r.column("low")[0].as_py()) == 2.0, str(r)
-    print("OK Test 6: when() with isin condition")
+    print("OK Test 8: when() with isin condition")
 
 
 def test_case_when_startswith():
@@ -105,7 +149,7 @@ def test_case_when_startswith():
     got = float(r.column("promo_rev")[0].as_py())
     # 200*(1-0.1) + 100*(1-0.2) = 180 + 80 = 260
     assert abs(got - 260.0) < 0.5, f"got {got}"
-    print("OK Test 7: when() with startswith condition")
+    print("OK Test 9: when() with startswith condition")
 
 
 def test_q12_style():
@@ -169,10 +213,10 @@ def test_q12_style():
                 mv = float(result.column(agg)[mi].as_py())
                 rv = float(ref.column(agg)[ri].as_py())
                 assert abs(mv - rv) < 1.0, f"Q12 {mode} {agg}: MX={mv}, DuckDB={rv}"
-        print("OK Test 8: Q12-style (join + isin + grouped case_when) -- matches DuckDB")
+        print("OK Test 10: Q12-style (join + isin + grouped case_when) -- matches DuckDB")
     except ImportError:
         assert result.num_rows == 2
-        print("OK Test 8: Q12-style -- shape OK (no DuckDB)")
+        print("OK Test 10: Q12-style -- shape OK (no DuckDB)")
 
 
 def test_q14_style():
@@ -229,16 +273,17 @@ def test_q14_style():
         ref_promo, ref_total = float(ref[0] or 0), float(ref[1] or 0)
         ref_pct = 100.0 * ref_promo / ref_total if ref_total > 0 else 0.0
         assert abs(pct - ref_pct) < 0.5, f"Q14: MX={pct:.4f}%, DuckDB={ref_pct:.4f}%"
-        print(f"OK Test 9: Q14-style -- promo_revenue={pct:.2f}% (DuckDB={ref_pct:.2f}%)")
+        print(f"OK Test 11: Q14-style -- promo_revenue={pct:.2f}% (DuckDB={ref_pct:.2f}%)")
     except ImportError:
         assert 0.0 < pct < 100.0
-        print(f"OK Test 9: Q14-style -- promo_revenue={pct:.2f}% (no DuckDB)")
+        print(f"OK Test 11: Q14-style -- promo_revenue={pct:.2f}% (no DuckDB)")
 
 
 if __name__ == "__main__":
     tests = [
-        test_isin_filter, test_startswith_filter, test_invert_isin,
-        test_ne_filter, test_case_when_numeric, test_case_when_isin,
+        test_isin_filter, test_startswith_filter, test_contains_filter, test_invert_isin,
+        test_ne_filter, test_utf8_equal_ne_and_isin_edges,
+        test_case_when_numeric, test_case_when_isin,
         test_case_when_startswith, test_q12_style, test_q14_style,
     ]
     for t in tests:

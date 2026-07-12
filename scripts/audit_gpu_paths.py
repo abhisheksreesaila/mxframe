@@ -158,8 +158,9 @@ def main() -> int:
         try:
             # Warmup (also captures provenance for classification)
             _records = []
+            b._DIRECT_PROVENANCE.clear()
             run(args.device)
-            records = list(_records)
+            records = [*_records, *b._DIRECT_PROVENANCE]
             status = classify(records, args.device)
             detail = " ".join(
                 f"{r.get('path')}@{r.get('device')}" for r in records
@@ -168,6 +169,7 @@ def main() -> int:
             samples = []
             for _ in range(args.runs):
                 _records = []
+                b._DIRECT_PROVENANCE.clear()
                 t0 = time.perf_counter()
                 run(args.device)
                 samples.append((time.perf_counter() - t0) * 1000.0)

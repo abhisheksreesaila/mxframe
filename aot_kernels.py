@@ -317,6 +317,7 @@ def _bind_gpu(lib, name: str, argtypes: list):
 
 _P64 = ctypes.c_int64   # GPU device pointer as int64
 _I64 = ctypes.c_int64   # plain integer sizes
+_F32 = ctypes.c_float
 
 _gpu_lib_path = _find_gpu_lib()
 GPU_AOT_AVAILABLE = _gpu_lib_path is not None
@@ -432,7 +433,9 @@ class AOTKernelsGPU:
         if self._cu is None:
             raise RuntimeError("CUDA driver unavailable")
         # Device-buffer cache: avoids re-uploading the same numpy arrays on hot runs.
-        # Key: (data_ptr, shape, dtype_str) → device pointer (int).
+        # Key: (data_ptr, shape, dtype_str) → (device pointer, host owner).
+        # Retaining the owner prevents NumPy from recycling a temporary array's
+        # address while its old device buffer is still cached.
         # Evicts oldest entry when size exceeds _BUF_CACHE_MAX.
         self._buf_cache: dict = {}
         self._BUF_CACHE_MAX = 128
@@ -447,8 +450,17 @@ class AOTKernelsGPU:
         _4c = [_P64, _P64, _I64, _I64]                # group_count (no val)
         _mgs = [_P64, _P64, _P64, _I64]               # masked_global_sum
         _mgsp = [_P64, _P64, _P64, _P64, _I64]        # sum_product
+        _range5 = [
+            _P64, _P64, _P64, _P64, _P64, _P64,
+            _I64, _I64, _I64, _F32, _F32, _F32,
+        ]
+        _semi_group = [_P64] * 8 + [_I64] * 6
+        _key_counts = [_P64, _P64, _P64, _P64, _I64, _I64, _I64]
+        _single_late = [_P64] * 11 + [_I64] * 4
         _fg  = [_P64, _P64, _P64, _P64, _I64]         # filter_gather
         _um  = [_P64, _P64, _I64]                      # unique_mask
+        _utf8_sw = [_P64, _P64, _P64, _P64, _P64, _I64, _I64]
+        _utf8_isin = [_P64, _P64, _P64, _P64, _P64, _P64, _I64, _I64]
 
         self._group_sum      = _bind_gpu(L, "group_sum_f32_gpu",             _5)
         self._group_min      = _bind_gpu(L, "group_min_f32_gpu",             _5)
@@ -458,6 +470,13 @@ class AOTKernelsGPU:
         self._masked_min     = _bind_gpu(L, "masked_global_min_f32_gpu",     _mgs)
         self._masked_max     = _bind_gpu(L, "masked_global_max_f32_gpu",     _mgs)
         self._masked_sumprod = _bind_gpu(L, "masked_global_sum_product_f32_gpu", _mgsp)
+        self._range5_sumprod = _bind_gpu(L, "range5_sum_product_f32_gpu", _range5)
+        self._semi_range_group_count = _bind_gpu(
+            L, "semi_range_group_count_i32_gpu", _semi_group)
+        self._key_match_counts = _bind_gpu(
+            L, "key_match_counts_i32_gpu", _key_counts)
+        self._single_late_supplier_counts = _bind_gpu(
+            L, "single_late_supplier_counts_i32_gpu", _single_late)
         # group_encode_i32_gpu: keys, out_ids, out_ng, htab, htid, n, cap
         _7  = [_P64, _P64, _P64, _P64, _P64, _I64, _I64]
         self._group_encode_i32 = _bind_gpu(L, "group_encode_i32_gpu", _7)
@@ -468,6 +487,14 @@ class AOTKernelsGPU:
         self._fg_i32 = _bind_gpu(L, "filter_gather_i32_gpu", _fg)
         self._fg_i64 = _bind_gpu(L, "filter_gather_i64_gpu", _fg)
         self._unique_mask  = _bind_gpu(L, "unique_mask_gpu", _um)
+        self._utf8_startswith = _bind_gpu(
+            L, "utf8_startswith_mask_gpu", _utf8_sw)
+        self._utf8_contains = _bind_gpu(
+            L, "utf8_contains_mask_gpu", _utf8_sw)
+        self._utf8_equal = _bind_gpu(
+            L, "utf8_equal_mask_gpu", _utf8_sw)
+        self._utf8_isin = _bind_gpu(
+            L, "utf8_isin_mask_gpu", _utf8_isin)
         # join kernels (Phase 4 — device-resident join pipeline)
         # join_count: (counts, table, left, right, n_left, n_right, table_size)
         _jc  = [_P64, _P64, _P64, _P64, _I64, _I64, _I64]
@@ -488,7 +515,13 @@ class AOTKernelsGPU:
         self._cu.h2d(dev, arr)
         return dev
 
-    def _cached_upload(self, arr: np.ndarray) -> int:
+    def _cached_upload(
+        self,
+        arr: np.ndarray,
+        *,
+        cache_key=None,
+        owner=None,
+    ) -> int:
         """Upload arr to GPU with caching by data pointer.
 
         On hot benchmark runs the same numpy arrays are reused (they live in
@@ -497,22 +530,22 @@ class AOTKernelsGPU:
         Python array object.  Output buffers (written by kernels) must NOT
         be cached here — only read-only input arrays.
         """
-        key = (arr.ctypes.data, arr.shape, arr.dtype.str)
-        ptr = self._buf_cache.get(key)
-        if ptr is not None:
-            return ptr
+        key = cache_key or (arr.ctypes.data, arr.shape, arr.dtype.str)
+        entry = self._buf_cache.get(key)
+        if entry is not None:
+            return entry[0]
         ptr = self._upload(arr)
         if len(self._buf_cache) >= self._BUF_CACHE_MAX:
             # Evict the oldest entry (dict insertion order) and free GPU memory.
-            old_key, old_ptr = next(iter(self._buf_cache.items()))
+            old_key, (old_ptr, _) = next(iter(self._buf_cache.items()))
             del self._buf_cache[old_key]
             self._cu.free(old_ptr)
-        self._buf_cache[key] = ptr
+        self._buf_cache[key] = (ptr, owner if owner is not None else arr)
         return ptr
 
     def clear_buf_cache(self):
         """Free all cached device buffers and clear the cache."""
-        for ptr in self._buf_cache.values():
+        for ptr, _ in self._buf_cache.values():
             self._cu.free(ptr)
         self._buf_cache.clear()
 
@@ -606,6 +639,107 @@ class AOTKernelsGPU:
         mask = cnts > 0.0
         return np.where(mask, sums / np.where(mask, cnts, 1.0), 0.0).astype(np.float32)
 
+    @staticmethod
+    def _utf8_buffers(arr: "pa.Array") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Expose a sliced Arrow UTF-8 array as offsets, data, and validity."""
+        import pyarrow as pa
+
+        if not pa.types.is_string(arr.type):
+            raise TypeError(f"Expected Arrow string array, got {arr.type}")
+
+        n = len(arr)
+        validity_buffer, offsets_buffer, data_buffer = arr.buffers()
+        raw_offsets = np.frombuffer(offsets_buffer, dtype=np.int32)
+        offsets = np.ascontiguousarray(
+            raw_offsets[arr.offset:arr.offset + n + 1] - raw_offsets[arr.offset],
+            dtype=np.int32,
+        )
+        data_start = int(raw_offsets[arr.offset])
+        data_end = int(raw_offsets[arr.offset + n])
+        data = np.frombuffer(data_buffer, dtype=np.uint8)[data_start:data_end]
+        data = np.ascontiguousarray(data, dtype=np.uint8)
+        valid = np.ones(n, dtype=np.uint8)
+        if validity_buffer is not None:
+            valid = np.ascontiguousarray(
+                arr.is_valid().to_numpy(zero_copy_only=False), dtype=np.uint8)
+        return offsets, data, valid
+
+    def _utf8_match_mask(self, arr: "pa.Array", pattern: str, kernel) -> np.ndarray:
+        n = len(arr)
+        if n == 0:
+            return np.empty(0, dtype=np.int32)
+        offsets, data, valid = self._utf8_buffers(arr)
+        pattern_bytes = np.frombuffer(pattern.encode("utf-8"), dtype=np.uint8).copy()
+        if len(pattern_bytes) == 0:
+            return valid.astype(np.int32, copy=False)
+
+        offsets_dev = self._upload(offsets)
+        data_dev = self._upload(data)
+        valid_dev = self._upload(valid)
+        pattern_dev = self._upload(pattern_bytes)
+        out_dev = self._cu.malloc(n * 4)
+        try:
+            kernel(
+                self._ptr(out_dev), self._ptr(offsets_dev), self._ptr(data_dev),
+                self._ptr(valid_dev), self._ptr(pattern_dev), n, len(pattern_bytes),
+            )
+            self._cu.sync()
+            return self._download(out_dev, np.int32, n)
+        finally:
+            self._free(offsets_dev, data_dev, valid_dev, pattern_dev, out_dev)
+
+    def utf8_startswith_mask(self, arr: "pa.Array", prefix: str) -> np.ndarray:
+        """Evaluate an Arrow UTF-8 starts-with predicate on the GPU."""
+        return self._utf8_match_mask(arr, prefix, self._utf8_startswith)
+
+    def utf8_contains_mask(self, arr: "pa.Array", pattern: str) -> np.ndarray:
+        """Evaluate an Arrow UTF-8 substring predicate on the GPU."""
+        return self._utf8_match_mask(arr, pattern, self._utf8_contains)
+
+    def utf8_equal_mask(self, arr: "pa.Array", value: str) -> np.ndarray:
+        """Evaluate exact Arrow UTF-8 scalar equality on the GPU."""
+        n = len(arr)
+        if n == 0:
+            return np.empty(0, dtype=np.int32)
+        offsets, data, valid = self._utf8_buffers(arr)
+        pattern = np.frombuffer(value.encode("utf-8"), dtype=np.uint8).copy()
+        pattern_storage = pattern if len(pattern) else np.zeros(1, dtype=np.uint8)
+        devices = [self._upload(value) for value in (offsets, data, valid, pattern_storage)]
+        out = self._cu.malloc(n * 4)
+        try:
+            self._utf8_equal(
+                self._ptr(out), *(self._ptr(ptr) for ptr in devices), n, len(pattern))
+            self._cu.sync()
+            return self._download(out, np.int32, n)
+        finally:
+            self._free(*devices, out)
+
+    def utf8_isin_mask(self, arr: "pa.Array", values: list[str]) -> np.ndarray:
+        """Evaluate membership in packed UTF-8 literals on the GPU."""
+        n = len(arr)
+        if n == 0 or not values:
+            return np.zeros(n, dtype=np.int32)
+        unique_values = list(dict.fromkeys(values))
+        encoded = [value.encode("utf-8") for value in unique_values]
+        pattern_offsets = np.zeros(len(encoded) + 1, dtype=np.int32)
+        np.cumsum([len(value) for value in encoded], out=pattern_offsets[1:])
+        joined = b"".join(encoded)
+        pattern_data = np.frombuffer(joined, dtype=np.uint8).copy()
+        if len(pattern_data) == 0:
+            pattern_data = np.zeros(1, dtype=np.uint8)
+        offsets, data, valid = self._utf8_buffers(arr)
+        devices = [self._upload(value) for value in (
+            offsets, data, valid, pattern_offsets, pattern_data)]
+        out = self._cu.malloc(n * 4)
+        try:
+            self._utf8_isin(
+                self._ptr(out), *(self._ptr(ptr) for ptr in devices),
+                n, len(unique_values))
+            self._cu.sync()
+            return self._download(out, np.int32, n)
+        finally:
+            self._free(*devices, out)
+
     def group_encode_i32(self, keys: np.ndarray, cap: int) -> tuple:
         """GPU open-addressing hash-table encode of int32 keys.
 
@@ -676,6 +810,116 @@ class AOTKernelsGPU:
         res = self._download(out, np.float32, 1)[0]
         self._cu.free(out)
         return float(res)
+
+    def range5_sum_product_f32(
+        self,
+        a: np.ndarray,
+        b: np.ndarray,
+        int_col: np.ndarray,
+        float_col: np.ndarray,
+        upper_col: np.ndarray,
+        int_lo: int,
+        int_hi: int,
+        float_lo: float,
+        float_hi: float,
+        upper_hi: float,
+    ) -> float:
+        """Fuse five range comparisons with sum(a * b) in one GPU pass."""
+        arrays = [a, b, float_col, upper_col]
+        av, bv, fv, uv = [self._cached_upload(self._c(v, np.float32)) for v in arrays]
+        iv = self._cached_upload(self._c(int_col, np.int32))
+        out = self._cu.malloc(4)
+        self._range5_sumprod(
+            self._ptr(out), self._ptr(av), self._ptr(bv), self._ptr(iv),
+            self._ptr(fv), self._ptr(uv), len(a), int_lo, int_hi,
+            float_lo, float_hi, upper_hi,
+        )
+        self._cu.sync()
+        result = float(self._download(out, np.float32, 1)[0])
+        self._cu.free(out)
+        return result
+
+    def semi_range_group_count_i32(
+        self,
+        right_keys: np.ndarray,
+        right_a: np.ndarray,
+        right_b: np.ndarray,
+        left_keys: np.ndarray,
+        left_range: np.ndarray,
+        left_groups: np.ndarray,
+        n_groups: int,
+        left_lo: int,
+        left_hi: int,
+    ) -> np.ndarray:
+        """GPU semi-join plus range filter and grouped row count."""
+        inputs = [right_keys, right_a, right_b, left_keys, left_range, left_groups]
+        devices = [self._cached_upload(self._c(value, np.int32)) for value in inputs]
+        table_size = int(max(np.max(right_keys), np.max(left_keys))) + 1
+        marks = self._cu.malloc(table_size * 4)
+        out = self._cu.malloc(n_groups * 4)
+        self._semi_range_group_count(
+            self._ptr(out), self._ptr(marks), *(self._ptr(ptr) for ptr in devices),
+            len(right_keys), len(left_keys), table_size, n_groups, left_lo, left_hi,
+        )
+        self._cu.sync()
+        result = self._download(out, np.int32, n_groups)
+        self._free(marks, out)
+        return result
+
+    def key_match_counts_i32(
+        self, left_keys: np.ndarray, right_keys: np.ndarray
+    ) -> np.ndarray:
+        """Return the number of right-key matches for every left key."""
+        left = self._c(left_keys, np.int32)
+        right = self._c(right_keys, np.int32)
+        table_size = int(max(np.max(left), np.max(right))) + 1
+        left_dev = self._cached_upload(left)
+        right_dev = self._cached_upload(right)
+        counts = self._cu.malloc(table_size * 4)
+        out = self._cu.malloc(len(left) * 4)
+        self._key_match_counts(
+            self._ptr(out), self._ptr(counts), self._ptr(left_dev),
+            self._ptr(right_dev), len(left), len(right), table_size,
+        )
+        self._cu.sync()
+        result = self._download(out, np.int32, len(left))
+        self._free(counts, out)
+        return result
+
+    def single_late_supplier_counts_i32(
+        self,
+        order_keys: np.ndarray,
+        supplier_keys: np.ndarray,
+        commit: np.ndarray,
+        receipt: np.ndarray,
+        finished_orders: np.ndarray,
+        target_suppliers: np.ndarray,
+    ) -> np.ndarray:
+        """Count Q21 single-late-order waits per target supplier on GPU."""
+        inputs = [order_keys, supplier_keys, commit, receipt,
+                  finished_orders, target_suppliers]
+        devices = [self._cached_upload(self._c(value, np.int32)) for value in inputs]
+        n_rows = len(order_keys)
+        n_orders = len(finished_orders)
+        n_suppliers = len(target_suppliers)
+        cap = 1
+        while cap < max(2, n_rows * 2):
+            cap <<= 1
+        out = self._cu.malloc(n_suppliers * 4)
+        order_counts = self._cu.malloc(n_orders * 4)
+        states = self._cu.malloc(cap * 4)
+        hash_orders = self._cu.malloc(cap * 4)
+        hash_suppliers = self._cu.malloc(cap * 4)
+        self._single_late_supplier_counts(
+            self._ptr(out), self._ptr(order_counts), self._ptr(states),
+            self._ptr(hash_orders), self._ptr(hash_suppliers),
+            *(self._ptr(ptr) for ptr in devices),
+            n_rows, n_orders, n_suppliers, cap,
+        )
+        self._cu.sync()
+        result = self._download(out, np.int32, n_suppliers)
+        self._free(out, order_counts, states, hash_orders, hash_suppliers)
+        return result
 
     # ── gather ───────────────────────────────────────────────────────────────
 
@@ -809,10 +1053,24 @@ class AOTKernelsGPU:
             if isinstance(col, pa.ChunkedArray):
                 col = col.combine_chunks()
             src_len = len(col)
+            value_buffer = col.buffers()[1]
+            buffer_address = value_buffer.address if value_buffer is not None else 0
+
+            def cached_source(src_np, target_dtype):
+                key = (
+                    "arrow",
+                    buffer_address,
+                    col.offset,
+                    src_len,
+                    str(col.type),
+                    np.dtype(target_dtype).str,
+                )
+                return self._cached_upload(src_np, cache_key=key, owner=col)
+
             if pa.types.is_float32(col.type):
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.float32))
-                s = self._cached_upload(src_np)
+                s = cached_source(src_np, np.float32)
                 out = self._cu.malloc(n * 4)
                 self._gather_f32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
                 self._cu.sync()
@@ -822,7 +1080,7 @@ class AOTKernelsGPU:
                 # downcast float64→float32 for GPU, restore type after
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.float32))
-                s = self._cached_upload(src_np)
+                s = cached_source(src_np, np.float32)
                 out = self._cu.malloc(n * 4)
                 self._gather_f32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
                 self._cu.sync()
@@ -832,7 +1090,7 @@ class AOTKernelsGPU:
             elif pa.types.is_integer(col.type) and col.type.bit_width == 64:
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.int64))
-                s = self._cached_upload(src_np)
+                s = cached_source(src_np, np.int64)
                 out = self._cu.malloc(n * 8)
                 self._gather_i64(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
                 self._cu.sync()
@@ -841,7 +1099,7 @@ class AOTKernelsGPU:
             elif pa.types.is_integer(col.type):
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.int32))
-                s = self._cached_upload(src_np)
+                s = cached_source(src_np, np.int32)
                 out = self._cu.malloc(n * 4)
                 self._gather_i32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
                 self._cu.sync()

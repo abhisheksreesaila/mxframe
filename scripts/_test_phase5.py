@@ -133,4 +133,38 @@ result8 = LazyFrame(left_dup).join(LazyFrame(right_dup), on="k").compute(device=
 assert result8.num_rows == 5, f"Expected 5 rows (m2m), got {result8.num_rows}"
 print("✅ Test 8: many-to-many join — passed")
 
+# ═══════════════════════════════════════════════════════════════════════
+# Test 9: string keys share one dictionary across both join sides
+# ═══════════════════════════════════════════════════════════════════════
+left_str = pa.table({"k": ["beta", "alpha", None], "a": [1, 2, 3]})
+right_str = pa.table({"k": ["alpha", "beta", None], "b": [10, 20, 30]})
+result9 = LazyFrame(left_str).join(LazyFrame(right_str), on="k").compute(device="cpu")
+assert result9.num_rows == 2, f"Expected 2 non-null string matches, got {result9.num_rows}"
+assert sorted(result9.column("a").to_pylist()) == [1, 2]
+assert sorted(result9.column("b").to_pylist()) == [10, 20]
+print("✅ Test 9: shared string-key encoding — passed")
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test 10: composite string/integer keys use shared dense IDs
+# ═══════════════════════════════════════════════════════════════════════
+left_multi = pa.table({"s": ["x", "x", "y"], "n": [2, 1, 1], "a": [1, 2, 3]})
+right_multi = pa.table({"rs": ["y", "x", "x"], "rn": [1, 1, 3], "b": [10, 20, 30]})
+result10 = LazyFrame(left_multi).join(
+    LazyFrame(right_multi), left_on=["s", "n"], right_on=["rs", "rn"]
+).compute(device="cpu")
+assert result10.num_rows == 2, f"Expected 2 composite-key matches, got {result10.num_rows}"
+assert sorted(result10.column("a").to_pylist()) == [2, 3]
+assert sorted(result10.column("b").to_pylist()) == [10, 20]
+print("✅ Test 10: shared composite-key encoding — passed")
+
+# ═══════════════════════════════════════════════════════════════════════
+# Test 11: left join with string keys preserves unmatched and null rows
+# ═══════════════════════════════════════════════════════════════════════
+result11 = LazyFrame(left_str).join(LazyFrame(right_str), on="k", how="left").compute(device="cpu")
+assert result11.num_rows == 3, f"Expected all 3 left rows, got {result11.num_rows}"
+rows11 = {row["a"]: row for row in result11.to_pylist()}
+assert rows11[1]["b"] == 20 and rows11[2]["b"] == 10
+assert rows11[3]["b"] is None, rows11[3]
+print("✅ Test 11: left string-key join + null semantics — passed")
+
 print("\n🎉 All Phase 5 tests passed!")

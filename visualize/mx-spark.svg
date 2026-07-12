@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">MXFrame performance mark</title>
+  <desc id="desc">Gray MX letters with the rising stroke of the X shaped like orange lightning.</desc>
+  <rect width="64" height="64" rx="8" fill="#0d1117"/>
+  <path d="M9 45V20l11 14 11-14v25" fill="none" stroke="#c7cbd1" stroke-width="7" stroke-linecap="square" stroke-linejoin="miter"/>
+  <path d="M36 20l19 25" fill="none" stroke="#c7cbd1" stroke-width="7" stroke-linecap="square"/>
+  <path d="M54 17L43 29h7L35 47l10-14h-7z" fill="#ff8a24"/>
+</svg>

@@ -1,3 +1,28 @@
+# v0.5.0 release workflow
+
+The authoritative local workflow is `scripts/release.sh`.
+
+```bash
+# Validate tests, rebuild GPU AOT, build wheel/sdist, run twine checks,
+# and verify compiled libraries are present. Does not publish or tag.
+scripts/release.sh
+
+# After committing the validated release tree:
+scripts/release.sh --tag       # annotated v0.5.0 tag + GitHub release
+scripts/release.sh --upload    # PyPI upload
+```
+
+The script refuses `--tag` and `--upload` from a dirty worktree. GitHub Actions with PyPI trusted publishing remains the preferred production upload path when `publish.yml` is configured.
+
+Release artifacts and evidence:
+
+- `RELEASE_NOTES_0.5.0.md` — GitHub release body;
+- `CHANGELOG.md` — concise version history;
+- `scripts/bench_results_1M.csv` and `scripts/bench_results_10M.csv` — bounded benchmark matrices;
+- `dist/mxframe-0.5.0-py3-none-linux_x86_64.whl` — Linux platform wheel.
+
+The sections below provide background and manual alternatives. Substitute the current version (`0.5.0`) in any older example.
+
 # 📦 Publishing MXFrame to PyPI
 
 > Step-by-step guide to building and releasing a new version.
@@ -33,7 +58,7 @@ In your repo → **Settings → Environments**:
 
 ### 4. Install local build tools
 
-```bash
+```sh
 pip install build twine
 ```
 
@@ -43,11 +68,13 @@ pip install build twine
 
 ### Before Every Release
 
-- [ ] All tests pass: `pixi run test-all`  
-- [ ] Benchmark shows no regression vs previous release  
-- [ ] `pyproject.toml` version bumped  
-- [ ] `CHANGELOG.md` updated (see format below)  
-- [ ] Pre-built `.so` files are current (rebuild if kernels changed)  
+- [ ] All tests pass: `pixi run test-all`
+- [ ] GPU integration passes: `pixi run test6-gpu`
+- [ ] Benchmark shows no regression versus the previous release
+- [ ] `pyproject.toml` and `mxframe.__version__` agree
+- [ ] `CHANGELOG.md` and the release-note artifact are updated
+- [ ] Pre-built CPU/GPU `.so` files are current
+- [ ] `twine check dist/*` passes
 
 ---
 
@@ -55,14 +82,14 @@ pip install build twine
 
 Always rebuild before packaging to ensure the `.so` files match the source:
 
-```bash
+```sh
 # CPU kernels
-pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
-    -o kernels_aot/libmxkernels_aot.so
+pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
+    --emit shared-lib -o kernels_aot/libmxkernels_aot.so
 
-# GPU kernels  
-pixi run mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo \
-    -o kernels_aot/libmxkernels_aot_gpu.so
+# GPU kernels
+pixi run mojo build kernels_aot/kernels_aot_gpu.mojo -I kernels_aot \
+    --emit shared-lib -o kernels_aot/libmxkernels_aot_gpu.so
 
 # Verify sizes look reasonable
 ls -lh kernels_aot/*.so
@@ -113,7 +140,7 @@ Append to `CHANGELOG.md`:
 
 ## 🧪 Step 4 — Test the Build Locally
 
-```bash
+```sh
 # Build wheel + sdist
 python -m build
 
@@ -136,7 +163,7 @@ Checking dist/mxframe-0.2.0-<platform-tag>.whl: PASSED
 
 ## 🚀 Step 5 — Publish to TestPyPI First
 
-```bash
+```sh
 # Upload to TestPyPI
 twine upload --repository testpypi dist/*
 
@@ -155,7 +182,7 @@ python3 -c "from mxframe import LazyFrame, col, lit; print('OK')"
 
 Once TestPyPI looks good:
 
-```bash
+```sh
 twine upload dist/*
 ```
 
@@ -195,7 +222,7 @@ GitHub → Releases → Create new release → tag v0.2.0 → Publish
 
 After publishing, verify from a fresh environment:
 
-```bash
+```sh
 # In a new venv or conda env
 pip install mxframe==0.2.0
 
@@ -223,16 +250,24 @@ EOF
 
 ---
 
-## ⚠️ Known Limitations for pip Install
+## ⚠️ Known limitations for pip install
 
 | Limitation | Status | Notes |
 |---|---|---|
-| GPU requires Modular MAX runtime | ⚠️ Not pip-installable | User must install `modular` via pixi or conda separately |
-| `.so` files are Linux-only (x86_64) | ⚠️ | Need separate builds for ARM64, macOS, Windows |
-| Python 3.12 only (tested) | ⚠️ | May work on 3.10/3.11 but untested |
+| GPU requires Modular MAX runtime | Optional extra | `pip install "mxframe[runtime]==0.5.0"`; Pixi users should use the Modular channel environment instead. |
+| Bundled `.so` files target Linux x86_64 | Current release target | Separate ARM64, macOS, and Windows artifacts are not published yet. |
+| Python 3.12+ | Required | The current wheel is tagged `py3` but validated with Python 3.12. |
+| GPU validation | NVIDIA RTX 3090 | AMD and Apple Silicon validation remains future work. |
 
-**For GPU support**, users need:
+For a pip-based GPU installation:
+
 ```bash
+pip install "mxframe[runtime]==0.5.0"
+```
+
+For development and reproducible Mojo builds, use `pixi install` from the repository.
+
+```sh
 # Install Modular MAX runtime
 curl -ssL https://magic.modular.com | bash
 magic install modular
@@ -248,7 +283,7 @@ The release wheel must be platform-specific because it bundles native Linux `.so
 The default GitHub Actions build should now produce a Linux-tagged wheel rather than `py3-none-any`.
 For a production release with broader Linux compatibility, use `manylinux` via `cibuildwheel`:
 
-```bash
+```sh
 # Build with manylinux (requires Docker on Linux)
 pip install cibuildwheel
 cibuildwheel --platform linux

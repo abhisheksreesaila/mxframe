@@ -4115,8 +4115,8 @@ packages:
   timestamp: 1749895533014
 - pypi: ./
   name: mxframe
-  version: 0.2.3
-  sha256: 4a08abc13fb39f1aba2c2bfbcd333f0354aa3a212e83f0f04ad8c9f052e219bb
+  version: 0.5.0
+  sha256: 12f77c0dafd8e3b898826cfe2e2cea3b85a15c83897d0ebfea566c3dca796cd4
   requires_dist:
   - pyarrow>=14.0
   - numpy>=1.24
@@ -4124,10 +4124,12 @@ packages:
   - modular>=26.4 ; extra == 'runtime'
   - polars>=0.20 ; extra == 'polars'
   - sqlglot>=25.0 ; extra == 'sql'
+  - build>=1.2 ; extra == 'dev'
   - pytest>=7.0 ; extra == 'dev'
   - polars>=0.20 ; extra == 'dev'
   - sqlglot>=25.0 ; extra == 'dev'
   - duckdb>=0.9 ; extra == 'dev'
+  - twine>=6.0 ; extra == 'dev'
   requires_python: '>=3.12'
 - conda: https://conda.anaconda.org/conda-forge/noarch/mypy_extensions-1.1.0-pyha770c72_0.conda
   sha256: 6ed158e4e5dd8f6a10ad9e525631e35cee8557718f83de7a4e3966b1f772c4b1

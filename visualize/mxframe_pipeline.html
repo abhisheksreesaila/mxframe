@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>MXFrame — Query to GPU Kernel</title>
+  <link rel="icon" href="mx-spark.svg" type="image/svg+xml" />
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -63,6 +64,10 @@
     @keyframes arrowSlide {
       from { width:0; opacity:0; }
       to   { opacity:1; }
+    }
+    @media (max-width: 900px) {
+      .pipeline-grid { grid-template-columns: minmax(0, 1fr) !important; }
+      .pipeline-panel { grid-column: 1 !important; min-height: 420px !important; }
     }
   </style>
 </head>
@@ -142,12 +147,12 @@ const QUERIES = {
     optimizer: { passes:["merge_adjacent_filters → combined AND predicate"], note:"5 filters collapsed to 1 Filter node" },
     dispatch: [
       { label:"_compute_masked_global_agg",   where:"Fast-path check",       color:"#a78bfa", note:"Detects: global agg + simple filter — special case!" },
-      { label:"eval_predicate (mask)",         where:"CPU (PyArrow)",         color:"#fb923c", note:"int32 mask of length N, only small cost" },
-      { label:"masked_global_sum_product_gpu", where:"🟢 GPU AOT kernel",     color:"#00ff88", note:"SINGLE PASS: sum(price × disc) where mask=1, zero allocation" },
+      { label:"range5 plan recognizer",        where:"Python metadata",       color:"#38bdf8", note:"Matches 5 range comparisons feeding sum(price × discount)" },
+      { label:"range5_sum_product_f32_gpu",    where:"🟢 GPU AOT kernel",     color:"#00ff88", note:"SINGLE PASS: compare 3 columns, multiply 2 columns, block-reduce — no mask allocation" },
     ],
-    provenance: "masked_global_agg_mojo (GPU session)",
-    kernel: { name:"masked_global_sum_product_f32_gpu", groups:1, N:1000000,
-              note:"Single-pass: each thread reads val_a[i], val_b[i], mask[i] → atomicAdd if mask\nZero intermediate array allocation" },
+    provenance: "range5_sum_product_f32_gpu (GPU AOT)",
+    kernel: { name:"range5_sum_product_f32_gpu", groups:1, N:1000000,
+              note:"Each thread evaluates date, discount, and quantity ranges, then contributes price × discount. Block sums use one atomic add each." },
     result: { rows:1, cols:["revenue"] },
   },
 
@@ -199,9 +204,9 @@ const QUERIES = {
   },
 
   Q14: {
-    label: "Q14 — Complex Expr Global Sum",
-    emoji: "🧮",
-    subtitle: "join → case_when expr → global fused sum",
+    label: "Q14 — Native GPU UTF-8 Prefix",
+    emoji: "MX",
+    subtitle: "Arrow UTF-8 buffers → parallel prefix mask → global sum",
     code: [
       { txt: "# TPC-H Q14: promo revenue %", cls:"tok-cm" },
       { txt: "promo = when(", cls:"tok-fn" },
@@ -230,14 +235,107 @@ const QUERIES = {
     dispatch: [
       { label:"join_count_gpu + join_scatter_gpu",     where:"🟢 GPU AOT kernel",  color:"#00ff88", note:"Inner hash join: lineitem ⋈ part" },
       { label:"_compute_masked_global_agg",            where:"Fast-path check",    color:"#a78bfa", note:"Phase 2 extension: handles ANY inner expression!" },
-      { label:"_eval_expr_arrow (case_when)",          where:"CPU (PyArrow)",      color:"#fb923c", note:"case_when/startswith evaluated in Arrow — result is float32[N]" },
+      { label:"Arrow UTF-8 buffers",                  where:"Arrow-native layout", color:"#38bdf8", note:"offsets[n+1] + contiguous UTF-8 bytes; no Python strings materialized" },
+      { label:"utf8_startswith_mask_gpu",            where:"🟢 GPU AOT kernel",   color:"#00ff88", note:"One thread per row compares its byte range with PROMO" },
+      { label:"case_when expression",                 where:"Arrow orchestration", color:"#38bdf8", note:"GPU boolean mask selects discounted revenue or 0.0" },
       { label:"eval_predicate → mask",                 where:"CPU (PyArrow)",      color:"#fb923c", note:"date filter → int32 mask" },
-      { label:"masked_global_sum_f32_gpu × 2",         where:"🟢 GPU AOT kernel",  color:"#00ff88", note:"SUM reduction on GPU for both expressions\nExpression eval in Arrow, aggregation in Mojo" },
+      { label:"masked_global_sum_f32_gpu × 2",         where:"🟢 GPU AOT kernel",  color:"#00ff88", note:"SUM reduction on GPU for promo and total revenue after expression orchestration" },
     ],
     provenance: "masked_global_agg_mojo (GPU session)",
-    kernel: { name:"masked_global_sum_f32_gpu", groups:1, N:200000,
-              note:"After Arrow evaluates case_when → float32[N], the GPU kernel sums it with the mask in one pass.\nThis is Phase 2: _compute_masked_global_agg handles complex inner expressions." },
+    kernel: { name:"utf8_startswith_mask_gpu", groups:1, N:200000,
+          note:"Arrow offsets locate each UTF-8 byte range. One GPU thread compares one row with the prefix and writes a boolean mask." },
     result: { rows:1, cols:["promo_revenue","total_revenue"] },
+  },
+  Q4: {
+    label:"Q4 — GPU Semi-Join + Group Count", emoji:"∃",
+    subtitle:"mark qualifying keys → probe orders → count priorities",
+    code:[
+      {txt:"# EXISTS without materializing a join",cls:"tok-cm"},
+      {txt:"orders.filter(date_range)",cls:"tok-fn"},
+      {txt:"  .semi_join(lineitem.filter(commit < receipt))",cls:"tok-fn"},
+      {txt:"  .groupby(\"o_orderpriority\").count()",cls:"tok-fn"},
+      {txt:"  .compute(device=\"gpu\")",cls:"tok-fn"},
+    ],
+    tree:[
+      {id:"agg",label:"Group Count",color:"#38bdf8",icon:"Σ",detail:"count orders per priority",children:["semi"]},
+      {id:"semi",label:"EXISTS Semi-Join",color:"#00ff88",icon:"∃",detail:"commit < receipt; date range",children:["scan"]},
+      {id:"scan",label:"Scan",color:"#4ade80",icon:"▤",detail:"orders + lineitem",children:[]},
+    ],
+    optimizer:{passes:["fuse right predicate + semi-join + grouped count"],note:"No unique-key table or joined rows"},
+    dispatch:[
+      {label:"encode 5 priorities",where:"Arrow metadata",color:"#38bdf8",note:"Tiny dictionary produces int32 group ids"},
+      {label:"semi_range_group_count_i32_gpu",where:"🟢 GPU AOT kernel",color:"#00ff88",note:"Mark qualifying order keys, probe date-filtered orders, atomically count groups"},
+    ],
+    provenance:"semi_range_group_count_i32_gpu",
+    kernel:{name:"semi_range_group_count_i32_gpu",groups:5,N:600000,note:"Three GPU phases: zero bitmap/counts, mark EXISTS keys, probe and count priorities."},
+    result:{rows:5,cols:["o_orderpriority","order_count"]},
+  },
+  Q12: {
+    label:"Q12 — Packed UTF-8 isin", emoji:"∈",
+    subtitle:"pack literals → compare row bytes → boolean mask",
+    code:[
+      {txt:"lineitem.filter(",cls:"tok-fn"},
+      {txt:"  col(\"l_shipmode\").isin([\"MAIL\", \"SHIP\"])",cls:"tok-col"},
+      {txt:").compute(device=\"gpu\")",cls:"tok-fn"},
+    ],
+    tree:[
+      {id:"filter",label:"String Membership",color:"#00ff88",icon:"∈",detail:"shipmode ∈ {MAIL, SHIP}",children:["scan"]},
+      {id:"scan",label:"Scan",color:"#4ade80",icon:"▤",detail:"Arrow UTF-8 column",children:[]},
+    ],
+    optimizer:{passes:["deduplicate and pack literal set"],note:"One kernel launch for all literals"},
+    dispatch:[
+      {label:"pack pattern offsets + bytes",where:"Python metadata",color:"#38bdf8",note:"[0,4,8] + MAILSHIP"},
+      {label:"utf8_isin_mask_gpu",where:"🟢 GPU AOT kernel",color:"#00ff88",note:"One row per thread; exact byte and length comparison"},
+    ],
+    provenance:"utf8_isin_mask_gpu",
+    kernel:{name:"utf8_isin_mask_gpu",groups:1,N:300000,note:"Each row thread scans packed literals and exits on its first exact match."},
+    result:{rows:2,cols:["l_shipmode","line_count"]},
+  },
+  Q13: {
+    label:"Q13 — Compact Match Counts", emoji:"#",
+    subtitle:"count right keys → gather one count per customer",
+    code:[
+      {txt:"# LEFT JOIN + COUNT without expanded rows",cls:"tok-cm"},
+      {txt:"customer.left_join(orders)",cls:"tok-fn"},
+      {txt:"  .groupby(\"c_custkey\").count(\"o_orderkey\")",cls:"tok-fn"},
+      {txt:"  .groupby(\"c_count\").count()",cls:"tok-fn"},
+    ],
+    tree:[
+      {id:"dist",label:"Distribution",color:"#38bdf8",icon:"Σ",detail:"customers per order count",children:["count"]},
+      {id:"count",label:"Left Match Count",color:"#00ff88",icon:"#",detail:"one int32 count per customer",children:["scan"]},
+      {id:"scan",label:"Scan",color:"#4ade80",icon:"▤",detail:"customer keys + order customer keys",children:[]},
+    ],
+    optimizer:{passes:["left join + group count → compact key counts"],note:"600K joined rows are never emitted"},
+    dispatch:[
+      {label:"key_match_counts_i32_gpu",where:"🟢 GPU AOT kernel",color:"#00ff88",note:"Count order keys, then gather one count per customer"},
+      {label:"small count distribution",where:"CPU compact result",color:"#38bdf8",note:"Only 150K int32 counts; no joined table"},
+    ],
+    provenance:"key_match_counts_i32_gpu",
+    kernel:{name:"key_match_counts_i32_gpu",groups:1,N:600000,note:"Zero counts, atomic count right keys, gather counts for every left key."},
+    result:{rows:20,cols:["c_count","custdist"]},
+  },
+  Q21: {
+    label:"Q21 — Exact Pair Dedup", emoji:"◇",
+    subtitle:"deduplicate (order,supplier) → single-late orders → supplier counts",
+    code:[
+      {txt:"late = lineitem.filter(receipt > commit)",cls:"tok-fn"},
+      {txt:"late.group_by(order).n_unique(supplier)",cls:"tok-fn"},
+      {txt:"  .filter(n_late == 1)",cls:"tok-fn"},
+      {txt:"  .groupby(\"supplier\").count()",cls:"tok-fn"},
+    ],
+    tree:[
+      {id:"top",label:"Top Suppliers",color:"#a78bfa",icon:"↓",detail:"sort numwait; limit 100",children:["pair"]},
+      {id:"pair",label:"Distinct Pairs",color:"#00ff88",icon:"◇",detail:"exact (order,supplier) hash table",children:["scan"]},
+      {id:"scan",label:"Scan",color:"#4ade80",icon:"▤",detail:"late rows + compact masks",children:[]},
+    ],
+    optimizer:{passes:["dedup + cardinality + filters + supplier count fusion"],note:"No NumPy unique or three joined tables"},
+    dispatch:[
+      {label:"single_late_supplier_counts_i32_gpu",where:"🟢 GPU AOT kernel",color:"#00ff88",note:"CAS slot ownership, exact pair compare, per-order cardinality, supplier count"},
+      {label:"top 100 compact counts",where:"CPU 2K values",color:"#38bdf8",note:"Deterministic numwait desc + supplier key asc"},
+    ],
+    provenance:"single_late_supplier_counts_i32_gpu",
+    kernel:{name:"single_late_supplier_counts_i32_gpu",groups:1,N:200000,note:"Exact pair hash table uses states 0 empty, -1 writer, 1 ready; collisions compare both keys."},
+    result:{rows:100,cols:["l_suppkey","numwait"]},
   },
 };
 
@@ -479,10 +577,10 @@ function MaskedSumViz({ sub }) {
   return (
     <div>
       <div style={{fontSize:9,color:"#64748b",marginBottom:6,fontFamily:"mono",minHeight:24}}>
-        {sub===0&&"Click ▶ to start — 256 threads ready"}
-        {sub===1&&"Step 1: mask[i] = (date∈window) ∧ (0.05 ≤ disc ≤ 0.07) ∧ (qty < 24)"}
-        {sub===2&&"Step 2: active threads  →  shmem[tid] = price[i] × discount[i]"}
-        {sub===3&&"Step 3: warp tree-reduce (12→6→3→1)  →  atomicAdd(out, block_sum)"}
+        {sub===0&&"Click ▶ — no mask exists yet; each thread receives one row"}
+        {sub===1&&"Step 1: thread i evaluates  date range ∧ discount range ∧ quantity < 24"}
+        {sub===2&&"Step 2: passing thread writes price[i] × discount[i] to shared memory; failures write 0"}
+        {sub===3&&"Step 3: block tree-reduce → one atomicAdd(out, block_sum); no N-row mask allocation"}
       </div>
       {/* Input grid */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:3,marginBottom:6}}>
@@ -619,97 +717,51 @@ function JoinViz({ sub, active }) {
   );
 }
 
-// EXPR → SUM — CPU Arrow expr then GPU sum (Q14)
-function ExprSumViz({ sub }) {
-  const rows = [
-    {type:"PROMO BRASS",  p:45.2,d:0.06},
-    {type:"MEDIUM COPPER",p:67.1,d:0.04},
-    {type:"PROMO NICKEL", p:38.9,d:0.07},
-    {type:"BRUSHED TIN",  p:82.3,d:0.05},
-    {type:"PROMO STEEL",  p:51.7,d:0.06},
-    {type:"LARGE BRASS",  p:43.8,d:0.03},
-  ];
-  const isPromo = r => r.type.startsWith("PROMO");
-  const exprV = rows.map(r=>isPromo(r)?(r.p*(1-r.d)).toFixed(1):"0.0");
-  const totalV = rows.map(r=>(r.p*(1-r.d)).toFixed(1));
-  const promoSum = rows.filter(isPromo).reduce((a,r)=>a+r.p*(1-r.d),0).toFixed(1);
-  const totSum   = rows.reduce((a,r)=>a+r.p*(1-r.d),0).toFixed(1);
-
-  return (
-    <div>
-      <div style={{fontSize:9,color:"#64748b",marginBottom:6,fontFamily:"mono",minHeight:28}}>
-        {sub===0&&"Click ▶ to start — Arrow + GPU ready"}
-        {sub===1&&"CPU · Arrow: case_when(p_type.startswith('PROMO'), price×(1−disc), 0.0)"}
-        {sub===2&&"CPU → GPU: float32[N] arrays uploaded, date-range mask computed"}
-        {sub===3&&"GPU · masked_global_sum_f32 → 2 scalar outputs (one pass each)"}
-      </div>
-      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
-        {/* CPU side */}
-        <div style={{
-          border:`1px solid ${sub>=1?"#fb923c44":"#1e293b"}`,
-          borderRadius:6,padding:"6px",
-          background:sub>=1?"rgba(251,146,60,0.04)":"#111827",
-          transition:"all 0.5s"
-        }}>
-          <div style={{fontSize:8,color:"#fb923c",marginBottom:4,letterSpacing:1,fontWeight:700}}>CPU · Arrow</div>
-          <div style={{fontSize:7,color:"#64748b",fontFamily:"mono",marginBottom:4}}>case_when(startswith…)</div>
-          {rows.map((r,i)=>(
-            <div key={i} style={{
-              display:"flex",justifyContent:"space-between",padding:"1px 2px",
-              borderRadius:2,marginBottom:1,
-              background:sub>=1&&isPromo(r)?"rgba(251,146,60,0.07)":"transparent",
-              transition:`all 0.3s ${i*60}ms`
-            }}>
-              <span style={{fontSize:7,fontFamily:"mono",maxWidth:75,overflow:"hidden",
-                textOverflow:"ellipsis",whiteSpace:"nowrap",
-                color:sub>=1&&isPromo(r)?"#fb923c":"#475569"}}>
-                {r.type}
-              </span>
-              <span style={{fontSize:8,fontFamily:"mono",fontWeight:700,
-                color:sub>=1?(isPromo(r)?"#fb923c":"#334155"):"#475569"}}>
-                {sub>=1?exprV[i]:"·"}
-              </span>
-            </div>
-          ))}
-        </div>
-        {/* GPU side */}
-        <div style={{
-          border:`1px solid ${sub>=2?"#00ff8833":"#1e293b"}`,
-          borderRadius:6,padding:"6px",
-          background:sub>=2?"rgba(0,255,136,0.04)":"#111827",
-          transition:"all 0.5s"
-        }}>
-          <div style={{fontSize:8,color:"#00ff88",marginBottom:4,letterSpacing:1,fontWeight:700}}>GPU · Mojo</div>
-          <div style={{fontSize:7,color:"#64748b",fontFamily:"mono",marginBottom:4}}>masked_global_sum_f32</div>
-          {rows.map((r,i)=>(
-            <div key={i} style={{
-              display:"flex",justifyContent:"space-between",padding:"1px 2px",
-              borderRadius:2,marginBottom:1,
-              opacity:sub>=2?1:0.2,transition:`opacity 0.3s ${i*60}ms`
-            }}>
-              <span style={{fontSize:7,color:"#64748b",fontFamily:"mono"}}>T{i}:</span>
-              <span style={{fontSize:8,fontFamily:"mono",color:sub>=2?"#00ff88":"#475569"}}>
-                {sub>=2?totalV[i]:"·"}
-              </span>
-            </div>
-          ))}
-          {sub>=3&&(
-            <div style={{borderTop:"1px solid #1e293b",paddingTop:4,marginTop:2}}>
-              <div style={{fontSize:9,fontFamily:"mono",color:"#a78bfa",marginBottom:1}}>promo: {promoSum}</div>
-              <div style={{fontSize:9,fontFamily:"mono",color:"#00ff88",fontWeight:700}}>total: {totSum}</div>
-            </div>
-          )}
-        </div>
-      </div>
+// UTF-8 PREFIX — Arrow offsets + bytes, one row per GPU thread (Q14)
+function Utf8PrefixViz({ sub }) {
+  const rows = ["PROMO STEEL", "BRUSHED", "PROMO", "PR"];
+  const offsets = [0,11,18,23,25];
+  const bytes = "PROMO STEELBRUSHEDPROMOPR".split("");
+  const matches = [1,0,1,0];
+  return <div>
+    <div style={{fontSize:9,color:"#64748b",marginBottom:8,fontFamily:"mono",minHeight:26}}>
+      {sub===0&&"Click ▶ — Arrow already stores strings as offsets + UTF-8 bytes"}
+      {sub===1&&"Step 1: offsets[i]..offsets[i+1] gives each row's byte range"}
+      {sub===2&&"Step 2: thread i compares its first 5 bytes with P R O M O"}
+      {sub===3&&"Step 3: threads write [1, 0, 1, 0] — no Python strings created"}
     </div>
-  );
+    <div style={{fontSize:8,color:"#38bdf8",fontFamily:"mono",marginBottom:3}}>offsets[n+1]</div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:3,marginBottom:8}}>
+      {offsets.map((v,i)=><div key={i} style={{padding:4,textAlign:"center",borderRadius:4,
+        border:`1px solid ${sub>=1?"#38bdf8":"#1e293b"}`,color:sub>=1?"#38bdf8":"#475569",
+        background:sub>=1?"#38bdf811":"#111827",fontSize:9,fontFamily:"mono"}}>{v}</div>)}
+    </div>
+    <div style={{fontSize:8,color:"#f59e0b",fontFamily:"mono",marginBottom:3}}>contiguous UTF-8 data buffer</div>
+    <div style={{display:"flex",gap:1,flexWrap:"wrap",marginBottom:8}}>
+      {bytes.map((b,i)=><span key={i} style={{width:13,padding:"2px 0",textAlign:"center",borderRadius:2,
+        background:sub>=1?"#f59e0b10":"#111827",color:sub>=1?"#f59e0b":"#475569",
+        border:"1px solid #f59e0b22",fontSize:7,fontFamily:"mono"}}>{b===" "?"·":b}</span>)}
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:4}}>
+      {rows.map((row,i)=><div key={row} style={{padding:"5px 3px",textAlign:"center",borderRadius:5,
+        border:`1px solid ${sub>=2?(matches[i]?"#00ff88":"#fb923c55"):"#1e293b"}`,
+        background:sub>=2?(matches[i]?"#00ff8810":"#fb923c08"):"#111827"}}>
+        <div style={{fontSize:7,color:"#64748b",fontFamily:"mono"}}>thread {i}</div>
+        <div style={{fontSize:7,color:sub>=2?(matches[i]?"#00ff88":"#fb923c"):"#475569",
+          overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{row}</div>
+        <div style={{fontSize:13,fontWeight:800,color:sub>=3?(matches[i]?"#00ff88":"#fb923c"):"#334155"}}>
+          {sub>=3?matches[i]:"·"}
+        </div>
+      </div>)}
+    </div>
+  </div>;
 }
 
 function KernelAlgoViz({ qid, active, sub }) {
   if (qid==="Q1")  return <GroupSumViz sub={sub} />;
   if (qid==="Q6")  return <MaskedSumViz sub={sub} />;
   if (qid==="Q3")  return <JoinViz sub={sub} active={active} />;
-  if (qid==="Q14") return <ExprSumViz sub={sub} />;
+  if (qid==="Q14") return <Utf8PrefixViz sub={sub} />;
   return <div style={{fontSize:10,color:"#334155",fontStyle:"italic",padding:"8px 0"}}>
     {active?"GPU kernel dispatched":"Waiting for dispatch"}
   </div>;
@@ -919,7 +971,8 @@ function App() {
         background:"#0d1117", borderBottom:"1px solid #21262d",
         padding:"14px 28px", display:"flex", alignItems:"center", gap:20, flexWrap:"wrap"
       }}>
-        <div>
+        <div style={{display:"flex",alignItems:"center"}}>
+          <img src="mx-spark.svg" alt="MXFrame" width="34" height="34" style={{marginRight:9}} />
           <span style={{fontWeight:900, fontSize:20, color:"#00ff88", letterSpacing:1}}>
             MXFrame
           </span>
@@ -957,17 +1010,17 @@ function App() {
         gridTemplateColumns:"1fr 1fr 1fr 1fr",
         gap:12, padding:"12px 16px",
         minHeight:0
-      }}>
+      }} className="pipeline-grid">
         {/* Code */}
-        <div style={{gridColumn:"1/2", minHeight:480}}>
+        <div className="pipeline-panel" style={{gridColumn:"1/2", minHeight:480}}>
           <CodePanel lines={q.code} visibleCount={cur.code || 0} />
         </div>
         {/* Plan tree */}
-        <div style={{gridColumn:"2/3", minHeight:480}}>
+        <div className="pipeline-panel" style={{gridColumn:"2/3", minHeight:480}}>
           <TreePanel query={q} visibleNodeIds={cur.nodeIds||[]} />
         </div>
         {/* Dispatch */}
-        <div style={{gridColumn:"3/4", minHeight:480}}>
+        <div className="pipeline-panel" style={{gridColumn:"3/4", minHeight:480}}>
           <DispatchPanel
             dispatch={q.dispatch}
             visibleCount={cur.dispatchCount||0}
@@ -975,7 +1028,7 @@ function App() {
           />
         </div>
         {/* Kernel */}
-        <div style={{gridColumn:"4/5", minHeight:480}}>
+        <div className="pipeline-panel" style={{gridColumn:"4/5", minHeight:480}}>
           <KernelPanel
             qid={qid}
             kernel={q.kernel}

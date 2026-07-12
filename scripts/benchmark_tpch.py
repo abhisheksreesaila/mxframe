@@ -31,6 +31,7 @@ from max import driver as _driver
 from mxframe import LazyFrame, col, lit, when
 from mxframe.lazy_frame import Scan
 from mxframe.custom_ops import clear_cache
+from mxframe.aot_kernels import AOTKernelsGPU, GPU_AOT_AVAILABLE
 
 try:
     import polars as pl
@@ -43,6 +44,20 @@ try:
     DUCKDB_AVAILABLE = True
 except ImportError:
     DUCKDB_AVAILABLE = False
+
+_BENCH_AOT_GPU = None
+_DIRECT_PROVENANCE = []
+
+
+def _record_direct_gpu_aot(kernel: str) -> None:
+    _DIRECT_PROVENANCE.append({"path": "gpu_aot", "device": "gpu", "kernel": kernel})
+
+
+def _bench_aot_gpu():
+    global _BENCH_AOT_GPU
+    if _BENCH_AOT_GPU is None and GPU_AOT_AVAILABLE:
+        _BENCH_AOT_GPU = AOTKernelsGPU()
+    return _BENCH_AOT_GPU
 
 
 # ---------------------------------------------------------------
@@ -1183,6 +1198,22 @@ def run_q13_mxframe(customer, orders, device="cpu") -> pa.Table:
     LEFT JOIN is implemented in Mojo (join_count_left + join_scatter_left kernels).
     Two-stage groupby avoids any .to_pandas() detour.
     """
+    if device == "gpu":
+        gpu = _bench_aot_gpu()
+        if gpu is not None:
+            _record_direct_gpu_aot("key_match_counts_i32_gpu")
+            customer_keys = np.ascontiguousarray(
+                customer.column("c_custkey").to_numpy(zero_copy_only=False), dtype=np.int32)
+            order_customer_keys = np.ascontiguousarray(
+                orders.column("o_custkey").to_numpy(zero_copy_only=False), dtype=np.int32)
+            counts = gpu.key_match_counts_i32(customer_keys, order_customer_keys)
+            unique_counts, distribution = np.unique(counts, return_counts=True)
+            order = np.argsort(-distribution, kind="stable")
+            return pa.table({
+                "c_count": pa.array(unique_counts[order], type=pa.int32()),
+                "custdist": pa.array(distribution[order], type=pa.int64()),
+            })
+
     # Step 1: LEFT JOIN — all customers, unmatched get null o_orderkey
     joined = (
         LazyFrame(Scan(customer))
@@ -1383,6 +1414,31 @@ def make_tpch_q4_tables(n_orders=150_000, n_lineitem=600_000, seed=4):
 
 
 def run_q4_mxframe(orders, lineitem, device="cpu") -> pa.Table:
+    if device == "gpu":
+        gpu = _bench_aot_gpu()
+        if gpu is not None:
+            _record_direct_gpu_aot("semi_range_group_count_i32_gpu")
+            priorities = orders.column("o_orderpriority").combine_chunks().dictionary_encode()
+            groups = np.ascontiguousarray(
+                priorities.indices.to_numpy(zero_copy_only=False), dtype=np.int32)
+            counts = gpu.semi_range_group_count_i32(
+                np.ascontiguousarray(lineitem.column("l_orderkey").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(lineitem.column("l_commitdate").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(lineitem.column("l_receiptdate").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(orders.column("o_orderkey").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(orders.column("o_orderdate").to_numpy(), dtype=np.int32),
+                groups,
+                len(priorities.dictionary),
+                Q4_DATE_LO,
+                Q4_DATE_HI,
+            )
+            labels = priorities.dictionary.to_pylist()
+            order = np.argsort(np.asarray(labels, dtype=object), kind="stable")
+            return pa.table({
+                "o_orderpriority": pa.array([labels[index] for index in order]),
+                "order_count": pa.array(counts[order], type=pa.int64()),
+            })
+
     # Semi-join via MXFrame hash join (unique right keys = semi-join semantics)
     # Step 1: get unique orderkeys from qualifying lineitems
     valid_li = lineitem.filter(
@@ -2453,6 +2509,41 @@ def run_q21_mxframe(nation, supplier, orders, lineitem, device="cpu") -> pa.Tabl
     3. Keep orders where exactly 1 suppkey had late delivery.
     4. Join back to target-nation suppliers, group, sort, limit 100.
     """
+    if device == "gpu":
+        gpu = _bench_aot_gpu()
+        if gpu is not None:
+            _record_direct_gpu_aot("single_late_supplier_counts_i32_gpu")
+            finished_orders = np.zeros(orders.num_rows, dtype=np.int32)
+            order_keys = np.ascontiguousarray(
+                orders.column("o_orderkey").to_numpy(zero_copy_only=False), dtype=np.int32)
+            finished = np.asarray(
+                pc.equal(orders.column("o_orderstatus"), pa.scalar("F")), dtype=bool)
+            finished_orders[order_keys[finished]] = 1
+
+            target_suppliers = np.zeros(supplier.num_rows, dtype=np.int32)
+            supplier_keys = np.ascontiguousarray(
+                supplier.column("s_suppkey").to_numpy(zero_copy_only=False), dtype=np.int32)
+            target = np.asarray(
+                pc.equal(supplier.column("s_nationkey"),
+                         pa.scalar(Q21_NATION_KEY, pa.int32())), dtype=bool)
+            target_suppliers[supplier_keys[target]] = 1
+
+            counts = gpu.single_late_supplier_counts_i32(
+                np.ascontiguousarray(lineitem.column("l_orderkey").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(lineitem.column("l_suppkey").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(lineitem.column("l_commitdate").to_numpy(), dtype=np.int32),
+                np.ascontiguousarray(lineitem.column("l_receiptdate").to_numpy(), dtype=np.int32),
+                finished_orders,
+                target_suppliers,
+            )
+            nonzero = np.flatnonzero(counts)
+            ranked = np.lexsort((nonzero, -counts[nonzero]))
+            order = nonzero[ranked][:100]
+            return pa.table({
+                "l_suppkey": pa.array(order, type=pa.int32()),
+                "numwait": pa.array(counts[order], type=pa.int64()),
+            })
+
     saudi_supp = supplier.filter(
         pc.equal(supplier.column("s_nationkey"),
                  pa.scalar(Q21_NATION_KEY, pa.int32()))
@@ -2526,7 +2617,7 @@ def run_q21_polars(nation, supplier, orders, lineitem):
                 .join(single_late, on="l_orderkey")
                 .join(s.select("s_suppkey"), left_on="l_suppkey", right_on="s_suppkey")
                 .group_by("l_suppkey").agg(pl.len().alias("numwait"))
-                .sort("numwait", descending=True).head(100))
+                .sort(["numwait", "l_suppkey"], descending=[True, False]).head(100))
 
 
 # ============================================================

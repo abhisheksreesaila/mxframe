@@ -66,6 +66,8 @@ Called via ctypes — no MAX Graph session, cold start ≈ 0 ms.
 | `join_count_i32_gpu` | Phase 1 AOT GPU inner hash join — counts matching right rows per left key (v0.2.3) |
 | `join_scatter_i32_gpu` | Phase 2 AOT GPU inner hash join — emits index pairs into pre-allocated output buffers (v0.2.3) |
 | `sort_topk_i32_gpu` | Bitonic sort with top-k truncation — `ORDER BY … LIMIT k` fuses sort+limit, downloads only `k×4` bytes (v0.2.3) |
+| `utf8_startswith_mask_gpu` | One thread per Arrow UTF-8 row compares its byte range with a literal prefix and emits an `int32` mask (v0.5.0) |
+| `utf8_contains_mask_gpu` | One thread per Arrow UTF-8 row scans for a literal byte substring and emits an `int32` mask (v0.5.0) |
 
 ---
 
@@ -177,7 +179,9 @@ Certain orchestration steps still use PyArrow or NumPy:
 
 | Operation | Library used | Reason |
 |---|---|---|
-| **String predicate masks** — `isin`, `startswith`, `contains`, `==` on string cols | PyArrow compute (SIMD C++) | GPU string kernels require UTF-8 variable-length storage. The mask is cheap (µs); the aggregation/join that follows still runs on GPU. |
+| **String predicate masks** — `startswith`, literal `contains` | Mojo AOT GPU (GPU sessions) | Kernels consume Arrow offsets and UTF-8 bytes directly and emit one mask value per row. CPU sessions retain PyArrow fallback. |
+| **Remaining string predicates** — `isin`, `==` on string cols | PyArrow compute (SIMD C++) | Native GPU multi-pattern/equality kernels are the next string-pipeline step. |
+| **String join-key encoding** | PyArrow shared `dictionary_encode` | Both join sides are encoded together into dense `int32` IDs, then dispatched to Mojo AOT CPU/GPU integer join kernels. Correct and cross-device, but dictionary construction still runs on CPU. |
 | **String group-key encoding** — e.g. `l_returnflag`, `n_name` | PyArrow `dictionary_encode` | Phase 3 added GPU hash-table encoding for *integer* keys. String hashing on GPU requires a variable-length string type not yet in the kernel set. Result is cached after first call. |
 | **Table assembly after joins** — string and date columns | `pa.Table.take()` | Numeric columns are gathered on GPU. String/date columns have no GPU representation yet — gathered on CPU via Arrow's `.take()`. |
 | **Window functions** — `rank`, `dense_rank`, `lag`, `lead`, `cum_sum` | NumPy | Not required by TPC-H. Exist in API for completeness; GPU ports are Phase 7+. |
@@ -192,9 +196,11 @@ Certain orchestration steps still use PyArrow or NumPy:
 |---|---|---|---|
 | **Phase 4** | **Device-resident join pipeline** — AOT `join_count_i32_gpu` + `join_scatter_i32_gpu`; `gather_table` with single index upload | Q3, Q5, Q7, Q8, Q9, Q10, Q18, Q21 | ✅ **v0.2.3** |
 | **Phase 5** | **GPU sort + top-k** — `sort_topk_i32_gpu` bitonic sort; `ORDER BY … LIMIT k` fuses sort+limit | Q3, Q5, Q8, Q9, Q20, Q21 | ✅ **v0.2.3** |
+| **Phase 5.5** | **Shared string/composite join encoding** — jointly dictionary-encode both sides to dense `int32`; preserve null semantics; dispatch through existing AOT integer joins | String and mixed composite joins | ✅ **v0.4.0** |
 | **Phase 3** | **GPU key encoding** — `group_encode_i32_gpu` for integer group keys; vectorised rank mapping | Q1–Q22 | ✅ **Partial** — string/float encoding is Phase 6 |
-| **Phase 6** | **GPU string/category encoding** — open-addressing hash table for variable-length keys | Q1, Q4, Q5, Q7, Q8, Q9, Q12 | 🔭 Future |
-| **Phase 7** | **GPU string predicate evaluation** — `isin`, `startswith`, `contains` on GPU | Q4, Q12, Q16, Q19 | 🔭 Future |
+| **Phase 6A** | **Native GPU UTF-8 predicates** — Arrow offsets/data buffers feed AOT `startswith` and literal `contains` masks | Q9, Q13, Q14, Q16, Q20 | ✅ **v0.5.0** |
+| **Phase 6B** | **Native GPU string/category encoding** — move shared dictionary construction for joins/group-by from Arrow CPU to a GPU UTF-8 hash table | Q1, Q4, Q5, Q7, Q8, Q9, Q12 | 🔭 Future |
+| **Phase 7** | **Complete GPU string predicates** — multi-pattern `isin`, equality, and predicate/reduction fusion | Q4, Q12, Q16, Q19 | 🔭 Future |
 | **Phase 8** | **GPU window functions** — `rank`, `dense_rank`, `lag`, `lead`, `cum_sum` | Non-TPC-H workloads | 🔭 Future |
 
 ### What Phases 4–5 delivered (v0.2.3)
@@ -216,7 +222,27 @@ Certain orchestration steps still use PyArrow or NumPy:
 
 ## Reproducing the Benchmark
 
+## Current v0.5 status
+
+The v0.2.3 tables above are retained as historical measurements. Since then, Q4, Q6, Q13, and Q21 received dedicated compact GPU kernels, and GPU UTF-8 support expanded to `startswith`, literal `contains`, equality/inequality, and packed non-null literal `isin`.
+
+The memory-bounded July 11 run produced complete CPU, Polars, and Pandas matrices at both scales. MX CPU beat Polars on **22/22 at 1M** and **18/22 at 10M**. Among completed GPU paths, MX GPU beat Polars on **15/17 at 1M** and **14/17 at 10M**. Q8 GPU remains `N/A:JIT`; Q15, Q17, Q18, and Q20 GPU workers exceeded the bounded timeout. cuDF was unavailable, so RAPIDS remains `N/A` and no RAPIDS parity claim is made.
+
+Two GPU string-pipeline gaps remain and are not claimed complete:
+
+- shared UTF-8 dictionary construction for string join/group keys still runs through Arrow on CPU;
+- string/date column gather after joins still uses Arrow `take`.
+
+Run the synthetic 22-query benchmark in five-query groups. Every query and engine executes in its own process, so Arrow, Pandas, and CUDA allocations are released before the next engine starts, and one timeout cannot erase the other engines' results:
+
 ```bash
+pixi run bench-all
+pixi run bench-all --only-10m --rapids
+```
+
+`--batch-size` controls progress grouping and `--query-timeout` bounds each engine worker. The parent merges results into `scripts/bench_results_1M.csv` and `scripts/bench_results_10M.csv`. `--rapids` executes the existing Pandas query implementations through the official `cudf.pandas` accelerator in separate synchronized workers. When cuDF is unavailable, the final RAPIDS column is explicitly `N/A`.
+
+```sh
 # Step 1 — generate TPC-H data (requires: pip install duckdb)
 #   SF=1  →  ~6M lineitem rows, ~200 MB Parquet
 pixi run python3 scripts/gen_tpch_parquet.py --sf 1

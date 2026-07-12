@@ -1,6 +1,6 @@
 """mxframe - GPU-accelerated DataFrames with MAX Engine"""
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 # Lazy expression layer
 from .lazy_expr import Expr, col, lit, when, row_number
@@ -13,17 +13,41 @@ from .lazy_frame import (
     DeviceType,
 )
 
-# Compiler
-from .compiler import GraphCompiler
-
 # Optimizer
 from .optimizer import PlanOptimizer, OptimizationResult, optimize_plan
 
 # Plan validation
 from .plan_validation import PlanValidationError, validate_plan, validate_plan_or_raise
 
-# Custom ops compiler
-from .custom_ops import CustomOpsCompiler, KERNELS_PATH, clear_cache
+_RUNTIME_EXPORTS = {"GraphCompiler", "CustomOpsCompiler", "KERNELS_PATH"}
+
+
+def _runtime_import_error() -> ImportError:
+    return ImportError(
+        "MXFrame computation requires the Modular MAX runtime. "
+        "Install with: pip install 'mxframe[runtime]'"
+    )
+
+
+def __getattr__(name: str):
+    if name not in _RUNTIME_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        if name == "GraphCompiler":
+            from .compiler import GraphCompiler
+            return GraphCompiler
+        from .custom_ops import CustomOpsCompiler, KERNELS_PATH
+        return CustomOpsCompiler if name == "CustomOpsCompiler" else KERNELS_PATH
+    except ImportError as exc:
+        raise _runtime_import_error() from exc
+
+
+def clear_cache() -> None:
+    try:
+        from .custom_ops import clear_cache as _clear_cache
+    except ImportError as exc:
+        raise _runtime_import_error() from exc
+    _clear_cache()
 
 # SQL frontend (optional; requires `sqlglot`).
 # Imported lazily so `pip install mxframe` works without the sql extra.
@@ -58,6 +82,11 @@ def warmup(device: str = "auto") -> float:
     import time as _t
     import pyarrow as _pa
     import numpy as _np
+
+    try:
+        from .custom_ops import CustomOpsCompiler
+    except ImportError as exc:
+        raise _runtime_import_error() from exc
 
     t0 = _t.perf_counter()
 

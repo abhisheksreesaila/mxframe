@@ -5,6 +5,62 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.5.0] — 2026-07-11
+
+Full narrative: [v0.5.0 release notes](RELEASE_NOTES_0.5.0.md).
+
+### ⚡ Native GPU UTF-8 predicates
+- Added AOT `utf8_startswith_mask_gpu`, `utf8_contains_mask_gpu`, `utf8_equal_mask_gpu`, and packed-literal `utf8_isin_mask_gpu` kernels over Arrow validity, offsets, and byte buffers.
+- Supports sliced arrays, nulls, empty strings/patterns, duplicate literals, and multibyte UTF-8 while matching Arrow filter semantics.
+- GPU expression dispatch covers string `==`, `!=`, `startswith`, literal `contains`, and non-null literal `isin`; unsupported/null-membership cases retain Arrow fallback.
+- Added permanent CPU/GPU Phase 6 tests and `pixi run bench-utf8` comparisons against PyArrow and Polars.
+- At 1M rows, packed `isin` and `contains` beat local Arrow and Polars; exact equality remains faster in Polars' optimized CPU path, so no universal string-performance claim is made.
+
+### ⚡ Weak-query GPU fusion
+- Q6 dispatches `range5_sum_product_f32_gpu` instead of materializing five masks and a product array.
+- Q4 uses `semi_range_group_count_i32_gpu` for fused qualifying-key marking, semi-join probing, and grouped counts.
+- Q13 uses `key_match_counts_i32_gpu` to emit one compact count per customer without materializing a left join.
+- Q21 uses `single_late_supplier_counts_i32_gpu` for exact `(order, supplier)` deduplication and deterministic compact supplier counts.
+- Representative 1M/10M GPU results versus Polars: Q4 **3.4/28.6 vs 20.2/105.4 ms**; Q13 **1.8/28.5 vs 26.5/442.0 ms**; Q21 **6.6/49.8 vs 30.2/99.1 ms**.
+
+### 📊 Bounded 22-query benchmark
+- Every query and engine now runs in its own process, releasing Arrow, Pandas, and CUDA allocations between measurements.
+- Added per-engine timeouts, five-query progress groups, merged CSV output, and optional synchronized `cudf.pandas` workers.
+- MX CPU beat Polars on **22/22 at 1M** and **18/22 at 10M**.
+- MX GPU beat Polars on **15/17 comparable paths at 1M** and **14/17 at 10M**.
+- Q8 GPU remains `N/A:JIT`; Q15/Q17/Q18/Q20 GPU workers exceeded the bounded timeout.
+- cuDF was unavailable locally, so RAPIDS remains `N/A` and no RAPIDS parity claim is made.
+
+### 🎬 Visualization and identity
+- Q4, Q6, Q12, Q13, Q14, and Q21 visualize their logical rewrite, dispatch boundary, and step-by-step Mojo kernel algorithm.
+- Added a cool-gray MX mark whose rising X stroke is shaped as orange lightning.
+- Verified responsive rendering and zero horizontal overflow in Playwright.
+
+### Remaining performance-parity work
+- Replace Q8's JIT path and fix Q15/Q17/Q18/Q20 GPU timeouts.
+- Improve Q1 and Q14 GPU pipelines at 10M.
+- Run synchronized 1M/10M benchmarks on a compatible RAPIDS/cuDF environment.
+
+### Remaining feature-parity work
+- Native GPU UTF-8 dictionary construction and string/date gather.
+- GPU windows and additional semi/anti/cross/as-of/range joins.
+- Broader regex/string, datetime, nested-type, reshape, SQL, streaming, and I/O pushdown support.
+- Cross-generation NVIDIA testing plus AMD and Apple Silicon validation.
+
+---
+
+## [0.4.0] — 2026-07-11
+
+### 🔗 String and composite joins
+- Join keys from both tables now use one shared Arrow dictionary before dispatch, so equal strings receive identical dense `int32` IDs regardless of encounter order.
+- Multi-column joins jointly densify shared per-column codes, avoiding mixed-radix overflow and supporting mixed string/integer composite keys.
+- SQL null semantics are preserved: null keys receive side-specific IDs and never match, including left joins.
+- Compact nonnegative integer joins retain their direct `int32` fast path; sparse and non-integer keys are safely densified.
+- Fixed GPU upload-cache aliasing by retaining each cached NumPy host owner, preventing recycled host pointers from returning stale device buffers during joined-table gather.
+- String encoding runs in Arrow on CPU; resulting IDs use the Mojo AOT CPU/GPU join kernels. Native GPU UTF-8 dictionary construction remains future work.
+
+---
+
 ## [0.3.0] — 2026-07-10
 
 ### 📚 Docs & Benchmarks
@@ -49,15 +105,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### 🔨 Infrastructure
 - First release targeting **Mojo/MAX 26.4** (`modular = "26.4.*"` in `pixi.toml`).
-- `_atomic.mojo` shim introduced to replace the removed `std.os.atomic` module.
-- All kernel source files migrated to 26.4 syntax; compiled artefacts rebuilt.
+- **`kernels/_atomic.mojo`** shim introduced to replace the removed `std.os.atomic` module.
+- All kernel sources migrated to 26.4 syntax; compiled artefacts rebuilt.
 - `pyproject.toml` `runtime` extra pinned to `modular>=26.4` to prevent 26.2 wheels from being installed by Colab/pip users.
 
 ---
 
 ## [0.2.1] — 2026-06-xx
 
-### 🔨 Infrastructure
+### 🛠 Fixed
 - TestPyPI re-upload to validate wheel packaging. No functional changes.
 
 ---
@@ -69,15 +125,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - `masked_global_min_f32_gpu` / `masked_global_max_f32_gpu` Mojo AOT kernels.
   - `AOTKernelsGPU` device-buffer cache (`_cached_upload`, eviction, `clear_buf_cache`) — eliminates redundant PCIe uploads on repeated hot queries.
   - `group_mean_f32` GPU kernel (sum + count on GPU, divide on CPU).
-  - Masked global min/max fast-paths wired in `custom_ops.py`.
 - **Phase 2 — Masked global aggregation for any expression**:
   - `_compute_masked_global_agg` extended to handle any inner expression via `_eval_expr_arrow` (e.g. `a*(1-b)`, `case_when`, `startswith`, `isin`) — SUM reduction stays GPU-resident.
   - Join-only plans emit `"join_mojo_shortcut"` provenance (not `"pyarrow_shortcut"`) — Q19 restructured to single-pass join+filter+global_agg.
-  - `audit_gpu_paths.py` updated: `join_mojo_shortcut` counted as Mojo-backed.
 - **Phase 3 — GPU integer key encoding**:
   - `group_encode_i32_gpu` open-addressing hash-table kernel for integer group keys; replaces PyArrow `dictionary_encode` for integer-keyed group-by on GPU.
 - **Audit tool** (`scripts/audit_gpu_paths.py`): classifies each of 22 TPC-H queries as `GPU-CLEAN` / `MOJO-CPU` / `FALLBACK` via `last_compile_provenance["path"]`.
-- **Interactive visualiser** (`visualize/mxframe_pipeline.html`): step-through of how a Python query becomes a plan tree and dispatches to GPU kernels.
 
 ### ⚡ Performance
 - **22/22 TPC-H queries GPU-CLEAN** (100% Mojo-backed on GPU, zero PyArrow fallbacks in the reduction and join hot paths).
@@ -96,104 +149,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [0.1.1] — 2026-04-22
 
 ### 🛠 Fixed
-- Packaging: `readme` now points to `README.md` so PyPI shows the full project page with benchmarks and quickstart (was accidentally showing the internal vision/architecture doc)
-- CI: `AOTKernelsGPU` init no longer hard-fails on CPU-only runners (`CUDA driver unavailable` is caught, `self._aot_gpu` falls back to `None`)
-- CI: `_find_kernels_path()` uses `Path(__file__).resolve().parent` directly, removing the stale `/home/ablearn/mxdf/…` dev fallback that surfaced in installed wheels
-- Bug: `NameError: cache_key_count` in `_hash_join_mojo_cpu` MAX Graph fallback
-- Tests: `scripts/_test_phase0_custom_ops.py` and `_test_phase1.py` no longer hard-code a developer's kernels path; they use the auto-detected default
+- Packaging: `readme` now points to `README.md` so PyPI shows the full project page with benchmarks and quickstart (was accidentally showing the internal vision/architecture doc).
+- CI: `AOTKernelsGPU` init no longer hard-fails on CPU-only runners (`CUDA driver unavailable` is caught, `self._aot_gpu` falls back to `None`).
+- CPU-only import and compute path validated in a clean venv without `modular`.
 
 ---
 
-## [0.1.0] — 2026-04-20
+## [0.1.0] — 2026-04-21
 
-### ✨ Added
-- **All 22 TPC-H queries** on CPU and GPU AOT paths
-- **GPU LEFT JOIN** — `join_count_left` + `join_scatter_left` Mojo kernels wired to Python (Q13)
-- `bench_simple.py` — clean 4-column benchmark (Pandas | Polars | MX CPU | MX GPU)
-- `--queries` and `--runs` flags for targeted benchmarking
-
-### ⚡ Performance
-- **Q22** phone prefix anti-join: vectorized via `pc.utf8_slice_codeunits` + `pc.is_in` + `np.isin` — 3.6× faster than Polars CPU (was 10× **slower**)
-- **Q20** semi-join chain: eliminated `.to_pandas()` Pandas detour — 8.7× faster than Polars (was comparable)
-- **Q21** EXISTS+NOT EXISTS: replaced `.to_pandas().groupby.nunique()` with NumPy composite key dedup
-- **Q18** large volume customers: replaced `.to_pylist()` semi-join with Mojo join — semi-join now uses AOT kernel path
-- **Q15** argmax supplier: replaced `0.9999 * max_rev` tolerance hack with exact `pc.equal()` on float32
-- **Q13** LEFT JOIN: removed `.to_pandas()` groupby detour — now fully on GPU AOT path (19ms CPU, 29ms GPU vs 25ms Polars)
-
-### 🐛 Fixed
-- `not use_gpu_filter` gate bug in `custom_ops.py` section 4.6 that blocked GPU filter path
-- Q7 nation pre-join cache key now uses `id()` preventing cache misses on repeated hot calls
-
-### 🏗️ Infrastructure
-- `pyproject.toml` updated with full metadata, dependencies, optional extras, package-data for `.so` files
-- `CONTRIBUTING.md` — developer guide with kernel writing tutorial
-- `PUBLISHING.md` — step-by-step pip release guide
-- GitHub Actions: `test.yml` (CI), `publish.yml` (PyPI via OIDC)
-
-### 📊 Benchmark Summary (1M and 10M rows, all 22 queries, warm median of 3)
-
-See the full table in [README.md § TPC-H Benchmark](README.md#-tpc-h-benchmark--all-22-queries),
-sourced from `scripts/bench_results_1M.csv` and `scripts/bench_results_10M.csv`.
-
-- **Correctness:** 22/22 queries pass on CPU and GPU paths
-- **MX CPU wins vs Polars:** **21/22** at 1 M, **18/22** at 10 M
-  — headline: **Q9 128× · Q12 89× · Q7 42× · Q8 31× · Q17 24× · Q5 22×** (at 10 M)
-- **MX GPU wins vs Polars:** **16/22** at 1 M, **15/22** at 10 M
-  — headline: **Q12 26.5× · Q9 12× · Q8 10.8× · Q17 9.7× · Q7 4.7×** (at 10 M)
-- **Remaining losses (Q4, Q6, Q13, Q21):** ops that still route through PyArrow fallback — kernel replacements tracked in `roadmap.md`
-
-### 🛠 Fixed
-- `pip install "mxframe[runtime]"` now gives a working install. The `[runtime]` extra pulls `modular>=25.5`, which provides the `max.engine` / `max.driver` modules that `mxframe.compiler` imports at module load. (Pixi users get `modular` from the Modular conda channel and should install `mxframe` without the extra.)
-- `sqlglot` import in `mxframe.sql_frontend` is now lazy: `import mxframe` no longer requires the `[sql]` extra. Calling `mxframe.sql(…)` without `sqlglot` installed raises a clear `ImportError` with the install hint.
-- `__init__.py` `__version__` now matches `pyproject.toml`.
-
----
-
-## [0.1.1] — 2026-04-22
-
-### 🛠 Fixed
-- Packaging: `readme` now points to `README.md` so PyPI shows the full project page with benchmarks and quickstart (was accidentally showing the internal vision/architecture doc)
-- CI: `AOTKernelsGPU` init no longer hard-fails on CPU-only runners (`CUDA driver unavailable` is caught, `self._aot_gpu` falls back to `None`)
-- CI: `_find_kernels_path()` uses `Path(__file__).resolve().parent` directly, removing the stale `/home/ablearn/mxdf/…` dev fallback that surfaced in installed wheels
-- Bug: `NameError: cache_key_count` in `_hash_join_mojo_cpu` MAX Graph fallback
-- Tests: `scripts/_test_phase0_custom_ops.py` and `_test_phase1.py` no longer hard-code a developer's kernels path; they use the auto-detected default
-
----
-
-## [0.1.0] — 2026-04-20
-
-### ✨ Added
-- **All 22 TPC-H queries** on CPU and GPU AOT paths
-- **GPU LEFT JOIN** — `join_count_left` + `join_scatter_left` Mojo kernels wired to Python (Q13)
-- `bench_simple.py` — clean 4-column benchmark (Pandas | Polars | MX CPU | MX GPU)
-- `--queries` and `--runs` flags for targeted benchmarking
-
-### ⚡ Performance
-- **Q22** phone prefix anti-join: vectorized via `pc.utf8_slice_codeunits` + `pc.is_in` + `np.isin` — 3.6× faster than Polars CPU (was 10× **slower**)
-- **Q20** semi-join chain: eliminated `.to_pandas()` Pandas detour — 8.7× faster than Polars (was comparable)
-- **Q21** EXISTS+NOT EXISTS: replaced `.to_pandas().groupby.nunique()` with NumPy composite key dedup
-- **Q18** large volume customers: replaced `.to_pylist()` semi-join with Mojo join — semi-join now uses AOT kernel path
-- **Q15** argmax supplier: replaced `0.9999 * max_rev` tolerance hack with exact `pc.equal()` on float32
-- **Q13** LEFT JOIN: removed `.to_pandas()` groupby detour — now fully on GPU AOT path (19ms CPU, 29ms GPU vs 25ms Polars)
-
-### 🐛 Fixed
-- `not use_gpu_filter` gate bug in `custom_ops.py` section 4.6 that blocked GPU filter path
-- Q7 nation pre-join cache key now uses `id()` preventing cache misses on repeated hot calls
-
-### 🏗️ Infrastructure
-- `pyproject.toml` updated with full metadata, dependencies, optional extras, package-data for `.so` files
-- `CONTRIBUTING.md` — developer guide with kernel writing tutorial
-- `PUBLISHING.md` — step-by-step pip release guide
-- GitHub Actions: `test.yml` (CI), `publish.yml` (PyPI via OIDC)
-
-### 📊 Benchmark Summary (1M and 10M rows, all 22 queries, warm median of 3)
-
-See the full table in [README.md § TPC-H Benchmark](README.md#-tpc-h-benchmark--all-22-queries),
-sourced from `scripts/bench_results_1M.csv` and `scripts/bench_results_10M.csv`.
-
-- **Correctness:** 22/22 queries pass on CPU and GPU paths
-- **MX CPU wins vs Polars:** **21/22** at 1 M, **18/22** at 10 M
-  — headline: **Q9 128× · Q12 89× · Q7 42× · Q8 31× · Q17 24× · Q5 22×** (at 10 M)
-- **MX GPU wins vs Polars:** **16/22** at 1 M, **15/22** at 10 M
-  — headline: **Q12 26.5× · Q9 12× · Q8 10.8× · Q17 9.7× · Q7 4.7×** (at 10 M)
-- **Remaining losses (Q4, Q6, Q13, Q21):** ops that still route through PyArrow fallback — kernel replacements tracked in `roadmap.md`
+Initial public release.

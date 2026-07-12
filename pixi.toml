@@ -14,15 +14,20 @@ setup-mxframe = "ln -sfn $(pwd) .pixi/envs/default/lib/python3.12/site-packages/
 # Run benchmarks: pixi run bench
 bench      = { cmd = "python scripts/benchmark_gpu_first.py",   depends-on = ["setup-mxframe"] }
 bench-tpch = { cmd = "python scripts/benchmark_tpch.py",        depends-on = ["setup-mxframe"] }
+bench-utf8 = { cmd = "python scripts/benchmark_utf8_predicates.py", depends-on = ["setup-mxframe"] }
+bench-weak = { cmd = "python scripts/benchmark_weak_queries.py", depends-on = ["setup-mxframe"] }
+bench-all = { cmd = "python scripts/benchmark_all_22.py", depends-on = ["setup-mxframe"] }
 demo       = { cmd = "python scripts/demo.py",                   depends-on = ["setup-mxframe"] }
 test0    = { cmd = "python scripts/_test_phase0_compiler.py", depends-on = ["setup-mxframe"] }
 test1    = { cmd = "python scripts/_test_phase1.py",          depends-on = ["setup-mxframe"] }
 test4    = { cmd = "python scripts/_test_phase4.py",          depends-on = ["setup-mxframe"] }
 test5    = { cmd = "python scripts/_test_phase5.py",          depends-on = ["setup-mxframe"] }
 test6    = { cmd = "python scripts/_test_phase6_tpch_tier2.py", depends-on = ["setup-mxframe"] }
+test6-gpu = { cmd = "MXFRAME_TEST_DEVICE=gpu python scripts/_test_phase6_tpch_tier2.py", depends-on = ["setup-mxframe"] }
 test-sql  = { cmd = "python scripts/_test_phase_sql.py",         depends-on = ["setup-mxframe"] }
 test-q5q10 = { cmd = "python scripts/_test_phase_q5_q10.py",    depends-on = ["setup-mxframe"] }
-test-all = { depends-on = ["test0", "test1", "test4", "test5", "test6", "test-sql", "test-q5q10"] }
+test-import = { cmd = "python scripts/_test_base_import.py", depends-on = ["setup-mxframe"] }
+test-all = { depends-on = ["test-import", "test0", "test1", "test4", "test5", "test6", "test-sql", "test-q5q10"] }
 check-gpu = { cmd = "python scripts/_check_gpu.py",           depends-on = ["setup-mxframe"] }
 
 [dependencies]

@@ -1,23 +1,23 @@
-Q,Description,MX-CPU(ms),MX-GPU(ms),Polars(ms),Pandas(ms)
-Q1,Filter+8Agg,11.2,94.4,35.6,117.4
-Q6,Masked GlobalAgg,7.9,13.2,10.4,7.7
-Q3,3-Table Join+Agg,5.6,15.9,19.2,21.8
-Q12,2-Table Join+Agg,0.8,3.5,24.5,586.2
-Q14,Promo Revenue,1.4,1.2,6.9,244.0
-Q5,Multi-Join+GroupBy,0.6,4.1,22.6,22.0
-Q10,Customer Revenue,3.6,11.0,32.6,19.3
-Q7,Shipping Volume,0.6,7.3,29.9,19.1
-Q8,Market Share,0.9,4.7,20.2,10.3
-Q13,Customer Distrib,16.2,30.2,27.5,33.5
-Q19,Discounted Revenue,10.9,11.2,19.6,22.4
-Q4,Order Priority,15.0,192.5,15.0,29.9
-Q9,Product Profit,0.6,6.6,39.9,17.8
-Q11,Important Stock,0.5,2.7,7.4,3.0
-Q18,Large Volume Cust,4.2,22.3,33.4,16.8
-Q16,Part/Supplier Rel,2.1,6.3,16.9,6.8
-Q17,Small Qty Order,0.3,2.7,7.9,4.7
-Q2,Min Cost Supplier,6.6,15.6,16.3,9.5
-Q15,Top Supplier Revenue,1.3,11.8,9.9,6.4
-Q20,Potential Part Promo,4.3,5.6,30.0,9.6
-Q21,Suppliers Who Kept,26.0,64.1,31.3,28.6
-Q22,Global Sales Oppty,7.6,16.5,25.4,56.7
+Q,Description,MX-CPU(ms),MX-GPU(ms),Polars(ms),Pandas(ms),RAPIDS-cuDF(ms)
+Q1,Filter+8Agg,12.1,81.9,37.9,130.2,N/A
+Q2,Min Cost Supplier,7.2,31.7,19.2,9.2,N/A
+Q3,3-Table Join+Agg,3.3,14.6,26.6,31.8,N/A
+Q4,Order Priority,12.8,3.4,20.2,40.6,N/A
+Q5,Multi-Join+GroupBy,0.7,6.0,33.0,85.4,N/A
+Q6,Masked GlobalAgg,6.7,6.8,10.8,9.6,N/A
+Q7,Shipping Volume,0.9,12.5,36.0,50.8,N/A
+Q8,Market Share,1.2,N/A:JIT,25.0,22.1,N/A
+Q9,Product Profit,1.0,8.6,48.7,51.5,N/A
+Q10,Customer Revenue,1.6,12.7,34.7,19.2,N/A
+Q11,Important Stock,0.5,2.2,10.1,2.8,N/A
+Q12,2-Table Join+Agg,0.6,6.1,26.6,642.4,N/A
+Q13,Customer Distrib,20.4,1.8,26.5,63.6,N/A
+Q14,Promo Revenue,4.5,9.8,10.0,309.3,N/A
+Q15,Top Supplier Rev,1.4,TIMEOUT,11.7,5.8,N/A
+Q16,Part/Supplier Rel,2.8,8.6,20.5,7.2,N/A
+Q17,Small Qty Order,0.4,TIMEOUT,10.3,5.9,N/A
+Q18,Large Volume Cust,6.3,TIMEOUT,38.8,22.1,N/A
+Q19,Discounted Revenue,10.4,14.3,22.8,43.7,N/A
+Q20,Potential Part Promo,4.7,TIMEOUT,41.9,11.0,N/A
+Q21,Suppliers Who Kept,27.1,6.6,30.2,28.3,N/A
+Q22,Global Sales Oppty,7.2,14.3,24.7,64.0,N/A
