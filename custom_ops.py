@@ -18,7 +18,8 @@ from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS
+from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS
+from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
     from .aot_kernels import AOTKernels, AOT_AVAILABLE, AOTKernelsGPU, GPU_AOT_AVAILABLE
 except Exception:
@@ -85,6 +86,39 @@ _INPUT_PREP_CACHE: Dict[tuple, dict] = {}    # (table_id, num_rows, plan_sig, de
 _POST_OP_MODEL_CACHE: Dict[tuple, Any] = {}  # ("sort_indices"|"unique_mask", N, device) → model  (GPU only)
 _GPU_BUFFER_CACHE: Dict[tuple, Dict[str, Any]] = {}  # prep_key → {col_name: driver.Buffer} (stable inputs only, never __filter_mask__)
 _JOIN_RESULT_CACHE: Dict[tuple, Any] = {}  # (left_stable_key, right_stable_key, left_on, right_on) → pa.Table
+
+
+_WATCHED_TABLES: Dict[int, Any] = {}   # id(table) -> weakref (purges cache entries when the table dies)
+
+
+def _contains_id(key, tid: int) -> bool:
+    if isinstance(key, tuple):
+        return any(_contains_id(k, tid) for k in key)
+    return key == tid and isinstance(key, int) and not isinstance(key, bool)
+
+
+def _watch_table(table) -> None:
+    """Caches above are keyed by ``id(table)``; ids are reused once a table is freed.
+
+    Register a weakref so that, when the table dies, every cache entry keyed by its
+    id is dropped before another object can inherit that id.
+    """
+    import weakref
+    tid = id(table)
+    ref = _WATCHED_TABLES.get(tid)
+    if ref is not None and ref() is table:
+        return
+
+    def _purge(_ref, tid=tid):
+        if _WATCHED_TABLES.get(tid) is _ref:
+            del _WATCHED_TABLES[tid]
+        for cache in (_GROUP_ENCODE_CACHE, _INPUT_PREP_CACHE, _GPU_BUFFER_CACHE, _JOIN_RESULT_CACHE):
+            for k in [k for k in list(cache) if _contains_id(k, tid)]:
+                cache.pop(k, None)
+    try:
+        _WATCHED_TABLES[tid] = weakref.ref(table, _purge)
+    except TypeError:
+        pass
 
 
 def _get_or_create_session(device_name: str, driver_device) -> Any:
@@ -372,6 +406,8 @@ class CustomOpsCompiler(GraphCompiler):
         op, args = expr.op, expr.args
         if op == "col":
             col_arr = table.column(args[0])
+            if pa.types.is_dictionary(col_arr.type):
+                col_arr = _decode_dict(col_arr)
             if isinstance(col_arr, pa.ChunkedArray):
                 # Single-chunk: return underlying Array directly — no 50ms copy!
                 if len(col_arr.chunks) == 1:
@@ -390,6 +426,10 @@ class CustomOpsCompiler(GraphCompiler):
             rhs = self._eval_expr_arrow(args[1], table)
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
             return fn(lhs, rhs)
+        if op in _DICT_PRED_OPS:
+            native = _dict_predicate(expr, table)
+            if native is not None:
+                return native
         if op in ("eq", "ne"):
             lhs_expr, rhs_expr = args[0], args[1]
             if (self._session_device == "gpu" and self._aot_gpu is not None
@@ -1250,6 +1290,7 @@ class CustomOpsCompiler(GraphCompiler):
 
         # pred_sig is empty for GPU filter path: graph is reused across filter values.
         pred_sig = () if use_gpu_filter else tuple(p.signature() for p in predicates)
+        _watch_table(original_scan.table)
         prep_key = (id(original_scan.table), original_scan.table.num_rows,
                     plan_clean.signature(), pred_sig, self._session_device)
 
@@ -2134,6 +2175,7 @@ class CustomOpsCompiler(GraphCompiler):
         for plans that are too complex to cheaply fingerprint (nested joins, …).
         """
         if isinstance(plan, Scan):
+            _watch_table(plan.table)
             return (id(plan.table), plan.table.num_rows)
         if isinstance(plan, Filter):
             inner = CustomOpsCompiler._plan_stable_key(plan.input)
@@ -2191,7 +2233,7 @@ class CustomOpsCompiler(GraphCompiler):
                 if len(_JOIN_RESULT_CACHE) > 24:
                     evict_n = 12
                     for _old_k in list(_JOIN_RESULT_CACHE.keys())[:evict_n]:
-                        del _JOIN_RESULT_CACHE[_old_k]
+                        _JOIN_RESULT_CACHE.pop(_old_k, None)
             return Scan(joined)
         if isinstance(plan, Filter):
             return Filter(self._materialize_joins(plan.input), plan.predicate)
@@ -2780,19 +2822,13 @@ class CustomOpsCompiler(GraphCompiler):
     def _build_group_ids(table, keys):
         """Dictionary-encode group keys into contiguous int32 group ids."""
         if len(keys) == 1:
-            col_arr = table.column(keys[0])
-            if isinstance(col_arr, pa.ChunkedArray):
-                col_arr = col_arr.combine_chunks()
-            encoded = col_arr.dictionary_encode()
+            encoded = _encode_key(table.column(keys[0]))
             ids = encoded.indices.to_numpy(zero_copy_only=False).astype(np.int32, copy=False)
             return ids, len(encoded.dictionary), {keys[0]: encoded.dictionary}
 
         encodings = []
         for k in keys:
-            arr = table.column(k)
-            if isinstance(arr, pa.ChunkedArray):
-                arr = arr.combine_chunks()
-            encodings.append(arr.dictionary_encode())
+            encodings.append(_encode_key(table.column(k)))
 
         sizes = [len(e.dictionary) for e in encodings]
         strides = []
@@ -2856,10 +2892,7 @@ class CustomOpsCompiler(GraphCompiler):
             # Dictionary-encode each key column (PyArrow SIMD — not replicated in Mojo)
             encodings = []
             for k in keys:
-                arr = table.column(k)
-                if isinstance(arr, pa.ChunkedArray):
-                    arr = arr.combine_chunks()
-                encodings.append(arr.dictionary_encode())
+                encodings.append(_encode_key(table.column(k)))
 
             sizes = [len(e.dictionary) for e in encodings]
             strides_list = []
@@ -2968,6 +3001,7 @@ class CustomOpsCompiler(GraphCompiler):
              (fused composite-key computation via Mojo group_composite kernel)
           3. CPU fallback                      → _build_group_ids (PyArrow)
         """
+        _watch_table(table)
         cache_key = (id(table), table.num_rows, tuple(keys))
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
