@@ -94,6 +94,12 @@ def _shapes():
             .groupby("k1", "k2")
             .agg(col("vol").sum().alias("total"), col("k1_price").sum().alias("k1_total"))
             .sort("k1", "k2").compute(device=dev)),
+        "filter selects nothing, one key": lambda dev: (
+            LazyFrame(Scan(f)).filter(col("ship") > lit(1_000_000)).groupby("k1")
+            .agg(col("price").sum().alias("s")).compute(device=dev)),
+        "filter selects nothing, two keys": lambda dev: (
+            LazyFrame(Scan(f)).filter(col("ship") > lit(1_000_000)).groupby("k1", "k2")
+            .agg(col("price").sum().alias("s"), col("price").count().alias("c")).compute(device=dev)),
         "sort + limit": lambda dev: (
             LazyFrame(Scan(f)).sort("price", descending=True).limit(10).compute(device=dev)),
         "distinct": lambda dev: (
@@ -110,7 +116,7 @@ def _shapes():
 @pytest.mark.parametrize("shape", list(_shapes()))
 def test_query_shape_compiles_no_graph(device, shape, jit_counter):
     out = _shapes()[shape](device)
-    assert out.num_rows > 0
+    assert out.num_rows > 0 or shape.startswith("filter selects nothing")
     assert jit_counter == {"load": 0, "session": 0}, f"{shape} on {device} hit the MAX Graph JIT: {jit_counter}"
 
 
