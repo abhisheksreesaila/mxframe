@@ -58,6 +58,7 @@ class _Driver:
             "cuMemcpyHtoDAsync_v2": [u64, vp, sz, u64],
             "cuMemcpyHtoD_v2": [u64, vp, sz],
             "cuMemcpyDtoH_v2": [vp, u64, sz],
+            "cuMemGetInfo_v2": [P(sz), P(sz)],
         }
         for fn, args in sigs.items():
             f = getattr(lib, fn)
@@ -216,3 +217,29 @@ def measure_h2d_gbps(nbytes: int = 256 << 20, pinned: bool = True, reps: int = 3
         d.lib.cuMemFree_v2(dev.value)
         if host_ptr:
             d.lib.cuMemFreeHost(host_ptr)
+
+
+def mem_info() -> tuple:
+    """(free_bytes, total_bytes) on the current device."""
+    d = _driver()
+    free, total = ctypes.c_size_t(0), ctypes.c_size_t(0)
+    d._check(d.lib.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total)), "cuMemGetInfo")
+    return free.value, total.value
+
+
+class CudaDevice:
+    """Device adapter for ResidencyTracker: synchronous alloc + upload, free."""
+
+    def alloc_and_upload(self, arr: np.ndarray) -> int:
+        d = _driver()
+        dev = ctypes.c_uint64(0)
+        d._check(d.lib.cuMemAlloc_v2(ctypes.byref(dev), max(arr.nbytes, 1)), "cuMemAlloc")
+        if arr.nbytes:
+            err = d.lib.cuMemcpyHtoD_v2(dev.value, arr.ctypes.data, arr.nbytes)
+            if err != 0:
+                d.lib.cuMemFree_v2(dev.value)
+                d._check(err, "cuMemcpyHtoD")
+        return dev.value
+
+    def free(self, ptr: int) -> None:
+        _driver().lib.cuMemFree_v2(ptr)
