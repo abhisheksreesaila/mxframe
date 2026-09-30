@@ -2,6 +2,10 @@ from std.gpu.host import DeviceContext, DeviceAttribute
 from std.math import ceildiv
 from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
 from std.gpu.memory import AddressSpace, external_memory
+from std.gpu.primitives.warp import vote, shuffle_idx
+from std.gpu.primitives.id import lane_id
+from std.bit import pop_count, count_trailing_zeros
+from std.sys._assembly import inlined_assembly
 from std.memory import stack_allocation
 from _atomic import Atomic
 
@@ -247,7 +251,10 @@ def _atomic_fold[op: Int, space: AddressSpace](
     elif op == OP_MAX:
         _ = Atomic.max[space](ptr, v)
     else:
-        _ = Atomic.fetch_add[space](ptr, v)
+        comptime if space == AddressSpace.GENERIC:
+            Atomic.red_add_global(Int(ptr), v)
+        else:
+            _ = Atomic.fetch_add[space](ptr, v)
 
 @always_inline
 def _row_value[op: Int](val_addr: Int, i: Int) -> Float32:
@@ -280,6 +287,50 @@ def group_global_kernel[op: Int](
         if gid >= 0 and gid < ng:
             _atomic_fold[op, AddressSpace.GENERIC](
                 _f32(out_addr) + gid, _row_value[op](val_addr, i))
+        i += stride
+
+@always_inline
+def _match_any(x: Int32) -> UInt32:
+    """Mask of the warp lanes holding the same value as this lane (sm_70+ match.any)."""
+    return inlined_assembly["match.any.sync.b32 $0, $1, 0xffffffff;", UInt32,
+                            constraints="=r,r"](x.cast[DType.uint32]())
+
+# Global-atomic path for SUM / COUNT with warp aggregation.  A float atomicrmw fadd
+# lowers to a compare-exchange loop, so k threads adding to one hot group cost O(k^2)
+# retries (10M rows, 100k groups, one key at 25%: 40 s).  Two fixes: the add is the
+# native `red.global.add.f32`, and lanes of a warp that hold the same group are
+# combined first (match.any, the group leader sums its members' values with
+# shuffles), so a hot group costs one atomic per warp per row instead of one per row.
+# Every lane runs every iteration (the shuffles need the full warp), rows past n are
+# lanes with group -1.
+def group_global_add_kernel[op: Int](
+    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+):
+    var lane = Int(lane_id())
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    for _ in range(ceildiv(n, stride)):
+        var gid = Int32(-1)
+        var v = Float32(0)
+        if i < n:
+            var g = _i32(lab_addr)[i]
+            if g >= Int32(0) and Int(g) < ng:
+                gid = g
+                v = _row_value[op](val_addr, i)
+        var mask = _match_any(gid)
+        var leader = lane == Int(count_trailing_zeros(mask))
+        var acc = Float32(0)
+        comptime if op == OP_COUNT:
+            acc = Float32(pop_count(mask))
+        else:
+            var m = mask if leader else UInt32(0)
+            while vote[DType.uint32](m != UInt32(0)) != UInt32(0):
+                var src = Int(count_trailing_zeros(m)) if m != UInt32(0) else lane
+                var x = shuffle_idx(v, UInt32(src))
+                if m != UInt32(0):
+                    acc += x
+                    m &= m - UInt32(1)
+        if leader and gid >= Int32(0):
+            Atomic.red_add_global(Int(_f32(out_addr) + Int(gid)), acc)
         i += stride
 
 def group_shared_kernel[op: Int](
@@ -346,9 +397,14 @@ def run_group[op: Int](
                 grid_dim=blocks, block_dim=BLOCK, shared_mem_bytes=smem)
         else:
             var blocks = min(sms * MAX_BLOCKS_PER_SM, ceildiv(n, BLOCK * GA_UNROLL))
-            ctx.enqueue_function_experimental[group_global_kernel[op]](
-                out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
-                grid_dim=blocks, block_dim=BLOCK)
+            comptime if op == OP_SUM or op == OP_COUNT:
+                ctx.enqueue_function_experimental[group_global_add_kernel[op]](
+                    out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                    grid_dim=blocks, block_dim=BLOCK)
+            else:
+                ctx.enqueue_function_experimental[group_global_kernel[op]](
+                    out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                    grid_dim=blocks, block_dim=BLOCK)
     ctx.synchronize()
 
 @export
@@ -1202,6 +1258,8 @@ def sort_topk_i32_gpu(
                     k <<= 1
                 ctx.enqueue_function_experimental[extract](
                     n, w, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+                ctx.synchronize()
+                _ = words^          # keep the scratch alive until the kernels are done
             ctx.synchronize()
     except: pass
 
@@ -1329,6 +1387,9 @@ def _scan_level(
     _scan_tiles(ctx, out_addr, in_addr, sums_addr, n)
     _scan_level(ctx, offs_addr, sums_addr, total_addr, nb)
     _scan_add_offsets(ctx, out_addr, offs_addr, n)
+    ctx.synchronize()
+    _ = sums^                       # keep the scratch alive until the kernels are done
+    _ = offs^
 
 @export
 def scan_i32_gpu(out_addr: Int, in_addr: Int, total_addr: Int, n: Int) abi("C"):

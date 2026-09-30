@@ -71,3 +71,16 @@ def test_late_supplier_hash_table_terminates_and_matches_numpy():
 
 def test_sort_end_to_end_single_and_multi_key_with_and_without_limit():
     run_scenario("sort_end_to_end", timeout=600)
+
+
+@pytest.mark.parametrize("kind", ["0.01", "0.05", "0.25", "zipf"])
+def test_skewed_high_cardinality_group_by_is_not_super_linear(kind):
+    run_scenario("group_skew", kind, timeout=120)
+
+
+def test_wrappers_work_from_a_thread_that_never_touched_cuda():
+    run_scenario("other_thread")
+
+
+def test_failed_hash_join_frees_its_scratch_buffers():
+    run_scenario("join_failure_frees_scratch")

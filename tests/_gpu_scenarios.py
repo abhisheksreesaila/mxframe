@@ -312,7 +312,89 @@ def sort_end_to_end():
         np.testing.assert_allclose(out.column("s").to_numpy(), ref[keys], rtol=1e-3, atol=1e-2)
 
 
-SCENARIOS = {f.__name__: f for f in (sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
+def other_thread():
+    """The co-processing Router runs the GPU worker on its own thread: every wrapper, including
+    DeviceArray.to_numpy()/free(), must work from a thread that never touched CUDA."""
+    import threading
+    g = gpu()                                   # created on the main thread
+    rng = np.random.default_rng(4)
+    val = rng.random(50_000, dtype=np.float32)
+    lab = rng.integers(0, 50, 50_000).astype(np.int32)
+    lk = rng.integers(0, 500, 5_000).astype(np.int32)
+    rk = rng.integers(0, 500, 800).astype(np.int32)
+    errors, results = [], {}
+
+    def worker():
+        try:
+            results["sum"] = g.group_sum_f32(val, lab, 50)
+            dev = g.group_sum_f32(val, lab, 50, device_out=True)
+            results["dev"] = dev.to_numpy()
+            dev.free()
+            results["join"] = g.hash_join(lk, rk)
+            results["sort"] = g.sort_topk(lab, 10)
+            results["enc"] = g.group_encode_i32(lab)
+        except BaseException as e:            # noqa: BLE001
+            errors.append(repr(e))
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert not errors, errors
+    ref = np.bincount(lab, val.astype(np.float64), 50)
+    np.testing.assert_allclose(results["sum"], ref, rtol=1e-4, atol=1e-2)
+    np.testing.assert_allclose(results["dev"], ref, rtol=1e-4, atol=1e-2)
+    li, ri = results["join"]
+    assert len(li) == int(sum((rk == a).sum() for a in lk))
+    np.testing.assert_array_equal(results["sort"], np.argsort(lab, kind="stable")[:10])
+    assert results["enc"][1] == len(np.unique(lab))
+
+
+def group_skew(kind: str):
+    """Skewed high-cardinality group-bys (global-atomic path): correct, and no slower than a small
+    multiple of the uniform case.  Float atomicAdd used to lower to a compare-exchange loop, so a
+    hot group made this super-linear (10M rows / 100k groups, one key at 25%: 40 s)."""
+    import time
+    n, ng = 10_000_000, 100_000
+    g = gpu()
+    rng = np.random.default_rng(0)
+    val = rng.random(n, dtype=np.float32)
+
+    def timed(lab):
+        g.group_sum_f32(val, lab, ng)                       # warm up + upload
+        t = time.perf_counter()
+        out = g.group_sum_f32(val, lab, ng)
+        cnt = g.group_count_f32(lab, ng)
+        return time.perf_counter() - t, out, cnt
+
+    uni = rng.integers(0, ng, n).astype(np.int32)
+    t_uni, _, _ = timed(uni)
+    if kind == "zipf":
+        lab = np.minimum(rng.zipf(1.3, n) - 1, ng - 1).astype(np.int32)
+    else:
+        lab = rng.integers(0, ng, n).astype(np.int32)
+        lab[rng.random(n) < float(kind)] = 7
+    dt, out, cnt = timed(lab)
+    np.testing.assert_allclose(out, np.bincount(lab, val.astype(np.float64), ng), rtol=1e-3, atol=1e-2)
+    np.testing.assert_array_equal(cnt, np.bincount(lab, minlength=ng).astype(np.float32))
+    assert dt < max(6 * t_uni, 0.1), f"skew {kind}: {dt:.3f}s vs uniform {t_uni:.3f}s"
+
+
+def join_failure_frees_scratch():
+    """A hash_join that dies mid-way (table for a huge key does not fit) leaks nothing."""
+    from mxframe import gpu_stream
+    g = gpu()
+    g.hash_join(np.array([1, 2], np.int32), np.array([2], np.int32))       # warm up
+    free0, _ = gpu_stream.mem_info()
+    for _ in range(5):
+        try:
+            g.hash_join(np.array([1, 2**31 - 2], np.int32), np.array([2**31 - 2], np.int32))
+        except (RuntimeError, MemoryError, OverflowError):
+            pass
+    free1, _ = gpu_stream.mem_info()
+    assert free0 - free1 < 64 << 20, (free0 - free1)
+
+
+SCENARIOS = {f.__name__: f for f in (join_failure_frees_scratch, other_thread, group_skew, sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
 
 
 def register(fn):

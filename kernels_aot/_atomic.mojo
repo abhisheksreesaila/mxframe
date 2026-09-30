@@ -9,6 +9,7 @@ add/min/max use monotonic (CUDA atomicAdd semantics); seq_cst makes NVPTX fence 
 """
 
 from std.gpu.memory import AddressSpace
+from std.sys._assembly import inlined_assembly
 from std.memory import UnsafePointer
 
 
@@ -94,13 +95,14 @@ struct Atomic:
         mut expected: Int32,
         desired: Int32,
     ) -> Bool:
-        """True CAS on global int32 memory via MLIR llvm.cmpxchg."""
+        """True CAS on global int32 memory via MLIR llvm.cmpxchg (seq_cst; a failed CAS is an
+        acquire load of the value it found, so a published slot is safe to read)."""
         var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
         var cmp = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](expected)
         var new = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](desired)
         var result = __mlir_op.`llvm.cmpxchg`[
             success_ordering = __mlir_attr.`7 : i64`,
-            failure_ordering = __mlir_attr.`2 : i64`,
+            failure_ordering = __mlir_attr.`4 : i64`,
             _type = __mlir_type.`!llvm.struct<(i32, i1)>`,
         ](p, cmp, new)
         var old_i32 = __mlir_op.`llvm.extractvalue`[position = __mlir_attr.`array<i64: 0>`, _type = __mlir_type.i32](result)
@@ -136,3 +138,9 @@ struct Atomic:
         var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](val)
         var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`7 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i32](p, v)
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Int32]](r)
+
+    @staticmethod
+    def red_add_global(addr: Int, val: Float32):
+        """Fire-and-forget native `red.global.add.f32` on a global address."""
+        inlined_assembly["red.relaxed.gpu.global.add.f32 [$0], $1;", NoneType,
+                         constraints="l,f,~{memory}"](addr, val)

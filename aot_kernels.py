@@ -1158,44 +1158,49 @@ class AOTKernelsGPU:
         the matches of one left row in right-row order.
         """
         tmps: list = []
+        bufs: list = []                                   # scratch freed on every exit, errors included
         try:
             lk, n_left = self._dev_in(left_keys, np.int32, tmps)
             rk, n_right = self._dev_in(right_keys, np.int32, tmps)
             if n_left == 0 or n_right == 0:
                 return self._pair_result(self._empty_pair(), device_out)
+
+            def scratch(nbytes: int) -> int:
+                ptr = self._alloc(nbytes)
+                bufs.append(ptr)
+                return ptr
+
             # table_size = max key + 1 (keys must be >= 0, as before)
-            mx = self._alloc(4)
+            mx = scratch(4)
             self._fill_i32(mx, 1, 0)
             self._sym("max_i32_gpu", [_P64, _P64, _I64])(self._ptr(mx), self._ptr(lk), n_left)
             self._sym("max_i32_gpu", [_P64, _P64, _I64])(self._ptr(mx), self._ptr(rk), n_right)
             table_size = int(self._download(mx, np.int32, 1)[0]) + 1
-            self._free(mx)
 
-            table = self._alloc(table_size * 4)                # right rows per key
+            table = scratch(table_size * 4)                # right rows per key
             self._fill_i32(table, table_size, 0)
-            counts = self._alloc(n_left * 4)                   # matches per left row
+            counts = scratch(n_left * 4)                   # matches per left row
             self._join_count_gpu(self._ptr(counts), self._ptr(table), self._ptr(lk), self._ptr(rk),
                                  n_left, n_right, table_size)
-            offsets = self._alloc(n_left * 4)                  # exclusive prefix sum of counts
+            offsets = scratch(n_left * 4)                  # exclusive prefix sum of counts
             total = self._scan_i32(offsets, counts, n_left)
             if total == 0:
-                self._free(table, counts, offsets)
                 return self._pair_result(self._empty_pair(), device_out)
-            starts = self._alloc(table_size * 4)               # exclusive prefix sum of table
+            starts = scratch(table_size * 4)               # exclusive prefix sum of table
             self._scan_i32(starts, table, table_size)
-            order = self._alloc(n_right * 4)                   # stable argsort of right keys
+            order = scratch(n_right * 4)                   # stable argsort of right keys
             self._sort_topk_gpu(self._ptr(order), self._ptr(rk), n_right, 2)   # negative keys last
             left_out = self._alloc(total * 4)
             right_out = self._alloc(total * 4)
+            pair = (DeviceArray(left_out, np.int32, total, owns=True),
+                    DeviceArray(right_out, np.int32, total, owns=True))   # owned from here on
             self._join_scatter_gpu(
                 self._ptr(left_out), self._ptr(right_out), self._ptr(lk), self._ptr(offsets),
                 self._ptr(order), self._ptr(starts), self._ptr(table), n_left, table_size)
             self._cu.sync()
-            self._free(table, counts, offsets, starts, order)
-            return self._pair_result((DeviceArray(left_out, np.int32, total, owns=True),
-                                      DeviceArray(right_out, np.int32, total, owns=True)), device_out)
+            return self._pair_result(pair, device_out)
         finally:
-            self._free(*tmps)
+            self._free(*bufs, *tmps)
 
     def _empty_pair(self) -> tuple:
         return tuple(DeviceArray(self._alloc(4), np.int32, 0, owns=True) for _ in range(2))
@@ -1217,11 +1222,12 @@ class AOTKernelsGPU:
         if n <= 0:
             return 0
         tot = self._alloc(4)
-        self._sym("scan_i32_gpu", [_P64, _P64, _P64, _I64])(
-            self._ptr(out), self._ptr(src), self._ptr(tot), n)
-        res = int(self._download(tot, np.int32, 1)[0])
-        self._cu.free(tot)
-        return res
+        try:
+            self._sym("scan_i32_gpu", [_P64, _P64, _P64, _I64])(
+                self._ptr(out), self._ptr(src), self._ptr(tot), n)
+            return int(self._download(tot, np.int32, 1)[0])
+        finally:
+            self._cu.free(tot)
 
     def gather_table(
         self,
@@ -1382,6 +1388,38 @@ class AOTKernelsGPU:
             return self._result(out, np.int32, n, device_out)
         finally:
             self._free(*tmps)
+
+
+_thread_state = threading.local()
+
+
+def _bind_thread(cu) -> None:
+    """Make the primary CUDA context current on the calling thread (once per thread).
+
+    The context is per thread; the co-processing Router runs its GPU worker on a helper thread
+    that never touched CUDA, where cuMemAlloc fails with "invalid context".  Applied to every
+    _CUDADriver entry point below (kept out of the class body so it does not collide with
+    F-004's own per-thread binding there; binding twice is harmless)."""
+    ctx = getattr(cu, "_ctx", None)
+    if ctx is None:
+        return
+    key = int(getattr(ctx, "value", ctx))
+    if getattr(_thread_state, "ctx", None) != key:
+        cu._lib.cuCtxSetCurrent(ctx)
+        _thread_state.ctx = key
+
+
+def _bound(method):
+    def call(self, *args, **kwargs):
+        _bind_thread(self)
+        return method(self, *args, **kwargs)
+    call.__name__ = method.__name__
+    call.__doc__ = method.__doc__
+    return call
+
+
+for _name in ("malloc", "free", "h2d", "d2h", "sync"):
+    setattr(_CUDADriver, _name, _bound(getattr(_CUDADriver, _name)))
 
 
 class DeviceArray:
