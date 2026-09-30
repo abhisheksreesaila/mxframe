@@ -517,6 +517,11 @@ class _CUDADriver:
         lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev)
         lib.cuCtxSetCurrent(ctx)
         self._ctx = ctx
+        # The current context is per thread.  The driver may be created on the warm-up
+        # thread and used from the caller's thread, so every driver call re-binds
+        # the (shared, primary) context once per thread.
+        self._tls = threading.local()
+        self._tls.bound = True
 
         # cuMemAlloc / cuMemFree / memcpy
         lib.cuMemAlloc_v2.restype = ctypes.c_int
@@ -533,7 +538,15 @@ class _CUDADriver:
         lib.cuCtxSynchronize.restype = ctypes.c_int
         lib.cuCtxSynchronize.argtypes = []
 
+    def bind_thread(self) -> None:
+        """Make the primary context current on the calling thread (once per thread).
+        Mojo's DeviceContext() inside the AOT library retains the same primary context."""
+        if not getattr(self._tls, "bound", False):
+            self._lib.cuCtxSetCurrent(self._ctx)
+            self._tls.bound = True
+
     def malloc(self, nbytes: int) -> int:
+        self.bind_thread()
         ptr = ctypes.c_uint64(0)
         err = self._lib.cuMemAlloc_v2(ctypes.byref(ptr), nbytes)
         if err != 0:
@@ -541,19 +554,23 @@ class _CUDADriver:
         return int(ptr.value)
 
     def free(self, ptr: int):
+        self.bind_thread()
         self._lib.cuMemFree_v2(ctypes.c_uint64(ptr))
 
     def h2d(self, dev_ptr: int, arr: np.ndarray):
+        self.bind_thread()
         hp = arr.ctypes.data_as(ctypes.c_void_p)
         self._lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), hp,
                                     ctypes.c_size_t(arr.nbytes))
 
     def d2h(self, arr: np.ndarray, dev_ptr: int):
+        self.bind_thread()
         hp = arr.ctypes.data_as(ctypes.c_void_p)
         self._lib.cuMemcpyDtoH_v2(hp, ctypes.c_uint64(dev_ptr),
                                     ctypes.c_size_t(arr.nbytes))
 
     def sync(self):
+        self.bind_thread()
         self._lib.cuCtxSynchronize()
 
 
@@ -561,14 +578,40 @@ class _CUDADriver:
 _cuda_driver: Optional["_CUDADriver"] = None
 
 
+_gpu_init_lock = threading.RLock()
+
+
 def _get_cuda_driver() -> Optional["_CUDADriver"]:
     global _cuda_driver
-    if _cuda_driver is None:
-        try:
-            _cuda_driver = _CUDADriver()
-        except Exception:
-            return None
-    return _cuda_driver
+    with _gpu_init_lock:
+        if _cuda_driver is None:
+            try:
+                _cuda_driver = _CUDADriver()
+            except Exception:
+                return None
+        return _cuda_driver
+
+
+_aot_gpu_singleton: Optional["AOTKernelsGPU"] = None
+_aot_gpu_failed = False
+
+
+def get_aot_gpu() -> Optional["AOTKernelsGPU"]:
+    """The process-wide ``AOTKernelsGPU``, created on first call (thread-safe), or None.
+
+    Nothing touches CUDA until this is called, so CPU-only use never creates a context.
+    Creation happens once, on whichever thread asks first (the auto-mode warm-up thread
+    or the caller's); a failure (no driver, no device) is remembered and returns None."""
+    global _aot_gpu_singleton, _aot_gpu_failed
+    if _aot_gpu_singleton is not None or _aot_gpu_failed or not GPU_AOT_AVAILABLE:
+        return _aot_gpu_singleton
+    with _gpu_init_lock:
+        if _aot_gpu_singleton is None and not _aot_gpu_failed:
+            try:
+                _aot_gpu_singleton = AOTKernelsGPU()
+            except Exception:
+                _aot_gpu_failed = True
+        return _aot_gpu_singleton
 
 
 class AOTKernelsGPU:
