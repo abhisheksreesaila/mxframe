@@ -65,6 +65,10 @@ class PlanOptimizer:
         if changed:
             trace.append("remove_identity_projects")
 
+        current, changed = self._prune_unused_outputs(current)
+        if changed:
+            trace.append("prune_unused_columns")
+
         if not trace:
             trace.append("no_op")
 
@@ -139,6 +143,20 @@ class PlanOptimizer:
                             to_right.append(c)
                         else:
                             stay.append(c)
+                    # A disjunction that mixes both sides cannot move, but each side can filter by what it
+                    # implies: (a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.y = 4) needs a.x IN (1, 3) and
+                    # b.y IN (2, 4). The original conjunct stays above the join, so results are unchanged.
+                    for c in list(stay):
+                        if getattr(c, "op", None) not in ("or", "__or__"):
+                            continue
+                        left_ok = lambda u: u <= lcols and not (u & r_visible)
+                        right_ok = lambda u: u <= r_visible - r_renamed and not (u & lcols)
+                        implied_left = _implied(c, left_ok)
+                        implied_right = _implied(c, right_ok) if node.how == "inner" else None
+                        if implied_left is not None:
+                            to_left.append(implied_left)
+                        if implied_right is not None:
+                            to_right.append(implied_right)
                     if to_left or to_right:
                         changed = True
                         node = Join(push(node.left, to_left), push(node.right, to_right),
@@ -166,6 +184,76 @@ class PlanOptimizer:
             return node
 
         return walk(plan), changed
+
+    # ── projection pushdown ─────────────────────────────────────────────────────────────────────
+    # `with_columns` passes every column of its input through, so a plan such as
+    # `lineitem.join(orders).with_columns(year).groupby(...).agg(...)` names every column of both tables
+    # in a Project although the aggregate reads six. Top-down, each Project keeps only the outputs its
+    # parent reads, which is also what `resolve_plan` uses to decide which Parquet columns to read.
+
+    def _prune_unused_outputs(self, plan: LogicalPlan) -> Tuple[LogicalPlan, bool]:
+        from .io_parquet import _expr_cols
+        changed = False
+
+        def cols_of(exprs) -> set:
+            out: set = set()
+            for e in exprs:
+                if hasattr(e, "op"):
+                    out |= _expr_cols(e)
+                else:
+                    out.add(e)                      # a bare column name (Sort.by)
+            return out
+
+        def out_name(e, i):
+            return getattr(e, "_alias", None) or (e.args[0] if e.op == "col" else f"col_{i}")
+
+        def walk(node: LogicalPlan, needed):
+            """``needed``: column names the parent reads from ``node`` (None: all of them)."""
+            nonlocal changed
+            if isinstance(node, Project):
+                exprs = list(node.exprs)
+                produced = {out_name(e, i) for i, e in enumerate(exprs)}
+                if needed is not None and all(getattr(e, "_alias", None) or e.op == "col" for e in exprs):
+                    keep = [e for i, e in enumerate(exprs) if out_name(e, i) in needed] or exprs[:1]
+                    if len(keep) != len(exprs):
+                        changed = True
+                        exprs = keep
+                below = cols_of(exprs)
+                if needed is not None:
+                    below |= needed - produced     # read through (a Project of new columns only)
+                return Project(walk(node.input, below), exprs)
+            if isinstance(node, Filter):
+                more = cols_of([node.predicate])
+                return Filter(walk(node.input, None if needed is None else needed | more), node.predicate)
+            if isinstance(node, Aggregate):
+                return Aggregate(walk(node.input, cols_of(list(node.group_by) + list(node.aggs))),
+                                 node.group_by, node.aggs)
+            if isinstance(node, Sort):
+                more = cols_of(list(node.by))
+                return Sort(walk(node.input, None if needed is None else needed | more), node.by, node.descending)
+            if isinstance(node, Limit):
+                return Limit(walk(node.input, needed), node.n)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input, needed), node.n)
+            if isinstance(node, Distinct):
+                below = None if (needed is None or not node.subset) else needed | set(node.subset)
+                return Distinct(walk(node.input, below), node.subset)
+            if isinstance(node, Join):
+                lcols, rcols = _output_columns(node.left), _output_columns(node.right)
+                if needed is None or lcols is None or rcols is None:
+                    return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
+                mapping = join_output_names(lcols, rcols, node.right_on)
+                if set(lcols) & {c for c in rcols if c not in node.right_on}:
+                    # a name on both sides is renamed `<name>_right` from the columns present: dropping a
+                    # column below would change the names the parent reads
+                    return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
+                left_need = (needed & set(lcols)) | set(node.left_on)
+                right_need = {orig for orig, out in mapping if out in needed} | set(node.right_on)
+                return Join(walk(node.left, left_need), walk(node.right, right_need),
+                            node.left_on, node.right_on, node.how)
+            return node
+
+        return walk(plan, None), changed
 
     def _collapse_nested_limits(self, plan: LogicalPlan) -> Tuple[LogicalPlan, bool]:
         changed = False
@@ -300,6 +388,41 @@ def _conjuncts(expr: Expr) -> List[Expr]:
     if getattr(expr, "op", None) in ("and", "__and__"):
         return _conjuncts(expr.args[0]) + _conjuncts(expr.args[1])
     return [expr]
+
+
+def _disjuncts(expr: Expr) -> List[Expr]:
+    if getattr(expr, "op", None) in ("or", "__or__"):
+        return _disjuncts(expr.args[0]) + _disjuncts(expr.args[1])
+    return [expr]
+
+
+def _implied(expr: Expr, ok) -> "Expr | None":
+    """A predicate over columns accepted by ``ok(columns)`` that every row satisfying the disjunction
+    ``expr`` also satisfies (each disjunct contributes the conjuncts it has on those columns), or None
+    when some disjunct has none."""
+    parts = []
+    for d in _disjuncts(expr):
+        atoms = []
+        for a in _conjuncts(d):
+            used = _expr_columns(a)
+            if used and ok(used):
+                atoms.append(a)
+        if not atoms:
+            return None
+        parts.append(_and_all(atoms))
+    if len(parts) < 2:
+        return None
+    out = parts[0]
+    for p in parts[1:]:
+        out = Expr("or", out, p)
+    return out
+
+
+def _and_all(atoms: List[Expr]) -> Expr:
+    out = atoms[0]
+    for a in atoms[1:]:
+        out = Expr("and", out, a)
+    return out
 
 
 def _wrap(node: LogicalPlan, conjuncts: List[Expr]) -> LogicalPlan:

@@ -61,11 +61,11 @@ def encode_key(col):
         # Keep the historical null handling of dictionary_encode().
         return decode(d).dictionary_encode()
     n = len(d.dictionary)
-    if len(pc.unique(d.indices)) == n:
-        return d
     idx = _np_of(d.indices, zero_copy_only=False)
     used = np.zeros(n, dtype=bool)
     used[idx] = True
+    if used.all():
+        return d
     remap = (np.cumsum(used) - 1).astype(np.int32)
     return pa.DictionaryArray.from_arrays(
         _npa(remap[idx]), d.dictionary.filter(_npa(used)))

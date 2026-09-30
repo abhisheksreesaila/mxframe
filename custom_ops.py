@@ -28,6 +28,12 @@ except Exception:
     GPU_AOT_AVAILABLE = False
     AOTKernelsGPU = None
     get_aot_gpu = lambda: None
+try:
+    from .aot_kernels import check_join_output_size
+except Exception:
+    def check_join_output_size(total):
+        if total > (1 << 31) - 1:
+            raise MemoryError(f"join output would have {total:,} rows, more than the join kernels can address")
 try:  # F-008 fused pipeline dispatch (AOT kernels; no JIT)
     from .pipeline_exec import try_fused_aggregate
 except Exception:
@@ -2800,70 +2806,15 @@ class CustomOpsCompiler(GraphCompiler):
             return inner + ("project", tuple(e.signature() for e in plan.exprs))
         return None
 
-    def _materialize_joins(self, plan):
-        """Recursively replace Join nodes with Scan(joined_table).
+    def _materialize_joins(self, plan, needed=None):
+        """Replace Join nodes by Scans of their results (F-018: see ``join_engine``).
 
-        Walks bottom-up: materializes both sides of a Join, executes the
-        hash join (Mojo kernel or numpy), and returns a Scan of the result.
-        After this, the plan tree is a single-input chain again.
-
-        Join results are cached in _JOIN_RESULT_CACHE keyed by the stable
-        fingerprints of both input plans + join columns.  This eliminates
-        redundant join computation on hot calls where the input tables are
-        the same Python objects.
+        ``needed`` is the set of column names read from ``plan``'s output (None: all); each join
+        only produces the columns read above it, and a chain of inner joins is reordered and
+        gathered once.  Results are cached in _JOIN_RESULT_CACHE on hot calls over the same tables.
         """
-        if isinstance(plan, Scan):
-            return plan
-        if isinstance(plan, Join):
-            left_plan = self._materialize_joins(plan.left)
-            right_plan = self._materialize_joins(plan.right)
-
-            # Attempt join-result cache lookup before materialising tables.
-            left_key  = self._plan_stable_key(left_plan)
-            right_key = self._plan_stable_key(right_plan)
-            join_cache_key: tuple | None = None
-            if left_key is not None and right_key is not None:
-                join_cache_key = (
-                    left_key, right_key,
-                    tuple(plan.left_on), tuple(plan.right_on),
-                    plan.how,
-                    self._session_device,      # a GPU-computed join (float32 gathers) is not a CPU join
-                )
-                cached_join = _JOIN_RESULT_CACHE.get(join_cache_key)
-                if cached_join is not None:
-                    return Scan(cached_join)
-
-            left_table = self._plan_to_table(left_plan)
-            right_table = self._plan_to_table(right_plan)
-            joined = self._execute_hash_join(
-                left_table, right_table, plan.left_on, plan.right_on, how=plan.how
-            )
-            if join_cache_key is not None:
-                _JOIN_RESULT_CACHE[join_cache_key] = joined
-                # Evict oldest half when cache exceeds 24 entries to prevent
-                # unbounded memory accumulation across long benchmark runs.
-                if len(_JOIN_RESULT_CACHE) > 24:
-                    evict_n = 12
-                    for _old_k in list(_JOIN_RESULT_CACHE.keys())[:evict_n]:
-                        _JOIN_RESULT_CACHE.pop(_old_k, None)
-            return Scan(joined)
-        if isinstance(plan, Filter):
-            return Filter(self._materialize_joins(plan.input), plan.predicate)
-        if isinstance(plan, Project):
-            return Project(self._materialize_joins(plan.input), plan.exprs)
-        if isinstance(plan, Aggregate):
-            return Aggregate(self._materialize_joins(plan.input), plan.group_by, plan.aggs)
-        if isinstance(plan, Sort):
-            return Sort(self._materialize_joins(plan.input), plan.by, plan.descending)
-        if isinstance(plan, Limit):
-            return Limit(self._materialize_joins(plan.input), plan.n)
-        if isinstance(plan, Distinct):
-            return Distinct(self._materialize_joins(plan.input), plan.subset)
-        if isinstance(plan, Tail):
-            return Tail(self._materialize_joins(plan.input), plan.n)
-        if hasattr(plan, 'input'):
-            plan.input = self._materialize_joins(plan.input)
-        return plan
+        from . import join_engine
+        return join_engine.materialize(self, plan, needed)
 
     def _plan_to_table(self, plan) -> pa.Table:
         """Resolve a plan subtree (no Aggregate) to a concrete pa.Table via PyArrow.
@@ -2963,7 +2914,12 @@ class CustomOpsCompiler(GraphCompiler):
             return a
         if pa.types.is_integer(a) and pa.types.is_integer(b):
             if pa.types.is_unsigned_integer(a) != pa.types.is_unsigned_integer(b):
-                return pa.int64() if max(a.bit_width, b.bit_width) < 64 else None
+                # a signed type that holds every value of both: uint32 with int64 -> int64, uint32 with
+                # int32 -> int64; uint64 with any signed integer has none and is refused
+                u, sg = (a, b) if pa.types.is_unsigned_integer(a) else (b, a)
+                if u.bit_width >= 64:
+                    return None
+                return sg if sg.bit_width > u.bit_width else {8: pa.int16(), 16: pa.int32(), 32: pa.int64()}[u.bit_width]
             return a if a.bit_width >= b.bit_width else b
         if pa.types.is_floating(a) and pa.types.is_floating(b):
             return a if a.bit_width >= b.bit_width else b
@@ -3099,7 +3055,8 @@ class CustomOpsCompiler(GraphCompiler):
         rk_in = rk if n_right > 0 else np.zeros(1, dtype=np.int32)
         (mc_t,) = m1.execute(lk, rk_in)
         mc = np.asarray(_np_of(mc_t)).reshape(-1).astype(np.int32)
-        total = int(mc.sum())
+        total = int(mc.sum(dtype=np.int64))
+        check_join_output_size(total)
         offsets = np.zeros(n_left, dtype=np.int32)
         if n_left > 1:
             np.cumsum(mc[:-1], out=offsets[1:])
@@ -3170,7 +3127,8 @@ class CustomOpsCompiler(GraphCompiler):
             _POST_OP_MODEL_CACHE[ck1] = m1
         (mc_t,) = m1.execute(lk, rk_in, max_key_arr)
         mc = np.asarray(_np_of(mc_t)).reshape(-1).astype(np.int32)
-        total = int(mc.sum())
+        total = int(mc.sum(dtype=np.int64))
+        check_join_output_size(total)
         offsets = np.zeros(n_left, dtype=np.int32)
         if n_left > 1:
             np.cumsum(mc[:-1], out=offsets[1:])
@@ -3269,12 +3227,13 @@ class CustomOpsCompiler(GraphCompiler):
         if n_left == 0 or n_right == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
-        lk = np.ascontiguousarray(left_keys.astype(np.int32))
-        rk = np.ascontiguousarray(right_keys.astype(np.int32))
+        lk = np.ascontiguousarray(left_keys.astype(np.int32, copy=False))
+        rk = np.ascontiguousarray(right_keys.astype(np.int32, copy=False))
 
         if self._aot is not None:
             mc = self._aot.join_count(lk, rk)
-            total = int(mc.sum())
+            total = int(mc.sum(dtype=np.int64))
+            check_join_output_size(total)
             if total == 0:
                 return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
             lo, ro = self._aot.join_scatter(lk, rk, mc)
@@ -3473,10 +3432,27 @@ class CustomOpsCompiler(GraphCompiler):
             strides.append(s)
         max_groups = strides[0] * sizes[0]
 
-        composite = np.zeros(len(table), dtype=np.int32)
+        if max_groups >= (1 << 62):
+            # the mixed-radix composite would overflow int64: fold the keys in one at a time, replacing
+            # the running key by its dense rank whenever the next radix would overflow it
+            codes = [_np_of(e.indices, zero_copy_only=False).astype(np.int64) for e in encodings]
+            running, span = codes[0], sizes[0]
+            for c, size in zip(codes[1:], sizes[1:]):
+                if span * size >= (1 << 62):
+                    uniq, running = np.unique(running, return_inverse=True)
+                    running, span = running.astype(np.int64), len(uniq)
+                running, span = running * size + c, span * size
+            uniq, first, dense_ids = np.unique(running, return_index=True, return_inverse=True)
+            unique_key_cols = {k: encodings[i].dictionary.take(_npa(codes[i][first]))
+                               for i, k in enumerate(keys)}
+            return dense_ids.astype(np.int32), len(uniq), unique_key_cols
+
+        # int64: with int32 the composite of a few high-cardinality keys (an order key and a supplier
+        # key) wrapped around and merged distinct groups (Distinct dropped 3080 of 6M rows at SF1)
+        composite = np.zeros(len(table), dtype=np.int64)
         for i, enc in enumerate(encodings):
             idx = _np_of(enc.indices, zero_copy_only=False)
-            composite += idx.astype(np.int32) * np.int32(strides[i])
+            composite += idx.astype(np.int64) * np.int64(strides[i])
 
         if max_groups <= 1024:
             present_mask = np.zeros(max_groups, dtype=bool)
@@ -3485,7 +3461,7 @@ class CustomOpsCompiler(GraphCompiler):
             n_groups = len(present)
 
             if n_groups == max_groups:
-                dense_ids = composite
+                dense_ids = composite.astype(np.int32)
             else:
                 remap = np.empty(max_groups, dtype=np.int32)
                 remap[present] = np.arange(n_groups, dtype=np.int32)
@@ -3499,8 +3475,7 @@ class CustomOpsCompiler(GraphCompiler):
                 )
             return dense_ids, n_groups, unique_key_cols
 
-        composite_i64 = composite.astype(np.int64)
-        unique_composite, dense_ids = np.unique(composite_i64, return_inverse=True)
+        unique_composite, dense_ids = np.unique(composite, return_inverse=True)
         dense_ids = dense_ids.astype(np.int32)
         n_groups = len(unique_composite)
 
@@ -3555,7 +3530,7 @@ class CustomOpsCompiler(GraphCompiler):
             )  # int64 array of length n_rows
 
             # Fast path: dense cartesian product (max_groups small enough for bitmask)
-            if max_groups <= 1024:
+            if max_groups <= max(1024, min(1 << 22, 2 * n_rows)):      # a direct table beats sorting the rows
                 present_mask = np.zeros(max_groups, dtype=bool)
                 present_mask[composite] = True
                 present = np.where(present_mask)[0]

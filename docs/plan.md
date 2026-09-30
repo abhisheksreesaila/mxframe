@@ -208,13 +208,13 @@ Before/after, mx-auto end to end via the F-001 worker (fresh process, scan_parqu
 SF1 is unchanged by design (6 row groups, 6M rows: the plain reader is already ~25 ms).
 
 
-## F-018 Join engine: order, lean materialization [todo]
+## F-018 Join engine: order, lean materialization [review]
 Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q20 7.3x slower than Polars — joins dominate
-- [ ] join reordering by estimated size/selectivity (filtered small sides first; e.g. Q2 joins 8M partsupp rows to supplier before the tiny filtered part table)
-- [ ] late materialization: joins produce row-index vectors and gather only the columns later operators need, once, instead of materializing every column after every join (Q9: six chained joins over 60M rows)
-- [ ] projection pushdown: only columns referenced above a join are carried through it
-- [ ] per-operator GPU placement for large joins (F-007) on top of the lean join representation
-- [ ] SF10 Q2/Q9/Q20 within 2x of Polars, results identical (DuckDB gate)
+- [x] join reordering by estimated size/selectivity (filtered small sides first; e.g. Q2 joins 8M partsupp rows to supplier before the tiny filtered part table)
+- [x] late materialization: joins produce row-index vectors and gather only the columns later operators need, once, instead of materializing every column after every join (Q9: six chained joins over 60M rows)
+- [x] projection pushdown: only columns referenced above a join are carried through it
+- [ ] per-operator GPU placement for large joins (F-007) — moved to F-020
+- [ ] SF10 Q2/Q9/Q20 within 2x of Polars, results identical (DuckDB gate): Q9 met (1.9x, DuckDB gate green); Q2 (2.6x) and Q20 (3.6x) remain, the gap is Parquet decode, blocked by the F-017 decoder decision
 
 ## F-019 Import time [done]
 Needs: none · Scoreboard reported ~700 ms under load; measured 172 ms idle → now ~117 ms median, with `import pyarrow` alone ~116 ms (the floor)
@@ -228,6 +228,7 @@ Needs: F-018 merged · From the F-018 report (2026-09-30)
 - [ ] GPU `hash_join` prefix sum is int32 and unguarded (the CPU path now raises MemoryError before overflow) — guard or widen
 - [ ] F-016 fuzz seed 5061 fails on gpu (distinct then aggregate; also on plain auto-mode) — find and fix (float32 GPU sum?)
 - [ ] per-operator GPU placement for large joins (F-007) on top of join_engine's index vectors
+- [ ] a self-join of one `scan_parquet` frame (`a.join(a, on="k")`) raises KeyError 'x_right' (pre-existing)
 
 ## F-021 Native Mojo Parquet reader [todo]
 Needs: none (later) · From the F-017 decision: PyArrow's decoder is the floor (~225 ms for 3 SF10 lineitem columns vs Polars' ~77 ms scan+filter)
