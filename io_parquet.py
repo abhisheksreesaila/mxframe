@@ -33,6 +33,7 @@ def _decode_dict(col):
 
 
 def _is_dict(arr_or_type) -> bool:
+    # Same as arrow_dict.is_dictionary; duplicated so importing io_parquet doesn't load pyarrow.compute.
     return pa.types.is_dictionary(getattr(arr_or_type, "type", arr_or_type))
 
 

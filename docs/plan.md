@@ -212,10 +212,10 @@ Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q2
 - [ ] per-operator GPU placement for large joins (F-007) on top of the lean join representation
 - [ ] SF10 Q2/Q9/Q20 within 2x of Polars, results identical (DuckDB gate)
 
-## F-019 Import time [todo]
-Needs: none · Scoreboard: `import mxframe` ~700 ms in a fresh process (Polars ~70 ms, DuckDB ~40 ms)
-- [ ] profile `python -X importtime -c "import mxframe"`; defer everything not needed to build a plan (pyarrow.parquet/csv, compute, numpy submodules, calibration, np_arrow) until first use
-- [ ] `import mxframe` < 150 ms; the background warm-up still overlaps the rest
+## F-019 Import time [done]
+Needs: none · Scoreboard reported ~700 ms under load; measured 172 ms idle → now ~117 ms median, with `import pyarrow` alone ~116 ms (the floor)
+- [x] profile `python -X importtime -c "import mxframe"`; defer everything not needed to build a plan (pyarrow.parquet/csv, compute, numpy submodules, calibration, np_arrow) until first use
+- [x] `import mxframe` < 150 ms; the background warm-up still overlaps the rest
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
