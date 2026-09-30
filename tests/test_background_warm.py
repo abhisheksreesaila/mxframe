@@ -59,3 +59,10 @@ for delay in (0.001, 0.005, 0.01, 0.02):
 print(ok)
 """)
     assert out.splitlines()[-1] == "4"
+
+
+def test_import_defers_heavy_modules():
+    out = _run("import mxframe; print(*[m in sys.modules for m in "
+               "('sqlglot', 'pyarrow.parquet', 'pyarrow.csv', 'pyarrow.compute', 'pandas')])",
+               {"MXFRAME_WARM": "0"})
+    assert out.split() == ["False"] * 5
