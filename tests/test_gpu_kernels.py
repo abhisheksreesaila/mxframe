@@ -67,3 +67,7 @@ def test_multi_key_sort_order_on_gpu_and_cpu():
 
 def test_late_supplier_hash_table_terminates_and_matches_numpy():
     run_scenario("late_suppliers", timeout=120)
+
+
+def test_sort_end_to_end_single_and_multi_key_with_and_without_limit():
+    run_scenario("sort_end_to_end", timeout=600)

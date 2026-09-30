@@ -999,7 +999,11 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
 # stable, ascending or descending, and there is no indirect key load per
 # compare.  The words are sorted with a bitonic network over a power-of-two
 # scratch buffer; the padding words (rows >= n) carry the maximum key and sort
-# to the end, so any n works.  (The old version sorted the index array in place
+# to the end, so any n works.  Up to SORT_TILE (2048) words the whole sort is one
+# shared-memory kernel; above that, tiles are sorted in shared memory and merged
+# with global steps for distance >= SORT_TILE plus one shared-memory kernel for the
+# remaining steps of each merge stage (about a third of the launches and memory
+# passes of the plain network).  (The old version sorted the index array in place
 # and skipped out-of-range partners, which is wrong for n that is not a power
 # of two, and it was not stable.)
 #
@@ -1010,6 +1014,80 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
 def _u64(addr: Int) -> UnsafePointer[UInt64, MutAnyOrigin]:
     return UnsafePointer[UInt64, MutAnyOrigin](unsafe_from_address=addr)
 
+comptime SORT_TILE: Int = 2048        # words sorted in shared memory (16 KB)
+
+@always_inline
+def _sort_word(keys_addr: Int, i: Int, n: Int, desc: Int) -> UInt64:
+    """(order-preserving key bits << 32) | row; rows >= n are +infinity padding."""
+    var hi = UInt64(0xFFFFFFFF)
+    if i < n:
+        var k = _i32(keys_addr)[i]
+        # flag bit 1: negative keys sort after every non-negative one (join build side)
+        if not ((desc & 2) != 0 and k < Int32(0)):
+            var bits = k.cast[DType.uint32]() ^ UInt32(0x80000000)
+            if (desc & 1) != 0: bits = ~bits
+            hi = UInt64(bits)
+    return (hi << 32) | UInt64(i)
+
+@always_inline
+def _pair_index(p: Int, j: Int) -> Int:
+    """Lower element of the p-th compare-exchange pair at distance j (a power of two)."""
+    var lo = p & (j - 1)
+    return ((p - lo) << 1) + lo
+
+@always_inline
+def _cmpx(
+    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    i: Int, j: Int, asc: Bool,
+):
+    var a = sh[i]
+    var b = sh[i + j]
+    if (asc and a > b) or (not asc and a < b):
+        sh[i] = b
+        sh[i + j] = a
+
+@always_inline
+def _sort_stages(
+    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    base: Int, tile: Int, tid: Int,
+):
+    """Bitonic stages k = 2..tile inside a shared-memory tile; the direction of each block
+    comes from its *global* index, so tiles alternate ascending / descending like the
+    global network."""
+    var k = 2
+    while k <= tile:
+        var j = k >> 1
+        while j > 0:
+            var p = tid
+            while p < (tile >> 1):
+                var i = _pair_index(p, j)
+                _cmpx(sh, i, j, ((base + i) & k) == 0)
+                p += BLOCK
+            barrier()
+            j >>= 1
+        k <<= 1
+
+@always_inline
+def _merge_steps(
+    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    base: Int, tile: Int, k_val: Int, tid: Int,
+):
+    """The steps j = tile/2..1 of one bitonic merge stage of size k_val >= 2 * tile."""
+    var j = tile >> 1
+    while j > 0:
+        var p = tid
+        while p < (tile >> 1):
+            var i = _pair_index(p, j)
+            _cmpx(sh, i, j, ((base + i) & k_val) == 0)
+            p += BLOCK
+        barrier()
+        j >>= 1
+
+# out_addr  int32[n]   output: row indices in sorted order (all n)
+# keys_addr int32[n]   input:  sort keys
+# desc_flag            bit 0: descending (ties keep row order);
+#                      bit 1: negative keys go last, in row order (the hash join's
+#                             build side, where a negative key means "no key")
 @export
 def sort_topk_i32_gpu(
     out_addr:  Int,
@@ -1018,28 +1096,73 @@ def sort_topk_i32_gpu(
     desc_flag: Int,
 ) abi("C"):
     @parameter
-    def init_words(n_: Int, padded_: Int, desc_: Int, words_addr: Int):
-        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if i >= padded_: return
-        var hi = UInt64(0xFFFFFFFF)
-        if i < n_:
-            var bits = _i32(keys_addr)[i].cast[DType.uint32]() ^ UInt32(0x80000000)
-            if desc_ != 0: bits = ~bits
-            hi = UInt64(bits)
-        _u64(words_addr)[i] = (hi << 32) | UInt64(i)
+    def small_sort(n_: Int, padded_: Int, desc_: Int):
+        # whole sort in one block: keys -> words -> shared sort -> rows
+        var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var t = tid
+        while t < padded_:
+            sh[t] = _sort_word(keys_addr, t, n_, desc_)
+            t += BLOCK
+        barrier()
+        _sort_stages(sh, 0, padded_, tid)
+        t = tid
+        while t < n_:
+            _i32(out_addr)[t] = Int32(Int(sh[t] & UInt64(0xFFFFFFFF)))
+            t += BLOCK
 
     @parameter
-    def step(padded_: Int, k_val: Int, j_val: Int, words_addr: Int):
+    def init_words(n_: Int, padded_: Int, desc_: Int, words_addr: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if i >= padded_: return
-        var partner = i ^ j_val
-        if partner <= i: return
+        if i < padded_:
+            _u64(words_addr)[i] = _sort_word(keys_addr, i, n_, desc_)
+
+    @parameter
+    def tile_sort(words_addr: Int):
+        var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var base = Int(block_idx.x) * SORT_TILE
+        var t = tid
+        while t < SORT_TILE:
+            sh[t] = _u64(words_addr)[base + t]
+            t += BLOCK
+        barrier()
+        _sort_stages(sh, base, SORT_TILE, tid)
+        t = tid
+        while t < SORT_TILE:
+            _u64(words_addr)[base + t] = sh[t]
+            t += BLOCK
+
+    @parameter
+    def tile_merge(k_val: Int, words_addr: Int):
+        var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var base = Int(block_idx.x) * SORT_TILE
+        var t = tid
+        while t < SORT_TILE:
+            sh[t] = _u64(words_addr)[base + t]
+            t += BLOCK
+        barrier()
+        _merge_steps(sh, base, SORT_TILE, k_val, tid)
+        t = tid
+        while t < SORT_TILE:
+            _u64(words_addr)[base + t] = sh[t]
+            t += BLOCK
+
+    @parameter
+    def global_step(padded_: Int, k_val: Int, j_val: Int, words_addr: Int):
+        var p = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if p >= (padded_ >> 1): return
+        var i = _pair_index(p, j_val)
         var a = _u64(words_addr)[i]
-        var b = _u64(words_addr)[partner]
-        var ascending = (i & k_val) == 0
-        if (ascending and a > b) or (not ascending and a < b):
+        var b = _u64(words_addr)[i + j_val]
+        var asc = (i & k_val) == 0
+        if (asc and a > b) or (not asc and a < b):
             _u64(words_addr)[i] = b
-            _u64(words_addr)[partner] = a
+            _u64(words_addr)[i + j_val] = a
 
     @parameter
     def extract(n_: Int, words_addr: Int):
@@ -1050,25 +1173,33 @@ def sort_topk_i32_gpu(
     try:
         if n > 0:
             var ctx = DeviceContext()
-            var padded = 1
+            var padded = 2
             while padded < n:
                 padded *= 2
-            var words = ctx.enqueue_create_buffer[DType.uint64](padded)
-            var w = Int(words.unsafe_ptr())
-            ctx.enqueue_function_experimental[init_words](
-                n, padded, desc_flag, w,
-                grid_dim=ceildiv(padded, BLOCK), block_dim=BLOCK)
-            var k = 2
-            while k <= padded:
-                var j = k >> 1
-                while j > 0:
-                    ctx.enqueue_function_experimental[step](
-                        padded, k, j, w,
-                        grid_dim=ceildiv(padded, BLOCK), block_dim=BLOCK)
-                    j >>= 1
-                k <<= 1
-            ctx.enqueue_function_experimental[extract](
-                n, w, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            if padded <= SORT_TILE:
+                ctx.enqueue_function_experimental[small_sort](
+                    n, padded, desc_flag, grid_dim=1, block_dim=BLOCK)
+            else:
+                var words = ctx.enqueue_create_buffer[DType.uint64](padded)
+                var w = Int(words.unsafe_ptr())
+                ctx.enqueue_function_experimental[init_words](
+                    n, padded, desc_flag, w,
+                    grid_dim=ceildiv(padded, BLOCK), block_dim=BLOCK)
+                ctx.enqueue_function_experimental[tile_sort](
+                    w, grid_dim=padded // SORT_TILE, block_dim=BLOCK)
+                var k = 2 * SORT_TILE
+                while k <= padded:
+                    var j = k >> 1
+                    while j >= SORT_TILE:
+                        ctx.enqueue_function_experimental[global_step](
+                            padded, k, j, w,
+                            grid_dim=ceildiv(padded >> 1, BLOCK), block_dim=BLOCK)
+                        j >>= 1
+                    ctx.enqueue_function_experimental[tile_merge](
+                        k, w, grid_dim=padded // SORT_TILE, block_dim=BLOCK)
+                    k <<= 1
+                ctx.enqueue_function_experimental[extract](
+                    n, w, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
             ctx.synchronize()
     except: pass
 

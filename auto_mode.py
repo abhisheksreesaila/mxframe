@@ -317,9 +317,7 @@ class AutoDecision:
 
 # GPU paths that currently return wrong results; auto never picks the GPU for a
 # plan that would run them. Remove an entry once its fix lands (F-012 / F-011).
-KNOWN_BROKEN_GPU = {
-    "sort": "GPU sort returns rows out of key order (F-012)",
-}
+KNOWN_BROKEN_GPU: dict = {}         # op -> reason; empty since F-012 fixed the GPU sort
 
 _AGG_OP = {"sum": "group_sum", "mean": "group_sum", "count": "group_count",
            "min": "group_min", "max": "group_max"}

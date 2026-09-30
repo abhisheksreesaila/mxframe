@@ -1184,7 +1184,7 @@ class AOTKernelsGPU:
             starts = self._alloc(table_size * 4)               # exclusive prefix sum of table
             self._scan_i32(starts, table, table_size)
             order = self._alloc(n_right * 4)                   # stable argsort of right keys
-            self._sort_topk_gpu(self._ptr(order), self._ptr(rk), n_right, 0)
+            self._sort_topk_gpu(self._ptr(order), self._ptr(rk), n_right, 2)   # negative keys last
             left_out = self._alloc(total * 4)
             right_out = self._alloc(total * 4)
             self._join_scatter_gpu(

@@ -432,13 +432,14 @@ def test_unknown_op_logs_once_at_debug(caplog):
     assert sum("mystery_op_xyz" in r.getMessage() for r in caplog.records) == 1
 
 
-def test_gpu_group_min_max_over_8192_groups_is_infinite():
+def test_gpu_group_min_max_have_finite_cost_at_any_group_count():
+    """F-012 replaced the shared-memory-only min/max kernel (it faulted above 8192 groups)
+    with one that has a global-atomic path, so no group count is off limits any more."""
     c = default_calibration(GPU)
-    for op in ("group_min", "group_max"):
-        assert c.estimate(op, "gpu", 10**6, card=8193) == math.inf
-        assert math.isfinite(c.estimate(op, "gpu", 10**6, card=8192))
+    for op in ("group_min", "group_max", "group_sum", "group_count"):
+        for card in (8192, 8193, 16_000, 10**6, 1_500_000):
+            assert math.isfinite(c.estimate(op, "gpu", 10**6, card=card))
         assert math.isfinite(c.estimate(op, "cpu", 10**6, card=10**6))
-    assert math.isfinite(c.estimate("group_sum", "gpu", 10**6, card=10**6))
 
 
 def test_blend_drops_group_term_when_refit_drops_it():

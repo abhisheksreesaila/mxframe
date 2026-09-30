@@ -140,6 +140,12 @@ def hash_join(nl: str = "0", nr: str = "0", keyspace: str = "0"):
         want_r = np.concatenate([order[a:b] for a, b in zip(lo, hi)]).astype(np.int32) if cnt.sum() else np.empty(0, np.int32)
         np.testing.assert_array_equal(li, want_l)
         np.testing.assert_array_equal(ri, want_r)
+    # negative keys (null markers) never match, on either side
+    lk = np.array([3, -1, 0, 2, -5, 3, 1], np.int32)
+    rk = np.array([-1, 3, 2, -1, 3, 0, -7, 1], np.int32)
+    li, ri = g.hash_join(lk, rk)
+    want = [(i, j) for i, a in enumerate(lk) if a >= 0 for j, b in enumerate(rk) if b == a]
+    assert list(zip(li.tolist(), ri.tolist())) == want
     for a, b in (([], [1]), ([1], []), ([1, 2], [3, 4])):                  # empty / no match
         li, ri = g.hash_join(np.array(a, np.int32), np.array(b, np.int32))
         assert len(li) == 0 and len(ri) == 0 and li.dtype == np.int32
@@ -274,7 +280,39 @@ def late_suppliers():
         np.testing.assert_array_equal(got, want)
 
 
-SCENARIOS = {f.__name__: f for f in (late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
+def sort_end_to_end():
+    """LazyFrame sort on the GPU vs a stable pandas sort: single and multi key, ascending and
+    descending, with and without LIMIT (top-k), n not a power of two and spanning many blocks,
+    and after a group-by (the reviewer's 2M rows / 1000 groups case)."""
+    import pyarrow as pa
+    from mxframe import LazyFrame, Scan, col
+    rng = np.random.default_rng(9)
+    for n in (5, 1000, 4097, 100_003, 2_000_000):
+        t = pa.table({"k": rng.integers(0, 1000, n).astype(np.int32),
+                      "j": rng.integers(0, 7, n).astype(np.int32),
+                      "v": np.arange(n, dtype=np.int32)})
+        df = t.to_pandas()
+        for by in (["k"], ["k", "j"], ["j", "k"]):
+            for desc in (False, True):
+                base = LazyFrame(Scan(t)).sort(*by, descending=desc)
+                want = df.sort_values(by, ascending=not desc, kind="stable")["v"].to_numpy()
+                got = base.compute(device="gpu").column("v").to_numpy()
+                assert got.tolist() == want.tolist(), (n, by, desc, "full")
+                for lim in (1, 10, 1000):
+                    if lim < n:
+                        got = base.limit(lim).compute(device="gpu").column("v").to_numpy()
+                        assert got.tolist() == want[:lim].tolist(), (n, by, desc, lim)
+    n, ng = 2_000_000, 1000
+    t = pa.table({"k": rng.integers(0, ng, n).astype(np.int32), "v": rng.random(n, dtype=np.float32)})
+    for desc in (False, True):
+        out = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).sort("k", descending=desc).compute(device="gpu")
+        keys = out.column("k").to_numpy()
+        assert len(keys) == ng and (np.diff(keys) < 0 if desc else np.diff(keys) > 0).all(), desc
+        ref = np.bincount(t.column("k").to_numpy(), t.column("v").to_numpy().astype(np.float64), ng)
+        np.testing.assert_allclose(out.column("s").to_numpy(), ref[keys], rtol=1e-3, atol=1e-2)
+
+
+SCENARIOS = {f.__name__: f for f in (sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
 
 
 def register(fn):

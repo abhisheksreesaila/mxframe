@@ -181,12 +181,21 @@ def test_any_unusable_gpu_operator_makes_the_gpu_plan_impossible():
     assert d.estimate.gpu_ms == float("inf")
 
 
-def test_known_broken_gpu_sort_keeps_query_on_cpu():
+def test_known_broken_gpu_op_keeps_query_on_cpu(monkeypatch):
+    monkeypatch.setitem(am.KNOWN_BROKEN_GPU, "sort", "pretend the GPU sort is broken")
     left, right = table(5000), table(5000)
     plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
     d = am.choose_device(plan, calib=Calib(join_cpu=5000.0, join_gpu=1.0), gpu=Gpu())
     assert d.device == "cpu"
     assert any(l.op == "sort" and l.gpu_ms == float("inf") for l in d.estimate.lines)
+
+
+def test_gpu_sort_is_priced_now_that_it_is_fixed():
+    assert am.KNOWN_BROKEN_GPU == {}
+    left, right = table(5000), table(5000)
+    plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
+    d = am.choose_device(plan, calib=Calib(join_cpu=5000.0, join_gpu=1.0), gpu=Gpu())
+    assert all(l.gpu_ms != float("inf") for l in d.estimate.lines if l.op == "sort")
 
 
 def test_string_key_group_count_is_sampled_not_guessed():
