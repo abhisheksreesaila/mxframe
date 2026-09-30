@@ -9,6 +9,7 @@ from typing import List, Tuple
 
 from .lazy_expr import Expr
 from mxframe.lazy_frame import (
+    join_output_names,
     LogicalPlan,
     Scan,
     Filter,
@@ -123,7 +124,10 @@ class PlanOptimizer:
             if isinstance(node, Join) and conjuncts and node.how in ("inner", "left"):
                 lcols, rcols = _output_columns(node.left), _output_columns(node.right)
                 if lcols is not None and rcols is not None:
-                    r_visible = rcols - set(node.right_on)
+                    mapping = join_output_names(lcols, rcols, node.right_on)   # right column -> output name
+                    lcols = set(lcols)
+                    r_visible = {out for _, out in mapping}
+                    r_renamed = {out for orig, out in mapping if out != orig}
                     to_left, to_right, stay = [], [], []
                     for c in conjuncts:
                         used = _expr_columns(c)
@@ -131,7 +135,7 @@ class PlanOptimizer:
                             stay.append(c)
                         elif used <= lcols and not (used & r_visible):
                             to_left.append(c)
-                        elif node.how == "inner" and used <= r_visible and not (used & lcols):
+                        elif node.how == "inner" and used <= r_visible - r_renamed and not (used & lcols):
                             to_right.append(c)
                         else:
                             stay.append(c)
@@ -327,33 +331,26 @@ def _expr_columns(expr):
 
 
 def _output_columns(plan):
-    """Set of column names a subtree produces, or None when unknown."""
+    """Ordered list of column names a subtree produces, or None when unknown."""
     from mxframe.lazy_frame import ParquetScan
     if isinstance(plan, Scan):
-        return set(plan.table.column_names)
+        return list(plan.table.column_names)
     if isinstance(plan, ParquetScan):
-        return set(plan.schema.names)
+        return list(plan.schema.names)
     if isinstance(plan, (Filter, Sort, Limit, Distinct, Tail)):
         return _output_columns(plan.input)
     if isinstance(plan, Join):
         l, r = _output_columns(plan.left), _output_columns(plan.right)
         if l is None or r is None:
             return None
-        return l | (r - set(plan.right_on))
-    if isinstance(plan, Project):
-        names = set()
-        for e in plan.exprs:
+        return l + [out for _, out in join_output_names(l, r, plan.right_on)]
+    if isinstance(plan, (Project, Aggregate)):
+        exprs = list(plan.exprs) if isinstance(plan, Project) else list(plan.group_by) + list(plan.aggs)
+        names = []
+        for e in exprs:
             name = getattr(e, "_alias", None) or (e.args[0] if e.op == "col" else None)
             if name is None:
                 return None
-            names.add(name)
-        return names
-    if isinstance(plan, Aggregate):
-        names = set()
-        for e in list(plan.group_by) + list(plan.aggs):
-            name = getattr(e, "_alias", None) or (e.args[0] if e.op == "col" else None)
-            if name is None:
-                return None
-            names.add(name)
+            names.append(name)
         return names
     return None

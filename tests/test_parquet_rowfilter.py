@@ -135,7 +135,8 @@ def test_filter_reading_does_not_import_pandas():
             "r = mx.scan_parquet(p).filter(col('a') >= 100).select(col('b')).compute(device='cpu')\n"
             "assert r.num_rows == 3900\n"
             "assert iop._read_file(p, ['b'], [], (('a', 'ge', 100),)).num_rows >= 3900\n"
-            "assert 'pandas' not in sys.modules, 'pandas imported'\n")
+            "for m in ('pandas', 'pyarrow.dataset', 'concurrent.futures'):\n"
+            "    assert m not in sys.modules, m + ' imported'\n")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-800:]
 
@@ -164,3 +165,58 @@ def test_small_reads_use_the_plain_reader(tmp_path, monkeypatch):
     pq.write_table(_table(), p, row_group_size=500)
     monkeypatch.setattr(iop, "_read_groups", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
     assert iop._read_file(p, ["id"], [], (("d", "ge", 9500),)).num_rows == 6000
+
+
+def test_footer_cache_refreshes_when_file_is_rewritten(tmp_path):
+    p = str(tmp_path / "r.parquet")
+    pq.write_table(_table(n=1000), p, row_group_size=500)
+    assert iop._metadata(p).num_rows == 1000
+    pq.write_table(_table(n=2000), p, row_group_size=500)
+    assert iop._metadata(p).num_rows == 2000
+    assert iop._read_file(p, ["id"], [], ()).num_rows == 2000
+
+
+def test_bad_thread_env_is_ignored(monkeypatch):
+    monkeypatch.setenv("MXFRAME_READ_THREADS", "lots")
+    assert iop._read_threads() >= 2
+
+
+def test_worker_exception_propagates():
+    def boom(x):
+        if x == 3:
+            raise ValueError("boom")
+        return x
+    with pytest.raises(ValueError, match="boom"):
+        iop._parallel_map(boom, range(8), 4)
+    assert iop._parallel_map(lambda x: x * 2, range(5), 3) == [0, 2, 4, 6, 8]
+
+
+@pytest.mark.parametrize("dtype", [np.int8, np.uint64])
+def test_narrow_and_unsigned_columns(tmp_path, dtype):
+    p = str(tmp_path / "n.parquet")
+    n = 2000
+    a = (np.arange(n) % 100).astype(dtype)
+    pq.write_table(pa.table({"k": pa.array(a), "id": pa.array(np.arange(n))}), p, row_group_size=250)
+    for op, v, f in [("ge", 90, a >= 90), ("lt", 5, a < 5), ("eq", 7, a == 7), ("isin", (3, 4), np.isin(a, [3, 4]))]:
+        got = iop._read_file(p, ["id"], [], (("k", op, v if op != "isin" else v),))
+        assert set(np.flatnonzero(f)) <= set(got.column("id").to_pylist())
+
+
+@pytest.mark.parametrize("value", [2**70, -2**70, 2**63, -2**63 - 1])
+def test_out_of_range_literals_never_drop_rows(tmp_path, value):
+    p = str(tmp_path / "o.parquet")
+    a = np.arange(2000, dtype=np.int32)
+    pq.write_table(pa.table({"k": pa.array(a), "id": pa.array(a.astype(np.int64))}), p, row_group_size=250)
+    for op in ("eq", "ne", "lt", "le", "gt", "ge"):
+        got = iop._read_file(p, ["id"], [], (("k", op, value),))
+        ref = {"eq": a == value, "ne": a != value, "lt": a < value, "le": a <= value,
+               "gt": a > value, "ge": a >= value}[op]
+        assert set(np.flatnonzero(ref)) <= set(got.column("id").to_pylist())
+
+
+def test_isin_mixing_huge_and_negative_values(tmp_path):
+    p = str(tmp_path / "i.parquet")
+    a = np.arange(-500, 1500, dtype=np.int64)
+    pq.write_table(pa.table({"k": pa.array(a), "id": pa.array(a)}), p, row_group_size=250)
+    got = iop._read_file(p, ["id"], [], (("k", "isin", (-3, 5, 2**64)),))
+    assert {-3, 5} <= set(got.column("id").to_pylist())

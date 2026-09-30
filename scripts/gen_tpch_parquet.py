@@ -134,7 +134,11 @@ def generate(sf: float, out_dir: str) -> None:
             if fcol in arrow_table.schema.names:
                 field_idx = arrow_table.schema.get_field_index(fcol)
                 if arrow_table.schema.field(field_idx).type != pa.float32():
-                    raw = arrow_table.column(fcol).cast(pa.float32())
+                    # decimal -> float64 -> float32 rounds to the NEAREST float32.  A direct
+                    # decimal -> float32 cast truncates (0.05 is stored as 0.049999997), so a
+                    # comparison like `l_discount >= 0.05` silently drops those rows (TPC-H Q6
+                    # came out 28% low).  Two-decimal values are exact in float64 to 1e-16.
+                    raw = arrow_table.column(fcol).cast(pa.float64()).cast(pa.float32())
                     arrow_table = arrow_table.set_column(field_idx, fcol, raw)
 
         out_path = os.path.join(out_dir, f"{tname}.parquet")

@@ -21,6 +21,15 @@ from typing import Optional
 
 import numpy as np
 
+from .np_arrow import take_rows
+
+# The Mojo device-context memory manager reserves ~90% of the GPU's free memory the first time
+# a kernel creates a buffer (the recursive scan does, at >= 1M rows), and this module's own
+# cuMemAlloc calls (uploads, join outputs, gathers) then fail with out-of-memory at TPC-H SF10,
+# as would any other process on the GPU.  A quarter is plenty for the kernels' scratch (the
+# sort's is 8 bytes per row).  Set MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT to override.
+os.environ.setdefault("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT", "25")
+
 # ── Locate the shared library ─────────────────────────────────────────────────
 def _find_lib() -> Optional[Path]:
     # 1. Env override (useful for development)
@@ -1228,6 +1237,12 @@ class AOTKernelsGPU:
             offsets = scratch(n_left * 4)                  # exclusive prefix sum of counts
             total = self._scan_i32(offsets, counts, n_left)
             if total == 0:
+                # a kernel that ran out of scratch memory (its pool is capped, see the top of
+                # this module) leaves zeros behind without an error: never turn that into an
+                # empty join
+                if self._download(counts, np.int32, n_left).any():
+                    raise MemoryError("GPU hash join: the prefix sum returned 0 for non-zero match "
+                                      "counts (kernel scratch memory exhausted?)")
                 return self._pair_result(self._empty_pair(), device_out)
             starts = scratch(table_size * 4)               # exclusive prefix sum of table
             self._scan_i32(starts, table, table_size)
@@ -1279,9 +1294,10 @@ class AOTKernelsGPU:
     ) -> "pa.Table":
         """Gather all columns of *table* by *idx* using AOT GPU kernels.
 
-        float32, int32, int64 columns are gathered on GPU with _cached_upload
-        for source data (stable input) and a single index upload shared across
-        all columns.  Other types (string, date, …) fall back to PyArrow CPU.
+        float32, float64 (as raw 8-byte words), int32, int64 columns without nulls are gathered
+        on GPU with _cached_upload for source data (stable input) and a single index upload
+        shared across all columns.  Everything else (strings, nulls, other widths) falls back
+        to PyArrow CPU take, which keeps types and nulls.
 
         Returns a new pa.Table with the same schema.
         """
@@ -1311,7 +1327,11 @@ class AOTKernelsGPU:
                 )
                 return self._cached_upload(src_np, cache_key=key, owner=col)
 
-            if pa.types.is_float32(col.type):
+            is_signed_int = pa.types.is_signed_integer(col.type)
+            if col.null_count:
+                # a validity mask is not gathered by these kernels: Arrow's take keeps the nulls
+                arrays.append(take_rows(col, idx32))
+            elif pa.types.is_float32(col.type):
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.float32))
                 s = cached_source(src_np, np.float32)
@@ -1321,17 +1341,16 @@ class AOTKernelsGPU:
                 arrays.append(pa.array(self._download(out, np.float32, n)))
                 self._cu.free(out)
             elif pa.types.is_float64(col.type):
-                # downcast float64→float32 for GPU, restore type after
+                # exact: gather the 8-byte words as int64 (float32 would round every value)
                 src_np = np.ascontiguousarray(
-                    col.to_numpy(zero_copy_only=False).astype(np.float32))
-                s = cached_source(src_np, np.float32)
-                out = self._cu.malloc(n * 4)
-                self._gather_f32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
+                    col.to_numpy(zero_copy_only=False).astype(np.float64)).view(np.int64)
+                s = cached_source(src_np, np.int64)
+                out = self._cu.malloc(n * 8)
+                self._gather_i64(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
                 self._cu.sync()
-                arrays.append(pa.array(
-                    self._download(out, np.float32, n).astype(np.float64)))
+                arrays.append(pa.array(self._download(out, np.int64, n).view(np.float64)))
                 self._cu.free(out)
-            elif pa.types.is_integer(col.type) and col.type.bit_width == 64:
+            elif is_signed_int and col.type.bit_width == 64:
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.int64))
                 s = cached_source(src_np, np.int64)
@@ -1340,7 +1359,7 @@ class AOTKernelsGPU:
                 self._cu.sync()
                 arrays.append(pa.array(self._download(out, np.int64, n)))
                 self._cu.free(out)
-            elif pa.types.is_integer(col.type):
+            elif is_signed_int and col.type.bit_width == 32:
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.int32))
                 s = cached_source(src_np, np.int32)
@@ -1351,7 +1370,7 @@ class AOTKernelsGPU:
                 self._cu.free(out)
             else:
                 # Non-numeric fallback: PyArrow CPU take
-                arrays.append(col.take(pa.array(idx32.astype(np.int64))))
+                arrays.append(take_rows(col, idx32))
             names.append(col_name)
 
         self._cu.free(idx_dev)

@@ -81,6 +81,8 @@ print(result.to_pandas())
 1  mkt         110.0          1
 ```
 
+**GPU memory.** Importing `mxframe.aot_kernels` sets `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=25` unless you have set it yourself. Left at its default, the Mojo runtime reserves about 90% of the free GPU memory the first time a kernel allocates a scratch buffer, which starves mxframe's own allocations at TPC-H SF10 and every other process on the GPU. The variable is process-wide: other MAX / Mojo users in the same Python process get the 25% pool too. Set it to a larger value before importing mxframe if a kernel needs more scratch than a quarter of the GPU.
+
 ---
 
 ## 📊 Performance — bounded v0.5.0 benchmark

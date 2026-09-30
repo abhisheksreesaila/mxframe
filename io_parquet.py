@@ -333,7 +333,10 @@ def _count(mask) -> int:
 
 def _read_threads() -> int:
     """Decode threads.  More than ~8 slow Arrow's decoder down (allocator and page-fault contention)."""
-    n = int(os.environ.get("MXFRAME_READ_THREADS", 0))
+    try:
+        n = int(os.environ.get("MXFRAME_READ_THREADS", 0))
+    except ValueError:
+        n = 0
     return n if n > 0 else min(8, max(2, (os.cpu_count() or 2) // 2))
 
 
@@ -433,14 +436,15 @@ def _chunks_are_small_dictionaries(path, schema, name, max_bytes) -> bool:
 
 
 @functools.lru_cache(maxsize=32)
-def _metadata_cached(path, mtime_ns, size):
+def _metadata_cached(path, dev, ino, mtime_ns, size):
     import pyarrow.parquet as pq
     return pq.ParquetFile(path).metadata
 
 
 def _metadata(path):
     st = os.stat(path)
-    return _metadata_cached(os.fspath(path), st.st_mtime_ns, st.st_size)
+    # the cached footer now drives data reads: key on file identity as well as mtime/size
+    return _metadata_cached(os.path.abspath(os.fspath(path)), st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 # ── plan analysis ───────────────────────────────────────────────────────────

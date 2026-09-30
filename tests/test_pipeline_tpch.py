@@ -151,9 +151,10 @@ def test_q19_matches_duckdb(tpch, device, fused_calls):
         return ", ".join(f"'{c}'" for c in x)
     want = con.sql(f"""
         select sum(l_extendedprice::double * (1 - l_discount::double)) from lineitem join part on l_partkey = p_partkey
-        where (p_brand = 'Brand#12' and p_container in ({cont(bm.CONTAINERS_SM)}) and l_quantity >= 1 and l_quantity <= 11 and p_size between 1 and 5)
+        where l_shipmode in ('AIR', 'AIR REG') and l_shipinstruct = 'DELIVER IN PERSON'
+          and ((p_brand = 'Brand#12' and p_container in ({cont(bm.CONTAINERS_SM)}) and l_quantity >= 1 and l_quantity <= 11 and p_size between 1 and 5)
            or (p_brand = 'Brand#23' and p_container in ({cont(bm.CONTAINERS_MD)}) and l_quantity >= 10 and l_quantity <= 20 and p_size between 1 and 10)
-           or (p_brand = 'Brand#34' and p_container in ({cont(bm.CONTAINERS_LG)}) and l_quantity >= 20 and l_quantity <= 30 and p_size between 1 and 15)
+           or (p_brand = 'Brand#34' and p_container in ({cont(bm.CONTAINERS_LG)}) and l_quantity >= 20 and l_quantity <= 30 and p_size between 1 and 15))
         """).fetchone()[0]
     _close([got.column("revenue")[0].as_py()], [want], 1e-9)
     assert fused_calls["served"] == 1

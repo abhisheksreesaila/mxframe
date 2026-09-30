@@ -21,14 +21,14 @@ Shared rules for every ticket:
 
 ## Wave 1: foundations (parallel)
 
-## F-001 User-felt TPC-H scoreboard [todo]
+## F-001 User-felt TPC-H scoreboard [done]
 Needs: none · Files: `scripts/bench_user_felt.py`, `scripts/tpch_user/` (new)
-- [ ] each (engine, query, scale) runs in a fresh subprocess; the clock covers Parquet read + query + materialized result; `import` time is recorded separately
-- [ ] engines: pandas, Polars (lazy `scan_parquet`), DuckDB (reference), MXFrame `cpu`, `gpu`, `auto`
-- [ ] all 22 queries at SF1 and SF10; every engine's result is checked against DuckDB (row count + numeric tolerance) and mismatches are shown, not hidden
-- [ ] a secondary "repeat run in same process" number is recorded
-- [ ] mx engines read through `mx.scan_parquet` (moved from F-010)
-- [ ] writes `docs/bench/user-felt-<date>.md` and a CSV; a `--queries`/`--engines`/`--sf` CLI; per-run timeout so one hang can't stall the run
+- [x] each (engine, query, scale) runs in a fresh subprocess; the clock covers Parquet read + query + materialized result; `import` time is recorded separately
+- [x] engines: pandas, Polars (lazy `scan_parquet`), DuckDB (reference), MXFrame `cpu`, `gpu`, `auto`
+- [x] all 22 queries at SF1 and SF10 (mx-gpu SF10 skipped this round: shared GPU memory, joins being rewritten in F-018); every engine's result is checked against DuckDB (row count + numeric tolerance) and mismatches are shown, not hidden
+- [x] a secondary "repeat run in same process" number is recorded
+- [x] mx engines read through `mx.scan_parquet` (moved from F-010)
+- [x] writes `docs/bench/user-felt-<date>.md` and a CSV; a `--queries`/`--engines`/`--sf` CLI; per-run timeout so one hang can't stall the run
 
 ## F-002 Multi-core CPU kernels with float64 accumulation [done]
 Needs: none · Files: `kernels_aot/kernels_aot.mojo`, `aot_kernels.py`, rebuilt `libmxkernels_aot.so`
@@ -104,23 +104,26 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - [x] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
 - [x] unsupported expressions fall back to the existing path, never wrong results
 
-## F-011 Correctness: counts, Q15, Q21, nulls [todo]
+## F-011 Correctness: counts, Q15, Q21, nulls [done]
 Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
-- [ ] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
-- [ ] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
-- [ ] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
-- [ ] float32 columns compared with float64 literals keep boundary rows (Q6 `l_discount <= 0.07` drops exact-grid rows today): compare in the column's precision, as DuckDB does on DECIMAL
-- [ ] case_when derived columns on the CPU group path are float64
-- [ ] a Limit below an Aggregate is applied (ignored today on both devices)
-- [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
-- [ ] `filter(k != "a")` with null keys doesn't raise
-- [ ] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
+- [x] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
+- [x] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
+- [x] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
+- [x] float32 columns compared with float64 literals keep boundary rows (Q6 `l_discount <= 0.07` drops exact-grid rows today): compare in the column's precision, as DuckDB does on DECIMAL
+- [x] case_when derived columns on the CPU group path are float64
+- [x] a Limit below an Aggregate is applied (ignored today on both devices)
+- [x] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
+- [x] `filter(k != "a")` with null keys doesn't raise
+- [x] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
 - [x] Q6 matches DuckDB on cpu/gpu/auto (fused CMPC compares in the column type); "global_agg" removed from `KNOWN_BROKEN_GPU`
-- [ ] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
-- [ ] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
-- [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
-- [ ] a join whose output has a duplicate column name (same non-key name on both sides) can be joined again / queried: rename with a suffix or raise clearly (today: pyarrow KeyError 'Field exists 2 times')
-- [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
+- [x] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
+- [x] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
+- [x] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
+- [x] a join whose output has a duplicate column name (same non-key name on both sides) can be joined again / queried: rename with a suffix or raise clearly (today: pyarrow KeyError 'Field exists 2 times') -- done: the right column becomes `<name>_right` (`_right2`, ...)
+- [x] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto` (132/132; SF10 gpu/auto ran on GPU 1 because another process held 17-21 GB of GPU 0)
+- Build notes: `tests/test_tpch_duckdb.py` is the gate (`MXFRAME_TPCH_SF10=1` adds SF10). The DuckDB reference reads the same Parquet through views that restore DATE and DECIMAL(15,2), so it runs the official TPC-H text and gives the official answers (Q6 SF1 = 123141078.2283). The old Q6 "matches DuckDB" was DuckDB on raw float32 columns, which shares the truncation below.
+- The data generator truncated DECIMAL to float32 (0.05 stored as 0.049999997): fixed in `scripts/gen_tpch_parquet.py`, regenerated as `data/tpch_sf1_exact` and `data/tpch_sf10_exact` (the older dirs are untouched; the harness prefers `_exact`). Other agents should read the `_exact` dirs.
+- `run_q5_*`/`run_q8_*` (mxframe, pandas, Polars) take `supplier=` (keyword): TPC-H Q5 matches customer and supplier nation and Q8 measures the supplier's nation; the four/six-table forms could not.
 
 ## F-012 Kernel health: crashes, hangs, per-call overhead [done]
 Needs: F-002 merged · Found by F-003 calibration (2026-09-30)
@@ -175,6 +178,7 @@ Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
 - [ ] a fuzz test of random plan shapes (project/filter/agg/join/sort/limit nested 2–3 deep) against DuckDB on cpu and auto
 
 ## F-017 Parquet read as fast as Polars [built, needs review; 1.5x target NOT met, see profile]
+Decision needed (Abhishek): pyarrow's Parquet decoder is the floor (raw read of 3 SF10 lineitem columns ~225 ms vs Polars' whole scan+filter ~77 ms; pyarrow 22 has no page-skipping API). Options: (a) optional Polars-backed reader when polars is installed (soft dependency on a competitor; type-mapping care); (b) a native Mojo Parquet decoder in mxframe (large; could decode on the GPU like cuDF); (c) accept ~3x on raw scans. Until you choose: (c).
 Needs: none · Found by the F-001 scoreboard (2026-09-30): SF10 `scan_parquet` of 3 lineitem columns with a date filter takes 689 ms in mx vs 149 ms in Polars.
 - [~] profile the mx read path and close the gap to within 1.5x of Polars on SF1/SF10 lineitem scans with and without filters. Profiled; gap narrowed for selective filters, not closed (pyarrow's decoder is ~3x slower than Polars' own).
 - [x] filters pushed to the reader drop rows while decoding ((row group, column) pieces on a thread pool; integer conjuncts; row groups fully covered by min/max skip the mask; unselective filters and files under 16M rows use the plain reader). Page-index skipping: not possible, pyarrow 22 has no row-range/page-skipping read API (`ParquetFile` has only read/read_row_group(s)/iter_batches).
@@ -198,7 +202,6 @@ Before/after, mx-auto end to end via the F-001 worker (fresh process, scan_parqu
 | SF10 scan 3 cols, no filter | 354 | 300 | 170 |
 SF1 is unchanged by design (6 row groups, 6M rows: the plain reader is already ~25 ms).
 
-Open decision for the owner: closing the rest of the gap needs a different decoder. Polars' collect+to_arrow for the SF10 Q6 columns is ~140 ms after a ~77 ms `import polars`, vs ~360 ms for pyarrow. Options: (a) optional Polars-backed reader for numeric columns when polars is installed, (b) a native (Mojo/C++) Parquet page decoder in mxframe, (c) accept ~3x on raw Parquet scans and win elsewhere. Not attempted: it adds a dependency and a second type-mapping path.
 
 ## F-018 Join engine: order, lean materialization [todo]
 Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q20 7.3x slower than Polars — joins dominate

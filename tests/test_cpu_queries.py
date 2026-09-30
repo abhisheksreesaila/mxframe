@@ -59,7 +59,7 @@ def test_grouped_sums_are_float64_exact_for_float32_inputs(threads):
             got = out.column(name)[i].as_py()
             assert got == pytest.approx(want, rel=1e-9), (name, gid, got, want)
     assert out.schema.field("s").type == pa.float64()
-    assert out.schema.field("c").type == pa.float64()
+    assert out.schema.field("c").type == pa.int64()
 
 
 def test_masked_global_sums_are_float64_exact():

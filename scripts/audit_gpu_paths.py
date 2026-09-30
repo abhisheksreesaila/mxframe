@@ -22,6 +22,7 @@ Usage:
   python scripts/audit_gpu_paths.py --device gpu --runs 3 --min-gpu-coverage 0.8
 """
 
+import functools
 import argparse
 import sys
 import time
@@ -112,10 +113,10 @@ def build_queries(s: int, N: int):
         "Q2":  q(b.run_q2_mxframe, na2, r2, p2, s2, ps2),
         "Q3":  q(b.run_q3_mxframe, c3, o3, l3),
         "Q4":  q(b.run_q4_mxframe, o4, l4),
-        "Q5":  q(b.run_q5_mxframe, na5, c5, o5, l5),
+        "Q5":  q(functools.partial(b.run_q5_mxframe, supplier=b.make_synthetic_supplier()), na5, c5, o5, l5),
         "Q6":  q(b.run_q6_mxframe, li),
         "Q7":  q(b.run_q7_mxframe, na7, s7, c7, o7, l7),
-        "Q8":  q(b.run_q8_mxframe, na8, r8, p8, c8, o8, l8),
+        "Q8":  q(functools.partial(b.run_q8_mxframe, supplier=b.make_synthetic_supplier()), na8, r8, p8, c8, o8, l8),
         "Q9":  q(b.run_q9_mxframe, na9, s9, ps9, p9, o9, l9),
         "Q10": q(b.run_q10_mxframe, na10, c10, o10, l10),
         "Q11": q(b.run_q11_mxframe, na11, s11, ps11),
