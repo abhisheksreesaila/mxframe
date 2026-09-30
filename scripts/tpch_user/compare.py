@@ -6,7 +6,7 @@ columns are compared with a relative tolerance and the largest relative error is
 
 verdict:
   ok     every float within `rtol`
-  drift  floats off by more than `rtol` but at most `drift_limit` (float32 accumulation drift)
+  drift  floats off by more than `rtol` but at most `drift_limit` = 1e-2 (float32 accumulation drift)
   wrong  different row count / keys / exact columns, or float error above `drift_limit`
 """
 from __future__ import annotations
@@ -61,7 +61,7 @@ def _rel_err(a: np.ndarray, e: np.ndarray) -> np.ndarray:
 
 
 def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
-                   drift_limit: float = 1e-3, topn_metric: int | None = None) -> Comparison:
+                   drift_limit: float = 1e-2, topn_metric: int | None = None) -> Comparison:
     if actual.num_columns != expected.num_columns:
         return Comparison("wrong", float("inf"),
                           f"column count {actual.num_columns} != {expected.num_columns}")

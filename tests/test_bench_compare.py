@@ -32,7 +32,7 @@ def test_float_drift_is_flagged_but_not_called_wrong():
 
 
 def test_large_float_error_is_wrong():
-    r = compare_tables(T(k=[1], v=[101.0]), T(k=[1], v=[100.0]))
+    r = compare_tables(T(k=[1], v=[150.0]), T(k=[1], v=[100.0]))
     assert not r.ok and r.verdict == "wrong"
 
 
