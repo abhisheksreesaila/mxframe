@@ -316,11 +316,14 @@ def test_thread_count_does_not_change_result(cpu_table, threads):
     check(prog, parts, ref, cnt, grouped=True)
 
 
-def test_global_agg_over_no_rows_finalizes_to_zero(device, cpu_table):
+def test_global_agg_over_no_rows_finalizes_to_null_and_count_zero(device, cpu_table):
     prog, parts, ref, cnt = run_case(cpu_table, PREDS["all_filtered"], AGGS["all_ops"], 1, 0, cpu_table.num_rows, device=device)
     present, cols = finalize(prog, parts, grouped=False)
-    assert all(float(v[0]) == 0.0 for v in cols.values())
-    assert cols["e"].dtype == np.int64
+    for name, op, _ in prog.outputs:                  # SQL: sum/min/max/mean over no rows is NULL, count is 0
+        if op == "count":
+            assert cols[name].tolist() == [0] and cols[name].dtype == np.int64
+        else:
+            assert np.ma.getmaskarray(cols[name]).all(), name
 
 
 def test_grouped_finalize_drops_empty_groups(device, cpu_table):

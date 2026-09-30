@@ -52,7 +52,10 @@ def test_pushdown_by_row_group_stats_is_exact(tmp_path):
         got = mx.scan_parquet(p).filter(pred).groupby().agg(col("v").sum().alias("s"), col("v").count().alias("n")).compute(device="cpu")
         want_n = int(mask.sum())
         assert got["n"][0].as_py() == want_n
-        np.testing.assert_allclose(got["s"][0].as_py(), t["v"].to_numpy()[mask].astype(np.float64).sum(), rtol=1e-9)
+        if want_n == 0:
+            assert got["s"][0].as_py() is None         # SQL: a sum over no rows is NULL
+        else:
+            np.testing.assert_allclose(got["s"][0].as_py(), t["v"].to_numpy()[mask].astype(np.float64).sum(), rtol=1e-9)
 
 
 def test_row_groups_are_skipped(tmp_path):

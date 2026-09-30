@@ -514,6 +514,26 @@ class CustomOpsCompiler(GraphCompiler):
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
                    for a in expr.args)
 
+    def _arith_operands(self, args, table):
+        """Operands of + - * /; a numeric literal next to an array takes the array's kind instead of
+        becoming a float32 array: an integer literal keeps an integer column integer (and exact
+        above 2**24), a float literal next to a float64 column is not rounded to float32."""
+        def literal(e):
+            return e.args[0] if e.op == "lit" and _is_number(e.args[0]) else None
+        l_lit, r_lit = literal(args[0]), literal(args[1])
+        if (l_lit is None) == (r_lit is None):
+            return self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table)
+        value, other = (l_lit, args[1]) if l_lit is not None else (r_lit, args[0])
+        arr = self._eval_expr_arrow(other, table)
+        typ = arr.type
+        if pa.types.is_floating(typ):
+            scalar = _npscalar(float(value), type=typ)
+        elif pa.types.is_integer(typ):
+            scalar = _npscalar(value) if isinstance(value, int) else _npscalar(float(value), type=pa.float64())
+        else:
+            return (self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table))
+        return (scalar, arr) if l_lit is not None else (arr, scalar)
+
     def _cmp_operands(self, args, table):
         """Operands of a comparison; a numeric literal next to a float32 column stays a scalar
         of the column's precision (see ``_align_literals``) instead of a float array."""
@@ -556,8 +576,9 @@ class CustomOpsCompiler(GraphCompiler):
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return _npa([val] * n)
         if op in ("add", "sub", "mul", "div"):
-            lhs = self._eval_expr_arrow(args[0], table)
-            rhs = self._eval_expr_arrow(args[1], table)
+            lhs, rhs = self._arith_operands(args, table)
+            if op == "div" and pa.types.is_integer(lhs.type) and pa.types.is_integer(rhs.type):
+                lhs, rhs = lhs.cast(pa.float64()), rhs.cast(pa.float64())      # SQL `/` is true division
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
             return fn(lhs, rhs)
         if op in _DICT_PRED_OPS:
@@ -734,6 +755,9 @@ class CustomOpsCompiler(GraphCompiler):
             if op in ("sum", "min", "max", "mean"):
                 inner_arr = self._eval_expr_arrow(expr.args[0], table)
                 arr_np    = _np_of(inner_arr, zero_copy_only=False).astype("float64")
+                if len(arr_np) == 0:                     # SQL: sum/min/max/mean over no rows is NULL
+                    result_cols[name] = _npa(np.ma.masked_all(1, dtype=np.float64), type=_pa.float64())
+                    continue
                 if   op == "sum":  val = float(arr_np.sum())
                 elif op == "min":  val = float(arr_np.min())
                 elif op == "max":  val = float(arr_np.max())
@@ -1077,6 +1101,8 @@ class CustomOpsCompiler(GraphCompiler):
                     self._get_col_as_f32(upper_name, table),
                     int(int_lo), int(int_hi), float(float_lo), float(float_hi), float(upper_hi),
                 )
+                if value == 0.0:
+                    raise ValueError("no row passed: the general path below returns SQL's NULL")
                 name = agg_node.aggs[0]._alias or "agg_0"
                 return pa.table({name: _npa([value], type=pa.float64())})
             except Exception:
@@ -1103,7 +1129,7 @@ class CustomOpsCompiler(GraphCompiler):
                 name = expr._alias or f"agg_{i}"
                 result_cols[name] = (
                     _npa([0], type=pa.int64()) if expr.op == "count"
-                    else _npa([0.0], type=pa.float64())
+                    else _npa(np.ma.masked_all(1, dtype=np.float64), type=pa.float64())   # SQL: NULL over no rows
                 )
             return pa.table(result_cols)
 
@@ -1327,6 +1353,49 @@ class CustomOpsCompiler(GraphCompiler):
             return Aggregate(self._lower_row_ops(plan.input, False), plan.group_by, plan.aggs)
         return plan
 
+    @staticmethod
+    def _contains_aggregate(plan) -> bool:
+        """True when an Aggregate sits anywhere in the single-input chain of ``plan`` (Joins are
+        materialized before this is asked, and their sides are computed on their own)."""
+        while plan is not None:
+            if isinstance(plan, Aggregate):
+                return True
+            plan = getattr(plan, "input", None)
+        return False
+
+    def _materialize_barrier(self, plan):
+        """Compute what sits below an aggregate result as a table, so the operator above works on it.
+
+        The engine runs one Aggregate over a scan (plus a HAVING filter and Sort/Limit on top).
+        Anything else that consumes an aggregate's output - a Project (``with_columns`` / ``select``
+        after ``agg``), a Filter that is not the aggregate's HAVING, another Aggregate (a groupby on
+        an aggregate column, or a global aggregate over groups) - is run on ``Scan(result)`` of the
+        subtree below it, computed by a recursive ``compile_and_run``.  ``plan`` has its Sort/Limit/
+        Distinct/Tail post-ops already peeled off."""
+        if isinstance(plan, Filter) and isinstance(plan.input, Aggregate) and plan.input.group_by:
+            # HAVING on a grouped aggregate: the filter stays (the global-aggregate paths do not
+            # apply one); the aggregate below it may itself sit on an aggregate
+            return Filter(self._materialize_barrier(plan.input), plan.predicate)
+        if isinstance(plan, Aggregate) and not self._contains_aggregate(plan.input):
+            # The aggregate paths read `Aggregate(Filter*(Scan))` (a Project directly below is
+            # inlined into it). Any other input - a Filter above a Project, a Project above a
+            # Filter under another Project - is computed as a table first.
+            inner = self._inline_project_into_aggregate(plan).input if plan.group_by else plan.input
+            node = inner
+            while isinstance(node, Filter):
+                node = node.input
+            if not isinstance(node, Scan):
+                return Aggregate(Scan(self._plan_to_table(plan.input)), plan.group_by, plan.aggs)
+            return plan
+        if isinstance(plan, (Filter, Project, Aggregate)) and self._contains_aggregate(plan.input):
+            below = Scan(self.compile_and_run(plan.input))
+            if isinstance(plan, Filter):
+                return Filter(below, plan.predicate)
+            if isinstance(plan, Project):
+                return Project(below, plan.exprs)
+            return Aggregate(below, plan.group_by, plan.aggs)
+        return plan
+
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0):
         """``Aggregate(Filter*(Scan))`` over columns that contain nulls, by Arrow's hash
         aggregate; None when the plan has no null in a column it reads (or is another shape)."""
@@ -1526,7 +1595,12 @@ class CustomOpsCompiler(GraphCompiler):
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:
         """Cast the columns of ``count`` aggregates to int64 (the kernels return float32/float64)."""
-        agg = cls._find_aggregate(plan)
+        node = plan
+        while isinstance(node, (Filter, Sort, Limit, Distinct, Tail)):
+            node = node.input
+        # A Project above the aggregate has already recomputed its columns (its input's counts
+        # were made exact when that input ran): the names it outputs are not the aggregate's.
+        agg = node if isinstance(node, Aggregate) else None
         if agg is None:
             return result
         for i, e in enumerate(agg.aggs):
@@ -1570,6 +1644,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         # 0 -- Extract post-ops (Sort/Limit/Distinct) -----------------
         plan, post_ops = self._extract_post_ops(plan)
+        # 0-b -- Operators above an aggregate result run on the materialized aggregate
+        plan = self._materialize_barrier(plan)
 
         # 0a -- Extract HAVING filter: a Filter wrapping an Aggregate is HAVING,
         # not a pre-scan WHERE.  Pull it out and apply after aggregation.
@@ -2379,6 +2455,12 @@ class CustomOpsCompiler(GraphCompiler):
             arr = table.column(k)
             if isinstance(arr, pa.ChunkedArray):
                 arr = arr.combine_chunks()
+            if pa.types.is_floating(arr.type):
+                # -0.0 and 0.0 are equal in SQL but hash (and would rank) as two values
+                vals = _np_of(arr, zero_copy_only=False)
+                if (vals == 0).any() and np.signbit(vals[vals == 0]).any():
+                    arr = _npa(np.ma.masked_array(vals + vals.dtype.type(0.0), mask=_np_of(arr.is_null(), zero_copy_only=False)),
+                               type=arr.type)
             # PyArrow dictionary_encode: O(N) hash → encounter-order indices
             enc = arr.dictionary_encode()
             dict_arr = enc.dictionary
