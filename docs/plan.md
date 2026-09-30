@@ -117,13 +117,13 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
 
-## F-012 Kernel health: crashes, hangs, per-call overhead [todo]
+## F-012 Kernel health: crashes, hangs, per-call overhead [done]
 Needs: F-002 merged · Found by F-003 calibration (2026-09-30)
-- [ ] GPU `group_min`/`group_max` no longer fault (`CUDA_ERROR_ILLEGAL_ADDRESS`) at >= 16k groups; test at 16k, 1.5M
-- [ ] `AOTKernelsGPU.group_encode_i32` terminates and is correct (hangs today for every input tried)
-- [ ] CPU `sort_indices` is O(n log n) (in-place rotate merge sort is O(n^2), hangs at 1e4 random rows); parallel radix/merge sort
-- [ ] GPU per-row cost measured with device-resident input is within 2x of memory bandwidth (calibrated today at 2–4 ms per million rows: slower than single-threaded CPU). Find where the time goes: per-call `DeviceContext()` creation, per-call upload/alloc in the Python wrappers, launch config
-- [ ] GPU wrappers accept device pointers (residency / Router) as well as NumPy arrays
+- [x] GPU `group_min`/`group_max` no longer fault (`CUDA_ERROR_ILLEGAL_ADDRESS`) at >= 16k groups; test at 16k, 1.5M
+- [x] `AOTKernelsGPU.group_encode_i32` terminates and is correct (hangs today for every input tried)
+- [x] CPU `sort_indices` is O(n log n) (in-place rotate merge sort is O(n^2), hangs at 1e4 random rows); parallel radix/merge sort
+- [x] GPU per-row cost measured with device-resident input is within 2x of memory bandwidth (calibrated today at 2–4 ms per million rows: slower than single-threaded CPU). Find where the time goes: per-call `DeviceContext()` creation, per-call upload/alloc in the Python wrappers, launch config
+- [x] GPU wrappers accept device pointers (residency / Router) as well as NumPy arrays
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008

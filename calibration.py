@@ -20,8 +20,8 @@ launch/sync and per-call context overhead but NO H2D/D2H copies and no host-side
 pre/post-processing that is not inherent to the op; the placer adds every copy via
 ``transfer_ms``.  (GPU join has host steps between its two kernels; they are a
 separate ``join_host`` CPU term.)  Group ops on the GPU are fitted per group-count
-bucket; ``group_min``/``group_max`` on the GPU return ``inf`` above 8192 groups (the
-kernel faults there).  With no GPU, ``estimate(..., "gpu", ...)`` returns ``inf`` so
+bucket (an op listed in ``GPU_MAX_CARD`` returns ``inf`` above its limit; the table is
+empty since F-012 fixed the min/max kernels that faulted above 8192 groups).  With no GPU, ``estimate(..., "gpu", ...)`` returns ``inf`` so
 ``min()`` just works.  Planner op names (``group_agg``, ``join_probe``, ``sort``,
 ``filter``, ...) are aliased to the measured ops; ``pipeline`` is reserved for
 F-008's fused kernel.
@@ -55,7 +55,8 @@ PERSIST_EVERY_S = 60.0      # ... or this many seconds
 DEFAULT_CARD = 1000         # assumed group cardinality when the caller gives none
 BUCKET_EDGES = (64, 1024, 8192)          # group-count buckets: <=64, <=1024, <=8192, >8192
 BUCKET_REP_CARDS = (8, 64, 100, 1000, 2048, 8192, 10_000, 200_000)   # two per bucket; interpolated on log(groups)
-GPU_MAX_CARD = {"group_min": 8192, "group_max": 8192}   # GPU kernels fault above this
+GPU_MAX_CARD: Dict[str, int] = {}     # op -> largest group count its GPU kernel handles (none now:
+                                      # min/max faulted above 8192 groups until F-012)
 OP_ALIASES = {"group_agg": "group_sum", "join_probe": "join",
               "sort": "sort_topk", "filter": "filter_take"}
 HOST_ONLY_OPS = frozenset({"join_host"})     # CPU work; estimate(..., "gpu") is inf
@@ -558,14 +559,16 @@ def _identity_from_dict(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # rows padded ~1.2x so the un-calibrated planner leans to CPU; GPU alpha (allocs,
 # sync, D2H) is ~20-40x the CPU alpha, so small inputs always go to the CPU.
 _DEFAULT_FITS: Dict[str, Tuple[float, float, float]] = {
-    "group_sum@cpu": (0.005, 0.8, 2.5), "group_sum@gpu": (0.05, 10.0, 0.0),
-    "group_count@cpu": (0.005, 0.8, 2.5), "group_count@gpu": (0.05, 10.0, 0.0),
-    "group_min@cpu": (0.005, 0.9, 10.0), "group_min@gpu": (0.1, 11.0, 0.0),
-    "group_max@cpu": (0.005, 0.9, 12.0), "group_max@gpu": (0.1, 11.0, 0.0),
+    # GPU group ops after F-012 (grid-stride kernels, relaxed atomics): 30M rows, resident
+    # input, 8..1.5M groups measured 0.1-0.5 ms per Mrow on a shared GPU; rows padded ~1.2x.
+    "group_sum@cpu": (0.005, 0.8, 2.5), "group_sum@gpu": (0.05, 0.3, 0.0),
+    "group_count@cpu": (0.005, 0.8, 2.5), "group_count@gpu": (0.05, 0.3, 0.0),
+    "group_min@cpu": (0.005, 0.9, 10.0), "group_min@gpu": (0.1, 0.3, 0.0),
+    "group_max@cpu": (0.005, 0.9, 12.0), "group_max@gpu": (0.1, 0.3, 0.0),
     "masked_sum@cpu": (0.005, 1.5, 0.0), "masked_sum@gpu": (0.15, 1.0, 0.0),
     "join@cpu": (0.02, 11.0, 0.0), "join@gpu": (0.05, 0.25, 0.0),
     "gather@cpu": (0.005, 0.8, 0.0), "gather@gpu": (0.03, 0.04, 0.0),
-    "sort_topk@cpu": (0.02, 60.0, 0.0), "sort_topk@gpu": (0.5, 5.0, 0.0),
+    "sort_topk@cpu": (0.02, 60.0, 0.0), "sort_topk@gpu": (0.1, 4.0, 0.0),   # stable tiled bitonic
     "group_encode@cpu": (0.02, 9.0, 0.0), "group_encode@gpu": (1.0, 4.0, 0.0),
     "filter_take@cpu": (0.02, 4.5, 0.0),
     # join_host: host steps between the two GPU join kernels (cumsum, bincount, argsort)
@@ -702,7 +705,7 @@ class Probe:
     max_rows: Optional[int] = None
     uses_card: bool = False
     enabled: bool = True             # False: skipped (defaults kept), noted in Calibration.errors
-    max_card: Optional[int] = None   # GPU group_min/max fault above ~8k groups (see GPU_MAX_CARD)
+    max_card: Optional[int] = None   # GPU kernel's group-count limit, if any (see GPU_MAX_CARD)
     bucketed: bool = False
     two_d: bool = False              # points are (left_rows, right_rows, ms); fit alpha + a*L^p + b*R
     grid: Optional[Callable[[Tuple[int, ...]], List[Tuple[int, int]]]] = None   # explicit (rows, card|R) grid
@@ -982,8 +985,8 @@ def _p_gather_gpu(ctx, n, card):
 
 @probe("sort_topk", "cpu", max_rows=10_000_000)
 def _p_sort_cpu(ctx, n, card):
-    # PyArrow sort, as the engine's CPU path uses it.  AOTKernels.sort_indices is an
-    # in-place rotate merge sort (O(n^2) on random keys): not usable as a probe.
+    # PyArrow sort, as the engine's CPU path uses it (the engine does not call
+    # AOTKernels.sort_indices, the parallel radix sort, yet).
     import pyarrow as pa
     import pyarrow.compute as pc
     arr = pa.array(ctx.keys(n))
@@ -1008,10 +1011,10 @@ def _p_enc_cpu(ctx, n, card):
     return lambda: arr.dictionary_encode()
 
 
-@probe("group_encode", "gpu", enabled=False)   # AOT kernel hangs on this build
+@probe("group_encode", "gpu")
 def _p_enc_gpu(ctx, n, card):
     k = ctx.labels(n, card)
-    cap = 1 << max(1, (2 * n - 1).bit_length())    # engine rule: next pow2 >= 2*rows (small caps hang)
+    cap = 1 << max(1, (2 * n - 1).bit_length())    # engine rule: next pow2 >= 2*rows
     return lambda: ctx.gpu.group_encode_i32(k, cap)
 
 

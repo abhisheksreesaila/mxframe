@@ -1957,21 +1957,24 @@ class CustomOpsCompiler(GraphCompiler):
             raw_idx = enc.indices.to_numpy(zero_copy_only=False).astype(np.int32)
             per_col_ranks.append((rank_of[raw_idx], len(dict_arr)))
 
-        # Compute strides and build composite key
-        sizes = [n for _, n in per_col_ranks]
-        strides = []
-        for i in range(len(sizes)):
-            s = 1
-            for j in range(i + 1, len(sizes)):
-                s *= sizes[j]
-            strides.append(s)
-
-        composite = np.zeros(len(table), dtype=np.int32)
+        # Fold the per-column ranks (most significant first) into one int32 key.
+        # The mixed-radix value idx0*n1*n2 + idx1*n2 + idx2 can exceed int32 when the
+        # columns have many distinct values, so accumulate in int64 and, whenever the
+        # next column could overflow, renumber the running key by its dense rank
+        # (np.unique) which preserves order and is always < len(table).
+        composite = np.zeros(len(table), dtype=np.int64)
+        radix = 1                                   # exclusive upper bound of `composite`
         for i, (idx, n_unique) in enumerate(per_col_ranks):
             if descending[i]:
                 idx = np.int32(n_unique - 1) - idx
-            composite += idx * np.int32(strides[i])
-        return composite
+            if radix * n_unique >= 2**31:
+                composite = np.unique(composite, return_inverse=True)[1].astype(np.int64)
+                radix = int(composite.max()) + 1 if len(composite) else 1
+            composite = composite * n_unique + idx
+            radix *= n_unique
+        if radix >= 2**31:
+            composite = np.unique(composite, return_inverse=True)[1]
+        return composite.astype(np.int32)
 
     def _apply_sort_custom(self, table: pa.Table, sort_node: Sort, topk: int = None) -> pa.Table:
         """Sort an Arrow table by integer composite key.
