@@ -245,6 +245,10 @@ Needs: F-020 merged · From the F-020 report
 - [ ] `encode_int` hash/sort fallback for wide key ranges (> 4x rows) if they show up in real data
 
 ## F-009 Scoreboard report and README [todo]
+Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).
+- Run from the repo root: `pixi run python scripts/bench_user_felt.py --sf 1 --engines pandas,polars,duckdb,mx-cpu,mx-auto,mx-gpu --timeout 120 --gpu 1 --name final-sf1` then `--sf 10 --engines polars,duckdb,mx-cpu,mx-auto,mx-gpu,pandas --timeout 300 --gpu 1 --name final-sf10` (add `--resume` to continue an interrupted run; exact-decimal data `data/tpch_sf{1,10}_exact` is the default; `scripts/tpch_user/official.py` checks the DuckDB reference against published answers).
+- Before trusting timings: `pixi run test -q` green; `uptime` load < 2; no other GPU users (`nvidia-smi`).
+- Report: `docs/bench/final-*.md` (+ CSV): headline first-run ms per engine, wins vs Polars/pandas/DuckDB for mx-auto, correctness verdicts, repeat-run column, honest losses with causes (Parquet decode on PyArrow — F-021; Q21 — F-022). Then the README `device="auto"` section with the real numbers and the co-processing result (repeat queries on resident data ~1.35x CPU-only; SF10 Q1 fused stage CPU 57 ms / GPU-resident 39 ms / split 25 ms).
 Needs: F-001, F-005..F-008
 - [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
 - [ ] full SF1 + SF10 user-felt run on an otherwise idle machine; results + honest losses in `docs/benchmarks.md`
