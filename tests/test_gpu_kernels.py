@@ -84,3 +84,10 @@ def test_wrappers_work_from_a_thread_that_never_touched_cuda():
 
 def test_failed_hash_join_frees_its_scratch_buffers():
     run_scenario("join_failure_frees_scratch")
+
+
+# F-013: masked global aggregates are block-reduced (were 100x too slow with per-block float atomics).
+# Sizes straddle the block (256), the unrolled step and the grid-stride; 0 and 1 are the edges.
+@pytest.mark.parametrize("n", [0, 1, 255, 256, 257, 4099, 1_000_003, 6_000_001])
+def test_masked_global_aggregates_match_numpy(n):
+    run_scenario("masked_aggs", n, timeout=120)
