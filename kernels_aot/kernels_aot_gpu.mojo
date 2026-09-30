@@ -1,7 +1,11 @@
-from std.gpu.host import DeviceContext
+from std.gpu.host import DeviceContext, DeviceAttribute
 from std.math import ceildiv
-from std.gpu import thread_idx, block_idx, block_dim, barrier
-from std.gpu.memory import AddressSpace
+from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
+from std.gpu.memory import AddressSpace, external_memory
+from std.gpu.primitives.warp import vote, shuffle_idx, shuffle_down
+from std.gpu.primitives.id import lane_id
+from std.bit import pop_count, count_trailing_zeros
+from std.sys._assembly import inlined_assembly
 from std.memory import stack_allocation
 from _atomic import Atomic
 
@@ -189,281 +193,508 @@ def utf8_isin_mask_gpu(
         ctx.synchronize()
     except: pass
 
-# ── group_sum ──────────────────────────────────────────────────────────────
+# ── grouped f32 aggregation (sum / count / min / max) ───────────────────────
+# One templated kernel family, two strategies picked on the host by group
+# count.  Both are grid-stride loops over a grid sized to the GPU (a few
+# resident blocks per SM), so a block covers many rows before it flushes.
+# (The old design launched one 1024-row block per slice, zeroed all 8192
+# shared slots in each, flushed every slot with a global atomic, and faulted
+# for > 8192 groups.)
+#
+#   SHARED ng <= 12288  block-private table in *dynamic* shared memory sized to
+#                       exactly ng slots, zeroed / flushed once per block
+#   GLOBAL otherwise    atomics straight into the output (float min/max are the
+#                       LLVM atomicrmw fmin/fmax, a CAS loop on NVPTX)
+#
+# The big win is in _atomic.mojo: atomics are `monotonic` (CUDA atomicAdd
+# semantics).  The old seq_cst ordering made NVPTX emit a fence.sc.gpu around
+# every atomic (~20x slower).  A register-accumulator path for <= 32 groups
+# with warp-shuffle reduction was tried and was slower than shared atomics for
+# float sums, so it was dropped.
+#
+# Rows with a label outside [0, ng) are ignored.
+comptime OP_SUM: Int = 0
+comptime OP_COUNT: Int = 1
+comptime OP_MIN: Int = 2
+comptime OP_MAX: Int = 3
+comptime SHARED_MAX_GROUPS: Int = 12288       # 48 KB of Float32 slots
+comptime SM_SHARED_BYTES: Int = 96 * 1024     # usable per SM on sm_80/86
+comptime MAX_BLOCKS_PER_SM: Int = 6           # global path: 1536 threads / 256
+comptime SHARED_BLOCKS_PER_SM: Int = 3        # shared path: more resident blocks made shared-memory
+                                              # float atomics contend (measured 1.5 ms vs 0.5 ms at 1000 groups)
+comptime GA_UNROLL: Int = 4
+
+@always_inline
+def _ident[op: Int]() -> Float32:
+    comptime if op == OP_MIN:
+        return F32_MAX
+    elif op == OP_MAX:
+        return F32_MIN
+    else:
+        return 0.0
+
+@always_inline
+def _fold[op: Int](a: Float32, b: Float32) -> Float32:
+    comptime if op == OP_MIN:
+        return b if b < a else a
+    elif op == OP_MAX:
+        return b if b > a else a
+    else:
+        return a + b
+
+@always_inline
+def _atomic_fold[op: Int, space: AddressSpace](
+    ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space], v: Float32
+):
+    comptime if op == OP_MIN:
+        _ = Atomic.min[space](ptr, v)
+    elif op == OP_MAX:
+        _ = Atomic.max[space](ptr, v)
+    else:
+        comptime if space == AddressSpace.GENERIC:
+            Atomic.red_add_global(Int(ptr), v)
+        else:
+            _ = Atomic.fetch_add[space](ptr, v)
+
+@always_inline
+def _row_value[op: Int](val_addr: Int, i: Int) -> Float32:
+    comptime if op == OP_COUNT:
+        return 1.0
+    else:
+        return _f32(val_addr)[i]
+
+def group_init_kernel[op: Int](out_addr: Int, ng: Int):
+    var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    if t < ng:
+        _f32(out_addr)[t] = _ident[op]()
+
+def group_global_kernel[op: Int](
+    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+):
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while i + (GA_UNROLL - 1) * stride < n:
+        var g = InlineArray[Int, GA_UNROLL](fill=0)
+        var v = InlineArray[Float32, GA_UNROLL](fill=0.0)
+        comptime for u in range(GA_UNROLL):
+            g[u] = Int(_i32(lab_addr)[i + u * stride])
+            v[u] = _row_value[op](val_addr, i + u * stride)
+        comptime for u in range(GA_UNROLL):
+            if g[u] >= 0 and g[u] < ng:
+                _atomic_fold[op, AddressSpace.GENERIC](_f32(out_addr) + g[u], v[u])
+        i += GA_UNROLL * stride
+    while i < n:
+        var gid = Int(_i32(lab_addr)[i])
+        if gid >= 0 and gid < ng:
+            _atomic_fold[op, AddressSpace.GENERIC](
+                _f32(out_addr) + gid, _row_value[op](val_addr, i))
+        i += stride
+
+@always_inline
+def _match_any(x: Int32) -> UInt32:
+    """Mask of the warp lanes holding the same value as this lane (sm_70+ match.any)."""
+    return inlined_assembly["match.any.sync.b32 $0, $1, 0xffffffff;", UInt32,
+                            constraints="=r,r"](x.cast[DType.uint32]())
+
+# Global-atomic path for SUM / COUNT with warp aggregation.  A float atomicrmw fadd
+# lowers to a compare-exchange loop, so k threads adding to one hot group cost O(k^2)
+# retries (10M rows, 100k groups, one key at 25%: 40 s).  Two fixes: the add is the
+# native `red.global.add.f32`, and lanes of a warp that hold the same group are
+# combined first (match.any, the group leader sums its members' values with
+# shuffles), so a hot group costs one atomic per warp per row instead of one per row.
+# Every lane runs every iteration (the shuffles need the full warp), rows past n are
+# lanes with group -1.
+def group_global_add_kernel[op: Int](
+    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+):
+    var lane = Int(lane_id())
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    for _ in range(ceildiv(n, stride)):
+        var gid = Int32(-1)
+        var v = Float32(0)
+        if i < n:
+            var g = _i32(lab_addr)[i]
+            if g >= Int32(0) and Int(g) < ng:
+                gid = g
+                v = _row_value[op](val_addr, i)
+        var mask = _match_any(gid)
+        var leader = lane == Int(count_trailing_zeros(mask))
+        var acc = Float32(0)
+        comptime if op == OP_COUNT:
+            acc = Float32(pop_count(mask))
+        else:
+            var m = mask if leader else UInt32(0)
+            while vote[DType.uint32](m != UInt32(0)) != UInt32(0):
+                var src = Int(count_trailing_zeros(m)) if m != UInt32(0) else lane
+                var x = shuffle_idx(v, UInt32(src))
+                if m != UInt32(0):
+                    acc += x
+                    m &= m - UInt32(1)
+        if leader and gid >= Int32(0):
+            Atomic.red_add_global(Int(_f32(out_addr) + Int(gid)), acc)
+        i += stride
+
+def group_shared_kernel[op: Int](
+    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+):
+    var shmem = rebind[
+        UnsafePointer[Scalar[DType.float32], MutAnyOrigin,
+                      address_space=AddressSpace.SHARED]
+    ](external_memory[
+        Scalar[DType.float32],
+        address_space=AddressSpace.SHARED,
+        alignment=16,
+        name="shared_dynamic_memory",
+    ]())
+    var tid = Int(thread_idx.x)
+    var t = tid
+    while t < ng:
+        shmem[t] = _ident[op]()
+        t += BLOCK
+    barrier()
+    var i = Int(block_idx.x) * BLOCK + tid
+    while i + (GA_UNROLL - 1) * stride < n:
+        var g = InlineArray[Int, GA_UNROLL](fill=0)
+        var v = InlineArray[Float32, GA_UNROLL](fill=0.0)
+        comptime for u in range(GA_UNROLL):
+            g[u] = Int(_i32(lab_addr)[i + u * stride])
+            v[u] = _row_value[op](val_addr, i + u * stride)
+        comptime for u in range(GA_UNROLL):
+            if g[u] >= 0 and g[u] < ng:
+                _atomic_fold[op, AddressSpace.SHARED](shmem + g[u], v[u])
+        i += GA_UNROLL * stride
+    while i < n:
+        var gid = Int(_i32(lab_addr)[i])
+        if gid >= 0 and gid < ng:
+            _atomic_fold[op, AddressSpace.SHARED](
+                shmem + gid, _row_value[op](val_addr, i))
+        i += stride
+    barrier()
+    t = tid
+    while t < ng:
+        var sv = shmem[t]
+        if sv != _ident[op]():          # untouched slot: nothing to flush
+            _atomic_fold[op, AddressSpace.GENERIC](_f32(out_addr) + t, sv)
+        t += BLOCK
+
+def run_group[op: Int](
+    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int
+) raises:
+    if ng <= 0:
+        return
+    var ctx = DeviceContext()
+    ctx.enqueue_function_experimental[group_init_kernel[op]](
+        out_addr, ng, grid_dim=ceildiv(ng, BLOCK), block_dim=BLOCK)
+    if n > 0:
+        var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+        if ng <= SHARED_MAX_GROUPS and n >= 4 * ng:
+            var smem = ng * 4
+            var per_sm = max(1, min(SHARED_BLOCKS_PER_SM, SM_SHARED_BYTES // (smem + 1024)))
+            # each block must cover >= ~2 rows per slot it flushes
+            var blocks = max(1, min(sms * per_sm, n // (2 * ng)))
+            blocks = min(blocks, ceildiv(n, BLOCK * GA_UNROLL))
+            ctx.enqueue_function_experimental[group_shared_kernel[op]](
+                out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK, shared_mem_bytes=smem)
+        else:
+            var blocks = min(sms * MAX_BLOCKS_PER_SM, ceildiv(n, BLOCK * GA_UNROLL))
+            comptime if op == OP_SUM or op == OP_COUNT:
+                ctx.enqueue_function_experimental[group_global_add_kernel[op]](
+                    out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                    grid_dim=blocks, block_dim=BLOCK)
+            else:
+                ctx.enqueue_function_experimental[group_global_kernel[op]](
+                    out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                    grid_dim=blocks, block_dim=BLOCK)
+    ctx.synchronize()
+
 @export
 def group_sum_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ) abi("C"):
-    @parameter
-    def zero_out(ng: Int):
-        var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if tid < ng: _f32(out_addr)[tid] = 0.0
-
-    @parameter
-    def sum_shared(n: Int, ng: Int):
-        var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var t = Int(thread_idx.x)
-        while t < MAX_GROUPS:
-            shmem[t] = 0.0; t += BLOCK
-        barrier()
-        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
-        for c in range(COARSE):
-            var i = base + c * BLOCK
-            if i < n:
-                var gid = Int(_i32(lab_addr)[i])
-                if gid >= 0 and gid < ng:
-                    _ = Atomic.fetch_add(shmem + gid, _f32(val_addr)[i])
-        barrier()
-        t = Int(thread_idx.x)
-        while t < ng:
-            var sv = shmem[t]
-            if sv != 0.0: _ = Atomic.fetch_add(_f32(out_addr) + t, sv)
-            t += BLOCK
-
-    @parameter
-    def sum_global(n: Int, ng: Int):
-        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
-        for c in range(COARSE):
-            var i = base + c * BLOCK
-            if i < n:
-                var gid = Int(_i32(lab_addr)[i])
-                if gid >= 0 and gid < ng:
-                    _ = Atomic.fetch_add(_f32(out_addr) + gid, _f32(val_addr)[i])
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](
-            n_groups, grid_dim=ceildiv(n_groups, BLOCK), block_dim=BLOCK)
-        if n_rows > 0:
-            var nb = ceildiv(n_rows, BLOCK * COARSE)
-            if n_groups <= MAX_GROUPS:
-                ctx.enqueue_function_experimental[sum_shared](
-                    n_rows, n_groups, grid_dim=nb, block_dim=BLOCK)
-            else:
-                ctx.enqueue_function_experimental[sum_global](
-                    n_rows, n_groups, grid_dim=nb, block_dim=BLOCK)
-        ctx.synchronize()
+    try: run_group[OP_SUM](out_addr, val_addr, lab_addr, n_rows, n_groups)
     except: pass
 
-# ── group_min ──────────────────────────────────────────────────────────────
 @export
 def group_min_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ) abi("C"):
-    @parameter
-    def init_out(ng: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < ng: _f32(out_addr)[t] = F32_MAX
-
-    @parameter
-    def min_kernel(n: Int, ng: Int):
-        var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var t = Int(thread_idx.x)
-        while t < MAX_GROUPS:
-            shmem[t] = F32_MAX; t += BLOCK
-        barrier()
-        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
-        for c in range(COARSE):
-            var i = base + c * BLOCK
-            if i < n:
-                var gid = Int(_i32(lab_addr)[i])
-                if gid >= 0 and gid < ng:
-                    _ = Atomic.min(shmem + gid, _f32(val_addr)[i])
-        barrier()
-        t = Int(thread_idx.x)
-        while t < ng:
-            _ = Atomic.min(_f32(out_addr) + t, shmem[t])
-            t += BLOCK
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_out](
-            n_groups, grid_dim=ceildiv(n_groups, BLOCK), block_dim=BLOCK)
-        if n_rows > 0:
-            ctx.enqueue_function_experimental[min_kernel](
-                n_rows, n_groups,
-                grid_dim=ceildiv(n_rows, BLOCK * COARSE), block_dim=BLOCK)
-        ctx.synchronize()
+    try: run_group[OP_MIN](out_addr, val_addr, lab_addr, n_rows, n_groups)
     except: pass
 
-# ── group_max ──────────────────────────────────────────────────────────────
 @export
 def group_max_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ) abi("C"):
-    @parameter
-    def init_out(ng: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < ng: _f32(out_addr)[t] = F32_MIN
-
-    @parameter
-    def max_kernel(n: Int, ng: Int):
-        var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var t = Int(thread_idx.x)
-        while t < MAX_GROUPS:
-            shmem[t] = F32_MIN; t += BLOCK
-        barrier()
-        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
-        for c in range(COARSE):
-            var i = base + c * BLOCK
-            if i < n:
-                var gid = Int(_i32(lab_addr)[i])
-                if gid >= 0 and gid < ng:
-                    _ = Atomic.max(shmem + gid, _f32(val_addr)[i])
-        barrier()
-        t = Int(thread_idx.x)
-        while t < ng:
-            _ = Atomic.max(_f32(out_addr) + t, shmem[t])
-            t += BLOCK
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_out](
-            n_groups, grid_dim=ceildiv(n_groups, BLOCK), block_dim=BLOCK)
-        if n_rows > 0:
-            ctx.enqueue_function_experimental[max_kernel](
-                n_rows, n_groups,
-                grid_dim=ceildiv(n_rows, BLOCK * COARSE), block_dim=BLOCK)
-        ctx.synchronize()
+    try: run_group[OP_MAX](out_addr, val_addr, lab_addr, n_rows, n_groups)
     except: pass
 
-# ── group_count ────────────────────────────────────────────────────────────
 @export
 def group_count_f32_gpu(
     out_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
 ) abi("C"):
-    @parameter
-    def zero_out(ng: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < ng: _f32(out_addr)[t] = 0.0
-
-    # Fast path: shared-memory privatisation (same pattern as group_sum)
-    @parameter
-    def count_shared(n: Int, ng: Int):
-        var shmem = stack_allocation[MAX_GROUPS, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var t = Int(thread_idx.x)
-        while t < MAX_GROUPS:
-            shmem[t] = 0.0; t += BLOCK
-        barrier()
-        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
-        for c in range(COARSE):
-            var i = base + c * BLOCK
-            if i < n:
-                var gid = Int(_i32(lab_addr)[i])
-                if gid >= 0 and gid < ng:
-                    _ = Atomic.fetch_add(shmem + gid, Float32(1.0))
-        barrier()
-        t = Int(thread_idx.x)
-        while t < ng:
-            var sv = shmem[t]
-            if sv != 0.0: _ = Atomic.fetch_add(_f32(out_addr) + t, sv)
-            t += BLOCK
-
-    # Slow path: direct global atomics (used when n_groups > MAX_GROUPS)
-    @parameter
-    def count_global(n: Int, ng: Int):
-        var base = Int(block_idx.x) * BLOCK * COARSE + Int(thread_idx.x)
-        for c in range(COARSE):
-            var i = base + c * BLOCK
-            if i < n:
-                var gid = Int(_i32(lab_addr)[i])
-                if gid >= 0 and gid < ng:
-                    _ = Atomic.fetch_add(_f32(out_addr) + gid, Float32(1.0))
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](
-            n_groups, grid_dim=ceildiv(n_groups, BLOCK), block_dim=BLOCK)
-        if n_rows > 0:
-            var nb = ceildiv(n_rows, BLOCK * COARSE)
-            if n_groups <= MAX_GROUPS:
-                ctx.enqueue_function_experimental[count_shared](
-                    n_rows, n_groups, grid_dim=nb, block_dim=BLOCK)
-            else:
-                ctx.enqueue_function_experimental[count_global](
-                    n_rows, n_groups, grid_dim=nb, block_dim=BLOCK)
-        ctx.synchronize()
+    try: run_group[OP_COUNT](out_addr, 0, lab_addr, n_rows, n_groups)
     except: pass
 
-# ── masked_global_sum ──────────────────────────────────────────────────────
+# ── masked global aggregates ───────────────────────────────────────────────
+# sum / sum_product / min / max over rows whose int32 mask != 0, plus the fused
+# range5 sum-product.  All are memory-bound streaming reductions:
+#   pass 1: grid-stride loop, MU independent rows in flight per thread, a per-thread
+#           partial (float64 for sums, like the CPU kernels; float32 for min/max, since
+#           float64 compares run at 1/64 rate on GeForce), then warp shuffle -> shared
+#           -> one partial per block written to a scratch buffer (no atomics at all);
+#   pass 2: one block folds the partials in a fixed order and writes the float32 result.
+# The result is deterministic run to run.  Semantics match the CPU kernels: masked-out
+# rows (NaN included) are ignored, NaN in a live row poisons sums and is skipped by
+# min/max, an empty selection gives 0 / +F32_MAX / -F32_MAX.
+comptime MU: Int = 4                      # independent rows per thread per iteration
+comptime MASKED_BLOCKS_PER_SM: Int = 6    # 6 * 256 = 1536 threads/SM
+
+@always_inline
+def _f64(addr: Int) -> UnsafePointer[Float64, MutAnyOrigin]:
+    return UnsafePointer[Float64, MutAnyOrigin](unsafe_from_address=addr)
+
+@always_inline
+def _warp_sum(v: Float64) -> Float64:
+    var x = v
+    comptime for k in range(5):
+        # shuffle has no float64 overload: move the two 32-bit halves
+        var bits = x.to_bits()
+        var lo = shuffle_down(UInt32(bits & 0xFFFFFFFF), UInt32(16 >> k))
+        var hi = shuffle_down(UInt32(bits >> 32), UInt32(16 >> k))
+        x += Float64(from_bits=(UInt64(hi) << 32) | UInt64(lo))
+    return x
+
+@always_inline
+def _warp_ext[is_min: Bool](v: Float32) -> Float32:
+    var x = v
+    comptime for k in range(5):
+        var o = shuffle_down(x, UInt32(16 >> k))
+        comptime if is_min:
+            if o < x: x = o
+        else:
+            if o > x: x = o
+    return x
+
+# Every thread of the block must call these; the result is valid in thread 0.
+@always_inline
+def _block_sum(v: Float64) -> Float64:
+    var sh = stack_allocation[32, Scalar[DType.float64],
+        address_space=AddressSpace.SHARED]()
+    var tid = Int(thread_idx.x)
+    var w = _warp_sum(v)
+    if tid % 32 == 0: sh[tid // 32] = w
+    barrier()
+    var r = Float64(0)
+    if tid < BLOCK // 32: r = sh[tid]
+    if tid < 32: r = _warp_sum(r)
+    return r
+
+@always_inline
+def _block_ext[is_min: Bool](v: Float32, ident: Float32) -> Float32:
+    var sh = stack_allocation[32, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED]()
+    var tid = Int(thread_idx.x)
+    var w = _warp_ext[is_min](v)
+    if tid % 32 == 0: sh[tid // 32] = w
+    barrier()
+    var r = ident
+    if tid < BLOCK // 32: r = sh[tid]
+    if tid < 32: r = _warp_ext[is_min](r)
+    return r
+
+# a * b (prod) or a, in float64, of a live row; 0 for a masked-out row.
+def masked_sum_pass1[prod: Bool](
+    part_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int, stride: Int
+):
+    var acc = Float64(0)
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while i + (MU - 1) * stride < n:
+        var m = InlineArray[Int32, MU](fill=0)
+        var x = InlineArray[Float32, MU](fill=0.0)
+        var y = InlineArray[Float32, MU](fill=0.0)
+        comptime for u in range(MU):
+            m[u] = _i32(mask_addr)[i + u * stride]
+            x[u] = _f32(a_addr)[i + u * stride]
+            comptime if prod:
+                y[u] = _f32(b_addr)[i + u * stride]
+        comptime for u in range(MU):
+            if m[u] != Int32(0):
+                comptime if prod:
+                    acc += x[u].cast[DType.float64]() * y[u].cast[DType.float64]()
+                else:
+                    acc += x[u].cast[DType.float64]()
+        i += MU * stride
+    while i < n:
+        if _i32(mask_addr)[i] != Int32(0):
+            comptime if prod:
+                acc += _f32(a_addr)[i].cast[DType.float64]() * _f32(b_addr)[i].cast[DType.float64]()
+            else:
+                acc += _f32(a_addr)[i].cast[DType.float64]()
+        i += stride
+    var total = _block_sum(acc)
+    if Int(thread_idx.x) == 0:
+        _f64(part_addr)[Int(block_idx.x)] = total
+
+def masked_ext_pass1[is_min: Bool](
+    part_addr: Int, a_addr: Int, mask_addr: Int, n: Int, stride: Int
+):
+    var ident = F32_MAX if is_min else F32_MIN
+    var best = ident
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while i + (MU - 1) * stride < n:
+        var m = InlineArray[Int32, MU](fill=0)
+        var x = InlineArray[Float32, MU](fill=0.0)
+        comptime for u in range(MU):
+            m[u] = _i32(mask_addr)[i + u * stride]
+            x[u] = _f32(a_addr)[i + u * stride]
+        comptime for u in range(MU):
+            if m[u] != Int32(0):
+                comptime if is_min:
+                    if x[u] < best: best = x[u]
+                else:
+                    if x[u] > best: best = x[u]
+        i += MU * stride
+    while i < n:
+        if _i32(mask_addr)[i] != Int32(0):
+            var xv = _f32(a_addr)[i]
+            comptime if is_min:
+                if xv < best: best = xv
+            else:
+                if xv > best: best = xv
+        i += stride
+    var r = _block_ext[is_min](best, ident)
+    if Int(thread_idx.x) == 0:
+        _f64(part_addr)[Int(block_idx.x)] = r.cast[DType.float64]()
+
+# One block folds the per-block partials (fixed order) into the float32 result.
+def masked_final_sum(out_addr: Int, part_addr: Int, nparts: Int):
+    var acc = Float64(0)
+    var t = Int(thread_idx.x)
+    while t < nparts:
+        acc += _f64(part_addr)[t]
+        t += BLOCK
+    var total = _block_sum(acc)
+    if Int(thread_idx.x) == 0:
+        _f64(out_addr)[0] = total
+
+def masked_final_ext[is_min: Bool](out_addr: Int, part_addr: Int, nparts: Int):
+    var ident = F32_MAX if is_min else F32_MIN
+    var best = ident
+    var t = Int(thread_idx.x)
+    while t < nparts:
+        var x = _f64(part_addr)[t].cast[DType.float32]()
+        comptime if is_min:
+            if x < best: best = x
+        else:
+            if x > best: best = x
+        t += BLOCK
+    var r = _block_ext[is_min](best, ident)
+    if Int(thread_idx.x) == 0:
+        _f64(out_addr)[0] = r.cast[DType.float64]()
+
+def masked_blocks(ctx: DeviceContext, n: Int) raises -> Int:
+    var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    return max(1, min(sms * MASKED_BLOCKS_PER_SM, ceildiv(n, BLOCK * MU)))
+
 @export
 def masked_global_sum_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
 ) abi("C"):
-    @parameter
-    def zero_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = 0.0
-
-    @parameter
-    def sum_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = 0.0
-        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s: shmem[tid] += shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.fetch_add(_f32(out_addr), shmem[0])
-
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](
-            1, grid_dim=1, block_dim=BLOCK)
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[sum_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function_experimental[masked_sum_pass1[False]](
+                pa, val_addr, 0, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_sum](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
+        _ = len(parts)
     except: pass
 
-# ── masked_global_sum_product ──────────────────────────────────────────────
 @export
 def masked_global_sum_product_f32_gpu(
     out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int
 ) abi("C"):
-    @parameter
-    def zero_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = 0.0
-
-    @parameter
-    def sum_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = 0.0
-        if gid < n_ and _i32(mask_addr)[gid] != 0:
-            v = _f32(a_addr)[gid] * _f32(b_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s: shmem[tid] += shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.fetch_add(_f32(out_addr), shmem[0])
-
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](
-            1, grid_dim=1, block_dim=BLOCK)
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[sum_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function_experimental[masked_sum_pass1[True]](
+                pa, a_addr, b_addr, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_sum](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
+        _ = len(parts)
     except: pass
 
-# Fused range predicate + product reduction. Each thread evaluates five
-# comparisons and contributes a[i] * b[i] only when every predicate passes.
+@export
+def masked_global_min_f32_gpu(
+    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
+) abi("C"):
+    try:
+        var ctx = DeviceContext()
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
+        if n > 0:
+            ctx.enqueue_function_experimental[masked_ext_pass1[True]](
+                pa, val_addr, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_ext[True]](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.synchronize()
+        _ = len(parts)
+    except: pass
+
+@export
+def masked_global_max_f32_gpu(
+    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
+) abi("C"):
+    try:
+        var ctx = DeviceContext()
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
+        if n > 0:
+            ctx.enqueue_function_experimental[masked_ext_pass1[False]](
+                pa, val_addr, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_ext[False]](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.synchronize()
+        _ = len(parts)
+    except: pass
+
+# Fused range predicate + product reduction: five comparisons decide whether a[i]*b[i]
+# (float64) joins the sum.  Same two-pass structure as above.
+def range5_pass1(
+    part_addr: Int, a_addr: Int, b_addr: Int,
+    int_col_addr: Int, float_col_addr: Int, upper_col_addr: Int,
+    n: Int, ilo: Int, ihi: Int, flo: Float32, fhi: Float32, uhi: Float32,
+    stride: Int,
+):
+    var acc = Float64(0)
+    var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while row < n:
+        var int_value = Int(_i32(int_col_addr)[row])
+        var float_value = _f32(float_col_addr)[row]
+        var upper_value = _f32(upper_col_addr)[row]
+        if (int_value >= ilo and int_value < ihi and
+                float_value >= flo and float_value <= fhi and
+                upper_value < uhi):
+            acc += _f32(a_addr)[row].cast[DType.float64]() * _f32(b_addr)[row].cast[DType.float64]()
+        row += stride
+    var total = _block_sum(acc)
+    if Int(thread_idx.x) == 0:
+        _f64(part_addr)[Int(block_idx.x)] = total
+
 @export
 def range5_sum_product_f32_gpu(
     out_addr: Int,
@@ -479,45 +710,20 @@ def range5_sum_product_f32_gpu(
     float_hi: Float32,
     upper_hi: Float32,
 ) abi("C"):
-    @parameter
-    def zero_out():
-        if Int(thread_idx.x) == 0:
-            _f32(out_addr)[0] = 0.0
-
-    @parameter
-    def sum_kernel(n_: Int, ilo: Int, ihi: Int, flo: Float32, fhi: Float32, uhi: Float32):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var row = Int(block_idx.x) * BLOCK + tid
-        var value: Float32 = 0.0
-        if row < n_:
-            var int_value = Int(_i32(int_col_addr)[row])
-            var float_value = _f32(float_col_addr)[row]
-            var upper_value = _f32(upper_col_addr)[row]
-            if (int_value >= ilo and int_value < ihi and
-                    float_value >= flo and float_value <= fhi and
-                    upper_value < uhi):
-                value = _f32(a_addr)[row] * _f32(b_addr)[row]
-        shmem[tid] = value
-        barrier()
-        var stride = BLOCK >> 1
-        while stride > 0:
-            if tid < stride:
-                shmem[tid] += shmem[tid + stride]
-            barrier()
-            stride = stride >> 1
-        if tid == 0:
-            _ = Atomic.fetch_add(_f32(out_addr), shmem[0])
-
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](grid_dim=1, block_dim=BLOCK)
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[sum_kernel](
-                n, int_lo, int_hi, float_lo, float_hi, upper_hi,
-                grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function_experimental[range5_pass1](
+                pa, a_addr, b_addr, int_col_addr, float_col_addr, upper_col_addr,
+                n, int_lo, int_hi, float_lo, float_hi, upper_hi, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_sum](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
+        _ = len(parts)
     except: pass
 
 # Mark right-side keys satisfying right_a < right_b, then count left rows by
@@ -677,20 +883,22 @@ def single_late_supplier_counts_i32_gpu(
         mixed ^= mixed >> 16
         var slot = Int(mixed) % cap_
         while True:
-            var state = _i32(states_addr)[slot]
+            # states / keys are written by other blocks while we read them: use L2
+            # acquire loads and a release store (plain loads may hit a stale L1 line)
+            var state = Atomic.load(_i32(states_addr) + slot)
             if state == Int32(0):
                 var expected = Int32(0)
                 if Atomic.compare_exchange(_i32(states_addr) + slot, expected, Int32(-1)):
                     _i32(hash_orders_addr)[slot] = order_key
                     _i32(hash_suppliers_addr)[slot] = supplier_key
-                    _i32(states_addr)[slot] = Int32(1)
+                    Atomic.store(_i32(states_addr) + slot, Int32(1))
                     _ = Atomic.fetch_add(_i32(order_counts_addr) + Int(order_key), Int32(1))
                     return
                 state = expected
             while state == Int32(-1):
-                state = _i32(states_addr)[slot]
-            if (state == Int32(1) and _i32(hash_orders_addr)[slot] == order_key and
-                    _i32(hash_suppliers_addr)[slot] == supplier_key):
+                state = Atomic.load(_i32(states_addr) + slot)
+            if (state == Int32(1) and Atomic.load(_i32(hash_orders_addr) + slot) == order_key and
+                    Atomic.load(_i32(hash_suppliers_addr) + slot) == supplier_key):
                 return
             slot = (slot + 1) % cap_
 
@@ -811,100 +1019,35 @@ def filter_gather_i64_gpu(
         ctx.synchronize()
     except: pass
 
-# ── masked_global_min ─────────────────────────────────────────────────────
-@export
-def masked_global_min_f32_gpu(
-    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
-    @parameter
-    def init_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = F32_MAX
-
-    @parameter
-    def min_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = F32_MAX
-        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s:
-                if shmem[tid + s] < shmem[tid]: shmem[tid] = shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.min(_f32(out_addr), shmem[0])
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_out](
-            1, grid_dim=1, block_dim=BLOCK)
-        if n > 0:
-            ctx.enqueue_function_experimental[min_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-        ctx.synchronize()
-    except: pass
-
-# ── masked_global_max ─────────────────────────────────────────────────────
-@export
-def masked_global_max_f32_gpu(
-    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
-    @parameter
-    def init_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = F32_MIN
-
-    @parameter
-    def max_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = F32_MIN
-        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s:
-                if shmem[tid + s] > shmem[tid]: shmem[tid] = shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.max(_f32(out_addr), shmem[0])
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_out](
-            1, grid_dim=1, block_dim=BLOCK)
-        if n > 0:
-            ctx.enqueue_function_experimental[max_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-        ctx.synchronize()
-    except: pass
-
 # ── group_encode_i32 ──────────────────────────────────────────────────────
-# Open-addressing linear-probing hash table: assign dense int32 group IDs
-# to an int32 key array.  INT32_MIN (-2147483648) is the empty-slot sentinel;
-# callers must ensure no key equals that value.
+# Open-addressing linear-probing hash table: assign dense int32 group IDs to an
+# int32 key array.  Every int32 value is a legal key (INT32_MIN included);
+# slot state lives in htid, not in a key sentinel:
 #
-# Algorithm per thread i:
-#   h = murmur_hash(keys[i]) % cap
-#   expected = EMPTY
+#   htid[h] == -1   empty
+#   htid[h] == -2   claimed, key being written
+#   htid[h] >= 0    ready: htab[h] holds the key, htid[h] its dense id
+#
+# Per thread i (key k):
+#   h = hash(k) % cap
 #   loop:
-#     won = CAS(htab[h], expected, keys[i])   — expected is updated on miss
-#     if won:
-#       new_id = atomicAdd(out_ng, 1)          — monotone counter
-#       htid[h] = new_id; out_ids[i] = new_id; return
-#     if expected == keys[i]:
-#       spin until htid[h] != -1; out_ids[i] = htid[h]; return
-#     h = (h+1)%cap; expected = EMPTY          — linear probe
+#     st = acquire_load(htid[h])                 # L2, never a stale L1 line
+#     if st == EMPTY and CAS(htid[h], EMPTY -> CLAIMED) wins:
+#         htab[h] = k; id = atomicAdd(out_ng, 1); release_store(htid[h], id)
+#         out_ids[i] = id; return
+#     while st == CLAIMED: st = acquire_load(htid[h])   # writer is 2 stores away
+#     if acquire_load(htab[h]) == k: out_ids[i] = st; return
+#     h = (h + 1) % cap                           # different key: probe on
 #
-# Inputs:  keys[n] int32, cap (power-of-2 >= 2*n)
-# Outputs: out_ids[n] dense group IDs, out_ng[1] n_groups found
-# Scratch: htab[cap], htid[cap]  (kernel initialises them internally)
+# The previous version spun on plain loads of htid, which the SM may serve from
+# L1 forever (the hang), and used INT32_MIN as the empty key so a real
+# INT32_MIN key could win the same slot several times.
+#
+# Inputs:  keys[n] int32; cap > (number of distinct keys), e.g. >= 2*n
+# Outputs: out_ids[n] dense group ids in claim order (not first-occurrence
+#          order; the numbering can differ between runs), out_ng[1] n_groups
+#          (ids are 0..n_groups-1).  out_ids[i] = -1 if the table was full.
+# Scratch: htab[cap], htid[cap]  (the kernel initialises them)
 @export
 def group_encode_i32_gpu(
     keys_addr: Int,
@@ -915,66 +1058,59 @@ def group_encode_i32_gpu(
     n: Int,
     cap: Int,
 ) abi("C"):
-    # Pass 1: initialise hash table slots and counter atomically
     @parameter
     def init_tables(cap_: Int):
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < cap_:
-            _i32(htab_addr)[t] = Int32(-2147483648)  # EMPTY sentinel
+            _i32(htab_addr)[t] = Int32(0)
             _i32(htid_addr)[t] = Int32(-1)
         if t == 0:
             _i32(out_ng_addr)[0] = Int32(0)
 
-    # Pass 2: each thread claims its key slot, assigns a dense ID
     @parameter
     def insert(n_: Int, cap_: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i >= n_: return
 
         var k = _i32(keys_addr)[i]
-        var EMPTY = Int32(-2147483648)
 
-        # Murmur-inspired 32-bit avalanche hash
-        var kk = UInt32(Int(k))
+        # 32-bit avalanche hash of the key's bit pattern
+        var kk = k.cast[DType.uint32]()
         kk ^= kk >> 16
-        kk ^= UInt32(0x45d9f3b)
-        kk ^= kk >> 16
-        kk ^= kk >> 4
-        kk ^= UInt32(0x27d4eb2f)
+        kk *= UInt32(0x7feb352d)
         kk ^= kk >> 15
+        kk *= UInt32(0x846ca68b)
+        kk ^= kk >> 16
         var h = Int(kk) % cap_
 
-        var expected = EMPTY
-        while True:
-            # Atomic CAS: try to install our key in slot h.
-            # On miss, `expected` is updated to the current slot value.
-            var won = Atomic.compare_exchange(
-                _i32(htab_addr) + h,
-                expected,
-                k,
-            )
-            if won:
-                # Slot claimed: get a fresh dense ID (atomicAdd returns old value = new ID)
-                var new_id = Atomic.fetch_add(_i32(out_ng_addr), Int32(1))
-                _i32(htid_addr)[h] = new_id
-                _i32(out_ids_addr)[i] = new_id
+        var probes = 0
+        while probes < cap_:
+            var st = Atomic.load(_i32(htid_addr) + h)
+            if st == Int32(-1):
+                var expected = Int32(-1)
+                if Atomic.compare_exchange(_i32(htid_addr) + h, expected, Int32(-2)):
+                    _i32(htab_addr)[h] = k
+                    var new_id = Atomic.fetch_add(_i32(out_ng_addr), Int32(1))
+                    Atomic.store(_i32(htid_addr) + h, new_id)
+                    _i32(out_ids_addr)[i] = new_id
+                    return
+                st = expected
+            while st == Int32(-2):
+                st = Atomic.load(_i32(htid_addr) + h)
+            if Atomic.load(_i32(htab_addr) + h) == k:
+                _i32(out_ids_addr)[i] = st
                 return
-            if expected == k:
-                # Another thread already claimed this key; spin until it writes the ID
-                var gid = _i32(htid_addr)[h]
-                while gid == Int32(-1):
-                    gid = _i32(htid_addr)[h]
-                _i32(out_ids_addr)[i] = gid
-                return
-            # Collision with a different key: linear probe to next slot
-            h = (h + 1) % cap_
-            expected = EMPTY  # reset for the next CAS attempt
+            h += 1
+            if h == cap_: h = 0
+            probes += 1
+        _i32(out_ids_addr)[i] = Int32(-1)
 
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_tables](
-            cap, grid_dim=ceildiv(cap, BLOCK), block_dim=BLOCK)
-        if n > 0:
+        if cap > 0:
+            ctx.enqueue_function_experimental[init_tables](
+                cap, grid_dim=ceildiv(cap, BLOCK), block_dim=BLOCK)
+        if n > 0 and cap > 0:
             ctx.enqueue_function_experimental[insert](
                 n, cap, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
@@ -1000,13 +1136,102 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
     except: pass
 
 # ── sort_topk_i32 ─────────────────────────────────────────────────────────
-# Full GPU bitonic sort producing a sorted index permutation.
-# Caller takes out_addr[0..k-1] for top-k, or the full array for full sort.
+# Stable GPU sort of an int32 key array into a row-index permutation.
 #
-# out_addr  int32[n]   output: sorted row indices
+# Each row becomes one 64-bit word  (order-preserving key bits << 32) | row,
+# so a plain 64-bit compare orders by key and breaks ties by row: the sort is
+# stable, ascending or descending, and there is no indirect key load per
+# compare.  The words are sorted with a bitonic network over a power-of-two
+# scratch buffer; the padding words (rows >= n) carry the maximum key and sort
+# to the end, so any n works.  Up to SORT_TILE (2048) words the whole sort is one
+# shared-memory kernel; above that, tiles are sorted in shared memory and merged
+# with global steps for distance >= SORT_TILE plus one shared-memory kernel for the
+# remaining steps of each merge stage (about a third of the launches and memory
+# passes of the plain network).  (The old version sorted the index array in place
+# and skipped out-of-range partners, which is wrong for n that is not a power
+# of two, and it was not stable.)
+#
+# out_addr  int32[n]   output: row indices in sorted order (all n)
 # keys_addr int32[n]   input:  sort keys
-# n                    number of elements
-# desc_flag            0 = ascending, 1 = descending
+# desc_flag            0 = ascending, 1 = descending (ties keep row order)
+@always_inline
+def _u64(addr: Int) -> UnsafePointer[UInt64, MutAnyOrigin]:
+    return UnsafePointer[UInt64, MutAnyOrigin](unsafe_from_address=addr)
+
+comptime SORT_TILE: Int = 2048        # words sorted in shared memory (16 KB)
+
+@always_inline
+def _sort_word(keys_addr: Int, i: Int, n: Int, desc: Int) -> UInt64:
+    """(order-preserving key bits << 32) | row; rows >= n are +infinity padding."""
+    var hi = UInt64(0xFFFFFFFF)
+    if i < n:
+        var k = _i32(keys_addr)[i]
+        # flag bit 1: negative keys sort after every non-negative one (join build side)
+        if not ((desc & 2) != 0 and k < Int32(0)):
+            var bits = k.cast[DType.uint32]() ^ UInt32(0x80000000)
+            if (desc & 1) != 0: bits = ~bits
+            hi = UInt64(bits)
+    return (hi << 32) | UInt64(i)
+
+@always_inline
+def _pair_index(p: Int, j: Int) -> Int:
+    """Lower element of the p-th compare-exchange pair at distance j (a power of two)."""
+    var lo = p & (j - 1)
+    return ((p - lo) << 1) + lo
+
+@always_inline
+def _cmpx(
+    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    i: Int, j: Int, asc: Bool,
+):
+    var a = sh[i]
+    var b = sh[i + j]
+    if (asc and a > b) or (not asc and a < b):
+        sh[i] = b
+        sh[i + j] = a
+
+@always_inline
+def _sort_stages(
+    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    base: Int, tile: Int, tid: Int,
+):
+    """Bitonic stages k = 2..tile inside a shared-memory tile; the direction of each block
+    comes from its *global* index, so tiles alternate ascending / descending like the
+    global network."""
+    var k = 2
+    while k <= tile:
+        var j = k >> 1
+        while j > 0:
+            var p = tid
+            while p < (tile >> 1):
+                var i = _pair_index(p, j)
+                _cmpx(sh, i, j, ((base + i) & k) == 0)
+                p += BLOCK
+            barrier()
+            j >>= 1
+        k <<= 1
+
+@always_inline
+def _merge_steps(
+    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    base: Int, tile: Int, k_val: Int, tid: Int,
+):
+    """The steps j = tile/2..1 of one bitonic merge stage of size k_val >= 2 * tile."""
+    var j = tile >> 1
+    while j > 0:
+        var p = tid
+        while p < (tile >> 1):
+            var i = _pair_index(p, j)
+            _cmpx(sh, i, j, ((base + i) & k_val) == 0)
+            p += BLOCK
+        barrier()
+        j >>= 1
+
+# out_addr  int32[n]   output: row indices in sorted order (all n)
+# keys_addr int32[n]   input:  sort keys
+# desc_flag            bit 0: descending (ties keep row order);
+#                      bit 1: negative keys go last, in row order (the hash join's
+#                             build side, where a negative key means "no key")
 @export
 def sort_topk_i32_gpu(
     out_addr:  Int,
@@ -1015,49 +1240,250 @@ def sort_topk_i32_gpu(
     desc_flag: Int,
 ) abi("C"):
     @parameter
-    def init_kernel(n_: Int):
-        var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if tid < n_:
-            _i32(out_addr)[tid] = Int32(tid)
+    def small_sort(n_: Int, padded_: Int, desc_: Int):
+        # whole sort in one block: keys -> words -> shared sort -> rows
+        var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var t = tid
+        while t < padded_:
+            sh[t] = _sort_word(keys_addr, t, n_, desc_)
+            t += BLOCK
+        barrier()
+        _sort_stages(sh, 0, padded_, tid)
+        t = tid
+        while t < n_:
+            _i32(out_addr)[t] = Int32(Int(sh[t] & UInt64(0xFFFFFFFF)))
+            t += BLOCK
 
     @parameter
-    def bitonic_step(n_: Int, k_val: Int, j_val: Int, desc_: Int):
+    def init_words(n_: Int, padded_: Int, desc_: Int, words_addr: Int):
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if i >= n_:
-            return
-        var partner = i ^ j_val
-        if partner <= i or partner >= n_:
-            return
-        # Ascending in first half of each k-block; flip if descending requested
-        var want_asc = ((i & k_val) == 0)
-        if desc_ != 0:
-            want_asc = not want_asc
-        var idx_i = Int(_i32(out_addr)[i])
-        var idx_p = Int(_i32(out_addr)[partner])
-        var ki = _i32(keys_addr)[idx_i]
-        var kp = _i32(keys_addr)[idx_p]
-        if (want_asc and ki > kp) or (not want_asc and ki < kp):
-            _i32(out_addr)[i]       = Int32(idx_p)
-            _i32(out_addr)[partner] = Int32(idx_i)
+        if i < padded_:
+            _u64(words_addr)[i] = _sort_word(keys_addr, i, n_, desc_)
+
+    @parameter
+    def tile_sort(words_addr: Int):
+        var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var base = Int(block_idx.x) * SORT_TILE
+        var t = tid
+        while t < SORT_TILE:
+            sh[t] = _u64(words_addr)[base + t]
+            t += BLOCK
+        barrier()
+        _sort_stages(sh, base, SORT_TILE, tid)
+        t = tid
+        while t < SORT_TILE:
+            _u64(words_addr)[base + t] = sh[t]
+            t += BLOCK
+
+    @parameter
+    def tile_merge(k_val: Int, words_addr: Int):
+        var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var base = Int(block_idx.x) * SORT_TILE
+        var t = tid
+        while t < SORT_TILE:
+            sh[t] = _u64(words_addr)[base + t]
+            t += BLOCK
+        barrier()
+        _merge_steps(sh, base, SORT_TILE, k_val, tid)
+        t = tid
+        while t < SORT_TILE:
+            _u64(words_addr)[base + t] = sh[t]
+            t += BLOCK
+
+    @parameter
+    def global_step(padded_: Int, k_val: Int, j_val: Int, words_addr: Int):
+        var p = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if p >= (padded_ >> 1): return
+        var i = _pair_index(p, j_val)
+        var a = _u64(words_addr)[i]
+        var b = _u64(words_addr)[i + j_val]
+        var asc = (i & k_val) == 0
+        if (asc and a > b) or (not asc and a < b):
+            _u64(words_addr)[i] = b
+            _u64(words_addr)[i + j_val] = a
+
+    @parameter
+    def extract(n_: Int, words_addr: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i < n_:
+            _i32(out_addr)[i] = Int32(Int(_u64(words_addr)[i] & UInt64(0xFFFFFFFF)))
 
     try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-        # Find next power of 2 >= n
-        var padded = 1
-        while padded < n:
-            padded *= 2
-        var k = 2
-        while k <= padded:
-            var j = k >> 1
-            while j > 0:
-                ctx.enqueue_function_experimental[bitonic_step](
-                    n, k, j, desc_flag,
-                    grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-                j >>= 1
-            k <<= 1
-        ctx.synchronize()
+        if n > 0:
+            var ctx = DeviceContext()
+            var padded = 2
+            while padded < n:
+                padded *= 2
+            if padded <= SORT_TILE:
+                ctx.enqueue_function_experimental[small_sort](
+                    n, padded, desc_flag, grid_dim=1, block_dim=BLOCK)
+            else:
+                var words = ctx.enqueue_create_buffer[DType.uint64](padded)
+                var w = Int(words.unsafe_ptr())
+                ctx.enqueue_function_experimental[init_words](
+                    n, padded, desc_flag, w,
+                    grid_dim=ceildiv(padded, BLOCK), block_dim=BLOCK)
+                ctx.enqueue_function_experimental[tile_sort](
+                    w, grid_dim=padded // SORT_TILE, block_dim=BLOCK)
+                var k = 2 * SORT_TILE
+                while k <= padded:
+                    var j = k >> 1
+                    while j >= SORT_TILE:
+                        ctx.enqueue_function_experimental[global_step](
+                            padded, k, j, w,
+                            grid_dim=ceildiv(padded >> 1, BLOCK), block_dim=BLOCK)
+                        j >>= 1
+                    ctx.enqueue_function_experimental[tile_merge](
+                        k, w, grid_dim=padded // SORT_TILE, block_dim=BLOCK)
+                    k <<= 1
+                ctx.enqueue_function_experimental[extract](
+                    n, w, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+                ctx.synchronize()
+                _ = words^          # keep the scratch alive until the kernels are done
+            ctx.synchronize()
+    except: pass
+
+# ── small device utilities used by the join / chaining wrappers ────────────
+@export
+def fill_i32_gpu(ptr_addr: Int, n: Int, value: Int) abi("C"):
+    @parameter
+    def kernel(n_: Int, v: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i < n_: _i32(ptr_addr)[i] = Int32(v)
+    try:
+        if n > 0:
+            var ctx = DeviceContext()
+            ctx.enqueue_function_experimental[kernel](
+                n, value, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.synchronize()
+    except: pass
+
+# out[0] = max(out[0], max(in[0..n))): the caller seeds out[0].
+@export
+def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C"):
+    @parameter
+    def kernel(n_: Int):
+        var shmem = stack_allocation[BLOCK, Scalar[DType.int32],
+            address_space=AddressSpace.SHARED]()
+        var tid = Int(thread_idx.x)
+        var m = Int32(-2147483648)
+        var i = Int(block_idx.x) * BLOCK + tid
+        var stride = Int(grid_dim.x) * BLOCK
+        while i < n_:
+            var v = _i32(in_addr)[i]
+            if v > m: m = v
+            i += stride
+        shmem[tid] = m
+        barrier()
+        var s = BLOCK >> 1
+        while s > 0:
+            if tid < s and shmem[tid + s] > shmem[tid]: shmem[tid] = shmem[tid + s]
+            barrier(); s = s >> 1
+        if tid == 0: _ = Atomic.max(_i32(out_addr), shmem[0])
+    try:
+        if n > 0:
+            var ctx = DeviceContext()
+            ctx.enqueue_function_experimental[kernel](
+                n, grid_dim=min(ceildiv(n, BLOCK), 1024), block_dim=BLOCK)
+            ctx.synchronize()
+    except: pass
+
+# out[i] = counts[i] > 0 ? sums[i] / counts[i] : 0
+@export
+def group_mean_finish_f32_gpu(out_addr: Int, sums_addr: Int, cnts_addr: Int, n: Int) abi("C"):
+    @parameter
+    def kernel(n_: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i < n_:
+            var c = _f32(cnts_addr)[i]
+            _f32(out_addr)[i] = _f32(sums_addr)[i] / c if c > 0.0 else Float32(0.0)
+    try:
+        if n > 0:
+            var ctx = DeviceContext()
+            ctx.enqueue_function_experimental[kernel](
+                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.synchronize()
+    except: pass
+
+# ── scan_i32: exclusive prefix sum ─────────────────────────────────────────
+# out[i] = sum(in[0..i)),  total_addr[0] = sum(in[0..n)).
+# Tiles of 1024 (256 threads x 4 items); the tile sums are scanned recursively.
+comptime SCAN_TILE: Int = 1024
+
+def _scan_tiles(
+    ctx: DeviceContext, out_addr: Int, in_addr: Int, sums_addr: Int, n: Int
+) raises:
+    @parameter
+    def kernel(n_: Int):
+        var sh = stack_allocation[BLOCK, Scalar[DType.int32],
+            address_space=AddressSpace.SHARED]()
+        var t = Int(thread_idx.x)
+        var base = Int(block_idx.x) * SCAN_TILE + t * 4
+        var x0 = Int32(0); var x1 = Int32(0); var x2 = Int32(0); var x3 = Int32(0)
+        if base + 0 < n_: x0 = _i32(in_addr)[base + 0]
+        if base + 1 < n_: x1 = _i32(in_addr)[base + 1]
+        if base + 2 < n_: x2 = _i32(in_addr)[base + 2]
+        if base + 3 < n_: x3 = _i32(in_addr)[base + 3]
+        var mine = x0 + x1 + x2 + x3
+        sh[t] = mine
+        barrier()
+        var off = 1
+        while off < BLOCK:
+            var add = Int32(0)
+            if t >= off: add = sh[t - off]
+            barrier()
+            sh[t] += add
+            barrier()
+            off <<= 1
+        var e = sh[t] - mine
+        if base + 0 < n_: _i32(out_addr)[base + 0] = e
+        if base + 1 < n_: _i32(out_addr)[base + 1] = e + x0
+        if base + 2 < n_: _i32(out_addr)[base + 2] = e + x0 + x1
+        if base + 3 < n_: _i32(out_addr)[base + 3] = e + x0 + x1 + x2
+        if t == BLOCK - 1: _i32(sums_addr)[Int(block_idx.x)] = sh[t]
+    ctx.enqueue_function_experimental[kernel](
+        n, grid_dim=ceildiv(n, SCAN_TILE), block_dim=BLOCK)
+
+def _scan_add_offsets(ctx: DeviceContext, out_addr: Int, offs_addr: Int, n: Int) raises:
+    @parameter
+    def kernel(n_: Int):
+        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+        if i < n_:
+            _i32(out_addr)[i] += _i32(offs_addr)[i // SCAN_TILE]
+    ctx.enqueue_function_experimental[kernel](
+        n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+
+def _scan_level(
+    ctx: DeviceContext, out_addr: Int, in_addr: Int, total_addr: Int, n: Int
+) raises:
+    var nb = ceildiv(n, SCAN_TILE)
+    if nb == 1:
+        _scan_tiles(ctx, out_addr, in_addr, total_addr, n)
+        return
+    var sums = ctx.enqueue_create_buffer[DType.int32](nb)
+    var offs = ctx.enqueue_create_buffer[DType.int32](nb)
+    var sums_addr = Int(sums.unsafe_ptr())
+    var offs_addr = Int(offs.unsafe_ptr())
+    _scan_tiles(ctx, out_addr, in_addr, sums_addr, n)
+    _scan_level(ctx, offs_addr, sums_addr, total_addr, nb)
+    _scan_add_offsets(ctx, out_addr, offs_addr, n)
+    ctx.synchronize()
+    _ = sums^                       # keep the scratch alive until the kernels are done
+    _ = offs^
+
+@export
+def scan_i32_gpu(out_addr: Int, in_addr: Int, total_addr: Int, n: Int) abi("C"):
+    try:
+        if n > 0:
+            var ctx = DeviceContext()
+            _scan_level(ctx, out_addr, in_addr, total_addr, n)
+            ctx.synchronize()
     except: pass
 
 # ── join_count_i32 ─────────────────────────────────────────────────────────# Two-pass GPU hash join — Phase 1: count right-key matches per left row.

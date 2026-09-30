@@ -140,6 +140,7 @@ class LazyFrame:
         self.plan = plan
         self._last_compile_provenance = None
         self._last_optimizer_trace = []
+        self.last_auto_decision = None
 
     def select(self, *exprs):
         """Select columns or compute new ones."""
@@ -180,19 +181,36 @@ class LazyFrame:
         verbose: bool = False,
         optimize: bool = True,
         validate: bool = True,
+        *,
+        prefer: Optional[str] = None,
+        placement: Optional[Dict[str, str]] = None,
+        gpu_fraction: Optional[float] = None,
+        strict: bool = False,
+        profile: bool = False,
     ) -> pa.Table:
         """Execute the logical plan and return the result.
 
         Args:
             device: "auto" (default), "cpu", or "gpu".
-                "auto" — use GPU when available and N > AUTO_GPU_THRESHOLD rows, else CPU.
+                "auto" — estimate the query on each device from this machine's
+                         calibration (`mx.calibrate()`), including copies over the
+                         CPU↔GPU link and GPU start-up, and run it on the cheaper one.
+                         A GPU error reruns the query on CPU (warning once per query shape).
                 "cpu"  — always run on CPU.
                 "gpu"  — run on GPU; raises RuntimeError if no GPU is available.
             verbose: if True, print compile/execute timing and cache status.
             optimize: if True (default), run logical plan optimization passes first.
             validate: if True (default), validate logical plan invariants before execution.
+            prefer: auto only; "gpu" or "cpu" biases the choice without forcing it.
+            placement: auto only; e.g. {"join": "gpu"}. Phase 1 places the whole
+                query: any "gpu" value runs the query on GPU, all "cpu" on CPU.
+            gpu_fraction: auto only; fixed GPU share of rows when a fused aggregate
+                co-processes on CPU and GPU (default: balanced from calibration).
+            strict: auto only; raise GPU errors instead of falling back to CPU.
+            profile: auto only; record the actual query time next to the estimate
+                (see `last_auto_decision`). Per-operator timings that refine the
+                calibration arrive with per-operator placement.
         """
-        from mxframe.custom_ops import CustomOpsCompiler
         from .io_parquet import resolve_plan
         source_plan = resolve_plan(self.plan)
         plan = source_plan
@@ -215,14 +233,49 @@ class LazyFrame:
                 for line in opt.trace:
                     print(f"  - {line}")
 
-        compiler = CustomOpsCompiler(device=device)
-        result = compiler.compile_and_run(
-            plan,
-            verbose=verbose,
-            optimizer_trace=optimizer_trace,
-        )
-        self._last_compile_provenance = dict(compiler.last_compile_provenance or {})
         self._last_optimizer_trace = list(optimizer_trace or [])
+        if device != "auto":
+            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace)
+            self._last_compile_provenance = prov
+            return result
+
+        from . import auto_mode as _am
+        import time as _t
+        decision = _am.choose_device(plan, prefer=prefer, placement=placement)
+        self.last_auto_decision = decision
+        if verbose:
+            print(decision.explain())
+        t0 = _t.perf_counter()
+        if decision.device == "gpu":
+            try:
+                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace)
+            except Exception as err:
+                if strict:
+                    raise
+                _am.remember_gpu_failure(plan)
+                if _am.is_sticky_gpu_error(err):
+                    _am.disable_gpu(f"{type(err).__name__}: {err}")
+                _am.warn_fallback_once(plan, err)
+                decision.device, decision.fallback = "cpu", True
+                result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
+        else:
+            # CPU plan: fused aggregates may still co-process with the GPU once their
+            # columns are resident there (see coproc_fused), and start that upload otherwise.
+            from . import coproc_fused as _cf
+            with _cf.deferred_background() as _bg:
+                if decision.estimate is not None and decision.gpu_available:
+                    # GPU start-up for later queries waits until this CPU query has returned.
+                    _bg.later(lambda: _am.get_gpu_warmup().start())
+                with _cf.policy(gpu_fraction=gpu_fraction), _cf.query_running():
+                    result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
+        if profile:
+            decision.actual_ms = (_t.perf_counter() - t0) * 1e3
+        prov = dict(prov)
+        if prov.get("coproc"):
+            decision.coproc = prov["coproc"]
+        prov["auto_device"] = decision.device
+        prov["auto_reason"] = decision.reason
+        self._last_compile_provenance = prov
         return result
 
     def explain(
@@ -230,6 +283,8 @@ class LazyFrame:
         optimized: bool = True,
         validate: bool = False,
         include_runtime: bool = False,
+        device: Optional[str] = None,
+        costs: bool = False,
     ) -> str:
         """Return a readable plan explanation.
 
@@ -237,6 +292,8 @@ class LazyFrame:
             optimized: if True (default), include optimizer pass trace and optimized plan.
             validate: if True, include validation summaries for shown plans.
             include_runtime: if True, include last compile provenance from compute().
+            device: "auto" adds the device decision (with `costs=True`, the
+                per-operator estimates on each device) without running the query.
         """
         from .io_parquet import resolve_plan
         trace = []
@@ -271,6 +328,12 @@ class LazyFrame:
                     lines.append(f"{k}={v}")
             else:
                 lines.append("none (run compute() first)")
+        if device == "auto":
+            from . import auto_mode as _am
+            decision = _am.choose_device(plan, quick=not costs)
+            text = decision.explain()
+            lines.append("AutoDecision")
+            lines.extend(text.splitlines() if costs else text.splitlines()[:1])
         return "\n".join(lines)
 
     @property
@@ -619,3 +682,11 @@ class _GPUGroupBy:
 
 
 
+
+
+def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None):
+    """Execute an already optimized plan on one device; returns (result, provenance)."""
+    from mxframe.custom_ops import CustomOpsCompiler
+    compiler = CustomOpsCompiler(device=device)
+    result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
+    return result, dict(compiler.last_compile_provenance or {})

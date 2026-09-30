@@ -11,21 +11,26 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
+import threading as _threading
 from pathlib import Path
-from max import engine, driver
-from max.graph import Graph, TensorType, ops
-from max.graph.type import DType, DeviceRef
+# MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
+from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
-    from .aot_kernels import AOTKernels, AOT_AVAILABLE, AOTKernelsGPU, GPU_AOT_AVAILABLE
+    from .aot_kernels import AOTKernels, AOT_AVAILABLE, AOTKernelsGPU, GPU_AOT_AVAILABLE, get_aot_gpu
 except Exception:
     AOT_AVAILABLE = False
     AOTKernels = None
     GPU_AOT_AVAILABLE = False
     AOTKernelsGPU = None
+    get_aot_gpu = lambda: None
+try:  # F-008 fused pipeline dispatch (AOT kernels; no JIT)
+    from .pipeline_exec import try_fused_aggregate
+except Exception:
+    try_fused_aggregate = None
 
 
 # %% ../nbs/04_custom_ops.ipynb 4
@@ -53,6 +58,100 @@ WARP_SIZE = 32
 MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
+
+# CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
+# float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
+_PRECISE = _threading.local()
+
+
+def _expr_col_names(expr, out=None) -> set:
+    """Names of every column an Expr tree reads."""
+    if out is None:
+        out = set()
+    if isinstance(expr, Expr):
+        if expr.op == "col":
+            out.add(expr.args[0])
+        else:
+            for a in expr.args:
+                _expr_col_names(a, out)
+    elif isinstance(expr, (list, tuple)):
+        for a in expr:
+            _expr_col_names(a, out)
+    return out
+
+
+_AOT_WARNED = False
+
+
+def _load_aot_kernels():
+    """AOTKernels(), or None (with one warning) if the library is missing/stale, so the
+    non-AOT path runs instead of every query failing."""
+    global _AOT_WARNED
+    if not AOT_AVAILABLE:
+        return None
+    try:
+        return AOTKernels()
+    except Exception as exc:                      # stale ABI, unloadable .so, ...
+        if not _AOT_WARNED:
+            _AOT_WARNED = True
+            import warnings
+            warnings.warn(f"mxframe: CPU AOT kernels disabled ({exc}); using the fallback path",
+                          RuntimeWarning, stacklevel=3)
+        return None
+
+
+# ── GPU acquisition (lazy) ───────────────────────────────────────────────────
+# Nothing here runs for device="cpu".  device="auto" starts a background warm-up (CUDA
+# context + GPU AOT library) and device="gpu" initialises on first use; both share the
+# one process-wide AOTKernelsGPU / CUDA driver (see aot_kernels.get_aot_gpu).
+_ACCELERATOR: Dict[str, Any] = {}
+_ACCEL_LOCK = _threading.Lock()
+
+
+def _process_gpu_warmup():
+    """The process-wide GpuWarmup (started on first call): CUDA context + GPU AOT library."""
+    from .auto_mode import get_gpu_warmup
+    return get_gpu_warmup()
+
+
+def _start_gpu_warmup() -> None:
+    """Begin GPU initialisation in the background (no-op without GPU AOT support)."""
+    if GPU_AOT_AVAILABLE:
+        _process_gpu_warmup()
+
+
+def _max_accelerator():
+    """The MAX ``Accelerator`` (created once per process), or None if there is no
+    MAX-compatible GPU.  Cheap after the first call."""
+    with _ACCEL_LOCK:
+        if "acc" not in _ACCELERATOR:
+            acc = None
+            try:
+                if driver.accelerator_count() > 0:
+                    from .compiler import _is_gpu_max_compatible
+                    cand = driver.Accelerator()
+                    acc = cand if _is_gpu_max_compatible(cand) else None
+            except Exception:
+                acc = None
+            _ACCELERATOR["acc"] = acc
+        return _ACCELERATOR["acc"]
+
+
+def _scan_rows(plan) -> int:
+    """Largest number of rows in any table the plan reads."""
+    best = 0
+    stack = [plan]
+    while stack:
+        p = stack.pop()
+        t = getattr(p, "table", None)
+        if t is not None and hasattr(t, "num_rows"):
+            best = max(best, t.num_rows)
+        for attr in ("input", "left", "right"):
+            child = getattr(p, attr, None)
+            if child is not None:
+                stack.append(child)
+    return best
+
 
 # ── Module-level caches ──────────────────────────────────────────────────────
 # Persist across CustomOpsCompiler instances so repeated .compute() calls
@@ -172,26 +271,63 @@ class CustomOpsCompiler(GraphCompiler):
         super().__init__(device=device)
         self.kernels_path = kernels_path or KERNELS_PATH
         self.last_compile_provenance = {}
-        # Reuse module-level cached session to avoid InferenceSession overhead
-        if GPU_AOT_AVAILABLE and self._session_device == "gpu":
-            self.session = None  # lazy: created on first MAX Graph call
-        else:
-            self.session = _get_or_create_session(self._session_device, self._driver_device)
-        self._aot = AOTKernels() if AOT_AVAILABLE else None
-        # GPU AOT init can fail at runtime even when the .so exists (e.g. no CUDA
-        # driver in a CPU-only CI runner). Fall back gracefully to CPU-only.
-        if GPU_AOT_AVAILABLE:
-            try:
-                self._aot_gpu = AOTKernelsGPU()
-            except Exception:
-                self._aot_gpu = None
-        else:
-            self._aot_gpu = None
+        self._aot = _load_aot_kernels()
+        self._aot_gpu_obj = None      # GPU AOT library: fetched on first GPU use, never for cpu
+        if self._device_arg == "auto":
+            # Speculative: initialise the GPU in the background so a query that turns out
+            # to need it finds it ready, and one that does not never waits for it.
+            _start_gpu_warmup()
+
+    def _create_session(self):
+        return _get_or_create_session(self._session_device, self._driver_device)
+
+    @property
+    def _aot_gpu(self):
+        """GPU AOT kernels, or None when this compiler is not on the GPU (or it has none).
+
+        Created lazily and shared process-wide; waits for the warm-up if that is running
+        rather than initialising a second time."""
+        if self._session_device != "gpu" or not GPU_AOT_AVAILABLE:
+            return None
+        if self._aot_gpu_obj is None:
+            warm = _process_gpu_warmup()           # starts it if nobody has; reused, never initialised twice
+            self._aot_gpu_obj = warm.result if warm.wait() else None
+        return self._aot_gpu_obj
+
+    @_aot_gpu.setter
+    def _aot_gpu(self, value):
+        self._aot_gpu_obj = value
+
+    def _resolve_auto(self, plan) -> None:
+        """device='auto': decide CPU vs GPU for this query before any operator runs.
+
+        Same rule as before (GPU when one is usable and the data exceeds
+        AUTO_GPU_THRESHOLD rows), but the GPU is only awaited when the query is big enough
+        to want it, so small queries never wait for -- or pay for -- GPU start-up."""
+        if not self._auto_pending:
+            return
+        self._auto_pending = False
+        if _scan_rows(plan) <= AUTO_GPU_THRESHOLD or not GPU_AOT_AVAILABLE:
+            return
+        warm = _process_gpu_warmup()
+        if not warm.wait():
+            return
+        acc = _max_accelerator()
+        if acc is None:
+            return
+        self._gpu_driver = acc
+        self._has_gpu = True
+        self._switch_to_gpu()
+
+    def _switch_to_gpu(self) -> None:
+        self._driver_device = self._gpu_driver
+        self._device_ref = DeviceRef.GPU(0)
+        self._session_device = "gpu"
+        self.session = None      # graph fallbacks build a session for the new device on demand
 
     def _maybe_switch_device(self, N: int) -> None:
         """For device='auto': re-evaluate CPU vs GPU based on row count.
 
-        Switches and re-creates the InferenceSession only when the decision changes.
         Threshold: N > AUTO_GPU_THRESHOLD and GPU available -> GPU, otherwise CPU.
         """
         if self._device_arg != "auto":
@@ -201,13 +337,12 @@ class CustomOpsCompiler(GraphCompiler):
         if want_gpu == have_gpu:
             return
         if want_gpu:
-            self._device_ref = DeviceRef.GPU(0)
-            self.session = _get_or_create_session("gpu", self._gpu_driver)
-            self._session_device = "gpu"
+            self._switch_to_gpu()
         else:
-            self._device_ref = DeviceRef.CPU()
-            self.session = _get_or_create_session("cpu", driver.CPU())
+            self._driver_device = None      # CPU handles are made on first use
+            self._device_ref = None
             self._session_device = "cpu"
+            self.session = None
 
     @staticmethod
     def _normalize_numeric_dtype(arr: np.ndarray) -> Union[np.ndarray, None]:
@@ -396,7 +531,8 @@ class CustomOpsCompiler(GraphCompiler):
             val = args[0]
             n = len(table)
             if isinstance(val, (int, float)):
-                return pa.array(np.full(n, val, dtype=np.float32))
+                return pa.array(np.full(
+                    n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return pa.array([val] * n)
         if op in ("add", "sub", "mul", "div"):
             lhs = self._eval_expr_arrow(args[0], table)
@@ -644,8 +780,8 @@ class CustomOpsCompiler(GraphCompiler):
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
     ) -> float:
         """Execute the masked_global_sum Mojo kernel and return a Python float."""
-        if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_sum_f32(arr_f32, mask_np)
+        if self._cpu_aot_fallback():
+            return self._aot.masked_global_sum(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_sum_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_sum_kernel", N, self._session_device)
@@ -688,8 +824,8 @@ class CustomOpsCompiler(GraphCompiler):
         allocation.  Faster than pc.multiply(full) + masked_sum for Q6-class
         queries with low selectivity.
         """
-        if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_sum_product_f32(a_f32, b_f32, mask_np)
+        if self._cpu_aot_fallback():
+            return self._aot.masked_global_sum_product(a_f32, b_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_sum_product_f32(a_f32, b_f32, mask_np)
         cache_key = ("_masked_global_sum_product_kernel", N, self._session_device)
@@ -728,8 +864,8 @@ class CustomOpsCompiler(GraphCompiler):
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
     ) -> float:
         """Execute the masked_global_min Mojo kernel and return a Python float."""
-        if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_min_f32(arr_f32, mask_np)
+        if self._cpu_aot_fallback():
+            return self._aot.masked_global_min(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_min_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_min_kernel", N, self._session_device)
@@ -766,8 +902,8 @@ class CustomOpsCompiler(GraphCompiler):
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
     ) -> float:
         """Execute the masked_global_max Mojo kernel and return a Python float."""
-        if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_max_f32(arr_f32, mask_np)
+        if self._cpu_aot_fallback():
+            return self._aot.masked_global_max(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_max_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_max_kernel", N, self._session_device)
@@ -803,9 +939,53 @@ class CustomOpsCompiler(GraphCompiler):
     @property
     def _session(self):
         """Lazy GPU session: created on first MAX Graph call (after AOT fast paths skip)."""
-        if self.session is None:
-            self.session = _get_or_create_session(self._session_device, self._driver_device)
         return self.session
+
+    def _cpu_aot_fallback(self) -> bool:
+        """Use the CPU AOT kernels: on the cpu device, or on the gpu device when the GPU AOT
+        library is unavailable (better than compiling a MAX Graph for host arrays)."""
+        if self._aot is None:
+            return False
+        return self._session_device == "cpu" or self._aot_gpu is None
+
+    def _cpu_aot_active(self) -> bool:
+        return self._session_device == "cpu" and self._aot is not None
+
+    def _eval_expr_f64(self, expr, table: pa.Table) -> np.ndarray:
+        """Evaluate a numeric expression with float32 columns widened to float64
+        (CPU aggregation path); returns a contiguous float64 ndarray."""
+        cols = {}
+        for name in _expr_col_names(expr):
+            c = table.column(name)
+            cols[name] = c.cast(pa.float64()) if pa.types.is_float32(c.type) else c
+        if not cols:
+            # literal-only expression: keep the row count so literals broadcast to every row
+            cols["__rows__"] = pa.array(np.zeros(table.num_rows, dtype=np.int8))
+        sub = pa.table(cols)
+        prev = getattr(_PRECISE, "on", False)
+        _PRECISE.on = True
+        try:
+            res = self._eval_expr_arrow(expr, sub)
+        finally:
+            _PRECISE.on = prev
+        return np.ascontiguousarray(res.to_numpy(zero_copy_only=False), dtype=np.float64)
+
+    def _get_col_agg(self, col_name: str, table: pa.Table) -> "Optional[np.ndarray]":
+        """Column as a contiguous array for an aggregation kernel.
+
+        GPU sessions: float32 (as before).  CPU AOT: float32 columns stay float32
+        (zero-copy; the kernels accumulate in float64), everything else is widened
+        to float64 instead of being squeezed down to float32."""
+        if not self._cpu_aot_active():
+            return self._get_col_as_f32(col_name, table)
+        arr = table.column(col_name)
+        if isinstance(arr, pa.ChunkedArray):
+            arr = arr.chunks[0] if len(arr.chunks) == 1 else arr.combine_chunks()
+        view = self._arrow_array_to_numpy_view(arr)
+        if view is None:
+            view = arr.to_numpy(zero_copy_only=False)
+        out = view if view.dtype == np.float32 else view.astype(np.float64, copy=False)
+        return out if out.flags["C_CONTIGUOUS"] else np.ascontiguousarray(out)
 
     def _get_col_as_f32(self, col_name: str, table: pa.Table) -> "Optional[np.ndarray]":
         """Get a column as a contiguous float32 numpy array, preferring zero-copy."""
@@ -918,7 +1098,7 @@ class CustomOpsCompiler(GraphCompiler):
                     # min/max only supported on simple single columns (not products)
                     if simple_col is None:
                         return None
-                    arr_f32 = self._get_col_as_f32(simple_col, table)
+                    arr_f32 = self._get_col_agg(simple_col, table)
                     if arr_f32 is None:
                         return None
                     if expr.op == "min":
@@ -931,15 +1111,15 @@ class CustomOpsCompiler(GraphCompiler):
                 if product_cols is not None:
                     # sum(col_a * col_b) — fused single-pass kernel, no alloc
                     col_a_name, col_b_name = product_cols
-                    a_f32 = self._get_col_as_f32(col_a_name, table)
-                    b_f32 = self._get_col_as_f32(col_b_name, table)
+                    a_f32 = self._get_col_agg(col_a_name, table)
+                    b_f32 = self._get_col_agg(col_b_name, table)
                     if a_f32 is None or b_f32 is None:
                         return None
                     sum_val = self._run_masked_global_sum_product(a_f32, b_f32, mask_np, N)
 
                 elif simple_col is not None:
                     # sum(col) — single-column masked sum
-                    arr_f32 = self._get_col_as_f32(simple_col, table)
+                    arr_f32 = self._get_col_agg(simple_col, table)
                     if arr_f32 is None:
                         return None
                     sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
@@ -948,10 +1128,13 @@ class CustomOpsCompiler(GraphCompiler):
                     # General expression path: evaluate inner with Arrow (handles
                     # a*(1-b), a*(1-b)*(1+c), case_when, startswith, isin, etc.),
                     # then SUM reduction on GPU via the masked_global_sum kernel.
-                    inner_arr = self._eval_expr_arrow(inner, table)
-                    arr_f32 = inner_arr.to_numpy(zero_copy_only=False).astype(np.float32)
-                    if not arr_f32.flags["C_CONTIGUOUS"]:
-                        arr_f32 = np.ascontiguousarray(arr_f32)
+                    if self._cpu_aot_active():
+                        arr_f32 = self._eval_expr_f64(inner, table)      # float64 end to end
+                    else:
+                        inner_arr = self._eval_expr_arrow(inner, table)
+                        arr_f32 = inner_arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                        if not arr_f32.flags["C_CONTIGUOUS"]:
+                            arr_f32 = np.ascontiguousarray(arr_f32)
                     sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
 
                 if expr.op == "sum":
@@ -1059,6 +1242,102 @@ class CustomOpsCompiler(GraphCompiler):
         optimizer_sig = tuple(optimizer_trace or ())
         return (plan_sig, input_sig, n_groups, self._session_device, optimizer_sig)
 
+    def _eval_group_key(self, expr, table: pa.Table):
+        """Evaluate a derived group key.  Integer arithmetic on integer columns stays integer
+        (the generic evaluator widens literals to float32, which would turn ``k*2+j`` keys
+        into floats and lose exactness above 2**24)."""
+        arr = self._eval_int_expr(expr, table)
+        return arr if arr is not None else self._eval_expr_arrow(expr, table)
+
+    def _eval_int_expr(self, expr, table: pa.Table):
+        """add/sub/mul over integer columns and Python-int literals, as an int array; else None."""
+        if expr.op == "col":
+            a = self._eval_expr_arrow(expr, table)
+            return a if pa.types.is_integer(a.type) else None
+        if expr.op == "lit":
+            return expr.args[0] if isinstance(expr.args[0], int) and not isinstance(expr.args[0], bool) else None
+        if expr.op in ("add", "sub", "mul") and len(expr.args) == 2:
+            l = self._eval_int_expr(expr.args[0], table)
+            r = self._eval_int_expr(expr.args[1], table)
+            if l is None or r is None or (isinstance(l, int) and isinstance(r, int)):
+                return None
+            fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply}[expr.op]
+            if isinstance(l, int):
+                l = pa.scalar(l, type=r.type)
+            if isinstance(r, int):
+                r = pa.scalar(r, type=l.type)
+            try:
+                return fn(l, r)
+            except pa.ArrowInvalid:            # overflow in the column's own width
+                wide = pa.int64()
+                return fn(l.cast(wide) if isinstance(l, pa.Array) else l,
+                          r.cast(wide) if isinstance(r, pa.Array) else r)
+        return None
+
+    @staticmethod
+    def _empty_grouped_result(agg_node, group_keys, unique_key_cols):
+        """Grouped aggregate over zero selected rows: no groups, right column names/types."""
+        agg_names = [e._alias or f"agg_{i}" for i, e in enumerate(agg_node.aggs)]
+        keys = [unique_key_cols[k].slice(0, 0) for k in group_keys]
+        aggs = [pa.array([], type=pa.float64()) for _ in agg_names]
+        return pa.Table.from_arrays(keys + aggs, names=list(group_keys) + agg_names)
+
+    _WINDOW_OPS = frozenset({"window", "row_number", "rank", "dense_rank"})
+
+    @classmethod
+    def _inline_project_into_aggregate(cls, plan):
+        """Inline every Project directly under a grouped Aggregate (chained ``with_columns``)."""
+        while True:
+            new = cls._inline_one_project(plan)
+            if new is plan:
+                return plan
+            plan = new
+
+    @classmethod
+    def _inline_one_project(cls, plan):
+        """``Aggregate(Project(x))`` -> ``Aggregate(x)`` with the projected expressions
+        substituted into the group keys / aggregate arguments.
+
+        The AOT aggregation kernels evaluate their arguments from the source columns, so a
+        ``with_columns(...)`` computed column feeding a grouped aggregate (TPC-H Q8) would
+        otherwise push the query onto the MAX Graph JIT path.  Left alone when the
+        Project holds window functions."""
+        if not (isinstance(plan, Aggregate) and plan.group_by and isinstance(plan.input, Project)):
+            return plan
+        proj = plan.input
+
+        def has_window(e):
+            if not isinstance(e, Expr):
+                return False
+            return e.op in cls._WINDOW_OPS or any(has_window(a) for a in e.args)
+
+        if any(has_window(e) for e in proj.exprs):
+            return plan
+        mapping = {}
+        for e in proj.exprs:
+            name = e._alias or (e.args[0] if e.op == "col" else None)
+            if name is None or (e.op == "col" and e.args[0] == name):
+                continue                      # pass-through column: the source table has it
+            mapping[name] = e
+
+        import copy
+
+        def subst(e, top=False):
+            if not isinstance(e, Expr):
+                if isinstance(e, list):
+                    return [subst(a) for a in e]
+                return e
+            if e.op == "col" and e.args[0] in mapping:
+                new = copy.copy(mapping[e.args[0]])       # refers to source columns only
+                new._alias = e.args[0] if top else None
+                return new
+            new = copy.copy(e)
+            new.args = tuple(subst(a) for a in e.args)
+            return new
+
+        return Aggregate(proj.input, [subst(e, top=True) for e in plan.group_by],
+                         [subst(e) for e in plan.aggs])
+
     @classmethod
     def _collect_predicates(cls, plan):
         """Collect all Filter predicates from the plan tree."""
@@ -1115,6 +1394,7 @@ class CustomOpsCompiler(GraphCompiler):
         7. Apply post-ops via Mojo kernels.
         """
         t0 = _time.perf_counter()
+        self._resolve_auto(plan)
 
         # Record whether the plan has Join nodes BEFORE materialising them.
         # Used below to emit an accurate 'join_mojo_shortcut' provenance label
@@ -1166,6 +1446,13 @@ class CustomOpsCompiler(GraphCompiler):
                 print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
             return result
 
+        # F-008 -- fused pipeline: filter + arithmetic + aggregates in one vectorized AOT pass
+        # (CPU or GPU), for grouped and global aggregate plans. None -> use the paths below.
+        if try_fused_aggregate is not None:
+            _fused = try_fused_aggregate(self, plan, having_pred, post_ops, optimizer_trace, t0)
+            if _fused is not None:
+                return _fused
+
         # 1b2 -- Global aggregate shortcut: bypass MAX Engine for un-grouped aggs.
         # For large tables with a filter, try the fused masked-kernel path first
         # (no table.filter() allocation). Fall back to PyArrow for unsupported ops.
@@ -1206,6 +1493,7 @@ class CustomOpsCompiler(GraphCompiler):
             return result
 
         # 1 -- Resolve plan, predicates, and decide execution path -----
+        plan = self._inline_project_into_aggregate(plan)
         original_scan = self._find_scan(plan)
         plan_clean = self._strip_filter_nodes(plan)
         predicates = self._collect_predicates(plan)
@@ -1262,14 +1550,22 @@ class CustomOpsCompiler(GraphCompiler):
                 # aggregation (group_sum / group_count kernels) still runs entirely in Mojo.
                 group_keys = []
                 _gk_table = original_scan.table
+                _gk_out = {}          # internal key column -> output name (alias that shadows a source column)
                 for _e in agg_node.group_by:
                     if _e.op == "col":
                         group_keys.append(_e.args[0])
                     else:
                         # Derived key (e.g. year(col("l_shipdate")).alias("l_year"))
                         _col_name = _e._alias or f"__gk_{len(group_keys)}__"
+                        if _col_name in _gk_table.column_names:
+                            # The alias shadows a source column (with_columns(k+10).alias("k")):
+                            # the key is the computed values, kept under an internal name so the
+                            # source column stays untouched for the aggregate arguments.
+                            _internal = f"__gk_{len(group_keys)}_{_col_name}__"
+                            _gk_out[_internal] = _col_name
+                            _col_name = _internal
                         if _col_name not in _gk_table.column_names:
-                            _arr = self._eval_expr_arrow(_e, _gk_table)
+                            _arr = self._eval_group_key(_e, _gk_table)
                             _gk_table = _gk_table.append_column(_col_name, _arr)
                         group_keys.append(_col_name)
                 if _gk_table is not original_scan.table:
@@ -1277,6 +1573,9 @@ class CustomOpsCompiler(GraphCompiler):
                 group_ids_full, n_groups, unique_key_cols = self._build_group_ids_cached(
                     original_scan.table, group_keys, gpu_compiler=self
                 )
+                if _gk_out:
+                    unique_key_cols = {_gk_out.get(k, k): v for k, v in unique_key_cols.items()}
+                    group_keys = [_gk_out.get(k, k) for k in group_keys]
 
             if use_gpu_filter:
                 # 4a -- GPU filter path: full arrays, no per-column CPU copy ----
@@ -1422,6 +1721,39 @@ class CustomOpsCompiler(GraphCompiler):
                     print(f"[mxframe] CPU AOT — {(t1-t0)*1000:.1f}ms")
                 return _aot_result
 
+
+        # 4.55 -- Empty input on the GPU device: nothing to upload (cuMemAlloc(0) fails and the
+        # MAX Graph fallback would JIT for it); the CPU kernels return the empty result.
+        # Also when the (GPU-path) filter mask selects no row: N is then the full row count.
+        _selects_nothing = mask_np_int32 is not None and not mask_np_int32.any()
+        if (self._session_device == "gpu" and (N == 0 or _selects_nothing) and self._aot is not None
+                and group_keys):
+            if _selects_nothing:
+                _aot_result = self._empty_grouped_result(
+                    self._find_aggregate(plan_clean), group_keys, unique_key_cols)
+            else:
+                _aot_result = self._execute_cpu_aot(
+                    plan_clean, col_arrays, extra_inputs, n_groups,
+                    group_keys, unique_key_cols,
+                    mask_np_int32=None,
+                )
+            if _aot_result is not None:
+                if having_pred is not None:
+                    _aot_result = _aot_result.filter(
+                        self._eval_predicate(having_pred, _aot_result)
+                    )
+                if post_ops:
+                    _aot_result = self._apply_post_ops_custom(_aot_result, post_ops)
+                self.last_compile_provenance = {
+                    "device": self._session_device, "rows": int(_aot_result.num_rows),
+                    "grouped": True, "n_groups": int(n_groups), "cache_hit": True,
+                    "compile_ms": 0.0,
+                    "execute_ms": round((_time.perf_counter() - t0) * 1000, 1),
+                    "gpu_input_path": "aot_ctypes",
+                    "optimizer_trace": list(optimizer_trace or []),
+                    "path": "cpu_aot",
+                }
+                return _aot_result
 
         # 4.6 -- GPU AOT fast path: bypass MAX Graph for grouped GPU aggs ------
         # Handles both unfiltered and filtered grouped queries.
@@ -1599,6 +1931,7 @@ class CustomOpsCompiler(GraphCompiler):
         Returns pa.Table on success, None to fall back to MAX Graph.
         """
         _aot = _aot_override if _aot_override is not None else self._aot
+        is_cpu = _aot_override is None      # CPU kernels: float64 accumulation, wider inputs
         agg_node = self._find_aggregate(plan_clean)
         if agg_node is None or not agg_node.group_by:
             return None
@@ -1660,7 +1993,8 @@ class CustomOpsCompiler(GraphCompiler):
             name = expr._alias or f"agg_{i}"
             try:
                 if expr.op == "count":
-                    res = _aot.group_count_f32(gids, n_groups)
+                    res = (_aot.group_count(gids, n_groups) if is_cpu
+                           else _aot.group_count_f32(gids, n_groups))
                     agg_names.append(name)
                     agg_arrays.append(pa.array(res.astype(np.float64)))
                     continue
@@ -1670,19 +2004,32 @@ class CustomOpsCompiler(GraphCompiler):
 
                 if mini_table is None:
                     return None
-                val_pa  = self._eval_expr_arrow(expr.args[0], mini_table)
-                vals_f32 = val_pa.to_numpy(zero_copy_only=False).astype(np.float32)
-                if not vals_f32.flags["C_CONTIGUOUS"]:
-                    vals_f32 = np.ascontiguousarray(vals_f32)
-
-                if expr.op == "sum":
-                    res = _aot.group_sum_f32(vals_f32, gids, n_groups)
-                elif expr.op == "min":
-                    res = _aot.group_min_f32(vals_f32, gids, n_groups)
-                elif expr.op == "max":
-                    res = _aot.group_max_f32(vals_f32, gids, n_groups)
-                else:  # mean
-                    res = _aot.group_mean_f32(vals_f32, gids, n_groups)
+                if is_cpu:
+                    if self._is_simple_col(expr.args[0]) is not None:
+                        # plain column: float32 stays float32 (zero-copy), kernels widen
+                        vals = self._eval_expr_arrow(expr.args[0], mini_table).to_numpy(
+                            zero_copy_only=False)
+                        if vals.dtype != np.float32:
+                            vals = vals.astype(np.float64, copy=False)
+                        vals = np.ascontiguousarray(vals)
+                    else:
+                        vals = self._eval_expr_f64(expr.args[0], mini_table)
+                    kern = {"sum": _aot.group_sum, "min": _aot.group_min,
+                            "max": _aot.group_max, "mean": _aot.group_mean}[expr.op]
+                    res = kern(vals, gids, n_groups)
+                else:
+                    val_pa  = self._eval_expr_arrow(expr.args[0], mini_table)
+                    vals_f32 = val_pa.to_numpy(zero_copy_only=False).astype(np.float32)
+                    if not vals_f32.flags["C_CONTIGUOUS"]:
+                        vals_f32 = np.ascontiguousarray(vals_f32)
+                    if expr.op == "sum":
+                        res = _aot.group_sum_f32(vals_f32, gids, n_groups)
+                    elif expr.op == "min":
+                        res = _aot.group_min_f32(vals_f32, gids, n_groups)
+                    elif expr.op == "max":
+                        res = _aot.group_max_f32(vals_f32, gids, n_groups)
+                    else:  # mean
+                        res = _aot.group_mean_f32(vals_f32, gids, n_groups)
 
                 agg_names.append(name)
                 agg_arrays.append(pa.array(res.astype(np.float64)))
@@ -1846,21 +2193,24 @@ class CustomOpsCompiler(GraphCompiler):
             raw_idx = enc.indices.to_numpy(zero_copy_only=False).astype(np.int32)
             per_col_ranks.append((rank_of[raw_idx], len(dict_arr)))
 
-        # Compute strides and build composite key
-        sizes = [n for _, n in per_col_ranks]
-        strides = []
-        for i in range(len(sizes)):
-            s = 1
-            for j in range(i + 1, len(sizes)):
-                s *= sizes[j]
-            strides.append(s)
-
-        composite = np.zeros(len(table), dtype=np.int32)
+        # Fold the per-column ranks (most significant first) into one int32 key.
+        # The mixed-radix value idx0*n1*n2 + idx1*n2 + idx2 can exceed int32 when the
+        # columns have many distinct values, so accumulate in int64 and, whenever the
+        # next column could overflow, renumber the running key by its dense rank
+        # (np.unique) which preserves order and is always < len(table).
+        composite = np.zeros(len(table), dtype=np.int64)
+        radix = 1                                   # exclusive upper bound of `composite`
         for i, (idx, n_unique) in enumerate(per_col_ranks):
             if descending[i]:
                 idx = np.int32(n_unique - 1) - idx
-            composite += idx * np.int32(strides[i])
-        return composite
+            if radix * n_unique >= 2**31:
+                composite = np.unique(composite, return_inverse=True)[1].astype(np.int64)
+                radix = int(composite.max()) + 1 if len(composite) else 1
+            composite = composite * n_unique + idx
+            radix *= n_unique
+        if radix >= 2**31:
+            composite = np.unique(composite, return_inverse=True)[1]
+        return composite.astype(np.int32)
 
     def _apply_sort_custom(self, table: pa.Table, sort_node: Sort, topk: int = None) -> pa.Table:
         """Sort an Arrow table by integer composite key.
@@ -1875,8 +2225,9 @@ class CustomOpsCompiler(GraphCompiler):
         N = len(composite_key)
         k = topk if topk is not None and topk < N else N
 
-        if self._session_device != "gpu":
-            # CPU fast path: numpy argsort, no graph compilation
+        if self._session_device != "gpu" or N == 0 or self._aot_gpu is None:
+            # CPU fast path: numpy argsort, no graph compilation (also for empty tables, where
+            # there is nothing to upload, and when the GPU AOT library is unavailable)
             if k < N:
                 # Partial sort: np.argpartition + sort of k elements
                 part_idx = np.argpartition(composite_key, k)[:k]
@@ -2215,7 +2566,7 @@ class CustomOpsCompiler(GraphCompiler):
             left_keys, right_keys = self._encode_join_key_pair(
                 left_table, right_table, left_on, right_on
             )
-            if self._session_device == "gpu":
+            if self._session_device == "gpu" and self._aot is None:
                 left_idx, right_idx = self._hash_join_left_mojo_gpu(left_keys, right_keys)
             else:
                 left_idx, right_idx = self._hash_join_left_mojo_cpu(left_keys, right_keys)
@@ -2232,7 +2583,8 @@ class CustomOpsCompiler(GraphCompiler):
         # Phase 4: AOT GPU path (no MAX Graph JIT, buffer caching, device-resident gather)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             left_idx, right_idx = self._aot_gpu.hash_join(left_keys, right_keys)
-        elif self._session_device == "gpu":
+        elif self._session_device == "gpu" and self._aot is None:
+            # last resort: MAX Graph join (JIT); with CPU AOT present, host arrays join there
             left_idx, right_idx = self._hash_join_mojo_gpu(left_keys, right_keys)
         else:
             left_idx, right_idx = self._hash_join_mojo_cpu(left_keys, right_keys)
@@ -2245,9 +2597,6 @@ class CustomOpsCompiler(GraphCompiler):
         if self._session_device == "gpu" and self._aot_gpu is not None and n_result > 0:
             left_take  = self._aot_gpu.gather_table(left_table,  left_idx)
             right_take = self._aot_gpu.gather_table(right_table, right_idx)
-        elif self._session_device == "gpu" and n_result > GPU_JOIN_THRESHOLD:
-            left_take = self._gpu_gather_table_np(left_table, left_idx, n_result)
-            right_take = self._gpu_gather_table_np(right_table, right_idx, n_result)
         else:
             left_take = left_table.take(pa.array(left_idx.astype(np.int64)))
             right_take = right_table.take(pa.array(right_idx.astype(np.int64)))
@@ -2344,9 +2693,14 @@ class CustomOpsCompiler(GraphCompiler):
         for col_name in left_table.column_names:
             arrays.append(left_take.column(col_name))
             names.append(col_name)
-        right_take = right_table.take(ri64)
+        empty_right = right_table.num_rows == 0
+        right_take = None if empty_right else right_table.take(ri64)
         for col_name in right_table.column_names:
             if col_name in right_on:
+                continue
+            if empty_right:                       # nothing to take from: every row is unmatched
+                arrays.append(pa.nulls(len(left_idx), type=right_table.schema.field(col_name).type))
+                names.append(col_name)
                 continue
             col_arr = right_take.column(col_name)
             if not has_match.all():
@@ -2365,8 +2719,8 @@ class CustomOpsCompiler(GraphCompiler):
         rk = np.ascontiguousarray(right_keys.astype(np.int32)) if n_right > 0 else np.array([], dtype=np.int32)
 
         if self._aot is not None:
-            mc = self._aot.join_count_left(lk, rk if n_right > 0 else np.zeros(1, dtype=np.int32))
-            lo, ro = self._aot.join_scatter_left(lk, rk if n_right > 0 else np.zeros(1, dtype=np.int32), mc)
+            mc = self._aot.join_count_left(lk, rk)
+            lo, ro = self._aot.join_scatter_left(lk, rk, mc)
             return lo, ro
         # Pass 1: count
         ck1 = ("join_count_left_cpu", n_left, n_right, self._session_device)
@@ -2766,7 +3120,7 @@ class CustomOpsCompiler(GraphCompiler):
         composite = np.zeros(len(table), dtype=np.int32)
         for i, enc in enumerate(encodings):
             idx = enc.indices.to_numpy(zero_copy_only=False)
-            composite += (idx * strides[i]).astype(np.int32)
+            composite += idx.astype(np.int32) * np.int32(strides[i])
 
         if max_groups <= 1024:
             present_mask = np.zeros(max_groups, dtype=bool)
@@ -2883,7 +3237,9 @@ class CustomOpsCompiler(GraphCompiler):
                 strides_i64 is an int64 numpy array of length 4.
         Returns: int64 numpy array of length n_rows.
         """
-        if self._session_device == "cpu" and self._aot is not None:
+        # Elementwise op on host arrays: the CPU AOT kernel is right on either device
+        # (no GPU round trip, no MAX Graph JIT).
+        if self._aot is not None:
             return self._aot.group_composite(k0, k1, k2, k3, strides_i64)
         n_rows = len(k0)
         cache_key = ("group_composite", n_rows, self._session_device)
@@ -2931,6 +3287,13 @@ class CustomOpsCompiler(GraphCompiler):
         if cached is not None:
             return cached
 
+        # Dictionary-encoded keys (F-015): ids straight from the Arrow code buffers.
+        from . import group_keys as _group_keys
+        result = _group_keys.build(table, keys)
+        if result is not None:
+            _GROUP_ENCODE_CACHE[cache_key] = result
+            return result
+
         # GPU single integer-key path: skip PyArrow dictionary_encode entirely
         if (gpu_compiler is not None
                 and gpu_compiler._session_device == "gpu"
@@ -2966,6 +3329,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         Returns (dense_ids, n_groups, unique_key_cols) or None on failure.
         """
+        if self._aot_gpu is None:       # no GPU AOT library: the caller encodes on the CPU (no MAX Graph JIT)
+            return None
         try:
             keys_np = col_arr.to_numpy(zero_copy_only=False).astype(np.int32)
             n = len(keys_np)

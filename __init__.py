@@ -45,6 +45,10 @@ def __getattr__(name: str):
         raise _runtime_import_error() from exc
 
 
+# CPU worker budget (env MXFRAME_CPU_THREADS, default all cores).  Pure ctypes/numpy import.
+from .aot_kernels import get_cpu_threads, set_cpu_threads
+
+
 def clear_cache() -> None:
     try:
         from .custom_ops import clear_cache as _clear_cache
@@ -62,6 +66,16 @@ except ImportError:
             "mxframe.sql requires the optional `sqlglot` dependency. "
             "Install with: pip install 'mxframe[sql]'"
         )
+
+
+def calibrate(full: bool = False, **kwargs):
+    """Measure this machine (link bandwidth, GPU init, per-kernel cost fits) and save it
+    to ~/.mxframe/calibration.json.  Quick mode takes < 30 s.  See `mxframe.calibration`.
+
+    Imported lazily so `import mxframe` stays fast.
+    """
+    from .calibration import calibrate as _calibrate
+    return _calibrate(full, **kwargs)
 
 
 def warmup(device: str = "auto") -> float:
@@ -160,7 +174,7 @@ __all__ = [
     # custom_ops
     "CustomOpsCompiler", "KERNELS_PATH",
     # caching
-    "clear_cache", "warmup",
+    "clear_cache", "warmup", "calibrate",
     # I/O
     "from_arrow", "from_pandas", "from_polars", "read_csv", "read_parquet",
     "scan_parquet", "read_parquet_table",

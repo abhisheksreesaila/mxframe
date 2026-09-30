@@ -18,3 +18,6 @@ TPCH_DATA = Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Pr
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: needs TPC-H Parquet data on disk / runs long")
+
+# Tests must never write observations into the user's real calibration file.
+os.environ.setdefault("MXFRAME_CALIBRATION", str(Path(tempfile.gettempdir()) / f"mxframe-test-calibration-{os.getpid()}.json"))

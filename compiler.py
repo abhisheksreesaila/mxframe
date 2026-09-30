@@ -10,9 +10,8 @@ from typing import Any, Dict, List, Union
 import pyarrow as pa
 import pyarrow.compute as pc
 import numpy as np
-from max import engine, driver
-from max.graph import Graph, TensorType, ops
-from max.graph.type import DType, DeviceRef
+# MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
+from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate
@@ -20,17 +19,17 @@ from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicat
 # %% ../nbs/03_compiler.ipynb 4
 # ── dtype helpers ────────────────────────────────────────────────────────
 
-_NP_TO_MAX = {
-    np.dtype("int32"):   DType.int32,
-    np.dtype("int64"):   DType.int64,
-    np.dtype("float32"): DType.float32,
-    np.dtype("float64"): DType.float64,
-    np.dtype("bool"):    DType.bool,
+_NP_TO_MAX_NAMES = {
+    np.dtype("int32"):   "int32",
+    np.dtype("int64"):   "int64",
+    np.dtype("float32"): "float32",
+    np.dtype("float64"): "float64",
+    np.dtype("bool"):    "bool",
 }
 
-def _max_dtype(arr) -> DType:
+def _max_dtype(arr):
     """Map a numpy dtype to the corresponding MAX DType."""
-    return _NP_TO_MAX.get(arr.dtype, DType.float32)
+    return getattr(DType, _NP_TO_MAX_NAMES.get(arr.dtype, "float32"))
 
 _PC_CMP_OPS = {
     "gt":  pc.greater,
@@ -46,16 +45,26 @@ _PC_CMP_OPS = {
 # Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
 _DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
 
-_CMP_OPS = {
-    "gt": ops.greater,
-    "ge": ops.greater_equal,
-    "lt": lambda a, b: ops.greater(b, a),
-    "le": lambda a, b: ops.greater_equal(b, a),
-    "eq": ops.equal,
-}
+class _LazyCmpOps:
+    """MAX comparison ops by name; ``ops`` is only touched when one is looked up."""
+    _KEYS = ("gt", "ge", "lt", "le", "eq")
+
+    def __contains__(self, op):
+        return op in self._KEYS
+
+    def __getitem__(self, op):
+        if op == "gt": return ops.greater
+        if op == "ge": return ops.greater_equal
+        if op == "lt": return lambda a, b: ops.greater(b, a)
+        if op == "le": return lambda a, b: ops.greater_equal(b, a)
+        if op == "eq": return ops.equal
+        raise KeyError(op)
 
 
-def _is_gpu_max_compatible(acc: driver.Accelerator) -> bool:
+_CMP_OPS = _LazyCmpOps()
+
+
+def _is_gpu_max_compatible(acc) -> bool:
     """Return True if MAX's GPU runtime supports this accelerator.
 
     MAX only supports certain datacenter GPUs (A10, A100, H100, etc.).
@@ -89,6 +98,7 @@ class GraphCompiler:
         # ── device resolution ────────────────────────────────────────────
         self._has_gpu = False
         self._gpu_driver = None
+        self._auto_pending = False
         resolved = device.lower()
         self._device_arg = resolved   # kept for subclass auto-switching
 
@@ -111,34 +121,54 @@ class GraphCompiler:
             self._has_gpu = True
             self._session_device = "gpu"
         elif resolved == "auto":
-            if driver.accelerator_count() > 0:
-                try:
-                    acc = driver.Accelerator()
-                    if _is_gpu_max_compatible(acc):
-                        self._gpu_driver = acc
-                        self._driver_device = self._gpu_driver
-                        self._device_ref = DeviceRef.GPU(0)
-                        self._has_gpu = True
-                        self._session_device = "gpu"
-                    else:
-                        # GPU present but not supported by MAX -- silently use CPU
-                        self._driver_device = driver.CPU()
-                        self._device_ref = DeviceRef.CPU()
-                        self._session_device = "cpu"
-                except Exception:
-                    self._driver_device = driver.CPU()
-                    self._device_ref = DeviceRef.CPU()
-                    self._session_device = "cpu"
-            else:
-                self._driver_device = driver.CPU()
-                self._device_ref = DeviceRef.CPU()
-                self._session_device = "cpu"
+            # Start on the CPU without touching the GPU; the subclass picks the GPU
+            # (waiting on the background warm-up) once it knows the query is big enough.
+            self._driver_device = None      # created on first use (see the properties below)
+            self._device_ref = None
+            self._session_device = "cpu"
+            self._auto_pending = True
         else:  # "cpu" or any unrecognised string
-            self._driver_device = driver.CPU()
-            self._device_ref = DeviceRef.CPU()
+            self._driver_device = None
+            self._device_ref = None
             self._session_device = "cpu"
 
-        self.session = engine.InferenceSession(devices=[self._driver_device])
+        self._session_obj = None     # MAX InferenceSession: created on first real graph load
+
+    # The CPU driver device and DeviceRef need the MAX import: made on first use only.
+    @property
+    def _driver_device(self):
+        if self._driver_device_v is None:
+            self._driver_device_v = driver.CPU()
+        return self._driver_device_v
+
+    @_driver_device.setter
+    def _driver_device(self, value):
+        self._driver_device_v = value
+
+    @property
+    def _device_ref(self):
+        if self._device_ref_v is None:
+            self._device_ref_v = DeviceRef.CPU()
+        return self._device_ref_v
+
+    @_device_ref.setter
+    def _device_ref(self, value):
+        self._device_ref_v = value
+
+    # A MAX InferenceSession is only needed by the graph (JIT) fallbacks; creating one
+    # eagerly costs start-up time on paths that never load a graph.
+    @property
+    def session(self):
+        if self._session_obj is None:
+            self._session_obj = self._create_session()
+        return self._session_obj
+
+    @session.setter
+    def session(self, value):
+        self._session_obj = value
+
+    def _create_session(self):
+        return engine.InferenceSession(devices=[self._driver_device])
 
     # ── Post-op extraction ───────────────────────────────────────────
     @classmethod
