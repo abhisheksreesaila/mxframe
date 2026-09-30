@@ -129,12 +129,12 @@ Needs: F-002 merged · Found by F-003 calibration (2026-09-30)
 - [x] GPU per-row cost measured with device-resident input is within 2x of memory bandwidth (calibrated today at 2–4 ms per million rows: slower than single-threaded CPU). Find where the time goes: per-call `DeviceContext()` creation, per-call upload/alloc in the Python wrappers, launch config
 - [x] GPU wrappers accept device pointers (residency / Router) as well as NumPy arrays
 
-## F-013 Calibration and masked-kernel refresh after F-012 [todo]
+## F-013 Calibration and masked-kernel refresh after F-012 [done]
 Needs: F-012 merged · Found by re-running calibration (2026-09-30)
-- [ ] GPU masked global aggregates (`masked_global_*_gpu`) at memory speed: 73 ms per 30M rows today vs 7 ms on CPU (same seq_cst/CAS atomics issue F-012 fixed for group ops?)
-- [ ] CPU `sort_topk` probe times the engine's new radix sort, not PyArrow (`sort_topk@cpu` estimates 2.2 s at 30M)
-- [ ] a `pipeline` probe on both devices (fused kernel, Q1-shaped program, resident input on GPU) so co-processing starts from measured fits, not defaults
-- [ ] `join_total@cpu` is not a separate fit (planner prices CPU joins with `join`)
+- [x] GPU masked global aggregates (`masked_global_*_gpu`) at memory speed: 73 ms per 30M rows today vs 7 ms on CPU (same seq_cst/CAS atomics issue F-012 fixed for group ops?)
+- [x] CPU `sort_topk` probe times the engine's new radix sort, not PyArrow (`sort_topk@cpu` estimates 2.2 s at 30M)
+- [x] a `pipeline` probe on both devices (fused kernel, Q1-shaped program, resident input on GPU) so co-processing starts from measured fits, not defaults
+- [x] `join_total@cpu` is not a separate fit (planner prices CPU joins with `join`)
 
 ## F-014 Engine uses the fast kernels it has [todo]
 Needs: F-011, F-013 merged · Found by F-013
