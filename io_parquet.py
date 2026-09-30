@@ -94,7 +94,7 @@ def read_parquet_table(path, columns: Optional[Sequence[str]] = None, filters=No
                          read_dictionary=dict_cols or None)
 
 
-def _read_file(path, columns, dict_cols, pushed=()) -> pa.Table:
+def _read_file(path, columns, dict_cols, pushed=(), mask_dict=()) -> pa.Table:
     """Read one Parquet file without ``pyarrow.dataset``.
 
     ``pq.read_table`` goes through ``pyarrow.dataset``, whose import pulls in
@@ -102,7 +102,9 @@ def _read_file(path, columns, dict_cols, pushed=()) -> pa.Table:
     without it. ``pushed`` simple filters skip row groups whose statistics rule
     them out and, for integer comparisons, drop non-matching rows right after
     each row group is decoded (see ``_read_groups``); rows are still filtered
-    exactly by the plan's Filter node.
+    exactly by the plan's Filter node.  String conjuncts are evaluated on dictionary codes: on the
+    ``dict_cols`` the caller wants back as dictionaries and on ``mask_dict`` columns, which are read
+    as dictionaries only to build the row mask and returned decoded.
     """
     import pyarrow.parquet as pq
     md = _metadata(path)
@@ -112,12 +114,12 @@ def _read_file(path, columns, dict_cols, pushed=()) -> pa.Table:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
     if groups is None:
         groups = list(range(md.num_row_groups))
-    rowwise = [p for p in pushed if _row_filterable(p, pf.schema_arrow)]
+    rowwise = [p for p in pushed if _row_filterable(p, pf.schema_arrow, tuple(dict_cols or ()) + tuple(mask_dict))]
     if (len(groups) >= 2 and rowwise and md.num_columns == len(pf.schema_arrow.names)
             and sum(md.row_group(g).num_rows for g in groups) >= MIN_ROWS_FOR_ROW_FILTER):
         need = _mask_needs(md, pf.schema_arrow.names, groups, rowwise)
         if any(need.values()) and _estimated_pass(md, pf.schema_arrow.names, need) < 0.6:
-            return _read_groups(path, md, pf.schema_arrow, columns, dict_cols, groups, need)
+            return _read_groups(path, md, pf.schema_arrow, columns, dict_cols, groups, need, mask_dict)
     if len(groups) == md.num_row_groups:
         return pf.read(columns=columns, use_threads=True)
     return pf.read_row_groups(groups, columns=columns, use_threads=True)
@@ -126,9 +128,13 @@ def _read_file(path, columns, dict_cols, pushed=()) -> pa.Table:
 _ROW_OPS = {"eq": "__eq__", "ne": "__ne__", "lt": "__lt__", "le": "__le__", "gt": "__gt__", "ge": "__ge__"}
 
 
-def _row_filterable(pushed_one, schema) -> bool:
+def _row_filterable(pushed_one, schema, dict_cols=()) -> bool:
+    """Integer comparisons/isin, and string ones on columns read as dictionaries (F-020)."""
     name, op, _ = pushed_one
-    return _kind(schema, name) == "int" and (op in _ROW_OPS or op == "isin")
+    if op not in _ROW_OPS and op != "isin":
+        return False
+    kind = _kind(schema, name)
+    return kind == "int" or (kind == "str" and name in (dict_cols or ()))
 
 
 def _mask_needs(md, names, groups, rowwise) -> dict:
@@ -169,6 +175,13 @@ def _estimated_pass(md, names, need) -> float:
             if st is None or not st.has_min_max:
                 continue
             lo, hi = st.min, st.max
+            if isinstance(value, str) or (op == "isin" and isinstance(next(iter(value), 0), str)):
+                # no value spread for strings: an equality keeps a modest share of a handful of values
+                if op == "eq":
+                    f *= 0.3
+                elif op == "isin":
+                    f *= min(1.0, 0.3 * len(value))
+                continue
             span = max(hi - lo + 1, 1)
             try:
                 if op == "eq":
@@ -218,6 +231,11 @@ def _row_mask(table, rowwise):
         c = table.column(name)
         if c.null_count:
             continue                       # nulls: leave the row-level decision to the Filter node
+        if _is_dict(c.type):
+            m = _dictionary_mask(c, op, value)
+            if m is not None:
+                mask = m if mask is None else (mask & m)
+            continue
         a = to_numpy(c)
         try:
             if op == "isin":
@@ -230,7 +248,26 @@ def _row_mask(table, rowwise):
     return mask
 
 
-def _read_groups(path, md, schema, columns, dict_cols, groups, need) -> pa.Table:
+def _dictionary_mask(col, op, value):
+    """Boolean NumPy mask of ``col <op> value`` on a dictionary column: compare each dictionary entry
+    once, then look the codes up (F-020).  None when the column is not a plain string dictionary."""
+    from .np_arrow import to_numpy
+    import numpy as np
+    arr = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+    if not isinstance(arr, pa.DictionaryArray) or arr.null_count or arr.dictionary.null_count:
+        return None
+    entries = arr.dictionary.to_pylist()
+    if op == "isin":
+        vals = set(value)
+        keep = [e in vals for e in entries]
+    else:
+        keep = [getattr(e, _ROW_OPS[op])(value) for e in entries]
+    if NotImplemented in keep:
+        return None
+    return np.asarray(keep, dtype=np.bool_)[to_numpy(arr.indices)]
+
+
+def _read_groups(path, md, schema, columns, dict_cols, groups, need, mask_dict=()) -> pa.Table:
     """Decode (row group, column) pieces on a thread pool, dropping rows as they are decoded.
 
     Stage 1 decodes the columns the pushed integer comparisons need, per row group, and turns
@@ -242,10 +279,13 @@ def _read_groups(path, md, schema, columns, dict_cols, groups, need) -> pa.Table
     import pyarrow.parquet as pq
     cols = list(columns) if columns else list(schema.names)
     rd = dict_cols or None
+    kept = set(dict_cols or ())
+    masked_as_dict = set(mask_dict) - kept
     src = pa.memory_map(path)              # one mapping shared by all readers: no per-group open/copy
 
-    def piece(g, name):
-        t = pq.ParquetFile(src, read_dictionary=rd, metadata=md).read_row_group(g, columns=[name], use_threads=False)
+    def piece(g, name, as_dict=False):
+        rdict = (list(rd or []) + [name]) if as_dict and name in masked_as_dict else rd
+        t = pq.ParquetFile(src, read_dictionary=rdict, metadata=md).read_row_group(g, columns=[name], use_threads=False)
         arrays = t.column(0).chunks
         return arrays[0] if len(arrays) == 1 else pa.concat_arrays(arrays)
 
@@ -255,7 +295,7 @@ def _read_groups(path, md, schema, columns, dict_cols, groups, need) -> pa.Table
 
     def stage1(g):
         names = list(dict.fromkeys(n for n, _, _ in need[g]))
-        tbl = pa.table([pa.chunked_array([piece(g, n)]) for n in names], names=names)
+        tbl = pa.table([pa.chunked_array([piece(g, n, True)]) for n in names], names=names)
         for n in names:
             have[(g, n)] = tbl.column(n).chunk(0)
         m = _row_mask(tbl, need[g])
@@ -270,7 +310,10 @@ def _read_groups(path, md, schema, columns, dict_cols, groups, need) -> pa.Table
         if arr is None:
             arr = piece(g, name)
         m = masks.get(g)
-        return arr if m is None else _take_array(arr, m)
+        out = arr if m is None else _take_array(arr, m)
+        if name in masked_as_dict and _is_dict(out.type):
+            out = out.cast(out.type.value_type)          # read as a dictionary only for the mask
+        return out
 
     tasks = [(g, n) for n in cols for g in groups]
     pieces = _parallel_map(stage2, tasks, workers)
@@ -637,6 +680,8 @@ def _kind(schema: pa.Schema, name: str) -> Optional[str]:
     if i < 0:
         return None
     t = schema.field(i).type
+    if pa.types.is_dictionary(t):            # a file opened with read_dictionary reports dictionary types
+        t = t.value_type
     if pa.types.is_integer(t):
         return "int"
     if pa.types.is_string(t) or pa.types.is_large_string(t):
@@ -690,12 +735,13 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
             cols = [n for n in names if n in info.refs] or names[:1]
         if not read:
             return dataclasses.replace(leaf, columns=tuple(cols), filters=pushed or None)
-        dict_cols = [n for n in dictionary_columns(leaf.path, leaf.schema, leaf.dictionary,
-                                                   leaf.max_dictionary_bytes, cols)
-                     if keepable(n, leaf)]
+        candidates = dictionary_columns(leaf.path, leaf.schema, leaf.dictionary,
+                                        leaf.max_dictionary_bytes, cols)
+        dict_cols = [n for n in candidates if keepable(n, leaf)]
+        mask_dict = [n for n in candidates if n not in dict_cols]
         import pyarrow.parquet as pq
         if os.path.isfile(leaf.path):
-            table = _read_file(leaf.path, cols, dict_cols, pushed or ())
+            table = _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict)
         else:
             table = pq.read_table(leaf.path, columns=cols,
                                   filters=_filters_expression(pushed) if pushed else None,
