@@ -162,7 +162,8 @@ def to_numpy(obj, zero_copy_only: bool = False, **kwargs):
             dt = _NP_OF.get(obj.type)
             if dt is not None and not kwargs:
                 return np.empty(0, dtype=dt)
-        if not kwargs and _NP_OF.get(obj.type) is not None and obj.null_count == 0:
+        if not kwargs and obj.num_chunks > 1 and _NP_OF.get(obj.type) is not None \
+                and obj.type != pa.date32() and obj.null_count == 0:
             return np.concatenate([to_numpy(c) for c in obj.chunks])
     if not isinstance(obj, pa.Array) or kwargs or obj.null_count:
         return obj.to_numpy(zero_copy_only=zero_copy_only, **kwargs) if isinstance(obj, (pa.Array, pa.ChunkedArray)) \

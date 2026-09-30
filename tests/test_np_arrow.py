@@ -145,13 +145,15 @@ def test_to_numpy_views_are_read_only():
     assert not out.flags.writeable
 
 
-@pytest.mark.parametrize("shape", ["over", "distinct", "date_lit"])
+@pytest.mark.parametrize("shape", ["over", "distinct", "date_lit", "with_columns", "when"])
 def test_more_shapes_do_not_import_pandas(shape):
     root = Path(__file__).resolve().parent
     q = {
         "over": 'LazyFrame(t).select(col("k"), col("v").sum().over("k").alias("w")).compute(device="cpu")',
         "distinct": 'LazyFrame(t).select(col("k"), col("d")).distinct().compute(device="cpu")',
         "date_lit": 'LazyFrame(t2).filter(col("dt") >= lit(datetime.date(1995, 1, 1))).groupby().agg(col("v").sum()).compute(device="cpu")',
+        "with_columns": 'LazyFrame(t).with_columns((col("v")*lit(2.0)+lit(1)).alias("z")).compute(device="cpu")',
+        "when": 'LazyFrame(t).select(col("k"), when(col("d") > lit(1), col("v"), lit(0.0)).alias("x")).compute(device="cpu")',
     }[shape]
     code = f"""import sys; sys.path.insert(0, {str(root)!r}); import conftest, datetime
 import numpy as np, pyarrow as pa
@@ -176,3 +178,8 @@ def test_distinct_matches_pyarrow_group_by_order_and_values():
     want = t.group_by(["a", "b"]).aggregate([])
     assert got.num_rows == want.num_rows
     assert sorted(zip(got["a"].to_pylist(), got["b"].to_pylist())) == sorted(zip(want["a"].to_pylist(), want["b"].to_pylist()))
+
+
+def test_empty_date32_chunked_array():
+    a = pa.chunked_array([], type=pa.date32())
+    assert to_numpy(a).dtype == a.to_numpy().dtype and len(to_numpy(a)) == 0
