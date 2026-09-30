@@ -1,5 +1,7 @@
 # User-felt TPC-H scoreboard - 2026-09-30
 
+> **Note (F-018 review):** Q2's harness query differs between the before and after runs: after, `scripts/tpch_user/q_mx.py` Q2 selects the columns the rest of the query reads. Harness narrowing alone takes SF10 mx-cpu Q2 from about 1,727 to about 600 ms; the join engine takes it from about 600 to 255 ms.
+
 **Headline = what a user feels:** a fresh Python process, data starting as Parquet on disk, the clock around *Parquet read + query + materialized result*. No warm-up. `import` time is reported separately (and summed in the "import + first" tables). Numbers are milliseconds; **bold** = fastest verified engine for that query.
 
 Legend: `†` float32 accumulation drift (result within 1e-2 relative of DuckDB, error shown but outside the strict 1e-6 check), `WRONG` = differs from DuckDB (rows/keys, relative error above 1e-2, or rows not in the query's ORDER BY order), `?` = **unchecked** (the DuckDB reference failed for that query, so the result was not verified; it never counts as fastest or as a win), `TIMEOUT` / `CRASH` / `ERR` = did not produce a result (timeout 300s per subprocess). `outside mx` = the mx engines do part of that query with PyArrow/NumPy because the LazyFrame API cannot express it (details under Query semantics); every other mx query is pure mxframe.

@@ -93,3 +93,14 @@ def test_pruning_keeps_what_a_select_at_the_top_returns():
     got = lf.select("k", "z").compute(device="cpu")
     assert got.column_names == ["k", "z"]
     assert _rows(got) == [(1, 2), (2, 3), (3, 4), (4, 5)]
+
+
+def test_pruning_below_a_join_keeps_the_right_suffix_names():
+    A = pa.table({"k": [1, 2, 3], "x": [10, 20, 30], "a": [7, 8, 9]})
+    B = pa.table({"k2": [1, 2, 2], "x": [100, 200, 201], "x_right": [5, 6, 7]})
+    q1 = (LazyFrame(A).select(col("k"), col("x"))
+          .join(LazyFrame(B).select(col("k2"), col("x")), left_on="k", right_on="k2").select(col("x_right")))
+    q2 = (LazyFrame(A).with_columns((col("a") + lit(1)).alias("b"))
+          .join(LazyFrame(B), left_on="k", right_on="k2").select(col("x_right2"), col("b")))
+    for q in (q1, q2):
+        assert q.compute(device="cpu").to_pydict() == q.compute(device="cpu", optimize=False).to_pydict()

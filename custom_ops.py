@@ -2888,7 +2888,12 @@ class CustomOpsCompiler(GraphCompiler):
             return a
         if pa.types.is_integer(a) and pa.types.is_integer(b):
             if pa.types.is_unsigned_integer(a) != pa.types.is_unsigned_integer(b):
-                return pa.int64() if max(a.bit_width, b.bit_width) < 64 else None
+                # a signed type that holds every value of both: uint32 with int64 -> int64, uint32 with
+                # int32 -> int64; uint64 with any signed integer has none and is refused
+                u, sg = (a, b) if pa.types.is_unsigned_integer(a) else (b, a)
+                if u.bit_width >= 64:
+                    return None
+                return sg if sg.bit_width > u.bit_width else {8: pa.int16(), 16: pa.int32(), 32: pa.int64()}[u.bit_width]
             return a if a.bit_width >= b.bit_width else b
         if pa.types.is_floating(a) and pa.types.is_floating(b):
             return a if a.bit_width >= b.bit_width else b

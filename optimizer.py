@@ -243,6 +243,10 @@ class PlanOptimizer:
                 if needed is None or lcols is None or rcols is None:
                     return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
                 mapping = join_output_names(lcols, rcols, node.right_on)
+                if set(lcols) & {c for c in rcols if c not in node.right_on}:
+                    # a name on both sides is renamed `<name>_right` from the columns present: dropping a
+                    # column below would change the names the parent reads
+                    return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
                 left_need = (needed & set(lcols)) | set(node.left_on)
                 right_need = {orig for orig, out in mapping if out in needed} | set(node.right_on)
                 return Join(walk(node.left, left_need), walk(node.right, right_need),

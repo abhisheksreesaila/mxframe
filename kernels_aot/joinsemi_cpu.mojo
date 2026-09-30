@@ -135,7 +135,8 @@ def mx_join_semi_select(
     for m in range(np_m):
         var c = Int(counts[m])
         if c > 0 and total != m * MORSEL:
-            memcpy(dest=out + total, src=out + m * MORSEL, count=c)
+            for i in range(c):                      # dest <= src and the ranges may overlap: copy forward
+                out[total + i] = out[m * MORSEL + i]
         total += c
     bits.free()
     ctr.free()
