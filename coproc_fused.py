@@ -21,6 +21,9 @@ columns live on the GPU. This module does both halves:
 A static split with one call per device beat a dynamic morsel queue here because
 each GPU call has a few ms of fixed cost. Residency is tied to the host table's
 lifetime (weakref), so freed memory can never alias a cached device copy.
+
+Uploads that do not fit the budget (e.g. while a larger entry is pinned by a
+running split) are skipped and retried after FAILED_RETRY_S (120 s).
 """
 
 from __future__ import annotations
@@ -223,36 +226,45 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
         def run():
             global _bytes, _inflight_bytes
             from . import pipeline_kernels as pk
-            reserved = False
-            try:
-                budget = _budget_bytes()
-                with _lock:
-                    unpinned = sum(e.nbytes for e in _cache.values() if e.users == 0)
-                    if _bytes - unpinned + _inflight_bytes + nbytes > budget:
-                        _failed[key] = time.monotonic()     # would not fit even after evicting: skip for a while
-                        return
-                    freeable = []
-                    for old in list(_cache):
-                        if _bytes + _inflight_bytes + nbytes <= budget:
-                            break
-                        e = _evict_locked(old)
-                        if e is not None:
-                            freeable.append(e)
-                    _inflight_bytes += nbytes
-                    reserved = True
-                for e in freeable:
-                    _free_entry(e)
-                dc = pk.upload_columns(prog, cc, gids, 0, n_rows)
-            except Exception:
-                with _lock:
-                    _failed[key] = time.monotonic()
-                return
-            finally:
+
+            def give_up(reserved: bool) -> None:
+                global _inflight_bytes
                 with _lock:
                     _inflight.pop(key, None)
                     if reserved:
                         _inflight_bytes -= nbytes
+                    _failed[key] = time.monotonic()
+
+            try:
+                budget = _budget_bytes()
+            except Exception:
+                give_up(False)
+                return
             with _lock:
+                unpinned = sum(e.nbytes for e in _cache.values() if e.users == 0)
+                if _bytes - unpinned + _inflight_bytes + nbytes > budget:
+                    # A pinned (in-use) or recent entry holds the budget: skip; retried after FAILED_RETRY_S.
+                    _inflight.pop(key, None)
+                    _failed[key] = time.monotonic()
+                    return
+                freeable = []
+                for old in list(_cache):
+                    if _bytes + _inflight_bytes + nbytes <= budget:
+                        break
+                    e = _evict_locked(old)
+                    if e is not None:
+                        freeable.append(e)
+                _inflight_bytes += nbytes
+            for e in freeable:
+                _free_entry(e)
+            try:
+                dc = pk.upload_columns(prog, cc, gids, 0, n_rows)
+            except Exception:
+                give_up(True)
+                return
+            with _lock:   # leave in-flight and enter the cache atomically: no duplicate upload can slip in
+                _inflight.pop(key, None)
+                _inflight_bytes -= nbytes
                 _cache[key] = _Entry(dc, nbytes, owners)
                 _bytes += nbytes
                 _failed.pop(key, None)

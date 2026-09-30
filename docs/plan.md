@@ -72,7 +72,8 @@ Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain ho
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
 
-## F-006 Router co-processing for grouped and global aggregates [review]
+## F-006 Router co-processing for grouped and global aggregates [done]
+Open for Abhishek: the two unticked items below are not achievable on PCIe x8 for host data (measured); keep them as future-hardware goals or drop them.
 Needs: F-002, F-003, F-005 · Files: `coproc.py` (new), hook in `custom_ops.py`
 Done so far: `auto_mode.Placer` (cpu/gpu/split cost decision), `coproc.run_router` (morsel queue, prepare/compute overlap, fallible GPU worker), `gpu_stream.DeviceStager` (pinned slots, async H2D), `residency.ResidencyTracker` (LRU GPU copies, pins).
 Physics on the reference box (measured 2026-09-29): GPU link is PCIe 4.0 **x8** — pinned H2D 13.4 GB/s, pageable 11 GB/s, stager ~9 GB/s; host DRAM (Ryzen 5900X, dual-channel DDR4) ~40–50 GB/s. So a scan-aggregate over host-resident data is ~4× faster on all CPU cores than shipping it to the GPU, and splitting a pure scan gains little (both devices read the same DRAM). The GPU earns its keep on (a) joins / high-cardinality group-bys (CPU latency-bound), (b) repeat queries over GPU-resident columns, (c) idle-link background upload of hot columns during CPU-bound queries so the next query finds them resident.
@@ -138,6 +139,7 @@ Needs: F-012 merged · Found by re-running calibration (2026-09-30)
 ## F-014 Engine uses the fast kernels it has [todo]
 Needs: F-011, F-013 merged · Found by F-013
 - [ ] CPU sort in `custom_ops._apply_sort_custom` uses `AOTKernels.sort_indices` (parallel radix, ~69 ms / 10M) instead of `np.argsort` / `argpartition`; `compiler.py` post-op sort likewise
+- [ ] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` is flaky on a shared GPU (fails ~1 in 3 even alone): find out whether it is memory pressure (cuMemAlloc 2) or a real ordering bug
 - [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
 
 ## F-015 Cold first query: 1.1 s vs 50 ms warm [todo]
