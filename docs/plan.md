@@ -70,7 +70,7 @@ Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain ho
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
 
-## F-006 Router co-processing for grouped and global aggregates [todo]
+## F-006 Router co-processing for grouped and global aggregates [doing]
 Needs: F-002, F-003, F-005 · Files: `coproc.py` (new), hook in `custom_ops.py`
 - [ ] large decomposable aggregations split into morsels pulled by CPU workers and a GPU worker from one queue; partial aggregates merged
 - [ ] GPU worker overlaps copy of morsel k+1 with compute of morsel k (2–3 staging buffers)
