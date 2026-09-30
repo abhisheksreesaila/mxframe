@@ -215,7 +215,9 @@ comptime OP_MIN: Int = 2
 comptime OP_MAX: Int = 3
 comptime SHARED_MAX_GROUPS: Int = 12288       # 48 KB of Float32 slots
 comptime SM_SHARED_BYTES: Int = 96 * 1024     # usable per SM on sm_80/86
-comptime MAX_BLOCKS_PER_SM: Int = 6           # 1536 threads / 256
+comptime MAX_BLOCKS_PER_SM: Int = 6           # global path: 1536 threads / 256
+comptime SHARED_BLOCKS_PER_SM: Int = 3        # shared path: more resident blocks made shared-memory
+                                              # float atomics contend (measured 1.5 ms vs 0.5 ms at 1000 groups)
 comptime GA_UNROLL: Int = 4
 
 @always_inline
@@ -335,7 +337,7 @@ def run_group[op: Int](
         var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
         if ng <= SHARED_MAX_GROUPS and n >= 4 * ng:
             var smem = ng * 4
-            var per_sm = max(1, min(MAX_BLOCKS_PER_SM, SM_SHARED_BYTES // (smem + 1024)))
+            var per_sm = max(1, min(SHARED_BLOCKS_PER_SM, SM_SHARED_BYTES // (smem + 1024)))
             # each block must cover >= ~2 rows per slot it flushes
             var blocks = max(1, min(sms * per_sm, n // (2 * ng)))
             blocks = min(blocks, ceildiv(n, BLOCK * GA_UNROLL))
