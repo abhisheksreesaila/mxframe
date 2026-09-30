@@ -191,7 +191,7 @@ def test_known_broken_gpu_op_keeps_query_on_cpu(monkeypatch):
 
 
 def test_gpu_sort_is_priced_now_that_it_is_fixed():
-    assert am.KNOWN_BROKEN_GPU == {}
+    assert "sort" not in am.KNOWN_BROKEN_GPU
     left, right = table(5000), table(5000)
     plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
     d = am.choose_device(plan, calib=Calib(join_cpu=5000.0, join_gpu=1.0), gpu=Gpu())
@@ -215,7 +215,8 @@ def test_join_output_rows_do_not_depend_on_side_order():
     assert a.lines[-1].rows == b.lines[-1].rows == 9000
 
 
-def test_global_agg_copies_the_unfiltered_input():
+def test_global_agg_copies_the_unfiltered_input(monkeypatch):
+    monkeypatch.setattr(am, "KNOWN_BROKEN_GPU", {})
     t = table(10_000)
     est = am.estimate_plan(LazyFrame(t).filter(col("d") > lit(3)).groupby().agg(col("v").sum().alias("s")).plan,
                            Calib(), Gpu())
@@ -252,3 +253,45 @@ def test_sticky_gpu_error_disables_gpu_for_the_process(monkeypatch):
 def test_no_gpu_explain_prints_na():
     d = am.choose_device(grouped(table(1000)), calib=Calib(has_gpu=False), gpu=Gpu(available=False))
     assert "gpu=n/a" in d.explain()
+
+
+def test_group_count_of_sorted_keys_is_not_undercounted():
+    n = 2_000_000
+    keys = np.repeat(np.arange(n // 4, dtype=np.int32), 4)       # sorted, 500K groups
+    t = pa.table({"k": keys, "v": np.ones(n, dtype=np.float32)})
+    est = am.estimate_plan(LazyFrame(t).groupby("k").agg(col("v").min().alias("m")).plan, Calib(), Gpu())
+    card = int(est.lines[0].note.split("~")[1].split(" ")[0].replace(",", ""))
+    assert card >= 250_000
+
+
+def test_placement_override_cannot_select_a_broken_gpu_path(monkeypatch):
+    monkeypatch.setitem(am.KNOWN_BROKEN_GPU, "sort", "pretend the GPU sort is broken")
+    left, right = table(5000), table(5000)
+    plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
+    d = am.choose_device(plan, calib=Calib(), gpu=Gpu(), placement={"join": "gpu"})
+    assert d.device == "cpu" and "unusable" in d.reason
+
+
+def test_only_device_errors_disable_the_gpu():
+    assert am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS"))
+    assert not am.is_sticky_gpu_error(MemoryError("x"))
+    assert not am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
+    assert not am.is_sticky_gpu_error(TypeError("unsupported dtype"))
+
+
+def test_gpu_global_agg_is_blocked_until_verified():
+    t = table(10_000)
+    plan = LazyFrame(t).filter(col("d") > lit(3)).groupby().agg(col("v").sum().alias("s")).plan
+    d = am.choose_device(plan, calib=Calib(cpu=1e4, gpu=0.001, link=1e6), gpu=Gpu())
+    assert d.device == "cpu" and "unusable" in d.reason
+
+
+def test_small_inputs_skip_calibration_entirely(monkeypatch):
+    import mxframe.calibration as cal
+
+    def boom():
+        raise AssertionError("calibration loaded for a tiny query")
+
+    monkeypatch.setattr(cal, "get_calibration", boom)
+    d = am.choose_device(grouped(table(1000)))
+    assert d.device == "cpu" and "small" in d.reason

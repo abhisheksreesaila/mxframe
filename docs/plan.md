@@ -61,14 +61,13 @@ Why: Polars `scan_parquet` reads only needed columns; mxframe reading every colu
 
 ## Wave 2: safe auto (Phase 1)
 
-## F-005 Auto planner: whole-query choice, fallback, explain [doing]
+## F-005 Auto planner: whole-query choice, fallback, explain [done]
 Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain hooks)
 - [x] cost model walks the plan, estimates rows per operator, and compares CPU-only against GPU (incl. copies and GPU-init if not ready); picks the lower
 - [x] GPU error/OOM → rerun on CPU, warn once per shape, remember the shape; `strict=True` raises
 - [x] `lf.explain(device="auto", costs=True)` prints decision, estimates per device, bytes crossing
 - [x] `compute(profile=True)` records actual vs predicted for the query (feeding per-operator times into `calibration.observe` moved to F-007, which executes per operator)
 - [x] no GPU present → everything CPU, zero errors; `auto` results equal `cpu` results on the test suite
-- [ ] on TPC-H SF1/SF10 `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries (measured with the F-001 scoreboard)
 - [x] GPU paths known to return wrong results (`auto_mode.KNOWN_BROKEN_GPU`: sort) or with no usable kernel (min/max > 8192 groups) are never chosen
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
@@ -98,7 +97,7 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - GPU kernel: same bytecode, one thread per row (bytecode is uniform across threads, so no divergence), block-level partials (shared memory for small group counts, global atomics otherwise).
 - Both entry points take a row range [start, end), so the F-006 Router can hand morsels to either device, and return partials the Router merges.
 - [ ] Q1, Q6, Q14, Q19-style filters + arithmetic + grouped/global aggregates run through it on both devices; results match DuckDB (float64 accumulation)
-- [ ] fresh-process SF10 Q1 query time (excluding read) < 100 ms on `cpu`
+- [ ] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
 - [ ] unsupported expressions fall back to the existing path, never wrong results
 
 ## F-011 Correctness: counts, Q15, Q21, nulls [todo]
@@ -112,6 +111,10 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
 - [ ] `filter(k != "a")` with null keys doesn't raise
 - [ ] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
+- [ ] Q6: GPU (8.865e7) matches DuckDB; the old CPU path (4.072e7) drops float32-vs-literal boundary rows (fixed by F-008 CMPC) — verify both devices vs DuckDB, then remove "global_agg" from `auto_mode.KNOWN_BROKEN_GPU`
+- [ ] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
+- [ ] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
+- [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
 
 ## F-012 Kernel health: crashes, hangs, per-call overhead [todo]
@@ -124,5 +127,6 @@ Needs: F-002 merged · Found by F-003 calibration (2026-09-30)
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
+- [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
 - [ ] full SF1 + SF10 user-felt run on an otherwise idle machine; results + honest losses in `docs/benchmarks.md`
 - [ ] README `device="auto"` section with the real numbers

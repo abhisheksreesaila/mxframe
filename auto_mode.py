@@ -317,7 +317,9 @@ class AutoDecision:
 
 # GPU paths that currently return wrong results; auto never picks the GPU for a
 # plan that would run them. Remove an entry once its fix lands (F-012 / F-011).
-KNOWN_BROKEN_GPU: dict = {}         # op -> reason; empty since F-012 fixed the GPU sort
+KNOWN_BROKEN_GPU = {
+    "global_agg": "GPU masked global aggregate returned 2x the CPU result on TPC-H Q6 (F-011)",
+}
 
 _AGG_OP = {"sum": "group_sum", "mean": "group_sum", "count": "group_count",
            "min": "group_min", "max": "group_max"}
@@ -373,9 +375,12 @@ def _key_card(name, tables, rows) -> int:
         column = t.column(name)
         if pa.types.is_dictionary(column.type):
             return max((len(ch.dictionary) for ch in column.chunks), default=1)
-        sample = column.slice(0, min(_SAMPLE_ROWS, len(column)))
-        if len(sample) == 0:
+        if len(column) == 0:
             return 1
+        # Strided, not a prefix: data is often sorted or clustered by the key.
+        import numpy as np
+        idx = np.unique(np.linspace(0, len(column) - 1, min(_SAMPLE_ROWS, len(column))).astype(np.int64))
+        sample = column.take(pa.array(idx))
         d = pc.count_distinct(sample).as_py()
         if d < 0.5 * len(sample):          # saturated: the sample saw (nearly) every value
             return max(1, d)
@@ -440,6 +445,9 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
             # Global aggregates run masked kernels over the unfiltered input.
             nbytes = src * (width + 4)
             cpu = len(ops) * calib.estimate("masked_sum", "cpu", src)
+            if "global_agg" in KNOWN_BROKEN_GPU:
+                est.lines.append(OpCost("global_agg", src, cpu, INF, note=KNOWN_BROKEN_GPU["global_agg"]))
+                return 1, ts, 1
             g = len(ops) * calib.estimate("masked_sum", "gpu", src) + h2d(nbytes)
             est.lines.append(OpCost("global_agg", src, cpu, g, nbytes))
             return 1, ts, 1
@@ -475,7 +483,9 @@ def disable_gpu(reason: str) -> None:
 
 def is_sticky_gpu_error(err: BaseException) -> bool:
     text = f"{type(err).__name__}: {err}"
-    return "OUT_OF_MEMORY" not in text and not isinstance(err, MemoryError)
+    if isinstance(err, MemoryError) or "OUT_OF_MEMORY" in text:
+        return False
+    return "CUDA_ERROR" in text or "cuda error" in text.lower()
 
 
 _failed_shapes: set = set()
@@ -514,8 +524,13 @@ def warn_fallback_once(plan, err: BaseException) -> None:
 
 
 def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
-                  placement: Optional[Dict[str, str]] = None) -> AutoDecision:
+                  placement: Optional[Dict[str, str]] = None, quick: bool = True) -> AutoDecision:
     """Pick cpu or gpu for the whole query (spec Phase 1)."""
+    if quick and calib is None and gpu is None and not placement and prefer != "gpu":
+        rows = _source_rows(plan)
+        if rows < SMALL_QUERY_ROWS:
+            return AutoDecision("cpu", f"small input ({rows:,} rows): gpu start-up and copies cannot pay off",
+                                None)
     if calib is None:
         from .calibration import get_calibration
         calib = get_calibration()
@@ -528,24 +543,35 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         return AutoDecision("cpu", f"gpu disabled after error: {_gpu_disabled}", est, gpu_available=False)
     if _shape_key(plan) in _failed_shapes:
         return AutoDecision("cpu", "this query shape failed on gpu before", est)
-    wanted = set((placement or {}).values())
-    if "gpu" in wanted:
-        return AutoDecision("gpu", "placement override", est, gpu.remaining_init_ms())
-    if wanted == {"cpu"}:
-        return AutoDecision("cpu", "placement override", est)
     init = gpu.remaining_init_ms()
-    cpu_ms, gpu_ms = est.cpu_ms, est.gpu_ms + init
-    margin = {"gpu": 0.0, "cpu": PREFER_CPU_MARGIN}.get(prefer, GPU_WIN_MARGIN)
     blocked = [l for l in est.lines if l.gpu_ms == float("inf")]
-    if blocked:
+    if blocked:   # checked before overrides: never run a GPU path known to be wrong or missing
         why = blocked[0].note or f"{blocked[0].op} has no usable gpu kernel"
         return AutoDecision("cpu", f"gpu path unusable: {why}", est, init)
+    wanted = set((placement or {}).values())
+    if "gpu" in wanted:
+        return AutoDecision("gpu", "placement override", est, init)
+    if wanted == {"cpu"}:
+        return AutoDecision("cpu", "placement override", est)
+    cpu_ms, gpu_ms = est.cpu_ms, est.gpu_ms + init
+    margin = {"gpu": 0.0, "cpu": PREFER_CPU_MARGIN}.get(prefer, GPU_WIN_MARGIN)
     if gpu_ms < cpu_ms * (1 - margin):
         return AutoDecision("gpu", "gpu faster incl. copies", est, init)
     if est.gpu_ms < cpu_ms * (1 - margin) and init > 0:
         return AutoDecision("cpu", "gpu faster but still starting up", est, init)
     return AutoDecision("cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster",
                         est, init)
+
+
+SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)
+
+
+def _source_rows(plan) -> int:
+    rows, _ = _scan_rows_and_schema(plan)
+    if rows is not None:
+        return rows
+    kids = [getattr(plan, a) for a in ("input", "left", "right") if getattr(plan, a, None) is not None]
+    return sum(_source_rows(k) for k in kids)
 
 
 class _NoGpu:
