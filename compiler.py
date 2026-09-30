@@ -89,6 +89,7 @@ class GraphCompiler:
         # ── device resolution ────────────────────────────────────────────
         self._has_gpu = False
         self._gpu_driver = None
+        self._auto_pending = False
         resolved = device.lower()
         self._device_arg = resolved   # kept for subclass auto-switching
 
@@ -111,34 +112,33 @@ class GraphCompiler:
             self._has_gpu = True
             self._session_device = "gpu"
         elif resolved == "auto":
-            if driver.accelerator_count() > 0:
-                try:
-                    acc = driver.Accelerator()
-                    if _is_gpu_max_compatible(acc):
-                        self._gpu_driver = acc
-                        self._driver_device = self._gpu_driver
-                        self._device_ref = DeviceRef.GPU(0)
-                        self._has_gpu = True
-                        self._session_device = "gpu"
-                    else:
-                        # GPU present but not supported by MAX -- silently use CPU
-                        self._driver_device = driver.CPU()
-                        self._device_ref = DeviceRef.CPU()
-                        self._session_device = "cpu"
-                except Exception:
-                    self._driver_device = driver.CPU()
-                    self._device_ref = DeviceRef.CPU()
-                    self._session_device = "cpu"
-            else:
-                self._driver_device = driver.CPU()
-                self._device_ref = DeviceRef.CPU()
-                self._session_device = "cpu"
+            # Start on the CPU without touching the GPU; the subclass picks the GPU
+            # (waiting on the background warm-up) once it knows the query is big enough.
+            self._driver_device = driver.CPU()
+            self._device_ref = DeviceRef.CPU()
+            self._session_device = "cpu"
+            self._auto_pending = True
         else:  # "cpu" or any unrecognised string
             self._driver_device = driver.CPU()
             self._device_ref = DeviceRef.CPU()
             self._session_device = "cpu"
 
-        self.session = engine.InferenceSession(devices=[self._driver_device])
+        self._session_obj = None     # MAX InferenceSession: created on first real graph load
+
+    # A MAX InferenceSession is only needed by the graph (JIT) fallbacks; creating one
+    # eagerly costs start-up time on paths that never load a graph.
+    @property
+    def session(self):
+        if self._session_obj is None:
+            self._session_obj = self._create_session()
+        return self._session_obj
+
+    @session.setter
+    def session(self, value):
+        self._session_obj = value
+
+    def _create_session(self):
+        return engine.InferenceSession(devices=[self._driver_device])
 
     # ── Post-op extraction ───────────────────────────────────────────
     @classmethod
