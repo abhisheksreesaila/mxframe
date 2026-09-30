@@ -14,3 +14,7 @@ if not _link.exists():
 sys.path.insert(0, str(_shim))
 
 TPCH_DATA = Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Projects/mxframe/data"))
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: needs TPC-H Parquet data on disk / runs long")

@@ -7,11 +7,14 @@ from .lazy_expr import Expr, col, lit, when, row_number
 
 # Lazy frame & logical plan
 from .lazy_frame import (
-    LogicalPlan, Scan, Filter, Project, Aggregate,
+    LogicalPlan, Scan, ParquetScan, Filter, Project, Aggregate,
     Sort, Limit, Distinct, Join,
     LazyFrame, LazyGroupBy, GPUFrame,
     DeviceType,
 )
+
+# Lazy Parquet source (pyarrow.parquet is imported only when a file is scanned)
+from .io_parquet import scan_parquet, read_parquet_table
 
 # Optimizer
 from .optimizer import PlanOptimizer, OptimizationResult, optimize_plan
@@ -145,7 +148,7 @@ __all__ = [
     # lazy_expr
     "Expr", "col", "lit", "when", "row_number",
     # lazy_frame
-    "LogicalPlan", "Scan", "Filter", "Project", "Aggregate",
+    "LogicalPlan", "Scan", "ParquetScan", "Filter", "Project", "Aggregate",
     "Sort", "Limit", "Distinct", "Join",
     "LazyFrame", "LazyGroupBy", "GPUFrame", "DeviceType",
     # compiler
@@ -160,6 +163,7 @@ __all__ = [
     "clear_cache", "warmup",
     # I/O
     "from_arrow", "from_pandas", "from_polars", "read_csv", "read_parquet",
+    "scan_parquet", "read_parquet_table",
     # SQL
     "sql",
 ]
