@@ -231,3 +231,284 @@ class GpuWarmup:
         self.start()
         self._done.wait(timeout)
         return self.ready
+
+
+# ── Whole-query choice (Phase 1) ─────────────────────────────────────────────
+#
+# Walks the plan once, estimating each operator's rows and its cost on each
+# path. Filters, projections and group-key encoding run on the host on either
+# path, so they cost the same on both; joins, aggregates and sorts differ.
+
+import logging
+import warnings
+
+_log = logging.getLogger("mxframe.auto")
+
+FILTER_SELECTIVITY = 0.3      # spec default until statistics exist
+JOIN_GPU_SAFETY = 1.15        # measured GPU join estimate runs 5-30% low under load (F-003 review)
+PREFER_CPU_MARGIN = 0.30      # prefer="cpu": the GPU must win by 30%
+DEFAULT_GROUPS = 1000
+
+
+@dataclass
+class OpCost:
+    op: str
+    rows: int
+    cpu_ms: float
+    gpu_ms: float
+    h2d_bytes: int = 0
+    note: str = ""
+
+    def line(self) -> str:
+        g = "n/a" if self.gpu_ms == float("inf") else f"{self.gpu_ms:.1f}ms"
+        note = f"  ({self.note})" if self.note else ""
+        return (f"  {self.op:<10} rows={self.rows:,} est cpu={self.cpu_ms:.1f}ms gpu={g}"
+                f" h2d={_fmt_bytes(self.h2d_bytes)}{note}")
+
+
+@dataclass
+class PlanEstimate:
+    lines: List[OpCost] = field(default_factory=list)
+
+    @property
+    def cpu_ms(self) -> float:
+        return sum(l.cpu_ms for l in self.lines)
+
+    @property
+    def gpu_ms(self) -> float:
+        return sum(min(l.gpu_ms, l.cpu_ms) if l.gpu_ms == float("inf") else l.gpu_ms for l in self.lines)
+
+    @property
+    def h2d_bytes(self) -> int:
+        return sum(l.h2d_bytes for l in self.lines)
+
+
+@dataclass
+class AutoDecision:
+    device: str
+    reason: str
+    estimate: Optional[PlanEstimate]
+    init_ms: float = 0.0
+    fallback: bool = False
+    actual_ms: Optional[float] = None
+
+    def explain(self) -> str:
+        head = f"auto -> {self.device}  reason: {self.reason}"
+        if self.fallback:
+            head += "  [fell back to cpu after a gpu error]"
+        if self.estimate is None:
+            return head
+        e = self.estimate
+        gpu_total = e.gpu_ms + self.init_ms
+        tail = f"  total est cpu={e.cpu_ms:.1f}ms gpu={gpu_total:.1f}ms"
+        if self.init_ms:
+            tail += f" (incl. gpu start-up {self.init_ms:.0f}ms)"
+        tail += f" h2d={_fmt_bytes(e.h2d_bytes)}"
+        if self.actual_ms is not None:
+            tail += f" actual={self.actual_ms:.1f}ms"
+        return "\n".join([head] + [l.line() for l in e.lines] + [tail])
+
+
+def _scan_rows_and_schema(plan):
+    from .lazy_frame import Scan, ParquetScan
+    if isinstance(plan, Scan):
+        return plan.table.num_rows, plan.table
+    if isinstance(plan, ParquetScan):
+        try:
+            import pyarrow.parquet as pq
+            return pq.ParquetFile(plan.path).metadata.num_rows, None
+        except Exception:
+            return 0, None
+    return None, None
+
+
+def _expr_cols(expr, out):
+    if getattr(expr, "op", None) == "col":
+        out.add(expr.args[0])
+    for a in getattr(expr, "args", ()):
+        if hasattr(a, "op"):
+            _expr_cols(a, out)
+    return out
+
+
+def _group_card(keys, table, rows) -> int:
+    """Estimated group count: dictionary sizes when known, else a guess."""
+    card = 1
+    for k in keys:
+        name = k.args[0] if getattr(k, "op", None) == "col" else None
+        c = None
+        if table is not None and name in (table.column_names if table is not None else []):
+            typ = table.schema.field(name).type
+            import pyarrow as pa
+            if pa.types.is_dictionary(typ):
+                chunks = table.column(name).chunks
+                c = max((len(ch.dictionary) for ch in chunks), default=1)
+            elif pa.types.is_string(typ) or pa.types.is_large_string(typ):
+                c = DEFAULT_GROUPS
+        if c is None:
+            c = max(1, rows // 4) if name else 64   # integer keys: many groups; derived keys (year): few
+        card *= c
+    return int(max(1, min(card, max(rows, 1))))
+
+
+def estimate_plan(plan, calib, gpu) -> PlanEstimate:
+    from .lazy_frame import Scan, ParquetScan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+    est = PlanEstimate()
+
+    def h2d(nbytes):
+        return calib.transfer_ms(nbytes, "h2d")
+
+    def walk(p):
+        """Returns (rows, a representative source table for schema lookups)."""
+        rows, table = _scan_rows_and_schema(p)
+        if rows is not None:
+            return rows, table
+        if isinstance(p, Filter):
+            n, t = walk(p.input)
+            c = calib.estimate("filter_take", "cpu", n)
+            est.lines.append(OpCost("filter", n, c, c, note="host on both paths"))
+            return max(1, int(n * FILTER_SELECTIVITY)), t
+        if isinstance(p, Join):
+            nl, tl = walk(p.left)
+            nr, _ = walk(p.right)
+            cpu = calib.estimate("join", "cpu", nl) + calib.estimate("join", "cpu", nr) * 0.2
+            nbytes = 4 * (nl + nr)
+            try:
+                g = calib.estimate_gpu_join_total(nl, nr) * JOIN_GPU_SAFETY
+            except Exception:
+                g = calib.estimate("join", "gpu", nl + nr)
+            est.lines.append(OpCost("join", nl, cpu, g + h2d(nbytes), nbytes))
+            return nl, tl
+        if isinstance(p, Aggregate):
+            n, t = walk(p.input)
+            cols = set()
+            for a in p.aggs:
+                _expr_cols(a, cols)
+            if p.group_by:
+                card = _group_card(p.group_by, t, n)
+                enc = calib.estimate("group_encode", "cpu", n)
+                k = max(1, len(p.aggs))
+                cpu = enc + k * calib.estimate("group_sum", "cpu", n, card=card)
+                nbytes = n * (4 + 4 * max(1, len(cols)))
+                g = enc + k * calib.estimate("group_sum", "gpu", n, card=card) + h2d(nbytes) \
+                    + calib.transfer_ms(card * 8 * k, "d2h")
+                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups"))
+                return card, t
+            k = max(1, len(p.aggs))
+            nbytes = n * 4 * max(1, len(cols))
+            cpu = k * calib.estimate("masked_sum", "cpu", n)
+            g = k * calib.estimate("masked_sum", "gpu", n) + h2d(nbytes)
+            est.lines.append(OpCost("global_agg", n, cpu, g, nbytes))
+            return 1, t
+        if isinstance(p, Sort):
+            n, t = walk(p.input)
+            if n > 1000:
+                nbytes = n * 4
+                est.lines.append(OpCost("sort", n, calib.estimate("sort_topk", "cpu", n),
+                                        calib.estimate("sort_topk", "gpu", n) + h2d(nbytes), nbytes))
+            return n, t
+        if isinstance(p, (Project, Limit, Distinct, Tail)):
+            n, t = walk(p.input)
+            if isinstance(p, (Limit, Tail)):
+                n = min(n, p.n)
+            return n, t
+        inner = getattr(p, "input", None)
+        return walk(inner) if inner is not None else (0, None)
+
+    walk(plan)
+    return est
+
+
+_failed_shapes: set = set()
+_warned_shapes: set = set()
+
+
+def _shape_key(plan):
+    try:
+        return plan.signature()
+    except Exception:
+        return None
+
+
+def remember_gpu_failure(plan) -> None:
+    k = _shape_key(plan)
+    if k is not None:
+        _failed_shapes.add(k)
+
+
+def forget_gpu_failures() -> None:
+    _failed_shapes.clear()
+    _warned_shapes.clear()
+
+
+def warn_fallback_once(plan, err: BaseException) -> None:
+    k = _shape_key(plan)
+    if k in _warned_shapes:
+        return
+    _warned_shapes.add(k)
+    warnings.warn(f"mxframe auto: GPU execution failed ({type(err).__name__}: {err}); "
+                  f"fell back to CPU. This query shape will plan CPU from now on.",
+                  RuntimeWarning, stacklevel=3)
+
+
+def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
+                  placement: Optional[Dict[str, str]] = None) -> AutoDecision:
+    """Pick cpu or gpu for the whole query (spec Phase 1)."""
+    if calib is None:
+        from .calibration import get_calibration
+        calib = get_calibration()
+    if gpu is None:
+        gpu = get_gpu_warmup(calib) if getattr(calib, "has_gpu", False) else _NO_GPU
+    est = estimate_plan(plan, calib, gpu)
+    if not gpu.available:
+        return AutoDecision("cpu", "no gpu", est)
+    if _shape_key(plan) in _failed_shapes:
+        return AutoDecision("cpu", "this query shape failed on gpu before", est)
+    wanted = set((placement or {}).values())
+    if "gpu" in wanted:
+        return AutoDecision("gpu", "placement override", est, gpu.remaining_init_ms())
+    if wanted == {"cpu"}:
+        return AutoDecision("cpu", "placement override", est)
+    init = gpu.remaining_init_ms()
+    cpu_ms, gpu_ms = est.cpu_ms, est.gpu_ms + init
+    margin = {"gpu": 0.0, "cpu": PREFER_CPU_MARGIN}.get(prefer, GPU_WIN_MARGIN)
+    if gpu_ms < cpu_ms * (1 - margin):
+        return AutoDecision("gpu", "gpu faster incl. copies", est, init)
+    if est.gpu_ms < cpu_ms * (1 - margin) and init > 0:
+        return AutoDecision("cpu", "gpu faster but still starting up", est, init)
+    return AutoDecision("cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster",
+                        est, init)
+
+
+class _NoGpu:
+    available = False
+    ready = False
+
+    def remaining_init_ms(self):
+        return float("inf")
+
+
+_NO_GPU = _NoGpu()
+_warmup: Optional[GpuWarmup] = None
+_warmup_lock = threading.Lock()
+
+
+def _init_gpu():
+    from .aot_kernels import AOTKernelsGPU
+    return AOTKernelsGPU()
+
+
+def get_gpu_warmup(calib=None) -> GpuWarmup:
+    """Process-wide GPU warm-up: CUDA context + GPU AOT library, started in the background."""
+    global _warmup
+    with _warmup_lock:
+        if _warmup is None:
+            expected = 250.0
+            if calib is not None:
+                try:
+                    expected = float(calib.gpu_init_cost_ms())
+                except Exception:
+                    pass
+            _warmup = GpuWarmup(_init_gpu, expected_ms=expected if expected != float("inf") else 250.0)
+            _warmup.start()
+        return _warmup

@@ -38,12 +38,12 @@ Needs: none · Files: `kernels_aot/kernels_aot.mojo`, `aot_kernels.py`, rebuilt 
 - [x] a thread-count knob (env `MXFRAME_CPU_THREADS`, default all cores) that later tickets can use to split cores between roles
 - [x] microbench before/after at 6M and 60M rows recorded in the commit message
 
-## F-003 Calibration store [todo]
+## F-003 Calibration store [done]
 Needs: none · Files: `calibration.py` (new), `tests/test_calibration.py`
-- [ ] `mx.calibrate()` (quick, < 30 s) measures H2D/D2H bandwidth (pageable + pinned where available), launch overhead, and `time = α + c·n` per kernel per device
-- [ ] saved to `~/.mxframe/calibration.json` (overridable via `MXFRAME_CALIBRATION`), keyed by device name + driver + MXFrame version, schema-versioned
-- [ ] missing / corrupt / stale file → safe built-in defaults, never a crash; no GPU → CPU-only calibration
-- [ ] `observe(op, device, rows, ms)` refines the fit online (HyPE-style)
+- [x] `mx.calibrate()` (quick, < 30 s) measures H2D/D2H bandwidth (pageable + pinned where available), launch overhead, and `time = α + c·n` per kernel per device
+- [x] saved to `~/.mxframe/calibration.json` (overridable via `MXFRAME_CALIBRATION`), keyed by device name + driver + MXFrame version, schema-versioned
+- [x] missing / corrupt / stale file → safe built-in defaults, never a crash; no GPU → CPU-only calibration
+- [x] `observe(op, device, rows, ms)` refines the fit online (HyPE-style)
 
 ## F-004 First-run cost: lazy GPU init, no JIT on hot paths [todo]
 Needs: F-002 merged (both touch `aot_kernels.py`) · Files: `custom_ops.py`, `aot_kernels.py`
