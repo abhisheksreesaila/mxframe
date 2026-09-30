@@ -20,3 +20,4 @@ Claude reads this at the start of each session. -->
 - 2026-09-30 · An operator above an Aggregate (Project, Filter, another Aggregate) or any Aggregate input that is not `Filter*(Scan)` must run on a materialized table (`_materialize_barrier`): the aggregate paths only look at the Scan under them and used to ignore what sat above or between. Add a fuzz seed (tests/test_f016_fuzz.py) when a new plan shape breaks.
 - 2026-09-30 · A numeric literal next to an array takes the array's type in arithmetic (`_arith_operands`): a float32 literal array turned `int + 2` into float32 and rounded `float64 + 0.1`.
 
+- 2026-09-30 · Every caller of AOTKernels.sort_indices (radix sort) must verify the result is a sorted permutation and fall back to np.argsort: one bad order was seen once and never explained, and F-020's group encoder skipped the check (review caught it).
