@@ -18,7 +18,7 @@ from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS
+from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
     from .aot_kernels import AOTKernels, AOT_AVAILABLE, AOTKernelsGPU, GPU_AOT_AVAILABLE, get_aot_gpu
@@ -514,6 +514,26 @@ class CustomOpsCompiler(GraphCompiler):
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
                    for a in expr.args)
 
+    def _cmp_operands(self, args, table):
+        """Operands of a comparison; a numeric literal next to a float32 column stays a scalar
+        of the column's precision (see ``_align_literals``) instead of a float array."""
+        def literal(e):
+            return e.args[0] if e.op == "lit" and _is_number(e.args[0]) else None
+        l_lit, r_lit = literal(args[0]), literal(args[1])
+        if l_lit is not None and r_lit is None:
+            rhs = self._eval_expr_arrow(args[1], table)
+            if isinstance(l_lit, int) and pa.types.is_integer(rhs.type):
+                return l_lit, rhs                       # exact: no float32 detour above 2**24
+            lhs, rhs = _align_literals(l_lit, rhs)
+            return (self._eval_expr_arrow(args[0], table) if lhs is l_lit else lhs), rhs
+        if r_lit is not None and l_lit is None:
+            lhs = self._eval_expr_arrow(args[0], table)
+            if isinstance(r_lit, int) and pa.types.is_integer(lhs.type):
+                return lhs, r_lit
+            lhs, rhs = _align_literals(lhs, r_lit)
+            return lhs, (self._eval_expr_arrow(args[1], table) if rhs is r_lit else rhs)
+        return self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table)
+
     def _eval_expr_arrow(self, expr, table):
         """Evaluate expr on an Arrow table, returning a pa.Array."""
         from .lazy_expr import Expr as _Expr
@@ -558,13 +578,12 @@ class CustomOpsCompiler(GraphCompiler):
                         if col_arr.null_count:
                             bool_mask &= col_arr.is_valid().to_numpy(zero_copy_only=False)
                     return pa.array(bool_mask, type=pa.bool_())
-            lhs = self._eval_expr_arrow(args[0], table)
-            rhs = self._eval_expr_arrow(args[1], table)
-            return _PC_CMP_OPS[op](lhs, rhs)
+            return _PC_CMP_OPS[op](*self._cmp_operands(args, table))
         if op in _PC_CMP_OPS:
-            lhs = self._eval_expr_arrow(args[0], table)
-            rhs = self._eval_expr_arrow(args[1], table)
-            return _PC_CMP_OPS[op](lhs, rhs)
+            if op in ("and", "or"):
+                return _PC_CMP_OPS[op](self._eval_expr_arrow(args[0], table),
+                                       self._eval_expr_arrow(args[1], table))
+            return _PC_CMP_OPS[op](*self._cmp_operands(args, table))
         if op == "not":
             return pc.invert(self._eval_expr_arrow(args[0], table))
         if op == "isin":

@@ -43,6 +43,26 @@ _PC_CMP_OPS = {
     "or":  pc.or_kleene,
 }
 
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _align_literals(lhs, rhs):
+    """A Python number compared with a float32 column becomes a float32 scalar.
+
+    Arrow would widen the column to float64 and compare it with the double nearest the
+    decimal literal, so `l_discount <= 0.07` dropped every row whose float32 value is the
+    float32 nearest 0.07 (it is 0.07000000029802322 > 0.07).  Comparing in the column's
+    own precision is what DuckDB does on DECIMAL and what NumPy 2 does."""
+    def is_f32(x):
+        return not _is_number(x) and hasattr(x, "type") and pa.types.is_float32(x.type)
+    if _is_number(rhs) and is_f32(lhs):
+        rhs = pa.scalar(rhs, pa.float32())
+    elif _is_number(lhs) and is_f32(rhs):
+        lhs = pa.scalar(lhs, pa.float32())
+    return lhs, rhs
+
+
 # Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
 _DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
 
@@ -233,6 +253,8 @@ class GraphCompiler:
         if op in _PC_CMP_OPS:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
+            if op not in ("and", "or"):
+                lhs, rhs = _align_literals(lhs, rhs)
             return _PC_CMP_OPS[op](lhs, rhs)
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))

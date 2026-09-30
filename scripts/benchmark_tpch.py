@@ -721,6 +721,18 @@ NATIONS = ["ALGERIA","ARGENTINA","BRAZIL","CANADA","EGYPT",
            "MOROCCO","MOZAMBIQUE","PERU","CHINA","ROMANIA",
            "SAUDI ARABIA","VIETNAM","RUSSIA","UNITED KINGDOM","UNITED STATES"]
 
+N_SYNTHETIC_SUPPLIERS = 1_000
+
+
+def make_synthetic_supplier(n_nations: int = 25, n_suppliers: int = N_SYNTHETIC_SUPPLIERS, seed: int = 5) -> pa.Table:
+    """Supplier table for the synthetic Q5 / Q8 data (their lineitem carries ``l_suppkey``)."""
+    rng = np.random.default_rng(seed)
+    return pa.table({
+        "s_suppkey":   pa.array(np.arange(1, n_suppliers + 1, dtype=np.int32)),
+        "s_nationkey": pa.array(rng.integers(0, n_nations, n_suppliers, dtype=np.int32)),
+    })
+
+
 def make_tpch_q5_tables(n_customers=15_000, n_orders=100_000, n_lineitem=400_000, seed=55):
     """Synthetic tables for Q5 (customer/orders/lineitem/nation)."""
     rng = np.random.default_rng(seed)
@@ -743,6 +755,7 @@ def make_tpch_q5_tables(n_customers=15_000, n_orders=100_000, n_lineitem=400_000
     })
     lineitem = pa.table({
         "l_orderkey":     pa.array(rng.integers(1, n_orders + 1, size=n_lineitem, dtype=np.int32)),
+        "l_suppkey":      pa.array(rng.integers(1, N_SYNTHETIC_SUPPLIERS + 1, size=n_lineitem, dtype=np.int32)),
         "l_extendedprice":pa.array(rng.uniform(900.0, 100000.0, size=n_lineitem).astype(np.float32)),
         "l_discount":     pa.array(rng.uniform(0.0, 0.10, size=n_lineitem).astype(np.float32)),
     })
@@ -782,32 +795,41 @@ def run_q5_mxframe(nation, customer, orders, lineitem, device="cpu", *, supplier
     )
 
 
-def run_q5_pandas(nation, customer, orders, lineitem) -> pd.DataFrame:
+def run_q5_pandas(nation, customer, orders, lineitem, *, supplier=None) -> pd.DataFrame:
+    if supplier is None:
+        raise TypeError("run_q5_pandas needs supplier=<supplier table>: TPC-H Q5 requires c_nationkey = s_nationkey")
     li = lineitem.to_pandas()
     o  = orders.to_pandas()
     c  = customer.to_pandas()
+    s  = supplier.to_pandas()
     n  = nation.to_pandas()
+    n  = n[n.n_regionkey == REGION_KEY_ASIA]
     o  = o[(o.o_orderdate >= _D(1994, 1, 1)) & (o.o_orderdate < _D(1995, 1, 1))]
     merged = li.merge(o, left_on="l_orderkey", right_on="o_orderkey")
     merged = merged.merge(c, left_on="o_custkey", right_on="c_custkey")
+    merged = merged.merge(s, left_on=["l_suppkey", "c_nationkey"], right_on=["s_suppkey", "s_nationkey"])
     merged = merged.merge(n, left_on="c_nationkey", right_on="n_nationkey")
     merged["revenue"] = merged.l_extendedprice * (1 - merged.l_discount)
     result = merged.groupby("n_name", as_index=False)["revenue"].sum()
     return result.sort_values("revenue", ascending=False).reset_index(drop=True)
 
 
-def run_q5_polars(nation, customer, orders, lineitem):
+def run_q5_polars(nation, customer, orders, lineitem, *, supplier=None):
     if not POLARS_AVAILABLE:
         return None
+    if supplier is None:
+        raise TypeError("run_q5_polars needs supplier=<supplier table>: TPC-H Q5 requires c_nationkey = s_nationkey")
     li = pl.from_arrow(lineitem)
     o  = pl.from_arrow(orders).filter(
         (pl.col("o_orderdate") >= _D(1994, 1, 1)) & (pl.col("o_orderdate") < _D(1995, 1, 1))
     )
     c  = pl.from_arrow(customer)
-    n  = pl.from_arrow(nation)
+    s  = pl.from_arrow(supplier)
+    n  = pl.from_arrow(nation).filter(pl.col("n_regionkey") == REGION_KEY_ASIA)
     return (
         li.join(o, left_on="l_orderkey", right_on="o_orderkey")
         .join(c, left_on="o_custkey", right_on="c_custkey")
+        .join(s, left_on=["l_suppkey", "c_nationkey"], right_on=["s_suppkey", "s_nationkey"])
         .join(n, left_on="c_nationkey", right_on="n_nationkey")
         .with_columns(
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("revenue")
@@ -1011,11 +1033,13 @@ def run_q7_pandas(nation, supplier, customer, orders, lineitem) -> pd.DataFrame:
     m  = m.merge(s, left_on="l_suppkey", right_on="s_suppkey")
     m  = m.merge(n.rename(columns={"n_nationkey":"s_nk","n_name":"supp_nation"}),
                  left_on="s_nationkey", right_on="s_nk")
-    m["l_year"] = _year_of_days(m["l_shipdate"])
+    m  = m[((m.supp_nation == "FRANCE") & (m.cust_nation == "GERMANY")) |
+           ((m.supp_nation == "GERMANY") & (m.cust_nation == "FRANCE"))]
+    m["l_year"] = _year_of_days(m["l_shipdate"]).astype("int32")
     m["volume"] = m.l_extendedprice * (1 - m.l_discount)
     return (m.groupby(["supp_nation","cust_nation","l_year"], as_index=False)["volume"]
              .sum().rename(columns={"volume":"revenue"})
-             .sort_values("supp_nation").reset_index(drop=True))
+             .sort_values(["supp_nation","cust_nation","l_year"]).reset_index(drop=True))
 
 
 def run_q7_polars(nation, supplier, customer, orders, lineitem):
@@ -1036,13 +1060,15 @@ def run_q7_polars(nation, supplier, customer, orders, lineitem):
         .join(s, left_on="l_suppkey", right_on="s_suppkey")
         .join(n.rename({"n_nationkey":"s_nk","n_name":"supp_nation"}),
               left_on="s_nationkey", right_on="s_nk")
+        .filter(((pl.col("supp_nation") == "FRANCE") & (pl.col("cust_nation") == "GERMANY")) |
+                ((pl.col("supp_nation") == "GERMANY") & (pl.col("cust_nation") == "FRANCE")))
         .with_columns([
-            pl.col("l_shipdate").cast(pl.Date).dt.year().alias("l_year"),
+            pl.col("l_shipdate").cast(pl.Date).dt.year().cast(pl.Int32).alias("l_year"),
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("volume"),
         ])
         .group_by(["supp_nation","cust_nation","l_year"])
         .agg(pl.col("volume").sum().alias("revenue"))
-        .sort("supp_nation")
+        .sort(["supp_nation", "cust_nation", "l_year"])
     )
 
 
@@ -1093,6 +1119,7 @@ def make_tpch_q8_tables(n_parts=5_000, n_cust=10_000, n_orders=80_000, n_li=200_
     lineitem = pa.table({
         "l_orderkey":      pa.array(rng.integers(1, n_orders + 1, n_li, dtype=np.int32)),
         "l_partkey":       pa.array(rng.integers(1, n_parts + 1, n_li, dtype=np.int32)),
+        "l_suppkey":       pa.array(rng.integers(1, N_SYNTHETIC_SUPPLIERS + 1, n_li, dtype=np.int32)),
         "l_extendedprice": pa.array(rng.uniform(900.0, 50000.0, n_li).astype(np.float32)),
         "l_discount":      pa.array(rng.uniform(0.0, 0.10, n_li).astype(np.float32)),
         "l_shipdate":      pa.array(shipdates),
@@ -1155,52 +1182,69 @@ def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu
     return result.append_column("mkt_share", pa.array(ms, type=pa.float64()))
 
 
-def run_q8_pandas(nation, region, part, customer, orders, lineitem) -> pd.DataFrame:
+def run_q8_pandas(nation, region, part, customer, orders, lineitem, *, supplier=None) -> pd.DataFrame:
+    if supplier is None:
+        raise TypeError("run_q8_pandas needs supplier=<supplier table>: TPC-H Q8 measures the supplier's nation")
     n  = nation.to_pandas()
+    r  = region.to_pandas()
     pt = part.to_pandas()
     c  = customer.to_pandas()
     o  = orders.to_pandas()
     li = lineitem.to_pandas()
-    n_am = n[n.n_regionkey == 1]
+    s  = supplier.to_pandas()[["s_suppkey", "s_nationkey"]]
+    america = r[r.r_name == "AMERICA"].r_regionkey
+    n_am = n[n.n_regionkey.isin(america)]
     c_am = c[c.c_nationkey.isin(n_am.n_nationkey)]
+    brazil_nk = n[n.n_name == "BRAZIL"].n_nationkey.iloc[0]
     pt_f = pt[pt.p_type == "ECONOMY ANODIZED STEEL"]
+    o = o[(o.o_orderdate >= Q8_DATE_LO) & (o.o_orderdate <= Q8_DATE_HI)]
     m = li.merge(pt_f, left_on="l_partkey", right_on="p_partkey")
     m = m.merge(o, left_on="l_orderkey", right_on="o_orderkey")
     m = m.merge(c_am, left_on="o_custkey", right_on="c_custkey")
-    m["o_year"] = _year_of_days(m.o_orderdate)
+    m = m.merge(s, left_on="l_suppkey", right_on="s_suppkey")
+    m["o_year"] = _year_of_days(m.o_orderdate).astype("int32")
     m["volume"] = m.l_extendedprice * (1 - m.l_discount)
-    m["brazil_vol"] = m.volume.where(m.c_nationkey == 2, 0.0)
-    r = m.groupby("o_year")[["volume","brazil_vol"]].sum().reset_index()
-    r["mkt_share"] = r.brazil_vol / r.volume
-    return r.sort_values("o_year").reset_index(drop=True)
+    m["brazil_vol"] = m.volume.where(m.s_nationkey == brazil_nk, 0.0)
+    g = m.groupby("o_year")[["volume","brazil_vol"]].sum().reset_index()
+    g = g.rename(columns={"volume": "total_vol", "brazil_vol": "brazil_vol_sum"})
+    g["mkt_share"] = g.brazil_vol_sum / g.total_vol
+    return g.sort_values("o_year").reset_index(drop=True)
 
 
-def run_q8_polars(nation, region, part, customer, orders, lineitem):
+def run_q8_polars(nation, region, part, customer, orders, lineitem, *, supplier=None):
     if not POLARS_AVAILABLE:
         return None
+    if supplier is None:
+        raise TypeError("run_q8_polars needs supplier=<supplier table>: TPC-H Q8 measures the supplier's nation")
     n  = pl.from_arrow(nation)
+    r  = pl.from_arrow(region)
     pt = pl.from_arrow(part)
     c  = pl.from_arrow(customer)
     o  = pl.from_arrow(orders)
     li = pl.from_arrow(lineitem)
-    n_am = n.filter(pl.col("n_regionkey") == 1)
+    s  = pl.from_arrow(supplier).select(["s_suppkey", "s_nationkey"])
+    america = r.filter(pl.col("r_name") == "AMERICA").select("r_regionkey")
+    n_am = n.join(america, left_on="n_regionkey", right_on="r_regionkey")
     c_am = c.join(n_am.select("n_nationkey"), left_on="c_nationkey", right_on="n_nationkey")
+    brazil_nk = n.filter(pl.col("n_name") == "BRAZIL")["n_nationkey"][0]
     pt_f = pt.filter(pl.col("p_type") == "ECONOMY ANODIZED STEEL")
+    o_f = o.filter((pl.col("o_orderdate") >= Q8_DATE_LO) & (pl.col("o_orderdate") <= Q8_DATE_HI))
     return (
         li.join(pt_f, left_on="l_partkey", right_on="p_partkey")
-        .join(o, left_on="l_orderkey", right_on="o_orderkey")
+        .join(o_f, left_on="l_orderkey", right_on="o_orderkey")
         .join(c_am, left_on="o_custkey", right_on="c_custkey")
+        .join(s, left_on="l_suppkey", right_on="s_suppkey")
         .with_columns([
-            pl.col("o_orderdate").cast(pl.Date).dt.year().alias("o_year"),
+            pl.col("o_orderdate").cast(pl.Date).dt.year().cast(pl.Int32).alias("o_year"),
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("volume"),
         ])
         .with_columns(
-            pl.when(pl.col("c_nationkey") == 2)
+            pl.when(pl.col("s_nationkey") == brazil_nk)
             .then(pl.col("volume")).otherwise(0.0).alias("brazil_vol")
         )
         .group_by("o_year")
-        .agg([pl.col("volume").sum(), pl.col("brazil_vol").sum()])
-        .with_columns((pl.col("brazil_vol") / pl.col("volume")).alias("mkt_share"))
+        .agg([pl.col("volume").sum().alias("total_vol"), pl.col("brazil_vol").sum().alias("brazil_vol_sum")])
+        .with_columns((pl.col("brazil_vol_sum") / pl.col("total_vol")).alias("mkt_share"))
         .sort("o_year")
     )
 
@@ -1215,9 +1259,12 @@ def make_tpch_q13_tables(n_customers=150_000, n_orders=600_000, seed=13):
     customer = pa.table({
         "c_custkey": pa.array(np.arange(1, n_customers + 1, dtype=np.int32)),
     })
+    comments = np.array(["carefully final deposits", "special requests detected",
+                         "quick packages sleep", "special packages, requests", "regular accounts"])
     orders = pa.table({
         "o_orderkey": pa.array(np.arange(1, n_orders + 1, dtype=np.int32)),
         "o_custkey":  pa.array(rng.integers(1, n_customers + 1, n_orders, dtype=np.int32)),
+        "o_comment":  pa.array(comments[rng.integers(0, len(comments), n_orders)]),
     })
     return customer, orders
 
@@ -1285,24 +1332,25 @@ def run_q13_mxframe(customer, orders, device="cpu") -> pa.Table:
 def run_q13_pandas(customer, orders) -> pd.DataFrame:
     c = customer.to_pandas()
     o = orders.to_pandas()
+    o = o[~o.o_comment.str.contains("special.*requests", regex=True)]
     m = c.merge(o, left_on="c_custkey", right_on="o_custkey", how="left")
     c_count = m.groupby("c_custkey", as_index=False)["o_orderkey"].count()
     c_count.rename(columns={"o_orderkey":"c_count"}, inplace=True)
     result = c_count.groupby("c_count", as_index=False)["c_custkey"].count()
     result.rename(columns={"c_custkey":"custdist"}, inplace=True)
-    return result.sort_values("custdist", ascending=False).reset_index(drop=True)
+    return result.sort_values(["custdist", "c_count"], ascending=False).reset_index(drop=True)
 
 
 def run_q13_polars(customer, orders):
     if not POLARS_AVAILABLE:
         return None
     c = pl.from_arrow(customer)
-    o = pl.from_arrow(orders)
+    o = pl.from_arrow(orders).filter(~pl.col("o_comment").str.contains("special.*requests"))
     return (
         c.join(o, left_on="c_custkey", right_on="o_custkey", how="left")
         .group_by("c_custkey").agg(pl.col("o_orderkey").count().alias("c_count"))
         .group_by("c_count").agg(pl.count("c_custkey").alias("custdist"))
-        .sort("custdist", descending=True)
+        .sort(["custdist", "c_count"], descending=True)
     )
 
 
@@ -1386,6 +1434,7 @@ def run_q19_mxframe(part, lineitem, device="cpu") -> pa.Table:
 
 def run_q19_pandas(part, lineitem) -> float:
     li = lineitem.to_pandas()
+    li = li[li.l_shipmode.isin(["AIR", "AIR REG"]) & (li.l_shipinstruct == "DELIVER IN PERSON")]
     pt = part.to_pandas()
     m  = li.merge(pt, left_on="l_partkey", right_on="p_partkey")
     cond = (
@@ -1403,7 +1452,8 @@ def run_q19_pandas(part, lineitem) -> float:
 def run_q19_polars(part, lineitem):
     if not POLARS_AVAILABLE:
         return None
-    li = pl.from_arrow(lineitem)
+    li = pl.from_arrow(lineitem).filter(
+        pl.col("l_shipmode").is_in(["AIR", "AIR REG"]) & (pl.col("l_shipinstruct") == "DELIVER IN PERSON"))
     pt = pl.from_arrow(part)
     m  = li.join(pt, left_on="l_partkey", right_on="p_partkey")
     return (
@@ -1762,6 +1812,7 @@ def make_tpch_q18_tables(n_customer=15_000, n_orders=60_000, n_lineitem=300_000,
     rng = np.random.default_rng(seed)
     customer = pa.table({
         "c_custkey": pa.array(np.arange(n_customer, dtype=np.int32)),
+        "c_name":    pa.array([f"Customer#{i:09d}" for i in range(n_customer)]),
     })
     orders = pa.table({
         "o_orderkey":   pa.array(np.arange(n_orders, dtype=np.int32)),
@@ -1804,13 +1855,12 @@ def run_q18_pandas(customer, orders, lineitem) -> pd.DataFrame:
     o  = orders.to_pandas()
     li = lineitem.to_pandas()
     qty_by_order = li.groupby("l_orderkey")["l_quantity"].sum().reset_index(name="sum_qty")
-    valid_keys = set(qty_by_order[qty_by_order.sum_qty > Q18_QTY_THRESHOLD].l_orderkey)
-    li_f = li[li.l_orderkey.isin(valid_keys)]
-    m = (li_f.merge(o, left_on="l_orderkey", right_on="o_orderkey")
-             .merge(c, left_on="o_custkey", right_on="c_custkey"))
-    return (m.groupby(["c_custkey","o_orderkey"])["l_quantity"].sum()
-             .reset_index(name="sum_qty")
-             .sort_values("sum_qty", ascending=False).head(100).reset_index(drop=True))
+    big = qty_by_order[qty_by_order.sum_qty > Q18_QTY_THRESHOLD]
+    m = (big.merge(o, left_on="l_orderkey", right_on="o_orderkey")
+            .merge(c, left_on="o_custkey", right_on="c_custkey"))
+    return (m[["c_name", "o_custkey", "l_orderkey", "o_orderdate", "o_totalprice", "sum_qty"]]
+             .sort_values(["o_totalprice", "o_orderdate"], ascending=[False, True])
+             .head(100).reset_index(drop=True))
 
 
 def run_q18_polars(customer, orders, lineitem):
@@ -1819,17 +1869,15 @@ def run_q18_polars(customer, orders, lineitem):
     c  = pl.from_arrow(customer)
     o  = pl.from_arrow(orders)
     li = pl.from_arrow(lineitem)
-    qty_by_order = (li.group_by("l_orderkey")
-                      .agg(pl.col("l_quantity").sum().alias("sum_qty"))
-                      .filter(pl.col("sum_qty") > Q18_QTY_THRESHOLD))
+    big = (li.group_by("l_orderkey")
+             .agg(pl.col("l_quantity").sum().alias("sum_qty"))
+             .filter(pl.col("sum_qty") > Q18_QTY_THRESHOLD))
     return (
-        li.join(qty_by_order.select("l_orderkey"), on="l_orderkey", how="semi")
-          .join(o, left_on="l_orderkey", right_on="o_orderkey")
-          .join(c, left_on="o_custkey",  right_on="c_custkey")
-          .group_by(["o_custkey","l_orderkey"])
-          .agg(pl.col("l_quantity").sum().alias("sum_qty"))
-          .sort("sum_qty", descending=True)
-          .head(100)
+        big.join(o, left_on="l_orderkey", right_on="o_orderkey")
+           .join(c, left_on="o_custkey", right_on="c_custkey")
+           .select(["c_name", "o_custkey", "l_orderkey", "o_orderdate", "o_totalprice", "sum_qty"])
+           .sort(["o_totalprice", "o_orderdate"], descending=[True, False])
+           .head(100)
     )
 
 
@@ -1919,7 +1967,7 @@ def run_q16_mxframe(part, supplier, partsupp, device="cpu") -> pa.Table:
 
 def run_q16_pandas(part, supplier, partsupp) -> pd.DataFrame:
     p, s, ps = part.to_pandas(), supplier.to_pandas(), partsupp.to_pandas()
-    ck = set(s[s.s_comment.str.contains("Complaints")]["s_suppkey"])
+    ck = set(s[s.s_comment.str.contains("Customer.*Complaints", regex=True)]["s_suppkey"])
     p_f = p[(p.p_brand != Q16_BRAND) & (~p.p_type.str.startswith(Q16_TYPE_PREFIX)) & (p.p_size.isin(Q16_SIZES))]
     j = ps.merge(p_f, left_on="ps_partkey", right_on="p_partkey")
     j = j[~j.ps_suppkey.isin(ck)]
@@ -1936,7 +1984,7 @@ def run_q16_polars(part, supplier, partsupp):
         (~pl.col("p_type").str.starts_with(Q16_TYPE_PREFIX)) &
         pl.col("p_size").is_in(Q16_SIZES))
     complaint_keys = (pl.from_arrow(supplier)
-                        .filter(pl.col("s_comment").str.contains("Complaints"))
+                        .filter(pl.col("s_comment").str.contains("Customer.*Complaints"))
                         .select("s_suppkey"))
     ps = pl.from_arrow(partsupp)
     # Join partsupp with part, then anti-join to remove complaint suppliers
@@ -2145,38 +2193,41 @@ def run_q2_mxframe(nation, region, part, supplier, partsupp, device="cpu") -> pa
 
 def run_q2_pandas(nation, region, part, supplier, partsupp) -> pd.DataFrame:
     n  = nation.to_pandas()
-    pt = part.to_pandas()
-    s  = supplier.to_pandas()
+    pt = _plain(part).to_pandas()
+    s  = _plain(supplier).to_pandas()
     ps = partsupp.to_pandas()
-    eu_nkeys = n[n.n_regionkey == Q2_REGION_KEY]["n_nationkey"].values
-    eu_sup = s[s.s_nationkey.isin(eu_nkeys)]
-    tgt_pts = pt[(pt.p_size == Q2_SIZE) & pt.p_type.str.contains(Q2_TYPE_SUFFIX, na=False)]
+    eu = n[n.n_regionkey == Q2_REGION_KEY][["n_nationkey", "n_name"]]
+    eu_sup = s.merge(eu, left_on="s_nationkey", right_on="n_nationkey")
+    tgt_pts = pt[(pt.p_size == Q2_SIZE) & pt.p_type.str.endswith(Q2_TYPE_SUFFIX)]
     m = (ps.merge(eu_sup, left_on="ps_suppkey", right_on="s_suppkey")
            .merge(tgt_pts, left_on="ps_partkey", right_on="p_partkey"))
     min_costs = m.groupby("ps_partkey")["ps_supplycost"].min().reset_index(name="min_supplycost")
     m2 = m.merge(min_costs, on="ps_partkey")
     r = m2[m2.ps_supplycost == m2.min_supplycost]
-    return (r[["s_acctbal","s_name","ps_partkey","p_mfgr","s_address","s_phone","s_comment"]]
-             .sort_values("s_acctbal", ascending=False).head(100).reset_index(drop=True))
+    return (r[["s_acctbal","s_name","n_name","p_partkey","p_mfgr","s_address","s_phone","s_comment"]]
+             .sort_values(["s_acctbal", "n_name", "s_name", "p_partkey"],
+                          ascending=[False, True, True, True])
+             .head(100).reset_index(drop=True))
 
 
 def run_q2_polars(nation, region, part, supplier, partsupp):
     if not POLARS_AVAILABLE:
         return None
     n  = pl.from_arrow(nation)
-    pt = pl.from_arrow(part)
-    s  = pl.from_arrow(supplier)
+    pt = pl.from_arrow(_plain(part))
+    s  = pl.from_arrow(_plain(supplier))
     ps = pl.from_arrow(partsupp)
-    eu_nkeys = n.filter(pl.col("n_regionkey") == Q2_REGION_KEY).select("n_nationkey")
-    eu_sup = s.join(eu_nkeys, left_on="s_nationkey", right_on="n_nationkey")
-    tgt_pts = pt.filter((pl.col("p_size") == Q2_SIZE) & pl.col("p_type").str.contains(Q2_TYPE_SUFFIX))
+    eu = n.filter(pl.col("n_regionkey") == Q2_REGION_KEY).select(["n_nationkey", "n_name"])
+    eu_sup = s.join(eu, left_on="s_nationkey", right_on="n_nationkey")
+    tgt_pts = pt.filter((pl.col("p_size") == Q2_SIZE) & pl.col("p_type").str.ends_with(Q2_TYPE_SUFFIX))
     m = (ps.join(eu_sup, left_on="ps_suppkey", right_on="s_suppkey")
            .join(tgt_pts, left_on="ps_partkey", right_on="p_partkey"))
     min_costs = m.group_by("ps_partkey").agg(pl.col("ps_supplycost").min().alias("min_supplycost"))
     return (m.join(min_costs, on="ps_partkey")
              .filter(pl.col("ps_supplycost") == pl.col("min_supplycost"))
-             .select(["s_acctbal","s_name","ps_partkey","p_mfgr","s_address","s_phone","s_comment"])
-             .sort("s_acctbal", descending=True)
+             .select(["s_acctbal","s_name","n_name",pl.col("ps_partkey").alias("p_partkey"),
+                      "p_mfgr","s_address","s_phone","s_comment"])
+             .sort(["s_acctbal", "n_name", "s_name", "p_partkey"], descending=[True, False, False, False])
              .head(100))
 
 
@@ -2405,7 +2456,7 @@ def run_q20_pandas(nation, part, supplier, partsupp, lineitem) -> pd.DataFrame:
     s  = supplier.to_pandas()
     ps = partsupp.to_pandas()
     li = lineitem.to_pandas()
-    forest_keys = set(pt[pt.p_name.str.contains(Q20_COLOR, na=False)].p_partkey)
+    forest_keys = set(pt[pt.p_name.str.startswith(Q20_COLOR, na=False)].p_partkey)
     canada_supp = s[s.s_nationkey == Q20_NATION_KEY]
     li_f = li[(li.l_shipdate >= Q20_DATE_LO) & (li.l_shipdate < Q20_DATE_HI) &
               li.l_partkey.isin(forest_keys)]
@@ -2421,7 +2472,7 @@ def run_q20_polars(nation, part, supplier, partsupp, lineitem):
     if not POLARS_AVAILABLE:
         return None
     n  = pl.from_arrow(nation)
-    pt = pl.from_arrow(part).filter(pl.col("p_name").str.contains(Q20_COLOR))
+    pt = pl.from_arrow(part).filter(pl.col("p_name").str.starts_with(Q20_COLOR))
     s  = pl.from_arrow(supplier).filter(pl.col("s_nationkey") == Q20_NATION_KEY)
     ps = pl.from_arrow(partsupp)
     li = (pl.from_arrow(lineitem)
@@ -2515,16 +2566,18 @@ def run_q21_pandas(nation, supplier, orders, lineitem) -> pd.DataFrame:
     li = lineitem.to_pandas()
     saudi_keys = set(s[s.s_nationkey == Q21_NATION_KEY].s_suppkey)
     f_keys = set(o[o.o_orderstatus == "F"].o_orderkey)
+    n_supp = li.groupby("l_orderkey")["l_suppkey"].nunique()
+    multi_keys = set(n_supp[n_supp >= 2].index)
     late = li[li.l_receiptdate > li.l_commitdate]
-    late_counts = (late.groupby("l_orderkey")["l_suppkey"].nunique()
-                       .reset_index(name="n_late"))
-    single_late_keys = set(late_counts[late_counts.n_late == 1].l_orderkey)
+    n_late = late.groupby("l_orderkey")["l_suppkey"].nunique()
+    single_late_keys = set(n_late[n_late == 1].index)
     q = late[(late.l_orderkey.isin(f_keys)) &
+             (late.l_orderkey.isin(multi_keys)) &
              (late.l_orderkey.isin(single_late_keys)) &
              (late.l_suppkey.isin(saudi_keys))]
     return (q.groupby("l_suppkey").size()
              .reset_index(name="numwait")
-             .sort_values("numwait", ascending=False)
+             .sort_values(["numwait", "l_suppkey"], ascending=[False, True])
              .head(100).reset_index(drop=True))
 
 
@@ -2534,11 +2587,14 @@ def run_q21_polars(nation, supplier, orders, lineitem):
     s  = pl.from_arrow(supplier).filter(pl.col("s_nationkey") == Q21_NATION_KEY)
     o  = pl.from_arrow(orders).filter(pl.col("o_orderstatus") == "F").select("o_orderkey")
     li = pl.from_arrow(lineitem)
+    multi = (li.group_by("l_orderkey").agg(pl.col("l_suppkey").n_unique().alias("n_supp"))
+               .filter(pl.col("n_supp") >= 2).select("l_orderkey"))
     late = li.filter(pl.col("l_receiptdate") > pl.col("l_commitdate"))
     single_late = (late.group_by("l_orderkey")
                        .agg(pl.col("l_suppkey").n_unique().alias("n_late"))
                        .filter(pl.col("n_late") == 1).select("l_orderkey"))
     return (late.join(o, left_on="l_orderkey", right_on="o_orderkey")
+                .join(multi, on="l_orderkey")
                 .join(single_late, on="l_orderkey")
                 .join(s.select("s_suppkey"), left_on="l_suppkey", right_on="s_suppkey")
                 .group_by("l_suppkey").agg(pl.len().alias("numwait"))
@@ -2942,6 +2998,7 @@ def main() -> None:
         q10_nation, q10_cust, q10_orders, q10_li = make_tpch_q10_tables(n_customers=15_000, n_orders=150_000*SCALE, n_lineitem=600_000*SCALE)
         q7_nation, q7_sup, q7_cust, q7_orders, q7_li = make_tpch_q7_tables(n_orders=80_000*SCALE, n_li=200_000*SCALE)
         q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li = make_tpch_q8_tables(n_orders=80_000*SCALE, n_li=200_000*SCALE)
+        q5_sup = q8_sup = make_synthetic_supplier(len(NATIONS))
         q13_cust, q13_orders = make_tpch_q13_tables(n_customers=150_000, n_orders=600_000*SCALE)
         q19_part, q19_li = make_tpch_q19_tables(n_lineitem=200_000*SCALE)
         print("done")
@@ -2950,25 +3007,25 @@ def main() -> None:
             f"Q5  (c={q5_cust.num_rows:,}  o={q5_orders.num_rows:,}"
             f"  l={q5_li.num_rows:,}  n=25)"
         )
-        ref_q5 = run_q5_pandas(q5_nation, q5_cust, q5_orders, q5_li)
+        ref_q5 = run_q5_pandas(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup)
         q5_rows = []
         q5_rows.append((
             "MXFrame CPU",
-            _stats(_time_cold(lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li), COLD)),
-            _stats(_time_runs( lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li), HOT, warmup=2)),
+            _stats(_time_cold(lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup), COLD)),
+            _stats(_time_runs( lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q5_rows.append((
                     "MXFrame GPU",
-                    _stats(_time_cold(lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, device="gpu"), COLD)),
-                    _stats(_time_runs( lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, device="gpu"), HOT, warmup=2)),
+                    _stats(_time_cold(lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup, device="gpu"), COLD)),
+                    _stats(_time_runs( lambda: run_q5_mxframe(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup, device="gpu"), HOT, warmup=2)),
                 ))
             except Exception as e:
                 print(f"  GPU Q5 skipped: {e}")
-        q5_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q5_pandas(q5_nation, q5_cust, q5_orders, q5_li), HOT, warmup=1))))
+        q5_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q5_pandas(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup), HOT, warmup=1))))
         if POLARS_AVAILABLE:
-            q5_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q5_polars(q5_nation, q5_cust, q5_orders, q5_li), HOT, warmup=2))))
+            q5_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q5_polars(q5_nation, q5_cust, q5_orders, q5_li, supplier=q5_sup), HOT, warmup=2))))
         _print_table("Q5", q5_rows)
         _summarize_relative(q5_rows)
 
@@ -3038,21 +3095,21 @@ def main() -> None:
         q8_rows = []
         q8_rows.append((
             "MXFrame CPU",
-            _stats(_time_cold(lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li), COLD)),
-            _stats(_time_runs( lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li), HOT, warmup=2)),
+            _stats(_time_cold(lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup), COLD)),
+            _stats(_time_runs( lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup), HOT, warmup=2)),
         ))
         if GPU_READY:
             try:
                 q8_rows.append((
                     "MXFrame GPU",
-                    _stats(_time_cold(lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, device="gpu"), COLD)),
-                    _stats(_time_runs( lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, device="gpu"), HOT, warmup=2)),
+                    _stats(_time_cold(lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup, device="gpu"), COLD)),
+                    _stats(_time_runs( lambda: run_q8_mxframe(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup, device="gpu"), HOT, warmup=2)),
                 ))
             except Exception as e:
                 print(f"  GPU Q8 skipped: {e}")
-        q8_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q8_pandas(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li), HOT, warmup=1))))
+        q8_rows.append(("Pandas", None, _stats(_time_runs(lambda: run_q8_pandas(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup), HOT, warmup=1))))
         if POLARS_AVAILABLE:
-            q8_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q8_polars(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li), HOT, warmup=2))))
+            q8_rows.append(("Polars", None, _stats(_time_runs(lambda: run_q8_polars(q8_nation, q8_region, q8_part, q8_cust, q8_orders, q8_li, supplier=q8_sup), HOT, warmup=2))))
         _print_table("Q8", q8_rows)
         _summarize_relative(q8_rows)
 

@@ -1,4 +1,5 @@
-"""F-011: every TPC-H query gives the same answer as DuckDB, on cpu, gpu and auto.
+"""F-011: every TPC-H query gives the same answer as DuckDB, on cpu, gpu and auto (and the
+pandas / Polars baseline versions at SF1).
 
 The reference is DuckDB running the official TPC-H SQL over the very same Parquet files
 (day-number dates and float32 decimals are turned back into DATE and DECIMAL(15,2) by
@@ -121,8 +122,12 @@ def _rows(t, sort_cols):
     return sorted(rows, key=lambda r: tuple("" if r[i] is None else str(r[i]) for i in sort_cols))
 
 
-def assert_matches_duckdb(got: pa.Table, want: pa.Table, meta: dict):
-    assert got.column_names == want.column_names, (got.column_names, want.column_names)
+def assert_matches_duckdb(got: pa.Table, want: pa.Table, meta: dict, check_names: bool = True):
+    if check_names:
+        assert got.column_names == want.column_names, (got.column_names, want.column_names)
+    else:
+        assert got.num_columns == want.num_columns, (got.column_names, want.column_names)
+        got = got.rename_columns(want.column_names)
     assert got.num_rows == want.num_rows, f"rows: got {got.num_rows}, DuckDB {want.num_rows}"
     for name in meta.get("int_cols", []):
         assert _is_int(got.schema.field(name).type), \
@@ -162,6 +167,30 @@ def test_float32_decimals_are_the_nearest_float32(sf):
     u = np.unique(d)
     nearest = np.round(u.astype(np.float64), 2).astype(np.float32)
     assert (u == nearest).all(), f"not the nearest float32: {u[u != nearest]}"
+
+
+# Polars sums float32 columns in float32: relative error 1e-4..1e-6 on sums of millions of rows.
+# A property of the engine, shown (not hidden) by the scoreboard, so it is expected here.
+POLARS_FLOAT32_SUMS = {1, 9}
+
+
+@pytest.mark.parametrize("engine", ["pandas", "polars"])
+@pytest.mark.parametrize("q", range(1, 23))
+def test_baseline_engine_matches_duckdb(engine, q, duck, tmp_path, request):
+    """The pandas and Polars versions in benchmark_tpch.py (the F-001 scoreboard's baselines)
+    express the same TPC-H queries: same answers as DuckDB at SF1."""
+    if not (SF_DIRS["1"] / "lineitem.parquet").exists():
+        pytest.skip("TPC-H SF1 data not present")
+    if engine == "polars":
+        pytest.importorskip("polars")
+        if q in POLARS_FLOAT32_SUMS:
+            request.applymarker(pytest.mark.xfail(strict=True, reason="Polars accumulates float32 sums in float32"))
+    want = reference(duck, "1", q)
+    got = run_mxframe("1", q, engine, tmp_path)
+    if q == 14:            # the baselines return the TPC-H ratio, mxframe the two sums it is made of
+        promo, total = want.column("promo_revenue")[0].as_py(), want.column("total_revenue")[0].as_py()
+        want = pa.table({"promo_revenue": [100.0 * promo / total]})
+    assert_matches_duckdb(got, want, ref.REFERENCE[q][1], check_names=False)
 
 
 # --- the comparison itself must be strict, or the gate means nothing -----------------------

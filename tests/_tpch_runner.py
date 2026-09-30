@@ -30,7 +30,7 @@ QUERIES = {
 
 # tables a query takes as keywords, beyond the positional ones above
 KEYWORD_TABLES = {5: ["supplier"], 8: ["supplier"]}
-SCALAR_NAME = {17: "avg_yearly"}
+SCALAR_NAME = {6: "revenue", 17: "avg_yearly", 19: "revenue"}
 
 
 def run_query(data_dir, q, device):
@@ -38,9 +38,18 @@ def run_query(data_dir, q, device):
     import mxframe as mx
     sys.path.insert(0, str(HERE.parent / "scripts"))
     import benchmark_tpch as bm
-    tables = [mx.read_parquet_table(Path(data_dir) / f"{n}.parquet") for n in QUERIES[q]]
-    extra = {n: mx.read_parquet_table(Path(data_dir) / f"{n}.parquet") for n in KEYWORD_TABLES.get(q, [])}
-    out = getattr(bm, f"run_q{q}_mxframe")(*tables, device=device, **extra)
+    dictionary = False if device in ("pandas", "polars") else "auto"   # baselines get plain strings
+    tables = [mx.read_parquet_table(Path(data_dir) / f"{n}.parquet", dictionary=dictionary) for n in QUERIES[q]]
+    extra = {n: mx.read_parquet_table(Path(data_dir) / f"{n}.parquet", dictionary=dictionary)
+             for n in KEYWORD_TABLES.get(q, [])}
+    if device in ("pandas", "polars"):            # the baseline engines take no device
+        out = getattr(bm, f"run_q{q}_{device}")(*tables, **extra)
+        if hasattr(out, "to_arrow"):              # polars DataFrame
+            out = out.to_arrow()
+        elif hasattr(out, "to_dict"):             # pandas DataFrame
+            out = pa.Table.from_pandas(out.reset_index(drop=True), preserve_index=False)
+    else:
+        out = getattr(bm, f"run_q{q}_mxframe")(*tables, device=device, **extra)
     if not isinstance(out, pa.Table):
         out = pa.table({SCALAR_NAME.get(q, "value"): [float(out)]})
     return out

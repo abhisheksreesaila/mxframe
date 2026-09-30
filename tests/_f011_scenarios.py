@@ -146,19 +146,29 @@ def limit_below_aggregate_is_applied(device):
 
 
 def multi_key_sort_order(device):
-    n = 5000
-    rng = np.random.default_rng(3)
-    a = rng.integers(0, 5, n).astype(np.int32)
-    b = rng.integers(0, 1000, n).astype(np.int32)
-    t = pa.table({"a": pa.array(a), "b": pa.array(b), "i": pa.array(np.arange(n, dtype=np.int32))})
-    for desc in ([False, False], [False, True], [True, False], [True, True]):
-        out = _lf(t).sort("a", "b", descending=desc).compute(device=device)
-        sa = -a.astype(np.int64) if desc[0] else a.astype(np.int64)
-        sb = -b.astype(np.int64) if desc[1] else b.astype(np.int64)
-        order = np.lexsort((np.arange(n), sb, sa))                     # stable: ties keep input order
-        got = list(zip(out.column("a").to_pylist(), out.column("b").to_pylist()))
-        want = list(zip(a[order].tolist(), b[order].tolist()))
-        assert got == want, (desc, got[:5], want[:5])
+    """Two- and three-key sorts, every direction mix, key ranges small and huge (the mixed-radix
+    key overflows int32 at 1e5 x 1e5), strings, and exact float64 payload columns."""
+    for n, ra, rb in ((5000, 5, 1000), (200_000, 100_000, 100_000)):
+        rng = np.random.default_rng(3)
+        a = rng.integers(0, ra, n).astype(np.int32)
+        b = rng.integers(0, rb, n).astype(np.int32)
+        x = 16_777_217.0 + np.arange(n, dtype=np.float64)              # not representable in float32
+        t = pa.table({"a": pa.array(a), "b": pa.array(b), "x": pa.array(x)})
+        for desc in ([False, False], [False, True], [True, False], [True, True]):
+            out = _lf(t).sort("a", "b", descending=desc).compute(device=device)
+            sa = -a.astype(np.int64) if desc[0] else a.astype(np.int64)
+            sb = -b.astype(np.int64) if desc[1] else b.astype(np.int64)
+            order = np.lexsort((np.arange(n), sb, sa))                 # stable: ties keep input order
+            got = list(zip(out.column("a").to_pylist(), out.column("b").to_pylist()))
+            want = list(zip(a[order].tolist(), b[order].tolist()))
+            assert got == want, (n, desc, got[:5], want[:5])
+            assert out.column("x").to_pylist() == x[order].tolist(), (n, desc, "float64 payload")
+    s1 = np.array(["b", "a", "c", "a", "b", "c", "a"])
+    k2 = np.array([1, 2, 3, 4, 5, 6, 7], dtype=np.int32)
+    t = pa.table({"s": pa.array(s1), "k": pa.array(k2)})
+    out = _lf(t).sort("s", "k", descending=[False, True]).compute(device=device)
+    assert list(zip(out.column("s").to_pylist(), out.column("k").to_pylist())) == \
+        [("a", 7), ("a", 4), ("a", 2), ("b", 5), ("b", 1), ("c", 6), ("c", 3)]
 
 
 def join_keys_of_different_integer_widths(device):
@@ -213,6 +223,28 @@ def min_max_identity_with_infinities(device):
                    .sort("g").compute(device=device))
             assert out.column("lo").to_pylist() == [inf, -inf, 1.0], (fused, out.column("lo").to_pylist())
             assert out.column("hi").to_pylist() == [inf, -inf, 1.0], (fused, out.column("hi").to_pylist())
+
+
+def float32_column_keeps_boundary_rows(device):
+    """`d >= 0.05 and d <= 0.07` on a float32 column keeps the rows that equal the literals
+    (the column is compared in its own precision, as DuckDB compares a DECIMAL), on every path."""
+    d = np.round(np.array([0.04, 0.05, 0.06, 0.07, 0.08] * 4, dtype=np.float64), 2).astype(np.float32)
+    t = pa.table({"g": pa.array(np.array([0, 1] * 10, dtype=np.int32)), "d": pa.array(d),
+                  "p": pa.array(np.ones(20, dtype=np.float32))})
+    pred = (col("d") >= lit(0.05)) & (col("d") <= lit(0.07))
+    for fused in ("1", "0"):
+        with _env(MXFRAME_FUSED_PIPELINE=fused):
+            out = _lf(t).filter(pred).groupby().agg(col("p").sum().alias("n")).compute(device=device)
+            assert out.column("n").to_pylist() == [12.0], (fused, "global", out.column("n").to_pylist())
+            out = (_lf(t).filter(pred).groupby("g").agg(col("p").sum().alias("n")).sort("g")
+                   .compute(device=device))
+            assert out.column("n").to_pylist() == [6.0, 6.0], (fused, "grouped", out.column("n").to_pylist())
+    out = _lf(t).filter(pred).compute(device=device)
+    assert out.num_rows == 12, out.num_rows
+    out = _lf(t).filter(col("d") == lit(0.06)).compute(device=device)
+    assert out.num_rows == 4, out.num_rows
+    out = _lf(t).filter(col("d") != lit(0.06)).compute(device=device)
+    assert out.num_rows == 16, out.num_rows
 
 
 SCENARIOS = {k: v for k, v in globals().items()

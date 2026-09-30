@@ -42,6 +42,7 @@ def _run(name, device):
     "join_cache_is_keyed_by_device",
     "case_when_sums_are_float64",
     "min_max_identity_with_infinities",
+    "float32_column_keeps_boundary_rows",
 ])
 def test_scenario(name, device):
     _run(name, device)
