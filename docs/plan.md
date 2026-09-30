@@ -83,10 +83,17 @@ Needs: F-005 · Files: `auto_mode.py` placement pass, join dispatch in `custom_o
 - [ ] filters/projections before a crossing so only surviving rows and needed columns move
 - [ ] join probe side can be split across CPU and GPU (Router) when both are worth it
 
-## F-008 Fused pipeline kernels [todo]
-Needs: F-002 · Why: SF10 Q1 spends ~1.3 s in PyArrow expression eval, NumPy mask indexing and dtype copies around a ~0.5 s kernel · Files: new fused kernels in `kernels_aot/`, dispatch in `custom_ops.py`
-- [ ] filter → arithmetic expression → grouped aggregate in one pass per morsel on CPU (multi-core) and GPU, no intermediate NumPy arrays (Crystal)
-- [ ] covers Q1, Q6, Q14, Q19-style shapes
+## F-008 Fused pipeline kernel: vectorized interpreter [todo]
+Needs: F-002 · Files: `kernels_aot/pipeline*.mojo` (new), `pipeline_program.py` (new: Expr → bytecode), dispatch in `custom_ops.py`
+Why: SF10 Q1 spends ~1.3 s in PyArrow expression eval, NumPy mask indexing and dtype copies around a ~0.5 s kernel; JIT-compiling a kernel per query shape would cost seconds on a first run.
+Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
+- Python compiles the query's filter predicate, the aggregate input expressions and the aggregate list into a small bytecode program (LOAD_COL i, CONST k, ADD/SUB/MUL/DIV, CMP_{LT,LE,GT,GE,EQ,NE}, AND/OR/NOT, BETWEEN, IN_SET (dictionary codes), plus AGG_{SUM,MIN,MAX,COUNT} slots). Registers are vectors.
+- CPU kernel: `parallelize` over morsels; within a morsel process vectors of ~1–2K rows: evaluate the predicate into a selection vector, evaluate expressions into cache-resident register vectors (SIMD), accumulate into per-thread float64 partials per group; merge partials at the end. Input columns are raw pointers (int32/int64/float32/float64 + int32 group ids, or none for global aggs).
+- GPU kernel: same bytecode, one thread per row (bytecode is uniform across threads, so no divergence), block-level partials (shared memory for small group counts, global atomics otherwise).
+- Both entry points take a row range [start, end), so the F-006 Router can hand morsels to either device, and return partials the Router merges.
+- [ ] Q1, Q6, Q14, Q19-style filters + arithmetic + grouped/global aggregates run through it on both devices; results match DuckDB (float64 accumulation)
+- [ ] fresh-process SF10 Q1 query time (excluding read) < 100 ms on `cpu`
+- [ ] unsupported expressions fall back to the existing path, never wrong results
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
