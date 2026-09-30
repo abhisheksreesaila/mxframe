@@ -36,6 +36,18 @@ See [v0.5.0 release notes](RELEASE_NOTES_0.5.0.md) for measured gains, limitatio
 
 ---
 
+## 🧠 How `device="auto"` works
+
+Give MXFrame a CPU and a GPU and `compute(device="auto")` decides where each query runs
+from costs it measures on your machine. First scans run on the CPU while the table's
+columns copy to the GPU in the background; after that, queries split their rows so the
+GPU and every CPU core work at the same time. On TPC-H SF10 Q1 the split finishes the
+aggregation in 25 ms, against 57 ms on the CPU alone and 39 ms on the GPU alone.
+
+➡️ **[Read how it works](docs/auto-mode.md)** · [visual version](https://htmlpreview.github.io/?https://github.com/abhisheksreesaila/mxframe/blob/main/docs/auto-mode.html)
+
+---
+
 ## ⚡ Quick Start
 
 ```sh
