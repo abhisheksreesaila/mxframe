@@ -15,6 +15,7 @@ from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate
 
 # %% ../nbs/03_compiler.ipynb 4
 # ── dtype helpers ────────────────────────────────────────────────────────
@@ -41,6 +42,9 @@ _PC_CMP_OPS = {
     "and": pc.and_,
     "or":  pc.or_,
 }
+
+# Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
+_DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
 
 _CMP_OPS = {
     "gt": ops.greater,
@@ -212,6 +216,8 @@ class GraphCompiler:
         op, args = expr.op, expr.args
         if op == "col":
             arr = table.column(args[0])
+            if pa.types.is_dictionary(arr.type):
+                arr = _decode_dict(arr)
             if isinstance(arr, pa.ChunkedArray):
                 # Single-chunk: return Array directly, no 50ms copy from combine_chunks.
                 if len(arr.chunks) == 1:
@@ -220,6 +226,10 @@ class GraphCompiler:
             return arr
         if op == "lit":
             return args[0]
+        if op in _DICT_PRED_OPS:
+            native = _dict_predicate(expr, table)
+            if native is not None:
+                return native
         if op in _PC_CMP_OPS:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)

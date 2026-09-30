@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -54,17 +55,86 @@ AOT_AVAILABLE: bool = _LIB_PATH is not None
 _c_int64 = ctypes.c_int64   # pointer-as-int (64-bit address)
 _c_int   = ctypes.c_int64   # n_rows / n_groups etc. (use int64 for Mojo Int = Int64 on x86-64)
 
+# Must match ABI_VERSION in kernels_aot/kernels_aot.mojo.  Bumped when the
+# exported signatures change (F-002 added a trailing `threads` argument).
+_EXPECTED_ABI = 2
+
 
 def _ptr(arr: np.ndarray) -> int:
     """Return the ctypes data pointer as a Python int."""
     return arr.ctypes.data
 
 
+def _check_len(name: str, arr: np.ndarray, n: int) -> None:
+    """Kernels trust n; a shorter buffer would be read out of bounds."""
+    if len(arr) != n:
+        raise ValueError(f"{name} has {len(arr)} elements, expected {n}")
+
+
+def _arr(a: np.ndarray, dtype) -> np.ndarray:
+    """C-contiguous view of `a` as `dtype` (no copy when it already is)."""
+    return np.ascontiguousarray(a, dtype=dtype)
+
+
+# ── CPU thread budget ─────────────────────────────────────────────────────────
+# Every CPU kernel takes a `threads` argument: the max number of worker tasks it
+# may use.  The default comes from env MXFRAME_CPU_THREADS (else all cores the
+# process may run on) and can be changed at runtime with set_cpu_threads(); a
+# co-processing scheduler that keeps some cores busy feeding the GPU lowers it
+# for the CPU workers, or passes `threads=` per call.  There is no state inside
+# the native library, so several Python threads may call kernels concurrently
+# (ctypes releases the GIL), each with its own budget.
+
+def _all_cores() -> int:
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:            # non-Linux
+        return max(1, os.cpu_count() or 1)
+
+
+def _threads_from_env() -> int:
+    raw = os.environ.get("MXFRAME_CPU_THREADS", "").strip()
+    if raw:
+        try:
+            n = int(raw)
+            if n >= 1:
+                return n
+        except ValueError:
+            pass
+    return _all_cores()
+
+
+_cpu_threads: int = _threads_from_env()
+_PIN_LOCK = threading.Lock()
+_RUNTIME_PINNED = False      # Mojo worker pool pinned once per process (see AOTKernels.__init__)
+
+
+def get_cpu_threads() -> int:
+    """Current default worker budget for CPU kernels."""
+    return _cpu_threads
+
+
+def set_cpu_threads(n: Optional[int]) -> int:
+    """Set the default worker budget for CPU kernels; ``None`` resets it to
+    ``MXFRAME_CPU_THREADS`` / all cores.  Returns the new value."""
+    global _cpu_threads
+    if n is None:
+        _cpu_threads = _threads_from_env()
+    else:
+        n = int(n)
+        if n < 1:
+            raise ValueError("cpu threads must be >= 1")
+        _cpu_threads = n
+    return _cpu_threads
+
+
 class AOTKernels:
     """Thin ctypes wrapper around libmxkernels_aot.so.
 
     All methods accept numpy arrays and dispatch directly to Mojo-compiled
-    functions.  No MAX Graph session is needed.
+    functions.  No MAX Graph session is needed.  Sum/mean accumulate in
+    float64 and return float64; every method takes an optional ``threads=``
+    (default: :func:`get_cpu_threads`).
     """
 
     def __init__(self, lib_path: Optional[Path] = None) -> None:
@@ -72,11 +142,36 @@ class AOTKernels:
         if path is None:
             raise RuntimeError(
                 "libmxkernels_aot.so not found. "
-                "Run `mojo build --emit shared-lib kernels_aot/kernels_aot.mojo "
+                "Run `mojo build -I kernels_aot --emit shared-lib kernels_aot/kernels_aot.mojo "
                 "-o kernels_aot/libmxkernels_aot.so` to build it."
             )
-        self._lib = ctypes.CDLL(str(path))
+        self._lib = ctypes.CDLL(str(path))   # CDLL (not PyDLL): the GIL is released per call
+        try:
+            abi = self._lib.mx_abi_version
+        except AttributeError:
+            abi = None
+        if abi is not None:
+            abi.restype = ctypes.c_int64
+        if abi is None or abi() != _EXPECTED_ABI:
+            raise RuntimeError(
+                f"{path} is stale (expected kernel ABI {_EXPECTED_ABI}); rebuild it with "
+                "`mojo build -I kernels_aot --emit shared-lib kernels_aot/kernels_aot.mojo "
+                "-o kernels_aot/libmxkernels_aot.so`."
+            )
+        # Pin the Mojo worker pool for the life of the process: without a live
+        # reference every parallel launch builds and tears down the pool (~1.7 ms).
+        global _RUNTIME_PINNED
+        self._lib.mx_init_runtime.restype = ctypes.c_int64
+        with _PIN_LOCK:
+            if not _RUNTIME_PINNED:
+                self._lib.mx_init_runtime()
+                _RUNTIME_PINNED = True
+        self._lib.mx_num_physical_cores.restype = ctypes.c_int64
         self._bind()
+
+    @property
+    def physical_cores(self) -> int:
+        return int(self._lib.mx_num_physical_cores())
 
     def _fn(self, name: str, argtypes: list) -> ctypes.CFUNCTYPE:
         fn = getattr(self._lib, name)
@@ -84,114 +179,162 @@ class AOTKernels:
         fn.restype  = None
         return fn
 
+    @staticmethod
+    def _t(threads: Optional[int]) -> int:
+        return _cpu_threads if threads is None else max(1, int(threads))
+
     def _bind(self) -> None:
         I = _c_int64   # pointer-as-int or size
-        # ── group aggs ────────────────────────────────────────────────────────
-        self._group_sum_f32     = self._fn("group_sum_f32",     [I,I,I,I,I])
-        self._group_sum_i64     = self._fn("group_sum_i64",     [I,I,I,I,I])
-        self._group_min_f32     = self._fn("group_min_f32",     [I,I,I,I,I])
-        self._group_max_f32     = self._fn("group_max_f32",     [I,I,I,I,I])
-        self._group_mean_f32    = self._fn("group_mean_f32",    [I,I,I,I,I,I])
-        self._group_count_f32   = self._fn("group_count_f32",   [I,I,I,I])
-        self._group_composite   = self._fn("group_composite",   [I,I,I,I,I,I,I])
-        # ── masked global aggs ───────────────────────────────────────────────
-        self._masked_global_sum_f32         = self._fn("masked_global_sum_f32",         [I,I,I,I])
-        self._masked_global_min_f32         = self._fn("masked_global_min_f32",         [I,I,I,I])
-        self._masked_global_max_f32         = self._fn("masked_global_max_f32",         [I,I,I,I])
-        self._masked_global_sum_product_f32 = self._fn("masked_global_sum_product_f32", [I,I,I,I,I])
+        # ── group aggs: (out, values, labels, n_rows, n_groups, threads) ─────
+        for name in ("group_sum_f32", "group_sum_f64", "group_sum_i64",
+                     "group_min_f32", "group_min_f64", "group_max_f32", "group_max_f64",
+                     "group_mean_f32", "group_mean_f64"):
+            setattr(self, "_" + name, self._fn(name, [I]*6))
+        self._group_count     = self._fn("group_count",     [I]*5)
+        self._group_composite = self._fn("group_composite", [I]*8)
+        # ── masked global aggs: (out, values, mask, n, threads) ──────────────
+        for name in ("masked_global_sum_f32", "masked_global_sum_f64",
+                     "masked_global_min_f32", "masked_global_min_f64",
+                     "masked_global_max_f32", "masked_global_max_f64"):
+            setattr(self, "_" + name, self._fn(name, [I]*5))
+        self._masked_global_sum_product_f32 = self._fn("masked_global_sum_product_f32", [I]*6)
+        self._masked_global_sum_product_f64 = self._fn("masked_global_sum_product_f64", [I]*6)
         # ── gather ────────────────────────────────────────────────────────────
-        self._gather_f32 = self._fn("gather_f32", [I,I,I,I])
-        self._gather_i32 = self._fn("gather_i32", [I,I,I,I])
-        self._gather_i64 = self._fn("gather_i64", [I,I,I,I])
-        # ── sort / distinct ──────────────────────────────────────────────────
+        self._gather_f32 = self._fn("gather_f32", [I]*5)
+        self._gather_i32 = self._fn("gather_i32", [I]*5)
+        self._gather_i64 = self._fn("gather_i64", [I]*5)
+        # ── sort / distinct (single-threaded) ────────────────────────────────
         self._sort_indices     = self._fn("sort_indices",     [I,I,I,I])
         self._unique_mask      = self._fn("unique_mask",      [I,I,I])
-        # ── filter_gather ────────────────────────────────────────────────────
+        # ── filter_gather (single-threaded) ──────────────────────────────────
         self._prefix_sum_count = self._fn("prefix_sum_count", [I,I,I])
         self._filter_gather_f32 = self._fn("filter_gather_f32", [I,I,I,I,I])
         self._filter_gather_i32 = self._fn("filter_gather_i32", [I,I,I,I,I])
         self._filter_gather_i64 = self._fn("filter_gather_i64", [I,I,I,I,I])
         # ── joins ─────────────────────────────────────────────────────────────
-        self._join_count        = self._fn("join_count",        [I,I,I,I,I,I])
-        self._join_scatter      = self._fn("join_scatter",      [I,I,I,I,I,I,I,I])
-        self._join_count_left   = self._fn("join_count_left",   [I,I,I,I,I,I])
-        self._join_scatter_left = self._fn("join_scatter_left", [I,I,I,I,I,I,I,I])
+        self._join_count        = self._fn("join_count",        [I]*7)
+        self._join_scatter      = self._fn("join_scatter",      [I]*9)
+        self._join_count_left   = self._fn("join_count_left",   [I]*7)
+        self._join_scatter_left = self._fn("join_scatter_left", [I]*9)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def group_sum_f32(self, values: np.ndarray, labels: np.ndarray, n_groups: int) -> np.ndarray:
-        out = np.zeros(n_groups, dtype=np.float32)
-        self._group_sum_f32(_ptr(out), _ptr(values), _ptr(labels), len(values), n_groups)
+    @staticmethod
+    def _vdt(values: np.ndarray) -> tuple:
+        """('f32'|'f64', array): float32 stays float32, everything else -> float64."""
+        if values.dtype == np.float32:
+            return "f32", _arr(values, np.float32)
+        return "f64", _arr(values, np.float64)
+
+    def _group(self, op: str, values: np.ndarray, labels: np.ndarray, n_groups: int,
+               threads: Optional[int]) -> np.ndarray:
+        kind, v = self._vdt(values)
+        lab = _arr(labels, np.int32)
+        _check_len("labels", lab, len(v))
+        out = np.empty(n_groups, dtype=np.float64)
+        getattr(self, f"_group_{op}_{kind}")(_ptr(out), _ptr(v), _ptr(lab), len(v), n_groups,
+                                             self._t(threads))
         return out
 
-    def group_sum_i64(self, values: np.ndarray, labels: np.ndarray, n_groups: int) -> np.ndarray:
+    def group_sum(self, values, labels, n_groups, threads=None) -> np.ndarray:
+        """Per-group sum, float64 accumulation; float64 result (float32/float64 input)."""
+        return self._group("sum", values, labels, n_groups, threads)
+
+    def group_min(self, values, labels, n_groups, threads=None) -> np.ndarray:
+        return self._group("min", values, labels, n_groups, threads)
+
+    def group_max(self, values, labels, n_groups, threads=None) -> np.ndarray:
+        return self._group("max", values, labels, n_groups, threads)
+
+    def group_mean(self, values, labels, n_groups, threads=None) -> np.ndarray:
+        """Per-group mean (sum/count in float64); empty groups stay 0."""
+        return self._group("mean", values, labels, n_groups, threads)
+
+    def group_count(self, labels, n_groups, threads=None) -> np.ndarray:
+        """Per-group row count as float64 (exact to 2**53)."""
+        lab = _arr(labels, np.int32)
+        out = np.empty(n_groups, dtype=np.float64)
+        self._group_count(_ptr(out), _ptr(lab), len(lab), n_groups, self._t(threads))
+        return out
+
+    # float32-named entry points kept for callers written against the old API
+    # (now float64-accumulating and float64-returning).
+    def group_sum_f32(self, values, labels, n_groups, threads=None):  return self.group_sum(values, labels, n_groups, threads)
+    def group_min_f32(self, values, labels, n_groups, threads=None):  return self.group_min(values, labels, n_groups, threads)
+    def group_max_f32(self, values, labels, n_groups, threads=None):  return self.group_max(values, labels, n_groups, threads)
+    def group_mean_f32(self, values, labels, n_groups, threads=None): return self.group_mean(values, labels, n_groups, threads)
+    def group_count_f32(self, labels, n_groups, threads=None):        return self.group_count(labels, n_groups, threads)
+
+    def group_sum_i64(self, values: np.ndarray, labels: np.ndarray, n_groups: int,
+                      threads: Optional[int] = None) -> np.ndarray:
+        v = _arr(values, np.int64)
+        lab = _arr(labels, np.int32)
         out = np.zeros(n_groups, dtype=np.int64)
-        self._group_sum_i64(_ptr(out), _ptr(values), _ptr(labels), len(values), n_groups)
-        return out
-
-    def group_min_f32(self, values: np.ndarray, labels: np.ndarray, n_groups: int) -> np.ndarray:
-        out = np.empty(n_groups, dtype=np.float32)
-        self._group_min_f32(_ptr(out), _ptr(values), _ptr(labels), len(values), n_groups)
-        return out
-
-    def group_max_f32(self, values: np.ndarray, labels: np.ndarray, n_groups: int) -> np.ndarray:
-        out = np.empty(n_groups, dtype=np.float32)
-        self._group_max_f32(_ptr(out), _ptr(values), _ptr(labels), len(values), n_groups)
-        return out
-
-    def group_mean_f32(self, values: np.ndarray, labels: np.ndarray, n_groups: int) -> np.ndarray:
-        out   = np.empty(n_groups, dtype=np.float32)
-        count = np.empty(n_groups, dtype=np.int32)
-        self._group_mean_f32(_ptr(out), _ptr(count), _ptr(values), _ptr(labels), len(values), n_groups)
-        return out
-
-    def group_count_f32(self, labels: np.ndarray, n_groups: int) -> np.ndarray:
-        out = np.empty(n_groups, dtype=np.float32)
-        self._group_count_f32(_ptr(out), _ptr(labels), len(labels), n_groups)
+        self._group_sum_i64(_ptr(out), _ptr(v), _ptr(lab), len(v), n_groups, self._t(threads))
         return out
 
     def group_composite(self, k0: np.ndarray, k1: np.ndarray, k2: np.ndarray, k3: np.ndarray,
-                        strides: np.ndarray) -> np.ndarray:
+                        strides: np.ndarray, threads: Optional[int] = None) -> np.ndarray:
         n = len(k0)
+        k0, k1, k2, k3 = (_arr(k, np.int32) for k in (k0, k1, k2, k3))
+        strides = _arr(strides, np.int64)
         out = np.empty(n, dtype=np.int64)
-        self._group_composite(_ptr(out), _ptr(k0), _ptr(k1), _ptr(k2), _ptr(k3), _ptr(strides), n)
+        self._group_composite(_ptr(out), _ptr(k0), _ptr(k1), _ptr(k2), _ptr(k3), _ptr(strides), n,
+                              self._t(threads))
         return out
 
-    def masked_global_sum_f32(self, values: np.ndarray, mask: np.ndarray) -> float:
-        out = np.zeros(1, dtype=np.float32)
-        self._masked_global_sum_f32(_ptr(out), _ptr(values), _ptr(mask), len(values))
+    def _masked(self, op: str, values: np.ndarray, mask: np.ndarray, threads) -> float:
+        kind, v = self._vdt(values)
+        m = _arr(mask, np.int32)
+        _check_len("mask", m, len(v))
+        out = np.zeros(1, dtype=np.float64)
+        getattr(self, f"_masked_global_{op}_{kind}")(_ptr(out), _ptr(v), _ptr(m), len(v), self._t(threads))
         return float(out[0])
 
-    def masked_global_min_f32(self, values: np.ndarray, mask: np.ndarray) -> float:
-        out = np.zeros(1, dtype=np.float32)
-        self._masked_global_min_f32(_ptr(out), _ptr(values), _ptr(mask), len(values))
+    def masked_global_sum(self, values, mask, threads=None) -> float:
+        """sum(values where mask != 0), float64 accumulation, SIMD + multi-core."""
+        return self._masked("sum", values, mask, threads)
+
+    def masked_global_min(self, values, mask, threads=None) -> float:
+        return self._masked("min", values, mask, threads)
+
+    def masked_global_max(self, values, mask, threads=None) -> float:
+        return self._masked("max", values, mask, threads)
+
+    def masked_global_sum_product(self, values_a, values_b, mask, threads=None) -> float:
+        """sum(a * b where mask != 0); product and sum in float64."""
+        kind, a = self._vdt(values_a)
+        b = _arr(values_b, np.float32 if kind == "f32" else np.float64)
+        m = _arr(mask, np.int32)
+        _check_len("values_b", b, len(a))
+        _check_len("mask", m, len(a))
+        out = np.zeros(1, dtype=np.float64)
+        getattr(self, f"_masked_global_sum_product_{kind}")(
+            _ptr(out), _ptr(a), _ptr(b), _ptr(m), len(a), self._t(threads))
         return float(out[0])
 
-    def masked_global_max_f32(self, values: np.ndarray, mask: np.ndarray) -> float:
-        out = np.zeros(1, dtype=np.float32)
-        self._masked_global_max_f32(_ptr(out), _ptr(values), _ptr(mask), len(values))
-        return float(out[0])
+    def masked_global_sum_f32(self, values, mask, threads=None):  return self.masked_global_sum(values, mask, threads)
+    def masked_global_min_f32(self, values, mask, threads=None):  return self.masked_global_min(values, mask, threads)
+    def masked_global_max_f32(self, values, mask, threads=None):  return self.masked_global_max(values, mask, threads)
+    def masked_global_sum_product_f32(self, values_a, values_b, mask, threads=None):
+        return self.masked_global_sum_product(values_a, values_b, mask, threads)
 
-    def masked_global_sum_product_f32(self, values_a: np.ndarray, values_b: np.ndarray,
-                                      mask: np.ndarray) -> float:
-        out = np.zeros(1, dtype=np.float32)
-        self._masked_global_sum_product_f32(_ptr(out), _ptr(values_a), _ptr(values_b),
-                                            _ptr(mask), len(values_a))
-        return float(out[0])
-
-    def gather_f32(self, values: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    def gather_f32(self, values: np.ndarray, indices: np.ndarray, threads: Optional[int] = None) -> np.ndarray:
+        values, indices = _arr(values, np.float32), _arr(indices, np.int32)
         out = np.empty(len(indices), dtype=np.float32)
-        self._gather_f32(_ptr(out), _ptr(values), _ptr(indices), len(indices))
+        self._gather_f32(_ptr(out), _ptr(values), _ptr(indices), len(indices), self._t(threads))
         return out
 
-    def gather_i32(self, values: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    def gather_i32(self, values: np.ndarray, indices: np.ndarray, threads: Optional[int] = None) -> np.ndarray:
+        values, indices = _arr(values, np.int32), _arr(indices, np.int32)
         out = np.empty(len(indices), dtype=np.int32)
-        self._gather_i32(_ptr(out), _ptr(values), _ptr(indices), len(indices))
+        self._gather_i32(_ptr(out), _ptr(values), _ptr(indices), len(indices), self._t(threads))
         return out
 
-    def gather_i64(self, values: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    def gather_i64(self, values: np.ndarray, indices: np.ndarray, threads: Optional[int] = None) -> np.ndarray:
+        values, indices = _arr(values, np.int64), _arr(indices, np.int32)
         out = np.empty(len(indices), dtype=np.int64)
-        self._gather_i64(_ptr(out), _ptr(values), _ptr(indices), len(indices))
+        self._gather_i64(_ptr(out), _ptr(values), _ptr(indices), len(indices), self._t(threads))
         return out
 
     def sort_indices(self, keys: np.ndarray, descending: bool = False) -> np.ndarray:
@@ -233,17 +376,26 @@ class AOTKernels:
         self._filter_gather_i64(_ptr(out), _ptr(values), _ptr(mask), _ptr(offsets), len(values))
         return out
 
-    def join_count(self, left_keys: np.ndarray, right_keys: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def _max_key(left_keys: np.ndarray, right_keys: np.ndarray) -> int:
+        if len(left_keys) > 0 and len(right_keys) > 0:
+            return int(max(left_keys.max(), right_keys.max()))
+        return 0
+
+    def join_count(self, left_keys: np.ndarray, right_keys: np.ndarray,
+                   threads: Optional[int] = None) -> np.ndarray:
+        left_keys, right_keys = _arr(left_keys, np.int32), _arr(right_keys, np.int32)
         n_left  = len(left_keys)
-        max_key = int(max(left_keys.max(), right_keys.max())) if n_left > 0 and len(right_keys) > 0 else 0
         out     = np.zeros(n_left, dtype=np.int32)
         self._join_count(_ptr(out), _ptr(left_keys), _ptr(right_keys),
-                         n_left, len(right_keys), max_key)
+                         n_left, len(right_keys), self._max_key(left_keys, right_keys),
+                         self._t(threads))
         return out
 
     def join_scatter(self, left_keys: np.ndarray, right_keys: np.ndarray,
-                     match_counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                     match_counts: np.ndarray, threads: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
         """Emit (left_idx, right_idx) pairs. match_counts[i] = # right matches for left row i."""
+        left_keys, right_keys = _arr(left_keys, np.int32), _arr(right_keys, np.int32)
         n_left  = len(left_keys)
         n_right = len(right_keys)
         total   = int(match_counts.sum())
@@ -252,24 +404,27 @@ class AOTKernels:
         offsets = np.zeros(n_left, dtype=np.int32)
         if n_left > 1:
             np.cumsum(match_counts[:-1], out=offsets[1:])
-        max_key = int(max(left_keys.max(), right_keys.max())) if n_left > 0 and n_right > 0 else 0
         lo      = np.empty(total, dtype=np.int32)
         ro      = np.empty(total, dtype=np.int32)
         self._join_scatter(_ptr(lo), _ptr(ro), _ptr(left_keys), _ptr(right_keys),
-                           _ptr(offsets), n_left, n_right, max_key)
+                           _ptr(offsets), n_left, n_right, self._max_key(left_keys, right_keys),
+                           self._t(threads))
         return lo, ro
 
-    def join_count_left(self, left_keys: np.ndarray, right_keys: np.ndarray) -> np.ndarray:
+    def join_count_left(self, left_keys: np.ndarray, right_keys: np.ndarray,
+                        threads: Optional[int] = None) -> np.ndarray:
+        left_keys, right_keys = _arr(left_keys, np.int32), _arr(right_keys, np.int32)
         n_left  = len(left_keys)
-        max_key = int(max(left_keys.max(), right_keys.max())) if n_left > 0 and len(right_keys) > 0 else 0
         out     = np.zeros(n_left, dtype=np.int32)
         self._join_count_left(_ptr(out), _ptr(left_keys), _ptr(right_keys),
-                              n_left, len(right_keys), max_key)
+                              n_left, len(right_keys), self._max_key(left_keys, right_keys),
+                              self._t(threads))
         return out
 
     def join_scatter_left(self, left_keys: np.ndarray, right_keys: np.ndarray,
-                          match_counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+                          match_counts: np.ndarray, threads: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
         """Emit left-outer (left_idx, right_idx) pairs. match_counts from join_count_left."""
+        left_keys, right_keys = _arr(left_keys, np.int32), _arr(right_keys, np.int32)
         n_left  = len(left_keys)
         n_right = len(right_keys)
         total   = int(match_counts.sum())  # includes 1 for each unmatched left row
@@ -278,11 +433,11 @@ class AOTKernels:
         offsets = np.zeros(n_left, dtype=np.int32)
         if n_left > 1:
             np.cumsum(match_counts[:-1], out=offsets[1:])
-        max_key = int(max(left_keys.max(), right_keys.max())) if n_left > 0 and n_right > 0 else 0
         lo      = np.empty(total, dtype=np.int32)
         ro      = np.empty(total, dtype=np.int32)
         self._join_scatter_left(_ptr(lo), _ptr(ro), _ptr(left_keys), _ptr(right_keys),
-                                _ptr(offsets), n_left, n_right, max_key)
+                                _ptr(offsets), n_left, n_right, self._max_key(left_keys, right_keys),
+                                self._t(threads))
         return lo, ro
 
 

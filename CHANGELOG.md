@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### ⚡ Multi-core CPU kernels with float64 accumulation (F-002)
+- CPU AOT kernels (`libmxkernels_aot.so`) now run on all cores: grouped sum/min/max/mean/count, masked global sum/min/max/sum-product (SIMD), join build/probe/scatter, gather, and group-key composition. Grouped kernels use per-worker partial arrays merged in parallel; the join build is parallel by key range.
+- Sums and means accumulate in **float64** and return float64 (counts are exact). At TPC-H SF10 the float32 accumulators were off by up to 4.6% (counts by 42%); Q1-style grouped sums now match DuckDB summing the same float32 values as doubles to ~1e-14 relative.
+- Compound aggregate expressions (`price * (1 - discount)`) are evaluated in float64 on the CPU path.
+- New thread budget: env `MXFRAME_CPU_THREADS` (default: all cores), `mxframe.set_cpu_threads(n)` / `mxframe.get_cpu_threads()`, and a per-call `threads=` on every `AOTKernels` method. The library keeps no global state, so several Python threads can call kernels at once.
+- The exported symbols gained a trailing `threads` argument (ABI version 2); a stale `.so` is rejected with a clear error. `device="gpu"` is untouched.
+
+---
+
 ## [0.5.0] — 2026-07-11
 
 Full narrative: [v0.5.0 release notes](RELEASE_NOTES_0.5.0.md).

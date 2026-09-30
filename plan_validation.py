@@ -11,6 +11,7 @@ from .lazy_expr import Expr
 from mxframe.lazy_frame import (
     LogicalPlan,
     Scan,
+    ParquetScan,
     Filter,
     Project,
     Aggregate,
@@ -41,6 +42,11 @@ def validate_plan(plan: LogicalPlan) -> List[PlanValidationError]:
         if isinstance(node, Scan):
             if node.table is None:
                 errors.append(PlanValidationError(path, "Scan.table cannot be None"))
+            return
+
+        if isinstance(node, ParquetScan):
+            if not node.path:
+                errors.append(PlanValidationError(path, "ParquetScan.path cannot be empty"))
             return
 
         if isinstance(node, Filter):
