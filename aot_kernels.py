@@ -1248,6 +1248,15 @@ class AOTKernelsGPU:
             counts = scratch(n_left * 4)                   # matches per left row
             self._join_count_gpu(self._ptr(counts), self._ptr(table), self._ptr(lk), self._ptr(rk),
                                  n_left, n_right, table_size)
+            # The prefix sum below is int32: a total past 2**31 - 1 wraps negative and the scatter would
+            # write through the wrapped offsets.  No left row matches more rows than the largest per-key
+            # count of the right side, so n_left * that bounds the total; only when the bound is past the
+            # limit are the counts summed exactly (in int64, on the host) and the join refused.
+            self._fill_i32(mx, 1, 0)
+            self._sym("max_i32_gpu", [_P64, _P64, _I64])(self._ptr(mx), self._ptr(table), table_size)
+            max_matches = int(self._download(mx, np.int32, 1)[0])
+            if n_left * max_matches > MAX_JOIN_ROWS:
+                check_join_output_size(int(self._download(counts, np.int32, n_left).sum(dtype=np.int64)))
             offsets = scratch(n_left * 4)                  # exclusive prefix sum of counts
             total = self._scan_i32(offsets, counts, n_left)
             if total == 0:
