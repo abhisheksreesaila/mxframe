@@ -46,7 +46,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2      # v2: compute-only estimate contract, group-count fit keys, size exponent
 MAX_OBS_SAMPLES = 64        # bounded per-fit sample list (HyPE-style)
 MIN_OBS = 3                 # samples before observations start to count
 OBS_RAMP = 6                # observed weight ramps 0 -> 1 over this many samples past MIN_OBS
@@ -217,6 +217,7 @@ class Fit:
     g: float = 0.0
     obs: List[List[float]] = field(default_factory=list)
     n_points: int = 0            # points used by the calibration fit (0 = built-in default)
+    n_max: float = 0.0           # largest measured rows; beyond it the fit extrapolates linearly
     p: float = 1.0               # size exponent: time = alpha + c * rows**p + g*card (p > 1: super-linear)
     _cur: Optional[Tuple[float, float, float]] = field(default=None, repr=False, compare=False)
 
@@ -226,10 +227,18 @@ class Fit:
             self._cur = self._blend()
         return self._cur
 
+    def _size_term(self, rows: float) -> float:
+        p = self.p
+        if p == 1.0:
+            return rows
+        if self.n_max and rows > self.n_max:      # slope at the last measured point, not the power law
+            return self.n_max ** p + p * self.n_max ** (p - 1.0) * (rows - self.n_max)
+        return rows ** p
+
     def predict(self, rows: float, card: Optional[float] = None) -> float:
         a, c, g = self.params()
         gterm = g * (DEFAULT_CARD if card is None else card) if g else 0.0
-        return max(0.0, a + c * (rows ** self.p if self.p != 1.0 else rows) + gterm)
+        return max(0.0, a + c * self._size_term(rows) + gterm)
 
     # -- online refinement ------------------------------------------------ #
     def observe(self, rows: float, ms: float, card: Optional[float] = None) -> None:
@@ -258,18 +267,19 @@ class Fit:
         return tuple((1 - w) * p + w * q for p, q in zip(prior, (a, c, g)))  # type: ignore[return-value]
 
     def predict_prior(self, rows: float, card: float) -> float:
-        return self.alpha + self.c * rows ** self.p + self.g * card
+        return self.alpha + self.c * self._size_term(rows) + self.g * card
 
     # -- (de)serialisation ------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {"alpha": self.alpha, "c": self.c, "g": self.g,
-                "n_points": self.n_points, "obs": self.obs, "p": self.p}
+                "n_points": self.n_points, "obs": self.obs, "p": self.p,
+                "n_max": self.n_max}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Fit":
         f = cls(float(d["alpha"]), float(d["c"]), float(d.get("g", 0.0)),
                 [[float(x) for x in o] for o in d.get("obs", [])][-MAX_OBS_SAMPLES:],
-                int(d.get("n_points", 0)), p=float(d.get("p", 1.0)))
+                int(d.get("n_points", 0)), p=float(d.get("p", 1.0)), n_max=float(d.get("n_max", 0.0)))
         if not (all(math.isfinite(v) and v >= 0 for v in (f.alpha, f.c, f.g)) and 0.5 <= f.p <= 3.0):
             raise ValueError("bad fit")
         return f
@@ -369,26 +379,36 @@ class Calibration:
         return v
 
     def estimate_gpu_join_total(self, left_rows: float, right_rows: float,
-                                table_size: Optional[float] = None, pinned: bool = False) -> float:
-        """Price of the real current GPU hash join (`AOTKernelsGPU.hash_join`), inputs resident.
+                                table_size: Optional[float] = None, pinned: bool = False,
+                                out_rows: Optional[float] = None) -> float:
+        """Price of the real current GPU hash join (`AOTKernelsGPU.hash_join`), key columns resident.
 
-        = count + scatter kernels (`join@gpu`)
-        + host steps between them (`join_host@cpu`: cumsum/bincount/argsort)
-        + counts D2H (4 B per left row)
-        + H2D of the scratch/aux arrays it re-uploads every call: zeroed key table,
-          offsets (4 B/left row), right_order (4 B/right row), right_starts and
-          right_count (4 B/table slot each).  ``table_size`` defaults to ``right_rows``.
-        Excludes the input key columns (assumed resident) and the (left_idx, right_idx)
-        result copy; the placer prices those with ``transfer_ms`` if it needs them.
+        Measured END TO END (`join_total@gpu`, fit alpha + a*L^p + b*R over left/right rows at
+        ratios 1:8 and 1:1): both kernels, the host bincount/argsort/cumsum, counts D2H, aux
+        uploads and the result D2H.  Excludes only the key upload (the placer prices it).
+        The probe has ~1 match per left row; pass ``out_rows`` (expected join output rows)
+        to swap the result-copy term (8 B per output row) for the real one.
+
+        Without a measured fit (defaults) it falls back to a sum of parts: `join@gpu` +
+        `join_host@cpu` + counts D2H + aux H2D (4*L + 4*R + 3*4*table bytes) + result D2H.
         """
         if not self.has_gpu:
             return math.inf
+        f = self.fits.get("join_total@gpu")
+        if f is not None and f.n_points >= 3:
+            v = f.predict(left_rows, right_rows)
+            if out_rows is not None:
+                v += (self.transfer_ms(8 * out_rows, "d2h", pinned)
+                      - self.transfer_ms(8 * left_rows, "d2h", pinned))
+            return max(v, 0.0)
         tab = right_rows if table_size is None else table_size
         h2d_bytes = 4 * left_rows + 4 * right_rows + 3 * 4 * tab
+        res = left_rows if out_rows is None else out_rows
         return (self.estimate("join", "gpu", left_rows)
                 + self.estimate("join_host", "cpu", left_rows)
                 + self.transfer_ms(4 * left_rows, "d2h", pinned)
-                + self.transfer_ms(h2d_bytes, "h2d", pinned))
+                + self.transfer_ms(h2d_bytes, "h2d", pinned)
+                + self.transfer_ms(8 * res, "d2h", pinned))
 
     def bandwidth_gbps(self, direction: str, pinned: bool = False) -> float:
         k = f"{direction}_{'pinned' if pinned and self.pinned_available else 'pageable'}"
@@ -583,7 +603,7 @@ def default_calibration(identity: Optional[Dict[str, Any]] = None,
         mxframe_version=ver, has_gpu=has_gpu,
         cpu_threads=_detect_cpu_threads(), cpu_cores=os.cpu_count() or 1,
         pinned_available=has_gpu,
-        link_gbps={"h2d_pageable": 9.0, "h2d_pinned": 11.0, "d2h_pageable": 8.0, "d2h_pinned": 11.0},
+        link_gbps={"h2d_pageable": 9.0, "h2d_pinned": 11.0, "d2h_pageable": 7.0, "d2h_pinned": 11.0},
         link_latency_ms={"h2d_pageable": 0.05, "h2d_pinned": 0.03,
                          "d2h_pageable": 0.05, "d2h_pinned": 0.03},
         launch_overhead_ms={"cpu": 0.005, "gpu": 0.1},
@@ -693,6 +713,10 @@ class Probe:
     enabled: bool = True             # False: skipped (defaults kept), noted in Calibration.errors
     max_card: Optional[int] = None   # GPU group_min/max fault above ~8k groups (see GPU_MAX_CARD)
     bucketed: bool = False
+    two_d: bool = False              # points are (left_rows, right_rows, ms); fit alpha + a*L^p + b*R
+    grid: Optional[Callable[[Tuple[int, ...]], List[Tuple[int, int]]]] = None   # explicit (rows, card|R) grid
+    budget_s: Optional[float] = None  # per-probe override of the size-skip budget
+    stat: str = "median"              # "min" for host-heavy end-to-end probes (least contended run)
 
 
 PROBES: Dict[Tuple[str, str], Probe] = {}
@@ -906,6 +930,31 @@ def _p_join_gpu(ctx, n, card):
     return run
 
 
+def _join_total_grid(sizes):
+    """(left_rows, right_rows): ratios 1:8 and 1:1; 1:1 stops early (it is ~4x slower)."""
+    g = []
+    for n in sizes:
+        if n < 100_000 or n > 30_000_000:
+            continue
+        g.append((n, max(n // 8, 1)))
+        if n <= 6_000_000:
+            g.append((n, n))
+    return g
+
+
+@probe("join_total", "gpu", two_d=True, grid=_join_total_grid, budget_s=3.0, stat="min")
+def _p_join_total_gpu(ctx, n, card):
+    """END-TO-END `AOTKernelsGPU.hash_join` with resident key buffers (keys are uploaded once
+    in the untimed warm-up and served from the device-buffer cache).  Includes everything the
+    wrapper does: table upload, counts D2H, host bincount/argsort/cumsum, aux uploads,
+    scatter, result D2H.  Excludes the key upload.  card = right rows; ~1 match per left row."""
+    import numpy as np
+    g = ctx.gpu
+    right = np.arange(card, dtype=np.int32)
+    left = (ctx.labels(n, 1 << 30) % max(card, 1)).astype(np.int32)
+    return lambda: g.hash_join(left, right)
+
+
 @probe("join_host", "cpu", max_rows=30_000_000)
 def _p_join_host(ctx, n, card):
     """Host work the GPU join does between its two kernels (rows = left rows)."""
@@ -986,16 +1035,20 @@ def _p_ft_cpu(ctx, n, card):
 # --------------------------------------------------------------------------- #
 # Measurement machinery
 # --------------------------------------------------------------------------- #
-def _time_call(fn: Callable[[], Any], timer: Callable[[], float], budget_s: float) -> float:
-    """Median-of-few wall time in ms (warm-up call first, excluded)."""
+def _time_call(fn: Callable[[], Any], timer: Callable[[], float], budget_s: float,
+               stat: str = "median") -> float:
+    """Median-of-few (or min, for host-heavy probes sensitive to machine noise) wall time in ms;
+    the warm-up call is excluded."""
     fn()
     t = timer(); fn(); first = timer() - t
     samples = [first]
     reps = 2 if first > 0.05 else (3 if first > 0.01 else 7)
+    if stat == "min":
+        reps = max(reps, 3)
     for _ in range(reps - 1):
         t = timer(); fn(); samples.append(timer() - t)
     samples.sort()
-    return samples[len(samples) // 2] * 1e3
+    return (samples[0] if stat == "min" else samples[len(samples) // 2]) * 1e3
 
 
 def _card_for(n: int) -> int:
@@ -1018,6 +1071,9 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
         low_card_sizes = big[:-1] if len(big) >= 4 else big    # top size is slow for mid group counts
         grid = [(n, c) for c in cards
                 for n in (big if c >= 100_000 else low_card_sizes) if c <= max(n, 8)]
+    elif p.grid is not None:
+        grid = p.grid(tuple(sizes_ok))
+        budget_s = p.budget_s or budget_s
     else:
         grid = [(n, _card_for(n)) for n in sizes_ok]
         if p.uses_card:                   # cardinality sweep at a mid size
@@ -1025,15 +1081,16 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
             if not (p.max_rows and mid > p.max_rows):
                 grid += [(mid, c) for c in (8, 200_000) if c <= cap]
     for n, card in grid:
-        prev = last.get(card)
+        lk = round(card / n, 3) if p.two_d else card       # series key: same ratio / same group count
+        prev = last.get(lk)
         if prev is not None and n > prev[0] and prev[1] / 1e3 * (n / prev[0]) * 4 > budget_s:
             continue                      # projected too slow for the budget: skip this size
-        ms = _time_call(p.make(ctx, n, card), timer, budget_s)
+        ms = _time_call(p.make(ctx, n, card), timer, budget_s, p.stat)
         if p.h2d_bytes_per_row and h2d_gbps > 0:      # wrapper re-uploads inputs: remove that copy
             ms = max(ms - p.h2d_bytes_per_row * n / (h2d_gbps * 1e9) * 1e3, ms * 0.05)
         pts.append([float(n), float(card), ms])
         if prev is None or n >= prev[0]:
-            last[card] = (n, ms)
+            last[lk] = (n, ms)
         if p.device == "gpu" and hasattr(ctx, "release_gpu_buffers"):
             ctx.release_gpu_buffers()
         if progress:
@@ -1074,7 +1131,7 @@ def _fit_scaling(sub: List[List[float]]) -> Optional[Fit]:
         c, p = max((ys[xs[-1]] - alpha) / xs[-1], 0.0), 1.0
     else:
         c, p = _power_fit(np.array(large)[ok], r[ok])
-    return Fit(alpha, c, 0.0, n_points=len(sub), p=p)
+    return Fit(alpha, c, 0.0, n_points=len(sub), p=p, n_max=xs[-1])
 
 
 def _power_fit(n, r) -> Tuple[float, float]:
@@ -1086,8 +1143,41 @@ def _power_fit(n, r) -> Tuple[float, float]:
     return c, p
 
 
-def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False
-                ) -> Tuple[Dict[str, Fit], Optional[str]]:
+def _fit_join2d(pts: List[List[float]]) -> Optional[Fit]:
+    """time = alpha + a * L**p + b * R over (L=left rows, R=right rows) points.
+
+    The right-row term rides in Fit.g (predict(L, card=R)).  p is chosen by grid search
+    to minimise the worst relative error on the large points; coefficients >= 0."""
+    import numpy as np
+    if len({q[0] for q in pts}) < 3 or len({round(q[1] / q[0], 3) for q in pts}) < 2:
+        return None
+    L = np.array([q[0] for q in pts]); R = np.array([q[1] for q in pts]); y = np.array([q[2] for q in pts])
+    big = L >= 1_000_000
+    if big.sum() < 3:
+        big = np.ones(len(L), dtype=bool)
+    best = None
+    for p in np.arange(1.0, 1.51, 0.05):
+        cols = {"a": np.ones(len(L)), "c": L ** p / 1e6 ** p, "g": R / 1e6}
+        active = ["a", "c", "g"]
+        w = 1.0 / np.sqrt(np.maximum(y, 1e-3))
+        coef = {"a": 0.0, "c": 0.0, "g": 0.0}
+        while active:
+            A = np.stack([cols[k] for k in active], axis=1) * w[:, None]
+            sol, *_ = np.linalg.lstsq(A, y * w, rcond=None)
+            if (sol >= 0).all():
+                coef.update({k: float(v) for k, v in zip(active, sol)})
+                break
+            active.remove(active[int(np.argmin(sol))])
+        pred = coef["a"] + coef["c"] * cols["c"] + coef["g"] * cols["g"]
+        err = float(np.max(np.abs(pred[big] - y[big]) / y[big]))
+        if best is None or err < best[0] - 1e-9:
+            best = (err, float(p), coef)
+    _, p, coef = best
+    return Fit(coef["a"], coef["c"] / 1e6 ** p, coef["g"] / 1e6, n_points=len(pts), p=p, n_max=float(L.max()))
+
+
+def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False,
+                two_d: bool = False) -> Tuple[Dict[str, Fit], Optional[str]]:
     """-> ({"": base fit, ":g<groups>": per-group-count fit, ...}, error).  {} on failure."""
     def line(sub, card_term):
         if len({q[0] for q in sub}) < 3:
@@ -1097,6 +1187,9 @@ def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False
             return Fit(a, c, g, n_points=len(sub))
         return _fit_scaling(sub)
 
+    if two_d:
+        f = _fit_join2d(pts)
+        return ({"": f}, None) if f else ({}, "too few (rows, ratio) points within time budget")
     if not bucketed:
         f = line(pts, uses_card)
         return ({"": f}, None) if f else ({}, "too few sizes within time budget")
@@ -1161,7 +1254,12 @@ def measure_link(sizes_mb: Tuple[int, ...], timer: Callable[[], float] = time.pe
                     host["pinned"] = (ptr, arr)
                     pinned_seen = True
             for kind, (_, arr) in host.items():
-                for d, fn in (("h2d", lambda a: cu.h2d(dev, a)), ("d2h", lambda a: cu.d2h(a, dev))):
+                # D2H into a FRESH np.empty (what the engine does) is ~1.45x slower than into
+                # pre-touched pages (page faults); measure pageable D2H that way.
+                fresh = kind == "pageable"
+                for d, fn in (("h2d", lambda a: cu.h2d(dev, a)),
+                              ("d2h", (lambda a: cu.d2h(np.empty(a.nbytes, np.uint8), dev)) if fresh
+                               else (lambda a: cu.d2h(a, dev)))):
                     fn(arr)                     # warm-up
                     ts = []
                     for _ in range(3):
@@ -1344,7 +1442,7 @@ def calibrate(full: bool = False, *, save: bool = True, verbose: bool = False,
             continue
         try:
             fits, err = _fit_points(_collect_points(p, ctx, sizes, budget, timer, 0.0),
-                                    p.uses_card, p.bucketed)
+                                    p.uses_card, p.bucketed, p.two_d)
         except Exception as exc:
             fits, err = {}, f"{type(exc).__name__}: {exc}"
         if fits:
@@ -1384,7 +1482,7 @@ def calibrate(full: bool = False, *, save: bool = True, verbose: bool = False,
                 op = item["op"]
                 probe_ = registry.get((op, "gpu"))
                 fits, err = _fit_points(item["points"], bool(probe_ and probe_.uses_card),
-                                        bool(probe_ and probe_.bucketed))
+                                        bool(probe_ and probe_.bucketed), bool(probe_ and probe_.two_d))
                 if fits:
                     _store_fits(cal, op, "gpu", fits)
                     fit = fits[""]

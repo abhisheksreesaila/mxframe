@@ -656,7 +656,7 @@ def test_join_total_prices_kernels_host_steps_and_round_trips():
     c = default_calibration(GPU)
     left, right = 6_000_000, 750_000
     expect = (c.estimate("join", "gpu", left) + c.estimate("join_host", "cpu", left)
-              + c.transfer_ms(4 * left, "d2h")
+              + c.transfer_ms(4 * left, "d2h") + c.transfer_ms(8 * left, "d2h")
               + c.transfer_ms(4 * left + 4 * right + 3 * 4 * right, "h2d"))
     assert c.estimate_gpu_join_total(left, right) == pytest.approx(expect)
     assert c.estimate("join_total", "gpu", left, right_rows=right) == pytest.approx(expect)
@@ -671,3 +671,87 @@ def test_join_host_is_cpu_only_and_join_build_not_aliased():
     assert math.isfinite(c.estimate("join_host", "cpu", 10**6))
     assert "join_build" not in cal_mod.OP_ALIASES
     assert c.estimate("join_build", "cpu", 10**6) == c.fit("generic", "cpu").predict(10**6)
+
+
+# ============================ round 3: end-to-end join, schema 2, tail extrapolation ===
+# Recorded end-to-end AOTKernelsGPU.hash_join timings (left_rows, right_rows, ms), min of reps.
+JOIN_E2E = [(100_000, 12_500, .71), (100_000, 100_000, 1.35), (1_000_000, 125_000, 8.4),
+            (1_000_000, 1_000_000, 15.2), (6_000_000, 750_000, 33.9), (6_000_000, 6_000_000, 91.6),
+            (30_000_000, 3_750_000, 165.6)]
+
+
+def test_join_total_fit_matches_recorded_end_to_end_points_at_both_ratios():
+    pts = [[float(a), float(b), ms] for a, b, ms in JOIN_E2E]
+    fits, err = cal_mod._fit_points(pts, False, False, True)
+    f = fits[""]
+    for a, b, ms in JOIN_E2E:
+        tol = 0.4 if a <= 1_000_000 else 0.3
+        assert abs(f.predict(a, b) - ms) / ms < tol, (a, b, f.predict(a, b), ms)
+    # a size/ratio pair that was not measured: 12M rows, 1:4
+    assert 40 < f.predict(12_000_000, 3_000_000) < 130
+
+
+def test_estimate_gpu_join_total_uses_measured_fit_and_out_rows_swaps_result_copy():
+    c = default_calibration(GPU)
+    pts = [[float(a), float(b), ms] for a, b, ms in JOIN_E2E]
+    c.fits["join_total@gpu"] = cal_mod._fit_points(pts, False, False, True)[0][""]
+    base = c.estimate_gpu_join_total(6_000_000, 750_000)
+    assert base == pytest.approx(c.fits["join_total@gpu"].predict(6_000_000, 750_000))
+    assert c.estimate("join_total", "gpu", 6_000_000, right_rows=750_000) == pytest.approx(base)
+    more = c.estimate_gpu_join_total(6_000_000, 750_000, out_rows=24_000_000)
+    assert more - base == pytest.approx(c.transfer_ms(8 * 24_000_000, "d2h") - c.transfer_ms(8 * 6_000_000, "d2h"))
+
+
+def test_join_total_probe_is_end_to_end_hash_join_with_two_ratios():
+    p = cal_mod.PROBES[("join_total", "gpu")]
+    assert p.two_d and p.stat == "min"
+    grid = p.grid(cal_mod.QUICK_SIZES)
+    ratios = {round(r / n, 3) for n, r in grid}
+    assert {0.125, 1.0} <= ratios and max(n for n, _ in grid) == 30_000_000
+
+
+def test_join_total_probe_calls_the_wrapper():
+    calls = []
+
+    class G:
+        def hash_join(self, left, right):
+            calls.append((len(left), len(right)))
+    ctx = cal_mod.ProbeCtx(10_000)
+    ctx._gpu = G()
+    cal_mod.PROBES[("join_total", "gpu")].make(ctx, 10_000, 1_250)()
+    assert calls == [(10_000, 1_250)]
+
+
+def test_schema_version_is_2_and_v1_files_load_as_defaults(tmp_path):
+    assert cal_mod.SCHEMA_VERSION == 2
+    cal = run_fake_calibration()
+    p = tmp_path / "calibration.json"
+    doc = json.loads(p.read_text())
+    doc["schema"] = 1
+    p.write_text(json.dumps(doc))
+    cal_mod.reset_calibration_cache()
+    assert cal_mod.get_calibration().source == "defaults"
+
+
+def test_beyond_largest_measured_size_extrapolates_linearly_from_end_slope():
+    f = Fit(0.0, 1e-9, p=1.4, n_max=30_000_000)
+    slope = 1e-9 * 1.4 * 30_000_000 ** 0.4
+    assert f.predict(60_000_000) == pytest.approx(f.predict(30_000_000) + slope * 30_000_000)
+    assert f.predict(60_000_000) < 1e-9 * 60_000_000 ** 1.4              # power law would overshoot
+    assert f.predict(10_000_000) == pytest.approx(1e-9 * 10_000_000 ** 1.4)   # inside range unchanged
+
+
+def test_scaling_fit_records_n_max_and_roundtrips():
+    pts = [[float(n), 8.0, ms] for n, ms in RECORDED["sort_topk"] if n in QUICK_GRID]
+    f = cal_mod._fit_points(pts, False, False)[0][""]
+    assert f.n_max == 30_000_000 and Fit.from_dict(f.to_dict()).n_max == 30_000_000
+    assert f.predict(60_000_000) < f.alpha + f.c * 60_000_000 ** f.p
+
+
+def test_time_call_min_stat_takes_fastest_sample():
+    clock = Clock()
+    costs = iter([0.5, 0.5, 0.3, 0.1, 0.2, 0.4, 0.4])
+
+    def fn():
+        clock.t += next(costs)
+    assert cal_mod._time_call(fn, clock, 1.0, stat="min") == pytest.approx(100.0)
