@@ -9,7 +9,8 @@ compiled binary handles any row count — no MAX Graph JIT cold starts.
 Multi-core (F-002)
 ------------------
 Every hot kernel takes a trailing `threads` argument: the maximum number of
-worker tasks it may use (<= 0 means "all physical cores").  Work is split into
+worker tasks it may use.  The Python wrapper always passes >= 1 (default: every
+logical core the process may use); a value <= 0 falls back to the physical core count.  Work is split into
 morsels of MORSEL rows that workers claim from one atomic counter (morsel-driven,
 so a worker that loses its core to another process simply takes fewer morsels) and
 run with `sync_parallelize`; small inputs (< MIN_ROWS per worker) run on one worker.  No global state:

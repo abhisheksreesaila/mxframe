@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -64,6 +65,12 @@ def _ptr(arr: np.ndarray) -> int:
     return arr.ctypes.data
 
 
+def _check_len(name: str, arr: np.ndarray, n: int) -> None:
+    """Kernels trust n; a shorter buffer would be read out of bounds."""
+    if len(arr) != n:
+        raise ValueError(f"{name} has {len(arr)} elements, expected {n}")
+
+
 def _arr(a: np.ndarray, dtype) -> np.ndarray:
     """C-contiguous view of `a` as `dtype` (no copy when it already is)."""
     return np.ascontiguousarray(a, dtype=dtype)
@@ -98,6 +105,7 @@ def _threads_from_env() -> int:
 
 
 _cpu_threads: int = _threads_from_env()
+_PIN_LOCK = threading.Lock()
 _RUNTIME_PINNED = False      # Mojo worker pool pinned once per process (see AOTKernels.__init__)
 
 
@@ -154,9 +162,10 @@ class AOTKernels:
         # reference every parallel launch builds and tears down the pool (~1.7 ms).
         global _RUNTIME_PINNED
         self._lib.mx_init_runtime.restype = ctypes.c_int64
-        if not _RUNTIME_PINNED:
-            self._lib.mx_init_runtime()
-            _RUNTIME_PINNED = True
+        with _PIN_LOCK:
+            if not _RUNTIME_PINNED:
+                self._lib.mx_init_runtime()
+                _RUNTIME_PINNED = True
         self._lib.mx_num_physical_cores.restype = ctypes.c_int64
         self._bind()
 
@@ -221,6 +230,7 @@ class AOTKernels:
                threads: Optional[int]) -> np.ndarray:
         kind, v = self._vdt(values)
         lab = _arr(labels, np.int32)
+        _check_len("labels", lab, len(v))
         out = np.empty(n_groups, dtype=np.float64)
         getattr(self, f"_group_{op}_{kind}")(_ptr(out), _ptr(v), _ptr(lab), len(v), n_groups,
                                              self._t(threads))
@@ -276,6 +286,7 @@ class AOTKernels:
     def _masked(self, op: str, values: np.ndarray, mask: np.ndarray, threads) -> float:
         kind, v = self._vdt(values)
         m = _arr(mask, np.int32)
+        _check_len("mask", m, len(v))
         out = np.zeros(1, dtype=np.float64)
         getattr(self, f"_masked_global_{op}_{kind}")(_ptr(out), _ptr(v), _ptr(m), len(v), self._t(threads))
         return float(out[0])
@@ -295,6 +306,8 @@ class AOTKernels:
         kind, a = self._vdt(values_a)
         b = _arr(values_b, np.float32 if kind == "f32" else np.float64)
         m = _arr(mask, np.int32)
+        _check_len("values_b", b, len(a))
+        _check_len("mask", m, len(a))
         out = np.zeros(1, dtype=np.float64)
         getattr(self, f"_masked_global_sum_product_{kind}")(
             _ptr(out), _ptr(a), _ptr(b), _ptr(m), len(a), self._t(threads))

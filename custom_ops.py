@@ -76,6 +76,26 @@ def _expr_col_names(expr, out=None) -> set:
     return out
 
 
+_AOT_WARNED = False
+
+
+def _load_aot_kernels():
+    """AOTKernels(), or None (with one warning) if the library is missing/stale, so the
+    non-AOT path runs instead of every query failing."""
+    global _AOT_WARNED
+    if not AOT_AVAILABLE:
+        return None
+    try:
+        return AOTKernels()
+    except Exception as exc:                      # stale ABI, unloadable .so, ...
+        if not _AOT_WARNED:
+            _AOT_WARNED = True
+            import warnings
+            warnings.warn(f"mxframe: CPU AOT kernels disabled ({exc}); using the fallback path",
+                          RuntimeWarning, stacklevel=3)
+        return None
+
+
 # ── Module-level caches ──────────────────────────────────────────────────────
 # Persist across CustomOpsCompiler instances so repeated .compute() calls
 # reuse the compiled MAX Graph model instead of recompiling from scratch.
@@ -199,7 +219,7 @@ class CustomOpsCompiler(GraphCompiler):
             self.session = None  # lazy: created on first MAX Graph call
         else:
             self.session = _get_or_create_session(self._session_device, self._driver_device)
-        self._aot = AOTKernels() if AOT_AVAILABLE else None
+        self._aot = _load_aot_kernels()
         # GPU AOT init can fail at runtime even when the .so exists (e.g. no CUDA
         # driver in a CPU-only CI runner). Fall back gracefully to CPU-only.
         if GPU_AOT_AVAILABLE:
@@ -840,12 +860,16 @@ class CustomOpsCompiler(GraphCompiler):
         for name in _expr_col_names(expr):
             c = table.column(name)
             cols[name] = c.cast(pa.float64()) if pa.types.is_float32(c.type) else c
+        if not cols:
+            # literal-only expression: keep the row count so literals broadcast to every row
+            cols["__rows__"] = pa.array(np.zeros(table.num_rows, dtype=np.int8))
         sub = pa.table(cols)
+        prev = getattr(_PRECISE, "on", False)
         _PRECISE.on = True
         try:
             res = self._eval_expr_arrow(expr, sub)
         finally:
-            _PRECISE.on = False
+            _PRECISE.on = prev
         return np.ascontiguousarray(res.to_numpy(zero_copy_only=False), dtype=np.float64)
 
     def _get_col_agg(self, col_name: str, table: pa.Table) -> "Optional[np.ndarray]":
@@ -2420,9 +2444,14 @@ class CustomOpsCompiler(GraphCompiler):
         for col_name in left_table.column_names:
             arrays.append(left_take.column(col_name))
             names.append(col_name)
-        right_take = right_table.take(ri64)
+        empty_right = right_table.num_rows == 0
+        right_take = None if empty_right else right_table.take(ri64)
         for col_name in right_table.column_names:
             if col_name in right_on:
+                continue
+            if empty_right:                       # nothing to take from: every row is unmatched
+                arrays.append(pa.nulls(len(left_idx), type=right_table.schema.field(col_name).type))
+                names.append(col_name)
                 continue
             col_arr = right_take.column(col_name)
             if not has_match.all():
@@ -2441,8 +2470,8 @@ class CustomOpsCompiler(GraphCompiler):
         rk = np.ascontiguousarray(right_keys.astype(np.int32)) if n_right > 0 else np.array([], dtype=np.int32)
 
         if self._aot is not None:
-            mc = self._aot.join_count_left(lk, rk if n_right > 0 else np.zeros(1, dtype=np.int32))
-            lo, ro = self._aot.join_scatter_left(lk, rk if n_right > 0 else np.zeros(1, dtype=np.int32), mc)
+            mc = self._aot.join_count_left(lk, rk)
+            lo, ro = self._aot.join_scatter_left(lk, rk, mc)
             return lo, ro
         # Pass 1: count
         ck1 = ("join_count_left_cpu", n_left, n_right, self._session_device)
