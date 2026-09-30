@@ -61,6 +61,16 @@ except ImportError:
         )
 
 
+def calibrate(full: bool = False, **kwargs):
+    """Measure this machine (link bandwidth, GPU init, per-kernel cost fits) and save it
+    to ~/.mxframe/calibration.json.  Quick mode takes < 30 s.  See `mxframe.calibration`.
+
+    Imported lazily so `import mxframe` stays fast.
+    """
+    from .calibration import calibrate as _calibrate
+    return _calibrate(full, **kwargs)
+
+
 def warmup(device: str = "auto") -> float:
     """Pre-initialize MAX runtime and pre-compile a canonical graph for fast first-query.
 
@@ -157,7 +167,7 @@ __all__ = [
     # custom_ops
     "CustomOpsCompiler", "KERNELS_PATH",
     # caching
-    "clear_cache", "warmup",
+    "clear_cache", "warmup", "calibrate",
     # I/O
     "from_arrow", "from_pandas", "from_polars", "read_csv", "read_parquet",
     # SQL
