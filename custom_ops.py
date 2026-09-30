@@ -8,7 +8,7 @@ __all__ = ['KERNELS_PATH', 'WARP_SIZE', 'MAX_GROUPS', 'AUTO_GPU_THRESHOLD', 'GPU
 # %% ../nbs/04_custom_ops.ipynb 2
 from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of
+from .np_arrow import array as _npa, to_numpy as _np_of, take_rows as _take_rows
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
@@ -2807,8 +2807,8 @@ class CustomOpsCompiler(GraphCompiler):
             left_take  = self._aot_gpu.gather_table(left_table,  left_idx)
             right_take = self._aot_gpu.gather_table(right_table, right_idx)
         else:
-            left_take = left_table.take(_npa(left_idx.astype(np.int64)))
-            right_take = right_table.take(_npa(right_idx.astype(np.int64)))
+            left_take = _take_rows(left_table, left_idx)
+            right_take = _take_rows(right_table, right_idx)
 
         # Combine: all left columns + right columns excluding join keys
         arrays = []
@@ -2915,19 +2915,17 @@ class CustomOpsCompiler(GraphCompiler):
 
     def _assemble_left_outer(self, left_table, right_table, right_on, left_idx, right_idx):
         """Assemble left-outer result. right_idx==-1 means no match (null right cols)."""
-        li64 = _npa(left_idx.astype(np.int64))
-        left_take = left_table.take(li64)
+        left_take = _take_rows(left_table, left_idx)
         has_match = (right_idx >= 0)
         safe_right = right_idx.copy()
         safe_right[~has_match] = 0
-        ri64 = _npa(safe_right.astype(np.int64))
         null_mask_arr = _npa(~has_match)
         arrays, names = [], []
         for col_name in left_table.column_names:
             arrays.append(left_take.column(col_name))
             names.append(col_name)
         empty_right = right_table.num_rows == 0
-        right_take = None if empty_right else right_table.take(ri64)
+        right_take = None if empty_right else _take_rows(right_table, safe_right)
         for col_name in right_table.column_names:
             if col_name in right_on:
                 continue

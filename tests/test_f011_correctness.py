@@ -47,3 +47,34 @@ def _run(name, device):
 ])
 def test_scenario(name, device):
     _run(name, device)
+
+
+# --- gathering strings ---------------------------------------------------------------------
+
+def test_take_rows_slices_string_columns(monkeypatch):
+    import numpy as np
+    import pyarrow as pa
+    from mxframe import np_arrow
+    monkeypatch.setattr(np_arrow, "TAKE_CHUNK_ROWS", 100)
+    t = pa.table({"s": pa.array([f"v{i}" for i in range(1000)]), "k": pa.array(np.arange(1000, dtype=np.int64))})
+    idx = np.random.default_rng(1).integers(0, 1000, 950)
+    got = np_arrow.take_rows(t, idx)
+    assert got.equals(t.take(pa.array(idx)))
+    assert got.column("s").num_chunks == 10 and got.column("k").num_chunks == 1     # only strings are sliced
+    col = np_arrow.take_rows(t.column("s").combine_chunks(), idx)
+    assert col.to_pylist() == [f"v{i}" for i in idx]
+
+
+@pytest.mark.slow
+def test_take_rows_survives_more_than_2gib_of_strings():
+    """Arrow's take returns a corrupt column (`Negative offsets in binary array`) past 2 GiB of
+    string data: a lineitem-to-orders join at SF10 gathers 3 GB of o_comment."""
+    import numpy as np
+    import pyarrow as pa
+    from mxframe import np_arrow
+    n = 1_000_000
+    t = pa.table({"s": pa.array(["x" * 100 + str(i % 10) for i in range(n)])})       # 100 MB
+    idx = np.tile(np.arange(n, dtype=np.int64), 24)                                    # 2.4 GB gathered
+    out = np_arrow.take_rows(t, idx)
+    out.validate(full=True)
+    assert out.num_rows == 24 * n and out.column("s")[24 * n - 1].as_py().endswith("9")

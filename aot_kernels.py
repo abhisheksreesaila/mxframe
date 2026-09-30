@@ -21,6 +21,8 @@ from typing import Optional
 
 import numpy as np
 
+from .np_arrow import take_rows
+
 # The Mojo device-context memory manager reserves ~90% of the GPU's free memory the first time
 # a kernel creates a buffer (the recursive scan does, at >= 1M rows), and this module's own
 # cuMemAlloc calls (uploads, join outputs, gathers) then fail with out-of-memory at TPC-H SF10,
@@ -1322,7 +1324,7 @@ class AOTKernelsGPU:
             is_signed_int = pa.types.is_signed_integer(col.type)
             if col.null_count:
                 # a validity mask is not gathered by these kernels: Arrow's take keeps the nulls
-                arrays.append(col.take(pa.array(idx32.astype(np.int64))))
+                arrays.append(take_rows(col, idx32))
             elif pa.types.is_float32(col.type):
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.float32))
@@ -1362,7 +1364,7 @@ class AOTKernelsGPU:
                 self._cu.free(out)
             else:
                 # Non-numeric fallback: PyArrow CPU take
-                arrays.append(col.take(pa.array(idx32.astype(np.int64))))
+                arrays.append(take_rows(col, idx32))
             names.append(col_name)
 
         self._cu.free(idx_dev)

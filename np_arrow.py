@@ -93,3 +93,38 @@ def to_numpy(obj, zero_copy_only: bool = False, **kwargs):
     if buf is None:
         return np.empty(0, dtype=dt)
     return np.frombuffer(buf, dtype=dt, count=len(obj), offset=obj.offset * np.dtype(dt).itemsize)
+
+
+# --- gathering rows -------------------------------------------------------------------------
+
+TAKE_CHUNK_ROWS = 1 << 22        # 4M rows per slice for variable-width columns
+
+
+def _has_32bit_offsets(t) -> bool:
+    return pa.types.is_string(t) or pa.types.is_binary(t) or pa.types.is_list(t)
+
+
+def take_rows(obj, idx):
+    """``obj.take(idx)`` for a table, chunked or plain array and a NumPy row-index array.
+
+    A column with 32-bit offsets (string, binary, list) gathered into more than 2 GiB of
+    values comes back as a corrupt array (``Negative offsets in binary array``): joining
+    60M TPC-H lineitem rows to their orders gathers 3 GB of ``o_comment``.  Such columns are
+    gathered in slices of ``TAKE_CHUNK_ROWS`` rows and returned as a chunked array; every
+    other column is gathered in one call, as before."""
+    idx = np.ascontiguousarray(idx, dtype=np.int64)
+    n = len(idx)
+
+    def one(col, sliced: bool):
+        if not sliced or n <= TAKE_CHUNK_ROWS:
+            return col.take(array(idx))
+        parts = [col.take(array(idx[i:i + TAKE_CHUNK_ROWS])) for i in range(0, n, TAKE_CHUNK_ROWS)]
+        chunks = [c for p in parts for c in (p.chunks if isinstance(p, pa.ChunkedArray) else [p])]
+        return pa.chunked_array(chunks, type=col.type)
+
+    if isinstance(obj, pa.Table):
+        if n <= TAKE_CHUNK_ROWS or not any(_has_32bit_offsets(t) for t in obj.schema.types):
+            return obj.take(array(idx))
+        cols = [one(obj.column(i), _has_32bit_offsets(obj.schema.types[i])) for i in range(obj.num_columns)]
+        return pa.Table.from_arrays(cols, schema=obj.schema)
+    return one(obj, _has_32bit_offsets(obj.type))
