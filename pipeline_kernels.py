@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
+import weakref
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
@@ -132,3 +133,251 @@ def run_pipeline_cpu(program: PipelineProgram, columns: Sequence[np.ndarray],
     if rc != 0:
         raise RuntimeError(f"mx_pipeline_cpu failed with code {rc}")
     return Partials(vals=vals, cnt=cnt)
+
+
+# ── GPU ─────────────────────────────────────────────────────────────────────
+# The CUDA driver API on the device's primary context, the same context Mojo's
+# DeviceContext() uses, so device pointers allocated here are visible in the
+# kernels. Nothing below runs (and libcuda is not loaded) until a GPU function
+# is called.
+
+class _Cuda:
+    """Minimal CUDA driver wrapper (memory + copies + SM count)."""
+
+    def __init__(self):
+        lib = None
+        for name in ("libcuda.so.1", "libcuda.so"):
+            try:
+                lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                pass
+        if lib is None:
+            raise RuntimeError("libcuda.so not found")
+        self.lib = lib
+        u64, i32, sz, vp = ctypes.c_uint64, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p
+        lib.cuInit.argtypes = [ctypes.c_uint]
+        err = lib.cuInit(0)
+        if err != 0:
+            raise RuntimeError(f"cuInit failed: {err}")
+        dev = ctypes.c_int(0)
+        lib.cuDeviceGet.argtypes = [ctypes.POINTER(i32), i32]
+        lib.cuDevicePrimaryCtxRetain.argtypes = [ctypes.POINTER(u64), i32]
+        lib.cuCtxSetCurrent.argtypes = [u64]
+        if lib.cuDeviceGet(ctypes.byref(dev), 0) != 0:
+            raise RuntimeError("no CUDA device")
+        ctx = u64(0)
+        lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev)
+        self.ctx = ctx
+        lib.cuMemAlloc_v2.argtypes = [ctypes.POINTER(u64), sz]
+        lib.cuMemFree_v2.argtypes = [u64]
+        lib.cuMemcpyHtoD_v2.argtypes = [u64, vp, sz]
+        lib.cuMemcpyDtoH_v2.argtypes = [vp, u64, sz]
+        lib.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(i32), i32, i32]
+        n = ctypes.c_int(0)
+        lib.cuDeviceGetAttribute(ctypes.byref(n), 16, dev)  # MULTIPROCESSOR_COUNT
+        self.sm_count = max(int(n.value), 1)
+        self._tls = threading.local()
+
+    def bind_thread(self) -> None:
+        """Make the primary context current on the calling thread (Router workers)."""
+        if not getattr(self._tls, "bound", False):
+            self.lib.cuCtxSetCurrent(self.ctx)
+            self._tls.bound = True
+
+    def malloc(self, nbytes: int) -> int:
+        self.bind_thread()
+        ptr = ctypes.c_uint64(0)
+        err = self.lib.cuMemAlloc_v2(ctypes.byref(ptr), max(int(nbytes), 8))
+        if err != 0:
+            raise MemoryError(f"cuMemAlloc({nbytes}) failed: {err}")
+        return int(ptr.value)
+
+    def free(self, ptr: int) -> None:
+        if ptr:
+            self.bind_thread()
+            self.lib.cuMemFree_v2(ctypes.c_uint64(ptr))
+
+    def h2d(self, dev_ptr: int, arr: np.ndarray) -> None:
+        self.bind_thread()
+        if arr.nbytes:
+            err = self.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), ctypes.c_void_p(arr.ctypes.data),
+                                           ctypes.c_size_t(arr.nbytes))
+            if err != 0:
+                raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
+
+    def d2h(self, arr: np.ndarray, dev_ptr: int) -> None:
+        self.bind_thread()
+        if arr.nbytes:
+            err = self.lib.cuMemcpyDtoH_v2(ctypes.c_void_p(arr.ctypes.data), ctypes.c_uint64(dev_ptr),
+                                           ctypes.c_size_t(arr.nbytes))
+            if err != 0:
+                raise RuntimeError(f"cuMemcpyDtoH failed: {err}")
+
+    def sync(self) -> None:
+        self.bind_thread()
+        self.lib.cuCtxSynchronize()
+
+    def upload(self, arr: np.ndarray) -> int:
+        arr = np.ascontiguousarray(arr)
+        ptr = self.malloc(arr.nbytes)
+        self.h2d(ptr, arr)
+        return ptr
+
+
+_cuda: Optional[_Cuda] = None
+
+
+def _get_cuda() -> _Cuda:
+    global _cuda
+    with _lock:
+        if _cuda is None:
+            _cuda = _Cuda()
+    return _cuda
+
+
+def _load_gpu():
+    global _gpu_lib
+    with _lock:
+        if _gpu_lib is None:
+            path = _find("libmxpipeline_gpu.so", "MXFRAME_PIPELINE_GPU_LIB")
+            if path is None:
+                raise FileNotFoundError("libmxpipeline_gpu.so not found")
+            lib = ctypes.CDLL(str(path))
+            fn = lib.mx_pipeline_gpu
+            fn.restype = _I64
+            fn.argtypes = [_I64] * 15
+            _gpu_lib = lib
+    return _gpu_lib
+
+
+class _DeviceProgram:
+    """Bytecode, constants, sets and identities of one program, resident on the GPU."""
+
+    def __init__(self, program: PipelineProgram, cu: _Cuda):
+        self.cu = cu
+        self.code = cu.upload(program.code)
+        self.consts = cu.upload(program.consts)
+        self.set_bytes = cu.upload(program.set_bytes)
+        self.set_meta = cu.upload(program.set_meta)
+        self.ident = cu.upload(program.identity if program.n_slots else np.zeros(1))
+        self._ptrs = [self.code, self.consts, self.set_bytes, self.set_meta, self.ident]
+
+    def free(self):
+        for p in self._ptrs:
+            self.cu.free(p)
+        self._ptrs = []
+
+
+def _device_program(program: PipelineProgram, cu: _Cuda) -> _DeviceProgram:
+    dp = getattr(program, "_device_program", None)
+    if dp is None:
+        dp = _DeviceProgram(program, cu)
+        program._device_program = dp
+        weakref.finalize(program, dp.free)
+    return dp
+
+
+class DeviceColumns:
+    """Columns (and group ids) resident on the GPU for rows ``[base_row, base_row + n_rows)``.
+
+    Lets a Router upload a morsel itself (on its own copy stream) and hand the
+    kernel already-resident pointers.
+    """
+
+    def __init__(self, ptrs: List[int], dtypes: List[int], gid_ptr: int, base_row: int, n_rows: int,
+                 owned: Optional[List[int]] = None, cu: Optional[_Cuda] = None):
+        self.ptrs, self.dtypes, self.gid_ptr = ptrs, dtypes, gid_ptr
+        self.base_row, self.n_rows = base_row, n_rows
+        self._owned = owned or []
+        self._cu = cu
+
+    def free(self) -> None:
+        if self._cu is not None:
+            for p in self._owned:
+                self._cu.free(p)
+        self._owned = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.free()
+
+
+def upload_columns(program: PipelineProgram, columns: Sequence[np.ndarray], gids: Optional[np.ndarray],
+                   start: int, end: int) -> DeviceColumns:
+    """Copy rows ``[start, end)`` of each column (and ``gids``) to the GPU."""
+    cu = _get_cuda()
+    cols, gids = _columns_and_gids(program, columns, gids, 1 if gids is None else 2)
+    owned: List[int] = []
+    try:
+        ptrs = []
+        for c in cols:
+            p = cu.upload(c[start:end])
+            owned.append(p)
+            ptrs.append(p)
+        gp = 0
+        if gids is not None:
+            gp = cu.upload(gids[start:end])
+            owned.append(gp)
+    except BaseException:
+        for p in owned:
+            cu.free(p)
+        raise
+    return DeviceColumns(ptrs, [dtype_code(c) for c in cols], gp, start, end - start, owned, cu)
+
+
+def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarray], DeviceColumns],
+                     gids: Optional[np.ndarray], n_groups: int, start: int, end: int) -> Partials:
+    """Run the program over rows ``[start, end)`` on the GPU.
+
+    ``columns`` are host arrays (only the row range is copied over) or a
+    :class:`DeviceColumns` already on the device.
+    """
+    lib = _load_gpu()
+    cu = _get_cuda()
+    dp = _device_program(program, cu)
+    if start < 0 or start > end:
+        raise ValueError(f"bad row range [{start}, {end})")
+    n_slots = program.n_slots
+    temps: List[int] = []
+    dev_cols: Optional[DeviceColumns] = None
+    try:
+        if isinstance(columns, DeviceColumns):
+            dc = columns
+            if start < dc.base_row or end > dc.base_row + dc.n_rows:
+                raise ValueError("row range outside the resident columns")
+        else:
+            host_cols, gids = _columns_and_gids(program, columns, gids, n_groups)
+            n_rows = min([len(c) for c in host_cols] + ([len(gids)] if gids is not None else [end]))
+            if end > n_rows:
+                raise ValueError(f"row range [{start}, {end}) outside 0..{n_rows}")
+            dc = dev_cols = upload_columns(program, host_cols, gids, start, end)
+        k_start, k_end = start - dc.base_row, end - dc.base_row
+        col_ptrs = cu.upload(np.array(dc.ptrs or [0], dtype=np.int64))
+        col_dt = cu.upload(np.array(dc.dtypes or [0], dtype=np.int32))
+        out_vals = cu.malloc(max(n_slots * n_groups, 1) * 8)
+        out_cnt = cu.malloc(n_groups * 8)
+        temps += [col_ptrs, col_dt, out_vals, out_cnt]
+        cu.sync()
+        if n_groups != 1 and not dc.gid_ptr:
+            raise ValueError("gids may only be omitted for a global aggregate (n_groups == 1)")
+        rc = lib.mx_pipeline_gpu(
+            dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
+            dc.gid_ptr if n_groups > 1 else 0, n_groups, n_slots, k_start, k_end,
+            out_vals, out_cnt, dp.ident, cu.sm_count * 6,
+        )
+        if rc != 0:
+            raise RuntimeError(f"mx_pipeline_gpu failed with code {rc}")
+        vals = np.empty((n_slots, n_groups), dtype=np.float64)
+        cnt = np.empty(n_groups, dtype=np.int64)
+        if n_slots:
+            cu.d2h(vals, out_vals)
+        cu.d2h(cnt, out_cnt)
+        return Partials(vals=vals, cnt=cnt)
+    finally:
+        for p in temps:
+            cu.free(p)
+        if dev_cols is not None:
+            dev_cols.free()

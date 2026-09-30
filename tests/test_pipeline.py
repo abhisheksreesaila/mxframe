@@ -14,6 +14,25 @@ from mxframe.pipeline_program import (
 RNG = np.random.default_rng(7)
 
 
+def _gpu_ok():
+    if not pk.gpu_available():
+        return False
+    try:
+        pk._get_cuda()
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(params=["cpu", "gpu"])
+def device(request):
+    if request.param == "cpu" and not pk.cpu_available():
+        pytest.skip("libmxpipeline_cpu.so not built")
+    if request.param == "gpu" and not _gpu_ok():
+        pytest.skip("no GPU or libmxpipeline_gpu.so not built")
+    return request.param
+
+
 def make_table(n, n_keys=4):
     return pa.table({
         "i32": pa.array(RNG.integers(-50, 50, n).astype(np.int32)),
@@ -188,7 +207,7 @@ AGGS = {
 }
 
 
-def run_case(t, preds, aggs, n_groups, start, end, threads=4, gids=None, device="cpu"):
+def run_case(t, preds, aggs, n_groups, start, end, threads=4, gids=None, device="cpu"):  # noqa
     prog = compile_pipeline(preds, aggs, t)
     assert prog is not None, (preds, aggs)
     arrays = prog.bind(t)
@@ -218,22 +237,18 @@ def cpu_table():
 @pytest.mark.parametrize("pname", list(PREDS))
 @pytest.mark.parametrize("aname", list(AGGS))
 @pytest.mark.parametrize("n_groups", [1, 4])
-def test_cpu_matches_reference(cpu_table, pname, aname, n_groups):
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
+def test_matches_reference(device, cpu_table, pname, aname, n_groups):
     n = cpu_table.num_rows
-    prog, parts, ref, cnt = run_case(cpu_table, PREDS[pname], AGGS[aname], n_groups, 0, n)
+    prog, parts, ref, cnt = run_case(cpu_table, PREDS[pname], AGGS[aname], n_groups, 0, n, device=device)
     check(prog, parts, ref, cnt, grouped=n_groups > 1)
 
 
 @pytest.mark.parametrize("dtype_col", ["i32", "i64", "f32", "f64", "flag"])
-def test_every_column_dtype_loads(cpu_table, dtype_col):
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
+def test_every_column_dtype_loads(device, cpu_table, dtype_col):
     aggs = [col(dtype_col).sum().alias("s")] if dtype_col != "flag" else [col("f32").sum().alias("s")]
     preds = [] if dtype_col != "flag" else [col("flag")]
     n = cpu_table.num_rows
-    prog, parts, ref, cnt = run_case(cpu_table, preds, aggs, 1, 0, n)
+    prog, parts, ref, cnt = run_case(cpu_table, preds, aggs, 1, 0, n, device=device)
     check(prog, parts, ref, cnt, grouped=False)
 
 
@@ -242,40 +257,34 @@ def test_every_column_dtype_loads(cpu_table, dtype_col):
     (5000, 3, 4999), (200_003, 12_345, 199_999), (70_000, 65_536, 70_000),
 ])
 @pytest.mark.parametrize("n_groups", [1, 4])
-def test_cpu_ranges_not_aligned_to_vectors(n, start, end, n_groups):
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
+def test_ranges_not_aligned_to_vectors(device, n, start, end, n_groups):
     t = make_table(max(n, 1)).slice(0, n) if n else make_table(1).slice(0, 0)
-    prog, parts, ref, cnt = run_case(t, PREDS["q6"][:0] + [col("f64") > lit(0.0)], AGGS["all_ops"], n_groups, start, end)
+    prog, parts, ref, cnt = run_case(t, PREDS["q6"][:0] + [col("f64") > lit(0.0)], AGGS["all_ops"], n_groups, start, end, device=device)
     check(prog, parts, ref, cnt, grouped=n_groups > 1)
 
 
-def test_cpu_many_groups():
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
+def test_many_groups(device):
     n, g = 400_000, 1_500_000
     t = make_table(n)
     gids = RNG.integers(0, g, n).astype(np.int32)
     aggs = [col("f32").sum().alias("s"), col("f64").min().alias("lo"), col("f64").max().alias("hi"),
             col("i32").count().alias("c")]
-    prog, parts, ref, cnt = run_case(t, [col("f32") > lit(5.0)], aggs, g, 0, n, gids=gids)
+    prog, parts, ref, cnt = run_case(t, [col("f32") > lit(5.0)], aggs, g, 0, n, gids=gids, device=device)
     check(prog, parts, ref, cnt, grouped=True)
 
 
 @pytest.mark.parametrize("n_groups", [1, 4])
-def test_split_ranges_merge_to_full_result(cpu_table, n_groups):
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
+def test_split_ranges_merge_to_full_result(device, cpu_table, n_groups):
     t = cpu_table
     n = t.num_rows
     preds, aggs = PREDS["cmp"], AGGS["all_ops"] + AGGS["expr"]
     prog = compile_pipeline(preds, aggs, t)
     arrays = prog.bind(t)
     gids = RNG.integers(0, n_groups, n).astype(np.int32) if n_groups > 1 else None
-    full = pk.run_pipeline_cpu(prog, arrays, gids, n_groups, 0, n)
+    run = pk.run_pipeline_cpu if device == "cpu" else pk.run_pipeline_gpu
+    full = run(prog, arrays, gids, n_groups, 0, n)
     cuts = [0, 1, 4097, 20_000, 33_333, n]
-    parts = [pk.run_pipeline_cpu(prog, arrays, gids, n_groups, a, b, threads=2)
-             for a, b in zip(cuts, cuts[1:])]
+    parts = [run(prog, arrays, gids, n_groups, a, b) for a, b in zip(cuts, cuts[1:])]
     merged = merge_partials(prog, parts[::-1])   # merge order must not matter
     assert np.array_equal(merged.cnt, full.cnt)
     np.testing.assert_allclose(merged.vals, full.vals, rtol=1e-12)
@@ -290,21 +299,34 @@ def test_thread_count_does_not_change_result(cpu_table, threads):
     check(prog, parts, ref, cnt, grouped=True)
 
 
-def test_global_agg_over_no_rows_finalizes_to_zero(cpu_table):
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
-    prog, parts, ref, cnt = run_case(cpu_table, PREDS["all_filtered"], AGGS["all_ops"], 1, 0, cpu_table.num_rows)
+def test_global_agg_over_no_rows_finalizes_to_zero(device, cpu_table):
+    prog, parts, ref, cnt = run_case(cpu_table, PREDS["all_filtered"], AGGS["all_ops"], 1, 0, cpu_table.num_rows, device=device)
     present, cols = finalize(prog, parts, grouped=False)
     assert all(float(v[0]) == 0.0 for v in cols.values())
     assert cols["e"].dtype == np.int64
 
 
-def test_grouped_finalize_drops_empty_groups(cpu_table):
-    if not pk.cpu_available():
-        pytest.skip("libmxpipeline_cpu.so not built")
+def test_grouped_finalize_drops_empty_groups(device, cpu_table):
     n = cpu_table.num_rows
     gids = np.where(np.arange(n) % 2 == 0, 0, 2).astype(np.int32)   # groups 1 and 3 never occur
-    prog, parts, ref, cnt = run_case(cpu_table, [], AGGS["sum"], 4, 0, n, gids=gids)
+    prog, parts, ref, cnt = run_case(cpu_table, [], AGGS["sum"], 4, 0, n, gids=gids, device=device)
     present, cols = finalize(prog, parts, grouped=True)
     assert present.tolist() == [True, False, True, False]
     assert len(cols["s"]) == 2
+
+
+def test_gpu_accepts_device_resident_columns(cpu_table):
+    if not _gpu_ok():
+        pytest.skip("no GPU or libmxpipeline_gpu.so not built")
+    t = cpu_table
+    n = t.num_rows
+    prog = compile_pipeline(PREDS["cmp"], AGGS["all_ops"], t)
+    arrays = prog.bind(t)
+    gids = RNG.integers(0, 4, n).astype(np.int32)
+    want = pk.run_pipeline_cpu(prog, arrays, gids, 4, 10_000, 40_000)
+    with pk.upload_columns(prog, arrays, gids, 10_000, 40_000) as dc:   # a morsel uploaded by the Router
+        got = pk.run_pipeline_gpu(prog, dc, None, 4, 10_000, 40_000)
+        half = pk.run_pipeline_gpu(prog, dc, None, 4, 10_000, 25_000)
+    assert np.array_equal(got.cnt, want.cnt)
+    np.testing.assert_allclose(got.vals, want.vals, rtol=1e-12)
+    assert half.cnt.sum() < got.cnt.sum()
