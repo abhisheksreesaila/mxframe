@@ -211,8 +211,12 @@ def _estimated_pass(md, names, need) -> float:
 def _str_fraction(value, lo, hi) -> float:
     """Where ``value`` falls between strings ``lo`` and ``hi`` (0..1), by their first 6 bytes."""
     def num(x):
-        return int.from_bytes(x.encode("utf-8")[:6].ljust(6, b"\0"), "big")
-    a, z, v = num(lo), num(hi), num(value)
+        b = x if isinstance(x, (bytes, bytearray)) else str(x).encode("utf-8")
+        return int.from_bytes(bytes(b[:6]).ljust(6, b"\0"), "big")
+    try:
+        a, z, v = num(lo), num(hi), num(value)
+    except Exception:             # an estimate only: never let odd statistics fail a query
+        return 0.5
     return min(max((v - a) / (z - a), 0.0), 1.0) if z > a else 0.5
 
 

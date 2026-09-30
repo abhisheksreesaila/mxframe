@@ -222,7 +222,7 @@ Needs: none · Scoreboard reported ~700 ms under load; measured 172 ms idle → 
 - [x] profile `python -X importtime -c "import mxframe"`; defer everything not needed to build a plan (pyarrow.parquet/csv, compute, numpy submodules, calibration, np_arrow) until first use
 - [x] `import mxframe` < 150 ms; the background warm-up still overlaps the rest
 
-## F-020 Remaining SF10 gaps after F-018 [todo]
+## F-020 Remaining SF10 gaps after F-018 [done]
 Needs: F-018 merged · From the F-018 report (2026-09-30)
 - [x] Q21 (4.7x Polars at SF10): integer group/distinct keys are encoded by direct addressing in Mojo (`groupkeys_cpu.mojo`, `group_keys.encode_int`: first-appearance numbering like Arrow's hash; sparse composites ranked by the radix sort, `dense_sorted`; `first_rows` for Distinct). SF10 Q21 19.2 s -> 9.4 s (Polars 4.2 s), SF1 1.94 s -> 1.0 s. Wide-range keys still use Arrow's hash
 - [x] Q10 (7.2x): string `==`/`!=`/range/isin filters are evaluated on dictionary codes inside the Parquet reader (also for columns the plan does not keep as dictionaries). SF10 Q10 2.47 s -> 1.21 s (Polars 0.34 s; the rest is Parquet decode, F-021)
