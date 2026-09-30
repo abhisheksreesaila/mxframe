@@ -9,7 +9,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, lit
+from mxframe import LazyFrame, col, lit, when
 from mxframe.lazy_frame import Scan
 import mxframe.custom_ops as custom_ops
 from mxframe.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE
@@ -66,7 +66,8 @@ def _fact(n=60_000, seed=0):
 
 def _dim():
     return pa.table({"pk": pa.array(np.arange(500, dtype=np.int32)),
-                     "region": pa.array((np.arange(500) % 5).astype(np.int32))})
+                     "region": pa.array((np.arange(500) % 5).astype(np.int32)),
+                     "tier": pa.array((np.arange(500) % 3).astype(np.int32))})
 
 
 def _shapes():
@@ -85,7 +86,14 @@ def _shapes():
             .sort("flag").compute(device=dev)),
         "join then group": lambda dev: (
             LazyFrame(Scan(f)).join(LazyFrame(Scan(d)), left_on="fk", right_on="pk")
-            .groupby("region").agg(col("price").sum().alias("s")).sort("region").compute(device=dev)),
+            .groupby("region", "tier").agg(col("price").sum().alias("s")).sort("region", "tier").compute(device=dev)),
+        "computed column then group": lambda dev: (
+            LazyFrame(Scan(f))
+            .with_columns((col("price") * (lit(1.0) - col("disc"))).alias("vol"),
+                          when(col("k1") == lit(1), col("price"), lit(0.0)).alias("k1_price"))
+            .groupby("k1", "k2")
+            .agg(col("vol").sum().alias("total"), col("k1_price").sum().alias("k1_total"))
+            .sort("k1", "k2").compute(device=dev)),
         "sort + limit": lambda dev: (
             LazyFrame(Scan(f)).sort("price", descending=True).limit(10).compute(device=dev)),
         "distinct": lambda dev: (

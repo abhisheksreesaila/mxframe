@@ -101,28 +101,20 @@ def _load_aot_kernels():
 # Nothing here runs for device="cpu".  device="auto" starts a background warm-up (CUDA
 # context + GPU AOT library) and device="gpu" initialises on first use; both share the
 # one process-wide AOTKernelsGPU / CUDA driver (see aot_kernels.get_aot_gpu).
-_LOCAL_WARMUP = None
 _ACCELERATOR: Dict[str, Any] = {}
 _ACCEL_LOCK = _threading.Lock()
 
 
 def _process_gpu_warmup():
-    """The process-wide GpuWarmup (auto_mode.get_gpu_warmup when it exists)."""
-    global _LOCAL_WARMUP
-    from . import auto_mode
-    getter = getattr(auto_mode, "get_gpu_warmup", None)
-    if getter is not None:
-        return getter()
-    with _ACCEL_LOCK:
-        if _LOCAL_WARMUP is None:
-            _LOCAL_WARMUP = auto_mode.GpuWarmup(get_aot_gpu, expected_ms=400.0)
-        return _LOCAL_WARMUP
+    """The process-wide GpuWarmup (started on first call): CUDA context + GPU AOT library."""
+    from .auto_mode import get_gpu_warmup
+    return get_gpu_warmup()
 
 
 def _start_gpu_warmup() -> None:
     """Begin GPU initialisation in the background (no-op without GPU AOT support)."""
     if GPU_AOT_AVAILABLE:
-        _process_gpu_warmup().start()
+        _process_gpu_warmup()
 
 
 def _max_accelerator():
@@ -295,7 +287,8 @@ class CustomOpsCompiler(GraphCompiler):
         if self._session_device != "gpu" or not GPU_AOT_AVAILABLE:
             return None
         if self._aot_gpu_obj is None:
-            self._aot_gpu_obj = get_aot_gpu()      # blocks on the lock while a warm-up initialises
+            warm = _process_gpu_warmup()           # starts it if nobody has; reused, never initialised twice
+            self._aot_gpu_obj = warm.result if warm.wait() else None
         return self._aot_gpu_obj
 
     @_aot_gpu.setter
@@ -313,7 +306,8 @@ class CustomOpsCompiler(GraphCompiler):
         self._auto_pending = False
         if _scan_rows(plan) <= AUTO_GPU_THRESHOLD or not GPU_AOT_AVAILABLE:
             return
-        if not _process_gpu_warmup().wait():
+        warm = _process_gpu_warmup()
+        if not warm.wait():
             return
         acc = _max_accelerator()
         if acc is None:
@@ -1245,6 +1239,53 @@ class CustomOpsCompiler(GraphCompiler):
         optimizer_sig = tuple(optimizer_trace or ())
         return (plan_sig, input_sig, n_groups, self._session_device, optimizer_sig)
 
+    _WINDOW_OPS = frozenset({"window", "row_number", "rank", "dense_rank"})
+
+    @classmethod
+    def _inline_project_into_aggregate(cls, plan):
+        """``Aggregate(Project(x))`` -> ``Aggregate(x)`` with the projected expressions
+        substituted into the group keys / aggregate arguments.
+
+        The AOT aggregation kernels evaluate their arguments from the source columns, so a
+        ``with_columns(...)`` computed column feeding a grouped aggregate (TPC-H Q8) would
+        otherwise push the query onto the MAX Graph JIT path.  Left alone when the
+        Project holds window functions."""
+        if not (isinstance(plan, Aggregate) and plan.group_by and isinstance(plan.input, Project)):
+            return plan
+        proj = plan.input
+
+        def has_window(e):
+            if not isinstance(e, Expr):
+                return False
+            return e.op in cls._WINDOW_OPS or any(has_window(a) for a in e.args)
+
+        if any(has_window(e) for e in proj.exprs):
+            return plan
+        mapping = {}
+        for e in proj.exprs:
+            name = e._alias or (e.args[0] if e.op == "col" else None)
+            if name is None or (e.op == "col" and e.args[0] == name):
+                continue                      # pass-through column: the source table has it
+            mapping[name] = e
+
+        import copy
+
+        def subst(e, top=False):
+            if not isinstance(e, Expr):
+                if isinstance(e, list):
+                    return [subst(a) for a in e]
+                return e
+            if e.op == "col" and e.args[0] in mapping:
+                new = copy.copy(mapping[e.args[0]])       # refers to source columns only
+                new._alias = e.args[0] if top else None
+                return new
+            new = copy.copy(e)
+            new.args = tuple(subst(a) for a in e.args)
+            return new
+
+        return Aggregate(proj.input, [subst(e, top=True) for e in plan.group_by],
+                         [subst(e) for e in plan.aggs])
+
     @classmethod
     def _collect_predicates(cls, plan):
         """Collect all Filter predicates from the plan tree."""
@@ -1393,6 +1434,7 @@ class CustomOpsCompiler(GraphCompiler):
             return result
 
         # 1 -- Resolve plan, predicates, and decide execution path -----
+        plan = self._inline_project_into_aggregate(plan)
         original_scan = self._find_scan(plan)
         plan_clean = self._strip_filter_nodes(plan)
         predicates = self._collect_predicates(plan)
@@ -1609,6 +1651,33 @@ class CustomOpsCompiler(GraphCompiler):
                     print(f"[mxframe] CPU AOT — {(t1-t0)*1000:.1f}ms")
                 return _aot_result
 
+
+        # 4.55 -- Empty input on the GPU device: nothing to upload (cuMemAlloc(0) fails and the
+        # MAX Graph fallback would JIT for it); the CPU kernels return the empty result.
+        if (self._session_device == "gpu" and N == 0 and self._aot is not None
+                and group_keys):
+            _aot_result = self._execute_cpu_aot(
+                plan_clean, col_arrays, extra_inputs, n_groups,
+                group_keys, unique_key_cols,
+                mask_np_int32=None,
+            )
+            if _aot_result is not None:
+                if having_pred is not None:
+                    _aot_result = _aot_result.filter(
+                        self._eval_predicate(having_pred, _aot_result)
+                    )
+                if post_ops:
+                    _aot_result = self._apply_post_ops_custom(_aot_result, post_ops)
+                self.last_compile_provenance = {
+                    "device": self._session_device, "rows": int(_aot_result.num_rows),
+                    "grouped": True, "n_groups": int(n_groups), "cache_hit": True,
+                    "compile_ms": 0.0,
+                    "execute_ms": round((_time.perf_counter() - t0) * 1000, 1),
+                    "gpu_input_path": "aot_ctypes",
+                    "optimizer_trace": list(optimizer_trace or []),
+                    "path": "cpu_aot",
+                }
+                return _aot_result
 
         # 4.6 -- GPU AOT fast path: bypass MAX Graph for grouped GPU aggs ------
         # Handles both unfiltered and filtered grouped queries.
@@ -2077,8 +2146,8 @@ class CustomOpsCompiler(GraphCompiler):
         N = len(composite_key)
         k = topk if topk is not None and topk < N else N
 
-        if self._session_device != "gpu":
-            # CPU fast path: numpy argsort, no graph compilation
+        if self._session_device != "gpu" or N == 0:
+            # CPU fast path: numpy argsort, no graph compilation (also for empty tables: nothing to upload)
             if k < N:
                 # Partial sort: np.argpartition + sort of k elements
                 part_idx = np.argpartition(composite_key, k)[:k]

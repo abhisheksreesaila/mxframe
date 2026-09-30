@@ -494,8 +494,12 @@ _warmup_lock = threading.Lock()
 
 
 def _init_gpu():
-    from .aot_kernels import AOTKernelsGPU
-    return AOTKernelsGPU()
+    # The engine shares this one instance (and its CUDA driver / device-buffer cache).
+    from .aot_kernels import get_aot_gpu
+    gpu = get_aot_gpu()
+    if gpu is None:
+        raise RuntimeError("GPU AOT kernels unavailable")
+    return gpu
 
 
 def get_gpu_warmup(calib=None) -> GpuWarmup:
