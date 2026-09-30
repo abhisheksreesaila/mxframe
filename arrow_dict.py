@@ -45,6 +45,27 @@ def combine_dictionary(col) -> pa.DictionaryArray:
     return col
 
 
+def _encode_int(arr):
+    """``arr.dictionary_encode()`` for an integer column, by direct addressing (F-020), or None.
+
+    Same groups, same numbering (first appearance) as Arrow's hash; the kernel reads the values in
+    place and gives up (None) on nulls, wide value ranges and small inputs.
+    """
+    t = arr.type
+    if not pa.types.is_integer(t) or t == pa.uint64() or arr.null_count or len(arr) < 50_000:
+        return None
+    from . import group_keys
+    r = group_keys.encode_int(_np_of(arr, zero_copy_only=False))
+    if r is None:
+        return None
+    ids, uniq, _ = r
+    return pa.DictionaryArray.from_arrays(_npa(ids), _npa(uniq.astype(_NP_OF_ARROW[t])), safe=False)
+
+
+_NP_OF_ARROW = {pa.int8(): np.int8, pa.int16(): np.int16, pa.int32(): np.int32, pa.int64(): np.int64,
+                pa.uint8(): np.uint8, pa.uint16(): np.uint16, pa.uint32(): np.uint32}
+
+
 def encode_key(col):
     """Group-key encoding: an object with ``.indices`` and ``.dictionary``.
 
@@ -55,6 +76,9 @@ def encode_key(col):
     """
     if not is_dictionary(col):
         arr = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+        fast = _encode_int(arr)
+        if fast is not None:
+            return fast
         return arr.dictionary_encode()
     d = combine_dictionary(col)
     if d.null_count:

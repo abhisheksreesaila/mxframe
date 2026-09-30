@@ -328,3 +328,14 @@ def test_random_plans_match_duckdb_large(seed, device):
     if device == "gpu" and not GPU_AOT_AVAILABLE:
         pytest.skip("no GPU AOT kernels")
     run_seed(5000 + seed, device, n_rows=20_000)
+
+
+@pytest.mark.parametrize("seed", [5061])
+@pytest.mark.parametrize("device", ["cpu", "auto", "gpu"])
+def test_regression_seeds_from_the_large_runs(seed, device):
+    """5061 (F-020): distinct -> select -> grouped sums of a float64 column cancelling to ~0.1. A Project under the
+    aggregate declined the fused pipeline and the GPU fallback summed in float32."""
+    from mxframe.aot_kernels import GPU_AOT_AVAILABLE
+    if device == "gpu" and not GPU_AOT_AVAILABLE:
+        pytest.skip("no GPU AOT kernels")
+    run_seed(seed, device, n_rows=20_000)

@@ -503,3 +503,28 @@ def test_isin_with_none_matches_arrow_semantics_on_dictionary():
         exp = pc.is_in(plain["s"], value_set=pa.array(values, pa.string()))
         got = dict_predicate(e, dic)
         assert got.to_pylist() == exp.to_pylist(), values
+
+
+# ── F-020: a self-join of one scan_parquet frame ────────────────────────────
+
+def _self_join_file(tmp_path):
+    import pyarrow.parquet as pq
+    p = str(tmp_path / "self.parquet")
+    pq.write_table(pa.table({"k": pa.array(np.arange(12) % 4), "x": pa.array(np.arange(12) * 1.5),
+                             "y": pa.array(np.arange(12))}), p)
+    return p, pq.read_table(p)
+
+
+@pytest.mark.parametrize("build", [
+    lambda a: a.join(a, on="k").select(col("k"), col("x_right")),
+    lambda a: a.join(a, on="k").groupby("k").agg(col("x_right").sum().alias("s")).sort("k"),
+    lambda a: a.join(a, on="k").filter(col("x_right") > 3.0).select(col("k"), col("y_right")),
+    lambda a: a.join(a, on="k").join(a, on="k").select(col("k"), col("x_right"), col("x_right2")),
+], ids=["select", "aggregate", "filter", "three-way"])
+def test_self_join_of_one_scan_reads_the_renamed_columns(tmp_path, build):
+    p, table = _self_join_file(tmp_path)
+    got = build(mx.scan_parquet(p)).compute(device="cpu")
+    want = build(mx.LazyFrame(table)).compute(device="cpu")
+    assert got.column_names == want.column_names
+    key = got.column_names
+    assert sorted(zip(*[got.column(c).to_pylist() for c in key])) == sorted(zip(*[want.column(c).to_pylist() for c in key]))

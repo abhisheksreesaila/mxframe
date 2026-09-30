@@ -220,3 +220,106 @@ def test_isin_mixing_huge_and_negative_values(tmp_path):
     pq.write_table(pa.table({"k": pa.array(a), "id": pa.array(a)}), p, row_group_size=250)
     got = iop._read_file(p, ["id"], [], (("k", "isin", (-3, 5, 2**64)),))
     assert {-3, 5} <= set(got.column("id").to_pylist())
+
+
+# ── F-020: string equality / isin on dictionary columns ─────────────────────
+
+STRING_CASES = [
+    (("f", "eq", "B"), lambda f: f == "B"),
+    (("f", "ne", "B"), lambda f: f != "B"),
+    (("f", "isin", ("A", "C")), lambda f: np.isin(f, ["A", "C"])),
+    (("f", "eq", "Z"), lambda f: f == "Z"),
+    (("f", "ge", "B"), lambda f: f >= "B"),
+    (("f", "lt", "C"), lambda f: f < "C"),
+]
+
+
+@pytest.mark.parametrize("pushed,pred", STRING_CASES)
+def test_string_conjuncts_on_dictionary_columns_drop_rows_exactly(path, pushed, pred):
+    got = iop._read_file(path, ["id", "f"], ["f"], (pushed,))
+    ref = pq.read_table(path)
+    f = np.asarray(ref.column("f").to_pylist())
+    want = sorted(np.asarray(ref.column("id").to_pylist())[pred(f)].tolist())
+    assert sorted(got.column("id").to_pylist()) == want
+    assert pa.types.is_dictionary(got.schema.field("f").type)
+
+
+def test_string_filter_needs_the_column_read_as_a_dictionary(path, monkeypatch):
+    calls = []
+    real = iop._read_groups
+    monkeypatch.setattr(iop, "_read_groups", lambda *a, **k: calls.append(1) or real(*a, **k))
+    iop._read_file(path, ["id"], [], (("f", "eq", "B"),))
+    assert not calls
+    iop._read_file(path, ["id"], ["f"], (("f", "eq", "B"),))
+    assert calls
+
+
+def test_string_filter_query_matches_the_reference(tmp_path):
+    p = str(tmp_path / "s.parquet")
+    pq.write_table(_table(n=8000), p, row_group_size=500)
+    lf = mx.scan_parquet(p).filter(col("f") == "B").select(col("id"), col("p"))
+    got = lf.compute(device="cpu")
+    ref = pq.read_table(p)
+    keep = np.asarray(ref.column("f").to_pylist()) == "B"
+    assert sorted(got.column("id").to_pylist()) == np.asarray(ref.column("id").to_pylist())[keep].tolist()
+    both = mx.scan_parquet(p).filter(col("f").isin(["A", "C"])).select(col("id")).compute(device="cpu")
+    keep = np.isin(np.asarray(ref.column("f").to_pylist()), ["A", "C"])
+    assert sorted(both.column("id").to_pylist()) == np.asarray(ref.column("id").to_pylist())[keep].tolist()
+
+
+def test_estimated_pass_handles_string_conjuncts(tmp_path):
+    p = str(tmp_path / "e.parquet")
+    pq.write_table(_table(n=4000), p, row_group_size=500)
+    md = iop._metadata(p)
+    names = list(md.schema.to_arrow_schema().names)
+    groups = range(md.num_row_groups)
+    for conj, lo, hi in [(("f", "eq", "B"), 0.0, 0.6), (("f", "isin", ("A", "B", "C")), 0.6, 1.0)]:
+        need = {g: (conj,) for g in groups}
+        assert lo <= _REAL_ESTIMATE(md, names, need) <= hi
+
+
+def test_mask_only_dictionary_columns_come_back_decoded(path):
+    """A string column read as a dictionary just to build the row mask is returned as plain strings."""
+    got = iop._read_file(path, ["id", "f"], [], (("f", "eq", "B"),), mask_dict=["f"])
+    ref = pq.read_table(path)
+    f = np.asarray(ref.column("f").to_pylist())
+    assert got.schema.field("f").type == pa.string()
+    assert sorted(got.column("id").to_pylist()) == sorted(np.asarray(ref.column("id").to_pylist())[f == "B"].tolist())
+    assert set(got.column("f").to_pylist()) == {"B"}
+    assert got.num_rows < ref.num_rows
+
+
+def test_join_query_filters_strings_in_the_reader(tmp_path, monkeypatch):
+    """Under a join the string column is not kept as a dictionary, yet the reader still drops the rows."""
+    p = str(tmp_path / "l.parquet")
+    q = str(tmp_path / "o.parquet")
+    pq.write_table(_table(n=8000), p, row_group_size=500)
+    pq.write_table(pa.table({"id": pa.array(np.arange(0, 8000, 2)), "z": pa.array(np.arange(4000, dtype=np.float32))}), q)
+    rows_read = {}
+    real = iop._read_file
+
+    def spy(path_, *a, **k):
+        out = real(path_, *a, **k)
+        rows_read[path_] = out.num_rows
+        return out
+
+    monkeypatch.setattr(iop, "_read_file", spy)
+    got = (mx.scan_parquet(p).filter(col("f") == "B").join(mx.scan_parquet(q), on="id")
+           .select(col("id"), col("z")).compute(device="cpu"))
+    ref = pq.read_table(p)
+    f = np.asarray(ref.column("f").to_pylist())
+    ids = np.asarray(ref.column("id").to_pylist())
+    want = sorted(int(i) for i in ids[f == "B"] if i % 2 == 0)
+    assert sorted(got.column("id").to_pylist()) == want
+    assert rows_read[p] < 8000                  # the fact side arrived already filtered
+
+
+def test_estimated_pass_covers_string_ne_and_ranges(tmp_path):
+    p = str(tmp_path / "r.parquet")
+    pq.write_table(_table(n=4000), p, row_group_size=500)
+    md = iop._metadata(p)
+    names = list(md.schema.to_arrow_schema().names)
+    est = lambda c: _REAL_ESTIMATE(md, names, {g: (c,) for g in range(md.num_row_groups)})
+    assert 0.6 < est(("f", "ne", "B")) < 1.0
+    assert est(("f", "lt", "B")) < est(("f", "lt", "C")) <= 1.0
+    assert est(("f", "ge", "A")) == pytest.approx(1.0)

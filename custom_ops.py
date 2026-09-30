@@ -19,6 +19,7 @@ from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
+from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
     from .aot_kernels import AOTKernels, AOT_AVAILABLE, AOTKernelsGPU, GPU_AOT_AVAILABLE, get_aot_gpu
@@ -66,26 +67,7 @@ MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
 RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
-_RADIX_WARNED = False
-
-
-def _is_sorted_permutation(keys, idx) -> bool:
-    """keys[idx] ascending and idx a valid index vector (cheap O(n) checks)."""
-    if len(idx) != len(keys) or (len(idx) and (idx.min() < 0 or idx.max() >= len(keys))):
-        return False
-    k = keys[idx]
-    if k.dtype.kind == "f":
-        k = np.where(np.isnan(k), np.inf, k)
-    return bool(np.all(k[1:] >= k[:-1])) if len(k) > 1 else True
-
-
-def _warn_radix_fallback():
-    global _RADIX_WARNED
-    if not _RADIX_WARNED:
-        _RADIX_WARNED = True
-        import warnings
-        warnings.warn("mxframe: radix sort returned an unsorted order; using np.argsort (please report)",
-                      RuntimeWarning, stacklevel=3)
+from .sort_check import is_sorted_permutation as _is_sorted_permutation, warn_fallback as _warn_radix_fallback
 
 # CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
 # float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
@@ -1723,6 +1705,10 @@ class CustomOpsCompiler(GraphCompiler):
 
         # F-008 -- fused pipeline: filter + arithmetic + aggregates in one vectorized AOT pass
         # (CPU or GPU), for grouped and global aggregate plans. None -> use the paths below.
+        # A Project under a grouped aggregate (a select / with_columns after distinct, say) is folded
+        # into the aggregate first: the fused kernels accumulate float64 in float64, while the GPU
+        # path it used to fall back to rounds float64 columns to float32 (F-016 fuzz seed 5061).
+        plan = self._inline_project_into_aggregate(plan)
         if try_fused_aggregate is not None:
             _fused = try_fused_aggregate(self, plan, having_pred, post_ops, optimizer_trace, t0)
             if _fused is not None:
@@ -2748,6 +2734,9 @@ class CustomOpsCompiler(GraphCompiler):
             gids, n_groups, _ = self._build_group_ids(sub, cols)
         except Exception:
             return sub.group_by(cols).aggregate([])
+        rows = _group_keys.first_rows(gids, int(n_groups)) if isinstance(gids, np.ndarray) else None
+        if rows is not None:
+            return sub.take(_npa(rows))
         gids = np.asarray(gids, dtype=np.int64)
         first = np.full(int(n_groups), len(gids), dtype=np.int64)
         np.minimum.at(first, gids, np.arange(len(gids), dtype=np.int64))
@@ -3449,10 +3438,12 @@ class CustomOpsCompiler(GraphCompiler):
 
         # int64: with int32 the composite of a few high-cardinality keys (an order key and a supplier
         # key) wrapped around and merged distinct groups (Distinct dropped 3080 of 6M rows at SF1)
-        composite = np.zeros(len(table), dtype=np.int64)
-        for i, enc in enumerate(encodings):
-            idx = _np_of(enc.indices, zero_copy_only=False)
-            composite += idx.astype(np.int64) * np.int64(strides[i])
+        index_arrays = [_np_of(enc.indices, zero_copy_only=False) for enc in encodings]
+        composite = _group_keys.composite(index_arrays, strides)
+        if composite is None:
+            composite = np.zeros(len(table), dtype=np.int64)
+            for i, idx in enumerate(index_arrays):
+                composite += idx.astype(np.int64) * np.int64(strides[i])
 
         if max_groups <= 1024:
             present_mask = np.zeros(max_groups, dtype=bool)
@@ -3475,8 +3466,12 @@ class CustomOpsCompiler(GraphCompiler):
                 )
             return dense_ids, n_groups, unique_key_cols
 
-        unique_composite, dense_ids = np.unique(composite, return_inverse=True)
-        dense_ids = dense_ids.astype(np.int32)
+        ranked = _group_keys.dense_sorted(composite)
+        if ranked is not None:
+            dense_ids, unique_composite, _ = ranked
+        else:
+            unique_composite, dense_ids = np.unique(composite, return_inverse=True)
+            dense_ids = dense_ids.astype(np.int32)
         n_groups = len(unique_composite)
 
         unique_key_cols = {}
