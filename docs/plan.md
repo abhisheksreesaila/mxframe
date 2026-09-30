@@ -174,11 +174,31 @@ Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
 - [ ] a groupby on a column produced by an earlier aggregate in the same plan works ("Field does not exist" today)
 - [ ] a fuzz test of random plan shapes (project/filter/agg/join/sort/limit nested 2–3 deep) against DuckDB on cpu and auto
 
-## F-017 Parquet read as fast as Polars [todo]
+## F-017 Parquet read as fast as Polars [built, needs review; 1.5x target NOT met, see profile]
 Needs: none · Found by the F-001 scoreboard (2026-09-30): SF10 `scan_parquet` of 3 lineitem columns with a date filter takes 689 ms in mx vs 149 ms in Polars.
-- [ ] profile the mx read path (ParquetFile.read / read_row_groups, pre_buffer, threads, dictionary="auto" metadata checks per row group, decode, dictionary columns) and close the gap to within 1.5x of Polars on SF1/SF10 lineitem scans with and without filters
-- [ ] filters pushed to the reader skip data inside row groups too where cheap (page index / late materialization of non-filter columns), or document why not
-- [ ] results unchanged (tests/test_scan_parquet.py, test_fast_read.py, DuckDB gate)
+- [~] profile the mx read path and close the gap to within 1.5x of Polars on SF1/SF10 lineitem scans with and without filters. Profiled; gap narrowed for selective filters, not closed (pyarrow's decoder is ~3x slower than Polars' own).
+- [x] filters pushed to the reader drop rows while decoding ((row group, column) pieces on a thread pool; integer conjuncts; row groups fully covered by min/max skip the mask; unselective filters and files under 16M rows use the plain reader). Page-index skipping: not possible, pyarrow 22 has no row-range/page-skipping read API (`ParquetFile` has only read/read_row_group(s)/iter_batches).
+- [x] results unchanged (tests/test_scan_parquet.py, test_fast_read.py, test_np_arrow.py, new tests/test_parquet_rowfilter.py; full suite green)
+
+Profile (fresh process, SF10 exact lineitem, 60M rows / 58 row groups of ~1M rows, snappy; machine shared and loaded, medians of 7-9 interleaved runs):
+- `l_shipdate` min/max is the same (8036..10561) in every row group, so statistics prune nothing for date ranges; the file is sorted by orderkey only. Only the mask-skipping "fully covered" case benefits from stats.
+- Old path for `scan -> filter(shipdate range) -> select 3 cols` (~540-760 ms depending on load): ~40 ms `scan_parquet` (pq import + footer parsed, then parsed AGAIN at compute, +20-30 ms), ~225 ms `ParquetFile.read` of all 60M rows x 3 cols, ~300 ms engine filter+select over 60M rows. Dictionary-decision loop is 0.02 ms (not a cost); pre_buffer=True was slower (270 vs 230 ms).
+- Raw decode floor: `pq.ParquetFile.read` of the 3 columns = ~225 ms (Polars does the whole scan+filter+select in ~77 ms, its no-filter 3-column read is ~165 ms). Arrow's decoder scales badly with threads on this box (user CPU x4 at 8 threads, x12 at 24: allocator/page-fault contention; glibc/jemalloc/mimalloc/system pool and mmap thresholds made no real difference); 6-8 decode threads is the sweet spot.
+- Polars prefilters (decodes the filter column, then only materializes matching rows); pyarrow can only decode whole pages, so late materialization of the other columns is impossible here. The gain available to us is not materializing 60M rows for the engine: filter per (row group, column) piece right after decoding.
+- Small things fixed: footer parsed once per process (`scan_parquet` primes the `_metadata` cache), `concurrent.futures` (10-40 ms to import) replaced by plain threads, `pyarrow.compute` not imported by the reader (NumPy gather), one chunk per plain column (like ParquetFile.read) so the engine does not re-concatenate.
+
+Before/after, mx-auto end to end via the F-001 worker (fresh process, scan_parquet, median ms; base = 7367b47):
+| query | base | F-017 | Polars |
+|---|---|---|---|
+| SF10 Q1 | 797 | 788 | 2771 |
+| SF10 Q6 | 401 | 405 | 242 |
+| SF10 Q14 | 1667 | 1659 | 235 |
+| SF10 Q15 | 1124 | 460 | 160 |
+| SF10 scan 3 cols + date filter (read+select only) | 763 | 452 | 82 |
+| SF10 scan 3 cols, no filter | 354 | 300 | 170 |
+SF1 is unchanged by design (6 row groups, 6M rows: the plain reader is already ~25 ms).
+
+Open decision for the owner: closing the rest of the gap needs a different decoder. Polars' collect+to_arrow for the SF10 Q6 columns is ~140 ms after a ~77 ms `import polars`, vs ~360 ms for pyarrow. Options: (a) optional Polars-backed reader for numeric columns when polars is installed, (b) a native (Mojo/C++) Parquet page decoder in mxframe, (c) accept ~3x on raw Parquet scans and win elsewhere. Not attempted: it adds a dependency and a second type-mapping path.
 
 ## F-018 Join engine: order, lean materialization [todo]
 Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q20 7.3x slower than Polars — joins dominate
