@@ -88,7 +88,7 @@ Needs: F-005 · Files: `auto_mode.py` placement pass, join dispatch in `custom_o
 - [ ] join probe side can be split across CPU and GPU (Router) when both are worth it
 - [ ] per-operator timings feed `calibration.observe` (moved from F-005)
 
-## F-008 Fused pipeline kernel: vectorized interpreter [todo]
+## F-008 Fused pipeline kernel: vectorized interpreter [done]
 Needs: F-002 · Files: `kernels_aot/pipeline*.mojo` (new), `pipeline_program.py` (new: Expr → bytecode), dispatch in `custom_ops.py`
 Why: SF10 Q1 spends ~1.3 s in PyArrow expression eval, NumPy mask indexing and dtype copies around a ~0.5 s kernel; JIT-compiling a kernel per query shape would cost seconds on a first run.
 Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
@@ -96,9 +96,9 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - CPU kernel: `parallelize` over morsels; within a morsel process vectors of ~1–2K rows: evaluate the predicate into a selection vector, evaluate expressions into cache-resident register vectors (SIMD), accumulate into per-thread float64 partials per group; merge partials at the end. Input columns are raw pointers (int32/int64/float32/float64 + int32 group ids, or none for global aggs).
 - GPU kernel: same bytecode, one thread per row (bytecode is uniform across threads, so no divergence), block-level partials (shared memory for small group counts, global atomics otherwise).
 - Both entry points take a row range [start, end), so the F-006 Router can hand morsels to either device, and return partials the Router merges.
-- [ ] Q1, Q6, Q14, Q19-style filters + arithmetic + grouped/global aggregates run through it on both devices; results match DuckDB (float64 accumulation)
-- [ ] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
-- [ ] unsupported expressions fall back to the existing path, never wrong results
+- [x] Q1, Q6, Q14, Q19-style filters + arithmetic + grouped/global aggregates run through it on both devices; results match DuckDB (float64 accumulation)
+- [x] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
+- [x] unsupported expressions fall back to the existing path, never wrong results
 
 ## F-011 Correctness: counts, Q15, Q21, nulls [todo]
 Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
@@ -111,7 +111,7 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
 - [ ] `filter(k != "a")` with null keys doesn't raise
 - [ ] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
-- [ ] Q6: GPU (8.865e7) matches DuckDB; the old CPU path (4.072e7) drops float32-vs-literal boundary rows (fixed by F-008 CMPC) — verify both devices vs DuckDB, then remove "global_agg" from `auto_mode.KNOWN_BROKEN_GPU`
+- [x] Q6 matches DuckDB on cpu/gpu/auto (fused CMPC compares in the column type); "global_agg" removed from `KNOWN_BROKEN_GPU`
 - [ ] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
 - [ ] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
 - [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)

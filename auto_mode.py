@@ -319,7 +319,6 @@ class AutoDecision:
 # plan that would run them. Remove an entry once its fix lands (F-012 / F-011).
 KNOWN_BROKEN_GPU = {
     "sort": "GPU sort returns rows out of key order (F-012)",
-    "global_agg": "GPU masked global aggregate returned 2x the CPU result on TPC-H Q6 (F-011)",
 }
 
 _AGG_OP = {"sum": "group_sum", "mean": "group_sum", "count": "group_count",

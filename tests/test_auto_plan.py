@@ -269,7 +269,8 @@ def test_only_device_errors_disable_the_gpu():
     assert not am.is_sticky_gpu_error(TypeError("unsupported dtype"))
 
 
-def test_gpu_global_agg_is_blocked_until_verified():
+def test_gpu_global_agg_is_blocked_while_listed(monkeypatch):
+    monkeypatch.setitem(am.KNOWN_BROKEN_GPU, "global_agg", "test")
     t = table(10_000)
     plan = LazyFrame(t).filter(col("d") > lit(3)).groupby().agg(col("v").sum().alias("s")).plan
     d = am.choose_device(plan, calib=Calib(cpu=1e4, gpu=0.001, link=1e6), gpu=Gpu())
