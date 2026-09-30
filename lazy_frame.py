@@ -116,6 +116,29 @@ class Tail(LogicalPlan):
         return ("Tail", self.input.signature(), self.n)
 
 
+def join_output_names(left_names, right_names, right_on):
+    """``[(right column, output name), ...]`` for the right side's non-key columns of a join.
+
+    A right column whose name is already taken (by the left side or an earlier right column)
+    is renamed with a ``_right`` suffix (``_right2``, ... when that is taken too), like Polars,
+    so a join result never holds two columns of one name."""
+    left = set(left_names)
+    right = [c for c in right_names if c not in right_on]
+    taken = left | {c for c in right if c not in left}          # names that are kept as they are
+    out = []
+    for c in right:
+        name, i = c, 1
+        if c in left:
+            while True:
+                name = f"{c}_right" if i == 1 else f"{c}_right{i}"
+                i += 1
+                if name not in taken and name not in right:
+                    break
+            taken.add(name)
+        out.append((c, name))
+    return out
+
+
 @dataclass
 class Join(LogicalPlan):
     """Represents an inner join between two plan trees (first two-child node)."""

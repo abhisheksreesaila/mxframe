@@ -383,7 +383,9 @@ def join_failure_frees_scratch():
     """A hash_join that dies mid-way (table for a huge key does not fit) leaks nothing."""
     from mxframe import gpu_stream
     g = gpu()
-    g.hash_join(np.array([1, 2], np.int32), np.array([2], np.int32))       # warm up
+    # warm up; 2M rows also make the recursive scan create its first kernel-side buffer, which is
+    # when the kernel library's memory pool (a quarter of the GPU) is reserved: not a leak
+    g.hash_join(np.arange(2_000_000, dtype=np.int32), np.array([2], np.int32))
     free0, _ = gpu_stream.mem_info()
     for _ in range(5):
         try:

@@ -186,3 +186,70 @@ def to_numpy(obj, zero_copy_only: bool = False, **kwargs):
     out = np.frombuffer(buf, dtype=dt, count=len(obj), offset=obj.offset * np.dtype(dt).itemsize)
     out.flags.writeable = False          # a view of immutable Arrow memory, as PyArrow returns
     return out
+
+
+# --- gathering rows -------------------------------------------------------------------------
+
+TAKE_CHUNK_ROWS = 1 << 22        # rows per slice for columns whose values cannot be measured
+TAKE_CHUNK_BYTES = 1 << 30       # value bytes per slice of a string / binary column
+TAKE_SLICE_MIN_ROWS = 1 << 17    # gathers of fewer rows are never sliced
+
+
+def _has_32bit_offsets(t) -> bool:
+    if pa.types.is_struct(t):
+        return any(_has_32bit_offsets(f.type) for f in t)
+    return pa.types.is_string(t) or pa.types.is_binary(t) or pa.types.is_list(t)
+
+
+def _byte_slices(col, idx):
+    """Slice bounds over ``idx`` such that each slice gathers at most TAKE_CHUNK_BYTES of
+    string / binary values (one row alone may exceed it), or None for other types."""
+    if not (pa.types.is_string(col.type) or pa.types.is_binary(col.type)):
+        return None
+    import pyarrow.compute as pc
+    lens = to_numpy(pc.fill_null(pc.binary_length(col), 0)).astype(np.int64, copy=False)
+    cum = np.cumsum(lens[idx])
+    n, bounds, start, base = len(idx), [], 0, 0
+    while start < n:
+        end = int(np.searchsorted(cum, base + TAKE_CHUNK_BYTES, side="right"))
+        end = min(max(end, start + 1), n)
+        bounds.append((start, end))
+        base, start = int(cum[end - 1]), end
+    return bounds
+
+
+def take_rows(obj, idx):
+    """``obj.take(idx)`` for a table, chunked or plain array and a NumPy row-index array.
+
+    A column with 32-bit offsets (string, binary, list) gathered into more than 2 GiB of
+    values comes back as a corrupt array (``Negative offsets in binary array``, visible only
+    to ``validate(full=True)``): joining 60M TPC-H lineitem rows to their orders gathers 3 GB
+    of ``o_comment``.  String and binary columns are gathered in slices of at most
+    ``TAKE_CHUNK_BYTES`` of values (measured from the value lengths); lists and structs
+    holding strings in slices of rows sized from the average value size, each checked with
+    ``validate`` (an ``ArrowInvalid`` is raised rather than a corrupt column returned).
+    The result is a chunked array.  Every other column is gathered in one call."""
+    idx = np.ascontiguousarray(idx, dtype=np.int64)
+    n = len(idx)
+
+    def one(col):
+        if n <= TAKE_SLICE_MIN_ROWS or not _has_32bit_offsets(col.type):
+            return col.take(array(idx))
+        bounds = _byte_slices(col, idx)
+        checked = bounds is None
+        if bounds is None:
+            per_row = max(1.0, col.nbytes / max(1, len(col)))          # average value bytes per source row
+            step = int(max(1, min(TAKE_CHUNK_ROWS, TAKE_CHUNK_BYTES // per_row)))
+            bounds = [(i, min(i + step, n)) for i in range(0, n, step)]
+        parts = [col.take(array(idx[a:b])) for a, b in bounds]
+        chunks = [c for p in parts for c in (p.chunks if isinstance(p, pa.ChunkedArray) else [p])]
+        if checked:
+            for c in chunks:
+                c.validate(full=True)
+        return pa.chunked_array(chunks, type=col.type)
+
+    if isinstance(obj, pa.Table):
+        if n <= TAKE_SLICE_MIN_ROWS or not any(_has_32bit_offsets(t) for t in obj.schema.types):
+            return obj.take(array(idx))
+        return pa.Table.from_arrays([one(obj.column(i)) for i in range(obj.num_columns)], schema=obj.schema)
+    return one(obj)
