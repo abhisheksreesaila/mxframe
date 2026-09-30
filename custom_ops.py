@@ -2146,8 +2146,9 @@ class CustomOpsCompiler(GraphCompiler):
         N = len(composite_key)
         k = topk if topk is not None and topk < N else N
 
-        if self._session_device != "gpu" or N == 0:
-            # CPU fast path: numpy argsort, no graph compilation (also for empty tables: nothing to upload)
+        if self._session_device != "gpu" or N == 0 or self._aot_gpu is None:
+            # CPU fast path: numpy argsort, no graph compilation (also for empty tables, where
+            # there is nothing to upload, and when the GPU AOT library is unavailable)
             if k < N:
                 # Partial sort: np.argpartition + sort of k elements
                 part_idx = np.argpartition(composite_key, k)[:k]
@@ -3242,6 +3243,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         Returns (dense_ids, n_groups, unique_key_cols) or None on failure.
         """
+        if self._aot_gpu is None:       # no GPU AOT library: the caller encodes on the CPU (no MAX Graph JIT)
+            return None
         try:
             keys_np = col_arr.to_numpy(zero_copy_only=False).astype(np.int32)
             n = len(keys_np)
