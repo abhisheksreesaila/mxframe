@@ -682,6 +682,8 @@ class _Builder:
             return None
         if x_e.op == "lit":
             return None
+        if x_e.op == "col" and self._fold(lo_e) is not None and self._fold(hi_e) is not None:
+            return None   # column between constants: two CMPCs, which follow the column-type rule
         try:
             x = self._need(x_e, "num")
             lo = self._need(lo_e, "num")

@@ -89,6 +89,16 @@ def test_cmpc_replaces_load_and_compare():
     assert "CMPC" not in both.op_names() and "GT" in both.op_names()
 
 
+def test_between_on_float32_column_keeps_boundary_rows(device):
+    """between() follows the same column-type rule as the two compares it stands for."""
+    t = pa.table({"d": pa.array(np.array([0.05, 0.06, 0.07, 0.07, 0.08, 0.04], dtype=np.float32)),
+                  "v": pa.array(np.ones(6))})
+    prog = compile_pipeline([col("d").between(0.05, 0.07)], [col("v").sum().alias("s")], t)
+    assert "BETWEEN" not in prog.op_names()
+    run = pk.run_pipeline_cpu if device == "cpu" else pk.run_pipeline_gpu
+    assert run(prog, prog.bind(t), None, 1, 0, 6).vals[0, 0] == 4.0
+
+
 def test_dead_columns_are_not_bound():
     t, _ = boundary_table()
     # the constant-false conjunct settles the predicate: no predicate column is read at all

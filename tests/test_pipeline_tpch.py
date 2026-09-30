@@ -112,6 +112,24 @@ def test_q6_matches_duckdb(tpch, device, fused_calls):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+def test_q6_written_with_between_matches_duckdb(tpch, device, fused_calls):
+    from mxframe.lazy_expr import col, lit
+    from mxframe.lazy_frame import LazyFrame, Scan
+    _, T, con = tpch
+    got = (LazyFrame(Scan(T["lineitem"]))
+           .filter((col("l_shipdate") >= lit(bm.Q6_DATE_LO)) & (col("l_shipdate") < lit(bm.Q6_DATE_HI))
+                   & col("l_discount").between(bm.Q6_DISC_LO, bm.Q6_DISC_HI) & (col("l_quantity") < lit(bm.Q6_QTY_HI)))
+           .groupby().agg((col("l_extendedprice") * col("l_discount")).sum().alias("revenue"))
+           .compute(device=device))
+    want = con.sql(f"""
+        select sum(l_extendedprice::double * l_discount::double) from lineitem
+        where l_shipdate >= {bm.Q6_DATE_LO} and l_shipdate < {bm.Q6_DATE_HI}
+          and l_discount between {bm.Q6_DISC_LO} and {bm.Q6_DISC_HI} and l_quantity < {bm.Q6_QTY_HI}""").fetchone()[0]
+    assert fused_calls["served"] == 1
+    _close([got.column("revenue")[0].as_py()], [want], 1e-9)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 def test_q14_matches_duckdb(tpch, device, fused_calls):
     _, T, con = tpch
     got = bm.run_q14_mxframe(T["part"], T["lineitem"], device=device)

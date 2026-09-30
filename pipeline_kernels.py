@@ -218,6 +218,9 @@ class _Cuda:
         lib.cuDeviceGetAttribute(ctypes.byref(n), 16, dev)  # MULTIPROCESSOR_COUNT
         self.sm_count = max(int(n.value), 1)
         self._tls = threading.local()
+        self._pool_lock = threading.Lock()
+        self._pool = {}
+        self._sizes = {}
 
     def bind_thread(self) -> None:
         """Make the primary context current on the calling thread (Router workers)."""
@@ -267,17 +270,36 @@ class _Cuda:
         self.bind_thread()
         self.lib.cuCtxSynchronize()
 
-    def pooled(self, name: str, nbytes: int) -> int:
-        """A per-thread device buffer that only grows: no allocation on the per-morsel path."""
-        pool = getattr(self._tls, "pool", None)
-        if pool is None:
-            pool = self._tls.pool = {}
-        ptr, size = pool.get(name, (0, 0))
-        if size < nbytes:
-            self.free(ptr)
-            ptr, size = self.malloc(nbytes), nbytes
-            pool[name] = (ptr, size)
+    POOL_KEEP = 4                  # buffers kept per name
+    POOL_MAX_BYTES = 32 << 20      # bigger ones are freed at check-in
+
+    def checkout(self, name: str, nbytes: int) -> int:
+        """A device buffer of at least ``nbytes`` from a shared, bounded pool (no allocation on
+        the per-morsel path). Return it with :meth:`checkin`; threads come and go (the Router
+        spawns one per run), so nothing is tied to a thread."""
+        with self._pool_lock:
+            free = self._pool.setdefault(name, [])
+            for i, (ptr, size) in enumerate(free):
+                if size >= nbytes:
+                    del free[i]
+                    self._sizes[ptr] = size
+                    return ptr
+            stale = free.pop(0) if len(free) >= self.POOL_KEEP else None
+        if stale is not None:
+            self.free(stale[0])
+        ptr = self.malloc(nbytes)
+        with self._pool_lock:
+            self._sizes[ptr] = nbytes
         return ptr
+
+    def checkin(self, name: str, ptr: int) -> None:
+        with self._pool_lock:
+            size = self._sizes.pop(ptr, 0)
+            free = self._pool.setdefault(name, [])
+            if size and size <= self.POOL_MAX_BYTES and len(free) < self.POOL_KEEP:
+                free.append((ptr, size))
+                return
+        self.free(ptr)
 
     def upload(self, arr: np.ndarray) -> int:
         arr = np.ascontiguousarray(arr)
@@ -423,6 +445,13 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         raise ValueError(f"bad row range [{start}, {end})")
     n_slots = program.n_slots
     dev_cols: Optional[DeviceColumns] = None
+    taken = []
+
+    def take(name: str, nbytes: int) -> int:
+        ptr = cu.checkout(name, nbytes)
+        taken.append((name, ptr))
+        return ptr
+
     try:
         if isinstance(columns, DeviceColumns):
             dc = columns
@@ -441,16 +470,16 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         if n_groups != 1 and not dc.gid_ptr:
             raise ValueError("gids may only be omitted for a global aggregate (n_groups == 1)")
         max_blocks = cu.sm_count * 8          # the kernel launches sm_count * (blocks that fit per SM)
-        # per-thread pooled scratch: launch arguments, outputs and the block partials
-        col_ptrs = cu.pooled("cols", max(len(dc.ptrs), 1) * 8)
-        col_dt = cu.pooled("dts", max(len(dc.dtypes), 1) * 4)
+        # pooled scratch: launch arguments, outputs and the block partials
+        col_ptrs = take("cols", max(len(dc.ptrs), 1) * 8)
+        col_dt = take("dts", max(len(dc.dtypes), 1) * 4)
         cu.h2d(col_ptrs, np.array(dc.ptrs or [0], dtype=np.int64))
         cu.h2d(col_dt, np.array(dc.dtypes or [0], dtype=np.int32))
-        out_vals = cu.pooled("out_vals", max(n_slots * n_groups, 1) * 8)
-        out_cnt = cu.pooled("out_cnt", n_groups * 8)
+        out_vals = take("out_vals", max(n_slots * n_groups, 1) * 8)
+        out_cnt = take("out_cnt", n_groups * 8)
         ns = (n_slots + 1) * n_groups
         block_rows = ns if ns <= 48 else 0
-        scratch = cu.pooled("scratch", max(max_blocks * block_rows * 8, 8))
+        scratch = take("scratch", max(max_blocks * block_rows * 8, 8))
         cu.sync()
         rc = lib.mx_pipeline_gpu(
             dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
@@ -467,5 +496,7 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         cu.d2h(cnt, out_cnt)
         return Partials(vals=vals, cnt=cnt)
     finally:
+        for name, ptr in taken:
+            cu.checkin(name, ptr)
         if dev_cols is not None:
             dev_cols.free()

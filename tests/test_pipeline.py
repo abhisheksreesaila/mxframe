@@ -141,7 +141,7 @@ def test_compiles_q1_shaped_program_with_shared_subexpressions():
 
 def test_between_pattern_uses_fused_op():
     t = make_table(10)
-    prog = compile_pipeline([col("f64").between(0.5, 3.0)], [col("f32").sum()], t)
+    prog = compile_pipeline([(col("f64") * lit(2.0)).between(0.5, 3.0)], [col("f32").sum()], t)
     assert "BETWEEN" in prog.op_names()
     assert "AND" not in prog.op_names()
 
