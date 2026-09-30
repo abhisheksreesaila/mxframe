@@ -44,10 +44,19 @@ Needs: none · Files: `calibration.py` (new), `tests/test_calibration.py`
 - [ ] missing / corrupt / stale file → safe built-in defaults, never a crash; no GPU → CPU-only calibration
 - [ ] `observe(op, device, rows, ms)` refines the fit online (HyPE-style)
 
-## F-004 Hide GPU start-up cost [todo]
-Needs: none · Files: `custom_ops.py` (init only), `aot_kernels.py` (GPU init only)
-- [ ] GPU context + AOT GPU library initialise lazily and, under `auto`, speculatively in a background thread at first `compute()`, so a CPU-bound query never waits on it
-- [ ] measured: fresh-process time of a small `auto` query is not worse than `cpu`
+## F-004 First-run cost: lazy GPU init, no JIT on hot paths [todo]
+Needs: F-002 merged (both touch `aot_kernels.py`) · Files: `custom_ops.py`, `aot_kernels.py`
+Why: fresh-process SF10 Q1 profile (2026-09-29): `device="cpu"` pays 0.25 s creating the CUDA context it never uses; `device="gpu"` pays **5.3 s** MAX Graph JIT compile for `group_composite` (18 `session.load` sites remain in `custom_ops.py`).
+- [ ] `device="cpu"` never initialises the GPU; GPU context + AOT GPU library initialise lazily, and under `auto` speculatively in a background thread so a CPU-bound query never waits
+- [ ] every operator the 22 TPC-H queries hit runs through AOT kernels on both devices: no MAX Graph compile in a fresh-process run (assert via a test that counts `session.load` calls)
+- [ ] measured: fresh-process SF10 Q1 on `gpu` loses the 5 s compile; small `auto` query not worse than `cpu`
+
+## F-010 `mx.scan_parquet` with pushdown and dictionary strings [todo]
+Needs: none · Files: `io_parquet.py` (new), `lazy_frame.py` (source-resolution pass), group-key encoding in `custom_ops.py`
+Why: Polars `scan_parquet` reads only needed columns; mxframe reading every column loses on I/O alone. SF10 Q1 spends 1.8 s dictionary-encoding string group keys that Parquet already stores dictionary-encoded.
+- [ ] `mx.scan_parquet(path)` returns a lazy frame; at compute, only columns referenced anywhere in the plan are read, and simple comparisons directly above the scan are pushed into the reader (row-group skipping)
+- [ ] low-cardinality string columns are read as Arrow dictionaries; group-key encoding uses the dictionary indices directly (no re-encode), unifying dictionaries across chunks
+- [ ] results equal the `pq.read_table` path on all 22 queries; F-001's `mx_read` helper switches to it
 
 ## Wave 2: safe auto (Phase 1)
 
@@ -75,7 +84,7 @@ Needs: F-005 · Files: `auto_mode.py` placement pass, join dispatch in `custom_o
 - [ ] join probe side can be split across CPU and GPU (Router) when both are worth it
 
 ## F-008 Fused pipeline kernels [todo]
-Needs: F-002 · Files: new fused kernels in `kernels_aot/`, dispatch in `custom_ops.py`
+Needs: F-002 · Why: SF10 Q1 spends ~1.3 s in PyArrow expression eval, NumPy mask indexing and dtype copies around a ~0.5 s kernel · Files: new fused kernels in `kernels_aot/`, dispatch in `custom_ops.py`
 - [ ] filter → arithmetic expression → grouped aggregate in one pass per morsel on CPU (multi-core) and GPU, no intermediate NumPy arrays (Crystal)
 - [ ] covers Q1, Q6, Q14, Q19-style shapes
 
