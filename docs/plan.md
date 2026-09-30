@@ -114,6 +114,7 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] Q6: GPU (8.865e7) matches DuckDB; the old CPU path (4.072e7) drops float32-vs-literal boundary rows (fixed by F-008 CMPC) — verify both devices vs DuckDB, then remove "global_agg" from `auto_mode.KNOWN_BROKEN_GPU`
 - [ ] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
 - [ ] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
+- [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
 
 ## F-012 Kernel health: crashes, hangs, per-call overhead [todo]
