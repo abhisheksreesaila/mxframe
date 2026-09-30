@@ -223,13 +223,13 @@ Needs: none · Scoreboard reported ~700 ms under load; measured 172 ms idle → 
 
 ## F-020 Remaining SF10 gaps after F-018 [todo]
 Needs: F-018 merged · From the F-018 report (2026-09-30)
-- [ ] Q21 (4.7x Polars at SF10): `dictionary_encode` of int keys in group/distinct encoding is 2.6 s of 4.3 s at SF1 — encode integer keys with a hash/radix kernel instead
-- [ ] Q10 (7.2x): string filters (`l_returnflag == 'R'`) pushed into the Parquet reader (dictionary codes), like the integer filters from F-017
-- [ ] GPU `hash_join` prefix sum is int32 and unguarded (the CPU path now raises MemoryError before overflow) — guard or widen
-- [ ] F-016 fuzz seed 5061 fails on gpu (distinct then aggregate; also on plain auto-mode) — find and fix (float32 GPU sum?)
-- [ ] per-operator GPU placement for large joins (F-007) on top of join_engine's index vectors
-- [ ] investigate rare Mojo-runtime crashes under heavy load (SF1 Q10 segfault, Q18 futex error once each in a run with 6 concurrent fuzz processes; not reproduced in 576 stress runs) — likely related to the rare radix-sort order failure
-- [ ] a self-join of one `scan_parquet` frame (`a.join(a, on="k")`) raises KeyError 'x_right' (pre-existing)
+- [x] Q21 (4.7x Polars at SF10): integer group/distinct keys are encoded by direct addressing in Mojo (`groupkeys_cpu.mojo`, `group_keys.encode_int`: first-appearance numbering like Arrow's hash; sparse composites ranked by the radix sort, `dense_sorted`; `first_rows` for Distinct). SF10 Q21 19.2 s -> 9.4 s (Polars 4.2 s), SF1 1.94 s -> 1.0 s. Wide-range keys still use Arrow's hash
+- [x] Q10 (7.2x): string `==`/`!=`/range/isin filters are evaluated on dictionary codes inside the Parquet reader (also for columns the plan does not keep as dictionaries). SF10 Q10 2.47 s -> 1.21 s (Polars 0.34 s; the rest is Parquet decode, F-021)
+- [x] GPU `hash_join` refuses an output past int32 before the prefix sum (`tests/test_join_gpu_limit.py`)
+- [x] F-016 fuzz seed 5061 on gpu: a Project under a grouped aggregate kept the plan off the fused pipeline and the GPU fallback path summed float64 in float32; the Project is now folded in first (regression test; 200 large seeds x gpu/auto pass). Not fixed: that fallback path (`gpu_aot`) still rounds float64 to float32 for any plan the fused pipeline declines
+- [ ] per-operator GPU placement for large joins (F-007) on top of join_engine's index vectors — stays in F-007
+- [x] rare Mojo-runtime crashes under load: not reproduced (see `scripts/stress_cpu_kernels.py`: 8 processes x 4 threads x 240 s, 320 fresh processes racing the warm-up thread, 1,440 fresh-process SF1 queries under 6-way load, all clean); slow stress tests added
+- [x] a self-join of one `scan_parquet` frame (`a.join(a, on="k")`) raised KeyError 'x_right' when the renamed column was used: the scan now keeps the columns a join renames
 
 ## F-021 Native Mojo Parquet reader [todo]
 Needs: none (later) · From the F-017 decision: PyArrow's decoder is the floor (~225 ms for 3 SF10 lineitem columns vs Polars' ~77 ms scan+filter)
