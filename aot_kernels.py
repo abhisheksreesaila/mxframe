@@ -56,8 +56,9 @@ _c_int64 = ctypes.c_int64   # pointer-as-int (64-bit address)
 _c_int   = ctypes.c_int64   # n_rows / n_groups etc. (use int64 for Mojo Int = Int64 on x86-64)
 
 # Must match ABI_VERSION in kernels_aot/kernels_aot.mojo.  Bumped when the
-# exported signatures change (F-002 added a trailing `threads` argument).
-_EXPECTED_ABI = 2
+# exported signatures change (F-002 added a trailing `threads` argument; ABI 3 added it to
+# sort_indices / unique_mask / prefix_sum_count / filter_gather and added sort_indices_{i64,f32,f64}).
+_EXPECTED_ABI = 3
 
 
 def _ptr(arr: np.ndarray) -> int:
@@ -203,14 +204,16 @@ class AOTKernels:
         self._gather_f32 = self._fn("gather_f32", [I]*5)
         self._gather_i32 = self._fn("gather_i32", [I]*5)
         self._gather_i64 = self._fn("gather_i64", [I]*5)
-        # ── sort / distinct (single-threaded) ────────────────────────────────
-        self._sort_indices     = self._fn("sort_indices",     [I,I,I,I])
-        self._unique_mask      = self._fn("unique_mask",      [I,I,I])
-        # ── filter_gather (single-threaded) ──────────────────────────────────
-        self._prefix_sum_count = self._fn("prefix_sum_count", [I,I,I])
-        self._filter_gather_f32 = self._fn("filter_gather_f32", [I,I,I,I,I])
-        self._filter_gather_i32 = self._fn("filter_gather_i32", [I,I,I,I,I])
-        self._filter_gather_i64 = self._fn("filter_gather_i64", [I,I,I,I,I])
+        # ── sort / distinct / filter_gather: (…, n, threads) ──────────────────
+        self._sort_indices = {
+            "i32": self._fn("sort_indices",     [I]*5), "i64": self._fn("sort_indices_i64", [I]*5),
+            "f32": self._fn("sort_indices_f32", [I]*5), "f64": self._fn("sort_indices_f64", [I]*5),
+        }
+        self._unique_mask      = self._fn("unique_mask",      [I]*4)
+        self._prefix_sum_count = self._fn("prefix_sum_count", [I]*4)
+        self._filter_gather_f32 = self._fn("filter_gather_f32", [I]*6)
+        self._filter_gather_i32 = self._fn("filter_gather_i32", [I]*6)
+        self._filter_gather_i64 = self._fn("filter_gather_i64", [I]*6)
         # ── joins ─────────────────────────────────────────────────────────────
         self._join_count        = self._fn("join_count",        [I]*7)
         self._join_scatter      = self._fn("join_scatter",      [I]*9)
@@ -337,44 +340,65 @@ class AOTKernels:
         self._gather_i64(_ptr(out), _ptr(values), _ptr(indices), len(indices), self._t(threads))
         return out
 
-    def sort_indices(self, keys: np.ndarray, descending: bool = False) -> np.ndarray:
-        n = len(keys)
-        out = np.empty(n, dtype=np.int32)
-        self._sort_indices(_ptr(out), _ptr(keys), n, int(descending))
+    @staticmethod
+    def _sort_kind(keys: np.ndarray) -> tuple:
+        """('i32'|'i64'|'f32'|'f64', keys as that dtype): the narrowest sort that loses nothing."""
+        dt = keys.dtype
+        if dt.kind == "f":
+            return ("f32", _arr(keys, np.float32)) if dt.itemsize <= 4 else ("f64", _arr(keys, np.float64))
+        if dt.kind in "biu":
+            if dt.kind == "u" and dt.itemsize == 8 and len(keys) and int(keys.max()) >= 2**63:
+                raise ValueError("uint64 keys above 2**63 cannot be sorted")
+            narrow = dt.itemsize < 4 or (dt.kind != "u" and dt.itemsize == 4) or dt.kind == "b"
+            return ("i32", _arr(keys, np.int32)) if narrow else ("i64", _arr(keys, np.int64))
+        raise TypeError(f"cannot sort keys of dtype {dt}")
+
+    def sort_indices(self, keys: np.ndarray, descending: bool = False,
+                     threads: Optional[int] = None) -> np.ndarray:
+        """Stable argsort (int32 row indices) of int32/int64/float32/float64 keys.
+
+        Equal keys keep their row order in both directions (identical to
+        ``np.argsort(keys, kind="stable")``, or of the negated keys for
+        ``descending``); NaN sorts last either way.  Parallel LSD radix sort.
+        """
+        kind, k = self._sort_kind(np.asarray(keys))
+        out = np.empty(len(k), dtype=np.int32)
+        self._sort_indices[kind](_ptr(out), _ptr(k), len(k), int(descending), self._t(threads))
         return out
 
-    def unique_mask(self, sorted_keys: np.ndarray) -> np.ndarray:
-        n = len(sorted_keys)
-        out = np.empty(n, dtype=np.int32)
-        self._unique_mask(_ptr(out), _ptr(sorted_keys), n)
+    def unique_mask(self, sorted_keys: np.ndarray, threads: Optional[int] = None) -> np.ndarray:
+        k = _arr(sorted_keys, np.int32)
+        out = np.empty(len(k), dtype=np.int32)
+        self._unique_mask(_ptr(out), _ptr(k), len(k), self._t(threads))
         return out
 
-    def prefix_sum_count(self, mask: np.ndarray) -> np.ndarray:
-        n = len(mask)
-        offsets = np.empty(n + 1, dtype=np.int32)
-        self._prefix_sum_count(_ptr(offsets), _ptr(mask), n)
+    def prefix_sum_count(self, mask: np.ndarray, threads: Optional[int] = None) -> np.ndarray:
+        """Exclusive prefix sum of `mask` in an int32 array of length n + 1 (last = total)."""
+        m = _arr(mask, np.int32)
+        offsets = np.empty(len(m) + 1, dtype=np.int32)
+        self._prefix_sum_count(_ptr(offsets), _ptr(m), len(m), self._t(threads))
         return offsets
 
-    def filter_gather_f32(self, values: np.ndarray, mask: np.ndarray,
-                          offsets: np.ndarray) -> np.ndarray:
-        count = int(offsets[-1])
-        out   = np.empty(count, dtype=np.float32)
-        self._filter_gather_f32(_ptr(out), _ptr(values), _ptr(mask), _ptr(offsets), len(values))
+    def _filter_gather(self, fn, dtype, values, mask, offsets, threads) -> np.ndarray:
+        v, m, o = _arr(values, dtype), _arr(mask, np.int32), _arr(offsets, np.int32)
+        _check_len("mask", m, len(v))
+        if len(o) not in (len(v), len(v) + 1):
+            raise ValueError(f"offsets has {len(o)} elements, expected {len(v)} or {len(v) + 1}")
+        count = int(o[-1]) if len(o) == len(v) + 1 else (int(o[-1]) + int(m[-1]) if len(v) else 0)
+        if count < 0 or count > len(v):
+            raise ValueError("offsets do not describe a selection of these rows")
+        out = np.empty(count, dtype=dtype)
+        fn(_ptr(out), _ptr(v), _ptr(m), _ptr(o), len(v), self._t(threads))
         return out
 
-    def filter_gather_i32(self, values: np.ndarray, mask: np.ndarray,
-                          offsets: np.ndarray) -> np.ndarray:
-        count = int(offsets[-1])
-        out   = np.empty(count, dtype=np.int32)
-        self._filter_gather_i32(_ptr(out), _ptr(values), _ptr(mask), _ptr(offsets), len(values))
-        return out
+    def filter_gather_f32(self, values, mask, offsets, threads: Optional[int] = None) -> np.ndarray:
+        return self._filter_gather(self._filter_gather_f32, np.float32, values, mask, offsets, threads)
 
-    def filter_gather_i64(self, values: np.ndarray, mask: np.ndarray,
-                          offsets: np.ndarray) -> np.ndarray:
-        count = int(offsets[-1])
-        out   = np.empty(count, dtype=np.int64)
-        self._filter_gather_i64(_ptr(out), _ptr(values), _ptr(mask), _ptr(offsets), len(values))
-        return out
+    def filter_gather_i32(self, values, mask, offsets, threads: Optional[int] = None) -> np.ndarray:
+        return self._filter_gather(self._filter_gather_i32, np.int32, values, mask, offsets, threads)
+
+    def filter_gather_i64(self, values, mask, offsets, threads: Optional[int] = None) -> np.ndarray:
+        return self._filter_gather(self._filter_gather_i64, np.int64, values, mask, offsets, threads)
 
     @staticmethod
     def _max_key(left_keys: np.ndarray, right_keys: np.ndarray) -> int:

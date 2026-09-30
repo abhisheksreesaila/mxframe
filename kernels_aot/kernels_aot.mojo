@@ -50,7 +50,7 @@ comptime I32 = Int32
 comptime I64 = Int64
 
 # ABI version of the exported symbol set; aot_kernels.py refuses a stale .so.
-comptime ABI_VERSION = 2
+comptime ABI_VERSION = 3
 
 comptime MIN_ROWS = 1 << 16          # rows per worker below which we stay serial
 comptime MIN_ROWS_STREAM = 1 << 17   # same, for pure streaming reductions
@@ -730,163 +730,305 @@ def gather_i64(out_addr: Int, values_addr: Int, indices_addr: Int, m: Int, threa
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# sort_indices
-# output[i] = original index at sorted position i.  Iterative bottom-up merge sort.
-# descending: 0 = ascending, 1 = descending
+# sort_indices{,_i64,_f32,_f64}
+# out[i] = original row index at sorted position i.  STABLE (equal keys keep row
+# order, ascending and descending), O(n) per radix pass, multi-core.
+#
+# Parallel LSD radix sort on 8-bit digits over (key, row) pairs:
+#   1. keys are mapped to unsigned integers that sort like the values (sign bit
+#      flipped for ints, the usual flip for floats; -0.0 == +0.0 and NaN sorts
+#      last in both directions); descending complements the mapped key, which
+#      still leaves equal keys in row order
+#   2. per pass every worker histograms its contiguous chunk of the current order,
+#      a tiny serial scan turns (digit, worker) counts into start offsets, and
+#      every worker scatters its chunk in order, which is what keeps the sort
+#      stable; a pass in which one digit holds every row is skipped, so keys
+#      with a small range cost fewer passes
+# The previous version was an in-place rotate merge sort: O(n^2), it hung at 1e4
+# random rows.
 # ─────────────────────────────────────────────────────────────────────────────
+comptime RADIX = 256
 
-def _merge_sort(idx: UnsafePointer[I32, MutAnyOrigin],
-               keys: UnsafePointer[I32, MutAnyOrigin],
-               left: Int, mid: Int, right: Int, desc: Bool):
-    """In-place stable merge of idx[left..mid) and idx[mid..right)."""
-    var i = left
-    var j = mid
-    while i < j and j < right:
-        var ki = keys[Int(idx[i])]
-        var kj = keys[Int(idx[j])]
-        var should_swap: Bool
-        if desc:
-            should_swap = kj > ki
+comptime KIND_I32 = 0
+comptime KIND_I64 = 1
+comptime KIND_F32 = 2
+comptime KIND_F64 = 3
+
+
+@always_inline
+def _to_key[KIND: Int, UT: DType](raw: Scalar[UT], desc: Bool) -> Scalar[UT]:
+    """Order-preserving unsigned key for the bits of one value."""
+    comptime if UT == DType.uint32:
+        comptime SIGN = Scalar[UT](0x80000000)
+        comptime ALL = ~Scalar[UT](0)
+        comptime if KIND == KIND_I32:
+            var k = raw ^ SIGN
+            return ~k if desc else k
         else:
-            should_swap = kj < ki
-        if should_swap:
-            # Rotate: bring idx[j] into position i by shift
-            var tmp = idx[j]
-            var k = j
-            while k > i:
-                idx[k] = idx[k - 1]
-                k -= 1
-            idx[i] = tmp
-            j += 1
-        i += 1
-
-@export
-def sort_indices(
-    out_addr:   Int,
-    keys_addr:  Int,
-    n:          Int,
-    descending: Int,   # 0=asc, 1=desc
-) abi("C"):
-    var idx  = _i32(out_addr)
-    var keys = _i32(keys_addr)
-    var desc = descending > 0
-    for i in range(n):
-        idx[i] = I32(i)
-    var width = 1
-    while width < n:
-        var left = 0
-        while left < n:
-            var mid = left + width
-            if mid > n:
-                mid = n
-            var right = mid + width
-            if right > n:
-                right = n
-            _merge_sort(idx, keys, left, mid, right, desc)
-            left += 2 * width
-        width *= 2
+            if (raw & Scalar[UT](0x7FFFFFFF)) > Scalar[UT](0x7F800000):
+                return ALL                                  # NaN last, either direction
+            var b = raw
+            if b == SIGN:
+                b = Scalar[UT](0)                            # -0.0 == +0.0
+            var k = ~b if (b & SIGN) != Scalar[UT](0) else (b | SIGN)
+            return ~k if desc else k
+    else:
+        comptime SIGN = Scalar[UT](1) << Scalar[UT](63)
+        comptime ALL = ~Scalar[UT](0)
+        comptime if KIND == KIND_I64:
+            var k = raw ^ SIGN
+            return ~k if desc else k
+        else:
+            if (raw & ~SIGN) > (Scalar[UT](0x7FF) << Scalar[UT](52)):
+                return ALL
+            var b = raw
+            if b == SIGN:
+                b = Scalar[UT](0)
+            var k = ~b if (b & SIGN) != Scalar[UT](0) else (b | SIGN)
+            return ~k if desc else k
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# unique_mask
-# output[i] = 1 if sorted_keys[i] is the first occurrence of that value, else 0
-# ─────────────────────────────────────────────────────────────────────────────
-@export
-def unique_mask(
-    out_addr:  Int,
-    keys_addr: Int,
-    n:         Int,
-) abi("C"):
-    var out  = _i32(out_addr)
-    var keys = _i32(keys_addr)
-    if n == 0:
+def _radix_pass[UT: DType](
+    src_k: UnsafePointer[Scalar[UT], MutAnyOrigin],
+    dst_k: UnsafePointer[Scalar[UT], MutAnyOrigin],
+    src_i: UnsafePointer[I32, MutAnyOrigin],
+    dst_i: UnsafePointer[I32, MutAnyOrigin],
+    hist: UnsafePointer[I32, MutAnyOrigin],
+    n: Int, W: Int, shift: Int,
+) -> Bool:
+    """One stable counting-sort pass on byte `shift`; False if it was skipped."""
+    @parameter
+    def count(w: Int):
+        var lo = (n * w) // W
+        var hi = (n * (w + 1)) // W
+        var h = hist + w * RADIX
+        for d in range(RADIX):
+            h[d] = I32(0)
+        for i in range(lo, hi):
+            var d = Int((src_k[i] >> Scalar[UT](shift)) & Scalar[UT](0xFF))
+            h[d] += I32(1)
+
+    sync_parallelize[count](W)
+
+    # digit totals: a digit holding every row makes the pass a no-op
+    var run = 0
+    for d in range(RADIX):
+        var total = 0
+        for w in range(W):
+            total += Int(hist[w * RADIX + d])
+        if total == n:
+            return False
+        for w in range(W):                      # (digit, worker) -> start offset
+            var c = Int(hist[w * RADIX + d])
+            hist[w * RADIX + d] = I32(run)
+            run += c
+
+    @parameter
+    def scatter(w: Int):
+        var lo = (n * w) // W
+        var hi = (n * (w + 1)) // W
+        var h = hist + w * RADIX
+        for i in range(lo, hi):
+            var k = src_k[i]
+            var d = Int((k >> Scalar[UT](shift)) & Scalar[UT](0xFF))
+            var p = Int(h[d])
+            h[d] = I32(p + 1)
+            dst_k[p] = k
+            dst_i[p] = src_i[i]
+
+    sync_parallelize[scatter](W)
+    return True
+
+
+def _radix_sort[UT: DType](
+    out_idx: UnsafePointer[I32, MutAnyOrigin],
+    keys: UnsafePointer[Scalar[UT], MutAnyOrigin],
+    n: Int, threads: Int,
+):
+    """Stable sort of the mapped `keys` (destroyed); out_idx gets the row order."""
+    comptime NBYTES = 4 if UT == DType.uint32 else 8
+    var W = _pick_workers(n, threads, MIN_ROWS)
+    var k_a: UnsafePointer[Scalar[UT], MutAnyOrigin] = keys
+    var k_b: UnsafePointer[Scalar[UT], MutAnyOrigin] = alloc[Scalar[UT]](n)
+    var i_a: UnsafePointer[I32, MutAnyOrigin] = alloc[I32](n)
+    var i_b: UnsafePointer[I32, MutAnyOrigin] = out_idx
+    var hist: UnsafePointer[I32, MutAnyOrigin] = alloc[I32](W * RADIX)
+
+    @parameter
+    def init(w: Int):
+        for i in range((n * w) // W, (n * (w + 1)) // W):
+            i_a[i] = I32(i)
+
+    sync_parallelize[init](W)
+
+    for p in range(NBYTES):
+        if _radix_pass[UT](k_a, k_b, i_a, i_b, hist, n, W, p * 8):
+            var tk: UnsafePointer[Scalar[UT], MutAnyOrigin] = k_a
+            k_a = k_b
+            k_b = tk
+            var ti: UnsafePointer[I32, MutAnyOrigin] = i_a
+            i_a = i_b
+            i_b = ti
+
+    if i_a != out_idx:                          # result ended in the scratch buffer
+        @parameter
+        def copy_out(w: Int):
+            for i in range((n * w) // W, (n * (w + 1)) // W):
+                out_idx[i] = i_a[i]
+
+        sync_parallelize[copy_out](W)
+    # free the two scratch index/key buffers (never `keys`' owner or out_idx)
+    if i_a != out_idx:
+        i_a.free()
+    else:
+        i_b.free()
+    if k_a != keys:
+        k_a.free()
+    else:
+        k_b.free()
+    hist.free()
+
+
+def _sort_impl[KIND: Int, UT: DType](
+    out_addr: Int, keys_addr: Int, n: Int, descending: Int, threads: Int
+):
+    if n <= 0:
         return
-    out[0] = I32(1)
-    for i in range(1, n):
-        if keys[i] != keys[i - 1]:
-            out[i] = I32(1)
-        else:
-            out[i] = I32(0)
+    var raw = _sp[UT](keys_addr)
+    var mapped = alloc[Scalar[UT]](n)
+    var desc = descending > 0
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+
+    @parameter
+    def map_keys(w: Int):
+        for i in range((n * w) // W, (n * (w + 1)) // W):
+            mapped[i] = _to_key[KIND, UT](raw[i], desc)
+
+    sync_parallelize[map_keys](W)
+    _radix_sort[UT](_i32(out_addr), mapped, n, threads)
+    mapped.free()
+
+
+@export
+def sort_indices(out_addr: Int, keys_addr: Int, n: Int, descending: Int, threads: Int) abi("C"):
+    _sort_impl[KIND_I32, DType.uint32](out_addr, keys_addr, n, descending, threads)
+
+@export
+def sort_indices_i64(out_addr: Int, keys_addr: Int, n: Int, descending: Int, threads: Int) abi("C"):
+    _sort_impl[KIND_I64, DType.uint64](out_addr, keys_addr, n, descending, threads)
+
+@export
+def sort_indices_f32(out_addr: Int, keys_addr: Int, n: Int, descending: Int, threads: Int) abi("C"):
+    _sort_impl[KIND_F32, DType.uint32](out_addr, keys_addr, n, descending, threads)
+
+@export
+def sort_indices_f64(out_addr: Int, keys_addr: Int, n: Int, descending: Int, threads: Int) abi("C"):
+    _sort_impl[KIND_F64, DType.uint64](out_addr, keys_addr, n, descending, threads)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# prefix_sum_count
-# Exclusive prefix sum of a binary mask into offsets[0..n].
-# offsets[n] = total count.
+# unique_mask   out[i] = 1 if sorted_keys[i] != sorted_keys[i-1] (or i == 0)
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-def prefix_sum_count(
-    offsets_addr: Int,   # int32[n+1]
-    mask_addr:    Int,   # int32[n]
-    n:            Int,
-) abi("C"):
-    var offsets = _i32(offsets_addr)
-    var mask    = _i32(mask_addr)
-    offsets[0] = I32(0)
-    for i in range(n):
-        offsets[i + 1] = offsets[i] + mask[i]
+def unique_mask(out_addr: Int, keys_addr: Int, n: Int, threads: Int) abi("C"):
+    if n <= 0:
+        return
+    var out = _i32(out_addr)
+    var keys = _i32(keys_addr)
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+
+    @parameter
+    def work(w: Int):
+        var lo = (n * w) // W
+        var hi = (n * (w + 1)) // W
+        if lo == 0:
+            out[0] = I32(1)
+            lo = 1
+        for i in range(lo, hi):
+            out[i] = I32(1) if keys[i] != keys[i - 1] else I32(0)
+
+    sync_parallelize[work](W)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# filter_gather_f32
-# output[offsets[i]] = values[i]  where mask[i] == 1
-# ─────────────────────────────────────────────────────────────────────────────
-@export
-def filter_gather_f32(
-    out_addr:     Int,
-    values_addr:  Int,
-    mask_addr:    Int,
-    offsets_addr: Int,
-    n:            Int,
-) abi("C"):
-    var out     = _f32(out_addr)
-    var values  = _f32(values_addr)
-    var mask    = _i32(mask_addr)
-    var offsets = _i32(offsets_addr)
-    for i in range(n):
-        if mask[i] == I32(1):
-            out[Int(offsets[i])] = values[i]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# filter_gather_i32
+# prefix_sum_count   offsets[0..n] = exclusive prefix sum of mask, offsets[n] = total
+# Two parallel sweeps over contiguous chunks with a tiny serial scan of the
+# chunk totals in between.
 # ─────────────────────────────────────────────────────────────────────────────
 @export
-def filter_gather_i32(
-    out_addr:     Int,
-    values_addr:  Int,
-    mask_addr:    Int,
-    offsets_addr: Int,
-    n:            Int,
-) abi("C"):
-    var out     = _i32(out_addr)
-    var values  = _i32(values_addr)
-    var mask    = _i32(mask_addr)
+def prefix_sum_count(offsets_addr: Int, mask_addr: Int, n: Int, threads: Int) abi("C"):
     var offsets = _i32(offsets_addr)
-    for i in range(n):
-        if mask[i] == I32(1):
-            out[Int(offsets[i])] = values[i]
+    var mask = _i32(mask_addr)
+    if n <= 0:
+        offsets[0] = I32(0)
+        return
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+    var sums = alloc[I32](W)
+
+    @parameter
+    def total(w: Int):
+        var s = I32(0)
+        for i in range((n * w) // W, (n * (w + 1)) // W):
+            s += mask[i]
+        sums[w] = s
+
+    sync_parallelize[total](W)
+    var run = I32(0)
+    for w in range(W):
+        var s = sums[w]
+        sums[w] = run
+        run += s
+    offsets[n] = run
+
+    @parameter
+    def fill(w: Int):
+        var acc = sums[w]
+        for i in range((n * w) // W, (n * (w + 1)) // W):
+            offsets[i] = acc
+            acc += mask[i]
+
+    sync_parallelize[fill](W)
+    sums.free()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# filter_gather_i64
+# filter_gather_{f32,i32,i64}   out[offsets[i]] = values[i]  where mask[i] == 1
+# Every selected row has its own output slot, so chunks are independent.
 # ─────────────────────────────────────────────────────────────────────────────
+def _filter_gather[T: DType](
+    out_addr: Int, values_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int, threads: Int
+):
+    if n <= 0:
+        return
+    var out = _sp[T](out_addr)
+    var values = _sp[T](values_addr)
+    var mask = _i32(mask_addr)
+    var offsets = _i32(offsets_addr)
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+
+    @parameter
+    def work(w: Int):
+        for i in range((n * w) // W, (n * (w + 1)) // W):
+            if mask[i] == I32(1):
+                out[Int(offsets[i])] = values[i]
+
+    sync_parallelize[work](W)
+
+
 @export
-def filter_gather_i64(
-    out_addr:     Int,
-    values_addr:  Int,
-    mask_addr:    Int,
-    offsets_addr: Int,
-    n:            Int,
-) abi("C"):
-    var out     = _i64(out_addr)
-    var values  = _i64(values_addr)
-    var mask    = _i32(mask_addr)
-    var offsets = _i32(offsets_addr)
-    for i in range(n):
-        if mask[i] == I32(1):
-            out[Int(offsets[i])] = values[i]
+def filter_gather_f32(out_addr: Int, values_addr: Int, mask_addr: Int, offsets_addr: Int,
+                      n: Int, threads: Int) abi("C"):
+    _filter_gather[DType.float32](out_addr, values_addr, mask_addr, offsets_addr, n, threads)
 
+@export
+def filter_gather_i32(out_addr: Int, values_addr: Int, mask_addr: Int, offsets_addr: Int,
+                      n: Int, threads: Int) abi("C"):
+    _filter_gather[DType.int32](out_addr, values_addr, mask_addr, offsets_addr, n, threads)
+
+@export
+def filter_gather_i64(out_addr: Int, values_addr: Int, mask_addr: Int, offsets_addr: Int,
+                      n: Int, threads: Int) abi("C"):
+    _filter_gather[DType.int64](out_addr, values_addr, mask_addr, offsets_addr, n, threads)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
