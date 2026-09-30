@@ -165,6 +165,34 @@ Needs: none · Found 2026-09-30: fresh process, SF10 lineitem already in memory,
 - [x] first-query SF10 Q1 (table in memory) under 200 ms on `cpu` and `auto`, results unchanged. After the orchestrator's auto changes (c32636f), 7 fresh-process runs each, machine load 4-7: cpu 172 179 194 173 175 179 168 (median 175 ms); auto 229 194 181 176 179 179 173 (median 179 ms). Before: cpu 984-1116, auto 1082-1205. Q1 result identical to the old path (and to DuckDB on SF1 in `tests/test_group_keys_review.py`).
 - [ ] follow-up (not done): a uint8 group-id variant in the fused kernel (<= 256 groups) would cut the 240 MB ids array to 60 MB and remove most of the ~95 ms.
 
+## F-016 Engine correctness gaps outside TPC-H [todo]
+Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
+- [ ] `with_columns` / `select` after an aggregate is applied (today silently ignored: `agg(count n).with_columns((n/2).alias("n"))` returns n unchanged)
+- [ ] a two-level groupby (aggregate over an aggregate) works (KeyError today)
+- [ ] a global sum/min/max/mean over zero rows returns NULL as SQL does (0.0 today); count stays 0
+- [ ] `count(col)` of a right-side column after a left join counts unmatched rows as 0 (counts them as 1 today: wrong answer)
+- [ ] a groupby on a column produced by an earlier aggregate in the same plan works ("Field does not exist" today)
+- [ ] a fuzz test of random plan shapes (project/filter/agg/join/sort/limit nested 2–3 deep) against DuckDB on cpu and auto
+
+## F-017 Parquet read as fast as Polars [todo]
+Needs: none · Found by the F-001 scoreboard (2026-09-30): SF10 `scan_parquet` of 3 lineitem columns with a date filter takes 689 ms in mx vs 149 ms in Polars.
+- [ ] profile the mx read path (ParquetFile.read / read_row_groups, pre_buffer, threads, dictionary="auto" metadata checks per row group, decode, dictionary columns) and close the gap to within 1.5x of Polars on SF1/SF10 lineitem scans with and without filters
+- [ ] filters pushed to the reader skip data inside row groups too where cheap (page index / late materialization of non-filter columns), or document why not
+- [ ] results unchanged (tests/test_scan_parquet.py, test_fast_read.py, DuckDB gate)
+
+## F-018 Join engine: order, lean materialization [todo]
+Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q20 7.3x slower than Polars — joins dominate
+- [ ] join reordering by estimated size/selectivity (filtered small sides first; e.g. Q2 joins 8M partsupp rows to supplier before the tiny filtered part table)
+- [ ] late materialization: joins produce row-index vectors and gather only the columns later operators need, once, instead of materializing every column after every join (Q9: six chained joins over 60M rows)
+- [ ] projection pushdown: only columns referenced above a join are carried through it
+- [ ] per-operator GPU placement for large joins (F-007) on top of the lean join representation
+- [ ] SF10 Q2/Q9/Q20 within 2x of Polars, results identical (DuckDB gate)
+
+## F-019 Import time [todo]
+Needs: none · Scoreboard: `import mxframe` ~700 ms in a fresh process (Polars ~70 ms, DuckDB ~40 ms)
+- [ ] profile `python -X importtime -c "import mxframe"`; defer everything not needed to build a plan (pyarrow.parquet/csv, compute, numpy submodules, calibration, np_arrow) until first use
+- [ ] `import mxframe` < 150 ms; the background warm-up still overlaps the rest
+
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
 - [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)

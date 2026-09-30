@@ -1172,7 +1172,7 @@ class CustomOpsCompiler(GraphCompiler):
             groups = {(): list(range(n))}
 
         for row_indices in groups.values():
-            sub = table.take(row_indices)
+            sub = table.take(_npa(np.asarray(row_indices, dtype=np.int64)))
             if order_by:
                 sort_keys = [(c, "descending" if descending else "ascending")
                              for c in order_by]
@@ -2409,8 +2409,23 @@ class CustomOpsCompiler(GraphCompiler):
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
 
     def _apply_distinct_custom(self, table, distinct_node):
-        cols = distinct_node.subset or table.column_names
-        return table.group_by(cols).aggregate([])
+        """Distinct rows of ``cols`` in first-appearance order (like pyarrow's group_by).
+
+        Uses the engine's own group-key encoding: pyarrow's Table.group_by imports
+        pyarrow.dataset and with it pandas (~150 ms of a first query).
+        """
+        cols = list(distinct_node.subset or table.column_names)
+        sub = table.select(cols)
+        if sub.num_rows == 0 or any(sub.column(c).null_count for c in cols):
+            return sub.group_by(cols).aggregate([])
+        try:
+            gids, n_groups, _ = self._build_group_ids(sub, cols)
+        except Exception:
+            return sub.group_by(cols).aggregate([])
+        gids = np.asarray(gids, dtype=np.int64)
+        first = np.full(int(n_groups), len(gids), dtype=np.int64)
+        np.minimum.at(first, gids, np.arange(len(gids), dtype=np.int64))
+        return sub.take(_npa(np.sort(first[first < len(gids)])))
 
     def _apply_post_ops_custom(self, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct using Mojo kernels (not PyArrow compute)."""

@@ -21,12 +21,20 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 
-from .arrow_dict import decode as _decode_dict, is_dictionary as _is_dict
 from .lazy_expr import Expr
 from .lazy_frame import (
     Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan,
     ParquetScan, Project, Scan, Sort, Tail,
 )
+
+def _decode_dict(col):
+    from .arrow_dict import decode       # pyarrow.compute (~25 ms) loads on first use, not at import
+    return decode(col)
+
+
+def _is_dict(arr_or_type) -> bool:
+    return pa.types.is_dictionary(getattr(arr_or_type, "type", arr_or_type))
+
 
 __all__ = ["scan_parquet", "read_parquet_table", "dictionary_columns", "resolve_plan"]
 
