@@ -165,6 +165,13 @@ Needs: none · Found 2026-09-30: fresh process, SF10 lineitem already in memory,
 - [x] first-query SF10 Q1 (table in memory) under 200 ms on `cpu` and `auto`, results unchanged. After the orchestrator's auto changes (c32636f), 7 fresh-process runs each, machine load 4-7: cpu 172 179 194 173 175 179 168 (median 175 ms); auto 229 194 181 176 179 179 173 (median 179 ms). Before: cpu 984-1116, auto 1082-1205. Q1 result identical to the old path (and to DuckDB on SF1 in `tests/test_group_keys_review.py`).
 - [ ] follow-up (not done): a uint8 group-id variant in the fused kernel (<= 256 groups) would cut the 240 MB ids array to 60 MB and remove most of the ~95 ms.
 
+## F-016 Engine correctness gaps outside TPC-H [todo]
+Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
+- [ ] `with_columns` / `select` after an aggregate is applied (today silently ignored: `agg(count n).with_columns((n/2).alias("n"))` returns n unchanged)
+- [ ] a two-level groupby (aggregate over an aggregate) works (KeyError today)
+- [ ] a global sum/min/max/mean over zero rows returns NULL as SQL does (0.0 today); count stays 0
+- [ ] a fuzz test of random plan shapes (project/filter/agg/join/sort/limit nested 2–3 deep) against DuckDB on cpu and auto
+
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
 - [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
