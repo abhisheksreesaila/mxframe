@@ -97,6 +97,13 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - [ ] fresh-process SF10 Q1 query time (excluding read) < 100 ms on `cpu`
 - [ ] unsupported expressions fall back to the existing path, never wrong results
 
+## F-011 Correctness: counts, Q15, Q21, nulls [todo]
+Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
+- [ ] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
+- [ ] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
+- [ ] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
+- [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
+
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
 - [ ] full SF1 + SF10 user-felt run on an otherwise idle machine; results + honest losses in `docs/benchmarks.md`
