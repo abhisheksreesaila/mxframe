@@ -204,7 +204,8 @@ class LazyFrame:
             prefer: auto only; "gpu" or "cpu" biases the choice without forcing it.
             placement: auto only; e.g. {"join": "gpu"}. Phase 1 places the whole
                 query: any "gpu" value runs the query on GPU, all "cpu" on CPU.
-            gpu_fraction: reserved for co-processing (Router splits); ignored for now.
+            gpu_fraction: auto only; fixed GPU share of rows when a fused aggregate
+                co-processes on CPU and GPU (default: balanced from calibration).
             strict: auto only; raise GPU errors instead of falling back to CPU.
             profile: auto only; record the actual query time next to the estimate
                 (see `last_auto_decision`). Per-operator timings that refine the
@@ -258,7 +259,11 @@ class LazyFrame:
                 decision.device, decision.fallback = "cpu", True
                 result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         else:
-            result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
+            # CPU plan: fused aggregates may still co-process with the GPU once their
+            # columns are resident there (see coproc_fused), and start that upload otherwise.
+            from . import coproc_fused as _cf
+            with _cf.policy(gpu_fraction=gpu_fraction):
+                result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3
         prov = dict(prov)

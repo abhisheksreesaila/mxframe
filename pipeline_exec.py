@@ -129,6 +129,12 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
 
     used = "cpu"
     partials = None
+    coproc_info = None
+    if device == "cpu":
+        from . import coproc_fused
+        split = coproc_fused.try_split(prog, cc, gids, n_groups, n_rows, table)
+        if split is not None:
+            partials, used, coproc_info = split
     if device == "gpu":
         try:
             partials = _run_gpu(pk, prog, cc, gids, n_groups, n_rows)
@@ -175,7 +181,7 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         finally:
             compiler._session_device = session_device
     compiler.last_compile_provenance = {
-        "device": used,
+        "device": {"split": "cpu+gpu", "gpu_resident": "gpu"}.get(used, used),
         "rows": int(result.num_rows),
         "grouped": grouped,
         "n_groups": int(n_groups) if grouped else 0,
@@ -186,4 +192,6 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         "optimizer_trace": list(optimizer_trace or []),
         "path": f"fused_pipeline_{used}",
     }
+    if coproc_info is not None:
+        compiler.last_compile_provenance["coproc"] = coproc_info
     return result
