@@ -28,6 +28,10 @@ except Exception:
     GPU_AOT_AVAILABLE = False
     AOTKernelsGPU = None
     get_aot_gpu = lambda: None
+try:  # F-008 fused pipeline dispatch (AOT kernels; no JIT)
+    from .pipeline_exec import try_fused_aggregate
+except Exception:
+    try_fused_aggregate = None
 
 
 # %% ../nbs/04_custom_ops.ipynb 4
@@ -1442,6 +1446,13 @@ class CustomOpsCompiler(GraphCompiler):
             if verbose:
                 print(f"[mxframe] PyArrow shortcut — {(t1-t0)*1000:.1f}ms")
             return result
+
+        # F-008 -- fused pipeline: filter + arithmetic + aggregates in one vectorized AOT pass
+        # (CPU or GPU), for grouped and global aggregate plans. None -> use the paths below.
+        if try_fused_aggregate is not None:
+            _fused = try_fused_aggregate(self, plan, having_pred, post_ops, optimizer_trace, t0)
+            if _fused is not None:
+                return _fused
 
         # 1b2 -- Global aggregate shortcut: bypass MAX Engine for un-grouped aggs.
         # For large tables with a filter, try the fused masked-kernel path first

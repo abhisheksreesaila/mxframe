@@ -319,7 +319,7 @@ class LazyFrame:
                 lines.append("none (run compute() first)")
         if device == "auto":
             from . import auto_mode as _am
-            decision = _am.choose_device(plan)
+            decision = _am.choose_device(plan, quick=not costs)
             text = decision.explain()
             lines.append("AutoDecision")
             lines.extend(text.splitlines() if costs else text.splitlines()[:1])
