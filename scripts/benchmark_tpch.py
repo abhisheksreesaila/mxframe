@@ -1227,7 +1227,11 @@ def run_q13_mxframe(customer, orders, device="cpu") -> pa.Table:
 
     LEFT JOIN is implemented in Mojo (join_count_left + join_scatter_left kernels).
     Two-stage groupby avoids any .to_pandas() detour.
+
+    TPC-H: only orders whose o_comment is NOT LIKE '%special%requests%' count.
     """
+    orders = _plain(orders)
+    orders = orders.filter(pc.invert(pc.match_substring_regex(orders.column("o_comment"), "special.*requests")))
     if device == "gpu":
         gpu = _bench_aot_gpu()
         if gpu is not None:
@@ -1238,7 +1242,7 @@ def run_q13_mxframe(customer, orders, device="cpu") -> pa.Table:
                 orders.column("o_custkey").to_numpy(zero_copy_only=False), dtype=np.int32)
             counts = gpu.key_match_counts_i32(customer_keys, order_customer_keys)
             unique_counts, distribution = np.unique(counts, return_counts=True)
-            order = np.argsort(-distribution, kind="stable")
+            order = np.lexsort((-unique_counts, -distribution))       # custdist desc, c_count desc
             return pa.table({
                 "c_count": pa.array(unique_counts[order], type=pa.int32()),
                 "custdist": pa.array(distribution[order], type=pa.int64()),
@@ -1273,7 +1277,7 @@ def run_q13_mxframe(customer, orders, device="cpu") -> pa.Table:
         LazyFrame(Scan(c_counts_int))
         .groupby("c_count")
         .agg(col("c_custkey").count().alias("custdist"))
-        .sort(col("custdist"), descending=True)
+        .sort(col("custdist"), col("c_count"), descending=[True, True])
         .compute(device=device)
     )
 
@@ -1367,6 +1371,8 @@ def run_q19_mxframe(part, lineitem, device="cpu") -> pa.Table:
     # calls masked_global_sum on the GPU — no intermediate table allocation.
     return (
         LazyFrame(Scan(lineitem))
+        .filter(col("l_shipmode").isin(["AIR", "AIR REG"]) &
+                (col("l_shipinstruct") == lit("DELIVER IN PERSON")))
         .join(LazyFrame(Scan(part)), left_on="l_partkey", right_on="p_partkey")
         .filter(cond_sm | cond_md | cond_lg)
         .groupby()
@@ -1772,26 +1778,22 @@ def make_tpch_q18_tables(n_customer=15_000, n_orders=60_000, n_lineitem=300_000,
 
 
 def run_q18_mxframe(customer, orders, lineitem, device="cpu") -> pa.Table:
-    # Step 1: find orders with SUM(l_quantity) > threshold
+    """Q18: Large Volume Customer (orders whose lines sum to more than 300 units)."""
+    # Step 1: quantity per order, kept where it exceeds the threshold
     qty_agg = (
         LazyFrame(Scan(lineitem))
         .groupby("l_orderkey")
         .agg(col("l_quantity").sum().alias("sum_qty"))
         .compute(device=device)
     )
-    valid_mask = pc.greater(qty_agg.column("sum_qty"),
-                            pa.scalar(Q18_QTY_THRESHOLD, pa.float32()))
-    # Keep as a pa.Table with unique l_orderkey — Mojo join = vectorized semi-join.
-    valid_orders = qty_agg.filter(valid_mask).select(["l_orderkey"])
-    # Step 2: Mojo join lineitem ⋈ valid_orders ⋈ orders ⋈ customer, groupby, sort, limit 100
+    big = qty_agg.filter(pc.greater(qty_agg.column("sum_qty"), Q18_QTY_THRESHOLD))
+    # Step 2: those orders with their customer; order by price desc, date; top 100
     return (
-        LazyFrame(Scan(lineitem))
-        .join(LazyFrame(Scan(valid_orders)), left_on="l_orderkey", right_on="l_orderkey")
-        .join(LazyFrame(Scan(orders)),       left_on="l_orderkey", right_on="o_orderkey")
-        .join(LazyFrame(Scan(customer)),     left_on="o_custkey",  right_on="c_custkey")
-        .groupby("o_custkey", "l_orderkey")
-        .agg(col("l_quantity").sum().alias("sum_qty"))
-        .sort(col("sum_qty"), descending=True)
+        LazyFrame(Scan(big))
+        .join(LazyFrame(Scan(orders)),   left_on="l_orderkey", right_on="o_orderkey")
+        .join(LazyFrame(Scan(customer)), left_on="o_custkey",  right_on="c_custkey")
+        .select("c_name", "o_custkey", "l_orderkey", "o_orderdate", "o_totalprice", "sum_qty")
+        .sort("o_totalprice", "o_orderdate", descending=[True, False])
         .limit(100)
         .compute(device=device)
     )
@@ -1886,47 +1888,12 @@ def make_tpch_q16_tables(n_parts=10_000, n_suppliers=2_000, seed=16):
     return part, supplier, partsupp
 
 
-# Module-level cache: keep deduped table stable so the second compute's
-# _INPUT_PREP_CACHE hits consistently -- eliminates GC-pause hot-run variance.
-_Q16_PRECOMP: dict = {}
-
-
 def run_q16_mxframe(part, supplier, partsupp, device="cpu") -> pa.Table:
     # Thin PyArrow: identify complaint supplier keys (small table)
+    supplier = _plain(supplier)
     complaint_keys = pc.unique(
-        supplier.filter(pc.match_substring(supplier.column("s_comment"), pattern="Complaints")).column("s_suppkey")
-    ).to_pylist()
-    # First compute: join + filter + select + distinct (cached across hot runs)
-    cache_key16 = (id(part), id(supplier), id(partsupp), device)
-    if cache_key16 not in _Q16_PRECOMP:
-        deduped = (
-            LazyFrame(Scan(part))
-            .filter(
-                (col("p_brand") != lit(Q16_BRAND)) &
-                (~col("p_type").startswith(Q16_TYPE_PREFIX)) &
-                col("p_size").isin(Q16_SIZES)
-            )
-            .join(LazyFrame(Scan(partsupp)), left_on="p_partkey", right_on="ps_partkey")
-            .filter(~col("ps_suppkey").isin(complaint_keys))
-            .select("p_brand", "p_type", "p_size", "ps_suppkey")
-            .distinct()
-            .compute(device=device)
-        )
-        _Q16_PRECOMP[cache_key16] = deduped
-    deduped = _Q16_PRECOMP[cache_key16]
-    # Second compute: groupby + count + sort (stable input -> cache hit every run)
-    return (
-        LazyFrame(Scan(deduped))
-        .groupby("p_brand", "p_type", "p_size")
-        .agg(col("ps_suppkey").count().alias("supplier_cnt"))
-        .sort(col("supplier_cnt"), descending=True)
-        .compute(device=device)
-    )
-
-def run_q16_mxframe(part, supplier, partsupp, device="cpu") -> pa.Table:
-    # Thin PyArrow: identify complaint supplier keys (small table)
-    complaint_keys = pc.unique(
-        supplier.filter(pc.match_substring(supplier.column("s_comment"), pattern="Complaints")).column("s_suppkey")
+        supplier.filter(pc.match_substring_regex(supplier.column("s_comment"), pattern="Customer.*Complaints"))
+        .column("s_suppkey")
     ).to_pylist()
     # Fused single compute: join + filter + select + distinct  (was 2 separate computes)
     deduped = (
@@ -2259,12 +2226,10 @@ def run_q15_mxframe(supplier, lineitem, device="cpu") -> pa.Table:
         )
         .compute(device=device)
     )
-    max_rev = float(pc.max(revenue_view.column("total_revenue")).as_py())
-    # Exact float32 equality — pc.max returns the actual stored value, so
-    # round-trip through pa.scalar(max_rev, pa.float32()) is safe.
+    # pc.max returns the stored value itself, in the column's own type (float64 here), so the
+    # equality is exact whatever precision the engine aggregated in.
     top_view = revenue_view.filter(
-        pc.equal(revenue_view.column("total_revenue"),
-                 pa.scalar(max_rev, pa.float32()))
+        pc.equal(revenue_view.column("total_revenue"), pc.max(revenue_view.column("total_revenue")))
     )
     return (
         LazyFrame(Scan(supplier))
@@ -2360,10 +2325,11 @@ def run_q20_mxframe(nation, part, supplier, partsupp, lineitem, device="cpu") ->
     All filter/join steps use PyArrow/NumPy vectorized ops.
     """
     MAX_SUPP = int(supplier.num_rows) + 1
+    part, supplier = _plain(part), _plain(supplier)
 
-    # Forest part keys (vectorized PyArrow filter, no to_pylist)
+    # Forest part keys: p_name LIKE 'forest%' (vectorized PyArrow filter, no to_pylist)
     forest_part_keys_arr = pc.unique(
-        part.filter(pc.match_substring(part.column("p_name"), pattern=Q20_COLOR))
+        part.filter(pc.starts_with(part.column("p_name"), Q20_COLOR))
             .column("p_partkey")
     )
     if len(forest_part_keys_arr) == 0:
@@ -2505,86 +2471,38 @@ def make_tpch_q21_tables(n_suppliers=2_000, n_orders=60_000, n_lineitem=200_000,
 
 
 def run_q21_mxframe(nation, supplier, orders, lineitem, device="cpu") -> pa.Table:
-    """Q21: Suppliers Who Kept Orders Waiting.
-    Find suppliers in the target nation whose lineitems on 'F'-status orders
-    were received AFTER commit date AND where no OTHER supplier on the same
-    order also had a late receipt.
+    """Q21: Suppliers Who Kept Orders Waiting (SAUDI ARABIA).
 
-    Implemented via two-step PyArrow + Mojo:
-    1. Flag rows where receipt > commit (late delivery).
-    2. Count unique late suppliers per order (PyArrow).
-    3. Keep orders where exactly 1 suppkey had late delivery.
-    4. Join back to target-nation suppliers, group, sort, limit 100.
+    A late line (receipt > commit) of a supplier in the target nation on an 'F' order counts
+    when the order has at least one other supplier and no other supplier was late.  So the
+    order must have >= 2 distinct suppliers and exactly 1 distinct late supplier (the line's
+    own).  Steps: per-order distinct supplier counts (Arrow), then the joins, group, sort and
+    limit run in the engine.
     """
-    if device == "gpu":
-        gpu = _bench_aot_gpu()
-        if gpu is not None:
-            _record_direct_gpu_aot("single_late_supplier_counts_i32_gpu")
-            finished_orders = np.zeros(orders.num_rows, dtype=np.int32)
-            order_keys = np.ascontiguousarray(
-                orders.column("o_orderkey").to_numpy(zero_copy_only=False), dtype=np.int32)
-            finished = np.asarray(
-                pc.equal(orders.column("o_orderstatus"), pa.scalar("F")), dtype=bool)
-            finished_orders[order_keys[finished]] = 1
-
-            target_suppliers = np.zeros(supplier.num_rows, dtype=np.int32)
-            supplier_keys = np.ascontiguousarray(
-                supplier.column("s_suppkey").to_numpy(zero_copy_only=False), dtype=np.int32)
-            target = np.asarray(
-                pc.equal(supplier.column("s_nationkey"),
-                         pa.scalar(Q21_NATION_KEY, pa.int32())), dtype=bool)
-            target_suppliers[supplier_keys[target]] = 1
-
-            counts = gpu.single_late_supplier_counts_i32(
-                np.ascontiguousarray(lineitem.column("l_orderkey").to_numpy(), dtype=np.int32),
-                np.ascontiguousarray(lineitem.column("l_suppkey").to_numpy(), dtype=np.int32),
-                np.ascontiguousarray(lineitem.column("l_commitdate").to_numpy(), dtype=np.int32),
-                np.ascontiguousarray(lineitem.column("l_receiptdate").to_numpy(), dtype=np.int32),
-                finished_orders,
-                target_suppliers,
-            )
-            nonzero = np.flatnonzero(counts)
-            ranked = np.lexsort((nonzero, -counts[nonzero]))
-            order = nonzero[ranked][:100]
-            return pa.table({
-                "l_suppkey": pa.array(order, type=pa.int32()),
-                "numwait": pa.array(counts[order], type=pa.int64()),
-            })
-
+    supplier, orders = _plain(supplier), _plain(orders)
     saudi_supp = supplier.filter(
-        pc.equal(supplier.column("s_nationkey"),
-                 pa.scalar(Q21_NATION_KEY, pa.int32()))
+        pc.equal(supplier.column("s_nationkey"), pa.scalar(Q21_NATION_KEY, pa.int32()))
     ).select(["s_suppkey"])
+    f_orders = orders.filter(pc.equal(orders.column("o_orderstatus"), "F")).select(["o_orderkey"])
 
-    # Orders with status='F'
-    f_orders = orders.filter(
-        pc.equal(orders.column("o_orderstatus"), pa.scalar("F"))
-    ).select(["o_orderkey"])
-
-    # Late lineitems (receipt > commit)
+    pairs = lineitem.select(["l_orderkey", "l_suppkey"])
     late_li = lineitem.filter(
         pc.greater(lineitem.column("l_receiptdate"), lineitem.column("l_commitdate"))
-    )
+    ).select(["l_orderkey", "l_suppkey"])
+    n_supp = pairs.group_by("l_orderkey").aggregate([("l_suppkey", "count_distinct")])
+    n_late = late_li.group_by("l_orderkey").aggregate([("l_suppkey", "count_distinct")])
+    multi = n_supp.filter(pc.greater_equal(n_supp.column("l_suppkey_count_distinct"), 2)).select(["l_orderkey"])
+    one_late = n_late.filter(pc.equal(n_late.column("l_suppkey_count_distinct"), 1)).select(["l_orderkey"])
+    qualifying = multi.join(one_late, keys="l_orderkey", join_type="inner")
+    qualifying = qualifying.join(f_orders, keys="l_orderkey", right_keys="o_orderkey", join_type="inner")
 
-    # Count unique l_suppkey per order among late rows — fully vectorized via NumPy.
-    # Build composite key (orderkey, suppkey) → deduplicate → count per orderkey.
-    MAX_SUPP_Q21 = int(supplier.num_rows) + 1
-    ok_np = np.asarray(late_li.column("l_orderkey")).astype(np.int64)
-    sk_np = np.asarray(late_li.column("l_suppkey")).astype(np.int64)
-    unique_pairs  = np.unique(ok_np * MAX_SUPP_Q21 + sk_np)       # dedup (ok,sk) pairs
-    u_orderkeys   = (unique_pairs // MAX_SUPP_Q21).astype(np.int32)
-    u_ok, u_cnt   = np.unique(u_orderkeys, return_counts=True)    # count per orderkey
-    single_late   = pa.table({"l_orderkey": pa.array(u_ok[u_cnt == 1], pa.int32())})
-
-    # Join: late lineitems (sa supplier) ⋈ f_orders ⋈ single_late_orders ⋈ sa_supp
     return (
         LazyFrame(Scan(late_li))
-        .join(LazyFrame(Scan(f_orders)), left_on="l_orderkey", right_on="o_orderkey")
-        .join(LazyFrame(Scan(single_late)), left_on="l_orderkey", right_on="l_orderkey")
+        .join(LazyFrame(Scan(qualifying)), left_on="l_orderkey", right_on="l_orderkey")
         .join(LazyFrame(Scan(saudi_supp)), left_on="l_suppkey", right_on="s_suppkey")
         .groupby("l_suppkey")
         .agg(col("l_orderkey").count().alias("numwait"))
-        .sort(col("numwait"), descending=True)
+        .sort(col("numwait"), col("l_suppkey"), descending=[True, False])
         .limit(100)
         .compute(device=device)
     )
