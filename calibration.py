@@ -1015,9 +1015,9 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
     if p.bucketed:                        # every size at one representative card per bucket
         cards = [c for c in BUCKET_REP_CARDS if c <= cap]
         big = [n for n in sizes_ok if n >= 100_000] or sizes_ok
-        low_card_sizes = big[:-1] if len(big) >= 5 else big    # top size is slow for mid group counts
+        low_card_sizes = big[:-1] if len(big) >= 4 else big    # top size is slow for mid group counts
         grid = [(n, c) for c in cards
-                for n in (big if c > BUCKET_EDGES[-1] else low_card_sizes) if c <= max(n, 8)]
+                for n in (big if c >= 100_000 else low_card_sizes) if c <= max(n, 8)]
     else:
         grid = [(n, _card_for(n)) for n in sizes_ok]
         if p.uses_card:                   # cardinality sweep at a mid size
