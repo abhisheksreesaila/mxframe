@@ -253,6 +253,18 @@ class _Cuda:
         self.bind_thread()
         self.lib.cuCtxSynchronize()
 
+    def pooled(self, name: str, nbytes: int) -> int:
+        """A per-thread device buffer that only grows: no allocation on the per-morsel path."""
+        pool = getattr(self._tls, "pool", None)
+        if pool is None:
+            pool = self._tls.pool = {}
+        ptr, size = pool.get(name, (0, 0))
+        if size < nbytes:
+            self.free(ptr)
+            ptr, size = self.malloc(nbytes), nbytes
+            pool[name] = (ptr, size)
+        return ptr
+
     def upload(self, arr: np.ndarray) -> int:
         arr = np.ascontiguousarray(arr)
         ptr = self.malloc(arr.nbytes)
@@ -281,7 +293,7 @@ def _load_gpu():
             lib = ctypes.CDLL(str(path))
             fn = lib.mx_pipeline_gpu
             fn.restype = _I64
-            fn.argtypes = [_I64] * 15
+            fn.argtypes = [_I64] * 20
             _gpu_lib = lib
     return _gpu_lib
 
@@ -292,7 +304,12 @@ class _DeviceProgram:
     def __init__(self, program: PipelineProgram, cu: _Cuda):
         self.cu = cu
         self.code = cu.upload(program.code)
-        self.consts = cu.upload(program.consts)
+        consts = np.zeros(64, dtype=np.float64)   # the kernel stages MAX_CONSTS = 64 doubles
+        consts[:len(program.consts)] = program.consts
+        self.consts = cu.upload(consts)
+        self.n_regs = int(program.code[1])
+        self.code_ints = int(len(program.code))
+        self.agg_base = int(program.code[2] + program.code[3] + program.code[4])
         self.set_bytes = cu.upload(program.set_bytes)
         self.set_meta = cu.upload(program.set_meta)
         self.ident = cu.upload(program.identity if program.n_slots else np.zeros(1))
@@ -377,11 +394,13 @@ def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray]
 
 
 def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarray], ChunkedColumns, DeviceColumns],
-                     gids: Optional[np.ndarray], n_groups: int, start: int, end: int) -> Partials:
+                     gids: Optional[np.ndarray], n_groups: int, start: int, end: int,
+                     _repeat: int = 1) -> Partials:
     """Run the program over rows ``[start, end)`` on the GPU.
 
     ``columns`` are host arrays / chunked columns (only the row range is copied
-    over) or a :class:`DeviceColumns` already on the device.
+    over) or a :class:`DeviceColumns` already on the device. ``_repeat`` re-runs
+    the main kernel (benchmarking only: results then accumulate).
     """
     lib = _load_gpu()
     cu = _get_cuda()
@@ -389,7 +408,6 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
     if start < 0 or start > end:
         raise ValueError(f"bad row range [{start}, {end})")
     n_slots = program.n_slots
-    temps: List[int] = []
     dev_cols: Optional[DeviceColumns] = None
     try:
         if isinstance(columns, DeviceColumns):
@@ -406,18 +424,25 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
                 raise ValueError(f"row range [{start}, {end}) outside 0..{n_rows}")
             dc = dev_cols = upload_columns(program, cc, gids, start, end)
         k_start, k_end = start - dc.base_row, end - dc.base_row
-        col_ptrs = cu.upload(np.array(dc.ptrs or [0], dtype=np.int64))
-        col_dt = cu.upload(np.array(dc.dtypes or [0], dtype=np.int32))
-        out_vals = cu.malloc(max(n_slots * n_groups, 1) * 8)
-        out_cnt = cu.malloc(n_groups * 8)
-        temps += [col_ptrs, col_dt, out_vals, out_cnt]
-        cu.sync()
         if n_groups != 1 and not dc.gid_ptr:
             raise ValueError("gids may only be omitted for a global aggregate (n_groups == 1)")
+        n_blocks = cu.sm_count * 6
+        # per-thread pooled scratch: launch arguments, outputs and the block partials
+        col_ptrs = cu.pooled("cols", max(len(dc.ptrs), 1) * 8)
+        col_dt = cu.pooled("dts", max(len(dc.dtypes), 1) * 4)
+        cu.h2d(col_ptrs, np.array(dc.ptrs or [0], dtype=np.int64))
+        cu.h2d(col_dt, np.array(dc.dtypes or [0], dtype=np.int32))
+        out_vals = cu.pooled("out_vals", max(n_slots * n_groups, 1) * 8)
+        out_cnt = cu.pooled("out_cnt", n_groups * 8)
+        ns = (n_slots + 1) * n_groups
+        block_rows = ns if ns <= 48 else 0
+        scratch = cu.pooled("scratch", max(n_blocks * block_rows * 8, 8))
+        cu.sync()
         rc = lib.mx_pipeline_gpu(
             dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
             dc.gid_ptr if n_groups > 1 else 0, n_groups, n_slots, k_start, k_end,
-            out_vals, out_cnt, dp.ident, cu.sm_count * 6,
+            out_vals, out_cnt, dp.ident, scratch, dp.n_regs, dp.code_ints, dp.agg_base,
+            n_blocks, int(_repeat),
         )
         if rc != 0:
             raise RuntimeError(f"mx_pipeline_gpu failed with code {rc}")
@@ -428,7 +453,5 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         cu.d2h(cnt, out_cnt)
         return Partials(vals=vals, cnt=cnt)
     finally:
-        for p in temps:
-            cu.free(p)
         if dev_cols is not None:
             dev_cols.free()
