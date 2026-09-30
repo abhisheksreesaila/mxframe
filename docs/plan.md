@@ -104,7 +104,7 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - [x] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
 - [x] unsupported expressions fall back to the existing path, never wrong results
 
-## F-011 Correctness: counts, Q15, Q21, nulls [todo]
+## F-011 Correctness: counts, Q15, Q21, nulls [review]
 Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [x] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
 - [x] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
@@ -119,7 +119,7 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [x] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
 - [x] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
 - [x] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
-- [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
+- [x] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto` (132/132; SF10 gpu/auto ran on GPU 1 because another process held 17-21 GB of GPU 0)
 - Build notes: `tests/test_tpch_duckdb.py` is the gate (`MXFRAME_TPCH_SF10=1` adds SF10). The DuckDB reference reads the same Parquet through views that restore DATE and DECIMAL(15,2), so it runs the official TPC-H text and gives the official answers (Q6 SF1 = 123141078.2283). The old Q6 "matches DuckDB" was DuckDB on raw float32 columns, which shares the truncation below.
 - The data generator truncated DECIMAL to float32 (0.05 stored as 0.049999997): fixed in `scripts/gen_tpch_parquet.py`, regenerated as `data/tpch_sf1_exact` and `data/tpch_sf10_exact` (the older dirs are untouched; the harness prefers `_exact`). Other agents should read the `_exact` dirs.
 - `run_q5_*`/`run_q8_*` (mxframe, pandas, Polars) take `supplier=` (keyword): TPC-H Q5 matches customer and supplier nation and Q8 measures the supplier's nation; the four/six-table forms could not.
