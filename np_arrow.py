@@ -11,6 +11,8 @@ anything else.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pyarrow as pa
 
@@ -23,9 +25,14 @@ _NUMERIC = {
 }
 
 
+def _is_masked(obj) -> bool:
+    ma = sys.modules.get("numpy.ma")          # touching np.ma would import it (~9 ms)
+    return ma is not None and isinstance(obj, ma.MaskedArray)
+
+
 def array(obj, type=None, **kwargs) -> pa.Array:
     """``pa.array(obj, type)`` for 1-D numeric/bool NumPy input, without pandas."""
-    if kwargs or not isinstance(obj, np.ndarray) or obj.ndim != 1 or isinstance(obj, np.ma.MaskedArray):
+    if kwargs or not isinstance(obj, np.ndarray) or obj.ndim != 1 or _is_masked(obj):
         return pa.array(obj, type=type, **kwargs)
     a = obj
     if a.dtype == np.bool_:
