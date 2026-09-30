@@ -77,6 +77,7 @@ comptime OP_FLOOR = 33
 comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
+comptime OP_CMPC = 38
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -209,6 +210,45 @@ def _binop(op: Int, d: FP, a: FP, b: FP, n: Int):
     else:
         _bin[OP_OR](d, a, b, n)
 
+@always_inline
+def _cmp_thr[OP: Int](d: FP, thr: Float64, n: Int):
+    """In place: d = 1.0 if d <OP> thr else 0.0."""
+    var t = SIMD[F64, W](thr)
+    var one = SIMD[F64, W](1.0)
+    var zero = SIMD[F64, W](0.0)
+    var i = 0
+    while i < n:
+        var x = d.load[width=W](i)
+        var r: SIMD[F64, W]
+        comptime if OP == OP_LT:
+            r = x.lt(t).select(one, zero)
+        elif OP == OP_LE:
+            r = x.le(t).select(one, zero)
+        elif OP == OP_GT:
+            r = x.gt(t).select(one, zero)
+        elif OP == OP_GE:
+            r = x.ge(t).select(one, zero)
+        elif OP == OP_EQ:
+            r = x.eq(t).select(one, zero)
+        else:
+            r = x.ne(t).select(one, zero)
+        d.store(i, r)
+        i += W
+
+def _cmp_const(op: Int, d: FP, thr: Float64, n: Int):
+    if op == OP_LT:
+        _cmp_thr[OP_LT](d, thr, n)
+    elif op == OP_LE:
+        _cmp_thr[OP_LE](d, thr, n)
+    elif op == OP_GT:
+        _cmp_thr[OP_GT](d, thr, n)
+    elif op == OP_GE:
+        _cmp_thr[OP_GE](d, thr, n)
+    elif op == OP_EQ:
+        _cmp_thr[OP_EQ](d, thr, n)
+    else:
+        _cmp_thr[OP_NE](d, thr, n)
+
 def _not(d: FP, a: FP, n: Int):
     var one = SIMD[F64, W](1.0)
     var zero = SIMD[F64, W](0.0)
@@ -318,6 +358,11 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             while i < VEC:
                 d.store(i, v)
                 i += W
+        elif op == OP_CMPC:
+            # column <cmp> constant: widen exactly, compare against the pre-rounded threshold
+            var c = Int(ins[2])
+            _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
+            _cmp_const(Int(ins[4]), d, p.consts[Int(ins[3])], npad)
         elif op < OP_NOT:
             _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad)
         elif op == OP_NOT:

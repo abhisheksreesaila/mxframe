@@ -63,6 +63,7 @@ comptime OP_FLOOR = 33
 comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
+comptime OP_CMPC = 38
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -113,6 +114,72 @@ def _b(x: Bool) -> Float64:
 
 
 @always_inline
+def _nz(x: Float64) -> Bool:
+    """x != 0 for the 0.0 / 1.0 booleans, by integer test (float64 compares are 1/64 rate on GeForce)."""
+    return bitcast[DType.int64, 1](SIMD[F64, 1](x))[0] != 0
+
+
+@always_inline
+def _cmp_f(cmp: Int, x: Float32, t: Float32) -> Bool:
+    if cmp == OP_GE:
+        return x >= t
+    elif cmp == OP_LT:
+        return x < t
+    elif cmp == OP_LE:
+        return x <= t
+    elif cmp == OP_GT:
+        return x > t
+    elif cmp == OP_EQ:
+        return x == t
+    return x != t
+
+
+@always_inline
+def _cmp_d(cmp: Int, x: Float64, t: Float64) -> Bool:
+    if cmp == OP_GE:
+        return x >= t
+    elif cmp == OP_LT:
+        return x < t
+    elif cmp == OP_LE:
+        return x <= t
+    elif cmp == OP_GT:
+        return x > t
+    elif cmp == OP_EQ:
+        return x == t
+    return x != t
+
+
+@always_inline
+def _cmp_i(cmp: Int, x: Int64, t: Int64) -> Bool:
+    if cmp == OP_GE:
+        return x >= t
+    elif cmp == OP_LT:
+        return x < t
+    elif cmp == OP_LE:
+        return x <= t
+    elif cmp == OP_GT:
+        return x > t
+    elif cmp == OP_EQ:
+        return x == t
+    return x != t
+
+
+@always_inline
+def _cmpc(addr: Int, dtype: Int, row: Int, thr: Float64, cmp: Int) -> Float64:
+    """column[row] <cmp> thr in the column's own type (thr was rounded on the host)."""
+    if dtype == 2:
+        var x = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=addr)[row]
+        return _b(_cmp_f(cmp, x, thr.cast[DType.float32]()))
+    elif dtype == 0:
+        return _b(_cmp_i(cmp, _ip(addr)[row].cast[DType.int64](), Int64(thr)))
+    elif dtype == 3:
+        return _b(_cmp_d(cmp, _fp(addr)[row], thr))
+    elif dtype == 1:
+        return _b(_cmp_i(cmp, _lp(addr)[row], Int64(thr)))
+    return _b(_cmp_i(cmp, _bp(addr)[row].cast[DType.int64](), Int64(thr)))
+
+
+@always_inline
 def _shfl_down(v: Float64, off: Int) -> Float64:
     """Float64 warp shuffle as two 32-bit shuffles (the stdlib has no f64 shuffle)."""
     var bits = bitcast[DType.uint32, 2](SIMD[F64, 1](v))
@@ -149,12 +216,12 @@ def _ident(kind: Int) -> Float64:
     return 0.0
 
 
-def _run[RPT: Int](
+def _run[RPT: Int, B: Int](
     code: SIP, base: Int, count: Int, regs: SFP, consts: SFP, cols: LP, dts: IP,
     set_bytes: BP, set_meta: LP, tid: Int, row_base: Int, mask: Int,
 ):
     """Run `count` instructions for this thread's RPT rows; bit k of `mask` = row k is live."""
-    comptime TILE = BLOCK * RPT
+    comptime TILE = B * RPT
     for n in range(count):
         var ins = code + (HDR + (base + n) * 5)
         var op = Int(ins[0])
@@ -165,18 +232,27 @@ def _run[RPT: Int](
             var dt = Int(dts[c])
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    d[k * BLOCK] = _load(addr, dt, row_base + tid + k * BLOCK)
+                    d[k * B] = _load(addr, dt, row_base + tid + k * B)
         elif op == OP_LOAD_CONST:
             var v = consts[Int(ins[2])]
             comptime for k in range(RPT):
-                d[k * BLOCK] = v
+                d[k * B] = v
+        elif op == OP_CMPC:
+            var c = Int(ins[2])
+            var addr = Int(cols[c])
+            var dt = Int(dts[c])
+            var thr = consts[Int(ins[3])]
+            var cmp = Int(ins[4])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = _cmpc(addr, dt, row_base + tid + k * B, thr, cmp)
         elif op < OP_LT:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    var x = a[k * BLOCK]
-                    var y = b[k * BLOCK]
+                    var x = a[k * B]
+                    var y = b[k * B]
                     var r = x + y
                     if op == OP_MUL:
                         r = x * y
@@ -184,14 +260,14 @@ def _run[RPT: Int](
                         r = x - y
                     elif op == OP_DIV:
                         r = x / y
-                    d[k * BLOCK] = r
+                    d[k * B] = r
         elif op < OP_AND:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    var x = a[k * BLOCK]
-                    var y = b[k * BLOCK]
+                    var x = a[k * B]
+                    var y = b[k * B]
                     var r = _b(x < y)
                     if op == OP_LE:
                         r = _b(x <= y)
@@ -203,40 +279,40 @@ def _run[RPT: Int](
                         r = _b(x == y)
                     elif op == OP_NE:
                         r = _b(x != y)
-                    d[k * BLOCK] = r
+                    d[k * B] = r
         elif op < OP_NOT:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    var x = a[k * BLOCK] != 0.0
-                    var y = b[k * BLOCK] != 0.0
-                    d[k * BLOCK] = _b(x and y) if op == OP_AND else _b(x or y)
+                    var x = _nz(a[k * B])
+                    var y = _nz(b[k * B])
+                    d[k * B] = _b(x and y) if op == OP_AND else _b(x or y)
         elif op == OP_NOT:
             var a = regs + Int(ins[2]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    d[k * BLOCK] = _b(a[k * BLOCK] == 0.0)
+                    d[k * B] = _b(not _nz(a[k * B]))
         elif op == OP_FLOOR:
             var a = regs + Int(ins[2]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    d[k * BLOCK] = floor(a[k * BLOCK])
+                    d[k * B] = floor(a[k * B])
         elif op == OP_SELECT:
             var c = regs + Int(ins[2]) * TILE + tid
             var a = regs + Int(ins[3]) * TILE + tid
             var b = regs + Int(ins[4]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    d[k * BLOCK] = a[k * BLOCK] if c[k * BLOCK] != 0.0 else b[k * BLOCK]
+                    d[k * B] = a[k * B] if _nz(c[k * B]) else b[k * B]
         elif op == OP_BETWEEN:
             var x = regs + Int(ins[2]) * TILE + tid
             var lo = regs + Int(ins[3]) * TILE + tid
             var hi = regs + Int(ins[4]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    var v = x[k * BLOCK]
-                    d[k * BLOCK] = _b(v >= lo[k * BLOCK] and v <= hi[k * BLOCK])
+                    var v = x[k * B]
+                    d[k * B] = _b(v >= lo[k * B] and v <= hi[k * B])
         elif op == OP_IN_SET:
             var s = Int(ins[3])
             var off = Int(set_meta[s * 3])
@@ -245,21 +321,22 @@ def _run[RPT: Int](
             var a = regs + Int(ins[2]) * TILE + tid
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    var x = a[k * BLOCK] - lo
+                    var x = a[k * B] - lo
                     var hit = 0.0
                     if x >= 0.0 and x < length:
                         if set_bytes[off + Int(x)] != 0:
                             hit = 1.0
-                    d[k * BLOCK] = hit
+                    d[k * B] = hit
 
 
-def pipeline_kernel[RPT: Int](
+def pipeline_kernel[RPT: Int, B: Int](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int, n_slots: Int,
     row0: Int, row_end: Int, out_vals_a: Int, out_cnt_a: Int, scratch_a: Int,
     n_regs: Int, code_ints: Int, mode: Int,
 ):
-    comptime TILE = BLOCK * RPT
+    comptime TILE = B * RPT
+    comptime NWARPS = B // 32
     var tid = Int(thread_idx.x)
     var G = n_groups
     var A = n_slots
@@ -269,15 +346,16 @@ def pipeline_kernel[RPT: Int](
     var regs = smem
     var consts = smem + n_regs * TILE
     var wpart = consts + MAX_CONSTS
-    var code = (wpart + WARPS * SMALL).bitcast[Int32]()
+    var accs = wpart + NWARPS * SMALL     # per-thread accumulators in shared memory (mode 3)
+    var code = (accs + (n_slots + 1) * n_groups * B if mode == 3 else accs).bitcast[Int32]()
     var i = tid
     while i < code_ints:
         code[i] = _ip(code_a)[i]
-        i += BLOCK
+        i += B
     i = tid
     while i < MAX_CONSTS:
         consts[i] = _fp(consts_a)[i]
-        i += BLOCK
+        i += B
     barrier()
 
     var n_pro = Int(code[2])
@@ -295,7 +373,7 @@ def pipeline_kernel[RPT: Int](
     var out_cnt = _lp(out_cnt_a)
 
     var all_rows = (1 << RPT) - 1
-    _run[RPT](code, 0, n_pro, regs, consts, cols, dts, set_bytes, set_meta, tid, 0, all_rows)
+    _run[RPT, B](code, 0, n_pro, regs, consts, cols, dts, set_bytes, set_meta, tid, 0, all_rows)
 
     var acc = stack_allocation[SMALL, Scalar[F64]]()
     var ns = (A + 1) * G
@@ -306,6 +384,13 @@ def pipeline_kernel[RPT: Int](
                 acc[a * G + g] = init
         for g in range(G):
             acc[A * G + g] = 0.0
+    elif mode == 3:
+        for a in range(A):
+            var init = _ident(Int(code[HDR + (agg_base + a) * 5]))
+            for g in range(G):
+                accs[(a * G + g) * B + tid] = init
+        for g in range(G):
+            accs[(A * G + g) * B + tid] = 0.0
 
     var n_tiles = ceildiv(row_end - row0, TILE)
     var tile = Int(block_idx.x)
@@ -314,31 +399,31 @@ def pipeline_kernel[RPT: Int](
         var row_base = row0 + tile * TILE
         var valid = 0
         comptime for k in range(RPT):
-            if row_base + tid + k * BLOCK < row_end:
+            if row_base + tid + k * B < row_end:
                 valid |= 1 << k
         var active = valid
         if pred_reg >= 0:
-            _run[RPT](code, n_pro, n_pred, regs, consts, cols, dts, set_bytes, set_meta,
+            _run[RPT, B](code, n_pro, n_pred, regs, consts, cols, dts, set_bytes, set_meta,
                       tid, row_base, valid)
             active = 0
             comptime for k in range(RPT):
-                if (valid >> k) & 1 != 0 and regs[pred_reg * TILE + tid + k * BLOCK] != 0.0:
+                if (valid >> k) & 1 != 0 and _nz(regs[pred_reg * TILE + tid + k * B]):
                     active |= 1 << k
         if active != 0:
-            _run[RPT](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
+            _run[RPT, B](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
                       set_meta, tid, row_base, active)
             comptime for k in range(RPT):
                 if (active >> k) & 1 != 0:
                     var g = 0
                     if has_gids:
-                        g = Int(gids[row_base + tid + k * BLOCK])
+                        g = Int(gids[row_base + tid + k * B])
                     if g >= 0 and g < G:
                         if mode == 0:
                             acc[A * G + g] += 1.0
                             for a in range(A):
                                 var ins = code + (HDR + (agg_base + a) * 5)
                                 var kind = Int(ins[0])
-                                var v = regs[Int(ins[2]) * TILE + tid + k * BLOCK]
+                                var v = regs[Int(ins[2]) * TILE + tid + k * B]
                                 var q = a * G + g
                                 if kind == OP_AGG_SUM:
                                     acc[q] += v
@@ -346,12 +431,25 @@ def pipeline_kernel[RPT: Int](
                                     acc[q] = min(acc[q], v)
                                 else:
                                     acc[q] = max(acc[q], v)
+                        elif mode == 3:
+                            accs[(A * G + g) * B + tid] += 1.0
+                            for a in range(A):
+                                var ins = code + (HDR + (agg_base + a) * 5)
+                                var kind = Int(ins[0])
+                                var v = regs[Int(ins[2]) * TILE + tid + k * B]
+                                var p = accs + ((a * G + g) * B + tid)
+                                if kind == OP_AGG_SUM:
+                                    p[0] += v
+                                elif kind == OP_AGG_MIN:
+                                    p[0] = min(p[0], v)
+                                else:
+                                    p[0] = max(p[0], v)
                         else:
                             _ = Atomic[DType.int64].fetch_add(out_cnt + g, Int64(1))
                             for a in range(A):
                                 var ins = code + (HDR + (agg_base + a) * 5)
                                 var kind = Int(ins[0])
-                                var v = regs[Int(ins[2]) * TILE + tid + k * BLOCK]
+                                var v = regs[Int(ins[2]) * TILE + tid + k * B]
                                 var p = out_vals + (a * G + g)
                                 if kind == OP_AGG_SUM:
                                     _ = Atomic[F64].fetch_add(p, v)
@@ -361,7 +459,7 @@ def pipeline_kernel[RPT: Int](
                                     Atomic[F64].max(p, v)
         tile += step
 
-    if mode == 0:
+    if mode == 0 or mode == 3:
         # reduce the block's per-thread partials: warp shuffles, then across warps
         var lane = tid & 31
         var warp = tid >> 5
@@ -369,7 +467,7 @@ def pipeline_kernel[RPT: Int](
             var kind = OP_AGG_SUM
             if s_ < A * G:
                 kind = Int(code[HDR + (agg_base + s_ // G) * 5])
-            var w = _warp_reduce(kind, acc[s_])
+            var w = _warp_reduce(kind, acc[s_] if mode == 0 else accs[s_ * B + tid])
             if lane == 0:
                 wpart[warp * SMALL + s_] = w
         barrier()
@@ -378,7 +476,7 @@ def pipeline_kernel[RPT: Int](
             if tid < A * G:
                 kind = Int(code[HDR + (agg_base + tid // G) * 5])
             var r = wpart[tid]
-            for w in range(1, WARPS):
+            for w in range(1, NWARPS):
                 r = _combine(kind, r, wpart[w * SMALL + tid])
             _fp(scratch_a)[Int(block_idx.x) * ns + tid] = r
 
@@ -430,13 +528,23 @@ def mx_pipeline_gpu(
     if gids_a == 0 and G != 1:
         return -2
     var ns = (A + 1) * G
+    var rpt = 2 if (n_regs <= 6 and G == 1 and A <= 2) else 1
     var mode = 0 if ns <= SMALL else 2
-    var small = 1 if mode == 0 else 0
-    var rpt = 2 if n_regs <= 6 else 1
-    var tile = BLOCK * rpt
-    var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + WARPS * SMALL * 8 + code_ints * 4
+    var bsz = BLOCK
+    if mode == 0 and G > 1:
+        # per-thread accumulators in shared memory (128-thread blocks) beat local memory
+        var smem3 = n_regs * 128 * rpt * 8 + MAX_CONSTS * 8 + 4 * SMALL * 8 + ns * 128 * 8 + code_ints * 4
+        if smem3 <= 48 * 1024:
+            mode = 3
+            bsz = 128
+    var tile = bsz * rpt
+    var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + (bsz // 32) * SMALL * 8 + code_ints * 4
+    if mode == 3:
+        smem += ns * bsz * 8
     if smem > 48 * 1024:
         return -5
+    var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
+    var small = 1 if mode != 2 else 0
     try:
         var ctx = DeviceContext()
         var total = A * G
@@ -445,18 +553,28 @@ def mx_pipeline_gpu(
                 out_vals_a, out_cnt_a, ident_a, G, total,
                 grid_dim=ceildiv(max(total, G), BLOCK), block_dim=BLOCK)
         if end > start:
-            var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1))
+            var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1) * per_sm)
             for _ in range(max(repeat, 1)):
-                if rpt == 2:
-                    ctx.enqueue_function[pipeline_kernel[2]](
+                if bsz == 128 and rpt == 2:
+                    ctx.enqueue_function[pipeline_kernel[2, 128]](
                         code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
                         G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
-                        mode, grid_dim=blocks, block_dim=BLOCK, shared_mem_bytes=smem)
+                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                elif bsz == 128:
+                    ctx.enqueue_function[pipeline_kernel[1, 128]](
+                        code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
+                        G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
+                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                elif rpt == 2:
+                    ctx.enqueue_function[pipeline_kernel[2, 256]](
+                        code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
+                        G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
+                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 else:
-                    ctx.enqueue_function[pipeline_kernel[1]](
+                    ctx.enqueue_function[pipeline_kernel[1, 256]](
                         code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
                         G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
-                        mode, grid_dim=blocks, block_dim=BLOCK, shared_mem_bytes=smem)
+                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
             if small != 0:
                 ctx.enqueue_function[merge_kernel](
                     code_a, scratch_a, out_vals_a, out_cnt_a, blocks, G, A, agg_base, ident_a,

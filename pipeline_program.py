@@ -27,6 +27,10 @@ ADD SUB    dst = a (+|-|*|/) b                              dst, a, b
 MUL DIV
 LT LE GT   dst = 1.0 if a (<|<=|>|>=|==|!=) b else 0.0      dst, a, b
 GE EQ NE
+CMPC       dst = column <cmp> constant, compared in the      dst, col, k, cmp
+           column's own type (f32 / int / f64) against a
+           threshold rounded so the answer equals the float64
+           comparison; no widening of the column
 AND OR     dst = logical and / or of a, b (non-zero = true) dst, a, b
 NOT        dst = 1.0 if a == 0 else 0.0                     dst, a
 FLOOR      dst = floor(a)                                   dst, a
@@ -67,7 +71,7 @@ OP_LOAD_COL, OP_LOAD_CONST = 1, 2
 OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
-OP_SELECT, OP_BETWEEN, OP_IN_SET = 35, 36, 37
+OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 
 OP_NAMES = {
@@ -75,7 +79,7 @@ OP_NAMES = {
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
-    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET",
+    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX",
 }
 
@@ -337,7 +341,7 @@ class _Builder:
         self._nv += 1
         return self._nv - 1
 
-    def const_reg(self, value: float) -> int:
+    def pool_index(self, value: float) -> int:
         v = float(value)
         key = v if v == v else "nan"
         if key not in self.const_ix:
@@ -345,7 +349,10 @@ class _Builder:
                 raise Unsupported("too many constants")
             self.const_ix[key] = len(self.consts)
             self.consts.append(v)
-        k = self.const_ix[key]
+        return self.const_ix[key]
+
+    def const_reg(self, value: float) -> int:
+        k = self.pool_index(value)
         if k not in self.const_vregs:
             self.const_vregs[k] = self.new_vreg()
         return self.const_vregs[k]
@@ -497,12 +504,56 @@ class _Builder:
                 d = self.dictionary(col_e.args[0])
                 member = np.asarray(pc.equal(d, pa.scalar(lit_e.args[0], type=d.type)).fill_null(False).to_numpy(zero_copy_only=False))
                 return self._dict_test(col_e.args[0], member, negate=(op == "ne"))
+        cmpc = self._try_cmpc(op, lhs, rhs)
+        if cmpc is not None:
+            return cmpc
         a = self._need(lhs, "num")
         b = self._need(rhs, "num")
         code = _CMP[op]
         if isinstance(a, _Const) and isinstance(b, _Const):
             return _Const(_FOLD[code](a.value, b.value), "bool")
         return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), "bool")
+
+    _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
+
+    def _fold(self, e: Expr) -> Optional[float]:
+        """Value of a constant numeric expression (literals and + - * /), else None."""
+        if e.op == "lit":
+            v = e.args[0]
+            if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
+                return None
+            return float(v)
+        if e.op in _ARITH:
+            a, b = self._fold(e.args[0]), self._fold(e.args[1])
+            if a is None or b is None:
+                return None
+            if e.op == "div":
+                return a / b if b != 0 else None
+            return _FOLD[_ARITH[e.op]](a, b)
+        return None
+
+    def _try_cmpc(self, op: str, lhs: Expr, rhs: Expr):
+        """`column <cmp> constant` in the column's own type, or None if not that shape."""
+        for col_e, other, flip in ((lhs, rhs, False), (rhs, lhs, True)):
+            if col_e.op != "col":
+                continue
+            c = self._fold(other)
+            if c is None or c != c:
+                continue
+            name = col_e.args[0]
+            if self.column_kind(name) not in ("int", "float", "bool"):
+                continue
+            eff = self._FLIP[op] if flip else op
+            t = self.table.schema.field(name).type
+            kind = "f32" if pa.types.is_float32(t) else "f64" if pa.types.is_floating(t) else "int"
+            res = _threshold(kind, eff, c)
+            if isinstance(res, bool):
+                return _Const(float(res), "bool")
+            thr, code = res
+            ix = self._column(name)
+            k = self.pool_index(thr)
+            return _Val(self.emit(OP_CMPC, ix, k, code, key_extra=("cmpc",)), "bool")
+        return None
 
     def _dict_test(self, name: str, member: np.ndarray, negate: bool = False):
         ix = self._column(name)
@@ -648,9 +699,22 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
     if not outputs:
         raise Unsupported("no aggregates")
 
+    # ── dead code, then keep only the columns still read ───────────────────
+    pred_sec.instrs = _dce(pred_sec.instrs, [pred_reg_v] if pred_reg_v >= 0 else [])
+    body_sec.instrs = _dce(body_sec.instrs, list(slot_src))
+    used: List[int] = []
+    for ins in pred_sec.instrs + body_sec.instrs:
+        if ins[0] in (OP_LOAD_COL, OP_CMPC) and ins[2] not in used:
+            used.append(ins[2])
+    remap = {old: new for new, old in enumerate(used)}
+    for ins in pred_sec.instrs + body_sec.instrs:
+        if ins[0] in (OP_LOAD_COL, OP_CMPC):
+            ins[2] = remap[ins[2]]
+    b.columns = [b.columns[old] for old in used]
+    b.dict_arrays = {n: d for n, d in b.dict_arrays.items() if n in b.columns}
+
     # ── register allocation ────────────────────────────────────────────────
     const_vregs = [b.const_vregs[k] for k in sorted(b.const_vregs)]
-    n_consts_used = len(b.consts)
     agg_instrs = [[OP_AGG_SUM if k == "sum" else OP_AGG_MIN if k == "min" else OP_AGG_MAX,
                    s, src, 0, 0] for s, (k, src) in enumerate(zip(slot_kinds, slot_src))]
     body_all = body_sec.instrs + agg_instrs
@@ -666,6 +730,8 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
         op = ins[0]
         if op == OP_LOAD_COL:
             return [op, phys_of(ins[1]), ins[2], 0, 0]
+        if op == OP_CMPC:
+            return [op, phys_of(ins[1]), ins[2], ins[3], ins[4]]
         if op == OP_IN_SET:
             return [op, phys_of(ins[1]), phys_of(ins[2]), ins[3], 0]
         if op in (OP_NOT, OP_FLOOR):
@@ -719,6 +785,79 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
     )
 
 
+_FLT_MAX = float(np.finfo(np.float32).max)
+
+
+def _threshold(kind: str, op: str, c: float):
+    """Threshold and compare code so that ``column <op> c`` (evaluated in float64)
+    equals the comparison done in the column's own type.
+
+    Returns ``bool`` when the result is the same for every value, else
+    ``(threshold, compare_opcode)``. ``kind`` is "f32", "f64" or "int".
+    """
+    code = _CMP[op]
+    if kind == "f64":
+        return c, code
+    if kind == "f32":
+        if c in (np.inf, -np.inf):
+            up = dn = c                        # infinities are representable
+        elif c > _FLT_MAX:
+            up, dn = np.inf, _FLT_MAX
+        elif c < -_FLT_MAX:
+            up, dn = -_FLT_MAX, -np.inf
+        else:
+            f = np.float32(c)
+            if float(f) < c:
+                up, dn = float(np.nextafter(f, np.float32(np.inf))), float(f)
+            elif float(f) > c:
+                up, dn = float(f), float(np.nextafter(f, np.float32(-np.inf)))
+            else:
+                up = dn = float(f)
+        exact = up == dn
+        if op == "ge":
+            return float(up), code
+        if op == "gt":
+            return float(dn), code
+        if op == "le":
+            return float(dn), code
+        if op == "lt":
+            return float(up), code
+        if op == "eq":
+            return (float(up), code) if exact else False
+        return (float(up), code) if exact else True     # ne
+    # integer column (int8..int64, bool)
+    import math
+    if c >= 2.0 ** 63 or c == np.inf:
+        return op in ("lt", "le", "ne")
+    if c <= -(2.0 ** 63) or c == -np.inf:
+        return op in ("gt", "ge", "ne")
+    lo, hi = math.ceil(c), math.floor(c)
+    if op == "ge":
+        return float(lo), code
+    if op == "gt":
+        return float(hi), code
+    if op == "le":
+        return float(hi), code
+    if op == "lt":
+        return float(lo), code
+    integral = lo == hi
+    if op == "eq":
+        return (float(lo), code) if integral else False
+    return (float(lo), code) if integral else True
+
+
+def _dce(instrs: List[List[int]], roots: List[int]) -> List[List[int]]:
+    """Drop instructions whose result is never used."""
+    live = set(roots)
+    keep: List[List[int]] = []
+    for ins in reversed(instrs):
+        if ins[1] in live:
+            keep.append(ins)
+            live.update(_uses_ext(ins))
+    keep.reverse()
+    return keep
+
+
 def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: int,
                        body: List[List[int]]) -> Tuple[Dict[int, int], int]:
     """Register allocation over the predicate and body sections.
@@ -768,7 +907,7 @@ def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: 
 
 def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
-    if op in (OP_LOAD_COL, OP_LOAD_CONST):
+    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC):
         return []
     if op in (OP_NOT, OP_FLOOR, OP_IN_SET):
         return [ins[2]]

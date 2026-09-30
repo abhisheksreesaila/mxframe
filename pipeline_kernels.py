@@ -426,7 +426,7 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         k_start, k_end = start - dc.base_row, end - dc.base_row
         if n_groups != 1 and not dc.gid_ptr:
             raise ValueError("gids may only be omitted for a global aggregate (n_groups == 1)")
-        n_blocks = cu.sm_count * 6
+        max_blocks = cu.sm_count * 8          # the kernel launches sm_count * (blocks that fit per SM)
         # per-thread pooled scratch: launch arguments, outputs and the block partials
         col_ptrs = cu.pooled("cols", max(len(dc.ptrs), 1) * 8)
         col_dt = cu.pooled("dts", max(len(dc.dtypes), 1) * 4)
@@ -436,13 +436,13 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         out_cnt = cu.pooled("out_cnt", n_groups * 8)
         ns = (n_slots + 1) * n_groups
         block_rows = ns if ns <= 48 else 0
-        scratch = cu.pooled("scratch", max(n_blocks * block_rows * 8, 8))
+        scratch = cu.pooled("scratch", max(max_blocks * block_rows * 8, 8))
         cu.sync()
         rc = lib.mx_pipeline_gpu(
             dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
             dc.gid_ptr if n_groups > 1 else 0, n_groups, n_slots, k_start, k_end,
             out_vals, out_cnt, dp.ident, scratch, dp.n_regs, dp.code_ints, dp.agg_base,
-            n_blocks, int(_repeat),
+            cu.sm_count, int(_repeat),
         )
         if rc != 0:
             raise RuntimeError(f"mx_pipeline_gpu failed with code {rc}")
