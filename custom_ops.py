@@ -17,7 +17,8 @@ from max.graph import Graph, TensorType, ops
 from max.graph.type import DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS
+from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS
+from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key, is_dense as _is_dense
 try:
     from .aot_kernels import AOTKernels, AOT_AVAILABLE, AOTKernelsGPU, GPU_AOT_AVAILABLE
 except Exception:
@@ -350,6 +351,8 @@ class CustomOpsCompiler(GraphCompiler):
         op, args = expr.op, expr.args
         if op == "col":
             col_arr = table.column(args[0])
+            if pa.types.is_dictionary(col_arr.type):
+                col_arr = _decode_dict(col_arr)
             if isinstance(col_arr, pa.ChunkedArray):
                 # Single-chunk: return underlying Array directly — no 50ms copy!
                 if len(col_arr.chunks) == 1:
@@ -367,6 +370,10 @@ class CustomOpsCompiler(GraphCompiler):
             rhs = self._eval_expr_arrow(args[1], table)
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
             return fn(lhs, rhs)
+        if op in _DICT_PRED_OPS:
+            native = _dict_predicate(expr, table)
+            if native is not None:
+                return native
         if op in ("eq", "ne"):
             lhs_expr, rhs_expr = args[0], args[1]
             if (self._session_device == "gpu" and self._aot_gpu is not None
@@ -2704,19 +2711,13 @@ class CustomOpsCompiler(GraphCompiler):
     def _build_group_ids(table, keys):
         """Dictionary-encode group keys into contiguous int32 group ids."""
         if len(keys) == 1:
-            col_arr = table.column(keys[0])
-            if isinstance(col_arr, pa.ChunkedArray):
-                col_arr = col_arr.combine_chunks()
-            encoded = col_arr.dictionary_encode()
+            encoded = _encode_key(table.column(keys[0]), _is_dense(table, keys[0]))
             ids = encoded.indices.to_numpy(zero_copy_only=False).astype(np.int32, copy=False)
             return ids, len(encoded.dictionary), {keys[0]: encoded.dictionary}
 
         encodings = []
         for k in keys:
-            arr = table.column(k)
-            if isinstance(arr, pa.ChunkedArray):
-                arr = arr.combine_chunks()
-            encodings.append(arr.dictionary_encode())
+            encodings.append(_encode_key(table.column(k), _is_dense(table, k)))
 
         sizes = [len(e.dictionary) for e in encodings]
         strides = []
@@ -2780,10 +2781,7 @@ class CustomOpsCompiler(GraphCompiler):
             # Dictionary-encode each key column (PyArrow SIMD — not replicated in Mojo)
             encodings = []
             for k in keys:
-                arr = table.column(k)
-                if isinstance(arr, pa.ChunkedArray):
-                    arr = arr.combine_chunks()
-                encodings.append(arr.dictionary_encode())
+                encodings.append(_encode_key(table.column(k), _is_dense(table, k)))
 
             sizes = [len(e.dictionary) for e in encodings]
             strides_list = []
