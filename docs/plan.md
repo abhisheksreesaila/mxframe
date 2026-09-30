@@ -97,7 +97,7 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - GPU kernel: same bytecode, one thread per row (bytecode is uniform across threads, so no divergence), block-level partials (shared memory for small group counts, global atomics otherwise).
 - Both entry points take a row range [start, end), so the F-006 Router can hand morsels to either device, and return partials the Router merges.
 - [ ] Q1, Q6, Q14, Q19-style filters + arithmetic + grouped/global aggregates run through it on both devices; results match DuckDB (float64 accumulation)
-- [ ] fresh-process SF10 Q1 query time (excluding read) < 100 ms on `cpu`
+- [ ] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
 - [ ] unsupported expressions fall back to the existing path, never wrong results
 
 ## F-011 Correctness: counts, Q15, Q21, nulls [todo]
