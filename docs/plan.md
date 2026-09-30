@@ -30,13 +30,13 @@ Needs: none · Files: `scripts/bench_user_felt.py`, `scripts/tpch_user/` (new)
 - [ ] mx engines read through `mx.scan_parquet` (moved from F-010)
 - [ ] writes `docs/bench/user-felt-<date>.md` and a CSV; a `--queries`/`--engines`/`--sf` CLI; per-run timeout so one hang can't stall the run
 
-## F-002 Multi-core CPU kernels with float64 accumulation [todo]
+## F-002 Multi-core CPU kernels with float64 accumulation [done]
 Needs: none · Files: `kernels_aot/kernels_aot.mojo`, `aot_kernels.py`, rebuilt `libmxkernels_aot.so`
-- [ ] grouped sum/min/max/mean/count and masked global aggs use all cores (`parallelize` over row morsels with per-thread partials, then merge)
-- [ ] sums and means accumulate in float64 (SF10 Q1 matches DuckDB to 1e-9 relative)
-- [ ] join build/probe and gather use multiple cores where the kernel is embarrassingly parallel
-- [ ] a thread-count knob (env `MXFRAME_CPU_THREADS`, default all cores) that later tickets can use to split cores between roles
-- [ ] microbench before/after at 6M and 60M rows recorded in the commit message
+- [x] grouped sum/min/max/mean/count and masked global aggs use all cores (`parallelize` over row morsels with per-thread partials, then merge)
+- [x] sums and means accumulate in float64 (SF10 Q1 matches DuckDB to 1e-9 relative)
+- [x] join build/probe and gather use multiple cores where the kernel is embarrassingly parallel
+- [x] a thread-count knob (env `MXFRAME_CPU_THREADS`, default all cores) that later tickets can use to split cores between roles
+- [x] microbench before/after at 6M and 60M rows recorded in the commit message
 
 ## F-003 Calibration store [todo]
 Needs: none · Files: `calibration.py` (new), `tests/test_calibration.py`
