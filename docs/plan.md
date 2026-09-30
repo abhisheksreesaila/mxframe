@@ -168,14 +168,17 @@ Needs: none · Found 2026-09-30: fresh process, SF10 lineitem already in memory,
 - [x] first-query SF10 Q1 (table in memory) under 200 ms on `cpu` and `auto`, results unchanged. After the orchestrator's auto changes (c32636f), 7 fresh-process runs each, machine load 4-7: cpu 172 179 194 173 175 179 168 (median 175 ms); auto 229 194 181 176 179 179 173 (median 179 ms). Before: cpu 984-1116, auto 1082-1205. Q1 result identical to the old path (and to DuckDB on SF1 in `tests/test_group_keys_review.py`).
 - [ ] follow-up (not done): a uint8 group-id variant in the fused kernel (<= 256 groups) would cut the 240 MB ids array to 60 MB and remove most of the ~95 ms.
 
-## F-016 Engine correctness gaps outside TPC-H [todo]
+## F-016 Engine correctness gaps outside TPC-H [built, needs review]
 Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
-- [ ] `with_columns` / `select` after an aggregate is applied (today silently ignored: `agg(count n).with_columns((n/2).alias("n"))` returns n unchanged)
-- [ ] a two-level groupby (aggregate over an aggregate) works (KeyError today)
-- [ ] a global sum/min/max/mean over zero rows returns NULL as SQL does (0.0 today); count stays 0
-- [ ] `count(col)` of a right-side column after a left join counts unmatched rows as 0 (counts them as 1 today: wrong answer)
-- [ ] a groupby on a column produced by an earlier aggregate in the same plan works ("Field does not exist" today)
-- [ ] a fuzz test of random plan shapes (project/filter/agg/join/sort/limit nested 2–3 deep) against DuckDB on cpu and auto
+- [x] `with_columns` / `select` after an aggregate is applied (`_materialize_barrier` in custom_ops; `with_columns` takes the aggregate's output names)
+- [x] a two-level groupby (aggregate over an aggregate) works
+- [x] a global sum/min/max/mean over zero rows returns NULL as SQL does; count stays 0 (fused, masked, Arrow paths)
+- [ ] `count(col)` of a right-side column after a left join counts unmatched rows as 0 (counts them as 1 today: wrong answer) - owned by F-018
+- [x] a groupby on a column produced by an earlier aggregate in the same plan works
+- [x] a fuzz test of random plan shapes against DuckDB on cpu and auto (tests/test_f016_fuzz.py; seed-reproducible; `-m slow` runs 300 seeds, `MXFRAME_FUZZ_SEEDS=n` more)
+- [x] found by the fuzz and fixed: a Filter above a Project under an Aggregate (wrong/crash with nulls), HAVING on a global aggregate ignored, int column + int literal returned float32, float64 column + float literal was rounded to float32, int/int `/` was integer division, -0.0 and 0.0 sorted as different values
+- [ ] follow-up (F-018/join owner): the CPU hash join segfaulted (`join_scatter`) on a many-to-many join of ~20k x 5k rows over 6 keys (16M+ output rows, then a second join); it should raise a MemoryError or handle it
+- [ ] follow-up: `min`/`max`/`sum` of an integer column come back as float64 (DuckDB: integer); int keys vs float keys in a join are refused by design (`_common_key_type`), so joining on such a column raises TypeError where SQL casts
 
 ## F-017 Parquet read as fast as Polars [blocked]
 Blocked: choose the Parquet decoder path — (a) Polars-backed reader, (b) native Mojo decoder, or (c) accept ~3x on raw scans — then say go. Everything else in this ticket is merged.

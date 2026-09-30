@@ -52,7 +52,16 @@ class State:
         return [c for c, k in self.kinds.items() if k == "int"]
 
     def nums(self):
+        return [c for c, k in self.kinds.items() if k != "str"]
+
+    def strs(self):
+        return [c for c, k in self.kinds.items() if k == "str"]
+
+    def all_cols(self):
         return list(self.kinds)
+
+    def keys(self):
+        return [c for c, k in self.kinds.items() if k in ("int", "str")]
 
 
 _CMP = {"gt": lambda a, b: a > b, "lt": lambda a, b: a < b, "ge": lambda a, b: a >= b,
@@ -78,6 +87,12 @@ def _predicate(rng, st):
         if st.kinds[c] == "int":
             v = int(rng.integers(0, 6))
         return _CMP[op](col(c), lit(v)), f"{c} {_SQL_CMP[op]} {_sql_lit(v)}"
+    if st.strs() and rng.random() < 0.3:
+        c = str(rng.choice(st.strs()))
+        v = str(rng.choice(["a", "b", "c"]))
+        if rng.random() < 0.5:
+            return col(c) == lit(v), f"{c} = '{v}'"
+        return col(c) != lit(v), f"{c} <> '{v}'"
     e, s = one()
     r = rng.random()
     if r < 0.25:
@@ -134,8 +149,10 @@ def op_with_columns(ctx, st):
 
 
 def op_select(ctx, st):
-    names = st.nums()
+    names = st.all_cols()
     keep = [c for c in names if ctx.rng.random() < 0.7] or names[:1]
+    if not any(st.kinds[c] != "str" for c in keep):
+        keep.append(st.nums()[0])
     exprs, sqls, kinds = [col(c) for c in keep], list(keep), {c: st.kinds[c] for c in keep}
     if ctx.rng.random() < 0.6:
         e, s, kind = _expression(ctx.rng, st)
@@ -147,15 +164,18 @@ def op_select(ctx, st):
 
 def op_agg(ctx, st):
     rng = ctx.rng
-    ints = st.ints()
-    n_keys = int(rng.choice([0, 0, 1, 1, 2])) if ints else 0
-    keys = list(rng.choice(ints, size=min(n_keys, len(ints)), replace=False)) if n_keys else []
+    cand = st.keys()
+    n_keys = int(rng.choice([0, 0, 1, 1, 2])) if cand else 0
+    keys = list(rng.choice(cand, size=min(n_keys, len(cand)), replace=False)) if n_keys else []
     keys = [str(k) for k in keys]
     aggs, sqls, kinds = [], [], {k: st.kinds[k] for k in keys}
     for _ in range(int(rng.integers(1, 4))):
         fn = str(rng.choice(["sum", "min", "max", "mean", "count"]))
         name = ctx.name("m")
-        if rng.random() < 0.3:
+        if st.strs() and rng.random() < 0.15:
+            fn = "count"                                # count of a string column
+            c = str(rng.choice(st.strs())); e = col(c); kind = "str"
+        elif rng.random() < 0.3:
             e, c, kind = _expression(rng, st)          # aggregate of an expression: sum(a * b)
         else:
             c = str(rng.choice(st.nums())); e = col(c); kind = st.kinds[c]
@@ -170,7 +190,7 @@ def op_agg(ctx, st):
 
 def op_topn(ctx, st):
     rng = ctx.rng
-    names = st.nums()
+    names = st.all_cols()
     desc = [bool(rng.random() < 0.4) for _ in names]
     n = int(rng.integers(1, 12))
     order = ", ".join(f"{c} {'desc' if d else 'asc'} nulls last" for c, d in zip(names, desc))
@@ -222,9 +242,13 @@ def build(seed, n_rows):
     rng = np.random.default_rng(seed)
     null_rate = 0.0 if seed % 2 else 0.12          # the fused kernels only take null-free columns
     base = _random_table(rng, n_rows, "c", int(rng.integers(1, 4)), int(rng.integers(1, 3)), key_card=_key_card(n_rows), null_rate=null_rate)
+    if rng.random() < 0.6:
+        strings = np.array(["a", "b", "c"], dtype=object)[rng.integers(0, 3, n_rows)]
+        base = base.append_column("cs0", pa.array(list(strings), mask=rng.random(n_rows) < null_rate))
     ctx = Ctx(rng, {"base": base}, n_rows)
     ctx.null_rate = null_rate
-    st = State(LazyFrame(Scan(base)), "select * from base", {c: ("int" if str(base.schema.field(c).type) == "int64" else "float") for c in base.column_names})
+    kind_of = {"int64": "int", "double": "float", "string": "str"}
+    st = State(LazyFrame(Scan(base)), "select * from base", {c: kind_of[str(base.schema.field(c).type)] for c in base.column_names})
     weights = np.array([w for _, w in OPS], dtype=float)
     for _ in range(int(rng.integers(2, 5))):
         for _try in range(5):
@@ -251,7 +275,7 @@ def _rows(t, names):
 
 
 def _key(row):
-    return tuple((0, 0.0) if v is None else (1, round(float(v), 3)) for v in row)
+    return tuple((0, "") if v is None else (1, v) if isinstance(v, str) else (2, round(float(v), 3)) for v in row)
 
 
 def assert_same(got, ref, what):
