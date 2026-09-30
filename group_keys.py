@@ -70,13 +70,8 @@ def _load():
 
 
 def _threads() -> int:
-    env = os.environ.get("MXFRAME_CPU_THREADS")
-    if env:
-        try:
-            return max(1, int(env))
-        except ValueError:
-            pass
-    return os.cpu_count() or 1
+    from .pipeline_kernels import default_threads
+    return default_threads()
 
 
 def _addr(a: np.ndarray) -> int:
@@ -151,7 +146,8 @@ def build(table, keys):
             idx = c.indices
             wcode, isz = _WIDTH[idx.type]
             base = idx.buffers()[1].address + idx.offset * isz - start * isz
-            tbl_rows.append((start, start + len(c), base, _addr(remaps[j]) if remaps else 0, wcode))
+            tbl_rows.append((start, start + len(c), base, _addr(remaps[j]) if remaps else 0, wcode,
+                             len(remaps[j]) if remaps else len(c.dictionary)))
             start += len(c)
         key_off.append(len(tbl_rows))
     tbl = np.array(tbl_rows, dtype=np.int64)

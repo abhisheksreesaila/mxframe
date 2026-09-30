@@ -3120,7 +3120,7 @@ class CustomOpsCompiler(GraphCompiler):
         composite = np.zeros(len(table), dtype=np.int32)
         for i, enc in enumerate(encodings):
             idx = enc.indices.to_numpy(zero_copy_only=False)
-            composite += (idx * strides[i]).astype(np.int32)
+            composite += idx.astype(np.int32) * np.int32(strides[i])
 
         if max_groups <= 1024:
             present_mask = np.zeros(max_groups, dtype=bool)

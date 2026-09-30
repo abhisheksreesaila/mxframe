@@ -6,8 +6,8 @@ any integer width) into int32 composite group ids in one parallel pass, and reco
 composite ids occur in a presence table. A second small pass rewrites the composite ids
 to dense ids (only combinations that occur become groups).
 
-Chunk table (int64, one row of 5 per chunk, all keys back to back):
-    row_start, row_end, base_addr, remap_addr, width
+Chunk table (int64, one row of 6 per chunk, all keys back to back):
+    row_start, row_end, base_addr, remap_addr, width, size
   base_addr is the address of the chunk's code buffer minus row_start * itemsize, so
   ``base_addr + row * itemsize`` is valid for every row of the chunk. remap_addr is 0 or
   an int32 table mapping the chunk's codes to the unified dictionary. width: 0 int8,
@@ -47,44 +47,52 @@ def _bp(addr: Int) -> BP:
 
 @always_inline
 def _pass[T: DType, REMAP: Bool, FIRST: Bool](
-    dst: IP, addr: Int, remap: IP, stride: Int32, a: Int, b: Int,
+    dst: IP, addr: Int, remap: IP, stride: Int32, size: Int32, err: IP, a: Int, b: Int,
 ):
     var src = UnsafePointer[Scalar[T], MutAnyOrigin](unsafe_from_address=addr)
+    var mn = Int32(2147483647)
+    var mx = Int32(-2147483648)
     for i in range(a, b):
         var v = Int32(src[i])
+        mn = min(mn, v)
+        mx = max(mx, v)
+        # An invalid code is reported (rc -5) but clamped so nothing is read or written out of bounds.
+        v = min(max(v, Int32(0)), size - 1)
         comptime if REMAP:
             v = remap[Int(v)]
         comptime if FIRST:
             dst[i] = v * stride
         else:
             dst[i] += v * stride
+    if mn < 0 or mx >= size:
+        err[0] = 1
 
 
 @always_inline
-def _dispatch[FIRST: Bool](dst: IP, width: Int, addr: Int, remap_a: Int, stride: Int32, a: Int, b: Int):
+def _dispatch[FIRST: Bool](dst: IP, width: Int, addr: Int, remap_a: Int, stride: Int32, size: Int32, err: IP, a: Int, b: Int):
     var remap = _ip(remap_a)
     if remap_a != 0:
         if width == 0:
-            _pass[DType.int8, True, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.int8, True, FIRST](dst, addr, remap, stride, size, err, a, b)
         elif width == 1:
-            _pass[DType.int16, True, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.int16, True, FIRST](dst, addr, remap, stride, size, err, a, b)
         elif width == 2:
-            _pass[DType.int32, True, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.int32, True, FIRST](dst, addr, remap, stride, size, err, a, b)
         elif width == 3:
-            _pass[DType.uint8, True, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.uint8, True, FIRST](dst, addr, remap, stride, size, err, a, b)
         else:
-            _pass[DType.uint16, True, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.uint16, True, FIRST](dst, addr, remap, stride, size, err, a, b)
     else:
         if width == 0:
-            _pass[DType.int8, False, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.int8, False, FIRST](dst, addr, remap, stride, size, err, a, b)
         elif width == 1:
-            _pass[DType.int16, False, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.int16, False, FIRST](dst, addr, remap, stride, size, err, a, b)
         elif width == 2:
-            _pass[DType.int32, False, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.int32, False, FIRST](dst, addr, remap, stride, size, err, a, b)
         elif width == 3:
-            _pass[DType.uint8, False, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.uint8, False, FIRST](dst, addr, remap, stride, size, err, a, b)
         else:
-            _pass[DType.uint16, False, FIRST](dst, addr, remap, stride, a, b)
+            _pass[DType.uint16, False, FIRST](dst, addr, remap, stride, size, err, a, b)
 
 
 @export
@@ -111,6 +119,8 @@ def mx_groupkeys_composite(
     var local = alloc[UInt8](nthreads * pstride)
     var counter = alloc[Int64](1)
     counter[0] = 0
+    var err = alloc[Int32](1)
+    err[0] = 0
 
     @parameter
     def worker(wid: Int):
@@ -128,7 +138,7 @@ def mx_groupkeys_composite(
                 var c0 = Int(key_off[k])
                 var c1 = Int(key_off[k + 1])
                 for c in range(c0, c1):
-                    var e = tbl + c * 5
+                    var e = tbl + c * 6
                     var cs = Int(e[0])
                     var ce = Int(e[1])
                     if ce <= lo or cs >= hi:
@@ -138,9 +148,9 @@ def mx_groupkeys_composite(
                     var w = Int(e[4])
                     var addr = Int(e[2])
                     if k == 0:
-                        _dispatch[True](dst_p, w, addr, Int(e[3]), stride, a, b)
+                        _dispatch[True](dst_p, w, addr, Int(e[3]), stride, Int32(e[5]), err, a, b)
                     else:
-                        _dispatch[False](dst_p, w, addr, Int(e[3]), stride, a, b)
+                        _dispatch[False](dst_p, w, addr, Int(e[3]), stride, Int32(e[5]), err, a, b)
             for i in range(lo, hi):
                 pl[Int(dst_p[i])] = 1
 
@@ -156,6 +166,10 @@ def mx_groupkeys_composite(
                 present[s] = 1
     local.free()
     counter.free()
+    var bad = err[0]
+    err.free()
+    if bad != 0:
+        return -5
     return 0
 
 
