@@ -91,3 +91,7 @@ def test_failed_hash_join_frees_its_scratch_buffers():
 @pytest.mark.parametrize("n", [0, 1, 255, 256, 257, 4099, 1_000_003, 6_000_001])
 def test_masked_global_aggregates_match_numpy(n):
     run_scenario("masked_aggs", n, timeout=120)
+
+
+def test_gpu_masked_outputs_are_float64_and_agree_with_cpu_at_1e9():
+    run_scenario("masked_f64_matches_cpu", timeout=120)

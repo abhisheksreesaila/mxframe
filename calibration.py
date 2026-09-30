@@ -1140,7 +1140,12 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
         prev = last.get(lk)
         if prev is not None and n > prev[0] and prev[1] / 1e3 * (n / prev[0]) * 4 > budget_s:
             continue                      # projected too slow for the budget: skip this size
-        ms = _time_call(p.make(ctx, n, card), timer, budget_s, p.stat)
+        try:
+            ms = _time_call(p.make(ctx, n, card), timer, budget_s, p.stat)
+        except BaseException:
+            if p.device == "gpu" and hasattr(ctx, "release_gpu_buffers"):
+                ctx.release_gpu_buffers()      # a failed probe must not keep resident buffers
+            raise
         if p.h2d_bytes_per_row and h2d_gbps > 0:      # wrapper re-uploads inputs: remove that copy
             ms = max(ms - p.h2d_bytes_per_row * n / (h2d_gbps * 1e9) * 1e3, ms * 0.05)
         pts.append([float(n), float(card), ms])

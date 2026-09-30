@@ -446,7 +446,33 @@ def masked_aggs(n: str):
         assert abs(got - want) <= 1e-6 * max(1.0, float(np.abs(a).astype(np.float64).sum()) * 2), (got, want)
 
 
-SCENARIOS = {f.__name__: f for f in (masked_aggs, join_failure_frees_scratch, other_thread, group_skew, sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
+def masked_f64_matches_cpu():
+    """GPU masked outputs are float64: at ~1e9 magnitude they agree with the CPU kernels to 1e-12."""
+    g = gpu()
+    cpu = ak.AOTKernels()
+    n = 4_000_000
+    rng = np.random.default_rng(3)
+    a = (rng.random(n, dtype=np.float32) * 500 + 500).astype(np.float32)    # ~1e9 total
+    b = (rng.random(n, dtype=np.float32) + 0.5).astype(np.float32)
+    m = (rng.random(n) > 0.2).astype(np.int32)
+    for name, got, want in (
+        ("sum", g.masked_global_sum_f32(a, m), cpu.masked_global_sum(a, m)),
+        ("prod", g.masked_global_sum_product_f32(a, b, m), cpu.masked_global_sum_product(a, b, m)),
+    ):
+        assert want > 1e8 and abs(got - want) <= 1e-12 * abs(want), (name, got, want)
+    assert g.masked_global_min_f32(a, m) == cpu.masked_global_min(a, m)
+    assert g.masked_global_max_f32(a, m) == cpu.masked_global_max(a, m)
+    ic = rng.integers(0, 100, n).astype(np.int32)
+    fc = rng.random(n, dtype=np.float32)
+    uc = (rng.random(n, dtype=np.float32) * 50).astype(np.float32)
+    sel = (ic >= 10) & (ic < 60) & (fc >= np.float32(0.2)) & (fc <= np.float32(0.7)) & (uc < np.float32(24))
+    want = float((a[sel].astype(np.float64) * b[sel].astype(np.float64)).sum())
+    got = g.range5_sum_product_f32(a, b, ic, fc, uc, 10, 60, 0.2, 0.7, 24.0)
+    assert abs(got - want) <= 1e-12 * abs(want), (got, want)
+    assert g.masked_global_sum_f32(a, m, device_out=True).dtype == np.float64
+
+
+SCENARIOS = {f.__name__: f for f in (masked_f64_matches_cpu, masked_aggs, join_failure_frees_scratch, other_thread, group_skew, sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
 
 
 def register(fn):

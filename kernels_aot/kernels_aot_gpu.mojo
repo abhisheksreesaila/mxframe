@@ -575,7 +575,7 @@ def masked_final_sum(out_addr: Int, part_addr: Int, nparts: Int):
         t += BLOCK
     var total = _block_sum(acc)
     if Int(thread_idx.x) == 0:
-        _f32(out_addr)[0] = total.cast[DType.float32]()
+        _f64(out_addr)[0] = total
 
 def masked_final_ext[is_min: Bool](out_addr: Int, part_addr: Int, nparts: Int):
     var ident = F32_MAX if is_min else F32_MIN
@@ -590,7 +590,7 @@ def masked_final_ext[is_min: Bool](out_addr: Int, part_addr: Int, nparts: Int):
         t += BLOCK
     var r = _block_ext[is_min](best, ident)
     if Int(thread_idx.x) == 0:
-        _f32(out_addr)[0] = r
+        _f64(out_addr)[0] = r.cast[DType.float64]()
 
 def masked_blocks(ctx: DeviceContext, n: Int) raises -> Int:
     var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
