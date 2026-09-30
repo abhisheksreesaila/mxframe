@@ -15,9 +15,15 @@ Aggregation modes (chosen from the slot and group counts):
     (slot, group); at the end the block reduces them with warp shuffles and
     writes one row of `scratch`; a second kernel merges the per-block rows in
     block order. No atomics, and results are deterministic.
+  * 1, a middle number of groups ((n_slots + 1) * n_groups shared-memory doubles
+    fit next to the register file): the block keeps one table of accumulators in
+    shared memory, updates it with shared float64 atomics, and adds the table to
+    the output once per block with global atomics.
   * 2, many groups: per-row float64 atomics (add / min / max) into the output.
-  (Shared-memory float64 atomics were tried for a middle tier and are ~100x
-  slower on sm_86: they lower to compare-and-swap loops under warp conflicts.)
+  Every accumulation atomic uses monotonic ordering: the default sequentially
+  consistent ordering makes NVPTX fence around each one (~20x slower). Modes 0
+  and 3 finish with a second kernel that merges the per-block rows of `scratch`
+  in block order, so their results are deterministic.
 
 All arithmetic is float64 (columns are widened on load). Device pointers are
 passed as integers; the Python side owns device memory (CUDA driver API on the
@@ -35,7 +41,6 @@ from std.gpu import thread_idx, block_idx, grid_dim, barrier
 from std.gpu.primitives.warp import shuffle_down
 from std.gpu.memory import AddressSpace, external_memory
 from std.memory import UnsafePointer, stack_allocation, bitcast
-from std.atomic import Atomic
 
 comptime F64 = DType.float64
 comptime BLOCK: Int = 256
@@ -75,6 +80,45 @@ comptime FP = UnsafePointer[Float64, MutAnyOrigin]
 comptime IP = UnsafePointer[Int32, MutAnyOrigin]
 comptime LP = UnsafePointer[Int64, MutAnyOrigin]
 comptime BP = UnsafePointer[UInt8, MutAnyOrigin]
+
+
+# ── monotonic atomics ────────────────────────────────────────────────────────
+# llvm.atomicrmw with monotonic ordering (CUDA atomicAdd semantics). The stdlib's
+# Atomic defaults to sequentially consistent, which makes NVPTX fence around every
+# atomic (~20x slower). Same lowering as _atomic.mojo, for float64 / int64.
+# bin_op: add=1 (int), fadd=11, fmax=13, fmin=14; ordering: monotonic=2.
+
+@always_inline
+def _llvm_ptr[space: AddressSpace, T: DType](ptr: UnsafePointer[Scalar[T], MutAnyOrigin, address_space=space]) -> __mlir_type.`!llvm.ptr`:
+    comptime if space == AddressSpace.SHARED:
+        var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+        return __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
+    else:
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+
+
+@always_inline
+def _atomic_add_f64[space: AddressSpace](ptr: UnsafePointer[Float64, MutAnyOrigin, address_space=space], val: Float64):
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`11 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.f64](_llvm_ptr[space, F64](ptr), v)
+
+
+@always_inline
+def _atomic_min_f64[space: AddressSpace](ptr: UnsafePointer[Float64, MutAnyOrigin, address_space=space], val: Float64):
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`14 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.f64](_llvm_ptr[space, F64](ptr), v)
+
+
+@always_inline
+def _atomic_max_f64[space: AddressSpace](ptr: UnsafePointer[Float64, MutAnyOrigin, address_space=space], val: Float64):
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`13 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.f64](_llvm_ptr[space, F64](ptr), v)
+
+
+@always_inline
+def _atomic_add_i64(ptr: UnsafePointer[Int64, MutAnyOrigin], val: Int64):
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[AddressSpace.GENERIC, DType.int64](ptr), v)
 
 
 @always_inline
@@ -347,7 +391,8 @@ def pipeline_kernel[RPT: Int, B: Int](
     var consts = smem + n_regs * TILE
     var wpart = consts + MAX_CONSTS
     var accs = wpart + NWARPS * SMALL     # per-thread accumulators in shared memory (mode 3)
-    var code = (accs + (n_slots + 1) * n_groups * B if mode == 3 else accs).bitcast[Int32]()
+    var acc_words = (n_slots + 1) * n_groups * B if mode == 3 else ((n_slots + 1) * n_groups if mode == 1 else 0)
+    var code = (accs + acc_words).bitcast[Int32]()
     var i = tid
     while i < code_ints:
         code[i] = _ip(code_a)[i]
@@ -391,6 +436,12 @@ def pipeline_kernel[RPT: Int, B: Int](
                 accs[(a * G + g) * B + tid] = init
         for g in range(G):
             accs[(A * G + g) * B + tid] = 0.0
+    elif mode == 1:
+        var j = tid
+        while j < ns:
+            accs[j] = _ident(Int(code[HDR + (agg_base + j // G) * 5])) if j < A * G else 0.0
+            j += B
+        barrier()
 
     var n_tiles = ceildiv(row_end - row0, TILE)
     var tile = Int(block_idx.x)
@@ -444,19 +495,32 @@ def pipeline_kernel[RPT: Int, B: Int](
                                     p[0] = min(p[0], v)
                                 else:
                                     p[0] = max(p[0], v)
+                        elif mode == 1:
+                            _atomic_add_f64(accs + (A * G + g), 1.0)
+                            for a in range(A):
+                                var ins = code + (HDR + (agg_base + a) * 5)
+                                var kind = Int(ins[0])
+                                var v = regs[Int(ins[2]) * TILE + tid + k * B]
+                                var p = accs + (a * G + g)
+                                if kind == OP_AGG_SUM:
+                                    _atomic_add_f64(p, v)
+                                elif kind == OP_AGG_MIN:
+                                    _atomic_min_f64(p, v)
+                                else:
+                                    _atomic_max_f64(p, v)
                         else:
-                            _ = Atomic[DType.int64].fetch_add(out_cnt + g, Int64(1))
+                            _atomic_add_i64(out_cnt + g, Int64(1))
                             for a in range(A):
                                 var ins = code + (HDR + (agg_base + a) * 5)
                                 var kind = Int(ins[0])
                                 var v = regs[Int(ins[2]) * TILE + tid + k * B]
                                 var p = out_vals + (a * G + g)
                                 if kind == OP_AGG_SUM:
-                                    _ = Atomic[F64].fetch_add(p, v)
+                                    _atomic_add_f64(p, v)
                                 elif kind == OP_AGG_MIN:
-                                    Atomic[F64].min(p, v)
+                                    _atomic_min_f64(p, v)
                                 else:
-                                    Atomic[F64].max(p, v)
+                                    _atomic_max_f64(p, v)
         tile += step
 
     if mode == 0 or mode == 3:
@@ -479,6 +543,27 @@ def pipeline_kernel[RPT: Int, B: Int](
             for w in range(1, NWARPS):
                 r = _combine(kind, r, wpart[w * SMALL + tid])
             _fp(scratch_a)[Int(block_idx.x) * ns + tid] = r
+    elif mode == 1:
+        barrier()
+        var j = tid
+        while j < ns:
+            var kind = OP_AGG_SUM
+            if j < A * G:
+                kind = Int(code[HDR + (agg_base + j // G) * 5])
+            var v = accs[j]
+            if j >= A * G:
+                if v != 0.0:
+                    _atomic_add_i64(out_cnt + (j - A * G), Int64(v))
+            elif kind == OP_AGG_SUM:
+                if v != 0.0:
+                    _atomic_add_f64(out_vals + j, v)
+            elif kind == OP_AGG_MIN:
+                if v != Float64.MAX:
+                    _atomic_min_f64(out_vals + j, v)
+            else:
+                if v != -Float64.MAX:
+                    _atomic_max_f64(out_vals + j, v)
+            j += B
 
 
 def init_kernel(out_vals_a: Int, out_cnt_a: Int, ident_a: Int, n_groups: Int, total: Int):
@@ -529,22 +614,31 @@ def mx_pipeline_gpu(
         return -2
     var ns = (A + 1) * G
     var rpt = 2 if (n_regs <= 6 and G == 1 and A <= 2) else 1
-    var mode = 0 if ns <= SMALL else 2
+    var mode = 0 if G == 1 and ns <= SMALL else 2
     var bsz = BLOCK
-    if mode == 0 and G > 1:
-        # per-thread accumulators in shared memory (128-thread blocks) beat local memory
-        var smem3 = n_regs * 128 * rpt * 8 + MAX_CONSTS * 8 + 4 * SMALL * 8 + ns * 128 * 8 + code_ints * 4
-        if smem3 <= 48 * 1024:
+    var base_smem = MAX_CONSTS * 8 + code_ints * 4
+    if G > 1:
+        # few groups: per-thread accumulators in shared memory (128-thread blocks)
+        var smem3 = n_regs * 128 * rpt * 8 + base_smem + 4 * SMALL * 8 + ns * 128 * 8
+        if ns <= SMALL and smem3 <= 48 * 1024:
             mode = 3
             bsz = 128
+        else:
+            # otherwise one shared table of accumulators per block, folded into the output
+            # with global atomics, if it fits next to the register file
+            var smem1 = n_regs * BLOCK * 8 + base_smem + WARPS * SMALL * 8 + ns * 8
+            if smem1 <= 48 * 1024:
+                mode = 1
     var tile = bsz * rpt
-    var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + (bsz // 32) * SMALL * 8 + code_ints * 4
+    var smem = n_regs * tile * 8 + base_smem + (bsz // 32) * SMALL * 8
     if mode == 3:
         smem += ns * bsz * 8
+    elif mode == 1:
+        smem += ns * 8
     if smem > 48 * 1024:
         return -5
     var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
-    var small = 1 if mode != 2 else 0
+    var small = 1 if (mode == 0 or mode == 3) else 0
     try:
         var ctx = DeviceContext()
         var total = A * G

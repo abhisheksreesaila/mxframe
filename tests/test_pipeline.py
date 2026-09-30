@@ -371,3 +371,16 @@ def test_multi_chunk_tables_need_no_concatenation(device, n_groups):
         assert np.array_equal(got.cnt, ref.cnt)
         np.testing.assert_allclose(got.vals, ref.vals, rtol=1e-12)
     assert want.cnt.sum() > 0
+
+
+@pytest.mark.parametrize("n_groups", [2, 8, 12, 100, 1000, 3000, 200_000])
+def test_group_count_regimes(device, n_groups):
+    """Per-thread partials (few groups), a shared table per block (some hundreds to thousands) and
+    per-row global atomics (many) must all agree with the reference, min / max / count included."""
+    n = 120_000
+    t = make_table(n)
+    gids = RNG.integers(0, n_groups, n).astype(np.int32)
+    aggs = [col("f32").sum().alias("s"), (col("f32") * col("f64")).sum().alias("p"),
+            col("f64").min().alias("lo"), col("i32").max().alias("hi"), col("i64").count().alias("c")]
+    prog, parts, ref, cnt = run_case(t, [col("f32") > lit(5.0)], aggs, n_groups, 0, n, gids=gids, device=device)
+    check(prog, parts, ref, cnt, grouped=True)
