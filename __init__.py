@@ -56,16 +56,17 @@ def clear_cache() -> None:
         raise _runtime_import_error() from exc
     _clear_cache()
 
-# SQL frontend (optional; requires `sqlglot`).
-# Imported lazily so `pip install mxframe` works without the sql extra.
-try:
-    from .sql_frontend import sql
-except ImportError:
-    def sql(*args, **kwargs):  # type: ignore[misc]
+# SQL frontend (optional; requires `sqlglot`). Imported on first call: sqlglot
+# costs ~37 ms at import and most programs never use SQL.
+def sql(*args, **kwargs):
+    try:
+        from .sql_frontend import sql as _sql
+    except ImportError:
         raise ImportError(
             "mxframe.sql requires the optional `sqlglot` dependency. "
             "Install with: pip install 'mxframe[sql]'"
-        )
+        ) from None
+    return _sql(*args, **kwargs)
 
 
 def calibrate(full: bool = False, **kwargs):
@@ -133,8 +134,6 @@ def warmup(device: str = "auto") -> float:
 
 # ── I/O & conversion helpers (Phase 7) ─────────────────────── #
 
-import pyarrow.csv as _pa_csv
-import pyarrow.parquet as _pq
 
 
 def from_arrow(table) -> "LazyFrame":
@@ -152,6 +151,7 @@ def from_polars(df) -> "LazyFrame":
 
 
 def read_csv(path: str, **kwargs) -> "LazyFrame":
+    import pyarrow.csv as _pa_csv
     return LazyFrame(Scan(_pa_csv.read_csv(path, **kwargs)))
 
 
@@ -160,6 +160,7 @@ def read_parquet(path: str, **kwargs) -> "LazyFrame":
     if set(kwargs) <= {"columns"} and os.path.isfile(os.fspath(path)):
         # ParquetFile path: pq.read_table imports pyarrow.dataset, which imports pandas (~150 ms)
         return LazyFrame(Scan(read_parquet_table(path, columns=kwargs.get("columns"), dictionary=False)))
+    import pyarrow.parquet as _pq
     return LazyFrame(Scan(_pq.read_table(path, **kwargs)))
 
 __all__ = [
@@ -195,7 +196,8 @@ __all__ = [
 
 def _background_warm():
     try:
-        from . import custom_ops, pipeline_exec, pipeline_kernels, coproc_fused, auto_mode  # noqa: F401
+        import pyarrow.compute  # noqa: F401
+        from . import custom_ops, pipeline_exec, pipeline_kernels, coproc_fused, auto_mode, arrow_dict  # noqa: F401
         custom_ops._load_aot_kernels()
         pipeline_kernels._load_cpu()
         from . import group_keys
