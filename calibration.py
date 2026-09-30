@@ -742,7 +742,10 @@ class ProbeCtx:
     def gpu(self):
         if self._gpu is None:
             from . import aot_kernels as ak
-            self._gpu = ak.AOTKernelsGPU()
+            # the process-wide instance (one CUDA driver / buffer cache); probes free their own buffers
+            self._gpu = ak.get_aot_gpu()
+            if self._gpu is None:
+                raise RuntimeError("GPU AOT kernels unavailable")
         return self._gpu
 
     def dev(self, arr) -> int:
