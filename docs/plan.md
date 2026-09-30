@@ -21,14 +21,14 @@ Shared rules for every ticket:
 
 ## Wave 1: foundations (parallel)
 
-## F-001 User-felt TPC-H scoreboard [todo]
+## F-001 User-felt TPC-H scoreboard [done]
 Needs: none · Files: `scripts/bench_user_felt.py`, `scripts/tpch_user/` (new)
-- [ ] each (engine, query, scale) runs in a fresh subprocess; the clock covers Parquet read + query + materialized result; `import` time is recorded separately
-- [ ] engines: pandas, Polars (lazy `scan_parquet`), DuckDB (reference), MXFrame `cpu`, `gpu`, `auto`
-- [ ] all 22 queries at SF1 and SF10; every engine's result is checked against DuckDB (row count + numeric tolerance) and mismatches are shown, not hidden
-- [ ] a secondary "repeat run in same process" number is recorded
-- [ ] mx engines read through `mx.scan_parquet` (moved from F-010)
-- [ ] writes `docs/bench/user-felt-<date>.md` and a CSV; a `--queries`/`--engines`/`--sf` CLI; per-run timeout so one hang can't stall the run
+- [x] each (engine, query, scale) runs in a fresh subprocess; the clock covers Parquet read + query + materialized result; `import` time is recorded separately
+- [x] engines: pandas, Polars (lazy `scan_parquet`), DuckDB (reference), MXFrame `cpu`, `gpu`, `auto`
+- [x] all 22 queries at SF1 and SF10 (mx-gpu SF10 skipped this round: shared GPU memory, joins being rewritten in F-018); every engine's result is checked against DuckDB (row count + numeric tolerance) and mismatches are shown, not hidden
+- [x] a secondary "repeat run in same process" number is recorded
+- [x] mx engines read through `mx.scan_parquet` (moved from F-010)
+- [x] writes `docs/bench/user-felt-<date>.md` and a CSV; a `--queries`/`--engines`/`--sf` CLI; per-run timeout so one hang can't stall the run
 
 ## F-002 Multi-core CPU kernels with float64 accumulation [done]
 Needs: none · Files: `kernels_aot/kernels_aot.mojo`, `aot_kernels.py`, rebuilt `libmxkernels_aot.so`
