@@ -1279,9 +1279,10 @@ class AOTKernelsGPU:
     ) -> "pa.Table":
         """Gather all columns of *table* by *idx* using AOT GPU kernels.
 
-        float32, int32, int64 columns are gathered on GPU with _cached_upload
-        for source data (stable input) and a single index upload shared across
-        all columns.  Other types (string, date, …) fall back to PyArrow CPU.
+        float32, float64 (as raw 8-byte words), int32, int64 columns without nulls are gathered
+        on GPU with _cached_upload for source data (stable input) and a single index upload
+        shared across all columns.  Everything else (strings, nulls, other widths) falls back
+        to PyArrow CPU take, which keeps types and nulls.
 
         Returns a new pa.Table with the same schema.
         """
@@ -1311,7 +1312,11 @@ class AOTKernelsGPU:
                 )
                 return self._cached_upload(src_np, cache_key=key, owner=col)
 
-            if pa.types.is_float32(col.type):
+            is_signed_int = pa.types.is_signed_integer(col.type)
+            if col.null_count:
+                # a validity mask is not gathered by these kernels: Arrow's take keeps the nulls
+                arrays.append(col.take(pa.array(idx32.astype(np.int64))))
+            elif pa.types.is_float32(col.type):
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.float32))
                 s = cached_source(src_np, np.float32)
@@ -1321,17 +1326,16 @@ class AOTKernelsGPU:
                 arrays.append(pa.array(self._download(out, np.float32, n)))
                 self._cu.free(out)
             elif pa.types.is_float64(col.type):
-                # downcast float64→float32 for GPU, restore type after
+                # exact: gather the 8-byte words as int64 (float32 would round every value)
                 src_np = np.ascontiguousarray(
-                    col.to_numpy(zero_copy_only=False).astype(np.float32))
-                s = cached_source(src_np, np.float32)
-                out = self._cu.malloc(n * 4)
-                self._gather_f32(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
+                    col.to_numpy(zero_copy_only=False).astype(np.float64)).view(np.int64)
+                s = cached_source(src_np, np.int64)
+                out = self._cu.malloc(n * 8)
+                self._gather_i64(self._ptr(out), self._ptr(s), self._ptr(idx_dev), n)
                 self._cu.sync()
-                arrays.append(pa.array(
-                    self._download(out, np.float32, n).astype(np.float64)))
+                arrays.append(pa.array(self._download(out, np.int64, n).view(np.float64)))
                 self._cu.free(out)
-            elif pa.types.is_integer(col.type) and col.type.bit_width == 64:
+            elif is_signed_int and col.type.bit_width == 64:
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.int64))
                 s = cached_source(src_np, np.int64)
@@ -1340,7 +1344,7 @@ class AOTKernelsGPU:
                 self._cu.sync()
                 arrays.append(pa.array(self._download(out, np.int64, n)))
                 self._cu.free(out)
-            elif pa.types.is_integer(col.type):
+            elif is_signed_int and col.type.bit_width == 32:
                 src_np = np.ascontiguousarray(
                     col.to_numpy(zero_copy_only=False).astype(np.int32))
                 s = cached_source(src_np, np.int32)

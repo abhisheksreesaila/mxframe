@@ -39,8 +39,8 @@ _PC_CMP_OPS = {
     "le":  pc.less_equal,
     "eq":  pc.equal,
     "ne":  pc.not_equal,
-    "and": pc.and_,
-    "or":  pc.or_,
+    "and": pc.and_kleene,       # SQL three-valued logic: false AND null = false, true OR null = true
+    "or":  pc.or_kleene,
 }
 
 # Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
@@ -249,7 +249,7 @@ class GraphCompiler:
             cond = GraphCompiler._eval_predicate(args[0], table)
             then = GraphCompiler._eval_predicate(args[1], table)
             else_ = GraphCompiler._eval_predicate(args[2], table)
-            return pc.if_else(cond, then, else_)
+            return pc.if_else(pc.fill_null(cond, False), then, else_)     # CASE: a null condition is not true
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
@@ -258,7 +258,7 @@ class GraphCompiler:
         if op in ("and", "or", "__and__", "__or__"):
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.and_(lhs, rhs) if "and" in op else pc.or_(lhs, rhs)
+            return pc.and_kleene(lhs, rhs) if "and" in op else pc.or_kleene(lhs, rhs)
         # Arithmetic ops inside predicates (e.g. lit(0.2) * col("avg_qty") as RHS of comparison)
         if op == "mul":
             lhs = GraphCompiler._eval_predicate(args[0], table)
