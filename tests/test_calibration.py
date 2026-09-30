@@ -355,3 +355,226 @@ def test_observed_outweighs_prior_after_a_handful_of_samples():
     for n in (1_000, 10_000, 100_000, 10_000, 100_000, 1_000):
         f.observe(n, 0.2 + 1e-4 * n)                      # truth says ~1.2 ms
     assert abs(f.predict(10_000) - 1.2) < abs(f.predict(10_000) - 12.0)
+
+
+# ============================ review fixes (contract: compute-only estimates) ===
+# Measured bare-kernel GPU group_sum cost per million rows by group count.
+CARD_COST = {8: 1.48, 1000: 10.5, 200_000: 2.85}
+
+
+def _card_cost(card):
+    if card <= 64:
+        return 1.48
+    if card <= 1024:
+        return 10.5
+    if card <= 8192:
+        return 6.0
+    return 2.85
+
+
+def test_gpu_group_cost_tracks_cardinality_within_30_percent():
+    clock = Clock()
+
+    def make(ctx, n, card):
+        cost = (0.1 + _card_cost(card) * n / 1e6) / 1e3
+
+        def run():
+            clock.t += cost
+        return run
+    reg = {("group_sum", "gpu"): Probe("group_sum", "gpu", make, uses_card=True, bucketed=True)}
+
+    def runner(sizes, budget, link_mb):
+        pts = cal_mod._collect_points(reg[("group_sum", "gpu")], object(), sizes, budget, clock, 0.0)
+        return [{"kind": "points", "op": "group_sum", "points": pts}]
+    cal = calibrate(registry=reg, gpu_runner=runner, gpu_init=lambda: {"total_ms": 1.0},
+                    identity=GPU, timer=clock, ctx=object(), save=False)
+    for card, per_m in CARD_COST.items():
+        est = cal.estimate("group_sum", "gpu", 6_000_000, card=card)
+        truth = 0.1 + per_m * 6
+        assert abs(est - truth) / truth < 0.3, (card, est, truth)
+
+
+def test_bucketed_fits_survive_reload_and_route_observations():
+    c = default_calibration(GPU)
+    c.fits["group_sum@gpu:<=64"] = Fit(0.1, 1.5e-6, n_points=4)
+    c.fits["group_sum@gpu:>8192"] = Fit(0.1, 3e-6, n_points=4)
+    assert c.estimate("group_sum", "gpu", 1_000_000, card=8) == pytest.approx(0.1 + 1.5)
+    assert c.estimate("group_sum", "gpu", 1_000_000, card=10**6) == pytest.approx(0.1 + 3.0)
+    c.observe("group_sum", "gpu", 1000, 1.0, card=8, persist=False)
+    assert len(c.fits["group_sum@gpu:<=64"].obs) == 1
+    assert c.save()
+    cal_mod.reset_calibration_cache()
+    assert "group_sum@gpu:<=64" in cal_mod.get_calibration().fits
+
+
+def test_op_aliases_resolve_to_measured_fits():
+    c = default_calibration(GPU)
+    for alias, real in [("group_agg", "group_sum"), ("join_probe", "join"), ("join_build", "join"),
+                        ("sort", "sort_topk"), ("filter", "filter_take")]:
+        assert c.estimate(alias, "cpu", 10**6) == c.estimate(real, "cpu", 10**6)
+    assert c.estimate("group_agg", "gpu", 10**6, card=8) == c.estimate("group_sum", "gpu", 10**6, card=8)
+
+
+def test_pipeline_op_is_reserved_with_default_fit():
+    c = default_calibration(GPU)
+    assert c.fits["pipeline@cpu"].n_points == 0 and c.estimate("pipeline", "cpu", 10**7) > 0
+    assert math.isfinite(c.estimate("pipeline", "gpu", 10**7))
+
+
+def test_unknown_op_logs_once_at_debug(caplog):
+    import logging
+    c = default_calibration(GPU)
+    with caplog.at_level(logging.DEBUG, logger="mxframe.calibration"):
+        c.estimate("mystery_op_xyz", "cpu", 10)
+        c.estimate("mystery_op_xyz", "cpu", 10)
+    assert sum("mystery_op_xyz" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_gpu_group_min_max_over_8192_groups_is_infinite():
+    c = default_calibration(GPU)
+    for op in ("group_min", "group_max"):
+        assert c.estimate(op, "gpu", 10**6, card=8193) == math.inf
+        assert math.isfinite(c.estimate(op, "gpu", 10**6, card=8192))
+        assert math.isfinite(c.estimate(op, "cpu", 10**6, card=10**6))
+    assert math.isfinite(c.estimate("group_sum", "gpu", 10**6, card=10**6))
+
+
+def test_blend_drops_group_term_when_refit_drops_it():
+    f = Fit(0.1, 1e-6, g=1e-4)                       # prior: strong per-group cost
+    for i in range(12):                              # constant card, varying rows
+        n = 1000 * 2 ** (i % 6)
+        f.observe(n, 0.1 + 1e-6 * n, card=50)
+    assert f.predict(10_000, card=500_000) == pytest.approx(f.predict(10_000, card=10), rel=1e-6)
+
+
+def test_module_observe_accepts_cardinality():
+    cal_mod.observe("group_sum", "cpu", 1000, 2.0, cardinality=77)
+    assert cal_mod.get_calibration().fits["group_sum@cpu"].obs[-1][1] == 77
+
+
+def test_concurrent_saves_do_not_lose_entries(tmp_path):
+    import threading
+    p = tmp_path / "calibration.json"
+    cals = [default_calibration({"name": f"GPU{i}", "driver": "1", "mem_bytes": 1}) for i in range(8)]
+    ts = [threading.Thread(target=c.save) for c in cals]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert set(json.loads(p.read_text())["entries"]) == {c.key for c in cals}
+
+
+# -- GPU child-process runner: hang / crash / progress -----------------------
+def _child(script):
+    return [sys.executable, "-c", script]
+
+
+def test_runner_kills_hung_child_keeps_partial_output():
+    import time
+    script = ("import sys,time,json\n"
+              "print(json.dumps({'kind':'link','gbps':{},'latency_ms':{},'pinned_available':False}),flush=True)\n"
+              "time.sleep(60)\n")
+    t0 = time.time()
+    items = cal_mod._run_gpu_subprocess((1,), 1.0, (1,), item_timeout_s=1.0, child_cmd=_child(script))
+    assert time.time() - t0 < 20
+    assert items[0]["kind"] == "link" and items[-1]["kind"] == "crash" and "no progress" in items[-1]["msg"]
+
+
+def test_runner_reports_crash_with_stderr_tail():
+    script = ("import sys,json\n"
+              "print(json.dumps({'kind':'launch','ms':1.0}),flush=True)\n"
+              "sys.stderr.write('CUDA_ERROR_ILLEGAL_ADDRESS\\n'); sys.exit(3)\n")
+    items = cal_mod._run_gpu_subprocess((1,), 1.0, (1,), child_cmd=_child(script))
+    assert items[0]["kind"] == "launch"
+    assert items[-1]["kind"] == "crash" and "ILLEGAL_ADDRESS" in items[-1]["msg"]
+
+
+def test_runner_progress_lines_reset_watchdog():
+    script = ("import time,json\n"
+              "for i in range(4):\n"
+              "    time.sleep(0.7); print(json.dumps({'kind':'progress','n':i}),flush=True)\n"
+              "print(json.dumps({'kind':'launch','ms':2.0}),flush=True)\n")
+    items = cal_mod._run_gpu_subprocess((1,), 1.0, (1,), item_timeout_s=1.2, child_cmd=_child(script))
+    assert items[-1] == {"kind": "launch", "ms": 2.0}          # 2.8 s total, never 1.2 s silent
+
+
+def test_collect_points_reports_progress_per_size():
+    clock = Clock()
+    seen = []
+    p = fake_probe(clock, "x", "cpu", 0.01, 1e-6)
+    cal_mod._collect_points(p, object(), (100, 1000, 10000), 1.0, clock, 0.0,
+                            progress=lambda n: seen.append(n))
+    assert seen == [100, 1000, 10000]
+
+
+# -- GPU probes time bare kernels on device-resident buffers ------------------
+class FakeCU:
+    def __init__(self):
+        self.h2d_calls = 0
+        self.d2h_calls = 0
+        self.n = 0
+
+    def malloc(self, nbytes):
+        self.n += 1
+        return self.n
+
+    def free(self, ptr):
+        pass
+
+    def sync(self):
+        pass
+
+    def h2d(self, *a):
+        self.h2d_calls += 1
+
+    def d2h(self, *a):
+        self.d2h_calls += 1
+
+
+class FakeGPU:
+    def __init__(self):
+        self._cu = FakeCU()
+        self.bare = []
+
+    def _upload(self, arr):
+        return self._cu.malloc(arr.nbytes)
+
+    def _ptr(self, p):
+        return p
+
+    def clear_buf_cache(self):
+        pass
+
+    def _gather_f32(self, *a):
+        self.bare.append("gather")
+
+    def _join_count_gpu(self, *a):
+        self.bare.append("join_count")
+
+    def _join_scatter_gpu(self, *a):
+        self.bare.append("join_scatter")
+
+    def gather_f32(self, *a):
+        raise AssertionError("wrapper (host copies) must not be timed")
+
+    def hash_join(self, *a):
+        raise AssertionError("wrapper (host copies) must not be timed")
+
+
+@pytest.mark.parametrize("op,expect", [("gather", ["gather"]), ("join", ["join_count", "join_scatter"])])
+def test_gpu_gather_and_join_probes_time_bare_kernels_only(op, expect):
+    ctx = cal_mod.ProbeCtx(20_000)
+    ctx._gpu = FakeGPU()
+    run = cal_mod.PROBES[(op, "gpu")].make(ctx, 10_000, 8)
+    ctx._gpu.bare.clear()
+    h2d, d2h = ctx._gpu._cu.h2d_calls, ctx._gpu._cu.d2h_calls
+    run()
+    assert ctx._gpu.bare == expect
+    assert (ctx._gpu._cu.h2d_calls, ctx._gpu._cu.d2h_calls) == (h2d, d2h)     # no copies inside timed call
+
+
+def test_join_host_step_is_modelled_separately_on_cpu():
+    assert ("join_host", "cpu") in cal_mod.PROBES
+    assert cal_mod.default_calibration(GPU).estimate("join_host", "cpu", 10**6) > 0
+
+
+def test_module_docstring_states_compute_only_contract():
+    assert "NO H2D/D2H" in cal_mod.__doc__

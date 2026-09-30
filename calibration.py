@@ -14,9 +14,17 @@ Consumers (F-005 planner, F-006 co-processing) use::
     cal.transfer_ms(nbytes, "h2d", pinned=False)                   # link time, ms
     cal.observe("group_sum", "gpu", rows, measured_ms)              # online refinement
 
-GPU ``estimate`` values are *device-resident* kernel times (input already on the
-GPU, result copied back); add ``transfer_ms`` for non-resident inputs.  With no
-GPU, ``estimate(..., "gpu", ...)`` returns ``inf`` so ``min()`` just works.
+Contract: ``estimate(op, device, rows, ...)`` is COMPUTE ONLY, with inputs already
+resident on that device and the output left on that device.  It includes kernel
+launch/sync and per-call context overhead but NO H2D/D2H copies and no host-side
+pre/post-processing that is not inherent to the op; the placer adds every copy via
+``transfer_ms``.  (GPU join has host steps between its two kernels; they are a
+separate ``join_host`` CPU term.)  Group ops on the GPU are fitted per group-count
+bucket; ``group_min``/``group_max`` on the GPU return ``inf`` above 8192 groups (the
+kernel faults there).  With no GPU, ``estimate(..., "gpu", ...)`` returns ``inf`` so
+``min()`` just works.  Planner op names (``group_agg``, ``join_probe``, ``sort``,
+``filter``, ...) are aliased to the measured ops; ``pipeline`` is reserved for
+F-008's fused kernel.
 
 The set of benchmarked kernels lives in a registry of probe callables
 (``PROBES``); when a kernel's signature or dtype changes, edit its one probe.
@@ -25,6 +33,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import logging
 import math
 import os
 import platform
@@ -44,10 +53,24 @@ OBS_RAMP = 6                # observed weight ramps 0 -> 1 over this many sample
 PERSIST_EVERY_N = 32        # observe(): save after this many new observations ...
 PERSIST_EVERY_S = 60.0      # ... or this many seconds
 DEFAULT_CARD = 1000         # assumed group cardinality when the caller gives none
+BUCKET_EDGES = (64, 1024, 8192)          # group-count buckets: <=64, <=1024, <=8192, >8192
+BUCKET_REP_CARDS = (8, 1000, 4096, 200_000)   # one representative group count per bucket
+GPU_MAX_CARD = {"group_min": 8192, "group_max": 8192}   # GPU kernels fault above this
+OP_ALIASES = {"group_agg": "group_sum", "join_probe": "join", "join_build": "join",
+              "sort": "sort_topk", "filter": "filter_take"}
+_log = logging.getLogger(__name__)
+_warned_ops: set = set()
+
+
+def bucket_name(card: float) -> str:
+    for e in BUCKET_EDGES:
+        if card <= e:
+            return f"<={e}"
+    return f">{BUCKET_EDGES[-1]}"
 
 DEVICES = ("cpu", "gpu")
 OPS = (
-    "group_sum", "group_count", "group_min", "group_max",
+    "pipeline", "join_host", "group_sum", "group_count", "group_min", "group_max",
     "masked_sum", "join", "gather", "sort_topk", "group_encode", "filter_take",
 )
 
@@ -225,9 +248,7 @@ class Fit:
         sizes = [r[0] for r in rows]
         if max(sizes) >= 2.0 * max(min(sizes), 1.0):      # enough spread in n: refit the line
             use_card = self.g > 0 and len({round(r[1]) for r in rows}) >= 3
-            a, c, g = _nnls_rel(rows, use_card)
-            if not use_card:
-                g = self.g
+            a, c, g = _nnls_rel(rows, use_card)     # no group term refit: it decays with the prior
         else:                                              # one size only: rescale the prior
             ratios = sorted(o[2] / max(self.predict_prior(o[0], o[1]), 1e-9) for o in self.obs)
             k = ratios[len(ratios) // 2]
@@ -284,8 +305,21 @@ class Calibration:
     _last_save: float = field(default_factory=time.monotonic, repr=False, compare=False)
 
     # -- queries ---------------------------------------------------------- #
-    def fit(self, op: str, device: str) -> Optional[Fit]:
-        return self.fits.get(f"{op}@{device}") or self.fits.get(f"generic@{device}")
+    def fit(self, op: str, device: str, card: Optional[float] = None) -> Optional[Fit]:
+        """Fit for (op, device), routed by alias and (if fitted) group-count bucket."""
+        op = OP_ALIASES.get(op, op)
+        base = f"{op}@{device}"
+        if base in self.fits or f"{base}:{bucket_name(DEFAULT_CARD)}" in self.fits:
+            b = f"{base}:{bucket_name(DEFAULT_CARD if card is None else card)}"
+            if b in self.fits:
+                return self.fits[b]
+            if base in self.fits:
+                return self.fits[base]
+            return None
+        if (op, device) not in _warned_ops:
+            _warned_ops.add((op, device))
+            _log.debug("no calibration for op %r on %s; using generic fit", op, device)
+        return self.fits.get(f"generic@{device}")
 
     def estimate(self, op: str, device: str, rows: float, card: Optional[float] = None,
                  **shape: Any) -> float:
@@ -294,10 +328,16 @@ class Calibration:
         compatibility (dtype, selectivity, ...) and currently ignored."""
         if device == "gpu" and not self.has_gpu:
             return math.inf
-        f = self.fit(op, device)
+        if card is None:
+            card = shape.get("cardinality")
+        real = OP_ALIASES.get(op, op)
+        limit = GPU_MAX_CARD.get(real)
+        if device == "gpu" and limit is not None and card is not None and card > limit:
+            return math.inf
+        f = self.fit(op, device, card)
         if f is None:
             return math.inf if device == "gpu" else 0.0
-        return f.predict(rows, card if card is not None else shape.get("cardinality"))
+        return f.predict(rows, card)
 
     def bandwidth_gbps(self, direction: str, pinned: bool = False) -> float:
         k = f"{direction}_{'pinned' if pinned and self.pinned_available else 'pageable'}"
@@ -319,7 +359,11 @@ class Calibration:
     def observe(self, op: str, device: str, rows: float, ms: float,
                 card: Optional[float] = None, persist: bool = True) -> None:
         with self._lock:
+            op = OP_ALIASES.get(op, op)
             k = f"{op}@{device}"
+            bk = f"{k}:{bucket_name(DEFAULT_CARD if card is None else card)}"
+            if bk in self.fits:
+                k = bk
             f = self.fits.get(k)
             if f is None:                     # new op: start from the generic prior if any
                 g = self.fits.get(f"generic@{device}")
@@ -375,13 +419,14 @@ class Calibration:
         p = Path(path) if path else calibration_path()
         with self._lock:
             try:
-                doc = _read_doc(p) or {"schema": SCHEMA_VERSION, "entries": {}}
-                doc["entries"][self.key] = self.to_dict()
                 p.parent.mkdir(parents=True, exist_ok=True)
-                fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".calib-", suffix=".tmp")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(doc, f, indent=1)
-                os.replace(tmp, p)
+                with _file_lock(p):          # read-merge-write must not interleave across processes
+                    doc = _read_doc(p) or {"schema": SCHEMA_VERSION, "entries": {}}
+                    doc["entries"][self.key] = self.to_dict()
+                    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".calib-", suffix=".tmp")
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(doc, f, indent=1)
+                    os.replace(tmp, p)
                 self._dirty = 0
                 self._last_save = time.monotonic()
                 return True
@@ -407,6 +452,31 @@ class Calibration:
         return "\n".join(L)
 
 
+class _file_lock:
+    """Advisory exclusive lock on ``<file>.lock`` (fcntl); a no-op where unavailable."""
+
+    def __init__(self, path: Path):
+        self._lock_path = str(path) + ".lock"
+        self._fd = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+            self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except Exception:
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is not None:
+            os.close(self._fd)          # closing releases the flock
+            self._fd = None
+        return False
+
+
 def _identity_from_dict(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if d.get("has_gpu"):
         return {"name": d["device_name"], "driver": d["driver"], "mem_bytes": d.get("gpu_mem_bytes", 0)}
@@ -421,16 +491,21 @@ def _identity_from_dict(d: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 # rows padded ~1.2x so the un-calibrated planner leans to CPU; GPU alpha (allocs,
 # sync, D2H) is ~20-40x the CPU alpha, so small inputs always go to the CPU.
 _DEFAULT_FITS: Dict[str, Tuple[float, float, float]] = {
-    "group_sum@cpu": (0.005, 0.8, 2.5), "group_sum@gpu": (0.2, 2.6, 4.0),
-    "group_count@cpu": (0.005, 0.8, 2.5), "group_count@gpu": (0.2, 3.0, 4.0),
-    "group_min@cpu": (0.005, 0.9, 10.0), "group_min@gpu": (0.2, 5.6, 0.0),
-    "group_max@cpu": (0.005, 0.9, 12.0), "group_max@gpu": (0.2, 5.6, 0.0),
+    "group_sum@cpu": (0.005, 0.8, 2.5), "group_sum@gpu": (0.05, 10.0, 0.0),
+    "group_count@cpu": (0.005, 0.8, 2.5), "group_count@gpu": (0.05, 10.0, 0.0),
+    "group_min@cpu": (0.005, 0.9, 10.0), "group_min@gpu": (0.1, 11.0, 0.0),
+    "group_max@cpu": (0.005, 0.9, 12.0), "group_max@gpu": (0.1, 11.0, 0.0),
     "masked_sum@cpu": (0.005, 1.5, 0.0), "masked_sum@gpu": (0.15, 1.0, 0.0),
-    "join@cpu": (0.02, 11.0, 0.0), "join@gpu": (0.4, 7.0, 0.0),
-    "gather@cpu": (0.005, 0.8, 0.0), "gather@gpu": (0.3, 6.0, 0.0),
+    "join@cpu": (0.02, 11.0, 0.0), "join@gpu": (0.05, 0.25, 0.0),
+    "gather@cpu": (0.005, 0.8, 0.0), "gather@gpu": (0.03, 0.04, 0.0),
     "sort_topk@cpu": (0.02, 60.0, 0.0), "sort_topk@gpu": (0.5, 5.0, 0.0),
     "group_encode@cpu": (0.02, 9.0, 0.0), "group_encode@gpu": (1.0, 4.0, 0.0),
     "filter_take@cpu": (0.02, 4.5, 0.0),
+    # join_host: host steps between the two GPU join kernels (cumsum, bincount, argsort)
+    "join_host@cpu": (0.01, 1.2, 0.0),
+    # pipeline: reserved for F-008's fused filter+expr+agg kernel.  CPU ~ memory-bandwidth
+    # bound (about 12 B/row over ~20 GB/s single thread); GPU fits TBD until the kernel exists.
+    "pipeline@cpu": (0.01, 0.6, 0.0), "pipeline@gpu": (0.3, 1.0, 0.0),
     "generic@cpu": (0.05, 6.0, 0.0), "generic@gpu": (1.0, 6.0, 0.0),
 }
 _DEFAULT_GPU_INIT_MS = 400.0
@@ -531,7 +606,8 @@ def transfer_ms(nbytes: float, direction: str, pinned: bool = False) -> float:
 
 
 def observe(op: str, device: str, rows: float, ms: float, **shape: Any) -> None:
-    get_calibration().observe(op, device, rows, ms, card=shape.get("card"))
+    card = shape.get("card", shape.get("cardinality"))
+    get_calibration().observe(op, device, rows, ms, card=card)
 
 
 # --------------------------------------------------------------------------- #
@@ -546,7 +622,11 @@ class Probe:
     ``h2d_bytes_per_row`` > 0 means the wrapper re-uploads inputs on every call
     (no device-buffer cache), so calibrate subtracts that copy from the GPU fit
     (the planner adds transfers separately).  ``max_rows`` caps the size grid.
-    ``uses_card``: fit the cardinality term.
+    ``uses_card``: fit the cardinality term.  ``bucketed``: fit separately per
+    group-count bucket (see BUCKET_EDGES) instead of a single line.
+
+    GPU probes time the BARE kernel on device-resident buffers (ctx.dev / ctx.dev_out)
+    followed by a sync: no host copies, no dtype conversion, no host pre/post steps.
     """
     op: str
     device: str
@@ -555,7 +635,8 @@ class Probe:
     max_rows: Optional[int] = None
     uses_card: bool = False
     enabled: bool = True             # False: skipped (defaults kept), noted in Calibration.errors
-    max_card: Optional[int] = None   # GPU group_min/max fault above ~8k groups (see docs)
+    max_card: Optional[int] = None   # GPU group_min/max fault above ~8k groups (see GPU_MAX_CARD)
+    bucketed: bool = False
 
 
 PROBES: Dict[Tuple[str, str], Probe] = {}
@@ -577,6 +658,7 @@ class ProbeCtx:
         self._cpu = None
         self._gpu = None
         self._data: Dict[str, Any] = {}
+        self._dev_ptrs: List[int] = []
 
     @property
     def cpu(self):
@@ -592,8 +674,25 @@ class ProbeCtx:
             self._gpu = ak.AOTKernelsGPU()
         return self._gpu
 
+    def dev(self, arr) -> int:
+        """Upload ``arr`` once (untimed setup) and return its device pointer."""
+        ptr = self.gpu._upload(arr)
+        self._dev_ptrs.append(ptr)
+        return ptr
+
+    def dev_out(self, nbytes: int) -> int:
+        ptr = self.gpu._cu.malloc(int(nbytes))
+        self._dev_ptrs.append(ptr)
+        return ptr
+
     def release_gpu_buffers(self) -> None:
         if self._gpu is not None:
+            for ptr in self._dev_ptrs:
+                try:
+                    self._gpu._cu.free(ptr)
+                except Exception:
+                    pass
+            self._dev_ptrs.clear()
             try:
                 self._gpu.clear_buf_cache()
             except Exception:
@@ -649,19 +748,24 @@ def _cpu_group(method: str):
     return make
 
 
-def _gpu_group(method: str):
+def _gpu_group(attr: str):
     def make(ctx: ProbeCtx, n: int, card: int):
-        v, lab = ctx.f32(n), ctx.labels(n, card)
-        m = getattr(ctx.gpu, method)
-        return lambda: m(v, lab, card)
+        g = ctx.gpu
+        dv, dl, out = ctx.dev(ctx.f32(n)), ctx.dev(ctx.labels(n, card)), ctx.dev_out(card * 4)
+        fn, cu = getattr(g, attr), g._cu
+
+        def run():
+            fn(g._ptr(out), g._ptr(dv), g._ptr(dl), n, card)
+            cu.sync()
+        return run
     return make
 
 
-for _op, _m in (("group_sum", "group_sum_f32"), ("group_min", "group_min_f32"),
-                ("group_max", "group_max_f32")):
+for _op, _m, _a in (("group_sum", "group_sum_f32", "_group_sum"), ("group_min", "group_min_f32", "_group_min"),
+                    ("group_max", "group_max_f32", "_group_max")):
     PROBES[(_op, "cpu")] = Probe(_op, "cpu", _cpu_group(_m), uses_card=True)
-    PROBES[(_op, "gpu")] = Probe(_op, "gpu", _gpu_group(_m), uses_card=True,
-                              max_card=4096 if _op in ("group_min", "group_max") else None)
+    PROBES[(_op, "gpu")] = Probe(_op, "gpu", _gpu_group(_a), uses_card=True, bucketed=True,
+                                 max_card=4096 if _op in GPU_MAX_CARD else None)
 
 
 @probe("group_count", "cpu", uses_card=True)
@@ -670,10 +774,15 @@ def _p_gc_cpu(ctx, n, card):
     return lambda: ctx.cpu.group_count_f32(lab, card)
 
 
-@probe("group_count", "gpu", uses_card=True)
+@probe("group_count", "gpu", uses_card=True, bucketed=True)
 def _p_gc_gpu(ctx, n, card):
-    lab = ctx.labels(n, card)
-    return lambda: ctx.gpu.group_count_f32(lab, card)
+    g = ctx.gpu
+    dl, out = ctx.dev(ctx.labels(n, card)), ctx.dev_out(card * 4)
+
+    def run():
+        g._group_count(g._ptr(out), g._ptr(dl), n, card)
+        g._cu.sync()
+    return run
 
 
 @probe("masked_sum", "cpu")
@@ -684,8 +793,13 @@ def _p_ms_cpu(ctx, n, card):
 
 @probe("masked_sum", "gpu")
 def _p_ms_gpu(ctx, n, card):
-    v, m = ctx.f32(n), ctx.mask(n)
-    return lambda: ctx.gpu.masked_global_sum_f32(v, m)
+    g = ctx.gpu
+    dv, dm, out = ctx.dev(ctx.f32(n)), ctx.dev(ctx.mask(n)), ctx.dev_out(4)
+
+    def run():
+        g._masked_sum(g._ptr(out), g._ptr(dv), g._ptr(dm), n)
+        g._cu.sync()
+    return run
 
 
 def _join_inputs(ctx, n):
@@ -708,8 +822,49 @@ def _p_join_cpu(ctx, n, card):
 
 @probe("join", "gpu", max_rows=30_000_000)
 def _p_join_gpu(ctx, n, card):
+    """Bare join kernels: count phase + scatter phase on resident buffers.  The host
+    steps between them (cumsum/bincount/argsort, counts D2H) are the `join_host` term."""
+    import numpy as np
+    g = ctx.gpu
     left, right = _join_inputs(ctx, n)
-    return lambda: ctx.gpu.hash_join(left, right)
+    m = len(right)
+    counts = np.bincount(right, minlength=m).astype(np.int32)[left]        # setup, untimed
+    offsets = np.zeros(n, dtype=np.int32)
+    np.cumsum(counts[:-1], out=offsets[1:])
+    right_order = np.argsort(right, kind="stable").astype(np.int32)
+    right_starts = np.zeros(m, dtype=np.int32)
+    rc = np.bincount(right, minlength=m).astype(np.int32)
+    np.cumsum(rc[:-1], out=right_starts[1:])
+    total = int(counts.sum())
+    lk, rk = ctx.dev(left), ctx.dev(right)
+    table, cnt = ctx.dev(np.zeros(m, dtype=np.int32)), ctx.dev_out(n * 4)
+    d_off, d_ord, d_st, d_rc = (ctx.dev(offsets), ctx.dev(right_order), ctx.dev(right_starts), ctx.dev(rc))
+    lo, ro = ctx.dev_out(max(total, 1) * 4), ctx.dev_out(max(total, 1) * 4)
+    P = g._ptr
+
+    def run():
+        # (table is not re-zeroed between calls: only timing matters; scatter inputs are fixed)
+        g._join_count_gpu(P(cnt), P(table), P(lk), P(rk), n, m, m)
+        g._join_scatter_gpu(P(lo), P(ro), P(lk), P(d_off), P(d_ord), P(d_st), P(d_rc), n, m)
+        g._cu.sync()
+    return run
+
+
+@probe("join_host", "cpu", max_rows=30_000_000)
+def _p_join_host(ctx, n, card):
+    """Host work the GPU join does between its two kernels (rows = left rows)."""
+    import numpy as np
+    left, right = _join_inputs(ctx, n)
+    counts = np.ones(n, dtype=np.int32)
+
+    def run():
+        offsets = np.zeros(n, dtype=np.int32)
+        np.cumsum(counts[:-1], out=offsets[1:])
+        rc = np.bincount(right, minlength=len(right)).astype(np.int32)
+        np.argsort(right, kind="stable")
+        starts = np.zeros(len(right), dtype=np.int32)
+        np.cumsum(rc[:-1], out=starts[1:])
+    return run
 
 
 @probe("gather", "cpu")
@@ -718,10 +873,15 @@ def _p_gather_cpu(ctx, n, card):
     return lambda: ctx.cpu.gather_f32(v, idx)
 
 
-@probe("gather", "gpu", h2d_bytes_per_row=8.0)
+@probe("gather", "gpu")
 def _p_gather_gpu(ctx, n, card):
-    v, idx = ctx.f32(n), ctx.perm(n)
-    return lambda: ctx.gpu.gather_f32(v, idx)
+    g = ctx.gpu
+    ds, di, out = ctx.dev(ctx.f32(n)), ctx.dev(ctx.perm(n)), ctx.dev_out(n * 4)
+
+    def run():
+        g._gather_f32(g._ptr(out), g._ptr(ds), g._ptr(di), n)
+        g._cu.sync()
+    return run
 
 
 @probe("sort_topk", "cpu", max_rows=10_000_000)
@@ -736,8 +896,13 @@ def _p_sort_cpu(ctx, n, card):
 
 @probe("sort_topk", "gpu", max_rows=10_000_000)
 def _p_sort_gpu(ctx, n, card):
-    k = ctx.keys(n)
-    return lambda: ctx.gpu.sort_topk(k, min(100, n), False)
+    g = ctx.gpu
+    dk, out = ctx.dev(ctx.keys(n)), ctx.dev_out(n * 4)
+
+    def run():
+        g._sort_topk_gpu(g._ptr(out), g._ptr(dk), n, 0)      # full bitonic sort, result stays on device
+        g._cu.sync()
+    return run
 
 
 @probe("group_encode", "cpu")
@@ -782,34 +947,67 @@ def _card_for(n: int) -> int:
 
 
 def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
-                    timer: Callable[[], float], h2d_gbps: float) -> List[List[float]]:
-    """Time one probe over the size grid -> [[rows, card, ms], ...].  May raise."""
+                    timer: Callable[[], float], h2d_gbps: float,
+                    progress: Optional[Callable[[int], None]] = None) -> List[List[float]]:
+    """Time one probe over the size grid -> [[rows, card, ms], ...].  May raise.
+
+    ``progress(n)`` is called after each finished size (keeps the child watchdog fed)."""
     pts: List[List[float]] = []
-    last: Optional[Tuple[int, float]] = None
-    grid: List[Tuple[int, int]] = [(n, _card_for(n)) for n in sizes if not (p.max_rows and n > p.max_rows)]
-    if p.uses_card:                       # cardinality sweep at a mid size
-        mid = min((n for n in sizes if n >= 1_000_000), default=sizes[-1])
-        if not (p.max_rows and mid > p.max_rows):
-            grid += [(mid, c) for c in (8, 200_000) if c <= (p.max_card or 1 << 30)]
+    last: Dict[int, Tuple[int, float]] = {}          # per group count: (rows, ms) of last run
+    sizes_ok = [n for n in sizes if not (p.max_rows and n > p.max_rows)]
+    cap = p.max_card or (1 << 30)
+    if p.bucketed:                        # every size at one representative card per bucket
+        cards = [c for c in BUCKET_REP_CARDS if c <= cap]
+        grid = [(n, c) for c in cards for n in sizes_ok if c <= max(n, 8)]
+    else:
+        grid = [(n, _card_for(n)) for n in sizes_ok]
+        if p.uses_card:                   # cardinality sweep at a mid size
+            mid = min((n for n in sizes if n >= 1_000_000), default=sizes[-1])
+            if not (p.max_rows and mid > p.max_rows):
+                grid += [(mid, c) for c in (8, 200_000) if c <= cap]
     for n, card in grid:
-        if last is not None and n > last[0] and last[1] / 1e3 * (n / last[0]) * 4 > budget_s:
+        prev = last.get(card)
+        if prev is not None and n > prev[0] and prev[1] / 1e3 * (n / prev[0]) * 4 > budget_s:
             continue                      # projected too slow for the budget: skip this size
         ms = _time_call(p.make(ctx, n, card), timer, budget_s)
         if p.h2d_bytes_per_row and h2d_gbps > 0:      # wrapper re-uploads inputs: remove that copy
             ms = max(ms - p.h2d_bytes_per_row * n / (h2d_gbps * 1e9) * 1e3, ms * 0.05)
         pts.append([float(n), float(card), ms])
-        if not last or n >= last[0]:
-            last = (n, ms)
+        if prev is None or n >= prev[0]:
+            last[card] = (n, ms)
         if p.device == "gpu" and hasattr(ctx, "release_gpu_buffers"):
             ctx.release_gpu_buffers()
+        if progress:
+            progress(n)
     return pts
 
 
-def _fit_points(pts: List[List[float]], uses_card: bool) -> Tuple[Optional[Fit], Optional[str]]:
-    if len({p_[0] for p_ in pts}) < 3:
-        return None, "too few sizes within time budget"
-    a, c, g = _nnls_rel([tuple(p_) for p_ in pts], uses_card and len({p_[1] for p_ in pts}) >= 3)
-    return Fit(a, c, g, n_points=len(pts)), None
+def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False
+                ) -> Tuple[Dict[str, Fit], Optional[str]]:
+    """-> ({"": base fit, ":<=64": bucket fit, ...}, error).  Empty dict on failure."""
+    def line(sub, card_term):
+        if len({q[0] for q in sub}) < 3:
+            return None
+        a, c, g = _nnls_rel([tuple(q) for q in sub], card_term and len({q[1] for q in sub}) >= 3)
+        return Fit(a, c, g, n_points=len(sub))
+
+    if not bucketed:
+        f = line(pts, uses_card)
+        return ({"": f}, None) if f else ({}, "too few sizes within time budget")
+    fits: Dict[str, Fit] = {}
+    for name in [bucket_name(c) for c in (*BUCKET_EDGES, BUCKET_EDGES[-1] + 1)]:
+        f = line([q for q in pts if bucket_name(q[1]) == name], False)
+        if f:
+            fits[f":{name}"] = f
+    if not fits:
+        return {}, "too few sizes within time budget"
+    fits[""] = fits.get(f":{bucket_name(DEFAULT_CARD)}") or next(iter(fits.values()))
+    return fits, None
+
+
+def _store_fits(cal: "Calibration", op: str, dev: str, fits: Dict[str, Fit]) -> None:
+    for suffix, f in fits.items():
+        cal.fits[f"{op}@{dev}{suffix}"] = f
 
 
 # -- link + GPU init ------------------------------------------------------- #
@@ -929,7 +1127,8 @@ def _measure_gpu_local(emit: Callable[[Dict[str, Any]], None], registry: Dict[Tu
             emit({"kind": "error", "what": f"{op}@gpu", "msg": "probe disabled (kernel unusable); defaults kept"})
             continue
         try:
-            emit({"kind": "points", "op": op, "points": _collect_points(p, ctx, sizes, budget_s, timer, h2d)})
+            emit({"kind": "points", "op": op, "points": _collect_points(
+                p, ctx, sizes, budget_s, timer, h2d, progress=lambda n: emit({"kind": "progress", "n": n}))})
         except Exception as exc:
             emit({"kind": "error", "what": f"{op}@gpu", "msg": f"{type(exc).__name__}: {exc}"})
     p = registry.get(("masked_sum", "gpu"))
@@ -949,15 +1148,20 @@ def _gpu_worker_main() -> None:      # pragma: no cover - runs in the child proc
 
 
 def _run_gpu_subprocess(sizes: Tuple[int, ...], budget_s: float, link_mb: Tuple[int, ...],
-                        item_timeout_s: float = 45.0, total_timeout_s: float = 900.0) -> List[Dict[str, Any]]:
-    """Run the GPU probes in a child; a per-item watchdog kills it if a kernel hangs."""
+                        item_timeout_s: Optional[float] = None, total_timeout_s: float = 1800.0,
+                        child_cmd: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Run the GPU probes in a child.  The watchdog kills it after ``item_timeout_s``
+    without any output line (the child emits one per finished size, so slow 1e8-row
+    steps in full mode do not trip it; a hung kernel does).  ``child_cmd`` is a test hook."""
     import queue
+    if item_timeout_s is None:
+        item_timeout_s = max(45.0, 20.0 * budget_s)
     pkg = __package__ or "mxframe"
     code = f"import {pkg}.calibration as c; c._gpu_worker_main()"
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([p for p in sys.path if p])
     items: List[Dict[str, Any]] = []
-    proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
+    proc = subprocess.Popen(child_cmd or [sys.executable, "-c", code], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     q: "queue.Queue[Optional[str]]" = queue.Queue()
     threading.Thread(target=lambda: ([q.put(l) for l in proc.stdout], q.put(None)), daemon=True).start()
@@ -977,9 +1181,11 @@ def _run_gpu_subprocess(sizes: Tuple[int, ...], budget_s: float, link_mb: Tuple[
         if line is None:
             break
         try:
-            items.append(json.loads(line))
+            item = json.loads(line)
         except ValueError:
-            pass
+            continue
+        if item.get("kind") != "progress":
+            items.append(item)
     rc = proc.wait()
     if problem is None and rc != 0:
         tail = "".join(err_lines).strip().splitlines()
@@ -1030,11 +1236,13 @@ def calibrate(full: bool = False, *, save: bool = True, verbose: bool = False,
             cal.errors[f"{op}@cpu"] = "probe disabled (kernel unusable); defaults kept"
             continue
         try:
-            fit, err = _fit_points(_collect_points(p, ctx, sizes, budget, timer, 0.0), p.uses_card)
+            fits, err = _fit_points(_collect_points(p, ctx, sizes, budget, timer, 0.0),
+                                    p.uses_card, p.bucketed)
         except Exception as exc:
-            fit, err = None, f"{type(exc).__name__}: {exc}"
-        if fit is not None:
-            cal.fits[f"{op}@cpu"] = fit
+            fits, err = {}, f"{type(exc).__name__}: {exc}"
+        if fits:
+            _store_fits(cal, op, "cpu", fits)
+            fit = fits[""]
             log(f"{op}@cpu: alpha={fit.alpha:.4f} c={fit.c * 1e6:.3f} ms/Mrow")
         else:
             cal.errors[f"{op}@cpu"] = err or "unknown"
@@ -1068,9 +1276,11 @@ def calibrate(full: bool = False, *, save: bool = True, verbose: bool = False,
             elif kind == "points":
                 op = item["op"]
                 probe_ = registry.get((op, "gpu"))
-                fit, err = _fit_points(item["points"], bool(probe_ and probe_.uses_card))
-                if fit is not None:
-                    cal.fits[f"{op}@gpu"] = fit
+                fits, err = _fit_points(item["points"], bool(probe_ and probe_.uses_card),
+                                        bool(probe_ and probe_.bucketed))
+                if fits:
+                    _store_fits(cal, op, "gpu", fits)
+                    fit = fits[""]
                     log(f"{op}@gpu: alpha={fit.alpha:.4f} c={fit.c * 1e6:.3f} ms/Mrow")
                 else:
                     cal.errors[f"{op}@gpu"] = err or "unknown"
