@@ -187,3 +187,33 @@ def test_sort_treats_negative_zero_as_zero(device):
     t = pa.table({"a": pa.array([0.0, -0.0, 0.0, -0.0]), "b": pa.array([4, 3, 2, 1], type=pa.int64())})
     got = LazyFrame(Scan(t)).sort("a", "b").compute(device=device)
     assert got.column("b").to_pylist() == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize("device", ["cpu", "auto"])
+def test_left_join_count_of_right_column_counts_unmatched_as_zero(device):
+    rng = np.random.default_rng(11)
+    a = pa.table({"k": pa.array(rng.integers(0, 50, 3000).astype(np.int64)),
+                  "g": pa.array(rng.integers(0, 4, 3000).astype(np.int64))})
+    b = pa.table({"k": pa.array(np.arange(0, 50, 2, dtype=np.int64)),       # half the keys have no match
+                  "w": pa.array(rng.normal(size=25))})
+    con = duckdb.connect()
+    con.register("a", a); con.register("b", b)
+    grouped = (LazyFrame(Scan(a)).join(LazyFrame(Scan(b)), on="k", how="left")
+               .groupby("g").agg(col("w").count().alias("n"), col("k").count().alias("rows")).compute(device=device))
+    ref = con.execute("select g, count(w) as n, count(a.k) as rows from a left join b using (k) group by g").fetch_arrow_table()
+    _same(grouped, ref)
+    total = (LazyFrame(Scan(a)).join(LazyFrame(Scan(b)), on="k", how="left")
+             .groupby().agg(col("w").count().alias("n")).compute(device=device))
+    assert total["n"][0].as_py() == con.execute("select count(w) from a left join b using (k)").fetchone()[0]
+
+
+def test_empty_global_aggregates_are_null_on_gpu():
+    from mxframe import gpu_stream
+    if not gpu_stream.cuda_available():
+        pytest.skip("no GPU")
+    n = 300_000                                   # above the auto/GPU thresholds
+    t = pa.table({"v": pa.array(np.ones(n)), "d": pa.array(np.zeros(n, dtype=np.int32))})
+    r = (LazyFrame(Scan(t)).filter(col("d") > lit(5))
+         .groupby().agg(col("v").sum().alias("s"), col("v").min().alias("lo"), col("v").count().alias("n"))
+         .compute(device="gpu"))
+    assert r["s"][0].as_py() is None and r["lo"][0].as_py() is None and r["n"][0].as_py() == 0
