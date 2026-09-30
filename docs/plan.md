@@ -142,10 +142,27 @@ Needs: F-011, F-013 merged · Found by F-013
 - [ ] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` is flaky on a shared GPU (fails ~1 in 3 even alone): find out whether it is memory pressure (cuMemAlloc 2) or a real ordering bug
 - [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
 
-## F-015 Cold first query: 1.1 s vs 50 ms warm [todo]
+## F-015 Cold first query: 1.1 s vs 50 ms warm [built]
 Needs: none · Found 2026-09-30: fresh process, SF10 lineitem already in memory, first `compute(device="auto")` of Q1 takes 1.0–1.2 s; the same query right after takes ~50 ms. The headline metric is the first run, so this is the biggest remaining gap.
-- [ ] profile the first query in a fresh process; list where the ~1 s goes (group-key encoding/dictionary unification, calibration load, Mojo runtime/thread-pool start, library loads, Arrow casts, first-call allocations)
-- [ ] first-query SF10 Q1 (table in memory) under 200 ms on `cpu` and `auto`, results unchanged
+- [x] profile the first query in a fresh process; list where the ~1 s goes. Fresh process, SF10 lineitem in memory (`dictionary="auto"`), first Q1-shaped `compute(device="cpu")`, ms:
+
+  | cost item | before | after |
+  |---|---|---|
+  | `encode_key` x2: `pc.unique` unused-entry check | 300 | 0 (only present combinations become groups) |
+  | `encode_key` x2: `combine_dictionary` (unify ~60-458 chunk dictionaries incl. remapping the rows) | 176 | ~1 (unify the tiny dictionaries only; skipped when shared) |
+  | codes int8/int32 -> int32 `astype` | 119 | 0 (codes read in place, any width) |
+  | Python/NumPy glue | 157 | ~5 |
+  | `group_composite` | 99 | inside the pass below |
+  | group ids in total | 851 | ~95 = page pre-fault of the 240 MB ids ~30 + composite/presence pass ~38 + dense remap ~18 |
+  | `import max.engine` / `max.graph` (lazy now, never imported on CPU paths) | ~153 | 0 |
+  | fused pipeline kernel | 44 | ~48 (same as warm) |
+  | `dlopen` of the three kernel libraries (Mojo runtime load, first time) | ~30 | ~30 |
+  | rest (plan, bind_chunks, calibration, ...) | ~20 | ~20 |
+  | **total** | **1075** | **~170** |
+
+  Finding: faulting the fresh 240 MB ids array from 24 Mojo threads inside the hot pass cost 190 ms vs 36 ms on touched pages; a separate parallel zero-fill first (~30 ms) fixes it.
+- [x] first-query SF10 Q1 (table in memory) under 200 ms on `cpu` and `auto`, results unchanged. After the orchestrator's auto changes (c32636f), 7 fresh-process runs each, machine load 4-7: cpu 172 179 194 173 175 179 168 (median 175 ms); auto 229 194 181 176 179 179 173 (median 179 ms). Before: cpu 984-1116, auto 1082-1205. Q1 result identical to the old path (and to DuckDB on SF1 in `tests/test_group_keys_review.py`).
+- [ ] follow-up (not done): a uint8 group-id variant in the fused kernel (<= 256 groups) would cut the 240 MB ids array to 60 MB and remove most of the ~95 ms.
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008

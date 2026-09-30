@@ -13,9 +13,8 @@ import numpy as np
 import time as _time
 import threading as _threading
 from pathlib import Path
-from max import engine, driver
-from max.graph import Graph, TensorType, ops
-from max.graph.type import DType, DeviceRef
+# MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
+from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS
@@ -340,8 +339,8 @@ class CustomOpsCompiler(GraphCompiler):
         if want_gpu:
             self._switch_to_gpu()
         else:
-            self._driver_device = driver.CPU()
-            self._device_ref = DeviceRef.CPU()
+            self._driver_device = None      # CPU handles are made on first use
+            self._device_ref = None
             self._session_device = "cpu"
             self.session = None
 
@@ -3121,7 +3120,7 @@ class CustomOpsCompiler(GraphCompiler):
         composite = np.zeros(len(table), dtype=np.int32)
         for i, enc in enumerate(encodings):
             idx = enc.indices.to_numpy(zero_copy_only=False)
-            composite += (idx * strides[i]).astype(np.int32)
+            composite += idx.astype(np.int32) * np.int32(strides[i])
 
         if max_groups <= 1024:
             present_mask = np.zeros(max_groups, dtype=bool)
@@ -3287,6 +3286,13 @@ class CustomOpsCompiler(GraphCompiler):
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
+
+        # Dictionary-encoded keys (F-015): ids straight from the Arrow code buffers.
+        from . import group_keys as _group_keys
+        result = _group_keys.build(table, keys)
+        if result is not None:
+            _GROUP_ENCODE_CACHE[cache_key] = result
+            return result
 
         # GPU single integer-key path: skip PyArrow dictionary_encode entirely
         if (gpu_compiler is not None
