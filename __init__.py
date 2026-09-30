@@ -59,6 +59,10 @@ def clear_cache() -> None:
 # SQL frontend (optional; requires `sqlglot`). Imported on first call: sqlglot
 # costs ~37 ms at import and most programs never use SQL.
 def sql(*args, **kwargs):
+    """Run a SQL query over Arrow tables / LazyFrames, e.g. ``mx.sql("SELECT ... FROM t", t=table)``.
+
+    Parsed with sqlglot into the same LogicalPlan the DataFrame API builds.
+    """
     try:
         from .sql_frontend import sql as _sql
     except ImportError:
