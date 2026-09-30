@@ -375,9 +375,12 @@ def _key_card(name, tables, rows) -> int:
         column = t.column(name)
         if pa.types.is_dictionary(column.type):
             return max((len(ch.dictionary) for ch in column.chunks), default=1)
-        sample = column.slice(0, min(_SAMPLE_ROWS, len(column)))
-        if len(sample) == 0:
+        if len(column) == 0:
             return 1
+        # Strided, not a prefix: data is often sorted or clustered by the key.
+        import numpy as np
+        idx = np.unique(np.linspace(0, len(column) - 1, min(_SAMPLE_ROWS, len(column))).astype(np.int64))
+        sample = column.take(pa.array(idx))
         d = pc.count_distinct(sample).as_py()
         if d < 0.5 * len(sample):          # saturated: the sample saw (nearly) every value
             return max(1, d)
@@ -477,7 +480,9 @@ def disable_gpu(reason: str) -> None:
 
 def is_sticky_gpu_error(err: BaseException) -> bool:
     text = f"{type(err).__name__}: {err}"
-    return "OUT_OF_MEMORY" not in text and not isinstance(err, MemoryError)
+    if isinstance(err, MemoryError) or "OUT_OF_MEMORY" in text:
+        return False
+    return "CUDA_ERROR" in text or "cuda error" in text.lower()
 
 
 _failed_shapes: set = set()
@@ -530,18 +535,18 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         return AutoDecision("cpu", f"gpu disabled after error: {_gpu_disabled}", est, gpu_available=False)
     if _shape_key(plan) in _failed_shapes:
         return AutoDecision("cpu", "this query shape failed on gpu before", est)
-    wanted = set((placement or {}).values())
-    if "gpu" in wanted:
-        return AutoDecision("gpu", "placement override", est, gpu.remaining_init_ms())
-    if wanted == {"cpu"}:
-        return AutoDecision("cpu", "placement override", est)
     init = gpu.remaining_init_ms()
-    cpu_ms, gpu_ms = est.cpu_ms, est.gpu_ms + init
-    margin = {"gpu": 0.0, "cpu": PREFER_CPU_MARGIN}.get(prefer, GPU_WIN_MARGIN)
     blocked = [l for l in est.lines if l.gpu_ms == float("inf")]
-    if blocked:
+    if blocked:   # checked before overrides: never run a GPU path known to be wrong or missing
         why = blocked[0].note or f"{blocked[0].op} has no usable gpu kernel"
         return AutoDecision("cpu", f"gpu path unusable: {why}", est, init)
+    wanted = set((placement or {}).values())
+    if "gpu" in wanted:
+        return AutoDecision("gpu", "placement override", est, init)
+    if wanted == {"cpu"}:
+        return AutoDecision("cpu", "placement override", est)
+    cpu_ms, gpu_ms = est.cpu_ms, est.gpu_ms + init
+    margin = {"gpu": 0.0, "cpu": PREFER_CPU_MARGIN}.get(prefer, GPU_WIN_MARGIN)
     if gpu_ms < cpu_ms * (1 - margin):
         return AutoDecision("gpu", "gpu faster incl. copies", est, init)
     if est.gpu_ms < cpu_ms * (1 - margin) and init > 0:

@@ -243,3 +243,26 @@ def test_sticky_gpu_error_disables_gpu_for_the_process(monkeypatch):
 def test_no_gpu_explain_prints_na():
     d = am.choose_device(grouped(table(1000)), calib=Calib(has_gpu=False), gpu=Gpu(available=False))
     assert "gpu=n/a" in d.explain()
+
+
+def test_group_count_of_sorted_keys_is_not_undercounted():
+    n = 2_000_000
+    keys = np.repeat(np.arange(n // 4, dtype=np.int32), 4)       # sorted, 500K groups
+    t = pa.table({"k": keys, "v": np.ones(n, dtype=np.float32)})
+    est = am.estimate_plan(LazyFrame(t).groupby("k").agg(col("v").min().alias("m")).plan, Calib(), Gpu())
+    card = int(est.lines[0].note.split("~")[1].split(" ")[0].replace(",", ""))
+    assert card >= 250_000
+
+
+def test_placement_override_cannot_select_a_broken_gpu_path():
+    left, right = table(5000), table(5000)
+    plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
+    d = am.choose_device(plan, calib=Calib(), gpu=Gpu(), placement={"join": "gpu"})
+    assert d.device == "cpu" and "unusable" in d.reason
+
+
+def test_only_device_errors_disable_the_gpu():
+    assert am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS"))
+    assert not am.is_sticky_gpu_error(MemoryError("x"))
+    assert not am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
+    assert not am.is_sticky_gpu_error(TypeError("unsupported dtype"))
