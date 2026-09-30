@@ -81,6 +81,18 @@ def _check_len(name: str, arr: np.ndarray, n: int) -> None:
         raise ValueError(f"{name} has {len(arr)} elements, expected {n}")
 
 
+MAX_JOIN_ROWS = (1 << 31) - 1     # the join kernels index their output with int32 offsets
+
+
+def check_join_output_size(total: int) -> None:
+    """Refuse a join whose output has more rows than int32 offsets address: the scatter kernel would write
+    through wrapped-around offsets and fault (a many-to-many join of two 46,500-row tables on one key)."""
+    if total > MAX_JOIN_ROWS:
+        raise MemoryError(
+            f"join output would have {total:,} rows, more than the {MAX_JOIN_ROWS:,} the join kernels can "
+            "address: filter or aggregate one side first")
+
+
 def _arr(a: np.ndarray, dtype) -> np.ndarray:
     """C-contiguous view of `a` as `dtype` (no copy when it already is)."""
     return np.ascontiguousarray(a, dtype=dtype)
@@ -431,7 +443,8 @@ class AOTKernels:
         left_keys, right_keys = _arr(left_keys, np.int32), _arr(right_keys, np.int32)
         n_left  = len(left_keys)
         n_right = len(right_keys)
-        total   = int(match_counts.sum())
+        total   = int(match_counts.sum(dtype=np.int64))
+        check_join_output_size(total)
         if total == 0:
             return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         offsets = np.zeros(n_left, dtype=np.int32)
@@ -460,7 +473,8 @@ class AOTKernels:
         left_keys, right_keys = _arr(left_keys, np.int32), _arr(right_keys, np.int32)
         n_left  = len(left_keys)
         n_right = len(right_keys)
-        total   = int(match_counts.sum())  # includes 1 for each unmatched left row
+        total   = int(match_counts.sum(dtype=np.int64))  # includes 1 for each unmatched left row
+        check_join_output_size(total)
         if total == 0:
             return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
         offsets = np.zeros(n_left, dtype=np.int32)

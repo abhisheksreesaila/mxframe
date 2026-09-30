@@ -159,8 +159,8 @@ def test_joins_carry_only_the_columns_read_above_them(monkeypatch):
     seen = []
     real = join_engine._execute_inner
 
-    def spy(comp, node, needed):
-        out = real(comp, node, needed)
+    def spy(comp, node, needed, *rest):
+        out = real(comp, node, needed, *rest)
         seen.append(list(out.column_names))
         return out
 
@@ -210,3 +210,45 @@ def test_plan_order_is_a_connected_order_over_every_leaf():
         assert r_leaf in seen and new not in seen and {a, b} == {r_leaf, new}
         seen.add(new)
     assert seen == {0, 1, 2, 3}
+
+
+def test_string_columns_of_a_small_side_are_consumed_by_filters_and_group_keys():
+    rng = np.random.default_rng(9)
+    n = 200_000
+    fact = pa.table({"f_k": _i32(rng.integers(0, 20, n)), "f_x": pa.array(rng.random(n))})
+    dim = pa.table({"d_k": _i32(np.arange(20)), "d_name": pa.array([f"nation_{i % 7}" for i in range(20)])})
+    lf = LazyFrame(fact).join(LazyFrame(dim), left_on="f_k", right_on="d_k")
+    got = (lf.filter(col("d_name") != lit("nation_3")).groupby("d_name")
+           .agg(col("f_x").sum().alias("s"), col("f_x").count().alias("n")).sort("d_name").compute(device="cpu"))
+    ref = _sql("""select d_name, sum(f_x) s, count(f_x) n from fact join dim on f_k = d_k
+                  where d_name <> 'nation_3' group by d_name order by d_name""", fact=fact, dim=dim)
+    assert got.column("d_name").to_pylist() == ref.column("d_name").to_pylist()
+    assert got.column("n").to_pylist() == ref.column("n").to_pylist()
+    np.testing.assert_allclose(got.column("s").to_pylist(), ref.column("s").to_pylist(), rtol=1e-9)
+    assert got.schema.field("d_name").type == pa.string()
+    got = lf.filter(col("d_name").startswith("nation_1")).groupby().agg(col("f_x").count().alias("n")).compute(device="cpu")
+    ref = _sql("select count(f_x) n from fact join dim on f_k = d_k where d_name like 'nation_1%'", fact=fact, dim=dim)
+    assert got.column("n").to_pylist() == ref.column("n").to_pylist()
+    # the same string column used as the join key of a second join must still match
+    got = lf.join(LazyFrame(dim.rename_columns(["d_k2", "d_name2"])), left_on="d_name", right_on="d_name2") \
+        .groupby().agg(col("f_x").count().alias("n")).compute(device="cpu")
+    ref = _sql("select count(f_x) n from fact join dim on f_k = d_k join dim d2 on dim.d_name = d2.d_name", fact=fact, dim=dim)
+    assert got.column("n").to_pylist() == ref.column("n").to_pylist()
+
+
+def test_threaded_numpy_passes_give_the_same_join(monkeypatch):
+    monkeypatch.setattr(join_engine, "PAR_MIN_ROWS", 1000)
+    monkeypatch.setattr(join_engine, "_PAR_PIECE", 700)
+    fact, da, db, dc = _star(11, n_fact=20_000)
+    lf = (LazyFrame(fact).join(LazyFrame(da), left_on="f_a", right_on="a_id")
+          .join(LazyFrame(dc).filter(col("c_rank") < lit(50)), left_on="f_c", right_on="c_id"))
+    got = lf.groupby("a_grp").agg(col("f_x").sum().alias("s"), col("f_id").count().alias("n")).sort("a_grp").compute(device="cpu")
+    ref = _sql("""select a_grp, sum(f_x) s, count(f_id) n from fact join da on f_a = a_id join dc on f_c = c_id
+                  where c_rank < 50 group by a_grp order by a_grp""", fact=fact, da=da, dc=dc)
+    assert got.column("n").to_pylist() == ref.column("n").to_pylist()
+    np.testing.assert_allclose(got.column("s").to_pylist(), ref.column("s").to_pylist(), rtol=1e-9)
+    assert join_engine._minmax(np.arange(5000)) == (0, 4999)
+    a = np.arange(5000, dtype=np.int64)
+    idx = np.random.default_rng(0).integers(0, 5000, 4000).astype(np.int32)
+    assert (join_engine._take(a, idx) == a[idx]).all()
+    assert (join_engine._as_i32(a) == a).all() and join_engine._as_i32(a).dtype == np.int32

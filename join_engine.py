@@ -30,6 +30,12 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
 from .optimizer import _output_columns as plan_columns
 
 
+# A one-shot gather is cheaper on the CPU below this many rows: the GPU one uploads the source columns
+# and downloads the result (measured: TPC-H Q9 SF10, 3.3M rows x 6 columns, 0.12 s on the CPU, 0.5-0.7 s on the GPU).
+GPU_GATHER_MIN_ROWS = int(os.environ.get("MXFRAME_GPU_GATHER_MIN_ROWS", 1 << 62))
+
+CACHE_MAX_CELLS = 1 << 25        # join results larger than this (rows x columns) are not kept for the next query
+
 _TRACE = bool(os.environ.get("MXFRAME_JOIN_TRACE"))      # print one line per join step to stderr
 
 
@@ -53,18 +59,21 @@ def _out_name(e, i: int) -> str:
     return e._alias or (e.args[0] if e.op == "col" else f"col_{i}")
 
 
-def materialize(comp, plan, needed: Optional[Set[str]] = None):
+def materialize(comp, plan, needed: Optional[Set[str]] = None, dict_ok: bool = True):
     """Replace every Join in ``plan`` by a ``Scan`` of its result.
 
     ``needed`` is the set of column names the caller reads from ``plan``'s output (None: all).
     It is narrowed on the way down so each join only produces the columns read above it.
+    ``dict_ok`` says every consumer up to the top (filters, projections, group keys, aggregates) accepts
+    dictionary-typed string columns; it is False below a sort, limit or distinct and below a join that
+    could use such a column as a key.
     """
     if isinstance(plan, Scan):
         return plan
     if isinstance(plan, Join):
-        return Scan(execute_join(comp, plan, needed))
+        return Scan(execute_join(comp, plan, needed, dict_ok))
     if isinstance(plan, Filter):
-        return Filter(materialize(comp, plan.input, _union(needed, _cols(plan.predicate))), plan.predicate)
+        return Filter(materialize(comp, plan.input, _union(needed, _cols(plan.predicate)), dict_ok), plan.predicate)
     if isinstance(plan, Project):
         used: Set[str] = set()
         produced = set()
@@ -75,26 +84,26 @@ def materialize(comp, plan, needed: Optional[Set[str]] = None):
         # (a Project of new columns only, with_columns after a join, is completed by the aggregate
         # that inlines it)
         below = used if needed is None else (used | (needed - produced))
-        return Project(materialize(comp, plan.input, below), plan.exprs)
+        return Project(materialize(comp, plan.input, below, dict_ok), plan.exprs)
     if isinstance(plan, Aggregate):
         used = set()
         for e in list(plan.group_by) + list(plan.aggs):
             used |= _cols(e)
-        return Aggregate(materialize(comp, plan.input, used), plan.group_by, plan.aggs)
+        return Aggregate(materialize(comp, plan.input, used, dict_ok), plan.group_by, plan.aggs)
     if isinstance(plan, Sort):
         used = set()
         for e in plan.by:
             used |= _cols(e) if hasattr(e, "op") else {e}
-        return Sort(materialize(comp, plan.input, _union(needed, used)), plan.by, plan.descending)
+        return Sort(materialize(comp, plan.input, _union(needed, used), False), plan.by, plan.descending)
     if isinstance(plan, Limit):
-        return Limit(materialize(comp, plan.input, needed), plan.n)
+        return Limit(materialize(comp, plan.input, needed, False), plan.n)
     if isinstance(plan, Tail):
-        return Tail(materialize(comp, plan.input, needed), plan.n)
+        return Tail(materialize(comp, plan.input, needed, False), plan.n)
     if isinstance(plan, Distinct):
         below = None if (needed is None or not plan.subset) else (needed | set(plan.subset))
-        return Distinct(materialize(comp, plan.input, below), plan.subset)
+        return Distinct(materialize(comp, plan.input, below, False), plan.subset)
     if hasattr(plan, "input"):
-        plan.input = materialize(comp, plan.input, None)
+        plan.input = materialize(comp, plan.input, None, dict_ok)
     return plan
 
 
@@ -118,24 +127,33 @@ def leaf_table(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
         mask = comp._eval_predicate(plan.predicate, inner)
         return _select(inner, needed).filter(mask)      # the mask is done: drop the predicate-only columns first
     if isinstance(plan, Join):
-        return execute_join(comp, plan, needed)
-    return comp._plan_to_table(materialize(comp, plan, needed))
+        return execute_join(comp, plan, needed, False)
+    return comp._plan_to_table(materialize(comp, plan, needed, False))
 
 
 # ── flattening a tree of inner joins ────────────────────────────────────────────────────────
 
 class _Flat:
     """Leaves, key edges and output naming of a group of inner joins."""
-    __slots__ = ("leaves", "edges", "names", "src")
+    __slots__ = ("leaves", "edges", "names", "src", "residuals")
 
-    def __init__(self, leaves, edges, names, src):
+    def __init__(self, leaves, edges, names, src, residuals=()):
         self.leaves = leaves          # leaf plans
         self.edges = edges            # (leaf a, leaf b, a columns, b columns)
         self.names = names            # output column names, in order
         self.src = src                # output name -> (leaf, column)
+        self.residuals = list(residuals)   # (predicate, {column name: (leaf, column)}): a Filter between joins
 
 
 def _flatten(node) -> Optional[_Flat]:
+    if isinstance(node, Filter) and isinstance(node.input, Join) and node.input.how == "inner":
+        # a condition across leaves between two joins (TPC-H Q5: c_nationkey = s_nationkey): applied as soon
+        # as the leaves it reads are joined, whatever order that is
+        inner = _flatten(node.input)
+        cols = _cols(node.predicate)
+        if inner is not None and cols and all(c in inner.src for c in cols):
+            inner.residuals.append((node.predicate, {c: inner.src[c] for c in cols}))
+            return inner
     if isinstance(node, Join) and node.how == "inner":
         left, right = _flatten(node.left), _flatten(node.right)
         if left is None or right is None:
@@ -154,7 +172,9 @@ def _flatten(node) -> Optional[_Flat]:
                 src[out] = (leaf + off, c)
             edges = list(left.edges) + [(a + off, b + off, ac, bc) for a, b, ac, bc in right.edges]
             edges.append((lsrc[0][0], rsrc[0][0] + off, [s[1] for s in lsrc], [s[1] for s in rsrc]))
-            return _Flat(left.leaves + right.leaves, edges, left.names + [o for _, o in mapping], src)
+            residuals = list(left.residuals) + [(p, {n: (l + off, c) for n, (l, c) in cm.items()})
+                                                for p, cm in right.residuals]
+            return _Flat(left.leaves + right.leaves, edges, left.names + [o for _, o in mapping], src, residuals)
         # keys drawn from several leaves of one side: join the two sides as units
         lnames, rnames = plan_columns(node.left), plan_columns(node.right)
         if lnames is None or rnames is None:
@@ -265,8 +285,51 @@ def _as_np_int(x):
     return None
 
 
+PAR_MIN_ROWS = 1 << 22           # NumPy passes over fewer rows run on one thread
+_PAR_PIECE = 1 << 20
+
+
+def _pieces(n: int):
+    parts = max(1, min(os.cpu_count() or 1, 16, n // _PAR_PIECE))
+    return [((i * n) // parts, ((i + 1) * n) // parts) for i in range(parts)]
+
+
+def _parallel(fn, n: int) -> list:
+    """``fn(lo, hi)`` over pieces of ``range(n)`` on several threads (NumPy releases the GIL)."""
+    from .io_parquet import _parallel_map
+    pieces = _pieces(n)
+    return _parallel_map(lambda b: fn(*b), pieces, len(pieces))
+
+
 def _minmax(a: np.ndarray) -> Tuple[int, int]:
-    return (int(a.min()), int(a.max())) if len(a) else (0, 0)
+    n = len(a)
+    if n == 0:
+        return 0, 0
+    if n < PAR_MIN_ROWS:
+        return int(a.min()), int(a.max())
+    parts = _parallel(lambda lo, hi: (a[lo:hi].min(), a[lo:hi].max()), n)
+    return int(min(p[0] for p in parts)), int(max(p[1] for p in parts))
+
+
+def _as_i32(a: np.ndarray) -> np.ndarray:
+    """``a`` as a contiguous int32 array (values known to fit)."""
+    if a.dtype == np.int32 and a.flags["C_CONTIGUOUS"]:
+        return a
+    if len(a) < PAR_MIN_ROWS:
+        return np.ascontiguousarray(a, dtype=np.int32)
+    out = np.empty(len(a), dtype=np.int32)
+    _parallel(lambda lo, hi: np.copyto(out[lo:hi], a[lo:hi], casting="unsafe"), len(a))
+    return out
+
+
+def _take(a: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    """``a[idx]``, on several threads for long ``idx``."""
+    n = len(idx)
+    if n < PAR_MIN_ROWS:
+        return a[idx]
+    out = np.empty(n, dtype=a.dtype)
+    _parallel(lambda lo, hi: np.take(a, idx[lo:hi], out=out[lo:hi], mode="clip"), n)
+    return out
 
 
 def _pack(lparts: List[np.ndarray], rparts: List[np.ndarray]):
@@ -308,7 +371,7 @@ def _dense(lk: np.ndarray, rk: np.ndarray):
     else:
         lo, hi = min(l0, r0), max(l1, r1)
     if lo >= 0 and hi <= dense_limit(n):
-        return (np.ascontiguousarray(lk, dtype=np.int32), np.ascontiguousarray(rk, dtype=np.int32))
+        return _as_i32(lk), _as_i32(rk)
     return None
 
 
@@ -383,11 +446,59 @@ def _gather_key(col, idx: Optional[np.ndarray]):
         return col
     a = _as_np_int(col)
     if a is not None:
-        return a[idx]
+        return _take(a, idx)
     return _as_pa(_take_rows(col, idx))
 
 
 # ── kernels ─────────────────────────────────────────────────────────────────────────────────
+
+_semi = {"lib": None, "tried": False}
+SEMI_MIN_PROBE = 1 << 20         # probe rows below which the prefilter is not worth a pass
+SEMI_MIN_RANGE = 1 << 20         # key range below which the join table stays in cache anyway
+SEMI_MAX_SHARE = 0.6             # the prefilter is kept only if it drops at least this much of the probe side
+
+
+def _semi_lib():
+    """The semi-join prefilter library (``kernels_aot/libmxjoin_cpu.so``), or None if it is missing."""
+    if not _semi["tried"]:
+        _semi["tried"] = True
+        import ctypes
+        from pathlib import Path
+        here = Path(__file__).parent
+        env = os.environ.get("MXFRAME_JOIN_LIB")
+        for cand in ([Path(env)] if env else []) + [here / "kernels_aot" / "libmxjoin_cpu.so", here / "libmxjoin_cpu.so"]:
+            if cand.exists():
+                try:
+                    lib = ctypes.CDLL(str(cand))
+                    i64 = ctypes.c_int64
+                    lib.mx_join_abi_version.restype = i64
+                    if lib.mx_join_abi_version() != 1:
+                        continue
+                    lib.mx_join_semi_select.restype = i64
+                    lib.mx_join_semi_select.argtypes = [i64] * 7
+                    lib.mx_join_init_runtime.restype = i64
+                    lib.mx_join_init_runtime()
+                    _semi["lib"] = lib
+                    break
+                except (OSError, AttributeError):
+                    continue
+    return _semi["lib"]
+
+
+def semi_select(probe: np.ndarray, build: np.ndarray, max_key: int) -> Optional[np.ndarray]:
+    """Row numbers (ascending, int32) of the ``probe`` keys that occur in ``build``; both are contiguous
+    int32 arrays of keys in ``[0, max_key]``.  None when the kernel is not available."""
+    lib = _semi_lib()
+    if lib is None:
+        return None
+    from .pipeline_kernels import default_threads
+    out = np.empty(len(probe), dtype=np.int32)
+    n = lib.mx_join_semi_select(int(probe.ctypes.data), len(probe), int(build.ctypes.data), len(build),
+                                int(max_key), int(out.ctypes.data), default_threads())
+    if n < 0:
+        return None
+    return out[:n].copy()
+
 
 def inner_pairs(comp, probe_keys: np.ndarray, build_keys: np.ndarray):
     """(probe_idx, build_idx) int32 pairs of the equal keys on the session device."""
@@ -416,7 +527,7 @@ def _dictionary_gather(col, idx: np.ndarray):
 def _gather_table(comp, table: pa.Table, idx: np.ndarray) -> pa.Table:
     if table.num_columns == 0:
         return table
-    if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) > 0:
+    if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
         return comp._aot_gpu.gather_table(table, idx)
     return _take_rows(table, idx)
 
@@ -432,17 +543,17 @@ def _stable_key(comp, plan):
     return type(comp)._plan_stable_key(plan)
 
 
-def execute_join(comp, node, needed: Optional[Set[str]]) -> pa.Table:
+def execute_join(comp, node, needed: Optional[Set[str]], dict_ok: bool = False) -> pa.Table:
     from . import custom_ops as _co
     cache = _co._JOIN_RESULT_CACHE
     key = _stable_key(comp, node)
     if key is not None:
-        key = (key, None if needed is None else frozenset(needed), comp._session_device)
+        key = (key, None if needed is None else frozenset(needed), dict_ok, comp._session_device)
         hit = cache.get(key)
         if hit is not None:
             return hit
-    out = _execute_join(comp, node, needed)
-    if key is not None:
+    out = _execute_join(comp, node, needed, dict_ok)
+    if key is not None and out.num_rows * max(1, out.num_columns) <= CACHE_MAX_CELLS:
         cache[key] = out
         if len(cache) > 24:
             for old in list(cache.keys())[:12]:
@@ -456,14 +567,23 @@ def _legacy(comp, node):
     return comp._execute_hash_join(left, right, node.left_on, node.right_on, how=node.how)
 
 
-def _execute_join(comp, node, needed):
+def _execute_join(comp, node, needed, dict_ok=False):
     if node.how == "left":
         out = _execute_left(comp, node, needed)
     elif node.how == "inner":
-        out = _execute_inner(comp, node, needed)
+        out = _execute_inner(comp, node, needed, dict_ok)
     else:
         out = None
     return out if out is not None else _legacy(comp, node)
+
+
+def _index_with_nulls(idx: np.ndarray, valid: np.ndarray) -> pa.Array:
+    """An int64 Arrow index array that is null where ``valid`` is False (built from buffers: ``pa.array``
+    with a mask, or a null scalar in a compute call, would import pandas)."""
+    n = len(idx)
+    data = np.where(valid, idx, 0).astype(np.int64)
+    bits = np.packbits(valid, bitorder="little") if n else np.zeros(0, np.uint8)
+    return pa.Array.from_buffers(pa.int64(), n, [pa.py_buffer(bits), pa.py_buffer(data)])
 
 
 def _execute_left(comp, node, needed):
@@ -496,16 +616,43 @@ def _execute_left(comp, node, needed):
             for orig, out in rwant:
                 arrays[out] = pa.nulls(len(li), type=rt.schema.field(orig).type)
         else:
-            safe = np.where(matched, ri, 0).astype(np.int64, copy=False) if not all_matched else ri
-            rtake = _take_rows(rt.select([o for o, _ in rwant]), safe)
-            valid = None if all_matched else _npa(matched)
+            sub = rt.select([o for o, _ in rwant])
+            if all_matched:
+                rtake = _take_rows(sub, ri)
+            else:
+                # unmatched rows carry a null index: Arrow's take turns those into null values
+                rtake = sub.take(_index_with_nulls(ri, matched))
             for orig, out in rwant:
-                col = rtake.column(orig)
-                arrays[out] = col if valid is None else pc.if_else(valid, col, None)
+                arrays[out] = rtake.column(orig)
     return pa.Table.from_arrays([arrays[n] for n in want], names=want)
 
 
 MAX_RESIDUAL_EXPANSION = 8.0     # a composite key joined on one column may emit this many candidate pairs per row
+
+
+def _pairs_prefiltered(comp, probe: np.ndarray, build: np.ndarray):
+    """``inner_pairs``, after dropping the probe rows that have no partner when the build side is a sparse
+    subset of a wide key range: the join table is then large, every probe a cache miss and nearly all of them
+    misses of the key too (a 456K-order relation against 60M lineitem rows)."""
+    n_p, n_b = len(probe), len(build)
+    if (n_p >= SEMI_MIN_PROBE and n_b > 0 and not (comp._session_device == "gpu")):
+        max_key = max(_minmax(probe)[1], _minmax(build)[1])
+        if max_key + 1 >= SEMI_MIN_RANGE and 4 * n_b <= max_key + 1:
+            sel = semi_select(probe, build, max_key)
+            if sel is not None and len(sel) <= SEMI_MAX_SHARE * n_p:
+                if len(sel) == 0:
+                    e = np.empty(0, dtype=np.int32)
+                    return e, e
+                pi, bi = inner_pairs(comp, _take(probe, sel), build)
+                return _take(sel, pi), bi
+    return inner_pairs(comp, probe, build)
+
+
+def _counts(a: np.ndarray, size: int) -> np.ndarray:
+    """Occurrences of each value 0..size-1 of a non-negative integer array, as int64."""
+    if a.dtype == np.uint64:
+        a = a.astype(np.int64)
+    return np.bincount(a, minlength=size).astype(np.int64)
 
 
 def _residual_split(rel_keys, new_keys, n_rel: int, n_new: int):
@@ -528,7 +675,13 @@ def _residual_split(rel_keys, new_keys, n_rel: int, n_new: int):
             continue
         if best is None or hi > best[1]:
             best = (j, hi + 1)
-    if best is None or min(n_rel, n_new) / best[1] > MAX_RESIDUAL_EXPANSION:
+    if best is None or best[1] > 8 * (n_rel + n_new):
+        return None
+    # candidate pairs the one column produces, counted exactly: a skewed column (one value on most rows)
+    # would blow up here where hashing the whole pair would not
+    a, b = ints_r[best[0]], ints_n[best[0]]
+    pairs = int(np.dot(_counts(a, best[1]), _counts(b, best[1])))
+    if pairs > MAX_RESIDUAL_EXPANSION * max(n_rel, n_new):
         return None
     return best[0], ints_r, ints_n
 
@@ -544,9 +697,9 @@ def _join_pairs(comp, rel_keys, new_keys, n_rel: int, n_new: int):
         rk, nk = encode_keys(rel_keys, new_keys, comp._common_key_type)
     t1 = time.perf_counter()
     if n_rel >= n_new:                                       # probe with the larger side, build on the smaller
-        ri, ni = inner_pairs(comp, rk, nk)
+        ri, ni = _pairs_prefiltered(comp, rk, nk)
     else:
-        ni, ri = inner_pairs(comp, nk, rk)
+        ni, ri = _pairs_prefiltered(comp, nk, rk)
     if split is not None and len(ri):
         keep = None
         for k, (a, b) in enumerate(zip(ints_r, ints_n)):
@@ -559,7 +712,31 @@ def _join_pairs(comp, rel_keys, new_keys, n_rel: int, n_new: int):
     return ri, ni, t1
 
 
-def _execute_inner(comp, node, needed):
+def _apply_residuals(comp, tables, idx, n_rel: int, pending):
+    """Filter the relation by every pending cross-leaf condition whose leaves are all in it (removes them
+    from ``pending``); returns the new index vectors and row count."""
+    for item in list(pending):
+        pred, cm, leaves = item
+        if not leaves <= idx.keys():
+            continue
+        pending.remove(item)
+        if n_rel == 0:
+            continue
+        arrays, names = [], []
+        for name, (leaf, c) in cm.items():
+            col = tables[leaf].column(c)
+            arrays.append(col if idx[leaf] is None else _take_rows(col, idx[leaf]))
+            names.append(name)
+        mask = comp._eval_predicate(pred, pa.Table.from_arrays(arrays, names=names))
+        keep = _np_of(pc.fill_null(mask, _npscalar(False, type=pa.bool_())), zero_copy_only=False)
+        sel = np.flatnonzero(keep).astype(np.int32)
+        if len(sel) != n_rel:
+            idx = {x: (sel if v is None else _take(v, sel)) for x, v in idx.items()}
+            n_rel = len(sel)
+    return idx, n_rel
+
+
+def _execute_inner(comp, node, needed, dict_ok=False):
     fl = _flatten(node)
     if fl is None:
         return None
@@ -573,6 +750,9 @@ def _execute_inner(comp, node, needed):
     for a, b, ac, bc in fl.edges:
         leaf_need[a].update(ac)
         leaf_need[b].update(bc)
+    for _, cm in fl.residuals:
+        for leaf, c in cm.values():
+            leaf_need[leaf].add(c)
     tables = [leaf_table(comp, fl.leaves[i], leaf_need[i]) for i in range(n_leaves)]
     rows = [t.num_rows for t in tables]
     base = [_base_rows(fl.leaves[i], rows[i]) for i in range(n_leaves)]
@@ -585,6 +765,9 @@ def _execute_inner(comp, node, needed):
     idx: Dict[int, Optional[np.ndarray]] = {start: None}     # leaf -> row index of the relation (None: identity)
     n_rel = rows[start]
     consumed: Set[int] = set()
+    pending = [(p, cm, {leaf for leaf, _ in cm.values()}) for p, cm in fl.residuals]
+    if pending:
+        idx, n_rel = _apply_residuals(comp, tables, idx, n_rel, pending)
     for new, ei, r_leaf in steps:
         a, b, ac, bc = fl.edges[ei]
         if r_leaf == a:
@@ -602,15 +785,18 @@ def _execute_inner(comp, node, needed):
         t1 = time.perf_counter()
         ri, ni, t2 = _join_pairs(comp, rel_keys, new_keys, n_rel, rows[new])
         t3 = time.perf_counter()
-        alive = {x for x in idx if x in out_leaves or any(
+        pending_leaves = set().union(*[lv for _, _, lv in pending]) if pending else set()
+        alive = {x for x in idx if x in out_leaves or x in pending_leaves or any(
             e not in consumed and (fl.edges[e][0] == x or fl.edges[e][1] == x) for e in range(len(fl.edges)))}
-        idx = {x: (ri if idx[x] is None else idx[x][ri]) for x in alive}
+        idx = {x: (ri if idx[x] is None else _take(idx[x], ri)) for x in alive}
         idx[new] = ni
         if _TRACE:
             t4 = time.perf_counter()
             _trace(f"add leaf {new} via {r_leaf}: rel {n_rel} x {rows[new]} -> {len(ri)}  "
                    f"keys {1e3*(t1-t0):.0f} ms, encode {1e3*(t2-t1):.0f} ms, join {1e3*(t3-t2):.0f} ms, compose {1e3*(t4-t3):.0f} ms")
         n_rel = len(ri)
+        if pending:
+            idx, n_rel = _apply_residuals(comp, tables, idx, n_rel, pending)
 
     t_g = time.perf_counter()
     by_leaf: Dict[int, List[Tuple[str, str]]] = {}
@@ -626,7 +812,7 @@ def _execute_inner(comp, node, needed):
         else:
             got = {}
             rest = names_c
-            if needed is not None:                      # a consumer above reads these: dictionary columns are fine
+            if needed is not None and dict_ok:          # a consumer above reads these: dictionary columns are fine
                 for c in names_c:
                     d = _dictionary_gather(sub.column(c), idx[leaf])
                     if d is not None:

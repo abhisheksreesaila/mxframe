@@ -236,8 +236,7 @@ class LazyFrame:
                 calibration arrive with per-operator placement.
         """
         from .io_parquet import resolve_plan
-        source_plan = resolve_plan(self.plan)
-        plan = source_plan
+        plan = self.plan
         optimizer_trace = None
 
         if validate:
@@ -245,17 +244,21 @@ class LazyFrame:
             validate_plan_or_raise(plan)
 
         if optimize:
+            # Optimize before the Parquet sources are read: filters the optimizer moves below a join land
+            # directly above their ParquetScan, where the reader applies them while decoding (F-017).
             from .optimizer import optimize_plan
-            opt = optimize_plan(source_plan)
+            opt = optimize_plan(plan)
             plan = opt.plan
             optimizer_trace = opt.trace
-            if validate:
-                from .plan_validation import validate_plan_or_raise
-                validate_plan_or_raise(plan)
             if verbose and opt.trace:
                 print("[mxframe] optimizer passes:")
                 for line in opt.trace:
                     print(f"  - {line}")
+
+        plan = resolve_plan(plan)
+        if validate:
+            from .plan_validation import validate_plan_or_raise
+            validate_plan_or_raise(plan)
 
         self._last_optimizer_trace = list(optimizer_trace or [])
         if device != "auto":
