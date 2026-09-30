@@ -28,15 +28,21 @@ QUERIES = {
 }
 
 
+# tables a query takes as keywords, beyond the positional ones above
+KEYWORD_TABLES = {5: ["supplier"], 8: ["supplier"]}
+SCALAR_NAME = {17: "avg_yearly"}
+
+
 def run_query(data_dir, q, device):
     import pyarrow as pa
     import mxframe as mx
     sys.path.insert(0, str(HERE.parent / "scripts"))
     import benchmark_tpch as bm
     tables = [mx.read_parquet_table(Path(data_dir) / f"{n}.parquet") for n in QUERIES[q]]
-    out = getattr(bm, f"run_q{q}_mxframe")(*tables, device=device)
+    extra = {n: mx.read_parquet_table(Path(data_dir) / f"{n}.parquet") for n in KEYWORD_TABLES.get(q, [])}
+    out = getattr(bm, f"run_q{q}_mxframe")(*tables, device=device, **extra)
     if not isinstance(out, pa.Table):
-        out = pa.table({"value": [float(out)]})
+        out = pa.table({SCALAR_NAME.get(q, "value"): [float(out)]})
     return out
 
 

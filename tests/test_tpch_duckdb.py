@@ -28,7 +28,16 @@ import tpch_duckdb_sql as ref
 
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "_tpch_runner.py"
-SF_DIRS = {"1": TPCH_DATA / "tpch_sf1", "10": TPCH_DATA / "tpch_sf10"}
+
+
+def _data_dir(sf):
+    """`tpch_sf<SF>_exact` (decimals rounded to the nearest float32, see gen_tpch_parquet.py) if
+    present, else the older `tpch_sf<SF>` whose decimals were truncated (Q6 cannot match there)."""
+    exact = TPCH_DATA / f"tpch_sf{sf}_exact"
+    return exact if (exact / "lineitem.parquet").exists() else TPCH_DATA / f"tpch_sf{sf}"
+
+
+SF_DIRS = {"1": _data_dir("1"), "10": _data_dir("10")}
 REL_TOL = 1e-6
 DEVICES = ["cpu", "gpu", "auto"]
 
@@ -140,6 +149,19 @@ def test_query_matches_duckdb(sf, q, device, duck, tmp_path):
     want = reference(duck, sf, q)
     got = run_mxframe(sf, q, device, tmp_path)
     assert_matches_duckdb(got, want, ref.REFERENCE[q][1])
+
+
+@pytest.mark.parametrize("sf", _sf_params())
+def test_float32_decimals_are_the_nearest_float32(sf):
+    """Data check: a decimal stored as the float32 one ulp BELOW its value (0.049999997 for
+    0.05) makes `l_discount >= 0.05` drop rows, and TPC-H Q6 comes out 28% low.  Regenerate
+    with scripts/gen_tpch_parquet.py if this fails."""
+    import numpy as np
+    import pyarrow.parquet as pq
+    d = pq.read_table(SF_DIRS[sf] / "lineitem.parquet", columns=["l_discount"]).column(0).to_numpy()
+    u = np.unique(d)
+    nearest = np.round(u.astype(np.float64), 2).astype(np.float32)
+    assert (u == nearest).all(), f"not the nearest float32: {u[u != nearest]}"
 
 
 # --- the comparison itself must be strict, or the gate means nothing -----------------------

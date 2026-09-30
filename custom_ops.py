@@ -507,7 +507,7 @@ class CustomOpsCompiler(GraphCompiler):
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
         if expr.op in ("case_when", "isin", "startswith", "contains", "not", "year",
-                       "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
+                       "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
                        "window"):
             return True
         from .lazy_expr import Expr as _Expr
@@ -589,6 +589,11 @@ class CustomOpsCompiler(GraphCompiler):
                 mask = self._aot_gpu.utf8_contains_mask(col_arr, args[1])
                 return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.match_substring(col_arr, pattern=args[1])
+        if op == "year_days":
+            col_arr = self._eval_expr_arrow(args[0], table)
+            if pa.types.is_integer(col_arr.type):
+                col_arr = pc.cast(col_arr, pa.int32()).cast(pa.date32())
+            return pc.cast(pc.year(col_arr), pa.int32())
         if op == "year":
             col_arr = self._eval_expr_arrow(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):

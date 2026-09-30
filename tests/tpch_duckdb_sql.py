@@ -40,12 +40,14 @@ def connect(data_dir):
 
 
 def run(con, q: int) -> pa.Table:
-    """Run reference query ``q``; DECIMAL/HUGEINT results come back as float64/int64."""
+    """Run reference query ``q``; DECIMAL results come back as float64, DATE as int32 day numbers."""
     sql, _ = REFERENCE[q]
     t = con.execute(sql).to_arrow_table()
     for i, typ in enumerate(t.schema.types):
         if pa.types.is_decimal(typ):
             t = t.set_column(i, t.schema.field(i).name, t.column(i).cast(pa.float64()))
+        elif pa.types.is_date(typ):         # back to the day numbers the Parquet files use
+            t = t.set_column(i, t.schema.field(i).name, t.column(i).cast(pa.int32()))
     return t
 
 
@@ -159,8 +161,7 @@ REFERENCE = {
         WHERE o_orderkey = l_orderkey AND l_shipmode IN ('MAIL', 'SHIP')
           AND l_commitdate < l_receiptdate AND l_shipdate < l_commitdate
           AND l_receiptdate >= DATE '1994-01-01' AND l_receiptdate < DATE '1995-01-01'
-        GROUP BY l_shipmode ORDER BY l_shipmode""",
-        dict(int_cols=["high_line_count", "low_line_count"])),
+        GROUP BY l_shipmode ORDER BY l_shipmode""", {}),
     13: ("""
         SELECT c_count, count(*) AS custdist FROM (
           SELECT c_custkey, count(o_orderkey) AS c_count

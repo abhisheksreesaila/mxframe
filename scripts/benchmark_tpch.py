@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import os
 import platform
 import sys
@@ -63,6 +64,24 @@ def _bench_aot_gpu():
 # ---------------------------------------------------------------
 #  Constants (dates encoded as int32: days since 1970-01-01)
 # ---------------------------------------------------------------
+def _D(year: int, month: int, day: int) -> int:
+    """Day number (days since 1970-01-01) of a calendar date: how every date column is stored."""
+    return (datetime.date(year, month, day) - datetime.date(1970, 1, 1)).days
+
+
+def _plain(tbl: pa.Table) -> pa.Table:
+    """``tbl`` with dictionary-encoded columns decoded (for pyarrow.compute string kernels)."""
+    for i, typ in enumerate(tbl.schema.types):
+        if pa.types.is_dictionary(typ):
+            tbl = tbl.set_column(i, tbl.schema.field(i).name, tbl.column(i).cast(typ.value_type))
+    return tbl
+
+
+def _year_of_days(days) -> np.ndarray:
+    """Calendar year of day numbers (NumPy)."""
+    return np.asarray(days, dtype="int64").astype("datetime64[D]").astype("datetime64[Y]").astype("int64") + 1970
+
+
 CUTOFF_Q1       = 10471   # 1998-09-02
 Q6_DATE_LO      = 8766    # 1994-01-01
 Q6_DATE_HI      = 9131    # 1995-01-01 (exclusive)
@@ -72,8 +91,8 @@ Q6_QTY_HI       = 24.0
 DATE_1995_03_15  = 9204   # 1995-03-15
 
 # Q12 receipt date range
-Q12_DATE_LO     = 8761    # 1994-01-01
-Q12_DATE_HI     = 9126    # 1995-01-01
+Q12_DATE_LO     = _D(1994, 1, 1)   # was 8761 (1993-12-27): DuckDB found the 5-day error
+Q12_DATE_HI     = _D(1995, 1, 1)   # was 9126
 # Q14 shipdate range
 Q14_DATE_LO     = 9374    # 1995-09-01
 Q14_DATE_HI     = 9404    # 1995-10-01
@@ -695,6 +714,7 @@ def run_sld_distinct_polars(tbl: pa.Table):
 #  customer(15K) ⋈ orders(100K) ⋈ lineitem(400K) ⋈ nation(25)
 #  groupby nation → sum revenue, sort DESC
 # ---------------------------------------------------------------
+REGION_KEY_ASIA = 2      # TPC-H region keys: AFRICA 0, AMERICA 1, ASIA 2, EUROPE 3, MIDDLE EAST 4
 NATIONS = ["ALGERIA","ARGENTINA","BRAZIL","CANADA","EGYPT",
            "ETHIOPIA","FRANCE","GERMANY","INDIA","INDONESIA",
            "IRAN","IRAQ","JAPAN","JORDAN","KENYA",
@@ -718,7 +738,7 @@ def make_tpch_q5_tables(n_customers=15_000, n_orders=100_000, n_lineitem=400_000
         "o_orderkey":  pa.array(np.arange(1, n_orders + 1, dtype=np.int32)),
         "o_custkey":   pa.array(rng.integers(1, n_customers + 1, size=n_orders, dtype=np.int32)),
         "o_orderdate": pa.array(
-            rng.integers(19930101, 19960101, size=n_orders, dtype=np.int32)
+            rng.integers(_D(1993, 1, 1), _D(1996, 1, 1), size=n_orders, dtype=np.int32)
         ),
     })
     lineitem = pa.table({
@@ -729,19 +749,29 @@ def make_tpch_q5_tables(n_customers=15_000, n_orders=100_000, n_lineitem=400_000
     return nation, customer, orders, lineitem
 
 
-def run_q5_mxframe(nation, customer, orders, lineitem, device="cpu") -> pa.Table:
-    # Filter orders: 1994
+def run_q5_mxframe(nation, customer, orders, lineitem, device="cpu", *, supplier=None) -> pa.Table:
+    """Q5: Local Supplier Volume (ASIA, orders of 1994).
+
+    TPC-H requires the customer and the supplier to be in the same nation, so the
+    supplier table is needed (``supplier=`` keyword; the older four-table form could not
+    express that condition and returned a different answer)."""
+    if supplier is None:
+        raise TypeError("run_q5_mxframe needs supplier=<supplier table>: TPC-H Q5 requires "
+                        "c_nationkey = s_nationkey")
     return (
         LazyFrame(Scan(lineitem))
         .join(
             LazyFrame(Scan(orders)).filter(
-                (col("o_orderdate") >= lit(19940101)) &
-                (col("o_orderdate") <  lit(19950101))
+                (col("o_orderdate") >= lit(_D(1994, 1, 1))) &
+                (col("o_orderdate") <  lit(_D(1995, 1, 1)))
             ),
             left_on="l_orderkey", right_on="o_orderkey",
         )
         .join(LazyFrame(Scan(customer)), left_on="o_custkey", right_on="c_custkey")
-        .join(LazyFrame(Scan(nation)),   left_on="c_nationkey", right_on="n_nationkey")
+        .join(LazyFrame(Scan(supplier)),
+              left_on=["l_suppkey", "c_nationkey"], right_on=["s_suppkey", "s_nationkey"])
+        .join(LazyFrame(Scan(nation)).filter(col("n_regionkey") == lit(REGION_KEY_ASIA)),
+              left_on="c_nationkey", right_on="n_nationkey")
         .groupby("n_name")
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount")))
@@ -757,7 +787,7 @@ def run_q5_pandas(nation, customer, orders, lineitem) -> pd.DataFrame:
     o  = orders.to_pandas()
     c  = customer.to_pandas()
     n  = nation.to_pandas()
-    o  = o[(o.o_orderdate >= 19940101) & (o.o_orderdate < 19950101)]
+    o  = o[(o.o_orderdate >= _D(1994, 1, 1)) & (o.o_orderdate < _D(1995, 1, 1))]
     merged = li.merge(o, left_on="l_orderkey", right_on="o_orderkey")
     merged = merged.merge(c, left_on="o_custkey", right_on="c_custkey")
     merged = merged.merge(n, left_on="c_nationkey", right_on="n_nationkey")
@@ -771,7 +801,7 @@ def run_q5_polars(nation, customer, orders, lineitem):
         return None
     li = pl.from_arrow(lineitem)
     o  = pl.from_arrow(orders).filter(
-        (pl.col("o_orderdate") >= 19940101) & (pl.col("o_orderdate") < 19950101)
+        (pl.col("o_orderdate") >= _D(1994, 1, 1)) & (pl.col("o_orderdate") < _D(1995, 1, 1))
     )
     c  = pl.from_arrow(customer)
     n  = pl.from_arrow(nation)
@@ -810,7 +840,7 @@ def make_tpch_q10_tables(n_customers=15_000, n_orders=150_000, n_lineitem=600_00
         "o_orderkey":  pa.array(np.arange(1, n_orders + 1, dtype=np.int32)),
         "o_custkey":   pa.array(rng.integers(1, n_customers + 1, n_orders, dtype=np.int32)),
         "o_orderdate": pa.array(
-            rng.integers(19930101, 19960101, n_orders, dtype=np.int32)
+            rng.integers(_D(1993, 1, 1), _D(1996, 1, 1), n_orders, dtype=np.int32)
         ),
     })
     rf = np.where(rng.random(n_lineitem) < 0.20, "R", "N")
@@ -829,8 +859,8 @@ def run_q10_mxframe(nation, customer, orders, lineitem, device="cpu") -> pa.Tabl
         .filter(col("l_returnflag") == lit("R"))
         .join(
             LazyFrame(Scan(orders)).filter(
-                (col("o_orderdate") >= lit(19931001)) &
-                (col("o_orderdate") <  lit(19940101))
+                (col("o_orderdate") >= lit(_D(1993, 10, 1))) &
+                (col("o_orderdate") <  lit(_D(1994, 1, 1)))
             ),
             left_on="l_orderkey", right_on="o_orderkey",
         )
@@ -853,7 +883,7 @@ def run_q10_pandas(nation, customer, orders, lineitem) -> pd.DataFrame:
     c  = customer.to_pandas()
     n  = nation.to_pandas()
     li = li[li.l_returnflag == "R"]
-    o  = o[(o.o_orderdate >= 19931001) & (o.o_orderdate < 19940101)]
+    o  = o[(o.o_orderdate >= _D(1993, 10, 1)) & (o.o_orderdate < _D(1994, 1, 1))]
     m = li.merge(o, left_on="l_orderkey", right_on="o_orderkey")
     m = m.merge(c, left_on="o_custkey", right_on="c_custkey")
     m = m.merge(n, left_on="c_nationkey", right_on="n_nationkey")
@@ -867,7 +897,7 @@ def run_q10_polars(nation, customer, orders, lineitem):
         return None
     li = pl.from_arrow(lineitem).filter(pl.col("l_returnflag") == "R")
     o  = pl.from_arrow(orders).filter(
-        (pl.col("o_orderdate") >= 19931001) & (pl.col("o_orderdate") < 19940101)
+        (pl.col("o_orderdate") >= _D(1993, 10, 1)) & (pl.col("o_orderdate") < _D(1994, 1, 1))
     )
     c = pl.from_arrow(customer)
     n = pl.from_arrow(nation)
@@ -891,8 +921,8 @@ def run_q10_polars(nation, customer, orders, lineitem):
 #  filter shipdate 1995-1996, group by supp_nation,cust_nation,year
 # ---------------------------------------------------------------
 # Q7 date range: shipdate as YYYYMMDD integers
-Q7_DATE_LO = 19950101
-Q7_DATE_HI  = 19961231
+Q7_DATE_LO = _D(1995, 1, 1)
+Q7_DATE_HI  = _D(1996, 12, 31)
 
 
 def make_tpch_q7_tables(n_sup=2_000, n_cust=10_000, n_orders=80_000, n_li=200_000, seed=77):
@@ -915,8 +945,8 @@ def make_tpch_q7_tables(n_sup=2_000, n_cust=10_000, n_orders=80_000, n_li=200_00
         "o_custkey":  pa.array(rng.integers(1, n_cust + 1, n_orders, dtype=np.int32)),
     })
     # ~70% of shipdates in range, 30% outside for realism
-    in_range = rng.integers(19950101, 19970101, n_li, dtype=np.int32)
-    out_range = rng.integers(19900101, 19950101, n_li, dtype=np.int32)
+    in_range = rng.integers(_D(1995, 1, 1), _D(1997, 1, 1), n_li, dtype=np.int32)
+    out_range = rng.integers(_D(1990, 1, 1), _D(1995, 1, 1), n_li, dtype=np.int32)
     mask_in = rng.random(n_li) < 0.7
     shipdates = np.where(mask_in, in_range, out_range).astype(np.int32)
     lineitem = pa.table({
@@ -931,29 +961,19 @@ def make_tpch_q7_tables(n_sup=2_000, n_cust=10_000, n_orders=80_000, n_li=200_00
 
 # Module-level cache: pre-join small nation tables so join-result cache hits
 # consistently across hot-benchmark calls (stable id() across repeated calls).
-_Q7_PREJOINED: dict = {}
+def _nation_side(tbl, key_col, nation, names, out_name):
+    """``tbl`` restricted to rows whose nation is in ``names``, with the nation's name as ``out_name``."""
+    nat = _plain(nation)
+    nat = nat.filter(pc.is_in(nat.column("n_name"), value_set=pa.array(names)))
+    nat = nat.select(["n_nationkey", "n_name"]).rename_columns(["n_nationkey", out_name])
+    return _plain(tbl).join(nat, keys=key_col, right_keys="n_nationkey", join_type="inner")
 
 
 def run_q7_mxframe(nation, supplier, customer, orders, lineitem, device="cpu") -> pa.Table:
-    # Pre-join nation into supplier/customer once per unique table combination.
-    # This keeps sup_nat and cust_nat as stable Python objects across hot runs --
-    # fixing the join-cache miss that caused 20-40x variance on hot run 2.
-    key7 = (id(nation), id(supplier), id(customer))
-    if key7 not in _Q7_PREJOINED:
-        n_map = dict(zip(
-            nation.column("n_nationkey").to_pylist(),
-            nation.column("n_name").to_pylist(),
-        ))
-        sup_nat  = supplier.append_column(
-            "supp_nation", pa.array([n_map[k] for k in supplier.column("s_nationkey").to_pylist()])
-        )
-        cust_nat = customer.append_column(
-            "cust_nation", pa.array([n_map[k] for k in customer.column("c_nationkey").to_pylist()])
-        )
-        _Q7_PREJOINED[key7] = (sup_nat, cust_nat)
-    sup_nat, cust_nat = _Q7_PREJOINED[key7]
-
-    # 4-join chain (was 6 -- two nation micro-joins eliminated by pre-join above)
+    """Q7: Volume Shipping between FRANCE and GERMANY, shipments of 1995-1996."""
+    pair = ["FRANCE", "GERMANY"]
+    sup_nat = _nation_side(supplier.select(["s_suppkey", "s_nationkey"]), "s_nationkey", nation, pair, "supp_nation")
+    cust_nat = _nation_side(customer.select(["c_custkey", "c_nationkey"]), "c_nationkey", nation, pair, "cust_nation")
     return (
         LazyFrame(Scan(lineitem))
         .filter(
@@ -963,14 +983,19 @@ def run_q7_mxframe(nation, supplier, customer, orders, lineitem, device="cpu") -
         .join(LazyFrame(Scan(orders)),   left_on="l_orderkey", right_on="o_orderkey")
         .join(LazyFrame(Scan(cust_nat)), left_on="o_custkey",  right_on="c_custkey")
         .join(LazyFrame(Scan(sup_nat)),  left_on="l_suppkey",  right_on="s_suppkey")
-        .groupby("supp_nation", "cust_nation", col("l_shipdate").year().alias("l_year"))
+        .filter(
+            ((col("supp_nation") == lit("FRANCE")) & (col("cust_nation") == lit("GERMANY"))) |
+            ((col("supp_nation") == lit("GERMANY")) & (col("cust_nation") == lit("FRANCE")))
+        )
+        .groupby("supp_nation", "cust_nation", col("l_shipdate").year_of_days().alias("l_year"))
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount")))
             .sum().alias("revenue")
         )
-        .sort(col("supp_nation"))
+        .sort(col("supp_nation"), col("cust_nation"), col("l_year"))
         .compute(device=device)
     )
+
 
 def run_q7_pandas(nation, supplier, customer, orders, lineitem) -> pd.DataFrame:
     li = lineitem.to_pandas()
@@ -986,7 +1011,7 @@ def run_q7_pandas(nation, supplier, customer, orders, lineitem) -> pd.DataFrame:
     m  = m.merge(s, left_on="l_suppkey", right_on="s_suppkey")
     m  = m.merge(n.rename(columns={"n_nationkey":"s_nk","n_name":"supp_nation"}),
                  left_on="s_nationkey", right_on="s_nk")
-    m["l_year"] = m["l_shipdate"] // 10000
+    m["l_year"] = _year_of_days(m["l_shipdate"])
     m["volume"] = m.l_extendedprice * (1 - m.l_discount)
     return (m.groupby(["supp_nation","cust_nation","l_year"], as_index=False)["volume"]
              .sum().rename(columns={"volume":"revenue"})
@@ -1012,7 +1037,7 @@ def run_q7_polars(nation, supplier, customer, orders, lineitem):
         .join(n.rename({"n_nationkey":"s_nk","n_name":"supp_nation"}),
               left_on="s_nationkey", right_on="s_nk")
         .with_columns([
-            (pl.col("l_shipdate") // 10000).alias("l_year"),
+            pl.col("l_shipdate").cast(pl.Date).dt.year().alias("l_year"),
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("volume"),
         ])
         .group_by(["supp_nation","cust_nation","l_year"])
@@ -1027,8 +1052,8 @@ def run_q7_polars(nation, supplier, customer, orders, lineitem):
 #  filter region='AMERICA', part type='ECONOMY ANODIZED STEEL'
 #  groupby year, sum(case when nation='BRAZIL' then rev else 0)/sum(rev)
 # ---------------------------------------------------------------
-Q8_DATE_LO = 19950101
-Q8_DATE_HI  = 19961231
+Q8_DATE_LO = _D(1995, 1, 1)
+Q8_DATE_HI  = _D(1996, 12, 31)
 REGIONS = ["AFRICA", "AMERICA", "ASIA", "EUROPE", "MIDDLE EAST"]
 PART_TYPES = ["ECONOMY ANODIZED STEEL", "STANDARD POLISHED BRASS",
               "PROMO BRUSHED COPPER", "LARGE BURNISHED TIN", "SMALL PLATED STEEL"]
@@ -1063,7 +1088,7 @@ def make_tpch_q8_tables(n_parts=5_000, n_cust=10_000, n_orders=80_000, n_li=200_
         "o_orderdate": pa.array(rng.integers(Q8_DATE_LO, Q8_DATE_HI + 1, n_orders, dtype=np.int32)),
     })
     in_range = rng.integers(Q8_DATE_LO, Q8_DATE_HI + 1, n_li, dtype=np.int32)
-    out_range = rng.integers(19900101, Q8_DATE_LO, n_li, dtype=np.int32)
+    out_range = rng.integers(_D(1990, 1, 1), Q8_DATE_LO, n_li, dtype=np.int32)
     shipdates = np.where(rng.random(n_li) < 0.7, in_range, out_range).astype(np.int32)
     lineitem = pa.table({
         "l_orderkey":      pa.array(rng.integers(1, n_orders + 1, n_li, dtype=np.int32)),
@@ -1076,31 +1101,30 @@ def make_tpch_q8_tables(n_parts=5_000, n_cust=10_000, n_orders=80_000, n_li=200_
 
 
 # Module-level cache: keep cust_am stable across hot-benchmark calls.
-_Q8_PREJOINED: dict = {}
+def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu", *, supplier=None) -> pa.Table:
+    """Q8: National Market Share (BRAZIL in AMERICA, ECONOMY ANODIZED STEEL, orders of 1995-1996).
 
+    The share is of the *supplier's* nation, so the supplier table is needed (``supplier=``
+    keyword); the earlier form used the customer's nation, which is a different query."""
+    if supplier is None:
+        raise TypeError("run_q8_mxframe needs supplier=<supplier table>: TPC-H Q8 measures the "
+                        "share of BRAZIL as the supplier's nation")
+    nation, region = _plain(nation), _plain(region)
+    america = region.filter(pc.equal(region.column("r_name"), "AMERICA")).column("r_regionkey")
+    american_nkeys = nation.filter(pc.is_in(nation.column("n_regionkey"), value_set=america.combine_chunks())
+                                   ).column("n_nationkey")
+    cust_am = customer.filter(
+        pc.is_in(customer.column("c_nationkey"), value_set=american_nkeys.combine_chunks())
+    ).select(["c_custkey"])
+    brazil_nk = nation.filter(pc.equal(nation.column("n_name"), "BRAZIL")).column("n_nationkey")[0].as_py()
+    sup_nk = supplier.select(["s_suppkey", "s_nationkey"])
 
-def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu") -> pa.Table:
-    # Pre-compute American customer subset once per unique table combination.
-    # Stable Python object -> join-result cache works across hot runs.
-    key8 = (id(nation), id(customer))
-    if key8 not in _Q8_PREJOINED:
-        american_nkeys = nation.filter(
-            pc.equal(nation.column("n_regionkey"), pa.scalar(1, pa.int32()))
-        ).column("n_nationkey").to_pylist()
-        cust_am = customer.filter(
-            pc.is_in(customer.column("c_nationkey"),
-                     value_set=pa.array(american_nkeys, type=pa.int32()))
-        ).select(["c_custkey", "c_nationkey"])
-        _Q8_PREJOINED[key8] = cust_am
-    cust_am = _Q8_PREJOINED[key8]
-
-    brazil_nk = 2  # BRAZIL nationkey
+    volume_expr = (col("l_extendedprice") * (lit(1.0) - col("l_discount"))).alias("volume")
     brazil_vol_expr = when(
-        col("c_nationkey") == lit(brazil_nk),
+        col("s_nationkey") == lit(brazil_nk),
         col("l_extendedprice") * (lit(1.0) - col("l_discount")),
         lit(0.0),
     ).alias("brazil_vol")
-    volume_expr = (col("l_extendedprice") * (lit(1.0) - col("l_discount"))).alias("volume")
 
     result = (
         LazyFrame(Scan(lineitem))
@@ -1108,10 +1132,15 @@ def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu
             LazyFrame(Scan(part)).filter(col("p_type") == lit("ECONOMY ANODIZED STEEL")),
             left_on="l_partkey", right_on="p_partkey",
         )
-        .join(LazyFrame(Scan(orders)),  left_on="l_orderkey", right_on="o_orderkey")
-        .join(LazyFrame(Scan(cust_am)), left_on="o_custkey",  right_on="c_custkey")
+        .join(
+            LazyFrame(Scan(orders)).filter(
+                (col("o_orderdate") >= lit(Q8_DATE_LO)) & (col("o_orderdate") <= lit(Q8_DATE_HI))),
+            left_on="l_orderkey", right_on="o_orderkey",
+        )
+        .join(LazyFrame(Scan(cust_am)), left_on="o_custkey", right_on="c_custkey")
+        .join(LazyFrame(Scan(sup_nk)),  left_on="l_suppkey", right_on="s_suppkey")
         .with_columns(volume_expr, brazil_vol_expr)
-        .groupby(col("o_orderdate").year().alias("o_year"))
+        .groupby(col("o_orderdate").year_of_days().alias("o_year"))
         .agg(
             col("volume").sum().alias("total_vol"),
             col("brazil_vol").sum().alias("brazil_vol_sum"),
@@ -1119,11 +1148,12 @@ def run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu
         .sort(col("o_year"))
         .compute(device=device)
     )
-    # Final market_share ratio (2-row result -- negligible cost)
-    tv = result.column("total_vol").to_pylist()
-    bv = result.column("brazil_vol_sum").to_pylist()
-    ms = [b / t if t else 0.0 for b, t in zip(bv, tv)]
-    return result.append_column("mkt_share", pa.array(ms, type=pa.float32()))
+    # Final market_share ratio (a 2-row result)
+    tv = result.column("total_vol").to_numpy(zero_copy_only=False)
+    bv = result.column("brazil_vol_sum").to_numpy(zero_copy_only=False)
+    ms = np.divide(bv, tv, out=np.zeros(len(tv)), where=tv != 0)
+    return result.append_column("mkt_share", pa.array(ms, type=pa.float64()))
+
 
 def run_q8_pandas(nation, region, part, customer, orders, lineitem) -> pd.DataFrame:
     n  = nation.to_pandas()
@@ -1137,7 +1167,7 @@ def run_q8_pandas(nation, region, part, customer, orders, lineitem) -> pd.DataFr
     m = li.merge(pt_f, left_on="l_partkey", right_on="p_partkey")
     m = m.merge(o, left_on="l_orderkey", right_on="o_orderkey")
     m = m.merge(c_am, left_on="o_custkey", right_on="c_custkey")
-    m["o_year"] = m.o_orderdate // 10000
+    m["o_year"] = _year_of_days(m.o_orderdate)
     m["volume"] = m.l_extendedprice * (1 - m.l_discount)
     m["brazil_vol"] = m.volume.where(m.c_nationkey == 2, 0.0)
     r = m.groupby("o_year")[["volume","brazil_vol"]].sum().reset_index()
@@ -1161,7 +1191,7 @@ def run_q8_polars(nation, region, part, customer, orders, lineitem):
         .join(o, left_on="l_orderkey", right_on="o_orderkey")
         .join(c_am, left_on="o_custkey", right_on="c_custkey")
         .with_columns([
-            (pl.col("o_orderdate") // 10000).alias("o_year"),
+            pl.col("o_orderdate").cast(pl.Date).dt.year().alias("o_year"),
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("volume"),
         ])
         .with_columns(
@@ -1389,8 +1419,8 @@ def run_q19_polars(part, lineitem):
 # ============================================================
 #  Q4 — Order Priority Checking  (EXISTS semi-join + count)
 # ============================================================
-Q4_DATE_LO = 19930701
-Q4_DATE_HI = 19931001
+Q4_DATE_LO = _D(1993, 7, 1)
+Q4_DATE_HI = _D(1993, 10, 1)
 Q4_PRIORITIES = ["1-URGENT", "2-HIGH", "3-MEDIUM", "4-NOT SPECIFIED", "5-LOW"]
 
 
@@ -1398,13 +1428,13 @@ def make_tpch_q4_tables(n_orders=150_000, n_lineitem=600_000, seed=4):
     rng = np.random.default_rng(seed)
     orders = pa.table({
         "o_orderkey":      pa.array(np.arange(n_orders, dtype=np.int32)),
-        "o_orderdate":     pa.array(rng.integers(19930101, 19940101, n_orders, dtype=np.int32)),
+        "o_orderdate":     pa.array(rng.integers(_D(1993, 1, 1), _D(1994, 1, 1), n_orders, dtype=np.int32)),
         "o_orderpriority": pa.array([Q4_PRIORITIES[i % 5] for i in range(n_orders)]),
     })
     # ~70% of lineitems have l_commitdate < l_receiptdate (EXISTS condition)
-    l_commit  = rng.integers(19920101, 19940101, n_lineitem, dtype=np.int32)
+    l_commit  = rng.integers(_D(1992, 1, 1), _D(1994, 1, 1), n_lineitem, dtype=np.int32)
     offset    = rng.integers(-10, 20, n_lineitem)  # positive = late receipt (EXISTS true)
-    l_receipt = (l_commit + offset).clip(19920101, 19950101).astype(np.int32)
+    l_receipt = (l_commit + offset).clip(_D(1992, 1, 1), _D(1995, 1, 1)).astype(np.int32)
     lineitem = pa.table({
         "l_orderkey":    pa.array(rng.integers(0, n_orders, n_lineitem, dtype=np.int32)),
         "l_commitdate":  pa.array(l_commit),
@@ -1530,7 +1560,7 @@ def make_tpch_q9_tables(n_parts=5_000, n_suppliers=2_000, n_orders=80_000,
     })
     orders = pa.table({
         "o_orderkey":  pa.array(np.arange(n_orders, dtype=np.int32)),
-        "o_orderdate": pa.array(rng.integers(19900101, 20000101, n_orders, dtype=np.int32)),
+        "o_orderdate": pa.array(rng.integers(_D(1990, 1, 1), _D(2000, 1, 1), n_orders, dtype=np.int32)),
     })
     # Lineitem: each row references a valid (partkey, suppkey) pair from partsupp
     ps_idx = rng.integers(0, len(ps_base_partkey), n_lineitem)
@@ -1560,7 +1590,7 @@ def run_q9_mxframe(nation, supplier, partsupp, part, orders, lineitem, device="c
         .join(LazyFrame(Scan(supplier)), left_on="l_suppkey",   right_on="s_suppkey")
         .join(LazyFrame(Scan(nation)),   left_on="s_nationkey", right_on="n_nationkey")
         .join(LazyFrame(Scan(orders)),   left_on="l_orderkey",  right_on="o_orderkey")
-        .groupby("n_name", col("o_orderdate").year().alias("o_year"))
+        .groupby("n_name", col("o_orderdate").year_of_days().alias("o_year"))
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount"))
              - col("ps_supplycost") * col("l_quantity"))
@@ -1584,7 +1614,7 @@ def run_q9_pandas(nation, supplier, partsupp, part, orders, lineitem) -> pd.Data
            .merge(s,   left_on="l_suppkey",   right_on="s_suppkey")
            .merge(n,   left_on="s_nationkey", right_on="n_nationkey")
            .merge(o,   left_on="l_orderkey",  right_on="o_orderkey"))
-    m["o_year"] = m["o_orderdate"] // 10000
+    m["o_year"] = _year_of_days(m["o_orderdate"])
     m["profit"] = m.l_extendedprice * (1 - m.l_discount) - m.ps_supplycost * m.l_quantity
     return (m.groupby(["n_name","o_year"])["profit"].sum()
              .reset_index(name="sum_profit").sort_values("n_name").reset_index(drop=True))
@@ -1606,7 +1636,7 @@ def run_q9_polars(nation, supplier, partsupp, part, orders, lineitem):
           .join(n,  left_on="s_nationkey", right_on="n_nationkey")
           .join(o,  left_on="l_orderkey",  right_on="o_orderkey")
           .with_columns([
-              (pl.col("o_orderdate") // 10000).alias("o_year"),
+              pl.col("o_orderdate").cast(pl.Date).dt.year().alias("o_year"),
               (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))
                - pl.col("ps_supplycost") * pl.col("l_quantity")).alias("profit"),
           ])
@@ -1730,7 +1760,7 @@ def make_tpch_q18_tables(n_customer=15_000, n_orders=60_000, n_lineitem=300_000,
     orders = pa.table({
         "o_orderkey":   pa.array(np.arange(n_orders, dtype=np.int32)),
         "o_custkey":    pa.array(rng.integers(0, n_customer, n_orders, dtype=np.int32)),
-        "o_orderdate":  pa.array(rng.integers(19900101, 19990101, n_orders, dtype=np.int32)),
+        "o_orderdate":  pa.array(rng.integers(_D(1990, 1, 1), _D(1999, 1, 1), n_orders, dtype=np.int32)),
         "o_totalprice": pa.array(rng.uniform(100.0, 50000.0, n_orders).astype(np.float32)),
     })
     # Qty designed so ~2% of orders exceed threshold
@@ -2101,72 +2131,49 @@ def make_tpch_q2_tables(n_parts=10_000, n_suppliers=2_000, seed=2):
     return nation, region, part, supplier, partsupp
 
 
-_Q2_PRECOMP: dict = {}
-
-
 def run_q2_mxframe(nation, region, part, supplier, partsupp, device="cpu") -> pa.Table:
-    """Q2: Minimum Cost Supplier.
-    Two-pass approach:
-    1. Find European (region=EUROPE) suppliers for each BRASS/size=15 part.
-    2. Find minimum supplycost per part across all European suppliers.
-    3. Join back to keep only rows at the minimum cost, sort, limit 100.
-    All heavy joins/aggregates use Mojo kernels; small PyArrow ops for pre-filtering.
+    """Q2: Minimum Cost Supplier (TPC-H text: EUROPE, size 15, type like '%BRASS').
+
+    1. Candidate (part, supplier) pairs for European suppliers and BRASS parts (small Arrow joins).
+    2. Minimum supply cost per part over those suppliers (engine group_min).
+    3. Keep the rows at the minimum; order by s_acctbal desc, n_name, s_name, p_partkey; top 100.
     """
-    cache_key = (id(nation), id(supplier), id(partsupp))
-    if cache_key not in _Q2_PRECOMP:
-        # Get European nation keys (tiny PyArrow)
-        eu_nkeys = nation.filter(
-            pc.equal(nation.column("n_regionkey"), pa.scalar(Q2_REGION_KEY, pa.int32()))
-        ).column("n_nationkey").to_pylist()
-        # European suppliers (small table)
-        eu_sup = supplier.filter(
-            pc.is_in(supplier.column("s_nationkey"),
-                     value_set=pa.array(eu_nkeys, type=pa.int32()))
-        )
-        _Q2_PRECOMP[cache_key] = eu_sup
-    eu_sup = _Q2_PRECOMP[cache_key]
+    nation, part, supplier = _plain(nation), _plain(part), _plain(supplier)
+    eu_nations = nation.filter(
+        pc.equal(nation.column("n_regionkey"), pa.scalar(Q2_REGION_KEY, pa.int32()))
+    ).select(["n_nationkey", "n_name"])
+    eu_sup = supplier.join(eu_nations, keys="s_nationkey", right_keys="n_nationkey", join_type="inner").select(
+        ["s_suppkey", "s_name", "s_acctbal", "s_address", "s_phone", "s_comment", "n_name"])
+    target_parts = part.filter(pc.and_(
+        pc.equal(part.column("p_size"), pa.scalar(Q2_SIZE, pa.int32())),
+        pc.ends_with(part.column("p_type"), Q2_TYPE_SUFFIX),
+    )).select(["p_partkey", "p_mfgr"])
 
-    # Step 1: filter target parts (size=15, type ends with BRASS) — tiny PyArrow op
-    target_parts = part.filter(
-        pc.and_(
-            pc.equal(part.column("p_size"), pa.scalar(Q2_SIZE, pa.int32())),
-            pc.match_substring(part.column("p_type"), pattern=Q2_TYPE_SUFFIX)
-        )
-    )
+    candidate = (partsupp.select(["ps_partkey", "ps_suppkey", "ps_supplycost"])
+                 .join(eu_sup, keys="ps_suppkey", right_keys="s_suppkey", join_type="inner")
+                 .join(target_parts, keys="ps_partkey", right_keys="p_partkey", join_type="inner"))
+    if candidate.num_rows == 0:
+        return pa.table({"s_acctbal": pa.array([], pa.float32()), "s_name": pa.array([], pa.string()),
+                         "n_name": pa.array([], pa.string()), "p_partkey": pa.array([], pa.int64()),
+                         "p_mfgr": pa.array([], pa.string()), "s_address": pa.array([], pa.string()),
+                         "s_phone": pa.array([], pa.string()), "s_comment": pa.array([], pa.string())})
 
-    # Step 2: pre-materialize the narrow candidate table in PyArrow (avoid 3-level join JIT)
-    # eu_sup and target_parts are both small; the join reduces partsupp to a small table.
-    eu_sup_pd  = eu_sup.to_pandas()
-    tgt_pd     = target_parts.to_pandas()
-    ps_pd      = partsupp.to_pandas()
-    candidate  = (ps_pd.merge(eu_sup_pd[["s_suppkey","s_name","s_acctbal","s_address","s_phone","s_comment"]],
-                               left_on="ps_suppkey", right_on="s_suppkey")
-                       .merge(tgt_pd[["p_partkey","p_mfgr"]],
-                               left_on="ps_partkey", right_on="p_partkey"))
-    if len(candidate) == 0:
-        return pa.table({c: pa.array([], pa.float32() if c == "s_acctbal" else pa.string())
-                         for c in ["s_acctbal","s_name","p_mfgr","s_address","s_phone","s_comment"]}
-                        | {"ps_partkey": pa.array([], pa.int32())})
-    candidate_arrow = pa.Table.from_pandas(candidate, preserve_index=False)
-
-    # Step 3: MXFrame group_min (single-join plan — fast JIT)
     min_costs = (
-        LazyFrame(Scan(candidate_arrow))
+        LazyFrame(Scan(candidate))
         .groupby("ps_partkey")
         .agg(col("ps_supplycost").min().alias("min_supplycost"))
         .compute(device=device)
     )
-
-    # Step 4: join candidate with min_costs, filter, sort, limit (MXFrame)
-    return (
-        LazyFrame(Scan(candidate_arrow))
+    top = (
+        LazyFrame(Scan(candidate))
         .join(LazyFrame(Scan(min_costs)), left_on="ps_partkey", right_on="ps_partkey")
         .filter(col("ps_supplycost") == col("min_supplycost"))
-        .select("s_acctbal", "s_name", "ps_partkey", "p_mfgr", "s_address", "s_phone", "s_comment")
-        .sort(col("s_acctbal"), descending=True)
+        .select("s_acctbal", "s_name", "n_name", "ps_partkey", "p_mfgr", "s_address", "s_phone", "s_comment")
+        .sort("s_acctbal", "n_name", "s_name", "ps_partkey", descending=[True, False, False, False])
         .limit(100)
         .compute(device=device)
     )
+    return top.rename_columns(["p_partkey" if n == "ps_partkey" else n for n in top.column_names])
 
 
 def run_q2_pandas(nation, region, part, supplier, partsupp) -> pd.DataFrame:
@@ -2209,8 +2216,8 @@ def run_q2_polars(nation, region, part, supplier, partsupp):
 # ============================================================
 #  Q15 — Top Supplier  (view / global-agg + argmax join)
 # ============================================================
-Q15_DATE_LO = 19960101
-Q15_DATE_HI = 19960401
+Q15_DATE_LO = _D(1996, 1, 1)
+Q15_DATE_HI = _D(1996, 4, 1)
 
 
 def make_tpch_q15_tables(n_suppliers=2_000, n_lineitem=200_000, seed=15):
@@ -2222,7 +2229,7 @@ def make_tpch_q15_tables(n_suppliers=2_000, n_lineitem=200_000, seed=15):
         "s_phone":   pa.array([f"555-{i:04d}" for i in range(n_suppliers)]),
     })
     in_range = rng.integers(Q15_DATE_LO, Q15_DATE_HI, n_lineitem, dtype=np.int32)
-    out_range = rng.integers(19900101, Q15_DATE_LO, n_lineitem, dtype=np.int32)
+    out_range = rng.integers(_D(1990, 1, 1), Q15_DATE_LO, n_lineitem, dtype=np.int32)
     shipdates = np.where(rng.random(n_lineitem) < 0.5, in_range, out_range).astype(np.int32)
     lineitem = pa.table({
         "l_suppkey":       pa.array(rng.integers(0, n_suppliers, n_lineitem, dtype=np.int32)),
@@ -2305,8 +2312,8 @@ def run_q15_polars(supplier, lineitem):
 Q20_COLOR   = "forest"
 Q20_NATION  = "CANADA"
 Q20_NATION_KEY = 3  # index in NATIONS
-Q20_DATE_LO = 19940101
-Q20_DATE_HI = 19950101
+Q20_DATE_LO = _D(1994, 1, 1)
+Q20_DATE_HI = _D(1995, 1, 1)
 
 
 def make_tpch_q20_tables(n_parts=5_000, n_suppliers=2_000, n_lineitem=100_000, seed=20):
@@ -2335,7 +2342,7 @@ def make_tpch_q20_tables(n_parts=5_000, n_suppliers=2_000, n_lineitem=100_000, s
         "ps_availqty": pa.array(rng.uniform(1.0, 10000.0, n_ps).astype(np.float32)),
     })
     in_range = rng.integers(Q20_DATE_LO, Q20_DATE_HI, n_lineitem, dtype=np.int32)
-    out_range = rng.integers(19900101, Q20_DATE_LO, n_lineitem, dtype=np.int32)
+    out_range = rng.integers(_D(1990, 1, 1), Q20_DATE_LO, n_lineitem, dtype=np.int32)
     shipdates = np.where(rng.random(n_lineitem) < 0.6, in_range, out_range).astype(np.int32)
     lineitem = pa.table({
         "l_partkey":  pa.array(rng.integers(0, n_parts, n_lineitem, dtype=np.int32)),
@@ -2485,9 +2492,9 @@ def make_tpch_q21_tables(n_suppliers=2_000, n_orders=60_000, n_lineitem=200_000,
         "o_orderkey":  pa.array(np.arange(n_orders, dtype=np.int32)),
         "o_orderstatus": pa.array(rng.choice(["F", "O", "P"], n_orders).tolist()),
     })
-    commit = rng.integers(19920101, 19960101, n_lineitem, dtype=np.int32)
+    commit = rng.integers(_D(1992, 1, 1), _D(1996, 1, 1), n_lineitem, dtype=np.int32)
     receipt_offset = rng.integers(-5, 15, n_lineitem)   # positive → late
-    receipt = (commit + receipt_offset).clip(19920101, 19970101).astype(np.int32)
+    receipt = (commit + receipt_offset).clip(_D(1992, 1, 1), _D(1997, 1, 1)).astype(np.int32)
     lineitem = pa.table({
         "l_orderkey":    pa.array(rng.integers(0, n_orders, n_lineitem, dtype=np.int32)),
         "l_suppkey":     pa.array(rng.integers(0, n_suppliers, n_lineitem, dtype=np.int32)),
@@ -3630,7 +3637,7 @@ def run_q5_datafusion(nation, customer, orders, lineitem):
         JOIN orders ON l_orderkey=o_orderkey
         JOIN customer ON o_custkey=c_custkey
         JOIN nation ON c_nationkey=n_nationkey
-        WHERE o_orderdate >= 19940101 AND o_orderdate < 19950101
+        WHERE o_orderdate >= 8766 AND o_orderdate < 9131
         GROUP BY n_name ORDER BY revenue DESC
     """)
 
@@ -3649,13 +3656,13 @@ def run_q7_datafusion(nation, supplier, customer, orders, lineitem):
     ctx = _df(nation=nation, supplier=supplier, customer=customer,
               orders=orders, lineitem=lineitem)
     return _df_collect(ctx, """
-        SELECT n_name, l_shipdate/10000 AS l_year,
+        SELECT n_name, EXTRACT(YEAR FROM CAST(l_shipdate AS DATE)) AS l_year,
           SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
         FROM supplier JOIN lineitem ON s_suppkey=l_suppkey
         JOIN orders ON l_orderkey=o_orderkey
         JOIN customer ON o_custkey=c_custkey
         JOIN nation ON s_nationkey=n_nationkey
-        WHERE l_shipdate >= 19950101 AND l_shipdate <= 19961231
+        WHERE l_shipdate >= 9131 AND l_shipdate <= 9861
         GROUP BY n_name, l_year ORDER BY n_name, l_year
     """)
 
@@ -3664,13 +3671,13 @@ def run_q8_datafusion(nation, region, part, customer, orders, lineitem):
     ctx = _df(nation=nation, region=region, part=part,
               customer=customer, orders=orders, lineitem=lineitem)
     return _df_collect(ctx, """
-        SELECT o_orderdate/10000 AS o_year,
+        SELECT EXTRACT(YEAR FROM CAST(o_orderdate AS DATE)) AS o_year,
           SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))) AS revenue
         FROM part JOIN lineitem ON p_partkey=l_partkey
         JOIN orders ON l_orderkey=o_orderkey
         JOIN customer ON o_custkey=c_custkey
         JOIN nation ON c_nationkey=n_nationkey
-        WHERE o_orderdate >= 19950101 AND o_orderdate <= 19961231
+        WHERE o_orderdate >= 9131 AND o_orderdate <= 9861
         GROUP BY o_year ORDER BY o_year
     """)
 
@@ -3679,7 +3686,7 @@ def run_q9_datafusion(nation, supplier, partsupp, part, orders, lineitem):
     ctx = _df(nation=nation, supplier=supplier, partsupp=partsupp,
               part=part, orders=orders, lineitem=lineitem)
     return _df_collect(ctx, """
-        SELECT n_name, o_orderdate/10000 AS o_year,
+        SELECT n_name, EXTRACT(YEAR FROM CAST(o_orderdate AS DATE)) AS o_year,
           SUM(CAST(l_extendedprice AS DOUBLE)*(1.0-CAST(l_discount AS DOUBLE))
               - CAST(ps_supplycost AS DOUBLE)*CAST(l_quantity AS DOUBLE)) AS sum_profit
         FROM lineitem JOIN part ON l_partkey=p_partkey
@@ -3700,7 +3707,7 @@ def run_q10_datafusion(nation, customer, orders, lineitem):
         FROM customer JOIN orders ON c_custkey=o_custkey
         JOIN lineitem ON l_orderkey=o_orderkey
         JOIN nation ON c_nationkey=n_nationkey
-        WHERE o_orderdate >= 19931001 AND o_orderdate < 19940101
+        WHERE o_orderdate >= 8674 AND o_orderdate < 8766
           AND l_returnflag='R'
         GROUP BY c_custkey, c_name, c_acctbal, n_name
         ORDER BY revenue DESC LIMIT 20
@@ -3850,7 +3857,7 @@ def run_q20_datafusion(nation, part, supplier, partsupp, lineitem):
               AND CAST(ps_availqty AS DOUBLE) > (
                 SELECT 0.5*SUM(CAST(l_quantity AS DOUBLE)) FROM lineitem
                 WHERE l_partkey=ps_partkey AND l_suppkey=ps_suppkey
-                  AND l_shipdate >= 19940101 AND l_shipdate < 19950101
+                  AND l_shipdate >= 8766 AND l_shipdate < 9131
               )
           )
         ORDER BY s_name

@@ -121,6 +121,11 @@ class Expr:
         """Extract the year from an integer YYYYMMDD date column (or Arrow date32)."""
         return Expr("year", self)
 
+    def year_of_days(self) -> 'Expr':
+        """Extract the year from an integer day-number date column (days since 1970-01-01,
+        as TPC-H Parquet dates are stored).  ``year()`` reads YYYYMMDD integers instead."""
+        return Expr("year_days", self)
+
     def sum(self) -> 'Expr':
         return Expr("sum", self)
 
