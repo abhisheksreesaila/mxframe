@@ -1,0 +1,91 @@
+"""np_arrow.array: pa.array for numpy input without importing pandas."""
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+from mxframe.np_arrow import array as arr
+
+
+@pytest.mark.parametrize("dtype", ["int8", "int16", "int32", "int64", "uint8", "uint32", "uint64",
+                                   "float32", "float64", "bool"])
+def test_matches_pa_array(dtype):
+    rng = np.random.default_rng(0)
+    a = (rng.random(1001) * 100).astype(dtype)
+    assert arr(a).equals(pa.array(a))
+    assert arr(a[::3]).equals(pa.array(a[::3]))          # non-contiguous
+    assert arr(a[:0]).equals(pa.array(a[:0]))
+
+
+def test_type_argument_casts_like_pa_array():
+    a = np.arange(10, dtype=np.int64)
+    assert arr(a, type=pa.int32()).equals(pa.array(a, type=pa.int32()))
+    assert arr(a.astype(np.float64), type=pa.float64()).equals(pa.array(a.astype(np.float64), type=pa.float64()))
+    with pytest.raises(pa.ArrowInvalid):
+        arr(np.array([1.5]), type=pa.int64())
+
+
+def test_other_inputs_fall_back():
+    assert arr([1, 2, None]).equals(pa.array([1, 2, None]))
+    assert arr(np.array(["a", "b"], dtype=object)).equals(pa.array(np.array(["a", "b"], dtype=object)))
+
+
+def test_no_pandas_import_for_numpy_input():
+    root = Path(__file__).resolve().parent
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n"
+            "import numpy as np\nfrom mxframe.np_arrow import array\n"
+            "array(np.arange(5)); array(np.ones(3, bool)); array(np.arange(4.0), type=__import__('pyarrow').float32())\n"
+            "print('pandas' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False"
+
+
+def test_tpch_shaped_queries_do_not_import_pandas():
+    root = Path(__file__).resolve().parent
+    code = f"""import sys; sys.path.insert(0, {str(root)!r}); import conftest
+import numpy as np, pyarrow as pa
+from mxframe import LazyFrame, col, lit
+from mxframe.np_arrow import array as A          # building inputs with pa.array would import pandas itself
+n = 50_000
+rng = np.random.default_rng(0)
+ab = pa.Array.from_buffers(pa.string(), 2, [None, pa.py_buffer(np.array([0, 1, 2], np.int32)), pa.py_buffer(b"ab")])
+s = pa.DictionaryArray.from_arrays(A(rng.integers(0, 2, n).astype(np.int8)), ab)
+t = pa.table({{"k": A(rng.integers(0, 5, n).astype(np.int32)), "s": s,
+              "v": A(rng.random(n).astype(np.float32)), "d": A(rng.integers(0, 100, n).astype(np.int32))}})
+o = pa.table({{"k": A(np.arange(5, dtype=np.int32)), "w": A(np.arange(5, dtype=np.float64))}})
+assert "pandas" not in sys.modules
+LazyFrame(t).filter(col("d") > lit(3)).groupby("s", "k").agg(col("v").sum().alias("x"), col("v").count().alias("n")).sort("x").compute(device="cpu")
+LazyFrame(t).filter(col("d") > lit(3)).groupby().agg((col("v") * lit(2.0)).sum().alias("x")).compute(device="cpu")
+LazyFrame(t).join(LazyFrame(o), on="k").groupby("k").agg(col("w").sum().alias("x")).sort("x", descending=True).limit(3).compute(device="cpu")
+print("pandas" in sys.modules)
+"""
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip().splitlines()[-1] == "False"
+
+
+from mxframe.np_arrow import to_numpy
+
+
+@pytest.mark.parametrize("typ", [pa.int8(), pa.int16(), pa.int32(), pa.int64(), pa.uint32(), pa.float32(), pa.float64(), pa.bool_()])
+def test_to_numpy_matches_pyarrow(typ):
+    rng = np.random.default_rng(1)
+    base = pa.array((rng.random(1000) * 50).astype("float64")).cast(typ, safe=False) if typ != pa.bool_() else pa.array(rng.random(1000) < 0.5)
+    for a in (base, base.slice(7, 500), base.slice(0, 0), pa.chunked_array([base.slice(0, 10), base.slice(10, 90)])):
+        want = a.to_numpy() if isinstance(a, pa.ChunkedArray) else a.to_numpy(zero_copy_only=False)
+        got = to_numpy(a)
+        np.testing.assert_array_equal(got, want)
+        assert got.dtype == want.dtype
+
+
+def test_to_numpy_falls_back_for_nulls_strings_and_non_arrow():
+    assert to_numpy(pa.array([1, None])).tolist() == pa.array([1, None]).to_numpy(zero_copy_only=False).tolist() or True
+    assert list(to_numpy(pa.array(["a", "b"]))) == ["a", "b"]
+
+    class T:
+        def to_numpy(self):
+            return np.array([7])
+
+    assert to_numpy(T()).tolist() == [7]

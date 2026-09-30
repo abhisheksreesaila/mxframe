@@ -11,6 +11,7 @@ from typing import Any, List, Literal, Optional, Union, Dict
 from dataclasses import dataclass
 from .lazy_expr import Expr, col
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 
 
 # %% ../nbs/02_lazy_frame.ipynb 4
@@ -430,13 +431,13 @@ class LazyFrame:
             if isinstance(arr, pa.ChunkedArray):
                 arr = arr.combine_chunks()
             if pa.types.is_integer(arr.type) or pa.types.is_floating(arr.type):
-                np_arr = arr.to_numpy(zero_copy_only=False).astype(_np.float64)
+                np_arr = _np_of(arr, zero_copy_only=False).astype(_np.float64)
                 numeric_cols[name] = np_arr[~_np.isnan(np_arr)]
         stat_names = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
-        stats: dict = {"statistic": pa.array(stat_names)}
+        stats: dict = {"statistic": _npa(stat_names)}
         for name, vals in numeric_cols.items():
             n = len(vals)
-            stats[name] = pa.array([
+            stats[name] = _npa([
                 float(n),
                 float(_np.mean(vals))              if n > 0 else float("nan"),
                 float(_np.std(vals, ddof=1))       if n > 1 else 0.0,

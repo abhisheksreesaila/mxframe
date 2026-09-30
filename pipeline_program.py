@@ -57,6 +57,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
+from .np_arrow import to_numpy as _np_of
 import pyarrow.compute as pc
 
 from .lazy_expr import Expr
@@ -294,7 +295,7 @@ def _dict_codes(d: pa.DictionaryArray) -> np.ndarray:
     idx = d.indices
     if idx.type != pa.int32():
         idx = idx.cast(pa.int32())
-    return np.ascontiguousarray(idx.to_numpy(zero_copy_only=False))
+    return np.ascontiguousarray(_np_of(idx, zero_copy_only=False))
 
 
 def _single_array(col) -> pa.Array:
@@ -316,12 +317,12 @@ def _column_numpy(col) -> Optional[np.ndarray]:
         return None
     t = arr.type
     if pa.types.is_boolean(t):
-        return np.ascontiguousarray(arr.cast(pa.uint8()).to_numpy(zero_copy_only=False))
+        return np.ascontiguousarray(_np_of(arr.cast(pa.uint8()), zero_copy_only=False))
     if not (pa.types.is_integer(t) or pa.types.is_floating(t)):
         return None
     if pa.types.is_uint64(t) or pa.types.is_float16(t):
         return None
-    np_arr = arr.to_numpy(zero_copy_only=False)
+    np_arr = _np_of(arr, zero_copy_only=False)
     if np_arr.dtype in _NP_DT:
         return np.ascontiguousarray(np_arr)
     if np_arr.dtype.kind in "iu":
@@ -549,7 +550,7 @@ class _Builder:
                 if op not in ("eq", "ne"):
                     raise Unsupported("ordered string comparison")
                 d = self.dictionary(col_e.args[0])
-                member = np.asarray(pc.equal(d, pa.scalar(lit_e.args[0], type=d.type)).fill_null(False).to_numpy(zero_copy_only=False))
+                member = np.asarray(_np_of(pc.equal(d, pa.scalar(lit_e.args[0], type=d.type)).fill_null(False), zero_copy_only=False))
                 return self._dict_test(col_e.args[0], member, negate=(op == "ne"))
         cmpc = self._try_cmpc(op, lhs, rhs)
         if cmpc is not None:
@@ -622,7 +623,7 @@ class _Builder:
             raise Unsupported("string op on a numeric column")
         d = self.dictionary(name)
         fn = pc.starts_with if op == "startswith" else pc.match_substring
-        member = np.asarray(fn(d, pattern=pattern).fill_null(False).to_numpy(zero_copy_only=False))
+        member = np.asarray(_np_of(fn(d, pattern=pattern).fill_null(False), zero_copy_only=False))
         return self._dict_test(name, member)
 
     def _isin(self, col_e: Expr, values):
@@ -631,7 +632,7 @@ class _Builder:
             if not all(isinstance(v, str) for v in values):
                 raise Unsupported("non-string values against a string column")
             d = self.dictionary(col_e.args[0])
-            member = np.asarray(pc.is_in(d, value_set=pa.array(values, type=d.type)).to_numpy(zero_copy_only=False))
+            member = np.asarray(_np_of(pc.is_in(d, value_set=pa.array(values, type=d.type)), zero_copy_only=False))
             return self._dict_test(col_e.args[0], member)
         x = self._need(col_e, "num")
         if isinstance(x, _Const):

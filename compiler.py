@@ -8,6 +8,7 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 import pyarrow.compute as pc
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
@@ -231,7 +232,7 @@ class GraphCompiler:
         model = self.session.load(graph)
         output_vals = model.execute(*[col_arrays[n] for n in col_names])
         result_names = list(result_nodes.keys())
-        arrays = [pa.array(t.to_numpy()) for t in output_vals]
+        arrays = [_npa(_np_of(t)) for t in output_vals]
         result_table = pa.Table.from_arrays(arrays, names=result_names)
 
         # Apply Sort/Limit/Distinct as post-ops
@@ -268,7 +269,7 @@ class GraphCompiler:
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
         if op == "isin":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
-            return pc.is_in(col_arr, value_set=pa.array(args[1]))
+            return pc.is_in(col_arr, value_set=_npa(args[1]))
         if op == "startswith":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])
