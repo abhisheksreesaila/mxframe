@@ -21,6 +21,9 @@ columns live on the GPU. This module does both halves:
 A static split with one call per device beat a dynamic morsel queue here because
 each GPU call has a few ms of fixed cost. Residency is tied to the host table's
 lifetime (weakref), so freed memory can never alias a cached device copy.
+
+Uploads that do not fit the budget (e.g. while a larger entry is pinned by a
+running split) are skipped and retried after FAILED_RETRY_S (120 s).
 """
 
 from __future__ import annotations
@@ -51,6 +54,70 @@ class Policy:
 
 
 _policy: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_policy", default=None)
+
+# Queries running right now (device="auto"). Background uploads pause between chunk
+# copies while this is non-zero, so work meant for the next query never slows this one.
+_active = 0
+_active_cv = threading.Condition()
+YIELD_MAX_S = 2.0          # an upload never waits longer than this per copy
+
+
+@contextlib.contextmanager
+def query_running():
+    global _active
+    with _active_cv:
+        _active += 1
+    try:
+        yield
+    finally:
+        with _active_cv:
+            _active -= 1
+            _active_cv.notify_all()
+
+
+def _yield_to_queries() -> None:
+    with _active_cv:
+        if _active:
+            _active_cv.wait_for(lambda: _active == 0, timeout=YIELD_MAX_S)
+_deferred: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_deferred", default=None)
+
+
+class _Background:
+    """GPU work queued while a query runs; started when the query has returned."""
+
+    def __init__(self):
+        self.threads = []
+        self.callbacks = []
+
+    def later(self, fn) -> None:
+        self.callbacks.append(fn)
+
+    def flush(self) -> None:
+        threads, self.threads = self.threads, []
+        callbacks, self.callbacks = self.callbacks, []
+        for fn in callbacks:
+            try:
+                fn()
+            except Exception:
+                pass
+        for t in threads:
+            t.start()
+
+
+@contextlib.contextmanager
+def deferred_background():
+    """Queue background uploads (and ``later`` callbacks) until the block exits.
+
+    A CPU-bound query should not share its cores and memory bandwidth with GPU
+    start-up or uploads meant for the *next* query.
+    """
+    bg = _Background()
+    token = _deferred.set(bg)
+    try:
+        yield bg
+    finally:
+        _deferred.reset(token)
+        bg.flush()
 
 
 def current_policy() -> Optional[Policy]:
@@ -105,7 +172,7 @@ _cache: "OrderedDict[tuple, _Entry]" = OrderedDict()
 _bytes = 0
 _inflight_bytes = 0
 _inflight: Dict[tuple, threading.Thread] = {}
-_failed: set = set()
+_failed: Dict[tuple, float] = {}
 _finalized: set = set()
 
 
@@ -184,6 +251,9 @@ def wait_for_uploads(timeout: float = 30.0) -> bool:
         if not threads:
             return True
         for t in threads:
+            if t.ident is None:            # queued behind a running query, not started yet
+                time.sleep(0.005)
+                continue
             t.join(max(0.0, deadline - time.monotonic()))
         if time.monotonic() >= deadline:
             with _lock:
@@ -208,44 +278,63 @@ def _release(e: _Entry) -> None:
 
 
 def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
-    """Upload the query's columns + group ids in the background (deduplicated per key)."""
-    global _inflight_bytes
+    """Upload the query's columns + group ids in the background (deduplicated per key).
+
+    The query thread only registers the upload: every CUDA call (memory info,
+    eviction frees, the copy itself) happens on the upload thread, so a first
+    query never waits for GPU initialisation.
+    """
     key = _key(cc, gids)
     with _lock:
-        if key in _cache or key in _inflight or key in _failed:
+        if key in _cache or key in _inflight or _recently_failed(key):
             return
-    budget = _budget_bytes()          # CUDA calls outside the lock
-    with _lock:
-        if key in _cache or key in _inflight or nbytes > budget:
-            return
-        freeable = []
-        for old in list(_cache):     # make room first, oldest unpinned entries
-            if _bytes + _inflight_bytes + nbytes <= budget:
-                break
-            e = _evict_locked(old)
-            if e is not None:
-                freeable.append(e)
-        if _bytes + _inflight_bytes + nbytes > budget:
-            return
-        _inflight_bytes += nbytes
         owners = [b.owner for arrs in cc.chunks for b in arrs] + ([gids] if gids is not None else [])
 
         def run():
             global _bytes, _inflight_bytes
             from . import pipeline_kernels as pk
-            try:
-                dc = pk.upload_columns(prog, cc, gids, 0, n_rows)
-            except Exception:
+
+            def give_up(reserved: bool) -> None:
+                global _inflight_bytes
                 with _lock:
                     _inflight.pop(key, None)
-                    _inflight_bytes -= nbytes
-                    _failed.add(key)
+                    if reserved:
+                        _inflight_bytes -= nbytes
+                    _failed[key] = time.monotonic()
+
+            try:
+                budget = _budget_bytes()
+            except Exception:
+                give_up(False)
                 return
             with _lock:
+                unpinned = sum(e.nbytes for e in _cache.values() if e.users == 0)
+                if _bytes - unpinned + _inflight_bytes + nbytes > budget:
+                    # A pinned (in-use) or recent entry holds the budget: skip; retried after FAILED_RETRY_S.
+                    _inflight.pop(key, None)
+                    _failed[key] = time.monotonic()
+                    return
+                freeable = []
+                for old in list(_cache):
+                    if _bytes + _inflight_bytes + nbytes <= budget:
+                        break
+                    e = _evict_locked(old)
+                    if e is not None:
+                        freeable.append(e)
+                _inflight_bytes += nbytes
+            for e in freeable:
+                _free_entry(e)
+            try:
+                dc = pk.upload_columns(prog, cc, gids, 0, n_rows, before_copy=_yield_to_queries)
+            except Exception:
+                give_up(True)
+                return
+            with _lock:   # leave in-flight and enter the cache atomically: no duplicate upload can slip in
                 _inflight.pop(key, None)
                 _inflight_bytes -= nbytes
                 _cache[key] = _Entry(dc, nbytes, owners)
                 _bytes += nbytes
+                _failed.pop(key, None)
                 register = key not in _finalized
                 _finalized.add(key)
             if register:
@@ -256,9 +345,19 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
 
         t = threading.Thread(target=run, name="mxframe-resident-upload", daemon=True)
         _inflight[key] = t
-    for e in freeable:
-        _free_entry(e)
-    t.start()
+    bg = _deferred.get()
+    if bg is not None:
+        bg.threads.append(t)
+    else:
+        t.start()
+
+
+FAILED_RETRY_S = 120.0   # a failed or rejected upload (e.g. shared-GPU memory pressure) is retried after this
+
+
+def _recently_failed(key) -> bool:
+    t = _failed.get(key)
+    return t is not None and time.monotonic() - t < FAILED_RETRY_S
 
 
 # ── the split ────────────────────────────────────────────────────────────────
@@ -319,6 +418,8 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol):
         if err is not None and auto_mode.is_sticky_gpu_error(err):
             auto_mode.disable_gpu(f"{type(err).__name__}: {err}")
         _evict(key)
+        with _lock:
+            _failed[key] = time.monotonic()      # e.g. GpuUnsupported: don't re-upload on every query
     else:
         for st in res.stats.values():
             if st.rows:

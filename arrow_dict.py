@@ -12,6 +12,7 @@ from typing import Optional
 
 import numpy as np
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 import pyarrow.compute as pc
 
 __all__ = ["is_dictionary", "decode", "combine_dictionary", "encode_key", "dict_predicate"]
@@ -37,7 +38,7 @@ def combine_dictionary(col) -> pa.DictionaryArray:
     """
     if isinstance(col, pa.ChunkedArray):
         if col.num_chunks == 0:
-            return pa.array([], type=col.type)
+            return _npa([], type=col.type)
         if col.num_chunks == 1:
             return col.chunk(0)
         return col.unify_dictionaries().combine_chunks()
@@ -62,12 +63,12 @@ def encode_key(col):
     n = len(d.dictionary)
     if len(pc.unique(d.indices)) == n:
         return d
-    idx = d.indices.to_numpy(zero_copy_only=False)
+    idx = _np_of(d.indices, zero_copy_only=False)
     used = np.zeros(n, dtype=bool)
     used[idx] = True
     remap = (np.cumsum(used) - 1).astype(np.int32)
     return pa.DictionaryArray.from_arrays(
-        pa.array(remap[idx]), d.dictionary.filter(pa.array(used)))
+        _npa(remap[idx]), d.dictionary.filter(_npa(used)))
 
 
 _CMP = {
@@ -89,7 +90,7 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
             return None
         fn = lambda v: _CMP[op](v, args[1].args[0])          # noqa: E731
     elif op == "isin":
-        fn = lambda v: pc.is_in(v, value_set=pa.array(args[1], type=v.type))   # noqa: E731
+        fn = lambda v: pc.is_in(v, value_set=_npa(args[1], type=v.type))   # noqa: E731
     elif op == "startswith":
         fn = lambda v: pc.starts_with(v, pattern=args[1])          # noqa: E731
     elif op == "contains":

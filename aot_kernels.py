@@ -1035,10 +1035,10 @@ class AOTKernelsGPU:
         mk, nm = self._dev_in(mask, np.int32)
         if nm != n:
             raise ValueError(f"mask has {nm} elements, values have {n}")
-        out = self._alloc(4)
+        out = self._alloc(8)
         fn(self._ptr(out), *(self._ptr(p) for p in ptrs), self._ptr(mk), n)
         self._cu.sync()
-        res = self._result(out, np.float32, 1, device_out)
+        res = self._result(out, np.float64, 1, device_out)
         return res if device_out else float(res[0])
 
     def masked_global_sum_f32(self, val, mask, device_out: bool = False):
@@ -1070,14 +1070,14 @@ class AOTKernelsGPU:
         arrays = [a, b, float_col, upper_col]
         av, bv, fv, uv = [self._cached_upload(self._c(v, np.float32)) for v in arrays]
         iv = self._cached_upload(self._c(int_col, np.int32))
-        out = self._cu.malloc(4)
+        out = self._cu.malloc(8)
         self._range5_sumprod(
             self._ptr(out), self._ptr(av), self._ptr(bv), self._ptr(iv),
             self._ptr(fv), self._ptr(uv), len(a), int_lo, int_hi,
             float_lo, float_hi, upper_hi,
         )
         self._cu.sync()
-        result = float(self._download(out, np.float32, 1)[0])
+        result = float(self._download(out, np.float64, 1)[0])
         self._cu.free(out)
         return result
 

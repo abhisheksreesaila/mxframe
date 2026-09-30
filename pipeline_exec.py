@@ -20,6 +20,7 @@ from typing import Any, List, Optional
 
 import numpy as np
 import pyarrow as pa
+from .np_arrow import array as _npa
 
 from .lazy_frame import Aggregate, Filter, Scan
 from .pipeline_program import (
@@ -154,13 +155,13 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
 
     present, cols = finalize(prog, partials, grouped)
     if grouped:
-        keep = None if bool(present.all()) else pa.array(present)
+        keep = None if bool(present.all()) else _npa(present)
         key_arrays = []
         for k in group_keys:
             v = unique_key_cols[k]
             key_arrays.append(v if keep is None else v.filter(keep))
         # counts stay exact int64 (float32/float64 would saturate at 2**24 / lose exactness)
-        agg_arrays = [pa.array(cols[name].astype(np.int64 if op == "count" else np.float64))
+        agg_arrays = [_npa(cols[name].astype(np.int64 if op == "count" else np.float64))
                       for name, op, _ in prog.outputs]
         result = pa.Table.from_arrays(key_arrays + agg_arrays,
                                       names=group_keys + [name for name, _, _ in prog.outputs])
@@ -168,7 +169,7 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         arrays = {}
         for name, op, _ in prog.outputs:
             typ = pa.int64() if op == "count" else pa.float64()
-            arrays[name] = pa.array(cols[name], type=typ)
+            arrays[name] = _npa(cols[name], type=typ)
         result = pa.table(arrays)
 
     if having_pred is not None:

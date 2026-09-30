@@ -2,7 +2,7 @@ from std.gpu.host import DeviceContext, DeviceAttribute
 from std.math import ceildiv
 from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
 from std.gpu.memory import AddressSpace, external_memory
-from std.gpu.primitives.warp import vote, shuffle_idx
+from std.gpu.primitives.warp import vote, shuffle_idx, shuffle_down
 from std.gpu.primitives.id import lane_id
 from std.bit import pop_count, count_trailing_zeros
 from std.sys._assembly import inlined_assembly
@@ -435,81 +435,266 @@ def group_count_f32_gpu(
     try: run_group[OP_COUNT](out_addr, 0, lab_addr, n_rows, n_groups)
     except: pass
 
-# ── masked_global_sum ──────────────────────────────────────────────────────
+# ── masked global aggregates ───────────────────────────────────────────────
+# sum / sum_product / min / max over rows whose int32 mask != 0, plus the fused
+# range5 sum-product.  All are memory-bound streaming reductions:
+#   pass 1: grid-stride loop, MU independent rows in flight per thread, a per-thread
+#           partial (float64 for sums, like the CPU kernels; float32 for min/max, since
+#           float64 compares run at 1/64 rate on GeForce), then warp shuffle -> shared
+#           -> one partial per block written to a scratch buffer (no atomics at all);
+#   pass 2: one block folds the partials in a fixed order and writes the float32 result.
+# The result is deterministic run to run.  Semantics match the CPU kernels: masked-out
+# rows (NaN included) are ignored, NaN in a live row poisons sums and is skipped by
+# min/max, an empty selection gives 0 / +F32_MAX / -F32_MAX.
+comptime MU: Int = 4                      # independent rows per thread per iteration
+comptime MASKED_BLOCKS_PER_SM: Int = 6    # 6 * 256 = 1536 threads/SM
+
+@always_inline
+def _f64(addr: Int) -> UnsafePointer[Float64, MutAnyOrigin]:
+    return UnsafePointer[Float64, MutAnyOrigin](unsafe_from_address=addr)
+
+@always_inline
+def _warp_sum(v: Float64) -> Float64:
+    var x = v
+    comptime for k in range(5):
+        # shuffle has no float64 overload: move the two 32-bit halves
+        var bits = x.to_bits()
+        var lo = shuffle_down(UInt32(bits & 0xFFFFFFFF), UInt32(16 >> k))
+        var hi = shuffle_down(UInt32(bits >> 32), UInt32(16 >> k))
+        x += Float64(from_bits=(UInt64(hi) << 32) | UInt64(lo))
+    return x
+
+@always_inline
+def _warp_ext[is_min: Bool](v: Float32) -> Float32:
+    var x = v
+    comptime for k in range(5):
+        var o = shuffle_down(x, UInt32(16 >> k))
+        comptime if is_min:
+            if o < x: x = o
+        else:
+            if o > x: x = o
+    return x
+
+# Every thread of the block must call these; the result is valid in thread 0.
+@always_inline
+def _block_sum(v: Float64) -> Float64:
+    var sh = stack_allocation[32, Scalar[DType.float64],
+        address_space=AddressSpace.SHARED]()
+    var tid = Int(thread_idx.x)
+    var w = _warp_sum(v)
+    if tid % 32 == 0: sh[tid // 32] = w
+    barrier()
+    var r = Float64(0)
+    if tid < BLOCK // 32: r = sh[tid]
+    if tid < 32: r = _warp_sum(r)
+    return r
+
+@always_inline
+def _block_ext[is_min: Bool](v: Float32, ident: Float32) -> Float32:
+    var sh = stack_allocation[32, Scalar[DType.float32],
+        address_space=AddressSpace.SHARED]()
+    var tid = Int(thread_idx.x)
+    var w = _warp_ext[is_min](v)
+    if tid % 32 == 0: sh[tid // 32] = w
+    barrier()
+    var r = ident
+    if tid < BLOCK // 32: r = sh[tid]
+    if tid < 32: r = _warp_ext[is_min](r)
+    return r
+
+# a * b (prod) or a, in float64, of a live row; 0 for a masked-out row.
+def masked_sum_pass1[prod: Bool](
+    part_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int, stride: Int
+):
+    var acc = Float64(0)
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while i + (MU - 1) * stride < n:
+        var m = InlineArray[Int32, MU](fill=0)
+        var x = InlineArray[Float32, MU](fill=0.0)
+        var y = InlineArray[Float32, MU](fill=0.0)
+        comptime for u in range(MU):
+            m[u] = _i32(mask_addr)[i + u * stride]
+            x[u] = _f32(a_addr)[i + u * stride]
+            comptime if prod:
+                y[u] = _f32(b_addr)[i + u * stride]
+        comptime for u in range(MU):
+            if m[u] != Int32(0):
+                comptime if prod:
+                    acc += x[u].cast[DType.float64]() * y[u].cast[DType.float64]()
+                else:
+                    acc += x[u].cast[DType.float64]()
+        i += MU * stride
+    while i < n:
+        if _i32(mask_addr)[i] != Int32(0):
+            comptime if prod:
+                acc += _f32(a_addr)[i].cast[DType.float64]() * _f32(b_addr)[i].cast[DType.float64]()
+            else:
+                acc += _f32(a_addr)[i].cast[DType.float64]()
+        i += stride
+    var total = _block_sum(acc)
+    if Int(thread_idx.x) == 0:
+        _f64(part_addr)[Int(block_idx.x)] = total
+
+def masked_ext_pass1[is_min: Bool](
+    part_addr: Int, a_addr: Int, mask_addr: Int, n: Int, stride: Int
+):
+    var ident = F32_MAX if is_min else F32_MIN
+    var best = ident
+    var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while i + (MU - 1) * stride < n:
+        var m = InlineArray[Int32, MU](fill=0)
+        var x = InlineArray[Float32, MU](fill=0.0)
+        comptime for u in range(MU):
+            m[u] = _i32(mask_addr)[i + u * stride]
+            x[u] = _f32(a_addr)[i + u * stride]
+        comptime for u in range(MU):
+            if m[u] != Int32(0):
+                comptime if is_min:
+                    if x[u] < best: best = x[u]
+                else:
+                    if x[u] > best: best = x[u]
+        i += MU * stride
+    while i < n:
+        if _i32(mask_addr)[i] != Int32(0):
+            var xv = _f32(a_addr)[i]
+            comptime if is_min:
+                if xv < best: best = xv
+            else:
+                if xv > best: best = xv
+        i += stride
+    var r = _block_ext[is_min](best, ident)
+    if Int(thread_idx.x) == 0:
+        _f64(part_addr)[Int(block_idx.x)] = r.cast[DType.float64]()
+
+# One block folds the per-block partials (fixed order) into the float32 result.
+def masked_final_sum(out_addr: Int, part_addr: Int, nparts: Int):
+    var acc = Float64(0)
+    var t = Int(thread_idx.x)
+    while t < nparts:
+        acc += _f64(part_addr)[t]
+        t += BLOCK
+    var total = _block_sum(acc)
+    if Int(thread_idx.x) == 0:
+        _f64(out_addr)[0] = total
+
+def masked_final_ext[is_min: Bool](out_addr: Int, part_addr: Int, nparts: Int):
+    var ident = F32_MAX if is_min else F32_MIN
+    var best = ident
+    var t = Int(thread_idx.x)
+    while t < nparts:
+        var x = _f64(part_addr)[t].cast[DType.float32]()
+        comptime if is_min:
+            if x < best: best = x
+        else:
+            if x > best: best = x
+        t += BLOCK
+    var r = _block_ext[is_min](best, ident)
+    if Int(thread_idx.x) == 0:
+        _f64(out_addr)[0] = r.cast[DType.float64]()
+
+def masked_blocks(ctx: DeviceContext, n: Int) raises -> Int:
+    var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    return max(1, min(sms * MASKED_BLOCKS_PER_SM, ceildiv(n, BLOCK * MU)))
+
 @export
 def masked_global_sum_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
 ) abi("C"):
-    @parameter
-    def zero_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = 0.0
-
-    @parameter
-    def sum_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = 0.0
-        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s: shmem[tid] += shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.fetch_add(_f32(out_addr), shmem[0])
-
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](
-            1, grid_dim=1, block_dim=BLOCK)
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[sum_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function_experimental[masked_sum_pass1[False]](
+                pa, val_addr, 0, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_sum](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
+        _ = len(parts)
     except: pass
 
-# ── masked_global_sum_product ──────────────────────────────────────────────
 @export
 def masked_global_sum_product_f32_gpu(
     out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int
 ) abi("C"):
-    @parameter
-    def zero_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = 0.0
-
-    @parameter
-    def sum_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = 0.0
-        if gid < n_ and _i32(mask_addr)[gid] != 0:
-            v = _f32(a_addr)[gid] * _f32(b_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s: shmem[tid] += shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.fetch_add(_f32(out_addr), shmem[0])
-
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](
-            1, grid_dim=1, block_dim=BLOCK)
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[sum_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function_experimental[masked_sum_pass1[True]](
+                pa, a_addr, b_addr, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_sum](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
+        _ = len(parts)
     except: pass
 
-# Fused range predicate + product reduction. Each thread evaluates five
-# comparisons and contributes a[i] * b[i] only when every predicate passes.
+@export
+def masked_global_min_f32_gpu(
+    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
+) abi("C"):
+    try:
+        var ctx = DeviceContext()
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
+        if n > 0:
+            ctx.enqueue_function_experimental[masked_ext_pass1[True]](
+                pa, val_addr, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_ext[True]](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.synchronize()
+        _ = len(parts)
+    except: pass
+
+@export
+def masked_global_max_f32_gpu(
+    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
+) abi("C"):
+    try:
+        var ctx = DeviceContext()
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
+        if n > 0:
+            ctx.enqueue_function_experimental[masked_ext_pass1[False]](
+                pa, val_addr, mask_addr, n, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_ext[False]](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.synchronize()
+        _ = len(parts)
+    except: pass
+
+# Fused range predicate + product reduction: five comparisons decide whether a[i]*b[i]
+# (float64) joins the sum.  Same two-pass structure as above.
+def range5_pass1(
+    part_addr: Int, a_addr: Int, b_addr: Int,
+    int_col_addr: Int, float_col_addr: Int, upper_col_addr: Int,
+    n: Int, ilo: Int, ihi: Int, flo: Float32, fhi: Float32, uhi: Float32,
+    stride: Int,
+):
+    var acc = Float64(0)
+    var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    while row < n:
+        var int_value = Int(_i32(int_col_addr)[row])
+        var float_value = _f32(float_col_addr)[row]
+        var upper_value = _f32(upper_col_addr)[row]
+        if (int_value >= ilo and int_value < ihi and
+                float_value >= flo and float_value <= fhi and
+                upper_value < uhi):
+            acc += _f32(a_addr)[row].cast[DType.float64]() * _f32(b_addr)[row].cast[DType.float64]()
+        row += stride
+    var total = _block_sum(acc)
+    if Int(thread_idx.x) == 0:
+        _f64(part_addr)[Int(block_idx.x)] = total
+
 @export
 def range5_sum_product_f32_gpu(
     out_addr: Int,
@@ -525,45 +710,20 @@ def range5_sum_product_f32_gpu(
     float_hi: Float32,
     upper_hi: Float32,
 ) abi("C"):
-    @parameter
-    def zero_out():
-        if Int(thread_idx.x) == 0:
-            _f32(out_addr)[0] = 0.0
-
-    @parameter
-    def sum_kernel(n_: Int, ilo: Int, ihi: Int, flo: Float32, fhi: Float32, uhi: Float32):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var row = Int(block_idx.x) * BLOCK + tid
-        var value: Float32 = 0.0
-        if row < n_:
-            var int_value = Int(_i32(int_col_addr)[row])
-            var float_value = _f32(float_col_addr)[row]
-            var upper_value = _f32(upper_col_addr)[row]
-            if (int_value >= ilo and int_value < ihi and
-                    float_value >= flo and float_value <= fhi and
-                    upper_value < uhi):
-                value = _f32(a_addr)[row] * _f32(b_addr)[row]
-        shmem[tid] = value
-        barrier()
-        var stride = BLOCK >> 1
-        while stride > 0:
-            if tid < stride:
-                shmem[tid] += shmem[tid + stride]
-            barrier()
-            stride = stride >> 1
-        if tid == 0:
-            _ = Atomic.fetch_add(_f32(out_addr), shmem[0])
-
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[zero_out](grid_dim=1, block_dim=BLOCK)
+        var blocks = masked_blocks(ctx, n)
+        var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
+        var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[sum_kernel](
-                n, int_lo, int_hi, float_lo, float_hi, upper_hi,
-                grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function_experimental[range5_pass1](
+                pa, a_addr, b_addr, int_col_addr, float_col_addr, upper_col_addr,
+                n, int_lo, int_hi, float_lo, float_hi, upper_hi, blocks * BLOCK,
+                grid_dim=blocks, block_dim=BLOCK)
+        ctx.enqueue_function_experimental[masked_final_sum](
+            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
+        _ = len(parts)
     except: pass
 
 # Mark right-side keys satisfying right_a < right_b, then count left rows by
@@ -856,80 +1016,6 @@ def filter_gather_i64_gpu(
         var ctx = DeviceContext()
         ctx.enqueue_function_experimental[kernel](
             n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-        ctx.synchronize()
-    except: pass
-
-# ── masked_global_min ─────────────────────────────────────────────────────
-@export
-def masked_global_min_f32_gpu(
-    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
-    @parameter
-    def init_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = F32_MAX
-
-    @parameter
-    def min_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = F32_MAX
-        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s:
-                if shmem[tid + s] < shmem[tid]: shmem[tid] = shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.min(_f32(out_addr), shmem[0])
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_out](
-            1, grid_dim=1, block_dim=BLOCK)
-        if n > 0:
-            ctx.enqueue_function_experimental[min_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-        ctx.synchronize()
-    except: pass
-
-# ── masked_global_max ─────────────────────────────────────────────────────
-@export
-def masked_global_max_f32_gpu(
-    out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
-    @parameter
-    def init_out(nout: Int):
-        var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if t < nout: _f32(out_addr)[t] = F32_MIN
-
-    @parameter
-    def max_kernel(n_: Int):
-        var shmem = stack_allocation[BLOCK, Scalar[DType.float32],
-            address_space=AddressSpace.SHARED]()
-        var tid = Int(thread_idx.x)
-        var gid = Int(block_idx.x) * BLOCK + tid
-        var v: Float32 = F32_MIN
-        if gid < n_ and _i32(mask_addr)[gid] != 0: v = _f32(val_addr)[gid]
-        shmem[tid] = v
-        barrier()
-        var s = BLOCK >> 1
-        while s > 0:
-            if tid < s:
-                if shmem[tid + s] > shmem[tid]: shmem[tid] = shmem[tid + s]
-            barrier(); s = s >> 1
-        if tid == 0: _ = Atomic.max(_f32(out_addr), shmem[0])
-
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_out](
-            1, grid_dim=1, block_dim=BLOCK)
-        if n > 0:
-            ctx.enqueue_function_experimental[max_kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 

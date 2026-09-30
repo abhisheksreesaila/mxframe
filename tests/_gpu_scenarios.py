@@ -396,7 +396,85 @@ def join_failure_frees_scratch():
     assert free0 - free1 < 64 << 20, (free0 - free1)
 
 
-SCENARIOS = {f.__name__: f for f in (join_failure_frees_scratch, other_thread, group_skew, sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
+def masked_aggs(n: str):
+    """masked sum / sum_product / min / max on the GPU vs NumPy float64 (CPU-kernel semantics)."""
+    n = int(n)
+    g = gpu()
+    rng = np.random.default_rng(n + 7)
+    a = (rng.random(n, dtype=np.float32) * 200 - 100).astype(np.float32)
+    b = (rng.random(n, dtype=np.float32) * 4 - 2).astype(np.float32)
+    F32MAX = float(F32_MAX)
+
+    def check(a, b, mask, tag):
+        live = mask != 0
+        for name, got, want in (
+            ("sum", g.masked_global_sum_f32(a, mask), float(a[live].astype(np.float64).sum())),
+            ("prod", g.masked_global_sum_product_f32(a, b, mask),
+             float((a[live].astype(np.float64) * b[live].astype(np.float64)).sum())),
+        ):
+            tol = 1e-6 * max(1.0, float(np.abs(a[live].astype(np.float64)).sum()) * 2)
+            assert abs(got - want) <= tol, (tag, name, got, want)
+        wmin = float(np.nanmin(a[live])) if live.any() and not np.isnan(a[live]).all() else F32MAX
+        wmax = float(np.nanmax(a[live])) if live.any() and not np.isnan(a[live]).all() else -F32MAX
+        assert g.masked_global_min_f32(a, mask) == wmin, (tag, "min")
+        assert g.masked_global_max_f32(a, mask) == wmax, (tag, "max")
+        # deterministic: same bits every run
+        assert g.masked_global_sum_f32(a, mask) == g.masked_global_sum_f32(a, mask)
+
+    rand = (rng.random(n) > 0.4).astype(np.int32)
+    check(a, b, rand, "random")
+    check(a, b, np.zeros(n, np.int32), "none")
+    check(a, b, np.ones(n, np.int32), "all")
+    # NaN in masked-out rows is ignored
+    an = a.copy(); mk = rand.copy()
+    an[::7] = np.nan; mk[::7] = 0
+    check(an, b, mk, "nan-masked-out")
+    if n:
+        # NaN in a live row: sum poisons (like the CPU kernel), min/max skip it
+        ln = a.copy(); ln[n // 2] = np.nan
+        mall = np.ones(n, np.int32)
+        assert np.isnan(g.masked_global_sum_f32(ln, mall))
+        okv = ln[~np.isnan(ln)]
+        assert g.masked_global_min_f32(ln, mall) == (float(okv.min()) if len(okv) else F32MAX)
+        assert g.masked_global_max_f32(ln, mall) == (float(okv.max()) if len(okv) else -F32MAX)
+    # range5 fused predicate + product
+    if n:
+        ic = rng.integers(0, 100, n).astype(np.int32)
+        fc = rng.random(n, dtype=np.float32)
+        uc = (rng.random(n, dtype=np.float32) * 50).astype(np.float32)
+        sel = (ic >= 10) & (ic < 60) & (fc >= np.float32(0.2)) & (fc <= np.float32(0.7)) & (uc < np.float32(24))
+        want = float((a[sel].astype(np.float64) * b[sel].astype(np.float64)).sum())
+        got = g.range5_sum_product_f32(a, b, ic, fc, uc, 10, 60, 0.2, 0.7, 24.0)
+        assert abs(got - want) <= 1e-6 * max(1.0, float(np.abs(a).astype(np.float64).sum()) * 2), (got, want)
+
+
+def masked_f64_matches_cpu():
+    """GPU masked outputs are float64: at ~1e9 magnitude they agree with the CPU kernels to 1e-12."""
+    g = gpu()
+    cpu = ak.AOTKernels()
+    n = 4_000_000
+    rng = np.random.default_rng(3)
+    a = (rng.random(n, dtype=np.float32) * 500 + 500).astype(np.float32)    # ~1e9 total
+    b = (rng.random(n, dtype=np.float32) + 0.5).astype(np.float32)
+    m = (rng.random(n) > 0.2).astype(np.int32)
+    for name, got, want in (
+        ("sum", g.masked_global_sum_f32(a, m), cpu.masked_global_sum(a, m)),
+        ("prod", g.masked_global_sum_product_f32(a, b, m), cpu.masked_global_sum_product(a, b, m)),
+    ):
+        assert want > 1e8 and abs(got - want) <= 1e-12 * abs(want), (name, got, want)
+    assert g.masked_global_min_f32(a, m) == cpu.masked_global_min(a, m)
+    assert g.masked_global_max_f32(a, m) == cpu.masked_global_max(a, m)
+    ic = rng.integers(0, 100, n).astype(np.int32)
+    fc = rng.random(n, dtype=np.float32)
+    uc = (rng.random(n, dtype=np.float32) * 50).astype(np.float32)
+    sel = (ic >= 10) & (ic < 60) & (fc >= np.float32(0.2)) & (fc <= np.float32(0.7)) & (uc < np.float32(24))
+    want = float((a[sel].astype(np.float64) * b[sel].astype(np.float64)).sum())
+    got = g.range5_sum_product_f32(a, b, ic, fc, uc, 10, 60, 0.2, 0.7, 24.0)
+    assert abs(got - want) <= 1e-12 * abs(want), (got, want)
+    assert g.masked_global_sum_f32(a, m, device_out=True).dtype == np.float64
+
+
+SCENARIOS = {f.__name__: f for f in (masked_f64_matches_cpu, masked_aggs, join_failure_frees_scratch, other_thread, group_skew, sort_end_to_end, late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
 
 
 def register(fn):

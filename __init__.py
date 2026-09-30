@@ -156,6 +156,10 @@ def read_csv(path: str, **kwargs) -> "LazyFrame":
 
 
 def read_parquet(path: str, **kwargs) -> "LazyFrame":
+    import os
+    if set(kwargs) <= {"columns"} and os.path.isfile(os.fspath(path)):
+        # ParquetFile path: pq.read_table imports pyarrow.dataset, which imports pandas (~150 ms)
+        return LazyFrame(Scan(read_parquet_table(path, columns=kwargs.get("columns"), dictionary=False)))
     return LazyFrame(Scan(_pq.read_table(path, **kwargs)))
 
 __all__ = [
@@ -181,3 +185,33 @@ __all__ = [
     # SQL
     "sql",
 ]
+
+
+# ── background warm-up ─────────────────────────────────────────────────────────
+# Loading the CPU kernel libraries (Mojo runtime, dlopen ~45 ms) and the engine
+# modules happens on the first query otherwise. Doing it on a background thread
+# from import time overlaps it with whatever the program does next (typically
+# reading data). CPU only: the GPU is never touched here. MXFRAME_WARM=0 disables.
+
+def _background_warm():
+    try:
+        from . import custom_ops, pipeline_exec, pipeline_kernels, coproc_fused, auto_mode  # noqa: F401
+        custom_ops._load_aot_kernels()
+        pipeline_kernels._load_cpu()
+        from . import group_keys
+        group_keys._load()
+    except Exception:
+        pass
+
+
+def _start_background_warm():
+    import os
+    import threading
+    if os.environ.get("MXFRAME_WARM", "1") == "0":
+        return None
+    t = threading.Thread(target=_background_warm, name="mxframe-warm", daemon=True)
+    t.start()
+    return t
+
+
+_warm_thread = _start_background_warm()

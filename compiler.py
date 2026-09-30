@@ -8,11 +8,11 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 import pyarrow.compute as pc
 import numpy as np
-from max import engine, driver
-from max.graph import Graph, TensorType, ops
-from max.graph.type import DType, DeviceRef
+# MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
+from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate
@@ -20,17 +20,17 @@ from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicat
 # %% ../nbs/03_compiler.ipynb 4
 # ── dtype helpers ────────────────────────────────────────────────────────
 
-_NP_TO_MAX = {
-    np.dtype("int32"):   DType.int32,
-    np.dtype("int64"):   DType.int64,
-    np.dtype("float32"): DType.float32,
-    np.dtype("float64"): DType.float64,
-    np.dtype("bool"):    DType.bool,
+_NP_TO_MAX_NAMES = {
+    np.dtype("int32"):   "int32",
+    np.dtype("int64"):   "int64",
+    np.dtype("float32"): "float32",
+    np.dtype("float64"): "float64",
+    np.dtype("bool"):    "bool",
 }
 
-def _max_dtype(arr) -> DType:
+def _max_dtype(arr):
     """Map a numpy dtype to the corresponding MAX DType."""
-    return _NP_TO_MAX.get(arr.dtype, DType.float32)
+    return getattr(DType, _NP_TO_MAX_NAMES.get(arr.dtype, "float32"))
 
 _PC_CMP_OPS = {
     "gt":  pc.greater,
@@ -66,16 +66,26 @@ def _align_literals(lhs, rhs):
 # Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
 _DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
 
-_CMP_OPS = {
-    "gt": ops.greater,
-    "ge": ops.greater_equal,
-    "lt": lambda a, b: ops.greater(b, a),
-    "le": lambda a, b: ops.greater_equal(b, a),
-    "eq": ops.equal,
-}
+class _LazyCmpOps:
+    """MAX comparison ops by name; ``ops`` is only touched when one is looked up."""
+    _KEYS = ("gt", "ge", "lt", "le", "eq")
+
+    def __contains__(self, op):
+        return op in self._KEYS
+
+    def __getitem__(self, op):
+        if op == "gt": return ops.greater
+        if op == "ge": return ops.greater_equal
+        if op == "lt": return lambda a, b: ops.greater(b, a)
+        if op == "le": return lambda a, b: ops.greater_equal(b, a)
+        if op == "eq": return ops.equal
+        raise KeyError(op)
 
 
-def _is_gpu_max_compatible(acc: driver.Accelerator) -> bool:
+_CMP_OPS = _LazyCmpOps()
+
+
+def _is_gpu_max_compatible(acc) -> bool:
     """Return True if MAX's GPU runtime supports this accelerator.
 
     MAX only supports certain datacenter GPUs (A10, A100, H100, etc.).
@@ -134,16 +144,37 @@ class GraphCompiler:
         elif resolved == "auto":
             # Start on the CPU without touching the GPU; the subclass picks the GPU
             # (waiting on the background warm-up) once it knows the query is big enough.
-            self._driver_device = driver.CPU()
-            self._device_ref = DeviceRef.CPU()
+            self._driver_device = None      # created on first use (see the properties below)
+            self._device_ref = None
             self._session_device = "cpu"
             self._auto_pending = True
         else:  # "cpu" or any unrecognised string
-            self._driver_device = driver.CPU()
-            self._device_ref = DeviceRef.CPU()
+            self._driver_device = None
+            self._device_ref = None
             self._session_device = "cpu"
 
         self._session_obj = None     # MAX InferenceSession: created on first real graph load
+
+    # The CPU driver device and DeviceRef need the MAX import: made on first use only.
+    @property
+    def _driver_device(self):
+        if self._driver_device_v is None:
+            self._driver_device_v = driver.CPU()
+        return self._driver_device_v
+
+    @_driver_device.setter
+    def _driver_device(self, value):
+        self._driver_device_v = value
+
+    @property
+    def _device_ref(self):
+        if self._device_ref_v is None:
+            self._device_ref_v = DeviceRef.CPU()
+        return self._device_ref_v
+
+    @_device_ref.setter
+    def _device_ref(self, value):
+        self._device_ref_v = value
 
     # A MAX InferenceSession is only needed by the graph (JIT) fallbacks; creating one
     # eagerly costs start-up time on paths that never load a graph.
@@ -221,7 +252,7 @@ class GraphCompiler:
         model = self.session.load(graph)
         output_vals = model.execute(*[col_arrays[n] for n in col_names])
         result_names = list(result_nodes.keys())
-        arrays = [pa.array(t.to_numpy()) for t in output_vals]
+        arrays = [_npa(_np_of(t)) for t in output_vals]
         result_table = pa.Table.from_arrays(arrays, names=result_names)
 
         # Apply Sort/Limit/Distinct as post-ops
@@ -260,7 +291,7 @@ class GraphCompiler:
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
         if op == "isin":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
-            return pc.is_in(col_arr, value_set=pa.array(args[1]))
+            return pc.is_in(col_arr, value_set=_npa(args[1]))
         if op == "startswith":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])

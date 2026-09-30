@@ -8,14 +8,14 @@ __all__ = ['KERNELS_PATH', 'WARP_SIZE', 'MAX_GROUPS', 'AUTO_GPU_THRESHOLD', 'GPU
 # %% ../nbs/04_custom_ops.ipynb 2
 from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
 import threading as _threading
 from pathlib import Path
-from max import engine, driver
-from max.graph import Graph, TensorType, ops
-from max.graph.type import DType, DeviceRef
+# MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
+from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
@@ -340,8 +340,8 @@ class CustomOpsCompiler(GraphCompiler):
         if want_gpu:
             self._switch_to_gpu()
         else:
-            self._driver_device = driver.CPU()
-            self._device_ref = DeviceRef.CPU()
+            self._driver_device = None      # CPU handles are made on first use
+            self._device_ref = None
             self._session_device = "cpu"
             self.session = None
 
@@ -422,7 +422,7 @@ class CustomOpsCompiler(GraphCompiler):
                 return out, False, True
 
         try:
-            np_arr = arr.to_numpy(zero_copy_only=True)
+            np_arr = _np_of(arr, zero_copy_only=True)
             norm = self._normalize_numeric_dtype(np_arr)
             if norm is not None:
                 out = norm if norm.flags['C_CONTIGUOUS'] else np.ascontiguousarray(norm)
@@ -431,7 +431,7 @@ class CustomOpsCompiler(GraphCompiler):
             pass
 
         try:
-            np_arr = arr.to_numpy(zero_copy_only=False)
+            np_arr = _np_of(arr, zero_copy_only=False)
             norm = self._normalize_numeric_dtype(np_arr)
             if norm is not None:
                 out = norm if norm.flags['C_CONTIGUOUS'] else np.ascontiguousarray(norm)
@@ -552,9 +552,9 @@ class CustomOpsCompiler(GraphCompiler):
             val = args[0]
             n = len(table)
             if isinstance(val, (int, float)):
-                return pa.array(np.full(
+                return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
-            return pa.array([val] * n)
+            return _npa([val] * n)
         if op in ("add", "sub", "mul", "div"):
             lhs = self._eval_expr_arrow(args[0], table)
             rhs = self._eval_expr_arrow(args[1], table)
@@ -576,8 +576,8 @@ class CustomOpsCompiler(GraphCompiler):
                     if op == "ne":
                         bool_mask = np.logical_not(bool_mask)
                         if col_arr.null_count:
-                            bool_mask &= col_arr.is_valid().to_numpy(zero_copy_only=False)
-                    return pa.array(bool_mask, type=pa.bool_())
+                            bool_mask &= _np_of(col_arr.is_valid(), zero_copy_only=False)
+                    return _npa(bool_mask, type=pa.bool_())
             return _PC_CMP_OPS[op](*self._cmp_operands(args, table))
         if op in _PC_CMP_OPS:
             if op in ("and", "or"):
@@ -592,21 +592,21 @@ class CustomOpsCompiler(GraphCompiler):
                     and pa.types.is_string(col_arr.type) and args[1]
                     and all(isinstance(value, str) for value in args[1])):
                 mask = self._aot_gpu.utf8_isin_mask(col_arr, args[1])
-                return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
-            return pc.is_in(col_arr, value_set=pa.array(args[1]))
+                return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
+            return pc.is_in(col_arr, value_set=_npa(args[1]))
         if op == "startswith":
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
                     and pa.types.is_string(col_arr.type)):
                 mask = self._aot_gpu.utf8_startswith_mask(col_arr, args[1])
-                return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
+                return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.starts_with(col_arr, pattern=args[1])
         if op == "contains":
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
                     and pa.types.is_string(col_arr.type)):
                 mask = self._aot_gpu.utf8_contains_mask(col_arr, args[1])
-                return pa.array(mask.astype(np.bool_, copy=False), type=pa.bool_())
+                return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.match_substring(col_arr, pattern=args[1])
         if op == "year_days":
             col_arr = self._eval_expr_arrow(args[0], table)
@@ -635,32 +635,32 @@ class CustomOpsCompiler(GraphCompiler):
             return result.cast(want) if result.type != want else result
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
-            return pa.array(np.arange(1, table.num_rows + 1, dtype=np.float64))
+            return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
         if op == "rank":
-            arr = self._eval_expr_arrow(args[0], table).to_numpy(zero_copy_only=False).astype(np.float64)
-            return pa.array(_window_rank(arr))
+            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
+            return _npa(_window_rank(arr))
         if op == "dense_rank":
-            arr = self._eval_expr_arrow(args[0], table).to_numpy(zero_copy_only=False).astype(np.float64)
-            return pa.array(_window_dense_rank(arr))
+            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
+            return _npa(_window_dense_rank(arr))
         if op == "cum_sum":
-            arr = self._eval_expr_arrow(args[0], table).to_numpy(zero_copy_only=False).astype(np.float64)
-            return pa.array(np.cumsum(arr))
+            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
+            return _npa(np.cumsum(arr))
         if op == "lag":
-            arr = self._eval_expr_arrow(args[0], table).to_numpy(zero_copy_only=False).astype(np.float64)
+            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
             n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
             default = args[2] if len(args) > 2 else None
             out = np.empty(len(arr), dtype=np.float64)
             out[:n_shift] = float(default) if default is not None else np.nan
             out[n_shift:] = arr[:-n_shift]
-            return pa.array(out)
+            return _npa(out)
         if op == "lead":
-            arr = self._eval_expr_arrow(args[0], table).to_numpy(zero_copy_only=False).astype(np.float64)
+            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
             n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
             default = args[2] if len(args) > 2 else None
             out = np.empty(len(arr), dtype=np.float64)
             out[-n_shift:] = float(default) if default is not None else np.nan
             out[:-n_shift] = arr[n_shift:]
-            return pa.array(out)
+            return _npa(out)
         if op == "window":
             return self._eval_window_arrow(args[0], args[1], table)
         raise NotImplementedError(f"_eval_expr_arrow: unsupported op '{op}'")
@@ -733,7 +733,7 @@ class CustomOpsCompiler(GraphCompiler):
             op   = expr.op
             if op in ("sum", "min", "max", "mean"):
                 inner_arr = self._eval_expr_arrow(expr.args[0], table)
-                arr_np    = inner_arr.to_numpy(zero_copy_only=False).astype("float64")
+                arr_np    = _np_of(inner_arr, zero_copy_only=False).astype("float64")
                 if   op == "sum":  val = float(arr_np.sum())
                 elif op == "min":  val = float(arr_np.min())
                 elif op == "max":  val = float(arr_np.max())
@@ -840,7 +840,7 @@ class CustomOpsCompiler(GraphCompiler):
             (result_tensor,) = mg_model.execute(val_buf, msk_buf)
         else:
             (result_tensor,) = mg_model.execute(arr_f32, mask_np)
-        return float(result_tensor.to_numpy().flat[0])
+        return float(_np_of(result_tensor).flat[0])
 
     def _run_masked_global_sum_product(
         self, a_f32: np.ndarray, b_f32: np.ndarray, mask_np: np.ndarray, N: int
@@ -886,7 +886,7 @@ class CustomOpsCompiler(GraphCompiler):
             (result_tensor,) = mg_model.execute(a_buf, b_buf, msk_buf)
         else:
             (result_tensor,) = mg_model.execute(a_f32, b_f32, mask_np)
-        return float(result_tensor.to_numpy().flat[0])
+        return float(_np_of(result_tensor).flat[0])
 
     def _run_masked_global_min(
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
@@ -924,7 +924,7 @@ class CustomOpsCompiler(GraphCompiler):
             (result_tensor,) = mg_model.execute(val_buf, msk_buf)
         else:
             (result_tensor,) = mg_model.execute(arr_f32, mask_np)
-        return float(result_tensor.to_numpy().flat[0])
+        return float(_np_of(result_tensor).flat[0])
 
     def _run_masked_global_max(
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
@@ -962,7 +962,7 @@ class CustomOpsCompiler(GraphCompiler):
             (result_tensor,) = mg_model.execute(val_buf, msk_buf)
         else:
             (result_tensor,) = mg_model.execute(arr_f32, mask_np)
-        return float(result_tensor.to_numpy().flat[0])
+        return float(_np_of(result_tensor).flat[0])
 
     @property
     def _session(self):
@@ -988,7 +988,7 @@ class CustomOpsCompiler(GraphCompiler):
             cols[name] = c.cast(pa.float64()) if pa.types.is_float32(c.type) else c
         if not cols:
             # literal-only expression: keep the row count so literals broadcast to every row
-            cols["__rows__"] = pa.array(np.zeros(table.num_rows, dtype=np.int8))
+            cols["__rows__"] = _npa(np.zeros(table.num_rows, dtype=np.int8))
         sub = pa.table(cols)
         prev = getattr(_PRECISE, "on", False)
         _PRECISE.on = True
@@ -996,7 +996,7 @@ class CustomOpsCompiler(GraphCompiler):
             res = self._eval_expr_arrow(expr, sub)
         finally:
             _PRECISE.on = prev
-        return np.ascontiguousarray(res.to_numpy(zero_copy_only=False), dtype=np.float64)
+        return np.ascontiguousarray(_np_of(res, zero_copy_only=False), dtype=np.float64)
 
     def _get_col_agg(self, col_name: str, table: pa.Table) -> "Optional[np.ndarray]":
         """Column as a contiguous array for an aggregation kernel.
@@ -1011,7 +1011,7 @@ class CustomOpsCompiler(GraphCompiler):
             arr = arr.chunks[0] if len(arr.chunks) == 1 else arr.combine_chunks()
         view = self._arrow_array_to_numpy_view(arr)
         if view is None:
-            view = arr.to_numpy(zero_copy_only=False)
+            view = _np_of(arr, zero_copy_only=False)
         out = view if view.dtype == np.float32 else view.astype(np.float64, copy=False)
         return out if out.flags["C_CONTIGUOUS"] else np.ascontiguousarray(out)
 
@@ -1024,7 +1024,7 @@ class CustomOpsCompiler(GraphCompiler):
         if view is not None:
             out = view.astype(np.float32, copy=False)
         else:
-            out = arr.to_numpy(zero_copy_only=False).astype(np.float32)
+            out = _np_of(arr, zero_copy_only=False).astype(np.float32)
         return out if out.flags["C_CONTIGUOUS"] else np.ascontiguousarray(out)
 
     def _compute_masked_global_agg(self, plan, agg_node) -> "Optional[pa.Table]":
@@ -1072,13 +1072,13 @@ class CustomOpsCompiler(GraphCompiler):
                     self._get_col_as_f32(product[0], table),
                     self._get_col_as_f32(product[1], table),
                     np.ascontiguousarray(
-                        table.column(int_name).to_numpy(zero_copy_only=False), dtype=np.int32),
+                        _np_of(table.column(int_name), zero_copy_only=False), dtype=np.int32),
                     self._get_col_as_f32(float_name, table),
                     self._get_col_as_f32(upper_name, table),
                     int(int_lo), int(int_hi), float(float_lo), float(float_hi), float(upper_hi),
                 )
                 name = agg_node.aggs[0]._alias or "agg_0"
-                return pa.table({name: pa.array([value], type=pa.float64())})
+                return pa.table({name: _npa([value], type=pa.float64())})
             except Exception:
                 pass
 
@@ -1090,7 +1090,7 @@ class CustomOpsCompiler(GraphCompiler):
                 for pred in predicates:
                     m = self._eval_predicate(pred, table)
                     combined = m if combined is None else pc.and_(combined, m)
-                mask_np = combined.to_numpy(zero_copy_only=False).astype(np.int32)
+                mask_np = _np_of(combined, zero_copy_only=False).astype(np.int32)
                 if not mask_np.flags["C_CONTIGUOUS"]:
                     mask_np = np.ascontiguousarray(mask_np)
             except Exception:
@@ -1102,8 +1102,8 @@ class CustomOpsCompiler(GraphCompiler):
             for i, expr in enumerate(agg_node.aggs):
                 name = expr._alias or f"agg_{i}"
                 result_cols[name] = (
-                    pa.array([0], type=pa.int64()) if expr.op == "count"
-                    else pa.array([0.0], type=pa.float64())
+                    _npa([0], type=pa.int64()) if expr.op == "count"
+                    else _npa([0.0], type=pa.float64())
                 )
             return pa.table(result_cols)
 
@@ -1115,7 +1115,7 @@ class CustomOpsCompiler(GraphCompiler):
             name = expr._alias or f"agg_{i}"
             try:
                 if expr.op == "count":
-                    result_cols[name] = pa.array([n_pass], type=pa.int64())
+                    result_cols[name] = _npa([n_pass], type=pa.int64())
                     continue
 
                 inner = expr.args[0]
@@ -1133,7 +1133,7 @@ class CustomOpsCompiler(GraphCompiler):
                         val = self._run_masked_global_min(arr_f32, mask_np, N)
                     else:
                         val = self._run_masked_global_max(arr_f32, mask_np, N)
-                    result_cols[name] = pa.array([float(val)], type=pa.float64())
+                    result_cols[name] = _npa([float(val)], type=pa.float64())
                     continue
 
                 if product_cols is not None:
@@ -1160,16 +1160,16 @@ class CustomOpsCompiler(GraphCompiler):
                         arr_f32 = self._eval_expr_f64(inner, table)      # float64 end to end
                     else:
                         inner_arr = self._eval_expr_arrow(inner, table)
-                        arr_f32 = inner_arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                        arr_f32 = _np_of(inner_arr, zero_copy_only=False).astype(np.float32)
                         if not arr_f32.flags["C_CONTIGUOUS"]:
                             arr_f32 = np.ascontiguousarray(arr_f32)
                     sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
 
                 if expr.op == "sum":
-                    result_cols[name] = pa.array([float(sum_val)], type=pa.float64())
+                    result_cols[name] = _npa([float(sum_val)], type=pa.float64())
                 else:  # mean
                     mean_val = float(sum_val) / n_pass if n_pass > 0 else 0.0
-                    result_cols[name] = pa.array([mean_val], type=pa.float64())
+                    result_cols[name] = _npa([mean_val], type=pa.float64())
 
             except Exception:
                 return None
@@ -1214,33 +1214,33 @@ class CustomOpsCompiler(GraphCompiler):
             m    = len(ordered_indices)
 
             if op in ("sum", "mean", "min", "max"):
-                arr = self._eval_expr_arrow(args[0], sub).to_numpy(zero_copy_only=False).astype(np.float64)
+                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 if   op == "sum":  val = np.full(m, arr.sum())
                 elif op == "mean": val = np.full(m, arr.mean() if m else np.nan)
                 elif op == "min":  val = np.full(m, arr.min()  if m else np.nan)
                 elif op == "max":  val = np.full(m, arr.max()  if m else np.nan)
             elif op == "rank":
-                arr = self._eval_expr_arrow(args[0], sub).to_numpy(zero_copy_only=False).astype(np.float64)
+                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = _window_rank(arr)
             elif op == "dense_rank":
-                arr = self._eval_expr_arrow(args[0], sub).to_numpy(zero_copy_only=False).astype(np.float64)
+                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = _window_dense_rank(arr)
             elif op == "row_number":
                 val = np.arange(1, m + 1, dtype=np.float64)
             elif op == "cum_sum":
-                arr = self._eval_expr_arrow(args[0], sub).to_numpy(zero_copy_only=False).astype(np.float64)
+                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = np.cumsum(arr)
             elif op == "lag":
                 n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
                 fill    = args[2] if len(args) > 2 else None
-                arr = self._eval_expr_arrow(args[0], sub).to_numpy(zero_copy_only=False).astype(np.float64)
+                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = np.empty(m, dtype=np.float64)
                 val[:n_shift] = float(fill) if fill is not None else np.nan
                 val[n_shift:] = arr[:-n_shift]
             elif op == "lead":
                 n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
                 fill    = args[2] if len(args) > 2 else None
-                arr = self._eval_expr_arrow(args[0], sub).to_numpy(zero_copy_only=False).astype(np.float64)
+                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = np.empty(m, dtype=np.float64)
                 val[-n_shift:] = float(fill) if fill is not None else np.nan
                 val[:-n_shift] = arr[n_shift:]
@@ -1252,7 +1252,7 @@ class CustomOpsCompiler(GraphCompiler):
             for i, orig_i in enumerate(ordered_indices):
                 result[orig_i] = val[i]
 
-        return pa.array(result, type=pa.float64())
+        return _npa(result, type=pa.float64())
 
     def _compute_cache_key(self, plan, all_names, all_arrays, n_groups, optimizer_trace=None):
         """Compute a hashable cache key for the compiled graph model.
@@ -1368,7 +1368,7 @@ class CustomOpsCompiler(GraphCompiler):
             for i, e in enumerate(plan.aggs):
                 agg_names.append(e._alias or f"agg_{i}")
                 if e.args[0].op == "lit":
-                    agg_arrays.append(pa.array(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
+                    agg_arrays.append(_npa(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
                 else:
                     agg_arrays.append(self._eval_expr_arrow(e.args[0], table))
         finally:
@@ -1389,12 +1389,12 @@ class CustomOpsCompiler(GraphCompiler):
             cols = []
             for e, arr in zip(plan.aggs, agg_arrays):
                 if e.op == "count":
-                    cols.append(pa.array([pc.count(arr).as_py()], type=pa.int64()))
+                    cols.append(_npa([pc.count(arr).as_py()], type=pa.int64()))
                     continue
                 v = {"sum": pc.sum, "min": pc.min_max, "max": pc.min_max, "mean": pc.mean}[e.op](arr)
                 if e.op in ("min", "max"):
                     v = v[e.op]
-                cols.append(pa.array([v.as_py()], type=pa.float64()))
+                cols.append(_npa([v.as_py()], type=pa.float64()))
             result = pa.Table.from_arrays(cols, names=agg_names)
 
         if having_pred is not None:
@@ -1417,7 +1417,7 @@ class CustomOpsCompiler(GraphCompiler):
         """Grouped aggregate over zero selected rows: no groups, right column names/types."""
         agg_names = [e._alias or f"agg_{i}" for i, e in enumerate(agg_node.aggs)]
         keys = [unique_key_cols[k].slice(0, 0) for k in group_keys]
-        aggs = [pa.array([], type=pa.int64() if e.op == "count" else pa.float64())
+        aggs = [_npa([], type=pa.int64() if e.op == "count" else pa.float64())
                 for e in agg_node.aggs]
         return pa.Table.from_arrays(keys + aggs, names=list(group_keys) + agg_names)
 
@@ -1774,7 +1774,7 @@ class CustomOpsCompiler(GraphCompiler):
                 # 4a-derived: pre-compute case_when/isin/startswith (unmasked on GPU)
                 for deriv_name, deriv_expr in derived_specs:
                     arr = self._eval_expr_arrow(deriv_expr, original_scan.table)
-                    col_arrays[deriv_name] = arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                    col_arrays[deriv_name] = _np_of(arr, zero_copy_only=False).astype(np.float32)
                     col_names.append(deriv_name)
                 _group_ids_full = group_ids_full
                 _INPUT_PREP_CACHE[prep_key] = {
@@ -1791,7 +1791,7 @@ class CustomOpsCompiler(GraphCompiler):
                     for pred in predicates:
                         m = self._eval_predicate(pred, original_scan.table)
                         combined = m if combined is None else pc.and_(combined, m)
-                    mask_np = combined.to_numpy(zero_copy_only=False)
+                    mask_np = _np_of(combined, zero_copy_only=False)
 
                 N = int(mask_np.sum()) if mask_np is not None else original_scan.table.num_rows
                 self._N = N
@@ -1810,7 +1810,7 @@ class CustomOpsCompiler(GraphCompiler):
                             gids = remap[gids]
                             n_groups = len(present_idx)
                             unique_key_cols = {
-                                k: v.take(pa.array(present_idx.astype(np.int64)))
+                                k: v.take(_npa(present_idx.astype(np.int64)))
                                 for k, v in unique_key_cols.items()
                             }
                     extra_inputs["__group_ids__"] = gids
@@ -1833,7 +1833,7 @@ class CustomOpsCompiler(GraphCompiler):
                 # 4b-derived: pre-compute case_when/isin/startswith, then apply mask
                 for deriv_name, deriv_expr in derived_specs:
                     arr = self._eval_expr_arrow(deriv_expr, original_scan.table)
-                    np_arr = arr.to_numpy(zero_copy_only=False).astype(
+                    np_arr = _np_of(arr, zero_copy_only=False).astype(
                         np.float64 if self._session_device == "cpu" else np.float32)
                     if mask_np is not None:
                         np_arr = np_arr[mask_np]
@@ -1855,7 +1855,7 @@ class CustomOpsCompiler(GraphCompiler):
             for p in predicates[1:]:
                 combined_pred = Expr("and", combined_pred, p)
             arrow_mask = self._eval_predicate(combined_pred, original_scan.table)
-            mask_np_int32 = arrow_mask.to_numpy(zero_copy_only=False).astype(np.int32)
+            mask_np_int32 = _np_of(arrow_mask, zero_copy_only=False).astype(np.int32)
 
         all_names = col_names + list(extra_inputs.keys())
         all_arrays = {**col_arrays, **extra_inputs}
@@ -2061,7 +2061,7 @@ class CustomOpsCompiler(GraphCompiler):
         }
 
         # 7 -- Assemble output ----------------------------------------
-        agg_arrays = [pa.array(np.asarray(t.to_numpy()).reshape(-1)) for t in output_vals]
+        agg_arrays = [_npa(np.asarray(_np_of(t)).reshape(-1)) for t in output_vals]
 
         if unique_key_cols:
             if (use_gpu_filter and group_keys
@@ -2071,7 +2071,7 @@ class CustomOpsCompiler(GraphCompiler):
                 surviving = np.zeros(n_groups, dtype=bool)
                 surviving[_group_ids_full[mask_np_int32.astype(bool)]] = True
                 if not surviving.all():
-                    surv_filter = pa.array(surviving)
+                    surv_filter = _npa(surviving)
                     unique_key_cols = {k: v.filter(surv_filter) for k, v in unique_key_cols.items()}
                     agg_arrays = [arr.filter(surv_filter) for arr in agg_arrays]
             key_arrays = [unique_key_cols[k] for k in group_keys]
@@ -2134,7 +2134,7 @@ class CustomOpsCompiler(GraphCompiler):
             gids = compact_gids
             n_groups = len(present_idx)
             unique_key_cols = {
-                k: v.take(pa.array(present_idx.astype(np.int64)))
+                k: v.take(_npa(present_idx.astype(np.int64)))
                 for k, v in unique_key_cols.items()
             }
 
@@ -2150,12 +2150,12 @@ class CustomOpsCompiler(GraphCompiler):
         mini_cols = {}
         for k, v in col_arrays.items():
             if v.dtype.kind in ("f", "i", "u"):   # float, int, uint only
-                mini_cols[k] = pa.array(v)
+                mini_cols[k] = _npa(v)
             else:
                 # String/object columns: preserve as-is via zero-copy pa.array
                 # (stays as dictionary/string type, no Python iteration needed)
                 try:
-                    mini_cols[k] = pa.array(v, from_pandas=True)
+                    mini_cols[k] = _npa(v, from_pandas=True)
                 except Exception:
                     pass  # skip columns that can't be converted
         mini_table = pa.table(mini_cols) if mini_cols else None
@@ -2173,7 +2173,7 @@ class CustomOpsCompiler(GraphCompiler):
                     else:
                         res = np.bincount(gids[gids >= 0], minlength=n_groups)
                     agg_names.append(name)
-                    agg_arrays.append(pa.array(np.rint(res).astype(np.int64)))
+                    agg_arrays.append(_npa(np.rint(res).astype(np.int64)))
                     continue
 
                 if expr.op not in ("sum", "min", "max", "mean"):
@@ -2184,7 +2184,7 @@ class CustomOpsCompiler(GraphCompiler):
                 if is_cpu:
                     if self._is_simple_col(expr.args[0]) is not None:
                         # plain column: float32 stays float32 (zero-copy), kernels widen
-                        vals = self._eval_expr_arrow(expr.args[0], mini_table).to_numpy(
+                        vals = _np_of(self._eval_expr_arrow(expr.args[0], mini_table), 
                             zero_copy_only=False)
                         if vals.dtype != np.float32:
                             vals = vals.astype(np.float64, copy=False)
@@ -2196,7 +2196,7 @@ class CustomOpsCompiler(GraphCompiler):
                     res = kern(vals, gids, n_groups)
                 else:
                     val_pa  = self._eval_expr_arrow(expr.args[0], mini_table)
-                    vals_f32 = val_pa.to_numpy(zero_copy_only=False).astype(np.float32)
+                    vals_f32 = _np_of(val_pa, zero_copy_only=False).astype(np.float32)
                     if not vals_f32.flags["C_CONTIGUOUS"]:
                         vals_f32 = np.ascontiguousarray(vals_f32)
                     if expr.op == "sum":
@@ -2212,7 +2212,7 @@ class CustomOpsCompiler(GraphCompiler):
                     res = self._fix_infinite_extremes(res, vals if is_cpu else vals_f32, gids,
                                                       n_groups, expr.op)
                 agg_names.append(name)
-                agg_arrays.append(pa.array(res.astype(np.float64)))
+                agg_arrays.append(_npa(res.astype(np.float64)))
 
             except Exception:
                 return None  # any error → fall back to MAX Graph
@@ -2384,20 +2384,20 @@ class CustomOpsCompiler(GraphCompiler):
             dict_arr = enc.dictionary
             # Vectorised rank: sort_indices gives sorted_order[rank] = orig_dict_idx
             # Invert with rank_of[orig_dict_idx] = rank  (single numpy scatter)
-            sorted_order = pc.sort_indices(dict_arr).to_numpy(zero_copy_only=False)
+            sorted_order = _np_of(pc.sort_indices(dict_arr), zero_copy_only=False)
             rank_of = np.empty(len(dict_arr), dtype=np.int32)
             rank_of[sorted_order] = np.arange(len(sorted_order), dtype=np.int32)
             n_dict = len(dict_arr)
             if enc.indices.null_count:
                 # nulls sort after every value, in either direction (DuckDB's default): they
                 # get one extra rank past the real ones, which a descending flip leaves alone
-                is_null = enc.indices.is_null().to_numpy(zero_copy_only=False)
-                raw_idx = enc.indices.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int32)
+                is_null = _np_of(enc.indices.is_null(), zero_copy_only=False)
+                raw_idx = _np_of(enc.indices.fill_null(0), zero_copy_only=False).astype(np.int32)
                 ranks = rank_of[raw_idx] if n_dict else np.zeros(len(raw_idx), dtype=np.int32)
                 ranks = np.where(is_null, np.int32(n_dict), ranks).astype(np.int32)
                 per_col_ranks.append((ranks, n_dict + 1, n_dict))
             else:
-                raw_idx = enc.indices.to_numpy(zero_copy_only=False).astype(np.int32)
+                raw_idx = _np_of(enc.indices, zero_copy_only=False).astype(np.int32)
                 per_col_ranks.append((rank_of[raw_idx], n_dict, n_dict))
 
         # Fold the per-column ranks (most significant first) into one int32 key.
@@ -2442,7 +2442,7 @@ class CustomOpsCompiler(GraphCompiler):
                 sorted_indices = part_idx[np.argsort(composite_key[part_idx], kind='stable')]
             else:
                 sorted_indices = np.argsort(composite_key, kind='stable')
-            return table.take(pa.array(sorted_indices.astype(np.int64)))
+            return table.take(_npa(sorted_indices.astype(np.int64)))
 
         # ── GPU path ────────────────────────────────────────────────────────
         # Phase 5: prefer AOT GPU sort (no JIT, cached key array, AOT gather)
@@ -2479,8 +2479,8 @@ class CustomOpsCompiler(GraphCompiler):
         f_buf = driver.Buffer.from_numpy(desc_flag).to(self._gpu_driver)
         (out_idx,) = model.execute(k_buf, f_buf)
         # Download indices and gather on CPU (original MAX Graph gather was broken)
-        idx_np = np.asarray(out_idx.to_numpy()).reshape(-1).astype(np.int32)
-        return table.take(pa.array(idx_np.astype(np.int64)))
+        idx_np = np.asarray(_np_of(out_idx)).reshape(-1).astype(np.int32)
+        return table.take(_npa(idx_np.astype(np.int64)))
 
     def _gpu_gather_table(self, table: pa.Table, idx_tensor, N: int) -> pa.Table:
         """Gather rows of `table` using an index tensor already on GPU.
@@ -2518,7 +2518,7 @@ class CustomOpsCompiler(GraphCompiler):
             return m
 
         # Upload index once and reuse the buffer across all columns
-        idx_np = np.asarray(idx_tensor.to_numpy()).reshape(-1).astype(np.int32)
+        idx_np = np.asarray(_np_of(idx_tensor)).reshape(-1).astype(np.int32)
         idx_buf = driver.Buffer.from_numpy(idx_np).to(self._gpu_driver)
 
         gathered_arrays = []
@@ -2532,20 +2532,20 @@ class CustomOpsCompiler(GraphCompiler):
                 col = col.combine_chunks()
 
             if pa.types.is_float32(col.type):
-                np_col = col.to_numpy(zero_copy_only=False).astype(np.float32)
+                np_col = _np_of(col, zero_copy_only=False).astype(np.float32)
                 model = _get_gather_model("f32", "gather_f32", DType.float32)
                 col_buf = driver.Buffer.from_numpy(np_col).to(self._gpu_driver)
                 (out_t,) = model.execute(col_buf, idx_buf)
-                gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
+                gathered_arrays.append(_npa(np.asarray(_np_of(out_t)).reshape(-1)))
             elif pa.types.is_integer(col.type):
-                np_col = col.to_numpy(zero_copy_only=False).astype(np.int32)
+                np_col = _np_of(col, zero_copy_only=False).astype(np.int32)
                 model = _get_gather_model("i32", "gather_i32", DType.int32)
                 col_buf = driver.Buffer.from_numpy(np_col).to(self._gpu_driver)
                 (out_t,) = model.execute(col_buf, idx_buf)
-                gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
+                gathered_arrays.append(_npa(np.asarray(_np_of(out_t)).reshape(-1)))
             else:
                 # Non-numeric column: fall back to Arrow.take (index already on CPU)
-                gathered_arrays.append(col.take(pa.array(idx_np.astype(np.int64))))
+                gathered_arrays.append(col.take(_npa(idx_np.astype(np.int64))))
             gathered_names.append(col_name)
 
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
@@ -2554,7 +2554,7 @@ class CustomOpsCompiler(GraphCompiler):
         """Like _gpu_gather_table but accepts a numpy index array directly.
 
         Used in _execute_hash_join on the GPU path: the join kernels already return
-        numpy int32 index arrays, so we skip the idx_tensor.to_numpy() step of
+        numpy int32 index arrays, so we skip the _np_of(idx_tensor) step of
         _gpu_gather_table.  For float32/int32 columns the gather runs on GPU via the
         'gather_f32' / 'gather_i32' Mojo kernels; string/date columns fall back to
         PyArrow .take() on CPU.
@@ -2597,20 +2597,20 @@ class CustomOpsCompiler(GraphCompiler):
             if pa.types.is_float32(col.type):
                 model = _get_gather_model("gather_f32", DType.float32, source_len)
                 col_buf = driver.Buffer.from_numpy(
-                    col.to_numpy(zero_copy_only=False).astype(np.float32)
+                    _np_of(col, zero_copy_only=False).astype(np.float32)
                 ).to(self._gpu_driver)
                 (out_t,) = model.execute(col_buf, idx_buf)
-                gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
+                gathered_arrays.append(_npa(np.asarray(_np_of(out_t)).reshape(-1)))
             elif pa.types.is_integer(col.type):
                 model = _get_gather_model("gather_i32", DType.int32, source_len)
                 col_buf = driver.Buffer.from_numpy(
-                    col.to_numpy(zero_copy_only=False).astype(np.int32)
+                    _np_of(col, zero_copy_only=False).astype(np.int32)
                 ).to(self._gpu_driver)
                 (out_t,) = model.execute(col_buf, idx_buf)
-                gathered_arrays.append(pa.array(np.asarray(out_t.to_numpy()).reshape(-1)))
+                gathered_arrays.append(_npa(np.asarray(_np_of(out_t)).reshape(-1)))
             else:
                 # Non-numeric column (string, date, etc.): CPU fallback
-                gathered_arrays.append(col.take(pa.array(idx_int32.astype(np.int64))))
+                gathered_arrays.append(col.take(_npa(idx_int32.astype(np.int64))))
             gathered_names.append(col_name)
 
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
@@ -2807,8 +2807,8 @@ class CustomOpsCompiler(GraphCompiler):
             left_take  = self._aot_gpu.gather_table(left_table,  left_idx)
             right_take = self._aot_gpu.gather_table(right_table, right_idx)
         else:
-            left_take = left_table.take(pa.array(left_idx.astype(np.int64)))
-            right_take = right_table.take(pa.array(right_idx.astype(np.int64)))
+            left_take = left_table.take(_npa(left_idx.astype(np.int64)))
+            right_take = right_table.take(_npa(right_idx.astype(np.int64)))
 
         # Combine: all left columns + right columns excluding join keys
         arrays = []
@@ -2877,8 +2877,8 @@ class CustomOpsCompiler(GraphCompiler):
                 and left_arr.null_count == 0
                 and right_arr.null_count == 0
             ):
-                left_np = left_arr.to_numpy(zero_copy_only=False)
-                right_np = right_arr.to_numpy(zero_copy_only=False)
+                left_np = _np_of(left_arr, zero_copy_only=False)
+                right_np = _np_of(right_arr, zero_copy_only=False)
                 all_keys = np.concatenate([left_np, right_np])
                 if len(all_keys) == 0:
                     return (
@@ -2893,7 +2893,7 @@ class CustomOpsCompiler(GraphCompiler):
                     )
 
             encoded = pa.concat_arrays([left_arr, right_arr]).dictionary_encode()
-            codes = encoded.indices.fill_null(-1).to_numpy(zero_copy_only=False).astype(np.int64)
+            codes = _np_of(encoded.indices.fill_null(-1), zero_copy_only=False).astype(np.int64)
             nulls = codes < 0
             if nulls.any():
                 next_code = len(encoded.dictionary)
@@ -2915,13 +2915,13 @@ class CustomOpsCompiler(GraphCompiler):
 
     def _assemble_left_outer(self, left_table, right_table, right_on, left_idx, right_idx):
         """Assemble left-outer result. right_idx==-1 means no match (null right cols)."""
-        li64 = pa.array(left_idx.astype(np.int64))
+        li64 = _npa(left_idx.astype(np.int64))
         left_take = left_table.take(li64)
         has_match = (right_idx >= 0)
         safe_right = right_idx.copy()
         safe_right[~has_match] = 0
-        ri64 = pa.array(safe_right.astype(np.int64))
-        null_mask_arr = pa.array(~has_match)
+        ri64 = _npa(safe_right.astype(np.int64))
+        null_mask_arr = _npa(~has_match)
         arrays, names = [], []
         for col_name in left_table.column_names:
             arrays.append(left_take.column(col_name))
@@ -2975,7 +2975,7 @@ class CustomOpsCompiler(GraphCompiler):
             _POST_OP_MODEL_CACHE[ck1] = m1
         rk_in = rk if n_right > 0 else np.zeros(1, dtype=np.int32)
         (mc_t,) = m1.execute(lk, rk_in)
-        mc = np.asarray(mc_t.to_numpy()).reshape(-1).astype(np.int32)
+        mc = np.asarray(_np_of(mc_t)).reshape(-1).astype(np.int32)
         total = int(mc.sum())
         offsets = np.zeros(n_left, dtype=np.int32)
         if n_left > 1:
@@ -3001,8 +3001,8 @@ class CustomOpsCompiler(GraphCompiler):
             m2 = self._session.load(g)
             _POST_OP_MODEL_CACHE[ck2] = m2
         lo_t, ro_t = m2.execute(lk, rk_in, offsets)
-        left_idx  = np.asarray(lo_t.to_numpy()).reshape(-1).astype(np.int32)
-        right_idx = np.asarray(ro_t.to_numpy()).reshape(-1).astype(np.int32)
+        left_idx  = np.asarray(_np_of(lo_t)).reshape(-1).astype(np.int32)
+        right_idx = np.asarray(_np_of(ro_t)).reshape(-1).astype(np.int32)
         return left_idx, right_idx
 
     def _hash_join_left_mojo_gpu(self, left_keys, right_keys):
@@ -3046,7 +3046,7 @@ class CustomOpsCompiler(GraphCompiler):
             m1 = self._session.load(g)
             _POST_OP_MODEL_CACHE[ck1] = m1
         (mc_t,) = m1.execute(lk, rk_in, max_key_arr)
-        mc = np.asarray(mc_t.to_numpy()).reshape(-1).astype(np.int32)
+        mc = np.asarray(_np_of(mc_t)).reshape(-1).astype(np.int32)
         total = int(mc.sum())
         offsets = np.zeros(n_left, dtype=np.int32)
         if n_left > 1:
@@ -3089,8 +3089,8 @@ class CustomOpsCompiler(GraphCompiler):
             m2 = self._session.load(g)
             _POST_OP_MODEL_CACHE[ck2] = m2
         lo_t, ro_t = m2.execute(lk, rk_in, offsets, right_sorted_idx, right_key_starts, right_count)
-        left_idx  = np.asarray(lo_t.to_numpy()).reshape(-1).astype(np.int32)
-        right_idx = np.asarray(ro_t.to_numpy()).reshape(-1).astype(np.int32)
+        left_idx  = np.asarray(_np_of(lo_t)).reshape(-1).astype(np.int32)
+        right_idx = np.asarray(_np_of(ro_t)).reshape(-1).astype(np.int32)
         return left_idx, right_idx
 
     @staticmethod
@@ -3184,7 +3184,7 @@ class CustomOpsCompiler(GraphCompiler):
             _POST_OP_MODEL_CACHE[cache_key_count] = model_count
 
         (match_counts_out,) = model_count.execute(left_keys_i32, right_keys_i32)
-        match_counts = np.asarray(match_counts_out.to_numpy()).reshape(-1).astype(np.int32)
+        match_counts = np.asarray(_np_of(match_counts_out)).reshape(-1).astype(np.int32)
 
         # -- Python bridge: total + offsets --
         total = int(match_counts.sum())
@@ -3221,8 +3221,8 @@ class CustomOpsCompiler(GraphCompiler):
             _POST_OP_MODEL_CACHE[cache_key_scatter] = model_scatter
 
         left_out_t, right_out_t = model_scatter.execute(left_keys_i32, right_keys_i32, offsets)
-        left_idx = np.asarray(left_out_t.to_numpy()).reshape(-1).astype(np.int32)
-        right_idx = np.asarray(right_out_t.to_numpy()).reshape(-1).astype(np.int32)
+        left_idx = np.asarray(_np_of(left_out_t)).reshape(-1).astype(np.int32)
+        right_idx = np.asarray(_np_of(right_out_t)).reshape(-1).astype(np.int32)
 
         return left_idx, right_idx
 
@@ -3273,7 +3273,7 @@ class CustomOpsCompiler(GraphCompiler):
         rk_buf = driver.Buffer.from_numpy(right_keys_i32).to(self._gpu_driver)
         mk_buf = driver.Buffer.from_numpy(max_key_buf).to(self._gpu_driver)
         match_counts_out, _ = model_count.execute(lk_buf, rk_buf, mk_buf)
-        match_counts = np.asarray(match_counts_out.to_numpy()).reshape(-1).astype(np.int32)
+        match_counts = np.asarray(_np_of(match_counts_out)).reshape(-1).astype(np.int32)
 
         # -- Python bridge --
         total = int(match_counts.sum())
@@ -3324,8 +3324,8 @@ class CustomOpsCompiler(GraphCompiler):
         rks_buf = driver.Buffer.from_numpy(right_starts).to(self._gpu_driver)
         rkc_buf = driver.Buffer.from_numpy(right_count).to(self._gpu_driver)
         left_out_t, right_out_t = model_scatter.execute(lk_buf, rk_buf, off_buf, rsi_buf, rks_buf, rkc_buf)
-        left_idx = np.asarray(left_out_t.to_numpy()).reshape(-1).astype(np.int32)
-        right_idx = np.asarray(right_out_t.to_numpy()).reshape(-1).astype(np.int32)
+        left_idx = np.asarray(_np_of(left_out_t)).reshape(-1).astype(np.int32)
+        right_idx = np.asarray(_np_of(right_out_t)).reshape(-1).astype(np.int32)
 
         return left_idx, right_idx
 
@@ -3334,7 +3334,7 @@ class CustomOpsCompiler(GraphCompiler):
         """Dictionary-encode group keys into contiguous int32 group ids."""
         if len(keys) == 1:
             encoded = _encode_key(table.column(keys[0]))
-            ids = encoded.indices.to_numpy(zero_copy_only=False).astype(np.int32, copy=False)
+            ids = _np_of(encoded.indices, zero_copy_only=False).astype(np.int32, copy=False)
             return ids, len(encoded.dictionary), {keys[0]: encoded.dictionary}
 
         encodings = []
@@ -3352,8 +3352,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         composite = np.zeros(len(table), dtype=np.int32)
         for i, enc in enumerate(encodings):
-            idx = enc.indices.to_numpy(zero_copy_only=False)
-            composite += (idx * strides[i]).astype(np.int32)
+            idx = _np_of(enc.indices, zero_copy_only=False)
+            composite += idx.astype(np.int32) * np.int32(strides[i])
 
         if max_groups <= 1024:
             present_mask = np.zeros(max_groups, dtype=bool)
@@ -3372,7 +3372,7 @@ class CustomOpsCompiler(GraphCompiler):
             for i, k in enumerate(keys):
                 key_idx = (present // strides[i]) % sizes[i]
                 unique_key_cols[k] = encodings[i].dictionary.take(
-                    pa.array(key_idx.astype(np.int64))
+                    _npa(key_idx.astype(np.int64))
                 )
             return dense_ids, n_groups, unique_key_cols
 
@@ -3384,7 +3384,7 @@ class CustomOpsCompiler(GraphCompiler):
         unique_key_cols = {}
         for i, k in enumerate(keys):
             key_idx = ((unique_composite // strides[i]) % sizes[i]).astype(np.int64)
-            unique_key_cols[k] = encodings[i].dictionary.take(pa.array(key_idx))
+            unique_key_cols[k] = encodings[i].dictionary.take(_npa(key_idx))
 
         return dense_ids, n_groups, unique_key_cols
 
@@ -3392,7 +3392,7 @@ class CustomOpsCompiler(GraphCompiler):
         """Multi-key group ID encoding using the Mojo group_composite kernel.
 
         Phase 16: replaces the NumPy per-key loop
-            composite += enc.indices.to_numpy() * stride
+            composite += _np_of(enc.indices) * stride
         with a single fused Mojo kernel pass over all key columns simultaneously.
         This improves cache efficiency (one memory pass vs K passes) for
         multi-column groupby (Q7, Q8, Q9, Q10).
@@ -3417,7 +3417,7 @@ class CustomOpsCompiler(GraphCompiler):
 
             # Extract int32 index arrays from dictionary encoding
             key_arrs = [
-                e.indices.to_numpy(zero_copy_only=False).astype(np.int32)
+                _np_of(e.indices, zero_copy_only=False).astype(np.int32)
                 for e in encodings
             ]
             # Pad to exactly 4 key slots with zero arrays
@@ -3447,7 +3447,7 @@ class CustomOpsCompiler(GraphCompiler):
                 for i, k in enumerate(keys):
                     key_idx = (present // strides_list[i]) % sizes[i]
                     unique_key_cols[k] = encodings[i].dictionary.take(
-                        pa.array(key_idx.astype(np.int64))
+                        _npa(key_idx.astype(np.int64))
                     )
                 return dense_ids, n_groups, unique_key_cols
 
@@ -3458,7 +3458,7 @@ class CustomOpsCompiler(GraphCompiler):
             unique_key_cols = {}
             for i, k in enumerate(keys):
                 key_idx = ((unique_composite // strides_list[i]) % sizes[i]).astype(np.int64)
-                unique_key_cols[k] = encodings[i].dictionary.take(pa.array(key_idx))
+                unique_key_cols[k] = encodings[i].dictionary.take(_npa(key_idx))
             return dense_ids, n_groups, unique_key_cols
         except Exception:
             return None
@@ -3501,7 +3501,7 @@ class CustomOpsCompiler(GraphCompiler):
             model = self._session.load(graph)
             _POST_OP_MODEL_CACHE[cache_key] = model
         (out,) = model.execute(k0, k1, k2, k3, strides_i64)
-        return np.asarray(out.to_numpy()).reshape(-1)
+        return np.asarray(_np_of(out)).reshape(-1)
 
     @staticmethod
     def _build_group_ids_cached(table, keys, gpu_compiler=None):
@@ -3519,6 +3519,13 @@ class CustomOpsCompiler(GraphCompiler):
         cached = _GROUP_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
+
+        # Dictionary-encoded keys (F-015): ids straight from the Arrow code buffers.
+        from . import group_keys as _group_keys
+        result = _group_keys.build(table, keys)
+        if result is not None:
+            _GROUP_ENCODE_CACHE[cache_key] = result
+            return result
 
         # GPU single integer-key path: skip PyArrow dictionary_encode entirely
         if (gpu_compiler is not None
@@ -3558,10 +3565,10 @@ class CustomOpsCompiler(GraphCompiler):
         if self._aot_gpu is None:       # no GPU AOT library: the caller encodes on the CPU (no MAX Graph JIT)
             return None
         try:
-            keys_np = col_arr.to_numpy(zero_copy_only=False).astype(np.int32)
+            keys_np = _np_of(col_arr, zero_copy_only=False).astype(np.int32)
             n = len(keys_np)
             if n == 0:
-                return np.array([], dtype=np.int32), 0, {key_name: pa.array([], type=pa.int32())}
+                return np.array([], dtype=np.int32), 0, {key_name: _npa([], type=pa.int32())}
 
             # Capacity: next power of two >= 2*n (load factor <= 0.5)
             cap = 1
@@ -3610,8 +3617,8 @@ class CustomOpsCompiler(GraphCompiler):
                 kt_buf = driver.Buffer.from_numpy(key_table_np).to(self._gpu_driver)
                 it_buf = driver.Buffer.from_numpy(id_table_np).to(self._gpu_driver)
                 group_ids_t, n_groups_t = model.execute(k_buf, c_buf, kt_buf, it_buf)
-                dense_ids = np.asarray(group_ids_t.to_numpy()).reshape(-1).astype(np.int32)
-                n_groups  = int(np.asarray(n_groups_t.to_numpy()).reshape(-1)[0])
+                dense_ids = np.asarray(_np_of(group_ids_t)).reshape(-1).astype(np.int32)
+                n_groups  = int(np.asarray(_np_of(n_groups_t)).reshape(-1)[0])
 
             # ── Reconstruct unique key values (vectorized, O(N log N)) ────────
             # For each dense ID 0..n_groups-1 find the first original position.
@@ -3622,7 +3629,7 @@ class CustomOpsCompiler(GraphCompiler):
                 sorted_gids, np.arange(n_groups, dtype=np.int32), side='left'
             )
             first_occurrence = sort_order[first_in_sorted].astype(np.int64)
-            unique_keys = col_arr.take(pa.array(first_occurrence))
+            unique_keys = col_arr.take(_npa(first_occurrence))
             return dense_ids, n_groups, {key_name: unique_keys}
 
         except Exception:

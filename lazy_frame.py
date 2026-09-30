@@ -11,6 +11,7 @@ from typing import Any, List, Literal, Optional, Union, Dict
 from dataclasses import dataclass
 from .lazy_expr import Expr, col
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 
 
 # %% ../nbs/02_lazy_frame.ipynb 4
@@ -262,8 +263,12 @@ class LazyFrame:
             # CPU plan: fused aggregates may still co-process with the GPU once their
             # columns are resident there (see coproc_fused), and start that upload otherwise.
             from . import coproc_fused as _cf
-            with _cf.policy(gpu_fraction=gpu_fraction):
-                result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
+            with _cf.deferred_background() as _bg:
+                if decision.estimate is not None and decision.gpu_available:
+                    # GPU start-up for later queries waits until this CPU query has returned.
+                    _bg.later(lambda: _am.get_gpu_warmup().start())
+                with _cf.policy(gpu_fraction=gpu_fraction), _cf.query_running():
+                    result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3
         prov = dict(prov)
@@ -426,13 +431,13 @@ class LazyFrame:
             if isinstance(arr, pa.ChunkedArray):
                 arr = arr.combine_chunks()
             if pa.types.is_integer(arr.type) or pa.types.is_floating(arr.type):
-                np_arr = arr.to_numpy(zero_copy_only=False).astype(_np.float64)
+                np_arr = _np_of(arr, zero_copy_only=False).astype(_np.float64)
                 numeric_cols[name] = np_arr[~_np.isnan(np_arr)]
         stat_names = ["count", "mean", "std", "min", "25%", "50%", "75%", "max"]
-        stats: dict = {"statistic": pa.array(stat_names)}
+        stats: dict = {"statistic": _npa(stat_names)}
         for name, vals in numeric_cols.items():
             n = len(vals)
-            stats[name] = pa.array([
+            stats[name] = _npa([
                 float(n),
                 float(_np.mean(vals))              if n > 0 else float("nan"),
                 float(_np.std(vals, ddof=1))       if n > 1 else 0.0,

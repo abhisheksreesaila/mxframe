@@ -373,6 +373,7 @@ def _col_bytes(tables, names) -> int:
 def _key_card(name, tables, rows) -> int:
     import pyarrow as pa
     import pyarrow.compute as pc
+    from .np_arrow import array as _npa
     for t in tables:
         if t is None or name not in t.column_names:
             continue
@@ -384,7 +385,7 @@ def _key_card(name, tables, rows) -> int:
         # Strided, not a prefix: data is often sorted or clustered by the key.
         import numpy as np
         idx = np.unique(np.linspace(0, len(column) - 1, min(_SAMPLE_ROWS, len(column))).astype(np.int64))
-        sample = column.take(pa.array(idx))
+        sample = column.take(_npa(idx))
         d = pc.count_distinct(sample).as_py()
         if d < 0.5 * len(sample):          # saturated: the sample saw (nearly) every value
             return max(1, d)
@@ -539,7 +540,7 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         from .calibration import get_calibration
         calib = get_calibration()
     if gpu is None:
-        gpu = get_gpu_warmup(calib) if getattr(calib, "has_gpu", False) else _NO_GPU
+        gpu = get_gpu_warmup(calib, start=False) if getattr(calib, "has_gpu", False) else _NO_GPU
     est = estimate_plan(plan, calib, gpu)
     if not gpu.available:
         return AutoDecision("cpu", "no gpu", est, gpu_available=False)
@@ -600,8 +601,12 @@ def _init_gpu():
     return gpu
 
 
-def get_gpu_warmup(calib=None) -> GpuWarmup:
-    """Process-wide GPU warm-up: CUDA context + GPU AOT library, started in the background."""
+def get_gpu_warmup(calib=None, start: bool = True) -> GpuWarmup:
+    """Process-wide GPU warm-up: CUDA context + GPU AOT library, started in the background.
+
+    ``start=False`` returns it unstarted (its remaining cost counts in full) so a
+    CPU-bound query can start it after it has returned.
+    """
     global _warmup
     with _warmup_lock:
         if _warmup is None:
@@ -612,5 +617,6 @@ def get_gpu_warmup(calib=None) -> GpuWarmup:
                 except Exception:
                     pass
             _warmup = GpuWarmup(_init_gpu, expected_ms=expected if expected != float("inf") else 250.0)
+        if start:
             _warmup.start()
         return _warmup

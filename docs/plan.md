@@ -72,11 +72,12 @@ Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain ho
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
 
-## F-006 Router co-processing for grouped and global aggregates [review]
+## F-006 Router co-processing for grouped and global aggregates [done]
+Open for Abhishek: the two unticked items below are not achievable on PCIe x8 for host data (measured); keep them as future-hardware goals or drop them.
 Needs: F-002, F-003, F-005 · Files: `coproc.py` (new), hook in `custom_ops.py`
 Done so far: `auto_mode.Placer` (cpu/gpu/split cost decision), `coproc.run_router` (morsel queue, prepare/compute overlap, fallible GPU worker), `gpu_stream.DeviceStager` (pinned slots, async H2D), `residency.ResidencyTracker` (LRU GPU copies, pins).
 Physics on the reference box (measured 2026-09-29): GPU link is PCIe 4.0 **x8** — pinned H2D 13.4 GB/s, pageable 11 GB/s, stager ~9 GB/s; host DRAM (Ryzen 5900X, dual-channel DDR4) ~40–50 GB/s. So a scan-aggregate over host-resident data is ~4× faster on all CPU cores than shipping it to the GPU, and splitting a pure scan gains little (both devices read the same DRAM). The GPU earns its keep on (a) joins / high-cardinality group-bys (CPU latency-bound), (b) repeat queries over GPU-resident columns, (c) idle-link background upload of hot columns during CPU-bound queries so the next query finds them resident.
-Design as built (measured 2026-09-30, SF10 Q1 fused stage, 60M rows): CPU 57 ms, GPU from host 353 ms, GPU resident 39 ms, CPU 40% + GPU 60% resident 25 ms; a Router streaming host data to the GPU was 67–160 ms (worse than CPU), and a dynamic morsel queue on resident data 42 ms (each GPU call has ~4.5 ms fixed cost). So `coproc_fused`: host data → CPU + background upload of the query's columns and group ids; resident data → static split, one GPU call + multi-core CPU, fraction balanced from calibration and refined by `observe`. Break-even: first run of a table is CPU (+ background upload, ~0–15 ms extra), second run pays the one-time GPU warm-up, then 1.3–1.4× faster than CPU-only (public API, SF10 Q1: 43 ms vs 58 ms).
+Design as built (measured 2026-09-30, SF10 Q1 fused stage, 60M rows): CPU 57 ms, GPU from host 353 ms, GPU resident 39 ms, CPU 40% + GPU 60% resident 25 ms; a Router streaming host data to the GPU was 67–160 ms (worse than CPU), and a dynamic morsel queue on resident data 42 ms (each GPU call has ~4.5 ms fixed cost). So `coproc_fused`: host data → CPU + background upload of the query's columns and group ids; resident data → static split, one GPU call + multi-core CPU, fraction balanced from calibration and refined by `observe`. Break-even (fresh process, public API, SF10 Q1, re-measured after moving all CUDA calls off the query thread): run 0 is ~1.0–1.2 s with or without co-processing (cold costs unrelated to it, see F-015); runs 1–2 pay the one-time GPU warm-up of the split (57–107 ms vs 51–96 ms); from run 3 on the split is 38–45 ms vs 51–60 ms CPU-only.
 - [x] decomposable aggregations run on both devices at once; partial aggregates merged (Router, static split)
 - [x] split ratio from calibration (refined online); `gpu_fraction=` overrides; results identical to `cpu` for 1, 2 and all threads (tests)
 - [x] GPU failures inside a split are redone on CPU; CUDA errors disable the GPU; residency never serves a stale or freed device copy (pinned entries, owners held, zero-copy columns only)
@@ -131,12 +132,40 @@ Needs: F-002 merged · Found by F-003 calibration (2026-09-30)
 - [x] GPU per-row cost measured with device-resident input is within 2x of memory bandwidth (calibrated today at 2–4 ms per million rows: slower than single-threaded CPU). Find where the time goes: per-call `DeviceContext()` creation, per-call upload/alloc in the Python wrappers, launch config
 - [x] GPU wrappers accept device pointers (residency / Router) as well as NumPy arrays
 
-## F-013 Calibration and masked-kernel refresh after F-012 [todo]
+## F-013 Calibration and masked-kernel refresh after F-012 [done]
 Needs: F-012 merged · Found by re-running calibration (2026-09-30)
-- [ ] GPU masked global aggregates (`masked_global_*_gpu`) at memory speed: 73 ms per 30M rows today vs 7 ms on CPU (same seq_cst/CAS atomics issue F-012 fixed for group ops?)
-- [ ] CPU `sort_topk` probe times the engine's new radix sort, not PyArrow (`sort_topk@cpu` estimates 2.2 s at 30M)
-- [ ] a `pipeline` probe on both devices (fused kernel, Q1-shaped program, resident input on GPU) so co-processing starts from measured fits, not defaults
-- [ ] `join_total@cpu` is not a separate fit (planner prices CPU joins with `join`)
+- [x] GPU masked global aggregates (`masked_global_*_gpu`) at memory speed: 73 ms per 30M rows today vs 7 ms on CPU (same seq_cst/CAS atomics issue F-012 fixed for group ops?)
+- [x] CPU `sort_topk` probe times the engine's new radix sort, not PyArrow (`sort_topk@cpu` estimates 2.2 s at 30M)
+- [x] a `pipeline` probe on both devices (fused kernel, Q1-shaped program, resident input on GPU) so co-processing starts from measured fits, not defaults
+- [x] `join_total@cpu` is not a separate fit (planner prices CPU joins with `join`)
+
+## F-014 Engine uses the fast kernels it has [todo]
+Needs: F-011, F-013 merged · Found by F-013
+- [ ] CPU sort in `custom_ops._apply_sort_custom` uses `AOTKernels.sort_indices` (parallel radix, ~69 ms / 10M) instead of `np.argsort` / `argpartition`; `compiler.py` post-op sort likewise
+- [ ] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` is flaky on a shared GPU (fails ~1 in 3 even alone): find out whether it is memory pressure (cuMemAlloc 2) or a real ordering bug
+- [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
+
+## F-015 Cold first query: 1.1 s vs 50 ms warm [done]
+Needs: none · Found 2026-09-30: fresh process, SF10 lineitem already in memory, first `compute(device="auto")` of Q1 takes 1.0–1.2 s; the same query right after takes ~50 ms. The headline metric is the first run, so this is the biggest remaining gap.
+- [x] profile the first query in a fresh process; list where the ~1 s goes. Fresh process, SF10 lineitem in memory (`dictionary="auto"`), first Q1-shaped `compute(device="cpu")`, ms:
+
+  | cost item | before | after |
+  |---|---|---|
+  | `encode_key` x2: `pc.unique` unused-entry check | 300 | 0 (only present combinations become groups) |
+  | `encode_key` x2: `combine_dictionary` (unify ~60-458 chunk dictionaries incl. remapping the rows) | 176 | ~1 (unify the tiny dictionaries only; skipped when shared) |
+  | codes int8/int32 -> int32 `astype` | 119 | 0 (codes read in place, any width) |
+  | Python/NumPy glue | 157 | ~5 |
+  | `group_composite` | 99 | inside the pass below |
+  | group ids in total | 851 | ~95 = page pre-fault of the 240 MB ids ~30 + composite/presence pass ~38 + dense remap ~18 |
+  | `import max.engine` / `max.graph` (lazy now, never imported on CPU paths) | ~153 | 0 |
+  | fused pipeline kernel | 44 | ~48 (same as warm) |
+  | `dlopen` of the three kernel libraries (Mojo runtime load, first time) | ~30 | ~30 |
+  | rest (plan, bind_chunks, calibration, ...) | ~20 | ~20 |
+  | **total** | **1075** | **~170** |
+
+  Finding: faulting the fresh 240 MB ids array from 24 Mojo threads inside the hot pass cost 190 ms vs 36 ms on touched pages; a separate parallel zero-fill first (~30 ms) fixes it.
+- [x] first-query SF10 Q1 (table in memory) under 200 ms on `cpu` and `auto`, results unchanged. After the orchestrator's auto changes (c32636f), 7 fresh-process runs each, machine load 4-7: cpu 172 179 194 173 175 179 168 (median 175 ms); auto 229 194 181 176 179 179 173 (median 179 ms). Before: cpu 984-1116, auto 1082-1205. Q1 result identical to the old path (and to DuckDB on SF1 in `tests/test_group_keys_review.py`).
+- [ ] follow-up (not done): a uint8 group-id variant in the fused kernel (<= 256 groups) would cut the 240 MB ids array to 60 MB and remove most of the ~95 ms.
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
