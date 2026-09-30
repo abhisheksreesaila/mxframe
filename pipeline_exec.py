@@ -57,40 +57,47 @@ def _run_gpu(pk, prog: PipelineProgram, cc: ChunkedColumns, gids, n_groups: int,
     return merge_partials(prog, parts)
 
 
+def _decline(compiler, reason: str):
+    """Remember why a plan was not served (``compiler.last_fused_decline``) and let the caller continue."""
+    compiler.last_fused_decline = reason
+    return None
+
+
 def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=None,
                         t0: Optional[float] = None) -> Optional[pa.Table]:
     if not enabled():
-        return None
+        return _decline(compiler, "disabled (MXFRAME_FUSED_PIPELINE=0)")
     shape = _shape(plan)
     if shape is None:
-        return None
+        return _decline(compiler, f"plan is not Aggregate(Filter*(Scan)): {type(plan).__name__}"
+                                  f" over {type(getattr(plan, 'input', None)).__name__}")
     predicates, agg_node, scan = shape
     table: pa.Table = scan.table
     n_rows = table.num_rows
     if n_rows == 0 or not agg_node.aggs:
-        return None
+        return _decline(compiler, "empty input or no aggregates")
     try:
         from . import pipeline_kernels as pk
     except Exception:
-        return None
+        return _decline(compiler, "pipeline kernels unavailable")
 
     if getattr(compiler, "_device_arg", None) == "auto":
         compiler._maybe_switch_device(n_rows)
     device = compiler._session_device
     if device == "gpu" and not pk.gpu_available():
-        return None
+        return _decline(compiler, "libmxpipeline_gpu.so not built")
     if not pk.cpu_available():
-        return None
+        return _decline(compiler, "libmxpipeline_cpu.so not built")
 
     prog = compile_pipeline(predicates, list(agg_node.aggs), table)
     if prog is None:
-        return None
+        return _decline(compiler, "expression not supported by the bytecode compiler")
     try:
         cc = prog.bind_chunks(table)
     except Unsupported:
-        return None
+        return _decline(compiler, "a column has nulls or an unsupported type")
     if cc.n_cols and cc.n_rows != n_rows:
-        return None
+        return _decline(compiler, "column lengths differ")
 
     t_start = t0 if t0 is not None else _time.perf_counter()
     group_keys: List[str] = []
@@ -111,10 +118,10 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         gids, n_groups, unique_key_cols = compiler._build_group_ids_cached(
             gk_table, group_keys, gpu_compiler=compiler)
         if n_groups <= 0:
-            return None
+            return _decline(compiler, "no groups")
         gids = np.ascontiguousarray(gids, dtype=np.int32)
         if len(gids) != n_rows:
-            return None
+            return _decline(compiler, "group ids do not cover the rows")
 
     used = "cpu"
     partials = None

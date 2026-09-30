@@ -51,6 +51,7 @@ comptime MORSEL = 65536
 comptime MAX_REGS = 64
 comptime HDR = 16
 comptime BUDGET_BYTES = 768 * 1024 * 1024
+comptime MERGE_GROUPS = 16384
 
 comptime FP = UnsafePointer[Float64, MutAnyOrigin]
 comptime IP = UnsafePointer[Int32, MutAnyOrigin]
@@ -601,28 +602,39 @@ def mx_pipeline_cpu(
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
         parallelize[worker](nthreads)
 
-    # merge worker partials into the output
-    for a in range(A):
-        var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
-        for g in range(G):
-            var acc = out_vals[a * G + g]
+    # merge worker partials into the output (parallel over group ranges when there are many groups)
+    @parameter
+    def merge(chunk: Int):
+        var g0 = chunk * MERGE_GROUPS
+        var g1 = min(g0 + MERGE_GROUPS, G)
+        for a in range(A):
+            var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+            for g in range(g0, g1):
+                var acc = out_vals[a * G + g]
+                for t in range(nthreads):
+                    var q = pv_all + t * pv_stride + (a * G + g) * NL
+                    for l in range(NL):
+                        if kind == OP_AGG_SUM:
+                            acc += q[l]
+                        elif kind == OP_AGG_MIN:
+                            acc = min(acc, q[l])
+                        else:
+                            acc = max(acc, q[l])
+                out_vals[a * G + g] = acc
+        for g in range(g0, g1):
+            var c = Int64(0)
             for t in range(nthreads):
-                var q = pv_all + t * pv_stride + (a * G + g) * NL
+                var q = pc_all + t * pc_stride + g * NL
                 for l in range(NL):
-                    if kind == OP_AGG_SUM:
-                        acc += q[l]
-                    elif kind == OP_AGG_MIN:
-                        acc = min(acc, q[l])
-                    else:
-                        acc = max(acc, q[l])
-            out_vals[a * G + g] = acc
-    for g in range(G):
-        var c = Int64(0)
-        for t in range(nthreads):
-            var q = pc_all + t * pc_stride + g * NL
-            for l in range(NL):
-                c += q[l]
-        out_cnt[g] = c
+                    c += q[l]
+            out_cnt[g] = c
+
+    var merge_chunks = (G + MERGE_GROUPS - 1) // MERGE_GROUPS
+    if nthreads > 1 and merge_chunks > 1:
+        parallelize[merge](merge_chunks, nthreads)
+    else:
+        for chunk in range(merge_chunks):
+            merge(chunk)
 
     pv_all.free()
     pc_all.free()

@@ -125,6 +125,26 @@ def _column_dtypes(cc: ChunkedColumns) -> List[int]:
     return [b.dt for b in cc.chunks[0]]
 
 
+def _chunk_table(cc: ChunkedColumns, n_rows: int):
+    """The kernel's chunk table (row range and per-column base address per chunk), built once per binding."""
+    cached = getattr(cc, "_cpu_table", None)
+    if cached is not None:
+        return cached
+    n_cols = cc.n_cols
+    if cc.chunks:
+        tbl = np.empty((len(cc.bounds), 2 + n_cols), dtype=np.int64)
+        for k, ((s, e), arrs) in enumerate(zip(cc.bounds, cc.chunks)):
+            tbl[k, 0], tbl[k, 1] = s, e
+            for c, b in enumerate(arrs):
+                tbl[k, 2 + c] = b.addr - s * b.itemsize
+    else:  # no column data (e.g. count-only over gids): one dummy chunk spanning the rows
+        tbl = np.array([[0, n_rows]], dtype=np.int64)
+    col_dt = np.array(_column_dtypes(cc) or [0], dtype=np.int32)
+    if cc.chunks:                       # the dummy table depends on the row count: not cached
+        cc._cpu_table = (tbl, col_dt)
+    return tbl, col_dt
+
+
 def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarray], n_groups: int,
                      start: int, end: int, threads: Optional[int] = None) -> Partials:
     """Run the program over rows ``[start, end)`` on the CPU (all cores by default).
@@ -143,17 +163,7 @@ def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarra
     n_slots = program.n_slots
     vals = np.empty((n_slots, n_groups), dtype=np.float64)
     cnt = np.empty(n_groups, dtype=np.int64)
-    n_cols = cc.n_cols
-    if cc.chunks:
-        bounds = cc.bounds
-        tbl = np.empty((len(bounds), 2 + n_cols), dtype=np.int64)
-        for k, ((s, e), arrs) in enumerate(zip(bounds, cc.chunks)):
-            tbl[k, 0], tbl[k, 1] = s, e
-            for c, b in enumerate(arrs):
-                tbl[k, 2 + c] = b.addr - s * b.itemsize
-    else:  # no column data (e.g. count-only over gids): one dummy chunk spanning the rows
-        tbl = np.array([[0, n_rows]], dtype=np.int64)
-    col_dt = np.array(_column_dtypes(cc) or [0], dtype=np.int32)
+    tbl, col_dt = _chunk_table(cc, n_rows)
     rc = lib.mx_pipeline_cpu(
         _addr(program.code), _addr(program.consts), _addr(program.set_bytes),
         _addr(program.set_meta), _addr(tbl), int(tbl.shape[0]), _addr(col_dt),
