@@ -157,7 +157,7 @@ def test_more_shapes_do_not_import_pandas(shape):
     }[shape]
     code = f"""import sys; sys.path.insert(0, {str(root)!r}); import conftest, datetime
 import numpy as np, pyarrow as pa
-from mxframe import LazyFrame, col, lit
+from mxframe import LazyFrame, col, lit, when
 from mxframe.np_arrow import array as A
 n = 1000; rng = np.random.default_rng(0)
 t = pa.table({{"k": A(rng.integers(0, 5, n).astype(np.int32)), "v": A(rng.random(n)), "d": A(rng.integers(0, 3, n).astype(np.int32))}})
