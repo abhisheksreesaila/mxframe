@@ -126,9 +126,38 @@ def _nvidia_driver_string() -> Optional[str]:
 def _gpu_identity() -> Optional[Dict[str, Any]]:
     """(name, driver, memory) of GPU 0 as seen through CUDA_VISIBLE_DEVICES, or None.
 
-    Uses the CUDA driver API directly (cheap; no MAX import).  Tests monkeypatch
-    this function to simulate machines with and without a GPU.
+    Reads /proc/driver/nvidia when it can (no CUDA initialisation, so loading the
+    calibration never makes a CPU-bound first query wait ~40 ms on cuInit), else
+    asks the CUDA driver. Tests monkeypatch this function to simulate machines
+    with and without a GPU.
     """
+    ident = _proc_gpu_identity()
+    return ident if ident is not None else _cuda_gpu_identity()
+
+
+def _proc_gpu_identity() -> Optional[Dict[str, Any]]:
+    """NVIDIA model + driver from /proc when every visible GPU is the same model, else None.
+
+    ``mem_bytes`` is 0 here; the stored calibration carries the measured value.
+    """
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if vis is not None and vis.strip() in ("", "-1"):
+        return None
+    try:
+        models = []
+        for info in sorted(Path("/proc/driver/nvidia/gpus").glob("*/information")):
+            for line in info.read_text().splitlines():
+                if line.startswith("Model:"):
+                    models.append(line.split(":", 1)[1].strip())
+        driver = _nvidia_driver_string()
+    except Exception:
+        return None
+    if not models or driver is None or len(set(models)) != 1:
+        return None
+    return {"name": models[0], "driver": driver, "mem_bytes": 0}
+
+
+def _cuda_gpu_identity() -> Optional[Dict[str, Any]]:
     for lib_name in ("libcuda.so.1", "libcuda.so"):
         try:
             lib = ctypes.CDLL(lib_name)

@@ -262,8 +262,12 @@ class LazyFrame:
             # CPU plan: fused aggregates may still co-process with the GPU once their
             # columns are resident there (see coproc_fused), and start that upload otherwise.
             from . import coproc_fused as _cf
-            with _cf.policy(gpu_fraction=gpu_fraction):
-                result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
+            with _cf.deferred_background() as _bg:
+                if decision.estimate is not None and decision.gpu_available:
+                    # GPU start-up for later queries waits until this CPU query has returned.
+                    _bg.later(lambda: _am.get_gpu_warmup().start())
+                with _cf.policy(gpu_fraction=gpu_fraction):
+                    result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3
         prov = dict(prov)

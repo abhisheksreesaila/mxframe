@@ -54,6 +54,45 @@ class Policy:
 
 
 _policy: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_policy", default=None)
+_deferred: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_deferred", default=None)
+
+
+class _Background:
+    """GPU work queued while a query runs; started when the query has returned."""
+
+    def __init__(self):
+        self.threads = []
+        self.callbacks = []
+
+    def later(self, fn) -> None:
+        self.callbacks.append(fn)
+
+    def flush(self) -> None:
+        threads, self.threads = self.threads, []
+        callbacks, self.callbacks = self.callbacks, []
+        for fn in callbacks:
+            try:
+                fn()
+            except Exception:
+                pass
+        for t in threads:
+            t.start()
+
+
+@contextlib.contextmanager
+def deferred_background():
+    """Queue background uploads (and ``later`` callbacks) until the block exits.
+
+    A CPU-bound query should not share its cores and memory bandwidth with GPU
+    start-up or uploads meant for the *next* query.
+    """
+    bg = _Background()
+    token = _deferred.set(bg)
+    try:
+        yield bg
+    finally:
+        _deferred.reset(token)
+        bg.flush()
 
 
 def current_policy() -> Optional[Policy]:
@@ -187,6 +226,9 @@ def wait_for_uploads(timeout: float = 30.0) -> bool:
         if not threads:
             return True
         for t in threads:
+            if t.ident is None:            # queued behind a running query, not started yet
+                time.sleep(0.005)
+                continue
             t.join(max(0.0, deadline - time.monotonic()))
         if time.monotonic() >= deadline:
             with _lock:
@@ -278,7 +320,11 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
 
         t = threading.Thread(target=run, name="mxframe-resident-upload", daemon=True)
         _inflight[key] = t
-    t.start()
+    bg = _deferred.get()
+    if bg is not None:
+        bg.threads.append(t)
+    else:
+        t.start()
 
 
 FAILED_RETRY_S = 120.0   # a failed or rejected upload (e.g. shared-GPU memory pressure) is retried after this
