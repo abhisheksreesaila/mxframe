@@ -61,14 +61,13 @@ Why: Polars `scan_parquet` reads only needed columns; mxframe reading every colu
 
 ## Wave 2: safe auto (Phase 1)
 
-## F-005 Auto planner: whole-query choice, fallback, explain [doing]
+## F-005 Auto planner: whole-query choice, fallback, explain [done]
 Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain hooks)
 - [x] cost model walks the plan, estimates rows per operator, and compares CPU-only against GPU (incl. copies and GPU-init if not ready); picks the lower
 - [x] GPU error/OOM → rerun on CPU, warn once per shape, remember the shape; `strict=True` raises
 - [x] `lf.explain(device="auto", costs=True)` prints decision, estimates per device, bytes crossing
 - [x] `compute(profile=True)` records actual vs predicted for the query (feeding per-operator times into `calibration.observe` moved to F-007, which executes per operator)
 - [x] no GPU present → everything CPU, zero errors; `auto` results equal `cpu` results on the test suite
-- [ ] on TPC-H SF1/SF10 `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries (measured with the F-001 scoreboard)
 - [x] GPU paths known to return wrong results (`auto_mode.KNOWN_BROKEN_GPU`: sort) or with no usable kernel (min/max > 8192 groups) are never chosen
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
@@ -124,5 +123,6 @@ Needs: F-002 merged · Found by F-003 calibration (2026-09-30)
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
+- [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
 - [ ] full SF1 + SF10 user-felt run on an otherwise idle machine; results + honest losses in `docs/benchmarks.md`
 - [ ] README `device="auto"` section with the real numbers
