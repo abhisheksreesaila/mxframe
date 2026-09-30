@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
 import pyarrow.compute as pc
 
 __all__ = ["is_dictionary", "decode", "combine_dictionary", "encode_key", "dict_predicate"]
@@ -88,7 +88,7 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
     if op in _CMP:
         if not (args[1].op == "lit"):
             return None
-        fn = lambda v: _CMP[op](v, args[1].args[0])          # noqa: E731
+        fn = lambda v: _CMP[op](v, _npscalar(args[1].args[0]))   # noqa: E731
     elif op == "isin":
         fn = lambda v: pc.is_in(v, value_set=_npa(args[1], type=v.type))   # noqa: E731
     elif op == "startswith":
@@ -109,6 +109,6 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
         # is_in is never null.  Null rows (null index) match only a None in the value set.
         out = pc.take(per_entry, d.indices)
         if d.null_count:
-            out = pc.if_else(d.indices.is_null(), None in args[1], out)
+            out = pc.if_else(d.indices.is_null(), _npscalar(None in args[1]), out)
         return out
     return pc.take(per_entry, d.indices)

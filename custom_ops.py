@@ -8,7 +8,7 @@ __all__ = ['KERNELS_PATH', 'WARP_SIZE', 'MAX_GROUPS', 'AUTO_GPU_THRESHOLD', 'GPU
 # %% ../nbs/04_custom_ops.ipynb 2
 from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, take_rows as _take_rows
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
@@ -616,7 +616,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "year":
             col_arr = self._eval_expr_arrow(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
-                return pc.cast(pc.divide(col_arr, pa.scalar(10000, type=pa.int32())), pa.int32())
+                return pc.cast(pc.divide(col_arr, _npscalar(10000, type=pa.int32())), pa.int32())
             return pc.year(col_arr)
         if op in ("and", "__and__"):
             return pc.and_kleene(self._eval_expr_arrow(args[0], table),
@@ -1199,7 +1199,7 @@ class CustomOpsCompiler(GraphCompiler):
             groups = {(): list(range(n))}
 
         for row_indices in groups.values():
-            sub = table.take(row_indices)
+            sub = table.take(_npa(np.asarray(row_indices, dtype=np.int64)))
             if order_by:
                 sort_keys = [(c, "descending" if descending else "ascending")
                              for c in order_by]
@@ -1291,9 +1291,9 @@ class CustomOpsCompiler(GraphCompiler):
                 return None
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply}[expr.op]
             if isinstance(l, int):
-                l = pa.scalar(l, type=r.type)
+                l = _npscalar(l, type=r.type)
             if isinstance(r, int):
-                r = pa.scalar(r, type=l.type)
+                r = _npscalar(r, type=l.type)
             try:
                 return fn(l, r)
             except pa.ArrowInvalid:            # overflow in the column's own width
@@ -2616,8 +2616,23 @@ class CustomOpsCompiler(GraphCompiler):
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
 
     def _apply_distinct_custom(self, table, distinct_node):
-        cols = distinct_node.subset or table.column_names
-        return table.group_by(cols).aggregate([])
+        """Distinct rows of ``cols`` in first-appearance order (like pyarrow's group_by).
+
+        Uses the engine's own group-key encoding: pyarrow's Table.group_by imports
+        pyarrow.dataset and with it pandas (~150 ms of a first query).
+        """
+        cols = list(distinct_node.subset or table.column_names)
+        sub = table.select(cols)
+        if sub.num_rows == 0 or any(sub.column(c).null_count for c in cols):
+            return sub.group_by(cols).aggregate([])
+        try:
+            gids, n_groups, _ = self._build_group_ids(sub, cols)
+        except Exception:
+            return sub.group_by(cols).aggregate([])
+        gids = np.asarray(gids, dtype=np.int64)
+        first = np.full(int(n_groups), len(gids), dtype=np.int64)
+        np.minimum.at(first, gids, np.arange(len(gids), dtype=np.int64))
+        return sub.take(_npa(np.sort(first[first < len(gids)])))
 
     def _apply_post_ops_custom(self, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct using Mojo kernels (not PyArrow compute)."""
@@ -2893,7 +2908,7 @@ class CustomOpsCompiler(GraphCompiler):
                     )
 
             encoded = pa.concat_arrays([left_arr, right_arr]).dictionary_encode()
-            codes = _np_of(encoded.indices.fill_null(-1), zero_copy_only=False).astype(np.int64)
+            codes = _np_of(encoded.indices.fill_null(_npscalar(-1, type=encoded.indices.type)), zero_copy_only=False).astype(np.int64)
             nulls = codes < 0
             if nulls.any():
                 next_code = len(encoded.dictionary)

@@ -38,3 +38,24 @@ def test_read_parquet_does_not_import_pandas(tmp_path):
     out = _run(f"import mxframe as mx; mx.read_parquet({str(p)!r}, columns=['x']).compute(device='cpu'); print('pandas' in sys.modules)",
                {"MXFRAME_WARM": "0"})
     assert out == "False"
+
+
+def test_fork_right_after_import_does_not_deadlock():
+    out = _run("""
+import os, signal, time
+import numpy as np, pyarrow as pa
+import mxframe
+from mxframe import LazyFrame, col
+ok = 0
+for delay in (0.001, 0.005, 0.01, 0.02):
+    pid = os.fork()
+    if pid == 0:
+        signal.alarm(20)
+        t = pa.table({"k": np.arange(100, dtype=np.int32) % 3, "v": np.ones(100)})
+        LazyFrame(t).groupby("k").agg(col("v").sum()).compute(device="cpu")
+        os._exit(0)
+    _, status = os.waitpid(pid, 0)
+    ok += int(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)
+print(ok)
+""")
+    assert out.splitlines()[-1] == "4"

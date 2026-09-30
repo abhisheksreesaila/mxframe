@@ -47,6 +47,11 @@ class PlanOptimizer:
         if changed:
             trace.append("merge_adjacent_filters")
 
+        current, changed = self._push_filters_through_joins(current)
+        if changed:
+            trace.append("push_filters_through_joins")
+            current, _ = self._merge_adjacent_filters(current)
+
         current, changed = self._collapse_nested_limits(current)
         if changed:
             trace.append("collapse_nested_limits")
@@ -96,6 +101,64 @@ class PlanOptimizer:
                     node.right_on,
                     node.how,
                 )
+            return node
+
+        return walk(plan), changed
+
+    # ── predicate pushdown ──────────────────────────────────────────────
+    # A join's output is its left columns plus its right non-key columns. A
+    # conjunct of a filter above a join moves to the side that owns every column
+    # it reads: either side for an inner join, only the left side for a left
+    # join (a right-side predicate there must see the nulls). Names present on
+    # both sides are ambiguous and never pushed. Filtering before a join is
+    # what every query engine does (e.g. TPC-H Q14 joins ~75K lineitem rows
+    # instead of 6M).
+
+    def _push_filters_through_joins(self, plan: LogicalPlan) -> Tuple[LogicalPlan, bool]:
+        changed = False
+
+        def push(node: LogicalPlan, conjuncts: List[Expr]) -> LogicalPlan:
+            """Apply ``conjuncts`` on top of ``node``, sinking what can sink."""
+            nonlocal changed
+            if isinstance(node, Join) and conjuncts and node.how in ("inner", "left"):
+                lcols, rcols = _output_columns(node.left), _output_columns(node.right)
+                if lcols is not None and rcols is not None:
+                    r_visible = rcols - set(node.right_on)
+                    to_left, to_right, stay = [], [], []
+                    for c in conjuncts:
+                        used = _expr_columns(c)
+                        if used is None or not used:
+                            stay.append(c)
+                        elif used <= lcols and not (used & r_visible):
+                            to_left.append(c)
+                        elif node.how == "inner" and used <= r_visible and not (used & lcols):
+                            to_right.append(c)
+                        else:
+                            stay.append(c)
+                    if to_left or to_right:
+                        changed = True
+                        node = Join(push(node.left, to_left), push(node.right, to_right),
+                                    node.left_on, node.right_on, node.how)
+                        return _wrap(node, stay)
+            return _wrap(walk(node), conjuncts)
+
+        def walk(node: LogicalPlan) -> LogicalPlan:
+            if isinstance(node, Filter):
+                return push(node.input, _conjuncts(node.predicate))
+            if isinstance(node, Join):
+                return Join(walk(node.left), walk(node.right), node.left_on, node.right_on, node.how)
+            if isinstance(node, Project):
+                return Project(walk(node.input), node.exprs)
+            if isinstance(node, Aggregate):
+                return Aggregate(walk(node.input), node.group_by, node.aggs)
+            if isinstance(node, Sort):
+                return Sort(walk(node.input), node.by, node.descending)
+            if isinstance(node, Limit):
+                return Limit(walk(node.input), node.n)
+            if isinstance(node, Distinct):
+                return Distinct(walk(node.input), node.subset)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input), node.n)
             return node
 
         return walk(plan), changed
@@ -227,3 +290,70 @@ class PlanOptimizer:
 def optimize_plan(plan: LogicalPlan) -> OptimizationResult:
     """Optimize a LogicalPlan with default pass pipeline."""
     return PlanOptimizer().optimize(plan)
+
+
+def _conjuncts(expr: Expr) -> List[Expr]:
+    if getattr(expr, "op", None) in ("and", "__and__"):
+        return _conjuncts(expr.args[0]) + _conjuncts(expr.args[1])
+    return [expr]
+
+
+def _wrap(node: LogicalPlan, conjuncts: List[Expr]) -> LogicalPlan:
+    if not conjuncts:
+        return node
+    pred = conjuncts[0]
+    for c in conjuncts[1:]:
+        pred = Expr("and", pred, c)
+    return Filter(node, pred)
+
+
+def _expr_columns(expr):
+    """Column names an expression reads, or None if it contains something opaque."""
+    out = set()
+
+    def walk(e):
+        op = getattr(e, "op", None)
+        if op is None:
+            return True
+        if op == "col":
+            out.add(e.args[0])
+            return True
+        if op in ("window", "over", "rank", "dense_rank", "lag", "lead", "cum_sum", "row_number",
+                  "sum", "min", "max", "mean", "count"):
+            return False              # windows and aggregates depend on the whole input, not one row
+        return all(walk(a) for a in e.args if hasattr(a, "op"))
+
+    return out if walk(expr) else None
+
+
+def _output_columns(plan):
+    """Set of column names a subtree produces, or None when unknown."""
+    from mxframe.lazy_frame import ParquetScan
+    if isinstance(plan, Scan):
+        return set(plan.table.column_names)
+    if isinstance(plan, ParquetScan):
+        return set(plan.schema.names)
+    if isinstance(plan, (Filter, Sort, Limit, Distinct, Tail)):
+        return _output_columns(plan.input)
+    if isinstance(plan, Join):
+        l, r = _output_columns(plan.left), _output_columns(plan.right)
+        if l is None or r is None:
+            return None
+        return l | (r - set(plan.right_on))
+    if isinstance(plan, Project):
+        names = set()
+        for e in plan.exprs:
+            name = getattr(e, "_alias", None) or (e.args[0] if e.op == "col" else None)
+            if name is None:
+                return None
+            names.add(name)
+        return names
+    if isinstance(plan, Aggregate):
+        names = set()
+        for e in list(plan.group_by) + list(plan.aggs):
+            name = getattr(e, "_alias", None) or (e.args[0] if e.op == "col" else None)
+            if name is None:
+                return None
+            names.add(name)
+        return names
+    return None

@@ -211,6 +211,10 @@ def _start_background_warm():
         return None
     t = threading.Thread(target=_background_warm, name="mxframe-warm", daemon=True)
     t.start()
+    # A fork while the thread holds an import lock or is inside dlopen would leave
+    # the child waiting on a lock no thread will release: wait for it first.
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(before=lambda: t.join(30))
     return t
 
 

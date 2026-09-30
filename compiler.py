@@ -8,7 +8,7 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
 import pyarrow.compute as pc
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
@@ -276,7 +276,11 @@ class GraphCompiler:
                 return arr.combine_chunks()
             return arr
         if op == "lit":
-            return args[0]
+            # An Arrow scalar, not the Python value: PyArrow converting a Python
+            # literal inside a compute call imports pandas (~150-200 ms, once).
+            import datetime as _dt
+            v = args[0]
+            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date)) else v
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)
             if native is not None:
@@ -306,7 +310,7 @@ class GraphCompiler:
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
-                return pc.cast(pc.divide(col_arr, pa.scalar(10000, type=pa.int32())), pa.int32())
+                return pc.cast(pc.divide(col_arr, _npscalar(10000, type=pa.int32())), pa.int32())
             return pc.year(col_arr)
         if op in ("and", "or", "__and__", "__or__"):
             lhs = GraphCompiler._eval_predicate(args[0], table)
