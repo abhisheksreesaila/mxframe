@@ -157,22 +157,13 @@ def _gpu_identity() -> Optional[Dict[str, Any]]:
 
 
 def _detect_cpu_threads() -> int:
-    """Threads the CPU kernels use.  F-002 makes them multi-threaded; probe its knobs."""
+    """Worker budget of the CPU kernels (MXFRAME_CPU_THREADS / set_cpu_threads, default all cores)."""
     try:
         from . import aot_kernels as ak
-        for attr in ("get_num_threads", "num_threads", "get_cpu_threads"):
-            v = getattr(ak, attr, None)
-            if callable(v):
-                return max(1, int(v()))
-            if isinstance(v, int):
-                return max(1, v)
+        return max(1, int(ak.get_cpu_threads()))
     except Exception:
-        pass
-    for var in ("MXFRAME_NUM_THREADS", "MXFRAME_THREADS", "MXFRAME_CPU_THREADS"):
-        v = os.environ.get(var)
-        if v and v.isdigit() and int(v) > 0:
-            return int(v)
-    return 1    # kernels are single-threaded until F-002 lands
+        v = os.environ.get("MXFRAME_CPU_THREADS", "")
+        return int(v) if v.isdigit() and int(v) > 0 else max(1, os.cpu_count() or 1)
 
 
 def machine_key(identity: Optional[Dict[str, Any]] = None, version: Optional[str] = None) -> str:
