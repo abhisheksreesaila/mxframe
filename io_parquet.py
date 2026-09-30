@@ -620,6 +620,13 @@ def _analyze(plan: LogicalPlan) -> _Info:
     return info
 
 
+def _renamed_ref(name: str, refs) -> bool:
+    """True when a join could have renamed column ``name`` and the query refers to the new name
+    (``x`` -> ``x_right``, ``x_right2``, ...; see ``lazy_frame.join_output_names``)."""
+    stem = name + "_right"
+    return any(r.startswith(stem) and (len(r) == len(stem) or r[len(stem):].isdigit()) for r in refs)
+
+
 def _leaves(plan: LogicalPlan):
     if isinstance(plan, (Scan, ParquetScan)):
         yield plan
@@ -732,7 +739,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         if info.passthrough.get(id(leaf), True):
             cols = list(names)
         else:
-            cols = [n for n in names if n in info.refs] or names[:1]
+            cols = [n for n in names if n in info.refs or (info.has_join and _renamed_ref(n, info.refs))] or names[:1]
         if not read:
             return dataclasses.replace(leaf, columns=tuple(cols), filters=pushed or None)
         candidates = dictionary_columns(leaf.path, leaf.schema, leaf.dictionary,
