@@ -329,6 +329,9 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a("The harness compares every engine with DuckDB, so the reference itself is checked against the "
           "published SF1 answers (full result, or the top rows for LIMIT queries): "
           + ", ".join(f"Q{q} {n.split(': ', 1)[1]}" for q, n in off) + ".\n")
+    if any(r["sf"] != "1" for r in rows) and not any(r["engine"] == "mx-gpu" and r["sf"] != "1" for r in rows):
+        a("\n**mx-gpu was not run at SF10** (decision for this round: GPU memory is shared with other jobs and the "
+          "join engine is being rewritten in F-018); SF10 tables have no mx-gpu column.\n")
     a("\n## Methodology\n")
     a("- **One subprocess per (engine, query, scale factor)**; the worker imports the engine "
       "(timed as `import_ms`), then runs read+query+materialize once (`first_ms`, the headline) and "

@@ -438,8 +438,9 @@ def q21(t, dev):
 def q22(t, dev):
     import numpy as np
     import pyarrow.compute as pc
-    customer = t["customer"].compute(device=dev)
-    orders = t["orders"].compute(device=dev)
+    # select() the needed columns first: a bare scan is a passthrough that reads every column
+    customer = t["customer"].select("c_custkey", "c_phone", "c_acctbal").compute(device=dev)
+    orders = t["orders"].select("o_custkey").compute(device=dev)
     code = pc.utf8_slice_codeunits(pc.cast(customer["c_phone"], pa.string()), 0, 2)
     tc = customer.filter(pc.is_in(code, value_set=np_arrow.array(S.Q22_CODES)))
     tcode = code.filter(pc.is_in(code, value_set=np_arrow.array(S.Q22_CODES)))

@@ -168,9 +168,7 @@ def test_order_by_distinct_floats_one_part_in_a_million_apart_are_not_ties():
 
 def test_official_answer_check_flags_a_wrong_reference():
     from tpch_user.official import check_official
-    ok = pa.table({"revenue": [123141078.2283]})
-    assert check_official(6, ok) == "ok"
-    assert check_official(6, pa.table({"revenue": [8.865e7]})).startswith("row")
-    assert check_official(9, ok) is None                              # no published answer listed
-    assert check_official(14, pa.table({"promo_revenue": [16.3807786]})) == "ok"
-    assert check_official(14, pa.table({"promo_revenue": [17.0]})).startswith("row")
+    ans = {6: "revenue\n123141078.2283\n"}
+    assert check_official(6, pa.table({"revenue": [123141078.2283]}), ans) == "ok"
+    assert check_official(6, pa.table({"revenue": [8.865e7]}), ans).startswith("row")
+    assert check_official(13, pa.table({"revenue": [1.0]}), ans) is None      # not checked

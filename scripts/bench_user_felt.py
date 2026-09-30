@@ -132,6 +132,8 @@ def main() -> None:
     ap.add_argument("--name", default=None, help="output basename (default user-felt-<date>)")
     ap.add_argument("--resume", action="store_true",
                     help="keep the existing CSV and skip (engine, sf, query) rows already in it")
+    ap.add_argument("--force", action="store_true",
+                    help="overwrite an existing non-empty CSV of the same name (default: refuse)")
     ap.add_argument("--report-only", action="store_true", help="re-render the markdown from the CSV and exit")
     a = ap.parse_args()
 
@@ -155,6 +157,9 @@ def main() -> None:
         print(f"wrote {md_path}")
         return
 
+    if csv_path.exists() and csv_path.stat().st_size > 0 and not (a.resume or a.force):
+        raise SystemExit(f"{csv_path} already has results; pass --resume to add to it, --force to overwrite, "
+                         "or use another --name")
     # fail BEFORE the loop: data present, and workers import mxframe from THIS checkout
     suffix = "" if a.legacy_data else "_exact"
     data_dirs = {sf: root / f"tpch_sf{sf}{suffix}" for sf in sfs}
