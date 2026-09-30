@@ -237,6 +237,12 @@ Needs: none (later) · From the F-017 decision: PyArrow's decoder is the floor (
 - [ ] late materialization and page skipping using the page index
 - [ ] replaces PyArrow on the query path; PyArrow stays as the fallback for anything unsupported
 
+## F-022 GPU fallback precision and Q21 [todo]
+Needs: F-020 merged · From the F-020 report
+- [ ] the `gpu_aot` grouped-aggregate fallback accumulates float64 inputs in float32 whenever the fused pipeline declines a plan: accumulate in float64 (or route to the fused/CPU path) so device choice never changes digits
+- [ ] SF10 Q21 (2.3x Polars): parallel hash distinct for the (orderkey, suppkey) pair instead of two radix sorts of 60M composites; Arrow filter/take on the hot path
+- [ ] `encode_int` hash/sort fallback for wide key ranges (> 4x rows) if they show up in real data
+
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
 - [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
