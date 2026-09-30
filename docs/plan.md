@@ -15,7 +15,7 @@ Brief: docs/brief.md · Spec: docs/spec-auto-mode.md · Branch: `auto-mode`
 Shared rules for every ticket:
 - Headline metric = **user-felt**: fresh process, Parquet on disk, clock around read + query + result, no warm-up.
 - `device="cpu"` and `device="gpu"` results and APIs keep working; new behaviour sits behind `device="auto"`.
-- Tests: `pixi run pytest tests` (new tests go in `tests/`) plus `pixi run test-all` (legacy scripts) must pass.
+- Tests: `pixi run test` (pytest via an `mxframe`-named symlink, works in worktrees; new tests go in `tests/`) plus `pixi run test-all` (legacy scripts) must pass.
 - TPC-H data (gitignored) lives at `/home/abhisheksreesaila/Projects/mxframe/data/tpch_sf{1,10}`; worktrees read it from there.
 - Use glossary terms from the spec: `Morsel`, `DeviceCross`, `Router`, `ResidencyTracker`, `Calibration`.
 
