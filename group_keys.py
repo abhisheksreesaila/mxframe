@@ -22,6 +22,7 @@ from typing import Optional
 
 import numpy as np
 import pyarrow as pa
+from .np_arrow import array as _npa, to_numpy as _np_of
 
 __all__ = ["available", "build", "MAX_SPACE"]
 
@@ -103,7 +104,7 @@ def _unify(chunks):
     if sum(len(d) for d in dicts) > _MAX_DICT_TOTAL:
         return None
     enc = pa.concat_arrays(dicts).dictionary_encode()
-    ids = enc.indices.to_numpy(zero_copy_only=False).astype(np.int32, copy=False)
+    ids = _np_of(enc.indices, zero_copy_only=False).astype(np.int32, copy=False)
     remaps, off = [], 0
     for d in dicts:
         remaps.append(np.ascontiguousarray(ids[off:off + len(d)]))
@@ -175,5 +176,5 @@ def build(table, keys):
     unique_key_cols = {}
     for i, k in enumerate(keys):
         key_idx = ((pres // strides[i]) % sizes[i]).astype(np.int64)
-        unique_key_cols[k] = dicts[i].take(pa.array(key_idx))
+        unique_key_cols[k] = dicts[i].take(_npa(key_idx))
     return ids, n_groups, unique_key_cols

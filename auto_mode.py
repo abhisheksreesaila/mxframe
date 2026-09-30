@@ -373,6 +373,7 @@ def _col_bytes(tables, names) -> int:
 def _key_card(name, tables, rows) -> int:
     import pyarrow as pa
     import pyarrow.compute as pc
+    from .np_arrow import array as _npa
     for t in tables:
         if t is None or name not in t.column_names:
             continue
@@ -384,7 +385,7 @@ def _key_card(name, tables, rows) -> int:
         # Strided, not a prefix: data is often sorted or clustered by the key.
         import numpy as np
         idx = np.unique(np.linspace(0, len(column) - 1, min(_SAMPLE_ROWS, len(column))).astype(np.int64))
-        sample = column.take(pa.array(idx))
+        sample = column.take(_npa(idx))
         d = pc.count_distinct(sample).as_py()
         if d < 0.5 * len(sample):          # saturated: the sample saw (nearly) every value
             return max(1, d)
