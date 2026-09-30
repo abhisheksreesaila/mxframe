@@ -105,20 +105,23 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 
 ## F-011 Correctness: counts, Q15, Q21, nulls [todo]
 Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
-- [ ] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
-- [ ] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
-- [ ] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
-- [ ] float32 columns compared with float64 literals keep boundary rows (Q6 `l_discount <= 0.07` drops exact-grid rows today): compare in the column's precision, as DuckDB does on DECIMAL
-- [ ] case_when derived columns on the CPU group path are float64
-- [ ] a Limit below an Aggregate is applied (ignored today on both devices)
-- [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
-- [ ] `filter(k != "a")` with null keys doesn't raise
-- [ ] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
+- [x] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
+- [x] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
+- [x] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
+- [x] float32 columns compared with float64 literals keep boundary rows (Q6 `l_discount <= 0.07` drops exact-grid rows today): compare in the column's precision, as DuckDB does on DECIMAL
+- [x] case_when derived columns on the CPU group path are float64
+- [x] a Limit below an Aggregate is applied (ignored today on both devices)
+- [x] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
+- [x] `filter(k != "a")` with null keys doesn't raise
+- [x] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
 - [x] Q6 matches DuckDB on cpu/gpu/auto (fused CMPC compares in the column type); "global_agg" removed from `KNOWN_BROKEN_GPU`
-- [ ] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
-- [ ] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
-- [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
+- [x] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
+- [x] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
+- [x] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
+- Build notes: `tests/test_tpch_duckdb.py` is the gate (`MXFRAME_TPCH_SF10=1` adds SF10). The DuckDB reference reads the same Parquet through views that restore DATE and DECIMAL(15,2), so it runs the official TPC-H text and gives the official answers (Q6 SF1 = 123141078.2283). The old Q6 "matches DuckDB" was DuckDB on raw float32 columns, which shares the truncation below.
+- The data generator truncated DECIMAL to float32 (0.05 stored as 0.049999997): fixed in `scripts/gen_tpch_parquet.py`, regenerated as `data/tpch_sf1_exact` and `data/tpch_sf10_exact` (the older dirs are untouched; the harness prefers `_exact`). Other agents should read the `_exact` dirs.
+- `run_q5_*`/`run_q8_*` (mxframe, pandas, Polars) take `supplier=` (keyword): TPC-H Q5 matches customer and supplier nation and Q8 measures the supplier's nation; the four/six-table forms could not.
 
 ## F-012 Kernel health: crashes, hangs, per-call overhead [done]
 Needs: F-002 merged · Found by F-003 calibration (2026-09-30)

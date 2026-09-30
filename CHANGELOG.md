@@ -7,6 +7,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### ✅ Correctness against DuckDB: counts, nulls, TPC-H queries (F-011)
+- **Counts** are exact `int64` on every path (grouped and global, fused and legacy, empty results); the fused path used to return float64 and the GPU count kernel saturates at 2^24 per group (the host now counts labels).
+- **Nulls follow SQL.** An aggregate that reads a column with nulls runs on Arrow's hash aggregate: a null group key is its own group, `sum/mean/min/max/count` skip null values, a comparison with null is not true, `AND`/`OR` are three-valued, a null `CASE` condition takes `ELSE`. Sorting with null keys puts them last (it raised `IndexError`).
+- A `Sort/Limit/Distinct/Tail` below a `Filter/Project/Aggregate` is applied first (a `Limit` under an `Aggregate` was ignored).
+- Join keys of different integer (or float) widths are cast to the wider type instead of raising; the join-result cache is keyed by device; the GPU gather no longer rounds `float64` columns to `float32` (it moves the 8-byte words) and defers nulls / other widths to Arrow.
+- A numeric literal next to a `float32` column is compared in `float32` on every path (`l_discount <= 0.07` dropped the rows equal to 0.07 on the unfused paths); `case_when` values are `float64` on the CPU; `min`/`max` of a group of only ±inf returns that infinity on the legacy AOT paths.
+- New `Expr.year_of_days()` for day-number date columns (`year()` reads YYYYMMDD integers).
+- **TPC-H benchmark queries** (`scripts/benchmark_tpch.py`) follow the TPC-H text and use day-number dates (Q4, Q5, Q7, Q8, Q10, Q15, Q20 returned no rows on real Parquet; Q12's date constants were 5 days off; Q19 lacked the ship mode/instruction filter, Q13 the comment filter, Q21 the EXISTS clause). Q5 and Q8 need the supplier table: `supplier=` keyword. The pandas and Polars versions changed with them.
+- `scripts/gen_tpch_parquet.py` casts DECIMAL to `float32` through `float64` (nearest); the direct cast truncated 0.05 to 0.049999997 and TPC-H Q6 came out 28% low. Regenerated data lives in `data/tpch_sf{1,10}_exact`.
+- `tests/test_tpch_duckdb.py`: all 22 queries against DuckDB (official SQL over the same Parquet files) on `cpu`, `gpu` and `auto`, plus the pandas/Polars baselines.
+
 ### 🩺 Kernel health: GPU crashes, hangs and per-call overhead (F-012)
 - **GPU grouped aggregates** (`group_sum/min/max/count`): grid-stride kernels sized to the GPU with a block-private table in dynamic shared memory sized to the real group count (up to 12,288 groups) or straight global atomics beyond it. `group_min`/`group_max` no longer fault above 8,192 groups. The big win was in `_atomic.mojo`: atomics were `seq_cst`, which made NVPTX put a fence around every atomic; they are `monotonic` now (CUDA `atomicAdd` semantics). 30M rows, resident input: 8 to 4,096 groups went from 44 to 610 ms down to about 1 to 3 ms.
 - Skewed high-cardinality group-bys no longer collapse: a float `atomicrmw fadd` lowers to a compare-exchange loop, so a hot group cost O(k^2) retries (10M rows / 100k groups with one key at 25%: 40 s). The global path for sum/count now uses native `red.global.add.f32` and combines equal groups within a warp first (`match.any`); Zipf(1.3) is within 1.5x of uniform.
