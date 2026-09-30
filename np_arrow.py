@@ -207,7 +207,8 @@ def _byte_slices(col, idx):
     if not (pa.types.is_string(col.type) or pa.types.is_binary(col.type)):
         return None
     import pyarrow.compute as pc
-    lens = to_numpy(pc.fill_null(pc.binary_length(col), 0)).astype(np.int64, copy=False)
+    lens = pc.binary_length(col)
+    lens = to_numpy(pc.fill_null(lens, scalar(0, type=lens.type))).astype(np.int64, copy=False)   # not a Python 0: that imports pandas
     cum = np.cumsum(lens[idx])
     n, bounds, start, base = len(idx), [], 0, 0
     while start < n:

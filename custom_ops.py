@@ -2687,70 +2687,15 @@ class CustomOpsCompiler(GraphCompiler):
             return inner + ("project", tuple(e.signature() for e in plan.exprs))
         return None
 
-    def _materialize_joins(self, plan):
-        """Recursively replace Join nodes with Scan(joined_table).
+    def _materialize_joins(self, plan, needed=None):
+        """Replace Join nodes by Scans of their results (F-018: see ``join_engine``).
 
-        Walks bottom-up: materializes both sides of a Join, executes the
-        hash join (Mojo kernel or numpy), and returns a Scan of the result.
-        After this, the plan tree is a single-input chain again.
-
-        Join results are cached in _JOIN_RESULT_CACHE keyed by the stable
-        fingerprints of both input plans + join columns.  This eliminates
-        redundant join computation on hot calls where the input tables are
-        the same Python objects.
+        ``needed`` is the set of column names read from ``plan``'s output (None: all); each join
+        only produces the columns read above it, and a chain of inner joins is reordered and
+        gathered once.  Results are cached in _JOIN_RESULT_CACHE on hot calls over the same tables.
         """
-        if isinstance(plan, Scan):
-            return plan
-        if isinstance(plan, Join):
-            left_plan = self._materialize_joins(plan.left)
-            right_plan = self._materialize_joins(plan.right)
-
-            # Attempt join-result cache lookup before materialising tables.
-            left_key  = self._plan_stable_key(left_plan)
-            right_key = self._plan_stable_key(right_plan)
-            join_cache_key: tuple | None = None
-            if left_key is not None and right_key is not None:
-                join_cache_key = (
-                    left_key, right_key,
-                    tuple(plan.left_on), tuple(plan.right_on),
-                    plan.how,
-                    self._session_device,      # a GPU-computed join (float32 gathers) is not a CPU join
-                )
-                cached_join = _JOIN_RESULT_CACHE.get(join_cache_key)
-                if cached_join is not None:
-                    return Scan(cached_join)
-
-            left_table = self._plan_to_table(left_plan)
-            right_table = self._plan_to_table(right_plan)
-            joined = self._execute_hash_join(
-                left_table, right_table, plan.left_on, plan.right_on, how=plan.how
-            )
-            if join_cache_key is not None:
-                _JOIN_RESULT_CACHE[join_cache_key] = joined
-                # Evict oldest half when cache exceeds 24 entries to prevent
-                # unbounded memory accumulation across long benchmark runs.
-                if len(_JOIN_RESULT_CACHE) > 24:
-                    evict_n = 12
-                    for _old_k in list(_JOIN_RESULT_CACHE.keys())[:evict_n]:
-                        _JOIN_RESULT_CACHE.pop(_old_k, None)
-            return Scan(joined)
-        if isinstance(plan, Filter):
-            return Filter(self._materialize_joins(plan.input), plan.predicate)
-        if isinstance(plan, Project):
-            return Project(self._materialize_joins(plan.input), plan.exprs)
-        if isinstance(plan, Aggregate):
-            return Aggregate(self._materialize_joins(plan.input), plan.group_by, plan.aggs)
-        if isinstance(plan, Sort):
-            return Sort(self._materialize_joins(plan.input), plan.by, plan.descending)
-        if isinstance(plan, Limit):
-            return Limit(self._materialize_joins(plan.input), plan.n)
-        if isinstance(plan, Distinct):
-            return Distinct(self._materialize_joins(plan.input), plan.subset)
-        if isinstance(plan, Tail):
-            return Tail(self._materialize_joins(plan.input), plan.n)
-        if hasattr(plan, 'input'):
-            plan.input = self._materialize_joins(plan.input)
-        return plan
+        from . import join_engine
+        return join_engine.materialize(self, plan, needed)
 
     def _plan_to_table(self, plan) -> pa.Table:
         """Resolve a plan subtree (no Aggregate) to a concrete pa.Table via PyArrow.
@@ -3156,8 +3101,8 @@ class CustomOpsCompiler(GraphCompiler):
         if n_left == 0 or n_right == 0:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
 
-        lk = np.ascontiguousarray(left_keys.astype(np.int32))
-        rk = np.ascontiguousarray(right_keys.astype(np.int32))
+        lk = np.ascontiguousarray(left_keys.astype(np.int32, copy=False))
+        rk = np.ascontiguousarray(right_keys.astype(np.int32, copy=False))
 
         if self._aot is not None:
             mc = self._aot.join_count(lk, rk)

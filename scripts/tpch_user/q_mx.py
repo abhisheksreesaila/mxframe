@@ -66,8 +66,12 @@ def q2(t, dev):
     eu_sup = t["supplier"].join(eu, left_on="s_nationkey", right_on="n_nationkey")
     target = (t["part"].filter((col("p_size") == lit(15)) & col("p_type").contains("BRASS"))
               .select("p_partkey", "p_mfgr"))
+    # the intermediate is materialized with .compute(), so name the columns the rest of the query
+    # reads (a user would): otherwise every partsupp column, ps_comment included, is read and carried
     cand = (t["partsupp"].join(eu_sup, left_on="ps_suppkey", right_on="s_suppkey")
             .join(target, left_on="ps_partkey", right_on="p_partkey")
+            .select("ps_partkey", "ps_supplycost", "s_acctbal", "s_name", "n_name", "p_mfgr",
+                    "s_address", "s_phone", "s_comment")
             .compute(device=dev))
     c = LazyFrame(cand)
     min_costs = c.groupby("ps_partkey").agg(col("ps_supplycost").min().alias("min_supplycost"))
