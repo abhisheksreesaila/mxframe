@@ -343,6 +343,8 @@ def _pack(lparts: List[np.ndarray], rparts: List[np.ndarray]):
     for l, r in zip(lparts, rparts):
         (lo1, hi1), (lo2, hi2) = _minmax(l), _minmax(r)
         lo, hi = min(lo1, lo2), max(hi1, hi2)
+        if hi > np.iinfo(np.int64).max or lo < np.iinfo(np.int64).min:
+            return None            # uint64 keys above 2^63 don't fit the int64 packing; general path joins them
         los.append(lo)
         strides.append(total)
         total *= (hi - lo + 1)

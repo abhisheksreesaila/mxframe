@@ -1,6 +1,7 @@
 """F-018: join key types. Integer keys of different widths join after widening to the wider type, signed
 with unsigned included when a wider signed type holds both (uint32 with int32/int64, uint8 with int8...).
 uint64 with any signed integer is refused with TypeError on every path (single, composite, dense or not)."""
+import numpy as np
 import pyarrow as pa
 import pytest
 
@@ -38,3 +39,16 @@ def test_uint64_with_signed_is_refused_everywhere(other, wide):
     b2 = b.append_column("j", pa.array([2, 3], other))
     with pytest.raises(TypeError):
         LazyFrame(a2).join(LazyFrame(b2), on=["k", "j"]).compute(device="cpu")
+
+
+@pytest.mark.parametrize("device", ["cpu", "auto"])
+def test_composite_uint64_keys_above_2_63(device):
+    from mxframe import LazyFrame, col
+    top = np.uint64(2**64 - 20)
+    a = pa.table({"k1": pa.array(np.array([top, top + np.uint64(1), top, 5], dtype=np.uint64)),
+                  "k2": pa.array(np.array([1, 2, 3, 1], dtype=np.int32)), "v": pa.array([1.0, 2.0, 3.0, 4.0])})
+    b = pa.table({"k1": pa.array(np.array([top, top + np.uint64(1), 5], dtype=np.uint64)),
+                  "k2": pa.array(np.array([1, 2, 1], dtype=np.int32)), "w": pa.array([10.0, 20.0, 30.0])})
+    got = LazyFrame(a).join(LazyFrame(b), on=["k1", "k2"]).groupby().agg(col("v").sum().alias("s"), col("w").sum().alias("t")).compute(device=device)
+    # DuckDB can't take uint64 values this large; the matches are (top,1), (top+1,2), (5,1)
+    assert got["s"][0].as_py() == 1.0 + 2.0 + 4.0 and got["t"][0].as_py() == 10.0 + 20.0 + 30.0

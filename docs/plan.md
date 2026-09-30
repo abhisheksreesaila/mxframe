@@ -208,7 +208,7 @@ Before/after, mx-auto end to end via the F-001 worker (fresh process, scan_parqu
 SF1 is unchanged by design (6 row groups, 6M rows: the plain reader is already ~25 ms).
 
 
-## F-018 Join engine: order, lean materialization [review]
+## F-018 Join engine: order, lean materialization [done]
 Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q20 7.3x slower than Polars — joins dominate
 - [x] join reordering by estimated size/selectivity (filtered small sides first; e.g. Q2 joins 8M partsupp rows to supplier before the tiny filtered part table)
 - [x] late materialization: joins produce row-index vectors and gather only the columns later operators need, once, instead of materializing every column after every join (Q9: six chained joins over 60M rows)
@@ -228,6 +228,7 @@ Needs: F-018 merged · From the F-018 report (2026-09-30)
 - [ ] GPU `hash_join` prefix sum is int32 and unguarded (the CPU path now raises MemoryError before overflow) — guard or widen
 - [ ] F-016 fuzz seed 5061 fails on gpu (distinct then aggregate; also on plain auto-mode) — find and fix (float32 GPU sum?)
 - [ ] per-operator GPU placement for large joins (F-007) on top of join_engine's index vectors
+- [ ] investigate rare Mojo-runtime crashes under heavy load (SF1 Q10 segfault, Q18 futex error once each in a run with 6 concurrent fuzz processes; not reproduced in 576 stress runs) — likely related to the rare radix-sort order failure
 - [ ] a self-join of one `scan_parquet` frame (`a.join(a, on="k")`) raises KeyError 'x_right' (pre-existing)
 
 ## F-021 Native Mojo Parquet reader [todo]
