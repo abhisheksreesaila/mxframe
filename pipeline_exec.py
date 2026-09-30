@@ -159,7 +159,9 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         for k in group_keys:
             v = unique_key_cols[k]
             key_arrays.append(v if keep is None else v.filter(keep))
-        agg_arrays = [pa.array(cols[name].astype(np.float64)) for name, _, _ in prog.outputs]
+        # counts stay exact int64 (float32/float64 would saturate at 2**24 / lose exactness)
+        agg_arrays = [pa.array(cols[name].astype(np.int64 if op == "count" else np.float64))
+                      for name, op, _ in prog.outputs]
         result = pa.Table.from_arrays(key_arrays + agg_arrays,
                                       names=group_keys + [name for name, _, _ in prog.outputs])
     else:

@@ -1280,7 +1280,8 @@ class CustomOpsCompiler(GraphCompiler):
         """Grouped aggregate over zero selected rows: no groups, right column names/types."""
         agg_names = [e._alias or f"agg_{i}" for i, e in enumerate(agg_node.aggs)]
         keys = [unique_key_cols[k].slice(0, 0) for k in group_keys]
-        aggs = [pa.array([], type=pa.float64()) for _ in agg_names]
+        aggs = [pa.array([], type=pa.int64() if e.op == "count" else pa.float64())
+                for e in agg_node.aggs]
         return pa.Table.from_arrays(keys + aggs, names=list(group_keys) + agg_names)
 
     _WINDOW_OPS = frozenset({"window", "row_number", "rank", "dense_rank"})
@@ -1381,6 +1382,27 @@ class CustomOpsCompiler(GraphCompiler):
         return plan
 
     def compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
+        """Run ``plan``; the result of ``count`` aggregates is always exact int64."""
+        result = self._compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
+        return self._exact_counts(plan, result)
+
+    @classmethod
+    def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:
+        """Cast the columns of ``count`` aggregates to int64 (the kernels return float32/float64)."""
+        agg = cls._find_aggregate(plan)
+        if agg is None:
+            return result
+        for i, e in enumerate(agg.aggs):
+            if e.op != "count":
+                continue
+            name = e._alias or f"agg_{i}"
+            idx = result.schema.get_field_index(name)
+            if idx >= 0 and not pa.types.is_integer(result.schema.field(idx).type):
+                col = result.column(idx)
+                result = result.set_column(idx, name, pc.cast(pc.round(col), pa.int64()))
+        return result
+
+    def _compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
         """Optimized execution with three-tier caching + post-ops.
 
         Pipeline:
@@ -1994,10 +2016,14 @@ class CustomOpsCompiler(GraphCompiler):
             name = expr._alias or f"agg_{i}"
             try:
                 if expr.op == "count":
-                    res = (_aot.group_count(gids, n_groups) if is_cpu
-                           else _aot.group_count_f32(gids, n_groups))
+                    # exact int64 on both devices: the GPU count kernel accumulates float32
+                    # (saturates at 2**24 per group), so the host counts the labels itself
+                    if is_cpu:
+                        res = _aot.group_count(gids, n_groups)
+                    else:
+                        res = np.bincount(gids[gids >= 0], minlength=n_groups)
                     agg_names.append(name)
-                    agg_arrays.append(pa.array(res.astype(np.float64)))
+                    agg_arrays.append(pa.array(np.rint(res).astype(np.int64)))
                     continue
 
                 if expr.op not in ("sum", "min", "max", "mean"):
