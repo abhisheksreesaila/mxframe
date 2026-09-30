@@ -330,3 +330,39 @@ def test_gpu_accepts_device_resident_columns(cpu_table):
     assert np.array_equal(got.cnt, want.cnt)
     np.testing.assert_allclose(got.vals, want.vals, rtol=1e-12)
     assert half.cnt.sum() < got.cnt.sum()
+
+
+def _chunked(t, sizes):
+    """Same rows, cut into chunks of the given sizes; one column cut differently."""
+    pieces, off = [], 0
+    for sz in sizes:
+        pieces.append(t.slice(off, sz))
+        off += sz
+    out = pa.concat_tables(pieces)
+    # misalign one column's chunk boundaries against the others
+    f32 = pa.chunked_array([t.column("f32").slice(0, 777), t.column("f32").slice(777)])
+    return out.set_column(out.schema.get_field_index("f32"), "f32", f32)
+
+
+@pytest.mark.parametrize("n_groups", [1, 4])
+def test_multi_chunk_tables_need_no_concatenation(device, n_groups):
+    t = make_table(9000)
+    ct = _chunked(t, [1, 1023, 2000, 3, 4096, 1877])
+    assert ct.column("i32").num_chunks == 6 and ct.column("f32").num_chunks == 2
+    preds = PREDS["isin_str"]
+    aggs = AGGS["all_ops"] + AGGS["expr"]
+    prog = compile_pipeline(preds, aggs, ct)
+    cc = prog.bind_chunks(ct)
+    assert len(cc.bounds) > 6                       # union of both layouts
+    assert cc.bounds[0][0] == 0 and cc.bounds[-1][1] == 9000
+    assert all(a[1] == b[0] for a, b in zip(cc.bounds, cc.bounds[1:]))
+    gids = RNG.integers(0, n_groups, 9000).astype(np.int32) if n_groups > 1 else None
+    run = pk.run_pipeline_cpu if device == "cpu" else pk.run_pipeline_gpu
+    flat = compile_pipeline(preds, aggs, t)
+    want = run(flat, flat.bind(t), gids, n_groups, 0, 9000)
+    for start, end in [(0, 9000), (5, 8999), (1024, 4000)]:
+        got = run(prog, cc, gids, n_groups, start, end)
+        ref = run(flat, flat.bind(t), gids, n_groups, start, end)
+        assert np.array_equal(got.cnt, ref.cnt)
+        np.testing.assert_allclose(got.vals, ref.vals, rtol=1e-12)
+    assert want.cnt.sum() > 0

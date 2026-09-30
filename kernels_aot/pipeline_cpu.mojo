@@ -26,7 +26,12 @@ Program/ABI contract (keep in sync with pipeline_program.py):
   code   int32[]  : header (16 ints) then 5-int instructions [op,dst,a,b,c]
                     in the order prologue, pred, body, aggs.
   consts float64[], set_bytes uint8[], set_meta int64[] (offset, length, lo)*
-  cols   int64[]  : column base addresses, dtypes int32[] (0 i32,1 i64,2 f32,3 f64,4 u8)
+  chunk table int64[n_chunks, 2 + n_cols]: row_start, row_end, then per column the
+                    chunk's base address minus row_start * itemsize, so that
+                    `addr + row * itemsize` is valid for every row of the chunk
+                    (columns arrive as Arrow chunks; nothing is concatenated).
+                    A single contiguous column set is one chunk [0, n).
+  dtypes int32[] (0 i32,1 i64,2 f32,3 f64,4 u8)
   gids   int32[]  : group id per row (0 address = global aggregate, n_groups==1)
 Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
          out_cnt int64[n_groups] (rows that passed the predicate per group).
@@ -251,7 +256,9 @@ struct Prog(Copyable, Movable):
     var consts: FP
     var set_bytes: BP
     var set_meta: LP
-    var cols: LP
+    var tbl: LP
+    var n_chunks: Int
+    var tbl_stride: Int
     var dtypes: IP
     var gids: IP
     var n_groups: Int
@@ -265,12 +272,14 @@ struct Prog(Copyable, Movable):
     var nl: Int      # partial lanes per (agg, group)
 
     def __init__(out self, code: IP, consts: FP, set_bytes: BP, set_meta: LP,
-                 cols: LP, dtypes: IP, gids: IP, n_groups: Int, has_gids: Bool):
+                 tbl: LP, n_chunks: Int, dtypes: IP, gids: IP, n_groups: Int, has_gids: Bool):
         self.code = code
         self.consts = consts
         self.set_bytes = set_bytes
         self.set_meta = set_meta
-        self.cols = cols
+        self.tbl = tbl
+        self.n_chunks = n_chunks
+        self.tbl_stride = 2 + Int(code[7])
         self.dtypes = dtypes
         self.gids = gids
         self.n_groups = n_groups
@@ -293,7 +302,7 @@ struct Prog(Copyable, Movable):
         return self.code + (HDR + (base + k) * 5)
 
 
-def _run_ops(p: Prog, regs: FP, base: Int, count: Int, i0: Int, sel: IP,
+def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: IP,
              use_sel: Bool, n: Int):
     var npad = ((n + W - 1) // W) * W
     for k in range(count):
@@ -302,7 +311,7 @@ def _run_ops(p: Prog, regs: FP, base: Int, count: Int, i0: Int, sel: IP,
         var d = regs + Int(ins[1]) * VEC
         if op == OP_LOAD_COL:
             var c = Int(ins[2])
-            _load_col(d, Int(p.cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
+            _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
         elif op == OP_LOAD_CONST:
             var v = SIMD[F64, W](p.consts[Int(ins[2])])
             var i = 0
@@ -412,40 +421,60 @@ def _init_partials(p: Prog, pv: FP, pc: LP):
         pc[i] = 0
 
 
+def _find_chunk(p: Prog, row: Int) -> Int:
+    """Index of the chunk holding `row` (binary search on row_start)."""
+    var lo = 0
+    var hi = p.n_chunks - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if Int(p.tbl[mid * p.tbl_stride]) <= row:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def _process_range(p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP,
                    lo: Int, hi: Int):
-    var i0 = lo
-    while i0 < hi:
-        var n = min(VEC, hi - i0)
-        var nsel = n
-        var use_sel = False
-        if p.pred_reg >= 0:
-            _run_ops(p, regs, p.n_pro, p.n_pred, i0, sel, False, n)
-            var pr = regs + p.pred_reg * VEC
-            var k = 0
-            for i in range(n):
-                sel[k] = Int32(i)
-                k += 1 if pr[i] != 0.0 else 0
-            nsel = k
-            use_sel = nsel < n
-        if nsel > 0:
-            _run_ops(p, regs, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
-            var gp = gscratch
-            if p.has_gids:
-                var gsrc = p.gids + i0
-                if use_sel:
-                    for j in range(nsel):
-                        gscratch[j] = gsrc[Int(sel[j])]
-                else:
-                    gp = gsrc
-            _accumulate(p, regs, gp, nsel, pv, pc)
-        i0 += n
+    var pos = lo
+    while pos < hi:
+        var k = _find_chunk(p, pos)
+        var row = p.tbl + k * p.tbl_stride
+        var cols = row + 2
+        var stop = min(hi, Int(row[1]))
+        var i0 = pos
+        while i0 < stop:
+            var n = min(VEC, stop - i0)
+            var nsel = n
+            var use_sel = False
+            if p.pred_reg >= 0:
+                _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                var pr = regs + p.pred_reg * VEC
+                var kk = 0
+                for i in range(n):
+                    sel[kk] = Int32(i)
+                    kk += 1 if pr[i] != 0.0 else 0
+                nsel = kk
+                use_sel = nsel < n
+            if nsel > 0:
+                _run_ops(p, regs, cols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
+                var gp = gscratch
+                if p.has_gids:
+                    var gsrc = p.gids + i0
+                    if use_sel:
+                        for j in range(nsel):
+                            gscratch[j] = gsrc[Int(sel[j])]
+                    else:
+                        gp = gsrc
+                _accumulate(p, regs, gp, nsel, pv, pc)
+            i0 += n
+        pos = stop
 
 
 @export
 def mx_pipeline_cpu(
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
-    cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int,
 ) abi("C") -> Int:
     var code = _ip(code_a)
@@ -454,10 +483,12 @@ def mx_pipeline_cpu(
     var has_gids = gids_a != 0
     if (not has_gids) and n_groups != 1:
         return -2
-    var p = Prog(code, _fp(consts_a), _bp(set_bytes_a), _lp(set_meta_a), _lp(cols_a),
-                 _ip(dtypes_a), _ip(gids_a), n_groups, has_gids)
+    var p = Prog(code, _fp(consts_a), _bp(set_bytes_a), _lp(set_meta_a), _lp(tbl_a),
+                 n_chunks, _ip(dtypes_a), _ip(gids_a), n_groups, has_gids)
     if p.n_regs > MAX_REGS:
         return -3
+    if n_chunks < 1 and end > start:
+        return -4
     var A = p.n_aggs
     var G = n_groups
     var NL = p.nl
@@ -506,7 +537,7 @@ def mx_pipeline_cpu(
         var pc = pc_all + wid * pc_stride
         _init_partials(p, pv, pc)
         # prologue (constants) once per worker
-        _run_ops(p, regs, 0, p.n_pro, 0, sel, False, VEC)
+        _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
         while True:
             var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
             var lo = start + m * MORSEL

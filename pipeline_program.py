@@ -116,6 +116,58 @@ class Partials:
 
 
 @dataclass
+class ChunkedColumns:
+    """Column data as row-aligned chunks (nothing concatenated).
+
+    ``bounds[k] = (start, end)`` is the row range of chunk ``k`` and
+    ``chunks[k][c]`` its numpy view of column ``c``. Arrow tables read from
+    Parquet arrive in many chunks (one per row group); the kernels take them as
+    they are instead of paying for a full copy of every column.
+    """
+
+    bounds: List[Tuple[int, int]]
+    chunks: List[List[np.ndarray]]
+    n_cols: int
+
+    @property
+    def n_rows(self) -> int:
+        return self.bounds[-1][1] if self.bounds else 0
+
+    @staticmethod
+    def from_arrays(arrays: List[np.ndarray]) -> "ChunkedColumns":
+        n = min((len(a) for a in arrays), default=0)
+        return ChunkedColumns([(0, n)] if n else [], [[a[:n] for a in arrays]] if n else [], len(arrays))
+
+    def column(self, c: int) -> np.ndarray:
+        """Column ``c`` as one contiguous array (copies when it has several chunks)."""
+        parts = [ch[c] for ch in self.chunks]
+        if not parts:
+            return np.empty(0)
+        return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+def _align(per_column: List[List[Tuple[int, np.ndarray]]]) -> ChunkedColumns:
+    """Cut every column at the union of all columns' chunk boundaries."""
+    import bisect
+    cuts = sorted({s for col in per_column for s, _ in col})
+    n = min((col[-1][0] + len(col[-1][1]) if col else 0) for col in per_column) if per_column else 0
+    cuts = [c for c in cuts if c < n] + [n]
+    bounds, chunks = [], []
+    starts = [[s for s, _ in col] for col in per_column]
+    for a, b in zip(cuts, cuts[1:]):
+        if b <= a:
+            continue
+        row = []
+        for col, st in zip(per_column, starts):
+            i = bisect.bisect_right(st, a) - 1
+            cs, arr = col[i]
+            row.append(arr[a - cs:b - cs])
+        bounds.append((a, b))
+        chunks.append(row)
+    return ChunkedColumns(bounds, chunks, len(per_column))
+
+
+@dataclass
 class PipelineProgram:
     code: np.ndarray                  # int32
     consts: np.ndarray                # float64
@@ -152,6 +204,27 @@ class PipelineProgram:
         return [OP_NAMES[int(self.code[HEADER_INTS + i * INSTR_INTS])] for i in range(n)]
 
     # ── binding to data ────────────────────────────────────────────────────
+    def bind_chunks(self, table: pa.Table) -> ChunkedColumns:
+        """Like :meth:`bind` but keeps the table's chunks: no column is concatenated."""
+        per_column: List[List[Tuple[int, np.ndarray]]] = []
+        for name in self.columns:
+            if name in self.dict_arrays:
+                per_column.append([(0, _dict_codes(self.dict_arrays[name]))])
+                continue
+            col = table.column(name)
+            chunks = col.chunks if isinstance(col, pa.ChunkedArray) else [col]
+            parts, off = [], 0
+            for ch in chunks:
+                if len(ch) == 0:
+                    continue
+                arr = _column_numpy(ch)
+                if arr is None:
+                    raise Unsupported(f"column {name!r} cannot be bound")
+                parts.append((off, arr))
+                off += len(ch)
+            per_column.append(parts)
+        return _align(per_column)
+
     def bind(self, table: pa.Table) -> List[np.ndarray]:
         """Contiguous numpy arrays for ``self.columns`` (zero-copy where possible)."""
         arrays = []
