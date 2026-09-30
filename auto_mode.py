@@ -276,7 +276,9 @@ class PlanEstimate:
 
     @property
     def gpu_ms(self) -> float:
-        return sum(min(l.gpu_ms, l.cpu_ms) if l.gpu_ms == float("inf") else l.gpu_ms for l in self.lines)
+        # device="gpu" runs every operator of the query on its GPU path, so one
+        # unusable GPU operator makes the whole GPU plan impossible.
+        return sum(l.gpu_ms for l in self.lines)
 
     @property
     def h2d_bytes(self) -> int:
@@ -291,6 +293,7 @@ class AutoDecision:
     init_ms: float = 0.0
     fallback: bool = False
     actual_ms: Optional[float] = None
+    gpu_available: bool = True
 
     def explain(self) -> str:
         head = f"auto -> {self.device}  reason: {self.reason}"
@@ -300,13 +303,28 @@ class AutoDecision:
             return head
         e = self.estimate
         gpu_total = e.gpu_ms + self.init_ms
-        tail = f"  total est cpu={e.cpu_ms:.1f}ms gpu={gpu_total:.1f}ms"
-        if self.init_ms:
+        g = "n/a" if (not self.gpu_available or gpu_total == float("inf")) else f"{gpu_total:.1f}ms"
+        tail = f"  total est cpu={e.cpu_ms:.1f}ms gpu={g}"
+        if self.init_ms and g != "n/a":
             tail += f" (incl. gpu start-up {self.init_ms:.0f}ms)"
-        tail += f" h2d={_fmt_bytes(e.h2d_bytes)}"
+        if self.gpu_available:
+            tail += f" h2d={_fmt_bytes(e.h2d_bytes)}"
         if self.actual_ms is not None:
             tail += f" actual={self.actual_ms:.1f}ms"
-        return "\n".join([head] + [l.line() for l in e.lines] + [tail])
+        lines = [l.line() if self.gpu_available else l.line().split(" gpu=")[0] for l in e.lines]
+        return "\n".join([head] + lines + [tail])
+
+
+# GPU paths that currently return wrong results; auto never picks the GPU for a
+# plan that would run them. Remove an entry once its fix lands (F-012 / F-011).
+KNOWN_BROKEN_GPU = {
+    "sort": "GPU sort returns rows out of key order (F-012)",
+}
+
+_AGG_OP = {"sum": "group_sum", "mean": "group_sum", "count": "group_count",
+           "min": "group_min", "max": "group_max"}
+_SAMPLE_ROWS = 65_536
+_UNKNOWN_COL_BYTES = 8
 
 
 def _scan_rows_and_schema(plan):
@@ -331,92 +349,140 @@ def _expr_cols(expr, out):
     return out
 
 
-def _group_card(keys, table, rows) -> int:
-    """Estimated group count: dictionary sizes when known, else a guess."""
+def _col_bytes(tables, names) -> int:
+    """Bytes per row of the named columns (their real widths when known)."""
+    total = 0
+    for n in names:
+        w = None
+        for t in tables:
+            if t is not None and n in t.column_names:
+                typ = t.schema.field(n).type
+                try:
+                    w = typ.bit_width // 8
+                except Exception:
+                    w = None
+                break
+        total += w or _UNKNOWN_COL_BYTES
+    return max(total, 1)
+
+
+def _key_card(name, tables, rows) -> int:
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    for t in tables:
+        if t is None or name not in t.column_names:
+            continue
+        column = t.column(name)
+        if pa.types.is_dictionary(column.type):
+            return max((len(ch.dictionary) for ch in column.chunks), default=1)
+        if len(column) == 0:
+            return 1
+        # Strided, not a prefix: data is often sorted or clustered by the key.
+        import numpy as np
+        idx = np.unique(np.linspace(0, len(column) - 1, min(_SAMPLE_ROWS, len(column))).astype(np.int64))
+        sample = column.take(pa.array(idx))
+        d = pc.count_distinct(sample).as_py()
+        if d < 0.5 * len(sample):          # saturated: the sample saw (nearly) every value
+            return max(1, d)
+        return max(1, int(rows * d / len(sample)))
+    return DEFAULT_GROUPS
+
+
+def _group_card(keys, tables, rows) -> int:
     card = 1
     for k in keys:
         name = k.args[0] if getattr(k, "op", None) == "col" else None
-        c = None
-        if table is not None and name in (table.column_names if table is not None else []):
-            typ = table.schema.field(name).type
-            import pyarrow as pa
-            if pa.types.is_dictionary(typ):
-                chunks = table.column(name).chunks
-                c = max((len(ch.dictionary) for ch in chunks), default=1)
-            elif pa.types.is_string(typ) or pa.types.is_large_string(typ):
-                c = DEFAULT_GROUPS
-        if c is None:
-            c = max(1, rows // 4) if name else 64   # integer keys: many groups; derived keys (year): few
-        card *= c
+        card *= _key_card(name, tables, rows) if name else 64   # derived keys (e.g. year) have few values
     return int(max(1, min(card, max(rows, 1))))
 
 
 def estimate_plan(plan, calib, gpu) -> PlanEstimate:
-    from .lazy_frame import Scan, ParquetScan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+    from .lazy_frame import Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
     est = PlanEstimate()
+    INF = float("inf")
 
     def h2d(nbytes):
         return calib.transfer_ms(nbytes, "h2d")
 
     def walk(p):
-        """Returns (rows, a representative source table for schema lookups)."""
+        """Returns (rows, source tables, rows before the filters since the last materialisation)."""
         rows, table = _scan_rows_and_schema(p)
         if rows is not None:
-            return rows, table
+            return rows, [table], rows
         if isinstance(p, Filter):
-            n, t = walk(p.input)
+            n, ts, src = walk(p.input)
             c = calib.estimate("filter_take", "cpu", n)
             est.lines.append(OpCost("filter", n, c, c, note="host on both paths"))
-            return max(1, int(n * FILTER_SELECTIVITY)), t
+            return max(1, int(n * FILTER_SELECTIVITY)), ts, src
         if isinstance(p, Join):
-            nl, tl = walk(p.left)
-            nr, _ = walk(p.right)
-            cpu = calib.estimate("join", "cpu", nl) + calib.estimate("join", "cpu", nr) * 0.2
-            nbytes = 4 * (nl + nr)
+            nl, tl, _ = walk(p.left)
+            nr, tr, _ = walk(p.right)
+            cpu = calib.estimate("join", "cpu", nl + nr)
+            nbytes = nl * _col_bytes(tl, p.left_on) + nr * _col_bytes(tr, p.right_on)
             try:
                 g = calib.estimate_gpu_join_total(nl, nr) * JOIN_GPU_SAFETY
             except Exception:
                 g = calib.estimate("join", "gpu", nl + nr)
-            est.lines.append(OpCost("join", nl, cpu, g + h2d(nbytes), nbytes))
-            return nl, tl
+            out = max(nl, nr)          # key/foreign-key join: one row per row of the larger side
+            est.lines.append(OpCost("join", out, cpu, g + h2d(nbytes), nbytes))
+            return out, tl + tr, out
         if isinstance(p, Aggregate):
-            n, t = walk(p.input)
+            n, ts, src = walk(p.input)
             cols = set()
             for a in p.aggs:
                 _expr_cols(a, cols)
+            ops = [_AGG_OP.get(a.op, "group_sum") for a in p.aggs] or ["group_count"]
+            width = _col_bytes(ts, sorted(cols)) if cols else 4
             if p.group_by:
-                card = _group_card(p.group_by, t, n)
+                card = _group_card(p.group_by, ts, n)
                 enc = calib.estimate("group_encode", "cpu", n)
-                k = max(1, len(p.aggs))
-                cpu = enc + k * calib.estimate("group_sum", "cpu", n, card=card)
-                nbytes = n * (4 + 4 * max(1, len(cols)))
-                g = enc + k * calib.estimate("group_sum", "gpu", n, card=card) + h2d(nbytes) \
-                    + calib.transfer_ms(card * 8 * k, "d2h")
+                cpu = enc + sum(calib.estimate(o, "cpu", n, card=card) for o in ops)
+                nbytes = n * (4 + width)
+                g = enc + sum(calib.estimate(o, "gpu", n, card=card) for o in ops) + h2d(nbytes) \
+                    + calib.transfer_ms(card * 8 * len(ops), "d2h")
                 est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups"))
-                return card, t
-            k = max(1, len(p.aggs))
-            nbytes = n * 4 * max(1, len(cols))
-            cpu = k * calib.estimate("masked_sum", "cpu", n)
-            g = k * calib.estimate("masked_sum", "gpu", n) + h2d(nbytes)
-            est.lines.append(OpCost("global_agg", n, cpu, g, nbytes))
-            return 1, t
+                return card, ts, card
+            # Global aggregates run masked kernels over the unfiltered input.
+            nbytes = src * (width + 4)
+            cpu = len(ops) * calib.estimate("masked_sum", "cpu", src)
+            g = len(ops) * calib.estimate("masked_sum", "gpu", src) + h2d(nbytes)
+            est.lines.append(OpCost("global_agg", src, cpu, g, nbytes))
+            return 1, ts, 1
         if isinstance(p, Sort):
-            n, t = walk(p.input)
-            if n > 1000:
+            n, ts, src = walk(p.input)
+            cpu = calib.estimate("sort_topk", "cpu", n)
+            if "sort" in KNOWN_BROKEN_GPU:
+                est.lines.append(OpCost("sort", n, cpu, INF, note=KNOWN_BROKEN_GPU["sort"]))
+            else:
                 nbytes = n * 4
-                est.lines.append(OpCost("sort", n, calib.estimate("sort_topk", "cpu", n),
-                                        calib.estimate("sort_topk", "gpu", n) + h2d(nbytes), nbytes))
-            return n, t
+                est.lines.append(OpCost("sort", n, cpu, calib.estimate("sort_topk", "gpu", n) + h2d(nbytes), nbytes))
+            return n, ts, src
         if isinstance(p, (Project, Limit, Distinct, Tail)):
-            n, t = walk(p.input)
+            n, ts, src = walk(p.input)
             if isinstance(p, (Limit, Tail)):
                 n = min(n, p.n)
-            return n, t
+            return n, ts, src
         inner = getattr(p, "input", None)
-        return walk(inner) if inner is not None else (0, None)
+        return walk(inner) if inner is not None else (0, [None], 0)
 
     walk(plan)
     return est
+
+
+_gpu_disabled: Optional[str] = None
+
+
+def disable_gpu(reason: str) -> None:
+    """After a sticky device error (e.g. illegal address) the CUDA context is unusable."""
+    global _gpu_disabled
+    _gpu_disabled = reason
+
+
+def is_sticky_gpu_error(err: BaseException) -> bool:
+    text = f"{type(err).__name__}: {err}"
+    if isinstance(err, MemoryError) or "OUT_OF_MEMORY" in text:
+        return False
+    return "CUDA_ERROR" in text or "cuda error" in text.lower()
 
 
 _failed_shapes: set = set()
@@ -437,15 +503,18 @@ def remember_gpu_failure(plan) -> None:
 
 
 def forget_gpu_failures() -> None:
+    global _gpu_disabled
     _failed_shapes.clear()
     _warned_shapes.clear()
+    _gpu_disabled = None
 
 
 def warn_fallback_once(plan, err: BaseException) -> None:
     k = _shape_key(plan)
-    if k in _warned_shapes:
+    if k is not None and k in _warned_shapes:
         return
-    _warned_shapes.add(k)
+    if k is not None:
+        _warned_shapes.add(k)
     warnings.warn(f"mxframe auto: GPU execution failed ({type(err).__name__}: {err}); "
                   f"fell back to CPU. This query shape will plan CPU from now on.",
                   RuntimeWarning, stacklevel=3)
@@ -461,15 +530,21 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         gpu = get_gpu_warmup(calib) if getattr(calib, "has_gpu", False) else _NO_GPU
     est = estimate_plan(plan, calib, gpu)
     if not gpu.available:
-        return AutoDecision("cpu", "no gpu", est)
+        return AutoDecision("cpu", "no gpu", est, gpu_available=False)
+    if _gpu_disabled is not None:
+        return AutoDecision("cpu", f"gpu disabled after error: {_gpu_disabled}", est, gpu_available=False)
     if _shape_key(plan) in _failed_shapes:
         return AutoDecision("cpu", "this query shape failed on gpu before", est)
+    init = gpu.remaining_init_ms()
+    blocked = [l for l in est.lines if l.gpu_ms == float("inf")]
+    if blocked:   # checked before overrides: never run a GPU path known to be wrong or missing
+        why = blocked[0].note or f"{blocked[0].op} has no usable gpu kernel"
+        return AutoDecision("cpu", f"gpu path unusable: {why}", est, init)
     wanted = set((placement or {}).values())
     if "gpu" in wanted:
-        return AutoDecision("gpu", "placement override", est, gpu.remaining_init_ms())
+        return AutoDecision("gpu", "placement override", est, init)
     if wanted == {"cpu"}:
         return AutoDecision("cpu", "placement override", est)
-    init = gpu.remaining_init_ms()
     cpu_ms, gpu_ms = est.cpu_ms, est.gpu_ms + init
     margin = {"gpu": 0.0, "cpu": PREFER_CPU_MARGIN}.get(prefer, GPU_WIN_MARGIN)
     if gpu_ms < cpu_ms * (1 - margin):

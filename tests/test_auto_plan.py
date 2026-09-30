@@ -159,3 +159,110 @@ def test_explain_auto_costs():
     lf = LazyFrame(table(1000)).groupby("k").agg(col("v").sum().alias("s"))
     text = lf.explain(device="auto", costs=True)
     assert "auto ->" in text and "group_agg" in text
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+class MinMaxCalib(Calib):
+    """GPU min/max unusable (as calibration reports above 8192 groups)."""
+
+    def estimate(self, op, device, rows, card=None, **shape):
+        if device == "gpu" and op in ("group_min", "group_max"):
+            return float("inf")
+        return super().estimate(op, device, rows, card=card, **shape)
+
+
+def test_any_unusable_gpu_operator_makes_the_gpu_plan_impossible():
+    left, right = table(5000), table(5000)
+    plan = (LazyFrame(left).join(LazyFrame(right), on="k")
+            .groupby("k").agg(col("v").max().alias("m")).plan)
+    d = am.choose_device(plan, calib=MinMaxCalib(join_cpu=5000.0, join_gpu=1.0), gpu=Gpu())
+    assert d.device == "cpu"
+    assert d.estimate.gpu_ms == float("inf")
+
+
+def test_known_broken_gpu_sort_keeps_query_on_cpu():
+    left, right = table(5000), table(5000)
+    plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
+    d = am.choose_device(plan, calib=Calib(join_cpu=5000.0, join_gpu=1.0), gpu=Gpu())
+    assert d.device == "cpu"
+    assert any(l.op == "sort" and l.gpu_ms == float("inf") for l in d.estimate.lines)
+
+
+def test_string_key_group_count_is_sampled_not_guessed():
+    n = 20_000
+    t = pa.table({"a": pa.array(["A", "N", "R", "A"] * (n // 4)),
+                  "b": pa.array(["F", "O"] * (n // 2)),
+                  "v": pa.array(np.ones(n, dtype=np.float32))})
+    est = am.estimate_plan(LazyFrame(t).groupby("a", "b").agg(col("v").sum().alias("s")).plan, Calib(), Gpu())
+    (g,) = est.lines
+    assert "~6 groups" in g.note  # 3 x 2 sampled distinct values
+
+
+def test_join_output_rows_do_not_depend_on_side_order():
+    small, big = table(1000), table(9000)
+    a = am.estimate_plan(LazyFrame(small).join(LazyFrame(big), on="k").groupby("k").agg(col("v").sum()).plan, Calib(), Gpu())
+    b = am.estimate_plan(LazyFrame(big).join(LazyFrame(small), on="k").groupby("k").agg(col("v").sum()).plan, Calib(), Gpu())
+    assert a.lines[-1].rows == b.lines[-1].rows == 9000
+
+
+def test_global_agg_copies_the_unfiltered_input():
+    t = table(10_000)
+    est = am.estimate_plan(LazyFrame(t).filter(col("d") > lit(3)).groupby().agg(col("v").sum().alias("s")).plan,
+                           Calib(), Gpu())
+    g = est.lines[-1]
+    assert g.op == "global_agg"
+    assert g.h2d_bytes >= 10_000 * 4  # engine runs masked kernels over all rows
+
+
+def test_sticky_gpu_error_disables_gpu_for_the_process(monkeypatch):
+    import mxframe.custom_ops as co
+    real = co.CustomOpsCompiler.compile_and_run
+
+    def fail_on_gpu(self, plan, **kw):
+        if self._session_device == "gpu":
+            raise RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS")
+        return real(self, plan, **kw)
+
+    monkeypatch.setattr(co.CustomOpsCompiler, "compile_and_run", fail_on_gpu)
+    am.forget_gpu_failures()
+    from mxframe import gpu_stream
+    if not gpu_stream.cuda_available():
+        pytest.skip("needs a GPU to reach the GPU compiler")
+    lf = LazyFrame(table(3000)).groupby("k").agg(col("v").sum().alias("s"))
+    want = lf.compute(device="cpu")
+    with pytest.warns(RuntimeWarning):
+        got = lf.compute(device="auto", placement={"group_agg": "gpu"})
+    assert got.sort_by("k").equals(want.sort_by("k"))
+    other = LazyFrame(table(3000)).groupby("d").agg(col("v").sum().alias("s"))
+    d = am.choose_device(other.plan, calib=Calib(), gpu=Gpu(), placement={"group_agg": "gpu"})
+    assert d.device == "cpu" and "disabled" in d.reason
+    am.forget_gpu_failures()
+
+
+def test_no_gpu_explain_prints_na():
+    d = am.choose_device(grouped(table(1000)), calib=Calib(has_gpu=False), gpu=Gpu(available=False))
+    assert "gpu=n/a" in d.explain()
+
+
+def test_group_count_of_sorted_keys_is_not_undercounted():
+    n = 2_000_000
+    keys = np.repeat(np.arange(n // 4, dtype=np.int32), 4)       # sorted, 500K groups
+    t = pa.table({"k": keys, "v": np.ones(n, dtype=np.float32)})
+    est = am.estimate_plan(LazyFrame(t).groupby("k").agg(col("v").min().alias("m")).plan, Calib(), Gpu())
+    card = int(est.lines[0].note.split("~")[1].split(" ")[0].replace(",", ""))
+    assert card >= 250_000
+
+
+def test_placement_override_cannot_select_a_broken_gpu_path():
+    left, right = table(5000), table(5000)
+    plan = LazyFrame(left).join(LazyFrame(right), on="k").sort("k").plan
+    d = am.choose_device(plan, calib=Calib(), gpu=Gpu(), placement={"join": "gpu"})
+    assert d.device == "cpu" and "unusable" in d.reason
+
+
+def test_only_device_errors_disable_the_gpu():
+    assert am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS"))
+    assert not am.is_sticky_gpu_error(MemoryError("x"))
+    assert not am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
+    assert not am.is_sticky_gpu_error(TypeError("unsupported dtype"))

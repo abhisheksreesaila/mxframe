@@ -202,11 +202,13 @@ class LazyFrame:
             optimize: if True (default), run logical plan optimization passes first.
             validate: if True (default), validate logical plan invariants before execution.
             prefer: auto only; "gpu" or "cpu" biases the choice without forcing it.
-            placement: auto only; per-operator override, e.g. {"join": "gpu"}.
-            gpu_fraction: auto only; fixed GPU share for Router splits (co-processing).
+            placement: auto only; e.g. {"join": "gpu"}. Phase 1 places the whole
+                query: any "gpu" value runs the query on GPU, all "cpu" on CPU.
+            gpu_fraction: reserved for co-processing (Router splits); ignored for now.
             strict: auto only; raise GPU errors instead of falling back to CPU.
-            profile: auto only; record the actual time next to the estimate
-                (see `last_auto_decision` and `explain(device="auto", costs=True)`).
+            profile: auto only; record the actual query time next to the estimate
+                (see `last_auto_decision`). Per-operator timings that refine the
+                calibration arrive with per-operator placement.
         """
         from .io_parquet import resolve_plan
         source_plan = resolve_plan(self.plan)
@@ -250,6 +252,8 @@ class LazyFrame:
                 if strict:
                     raise
                 _am.remember_gpu_failure(plan)
+                if _am.is_sticky_gpu_error(err):
+                    _am.disable_gpu(f"{type(err).__name__}: {err}")
                 _am.warn_fallback_once(plan, err)
                 decision.device, decision.fallback = "cpu", True
                 result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
