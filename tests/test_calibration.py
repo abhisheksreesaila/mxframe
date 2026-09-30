@@ -396,20 +396,20 @@ def test_gpu_group_cost_tracks_cardinality_within_30_percent():
 
 def test_bucketed_fits_survive_reload_and_route_observations():
     c = default_calibration(GPU)
-    c.fits["group_sum@gpu:<=64"] = Fit(0.1, 1.5e-6, n_points=4)
-    c.fits["group_sum@gpu:>8192"] = Fit(0.1, 3e-6, n_points=4)
+    c.fits["group_sum@gpu:g8"] = Fit(0.1, 1.5e-6, n_points=4)
+    c.fits["group_sum@gpu:g200000"] = Fit(0.1, 3e-6, n_points=4)
     assert c.estimate("group_sum", "gpu", 1_000_000, card=8) == pytest.approx(0.1 + 1.5)
     assert c.estimate("group_sum", "gpu", 1_000_000, card=10**6) == pytest.approx(0.1 + 3.0)
     c.observe("group_sum", "gpu", 1000, 1.0, card=8, persist=False)
-    assert len(c.fits["group_sum@gpu:<=64"].obs) == 1
+    assert len(c.fits["group_sum@gpu:g8"].obs) == 1
     assert c.save()
     cal_mod.reset_calibration_cache()
-    assert "group_sum@gpu:<=64" in cal_mod.get_calibration().fits
+    assert "group_sum@gpu:g8" in cal_mod.get_calibration().fits
 
 
 def test_op_aliases_resolve_to_measured_fits():
     c = default_calibration(GPU)
-    for alias, real in [("group_agg", "group_sum"), ("join_probe", "join"), ("join_build", "join"),
+    for alias, real in [("group_agg", "group_sum"), ("join_probe", "join"),
                         ("sort", "sort_topk"), ("filter", "filter_take")]:
         assert c.estimate(alias, "cpu", 10**6) == c.estimate(real, "cpu", 10**6)
     assert c.estimate("group_agg", "gpu", 10**6, card=8) == c.estimate("group_sum", "gpu", 10**6, card=8)
@@ -578,3 +578,96 @@ def test_join_host_step_is_modelled_separately_on_cpu():
 
 def test_module_docstring_states_compute_only_contract():
     assert "NO H2D/D2H" in cal_mod.__doc__
+
+
+# ============================ fit accuracy (second review) ======================
+# Recorded bare-kernel GPU timings on the RTX 3090 (rows -> ms).  Super-linear ops.
+RECORDED = {
+    "gather": [(10_000, .023), (100_000, .023), (1_000_000, .073), (3_000_000, .209),
+               (6_000_000, .671), (12_000_000, 1.509), (30_000_000, 4.279)],
+    "join": [(10_000, .033), (100_000, .043), (1_000_000, .227), (3_000_000, .49),
+             (6_000_000, 1.389), (12_000_000, 4.381), (30_000_000, 15.014)],
+    "sort_topk": [(10_000, .222), (100_000, .442), (1_000_000, 3.579), (3_000_000, 14.909),
+                  (6_000_000, 43.208), (12_000_000, 122.738), (30_000_000, 431.456)],
+    "masked_sum": [(10_000, .074), (100_000, .109), (1_000_000, .772), (3_000_000, 2.358),
+                   (6_000_000, 4.462), (12_000_000, 8.941), (30_000_000, 22.131)],
+}
+QUICK_GRID = (10_000, 100_000, 1_000_000, 6_000_000, 30_000_000)
+
+
+@pytest.mark.parametrize("op", sorted(RECORDED))
+def test_fit_matches_recorded_points_at_large_sizes(op):
+    """Fit on the quick-grid subset; must hit the biggest sizes (where the planner decides)."""
+    pts = [[float(n), 8.0, ms] for n, ms in RECORDED[op] if n in QUICK_GRID]
+    fits, err = cal_mod._fit_points(pts, False, False)
+    f = fits[""]
+    for n, ms in RECORDED[op]:
+        if n >= 6_000_000:
+            assert abs(f.predict(n) - ms) / ms < 0.3, (op, n, f.predict(n), ms)
+    # interpolated size that was NOT in the fit
+    ms12 = dict(RECORDED[op])[12_000_000]
+    assert abs(f.predict(12_000_000) - ms12) / ms12 < 0.4
+
+
+def test_fit_exponent_persists_and_linear_ops_stay_linear():
+    pts = [[float(n), 8.0, ms] for n, ms in RECORDED["sort_topk"] if n in QUICK_GRID]
+    f = cal_mod._fit_points(pts, False, False)[0][""]
+    assert f.p > 1.2
+    assert Fit.from_dict(f.to_dict()).predict(6_000_000) == pytest.approx(f.predict(6_000_000))
+    lin = [[float(n), 8.0, 0.05 + 2e-6 * n] for n in QUICK_GRID]
+    g = cal_mod._fit_points(lin, False, False)[0][""]
+    assert g.p == 1.0 and g.predict(20_000_000) == pytest.approx(0.05 + 40.0, rel=0.02)
+
+
+def test_quick_grid_reaches_30m_rows_for_gpu_gather_join_sort():
+    assert max(cal_mod.QUICK_SIZES) == 30_000_000
+    for op in ("gather", "join", "sort_topk"):
+        assert (cal_mod.PROBES[(op, "gpu")].max_rows or 10**9) >= 30_000_000
+
+
+def test_group_cost_interpolates_within_bucket_on_log_groups():
+    clock = Clock()
+
+    def per_m(card):                       # >8192 bucket: 7.5 ms/M at 10k falling to 2.8 at 200k
+        if card <= 8192:
+            return 1.5
+        import math as m
+        return 7.5 + (2.8 - 7.5) * m.log(card / 1e4) / m.log(20)
+
+    def make(ctx, n, card):
+        cost = (0.05 + per_m(card) * n / 1e6) / 1e3
+
+        def run():
+            clock.t += cost
+        return run
+    reg = {("group_sum", "gpu"): Probe("group_sum", "gpu", make, uses_card=True, bucketed=True)}
+
+    def runner(sizes, budget, link_mb):
+        pts = cal_mod._collect_points(reg[("group_sum", "gpu")], object(), sizes, budget, clock, 0.0)
+        return [{"kind": "points", "op": "group_sum", "points": pts}]
+    cal = calibrate(registry=reg, gpu_runner=runner, gpu_init=lambda: {"total_ms": 1.0},
+                    identity=GPU, timer=clock, ctx=object(), save=False)
+    for card in (10_000, 30_000, 100_000, 200_000):
+        truth = 0.05 + per_m(card) * 30
+        assert abs(cal.estimate("group_sum", "gpu", 30_000_000, card=card) - truth) / truth < 0.3, card
+
+
+def test_join_total_prices_kernels_host_steps_and_round_trips():
+    c = default_calibration(GPU)
+    left, right = 6_000_000, 750_000
+    expect = (c.estimate("join", "gpu", left) + c.estimate("join_host", "cpu", left)
+              + c.transfer_ms(4 * left, "d2h")
+              + c.transfer_ms(4 * left + 4 * right + 3 * 4 * right, "h2d"))
+    assert c.estimate_gpu_join_total(left, right) == pytest.approx(expect)
+    assert c.estimate("join_total", "gpu", left, right_rows=right) == pytest.approx(expect)
+    assert c.estimate("join_total", "cpu", left) == c.estimate("join", "cpu", left)
+    assert c.estimate_gpu_join_total(left, right) > c.estimate("join", "gpu", left)
+    assert default_calibration(None).estimate_gpu_join_total(left, right) == math.inf
+
+
+def test_join_host_is_cpu_only_and_join_build_not_aliased():
+    c = default_calibration(GPU)
+    assert c.estimate("join_host", "gpu", 10**6) == math.inf
+    assert math.isfinite(c.estimate("join_host", "cpu", 10**6))
+    assert "join_build" not in cal_mod.OP_ALIASES
+    assert c.estimate("join_build", "cpu", 10**6) == c.fit("generic", "cpu").predict(10**6)

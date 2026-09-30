@@ -54,10 +54,11 @@ PERSIST_EVERY_N = 32        # observe(): save after this many new observations .
 PERSIST_EVERY_S = 60.0      # ... or this many seconds
 DEFAULT_CARD = 1000         # assumed group cardinality when the caller gives none
 BUCKET_EDGES = (64, 1024, 8192)          # group-count buckets: <=64, <=1024, <=8192, >8192
-BUCKET_REP_CARDS = (8, 1000, 4096, 200_000)   # one representative group count per bucket
+BUCKET_REP_CARDS = (8, 64, 100, 1000, 2048, 8192, 10_000, 200_000)   # two per bucket; interpolated on log(groups)
 GPU_MAX_CARD = {"group_min": 8192, "group_max": 8192}   # GPU kernels fault above this
-OP_ALIASES = {"group_agg": "group_sum", "join_probe": "join", "join_build": "join",
+OP_ALIASES = {"group_agg": "group_sum", "join_probe": "join",
               "sort": "sort_topk", "filter": "filter_take"}
+HOST_ONLY_OPS = frozenset({"join_host"})     # CPU work; estimate(..., "gpu") is inf
 _log = logging.getLogger(__name__)
 _warned_ops: set = set()
 
@@ -70,7 +71,7 @@ def bucket_name(card: float) -> str:
 
 DEVICES = ("cpu", "gpu")
 OPS = (
-    "pipeline", "join_host", "group_sum", "group_count", "group_min", "group_max",
+    "pipeline", "join_host", "join_total", "group_sum", "group_count", "group_min", "group_max",
     "masked_sum", "join", "gather", "sort_topk", "group_encode", "filter_take",
 )
 
@@ -78,7 +79,7 @@ QUICK_SIZES = (10_000, 100_000, 1_000_000, 6_000_000, 30_000_000)
 FULL_SIZES = (10_000, 100_000, 1_000_000, 10_000_000, 30_000_000, 100_000_000)
 QUICK_LINK_MB = (1, 8, 64)
 FULL_LINK_MB = (1, 16, 128, 1024)
-QUICK_OP_BUDGET_S = 0.8     # skip a size when its projected time exceeds this (quick)
+QUICK_OP_BUDGET_S = 1.5     # skip a size when its projected time exceeds this (quick)
 FULL_OP_BUDGET_S = 6.0
 
 
@@ -216,6 +217,7 @@ class Fit:
     g: float = 0.0
     obs: List[List[float]] = field(default_factory=list)
     n_points: int = 0            # points used by the calibration fit (0 = built-in default)
+    p: float = 1.0               # size exponent: time = alpha + c * rows**p + g*card (p > 1: super-linear)
     _cur: Optional[Tuple[float, float, float]] = field(default=None, repr=False, compare=False)
 
     # -- prediction ------------------------------------------------------- #
@@ -227,7 +229,7 @@ class Fit:
     def predict(self, rows: float, card: Optional[float] = None) -> float:
         a, c, g = self.params()
         gterm = g * (DEFAULT_CARD if card is None else card) if g else 0.0
-        return max(0.0, a + c * rows + gterm)
+        return max(0.0, a + c * (rows ** self.p if self.p != 1.0 else rows) + gterm)
 
     # -- online refinement ------------------------------------------------ #
     def observe(self, rows: float, ms: float, card: Optional[float] = None) -> None:
@@ -244,8 +246,8 @@ class Fit:
         if n < MIN_OBS:
             return prior
         w = min(1.0, (n - MIN_OBS + 1) / OBS_RAMP)      # >0.5 (outweighs prior) from MIN_OBS+3
-        rows = [tuple(o) for o in self.obs]
-        sizes = [r[0] for r in rows]
+        rows = [(o[0] ** self.p, o[1], o[2]) for o in self.obs]
+        sizes = [o[0] for o in self.obs]
         if max(sizes) >= 2.0 * max(min(sizes), 1.0):      # enough spread in n: refit the line
             use_card = self.g > 0 and len({round(r[1]) for r in rows}) >= 3
             a, c, g = _nnls_rel(rows, use_card)     # no group term refit: it decays with the prior
@@ -256,19 +258,19 @@ class Fit:
         return tuple((1 - w) * p + w * q for p, q in zip(prior, (a, c, g)))  # type: ignore[return-value]
 
     def predict_prior(self, rows: float, card: float) -> float:
-        return self.alpha + self.c * rows + self.g * card
+        return self.alpha + self.c * rows ** self.p + self.g * card
 
     # -- (de)serialisation ------------------------------------------------ #
     def to_dict(self) -> Dict[str, Any]:
         return {"alpha": self.alpha, "c": self.c, "g": self.g,
-                "n_points": self.n_points, "obs": self.obs}
+                "n_points": self.n_points, "obs": self.obs, "p": self.p}
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Fit":
         f = cls(float(d["alpha"]), float(d["c"]), float(d.get("g", 0.0)),
                 [[float(x) for x in o] for o in d.get("obs", [])][-MAX_OBS_SAMPLES:],
-                int(d.get("n_points", 0)))
-        if not all(math.isfinite(v) and v >= 0 for v in (f.alpha, f.c, f.g)):
+                int(d.get("n_points", 0)), p=float(d.get("p", 1.0)))
+        if not (all(math.isfinite(v) and v >= 0 for v in (f.alpha, f.c, f.g)) and 0.5 <= f.p <= 3.0):
             raise ValueError("bad fit")
         return f
 
@@ -305,39 +307,88 @@ class Calibration:
     _last_save: float = field(default_factory=time.monotonic, repr=False, compare=False)
 
     # -- queries ---------------------------------------------------------- #
+    def _card_fits(self, base: str) -> List[Tuple[float, Fit]]:
+        pre = f"{base}:g"
+        return sorted((float(k[len(pre):]), f) for k, f in self.fits.items() if k.startswith(pre))
+
     def fit(self, op: str, device: str, card: Optional[float] = None) -> Optional[Fit]:
-        """Fit for (op, device), routed by alias and (if fitted) group-count bucket."""
+        """Fit for (op, device), routed by alias; for group ops the nearest measured
+        group-count fit (same bucket preferred)."""
         op = OP_ALIASES.get(op, op)
         base = f"{op}@{device}"
-        if base in self.fits or f"{base}:{bucket_name(DEFAULT_CARD)}" in self.fits:
-            b = f"{base}:{bucket_name(DEFAULT_CARD if card is None else card)}"
-            if b in self.fits:
-                return self.fits[b]
-            if base in self.fits:
-                return self.fits[base]
-            return None
+        cf = self._card_fits(base)
+        if cf:
+            q = DEFAULT_CARD if card is None else card
+            same = [t for t in cf if bucket_name(t[0]) == bucket_name(q)] or cf
+            return min(same, key=lambda t: abs(math.log(t[0]) - math.log(max(q, 1))))[1]
+        if base in self.fits:
+            return self.fits[base]
         if (op, device) not in _warned_ops:
             _warned_ops.add((op, device))
             _log.debug("no calibration for op %r on %s; using generic fit", op, device)
         return self.fits.get(f"generic@{device}")
 
+    def _predict(self, op: str, device: str, rows: float, card: Optional[float]) -> Optional[float]:
+        """Predicted ms; group ops interpolate on log(groups) between the two measured
+        group counts of the query's bucket (clamped at the ends)."""
+        real = OP_ALIASES.get(op, op)
+        cf = self._card_fits(f"{real}@{device}")
+        if cf:
+            q = DEFAULT_CARD if card is None else max(card, 1)
+            same = [t for t in cf if bucket_name(t[0]) == bucket_name(q)] or cf
+            lo = max((t for t in same if t[0] <= q), key=lambda t: t[0], default=None)
+            hi = min((t for t in same if t[0] >= q), key=lambda t: t[0], default=None)
+            if lo is None or hi is None or lo[0] == hi[0]:
+                t = lo or hi
+                return t[1].predict(rows, q)
+            w = (math.log(q) - math.log(lo[0])) / (math.log(hi[0]) - math.log(lo[0]))
+            return (1 - w) * lo[1].predict(rows, q) + w * hi[1].predict(rows, q)
+        f = self.fit(op, device, card)
+        return None if f is None else f.predict(rows, card)
+
     def estimate(self, op: str, device: str, rows: float, card: Optional[float] = None,
                  **shape: Any) -> float:
-        """Predicted kernel time in ms (GPU: input device-resident).  ``inf`` if the
-        device is unavailable.  Extra ``shape`` kwargs are accepted for forward
-        compatibility (dtype, selectivity, ...) and currently ignored."""
-        if device == "gpu" and not self.has_gpu:
+        """Compute-only ms (see module docstring).  ``inf`` if the device is unavailable
+        or the op cannot run there.  ``join_total`` (GPU) needs ``right_rows=``; it is
+        `estimate_gpu_join_total`.  Extra ``shape`` kwargs are ignored (forward compat)."""
+        real = OP_ALIASES.get(op, op)
+        if device == "gpu" and (not self.has_gpu or real in HOST_ONLY_OPS):
             return math.inf
+        if real == "join_total":
+            if device == "gpu":
+                return self.estimate_gpu_join_total(rows, shape.get("right_rows", rows // 8 or 1))
+            return self.estimate("join", "cpu", rows)
         if card is None:
             card = shape.get("cardinality")
-        real = OP_ALIASES.get(op, op)
         limit = GPU_MAX_CARD.get(real)
         if device == "gpu" and limit is not None and card is not None and card > limit:
             return math.inf
-        f = self.fit(op, device, card)
-        if f is None:
+        v = self._predict(op, device, rows, card)
+        if v is None:
             return math.inf if device == "gpu" else 0.0
-        return f.predict(rows, card)
+        return v
+
+    def estimate_gpu_join_total(self, left_rows: float, right_rows: float,
+                                table_size: Optional[float] = None, pinned: bool = False) -> float:
+        """Price of the real current GPU hash join (`AOTKernelsGPU.hash_join`), inputs resident.
+
+        = count + scatter kernels (`join@gpu`)
+        + host steps between them (`join_host@cpu`: cumsum/bincount/argsort)
+        + counts D2H (4 B per left row)
+        + H2D of the scratch/aux arrays it re-uploads every call: zeroed key table,
+          offsets (4 B/left row), right_order (4 B/right row), right_starts and
+          right_count (4 B/table slot each).  ``table_size`` defaults to ``right_rows``.
+        Excludes the input key columns (assumed resident) and the (left_idx, right_idx)
+        result copy; the placer prices those with ``transfer_ms`` if it needs them.
+        """
+        if not self.has_gpu:
+            return math.inf
+        tab = right_rows if table_size is None else table_size
+        h2d_bytes = 4 * left_rows + 4 * right_rows + 3 * 4 * tab
+        return (self.estimate("join", "gpu", left_rows)
+                + self.estimate("join_host", "cpu", left_rows)
+                + self.transfer_ms(4 * left_rows, "d2h", pinned)
+                + self.transfer_ms(h2d_bytes, "h2d", pinned))
 
     def bandwidth_gbps(self, direction: str, pinned: bool = False) -> float:
         k = f"{direction}_{'pinned' if pinned and self.pinned_available else 'pageable'}"
@@ -361,9 +412,12 @@ class Calibration:
         with self._lock:
             op = OP_ALIASES.get(op, op)
             k = f"{op}@{device}"
-            bk = f"{k}:{bucket_name(DEFAULT_CARD if card is None else card)}"
-            if bk in self.fits:
-                k = bk
+            cf = self._card_fits(k)
+            if cf:                             # route to the nearest measured group count
+                q = DEFAULT_CARD if card is None else card
+                same = [t for t in cf if bucket_name(t[0]) == bucket_name(q)] or cf
+                near = min(same, key=lambda t: abs(math.log(t[0]) - math.log(max(q, 1))))[0]
+                k = f"{k}:g{int(near)}"
             f = self.fits.get(k)
             if f is None:                     # new op: start from the generic prior if any
                 g = self.fits.get(f"generic@{device}")
@@ -445,7 +499,9 @@ class Calibration:
         L.append("  launch overhead ms: " + ", ".join(f"{k}={v:.4f}" for k, v in self.launch_overhead_ms.items()))
         for k in sorted(self.fits):
             a, c, g = self.fits[k].params()
+            p_ = self.fits[k].p
             L.append(f"  {k:<22} alpha={a:8.4f} ms  c={c * 1e6:9.4f} ms/Mrow"
+                     + (f"  p={p_:.2f}" if p_ != 1.0 else "")
                      + (f"  g={g * 1e6:.4f} ms/Mgroup" if g else "") + f"  (pts={self.fits[k].n_points})")
         for k, v in self.errors.items():
             L.append(f"  ! {k}: {v}")
@@ -765,7 +821,7 @@ for _op, _m, _a in (("group_sum", "group_sum_f32", "_group_sum"), ("group_min", 
                     ("group_max", "group_max_f32", "_group_max")):
     PROBES[(_op, "cpu")] = Probe(_op, "cpu", _cpu_group(_m), uses_card=True)
     PROBES[(_op, "gpu")] = Probe(_op, "gpu", _gpu_group(_a), uses_card=True, bucketed=True,
-                                 max_card=4096 if _op in GPU_MAX_CARD else None)
+                                 max_card=GPU_MAX_CARD.get(_op))
 
 
 @probe("group_count", "cpu", uses_card=True)
@@ -894,7 +950,7 @@ def _p_sort_cpu(ctx, n, card):
     return lambda: pc.sort_indices(arr)
 
 
-@probe("sort_topk", "gpu", max_rows=10_000_000)
+@probe("sort_topk", "gpu", max_rows=30_000_000)
 def _p_sort_gpu(ctx, n, card):
     g = ctx.gpu
     dk, out = ctx.dev(ctx.keys(n)), ctx.dev_out(n * 4)
@@ -935,7 +991,7 @@ def _time_call(fn: Callable[[], Any], timer: Callable[[], float], budget_s: floa
     fn()
     t = timer(); fn(); first = timer() - t
     samples = [first]
-    reps = 1 if first > budget_s / 2 else (3 if first > budget_s / 12 else 7)
+    reps = 2 if first > 0.05 else (3 if first > 0.01 else 7)
     for _ in range(reps - 1):
         t = timer(); fn(); samples.append(timer() - t)
     samples.sort()
@@ -958,7 +1014,10 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
     cap = p.max_card or (1 << 30)
     if p.bucketed:                        # every size at one representative card per bucket
         cards = [c for c in BUCKET_REP_CARDS if c <= cap]
-        grid = [(n, c) for c in cards for n in sizes_ok if c <= max(n, 8)]
+        big = [n for n in sizes_ok if n >= 100_000] or sizes_ok
+        low_card_sizes = big[:-1] if len(big) >= 5 else big    # top size is slow for mid group counts
+        grid = [(n, c) for c in cards
+                for n in (big if c > BUCKET_EDGES[-1] else low_card_sizes) if c <= max(n, 8)]
     else:
         grid = [(n, _card_for(n)) for n in sizes_ok]
         if p.uses_card:                   # cardinality sweep at a mid size
@@ -982,26 +1041,74 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
     return pts
 
 
+def _fit_scaling(sub: List[List[float]]) -> Optional[Fit]:
+    """alpha + c * rows**p, tuned for where the planner decides (large inputs).
+
+    alpha comes from the smallest size; (c, p) from points with rows >= 1M, weighted by
+    absolute error so the biggest sizes dominate.  p > 1 only when the data show it
+    (cache misses, n log^2 n sorts); otherwise the fit stays linear.
+    """
+    import numpy as np
+    by_n: Dict[float, List[float]] = {}
+    for n, _, ms in sub:
+        by_n.setdefault(float(n), []).append(float(ms))
+    xs = sorted(by_n)
+    if len(xs) < 3:
+        return None
+    ys = {n: sorted(v)[len(v) // 2] for n, v in by_n.items()}
+    large = [n for n in xs if n >= 1_000_000]
+    if len(large) < 2:
+        large = xs[-3:]
+    alpha = ys[xs[0]]
+    for _ in range(2):                      # refine alpha: subtract the small-size slope share
+        r = np.array([ys[n] - alpha for n in large])
+        ok = r > 1e-9
+        if ok.sum() < 2:
+            break
+        nl = np.array(large)[ok]
+        slope, p = _power_fit(nl, r[ok])
+        alpha = max(0.0, ys[xs[0]] - slope * xs[0] ** p)
+    r = np.array([ys[n] - alpha for n in large])
+    ok = r > 1e-9
+    if ok.sum() < 2:
+        c, p = max((ys[xs[-1]] - alpha) / xs[-1], 0.0), 1.0
+    else:
+        c, p = _power_fit(np.array(large)[ok], r[ok])
+    return Fit(alpha, c, 0.0, n_points=len(sub), p=p)
+
+
+def _power_fit(n, r) -> Tuple[float, float]:
+    """r ~ c * n**p on the given (large) points; p in [1, 1.5], snapped to 1 below 1.12."""
+    import numpy as np
+    p = float(np.polyfit(np.log(n), np.log(r), 1, w=np.sqrt(n / n.max()))[0])   # biggest sizes dominate
+    p = 1.0 if p < 1.12 else min(p, 1.5)
+    c = float((n ** p * r).sum() / (n ** (2 * p)).sum())      # absolute-error weighting
+    return c, p
+
+
 def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False
                 ) -> Tuple[Dict[str, Fit], Optional[str]]:
-    """-> ({"": base fit, ":<=64": bucket fit, ...}, error).  Empty dict on failure."""
+    """-> ({"": base fit, ":g<groups>": per-group-count fit, ...}, error).  {} on failure."""
     def line(sub, card_term):
         if len({q[0] for q in sub}) < 3:
             return None
-        a, c, g = _nnls_rel([tuple(q) for q in sub], card_term and len({q[1] for q in sub}) >= 3)
-        return Fit(a, c, g, n_points=len(sub))
+        if card_term:                      # CPU group ops: cheap linear + per-group term
+            a, c, g = _nnls_rel([tuple(q) for q in sub], len({q[1] for q in sub}) >= 3)
+            return Fit(a, c, g, n_points=len(sub))
+        return _fit_scaling(sub)
 
     if not bucketed:
         f = line(pts, uses_card)
         return ({"": f}, None) if f else ({}, "too few sizes within time budget")
     fits: Dict[str, Fit] = {}
-    for name in [bucket_name(c) for c in (*BUCKET_EDGES, BUCKET_EDGES[-1] + 1)]:
-        f = line([q for q in pts if bucket_name(q[1]) == name], False)
+    for card in sorted({q[1] for q in pts}):
+        f = line([q for q in pts if q[1] == card], False)
         if f:
-            fits[f":{name}"] = f
+            fits[f":g{int(card)}"] = f
     if not fits:
         return {}, "too few sizes within time budget"
-    fits[""] = fits.get(f":{bucket_name(DEFAULT_CARD)}") or next(iter(fits.values()))
+    near = min(fits, key=lambda k: abs(math.log(int(k[2:])) - math.log(DEFAULT_CARD)))
+    fits[""] = fits[near]
     return fits, None
 
 
