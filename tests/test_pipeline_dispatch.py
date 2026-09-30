@@ -76,7 +76,8 @@ def test_served_and_same_table_shape_as_existing_path(device, name, spy, monkeyp
     fused = lf.compute(device=device)
     assert spy["served"] == 1, name
     monkeypatch.setenv("MXFRAME_FUSED_PIPELINE", "0")
-    existing = plans(t)[name].compute(device=device)
+    # the reference is the existing CPU path: the existing GPU key encoders hang / corrupt memory
+    existing = plans(t)[name].compute(device="cpu")
     assert fused.schema == existing.schema, (fused.schema, existing.schema)
     assert fused.num_rows == existing.num_rows
     for c in fused.column_names:
@@ -97,7 +98,7 @@ def test_unsupported_expression_falls_back_never_wrong(device, spy, monkeypatch)
     got = build().compute(device=device)
     assert spy["declined"] == 1 and spy["served"] == 0
     monkeypatch.setenv("MXFRAME_FUSED_PIPELINE", "0")
-    want = build().compute(device=device)
+    want = build().compute(device="cpu")
     assert got.equals(want)
 
 
@@ -111,7 +112,7 @@ def test_nulls_fall_back(device, spy, monkeypatch):
         return LazyFrame(Scan(t)).groupby("k").agg(col("y").sum().alias("s"), col("x").count().alias("c"))
     got = build().compute(device=device)
     monkeypatch.setenv("MXFRAME_FUSED_PIPELINE", "0")
-    want = build().compute(device=device)
+    want = build().compute(device="cpu")
     assert got.column("c").to_pylist() == want.column("c").to_pylist()
     np.testing.assert_allclose(got.column("s").to_numpy(), want.column("s").to_numpy(), rtol=2e-3)
 

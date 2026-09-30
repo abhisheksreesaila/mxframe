@@ -115,8 +115,12 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
                 if name not in gk_table.column_names:
                     gk_table = gk_table.append_column(name, compiler._eval_expr_arrow(e, gk_table))
                 group_keys.append(name)
+        # On a GPU session the existing GPU key-encoding kernels are avoided: the single-int-key
+        # one hangs (even at 1000 rows) and the multi-key one corrupts the heap (a later
+        # pq.read_table segfaults). The group ids must come back to the host for the fused
+        # kernel anyway, so the CPU encoder costs nothing extra.
         gids, n_groups, unique_key_cols = compiler._build_group_ids_cached(
-            gk_table, group_keys, gpu_compiler=compiler)
+            gk_table, group_keys, gpu_compiler=None if device == "gpu" else compiler)
         if n_groups <= 0:
             return _decline(compiler, "no groups")
         gids = np.ascontiguousarray(gids, dtype=np.int32)
