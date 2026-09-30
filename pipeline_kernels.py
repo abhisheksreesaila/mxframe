@@ -400,7 +400,7 @@ class DeviceColumns:
 
 
 def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray],
-                   start: int, end: int) -> DeviceColumns:
+                   start: int, end: int, before_copy=None) -> DeviceColumns:
     """Copy rows ``[start, end)`` of each column (and ``gids``) to the GPU.
 
     Chunked columns are copied chunk by chunk straight into one device buffer
@@ -421,6 +421,8 @@ def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray]
             if hi <= lo:
                 continue
             for c, b in enumerate(arrs):
+                if before_copy is not None:
+                    before_copy()        # background uploads yield to running queries here
                 cu.h2d_addr(ptrs[c] + (lo - start) * b.itemsize, b.addr + (lo - s) * b.itemsize,
                             (hi - lo) * b.itemsize)
         gp = 0

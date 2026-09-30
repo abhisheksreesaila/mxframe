@@ -54,6 +54,31 @@ class Policy:
 
 
 _policy: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_policy", default=None)
+
+# Queries running right now (device="auto"). Background uploads pause between chunk
+# copies while this is non-zero, so work meant for the next query never slows this one.
+_active = 0
+_active_cv = threading.Condition()
+YIELD_MAX_S = 2.0          # an upload never waits longer than this per copy
+
+
+@contextlib.contextmanager
+def query_running():
+    global _active
+    with _active_cv:
+        _active += 1
+    try:
+        yield
+    finally:
+        with _active_cv:
+            _active -= 1
+            _active_cv.notify_all()
+
+
+def _yield_to_queries() -> None:
+    with _active_cv:
+        if _active:
+            _active_cv.wait_for(lambda: _active == 0, timeout=YIELD_MAX_S)
 _deferred: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_deferred", default=None)
 
 
@@ -300,7 +325,7 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
             for e in freeable:
                 _free_entry(e)
             try:
-                dc = pk.upload_columns(prog, cc, gids, 0, n_rows)
+                dc = pk.upload_columns(prog, cc, gids, 0, n_rows, before_copy=_yield_to_queries)
             except Exception:
                 give_up(True)
                 return

@@ -266,7 +266,7 @@ class LazyFrame:
                 if decision.estimate is not None and decision.gpu_available:
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
-                with _cf.policy(gpu_fraction=gpu_fraction):
+                with _cf.policy(gpu_fraction=gpu_fraction), _cf.query_running():
                     result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3

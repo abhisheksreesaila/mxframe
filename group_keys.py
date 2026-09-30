@@ -120,8 +120,8 @@ def build(table, keys):
     dicts, sizes, rows, keep = [], [], [], []
     for k in keys:
         chunks = _key_chunks(table.column(k), n_rows)
-        if chunks is None:
-            return None
+        if chunks is None or any(len(c.dictionary) == 0 for c in chunks):
+            return None      # non-empty chunk with an empty dictionary: invalid codes, old path decides
         u = _unify(chunks)
         if u is None:
             return None

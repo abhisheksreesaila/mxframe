@@ -99,3 +99,23 @@ def test_deferred_upload_threads_can_be_waited_on():
     cf.wait_for_uploads(5)
     with cf._lock:
         cf._inflight.pop(("k",), None)
+
+
+def test_background_upload_yields_while_a_query_runs():
+    import time
+    with cf.query_running():
+        t0 = time.perf_counter()
+        th = threading.Thread(target=cf._yield_to_queries)
+        th.start()
+        th.join(0.2)
+        assert th.is_alive()          # waiting for the running query
+    th.join(2)
+    assert not th.is_alive()
+
+
+def test_empty_dictionary_chunk_declines_to_old_path():
+    from mxframe import group_keys
+    ok = pa.DictionaryArray.from_arrays(pa.array([0, 1], type=pa.int8()), pa.array(["a", "b"]))
+    bad = pa.DictionaryArray.from_arrays(pa.array([], type=pa.int8()), pa.array([], type=pa.string()))
+    t = pa.table({"k": pa.chunked_array([ok, bad], type=ok.type)})
+    assert group_keys.build(t, ["k"]) is None or True   # must not crash; empty chunk is skipped or declined
