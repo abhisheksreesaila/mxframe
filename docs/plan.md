@@ -178,6 +178,7 @@ Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
 - [ ] a fuzz test of random plan shapes (project/filter/agg/join/sort/limit nested 2–3 deep) against DuckDB on cpu and auto
 
 ## F-017 Parquet read as fast as Polars [built, needs review; 1.5x target NOT met, see profile]
+Blocked: choose the Parquet decoder path — (a) Polars-backed reader, (b) native Mojo decoder, or (c) accept ~3x on raw scans — then say go. Everything else in this ticket is merged.
 Decision needed (Abhishek): pyarrow's Parquet decoder is the floor (raw read of 3 SF10 lineitem columns ~225 ms vs Polars' whole scan+filter ~77 ms; pyarrow 22 has no page-skipping API). Options: (a) optional Polars-backed reader when polars is installed (soft dependency on a competitor; type-mapping care); (b) a native Mojo Parquet decoder in mxframe (large; could decode on the GPU like cuDF); (c) accept ~3x on raw scans. Until you choose: (c).
 Needs: none · Found by the F-001 scoreboard (2026-09-30): SF10 `scan_parquet` of 3 lineitem columns with a date filter takes 689 ms in mx vs 149 ms in Polars.
 - [~] profile the mx read path and close the gap to within 1.5x of Polars on SF1/SF10 lineitem scans with and without filters. Profiled; gap narrowed for selective filters, not closed (pyarrow's decoder is ~3x slower than Polars' own).
