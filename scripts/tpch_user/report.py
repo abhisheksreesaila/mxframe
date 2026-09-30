@@ -321,11 +321,19 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
     loads = [r["load1"] for r in rows if r.get("load1") is not None]
     load_txt = (f"1-minute load average at measurement time: median {statistics.median(loads):.1f}, "
                 f"max {max(loads):.1f} over {len(loads)} runs; " if loads else "")
+    off = sorted((r["query"], r["compare_note"]) for r in rows
+                 if r["engine"] == "duckdb" and r["sf"] == "1" and r.get("compare_note", "").startswith("official"))
+    if off:
+        a("\n## Sanity check of the DuckDB reference against published TPC-H SF1 answers\n")
+        a("The harness compares every engine with DuckDB, so the reference itself is checked against the "
+          "published SF1 answers (full result, or the top rows for LIMIT queries): "
+          + ", ".join(f"Q{q} {n.split(': ', 1)[1]}" for q, n in off) + ".\n")
     a("\n## Methodology\n")
     a("- **One subprocess per (engine, query, scale factor)**; the worker imports the engine "
       "(timed as `import_ms`), then runs read+query+materialize once (`first_ms`, the headline) and "
       "once more in the same process (`repeat_ms`).")
-    a("- **Data**: DuckDB `dbgen` Parquet (dates as int32 days since epoch, decimals as float32), read "
+    a(f"- **Data** ({meta.get('data_variant', 'exact')}): DuckDB `dbgen` Parquet (dates as int32 days since epoch, "
+      "decimals as float32), read "
       "from the OS page cache (files are read once before each scale factor so no engine pays a cold disk).")
     a("- **Column pruning**: nobody passes a column list. Polars (`scan_parquet`), DuckDB "
       "and MXFrame (`mx.scan_parquet`, one lazy scan per table; low-cardinality strings are read as "

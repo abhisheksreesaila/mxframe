@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tpch_user import spec  # noqa: E402
 from tpch_user.compare import compare_tables  # noqa: E402
+from tpch_user.official import check_official  # noqa: E402
 from tpch_user.report import (CSV_FIELDS, ENGINE_ORDER, environment_info, new_row, read_csv,  # noqa: E402
                               render_markdown)
 from tpch_user.runner import (REPO_ROOT, check_mxframe_path, resolve_gpu, run_one,  # noqa: E402
@@ -83,6 +84,14 @@ def compare_result(path, ref_path, q: int):
     return cmp.verdict, cmp.ok, cmp.max_rel_err, cmp.message
 
 
+def official_check(path, q: int) -> str | None:
+    import pyarrow.parquet as pq
+    try:
+        return check_official(q, pq.read_table(path))
+    except Exception as e:  # noqa: BLE001
+        return f"check failed: {type(e).__name__}: {str(e)[:100]}"
+
+
 def open_log(csv_path: Path, resume: bool):
     """(file, writer, rows already present). Without --resume the CSV starts empty."""
     existing = read_csv(csv_path) if resume and csv_path.exists() else []
@@ -103,6 +112,7 @@ def write_report(csv_path: Path, md_path: Path, a, root, gpu_desc: str, elapsed:
     qs = sorted({r["query"] for r in rows} | set(queries))
     sf_all = sorted({r["sf"] for r in rows} | set(sfs), key=float)
     meta = environment_info(a, root, elapsed, gpu_desc)
+    meta['data_variant'] = 'legacy (truncated float32 DECIMALs)' if a.legacy_data else 'exact'
     md_path.write_text(render_markdown(rows, meta, engines, qs, sf_all))
 
 
@@ -114,6 +124,9 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=300.0, help="seconds per subprocess")
     ap.add_argument("--out", default="docs/bench")
     ap.add_argument("--data-root", default=None)
+    ap.add_argument("--legacy-data", action="store_true",
+                    help="use <root>/tpch_sf<SF> (float32 DECIMALs truncated: 0.05 -> 0.049999997) instead of "
+                         "the default <root>/tpch_sf<SF>_exact")
     ap.add_argument("--gpu", default="1", help="nvidia-smi index (or GPU-UUID) of the GPU the workers may use")
     ap.add_argument("--date", default=datetime.date.today().isoformat())
     ap.add_argument("--name", default=None, help="output basename (default user-felt-<date>)")
@@ -143,7 +156,8 @@ def main() -> None:
         return
 
     # fail BEFORE the loop: data present, and workers import mxframe from THIS checkout
-    data_dirs = {sf: root / f"tpch_sf{sf}" for sf in sfs}
+    suffix = "" if a.legacy_data else "_exact"
+    data_dirs = {sf: root / f"tpch_sf{sf}{suffix}" for sf in sfs}
     missing = [str(d) for d in data_dirs.values() if not d.is_dir()]
     if missing:
         raise SystemExit(f"TPC-H data not found: {missing}")
@@ -187,6 +201,10 @@ def main() -> None:
                         rec["error"] = f"imported mxframe from {mxp}, not {REPO_ROOT}"
                     if eng == "duckdb":
                         ref_ok = "error" not in rec and res_path.exists()
+                        if ref_ok and sf == "1":
+                            msg = official_check(res_path, q)
+                            if msg:
+                                rec["compare_note"] = f"official TPC-H SF1 answer: {msg}"
                         if rec.get("repeat_ms") is not None and ref_ok and rep_path.exists():
                             rec["repeat_verdict"] = compare_result(rep_path, ref_path, q)[0]
                     elif "error" in rec:

@@ -33,14 +33,16 @@ def q1(t):
 
 def q2(t):
     n, pt, s, ps = t["nation"], t["part"], t["supplier"], t["partsupp"]
-    eu = s[s.s_nationkey.isin(n[n.n_regionkey == S.Q2_REGIONKEY].n_nationkey)]
+    eu = s.merge(n[n.n_regionkey == S.Q2_REGIONKEY][["n_nationkey", "n_name"]],
+                 left_on="s_nationkey", right_on="n_nationkey")
     tgt = pt[(pt.p_size == 15) & pt.p_type.str.contains("BRASS", regex=False)]
     m = (ps.merge(eu, left_on="ps_suppkey", right_on="s_suppkey")
            .merge(tgt, left_on="ps_partkey", right_on="p_partkey"))
     mn = m.groupby("ps_partkey")["ps_supplycost"].min().rename("min_supplycost").reset_index()
     r = m.merge(mn, on="ps_partkey")
     r = r[r.ps_supplycost == r.min_supplycost]
-    return (r[S.OUTPUT[2]].sort_values(["s_acctbal", "s_name", "ps_partkey"], ascending=[False, True, True])
+    return (r[S.OUTPUT[2]].sort_values(["s_acctbal", "n_name", "s_name", "ps_partkey"],
+                                       ascending=[False, True, True, True])
             .head(100).reset_index(drop=True))
 
 
@@ -66,11 +68,13 @@ def q4(t):
 
 
 def q5(t):
-    n, c, o, l = t["nation"], t["customer"], t["orders"], t["lineitem"]
+    n, s, c, o, l = t["nation"], t["supplier"], t["customer"], t["orders"], t["lineitem"]
     o = o[(o.o_orderdate >= S.Q5_LO) & (o.o_orderdate < S.Q5_HI)]
     m = (l.merge(o, left_on="l_orderkey", right_on="o_orderkey")
           .merge(c, left_on="o_custkey", right_on="c_custkey")
-          .merge(n, left_on="c_nationkey", right_on="n_nationkey"))
+          .merge(s, left_on="l_suppkey", right_on="s_suppkey"))
+    m = m[m.c_nationkey == m.s_nationkey].merge(
+        n[n.n_regionkey == S.Q5_REGIONKEY], left_on="c_nationkey", right_on="n_nationkey")
     m["revenue"] = m.l_extendedprice * (1.0 - m.l_discount)
     return m.groupby("n_name", as_index=False)["revenue"].sum().sort_values(
         "revenue", ascending=False).reset_index(drop=True)
@@ -93,6 +97,8 @@ def q7(t):
     m = (l.merge(o, left_on="l_orderkey", right_on="o_orderkey")
           .merge(cn, left_on="o_custkey", right_on="c_custkey")
           .merge(sn, left_on="l_suppkey", right_on="s_suppkey"))
+    a, b = S.Q7_NATIONS
+    m = m[((m.supp_nation == a) & (m.cust_nation == b)) | ((m.supp_nation == b) & (m.cust_nation == a))].copy()
     m["l_year"] = _year(m.l_shipdate)
     m["revenue"] = m.l_extendedprice * (1.0 - m.l_discount)
     return (m.groupby(["supp_nation", "cust_nation", "l_year"], as_index=False)["revenue"].sum()
@@ -100,15 +106,17 @@ def q7(t):
 
 
 def q8(t):
-    n, pt, c, o, l = t["nation"], t["part"], t["customer"], t["orders"], t["lineitem"]
+    n, pt, s, c, o, l = t["nation"], t["part"], t["supplier"], t["customer"], t["orders"], t["lineitem"]
     c_am = c[c.c_nationkey.isin(n[n.n_regionkey == S.Q8_REGIONKEY].n_nationkey)]
     pt = pt[pt.p_type == "ECONOMY ANODIZED STEEL"]
+    o = o[(o.o_orderdate >= S.Q8_LO) & (o.o_orderdate <= S.Q8_HI)]
     m = (l.merge(pt, left_on="l_partkey", right_on="p_partkey")
+          .merge(s, left_on="l_suppkey", right_on="s_suppkey")
           .merge(o, left_on="l_orderkey", right_on="o_orderkey")
           .merge(c_am, left_on="o_custkey", right_on="c_custkey"))
     m["o_year"] = _year(m.o_orderdate)
     m["total_vol"] = m.l_extendedprice * (1.0 - m.l_discount)
-    m["brazil_vol_sum"] = m.total_vol.where(m.c_nationkey == S.Q8_NATIONKEY, 0.0)
+    m["brazil_vol_sum"] = m.total_vol.where(m.s_nationkey == S.Q8_NATIONKEY, 0.0)
     r = m.groupby("o_year", as_index=False)[["total_vol", "brazil_vol_sum"]].sum()
     r["mkt_share"] = r.brazil_vol_sum / r.total_vol
     return r.sort_values("o_year").reset_index(drop=True)
@@ -125,7 +133,7 @@ def q9(t):
     m["o_year"] = _year(m.o_orderdate)
     m["profit"] = m.l_extendedprice * (1.0 - m.l_discount) - m.ps_supplycost * m.l_quantity
     return (m.groupby(["n_name", "o_year"], as_index=False)["profit"].sum()
-            .rename(columns={"profit": "sum_profit"}).sort_values(["n_name", "o_year"])
+            .rename(columns={"profit": "sum_profit"}).sort_values(["n_name", "o_year"], ascending=[True, False])
             .reset_index(drop=True))
 
 
@@ -146,7 +154,7 @@ def q11(t):
     ger = s.loc[s.s_nationkey == S.Q11_NATIONKEY, "s_suppkey"]
     f = ps[ps.ps_suppkey.isin(ger)].copy()
     f["value"] = f.ps_supplycost * f.ps_availqty
-    thr = f["value"].sum() * S.Q11_FRACTION
+    thr = f["value"].sum() * S.q11_fraction()
     g = f.groupby("ps_partkey", as_index=False)["value"].sum()
     return g[g.value > thr].sort_values("value", ascending=False).reset_index(drop=True)
 
@@ -179,7 +187,7 @@ def q14(t):
     m = l.merge(pt, left_on="l_partkey", right_on="p_partkey")
     rev = m.l_extendedprice * (1.0 - m.l_discount)
     promo = rev.where(m.p_type.str.startswith("PROMO"), 0.0)
-    return _df(promo_revenue=[float(promo.sum())], total_revenue=[float(rev.sum())])
+    return _df(promo_revenue=[100.0 * float(promo.sum()) / float(rev.sum())])
 
 
 def q15(t):
@@ -236,7 +244,7 @@ def q19(t):
            & (m.l_quantity >= 10) & (m.l_quantity <= 20) & (m.p_size >= 1) & (m.p_size <= 10))
         | ((m.p_brand == "Brand#34") & m.p_container.isin(S.CONTAINERS_LG)
            & (m.l_quantity >= 20) & (m.l_quantity <= 30) & (m.p_size >= 1) & (m.p_size <= 15)))
-    f = m[cond]
+    f = m[cond & m.l_shipmode.isin(["AIR", "AIR REG"]) & (m.l_shipinstruct == "DELIVER IN PERSON")]
     return _df(revenue=[float((f.l_extendedprice * (1.0 - f.l_discount)).sum())])
 
 
@@ -257,10 +265,13 @@ def q21(t):
     s, o, l = t["supplier"], t["orders"], t["lineitem"]
     saudi = s.loc[s.s_nationkey == S.Q21_NATIONKEY, "s_suppkey"]
     fkeys = o.loc[o.o_orderstatus == "F", "o_orderkey"]
+    ns = l.groupby("l_orderkey")["l_suppkey"].nunique()
+    multi = ns.index[ns >= 2]
     late = l[l.l_receiptdate > l.l_commitdate]
     nl = late.groupby("l_orderkey")["l_suppkey"].nunique()
     single = nl.index[nl == 1]
-    q = late[late.l_orderkey.isin(fkeys) & late.l_orderkey.isin(single) & late.l_suppkey.isin(saudi)]
+    q = late[late.l_orderkey.isin(fkeys) & late.l_orderkey.isin(single) & late.l_orderkey.isin(multi)
+             & late.l_suppkey.isin(saudi)]
     return (q.groupby("l_suppkey").size().reset_index(name="numwait")
             .sort_values(["numwait", "l_suppkey"], ascending=[False, True]).head(100)
             .reset_index(drop=True))
@@ -282,6 +293,7 @@ QUERIES = {i: globals()[f"q{i}"] for i in range(1, 23)}
 
 def run(q: int, data_dir: str, device=None):
     """Timed unit: Parquet read + query + materialized DataFrame."""
+    S.set_scale_from(data_dir)
     t = {n: pandas_read(table_path(data_dir, n), cols) for n, cols in S.TABLES[q].items()}
     return QUERIES[q](t)
 

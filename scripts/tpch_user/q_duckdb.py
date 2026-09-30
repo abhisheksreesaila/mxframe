@@ -24,15 +24,15 @@ SELECT l_returnflag, l_linestatus,
 FROM lineitem WHERE l_shipdate <= {S.Q1_CUTOFF}
 GROUP BY 1, 2 ORDER BY 1, 2""",
     2: f"""
-WITH eu AS (SELECT s_suppkey, s_name, s_acctbal, s_address, s_phone, s_comment FROM supplier
-            WHERE s_nationkey IN (SELECT n_nationkey FROM nation WHERE n_regionkey = {S.Q2_REGIONKEY})),
+WITH eu AS (SELECT s_suppkey, s_name, s_acctbal, s_address, s_phone, s_comment, n_name FROM supplier
+            JOIN nation ON s_nationkey = n_nationkey WHERE n_regionkey = {S.Q2_REGIONKEY}),
 tp AS (SELECT p_partkey, p_mfgr FROM part WHERE p_size = 15 AND p_type LIKE '%BRASS%'),
-m AS (SELECT ps_partkey, ps_supplycost, s_acctbal, s_name, s_address, s_phone, s_comment, p_mfgr
+m AS (SELECT ps_partkey, ps_supplycost, s_acctbal, s_name, n_name, s_address, s_phone, s_comment, p_mfgr
       FROM partsupp JOIN eu ON ps_suppkey = s_suppkey JOIN tp ON ps_partkey = p_partkey),
 mc AS (SELECT ps_partkey AS pk, min(ps_supplycost) AS mn FROM m GROUP BY 1)
-SELECT s_acctbal, s_name, ps_partkey, p_mfgr, s_address, s_phone, s_comment
+SELECT s_acctbal, s_name, n_name, ps_partkey, p_mfgr, s_address, s_phone, s_comment
 FROM m JOIN mc ON ps_partkey = pk AND ps_supplycost = mn
-ORDER BY s_acctbal DESC, s_name, ps_partkey LIMIT 100""",
+ORDER BY s_acctbal DESC, n_name, s_name, ps_partkey LIMIT 100""",
     3: f"""
 SELECT o_orderkey, o_orderdate, o_shippriority, sum({_REV}) AS revenue
 FROM orders JOIN customer ON o_custkey = c_custkey JOIN lineitem ON o_orderkey = l_orderkey
@@ -46,8 +46,9 @@ GROUP BY 1 ORDER BY 1""",
     5: f"""
 SELECT n_name, sum({_REV}) AS revenue
 FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey
-     JOIN nation ON c_nationkey = n_nationkey
-WHERE o_orderdate >= {S.Q5_LO} AND o_orderdate < {S.Q5_HI}
+     JOIN supplier ON l_suppkey = s_suppkey AND c_nationkey = s_nationkey
+     JOIN nation ON s_nationkey = n_nationkey
+WHERE n_regionkey = {S.Q5_REGIONKEY} AND o_orderdate >= {S.Q5_LO} AND o_orderdate < {S.Q5_HI}
 GROUP BY 1 ORDER BY 2 DESC""",
     6: f"""
 SELECT sum(l_extendedprice::DOUBLE * l_discount::DOUBLE) AS revenue FROM lineitem
@@ -60,17 +61,19 @@ FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey 
      JOIN supplier ON l_suppkey = s_suppkey
      JOIN nation n1 ON s_nationkey = n1.n_nationkey JOIN nation n2 ON c_nationkey = n2.n_nationkey
 WHERE l_shipdate >= {S.Q7_LO} AND l_shipdate <= {S.Q7_HI}
+  AND ((n1.n_name = '{S.Q7_NATIONS[0]}' AND n2.n_name = '{S.Q7_NATIONS[1]}')
+    OR (n1.n_name = '{S.Q7_NATIONS[1]}' AND n2.n_name = '{S.Q7_NATIONS[0]}'))
 GROUP BY 1, 2, 3 ORDER BY 1, 2, 3""",
     8: f"""
 WITH v AS (
-  SELECT {_YEAR.format(c='o_orderdate')} AS o_year, {_REV} AS vol, c_nationkey
-  FROM lineitem JOIN part ON l_partkey = p_partkey JOIN orders ON l_orderkey = o_orderkey
-       JOIN customer ON o_custkey = c_custkey
-  WHERE p_type = 'ECONOMY ANODIZED STEEL'
+  SELECT {_YEAR.format(c='o_orderdate')} AS o_year, {_REV} AS vol, s_nationkey
+  FROM lineitem JOIN part ON l_partkey = p_partkey JOIN supplier ON l_suppkey = s_suppkey
+       JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey
+  WHERE p_type = 'ECONOMY ANODIZED STEEL' AND o_orderdate >= {S.Q8_LO} AND o_orderdate <= {S.Q8_HI}
     AND c_nationkey IN (SELECT n_nationkey FROM nation WHERE n_regionkey = {S.Q8_REGIONKEY}))
 SELECT o_year, sum(vol) AS total_vol,
-       sum(CASE WHEN c_nationkey = {S.Q8_NATIONKEY} THEN vol ELSE 0 END) AS brazil_vol_sum,
-       sum(CASE WHEN c_nationkey = {S.Q8_NATIONKEY} THEN vol ELSE 0 END) / sum(vol) AS mkt_share
+       sum(CASE WHEN s_nationkey = {S.Q8_NATIONKEY} THEN vol ELSE 0 END) AS brazil_vol_sum,
+       sum(CASE WHEN s_nationkey = {S.Q8_NATIONKEY} THEN vol ELSE 0 END) / sum(vol) AS mkt_share
 FROM v GROUP BY 1 ORDER BY 1""",
     9: f"""
 SELECT n_name, {_YEAR.format(c='o_orderdate')} AS o_year,
@@ -79,7 +82,7 @@ FROM lineitem JOIN part ON l_partkey = p_partkey
      JOIN partsupp ON l_partkey = ps_partkey AND l_suppkey = ps_suppkey
      JOIN supplier ON l_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey
      JOIN orders ON l_orderkey = o_orderkey
-WHERE p_name LIKE '%green%' GROUP BY 1, 2 ORDER BY 1, 2""",
+WHERE p_name LIKE '%green%' GROUP BY 1, 2 ORDER BY 1, 2 DESC""",
     10: f"""
 SELECT o_custkey, n_name, sum({_REV}) AS revenue
 FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey
@@ -90,7 +93,7 @@ GROUP BY 1, 2 ORDER BY 3 DESC, 1 LIMIT 20""",
 WITH v AS (SELECT ps_partkey, sum(ps_supplycost::DOUBLE * ps_availqty::DOUBLE) AS value FROM partsupp
            WHERE ps_suppkey IN (SELECT s_suppkey FROM supplier WHERE s_nationkey = {S.Q11_NATIONKEY})
            GROUP BY 1)
-SELECT ps_partkey, value FROM v WHERE value > (SELECT sum(value) * {S.Q11_FRACTION} FROM v)
+SELECT ps_partkey, value FROM v WHERE value > (SELECT sum(value) * @FRAC@ FROM v)
 ORDER BY value DESC""",
     12: f"""
 SELECT l_shipmode,
@@ -105,8 +108,7 @@ SELECT c_count, count(*) AS custdist FROM (
   SELECT c_custkey, count(o_orderkey) AS c_count FROM customer LEFT JOIN orders ON c_custkey = o_custkey
   GROUP BY 1) GROUP BY 1 ORDER BY 2 DESC, 1 DESC""",
     14: f"""
-SELECT sum(CASE WHEN p_type LIKE 'PROMO%' THEN {_REV} ELSE 0 END) AS promo_revenue,
-       sum({_REV}) AS total_revenue
+SELECT 100.0 * sum(CASE WHEN p_type LIKE 'PROMO%' THEN {_REV} ELSE 0 END) / sum({_REV}) AS promo_revenue
 FROM lineitem JOIN part ON l_partkey = p_partkey
 WHERE l_shipdate >= {S.Q14_LO} AND l_shipdate < {S.Q14_HI}""",
     15: f"""
@@ -135,12 +137,13 @@ FROM lineitem JOIN big USING (l_orderkey) JOIN orders ON l_orderkey = o_orderkey
 GROUP BY 1, 2 ORDER BY 3 DESC, 2 LIMIT 100""",
     19: f"""
 SELECT sum({_REV}) AS revenue FROM lineitem JOIN part ON l_partkey = p_partkey
-WHERE (p_brand = 'Brand#12' AND p_container IN ({', '.join(repr(c) for c in S.CONTAINERS_SM)})
+WHERE ((p_brand = 'Brand#12' AND p_container IN ({', '.join(repr(c) for c in S.CONTAINERS_SM)})
        AND l_quantity >= 1 AND l_quantity <= 11 AND p_size BETWEEN 1 AND 5)
    OR (p_brand = 'Brand#23' AND p_container IN ({', '.join(repr(c) for c in S.CONTAINERS_MD)})
        AND l_quantity >= 10 AND l_quantity <= 20 AND p_size BETWEEN 1 AND 10)
    OR (p_brand = 'Brand#34' AND p_container IN ({', '.join(repr(c) for c in S.CONTAINERS_LG)})
-       AND l_quantity >= 20 AND l_quantity <= 30 AND p_size BETWEEN 1 AND 15)""",
+       AND l_quantity >= 20 AND l_quantity <= 30 AND p_size BETWEEN 1 AND 15))
+  AND l_shipmode IN ('AIR', 'AIR REG') AND l_shipinstruct = 'DELIVER IN PERSON'""",
     20: f"""
 WITH forest AS (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%'),
 q AS (SELECT l_partkey, l_suppkey, sum(l_quantity::DOUBLE) AS sq FROM lineitem
@@ -152,9 +155,11 @@ SELECT s_name, s_address FROM supplier
 WHERE s_nationkey = {S.Q20_NATIONKEY} AND s_suppkey IN (SELECT ps_suppkey FROM ex) ORDER BY s_name""",
     21: f"""
 WITH late AS (SELECT l_orderkey, l_suppkey FROM lineitem WHERE l_receiptdate > l_commitdate),
-single AS (SELECT l_orderkey FROM late GROUP BY 1 HAVING count(DISTINCT l_suppkey) = 1)
+single AS (SELECT l_orderkey FROM late GROUP BY 1 HAVING count(DISTINCT l_suppkey) = 1),
+multi AS (SELECT l_orderkey FROM lineitem GROUP BY 1 HAVING count(DISTINCT l_suppkey) >= 2)
 SELECT l_suppkey, count(*) AS numwait
 FROM late JOIN orders ON l_orderkey = o_orderkey JOIN single USING (l_orderkey)
+     JOIN multi USING (l_orderkey)
 WHERE o_orderstatus = 'F'
   AND l_suppkey IN (SELECT s_suppkey FROM supplier WHERE s_nationkey = {S.Q21_NATIONKEY})
 GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 100""",
@@ -172,10 +177,11 @@ GROUP BY 1 ORDER BY 1""",
 def run(q: int, data_dir: str, device=None):
     """Timed unit: Parquet read + query + materialized Arrow result."""
     import duckdb
+    S.set_scale_from(data_dir)
     con = duckdb.connect()
     for name in S.TABLES[q]:
         con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{table_path(data_dir, name)}')")
-    res = con.execute(SQL[q])
+    res = con.execute(SQL[q].replace('@FRAC@', repr(S.q11_fraction())))
     out = res.fetch_arrow_table() if hasattr(res, "fetch_arrow_table") else res.arrow()
     return out.read_all() if hasattr(out, "read_all") else out
 

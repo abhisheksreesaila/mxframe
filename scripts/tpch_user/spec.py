@@ -17,6 +17,7 @@ Q4_LO, Q4_HI = days(1993, 7, 1), days(1993, 10, 1)
 Q5_LO, Q5_HI = days(1994, 1, 1), days(1995, 1, 1)
 Q6_LO, Q6_HI = days(1994, 1, 1), days(1995, 1, 1)
 Q7_LO, Q7_HI = days(1995, 1, 1), days(1996, 12, 31)  # inclusive
+Q8_LO, Q8_HI = days(1995, 1, 1), days(1996, 12, 31)  # inclusive
 Q10_LO, Q10_HI = days(1993, 10, 1), days(1994, 1, 1)
 Q12_LO, Q12_HI = days(1994, 1, 1), days(1995, 1, 1)
 Q14_LO, Q14_HI = days(1995, 9, 1), days(1995, 10, 1)
@@ -24,23 +25,40 @@ Q15_LO, Q15_HI = days(1996, 1, 1), days(1996, 4, 1)
 Q20_LO, Q20_HI = days(1994, 1, 1), days(1995, 1, 1)
 
 Q11_NATIONKEY = 7            # GERMANY
-Q11_FRACTION = 0.0001
+Q5_REGIONKEY = 2             # ASIA
+Q7_NATIONS = ("FRANCE", "GERMANY")
 Q20_NATIONKEY = 3            # CANADA
 Q21_NATIONKEY = 20           # SAUDI ARABIA
 Q2_REGIONKEY = 3             # EUROPE
 Q8_REGIONKEY = 1             # AMERICA
-Q8_NATIONKEY = 2             # BRAZIL
+Q8_NATIONKEY = 2             # BRAZIL (the SUPPLIER's nation)
 Q16_SIZES = [49, 14, 23, 45, 19, 3, 36, 9]
 Q22_CODES = ["13", "31", "23", "29", "30", "18", "17"]
 CONTAINERS_SM = ["SM CASE", "SM BOX", "SM PACK", "SM PKG"]
 CONTAINERS_MD = ["MED BAG", "MED BOX", "MED PKG", "MED PACK"]
 CONTAINERS_LG = ["LG CASE", "LG BOX", "LG PACK", "LG PKG"]
 
+import re
+
+CURRENT_SF = 1.0     # set by each engine's run() from the data directory name
+
+
+def set_scale_from(data_dir: str) -> None:
+    """TPC-H Q11's threshold is 0.0001 / SF."""
+    global CURRENT_SF
+    m = re.search(r"tpch_sf([0-9.]+)", str(data_dir))
+    CURRENT_SF = float(m.group(1).rstrip(".")) if m else 1.0
+
+
+def q11_fraction() -> float:
+    return 0.0001 / CURRENT_SF
+
+
 # ---- columns each query reads (both mx and pandas read only these; Polars/DuckDB prune) ----
 TABLES: dict[int, dict[str, list[str]]] = {
     1: {"lineitem": ["l_shipdate", "l_returnflag", "l_linestatus", "l_quantity",
                      "l_extendedprice", "l_discount", "l_tax"]},
-    2: {"nation": ["n_nationkey", "n_regionkey"],
+    2: {"nation": ["n_nationkey", "n_name", "n_regionkey"],
         "part": ["p_partkey", "p_size", "p_type", "p_mfgr"],
         "supplier": ["s_suppkey", "s_name", "s_acctbal", "s_address", "s_phone", "s_comment",
                      "s_nationkey"],
@@ -50,10 +68,11 @@ TABLES: dict[int, dict[str, list[str]]] = {
         "lineitem": ["l_orderkey", "l_shipdate", "l_extendedprice", "l_discount"]},
     4: {"orders": ["o_orderkey", "o_orderdate", "o_orderpriority"],
         "lineitem": ["l_orderkey", "l_commitdate", "l_receiptdate"]},
-    5: {"nation": ["n_nationkey", "n_name"],
+    5: {"nation": ["n_nationkey", "n_name", "n_regionkey"],
+        "supplier": ["s_suppkey", "s_nationkey"],
         "customer": ["c_custkey", "c_nationkey"],
         "orders": ["o_orderkey", "o_custkey", "o_orderdate"],
-        "lineitem": ["l_orderkey", "l_extendedprice", "l_discount"]},
+        "lineitem": ["l_orderkey", "l_suppkey", "l_extendedprice", "l_discount"]},
     6: {"lineitem": ["l_shipdate", "l_discount", "l_quantity", "l_extendedprice"]},
     7: {"nation": ["n_nationkey", "n_name"],
         "supplier": ["s_suppkey", "s_nationkey"],
@@ -62,9 +81,10 @@ TABLES: dict[int, dict[str, list[str]]] = {
         "lineitem": ["l_orderkey", "l_suppkey", "l_shipdate", "l_extendedprice", "l_discount"]},
     8: {"nation": ["n_nationkey", "n_regionkey"],
         "part": ["p_partkey", "p_type"],
+        "supplier": ["s_suppkey", "s_nationkey"],
         "customer": ["c_custkey", "c_nationkey"],
         "orders": ["o_orderkey", "o_custkey", "o_orderdate"],
-        "lineitem": ["l_orderkey", "l_partkey", "l_extendedprice", "l_discount"]},
+        "lineitem": ["l_orderkey", "l_partkey", "l_suppkey", "l_extendedprice", "l_discount"]},
     9: {"nation": ["n_nationkey", "n_name"],
         "supplier": ["s_suppkey", "s_nationkey"],
         "partsupp": ["ps_partkey", "ps_suppkey", "ps_supplycost"],
@@ -94,7 +114,8 @@ TABLES: dict[int, dict[str, list[str]]] = {
          "orders": ["o_orderkey", "o_custkey"],
          "lineitem": ["l_orderkey", "l_quantity"]},
     19: {"part": ["p_partkey", "p_brand", "p_container", "p_size"],
-         "lineitem": ["l_partkey", "l_quantity", "l_extendedprice", "l_discount"]},
+         "lineitem": ["l_partkey", "l_quantity", "l_extendedprice", "l_discount", "l_shipmode",
+                      "l_shipinstruct"]},
     20: {"part": ["p_partkey", "p_name"],
          "supplier": ["s_suppkey", "s_name", "s_address", "s_nationkey"],
          "partsupp": ["ps_partkey", "ps_suppkey", "ps_availqty"],
@@ -109,7 +130,7 @@ TABLES: dict[int, dict[str, list[str]]] = {
 OUTPUT: dict[int, list[str]] = {
     1: ["l_returnflag", "l_linestatus", "sum_qty", "sum_base_price", "sum_disc_price",
         "sum_charge", "avg_qty", "avg_price", "avg_disc", "count_order"],
-    2: ["s_acctbal", "s_name", "ps_partkey", "p_mfgr", "s_address", "s_phone", "s_comment"],
+    2: ["s_acctbal", "s_name", "n_name", "ps_partkey", "p_mfgr", "s_address", "s_phone", "s_comment"],
     3: ["o_orderkey", "o_orderdate", "o_shippriority", "revenue"],
     4: ["o_orderpriority", "order_count"],
     5: ["n_name", "revenue"],
@@ -121,7 +142,7 @@ OUTPUT: dict[int, list[str]] = {
     11: ["ps_partkey", "value"],
     12: ["l_shipmode", "high_line_count", "low_line_count"],
     13: ["c_count", "custdist"],
-    14: ["promo_revenue", "total_revenue"],
+    14: ["promo_revenue"],
     15: ["s_suppkey", "s_name", "s_address", "s_phone", "total_revenue"],
     16: ["p_brand", "p_type", "p_size", "supplier_cnt"],
     17: ["revenue"],
@@ -139,13 +160,13 @@ TOPN_METRIC: dict[int, int] = {2: 0, 3: 3, 10: 2, 18: 2, 21: 1}
 # checks that every engine's rows come back in this order. Queries without ORDER BY are absent.
 ORDER_BY: dict[int, list[tuple[int, bool]]] = {
     1: [(0, False), (1, False)],
-    2: [(0, True), (1, False), (2, False)],
+    2: [(0, True), (2, False), (1, False), (3, False)],
     3: [(3, True), (1, False), (0, False)],
     4: [(0, False)],
     5: [(1, True)],
     7: [(0, False), (1, False), (2, False)],
     8: [(0, False)],
-    9: [(0, False), (1, False)],
+    9: [(0, False), (1, True)],
     10: [(2, True), (0, False)],
     11: [(1, True)],
     12: [(0, False)],
@@ -179,25 +200,19 @@ TITLES = {
 # DuckDB reference compute the SAME query, so the comparison is apples-to-apples). Everything
 # not listed here (Q1, Q3, Q6, Q12, ...) follows the TPC-H text with the standard parameters.
 DEVIATIONS = {
-    2: "region filter by nation.n_regionkey = 3 (no region-name join); 'BRASS' matched anywhere in p_type "
-       "(TPC-H: suffix); n_name is not in the output; ORDER BY s_acctbal DESC, s_name, ps_partkey "
-       "(TPC-H: s_acctbal DESC, n_name, s_name, p_partkey)",
-    5: "no supplier-nation = customer-nation condition and no region filter (all nations)",
-    7: "all nation pairs (no FRANCE/GERMANY filter)",
-    8: "market share by CUSTOMER nation (Brazil, nationkey 2), customers in region 1, all order years",
-    9: "ORDER BY nation, o_year ascending (TPC-H: o_year DESC)",
-    10: "no c_name/c_acctbal/... output columns; groups by (o_custkey, n_name); ties on revenue broken by o_custkey",
-    11: "Germany = nationkey 7, threshold fraction 0.0001 (not 0.0001/SF)",
+    2: "region EUROPE and nation joined by key (n_regionkey = 3, no region table); 'BRASS' matched anywhere in "
+       "p_type (TPC-H: suffix)",
+    5: "region ASIA by n_regionkey = 2 (no region table)",
+    7: "shipping year from l_shipdate; nations FRANCE/GERMANY by name",
+    8: "supplier nation BRAZIL by nationkey 2, region AMERICA by n_regionkey = 1 (no region table)",
+    10: "no c_name/c_acctbal/c_address/c_phone/c_comment output columns; groups by (o_custkey, n_name); "
+        "ties on revenue broken by o_custkey",
     13: "the `o_comment NOT LIKE '%special%requests%'` predicate is NOT applied (o_comment is not read)",
-    14: "returns promo_revenue and total_revenue, not the 100*ratio",
     16: "supplier filter is `s_comment LIKE '%Complaints%'` (TPC-H: '%Customer%Complaints%')",
-    17: "no rounding; sum(l_extendedprice)/7.0",
-    18: "sorted by sum_qty DESC, l_orderkey; no o_totalprice/o_orderdate/c_name columns",
-    19: "no l_shipmode / l_shipinstruct predicates",
-    20: "supplier nation is Canada by nationkey (3), no nation-name join",
-    21: "orders with exactly one late supplier; the 'another supplier on the order' EXISTS is dropped; "
-        "Saudi Arabia by nationkey (20)",
+    18: "sorted by sum_qty DESC, l_orderkey (TPC-H: o_totalprice DESC, o_orderdate); no c_name/o_orderdate/"
+        "o_totalprice output columns",
+    20: "Canada by nationkey 3 (no nation table)",
+    21: "Saudi Arabia by nationkey 20 (no nation table)",
     22: "the c_acctbal column is float32 in the data, so the average-balance threshold and the sums are "
-        "compared on float32 inputs (DuckDB reference sums them in DOUBLE)",
+        "computed on float32 inputs (the DuckDB reference sums them in DOUBLE)",
 }
-

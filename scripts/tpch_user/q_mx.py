@@ -61,7 +61,8 @@ def q1(t, dev):
 
 
 def q2(t, dev):
-    eu = t["nation"].filter(col("n_regionkey") == lit(S.Q2_REGIONKEY)).select("n_nationkey")
+    eu = (t["nation"].filter(col("n_regionkey") == lit(S.Q2_REGIONKEY))
+          .select("n_nationkey", "n_name"))
     eu_sup = t["supplier"].join(eu, left_on="s_nationkey", right_on="n_nationkey")
     target = (t["part"].filter((col("p_size") == lit(15)) & col("p_type").contains("BRASS"))
               .select("p_partkey", "p_mfgr"))
@@ -73,8 +74,9 @@ def q2(t, dev):
     return (
         c.join(min_costs, on="ps_partkey")
         .filter(col("ps_supplycost") == col("min_supplycost"))
-        .select("s_acctbal", "s_name", "ps_partkey", "p_mfgr", "s_address", "s_phone", "s_comment")
-        .sort("s_acctbal", "s_name", "ps_partkey", descending=[True, False, False])
+        .select("s_acctbal", "s_name", "n_name", "ps_partkey", "p_mfgr", "s_address", "s_phone",
+                "s_comment")
+        .sort("s_acctbal", "n_name", "s_name", "ps_partkey", descending=[True, False, False, False])
         .limit(100)
         .compute(device=dev)
     )
@@ -110,13 +112,16 @@ def q4(t, dev):
 
 
 def q5(t, dev):
+    asia = t["nation"].filter(col("n_regionkey") == lit(S.Q5_REGIONKEY))
     return (
         t["lineitem"]
         .join(t["orders"].filter((col("o_orderdate") >= lit(S.Q5_LO)) &
                                  (col("o_orderdate") < lit(S.Q5_HI))),
               left_on="l_orderkey", right_on="o_orderkey")
         .join(t["customer"], left_on="o_custkey", right_on="c_custkey")
-        .join(t["nation"], left_on="c_nationkey", right_on="n_nationkey")
+        .join(t["supplier"], left_on="l_suppkey", right_on="s_suppkey")
+        .filter(col("c_nationkey") == col("s_nationkey"))
+        .join(asia, left_on="c_nationkey", right_on="n_nationkey")
         .groupby("n_name")
         .agg(_rev().sum().alias("revenue"))
         .sort("revenue", descending=True)
@@ -149,6 +154,8 @@ def q7(t, dev):
         .join(t["orders"], left_on="l_orderkey", right_on="o_orderkey")
         .join(cust, left_on="o_custkey", right_on="c_custkey")
         .join(sup, left_on="l_suppkey", right_on="s_suppkey")
+        .filter(((col("supp_nation") == lit(S.Q7_NATIONS[0])) & (col("cust_nation") == lit(S.Q7_NATIONS[1])))
+                | ((col("supp_nation") == lit(S.Q7_NATIONS[1])) & (col("cust_nation") == lit(S.Q7_NATIONS[0]))))
         .with_columns(_year("l_shipdate", 1995, 1996).alias("l_year"))
         .groupby("supp_nation", "cust_nation", "l_year")
         .agg(_rev().sum().alias("revenue"))
@@ -160,16 +167,18 @@ def q7(t, dev):
 def q8(t, dev):
     am = t["nation"].filter(col("n_regionkey") == lit(S.Q8_REGIONKEY)).select("n_nationkey")
     cust_am = t["customer"].join(am, left_on="c_nationkey", right_on="n_nationkey")
+    orders = t["orders"].filter((col("o_orderdate") >= lit(S.Q8_LO)) & (col("o_orderdate") <= lit(S.Q8_HI)))
     by_year = (
         t["lineitem"]
         .join(t["part"].filter(col("p_type") == lit("ECONOMY ANODIZED STEEL")),
               left_on="l_partkey", right_on="p_partkey")
-        .join(t["orders"], left_on="l_orderkey", right_on="o_orderkey")
+        .join(t["supplier"], left_on="l_suppkey", right_on="s_suppkey")
+        .join(orders, left_on="l_orderkey", right_on="o_orderkey")
         .join(cust_am, left_on="o_custkey", right_on="c_custkey")
         .with_columns(
-            _year("o_orderdate", 1992, 1998).alias("o_year"),
+            _year("o_orderdate", 1995, 1996).alias("o_year"),
             _rev().alias("volume"),
-            when(col("c_nationkey") == lit(S.Q8_NATIONKEY), _rev(), lit(0.0)).alias("brazil_vol"),
+            when(col("s_nationkey") == lit(S.Q8_NATIONKEY), _rev(), lit(0.0)).alias("brazil_vol"),
         )
         .groupby("o_year")
         .agg(col("volume").sum().alias("total_vol"), col("brazil_vol").sum().alias("brazil_vol_sum"))
@@ -195,7 +204,7 @@ def q9(t, dev):
         .with_columns(_year("o_orderdate", 1992, 1998).alias("o_year"))
         .groupby("n_name", "o_year")
         .agg((_rev() - col("ps_supplycost") * col("l_quantity")).sum().alias("sum_profit"))
-        .sort("n_name", "o_year")
+        .sort("n_name", "o_year", descending=[False, True])
         .compute(device=dev)
     )
 
@@ -227,7 +236,7 @@ def q11(t, dev):
     )
     g = LazyFrame(grouped)
     total = _scalar(g.groupby().agg(col("value").sum().alias("total")).compute(device=dev))
-    return (g.filter(col("value") > lit(total * S.Q11_FRACTION))
+    return (g.filter(col("value") > lit(total * S.q11_fraction()))
             .sort("value", descending=True).compute(device=dev))
 
 
@@ -272,15 +281,17 @@ def q13(t, dev):
 
 def q14(t, dev):
     promo = when(col("p_type").startswith("PROMO"), _rev(), lit(0.0))
-    return (
+    sums = (
         t["lineitem"]
         .join(t["part"], left_on="l_partkey", right_on="p_partkey")
         .filter(col("l_shipdate") >= lit(S.Q14_LO))
         .filter(col("l_shipdate") < lit(S.Q14_HI))
         .groupby()
-        .agg(promo.sum().alias("promo_revenue"), _rev().sum().alias("total_revenue"))
+        .agg(promo.sum().alias("promo_sum"), _rev().sum().alias("total_sum"))
         .compute(device=dev)
     )
+    return (LazyFrame(sums).select((lit(100.0) * col("promo_sum") / col("total_sum")).alias("promo_revenue"))
+            .compute(device=dev))
 
 
 def q15(t, dev):
@@ -366,7 +377,8 @@ def q19(t, dev):
           & (col("p_size") >= lit(1)) & (col("p_size") <= lit(15)))
     return (
         t["lineitem"].join(t["part"], left_on="l_partkey", right_on="p_partkey")
-        .filter(sm | md | lg)
+        .filter((sm | md | lg) & col("l_shipmode").isin(["AIR", "AIR REG"])
+                & (col("l_shipinstruct") == lit("DELIVER IN PERSON")))
         .groupby()
         .agg(_rev().sum().alias("revenue"))
         .compute(device=dev)
@@ -404,12 +416,16 @@ def q21(t, dev):
     single = (late.select("l_orderkey", "l_suppkey").distinct()
               .groupby("l_orderkey").agg(col("l_suppkey").count().alias("n_late"))
               .filter(col("n_late") == lit(1)).select("l_orderkey"))
+    multi = (t["lineitem"].select("l_orderkey", "l_suppkey").distinct()
+             .groupby("l_orderkey").agg(col("l_suppkey").count().alias("n_supp"))
+             .filter(col("n_supp") >= lit(2)).select("l_orderkey"))
     f_orders = t["orders"].filter(col("o_orderstatus") == lit("F")).select("o_orderkey")
     saudi = t["supplier"].filter(col("s_nationkey") == lit(S.Q21_NATIONKEY)).select("s_suppkey")
     return (
         late
         .join(f_orders, left_on="l_orderkey", right_on="o_orderkey")
         .join(single, on="l_orderkey")
+        .join(multi, on="l_orderkey")
         .join(saudi, left_on="l_suppkey", right_on="s_suppkey")
         .groupby("l_suppkey")
         .agg(col("l_orderkey").count().alias("numwait"))
@@ -445,6 +461,7 @@ QUERIES = {i: globals()[f"q{i}"] for i in range(1, 23)}
 
 def load(q: int, data_dir: str) -> dict:
     """Lazy scans (footer only); the engine reads just the columns each query references."""
+    S.set_scale_from(data_dir)
     return {n: mx.scan_parquet(table_path(data_dir, n)) for n in S.TABLES[q]}
 
 

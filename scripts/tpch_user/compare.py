@@ -20,6 +20,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 
+# Float ORDER BY keys closer than this are one tie (only accumulation-order noise, ~1e-15, should
+# count); real data values such as 9999.99 vs 9999.98 differ by 1e-6 and are NOT ties.
+ORDER_RTOL = 1e-9
+
+
 @dataclass
 class Comparison:
     verdict: str            # "ok" | "drift" | "wrong"
@@ -71,13 +76,13 @@ def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
                           topn_metric=topn_metric)
     if res.verdict == "wrong" or not order_by or actual.num_rows < 2:
         return res
-    bad = check_order(actual, order_by, rtol)
+    bad = check_order(actual, order_by, ORDER_RTOL)
     if bad is not None:
         return Comparison("wrong", res.max_rel_err, f"ORDER BY violated at result row {bad}")
     return res
 
 
-def check_order(tbl: pa.Table, order_by: list[tuple[int, bool]], rtol: float = 1e-6) -> int | None:
+def check_order(tbl: pa.Table, order_by: list[tuple[int, bool]], rtol: float = ORDER_RTOL) -> int | None:
     """Index of the first row that breaks the ORDER BY sequence, or None. Float keys that agree
     within `rtol` count as tied (the next key decides), like DuckDB's exact ties after float noise."""
     n = tbl.num_rows

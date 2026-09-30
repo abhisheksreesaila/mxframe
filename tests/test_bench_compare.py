@@ -159,3 +159,18 @@ def test_csv_roundtrip_keeps_types(tmp_path):
 
 def test_import_plus_first_cell_sums_the_two():
     assert report.fmt_sum_cell({"import_ms": 700.0, "first_ms": 100.0, "verdict": "ok"}) == "800"
+
+
+def test_order_by_distinct_floats_one_part_in_a_million_apart_are_not_ties():
+    t = T(v=[9999.99, 9999.98], k=["z", "a"])            # v DESC then k: correct as given
+    assert compare_tables(t, t, order_by=[(0, True), (1, False)]).ok
+
+
+def test_official_answer_check_flags_a_wrong_reference():
+    from tpch_user.official import check_official
+    ok = pa.table({"revenue": [123141078.2283]})
+    assert check_official(6, ok) == "ok"
+    assert check_official(6, pa.table({"revenue": [8.865e7]})).startswith("row")
+    assert check_official(9, ok) is None                              # no published answer listed
+    assert check_official(14, pa.table({"promo_revenue": [16.3807786]})) == "ok"
+    assert check_official(14, pa.table({"promo_revenue": [17.0]})).startswith("row")
