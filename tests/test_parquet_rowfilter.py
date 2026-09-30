@@ -25,6 +25,15 @@ def _table(n=6000, seed=3, with_nulls=False):
     return pa.table(t)
 
 
+_REAL_ESTIMATE = iop._estimated_pass
+
+
+@pytest.fixture(autouse=True)
+def _always_row_filter(monkeypatch):
+    monkeypatch.setattr(iop, "MIN_ROWS_FOR_ROW_FILTER", 0)      # test files are tiny
+    monkeypatch.setattr(iop, "_estimated_pass", lambda *a: 0.0)  # exercise the mask code for every case
+
+
 @pytest.fixture(params=[False, True], ids=["plain", "nulls"])
 def path(tmp_path, request):
     p = tmp_path / "t.parquet"
@@ -122,8 +131,36 @@ def test_filter_reading_does_not_import_pandas():
             "d = tempfile.mkdtemp(); p = os.path.join(d, 't.parquet')\n"
             "from mxframe.np_arrow import array as A\n"
             "pq.write_table(pa.table({'a': A(np.arange(4000, dtype=np.int64)), 'b': A(np.ones(4000, np.float32))}), p, row_group_size=500)\n"
+            "import mxframe.io_parquet as iop; iop.MIN_ROWS_FOR_ROW_FILTER = 0; iop._estimated_pass = lambda *a: 0.0\n"
             "r = mx.scan_parquet(p).filter(col('a') >= 100).select(col('b')).compute(device='cpu')\n"
             "assert r.num_rows == 3900\n"
+            "assert iop._read_file(p, ['b'], [], (('a', 'ge', 100),)).num_rows >= 3900\n"
             "assert 'pandas' not in sys.modules, 'pandas imported'\n")
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[-800:]
+
+
+def test_covers_and_estimates():
+    assert iop._covers(5, 9, "ge", 5) and not iop._covers(5, 9, "gt", 5)
+    assert iop._covers(5, 9, "lt", 10) and not iop._covers(5, 9, "le", 8)
+    assert iop._covers(7, 7, "eq", 7) and not iop._covers(5, 9, "eq", 7)
+    assert iop._covers(5, 9, "ne", 11) and not iop._covers(5, 9, "ne", 7)
+    assert iop._covers(7, 7, "isin", (1, 7)) and not iop._covers(5, 9, "isin", (7,))
+
+
+def test_unselective_filters_are_left_to_the_engine(tmp_path, monkeypatch):
+    p = str(tmp_path / "u.parquet")
+    pq.write_table(_table(), p, row_group_size=500)
+    calls = []
+    monkeypatch.setattr(iop, "_estimated_pass", _REAL_ESTIMATE)
+    monkeypatch.setattr(iop, "_read_groups", lambda *a, **k: calls.append(1) or (_ for _ in ()).throw(AssertionError))
+    got = iop._read_file(p, ["id"], [], (("d", "ge", 8010),))       # ~99% of rows survive
+    assert not calls and got.num_rows == 6000
+
+
+def test_small_reads_use_the_plain_reader(tmp_path, monkeypatch):
+    monkeypatch.setattr(iop, "MIN_ROWS_FOR_ROW_FILTER", 10**9)
+    p = str(tmp_path / "s.parquet")
+    pq.write_table(_table(), p, row_group_size=500)
+    monkeypatch.setattr(iop, "_read_groups", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    assert iop._read_file(p, ["id"], [], (("d", "ge", 9500),)).num_rows == 6000
