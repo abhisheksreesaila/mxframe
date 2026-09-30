@@ -1,5 +1,6 @@
-"""F-008: column-vs-constant compares run in the column's own type (CMPC) and still
-equal the float64 comparison, including right at the rounding boundaries."""
+"""F-008: column-vs-constant compares run in the column's own type (CMPC): a float32 column
+takes the literal as float32 (so TPC-H Q6's `l_discount <= 0.07` keeps the 0.07 rows, as DuckDB
+does), integer columns compare exactly. Boundary values on both sides of every literal."""
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -49,6 +50,15 @@ def boundary_table():
     return table, lits + [float("inf"), float("-inf"), 1, 0, 2 ** 31]
 
 
+def reference(column, x_native, op, c):
+    """The comparison as DuckDB / Polars / NumPy 2 do it: a float32 column takes the literal as float32,
+    everything else compares exactly (float64 for float64, exact integers for integer columns)."""
+    if column == "f32":
+        with np.errstate(over="ignore"):
+            return NP_OPS[op](x_native.astype(np.float32), np.float32(c))
+    return NP_OPS[op](x_native.astype(np.float64), float(c))
+
+
 NP_OPS = {"ge": np.greater_equal, "gt": np.greater, "le": np.less_equal, "lt": np.less,
           "eq": np.equal, "ne": np.not_equal}
 DUNDER = {"ge": "__ge__", "gt": "__gt__", "le": "__le__", "lt": "__lt__", "eq": "__eq__", "ne": "__ne__"}
@@ -57,12 +67,12 @@ MIRROR = {"ge": "__le__", "gt": "__lt__", "le": "__ge__", "lt": "__gt__", "eq": 
 
 @pytest.mark.parametrize("op", list(NP_OPS))
 @pytest.mark.parametrize("column", ["f32", "i32", "i64", "f64", "flag"])
-def test_column_vs_constant_matches_float64_reference(device, column, op):
+def test_column_vs_constant_uses_the_columns_type(device, column, op):
     t, lits = boundary_table()
-    x = t.column(column).to_numpy().astype(np.float64)
+    x = t.column(column).to_numpy()
     run = pk.run_pipeline_cpu if device == "cpu" else pk.run_pipeline_gpu
     for c in lits:
-        want = int(np.count_nonzero(NP_OPS[op](x, float(c))))
+        want = int(np.count_nonzero(reference(column, x, op, c)))
         for pred in (getattr(col(column), DUNDER[op])(lit(c)),      # column <op> literal
                      getattr(lit(c), MIRROR[op])(col(column))):     # literal <mirrored op> column
             prog = compile_pipeline([pred], [col(column).count().alias("n")], t)
@@ -84,3 +94,14 @@ def test_dead_columns_are_not_bound():
     # the constant-false conjunct settles the predicate: no predicate column is read at all
     prog = compile_pipeline([col("i32") > lit(1), lit(0) > lit(1)], [col("f64").sum()], t)
     assert prog.columns == ["f64"]
+
+
+def test_float32_column_keeps_rows_equal_to_a_decimal_literal():
+    """0.07 stored as float32 is 0.07000000029..., above the float64 literal 0.07: comparing in
+    float64 would drop every such row (TPC-H Q6 then loses a third of its revenue)."""
+    t = pa.table({"d": pa.array(np.array([0.05, 0.06, 0.07, 0.08], dtype=np.float32)),
+                  "v": pa.array(np.ones(4))})
+    prog = compile_pipeline([col("d") >= lit(0.05), col("d") <= lit(0.07)], [col("v").sum().alias("s")], t)
+    assert pk.cpu_available()
+    parts = pk.run_pipeline_cpu(prog, prog.bind(t), None, 1, 0, 4)
+    assert parts.vals[0, 0] == 3.0

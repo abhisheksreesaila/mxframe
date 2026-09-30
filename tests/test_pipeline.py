@@ -61,12 +61,17 @@ def ref_eval(e, t):
     if op == "sub": return ref_eval(a[0], t) - ref_eval(a[1], t)
     if op == "mul": return ref_eval(a[0], t) * ref_eval(a[1], t)
     if op == "div": return ref_eval(a[0], t) / ref_eval(a[1], t)
-    if op == "lt": return ref_eval(a[0], t) < ref_eval(a[1], t)
-    if op == "le": return ref_eval(a[0], t) <= ref_eval(a[1], t)
-    if op == "gt": return ref_eval(a[0], t) > ref_eval(a[1], t)
-    if op == "ge": return ref_eval(a[0], t) >= ref_eval(a[1], t)
-    if op == "eq": return ref_eval(a[0], t) == ref_eval(a[1], t)
-    if op == "ne": return ref_eval(a[0], t) != ref_eval(a[1], t)
+    if op in ("lt", "le", "gt", "ge", "eq", "ne"):
+        fn = {"lt": np.less, "le": np.less_equal, "gt": np.greater, "ge": np.greater_equal,
+              "eq": np.equal, "ne": np.not_equal}[op]
+        for x_e, c_e in ((a[0], a[1]), (a[1], a[0])):
+            # float32 column vs literal: the literal takes the column's type (DuckDB / Polars / NumPy 2)
+            if (x_e.op == "col" and c_e.op == "lit" and isinstance(c_e.args[0], (int, float))
+                    and t.schema.field(x_e.args[0]).type == pa.float32()):
+                x = t.column(x_e.args[0]).to_numpy().astype(np.float32)
+                c = np.float32(c_e.args[0])
+                return fn(x, c) if x_e is a[0] else fn(c, x)
+        return fn(ref_eval(a[0], t), ref_eval(a[1], t))
     if op == "and": return np.logical_and(ref_eval(a[0], t), ref_eval(a[1], t))
     if op == "or": return np.logical_or(ref_eval(a[0], t), ref_eval(a[1], t))
     if op == "not": return np.logical_not(ref_eval(a[0], t))

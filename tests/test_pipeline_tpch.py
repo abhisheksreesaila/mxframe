@@ -1,4 +1,7 @@
-"""F-008: TPC-H Q1 / Q6 / Q14 / Q19 through the fused pipeline match DuckDB (CPU and GPU)."""
+"""F-008: TPC-H Q1 / Q6 / Q14 / Q19 through the fused pipeline match DuckDB (CPU and GPU).
+
+The reference keeps DuckDB's own comparisons (a float32 column against a decimal literal is
+compared in float32) and only widens the arithmetic to double, since the fused kernel sums in float64."""
 import sys
 from pathlib import Path
 
@@ -102,8 +105,8 @@ def test_q6_matches_duckdb(tpch, device, fused_calls):
     want = con.sql(f"""
         select sum(l_extendedprice::double * l_discount::double) revenue from lineitem
         where l_shipdate >= {bm.Q6_DATE_LO} and l_shipdate < {bm.Q6_DATE_HI}
-          and l_discount::double >= {bm.Q6_DISC_LO} and l_discount::double <= {bm.Q6_DISC_HI}
-          and l_quantity::double < {bm.Q6_QTY_HI}""").fetchone()[0]
+          and l_discount >= {bm.Q6_DISC_LO} and l_discount <= {bm.Q6_DISC_HI}
+          and l_quantity < {bm.Q6_QTY_HI}""").fetchone()[0]
     assert fused_calls["served"] == 1
     _close([got.column("revenue")[0].as_py()], [want], 1e-9)
 
@@ -130,9 +133,9 @@ def test_q19_matches_duckdb(tpch, device, fused_calls):
         return ", ".join(f"'{c}'" for c in x)
     want = con.sql(f"""
         select sum(l_extendedprice::double * (1 - l_discount::double)) from lineitem join part on l_partkey = p_partkey
-        where (p_brand = 'Brand#12' and p_container in ({cont(bm.CONTAINERS_SM)}) and l_quantity::double >= 1 and l_quantity::double <= 11 and p_size between 1 and 5)
-           or (p_brand = 'Brand#23' and p_container in ({cont(bm.CONTAINERS_MD)}) and l_quantity::double >= 10 and l_quantity::double <= 20 and p_size between 1 and 10)
-           or (p_brand = 'Brand#34' and p_container in ({cont(bm.CONTAINERS_LG)}) and l_quantity::double >= 20 and l_quantity::double <= 30 and p_size between 1 and 15)
+        where (p_brand = 'Brand#12' and p_container in ({cont(bm.CONTAINERS_SM)}) and l_quantity >= 1 and l_quantity <= 11 and p_size between 1 and 5)
+           or (p_brand = 'Brand#23' and p_container in ({cont(bm.CONTAINERS_MD)}) and l_quantity >= 10 and l_quantity <= 20 and p_size between 1 and 10)
+           or (p_brand = 'Brand#34' and p_container in ({cont(bm.CONTAINERS_LG)}) and l_quantity >= 20 and l_quantity <= 30 and p_size between 1 and 15)
         """).fetchone()[0]
     _close([got.column("revenue")[0].as_py()], [want], 1e-9)
     assert fused_calls["served"] == 1

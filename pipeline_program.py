@@ -28,9 +28,11 @@ MUL DIV
 LT LE GT   dst = 1.0 if a (<|<=|>|>=|==|!=) b else 0.0      dst, a, b
 GE EQ NE
 CMPC       dst = column <cmp> constant, compared in the      dst, col, k, cmp
-           column's own type (f32 / int / f64) against a
-           threshold rounded so the answer equals the float64
-           comparison; no widening of the column
+           column's own type: a float32 column compares
+           against the constant converted to float32 (the
+           literal adopts the column's type, as in DuckDB,
+           Polars and NumPy 2), an integer column against the
+           exact ceil / floor of the constant, float64 as is
 AND OR     dst = logical and / or of a, b (non-zero = true) dst, a, b
 NOT        dst = 1.0 if a == 0 else 0.0                     dst, a
 FLOOR      dst = floor(a)                                   dst, a
@@ -645,9 +647,15 @@ class _Builder:
             raise Unsupported("wide float isin")
         acc = None
         for v in values:
-            t = self.emit(OP_EQ, x.vreg, self.const_reg(float(v)))
-            acc = t if acc is None else self.emit(OP_OR, acc, t)
-        return _Val(acc, "bool")
+            t = self._compare("eq", (col_e, Expr("lit", v))) if col_e.op == "col" else None
+            if t is None:
+                t = _Val(self.emit(OP_EQ, x.vreg, self.const_reg(float(v))), "bool")
+            if isinstance(t, _Const):
+                if t.value == 0:
+                    continue
+                return t
+            acc = t if acc is None else _Val(self.emit(OP_OR, acc.vreg, t.vreg), "bool")
+        return acc if acc is not None else _Const(0.0, "bool")
 
     def _logic(self, op: str, args):
         code = OP_AND if op == "and" else OP_OR
@@ -827,12 +835,14 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
     )
 
 
-_FLT_MAX = float(np.finfo(np.float32).max)
-
-
 def _threshold(kind: str, op: str, c: float):
-    """Threshold and compare code so that ``column <op> c`` (evaluated in float64)
-    equals the comparison done in the column's own type.
+    """Threshold and compare code for ``column <op> c``, compared in the column's own type.
+
+    * float32 column: the literal is converted to float32 (nearest), as DuckDB, Polars and
+      NumPy 2 do; this is what makes TPC-H Q6's ``l_discount <= 0.07`` include 0.07 in
+      float32 data, where comparing in float64 would drop those rows.
+    * float64 column: as is.
+    * integer column: exact (``ceil`` / ``floor`` of the constant), never rounded.
 
     Returns ``bool`` when the result is the same for every value, else
     ``(threshold, compare_opcode)``. ``kind`` is "f32", "f64" or "int".
@@ -841,32 +851,8 @@ def _threshold(kind: str, op: str, c: float):
     if kind == "f64":
         return c, code
     if kind == "f32":
-        if c in (np.inf, -np.inf):
-            up = dn = c                        # infinities are representable
-        elif c > _FLT_MAX:
-            up, dn = np.inf, _FLT_MAX
-        elif c < -_FLT_MAX:
-            up, dn = -_FLT_MAX, -np.inf
-        else:
-            f = np.float32(c)
-            if float(f) < c:
-                up, dn = float(np.nextafter(f, np.float32(np.inf))), float(f)
-            elif float(f) > c:
-                up, dn = float(f), float(np.nextafter(f, np.float32(-np.inf)))
-            else:
-                up = dn = float(f)
-        exact = up == dn
-        if op == "ge":
-            return float(up), code
-        if op == "gt":
-            return float(dn), code
-        if op == "le":
-            return float(dn), code
-        if op == "lt":
-            return float(up), code
-        if op == "eq":
-            return (float(up), code) if exact else False
-        return (float(up), code) if exact else True     # ne
+        with np.errstate(over="ignore"):
+            return float(np.float32(c)), code
     # integer column (int8..int64, bool)
     import math
     if c >= 2.0 ** 63 or c == np.inf:
