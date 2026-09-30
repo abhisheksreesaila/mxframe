@@ -120,3 +120,53 @@ def test_switch_off_env(spy, monkeypatch):
     monkeypatch.setenv("MXFRAME_FUSED_PIPELINE", "0")
     plans(make_table())["grouped"].compute(device="cpu")
     assert spy["served"] == 0
+
+
+# ── shapes the Router relies on ────────────────────────────────────────────
+
+def test_count_only_programs(spy):
+    from mxframe.pipeline_program import compile_pipeline, finalize
+    t = make_table(5000)
+    for device in DEVICES:
+        prog = compile_pipeline([col("x") > lit(50.0)], [col("n").count().alias("c")], t)
+        assert prog.n_slots == 0
+        gids = RNG.integers(0, 4, t.num_rows).astype(np.int32)
+        run = pk.run_pipeline_cpu if device == "cpu" else pk.run_pipeline_gpu
+        for g, ids in ((1, None), (4, gids)):
+            parts = run(prog, prog.bind_chunks(t), ids, g, 0, t.num_rows)
+            want = np.bincount(ids[t.column("x").to_numpy() > 50.0] if ids is not None else
+                               np.zeros(int((t.column("x").to_numpy() > 50.0).sum()), dtype=np.int64), minlength=g)
+            assert parts.cnt.tolist() == want.tolist()
+            _, cols = finalize(prog, parts, grouped=g > 1)
+            assert cols["c"].dtype == np.int64
+
+
+def test_concurrent_callers_from_python_threads():
+    """The Router calls the CPU kernel from several threads and the GPU kernel from another."""
+    import threading
+    from mxframe.pipeline_program import compile_pipeline, merge_partials
+    t = make_table(400_000)
+    aggs = [(col("x") * col("y")).sum().alias("s"), col("x").max().alias("hi"), col("n").count().alias("c")]
+    prog = compile_pipeline([col("y") < lit(0.8)], aggs, t)
+    cc = prog.bind_chunks(t)
+    gids = RNG.integers(0, 4, t.num_rows).astype(np.int32)
+    want = pk.run_pipeline_cpu(prog, cc, gids, 4, 0, t.num_rows)
+    cuts = list(range(0, t.num_rows, 50_000)) + [t.num_rows]
+    ranges = list(zip(cuts, cuts[1:]))
+    out, errors = {}, []
+
+    def work(i, r, device):
+        try:
+            run = pk.run_pipeline_cpu if device == "cpu" else pk.run_pipeline_gpu
+            out[i] = run(prog, cc, gids, 4, r[0], r[1])
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=work, args=(i, r, "gpu" if (i % 3 == 0 and "gpu" in DEVICES) else "cpu"))
+               for i, r in enumerate(ranges)]
+    [th.start() for th in threads]
+    [th.join() for th in threads]
+    assert not errors, errors
+    merged = merge_partials(prog, [out[i] for i in sorted(out)])
+    assert np.array_equal(merged.cnt, want.cnt)
+    np.testing.assert_allclose(merged.vals, want.vals, rtol=1e-9)
