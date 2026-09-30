@@ -15,7 +15,7 @@ or Ctrl-C loses nothing; the markdown is rendered from the CSV at the end.  `--r
 
 Environment: the subprocesses use CUDA_VISIBLE_DEVICES=<--gpu> (default 1) and import
 mxframe from THIS checkout.  Data: $MXFRAME_TPCH_DATA or <repo>/data or the main checkout's
-data/ (a worktree has none); files are <data>/tpch_sf<SF>/<table>.parquet.
+data/ (a worktree has none); files are <data>/tpch_sf<SF>_exact/<table>.parquet (exact DECIMALs; --legacy-data uses tpch_sf<SF>).
 """
 from __future__ import annotations
 

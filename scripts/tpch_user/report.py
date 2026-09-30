@@ -225,38 +225,39 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         if not srows:
             continue
         by = {(r["engine"], r["query"]): r for r in srows}
+        eng = [e for e in engines if any(r["engine"] == e for r in srows)]     # engines run at this SF
         a(f"\n## Scale factor {sf}: headline (first run in a fresh process), ms\n")
         body = []
-        fastest_count = {e: 0 for e in engines}
+        fastest_count = {e: 0 for e in eng}
         for q in queries:
-            valid = [(by[(e, q)]["first_ms"], e) for e in engines if is_valid(by.get((e, q)))]
+            valid = [(by[(e, q)]["first_ms"], e) for e in eng if is_valid(by.get((e, q)))]
             best = min(valid)[1] if valid else None
             if best:
                 fastest_count[best] += 1
             body.append([f"Q{q} {spec.TITLES[q]}"]
-                        + [fmt_cell(by.get((e, q)), fastest=(e == best)) for e in engines]
+                        + [fmt_cell(by.get((e, q)), fastest=(e == best)) for e in eng]
                         + ([_outside_flag(q)] if mx_shown else []))
-        tot, nq = totals(by, engines, queries)
+        tot, nq = totals(by, eng, queries)
         body.append([f"**sum over the {nq} queries valid for every engine**"]
-                    + [f"**{fmt_ms(tot[e])}**" for e in engines] + (["" ] if mx_shown else []))
-        a(_table(["query"] + [NAMES[e] for e in engines] + (["outside mx"] if mx_shown else []), body))
+                    + [f"**{fmt_ms(tot[e])}**" for e in eng] + (["" ] if mx_shown else []))
+        a(_table(["query"] + [NAMES[e] for e in eng] + (["outside mx"] if mx_shown else []), body))
         a("\nFastest verified engine per query: "
           + ", ".join(f"{NAMES[e]} {n}" for e, n in fastest_count.items()) + ".\n")
 
         a(f"### Wins at SF{sf} (headline, both results verified)\n")
         n = len(queries)
-        for m in [e for e in MX if e in engines]:
+        for m in [e for e in MX if e in eng]:
             parts = []
             for rival in ("polars", "pandas", "duckdb"):
-                if rival in engines:
+                if rival in eng:
                     w, c = win_counts(rows, sf, queries, m, rival)
                     parts.append(f"**{m} beats {NAMES[rival]} on {w}/{n}** ({c} comparable)")
             a("- " + "; ".join(parts))
         a("")
 
-        if mx_shown and "polars" in engines:
+        if mx_shown and "polars" in eng:
             for label, mxs in (("mx-auto", ["mx-auto"]), ("best of mx-cpu / mx-gpu / mx-auto", MX)):
-                mxs = [e for e in mxs if e in engines]
+                mxs = [e for e in mxs if e in eng]
                 lost = losses_vs(rows, sf, queries, mxs)
                 if lost and (label == "mx-auto" or len(mxs) > 1):
                     a(f"### Where {label} loses to Polars at SF{sf} (worst first)\n")
@@ -268,28 +269,28 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a(f"### SF{sf}: import + first run, ms (headline + engine import time)\n")
         body = []
         for q in queries:
-            body.append([f"Q{q}"] + [fmt_sum_cell(by.get((e, q))) for e in engines])
-        tot, nq = totals(by, engines, queries, with_import=True)
-        body.append([f"**sum ({nq} queries)**"] + [f"**{fmt_ms(tot[e])}**" for e in engines])
-        a(_table(["query"] + [NAMES[e] for e in engines], body))
+            body.append([f"Q{q}"] + [fmt_sum_cell(by.get((e, q))) for e in eng])
+        tot, nq = totals(by, eng, queries, with_import=True)
+        body.append([f"**sum ({nq} queries)**"] + [f"**{fmt_ms(tot[e])}**" for e in eng])
+        a(_table(["query"] + [NAMES[e] for e in eng], body))
         if mx_shown:
             a("\n> `import mxframe` starts a background thread that warms the CPU kernel libraries while "
               "the user's code runs. Its cost is in neither `import` (it returns immediately) nor the headline "
-              "unless it contends with the query for cores; the other engines have no equivalent.\n")
+              "unless it contends with the query for cores; the other eng have no equivalent.\n")
 
         a(f"### SF{sf}: repeat run in the same process, ms (secondary: warm caches / JIT / result caches)\n")
-        body = [[f"Q{q}"] + [fmt_repeat_cell(by.get((e, q))) for e in engines] for q in queries]
-        a(_table(["query"] + [NAMES[e] for e in engines], body))
+        body = [[f"Q{q}"] + [fmt_repeat_cell(by.get((e, q))) for e in eng] for q in queries]
+        a(_table(["query"] + [NAMES[e] for e in eng], body))
         a("\n> The repeat result is verified against DuckDB like the first one (`WRONG`/`?` marks as above). "
           "Module-level result caches in `custom_ops.py` make the mx repeat numbers unrealistically "
           "fast; that is why the headline is a fresh process.\n")
 
         a(f"### SF{sf}: import time, ms (median over queries; not in the headline)\n")
         imp = []
-        for e in engines:
+        for e in eng:
             xs = [r["import_ms"] for r in srows if r["engine"] == e and r.get("import_ms") is not None]
             imp.append(fmt_ms(statistics.median(xs)) if xs else "-")
-        a(_table([""] + [NAMES[e] for e in engines], [["import"] + imp]))
+        a(_table([""] + [NAMES[e] for e in eng], [["import"] + imp]))
         a("")
 
         bad = [r for r in srows if r["engine"] != "duckdb"
