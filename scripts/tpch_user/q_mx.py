@@ -464,7 +464,7 @@ QUERIES = {i: globals()[f"q{i}"] for i in range(1, 23)}
 
 
 # Tables this file touches with PyArrow string/nation kernels before mxframe sees them: read plain.
-PLAIN = {2: {"part"}, 7: {"nation"}, 16: {"supplier"}, 17: {"part"}, 20: {"part"},
+PLAIN = {2: {"part"}, 7: {"nation"}, 16: {"supplier"}, 17: {"part"}, 20: {"part", "supplier"},
          21: {"orders"}, 22: {"customer"}}
 
 
