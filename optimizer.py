@@ -139,6 +139,20 @@ class PlanOptimizer:
                             to_right.append(c)
                         else:
                             stay.append(c)
+                    # A disjunction that mixes both sides cannot move, but each side can filter by what it
+                    # implies: (a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.y = 4) needs a.x IN (1, 3) and
+                    # b.y IN (2, 4). The original conjunct stays above the join, so results are unchanged.
+                    for c in list(stay):
+                        if getattr(c, "op", None) not in ("or", "__or__"):
+                            continue
+                        left_ok = lambda u: u <= lcols and not (u & r_visible)
+                        right_ok = lambda u: u <= r_visible - r_renamed and not (u & lcols)
+                        implied_left = _implied(c, left_ok)
+                        implied_right = _implied(c, right_ok) if node.how == "inner" else None
+                        if implied_left is not None:
+                            to_left.append(implied_left)
+                        if implied_right is not None:
+                            to_right.append(implied_right)
                     if to_left or to_right:
                         changed = True
                         node = Join(push(node.left, to_left), push(node.right, to_right),
@@ -300,6 +314,41 @@ def _conjuncts(expr: Expr) -> List[Expr]:
     if getattr(expr, "op", None) in ("and", "__and__"):
         return _conjuncts(expr.args[0]) + _conjuncts(expr.args[1])
     return [expr]
+
+
+def _disjuncts(expr: Expr) -> List[Expr]:
+    if getattr(expr, "op", None) in ("or", "__or__"):
+        return _disjuncts(expr.args[0]) + _disjuncts(expr.args[1])
+    return [expr]
+
+
+def _implied(expr: Expr, ok) -> "Expr | None":
+    """A predicate over columns accepted by ``ok(columns)`` that every row satisfying the disjunction
+    ``expr`` also satisfies (each disjunct contributes the conjuncts it has on those columns), or None
+    when some disjunct has none."""
+    parts = []
+    for d in _disjuncts(expr):
+        atoms = []
+        for a in _conjuncts(d):
+            used = _expr_columns(a)
+            if used and ok(used):
+                atoms.append(a)
+        if not atoms:
+            return None
+        parts.append(_and_all(atoms))
+    if len(parts) < 2:
+        return None
+    out = parts[0]
+    for p in parts[1:]:
+        out = Expr("or", out, p)
+    return out
+
+
+def _and_all(atoms: List[Expr]) -> Expr:
+    out = atoms[0]
+    for a in atoms[1:]:
+        out = Expr("and", out, a)
+    return out
 
 
 def _wrap(node: LogicalPlan, conjuncts: List[Expr]) -> LogicalPlan:

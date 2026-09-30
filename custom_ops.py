@@ -3387,7 +3387,7 @@ class CustomOpsCompiler(GraphCompiler):
             )  # int64 array of length n_rows
 
             # Fast path: dense cartesian product (max_groups small enough for bitmask)
-            if max_groups <= 1024:
+            if max_groups <= max(1024, min(1 << 22, 2 * n_rows)):      # a direct table beats sorting the rows
                 present_mask = np.zeros(max_groups, dtype=bool)
                 present_mask[composite] = True
                 present = np.where(present_mask)[0]

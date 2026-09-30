@@ -288,6 +288,13 @@ def _pack(lparts: List[np.ndarray], rparts: List[np.ndarray]):
     return lk, rk
 
 
+def dense_limit(n_rows: int) -> int:
+    """Largest key a direct-address join takes as it is.  The kernel's table costs ~3 ns per possible key
+    and hashing the keys into dense codes ~100 ns per row, so a key range up to ~30x the rows is cheaper
+    as a table (TPC-H order keys are 4x sparse, filtered ones far more)."""
+    return min(max(1024, 32 * n_rows), (1 << 28) - 1)
+
+
 def _dense(lk: np.ndarray, rk: np.ndarray):
     """Both sides as int32 keys usable by a direct-address join, if the key range is small."""
     n = len(lk) + len(rk)
@@ -300,7 +307,7 @@ def _dense(lk: np.ndarray, rk: np.ndarray):
         lo, hi = l0, l1
     else:
         lo, hi = min(l0, r0), max(l1, r1)
-    if lo >= 0 and hi <= max(1024, 4 * n):
+    if lo >= 0 and hi <= dense_limit(n):
         return (np.ascontiguousarray(lk, dtype=np.int32), np.ascontiguousarray(rk, dtype=np.int32))
     return None
 
@@ -389,6 +396,21 @@ def inner_pairs(comp, probe_keys: np.ndarray, build_keys: np.ndarray):
     if comp._session_device == "gpu" and comp._aot is None:
         return comp._hash_join_mojo_gpu(probe_keys, build_keys)
     return comp._hash_join_mojo_cpu(probe_keys, build_keys)
+
+
+def _dictionary_gather(col, idx: np.ndarray):
+    """A string column gathered as a dictionary array (codes gathered, values shared) when it has far
+    fewer rows than the gather: n_name of 25 nations over 18M joined rows moves 4-byte codes, not
+    strings, and the group-by above uses the codes as they are.  None when that does not apply."""
+    if not (pa.types.is_string(col.type) or pa.types.is_large_string(col.type)):
+        return None
+    if len(col) * 8 > len(idx) or len(idx) < (1 << 16):
+        return None
+    enc = _as_pa(col).dictionary_encode()
+    if enc.indices.null_count:
+        return None
+    codes = _np_of(enc.indices, zero_copy_only=False)[idx]
+    return pa.DictionaryArray.from_arrays(_npa(codes), enc.dictionary)
 
 
 def _gather_table(comp, table: pa.Table, idx: np.ndarray) -> pa.Table:
@@ -502,7 +524,7 @@ def _residual_split(rel_keys, new_keys, n_rel: int, n_new: int):
             return None
         (a0, a1), (b0, b1) = _minmax(a), _minmax(b)
         lo, hi = min(a0, b0), max(a1, b1)
-        if lo < 0 or hi > max(1024, 4 * (n_rel + n_new)):
+        if lo < 0 or hi > dense_limit(n_rel + n_new):
             continue
         if best is None or hi > best[1]:
             best = (j, hi + 1)
@@ -597,10 +619,24 @@ def _execute_inner(comp, node, needed):
         by_leaf.setdefault(leaf, []).append((n, c))
     arrays = {}
     for leaf, cols in by_leaf.items():
-        sub = tables[leaf].select(list(dict.fromkeys(c for _, c in cols)))
-        got = sub if idx[leaf] is None else _gather_table(comp, sub, idx[leaf])
+        names_c = list(dict.fromkeys(c for _, c in cols))
+        sub = tables[leaf].select(names_c)
+        if idx[leaf] is None:
+            got = {c: sub.column(c) for c in names_c}
+        else:
+            got = {}
+            rest = names_c
+            if needed is not None:                      # a consumer above reads these: dictionary columns are fine
+                for c in names_c:
+                    d = _dictionary_gather(sub.column(c), idx[leaf])
+                    if d is not None:
+                        got[c] = d
+                rest = [c for c in names_c if c not in got]
+            if rest:
+                taken = _gather_table(comp, sub.select(rest), idx[leaf])
+                got.update({c: taken.column(c) for c in rest})
         for n, c in cols:
-            arrays[n] = got.column(c)
+            arrays[n] = got[c]
     if _TRACE:
         _trace(f"gather {len(want)} columns of {n_rel} rows: {1e3*(time.perf_counter()-t_g):.0f} ms")
     return pa.Table.from_arrays([arrays[n] for n in want], names=want)
