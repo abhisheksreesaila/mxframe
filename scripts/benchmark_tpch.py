@@ -741,6 +741,7 @@ def make_tpch_q5_tables(n_customers=15_000, n_orders=100_000, n_lineitem=400_000
     nation = pa.table({
         "n_nationkey": pa.array(np.arange(n_nations, dtype=np.int32)),
         "n_name":      pa.array(NATIONS),
+        "n_regionkey": pa.array((np.arange(n_nations) // 5).astype(np.int32)),
     })
     customer = pa.table({
         "c_custkey":   pa.array(np.arange(1, n_customers + 1, dtype=np.int32)),
