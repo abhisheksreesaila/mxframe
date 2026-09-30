@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
+import threading as _threading
 from pathlib import Path
 from max import engine, driver
 from max.graph import Graph, TensorType, ops
@@ -52,6 +53,27 @@ WARP_SIZE = 32
 MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
+
+# CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
+# float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
+_PRECISE = _threading.local()
+
+
+def _expr_col_names(expr, out=None) -> set:
+    """Names of every column an Expr tree reads."""
+    if out is None:
+        out = set()
+    if isinstance(expr, Expr):
+        if expr.op == "col":
+            out.add(expr.args[0])
+        else:
+            for a in expr.args:
+                _expr_col_names(a, out)
+    elif isinstance(expr, (list, tuple)):
+        for a in expr:
+            _expr_col_names(a, out)
+    return out
+
 
 # ── Module-level caches ──────────────────────────────────────────────────────
 # Persist across CustomOpsCompiler instances so repeated .compute() calls
@@ -360,7 +382,8 @@ class CustomOpsCompiler(GraphCompiler):
             val = args[0]
             n = len(table)
             if isinstance(val, (int, float)):
-                return pa.array(np.full(n, val, dtype=np.float32))
+                return pa.array(np.full(
+                    n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return pa.array([val] * n)
         if op in ("add", "sub", "mul", "div"):
             lhs = self._eval_expr_arrow(args[0], table)
@@ -605,7 +628,7 @@ class CustomOpsCompiler(GraphCompiler):
     ) -> float:
         """Execute the masked_global_sum Mojo kernel and return a Python float."""
         if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_sum_f32(arr_f32, mask_np)
+            return self._aot.masked_global_sum(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_sum_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_sum_kernel", N, self._session_device)
@@ -649,7 +672,7 @@ class CustomOpsCompiler(GraphCompiler):
         queries with low selectivity.
         """
         if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_sum_product_f32(a_f32, b_f32, mask_np)
+            return self._aot.masked_global_sum_product(a_f32, b_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_sum_product_f32(a_f32, b_f32, mask_np)
         cache_key = ("_masked_global_sum_product_kernel", N, self._session_device)
@@ -689,7 +712,7 @@ class CustomOpsCompiler(GraphCompiler):
     ) -> float:
         """Execute the masked_global_min Mojo kernel and return a Python float."""
         if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_min_f32(arr_f32, mask_np)
+            return self._aot.masked_global_min(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_min_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_min_kernel", N, self._session_device)
@@ -727,7 +750,7 @@ class CustomOpsCompiler(GraphCompiler):
     ) -> float:
         """Execute the masked_global_max Mojo kernel and return a Python float."""
         if self._session_device == "cpu" and self._aot is not None:
-            return self._aot.masked_global_max_f32(arr_f32, mask_np)
+            return self._aot.masked_global_max(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
             return self._aot_gpu.masked_global_max_f32(arr_f32, mask_np)
         cache_key = ("_masked_global_max_kernel", N, self._session_device)
@@ -766,6 +789,41 @@ class CustomOpsCompiler(GraphCompiler):
         if self.session is None:
             self.session = _get_or_create_session(self._session_device, self._driver_device)
         return self.session
+
+    def _cpu_aot_active(self) -> bool:
+        return self._session_device == "cpu" and self._aot is not None
+
+    def _eval_expr_f64(self, expr, table: pa.Table) -> np.ndarray:
+        """Evaluate a numeric expression with float32 columns widened to float64
+        (CPU aggregation path); returns a contiguous float64 ndarray."""
+        cols = {}
+        for name in _expr_col_names(expr):
+            c = table.column(name)
+            cols[name] = c.cast(pa.float64()) if pa.types.is_float32(c.type) else c
+        sub = pa.table(cols)
+        _PRECISE.on = True
+        try:
+            res = self._eval_expr_arrow(expr, sub)
+        finally:
+            _PRECISE.on = False
+        return np.ascontiguousarray(res.to_numpy(zero_copy_only=False), dtype=np.float64)
+
+    def _get_col_agg(self, col_name: str, table: pa.Table) -> "Optional[np.ndarray]":
+        """Column as a contiguous array for an aggregation kernel.
+
+        GPU sessions: float32 (as before).  CPU AOT: float32 columns stay float32
+        (zero-copy; the kernels accumulate in float64), everything else is widened
+        to float64 instead of being squeezed down to float32."""
+        if not self._cpu_aot_active():
+            return self._get_col_as_f32(col_name, table)
+        arr = table.column(col_name)
+        if isinstance(arr, pa.ChunkedArray):
+            arr = arr.chunks[0] if len(arr.chunks) == 1 else arr.combine_chunks()
+        view = self._arrow_array_to_numpy_view(arr)
+        if view is None:
+            view = arr.to_numpy(zero_copy_only=False)
+        out = view if view.dtype == np.float32 else view.astype(np.float64, copy=False)
+        return out if out.flags["C_CONTIGUOUS"] else np.ascontiguousarray(out)
 
     def _get_col_as_f32(self, col_name: str, table: pa.Table) -> "Optional[np.ndarray]":
         """Get a column as a contiguous float32 numpy array, preferring zero-copy."""
@@ -878,7 +936,7 @@ class CustomOpsCompiler(GraphCompiler):
                     # min/max only supported on simple single columns (not products)
                     if simple_col is None:
                         return None
-                    arr_f32 = self._get_col_as_f32(simple_col, table)
+                    arr_f32 = self._get_col_agg(simple_col, table)
                     if arr_f32 is None:
                         return None
                     if expr.op == "min":
@@ -891,15 +949,15 @@ class CustomOpsCompiler(GraphCompiler):
                 if product_cols is not None:
                     # sum(col_a * col_b) — fused single-pass kernel, no alloc
                     col_a_name, col_b_name = product_cols
-                    a_f32 = self._get_col_as_f32(col_a_name, table)
-                    b_f32 = self._get_col_as_f32(col_b_name, table)
+                    a_f32 = self._get_col_agg(col_a_name, table)
+                    b_f32 = self._get_col_agg(col_b_name, table)
                     if a_f32 is None or b_f32 is None:
                         return None
                     sum_val = self._run_masked_global_sum_product(a_f32, b_f32, mask_np, N)
 
                 elif simple_col is not None:
                     # sum(col) — single-column masked sum
-                    arr_f32 = self._get_col_as_f32(simple_col, table)
+                    arr_f32 = self._get_col_agg(simple_col, table)
                     if arr_f32 is None:
                         return None
                     sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
@@ -908,10 +966,13 @@ class CustomOpsCompiler(GraphCompiler):
                     # General expression path: evaluate inner with Arrow (handles
                     # a*(1-b), a*(1-b)*(1+c), case_when, startswith, isin, etc.),
                     # then SUM reduction on GPU via the masked_global_sum kernel.
-                    inner_arr = self._eval_expr_arrow(inner, table)
-                    arr_f32 = inner_arr.to_numpy(zero_copy_only=False).astype(np.float32)
-                    if not arr_f32.flags["C_CONTIGUOUS"]:
-                        arr_f32 = np.ascontiguousarray(arr_f32)
+                    if self._cpu_aot_active():
+                        arr_f32 = self._eval_expr_f64(inner, table)      # float64 end to end
+                    else:
+                        inner_arr = self._eval_expr_arrow(inner, table)
+                        arr_f32 = inner_arr.to_numpy(zero_copy_only=False).astype(np.float32)
+                        if not arr_f32.flags["C_CONTIGUOUS"]:
+                            arr_f32 = np.ascontiguousarray(arr_f32)
                     sum_val = self._run_masked_global_sum(arr_f32, mask_np, N)
 
                 if expr.op == "sum":
@@ -1558,6 +1619,7 @@ class CustomOpsCompiler(GraphCompiler):
         Returns pa.Table on success, None to fall back to MAX Graph.
         """
         _aot = _aot_override if _aot_override is not None else self._aot
+        is_cpu = _aot_override is None      # CPU kernels: float64 accumulation, wider inputs
         agg_node = self._find_aggregate(plan_clean)
         if agg_node is None or not agg_node.group_by:
             return None
@@ -1619,7 +1681,8 @@ class CustomOpsCompiler(GraphCompiler):
             name = expr._alias or f"agg_{i}"
             try:
                 if expr.op == "count":
-                    res = _aot.group_count_f32(gids, n_groups)
+                    res = (_aot.group_count(gids, n_groups) if is_cpu
+                           else _aot.group_count_f32(gids, n_groups))
                     agg_names.append(name)
                     agg_arrays.append(pa.array(res.astype(np.float64)))
                     continue
@@ -1629,19 +1692,32 @@ class CustomOpsCompiler(GraphCompiler):
 
                 if mini_table is None:
                     return None
-                val_pa  = self._eval_expr_arrow(expr.args[0], mini_table)
-                vals_f32 = val_pa.to_numpy(zero_copy_only=False).astype(np.float32)
-                if not vals_f32.flags["C_CONTIGUOUS"]:
-                    vals_f32 = np.ascontiguousarray(vals_f32)
-
-                if expr.op == "sum":
-                    res = _aot.group_sum_f32(vals_f32, gids, n_groups)
-                elif expr.op == "min":
-                    res = _aot.group_min_f32(vals_f32, gids, n_groups)
-                elif expr.op == "max":
-                    res = _aot.group_max_f32(vals_f32, gids, n_groups)
-                else:  # mean
-                    res = _aot.group_mean_f32(vals_f32, gids, n_groups)
+                if is_cpu:
+                    if self._is_simple_col(expr.args[0]) is not None:
+                        # plain column: float32 stays float32 (zero-copy), kernels widen
+                        vals = self._eval_expr_arrow(expr.args[0], mini_table).to_numpy(
+                            zero_copy_only=False)
+                        if vals.dtype != np.float32:
+                            vals = vals.astype(np.float64, copy=False)
+                        vals = np.ascontiguousarray(vals)
+                    else:
+                        vals = self._eval_expr_f64(expr.args[0], mini_table)
+                    kern = {"sum": _aot.group_sum, "min": _aot.group_min,
+                            "max": _aot.group_max, "mean": _aot.group_mean}[expr.op]
+                    res = kern(vals, gids, n_groups)
+                else:
+                    val_pa  = self._eval_expr_arrow(expr.args[0], mini_table)
+                    vals_f32 = val_pa.to_numpy(zero_copy_only=False).astype(np.float32)
+                    if not vals_f32.flags["C_CONTIGUOUS"]:
+                        vals_f32 = np.ascontiguousarray(vals_f32)
+                    if expr.op == "sum":
+                        res = _aot.group_sum_f32(vals_f32, gids, n_groups)
+                    elif expr.op == "min":
+                        res = _aot.group_min_f32(vals_f32, gids, n_groups)
+                    elif expr.op == "max":
+                        res = _aot.group_max_f32(vals_f32, gids, n_groups)
+                    else:  # mean
+                        res = _aot.group_mean_f32(vals_f32, gids, n_groups)
 
                 agg_names.append(name)
                 agg_arrays.append(pa.array(res.astype(np.float64)))
