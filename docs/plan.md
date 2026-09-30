@@ -119,6 +119,7 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
 - [ ] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
 - [ ] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
+- [ ] a join whose output has a duplicate column name (same non-key name on both sides) can be joined again / queried: rename with a suffix or raise clearly (today: pyarrow KeyError 'Field exists 2 times')
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
 
 ## F-012 Kernel health: crashes, hangs, per-call overhead [done]
