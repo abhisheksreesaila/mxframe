@@ -272,3 +272,38 @@ def test_profile_reports_both_devices_busy():
     d = lf.last_auto_decision
     assert d.coproc is not None and d.coproc["cpu_ms"] > 0 and d.coproc["gpu_ms"] > 0
     assert "co-processing" in d.explain()
+
+
+def test_first_query_makes_no_cuda_call_on_the_query_thread(monkeypatch):
+    import threading
+    from mxframe import gpu_stream
+    main = threading.get_ident()
+    calls = []
+    real = gpu_stream.mem_info
+
+    def spy():
+        calls.append(threading.get_ident())
+        return real()
+
+    monkeypatch.setattr(gpu_stream, "mem_info", spy)
+    cf.clear_residency()
+    t = table(600_000)
+    with cf.policy(min_upload_bytes=0):
+        query(t).compute(device="cpu")
+        cf.wait_for_uploads(30)
+    assert main not in calls
+
+
+@needs_gpu
+def test_failed_gpu_program_is_not_reuploaded_every_query(monkeypatch):
+    cf.clear_residency()
+    t = table(600_000)
+    uploads = []
+    real = pk.upload_columns
+    monkeypatch.setattr(pk, "upload_columns", lambda *a, **k: uploads.append(1) or real(*a, **k))
+    monkeypatch.setattr(pk, "run_pipeline_gpu", lambda *a, **k: (_ for _ in ()).throw(pk.GpuUnsupported("x")))
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        for _ in range(4):
+            query(t).compute(device="cpu")
+            cf.wait_for_uploads(30)
+    assert len(uploads) == 1

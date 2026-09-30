@@ -105,7 +105,7 @@ _cache: "OrderedDict[tuple, _Entry]" = OrderedDict()
 _bytes = 0
 _inflight_bytes = 0
 _inflight: Dict[tuple, threading.Thread] = {}
-_failed: set = set()
+_failed: Dict[tuple, float] = {}
 _finalized: set = set()
 
 
@@ -208,44 +208,54 @@ def _release(e: _Entry) -> None:
 
 
 def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
-    """Upload the query's columns + group ids in the background (deduplicated per key)."""
-    global _inflight_bytes
+    """Upload the query's columns + group ids in the background (deduplicated per key).
+
+    The query thread only registers the upload: every CUDA call (memory info,
+    eviction frees, the copy itself) happens on the upload thread, so a first
+    query never waits for GPU initialisation.
+    """
     key = _key(cc, gids)
     with _lock:
-        if key in _cache or key in _inflight or key in _failed:
+        if key in _cache or key in _inflight or _recently_failed(key):
             return
-    budget = _budget_bytes()          # CUDA calls outside the lock
-    with _lock:
-        if key in _cache or key in _inflight or nbytes > budget:
-            return
-        freeable = []
-        for old in list(_cache):     # make room first, oldest unpinned entries
-            if _bytes + _inflight_bytes + nbytes <= budget:
-                break
-            e = _evict_locked(old)
-            if e is not None:
-                freeable.append(e)
-        if _bytes + _inflight_bytes + nbytes > budget:
-            return
-        _inflight_bytes += nbytes
         owners = [b.owner for arrs in cc.chunks for b in arrs] + ([gids] if gids is not None else [])
 
         def run():
             global _bytes, _inflight_bytes
             from . import pipeline_kernels as pk
+            reserved = False
             try:
+                budget = _budget_bytes()
+                with _lock:
+                    unpinned = sum(e.nbytes for e in _cache.values() if e.users == 0)
+                    if _bytes - unpinned + _inflight_bytes + nbytes > budget:
+                        _failed[key] = time.monotonic()     # would not fit even after evicting: skip for a while
+                        return
+                    freeable = []
+                    for old in list(_cache):
+                        if _bytes + _inflight_bytes + nbytes <= budget:
+                            break
+                        e = _evict_locked(old)
+                        if e is not None:
+                            freeable.append(e)
+                    _inflight_bytes += nbytes
+                    reserved = True
+                for e in freeable:
+                    _free_entry(e)
                 dc = pk.upload_columns(prog, cc, gids, 0, n_rows)
             except Exception:
                 with _lock:
-                    _inflight.pop(key, None)
-                    _inflight_bytes -= nbytes
-                    _failed.add(key)
+                    _failed[key] = time.monotonic()
                 return
+            finally:
+                with _lock:
+                    _inflight.pop(key, None)
+                    if reserved:
+                        _inflight_bytes -= nbytes
             with _lock:
-                _inflight.pop(key, None)
-                _inflight_bytes -= nbytes
                 _cache[key] = _Entry(dc, nbytes, owners)
                 _bytes += nbytes
+                _failed.pop(key, None)
                 register = key not in _finalized
                 _finalized.add(key)
             if register:
@@ -256,9 +266,15 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
 
         t = threading.Thread(target=run, name="mxframe-resident-upload", daemon=True)
         _inflight[key] = t
-    for e in freeable:
-        _free_entry(e)
     t.start()
+
+
+FAILED_RETRY_S = 120.0   # a failed or rejected upload (e.g. shared-GPU memory pressure) is retried after this
+
+
+def _recently_failed(key) -> bool:
+    t = _failed.get(key)
+    return t is not None and time.monotonic() - t < FAILED_RETRY_S
 
 
 # ── the split ────────────────────────────────────────────────────────────────
@@ -319,6 +335,8 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol):
         if err is not None and auto_mode.is_sticky_gpu_error(err):
             auto_mode.disable_gpu(f"{type(err).__name__}: {err}")
         _evict(key)
+        with _lock:
+            _failed[key] = time.monotonic()      # e.g. GpuUnsupported: don't re-upload on every query
     else:
         for st in res.stats.values():
             if st.rows:
