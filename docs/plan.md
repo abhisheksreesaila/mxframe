@@ -102,6 +102,9 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
 - [ ] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
 - [ ] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
+- [ ] a Limit below an Aggregate is applied (ignored today on both devices)
+- [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
+- [ ] `filter(k != "a")` with null keys doesn't raise
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
 
 ## F-009 Scoreboard report and README [todo]
