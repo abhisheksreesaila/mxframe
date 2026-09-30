@@ -67,26 +67,7 @@ MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
 RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
-_RADIX_WARNED = False
-
-
-def _is_sorted_permutation(keys, idx) -> bool:
-    """keys[idx] ascending and idx a valid index vector (cheap O(n) checks)."""
-    if len(idx) != len(keys) or (len(idx) and (idx.min() < 0 or idx.max() >= len(keys))):
-        return False
-    k = keys[idx]
-    if k.dtype.kind == "f":
-        k = np.where(np.isnan(k), np.inf, k)
-    return bool(np.all(k[1:] >= k[:-1])) if len(k) > 1 else True
-
-
-def _warn_radix_fallback():
-    global _RADIX_WARNED
-    if not _RADIX_WARNED:
-        _RADIX_WARNED = True
-        import warnings
-        warnings.warn("mxframe: radix sort returned an unsorted order; using np.argsort (please report)",
-                      RuntimeWarning, stacklevel=3)
+from .sort_check import is_sorted_permutation as _is_sorted_permutation, warn_fallback as _warn_radix_fallback
 
 # CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
 # float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.

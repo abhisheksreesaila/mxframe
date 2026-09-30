@@ -312,3 +312,14 @@ def test_join_query_filters_strings_in_the_reader(tmp_path, monkeypatch):
     want = sorted(int(i) for i in ids[f == "B"] if i % 2 == 0)
     assert sorted(got.column("id").to_pylist()) == want
     assert rows_read[p] < 8000                  # the fact side arrived already filtered
+
+
+def test_estimated_pass_covers_string_ne_and_ranges(tmp_path):
+    p = str(tmp_path / "r.parquet")
+    pq.write_table(_table(n=4000), p, row_group_size=500)
+    md = iop._metadata(p)
+    names = list(md.schema.to_arrow_schema().names)
+    est = lambda c: _REAL_ESTIMATE(md, names, {g: (c,) for g in range(md.num_row_groups)})
+    assert 0.6 < est(("f", "ne", "B")) < 1.0
+    assert est(("f", "lt", "B")) < est(("f", "lt", "C")) <= 1.0
+    assert est(("f", "ge", "A")) == pytest.approx(1.0)

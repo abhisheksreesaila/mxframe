@@ -288,7 +288,8 @@ def dense_sorted(comp: np.ndarray):
         return ids, uniq, None
     try:
         from .aot_kernels import AOTKernels
-        perm = AOTKernels().sort_indices(comp)
+        from .sort_check import checked_sort_indices
+        perm = checked_sort_indices(AOTKernels(), comp)
     except Exception:
         return None
     ids = np.empty(n, dtype=np.int32)
@@ -313,5 +314,5 @@ def first_rows(ids: np.ndarray, n_groups: int):
     if lib.mx_ik_first(_addr(ids), 2, n, 0, n_groups, _addr(tab), _threads()) != 0:
         return None
     mark = np.zeros(n, dtype=np.bool_)
-    mark[tab] = True
+    mark[tab[tab < n]] = True          # n = group without rows
     return np.flatnonzero(mark)

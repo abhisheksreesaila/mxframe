@@ -126,3 +126,34 @@ def test_distinct_keeps_first_appearance_order():
     df = t.to_pandas().drop_duplicates()
     assert got.column("a").to_pylist() == df["a"].tolist()
     assert got.column("b").to_pylist() == df["b"].tolist()
+
+
+# ── review fixes: the radix result is verified; first_rows tolerates empty groups ─────────────
+
+@pytest.mark.parametrize("damage", ["swap", "out_of_range"])
+def test_dense_sorted_survives_a_bad_radix_permutation(monkeypatch, damage):
+    from mxframe import aot_kernels, sort_check
+    monkeypatch.setattr(sort_check, "_WARNED", False)
+    real = aot_kernels.AOTKernels.sort_indices
+
+    def bad(self, keys, *a, **k):
+        p = real(self, keys, *a, **k).copy()
+        if damage == "swap":
+            p[[10, 40_000]] = p[[40_000, 10]]
+        else:
+            p[5] = len(p) + 7
+        return p
+
+    monkeypatch.setattr(aot_kernels.AOTKernels, "sort_indices", bad)
+    a = _rng().integers(0, 3 * 10**12, N).astype(np.int64)
+    a[::5] = a[0]
+    with pytest.warns(RuntimeWarning, match="radix sort"):
+        ids, uniq, first = group_keys.dense_sorted(a)
+    wu, wi = np.unique(a, return_inverse=True)
+    assert np.array_equal(uniq, wu) and np.array_equal(ids, wi.astype(np.int32))
+
+
+def test_first_rows_with_group_ids_that_never_occur():
+    ids = _rng().integers(0, 100, N).astype(np.int32)
+    got = group_keys.first_rows(ids, 500)          # 400 groups without rows
+    assert np.array_equal(got, np.sort(np.unique(ids, return_index=True)[1]))

@@ -395,6 +395,8 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
                     if c < 0 or c >= r:
                         bad = True
                         continue
+                    # plain read racing other workers' atomic mins is benign: the entry only ever
+                    # decreases, a stale (larger) value just makes one redundant atomic min
                     if Int32(i) < tab[c]:
                         _ = Atomic[DType.int32].min(tab + c, Int32(i))
             if bad:

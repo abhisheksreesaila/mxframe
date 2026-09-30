@@ -181,6 +181,14 @@ def _estimated_pass(md, names, need) -> float:
                     f *= 0.3
                 elif op == "isin":
                     f *= min(1.0, 0.3 * len(value))
+                elif op == "ne":
+                    f *= 0.7                         # 1 - 1/distinct for a handful of values
+                elif op in ("lt", "le", "gt", "ge"):
+                    try:
+                        pos = _str_fraction(value, lo, hi)
+                    except (TypeError, ValueError):
+                        continue
+                    f *= pos if op in ("lt", "le") else 1.0 - pos
                 continue
             span = max(hi - lo + 1, 1)
             try:
@@ -198,6 +206,14 @@ def _estimated_pass(md, names, need) -> float:
                 pass
         total += f
     return total / max(len(need), 1)
+
+
+def _str_fraction(value, lo, hi) -> float:
+    """Where ``value`` falls between strings ``lo`` and ``hi`` (0..1), by their first 6 bytes."""
+    def num(x):
+        return int.from_bytes(x.encode("utf-8")[:6].ljust(6, b"\0"), "big")
+    a, z, v = num(lo), num(hi), num(value)
+    return min(max((v - a) / (z - a), 0.0), 1.0) if z > a else 0.5
 
 
 def _covers(lo, hi, op, value) -> bool:
