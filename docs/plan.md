@@ -103,6 +103,8 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
 - [ ] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
 - [ ] nulls in filtered/grouped columns follow SQL semantics (filter drops null comparisons, null group key is its own group) or raise clearly
+- [ ] float32 columns compared with float64 literals keep boundary rows (Q6 `l_discount <= 0.07` drops exact-grid rows today): compare in the column's precision, as DuckDB does on DECIMAL
+- [ ] case_when derived columns on the CPU group path are float64
 - [ ] a Limit below an Aggregate is applied (ignored today on both devices)
 - [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
 - [ ] `filter(k != "a")` with null keys doesn't raise
