@@ -63,3 +63,7 @@ def test_device_resident_inputs_and_outputs_chain_without_host_round_trips():
 
 def test_multi_key_sort_order_on_gpu_and_cpu():
     run_scenario("sort_multikey")
+
+
+def test_late_supplier_hash_table_terminates_and_matches_numpy():
+    run_scenario("late_suppliers", timeout=120)

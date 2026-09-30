@@ -253,7 +253,28 @@ def sort_multikey():
                 assert got.column("v").to_numpy().tolist() == want.tolist(), (n, kmax, jmax, desc, dev)
 
 
-SCENARIOS = {f.__name__: f for f in (sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
+def late_suppliers():
+    """Q21 kernel (CAS-published hash table): per-target-supplier counts vs NumPy."""
+    g = gpu()
+    rng = np.random.default_rng(2)
+    n, n_orders, n_sup = 400_000, 60_000, 500
+    order = rng.integers(0, n_orders, n).astype(np.int32)
+    sup = rng.integers(0, n_sup, n).astype(np.int32)
+    commit = rng.integers(0, 100, n).astype(np.int32)
+    receipt = (commit + rng.integers(-30, 40, n)).astype(np.int32)
+    finished = (rng.random(n_orders) > 0.3).astype(np.int32)
+    target = (rng.random(n_sup) > 0.5).astype(np.int32)
+    late = receipt > commit
+    pairs = np.unique(np.stack([order[late], sup[late]], 1), axis=0)
+    per_order = np.bincount(pairs[:, 0], minlength=n_orders)
+    sel = late & (per_order[order] == 1) & (finished[order] != 0) & (target[sup] != 0)
+    want = np.bincount(sup[sel], minlength=n_sup).astype(np.int32)
+    for _ in range(3):
+        got = g.single_late_supplier_counts_i32(order, sup, commit, receipt, finished, target)
+        np.testing.assert_array_equal(got, want)
+
+
+SCENARIOS = {f.__name__: f for f in (late_suppliers, sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
 
 
 def register(fn):

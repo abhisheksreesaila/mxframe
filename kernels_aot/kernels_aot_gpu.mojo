@@ -665,20 +665,22 @@ def single_late_supplier_counts_i32_gpu(
         mixed ^= mixed >> 16
         var slot = Int(mixed) % cap_
         while True:
-            var state = _i32(states_addr)[slot]
+            # states / keys are written by other blocks while we read them: use L2
+            # acquire loads and a release store (plain loads may hit a stale L1 line)
+            var state = Atomic.load(_i32(states_addr) + slot)
             if state == Int32(0):
                 var expected = Int32(0)
                 if Atomic.compare_exchange(_i32(states_addr) + slot, expected, Int32(-1)):
                     _i32(hash_orders_addr)[slot] = order_key
                     _i32(hash_suppliers_addr)[slot] = supplier_key
-                    _i32(states_addr)[slot] = Int32(1)
+                    Atomic.store(_i32(states_addr) + slot, Int32(1))
                     _ = Atomic.fetch_add(_i32(order_counts_addr) + Int(order_key), Int32(1))
                     return
                 state = expected
             while state == Int32(-1):
-                state = _i32(states_addr)[slot]
-            if (state == Int32(1) and _i32(hash_orders_addr)[slot] == order_key and
-                    _i32(hash_suppliers_addr)[slot] == supplier_key):
+                state = Atomic.load(_i32(states_addr) + slot)
+            if (state == Int32(1) and Atomic.load(_i32(hash_orders_addr) + slot) == order_key and
+                    Atomic.load(_i32(hash_suppliers_addr) + slot) == supplier_key):
                 return
             slot = (slot + 1) % cap_
 
