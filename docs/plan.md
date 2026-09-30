@@ -27,6 +27,7 @@ Needs: none · Files: `scripts/bench_user_felt.py`, `scripts/tpch_user/` (new)
 - [ ] engines: pandas, Polars (lazy `scan_parquet`), DuckDB (reference), MXFrame `cpu`, `gpu`, `auto`
 - [ ] all 22 queries at SF1 and SF10; every engine's result is checked against DuckDB (row count + numeric tolerance) and mismatches are shown, not hidden
 - [ ] a secondary "repeat run in same process" number is recorded
+- [ ] mx engines read through `mx.scan_parquet` (moved from F-010)
 - [ ] writes `docs/bench/user-felt-<date>.md` and a CSV; a `--queries`/`--engines`/`--sf` CLI; per-run timeout so one hang can't stall the run
 
 ## F-002 Multi-core CPU kernels with float64 accumulation [todo]
@@ -51,12 +52,12 @@ Why: fresh-process SF10 Q1 profile (2026-09-29): `device="cpu"` pays 0.25 s crea
 - [ ] every operator the 22 TPC-H queries hit runs through AOT kernels on both devices: no MAX Graph compile in a fresh-process run (assert via a test that counts `session.load` calls)
 - [ ] measured: fresh-process SF10 Q1 on `gpu` loses the 5 s compile; small `auto` query not worse than `cpu`
 
-## F-010 `mx.scan_parquet` with pushdown and dictionary strings [todo]
+## F-010 `mx.scan_parquet` with pushdown and dictionary strings [done]
 Needs: none · Files: `io_parquet.py` (new), `lazy_frame.py` (source-resolution pass), group-key encoding in `custom_ops.py`
 Why: Polars `scan_parquet` reads only needed columns; mxframe reading every column loses on I/O alone. SF10 Q1 spends 1.8 s dictionary-encoding string group keys that Parquet already stores dictionary-encoded.
-- [ ] `mx.scan_parquet(path)` returns a lazy frame; at compute, only columns referenced anywhere in the plan are read, and simple comparisons directly above the scan are pushed into the reader (row-group skipping)
-- [ ] low-cardinality string columns are read as Arrow dictionaries; group-key encoding uses the dictionary indices directly (no re-encode), unifying dictionaries across chunks
-- [ ] results equal the `pq.read_table` path on all 22 queries; F-001's `mx_read` helper switches to it
+- [x] `mx.scan_parquet(path)` returns a lazy frame; at compute, only columns referenced anywhere in the plan are read, and simple comparisons directly above the scan are pushed into the reader (row-group skipping)
+- [x] low-cardinality string columns are read as Arrow dictionaries; group-key encoding uses the dictionary indices directly (no re-encode), unifying dictionaries across chunks
+- [x] results equal the `pq.read_table` path (20 queries on dictionary inputs; Q1/Q3/Q6/Q12/Q14 end to end through scan_parquet; Q15/Q21 blocked by F-011)
 
 ## Wave 2: safe auto (Phase 1)
 

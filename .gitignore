@@ -61,3 +61,4 @@ NUL
 
 # Local-only archive — not published
 docs/archive/
+.claude/worktrees/
