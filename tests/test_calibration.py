@@ -113,7 +113,8 @@ def test_pinned_unavailable_falls_back_to_pageable():
 
 
 def test_cpu_thread_count_recorded(monkeypatch):
-    monkeypatch.setenv("MXFRAME_NUM_THREADS", "7")
+    from mxframe import aot_kernels as _ak
+    monkeypatch.setattr(_ak, "_cpu_threads", 7)
     assert run_fake_calibration(save=False).cpu_threads == 7
 
 
@@ -244,7 +245,8 @@ def test_other_machine_gives_defaults_and_entries_coexist(tmp_path, monkeypatch)
 
 def test_changed_cpu_thread_count_invalidates_cpu_fits_only(monkeypatch):
     run_fake_calibration()
-    monkeypatch.setenv("MXFRAME_NUM_THREADS", "16")
+    from mxframe import aot_kernels as _ak
+    monkeypatch.setattr(_ak, "_cpu_threads", 16)
     cal_mod.reset_calibration_cache()
     c = cal_mod.get_calibration()
     assert c.fits["group_sum@cpu"].n_points == 0          # back to default
