@@ -523,13 +523,13 @@ class CustomOpsCompiler(GraphCompiler):
         if l_lit is not None and r_lit is None:
             rhs = self._eval_expr_arrow(args[1], table)
             if isinstance(l_lit, int) and pa.types.is_integer(rhs.type):
-                return l_lit, rhs                       # exact: no float32 detour above 2**24
+                return _npscalar(l_lit), rhs            # exact: no float32 detour above 2**24
             lhs, rhs = _align_literals(l_lit, rhs)
             return (self._eval_expr_arrow(args[0], table) if lhs is l_lit else lhs), rhs
         if r_lit is not None and l_lit is None:
             lhs = self._eval_expr_arrow(args[0], table)
             if isinstance(r_lit, int) and pa.types.is_integer(lhs.type):
-                return lhs, r_lit
+                return lhs, _npscalar(r_lit)
             lhs, rhs = _align_literals(lhs, r_lit)
             return lhs, (self._eval_expr_arrow(args[1], table) if rhs is r_lit else rhs)
         return self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table)
@@ -625,7 +625,7 @@ class CustomOpsCompiler(GraphCompiler):
             return pc.or_kleene(self._eval_expr_arrow(args[0], table),
                                 self._eval_expr_arrow(args[1], table))
         if op == "case_when":
-            cond  = pc.fill_null(self._eval_expr_arrow(args[0], table), False)   # null condition: ELSE
+            cond  = pc.fill_null(self._eval_expr_arrow(args[0], table), _npscalar(False, type=pa.bool_()))   # null condition: ELSE
             then  = self._eval_expr_arrow(args[1], table)
             else_ = self._eval_expr_arrow(args[2], table)
             result = pc.if_else(cond, then, else_)
@@ -1355,7 +1355,7 @@ class CustomOpsCompiler(GraphCompiler):
             if preds:
                 mask = None
                 for pred in preds:
-                    m = pc.fill_null(self._eval_predicate(pred, table), False)   # null is not true
+                    m = pc.fill_null(self._eval_predicate(pred, table), _npscalar(False, type=pa.bool_()))   # null is not true
                     mask = m if mask is None else pc.and_(mask, m)
                 table = table.filter(mask)
             key_arrays, key_names = [], []
@@ -1398,7 +1398,7 @@ class CustomOpsCompiler(GraphCompiler):
             result = pa.Table.from_arrays(cols, names=agg_names)
 
         if having_pred is not None:
-            result = result.filter(pc.fill_null(self._eval_predicate(having_pred, result), False))
+            result = result.filter(pc.fill_null(self._eval_predicate(having_pred, result), _npscalar(False, type=pa.bool_())))
         if post_ops:
             result = self._apply_post_ops_custom(result, post_ops)
         self.last_compile_provenance = {
@@ -2392,7 +2392,7 @@ class CustomOpsCompiler(GraphCompiler):
                 # nulls sort after every value, in either direction (DuckDB's default): they
                 # get one extra rank past the real ones, which a descending flip leaves alone
                 is_null = _np_of(enc.indices.is_null(), zero_copy_only=False)
-                raw_idx = _np_of(enc.indices.fill_null(0), zero_copy_only=False).astype(np.int32)
+                raw_idx = _np_of(enc.indices.fill_null(_npscalar(0, type=enc.indices.type)), zero_copy_only=False).astype(np.int32)
                 ranks = rank_of[raw_idx] if n_dict else np.zeros(len(raw_idx), dtype=np.int32)
                 ranks = np.where(is_null, np.int32(n_dict), ranks).astype(np.int32)
                 per_col_ranks.append((ranks, n_dict + 1, n_dict))

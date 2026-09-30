@@ -45,7 +45,11 @@ def test_ambiguous_names_and_left_join_right_side_stay_above():
     left, right = tables()
     lf = LazyFrame(left).join(LazyFrame(right), left_on="lk", right_on="rk").filter(col("shared") == lit(1))
     j = _find(optimize_plan(lf.plan).plan, Join)[0]
-    assert not isinstance(j.left, Filter) and not isinstance(j.right, Filter)
+    # a duplicate name is the LEFT column (the right one is `shared_right`): it sinks to the left only
+    assert isinstance(j.left, Filter) and not isinstance(j.right, Filter)
+    lf = LazyFrame(left).join(LazyFrame(right), left_on="lk", right_on="rk").filter(col("shared_right") == lit(1))
+    j = _find(optimize_plan(lf.plan).plan, Join)[0]
+    assert not isinstance(j.left, Filter) and not isinstance(j.right, Filter)     # renamed: stays above
     lf = LazyFrame(left).join(LazyFrame(right), left_on="lk", right_on="rk", how="left").filter(col("t") == lit(3))
     j = _find(optimize_plan(lf.plan).plan, Join)[0]
     assert not isinstance(j.right, Filter)

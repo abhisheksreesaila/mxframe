@@ -862,6 +862,9 @@ def make_tpch_q10_tables(n_customers=15_000, n_orders=150_000, n_lineitem=600_00
         "c_name":      pa.array([f"Cust#{i}" for i in range(1, n_customers + 1)]),
         "c_acctbal":   pa.array(rng.uniform(-999.99, 9999.99, n_customers).astype(np.float32)),
         "c_nationkey": pa.array(rng.integers(0, n_nations, n_customers, dtype=np.int32)),
+        "c_address":   pa.array([f"{i} Main St" for i in range(1, n_customers + 1)]),
+        "c_phone":     pa.array([f"{10 + i % 25}-555-{i % 10000:04d}" for i in range(1, n_customers + 1)]),
+        "c_comment":   pa.array([f"comment {i}" for i in range(1, n_customers + 1)]),
     })
     orders = pa.table({
         "o_orderkey":  pa.array(np.arange(1, n_orders + 1, dtype=np.int32)),

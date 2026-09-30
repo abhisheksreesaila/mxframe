@@ -47,19 +47,29 @@ def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _numeric_literal(x):
+    """The Python value of a numeric literal operand (a Python number or an Arrow scalar), else None."""
+    if _is_number(x):
+        return x
+    if isinstance(x, pa.Scalar) and (pa.types.is_integer(x.type) or pa.types.is_floating(x.type)):
+        return x.as_py()
+    return None
+
+
 def _align_literals(lhs, rhs):
-    """A Python number compared with a float32 column becomes a float32 scalar.
+    """A numeric literal compared with a float32 column becomes a float32 scalar.
 
     Arrow would widen the column to float64 and compare it with the double nearest the
     decimal literal, so `l_discount <= 0.07` dropped every row whose float32 value is the
     float32 nearest 0.07 (it is 0.07000000029802322 > 0.07).  Comparing in the column's
     own precision is what DuckDB does on DECIMAL and what NumPy 2 does."""
     def is_f32(x):
-        return not _is_number(x) and hasattr(x, "type") and pa.types.is_float32(x.type)
-    if _is_number(rhs) and is_f32(lhs):
-        rhs = pa.scalar(rhs, pa.float32())
-    elif _is_number(lhs) and is_f32(rhs):
-        lhs = pa.scalar(lhs, pa.float32())
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float32(x.type)
+    r, l = _numeric_literal(rhs), _numeric_literal(lhs)
+    if r is not None and is_f32(lhs):
+        rhs = _npscalar(r, type=pa.float32())
+    elif l is not None and is_f32(rhs):
+        lhs = _npscalar(l, type=pa.float32())
     return lhs, rhs
 
 
@@ -306,7 +316,7 @@ class GraphCompiler:
             cond = GraphCompiler._eval_predicate(args[0], table)
             then = GraphCompiler._eval_predicate(args[1], table)
             else_ = GraphCompiler._eval_predicate(args[2], table)
-            return pc.if_else(pc.fill_null(cond, False), then, else_)     # CASE: a null condition is not true
+            return pc.if_else(pc.fill_null(cond, _npscalar(False, type=pa.bool_())), then, else_)     # CASE: a null condition is not true
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):

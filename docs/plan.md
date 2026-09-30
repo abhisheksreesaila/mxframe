@@ -119,7 +119,7 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [x] GPU Q3 top-10 equals CPU; Q21 on `gpu` doesn't raise IndexError
 - [x] benchmark queries Q4, Q5, Q7, Q10, Q20 filter real Parquet dates correctly (they compare yyyymmdd ints against date columns and return 0 rows today)
 - [x] GPU min over a group whose only values are +inf returns +inf (identity is Float64.MAX today)
-- [ ] a join whose output has a duplicate column name (same non-key name on both sides) can be joined again / queried: rename with a suffix or raise clearly (today: pyarrow KeyError 'Field exists 2 times')
+- [x] a join whose output has a duplicate column name (same non-key name on both sides) can be joined again / queried: rename with a suffix or raise clearly (today: pyarrow KeyError 'Field exists 2 times') -- done: the right column becomes `<name>_right` (`_right2`, ...)
 - [x] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto` (132/132; SF10 gpu/auto ran on GPU 1 because another process held 17-21 GB of GPU 0)
 - Build notes: `tests/test_tpch_duckdb.py` is the gate (`MXFRAME_TPCH_SF10=1` adds SF10). The DuckDB reference reads the same Parquet through views that restore DATE and DECIMAL(15,2), so it runs the official TPC-H text and gives the official answers (Q6 SF1 = 123141078.2283). The old Q6 "matches DuckDB" was DuckDB on raw float32 columns, which shares the truncation below.
 - The data generator truncated DECIMAL to float32 (0.05 stored as 0.049999997): fixed in `scripts/gen_tpch_parquet.py`, regenerated as `data/tpch_sf1_exact` and `data/tpch_sf10_exact` (the older dirs are untouched; the harness prefers `_exact`). Other agents should read the `_exact` dirs.
