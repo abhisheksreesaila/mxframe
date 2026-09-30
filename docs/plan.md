@@ -63,11 +63,13 @@ Why: Polars `scan_parquet` reads only needed columns; mxframe reading every colu
 
 ## F-005 Auto planner: whole-query choice, fallback, explain [doing]
 Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain hooks)
-- [ ] cost model walks the plan, estimates rows per operator, and compares CPU-only against GPU (incl. copies and GPU-init if not ready); picks the lower
-- [ ] GPU error/OOM → rerun on CPU, warn once per shape, remember the shape; `strict=True` raises
-- [ ] `lf.explain(device="auto", costs=True)` prints decision, estimates per device, bytes crossing
-- [ ] `compute(profile=True)` returns predicted vs actual and feeds `calibration.observe`
-- [ ] no GPU present → everything CPU, zero errors; `auto` results equal `cpu` results on the test suite
+- [x] cost model walks the plan, estimates rows per operator, and compares CPU-only against GPU (incl. copies and GPU-init if not ready); picks the lower
+- [x] GPU error/OOM → rerun on CPU, warn once per shape, remember the shape; `strict=True` raises
+- [x] `lf.explain(device="auto", costs=True)` prints decision, estimates per device, bytes crossing
+- [x] `compute(profile=True)` records actual vs predicted for the query (feeding per-operator times into `calibration.observe` moved to F-007, which executes per operator)
+- [x] no GPU present → everything CPU, zero errors; `auto` results equal `cpu` results on the test suite
+- [ ] on TPC-H SF1/SF10 `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries (measured with the F-001 scoreboard)
+- [x] GPU paths known to return wrong results (`auto_mode.KNOWN_BROKEN_GPU`: sort) or with no usable kernel (min/max > 8192 groups) are never chosen
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
 
@@ -85,6 +87,7 @@ Needs: F-005 · Files: `auto_mode.py` placement pass, join dispatch in `custom_o
 - [ ] placement pass assigns each operator a device; `DeviceCross` nodes shown in explain with bytes
 - [ ] filters/projections before a crossing so only surviving rows and needed columns move
 - [ ] join probe side can be split across CPU and GPU (Router) when both are worth it
+- [ ] per-operator timings feed `calibration.observe` (moved from F-005)
 
 ## F-008 Fused pipeline kernel: vectorized interpreter [todo]
 Needs: F-002 · Files: `kernels_aot/pipeline*.mojo` (new), `pipeline_program.py` (new: Expr → bytecode), dispatch in `custom_ops.py`
@@ -108,6 +111,7 @@ Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [ ] a Limit below an Aggregate is applied (ignored today on both devices)
 - [ ] multi-key `sort("k","j")` on GPU returns the right order (wrong today)
 - [ ] `filter(k != "a")` with null keys doesn't raise
+- [ ] `_JOIN_RESULT_CACHE` keyed by device (a GPU-computed join is reused by later CPU queries today)
 - [ ] all 22 queries match DuckDB at SF1 and SF10 on `cpu`, `gpu`, `auto`
 
 ## F-012 Kernel health: crashes, hangs, per-call overhead [todo]
