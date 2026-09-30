@@ -104,7 +104,7 @@ Design (MonetDB/X100-style vectorized interpretation, AOT, no JIT):
 - [x] fused stage on SF10 Q1 (60M rows, group ids ready) < 100 ms on `cpu`; cold end-to-end time is tracked in F-009
 - [x] unsupported expressions fall back to the existing path, never wrong results
 
-## F-011 Correctness: counts, Q15, Q21, nulls [review]
+## F-011 Correctness: counts, Q15, Q21, nulls [done]
 Needs: F-002, F-008 merged (they own the count kernels) · Found by F-010
 - [x] grouped `count` returns int64, exact beyond 2^24 (SF10 Q1 `count_order` saturates at 16,777,216 today: float32)
 - [x] Q15 runs (fails today: NoneType float error) and Q21 runs (fails: join key types int64 vs int32; cast keys to a common type)
