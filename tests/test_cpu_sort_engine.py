@@ -36,3 +36,14 @@ def test_engine_calls_radix_sort(monkeypatch):
     monkeypatch.setattr(aot_kernels.AOTKernels, "sort_indices", spy)
     LazyFrame(Scan(_t())).sort("a").compute(device="cpu")
     assert calls and calls[0] == 300_000
+
+
+def test_bad_radix_result_falls_back_to_argsort(monkeypatch):
+    from mxframe import aot_kernels
+    monkeypatch.setattr(aot_kernels.AOTKernels, "sort_indices",
+                        lambda self, keys, *a, **k: np.arange(len(keys), dtype=np.int32)[::-1].copy())
+    t = _t(100_000)
+    with pytest.warns(RuntimeWarning, match="radix sort"):
+        got = LazyFrame(Scan(t)).sort("a").compute(device="cpu")
+    order = np.argsort(t["a"].to_numpy(), kind="stable")
+    np.testing.assert_array_equal(got["row"].to_numpy(), t["row"].to_numpy()[order])

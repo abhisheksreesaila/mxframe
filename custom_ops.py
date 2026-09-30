@@ -60,6 +60,26 @@ MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
 RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
+_RADIX_WARNED = False
+
+
+def _is_sorted_permutation(keys, idx) -> bool:
+    """keys[idx] ascending and idx a valid index vector (cheap O(n) checks)."""
+    if len(idx) != len(keys) or (len(idx) and (idx.min() < 0 or idx.max() >= len(keys))):
+        return False
+    k = keys[idx]
+    if k.dtype.kind == "f":
+        k = np.where(np.isnan(k), np.inf, k)
+    return bool(np.all(k[1:] >= k[:-1])) if len(k) > 1 else True
+
+
+def _warn_radix_fallback():
+    global _RADIX_WARNED
+    if not _RADIX_WARNED:
+        _RADIX_WARNED = True
+        import warnings
+        warnings.warn("mxframe: radix sort returned an unsorted order; using np.argsort (please report)",
+                      RuntimeWarning, stacklevel=3)
 
 # CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
 # float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
@@ -2525,8 +2545,14 @@ class CustomOpsCompiler(GraphCompiler):
                 sorted_indices = part_idx[np.argsort(composite_key[part_idx], kind='stable')]
             elif self._aot is not None and N >= RADIX_SORT_MIN_ROWS and N < 2**31 \
                     and composite_key.dtype in (np.int32, np.int64, np.float32, np.float64):
-                # Parallel stable LSD radix sort (F-012): ~15x np.argsort at 10M rows
+                # Parallel stable LSD radix sort (F-012): ~15x np.argsort at 10M rows.
+                # Verified in O(n) before use: one unexplained order failure was seen once in a
+                # loaded full-suite run (not reproducible in 5,600 stress runs), so a bad result
+                # falls back to np.argsort instead of returning a wrong order.
                 sorted_indices = self._aot.sort_indices(composite_key)
+                if not _is_sorted_permutation(composite_key, sorted_indices):
+                    _warn_radix_fallback()
+                    sorted_indices = np.argsort(composite_key, kind='stable')
             else:
                 sorted_indices = np.argsort(composite_key, kind='stable')
             return table.take(_npa(sorted_indices.astype(np.int64)))
