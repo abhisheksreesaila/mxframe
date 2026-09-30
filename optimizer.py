@@ -120,7 +120,7 @@ class PlanOptimizer:
         def push(node: LogicalPlan, conjuncts: List[Expr]) -> LogicalPlan:
             """Apply ``conjuncts`` on top of ``node``, sinking what can sink."""
             nonlocal changed
-            if isinstance(node, Join) and conjuncts:
+            if isinstance(node, Join) and conjuncts and node.how in ("inner", "left"):
                 lcols, rcols = _output_columns(node.left), _output_columns(node.right)
                 if lcols is not None and rcols is not None:
                     r_visible = rcols - set(node.right_on)
@@ -318,8 +318,9 @@ def _expr_columns(expr):
         if op == "col":
             out.add(e.args[0])
             return True
-        if op in ("over", "rank", "dense_rank", "lag", "lead", "cum_sum", "row_number"):
-            return False              # window functions depend on the whole input
+        if op in ("window", "over", "rank", "dense_rank", "lag", "lead", "cum_sum", "row_number",
+                  "sum", "min", "max", "mean", "count"):
+            return False              # windows and aggregates depend on the whole input, not one row
         return all(walk(a) for a in e.args if hasattr(a, "op"))
 
     return out if walk(expr) else None

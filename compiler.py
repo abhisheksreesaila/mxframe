@@ -258,8 +258,9 @@ class GraphCompiler:
         if op == "lit":
             # An Arrow scalar, not the Python value: PyArrow converting a Python
             # literal inside a compute call imports pandas (~150-200 ms, once).
+            import datetime as _dt
             v = args[0]
-            return _npscalar(v) if isinstance(v, (bool, int, float, str)) else v
+            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date)) else v
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)
             if native is not None:

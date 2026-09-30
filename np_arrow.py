@@ -38,18 +38,47 @@ def _strings(values) -> pa.Array:
                                  [None, pa.py_buffer(offsets), pa.py_buffer(b"".join(data))])
 
 
+def _same_kind(kind, type) -> bool:
+    """True when a Python value of ``kind`` converts to ``type`` exactly as PyArrow would."""
+    if type is None:
+        return True
+    if kind is bool:
+        return pa.types.is_boolean(type)
+    if kind is int:
+        return pa.types.is_integer(type) or pa.types.is_floating(type)
+    if kind is float:
+        return pa.types.is_floating(type)
+    if kind is str:
+        return pa.types.is_string(type) or pa.types.is_large_string(type)
+    return False
+
+
 def _from_pylist(values, type):
-    """Homogeneous list of bool / int / float / str (no None) without pandas, else None."""
+    """Homogeneous list of bool / int / float / str (no None) without pandas, else None.
+
+    Only takes the fast path when PyArrow would produce the same result; anything
+    else (typed conversions like int->decimal, str->date, numpy scalars of other
+    widths) returns None so the caller defers to PyArrow.
+    """
     if not values:
         return None
-    kinds = {bool if isinstance(v, (bool, np.bool_)) else
-             int if isinstance(v, (int, np.integer)) else
-             float if isinstance(v, (float, np.floating)) else
-             str if isinstance(v, str) else None for v in values}
-    if len(kinds) != 1 and kinds != {int, float}:
+    if all(isinstance(v, np.generic) for v in values):
+        a = np.asarray(values)
+        if a.dtype in _NUMERIC or a.dtype == np.bool_:
+            out = array(a)
+            return out if type is None or out.type == type else None
         return None
-    k = float if kinds == {int, float} else next(iter(kinds))
-    if k is None:
+    if any(isinstance(v, np.generic) for v in values):
+        return None
+    kinds = {bool if isinstance(v, bool) else int if isinstance(v, int) else
+             float if isinstance(v, float) else str if isinstance(v, str) else None for v in values}
+    if kinds == {int, float}:
+        k = float
+    elif len(kinds) == 1:
+        k = next(iter(kinds))
+    else:
+        return None
+    if k is None or not _same_kind(k, type):
         return None
     if k is str:
         out = _strings(values)
@@ -62,18 +91,29 @@ def _from_pylist(values, type):
             return None
     else:
         out = array(np.asarray(values, dtype=np.float64))
-    return out.cast(type, safe=True) if type is not None and out.type != type else out
+    if type is not None and out.type != type:
+        try:
+            out = out.cast(type, safe=True)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            return None          # let PyArrow raise its own error
+    return out
 
 
 def scalar(value, type=None):
     """``pa.scalar(value, type)`` without importing pandas (bool/int/float/str; else PyArrow)."""
     if isinstance(value, pa.Scalar):
         return value.cast(type) if type is not None and value.type != type else value
-    arr = _from_pylist([value], None) if value is not None else None
+    import datetime as _dt
+    if type is None and isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
+        days = (value - _dt.date(1970, 1, 1)).days
+        return array(np.array([days], dtype=np.int32)).cast(pa.date32())[0]
+    if type is None and isinstance(value, _dt.datetime) and value.tzinfo is None:
+        us = (value - _dt.datetime(1970, 1, 1)) // _dt.timedelta(microseconds=1)
+        return array(np.array([us], dtype=np.int64)).cast(pa.timestamp("us"))[0]
+    arr = _from_pylist([value], type) if value is not None else None
     if arr is None:
         return pa.scalar(value, type=type)
-    sc = arr[0]
-    return sc.cast(type) if type is not None and sc.type != type else sc
+    return arr[0]
 
 
 def array(obj, type=None, **kwargs) -> pa.Array:
@@ -118,7 +158,7 @@ def to_numpy(obj, zero_copy_only: bool = False, **kwargs):
     if isinstance(obj, pa.ChunkedArray):
         if obj.num_chunks == 1:
             return to_numpy(obj.chunk(0), zero_copy_only=zero_copy_only, **kwargs)
-        if obj.num_chunks == 0:
+        if obj.num_chunks == 0 and obj.type != pa.date32():
             dt = _NP_OF.get(obj.type)
             if dt is not None and not kwargs:
                 return np.empty(0, dtype=dt)
@@ -142,4 +182,6 @@ def to_numpy(obj, zero_copy_only: bool = False, **kwargs):
     buf = obj.buffers()[1]
     if buf is None:
         return np.empty(0, dtype=dt)
-    return np.frombuffer(buf, dtype=dt, count=len(obj), offset=obj.offset * np.dtype(dt).itemsize)
+    out = np.frombuffer(buf, dtype=dt, count=len(obj), offset=obj.offset * np.dtype(dt).itemsize)
+    out.flags.writeable = False          # a view of immutable Arrow memory, as PyArrow returns
+    return out

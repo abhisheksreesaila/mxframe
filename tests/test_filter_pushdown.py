@@ -76,3 +76,9 @@ def test_pushdown_through_chained_joins():
     a = lf.compute(device="cpu").sort_by("v")
     b = lf.compute(device="cpu", optimize=False).sort_by("v")
     assert a.num_rows == b.num_rows and a.column("v").equals(b.column("v"))
+
+
+def test_window_and_aggregate_predicates_are_not_pushed():
+    from mxframe.optimizer import _expr_columns
+    assert _expr_columns(col("v").sum().over("t") > lit(10)) is None
+    assert _expr_columns(col("v") > col("v").mean()) is None
