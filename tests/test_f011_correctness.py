@@ -43,6 +43,7 @@ def _run(name, device):
     "case_when_sums_are_float64",
     "min_max_identity_with_infinities",
     "float32_column_keeps_boundary_rows",
+    "gpu_scratch_does_not_reserve_the_device",
 ])
 def test_scenario(name, device):
     _run(name, device)

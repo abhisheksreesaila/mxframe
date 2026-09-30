@@ -247,6 +247,34 @@ def float32_column_keeps_boundary_rows(device):
     assert out.num_rows == 16, out.num_rows
 
 
+def gpu_scratch_does_not_reserve_the_device(device):
+    """The first Mojo-side buffer (the recursive scan makes one at >= 1M rows) must not make the
+    kernel library's memory manager reserve ~90% of the GPU: at SF10 our own cuMemAlloc calls
+    (uploads, join outputs, gathers) then ran out of memory."""
+    if device == "cpu":
+        return
+    import ctypes
+    from mxframe.aot_kernels import get_aot_gpu
+    g = get_aot_gpu()
+    assert g is not None
+    lib = g._cu._lib
+    free, total = ctypes.c_size_t(), ctypes.c_size_t()
+
+    def used_bytes():
+        lib.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total))
+        return total.value - free.value
+
+    before = used_bytes()
+    n = 4_000_000
+    src = g._alloc(n * 4)
+    g._fill_i32(src, n, 1)
+    out = g._alloc(n * 4)
+    assert g._scan_i32(out, src, n) == n
+    g._free(src, out)
+    grown = used_bytes() - before
+    assert grown < 0.5 * total.value, f"the scan made the device grow by {grown >> 20} MiB of {total.value >> 20}"
+
+
 SCENARIOS = {k: v for k, v in globals().items()
              if callable(v) and not k.startswith("_") and getattr(v, "__module__", None) == __name__}
 

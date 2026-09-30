@@ -21,6 +21,13 @@ from typing import Optional
 
 import numpy as np
 
+# The Mojo device-context memory manager reserves ~90% of the GPU's free memory the first time
+# a kernel creates a buffer (the recursive scan does, at >= 1M rows), and this module's own
+# cuMemAlloc calls (uploads, join outputs, gathers) then fail with out-of-memory at TPC-H SF10,
+# as would any other process on the GPU.  A quarter is plenty for the kernels' scratch (the
+# sort's is 8 bytes per row).  Set MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT to override.
+os.environ.setdefault("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT", "25")
+
 # ── Locate the shared library ─────────────────────────────────────────────────
 def _find_lib() -> Optional[Path]:
     # 1. Env override (useful for development)
