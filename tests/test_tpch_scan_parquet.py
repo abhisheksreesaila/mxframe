@@ -102,16 +102,70 @@ def test_query_identical_with_dictionary_inputs(q, bm, plain_tables, dict_tables
     _assert_same(got, expected)
 
 
-def test_scan_parquet_q1_end_to_end(bm, plain_tables):
-    import mxframe as mx
-    from mxframe import LazyFrame, col, lit
-    path = str(SF1 / "lineitem.parquet")
+def _lazy_queries(bm):
+    """Q1/Q3/Q6/Q12/Q14 rewritten over lazy sources (the harness versions take pa.Tables)."""
+    from mxframe import col, lit, when
+    D = "cpu"
 
-    def q1(lf):
-        return (lf.filter(col("l_shipdate") <= lit(bm.CUTOFF_Q1))
+    def q1(li):
+        return (li.filter(col("l_shipdate") <= lit(bm.CUTOFF_Q1))
                 .groupby("l_returnflag", "l_linestatus")
                 .agg(col("l_quantity").sum().alias("sum_qty"),
                      (col("l_extendedprice") * (lit(1.0) - col("l_discount"))).sum().alias("rev"),
+                     col("l_quantity").mean().alias("avg_qty"),
                      col("l_quantity").count().alias("n"))
-                .sort("l_returnflag", "l_linestatus").compute(device="cpu"))
-    _assert_same(q1(mx.scan_parquet(path)), q1(LazyFrame(plain_tables["lineitem"])))
+                .sort("l_returnflag", "l_linestatus").compute(device=D))
+
+    def q3(c, o, li):
+        return (o.filter(col("o_orderdate") < lit(bm.DATE_1995_03_15))
+                .join(c.filter(col("c_mktsegment") == lit("BUILDING")), left_on="o_custkey", right_on="c_custkey")
+                .join(li.filter(col("l_shipdate") > lit(bm.DATE_1995_03_15)), left_on="o_orderkey", right_on="l_orderkey")
+                .groupby("o_orderkey", "o_orderdate", "o_shippriority")
+                .agg((col("l_extendedprice") * (lit(1.0) - col("l_discount"))).sum().alias("revenue"))
+                .sort("revenue", descending=True).limit(10).compute(device=D))
+
+    def q6(li):
+        return (li.filter((col("l_shipdate") >= lit(bm.Q6_DATE_LO)) & (col("l_shipdate") < lit(bm.Q6_DATE_HI))
+                          & (col("l_discount") >= lit(bm.Q6_DISC_LO)) & (col("l_discount") <= lit(bm.Q6_DISC_HI))
+                          & (col("l_quantity") < lit(bm.Q6_QTY_HI)))
+                .groupby().agg((col("l_extendedprice") * col("l_discount")).sum().alias("revenue"))
+                .compute(device=D))
+
+    def q12(o, li):
+        return (li.join(o, left_on="l_orderkey", right_on="o_orderkey")
+                .filter(col("l_shipmode").isin(["MAIL", "SHIP"]))
+                .filter(col("l_commitdate") < col("l_receiptdate"))
+                .filter(col("l_shipdate") < col("l_commitdate"))
+                .filter(col("l_receiptdate") >= lit(bm.Q12_DATE_LO))
+                .filter(col("l_receiptdate") < lit(bm.Q12_DATE_HI))
+                .groupby("l_shipmode")
+                .agg(when(col("o_orderpriority").isin(["1-URGENT", "2-HIGH"]), lit(1), lit(0)).sum().alias("high"),
+                     when(~col("o_orderpriority").isin(["1-URGENT", "2-HIGH"]), lit(1), lit(0)).sum().alias("low"))
+                .sort(col("l_shipmode")).compute(device=D))
+
+    def q14(p, li):
+        promo = when(col("p_type").startswith("PROMO"),
+                     col("l_extendedprice") * (lit(1.0) - col("l_discount")), lit(0.0))
+        total = col("l_extendedprice") * (lit(1.0) - col("l_discount"))
+        return (li.join(p, left_on="l_partkey", right_on="p_partkey")
+                .filter(col("l_shipdate") >= lit(bm.Q14_DATE_LO)).filter(col("l_shipdate") < lit(bm.Q14_DATE_HI))
+                .groupby().agg(promo.sum().alias("promo"), total.sum().alias("total")).compute(device=D))
+    return {1: (q1, ["lineitem"]), 3: (q3, ["customer", "orders", "lineitem"]), 6: (q6, ["lineitem"]),
+            12: (q12, ["orders", "lineitem"]), 14: (q14, ["part", "lineitem"])}
+
+
+@pytest.mark.parametrize("q", [1, 3, 6, 12, 14])
+def test_queries_through_scan_parquet(q, bm, plain_tables):
+    """Genuinely lazy: column pruning + pushdown, compared with the same query on in-memory tables."""
+    import mxframe as mx
+    from mxframe import LazyFrame
+    fn, names = _lazy_queries(bm)[q]
+    got = fn(*[mx.scan_parquet(str(SF1 / f"{n}.parquet")) for n in names])
+    exp = fn(*[LazyFrame(plain_tables[n]) for n in names])
+    if not isinstance(got, pa.Table):
+        _assert_same(got, exp)
+    elif q in (3,):
+        assert got.num_rows == exp.num_rows           # top-10 ties may order differently
+        assert got.column("revenue").to_pylist() == pytest.approx(exp.column("revenue").to_pylist(), rel=2e-3)
+    else:
+        _assert_same(got, exp)

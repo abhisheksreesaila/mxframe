@@ -427,6 +427,8 @@ class LazyFrame:
         # Store under a stable key (no filter, no plan-specific signature)
         # so filter variations all reuse these buffers.
         stable_key = (id(table), table.num_rows, tuple(col_names), "gpu")
+        from .custom_ops import _watch_table
+        _watch_table(table)
         _GPU_BUFFER_CACHE[stable_key] = gpu_bufs
 
         return GPUFrame(table, _compiler=compiler_inst)

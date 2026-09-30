@@ -411,3 +411,95 @@ def test_groups_absent_after_pushdown_do_not_appear(tmp_path):
     only_early = (mx.scan_parquet(p).filter(col("id") < 400)
                   .groupby("g").agg(col("v").sum().alias("s")).compute(device=DEV))
     assert only_early.column("g").to_pylist() == ["early"]
+
+
+# ── review fixes ───────────────────────────────────────────────────────────
+
+def _write_dict_file(path, values, dictionary=None, vname="x"):
+    d = pa.DictionaryArray.from_arrays(pa.array(values, pa.int32()), pa.array(dictionary))
+    cols = {"k": d, vname: pa.array(np.arange(len(values), dtype=np.float32) + 1)}
+    pq.write_table(pa.table(cols), path)
+
+
+def test_stored_dictionary_schema_is_decoded_like_plain(tmp_path):
+    f, g = str(tmp_path / "f.parquet"), str(tmp_path / "g.parquet")
+    _write_dict_file(f, [0, 1, 0, 2], dictionary=["a", "b", "c"])
+    _write_dict_file(g, [1, 0], dictionary=["a", "b"], vname="y")
+    assert pa.types.is_dictionary(pq.read_table(f).schema.field("k").type)   # premise
+    # projection / passthrough are decoded
+    assert mx.scan_parquet(f).compute(device=DEV).schema.field("k").type == pa.string()
+    # join across two stored-dictionary files
+    got = (mx.scan_parquet(f).join(mx.scan_parquet(g), on="k")
+           .groupby("k").agg(col("x").sum().alias("s")).compute(device=DEV))
+    fp, gp = pq.read_table(f), pq.read_table(g)
+    dec = lambda t: pa.table({"k": t["k"].cast(pa.string()), t.column_names[1]: t.column(1)})  # noqa: E731
+    exp = (LazyFrame(dec(fp)).join(LazyFrame(dec(gp)), on="k")
+           .groupby("k").agg(col("x").sum().alias("s")).compute(device=DEV))
+    assert_same(got, exp)
+
+
+def test_dictionary_with_unused_entries_in_parquet_file(tmp_path):
+    f = str(tmp_path / "u.parquet")
+    _write_dict_file(f, [0, 0, 2, 2], dictionary=["a", "UNUSED", "c"])
+    out = mx.scan_parquet(f).groupby("k").agg(col("x").count().alias("n")).compute(device=DEV)
+    assert sorted(out.column("k").to_pylist()) == ["a", "c"]
+    out = (mx.scan_parquet(f).filter(col("x") > 0).groupby("k").agg(col("x").count().alias("n"))
+           .compute(device=DEV))
+    assert sorted(out.column("k").to_pylist()) == ["a", "c"]
+
+
+def test_engine_caches_do_not_serve_stale_results_for_reused_table_ids(tmp_path):
+    """A freed table's id can be reused; cached group encodings must not leak across."""
+    import gc
+    p = str(tmp_path / "c.parquet")
+    pq.write_table(pa.table({"g": ["x", "y", "z"] * 40, "v": np.ones(120, dtype=np.float32)}), p)
+    seen_ids, hits = set(), 0
+    for i in range(300):
+        first = mx.scan_parquet(p).groupby("g").agg(col("v").sum().alias("s")).compute(device=DEV)
+        assert first.num_rows == 3
+        gc.collect()
+        n = 7
+        t = pa.table({"g": [f"k{j % n}" for j in range(70)], "v": np.ones(70, dtype=np.float32)})
+        if id(t) in seen_ids:
+            hits += 1
+        seen_ids.add(id(t))
+        out = LazyFrame(t).groupby("g").agg(col("v").sum().alias("s")).compute(device=DEV)
+        assert out.num_rows == n
+        del t, out
+    # (id reuse is likely but not guaranteed; the assertions above are what matter)
+
+
+def test_cache_entries_are_purged_when_table_dies():
+    import gc
+    from mxframe import custom_ops as co
+    t = pa.table({"g": ["a", "b", "a"], "v": np.ones(3, dtype=np.float32)})
+    LazyFrame(t).groupby("g").agg(col("v").sum().alias("s")).compute(device=DEV)
+    tid = id(t)
+    assert any(co._contains_id(k, tid) for k in co._GROUP_ENCODE_CACHE)
+    del t
+    gc.collect()
+    assert not any(co._contains_id(k, tid) for k in co._GROUP_ENCODE_CACHE)
+    assert not any(co._contains_id(k, tid) for k in co._INPUT_PREP_CACHE)
+
+
+def test_other_tables_caches_survive_scan_parquet_compute(parquet_file):
+    from mxframe import custom_ops as co
+    t = _base_table()
+    LazyFrame(t).groupby("grp").agg(col("qty").sum().alias("s")).compute(device=DEV)
+    before = len(co._GROUP_ENCODE_CACHE)
+    mx.scan_parquet(parquet_file).groupby("grp").agg(col("qty").sum().alias("s")).compute(device=DEV)
+    assert len(co._GROUP_ENCODE_CACHE) >= before - 0 and any(
+        co._contains_id(k, id(t)) for k in co._GROUP_ENCODE_CACHE)
+
+
+def test_isin_with_none_matches_arrow_semantics_on_dictionary():
+    vals = ["a", None, "b", "a"]
+    plain = pa.table({"s": pa.array(vals), "v": np.arange(4, dtype=np.float32)})
+    dic = pa.table({"s": pa.array(vals).dictionary_encode(), "v": plain["v"]})
+    from mxframe.arrow_dict import dict_predicate
+    import pyarrow.compute as pc
+    for values in (["a", None], ["a"], [None], ["a", "b"]):
+        e = col("s").isin(values)
+        exp = pc.is_in(plain["s"], value_set=pa.array(values, pa.string()))
+        got = dict_predicate(e, dic)
+        assert got.to_pylist() == exp.to_pylist(), values

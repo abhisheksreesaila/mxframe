@@ -20,7 +20,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 
-from .arrow_dict import decode as _decode_dict, is_dictionary as _is_dict, mark_dense as _mark_dense
+from .arrow_dict import decode as _decode_dict, is_dictionary as _is_dict
 from .lazy_expr import Expr
 from .lazy_frame import (
     Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan,
@@ -349,7 +349,6 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
     if not has_parquet and not has_dict:
         return plan
     info = _analyze(plan)
-    created = []
 
     def keepable(name: str, leaf) -> bool:
         return (name in info.refs and name not in info.bad
@@ -370,12 +369,13 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         table = pq.read_table(leaf.path, columns=cols,
                               filters=_filters_expression(pushed) if pushed else None,
                               read_dictionary=dict_cols or None)
-        if dict_cols:
-            # Row-group dictionaries hold only values present in the file, and any
-            # pushed-down filter is repeated by a Filter node that drops empty groups.
-            table = _mark_dense(table, dict_cols)
-        created.append(table)
-        return Scan(table)
+        return Scan(_decode_unkept(table, leaf))
+
+    def _decode_unkept(table, leaf):
+        for i, (n, t) in enumerate(zip(table.column_names, table.schema.types)):
+            if _is_dict(t) and not keepable(n, leaf):
+                table = table.set_column(i, n, _decode_dict(table.column(n)))
+        return table
 
     def resolve_scan(leaf: Scan):
         table = leaf.table
@@ -386,7 +386,6 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         for n in drop:
             i = table.schema.get_field_index(n)
             table = table.set_column(i, n, _decode_dict(table.column(n)))
-        created.append(table)
         return Scan(table)
 
     def rebuild(node):
@@ -417,15 +416,4 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
             return dataclasses.replace(node, input=rebuild(node.input))
         return node
 
-    out = rebuild(plan)
-    if created:
-        _forget_table_caches()
-    return out
-
-
-def _forget_table_caches():
-    """Engine caches are keyed by ``id(table)``; freshly built tables must not alias old ids."""
-    from . import custom_ops as co
-    for cache in (co._INPUT_PREP_CACHE, co._GROUP_ENCODE_CACHE,
-                  co._GPU_BUFFER_CACHE, co._JOIN_RESULT_CACHE):
-        cache.clear()
+    return rebuild(plan)

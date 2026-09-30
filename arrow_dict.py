@@ -14,26 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-__all__ = ["is_dictionary", "decode", "combine_dictionary", "encode_key", "dict_predicate",
-           "mark_dense", "is_dense"]
-
-# Field-metadata marker: "every dictionary entry is used by at least one row, or a
-# Filter node in the plan removes unused groups anyway" (set by the Parquet reader).
-_DENSE = b"mxframe.dense_dictionary"
-
-
-def mark_dense(table: pa.Table, names) -> pa.Table:
-    for n in names:
-        i = table.schema.get_field_index(n)
-        field = table.schema.field(i).with_metadata({_DENSE: b"1"})
-        table = table.set_column(i, field, table.column(i))
-    return table
-
-
-def is_dense(table: pa.Table, name: str) -> bool:
-    i = table.schema.get_field_index(name)
-    md = table.schema.field(i).metadata if i >= 0 else None
-    return bool(md and md.get(_DENSE))
+__all__ = ["is_dictionary", "decode", "combine_dictionary", "encode_key", "dict_predicate"]
 
 
 def is_dictionary(arr_or_type) -> bool:
@@ -63,12 +44,12 @@ def combine_dictionary(col) -> pa.DictionaryArray:
     return col
 
 
-def encode_key(col, dense: bool = False):
+def encode_key(col):
     """Group-key encoding: an object with ``.indices`` and ``.dictionary``.
 
     Dictionary columns reuse their own indices (no hashing pass over the rows);
     dictionary entries no row refers to are dropped so every dictionary entry is
-    a real group (skipped when ``dense`` says the reader already guarantees that).
+    a real group.
     Plain columns go through ``dictionary_encode()``.
     """
     if not is_dictionary(col):
@@ -79,7 +60,7 @@ def encode_key(col, dense: bool = False):
         # Keep the historical null handling of dictionary_encode().
         return decode(d).dictionary_encode()
     n = len(d.dictionary)
-    if dense or len(pc.unique(d.indices)) == n:
+    if len(pc.unique(d.indices)) == n:
         return d
     idx = d.indices.to_numpy(zero_copy_only=False)
     used = np.zeros(n, dtype=bool)
@@ -108,7 +89,7 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
             return None
         fn = lambda v: _CMP[op](v, args[1].args[0])          # noqa: E731
     elif op == "isin":
-        fn = lambda v: pc.is_in(v, value_set=pa.array(args[1]))   # noqa: E731
+        fn = lambda v: pc.is_in(v, value_set=pa.array(args[1], type=v.type))   # noqa: E731
     elif op == "startswith":
         fn = lambda v: pc.starts_with(v, pattern=args[1])          # noqa: E731
     elif op == "contains":
@@ -124,6 +105,9 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
     d = combine_dictionary(col)
     per_entry = fn(d.dictionary)
     if op == "isin":
-        # is_in is never null; a null row is simply "not in".
-        return pc.take(per_entry, d.indices).fill_null(False)
+        # is_in is never null.  Null rows (null index) match only a None in the value set.
+        out = pc.take(per_entry, d.indices)
+        if d.null_count:
+            out = pc.if_else(d.indices.is_null(), None in args[1], out)
+        return out
     return pc.take(per_entry, d.indices)
