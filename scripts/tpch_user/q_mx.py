@@ -463,8 +463,14 @@ def q22(t, dev):
 QUERIES = {i: globals()[f"q{i}"] for i in range(1, 23)}
 
 
+# Tables this file touches with PyArrow string/nation kernels before mxframe sees them: read plain.
+PLAIN = {2: {"part"}, 7: {"nation"}, 16: {"supplier"}, 17: {"part"}, 20: {"part"},
+         21: {"orders"}, 22: {"customer"}}
+
+
 def load(q: int, data_dir: str) -> dict:
-    return {n: mx_read(table_path(data_dir, n), cols) for n, cols in S.TABLES[q].items()}
+    return {n: mx_read(table_path(data_dir, n), cols, dictionary=False if n in PLAIN.get(q, ()) else "auto")
+            for n, cols in S.TABLES[q].items()}
 
 
 def run(q: int, data_dir: str, device: str):
