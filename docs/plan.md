@@ -135,6 +135,11 @@ Needs: F-012 merged · Found by re-running calibration (2026-09-30)
 - [ ] a `pipeline` probe on both devices (fused kernel, Q1-shaped program, resident input on GPU) so co-processing starts from measured fits, not defaults
 - [ ] `join_total@cpu` is not a separate fit (planner prices CPU joins with `join`)
 
+## F-014 Engine uses the fast kernels it has [todo]
+Needs: F-011, F-013 merged · Found by F-013
+- [ ] CPU sort in `custom_ops._apply_sort_custom` uses `AOTKernels.sort_indices` (parallel radix, ~69 ms / 10M) instead of `np.argsort` / `argpartition`; `compiler.py` post-op sort likewise
+- [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
+
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
 - [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
