@@ -45,12 +45,12 @@ Needs: none · Files: `calibration.py` (new), `tests/test_calibration.py`
 - [x] missing / corrupt / stale file → safe built-in defaults, never a crash; no GPU → CPU-only calibration
 - [x] `observe(op, device, rows, ms)` refines the fit online (HyPE-style)
 
-## F-004 First-run cost: lazy GPU init, no JIT on hot paths [todo]
+## F-004 First-run cost: lazy GPU init, no JIT on hot paths [done]
 Needs: F-002 merged (both touch `aot_kernels.py`) · Files: `custom_ops.py`, `aot_kernels.py`
 Why: fresh-process SF10 Q1 profile (2026-09-29): `device="cpu"` pays 0.25 s creating the CUDA context it never uses; `device="gpu"` pays **5.3 s** MAX Graph JIT compile for `group_composite` (18 `session.load` sites remain in `custom_ops.py`).
-- [ ] `device="cpu"` never initialises the GPU; GPU context + AOT GPU library initialise lazily, and under `auto` speculatively in a background thread so a CPU-bound query never waits
-- [ ] every operator the 22 TPC-H queries hit runs through AOT kernels on both devices: no MAX Graph compile in a fresh-process run (assert via a test that counts `session.load` calls)
-- [ ] measured: fresh-process SF10 Q1 on `gpu` loses the 5 s compile; small `auto` query not worse than `cpu`
+- [x] `device="cpu"` never initialises the GPU; GPU context + AOT GPU library initialise lazily, and under `auto` speculatively in a background thread so a CPU-bound query never waits
+- [x] every operator the 22 TPC-H queries hit runs through AOT kernels on both devices: no MAX Graph compile in a fresh-process run (assert via a test that counts `session.load` calls)
+- [x] measured: fresh-process SF10 Q1 on `gpu` loses the 5 s compile; small `auto` query not worse than `cpu`
 
 ## F-010 `mx.scan_parquet` with pushdown and dictionary strings [done]
 Needs: none · Files: `io_parquet.py` (new), `lazy_frame.py` (source-resolution pass), group-key encoding in `custom_ops.py`
