@@ -60,6 +60,11 @@ assert "pandas" not in sys.modules
 LazyFrame(t).filter(col("d") > lit(3)).groupby("s", "k").agg(col("v").sum().alias("x"), col("v").count().alias("n")).sort("x").compute(device="cpu")
 LazyFrame(t).filter(col("d") > lit(3)).groupby().agg((col("v") * lit(2.0)).sum().alias("x")).compute(device="cpu")
 LazyFrame(t).join(LazyFrame(o), on="k").groupby("k").agg(col("w").sum().alias("x")).sort("x", descending=True).limit(3).compute(device="cpu")
+from mxframe import when
+rev = col("v") * (lit(1.0) - col("w"))
+LazyFrame(t).join(LazyFrame(o), on="k").filter(col("d") >= lit(10)).filter(col("d") < lit(50)).groupby().agg(
+    when(col("s").startswith("a"), rev, lit(0.0)).sum().alias("p"), rev.sum().alias("t")).compute(device="cpu")
+LazyFrame(t).filter(col("s").isin(["a"]) & (col("d") != lit(3))).groupby("k").agg(col("v").mean()).compute(device="cpu")
 print("pandas" in sys.modules)
 """
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
@@ -89,3 +94,20 @@ def test_to_numpy_falls_back_for_nulls_strings_and_non_arrow():
             return np.array([7])
 
     assert to_numpy(T()).tolist() == [7]
+
+
+
+def test_scalars_and_lists_without_pandas():
+    from mxframe.np_arrow import scalar
+    assert scalar(5).equals(pa.scalar(5)) and scalar(0.5).equals(pa.scalar(0.5))
+    assert scalar("PROMO").equals(pa.scalar("PROMO")) and scalar(True).equals(pa.scalar(True))
+    assert scalar(5, type=pa.int32()).equals(pa.scalar(5, type=pa.int32()))
+    assert arr([1, 2, 3]).equals(pa.array([1, 2, 3])) and arr(["a", "bc"]).equals(pa.array(["a", "bc"]))
+    assert arr([1, 2.5]).equals(pa.array([1, 2.5]))
+    root = Path(__file__).resolve().parent
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n"
+            "import numpy as np, pyarrow.compute as pc\nfrom mxframe.np_arrow import array, scalar\n"
+            "a = array(np.arange(5, dtype=np.int32)); pc.greater_equal(a, scalar(3)); pc.is_in(a, value_set=array([1, 2]))\n"
+            "print('pandas' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False"

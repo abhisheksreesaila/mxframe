@@ -57,7 +57,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
-from .np_arrow import to_numpy as _np_of
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
 import pyarrow.compute as pc
 
 from .lazy_expr import Expr
@@ -303,7 +303,7 @@ def _single_array(col) -> pa.Array:
         if col.num_chunks == 1:
             return col.chunk(0)
         if col.num_chunks == 0:
-            return pa.array([], type=col.type)
+            return _npa([], type=col.type)
         return col.combine_chunks()
     return col
 
@@ -312,7 +312,7 @@ def _column_numpy(col) -> Optional[np.ndarray]:
     """Numeric Arrow column -> contiguous numpy in a kernel-supported dtype."""
     arr = _single_array(col)
     if isinstance(arr, pa.ChunkedArray):  # combine_chunks on some versions
-        arr = arr.chunk(0) if arr.num_chunks else pa.array([], type=arr.type)
+        arr = arr.chunk(0) if arr.num_chunks else _npa([], type=arr.type)
     if arr.null_count:
         return None
     t = arr.type
@@ -550,7 +550,7 @@ class _Builder:
                 if op not in ("eq", "ne"):
                     raise Unsupported("ordered string comparison")
                 d = self.dictionary(col_e.args[0])
-                member = np.asarray(_np_of(pc.equal(d, pa.scalar(lit_e.args[0], type=d.type)).fill_null(False), zero_copy_only=False))
+                member = np.asarray(_np_of(pc.equal(d, _npscalar(lit_e.args[0], type=d.type)).fill_null(_npscalar(False)), zero_copy_only=False))
                 return self._dict_test(col_e.args[0], member, negate=(op == "ne"))
         cmpc = self._try_cmpc(op, lhs, rhs)
         if cmpc is not None:
@@ -623,7 +623,7 @@ class _Builder:
             raise Unsupported("string op on a numeric column")
         d = self.dictionary(name)
         fn = pc.starts_with if op == "startswith" else pc.match_substring
-        member = np.asarray(_np_of(fn(d, pattern=pattern).fill_null(False), zero_copy_only=False))
+        member = np.asarray(_np_of(fn(d, pattern=pattern).fill_null(_npscalar(False)), zero_copy_only=False))
         return self._dict_test(name, member)
 
     def _isin(self, col_e: Expr, values):
@@ -632,7 +632,7 @@ class _Builder:
             if not all(isinstance(v, str) for v in values):
                 raise Unsupported("non-string values against a string column")
             d = self.dictionary(col_e.args[0])
-            member = np.asarray(_np_of(pc.is_in(d, value_set=pa.array(values, type=d.type)), zero_copy_only=False))
+            member = np.asarray(_np_of(pc.is_in(d, value_set=_npa(values, type=d.type)), zero_copy_only=False))
             return self._dict_test(col_e.args[0], member)
         x = self._need(col_e, "num")
         if isinstance(x, _Const):

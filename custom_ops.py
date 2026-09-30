@@ -8,7 +8,7 @@ __all__ = ['KERNELS_PATH', 'WARP_SIZE', 'MAX_GROUPS', 'AUTO_GPU_THRESHOLD', 'GPU
 # %% ../nbs/04_custom_ops.ipynb 2
 from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
@@ -592,7 +592,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "year":
             col_arr = self._eval_expr_arrow(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
-                return pc.cast(pc.divide(col_arr, pa.scalar(10000, type=pa.int32())), pa.int32())
+                return pc.cast(pc.divide(col_arr, _npscalar(10000, type=pa.int32())), pa.int32())
             return pc.year(col_arr)
         if op in ("and", "__and__"):
             return pc.and_(self._eval_expr_arrow(args[0], table),
@@ -1264,9 +1264,9 @@ class CustomOpsCompiler(GraphCompiler):
                 return None
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply}[expr.op]
             if isinstance(l, int):
-                l = pa.scalar(l, type=r.type)
+                l = _npscalar(l, type=r.type)
             if isinstance(r, int):
-                r = pa.scalar(r, type=l.type)
+                r = _npscalar(r, type=l.type)
             try:
                 return fn(l, r)
             except pa.ArrowInvalid:            # overflow in the column's own width
@@ -2661,7 +2661,7 @@ class CustomOpsCompiler(GraphCompiler):
                     )
 
             encoded = pa.concat_arrays([left_arr, right_arr]).dictionary_encode()
-            codes = _np_of(encoded.indices.fill_null(-1), zero_copy_only=False).astype(np.int64)
+            codes = _np_of(encoded.indices.fill_null(_npscalar(-1, type=encoded.indices.type)), zero_copy_only=False).astype(np.int64)
             nulls = codes < 0
             if nulls.any():
                 next_code = len(encoded.dictionary)

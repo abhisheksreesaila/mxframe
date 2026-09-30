@@ -30,8 +30,58 @@ def _is_masked(obj) -> bool:
     return ma is not None and isinstance(obj, ma.MaskedArray)
 
 
+def _strings(values) -> pa.Array:
+    data = [v.encode("utf-8") for v in values]
+    offsets = np.zeros(len(data) + 1, dtype=np.int32)
+    np.cumsum([len(b) for b in data], out=offsets[1:])
+    return pa.Array.from_buffers(pa.string(), len(data),
+                                 [None, pa.py_buffer(offsets), pa.py_buffer(b"".join(data))])
+
+
+def _from_pylist(values, type):
+    """Homogeneous list of bool / int / float / str (no None) without pandas, else None."""
+    if not values:
+        return None
+    kinds = {bool if isinstance(v, (bool, np.bool_)) else
+             int if isinstance(v, (int, np.integer)) else
+             float if isinstance(v, (float, np.floating)) else
+             str if isinstance(v, str) else None for v in values}
+    if len(kinds) != 1 and kinds != {int, float}:
+        return None
+    k = float if kinds == {int, float} else next(iter(kinds))
+    if k is None:
+        return None
+    if k is str:
+        out = _strings(values)
+    elif k is bool:
+        out = array(np.asarray(values, dtype=np.bool_))
+    elif k is int:
+        try:
+            out = array(np.asarray(values, dtype=np.int64))
+        except OverflowError:
+            return None
+    else:
+        out = array(np.asarray(values, dtype=np.float64))
+    return out.cast(type, safe=True) if type is not None and out.type != type else out
+
+
+def scalar(value, type=None):
+    """``pa.scalar(value, type)`` without importing pandas (bool/int/float/str; else PyArrow)."""
+    if isinstance(value, pa.Scalar):
+        return value.cast(type) if type is not None and value.type != type else value
+    arr = _from_pylist([value], None) if value is not None else None
+    if arr is None:
+        return pa.scalar(value, type=type)
+    sc = arr[0]
+    return sc.cast(type) if type is not None and sc.type != type else sc
+
+
 def array(obj, type=None, **kwargs) -> pa.Array:
     """``pa.array(obj, type)`` for 1-D numeric/bool NumPy input, without pandas."""
+    if not kwargs and isinstance(obj, (list, tuple)):
+        out = _from_pylist(list(obj), type)
+        if out is not None:
+            return out
     if kwargs or not isinstance(obj, np.ndarray) or obj.ndim != 1 or _is_masked(obj):
         return pa.array(obj, type=type, **kwargs)
     a = obj
