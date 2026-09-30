@@ -62,7 +62,11 @@ def scan_parquet(path, *, dictionary: Any = "auto",
     """
     import pyarrow.parquet as pq
     path = os.fspath(path)
-    schema = pq.read_schema(path)          # footer only
+    if os.path.isfile(path):
+        # footer parsed once per process: the same metadata serves the read later
+        schema = pq.ParquetFile(path, metadata=_metadata(path)).schema_arrow
+    else:
+        schema = pq.read_schema(path)
     return LazyFrame(ParquetScan(path, schema, dictionary, int(max_dictionary_bytes)))
 
 
@@ -92,16 +96,115 @@ def _read_file(path, columns, dict_cols, pushed=()) -> pa.Table:
     ``pq.read_table`` goes through ``pyarrow.dataset``, whose import pulls in
     pandas (~150 ms of a first query). ``ParquetFile`` reads the same data
     without it. ``pushed`` simple filters skip row groups whose statistics rule
-    them out; rows are still filtered exactly by the plan's Filter node.
+    them out and, for integer comparisons, drop non-matching rows right after
+    each row group is decoded (see ``_read_groups``); rows are still filtered
+    exactly by the plan's Filter node.
     """
     import pyarrow.parquet as pq
-    pf = pq.ParquetFile(path, read_dictionary=dict_cols or None)
+    md = _metadata(path)
+    pf = pq.ParquetFile(path, read_dictionary=dict_cols or None, metadata=md)
     groups = _row_groups_for(pf, pushed) if pushed else None
-    if groups is None or len(groups) == pf.metadata.num_row_groups:
-        return pf.read(columns=columns, use_threads=True)
-    if not groups:
+    if groups is not None and not groups:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
+    if groups is None:
+        groups = list(range(md.num_row_groups))
+    rowwise = [p for p in pushed if _row_filterable(p, pf.schema_arrow)]
+    if len(groups) >= 2 and md.num_columns == len(pf.schema_arrow.names) and (rowwise or len(groups) > 2):
+        return _read_groups(path, md, pf.schema_arrow, columns, dict_cols, groups, rowwise)
+    if len(groups) == md.num_row_groups:
+        return pf.read(columns=columns, use_threads=True)
     return pf.read_row_groups(groups, columns=columns, use_threads=True)
+
+
+_ROW_OPS = {"eq": "__eq__", "ne": "__ne__", "lt": "__lt__", "le": "__le__", "gt": "__gt__", "ge": "__ge__"}
+
+
+def _row_filterable(pushed_one, schema) -> bool:
+    name, op, _ = pushed_one
+    return _kind(schema, name) == "int" and (op in _ROW_OPS or op == "isin")
+
+
+def _row_mask(table, rowwise):
+    """Boolean NumPy mask of the rows satisfying every integer conjunct, or None (keep all)."""
+    from .np_arrow import to_numpy
+    import numpy as np
+    mask = None
+    for name, op, value in rowwise:
+        c = table.column(name)
+        if c.null_count:
+            continue                       # nulls: leave the row-level decision to the Filter node
+        a = to_numpy(c)
+        try:
+            if op == "isin":
+                m = np.isin(a, np.asarray(value, dtype=np.int64))
+            else:
+                m = getattr(a, _ROW_OPS[op])(value)
+        except (OverflowError, TypeError):
+            continue                       # literal outside the column's range: the Filter node decides
+        mask = m if mask is None else (mask & m)
+    return mask
+
+
+def _read_groups(path, md, schema, columns, dict_cols, groups, rowwise) -> pa.Table:
+    """Decode row groups on a thread pool, filtering each right after it is decoded.
+
+    Each worker reads one row group single-threaded (its own ``ParquetFile`` over
+    the shared cached footer) and applies the pushed integer comparisons while the
+    columns are still cache-hot, so only the surviving rows are kept and later
+    concatenated.  This is what makes ``scan -> filter -> select`` on a big file
+    cost about as much as decoding the columns once.
+    """
+    import pyarrow.parquet as pq
+    from concurrent.futures import ThreadPoolExecutor
+    cols = list(columns) if columns else list(schema.names)
+    fnames = [n for n, _, _ in rowwise]
+    read_cols = cols + [n for n in dict.fromkeys(fnames) if n not in cols]
+    rd = dict_cols or None
+    src = pa.memory_map(path)              # one mapping shared by all readers: no per-group open/copy
+
+    def one(g):
+        pf = pq.ParquetFile(src, read_dictionary=rd, metadata=md)
+        t = pf.read_row_group(g, columns=read_cols, use_threads=False)
+        if rowwise:
+            m = _row_mask(t, rowwise)
+            if m is not None:
+                t = _take_rows(t, m)
+        return t.select(cols) if len(read_cols) != len(cols) else t
+
+    workers = max(1, min(len(groups), _read_threads()))
+    with ThreadPoolExecutor(workers) as ex:
+        parts = list(ex.map(one, groups))
+    kept = [t for t in parts if t.num_rows] or parts[:1]
+    return pa.concat_tables(kept)
+
+
+def _read_threads() -> int:
+    """Decode threads.  More than ~8 slow Arrow's decoder down (allocator and page-fault contention)."""
+    n = int(os.environ.get("MXFRAME_READ_THREADS", 0))
+    return n if n > 0 else min(8, max(2, (os.cpu_count() or 2) // 2))
+
+
+def _take_rows(table: pa.Table, mask) -> pa.Table:
+    """``table`` rows where the NumPy boolean ``mask`` is set.
+
+    Plain numeric columns go through NumPy (no ``pyarrow.compute`` import, ~25 ms
+    of a first query); anything else (strings, dictionaries, nulls) uses Arrow.
+    """
+    import numpy as np
+    from .np_arrow import array as _arr, to_numpy
+    if mask.all():
+        return table
+    cols, fallback = [], None
+    for c in table.columns:
+        t = c.type
+        if (pa.types.is_integer(t) or pa.types.is_floating(t)) and not c.null_count:
+            cols.append(_arr(to_numpy(c)[mask], type=t))
+        else:
+            fallback = True
+            break
+    if fallback:
+        return table.filter(_arr(mask))
+    return pa.table(cols, names=table.column_names)
 
 
 def _row_groups_for(pf, pushed) -> List[int]:
