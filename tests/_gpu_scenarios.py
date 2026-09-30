@@ -234,7 +234,26 @@ def device_chaining():
         pass
 
 
-SCENARIOS = {f.__name__: f for f in (group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
+def sort_multikey():
+    """LazyFrame.sort("k", "j") on the GPU (and CPU): correct order, ties in row order,
+    including key columns whose combined radix overflows int32."""
+    import pyarrow as pa
+    from mxframe import LazyFrame, Scan
+    rng = np.random.default_rng(3)
+    for n, kmax, jmax in [(10, 3, 3), (1000, 5, 7), (1024, 5, 7), (100_000, 100, 100),
+                          (100_000, 100_000, 100_000)]:
+        t = pa.table({"k": rng.integers(0, kmax, n).astype(np.int32),
+                      "j": rng.integers(0, jmax, n).astype(np.int32),
+                      "v": np.arange(n, dtype=np.int32)})
+        df = t.to_pandas()
+        for desc in (False, True):
+            want = df.sort_values(["k", "j"], ascending=not desc, kind="stable")["v"].to_numpy()
+            for dev in ("cpu", "gpu"):
+                got = LazyFrame(Scan(t)).sort("k", "j", descending=desc).compute(device=dev)
+                assert got.column("v").to_numpy().tolist() == want.tolist(), (n, kmax, jmax, desc, dev)
+
+
+SCENARIOS = {f.__name__: f for f in (sort_multikey, group_aggs, group_edge_cases, group_encode, sort_topk, hash_join, device_chaining)}
 
 
 def register(fn):

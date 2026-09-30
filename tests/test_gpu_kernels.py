@@ -59,3 +59,7 @@ def test_hash_join_matches_reference():
 
 def test_device_resident_inputs_and_outputs_chain_without_host_round_trips():
     run_scenario("device_chaining")
+
+
+def test_multi_key_sort_order_on_gpu_and_cpu():
+    run_scenario("sort_multikey")
