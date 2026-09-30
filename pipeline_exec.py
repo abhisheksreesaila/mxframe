@@ -132,7 +132,8 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     coproc_info = None
     if device == "cpu":
         from . import coproc_fused
-        split = coproc_fused.try_split(prog, cc, gids, n_groups, n_rows, table)
+        stable = not grouped or all(e.op == "col" for e in agg_node.group_by)   # derived keys: fresh ids per query
+        split = coproc_fused.try_split(prog, cc, gids, n_groups, n_rows, table, stable_gids=stable)
         if split is not None:
             partials, used, coproc_info = split
     if device == "gpu":

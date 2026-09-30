@@ -83,23 +83,39 @@ def balanced_fraction(cpu_ms: float, gpu_ms: float, gpu_alpha: float = 0.0) -> f
 
 
 # ── residency cache ──────────────────────────────────────────────────────────
+#
+# Only programs whose every column chunk is a zero-copy Arrow buffer are made
+# resident: Arrow buffers are immutable and the entry holds their owners, so a
+# cached address can never be reused for other data while the entry exists.
+# Converted columns (dictionary codes, bools, narrow ints) are fresh arrays on
+# every query and are never uploaded. Entries in use by a split are pinned; an
+# evicted entry is freed only when its last user releases it.
 
 @dataclass
 class _Entry:
-    dc: Any            # pipeline_kernels.DeviceColumns
+    dc: Any                  # pipeline_kernels.DeviceColumns
     nbytes: int
-    gids: Optional[np.ndarray]   # strong ref: its address is part of the key
+    owners: list             # Arrow chunk owners + gids: keep every keyed address alive
+    users: int = 0
+    evicted: bool = False
 
 
 _lock = threading.Lock()
 _cache: "OrderedDict[tuple, _Entry]" = OrderedDict()
 _bytes = 0
-_budget: Optional[int] = None
+_inflight_bytes = 0
 _inflight: Dict[tuple, threading.Thread] = {}
+_failed: set = set()
+_finalized: set = set()
+
+
+def _stable_columns(cc) -> bool:
+    import pyarrow as pa
+    return all(isinstance(b.owner, pa.Array) for arrs in cc.chunks for b in arrs)
 
 
 def _key(cc, gids) -> tuple:
-    cols = tuple(tuple((int(b.addr), int(b.itemsize)) for b in arrs) for arrs in cc.chunks)
+    cols = tuple(tuple((int(b.addr), int(b.n), int(b.itemsize), int(b.dt)) for b in arrs) for arrs in cc.chunks)
     g = (int(gids.ctypes.data), len(gids)) if gids is not None else None
     return (tuple(tuple(b) for b in cc.bounds), cols, g)
 
@@ -110,15 +126,13 @@ def _input_bytes(cc, gids, n_rows) -> int:
 
 
 def _budget_bytes() -> int:
-    global _budget
-    if _budget is None:
-        try:
-            from . import gpu_stream
-            free, _ = gpu_stream.mem_info()
-            _budget = int(free * RESIDENT_MEM_FRACTION)
-        except Exception:
-            _budget = 0
-    return _budget
+    """Half of what the GPU could hold for us right now (refreshed on every upload)."""
+    try:
+        from . import gpu_stream
+        free, _ = gpu_stream.mem_info()
+    except Exception:
+        return 0
+    return int((free + _bytes) * RESIDENT_MEM_FRACTION)
 
 
 def resident_count() -> int:
@@ -126,25 +140,40 @@ def resident_count() -> int:
         return len(_cache)
 
 
-def _evict(key) -> None:
-    global _bytes
-    with _lock:
-        e = _cache.pop(key, None)
-        if e is None:
-            return
-        _bytes -= e.nbytes
+def _free_entry(e: _Entry) -> None:
     try:
         e.dc.free()
     except Exception:
         pass
 
 
+def _evict_locked(key) -> Optional[_Entry]:
+    """Remove from the cache; returns the entry if it can be freed now."""
+    global _bytes
+    e = _cache.pop(key, None)
+    if e is None:
+        return None
+    _bytes -= e.nbytes
+    e.evicted = True
+    return e if e.users == 0 else None
+
+
+def _evict(key) -> None:
+    with _lock:
+        e = _evict_locked(key)
+        _finalized.discard(key)
+    if e is not None:
+        _free_entry(e)
+
+
 def clear_residency() -> None:
     wait_for_uploads(30)
     with _lock:
-        keys = list(_cache)
-    for k in keys:
-        _evict(k)
+        freeable = [e for e in (_evict_locked(k) for k in list(_cache)) if e is not None]
+        _failed.clear()
+        _finalized.clear()
+    for e in freeable:
+        _free_entry(e)
 
 
 def wait_for_uploads(timeout: float = 30.0) -> bool:
@@ -161,47 +190,74 @@ def wait_for_uploads(timeout: float = 30.0) -> bool:
                 return not _inflight
 
 
-def _lookup(key):
+def _acquire(key) -> Optional[_Entry]:
     with _lock:
         e = _cache.get(key)
         if e is not None:
             _cache.move_to_end(key)
+            e.users += 1
         return e
+
+
+def _release(e: _Entry) -> None:
+    with _lock:
+        e.users -= 1
+        free_now = e.evicted and e.users == 0
+    if free_now:
+        _free_entry(e)
 
 
 def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
     """Upload the query's columns + group ids in the background (deduplicated per key)."""
+    global _inflight_bytes
     key = _key(cc, gids)
     with _lock:
-        if key in _cache or key in _inflight:
+        if key in _cache or key in _inflight or key in _failed:
             return
-        if nbytes > _budget_bytes():
+    budget = _budget_bytes()          # CUDA calls outside the lock
+    with _lock:
+        if key in _cache or key in _inflight or nbytes > budget:
             return
+        freeable = []
+        for old in list(_cache):     # make room first, oldest unpinned entries
+            if _bytes + _inflight_bytes + nbytes <= budget:
+                break
+            e = _evict_locked(old)
+            if e is not None:
+                freeable.append(e)
+        if _bytes + _inflight_bytes + nbytes > budget:
+            return
+        _inflight_bytes += nbytes
+        owners = [b.owner for arrs in cc.chunks for b in arrs] + ([gids] if gids is not None else [])
 
         def run():
-            global _bytes
+            global _bytes, _inflight_bytes
             from . import pipeline_kernels as pk
             try:
                 dc = pk.upload_columns(prog, cc, gids, 0, n_rows)
             except Exception:
                 with _lock:
                     _inflight.pop(key, None)
+                    _inflight_bytes -= nbytes
+                    _failed.add(key)
                 return
             with _lock:
                 _inflight.pop(key, None)
-                while _cache and _bytes + nbytes > _budget_bytes():
-                    old_key, old = _cache.popitem(last=False)
-                    _bytes -= old.nbytes
-                    old.dc.free()
-                _cache[key] = _Entry(dc, nbytes, gids)
+                _inflight_bytes -= nbytes
+                _cache[key] = _Entry(dc, nbytes, owners)
                 _bytes += nbytes
-            try:
-                weakref.finalize(owner, _evict, key)
-            except TypeError:
-                pass
+                register = key not in _finalized
+                _finalized.add(key)
+            if register:
+                try:
+                    weakref.finalize(owner, _evict, key)
+                except TypeError:
+                    pass
 
         t = threading.Thread(target=run, name="mxframe-resident-upload", daemon=True)
         _inflight[key] = t
+    for e in freeable:
+        _free_entry(e)
     t.start()
 
 
@@ -212,47 +268,69 @@ def _gpu_usable() -> bool:
     return enabled_by_env() and pk.gpu_available() and auto_mode._gpu_disabled is None
 
 
-def try_split(prog, cc, gids, n_groups: int, n_rows: int, owner) -> Optional[Tuple[Any, str, dict]]:
+def try_split(prog, cc, gids, n_groups: int, n_rows: int, owner,
+              stable_gids: bool = True) -> Optional[Tuple[Any, str, dict]]:
     """Returns (partials, device label, info) when co-processing served the query, else None."""
     pol = current_policy()
-    if pol is None or n_rows == 0 or not _gpu_usable():
+    if pol is None or n_rows == 0 or not _gpu_usable() or not _stable_columns(cc):
         return None
-    nbytes = _input_bytes(cc, gids, n_rows)
-    entry = _lookup(_key(cc, gids))
+    key = _key(cc, gids)
+    entry = _acquire(key)
     if entry is None:
-        if pol.background_upload and nbytes >= pol.min_upload_bytes:
+        nbytes = _input_bytes(cc, gids, n_rows)
+        if pol.background_upload and stable_gids and nbytes >= pol.min_upload_bytes:
             _start_upload(prog, cc, gids, n_rows, owner, nbytes)
         return None
+    try:
+        return _split(prog, cc, gids, n_groups, n_rows, entry, key, pol)
+    finally:
+        _release(entry)
 
+
+def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol):
+    from . import auto_mode
     from . import pipeline_kernels as pk
     from .calibration import get_calibration
     from .coproc import Worker, run_router
     from .pipeline_program import merge_partials
 
     cal = get_calibration()
-    cpu_ms = cal.estimate("pipeline", "cpu", n_rows)
-    gpu_ms = cal.estimate("pipeline", "gpu", n_rows)
+    card = max(n_groups, 1)
+    cpu_ms = cal.estimate("pipeline", "cpu", n_rows, card=card)
+    gpu_ms = cal.estimate("pipeline", "gpu", n_rows, card=card)
     f = pol.gpu_fraction if pol.gpu_fraction is not None else balanced_fraction(cpu_ms, gpu_ms, DEFAULT_GPU_ALPHA_MS)
     k = int(round(n_rows * f))
     dc = entry.dc
-    workers = []
-    if k < n_rows:
-        workers.append(Worker("cpu", "cpu", n_rows,
-                              compute=lambda r: pk.run_pipeline_cpu(prog, cc, gids, n_groups, r[0], r[1])))
-    if k > 0:
-        workers.append(Worker("gpu", "gpu", n_rows,
-                              compute=lambda r: pk.run_pipeline_gpu(prog, dc, None, n_groups, r[0], r[1])))
-    fractions = {"gpu": k / n_rows} if len(workers) == 2 else None
+    cpu = Worker("cpu", "cpu", n_rows,
+                 compute=lambda r: pk.run_pipeline_cpu(prog, cc, gids, n_groups, r[0], r[1]))
+    # Fallible: if the GPU share fails, the Router redoes its rows on the CPU worker.
+    gpu = Worker("gpu", "gpu", n_rows, fallible=True,
+                 compute=lambda r: pk.run_pipeline_gpu(prog, dc, None, n_groups, r[0], r[1]))
+    if k <= 0:
+        workers, fractions = [cpu], None
+    elif k >= n_rows:
+        workers, fractions = [gpu, cpu], {"gpu": 1.0}
+    else:
+        workers, fractions = [gpu, cpu], {"gpu": k / n_rows}
     res = run_router(n_rows, workers, merge=lambda parts: merge_partials(prog, parts), static_fractions=fractions)
-    for name, st in res.stats.items():
-        if st.rows:
-            try:
-                cal.observe("pipeline", st.device, st.rows, st.busy_ms)
-            except Exception:
-                pass
-    label = "split" if len(workers) == 2 else ("gpu_resident" if k else "cpu")
+    gstat = res.stats.get("gpu")
+    if gstat is not None and gstat.failed:
+        err = gstat.error
+        if err is not None and auto_mode.is_sticky_gpu_error(err):
+            auto_mode.disable_gpu(f"{type(err).__name__}: {err}")
+        _evict(key)
+    else:
+        for st in res.stats.values():
+            if st.rows:
+                try:
+                    cal.observe("pipeline", st.device, st.rows, st.busy_ms, card=card)
+                except Exception:
+                    pass
+    used = {n for n, st in res.stats.items() if st.rows}
+    label = "split" if used == {"cpu", "gpu"} else ("gpu_resident" if used == {"gpu"} else "cpu")
     info = {"resident": True, "gpu_fraction": round(k / n_rows, 3),
             "est_cpu_ms": round(cpu_ms, 1), "est_gpu_ms": round(gpu_ms, 1),
-            "cpu_ms": round(res.stats["cpu"].busy_ms, 1) if "cpu" in res.stats else 0.0,
-            "gpu_ms": round(res.stats["gpu"].busy_ms, 1) if "gpu" in res.stats else 0.0}
+            "cpu_ms": round(res.stats["cpu"].busy_ms, 1),
+            "gpu_ms": round(gstat.busy_ms, 1) if gstat is not None else 0.0,
+            "gpu_failed": bool(gstat is not None and gstat.failed)}
     return res.value, label, info

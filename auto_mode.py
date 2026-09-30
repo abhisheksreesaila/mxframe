@@ -294,6 +294,7 @@ class AutoDecision:
     fallback: bool = False
     actual_ms: Optional[float] = None
     gpu_available: bool = True
+    coproc: Optional[dict] = None     # set when a fused aggregate co-processed on cpu+gpu
 
     def explain(self) -> str:
         head = f"auto -> {self.device}  reason: {self.reason}"
@@ -311,6 +312,10 @@ class AutoDecision:
             tail += f" h2d={_fmt_bytes(e.h2d_bytes)}"
         if self.actual_ms is not None:
             tail += f" actual={self.actual_ms:.1f}ms"
+        if self.coproc:
+            c = self.coproc
+            tail += (f"\n  co-processing: gpu_fraction={c.get('gpu_fraction')} cpu busy={c.get('cpu_ms')}ms "
+                     f"gpu busy={c.get('gpu_ms')}ms (resident columns)")
         lines = [l.line() if self.gpu_available else l.line().split(" gpu=")[0] for l in e.lines]
         return "\n".join([head] + lines + [tail])
 

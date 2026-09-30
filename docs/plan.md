@@ -72,14 +72,17 @@ Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain ho
 
 ## Wave 3: per-operator placement + co-processing (Phases 2–3)
 
-## F-006 Router co-processing for grouped and global aggregates [doing]
+## F-006 Router co-processing for grouped and global aggregates [review]
 Needs: F-002, F-003, F-005 · Files: `coproc.py` (new), hook in `custom_ops.py`
 Done so far: `auto_mode.Placer` (cpu/gpu/split cost decision), `coproc.run_router` (morsel queue, prepare/compute overlap, fallible GPU worker), `gpu_stream.DeviceStager` (pinned slots, async H2D), `residency.ResidencyTracker` (LRU GPU copies, pins).
 Physics on the reference box (measured 2026-09-29): GPU link is PCIe 4.0 **x8** — pinned H2D 13.4 GB/s, pageable 11 GB/s, stager ~9 GB/s; host DRAM (Ryzen 5900X, dual-channel DDR4) ~40–50 GB/s. So a scan-aggregate over host-resident data is ~4× faster on all CPU cores than shipping it to the GPU, and splitting a pure scan gains little (both devices read the same DRAM). The GPU earns its keep on (a) joins / high-cardinality group-bys (CPU latency-bound), (b) repeat queries over GPU-resident columns, (c) idle-link background upload of hot columns during CPU-bound queries so the next query finds them resident.
-- [ ] large decomposable aggregations split into morsels pulled by CPU workers and a GPU worker from one queue; partial aggregates merged
-- [ ] GPU worker overlaps copy of morsel k+1 with compute of morsel k (2–3 staging buffers)
-- [ ] split ratio from calibration; `gpu_fraction=` overrides; results identical to `cpu` for 1, 2 and all threads
-- [ ] SF10 Q1 cold under `auto` beats both `cpu` and `gpu` by ≥ 15%, or the ticket records the measured break-even and why
+Design as built (measured 2026-09-30, SF10 Q1 fused stage, 60M rows): CPU 57 ms, GPU from host 353 ms, GPU resident 39 ms, CPU 40% + GPU 60% resident 25 ms; a Router streaming host data to the GPU was 67–160 ms (worse than CPU), and a dynamic morsel queue on resident data 42 ms (each GPU call has ~4.5 ms fixed cost). So `coproc_fused`: host data → CPU + background upload of the query's columns and group ids; resident data → static split, one GPU call + multi-core CPU, fraction balanced from calibration and refined by `observe`. Break-even: first run of a table is CPU (+ background upload, ~0–15 ms extra), second run pays the one-time GPU warm-up, then 1.3–1.4× faster than CPU-only (public API, SF10 Q1: 43 ms vs 58 ms).
+- [x] decomposable aggregations run on both devices at once; partial aggregates merged (Router, static split)
+- [x] split ratio from calibration (refined online); `gpu_fraction=` overrides; results identical to `cpu` for 1, 2 and all threads (tests)
+- [x] GPU failures inside a split are redone on CPU; CUDA errors disable the GPU; residency never serves a stale or freed device copy (pinned entries, owners held, zero-copy columns only)
+- [x] `profile=True` / explain show both devices' busy time
+- [ ] streaming host data to the GPU with copy/compute overlap beats CPU-only on this box — not achievable on PCIe x8 (measured above); revisit on PCIe 5 / Grace Hopper hardware
+- [ ] cold (first-query) SF10 Q1 under `auto` beats `cpu` by ≥ 15% — not on this box for host data (see break-even); met for repeat queries
 
 ## F-007 Per-operator placement for joins (CPU filter → GPU join) [todo]
 Needs: F-005 · Files: `auto_mode.py` placement pass, join dispatch in `custom_ops.py`

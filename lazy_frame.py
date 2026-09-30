@@ -267,6 +267,8 @@ class LazyFrame:
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3
         prov = dict(prov)
+        if prov.get("coproc"):
+            decision.coproc = prov["coproc"]
         prov["auto_device"] = decision.device
         prov["auto_reason"] = decision.reason
         self._last_compile_provenance = prov

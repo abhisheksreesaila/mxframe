@@ -111,3 +111,164 @@ def test_auto_enables_policy_and_results_match():
     want = query(t).compute(device="cpu")
     got = query(t).compute(device="auto")
     assert_same(got, want)
+
+
+# ── review fixes ─────────────────────────────────────────────────────────────
+
+def _two_tables_sharing_x(n=1_000_000):
+    rng = np.random.default_rng(1)
+    x = pa.array(np.ones(n, dtype=np.float32))
+    a = pa.table({"x": x, "s": pa.array(np.where(rng.random(n) < 0.5, "a", "b"))})
+    b = pa.table({"x": x, "s": pa.array(np.where(rng.random(n) < 0.8, "a", "b"))})
+    return a, b
+
+
+def _s_query(t):
+    return LazyFrame(t).filter(col("s") == lit("a")).groupby().agg(col("x").sum().alias("t"))
+
+
+@needs_gpu
+def test_converted_columns_never_serve_a_stale_device_copy():
+    cf.clear_residency()
+    a, b = _two_tables_sharing_x()
+    want_a = _s_query(a).compute(device="cpu").column("t")[0].as_py()
+    want_b = _s_query(b).compute(device="cpu").column("t")[0].as_py()
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        for _ in range(4):
+            for t, want in ((a, want_a), (b, want_b)):
+                got = _s_query(t).compute(device="cpu").column("t")[0].as_py()
+                cf.wait_for_uploads(30)
+                assert got == pytest.approx(want, rel=1e-9)
+
+
+@needs_gpu
+def test_eviction_during_a_split_never_frees_memory_in_use(monkeypatch):
+    cf.clear_residency()
+    ts = [table(1_500_000, seed=i) for i in range(4)]
+    wants = [query(t).compute(device="cpu") for t in ts]
+    per_table = cf._input_bytes(cf_bind(ts[0]), None, ts[0].num_rows) + 4 * ts[0].num_rows
+    monkeypatch.setattr(cf, "_budget_bytes", lambda: int(per_table * 1.5))   # room for one entry
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        for _ in range(3):
+            for t, want in zip(ts, wants):
+                assert_same(query(t).compute(device="cpu"), want)   # uploads evict older entries meanwhile
+    cf.wait_for_uploads(30)
+
+
+def cf_bind(t):
+    from mxframe.pipeline_program import compile_pipeline
+    prog = compile_pipeline([col("d") > lit(20)], [col("v").sum(), (col("v") * col("w")).sum(), col("w").max()], t)
+    return prog.bind_chunks(t)
+
+
+@needs_gpu
+def test_gpu_error_inside_split_is_redone_on_cpu(monkeypatch):
+    cf.clear_residency()
+    t = table(800_000)
+    want = query(t).compute(device="cpu")
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        query(t).compute(device="cpu")
+        cf.wait_for_uploads(30)
+
+        def boom(*a, **k):
+            raise pk.GpuUnsupported("simulated")
+
+        monkeypatch.setattr(pk, "run_pipeline_gpu", boom)
+        assert_same(query(t).compute(device="cpu"), want)
+
+
+@needs_gpu
+def test_sticky_cuda_error_in_split_disables_gpu(monkeypatch):
+    from mxframe import auto_mode as am
+    cf.clear_residency()
+    t = table(800_000)
+    want = query(t).compute(device="cpu")
+    try:
+        with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+            query(t).compute(device="cpu")
+            cf.wait_for_uploads(30)
+
+            def boom(*a, **k):
+                raise RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS")
+
+            monkeypatch.setattr(pk, "run_pipeline_gpu", boom)
+            assert_same(query(t).compute(device="cpu"), want)
+        assert am._gpu_disabled is not None
+    finally:
+        am.forget_gpu_failures()
+
+
+@needs_gpu
+def test_derived_group_keys_do_not_upload():
+    cf.clear_residency()
+    t = table(600_000)
+    q = LazyFrame(t).groupby(col("d").year().alias("y")).agg(col("v").sum().alias("s"))
+    with cf.policy(min_upload_bytes=0):
+        for _ in range(3):
+            q.compute(device="cpu")
+            cf.wait_for_uploads(30)
+    assert cf.resident_count() == 0
+
+
+@needs_gpu
+@pytest.mark.parametrize("threads", ["1", "2", None])
+def test_split_shapes_match_cpu_for_thread_counts(monkeypatch, threads):
+    from mxframe import aot_kernels as ak
+    from mxframe import pipeline_kernels as pkm
+    if threads:
+        monkeypatch.setattr(pkm, "default_threads", lambda: int(threads))
+    cf.clear_residency()
+    t = table(700_000, groups=50)
+    shapes = [
+        lambda: LazyFrame(t).filter(col("d") > lit(20)).groupby().agg(col("v").sum().alias("s"), col("w").max().alias("m")),
+        lambda: LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).filter(col("s") > lit(6000.0)).sort("k"),
+        lambda: LazyFrame(t).filter(col("d") > lit(98)).groupby("k").agg(col("v").sum().alias("s")).sort("k"),
+    ]
+    for make in shapes:
+        want = make().compute(device="cpu")
+        with cf.policy(min_upload_bytes=0, gpu_fraction=0.4):
+            make().compute(device="cpu")
+            cf.wait_for_uploads(30)
+            got = make().compute(device="cpu")
+        assert got.column_names == want.column_names and got.num_rows == want.num_rows
+        for c in got.column_names:
+            np.testing.assert_allclose(np.asarray(got.column(c).to_pylist(), dtype=float),
+                                       np.asarray(want.column(c).to_pylist(), dtype=float), rtol=1e-9)
+
+
+@needs_gpu
+def test_concurrent_callers_on_one_table():
+    import threading
+    cf.clear_residency()
+    t = table(1_000_000)
+    want = query(t).compute(device="cpu")
+    errors = []
+
+    def worker():
+        try:
+            with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+                for _ in range(5):
+                    assert_same(query(t).compute(device="cpu"), want)
+        except BaseException as e:
+            errors.append(e)
+
+    ts = [threading.Thread(target=worker) for _ in range(4)]
+    [x.start() for x in ts]
+    [x.join() for x in ts]
+    cf.wait_for_uploads(30)
+    assert not errors, errors[0]
+
+
+@needs_gpu
+def test_profile_reports_both_devices_busy():
+    cf.clear_residency()
+    t = table()
+    lf = query(t)
+    lf.compute(device="auto", gpu_fraction=0.5)      # host data: cpu + background upload (above 64 MB? no: small)
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        lf.compute(device="cpu")
+        cf.wait_for_uploads(30)
+    lf.compute(device="auto", gpu_fraction=0.5, profile=True)
+    d = lf.last_auto_decision
+    assert d.coproc is not None and d.coproc["cpu_ms"] > 0 and d.coproc["gpu_ms"] > 0
+    assert "co-processing" in d.explain()
