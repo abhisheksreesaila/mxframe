@@ -7,10 +7,12 @@ columns are compared with a relative tolerance and the largest relative error is
 verdict:
   ok     every float within `rtol`
   drift  floats off by more than `rtol` but at most `drift_limit` = 1e-2 (float32 accumulation drift)
-  wrong  different row count / keys / exact columns, or float error above `drift_limit`
+  wrong  different row count / keys / exact columns, float error above `drift_limit`, or rows
+         not in the query's ORDER BY order (`order_by`, checked after the values match)
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
@@ -61,7 +63,50 @@ def _rel_err(a: np.ndarray, e: np.ndarray) -> np.ndarray:
 
 
 def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
-                   drift_limit: float = 1e-2, topn_metric: int | None = None) -> Comparison:
+                   drift_limit: float = 1e-2, topn_metric: int | None = None,
+                   order_by: list[tuple[int, bool]] | None = None) -> Comparison:
+    """`order_by` = [(column index, descending)] of the query's ORDER BY (positional, like every
+    other column here). After the values match, `actual` must be sorted by those keys."""
+    res = _compare_values(actual, expected, rtol=rtol, drift_limit=drift_limit,
+                          topn_metric=topn_metric)
+    if res.verdict == "wrong" or not order_by or actual.num_rows < 2:
+        return res
+    bad = check_order(actual, order_by, rtol)
+    if bad is not None:
+        return Comparison("wrong", res.max_rel_err, f"ORDER BY violated at result row {bad}")
+    return res
+
+
+def check_order(tbl: pa.Table, order_by: list[tuple[int, bool]], rtol: float = 1e-6) -> int | None:
+    """Index of the first row that breaks the ORDER BY sequence, or None. Float keys that agree
+    within `rtol` count as tied (the next key decides), like DuckDB's exact ties after float noise."""
+    n = tbl.num_rows
+    cols = []
+    for i, desc in order_by:
+        c = tbl.column(i)
+        cols.append((_floats(c) if _is_float(c.type) else c.to_pylist(), _is_float(c.type), desc))
+    for r in range(1, n):
+        for vals, is_f, desc in cols:
+            a, b = vals[r - 1], vals[r]
+            if is_f:
+                if a == b or abs(a - b) <= rtol * max(abs(a), abs(b), 1e-30) or (a != a and b != b):
+                    continue
+                cmp = -1 if a < b else 1
+            else:
+                if a == b:
+                    continue
+                if a is None or b is None:                # NULLs sort last
+                    cmp = 1 if a is None else -1
+                else:
+                    cmp = -1 if a < b else 1
+            if (cmp > 0) != desc:
+                return r
+            break
+    return None
+
+
+def _compare_values(actual: pa.Table, expected: pa.Table, *, rtol: float, drift_limit: float,
+                    topn_metric: int | None) -> Comparison:
     if actual.num_columns != expected.num_columns:
         return Comparison("wrong", float("inf"),
                           f"column count {actual.num_columns} != {expected.num_columns}")
@@ -88,8 +133,10 @@ def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
         missing = len(set(ke) - set(ka))
         return Comparison("wrong", float("inf"),
                           f"key columns differ ({missing} expected keys missing)")
-    oa = sorted(range(n), key=lambda i: _sort_key(ka[i]))
-    oe = sorted(range(n), key=lambda i: _sort_key(ke[i]))
+    fa = [_floats(actual.column(i)) for i in float_idx]
+    fe = [_floats(expected.column(i)) for i in float_idx]
+    oa = sorted(range(n), key=lambda i: (_sort_key(ka[i]), tuple(f[i] for f in fa)))
+    oe = sorted(range(n), key=lambda i: (_sort_key(ke[i]), tuple(f[i] for f in fe)))
     return _finish(actual, expected, oa, oe, float_idx, rtol, drift_limit)
 
 
@@ -109,8 +156,20 @@ def _finish(actual, expected, oa, oe, float_idx, rtol, drift_limit) -> Compariso
     return Comparison("wrong", worst, f"max relative error {worst:.2e}")
 
 
+def _group(keys: list[tuple], metric: np.ndarray) -> dict[tuple, list[int]]:
+    """key -> row indices, best metric first (duplicate keys pair up in that order)."""
+    g: dict[tuple, list[int]] = defaultdict(list)
+    for i in sorted(range(len(keys)), key=lambda i: -metric[i]):
+        g[keys[i]].append(i)
+    return g
+
+
 def _compare_topn(actual, expected, ka, ke, float_idx, key_idx, metric, rtol, drift_limit):
-    """LIMIT-N queries: rows tied at the cutoff may legitimately differ between engines."""
+    """LIMIT-N queries: rows tied at the cutoff may legitimately differ between engines.
+
+    The tie band is the set of rows whose metric equals the cutoff within the float noise seen
+    (`rtol`, or the largest metric error if bigger); every row above it must be present, and
+    every row of the result above it must be expected. Inside the band any row is accepted."""
     a_m = _floats(actual.column(metric))
     e_m = _floats(expected.column(metric))
     sa = np.argsort(-a_m, kind="stable")
@@ -120,18 +179,21 @@ def _compare_topn(actual, expected, ka, ke, float_idx, key_idx, metric, rtol, dr
         return Comparison("wrong", worst, f"top-N metric differs, max relative error {worst:.2e}")
 
     cutoff = float(e_m.min())
-    slack = abs(cutoff) * max(drift_limit, 1e-9)
-    e_rows = {ke[i]: i for i in range(len(ke))}
-    a_rows = {ka[i]: i for i in range(len(ka))}
-    for k, i in e_rows.items():
-        if e_m[i] - cutoff > slack and k not in a_rows:
+    slack = abs(cutoff) * max(rtol, worst)
+    e_rows = _group(ke, e_m)
+    a_rows = _group(ka, a_m)
+    for k, idx in e_rows.items():
+        above = sum(1 for i in idx if e_m[i] - cutoff > slack)
+        if above > len(a_rows.get(k, ())):
             return Comparison("wrong", worst, f"row {k} missing from result (above the cutoff)")
-    for k, i in a_rows.items():
-        if a_m[i] - cutoff > slack and k not in e_rows:
+    for k, idx in a_rows.items():
+        above = sum(1 for i in idx if a_m[i] - cutoff > slack)
+        if above > len(e_rows.get(k, ())):
             return Comparison("wrong", worst, f"unexpected row {k} (above the cutoff)")
 
-    # other float columns on rows both sides share
-    shared = [(a_rows[k], e_rows[k]) for k in e_rows if k in a_rows]
+    # other float columns on rows both sides share (duplicate keys pair best-metric first)
+    shared = [(a_rows[k][j], e_rows[k][j]) for k in e_rows if k in a_rows
+              for j in range(min(len(a_rows[k]), len(e_rows[k])))]
     for c in float_idx:
         if c == metric or not shared:
             continue

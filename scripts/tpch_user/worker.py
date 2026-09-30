@@ -4,8 +4,8 @@ Reports (as `@@RESULT {json}` lines on stdout):
   import_ms  time to import the engine (+ pyarrow.parquet where a reader needs it); NOT in the headline
   first_ms   HEADLINE: Parquet read + query + materialized result, first thing this process does
   repeat_ms  the same read+query again in the same process (secondary; warm caches / JIT)
-The first result is written (canonical column names/order) to --result as Parquet so the
-parent can compare it with the DuckDB reference.
+The first result is written (canonical column names/order) to --result as Parquet, the repeat
+result to --result + ".repeat", so the parent can compare both with the DuckDB reference.
 """
 from __future__ import annotations
 
@@ -83,7 +83,10 @@ def main() -> None:
             try:
                 t0 = time.perf_counter()
                 res = mod.run(a.query, a.data_dir, device)
-                emit({"repeat_ms": (time.perf_counter() - t0) * 1000.0})
+                repeat_ms = (time.perf_counter() - t0) * 1000.0
+                # verified by the parent like the first result (written outside the clock)
+                pq.write_table(canonicalize(mod.to_arrow(res), spec.OUTPUT[a.query]), a.result + ".repeat")
+                emit({"repeat_ms": repeat_ms, "repeat_written": True})
             except BaseException as e:  # noqa: BLE001
                 emit({"repeat_ms": None, "repeat_note": f"repeat failed: {type(e).__name__}: {str(e)[:200]}"})
         else:

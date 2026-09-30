@@ -40,7 +40,7 @@ def q2(t):
     mn = m.groupby("ps_partkey")["ps_supplycost"].min().rename("min_supplycost").reset_index()
     r = m.merge(mn, on="ps_partkey")
     r = r[r.ps_supplycost == r.min_supplycost]
-    return (r[S.OUTPUT[2]].sort_values(["s_acctbal", "s_name"], ascending=[False, True])
+    return (r[S.OUTPUT[2]].sort_values(["s_acctbal", "s_name", "ps_partkey"], ascending=[False, True, True])
             .head(100).reset_index(drop=True))
 
 
@@ -53,7 +53,7 @@ def q3(t):
         l, left_on="o_orderkey", right_on="l_orderkey")
     m["revenue"] = m.l_extendedprice * (1.0 - m.l_discount)
     return (m.groupby(["o_orderkey", "o_orderdate", "o_shippriority"], as_index=False)["revenue"].sum()
-            .sort_values(["revenue", "o_orderdate"], ascending=[False, True]).head(10)
+            .sort_values(["revenue", "o_orderdate", "o_orderkey"], ascending=[False, True, True]).head(10)
             .reset_index(drop=True))
 
 
@@ -138,7 +138,7 @@ def q10(t):
           .merge(n, left_on="c_nationkey", right_on="n_nationkey"))
     m["revenue"] = m.l_extendedprice * (1.0 - m.l_discount)
     return (m.groupby(["o_custkey", "n_name"], as_index=False)["revenue"].sum()
-            .sort_values("revenue", ascending=False).head(20).reset_index(drop=True))
+            .sort_values(["revenue", "o_custkey"], ascending=[False, True]).head(20).reset_index(drop=True))
 
 
 def q11(t):
@@ -170,7 +170,7 @@ def q13(t):
         columns={"o_orderkey": "c_count"})
     return (cc.groupby("c_count", as_index=False)["c_custkey"].count()
             .rename(columns={"c_custkey": "custdist"})
-            .sort_values("custdist", ascending=False).reset_index(drop=True))
+            .sort_values(["custdist", "c_count"], ascending=[False, False]).reset_index(drop=True))
 
 
 def q14(t):
@@ -201,7 +201,8 @@ def q16(t):
     j = j[~j.ps_suppkey.isin(bad)]
     d = j[["p_brand", "p_type", "p_size", "ps_suppkey"]].drop_duplicates()
     return (d.groupby(["p_brand", "p_type", "p_size"]).size().reset_index(name="supplier_cnt")
-            .sort_values("supplier_cnt", ascending=False).reset_index(drop=True))
+            .sort_values(["supplier_cnt", "p_brand", "p_type", "p_size"], ascending=[False, True, True, True])
+            .reset_index(drop=True))
 
 
 def q17(t):
@@ -222,7 +223,7 @@ def q18(t):
            .merge(c, left_on="o_custkey", right_on="c_custkey"))
     return (m.groupby(["o_custkey", "l_orderkey"], as_index=False)["l_quantity"].sum()
             .rename(columns={"l_quantity": "sum_qty"})
-            .sort_values("sum_qty", ascending=False).head(100).reset_index(drop=True))
+            .sort_values(["sum_qty", "l_orderkey"], ascending=[False, True]).head(100).reset_index(drop=True))
 
 
 def q19(t):
@@ -241,7 +242,7 @@ def q19(t):
 
 def q20(t):
     p, s, ps, l = t["part"], t["supplier"], t["partsupp"], t["lineitem"]
-    forest = p.loc[p.p_name.str.contains("forest", regex=False), "p_partkey"]
+    forest = p.loc[p.p_name.str.startswith("forest"), "p_partkey"]
     lf = l[(l.l_shipdate >= S.Q20_LO) & (l.l_shipdate < S.Q20_HI) & l.l_partkey.isin(forest)]
     q = lf.groupby(["l_partkey", "l_suppkey"], as_index=False)["l_quantity"].sum().rename(
         columns={"l_quantity": "sum_qty"})

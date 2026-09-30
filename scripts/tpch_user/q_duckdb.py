@@ -142,7 +142,7 @@ WHERE (p_brand = 'Brand#12' AND p_container IN ({', '.join(repr(c) for c in S.CO
    OR (p_brand = 'Brand#34' AND p_container IN ({', '.join(repr(c) for c in S.CONTAINERS_LG)})
        AND l_quantity >= 20 AND l_quantity <= 30 AND p_size BETWEEN 1 AND 15)""",
     20: f"""
-WITH forest AS (SELECT p_partkey FROM part WHERE p_name LIKE '%forest%'),
+WITH forest AS (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%'),
 q AS (SELECT l_partkey, l_suppkey, sum(l_quantity::DOUBLE) AS sq FROM lineitem
       WHERE l_shipdate >= {S.Q20_LO} AND l_shipdate < {S.Q20_HI}
         AND l_partkey IN (SELECT p_partkey FROM forest) GROUP BY 1, 2),

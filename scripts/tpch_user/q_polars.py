@@ -39,7 +39,7 @@ def q2(t):
            .join(tgt, left_on="ps_partkey", right_on="p_partkey"))
     mn = m.group_by("ps_partkey").agg(pl.col("ps_supplycost").min().alias("min_supplycost"))
     return (m.join(mn, on="ps_partkey").filter(pl.col("ps_supplycost") == pl.col("min_supplycost"))
-            .select(S.OUTPUT[2]).sort(["s_acctbal", "s_name"], descending=[True, False]).head(100))
+            .select(S.OUTPUT[2]).sort(["s_acctbal", "s_name", "ps_partkey"], descending=[True, False, False]).head(100))
 
 
 def q3(t):
@@ -50,7 +50,7 @@ def q3(t):
             .join(l, left_on="o_orderkey", right_on="l_orderkey")
             .group_by("o_orderkey", "o_orderdate", "o_shippriority")
             .agg(_rev().sum().alias("revenue"))
-            .sort(["revenue", "o_orderdate"], descending=[True, False]).head(10))
+            .sort(["revenue", "o_orderdate", "o_orderkey"], descending=[True, False, False]).head(10))
 
 
 def q4(t):
@@ -133,7 +133,7 @@ def q10(t):
             .join(t["customer"], left_on="o_custkey", right_on="c_custkey")
             .join(t["nation"], left_on="c_nationkey", right_on="n_nationkey")
             .group_by("o_custkey", "n_name").agg(_rev().sum().alias("revenue"))
-            .sort("revenue", descending=True).head(20))
+            .sort(["revenue", "o_custkey"], descending=[True, False]).head(20))
 
 
 def q11(t):
@@ -190,7 +190,7 @@ def q16(t):
             .join(bad, left_on="ps_suppkey", right_on="s_suppkey", how="anti")
             .group_by("p_brand", "p_type", "p_size")
             .agg(pl.col("ps_suppkey").n_unique().alias("supplier_cnt"))
-            .sort("supplier_cnt", descending=True))
+            .sort(["supplier_cnt", "p_brand", "p_type", "p_size"], descending=[True, False, False, False]))
 
 
 def q17(t):
@@ -208,7 +208,7 @@ def q18(t):
             .join(t["orders"], left_on="l_orderkey", right_on="o_orderkey")
             .join(t["customer"], left_on="o_custkey", right_on="c_custkey")
             .group_by("o_custkey", "l_orderkey").agg(pl.col("l_quantity").sum().alias("sum_qty"))
-            .sort("sum_qty", descending=True).head(100))
+            .sort(["sum_qty", "l_orderkey"], descending=[True, False]).head(100))
 
 
 def q19(t):
@@ -223,7 +223,7 @@ def q19(t):
 
 
 def q20(t):
-    forest = t["part"].filter(pl.col("p_name").str.contains("forest", literal=True)).select("p_partkey")
+    forest = t["part"].filter(pl.col("p_name").str.starts_with("forest")).select("p_partkey")
     q = (t["lineitem"].filter((pl.col("l_shipdate") >= S.Q20_LO) & (pl.col("l_shipdate") < S.Q20_HI))
          .join(forest, left_on="l_partkey", right_on="p_partkey", how="semi")
          .group_by("l_partkey", "l_suppkey").agg(pl.col("l_quantity").sum().alias("sum_qty")))

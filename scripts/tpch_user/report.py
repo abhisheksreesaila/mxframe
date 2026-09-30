@@ -1,28 +1,38 @@
-"""Markdown + CSV output for the user-felt scoreboard (pure formatting, no engines)."""
+"""Markdown + CSV output for the user-felt scoreboard (pure formatting, no engines).
+
+The CSV is the source of truth: the driver appends one row per measurement as soon as it is
+made, and the markdown is rendered from the CSV at the end (or with --report-only).
+"""
 from __future__ import annotations
 
 import csv
-import datetime
+import glob
 import os
 import statistics
 import subprocess
+import sys
 from importlib import metadata
 from pathlib import Path
 
 from . import spec
 
 CSV_FIELDS = ["engine", "sf", "query", "import_ms", "first_ms", "repeat_ms", "rows", "correct",
-              "max_rel_err", "verdict", "error", "notes"]
+              "max_rel_err", "verdict", "repeat_verdict", "load1", "error", "repeat_note",
+              "compare_note"]
+_FLOATS = ("import_ms", "first_ms", "repeat_ms", "max_rel_err", "load1")
 MX = ["mx-cpu", "mx-gpu", "mx-auto"]
+ENGINE_ORDER = ["pandas", "polars", "duckdb", "mx-cpu", "mx-gpu", "mx-auto"]
 NAMES = {"pandas": "pandas", "polars": "Polars", "duckdb": "DuckDB", "mx-cpu": "mx-cpu",
          "mx-gpu": "mx-gpu", "mx-auto": "mx-auto"}
+VALID = ("ok", "drift", "ref")     # results that may count as fastest / as a win
 
 
 # ------------------------------------------------------------------ helpers (pure) -----------
 def is_valid(rec: dict | None) -> bool:
-    """Has a headline time and is not WRONG (a wrong answer cannot win)."""
-    return bool(rec) and "error" not in rec and rec.get("first_ms") is not None \
-        and rec.get("verdict") != "wrong"
+    """Has a headline time and a result verified against DuckDB (ok / drift / the reference
+    itself). WRONG, errored and UNCHECKED (reference failed) results can never win."""
+    return bool(rec) and not rec.get("error") and rec.get("first_ms") is not None \
+        and rec.get("verdict") in VALID
 
 
 def fmt_ms(ms: float | None) -> str:
@@ -43,19 +53,43 @@ def _short_error(err: str) -> str:
     return "ERR"
 
 
-def fmt_cell(rec: dict | None, fastest: bool = False) -> str:
+def _mark(ms: float | None, verdict: str | None, err: float | None = None) -> str:
+    text = fmt_ms(ms)
+    if verdict == "wrong":
+        return f"{text} WRONG"
+    if verdict in ("unchecked", None, ""):
+        return f"{text} ?"
+    if verdict == "drift" and err is not None:
+        return text + f" †{err:.0e}".replace("e-0", "e-")
+    return text
+
+
+def fmt_cell(rec: dict | None, fastest: bool = False, key: str = "first_ms") -> str:
     if rec is None:
         return "n/a"
-    if "error" in rec:
+    if rec.get("error"):
         return _short_error(rec["error"])
-    ms = fmt_ms(rec.get("first_ms"))
-    v = rec.get("verdict")
-    if v == "wrong":
-        return f"{ms} WRONG"
-    text = ms
-    if v == "drift":
-        text += f" †{rec['max_rel_err']:.0e}".replace("e-0", "e-")
+    text = _mark(rec.get(key), rec.get("verdict"), rec.get("max_rel_err"))
     return f"**{text}**" if fastest else text
+
+
+def fmt_sum_cell(rec: dict | None) -> str:
+    """import + first."""
+    if rec is None:
+        return "n/a"
+    if rec.get("error"):
+        return _short_error(rec["error"])
+    tot = None if rec.get("first_ms") is None else (rec.get("import_ms") or 0.0) + rec["first_ms"]
+    return _mark(tot, rec.get("verdict"), rec.get("max_rel_err"))
+
+
+def fmt_repeat_cell(rec: dict | None) -> str:
+    if rec is None or rec.get("error") or rec.get("repeat_ms") is None:
+        return "-"
+    v = rec.get("repeat_verdict")
+    if v in ("ok", "drift"):
+        return fmt_ms(rec["repeat_ms"])
+    return _mark(rec["repeat_ms"], v if v else "unchecked")
 
 
 def win_counts(rows: list[dict], sf: str, queries: list[int], a: str, b: str) -> tuple[int, int]:
@@ -87,15 +121,31 @@ def losses_vs(rows: list[dict], sf: str, queries: list[int], mx_engines: list[st
     return sorted(out, reverse=True)[:top]
 
 
+def totals(by: dict, engines: list[str], queries: list[int], with_import: bool = False) -> dict:
+    """Sum of times over the queries where EVERY engine in the table has a valid result."""
+    qs = [q for q in queries if all(is_valid(by.get((e, q))) for e in engines)]
+    return {e: sum(by[(e, q)]["first_ms"] + (by[(e, q)].get("import_ms") or 0.0 if with_import else 0.0)
+                   for q in qs) for e in engines}, len(qs)
+
+
 # ------------------------------------------------------------------ CSV -----------------------
-def write_csv(rows: list[dict], path: Path) -> None:
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        w.writeheader()
-        for r in sorted(rows, key=lambda r: (float(r["sf"]), r["query"], r["engine"])):
-            notes = "; ".join(str(r[k]) for k in ("repeat_note", "compare_note") if r.get(k))
-            w.writerow({**{k: r.get(k) for k in CSV_FIELDS}, "notes": notes,
-                        "error": r.get("error", "")})
+def new_row(rec: dict) -> dict:
+    return {k: rec.get(k) for k in CSV_FIELDS}
+
+
+def read_csv(path: Path) -> list[dict]:
+    rows = []
+    with open(path, newline="") as f:
+        for r in csv.DictReader(f):
+            for k in _FLOATS:
+                r[k] = float(r[k]) if r.get(k) not in (None, "") else None
+            r["query"] = int(r["query"])
+            r["rows"] = int(float(r["rows"])) if r.get("rows") not in (None, "") else None
+            r["correct"] = {"True": True, "False": False}.get(r.get("correct"))
+            for k in ("error", "repeat_note", "compare_note", "repeat_verdict"):
+                r[k] = r.get(k) or ""
+            rows.append(r)
+    return rows
 
 
 # ------------------------------------------------------------------ environment ----------------
@@ -103,7 +153,12 @@ def _ver(pkg: str) -> str:
     try:
         return metadata.version(pkg)
     except metadata.PackageNotFoundError:
-        return "?"
+        pass
+    # conda packages without pip metadata (MAX, Mojo): read the conda-meta record
+    hits = sorted(glob.glob(os.path.join(sys.prefix, "conda-meta", f"{pkg}-[0-9]*.json")))
+    if hits:
+        return os.path.basename(hits[-1])[len(pkg) + 1:].rsplit("-", 2)[0]
+    return "?"
 
 
 def _run(cmd: list[str]) -> str:
@@ -113,7 +168,7 @@ def _run(cmd: list[str]) -> str:
         return ""
 
 
-def environment_info(args, data_root, elapsed_s: float) -> dict:
+def environment_info(args, data_root, elapsed_s: float, gpu_desc: str = "") -> dict:
     from .runner import REPO_ROOT
     gpu_name = _run(["nvidia-smi", f"--id={args.gpu}", "--query-gpu=name,driver_version,memory.total",
                      "--format=csv,noheader"]) or "unknown"
@@ -127,10 +182,10 @@ def environment_info(args, data_root, elapsed_s: float) -> dict:
         pass
     return {
         "date": args.date, "cores": os.cpu_count(), "cpu": cpu, "gpu": gpu_name,
-        "gpu_index": args.gpu, "timeout": args.timeout, "elapsed_min": elapsed_s / 60.0,
-        "data_root": str(data_root),
+        "gpu_desc": gpu_desc or f"index {args.gpu}", "timeout": args.timeout,
+        "elapsed_min": elapsed_s / 60.0, "data_root": str(data_root),
         "git": _run(["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"]),
-        "versions": {p: _ver(p) for p in ("pandas", "polars", "duckdb", "pyarrow", "max")},
+        "versions": {p: _ver(p) for p in ("pandas", "polars", "duckdb", "pyarrow", "numpy", "max", "mojo")},
         "loadavg": " ".join(f"{x:.1f}" for x in os.getloadavg()),
     }
 
@@ -142,20 +197,28 @@ def _table(header: list[str], body: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
+def _outside_flag(q: int) -> str:
+    return "PyArrow/NumPy" if q in spec.OUTSIDE_MX else "-"
+
+
 def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: list[int],
                     sfs: list[str]) -> str:
     L: list[str] = []
     a = L.append
     v = meta["versions"]
+    mx_shown = any(e in engines for e in MX)
     a(f"# User-felt TPC-H scoreboard - {meta['date']}\n")
     a("**Headline = what a user feels:** a fresh Python process, data starting as Parquet on disk, "
       "the clock around *Parquet read + query + materialized result*. No warm-up. "
-      "`import` time is reported separately and is not in the headline. "
-      "Numbers are milliseconds; **bold** = fastest correct engine for that query.\n")
+      "`import` time is reported separately (and summed in the \"import + first\" tables). "
+      "Numbers are milliseconds; **bold** = fastest verified engine for that query.\n")
     a("Legend: `†` float32 accumulation drift (result within 1e-2 relative of DuckDB, error shown but outside the strict "
-      "1e-6 check), `WRONG` = differs from DuckDB (rows/keys or relative error above 1e-2; excluded from "
-      "\"fastest\" and from win counts), `TIMEOUT` / `CRASH` / `ERR` = did not produce a result "
-      f"(timeout {meta['timeout']:.0f}s per subprocess).\n")
+      "1e-6 check), `WRONG` = differs from DuckDB (rows/keys, relative error above 1e-2, or rows not in the query's "
+      "ORDER BY order), `?` = **unchecked** (the DuckDB reference failed for that query, so the result was not "
+      "verified; it never counts as fastest or as a win), `TIMEOUT` / `CRASH` / `ERR` = did not produce a result "
+      f"(timeout {meta['timeout']:.0f}s per subprocess). `outside mx` = the mx engines do part of that query with "
+      "PyArrow/NumPy because the LazyFrame API cannot express it (details under Query semantics); every other "
+      "mx query is pure mxframe.\n")
 
     for sf in sfs:
         srows = [r for r in rows if r["sf"] == sf]
@@ -170,12 +233,17 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
             best = min(valid)[1] if valid else None
             if best:
                 fastest_count[best] += 1
-            body.append([f"Q{q} {spec.TITLES[q]}"] + [fmt_cell(by.get((e, q)), fastest=(e == best))
-                                                        for e in engines])
-        a(_table(["query"] + [NAMES[e] for e in engines], body))
-        a("\nFastest engine per query: " + ", ".join(f"{NAMES[e]} {n}" for e, n in fastest_count.items()) + ".\n")
+            body.append([f"Q{q} {spec.TITLES[q]}"]
+                        + [fmt_cell(by.get((e, q)), fastest=(e == best)) for e in engines]
+                        + ([_outside_flag(q)] if mx_shown else []))
+        tot, nq = totals(by, engines, queries)
+        body.append([f"**sum over the {nq} queries valid for every engine**"]
+                    + [f"**{fmt_ms(tot[e])}**" for e in engines] + (["" ] if mx_shown else []))
+        a(_table(["query"] + [NAMES[e] for e in engines] + (["outside mx"] if mx_shown else []), body))
+        a("\nFastest verified engine per query: "
+          + ", ".join(f"{NAMES[e]} {n}" for e, n in fastest_count.items()) + ".\n")
 
-        a(f"### Wins at SF{sf} (headline, both results correct)\n")
+        a(f"### Wins at SF{sf} (headline, both results verified)\n")
         n = len(queries)
         for m in [e for e in MX if e in engines]:
             parts = []
@@ -186,24 +254,34 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
             a("- " + "; ".join(parts))
         a("")
 
-        if any(e in engines for e in MX) and "polars" in engines:
+        if mx_shown and "polars" in engines:
             for label, mxs in (("mx-auto", ["mx-auto"]), ("best of mx-cpu / mx-gpu / mx-auto", MX)):
                 mxs = [e for e in mxs if e in engines]
                 lost = losses_vs(rows, sf, queries, mxs)
-                if lost:
+                if lost and (label == "mx-auto" or len(mxs) > 1):
                     a(f"### Where {label} loses to Polars at SF{sf} (worst first)\n")
                     a(_table(["query", "engine", "MXFrame ms", "Polars ms", "slower by"],
                              [[f"Q{q} {spec.TITLES[q]}", e, fmt_ms(m), fmt_ms(p), f"{r:.1f}x"]
                               for r, q, e, m, p in lost]))
                     a("")
 
-        a(f"### SF{sf}: repeat run in the same process, ms (secondary: warm caches / JIT / result caches)\n")
+        a(f"### SF{sf}: import + first run, ms (headline + engine import time)\n")
         body = []
         for q in queries:
-            body.append([f"Q{q}"] + [fmt_ms(by[(e, q)].get("repeat_ms")) if by.get((e, q)) and "error" not in by[(e, q)]
-                                     else "-" for e in engines])
+            body.append([f"Q{q}"] + [fmt_sum_cell(by.get((e, q))) for e in engines])
+        tot, nq = totals(by, engines, queries, with_import=True)
+        body.append([f"**sum ({nq} queries)**"] + [f"**{fmt_ms(tot[e])}**" for e in engines])
         a(_table(["query"] + [NAMES[e] for e in engines], body))
-        a("\n> Module-level result caches in `custom_ops.py` make the mx repeat numbers unrealistically "
+        if mx_shown:
+            a("\n> `import mxframe` starts a background thread that warms the CPU kernel libraries while "
+              "the user's code runs. Its cost is in neither `import` (it returns immediately) nor the headline "
+              "unless it contends with the query for cores; the other engines have no equivalent.\n")
+
+        a(f"### SF{sf}: repeat run in the same process, ms (secondary: warm caches / JIT / result caches)\n")
+        body = [[f"Q{q}"] + [fmt_repeat_cell(by.get((e, q))) for e in engines] for q in queries]
+        a(_table(["query"] + [NAMES[e] for e in engines], body))
+        a("\n> The repeat result is verified against DuckDB like the first one (`WRONG`/`?` marks as above). "
+          "Module-level result caches in `custom_ops.py` make the mx repeat numbers unrealistically "
           "fast; that is why the headline is a fresh process.\n")
 
         a(f"### SF{sf}: import time, ms (median over queries; not in the headline)\n")
@@ -214,12 +292,16 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a(_table([""] + [NAMES[e] for e in engines], [["import"] + imp]))
         a("")
 
-        bad = [r for r in srows if r["engine"] != "duckdb" and (r.get("verdict") in ("wrong", "drift") or "error" in r)]
+        bad = [r for r in srows if r["engine"] != "duckdb"
+               and (r.get("verdict") in ("wrong", "drift", "unchecked") or r.get("repeat_verdict") == "wrong"
+                    or r.get("error"))]
         if bad:
             a(f"### SF{sf}: correctness against DuckDB and failures\n")
             body = []
             for r in sorted(bad, key=lambda r: (r["query"], r["engine"])):
                 what = r.get("error") or r.get("compare_note") or ""
+                if r.get("repeat_verdict") == "wrong":
+                    what = (what + " | repeat run WRONG").strip(" |")
                 mre = r.get("max_rel_err")
                 body.append([f"Q{r['query']}", r["engine"], r["verdict"],
                              "-" if mre is None else ("inf" if mre == float("inf") else f"{mre:.2e}"),
@@ -236,34 +318,43 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
             a("Largest relative error vs DuckDB (over all queries where rows/keys matched): "
               + ", ".join(f"{NAMES[e]} {x:.1e}" for e, x in worst.items()) + ".\n")
 
+    loads = [r["load1"] for r in rows if r.get("load1") is not None]
+    load_txt = (f"1-minute load average at measurement time: median {statistics.median(loads):.1f}, "
+                f"max {max(loads):.1f} over {len(loads)} runs; " if loads else "")
     a("\n## Methodology\n")
     a("- **One subprocess per (engine, query, scale factor)**; the worker imports the engine "
       "(timed as `import_ms`), then runs read+query+materialize once (`first_ms`, the headline) and "
       "once more in the same process (`repeat_ms`).")
     a("- **Data**: DuckDB `dbgen` Parquet (dates as int32 days since epoch, decimals as float32), read "
       "from the OS page cache (files are read once before each scale factor so no engine pays a cold disk).")
-    a("- **Column pruning**: every engine reads only the columns its query uses. Polars (`scan_parquet`) and "
-      "DuckDB prune automatically; pandas gets `pd.read_parquet(columns=...)`; MXFrame gets "
-      "`mx.read_parquet_table(columns=..., dictionary=\"auto\")` (the `scan_parquet` reader, eager) through one helper "
-      "(`scripts/tpch_user/readers.py::mx_read`); tables the harness itself touches with PyArrow string kernels "
-      "are read with `dictionary=False`.")
+    a("- **Column pruning**: nobody passes a column list. Polars (`scan_parquet`), DuckDB "
+      "and MXFrame (`mx.scan_parquet`, one lazy scan per table; low-cardinality strings are read as "
+      "dictionaries) prune to the columns each query references; pandas uses "
+      "`pd.read_parquet(columns=...)` with the columns the query uses (it has no lazy reader).")
     a("- **Engines**: pandas (eager), Polars (lazy `scan_parquet` + `collect()`), DuckDB "
       "(SQL over `read_parquet`, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` "
-      "through the public `LazyFrame` API (plus PyArrow where the LazyFrame layer cannot express a step).")
+      "through the public `LazyFrame` API; multi-stage queries `.compute()` a small intermediate and wrap it "
+      "with `mx.LazyFrame(table)`. Work the API cannot express is done with PyArrow/NumPy inside the timed "
+      "region and listed per query below.")
     a("- **Correctness**: each result is compared with DuckDB (row count; integer/string columns exactly; "
-      "float columns at 1e-6 relative, sorted by key columns; LIMIT queries tolerate ties at the cutoff). "
-      "inputs are float32; an engine that accumulates in float32 "
-      "drifts on large sums (`†`), DuckDB sums in double.")
+      "float columns at 1e-6 relative, matched by key columns; LIMIT queries tolerate rows that tie at the "
+      "cutoff within 1e-6) and then checked to be in the query's ORDER BY order. Inputs are float32; an "
+      "engine that accumulates in float32 drifts on large sums (`†`), DuckDB sums in double.")
     a(f"- **Hardware**: {meta['cpu']} ({meta['cores']} cores); GPU: {meta['gpu']} "
-      f"(`CUDA_VISIBLE_DEVICES={meta['gpu_index']}`). **The machine was shared with other jobs during this run "
-      f"(load average at report time: {meta['loadavg']}), so timings are indicative.**")
+      f"({meta['gpu_desc']}; the workers get `CUDA_VISIBLE_DEVICES=<that UUID>`, so it is the same "
+      f"card nvidia-smi calls by that index). **The machine was shared with other jobs during this run "
+      f"({load_txt}load average at report time: {meta['loadavg']}), so timings are indicative.**")
     a(f"- **Versions**: " + ", ".join(f"{k} {x}" for k, x in v.items()) + f"; mxframe at git `{meta['git']}`. "
-      f"Run took {meta['elapsed_min']:.0f} min. Data root: `{meta['data_root']}`.")
+      f"Last invocation took {meta['elapsed_min']:.0f} min. Data root: `{meta['data_root']}`.")
     a("\n### Query semantics\n")
     a("All engines and the DuckDB reference compute the same query. Where it differs from the official "
-      "TPC-H text (the mxframe implementations are simplified) the difference is listed here; this is "
-      "not a TPC-certified benchmark.\n")
+      "TPC-H text the difference is listed here; this is not a TPC-certified benchmark.\n")
     for q, text in sorted(spec.DEVIATIONS.items()):
+        a(f"- Q{q}: {text}")
+    a("")
+    a("**Work the mx engines do outside mxframe** (PyArrow / NumPy inside the timed region; all other "
+      "queries are pure mxframe):\n")
+    for q, text in sorted(spec.OUTSIDE_MX.items()):
         a(f"- Q{q}: {text}")
     a("")
     return "\n".join(L) + "\n"

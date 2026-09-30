@@ -135,6 +135,37 @@ OUTPUT: dict[int, list[str]] = {
 # LIMIT-N queries: index (in OUTPUT) of the ORDER BY metric, so boundary ties are tolerated.
 TOPN_METRIC: dict[int, int] = {2: 0, 3: 3, 10: 2, 18: 2, 21: 1}
 
+# The SQL ORDER BY of each query (q_duckdb.py) as (index in OUTPUT, descending); the harness
+# checks that every engine's rows come back in this order. Queries without ORDER BY are absent.
+ORDER_BY: dict[int, list[tuple[int, bool]]] = {
+    1: [(0, False), (1, False)],
+    2: [(0, True), (1, False), (2, False)],
+    3: [(3, True), (1, False), (0, False)],
+    4: [(0, False)],
+    5: [(1, True)],
+    7: [(0, False), (1, False), (2, False)],
+    8: [(0, False)],
+    9: [(0, False), (1, False)],
+    10: [(2, True), (0, False)],
+    11: [(1, True)],
+    12: [(0, False)],
+    13: [(1, True), (0, True)],
+    15: [(0, False)],
+    16: [(3, True), (0, False), (1, False), (2, False)],
+    18: [(2, True), (1, False)],
+    20: [(0, False)],
+    21: [(1, True), (0, False)],
+    22: [(0, False)],
+}
+
+# Work the mx engines do OUTSIDE mxframe (PyArrow / NumPy on the timed path), per query; the
+# report prints it. Queries not listed are pure mxframe (scan_parquet -> LazyFrame -> compute,
+# plus reading a scalar back out of a small computed table). Implemented in q_mx.py.
+OUTSIDE_MX: dict[int, str] = {
+    13: "PyArrow: appends the zero-order customer row (customers minus customers with orders)",
+    22: "PyArrow/NumPy: phone-prefix substring, NOT EXISTS anti-join",
+}
+
 TITLES = {
     1: "filter+groupby+8 aggs", 2: "min-cost supplier", 3: "3-join+top10", 4: "EXISTS semi-join",
     5: "4-join+groupby", 6: "filter+global sum", 7: "volume shipping", 8: "market share",
@@ -145,21 +176,28 @@ TITLES = {
 }
 
 # Where the shared implementation differs from the official TPC-H text (all engines and the
-# DuckDB reference compute the SAME simplified query, so the comparison is apples-to-apples).
+# DuckDB reference compute the SAME query, so the comparison is apples-to-apples). Everything
+# not listed here (Q1, Q3, Q6, Q12, ...) follows the TPC-H text with the standard parameters.
 DEVIATIONS = {
-    2: "no region-name join (nation.regionkey = 3), 'BRASS' matched anywhere in p_type, no tie-break columns",
-    4: "'EXISTS' expressed as commit < receipt semi-join (as in spec)",
-    5: "no supplier-nation = customer-nation condition, no region filter (all nations)",
+    2: "region filter by nation.n_regionkey = 3 (no region-name join); 'BRASS' matched anywhere in p_type "
+       "(TPC-H: suffix); n_name is not in the output; ORDER BY s_acctbal DESC, s_name, ps_partkey "
+       "(TPC-H: s_acctbal DESC, n_name, s_name, p_partkey)",
+    5: "no supplier-nation = customer-nation condition and no region filter (all nations)",
     7: "all nation pairs (no FRANCE/GERMANY filter)",
-    8: "market share by CUSTOMER nation (Brazil, nationkey 2), all order years, customers in region 1",
-    10: "no c_name/c_acctbal/... output columns; groups by (o_custkey, n_name)",
+    8: "market share by CUSTOMER nation (Brazil, nationkey 2), customers in region 1, all order years",
+    9: "ORDER BY nation, o_year ascending (TPC-H: o_year DESC)",
+    10: "no c_name/c_acctbal/... output columns; groups by (o_custkey, n_name); ties on revenue broken by o_custkey",
     11: "Germany = nationkey 7, threshold fraction 0.0001 (not 0.0001/SF)",
+    13: "the `o_comment NOT LIKE '%special%requests%'` predicate is NOT applied (o_comment is not read)",
     14: "returns promo_revenue and total_revenue, not the 100*ratio",
-    15: "top supplier = exact equality with max revenue",
-    17: "no rounding; sum(l_extendedprice)/7",
-    18: "sorted by sum_qty only; no o_totalprice/o_orderdate/c_name columns",
+    16: "supplier filter is `s_comment LIKE '%Complaints%'` (TPC-H: '%Customer%Complaints%')",
+    17: "no rounding; sum(l_extendedprice)/7.0",
+    18: "sorted by sum_qty DESC, l_orderkey; no o_totalprice/o_orderdate/c_name columns",
     19: "no l_shipmode / l_shipinstruct predicates",
-    20: "no partsupp/lineitem correlation on nation join beyond supplier nationkey 3 (Canada)",
-    21: "orders with exactly one late supplier, no 'other supplier on the order' EXISTS",
-    22: "as TPC-H apart from avg over positive balances computed in float32",
+    20: "supplier nation is Canada by nationkey (3), no nation-name join",
+    21: "orders with exactly one late supplier; the 'another supplier on the order' EXISTS is dropped; "
+        "Saudi Arabia by nationkey (20)",
+    22: "the c_acctbal column is float32 in the data, so the average-balance threshold and the sums are "
+        "compared on float32 inputs (DuckDB reference sums them in DOUBLE)",
 }
+
