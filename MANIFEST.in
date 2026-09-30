@@ -11,6 +11,9 @@ include custom_ops.py
 include lazy_expr.py
 include lazy_frame.py
 include optimizer.py
+include pipeline_exec.py
+include pipeline_kernels.py
+include pipeline_program.py
 include plan_validation.py
 include sql_frontend.py
 include kernels.mojopkg
