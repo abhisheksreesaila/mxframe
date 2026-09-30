@@ -206,7 +206,8 @@ def test_join_output_rows_do_not_depend_on_side_order():
     assert a.lines[-1].rows == b.lines[-1].rows == 9000
 
 
-def test_global_agg_copies_the_unfiltered_input():
+def test_global_agg_copies_the_unfiltered_input(monkeypatch):
+    monkeypatch.setattr(am, "KNOWN_BROKEN_GPU", {})
     t = table(10_000)
     est = am.estimate_plan(LazyFrame(t).filter(col("d") > lit(3)).groupby().agg(col("v").sum().alias("s")).plan,
                            Calib(), Gpu())
@@ -266,3 +267,21 @@ def test_only_device_errors_disable_the_gpu():
     assert not am.is_sticky_gpu_error(MemoryError("x"))
     assert not am.is_sticky_gpu_error(RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"))
     assert not am.is_sticky_gpu_error(TypeError("unsupported dtype"))
+
+
+def test_gpu_global_agg_is_blocked_until_verified():
+    t = table(10_000)
+    plan = LazyFrame(t).filter(col("d") > lit(3)).groupby().agg(col("v").sum().alias("s")).plan
+    d = am.choose_device(plan, calib=Calib(cpu=1e4, gpu=0.001, link=1e6), gpu=Gpu())
+    assert d.device == "cpu" and "unusable" in d.reason
+
+
+def test_small_inputs_skip_calibration_entirely(monkeypatch):
+    import mxframe.calibration as cal
+
+    def boom():
+        raise AssertionError("calibration loaded for a tiny query")
+
+    monkeypatch.setattr(cal, "get_calibration", boom)
+    d = am.choose_device(grouped(table(1000)))
+    assert d.device == "cpu" and "small" in d.reason

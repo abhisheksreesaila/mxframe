@@ -319,6 +319,7 @@ class AutoDecision:
 # plan that would run them. Remove an entry once its fix lands (F-012 / F-011).
 KNOWN_BROKEN_GPU = {
     "sort": "GPU sort returns rows out of key order (F-012)",
+    "global_agg": "GPU masked global aggregate returned 2x the CPU result on TPC-H Q6 (F-011)",
 }
 
 _AGG_OP = {"sum": "group_sum", "mean": "group_sum", "count": "group_count",
@@ -445,6 +446,9 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
             # Global aggregates run masked kernels over the unfiltered input.
             nbytes = src * (width + 4)
             cpu = len(ops) * calib.estimate("masked_sum", "cpu", src)
+            if "global_agg" in KNOWN_BROKEN_GPU:
+                est.lines.append(OpCost("global_agg", src, cpu, INF, note=KNOWN_BROKEN_GPU["global_agg"]))
+                return 1, ts, 1
             g = len(ops) * calib.estimate("masked_sum", "gpu", src) + h2d(nbytes)
             est.lines.append(OpCost("global_agg", src, cpu, g, nbytes))
             return 1, ts, 1
@@ -521,8 +525,13 @@ def warn_fallback_once(plan, err: BaseException) -> None:
 
 
 def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
-                  placement: Optional[Dict[str, str]] = None) -> AutoDecision:
+                  placement: Optional[Dict[str, str]] = None, quick: bool = True) -> AutoDecision:
     """Pick cpu or gpu for the whole query (spec Phase 1)."""
+    if quick and calib is None and gpu is None and not placement and prefer != "gpu":
+        rows = _source_rows(plan)
+        if rows < SMALL_QUERY_ROWS:
+            return AutoDecision("cpu", f"small input ({rows:,} rows): gpu start-up and copies cannot pay off",
+                                None)
     if calib is None:
         from .calibration import get_calibration
         calib = get_calibration()
@@ -553,6 +562,17 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         return AutoDecision("cpu", "gpu faster but still starting up", est, init)
     return AutoDecision("cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster",
                         est, init)
+
+
+SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)
+
+
+def _source_rows(plan) -> int:
+    rows, _ = _scan_rows_and_schema(plan)
+    if rows is not None:
+        return rows
+    kids = [getattr(plan, a) for a in ("input", "left", "right") if getattr(plan, a, None) is not None]
+    return sum(_source_rows(k) for k in kids)
 
 
 class _NoGpu:
