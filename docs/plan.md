@@ -220,6 +220,14 @@ Needs: none · Scoreboard reported ~700 ms under load; measured 172 ms idle → 
 - [x] profile `python -X importtime -c "import mxframe"`; defer everything not needed to build a plan (pyarrow.parquet/csv, compute, numpy submodules, calibration, np_arrow) until first use
 - [x] `import mxframe` < 150 ms; the background warm-up still overlaps the rest
 
+## F-020 Remaining SF10 gaps after F-018 [todo]
+Needs: F-018 merged · From the F-018 report (2026-09-30)
+- [ ] Q21 (4.7x Polars at SF10): `dictionary_encode` of int keys in group/distinct encoding is 2.6 s of 4.3 s at SF1 — encode integer keys with a hash/radix kernel instead
+- [ ] Q10 (7.2x): string filters (`l_returnflag == 'R'`) pushed into the Parquet reader (dictionary codes), like the integer filters from F-017
+- [ ] GPU `hash_join` prefix sum is int32 and unguarded (the CPU path now raises MemoryError before overflow) — guard or widen
+- [ ] F-016 fuzz seed 5061 fails on gpu (distinct then aggregate; also on plain auto-mode) — find and fix (float32 GPU sum?)
+- [ ] per-operator GPU placement for large joins (F-007) on top of join_engine's index vectors
+
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
 - [ ] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005)
