@@ -65,6 +65,7 @@ WARP_SIZE = 32
 MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
+RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
 
 # CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
 # float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
@@ -2528,6 +2529,10 @@ class CustomOpsCompiler(GraphCompiler):
                 # Partial sort: np.argpartition + sort of k elements
                 part_idx = np.argpartition(composite_key, k)[:k]
                 sorted_indices = part_idx[np.argsort(composite_key[part_idx], kind='stable')]
+            elif self._aot is not None and N >= RADIX_SORT_MIN_ROWS and N < 2**31 \
+                    and composite_key.dtype in (np.int32, np.int64, np.float32, np.float64):
+                # Parallel stable LSD radix sort (F-012): ~15x np.argsort at 10M rows
+                sorted_indices = self._aot.sort_indices(composite_key)
             else:
                 sorted_indices = np.argsort(composite_key, kind='stable')
             return table.take(_npa(sorted_indices.astype(np.int64)))
