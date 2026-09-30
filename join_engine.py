@@ -75,16 +75,21 @@ def materialize(comp, plan, needed: Optional[Set[str]] = None, dict_ok: bool = T
     if isinstance(plan, Filter):
         return Filter(materialize(comp, plan.input, _union(needed, _cols(plan.predicate)), dict_ok), plan.predicate)
     if isinstance(plan, Project):
+        exprs = list(plan.exprs)
+        named = all(e._alias or e.op == "col" for e in exprs)      # unnamed expressions are named by position
+        produced = {_out_name(e, i) for i, e in enumerate(exprs)}
+        if needed is not None and named:
+            # `with_columns` after a join passes every column through: keep only what the parent reads
+            keep = [e for i, e in enumerate(exprs) if _out_name(e, i) in needed]
+            exprs = keep or exprs[:1]
         used: Set[str] = set()
-        produced = set()
-        for i, e in enumerate(plan.exprs):
+        for e in exprs:
             used |= _cols(e)
-            produced.add(_out_name(e, i))
         # a column the parent reads that this Project does not produce passes through from below
         # (a Project of new columns only, with_columns after a join, is completed by the aggregate
         # that inlines it)
         below = used if needed is None else (used | (needed - produced))
-        return Project(materialize(comp, plan.input, below, dict_ok), plan.exprs)
+        return Project(materialize(comp, plan.input, below, dict_ok), exprs)
     if isinstance(plan, Aggregate):
         used = set()
         for e in list(plan.group_by) + list(plan.aggs):

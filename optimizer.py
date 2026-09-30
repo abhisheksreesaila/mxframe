@@ -65,6 +65,10 @@ class PlanOptimizer:
         if changed:
             trace.append("remove_identity_projects")
 
+        current, changed = self._prune_unused_outputs(current)
+        if changed:
+            trace.append("prune_unused_columns")
+
         if not trace:
             trace.append("no_op")
 
@@ -180,6 +184,72 @@ class PlanOptimizer:
             return node
 
         return walk(plan), changed
+
+    # ── projection pushdown ─────────────────────────────────────────────────────────────────────
+    # `with_columns` passes every column of its input through, so a plan such as
+    # `lineitem.join(orders).with_columns(year).groupby(...).agg(...)` names every column of both tables
+    # in a Project although the aggregate reads six. Top-down, each Project keeps only the outputs its
+    # parent reads, which is also what `resolve_plan` uses to decide which Parquet columns to read.
+
+    def _prune_unused_outputs(self, plan: LogicalPlan) -> Tuple[LogicalPlan, bool]:
+        from .io_parquet import _expr_cols
+        changed = False
+
+        def cols_of(exprs) -> set:
+            out: set = set()
+            for e in exprs:
+                if hasattr(e, "op"):
+                    out |= _expr_cols(e)
+                else:
+                    out.add(e)                      # a bare column name (Sort.by)
+            return out
+
+        def out_name(e, i):
+            return getattr(e, "_alias", None) or (e.args[0] if e.op == "col" else f"col_{i}")
+
+        def walk(node: LogicalPlan, needed):
+            """``needed``: column names the parent reads from ``node`` (None: all of them)."""
+            nonlocal changed
+            if isinstance(node, Project):
+                exprs = list(node.exprs)
+                produced = {out_name(e, i) for i, e in enumerate(exprs)}
+                if needed is not None and all(getattr(e, "_alias", None) or e.op == "col" for e in exprs):
+                    keep = [e for i, e in enumerate(exprs) if out_name(e, i) in needed] or exprs[:1]
+                    if len(keep) != len(exprs):
+                        changed = True
+                        exprs = keep
+                below = cols_of(exprs)
+                if needed is not None:
+                    below |= needed - produced     # read through (a Project of new columns only)
+                return Project(walk(node.input, below), exprs)
+            if isinstance(node, Filter):
+                more = cols_of([node.predicate])
+                return Filter(walk(node.input, None if needed is None else needed | more), node.predicate)
+            if isinstance(node, Aggregate):
+                return Aggregate(walk(node.input, cols_of(list(node.group_by) + list(node.aggs))),
+                                 node.group_by, node.aggs)
+            if isinstance(node, Sort):
+                more = cols_of(list(node.by))
+                return Sort(walk(node.input, None if needed is None else needed | more), node.by, node.descending)
+            if isinstance(node, Limit):
+                return Limit(walk(node.input, needed), node.n)
+            if isinstance(node, Tail):
+                return Tail(walk(node.input, needed), node.n)
+            if isinstance(node, Distinct):
+                below = None if (needed is None or not node.subset) else needed | set(node.subset)
+                return Distinct(walk(node.input, below), node.subset)
+            if isinstance(node, Join):
+                lcols, rcols = _output_columns(node.left), _output_columns(node.right)
+                if needed is None or lcols is None or rcols is None:
+                    return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
+                mapping = join_output_names(lcols, rcols, node.right_on)
+                left_need = (needed & set(lcols)) | set(node.left_on)
+                right_need = {orig for orig, out in mapping if out in needed} | set(node.right_on)
+                return Join(walk(node.left, left_need), walk(node.right, right_need),
+                            node.left_on, node.right_on, node.how)
+            return node
+
+        return walk(plan, None), changed
 
     def _collapse_nested_limits(self, plan: LogicalPlan) -> Tuple[LogicalPlan, bool]:
         changed = False
