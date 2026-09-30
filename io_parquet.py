@@ -39,6 +39,9 @@ def _is_dict(arr_or_type) -> bool:
 __all__ = ["scan_parquet", "read_parquet_table", "dictionary_columns", "resolve_plan"]
 
 DEFAULT_MAX_DICTIONARY_BYTES = 64 * 1024
+# Filtering while decoding pays for its thread hand-offs only on big reads: at 6M rows (SF1
+# lineitem) ParquetFile.read's own threads finish in ~25 ms and the engine filters the rest in ~15.
+MIN_ROWS_FOR_ROW_FILTER = 16_000_000
 
 
 # ── public API ──────────────────────────────────────────────────────────────
@@ -62,7 +65,11 @@ def scan_parquet(path, *, dictionary: Any = "auto",
     """
     import pyarrow.parquet as pq
     path = os.fspath(path)
-    schema = pq.read_schema(path)          # footer only
+    if os.path.isfile(path):
+        # footer parsed once per process: the same metadata serves the read later
+        schema = pq.ParquetFile(path, metadata=_metadata(path)).schema_arrow
+    else:
+        schema = pq.read_schema(path)
     return LazyFrame(ParquetScan(path, schema, dictionary, int(max_dictionary_bytes)))
 
 
@@ -92,16 +99,258 @@ def _read_file(path, columns, dict_cols, pushed=()) -> pa.Table:
     ``pq.read_table`` goes through ``pyarrow.dataset``, whose import pulls in
     pandas (~150 ms of a first query). ``ParquetFile`` reads the same data
     without it. ``pushed`` simple filters skip row groups whose statistics rule
-    them out; rows are still filtered exactly by the plan's Filter node.
+    them out and, for integer comparisons, drop non-matching rows right after
+    each row group is decoded (see ``_read_groups``); rows are still filtered
+    exactly by the plan's Filter node.
     """
     import pyarrow.parquet as pq
-    pf = pq.ParquetFile(path, read_dictionary=dict_cols or None)
+    md = _metadata(path)
+    pf = pq.ParquetFile(path, read_dictionary=dict_cols or None, metadata=md)
     groups = _row_groups_for(pf, pushed) if pushed else None
-    if groups is None or len(groups) == pf.metadata.num_row_groups:
-        return pf.read(columns=columns, use_threads=True)
-    if not groups:
+    if groups is not None and not groups:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
+    if groups is None:
+        groups = list(range(md.num_row_groups))
+    rowwise = [p for p in pushed if _row_filterable(p, pf.schema_arrow)]
+    if (len(groups) >= 2 and rowwise and md.num_columns == len(pf.schema_arrow.names)
+            and sum(md.row_group(g).num_rows for g in groups) >= MIN_ROWS_FOR_ROW_FILTER):
+        need = _mask_needs(md, pf.schema_arrow.names, groups, rowwise)
+        if any(need.values()) and _estimated_pass(md, pf.schema_arrow.names, need) < 0.6:
+            return _read_groups(path, md, pf.schema_arrow, columns, dict_cols, groups, need)
+    if len(groups) == md.num_row_groups:
+        return pf.read(columns=columns, use_threads=True)
     return pf.read_row_groups(groups, columns=columns, use_threads=True)
+
+
+_ROW_OPS = {"eq": "__eq__", "ne": "__ne__", "lt": "__lt__", "le": "__le__", "gt": "__gt__", "ge": "__ge__"}
+
+
+def _row_filterable(pushed_one, schema) -> bool:
+    name, op, _ = pushed_one
+    return _kind(schema, name) == "int" and (op in _ROW_OPS or op == "isin")
+
+
+def _mask_needs(md, names, groups, rowwise) -> dict:
+    """Per row group, the row-level conjuncts its statistics do not already guarantee.
+
+    A group whose min/max prove every row passes a conjunct (a 98%-selective ``shipdate <= x``
+    over sorted-ish data, say) needs no mask for it, so it is read exactly like an unfiltered file.
+    """
+    out = {}
+    for g in groups:
+        rg = md.row_group(g)
+        todo = []
+        for c in rowwise:
+            name, op, value = c
+            j = names.index(name) if name in names else -1
+            st = rg.column(j).statistics if j >= 0 else None
+            if st is not None and st.has_min_max and _covers(st.min, st.max, op, value):
+                continue
+            todo.append(c)
+        out[g] = tuple(todo)
+    return out
+
+
+def _estimated_pass(md, names, need) -> float:
+    """Average fraction of rows expected to survive the pushed conjuncts, from min/max alone.
+
+    Values are assumed uniform between a group's min and max (conjuncts independent).  Only used
+    to decide whether filtering while decoding is worth it: a 98%-selective ``shipdate <= x`` is
+    cheaper to read as one plain table and let the engine's Filter node drop the few rows.
+    """
+    total = 0.0
+    for g, todo in need.items():
+        rg = md.row_group(g)
+        f = 1.0
+        for name, op, value in todo:
+            j = names.index(name)
+            st = rg.column(j).statistics
+            if st is None or not st.has_min_max:
+                continue
+            lo, hi = st.min, st.max
+            span = max(hi - lo + 1, 1)
+            try:
+                if op == "eq":
+                    f *= (1.0 / span) if lo <= value <= hi else 0.0
+                elif op == "isin":
+                    f *= sum(1 for v in value if lo <= v <= hi) / span
+                elif op == "ne":
+                    pass
+                elif op in ("lt", "le"):
+                    f *= min(max((value - lo + (op == "le")) / span, 0.0), 1.0)
+                else:
+                    f *= min(max((hi - value + (op == "ge")) / span, 0.0), 1.0)
+            except TypeError:
+                pass
+        total += f
+    return total / max(len(need), 1)
+
+
+def _covers(lo, hi, op, value) -> bool:
+    """True when every value in [lo, hi] satisfies ``op value``."""
+    try:
+        if op == "eq":
+            return lo == hi == value
+        if op == "ne":
+            return value < lo or value > hi
+        if op == "lt":
+            return hi < value
+        if op == "le":
+            return hi <= value
+        if op == "gt":
+            return lo > value
+        if op == "ge":
+            return lo >= value
+        if op == "isin":
+            return lo == hi and lo in value
+    except TypeError:
+        pass
+    return False
+
+
+def _row_mask(table, rowwise):
+    """Boolean NumPy mask of the rows satisfying every integer conjunct, or None (keep all)."""
+    from .np_arrow import to_numpy
+    import numpy as np
+    mask = None
+    for name, op, value in rowwise:
+        c = table.column(name)
+        if c.null_count:
+            continue                       # nulls: leave the row-level decision to the Filter node
+        a = to_numpy(c)
+        try:
+            if op == "isin":
+                m = np.isin(a, np.asarray(value, dtype=np.int64))
+            else:
+                m = getattr(a, _ROW_OPS[op])(value)
+        except (OverflowError, TypeError):
+            continue                       # literal outside the column's range: the Filter node decides
+        mask = m if mask is None else (mask & m)
+    return mask
+
+
+def _read_groups(path, md, schema, columns, dict_cols, groups, need) -> pa.Table:
+    """Decode (row group, column) pieces on a thread pool, dropping rows as they are decoded.
+
+    Stage 1 decodes the columns the pushed integer comparisons need, per row group, and turns
+    them into NumPy masks.  Stage 2 decodes every other column piece and keeps only the rows
+    the mask selects, while the piece is still cache-hot, so filtered-out rows never reach the
+    engine.  Pieces are single-threaded reads of a shared memory map; the (group, column) grain
+    keeps all threads busy even on files with few row groups.
+    """
+    import pyarrow.parquet as pq
+    cols = list(columns) if columns else list(schema.names)
+    rd = dict_cols or None
+    src = pa.memory_map(path)              # one mapping shared by all readers: no per-group open/copy
+
+    def piece(g, name):
+        t = pq.ParquetFile(src, read_dictionary=rd, metadata=md).read_row_group(g, columns=[name], use_threads=False)
+        arrays = t.column(0).chunks
+        return arrays[0] if len(arrays) == 1 else pa.concat_arrays(arrays)
+
+    workers = max(1, min(len(groups) * len(cols), _read_threads()))
+    masked = [g for g in groups if need[g]]
+    have = {}
+
+    def stage1(g):
+        names = list(dict.fromkeys(n for n, _, _ in need[g]))
+        tbl = pa.table([pa.chunked_array([piece(g, n)]) for n in names], names=names)
+        for n in names:
+            have[(g, n)] = tbl.column(n).chunk(0)
+        m = _row_mask(tbl, need[g])
+        # dropping under ~1/4 of a group is not worth a gather; the Filter node drops them
+        return m if m is not None and _count(m) * 4 < len(m) * 3 else None
+
+    masks = dict(zip(masked, _parallel_map(stage1, masked, workers)))
+
+    def stage2(task):
+        g, name = task
+        arr = have.get((g, name))
+        if arr is None:
+            arr = piece(g, name)
+        m = masks.get(g)
+        return arr if m is None else _take_array(arr, m)
+
+    tasks = [(g, n) for n in cols for g in groups]
+    pieces = _parallel_map(stage2, tasks, workers)
+    out = []
+    for k, name in enumerate(cols):
+        arrs = pieces[k * len(groups):(k + 1) * len(groups)]
+        arrs = [a for a in arrs if len(a)] or arrs[:1]
+        typ = arrs[0].type
+        if len(arrs) == 1 or pa.types.is_dictionary(typ):
+            out.append(pa.chunked_array(arrs, typ))
+        else:
+            out.append(("concat", arrs, typ))
+    # one chunk per plain column (what ParquetFile.read gives), copied column-parallel;
+    # dictionary columns keep one chunk per group, each with its own dictionary
+    todo = [i for i, o in enumerate(out) if isinstance(o, tuple)]
+    done = _parallel_map(lambda i: pa.chunked_array([pa.concat_arrays(out[i][1])], out[i][2]), todo, min(workers, len(todo)) or 1)
+    for i, d in zip(todo, done):
+        out[i] = d
+    return pa.table(out, names=cols)
+
+
+def _parallel_map(fn, items, workers) -> list:
+    """``[fn(x) for x in items]`` on ``workers`` threads (results in order; first error re-raised).
+
+    Plain ``threading``: ``concurrent.futures`` costs ~10-40 ms to import in a fresh process.
+    """
+    import threading
+    items = list(items)
+    out = [None] * len(items)
+    errors = []
+    nxt = iter(range(len(items)))
+    lock = threading.Lock()
+
+    def work():
+        while not errors:
+            with lock:
+                i = next(nxt, None)
+            if i is None:
+                return
+            try:
+                out[i] = fn(items[i])
+            except BaseException as e:      # noqa: BLE001 - re-raised in the caller
+                errors.append(e)
+                return
+
+    threads = [threading.Thread(target=work, daemon=True) for _ in range(max(1, workers) - 1)]
+    for t in threads:
+        t.start()
+    work()                                  # the calling thread works too
+    for t in threads:
+        t.join()
+    if errors:
+        raise errors[0]
+    return out
+
+
+def _count(mask) -> int:
+    import numpy as np
+    return int(np.count_nonzero(mask))
+
+
+def _read_threads() -> int:
+    """Decode threads.  More than ~8 slow Arrow's decoder down (allocator and page-fault contention)."""
+    try:
+        n = int(os.environ.get("MXFRAME_READ_THREADS", 0))
+    except ValueError:
+        n = 0
+    return n if n > 0 else min(8, max(2, (os.cpu_count() or 2) // 2))
+
+
+def _take_array(arr: pa.Array, mask) -> pa.Array:
+    """``arr`` rows where the NumPy boolean ``mask`` is set.
+
+    Plain numeric arrays go through NumPy (no ``pyarrow.compute`` import, ~25 ms of a first
+    query); anything else (strings, dictionaries, nulls) uses Arrow.
+    """
+    from .np_arrow import array as _arr, to_numpy
+    t = arr.type
+    if (pa.types.is_integer(t) or pa.types.is_floating(t)) and not arr.null_count:
+        return _arr(to_numpy(arr)[mask], type=t)
+    return arr.filter(_arr(mask))
 
 
 def _row_groups_for(pf, pushed) -> List[int]:
@@ -187,14 +436,15 @@ def _chunks_are_small_dictionaries(path, schema, name, max_bytes) -> bool:
 
 
 @functools.lru_cache(maxsize=32)
-def _metadata_cached(path, mtime_ns, size):
+def _metadata_cached(path, dev, ino, mtime_ns, size):
     import pyarrow.parquet as pq
     return pq.ParquetFile(path).metadata
 
 
 def _metadata(path):
     st = os.stat(path)
-    return _metadata_cached(os.fspath(path), st.st_mtime_ns, st.st_size)
+    # the cached footer now drives data reads: key on file identity as well as mtime/size
+    return _metadata_cached(os.path.abspath(os.fspath(path)), st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
 
 
 # ── plan analysis ───────────────────────────────────────────────────────────
