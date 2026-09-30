@@ -1724,6 +1724,10 @@ class CustomOpsCompiler(GraphCompiler):
 
         # F-008 -- fused pipeline: filter + arithmetic + aggregates in one vectorized AOT pass
         # (CPU or GPU), for grouped and global aggregate plans. None -> use the paths below.
+        # A Project under a grouped aggregate (a select / with_columns after distinct, say) is folded
+        # into the aggregate first: the fused kernels accumulate float64 in float64, while the GPU
+        # path it used to fall back to rounds float64 columns to float32 (F-016 fuzz seed 5061).
+        plan = self._inline_project_into_aggregate(plan)
         if try_fused_aggregate is not None:
             _fused = try_fused_aggregate(self, plan, having_pred, post_ops, optimizer_trace, t0)
             if _fused is not None:

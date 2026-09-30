@@ -108,14 +108,21 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     grouped = bool(agg_node.group_by)
     if grouped:
         gk_table = table
+        derived = []
         for i, e in enumerate(agg_node.group_by):
             if e.op == "col":
                 group_keys.append(e.args[0])
             else:  # derived key, e.g. year(col): same treatment as the existing path
                 name = e._alias or f"__gk_{len(group_keys)}__"
-                if name not in gk_table.column_names:
-                    gk_table = gk_table.append_column(name, compiler._eval_expr_arrow(e, gk_table))
+                # evaluated against the source table; a key that reuses a source column's name
+                # (``with_columns((k + 10).alias("k"))`` inlined into the aggregate) replaces it
+                derived.append((name, compiler._eval_expr_arrow(e, table)))
                 group_keys.append(name)
+        for name, arr in derived:
+            if name in gk_table.column_names:
+                gk_table = gk_table.set_column(gk_table.schema.get_field_index(name), name, arr)
+            else:
+                gk_table = gk_table.append_column(name, arr)
         # On a GPU session the existing GPU key-encoding kernels are avoided: the single-int-key
         # one hangs (even at 1000 rows) and the multi-key one corrupts the heap (a later
         # pq.read_table segfaults). The group ids must come back to the host for the fused
