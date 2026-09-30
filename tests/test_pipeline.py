@@ -168,6 +168,18 @@ def test_unsupported_returns_none(pred, aggs):
     assert compile_pipeline([pred] if pred is not None else [], aggs, t) is None
 
 
+@pytest.mark.parametrize("pred", [
+    col("i64") == lit(2 ** 53 + 1),
+    col("i64") < lit(2 ** 60),
+    lit(2 ** 55) > col("i64"),
+    col("i64").isin([1, 2 ** 54]),
+])
+def test_integer_literals_beyond_2_53_decline(pred):
+    t = make_table(10)
+    assert compile_pipeline([pred], [col("f32").sum()], t) is None
+    assert compile_pipeline([col("i64") == lit(2 ** 53)], [col("f32").sum()], t) is not None
+
+
 def test_nulls_in_string_column_are_unsupported():
     t = pa.table({"s": pa.array(["a", None, "b"]), "x": pa.array([1.0, 2.0, 3.0])})
     assert compile_pipeline([col("s") == lit("a")], [col("x").sum()], t) is None

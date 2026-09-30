@@ -34,7 +34,7 @@ from .pipeline_program import (
 
 __all__ = [
     "cpu_available", "gpu_available", "default_threads", "run_pipeline_cpu",
-    "run_pipeline_gpu", "DeviceColumns", "upload_columns", "merge_partials", "finalize",
+    "run_pipeline_gpu", "GpuUnsupported", "DeviceColumns", "upload_columns", "merge_partials", "finalize",
 ]
 
 _HERE = Path(__file__).parent
@@ -43,6 +43,10 @@ _cpu_lib = None
 _gpu_lib = None
 
 _I64 = ctypes.c_int64
+
+
+class GpuUnsupported(Exception):
+    """This program or shape cannot run on the GPU kernel (the caller should use the CPU kernel)."""
 
 
 def _find(name: str, env: str) -> Optional[Path]:
@@ -233,7 +237,9 @@ class _Cuda:
         ptr = ctypes.c_uint64(0)
         err = self.lib.cuMemAlloc_v2(ctypes.byref(ptr), max(int(nbytes), 8))
         if err != 0:
-            raise MemoryError(f"cuMemAlloc({nbytes}) failed: {err}")
+            if err == 2:
+                raise MemoryError(f"CUDA_ERROR_OUT_OF_MEMORY: cuMemAlloc({nbytes}) failed")
+            raise RuntimeError(f"CUDA_ERROR {err}: cuMemAlloc({nbytes}) failed")
         return int(ptr.value)
 
     def free(self, ptr: int) -> None:
@@ -247,7 +253,7 @@ class _Cuda:
             err = self.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), ctypes.c_void_p(arr.ctypes.data),
                                            ctypes.c_size_t(arr.nbytes))
             if err != 0:
-                raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
+                raise RuntimeError(f"CUDA_ERROR {err}: cuMemcpyHtoD failed")
 
     def h2d_addr(self, dev_ptr: int, host_addr: int, nbytes: int) -> None:
         """Copy ``nbytes`` from a host address (an Arrow buffer, say) to the device."""
@@ -256,7 +262,7 @@ class _Cuda:
             err = self.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), ctypes.c_void_p(host_addr),
                                            ctypes.c_size_t(nbytes))
             if err != 0:
-                raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
+                raise RuntimeError(f"CUDA_ERROR {err}: cuMemcpyHtoD failed")
 
     def d2h(self, arr: np.ndarray, dev_ptr: int) -> None:
         self.bind_thread()
@@ -264,7 +270,7 @@ class _Cuda:
             err = self.lib.cuMemcpyDtoH_v2(ctypes.c_void_p(arr.ctypes.data), ctypes.c_uint64(dev_ptr),
                                            ctypes.c_size_t(arr.nbytes))
             if err != 0:
-                raise RuntimeError(f"cuMemcpyDtoH failed: {err}")
+                raise RuntimeError(f"CUDA_ERROR {err}: cuMemcpyDtoH failed")
 
     def sync(self) -> None:
         self.bind_thread()
@@ -487,8 +493,10 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
             out_vals, out_cnt, dp.ident, scratch, dp.n_regs, dp.code_ints, dp.agg_base,
             cu.sm_count, int(_repeat),
         )
+        if rc == -5:
+            raise GpuUnsupported("program needs more shared memory than a block has")
         if rc != 0:
-            raise RuntimeError(f"mx_pipeline_gpu failed with code {rc}")
+            raise RuntimeError(f"CUDA_ERROR: mx_pipeline_gpu failed with code {rc}")
         vals = np.empty((n_slots, n_groups), dtype=np.float64)
         cnt = np.empty(n_groups, dtype=np.int64)
         if n_slots:

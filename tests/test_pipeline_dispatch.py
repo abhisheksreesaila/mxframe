@@ -171,3 +171,30 @@ def test_concurrent_callers_from_python_threads():
     merged = merge_partials(prog, [out[i] for i in sorted(out)])
     assert np.array_equal(merged.cnt, want.cnt)
     np.testing.assert_allclose(merged.vals, want.vals, rtol=1e-9)
+
+
+# ── GPU errors ─────────────────────────────────────────────────────────────
+
+def _gpu_frame():
+    return LazyFrame(Scan(make_table())).filter(col("y") < lit(0.9)).groupby().agg(col("x").sum().alias("s"))
+
+
+@pytest.mark.skipif("gpu" not in DEVICES, reason="no GPU")
+def test_device_errors_reach_the_caller(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("CUDA_ERROR_ILLEGAL_ADDRESS: kernel faulted")
+    monkeypatch.setattr(pk, "run_pipeline_gpu", boom)
+    with pytest.raises(RuntimeError, match="CUDA_ERROR_ILLEGAL_ADDRESS"):
+        _gpu_frame().compute(device="gpu")
+
+
+@pytest.mark.skipif("gpu" not in DEVICES, reason="no GPU")
+@pytest.mark.parametrize("err", [MemoryError("CUDA_ERROR_OUT_OF_MEMORY"), pk.GpuUnsupported("too big")])
+def test_oom_and_unsupported_programs_are_served_by_the_cpu_kernel(monkeypatch, err):
+    def boom(*a, **k):
+        raise err
+    monkeypatch.setattr(pk, "run_pipeline_gpu", boom)
+    lf = _gpu_frame()
+    got = lf.compute(device="gpu")
+    assert lf._last_compile_provenance["device"] == "cpu"
+    assert got.num_rows == 1

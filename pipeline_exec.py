@@ -133,8 +133,15 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         try:
             partials = _run_gpu(pk, prog, cc, gids, n_groups, n_rows)
             used = "gpu"
-        except Exception:
-            partials = None            # e.g. out of device memory: redo on the CPU kernel
+        except pk.GpuUnsupported:
+            partials = None            # this program does not fit the GPU kernel: CPU kernel
+        except MemoryError:
+            # Out of device memory: an explicit device="gpu" is served by the CPU kernel
+            # (provenance says cpu); under auto the caller's own fallback decides.
+            if getattr(compiler, "_device_arg", None) != "gpu":
+                raise
+            partials = None
+        # any other GPU error propagates, so auto_mode sees it (is_sticky_gpu_error / disable_gpu)
     if partials is None:
         partials = pk.run_pipeline_cpu(prog, cc, gids, n_groups, 0, n_rows)
 

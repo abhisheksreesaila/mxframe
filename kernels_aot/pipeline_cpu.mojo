@@ -177,7 +177,7 @@ def _bin[OP: Int](d: FP, a: FP, b: FP, n: Int):
         elif OP == OP_EQ:
             r = x.eq(y).select(one, zero)
         elif OP == OP_NE:
-            r = x.ne(y).select(one, zero)
+            r = x.eq(y).select(zero, one)
         elif OP == OP_AND:
             r = (x.ne(zero) & y.ne(zero)).select(one, zero)
         else:
@@ -232,7 +232,7 @@ def _cmp_thr[OP: Int](d: FP, thr: Float64, n: Int):
         elif OP == OP_EQ:
             r = x.eq(t).select(one, zero)
         else:
-            r = x.ne(t).select(one, zero)
+            r = x.eq(t).select(zero, one)
         d.store(i, r)
         i += W
 

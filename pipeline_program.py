@@ -219,6 +219,7 @@ class PipelineProgram:
     n_regs: int
     n_instr: int
     identity: np.ndarray = field(default=None)  # float64 [n_slots] initial value per slot
+    nan_slots: Dict[str, int] = field(default_factory=dict)  # min / max output -> hidden NaN-count slot
 
     @property
     def n_slots(self) -> int:
@@ -475,6 +476,8 @@ class _Builder:
             if isinstance(v, bool):
                 return _Const(float(v), "bool")
             if isinstance(v, (int, np.integer)):
+                if abs(int(v)) > 2 ** 53:
+                    raise Unsupported("integer literal beyond 2**53 is not exact in float64")
                 return _Const(float(v), "int")
             if isinstance(v, (float, np.floating)):
                 if v != v:
@@ -566,6 +569,8 @@ class _Builder:
             v = e.args[0]
             if isinstance(v, bool) or not isinstance(v, (int, float, np.integer, np.floating)):
                 return None
+            if isinstance(v, (int, np.integer)) and abs(int(v)) > 2 ** 53:
+                raise Unsupported("integer literal beyond 2**53 is not exact in float64")
             return float(v)
         if e.op in _ARITH:
             a, b = self._fold(e.args[0]), self._fold(e.args[1])
@@ -635,6 +640,8 @@ class _Builder:
             return _Const(0.0, "bool")
         if not all(isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool) for v in values):
             raise Unsupported("isin values must be numbers")
+        if any(isinstance(v, (int, np.integer)) and abs(int(v)) > 2 ** 53 for v in values):
+            raise Unsupported("integer literal beyond 2**53 is not exact in float64")
         if x.kind == "int" and all(float(v) == int(v) for v in values):
             ints = sorted({int(v) for v in values})
             lo, hi = ints[0], ints[-1]
@@ -733,6 +740,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
     slot_kinds: List[str] = []
     slot_src: List[int] = []
     outputs: List[Tuple[str, str, Optional[int]]] = []
+    nan_slots: Dict[str, int] = {}
     for i, e in enumerate(aggs):
         name = e._alias or f"agg_{i}"
         if e.op == "count":
@@ -743,6 +751,21 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
         inner = b._need(e.args[0], "num")
         kind = "sum" if e.op == "mean" else e.op
         key = (kind, e.args[0].signature())
+        if e.op in ("min", "max") and not isinstance(inner, _Const) and inner.kind == "float":
+            # DuckDB orders NaN above every number: min skips NaN (NaN only if the group is all NaN),
+            # max is NaN if any value is. NaN is masked out of the compare (so no min/max instruction
+            # ever sees one) and counted in a hidden sum slot; finalize applies the rule.
+            isnan = b.emit(OP_NE, inner.vreg, inner.vreg)
+            sentinel = b.const_reg(float("inf") if e.op == "min" else float("-inf"))
+            masked = b.emit(OP_SELECT, isnan, sentinel, inner.vreg)
+            key = (kind, e.args[0].signature(), "nan-masked")
+            nan_key = ("sum", e.args[0].signature(), "nan-count")
+            if nan_key not in slot_index:
+                slot_index[nan_key] = len(slot_kinds)
+                slot_kinds.append("sum")
+                slot_src.append(isnan)
+            nan_slots[name] = slot_index[nan_key]
+            inner = _Val(masked, "float")
         if key not in slot_index:
             slot_index[key] = len(slot_kinds)
             slot_kinds.append(kind)
@@ -831,6 +854,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
         dict_arrays=dict(b.dict_arrays),
         slot_kinds=slot_kinds,
         outputs=outputs,
+        nan_slots=nan_slots,
         n_regs=n_regs,
         n_instr=total_instr,
         identity=identity,
@@ -997,6 +1021,11 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
             c = cnt[present]
             with np.errstate(divide="ignore", invalid="ignore"):
                 v = np.where(c > 0, v / np.maximum(c, 1), 0.0)
+        if name in program.nan_slots:
+            n_nan = partials.vals[program.nan_slots[name]][present]
+            c = cnt[present]
+            hit = (n_nan > 0) if op == "max" else ((n_nan >= c) & (c > 0))
+            v = np.where(hit, np.nan, v)
         if not grouped:
             if cnt[0] == 0:
                 v = np.zeros_like(v)
