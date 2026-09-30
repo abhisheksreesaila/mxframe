@@ -1005,8 +1005,8 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
     queries drop the others, like the existing path); ``columns`` maps each
     output name to a numpy array over the present groups (all of the single
     group for a global aggregate). Sums and means are float64, min/max float64;
-    counts are int64. A global aggregate over no rows yields 0 (count 0), like
-    the existing path.
+    counts are int64. A global aggregate over no rows yields NULL (a masked
+    array) for sum / min / max / mean, and 0 for count, like SQL.
     """
     cnt = partials.cnt
     present = cnt > 0
@@ -1027,8 +1027,7 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
             c = cnt[present]
             hit = (n_nan > 0) if op == "max" else ((n_nan >= c) & (c > 0))
             v = np.where(hit, np.nan, v)
-        if not grouped:
-            if cnt[0] == 0:
-                v = np.zeros_like(v)
+        if not grouped and cnt[0] == 0:
+            v = np.ma.masked_all(v.shape, dtype=v.dtype)      # SQL: sum/min/max/mean over no rows is NULL
         cols[name] = v
     return present, cols

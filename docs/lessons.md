@@ -17,3 +17,6 @@ Claude reads this at the start of each session. -->
 - 2026-09-30 · `pyarrow.Table.join` defaults to a LEFT OUTER join: pass `join_type="inner"`.
 - 2026-09-30 · On the query path never call pa.array / pa.scalar / Array.to_numpy / fill_null(<python value>) / compute with Python literals / pq.read_table: PyArrow then imports pandas (~150-200 ms per fresh process). Use np_arrow.array / scalar / to_numpy and ParquetFile; tests/test_np_arrow.py guards it.
 - 2026-09-30 · Never chain `git commit` after `pytest ... | tail`: the pipe hides pytest's exit code and a red test got committed. Capture the exit status (`> log; rc=$?`) and commit only when it is 0.
+- 2026-09-30 · An operator above an Aggregate (Project, Filter, another Aggregate) or any Aggregate input that is not `Filter*(Scan)` must run on a materialized table (`_materialize_barrier`): the aggregate paths only look at the Scan under them and used to ignore what sat above or between. Add a fuzz seed (tests/test_f016_fuzz.py) when a new plan shape breaks.
+- 2026-09-30 · A numeric literal next to an array takes the array's type in arithmetic (`_arith_operands`): a float32 literal array turned `int + 2` into float32 and rounded `float64 + 0.1`.
+

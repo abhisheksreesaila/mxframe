@@ -186,7 +186,10 @@ class LazyFrame:
             if hasattr(p, "input"):
                 return _scan_cols(p.input)
             return []
-        existing = _scan_cols(self.plan)
+        from .optimizer import _output_columns
+        existing = _output_columns(self.plan)          # what the plan produces (an aggregate's keys and aggs, not the scan's)
+        if existing is None:
+            existing = _scan_cols(self.plan)
         passthrough = [col(c) for c in existing if c not in new_aliases]
         return LazyFrame(Project(self.plan, passthrough + list(exprs)))
 
