@@ -991,8 +991,8 @@ def _p_gather_gpu(ctx, n, card):
 
 @probe("sort_topk", "cpu", max_rows=10_000_000)
 def _p_sort_cpu(ctx, n, card):
-    # PyArrow sort, as the engine's CPU path uses it.  AOTKernels.sort_indices is an
-    # in-place rotate merge sort (O(n^2) on random keys): not usable as a probe.
+    # PyArrow sort, as the engine's CPU path uses it (the engine does not call
+    # AOTKernels.sort_indices, the parallel radix sort, yet).
     import pyarrow as pa
     import pyarrow.compute as pc
     arr = pa.array(ctx.keys(n))
@@ -1017,10 +1017,10 @@ def _p_enc_cpu(ctx, n, card):
     return lambda: arr.dictionary_encode()
 
 
-@probe("group_encode", "gpu", enabled=False)   # AOT kernel hangs on this build
+@probe("group_encode", "gpu")
 def _p_enc_gpu(ctx, n, card):
     k = ctx.labels(n, card)
-    cap = 1 << max(1, (2 * n - 1).bit_length())    # engine rule: next pow2 >= 2*rows (small caps hang)
+    cap = 1 << max(1, (2 * n - 1).bit_length())    # engine rule: next pow2 >= 2*rows
     return lambda: ctx.gpu.group_encode_i32(k, cap)
 
 
