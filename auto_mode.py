@@ -539,7 +539,7 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         from .calibration import get_calibration
         calib = get_calibration()
     if gpu is None:
-        gpu = get_gpu_warmup(calib) if getattr(calib, "has_gpu", False) else _NO_GPU
+        gpu = get_gpu_warmup(calib, start=False) if getattr(calib, "has_gpu", False) else _NO_GPU
     est = estimate_plan(plan, calib, gpu)
     if not gpu.available:
         return AutoDecision("cpu", "no gpu", est, gpu_available=False)
@@ -600,8 +600,12 @@ def _init_gpu():
     return gpu
 
 
-def get_gpu_warmup(calib=None) -> GpuWarmup:
-    """Process-wide GPU warm-up: CUDA context + GPU AOT library, started in the background."""
+def get_gpu_warmup(calib=None, start: bool = True) -> GpuWarmup:
+    """Process-wide GPU warm-up: CUDA context + GPU AOT library, started in the background.
+
+    ``start=False`` returns it unstarted (its remaining cost counts in full) so a
+    CPU-bound query can start it after it has returned.
+    """
     global _warmup
     with _warmup_lock:
         if _warmup is None:
@@ -612,5 +616,6 @@ def get_gpu_warmup(calib=None) -> GpuWarmup:
                 except Exception:
                     pass
             _warmup = GpuWarmup(_init_gpu, expected_ms=expected if expected != float("inf") else 250.0)
+        if start:
             _warmup.start()
         return _warmup

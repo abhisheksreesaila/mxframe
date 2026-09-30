@@ -725,12 +725,12 @@ def test_join_total_probe_calls_the_wrapper():
     assert calls == [(10_000, 1_250)]
 
 
-def test_schema_version_is_2_and_v1_files_load_as_defaults(tmp_path):
-    assert cal_mod.SCHEMA_VERSION == 2
+def test_schema_version_is_3_and_older_files_load_as_defaults(tmp_path):
+    assert cal_mod.SCHEMA_VERSION == 3
     cal = run_fake_calibration()
     p = tmp_path / "calibration.json"
     doc = json.loads(p.read_text())
-    doc["schema"] = 1
+    doc["schema"] = 2      # v2 holds PyArrow sort_topk@cpu and default pipeline fits
     p.write_text(json.dumps(doc))
     cal_mod.reset_calibration_cache()
     assert cal_mod.get_calibration().source == "defaults"
@@ -758,3 +758,71 @@ def test_time_call_min_stat_takes_fastest_sample():
     def fn():
         clock.t += next(costs)
     assert cal_mod._time_call(fn, clock, 1.0, stat="min") == pytest.approx(100.0)
+
+
+# ============================ F-013: probe refresh ==============================
+def test_cpu_sort_probe_times_the_radix_sort_kernel():
+    calls = []
+
+    class C:
+        def sort_indices(self, keys):
+            calls.append(len(keys))
+    ctx = cal_mod.ProbeCtx(10_000)
+    ctx._cpu = C()
+    cal_mod.PROBES[("sort_topk", "cpu")].make(ctx, 5_000, 8)()
+    assert calls == [5_000]
+    assert (cal_mod.PROBES[("sort_topk", "cpu")].max_rows or 10**9) >= 30_000_000   # no 10M cap any more
+
+
+def test_no_separate_join_total_cpu_fit():
+    """The planner prices CPU joins with `join`; `join_total` on the CPU is an alias, never a probe or a fit."""
+    assert ("join_total", "cpu") not in cal_mod.PROBES
+    c = default_calibration(GPU)
+    assert "join_total@cpu" not in c.fits
+    assert c.estimate("join_total", "cpu", 3_000_000) == c.estimate("join", "cpu", 3_000_000)
+    c.observe("join", "cpu", 1_000_000, 5.0)
+    assert "join_total@cpu" not in c.fits
+
+
+def test_pipeline_probes_exist_on_both_devices_and_are_compute_only():
+    assert ("pipeline", "cpu") in cal_mod.PROBES and ("pipeline", "gpu") in cal_mod.PROBES
+    assert cal_mod.PROBES[("pipeline", "gpu")].h2d_bytes_per_row == 0.0    # inputs resident: no upload in the fit
+    assert (cal_mod.PROBES[("pipeline", "gpu")].max_rows or 10**9) >= 30_000_000
+
+
+@pytest.mark.parametrize("dev", ["cpu", "gpu"])
+def test_pipeline_probe_runs_the_q1_shaped_program_correctly(dev):
+    import numpy as np
+    from mxframe import pipeline_kernels as pk
+    if dev == "cpu" and not pk.cpu_available():
+        pytest.skip("libmxpipeline_cpu.so not built")
+    if dev == "gpu":
+        try:
+            ok = pk.gpu_available() and pk._get_cuda() is not None
+        except Exception:
+            ok = False
+        if not ok:
+            pytest.skip("no GPU or libmxpipeline_gpu.so not built")
+    n = 50_000
+    ctx = cal_mod.ProbeCtx(100_000)
+    box = {}
+    name = "run_pipeline_" + dev
+    orig = getattr(pk, name)
+
+    def spy(*a, **kw):
+        box["p"] = orig(*a, **kw)
+        return box["p"]
+    setattr(pk, name, spy)
+    try:
+        cal_mod.PROBES[("pipeline", dev)].make(ctx, n, 4)()
+    finally:
+        setattr(pk, name, orig)
+    prog, cols, gids = cal_mod._pipeline_case(ctx, n)
+    ctx.release_gpu_buffers()
+    by_name = dict(zip(prog.columns, cols))
+    keep = by_name["l_shipdate"] <= 2436
+    part = box["p"]
+    assert part.vals.shape == (prog.n_slots, cal_mod.PIPELINE_GROUPS) and 0.9 < keep.mean() < 1.0
+    np.testing.assert_array_equal(part.cnt, np.bincount(gids[keep], minlength=4))
+    want_qty = np.bincount(gids[keep], weights=by_name["l_quantity"][keep].astype(np.float64), minlength=4)
+    assert any(np.allclose(row, want_qty, rtol=1e-6) for row in part.vals)

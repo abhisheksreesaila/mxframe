@@ -141,6 +141,10 @@ struct Atomic:
 
     @staticmethod
     def red_add_global(addr: Int, val: Float32):
-        """Fire-and-forget native `red.global.add.f32` on a global address."""
-        inlined_assembly["red.relaxed.gpu.global.add.f32 [$0], $1;", NoneType,
+        """Fire-and-forget native `red.global.add.f32` on a global address.
+        `cvta.to.global` converts the generic address a caller holds to the global
+        window first, as nvcc does; a `.global` instruction on a generic address is
+        undefined in the PTX spec."""
+        inlined_assembly["{ .reg .u64 %g; cvta.to.global.u64 %g, $0; "
+                         "red.relaxed.gpu.global.add.f32 [%g], $1; }", NoneType,
                          constraints="l,f,~{memory}"](addr, val)

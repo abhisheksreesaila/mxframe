@@ -46,7 +46,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-SCHEMA_VERSION = 2      # v2: compute-only estimate contract, group-count fit keys, size exponent
+SCHEMA_VERSION = 3      # v3: sort_topk@cpu times the radix sort (was PyArrow); pipeline fits are measured
+                        # (v2: compute-only estimate contract, group-count fit keys, size exponent)
 MAX_OBS_SAMPLES = 64        # bounded per-fit sample list (HyPE-style)
 MIN_OBS = 3                 # samples before observations start to count
 OBS_RAMP = 6                # observed weight ramps 0 -> 1 over this many samples past MIN_OBS
@@ -125,9 +126,38 @@ def _nvidia_driver_string() -> Optional[str]:
 def _gpu_identity() -> Optional[Dict[str, Any]]:
     """(name, driver, memory) of GPU 0 as seen through CUDA_VISIBLE_DEVICES, or None.
 
-    Uses the CUDA driver API directly (cheap; no MAX import).  Tests monkeypatch
-    this function to simulate machines with and without a GPU.
+    Reads /proc/driver/nvidia when it can (no CUDA initialisation, so loading the
+    calibration never makes a CPU-bound first query wait ~40 ms on cuInit), else
+    asks the CUDA driver. Tests monkeypatch this function to simulate machines
+    with and without a GPU.
     """
+    ident = _proc_gpu_identity()
+    return ident if ident is not None else _cuda_gpu_identity()
+
+
+def _proc_gpu_identity() -> Optional[Dict[str, Any]]:
+    """NVIDIA model + driver from /proc when every visible GPU is the same model, else None.
+
+    ``mem_bytes`` is 0 here; the stored calibration carries the measured value.
+    """
+    vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if vis is not None and vis.strip() in ("", "-1"):
+        return None
+    try:
+        models = []
+        for info in sorted(Path("/proc/driver/nvidia/gpus").glob("*/information")):
+            for line in info.read_text().splitlines():
+                if line.startswith("Model:"):
+                    models.append(line.split(":", 1)[1].strip())
+        driver = _nvidia_driver_string()
+    except Exception:
+        return None
+    if not models or driver is None or len(set(models)) != 1:
+        return None
+    return {"name": models[0], "driver": driver, "mem_bytes": 0}
+
+
+def _cuda_gpu_identity() -> Optional[Dict[str, Any]]:
     for lib_name in ("libcuda.so.1", "libcuda.so"):
         try:
             lib = ctypes.CDLL(lib_name)
@@ -565,17 +595,17 @@ _DEFAULT_FITS: Dict[str, Tuple[float, float, float]] = {
     "group_count@cpu": (0.005, 0.8, 2.5), "group_count@gpu": (0.05, 0.3, 0.0),
     "group_min@cpu": (0.005, 0.9, 10.0), "group_min@gpu": (0.1, 0.3, 0.0),
     "group_max@cpu": (0.005, 0.9, 12.0), "group_max@gpu": (0.1, 0.3, 0.0),
-    "masked_sum@cpu": (0.005, 1.5, 0.0), "masked_sum@gpu": (0.15, 1.0, 0.0),
+    "masked_sum@cpu": (0.005, 0.3, 0.0), "masked_sum@gpu": (0.05, 0.02, 0.0),   # F-013: block-reduced GPU kernel
     "join@cpu": (0.02, 11.0, 0.0), "join@gpu": (0.05, 0.25, 0.0),
     "gather@cpu": (0.005, 0.8, 0.0), "gather@gpu": (0.03, 0.04, 0.0),
-    "sort_topk@cpu": (0.02, 60.0, 0.0), "sort_topk@gpu": (0.1, 4.0, 0.0),   # stable tiled bitonic
+    "sort_topk@cpu": (0.1, 7.0, 0.0), "sort_topk@gpu": (0.1, 2.5, 0.0),   # CPU: parallel radix; GPU: stable tiled bitonic
     "group_encode@cpu": (0.02, 9.0, 0.0), "group_encode@gpu": (1.0, 4.0, 0.0),
     "filter_take@cpu": (0.02, 4.5, 0.0),
     # join_host: host steps between the two GPU join kernels (cumsum, bincount, argsort)
     "join_host@cpu": (0.01, 1.2, 0.0),
-    # pipeline: reserved for F-008's fused filter+expr+agg kernel.  CPU ~ memory-bandwidth
-    # bound (about 12 B/row over ~20 GB/s single thread); GPU fits TBD until the kernel exists.
-    "pipeline@cpu": (0.01, 0.6, 0.0), "pipeline@gpu": (0.3, 1.0, 0.0),
+    # pipeline: F-008 fused filter+expr+agg kernel, Q1-shaped (5 columns, 5 sums, 4 groups),
+    # resident input (F-013 probe): CPU ~0.85 ms/Mrow on 24 threads, GPU ~0.26 ms/Mrow.
+    "pipeline@cpu": (0.1, 0.9, 0.0), "pipeline@gpu": (0.1, 0.3, 0.0),
     "generic@cpu": (0.05, 6.0, 0.0), "generic@gpu": (1.0, 6.0, 0.0),
 }
 _DEFAULT_GPU_INIT_MS = 400.0
@@ -763,6 +793,11 @@ class ProbeCtx:
         return ptr
 
     def release_gpu_buffers(self) -> None:
+        for dc in self._data.pop("pipe_dcs", []):      # resident pipeline columns
+            try:
+                dc.free()
+            except Exception:
+                pass
         if self._gpu is not None:
             for ptr in self._dev_ptrs:
                 try:
@@ -969,6 +1004,63 @@ def _p_join_host(ctx, n, card):
     return run
 
 
+# --- fused pipeline (F-008): Q1-shaped program ----------------------------------------
+# filter (shipdate <= cutoff, ~95% of rows pass) + 5 float64 sums over 4 float32 columns
+# (sum(qty), sum(price), sum(price*(1-disc)), sum(price*(1-disc)*(1+tax)), sum(disc)) into
+# 4 groups (returnflag x linestatus).  coproc_fused balances the CPU/GPU row split from
+# these two fits.
+PIPELINE_GROUPS = 4
+
+
+def _pipeline_case(ctx, n):
+    """(program, [columns in program order], gids) for the first ``n`` rows; built once."""
+    import numpy as np
+    import pyarrow as pa
+    from .lazy_expr import col, lit
+    from .pipeline_program import compile_pipeline
+    d = ctx._data
+    if "pipe" not in d:
+        f = ctx.f32(ctx.max_rows)
+        cols = {
+            "l_shipdate": (f * np.float32(2556)).astype(np.int32),
+            "l_quantity": f * np.float32(50) + np.float32(1),
+            "l_extendedprice": f * np.float32(1e5) + np.float32(900),
+            "l_discount": f * np.float32(0.1),
+            "l_tax": f[::-1] * np.float32(0.08),
+        }
+        disc_price = col("l_extendedprice") * (lit(1.0) - col("l_discount"))
+        aggs = [col("l_quantity").sum().alias("sum_qty"), col("l_extendedprice").sum().alias("sum_base"),
+                disc_price.sum().alias("sum_disc_price"),
+                (disc_price * (lit(1.0) + col("l_tax"))).sum().alias("sum_charge"),
+                col("l_discount").sum().alias("sum_disc")]
+        head = pa.table({k: pa.array(v[:64]) for k, v in cols.items()})
+        prog = compile_pipeline([col("l_shipdate") <= lit(2436)], aggs, head)
+        if prog is None:
+            raise RuntimeError("Q1-shaped program did not compile")
+        d["pipe"] = (prog, [cols[c] for c in prog.columns],
+                     ctx.labels(ctx.max_rows, PIPELINE_GROUPS))
+    prog, cols, gids = d["pipe"]
+    return prog, [c[:n] for c in cols], gids[:n]
+
+
+@probe("pipeline", "cpu")
+def _p_pipe_cpu(ctx, n, card):
+    from . import pipeline_kernels as pk
+    prog, cols, gids = _pipeline_case(ctx, n)
+    return lambda: pk.run_pipeline_cpu(prog, cols, gids, PIPELINE_GROUPS, 0, n)
+
+
+@probe("pipeline", "gpu")
+def _p_pipe_gpu(ctx, n, card):
+    """Compute-only: columns and group ids are resident (uploaded here, untimed); the timed
+    call is the kernel launch plus the tiny per-group partials D2H."""
+    from . import pipeline_kernels as pk
+    prog, cols, gids = _pipeline_case(ctx, n)
+    dc = pk.upload_columns(prog, cols, gids, 0, n)
+    ctx._data.setdefault("pipe_dcs", []).append(dc)
+    return lambda: pk.run_pipeline_gpu(prog, dc, None, PIPELINE_GROUPS, 0, n)
+
+
 @probe("gather", "cpu")
 def _p_gather_cpu(ctx, n, card):
     v, idx = ctx.f32(n), ctx.perm(n)
@@ -986,14 +1078,12 @@ def _p_gather_gpu(ctx, n, card):
     return run
 
 
-@probe("sort_topk", "cpu", max_rows=10_000_000)
+@probe("sort_topk", "cpu")
 def _p_sort_cpu(ctx, n, card):
-    # PyArrow sort, as the engine's CPU path uses it (the engine does not call
-    # AOTKernels.sort_indices, the parallel radix sort, yet).
-    import pyarrow as pa
-    import pyarrow.compute as pc
-    arr = pa.array(ctx.keys(n))
-    return lambda: pc.sort_indices(arr)
+    # The CPU sort kernel: `AOTKernels.sort_indices`, the parallel stable LSD radix sort
+    # (F-012), on the int32 composite key like the GPU probe below.
+    keys = ctx.keys(n)
+    return lambda: ctx.cpu.sort_indices(keys)
 
 
 @probe("sort_topk", "gpu", max_rows=30_000_000)
@@ -1082,7 +1172,12 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
         prev = last.get(lk)
         if prev is not None and n > prev[0] and prev[1] / 1e3 * (n / prev[0]) * 4 > budget_s:
             continue                      # projected too slow for the budget: skip this size
-        ms = _time_call(p.make(ctx, n, card), timer, budget_s, p.stat)
+        try:
+            ms = _time_call(p.make(ctx, n, card), timer, budget_s, p.stat)
+        except BaseException:
+            if p.device == "gpu" and hasattr(ctx, "release_gpu_buffers"):
+                ctx.release_gpu_buffers()      # a failed probe must not keep resident buffers
+            raise
         if p.h2d_bytes_per_row and h2d_gbps > 0:      # wrapper re-uploads inputs: remove that copy
             ms = max(ms - p.h2d_bytes_per_row * n / (h2d_gbps * 1e9) * 1e3, ms * 0.05)
         pts.append([float(n), float(card), ms])
