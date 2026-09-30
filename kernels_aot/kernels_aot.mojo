@@ -6,20 +6,63 @@ UnsafePointer[T, MutAnyOrigin] inside. This satisfies @export's C-ABI requiremen
 while giving fully typed pointer access. N is always a runtime parameter so one
 compiled binary handles any row count — no MAX Graph JIT cold starts.
 
-Build:
-    mojo build --emit shared-lib kernels_aot/kernels_aot.mojo -o kernels_aot/libmxkernels_aot.so
+Multi-core (F-002)
+------------------
+Every hot kernel takes a trailing `threads` argument: the maximum number of
+worker tasks it may use.  The Python wrapper always passes >= 1 (default: every
+logical core the process may use); a value <= 0 falls back to the physical core count.  Work is split into
+morsels of MORSEL rows that workers claim from one atomic counter (morsel-driven,
+so a worker that loses its core to another process simply takes fewer morsels) and
+run with `sync_parallelize`; small inputs (< MIN_ROWS per worker) run on one worker.  No global state:
+several Python threads (ctypes releases the GIL) can call kernels at once, each
+with its own `threads` budget, so a co-processing scheduler can give some cores
+to feeding the GPU and the rest to CPU work.
 
-Pattern confirmed working in Mojo 0.26.2:
-    UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=addr)
+Accumulation is float64 for sum/mean (values may be float32 or float64), so a
+60M-row float32 sum no longer drifts.  Which worker sums which morsel varies from
+run to run, so float64 sums/means can differ in the last ulps between runs; counts,
+min/max, integer sums and all join/gather/composite outputs are exact and do not
+depend on `threads`.
+
+Grouped aggregates pick one of two strategies:
+  * per-worker partials — every worker aggregates its rows into a private
+                          (padded) array, merged in parallel by group range.
+                          Workers are capped so workers * n_groups <= PARTIAL_ELEMS
+  * serial              — one worker, tiny input, or n_groups > PARTIAL_ELEMS / 2
+Measured on a 12-core Ryzen 5900X (60M rows, 1.5M random groups) radix
+partitioning, SIMD owner-scan, per-worker partials and f64 atomics were all
+no faster than the serial loop (28 GB/s DRAM ceiling; the 12 MB accumulator
+array is latency-bound), so that regime stays serial rather than pay for
+extra memory traffic.
+
+Build:
+    mojo build -I kernels_aot --emit shared-lib kernels_aot/kernels_aot.mojo -o kernels_aot/libmxkernels_aot.so
 """
 
-from std.memory import UnsafePointer
+from std.memory import UnsafePointer, alloc, memset_zero
+from std.algorithm import sync_parallelize
+from std.sys.info import num_physical_cores
+from std.ffi import external_call
 
 comptime F32 = Float32
+comptime F64 = Float64
 comptime I32 = Int32
 comptime I64 = Int64
-comptime F32_MAX: Float32 = 3.4028234663852886e+38
-comptime F32_MIN: Float32 = -3.4028234663852886e+38
+
+# ABI version of the exported symbol set; aot_kernels.py refuses a stale .so.
+comptime ABI_VERSION = 2
+
+comptime MIN_ROWS = 1 << 16          # rows per worker below which we stay serial
+comptime MIN_ROWS_STREAM = 1 << 17   # same, for pure streaming reductions
+comptime MAX_WORKERS = 256
+comptime SW = 8                      # SIMD lanes (AVX2-friendly)
+comptime PARTIAL_ELEMS = 3 << 20     # cap on workers*groups for private partials (~25 MB of f64)
+
+comptime OP_SUM = 0
+comptime OP_MIN = 1
+comptime OP_MAX = 2
+comptime OP_COUNT = 3
+comptime OP_MEAN = 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,6 +74,10 @@ def _f32(addr: Int) -> UnsafePointer[F32, MutAnyOrigin]:
     return UnsafePointer[F32, MutAnyOrigin](unsafe_from_address=addr)
 
 @always_inline
+def _f64(addr: Int) -> UnsafePointer[F64, MutAnyOrigin]:
+    return UnsafePointer[F64, MutAnyOrigin](unsafe_from_address=addr)
+
+@always_inline
 def _i32(addr: Int) -> UnsafePointer[I32, MutAnyOrigin]:
     return UnsafePointer[I32, MutAnyOrigin](unsafe_from_address=addr)
 
@@ -38,150 +85,308 @@ def _i32(addr: Int) -> UnsafePointer[I32, MutAnyOrigin]:
 def _i64(addr: Int) -> UnsafePointer[I64, MutAnyOrigin]:
     return UnsafePointer[I64, MutAnyOrigin](unsafe_from_address=addr)
 
+@always_inline
+def _sp[T: DType](addr: Int) -> UnsafePointer[Scalar[T], MutAnyOrigin]:
+    return UnsafePointer[Scalar[T], MutAnyOrigin](unsafe_from_address=addr)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# group_sum_f32
-# out[labels[i]] += values[i]  for i in 0..n_rows
-# ─────────────────────────────────────────────────────────────────────────────
+
+comptime MORSEL = 1 << 17            # rows per dynamically claimed morsel
+
+
+@always_inline
+def _fetch_add_i32(ptr: UnsafePointer[I32, MutAnyOrigin], val: I32) -> I32:
+    """Atomic add (monotonic) via llvm.atomicrmw; same MLIR pattern as _atomic.mojo."""
+    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](val)
+    var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i32](p, v)
+    return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[I32]](r)
+
+
+@always_inline
+def _claim(ctr: UnsafePointer[I32, MutAnyOrigin]) -> Int:
+    """Next unclaimed morsel index (work-queue pop)."""
+    return Int(_fetch_add_i32(ctr, I32(1)))
+
+
+def _new_queue() -> UnsafePointer[I32, MutAnyOrigin]:
+    var ctr = alloc[I32](1)
+    ctr[0] = I32(0)
+    return ctr
+
+
+def _n_morsels(n: Int) -> Int:
+    return (n + MORSEL - 1) // MORSEL
+
+
+def _pick_workers(n: Int, threads: Int, min_rows: Int) -> Int:
+    """Number of parallel tasks for n rows: <= threads, >= 1, >= min_rows each."""
+    var t = threads
+    if t <= 0:
+        t = num_physical_cores()
+    if t > MAX_WORKERS:
+        t = MAX_WORKERS
+    var cap = n // min_rows
+    if cap < 1:
+        cap = 1
+    if t > cap:
+        t = cap
+    return t
+
+
 @export
-def group_sum_f32(
-    out_addr:    Int,
-    values_addr: Int,
-    labels_addr: Int,
-    n_rows:      Int,
-    n_groups:    Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var values = _f32(values_addr)
-    var labels = _i32(labels_addr)
-    for g in range(n_groups):
-        out[g] = F32(0.0)
-    for i in range(n_rows):
-        var g = Int(labels[i])
-        if g >= 0 and g < n_groups:
-            out[g] += values[i]
+def mx_init_runtime() abi("C") -> Int:
+    """Pin the Mojo async runtime (worker pool) for the life of the process.
+
+    Without a live reference, every sync_parallelize call builds and tears down
+    the whole pool (~1.7 ms/call); with one, a launch costs ~20 us.  Idempotent:
+    the reference is taken once and never released."""
+    return external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# group_sum_i64
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def group_sum_i64(
-    out_addr:    Int,
-    values_addr: Int,
-    labels_addr: Int,
-    n_rows:      Int,
-    n_groups:    Int,
-) abi("C"):
-    var out    = _i64(out_addr)
-    var values = _i64(values_addr)
-    var labels = _i32(labels_addr)
-    for g in range(n_groups):
-        out[g] = I64(0)
-    for i in range(n_rows):
-        var g = Int(labels[i])
-        if g >= 0 and g < n_groups:
-            out[g] += values[i]
+def mx_abi_version() abi("C") -> Int:
+    return ABI_VERSION
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# group_min_f32
-# out[labels[i]] = min(out[labels[i]], values[i])
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def group_min_f32(
-    out_addr:    Int,
-    values_addr: Int,
-    labels_addr: Int,
-    n_rows:      Int,
-    n_groups:    Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var values = _f32(values_addr)
-    var labels = _i32(labels_addr)
-    for g in range(n_groups):
-        out[g] = F32_MAX
-    for i in range(n_rows):
+def mx_num_physical_cores() abi("C") -> Int:
+    return num_physical_cores()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grouped aggregates:  sum / min / max / mean / count
+#   out[labels[i]] (op)= values[i]      labels outside [0, n_groups) are skipped
+# Accumulator type AT is float64 for float inputs (int64 for the int64 sum).
+# ─────────────────────────────────────────────────────────────────────────────
+
+@always_inline
+def _ident[OP: Int, VT: DType, AT: DType]() -> Scalar[AT]:
+    """Initial accumulator value. min/max keep the historical float32 sentinel."""
+    comptime if OP == OP_MIN:
+        comptime if AT == DType.int64:
+            return Scalar[AT].MAX
+        elif VT == DType.float32:
+            return Scalar[AT](3.4028234663852886e+38)
+        else:
+            return Scalar[AT](1.7976931348623157e+308)
+    elif OP == OP_MAX:
+        comptime if AT == DType.int64:
+            return Scalar[AT].MIN
+        elif VT == DType.float32:
+            return Scalar[AT](-3.4028234663852886e+38)
+        else:
+            return Scalar[AT](-1.7976931348623157e+308)
+    else:
+        return Scalar[AT](0)
+
+
+@always_inline
+def _val[OP: Int, VT: DType](values: UnsafePointer[Scalar[VT], MutAnyOrigin], i: Int) -> Scalar[VT]:
+    comptime if OP == OP_COUNT:
+        return Scalar[VT](0)
+    else:
+        return values[i]
+
+
+@always_inline
+def _step[OP: Int, VT: DType, AT: DType](
+    acc: UnsafePointer[Scalar[AT], MutAnyOrigin],
+    g: Int,
+    v: Scalar[VT],
+):
+    """One row.  Mean keeps (sum, count) interleaved at acc[2g], acc[2g+1] so a
+    row touches a single cache line."""
+    comptime if OP == OP_SUM:
+        acc[g] += v.cast[AT]()
+    elif OP == OP_MIN:
+        var x = v.cast[AT]()
+        if x < acc[g]:
+            acc[g] = x
+    elif OP == OP_MAX:
+        var x = v.cast[AT]()
+        if x > acc[g]:
+            acc[g] = x
+    elif OP == OP_COUNT:
+        acc[g] += Scalar[AT](1)
+    else:  # mean
+        acc[2 * g] += v.cast[AT]()
+        acc[2 * g + 1] += Scalar[AT](1)
+
+
+@always_inline
+def _combine[OP: Int, AT: DType](a: Scalar[AT], b: Scalar[AT]) -> Scalar[AT]:
+    comptime if OP == OP_MIN:
+        return b if b < a else a
+    elif OP == OP_MAX:
+        return b if b > a else a
+    else:
+        return a + b
+
+
+def _accumulate[OP: Int, VT: DType, AT: DType](
+    acc: UnsafePointer[Scalar[AT], MutAnyOrigin],
+    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
+    labels: UnsafePointer[I32, MutAnyOrigin],
+    lo: Int, hi: Int, G: Int,
+):
+    for i in range(lo, hi):
         var g = Int(labels[i])
-        if g >= 0 and g < n_groups:
-            var v = values[i]
-            if v < out[g]:
-                out[g] = v
+        if g >= 0 and g < G:
+            _step[OP, VT, AT](acc, g, _val[OP, VT](values, i))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# group_max_f32
-# ─────────────────────────────────────────────────────────────────────────────
+def _group_agg[OP: Int, VT: DType, AT: DType](
+    dst: UnsafePointer[Scalar[AT], MutAnyOrigin],
+    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
+    labels: UnsafePointer[I32, MutAnyOrigin],
+    n_rows: Int,
+    n_groups: Int,
+    threads: Int,
+):
+    if n_groups <= 0:
+        return
+    var out = dst
+    var G = n_groups
+    comptime K = 2 if OP == OP_MEAN else 1      # accumulator slots per group
+    var init = _ident[OP, VT, AT]()
+    var W = _pick_workers(n_rows, threads, MIN_ROWS)
+    if n_rows < 6 * G:
+        W = 1                        # init + merge of W x G partials would cost as much as the scan
+    elif K * G * W > PARTIAL_ELEMS:
+        W = PARTIAL_ELEMS // (K * G)     # fewer workers so private partials stay cache-sized
+
+    if W <= 1 or n_rows == 0:
+        # ---- serial: accumulate straight into `out` (mean: into a pair array) ----
+        comptime if OP == OP_MEAN:
+            var tmp = alloc[Scalar[AT]](2 * G)
+            memset_zero(tmp, 2 * G)
+            _accumulate[OP, VT, AT](tmp, values, labels, 0, n_rows, G)
+            for g in range(G):
+                var c = tmp[2 * g + 1]
+                out[g] = tmp[2 * g] / c if c > 0 else tmp[2 * g]
+            tmp.free()
+        else:
+            for g in range(G):
+                out[g] = init
+            _accumulate[OP, VT, AT](out, values, labels, 0, n_rows, G)
+    else:
+        # ---- per-worker private partial arrays, merged by group range ----
+        var stride = ((K * G + 15) // 16) * 16 + 16          # pad: no false sharing
+        var part = alloc[Scalar[AT]](W * stride)
+        var ctr = _new_queue()
+        var n_m = _n_morsels(n_rows)
+
+        @parameter
+        def scan(w: Int):
+            var p = part + w * stride
+            comptime if OP == OP_MEAN:
+                memset_zero(p, 2 * G)
+            else:
+                for g in range(G):
+                    p[g] = init
+            while True:                                   # pull morsels until the queue is empty
+                var m = _claim(ctr)
+                if m >= n_m:
+                    break
+                var lo = m * MORSEL
+                var hi = lo + MORSEL
+                if hi > n_rows:
+                    hi = n_rows
+                _accumulate[OP, VT, AT](p, values, labels, lo, hi, G)
+
+        sync_parallelize[scan](W)
+        ctr.free()
+
+        var MT = G // 4096
+        if MT > W:
+            MT = W
+        if MT < 1:
+            MT = 1
+
+        @parameter
+        def merge(t: Int):
+            var g0 = (t * G) // MT
+            var g1 = ((t + 1) * G) // MT
+            for g in range(g0, g1):
+                comptime if OP == OP_MEAN:
+                    var s = part[2 * g]
+                    var c = part[2 * g + 1]
+                    for w in range(1, W):
+                        s += part[w * stride + 2 * g]
+                        c += part[w * stride + 2 * g + 1]
+                    out[g] = s / c if c > 0 else s
+                else:
+                    var a = part[g]
+                    for w in range(1, W):
+                        a = _combine[OP, AT](a, part[w * stride + g])
+                    out[g] = a
+
+        sync_parallelize[merge](MT)
+        part.free()
+
+
+# ---- exports: out is float64 for sum/min/max/mean/count (int64 for sum_i64) ----
+
 @export
-def group_max_f32(
-    out_addr:    Int,
-    values_addr: Int,
-    labels_addr: Int,
-    n_rows:      Int,
-    n_groups:    Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var values = _f32(values_addr)
-    var labels = _i32(labels_addr)
-    for g in range(n_groups):
-        out[g] = F32_MIN
-    for i in range(n_rows):
-        var g = Int(labels[i])
-        if g >= 0 and g < n_groups:
-            var v = values[i]
-            if v > out[g]:
-                out[g] = v
+def group_sum_f32(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_SUM, DType.float32, DType.float64](
+        _f64(out_addr), _f32(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# group_mean_f32
-# Compute sum and count in one pass, divide at end.
-# out_sum[g] receives the mean; out_count (scratch) is int-sized counts.
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def group_mean_f32(
-    out_addr:      Int,
-    count_addr:    Int,   # scratch: Int32 counts, length n_groups
-    values_addr:   Int,
-    labels_addr:   Int,
-    n_rows:        Int,
-    n_groups:      Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var cnt    = _i32(count_addr)
-    var values = _f32(values_addr)
-    var labels = _i32(labels_addr)
-    for g in range(n_groups):
-        out[g] = F32(0.0)
-        cnt[g] = I32(0)
-    for i in range(n_rows):
-        var g = Int(labels[i])
-        if g >= 0 and g < n_groups:
-            out[g] += values[i]
-            cnt[g] += I32(1)
-    for g in range(n_groups):
-        if cnt[g] > 0:
-            out[g] = out[g] / F32(Int(cnt[g]))
+def group_sum_f64(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_SUM, DType.float64, DType.float64](
+        _f64(out_addr), _f64(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# group_count_f32  (output is float32 counts for consistency with MAX Graph)
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def group_count_f32(
-    out_addr:    Int,
-    labels_addr: Int,
-    n_rows:      Int,
-    n_groups:    Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var labels = _i32(labels_addr)
-    for g in range(n_groups):
-        out[g] = F32(0.0)
-    for i in range(n_rows):
-        var g = Int(labels[i])
-        if g >= 0 and g < n_groups:
-            out[g] += F32(1.0)
+def group_sum_i64(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_SUM, DType.int64, DType.int64](
+        _i64(out_addr), _i64(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_min_f32(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_MIN, DType.float32, DType.float64](
+        _f64(out_addr), _f32(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_min_f64(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_MIN, DType.float64, DType.float64](
+        _f64(out_addr), _f64(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_max_f32(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_MAX, DType.float32, DType.float64](
+        _f64(out_addr), _f32(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_max_f64(out_addr: Int, values_addr: Int, labels_addr: Int,
+                  n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_MAX, DType.float64, DType.float64](
+        _f64(out_addr), _f64(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_mean_f32(out_addr: Int, values_addr: Int, labels_addr: Int,
+                   n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_MEAN, DType.float32, DType.float64](
+        _f64(out_addr), _f32(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_mean_f64(out_addr: Int, values_addr: Int, labels_addr: Int,
+                   n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    _group_agg[OP_MEAN, DType.float64, DType.float64](
+        _f64(out_addr), _f64(values_addr), _i32(labels_addr), n_rows, n_groups, threads)
+
+@export
+def group_count(out_addr: Int, labels_addr: Int,
+                n_rows: Int, n_groups: Int, threads: Int) abi("C"):
+    """Float64 out[g] = number of rows with labels == g."""
+    _group_agg[OP_COUNT, DType.float32, DType.float64](
+        _f64(out_addr), _f32(0), _i32(labels_addr), n_rows, n_groups, threads)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +402,7 @@ def group_composite(
     k3_addr:      Int,
     strides_addr: Int,   # int64[4]: s0,s1,s2,s3
     n_rows:       Int,
+    threads:      Int,
 ) abi("C"):
     var out     = _i64(out_addr)
     var k0      = _i32(k0_addr)
@@ -208,147 +414,319 @@ def group_composite(
     var s1 = strides[1]
     var s2 = strides[2]
     var s3 = strides[3]
-    for i in range(n_rows):
-        out[i] = I64(k0[i])*s0 + I64(k1[i])*s1 + I64(k2[i])*s2 + I64(k3[i])*s3
+    var W = _pick_workers(n_rows, threads, MIN_ROWS_STREAM)
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n_rows)
+
+    @parameter
+    def work(w: Int):
+        while True:
+            var m = _claim(ctr)
+            if m >= n_m:
+                break
+            var lo = m * MORSEL
+            var hi = lo + MORSEL
+            if hi > n_rows:
+                hi = n_rows
+            for i in range(lo, hi):
+                out[i] = I64(k0[i])*s0 + I64(k1[i])*s1 + I64(k2[i])*s2 + I64(k3[i])*s3
+
+    sync_parallelize[work](W)
+    ctr.free()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# masked_global_sum_f32
-# result[0] = sum(values[i] where mask[i] != 0)
+# Masked global aggregates (pure streaming reductions, SIMD + multi-core)
+#   sum / sum_product accumulate in float64; min / max are exact.
+#   `out` is a single float64.  mask is int32, non-zero = row passes.
 # ─────────────────────────────────────────────────────────────────────────────
-@export
-def masked_global_sum_f32(
-    out_addr:    Int,
-    values_addr: Int,
-    mask_addr:   Int,
-    n:           Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var values = _f32(values_addr)
-    var mask   = _i32(mask_addr)
-    var acc: F32 = 0.0
-    for i in range(n):
+
+
+
+@always_inline
+def _big[VT: DType]() -> Scalar[VT]:
+    comptime if VT == DType.float32:
+        return Scalar[VT](3.4028234663852886e+38)
+    else:
+        return Scalar[VT](1.7976931348623157e+308)
+
+
+def _msum_range[VT: DType](
+    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
+    mask: UnsafePointer[I32, MutAnyOrigin], lo: Int, hi: Int,
+) -> F64:
+    var zero = SIMD[DType.float64, SW](0)
+    var a0 = zero
+    var a1 = zero
+    var i = lo
+    while i + 2 * SW <= hi:
+        var m0 = mask.load[width=SW](i)
+        var m1 = mask.load[width=SW](i + SW)
+        var v0 = values.load[width=SW](i).cast[DType.float64]()
+        var v1 = values.load[width=SW](i + SW).cast[DType.float64]()
+        a0 += m0.ne(0).select(v0, zero)
+        a1 += m1.ne(0).select(v1, zero)
+        i += 2 * SW
+    var acc = (a0 + a1).reduce_add()
+    while i < hi:
         if mask[i] != I32(0):
-            acc += values[i]
-    out[0] = acc
+            acc += values[i].cast[DType.float64]()
+        i += 1
+    return acc
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# masked_global_min_f32
-# ─────────────────────────────────────────────────────────────────────────────
-@export
-def masked_global_min_f32(
-    out_addr:    Int,
-    values_addr: Int,
-    mask_addr:   Int,
-    n:           Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var values = _f32(values_addr)
-    var mask   = _i32(mask_addr)
-    var acc: F32 = F32_MAX
-    for i in range(n):
+def _mprod_range[VT: DType](
+    a: UnsafePointer[Scalar[VT], MutAnyOrigin],
+    b: UnsafePointer[Scalar[VT], MutAnyOrigin],
+    mask: UnsafePointer[I32, MutAnyOrigin], lo: Int, hi: Int,
+) -> F64:
+    var zero = SIMD[DType.float64, SW](0)
+    var a0 = zero
+    var a1 = zero
+    var i = lo
+    while i + 2 * SW <= hi:
+        var m0 = mask.load[width=SW](i)
+        var m1 = mask.load[width=SW](i + SW)
+        var p0 = a.load[width=SW](i).cast[DType.float64]() * b.load[width=SW](i).cast[DType.float64]()
+        var p1 = a.load[width=SW](i + SW).cast[DType.float64]() * b.load[width=SW](i + SW).cast[DType.float64]()
+        a0 += m0.ne(0).select(p0, zero)
+        a1 += m1.ne(0).select(p1, zero)
+        i += 2 * SW
+    var acc = (a0 + a1).reduce_add()
+    while i < hi:
         if mask[i] != I32(0):
-            var v = values[i]
-            if v < acc:
-                acc = v
-    out[0] = acc
+            acc += a[i].cast[DType.float64]() * b[i].cast[DType.float64]()
+        i += 1
+    return acc
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# masked_global_max_f32
-# ─────────────────────────────────────────────────────────────────────────────
-@export
-def masked_global_max_f32(
-    out_addr:    Int,
-    values_addr: Int,
-    mask_addr:   Int,
-    n:           Int,
-) abi("C"):
-    var out    = _f32(out_addr)
-    var values = _f32(values_addr)
-    var mask   = _i32(mask_addr)
-    var acc: F32 = F32_MIN
-    for i in range(n):
+def _mext_range[VT: DType, IS_MIN: Bool](
+    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
+    mask: UnsafePointer[I32, MutAnyOrigin], lo: Int, hi: Int,
+) -> Scalar[VT]:
+    """Masked min (IS_MIN) or max; NaN values are ignored like the scalar loop."""
+    var ident: Scalar[VT]
+    comptime if IS_MIN:
+        ident = _big[VT]()
+    else:
+        ident = -_big[VT]()
+    var acc = SIMD[VT, SW](ident)
+    var i = lo
+    while i + SW <= hi:
+        var m = mask.load[width=SW](i).ne(0)
+        var v = m.select(values.load[width=SW](i), SIMD[VT, SW](ident))
+        comptime if IS_MIN:
+            acc = v.lt(acc).select(v, acc)
+        else:
+            acc = v.gt(acc).select(v, acc)
+        i += SW
+    var r = ident
+    for k in range(SW):
+        var x = acc[k]
+        comptime if IS_MIN:
+            if x < r:
+                r = x
+        else:
+            if x > r:
+                r = x
+    while i < hi:
         if mask[i] != I32(0):
-            var v = values[i]
-            if v > acc:
-                acc = v
-    out[0] = acc
+            var x = values[i]
+            comptime if IS_MIN:
+                if x < r:
+                    r = x
+            else:
+                if x > r:
+                    r = x
+        i += 1
+    return r
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# masked_global_sum_product_f32
-# result[0] = sum(values_a[i] * values_b[i] where mask[i] != 0)
-# ─────────────────────────────────────────────────────────────────────────────
+def _masked_sum[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
+                           values: UnsafePointer[Scalar[VT], MutAnyOrigin],
+                           mask: UnsafePointer[I32, MutAnyOrigin], n: Int, threads: Int):
+    var out = dst
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+    var parts = alloc[F64](W)
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n)
+
+    @parameter
+    def work(w: Int):
+        var acc: F64 = 0.0
+        while True:
+            var m = _claim(ctr)
+            if m >= n_m:
+                break
+            var lo = m * MORSEL
+            acc += _msum_range[VT](values, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
+        parts[w] = acc
+
+    sync_parallelize[work](W)
+    ctr.free()
+    var total: F64 = 0.0
+    for w in range(W):
+        total += parts[w]
+    out[0] = total
+    parts.free()
+
+
+def _masked_sum_product[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
+                                   a: UnsafePointer[Scalar[VT], MutAnyOrigin],
+                                   b: UnsafePointer[Scalar[VT], MutAnyOrigin],
+                                   mask: UnsafePointer[I32, MutAnyOrigin], n: Int, threads: Int):
+    var out = dst
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+    var parts = alloc[F64](W)
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n)
+
+    @parameter
+    def work(w: Int):
+        var acc: F64 = 0.0
+        while True:
+            var m = _claim(ctr)
+            if m >= n_m:
+                break
+            var lo = m * MORSEL
+            acc += _mprod_range[VT](a, b, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
+        parts[w] = acc
+
+    sync_parallelize[work](W)
+    ctr.free()
+    var total: F64 = 0.0
+    for w in range(W):
+        total += parts[w]
+    out[0] = total
+    parts.free()
+
+
+def _masked_ext[VT: DType, IS_MIN: Bool](dst: UnsafePointer[F64, MutAnyOrigin],
+                                         values: UnsafePointer[Scalar[VT], MutAnyOrigin],
+                                         mask: UnsafePointer[I32, MutAnyOrigin], n: Int, threads: Int):
+    var out = dst
+    var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
+    var parts = alloc[Scalar[VT]](W)
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n)
+    var ident: Scalar[VT]
+    comptime if IS_MIN:
+        ident = _big[VT]()
+    else:
+        ident = -_big[VT]()
+
+    @parameter
+    def work(w: Int):
+        var best = ident
+        while True:
+            var m = _claim(ctr)
+            if m >= n_m:
+                break
+            var lo = m * MORSEL
+            var x = _mext_range[VT, IS_MIN](values, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
+            comptime if IS_MIN:
+                if x < best:
+                    best = x
+            else:
+                if x > best:
+                    best = x
+        parts[w] = best
+
+    sync_parallelize[work](W)
+    ctr.free()
+    var r = parts[0]
+    for w in range(1, W):
+        comptime if IS_MIN:
+            if parts[w] < r:
+                r = parts[w]
+        else:
+            if parts[w] > r:
+                r = parts[w]
+    out[0] = r.cast[DType.float64]()
+    parts.free()
+
+
 @export
-def masked_global_sum_product_f32(
-    out_addr:      Int,
-    values_a_addr: Int,
-    values_b_addr: Int,
-    mask_addr:     Int,
-    n:             Int,
-) abi("C"):
-    var out      = _f32(out_addr)
-    var values_a = _f32(values_a_addr)
-    var values_b = _f32(values_b_addr)
-    var mask     = _i32(mask_addr)
-    var acc: F32 = 0.0
-    for i in range(n):
-        if mask[i] != I32(0):
-            acc += values_a[i] * values_b[i]
-    out[0] = acc
+def masked_global_sum_f32(out_addr: Int, values_addr: Int, mask_addr: Int,
+                          n: Int, threads: Int) abi("C"):
+    _masked_sum[DType.float32](_f64(out_addr), _f32(values_addr), _i32(mask_addr), n, threads)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# gather_f32   output[i] = values[indices[i]]
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def gather_f32(
-    out_addr:     Int,
-    values_addr:  Int,
-    indices_addr: Int,
-    m:            Int,   # length of output / indices
-) abi("C"):
-    var out     = _f32(out_addr)
-    var values  = _f32(values_addr)
+def masked_global_sum_f64(out_addr: Int, values_addr: Int, mask_addr: Int,
+                          n: Int, threads: Int) abi("C"):
+    _masked_sum[DType.float64](_f64(out_addr), _f64(values_addr), _i32(mask_addr), n, threads)
+
+@export
+def masked_global_min_f32(out_addr: Int, values_addr: Int, mask_addr: Int,
+                          n: Int, threads: Int) abi("C"):
+    _masked_ext[DType.float32, True](_f64(out_addr), _f32(values_addr), _i32(mask_addr), n, threads)
+
+@export
+def masked_global_min_f64(out_addr: Int, values_addr: Int, mask_addr: Int,
+                          n: Int, threads: Int) abi("C"):
+    _masked_ext[DType.float64, True](_f64(out_addr), _f64(values_addr), _i32(mask_addr), n, threads)
+
+@export
+def masked_global_max_f32(out_addr: Int, values_addr: Int, mask_addr: Int,
+                          n: Int, threads: Int) abi("C"):
+    _masked_ext[DType.float32, False](_f64(out_addr), _f32(values_addr), _i32(mask_addr), n, threads)
+
+@export
+def masked_global_max_f64(out_addr: Int, values_addr: Int, mask_addr: Int,
+                          n: Int, threads: Int) abi("C"):
+    _masked_ext[DType.float64, False](_f64(out_addr), _f64(values_addr), _i32(mask_addr), n, threads)
+
+@export
+def masked_global_sum_product_f32(out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int,
+                                  n: Int, threads: Int) abi("C"):
+    _masked_sum_product[DType.float32](_f64(out_addr), _f32(a_addr), _f32(b_addr), _i32(mask_addr), n, threads)
+
+@export
+def masked_global_sum_product_f64(out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int,
+                                  n: Int, threads: Int) abi("C"):
+    _masked_sum_product[DType.float64](_f64(out_addr), _f64(a_addr), _f64(b_addr), _i32(mask_addr), n, threads)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# gather_{f32,i32,i64}   output[i] = values[indices[i]]   (parallel over output)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gather[T: DType](out_addr: Int, values_addr: Int, indices_addr: Int, m: Int, threads: Int):
+    var out = _sp[T](out_addr)
+    var values = _sp[T](values_addr)
     var indices = _i32(indices_addr)
-    for i in range(m):
-        out[i] = values[Int(indices[i])]
+    var W = _pick_workers(m, threads, MIN_ROWS)
+    var ctr = _new_queue()
+    var n_m = _n_morsels(m)
+
+    @parameter
+    def work(w: Int):
+        while True:
+            var q = _claim(ctr)
+            if q >= n_m:
+                break
+            var lo = q * MORSEL
+            var hi = lo + MORSEL
+            if hi > m:
+                hi = m
+            for i in range(lo, hi):
+                out[i] = values[Int(indices[i])]
+
+    sync_parallelize[work](W)
+    ctr.free()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# gather_i32
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def gather_i32(
-    out_addr:     Int,
-    values_addr:  Int,
-    indices_addr: Int,
-    m:            Int,
-) abi("C"):
-    var out     = _i32(out_addr)
-    var values  = _i32(values_addr)
-    var indices = _i32(indices_addr)
-    for i in range(m):
-        out[i] = values[Int(indices[i])]
+def gather_f32(out_addr: Int, values_addr: Int, indices_addr: Int, m: Int, threads: Int) abi("C"):
+    _gather[DType.float32](out_addr, values_addr, indices_addr, m, threads)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# gather_i64
-# ─────────────────────────────────────────────────────────────────────────────
 @export
-def gather_i64(
-    out_addr:     Int,
-    values_addr:  Int,
-    indices_addr: Int,
-    m:            Int,
-) abi("C"):
-    var out     = _i64(out_addr)
-    var values  = _i64(values_addr)
-    var indices = _i32(indices_addr)
-    for i in range(m):
-        out[i] = values[Int(indices[i])]
+def gather_i32(out_addr: Int, values_addr: Int, indices_addr: Int, m: Int, threads: Int) abi("C"):
+    _gather[DType.int32](out_addr, values_addr, indices_addr, m, threads)
+
+@export
+def gather_i64(out_addr: Int, values_addr: Int, indices_addr: Int, m: Int, threads: Int) abi("C"):
+    _gather[DType.int64](out_addr, values_addr, indices_addr, m, threads)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,10 +888,114 @@ def filter_gather_i64(
             out[Int(offsets[i])] = values[i]
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# join_count (inner join)
-# For each left row: match_counts[i] = number of right rows with same key
+# Joins (inner / left) on dense int32 keys.
+#
+# Build side (right): a direct-address "CSR" index over keys 0..max_key,
+#   A[k + 1] = end offset of key k's run, positions[] = right row ids grouped by
+#   key (ascending row id within a key, so output order matches the serial
+#   kernel exactly).  Built in parallel by KEY-RANGE OWNERSHIP: worker w owns a
+#   contiguous key range and sweeps all right keys, touching only its own
+#   counters — no atomics, no partial tables.  Probe (left) is embarrassingly
+#   parallel over left rows.
+#
+#   count-only layout : start(k) = A[k],     end(k) = A[k + 1]
+#   after fill layout : start(k) = A[k + 1], end(k) = A[k + 2]
 # ─────────────────────────────────────────────────────────────────────────────
+
+comptime MIN_KEYS_PER_OWNER = 4096
+
+
+def _build_index(
+    A: UnsafePointer[I32, MutAnyOrigin],          # (table_size + 2) entries
+    positions: UnsafePointer[I32, MutAnyOrigin],  # n_right entries (fill only)
+    right_keys: UnsafePointer[I32, MutAnyOrigin],
+    n_right: Int,
+    table_size: Int,
+    fill: Bool,
+    threads: Int,
+):
+    var T = table_size
+    var Wk = _pick_workers(n_right, threads, 1 << 18)
+    var cap = T // MIN_KEYS_PER_OWNER
+    if cap < 1:
+        cap = 1
+    if Wk > cap:
+        Wk = cap
+    var Wz = _pick_workers(T + 2, threads, 1 << 18)
+    var tot = alloc[Int](Wk + 1)
+
+    @parameter
+    def zero(w: Int):
+        var lo = (w * (T + 2)) // Wz
+        var hi = ((w + 1) * (T + 2)) // Wz
+        memset_zero(A + lo, hi - lo)
+
+    @parameter
+    def count(w: Int):
+        var kl = (w * T) // Wk
+        var kh = ((w + 1) * T) // Wk
+        for i in range(n_right):
+            var k = Int(right_keys[i])
+            if k >= kl and k < kh:
+                A[k + 1] += 1
+
+    @parameter
+    def scan1(w: Int):
+        var kl = (w * T) // Wk
+        var kh = ((w + 1) * T) // Wk
+        var run = 0
+        for k in range(kl, kh):
+            run += Int(A[k + 1])
+            A[k + 1] = I32(run)
+        tot[w] = run
+
+    @parameter
+    def scan2(w: Int):
+        var kl = (w * T) // Wk
+        var kh = ((w + 1) * T) // Wk
+        var base = I32(tot[w])          # exclusive offset of this range (set below)
+        if base != 0:
+            for k in range(kl, kh):
+                A[k + 1] += base
+
+    @parameter
+    def fill_pass(w: Int):
+        var kl = (w * T) // Wk
+        var kh = ((w + 1) * T) // Wk
+        var i = n_right - 1
+        while i >= 0:
+            var k = Int(right_keys[i])
+            if k >= kl and k < kh:
+                var p = A[k + 1] - 1
+                A[k + 1] = p
+                positions[Int(p)] = I32(i)
+            i -= 1
+
+    sync_parallelize[zero](Wz)
+    sync_parallelize[count](Wk)
+    sync_parallelize[scan1](Wk)
+    # turn per-range totals into exclusive bases, in place
+    var run = 0
+    for w in range(Wk):
+        var t = tot[w]
+        tot[w] = run
+        run += t
+    A[T + 1] = I32(run)                 # sentinel: total valid right rows
+    sync_parallelize[scan2](Wk)
+    if fill:
+        sync_parallelize[fill_pass](Wk)
+    tot.free()
+
+
+@always_inline
+def _run_bounds(A: UnsafePointer[I32, MutAnyOrigin], k: Int, sh: Int) -> Int:
+    """Number of right rows matching key k (0 for out-of-range keys is handled
+    by the caller)."""
+    return Int(A[k + sh + 1]) - Int(A[k + sh])
+
+
 @export
 def join_count(
     match_counts_addr: Int,   # int32[n_left]
@@ -522,30 +1004,155 @@ def join_count(
     n_left:            Int,
     n_right:           Int,
     max_key:           Int,   # caller provides max(max(left), max(right))
+    threads:           Int,
 ) abi("C"):
     var match_counts = _i32(match_counts_addr)
     var left_keys    = _i32(left_keys_addr)
     var right_keys   = _i32(right_keys_addr)
-    var table_size   = max_key + 1
-    var right_count  = List[I32](capacity=table_size)
-    for _ in range(table_size):
-        right_count.append(I32(0))
-    for i in range(n_right):
-        var k = Int(right_keys[i])
-        if k >= 0 and k < table_size:
-            right_count[k] += I32(1)
-    for i in range(n_left):
-        var k = Int(left_keys[i])
-        if k >= 0 and k < table_size:
-            match_counts[i] = right_count[k]
-        else:
-            match_counts[i] = I32(0)
+    var T = max_key + 1
+    if T < 1:
+        T = 1
+    var A = alloc[I32](T + 2)
+    var pos = alloc[I32](1)
+    _build_index(A, pos, right_keys, n_right, T, False, threads)
+    var W = _pick_workers(n_left, threads, MIN_ROWS)
+
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n_left)
+
+    @parameter
+    def probe(w: Int):
+        while True:
+            var q = _claim(ctr)
+            if q >= n_m:
+                break
+            var lo = q * MORSEL
+            var hi = lo + MORSEL
+            if hi > n_left:
+                hi = n_left
+            for i in range(lo, hi):
+                var k = Int(left_keys[i])
+                if k >= 0 and k < T:
+                    match_counts[i] = I32(_run_bounds(A, k, 0))
+                else:
+                    match_counts[i] = I32(0)
+
+    sync_parallelize[probe](W)
+    ctr.free()
+    A.free()
+    pos.free()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# join_scatter (inner join)
-# Emit (left_index, right_index) pairs given prefix-sum offsets
-# ─────────────────────────────────────────────────────────────────────────────
+@export
+def join_count_left(
+    match_counts_addr: Int,
+    left_keys_addr:    Int,
+    right_keys_addr:   Int,
+    n_left:            Int,
+    n_right:           Int,
+    max_key:           Int,
+    threads:           Int,
+) abi("C"):
+    """Left-join counts: max(1, right matches), so unmatched left rows get 1."""
+    var match_counts = _i32(match_counts_addr)
+    var left_keys    = _i32(left_keys_addr)
+    var right_keys   = _i32(right_keys_addr)
+    var T = max_key + 1
+    if T < 1:
+        T = 1
+    var A = alloc[I32](T + 2)
+    var pos = alloc[I32](1)
+    _build_index(A, pos, right_keys, n_right, T, False, threads)
+    var W = _pick_workers(n_left, threads, MIN_ROWS)
+
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n_left)
+
+    @parameter
+    def probe(w: Int):
+        while True:
+            var q = _claim(ctr)
+            if q >= n_m:
+                break
+            var lo = q * MORSEL
+            var hi = lo + MORSEL
+            if hi > n_left:
+                hi = n_left
+            for i in range(lo, hi):
+                var k = Int(left_keys[i])
+                var cnt = 0
+                if k >= 0 and k < T:
+                    cnt = _run_bounds(A, k, 0)
+                match_counts[i] = I32(cnt if cnt > 0 else 1)
+
+    sync_parallelize[probe](W)
+    ctr.free()
+    A.free()
+    pos.free()
+
+
+def _join_scatter_impl[LEFT: Bool](
+    left_out_addr:   Int,
+    right_out_addr:  Int,
+    left_keys_addr:  Int,
+    right_keys_addr: Int,
+    offsets_addr:    Int,
+    n_left:          Int,
+    n_right:         Int,
+    max_key:         Int,
+    threads:         Int,
+):
+    var left_out   = _i32(left_out_addr)
+    var right_out  = _i32(right_out_addr)
+    var left_keys  = _i32(left_keys_addr)
+    var right_keys = _i32(right_keys_addr)
+    var offsets    = _i32(offsets_addr)
+    var T = max_key + 1
+    if T < 1:
+        T = 1
+    var A = alloc[I32](T + 2)
+    var pos = alloc[I32](n_right if n_right > 0 else 1)
+    _build_index(A, pos, right_keys, n_right, T, True, threads)
+    var W = _pick_workers(n_left, threads, MIN_ROWS)
+
+    var ctr = _new_queue()
+    var n_m = _n_morsels(n_left)
+
+    @parameter
+    def probe(w: Int):
+        while True:
+            var q = _claim(ctr)
+            if q >= n_m:
+                break
+            var lo = q * MORSEL
+            var hi = lo + MORSEL
+            if hi > n_left:
+                hi = n_left
+            for i in range(lo, hi):
+                var k = Int(left_keys[i])
+                var s = 0
+                var rc = 0
+                if k >= 0 and k < T:
+                    s = Int(A[k + 1])
+                    rc = Int(A[k + 2]) - s
+                var base = Int(offsets[i])
+                if rc == 0:
+                    comptime if LEFT:
+                        left_out[base]  = I32(i)
+                        right_out[base] = I32(-1)
+                else:
+                    for j in range(rc):
+                        left_out[base + j]  = I32(i)
+                        right_out[base + j] = pos[s + j]
+
+    sync_parallelize[probe](W)
+    ctr.free()
+    A.free()
+    pos.free()
+
+
+# join_scatter (inner join): emit (left_index, right_index) pairs given
+# exclusive prefix-sum offsets of match_counts.
 @export
 def join_scatter(
     left_out_addr:   Int,   # int32[total_matches]
@@ -556,87 +1163,14 @@ def join_scatter(
     n_left:          Int,
     n_right:         Int,
     max_key:         Int,
+    threads:         Int,
 ) abi("C"):
-    var left_out   = _i32(left_out_addr)
-    var right_out  = _i32(right_out_addr)
-    var left_keys  = _i32(left_keys_addr)
-    var right_keys = _i32(right_keys_addr)
-    var offsets    = _i32(offsets_addr)
-    var table_size = max_key + 1
-
-    var right_count = List[I32](capacity=table_size)
-    for _ in range(table_size):
-        right_count.append(I32(0))
-    for i in range(n_right):
-        var k = Int(right_keys[i])
-        if k >= 0 and k < table_size:
-            right_count[k] += I32(1)
-
-    var right_start = List[I32](capacity=table_size)
-    right_start.append(I32(0))
-    for i in range(1, table_size):
-        right_start.append(right_start[i-1] + right_count[i-1])
-
-    var right_positions = List[I32](capacity=n_right)
-    for _ in range(n_right):
-        right_positions.append(I32(0))
-    var cursor = List[I32](capacity=table_size)
-    for i in range(table_size):
-        cursor.append(right_start[i])
-    for i in range(n_right):
-        var k = Int(right_keys[i])
-        if k >= 0 and k < table_size:
-            right_positions[Int(cursor[k])] = I32(i)
-            cursor[k] += I32(1)
-
-    for i in range(n_left):
-        var k = Int(left_keys[i])
-        if k < 0 or k >= table_size:
-            continue
-        var rc = Int(right_count[k])
-        var base = Int(offsets[i])
-        var rs   = Int(right_start[k])
-        for j in range(rc):
-            left_out[base + j]  = I32(i)
-            right_out[base + j] = right_positions[rs + j]
+    _join_scatter_impl[False](left_out_addr, right_out_addr, left_keys_addr,
+        right_keys_addr, offsets_addr, n_left, n_right, max_key, threads)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# join_count_left (left join)
-# match_counts[i] = max(1, number of right matches) — unmatched left rows get 1
-# ─────────────────────────────────────────────────────────────────────────────
-@export
-def join_count_left(
-    match_counts_addr: Int,
-    left_keys_addr:    Int,
-    right_keys_addr:   Int,
-    n_left:            Int,
-    n_right:           Int,
-    max_key:           Int,
-) abi("C"):
-    var match_counts = _i32(match_counts_addr)
-    var left_keys    = _i32(left_keys_addr)
-    var right_keys   = _i32(right_keys_addr)
-    var table_size   = max_key + 1
-    var right_count  = List[I32](capacity=table_size)
-    for _ in range(table_size):
-        right_count.append(I32(0))
-    for i in range(n_right):
-        var k = Int(right_keys[i])
-        if k >= 0 and k < table_size:
-            right_count[k] += I32(1)
-    for i in range(n_left):
-        var k = Int(left_keys[i])
-        var cnt: Int = 0
-        if k >= 0 and k < table_size:
-            cnt = Int(right_count[k])
-        match_counts[i] = I32(cnt if cnt > 0 else 1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# join_scatter_left (left join)
-# Like join_scatter but unmatched left rows emit right_index = -1
-# ─────────────────────────────────────────────────────────────────────────────
+# join_scatter_left (left join): like join_scatter but unmatched left rows
+# emit right_index = -1.
 @export
 def join_scatter_left(
     left_out_addr:   Int,
@@ -647,50 +1181,7 @@ def join_scatter_left(
     n_left:          Int,
     n_right:         Int,
     max_key:         Int,
+    threads:         Int,
 ) abi("C"):
-    var left_out   = _i32(left_out_addr)
-    var right_out  = _i32(right_out_addr)
-    var left_keys  = _i32(left_keys_addr)
-    var right_keys = _i32(right_keys_addr)
-    var offsets    = _i32(offsets_addr)
-    var table_size = max_key + 1
-
-    var right_count = List[I32](capacity=table_size)
-    for _ in range(table_size):
-        right_count.append(I32(0))
-    for i in range(n_right):
-        var k = Int(right_keys[i])
-        if k >= 0 and k < table_size:
-            right_count[k] += I32(1)
-
-    var right_start = List[I32](capacity=table_size)
-    right_start.append(I32(0))
-    for i in range(1, table_size):
-        right_start.append(right_start[i-1] + right_count[i-1])
-
-    var right_positions = List[I32](capacity=n_right)
-    for _ in range(n_right):
-        right_positions.append(I32(0))
-    var cursor = List[I32](capacity=table_size)
-    for i in range(table_size):
-        cursor.append(right_start[i])
-    for i in range(n_right):
-        var k = Int(right_keys[i])
-        if k >= 0 and k < table_size:
-            right_positions[Int(cursor[k])] = I32(i)
-            cursor[k] += I32(1)
-
-    for i in range(n_left):
-        var k = Int(left_keys[i])
-        var rc: Int = 0
-        if k >= 0 and k < table_size:
-            rc = Int(right_count[k])
-        var base = Int(offsets[i])
-        if rc == 0:
-            left_out[base]  = I32(i)
-            right_out[base] = I32(-1)
-        else:
-            var rs = Int(right_start[k])
-            for j in range(rc):
-                left_out[base + j]  = I32(i)
-                right_out[base + j] = right_positions[rs + j]
+    _join_scatter_impl[True](left_out_addr, right_out_addr, left_keys_addr,
+        right_keys_addr, offsets_addr, n_left, n_right, max_key, threads)

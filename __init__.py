@@ -45,6 +45,10 @@ def __getattr__(name: str):
         raise _runtime_import_error() from exc
 
 
+# CPU worker budget (env MXFRAME_CPU_THREADS, default all cores).  Pure ctypes/numpy import.
+from .aot_kernels import get_cpu_threads, set_cpu_threads
+
+
 def clear_cache() -> None:
     try:
         from .custom_ops import clear_cache as _clear_cache
