@@ -72,6 +72,8 @@ Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain ho
 
 ## F-006 Router co-processing for grouped and global aggregates [doing]
 Needs: F-002, F-003, F-005 · Files: `coproc.py` (new), hook in `custom_ops.py`
+Done so far: `auto_mode.Placer` (cpu/gpu/split cost decision), `coproc.run_router` (morsel queue, prepare/compute overlap, fallible GPU worker), `gpu_stream.DeviceStager` (pinned slots, async H2D), `residency.ResidencyTracker` (LRU GPU copies, pins).
+Physics on the reference box (measured 2026-09-29): GPU link is PCIe 4.0 **x8** — pinned H2D 13.4 GB/s, pageable 11 GB/s, stager ~9 GB/s; host DRAM (Ryzen 5900X, dual-channel DDR4) ~40–50 GB/s. So a scan-aggregate over host-resident data is ~4× faster on all CPU cores than shipping it to the GPU, and splitting a pure scan gains little (both devices read the same DRAM). The GPU earns its keep on (a) joins / high-cardinality group-bys (CPU latency-bound), (b) repeat queries over GPU-resident columns, (c) idle-link background upload of hot columns during CPU-bound queries so the next query finds them resident.
 - [ ] large decomposable aggregations split into morsels pulled by CPU workers and a GPU worker from one queue; partial aggregates merged
 - [ ] GPU worker overlaps copy of morsel k+1 with compute of morsel k (2–3 staging buffers)
 - [ ] split ratio from calibration; `gpu_fraction=` overrides; results identical to `cpu` for 1, 2 and all threads
