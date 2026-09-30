@@ -51,7 +51,7 @@ the aggregate slots.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
@@ -97,6 +97,7 @@ _FOLD = {
 DT_I32, DT_I64, DT_F32, DT_F64, DT_U8 = 0, 1, 2, 3, 4
 _DT_NP = {DT_I32: np.int32, DT_I64: np.int64, DT_F32: np.float32, DT_F64: np.float64, DT_U8: np.uint8}
 _NP_DT = {np.dtype(v): k for k, v in _DT_NP.items()}
+_DIRECT = {pa.int32(): (4, DT_I32), pa.int64(): (8, DT_I64), pa.float32(): (4, DT_F32), pa.float64(): (8, DT_F64)}
 
 
 def dtype_code(arr: np.ndarray) -> int:
@@ -119,18 +120,48 @@ class Partials:
         return int(self.cnt.shape[0])
 
 
+class Buf(NamedTuple):
+    """One contiguous, null-free column chunk: address, row count and element type.
+
+    ``owner`` keeps the memory alive (an Arrow array or a numpy array); no data is copied
+    to describe a chunk, which is what makes binding a many-row-group table cheap.
+    """
+
+    addr: int
+    n: int
+    itemsize: int
+    dt: int
+    owner: Any
+
+    def slice(self, lo: int, hi: int) -> "Buf":
+        return Buf(self.addr + lo * self.itemsize, hi - lo, self.itemsize, self.dt, self.owner)
+
+
+def buf_from_numpy(a: np.ndarray) -> Buf:
+    return Buf(int(a.ctypes.data), len(a), a.itemsize, dtype_code(a), a)
+
+
+def buf_numpy(b: Buf) -> np.ndarray:
+    """A numpy view of a chunk (for host-side use and tests)."""
+    if isinstance(b.owner, np.ndarray) and b.owner.ctypes.data == b.addr and len(b.owner) == b.n:
+        return b.owner
+    import ctypes
+    raw = (ctypes.c_char * (b.n * b.itemsize)).from_address(b.addr)
+    return np.frombuffer(raw, dtype=_DT_NP[b.dt], count=b.n)
+
+
 @dataclass
 class ChunkedColumns:
     """Column data as row-aligned chunks (nothing concatenated).
 
     ``bounds[k] = (start, end)`` is the row range of chunk ``k`` and
-    ``chunks[k][c]`` its numpy view of column ``c``. Arrow tables read from
+    ``chunks[k][c]`` the :class:`Buf` of column ``c`` in it. Arrow tables read from
     Parquet arrive in many chunks (one per row group); the kernels take them as
     they are instead of paying for a full copy of every column.
     """
 
     bounds: List[Tuple[int, int]]
-    chunks: List[List[np.ndarray]]
+    chunks: List[List[Buf]]
     n_cols: int
 
     @property
@@ -140,21 +171,23 @@ class ChunkedColumns:
     @staticmethod
     def from_arrays(arrays: List[np.ndarray]) -> "ChunkedColumns":
         n = min((len(a) for a in arrays), default=0)
-        return ChunkedColumns([(0, n)] if n else [], [[a[:n] for a in arrays]] if n else [], len(arrays))
+        if not n:
+            return ChunkedColumns([], [], len(arrays))
+        return ChunkedColumns([(0, n)], [[buf_from_numpy(a[:n]) for a in arrays]], len(arrays))
 
     def column(self, c: int) -> np.ndarray:
         """Column ``c`` as one contiguous array (copies when it has several chunks)."""
-        parts = [ch[c] for ch in self.chunks]
+        parts = [buf_numpy(ch[c]) for ch in self.chunks]
         if not parts:
             return np.empty(0)
         return parts[0] if len(parts) == 1 else np.concatenate(parts)
 
 
-def _align(per_column: List[List[Tuple[int, np.ndarray]]]) -> ChunkedColumns:
+def _align(per_column: List[List[Tuple[int, Buf]]]) -> ChunkedColumns:
     """Cut every column at the union of all columns' chunk boundaries."""
     import bisect
     cuts = sorted({s for col in per_column for s, _ in col})
-    n = min((col[-1][0] + len(col[-1][1]) if col else 0) for col in per_column) if per_column else 0
+    n = min((col[-1][0] + col[-1][1].n if col else 0) for col in per_column) if per_column else 0
     cuts = [c for c in cuts if c < n] + [n]
     bounds, chunks = [], []
     starts = [[s for s, _ in col] for col in per_column]
@@ -164,8 +197,8 @@ def _align(per_column: List[List[Tuple[int, np.ndarray]]]) -> ChunkedColumns:
         row = []
         for col, st in zip(per_column, starts):
             i = bisect.bisect_right(st, a) - 1
-            cs, arr = col[i]
-            row.append(arr[a - cs:b - cs])
+            cs, buf = col[i]
+            row.append(buf.slice(a - cs, b - cs))
         bounds.append((a, b))
         chunks.append(row)
     return ChunkedColumns(bounds, chunks, len(per_column))
@@ -209,23 +242,32 @@ class PipelineProgram:
 
     # ── binding to data ────────────────────────────────────────────────────
     def bind_chunks(self, table: pa.Table) -> ChunkedColumns:
-        """Like :meth:`bind` but keeps the table's chunks: no column is concatenated."""
-        per_column: List[List[Tuple[int, np.ndarray]]] = []
+        """Like :meth:`bind` but keeps the table's chunks: no column is concatenated,
+        and null-free int32 / int64 / float32 / float64 chunks are described by their
+        Arrow buffer address without creating any array object."""
+        per_column: List[List[Tuple[int, Buf]]] = []
         for name in self.columns:
             if name in self.dict_arrays:
-                per_column.append([(0, _dict_codes(self.dict_arrays[name]))])
+                per_column.append([(0, buf_from_numpy(_dict_codes(self.dict_arrays[name])))])
                 continue
             col = table.column(name)
             chunks = col.chunks if isinstance(col, pa.ChunkedArray) else [col]
             parts, off = [], 0
             for ch in chunks:
-                if len(ch) == 0:
+                n = len(ch)
+                if n == 0:
                     continue
-                arr = _column_numpy(ch)
-                if arr is None:
-                    raise Unsupported(f"column {name!r} cannot be bound")
-                parts.append((off, arr))
-                off += len(ch)
+                spec = _DIRECT.get(ch.type)
+                if spec is not None and ch.null_count == 0:
+                    itemsize, dt = spec
+                    buf = Buf(ch.buffers()[1].address + ch.offset * itemsize, n, itemsize, dt, ch)
+                else:
+                    arr = _column_numpy(ch)
+                    if arr is None:
+                        raise Unsupported(f"column {name!r} cannot be bound")
+                    buf = buf_from_numpy(arr)
+                parts.append((off, buf))
+                off += n
             per_column.append(parts)
         return _align(per_column)
 

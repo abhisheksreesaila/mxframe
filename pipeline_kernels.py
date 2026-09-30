@@ -22,6 +22,7 @@ from typing import List, Optional, Sequence, Union
 import numpy as np
 
 from .pipeline_program import (
+    Buf,
     ChunkedColumns,
     Partials,
     PipelineProgram,
@@ -106,9 +107,6 @@ def _as_chunked(program: PipelineProgram, columns) -> ChunkedColumns:
             cc = ChunkedColumns([], [], 0)
     if cc.n_cols != len(program.columns):
         raise ValueError(f"program reads {len(program.columns)} columns, got {cc.n_cols}")
-    for ch in cc.chunks[:1]:
-        for a in ch:
-            dtype_code(a)  # raises KeyError on an unsupported dtype
     return cc
 
 
@@ -124,7 +122,7 @@ def _check_gids(gids: Optional[np.ndarray], n_groups: int) -> Optional[np.ndarra
 def _column_dtypes(cc: ChunkedColumns) -> List[int]:
     if not cc.chunks:
         return [0] * cc.n_cols
-    return [dtype_code(a) for a in cc.chunks[0]]
+    return [b.dt for b in cc.chunks[0]]
 
 
 def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarray], n_groups: int,
@@ -151,8 +149,8 @@ def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarra
         tbl = np.empty((len(bounds), 2 + n_cols), dtype=np.int64)
         for k, ((s, e), arrs) in enumerate(zip(bounds, cc.chunks)):
             tbl[k, 0], tbl[k, 1] = s, e
-            for c, a in enumerate(arrs):
-                tbl[k, 2 + c] = a.ctypes.data - s * a.itemsize
+            for c, b in enumerate(arrs):
+                tbl[k, 2 + c] = b.addr - s * b.itemsize
     else:  # no column data (e.g. count-only over gids): one dummy chunk spanning the rows
         tbl = np.array([[0, n_rows]], dtype=np.int64)
     col_dt = np.array(_column_dtypes(cc) or [0], dtype=np.int32)
@@ -238,8 +236,14 @@ class _Cuda:
             if err != 0:
                 raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
 
-    def h2d_at(self, dev_ptr: int, arr: np.ndarray) -> None:
-        self.h2d(dev_ptr, arr)
+    def h2d_addr(self, dev_ptr: int, host_addr: int, nbytes: int) -> None:
+        """Copy ``nbytes`` from a host address (an Arrow buffer, say) to the device."""
+        self.bind_thread()
+        if nbytes:
+            err = self.lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), ctypes.c_void_p(host_addr),
+                                           ctypes.c_size_t(nbytes))
+            if err != 0:
+                raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
 
     def d2h(self, arr: np.ndarray, dev_ptr: int) -> None:
         self.bind_thread()
@@ -369,7 +373,7 @@ def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray]
     if gids is not None:
         gids = _check_gids(gids, 2)
     n = end - start
-    itemsizes = [a.itemsize for a in cc.chunks[0]] if cc.chunks else [8] * cc.n_cols
+    itemsizes = [b.itemsize for b in cc.chunks[0]] if cc.chunks else [8] * cc.n_cols
     owned: List[int] = []
     try:
         ptrs = [cu.malloc(n * isz) for isz in itemsizes]
@@ -378,9 +382,9 @@ def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray]
             lo, hi = max(s, start), min(e, end)
             if hi <= lo:
                 continue
-            for c, a in enumerate(arrs):
-                piece = np.ascontiguousarray(a[lo - s:hi - s])
-                cu.h2d_at(ptrs[c] + (lo - start) * a.itemsize, piece)
+            for c, b in enumerate(arrs):
+                cu.h2d_addr(ptrs[c] + (lo - start) * b.itemsize, b.addr + (lo - s) * b.itemsize,
+                            (hi - lo) * b.itemsize)
         gp = 0
         if gids is not None:
             gp = cu.upload(gids[start:end])
