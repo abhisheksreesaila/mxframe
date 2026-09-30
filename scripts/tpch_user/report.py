@@ -244,15 +244,16 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
       "from the OS page cache (files are read once before each scale factor so no engine pays a cold disk).")
     a("- **Column pruning**: every engine reads only the columns its query uses. Polars (`scan_parquet`) and "
       "DuckDB prune automatically; pandas gets `pd.read_parquet(columns=...)`; MXFrame gets "
-      "`pyarrow.parquet.read_table(columns=...)` through one helper (`scripts/tpch_user/readers.py::mx_read`) "
-      "to be swapped for a native `scan_parquet` later.")
+      "`mx.read_parquet_table(columns=..., dictionary=\"auto\")` (the `scan_parquet` reader, eager) through one helper "
+      "(`scripts/tpch_user/readers.py::mx_read`); tables the harness itself touches with PyArrow string kernels "
+      "are read with `dictionary=False`.")
     a("- **Engines**: pandas (eager), Polars (lazy `scan_parquet` + `collect()`), DuckDB "
       "(SQL over `read_parquet`, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` "
       "through the public `LazyFrame` API (plus PyArrow where the LazyFrame layer cannot express a step).")
     a("- **Correctness**: each result is compared with DuckDB (row count; integer/string columns exactly; "
       "float columns at 1e-6 relative, sorted by key columns; LIMIT queries tolerate ties at the cutoff). "
-      "float32 inputs are summed in float32 by pandas, Polars and MXFrame's CPU kernels, so large sums "
-      "drift (`†`); DuckDB sums in double.")
+      "inputs are float32; an engine that accumulates in float32 "
+      "drifts on large sums (`†`), DuckDB sums in double.")
     a(f"- **Hardware**: {meta['cpu']} ({meta['cores']} cores); GPU: {meta['gpu']} "
       f"(`CUDA_VISIBLE_DEVICES={meta['gpu_index']}`). **The machine was shared with other jobs during this run "
       f"(load average at report time: {meta['loadavg']}), so timings are indicative.**")
