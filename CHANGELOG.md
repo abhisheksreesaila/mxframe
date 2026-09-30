@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### 🩺 Kernel health: GPU crashes, hangs and per-call overhead (F-012)
+- **GPU grouped aggregates** (`group_sum/min/max/count`): grid-stride kernels sized to the GPU with a block-private table in dynamic shared memory sized to the real group count (up to 12,288 groups) or straight global atomics beyond it. `group_min`/`group_max` no longer fault above 8,192 groups. The big win was in `_atomic.mojo`: atomics were `seq_cst`, which made NVPTX put a fence around every atomic; they are `monotonic` now (CUDA `atomicAdd` semantics). 30M rows, resident input: 8 to 4,096 groups went from 44 to 610 ms down to about 1 to 3 ms.
+- **GPU `group_encode_i32`** no longer hangs (spin-wait on plain loads could read a stale L1 line) and accepts every int32 key including `INT32_MIN`. The Q21 hash-table kernel had the same spin-wait and was fixed the same way.
+- **GPU sort** is stable, correct for any length (the old network skipped out-of-range partners, so any non-power-of-two length could come back out of order), ascending or descending, and about 2.6x faster (64-bit key|row words, shared-memory tiles). Multi-key composite sort keys no longer overflow int32 (also fixed on the CPU path).
+- **GPU hash join** runs its prefix sums and the right-side argsort on the device.
+- **Device-resident chaining:** the `AOTKernelsGPU` wrappers take `DeviceArray` inputs (`DeviceArray.borrow(ptr, dtype, n)` for residency-tracker or stager pointers) and `device_out=True` to leave results on the device. NumPy signatures are unchanged.
+- **CPU `sort_indices`** is a stable parallel LSD radix sort for int32/int64/float32/float64 keys (10M rows: about 60 ms, was O(n^2) and hung at 10,000 rows); `unique_mask`, `prefix_sum_count` and `filter_gather_*` are parallel. Kernel ABI version 3 (these gained the trailing `threads` argument).
+- Auto mode no longer treats the GPU sort as broken; the GPU calibration probe for `group_encode` is enabled and the min/max group-count limit is gone.
+
 ### ⚡ Multi-core CPU kernels with float64 accumulation (F-002)
 - CPU AOT kernels (`libmxkernels_aot.so`) now run on all cores: grouped sum/min/max/mean/count, masked global sum/min/max/sum-product (SIMD), join build/probe/scatter, gather, and group-key composition. Grouped kernels use per-worker partial arrays merged in parallel; the join build is parallel by key range.
 - Sums and means accumulate in **float64** and return float64 (counts are exact). At TPC-H SF10 the float32 accumulators were off by up to 4.6% (counts by 42%); Q1-style grouped sums now match DuckDB summing the same float32 values as doubles to ~1e-14 relative.
