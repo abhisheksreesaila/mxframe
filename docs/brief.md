@@ -31,6 +31,7 @@ Status: approved
 - Spec `docs/spec-auto-mode.md` is the design source; this brief is the summary.
 - Headline metric is first-run end-to-end, not hot, so GPU init and graph compile count. Pro: honest. Con: the GPU path must hide or avoid its startup cost.
 - Work lands on branch `auto-mode`, local commits, no push.
+- Parquet I/O stays on PyArrow for now (2026-09-30): easy path, accepts ~3x slower raw scans than Polars; a native Mojo reader later (F-021).
 
 ## Open questions
 - (deferred) Name change, auto as the 1.0 default, calibration file location on shared servers.

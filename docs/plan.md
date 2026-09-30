@@ -180,8 +180,8 @@ Needs: F-011 merged · Found by the F-011 review (2026-09-30), all pre-existing
 - [ ] follow-up (F-018/join owner): the CPU hash join segfaulted (`join_scatter`) on a many-to-many join of ~20k x 5k rows over 6 keys (16M+ output rows, then a second join); it should raise a MemoryError or handle it
 - [ ] follow-up: `min`/`max`/`sum` of an integer column come back as float64 (DuckDB: integer); int keys vs float keys in a join are refused by design (`_common_key_type`), so joining on such a column raises TypeError where SQL casts
 
-## F-017 Parquet read as fast as Polars [blocked]
-Blocked: choose the Parquet decoder path — (a) Polars-backed reader, (b) native Mojo decoder, or (c) accept ~3x on raw scans — then say go. Everything else in this ticket is merged.
+## F-017 Parquet read as fast as Polars [done]
+Decided 2026-09-30 (Abhishek): (c) keep PyArrow for Parquet read/write for now; a native Mojo reader comes later (F-021). The 1.5x-of-Polars check is waived until then.
 Decision needed (Abhishek): pyarrow's Parquet decoder is the floor (raw read of 3 SF10 lineitem columns ~225 ms vs Polars' whole scan+filter ~77 ms; pyarrow 22 has no page-skipping API). Options: (a) optional Polars-backed reader when polars is installed (soft dependency on a competitor; type-mapping care); (b) a native Mojo Parquet decoder in mxframe (large; could decode on the GPU like cuDF); (c) accept ~3x on raw scans. Until you choose: (c).
 Needs: none · Found by the F-001 scoreboard (2026-09-30): SF10 `scan_parquet` of 3 lineitem columns with a date filter takes 689 ms in mx vs 149 ms in Polars.
 - [~] profile the mx read path and close the gap to within 1.5x of Polars on SF1/SF10 lineitem scans with and without filters. Profiled; gap narrowed for selective filters, not closed (pyarrow's decoder is ~3x slower than Polars' own).
@@ -227,6 +227,12 @@ Needs: F-018 merged · From the F-018 report (2026-09-30)
 - [ ] GPU `hash_join` prefix sum is int32 and unguarded (the CPU path now raises MemoryError before overflow) — guard or widen
 - [ ] F-016 fuzz seed 5061 fails on gpu (distinct then aggregate; also on plain auto-mode) — find and fix (float32 GPU sum?)
 - [ ] per-operator GPU placement for large joins (F-007) on top of join_engine's index vectors
+
+## F-021 Native Mojo Parquet reader [todo]
+Needs: none (later) · From the F-017 decision: PyArrow's decoder is the floor (~225 ms for 3 SF10 lineitem columns vs Polars' ~77 ms scan+filter)
+- [ ] Mojo decoder for the common Parquet encodings (plain, dictionary/RLE, snappy) of numeric and string columns, on CPU and later GPU
+- [ ] late materialization and page skipping using the page index
+- [ ] replaces PyArrow on the query path; PyArrow stays as the fallback for anything unsupported
 
 ## F-009 Scoreboard report and README [todo]
 Needs: F-001, F-005..F-008
