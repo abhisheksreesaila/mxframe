@@ -60,7 +60,7 @@ Why: Polars `scan_parquet` reads only needed columns; mxframe reading every colu
 
 ## Wave 2: safe auto (Phase 1)
 
-## F-005 Auto planner: whole-query choice, fallback, explain [todo]
+## F-005 Auto planner: whole-query choice, fallback, explain [doing]
 Needs: F-003 · Files: `auto_mode.py` (new), `lazy_frame.py` (compute/explain hooks)
 - [ ] cost model walks the plan, estimates rows per operator, and compares CPU-only against GPU (incl. copies and GPU-init if not ready); picks the lower
 - [ ] GPU error/OOM → rerun on CPU, warn once per shape, remember the shape; `strict=True` raises
