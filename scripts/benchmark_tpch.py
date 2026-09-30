@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+from mxframe.np_arrow import array as _npa
 from max import driver as _driver
 
 from mxframe import LazyFrame, col, lit, when
@@ -427,7 +428,7 @@ def run_q3_mxframe(customer, orders, lineitem, device: str = "cpu") -> pa.Table:
         .agg(
             (col("l_extendedprice") * (lit(1.0) - col("l_discount"))).sum().alias("revenue"),
         )
-        .sort("revenue", descending=True)
+        .sort("revenue", "o_orderdate", descending=[True, False])
         .limit(10)
         .compute(device=device)
     )
@@ -590,7 +591,7 @@ def run_q14_mxframe(part, lineitem, device="cpu") -> pa.Table:
         lit(0.0),
     )
     total_col = col("l_extendedprice") * (lit(1.0) - col("l_discount"))
-    return (
+    sums = (
         LazyFrame(lineitem)
         .join(LazyFrame(part), left_on="l_partkey", right_on="p_partkey")
         .filter(col("l_shipdate") >= lit(Q14_DATE_LO))
@@ -602,6 +603,9 @@ def run_q14_mxframe(part, lineitem, device="cpu") -> pa.Table:
         )
         .compute(device=device)
     )
+    promo, total = sums.column("promo_revenue")[0].as_py(), sums.column("total_revenue")[0].as_py()
+    pct = 100.0 * promo / total if total else 0.0
+    return sums.append_column("promo_pct", _npa([pct], type=pa.float64()))   # TPC-H's promo_revenue
 
 
 def run_q14_pandas(part, lineitem) -> float:
@@ -877,7 +881,7 @@ def make_tpch_q10_tables(n_customers=15_000, n_orders=150_000, n_lineitem=600_00
 
 
 def run_q10_mxframe(nation, customer, orders, lineitem, device="cpu") -> pa.Table:
-    return (
+    top = (
         LazyFrame(Scan(lineitem))
         .filter(col("l_returnflag") == lit("R"))
         .join(
@@ -898,6 +902,15 @@ def run_q10_mxframe(nation, customer, orders, lineitem, device="cpu") -> pa.Tabl
         .limit(20)
         .compute(device=device)
     )
+    return _q10_customer_columns(top, customer)
+
+
+def _q10_customer_columns(top: pa.Table, customer) -> pa.Table:
+    """The 20 rows with the customer columns TPC-H Q10 returns, in its column order, by revenue."""
+    cust = _plain(customer).select(["c_custkey", "c_name", "c_acctbal", "c_address", "c_phone", "c_comment"])
+    j = top.join(cust, keys="o_custkey", right_keys="c_custkey", join_type="inner")
+    j = j.take(pc.sort_indices(j, sort_keys=[("revenue", "descending")]))
+    return j.select(["o_custkey", "c_name", "revenue", "c_acctbal", "n_name", "c_address", "c_phone", "c_comment"])
 
 
 def run_q10_pandas(nation, customer, orders, lineitem) -> pd.DataFrame:
@@ -911,8 +924,10 @@ def run_q10_pandas(nation, customer, orders, lineitem) -> pd.DataFrame:
     m = m.merge(c, left_on="o_custkey", right_on="c_custkey")
     m = m.merge(n, left_on="c_nationkey", right_on="n_nationkey")
     m["revenue"] = m.l_extendedprice * (1 - m.l_discount)
-    r = m.groupby(["c_custkey", "n_name"], as_index=False)["revenue"].sum()
-    return r.sort_values("revenue", ascending=False).head(20).reset_index(drop=True)
+    keys = ["c_custkey", "c_name", "c_acctbal", "n_name", "c_address", "c_phone", "c_comment"]
+    r = m.groupby(keys, as_index=False)["revenue"].sum()
+    r = r.sort_values("revenue", ascending=False).head(20).reset_index(drop=True)
+    return r[["c_custkey", "c_name", "revenue", "c_acctbal", "n_name", "c_address", "c_phone", "c_comment"]]
 
 
 def run_q10_polars(nation, customer, orders, lineitem):
@@ -931,10 +946,11 @@ def run_q10_polars(nation, customer, orders, lineitem):
         .with_columns(
             (pl.col("l_extendedprice") * (1 - pl.col("l_discount"))).alias("revenue")
         )
-        .group_by(["o_custkey", "n_name"])
+        .group_by(["o_custkey", "c_name", "c_acctbal", "n_name", "c_address", "c_phone", "c_comment"])
         .agg(pl.col("revenue").sum())
         .sort("revenue", descending=True)
         .head(20)
+        .select(["o_custkey", "c_name", "revenue", "c_acctbal", "n_name", "c_address", "c_phone", "c_comment"])
     )
 
 
@@ -1653,7 +1669,7 @@ def run_q9_mxframe(nation, supplier, partsupp, part, orders, lineitem, device="c
              - col("ps_supplycost") * col("l_quantity"))
             .sum().alias("sum_profit")
         )
-        .sort(col("n_name"))
+        .sort(col("n_name"), col("o_year"), descending=[False, True])
         .compute(device=device)
     )
 
@@ -1674,7 +1690,7 @@ def run_q9_pandas(nation, supplier, partsupp, part, orders, lineitem) -> pd.Data
     m["o_year"] = _year_of_days(m["o_orderdate"])
     m["profit"] = m.l_extendedprice * (1 - m.l_discount) - m.ps_supplycost * m.l_quantity
     return (m.groupby(["n_name","o_year"])["profit"].sum()
-             .reset_index(name="sum_profit").sort_values("n_name").reset_index(drop=True))
+             .reset_index(name="sum_profit").sort_values(["n_name", "o_year"], ascending=[True, False]).reset_index(drop=True))
 
 
 def run_q9_polars(nation, supplier, partsupp, part, orders, lineitem):
@@ -1698,7 +1714,7 @@ def run_q9_polars(nation, supplier, partsupp, part, orders, lineitem):
                - pl.col("ps_supplycost") * pl.col("l_quantity")).alias("profit"),
           ])
           .group_by(["n_name","o_year"]).agg(pl.col("profit").sum().alias("sum_profit"))
-          .sort("n_name")
+          .sort(["n_name", "o_year"], descending=[False, True])
     )
 
 
@@ -1707,7 +1723,11 @@ def run_q9_polars(nation, supplier, partsupp, part, orders, lineitem):
 # ============================================================
 Q11_NATION = "GERMANY"
 Q11_NATION_KEY = 7    # index into NATIONS list
-Q11_FRACTION   = 0.0001
+Q11_FRACTION   = 0.0001      # TPC-H: FRACTION = 0.0001 / SF, SF = suppliers / 10,000
+
+
+def _q11_fraction(supplier) -> float:
+    return Q11_FRACTION / (supplier.num_rows / 10_000.0)
 
 
 def make_tpch_q11_tables(n_parts=10_000, n_suppliers=2_000, seed=11):
@@ -1769,7 +1789,7 @@ def run_q11_mxframe(nation, supplier, partsupp, device="cpu") -> pa.Table:
     # HAVING: trivial PyArrow scalar ops on the ~10 K-row group result --
     # all heavy computation already done by Mojo above.
     total = pc.sum(grouped.column("value")).as_py() or 0.0
-    threshold = total * Q11_FRACTION
+    threshold = total * _q11_fraction(supplier)
     result = grouped.filter(
         pc.greater(grouped.column("value"),
                    pa.scalar(float(threshold), pa.float32()))
@@ -1782,7 +1802,7 @@ def run_q11_pandas(nation, supplier, partsupp) -> pd.DataFrame:
     ger_keys = s[s.s_nationkey == Q11_NATION_KEY]["s_suppkey"].values
     ps_f = ps[ps.ps_suppkey.isin(ger_keys)].copy()
     ps_f["value"] = ps_f.ps_supplycost * ps_f.ps_availqty
-    threshold = ps_f["value"].sum() * Q11_FRACTION
+    threshold = ps_f["value"].sum() * _q11_fraction(supplier)
     grouped = ps_f.groupby("ps_partkey")["value"].sum().reset_index()
     return (grouped[grouped.value > threshold]
             .sort_values("value", ascending=False).reset_index(drop=True))
@@ -1797,7 +1817,7 @@ def run_q11_polars(nation, supplier, partsupp):
     ps_f = ps_f.with_columns(
         (pl.col("ps_supplycost") * pl.col("ps_availqty")).alias("value")
     )
-    threshold = float(ps_f.select(pl.col("value").sum()).item()) * Q11_FRACTION
+    threshold = float(ps_f.select(pl.col("value").sum()).item()) * _q11_fraction(supplier)
     return (ps_f.group_by("ps_partkey").agg(pl.col("value").sum())
                .filter(pl.col("value") > threshold)
                .sort("value", descending=True))
@@ -1962,7 +1982,7 @@ def run_q16_mxframe(part, supplier, partsupp, device="cpu") -> pa.Table:
         LazyFrame(Scan(deduped))
         .groupby("p_brand", "p_type", "p_size")
         .agg(col("ps_suppkey").count().alias("supplier_cnt"))
-        .sort(col("supplier_cnt"), descending=True)
+        .sort(col("supplier_cnt"), col("p_brand"), col("p_type"), col("p_size"), descending=[True, False, False, False])
         .compute(device=device)
     )
 
@@ -1974,7 +1994,7 @@ def run_q16_pandas(part, supplier, partsupp) -> pd.DataFrame:
     j = j[~j.ps_suppkey.isin(ck)]
     d = j[["p_brand","p_type","p_size","ps_suppkey"]].drop_duplicates()
     return (d.groupby(["p_brand","p_type","p_size"]).size().reset_index(name="supplier_cnt")
-             .sort_values("supplier_cnt", ascending=False).reset_index(drop=True))
+             .sort_values(["supplier_cnt", "p_brand", "p_type", "p_size"], ascending=[False, True, True, True]).reset_index(drop=True))
 
 
 def run_q16_polars(part, supplier, partsupp):
@@ -1993,7 +2013,7 @@ def run_q16_polars(part, supplier, partsupp):
             .join(complaint_keys, left_on="ps_suppkey", right_on="s_suppkey", how="anti"))
     d  = j.select(["p_brand","p_type","p_size","ps_suppkey"]).unique()
     return (d.group_by(["p_brand","p_type","p_size"]).agg(pl.len().alias("supplier_cnt"))
-              .sort("supplier_cnt", descending=True))
+              .sort(["supplier_cnt", "p_brand", "p_type", "p_size"], descending=[True, False, False, False]))
 
 
 # ============================================================
@@ -2548,7 +2568,7 @@ def run_q21_mxframe(nation, supplier, orders, lineitem, device="cpu") -> pa.Tabl
     qualifying = multi.join(one_late, keys="l_orderkey", join_type="inner")
     qualifying = qualifying.join(f_orders, keys="l_orderkey", right_keys="o_orderkey", join_type="inner")
 
-    return (
+    top = (
         LazyFrame(Scan(late_li))
         .join(LazyFrame(Scan(qualifying)), left_on="l_orderkey", right_on="l_orderkey")
         .join(LazyFrame(Scan(saudi_supp)), left_on="l_suppkey", right_on="s_suppkey")
@@ -2558,6 +2578,15 @@ def run_q21_mxframe(nation, supplier, orders, lineitem, device="cpu") -> pa.Tabl
         .limit(100)
         .compute(device=device)
     )
+    return _q21_names(top, supplier)
+
+
+def _q21_names(top: pa.Table, supplier) -> pa.Table:
+    """s_name, numwait (TPC-H groups by the supplier's name; names sort like their keys)."""
+    names = _plain(supplier).select(["s_suppkey", "s_name"])
+    j = top.join(names, keys="l_suppkey", right_keys="s_suppkey", join_type="inner")
+    j = j.take(pc.sort_indices(j, sort_keys=[("numwait", "descending"), ("s_name", "ascending")]))
+    return j.select(["s_name", "numwait"])
 
 
 def run_q21_pandas(nation, supplier, orders, lineitem) -> pd.DataFrame:
@@ -2576,10 +2605,11 @@ def run_q21_pandas(nation, supplier, orders, lineitem) -> pd.DataFrame:
              (late.l_orderkey.isin(multi_keys)) &
              (late.l_orderkey.isin(single_late_keys)) &
              (late.l_suppkey.isin(saudi_keys))]
-    return (q.groupby("l_suppkey").size()
-             .reset_index(name="numwait")
-             .sort_values(["numwait", "l_suppkey"], ascending=[False, True])
-             .head(100).reset_index(drop=True))
+    top = (q.groupby("l_suppkey").size()
+            .reset_index(name="numwait")
+            .sort_values(["numwait", "l_suppkey"], ascending=[False, True])
+            .head(100).reset_index(drop=True))
+    return top.merge(s[["s_suppkey", "s_name"]], left_on="l_suppkey", right_on="s_suppkey")[["s_name", "numwait"]]
 
 
 def run_q21_polars(nation, supplier, orders, lineitem):
@@ -2597,9 +2627,10 @@ def run_q21_polars(nation, supplier, orders, lineitem):
     return (late.join(o, left_on="l_orderkey", right_on="o_orderkey")
                 .join(multi, on="l_orderkey")
                 .join(single_late, on="l_orderkey")
-                .join(s.select("s_suppkey"), left_on="l_suppkey", right_on="s_suppkey")
-                .group_by("l_suppkey").agg(pl.len().alias("numwait"))
-                .sort(["numwait", "l_suppkey"], descending=[True, False]).head(100))
+                .join(s.select(["s_suppkey", "s_name"]), left_on="l_suppkey", right_on="s_suppkey")
+                .group_by(["l_suppkey", "s_name"]).agg(pl.len().alias("numwait"))
+                .sort(["numwait", "l_suppkey"], descending=[True, False]).head(100)
+                .select(["s_name", "numwait"]))
 
 
 # ============================================================

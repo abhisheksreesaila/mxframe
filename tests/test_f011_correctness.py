@@ -44,6 +44,9 @@ def _run(name, device):
     "min_max_identity_with_infinities",
     "float32_column_keeps_boundary_rows",
     "gpu_scratch_does_not_reserve_the_device",
+    "join_duplicate_names_get_a_right_suffix",
+    "self_join_then_aggregate",
+    "literal_aggregates_with_nulls",
 ])
 def test_scenario(name, device):
     _run(name, device)
@@ -51,30 +54,42 @@ def test_scenario(name, device):
 
 # --- gathering strings ---------------------------------------------------------------------
 
-def test_take_rows_slices_string_columns(monkeypatch):
+def test_take_rows_slices_string_columns_by_bytes(monkeypatch):
     import numpy as np
     import pyarrow as pa
     from mxframe import np_arrow
-    monkeypatch.setattr(np_arrow, "TAKE_CHUNK_ROWS", 100)
-    t = pa.table({"s": pa.array([f"v{i}" for i in range(1000)]), "k": pa.array(np.arange(1000, dtype=np.int64))})
+    monkeypatch.setattr(np_arrow, "TAKE_CHUNK_BYTES", 400)
+    monkeypatch.setattr(np_arrow, "TAKE_SLICE_MIN_ROWS", 10)
+    t = pa.table({"s": pa.array([f"v{i}" * (1 + i % 5) for i in range(1000)]),
+                  "k": pa.array(np.arange(1000, dtype=np.int64))})
     idx = np.random.default_rng(1).integers(0, 1000, 950)
     got = np_arrow.take_rows(t, idx)
     assert got.equals(t.take(pa.array(idx)))
-    assert got.column("s").num_chunks == 10 and got.column("k").num_chunks == 1     # only strings are sliced
+    assert got.column("s").num_chunks > 5 and got.column("k").num_chunks == 1     # only strings are sliced
+    for c in got.column("s").chunks:
+        assert sum(len(v.as_py()) for v in c) <= 400 + 25                          # a slice stays near the budget
     col = np_arrow.take_rows(t.column("s").combine_chunks(), idx)
-    assert col.to_pylist() == [f"v{i}" for i in idx]
+    assert col.to_pylist() == [t.column("s")[int(i)].as_py() for i in idx]
+    # structs holding strings are sliced by rows and validated
+    monkeypatch.setattr(np_arrow, "TAKE_CHUNK_ROWS", 100)
+    st = pa.table({"x": pa.array([{"a": f"s{i}", "b": i} for i in range(1000)])})
+    assert np_arrow.take_rows(st, idx).equals(st.take(pa.array(idx)))
 
 
 @pytest.mark.slow
-def test_take_rows_survives_more_than_2gib_of_strings():
-    """Arrow's take returns a corrupt column (`Negative offsets in binary array`) past 2 GiB of
-    string data: a lineitem-to-orders join at SF10 gathers 3 GB of o_comment."""
+def test_take_rows_survives_more_than_2gib_of_long_strings():
+    """Arrow's take returns a corrupt column (`Negative offsets in binary array`, seen only by
+    validate(full=True)) past 2 GiB of string data, however few rows that is: a lineitem-to-orders
+    join at SF10 gathers 3 GB of o_comment; 3.2M rows of 703 bytes are 2.25 GB."""
     import numpy as np
     import pyarrow as pa
     from mxframe import np_arrow
-    n = 1_000_000
-    t = pa.table({"s": pa.array(["x" * 100 + str(i % 10) for i in range(n)])})       # 100 MB
-    idx = np.tile(np.arange(n, dtype=np.int64), 24)                                    # 2.4 GB gathered
+    n = 100_000
+    t = pa.table({"s": pa.array(["x" * 700 + f"{i % 1000:03d}" for i in range(n)])})    # 70 MB
+    idx = np.tile(np.arange(n, dtype=np.int64), 32)                                      # 3.2M rows, 2.25 GB
     out = np_arrow.take_rows(t, idx)
     out.validate(full=True)
-    assert out.num_rows == 24 * n and out.column("s")[24 * n - 1].as_py().endswith("9")
+    assert out.num_rows == 32 * n and out.column("s")[32 * n - 1].as_py().endswith("999")
+    st = pa.table({"x": pa.array([{"a": "y" * 700, "b": i} for i in range(n)])})
+    out = np_arrow.take_rows(st, idx)
+    out.validate(full=True)

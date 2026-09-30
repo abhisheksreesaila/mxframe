@@ -17,7 +17,7 @@ from pathlib import Path
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
-from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+from .lazy_frame import join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -1367,7 +1367,7 @@ class CustomOpsCompiler(GraphCompiler):
             agg_names, agg_arrays = [], []
             for i, e in enumerate(plan.aggs):
                 agg_names.append(e._alias or f"agg_{i}")
-                if e.args[0].op == "lit":
+                if e.op == "count" and e.args[0].op == "lit":
                     agg_arrays.append(_npa(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
                 else:
                     agg_arrays.append(self._eval_expr_arrow(e.args[0], table))
@@ -2831,10 +2831,9 @@ class CustomOpsCompiler(GraphCompiler):
         for col_name in left_table.column_names:
             arrays.append(left_take.column(col_name))
             names.append(col_name)
-        for col_name in right_table.column_names:
-            if col_name not in right_on:
-                arrays.append(right_take.column(col_name))
-                names.append(col_name)
+        for col_name, out_name in join_output_names(left_table.column_names, right_table.column_names, right_on):
+            arrays.append(right_take.column(col_name))
+            names.append(out_name)
 
         return pa.Table.from_arrays(arrays, names=names)
 
@@ -2941,18 +2940,16 @@ class CustomOpsCompiler(GraphCompiler):
             names.append(col_name)
         empty_right = right_table.num_rows == 0
         right_take = None if empty_right else _take_rows(right_table, safe_right)
-        for col_name in right_table.column_names:
-            if col_name in right_on:
-                continue
+        for col_name, out_name in join_output_names(left_table.column_names, right_table.column_names, right_on):
             if empty_right:                       # nothing to take from: every row is unmatched
                 arrays.append(pa.nulls(len(left_idx), type=right_table.schema.field(col_name).type))
-                names.append(col_name)
+                names.append(out_name)
                 continue
             col_arr = right_take.column(col_name)
             if not has_match.all():
                 col_arr = pc.if_else(pc.invert(null_mask_arr), col_arr, None)
             arrays.append(col_arr)
-            names.append(col_name)
+            names.append(out_name)
         return pa.Table.from_arrays(arrays, names=names)
 
     def _hash_join_left_mojo_cpu(self, left_keys, right_keys):

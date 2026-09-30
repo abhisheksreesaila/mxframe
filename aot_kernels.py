@@ -1237,6 +1237,12 @@ class AOTKernelsGPU:
             offsets = scratch(n_left * 4)                  # exclusive prefix sum of counts
             total = self._scan_i32(offsets, counts, n_left)
             if total == 0:
+                # a kernel that ran out of scratch memory (its pool is capped, see the top of
+                # this module) leaves zeros behind without an error: never turn that into an
+                # empty join
+                if self._download(counts, np.int32, n_left).any():
+                    raise MemoryError("GPU hash join: the prefix sum returned 0 for non-zero match "
+                                      "counts (kernel scratch memory exhausted?)")
                 return self._pair_result(self._empty_pair(), device_out)
             starts = scratch(table_size * 4)               # exclusive prefix sum of table
             self._scan_i32(starts, table, table_size)

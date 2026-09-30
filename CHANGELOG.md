@@ -16,6 +16,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New `Expr.year_of_days()` for day-number date columns (`year()` reads YYYYMMDD integers).
 - **TPC-H benchmark queries** (`scripts/benchmark_tpch.py`) follow the TPC-H text and use day-number dates (Q4, Q5, Q7, Q8, Q10, Q15, Q20 returned no rows on real Parquet; Q12's date constants were 5 days off; Q19 lacked the ship mode/instruction filter, Q13 the comment filter, Q21 the EXISTS clause). Q5 and Q8 need the supplier table: `supplier=` keyword. The pandas and Polars versions changed with them.
 - `scripts/gen_tpch_parquet.py` casts DECIMAL to `float32` through `float64` (nearest); the direct cast truncated 0.05 to 0.049999997 and TPC-H Q6 came out 28% low. Regenerated data lives in `data/tpch_sf{1,10}_exact`.
+- **GPU memory pool:** `mxframe.aot_kernels` defaults `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT` to 25 (the Mojo runtime otherwise reserves ~90% of free GPU memory at the first kernel-side buffer and our own allocations ran out at SF10). It is process-wide, respects a value you set, and is documented in the README. `hash_join` raises instead of returning an empty join if its prefix sum is 0 over non-zero match counts.
+- Join outputs never hold two columns of one name: a right-side column whose name is taken is renamed `<name>_right` (`_right2`, ...), for inner and left joins; the optimizer's filter pushdown uses the same names.
 - `tests/test_tpch_duckdb.py`: all 22 queries against DuckDB (official SQL over the same Parquet files) on `cpu`, `gpu` and `auto`, plus the pandas/Polars baselines.
 
 ### 🩺 Kernel health: GPU crashes, hangs and per-call overhead (F-012)

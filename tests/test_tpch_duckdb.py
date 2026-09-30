@@ -105,15 +105,24 @@ def _close(a, b):
     return math.isclose(float(a), float(b), rel_tol=REL_TOL, abs_tol=1e-9)
 
 
-def _drop_tied_at_limit(t, column, descending):
-    """Drop rows whose ``column`` equals the last row's value (the LIMIT boundary tie group)."""
-    idx = t.schema.get_field_index(column)
-    vals = t.column(idx).to_pylist()
-    if not vals:
+def _drop_tied_at_limit(t, order_cols):
+    """Drop the rows equal to the last row on every ORDER BY column (the LIMIT boundary tie group)."""
+    if t.num_rows == 0:
         return t
-    edge = vals[-1]
-    keep = pa.array([not _close(v, edge) for v in vals])
-    return t.filter(keep)
+    cols = [t.column(c).to_pylist() for c in order_cols]
+    edge = [c[-1] for c in cols]
+    keep = [not all(_close(c[i], e) if isinstance(e, float) else c[i] == e for c, e in zip(cols, edge))
+            for i in range(t.num_rows)]
+    return t.filter(pa.array(keep))
+
+
+def _assert_in_order(got, want, order_cols):
+    """The ORDER BY columns of both results agree row by row (so ``got`` is in DuckDB's order)."""
+    for c in order_cols:
+        g, w = got.column(c).to_pylist(), want.column(c).to_pylist()
+        for i, (a, b) in enumerate(zip(g, w)):
+            ok = _close(a, b) if isinstance(b, float) else a == b
+            assert ok, f"row {i} is out of ORDER BY order in {c}: got {a!r}, DuckDB {b!r}"
 
 
 def _rows(t, sort_cols):
@@ -122,7 +131,7 @@ def _rows(t, sort_cols):
     return sorted(rows, key=lambda r: tuple("" if r[i] is None else str(r[i]) for i in sort_cols))
 
 
-def assert_matches_duckdb(got: pa.Table, want: pa.Table, meta: dict, check_names: bool = True):
+def assert_matches_duckdb(got: pa.Table, want: pa.Table, meta: dict, check_names: bool = True, q=None):
     if check_names:
         assert got.column_names == want.column_names, (got.column_names, want.column_names)
     else:
@@ -132,9 +141,11 @@ def assert_matches_duckdb(got: pa.Table, want: pa.Table, meta: dict, check_names
     for name in meta.get("int_cols", []):
         assert _is_int(got.schema.field(name).type), \
             f"{name} must be an integer count, got {got.schema.field(name).type}"
+    order_cols = ref.ORDER_BY.get(q, [])
+    if order_cols:
+        _assert_in_order(got, want, order_cols)
     if "limit" in meta:
-        col, desc = meta["limit"]
-        got, want = _drop_tied_at_limit(got, col, desc), _drop_tied_at_limit(want, col, desc)
+        got, want = _drop_tied_at_limit(got, order_cols), _drop_tied_at_limit(want, order_cols)
         assert got.num_rows == want.num_rows, "rows differ outside the LIMIT boundary tie group"
     key_cols = [i for i, t in enumerate(want.schema.types) if not _is_float(t)]
     rows_got, rows_want = _rows(got, key_cols), _rows(want, key_cols)
@@ -153,7 +164,7 @@ def assert_matches_duckdb(got: pa.Table, want: pa.Table, meta: dict, check_names
 def test_query_matches_duckdb(sf, q, device, duck, tmp_path):
     want = reference(duck, sf, q)
     got = run_mxframe(sf, q, device, tmp_path)
-    assert_matches_duckdb(got, want, ref.REFERENCE[q][1])
+    assert_matches_duckdb(got, want, ref.REFERENCE[q][1], q=q)
 
 
 @pytest.mark.parametrize("sf", _sf_params())
@@ -187,10 +198,9 @@ def test_baseline_engine_matches_duckdb(engine, q, duck, tmp_path, request):
             request.applymarker(pytest.mark.xfail(strict=True, reason="Polars accumulates float32 sums in float32"))
     want = reference(duck, "1", q)
     got = run_mxframe("1", q, engine, tmp_path)
-    if q == 14:            # the baselines return the TPC-H ratio, mxframe the two sums it is made of
-        promo, total = want.column("promo_revenue")[0].as_py(), want.column("total_revenue")[0].as_py()
-        want = pa.table({"promo_revenue": [100.0 * promo / total]})
-    assert_matches_duckdb(got, want, ref.REFERENCE[q][1], check_names=False)
+    if q == 14:            # the baselines return the TPC-H ratio only, mxframe also the two sums it is made of
+        want = want.select(["promo_pct"])
+    assert_matches_duckdb(got, want, ref.REFERENCE[q][1], check_names=False, q=q)
 
 
 # --- the comparison itself must be strict, or the gate means nothing -----------------------
@@ -211,7 +221,27 @@ def test_compare_rejects_a_missing_row_and_a_small_float_error():
     assert_matches_duckdb(pa.table({"k": ["b", "a"], "x": [2.0000001, 1.0]}), want, {})
 
 
-def test_limit_ties_at_the_boundary_are_not_compared():
+def test_limit_ties_at_the_boundary_are_not_compared(monkeypatch):
+    monkeypatch.setitem(ref.ORDER_BY, 99, ["v"])
     want = pa.table({"k": ["a", "b", "c"], "v": [3.0, 2.0, 2.0]})
     got = pa.table({"k": ["a", "b", "z"], "v": [3.0, 2.0, 2.0]})
-    assert_matches_duckdb(got, want, {"limit": ("v", True)})
+    assert_matches_duckdb(got, want, {"limit": ("v", True)}, q=99)
+
+
+def test_ties_on_one_order_key_only_are_still_compared(monkeypatch):
+    """The boundary group is the rows tied on ALL order-by keys: a row that differs in the second key is a bug."""
+    monkeypatch.setitem(ref.ORDER_BY, 99, ["v", "k"])
+    want = pa.table({"k": ["a", "b", "c"], "v": [3.0, 2.0, 2.0]})
+    got = pa.table({"k": ["a", "c", "b"], "v": [3.0, 2.0, 2.0]})
+    with pytest.raises(AssertionError):
+        assert_matches_duckdb(got, want, {"limit": ("v", True)}, q=99)
+
+
+def test_result_order_is_checked(monkeypatch):
+    monkeypatch.setitem(ref.ORDER_BY, 99, ["y", "k"])
+    want = pa.table({"y": [2, 2, 1], "k": ["a", "b", "c"]})
+    assert_matches_duckdb(pa.table({"y": [2, 2, 1], "k": ["a", "b", "c"]}), want, {}, q=99)
+    with pytest.raises(AssertionError):
+        assert_matches_duckdb(pa.table({"y": [1, 2, 2], "k": ["c", "a", "b"]}), want, {}, q=99)
+    with pytest.raises(AssertionError):
+        assert_matches_duckdb(pa.table({"y": [2, 2, 1], "k": ["b", "a", "c"]}), want, {}, q=99)

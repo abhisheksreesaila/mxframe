@@ -6,6 +6,14 @@ DuckDB reads the very same files through views that turn them back into what TPC
 says they are (DATE and DECIMAL(15,2)), so the SQL below is the official TPC-H text
 (with the parameter values the benchmark uses) and the answers are exact.
 
+Where the reference differs from the official TPC-H text (all on purpose, and the same query):
+  Q1/Q3/Q10/Q18/Q21  column aliases follow the benchmark functions (o_orderkey for l_orderkey, ...)
+  Q8   also returns the two sums the share is made of (total_vol, brazil_vol_sum)
+  Q14  also returns the two sums (promo_revenue, total_revenue) besides the percentage (promo_pct)
+  Q17  sum(...) / 7.0 as avg_yearly, unchanged; Q15 reads the revenue view as a CTE
+  Everything else (parameters, joins, predicates, GROUP BY / ORDER BY / LIMIT) is the official text;
+  Q11's FRACTION is 0.0001 / SF (SF = suppliers / 10,000) as in the specification.
+
 Each entry: (sql, meta) where meta has
   int_cols  columns of the result that must be integers (counts), never floats
   limit     (column, descending) when the query has a LIMIT; rows tied with the last
@@ -50,6 +58,18 @@ def run(con, q: int) -> pa.Table:
             t = t.set_column(i, t.schema.field(i).name, t.column(i).cast(pa.int32()))
     return t
 
+
+# The ORDER BY columns of each query, in order (every key of the SQL, so the order is fully
+# determined up to rows equal on all of them).  The result must come back in this order.
+ORDER_BY = {
+    1: ["l_returnflag", "l_linestatus"], 2: ["s_acctbal", "n_name", "s_name", "p_partkey"],
+    3: ["revenue", "o_orderdate"], 4: ["o_orderpriority"], 5: ["revenue"],
+    7: ["supp_nation", "cust_nation", "l_year"], 8: ["o_year"], 9: ["n_name", "o_year"],
+    10: ["revenue"], 11: ["value"], 12: ["l_shipmode"], 13: ["custdist", "c_count"],
+    15: ["s_suppkey"], 16: ["supplier_cnt", "p_brand", "p_type", "p_size"],
+    18: ["o_totalprice", "o_orderdate"], 20: ["s_name"], 21: ["numwait", "s_name"],
+    22: ["cntrycode"],
+}
 
 REVENUE = "l_extendedprice * (1 - l_discount)"
 
@@ -136,12 +156,14 @@ REFERENCE = {
             AND p_name LIKE '%green%') AS profit
         GROUP BY nation, o_year ORDER BY nation, o_year DESC""", {}),
     10: (f"""
-        SELECT c_custkey AS o_custkey, n_name, sum({REVENUE}) AS revenue
+        SELECT c_custkey AS o_custkey, c_name, sum({REVENUE}) AS revenue, c_acctbal, n_name,
+               c_address, c_phone, c_comment
         FROM customer, orders, lineitem, nation
         WHERE c_custkey = o_custkey AND l_orderkey = o_orderkey
           AND o_orderdate >= DATE '1993-10-01' AND o_orderdate < DATE '1994-01-01'
           AND l_returnflag = 'R' AND c_nationkey = n_nationkey
-        GROUP BY c_custkey, n_name ORDER BY revenue DESC LIMIT 20""",
+        GROUP BY c_custkey, c_name, c_acctbal, c_phone, n_name, c_address, c_comment
+        ORDER BY revenue DESC LIMIT 20""",
         dict(limit=("revenue", True))),
     11: ("""
         SELECT ps_partkey, sum(ps_supplycost * ps_availqty) AS value
@@ -149,7 +171,7 @@ REFERENCE = {
         WHERE ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'GERMANY'
         GROUP BY ps_partkey
         HAVING sum(ps_supplycost * ps_availqty) > (
-            SELECT sum(ps_supplycost * ps_availqty) * 0.0001
+            SELECT sum(ps_supplycost * ps_availqty) * 0.0001 / ((SELECT count(*) FROM supplier) / 10000.0)
             FROM partsupp, supplier, nation
             WHERE ps_suppkey = s_suppkey AND s_nationkey = n_nationkey AND n_name = 'GERMANY')
         ORDER BY value DESC""", {}),
@@ -172,7 +194,8 @@ REFERENCE = {
         dict(int_cols=["c_count", "custdist"])),
     14: (f"""
         SELECT sum(CASE WHEN p_type LIKE 'PROMO%' THEN {REVENUE} ELSE 0 END) AS promo_revenue,
-               sum({REVENUE}) AS total_revenue
+               sum({REVENUE}) AS total_revenue,
+               100.00 * sum(CASE WHEN p_type LIKE 'PROMO%' THEN {REVENUE} ELSE 0 END) / sum({REVENUE}) AS promo_pct
         FROM lineitem, part
         WHERE l_partkey = p_partkey AND l_shipdate >= DATE '1995-09-01' AND l_shipdate < DATE '1995-10-01'""", {}),
     15: (f"""
@@ -226,7 +249,7 @@ REFERENCE = {
           AND s_nationkey = n_nationkey AND n_name = 'CANADA'
         ORDER BY s_name""", {}),
     21: ("""
-        SELECT s_suppkey AS l_suppkey, count(*) AS numwait
+        SELECT s_name, count(*) AS numwait
         FROM supplier, lineitem l1, orders, nation
         WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey AND o_orderstatus = 'F'
           AND l1.l_receiptdate > l1.l_commitdate
@@ -234,7 +257,7 @@ REFERENCE = {
           AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey
                             AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate)
           AND s_nationkey = n_nationkey AND n_name = 'SAUDI ARABIA'
-        GROUP BY s_suppkey ORDER BY numwait DESC, s_suppkey LIMIT 100""",
+        GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100""",
         dict(int_cols=["numwait"], limit=("numwait", True))),
     22: ("""
         SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (

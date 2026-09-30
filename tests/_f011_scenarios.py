@@ -275,6 +275,53 @@ def gpu_scratch_does_not_reserve_the_device(device):
     assert grown < 0.5 * total.value, f"the scan made the device grow by {grown >> 20} MiB of {total.value >> 20}"
 
 
+def join_duplicate_names_get_a_right_suffix(device):
+    """Non-key columns with the same name on both sides: the right one is renamed `_right`
+    (`_right2`, ... when taken, also by another right column), for inner and left joins, so the result can be queried again."""
+    a = pa.table({"k": pa.array([1, 2, 3], pa.int32()), "v": pa.array([10.0, 20.0, 30.0])})
+    b = pa.table({"k": pa.array([1, 2, 4], pa.int32()), "v": pa.array([1.0, 2.0, 4.0]),
+                  "v_right": pa.array([7.0, 8.0, 9.0])})
+    out = _lf(a).join(_lf(b), on="k").compute(device=device)
+    assert out.column_names == ["k", "v", "v_right2", "v_right"], out.column_names
+    assert _rows(out) == [(1, 10.0, 1.0, 7.0), (2, 20.0, 2.0, 8.0)], _rows(out)
+    out = _lf(a).join(_lf(b), on="k", how="left").compute(device=device)
+    assert out.column_names == ["k", "v", "v_right2", "v_right"], out.column_names
+    assert sorted(out.column("v_right2").to_pylist(), key=str) == [1.0, 2.0, None]
+    twice = _lf(a).join(_lf(a), on="k").join(_lf(a), on="k").compute(device=device)
+    assert twice.column_names == ["k", "v", "v_right", "v_right2"], twice.column_names
+    out = (_lf(a).join(_lf(a), on="k").filter(col("v_right") > lit(15.0))
+           .compute(device=device))                    # the filter must not be pushed into either side wrongly
+    assert _rows(out) == [(2, 20.0, 20.0), (3, 30.0, 30.0)], _rows(out)
+    out = (_lf(a).join(_lf(a), on="k").filter(col("v") > lit(15.0)).compute(device=device))
+    assert _rows(out) == [(2, 20.0, 20.0), (3, 30.0, 30.0)], _rows(out)
+
+
+def self_join_then_aggregate(device):
+    t = pa.table({"k": pa.array([1, 1, 2, None], pa.int32()), "v": pa.array([1.0, 2.0, None, 4.0])})
+    j = _lf(t).join(_lf(t), on="v")
+    out = j.groupby().agg(col("v").sum().alias("s"), col("k_right").count().alias("n")).compute(device=device)
+    assert out.column("s").to_pylist() == [1.0 + 2.0 + 4.0], out.to_pydict()
+    t2 = pa.table({"k": pa.array([1, 1, 2], pa.int32()), "j": pa.array([1, 2, 3], pa.int32()),
+                   "v": pa.array([1.0, 2.0, 3.0])})
+    out = (_lf(t2).join(_lf(t2), on="k").groupby("k")
+           .agg(col("v_right").sum().alias("s")).sort("k").compute(device=device))
+    assert _rows(out) == [(1, 6.0), (2, 3.0)], _rows(out)
+    t3 = pa.table({"k": pa.array([1, 1, 2], pa.int32()), "v": pa.array([1.0, None, 3.0])})
+    out = (_lf(t3).join(_lf(t3), on="k").groupby("k")
+           .agg(col("v_right").sum().alias("s"), col("v").count().alias("n")).sort("k").compute(device=device))
+    assert _rows(out) == [(1, 2.0, 2), (2, 3.0, 1)], _rows(out)
+
+
+def literal_aggregates_with_nulls(device):
+    """Only count(*) is a row count; sum / max of a literal broadcast the literal."""
+    t = pa.table({"k": pa.array([1, 1, None, None, None], pa.int32()), "v": pa.array([1.0, None, 3.0, 4.0, 5.0])})
+    out = (_lf(t).groupby("k").agg(lit(1.0).sum().alias("s"), lit(5.0).max().alias("m"),
+                                   lit(1).count().alias("n")).compute(device=device))
+    assert _rows(out) == [(1, 2.0, 5.0, 2), (None, 3.0, 5.0, 3)], _rows(out)
+    out = _lf(t).groupby().agg(lit(2.0).sum().alias("s"), lit(1).count().alias("n")).compute(device=device)
+    assert out.column("s").to_pylist() == [10.0] and out.column("n").to_pylist() == [5]
+
+
 SCENARIOS = {k: v for k, v in globals().items()
              if callable(v) and not k.startswith("_") and getattr(v, "__module__", None) == __name__}
 
