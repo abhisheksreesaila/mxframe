@@ -106,7 +106,7 @@ stays as the fallback throughout and is only retired once a query is native and 
 ## M0 result (2026-10-12)
 
 Go. Q1 and Q6 run as one `mx_execute` call per query, results equal to DuckDB, Python-side time
-0.3–0.5 ms. Fusing group-key encoding with aggregation per morsel made SF10 Q1 66 ms against 141 ms on
+0.3–0.5 ms up to SF1 (1.5–1.9 ms at SF10, from one C Data export per chunk per column). Fusing group-key encoding with aggregation per morsel made SF10 Q1 66 ms against 141 ms on
 today's path (Polars 2,608 ms); at 12k rows the one-time Mojo runtime load (~20 ms, F-028) is now the
 largest cost. Details and the lessons for M1: `docs/plan.md`, F-030.
 

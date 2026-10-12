@@ -1716,7 +1716,10 @@ class CustomOpsCompiler(GraphCompiler):
         plan = self._inline_project_into_aggregate(plan)
         # F-030 -- native executor (opt-in during the M0 spike): the whole plan in one Mojo call
         if _native_exec is not None and _native_exec.enabled():
-            _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
+            try:
+                _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
+            except Exception as _exc:      # a plan is fully native or not at all: never fail the query
+                _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
             if _native is not None:
                 return _native
         if try_fused_aggregate is not None:

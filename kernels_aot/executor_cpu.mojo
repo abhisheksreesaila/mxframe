@@ -64,6 +64,7 @@ comptime E_TOO_MANY_GROUPS = -10
 comptime E_BAD_KEY = -11
 comptime E_PIPELINE = -12
 comptime E_DICT_TOO_BIG = -13
+comptime E_OUTPUT_TOO_BIG = -14   # string keys past int32 offsets
 comptime FUSE_GROUPS = 4096   # up to this many groups: keys encoded and aggregated per morsel
 comptime HDR = 16
 comptime OP_AGG_SUM = 50
@@ -276,8 +277,10 @@ def _global_ranks(arrays: LP, stride_a: Int, col: Int, n: Int, gchunk: LP, gcode
 
 
 def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, tbl: LP,
-                tstride: Int, lo: Int, hi: Int, gids: IP):
-    """gids[i] for rows i in [lo, hi): dense group id, one tight loop per key column."""
+                tstride: Int, lo: Int, hi: Int, gids: IP) -> Bool:
+    """gids[i] for rows i in [lo, hi): dense group id, one tight loop per key column. False when a
+    dictionary code is outside its chunk's dictionary (invalid Arrow input): nothing is read past
+    the remap, and the caller declines."""
     var c = 0
     while Int(tbl[c * tstride + 1]) <= lo:
         c += 1
@@ -299,6 +302,12 @@ def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, t
             elif kind == K_DICT:
                 var src = _ip(_arr_buf(arr, 1) + (_arr_off(arr) - c0) * 4)
                 var m = _ip(Int(_lp(Int(K.remap[k]))[c]))
+                var nd = Int32(_arr_len(_arr_dict(arr)))
+                var bad = False
+                for i in range(r, c1):
+                    bad = bad or src[i] < 0 or src[i] >= nd
+                if bad:
+                    return False
                 for i in range(r, c1):
                     var t = m[Int(src[i])] * sk
                     gids[i] = t if first else gids[i] + t
@@ -310,6 +319,7 @@ def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, t
                     gids[i] = t if first else gids[i] + t
         r = c1
         c += 1
+    return True
 
 
 @export
@@ -458,7 +468,9 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                     break
                 var hi = min(lo + MORSEL, n_rows)
                 var gbase = _ip(Int(gbuf) - lo * 4)          # gbase[i] valid for i in [lo, hi)
-                _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, hi, gbase)
+                if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, hi, gbase):
+                    failed[0] = 2
+                    break
                 var r = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks,
                                         Int(dtypes), Int(gbase), G, lo, hi, Int(tv), Int(tc), 1)
                 if r < 0:
@@ -504,7 +516,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for w in range(nt):
                 c += acc_c[w * G + g]
             cnt[g] = c
-        rc = -1 if Int(failed[0]) != 0 else 0
+        rc = 0 if Int(failed[0]) == 0 else (E_BAD_KEY if Int(failed[0]) == 2 else E_PIPELINE)
         acc_v.free()
         acc_c.free()
         failed.free()
@@ -515,6 +527,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         var gids = alloc[Int32](max(n_rows, 1))
         var counter = alloc[Int64](1)
         counter[0] = 0
+        var bad_key = alloc[Int64](1)
+        bad_key[0] = 0
 
         @parameter
         def keys_worker(wid: Int):
@@ -523,7 +537,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 var lo = m * MORSEL
                 if lo >= n_rows:
                     break
-                _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, min(lo + MORSEL, n_rows), gids)
+                if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, min(lo + MORSEL, n_rows), gids):
+                    bad_key[0] = 1
 
         if nt > 1:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
@@ -531,15 +546,19 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         else:
             keys_worker(0)
         counter.free()
-        rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                             Int(gids), G, 0, n_rows, Int(vals), Int(cnt), threads)
+        if Int(bad_key[0]) != 0:
+            rc = E_BAD_KEY
+        else:
+            rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                 Int(gids), G, 0, n_rows, Int(vals), Int(cnt), threads)
+        bad_key.free()
         gids.free()
     tbl.free()
     if rc < 0:
         vals.free()
         cnt.free()
         K.free()
-        return E_PIPELINE
+        return rc if rc == E_BAD_KEY else E_PIPELINE
 
     # ── 4. which groups exist, in output order ───────────────────────────────────────────────
     var order = alloc[Int64](G)      # output position -> dense group id
@@ -604,6 +623,13 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for i in range(n_res):
                 var e = (Int(order[i]) // Int(K.stride[k])) % Int(K.card[k])
                 nb += _dlen(_arr_dict(Int(arrays[Int(gch[e]) * stride_a + n_cols + k])), Int(gco[e]))
+            if nb > 2147483647:
+                key_bytes.free()
+                order.free()
+                vals.free()
+                cnt.free()
+                K.free()
+                return E_OUTPUT_TOO_BIG
             key_bytes[k] = Int64(nb)
             total += _align8((n_res + 1) * 4) + _align8(max(nb, 1))
         elif kind == K_I32:

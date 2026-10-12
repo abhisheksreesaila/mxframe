@@ -217,3 +217,109 @@ def test_columns_chunked_differently(native, monkeypatch):
     old = PLANS["dict key, sort"](t).compute(device="cpu")
     assert got.column("n").to_pylist() == old.column("n").to_pylist()
     np.testing.assert_allclose(got.column("s").to_pylist(), old.column("s").to_pylist(), rtol=1e-12)
+
+
+# ---- F-030 review: the multi-threaded and large paths behind the headline ----------------------
+
+def _check_same(lf_fn, monkeypatch, expect_native=True):
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    got = lf_fn().compute(device="cpu")
+    path, why = nx.last_path(), nx.last_decline()
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    old = lf_fn().compute(device="cpu")
+    assert (path == "native_m0") == expect_native, why
+    assert got.schema == old.schema and got.num_rows == old.num_rows
+    for c in got.column_names:
+        g, o = got.column(c).to_pylist(), old.column(c).to_pylist()
+        if pa.types.is_floating(got.schema.field(c).type):
+            np.testing.assert_allclose(g, o, rtol=1e-12, err_msg=c)
+        else:
+            assert g == o, c
+    return why
+
+
+def _big(n=600_000, seed=4, chunks=7):
+    r = np.random.default_rng(seed)
+    t = pa.table({
+        "f": pa.DictionaryArray.from_arrays(A(r.integers(0, 3, n).astype(np.int32)), A(["A", "N", "R"])),
+        "g": A(r.integers(0, 50, n).astype(np.int32)),
+        "big": A(r.integers(0, 20_000, n).astype(np.int64)),
+        "v": A(r.random(n) * 100), "q": A(r.integers(-1000, 1000, n).astype(np.int32)),
+        "d": A(r.integers(0, 1000, n).astype(np.int32)),
+    })
+    cuts = np.linspace(0, n, chunks + 1).astype(int)
+    return pa.concat_tables([t.slice(a, b - a) for a, b in zip(cuts[:-1], cuts[1:])])
+
+
+def test_many_morsels_and_threads_with_min_max(monkeypatch):
+    t = _big()                       # ~10 morsels of 64k rows: several workers, then the merge
+    _check_same(lambda: LazyFrame(t).filter(col("d") < lit(900)).groupby("f", "g")
+                .agg(col("v").sum().alias("s"), col("v").mean().alias("m"), col("q").min().alias("lo"),
+                     col("q").max().alias("hi"), col("v").count().alias("n")).sort("f", "g"), monkeypatch)
+    _check_same(lambda: LazyFrame(t).filter(col("d") < lit(500)).groupby()
+                .agg(col("v").sum().alias("s"), col("q").min().alias("lo"), col("q").max().alias("hi")), monkeypatch)
+
+
+def test_more_than_4096_groups(monkeypatch):
+    t = _big()                       # 20k groups: the group-id array path, not the per-morsel one
+    _check_same(lambda: LazyFrame(t).groupby("big").agg(col("v").sum().alias("s"), col("v").count().alias("n"))
+                .sort("big"), monkeypatch)
+
+
+def test_dictionary_too_big_to_merge_is_declined_after_the_call(native, monkeypatch):
+    n = 20_000
+    words = [f"w{i:05d}" for i in range(5000)]
+    r = np.random.default_rng(2)
+    t = pa.table({"f": pa.DictionaryArray.from_arrays(A(r.integers(0, 5000, n).astype(np.int32)), A(words)),
+                  "v": A(r.random(n))})
+    why = _check_same(lambda: LazyFrame(t).groupby("f").agg(col("v").sum().alias("s")).sort("f"),
+                      monkeypatch, expect_native=False)
+    assert "code -13" in why and len(native) == 1      # Mojo looked, declined, the old path answered
+
+
+def test_dictionaries_repeating_in_non_adjacent_chunks(monkeypatch):
+    r = np.random.default_rng(6)
+    da, db = A(["A", "B", "C"]), A(["C", "A"])
+    parts = []
+    for d in [da, db, da, da, db] * 4:
+        n = 3000
+        parts.append(pa.table({"f": pa.DictionaryArray.from_arrays(A(r.integers(0, len(d), n).astype(np.int32)), d),
+                               "v": A(r.random(n))}))
+    t = pa.concat_tables(parts)
+    _check_same(lambda: LazyFrame(t).groupby("f").agg(col("v").sum().alias("s"), col("v").count().alias("n"))
+                .sort("f"), monkeypatch)
+
+
+def test_an_executor_exception_falls_back(native, monkeypatch):
+    def boom():
+        raise OSError("library could not be loaded")
+    monkeypatch.setattr(nx, "_load", boom)
+    t = _table()
+    got = PLANS["dict key, sort"](t).compute(device="cpu")
+    assert nx.last_path() is None and "OSError" in nx.last_decline()
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    assert got.equals(PLANS["dict key, sort"](t).compute(device="cpu"))
+
+
+def test_invalid_dictionary_codes_are_declined_not_read():
+    """A dictionary index past its dictionary (invalid Arrow) must not be read through: Mojo declines."""
+    code = """
+import os, sys
+os.environ["MXFRAME_NATIVE"] = "1"
+import numpy as np, pyarrow as pa
+import mxframe.native_exec as nx
+from mxframe import LazyFrame, col, lit
+from mxframe.np_arrow import array as A
+idx = A(np.array([0, 1, 7, 1] * 1000, np.int32))         # 7 is outside a 3-entry dictionary
+f = pa.DictionaryArray.from_buffers(pa.dictionary(pa.int32(), pa.string()), 4000, idx.buffers(), A(["A", "N", "R"]))
+t = pa.table({"f": f, "v": A(np.ones(4000))})
+try:
+    LazyFrame(t).groupby("f").agg(col("v").sum().alias("s")).sort("f").compute(device="cpu")
+except Exception:
+    pass                                                     # the old path may reject it too
+print("@@", nx.last_decline())
+"""
+    root = Path(__file__).resolve().parent
+    code = f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n" + code
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+    assert "@@ executor declined (code -11)" in p.stdout, (p.returncode, p.stdout[-500:], p.stderr[-1500:])
