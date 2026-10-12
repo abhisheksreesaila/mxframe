@@ -181,7 +181,27 @@ def run(q: int, data_dir: str, device=None):
     con = duckdb.connect()
     for name in S.TABLES[q]:
         con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{table_path(data_dir, name)}')")
-    res = con.execute(SQL[q].replace('@FRAC@', repr(S.q11_fraction())))
+    return _fetch(con.execute(SQL[q].replace('@FRAC@', repr(S.q11_fraction()))))
+
+
+def load_mem(q: int, data_dir: str):
+    """Engine-only mode, untimed: the columns the query uses, as DuckDB in-memory tables
+    (its native storage, so the query runs on loaded data, not on a Parquet scan)."""
+    import duckdb
+    S.set_scale_from(data_dir)
+    con = duckdb.connect()
+    for name, cols in S.TABLES[q].items():
+        con.execute(f"CREATE TABLE {name} AS SELECT {', '.join(cols)} "
+                    f"FROM read_parquet('{table_path(data_dir, name)}')")
+    return con
+
+
+def run_mem(q: int, con, device=None):
+    """Engine-only timed unit: query + materialized Arrow result on the loaded tables."""
+    return _fetch(con.execute(SQL[q].replace('@FRAC@', repr(S.q11_fraction()))))
+
+
+def _fetch(res):
     out = res.fetch_arrow_table() if hasattr(res, "fetch_arrow_table") else res.arrow()
     return out.read_all() if hasattr(out, "read_all") else out
 

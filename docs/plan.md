@@ -252,6 +252,16 @@ Needs: F-022 · From the F-022 profile
 - [ ] `select(a, b).distinct().groupby(a).agg(count)` runs as a per-key distinct count without materializing the distinct table
 - [ ] SF10 Q21 within 1.5x Polars user-felt
 
+## F-024 Engine-only scoreboard [doing]
+Needs: F-009 · Asked for 2026-10-12: the user-felt headline mixes Parquet reading with query speed; add a second number that isolates the engine. The user-felt number stays the headline.
+- [ ] `bench_user_felt.py --mode engine`: each engine first loads the columns its query uses into its own in-memory form (pandas DataFrame, Polars DataFrame, DuckDB in-memory table, an Arrow table under an MXFrame LazyFrame), outside the clock; the clock then covers query + materialized result only. Still a fresh process per (engine, query, sf) with no warm-up
+- [ ] the load time is recorded (`load_ms`), so read cost = user-felt minus engine-only is visible per engine
+- [ ] nothing in the timed region touches the Parquet files (test: the data directory is moved away after loading and every query still runs)
+- [ ] engine-only results equal the user-felt results for all 22 queries on every engine (SF0.01 generated in the test), and are checked against DuckDB in the run like the headline
+- [ ] the repeat run reloads the tables first, so the engine's caches keyed by table identity cannot make it look faster than a second, different query would be
+- [ ] the report says which mode it is (title, the clock sentence, methodology); old CSVs without `load_ms` render, and `--resume` into a CSV with a different header is refused
+- [ ] SF1 + SF10 engine-only run on a quiet machine (`docs/bench/engine-sf1.md`, `engine-sf10.md`), summarized next to the user-felt totals in `docs/benchmarks.md` and the README
+
 ## F-009 Scoreboard report and README [done]
 Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).
 - Run from the repo root: `pixi run python scripts/bench_user_felt.py --sf 1 --engines pandas,polars,duckdb,mx-cpu,mx-auto,mx-gpu --timeout 120 --gpu 1 --name final-sf1` then `--sf 10 --engines polars,duckdb,mx-cpu,mx-auto,mx-gpu,pandas --timeout 300 --gpu 1 --name final-sf10` (add `--resume` to continue an interrupted run; exact-decimal data `data/tpch_sf{1,10}_exact` is the default; `scripts/tpch_user/official.py` checks the DuckDB reference against published answers).

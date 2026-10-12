@@ -282,5 +282,16 @@ def run(q: int, data_dir: str, device=None):
     return QUERIES[q](t).collect()
 
 
+def load_mem(q: int, data_dir: str) -> dict:
+    """Engine-only mode, untimed: the columns the query uses, as in-memory DataFrames."""
+    S.set_scale_from(data_dir)
+    return {n: pl.read_parquet(table_path(data_dir, n), columns=cols) for n, cols in S.TABLES[q].items()}
+
+
+def run_mem(q: int, tables: dict, device=None):
+    """Engine-only timed unit: lazy query over the loaded DataFrames + collect."""
+    return QUERIES[q]({n: df.lazy() for n, df in tables.items()}).collect()
+
+
 def to_arrow(result):
     return result.to_arrow()

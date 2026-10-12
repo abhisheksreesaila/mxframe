@@ -475,5 +475,18 @@ def run(q: int, data_dir: str, device: str):
     return QUERIES[q](load(q, data_dir), device)
 
 
+def load_mem(q: int, data_dir: str) -> dict:
+    """Engine-only mode, untimed: the columns the query uses as Arrow tables, read by the same
+    reader `scan_parquet` uses (low-cardinality strings as dictionaries)."""
+    S.set_scale_from(data_dir)
+    return {n: mx.read_parquet_table(table_path(data_dir, n), columns=cols, dictionary="auto")
+            for n, cols in S.TABLES[q].items()}
+
+
+def run_mem(q: int, tables: dict, device: str):
+    """Engine-only timed unit: query + materialized result on in-memory tables."""
+    return QUERIES[q]({n: LazyFrame(t) for n, t in tables.items()}, device)
+
+
 def to_arrow(result) -> pa.Table:
     return result

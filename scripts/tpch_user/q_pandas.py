@@ -298,5 +298,16 @@ def run(q: int, data_dir: str, device=None):
     return QUERIES[q](t)
 
 
+def load_mem(q: int, data_dir: str) -> dict:
+    """Engine-only mode, untimed: the columns the query uses, as DataFrames."""
+    S.set_scale_from(data_dir)
+    return {n: pandas_read(table_path(data_dir, n), cols) for n, cols in S.TABLES[q].items()}
+
+
+def run_mem(q: int, tables: dict, device=None):
+    """Engine-only timed unit: query + materialized DataFrame on loaded tables."""
+    return QUERIES[q](tables)
+
+
 def to_arrow(result) -> pa.Table:
     return pa.Table.from_pandas(result, preserve_index=False)

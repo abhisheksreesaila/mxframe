@@ -4,6 +4,10 @@ Reports (as `@@RESULT {json}` lines on stdout):
   import_ms  time to import the engine (+ pyarrow.parquet where a reader needs it); NOT in the headline
   first_ms   HEADLINE: Parquet read + query + materialized result, first thing this process does
   repeat_ms  the same read+query again in the same process (secondary; warm caches / JIT)
+With --mode engine (engine-only scoreboard) the engine first loads the columns the query uses into
+its own in-memory form (`load_ms`, outside the clock); first_ms / repeat_ms then cover query +
+materialized result only, and the repeat reloads the tables first so result caches keyed by table
+identity cannot answer it.
 The first result is written (canonical column names/order) to --result as Parquet, the repeat
 result to --result + ".repeat", so the parent can compare both with the DuckDB reference.
 """
@@ -49,10 +53,11 @@ def main() -> None:
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--result", required=True)
     ap.add_argument("--skip-repeat-over-ms", type=float, default=float("inf"))
+    ap.add_argument("--mode", choices=["user-felt", "engine"], default="user-felt")
     a = ap.parse_args()
 
     modname, device, extra = ENGINES[a.engine]
-    out: dict = {"engine": a.engine, "query": a.query}
+    out: dict = {"engine": a.engine, "query": a.query, "mode": a.mode}
     try:
         t0 = time.perf_counter()
         for m in extra:
@@ -64,9 +69,25 @@ def main() -> None:
             import mxframe
             out["mxframe_path"] = os.path.dirname(os.path.abspath(mxframe.__file__))
 
+        engine_only = a.mode == "engine"
+
+        def load():
+            t0 = time.perf_counter()
+            tables = mod.load_mem(a.query, a.data_dir)
+            ms = (time.perf_counter() - t0) * 1000.0
+            gc.collect()
+            return tables, ms
+
+        def timed():
+            return mod.run_mem(a.query, tables, device) if engine_only else mod.run(a.query, a.data_dir, device)
+
+        tables = None
+        if engine_only:
+            tables, out["load_ms"] = load()
+
         # ---- headline: first run in a fresh process, nothing warmed up -------------------
         t0 = time.perf_counter()
-        res = mod.run(a.query, a.data_dir, device)
+        res = timed()
         first_ms = (time.perf_counter() - t0) * 1000.0
         out["first_ms"] = first_ms
 
@@ -81,12 +102,18 @@ def main() -> None:
         gc.collect()
         if first_ms <= a.skip_repeat_over_ms:
             try:
+                extra = {}
+                if engine_only:
+                    tables = None
+                    gc.collect()
+                    tables, _ = load()
+                    extra["repeat_reloaded"] = True
                 t0 = time.perf_counter()
-                res = mod.run(a.query, a.data_dir, device)
+                res = timed()
                 repeat_ms = (time.perf_counter() - t0) * 1000.0
                 # verified by the parent like the first result (written outside the clock)
                 pq.write_table(canonicalize(mod.to_arrow(res), spec.OUTPUT[a.query]), a.result + ".repeat")
-                emit({"repeat_ms": repeat_ms, "repeat_written": True})
+                emit({"repeat_ms": repeat_ms, "repeat_written": True, **extra})
             except BaseException as e:  # noqa: BLE001
                 emit({"repeat_ms": None, "repeat_note": f"repeat failed: {type(e).__name__}: {str(e)[:200]}"})
         else:

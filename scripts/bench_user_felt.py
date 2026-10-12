@@ -6,6 +6,10 @@ around (Parquet read + query + materialized result).  No warm-up, ever.  One sub
 per (engine, query, scale factor).  `import` time is reported separately; a repeat run in
 the same process is a secondary number.  Every result is checked against DuckDB.
 
+`--mode engine` (F-024) is the engine-only scoreboard: each engine first loads the columns the
+query uses into its own in-memory form (outside the clock, recorded as load_ms) and the clock
+covers query + materialized result only.  The user-felt mode stays the headline.
+
     pixi run python scripts/bench_user_felt.py --sf 1,10 --queries 1-22 \
         --engines pandas,polars,duckdb,mx-cpu,mx-gpu,mx-auto --timeout 300 --out docs/bench
 
@@ -35,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tpch_user import spec  # noqa: E402
 from tpch_user.compare import compare_tables  # noqa: E402
 from tpch_user.official import check_official  # noqa: E402
-from tpch_user.report import (CSV_FIELDS, ENGINE_ORDER, environment_info, new_row, read_csv,  # noqa: E402
+from tpch_user.report import (CSV_FIELDS, ENGINE_ORDER, environment_info, mode_of, new_row, read_csv,  # noqa: E402
                               render_markdown)
 from tpch_user.runner import (REPO_ROOT, check_mxframe_path, resolve_gpu, run_one,  # noqa: E402
                               warm_page_cache)
@@ -92,11 +96,21 @@ def official_check(path, q: int) -> str | None:
         return f"check failed: {type(e).__name__}: {str(e)[:100]}"
 
 
-def open_log(csv_path: Path, resume: bool):
-    """(file, writer, rows already present). Without --resume the CSV starts empty."""
+def open_log(csv_path: Path, resume: bool, mode: str = "user-felt"):
+    """(file, writer, rows already present). Without --resume the CSV starts empty. Resuming keeps
+    the CSV's own header (pre-F-024 CSVs lack `mode` and `load_ms`) and refuses another mode's rows."""
     existing = read_csv(csv_path) if resume and csv_path.exists() else []
+    fields = CSV_FIELDS
+    if existing:
+        if mode_of(existing) != mode:
+            raise SystemExit(f"{csv_path} holds {mode_of(existing)} rows; cannot resume it in {mode} mode "
+                             "(use another --name)")
+        with open(csv_path, newline="") as f:
+            fields = next(csv.reader(f))
+        if mode == "engine" and "load_ms" not in fields:
+            raise SystemExit(f"{csv_path} has no load_ms column; cannot resume it in engine mode")
     f = open(csv_path, "a" if existing else "w", newline="")
-    w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+    w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
     if not existing:
         w.writeheader()
         f.flush()
@@ -129,7 +143,11 @@ def main() -> None:
                          "the default <root>/tpch_sf<SF>_exact")
     ap.add_argument("--gpu", default="1", help="nvidia-smi index (or GPU-UUID) of the GPU the workers may use")
     ap.add_argument("--date", default=datetime.date.today().isoformat())
-    ap.add_argument("--name", default=None, help="output basename (default user-felt-<date>)")
+    ap.add_argument("--name", default=None,
+                    help="output basename (default user-felt-<date>, or engine-only-<date> with --mode engine)")
+    ap.add_argument("--mode", choices=["user-felt", "engine"], default="user-felt",
+                    help="user-felt (headline): clock around Parquet read + query; engine: each engine loads "
+                         "the query's columns into memory first, the clock covers query + result only")
     ap.add_argument("--resume", action="store_true",
                     help="keep the existing CSV and skip (engine, sf, query) rows already in it")
     ap.add_argument("--force", action="store_true",
@@ -148,7 +166,7 @@ def main() -> None:
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    base = a.name or f"user-felt-{a.date}"
+    base = a.name or (f"engine-only-{a.date}" if a.mode == "engine" else f"user-felt-{a.date}")
     csv_path, md_path = out_dir / f"{base}.csv", out_dir / f"{base}.md"
     cuda_dev, gpu_desc = resolve_gpu(a.gpu)
 
@@ -174,7 +192,7 @@ def main() -> None:
     # the DuckDB reference always runs first (it is only *reported* when requested)
     order = ["duckdb"] + [e for e in engines if e != "duckdb"]
     tmp = Path(tempfile.mkdtemp(prefix="bench-user-felt-"))
-    f, writer, existing = open_log(csv_path, a.resume)
+    f, writer, existing = open_log(csv_path, a.resume, a.mode)
     done = {(r["engine"], r["sf"], r["query"]) for r in existing}
     t_start = time.time()
     try:
@@ -197,7 +215,7 @@ def main() -> None:
                     res_path = ref_path if eng == "duckdb" else tmp / f"{eng}_sf{sf}_q{q}.parquet"
                     rep_path = Path(str(res_path) + ".repeat")
                     load1 = os.getloadavg()[0]
-                    rec = run_one(eng, q, str(data_dir), str(res_path), a.timeout, cuda_dev)
+                    rec = run_one(eng, q, str(data_dir), str(res_path), a.timeout, cuda_dev, a.mode)
                     rec.update(engine=eng, sf=sf, query=q, correct=None, max_rel_err=None,
                                load1=load1, verdict="ref" if eng == "duckdb" else "unchecked",
                                repeat_verdict="")

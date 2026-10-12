@@ -75,11 +75,11 @@ def _tail(text: str, n: int = 3) -> str:
 
 
 def run_one(engine: str, query: int, data_dir: str, result_path: str, timeout: float,
-            gpu: str = "1") -> dict:
+            gpu: str = "1", mode: str = "user-felt") -> dict:
     """Returns a dict with import_ms/first_ms/repeat_ms/rows/error/mxframe_path (no correctness)."""
     cmd = [sys.executable, "-m", "tpch_user.worker", "--engine", engine, "--query", str(query),
            "--data-dir", data_dir, "--result", result_path,
-           "--skip-repeat-over-ms", str(timeout * 1000 * 0.4)]
+           "--skip-repeat-over-ms", str(timeout * 1000 * 0.4), "--mode", mode]
     with tempfile.TemporaryFile("w+") as log:
         p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=worker_env(gpu),
                              cwd=str(REPO_ROOT), start_new_session=True)
@@ -98,6 +98,8 @@ def run_one(engine: str, query: int, data_dir: str, result_path: str, timeout: f
     rec = parse_output(text)
     rec.pop("engine", None)
     rec.pop("query", None)
+    rec.pop("repeat_reloaded", None)
+    rec["mode"] = mode
     if timed_out:
         if "first_ms" in rec and "error" not in rec:
             rec["repeat_ms"] = None

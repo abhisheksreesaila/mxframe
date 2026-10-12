@@ -18,8 +18,9 @@ from . import spec
 
 CSV_FIELDS = ["engine", "sf", "query", "import_ms", "first_ms", "repeat_ms", "rows", "correct",
               "max_rel_err", "verdict", "repeat_verdict", "load1", "error", "repeat_note",
-              "compare_note"]
-_FLOATS = ("import_ms", "first_ms", "repeat_ms", "max_rel_err", "load1")
+              "compare_note", "mode", "load_ms"]
+_FLOATS = ("import_ms", "first_ms", "repeat_ms", "max_rel_err", "load1", "load_ms")
+MODES = ("user-felt", "engine")
 MX = ["mx-cpu", "mx-gpu", "mx-auto"]
 ENGINE_ORDER = ["pandas", "polars", "duckdb", "mx-cpu", "mx-gpu", "mx-auto"]
 NAMES = {"pandas": "pandas", "polars": "Polars", "duckdb": "DuckDB", "mx-cpu": "mx-cpu",
@@ -144,8 +145,17 @@ def read_csv(path: Path) -> list[dict]:
             r["correct"] = {"True": True, "False": False}.get(r.get("correct"))
             for k in ("error", "repeat_note", "compare_note", "repeat_verdict"):
                 r[k] = r.get(k) or ""
+            r["mode"] = r.get("mode") or "user-felt"      # CSVs from before F-024 have no mode
             rows.append(r)
     return rows
+
+
+def mode_of(rows: list[dict]) -> str:
+    """The scoreboard mode of a CSV's rows ("user-felt" or "engine"); a mix is an error."""
+    modes = {r.get("mode") or "user-felt" for r in rows}
+    if len(modes) > 1:
+        raise ValueError(f"rows from more than one mode: {sorted(modes)}")
+    return modes.pop() if modes else "user-felt"
 
 
 # ------------------------------------------------------------------ environment ----------------
@@ -207,11 +217,22 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
     a = L.append
     v = meta["versions"]
     mx_shown = any(e in engines for e in MX)
-    a(f"# User-felt TPC-H scoreboard - {meta['date']}\n")
-    a("**Headline = what a user feels:** a fresh Python process, data starting as Parquet on disk, "
-      "the clock around *Parquet read + query + materialized result*. No warm-up. "
-      "`import` time is reported separately (and summed in the \"import + first\" tables). "
-      "Numbers are milliseconds; **bold** = fastest verified engine for that query.\n")
+    engine_only = mode_of(rows) == "engine"
+    if engine_only:
+        a(f"# Engine-only TPC-H scoreboard - {meta['date']}\n")
+        a("**Engine-only:** a fresh Python process; each engine first loads the columns the query uses "
+          "from Parquet into its own in-memory form (pandas / Polars DataFrame, DuckDB table, Arrow table "
+          "under an MXFrame LazyFrame), outside the clock; the clock then covers *query + materialized "
+          "result* only. No warm-up. This isolates the query engine from file reading; the user-felt "
+          "scoreboard (clock around read + query) stays the headline for what a user waits for. "
+          "Load and `import` times are reported separately. "
+          "Numbers are milliseconds; **bold** = fastest verified engine for that query.\n")
+    else:
+        a(f"# User-felt TPC-H scoreboard - {meta['date']}\n")
+        a("**Headline = what a user feels:** a fresh Python process, data starting as Parquet on disk, "
+          "the clock around *Parquet read + query + materialized result*. No warm-up. "
+          "`import` time is reported separately (and summed in the \"import + first\" tables). "
+          "Numbers are milliseconds; **bold** = fastest verified engine for that query.\n")
     a("Legend: `†` float32 accumulation drift (result within 1e-2 relative of DuckDB, error shown but outside the strict "
       "1e-6 check), `WRONG` = differs from DuckDB (rows/keys, relative error above 1e-2, or rows not in the query's "
       "ORDER BY order), `?` = **unchecked** (the DuckDB reference failed for that query, so the result was not "
@@ -278,6 +299,13 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
               "the user's code runs. Its cost is in neither `import` (it returns immediately) nor the headline "
               "unless it contends with the query for cores; the other eng have no equivalent.\n")
 
+        if engine_only:
+            a(f"### SF{sf}: load time, ms (Parquet -> in-memory tables, outside the clock)\n")
+            body = [[f"Q{q}"] + [fmt_ms((by.get((e, q)) or {}).get("load_ms")) for e in eng] for q in queries]
+            a(_table(["query"] + [NAMES[e] for e in eng], body))
+            a("\n> Each engine reads only the columns the query uses, but no engine can skip row groups "
+              "with the query's filters here (Polars and DuckDB do in the user-felt run).\n")
+
         a(f"### SF{sf}: repeat run in the same process, ms (secondary: warm caches / JIT / result caches)\n")
         body = [[f"Q{q}"] + [fmt_repeat_cell(by.get((e, q))) for e in eng] for q in queries]
         a(_table(["query"] + [NAMES[e] for e in eng], body))
@@ -333,9 +361,16 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a("\n**mx-gpu was not run at SF10** (decision for this round: GPU memory is shared with other jobs and the "
           "join engine is being rewritten in F-018); SF10 tables have no mx-gpu column.\n")
     a("\n## Methodology\n")
-    a("- **One subprocess per (engine, query, scale factor)**; the worker imports the engine "
-      "(timed as `import_ms`), then runs read+query+materialize once (`first_ms`, the headline) and "
-      "once more in the same process (`repeat_ms`).")
+    if engine_only:
+        a("- **One subprocess per (engine, query, scale factor)**; the worker imports the engine "
+          "(timed as `import_ms`), loads the query's columns into memory (`load_ms`, outside the clock), "
+          "then runs query+materialize once (`first_ms`) and, after reloading the tables, once more in "
+          "the same process (`repeat_ms`). Reloading gives the repeat new table objects, so caches keyed "
+          "by table identity cannot answer it.")
+    else:
+        a("- **One subprocess per (engine, query, scale factor)**; the worker imports the engine "
+          "(timed as `import_ms`), then runs read+query+materialize once (`first_ms`, the headline) and "
+          "once more in the same process (`repeat_ms`).")
     a(f"- **Data** ({meta.get('data_variant', 'exact')}): DuckDB `dbgen` Parquet (dates as int32 days since epoch, "
       "decimals as float32), read "
       "from the OS page cache (files are read once before each scale factor so no engine pays a cold disk).")
