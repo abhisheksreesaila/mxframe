@@ -36,11 +36,8 @@ import json
 import logging
 import math
 import os
-import platform
-import subprocess
 import sys
-import tempfile
-import threading
+import threading   # platform, subprocess, tempfile: imported where used (auto's first query pays for module imports)
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,6 +106,7 @@ def _cpu_model() -> str:
                     return line.split(":", 1)[1].strip()
     except Exception:
         pass
+    import platform
     return platform.processor() or platform.machine() or "cpu"
 
 
@@ -519,6 +517,7 @@ class Calibration:
                 with _file_lock(p):          # read-merge-write must not interleave across processes
                     doc = _read_doc(p) or {"schema": SCHEMA_VERSION, "entries": {}}
                     doc["entries"][self.key] = self.to_dict()
+                    import tempfile
                     fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".calib-", suffix=".tmp")
                     with os.fdopen(fd, "w") as f:
                         json.dump(doc, f, indent=1)
@@ -1393,6 +1392,7 @@ def measure_gpu_init(timeout_s: float = 90.0) -> Dict[str, float]:
     """Fresh-process GPU init: CUDA ctx + GPU AOT library load + first kernel launch
     (Mojo DeviceContext creation).  Excludes interpreter/numpy start-up."""
     aot = Path(__file__).with_name("aot_kernels.py")
+    import subprocess
     out = subprocess.run([sys.executable, "-c", _GPU_INIT_SCRIPT, str(aot)],
                          capture_output=True, text=True, timeout=timeout_s, env=os.environ.copy())
     if out.returncode != 0:
@@ -1451,6 +1451,7 @@ def _run_gpu_subprocess(sizes: Tuple[int, ...], budget_s: float, link_mb: Tuple[
     without any output line (the child emits one per finished size, so slow 1e8-row
     steps in full mode do not trip it; a hung kernel does).  ``child_cmd`` is a test hook."""
     import queue
+    import subprocess
     if item_timeout_s is None:
         item_timeout_s = max(45.0, 20.0 * budget_s)
     pkg = __package__ or "mxframe"

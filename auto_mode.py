@@ -384,13 +384,43 @@ def _key_card(name, tables, rows) -> int:
             return 1
         # Strided, not a prefix: data is often sorted or clustered by the key.
         import numpy as np
-        idx = np.unique(np.linspace(0, len(column) - 1, min(_SAMPLE_ROWS, len(column))).astype(np.int64))
-        sample = column.take(_npa(idx))
-        d = pc.count_distinct(sample).as_py()
-        if d < 0.5 * len(sample):          # saturated: the sample saw (nearly) every value
+        n = len(column)
+        if n <= _SAMPLE_ROWS:
+            idx = np.arange(n, dtype=np.int64)
+        else:   # linspace(0, n - 1, S) in integers: strictly increasing, no np.unique needed
+            idx = np.arange(_SAMPLE_ROWS, dtype=np.int64) * (n - 1) // (_SAMPLE_ROWS - 1)
+        d = _sample_distinct(column, idx)
+        if d < 0.5 * len(idx):             # saturated: the sample saw (nearly) every value
             return max(1, d)
-        return max(1, int(rows * d / len(sample)))
+        return max(1, int(rows * d / len(idx)))
     return DEFAULT_GROUPS
+
+
+def _sample_distinct(column, idx) -> int:
+    """Distinct non-null values among ``column[idx]``. Numeric chunks are read through NumPy: on the
+    first query of a process this is on the user-felt clock, and the Arrow path cost ~20 ms there
+    (``np.unique`` pulls in ``numpy.ma``; the first ``count_distinct`` initialises Arrow compute)."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    from .np_arrow import array as _npa, to_numpy as _np_of
+    typ = column.type
+    if (pa.types.is_integer(typ) or pa.types.is_floating(typ)) and column.null_count == 0:
+        parts, off = [], 0
+        for ch in column.chunks:
+            sel = idx[(idx >= off) & (idx < off + len(ch))] - off
+            if len(sel):
+                parts.append(_np_of(ch, zero_copy_only=False)[sel])
+            off += len(ch)
+        v = np.sort(np.concatenate(parts)) if parts else np.empty(0)
+        if len(v) == 0:
+            return 0
+        if v.dtype.kind == "f":
+            v = v[~np.isnan(v)]
+            if len(v) == 0:
+                return 0
+        return int(1 + np.count_nonzero(v[1:] != v[:-1]))
+    return int(pc.count_distinct(column.take(_npa(idx))).as_py())
 
 
 def _group_card(keys, tables, rows) -> int:

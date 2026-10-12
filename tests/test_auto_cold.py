@@ -1,6 +1,7 @@
 """device="auto" must not slow a CPU-bound first query with GPU work."""
 import sys
 import threading
+import time
 
 import numpy as np
 import pyarrow as pa
@@ -86,7 +87,28 @@ def test_background_work_waits_for_the_query(monkeypatch):
     n = 400_000
     t = pa.table({"k": np.arange(n, dtype=np.int32) % 5, "v": np.ones(n, dtype=np.float32)})
     LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).compute(device="auto")
+    deadline = time.monotonic() + 5
+    while not w.started and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert w.started and started_during == [False]
+
+
+def test_background_work_waits_for_an_idle_gap(monkeypatch):
+    """Chained queries (a script computing several frames in a row) run before any GPU start-up."""
+    monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.15)
+    ran = []
+    with cf.deferred_background() as bg:
+        bg.later(lambda: ran.append(time.monotonic()))
+    t_end = time.monotonic()
+    for _ in range(5):                          # five back-to-back queries, 50 ms apart
+        with cf.query_running():
+            time.sleep(0.05)
+        assert not ran
+    last = time.monotonic()
+    deadline = last + 5
+    while not ran and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ran and ran[0] - last >= 0.14 and ran[0] > t_end
 
 
 def test_deferred_upload_threads_can_be_waited_on():

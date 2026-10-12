@@ -95,13 +95,37 @@ class _Background:
     def flush(self) -> None:
         threads, self.threads = self.threads, []
         callbacks, self.callbacks = self.callbacks, []
-        for fn in callbacks:
-            try:
-                fn()
-            except Exception:
-                pass
-        for t in threads:
-            t.start()
+        if not threads and not callbacks:
+            return
+
+        def launch():
+            for fn in callbacks:
+                try:
+                    fn()
+                except Exception:
+                    pass
+            for t in threads:
+                t.start()
+
+        if IDLE_BEFORE_BACKGROUND_S <= 0:
+            launch()
+            return
+        threading.Thread(target=lambda: (_wait_until_idle(IDLE_BEFORE_BACKGROUND_S), launch()),
+                         name="mxframe-background-launch", daemon=True).start()
+
+
+# GPU start-up and uploads meant for later queries begin only after no auto query has run for
+# this long: a script that chains computes (TPC-H Q17, Q11: two or three in a row) would
+# otherwise run its next query next to CUDA initialisation (+10-25 ms per SF1 query, F-009).
+IDLE_BEFORE_BACKGROUND_S = 0.1
+
+
+def _wait_until_idle(quiet_s: float) -> None:
+    with _active_cv:
+        while True:
+            _active_cv.wait_for(lambda: _active == 0)
+            if not _active_cv.wait_for(lambda: _active > 0, timeout=quiet_s):
+                return
 
 
 @contextlib.contextmanager
