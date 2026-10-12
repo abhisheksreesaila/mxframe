@@ -238,11 +238,19 @@ Needs: none (later) · From the F-017 decision: PyArrow's decoder is the floor (
 - [ ] late materialization and page skipping using the page index
 - [ ] replaces PyArrow on the query path; PyArrow stays as the fallback for anything unsupported
 
-## F-022 GPU fallback precision and Q21 [todo]
+## F-022 GPU fallback precision and Q21 [review]
 Needs: F-020 merged · From the F-020 report
-- [ ] the `gpu_aot` grouped-aggregate fallback accumulates float64 inputs in float32 whenever the fused pipeline declines a plan: accumulate in float64 (or route to the fused/CPU path) so device choice never changes digits
-- [ ] SF10 Q21 (2.3x Polars): parallel hash distinct for the (orderkey, suppkey) pair instead of two radix sorts of 60M composites; Arrow filter/take on the hot path
-- [ ] `encode_int` hash/sort fallback for wide key ranges (> 4x rows) if they show up in real data
+- [x] the `gpu_aot` grouped-aggregate fallback accumulated float64 inputs in float32 whenever the fused pipeline declined a plan: a GPU session now runs that fallback on the CPU kernels (float64 accumulation, `last_compile_provenance` path `cpu_aot` + `gpu_declined`), and derived columns (`case_when`, isin, ...) stay float64 on both devices (`tests/test_gpu_fallback_precision.py`: declined plans give the same digits on cpu and gpu)
+- [x] SF10 Q21: the (orderkey, suppkey) distincts are ranked by a counting sort on the leading key (`mx_ik_rank_bucketed`, `group_keys.dense_sorted(lead=...)`) instead of a radix sort of 60M composites: 1.26-1.76 s -> 0.33 s per distinct, identical ids/uniques/first rows (`tests/test_rank_bucketed.py`). Q21 user-felt SF10 9.4 s -> 8.3 s (Polars 4.5 s, same run, load ~5)
+- [ ] Q21 rest (profile, SF10 cpu 8.4 s): Parquet read 1.6 s (F-021), `encode_int` 1.2 s, Arrow take/compute ~1.8 s, rebuilding 60M unique key columns in `_build_group_ids` 0.7 s. Next step: plan `distinct -> groupby(k) -> count` as one n_unique per key (no 60M-row distinct table) — moved to F-023
+- [ ] `encode_int` hash/sort fallback for wide key ranges (> 4x rows): not seen in TPC-H; only if real data needs it
+- Seen once during F-022: SF1 Q18 `auto` exited -11 (no stderr) in a full-suite run while a 60M-row benchmark loaded the machine; 16 reruns clean (the rare crash under load from F-020)
+- `pixi run test-import` (`scripts/_test_base_import.py`) fails at HEAD before F-022 too: `mxframe.GraphCompiler` loads with MAX blocked
+
+## F-023 Q21: distinct + count as one n_unique [todo]
+Needs: F-022 · From the F-022 profile
+- [ ] `select(a, b).distinct().groupby(a).agg(count)` runs as a per-key distinct count without materializing the distinct table
+- [ ] SF10 Q21 within 1.5x Polars user-felt
 
 ## F-009 Scoreboard report and README [todo]
 Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).

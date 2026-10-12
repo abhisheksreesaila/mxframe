@@ -659,9 +659,9 @@ class CustomOpsCompiler(GraphCompiler):
             then  = self._eval_expr_arrow(args[1], table)
             else_ = self._eval_expr_arrow(args[2], table)
             result = pc.if_else(cond, then, else_)
-            # float64 on the CPU (its kernels accumulate in float64; float32 would lose integers
-            # above 2**24), float32 for the GPU kernels
-            want = pa.float64() if self._session_device == "cpu" else pa.float32()
+            # float64 on both devices: float32 would lose integers above 2**24 and round
+            # float64 values, so the device would change the digits (F-022)
+            want = pa.float64()
             return result.cast(want) if result.type != want else result
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
@@ -1863,7 +1863,7 @@ class CustomOpsCompiler(GraphCompiler):
                 # 4a-derived: pre-compute case_when/isin/startswith (unmasked on GPU)
                 for deriv_name, deriv_expr in derived_specs:
                     arr = self._eval_expr_arrow(deriv_expr, original_scan.table)
-                    col_arrays[deriv_name] = _np_of(arr, zero_copy_only=False).astype(np.float32)
+                    col_arrays[deriv_name] = _np_of(arr, zero_copy_only=False).astype(np.float64)
                     col_names.append(deriv_name)
                 _group_ids_full = group_ids_full
                 _INPUT_PREP_CACHE[prep_key] = {
@@ -1922,8 +1922,7 @@ class CustomOpsCompiler(GraphCompiler):
                 # 4b-derived: pre-compute case_when/isin/startswith, then apply mask
                 for deriv_name, deriv_expr in derived_specs:
                     arr = self._eval_expr_arrow(deriv_expr, original_scan.table)
-                    np_arr = _np_of(arr, zero_copy_only=False).astype(
-                        np.float64 if self._session_device == "cpu" else np.float32)
+                    np_arr = _np_of(arr, zero_copy_only=False).astype(np.float64)
                     if mask_np is not None:
                         np_arr = np_arr[mask_np]
                     col_arrays[deriv_name] = np_arr
@@ -2017,16 +2016,15 @@ class CustomOpsCompiler(GraphCompiler):
                 }
                 return _aot_result
 
-        # 4.6 -- GPU AOT fast path: bypass MAX Graph for grouped GPU aggs ------
-        # Handles both unfiltered and filtered grouped queries.
-        # When filtered, mask_np_int32 is passed so filtered-out rows get gid=-1
-        # and are skipped by the GPU kernels (which already check `if gid >= 0`).
-        if (self._session_device == "gpu" and self._aot_gpu is not None
+        # 4.6 -- grouped aggregate the fused pipeline declined, GPU session: the CPU kernels
+        # (float64 accumulation) run it, so the device never changes the digits (F-022). The
+        # float32 GPU group kernels rounded float64 inputs and sums. When filtered,
+        # mask_np_int32 turns filtered-out rows into gid=-1, which the kernels skip.
+        if (self._session_device == "gpu" and self._aot is not None
                 and group_keys):
             _aot_result = self._execute_cpu_aot(
                 plan_clean, col_arrays, extra_inputs, n_groups,
                 group_keys, unique_key_cols,
-                _aot_override=self._aot_gpu,
                 mask_np_int32=mask_np_int32,
             )
             if _aot_result is not None:
@@ -2047,10 +2045,11 @@ class CustomOpsCompiler(GraphCompiler):
                     "execute_ms": round((t1 - t0) * 1000, 1),
                     "gpu_input_path": "aot_ctypes",
                     "optimizer_trace": list(optimizer_trace or []),
-                    "path": "gpu_aot",
+                    "path": "cpu_aot",
+                    "gpu_declined": True,
                 }
                 if verbose:
-                    print(f"[mxframe] GPU AOT — {(t1-t0)*1000:.1f}ms")
+                    print(f"[mxframe] CPU AOT (GPU session) — {(t1-t0)*1000:.1f}ms")
                 return _aot_result
 
         # 5 -- Graph cache lookup --------------------------------------
@@ -3466,7 +3465,7 @@ class CustomOpsCompiler(GraphCompiler):
                 )
             return dense_ids, n_groups, unique_key_cols
 
-        ranked = _group_keys.dense_sorted(composite)
+        ranked = _group_keys.dense_sorted(composite, lead=(strides[0], sizes[0]))
         if ranked is not None:
             dense_ids, unique_composite, _ = ranked
         else:

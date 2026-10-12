@@ -36,7 +36,8 @@ _I64 = ctypes.c_int64
 _IK_ARGS = {"mx_ik_range": [_I64] * 5, "mx_ik_first": [_I64] * 7, "mx_ik_rank": [_I64] * 5,
             "mx_ik_finish": [_I64] * 8, "mx_ik_apply": [_I64] * 7,
             "mx_ik_composite": [_I64] * 7, "mx_ik_present": [_I64] * 7, "mx_ik_prefix": [_I64] * 4,
-            "mx_ik_uniq": [_I64] * 6, "mx_ik_rank_sorted": [_I64] * 6}
+            "mx_ik_uniq": [_I64] * 6, "mx_ik_rank_sorted": [_I64] * 6,
+            "mx_ik_rank_bucketed": [_I64] * 9}
 _IK_WIDTH = {np.dtype("int8"): 0, np.dtype("int16"): 1, np.dtype("int32"): 2, np.dtype("int64"): 3,
              np.dtype("uint8"): 4, np.dtype("uint16"): 5, np.dtype("uint32"): 6}
 IK_MAX_RANGE_FACTOR = 4       # direct-address table entries per row, at most
@@ -256,11 +257,13 @@ def composite(codes, strides):
     return out
 
 
-def dense_sorted(comp: np.ndarray):
+def dense_sorted(comp: np.ndarray, lead=None):
     """``np.unique(comp, return_inverse=True)[::-1]`` for non-negative int64 ``comp``, or None.
 
     Returns ``(ids int32[n], unique int64[g], first int32[g] or None)``: dense ids numbered in
-    ascending value order.  Small value ranges use a presence table, wide ones a parallel radix sort.
+    ascending value order.  Small value ranges use a presence table, wide ones a parallel radix sort,
+    or, when ``lead = (stride, n_codes)`` says ``comp // stride`` is a code in [0, n_codes) shared
+    by only a few rows each (an order key leading a composite), a counting sort on that code.
     """
     n = len(comp)
     if n < IK_MIN_ROWS or n >= (1 << 31) - 1 or comp.dtype != np.int64 or not available():
@@ -286,6 +289,10 @@ def dense_sorted(comp: np.ndarray):
         ids = np.empty(n, dtype=np.int32)
         lib.mx_ik_apply(_addr(comp), 3, n, lo, _addr(tab), _addr(ids), th)
         return ids, uniq, None
+    if lead is not None:
+        ranked = _rank_bucketed(lib, comp, *lead, th)
+        if ranked is not None:
+            return ranked
     try:
         from .aot_kernels import AOTKernels
         from .sort_check import checked_sort_indices
@@ -295,6 +302,25 @@ def dense_sorted(comp: np.ndarray):
     ids = np.empty(n, dtype=np.int32)
     first = np.empty(n, dtype=np.int32)
     g = lib.mx_ik_rank_sorted(_addr(comp), _addr(perm), n, _addr(ids), _addr(first), th)
+    if g <= 0:
+        return None
+    first = first[:g]
+    return ids, comp[first], first
+
+
+def _rank_bucketed(lib, comp, stride, n_codes, th):
+    """``dense_sorted``'s sorted-path result through buckets of ``comp // stride``, or None."""
+    n = len(comp)
+    if not hasattr(lib, "mx_ik_rank_bucketed") or stride <= 0 or not 0 < n_codes < (1 << 31) - 1:
+        return None
+    if n_codes * 16 < n:            # long buckets: the per-bucket insertion sort would lose
+        return None
+    ids = np.empty(n, dtype=np.int32)
+    first = np.empty(n, dtype=np.int32)
+    cnt = np.empty(n_codes + 1, dtype=np.int32)
+    rows = np.empty(n, dtype=np.int32)
+    g = lib.mx_ik_rank_bucketed(_addr(comp), n, int(stride), int(n_codes), _addr(ids), _addr(first),
+                                _addr(cnt), _addr(rows), th)
     if g <= 0:
         return None
     first = first[:g]

@@ -750,3 +750,168 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
             emit(c)
     sums.free()
     return Int(total)
+
+
+comptime IK_BUCKET_MAX = 256
+
+
+@export
+def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, first_a: Int,
+                        cnt_a: Int, rows_a: Int, threads: Int) abi("C") -> Int:
+    """``mx_ik_rank_sorted`` without the sort, for keys whose leading part is a small code (F-022).
+
+    Rows are bucketed by ``keys[i] // stride`` (in [0, nb)) with a counting sort, then each bucket
+    is sorted by (key, row). Ids are numbered in ascending key order and first[g] is the group's
+    smallest row, exactly as the radix-sort path gives them. Scratch: cnt int32[nb + 1],
+    rows int32[n]. Returns the number of groups, -5 for a key outside [0, nb * stride), -6 when a
+    bucket holds more than IK_BUCKET_MAX rows (the caller then sorts)."""
+    var keys = _lp(keys_a)
+    var ids = _ip(ids_a)
+    var first = _ip(first_a)
+    var cnt = _ip(cnt_a)
+    var rows = _ip(rows_a)
+    var st = Int64(stride)
+    var nth = _workers(max(n, nb), threads)
+    var chunks_n = (n + IK_CHUNK - 1) // IK_CHUNK
+    var chunks_b = (nb + IK_CHUNK - 1) // IK_CHUNK
+    var err = alloc[Int32](1)
+    err[0] = 0
+    var sums = alloc[Int64](chunks_b + 1)
+    if nth > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+
+    @parameter
+    def zero(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, nb + 1)
+        for j in range(a, b):
+            cnt[j] = 0
+
+    @parameter
+    def hist(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, n)
+        var bad = False
+        for i in range(a, b):
+            var k = keys[i]
+            if k < 0:
+                bad = True
+                continue
+            var bk = Int(k // st)
+            if bk >= nb:
+                bad = True
+                continue
+            _ = Atomic[DType.int32].fetch_add(cnt + bk, 1)
+        if bad:
+            err[0] = 1
+
+    # bucket offsets: cnt[b] becomes the start of bucket b (exclusive prefix), cnt[nb] = n
+    @parameter
+    def bsum(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, nb)
+        var s = Int64(0)
+        for j in range(a, b):
+            s += Int64(cnt[j])
+        sums[c] = s
+
+    @parameter
+    def bscan(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, nb)
+        var run = Int32(sums[c])
+        for j in range(a, b):
+            var v = cnt[j]
+            cnt[j] = run
+            run += v
+
+    # scatter rows; cnt[b] advances to the end of bucket b (= start of b + 1)
+    @parameter
+    def scatter(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, n)
+        for i in range(a, b):
+            var bk = Int(keys[i] // st)
+            var p = Atomic[DType.int32].fetch_add(cnt + bk, 1)
+            rows[Int(p)] = Int32(i)
+
+    # sort each bucket by (key, row); count its distinct keys into sums
+    @parameter
+    def sort_count(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, nb)
+        var s = Int64(0)
+        for j in range(a, b):
+            var lo = 0 if j == 0 else Int(cnt[j - 1])
+            var hi = Int(cnt[j])
+            if hi - lo > IK_BUCKET_MAX:
+                err[0] = 2
+                continue
+            for x in range(lo + 1, hi):
+                var r = rows[x]
+                var kr = keys[Int(r)]
+                var y = x - 1
+                while y >= lo:
+                    var ry = rows[y]
+                    var ky = keys[Int(ry)]
+                    if ky < kr or (ky == kr and ry < r):
+                        break
+                    rows[y + 1] = ry
+                    y -= 1
+                rows[y + 1] = r
+            for x in range(lo, hi):
+                if x == lo or keys[Int(rows[x])] != keys[Int(rows[x - 1])]:
+                    s += 1
+        sums[c] = s
+
+    @parameter
+    def emit(c: Int):
+        var a = c * IK_CHUNK
+        var b = min(a + IK_CHUNK, nb)
+        var g = Int(sums[c]) - 1
+        for j in range(a, b):
+            var lo = 0 if j == 0 else Int(cnt[j - 1])
+            var hi = Int(cnt[j])
+            for x in range(lo, hi):
+                var p = Int(rows[x])
+                if x == lo or keys[p] != keys[Int(rows[x - 1])]:
+                    g += 1
+                    first[g] = Int32(p)
+                ids[p] = Int32(g)
+
+    def run_n[f: def(Int) capturing -> None](chunks: Int):
+        if nth > 1:
+            parallelize[f](chunks, nth)
+        else:
+            for c in range(chunks):
+                f(c)
+
+    run_n[zero]((nb + 1 + IK_CHUNK - 1) // IK_CHUNK)
+    run_n[hist](chunks_n)
+    if err[0] != 0:
+        err.free()
+        sums.free()
+        return -5
+    run_n[bsum](chunks_b)
+    var total = Int64(0)
+    for c in range(chunks_b):
+        var s = sums[c]
+        sums[c] = total
+        total += s
+    run_n[bscan](chunks_b)
+    cnt[nb] = Int32(n)
+    run_n[scatter](chunks_n)
+    run_n[sort_count](chunks_b)
+    if err[0] != 0:
+        err.free()
+        sums.free()
+        return -6
+    total = 0
+    for c in range(chunks_b):
+        var s = sums[c]
+        sums[c] = total
+        total += s
+    run_n[emit](chunks_b)
+    err.free()
+    sums.free()
+    return Int(total)
