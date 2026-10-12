@@ -1,6 +1,17 @@
 # Design: the whole plan executes in Mojo
 
-Status: **draft, needs approval** · 2026-10-12 · Replaces the "shave Python" parts of F-028 and F-029
+Status: **approved (shape and principle), 2026-10-12** · Replaces the "shave Python" parts of F-028 and F-029
+
+## The principle (Abhishek, 2026-10-12)
+
+> Python is just a simple lightweight front end that does the planning, parses SQL, etc. All the heavy
+> lifting has to be Mojo; else what is the point.
+
+So Python owns the API, SQL parsing, planning, optimizing and compiling the plan, and nothing that touches
+row data. Every operation that loops over rows runs in Mojo: filters, expressions, joins, aggregates,
+sorts, distinct, string matching, and in time Parquet decoding (F-021). The Python execution path is a
+transitional fallback, retired query by query as the native executor covers it; new engine work goes
+into Mojo, not into the Python path.
 
 ## Why
 
@@ -112,7 +123,7 @@ a native Parquet reader (F-021) · changes to the public `LazyFrame` API.
 
 ## Questions for Abhishek
 
-1. Approve the shape (Python plans, one Mojo call executes)?
+1. ~~Approve the shape?~~ Approved, with the principle above.
 2. Start with M0 as a time-boxed spike (a few days) before committing to M1–M4?
 3. Keep F-028's cheap item (runtime load, ~22 ms per process) as a separate small ticket now, since it pays
    off regardless?

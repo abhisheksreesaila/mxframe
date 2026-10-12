@@ -265,14 +265,14 @@ Needs: F-009 · Asked for 2026-10-12: the user-felt headline mixes Parquet readi
   - Q12 and Q19 are slower on in-memory tables than through scan_parquet; cause not profiled (F-025).
   - The old "decode is most of the loss on Q3/Q10/Q12/Q14/Q19" claim in benchmarks.md is now scoped to what the data shows.
 
-## F-025 Q12/Q19 slower on in-memory tables than through scan_parquet [todo]
+## F-025 Q12/Q19 slower on in-memory tables than through scan_parquet [todo, check again after F-031/F-032]
 Needs: F-024 · From the engine-only run
 - [ ] profile SF10 Q12 and Q19 on in-memory Arrow tables (`--mode engine`): mx-cpu Q12 1,827 ms engine-only vs 954 ms user-felt with the read included, Q19 2,271 vs 654 ms; Polars 173 / 487 ms. Candidates, unmeasured: the reader's filter pushdown hides a slow in-engine filter (Q12's `l_receiptdate` range, Q19's conditions), and Q12's plan joining before filtering
 - [ ] fix what the profile shows: the same query on an in-memory table is no slower than through `scan_parquet`
 - [ ] engine-only Q12 and Q19 within 2x Polars at SF10
 
 ## CPU track (agreed 2026-10-12)
-Strong CPU at every size first, then warm GPU and large data on small GPUs, then `auto` on top. Order: F-026 → F-027 → F-028 → F-025 → F-029 → F-021. Borrowing Polars' ideas (not its code) is fine. Baseline: `docs/bench/small-{userfelt,engine}.md` (~12k / 100k / 1M lineitem rows = TPC-H SF 0.002 / 0.017 / 0.17), plus `engine-sf{1,10}` and `final-sf{1,10}`.
+Strong CPU at every size first, then warm GPU and large data on small GPUs, then `auto` on top. **Principle (2026-10-12): Python is a thin front end (API, SQL, planning); all heavy lifting runs in Mojo, as one call per query** (`docs/design/mojo-executor.md`, approved). Order: F-026 ✓ → F-027 → F-028 (runtime load only) → F-030 (M0 spike) → F-031 … F-034. F-025 and F-029 are folded into the executor milestones. Borrowing Polars' ideas (not its code) is fine. Baseline: `docs/bench/small-{userfelt,engine}.md` (~12k / 100k / 1M lineitem rows = TPC-H SF 0.002 / 0.017 / 0.17), plus `engine-sf{1,10}` and `final-sf{1,10}`.
 
 ## F-026 No pandas import on the query path [done]
 Needs: none · From the CPU baseline: Q7, Q13, Q16, Q17, Q19, Q21 take 115–140 ms at 12k rows against 3–5 ms for the other queries, because some query paths make PyArrow import pandas (110–160 ms, once per process). Cause: PyArrow builds empty results with `pa.array([])`, which imports pandas. That happens on `ChunkedArray.combine_chunks()` / `to_numpy()` of a zero-chunk column (an intermediate a filter emptied), on masked NumPy arrays (the NULL of an aggregate over no rows), and on an empty `isin` list. Empty intermediates are common at 12k rows and rare at SF1, where these queries showed no such jump.
@@ -288,18 +288,45 @@ Needs: none · From the CPU baseline at ~12k rows
 - [x] the harness settles Q19 at SF0.002 (pandas/Polars marked WRONG): for pandas and Polars only (their convention), a one-row aggregate of 0 against a NULL reference counts as equal, with a note on the row (`compare_tables(empty_sum_is_zero=True)`); the report's correctness methodology says so
 - [x] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17: `docs/bench/small-userfelt-f027.md`, 198 results checked against DuckDB, 195 ok and 3 drift (Polars Q1, float32 accumulation, 3e-6 to 1.6e-3). mx-cpu 66/66 ok with no NULL-vs-0 note. `tests/test_tpch_small_correct.py` checks pandas, Polars and mx-cpu against DuckDB at 0.002 and 0.017, user-felt and engine-only paths
 
-## F-028 Fixed per-query overhead at small sizes [todo]
+## F-028 One-time Mojo runtime load [todo]
 Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms
 - [ ] profile where a 12k-row query spends its time (planning, Arrow↔NumPy conversion, ctypes calls, result building) and write it down
   - First finding (2026-10-12): the ~23 ms first runs (Q6 at 12k, Q1 and Q21 at 100k, reproducible 23–25 ms in fresh workers vs 3–6 ms when warm) are the one-time Mojo runtime load. The first kernel library dlopen costs 22–42 ms, whichever library it is: `libNVPTX.so` (56 MB LLVM NVPTX backend, linked even by the CPU libraries) 11 ms, `libKGENCompilerRTShared.so` 5 ms, the rest runtime start-up. The import-time warm-up thread hides it only when the data load takes longer (Q1 load 27 ms → query 5 ms; load 8 ms → query 25 ms); with `MXFRAME_WARM=0` every first query pays 27–50 ms. Leads: build the CPU libraries without the NVPTX dependency; one CPU library instead of four; start the warm-up before `import pyarrow.compute` (29 ms) in `import mxframe` (89 ms)
-- [ ] cut the biggest fixed costs (Polars-style ideas: plan once and run natively, keep data in one columnar form end to end, avoid per-operator materialization)
-- [ ] engine-only at 12k and 100k rows: mx-cpu beats pandas on ≥ 18/22 and is within 2x Polars on the median; user-felt read overhead at 12k within 1.5x Polars
+- ~~cut the Python-side fixed costs~~ superseded by the Mojo executor (F-030+): Python glue is not where the fix belongs
+- [ ] the one-time runtime load (~22 ms per process) off the first query: CPU libraries without the NVPTX dependency if the toolchain allows, one CPU library, warm-up started earlier; measured in fresh workers at 12k rows (Q6, Q21)
 
-## F-029 CPU joins [todo]
+## F-029 CPU joins [superseded by F-032]
 Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17, Q20 with reading out of the clock (F-007 is GPU placement; this ticket is the CPU join itself)
 - [ ] profile the CPU join path on those queries (build, probe, materialization, key encoding)
 - [ ] apply what the profile points at (Polars-style ideas: partitioned parallel build, join on dictionary codes / integer keys, late materialization of payload columns, join order by cardinality)
 - [ ] engine-only SF10: each of those queries within 2x Polars
+
+## F-030 Mojo executor M0: one call runs the plan (spike) [todo]
+Needs: design approved · Design: docs/design/mojo-executor.md · Time-box: a few days
+- [ ] Arrow C Data Interface in and out (no NumPy conversion on the way in or out)
+- [ ] a serialized physical plan (pipelines of operators + the existing expression bytecode) compiled once in Python
+- [ ] `mx_execute(plan, inputs, outputs)`: Q1 and Q6 run through that single call, results equal to DuckDB
+- [ ] Python-side time per query < 0.5 ms; engine-only numbers at 12k / 1M / SF10 against today's path and Polars; a go / no-go note for M1
+
+## F-031 Mojo executor M1: single-table pipelines [todo]
+Needs: F-030
+- [ ] scan, filter, project, global and grouped aggregate (hash table on composite keys in Mojo), sort, top-k, limit, all in the executor, with typed vectors (int64 exact, float64 accumulation)
+- [ ] engine-only at 12k–1M rows within 1.5x Polars on the queries covered
+
+## F-032 Mojo executor M2: hash joins [todo]
+Needs: F-031 · Replaces F-029
+- [ ] inner, semi, anti and left hash joins (build sink + probe operator), multi-pipeline plans
+- [ ] Q3, Q4, Q5, Q7, Q10, Q12, Q14, Q19 fully native; SF10 engine-only within 2x Polars
+
+## F-033 Mojo executor M3: distinct and subquery-shaped plans [todo]
+Needs: F-032
+- [ ] distinct; scalar results feeding a later filter inside one plan
+- [ ] 18/22 TPC-H queries fully native
+
+## F-034 Mojo executor M4: general strings [todo]
+Needs: F-033
+- [ ] LIKE / contains / substr and non-dictionary string keys in Mojo
+- [ ] 22/22 TPC-H queries fully native; the Python execution path retired for them
 
 ## F-009 Scoreboard report and README [done]
 Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).
