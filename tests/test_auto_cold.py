@@ -141,3 +141,19 @@ def test_empty_dictionary_chunk_declines_to_old_path():
     bad = pa.DictionaryArray.from_arrays(pa.array([], type=pa.int8()), pa.array([], type=pa.string()))
     t = pa.table({"k": pa.chunked_array([ok, bad], type=ok.type)})
     assert group_keys.build(t, ["k"]) is None or True   # must not crash; empty chunk is skipped or declined
+
+
+def test_a_short_query_inside_the_window_restarts_it(monkeypatch):
+    """Idle means no query for the whole gap, counted from when the last one ended."""
+    monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.2)
+    ran = []
+    with cf.deferred_background() as bg:
+        bg.later(lambda: ran.append(time.monotonic()))
+    time.sleep(0.12)
+    with cf.query_running():            # a short query 120 ms into the 200 ms window
+        time.sleep(0.02)
+    ended = time.monotonic()
+    deadline = ended + 5
+    while not ran and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert ran and ran[0] - ended >= 0.19

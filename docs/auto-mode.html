@@ -150,7 +150,7 @@ code { font-family: var(--font-mono); font-size: 13px; background: var(--surface
 
   <section>
     <h2>2 · One session: how the GPU gets involved</h2>
-    <p>The GPU pays off once the data already lives there. So the first scan of a table runs on the CPU, and after it returns the table's columns are copied to the GPU in the background. The copy pauses whenever another query is running. From then on, a repeat query over that table splits its rows between both devices.</p>
+    <p>The GPU pays off once the data already lives there. So the first scan of a table runs on the CPU, and once no query has run for 0.1 s the table's columns are copied to the GPU in the background, so back-to-back queries in a script finish first. The copy pauses whenever another query is running. From then on, a repeat query over that table splits its rows between both devices.</p>
     <div class="panel" role="img" aria-label="Timeline of four queries across CPU, link and GPU lanes">
       <svg viewBox="0 0 860 250">
         <text x="12" y="62" class="t-b">CPU</text>
@@ -164,7 +164,7 @@ code { font-family: var(--font-mono); font-size: 13px; background: var(--surface
         <rect x="80" y="44" width="150" height="28" rx="3" class="fill-cpu"/>
         <text x="155" y="30" text-anchor="middle" class="t">query 1 · first scan</text>
         <rect x="236" y="104" width="160" height="28" rx="3" class="fill-link pulse"/>
-        <text x="316" y="150" text-anchor="middle" class="t-sm">columns copy up after it returns</text>
+        <text x="316" y="150" text-anchor="middle" class="t-sm">columns copy up once idle</text>
         <rect x="236" y="164" width="80" height="28" rx="3" class="fill-dim"/>
         <text x="276" y="212" text-anchor="middle" class="t-sm">GPU start-up</text>
 

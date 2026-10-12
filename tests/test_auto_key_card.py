@@ -52,3 +52,17 @@ def test_numeric_estimate_imports_nothing_heavy():
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "[]"
+
+
+def test_many_chunks_stay_cheap_and_agree():
+    import time
+    n, chunks = 2_000_000, 10_000
+    r = np.random.default_rng(3)
+    v = r.integers(0, 40_000, n)
+    col = pa.chunked_array([pa.array(c) for c in np.array_split(v, chunks)])
+    t0 = time.perf_counter()
+    est = am._key_card("k", [pa.table({"k": col})], n)
+    took = time.perf_counter() - t0
+    ref = _reference(col, n)
+    assert abs(est - ref) <= 0.05 * ref + 1
+    assert took < 0.1, f"{took * 1e3:.0f} ms for {chunks} chunks"

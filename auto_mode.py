@@ -406,12 +406,14 @@ def _sample_distinct(column, idx) -> int:
     from .np_arrow import array as _npa, to_numpy as _np_of
     typ = column.type
     if (pa.types.is_integer(typ) or pa.types.is_floating(typ)) and column.null_count == 0:
-        parts, off = [], 0
-        for ch in column.chunks:
-            sel = idx[(idx >= off) & (idx < off + len(ch))] - off
+        chunks = column.chunks
+        starts = np.cumsum([0] + [len(ch) for ch in chunks])
+        cuts = np.searchsorted(idx, starts)          # idx is sorted: one slice of it per chunk
+        parts = []
+        for c, ch in enumerate(chunks):
+            sel = idx[cuts[c]:cuts[c + 1]]
             if len(sel):
-                parts.append(_np_of(ch, zero_copy_only=False)[sel])
-            off += len(ch)
+                parts.append(_np_of(ch, zero_copy_only=False)[sel - starts[c]])
         v = np.sort(np.concatenate(parts)) if parts else np.empty(0)
         if len(v) == 0:
             return 0

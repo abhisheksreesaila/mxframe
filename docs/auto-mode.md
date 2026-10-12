@@ -43,8 +43,10 @@ flowchart LR
 
 The GPU pays off once the data already lives there. So:
 
-1. **First query on a table:** runs on the CPU. After it returns, the table's columns
-   are copied to the GPU in the background. The copy pauses while any other query runs.
+1. **First query on a table:** runs on the CPU. Once no query has run for 0.1 s, the
+   table's columns are copied to the GPU in the background, and the GPU starts up. A script
+   that runs several queries back to back therefore finishes them before any GPU work
+   competes for its cores. The copy also pauses while any other query runs.
 2. **Second query:** splits the rows between the devices, paying the GPU's one-time
    warm-up.
 3. **Later queries:** split the rows with no copy over the link at all.

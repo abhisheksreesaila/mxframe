@@ -58,20 +58,23 @@ _policy: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_policy"
 # Queries running right now (device="auto"). Background uploads pause between chunk
 # copies while this is non-zero, so work meant for the next query never slows this one.
 _active = 0
+_last_end = 0.0            # monotonic time the last query finished
 _active_cv = threading.Condition()
 YIELD_MAX_S = 2.0          # an upload never waits longer than this per copy
 
 
 @contextlib.contextmanager
 def query_running():
-    global _active
+    global _active, _last_end
     with _active_cv:
         _active += 1
+        _active_cv.notify_all()
     try:
         yield
     finally:
         with _active_cv:
             _active -= 1
+            _last_end = time.monotonic()
             _active_cv.notify_all()
 
 
@@ -105,7 +108,12 @@ class _Background:
                 except Exception:
                     pass
             for t in threads:
-                t.start()
+                try:
+                    t.start()
+                except Exception:      # e.g. interpreter shutdown: free the key so a later query retries
+                    with _lock:
+                        for k in [k for k, v in _inflight.items() if v is t]:
+                            _inflight.pop(k, None)
 
         if IDLE_BEFORE_BACKGROUND_S <= 0:
             launch()
@@ -121,11 +129,14 @@ IDLE_BEFORE_BACKGROUND_S = 0.1
 
 
 def _wait_until_idle(quiet_s: float) -> None:
+    """Return once no query is running and none has finished for ``quiet_s``."""
     with _active_cv:
         while True:
             _active_cv.wait_for(lambda: _active == 0)
-            if not _active_cv.wait_for(lambda: _active > 0, timeout=quiet_s):
+            left = quiet_s - (time.monotonic() - _last_end)
+            if left <= 0:
                 return
+            _active_cv.wait(timeout=left)
 
 
 @contextlib.contextmanager
