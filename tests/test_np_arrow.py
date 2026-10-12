@@ -194,9 +194,9 @@ TYPES = [pa.int32(), pa.int64(), pa.float64(), pa.string(), pa.bool_(), pa.date3
 
 
 @pytest.mark.parametrize("t", TYPES, ids=str)
-def test_combine_matches_combine_chunks(t):
+def test_combine_matches_combine_chunks_except_it_keeps_a_single_chunk(t):
     empty = pa.chunked_array([], type=t)
-    assert combine(empty).equals(pa.nulls(0, t)) and combine(empty).type == t
+    assert combine(empty).equals(empty.combine_chunks()) and combine(empty).type == t
     one = pa.chunked_array([pa.nulls(3, t)])
     got = combine(one)
     assert got.equals(one.chunk(0)) and [b.address if b else None for b in got.buffers()] == \
@@ -254,3 +254,80 @@ def test_empty_value_set_takes_the_column_type(like):
     col = pa.nulls(3, like) if not pa.types.is_dictionary(like) else pa.array(["a", "b", "a"]).dictionary_encode()
     assert pc.is_in(col, value_set=vs).to_pylist() == [False] * 3
     assert value_set([1, 2], pa.int64()).equals(arr([1, 2]))
+
+
+# ---- F-026 review: Table.group_by imports pandas even on non-empty data ----------------------
+
+from mxframe.np_arrow import distinct_rows, group_aggregate  # noqa: E402
+
+
+def _nullable_table(n=500, seed=3):
+    r = np.random.default_rng(seed)
+    k1 = pa.array([None if x == 0 else int(x) for x in r.integers(0, 4, n)], pa.int32())
+    k2 = pa.array([None if x == 0 else f"s{x}" for x in r.integers(0, 3, n)], pa.string())
+    v = pa.array([None if x < 0.2 else float(x) for x in r.random(n)], pa.float64())
+    return pa.table({"k1": k1, "k2": k2, "v": v})
+
+
+@pytest.mark.parametrize("cols", [["k1"], ["k2"], ["k1", "k2"], ["k1", "k2", "v"]])
+def test_distinct_rows_matches_group_by(cols):
+    t = _nullable_table()
+    want = t.select(cols).group_by(cols, use_threads=False).aggregate([])
+    got = distinct_rows(t.select(cols)).to_pylist()
+    first, seen = [], set()
+    for r in t.select(cols).to_pylist():                 # first-appearance order, nulls equal
+        if tuple(r.values()) not in seen:
+            seen.add(tuple(r.values()))
+            first.append(r)
+    assert got == first
+    # same rows as PyArrow (whose order is not first appearance once a float key is involved)
+    assert sorted(map(str, got)) == sorted(map(str, want.select(cols).to_pylist()))
+    assert distinct_rows(t.select(cols).slice(0, 0)).num_rows == 0
+
+
+@pytest.mark.parametrize("keys", [["k1"], ["k1", "k2"]])
+def test_group_aggregate_matches_group_by(keys):
+    t = _nullable_table()
+    ops = ["sum", "min", "max", "mean", "count"]
+    spec = [("v", op) for op in ops]
+    want = t.group_by(keys, use_threads=False).aggregate(spec)
+    got = group_aggregate(t, keys, spec)
+    assert got.column_names == want.column_names
+    for name in want.column_names:
+        w, g = want.column(name).to_pylist(), got.column(name).to_pylist()
+        if name.startswith("v_") and name not in ("v_count",):
+            assert [x is None for x in g] == [x is None for x in w], name
+            assert np.allclose([x for x in g if x is not None], [x for x in w if x is not None], rtol=1e-12), name
+        else:
+            assert g == w, name
+
+
+def test_group_aggregate_all_null_group_and_empty_input():
+    t = pa.table({"k": pa.array([1, 1, 2], pa.int32()), "v": pa.array([None, None, 3.0], pa.float64())})
+    got = group_aggregate(t, ["k"], [("v", "sum"), ("v", "count"), ("v", "mean"), ("v", "min")]).to_pylist()
+    assert got == [{"k": 1, "v_sum": None, "v_count": 0, "v_mean": None, "v_min": None},
+                   {"k": 2, "v_sum": 3.0, "v_count": 1, "v_mean": 3.0, "v_min": 3.0}]
+    assert group_aggregate(t.slice(0, 0), ["k"], [("v", "sum")]).num_rows == 0
+
+
+def test_masked_array_edge_cases():
+    m = np.ma.array(np.arange(12.0), mask=[i % 3 == 0 for i in range(12)])
+    for x in (m[2:9], m[::2], m[1:1]):
+        assert arr(x).equals(pa.array(x))
+    b = np.ma.array(np.array([True, False, True]), mask=[0, 1, 0])
+    assert arr(b).equals(pa.array(b))
+    nan_masked = np.ma.array(np.array([1.0, np.nan, 3.0]), mask=[0, 1, 0])
+    assert arr(nan_masked, type=pa.int64()).equals(pa.array(nan_masked, type=pa.int64()))
+
+
+def test_distinct_and_group_aggregate_do_not_import_pandas():
+    root = Path(__file__).resolve().parent
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n"
+            "import numpy as np, pyarrow as pa\nfrom mxframe.np_arrow import array, distinct_rows, group_aggregate\n"
+            "k = pa.chunked_array([array(np.array([1, 2, 1], np.int32))]).cast(pa.int32())\n"
+            "m = np.ma.array(np.array([1.0, 2.0, 3.0]), mask=[0, 1, 0])\n"
+            "t = pa.table({'k': k, 'v': array(m)})\n"
+            "distinct_rows(t.select(['k'])); group_aggregate(t, ['k'], [('v', 'sum'), ('v', 'count')])\n"
+            "print('pandas' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False"

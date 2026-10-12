@@ -8,7 +8,8 @@ __all__ = ['KERNELS_PATH', 'WARP_SIZE', 'MAX_GROUPS', 'AUTO_GPU_THRESHOLD', 'GPU
 # %% ../nbs/04_custom_ops.ipynb 2
 from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, value_set as _value_set
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, value_set as _value_set,\
+    distinct_rows as _distinct_rows, group_aggregate as _group_aggregate
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
@@ -771,9 +772,9 @@ class CustomOpsCompiler(GraphCompiler):
                 elif op == "min":  val = float(arr_np.min())
                 elif op == "max":  val = float(arr_np.max())
                 else:              val = float(arr_np.mean())   # mean
-                result_cols[name] = _pa.array([val], type=_pa.float64())
+                result_cols[name] = _npa([val], type=_pa.float64())
             elif op == "count":
-                result_cols[name] = _pa.array([len(table)], type=_pa.int64())
+                result_cols[name] = _npa([len(table)], type=_pa.int64())
             else:
                 raise NotImplementedError(
                     f"_compute_global_agg_pyarrow: unsupported agg op '{op}'"
@@ -1457,7 +1458,7 @@ class CustomOpsCompiler(GraphCompiler):
                                        names=key_names + [f"__v{i}__" for i in range(len(agg_arrays))])
             spec = [(f"__v{i}__", {"sum": "sum", "min": "min", "max": "max", "mean": "mean",
                                   "count": "count"}[e.op]) for i, e in enumerate(plan.aggs)]
-            grouped = src.group_by(key_names, use_threads=False).aggregate(spec)
+            grouped = _group_aggregate(src, key_names, spec)      # Table.group_by imports pandas
             out_cols = [grouped.column(n) for n in key_names]
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
@@ -2726,12 +2727,14 @@ class CustomOpsCompiler(GraphCompiler):
         """
         cols = list(distinct_node.subset or table.column_names)
         sub = table.select(cols)
-        if sub.num_rows == 0 or any(sub.column(c).null_count for c in cols):
-            return sub.group_by(cols).aggregate([])
+        if sub.num_rows == 0:
+            return sub                                   # no rows: already distinct
+        if any(sub.column(c).null_count for c in cols):
+            return _distinct_rows(sub)
         try:
             gids, n_groups, _ = self._build_group_ids(sub, cols)
         except Exception:
-            return sub.group_by(cols).aggregate([])
+            return _distinct_rows(sub)
         rows = _group_keys.first_rows(gids, int(n_groups)) if isinstance(gids, np.ndarray) else None
         if rows is not None:
             return sub.take(_npa(rows))

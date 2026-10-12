@@ -8,7 +8,7 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
 import pyarrow.compute as pc
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
@@ -233,7 +233,7 @@ class GraphCompiler:
                 table = table.slice(0, node.n)
             elif isinstance(node, Distinct):
                 cols = node.subset or table.column_names
-                table = table.group_by(cols).aggregate([])
+                table = _distinct_rows(table.select(cols)) if table.num_rows else table.select(cols)
             elif isinstance(node, Tail):
                 table = table.slice(max(0, table.num_rows - node.n), node.n)
         return table

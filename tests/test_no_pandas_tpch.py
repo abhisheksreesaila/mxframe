@@ -64,5 +64,31 @@ def test_no_query_imports_pandas(data_dir, mode):
     assert not any(r["before"] for _, _, r in results), "pandas imported before the query started"
     if mode == "engine":
         assert not [q for q, _, r in results if r.get("after_load")], "loading imported pandas"
+    failed = {q: r["query_error"] for q, _, r in results if "query_error" in r}
+    assert not failed, f"queries that failed ({mode}): {failed}"
     bad = [q for q, _, r in results if r["after_query"]]
     assert not bad, f"queries that import pandas ({mode}): {bad}"
+
+
+_PATHS = """
+import sys, numpy as np, pyarrow as pa
+import mxframe
+from mxframe import LazyFrame, col, lit
+from mxframe.np_arrow import array as A
+r = np.random.default_rng(0)
+n = 2000
+m = np.ma.array(r.random(n), mask=r.random(n) < 0.1)
+t = pa.table({"k": A(r.integers(0, 5, n).astype(np.int32)), "v": A(r.random(n)), "w": A(m)})
+LazyFrame(t).filter(col("v") > lit(100.0)).select("k").distinct().compute(device="cpu")    # empty DISTINCT
+LazyFrame(t).groupby("k").agg(col("w").sum().alias("s"), col("w").count().alias("c")).compute(device="cpu")
+LazyFrame(t).select("k", "w").distinct().compute(device="cpu")                              # DISTINCT with nulls
+print("@@", "pandas" in sys.modules)
+"""
+
+
+def test_review_paths_do_not_import_pandas():
+    """F-026 review: an empty DISTINCT, a grouped aggregate over a column with nulls, and a DISTINCT
+    with nulls each used Table.group_by."""
+    p = subprocess.run([sys.executable, "-c", _PATHS], capture_output=True, text=True,
+                       env=worker_env("-1"), cwd=str(REPO_ROOT), timeout=300)
+    assert "@@ False" in p.stdout, (p.stdout[-500:], p.stderr[-1500:])

@@ -123,7 +123,8 @@ def scalar(value, type=None):
 def combine(arr) -> pa.Array:
     """``ChunkedArray.combine_chunks()`` without pandas: PyArrow builds the zero-chunk case with
     ``pa.array([])``, which imports pandas, and an empty intermediate (a filter that keeps no
-    rows) is common on small data. One chunk is returned as is; an Array passes through."""
+    rows) is common on small data. One chunk is returned as is (unlike ``combine_chunks``, which
+    copies it, the result can keep a non-zero offset); an Array passes through."""
     if not isinstance(arr, pa.ChunkedArray):
         return arr
     if arr.num_chunks == 0:
@@ -301,3 +302,87 @@ def take_rows(obj, idx):
             return obj.take(array(idx))
         return pa.Table.from_arrays([one(obj.column(i)) for i in range(obj.num_columns)], schema=obj.schema)
     return one(obj)
+
+
+# ---- pandas-free replacements for Table.group_by -----------------------------------------------
+# PyArrow's Table.group_by / Table.join import pandas (through pyarrow.dataset) on every call, even
+# on non-empty data. These cover the engine's fallback uses: DISTINCT and grouped aggregates over
+# columns with nulls. Groups come out in first-appearance order, like Table.group_by.
+
+def _codes(col) -> np.ndarray:
+    """Dense int64 codes per row, nulls encoded as their own value."""
+    import pyarrow.compute as pc
+    a = combine(col)
+    if pa.types.is_dictionary(a.type):
+        a = a.dictionary_decode()
+    return to_numpy(pc.dictionary_encode(a, null_encoding="encode").indices).astype(np.int64)
+
+
+def _group_ids(table: pa.Table, cols):
+    """(group id per row, first row of each group), groups numbered by first appearance."""
+    codes = np.stack([_codes(table.column(c)) for c in cols], axis=1)
+    _, first, inv = np.unique(codes, axis=0, return_index=True, return_inverse=True)
+    order = np.argsort(first, kind="stable")
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+    return rank[inv.reshape(-1)], first[order]
+
+
+def _float_values(a) -> np.ndarray:
+    """float64 values of a numeric Array, null slots unspecified (callers mask them). Reads the
+    data buffer: ``to_numpy`` on an array with nulls goes through pandas."""
+    import pyarrow.compute as pc
+    if a.type != pa.float64():
+        a = pc.cast(a, pa.float64())
+    if len(a) == 0:
+        return np.zeros(0, np.float64)
+    return np.frombuffer(a.buffers()[1], dtype=np.float64, count=a.offset + len(a))[a.offset:]
+
+
+def distinct_rows(table: pa.Table) -> pa.Table:
+    """Distinct rows of ``table`` (nulls equal to each other), first-appearance order."""
+    if table.num_rows == 0:
+        return table
+    _, first = _group_ids(table, table.column_names)
+    return table.take(array(first.astype(np.int64)))
+
+
+def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
+    """``table.group_by(keys).aggregate(spec)`` for spec ops sum / min / max / mean / count (nulls
+    skipped; a group with no valid value gives NULL, count 0). Columns: keys, then ``<col>_<op>``."""
+    import pyarrow.compute as pc
+    names = list(keys) + [f"{c}_{op}" for c, op in spec]
+    if table.num_rows == 0:
+        cols = [pa.nulls(0, table.schema.field(k).type) for k in keys]
+        for c, op in spec:
+            t = table.schema.field(c).type
+            cols.append(pa.nulls(0, pa.int64() if op == "count" else
+                                 t if op in ("min", "max") else
+                                 pa.int64() if op == "sum" and pa.types.is_integer(t) else pa.float64()))
+        return pa.Table.from_arrays(cols, names=names)
+    gid, first = _group_ids(table, keys)
+    n_groups = len(first)
+    take = array(first.astype(np.int64))
+    out = [combine(table.column(k)).take(take) for k in keys]
+    for c, op in spec:
+        a = combine(table.column(c))
+        valid = to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else np.ones(len(a), bool)
+        g = gid[valid]
+        cnt = np.bincount(g, minlength=n_groups)
+        if op == "count":
+            out.append(array(cnt.astype(np.int64)))
+            continue
+        x = _float_values(a)[valid]
+        if op in ("sum", "mean"):
+            res = np.bincount(g, weights=x, minlength=n_groups)
+            if op == "mean":
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    res = res / cnt
+        else:
+            res = np.full(n_groups, np.inf if op == "min" else -np.inf)
+            (np.minimum if op == "min" else np.maximum).at(res, g, x)
+        t = a.type
+        typ = (t if op in ("min", "max") else
+               pa.int64() if op == "sum" and pa.types.is_integer(t) else pa.float64())
+        out.append(array(np.ma.array(res, mask=cnt == 0), type=typ))
+    return pa.Table.from_arrays(out, names=names)
