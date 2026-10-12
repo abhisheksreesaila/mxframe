@@ -280,12 +280,12 @@ Needs: none · From the CPU baseline: Q7, Q13, Q16, Q17, Q19, Q21 take 115–140
 - [x] the paths found get a pandas-free equivalent; nothing falls back to `pa.array` on the query path for inputs we produce ourselves
 - [x] small-size engine-only rerun (`docs/bench/small-engine-f026.md`, load ~3): those six queries 3–8 ms at 12k rows (were 115–140). mx-cpu sum 571 → 104 ms at 12k (pandas 102, Polars 44) and 507 → 160 ms at 100k (pandas 177, Polars 68). Left for F-028: one-off ~23 ms first calls (Q6 at 12k, Q1 and Q21 at 100k)
 
-## F-027 Empty intermediate results [todo]
+## F-027 Empty intermediate results [review]
 Needs: none · From the CPU baseline at ~12k rows
-- [ ] SF0.002 Q11 no longer crashes (`TypeError: None * float`) and Q17 is no longer WRONG on mx-cpu; root cause found and fixed in the engine (empty group / empty aggregate semantics), not worked around in the harness
-- [ ] aggregates over zero rows follow one documented rule (SQL: SUM/AVG/MIN/MAX of no rows = NULL, COUNT = 0), with tests
-- [ ] the harness settles Q19 at SF0.002 (pandas/Polars marked WRONG): decide whether an empty SUM compares equal to 0 or NULL, and say so in the report
-- [ ] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17
+- [x] SF0.002 Q11 no longer crashes and Q17 is no longer WRONG on mx-cpu. Neither was an engine bug: the engine already returns SQL NULL for an aggregate over no rows. Q11 crashed in the benchmark's own mx code (`None * fraction` when Germany has no suppliers; now `value > NULL` keeps no rows, as in SQL), and Q17 was the reference's fault (DuckDB's Q17 SQL wraps the sum in `coalesce(.., 0)`, Q19's does not)
+- [x] aggregates over zero rows follow SQL (SUM/MEAN/MIN/MAX of no rows = NULL, COUNT = 0, grouped = no groups), pinned on every aggregate path in `tests/test_empty_aggregates.py`
+- [x] the harness counts a one-row aggregate NULL (SQL) vs 0 (pandas/Polars) as the same answer, with a note on the row and a sentence in the report's correctness methodology (`compare._empty_aggregate`)
+- [x] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17: 264/264 in `docs/bench/small-userfelt-f027.md`; `tests/test_tpch_small_correct.py` checks pandas, Polars and mx-cpu against DuckDB at 0.002 and 0.017
 
 ## F-028 Fixed per-query overhead at small sizes [todo]
 Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms

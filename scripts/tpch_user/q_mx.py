@@ -240,7 +240,9 @@ def q11(t, dev):
     )
     g = LazyFrame(grouped)
     total = _scalar(g.groupby().agg(col("value").sum().alias("total")).compute(device=dev))
-    return (g.filter(col("value") > lit(total * S.q11_fraction()))
+    # no partsupp rows for the nation: SUM is NULL, and SQL's `value > NULL` keeps no rows
+    cut = total * S.q11_fraction() if total is not None else float("inf")
+    return (g.filter(col("value") > lit(cut))
             .sort("value", descending=True).compute(device=dev))
 
 

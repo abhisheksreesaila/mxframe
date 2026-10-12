@@ -414,7 +414,9 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
     a("- **Correctness**: each result is compared with DuckDB (row count; integer/string columns exactly; "
       "float columns at 1e-6 relative, matched by key columns; LIMIT queries tolerate rows that tie at the "
       "cutoff within 1e-6) and then checked to be in the query's ORDER BY order. Inputs are float32; an "
-      "engine that accumulates in float32 drifts on large sums (`†`), DuckDB sums in double.")
+      "engine that accumulates in float32 drifts on large sums (`†`), DuckDB sums in double. "
+      "A one-row aggregate over no rows is NULL in SQL (DuckDB, MXFrame) and 0 in pandas and Polars; "
+      "the comparison counts the two as the same answer (it happens only on tiny data).")
     a(f"- **Hardware**: {meta['cpu']} ({meta['cores']} cores); GPU: {meta['gpu']} "
       f"({meta['gpu_desc']}; the workers get `CUDA_VISIBLE_DEVICES=<that UUID>`, so it is the same "
       f"card nvidia-smi calls by that index). **The machine was shared with other jobs during this run "

@@ -72,14 +72,37 @@ def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
                    order_by: list[tuple[int, bool]] | None = None) -> Comparison:
     """`order_by` = [(column index, descending)] of the query's ORDER BY (positional, like every
     other column here). After the values match, `actual` must be sorted by those keys."""
+    actual, expected, note = _empty_aggregate(actual, expected)
     res = _compare_values(actual, expected, rtol=rtol, drift_limit=drift_limit,
                           topn_metric=topn_metric)
+    if note and res.verdict != "wrong":
+        res.message = (res.message + "; " if res.message else "") + note
     if res.verdict == "wrong" or not order_by or actual.num_rows < 2:
         return res
     bad = check_order(actual, order_by, ORDER_RTOL)
     if bad is not None:
         return Comparison("wrong", res.max_rel_err, f"ORDER BY violated at result row {bad}")
     return res
+
+
+def _empty_aggregate(actual: pa.Table, expected: pa.Table):
+    """A one-row aggregate over no rows is NULL in SQL (DuckDB, mxframe) and 0 in pandas / Polars.
+    In a one-row result a float NULL on one side against 0 on the other is the same answer: both
+    become 0, and a note says so. Anything else is left for the normal comparison."""
+    if actual.num_rows != 1 or expected.num_rows != 1 or actual.num_columns != expected.num_columns:
+        return actual, expected, ""
+    hit = False
+    for i in range(actual.num_columns):
+        a, e = actual.column(i), expected.column(i)
+        if not (_is_float(a.type) and _is_float(e.type)):
+            continue
+        av, ev = a[0].as_py(), e[0].as_py()
+        if (av is None and ev == 0) or (ev is None and av == 0):
+            zero = pa.array([0.0])
+            actual = actual.set_column(i, actual.field(i).with_type(pa.float64()), zero)
+            expected = expected.set_column(i, expected.field(i).with_type(pa.float64()), zero)
+            hit = True
+    return actual, expected, ("empty aggregate: NULL (SQL) vs 0 (pandas/Polars) counted as equal" if hit else "")
 
 
 def check_order(tbl: pa.Table, order_by: list[tuple[int, bool]], rtol: float = ORDER_RTOL) -> int | None:

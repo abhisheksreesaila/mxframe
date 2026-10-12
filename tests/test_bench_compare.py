@@ -172,3 +172,16 @@ def test_official_answer_check_flags_a_wrong_reference():
     assert check_official(6, pa.table({"revenue": [123141078.2283]}), ans) == "ok"
     assert check_official(6, pa.table({"revenue": [8.865e7]}), ans).startswith("row")
     assert check_official(13, pa.table({"revenue": [1.0]}), ans) is None      # not checked
+
+
+def test_empty_aggregate_null_and_zero_are_the_same_answer():
+    # SQL: SUM over no rows is NULL; pandas and Polars give 0. A one-row aggregate result may differ
+    # only in that, and the comparison says so.
+    for a, e in ((T(r=pa.array([0.0])), T(r=pa.array([None], pa.float64()))),
+                 (T(r=pa.array([None], pa.float64())), T(r=pa.array([0.0])))):
+        r = compare_tables(a, e)
+        assert r.ok and "NULL" in r.message
+    # not for a real value, nor for results with more than one row
+    assert not compare_tables(T(r=pa.array([1.5])), T(r=pa.array([None], pa.float64()))).ok
+    assert not compare_tables(T(k=[1, 2], r=pa.array([0.0, 1.0])),
+                              T(k=[1, 2], r=pa.array([None, 1.0], pa.float64()))).ok
