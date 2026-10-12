@@ -274,7 +274,7 @@ Needs: F-024 · From the engine-only run
 ## CPU track (agreed 2026-10-12)
 Strong CPU at every size first, then warm GPU and large data on small GPUs, then `auto` on top. Order: F-026 → F-027 → F-028 → F-025 → F-029 → F-021. Borrowing Polars' ideas (not its code) is fine. Baseline: `docs/bench/small-{userfelt,engine}.md` (~12k / 100k / 1M lineitem rows = TPC-H SF 0.002 / 0.017 / 0.17), plus `engine-sf{1,10}` and `final-sf{1,10}`.
 
-## F-026 No pandas import on the query path [review]
+## F-026 No pandas import on the query path [done]
 Needs: none · From the CPU baseline: Q7, Q13, Q16, Q17, Q19, Q21 take 115–140 ms at 12k rows against 3–5 ms for the other queries, because some query paths make PyArrow import pandas (110–160 ms, once per process). Cause: PyArrow builds empty results with `pa.array([])`, which imports pandas. That happens on `ChunkedArray.combine_chunks()` / `to_numpy()` of a zero-chunk column (an intermediate a filter emptied), on masked NumPy arrays (the NULL of an aggregate over no rows), and on an empty `isin` list. Empty intermediates are common at 12k rows and rare at SF1, where these queries showed no such jump.
 - [x] none of the 22 TPC-H queries imports pandas, mx-cpu, user-felt and engine-only, each in a fresh process (test over generated SF0.002 data)
 - [x] the paths found get a pandas-free equivalent; nothing falls back to `pa.array` on the query path for inputs we produce ourselves
