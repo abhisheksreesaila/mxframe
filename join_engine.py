@@ -26,7 +26,7 @@ import pyarrow.compute as pc
 
 from .lazy_frame import (join_output_names, Scan, Filter, Project, Aggregate, Sort, Limit,
                          Distinct, Tail, Join)
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine
 from .optimizer import _output_columns as plan_columns
 
 
@@ -276,7 +276,7 @@ def _as_pa(x) -> pa.Array:
     if isinstance(x, np.ndarray):
         return _npa(x)
     if isinstance(x, pa.ChunkedArray):
-        return x.combine_chunks() if x.num_chunks != 1 else x.chunk(0)
+        return _combine(x) if x.num_chunks != 1 else x.chunk(0)
     return x
 
 

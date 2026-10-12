@@ -271,9 +271,9 @@ def _row_mask(table, rowwise):
 def _dictionary_mask(col, op, value):
     """Boolean NumPy mask of ``col <op> value`` on a dictionary column: compare each dictionary entry
     once, then look the codes up (F-020).  None when the column is not a plain string dictionary."""
-    from .np_arrow import to_numpy
+    from .np_arrow import to_numpy, combine as _combine
     import numpy as np
-    arr = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+    arr = _combine(col) if isinstance(col, pa.ChunkedArray) else col
     if not isinstance(arr, pa.DictionaryArray) or arr.null_count or arr.dictionary.null_count:
         return None
     entries = arr.dictionary.to_pylist()

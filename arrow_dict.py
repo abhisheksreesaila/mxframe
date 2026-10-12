@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
 import pyarrow.compute as pc
 
 __all__ = ["is_dictionary", "decode", "combine_dictionary", "encode_key", "dict_predicate"]
@@ -41,7 +41,7 @@ def combine_dictionary(col) -> pa.DictionaryArray:
             return _npa([], type=col.type)
         if col.num_chunks == 1:
             return col.chunk(0)
-        return col.unify_dictionaries().combine_chunks()
+        return _combine(col.unify_dictionaries())
     return col
 
 
@@ -75,7 +75,7 @@ def encode_key(col):
     Plain columns go through ``dictionary_encode()``.
     """
     if not is_dictionary(col):
-        arr = col.combine_chunks() if isinstance(col, pa.ChunkedArray) else col
+        arr = _combine(col) if isinstance(col, pa.ChunkedArray) else col
         fast = _encode_int(arr)
         if fast is not None:
             return fast

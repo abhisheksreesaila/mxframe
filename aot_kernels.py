@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 
-from .np_arrow import take_rows
+from .np_arrow import take_rows, combine as _combine
 
 # The Mojo device-context memory manager reserves ~90% of the GPU's free memory the first time
 # a kernel creates a buffer (the recursive scan does, at >= 1M rows), and this module's own
@@ -1334,7 +1334,7 @@ class AOTKernelsGPU:
         for col_name in table.column_names:
             col = table.column(col_name)
             if isinstance(col, pa.ChunkedArray):
-                col = col.combine_chunks()
+                col = _combine(col)
             src_len = len(col)
             value_buffer = col.buffers()[1]
             buffer_address = value_buffer.address if value_buffer is not None else 0

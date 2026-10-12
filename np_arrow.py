@@ -78,6 +78,10 @@ def _from_pylist(values, type):
         k = next(iter(kinds))
     else:
         return None
+    if k is float and type is not None and pa.types.is_integer(type) \
+            and all(float(v).is_integer() and abs(v) < 2 ** 53 for v in values):
+        k = int                  # whole floats into an integer type: PyArrow gives the same ints
+        values = [int(v) for v in values]
     if k is None or not _same_kind(k, type):
         return None
     if k is str:
@@ -116,10 +120,53 @@ def scalar(value, type=None):
     return arr[0]
 
 
+def combine(arr) -> pa.Array:
+    """``ChunkedArray.combine_chunks()`` without pandas: PyArrow builds the zero-chunk case with
+    ``pa.array([])``, which imports pandas, and an empty intermediate (a filter that keeps no
+    rows) is common on small data. One chunk is returned as is; an Array passes through."""
+    if not isinstance(arr, pa.ChunkedArray):
+        return arr
+    if arr.num_chunks == 0:
+        return pa.nulls(0, arr.type)
+    if arr.num_chunks == 1:
+        return arr.chunk(0)
+    return arr.combine_chunks()
+
+
+def value_set(values, like) -> pa.Array:
+    """``value_set`` for ``pc.is_in`` against a column of type ``like``. An empty list has no type
+    to infer, and ``pa.array([])`` imports pandas: build it empty with the column's value type."""
+    if len(values) == 0:
+        return pa.nulls(0, like.value_type if pa.types.is_dictionary(like) else like)
+    return array(values)
+
+
+def _masked(obj, type):
+    """1-D masked numeric/bool array: values plus a validity bitmap, None if not supported."""
+    data = np.ma.getdata(obj)
+    if data.ndim != 1 or not (data.dtype in _NUMERIC or data.dtype == np.bool_):
+        return None
+    mask = np.ma.getmaskarray(obj)
+    base = array(np.ascontiguousarray(data))
+    if not mask.any():
+        out = base
+    else:
+        valid = np.packbits(~mask, bitorder="little")
+        out = pa.Array.from_buffers(base.type, len(base), [pa.py_buffer(valid), base.buffers()[1]],
+                                    null_count=int(mask.sum()))
+    return out.cast(type, safe=True) if type is not None and out.type != type else out
+
+
 def array(obj, type=None, **kwargs) -> pa.Array:
     """``pa.array(obj, type)`` for 1-D numeric/bool NumPy input, without pandas."""
     if not kwargs and isinstance(obj, (list, tuple)):
+        if len(obj) == 0 and type is not None:
+            return pa.nulls(0, type)
         out = _from_pylist(list(obj), type)
+        if out is not None:
+            return out
+    if not kwargs and _is_masked(obj):
+        out = _masked(obj, type)
         if out is not None:
             return out
     if kwargs or not isinstance(obj, np.ndarray) or obj.ndim != 1 or _is_masked(obj):

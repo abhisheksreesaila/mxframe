@@ -183,3 +183,74 @@ def test_distinct_matches_pyarrow_group_by_order_and_values():
 def test_empty_date32_chunked_array():
     a = pa.chunked_array([], type=pa.date32())
     assert to_numpy(a).dtype == a.to_numpy().dtype and len(to_numpy(a)) == 0
+
+
+# ---- F-026: empty and masked inputs, the cases PyArrow sends through pandas ---------------------
+
+from mxframe.np_arrow import combine  # noqa: E402
+
+TYPES = [pa.int32(), pa.int64(), pa.float64(), pa.string(), pa.bool_(), pa.date32(),
+         pa.dictionary(pa.int32(), pa.string())]
+
+
+@pytest.mark.parametrize("t", TYPES, ids=str)
+def test_combine_matches_combine_chunks(t):
+    empty = pa.chunked_array([], type=t)
+    assert combine(empty).equals(pa.nulls(0, t)) and combine(empty).type == t
+    one = pa.chunked_array([pa.nulls(3, t)])
+    got = combine(one)
+    assert got.equals(one.chunk(0)) and [b.address if b else None for b in got.buffers()] == \
+        [b.address if b else None for b in one.chunk(0).buffers()]      # no copy
+    arr = pa.nulls(2, t)
+    assert combine(arr) is arr                              # already an Array
+    if t == pa.int64():
+        two = pa.chunked_array([arr_from(range(3)), arr_from(range(3, 5))])
+        assert combine(two).equals(two.combine_chunks())
+
+
+def arr_from(r):
+    return arr(np.array(list(r), dtype=np.int64))
+
+
+@pytest.mark.parametrize("t", TYPES[:6], ids=str)
+def test_empty_list_with_a_type(t):
+    assert arr([], type=t).equals(pa.array([], type=t))
+
+
+@pytest.mark.parametrize("dtype,t", [("float64", pa.float64()), ("int64", pa.int64()), ("float32", pa.float32())])
+def test_masked_numeric_arrays(dtype, t):
+    m = np.ma.array(np.arange(6).astype(dtype), mask=[0, 1, 0, 0, 1, 0])
+    assert arr(m).equals(pa.array(m))
+    assert arr(m, type=t).equals(pa.array(m, type=t))
+    allmasked = np.ma.masked_all(1, dtype=dtype)
+    assert arr(allmasked, type=t).equals(pa.array(allmasked, type=t))
+    assert arr(np.ma.array(np.arange(3).astype(dtype))).equals(pa.array(np.arange(3).astype(dtype)))
+
+
+def test_empty_and_masked_inputs_do_not_import_pandas():
+    root = Path(__file__).resolve().parent
+    code = (f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n"
+            "import numpy as np, pyarrow as pa\nfrom mxframe.np_arrow import array, combine\n"
+            "combine(pa.chunked_array([], type=pa.string())); combine(pa.chunked_array([], type=pa.int64()))\n"
+            "array([], type=pa.float64()); array(np.ma.masked_all(1, dtype=np.float64), type=pa.float64())\n"
+            "array(np.ma.array(np.arange(4.0), mask=[0, 1, 0, 1]))\n"
+            "print('pandas' in sys.modules)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False"
+
+
+def test_whole_floats_into_an_integer_type():
+    for t in (pa.int64(), pa.int32(), pa.uint8()):
+        assert arr([0.0, 3.0], type=t).equals(pa.array([0.0, 3.0], type=t))
+    assert arr([0.5], type=pa.int64()).equals(pa.array([0.5], type=pa.int64()))    # PyArrow's own path
+
+
+@pytest.mark.parametrize("like", [pa.int32(), pa.string(), pa.dictionary(pa.int32(), pa.string())], ids=str)
+def test_empty_value_set_takes_the_column_type(like):
+    import pyarrow.compute as pc
+    from mxframe.np_arrow import value_set
+    vs = value_set([], like)
+    assert len(vs) == 0 and vs.type == (like.value_type if pa.types.is_dictionary(like) else like)
+    col = pa.nulls(3, like) if not pa.types.is_dictionary(like) else pa.array(["a", "b", "a"]).dictionary_encode()
+    assert pc.is_in(col, value_set=vs).to_pylist() == [False] * 3
+    assert value_set([1, 2], pa.int64()).equals(arr([1, 2]))

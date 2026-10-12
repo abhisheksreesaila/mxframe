@@ -8,7 +8,7 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set
 import pyarrow.compute as pc
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
@@ -283,7 +283,7 @@ class GraphCompiler:
                 # Single-chunk: return Array directly, no 50ms copy from combine_chunks.
                 if len(arr.chunks) == 1:
                     return arr.chunks[0]
-                return arr.combine_chunks()
+                return _combine(arr)
             return arr
         if op == "lit":
             # An Arrow scalar, not the Python value: PyArrow converting a Python
@@ -305,7 +305,7 @@ class GraphCompiler:
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
         if op == "isin":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
-            return pc.is_in(col_arr, value_set=_npa(args[1]))
+            return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
         if op == "startswith":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])

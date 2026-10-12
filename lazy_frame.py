@@ -11,7 +11,7 @@ from typing import Any, List, Literal, Optional, Union, Dict
 from dataclasses import dataclass
 from .lazy_expr import Expr, col
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of
+from .np_arrow import array as _npa, to_numpy as _np_of, combine as _combine
 
 
 # %% ../nbs/02_lazy_frame.ipynb 4
@@ -458,7 +458,7 @@ class LazyFrame:
         for name in result.column_names:
             arr = result.column(name)
             if isinstance(arr, pa.ChunkedArray):
-                arr = arr.combine_chunks()
+                arr = _combine(arr)
             if pa.types.is_integer(arr.type) or pa.types.is_floating(arr.type):
                 np_arr = _np_of(arr, zero_copy_only=False).astype(_np.float64)
                 numeric_cols[name] = np_arr[~_np.isnan(np_arr)]
@@ -506,7 +506,7 @@ class LazyFrame:
         for name in table.column_names:
             col = table.column(name)
             if isinstance(col, pa.ChunkedArray):
-                col = col.combine_chunks()
+                col = _combine(col)
             np_arr, _, _ = compiler_inst._column_to_numpy_cached(col)
             if np_arr is None:
                 continue

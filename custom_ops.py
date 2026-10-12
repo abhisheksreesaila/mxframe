@@ -8,7 +8,7 @@ __all__ = ['KERNELS_PATH', 'WARP_SIZE', 'MAX_GROUPS', 'AUTO_GPU_THRESHOLD', 'GPU
 # %% ../nbs/04_custom_ops.ipynb 2
 from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, value_set as _value_set
 import pyarrow.compute as pc
 import numpy as np
 import time as _time
@@ -419,7 +419,7 @@ class CustomOpsCompiler(GraphCompiler):
             if len(col.chunks) == 1:
                 arr = col.chunks[0]
             else:
-                arr = col.combine_chunks()
+                arr = _combine(col)
         else:
             arr = col
 
@@ -575,7 +575,7 @@ class CustomOpsCompiler(GraphCompiler):
                 # Single-chunk: return underlying Array directly — no 50ms copy!
                 if len(col_arr.chunks) == 1:
                     return col_arr.chunks[0]
-                return col_arr.combine_chunks()
+                return _combine(col_arr)
             return col_arr
         if op == "lit":
             val = args[0]
@@ -623,7 +623,7 @@ class CustomOpsCompiler(GraphCompiler):
                     and all(isinstance(value, str) for value in args[1])):
                 mask = self._aot_gpu.utf8_isin_mask(col_arr, args[1])
                 return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
-            return pc.is_in(col_arr, value_set=_npa(args[1]))
+            return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
         if op == "startswith":
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
@@ -1041,7 +1041,7 @@ class CustomOpsCompiler(GraphCompiler):
             return self._get_col_as_f32(col_name, table)
         arr = table.column(col_name)
         if isinstance(arr, pa.ChunkedArray):
-            arr = arr.chunks[0] if len(arr.chunks) == 1 else arr.combine_chunks()
+            arr = arr.chunks[0] if len(arr.chunks) == 1 else _combine(arr)
         view = self._arrow_array_to_numpy_view(arr)
         if view is None:
             view = _np_of(arr, zero_copy_only=False)
@@ -1052,7 +1052,7 @@ class CustomOpsCompiler(GraphCompiler):
         """Get a column as a contiguous float32 numpy array, preferring zero-copy."""
         arr = table.column(col_name)
         if isinstance(arr, pa.ChunkedArray):
-            arr = arr.chunks[0] if len(arr.chunks) == 1 else arr.combine_chunks()
+            arr = arr.chunks[0] if len(arr.chunks) == 1 else _combine(arr)
         view = self._arrow_array_to_numpy_view(arr)
         if view is not None:
             out = view.astype(np.float32, copy=False)
@@ -2465,7 +2465,7 @@ class CustomOpsCompiler(GraphCompiler):
         for k in key_names:
             arr = table.column(k)
             if isinstance(arr, pa.ChunkedArray):
-                arr = arr.combine_chunks()
+                arr = _combine(arr)
             if pa.types.is_floating(arr.type):
                 # -0.0 and 0.0 are equal in SQL but hash (and would rank) as two values
                 vals = _np_of(arr, zero_copy_only=False)
@@ -2632,7 +2632,7 @@ class CustomOpsCompiler(GraphCompiler):
         for col_name in table.column_names:
             col = table.column(col_name)
             if isinstance(col, pa.ChunkedArray):
-                col = col.combine_chunks()
+                col = _combine(col)
 
             if pa.types.is_float32(col.type):
                 np_col = _np_of(col, zero_copy_only=False).astype(np.float32)
@@ -2695,7 +2695,7 @@ class CustomOpsCompiler(GraphCompiler):
         for col_name in table.column_names:
             col = table.column(col_name)
             if isinstance(col, pa.ChunkedArray):
-                col = col.combine_chunks()
+                col = _combine(col)
             source_len = len(col)
             if pa.types.is_float32(col.type):
                 model = _get_gather_model("gather_f32", DType.float32, source_len)
@@ -2930,8 +2930,8 @@ class CustomOpsCompiler(GraphCompiler):
         n_left = len(left_table)
         paired_codes = []
         for left_name, right_name in zip(left_cols, right_cols):
-            left_arr = left_table.column(left_name).combine_chunks()
-            right_arr = right_table.column(right_name).combine_chunks()
+            left_arr = _combine(left_table.column(left_name))
+            right_arr = _combine(right_table.column(right_name))
             if left_arr.type != right_arr.type:
                 common = CustomOpsCompiler._common_key_type(left_arr.type, right_arr.type)
                 if common is None:
@@ -3624,7 +3624,7 @@ class CustomOpsCompiler(GraphCompiler):
                 and len(keys) == 1):
             col_arr = table.column(keys[0])
             if isinstance(col_arr, pa.ChunkedArray):
-                col_arr = col_arr.combine_chunks()
+                col_arr = _combine(col_arr)
             if pa.types.is_integer(col_arr.type):
                 result = gpu_compiler._build_group_ids_gpu_single_int(
                     col_arr, keys[0], len(table)

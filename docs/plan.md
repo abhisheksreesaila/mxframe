@@ -271,6 +271,34 @@ Needs: F-024 · From the engine-only run
 - [ ] fix what the profile shows: the same query on an in-memory table is no slower than through `scan_parquet`
 - [ ] engine-only Q12 and Q19 within 2x Polars at SF10
 
+## CPU track (agreed 2026-10-12)
+Strong CPU at every size first, then warm GPU and large data on small GPUs, then `auto` on top. Order: F-026 → F-027 → F-028 → F-025 → F-029 → F-021. Borrowing Polars' ideas (not its code) is fine. Baseline: `docs/bench/small-{userfelt,engine}.md` (~12k / 100k / 1M lineitem rows = TPC-H SF 0.002 / 0.017 / 0.17), plus `engine-sf{1,10}` and `final-sf{1,10}`.
+
+## F-026 No pandas import on the query path [review]
+Needs: none · From the CPU baseline: Q7, Q13, Q16, Q17, Q19, Q21 take 115–140 ms at 12k rows against 3–5 ms for the other queries, because some query paths make PyArrow import pandas (110–160 ms, once per process). Cause: PyArrow builds empty results with `pa.array([])`, which imports pandas. That happens on `ChunkedArray.combine_chunks()` / `to_numpy()` of a zero-chunk column (an intermediate a filter emptied), on masked NumPy arrays (the NULL of an aggregate over no rows), and on an empty `isin` list. Empty intermediates are common at 12k rows and rare at SF1, where these queries showed no such jump.
+- [x] none of the 22 TPC-H queries imports pandas, mx-cpu, user-felt and engine-only, each in a fresh process (test over generated SF0.002 data)
+- [x] the paths found get a pandas-free equivalent; nothing falls back to `pa.array` on the query path for inputs we produce ourselves
+- [x] small-size engine-only rerun (`docs/bench/small-engine-f026.md`, load ~3): those six queries 3–8 ms at 12k rows (were 115–140). mx-cpu sum 571 → 104 ms at 12k (pandas 102, Polars 44) and 507 → 160 ms at 100k (pandas 177, Polars 68). Left for F-028: one-off ~23 ms first calls (Q6 at 12k, Q1 and Q21 at 100k)
+
+## F-027 Empty intermediate results [todo]
+Needs: none · From the CPU baseline at ~12k rows
+- [ ] SF0.002 Q11 no longer crashes (`TypeError: None * float`) and Q17 is no longer WRONG on mx-cpu; root cause found and fixed in the engine (empty group / empty aggregate semantics), not worked around in the harness
+- [ ] aggregates over zero rows follow one documented rule (SQL: SUM/AVG/MIN/MAX of no rows = NULL, COUNT = 0), with tests
+- [ ] the harness settles Q19 at SF0.002 (pandas/Polars marked WRONG): decide whether an empty SUM compares equal to 0 or NULL, and say so in the report
+- [ ] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17
+
+## F-028 Fixed per-query overhead at small sizes [todo]
+Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms
+- [ ] profile where a 12k-row query spends its time (planning, Arrow↔NumPy conversion, ctypes calls, result building) and write it down
+- [ ] cut the biggest fixed costs (Polars-style ideas: plan once and run natively, keep data in one columnar form end to end, avoid per-operator materialization)
+- [ ] engine-only at 12k and 100k rows: mx-cpu beats pandas on ≥ 18/22 and is within 2x Polars on the median; user-felt read overhead at 12k within 1.5x Polars
+
+## F-029 CPU joins [todo]
+Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17, Q20 with reading out of the clock (F-007 is GPU placement; this ticket is the CPU join itself)
+- [ ] profile the CPU join path on those queries (build, probe, materialization, key encoding)
+- [ ] apply what the profile points at (Polars-style ideas: partitioned parallel build, join on dictionary codes / integer keys, late materialization of payload columns, join order by cardinality)
+- [ ] engine-only SF10: each of those queries within 2x Polars
+
 ## F-009 Scoreboard report and README [done]
 Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).
 - Run from the repo root: `pixi run python scripts/bench_user_felt.py --sf 1 --engines pandas,polars,duckdb,mx-cpu,mx-auto,mx-gpu --timeout 120 --gpu 1 --name final-sf1` then `--sf 10 --engines polars,duckdb,mx-cpu,mx-auto,mx-gpu,pandas --timeout 300 --gpu 1 --name final-sf10` (add `--resume` to continue an interrupted run; exact-decimal data `data/tpch_sf{1,10}_exact` is the default; `scripts/tpch_user/official.py` checks the DuckDB reference against published answers).

@@ -57,7 +57,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
 import pyarrow.compute as pc
 
 from .lazy_expr import Expr
@@ -304,7 +304,7 @@ def _single_array(col) -> pa.Array:
             return col.chunk(0)
         if col.num_chunks == 0:
             return _npa([], type=col.type)
-        return col.combine_chunks()
+        return _combine(col)
     return col
 
 
@@ -441,7 +441,7 @@ class _Builder:
             col = self.table.column(name)
             arr = _single_array(col)
             if isinstance(col, pa.ChunkedArray) and col.num_chunks > 1 and pa.types.is_dictionary(col.type):
-                arr = col.unify_dictionaries().combine_chunks()
+                arr = _combine(col.unify_dictionaries())
             if arr.null_count:
                 raise Unsupported("string column has nulls")
             if not pa.types.is_dictionary(arr.type):
