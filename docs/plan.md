@@ -288,7 +288,7 @@ Needs: none · From the CPU baseline at ~12k rows
 - [x] the harness settles Q19 at SF0.002 (pandas/Polars marked WRONG): for pandas and Polars only (their convention), a one-row aggregate of 0 against a NULL reference counts as equal, with a note on the row (`compare_tables(empty_sum_is_zero=True)`); the report's correctness methodology says so
 - [x] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17: `docs/bench/small-userfelt-f027.md`, 198 results checked against DuckDB, 195 ok and 3 drift (Polars Q1, float32 accumulation, 3e-6 to 1.6e-3). mx-cpu 66/66 ok with no NULL-vs-0 note. `tests/test_tpch_small_correct.py` checks pandas, Polars and mx-cpu against DuckDB at 0.002 and 0.017, user-felt and engine-only paths
 
-## F-028 One-time Mojo runtime load [todo]
+## F-028 One-time Mojo runtime load [doing]
 Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms
 - [ ] profile where a 12k-row query spends its time (planning, Arrow↔NumPy conversion, ctypes calls, result building) and write it down
   - First finding (2026-10-12): the ~23 ms first runs (Q6 at 12k, Q1 and Q21 at 100k, reproducible 23–25 ms in fresh workers vs 3–6 ms when warm) are the one-time Mojo runtime load. The first kernel library dlopen costs 22–42 ms, whichever library it is: `libNVPTX.so` (56 MB LLVM NVPTX backend, linked even by the CPU libraries) 11 ms, `libKGENCompilerRTShared.so` 5 ms, the rest runtime start-up. The import-time warm-up thread hides it only when the data load takes longer (Q1 load 27 ms → query 5 ms; load 8 ms → query 25 ms); with `MXFRAME_WARM=0` every first query pays 27–50 ms. Leads: build the CPU libraries without the NVPTX dependency; one CPU library instead of four; start the warm-up before `import pyarrow.compute` (29 ms) in `import mxframe` (89 ms)
@@ -301,7 +301,7 @@ Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind 
 - [ ] apply what the profile points at (Polars-style ideas: partitioned parallel build, join on dictionary codes / integer keys, late materialization of payload columns, join order by cardinality)
 - [ ] engine-only SF10: each of those queries within 2x Polars
 
-## F-030 Mojo executor M0: one call runs the plan (spike) [review]
+## F-030 Mojo executor M0: one call runs the plan (spike) [done]
 Needs: design approved · Design: docs/design/mojo-executor.md · Time-box: a few days (took one session)
 - [x] Arrow C Data Interface in (`_export_to_c` per chunk; Mojo reads the ten-word ArrowArray structs directly) and out (the executor writes the result into one arena that Python wraps zero-copy with `pa.foreign_buffer` and frees with `mx_exec_free`; no NumPy in either direction)
 - [x] a serialized plan (an int64 buffer: shape, bytecode, columns, key kinds, outputs, sort) compiled once in Python (`native_exec.py`); columns chunked differently are cut at common boundaries with zero-copy slices
