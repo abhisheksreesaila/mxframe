@@ -282,10 +282,11 @@ Needs: none · From the CPU baseline: Q7, Q13, Q16, Q17, Q19, Q21 take 115–140
 
 ## F-027 Empty intermediate results [review]
 Needs: none · From the CPU baseline at ~12k rows
-- [x] SF0.002 Q11 no longer crashes and Q17 is no longer WRONG on mx-cpu. Neither was an engine bug: the engine already returns SQL NULL for an aggregate over no rows. Q11 crashed in the benchmark's own mx code (`None * fraction` when Germany has no suppliers; now `value > NULL` keeps no rows, as in SQL), and Q17 was the reference's fault (DuckDB's Q17 SQL wraps the sum in `coalesce(.., 0)`, Q19's does not)
-- [x] aggregates over zero rows follow SQL (SUM/MEAN/MIN/MAX of no rows = NULL, COUNT = 0, grouped = no groups), pinned on every aggregate path in `tests/test_empty_aggregates.py`
-- [x] the harness counts a one-row aggregate NULL (SQL) vs 0 (pandas/Polars) as the same answer, with a note on the row and a sentence in the report's correctness methodology (`compare._empty_aggregate`)
-- [x] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17: 264/264 in `docs/bench/small-userfelt-f027.md`; `tests/test_tpch_small_correct.py` checks pandas, Polars and mx-cpu against DuckDB at 0.002 and 0.017
+- [ ] SF0.002 Q11 no longer crashes (`TypeError: None * float`) and Q17 is no longer WRONG on mx-cpu; root cause found and fixed in the engine (empty group / empty aggregate semantics), not worked around in the harness
+  - Outcome, **needs the user's OK** because it doesn't match the check as written: neither root cause was in the engine, which already returns SQL NULL over no rows. Q11 crashed in the benchmark's own mx query code (`None * fraction` when Germany has no suppliers; now `value > NULL` keeps no rows, as SQL does). Q17 failed because the DuckDB reference had `coalesce(sum, 0)`, which the published Q17 does not; the reference is now the published SQL and mx-cpu matches it exactly
+- [x] aggregates over zero rows follow one documented rule (SQL: SUM/AVG/MIN/MAX of no rows = NULL, COUNT = 0), with tests: `tests/test_empty_aggregates.py`, on tables with and without nulls (the `_aggregate_with_nulls` path too), global and grouped, plus an all-NULL group
+- [x] the harness settles Q19 at SF0.002 (pandas/Polars marked WRONG): for pandas and Polars only (their convention), a one-row aggregate of 0 against a NULL reference counts as equal, with a note on the row (`compare_tables(empty_sum_is_zero=True)`); the report's correctness methodology says so
+- [x] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17: `docs/bench/small-userfelt-f027.md`, 198 results checked against DuckDB, 195 ok and 3 drift (Polars Q1, float32 accumulation, 3e-6 to 1.6e-3). mx-cpu 66/66 ok with no NULL-vs-0 note. `tests/test_tpch_small_correct.py` checks pandas, Polars and mx-cpu against DuckDB at 0.002 and 0.017, user-felt and engine-only paths
 
 ## F-028 Fixed per-query overhead at small sizes [todo]
 Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms

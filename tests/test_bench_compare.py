@@ -177,11 +177,13 @@ def test_official_answer_check_flags_a_wrong_reference():
 def test_empty_aggregate_null_and_zero_are_the_same_answer():
     # SQL: SUM over no rows is NULL; pandas and Polars give 0. A one-row aggregate result may differ
     # only in that, and the comparison says so.
-    for a, e in ((T(r=pa.array([0.0])), T(r=pa.array([None], pa.float64()))),
-                 (T(r=pa.array([None], pa.float64())), T(r=pa.array([0.0])))):
-        r = compare_tables(a, e)
-        assert r.ok and "NULL" in r.message
+    zero, null = T(r=pa.array([0.0])), T(r=pa.array([None], pa.float64()))
+    r = compare_tables(zero, null, empty_sum_is_zero=True)
+    assert r.ok and "NULL" in r.message
+    # only for engines with that convention, only 0 against a NULL reference
+    assert not compare_tables(zero, null).ok
+    assert not compare_tables(null, zero, empty_sum_is_zero=True).ok
     # not for a real value, nor for results with more than one row
-    assert not compare_tables(T(r=pa.array([1.5])), T(r=pa.array([None], pa.float64()))).ok
+    assert not compare_tables(T(r=pa.array([1.5])), null, empty_sum_is_zero=True).ok
     assert not compare_tables(T(k=[1, 2], r=pa.array([0.0, 1.0])),
-                              T(k=[1, 2], r=pa.array([None, 1.0], pa.float64()))).ok
+                              T(k=[1, 2], r=pa.array([None, 1.0], pa.float64())), empty_sum_is_zero=True).ok

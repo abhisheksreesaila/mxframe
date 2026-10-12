@@ -161,8 +161,8 @@ def _masked(obj, type):
 def array(obj, type=None, **kwargs) -> pa.Array:
     """``pa.array(obj, type)`` for 1-D numeric/bool NumPy input, without pandas."""
     if not kwargs and isinstance(obj, (list, tuple)):
-        if len(obj) == 0 and type is not None:
-            return pa.nulls(0, type)
+        if type is not None and all(v is None for v in obj):
+            return pa.nulls(len(obj), type)          # empty, or all NULL (an aggregate over no rows)
         out = _from_pylist(list(obj), type)
         if out is not None:
             return out
@@ -379,8 +379,11 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
                 with np.errstate(invalid="ignore", divide="ignore"):
                     res = res / cnt
         else:
+            # NaN is skipped, like Table.group_by; a group of only NaN gives NaN (PyArrow gives +-inf)
+            num = ~np.isnan(x)
             res = np.full(n_groups, np.inf if op == "min" else -np.inf)
-            (np.minimum if op == "min" else np.maximum).at(res, g, x)
+            (np.minimum if op == "min" else np.maximum).at(res, g[num], x[num])
+            res[np.bincount(g[num], minlength=n_groups) == 0] = np.nan
         t = a.type
         typ = (t if op in ("min", "max") else
                pa.int64() if op == "sum" and pa.types.is_integer(t) else pa.float64())

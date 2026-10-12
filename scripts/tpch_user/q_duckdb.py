@@ -127,7 +127,7 @@ GROUP BY 1, 2, 3 ORDER BY 4 DESC, 1, 2, 3""",
 WITH tp AS (SELECT p_partkey FROM part WHERE p_brand = 'Brand#23' AND p_container = 'MED BOX'),
 li AS (SELECT l_partkey, l_quantity, l_extendedprice FROM lineitem JOIN tp ON l_partkey = p_partkey),
 av AS (SELECT l_partkey AS pk, avg(l_quantity::DOUBLE) AS aq FROM li GROUP BY 1)
-SELECT coalesce(sum(l_extendedprice::DOUBLE), 0) / 7.0 AS revenue
+SELECT sum(l_extendedprice::DOUBLE) / 7.0 AS revenue
 FROM li JOIN av ON l_partkey = pk WHERE l_quantity < 0.2 * aq""",
     18: """
 WITH big AS (SELECT l_orderkey FROM lineitem GROUP BY 1 HAVING sum(l_quantity::DOUBLE) > 300)

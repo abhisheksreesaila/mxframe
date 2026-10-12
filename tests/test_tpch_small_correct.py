@@ -28,7 +28,8 @@ def _arrow(mod, res, q):
     return tbl.select(names) if all(n in tbl.column_names for n in names) else tbl.rename_columns(names)
 
 
-def test_all_queries_match_duckdb(data_dir):
+@pytest.mark.parametrize("mode", ["user-felt", "engine"])
+def test_all_queries_match_duckdb(data_dir, mode):
     ref = importlib.import_module("tpch_user.q_duckdb")
     bad = []
     for q in sorted(spec.OUTPUT):
@@ -36,11 +37,14 @@ def test_all_queries_match_duckdb(data_dir):
         for name, modname, device in ENGINES:
             mod = importlib.import_module(f"tpch_user.{modname}")
             try:
-                got = _arrow(mod, mod.run(q, data_dir, device), q)
+                res = (mod.run(q, data_dir, device) if mode == "user-felt"
+                       else mod.run_mem(q, mod.load_mem(q, data_dir), device))
+                got = _arrow(mod, res, q)
             except Exception as e:  # noqa: BLE001
                 bad.append(f"Q{q} {name}: {type(e).__name__}: {e}")
                 continue
-            cmp = compare_tables(got, want, topn_metric=spec.TOPN_METRIC.get(q), order_by=spec.ORDER_BY.get(q))
+            cmp = compare_tables(got, want, topn_metric=spec.TOPN_METRIC.get(q), order_by=spec.ORDER_BY.get(q),
+                                 empty_sum_is_zero=name in ("pandas", "polars"))
             if cmp.verdict == "wrong":
                 bad.append(f"Q{q} {name}: {cmp.message}")
     assert not bad, "\n".join(bad)

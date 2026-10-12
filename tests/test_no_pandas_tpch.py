@@ -92,3 +92,13 @@ def test_review_paths_do_not_import_pandas():
     p = subprocess.run([sys.executable, "-c", _PATHS], capture_output=True, text=True,
                        env=worker_env("-1"), cwd=str(REPO_ROOT), timeout=300)
     assert "@@ False" in p.stdout, (p.stdout[-500:], p.stderr[-1500:])
+
+
+def test_global_aggregate_over_no_rows_with_nulls_does_not_import_pandas():
+    code = _PATHS.replace(
+        'print("@@"',
+        'LazyFrame(t).filter(col("v") > lit(100.0)).groupby().agg(col("w").sum().alias("s"), '
+        'col("w").min().alias("lo"), col("w").count().alias("n")).compute(device="cpu")\nprint("@@"')
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       env=worker_env("-1"), cwd=str(REPO_ROOT), timeout=300)
+    assert "@@ False" in p.stdout, (p.stdout[-500:], p.stderr[-1500:])

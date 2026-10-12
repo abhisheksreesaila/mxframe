@@ -77,12 +77,16 @@ def find_data_root(cli: str | None) -> Path:
     raise SystemExit("TPC-H data not found; pass --data-root (expects <root>/tpch_sf<SF>/*.parquet)")
 
 
-def compare_result(path, ref_path, q: int):
+EMPTY_SUM_IS_ZERO = ("pandas", "polars")      # engines that give 0, not NULL, over no rows
+
+
+def compare_result(path, ref_path, q: int, engine: str = ""):
     """Compare a result Parquet with the reference; returns (verdict, correct, max_rel_err, note)."""
     import pyarrow.parquet as pq
     try:
         cmp = compare_tables(pq.read_table(path), pq.read_table(ref_path),
-                             topn_metric=spec.TOPN_METRIC.get(q), order_by=spec.ORDER_BY.get(q))
+                             topn_metric=spec.TOPN_METRIC.get(q), order_by=spec.ORDER_BY.get(q),
+                             empty_sum_is_zero=engine in EMPTY_SUM_IS_ZERO)
     except Exception as e:  # noqa: BLE001 - a broken comparison must not lose the measurement
         return "unchecked", None, None, f"comparison failed: {type(e).__name__}: {str(e)[:150]}"
     return cmp.verdict, cmp.ok, cmp.max_rel_err, cmp.message
@@ -227,16 +231,16 @@ def main() -> None:
                             if msg:
                                 rec["compare_note"] = f"official TPC-H SF1 answer: {msg}"
                         if rec.get("repeat_ms") is not None and ref_ok and rep_path.exists():
-                            rec["repeat_verdict"] = compare_result(rep_path, ref_path, q)[0]
+                            rec["repeat_verdict"] = compare_result(rep_path, ref_path, q, eng)[0]
                     elif "error" in rec:
                         rec["verdict"] = "error"
                     elif ref_ok and res_path.exists():
                         rec["verdict"], rec["correct"], rec["max_rel_err"], note = \
-                            compare_result(res_path, ref_path, q)
+                            compare_result(res_path, ref_path, q, eng)
                         if note:
                             rec["compare_note"] = note
                         if rec.get("repeat_ms") is not None and rep_path.exists():
-                            rec["repeat_verdict"] = compare_result(rep_path, ref_path, q)[0]
+                            rec["repeat_verdict"] = compare_result(rep_path, ref_path, q, eng)[0]
                     elif res_path.exists():
                         rec["compare_note"] = "not verified: the DuckDB reference failed for this query"
                     if eng in todo:

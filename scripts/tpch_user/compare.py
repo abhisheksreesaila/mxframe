@@ -69,10 +69,15 @@ def _rel_err(a: np.ndarray, e: np.ndarray) -> np.ndarray:
 
 def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
                    drift_limit: float = 1e-2, topn_metric: int | None = None,
-                   order_by: list[tuple[int, bool]] | None = None) -> Comparison:
+                   order_by: list[tuple[int, bool]] | None = None,
+                   empty_sum_is_zero: bool = False) -> Comparison:
     """`order_by` = [(column index, descending)] of the query's ORDER BY (positional, like every
-    other column here). After the values match, `actual` must be sorted by those keys."""
-    actual, expected, note = _empty_aggregate(actual, expected)
+    other column here). After the values match, `actual` must be sorted by those keys.
+    `empty_sum_is_zero`: the engine's convention gives 0, not SQL's NULL, for an aggregate over no
+    rows (pandas, Polars); only then does `actual` = 0 against a NULL reference count as equal."""
+    note = ""
+    if empty_sum_is_zero:
+        actual, expected, note = _empty_aggregate(actual, expected)
     res = _compare_values(actual, expected, rtol=rtol, drift_limit=drift_limit,
                           topn_metric=topn_metric)
     if note and res.verdict != "wrong":
@@ -87,8 +92,8 @@ def compare_tables(actual: pa.Table, expected: pa.Table, *, rtol: float = 1e-6,
 
 def _empty_aggregate(actual: pa.Table, expected: pa.Table):
     """A one-row aggregate over no rows is NULL in SQL (DuckDB, mxframe) and 0 in pandas / Polars.
-    In a one-row result a float NULL on one side against 0 on the other is the same answer: both
-    become 0, and a note says so. Anything else is left for the normal comparison."""
+    In a one-row result, `actual` 0 against a NULL reference in a float column is that convention:
+    both become 0, and a note says so. Anything else is left for the normal comparison."""
     if actual.num_rows != 1 or expected.num_rows != 1 or actual.num_columns != expected.num_columns:
         return actual, expected, ""
     hit = False
@@ -97,12 +102,13 @@ def _empty_aggregate(actual: pa.Table, expected: pa.Table):
         if not (_is_float(a.type) and _is_float(e.type)):
             continue
         av, ev = a[0].as_py(), e[0].as_py()
-        if (av is None and ev == 0) or (ev is None and av == 0):
+        if ev is None and av == 0:
             zero = pa.array([0.0])
             actual = actual.set_column(i, actual.field(i).with_type(pa.float64()), zero)
             expected = expected.set_column(i, expected.field(i).with_type(pa.float64()), zero)
             hit = True
-    return actual, expected, ("empty aggregate: NULL (SQL) vs 0 (pandas/Polars) counted as equal" if hit else "")
+    return actual, expected, ("aggregate over no rows: 0 here, NULL in the SQL reference; counted as equal"
+                              if hit else "")
 
 
 def check_order(tbl: pa.Table, order_by: list[tuple[int, bool]], rtol: float = ORDER_RTOL) -> int | None:
