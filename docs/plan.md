@@ -260,13 +260,16 @@ Needs: F-009 · Asked for 2026-10-12: the user-felt headline mixes Parquet readi
 - [x] engine-only results equal the user-felt results for all 22 queries on every engine (SF0.01 generated in the test), and are checked against DuckDB in the run like the headline
 - [x] the repeat run reloads the tables first, so the engine's caches keyed by table identity cannot make it look faster than a second, different query would be
 - [x] the report says which mode it is (title, the clock sentence, methodology); old CSVs without `load_ms` render, and `--resume` into a CSV with a different header is refused
-- [x] SF1 + SF10 engine-only run on a quiet machine (`docs/bench/engine-sf1.md`, `engine-sf10.md`), summarized next to the user-felt totals in `docs/benchmarks.md` and the README (2026-10-12 09:15, commit 302cc70; all 132 mx results match DuckDB). Finding: the engine, not the read, is most of the gap to Polars (mx-cpu/Polars summed: SF1 2.2x user-felt vs 1.8x engine-only, SF10 1.9x vs 1.9x); string-filtered queries are slower on in-memory tables than on mx's own scans (F-025); the old "decode is most of the loss on Q3/Q10/Q12/Q14/Q19" claim in benchmarks.md was wrong and is corrected
+- [x] SF1 + SF10 engine-only run on a quiet machine (`docs/bench/engine-sf1.md`, `engine-sf10.md`), summarized next to the user-felt totals in `docs/benchmarks.md` and the README (2026-10-12 09:15, commit 302cc70; all 132 mx results match DuckDB). Findings:
+  - About half of the gap to Polars is the engine and half the read (mx-auto/Polars without Q12 and Q19: SF1 2.09x user-felt vs 1.78x engine-only, SF10 1.91x vs 1.60x; engine ≈ 51% / 54% of the gap in ms).
+  - Q12 and Q19 are slower on in-memory tables than through scan_parquet; cause not profiled (F-025).
+  - The old "decode is most of the loss on Q3/Q10/Q12/Q14/Q19" claim in benchmarks.md is now scoped to what the data shows.
 
-## F-025 String filters on in-memory tables as fast as in a Parquet scan [todo]
+## F-025 Q12/Q19 slower on in-memory tables than through scan_parquet [todo]
 Needs: F-024 · From the engine-only run
-- [ ] profile SF10 Q12, Q14, Q19 on in-memory Arrow tables (`--mode engine`): mx-cpu Q12 1,827 ms engine-only vs 954 ms user-felt with the read included, Q19 2,271 vs 654 ms, Q14 349 vs 412 ms; Polars 173 / 487 / 71 ms
-- [ ] string predicates (`isin`, equality, LIKE-style prefix/contains on dictionary columns) on an in-memory table run at least as fast as the same query through `scan_parquet`
-- [ ] engine-only Q12, Q14, Q19 within 2x Polars at SF10
+- [ ] profile SF10 Q12 and Q19 on in-memory Arrow tables (`--mode engine`): mx-cpu Q12 1,827 ms engine-only vs 954 ms user-felt with the read included, Q19 2,271 vs 654 ms; Polars 173 / 487 ms. Candidates, unmeasured: the reader's filter pushdown hides a slow in-engine filter (Q12's `l_receiptdate` range, Q19's conditions), and Q12's plan joining before filtering
+- [ ] fix what the profile shows: the same query on an in-memory table is no slower than through `scan_parquet`
+- [ ] engine-only Q12 and Q19 within 2x Polars at SF10
 
 ## F-009 Scoreboard report and README [done]
 Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).

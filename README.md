@@ -127,9 +127,10 @@ query's columns into its own in-memory form, untimed, and the clock covers query
 | SF1 (22) | 4,499 | **1,391** | 2,299 | 2,777 |
 | SF10 (21) | 66,199 | 12,146 | **6,716** | 22,511 |
 
-Most of MXFrame's gap to Polars is in the engine, not the Parquet read: about 1.8–1.9x at both scales
-with reading excluded. One finding from this run: filters on string columns are much slower on
-in-memory Arrow tables than in MXFrame's own Parquet scans (F-025).
+Roughly half of MXFrame's gap to Polars is the engine and half is the Parquet read. Leaving out
+Q12 and Q19, `auto` against Polars is 2.1x with the read and 1.8x without it at SF1, and 1.9x
+against 1.6x at SF10. Q12 and Q19 run slower on in-memory Arrow tables than through MXFrame's own
+Parquet scan; the cause is not yet profiled (F-025).
 [Details](docs/benchmarks.md#engine-only-scoreboard-2026-10-12-f-024).
 
 The section below is the older warm-run benchmark on synthetic data: 1 warm-up, then the median
