@@ -238,9 +238,9 @@ Needs: none (later) · From the F-017 decision: PyArrow's decoder is the floor (
 - [ ] late materialization and page skipping using the page index
 - [ ] replaces PyArrow on the query path; PyArrow stays as the fallback for anything unsupported
 
-## F-022 GPU fallback precision and Q21 [review]
+## F-022 GPU fallback precision and Q21 [done]
 Needs: F-020 merged · From the F-020 report
-- [x] the `gpu_aot` grouped-aggregate fallback accumulated float64 inputs in float32 whenever the fused pipeline declined a plan: a GPU session now runs that fallback on the CPU kernels (float64 accumulation, `last_compile_provenance` path `cpu_aot` + `gpu_declined`), and derived columns (`case_when`, isin, ...) stay float64 on both devices (`tests/test_gpu_fallback_precision.py`: declined plans give the same digits on cpu and gpu)
+- [x] the `gpu_aot` grouped-aggregate fallback accumulated float64 inputs in float32 whenever the fused pipeline declined a plan: a GPU session now runs that fallback on the CPU kernels (float64 accumulation; provenance path `cpu_aot`, device `cpu`, `gpu_declined`), and derived columns (`case_when`, isin, ...) stay float64 on both devices (`tests/test_gpu_fallback_precision.py`: declined plans give the same digits on cpu and gpu)
 - [x] SF10 Q21: the (orderkey, suppkey) distincts are ranked by a counting sort on the leading key (`mx_ik_rank_bucketed`, `group_keys.dense_sorted(lead=...)`) instead of a radix sort of 60M composites: 1.26-1.76 s -> 0.33 s per distinct, identical ids/uniques/first rows (`tests/test_rank_bucketed.py`). Q21 user-felt SF10 9.4 s -> 8.3 s (Polars 4.5 s, same run, load ~5)
 - [ ] Q21 rest (profile, SF10 cpu 8.4 s): Parquet read 1.6 s (F-021), `encode_int` 1.2 s, Arrow take/compute ~1.8 s, rebuilding 60M unique key columns in `_build_group_ids` 0.7 s. Next step: plan `distinct -> groupby(k) -> count` as one n_unique per key (no 60M-row distinct table) — moved to F-023
 - [ ] `encode_int` hash/sort fallback for wide key ranges (> 4x rows): not seen in TPC-H; only if real data needs it

@@ -2036,14 +2036,13 @@ class CustomOpsCompiler(GraphCompiler):
                     _aot_result = self._apply_post_ops_custom(_aot_result, post_ops)
                 t1 = _time.perf_counter()
                 self.last_compile_provenance = {
-                    "device": self._session_device,
+                    "device": "cpu",              # CPU work in a GPU session
                     "rows": int(_aot_result.num_rows),
                     "grouped": True,
                     "n_groups": int(n_groups),
                     "cache_hit": True,
                     "compile_ms": 0.0,
                     "execute_ms": round((t1 - t0) * 1000, 1),
-                    "gpu_input_path": "aot_ctypes",
                     "optimizer_trace": list(optimizer_trace or []),
                     "path": "cpu_aot",
                     "gpu_declined": True,

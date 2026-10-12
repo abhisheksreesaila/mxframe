@@ -66,7 +66,19 @@ def no_fused(monkeypatch):
 @pytest.mark.parametrize("name", list(CASES))
 def test_declined_plan_keeps_float64_digits_on_gpu(no_fused, name):
     t = _t()
-    out = CASES[name](t).sort("k").compute(device="gpu").to_pydict()
+    seen = []
+    real = co.CustomOpsCompiler._execute_cpu_aot
+
+    def spy(self, *a, **kw):
+        res = real(self, *a, **kw)
+        seen.append((self._session_device, kw.get("_aot_override"), res is not None))
+        return res
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(co.CustomOpsCompiler, "_execute_cpu_aot", spy)
+        out = CASES[name](t).sort("k").compute(device="gpu").to_pydict()
+    # answered by the float64 CPU kernels inside the GPU session, not by the float32 GPU kernels
+    assert ("gpu", None, True) in seen
     assert out["k"] == list(range(7))
     for c, want in _reference(name, t).items():
         np.testing.assert_allclose(out[c], want, rtol=1e-12, err_msg=f"{name}: {c}")

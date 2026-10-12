@@ -24,3 +24,4 @@ Claude reads this at the start of each session. -->
 - 2026-09-30 · `pyarrow.parquet` row-group stats and `ParquetFile.schema_arrow` report dictionary types when `read_dictionary` is set: look through them (`_kind`) before deciding a column is not a string.
 
 - 2026-09-30 · Every caller of AOTKernels.sort_indices (radix sort) must verify the result is a sorted permutation and fall back to np.argsort: one bad order was seen once and never explained, and F-020's group encoder skipped the check (review caught it).
+- 2026-10-12 · A shortcut guard (here `n_codes * 16 < n`) can make a test silently exercise the fallback instead of the new path: assert the new path ran (non-None result, provenance), not only that the answer is right.

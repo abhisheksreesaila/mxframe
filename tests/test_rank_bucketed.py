@@ -24,7 +24,7 @@ def _pairs(n, n_lead, n_second, seed):
 
 
 @pytest.mark.parametrize("seed", range(4))
-@pytest.mark.parametrize("n_lead", [60_000, 250_000])
+@pytest.mark.parametrize("n_lead", [100_000, 250_000])
 def test_matches_np_unique_and_the_sort_path(seed, n_lead):
     if not _has_kernel():
         pytest.skip("kernel not built")
@@ -32,12 +32,22 @@ def test_matches_np_unique_and_the_sort_path(seed, n_lead):
     lead, second = _pairs(n, n_lead, n_second, seed)
     comp = lead * n_second + second
     got = gk.dense_sorted(comp, lead=(n_second, n_lead))
+    single = gk._rank_bucketed(gk._load(), comp, n_second, n_lead, 1)   # one thread
+    assert single is not None                      # the bucketed path ran
     sorted_path = gk.dense_sorted(comp)            # no lead: radix sort
     uniq, first, inv = np.unique(comp, return_index=True, return_inverse=True)
-    for ids, u, f in (got, sorted_path):
+    for ids, u, f in (got, single, sorted_path):
         np.testing.assert_array_equal(ids, inv.astype(np.int32))
         np.testing.assert_array_equal(u, uniq)
         np.testing.assert_array_equal(f, first)
+
+
+def _scratch_args(keys, stride, n_codes):
+    n = len(keys)
+    bufs = [np.empty(n, np.int32), np.empty(n, np.int32), np.empty(n_codes + 1, np.int32),
+            np.empty(n, np.int32)]
+    _scratch_args.keep = bufs                       # alive through the call
+    return (gk._addr(keys), n, stride, n_codes, *[gk._addr(b) for b in bufs])
 
 
 def test_long_buckets_and_bad_keys_fall_back():
@@ -49,8 +59,13 @@ def test_long_buckets_and_bad_keys_fall_back():
     lib, th = gk._load(), gk._threads()
     # few codes, so buckets are long: declined before the kernel runs
     assert gk._rank_bucketed(lib, comp, 1 << 37, 8, th) is None
-    # a key past n_codes * stride: the kernel reports it
-    assert gk._rank_bucketed(lib, comp, 1 << 20, 1000, th) is None
+    # a key past n_codes * stride, or a negative key: the kernel reports it (rc -5)
+    for bad in (n + 5, -3):
+        keys = np.arange(n, dtype=np.int64)
+        keys[n // 2] = bad
+        for threads in (1, th):
+            assert lib.mx_ik_rank_bucketed(*_scratch_args(keys, 1, n), threads) == -5
+            assert gk._rank_bucketed(lib, keys, 1, n, threads) is None
     # a bucket with more than IK_BUCKET_MAX rows
     skew = np.arange(n, dtype=np.int64)
     skew[:1000] = 5
