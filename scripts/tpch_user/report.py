@@ -247,7 +247,8 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
             continue
         by = {(r["engine"], r["query"]): r for r in srows}
         eng = [e for e in engines if any(r["engine"] == e for r in srows)]     # engines run at this SF
-        a(f"\n## Scale factor {sf}: headline (first run in a fresh process), ms\n")
+        a(f"\n## Scale factor {sf}: " + ("engine-only (query on loaded data, first run in a fresh process), ms\n"
+                                          if engine_only else "headline (first run in a fresh process), ms\n"))
         body = []
         fastest_count = {e: 0 for e in eng}
         for q in queries:
@@ -265,7 +266,7 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a("\nFastest verified engine per query: "
           + ", ".join(f"{NAMES[e]} {n}" for e, n in fastest_count.items()) + ".\n")
 
-        a(f"### Wins at SF{sf} (headline, both results verified)\n")
+        a(f"### Wins at SF{sf} ({'engine-only' if engine_only else 'headline'}, both results verified)\n")
         n = len(queries)
         for m in [e for e in MX if e in eng]:
             parts = []
@@ -287,33 +288,45 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
                               for r, q, e, m, p in lost]))
                     a("")
 
-        a(f"### SF{sf}: import + first run, ms (headline + engine import time)\n")
+        a(f"### SF{sf}: import + first run, ms ({'engine-only' if engine_only else 'headline'} "
+          "+ engine import time)\n")
         body = []
         for q in queries:
             body.append([f"Q{q}"] + [fmt_sum_cell(by.get((e, q))) for e in eng])
         tot, nq = totals(by, eng, queries, with_import=True)
         body.append([f"**sum ({nq} queries)**"] + [f"**{fmt_ms(tot[e])}**" for e in eng])
         a(_table(["query"] + [NAMES[e] for e in eng], body))
-        if mx_shown:
+        if mx_shown and engine_only:
+            a("\n> `import mxframe` starts a background thread that warms the CPU kernel libraries. In this "
+              "mode it finishes during the untimed load, so the mx first runs start with warm kernel "
+              "libraries; the other engines' loads also start their thread pools / connections, but have "
+              "no equivalent of that thread.\n")
+        elif mx_shown:
             a("\n> `import mxframe` starts a background thread that warms the CPU kernel libraries while "
               "the user's code runs. Its cost is in neither `import` (it returns immediately) nor the headline "
-              "unless it contends with the query for cores; the other eng have no equivalent.\n")
+              "unless it contends with the query for cores; the other engines have no equivalent.\n")
 
         if engine_only:
             a(f"### SF{sf}: load time, ms (Parquet -> in-memory tables, outside the clock)\n")
             body = [[f"Q{q}"] + [fmt_ms((by.get((e, q)) or {}).get("load_ms")) for e in eng] for q in queries]
             a(_table(["query"] + [NAMES[e] for e in eng], body))
             a("\n> Each engine reads only the columns the query uses, but no engine can skip row groups "
-              "with the query's filters here (Polars and DuckDB do in the user-felt run).\n")
+              "with the query's filters here (Polars, DuckDB and MXFrame push filters into the reader in "
+              "the user-felt run).\n")
 
         a(f"### SF{sf}: repeat run in the same process, ms (secondary: warm caches / JIT / result caches)\n")
         body = [[f"Q{q}"] + [fmt_repeat_cell(by.get((e, q))) for e in eng] for q in queries]
         a(_table(["query"] + [NAMES[e] for e in eng], body))
-        a("\n> The repeat result is verified against DuckDB like the first one (`WRONG`/`?` marks as above). "
-          "Module-level result caches in `custom_ops.py` make the mx repeat numbers unrealistically "
-          "fast; that is why the headline is a fresh process.\n")
+        if engine_only:
+            a("\n> The repeat result is verified against DuckDB like the first one (`WRONG`/`?` marks as above). "
+              "The tables are reloaded before the repeat, so result caches keyed by table identity "
+              "(`custom_ops.py`) cannot answer it; it still runs with warm kernels, JIT and thread pools.\n")
+        else:
+            a("\n> The repeat result is verified against DuckDB like the first one (`WRONG`/`?` marks as above). "
+              "Module-level result caches in `custom_ops.py` make the mx repeat numbers unrealistically "
+              "fast; that is why the headline is a fresh process.\n")
 
-        a(f"### SF{sf}: import time, ms (median over queries; not in the headline)\n")
+        a(f"### SF{sf}: import time, ms (median over queries; not in the first-run times)\n")
         imp = []
         for e in eng:
             xs = [r["import_ms"] for r in srows if r["engine"] == e and r.get("import_ms") is not None]
@@ -374,15 +387,30 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
     a(f"- **Data** ({meta.get('data_variant', 'exact')}): DuckDB `dbgen` Parquet (dates as int32 days since epoch, "
       "decimals as float32), read "
       "from the OS page cache (files are read once before each scale factor so no engine pays a cold disk).")
-    a("- **Column pruning**: nobody passes a column list. Polars (`scan_parquet`), DuckDB "
-      "and MXFrame (`mx.scan_parquet`, one lazy scan per table; low-cardinality strings are read as "
-      "dictionaries) prune to the columns each query references; pandas uses "
-      "`pd.read_parquet(columns=...)` with the columns the query uses (it has no lazy reader).")
-    a("- **Engines**: pandas (eager), Polars (lazy `scan_parquet` + `collect()`), DuckDB "
-      "(SQL over `read_parquet`, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` "
-      "through the public `LazyFrame` API; multi-stage queries `.compute()` a small intermediate and wrap it "
-      "with `mx.LazyFrame(table)`. Work the API cannot express is done with PyArrow/NumPy inside the timed "
-      "region and listed per query below.")
+    if engine_only:
+        a("- **Loading** (untimed): every engine is given the columns the query uses. pandas "
+          "`pd.read_parquet(columns=...)`, Polars `pl.read_parquet(columns=...)`, DuckDB "
+          "`CREATE TABLE ... AS SELECT <columns> FROM read_parquet(...)` (its native in-memory storage), "
+          "MXFrame `mx.read_parquet_table(columns=..., dictionary=\"auto\")` (the `scan_parquet` reader; "
+          "low-cardinality strings as dictionaries).")
+        a("- **Engines**: pandas, Polars (`df.lazy()` + `collect()`), DuckDB (the same SQL over the loaded "
+          "tables, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` through the "
+          "public `LazyFrame` API over the loaded Arrow tables; multi-stage queries `.compute()` a small "
+          "intermediate and wrap it with `mx.LazyFrame(table)`. Work the API cannot express is done with "
+          "PyArrow/NumPy inside the timed region and listed per query below.")
+        a("- **What \"loaded\" means for MXFrame**: the Arrow tables stay as read (chunked, in host memory). "
+          "Inside the clock MXFrame still combines chunks, hands buffers to its kernels and, on the GPU, "
+          "uploads them; the other engines start from their own native in-memory format.")
+    else:
+        a("- **Column pruning**: nobody passes a column list. Polars (`scan_parquet`), DuckDB "
+          "and MXFrame (`mx.scan_parquet`, one lazy scan per table; low-cardinality strings are read as "
+          "dictionaries) prune to the columns each query references; pandas uses "
+          "`pd.read_parquet(columns=...)` with the columns the query uses (it has no lazy reader).")
+        a("- **Engines**: pandas (eager), Polars (lazy `scan_parquet` + `collect()`), DuckDB "
+          "(SQL over `read_parquet`, also the correctness reference), MXFrame `device=\"cpu\"|\"gpu\"|\"auto\"` "
+          "through the public `LazyFrame` API; multi-stage queries `.compute()` a small intermediate and wrap it "
+          "with `mx.LazyFrame(table)`. Work the API cannot express is done with PyArrow/NumPy inside the timed "
+          "region and listed per query below.")
     a("- **Correctness**: each result is compared with DuckDB (row count; integer/string columns exactly; "
       "float columns at 1e-6 relative, matched by key columns; LIMIT queries tolerate rows that tie at the "
       "cutoff within 1e-6) and then checked to be in the query's ORDER BY order. Inputs are float32; an "

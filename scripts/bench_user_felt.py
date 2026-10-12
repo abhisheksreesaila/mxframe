@@ -107,8 +107,6 @@ def open_log(csv_path: Path, resume: bool, mode: str = "user-felt"):
                              "(use another --name)")
         with open(csv_path, newline="") as f:
             fields = next(csv.reader(f))
-        if mode == "engine" and "load_ms" not in fields:
-            raise SystemExit(f"{csv_path} has no load_ms column; cannot resume it in engine mode")
     f = open(csv_path, "a" if existing else "w", newline="")
     w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
     if not existing:
