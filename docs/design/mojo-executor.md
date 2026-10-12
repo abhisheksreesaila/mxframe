@@ -103,6 +103,13 @@ either fully native or not at all; never a wrong result. Coverage is measured pe
 The scoreboards (user-felt and engine-only, 12k → SF10) are rerun after each milestone. The Python path
 stays as the fallback throughout and is only retired once a query is native and verified.
 
+## M0 result (2026-10-12)
+
+Go. Q1 and Q6 run as one `mx_execute` call per query, results equal to DuckDB, Python-side time
+0.3–0.5 ms. Fusing group-key encoding with aggregation per morsel made SF10 Q1 66 ms against 141 ms on
+today's path (Polars 2,608 ms); at 12k rows the one-time Mojo runtime load (~20 ms, F-028) is now the
+largest cost. Details and the lessons for M1: `docs/plan.md`, F-030.
+
 ## Risks
 
 - **Size.** This is the largest change to the engine so far: weeks, not days. The milestones are ordered so

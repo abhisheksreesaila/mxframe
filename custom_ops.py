@@ -40,6 +40,10 @@ try:  # F-008 fused pipeline dispatch (AOT kernels; no JIT)
     from .pipeline_exec import try_fused_aggregate
 except Exception:
     try_fused_aggregate = None
+try:  # F-030 native executor (one Mojo call per plan)
+    from . import native_exec as _native_exec
+except Exception:
+    _native_exec = None
 
 
 # %% ../nbs/04_custom_ops.ipynb 4
@@ -1710,6 +1714,11 @@ class CustomOpsCompiler(GraphCompiler):
         # into the aggregate first: the fused kernels accumulate float64 in float64, while the GPU
         # path it used to fall back to rounds float64 columns to float32 (F-016 fuzz seed 5061).
         plan = self._inline_project_into_aggregate(plan)
+        # F-030 -- native executor (opt-in during the M0 spike): the whole plan in one Mojo call
+        if _native_exec is not None and _native_exec.enabled():
+            _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
+            if _native is not None:
+                return _native
         if try_fused_aggregate is not None:
             _fused = try_fused_aggregate(self, plan, having_pred, post_ops, optimizer_trace, t0)
             if _fused is not None:

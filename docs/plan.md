@@ -301,12 +301,19 @@ Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind 
 - [ ] apply what the profile points at (Polars-style ideas: partitioned parallel build, join on dictionary codes / integer keys, late materialization of payload columns, join order by cardinality)
 - [ ] engine-only SF10: each of those queries within 2x Polars
 
-## F-030 Mojo executor M0: one call runs the plan (spike) [todo]
-Needs: design approved · Design: docs/design/mojo-executor.md · Time-box: a few days
-- [ ] Arrow C Data Interface in and out (no NumPy conversion on the way in or out)
-- [ ] a serialized physical plan (pipelines of operators + the existing expression bytecode) compiled once in Python
-- [ ] `mx_execute(plan, inputs, outputs)`: Q1 and Q6 run through that single call, results equal to DuckDB
-- [ ] Python-side time per query < 0.5 ms; engine-only numbers at 12k / 1M / SF10 against today's path and Polars; a go / no-go note for M1
+## F-030 Mojo executor M0: one call runs the plan (spike) [review]
+Needs: design approved · Design: docs/design/mojo-executor.md · Time-box: a few days (took one session)
+- [x] Arrow C Data Interface in (`_export_to_c` per chunk; Mojo reads the ten-word ArrowArray structs directly) and out (the executor writes the result into one arena that Python wraps zero-copy with `pa.foreign_buffer` and frees with `mx_exec_free`; no NumPy in either direction)
+- [x] a serialized plan (an int64 buffer: shape, bytecode, columns, key kinds, outputs, sort) compiled once in Python (`native_exec.py`); columns chunked differently are cut at common boundaries with zero-copy slices
+- [x] `mx_execute(plan, out)` in `libmxexec_cpu.so` (`kernels_aot/executor_cpu.mojo`): group keys (dictionary strings with per-chunk dictionaries merged in Mojo, int32, int64), filter + aggregate (the existing bytecode interpreter, run per 64k-row morsel together with the key encoding), mean / count, sorting the groups by key values (strings by their bytes), and the output columns including string keys. Q1 and Q6 run through that one call and match DuckDB (SF1 / SF10 max relative error 9e-15); `tests/test_native_exec_m0.py` (21 tests) covers shapes, chunking, slices, empty input and fallbacks; with `MXFRAME_NATIVE=1` the whole suite gives 2039 passed and 8 failed: 4 tests assert the old fused path served the query, 4 demand bit-identical CPU vs GPU digits (the executor sums per morsel, ~1e-15 apart)
+- [x] Python-side time per query 0.26–0.5 ms up to SF1 (SF10 1.5–1.9 ms: one C Data export per chunk per column). Engine-only, first run in a fresh process (`docs/bench/m0-native.md` vs `m0-today.md`): SF10 Q1 66 ms vs 141 today (Polars 2,608, wrong), SF1 Q1 13 vs 21, SF1 Q6 6 vs 9, SF10 Q6 31 vs 30 (Polars 46); at 12k rows both ~24 ms, of which ~20 is the one-time Mojo runtime load (F-028)
+- **Go for M1.** What M0 taught:
+  - Fusing the key encoding with aggregation per morsel (no n_rows-sized intermediate) made Q1 2x faster than today's path; materializing a 240 MB group-id array cost more than the work. M1 should keep every operator inside morsel pipelines.
+  - The one-time runtime load (F-028) now dominates small data: do it before or with M1.
+  - Exporting one C Data struct per chunk per column costs ~2 ms at SF10; export streams or cache exports in M1.
+  - When the executor becomes the default, the GPU session's fallback must use it too, or CPU and GPU digits differ in the last place.
+  - Still float64 everywhere inside the interpreter; typed vectors and a hash-table aggregate (merged dictionaries are capped at 4096 strings, dense groups at 2^20) are M1.
+  - Opt-in (`MXFRAME_NATIVE=1`) until M1 makes it the default.
 
 ## F-031 Mojo executor M1: single-table pipelines [todo]
 Needs: F-030

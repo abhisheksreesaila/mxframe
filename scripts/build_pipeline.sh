@@ -17,8 +17,13 @@ if [[ "$WHICH" == "all" || "$WHICH" == "cpu" ]]; then
     pixi run mojo build kernels_aot/pipeline_cpu.mojo -I kernels_aot --target-cpu x86-64-v3 \
         --emit shared-lib -o kernels_aot/libmxpipeline_cpu.so
 fi
+if [[ "$WHICH" == "all" || "$WHICH" == "cpu" || "$WHICH" == "exec" ]]; then
+    # F-030 native executor: one call runs the whole plan (imports pipeline_cpu.mojo)
+    pixi run mojo build kernels_aot/executor_cpu.mojo -I kernels_aot --target-cpu x86-64-v3 \
+        --emit shared-lib -o kernels_aot/libmxexec_cpu.so
+fi
 if [[ "$WHICH" == "all" || "$WHICH" == "gpu" ]]; then
     pixi run mojo build kernels_aot/pipeline_gpu.mojo -I kernels_aot --target-cpu x86-64-v3 \
         --emit shared-lib -o kernels_aot/libmxpipeline_gpu.so
 fi
-echo "built: $(ls kernels_aot/libmxpipeline_*.so | tr '\n' ' ')"
+echo "built: $(ls kernels_aot/libmxpipeline_*.so kernels_aot/libmxexec_cpu.so | tr '\n' ' ')"
