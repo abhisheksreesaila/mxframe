@@ -290,6 +290,7 @@ Needs: none · From the CPU baseline at ~12k rows
 ## F-028 Fixed per-query overhead at small sizes [todo]
 Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms
 - [ ] profile where a 12k-row query spends its time (planning, Arrow↔NumPy conversion, ctypes calls, result building) and write it down
+  - First finding (2026-10-12): the ~23 ms first runs (Q6 at 12k, Q1 and Q21 at 100k, reproducible 23–25 ms in fresh workers vs 3–6 ms when warm) are the one-time Mojo runtime load. The first kernel library dlopen costs 22–42 ms, whichever library it is: `libNVPTX.so` (56 MB LLVM NVPTX backend, linked even by the CPU libraries) 11 ms, `libKGENCompilerRTShared.so` 5 ms, the rest runtime start-up. The import-time warm-up thread hides it only when the data load takes longer (Q1 load 27 ms → query 5 ms; load 8 ms → query 25 ms); with `MXFRAME_WARM=0` every first query pays 27–50 ms. Leads: build the CPU libraries without the NVPTX dependency; one CPU library instead of four; start the warm-up before `import pyarrow.compute` (29 ms) in `import mxframe` (89 ms)
 - [ ] cut the biggest fixed costs (Polars-style ideas: plan once and run natively, keep data in one columnar form end to end, avoid per-operator materialization)
 - [ ] engine-only at 12k and 100k rows: mx-cpu beats pandas on ≥ 18/22 and is within 2x Polars on the median; user-felt read overhead at 12k within 1.5x Polars
 
