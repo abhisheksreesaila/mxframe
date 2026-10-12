@@ -44,6 +44,12 @@ columns copy to the GPU in the background; after that, queries split their rows 
 GPU and every CPU core work at the same time. On TPC-H SF10 Q1 the split finishes the
 aggregation in 25 ms, against 57 ms on the CPU alone and 39 ms on the GPU alone.
 
+On the final user-felt TPC-H run, `auto` is within 10% of the better of `cpu` and `gpu` on
+21/22 queries at SF1 and at SF10. Each query ran in a fresh process from Parquet on disk with
+no warm-up, and every result matched DuckDB. On SF10 Q9 and Q18, where the GPU wins from a cold
+start, `auto` keeps pace with the GPU. At SF1, where CUDA start-up would cost more than the query,
+it stays on the CPU.
+
 ➡️ **[Read how it works](docs/auto-mode.md)** · [visual version](https://htmlpreview.github.io/?https://github.com/abhisheksreesaila/mxframe/blob/main/docs/auto-mode.html)
 
 ---
@@ -97,7 +103,26 @@ print(result.to_pandas())
 
 ---
 
-## 📊 Performance — bounded v0.5.0 benchmark
+## 📊 Performance: user-felt TPC-H (2026-10-12)
+
+Each engine runs each query in a fresh process. The data starts as Parquet on disk, and the
+clock covers read + query + result with no warm-up. Every result is checked against DuckDB.
+Ryzen 9 5900X, RTX 3090.
+
+| sum of 22 queries, ms | pandas | Polars | DuckDB | MXFrame `auto` |
+|---|---:|---:|---:|---:|
+| SF1 | 6,375 | **2,027** | 3,324 | 4,419 |
+| SF10 | 81,758 | 17,063 | **10,388** | 28,825 |
+
+MXFrame `auto` beats pandas on 15/22 (SF1) and 19/22 (SF10). It beats DuckDB on 8/22 at SF1.
+It is behind Polars on most queries and behind DuckDB on every SF10 query. The main causes are
+the PyArrow Parquet decoder (F-021) and join-heavy queries (F-007). Full tables and the honest
+losses: [docs/benchmarks.md](docs/benchmarks.md#final-user-felt-scoreboard-2026-10-12-f-009).
+
+The section below is the older warm-run benchmark on synthetic data: 1 warm-up, then the median
+of 3 runs. Its numbers are not comparable with the table above.
+
+### Historical: 📊 Performance — bounded v0.5.0 benchmark
 
 RTX 3090, warm median of three runs. Every query and engine ran in its own process so Arrow, Pandas, and CUDA allocations were released between measurements.
 

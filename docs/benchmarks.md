@@ -7,6 +7,50 @@
 
 ---
 
+## Final user-felt scoreboard (2026-10-12, F-009)
+
+**What is measured:** what a user feels. Every (engine, query) runs in a fresh Python process with the data starting as Parquet on disk (exact DECIMAL TPC-H data). The clock covers Parquet read + query + materialized result. There is no warm-up. Import time is reported separately. Every result is checked against DuckDB, and DuckDB's own answers are checked against the published TPC-H answers.
+Machine: Ryzen 9 5900X (12 cores / 24 threads), 64 GB RAM, RTX 3090 (GPU 0; GPU 1 drives the display). Both runs started on a quiet machine (load1 0.14). The load average then rose to about 2 at SF1 and 3–8 at SF10, from the engines' own threads; the CPU was 99.5% idle straight after the run.
+Full tables: [SF1](bench/final-sf1.md) · [SF10](bench/final-sf10.md) (CSV next to each). The older tables further down are historical warm-run measurements on synthetic data. They are not comparable.
+
+| sum of the 22 first runs, ms | pandas | Polars | DuckDB | mx-cpu | mx-gpu | mx-auto |
+|---|---:|---:|---:|---:|---:|---:|
+| SF1 | 6,375 | **2,027** | 3,324 | 4,335 | 9,482 | 4,419 |
+| SF10 | 81,758 | 17,063 | **10,388** | 29,143 | 31,602 | 28,825 |
+| import (median) | 234 | 71 | 39 | 126 | 126 | 127 |
+
+Wins are counted on comparable results. A Polars result within float drift of DuckDB still counts (SF1 Q1/Q9, SF10 Q7/Q9). Polars' SF10 Q1 is off by 5.5%, so it does not count.
+
+| mx-auto beats | pandas | Polars | DuckDB |
+|---|---:|---:|---:|
+| SF1 | 15/22 | 1/22 (Q1) | 8/22 |
+| SF10 | 19/22 | 1/21 (Q13) | 0/22 |
+
+**Correctness:** all 132 mx results (22 queries × cpu/gpu/auto × SF1/SF10) match DuckDB.
+
+**`device="auto"`:** it lands within 10% of the better of cpu and gpu on **21/22 queries at SF1** (miss: Q12, 287 vs 258 ms) and **21/22 at SF10** (miss: Q11, 184 vs 161 ms). The GPU path is faster than the CPU path, end to end from a cold process, on SF10 Q5, Q9, Q18 and Q21. On none at SF1: there CUDA start-up and copies cost more than the query. Before F-009, auto missed 10 of 22 at SF1, on fixed per-query overhead of 10–40 ms. Three changes removed it: a cheaper group-cardinality sample, lazy imports in `calibration`, and starting background GPU work only after a 100 ms idle gap.
+
+**Co-processing:** this needs data already resident on the GPU, so a cold first run cannot show it. In one session it runs SF10 Q1's fused stage in 25 ms split across CPU+GPU, against 57 ms CPU-only and 39 ms GPU-resident. Repeat queries on resident data run ~1.35x faster than CPU-only ([how it works](auto-mode.md)).
+
+### Honest losses, and why
+
+- **Parquet decode.** PyArrow's decoder is the floor for every mx query. Three SF10 lineitem columns take ~225 ms, against Polars' ~77 ms scan+filter. That gap is most of the loss on the scan-heavy queries (Q3, Q10, Q12, Q14, Q19). A native Mojo reader is ticket **F-021**.
+- **Joins and distinct at SF10.** DuckDB wins every SF10 query; mx-auto is 1.1x–6.9x slower (median ~2.7x). The worst cases are Q4 (6.9x), Q18 (4.8x), Q17 (4.1x), Q12 and Q8 (3.8x / 3.7x). Join probe placement on the GPU is **F-007**.
+- **Q21: 8.3 s against Polars' 4.1 s.** F-022 cut the (orderkey, suppkey) distincts from 1.3–1.8 s to 0.33 s, but the query still materializes a 60M-row distinct table. Planning `distinct → groupby → count` as one n_unique is **F-023**.
+- **Small queries (SF1).** Polars is faster than mx-auto on 21 of 22 queries. mx pays ~126 ms of import and per-query Python planning that Polars does not.
+- **GPU first run.** `device="gpu"` pays CUDA start-up (~250 ms) in every fresh process, so it never wins at SF1. `auto` avoids this by keeping small or cold work on the CPU.
+
+### Reproduce
+
+```bash
+pixi run python scripts/bench_user_felt.py --sf 1 --engines pandas,polars,duckdb,mx-cpu,mx-auto,mx-gpu --timeout 120 --gpu 0 --name final-sf1
+pixi run python scripts/bench_user_felt.py --sf 10 --engines polars,duckdb,mx-cpu,mx-auto,mx-gpu,pandas --timeout 300 --gpu 0 --name final-sf10
+```
+
+Check `uptime` (load < 2) and `nvidia-smi` (no other GPU users) first.
+
+---
+
 ## How the kernels dispatch
 
 | Device | Path | Coverage |
