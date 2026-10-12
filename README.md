@@ -119,6 +119,19 @@ It is behind Polars on most queries and behind DuckDB on every SF10 query. The m
 the PyArrow Parquet decoder (F-021) and join-heavy queries (F-007). Full tables and the honest
 losses: [docs/benchmarks.md](docs/benchmarks.md#final-user-felt-scoreboard-2026-10-12-f-009).
 
+**Engine only.** A second run takes file reading out of the clock: each engine first loads the
+query's columns into its own in-memory form, untimed, and the clock covers query + result.
+
+| sum of queries, ms | pandas | Polars | DuckDB | MXFrame `auto` |
+|---|---:|---:|---:|---:|
+| SF1 (22) | 4,499 | **1,391** | 2,299 | 2,777 |
+| SF10 (21) | 66,199 | 12,146 | **6,716** | 22,511 |
+
+Most of MXFrame's gap to Polars is in the engine, not the Parquet read: about 1.8–1.9x at both scales
+with reading excluded. One finding from this run: filters on string columns are much slower on
+in-memory Arrow tables than in MXFrame's own Parquet scans (F-025).
+[Details](docs/benchmarks.md#engine-only-scoreboard-2026-10-12-f-024).
+
 The section below is the older warm-run benchmark on synthetic data: 1 warm-up, then the median
 of 3 runs. Its numbers are not comparable with the table above.
 

@@ -252,15 +252,21 @@ Needs: F-022 · From the F-022 profile
 - [ ] `select(a, b).distinct().groupby(a).agg(count)` runs as a per-key distinct count without materializing the distinct table
 - [ ] SF10 Q21 within 1.5x Polars user-felt
 
-## F-024 Engine-only scoreboard [doing]
+## F-024 Engine-only scoreboard [done]
 Needs: F-009 · Asked for 2026-10-12: the user-felt headline mixes Parquet reading with query speed; add a second number that isolates the engine. The user-felt number stays the headline.
-- [ ] `bench_user_felt.py --mode engine`: each engine first loads the columns its query uses into its own in-memory form (pandas DataFrame, Polars DataFrame, DuckDB in-memory table, an Arrow table under an MXFrame LazyFrame), outside the clock; the clock then covers query + materialized result only. Still a fresh process per (engine, query, sf) with no warm-up
-- [ ] the load time is recorded (`load_ms`), so read cost = user-felt minus engine-only is visible per engine
-- [ ] nothing in the timed region touches the Parquet files (test: the data directory is moved away after loading and every query still runs)
-- [ ] engine-only results equal the user-felt results for all 22 queries on every engine (SF0.01 generated in the test), and are checked against DuckDB in the run like the headline
-- [ ] the repeat run reloads the tables first, so the engine's caches keyed by table identity cannot make it look faster than a second, different query would be
-- [ ] the report says which mode it is (title, the clock sentence, methodology); old CSVs without `load_ms` render, and `--resume` into a CSV with a different header is refused
-- [ ] SF1 + SF10 engine-only run on a quiet machine (`docs/bench/engine-sf1.md`, `engine-sf10.md`), summarized next to the user-felt totals in `docs/benchmarks.md` and the README
+- [x] `bench_user_felt.py --mode engine`: each engine first loads the columns its query uses into its own in-memory form (pandas DataFrame, Polars DataFrame, DuckDB in-memory table, an Arrow table under an MXFrame LazyFrame), outside the clock; the clock then covers query + materialized result only. Still a fresh process per (engine, query, sf) with no warm-up
+- [x] the load time is recorded (`load_ms`), so read cost = user-felt minus engine-only is visible per engine
+- [x] nothing in the timed region touches the Parquet files (test: the data directory is moved away after loading and every query still runs)
+- [x] engine-only results equal the user-felt results for all 22 queries on every engine (SF0.01 generated in the test), and are checked against DuckDB in the run like the headline
+- [x] the repeat run reloads the tables first, so the engine's caches keyed by table identity cannot make it look faster than a second, different query would be
+- [x] the report says which mode it is (title, the clock sentence, methodology); old CSVs without `load_ms` render, and `--resume` into a CSV with a different header is refused
+- [x] SF1 + SF10 engine-only run on a quiet machine (`docs/bench/engine-sf1.md`, `engine-sf10.md`), summarized next to the user-felt totals in `docs/benchmarks.md` and the README (2026-10-12 09:15, commit 302cc70; all 132 mx results match DuckDB). Finding: the engine, not the read, is most of the gap to Polars (mx-cpu/Polars summed: SF1 2.2x user-felt vs 1.8x engine-only, SF10 1.9x vs 1.9x); string-filtered queries are slower on in-memory tables than on mx's own scans (F-025); the old "decode is most of the loss on Q3/Q10/Q12/Q14/Q19" claim in benchmarks.md was wrong and is corrected
+
+## F-025 String filters on in-memory tables as fast as in a Parquet scan [todo]
+Needs: F-024 · From the engine-only run
+- [ ] profile SF10 Q12, Q14, Q19 on in-memory Arrow tables (`--mode engine`): mx-cpu Q12 1,827 ms engine-only vs 954 ms user-felt with the read included, Q19 2,271 vs 654 ms, Q14 349 vs 412 ms; Polars 173 / 487 / 71 ms
+- [ ] string predicates (`isin`, equality, LIKE-style prefix/contains on dictionary columns) on an in-memory table run at least as fast as the same query through `scan_parquet`
+- [ ] engine-only Q12, Q14, Q19 within 2x Polars at SF10
 
 ## F-009 Scoreboard report and README [done]
 Handoff (2026-09-30): all engine work up to F-020 is merged on `auto-mode` (1928 tests green). This ticket is the final run on a QUIET machine (ask Abhishek to pause other jobs; record load average).

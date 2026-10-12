@@ -34,7 +34,7 @@ Wins are counted on comparable results. A Polars result within float drift of Du
 
 ### Honest losses, and why
 
-- **Parquet decode.** PyArrow's decoder is the floor for every mx query. Three SF10 lineitem columns take ~225 ms, against Polars' ~77 ms scan+filter. That gap is most of the loss on the scan-heavy queries (Q3, Q10, Q12, Q14, Q19). A native Mojo reader is ticket **F-021**.
+- **Parquet decode.** PyArrow's decoder is the floor for every mx query. Three SF10 lineitem columns take ~225 ms, against Polars' ~77 ms scan+filter. A native Mojo reader is ticket **F-021**. The [engine-only run](#engine-only-scoreboard-2026-10-12-f-024) shows the read is *not* most of the loss on Q3, Q10, Q12, Q14 or Q19, as this section used to say: with reading out of the clock mx is still 2.8x–10.6x behind Polars on them.
 - **Joins and distinct at SF10.** DuckDB wins every SF10 query; mx-auto is 1.1x–6.8x slower (median 2.6x). The worst cases are Q4 (6.8x), Q18 (4.8x), Q17 (4.0x), Q8 (3.8x), and Q12 and Q3 (3.7x). Join probe placement on the GPU is **F-007**.
 - **Q21: 8.3 s against Polars' 4.1 s (SF10).** F-022 cut the (orderkey, suppkey) distincts from 1.3–1.8 s to 0.33 s, but the query still materializes a 60M-row distinct table. Planning `distinct → groupby → count` as one n_unique is **F-023**.
 - **Small queries (SF1).** Polars is faster than mx-auto on 21 of 22 queries. mx pays ~126 ms of import and per-query Python planning that Polars does not.
@@ -48,6 +48,42 @@ pixi run python scripts/bench_user_felt.py --sf 10 --engines polars,duckdb,mx-cp
 ```
 
 Check `uptime` (load < 2) and `nvidia-smi` (no other GPU users) first.
+
+## Engine-only scoreboard (2026-10-12, F-024)
+
+**What is measured:** the query engine alone. Same harness, data and machine as the user-felt run above, with one change: each engine first loads the columns its query uses into its own in-memory form, outside the clock. pandas and Polars get DataFrames, DuckDB gets in-memory tables, and MXFrame gets Arrow tables under a `LazyFrame`. The clock then covers query + materialized result only. It is still a fresh process per (engine, query) with no warm-up run. The user-felt numbers stay the headline; this run separates engine speed from file reading. Two things favour MXFrame slightly, and the reports say so. The CPU warm-up thread that `import mxframe` starts finishes during the untimed load. Against that, MXFrame still combines Arrow chunks, and on the GPU uploads them, inside the clock.
+Run started 09:15 on a quiet machine (load1 under 2 for 3 minutes). As in the user-felt run, the engines' own threads raised load1 to a median of 3.0 at SF1 and 6.7 at SF10. The run used commit 302cc70; the engine code is the same as the user-felt run's.
+Full tables: [SF1](bench/engine-sf1.md) · [SF10](bench/engine-sf10.md).
+
+| sum of first runs, ms | pandas | Polars | DuckDB | mx-cpu | mx-gpu | mx-auto |
+|---|---:|---:|---:|---:|---:|---:|
+| SF1 engine-only (22 queries) | 4,499 | **1,391** | 2,299 | 2,524 | 8,151 | 2,777 |
+| SF1 user-felt (same 22) | 6,394 | **2,014** | 3,336 | 4,357 | 9,512 | 4,479 |
+| SF10 engine-only (21 queries) | 66,199 | 12,146 | **6,716** | 22,512 | 25,226 | 22,511 |
+| SF10 user-felt (same 21) | 74,295 | 14,910 | **10,060** | 28,555 | 30,732 | 28,225 |
+| SF10 load, outside the clock (22) | 18,813 | 6,696 | 9,848 | 13,448 | 13,299 | 13,345 |
+
+SF10 is summed over the 21 queries with a valid result from every engine (Polars' Q1 is wrong in both runs).
+
+| mx-auto beats | pandas | Polars | DuckDB |
+|---|---:|---:|---:|
+| SF1 engine-only | 12/22 | 1/22 (Q1) | 12/22 |
+| SF10 engine-only | 14/22 | 4/21 (Q6, Q7, Q13, Q22) | 3/22 (Q1, Q6, Q13) |
+
+**Correctness:** all 132 mx results match DuckDB.
+
+**What it says:**
+
+- **The engine is most of the gap to Polars, not the read.** mx-cpu against Polars, summed: SF1 2.2x user-felt and 1.8x engine-only; SF10 1.9x user-felt and 1.9x engine-only. A faster Parquet reader (F-021) would close part of the SF1 gap and little of the SF10 gap.
+- **The read does cost MXFrame more than Polars.** Loading the same columns takes 13.4 s for mx at SF10 against 6.7 s for Polars (2.0x) and 9.8 s for DuckDB. That is PyArrow decoding against Polars' own reader, with no filter pushdown on either side.
+- **MXFrame is slower on in-memory tables than on its own Parquet scans for string-filtered queries.** SF10 mx-cpu Q12 takes 1,827 ms engine-only against 954 ms user-felt (read included); Q19 2,271 against 654 ms; Q14 349 against 412 ms. The repeat runs are just as slow, so this is not first-run cost. All three filter on string columns. In a Parquet scan MXFrame pushes those filters into the reader; on an in-memory table it evaluates them itself, and that path appears to be slow. This is not profiled yet; it is ticket **F-025**. Anyone handing MXFrame an Arrow table, rather than a Parquet path, hits this.
+- **Where the engine is already fast.** Q1's fused aggregate runs in 145 ms at SF10, against 2,879 ms for Polars (which also accumulates in float32 and is 5.5% off) and 223 ms for DuckDB. mx also beats Polars on Q6, Q7, Q13 and Q22 at SF10.
+- **The joins are still the big engine loss** (Q2, Q3, Q8, Q10, Q16, Q17, Q20 stay 2.7x–4.4x behind Polars at SF10 engine-only); **F-007**.
+
+```bash
+pixi run python scripts/bench_user_felt.py --mode engine --sf 1 --engines pandas,polars,duckdb,mx-cpu,mx-auto,mx-gpu --timeout 120 --gpu 0 --name engine-sf1
+pixi run python scripts/bench_user_felt.py --mode engine --sf 10 --engines polars,duckdb,mx-cpu,mx-auto,mx-gpu,pandas --timeout 300 --gpu 0 --name engine-sf10
+```
 
 ---
 
