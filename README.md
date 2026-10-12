@@ -45,10 +45,10 @@ GPU and every CPU core work at the same time. On TPC-H SF10 Q1 the split finishe
 aggregation in 25 ms, against 57 ms on the CPU alone and 39 ms on the GPU alone.
 
 On the final user-felt TPC-H run, `auto` is within 10% of the better of `cpu` and `gpu` on
-22/22 queries at SF10, and on 21/22 at SF1 (median of 4 runs). Each query ran in a fresh process from Parquet on disk with
-no warm-up, and every result matched DuckDB. On SF10 Q9 and Q18, where the GPU wins from a cold
-start, `auto` keeps pace with the GPU. At SF1, where CUDA start-up would cost more than the query,
-it stays on the CPU.
+22/22 queries at SF10, and on 21/22 at SF1 (median of 4 runs; single runs 17–21). Each query ran in a fresh process from Parquet on disk with
+no warm-up, and every result matched DuckDB. On the five SF10 queries where the GPU wins from a
+cold start (Q5, Q7, Q9, Q18, Q21), `auto` stays within 5% of it. At SF1, where CUDA start-up
+would cost more than the query, it stays on the CPU.
 
 ➡️ **[Read how it works](docs/auto-mode.md)** · [visual version](https://htmlpreview.github.io/?https://github.com/abhisheksreesaila/mxframe/blob/main/docs/auto-mode.html)
 
