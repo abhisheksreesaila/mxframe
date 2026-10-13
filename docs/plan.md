@@ -423,9 +423,31 @@ Needs: F-033
 Needs: none · Found by the M2h review (predates F-032)
 - [x] `LazyFrame(t).select(col("s").alias("b")).groupby("b")` returns the key as `b` with the right values. (On 2026-10-13 it no longer raised but silently returned the key as `s`: the kernel and fused group-by paths named a plain column key after its source and ignored the alias. A renamed key now takes the derived-key branch.) `tests/test_groupby_alias.py`: 3 paths, each checked to be the one that ran, plus GPU. Reviewer PASS.
 
-## F-041 SQL: a SELECT alias on a group key is lost [todo]
+## F-041 SQL: a SELECT alias on a group key is lost [done]
 Needs: none · Found by the F-040 review
-- [ ] `SELECT s AS b, SUM(v) AS x FROM t GROUP BY s` returns the key as `s`; `... GROUP BY b` raises `KeyError: Field "b"`. `sql_frontend._build_aggregate` builds keys from GROUP BY and never applies the SELECT alias or resolves GROUP BY on one. Check against DuckDB
+- [x] `SELECT s AS b, SUM(v) AS x FROM t GROUP BY s` and `... GROUP BY b` return `b` like DuckDB. Keys are matched by their translated expression, so one rule covers aliases, `t.s` vs `s`, ORDER BY on the original name or expression, and a key selected twice; result columns follow the SELECT list (a projection after ORDER BY / LIMIT). `tests/test_sql_group_alias.py`: 19 queries checked against DuckDB. Reviewer PASS (round 2)
+
+## F-042 SQL front end gaps found in the F-041 review [todo]
+Needs: none · Pre-existing, found by the F-041 review
+- [ ] an aggregate without an alias is named `agg_0` (DuckDB: `sum(v)`) and its SELECT position is ignored
+- [ ] `SELECT kid ... JOIN ... ON k = kid GROUP BY kid` returns the column as `k`
+- [ ] `GROUP BY ALL` drops the keys
+- [ ] a duplicate output name (`SELECT x, SUM(v) AS x`) is accepted (DuckDB raises)
+- [ ] arithmetic on an aggregate (`SUM(v) * 2 AS y`) is not seen as an aggregate: raises "Aggregate.aggs cannot be empty", or the column is silently dropped when another aggregate is present
+
+## F-043 SF10: the four queries DuckDB still wins, with general fixes only [todo]
+Needs: none · Agreed 2026-10-13 (Abhishek: focus on these, no TPC-H-only tuning)
+- [ ] Q18 (697 vs 395 ms): a group-by with millions of groups runs on one worker (each worker's partial table would be GBs, so the 128 MB budget leaves one); any query with that many groups is affected
+- [ ] Q4 (224 vs 170 ms): the semi join's two native filter scans
+- [ ] Q10 (187 vs 188 ms): the multi-key group-by with string keys
+- [ ] Q22 (148 vs 117 ms): the anti join runs in NumPy (`has_partner`) plus ~68 ms of Arrow compute calls
+- [ ] each change helps the general shape (checked on a non-TPC-H case), and no SF1 / SF10 query gets slower
+
+## F-044 Random queries on the TPC-H data: performance beyond the 22 [todo]
+Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
+- [ ] a seeded generator of random queries over the TPC-H tables (filters, group-bys on random keys, joins, aggregates, sorts / limits, DISTINCT, count distinct), each run in MXFrame, Polars and DuckDB the engine-only way
+- [ ] every MXFrame result checked against DuckDB; any mismatch or crash is a bug ticket
+- [ ] report: per-shape timing against Polars and DuckDB, how many run natively vs fall back, and where MXFrame is slow; also the 22 queries on shuffled tables
 
 ## F-039 The optimization story: README with visuals [doing]
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13
