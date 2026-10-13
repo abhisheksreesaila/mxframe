@@ -200,12 +200,17 @@ __all__ = [
 
 def _background_warm():
     try:
-        pass  # pyarrow.compute is not preloaded: it loads on first use (_lazy_pc), ~25 ms the native paths never need
         from . import custom_ops, pipeline_exec, pipeline_kernels, coproc_fused, auto_mode, arrow_dict  # noqa: F401
         custom_ops._load_aot_kernels()
         pipeline_kernels._load_cpu()
         from . import group_keys
         group_keys._load()
+        from . import io_parquet, plan_validation, optimizer, join_engine, np_arrow, lazy_expr, pipeline_program, native_exec  # noqa: F401
+        if native_exec.available():
+            native_exec._load()
+        # pyarrow.compute itself is not preloaded (~25 ms of wrapper docstrings): `_lazy_pc.pc` calls
+        # its functions through pyarrow._compute, and the engine avoids Arrow methods that import it
+        import pyarrow._compute  # noqa: F401
     except Exception:
         pass
 

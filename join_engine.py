@@ -169,7 +169,7 @@ def _leaf_table_py(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
     if isinstance(plan, Filter):
         inner = _leaf_table_py(comp, plan.input, _union(needed, _cols(plan.predicate)))
         mask = comp._eval_predicate(plan.predicate, inner)
-        return _select(inner, needed).filter(mask)      # the mask is done: drop the predicate-only columns first
+        return pc.filter(_select(inner, needed), mask)      # the mask is done: drop the predicate-only columns first
     if isinstance(plan, Join):
         return execute_join(comp, plan, needed, False)
     return comp._plan_to_table(materialize(comp, plan, needed, False))
@@ -449,8 +449,8 @@ def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
                 dense = _dense(lk, rk)
                 if dense is not None:
                     return dense
-                enc = pa.concat_arrays([_npa(np.ascontiguousarray(lk, dtype=np.int64)),
-                                        _npa(np.ascontiguousarray(rk, dtype=np.int64))]).dictionary_encode()
+                enc = pc.dictionary_encode(pa.concat_arrays([_npa(np.ascontiguousarray(lk, dtype=np.int64)),
+                                        _npa(np.ascontiguousarray(rk, dtype=np.int64))]))
                 codes = _np_of(enc.indices, zero_copy_only=False)
                 codes = codes.astype(np.int32, copy=False)
                 return np.ascontiguousarray(codes[:n_left]), np.ascontiguousarray(codes[n_left:])
@@ -462,9 +462,9 @@ def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
             common = common_key_type(la.type, ra.type)
             if common is None:
                 raise TypeError(f"join key types differ: {la.type} and {ra.type}")
-            la, ra = la.cast(common), ra.cast(common)
-        enc = pa.concat_arrays([la, ra]).dictionary_encode()
-        codes = _np_of(enc.indices.fill_null(_npscalar(-1, type=enc.indices.type)),
+            la, ra = pc.cast(la, common), pc.cast(ra, common)
+        enc = pc.dictionary_encode(pa.concat_arrays([la, ra]))
+        codes = _np_of(pc.fill_null(enc.indices, _npscalar(-1, type=enc.indices.type)),
                        zero_copy_only=False).astype(np.int64)
         nulls = codes < 0
         if nulls.any():
@@ -478,7 +478,7 @@ def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
         packed = _pack([c[:n_left] for c in paired], [c[n_left:] for c in paired])
         if packed is not None:
             both = np.concatenate(packed)
-            enc = _npa(both).dictionary_encode()
+            enc = pc.dictionary_encode(_npa(both))
             dense = _np_of(enc.indices, zero_copy_only=False)
         else:
             _, dense = np.unique(np.column_stack(paired), axis=0, return_inverse=True)
@@ -563,7 +563,7 @@ def _dictionary_gather(col, idx: np.ndarray):
         return None
     if len(col) * 8 > len(idx) or len(idx) < (1 << 16):
         return None
-    enc = _as_pa(col).dictionary_encode()
+    enc = pc.dictionary_encode(_as_pa(col))
     if enc.indices.null_count:
         return None
     codes = _np_of(enc.indices, zero_copy_only=False)[idx]
@@ -673,7 +673,7 @@ def _execute_left(comp, node, needed):
                 rtake = _take_rows(sub, ri)
             else:
                 # unmatched rows carry a null index: Arrow's take turns those into null values
-                rtake = sub.take(_index_with_nulls(ri, matched))
+                rtake = pc.take(sub, _index_with_nulls(ri, matched))
             for orig, out in rwant:
                 arrays[out] = rtake.column(orig)
     return pa.Table.from_arrays([arrays[n] for n in want], names=want)

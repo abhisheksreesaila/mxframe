@@ -16,6 +16,8 @@ import sys
 import numpy as np
 import pyarrow as pa
 
+from ._lazy_pc import pc
+
 _NUMERIC = {
     np.dtype("int8"): pa.int8(), np.dtype("int16"): pa.int16(),
     np.dtype("int32"): pa.int32(), np.dtype("int64"): pa.int64(),
@@ -97,7 +99,7 @@ def _from_pylist(values, type):
         out = array(np.asarray(values, dtype=np.float64))
     if type is not None and out.type != type:
         try:
-            out = out.cast(type, safe=True)
+            out = pc.cast(out, type, safe=True)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
             return None          # let PyArrow raise its own error
     return out
@@ -106,14 +108,14 @@ def _from_pylist(values, type):
 def scalar(value, type=None):
     """``pa.scalar(value, type)`` without importing pandas (bool/int/float/str; else PyArrow)."""
     if isinstance(value, pa.Scalar):
-        return value.cast(type) if type is not None and value.type != type else value
+        return pc.cast(value, type) if type is not None and value.type != type else value
     import datetime as _dt
     if type is None and isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
         days = (value - _dt.date(1970, 1, 1)).days
-        return array(np.array([days], dtype=np.int32)).cast(pa.date32())[0]
+        return pc.cast(array(np.array([days], dtype=np.int32)), pa.date32())[0]
     if type is None and isinstance(value, _dt.datetime) and value.tzinfo is None:
         us = (value - _dt.datetime(1970, 1, 1)) // _dt.timedelta(microseconds=1)
-        return array(np.array([us], dtype=np.int64)).cast(pa.timestamp("us"))[0]
+        return pc.cast(array(np.array([us], dtype=np.int64)), pa.timestamp("us"))[0]
     arr = _from_pylist([value], type) if value is not None else None
     if arr is None:
         return pa.scalar(value, type=type)
@@ -155,7 +157,7 @@ def _masked(obj, type):
         valid = np.packbits(~mask, bitorder="little")
         out = pa.Array.from_buffers(base.type, len(base), [pa.py_buffer(valid), base.buffers()[1]],
                                     null_count=int(mask.sum()))
-    return out.cast(type, safe=True) if type is not None and out.type != type else out
+    return pc.cast(out, type, safe=True) if type is not None and out.type != type else out
 
 
 def array(obj, type=None, **kwargs) -> pa.Array:
@@ -185,7 +187,7 @@ def array(obj, type=None, **kwargs) -> pa.Array:
             a = np.ascontiguousarray(a)
         out = pa.Array.from_buffers(at, len(a), [None, pa.py_buffer(a)])
     if type is not None and out.type != type:
-        out = out.cast(type, safe=True)
+        out = pc.cast(out, type, safe=True)
     return out
 
 
@@ -254,7 +256,6 @@ def _byte_slices(col, idx):
     string / binary values (one row alone may exceed it), or None for other types."""
     if not (pa.types.is_string(col.type) or pa.types.is_binary(col.type)):
         return None
-    import pyarrow.compute as pc
     lens = pc.binary_length(col)
     lens = to_numpy(pc.fill_null(lens, scalar(0, type=lens.type))).astype(np.int64, copy=False)   # not a Python 0: that imports pandas
     cum = np.cumsum(lens[idx])
@@ -283,14 +284,14 @@ def take_rows(obj, idx):
 
     def one(col):
         if n <= TAKE_SLICE_MIN_ROWS or not _has_32bit_offsets(col.type):
-            return col.take(array(idx))
+            return pc.take(col, array(idx))
         bounds = _byte_slices(col, idx)
         checked = bounds is None
         if bounds is None:
             per_row = max(1.0, col.nbytes / max(1, len(col)))          # average value bytes per source row
             step = int(max(1, min(TAKE_CHUNK_ROWS, TAKE_CHUNK_BYTES // per_row)))
             bounds = [(i, min(i + step, n)) for i in range(0, n, step)]
-        parts = [col.take(array(idx[a:b])) for a, b in bounds]
+        parts = [pc.take(col, array(idx[a:b])) for a, b in bounds]
         chunks = [c for p in parts for c in (p.chunks if isinstance(p, pa.ChunkedArray) else [p])]
         if checked:
             for c in chunks:
@@ -299,7 +300,7 @@ def take_rows(obj, idx):
 
     if isinstance(obj, pa.Table):
         if n <= TAKE_SLICE_MIN_ROWS or not any(_has_32bit_offsets(t) for t in obj.schema.types):
-            return obj.take(array(idx))
+            return pc.take(obj, array(idx))
         return pa.Table.from_arrays([one(obj.column(i)) for i in range(obj.num_columns)], schema=obj.schema)
     return one(obj)
 
@@ -311,7 +312,6 @@ def take_rows(obj, idx):
 
 def _codes(col) -> np.ndarray:
     """Dense int64 codes per row, nulls encoded as their own value."""
-    import pyarrow.compute as pc
     a = combine(col)
     if pa.types.is_dictionary(a.type):
         a = a.dictionary_decode()
@@ -331,7 +331,6 @@ def _group_ids(table: pa.Table, cols):
 def _float_values(a) -> np.ndarray:
     """float64 values of a numeric Array, null slots unspecified (callers mask them). Reads the
     data buffer: ``to_numpy`` on an array with nulls goes through pandas."""
-    import pyarrow.compute as pc
     if a.type != pa.float64():
         a = pc.cast(a, pa.float64())
     if len(a) == 0:
@@ -344,13 +343,12 @@ def distinct_rows(table: pa.Table) -> pa.Table:
     if table.num_rows == 0:
         return table
     _, first = _group_ids(table, table.column_names)
-    return table.take(array(first.astype(np.int64)))
+    return pc.take(table, array(first.astype(np.int64)))
 
 
 def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
     """``table.group_by(keys).aggregate(spec)`` for spec ops sum / min / max / mean / count (nulls
     skipped; a group with no valid value gives NULL, count 0). Columns: keys, then ``<col>_<op>``."""
-    import pyarrow.compute as pc
     names = list(keys) + [f"{c}_{op}" for c, op in spec]
     if table.num_rows == 0:
         cols = [pa.nulls(0, table.schema.field(k).type) for k in keys]
@@ -363,7 +361,7 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
     gid, first = _group_ids(table, keys)
     n_groups = len(first)
     take = array(first.astype(np.int64))
-    out = [combine(table.column(k)).take(take) for k in keys]
+    out = [pc.take(combine(table.column(k)), take) for k in keys]
     for c, op in spec:
         a = combine(table.column(c))
         valid = to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else np.ones(len(a), bool)

@@ -301,13 +301,13 @@ def _dict_member(d: pa.Array, test, arrow) -> np.ndarray:
     ~25 ms per process, more than the test itself on TPC-H's dictionaries; `arrow` above it."""
     if len(d) <= DICT_MEMBER_PY_MAX:
         return np.fromiter((v is not None and bool(test(v)) for v in d.to_pylist()), dtype=bool, count=len(d))
-    return np.asarray(_np_of(arrow().fill_null(_npscalar(False)), zero_copy_only=False))
+    return np.asarray(_np_of(pc.fill_null(arrow(), _npscalar(False)), zero_copy_only=False))
 
 
 def _dict_codes(d: pa.DictionaryArray) -> np.ndarray:
     idx = d.indices
     if idx.type != pa.int32():
-        idx = idx.cast(pa.int32())
+        idx = pc.cast(idx, pa.int32())
     return np.ascontiguousarray(_np_of(idx, zero_copy_only=False))
 
 
@@ -330,7 +330,7 @@ def _column_numpy(col) -> Optional[np.ndarray]:
         return None
     t = arr.type
     if pa.types.is_boolean(t):
-        return np.ascontiguousarray(_np_of(arr.cast(pa.uint8()), zero_copy_only=False))
+        return np.ascontiguousarray(_np_of(pc.cast(arr, pa.uint8()), zero_copy_only=False))
     if not (pa.types.is_integer(t) or pa.types.is_floating(t)):
         return None
     if pa.types.is_uint64(t) or pa.types.is_float16(t):
@@ -491,7 +491,7 @@ class _Builder:
             if arr.null_count:
                 raise Unsupported("string column has nulls")
             if not pa.types.is_dictionary(arr.type):
-                arr = arr.dictionary_encode()
+                arr = pc.dictionary_encode(arr)
             if arr.indices.null_count:
                 raise Unsupported("string column has nulls")
             self.dict_arrays[name] = arr

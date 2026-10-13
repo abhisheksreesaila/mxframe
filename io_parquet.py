@@ -21,6 +21,8 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 
+from ._lazy_pc import pc
+
 from .lazy_expr import Expr
 from .lazy_frame import (
     Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan,
@@ -332,7 +334,7 @@ def _read_groups(path, md, schema, columns, dict_cols, groups, need, mask_dict=(
         m = masks.get(g)
         out = arr if m is None else _take_array(arr, m)
         if name in masked_as_dict and _is_dict(out.type):
-            out = out.cast(out.type.value_type)          # read as a dictionary only for the mask
+            out = pc.cast(out, out.type.value_type)          # read as a dictionary only for the mask
         return out
 
     tasks = [(g, n) for n in cols for g in groups]
@@ -414,7 +416,7 @@ def _take_array(arr: pa.Array, mask) -> pa.Array:
     t = arr.type
     if (pa.types.is_integer(t) or pa.types.is_floating(t)) and not arr.null_count:
         return _arr(to_numpy(arr)[mask], type=t)
-    return arr.filter(_arr(mask))
+    return pc.filter(arr, _arr(mask))
 
 
 def _row_groups_for(pf, pushed) -> List[int]:

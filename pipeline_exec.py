@@ -21,6 +21,7 @@ from typing import Any, List, Optional
 import numpy as np
 import pyarrow as pa
 from .np_arrow import array as _npa
+from ._lazy_pc import pc
 
 from .lazy_frame import Aggregate, Filter, Scan
 from .pipeline_program import (
@@ -168,7 +169,7 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         key_arrays = []
         for k in group_keys:
             v = unique_key_cols[k]
-            key_arrays.append(v if keep is None else v.filter(keep))
+            key_arrays.append(v if keep is None else pc.filter(v, keep))
         # counts stay exact int64 (float32/float64 would saturate at 2**24 / lose exactness)
         agg_arrays = [_npa(cols[name].astype(np.int64 if op == "count" else np.float64))
                       for name, op, _ in prog.outputs]
@@ -182,7 +183,7 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         result = pa.table(arrays)
 
     if having_pred is not None:
-        result = result.filter(compiler._eval_predicate(having_pred, result))
+        result = pc.filter(result, compiler._eval_predicate(having_pred, result))
     if post_ops:
         # Aggregate results are small: sort/limit them on the CPU. The GPU sort path
         # gathers every column through float32, which would round the float64 sums.

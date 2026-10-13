@@ -594,7 +594,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div" and pa.types.is_integer(lhs.type) and pa.types.is_integer(rhs.type):
-                lhs, rhs = lhs.cast(pa.float64()), rhs.cast(pa.float64())      # SQL `/` is true division
+                lhs, rhs = pc.cast(lhs, pa.float64()), pc.cast(rhs, pa.float64())      # SQL `/` is true division
             fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
             return fn(lhs, rhs)
         if op in _DICT_PRED_OPS:
@@ -613,7 +613,7 @@ class CustomOpsCompiler(GraphCompiler):
                     if op == "ne":
                         bool_mask = np.logical_not(bool_mask)
                         if col_arr.null_count:
-                            bool_mask &= _np_of(col_arr.is_valid(), zero_copy_only=False)
+                            bool_mask &= _np_of(pc.is_valid(col_arr), zero_copy_only=False)
                     return _npa(bool_mask, type=pa.bool_())
             return _PC_CMP_OPS[op](*self._cmp_operands(args, table))
         if op in _PC_CMP_OPS:
@@ -669,7 +669,7 @@ class CustomOpsCompiler(GraphCompiler):
             # float64 on both devices: float32 would lose integers above 2**24 and round
             # float64 values, so the device would change the digits (F-022)
             want = pa.float64()
-            return result.cast(want) if result.type != want else result
+            return pc.cast(result, want) if result.type != want else result
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
@@ -1025,7 +1025,7 @@ class CustomOpsCompiler(GraphCompiler):
         cols = {}
         for name in _expr_col_names(expr):
             c = table.column(name)
-            cols[name] = c.cast(pa.float64()) if pa.types.is_float32(c.type) else c
+            cols[name] = pc.cast(c, pa.float64()) if pa.types.is_float32(c.type) else c
         if not cols:
             # literal-only expression: keep the row count so literals broadcast to every row
             cols["__rows__"] = _npa(np.zeros(table.num_rows, dtype=np.int8))
@@ -1241,12 +1241,12 @@ class CustomOpsCompiler(GraphCompiler):
             groups = {(): list(range(n))}
 
         for row_indices in groups.values():
-            sub = table.take(_npa(np.asarray(row_indices, dtype=np.int64)))
+            sub = pc.take(table, _npa(np.asarray(row_indices, dtype=np.int64)))
             if order_by:
                 sort_keys = [(c, "descending" if descending else "ascending")
                              for c in order_by]
                 perm = pc.sort_indices(sub, sort_keys=sort_keys).to_pylist()
-                sub = sub.take(perm)
+                sub = pc.take(sub, perm)
                 ordered_indices = [row_indices[i] for i in perm]
             else:
                 ordered_indices = row_indices
@@ -1340,8 +1340,8 @@ class CustomOpsCompiler(GraphCompiler):
                 return fn(l, r)
             except pa.ArrowInvalid:            # overflow in the column's own width
                 wide = pa.int64()
-                return fn(l.cast(wide) if isinstance(l, pa.Array) else l,
-                          r.cast(wide) if isinstance(r, pa.Array) else r)
+                return fn(pc.cast(l, wide) if isinstance(l, pa.Array) else l,
+                          pc.cast(r, wide) if isinstance(r, pa.Array) else r)
         return None
 
     def _lower_row_ops(self, plan, top: bool = True):
@@ -1442,7 +1442,7 @@ class CustomOpsCompiler(GraphCompiler):
                 for pred in preds:
                     m = pc.fill_null(self._eval_predicate(pred, table), _npscalar(False, type=pa.bool_()))   # null is not true
                     mask = m if mask is None else pc.and_(mask, m)
-                table = table.filter(mask)
+                table = pc.filter(table, mask)
             key_arrays, key_names = [], []
             for i, e in enumerate(plan.group_by):
                 name = e._alias or (e.args[0] if e.op == "col" else f"__gk_{i}__")
@@ -1468,7 +1468,7 @@ class CustomOpsCompiler(GraphCompiler):
             out_cols = [grouped.column(n) for n in key_names]
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
-                out_cols.append(c.cast(pa.int64()) if e.op == "count" else c.cast(pa.float64()))
+                out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" else pc.cast(c, pa.float64()))
             result = pa.Table.from_arrays(out_cols, names=key_names + agg_names)
         else:
             cols = []
@@ -1923,7 +1923,7 @@ class CustomOpsCompiler(GraphCompiler):
                             gids = remap[gids]
                             n_groups = len(present_idx)
                             unique_key_cols = {
-                                k: v.take(_npa(present_idx.astype(np.int64)))
+                                k: pc.take(v, _npa(present_idx.astype(np.int64)))
                                 for k, v in unique_key_cols.items()
                             }
                     extra_inputs["__group_ids__"] = gids
@@ -1984,7 +1984,7 @@ class CustomOpsCompiler(GraphCompiler):
             )
             if _aot_result is not None:
                 if having_pred is not None:
-                    _aot_result = _aot_result.filter(
+                    _aot_result = pc.filter(_aot_result,
                         self._eval_predicate(having_pred, _aot_result)
                     )
                 if post_ops:
@@ -2024,7 +2024,7 @@ class CustomOpsCompiler(GraphCompiler):
                 )
             if _aot_result is not None:
                 if having_pred is not None:
-                    _aot_result = _aot_result.filter(
+                    _aot_result = pc.filter(_aot_result,
                         self._eval_predicate(having_pred, _aot_result)
                     )
                 if post_ops:
@@ -2053,7 +2053,7 @@ class CustomOpsCompiler(GraphCompiler):
             )
             if _aot_result is not None:
                 if having_pred is not None:
-                    _aot_result = _aot_result.filter(
+                    _aot_result = pc.filter(_aot_result,
                         self._eval_predicate(having_pred, _aot_result)
                     )
                 if post_ops:
@@ -2183,8 +2183,8 @@ class CustomOpsCompiler(GraphCompiler):
                 surviving[_group_ids_full[mask_np_int32.astype(bool)]] = True
                 if not surviving.all():
                     surv_filter = _npa(surviving)
-                    unique_key_cols = {k: v.filter(surv_filter) for k, v in unique_key_cols.items()}
-                    agg_arrays = [arr.filter(surv_filter) for arr in agg_arrays]
+                    unique_key_cols = {k: pc.filter(v, surv_filter) for k, v in unique_key_cols.items()}
+                    agg_arrays = [pc.filter(arr, surv_filter) for arr in agg_arrays]
             key_arrays = [unique_key_cols[k] for k in group_keys]
             result = pa.Table.from_arrays(key_arrays + agg_arrays, names=group_keys + agg_names)
         else:
@@ -2193,7 +2193,7 @@ class CustomOpsCompiler(GraphCompiler):
         # 8 -- Apply HAVING filter (post-aggregation predicate) -------
         if having_pred is not None:
             having_mask = self._eval_predicate(having_pred, result)
-            result = result.filter(having_mask)
+            result = pc.filter(result, having_mask)
 
         # 9 -- Apply post-ops (Sort/Limit/Distinct via Mojo kernels) ---
         if post_ops:
@@ -2245,7 +2245,7 @@ class CustomOpsCompiler(GraphCompiler):
             gids = compact_gids
             n_groups = len(present_idx)
             unique_key_cols = {
-                k: v.take(_npa(present_idx.astype(np.int64)))
+                k: pc.take(v, _npa(present_idx.astype(np.int64)))
                 for k, v in unique_key_cols.items()
             }
 
@@ -2494,10 +2494,10 @@ class CustomOpsCompiler(GraphCompiler):
                 # -0.0 and 0.0 are equal in SQL but hash (and would rank) as two values
                 vals = _np_of(arr, zero_copy_only=False)
                 if (vals == 0).any() and np.signbit(vals[vals == 0]).any():
-                    arr = _npa(np.ma.masked_array(vals + vals.dtype.type(0.0), mask=_np_of(arr.is_null(), zero_copy_only=False)),
+                    arr = _npa(np.ma.masked_array(vals + vals.dtype.type(0.0), mask=_np_of(pc.is_null(arr), zero_copy_only=False)),
                                type=arr.type)
             # PyArrow dictionary_encode: O(N) hash → encounter-order indices
-            enc = arr.dictionary_encode()
+            enc = pc.dictionary_encode(arr)
             dict_arr = enc.dictionary
             # Vectorised rank: sort_indices gives sorted_order[rank] = orig_dict_idx
             # Invert with rank_of[orig_dict_idx] = rank  (single numpy scatter)
@@ -2508,8 +2508,8 @@ class CustomOpsCompiler(GraphCompiler):
             if enc.indices.null_count:
                 # nulls sort after every value, in either direction (DuckDB's default): they
                 # get one extra rank past the real ones, which a descending flip leaves alone
-                is_null = _np_of(enc.indices.is_null(), zero_copy_only=False)
-                raw_idx = _np_of(enc.indices.fill_null(_npscalar(0, type=enc.indices.type)), zero_copy_only=False).astype(np.int32)
+                is_null = _np_of(pc.is_null(enc.indices), zero_copy_only=False)
+                raw_idx = _np_of(pc.fill_null(enc.indices, _npscalar(0, type=enc.indices.type)), zero_copy_only=False).astype(np.int32)
                 ranks = rank_of[raw_idx] if n_dict else np.zeros(len(raw_idx), dtype=np.int32)
                 ranks = np.where(is_null, np.int32(n_dict), ranks).astype(np.int32)
                 per_col_ranks.append((ranks, n_dict + 1, n_dict))
@@ -2569,7 +2569,7 @@ class CustomOpsCompiler(GraphCompiler):
                     sorted_indices = np.argsort(composite_key, kind='stable')
             else:
                 sorted_indices = np.argsort(composite_key, kind='stable')
-            return table.take(_npa(sorted_indices.astype(np.int64)))
+            return pc.take(table, _npa(sorted_indices.astype(np.int64)))
 
         # ── GPU path ────────────────────────────────────────────────────────
         # Phase 5: prefer AOT GPU sort (no JIT, cached key array, AOT gather)
@@ -2607,7 +2607,7 @@ class CustomOpsCompiler(GraphCompiler):
         (out_idx,) = model.execute(k_buf, f_buf)
         # Download indices and gather on CPU (original MAX Graph gather was broken)
         idx_np = np.asarray(_np_of(out_idx)).reshape(-1).astype(np.int32)
-        return table.take(_npa(idx_np.astype(np.int64)))
+        return pc.take(table, _npa(idx_np.astype(np.int64)))
 
     def _gpu_gather_table(self, table: pa.Table, idx_tensor, N: int) -> pa.Table:
         """Gather rows of `table` using an index tensor already on GPU.
@@ -2672,7 +2672,7 @@ class CustomOpsCompiler(GraphCompiler):
                 gathered_arrays.append(_npa(np.asarray(_np_of(out_t)).reshape(-1)))
             else:
                 # Non-numeric column: fall back to Arrow.take (index already on CPU)
-                gathered_arrays.append(col.take(_npa(idx_np.astype(np.int64))))
+                gathered_arrays.append(pc.take(col, _npa(idx_np.astype(np.int64))))
             gathered_names.append(col_name)
 
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
@@ -2737,7 +2737,7 @@ class CustomOpsCompiler(GraphCompiler):
                 gathered_arrays.append(_npa(np.asarray(_np_of(out_t)).reshape(-1)))
             else:
                 # Non-numeric column (string, date, etc.): CPU fallback
-                gathered_arrays.append(col.take(_npa(idx_int32.astype(np.int64))))
+                gathered_arrays.append(pc.take(col, _npa(idx_int32.astype(np.int64))))
             gathered_names.append(col_name)
 
         return pa.Table.from_arrays(gathered_arrays, names=gathered_names)
@@ -2760,11 +2760,11 @@ class CustomOpsCompiler(GraphCompiler):
             return _distinct_rows(sub)
         rows = _group_keys.first_rows(gids, int(n_groups)) if isinstance(gids, np.ndarray) else None
         if rows is not None:
-            return sub.take(_npa(rows))
+            return pc.take(sub, _npa(rows))
         gids = np.asarray(gids, dtype=np.int64)
         first = np.full(int(n_groups), len(gids), dtype=np.int64)
         np.minimum.at(first, gids, np.arange(len(gids), dtype=np.int64))
-        return sub.take(_npa(np.sort(first[first < len(gids)])))
+        return pc.take(sub, _npa(np.sort(first[first < len(gids)])))
 
     def _apply_post_ops_custom(self, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct using Mojo kernels (not PyArrow compute)."""
@@ -2843,7 +2843,7 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(plan, Filter):
             inner_table = self._plan_to_table(plan.input)
             mask = self._eval_predicate(plan.predicate, inner_table)
-            return inner_table.filter(mask)
+            return pc.filter(inner_table, mask)
         if isinstance(plan, Project):
             inner_table = self._plan_to_table(plan.input)
             arrays, names = [], []
@@ -2965,7 +2965,7 @@ class CustomOpsCompiler(GraphCompiler):
                         f"join key types differ: {left_name}={left_arr.type}, "
                         f"{right_name}={right_arr.type}"
                     )
-                left_arr, right_arr = left_arr.cast(common), right_arr.cast(common)
+                left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
 
             if (
                 len(left_cols) == 1
@@ -2988,8 +2988,8 @@ class CustomOpsCompiler(GraphCompiler):
                         np.ascontiguousarray(right_np.astype(np.int32)),
                     )
 
-            encoded = pa.concat_arrays([left_arr, right_arr]).dictionary_encode()
-            codes = _np_of(encoded.indices.fill_null(_npscalar(-1, type=encoded.indices.type)), zero_copy_only=False).astype(np.int64)
+            encoded = pc.dictionary_encode(pa.concat_arrays([left_arr, right_arr]))
+            codes = _np_of(pc.fill_null(encoded.indices, _npscalar(-1, type=encoded.indices.type)), zero_copy_only=False).astype(np.int64)
             nulls = codes < 0
             if nulls.any():
                 next_code = len(encoded.dictionary)
@@ -3456,7 +3456,7 @@ class CustomOpsCompiler(GraphCompiler):
                     running, span = running.astype(np.int64), len(uniq)
                 running, span = running * size + c, span * size
             uniq, first, dense_ids = np.unique(running, return_index=True, return_inverse=True)
-            unique_key_cols = {k: encodings[i].dictionary.take(_npa(codes[i][first]))
+            unique_key_cols = {k: pc.take(encodings[i].dictionary, _npa(codes[i][first]))
                                for i, k in enumerate(keys)}
             return dense_ids.astype(np.int32), len(uniq), unique_key_cols
 
@@ -3485,7 +3485,7 @@ class CustomOpsCompiler(GraphCompiler):
             unique_key_cols = {}
             for i, k in enumerate(keys):
                 key_idx = (present // strides[i]) % sizes[i]
-                unique_key_cols[k] = encodings[i].dictionary.take(
+                unique_key_cols[k] = pc.take(encodings[i].dictionary,
                     _npa(key_idx.astype(np.int64))
                 )
             return dense_ids, n_groups, unique_key_cols
@@ -3501,7 +3501,7 @@ class CustomOpsCompiler(GraphCompiler):
         unique_key_cols = {}
         for i, k in enumerate(keys):
             key_idx = ((unique_composite // strides[i]) % sizes[i]).astype(np.int64)
-            unique_key_cols[k] = encodings[i].dictionary.take(_npa(key_idx))
+            unique_key_cols[k] = pc.take(encodings[i].dictionary, _npa(key_idx))
 
         return dense_ids, n_groups, unique_key_cols
 
@@ -3563,7 +3563,7 @@ class CustomOpsCompiler(GraphCompiler):
                 unique_key_cols = {}
                 for i, k in enumerate(keys):
                     key_idx = (present // strides_list[i]) % sizes[i]
-                    unique_key_cols[k] = encodings[i].dictionary.take(
+                    unique_key_cols[k] = pc.take(encodings[i].dictionary,
                         _npa(key_idx.astype(np.int64))
                     )
                 return dense_ids, n_groups, unique_key_cols
@@ -3575,7 +3575,7 @@ class CustomOpsCompiler(GraphCompiler):
             unique_key_cols = {}
             for i, k in enumerate(keys):
                 key_idx = ((unique_composite // strides_list[i]) % sizes[i]).astype(np.int64)
-                unique_key_cols[k] = encodings[i].dictionary.take(_npa(key_idx))
+                unique_key_cols[k] = pc.take(encodings[i].dictionary, _npa(key_idx))
             return dense_ids, n_groups, unique_key_cols
         except Exception:
             return None
@@ -3746,7 +3746,7 @@ class CustomOpsCompiler(GraphCompiler):
                 sorted_gids, np.arange(n_groups, dtype=np.int32), side='left'
             )
             first_occurrence = sort_order[first_in_sorted].astype(np.int64)
-            unique_keys = col_arr.take(_npa(first_occurrence))
+            unique_keys = pc.take(col_arr, _npa(first_occurrence))
             return dense_ids, n_groups, {key_name: unique_keys}
 
         except Exception:

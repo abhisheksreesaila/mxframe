@@ -27,7 +27,7 @@ def decode(arr):
     """Return ``arr`` with dictionary encoding removed (no-op for plain arrays)."""
     if not is_dictionary(arr):
         return arr
-    return arr.cast(arr.type.value_type)
+    return pc.cast(arr, arr.type.value_type)   # not arr.cast: it imports pyarrow.compute (_lazy_pc)
 
 
 def combine_dictionary(col) -> pa.DictionaryArray:
@@ -79,11 +79,11 @@ def encode_key(col):
         fast = _encode_int(arr)
         if fast is not None:
             return fast
-        return arr.dictionary_encode()
+        return pc.dictionary_encode(arr)
     d = combine_dictionary(col)
     if d.null_count:
         # Keep the historical null handling of dictionary_encode().
-        return decode(d).dictionary_encode()
+        return pc.dictionary_encode(decode(d))
     n = len(d.dictionary)
     idx = _np_of(d.indices, zero_copy_only=False)
     used = np.zeros(n, dtype=bool)
@@ -92,7 +92,7 @@ def encode_key(col):
         return d
     remap = (np.cumsum(used) - 1).astype(np.int32)
     return pa.DictionaryArray.from_arrays(
-        _npa(remap[idx]), d.dictionary.filter(_npa(used)))
+        _npa(remap[idx]), pc.filter(d.dictionary, _npa(used)))
 
 
 _CMP = {   # names: pyarrow.compute loads on first use (_lazy_pc)
@@ -133,6 +133,6 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
         # is_in is never null.  Null rows (null index) match only a None in the value set.
         out = pc.take(per_entry, d.indices)
         if d.null_count:
-            out = pc.if_else(d.indices.is_null(), _npscalar(None in args[1]), out)
+            out = pc.if_else(pc.is_null(d.indices), _npscalar(None in args[1]), out)
         return out
     return pc.take(per_entry, d.indices)
