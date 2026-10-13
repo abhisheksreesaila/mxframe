@@ -403,13 +403,15 @@ _KEY_WIDTH = {pa.int32(): 4, pa.int64(): 8, pa.date32(): 4}
 class Lookup:
     """A join partner fused into the leaf filter (F-032): rows of the scanned table whose ``probe``
     columns equal ``build_keys`` of a row of ``build`` keep that row's ``outputs`` (written under
-    ``names``). ``build`` keys must be unique (a duplicate declines); 1 or 2 integer key columns."""
-    __slots__ = ("probe", "build", "build_keys", "outputs", "names")
+    ``names``). ``build`` keys must be unique (a duplicate declines); 1 or 2 integer key columns.
+    ``semi``: only whether a partner row exists counts (keys may repeat, no outputs)."""
+    __slots__ = ("probe", "build", "build_keys", "outputs", "names", "semi")
 
-    def __init__(self, probe, build: pa.Table, build_keys, outputs, names=None):
+    def __init__(self, probe, build: pa.Table, build_keys, outputs, names=None, semi=False):
         self.probe, self.build, self.build_keys = list(probe), build, list(build_keys)
         self.outputs = list(outputs)
         self.names = list(names) if names is not None else list(outputs)
+        self.semi = bool(semi)
 
 
 def _lookup_key_kind(t: pa.DataType):
@@ -468,6 +470,8 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
     for lk in lookups:
         if len(lk.probe) not in (1, 2) or len(lk.probe) != len(lk.build_keys):
             return _filter_decline("lookup: 1 or 2 key columns")
+        if lk.semi and lk.outputs:
+            return _filter_decline("lookup: a semi join has no outputs")
         b = lk.build.combine_chunks()     # one chunk per column; dictionaries unified, not decoded
         if b.num_rows == 0 or any(b.column(c).num_chunks != 1 for c in b.column_names):
             return _filter_decline("lookup: empty partner")
@@ -481,6 +485,8 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
                 pk_names.append(pn)
             pks.append(pk_names.index(pn))
             widths |= _KEY_WIDTH[pc_.type] << (4 * i) | _KEY_WIDTH[bc_.type] << (8 + 4 * i)
+        if lk.semi:
+            widths |= 1 << 16
         bkeys = [b.column(bn).chunk(0) for bn in lk.build_keys]
         bouts = []
         for on, nm in zip(lk.outputs, lk.names):

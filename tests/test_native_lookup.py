@@ -319,3 +319,70 @@ def test_date_key_against_an_integer_key_declines(comp):
     dim = _dim(np.arange(10))
     dim = dim.set_column(0, "dk", dim.column("dk").cast(pa.int32()).cast(pa.date32()))
     assert nx.try_filter(comp, fact, [], {"q"}, [_lk(["k"], dim, ["dk"], ["w"], 0)]) is None
+
+
+# ── semi joins: a partner that is the distinct keys of a filtered table ──────────────────────
+
+def test_semi_lookup_allows_repeated_keys(comp):
+    fact = _fact(50_000, key_hi=3000)
+    for keys in (np.repeat(np.arange(0, 3000, 5), 3), np.repeat(np.arange(0, 3000, 5), 3) * 1_000_003):
+        f = fact if keys.max() < 10**6 else fact.set_column(0, "k", A(fact.column("k").to_numpy() * 1_000_003))
+        dim = pa.table({"dk": A(keys.astype(np.int64))})
+        got = nx.try_filter(comp, f, [], {"q", "k"}, [nx.Lookup(["k"], dim, ["dk"], [], [], semi=True)])
+        assert got is not None, nx.last_filter()
+        present = set(keys.tolist())
+        ks = f.column("k").to_pylist()
+        want = [i for i in range(f.num_rows) if ks[i] in present]
+        assert got.column("k").to_pylist() == [ks[i] for i in want]
+        assert got.column("q").to_pylist() == [f.column("q")[i].as_py() for i in want]
+
+
+SEMI_PLANS = {
+    "filtered distinct keys, aggregate on top": lambda t: (
+        LazyFrame(t["orders"]).filter(col("o_cust") < lit(2000))
+        .join(LazyFrame(t["li"]).filter(col("l_qty") < lit(5)).select("l_order").distinct(),
+              left_on="o_key", right_on="l_order")
+        .groupby("o_day").agg(col("o_cust").count().alias("n")).sort("o_day")),
+    "unfiltered distinct keys, rows out": lambda t: (
+        LazyFrame(t["orders"]).filter(col("o_cust") < lit(300))
+        .join(LazyFrame(t["li"]).select("l_order").distinct(), left_on="o_key", right_on="l_order")
+        .select("o_key", "o_day").sort("o_key")),
+    "two-column distinct keys": lambda t: (
+        LazyFrame(t["li"]).filter(col("l_qty") > lit(45))
+        .join(LazyFrame(t["ps"]).filter(col("ps_cost") < lit(50.0)).select("ps_part", "ps_supp").distinct(),
+              left_on=["l_part", "l_supp"], right_on=["ps_part", "ps_supp"])
+        .groupby("l_supp").agg(col("l_price").sum().alias("s")).sort("l_supp")),
+}
+
+
+@pytest.mark.parametrize("name", list(SEMI_PLANS))
+def test_semi_plans_match_and_skip_the_distinct(monkeypatch, name):
+    import mxframe.custom_ops as co
+    t = _tables()
+    semis, star = [], []
+    real = je._semi_partner
+    monkeypatch.setattr(je, "_semi_partner", lambda *a: semis.append(r := real(*a)) or r)
+    real_star = je._execute_star
+    monkeypatch.setattr(je, "_execute_star", lambda *a: star.append(r := real_star(*a)) or r)
+    co._JOIN_RESULT_CACHE.clear()
+    got, old, _ = _run_both(SEMI_PLANS[name], t, monkeypatch)
+    assert semis and semis[0] is not None
+    assert star and star[0] is not None, nx.last_filter()      # the semi lookup ran, no fallback
+    assert got.num_rows > 0
+    _same(got, old)
+
+
+def test_distinct_of_more_than_the_keys_is_not_a_semi_join(monkeypatch):
+    import mxframe.custom_ops as co
+    t = _tables()
+    plan = lambda t: (LazyFrame(t["orders"])
+                      .join(LazyFrame(t["li"]).filter(col("l_qty") < lit(3)).select("l_order", "l_qty").distinct(),
+                            left_on="o_key", right_on="l_order")
+                      .groupby("l_qty").agg(col("o_cust").count().alias("n")).sort("l_qty"))
+    semis = []
+    real = je._semi_partner
+    monkeypatch.setattr(je, "_semi_partner", lambda *a: semis.append(r := real(*a)) or r)
+    co._JOIN_RESULT_CACHE.clear()
+    got, old, _ = _run_both(plan, t, monkeypatch)
+    _same(got, old)
+    assert all(r is None for r in semis)          # never taken as a semi partner

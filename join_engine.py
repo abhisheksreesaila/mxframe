@@ -810,7 +810,35 @@ def _star_name(leaf: int, c: str) -> str:
     return f"{leaf}:{c}"
 
 
-def _execute_star(comp, fl, fact: int, tables, want, leaf_need) -> Optional[pa.Table]:
+def _semi_keys(plan) -> Optional[Tuple[Scan, list, List[str]]]:
+    """(Scan, predicates, key columns) when ``plan`` is Distinct(Project(columns)(Filter*(Scan))):
+    joining it on exactly those columns is a semi join (a row of the other side either has a
+    partner or not), so the distinct never has to run."""
+    if not (isinstance(plan, Distinct) and not plan.subset and isinstance(plan.input, Project)):
+        return None
+    exprs = plan.input.exprs
+    if not exprs or any(e.op != "col" or (e._alias not in (None, e.args[0])) for e in exprs):
+        return None
+    scan, preds = _scan_under_filters(plan.input.input)
+    if scan is None:
+        return None
+    return scan, preds, [e.args[0] for e in exprs]
+
+
+def _semi_partner(comp, plan, bkeys) -> Optional[pa.Table]:
+    """The key rows of a semi-join partner (repeats and all), filtered natively; None: not one."""
+    sk = _semi_keys(plan)
+    if sk is None or set(sk[2]) != set(bkeys) or len(sk[2]) != len(bkeys):
+        return None
+    scan, preds, _ = sk
+    if not preds:
+        return scan.table.select(list(bkeys))
+    from . import native_exec
+    out = native_exec.try_filter(comp, scan.table, preds, set(bkeys))
+    return None if out is None else out.select(list(bkeys))
+
+
+def _execute_star(comp, fl, fact: int, get, want, leaf_need) -> Optional[pa.Table]:
     """The join as one scan of leaf ``fact``: every other leaf belongs to the subtree of one of the
     fact's neighbours (the edges form a tree); each subtree is joined on its own (small tables) and
     becomes a partner looked up by key while the fact's filter runs (``native_exec.try_filter``).
@@ -868,10 +896,22 @@ def _execute_star(comp, fl, fact: int, tables, want, leaf_need) -> Optional[pa.T
                 deliver[leaf].append(c)
 
     lookups = []
+    # semi partners' key columns, served from the fact's equal probe columns. Defensive: a join drops
+    # its right key, so no output or residual can name one today
+    via_probe: Dict[Tuple[int, str], str] = {}
     for c, ei in roots:
         a, b, ac, bc = fl.edges[ei]
         probe, bkeys = (ac, bc) if a == fact else (bc, ac)
         S = members[c]
+        if len(S) == 1 and set(deliver[c]) <= set(bkeys):
+            keys = _semi_partner(comp, fl.leaves[c], bkeys)
+            if keys is not None:
+                for pk, bk in zip(probe, bkeys):
+                    via_probe[(c, bk)] = pk
+                    if bk in deliver[c] and pk not in deliver[fact]:
+                        deliver[fact].append(pk)
+                lookups.append(native_exec.Lookup(probe, keys, list(bkeys), [], [], semi=True))
+                continue
         bnames = []
         cols_of: Dict[int, List[str]] = {}
         for x in S:
@@ -880,12 +920,12 @@ def _execute_star(comp, fl, fact: int, tables, want, leaf_need) -> Optional[pa.T
                 cols += [k for k in bkeys if k not in cols]
             cols_of[x] = cols
         if len(S) == 1:
-            t = tables[c].select(cols_of[c])
+            t = get(c).select(cols_of[c])
             B = pa.Table.from_arrays([t.column(k) for k in cols_of[c]],
                                      names=[_star_name(c, k) for k in cols_of[c]])
         else:
             loc = {x: i for i, x in enumerate(S)}
-            lt = [tables[x] for x in S]
+            lt = [get(x) for x in S]
             rows = [t.num_rows for t in lt]
             base = [_base_rows(fl.leaves[x], rows[loc[x]]) for x in S]
             ledges = [(loc[a2], loc[b2], ac2, bc2) for a2, b2, ac2, bc2 in fl.edges
@@ -917,6 +957,8 @@ def _execute_star(comp, fl, fact: int, tables, want, leaf_need) -> Optional[pa.T
         return None
 
     def name_of(leaf, c):
+        if (leaf, c) in via_probe:
+            return via_probe[(leaf, c)]
         return c if leaf == fact else _star_name(leaf, c)
 
     for pred, cm in post_res:
@@ -1006,15 +1048,19 @@ def _execute_inner(comp, node, needed, dict_ok=False):
         for leaf, c in cm.values():
             later[leaf].discard(c)
     tables: List[Optional[pa.Table]] = [None] * n_leaves
-    fact = _star_fact(comp, fl)
-    for i in range(n_leaves):
-        if i != fact:
+
+    def get(i: int) -> pa.Table:             # a leaf evaluated once, when first needed
+        if tables[i] is None:
             tables[i] = leaf_table(comp, fl.leaves[i], leaf_need[i], keep=later[i])
+        return tables[i]
+
+    fact = _star_fact(comp, fl)
     if fact is not None:
-        out = _execute_star(comp, fl, fact, tables, want, leaf_need)
+        out = _execute_star(comp, fl, fact, get, want, leaf_need)
         if out is not None:
             return out
-        tables[fact] = leaf_table(comp, fl.leaves[fact], leaf_need[fact], keep=later[fact])
+    for i in range(n_leaves):
+        get(i)
     rows = [t.num_rows for t in tables]
     base = [_base_rows(fl.leaves[i], rows[i]) for i in range(n_leaves)]
     out_leaves = {fl.src[n][0] for n in want}

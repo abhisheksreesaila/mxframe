@@ -1349,7 +1349,8 @@ def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP
 # version 2 (M2d, join partners looked up in the same pass; a row without a partner is dropped):
 #  16 n_look   17 look* : int64[n_look][8] = (n_keys 1|2, probe key a, probe key b or -1 (indexes
 #     into the n_pk probe key columns), partner key ArrowArray* a, b or 0, widths (probe a | probe b
-#     << 4 | partner a << 8 | partner b << 12, 4 or 8 bytes), n_bout, bout* : int64[n_bout][3] =
+#     << 4 | partner a << 8 | partner b << 12, 4 or 8 bytes; bit 16: semi join, keys may repeat and
+#     the partner has no output columns), n_bout, bout* : int64[n_bout][3] =
 #     (ArrowArray*, kind, size)); partner arrays are one chunk each
 #  18 n_pk (probe key columns, after the output columns in `arrays`)
 # Result: 0 n_rows   1 arena*   then per output column (A, B), the scanned table's then each
@@ -1472,6 +1473,7 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
     var widths = Int(L[5])
     var wa = (widths >> 8) & 15
     var wb = (widths >> 12) & 15
+    var semi = ((widths >> 16) & 1) == 1      # presence only: repeated keys are fine
     var n = _arr_len(ka)
     M[0] = 0
     M[6] = 0
@@ -1571,6 +1573,8 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
         counter[0] = 0
 
         def check(wid: Int) {imm}:
+            if semi:
+                return
             while True:
                 var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
                 if b >= nb:
@@ -1666,7 +1670,8 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
                             vv[i] = Int32(r + 1)
                             break
                         if Int(kk[i]) == c:
-                            dup[0] = 1
+                            if not semi:
+                                dup[0] = 1
                             break
                         i = Int(UInt64(i + 1) & msk)
 
