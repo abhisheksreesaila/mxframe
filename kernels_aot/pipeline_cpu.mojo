@@ -53,7 +53,7 @@ comptime VEC = 1024
 comptime MORSEL = 65536
 comptime MAX_REGS = 64
 comptime HDR = 16
-comptime BUDGET_BYTES = 768 * 1024 * 1024
+comptime BUDGET_BYTES = 128 * 1024 * 1024   # all workers' partials: each worker fills and merges its own
 comptime MERGE_GROUPS = 16384
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
@@ -291,6 +291,25 @@ def _in_set(d: FP, a: FP, bytes: BP, off: Int, length: Int, lo: Int, n: Int):
             if bytes[off + Int(x)] != 0:
                 hit = 1.0
         d[i] = hit
+
+
+comptime HUGE = 1 << 21
+
+
+def big_alloc(n: Int) -> Int:
+    """Address of n bytes that are written right after allocation, in parallel: 2 MiB-aligned and
+    marked for transparent huge pages above 2 MiB, so first-touch faults are 512x fewer (24 threads
+    faulting 4 KiB pages serialize on the kernel's mm lock: ~25 ms for 50 MB). Free with free_big."""
+    if n < HUGE:
+        return Int(unsafe_alloc[UInt8](max(n, 1), alignment=64))
+    var size = (n + HUGE - 1) // HUGE * HUGE
+    var b = unsafe_alloc[UInt8](size, alignment=HUGE)
+    _ = external_call["madvise", Int32](Int(b), size, Int32(14))     # MADV_HUGEPAGE
+    return Int(b)
+
+
+def free_big(a: Int):
+    Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=a).free()
 
 
 # ── per-run immutable state ────────────────────────────────────────────────
@@ -584,11 +603,14 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
     var morsels = (total + MORSEL - 1) // MORSEL
     nthreads = min(nthreads, morsels)
     if per_worker > 0:
+        # every worker initializes and merges a partial per group: with many groups, fewer workers
+        # (at most rows / groups of them) beat the extra passes over a large partial each
         nthreads = min(nthreads, max(1, BUDGET_BYTES // per_worker))
+        nthreads = min(nthreads, max(1, total // max(G, 1)))
     nthreads = max(nthreads, 1)
 
-    var pv_all = unsafe_alloc[Float64](nthreads * max(A * G * NL, 1))
-    var pc_all = unsafe_alloc[Int64](nthreads * max(G * NL, 1))
+    var pv_all = _fp(big_alloc(nthreads * max(A * G * NL, 1) * 8))
+    var pc_all = _lp(big_alloc(nthreads * max(G * NL, 1) * 8))
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
     var failed = unsafe_alloc[Int64](1)
@@ -660,8 +682,8 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
         for chunk in range(merge_chunks):
             merge(chunk)
 
-    pv_all.free()
-    pc_all.free()
+    free_big(Int(pv_all))
+    free_big(Int(pc_all))
     counter.free()
     var rc = -5 if Int(failed[0]) != 0 else 0
     failed.free()

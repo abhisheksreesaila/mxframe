@@ -56,7 +56,7 @@ from std.ffi import external_call
 
 from std.utils.numerics import nan
 
-from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
+from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, big_alloc, free_big, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -346,11 +346,46 @@ def _mix(h: UInt64) -> UInt64:
 
 @always_inline
 def _hash_bytes(a: Int, n: Int) -> UInt64:
-    var h = UInt64(0xCBF29CE484222325)          # FNV-1a, then mixed
+    """Hash of n bytes at a: 8 bytes per step (unaligned loads), the tail and the length last."""
+    var h = UInt64(0xCBF29CE484222325)
+    var k = 0
+    while k + 8 <= n:
+        h = _mix(h ^ UInt64(Int(_lp(a + k)[0])))
+        k += 8
+    var tail = UInt64(0)
     var p = _bp(a)
-    for i in range(n):
-        h = (h ^ UInt64(p[i])) * 0x100000001B3
-    return _mix(h ^ UInt64(n))
+    for i in range(k, n):
+        tail = (tail << 8) | UInt64(p[i])
+    return _mix(h ^ tail ^ (UInt64(n) << 56))
+
+
+@always_inline
+def _copy_bytes(dst: Int, src: Int, n: Int):
+    """n bytes from src to dst, 8 at a time (unaligned), never past dst + n."""
+    var k = 0
+    while k + 8 <= n:
+        _lp(dst + k)[0] = _lp(src + k)[0]
+        k += 8
+    var d = _bp(dst)
+    var s = _bp(src)
+    for i in range(k, n):
+        d[i] = s[i]
+
+
+@always_inline
+def _bytes_eq(a: Int, b: Int, n: Int) -> Bool:
+    """n bytes at a equal n bytes at b (8 at a time)."""
+    var k = 0
+    while k + 8 <= n:
+        if _lp(a + k)[0] != _lp(b + k)[0]:
+            return False
+        k += 8
+    var pa = _bp(a)
+    var pb = _bp(b)
+    for i in range(k, n):
+        if pa[i] != pb[i]:
+            return False
+    return True
 
 
 def _pow2_at_least(n: Int) -> Int:
@@ -419,7 +454,7 @@ def _build_global_dict(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, cap: 
                     ng += 1
                     break
                 var dg = _arr_dict(Int(arrays[Int(gchunk[e]) * stride_a + col]))
-                if _bytes_cmp(s0, l0, _dstart(dg, Int(gcode[e])), _dlen(dg, Int(gcode[e]))) == 0:
+                if l0 == _dlen(dg, Int(gcode[e])) and _bytes_eq(s0, _dstart(dg, Int(gcode[e])), l0):
                     break
                 pos = (pos + 1) & (tsize - 1)
             rm[code] = Int32(e)
@@ -433,7 +468,9 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
     occurrence); rowcode[i] = entry of row i. Returns the number of entries. In parallel: rows are
     hashed per 64k-row block, scattered to 64 partitions by the hash's top bits (row order kept),
     and each partition numbers its own strings; entries are partition-major (callers order string
-    keys by their bytes, never by entry number)."""
+    keys by their bytes, never by entry number). A per-block cache sends a row equal to an earlier
+    row of its block to that row's entry instead (few distinct strings would otherwise all land in
+    a few partitions)."""
     if n_rows == 0:
         return 0
     var nb = 0
@@ -451,12 +488,15 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
             k += 1
             r += MORSEL
     var nt = max(1, min(threads, nb))
-    var hs = unsafe_alloc[UInt64](n_rows)
+    var hs = Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=big_alloc(n_rows * 8))
+    var alias = _lp(big_alloc(n_rows * 8))               # -1, or an earlier equal row of the block
     var cnt = unsafe_alloc[Int64](max(nb, 1) * HP)
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
 
     def hash_rows(wid: Int) {imm}:
+        comptime CACHE = 4096
+        var cache = unsafe_alloc[Int64](CACHE)
         while True:
             var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             if b >= nb:
@@ -466,10 +506,22 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
             var c0 = Int(tbl[c * tstride])
             for p in range(HP):
                 cnt[b * HP + p] = 0
+            for t in range(CACHE):
+                cache[t] = -1
             for r in range(Int(items[3 * b + 1]), Int(items[3 * b + 2])):
-                var h = _hash_bytes(_dstart(arr, r), _dlen(arr, r))
+                var s0 = _dstart(arr, r)
+                var l0 = _dlen(arr, r)
+                var h = _hash_bytes(s0, l0)
                 hs[c0 + r] = h
-                cnt[b * HP + Int(h >> HP_SHIFT)] += 1
+                var slot = Int(h & UInt64(CACHE - 1))
+                var e = Int(cache[slot])               # an earlier row of this block (chunk-local)
+                if e >= 0 and hs[c0 + e] == h and _dlen(arr, e) == l0 and _bytes_eq(_dstart(arr, e), s0, l0):
+                    alias[c0 + r] = Int64(c0 + e)
+                else:
+                    cache[slot] = Int64(r)
+                    alias[c0 + r] = -1
+                    cnt[b * HP + Int(h >> HP_SHIFT)] += 1
+        cache.free()
 
     _par(hash_rows, nt)
     var poff = unsafe_alloc[Int64](HP + 1)
@@ -481,7 +533,7 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
             cnt[b * HP + p] = Int64(run)
             run += m
     poff[HP] = Int64(run)
-    var rows = unsafe_alloc[Int64](n_rows)               # chunk << 40 | chunk-local row
+    var rows = _lp(big_alloc(n_rows * 8))                # chunk << 40 | chunk-local row
     counter[0] = 0
 
     def scatter(wid: Int) {imm}:
@@ -495,6 +547,8 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
             for p in range(HP):
                 at[p] = cnt[b * HP + p]
             for r in range(Int(items[3 * b + 1]), Int(items[3 * b + 2])):
+                if Int(alias[c0 + r]) >= 0:
+                    continue
                 var p = Int(hs[c0 + r] >> HP_SHIFT)
                 rows[Int(at[p])] = Int64((c << 40) | r)
                 at[p] += 1
@@ -544,7 +598,7 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
                     var ec = Int(gchunk[lo + e])
                     var ag = Int(arrays[ec * stride_a + col])
                     var er = Int(gcode[lo + e])
-                    if hs[Int(tbl[ec * tstride]) + er] == h and _bytes_cmp(s0, l0, _dstart(ag, er), _dlen(ag, er)) == 0:
+                    if hs[Int(tbl[ec * tstride]) + er] == h and l0 == _dlen(ag, er) and _bytes_eq(s0, _dstart(ag, er), l0):
                         break
                     pos = (pos + 1) & (cap - 1)
                 rowcode[g] = Int32(e)
@@ -571,15 +625,20 @@ def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: 
             var c0 = Int(tbl[Int(items[3 * b]) * tstride])
             for r in range(Int(items[3 * b + 1]), Int(items[3 * b + 2])):
                 var g = c0 + r
-                rowcode[g] = rowcode[g] + Int32(Int(base[Int(hs[g] >> HP_SHIFT)]))
+                var e = Int(alias[g])
+                if e >= 0:
+                    rowcode[g] = rowcode[e]            # earlier in this block: already final
+                else:
+                    rowcode[g] = rowcode[g] + Int32(Int(base[Int(hs[g] >> HP_SHIFT)]))
 
     _par(rebase, nt)
     items.free()
-    hs.free()
+    free_big(Int(hs))
+    free_big(Int(alias))
     cnt.free()
     counter.free()
     poff.free()
-    rows.free()
+    free_big(Int(rows))
     pent.free()
     base.free()
     return ng
@@ -822,9 +881,9 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             K.base[k] = 0
             K.card[k] = Int64(max(ng, 1))
         elif kind == K_STR:
-            var gch = unsafe_alloc[Int64](max(n_rows, 1))
-            var gco = unsafe_alloc[Int64](max(n_rows, 1))
-            var rcode = unsafe_alloc[Int32](max(n_rows, 1))
+            var gch = _lp(big_alloc(max(n_rows, 1) * 8))
+            var gco = _lp(big_alloc(max(n_rows, 1) * 8))
+            var rcode = _ip(big_alloc(max(n_rows, 1) * 4))
             K.gchunk[k] = Int64(Int(gch))
             K.gcode[k] = Int64(Int(gco))
             K.rowcode[k] = Int64(Int(rcode))
@@ -1149,9 +1208,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 var d = _entry_src(kind, arrays, stride_a, n_cols + k, Int(gch[e]))
                 var src = _bp(_dstart(d, Int(gco[e])))
                 var ln = _dlen(d, Int(gco[e]))
-                for b in range(ln):
-                    dst[p] = src[b]
-                    p += 1
+                _copy_bytes(Int(dst) + p, Int(src), ln)
+                p += ln
                 offs[i + 1] = Int32(p)
             O[3 + 2 * k] = Int64(Int(offs))
             O[4 + 2 * k] = Int64(Int(dst))
@@ -2250,8 +2308,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                             _out_str(kd, arr, lo + Int(kr[t]) - c0, st, ln)
                             offs[rr] = Int32(bp)
                             var sp = _bp(st)
-                            for b in range(ln):
-                                data[bp + b] = sp[b]
+                            _copy_bytes(Int(data) + bp, Int(sp), ln)
                             bp += ln
                             rr += 1
                         mbytes[m * n_tot + j] = Int64(bp)      # next chunk of this morsel continues here
@@ -2297,8 +2354,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                             _out_str(kd, arr, Int(rows[i * n_look + j]), st, ln)
                             offs[r0 + i] = Int32(bp)
                             var sp = _bp(st)
-                            for b in range(ln):
-                                data[bp + b] = sp[b]
+                            _copy_bytes(Int(data) + bp, Int(sp), ln)
                             bp += ln
 
     if nt > 1:
@@ -2526,8 +2582,7 @@ def mx_gather(plan_a: Int, out_a: Int) abi("C") -> Int:
                         _out_str(kd, Int(arrays[c * n_out + j]), r - Int(starts[c]), st, ln)
                         offs[i] = Int32(bp)
                         var sp = _bp(st)
-                        for b in range(ln):
-                            data[bp + b] = sp[b]
+                        _copy_bytes(Int(data) + bp, Int(sp), ln)
                         bp += ln
 
     if nt > 1:
@@ -2577,7 +2632,7 @@ def _dval_hash(kind: Int, arr: Int, i: Int) -> UInt64:
 def _dval_eq(kind: Int, arr: Int, i: Int, j: Int) -> Bool:
     if kind == 2:
         var li = _dlen(arr, i)
-        return li == _dlen(arr, j) and _bytes_cmp(_dstart(arr, i), li, _dstart(arr, j), li) == 0
+        return li == _dlen(arr, j) and _bytes_eq(_dstart(arr, i), _dstart(arr, j), li)
     var w = 4 if kind == 0 else 8
     return _ival(arr, w, i) == _ival(arr, w, j)
 
@@ -2600,9 +2655,9 @@ def mx_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
             return E_BAD_PLAN
     var nb = max(1, min(threads * 4, (n + 65535) // 65536))
     var nt = max(1, min(threads, nb))
-    var hs = unsafe_alloc[UInt64](max(n, 1))
+    var hs = Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=big_alloc(max(n, 1) * 8))
     var cnt = unsafe_alloc[Int64](nb * HP)
-    var keep = unsafe_alloc[UInt8](max(n, 1))     # 2: candidate (no equal row earlier in its block)
+    var keep = _bp(big_alloc(max(n, 1)))     # 2: candidate (no equal row earlier in its block)
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
 
@@ -2653,7 +2708,7 @@ def mx_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
             cnt[b * HP + p] = Int64(run)
             run += k
     poff[HP] = Int64(run)
-    var rows = unsafe_alloc[Int64](max(n, 1))
+    var rows = _lp(big_alloc(max(n, 1) * 8))
     counter[0] = 0
 
     def scatter(wid: Int) {imm}:
@@ -2752,11 +2807,11 @@ def mx_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
     _par(write, nt)
     O[0] = Int64(tot)
     O[1] = Int64(Int(arena))
-    hs.free()
+    free_big(Int(hs))
     cnt.free()
     counter.free()
     poff.free()
-    rows.free()
-    keep.free()
+    free_big(Int(rows))
+    free_big(Int(keep))
     bk.free()
     return 0
