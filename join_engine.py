@@ -123,12 +123,51 @@ def _select(table: pa.Table, needed: Optional[Set[str]]) -> pa.Table:
     return table if len(names) == table.num_columns else table.select(names)
 
 
-def leaf_table(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
-    """``plan`` evaluated to a table holding (at least) the ``needed`` columns."""
+def _scan_under_filters(plan):
+    """(Scan, predicates) when ``plan`` is Filter*(Scan), else (None, [])."""
+    preds, node = [], plan
+    while isinstance(node, Filter):
+        preds.append(node.predicate)
+        node = node.input
+    return (node, preds) if isinstance(node, Scan) else (None, [])
+
+
+def _decode_deferred(table: pa.Table, cols) -> pa.Table:
+    """Decode the dictionary columns io_parquet.resolve_plan left encoded until after the leaf's
+    filter (so only surviving rows are decoded)."""
+    from .arrow_dict import decode
+    for i, (n, t) in enumerate(zip(table.column_names, table.schema.types)):
+        if n in cols and pa.types.is_dictionary(t):
+            table = table.set_column(i, n, decode(table.column(n)))
+    return table
+
+
+def leaf_table(comp, plan, needed: Optional[Set[str]], keep: Optional[Set[str]] = None) -> pa.Table:
+    """``plan`` evaluated to a table holding (at least) the ``needed`` columns.
+
+    A Filter*(Scan) leaf runs as one native call when the executor can (F-032: predicate per morsel
+    in Mojo, only the surviving rows of the needed columns written, dictionary strings decoded on
+    the way out). Otherwise the predicates are evaluated here, then the dictionary columns
+    resolve_plan deferred are decoded on the surviving rows, except those in ``keep``: the caller
+    decodes them itself, after the join has gathered only the joined rows."""
+    scan, preds = _scan_under_filters(plan)
+    if scan is not None:
+        if preds:
+            from . import native_exec
+            out = native_exec.try_filter(comp, scan.table, preds, needed)
+            if out is not None:
+                return out
+        later = set(getattr(scan, "_mx_decode_after", None) or ()) - set(keep or ())
+        out = _leaf_table_py(comp, plan, needed)
+        return _decode_deferred(out, later) if later else out
+    return _leaf_table_py(comp, plan, needed)
+
+
+def _leaf_table_py(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
     if isinstance(plan, Scan):
         return _select(plan.table, needed)
     if isinstance(plan, Filter):
-        inner = leaf_table(comp, plan.input, _union(needed, _cols(plan.predicate)))
+        inner = _leaf_table_py(comp, plan.input, _union(needed, _cols(plan.predicate)))
         mask = comp._eval_predicate(plan.predicate, inner)
         return _select(inner, needed).filter(mask)      # the mask is done: drop the predicate-only columns first
     if isinstance(plan, Join):
@@ -531,11 +570,17 @@ def _dictionary_gather(col, idx: np.ndarray):
     return pa.DictionaryArray.from_arrays(_npa(codes), enc.dictionary)
 
 
-def _gather_table(comp, table: pa.Table, idx: np.ndarray) -> pa.Table:
+def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = False) -> pa.Table:
+    """``table`` rows ``idx``. On the CPU one native call (F-032) gathers every column; dictionary
+    columns only when ``decode_dicts`` (they come back decoded). Else Arrow ``take``."""
     if table.num_columns == 0:
         return table
     if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
         return comp._aot_gpu.gather_table(table, idx)
+    from . import native_exec
+    out = native_exec.try_gather(comp, table, idx, decode_dicts)
+    if out is not None:
+        return out
     return _take_rows(table, idx)
 
 
@@ -760,7 +805,19 @@ def _execute_inner(comp, node, needed, dict_ok=False):
     for _, cm in fl.residuals:
         for leaf, c in cm.values():
             leaf_need[leaf].add(c)
-    tables = [leaf_table(comp, fl.leaves[i], leaf_need[i]) for i in range(n_leaves)]
+    # dictionary columns resolve_plan deferred (decoded only because the plan has a join): decoded
+    # after the final gather, on the joined rows only, unless they are join keys or residual inputs
+    later: List[Set[str]] = []
+    for i in range(n_leaves):
+        sc, _ = _scan_under_filters(fl.leaves[i])
+        later.append(set(getattr(sc, "_mx_decode_after", None) or ()) if sc is not None else set())
+    for a, b, ac, bc in fl.edges:
+        later[a] -= set(ac)
+        later[b] -= set(bc)
+    for _, cm in fl.residuals:
+        for leaf, c in cm.values():
+            later[leaf].discard(c)
+    tables = [leaf_table(comp, fl.leaves[i], leaf_need[i], keep=later[i]) for i in range(n_leaves)]
     rows = [t.num_rows for t in tables]
     base = [_base_rows(fl.leaves[i], rows[i]) for i in range(n_leaves)]
 
@@ -826,8 +883,16 @@ def _execute_inner(comp, node, needed, dict_ok=False):
                         got[c] = d
                 rest = [c for c in names_c if c not in got]
             if rest:
-                taken = _gather_table(comp, sub.select(rest), idx[leaf])
+                # deferred dictionary columns are decoded right after anyway: let the gather do it
+                deferred_only = all(c in later[leaf] for c in rest
+                                    if pa.types.is_dictionary(sub.schema.field(c).type))
+                taken = _gather_table(comp, sub.select(rest), idx[leaf], decode_dicts=deferred_only)
                 got.update({c: taken.column(c) for c in rest})
+        if later[leaf]:
+            from .arrow_dict import decode
+            for c in names_c:
+                if c in later[leaf] and pa.types.is_dictionary(got[c].type):
+                    got[c] = decode(got[c])
         for n, c in cols:
             arrays[n] = got[c]
     if _TRACE:

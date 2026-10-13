@@ -647,6 +647,26 @@ def _renamed_ref(name: str, refs) -> bool:
     return any(r.startswith(stem) and (len(r) == len(stem) or r[len(stem):].isdigit()) for r in refs)
 
 
+def _join_leaf_filters(plan: LogicalPlan) -> dict:
+    """id(leaf) -> columns read by its Filter chain, for every leaf that is a Filter*(Scan) input
+    of a Join (the join engine's leaf_table handles exactly these). Other leaves are absent."""
+    out: dict = {}
+
+    def walk(node, above, under_join):
+        if isinstance(node, (Scan, ParquetScan)):
+            if under_join:
+                out[id(node)] = out.get(id(node), set()) | above
+        elif isinstance(node, Filter):
+            walk(node.input, above | set(_expr_cols(node.predicate)), under_join)
+        elif isinstance(node, Join):
+            walk(node.left, set(), True)
+            walk(node.right, set(), True)
+        elif hasattr(node, "input"):
+            walk(node.input, set(), False)
+    walk(plan, set(), False)
+    return out
+
+
 def _leaves(plan: LogicalPlan):
     if isinstance(plan, (Scan, ParquetScan)):
         yield plan
@@ -754,6 +774,26 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         return (name in info.refs and name not in info.bad
                 and not info.has_join and not info.passthrough.get(id(leaf), True))
 
+    leaf_preds = _join_leaf_filters(plan) if info.has_join else {}
+
+    def deferrable(name: str, leaf) -> bool:
+        """Under a join, leave a dictionary column encoded: the join engine decodes it after the
+        leaf's filter, or after the final gather (joined rows only), so every consumer above the
+        join still sees plain strings (F-032). A use the Python path can't take on dictionaries
+        ("bad": CASE WHEN, arithmetic, ...) only matters in the leaf's own filter, where the
+        column is decoded first as before."""
+        if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
+            return False
+        if id(leaf) not in leaf_preds:              # not a Filter*(Scan) input of a join
+            return False
+        return name not in info.bad or name not in leaf_preds[id(leaf)]
+
+    def _scan(table, defer):
+        s = Scan(table)
+        if defer:
+            s._mx_decode_after = frozenset(defer)
+        return s
+
     def resolve_leaf(leaf: ParquetScan, pushed: tuple):
         names = leaf.schema.names
         if info.passthrough.get(id(leaf), True):
@@ -764,7 +804,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
             return dataclasses.replace(leaf, columns=tuple(cols), filters=pushed or None)
         candidates = dictionary_columns(leaf.path, leaf.schema, leaf.dictionary,
                                         leaf.max_dictionary_bytes, cols)
-        dict_cols = [n for n in candidates if keepable(n, leaf)]
+        dict_cols = [n for n in candidates if keepable(n, leaf) or deferrable(n, leaf)]
         mask_dict = [n for n in candidates if n not in dict_cols]
         import pyarrow.parquet as pq
         if os.path.isfile(leaf.path):
@@ -773,13 +813,18 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
             table = pq.read_table(leaf.path, columns=cols,
                                   filters=_filters_expression(pushed) if pushed else None,
                                   read_dictionary=dict_cols or None)
-        return Scan(_decode_unkept(table, leaf))
+        table, defer = _decode_unkept(table, leaf)
+        return _scan(table, defer)
 
     def _decode_unkept(table, leaf):
+        defer = []
         for i, (n, t) in enumerate(zip(table.column_names, table.schema.types)):
             if _is_dict(t) and not keepable(n, leaf):
-                table = table.set_column(i, n, _decode_dict(table.column(n)))
-        return table
+                if deferrable(n, leaf):
+                    defer.append(n)
+                else:
+                    table = table.set_column(i, n, _decode_dict(table.column(n)))
+        return table, defer
 
     def resolve_scan(leaf: Scan):
         table = leaf.table
@@ -787,10 +832,13 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
                 if _is_dict(t) and not keepable(n, leaf)]
         if not drop:
             return leaf
+        defer = [n for n in drop if deferrable(n, leaf)]
         for n in drop:
+            if n in defer:
+                continue
             i = table.schema.get_field_index(n)
             table = table.set_column(i, n, _decode_dict(table.column(n)))
-        return Scan(table)
+        return _scan(table, defer)
 
     def rebuild(node):
         if isinstance(node, ParquetScan):

@@ -56,7 +56,7 @@ from std.ffi import external_call
 
 from std.utils.numerics import nan
 
-from pipeline_cpu import mx_pipeline_cpu
+from pipeline_cpu import mx_pipeline_cpu, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -84,6 +84,7 @@ comptime E_PIPELINE = -12
 comptime E_DICT_TOO_BIG = -13
 comptime E_OUTPUT_TOO_BIG = -14   # string keys past int32 offsets
 comptime E_NAN_SORT = -15         # NaN among ORDER BY values
+comptime E_INEXACT = -16          # an int64 value column holds values past 2^53 (the interpreter is float64)
 comptime FUSE_GROUPS = 4096   # up to this many groups: keys encoded and aggregated per morsel
 comptime HDR = 16
 comptime OP_AGG_SUM = 50
@@ -240,6 +241,58 @@ def _bytes_cmp(a: Int, la: Int, b: Int, lb: Int) -> Int:
 def _same_dict(d1: Int, d2: Int) -> Bool:
     return (_arr_len(d1) == _arr_len(d2) and _arr_off(d1) == _arr_off(d2)
             and _arr_buf(d1, 1) == _arr_buf(d2, 1) and _arr_buf(d1, 2) == _arr_buf(d2, 2))
+
+
+def _i64_cols_exact(arrays: LP, stride_a: Int, n_chunks: Int, n_cols: Int, dtypes: IP) -> Bool:
+    """The bytecode interpreter computes in float64: an int64 value column is exact only within
+    +-2^53. False when any value of any int64 value column lies outside (the caller declines).
+    One parallel pass over 64k-row pieces of every int64 value column."""
+    var n_items = 0
+    for j in range(n_cols):
+        if (Int(dtypes[j]) & 255) == 1:
+            for c in range(n_chunks):
+                n_items += (_arr_len(Int(arrays[c * stride_a + j])) + MORSEL - 1) // MORSEL
+    if n_items == 0:
+        return True
+    var items = unsafe_alloc[Int64](n_items * 3)       # (address of the values, lo, hi)
+    var k = 0
+    for j in range(n_cols):
+        if (Int(dtypes[j]) & 255) == 1:
+            for c in range(n_chunks):
+                var arr = Int(arrays[c * stride_a + j])
+                var base = _arr_buf(arr, 1) + _arr_off(arr) * 8
+                var n = _arr_len(arr)
+                var lo = 0
+                while lo < n:
+                    items[3 * k] = Int64(base)
+                    items[3 * k + 1] = Int64(lo)
+                    items[3 * k + 2] = Int64(min(lo + MORSEL, n))
+                    k += 1
+                    lo += MORSEL
+    var bad = unsafe_alloc[Int64](1)
+    bad[0] = 0
+
+    def check(i: Int) {imm}:
+        comptime LIM = Int64(1) << 53
+        var src = _lp(Int(items[3 * i]))
+        var lo = Int64.MAX
+        var hi = Int64.MIN
+        for r in range(Int(items[3 * i + 1]), Int(items[3 * i + 2])):
+            var v = src[r]
+            lo = min(lo, v)
+            hi = max(hi, v)
+        if hi > LIM or lo < -LIM:
+            bad[0] = 1
+
+    if n_items > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(check, n_items)
+    else:
+        check(0)
+    var ok = Int(bad[0]) == 0
+    items.free()
+    bad.free()
+    return ok
 
 
 @always_inline
@@ -515,6 +568,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var stride_a = n_cols + n_keys
     if n_chunks < 1:
         return E_BAD_PLAN
+    if not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+        return E_INEXACT
 
     # ── 1. chunk table for the interpreter: row_start, row_end, per column base address ──────
     var tstride = 2 + n_cols + n_dcols
@@ -1273,3 +1328,522 @@ def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP
         dst[Int(src[t])] = sign * Float64(r)
     perm.free()
     tmp.free()
+# ── M2: native leaf filter ─────────────────────────────────────────────────────────────────
+#
+# Filter*(Scan) leaves under a join: the predicate runs on the bytecode interpreter per morsel (in
+# parallel), and the surviving rows of the needed columns are written into one arena. Dictionary
+# string columns are read as codes (predicates: dtype 5) and written out decoded, so only the rows
+# that survive are ever decoded.
+#
+# Plan (int64 words):
+#   0 magic 0x4d584631 ("MXF1")   1 version (1)   2 n_chunks   3 n_cols (bytecode value columns)
+#   4 n_out (output columns)   5 code*   6 consts*   7 set_bytes*   8 set_meta*   9 dtypes* (int32)
+#  10 arrays* : int64[n_chunks][n_cols + n_out] = ArrowArray*
+#  11 out_kinds* : int64[n_out]  0 fixed width, 1 utf8 (int32 offsets), 2 dictionary<int32, utf8>
+#                                (written as utf8)
+#  12 out_size* : int64[n_out]  bytes per value of fixed-width columns
+#  13 threads   14 n_dcols   15 doffs* : int64[n_chunks][n_dcols]
+# Result: 0 n_rows   1 arena*   then per output column (A, B): fixed (values*, 0); strings
+#         (int32 offsets[n+1]*, bytes*)
+
+comptime FMAGIC = 0x4D584631
+comptime HUGE = 1 << 21
+
+
+def _big_alloc(n: Int) -> BP:
+    """A buffer written once, in parallel, right after allocation: 2 MiB-aligned and marked for
+    transparent huge pages above 2 MiB, so first-touch faults are 512x fewer (24 threads faulting
+    4 KiB pages serialize on the kernel's mm lock: ~25 ms for 50 MB at SF1)."""
+    if n < HUGE:
+        return unsafe_alloc[UInt8](n, alignment=64)
+    var size = (n + HUGE - 1) // HUGE * HUGE
+    var b = unsafe_alloc[UInt8](size, alignment=HUGE)
+    _ = external_call["madvise", Int32](Int(b), size, Int32(14))     # MADV_HUGEPAGE
+    return b
+comptime OK_FIXED = 0
+comptime OK_UTF8 = 1
+comptime OK_DICT = 2
+
+
+@always_inline
+def _out_str(kind: Int, arr: Int, local: Int, mut start: Int, mut ln: Int):
+    """Bytes of row `local` of a string output column (utf8, or a dictionary entry)."""
+    if kind == OK_DICT:
+        var code = Int(_ip(_arr_buf(arr, 1))[_arr_off(arr) + local])
+        var d = _arr_dict(arr)
+        start = _dstart(d, code)
+        ln = _dlen(d, code)
+    else:
+        start = _dstart(arr, local)
+        ln = _dlen(arr, local)
+
+
+@export
+def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != FMAGIC or Int(P[1]) != 1:
+        return E_BAD_PLAN
+    var n_chunks = Int(P[2])
+    var n_cols = Int(P[3])
+    var n_out = Int(P[4])
+    var code = _ip(Int(P[5]))
+    var dtypes = _ip(Int(P[9]))
+    var arrays = _lp(Int(P[10]))
+    var kinds = _lp(Int(P[11]))
+    var sizes = _lp(Int(P[12]))
+    var threads = max(1, Int(P[13]))
+    var n_dcols = Int(P[14])
+    var doffs = _lp(Int(P[15]))
+    var O = _lp(out_a)
+    var stride_a = n_cols + n_out
+    if n_chunks < 1 or Int(code[0]) != 0x4D585031:
+        return E_BAD_PLAN
+    if not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+        return E_INEXACT
+
+    # chunk table: row_start, row_end, per value column its base address, then dictionary offsets
+    var tstride = 2 + n_cols + n_dcols
+    var tbl = unsafe_alloc[Int64](n_chunks * tstride)
+    var row = 0
+    for c in range(n_chunks):
+        var first = Int(arrays[c * stride_a])
+        var n = _arr_len(first)
+        tbl[c * tstride] = Int64(row)
+        tbl[c * tstride + 1] = Int64(row + n)
+        for j in range(n_cols):
+            var arr = Int(arrays[c * stride_a + j])
+            var isz = _itemsize(Int(dtypes[j]) & 255)
+            tbl[c * tstride + 2 + j] = Int64(_arr_buf(arr, 1) + (_arr_off(arr) - row) * isz)
+        for i in range(n_dcols):
+            tbl[c * tstride + 2 + n_cols + i] = doffs[c * n_dcols + i]
+        row += n
+    var n_rows = row
+    var no_gids = unsafe_alloc[Int32](1)          # no group ids (Mojo has no null pointer)
+    var p = Prog(code, FP(unsafe_from_address=Int(P[6])), _bp(Int(P[7])), _lp(Int(P[8])), tbl,
+                 n_chunks, dtypes, no_gids, 1, False)
+    if p.n_regs > MAX_REGS:
+        no_gids.free()
+        tbl.free()
+        return E_PIPELINE
+
+    var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
+    var nt = max(1, min(threads, morsels))
+    var mask = _big_alloc(max(n_rows, 1))
+    var mcnt = unsafe_alloc[Int64](morsels)                    # surviving rows per morsel
+    var mbytes = unsafe_alloc[Int64](morsels * max(n_out, 1))  # string bytes per morsel per column
+    for i in range(morsels * max(n_out, 1)):
+        mbytes[i] = 0
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    # ── pass 1: predicate -> mask, counts and string bytes per morsel ───────────────────────
+    def pass1(wid: Int) {imm}:
+        var regs = unsafe_alloc[Float64](max(p.n_regs, 1) * VEC)
+        var sel = unsafe_alloc[Int32](VEC)
+        _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)     # constants, once
+        while True:
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            var lo = m * MORSEL
+            if lo >= n_rows:
+                break
+            var hi = min(lo + MORSEL, n_rows)
+            var pos = lo
+            var kept = 0
+            while pos < hi:
+                var k = _find_chunk(p, pos)
+                var rowp = p.tbl + k * p.tbl_stride
+                var cols = rowp + 2
+                var stop = min(hi, Int(rowp[1]))
+                var c0 = Int(rowp[0])
+                var i0 = pos
+                while i0 < stop:
+                    var n = min(VEC, stop - i0)
+                    if p.pred_reg >= 0:
+                        _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                        var pr = regs + p.pred_reg * VEC
+                        for i in range(n):
+                            mask[i0 + i] = 1 if pr[i] != 0.0 else 0
+                    else:
+                        for i in range(n):
+                            mask[i0 + i] = 1
+                    for i in range(n):
+                        if mask[i0 + i] != 0:
+                            kept += 1
+                            for j in range(n_out):
+                                var kd = Int(kinds[j])
+                                if kd != OK_FIXED:
+                                    var st = 0
+                                    var ln = 0
+                                    _out_str(kd, Int(arrays[k * stride_a + n_cols + j]), i0 + i - c0, st, ln)
+                                    mbytes[m * n_out + j] += Int64(ln)
+                    i0 += n
+                pos = stop
+            mcnt[m] = Int64(kept)
+        regs.free()
+        sel.free()
+
+    if nt > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(pass1, nt)
+    else:
+        pass1(0)
+
+    # ── prefix sums: each morsel's first output row and first string byte ──────────────────
+    var mrow = unsafe_alloc[Int64](morsels)
+    var total = 0
+    for m in range(morsels):
+        mrow[m] = Int64(total)
+        total += Int(mcnt[m])
+    var n_sel = total
+    var col_bytes = unsafe_alloc[Int64](max(n_out, 1))
+    for j in range(n_out):
+        var b = 0
+        for m in range(morsels):
+            var x = Int(mbytes[m * n_out + j])
+            mbytes[m * n_out + j] = Int64(b)
+            b += x
+        col_bytes[j] = Int64(b)
+        if Int(kinds[j]) != OK_FIXED and b > 2147483647:
+            mask.free()
+            mcnt.free()
+            mbytes.free()
+            counter.free()
+            mrow.free()
+            col_bytes.free()
+            no_gids.free()
+            tbl.free()
+            return E_OUTPUT_TOO_BIG
+
+    # ── arena ────────────────────────────────────────────────────────────────────────────
+    var asize = 0
+    for j in range(n_out):
+        if Int(kinds[j]) == OK_FIXED:
+            asize += _align8(n_sel * Int(sizes[j]))
+        else:
+            asize += _align8((n_sel + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
+    var arena = _big_alloc(max(asize, 8))
+    var dst_a = unsafe_alloc[Int64](max(n_out, 1))    # values / offsets
+    var dst_b = unsafe_alloc[Int64](max(n_out, 1))    # string bytes
+    var at = Int(arena)
+    for j in range(n_out):
+        if Int(kinds[j]) == OK_FIXED:
+            dst_a[j] = Int64(at)
+            dst_b[j] = 0
+            at += _align8(n_sel * Int(sizes[j]))
+        else:
+            dst_a[j] = Int64(at)
+            at += _align8((n_sel + 1) * 4)
+            dst_b[j] = Int64(at)
+            at += _align8(max(Int(col_bytes[j]), 1))
+            _ip(Int(dst_a[j]))[n_sel] = Int32(Int(col_bytes[j]))
+
+    # ── pass 2: write the surviving rows ─────────────────────────────────────────────────
+    counter[0] = 0
+
+    def pass2(wid: Int) {imm}:
+        while True:
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            var lo = m * MORSEL
+            if lo >= n_rows:
+                break
+            var hi = min(lo + MORSEL, n_rows)
+            var r = Int(mrow[m])
+            var pos = lo
+            while pos < hi:
+                var k = _find_chunk(p, pos)
+                var rowp = p.tbl + k * p.tbl_stride
+                var stop = min(hi, Int(rowp[1]))
+                var c0 = Int(rowp[0])
+                for j in range(n_out):
+                    var arr = Int(arrays[k * stride_a + n_cols + j])
+                    var kd = Int(kinds[j])
+                    var rr = r
+                    if kd == OK_FIXED:
+                        var sz = Int(sizes[j])
+                        var base = _arr_buf(arr, 1) + _arr_off(arr) * sz
+                        if sz == 8 or sz == 16:             # int64 / float64 / dates64 / decimal128
+                            var w = sz // 8
+                            var src = _lp(base)
+                            var dst = _lp(Int(dst_a[j]))
+                            for i in range(pos, stop):
+                                if mask[i] != 0:
+                                    for b in range(w):
+                                        dst[rr * w + b] = src[(i - c0) * w + b]
+                                    rr += 1
+                        elif sz == 4:                         # int32 / float32 / date32
+                            var src = _ip(base)
+                            var dst = _ip(Int(dst_a[j]))
+                            for i in range(pos, stop):
+                                if mask[i] != 0:
+                                    dst[rr] = src[i - c0]
+                                    rr += 1
+                        else:
+                            var src = _bp(base)
+                            var dst = _bp(Int(dst_a[j]))
+                            for i in range(pos, stop):
+                                if mask[i] != 0:
+                                    var s0 = (i - c0) * sz
+                                    var d0 = rr * sz
+                                    for b in range(sz):
+                                        dst[d0 + b] = src[s0 + b]
+                                    rr += 1
+                    else:
+                        var offs = _ip(Int(dst_a[j]))
+                        var data = _bp(Int(dst_b[j]))
+                        var bp = Int(mbytes[m * n_out + j])
+                        # rows of this morsel before `pos` (earlier chunks) already advanced bp:
+                        # recompute it from the rows written so far in this morsel
+                        for i in range(pos, stop):
+                            if mask[i] != 0:
+                                var st = 0
+                                var ln = 0
+                                _out_str(kd, arr, i - c0, st, ln)
+                                offs[rr] = Int32(bp)
+                                var sp = _bp(st)
+                                for b in range(ln):
+                                    data[bp + b] = sp[b]
+                                bp += ln
+                                rr += 1
+                        mbytes[m * n_out + j] = Int64(bp)      # next chunk of this morsel continues here
+                var adv = 0
+                for i in range(pos, stop):
+                    adv += Int(mask[i])
+                r += adv
+                pos = stop
+
+    if nt > 1:
+        parallelize(pass2, nt)
+    else:
+        pass2(0)
+
+    O[0] = Int64(n_sel)
+    O[1] = Int64(Int(arena))
+    for j in range(n_out):
+        O[2 + 2 * j] = dst_a[j]
+        O[3 + 2 * j] = dst_b[j]
+    mask.free()
+    mcnt.free()
+    mbytes.free()
+    counter.free()
+    mrow.free()
+    col_bytes.free()
+    dst_a.free()
+    dst_b.free()
+    no_gids.free()
+    tbl.free()
+    return 0
+
+
+# ── M2: native gather (a join's output rows) ──────────────────────────────────────────────
+#
+# Plan (int64 words):
+#   0 magic 0x4d584731 ("MXG1")   1 version (1)   2 n_chunks   3 n_out
+#   4 arrays* : int64[n_chunks][n_out] = ArrowArray*
+#   5 out_kinds* (as mx_filter: 0 fixed, 1 utf8, 2 dictionary written as utf8)   6 out_size*
+#   7 idx* (row numbers of the table, in output order)   8 n_idx   9 idx width (4 or 8)   10 threads
+# Result: 0 n_idx   1 arena*   then per column (A, B) as mx_filter.
+
+comptime GMAGIC = 0x4D584731
+comptime E_BAD_INDEX = -17
+
+
+@always_inline
+def _row_at(idx: Int, width: Int, i: Int) -> Int:
+    if width == 4:
+        return Int(_ip(idx)[i])
+    return Int(_lp(idx)[i])
+
+
+@always_inline
+def _chunk_of(starts: LP, n_chunks: Int, r: Int) -> Int:
+    var lo = 0
+    var hi = n_chunks - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if Int(starts[mid]) <= r:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+@export
+def mx_gather(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != GMAGIC or Int(P[1]) != 1:
+        return E_BAD_PLAN
+    var n_chunks = Int(P[2])
+    var n_out = Int(P[3])
+    var arrays = _lp(Int(P[4]))
+    var kinds = _lp(Int(P[5]))
+    var sizes = _lp(Int(P[6]))
+    var idx = Int(P[7])
+    var n = Int(P[8])
+    var width = Int(P[9])
+    var threads = max(1, Int(P[10]))
+    var O = _lp(out_a)
+    if n_chunks < 1 or n_out < 1 or (width != 4 and width != 8):
+        return E_BAD_PLAN
+    var starts = unsafe_alloc[Int64](n_chunks + 1)
+    var total_rows = 0
+    for c in range(n_chunks):
+        starts[c] = Int64(total_rows)
+        total_rows += _arr_len(Int(arrays[c * n_out]))
+    starts[n_chunks] = Int64(total_rows)
+    for i in range(n):                       # every row number inside the table
+        var r = _row_at(idx, width, i)
+        if r < 0 or r >= total_rows:
+            starts.free()
+            return E_BAD_INDEX
+
+    var morsels = max((n + MORSEL - 1) // MORSEL, 1)
+    var nt = max(1, min(threads, morsels))
+    var mbytes = unsafe_alloc[Int64](morsels * n_out)
+    for i in range(morsels * n_out):
+        mbytes[i] = 0
+    var any_str = False
+    for j in range(n_out):
+        any_str = any_str or Int(kinds[j]) != OK_FIXED
+    var counter = unsafe_alloc[Int64](1)
+
+    # ── pass 1: string bytes per morsel ────────────────────────────────────────────────────
+    if any_str:
+        counter[0] = 0
+
+        def gpass1(wid: Int) {imm}:
+            while True:
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                var lo = m * MORSEL
+                if lo >= n:
+                    break
+                var hi = min(lo + MORSEL, n)
+                for j in range(n_out):
+                    var kd = Int(kinds[j])
+                    if kd == OK_FIXED:
+                        continue
+                    var b = 0
+                    for i in range(lo, hi):
+                        var r = _row_at(idx, width, i)
+                        var c = _chunk_of(starts, n_chunks, r)
+                        var st = 0
+                        var ln = 0
+                        _out_str(kd, Int(arrays[c * n_out + j]), r - Int(starts[c]), st, ln)
+                        b += ln
+                    mbytes[m * n_out + j] = Int64(b)
+
+        if nt > 1:
+            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+            parallelize(gpass1, nt)
+        else:
+            gpass1(0)
+
+    var col_bytes = unsafe_alloc[Int64](n_out)
+    for j in range(n_out):
+        var b = 0
+        for m in range(morsels):
+            var x = Int(mbytes[m * n_out + j])
+            mbytes[m * n_out + j] = Int64(b)
+            b += x
+        col_bytes[j] = Int64(b)
+        if Int(kinds[j]) != OK_FIXED and b > 2147483647:
+            starts.free()
+            mbytes.free()
+            counter.free()
+            col_bytes.free()
+            return E_OUTPUT_TOO_BIG
+
+    var asize = 0
+    for j in range(n_out):
+        if Int(kinds[j]) == OK_FIXED:
+            asize += _align8(n * Int(sizes[j]))
+        else:
+            asize += _align8((n + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
+    var arena = _big_alloc(max(asize, 8))
+    var dst_a = unsafe_alloc[Int64](n_out)
+    var dst_b = unsafe_alloc[Int64](n_out)
+    var at = Int(arena)
+    for j in range(n_out):
+        dst_a[j] = Int64(at)
+        if Int(kinds[j]) == OK_FIXED:
+            dst_b[j] = 0
+            at += _align8(n * Int(sizes[j]))
+        else:
+            at += _align8((n + 1) * 4)
+            dst_b[j] = Int64(at)
+            at += _align8(max(Int(col_bytes[j]), 1))
+            _ip(Int(dst_a[j]))[n] = Int32(Int(col_bytes[j]))
+
+    # ── pass 2: write ──────────────────────────────────────────────────────────────────────
+    counter[0] = 0
+
+    def gpass2(wid: Int) {imm}:
+        while True:
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            var lo = m * MORSEL
+            if lo >= n:
+                break
+            var hi = min(lo + MORSEL, n)
+            for j in range(n_out):
+                var kd = Int(kinds[j])
+                if kd == OK_FIXED:
+                    var sz = Int(sizes[j])
+                    if sz == 4:
+                        var dst = _ip(Int(dst_a[j]))
+                        for i in range(lo, hi):
+                            var r = _row_at(idx, width, i)
+                            var c = _chunk_of(starts, n_chunks, r)
+                            var arr = Int(arrays[c * n_out + j])
+                            dst[i] = _ip(_arr_buf(arr, 1))[_arr_off(arr) + r - Int(starts[c])]
+                    elif sz == 8 or sz == 16:
+                        var w = sz // 8
+                        var dst = _lp(Int(dst_a[j]))
+                        for i in range(lo, hi):
+                            var r = _row_at(idx, width, i)
+                            var c = _chunk_of(starts, n_chunks, r)
+                            var arr = Int(arrays[c * n_out + j])
+                            var src = _lp(_arr_buf(arr, 1)) + (_arr_off(arr) + r - Int(starts[c])) * w
+                            for b in range(w):
+                                dst[i * w + b] = src[b]
+                    else:
+                        var dst = _bp(Int(dst_a[j]))
+                        for i in range(lo, hi):
+                            var r = _row_at(idx, width, i)
+                            var c = _chunk_of(starts, n_chunks, r)
+                            var arr = Int(arrays[c * n_out + j])
+                            var src = _bp(_arr_buf(arr, 1)) + (_arr_off(arr) + r - Int(starts[c])) * sz
+                            for b in range(sz):
+                                dst[i * sz + b] = src[b]
+                else:
+                    var offs = _ip(Int(dst_a[j]))
+                    var data = _bp(Int(dst_b[j]))
+                    var bp = Int(mbytes[m * n_out + j])
+                    for i in range(lo, hi):
+                        var r = _row_at(idx, width, i)
+                        var c = _chunk_of(starts, n_chunks, r)
+                        var st = 0
+                        var ln = 0
+                        _out_str(kd, Int(arrays[c * n_out + j]), r - Int(starts[c]), st, ln)
+                        offs[i] = Int32(bp)
+                        var sp = _bp(st)
+                        for b in range(ln):
+                            data[bp + b] = sp[b]
+                        bp += ln
+
+    if nt > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(gpass2, nt)
+    else:
+        gpass2(0)
+
+    O[0] = Int64(n)
+    O[1] = Int64(Int(arena))
+    for j in range(n_out):
+        O[2 + 2 * j] = dst_a[j]
+        O[3 + 2 * j] = dst_b[j]
+    starts.free()
+    mbytes.free()
+    counter.free()
+    col_bytes.free()
+    dst_a.free()
+    dst_b.free()
+    return 0

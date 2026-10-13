@@ -67,3 +67,14 @@ def test_python_path_loads_compute_when_it_needs_it(tpch_tiny_dir):
     assert out["result"].keys() == nat["result"].keys()
     for c, vals in out["result"].items():
         assert vals == pytest.approx(nat["result"][c], rel=1e-12) if isinstance(vals[0], float) else vals == nat["result"][c]
+
+
+def test_join_query_with_dictionary_predicates_never_imports_pyarrow_compute(tpch_tiny_dir):
+    """Q3: leaf filters (a dictionary predicate on c_mktsegment) run natively, string membership is
+    computed over the dictionary values in Python, the join's gather and the final aggregate are
+    native (F-032)."""
+    out = _run(tpch_tiny_dir, 3, {"MXFRAME_NATIVE": "1"})
+    assert not (out["after_import"] or out["after_load"] or out["after_query"]), out
+    old = _run(tpch_tiny_dir, 3, {"MXFRAME_NATIVE": "0"})
+    assert out["result"] == old["result"] or all(
+        (a == pytest.approx(b, rel=1e-12)) for c in out["result"] for a, b in zip(out["result"][c], old["result"][c]))
