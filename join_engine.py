@@ -570,11 +570,17 @@ def _dictionary_gather(col, idx: np.ndarray):
     return pa.DictionaryArray.from_arrays(_npa(codes), enc.dictionary)
 
 
-def _gather_table(comp, table: pa.Table, idx: np.ndarray) -> pa.Table:
+def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = False) -> pa.Table:
+    """``table`` rows ``idx``. On the CPU one native call (F-032) gathers every column; dictionary
+    columns only when ``decode_dicts`` (they come back decoded). Else Arrow ``take``."""
     if table.num_columns == 0:
         return table
     if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
         return comp._aot_gpu.gather_table(table, idx)
+    from . import native_exec
+    out = native_exec.try_gather(comp, table, idx, decode_dicts)
+    if out is not None:
+        return out
     return _take_rows(table, idx)
 
 
@@ -877,7 +883,10 @@ def _execute_inner(comp, node, needed, dict_ok=False):
                         got[c] = d
                 rest = [c for c in names_c if c not in got]
             if rest:
-                taken = _gather_table(comp, sub.select(rest), idx[leaf])
+                # deferred dictionary columns are decoded right after anyway: let the gather do it
+                deferred_only = all(c in later[leaf] for c in rest
+                                    if pa.types.is_dictionary(sub.schema.field(c).type))
+                taken = _gather_table(comp, sub.select(rest), idx[leaf], decode_dicts=deferred_only)
                 got.update({c: taken.column(c) for c in rest})
         if later[leaf]:
             from .arrow_dict import decode

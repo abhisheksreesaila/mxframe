@@ -245,24 +245,54 @@ def _same_dict(d1: Int, d2: Int) -> Bool:
 
 def _i64_cols_exact(arrays: LP, stride_a: Int, n_chunks: Int, n_cols: Int, dtypes: IP) -> Bool:
     """The bytecode interpreter computes in float64: an int64 value column is exact only within
-    +-2^53. False when any value of any int64 value column lies outside (the caller declines)."""
-    comptime LIM = Int64(1) << 53
+    +-2^53. False when any value of any int64 value column lies outside (the caller declines).
+    One parallel pass over 64k-row pieces of every int64 value column."""
+    var n_items = 0
     for j in range(n_cols):
-        if (Int(dtypes[j]) & 255) != 1:
-            continue
-        for c in range(n_chunks):
-            var arr = Int(arrays[c * stride_a + j])
-            var src = _lp(_arr_buf(arr, 1)) + _arr_off(arr)
-            var n = _arr_len(arr)
-            var lo = Int64.MAX
-            var hi = Int64.MIN
-            for i in range(n):
-                var v = src[i]
-                lo = min(lo, v)
-                hi = max(hi, v)
-            if n > 0 and (hi > LIM or lo < -LIM):
-                return False
-    return True
+        if (Int(dtypes[j]) & 255) == 1:
+            for c in range(n_chunks):
+                n_items += (_arr_len(Int(arrays[c * stride_a + j])) + MORSEL - 1) // MORSEL
+    if n_items == 0:
+        return True
+    var items = unsafe_alloc[Int64](n_items * 3)       # (address of the values, lo, hi)
+    var k = 0
+    for j in range(n_cols):
+        if (Int(dtypes[j]) & 255) == 1:
+            for c in range(n_chunks):
+                var arr = Int(arrays[c * stride_a + j])
+                var base = _arr_buf(arr, 1) + _arr_off(arr) * 8
+                var n = _arr_len(arr)
+                var lo = 0
+                while lo < n:
+                    items[3 * k] = Int64(base)
+                    items[3 * k + 1] = Int64(lo)
+                    items[3 * k + 2] = Int64(min(lo + MORSEL, n))
+                    k += 1
+                    lo += MORSEL
+    var bad = unsafe_alloc[Int64](1)
+    bad[0] = 0
+
+    def check(i: Int) {imm}:
+        comptime LIM = Int64(1) << 53
+        var src = _lp(Int(items[3 * i]))
+        var lo = Int64.MAX
+        var hi = Int64.MIN
+        for r in range(Int(items[3 * i + 1]), Int(items[3 * i + 2])):
+            var v = src[r]
+            lo = min(lo, v)
+            hi = max(hi, v)
+        if hi > LIM or lo < -LIM:
+            bad[0] = 1
+
+    if n_items > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(check, n_items)
+    else:
+        check(0)
+    var ok = Int(bad[0]) == 0
+    items.free()
+    bad.free()
+    return ok
 
 
 @always_inline
@@ -1601,4 +1631,219 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     dst_b.free()
     no_gids.free()
     tbl.free()
+    return 0
+
+
+# ── M2: native gather (a join's output rows) ──────────────────────────────────────────────
+#
+# Plan (int64 words):
+#   0 magic 0x4d584731 ("MXG1")   1 version (1)   2 n_chunks   3 n_out
+#   4 arrays* : int64[n_chunks][n_out] = ArrowArray*
+#   5 out_kinds* (as mx_filter: 0 fixed, 1 utf8, 2 dictionary written as utf8)   6 out_size*
+#   7 idx* (row numbers of the table, in output order)   8 n_idx   9 idx width (4 or 8)   10 threads
+# Result: 0 n_idx   1 arena*   then per column (A, B) as mx_filter.
+
+comptime GMAGIC = 0x4D584731
+comptime E_BAD_INDEX = -17
+
+
+@always_inline
+def _row_at(idx: Int, width: Int, i: Int) -> Int:
+    if width == 4:
+        return Int(_ip(idx)[i])
+    return Int(_lp(idx)[i])
+
+
+@always_inline
+def _chunk_of(starts: LP, n_chunks: Int, r: Int) -> Int:
+    var lo = 0
+    var hi = n_chunks - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if Int(starts[mid]) <= r:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+@export
+def mx_gather(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != GMAGIC or Int(P[1]) != 1:
+        return E_BAD_PLAN
+    var n_chunks = Int(P[2])
+    var n_out = Int(P[3])
+    var arrays = _lp(Int(P[4]))
+    var kinds = _lp(Int(P[5]))
+    var sizes = _lp(Int(P[6]))
+    var idx = Int(P[7])
+    var n = Int(P[8])
+    var width = Int(P[9])
+    var threads = max(1, Int(P[10]))
+    var O = _lp(out_a)
+    if n_chunks < 1 or n_out < 1 or (width != 4 and width != 8):
+        return E_BAD_PLAN
+    var starts = unsafe_alloc[Int64](n_chunks + 1)
+    var total_rows = 0
+    for c in range(n_chunks):
+        starts[c] = Int64(total_rows)
+        total_rows += _arr_len(Int(arrays[c * n_out]))
+    starts[n_chunks] = Int64(total_rows)
+    for i in range(n):                       # every row number inside the table
+        var r = _row_at(idx, width, i)
+        if r < 0 or r >= total_rows:
+            starts.free()
+            return E_BAD_INDEX
+
+    var morsels = max((n + MORSEL - 1) // MORSEL, 1)
+    var nt = max(1, min(threads, morsels))
+    var mbytes = unsafe_alloc[Int64](morsels * n_out)
+    for i in range(morsels * n_out):
+        mbytes[i] = 0
+    var any_str = False
+    for j in range(n_out):
+        any_str = any_str or Int(kinds[j]) != OK_FIXED
+    var counter = unsafe_alloc[Int64](1)
+
+    # ── pass 1: string bytes per morsel ────────────────────────────────────────────────────
+    if any_str:
+        counter[0] = 0
+
+        def gpass1(wid: Int) {imm}:
+            while True:
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                var lo = m * MORSEL
+                if lo >= n:
+                    break
+                var hi = min(lo + MORSEL, n)
+                for j in range(n_out):
+                    var kd = Int(kinds[j])
+                    if kd == OK_FIXED:
+                        continue
+                    var b = 0
+                    for i in range(lo, hi):
+                        var r = _row_at(idx, width, i)
+                        var c = _chunk_of(starts, n_chunks, r)
+                        var st = 0
+                        var ln = 0
+                        _out_str(kd, Int(arrays[c * n_out + j]), r - Int(starts[c]), st, ln)
+                        b += ln
+                    mbytes[m * n_out + j] = Int64(b)
+
+        if nt > 1:
+            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+            parallelize(gpass1, nt)
+        else:
+            gpass1(0)
+
+    var col_bytes = unsafe_alloc[Int64](n_out)
+    for j in range(n_out):
+        var b = 0
+        for m in range(morsels):
+            var x = Int(mbytes[m * n_out + j])
+            mbytes[m * n_out + j] = Int64(b)
+            b += x
+        col_bytes[j] = Int64(b)
+        if Int(kinds[j]) != OK_FIXED and b > 2147483647:
+            starts.free()
+            mbytes.free()
+            counter.free()
+            col_bytes.free()
+            return E_OUTPUT_TOO_BIG
+
+    var asize = 0
+    for j in range(n_out):
+        if Int(kinds[j]) == OK_FIXED:
+            asize += _align8(n * Int(sizes[j]))
+        else:
+            asize += _align8((n + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
+    var arena = _big_alloc(max(asize, 8))
+    var dst_a = unsafe_alloc[Int64](n_out)
+    var dst_b = unsafe_alloc[Int64](n_out)
+    var at = Int(arena)
+    for j in range(n_out):
+        dst_a[j] = Int64(at)
+        if Int(kinds[j]) == OK_FIXED:
+            dst_b[j] = 0
+            at += _align8(n * Int(sizes[j]))
+        else:
+            at += _align8((n + 1) * 4)
+            dst_b[j] = Int64(at)
+            at += _align8(max(Int(col_bytes[j]), 1))
+            _ip(Int(dst_a[j]))[n] = Int32(Int(col_bytes[j]))
+
+    # ── pass 2: write ──────────────────────────────────────────────────────────────────────
+    counter[0] = 0
+
+    def gpass2(wid: Int) {imm}:
+        while True:
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            var lo = m * MORSEL
+            if lo >= n:
+                break
+            var hi = min(lo + MORSEL, n)
+            for j in range(n_out):
+                var kd = Int(kinds[j])
+                if kd == OK_FIXED:
+                    var sz = Int(sizes[j])
+                    if sz == 4:
+                        var dst = _ip(Int(dst_a[j]))
+                        for i in range(lo, hi):
+                            var r = _row_at(idx, width, i)
+                            var c = _chunk_of(starts, n_chunks, r)
+                            var arr = Int(arrays[c * n_out + j])
+                            dst[i] = _ip(_arr_buf(arr, 1))[_arr_off(arr) + r - Int(starts[c])]
+                    elif sz == 8 or sz == 16:
+                        var w = sz // 8
+                        var dst = _lp(Int(dst_a[j]))
+                        for i in range(lo, hi):
+                            var r = _row_at(idx, width, i)
+                            var c = _chunk_of(starts, n_chunks, r)
+                            var arr = Int(arrays[c * n_out + j])
+                            var src = _lp(_arr_buf(arr, 1)) + (_arr_off(arr) + r - Int(starts[c])) * w
+                            for b in range(w):
+                                dst[i * w + b] = src[b]
+                    else:
+                        var dst = _bp(Int(dst_a[j]))
+                        for i in range(lo, hi):
+                            var r = _row_at(idx, width, i)
+                            var c = _chunk_of(starts, n_chunks, r)
+                            var arr = Int(arrays[c * n_out + j])
+                            var src = _bp(_arr_buf(arr, 1)) + (_arr_off(arr) + r - Int(starts[c])) * sz
+                            for b in range(sz):
+                                dst[i * sz + b] = src[b]
+                else:
+                    var offs = _ip(Int(dst_a[j]))
+                    var data = _bp(Int(dst_b[j]))
+                    var bp = Int(mbytes[m * n_out + j])
+                    for i in range(lo, hi):
+                        var r = _row_at(idx, width, i)
+                        var c = _chunk_of(starts, n_chunks, r)
+                        var st = 0
+                        var ln = 0
+                        _out_str(kd, Int(arrays[c * n_out + j]), r - Int(starts[c]), st, ln)
+                        offs[i] = Int32(bp)
+                        var sp = _bp(st)
+                        for b in range(ln):
+                            data[bp + b] = sp[b]
+                        bp += ln
+
+    if nt > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(gpass2, nt)
+    else:
+        gpass2(0)
+
+    O[0] = Int64(n)
+    O[1] = Int64(Int(arena))
+    for j in range(n_out):
+        O[2 + 2 * j] = dst_a[j]
+        O[3 + 2 * j] = dst_b[j]
+    starts.free()
+    mbytes.free()
+    counter.free()
+    col_bytes.free()
+    dst_a.free()
+    dst_b.free()
     return 0

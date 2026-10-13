@@ -70,6 +70,8 @@ def _load():
             lib.mx_exec_free.restype = ctypes.c_int64
             lib.mx_filter.argtypes = [ctypes.c_int64, ctypes.c_int64]
             lib.mx_filter.restype = ctypes.c_int64
+            lib.mx_gather.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_gather.restype = ctypes.c_int64
             _lib = lib
     return _lib
 
@@ -493,3 +495,81 @@ def try_filter(compiler, table: pa.Table, predicates, needed) -> Optional[pa.Tab
             out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
     _filter_last.update(path="native_filter", decline=None)
     return pa.Table.from_arrays(out, names=names)
+
+
+# ── M2: native gather (a join's output rows) ───────────────────────────────────────────────
+
+GMAGIC = 0x4D584731
+
+
+def _call_gather(lib, plan_addr: int, out_addr: int) -> int:
+    """The one native call per gather (a separate function so tests can count it)."""
+    return lib.mx_gather(plan_addr, out_addr)
+
+
+def try_gather(compiler, table: pa.Table, idx, decode_dicts: bool = False) -> Optional[pa.Table]:
+    """``table.take(idx)`` in one native call (rows in ``idx`` order; ``idx`` an int32 / int64 NumPy
+    array of row numbers). Dictionary string columns come back decoded, so only when
+    ``decode_dicts`` (the caller decodes them anyway); else None. None: the caller takes as before."""
+    import numpy as np
+    if not enabled() or getattr(compiler, "_device_arg", None) != "cpu" or not available():
+        return None
+    if table.num_columns == 0 or table.num_rows == 0:
+        return None
+    idx = np.asarray(idx)
+    if idx.dtype not in (np.int32, np.int64) or idx.ndim != 1 or len(idx) == 0:
+        return None
+    idx = np.ascontiguousarray(idx)
+    cols = [table.column(i) for i in range(table.num_columns)]
+    kinds, sizes = [], []
+    for c in cols:
+        k = _out_kind(c.type)
+        if k is None or c.null_count or (k[0] == 2 and not decode_dicts):
+            return None
+        if k[0] == 2 and any(ch.dictionary.null_count for ch in c.chunks):
+            return None
+        kinds.append(k[0])
+        sizes.append(k[1])
+    segs = _segments(cols)
+    if not segs:
+        return None
+    width = len(cols)
+    structs = []
+    arrays = (ctypes.c_int64 * (len(segs) * width))()
+    try:
+        for r, seg in enumerate(segs):
+            for j, piece in enumerate(seg):
+                st = (ctypes.c_int64 * 10)()
+                piece._export_to_c(ctypes.addressof(st))
+                structs.append(st)
+                arrays[r * width + j] = ctypes.addressof(st)
+        c_kinds = (ctypes.c_int64 * width)(*kinds)
+        c_sizes = (ctypes.c_int64 * width)(*sizes)
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 11)(GMAGIC, 1, len(segs), width, ctypes.addressof(arrays),
+                                  ctypes.addressof(c_kinds), ctypes.addressof(c_sizes),
+                                  idx.ctypes.data, len(idx), idx.dtype.itemsize, default_threads())
+        O = (ctypes.c_int64 * (2 + 2 * width))()
+        lib = _load()
+        rc = _call_gather(lib, ctypes.addressof(P), ctypes.addressof(O))
+    finally:
+        for st in structs:
+            if st[8]:
+                _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return None
+    n = int(O[0])
+    owner = _Arena(lib, int(O[1]))
+
+    def buf(addr, nbytes):
+        return pa.foreign_buffer(int(addr), max(nbytes, 0), base=owner)
+
+    out = []
+    for j, (c, kind, size) in enumerate(zip(cols, kinds, sizes)):
+        a, b = int(O[2 + 2 * j]), int(O[3 + 2 * j])
+        if kind == 0:
+            out.append(pa.Array.from_buffers(c.type, n, [None, buf(a, n * size)]))
+        else:
+            nbytes = ctypes.c_int32.from_address(a + 4 * n).value
+            out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
+    return pa.Table.from_arrays(out, names=table.column_names)

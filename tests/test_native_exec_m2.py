@@ -205,7 +205,10 @@ def test_case_when_column_above_a_join_is_decoded_on_the_joined_rows_only(monkey
                     .groupby("mode").agg(when(col("pri").isin(["1-URGENT", "2-HIGH"]), lit(1.0), lit(0.0))
                                          .sum().alias("high")).sort("mode"))
     got = plan().compute(device="cpu")
-    assert sizes and max(sizes) < 10_000, sizes            # never the 50,000-row dimension in full
+    # never the 50,000-row dimension in full (with the executor on, the native gather decodes the
+    # joined rows itself and Arrow decodes nothing)
+    assert max(sizes, default=0) < 10_000, sizes
+    assert sizes or native_on == "1"
     monkeypatch.setattr(ad, "decode", real)
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     monkeypatch.setattr("mxframe.io_parquet._join_leaf_filters", lambda plan: {})   # reference: decode up front
@@ -271,3 +274,71 @@ def test_parquet_source_with_join(tmp_path, filters, monkeypatch):
     got, old = _both(plan, monkeypatch)
     assert len(filters) >= 1, nx.last_filter()
     _same(got, old)
+
+
+@pytest.fixture
+def gathers(monkeypatch):
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    calls = []
+    real = nx._call_gather
+
+    def counting(*a):
+        calls.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(nx, "_call_gather", counting)
+    return calls
+
+
+def test_join_output_is_gathered_natively(gathers, monkeypatch):
+    """The join's final gather: fixed-width columns (int, float, date, decimal), utf8 with empty
+    strings, and deferred dictionary columns (decoded in the gather), from several chunks."""
+    f, d = _fact(n=90_000), _dim()
+    note = f.column("note").to_pylist()
+    note[::5] = [""] * len(note[::5])
+    f = f.set_column(f.schema.get_field_index("note"), "note", pa.array(note, type=pa.string()))
+    plan = lambda: (LazyFrame(f).filter(col("qty") < lit(25.0)).join(LazyFrame(d), on="ok")
+                    .groupby("mode", "note", "pri").agg(col("v").sum().alias("s"), col("price").count().alias("n"))
+                    .sort("mode", "note", "pri"))
+    got, old = _both(plan, monkeypatch)
+    assert len(gathers) >= 1
+    _same(got, old)
+    rows = lambda: (LazyFrame(f).filter(col("qty") < lit(3.0)).join(LazyFrame(d), on="ok")
+                    .select("ok", "note", "shipd", "price", "qty", "pri").sort("ok", "note", "qty", "shipd"))
+    got, old = _both(rows, monkeypatch)
+    _same(got, old)
+
+
+def test_native_gather_matches_arrow_take_on_odd_chunks():
+    import mxframe.custom_ops as co
+    r = np.random.default_rng(3)
+    words = np.array(["", "a", "bb", "ccc", "Zz"], dtype=object)
+    parts = []
+    for m in (30_000, 1, 17, 50_000):
+        parts.append(pa.table({"s": pa.array(words[r.integers(0, 5, m)].tolist(), type=pa.string()),
+                               "i": A(r.integers(-9, 9, m).astype(np.int64)),
+                               "f": A(r.random(m).astype(np.float32)),
+                               "d": pa.array(r.integers(0, 1000, m).astype(np.int64)).cast(pa.decimal128(38, 2)),
+                               "t": pa.array(r.integers(0, 10**9, m), type=pa.timestamp("us", tz="UTC"))}))
+    t = pa.concat_tables(parts)
+    comp = co.CustomOpsCompiler(device="cpu")
+    for dtype in (np.int32, np.int64):
+        idx = r.integers(0, t.num_rows, 70_000).astype(dtype)
+        got = nx.try_gather(comp, t, idx)
+        assert got is not None
+        assert got.equals(t.take(pa.array(idx.astype(np.int64))).combine_chunks())
+    assert nx.try_gather(comp, t, np.array([t.num_rows], dtype=np.int64)) is None      # out of range: declined
+
+
+
+def test_fused_pipeline_declines_int64_past_2_53_too(monkeypatch):
+    """With the executor off, the older fused pipeline (also float64) must decline as well."""
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    import mxframe.custom_ops as co
+    n = 20_000
+    x = np.full(n, (1 << 53) + 1, dtype=np.int64)
+    x[::4] = 3
+    t = pa.table({"g": A((np.arange(n) % 3).astype(np.int32)), "x": A(x), "v": A(np.ones(n))})
+    got = (LazyFrame(t).filter(col("x") > lit(1 << 53)).groupby("g").agg(col("v").sum().alias("s"))
+           .sort("g").compute(device="cpu"))
+    assert sum(got.column("s").to_pylist()) == n - len(x[::4])

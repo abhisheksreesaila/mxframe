@@ -292,7 +292,7 @@ class PipelineProgram:
 
 # ── column access helpers ──────────────────────────────────────────────────
 
-DICT_MEMBER_PY_MAX = 200_000
+DICT_MEMBER_PY_MAX = 50_000          # above this a Python loop costs more than importing pyarrow.compute
 
 
 def _dict_member(d: pa.Array, test, arrow) -> np.ndarray:

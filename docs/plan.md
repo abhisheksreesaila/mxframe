@@ -316,6 +316,10 @@ Needs: none · From the F-035 review
 - [ ] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
 - [ ] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
 
+## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [todo]
+Needs: none · From the F-032 review (round 2); predates the executor (the fused pipeline has it too)
+- [ ] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+
 ## F-029 CPU joins [superseded by F-032]
 Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17, Q20 with reading out of the clock (F-007 is GPU placement; this ticket is the CPU join itself)
 - [ ] profile the CPU join path on those queries (build, probe, materialization, key encoding)
@@ -362,7 +366,8 @@ Needs: F-031 · Replaces F-029
 - [x] numbers, engine-only first runs (`docs/bench/m2a-*`, `m2b-*`; load average 2-4): SF10 total 21.0 s (M1) → 16.2 s (M2a) → 15.7 s (M2b), Polars 15.0 s; MXFrame beats Polars on 6/22 and is within 2x on 14/22 (M1: 13/22). Q19 2,159 → 146 ms (Polars 487), Q12 1,788 → 511, Q10 1,105 → 559, Q14 345 → 189, Q20 459 → 286. SF1 total 2,699 → 2,209 ms (Polars 1,391). Worst left: Q17 3.8x, Q16 3.8x, Q8 3.5x at SF10
 - [x] small data (12k / 100k rows, `docs/bench/m2b-small-*`): import + first query, sum of 22, user-felt: mx-cpu 3,503 → 3,245 ms at 12k (pandas 5,811, Polars 2,043, DuckDB 2,885) and 3,833 → 3,373 at 100k; mx-cpu beats pandas on 22/22 queries at both sizes. The "first run" column alone grew because `pyarrow.compute` (~25 ms) now loads in the first query that needs it instead of at import; join queries still need it for Arrow `take` in the join's gather (next item)
 - [x] review round 1 (NEEDS WORK) fixed: int64 value columns past 2^53 were compared / summed in float64 by the bytecode interpreter (wrong rows); `mx_execute`, `mx_filter` and the legacy fused pipeline now decline such columns (`E_INEXACT`, the old path is exact); deferral limited to Filter*(Scan) join inputs; tests for left joins, other leaf shapes, a Parquet source, int64 past 2^53
-- [ ] native gather: the join's final gather is Arrow `take` (row work in Arrow, and it imports `pyarrow.compute`): a Mojo gather of fixed-width and string columns by row index (`test_join_query_with_dictionary_predicates_never_imports_pyarrow_compute` is xfail until then)
+- [x] native gather (`mx_gather`): the join's final gather is one native call (fixed-width, utf8, and deferred dictionary columns decoded in the gather); Arrow `take` only for other types or nulls. Q3 now runs without importing `pyarrow.compute`
+- [x] review round 2 (PASS) follow-ups: the int64 range check runs in parallel; the fused pipeline's guard has a test; Python dictionary membership below 50k values; F-037 for arithmetic intermediates past 2^53. The m2a / m2b benchmark numbers above were taken before the int64 guard
 - [ ] inner, semi, anti and left hash joins (build sink + probe operator), multi-pipeline plans
 - [ ] Q3, Q4, Q5, Q7, Q10, Q12, Q14, Q19 fully native; SF10 engine-only within 2x Polars
 
