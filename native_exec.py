@@ -9,9 +9,11 @@ wrapped zero-copy and freed by the executor when the table is garbage collected.
 Covered: ``Limit? Sort? Having? Aggregate(Filter*(Scan))`` on the CPU, with string keys (utf8, or
 dictionary-encoded with a dictionary per chunk; merged by hashing in Mojo) and int32 / int64 keys
 (any range: direct, compacted or hashed),
-null-free numeric value columns, and sum / mean / count (min / max without NaN handling). HAVING is
+null-free numeric value columns, and sum / mean / count / min / max (NaN-aware, as DuckDB). HAVING is
 an AND of ``aggregate <op> number``; ORDER BY any mix of group keys and aggregates. Join results are
-materialized before the aggregate, so this is the final stage of most queries. Everything else
+materialized before the aggregate, so this is the final stage of most queries. Groups come out in key
+order on every path (dense, compacted, hashed), as pandas' groupby does by default; ORDER BY ties keep
+that order. The old path emits first appearance: SQL leaves both orders undefined. Everything else
 returns ``None`` and the existing path runs: the executor never changes an answer.
 On by default; ``MXFRAME_NATIVE=0`` turns it off.
 """

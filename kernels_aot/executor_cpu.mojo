@@ -816,6 +816,24 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             if cnt[g] > 0:
                 order[n_res] = Int64(g)
                 n_res += 1
+    if use_hash and n_res > 1:
+        # the hash table numbers groups by first appearance; emit them in key order like the dense
+        # and compacted paths (pandas' groupby default), which is also the ORDER BY tie-break
+        var kvals = unsafe_alloc[Float64](n_keys * n_res)
+        for k in range(n_keys):
+            _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, n_cols,
+                             kvals + k * n_res, 1.0)
+        var kperm = unsafe_alloc[Int64](n_res)
+        for i in range(n_res):
+            kperm[i] = Int64(i)
+        _merge_sort(kperm, n_res, kvals, n_keys, n_res)
+        var korder = unsafe_alloc[Int64](max(G, 1))
+        for i in range(n_res):
+            korder[i] = order[Int(kperm[i])]
+        order.free()
+        order = korder
+        kperm.free()
+        kvals.free()
     var empty_global = not grouped and cnt[0] == 0
     if n_having > 0:
         var kept = 0
@@ -847,19 +865,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var idx = Int(sorts[3 * j + 1])
             var sign = -1.0 if Int(sorts[3 * j + 2]) != 0 else 1.0
             if what == 0:
-                var kind = Int(K.kinds[idx])
-                var kvi = _lp(Int(kv[idx]))
-                if kind == K_DICT or kind == K_STR:
-                    var card = Int(K.card[idx])
-                    var rk = unsafe_alloc[Int64](max(card, 1))
-                    _global_ranks(kind, arrays, stride_a, n_cols + idx, card, _lp(Int(K.gchunk[idx])),
-                                  _lp(Int(K.gcode[idx])), rk)
-                    for i in range(n_res):
-                        sv[j * n_res + i] = sign * Float64(Int(rk[Int(kvi[Int(order[i])])]))
-                    rk.free()
-                else:                                  # value - base: exact in float64 below 2^53
-                    for i in range(n_res):
-                        sv[j * n_res + i] = sign * Float64(Int(kvi[Int(order[i])]))
+                _key_sort_values(K, idx, _lp(Int(kv[idx])), order, n_res, arrays, stride_a, n_cols,
+                                 sv + j * n_res, sign)
             else:
                 var op = Int(outs[3 * idx])
                 var slot = Int(outs[3 * idx + 1])
@@ -1190,3 +1197,73 @@ def _hash_groups(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, t
     table.free()
     v.free()
     return ng
+
+
+def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP, stride_a: Int,
+                     n_cols: Int, dst: FP, sign: Float64):
+    """dst[i] = sign * (exact rank of row i's value of key k): strings by their bytes; integers by
+    their code when it fits in float64 exactly (dense and compacted codes are below 2^27), else by
+    their rank among the rows (hash-path codes, value - base, can reach 2^63)."""
+    var kind = Int(K.kinds[k])
+    if kind == K_DICT or kind == K_STR:
+        var card = Int(K.card[k])
+        var rk = unsafe_alloc[Int64](max(card, 1))
+        _global_ranks(kind, arrays, stride_a, n_cols + k, card, _lp(Int(K.gchunk[k])),
+                      _lp(Int(K.gcode[k])), rk)
+        for i in range(n_res):
+            dst[i] = sign * Float64(Int(rk[Int(kvi[Int(order[i])])]))
+        rk.free()
+        return
+    var hi = 0
+    for i in range(n_res):
+        hi = max(hi, Int(kvi[Int(order[i])]))
+    if hi < (1 << 53):
+        for i in range(n_res):
+            dst[i] = sign * Float64(Int(kvi[Int(order[i])]))
+        return
+    var perm = unsafe_alloc[Int64](n_res)
+    var tmp = unsafe_alloc[Int64](n_res)
+    for i in range(n_res):
+        perm[i] = Int64(i)
+    # merge sort of row numbers by their int64 code (ties by row number)
+    var src = perm
+    var dstp = tmp
+    var width = 1
+    while width < n_res:
+        var lo = 0
+        while lo < n_res:
+            var mid = min(lo + width, n_res)
+            var hi2 = min(lo + 2 * width, n_res)
+            var a = lo
+            var b = mid
+            var t = lo
+            while a < mid and b < hi2:
+                var ca = kvi[Int(order[Int(src[a])])]
+                var cb = kvi[Int(order[Int(src[b])])]
+                if cb < ca or (cb == ca and src[b] < src[a]):
+                    dstp[t] = src[b]
+                    b += 1
+                else:
+                    dstp[t] = src[a]
+                    a += 1
+                t += 1
+            while a < mid:
+                dstp[t] = src[a]
+                a += 1
+                t += 1
+            while b < hi2:
+                dstp[t] = src[b]
+                b += 1
+                t += 1
+            lo += 2 * width
+        var sw = src
+        src = dstp
+        dstp = sw
+        width *= 2
+    var r = 0
+    for t in range(n_res):
+        if t > 0 and kvi[Int(order[Int(src[t])])] != kvi[Int(order[Int(src[t - 1])])]:
+            r += 1
+        dst[Int(src[t])] = sign * Float64(r)
+    perm.free()
+    tmp.free()

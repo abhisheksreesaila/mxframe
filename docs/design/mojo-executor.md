@@ -118,6 +118,14 @@ dictionary string predicates). Where the aggregate is the work it wins (SF10 Q1 
 path, Polars 2,879); elsewhere the totals barely move, because the time is in the joins and the Python
 orchestration around them: M2 is where the gap to Polars closes. Details: `docs/plan.md`, F-031.
 
+### Row order (decision proposed in M1, for Abhishek)
+
+Unsorted GROUP BY results come out in key order, whichever grouping path runs (dense, compacted,
+hashed); ORDER BY ties keep that order, and LIMIT without ORDER BY returns the first groups in key
+order. This is pandas' default (`groupby(sort=True)`) and is deterministic. The old Python path
+returned first appearance; SQL defines neither. Alternative if wanted: first appearance among the
+rows that pass the filter, which needs the interpreter to report the first surviving row per group.
+
 ## Risks
 
 - **Size.** This is the largest change to the engine so far: weeks, not days. The milestones are ordered so

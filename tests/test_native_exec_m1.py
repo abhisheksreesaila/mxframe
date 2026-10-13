@@ -118,11 +118,11 @@ def test_grouped_without_sort_has_the_same_rows(native, monkeypatch, name):
     _same(got, old, ordered=False)
 
 
-def test_limit_without_sort_returns_that_many_groups(native, monkeypatch):
+def test_limit_without_sort_returns_the_first_groups_in_key_order(native, monkeypatch):
     t = _table()
     got = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).limit(5).compute(device="cpu")
     assert nx.last_path() == "native", nx.last_decline()
-    assert got.num_rows == 5
+    assert got.column("k").to_pylist() == sorted(set(t.column("k").to_pylist()))[:5]
     full = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).compute(device="cpu")
     sums = dict(zip(full.column("k").to_pylist(), full.column("s").to_pylist()))
     for k, s in zip(got.column("k").to_pylist(), got.column("s").to_pylist()):
@@ -280,3 +280,57 @@ def test_case_when_on_a_dictionary_column_is_decoded_first_and_still_correct(nat
         when(col("pri").isin(["1-URGENT", "2-HIGH"]), lit(1.0), lit(0.0)).sum().alias("high")).sort("k")
     got, old, path, decline = _both(plan, t, monkeypatch)
     _same(got, old)
+
+
+# ── order: key order on every path (pandas' groupby default); ORDER BY ties broken by key order ──
+# The old path emits groups in first appearance (SQL leaves the order of an unsorted GROUP BY, and
+# of ties, undefined); the executor's order is the same whichever grouping path a query takes.
+
+def _keys_table(keys, seed=3):
+    r = np.random.default_rng(seed)
+    n = len(keys)
+    return pa.table({"k": A(np.asarray(keys, dtype=np.int64)), "v": A(np.round(r.random(n) * 4)),
+                     "w": A(np.ones(n))})
+
+
+@pytest.mark.parametrize("spread", ["dense", "compact", "hash"])
+def test_unsorted_groups_come_out_in_key_order_on_every_path(native, monkeypatch, spread):
+    r = np.random.default_rng(11)
+    base = {"dense": 1, "compact": 3, "hash": 1 << 41}[spread]
+    keys = r.permutation(np.repeat(np.arange(4000) * base, 5))
+    if spread == "compact":
+        keys = np.concatenate([keys, [0, 4_000_000]])          # range ~4M > 2^20, under 8x rows
+    t = _keys_table(keys)
+    got = LazyFrame(t).groupby("k").agg(col("w").sum().alias("n")).compute(device="cpu")
+    assert nx.last_path() == "native", nx.last_decline()
+    ks = got.column("k").to_pylist()
+    assert ks == sorted(ks)
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    old = LazyFrame(t).groupby("k").agg(col("w").sum().alias("n")).compute(device="cpu")
+    _same(got, old, ordered=False)
+
+
+@pytest.mark.parametrize("spread", ["dense", "hash"])
+def test_order_by_ties_and_limit_follow_key_order(native, monkeypatch, spread):
+    base = 1 if spread == "dense" else (1 << 41)
+    keys = np.random.default_rng(5).permutation(np.repeat(np.arange(300) * base, 4))
+    t = _keys_table(keys)
+    got = (LazyFrame(t).groupby("k").agg(col("w").sum().alias("n")).sort("n", descending=[True])
+           .limit(7).compute(device="cpu"))
+    assert nx.last_path() == "native", nx.last_decline()
+    assert got.column("k").to_pylist() == [i * base for i in range(7)]       # every n ties at 4
+    first = LazyFrame(t).groupby("k").agg(col("w").sum().alias("n")).limit(3).compute(device="cpu")
+    assert first.column("k").to_pylist() == [0, base, 2 * base]
+
+
+def test_sort_by_int64_keys_past_2_53_is_exact(native, monkeypatch):
+    big = 1 << 60
+    keys = [big + 1, 5, big, big + 3, big + 2, 0, big + 1, -big]
+    t = pa.table({"k": A(np.array(keys, dtype=np.int64)), "v": A(np.arange(len(keys), dtype=np.float64))})
+    for desc in (False, True):
+        got = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).sort("k", descending=[desc]).compute(device="cpu")
+        assert nx.last_path() == "native", nx.last_decline()
+        want = sorted(set(keys), reverse=desc)
+        assert got.column("k").to_pylist() == want
+    got = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).compute(device="cpu")
+    assert got.column("k").to_pylist() == sorted(set(keys))

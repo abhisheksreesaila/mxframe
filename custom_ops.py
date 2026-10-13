@@ -1715,7 +1715,7 @@ class CustomOpsCompiler(GraphCompiler):
         # path it used to fall back to rounds float64 columns to float32 (F-016 fuzz seed 5061).
         plan = self._inline_project_into_aggregate(plan)
         # F-030 / F-031 -- native executor: the whole plan in one Mojo call
-        if _native_exec is not None and _native_exec.enabled():
+        if _native_exec is not None:          # (declines at once when MXFRAME_NATIVE=0)
             try:
                 _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
             except Exception as _exc:      # a plan is fully native or not at all: never fail the query
