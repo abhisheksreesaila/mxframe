@@ -123,12 +123,50 @@ def _select(table: pa.Table, needed: Optional[Set[str]]) -> pa.Table:
     return table if len(names) == table.num_columns else table.select(names)
 
 
+def _scan_under_filters(plan):
+    """(Scan, predicates) when ``plan`` is Filter*(Scan), else (None, [])."""
+    preds, node = [], plan
+    while isinstance(node, Filter):
+        preds.append(node.predicate)
+        node = node.input
+    return (node, preds) if isinstance(node, Scan) else (None, [])
+
+
+def _decode_deferred(table: pa.Table, cols) -> pa.Table:
+    """Decode the dictionary columns io_parquet.resolve_plan left encoded until after the leaf's
+    filter (so only surviving rows are decoded)."""
+    from .arrow_dict import decode
+    for i, (n, t) in enumerate(zip(table.column_names, table.schema.types)):
+        if n in cols and pa.types.is_dictionary(t):
+            table = table.set_column(i, n, decode(table.column(n)))
+    return table
+
+
 def leaf_table(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
-    """``plan`` evaluated to a table holding (at least) the ``needed`` columns."""
+    """``plan`` evaluated to a table holding (at least) the ``needed`` columns.
+
+    A Filter*(Scan) leaf runs as one native call when the executor can (F-032: predicate per morsel
+    in Mojo, only the surviving rows of the needed columns written, dictionary strings decoded on
+    the way out). Otherwise the predicates are evaluated here, then the dictionary columns
+    resolve_plan deferred are decoded on the surviving rows."""
+    scan, preds = _scan_under_filters(plan)
+    if scan is not None:
+        if preds:
+            from . import native_exec
+            out = native_exec.try_filter(comp, scan.table, preds, needed)
+            if out is not None:
+                return out
+        later = getattr(scan, "_mx_decode_after", None)
+        out = _leaf_table_py(comp, plan, needed)
+        return _decode_deferred(out, later) if later else out
+    return _leaf_table_py(comp, plan, needed)
+
+
+def _leaf_table_py(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
     if isinstance(plan, Scan):
         return _select(plan.table, needed)
     if isinstance(plan, Filter):
-        inner = leaf_table(comp, plan.input, _union(needed, _cols(plan.predicate)))
+        inner = _leaf_table_py(comp, plan.input, _union(needed, _cols(plan.predicate)))
         mask = comp._eval_predicate(plan.predicate, inner)
         return _select(inner, needed).filter(mask)      # the mask is done: drop the predicate-only columns first
     if isinstance(plan, Join):

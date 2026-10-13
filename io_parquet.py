@@ -754,6 +754,18 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         return (name in info.refs and name not in info.bad
                 and not info.has_join and not info.passthrough.get(id(leaf), True))
 
+    def deferrable(name: str, leaf) -> bool:
+        """Decoded only because the plan has a join: leave it encoded until the leaf's filter has
+        run (join_engine.leaf_table decodes it then, on the surviving rows only; F-032)."""
+        return (info.has_join and name in info.refs and name not in info.bad
+                and not info.passthrough.get(id(leaf), True))
+
+    def _scan(table, defer):
+        s = Scan(table)
+        if defer:
+            s._mx_decode_after = frozenset(defer)
+        return s
+
     def resolve_leaf(leaf: ParquetScan, pushed: tuple):
         names = leaf.schema.names
         if info.passthrough.get(id(leaf), True):
@@ -773,13 +785,18 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
             table = pq.read_table(leaf.path, columns=cols,
                                   filters=_filters_expression(pushed) if pushed else None,
                                   read_dictionary=dict_cols or None)
-        return Scan(_decode_unkept(table, leaf))
+        table, defer = _decode_unkept(table, leaf)
+        return _scan(table, defer)
 
     def _decode_unkept(table, leaf):
+        defer = []
         for i, (n, t) in enumerate(zip(table.column_names, table.schema.types)):
             if _is_dict(t) and not keepable(n, leaf):
-                table = table.set_column(i, n, _decode_dict(table.column(n)))
-        return table
+                if deferrable(n, leaf):
+                    defer.append(n)
+                else:
+                    table = table.set_column(i, n, _decode_dict(table.column(n)))
+        return table, defer
 
     def resolve_scan(leaf: Scan):
         table = leaf.table
@@ -787,10 +804,13 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
                 if _is_dict(t) and not keepable(n, leaf)]
         if not drop:
             return leaf
+        defer = [n for n in drop if deferrable(n, leaf)]
         for n in drop:
+            if n in defer:
+                continue
             i = table.schema.get_field_index(n)
             table = table.set_column(i, n, _decode_dict(table.column(n)))
-        return Scan(table)
+        return _scan(table, defer)
 
     def rebuild(node):
         if isinstance(node, ParquetScan):
