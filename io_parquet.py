@@ -813,6 +813,11 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         s = Scan(table)
         if defer:
             s._mx_decode_after = frozenset(defer)
+            # read above the join only in dictionary-native ways (a bare group key, a predicate the
+            # engine evaluates on codes): the join passes them on as dictionaries, never decoded
+            keep = frozenset(n for n in defer if n not in info.bad)
+            if keep:
+                s._mx_keep_dict = keep
         return s
 
     def resolve_leaf(leaf: ParquetScan, pushed: tuple):

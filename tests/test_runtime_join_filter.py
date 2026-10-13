@@ -22,8 +22,8 @@ def reduced(monkeypatch):
     log = []
     real = nx.try_filter
 
-    def spy(comp, table, preds, needed, lookups=()):
-        out = real(comp, table, preds, needed, lookups)
+    def spy(comp, table, preds, needed, lookups=(), **kw):
+        out = real(comp, table, preds, needed, lookups, **kw)
         if "pk" in table.column_names and lookups and out is not None:     # the partner, by the fact's keys
             log.append(1)
         return out

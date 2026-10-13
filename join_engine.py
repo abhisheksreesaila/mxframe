@@ -611,12 +611,30 @@ def _stable_key(comp, plan):
     return type(comp)._plan_stable_key(plan)
 
 
+def _keep_sig(plan) -> tuple:
+    """The dictionary columns the leaves under ``plan`` keep coded (F-046d): part of the join cache
+    key, so a result with coded columns never serves a plan that wants them decoded."""
+    out = []
+
+    def walk(p):
+        k = getattr(p, "_mx_keep_dict", None)
+        if k:
+            out.append(tuple(sorted(k)))
+        for child in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None)):
+            if child is not None:
+                walk(child)
+
+    walk(plan)
+    return tuple(out)
+
+
 def execute_join(comp, node, needed: Optional[Set[str]], dict_ok: bool = False) -> pa.Table:
     from . import custom_ops as _co
     cache = _co._JOIN_RESULT_CACHE
     key = _stable_key(comp, node)
     if key is not None:
-        key = (key, None if needed is None else frozenset(needed), dict_ok, comp._session_device)
+        key = (key, None if needed is None else frozenset(needed), dict_ok, _keep_sig(node),
+               comp._session_device)
         hit = cache.get(key)
         if hit is not None:
             return hit
@@ -907,7 +925,7 @@ def _semi_partner(comp, plan, bkeys, reduce=None) -> Optional[pa.Table]:
     return None if out is None else out.select(list(bkeys))
 
 
-def _execute_star(comp, fl, fact: int, get, want, leaf_need) -> Optional[pa.Table]:
+def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Optional[pa.Table]:
     """The join as one scan of leaf ``fact``: every other leaf belongs to the subtree of one of the
     fact's neighbours (the edges form a tree); each subtree is joined on its own (small tables) and
     becomes a partner looked up by key while the fact's filter runs (``native_exec.try_filter``).
@@ -1031,7 +1049,8 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need) -> Optional[pa.Tabl
                 B = pa.Table.from_arrays(arrays, names=names)
         outs = [nm for nm in B.column_names if nm.split(":", 1)[0] != str(c) or
                 nm.split(":", 1)[1] in deliver[c]]
-        lookups.append(native_exec.Lookup(probe, B, [_star_name(c, k) for k in bkeys], outs, outs))
+        keep_b = {_star_name(c, k) for k in (coded[c] if coded is not None and len(S) == 1 else ())}
+        lookups.append(native_exec.Lookup(probe, B, [_star_name(c, k) for k in bkeys], outs, outs, keep=keep_b))
 
     # probe the most selective partner first: a row stops at its first miss (Q8: the filtered part
     # table before supplier and the orders subtree)
@@ -1043,7 +1062,8 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need) -> Optional[pa.Tabl
     order = sorted(range(len(lookups)), key=lambda i: kept_share(roots[i][0], lookups[i]))
     roots, lookups = [roots[i] for i in order], [lookups[i] for i in order]
     t0 = time.perf_counter()
-    out = native_exec.try_filter(comp, scan.table, preds, set(deliver[fact]), lookups)
+    out = native_exec.try_filter(comp, scan.table, preds, set(deliver[fact]), lookups,
+                                 keep_dict=coded[fact] if coded is not None else ())
     if _TRACE:
         _trace(f"star: scan leaf {fact} ({scan.table.num_rows} rows) with partners "
                f"{[(c, lk.build.num_rows) for (c, _), lk in zip(roots, lookups)]} -> "
@@ -1134,15 +1154,19 @@ def _execute_inner(comp, node, needed, dict_ok=False):
     # dictionary columns resolve_plan deferred (decoded only because the plan has a join): decoded
     # after the final gather, on the joined rows only, unless they are join keys or residual inputs
     later: List[Set[str]] = []
+    coded: List[Set[str]] = []           # deferred ones the plan reads as dictionaries: never decoded
     for i in range(n_leaves):
         sc, _ = _scan_under_filters(fl.leaves[i])
         later.append(set(getattr(sc, "_mx_decode_after", None) or ()) if sc is not None else set())
+        coded.append(set(getattr(sc, "_mx_keep_dict", None) or ()) if sc is not None else set())
     for a, b, ac, bc in fl.edges:
         later[a] -= set(ac)
         later[b] -= set(bc)
     for _, cm in fl.residuals:
         for leaf, c in cm.values():
             later[leaf].discard(c)
+    for i in range(n_leaves):
+        coded[i] &= later[i]
     tables: List[Optional[pa.Table]] = [None] * n_leaves
 
     def get(i: int) -> pa.Table:             # a leaf evaluated once, when first needed
@@ -1152,7 +1176,7 @@ def _execute_inner(comp, node, needed, dict_ok=False):
 
     fact = _star_fact(comp, fl)
     if fact is not None:
-        out = _execute_star(comp, fl, fact, get, want, leaf_need)
+        out = _execute_star(comp, fl, fact, get, want, leaf_need, coded)
         if out is not None:
             return out
     for i in range(n_leaves):
@@ -1182,6 +1206,9 @@ def _execute_inner(comp, node, needed, dict_ok=False):
                     if d is not None:
                         got[c] = d
                 rest = [c for c in names_c if c not in got]
+            for c in [c for c in rest if c in coded[leaf] and pa.types.is_dictionary(sub.schema.field(c).type)]:
+                got[c] = pc.take(sub.column(c), _npa(idx[leaf]))     # codes gathered, never decoded
+            rest = [c for c in rest if c not in got]
             if rest:
                 # deferred dictionary columns are decoded right after anyway: let the gather do it
                 deferred_only = all(c in later[leaf] for c in rest
@@ -1191,7 +1218,7 @@ def _execute_inner(comp, node, needed, dict_ok=False):
         if later[leaf]:
             from .arrow_dict import decode
             for c in names_c:
-                if c in later[leaf] and pa.types.is_dictionary(got[c].type):
+                if c in later[leaf] and c not in coded[leaf] and pa.types.is_dictionary(got[c].type):
                     got[c] = decode(got[c])
         for n, c in cols:
             arrays[n] = got[c]

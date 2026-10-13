@@ -99,11 +99,32 @@ def test_run_lengths(calls, run):
     assert calls == [0]
 
 
-def test_unsorted_key_takes_the_existing_path(calls):
-    t = _table(sort=False)
+@pytest.mark.parametrize("strings", [False, True])
+@pytest.mark.parametrize("keyrange", [1_000, 500_000])
+def test_unsorted_keys_count_natively_by_hash(calls, strings, keyrange):
+    # F-046b: an unsorted key no longer falls back: a radix-partitioned hash aggregate counts it
+    r = np.random.default_rng(13)
+    n = 150_000
+    t = pa.table({
+        "a": A((r.integers(0, min(keyrange, 40_000), n) * (keyrange // min(keyrange, 40_000))).astype(np.int64)),
+        "b": pa.array([f"s{x}" for x in r.integers(0, 6, n)], pa.string()) if strings
+             else A(r.integers(0, 6, n).astype(np.int64)),
+        "d": A(r.integers(0, 100, n).astype(np.int32)),
+    })
     res = _q(t).compute(device="cpu")
     _check(res, _expected(t, lambda d: d < 60))
-    assert calls == [nx.E_UNSORTED]
+    assert calls == [0]
+
+
+def test_unsorted_int32_keys_with_negatives(calls):
+    r = np.random.default_rng(14)
+    n = 100_000
+    t = pa.table({"a": A(r.integers(-3000, 3000, n).astype(np.int32)), "b": A(r.integers(0, 9, n).astype(np.int32)),
+                  "d": A(np.zeros(n, np.int32))})
+    res = _q(t, filt=False).compute(device="cpu")
+    assert res.schema.field("a").type == pa.int32()
+    _check(res, _expected(t))
+    assert calls == [0]
 
 
 def test_nulls_take_the_existing_path(calls):
@@ -159,7 +180,7 @@ def test_negative_int32_keys(calls):
     assert calls == [0]
 
 
-def test_a_dip_at_a_block_boundary_is_unsorted(calls):
+def test_a_dip_at_a_block_boundary_takes_the_hash_path(calls):
     # the kernel splits 200k rows into blocks of n // nb rows: put a single descent exactly there
     t = _table(n=200_000)
     a = t.column("a").to_numpy().copy()
@@ -170,7 +191,7 @@ def test_a_dip_at_a_block_boundary_is_unsorted(calls):
         calls.clear()
         res = _q(t2, filt=False).compute(device="cpu")
         _check(res, _expected(t2))
-        assert calls == [nx.E_UNSORTED]
+        assert calls == [0]          # unsorted: the radix-partitioned hash path (F-046b)
 
 
 def test_sliced_input(calls):
@@ -203,3 +224,14 @@ def test_gpu_keeps_the_old_plan(calls):
     res = _q(t).compute(device="gpu")
     _check(res, _expected(t, lambda d: d < 60))
     assert calls == []
+
+
+def test_unsorted_sparse_keys_fall_back(calls):
+    # a key range far wider than the rows: the hash aggregate declines and the old path answers
+    r = np.random.default_rng(15)
+    n = 50_000
+    t = pa.table({"a": A((r.integers(0, 2000, n) * 10**9).astype(np.int64)), "b": A(r.integers(0, 5, n).astype(np.int64)),
+                  "d": A(np.zeros(n, np.int32))})
+    res = _q(t, filt=False).compute(device="cpu")
+    _check(res, _expected(t))
+    assert calls == [nx.E_UNSORTED]

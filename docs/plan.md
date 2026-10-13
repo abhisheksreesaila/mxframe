@@ -433,6 +433,8 @@ Needs: none · Pre-existing, found by the F-041 review
 - [ ] `SELECT kid ... JOIN ... ON k = kid GROUP BY kid` returns the column as `k`
 - [ ] `GROUP BY ALL` drops the keys
 - [ ] a duplicate output name (`SELECT x, SUM(v) AS x`) is accepted (DuckDB raises)
+- [ ] HAVING is dropped without an error (`... GROUP BY flag HAVING SUM(v) > 25000` gives no Filter); found by the F-046d review
+- [ ] `COUNT(DISTINCT x)` raises NotImplementedError
 - [ ] arithmetic on an aggregate (`SUM(v) * 2 AS y`) is not seen as an aggregate: raises "Aggregate.aggs cannot be empty", or the column is silently dropped when another aggregate is present
 
 ## F-043 SF10: the four queries DuckDB still wins, with general fixes only [todo]
@@ -455,13 +457,16 @@ Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
 Needs: none · Found by the F-043 review
 - [ ] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks)
 
-## F-046 Where DuckDB is still faster (from F-044) [todo]
-Needs: none · general fixes only
-- [ ] joins (random joins 0.64-0.86x DuckDB; TPC-H Q3 / Q5 / Q8 / Q12 / Q17 / Q22 at SF10)
-- [ ] COUNT(DISTINCT) and SELECT DISTINCT (0.3-0.6x DuckDB): unsorted keys fall back; dictionary columns are decoded for the whole table before the filter (q68: 26 ms on 6M rows to keep 1%)
-- [ ] shuffled data: Q21 without sorted runs (hash count-distinct), Q18, Q9
-- [ ] top-N 0.4-0.6x DuckDB: fuse the filter into the top-k (no filtered table)
-- [ ] a quiet-machine rerun of m2p (other projects ran at ~5 cores during it)
+## F-046 Close the CPU gaps to DuckDB (next release) [doing]
+Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong baseline). General fixes only; every slice measured on TPC-H (stored and shuffled) and the random suite, and must not slow any other query. MojoFrame (illinoisdata/MojoFrame, arXiv 2505.04080) checked: its techniques (integer ids for low-cardinality strings, tuple-hash group-by, factorize-then-join) are already covered here; the slices below follow the database literature instead
+- [ ] F-046a joins: profile the random joins (0.64-0.86x DuckDB) and TPC-H Q3 / Q5 / Q8 / Q12 / Q17 / Q22; a partitioned parallel hash join in Mojo for build sides that are not direct-addressable and for the leaf-by-leaf fallback
+- [ ] F-046g SELECT DISTINCT on dictionary / unsorted data (0.43-0.67x DuckDB; random q30: DISTINCT of two dictionary columns over 15M filtered rows, 375 ms vs 27)
+- [ ] F-046c zone maps: per-chunk min / max to skip chunks a filter cannot match
+- [x] F-046d dictionary strings pass through joins as codes when the plan reads them above the join only in dictionary-native ways (bare group key, native predicates): the native join scan writes int32 codes of one unified dictionary (per-chunk remaps), the group-by uses them as they are; columns that reach the output are decoded as before. Random SF10 joins 387 -> 217 ms and 1597 -> 639 ms. `tests/test_dict_through_join.py`
+- [ ] F-046f single-table filters: a dictionary column projected or DISTINCTed after a filter is decoded for the whole table first (q68: 6M rows decoded to keep 60k, ~36 ms); filter on codes, decode only surviving rows
+- [x] F-046b COUNT(DISTINCT) on unsorted keys: a radix-partitioned hash aggregate in `mx_count_distinct` (partitions of about 64k consecutive keys, pairs deduped and counted per key in cache, no atomics, output in key order; key ranges past max(2^26, 8 x rows) still fall back). Shuffled SF10 Q21 4.98 s -> 1.47 s (DuckDB 2.88). Costs 16 bytes of scratch per row (24 with string values); a key range holding most rows is one partition, so one worker
+- [ ] F-046e top-k fused with its filter (no filtered table)
+- [ ] numbers: TPC-H stored + shuffled and the random suite (SF1, SF1 shuffled, SF10) on one build, a quiet machine if possible
 
 ## F-039 The optimization story: README with visuals [doing]
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13

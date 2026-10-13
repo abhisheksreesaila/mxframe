@@ -402,9 +402,9 @@ def test_a_selected_partner_is_filtered_natively_on_its_dictionary(monkeypatch):
     seen = []
     real = nx.try_filter
 
-    def spy(comp, table, preds, needed, lookups=()):
+    def spy(comp, table, preds, needed, lookups=(), **kw):
         seen.append((table.num_rows, table.schema))
-        return real(comp, table, preds, needed, lookups)
+        return real(comp, table, preds, needed, lookups, **kw)
 
     monkeypatch.setattr(nx, "try_filter", spy)
     co._JOIN_RESULT_CACHE.clear()
@@ -429,9 +429,9 @@ def test_a_selected_partner_read_from_parquet_keeps_its_strings_encoded(monkeypa
     seen = []
     real = nx.try_filter
 
-    def spy(comp, table, preds, needed, lookups=()):
+    def spy(comp, table, preds, needed, lookups=(), **kw):
         seen.append((table.num_rows, table.schema))
-        return real(comp, table, preds, needed, lookups)
+        return real(comp, table, preds, needed, lookups, **kw)
 
     monkeypatch.setattr(nx, "try_filter", spy)
 
@@ -468,9 +468,9 @@ def test_a_filtered_string_also_selected_after_the_join_stays_encoded_in_its_lea
     seen = []
     real = nx.try_filter
 
-    def spy(comp, table, preds, needed, lookups=()):
+    def spy(comp, table, preds, needed, lookups=(), **kw):
         seen.append((table.num_rows, table.schema))
-        return real(comp, table, preds, needed, lookups)
+        return real(comp, table, preds, needed, lookups, **kw)
 
     monkeypatch.setattr(nx, "try_filter", spy)
     co._JOIN_RESULT_CACHE.clear()

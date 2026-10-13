@@ -476,11 +476,12 @@ def _call_count_distinct(lib, plan_addr: int, out_addr: int) -> int:
 
 
 def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str) -> Optional[pa.Table]:
-    """``table.distinct().group_by(key).count(val)`` without the distinct table (F-023): when
-    ``key`` is non-decreasing (TPC-H lineitem by order key, and any filter of it), equal keys form
-    runs and one native pass counts the distinct ``val`` of every run. Returns ``key`` (its own type)
-    and ``name`` (int64) in key order; None when the key is not sorted or the columns do not fit
-    (int32 / int64 key, int32 / int64 / utf8 value, no nulls), so the caller's path answers."""
+    """``table.distinct().group_by(key).count(val)`` without the distinct table. A non-decreasing
+    ``key`` (TPC-H lineitem by order key, and any filter of it) is counted run by run (F-023); any
+    other key by a radix-partitioned hash aggregate over the key's range (F-046b). Returns ``key``
+    (its own type) and ``name`` (int64) in key order; None when the key range is too sparse (past
+    max(2^26, 8 x rows)) or the columns do not fit (int32 / int64 key, int32 / int64 / utf8 value,
+    no nulls), so the caller's path answers."""
     if not enabled() or not available():
         return _decline("count distinct: native executor off")
     if getattr(compiler, "_device_arg", None) != "cpu":
@@ -510,7 +511,7 @@ def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str)
             if st[8]:
                 _RELEASE(st[8])(ctypes.addressof(st))
     if rc == E_UNSORTED:
-        return _decline("count distinct: key not sorted")
+        return _decline("count distinct: key range too sparse")
     if rc < 0:
         return _decline(f"count distinct: executor declined (code {rc})")
     n = int(O[0])
@@ -716,25 +717,46 @@ def _out_kind(t: pa.DataType):
 _KEY_WIDTH = {pa.int32(): 4, pa.int64(): 8, pa.date32(): 4}
 
 
+def _unified_dictionary(dicts):
+    """One dictionary of the distinct values of ``dicts`` (string arrays: per-chunk dictionaries)
+    and, per input, an int32 NumPy remap of its codes to the unified codes (F-046d). Dictionaries
+    are small (a Parquet row group's distinct values), and shared ones are mapped once."""
+    import numpy as np
+    from ._lazy_pc import pc
+    from .np_arrow import to_numpy
+    def ident(d):            # the same dictionary buffers (chunks sharing one dictionary)
+        return (d.offset, len(d)) + tuple(b.address if b is not None else 0 for b in d.buffers())
+
+    uniq, seen = [], {}
+    for d in dicts:
+        if ident(d) not in seen:
+            seen[ident(d)] = len(uniq)
+            uniq.append(d)
+    unified = pc.unique(pa.concat_arrays(uniq))
+    maps = [np.ascontiguousarray(to_numpy(pc.index_in(d, value_set=unified)).astype(np.int32)) for d in uniq]
+    return unified, [maps[seen[ident(d)]] for d in dicts]
+
+
 class Lookup:
     """A join partner fused into the leaf filter (F-032): rows of the scanned table whose ``probe``
     columns equal ``build_keys`` of a row of ``build`` keep that row's ``outputs`` (written under
     ``names``). ``build`` keys must be unique (a duplicate declines); 1 or 2 integer key columns.
     ``semi``: only whether a partner row exists counts (keys may repeat, no outputs)."""
-    __slots__ = ("probe", "build", "build_keys", "outputs", "names", "semi")
+    __slots__ = ("probe", "build", "build_keys", "outputs", "names", "semi", "keep")
 
-    def __init__(self, probe, build: pa.Table, build_keys, outputs, names=None, semi=False):
+    def __init__(self, probe, build: pa.Table, build_keys, outputs, names=None, semi=False, keep=()):
         self.probe, self.build, self.build_keys = list(probe), build, list(build_keys)
         self.outputs = list(outputs)
         self.names = list(names) if names is not None else list(outputs)
         self.semi = bool(semi)
+        self.keep = frozenset(keep)        # dictionary outputs written as codes, not decoded (F-046d)
 
 
 def _lookup_key_kind(t: pa.DataType):
     return "date" if t == pa.date32() else "int"
 
 
-def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Optional[pa.Table]:
+def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_dict=()) -> Optional[pa.Table]:
     """The rows of ``table`` that pass every predicate (and find a partner row in every lookup),
     holding the ``needed`` columns (None: all) in table order, then each lookup's outputs, in one
     native call; dictionary string columns come back decoded (as the join path expects). None: the
@@ -770,12 +792,16 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
         dtypes.append(_DT[c.type])
     ocols = [table.column(n) for n in names]
     kinds, sizes = [], []
+    coded = []                                  # output positions written as dictionary codes
     for n, c in zip(names, ocols):
         k = _out_kind(c.type)
         if k is None or c.null_count:
             return _filter_decline(f"output column {n}: type {c.type} or nulls")
         if k[0] == 2 and any(ch.dictionary.null_count for ch in c.chunks):
             return _filter_decline(f"output column {n}: null in a dictionary")
+        if k[0] == 2 and n in keep_dict:
+            coded.append(len(kinds))
+            k = (3, 0)                           # remap table address filled in below
         kinds.append(k[0])
         sizes.append(k[1])
 
@@ -813,6 +839,8 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
             if k[0] == 2 and col.chunk(0).dictionary.null_count:
                 return _filter_decline(f"lookup output {on}: null in a dictionary")
             arr = col.chunk(0)
+            if k[0] == 2 and on in lk.keep:
+                k = (3, 0)
             bouts.append((arr, k))
             out_types.append(col.type)
             out_names.append(nm)
@@ -828,6 +856,14 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
 
     width = len(every)
     structs = []
+    # dictionary columns kept coded: one unified dictionary each, a code remap per segment
+    unified = {}
+    for j in coded:
+        u, maps = _unified_dictionary([seg[len(vcols) + j].dictionary for seg in segs])
+        tab = (ctypes.c_int64 * len(segs))(*[m.ctypes.data for m in maps])
+        keep_alive.extend([maps, tab])
+        sizes[j] = ctypes.addressof(tab)
+        unified[j] = u
 
     def export(arr):
         st = (ctypes.c_int64 * 10)()
@@ -844,6 +880,12 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
         for j, (nk, pks, bkeys, widths, bouts) in enumerate(look_words):
             bo = (ctypes.c_int64 * max(3 * len(bouts), 1))()
             for t, (arr, (kind, size)) in enumerate(bouts):
+                if kind == 3:                            # a partner is one chunk: one remap
+                    u, (m,) = _unified_dictionary([arr.dictionary])
+                    tab = (ctypes.c_int64 * 1)(m.ctypes.data)
+                    keep_alive.extend([m, tab])
+                    size = ctypes.addressof(tab)
+                    unified[("b", j, t)] = u
                 bo[3 * t], bo[3 * t + 1], bo[3 * t + 2] = export(arr), kind, size
             keep_alive.append(bo)
             L[8 * j: 8 * j + 8] = [nk, pks[0], pks[1] if nk == 2 else -1, export(bkeys[0]),
@@ -881,11 +923,21 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
     def buf(addr, nbytes):
         return pa.foreign_buffer(int(addr), max(nbytes, 0), base=owner)
 
+    coded_out = {j: unified[j] for j in coded}
+    pos = len(ocols)
+    for jl, (nk, pks, bkeys, widths, bouts) in enumerate(look_words):
+        for tb, (arr, (kind, size)) in enumerate(bouts):
+            if kind == 3:
+                coded_out[pos] = unified[("b", jl, tb)]
+            pos += 1
     out = []
     for j, t in enumerate(out_types):
         kind, size = _out_kind(t)
         a, b = int(O[2 + 2 * j]), int(O[3 + 2 * j])
-        if kind == 0:
+        if j in coded_out:
+            idx = pa.Array.from_buffers(pa.int32(), n, [None, buf(a, 4 * n)])
+            out.append(pa.DictionaryArray.from_arrays(idx, coded_out[j]))
+        elif kind == 0:
             out.append(pa.Array.from_buffers(t, n, [None, buf(a, n * size)]))
         else:
             nbytes = ctypes.c_int32.from_address(a + 4 * n).value
