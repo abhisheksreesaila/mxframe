@@ -223,8 +223,8 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
         a("**Engine-only:** a fresh Python process; each engine first loads the columns the query uses "
           "from Parquet into its own in-memory form (pandas / Polars DataFrame, DuckDB table, Arrow table "
           "under an MXFrame LazyFrame), outside the clock; the clock then covers *query + materialized "
-          "result* only. No warm-up run. This isolates the query engine from file reading; the user-felt "
-          "scoreboard (clock around read + query) stays the headline for what a user waits for. "
+          "result* only. No warm-up run. Loading data is staging; this is the headline measure (since 2026-10-13). The user-felt "
+          "scoreboard (clock around read + query) is the secondary number. "
           "Load and `import` times are reported separately. "
           "Numbers are milliseconds; **bold** = fastest verified engine for that query.\n")
     else:

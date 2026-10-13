@@ -1,5 +1,14 @@
 # 📊 MXFrame — TPC-H Benchmarks
 
+> **Current headline (2026-10-13):** engine-only first runs after the Mojo executor work, in
+> [bench/m2l-engine.md](bench/m2l-engine.md) and [optimizations.md](optimizations.md): SF10 6.45 s
+> against Polars 15.20 s and DuckDB 6.66 s. Loading data is staging, outside the clock. Everything
+> below is earlier and kept for history.
+
+---
+
+## Method of the oldest runs (the 1M / 10M-row tables further down; history only)
+
 > **Hardware:** NVIDIA RTX 3090 (sm_86) · AMD 12-core CPU · Mojo 26.4 (1.0.0b2) AOT kernels
 > **Baselines:** Polars 1.29+ · Pandas 3.0 · MXFrame CPU path · MXFrame GPU path
 > **Data:** TPC-H schema synthetic data (numpy RNG, fixed seed)
@@ -51,7 +60,7 @@ Check `uptime` (load < 2) and `nvidia-smi` (no other GPU users) first.
 
 ## Engine-only scoreboard (2026-10-12, F-024)
 
-**What is measured:** the query engine alone. Same harness, data and machine as the user-felt run above, with one change: each engine first loads the columns its query uses into its own in-memory form, outside the clock. pandas and Polars get DataFrames, DuckDB gets in-memory tables, and MXFrame gets Arrow tables under a `LazyFrame`. The clock then covers query + materialized result only. It is still a fresh process per (engine, query) with no warm-up run. The user-felt numbers stay the headline; this run separates engine speed from file reading. One thing favours MXFrame and one works against it; the reports say so. The CPU warm-up thread that `import mxframe` starts finishes during the untimed load. Against that, MXFrame still combines Arrow chunks, and on the GPU uploads them, inside the clock.
+**What is measured:** the query engine alone. Same harness, data and machine as the user-felt run above, with one change: each engine first loads the columns its query uses into its own in-memory form, outside the clock. pandas and Polars get DataFrames, DuckDB gets in-memory tables, and MXFrame gets Arrow tables under a `LazyFrame`. The clock then covers query + materialized result only. It is still a fresh process per (engine, query) with no warm-up run. This run separates engine speed from file reading. (Since 2026-10-13 engine-only is the headline measure and user-felt is secondary; the current numbers are in [bench/m2l-engine.md](bench/m2l-engine.md).) One thing favours MXFrame and one works against it; the reports say so. The CPU warm-up thread that `import mxframe` starts finishes during the untimed load. Against that, MXFrame still combines Arrow chunks, and on the GPU uploads them, inside the clock.
 Run started 09:15 on a quiet machine (load1 under 2 for 3 minutes). As in the user-felt run, the engines' own threads raised load1 to a median of 3.0 at SF1 and 6.7 at SF10. The run used commit 302cc70; the engine code is the same as the user-felt run's.
 Full tables: [SF1](bench/engine-sf1.md) · [SF10](bench/engine-sf10.md).
 

@@ -8,7 +8,8 @@ the same process is a secondary number.  Every result is checked against DuckDB.
 
 `--mode engine` (F-024) is the engine-only scoreboard: each engine first loads the columns the
 query uses into its own in-memory form (outside the clock, recorded as load_ms) and the clock
-covers query + materialized result only.  The user-felt mode stays the headline.
+covers query + materialized result only.  Since 2026-10-13 this is the headline measure (loading
+data is staging); user-felt is the secondary number.
 
     pixi run python scripts/bench_user_felt.py --sf 1,10 --queries 1-22 \
         --engines pandas,polars,duckdb,mx-cpu,mx-gpu,mx-auto --timeout 300 --out docs/bench
@@ -148,7 +149,7 @@ def main() -> None:
     ap.add_argument("--name", default=None,
                     help="output basename (default user-felt-<date>, or engine-only-<date> with --mode engine)")
     ap.add_argument("--mode", choices=["user-felt", "engine"], default="user-felt",
-                    help="user-felt (headline): clock around Parquet read + query; engine: each engine loads "
+                    help="user-felt (secondary): clock around Parquet read + query; engine (headline): each engine loads "
                          "the query's columns into memory first, the clock covers query + result only")
     ap.add_argument("--resume", action="store_true",
                     help="keep the existing CSV and skip (engine, sf, query) rows already in it")

@@ -107,8 +107,13 @@ print(result.to_pandas())
 
 In two days of work, the engine went from Python glue around kernels to Mojo running each query
 stage in one native call. Python plans; Mojo runs the filters, joins, group-bys, DISTINCT and
-gathers directly on Arrow memory. Engine-only TPC-H (data already in memory, fresh process, no
-warm-up, every result checked against DuckDB):
+gathers directly on Arrow memory.
+
+**How we measure (the headline): engine-only, first run.** Loading data is staging: each engine
+first reads the query's columns from Parquet into its own in-memory form, outside the clock, as
+the official TPC-H power test, the H2O db-benchmark and ClickBench do. The clock covers the query
+and its materialized result only, in a fresh process, on the **first** run: no warm-up and no
+reused results. Every result is checked against DuckDB.
 
 ![MXFrame total per milestone against Polars and DuckDB](docs/img/progress.svg)
 
@@ -117,21 +122,27 @@ warm-up, every result checked against DuckDB):
 | SF10 | **6.45 s** | 15.20 s | 6.66 s |
 | SF1 | **0.73 s** | 1.34 s | 2.31 s |
 
-- **Against Polars:** faster on 21 of 22 queries at SF10 and 14 of 22 at SF1.
+- **Against Polars:** faster on 20 of the 21 verified queries at SF10 (Polars' Q1 result is wrong,
+  see below) and on 14 of 22 at SF1.
 - **Against DuckDB:** faster on 17 of 22 at SF10 and on all 22 at SF1.
 
 Each optimization is explained with a diagram, its before/after numbers, and the Mojo feature it
 relies on (or a plain statement when it is ordinary engineering) in
 **[docs/optimizations.md](docs/optimizations.md)**. Caveats:
 
-- These are engine-only numbers on a shared machine.
-- The user-felt scoreboard below, which includes the Parquet read, predates this work.
-- Polars' Q1 is an outlier (see the doc).
+- The machine was shared during this run; a quiet-machine rerun is still to do.
+- `import mxframe` warms its kernel libraries in the background, and that finishes during the
+  untimed staging. Polars and DuckDB have no equivalent step.
+- Polars' Q1 at SF10 takes 2.8 s and its result differs from DuckDB's, so it is not counted as a
+  win. Leaving Q1 out, SF10 totals are MXFrame 6.39 s, Polars 12.40 s, DuckDB 6.44 s.
+- One thing works against MXFrame: it combines Arrow chunks inside the clock.
+- Import time and the Parquet read are reported separately, not hidden. The earlier scoreboards
+  below include them and predate this work; MXFrame still reads Parquet through PyArrow (F-021).
 
-## 📊 Performance: user-felt TPC-H (2026-10-12)
+## 📊 Earlier scoreboards (2026-10-12, before the Mojo executor)
 
-Each engine runs each query in a fresh process. The data starts as Parquet on disk, and the
-clock covers read + query + result with no warm-up. Every result is checked against DuckDB.
+**User-felt (secondary).** These include staging: each engine runs each query in a fresh
+process. The data starts as Parquet on disk, and the clock covers read + query + result with no warm-up. Every result is checked against DuckDB.
 Ryzen 9 5900X, RTX 3090.
 
 | sum of 22 queries, ms | pandas | Polars | DuckDB | MXFrame `auto` |

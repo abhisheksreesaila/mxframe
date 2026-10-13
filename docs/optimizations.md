@@ -47,7 +47,7 @@ memory. Arrow then wraps that block without copying it.
 
 ```mermaid
 timeline
-    title SF10 engine-only total, 22 TPC-H queries (Polars: 15.0 s, DuckDB: 6.9 s)
+    title SF10 engine-only total, 22 TPC-H queries (Polars: 15.2 s, DuckDB: 6.7 s)
     before the executor : 22.7 s
     M1 native aggregates : 21.0 s
     M2a native leaf filters : 16.2 s
@@ -206,8 +206,8 @@ inlines it into the specialized row loop. SF10 Q9 666 → 439 ms (Polars 930 ms)
 | SF10, engine-only | **6.45 s** | 15.20 s | 6.66 s |
 | SF1, engine-only | **0.73 s** | 1.34 s | 2.31 s |
 
-- **Against Polars:** faster on 21 of 22 queries at SF10 (Q16: 99 ms vs 98 ms, a tie) and 14 of
-  22 at SF1.
+- **Against Polars:** faster on 20 of the 21 verified queries at SF10 (Q16: 99 ms vs 98 ms, a
+  tie; Polars' Q1 result is wrong, see below) and on 14 of 22 at SF1.
 - **Against DuckDB:** faster on 17 of 22 at SF10 and on all 22 at SF1.
 - All 44 results equal DuckDB's.
 
@@ -215,9 +215,13 @@ inlines it into the specialized row loop. SF10 Q9 666 → 439 ms (Polars 930 ms)
 
 ### Read these numbers honestly
 
-- **Engine-only** means the data is already in memory. The headline, user-felt scoreboard (Parquet
-  read included, `docs/benchmarks.md`) has not been re-run since these optimizations. MXFrame
-  still reads Parquet through PyArrow, so that gap remains (F-021).
+- **Engine-only is the headline.** Loading data is staging and stays outside the clock (as in the
+  TPC-H power test, the H2O db-benchmark and ClickBench); the clock covers the first run of the
+  query in a fresh process. The secondary user-felt scoreboard (import and Parquet read included,
+  `docs/benchmarks.md`) has not been re-run since these optimizations. MXFrame still reads
+  Parquet through PyArrow, so that gap remains (F-021).
+- **MXFrame's kernel warm-up is staged.** `import mxframe` warms the kernel libraries in a
+  background thread that finishes during the untimed load; Polars and DuckDB have no such step.
 - **Polars' Q1 is an outlier.** At SF10 its first run takes 2.8 s, and its result differs from
   DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are MXFrame 6.39 s, Polars 12.40 s,
   DuckDB 6.44 s.
