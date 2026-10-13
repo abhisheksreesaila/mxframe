@@ -74,6 +74,8 @@ def _load():
             lib.mx_gather.restype = ctypes.c_int64
             lib.mx_distinct.argtypes = [ctypes.c_int64, ctypes.c_int64]
             lib.mx_distinct.restype = ctypes.c_int64
+            lib.mx_count_distinct.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_count_distinct.restype = ctypes.c_int64
             _lib = lib
     return _lib
 
@@ -456,6 +458,65 @@ def try_distinct(compiler, table: pa.Table) -> Optional[pa.Table]:
         out = pc.take(table, pa.array(idx))
     _last.update(path="native", decline=None)
     return out
+
+
+CMAGIC = 0x4D584332
+E_UNSORTED = -20
+
+
+def _call_count_distinct(lib, plan_addr: int, out_addr: int) -> int:
+    """The native count-distinct call (a separate function so tests can count it)."""
+    return lib.mx_count_distinct(plan_addr, out_addr)
+
+
+def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str) -> Optional[pa.Table]:
+    """``table.distinct().group_by(key).count(val)`` without the distinct table (F-023): when
+    ``key`` is non-decreasing (TPC-H lineitem by order key, and any filter of it), equal keys form
+    runs and one native pass counts the distinct ``val`` of every run. Returns ``key`` (its own type)
+    and ``name`` (int64) in key order; None when the key is not sorted or the columns do not fit
+    (int32 / int64 key, int32 / int64 / utf8 value, no nulls), so the caller's path answers."""
+    if not enabled() or not available():
+        return _decline("count distinct: native executor off")
+    if getattr(compiler, "_device_arg", None) != "cpu":
+        return _decline("count distinct: device='cpu'")
+    a, b = table.column(key), table.column(val)
+    if a.type not in (pa.int32(), pa.int64()) or b.type not in _DISTINCT_KIND or a.null_count or b.null_count:
+        return _decline("count distinct: column types or nulls")
+    if table.num_rows < 1:
+        return _decline("count distinct: empty input")
+    import numpy as np
+    flat = [c.combine_chunks() if c.num_chunks != 1 else c.chunk(0) for c in (a, b)]
+    structs = []
+    try:
+        for arr in flat:
+            st = (ctypes.c_int64 * 10)()
+            arr._export_to_c(ctypes.addressof(st))
+            structs.append(st)
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 6)(CMAGIC, ctypes.addressof(structs[0]), 0 if a.type == pa.int32() else 1,
+                                 ctypes.addressof(structs[1]), _DISTINCT_KIND[b.type],
+                                 default_threads(table.num_rows))
+        O = (ctypes.c_int64 * 2)()
+        lib = _load()
+        rc = _call_count_distinct(lib, ctypes.addressof(P), ctypes.addressof(O))
+    finally:
+        for st in structs:
+            if st[8]:
+                _RELEASE(st[8])(ctypes.addressof(st))
+    if rc == E_UNSORTED:
+        return _decline("count distinct: key not sorted")
+    if rc < 0:
+        return _decline(f"count distinct: executor declined (code {rc})")
+    n = int(O[0])
+    owner = _Arena(lib, int(O[1]))
+    buf = pa.foreign_buffer(int(O[1]), 16 * n, base=owner)
+    keys = pa.Array.from_buffers(pa.int64(), n, [None, buf], offset=0)
+    cnts = pa.Array.from_buffers(pa.int64(), n, [None, buf], offset=n)
+    if a.type == pa.int32():
+        from ._lazy_pc import pc
+        keys = pc.cast(keys, pa.int32())
+    _last.update(path="native", decline=None)
+    return pa.table({key: keys, name: cnts})
 
 
 # ── M2: native leaf filter (Filter*(Scan) under a join) ─────────────────────────────────────

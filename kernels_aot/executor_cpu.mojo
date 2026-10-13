@@ -2844,3 +2844,168 @@ def mx_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
     free_big(Int(keep))
     bk.free()
     return 0
+
+
+# ── F-023: COUNT(DISTINCT b) per a, for a key column a in non-decreasing order ──────────────────
+#
+# Plan (int64 words):
+#   0 CMAGIC   1 a (ArrowArray*, int32 / int64, one chunk)   2 a's kind (0 int32, 1 int64)
+#   3 b (ArrowArray*, one chunk, same length)   4 b's kind (0 int32, 1 int64, 2 utf8)   5 threads
+# Output: 0 number of groups, 1 arena: int64 keys[n], then int64 counts[n], in key order
+# (mx_exec_free). Returns E_UNSORTED when a is not non-decreasing (the caller's path answers).
+# Equal keys form one run, so every run is a group: blocks are moved to the next run start, each
+# worker counts its runs, prefix sums give each block's first output slot, and a second pass counts
+# the distinct b of every run (pairwise for short runs, an open-addressing table for long ones).
+
+comptime CMAGIC = 0x4D584332
+comptime E_UNSORTED = -20
+comptime SHORT_RUN = 32
+
+
+@always_inline
+def _run_distinct(kb: Int, b: Int, s: Int, e: Int) -> Int:
+    """Distinct values of b among rows s .. e - 1."""
+    var L = e - s
+    var d = 0
+    if L <= SHORT_RUN:
+        for i in range(s, e):
+            var seen = False
+            for j in range(s, i):
+                if _dval_eq(kb, b, j, i):
+                    seen = True
+                    break
+            if not seen:
+                d += 1
+        return d
+    var cap = _pow2_at_least(2 * L + 2)
+    var tab = unsafe_alloc[Int64](cap)
+    for t in range(cap):
+        tab[t] = -1
+    for i in range(s, e):
+        var h = _dval_hash(kb, b, i)
+        var t = Int(h & UInt64(cap - 1))
+        var new = True
+        while True:
+            var r = Int(tab[t])
+            if r < 0:
+                break
+            if _dval_eq(kb, b, r, i):
+                new = False
+                break
+            t = (t + 1) & (cap - 1)
+        if new:
+            tab[t] = Int64(i)
+            d += 1
+    tab.free()
+    return d
+
+
+@export
+def mx_count_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != CMAGIC:
+        return E_BAD_PLAN
+    var a = Int(P[1])
+    var wa = 4 if Int(P[2]) == 0 else 8
+    var b = Int(P[3])
+    var kb = Int(P[4])
+    var threads = max(1, Int(P[5]))
+    var O = _lp(out_a)
+    var n = _arr_len(a)
+    if Int(P[2]) < 0 or Int(P[2]) > 1 or kb < 0 or kb > 2 or _arr_len(b) != n or n < 1:
+        return E_BAD_PLAN
+    var nb = max(1, min(threads * 4, (n + 65535) // 65536))
+    var nt = max(1, min(threads, nb))
+    var starts = unsafe_alloc[Int64](nb + 1)       # block b covers rows starts[b] .. starts[b + 1]
+    var unsorted = unsafe_alloc[Int64](1)
+    unsorted[0] = 0
+    var counter = unsafe_alloc[Int64](1)
+
+    # 1. sortedness check, and block bounds moved forward to the start of a run
+    counter[0] = 0
+
+    def check(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var lo = blk * n // nb
+            var hi = (blk + 1) * n // nb
+            for i in range(max(lo, 1), hi):
+                if _ival(a, wa, i) < _ival(a, wa, i - 1):
+                    unsorted[0] = 1
+                    break
+            var s = lo
+            if blk > 0:
+                var k = _ival(a, wa, lo - 1)
+                while s < n and _ival(a, wa, s) == k:
+                    s += 1
+            starts[blk] = Int64(s)
+
+    _par(check, nt)
+    if Int(unsorted[0]) != 0:
+        starts.free()
+        unsorted.free()
+        counter.free()
+        return E_UNSORTED
+    starts[nb] = Int64(n)
+    for blk in range(1, nb + 1):                   # a run longer than a block: later blocks empty
+        if Int(starts[blk]) < Int(starts[blk - 1]):
+            starts[blk] = starts[blk - 1]
+
+    # 2. runs per block, prefix sums
+    var nr = unsafe_alloc[Int64](nb + 1)
+    counter[0] = 0
+
+    def count_runs(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var lo = Int(starts[blk])
+            var hi = Int(starts[blk + 1])
+            var r = 0
+            for i in range(lo, hi):
+                if i == lo or _ival(a, wa, i) != _ival(a, wa, i - 1):
+                    r += 1
+            nr[blk] = Int64(r)
+
+    _par(count_runs, nt)
+    var tot = 0
+    for blk in range(nb):
+        var r = Int(nr[blk])
+        nr[blk] = Int64(tot)
+        tot += r
+    var arena = unsafe_alloc[UInt8](max(tot * 16, 16), alignment=64)
+    var keys = _lp(Int(arena))
+    var cnts = _lp(Int(arena) + tot * 8)
+
+    # 3. one group per run: its key and its number of distinct b
+    counter[0] = 0
+
+    def emit(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var at = Int(nr[blk])
+            var hi = Int(starts[blk + 1])
+            var s = Int(starts[blk])
+            while s < hi:
+                var k = _ival(a, wa, s)
+                var e = s + 1
+                while e < hi and _ival(a, wa, e) == k:
+                    e += 1
+                keys[at] = Int64(k)
+                cnts[at] = Int64(_run_distinct(kb, b, s, e))
+                at += 1
+                s = e
+
+    _par(emit, nt)
+    O[0] = Int64(tot)
+    O[1] = Int64(Int(arena))
+    starts.free()
+    unsorted.free()
+    counter.free()
+    nr.free()
+    return 0

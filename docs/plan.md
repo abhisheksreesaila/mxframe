@@ -247,10 +247,10 @@ Needs: F-020 merged · From the F-020 report
 - Seen once during F-022: SF1 Q18 `auto` exited -11 (no stderr) in a full-suite run while a 60M-row benchmark loaded the machine; 16 reruns clean (the rare crash under load from F-020)
 - `pixi run test-import` (`scripts/_test_base_import.py`) fails at HEAD before F-022 too: `mxframe.GraphCompiler` loads with MAX blocked
 
-## F-023 Q21: distinct + count as one n_unique [todo]
+## F-023 Q21: distinct + count as one n_unique [done]
 Needs: F-022 · From the F-022 profile
-- [ ] `select(a, b).distinct().groupby(a).agg(count)` runs as a per-key distinct count without materializing the distinct table
-- [ ] SF10 Q21 within 1.5x Polars user-felt
+- [x] `select(a, b).distinct().groupby(a).agg(count)` runs as a per-key distinct count without materializing the distinct table: when `a` is non-decreasing (lineitem is stored by order key, and filters keep that), runs of equal keys are the groups and one native pass (`mx_count_distinct`) counts each run's distinct `b`. Unsorted keys, nulls, GPU devices and other shapes keep the old plan. `tests/test_count_distinct.py` (20). Reviewer PASS
+- [x] SF10 Q21 within 1.5x Polars (engine-only, the headline since 2026-10-13): 3.44 s -> 0.96 s (Polars 4.12, DuckDB 2.80); SF1 279 -> 102 ms; both equal to DuckDB
 
 ## F-024 Engine-only scoreboard [done]
 Needs: F-009 · Asked for 2026-10-12: the user-felt headline mixes Parquet reading with query speed; add a second number that isolates the engine. The user-felt number stays the headline.

@@ -1355,6 +1355,36 @@ class CustomOpsCompiler(GraphCompiler):
                           pc.cast(r, wide) if isinstance(r, pa.Array) else r)
         return None
 
+    def _count_distinct_by_key(self, plan):
+        """``Aggregate(Distinct(two columns a, b), group_by=[a], aggs=[count(b) or count(*)])``
+        (TPC-H Q21's suppliers per order) as one native pass when ``a`` is sorted (F-023): no
+        distinct table, no second group-by. Returns a Scan of the result, an equivalent plan when
+        the native call declines (the distinct input computed once), or None for other shapes."""
+        if _native_exec is None or not isinstance(plan.input, Distinct) or plan.input.subset:
+            return None
+        if not _native_exec.enabled() or getattr(self, "_device_arg", None) != "cpu":
+            return None                    # GPU / auto / executor off: the plan as it was
+        if len(plan.group_by) != 1 or len(plan.aggs) != 1:
+            return None
+        k, agg = plan.group_by[0], plan.aggs[0]
+        if k.op != "col" or k._alias not in (None, k.args[0]) or agg.op != "count" or not agg._alias:
+            return None
+        key, arg = k.args[0], agg.args[0]
+        if not isinstance(arg, Expr) or (arg.op == "col" and arg.args[0] == key) or arg.op not in ("col", "lit"):
+            return None
+        table = self.compile_and_run(plan.input.input)
+        names = table.column_names
+        other = [c for c in names if c != key]
+        if len(names) != 2 or len(other) != 1 or (arg.op == "col" and arg.args[0] != other[0]):
+            return Aggregate(Scan(self.compile_and_run(Distinct(Scan(table), None))), plan.group_by, plan.aggs)
+        try:
+            res = _native_exec.try_count_distinct(self, table, key, other[0], agg._alias)
+        except Exception as exc:          # never fail the query: the equivalent plan answers
+            res = _native_exec._decline(f"count distinct raised {type(exc).__name__}: {exc}")
+        if res is None:
+            return Aggregate(Scan(self.compile_and_run(Distinct(Scan(table), None))), plan.group_by, plan.aggs)
+        return Scan(res)
+
     def _lower_row_ops(self, plan, top: bool = True):
         """Execute Sort/Limit/Distinct/Tail nodes that sit below a Filter/Project/Aggregate.
 
@@ -1377,6 +1407,9 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(plan, Project):
             return Project(self._lower_row_ops(plan.input, False), plan.exprs)
         if isinstance(plan, Aggregate):
+            counted = self._count_distinct_by_key(plan)
+            if counted is not None:
+                return counted
             return Aggregate(self._lower_row_ops(plan.input, False), plan.group_by, plan.aggs)
         return plan
 
