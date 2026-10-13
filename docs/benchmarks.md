@@ -1,9 +1,11 @@
 # 📊 MXFrame — TPC-H Benchmarks
 
-> **Current headline (2026-10-13):** engine-only first runs after the Mojo executor work, in
-> [bench/m2l-engine.md](bench/m2l-engine.md) and [optimizations.md](optimizations.md): SF10 6.45 s
-> against Polars 15.20 s and DuckDB 6.66 s. Loading data is staging, outside the clock. Everything
-> below is earlier and kept for history.
+> **Current headline (2026-10-13):** engine-only first runs, in [bench/m2p-engine.md](bench/m2p-engine.md)
+> (shuffled rows: [bench/m2p-engine-shuffled.md](bench/m2p-engine-shuffled.md); random queries:
+> [SF1](bench/random-sf1.md), [SF1 shuffled](bench/random-sf1-shuffled.md), [SF10](bench/random-sf10.md)) and [optimizations.md](optimizations.md):
+> SF10 MXFrame 3.27 s, Polars 14.94 s, DuckDB 5.31 s (DuckDB is faster on 13 of the 22 queries and
+> on shuffled data). Loading data is staging, outside the clock. Everything below is earlier and
+> kept for history; DuckDB times before 2026-10-13 include its pyarrow import (about 70 ms).
 
 ---
 

@@ -13,8 +13,10 @@ It is also an argument: that **Mojo** is a good language for building a data eng
 section says which Mojo feature the optimization relies on, or says plainly when the win is
 ordinary engineering that any language would get.
 
-> Numbers: [`docs/bench/m2n-engine.md`](bench/m2n-engine.md) (2026-10-13, mx-cpu, Polars and
-> DuckDB in one run; Ryzen 9 5900X, 12 cores). Charts: `pixi run python scripts/plot_progress.py`.
+> Numbers: [`docs/bench/m2p-engine.md`](bench/m2p-engine.md) and its shuffled-rows twin
+> (2026-10-13, mx-cpu, Polars and DuckDB in one run; Ryzen 9 5900X, 12 cores; a busy machine).
+> Earlier milestones' DuckDB figures included DuckDB's pyarrow import (see F-044 below); MXFrame's
+> own figures are unaffected. Charts: `pixi run python scripts/plot_progress.py`.
 
 ![MXFrame total per milestone against Polars and DuckDB](img/progress.svg)
 
@@ -47,7 +49,7 @@ memory. Arrow then wraps that block without copying it.
 
 ```mermaid
 timeline
-    title SF10 engine-only total, 22 TPC-H queries (Polars: 14.1 s, DuckDB: 6.6 s)
+    title SF10 engine-only total, 22 TPC-H queries (Polars: 14.9 s, DuckDB: 5.3 s)
     before the executor : 22.7 s
     M1 native aggregates : 21.0 s
     M2a native leaf filters : 16.2 s
@@ -58,6 +60,7 @@ timeline
     M2h native DISTINCT, leaner scans : 7.3 s
     M2i-M2l threads, semi/anti joins, expression keys : 6.45 s
     M2m-M2n sparse keys, count distinct on sorted keys : 3.82 s
+    F-043 many groups, runtime join filter, string kernels : 3.27 s
 ```
 
 ### M0 / M1: one native call runs a whole aggregate
@@ -240,20 +243,63 @@ the same idea when they know a column is sorted; MXFrame checks at run time.
 *Mojo:* the kernel is a few `parallelize` closures over blocks that start at run boundaries, and
 reuses the value hashing and comparison helpers written for DISTINCT, including strings.
 
+### F-043: four general fixes for the queries DuckDB led
+
+- **Millions of groups on every core.** A group-by with millions of groups (Q18's 15M orders) ran on
+  one worker, because each worker's partial table would have taken gigabytes. Now all workers
+  update one shared output with atomic add, min and max. A small per-worker cache of 4,096
+  groups sits in front, so a hot key (skewed data) stays local. Compacted keys are encoded per
+  block, with no group id per row. Q18 at SF10: 697 → about 400 ms. Non-TPC-H, 20M rows over 5M
+  groups: sum 608 → about 390 ms; 95% of rows on one key 29 → 21 ms.
+  *Mojo:* `Atomic[Scalar[DType.float64]]` add, min and max, and a compile-time `shared` parameter
+  on the interpreter loop.
+- **Runtime join filter.** A semi-join partner much larger than the filtered side (Q4's late
+  lineitems) is filtered through that side's keys first, so it never materializes rows nobody
+  can use. Q4: 224 → about 120 ms.
+- **One sort, not two.** With an ORDER BY in the same call, groups are no longer sorted into key
+  order first; the keys become the sort's last tie-break columns. Q10's group-by: 88 → 48 ms.
+- **String kernels.** `str_slice` and a string `IN (...)` run natively, counting UTF-8 code points
+  the way Arrow does. Q22: 148 → about 94 ms.
+
+### F-044: random queries, and a fairness bug in our own benchmark
+
+To check that none of this is TPC-H tuning, a seeded generator writes random queries over the
+TPC-H tables and runs each one in MXFrame, Polars and DuckDB, on the stored rows and on
+shuffled rows. Shapes: filters, group-bys, 1-3 joins, top-N, DISTINCT, COUNT(DISTINCT) and HAVING.
+Every result is checked against DuckDB, and **all 250 MXFrame results matched**.
+
+It found two blind spots and fixed them:
+- **ORDER BY ... LIMIT had no fast path.** A native top-k now keeps a heap of the best k rows per
+  worker (one query: 543 → 14 ms).
+- **WHERE-only queries were filtered by Arrow.** They now go through the native filter.
+
+It also found **a bug in the benchmark that favoured MXFrame.** DuckDB imports pyarrow inside its
+first `.arrow()` call, about 70 ms per process. That had been counted in every DuckDB time, and
+it explained most of the earlier "faster than DuckDB on 22/22 at SF1". The import is now staging,
+like MXFrame's own.
+
 ## Where it stands
 
 ![SF10: MXFrame against Polars per query](img/per-query-sf10.svg)
 
 | total of 22 queries | MXFrame (CPU) | Polars | DuckDB |
 |---|---:|---:|---:|
-| SF10, engine-only | **3.82 s** | 14.12 s | 6.57 s |
-| SF1, engine-only | **0.52 s** | 1.33 s | 2.20 s |
+| SF10, engine-only | **3.27 s** | 14.94 s | 5.31 s |
+| SF1, engine-only | **0.50 s** | 1.42 s | 0.63 s |
+| SF10, rows shuffled | 8.64 s | 15.21 s | **5.78 s** |
+| SF1, rows shuffled | 0.77 s | 1.34 s | **0.67 s** |
 
-- **Against Polars:** faster on all 21 verified queries at SF10 (the closest is Q16, 95 ms vs
-  100 ms; Polars' Q1 result is wrong, see below) and on 15 of 22 at SF1.
-- **Against DuckDB:** faster on 18 of 22 at SF10 (DuckDB wins Q4, Q10, Q18 and Q22) and on all 22
-  at SF1.
-- All 44 results equal DuckDB's.
+- **Against Polars:** faster on all 21 verified queries at SF10 (the closest is Q16, about even;
+  Polars' Q1 result is wrong) and on 13 of 22 at SF1. On random queries it is faster at SF10 (40
+  of 50, 2.7x geometric mean) and on shuffled SF1 (2.4x), and about even on stock SF1 (1.04x).
+- **Against DuckDB:** MXFrame's lower total on stock TPC-H comes from Q21 alone (0.81 s against
+  3.04 s at SF10), which needs lineitem stored by order key. Leaving Q21 out, DuckDB's SF10 total
+  is lower (2.27 s against 2.46 s). DuckDB is faster on 13 of the 22 queries at SF10, on most
+  random queries (MXFrame runs at 0.63x, 0.91x and 0.75x DuckDB's speed on SF1, SF1 shuffled and
+  SF10, geometric mean) and on shuffled data. Next: joins, DISTINCT on unsorted keys, and top-N
+  with a filter (F-046).
+- MXFrame's results equal DuckDB's on all 44 TPC-H runs, the 44 shuffled ones, and 250 random
+  queries.
 
 ![SF1: MXFrame against Polars per query](img/per-query-sf1.svg)
 
@@ -267,12 +313,14 @@ reuses the value hashing and comparison helpers written for DISTINCT, including 
 - **MXFrame's kernel warm-up is staged.** `import mxframe` warms the kernel libraries in a
   background thread that finishes during the untimed load; Polars and DuckDB have no such step.
 - **Polars' Q1 is an outlier.** At SF10 its first run takes 2.6 s, and its result differs from
-  DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are MXFrame 3.75 s, Polars 11.54 s,
-  DuckDB 6.35 s.
-- **SF1 losses are small.** MXFrame still loses 7 queries at SF1 (Q8, Q11, Q14, Q15, Q16, Q17,
-  Q22), each by 1-7 ms. Python planning is about 2-3 ms of each; the rest is per-call cost of
-  native calls on small inputs. These numbers move by a few ms from run to run.
-- **The machine was shared.** Other jobs were running during the run (median load average 4.4).
+  DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are MXFrame 3.20 s, Polars 12.28 s,
+  DuckDB 5.17 s.
+- **DuckDB is timed without its pyarrow import** (staging, like MXFrame's import); earlier
+  versions of this page counted it and overstated MXFrame's lead.
+- **TPC-H's stored order helps MXFrame on Q21.** On shuffled rows the sorted-run count-distinct
+  doesn't apply and Q21 takes about 5 s at SF10 (DuckDB about 2.9 s).
+- **The machine was shared.** Other projects used about 5 cores during the run (median load
+  average about 7).
   A quiet-machine rerun (F-009's protocol) is still to do before any
   published claim.
 - **Some wins are not Mojo.** M2f (imports), M2i (fewer workers) and M2k (physical cores) are

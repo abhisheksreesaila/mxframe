@@ -1,7 +1,7 @@
 """Charts for docs/optimizations.md and the README (F-039): plain SVG, light and dark, from the
 engine-only benchmark CSVs in docs/bench/.
 
-    pixi run python scripts/plot_progress.py docs/bench/m2n-engine.csv M2n
+    pixi run python scripts/plot_progress.py docs/bench/m2p-engine.csv F-043
 
 1. docs/img/progress.svg: the 22-query total per milestone, SF10 and SF1 side by side (two panels,
    one axis each), MXFrame as a line, Polars and DuckDB (from the final run) as reference lines.
@@ -31,6 +31,7 @@ MILESTONES = [
     ("M2g", {"10": "m2g-engine", "1": "m2g-engine"}),
     ("M2h", {"10": "m2h-engine", "1": "m2h-engine"}),
     ("M2l", {"10": "m2l-engine", "1": "m2l-engine"}),
+    ("M2n", {"10": "m2n-engine", "1": "m2n-engine"}),
 ]
 
 STYLE = """
@@ -174,8 +175,8 @@ def per_query_svg(final_rows, sf, titles):
 
 
 def main():
-    final = Path(sys.argv[1]) if len(sys.argv) > 1 else BENCH / "m2n-engine.csv"
-    label = sys.argv[2] if len(sys.argv) > 2 else "M2n"
+    final = Path(sys.argv[1]) if len(sys.argv) > 1 else BENCH / "m2p-engine.csv"
+    label = sys.argv[2] if len(sys.argv) > 2 else "F-043"
     rows = _rows(final)
     sys.path.insert(0, str(ROOT / "scripts"))
     from tpch_user.spec import TITLES

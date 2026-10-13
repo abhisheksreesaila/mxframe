@@ -12,87 +12,87 @@
   .title { font-size: 14px; font-weight: 600 }
 </style>
 <rect class="bg" width="780" height="610" rx="8"/>
-<text class="t1 title" x="24" y="32">SF1: MXFrame against Polars, per TPC-H query (15 of 22 verified faster)</text>
+<text class="t1 title" x="24" y="32">SF1: MXFrame against Polars, per TPC-H query (13 of 22 verified faster)</text>
 <text class="t2" x="24" y="52">times faster (right) or slower (left) than Polars, log scale; engine-only first runs</text>
-<text class="t2" x="402.5" y="82">faster →</text>
-<text class="t2" x="386.5" y="82" text-anchor="end">← slower</text>
-<line class="grid" x1="343.1" x2="343.1" y1="90" y2="580"/>
-<text class="t2" x="343.1" y="596" text-anchor="middle">2x</text>
-<line class="grid" x1="394.5" x2="394.5" y1="90" y2="580"/>
-<text class="t2" x="394.5" y="596" text-anchor="middle">1x</text>
-<line class="grid" x1="445.9" x2="445.9" y1="90" y2="580"/>
-<text class="t2" x="445.9" y="596" text-anchor="middle">2x</text>
-<line class="grid" x1="497.2" x2="497.2" y1="90" y2="580"/>
-<text class="t2" x="497.2" y="596" text-anchor="middle">4x</text>
-<line class="grid" x1="548.6" x2="548.6" y1="90" y2="580"/>
-<text class="t2" x="548.6" y="596" text-anchor="middle">8x</text>
+<text class="t2" x="415.4" y="82">faster →</text>
+<text class="t2" x="399.4" y="82" text-anchor="end">← slower</text>
+<line class="grid" x1="359.3" x2="359.3" y1="90" y2="580"/>
+<text class="t2" x="359.3" y="596" text-anchor="middle">2x</text>
+<line class="grid" x1="407.4" x2="407.4" y1="90" y2="580"/>
+<text class="t2" x="407.4" y="596" text-anchor="middle">1x</text>
+<line class="grid" x1="455.6" x2="455.6" y1="90" y2="580"/>
+<text class="t2" x="455.6" y="596" text-anchor="middle">2x</text>
+<line class="grid" x1="503.7" x2="503.7" y1="90" y2="580"/>
+<text class="t2" x="503.7" y="596" text-anchor="middle">4x</text>
+<line class="grid" x1="551.9" x2="551.9" y1="90" y2="580"/>
+<text class="t2" x="551.9" y="596" text-anchor="middle">8x</text>
 <line class="grid" x1="600.0" x2="600.0" y1="90" y2="580"/>
 <text class="t2" x="600.0" y="596" text-anchor="middle">16x</text>
 <text class="t2" x="24" y="110">Q1 filter+groupby+8 aggs</text>
-<rect class="fast" x="394.5" y="99" width="205.5" height="16" rx="3"><title>Q1: MXFrame 11 ms, Polars 275 ms</title></rect>
-<text class="t1" x="606.0" y="110" text-anchor="start">24.3x → <tspan class="t2">(11 vs 275 ms)</tspan></text>
+<rect class="fast" x="407.4" y="99" width="192.6" height="16" rx="3"><title>Q1: MXFrame 10 ms, Polars 276 ms</title></rect>
+<text class="t1" x="606.0" y="110" text-anchor="start">28.1x → <tspan class="t2">(10 vs 276 ms)</tspan></text>
 <text class="t2" x="24" y="132">Q2 min-cost supplier</text>
-<rect class="fast" x="394.5" y="121" width="9.5" height="16" rx="3"><title>Q2: MXFrame 8 ms, Polars 9 ms</title></rect>
-<text class="t1" x="410.0" y="132" text-anchor="start">1.1x <tspan class="t2">(8 vs 9 ms)</tspan></text>
+<rect class="slow" x="386.8" y="121" width="20.6" height="16" rx="3"><title>Q2: MXFrame 10 ms, Polars 7 ms</title></rect>
+<text class="t1" x="380.8" y="132" text-anchor="end">1.3x slower <tspan class="t2">(10 vs 7 ms)</tspan></text>
 <text class="t2" x="24" y="154">Q3 3-join+top10</text>
-<rect class="fast" x="394.5" y="143" width="37.7" height="16" rx="3"><title>Q3: MXFrame 18 ms, Polars 31 ms</title></rect>
-<text class="t1" x="438.2" y="154" text-anchor="start">1.7x <tspan class="t2">(18 vs 31 ms)</tspan></text>
+<rect class="fast" x="407.4" y="143" width="32.1" height="16" rx="3"><title>Q3: MXFrame 20 ms, Polars 31 ms</title></rect>
+<text class="t1" x="445.5" y="154" text-anchor="start">1.6x <tspan class="t2">(20 vs 31 ms)</tspan></text>
 <text class="t2" x="24" y="176">Q4 EXISTS semi-join</text>
-<rect class="fast" x="394.5" y="165" width="77.5" height="16" rx="3"><title>Q4: MXFrame 26 ms, Polars 75 ms</title></rect>
-<text class="t1" x="478.0" y="176" text-anchor="start">2.8x <tspan class="t2">(26 vs 75 ms)</tspan></text>
+<rect class="fast" x="407.4" y="165" width="101.4" height="16" rx="3"><title>Q4: MXFrame 19 ms, Polars 80 ms</title></rect>
+<text class="t1" x="514.8" y="176" text-anchor="start">4.3x <tspan class="t2">(19 vs 80 ms)</tspan></text>
 <text class="t2" x="24" y="198">Q5 4-join+groupby</text>
-<rect class="fast" x="394.5" y="187" width="66.1" height="16" rx="3"><title>Q5: MXFrame 19 ms, Polars 47 ms</title></rect>
-<text class="t1" x="466.5" y="198" text-anchor="start">2.4x <tspan class="t2">(19 vs 47 ms)</tspan></text>
+<rect class="fast" x="407.4" y="187" width="66.8" height="16" rx="3"><title>Q5: MXFrame 19 ms, Polars 49 ms</title></rect>
+<text class="t1" x="480.3" y="198" text-anchor="start">2.6x <tspan class="t2">(19 vs 49 ms)</tspan></text>
 <text class="t2" x="24" y="220">Q6 filter+global sum</text>
-<rect class="fast" x="394.5" y="209" width="6.4" height="16" rx="3"><title>Q6: MXFrame 6 ms, Polars 7 ms</title></rect>
-<text class="t1" x="406.9" y="220" text-anchor="start">1.1x <tspan class="t2">(6 vs 7 ms)</tspan></text>
+<rect class="slow" x="364.1" y="209" width="43.3" height="16" rx="3"><title>Q6: MXFrame 11 ms, Polars 6 ms</title></rect>
+<text class="t1" x="358.1" y="220" text-anchor="end">1.9x slower <tspan class="t2">(11 vs 6 ms)</tspan></text>
 <text class="t2" x="24" y="242">Q7 volume shipping</text>
-<rect class="fast" x="394.5" y="231" width="119.6" height="16" rx="3"><title>Q7: MXFrame 21 ms, Polars 105 ms</title></rect>
-<text class="t1" x="520.1" y="242" text-anchor="start">5.0x <tspan class="t2">(21 vs 105 ms)</tspan></text>
+<rect class="fast" x="407.4" y="231" width="121.5" height="16" rx="3"><title>Q7: MXFrame 20 ms, Polars 113 ms</title></rect>
+<text class="t1" x="534.9" y="242" text-anchor="start">5.8x <tspan class="t2">(20 vs 113 ms)</tspan></text>
 <text class="t2" x="24" y="264">Q8 market share</text>
-<rect class="slow" x="380.3" y="253" width="14.1" height="16" rx="3"><title>Q8: MXFrame 17 ms, Polars 14 ms</title></rect>
-<text class="t1" x="374.3" y="264" text-anchor="end">1.2x slower <tspan class="t2">(17 vs 14 ms)</tspan></text>
+<rect class="slow" x="388.1" y="253" width="19.3" height="16" rx="3"><title>Q8: MXFrame 18 ms, Polars 14 ms</title></rect>
+<text class="t1" x="382.1" y="264" text-anchor="end">1.3x slower <tspan class="t2">(18 vs 14 ms)</tspan></text>
 <text class="t2" x="24" y="286">Q9 6-join profit</text>
-<rect class="fast" x="394.5" y="275" width="14.6" height="16" rx="3"><title>Q9: MXFrame 53 ms, Polars 65 ms</title></rect>
-<text class="t1" x="415.0" y="286" text-anchor="start">1.2x <tspan class="t2">(53 vs 65 ms)</tspan></text>
+<rect class="fast" x="407.4" y="275" width="23.2" height="16" rx="3"><title>Q9: MXFrame 54 ms, Polars 75 ms</title></rect>
+<text class="t1" x="436.6" y="286" text-anchor="start">1.4x <tspan class="t2">(54 vs 75 ms)</tspan></text>
 <text class="t2" x="24" y="308">Q10 returned items top20</text>
-<rect class="fast" x="394.5" y="297" width="26.7" height="16" rx="3"><title>Q10: MXFrame 25 ms, Polars 36 ms</title></rect>
-<text class="t1" x="427.2" y="308" text-anchor="start">1.4x <tspan class="t2">(25 vs 36 ms)</tspan></text>
+<rect class="fast" x="407.4" y="297" width="33.9" height="16" rx="3"><title>Q10: MXFrame 22 ms, Polars 36 ms</title></rect>
+<text class="t1" x="447.4" y="308" text-anchor="start">1.6x <tspan class="t2">(22 vs 36 ms)</tspan></text>
 <text class="t2" x="24" y="330">Q11 important stock</text>
-<rect class="slow" x="330.0" y="319" width="64.5" height="16" rx="3"><title>Q11: MXFrame 11 ms, Polars 5 ms</title></rect>
-<text class="t1" x="324.0" y="330" text-anchor="end">2.4x slower <tspan class="t2">(11 vs 5 ms)</tspan></text>
+<rect class="slow" x="330.0" y="319" width="77.4" height="16" rx="3"><title>Q11: MXFrame 14 ms, Polars 5 ms</title></rect>
+<text class="t1" x="324.0" y="330" text-anchor="end">3.1x slower <tspan class="t2">(14 vs 5 ms)</tspan></text>
 <text class="t2" x="24" y="352">Q12 shipping modes</text>
-<rect class="fast" x="394.5" y="341" width="2.0" height="16" rx="3"><title>Q12: MXFrame 18 ms, Polars 18 ms</title></rect>
-<text class="t1" x="401.2" y="352" text-anchor="start">1.0x <tspan class="t2">(18 vs 18 ms)</tspan></text>
+<rect class="fast" x="407.4" y="341" width="6.2" height="16" rx="3"><title>Q12: MXFrame 18 ms, Polars 19 ms</title></rect>
+<text class="t1" x="419.6" y="352" text-anchor="start">1.1x <tspan class="t2">(18 vs 19 ms)</tspan></text>
 <text class="t2" x="24" y="374">Q13 customer distribution</text>
-<rect class="fast" x="394.5" y="363" width="139.6" height="16" rx="3"><title>Q13: MXFrame 8 ms, Polars 52 ms</title></rect>
-<text class="t1" x="540.1" y="374" text-anchor="start">6.6x <tspan class="t2">(8 vs 52 ms)</tspan></text>
+<rect class="fast" x="407.4" y="363" width="138.9" height="16" rx="3"><title>Q13: MXFrame 10 ms, Polars 72 ms</title></rect>
+<text class="t1" x="552.3" y="374" text-anchor="start">7.4x <tspan class="t2">(10 vs 72 ms)</tspan></text>
 <text class="t2" x="24" y="396">Q14 promo revenue</text>
-<rect class="slow" x="377.7" y="385" width="16.8" height="16" rx="3"><title>Q14: MXFrame 12 ms, Polars 10 ms</title></rect>
-<text class="t1" x="371.7" y="396" text-anchor="end">1.3x slower <tspan class="t2">(12 vs 10 ms)</tspan></text>
+<rect class="slow" x="399.1" y="385" width="8.3" height="16" rx="3"><title>Q14: MXFrame 11 ms, Polars 10 ms</title></rect>
+<text class="t1" x="393.1" y="396" text-anchor="end">1.1x slower <tspan class="t2">(11 vs 10 ms)</tspan></text>
 <text class="t2" x="24" y="418">Q15 top supplier</text>
-<rect class="slow" x="384.0" y="407" width="10.5" height="16" rx="3"><title>Q15: MXFrame 9 ms, Polars 8 ms</title></rect>
-<text class="t1" x="378.0" y="418" text-anchor="end">1.2x slower <tspan class="t2">(9 vs 8 ms)</tspan></text>
+<rect class="slow" x="403.5" y="407" width="3.9" height="16" rx="3"><title>Q15: MXFrame 9 ms, Polars 9 ms</title></rect>
+<text class="t1" x="397.5" y="418" text-anchor="end">1.1x slower <tspan class="t2">(9 vs 9 ms)</tspan></text>
 <text class="t2" x="24" y="440">Q16 part/supplier</text>
-<rect class="slow" x="375.7" y="429" width="18.8" height="16" rx="3"><title>Q16: MXFrame 24 ms, Polars 19 ms</title></rect>
-<text class="t1" x="369.7" y="440" text-anchor="end">1.3x slower <tspan class="t2">(24 vs 19 ms)</tspan></text>
+<rect class="slow" x="375.6" y="429" width="31.9" height="16" rx="3"><title>Q16: MXFrame 27 ms, Polars 17 ms</title></rect>
+<text class="t1" x="369.6" y="440" text-anchor="end">1.6x slower <tspan class="t2">(27 vs 17 ms)</tspan></text>
 <text class="t2" x="24" y="462">Q17 small-qty revenue</text>
-<rect class="slow" x="364.3" y="451" width="30.2" height="16" rx="3"><title>Q17: MXFrame 10 ms, Polars 7 ms</title></rect>
-<text class="t1" x="358.3" y="462" text-anchor="end">1.5x slower <tspan class="t2">(10 vs 7 ms)</tspan></text>
+<rect class="slow" x="402.0" y="451" width="5.5" height="16" rx="3"><title>Q17: MXFrame 9 ms, Polars 9 ms</title></rect>
+<text class="t1" x="396.0" y="462" text-anchor="end">1.1x slower <tspan class="t2">(9 vs 9 ms)</tspan></text>
 <text class="t2" x="24" y="484">Q18 large volume top100</text>
-<rect class="fast" x="394.5" y="473" width="41.0" height="16" rx="3"><title>Q18: MXFrame 75 ms, Polars 131 ms</title></rect>
-<text class="t1" x="441.4" y="484" text-anchor="start">1.7x <tspan class="t2">(75 vs 131 ms)</tspan></text>
+<rect class="fast" x="407.4" y="473" width="58.3" height="16" rx="3"><title>Q18: MXFrame 62 ms, Polars 143 ms</title></rect>
+<text class="t1" x="471.7" y="484" text-anchor="start">2.3x <tspan class="t2">(62 vs 143 ms)</tspan></text>
 <text class="t2" x="24" y="506">Q19 discounted revenue</text>
-<rect class="fast" x="394.5" y="495" width="73.4" height="16" rx="3"><title>Q19: MXFrame 15 ms, Polars 40 ms</title></rect>
-<text class="t1" x="473.8" y="506" text-anchor="start">2.7x <tspan class="t2">(15 vs 40 ms)</tspan></text>
+<rect class="fast" x="407.4" y="495" width="83.1" height="16" rx="3"><title>Q19: MXFrame 14 ms, Polars 48 ms</title></rect>
+<text class="t1" x="496.5" y="506" text-anchor="start">3.3x <tspan class="t2">(14 vs 48 ms)</tspan></text>
 <text class="t2" x="24" y="528">Q20 potential promotion</text>
-<rect class="fast" x="394.5" y="517" width="2.0" height="16" rx="3"><title>Q20: MXFrame 14 ms, Polars 14 ms</title></rect>
-<text class="t1" x="402.3" y="528" text-anchor="start">1.0x <tspan class="t2">(14 vs 14 ms)</tspan></text>
+<rect class="fast" x="407.4" y="517" width="9.7" height="16" rx="3"><title>Q20: MXFrame 14 ms, Polars 16 ms</title></rect>
+<text class="t1" x="423.2" y="528" text-anchor="start">1.2x <tspan class="t2">(14 vs 16 ms)</tspan></text>
 <text class="t2" x="24" y="550">Q21 suppliers waiting</text>
-<rect class="fast" x="394.5" y="539" width="92.8" height="16" rx="3"><title>Q21: MXFrame 101 ms, Polars 355 ms</title></rect>
-<text class="t1" x="493.3" y="550" text-anchor="start">3.5x <tspan class="t2">(101 vs 355 ms)</tspan></text>
+<rect class="fast" x="407.4" y="539" width="97.2" height="16" rx="3"><title>Q21: MXFrame 92 ms, Polars 373 ms</title></rect>
+<text class="t1" x="510.6" y="550" text-anchor="start">4.1x <tspan class="t2">(92 vs 373 ms)</tspan></text>
 <text class="t2" x="24" y="572">Q22 global sales opportunity</text>
-<rect class="slow" x="380.3" y="561" width="14.2" height="16" rx="3"><title>Q22: MXFrame 16 ms, Polars 13 ms</title></rect>
-<text class="t1" x="374.3" y="572" text-anchor="end">1.2x slower <tspan class="t2">(16 vs 13 ms)</tspan></text>
-<line class="mid" stroke-width="1.5" x1="394.47134482379477" x2="394.47134482379477" y1="90" y2="580"/>
+<rect class="slow" x="388.7" y="561" width="18.7" height="16" rx="3"><title>Q22: MXFrame 18 ms, Polars 14 ms</title></rect>
+<text class="t1" x="382.7" y="572" text-anchor="end">1.3x slower <tspan class="t2">(18 vs 14 ms)</tspan></text>
+<line class="mid" stroke-width="1.5" x1="407.44758340848114" x2="407.44758340848114" y1="90" y2="580"/>
 </svg>
