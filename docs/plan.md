@@ -417,9 +417,13 @@ Needs: F-033
 - [ ] LIKE / contains / substr and non-dictionary string keys in Mojo
 - [ ] 22/22 TPC-H queries fully native; the Python execution path retired for them
 
-## F-040 A group-by on an aliased column fails [todo]
+## F-040 A group-by on an aliased column fails [done]
 Needs: none · Found by the M2h review (predates F-032)
-- [ ] `LazyFrame(t).select(col("s").alias("b")).groupby("b")` raises `KeyError: Field "b"` (in-memory tables, native path off too). The group-by should see the alias
+- [x] `LazyFrame(t).select(col("s").alias("b")).groupby("b")` returns the key as `b` with the right values. (On 2026-10-13 it no longer raised but silently returned the key as `s`: the kernel and fused group-by paths named a plain column key after its source and ignored the alias. A renamed key now takes the derived-key branch.) `tests/test_groupby_alias.py`: 3 paths, each checked to be the one that ran, plus GPU. Reviewer PASS.
+
+## F-041 SQL: a SELECT alias on a group key is lost [todo]
+Needs: none · Found by the F-040 review
+- [ ] `SELECT s AS b, SUM(v) AS x FROM t GROUP BY s` returns the key as `s`; `... GROUP BY b` raises `KeyError: Field "b"`. `sql_frontend._build_aggregate` builds keys from GROUP BY and never applies the SELECT alias or resolves GROUP BY on one. Check against DuckDB
 
 ## F-039 The optimization story: README with visuals [doing]
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13

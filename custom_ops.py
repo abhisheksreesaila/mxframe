@@ -1848,7 +1848,7 @@ class CustomOpsCompiler(GraphCompiler):
                 _gk_table = original_scan.table
                 _gk_out = {}          # internal key column -> output name (alias that shadows a source column)
                 for _e in agg_node.group_by:
-                    if _e.op == "col":
+                    if _e.op == "col" and _e._alias in (None, _e.args[0]):
                         group_keys.append(_e.args[0])
                     else:
                         # Derived key (e.g. year(col("l_shipdate")).alias("l_year"))
@@ -1861,7 +1861,9 @@ class CustomOpsCompiler(GraphCompiler):
                             _gk_out[_internal] = _col_name
                             _col_name = _internal
                         if _col_name not in _gk_table.column_names:
-                            _arr = self._eval_group_key(_e, _gk_table)
+                            # a renamed column (select(col("s").alias("b"))) is the source column
+                            _arr = (_gk_table.column(_e.args[0]) if _e.op == "col"
+                                    else self._eval_group_key(_e, _gk_table))
                             _gk_table = _gk_table.append_column(_col_name, _arr)
                         group_keys.append(_col_name)
                 if _gk_table is not original_scan.table:

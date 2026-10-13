@@ -113,13 +113,14 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         gk_table = table
         derived = []
         for i, e in enumerate(agg_node.group_by):
-            if e.op == "col":
+            if e.op == "col" and e._alias in (None, e.args[0]):
                 group_keys.append(e.args[0])
-            else:  # derived key, e.g. year(col): same treatment as the existing path
+            else:  # derived key, e.g. year(col), or a renamed column: same treatment as the existing path
                 name = e._alias or f"__gk_{len(group_keys)}__"
                 # evaluated against the source table; a key that reuses a source column's name
                 # (``with_columns((k + 10).alias("k"))`` inlined into the aggregate) replaces it
-                derived.append((name, compiler._eval_expr_arrow(e, table)))
+                derived.append((name, table.column(e.args[0]) if e.op == "col"
+                                else compiler._eval_expr_arrow(e, table)))
                 group_keys.append(name)
         for name, arr in derived:
             if name in gk_table.column_names:
@@ -143,7 +144,8 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     coproc_info = None
     if device == "cpu":
         from . import coproc_fused
-        stable = not grouped or all(e.op == "col" for e in agg_node.group_by)   # derived keys: fresh ids per query
+        stable = not grouped or all(e.op == "col" and e._alias in (None, e.args[0])
+                                      for e in agg_node.group_by)   # derived or renamed keys: fresh ids per query
         split = coproc_fused.try_split(prog, cc, gids, n_groups, n_rows, table, stable_gids=stable)
         if split is not None:
             partials, used, coproc_info = split
