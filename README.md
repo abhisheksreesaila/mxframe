@@ -103,6 +103,31 @@ print(result.to_pandas())
 
 ---
 
+## 📈 How the CPU engine got fast (2026-10-13)
+
+In two days of work, the engine went from Python glue around kernels to Mojo running each query
+stage in one native call. Python plans; Mojo runs the filters, joins, group-bys, DISTINCT and
+gathers directly on Arrow memory. Engine-only TPC-H (data already in memory, fresh process, no
+warm-up, every result checked against DuckDB):
+
+![MXFrame total per milestone against Polars and DuckDB](docs/img/progress.svg)
+
+| total of 22 queries | MXFrame (CPU) | Polars | DuckDB |
+|---|---:|---:|---:|
+| SF10 | **6.45 s** | 15.20 s | 6.66 s |
+| SF1 | **0.73 s** | 1.34 s | 2.31 s |
+
+- **Against Polars:** faster on 21 of 22 queries at SF10 and 14 of 22 at SF1.
+- **Against DuckDB:** faster on 17 of 22 at SF10 and on all 22 at SF1.
+
+Each optimization is explained with a diagram, its before/after numbers, and the Mojo feature it
+relies on (or a plain statement when it is ordinary engineering) in
+**[docs/optimizations.md](docs/optimizations.md)**. Caveats:
+
+- These are engine-only numbers on a shared machine.
+- The user-felt scoreboard below, which includes the Parquet read, predates this work.
+- Polars' Q1 is an outlier (see the doc).
+
 ## 📊 Performance: user-felt TPC-H (2026-10-12)
 
 Each engine runs each query in a fresh process. The data starts as Parquet on disk, and the
@@ -173,7 +198,7 @@ Full matrices: [1M CSV](scripts/bench_results_1M.csv) · [10M CSV](scripts/bench
 
 **Performance parity:** replace Q8's JIT path; fix Q15/Q17/Q18/Q20 GPU timeouts; improve Q1 and Q14 GPU execution; run synchronized 1M/10M measurements on a compatible RAPIDS/cuDF environment.
 
-**Feature parity:** native GPU UTF-8 dictionary construction and string/date gather; GPU windows; semi/anti/as-of/range joins; broader string/regex, datetime, nested-type, reshape, SQL, streaming, and I/O pushdown coverage.
+**Feature parity:** native GPU UTF-8 dictionary construction and string/date gather; GPU windows; as-of/range joins (semi and anti joins exist since 2026-10-13: `how="semi"` / `how="anti"`); broader string/regex, datetime, nested-type, reshape, SQL, streaming, and I/O pushdown coverage.
 
 ---
 

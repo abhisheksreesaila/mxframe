@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="360" viewBox="0 0 1000 360" role="img" aria-label="MXFrame engine-only TPC-H total per milestone, against Polars and DuckDB">
+<style>
+  .bg { fill: #fcfcfb } .t1 { fill: #0b0b0b } .t2 { fill: #52514e } .grid { stroke: #e4e3df }
+  .axis { stroke: #b8b7b0 } .mx { stroke: #2a78d6; fill: #2a78d6 } .mxl { stroke: #2a78d6; fill: none } .pl { stroke: #eb6834 } .dk { stroke: #1baf7a }
+  .fast { fill: #2a78d6 } .slow { fill: #e34948 } .mid { stroke: #8f8e88 }
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #1a1a19 } .t1 { fill: #f0efec } .t2 { fill: #c3c2b7 } .grid { stroke: #383835 }
+    .axis { stroke: #5c5b57 } .mx { stroke: #3987e5; fill: #3987e5 } .mxl { stroke: #3987e5; fill: none } .pl { stroke: #d95926 } .dk { stroke: #199e70 }
+    .fast { fill: #3987e5 } .slow { fill: #e66767 } .mid { stroke: #8f8e88 }
+  }
+  text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 12px }
+  .title { font-size: 14px; font-weight: 600 }
+</style>
+<rect class="bg" width="1000" height="360" rx="8"/>
+<text class="t1 title" x="24" y="32">MXFrame CPU engine: total of the 22 TPC-H queries, seconds (lower is faster)</text>
+<text class="t2" x="24" y="52">engine-only first runs: data in memory, fresh process, every result checked against DuckDB</text>
+<text class="t1" x="56" y="72" font-weight="600">SF10</text>
+<line class="grid" x1="56" x2="416" y1="310.0" y2="310.0"/>
+<text class="t2" x="48" y="314.0" text-anchor="end">0</text>
+<line class="grid" x1="56" x2="416" y1="263.9" y2="263.9"/>
+<text class="t2" x="48" y="267.9" text-anchor="end">5</text>
+<line class="grid" x1="56" x2="416" y1="217.7" y2="217.7"/>
+<text class="t2" x="48" y="221.7" text-anchor="end">10</text>
+<line class="grid" x1="56" x2="416" y1="171.6" y2="171.6"/>
+<text class="t2" x="48" y="175.6" text-anchor="end">15</text>
+<line class="grid" x1="56" x2="416" y1="125.4" y2="125.4"/>
+<text class="t2" x="48" y="129.4" text-anchor="end">20</text>
+<line class="axis" x1="56" x2="416" y1="310.0" y2="310.0"/>
+<line class="pl" stroke-width="2" stroke-dasharray="6 4" x1="56" x2="416" y1="169.7" y2="169.7"/>
+<text class="t2" x="422" y="173.7">Polars 15.20</text>
+<line class="dk" stroke-width="2" stroke-dasharray="6 4" x1="56" x2="416" y1="248.5" y2="248.5"/>
+<text class="t2" x="422" y="252.5">DuckDB 6.66</text>
+<path class="mxl" stroke-width="2" d="M56.0,100.9 L101.0,116.1 L146.0,160.8 L191.0,165.3 L236.0,207.7 L281.0,213.4 L326.0,219.3 L371.0,242.2 L416.0,250.4"/>
+<circle class="mx" cx="56.0" cy="100.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>before: 22.66 s</title></circle>
+<text class="t2" x="56.0" y="328" text-anchor="middle">before</text>
+<circle class="mx" cx="101.0" cy="116.1" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M1: 21.01 s</title></circle>
+<text class="t2" x="101.0" y="328" text-anchor="middle">M1</text>
+<circle class="mx" cx="146.0" cy="160.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2a: 16.16 s</title></circle>
+<text class="t2" x="146.0" y="328" text-anchor="middle">M2a</text>
+<circle class="mx" cx="191.0" cy="165.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2b: 15.68 s</title></circle>
+<text class="t2" x="191.0" y="328" text-anchor="middle">M2b</text>
+<circle class="mx" cx="236.0" cy="207.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2d: 11.08 s</title></circle>
+<text class="t2" x="236.0" y="328" text-anchor="middle">M2d</text>
+<circle class="mx" cx="281.0" cy="213.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2e: 10.46 s</title></circle>
+<text class="t2" x="281.0" y="328" text-anchor="middle">M2e</text>
+<circle class="mx" cx="326.0" cy="219.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2g: 9.82 s</title></circle>
+<text class="t2" x="326.0" y="328" text-anchor="middle">M2g</text>
+<circle class="mx" cx="371.0" cy="242.2" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2h: 7.34 s</title></circle>
+<text class="t2" x="371.0" y="328" text-anchor="middle">M2h</text>
+<circle class="mx" cx="416.0" cy="250.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2l: 6.45 s</title></circle>
+<text class="t2" x="416.0" y="328" text-anchor="middle">M2l</text>
+<text class="t1" x="64.0" y="118.9">MXFrame 22.66</text>
+<text class="t1" x="416.0" y="240.4" text-anchor="end">6.45</text>
+<text class="t1" x="546" y="72" font-weight="600">SF1</text>
+<line class="grid" x1="546" x2="906" y1="310.0" y2="310.0"/>
+<text class="t2" x="538" y="314.0" text-anchor="end">0</text>
+<line class="grid" x1="546" x2="906" y1="232.5" y2="232.5"/>
+<text class="t2" x="538" y="236.5" text-anchor="end">1</text>
+<line class="grid" x1="546" x2="906" y1="155.1" y2="155.1"/>
+<text class="t2" x="538" y="159.1" text-anchor="end">2</text>
+<line class="axis" x1="546" x2="906" y1="310.0" y2="310.0"/>
+<line class="pl" stroke-width="2" stroke-dasharray="6 4" x1="546" x2="906" y1="206.3" y2="206.3"/>
+<text class="t2" x="912" y="210.3">Polars 1.34</text>
+<line class="dk" stroke-width="2" stroke-dasharray="6 4" x1="546" x2="906" y1="131.0" y2="131.0"/>
+<text class="t2" x="912" y="135.0">DuckDB 2.31</text>
+<path class="mxl" stroke-width="2" d="M546.0,114.4 L591.0,100.9 L636.0,135.7 L681.0,138.9 L726.0,173.7 L771.0,181.4 L816.0,213.3 L861.0,233.6 L906.0,253.2"/>
+<circle class="mx" cx="546.0" cy="114.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>before: 2.52 s</title></circle>
+<text class="t2" x="546.0" y="328" text-anchor="middle">before</text>
+<circle class="mx" cx="591.0" cy="100.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M1: 2.70 s</title></circle>
+<text class="t2" x="591.0" y="328" text-anchor="middle">M1</text>
+<circle class="mx" cx="636.0" cy="135.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2a: 2.25 s</title></circle>
+<text class="t2" x="636.0" y="328" text-anchor="middle">M2a</text>
+<circle class="mx" cx="681.0" cy="138.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2b: 2.21 s</title></circle>
+<text class="t2" x="681.0" y="328" text-anchor="middle">M2b</text>
+<circle class="mx" cx="726.0" cy="173.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2d: 1.76 s</title></circle>
+<text class="t2" x="726.0" y="328" text-anchor="middle">M2d</text>
+<circle class="mx" cx="771.0" cy="181.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2e: 1.66 s</title></circle>
+<text class="t2" x="771.0" y="328" text-anchor="middle">M2e</text>
+<circle class="mx" cx="816.0" cy="213.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2g: 1.25 s</title></circle>
+<text class="t2" x="816.0" y="328" text-anchor="middle">M2g</text>
+<circle class="mx" cx="861.0" cy="233.6" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2h: 0.99 s</title></circle>
+<text class="t2" x="861.0" y="328" text-anchor="middle">M2h</text>
+<circle class="mx" cx="906.0" cy="253.2" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2l: 0.73 s</title></circle>
+<text class="t2" x="906.0" y="328" text-anchor="middle">M2l</text>
+<text class="t1" x="554.0" y="132.4">MXFrame 2.52</text>
+<text class="t1" x="906.0" y="243.2" text-anchor="end">0.73</text>
+</svg>
