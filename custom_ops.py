@@ -2596,6 +2596,17 @@ class CustomOpsCompiler(GraphCompiler):
 
         topk: if set, only return the first topk sorted rows (ORDER BY ... LIMIT topk).
         """
+        if (topk is not None and topk < table.num_rows and self._session_device != "gpu"
+                and topk <= 65536 and topk * 8 <= table.num_rows      # heaps pay off for small k only
+                and all(isinstance(e, Expr) and e.op == "col" for e in sort_node.by)):
+            # ORDER BY plain numeric columns LIMIT k: per-worker heaps in one native pass (F-044)
+            from . import native_exec
+            desc = list(sort_node.descending) if isinstance(sort_node.descending, (list, tuple)) \
+                else [bool(sort_node.descending)] * len(sort_node.by)
+            idx = native_exec.try_topk(table, [e.args[0] for e in sort_node.by], desc, topk)
+            if idx is not None:
+                got = native_exec.try_gather(self, table, idx)
+                return got if got is not None else pc.take(table, _npa(idx))
         composite_key = self._encode_sort_key(table, sort_node.by, sort_node.descending)
         N = len(composite_key)
         k = topk if topk is not None and topk < N else N
@@ -2883,6 +2894,28 @@ class CustomOpsCompiler(GraphCompiler):
         from . import join_engine
         return join_engine.materialize(self, plan, needed)
 
+    def _native_filter_scan(self, plan, needed):
+        """Filter*(Scan) in one native pass (F-044: a WHERE without an aggregate, e.g. before ORDER BY
+        ... LIMIT), keeping ``needed`` columns (None: all). None when the plan is another shape or a
+        column it returns is a dictionary (the native filter decodes them; the result keeps types)."""
+        if _native_exec is None:
+            return None
+        preds, node = [], plan
+        while isinstance(node, Filter):
+            preds.append(node.predicate)
+            node = node.input
+        if not isinstance(node, Scan) or not preds:
+            return None
+        t = node.table
+        cols = [f for f in t.schema if needed is None or f.name in needed]
+        if not cols or any(pa.types.is_dictionary(f.type) for f in cols):
+            return None
+        try:
+            out = _native_exec.try_filter(self, t, preds, None if needed is None else set(needed))
+        except Exception:
+            return None
+        return None if out is None else out.replace_schema_metadata(t.schema.metadata)
+
     def _plan_to_table(self, plan) -> pa.Table:
         """Resolve a plan subtree (no Aggregate) to a concrete pa.Table via PyArrow.
 
@@ -2895,11 +2928,21 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(plan, Scan):
             return plan.table
         if isinstance(plan, Filter):
+            got = self._native_filter_scan(plan, None)
+            if got is not None:
+                return got
             inner_table = self._plan_to_table(plan.input)
             mask = self._eval_predicate(plan.predicate, inner_table)
             return pc.filter(inner_table, mask)
         if isinstance(plan, Project):
-            inner_table = self._plan_to_table(plan.input)
+            inner_table = None
+            if isinstance(plan.input, Filter):
+                need = set()
+                for expr in plan.exprs:
+                    _expr_col_names(expr, need)
+                inner_table = self._native_filter_scan(plan.input, need)
+            if inner_table is None:
+                inner_table = self._plan_to_table(plan.input)
             arrays, names = [], []
             for expr in plan.exprs:
                 arr = self._eval_expr_arrow(expr, inner_table)

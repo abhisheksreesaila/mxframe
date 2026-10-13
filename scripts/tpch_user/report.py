@@ -219,7 +219,12 @@ def render_markdown(rows: list[dict], meta: dict, engines: list[str], queries: l
     mx_shown = any(e in engines for e in MX)
     engine_only = mode_of(rows) == "engine"
     if engine_only:
-        a(f"# Engine-only TPC-H scoreboard - {meta['date']}\n")
+        shuf = os.environ.get("MXBENCH_SHUFFLE") == "1"
+        a(f"# Engine-only TPC-H scoreboard{' (rows shuffled)' if shuf else ''} - {meta['date']}\n")
+        if shuf:
+            a("**Rows shuffled:** after the untimed load every table's rows are put in a random order "
+              "(seeded per table, the same for every engine), so no engine gains from TPC-H's stored "
+              "order (lineitem by order key, ...).\n")
         a("**Engine-only:** a fresh Python process; each engine first loads the columns the query uses "
           "from Parquet into its own in-memory form (pandas / Polars DataFrame, DuckDB table, Arrow table "
           "under an MXFrame LazyFrame), outside the clock; the clock then covers *query + materialized "

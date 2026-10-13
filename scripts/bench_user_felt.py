@@ -151,12 +151,18 @@ def main() -> None:
     ap.add_argument("--mode", choices=["user-felt", "engine"], default="user-felt",
                     help="user-felt (secondary): clock around Parquet read + query; engine (headline): each engine loads "
                          "the query's columns into memory first, the clock covers query + result only")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="engine mode: put each loaded table's rows in a random order (outside the clock); --report-only on such a CSV needs --mode engine --shuffle too, to keep the label")
     ap.add_argument("--resume", action="store_true",
                     help="keep the existing CSV and skip (engine, sf, query) rows already in it")
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing non-empty CSV of the same name (default: refuse)")
     ap.add_argument("--report-only", action="store_true", help="re-render the markdown from the CSV and exit")
     a = ap.parse_args()
+    if a.shuffle:
+        if a.mode != "engine":
+            ap.error("--shuffle needs --mode engine (the rows are shuffled after the untimed load)")
+        os.environ["MXBENCH_SHUFFLE"] = "1"          # read by every worker (scripts/tpch_user/worker.py)
 
     engines = [e.strip() for e in a.engines.split(",") if e.strip()]
     unknown = [e for e in engines if e not in ALL_ENGINES]
@@ -169,7 +175,8 @@ def main() -> None:
     if not out_dir.is_absolute():
         out_dir = REPO_ROOT / out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    base = a.name or (f"engine-only-{a.date}" if a.mode == "engine" else f"user-felt-{a.date}")
+    base = a.name or (f"engine-only{'-shuffled' if a.shuffle else ''}-{a.date}" if a.mode == "engine"
+                      else f"user-felt-{a.date}")
     csv_path, md_path = out_dir / f"{base}.csv", out_dir / f"{base}.md"
     cuda_dev, gpu_desc = resolve_gpu(a.gpu)
 

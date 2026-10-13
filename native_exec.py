@@ -80,6 +80,8 @@ def _load():
             lib.mx_str_slice_in.restype = ctypes.c_int64
             lib.mx_str_slice.argtypes = [ctypes.c_int64, ctypes.c_int64]
             lib.mx_str_slice.restype = ctypes.c_int64
+            lib.mx_topk.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_topk.restype = ctypes.c_int64
             _lib = lib
     return _lib
 
@@ -614,6 +616,65 @@ def try_str_slice(arr, offset: int, length) -> Optional[pa.Array]:
         return pa.Array.from_buffers(pa.string(), n, [arr.buffers()[0], offs, data], null_count=arr.null_count)
     from ._lazy_pc import pc
     return pc.if_else(pc.is_valid(arr), out, pa.scalar(None, pa.string()))
+
+
+KMAGIC = 0x4D58544B
+
+
+def _topk_kind(t: pa.DataType):
+    if t in (pa.int32(), pa.date32()):
+        return 0
+    if t == pa.int64() or pa.types.is_timestamp(t) or t == pa.date64():
+        return 1
+    if t == pa.float32():
+        return 2
+    if t == pa.float64():
+        return 3
+    return None
+
+
+def try_topk(table: pa.Table, names, descending, k: int):
+    """Row numbers of ``table`` sorted by ``names`` (``descending`` per column), the first ``k``
+    (F-044): one native pass of per-worker heaps instead of ranking every row. Ties keep row order
+    (a stable sort's first k). int32 / int64 / float / date / timestamp columns without nulls; None
+    otherwise, or on NaN (the caller's sort decides where NaN goes)."""
+    if not enabled() or not available() or k <= 0 or table.num_rows == 0:
+        return None
+    kinds = []
+    for nm in names:
+        c = table.column(nm)
+        kd = _topk_kind(c.type)
+        if kd is None or c.null_count:
+            return None
+        kinds.append(kd)
+    import numpy as np
+    flat = [table.column(nm).combine_chunks() if table.column(nm).num_chunks != 1 else table.column(nm).chunk(0)
+            for nm in names]
+    structs = []
+    c_cols = (ctypes.c_int64 * len(flat))()
+    try:
+        for j, arr in enumerate(flat):
+            st = (ctypes.c_int64 * 10)()
+            arr._export_to_c(ctypes.addressof(st))
+            structs.append(st)
+            c_cols[j] = ctypes.addressof(st)
+        c_kinds = (ctypes.c_int64 * len(kinds))(*kinds)
+        c_desc = (ctypes.c_int64 * len(kinds))(*[1 if d else 0 for d in descending])
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 7)(KMAGIC, len(flat), ctypes.addressof(c_cols), ctypes.addressof(c_kinds),
+                                 ctypes.addressof(c_desc), k, default_threads(table.num_rows))
+        O = (ctypes.c_int64 * 2)()
+        lib = _load()
+        rc = lib.mx_topk(ctypes.addressof(P), ctypes.addressof(O))
+    finally:
+        for st in structs:
+            if st[8]:
+                _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return None
+    n = int(O[0])
+    owner = _Arena(lib, int(O[1]))
+    return np.frombuffer(pa.foreign_buffer(int(O[1]), max(8 * n, 8), base=owner), dtype=np.int64, count=n)
 
 
 # ── M2: native leaf filter (Filter*(Scan) under a join) ─────────────────────────────────────

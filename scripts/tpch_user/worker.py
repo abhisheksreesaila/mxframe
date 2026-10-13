@@ -26,11 +26,38 @@ ENGINES = {
     #  name      module     device  extra imports timed as part of "import"
     "pandas":  ("q_pandas", None, ["pandas", "pyarrow.parquet"]),
     "polars":  ("q_polars", None, ["polars"]),
-    "duckdb":  ("q_duckdb", None, ["duckdb"]),
+    "duckdb":  ("q_duckdb", None, ["duckdb", "pyarrow"]),   # DuckDB imports pyarrow on its first .arrow() (~70 ms)
     "mx-cpu":  ("q_mx", "cpu", ["pyarrow.parquet"]),     # pyarrow.compute loads on first use (F-035)
     "mx-gpu":  ("q_mx", "gpu", ["pyarrow.parquet"]),
     "mx-auto": ("q_mx", "auto", ["pyarrow.parquet"]),
 }
+
+
+def _shuffle(modname, tables):
+    """The loaded tables with their rows in a random (seeded, per table) order, so no engine gains
+    from TPC-H's stored order (lineitem by order key, ...). Same permutation for every engine."""
+    import numpy as np
+    perm = lambda n, name: np.random.default_rng(sum(map(ord, name))).permutation(n)
+    if modname == "q_duckdb":
+        con = tables
+        for (name,) in con.execute("SELECT table_name FROM duckdb_tables()").fetchall():
+            t = con.execute(f"SELECT * FROM {name}").arrow()
+            t = t.read_all() if hasattr(t, "read_all") else t
+            t = t.take(perm(t.num_rows, name))
+            con.register("shuf_tmp", t)
+            con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT * FROM shuf_tmp")
+            con.unregister("shuf_tmp")
+        return con
+    out = {}
+    for name, t in tables.items():
+        if modname == "q_polars":
+            import polars as pl
+            out[name] = pl.from_arrow(t.to_arrow().take(perm(t.height, name)))
+        elif modname == "q_pandas":
+            out[name] = t.iloc[perm(len(t), name)].reset_index(drop=True)
+        else:
+            out[name] = t.take(perm(t.num_rows, name))
+    return out
 
 
 def emit(d: dict) -> None:
@@ -75,6 +102,8 @@ def main() -> None:
             t0 = time.perf_counter()
             tables = mod.load_mem(a.query, a.data_dir)
             ms = (time.perf_counter() - t0) * 1000.0
+            if os.environ.get("MXBENCH_SHUFFLE") == "1":
+                tables = _shuffle(modname, tables)      # outside the clock and the load time
             gc.collect()
             return tables, ms
 

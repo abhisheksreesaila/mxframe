@@ -3332,3 +3332,196 @@ def mx_str_slice(plan_a: Int, out_a: Int) abi("C") -> Int:
     btot.free()
     counter.free()
     return 0
+
+
+# ── F-044: ORDER BY ... LIMIT k over plain columns (top-k rows) ───────────────────────────────────
+#
+# Plan: 0 KMAGIC   1 n_cols   2 cols* (ArrowArray* per sort column, one chunk each, same length)
+#   3 kinds* (0 int32, 1 int64, 2 float32, 3 float64)   4 desc* (0 / 1)   5 k   6 threads
+# Output: 0 n_out (min(k, rows))   1 arena (mx_exec_free): int64 row numbers in sorted order.
+# Rows compare by the columns in order (descending flips one), then by row number, so the result
+# is the stable sort's first k rows. Each worker keeps a max-heap of its best k rows over blocks of
+# the rows; the heaps' rows are then sorted together. E_NAN_SORT on a NaN (the caller decides).
+
+comptime KMAGIC = 0x4D58544B
+
+
+@always_inline
+def _tk_val_i(arr: Int, kind: Int, i: Int) -> Int:
+    return _ival(arr, 4 if kind == 0 else 8, i)
+
+
+@always_inline
+def _tk_val_f(arr: Int, kind: Int, i: Int) -> Float64:
+    var off = _arr_off(arr)
+    var data = _arr_buf(arr, 1)
+    if kind == 2:
+        return Float64(Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=data)[off + i])
+    return Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=data)[off + i]
+
+
+@always_inline
+def _tk_before(cols: LP, kinds: LP, desc: LP, nc: Int, a: Int, b: Int) -> Bool:
+    """Row a sorts before row b."""
+    for c in range(nc):
+        var arr = Int(cols[c])
+        var kind = Int(kinds[c])
+        var d = Int(desc[c]) != 0
+        if kind <= 1:
+            var x = _tk_val_i(arr, kind, a)
+            var y = _tk_val_i(arr, kind, b)
+            if x != y:
+                return (x > y) if d else (x < y)
+        else:
+            var x = _tk_val_f(arr, kind, a)
+            var y = _tk_val_f(arr, kind, b)
+            if x != y:
+                return (x > y) if d else (x < y)
+    return a < b
+
+
+def _tk_sift_down(h: LP, size: Int, cols: LP, kinds: LP, desc: LP, nc: Int):
+    """Restore the max-heap (root: the row that sorts last) from the root."""
+    var c = 0
+    while True:
+        var l = 2 * c + 1
+        if l >= size:
+            break
+        var w = l
+        if l + 1 < size and _tk_before(cols, kinds, desc, nc, Int(h[l]), Int(h[l + 1])):
+            w = l + 1
+        if _tk_before(cols, kinds, desc, nc, Int(h[c]), Int(h[w])):
+            var t = h[c]
+            h[c] = h[w]
+            h[w] = t
+            c = w
+        else:
+            break
+
+
+@export
+def mx_topk(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != KMAGIC:
+        return E_BAD_PLAN
+    var nc = Int(P[1])
+    var cols = _lp(Int(P[2]))
+    var kinds = _lp(Int(P[3]))
+    var desc = _lp(Int(P[4]))
+    var k = Int(P[5])
+    var threads = max(1, Int(P[6]))
+    var O = _lp(out_a)
+    if nc < 1 or k < 1:
+        return E_BAD_PLAN
+    var n = _arr_len(Int(cols[0]))
+    for c in range(nc):
+        if _arr_len(Int(cols[c])) != n or Int(kinds[c]) < 0 or Int(kinds[c]) > 3:
+            return E_BAD_PLAN
+    k = min(k, n)
+    var nb = max(1, min(threads * 4, (n + 65535) // 65536))
+    var nt = max(1, min(threads, nb))
+    var heaps = unsafe_alloc[Int64](nt * max(k, 1))
+    var sizes = unsafe_alloc[Int64](nt)
+    var nan = unsafe_alloc[Int64](1)
+    nan[0] = 0
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def work(wid: Int) {imm}:
+        var h = heaps + wid * k
+        var size = 0
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                for c in range(nc):
+                    var kind = Int(kinds[c])
+                    if kind >= 2:
+                        var x = _tk_val_f(Int(cols[c]), kind, i)
+                        if x != x:
+                            nan[0] = 1
+                if size < k:
+                    var c2 = size                   # sift up
+                    h[c2] = Int64(i)
+                    size += 1
+                    while c2 > 0:
+                        var p = (c2 - 1) // 2
+                        if _tk_before(cols, kinds, desc, nc, Int(h[p]), Int(h[c2])):
+                            var t = h[p]
+                            h[p] = h[c2]
+                            h[c2] = t
+                            c2 = p
+                        else:
+                            break
+                elif _tk_before(cols, kinds, desc, nc, i, Int(h[0])):
+                    h[0] = Int64(i)
+                    _tk_sift_down(h, size, cols, kinds, desc, nc)
+        sizes[wid] = Int64(size)
+
+    _par(work, nt)
+    if Int(nan[0]) != 0:
+        heaps.free()
+        sizes.free()
+        nan.free()
+        counter.free()
+        return E_NAN_SORT
+    # all workers' candidates (at most threads * k rows), merge-sorted
+    var m = 0
+    for w in range(nt):
+        m += Int(sizes[w])
+    var cand = unsafe_alloc[Int64](max(m, 1))
+    var at = 0
+    for w in range(nt):
+        for j in range(Int(sizes[w])):
+            cand[at] = heaps[w * k + j]
+            at += 1
+    var perm = unsafe_alloc[Int64](max(m, 1))
+    for j in range(m):
+        perm[j] = cand[j]
+    # merge sort of the candidates by _tk_before
+    var tmp = unsafe_alloc[Int64](max(m, 1))
+    var width = 1
+    while width < m:
+        var lo = 0
+        while lo < m:
+            var mid = min(lo + width, m)
+            var hi = min(lo + 2 * width, m)
+            var a = lo
+            var b2 = mid
+            var o = lo
+            while a < mid and b2 < hi:
+                if _tk_before(cols, kinds, desc, nc, Int(perm[b2]), Int(perm[a])):
+                    tmp[o] = perm[b2]
+                    b2 += 1
+                else:
+                    tmp[o] = perm[a]
+                    a += 1
+                o += 1
+            while a < mid:
+                tmp[o] = perm[a]
+                a += 1
+                o += 1
+            while b2 < hi:
+                tmp[o] = perm[b2]
+                b2 += 1
+                o += 1
+            lo += 2 * width
+        for j in range(m):
+            perm[j] = tmp[j]
+        width *= 2
+    var n_out = min(k, m)
+    var arena = unsafe_alloc[UInt8](max(n_out * 8, 8), alignment=64)
+    var dst = _lp(Int(arena))
+    for j in range(n_out):
+        dst[j] = perm[j]
+    O[0] = Int64(n_out)
+    O[1] = Int64(Int(arena))
+    heaps.free()
+    sizes.free()
+    nan.free()
+    counter.free()
+    cand.free()
+    perm.free()
+    tmp.free()
+    return 0
