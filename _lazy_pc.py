@@ -6,16 +6,15 @@ when the plan runs natively and never calls a compute function. This proxy defer
 the first attribute access.
 """
 
-import sys
 
 
 class _LazyCompute:
     __slots__ = ()
 
     def __getattr__(self, name):
-        mod = sys.modules.get("pyarrow.compute")
-        if mod is None:
-            import pyarrow.compute as mod
+        # always through the import system: it waits on the module lock, so a thread never sees a
+        # half-imported pyarrow.compute (a cached module costs a dict lookup)
+        import pyarrow.compute as mod
         return getattr(mod, name)
 
     def __dir__(self):

@@ -101,7 +101,7 @@ frontend built the plan — they see identical plan trees either way.
 │   - scatter / gather    - hash_join                     │
 │                                                         │
 │   Files: mxframe/kernels/*.mojo                         │
-│   Built to: mxframe/kernels.mojopkg                     │
+│   Built to: mxframe/kernels.mojoc                       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -163,7 +163,7 @@ The `GraphCompiler` (and its subclass `CustomOpsCompiler`) does:
    - `Filter` → emit comparison ops, then `ops.gather` to select matching rows
    - `Project` → emit arithmetic/function ops for each expression
    - `Aggregate` → emit `ops.custom("group_sum", ...)` or `ops.sum(axis=0)`
-3. **Load custom Mojo kernels** via `custom_extensions=[Path("kernels.mojopkg")]`
+3. **Load custom Mojo kernels** via `custom_extensions=[Path("kernels.mojoc")]`
 4. **Execute** via `session.load(graph)` → `model.execute(*inputs)`
 5. **Convert results** back to PyArrow via `tensor.to_numpy()` → `pa.array()`
 

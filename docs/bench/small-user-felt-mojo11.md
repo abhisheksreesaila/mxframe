@@ -1,5 +1,8 @@
 # User-felt TPC-H scoreboard - 2026-10-12
 
+> **Note (F-035):** run on the uncommitted Mojo 1.1 port (modular 26.6, Mojo 1.1.0), *before* the lazy `pyarrow.compute` change; the "mxframe at git 9b5d66e" line below is the base commit, not 26.4 code. mx engines still pre-imported `pyarrow.compute` in this run.
+
+
 **Headline = what a user feels:** a fresh Python process, data starting as Parquet on disk, the clock around *Parquet read + query + materialized result*. No warm-up. `import` time is reported separately (and summed in the "import + first" tables). Numbers are milliseconds; **bold** = fastest verified engine for that query.
 
 Legend: `†` float32 accumulation drift (result within 1e-2 relative of DuckDB, error shown but outside the strict 1e-6 check), `WRONG` = differs from DuckDB (rows/keys, relative error above 1e-2, or rows not in the query's ORDER BY order), `?` = **unchecked** (the DuckDB reference failed for that query, so the result was not verified; it never counts as fastest or as a win), `TIMEOUT` / `CRASH` / `ERR` = did not produce a result (timeout 120s per subprocess). `outside mx` = the mx engines do part of that query with PyArrow/NumPy because the LazyFrame API cannot express it (details under Query semantics); every other mx query is pure mxframe.

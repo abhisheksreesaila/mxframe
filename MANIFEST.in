@@ -3,20 +3,9 @@ include setup.py
 include README.md
 include CHANGELOG.md
 include docs/vision-and-architecture.md
-include __init__.py
-include _modidx.py
-include aot_kernels.py
-include compiler.py
-include custom_ops.py
-include lazy_expr.py
-include lazy_frame.py
-include optimizer.py
-include pipeline_exec.py
-include pipeline_kernels.py
-include pipeline_program.py
-include plan_validation.py
-include sql_frontend.py
-include kernels.mojopkg
+# every module of the package (the repo root is the `mxframe` package); a hand-kept list went stale
+include *.py
+include kernels.mojoc
 recursive-include kernels_aot *.py *.so
 prune llm-ctx
 prune scripts

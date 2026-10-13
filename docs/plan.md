@@ -288,8 +288,9 @@ Needs: none · From the CPU baseline at ~12k rows
 - [x] the harness settles Q19 at SF0.002 (pandas/Polars marked WRONG): for pandas and Polars only (their convention), a one-row aggregate of 0 against a NULL reference counts as equal, with a note on the row (`compare_tables(empty_sum_is_zero=True)`); the report's correctness methodology says so
 - [x] all 22 queries correct on every engine at SF 0.002, 0.017 and 0.17: `docs/bench/small-userfelt-f027.md`, 198 results checked against DuckDB, 195 ok and 3 drift (Polars Q1, float32 accumulation, 3e-6 to 1.6e-3). mx-cpu 66/66 ok with no NULL-vs-0 note. `tests/test_tpch_small_correct.py` checks pandas, Polars and mx-cpu against DuckDB at 0.002 and 0.017, user-felt and engine-only paths
 
-## F-028 One-time Mojo runtime load [doing]
+## F-028 One-time Mojo runtime load [done]
 Unblocked 2026-10-12: Abhishek approved the toolchain upgrade (F-035); on Mojo 1.1 the runtime no longer links libNVPTX.
+Done through F-035: library load 19 → 5.6 ms; the remaining first-query wait was the warm-up's `import pyarrow.compute`, now lazy.
 Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows Polars 2.6 ms, mx-cpu 4.6 ms (before F-026), pandas 5.4 ms; user-felt read median mx 31 ms vs Polars 19 ms
 - [ ] profile where a 12k-row query spends its time (planning, Arrow↔NumPy conversion, ctypes calls, result building) and write it down
   - First finding (2026-10-12): the ~23 ms first runs (Q6 at 12k, Q1 and Q21 at 100k, reproducible 23–25 ms in fresh workers vs 3–6 ms when warm) are the one-time Mojo runtime load. The first kernel library dlopen costs 22–42 ms, whichever library it is: `libNVPTX.so` (56 MB LLVM NVPTX backend, linked even by the CPU libraries) 11 ms, `libKGENCompilerRTShared.so` 5 ms, the rest runtime start-up. The import-time warm-up thread hides it only when the data load takes longer (Q1 load 27 ms → query 5 ms; load 8 ms → query 25 ms); with `MXFRAME_WARM=0` every first query pays 27–50 ms. Leads: build the CPU libraries without the NVPTX dependency; one CPU library instead of four; start the warm-up before `import pyarrow.compute` (29 ms) in `import mxframe` (89 ms)
@@ -299,14 +300,21 @@ Needs: F-026 · From the CPU baseline: engine-only median per query at 12k rows 
   - Moving the load can't hide it: dlopen holds the dynamic-loader lock that Python's own extension imports need. Preloading at the top of `import mxframe`, or first in the warm-up thread, turns the 12k-row first query from ~23 ms into ~5 ms but `import` from ~124 into ~143 ms; import + first query stays ~150 ms (engine-only) and ~155 ms (user-felt) either way. Shipping that would only move time from the headline column into the import column, so it stays out.
   - Remaining small-data cost to look at in M1: SF0.017 Q21 pays ~23 ms on its first run even with the runtime loaded (not this load)
 
-## F-035 Toolchain: Mojo 1.1 / MAX 26.6 [review]
+## F-035 Toolchain: Mojo 1.1 / MAX 26.6 [done]
 Needs: Abhishek's go (given 2026-10-12) · Unblocks F-028
 - [x] `pixi.toml` `modular = "26.6.*"` (Mojo 1.1.0, Sept 2026; was 26.4 / Mojo 1.0.0b2)
 - [x] all seven AOT libraries and the MAX Graph custom-op package build on 1.1. Changes are mechanical: `std.gpu` → `max.gpu`, `parallelize` from `max.algorithm` taking the worker as a value (`def worker(i: Int) {imm}:` closures), `memcpy` / `memset_zero` / `alloc` → `unsafe_*`, `InlineArray` → `Array`, `Atomic[DType.x]` → `Atomic[Scalar[DType.x]]`, pointer aliases `Pointer[T, MutUntrackedOrigin]` (struct fields can't hold `AnyOrigin`), `.address` → `._mlir_value`, `enqueue_function_experimental` → `enqueue_function`, GPU kernel arguments `Int64` instead of `Int` (Int is no longer `DevicePassable`); the package is `kernels.mojoc` (1.1 writes `.mojoc`, not `.mojopkg`)
 - [x] `libNVPTX.so` is gone from the runtime's dependencies: dlopen of `libmxexec_cpu.so` 19 ms → 5.6 ms in a fresh process
 - [x] `pixi run test` 2053 passed, 2 xfailed; `test0`, `test1`, `test4`, `test5`, `test6`, `test6-gpu`, `test-sql`, `test-q5q10` pass; `test-import` was failing before the upgrade too (it expected `GraphCompiler` to need MAX, which F-019 made lazy) and now checks that MAX is not imported eagerly
-- [ ] small-data scoreboards (12k and 100k rows, engine-only and user-felt) against the 1.0.0b2 runs
+- [x] small-data scoreboards (12k and 100k rows) against the 1.0.0b2 runs: `docs/bench/small-{engine,user-felt}-mojo11.md` (run on the port before the lazy `pyarrow.compute` change). User-felt, sum of 22 first runs: mx-cpu 765 → 511 ms at 12k rows (pandas 526, Polars 443) and 835 → 587 ms at 100k (pandas 622, Polars 455). The first query of a process still paid ~10 ms: it waited for the warm-up thread, 29 of whose ~45 ms were `import pyarrow.compute`
+- [x] `pyarrow.compute` loads on first use (`_lazy_pc.py`; the comparison tables hold names), not at import or in the warm-up. Fresh process, SF0.002 Q6 engine-only: load + first query 47 + 11 = 58 ms → 33 + 2 = 35 ms; Q1 (still on the Python path, which calls Arrow compute) 58 → 58 ms, the import moved into the query. The benchmark worker no longer pre-imports it for the mx engines (`tests/test_lazy_compute.py`)
+- [x] review fixes: `MANIFEST.in` shipped a hand-kept module list that had gone stale (no `native_exec`, `io_parquet`, `join_engine`, `np_arrow`, ...) and `kernels.mojopkg`: now `include *.py` and `kernels.mojoc`; runtime extra `modular>=26.6`; `_lazy_pc` always imports through the module lock; `_LazyPcOps.get` returns functions and `.values()` / `.items()` raise
 - Follow-up: ~1,300 deprecation warnings (positional `ptr[i]` → `ptr[unsafe_offset=i]`, `.free()` → `.unsafe_free()`, `@parameter` closures); harmless on 1.1, to be cleaned before Modular removes them
+
+## F-036 Kernel libraries find the Mojo runtime wherever they are installed [todo]
+Needs: none · From the F-035 review
+- [ ] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
+- [ ] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
 
 ## F-029 CPU joins [superseded by F-032]
 Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17, Q20 with reading out of the clock (F-007 is GPU placement; this ticket is the CPU join itself)

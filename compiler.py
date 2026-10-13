@@ -33,9 +33,18 @@ def _max_dtype(arr):
     return getattr(DType, _NP_TO_MAX_NAMES.get(arr.dtype, "float32"))
 
 class _LazyPcOps(dict):
-    """op -> pyarrow.compute function, looked up on use: pyarrow.compute loads on first use (_lazy_pc)."""
+    """op -> pyarrow.compute function, looked up on use: pyarrow.compute loads on first use (_lazy_pc).
+    Only `in` and `[]` give functions; the stored values are names."""
     def __getitem__(self, op):
         return getattr(pc, dict.__getitem__(self, op))
+
+    def get(self, op, default=None):
+        return self[op] if op in self else default
+
+    def values(self):
+        raise TypeError("_LazyPcOps holds function names; look ops up with [] instead")
+
+    items = values
 
 
 _PC_CMP_OPS = _LazyPcOps({
