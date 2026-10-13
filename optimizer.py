@@ -10,6 +10,7 @@ from typing import List, Tuple
 from .lazy_expr import Expr
 from mxframe.lazy_frame import (
     join_output_names,
+    FILTERING_JOINS,
     LogicalPlan,
     Scan,
     Filter,
@@ -125,10 +126,15 @@ class PlanOptimizer:
         def push(node: LogicalPlan, conjuncts: List[Expr]) -> LogicalPlan:
             """Apply ``conjuncts`` on top of ``node``, sinking what can sink."""
             nonlocal changed
-            if isinstance(node, Join) and conjuncts and node.how in ("inner", "left"):
+            if isinstance(node, Join) and conjuncts:
                 lcols, rcols = _output_columns(node.left), _output_columns(node.right)
+                if node.how in FILTERING_JOINS:
+                    rcols = rcols if rcols is not None else []
                 if lcols is not None and rcols is not None:
-                    mapping = join_output_names(lcols, rcols, node.right_on)   # right column -> output name
+                    # right column -> output name (a semi / anti join outputs the left columns only:
+                    # a filter above it reads left columns and moves to the left side)
+                    mapping = ([] if node.how in FILTERING_JOINS
+                               else join_output_names(lcols, rcols, node.right_on))
                     lcols = set(lcols)
                     r_visible = {out for _, out in mapping}
                     r_renamed = {out for orig, out in mapping if out != orig}
@@ -240,6 +246,10 @@ class PlanOptimizer:
                 return Distinct(walk(node.input, below), node.subset)
             if isinstance(node, Join):
                 lcols, rcols = _output_columns(node.left), _output_columns(node.right)
+                if node.how in FILTERING_JOINS and needed is not None and lcols is not None:
+                    # only the keys are read from the right side
+                    return Join(walk(node.left, (needed & set(lcols)) | set(node.left_on)),
+                                walk(node.right, set(node.right_on)), node.left_on, node.right_on, node.how)
                 if needed is None or lcols is None or rcols is None:
                     return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
                 mapping = join_output_names(lcols, rcols, node.right_on)
@@ -464,8 +474,10 @@ def _output_columns(plan):
         return _output_columns(plan.input)
     if isinstance(plan, Join):
         l, r = _output_columns(plan.left), _output_columns(plan.right)
-        if l is None or r is None:
+        if l is None or (r is None and plan.how not in FILTERING_JOINS):
             return None
+        if plan.how in FILTERING_JOINS:
+            return l
         return l + [out for _, out in join_output_names(l, r, plan.right_on)]
     if isinstance(plan, (Project, Aggregate)):
         exprs = list(plan.exprs) if isinstance(plan, Project) else list(plan.group_by) + list(plan.aggs)

@@ -635,8 +635,45 @@ def _legacy(comp, node):
     return comp._execute_hash_join(left, right, node.left_on, node.right_on, how=node.how)
 
 
+def has_partner(lk: np.ndarray, rk: np.ndarray) -> np.ndarray:
+    """For each left key code, whether some right key code equals it (codes from ``encode_keys``:
+    non-negative, nulls on side-specific codes that never match)."""
+    if len(lk) == 0 or len(rk) == 0:
+        return np.zeros(len(lk), dtype=bool)
+    hi = int(max(lk.max(), rk.max())) + 1
+    if hi <= 4 * (len(lk) + len(rk)) + 1024:
+        mark = np.zeros(hi, dtype=bool)
+        mark[rk] = True
+        return mark[lk]
+    return np.isin(lk, rk)
+
+
+def _execute_filtering(comp, node, needed):
+    """A semi join (left rows with a partner) or anti join (left rows without one): the left
+    columns, in the left table's row order."""
+    lcols = plan_columns(node.left)
+    if lcols is None:
+        return None
+    want = lcols if needed is None else [n for n in lcols if n in needed] or lcols[:1]
+    lt = leaf_table(comp, node.left, set(want) | set(node.left_on))
+    rt = leaf_table(comp, node.right, set(node.right_on))
+    if lt.num_rows and rt.num_rows:
+        lk, rk = encode_keys([lt.column(c) for c in node.left_on], [rt.column(c) for c in node.right_on],
+                             comp._common_key_type)
+        hit = has_partner(lk, rk)
+    else:
+        hit = np.zeros(lt.num_rows, dtype=bool)
+    keep = ~hit if node.how == "anti" else hit
+    sub = lt.select(want)
+    if keep.all():
+        return sub
+    return _gather_table(comp, sub, np.flatnonzero(keep).astype(np.int64))
+
+
 def _execute_join(comp, node, needed, dict_ok=False):
-    if node.how == "left":
+    if node.how in ("semi", "anti"):
+        out = _execute_filtering(comp, node, needed)
+    elif node.how == "left":
         out = _execute_left(comp, node, needed)
     elif node.how == "inner":
         out = _execute_inner(comp, node, needed, dict_ok)

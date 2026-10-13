@@ -71,6 +71,13 @@ class Expr:
         """True for rows where this string column starts with *prefix*."""
         return Expr("startswith", self, prefix)
 
+    def str_slice(self, offset: int, length: int = None) -> 'Expr':
+        """The part of this string column from character ``offset`` (0-based), ``length``
+        characters long (to the end when None), like Polars' ``str.slice``."""
+        if not isinstance(offset, int) or offset < 0 or (length is not None and (not isinstance(length, int) or length < 0)):
+            raise ValueError("str_slice: offset and length must be non-negative integers")
+        return Expr("str_slice", self, offset, length)
+
     def contains(self, pattern: str) -> 'Expr':
         """True for rows where this string column contains *pattern* (substring match)."""
         return Expr("contains", self, pattern)

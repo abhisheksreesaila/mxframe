@@ -116,6 +116,10 @@ class Tail(LogicalPlan):
         return ("Tail", self.input.signature(), self.n)
 
 
+JOIN_TYPES = ("inner", "left", "semi", "anti")
+FILTERING_JOINS = ("semi", "anti")      # keep or drop left rows; no right column in the output
+
+
 def join_output_names(left_names, right_names, right_on):
     """``[(right column, output name), ...]`` for the right side's non-key columns of a join.
 
@@ -528,15 +532,20 @@ class LazyFrame:
 
 
     def join(self, other, *, on=None, left_on=None, right_on=None, how="inner"):
-        """Inner join with another LazyFrame.
+        """Join with another LazyFrame.
 
         Args:
             other: LazyFrame to join with.
             on: Column name(s) present in both frames (shorthand for left_on=right_on).
             left_on: Column name(s) in the left frame.
             right_on: Column name(s) in the right frame.
-            how: Join type (currently only "inner" is supported).
+            how: "inner", "left" (every left row; right columns null without a partner), "semi" (the
+                left rows that have a partner, each once) or "anti" (the left rows that have none).
+                Semi and anti joins return the left columns only, in the left table's row order;
+                null keys never match (SQL EXISTS / NOT EXISTS).
         """
+        if how not in JOIN_TYPES:
+            raise ValueError(f"Unsupported join type {how!r}; use one of {', '.join(JOIN_TYPES)}")
         if on is not None:
             if left_on is not None or right_on is not None:
                 raise ValueError("Cannot specify both 'on' and 'left_on'/'right_on'")

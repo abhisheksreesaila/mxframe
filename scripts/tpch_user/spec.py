@@ -185,7 +185,6 @@ ORDER_BY: dict[int, list[tuple[int, bool]]] = {
 OUTSIDE_MX: dict[int, str] = {
     13: "PyArrow: appends the zero-order customer row (customers minus customers with orders); no left join: "
         "works around the engine's left-join count bug (F-016)",
-    22: "PyArrow/NumPy: phone-prefix substring, NOT EXISTS anti-join",
 }
 
 TITLES = {

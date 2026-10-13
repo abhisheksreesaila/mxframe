@@ -321,6 +321,9 @@ class GraphCompiler:
         if op == "isin":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
+        if op == "str_slice":
+            from .custom_ops import _str_slice
+            return _str_slice(GraphCompiler._eval_predicate(args[0], table), args[1], args[2])
         if op == "startswith":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])

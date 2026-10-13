@@ -9,6 +9,7 @@ from typing import List
 
 from .lazy_expr import Expr
 from mxframe.lazy_frame import (
+    JOIN_TYPES,
     LogicalPlan,
     Scan,
     ParquetScan,
@@ -109,8 +110,8 @@ def validate_plan(plan: LogicalPlan) -> List[PlanValidationError]:
             return
 
         if isinstance(node, Join):
-            if node.how not in ("inner", "left"):
-                errors.append(PlanValidationError(path, f"Unsupported join type '{node.how}'; use 'inner' or 'left'"))
+            if node.how not in JOIN_TYPES:
+                errors.append(PlanValidationError(path, f"Unsupported join type '{node.how}'; use one of {', '.join(JOIN_TYPES)}"))
             if not node.left_on or not node.right_on:
                 errors.append(PlanValidationError(path, "Join key lists cannot be empty"))
             if len(node.left_on) != len(node.right_on):

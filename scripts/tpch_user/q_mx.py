@@ -442,21 +442,14 @@ def q21(t, dev):
 
 
 def q22(t, dev):
-    import numpy as np
-    import pyarrow.compute as pc
-    # select() the needed columns first: a bare scan is a passthrough that reads every column
-    customer = t["customer"].select("c_custkey", "c_phone", "c_acctbal").compute(device=dev)
-    orders = t["orders"].select("o_custkey").compute(device=dev)
-    code = pc.utf8_slice_codeunits(pc.cast(customer["c_phone"], pa.string()), 0, 2)
-    tc = customer.filter(pc.is_in(code, value_set=np_arrow.array(S.Q22_CODES)))
-    tcode = code.filter(pc.is_in(code, value_set=np_arrow.array(S.Q22_CODES)))
-    pos = LazyFrame(tc).filter(col("c_acctbal") > lit(0.0))
-    avg_bal = _scalar(pos.groupby().agg(col("c_acctbal").mean().alias("a")).compute(device=dev))
-    no_order = np_arrow.array(~np.isin(np_arrow.to_numpy(tc["c_custkey"]),
-                                       np_arrow.to_numpy(orders["o_custkey"])))
-    filtered = tc.filter(no_order).append_column("cntrycode", tcode.filter(no_order))
+    c = (t["customer"].select("c_custkey", "c_phone", "c_acctbal")
+         .with_columns(col("c_phone").str_slice(0, 2).alias("cntrycode"))
+         .filter(col("cntrycode").isin(S.Q22_CODES)))
+    avg_bal = _scalar(c.filter(col("c_acctbal") > lit(0.0)).groupby().agg(col("c_acctbal").mean().alias("a"))
+                      .compute(device=dev))
     return (
-        LazyFrame(filtered).filter(col("c_acctbal") > lit(avg_bal))
+        c.filter(col("c_acctbal") > lit(avg_bal))
+        .join(t["orders"], left_on="c_custkey", right_on="o_custkey", how="anti")
         .groupby("cntrycode")
         .agg(col("c_custkey").count().alias("numcust"), col("c_acctbal").sum().alias("totacctbal"))
         .sort("cntrycode").compute(device=dev)

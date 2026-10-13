@@ -207,12 +207,21 @@ def _watch_table(table) -> None:
         if _WATCHED_TABLES.get(tid) is _ref:
             del _WATCHED_TABLES[tid]
         for cache in (_GROUP_ENCODE_CACHE, _INPUT_PREP_CACHE, _GPU_BUFFER_CACHE, _JOIN_RESULT_CACHE):
+            if cache is None:                # shutdown clears globals one at a time
+                return
             for k in [k for k in list(cache) if _contains_id(k, tid)]:
                 cache.pop(k, None)
     try:
         _WATCHED_TABLES[tid] = weakref.ref(table, _purge)
     except TypeError:
         pass
+
+
+def _str_slice(arr, offset: int, length):
+    """Characters [offset, offset + length) of every string (to the end when length is None)."""
+    if pa.types.is_dictionary(arr.type):
+        arr = _decode_dict(arr)
+    return pc.utf8_slice_codeunits(arr, start=offset, stop=None if length is None else offset + length)
 
 
 def _get_or_create_session(device_name: str, driver_device) -> Any:
@@ -522,7 +531,7 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
-        if expr.op in ("case_when", "isin", "startswith", "contains", "not", "year",
+        if expr.op in ("case_when", "isin", "startswith", "contains", "str_slice", "not", "year",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
                        "window"):
             return True
@@ -631,6 +640,8 @@ class CustomOpsCompiler(GraphCompiler):
                 mask = self._aot_gpu.utf8_isin_mask(col_arr, args[1])
                 return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
             return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
+        if op == "str_slice":
+            return _str_slice(self._eval_expr_arrow(args[0], table), args[1], args[2])
         if op == "startswith":
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
@@ -2866,6 +2877,16 @@ class CustomOpsCompiler(GraphCompiler):
         how="inner": Mojo GPU/CPU kernels, all matching rows.
         how="left":  PyArrow left outer; unmatched left rows get null right cols.
         """
+        if how in ("semi", "anti"):
+            # left rows with (semi) / without (anti) a partner, left columns only, in left order
+            from .join_engine import has_partner
+            if left_table.num_rows and right_table.num_rows:
+                left_keys, right_keys = self._encode_join_key_pair(left_table, right_table, left_on, right_on)
+                hit = has_partner(np.asarray(left_keys), np.asarray(right_keys))
+            else:
+                hit = np.zeros(left_table.num_rows, dtype=bool)
+            keep = ~hit if how == "anti" else hit
+            return pc.take(left_table, _npa(np.flatnonzero(keep).astype(np.int64)))
         if how == "left":
             # Mojo left-outer join: join_count_left + join_scatter_left kernels.
             left_keys, right_keys = self._encode_join_key_pair(
