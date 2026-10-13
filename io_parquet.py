@@ -628,6 +628,7 @@ def _analyze(plan: LogicalPlan) -> _Info:
                 info.refs.update(node.subset)
                 if not cut:
                     info.bad.update(node.subset)
+                    info.bad_expr.update(node.subset)
             return cut
         if isinstance(node, Join):
             info.has_join = True
@@ -635,6 +636,8 @@ def _analyze(plan: LogicalPlan) -> _Info:
             info.refs.update(node.right_on)
             info.bad.update(node.left_on)
             info.bad.update(node.right_on)
+            info.bad_expr.update(node.left_on)       # join keys and distinct subsets stay decoded
+            info.bad_expr.update(node.right_on)      # up front, as before (only bare projections defer)
             lcut = walk(node.left, passthru)
             rcut = walk(node.right, passthru)
             return lcut or rcut

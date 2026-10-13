@@ -485,3 +485,26 @@ def test_a_filtered_string_also_selected_after_the_join_stays_encoded_in_its_lea
     assert cust and pa.types.is_dictionary(cust[0].field("c_seg").type)
     assert got.schema.field("c_seg").type == pa.string()
     _same(got, old)
+
+
+def test_a_condition_inside_a_nested_star_partner(monkeypatch):
+    """Q8's shape with a condition inside the partner subtree (M2h review): orders -> customer runs
+    as a star of its own (a nested `_execute_star`) with the condition applied there, and the answer
+    equals the leaf-by-leaf join's."""
+    import mxframe.custom_ops as co
+    t = _tables()
+    calls = []
+    real = je._execute_star
+    monkeypatch.setattr(je, "_execute_star", lambda *a: calls.append(r := real(*a)) or r)
+    co._JOIN_RESULT_CACHE.clear()
+
+    def plan(t):
+        sub = (LazyFrame(t["orders"]).join(LazyFrame(t["cust"]), left_on="o_cust", right_on="c_key")
+               .filter(col("c_nat") * lit(100) < col("o_cust")))
+        return (LazyFrame(t["li"]).filter(col("l_qty") < lit(40)).join(sub, left_on="l_order", right_on="o_key")
+                .groupby("c_nat").agg(col("l_price").sum().alias("s"), col("l_qty").count().alias("n")).sort("c_nat"))
+
+    got, old, _ = _run_both(plan, t, monkeypatch)
+    assert len([c for c in calls if c is not None]) >= 2, calls      # the outer star and the nested one
+    assert got.num_rows > 0
+    _same(got, old)

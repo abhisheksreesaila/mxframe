@@ -393,6 +393,7 @@ Needs: F-031 · Replaces F-029
   - a partner subtree of 2+ leaves runs as a star of its own (recursively) before the leaf-by-leaf join; partners are probed most selective first. Q8's orders -> customer -> nation: 101 -> 36 ms
   - `mx_filter`: direct maps carry a presence bitmap (one bit per key, L2-resident), lookups are probed column-wise per 1024-row block with each map's words read once, and pass 1 records each morsel's kept rows so pass 2 copies only those (no row mask over the whole table). Q8's 60M-row lineitem scan 97 -> ~45 ms; Q8 SF10 212 -> ~100 ms (Polars 136)
 - [x] numbers after M2h (`docs/bench/m2h-engine.*`, mx-cpu and Polars in one run, load average 6-7 at the start, 44/44 equal to DuckDB): SF10 beats Polars on **20/22** (total 7.3 s vs 15.1 s; losses Q11 33 vs 32 ms, Q16 142 vs 113), SF1 9/22 (total 0.99 s vs 1.37 s). Q21 SF10 5.6 -> 3.9 s (Polars 4.2), its distinct now native
+- [x] review M2h (PASS) follow-ups: a test where the condition sits inside a nested star partner (and the nested call is asserted); join keys and DISTINCT subsets count in `bad_expr` again (only bare projected columns defer); kept-row offsets are uint16 (2 bytes per kept row, was 4); the presence bitmap is built only after the duplicate-key check passes
 - [x] M2i, many groups and string keys:
   - the interpreter gives all workers' partials 128 MB (was 768) and uses at most rows / groups workers: every worker fills and merges a partial per group, so with many groups fewer workers win (Q18's 1.5M-group subquery at SF1 164 -> 84 ms, Polars 134; Q21 SF1 406 -> 324; Q13 SF1 12.7 -> 8)
   - string-key interning: a per-block cache sends repeats of an earlier row of the block to its entry (25 brands would otherwise land in a few partitions); Q16's final group-by 25 -> 15.5 ms
@@ -409,6 +410,10 @@ Needs: F-032
 Needs: F-033
 - [ ] LIKE / contains / substr and non-dictionary string keys in Mojo
 - [ ] 22/22 TPC-H queries fully native; the Python execution path retired for them
+
+## F-040 A group-by on an aliased column fails [todo]
+Needs: none · Found by the M2h review (predates F-032)
+- [ ] `LazyFrame(t).select(col("s").alias("b")).groupby("b")` raises `KeyError: Field "b"` (in-memory tables, native path off too). The group-by should see the alias
 
 ## F-039 The optimization story: README with visuals [todo]
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13

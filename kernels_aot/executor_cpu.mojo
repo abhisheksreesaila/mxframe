@@ -1607,7 +1607,7 @@ def _par[F: def(Int) -> None](f: F, nt: Int):
 
 
 def _free_lists(lists: LP, n: Int):
-    """Free n int32 arrays (address 0: none) and the list of them."""
+    """Free n arrays (address 0: none) and the list of them."""
     for i in range(n):
         if Int(lists[i]) != 0:
             _ip(Int(lists[i])).free()
@@ -1813,27 +1813,28 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
                         dup[0] = 1
 
         _par(check, nt)
-        # presence bitmap of the direct array (one bit per key), built in parallel by 64-key words
-        var nwords = (rng + 63) // 64
-        var bits = unsafe_alloc[Int64](max(nwords, 1))
-        M[12] = Int64(Int(bits))
-        var nwb = max(1, min(nb, (nwords + 4095) // 4096))
-        counter[0] = 0
+        if Int(dup[0]) == 0:              # (a duplicate declines: no bitmap needed)
+            # presence bitmap of the direct array (one bit per key), built in parallel by 64-key words
+            var nwords = (rng + 63) // 64
+            var bits = unsafe_alloc[Int64](max(nwords, 1))
+            M[12] = Int64(Int(bits))
+            var nwb = max(1, min(nb, (nwords + 4095) // 4096))
+            counter[0] = 0
 
-        def mark(wid: Int) {imm}:
-            while True:
-                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-                if b >= nwb:
-                    break
-                for w in range(b * nwords // nwb, (b + 1) * nwords // nwb):
-                    var x = Int64(0)
-                    for t in range(64):
-                        var c = w * 64 + t
-                        if c < rng and slot[c] != 0:
-                            x |= Int64(1) << Int64(t)
-                    bits[w] = x
+            def mark(wid: Int) {imm}:
+                while True:
+                    var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                    if b >= nwb:
+                        break
+                    for w in range(b * nwords // nwb, (b + 1) * nwords // nwb):
+                        var x = Int64(0)
+                        for t in range(64):
+                            var c = w * 64 + t
+                            if c < rng and slot[c] != 0:
+                                x |= Int64(1) << Int64(t)
+                        bits[w] = x
 
-        _par(mark, max(1, min(threads, nwb)))
+            _par(mark, max(1, min(threads, nwb)))
     else:
         # partitioned hash table: count rows per (block, partition), scatter row numbers by
         # partition, then each partition builds its own open-addressing table
@@ -2029,7 +2030,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
     var nt = max(1, min(threads, morsels))
-    var mkeep = unsafe_alloc[Int64](morsels)       # per morsel: int32[kept] rows kept (offsets from its start)
+    var mkeep = unsafe_alloc[Int64](morsels)       # per morsel: uint16[kept] rows kept (offsets from its start)
     for i in range(morsels):
         mkeep[i] = 0
     var mcnt = unsafe_alloc[Int64](morsels)                    # surviving rows per morsel
@@ -2049,7 +2050,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         var tmp = unsafe_alloc[Int32](max(MORSEL * n_look, 1))
         var kp = unsafe_alloc[Int64](max(n_look, 1) * 4)      # per lookup: key base, width (x2)
         var cand = unsafe_alloc[Int32](VEC)                     # a block's candidate rows
-        var ktmp = unsafe_alloc[Int32](MORSEL)                  # the morsel's kept rows
+        var ktmp = unsafe_alloc[UInt16](MORSEL)                 # the morsel's kept rows (offsets < 2^16)
         var prow = unsafe_alloc[Int32](max(n_look, 1) * VEC)    # their partner rows, per lookup
         _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)     # constants, once
         while True:
@@ -2135,7 +2136,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                         nc = nn
                     for t in range(nc):
                         var i = Int(cand[t])
-                        ktmp[kept] = Int32(i0 + i - lo)
+                        ktmp[kept] = UInt16(i0 + i - lo)
                         for j in range(n_look):
                             tmp[kept * n_look + j] = prow[j * VEC + t]
                         for j in range(n_out):
@@ -2157,7 +2158,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                 pos = stop
             mcnt[m] = Int64(kept)
             if kept > 0:
-                var kr = unsafe_alloc[Int32](kept)
+                var kr = unsafe_alloc[UInt16](kept)
                 for i in range(kept):
                     kr[i] = ktmp[i]
                 mkeep[m] = Int64(Int(kr))
@@ -2255,7 +2256,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             var hi = min(lo + MORSEL, n_rows)
             var r = Int(mrow[m])
             var r0 = r
-            var kr = _ip(Int(mkeep[m]))
+            var kr = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=Int(mkeep[m]))
             var nk = Int(mcnt[m])
             var q = 0                                  # next kept row of this morsel
             var pos = lo
