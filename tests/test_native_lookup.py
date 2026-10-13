@@ -413,3 +413,75 @@ def test_a_selected_partner_is_filtered_natively_on_its_dictionary(monkeypatch):
     cust = [sch for n, sch in seen if n == 3000]
     assert cust and pa.types.is_dictionary(cust[0].field("c_seg").type)
     _same(got, old)
+
+
+def test_a_selected_partner_read_from_parquet_keeps_its_strings_encoded(monkeypatch, tmp_path):
+    """The same shape read through scan_parquet (M2g review): io_parquet treats
+    `.filter().select(key)` under a join as a Filter*(Scan) leaf, so the partner's string column is
+    read as a dictionary, filtered on its codes, and never decoded; a second select on top is not
+    seen through (one Project, as in the join engine) and still answers the same."""
+    import pyarrow.parquet as pq
+    import mxframe as mx
+    import mxframe.custom_ops as co
+    t = _tables()
+    for n in ("li", "orders", "cust"):
+        pq.write_table(t[n], tmp_path / f"{n}.parquet")
+    seen = []
+    real = nx.try_filter
+
+    def spy(comp, table, preds, needed, lookups=()):
+        seen.append((table.num_rows, table.schema))
+        return real(comp, table, preds, needed, lookups)
+
+    monkeypatch.setattr(nx, "try_filter", spy)
+
+    def plan(double):
+        cust = mx.scan_parquet(str(tmp_path / "cust.parquet")).filter(col("c_seg") == lit("BUILD")).select("c_key", "c_nat")
+        cust = cust.select("c_key") if double else cust
+        return (mx.scan_parquet(str(tmp_path / "li.parquet"))
+                .join(mx.scan_parquet(str(tmp_path / "orders.parquet")), left_on="l_order", right_on="o_key")
+                .join(cust, left_on="o_cust", right_on="c_key")
+                .groupby("l_mode").agg(col("l_price").sum().alias("s")).sort("l_mode"))
+
+    want = (LazyFrame(t["li"]).join(LazyFrame(t["orders"]), left_on="l_order", right_on="o_key")
+            .join(LazyFrame(t["cust"]).filter(col("c_seg") == lit("BUILD")).select("c_key"), left_on="o_cust", right_on="c_key")
+            .groupby("l_mode").agg(col("l_price").sum().alias("s")).sort("l_mode"))
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    ref = want.compute(device="cpu")
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    for double in (False, True):
+        seen.clear()
+        co._JOIN_RESULT_CACHE.clear()
+        got = plan(double).compute(device="cpu")
+        _same(got, ref)
+        if not double:
+            cust = [sch for n, sch in seen if n == 3000]
+            assert cust and pa.types.is_dictionary(cust[0].field("c_seg").type)
+
+
+def test_a_filtered_string_also_selected_after_the_join_stays_encoded_in_its_leaf(monkeypatch):
+    """Q16's part: `p_brand != ...` in the leaf's filter and `p_brand` selected after the join. A bare
+    projected column is decoded after the join's gather, so it does not force decoding the whole
+    leaf first (io_parquet `bad_expr`): the leaf is filtered natively on its codes (M2h)."""
+    import mxframe.custom_ops as co
+    t = _tables()
+    seen = []
+    real = nx.try_filter
+
+    def spy(comp, table, preds, needed, lookups=()):
+        seen.append((table.num_rows, table.schema))
+        return real(comp, table, preds, needed, lookups)
+
+    monkeypatch.setattr(nx, "try_filter", spy)
+    co._JOIN_RESULT_CACHE.clear()
+
+    def plan(t):
+        return (LazyFrame(t["orders"]).join(LazyFrame(t["cust"]).filter(col("c_seg") != lit("AUTO")),
+                                            left_on="o_cust", right_on="c_key")
+                .select("c_seg", "o_cust").distinct())
+
+    got, old, _ = _run_both(plan, t, monkeypatch)
+    cust = [sch for n, sch in seen if n == 3000]
+    assert cust and pa.types.is_dictionary(cust[0].field("c_seg").type)
+    assert got.schema.field("c_seg").type == pa.string()
+    _same(got, old)

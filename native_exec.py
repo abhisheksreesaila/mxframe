@@ -72,6 +72,8 @@ def _load():
             lib.mx_filter.restype = ctypes.c_int64
             lib.mx_gather.argtypes = [ctypes.c_int64, ctypes.c_int64]
             lib.mx_gather.restype = ctypes.c_int64
+            lib.mx_distinct.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_distinct.restype = ctypes.c_int64
             _lib = lib
     return _lib
 
@@ -359,6 +361,66 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data",
     }
     return result
+
+
+_DISTINCT_KIND = {pa.int32(): 0, pa.int64(): 1, pa.string(): 2}
+DMAGIC = 0x4D584431
+
+
+def _call_distinct(lib, plan_addr: int, out_addr: int) -> int:
+    """The native distinct call (a separate function so tests can count it)."""
+    return lib.mx_distinct(plan_addr, out_addr)
+
+
+def try_distinct(compiler, table: pa.Table) -> Optional[pa.Table]:
+    """The distinct rows of ``table`` in first-appearance order (F-032 M2h): one native call finds
+    the first row of every tuple (parallel hashing, 64 partitions built in row order), then the
+    kept rows are gathered. Columns int32 / int64 / utf8 without nulls; None: the caller's path."""
+    if not enabled() or not available():
+        return _decline("distinct: native executor off")
+    if getattr(compiler, "_device_arg", None) != "cpu":
+        return _decline("distinct: device='cpu'")
+    if table.num_rows < 2:
+        return _decline("distinct: row count")
+    import numpy as np
+    from ._lazy_pc import pc
+    kinds = []
+    for c in table.columns:
+        if c.type not in _DISTINCT_KIND or c.null_count:
+            return _decline(f"distinct: column type {c.type} or nulls")
+        kinds.append(_DISTINCT_KIND[c.type])
+    flat = [c.combine_chunks() if c.num_chunks != 1 else c.chunk(0) for c in table.columns]
+    structs = []
+    c_cols = (ctypes.c_int64 * len(flat))()
+    try:
+        for j, arr in enumerate(flat):
+            st = (ctypes.c_int64 * 10)()
+            arr._export_to_c(ctypes.addressof(st))
+            structs.append(st)
+            c_cols[j] = ctypes.addressof(st)
+        c_kinds = (ctypes.c_int64 * len(kinds))(*kinds)
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 5)(DMAGIC, len(flat), ctypes.addressof(c_cols), ctypes.addressof(c_kinds),
+                                 default_threads())
+        O = (ctypes.c_int64 * 2)()
+        lib = _load()
+        rc = _call_distinct(lib, ctypes.addressof(P), ctypes.addressof(O))
+    finally:
+        for st in structs:
+            if st[8]:
+                _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return _decline(f"distinct: executor declined (code {rc})")
+    n = int(O[0])
+    owner = _Arena(lib, int(O[1]))
+    if n == table.num_rows:
+        return table
+    idx = np.frombuffer(pa.foreign_buffer(int(O[1]), 8 * n, base=owner), dtype=np.int64, count=n)
+    out = try_gather(compiler, table, idx)
+    if out is None:
+        out = pc.take(table, pa.array(idx))
+    _last.update(path="native", decline=None)
+    return out
 
 
 # ── M2: native leaf filter (Filter*(Scan) under a join) ─────────────────────────────────────

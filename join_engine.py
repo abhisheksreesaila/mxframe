@@ -941,27 +941,46 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need) -> Optional[pa.Tabl
                                      names=[_star_name(c, k) for k in cols_of[c]])
         else:
             loc = {x: i for i, x in enumerate(S)}
-            lt = [get(x) for x in S]
-            rows = [t.num_rows for t in lt]
-            base = [_base_rows(fl.leaves[x], rows[loc[x]]) for x in S]
             ledges = [(loc[a2], loc[b2], ac2, bc2) for a2, b2, ac2, bc2 in fl.edges
                       if a2 in loc and b2 in loc]
             lres = [(p, {k: (loc[leaf], col_) for k, (leaf, col_) in cm.items()}) for p, cm in inner_res[c]]
-            idx, _ = _join_indices(comp, lt, rows, base, ledges, lres, {loc[x] for x in S if cols_of[x]})
-            arrays, names = [], []
-            for x in S:
-                if not cols_of[x]:
-                    continue
-                t = lt[loc[x]].select(cols_of[x])
-                ix = idx.get(loc[x])
-                g = t if ix is None else _gather_table(comp, t, ix, decode_dicts=True)
-                arrays += [g.column(k) for k in cols_of[x]]
-                names += [_star_name(x, k) for k in cols_of[x]]
-            B = pa.Table.from_arrays(arrays, names=names)
+            # the subtree as a star of its own (Q8's orders -> customer -> nation: one scan of orders
+            # instead of filtering it and joining leaf by leaf); else the leaf-by-leaf join
+            bn = [_star_name(x, k) for x in S for k in cols_of[x]]
+            sub = _Flat([fl.leaves[x] for x in S], ledges, bn,
+                        {_star_name(x, k): (loc[x], k) for x in S for k in cols_of[x]}, lres)
+            sub_fact = _star_fact(comp, sub)
+            B = None
+            if sub_fact is not None:
+                B = _execute_star(comp, sub, sub_fact, lambda i: get(S[i]), bn, None)
+            if B is None:
+                lt = [get(x) for x in S]
+                rows = [t.num_rows for t in lt]
+                base = [_base_rows(fl.leaves[x], rows[loc[x]]) for x in S]
+                idx, _ = _join_indices(comp, lt, rows, base, ledges, lres, {loc[x] for x in S if cols_of[x]})
+                arrays, names = [], []
+                for x in S:
+                    if not cols_of[x]:
+                        continue
+                    t = lt[loc[x]].select(cols_of[x])
+                    ix = idx.get(loc[x])
+                    g = t if ix is None else _gather_table(comp, t, ix, decode_dicts=True)
+                    arrays += [g.column(k) for k in cols_of[x]]
+                    names += [_star_name(x, k) for k in cols_of[x]]
+                B = pa.Table.from_arrays(arrays, names=names)
         outs = [nm for nm in B.column_names if nm.split(":", 1)[0] != str(c) or
                 nm.split(":", 1)[1] in deliver[c]]
         lookups.append(native_exec.Lookup(probe, B, [_star_name(c, k) for k in bkeys], outs, outs))
 
+    # probe the most selective partner first: a row stops at its first miss (Q8: the filtered part
+    # table before supplier and the orders subtree)
+    def kept_share(c, lk):
+        sk = _semi_keys(fl.leaves[c])
+        sc = sk[0] if sk is not None else _scan_under_filters(fl.leaves[c])[0]
+        return lk.build.num_rows / max(1, sc.table.num_rows) if sc is not None else 1.0
+
+    order = sorted(range(len(lookups)), key=lambda i: kept_share(roots[i][0], lookups[i]))
+    roots, lookups = [roots[i] for i in order], [lookups[i] for i in order]
     t0 = time.perf_counter()
     out = native_exec.try_filter(comp, scan.table, preds, set(deliver[fact]), lookups)
     if _TRACE:

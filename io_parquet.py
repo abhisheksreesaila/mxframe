@@ -527,13 +527,18 @@ class _Info:
     def __init__(self):
         self.refs: set = set()          # every column name referenced anywhere
         self.bad: set = set()           # referenced in a way that needs plain values
+        self.bad_expr: set = set()      # ... inside an expression (not a bare column projected out)
         self.has_join = False
         self.passthrough: dict = {}     # id(leaf) -> scan columns flow to the plan output
 
-    def use_plain(self, expr: Expr):
+    def use_plain(self, expr: Expr, bare_ok: bool = False):
+        """``bare_ok``: a bare column projected out of the plan is plain by then when the join
+        engine decodes it after its gather (deferral), so it does not count in ``bad_expr``."""
         for name in _expr_cols(expr):
             self.refs.add(name)
             self.bad.add(name)
+            if not (bare_ok and expr.op == "col"):
+                self.bad_expr.add(name)
 
     def predicate(self, expr: Expr):
         """A Filter predicate: `col <cmp> literal`, isin, startswith, contains may see dictionaries."""
@@ -595,7 +600,7 @@ def _analyze(plan: LogicalPlan) -> _Info:
         if isinstance(node, Project):
             walk(node.input, False)
             for e in node.exprs:
-                info.use_plain(e)
+                info.use_plain(e, bare_ok=True)
             return True
         if isinstance(node, Aggregate):
             walk(node.input, False)
@@ -663,8 +668,9 @@ def _join_leaf_filters(plan: LogicalPlan) -> dict:
         elif isinstance(node, Join):
             walk(node.left, set(), True)
             walk(node.right, set(), True)
-        elif under_join and not above and _selects_columns(node):
+        elif under_join and not above and _selects_columns(node) and not isinstance(node.input, Project):
             walk(node.input, set(), True)        # .filter(...).select(key) under a join: still a leaf
+                                                 # (one Project, as join_engine._scan_under_filters)
         elif hasattr(node, "input"):
             walk(node.input, set(), False)
     walk(plan, set(), False)
@@ -673,7 +679,6 @@ def _join_leaf_filters(plan: LogicalPlan) -> dict:
 
 def _selects_columns(node) -> bool:
     """A Project that only selects columns (join_engine sees through it to a Filter*(Scan) leaf)."""
-    from .lazy_frame import Project
     return (isinstance(node, Project) and bool(node.exprs)
             and all(e.op == "col" and e._alias in (None, e.args[0]) for e in node.exprs))
 
@@ -792,12 +797,13 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         leaf's filter, or after the final gather (joined rows only), so every consumer above the
         join still sees plain strings (F-032). A use the Python path can't take on dictionaries
         ("bad": CASE WHEN, arithmetic, ...) only matters in the leaf's own filter, where the
-        column is decoded first as before."""
+        column is decoded first as before; a bare column projected out above the join is not
+        such a use (`bad_expr`): it is decoded after the gather."""
         if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
             return False
         if id(leaf) not in leaf_preds:              # not a Filter*(Scan) input of a join
             return False
-        return name not in info.bad or name not in leaf_preds[id(leaf)]
+        return name not in info.bad_expr or name not in leaf_preds[id(leaf)]
 
     def _scan(table, defer):
         s = Scan(table)

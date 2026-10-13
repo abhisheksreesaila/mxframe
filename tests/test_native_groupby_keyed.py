@@ -21,6 +21,7 @@ def _table(n=300_000, seed=7, chunks=1):
     t = pa.table({
         "k": A(r.integers(1, 100_001, n).astype(np.int64)),          # ~100k groups: past the old 4096
         "j": A(r.integers(-50, 50, n).astype(np.int32)),
+        "m": A(r.integers(0, 8, n).astype(np.int32)),                # with k: 800k combinations, direct
         "f": pa.DictionaryArray.from_arrays(A(r.integers(0, 4, n).astype(np.int32)), A(["A", "N", "O", "R"])),
         "s": pa.array(names[r.integers(0, 3000, n)].tolist(), pa.string()),
         "d": A(r.integers(0, 1000, n).astype(np.int32)),
@@ -50,6 +51,8 @@ PLANS = {
     "many groups, no filter": (lambda t: LazyFrame(t).groupby("k")
         .agg(col("v").min().alias("lo"), col("v").max().alias("hi"), col("v").mean().alias("m")), False),
     "composite int keys, filter": (lambda t: LazyFrame(t).filter((col("d") >= lit(100)) & (col("d") < lit(400)))
+        .groupby("m", "k").agg(col("v").sum().alias("s")), False),
+    "composite past the direct limit (compacted), filter": (lambda t: LazyFrame(t).filter(col("d") < lit(400))
         .groupby("j", "k").agg(col("v").sum().alias("s")), False),
     "dictionary x int key, filter": (lambda t: LazyFrame(t).filter(col("d") < lit(500))
         .groupby("f", "j").agg(col("v").sum().alias("s"), col("v").count().alias("n")), False),

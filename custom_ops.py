@@ -2754,6 +2754,10 @@ class CustomOpsCompiler(GraphCompiler):
             return sub                                   # no rows: already distinct
         if any(sub.column(c).null_count for c in cols):
             return _distinct_rows(sub)
+        from . import native_exec
+        out = native_exec.try_distinct(self, sub)
+        if out is not None:
+            return out
         try:
             gids, n_groups, _ = self._build_group_ids(sub, cols)
         except Exception:
