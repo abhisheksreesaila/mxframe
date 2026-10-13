@@ -35,7 +35,7 @@ MAX_GROUPS = 1 << 20          # key ranges addressed directly
 MAX_COMPACT = 1 << 27         # key ranges compacted through a presence table (bytes + int32 per code)
 _CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
 _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
-K_DICT, K_I32, K_I64, K_STR = 0, 1, 2, 3
+K_DICT, K_I32, K_I64, K_STR, K_EXPR = 0, 1, 2, 3, 4
 _OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4}
 _DT = {pa.int32(): 0, pa.int64(): 1, pa.float32(): 2, pa.float64(): 3}
 
@@ -210,11 +210,30 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
     if table.num_rows == 0:
         return _decline("empty input")
 
-    keys = []
-    for e in plan.group_by:
-        if e.op != "col" or e._alias:
-            return _decline("derived group key")
-        keys.append(e.args[0])
+    keys, derived = [], {}                     # derived: key position -> integer expression
+    for i, e in enumerate(plan.group_by):
+        if e.op == "col" and e._alias in (None, e.args[0]):
+            keys.append(e.args[0])
+            continue
+        if not e._alias:
+            return _decline("derived group key without a name")
+        keys.append(e._alias)
+        derived[i] = e
+    ranges = {}
+    if derived:
+        # an integer expression key (TPC-H's order year): its range from one native min / max pass,
+        # then the executor groups by the program's value of it (directly addressed)
+        from .lazy_expr import Expr
+        probe = Aggregate(plan.input, [], [a for i, e in derived.items()
+                                           for a in (Expr("min", e).alias(f"lo{i}"), Expr("max", e).alias(f"hi{i}"))])
+        r = try_execute(compiler, probe, None, None, gpu_fallback)
+        if r is None:
+            return _decline("derived group key: range pass declined")
+        for i in derived:
+            lo, hi = r.column(f"lo{i}")[0].as_py(), r.column(f"hi{i}")[0].as_py()
+            if lo is None or hi is None or lo != int(lo) or hi != int(hi) or hi - lo + 1 > MAX_GROUPS:
+                return _decline("derived group key: not a small integer range")
+            ranges[i] = (int(lo), int(hi))
     sort_node, limit = None, -1
     for op in post_ops or []:
         if isinstance(op, Sort) and sort_node is None and limit < 0:
@@ -231,10 +250,20 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             sort_by.append((e.args[0], bool(desc)))
 
     from .pipeline_program import compile_pipeline
-    prog = compile_pipeline(preds, list(plan.aggs), table, concat_dicts=True)
+    from .lazy_expr import Expr
+    n_user = len(plan.aggs)
+    hidden = [Expr("min", derived[i]).alias(f"__key{i}") for i in sorted(derived)]
+    prog = compile_pipeline(preds, list(plan.aggs) + hidden, table, concat_dicts=True)
     if prog is None:
         return _decline("expression not supported by the bytecode compiler")
-    names = [name for name, _, _ in prog.outputs]
+    key_slot = {}
+    for j, i in enumerate(sorted(derived)):
+        slot = prog.outputs[n_user + j][2]
+        if slot is None or not prog.slot_int[slot]:
+            return _decline("derived group key is not an integer expression")
+        key_slot[i] = slot
+    outputs = prog.outputs[:n_user]
+    names = [name for name, _, _ in outputs]
     sorts = []
     for name, desc in sort_by:
         if name in keys:
@@ -259,12 +288,17 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         if c.type not in _DT or c.null_count:
             return _decline(f"value column type {c.type} or nulls")
         dtypes.append(_DT[c.type])
-    key_cols = [table.column(k) for k in keys]
-    kinds = []
-    for c in key_cols:
+    key_cols, kinds = [], []
+    for i, k in enumerate(keys):
+        if i in derived:                       # placeholder column: the key comes from the program
+            key_cols.append(table.column(0))
+            kinds.append(K_EXPR)
+            continue
+        c = table.column(k)
         kind = _key_kind(c)
         if kind is None or c.null_count:
             return _decline(f"group key type {c.type} or nulls not in M0")
+        key_cols.append(c)
         kinds.append(kind)
     every = cols + key_cols
     if not every:
@@ -284,11 +318,11 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
                 piece._export_to_c(ctypes.addressof(st))
                 structs.append(st)
                 arrays[r * width + j] = ctypes.addressof(st)
-        n_keys, n_out = len(keys), len(prog.outputs)
+        n_keys, n_out = len(keys), len(outputs)
         c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
         c_kinds = (ctypes.c_int64 * max(n_keys, 1))(*kinds)
         c_outs = (ctypes.c_int64 * max(3 * n_out, 1))(
-            *[v for name, op, slot in prog.outputs
+            *[v for name, op, slot in outputs
               for v in (_OPS[op], slot if slot is not None else 0, prog.nan_slots.get(name, -1))])
         c_sorts = (ctypes.c_int64 * max(3 * len(sorts), 1))(*[v for t in sorts for v in t])
         c_having = (ctypes.c_int64 * max(3 * len(having), 1))(*[v for j, c, _ in having for v in (j, c, 0)])
@@ -304,14 +338,16 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             code = code.copy()
             code[7] = len(prog.columns) + len(dcols)
         from .pipeline_kernels import default_threads
-        P = (ctypes.c_int64 * 25)(
+        c_xkeys = (ctypes.c_int64 * max(3 * n_keys, 1))(
+            *[v for i in range(n_keys) for v in ((key_slot[i],) + ranges[i] if i in derived else (0, 0, 0))])
+        P = (ctypes.c_int64 * 26)(
             MAGIC, 2, len(segs), len(cols), n_keys, n_out, len(sorts),
             code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
             ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
             default_threads(table.num_rows), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
             min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)), ctypes.addressof(c_hconst),
-            len(dcols), ctypes.addressof(c_doffs))
+            len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -345,7 +381,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         names.append(name)
         out_cols.append(arr)
     base = 3 + 2 * len(keys)
-    for j, (name, op, _) in enumerate(prog.outputs):
+    for j, (name, op, _) in enumerate(outputs):
         t = pa.int64() if op == "count" else pa.float64()
         if empty_global and op != "count":
             arr = pa.nulls(1, t)

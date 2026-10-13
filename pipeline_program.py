@@ -221,6 +221,7 @@ class PipelineProgram:
     n_instr: int
     identity: np.ndarray = field(default=None)  # float64 [n_slots] initial value per slot
     nan_slots: Dict[str, int] = field(default_factory=dict)  # min / max output -> hidden NaN-count slot
+    slot_int: List[bool] = field(default_factory=list)       # slot input is integer-valued (exact in float64)
     dict_concat: Dict[str, Dict[tuple, int]] = field(default_factory=dict)   # concat_dicts mode: name -> {dictionary key: offset}
 
     @property
@@ -794,6 +795,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
     slot_index: Dict[tuple, int] = {}
     slot_kinds: List[str] = []
     slot_src: List[int] = []
+    slot_int: List[bool] = []
     outputs: List[Tuple[str, str, Optional[int]]] = []
     nan_slots: Dict[str, int] = {}
     for i, e in enumerate(aggs):
@@ -819,12 +821,14 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
                 slot_index[nan_key] = len(slot_kinds)
                 slot_kinds.append("sum")
                 slot_src.append(isnan)
+                slot_int.append(False)
             nan_slots[name] = slot_index[nan_key]
             inner = _Val(masked, "float")
         if key not in slot_index:
             slot_index[key] = len(slot_kinds)
             slot_kinds.append(kind)
             slot_src.append(b.as_reg(inner))
+            slot_int.append(inner.kind in ("int", "bool"))
         outputs.append((name, e.op, slot_index[key]))
     if not outputs and not concat_dicts:
         raise Unsupported("no aggregates")       # (a predicate-only program is the executor's leaf filter)
@@ -909,6 +913,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         dict_arrays=dict(b.dict_arrays),
         dict_concat={n: o for n, o in b.dict_concat.items() if n in b.columns},
         slot_kinds=slot_kinds,
+        slot_int=slot_int,
         outputs=outputs,
         nan_slots=nan_slots,
         n_regs=n_regs,

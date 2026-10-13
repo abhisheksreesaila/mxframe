@@ -65,6 +65,9 @@ def _join_type(join) -> str:
     side = str(join.args.get("side") or "").lower()
     kind = str(join.args.get("kind") or "").lower()
     if kind in ("semi", "anti"):
+        if side not in ("", "left"):
+            raise ValueError(f"unsupported SQL join: {side.upper()} {kind.upper()} "
+                             "(supported: [INNER] JOIN, LEFT [OUTER] JOIN, [LEFT] SEMI JOIN, [LEFT] ANTI JOIN)")
         return kind
     if kind in ("", "inner", "outer") and side == "left":
         return "left"
@@ -157,7 +160,8 @@ class _SQLTranslator:
             if on is not None:
                 left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
             elif using:
-                keys = [str(c.name) for c in using.expressions]
+                cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
+                keys = [str(c.name) for c in cols]
                 left_on = right_on = keys
             else:
                 raise ValueError("JOIN requires ON or USING clause")

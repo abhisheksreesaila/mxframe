@@ -70,6 +70,7 @@ comptime K_DICT = 0
 comptime K_I32 = 1
 comptime K_I64 = 2
 comptime K_STR = 3     # utf8 (int32 offsets), not dictionary-encoded: hashed to entry ids in Mojo
+comptime K_EXPR = 4    # an integer expression of the row (a register of the program): its range comes in the plan
 
 comptime O_SUM = 0
 comptime O_MIN = 1
@@ -147,6 +148,7 @@ struct Keys(Copyable, Movable):
     var gcode: LP       # per key: address of int64[card] (code in that chunk's dictionary)
     var remap: LP       # per key: address of int64[n_chunks] of addresses of int32[dict len]
     var rowcode: LP     # per utf8 key: address of int32[n_rows] (entry id of every row)
+    var xreg: LP        # per expression key: the program register holding its value
 
     def __init__(out self, n: Int, n_chunks: Int):
         self.n = n
@@ -159,6 +161,7 @@ struct Keys(Copyable, Movable):
         self.gcode = unsafe_alloc[Int64](max(n, 1))
         self.remap = unsafe_alloc[Int64](max(n, 1))
         self.rowcode = unsafe_alloc[Int64](max(n, 1))
+        self.xreg = unsafe_alloc[Int64](max(n, 1))
         for k in range(max(n, 1)):
             self.gchunk[k] = 0
             self.gcode[k] = 0
@@ -182,6 +185,7 @@ struct Keys(Copyable, Movable):
             if Int(self.rowcode[k]) != 0:
                 _ip(Int(self.rowcode[k])).free()
         self.rowcode.free()
+        self.xreg.free()
         self.kinds.free()
         self.base.free()
         self.card.free()
@@ -746,7 +750,7 @@ def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, t
 
 
 def _encode_sel(K: Keys, arrays: LP, stride_a: Int, n_keys: Int, col0: Int, c: Int, c0: Int, i0: Int,
-               sel: IP, nsel: Int, use_sel: Bool, dst: IP) -> Bool:
+               sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
     """Group ids of the selected rows of one VEC block (rows i0 + sel[j], or i0 + j without a
     selection) of chunk c (first global row c0): dst[j], j < nsel. Same codes as _encode_keys;
     False when a dictionary code is outside its chunk's dictionary."""
@@ -756,7 +760,14 @@ def _encode_sel(K: Keys, arrays: LP, stride_a: Int, n_keys: Int, col0: Int, c: I
         var sk = Int32(Int(K.stride[k]))
         var first = k == 0
         var r0 = i0 - c0
-        if kind == K_I64:
+        if kind == K_EXPR:
+            # the program computed the key for the block's selected rows, compacted: row j is j
+            var xr = regs + Int(K.xreg[k]) * VEC
+            var bx = Int(K.base[k])
+            for j in range(nsel):
+                var t = Int32(Int(xr[j]) - bx) * sk
+                dst[j] = t if first else dst[j] + t
+        elif kind == K_I64:
             var src = _lp(_arr_buf(arr, 1)) + _arr_off(arr) + r0
             var b64 = Int64(Int(K.base[k]))
             for j in range(nsel):
@@ -890,6 +901,15 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var ng = _build_row_strings(arrays, stride_a, n_chunks, col, tbl, tstride, n_rows, gch, gco, rcode, threads)
             K.base[k] = 0
             K.card[k] = Int64(max(ng, 1))
+        elif kind == K_EXPR:
+            # value range from the plan (the caller measured it); register of the hidden aggregate
+            # slot whose input is the key expression
+            var xk = _lp(Int(P[25])) + 3 * k
+            var slot = Int(xk[0])
+            var cp = _ip(code)
+            K.xreg[k] = Int64(Int(cp[HDR + (Int(cp[2]) + Int(cp[3]) + Int(cp[4]) + slot) * 5 + 2]))
+            K.base[k] = xk[1]
+            K.card[k] = Int64(Int(xk[2]) - Int(xk[1]) + 1)
         elif kind == K_I32 or kind == K_I64:
             var lo = 0
             var hi = -1
@@ -918,6 +938,12 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     var grouped = n_keys > 0
     var compact = grouped and not use_hash and D > max_groups   # composite codes compacted to the groups present
+    if use_hash or compact:
+        for k in range(n_keys):
+            if Int(K.kinds[k]) == K_EXPR:             # expression keys: directly addressed only
+                K.free()
+                tbl.free()
+                return E_BAD_KEY
     var G = D if (grouped and not use_hash) else 1
     var code_p = _ip(code)
     var n_slots = Int(code_p[5])
@@ -938,9 +964,9 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         # ── direct group ids: made per 1024-row block for the rows that pass the predicate only (no
         #    n_rows-sized group-id array, keys of filtered-out rows never read), aggregated into
         #    per-worker partials
-        def enc(c: Int, i0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP) {imm} -> Bool:
+        def enc(c: Int, i0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) {imm} -> Bool:
             return _encode_sel(K, arrays, stride_a, n_keys, n_cols, c, Int(tbl[c * tstride]), i0,
-                               sel, nsel, use_sel, dst)
+                               sel, nsel, use_sel, dst, regs)
 
         rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
                             G, 0, n_rows, Int(vals), Int(cnt), threads, enc)

@@ -511,11 +511,11 @@ def _find_chunk(p: Prog, row: Int) -> Int:
     return lo
 
 
-def _process_range[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
+def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
     p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP, lo: Int, hi: Int, encode: E,
 ) -> Bool:
     """Rows [lo, hi) in VEC blocks: predicate, selection, body, accumulate. `keyed`: group ids of
-    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst)` (False: bad key)."""
+    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst, regs)` (regs: the program's registers, for keys it computed) (False: bad key)."""
     var pos = lo
     while pos < hi:
         var k = _find_chunk(p, pos)
@@ -540,7 +540,7 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
                 _run_ops(p, regs, cols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
                 var gp = gscratch
                 comptime if keyed:
-                    if not encode(k, i0, sel, nsel, use_sel, gscratch):
+                    if not encode(k, i0, sel, nsel, use_sel, gscratch, regs):
                         return False
                 else:
                     if p.has_gids:
@@ -556,7 +556,7 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
     return True
 
 
-def _pipeline[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
+def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
@@ -690,7 +690,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
     return rc
 
 
-def _no_keys(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP) -> Bool:
+def _no_keys(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
     return True
 
 
@@ -704,7 +704,7 @@ def mx_pipeline_cpu(
                                   gids_a, n_groups, start, end, out_vals_a, out_cnt_a, threads, _no_keys)
 
 
-def pipeline_keyed[E: def(Int, Int, IP, Int, Bool, IP) -> Bool](
+def pipeline_keyed[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
