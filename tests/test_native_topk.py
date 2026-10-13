@@ -120,3 +120,105 @@ def test_int64_past_2_53_offsets_and_timestamps():
     for by, desc in ((["b"], [False]), (["b"], [True]), (["ts", "row"], [True, False])):
         idx = nx.try_topk(t, by, desc, 30)
         assert t.column("row").to_numpy()[idx].tolist() == _expected(t, by, desc, 30)
+
+
+# F-046e: WHERE ... ORDER BY ... LIMIT k in one pass (per-worker heaps behind the predicate)
+@pytest.fixture
+def fused(monkeypatch):
+    log = []
+    real = nx.try_filter_topk
+
+    def spy(*a, **k):
+        r = real(*a, **k)
+        log.append(r is not None)
+        return r
+
+    monkeypatch.setattr(nx, "try_filter_topk", spy)
+    return log
+
+
+def _dict_t(n=300_000, chunks=3, seed=4):
+    t = _t(n=n, seed=seed, chunks=chunks)
+    s = t.column("s")
+    return t.set_column(t.schema.get_field_index("s"), "s", pa.chunked_array([c.dictionary_encode() for c in s.chunks]))
+
+
+@pytest.mark.parametrize("k", [1, 10, 300])
+@pytest.mark.parametrize("by,desc", [(["f32", "row"], [True, False]), (["d", "i64"], [False, True]), (["i32"], [False])])
+def test_fused_filter_topk_matches_a_stable_sort(fused, by, desc, k):
+    t = _dict_t()
+    got = (LazyFrame(t).filter((col("f64") < lit(0.4)) & (col("i32") > lit(-20)))
+           .sort(*by, descending=desc).limit(k).compute(device="cpu"))
+    m = (t.column("f64").to_numpy() < 0.4) & (t.column("i32").to_numpy() > -20)
+    sub = t.filter(pa.array(m))
+    assert got.column("row").to_pylist() == _expected(sub, by, desc, k)
+    assert got.column_names == t.column_names
+    assert fused == [True]
+
+
+def test_dictionary_predicate_runs_fused(fused):
+    t = _dict_t()
+    got = (LazyFrame(t).filter((col("f64") < lit(0.4)) & col("s").isin(["s1", "s4"]))
+           .sort("f32", "row", descending=[True, False]).limit(30).compute(device="cpu"))
+    m = (t.column("f64").to_numpy() < 0.4) & np.isin(np.array(t.column("s").to_pylist()), ["s1", "s4"])
+    assert got.column("row").to_pylist() == _expected(t.filter(pa.array(m)), ["f32", "row"], [True, False], 30)
+    assert got.schema.field("s").type == pa.string()           # decoded, as without the fused path
+    assert fused == [True]
+
+
+def test_k_past_the_passing_rows_and_empty(fused):
+    t = _t()
+    got = LazyFrame(t).filter(col("i32") == lit(7)).filter(col("f64") < lit(0.001)).sort("row").limit(5000).compute(device="cpu")
+    m = (t.column("i32").to_numpy() == 7) & (t.column("f64").to_numpy() < 0.001)
+    assert got.column("row").to_pylist() == t.column("row").to_numpy()[m].tolist()
+    got = LazyFrame(t).filter(col("i32") > lit(1000)).sort("row").limit(10).compute(device="cpu")
+    assert got.num_rows == 0
+
+
+def test_sliced_and_misaligned_chunks(fused):
+    t = _t(n=200_000, chunks=3).slice(777, 150_000)
+    f = pa.chunked_array([t.column("f64").combine_chunks()])           # one chunk; the others have three
+    t = t.set_column(t.schema.get_field_index("f64"), "f64", f)
+    got = (LazyFrame(t).filter(col("f64") < lit(0.5)).sort("f32", "row", descending=[False, False]).limit(40)
+           .compute(device="cpu"))
+    m = t.column("f64").to_numpy() < 0.5
+    assert got.column("row").to_pylist() == _expected(t.filter(pa.array(m)), ["f32", "row"], [False, False], 40)
+    assert fused == [True]
+
+
+def test_fused_filter_topk_with_a_projection(fused):
+    t = _dict_t()
+    got = (LazyFrame(t).filter(col("i32") > lit(10)).select(col("row"), col("f32").alias("x"))
+           .sort("x", "row", descending=[True, False]).limit(20).compute(device="cpu"))
+    m = t.column("i32").to_numpy() > 10
+    assert got.column_names == ["row", "x"]
+    assert got.column("row").to_pylist() == _expected(t.filter(pa.array(m)), ["f32", "row"], [True, False], 20)
+    assert fused == [True]
+
+
+def test_fused_filter_topk_nan_falls_back(fused):
+    t = _t(n=100_000)
+    i32 = t.column("i32").to_numpy()
+    f = t.column("f64").to_numpy().copy()
+    f[int(np.flatnonzero(i32 > 0)[0])] = np.nan                    # on a row that passes the filter
+    t = t.set_column(t.schema.get_field_index("f64"), "f64", A(f))
+    got = LazyFrame(t).filter(col("i32") > lit(0)).sort("f64", "row").limit(5).compute(device="cpu")
+    sub = t.filter(pa.array(i32 > 0))
+    vals = sub.column("f64").to_numpy()
+    order = np.lexsort((sub.column("row").to_numpy(), vals))       # NaN sorts last here, as in Arrow
+    assert got.column("row").to_pylist() == sub.column("row").to_numpy()[order][:5].tolist()
+    assert fused == [False]
+
+
+def test_renamed_dictionary_column_comes_back_decoded(fused):
+    t = _dict_t()
+    got = (LazyFrame(t).filter(col("f64") < lit(0.4)).select(col("row"), col("s").alias("x"), col("f32"))
+           .sort("f32", "row").limit(10).compute(device="cpu"))
+    assert got.schema.field("x").type == pa.string()
+    m = t.column("f64").to_numpy() < 0.4
+    sub = t.filter(pa.array(m))
+    exp = _expected(sub, ["f32", "row"], [False, False], 10)
+    assert got.column("row").to_pylist() == exp
+    s = dict(zip(t.column("row").to_pylist(), t.column("s").to_pylist()))
+    assert got.column("x").to_pylist() == [s[r] for r in exp]
+    assert fused == [True]

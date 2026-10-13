@@ -3764,3 +3764,267 @@ def _count_distinct_hash(a: Int, wa: Int, b: Int, kb: Int, n: Int, threads: Int,
     gstart.free()
     counter.free()
     return 0
+
+
+# ── F-046e: WHERE ... ORDER BY ... LIMIT k in one pass (no filtered table) ─────────────────────
+#
+# Plan: 0 TKMAGIC   1 n_chunks   2 n_cols (bytecode value columns)   3 code*   4 consts*
+#   5 set_bytes*   6 set_meta*   7 dtypes* (int32)   8 arrays*: int64[n_chunks][n_cols + n_sort]
+#   9 n_sort   10 sort kinds* (0 int32, 1 int64, 2 float32, 3 float64)   11 desc* (0 / 1)   12 k
+#   13 threads   14 n_dcols   15 doffs*: int64[n_chunks][n_dcols] (dictionary predicate columns)
+# Output: 0 n_out   1 arena (mx_exec_free): int64 row numbers (of the whole table) in sorted order.
+# The predicate runs per 1024-row block as in mx_filter; a passing row is offered to its worker's
+# max-heap of k rows, which holds copies of the sort values, so nothing is materialized. Ties go
+# by row number (a stable sort's first k). E_NAN_SORT on a NaN sort value.
+
+comptime TKMAGIC = 0x4D58464B
+
+
+@always_inline
+def _ftk_before(ki: LP, kf: FP, ri: Int, si: Int, vi: LP, vf: FP, rj: Int, sj: Int,
+                skinds: LP, desc: LP, S: Int) -> Bool:
+    """Entry (values at slot si of ki/kf, row ri) sorts before entry (slot sj of vi/vf, row rj)."""
+    for c in range(S):
+        var d = Int(desc[c]) != 0
+        if Int(skinds[c]) <= 1:
+            var x = Int(ki[si * S + c])
+            var y = Int(vi[sj * S + c])
+            if x != y:
+                return (x > y) if d else (x < y)
+        else:
+            var x = kf[si * S + c]
+            var y = vf[sj * S + c]
+            if x != y:
+                return (x > y) if d else (x < y)
+    return ri < rj
+
+
+@export
+def mx_filter_topk(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != TKMAGIC:
+        return E_BAD_PLAN
+    var n_chunks = Int(P[1])
+    var n_cols = Int(P[2])
+    var code = _ip(Int(P[3]))
+    var dtypes = _ip(Int(P[7]))
+    var arrays = _lp(Int(P[8]))
+    var S = Int(P[9])
+    var skinds = _lp(Int(P[10]))
+    var desc = _lp(Int(P[11]))
+    var k = Int(P[12])
+    var threads = max(1, Int(P[13]))
+    var n_dcols = Int(P[14])
+    var doffs = _lp(Int(P[15]))
+    var O = _lp(out_a)
+    var stride_a = n_cols + S
+    if n_chunks < 1 or S < 1 or k < 1 or Int(code[0]) != 0x4D585031:
+        return E_BAD_PLAN
+    if n_cols > 0 and not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+        return E_INEXACT
+    if Int(code[1]) > MAX_REGS:
+        return E_PIPELINE
+    var tstride = 2 + n_cols + n_dcols
+    var tbl = unsafe_alloc[Int64](n_chunks * tstride)
+    var row = 0
+    for c in range(n_chunks):
+        var n = _arr_len(Int(arrays[c * stride_a + n_cols]))      # a sort column: always present
+        tbl[c * tstride] = Int64(row)
+        tbl[c * tstride + 1] = Int64(row + n)
+        for j in range(n_cols):
+            var arr = Int(arrays[c * stride_a + j])
+            var isz = _itemsize(Int(dtypes[j]) & 255)
+            tbl[c * tstride + 2 + j] = Int64(_arr_buf(arr, 1) + (_arr_off(arr) - row) * isz)
+        for i in range(n_dcols):
+            tbl[c * tstride + 2 + n_cols + i] = doffs[c * n_dcols + i]
+        row += n
+    var n_rows = row
+    var no_gids = unsafe_alloc[Int32](1)
+    var p = Prog(code, FP(unsafe_from_address=Int(P[4])), _bp(Int(P[5])), _lp(Int(P[6])), tbl,
+                 n_chunks, dtypes, no_gids, 1, False)
+    var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
+    var nt = max(1, min(threads, morsels))
+    var hi_all = unsafe_alloc[Int64](nt * k * S)    # per worker: k entries of S integer sort values
+    var hf_all = unsafe_alloc[Float64](nt * k * S)  # ... and of S float sort values
+    var hr_all = unsafe_alloc[Int64](nt * k)        # ... and their row numbers
+    var hsz = unsafe_alloc[Int64](nt)
+    var nan = unsafe_alloc[Int64](1)
+    nan[0] = 0
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def work(wid: Int) {imm}:
+        var regs = unsafe_alloc[Float64](max(p.n_regs, 1) * VEC)
+        var sel = unsafe_alloc[Int32](VEC)
+        var cvi = unsafe_alloc[Int64](S)            # the candidate's sort values
+        var cvf = unsafe_alloc[Float64](S)
+        var hi = hi_all + wid * k * S
+        var hf = hf_all + wid * k * S
+        var hr = hr_all + wid * k
+        var size = 0
+        _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
+        while True:
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            var lo = m * MORSEL
+            if lo >= n_rows:
+                break
+            var hi_r = min(lo + MORSEL, n_rows)
+            var pos = lo
+            while pos < hi_r:
+                var kc = _find_chunk(p, pos)
+                var rowp = p.tbl + kc * p.tbl_stride
+                var cols = rowp + 2
+                var stop = min(hi_r, Int(rowp[1]))
+                var c0 = Int(rowp[0])
+                var i0 = pos
+                while i0 < stop:
+                    var n = min(VEC, stop - i0)
+                    var pr = regs
+                    var has_pred = p.pred_reg >= 0
+                    if has_pred:
+                        _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                        pr = regs + p.pred_reg * VEC
+                    for i in range(n):
+                        if has_pred and pr[i] == 0.0:
+                            continue
+                        var local = i0 + i - c0
+                        for s in range(S):
+                            var arr = Int(arrays[kc * stride_a + n_cols + s])
+                            var kd = Int(skinds[s])
+                            if kd <= 1:
+                                cvi[s] = Int64(_tk_val_i(arr, kd, local))
+                                cvf[s] = 0.0
+                            else:
+                                var x = _tk_val_f(arr, kd, local)
+                                if x != x:
+                                    nan[0] = 1
+                                cvf[s] = x
+                                cvi[s] = 0
+                        var g = i0 + i
+                        if size < k:
+                            var c2 = size
+                            for s in range(S):
+                                hi[c2 * S + s] = cvi[s]
+                                hf[c2 * S + s] = cvf[s]
+                            hr[c2] = Int64(g)
+                            size += 1
+                            while c2 > 0:              # sift up: the root sorts last
+                                var pp = (c2 - 1) // 2
+                                if _ftk_before(hi, hf, Int(hr[pp]), pp, hi, hf, Int(hr[c2]), c2, skinds, desc, S):
+                                    for s in range(S):
+                                        var ti = hi[pp * S + s]
+                                        hi[pp * S + s] = hi[c2 * S + s]
+                                        hi[c2 * S + s] = ti
+                                        var tf = hf[pp * S + s]
+                                        hf[pp * S + s] = hf[c2 * S + s]
+                                        hf[c2 * S + s] = tf
+                                    var tr = hr[pp]
+                                    hr[pp] = hr[c2]
+                                    hr[c2] = tr
+                                    c2 = pp
+                                else:
+                                    break
+                        elif _ftk_before(cvi, cvf, g, 0, hi, hf, Int(hr[0]), 0, skinds, desc, S):
+                            for s in range(S):
+                                hi[s] = cvi[s]
+                                hf[s] = cvf[s]
+                            hr[0] = Int64(g)
+                            var c3 = 0
+                            while True:                # sift down
+                                var l = 2 * c3 + 1
+                                if l >= size:
+                                    break
+                                var w = l
+                                if l + 1 < size and _ftk_before(hi, hf, Int(hr[l]), l, hi, hf, Int(hr[l + 1]), l + 1, skinds, desc, S):
+                                    w = l + 1
+                                if _ftk_before(hi, hf, Int(hr[c3]), c3, hi, hf, Int(hr[w]), w, skinds, desc, S):
+                                    for s in range(S):
+                                        var ti = hi[c3 * S + s]
+                                        hi[c3 * S + s] = hi[w * S + s]
+                                        hi[w * S + s] = ti
+                                        var tf = hf[c3 * S + s]
+                                        hf[c3 * S + s] = hf[w * S + s]
+                                        hf[w * S + s] = tf
+                                    var tr = hr[c3]
+                                    hr[c3] = hr[w]
+                                    hr[w] = tr
+                                    c3 = w
+                                else:
+                                    break
+                    i0 += n
+                pos = stop
+        hsz[wid] = Int64(size)
+        regs.free()
+        sel.free()
+        cvi.free()
+        cvf.free()
+
+    _par(work, nt)
+    var rc = 0
+    var n_out = 0
+    var arena = unsafe_alloc[UInt8](max(k * 8, 8), alignment=64)
+    if Int(nan[0]) != 0:
+        rc = E_NAN_SORT
+    else:
+        # every worker's entries, merge-sorted by (values, row); the first k
+        var m = 0
+        for w in range(nt):
+            m += Int(hsz[w])
+        var ent = unsafe_alloc[Int64](max(m, 1))      # entry = worker * k + slot
+        var at = 0
+        for w in range(nt):
+            for j in range(Int(hsz[w])):
+                ent[at] = Int64(w * k + j)
+                at += 1
+        var tmp = unsafe_alloc[Int64](max(m, 1))
+        var width = 1
+        while width < m:
+            var lo2 = 0
+            while lo2 < m:
+                var mid = min(lo2 + width, m)
+                var hi2 = min(lo2 + 2 * width, m)
+                var a = lo2
+                var b = mid
+                var o = lo2
+                while a < mid and b < hi2:
+                    var eb = Int(ent[b])
+                    var ea = Int(ent[a])
+                    if _ftk_before(hi_all, hf_all, Int(hr_all[eb]), eb, hi_all, hf_all, Int(hr_all[ea]), ea, skinds, desc, S):
+                        tmp[o] = ent[b]
+                        b += 1
+                    else:
+                        tmp[o] = ent[a]
+                        a += 1
+                    o += 1
+                while a < mid:
+                    tmp[o] = ent[a]
+                    a += 1
+                    o += 1
+                while b < hi2:
+                    tmp[o] = ent[b]
+                    b += 1
+                    o += 1
+                lo2 += 2 * width
+            for j in range(m):
+                ent[j] = tmp[j]
+            width *= 2
+        n_out = min(k, m)
+        var dst = _lp(Int(arena))
+        for j in range(n_out):
+            dst[j] = hr_all[Int(ent[j])]
+        ent.free()
+        tmp.free()
+    if rc < 0:
+        arena.free()
+    else:
+        O[0] = Int64(n_out)
+        O[1] = Int64(Int(arena))
+    hi_all.free()
+    hf_all.free()
+    hr_all.free()
+    hsz.free()
+    nan.free()
+    counter.free()
+    no_gids.free()
+    tbl.free()
+    return rc

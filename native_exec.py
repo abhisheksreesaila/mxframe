@@ -82,6 +82,8 @@ def _load():
             lib.mx_str_slice.restype = ctypes.c_int64
             lib.mx_topk.argtypes = [ctypes.c_int64, ctypes.c_int64]
             lib.mx_topk.restype = ctypes.c_int64
+            lib.mx_filter_topk.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_filter_topk.restype = ctypes.c_int64
             _lib = lib
     return _lib
 
@@ -415,10 +417,11 @@ def _call_distinct(lib, plan_addr: int, out_addr: int) -> int:
     return lib.mx_distinct(plan_addr, out_addr)
 
 
-def try_distinct(compiler, table: pa.Table) -> Optional[pa.Table]:
+def try_distinct(compiler, table: pa.Table, rows_only: bool = False):
     """The distinct rows of ``table`` in first-appearance order (F-032 M2h): one native call finds
     the first row of every tuple (parallel hashing, 64 partitions built in row order), then the
-    kept rows are gathered. Columns int32 / int64 / utf8 without nulls; None: the caller's path."""
+    kept rows are gathered. Columns int32 / int64 / utf8 without nulls; None: the caller's path.
+    ``rows_only``: the kept row numbers (int64 NumPy), or the table itself when every row is kept."""
     if not enabled() or not available():
         return _decline("distinct: native executor off")
     if getattr(compiler, "_device_arg", None) != "cpu":
@@ -459,6 +462,8 @@ def try_distinct(compiler, table: pa.Table) -> Optional[pa.Table]:
     if n == table.num_rows:
         return table
     idx = np.frombuffer(pa.foreign_buffer(int(O[1]), 8 * n, base=owner), dtype=np.int64, count=n)
+    if rows_only:
+        return idx
     out = try_gather(compiler, table, idx)
     if out is None:
         out = pc.take(table, pa.array(idx))
@@ -667,6 +672,83 @@ def try_topk(table: pa.Table, names, descending, k: int):
         O = (ctypes.c_int64 * 2)()
         lib = _load()
         rc = lib.mx_topk(ctypes.addressof(P), ctypes.addressof(O))
+    finally:
+        for st in structs:
+            if st[8]:
+                _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return None
+    n = int(O[0])
+    owner = _Arena(lib, int(O[1]))
+    return np.frombuffer(pa.foreign_buffer(int(O[1]), max(8 * n, 8), base=owner), dtype=np.int64, count=n)
+
+
+TKMAGIC = 0x4D58464B
+
+
+def try_filter_topk(compiler, table: pa.Table, predicates, names, descending, k: int):
+    """Row numbers of the rows of ``table`` passing ``predicates``, sorted by ``names``
+    (``descending`` per column), the first ``k`` (F-046e): the predicate runs per block and passing
+    rows go straight into per-worker heaps, so no filtered table is built. Ties keep row order.
+    Sort columns int32 / int64 / float / date / timestamp without nulls; None otherwise or on NaN."""
+    if not enabled() or not available() or getattr(compiler, "_device_arg", None) != "cpu":
+        return None
+    if k <= 0 or table.num_rows == 0 or not predicates:
+        return None
+    skinds = []
+    for nm in names:
+        c = table.column(nm)
+        kd = _topk_kind(c.type)
+        if kd is None or c.null_count:
+            return None
+        skinds.append(kd)
+    from .pipeline_program import compile_pipeline, _dict_key
+    prog = compile_pipeline(list(predicates), [], table, concat_dicts=True)
+    if prog is None or prog.dict_arrays:
+        return None
+    dcols = [c for c in prog.columns if c in prog.dict_concat]
+    vcols = [table.column(c) for c in prog.columns]
+    dtypes = []
+    for name, c in zip(prog.columns, vcols):
+        if name in prog.dict_concat:
+            dtypes.append(5 | ((len(prog.columns) + dcols.index(name)) << 8))
+            continue
+        if c.type not in _DT or c.null_count:
+            return None
+        dtypes.append(_DT[c.type])
+    scols = [table.column(nm) for nm in names]
+    segs = _segments(vcols + scols)
+    if not segs:
+        return None
+    import numpy as np
+    width = len(vcols) + len(scols)
+    structs = []
+    arrays = (ctypes.c_int64 * (len(segs) * width))()
+    try:
+        for r, seg in enumerate(segs):
+            for j, piece in enumerate(seg):
+                st = (ctypes.c_int64 * 10)()
+                piece._export_to_c(ctypes.addressof(st))
+                structs.append(st)
+                arrays[r * width + j] = ctypes.addressof(st)
+        doffs = [prog.dict_concat[nm][_dict_key(seg[prog.columns.index(nm)].dictionary)] for seg in segs for nm in dcols]
+        c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
+        code = prog.code
+        if dcols:
+            code = code.copy()
+            code[7] = len(prog.columns) + len(dcols)
+        c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
+        c_sk = (ctypes.c_int64 * len(skinds))(*skinds)
+        c_desc = (ctypes.c_int64 * len(skinds))(*[1 if d else 0 for d in descending])
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 16)(TKMAGIC, len(segs), len(vcols), code.ctypes.data, prog.consts.ctypes.data,
+                                  prog.set_bytes.ctypes.data, prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes),
+                                  ctypes.addressof(arrays), len(scols), ctypes.addressof(c_sk),
+                                  ctypes.addressof(c_desc), k, default_threads(table.num_rows), len(dcols),
+                                  ctypes.addressof(c_doffs))
+        O = (ctypes.c_int64 * 2)()
+        lib = _load()
+        rc = lib.mx_filter_topk(ctypes.addressof(P), ctypes.addressof(O))
     finally:
         for st in structs:
             if st[8]:

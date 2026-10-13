@@ -79,6 +79,15 @@ from .sort_check import is_sorted_permutation as _is_sorted_permutation, warn_fa
 _PRECISE = _threading.local()
 
 
+def _decode_deferred_cols(table: pa.Table, names) -> pa.Table:
+    """``table`` with its dictionary columns among ``names`` decoded to their value type."""
+    from .arrow_dict import decode
+    for i, f in enumerate(table.schema):
+        if f.name in names and pa.types.is_dictionary(f.type):
+            table = table.set_column(i, f.name, decode(table.column(i)))
+    return table
+
+
 def _expr_col_names(expr, out=None) -> set:
     """Names of every column an Expr tree reads."""
     if out is None:
@@ -1733,7 +1742,19 @@ class CustomOpsCompiler(GraphCompiler):
         plan_no_filters = self._strip_filter_nodes(plan)
         if self._find_aggregate(plan_no_filters) is None:
             # No Aggregate: use PyArrow path (handles strings, year, Project, Filter)
-            result = self._plan_to_table(plan)
+            deferred = self._deferred_dicts(plan)
+            result = self._filter_topk(plan, post_ops)       # WHERE ... ORDER BY ... LIMIT k first
+            if result is not None:
+                post_ops = post_ops[2:]                      # the Sort and the Limit are done
+            else:
+                result, post_ops = self._single_table(plan, post_ops, deferred)
+            if result is None:
+                if deferred:                                 # the old way: decoded before the filter
+                    plan = self._decode_scan_dicts(plan, deferred)
+                    deferred = ()
+                result = self._plan_to_table(plan)
+            if deferred and result is not None:
+                result = _decode_deferred_cols(result, deferred)
             if post_ops:
                 result = self._apply_post_ops_custom(result, post_ops)
             t1 = _time.perf_counter()
@@ -2893,6 +2914,115 @@ class CustomOpsCompiler(GraphCompiler):
         """
         from . import join_engine
         return join_engine.materialize(self, plan, needed)
+
+    @staticmethod
+    def _scan_of(plan):
+        node = plan.input if isinstance(plan, Project) else plan
+        preds = []
+        while isinstance(node, Filter):
+            preds.append(node.predicate)
+            node = node.input
+        return (node, preds) if isinstance(node, Scan) else (None, preds)
+
+    def _deferred_dicts(self, plan):
+        """Dictionary columns resolve_plan left encoded for this single-table plan (F-046f)."""
+        scan, _ = self._scan_of(plan)
+        return frozenset(getattr(scan, "_mx_decode_after", None) or ()) if scan is not None else frozenset()
+
+    def _decode_scan_dicts(self, plan, deferred):
+        """The plan with its scan's deferred dictionary columns decoded (the pre-F-046f way)."""
+        scan, _ = self._scan_of(plan)
+        t = _decode_deferred_cols(scan.table, deferred)
+
+        def swap(p):
+            if p is scan:
+                return Scan(t)
+            if isinstance(p, Filter):
+                return Filter(swap(p.input), p.predicate)
+            if isinstance(p, Project):
+                return Project(swap(p.input), p.exprs)
+            return p
+
+        return swap(plan)
+
+    def _single_table(self, plan, post_ops, deferred):
+        """One table, filtered, selected, maybe DISTINCT (F-046f / F-046g): the native filter decodes
+        only the rows that pass, and keeps the codes of a DISTINCT's columns, which runs on the codes;
+        only the distinct rows are decoded. (None, post_ops) when the plan is another shape."""
+        if not deferred or _native_exec is None or self._session_device == "gpu":
+            return None, post_ops
+        scan, preds = self._scan_of(plan)
+        if scan is None or not preds:
+            return None, post_ops
+        proj = plan if isinstance(plan, Project) else None
+        names = [e.args[0] for e in proj.exprs] if proj is not None else list(scan.table.column_names)
+        distinct = bool(post_ops) and isinstance(post_ops[0], Distinct) and not post_ops[0].subset
+        keep = (deferred & set(names)) if distinct else frozenset()
+        try:
+            out = _native_exec.try_filter(self, scan.table, preds, set(names), keep_dict=keep)
+        except Exception:
+            out = None
+        if out is None:
+            return None, post_ops
+        out = pa.Table.from_arrays([out.column(n) for n in names],
+                                   names=[e._alias or e.args[0] for e in proj.exprs] if proj is not None else names)
+        if proj is None:
+            out = out.replace_schema_metadata(scan.table.schema.metadata)
+        if distinct:
+            codes = pa.Table.from_arrays(
+                [c.chunk(0).indices if pa.types.is_dictionary(c.type) else c for c in out.columns],
+                names=out.column_names) if out.num_rows else out
+            idx = _native_exec.try_distinct(self, codes, rows_only=True) if out.num_rows else None
+            if idx is not None:
+                out = out if isinstance(idx, pa.Table) else pc.take(out, _npa(idx))
+                post_ops = post_ops[1:]
+            out = _decode_deferred_cols(out, set(out.column_names))
+        return out, post_ops
+
+    def _filter_topk(self, plan, post_ops):
+        """WHERE ... ORDER BY ... LIMIT k over one table in one native pass (F-046e): passing rows
+        go straight into per-worker heaps, and only the k winners are gathered. The plan is
+        Filter*(Scan), or a Project of plain columns over it; None for anything else."""
+        if _native_exec is None or self._session_device == "gpu" or not post_ops or len(post_ops) < 2:
+            return None
+        srt, lim = post_ops[0], post_ops[1]
+        if not (isinstance(srt, Sort) and isinstance(lim, Limit)) or not (0 < lim.n <= 65536):
+            return None
+        proj, node = None, plan
+        if isinstance(node, Project):
+            proj, node = node, node.input
+        preds = []
+        while isinstance(node, Filter):
+            preds.append(node.predicate)
+            node = node.input
+        if not isinstance(node, Scan) or not preds or node.table.num_rows < 8 * lim.n:
+            return None
+        table = node.table
+        if proj is not None:
+            if not all(isinstance(e, Expr) and e.op == "col" for e in proj.exprs):
+                return None
+            src = {(e._alias or e.args[0]): e.args[0] for e in proj.exprs}
+        else:
+            src = {n: n for n in table.column_names}
+        by = []
+        for e in srt.by:
+            if not (isinstance(e, Expr) and e.op == "col" and e.args[0] in src):
+                return None
+            by.append(src[e.args[0]])
+        desc = list(srt.descending) if isinstance(srt.descending, (list, tuple)) \
+            else [bool(srt.descending)] * len(by)
+        try:
+            idx = _native_exec.try_filter_topk(self, table, preds, by, desc, lim.n)
+        except Exception:
+            return None
+        if idx is None:
+            return None
+        keep = table if proj is None else table.select(list(dict.fromkeys(src.values())))
+        rows = _decode_deferred_cols(pc.take(keep, _npa(idx)), self._deferred_dicts(plan))  # by source name
+        if proj is None:
+            return rows
+        return pa.Table.from_arrays([rows.column(e.args[0]) for e in proj.exprs],
+                                    names=[e._alias or e.args[0] for e in proj.exprs])
 
     def _native_filter_scan(self, plan, needed):
         """Filter*(Scan) in one native pass (F-044: a WHERE without an aggregate, e.g. before ORDER BY

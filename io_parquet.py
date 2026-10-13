@@ -770,6 +770,23 @@ def _filters_expression(filters):
 
 # ── resolution ──────────────────────────────────────────────────────────────
 
+def _single_table_shape(plan) -> bool:
+    """``[Sort / Limit / Distinct(all columns)]* [Project(plain columns)] Filter+ (Scan | ParquetScan)``:
+    one table filtered and selected, with nothing that reads its columns as values on the way."""
+    node = plan
+    while isinstance(node, (Sort, Limit, Tail)) or (isinstance(node, Distinct) and not node.subset):
+        node = node.input
+    if isinstance(node, Project):
+        if not all(isinstance(e, Expr) and e.op == "col" for e in node.exprs):
+            return False
+        node = node.input
+    if not isinstance(node, Filter):
+        return False
+    while isinstance(node, Filter):
+        node = node.input
+    return isinstance(node, (Scan, ParquetScan))
+
+
 def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
     """Replace every ``ParquetScan`` by a ``Scan`` of just the needed columns.
 
@@ -789,6 +806,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
     if not has_parquet and not has_dict:
         return plan
     info = _analyze(plan)
+    single = _single_table_shape(plan)
 
     def keepable(name: str, leaf) -> bool:
         return (name in info.refs and name not in info.bad
@@ -803,6 +821,11 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         ("bad": CASE WHEN, arithmetic, ...) only matters in the leaf's own filter, where the
         column is decoded first as before; a bare column projected out above the join is not
         such a use (`bad_expr`): it is decoded after the gather."""
+        if single:
+            # one table, filtered then selected (F-046f): the native filter decodes only the rows
+            # that pass, or keeps codes for a DISTINCT above; unless a filter reads the column in a
+            # way the engine can't evaluate on codes (CASE WHEN, arithmetic, ...)
+            return name not in info.bad_expr
         if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
             return False
         if id(leaf) not in leaf_preds:              # not a Filter*(Scan) input of a join
