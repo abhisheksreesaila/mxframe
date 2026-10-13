@@ -123,8 +123,21 @@ def _select(table: pa.Table, needed: Optional[Set[str]]) -> pa.Table:
     return table if len(names) == table.num_columns else table.select(names)
 
 
+def _plain_columns(plan) -> Optional[List[str]]:
+    """The columns of a Project that only selects columns (no expression, no rename), else None."""
+    if not isinstance(plan, Project) or not plan.exprs:
+        return None
+    if any(e.op != "col" or e._alias not in (None, e.args[0]) for e in plan.exprs):
+        return None
+    return [e.args[0] for e in plan.exprs]
+
+
 def _scan_under_filters(plan):
-    """(Scan, predicates) when ``plan`` is Filter*(Scan), else (None, [])."""
+    """(Scan, predicates) when ``plan`` is Filter*(Scan), else (None, []). A Project that only
+    selects columns on top (``.filter(...).select(key)``) is seen through: callers ask for the
+    columns they need, which are among the selected ones."""
+    if _plain_columns(plan) is not None:
+        plan = plan.input
     preds, node = [], plan
     while isinstance(node, Filter):
         preds.append(node.predicate)
@@ -152,6 +165,9 @@ def leaf_table(comp, plan, needed: Optional[Set[str]], keep: Optional[Set[str]] 
     decodes them itself, after the join has gathered only the joined rows."""
     scan, preds = _scan_under_filters(plan)
     if scan is not None:
+        sel = _plain_columns(plan)
+        if sel is not None:
+            needed = set(sel) if needed is None else set(needed) & set(sel)
         if preds:
             from . import native_exec
             out = native_exec.try_filter(comp, scan.table, preds, needed)

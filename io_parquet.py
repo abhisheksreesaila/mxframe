@@ -663,10 +663,19 @@ def _join_leaf_filters(plan: LogicalPlan) -> dict:
         elif isinstance(node, Join):
             walk(node.left, set(), True)
             walk(node.right, set(), True)
+        elif under_join and not above and _selects_columns(node):
+            walk(node.input, set(), True)        # .filter(...).select(key) under a join: still a leaf
         elif hasattr(node, "input"):
             walk(node.input, set(), False)
     walk(plan, set(), False)
     return out
+
+
+def _selects_columns(node) -> bool:
+    """A Project that only selects columns (join_engine sees through it to a Filter*(Scan) leaf)."""
+    from .lazy_frame import Project
+    return (isinstance(node, Project) and bool(node.exprs)
+            and all(e.op == "col" and e._alias in (None, e.args[0]) for e in node.exprs))
 
 
 def _leaves(plan: LogicalPlan):

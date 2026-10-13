@@ -56,7 +56,7 @@ from std.ffi import external_call
 
 from std.utils.numerics import nan
 
-from pipeline_cpu import mx_pipeline_cpu, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
+from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -85,7 +85,6 @@ comptime E_DICT_TOO_BIG = -13
 comptime E_OUTPUT_TOO_BIG = -14   # string keys past int32 offsets
 comptime E_NAN_SORT = -15         # NaN among ORDER BY values
 comptime E_INEXACT = -16          # an int64 value column holds values past 2^53 (the interpreter is float64)
-comptime FUSE_GROUPS = 4096   # up to this many groups: keys encoded and aggregated per morsel
 comptime HDR = 16
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
@@ -204,15 +203,56 @@ def _key_value(kind: Int, arr: Int, i: Int) -> Int:
 
 def _int_range(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, kind: Int,
                mut lo: Int, mut hi: Int):
+    """Min and max of an integer key column: one parallel pass over 64k-row pieces."""
     lo = Int(Int64.MAX)
     hi = Int(Int64.MIN)
+    var n_items = 0
+    for c in range(n_chunks):
+        n_items += (_arr_len(Int(arrays[c * stride_a + col])) + MORSEL - 1) // MORSEL
+    if n_items == 0:
+        return
+    var items = unsafe_alloc[Int64](n_items * 5)       # (array, lo, hi) in, (min, max) out
+    var k = 0
     for c in range(n_chunks):
         var arr = Int(arrays[c * stride_a + col])
         var n = _arr_len(arr)
-        for i in range(n):
-            var v = _key_value(kind, arr, i)
-            lo = min(lo, v)
-            hi = max(hi, v)
+        var r = 0
+        while r < n:
+            items[5 * k] = Int64(arr)
+            items[5 * k + 1] = Int64(r)
+            items[5 * k + 2] = Int64(min(r + MORSEL, n))
+            k += 1
+            r += MORSEL
+
+    def part(i: Int) {imm}:
+        var arr = Int(items[5 * i])
+        var data = _arr_buf(arr, 1)
+        var off = _arr_off(arr)
+        var a = Int64.MAX
+        var b = Int64.MIN
+        if kind == K_I64:
+            var src = _lp(data) + off
+            for r in range(Int(items[5 * i + 1]), Int(items[5 * i + 2])):
+                a = min(a, src[r])
+                b = max(b, src[r])
+        else:
+            var src = _ip(data) + off
+            for r in range(Int(items[5 * i + 1]), Int(items[5 * i + 2])):
+                var v = Int64(src[r])
+                a = min(a, v)
+                b = max(b, v)
+        items[5 * i + 3] = a
+        items[5 * i + 4] = b
+
+    if n_items > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(part, n_items)
+    else:
+        part(0)
+    for i in range(n_items):
+        lo = min(lo, Int(items[5 * i + 3]))
+        hi = max(hi, Int(items[5 * i + 4]))
+    items.free()
 
 
 @always_inline
@@ -524,6 +564,51 @@ def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, t
     return True
 
 
+def _encode_sel(K: Keys, arrays: LP, stride_a: Int, n_keys: Int, col0: Int, c: Int, c0: Int, i0: Int,
+               sel: IP, nsel: Int, use_sel: Bool, dst: IP) -> Bool:
+    """Group ids of the selected rows of one VEC block (rows i0 + sel[j], or i0 + j without a
+    selection) of chunk c (first global row c0): dst[j], j < nsel. Same codes as _encode_keys;
+    False when a dictionary code is outside its chunk's dictionary."""
+    for k in range(n_keys):
+        var arr = Int(arrays[c * stride_a + col0 + k])
+        var kind = Int(K.kinds[k])
+        var sk = Int32(Int(K.stride[k]))
+        var first = k == 0
+        var r0 = i0 - c0
+        if kind == K_I64:
+            var src = _lp(_arr_buf(arr, 1)) + _arr_off(arr) + r0
+            var b64 = Int64(Int(K.base[k]))
+            for j in range(nsel):
+                var i = Int(sel[j]) if use_sel else j
+                var t = Int32(src[i] - b64) * sk
+                dst[j] = t if first else dst[j] + t
+        elif kind == K_STR:
+            var rcode = _ip(Int(K.rowcode[k])) + i0
+            for j in range(nsel):
+                var i = Int(sel[j]) if use_sel else j
+                var t = rcode[i] * sk
+                dst[j] = t if first else dst[j] + t
+        elif kind == K_DICT:
+            var src = _ip(_arr_buf(arr, 1)) + _arr_off(arr) + r0
+            var m = _ip(Int(_lp(Int(K.remap[k]))[c]))
+            var nd = Int32(_arr_len(_arr_dict(arr)))
+            for j in range(nsel):
+                var i = Int(sel[j]) if use_sel else j
+                var code = src[i]
+                if code < 0 or code >= nd:
+                    return False
+                var t = m[Int(code)] * sk
+                dst[j] = t if first else dst[j] + t
+        else:
+            var src = _ip(_arr_buf(arr, 1)) + _arr_off(arr) + r0
+            var bk = Int32(Int(K.base[k]))
+            for j in range(nsel):
+                var i = Int(sel[j]) if use_sel else j
+                var t = (src[i] - bk) * sk
+                dst[j] = t if first else dst[j] + t
+    return True
+
+
 @export
 def mx_exec_abi_version() abi("C") -> Int:
     return 1
@@ -668,94 +753,21 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     if not grouped:
         rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
                              0, 1, 0, n_rows, Int(vals), Int(cnt), threads)
-    elif not compact and not use_hash and G <= FUSE_GROUPS:
-        # ── fused: per 64k-row morsel, encode keys into a small reused buffer and aggregate it
-        #    right away (no n_rows-sized group-id array: no page faults, cache-resident)
-        var agg_base = HDR + (Int(code_p[2]) + Int(code_p[3]) + Int(code_p[4])) * 5
-        var acc_v = unsafe_alloc[Float64](nt * max(n_slots * G, 1))
-        var acc_c = unsafe_alloc[Int64](nt * G)
-        var vstride = max(n_slots * G, 1)
-        var failed = unsafe_alloc[Int64](1)
-        failed[0] = 0
-        var counter = unsafe_alloc[Int64](1)
-        counter[0] = 0
+    elif not compact and not use_hash:
+        # ── direct group ids: made per 1024-row block for the rows that pass the predicate only (no
+        #    n_rows-sized group-id array, keys of filtered-out rows never read), aggregated into
+        #    per-worker partials
+        def enc(c: Int, i0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP) {imm} -> Bool:
+            return _encode_sel(K, arrays, stride_a, n_keys, n_cols, c, Int(tbl[c * tstride]), i0,
+                               sel, nsel, use_sel, dst)
 
-        def fused_worker(wid: Int) {imm}:
-            var gbuf = unsafe_alloc[Int32](MORSEL)
-            var tv = unsafe_alloc[Float64](vstride)
-            var tc = unsafe_alloc[Int64](G)
-            var av = acc_v + wid * vstride
-            var ac = acc_c + wid * G
-            for a in range(n_slots):
-                var kind = Int(code_p[agg_base + a * 5])
-                var init = 0.0 if kind == OP_AGG_SUM else (INF if kind == OP_AGG_MIN else -INF)
-                for g in range(G):
-                    av[a * G + g] = init
-            for g in range(G):
-                ac[g] = 0
-            while True:
-                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-                var lo = m * MORSEL
-                if lo >= n_rows:
-                    break
-                var hi = min(lo + MORSEL, n_rows)
-                var gbase = _ip(Int(gbuf) - lo * 4)          # gbase[i] valid for i in [lo, hi)
-                if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, hi, gbase):
-                    failed[0] = 2
-                    break
-                var r = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks,
-                                        Int(dtypes), Int(gbase), G, lo, hi, Int(tv), Int(tc), 1)
-                if r < 0:
-                    failed[0] = 1
-                    break
-                for a in range(n_slots):
-                    var kind = Int(code_p[agg_base + a * 5])
-                    for g in range(G):
-                        var x = tv[a * G + g]
-                        var i = a * G + g
-                        if kind == OP_AGG_SUM:
-                            av[i] += x
-                        elif kind == OP_AGG_MIN:
-                            av[i] = min(av[i], x)
-                        else:
-                            av[i] = max(av[i], x)
-                for g in range(G):
-                    ac[g] += tc[g]
-            gbuf.free()
-            tv.free()
-            tc.free()
-
-        if nt > 1:
-            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(fused_worker, nt)
-        else:
-            fused_worker(0)
-        for a in range(n_slots):
-            var kind = Int(code_p[agg_base + a * 5])
-            for g in range(G):
-                var acc = acc_v[a * G + g]
-                for w in range(1, nt):
-                    var x = acc_v[w * vstride + a * G + g]
-                    if kind == OP_AGG_SUM:
-                        acc += x
-                    elif kind == OP_AGG_MIN:
-                        acc = min(acc, x)
-                    else:
-                        acc = max(acc, x)
-                vals[a * G + g] = acc
-        for g in range(G):
-            var c = Int64(0)
-            for w in range(nt):
-                c += acc_c[w * G + g]
-            cnt[g] = c
-        rc = 0 if Int(failed[0]) == 0 else (E_BAD_KEY if Int(failed[0]) == 2 else E_PIPELINE)
-        acc_v.free()
-        acc_c.free()
-        failed.free()
-        counter.free()
+        rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                            G, 0, n_rows, Int(vals), Int(cnt), threads, enc)
+        if rc == -5:
+            rc = E_BAD_KEY
     else:
-        # ── many groups: one group-id array, then one interpreter pass (M1 replaces this with a
-        #    hash-table aggregate)
+        # ── sparse keys (hash) or compacted composite codes: one group-id array, then one
+        #    interpreter pass
         var gids = unsafe_alloc[Int32](max(n_rows, 1))
         var counter = unsafe_alloc[Int64](1)
         counter[0] = 0

@@ -225,6 +225,11 @@ STAR_PLANS = {
         LazyFrame(t["li"]).filter(col("l_qty") > lit(40))
         .join(LazyFrame(t["orders"]), left_on="l_order", right_on="o_key")
         .groupby("o_cust").agg(col("o_day").count().alias("n")).sort("o_cust")),
+    "partner filtered on a dictionary string, narrowed to its key (.filter().select(key))": lambda t: (
+        LazyFrame(t["li"]).join(LazyFrame(t["orders"]), left_on="l_order", right_on="o_key")
+        .join(LazyFrame(t["cust"]).filter(col("c_seg") == lit("BUILD")).select("c_key"),
+              left_on="o_cust", right_on="c_key")
+        .groupby("l_mode").agg(col("l_price").sum().alias("s")).sort("l_mode")),
     "rows out, strings from both sides": lambda t: (
         LazyFrame(t["li"]).filter(col("l_qty") == lit(7))
         .join(LazyFrame(t["orders"]), left_on="l_order", right_on="o_key")
@@ -386,3 +391,25 @@ def test_distinct_of_more_than_the_keys_is_not_a_semi_join(monkeypatch):
     got, old, _ = _run_both(plan, t, monkeypatch)
     _same(got, old)
     assert all(r is None for r in semis)          # never taken as a semi partner
+
+
+def test_a_selected_partner_is_filtered_natively_on_its_dictionary(monkeypatch):
+    """Q17's `part.filter(brand, container).select(p_partkey)`: the Project only narrows the columns,
+    so the partner is still a Filter*(Scan) leaf: its predicate runs in `mx_filter` on the
+    dictionary codes (not decoded first, not evaluated in Python). F-032 (M2g)."""
+    import mxframe.custom_ops as co
+    t = _tables()
+    seen = []
+    real = nx.try_filter
+
+    def spy(comp, table, preds, needed, lookups=()):
+        seen.append((table.num_rows, table.schema))
+        return real(comp, table, preds, needed, lookups)
+
+    monkeypatch.setattr(nx, "try_filter", spy)
+    co._JOIN_RESULT_CACHE.clear()
+    plan = STAR_PLANS["partner filtered on a dictionary string, narrowed to its key (.filter().select(key))"]
+    got, old, path = _run_both(plan, t, monkeypatch)
+    cust = [sch for n, sch in seen if n == 3000]
+    assert cust and pa.types.is_dictionary(cust[0].field("c_seg").type)
+    _same(got, old)

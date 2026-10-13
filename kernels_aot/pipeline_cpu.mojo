@@ -492,8 +492,11 @@ def _find_chunk(p: Prog, row: Int) -> Int:
     return lo
 
 
-def _process_range(p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP,
-                   lo: Int, hi: Int):
+def _process_range[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
+    p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP, lo: Int, hi: Int, encode: E,
+) -> Bool:
+    """Rows [lo, hi) in VEC blocks: predicate, selection, body, accumulate. `keyed`: group ids of
+    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst)` (False: bad key)."""
     var pos = lo
     while pos < hi:
         var k = _find_chunk(p, pos)
@@ -517,28 +520,35 @@ def _process_range(p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP,
             if nsel > 0:
                 _run_ops(p, regs, cols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
                 var gp = gscratch
-                if p.has_gids:
-                    var gsrc = p.gids + i0
-                    if use_sel:
-                        for j in range(nsel):
-                            gscratch[j] = gsrc[Int(sel[j])]
-                    else:
-                        gp = gsrc
+                comptime if keyed:
+                    if not encode(k, i0, sel, nsel, use_sel, gscratch):
+                        return False
+                else:
+                    if p.has_gids:
+                        var gsrc = p.gids + i0
+                        if use_sel:
+                            for j in range(nsel):
+                                gscratch[j] = gsrc[Int(sel[j])]
+                        else:
+                            gp = gsrc
                 _accumulate(p, regs, gp, nsel, pv, pc)
             i0 += n
         pos = stop
+    return True
 
 
-@export
-def mx_pipeline_cpu(
+def _pipeline[E: def(Int, Int, IP, Int, Bool, IP) -> Bool, keyed: Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
-    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int,
-) abi("C") -> Int:
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+) -> Int:
+    """The interpreter over rows [start, end). `keyed`: no group-id array; the group ids of the rows
+    that pass the predicate are made per VEC block by `encode` (see _process_range), so keys of
+    filtered-out rows are never read and no n_rows-sized array is written. -5 when `encode` fails."""
     var code = _ip(code_a)
     if Int(code[0]) != 0x4d585031:
         return -1
-    var has_gids = gids_a != 0
+    var has_gids = keyed or gids_a != 0
     if (not has_gids) and n_groups != 1:
         return -2
     var p = Prog(code, _fp(consts_a), _bp(set_bytes_a), _lp(set_meta_a), _lp(tbl_a),
@@ -581,6 +591,8 @@ def mx_pipeline_cpu(
     var pc_all = unsafe_alloc[Int64](nthreads * max(G * NL, 1))
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
+    var failed = unsafe_alloc[Int64](1)
+    failed[0] = 0
     var pv_stride = max(A * G * NL, 1)
     var pc_stride = max(G * NL, 1)
 
@@ -600,7 +612,9 @@ def mx_pipeline_cpu(
             var lo = start + m * MORSEL
             if lo >= end:
                 break
-            _process_range(p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end))
+            if not _process_range[keyed=keyed](p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode):
+                failed[0] = 1
+                break
         regs.free()
         sel.free()
         gscratch.free()
@@ -649,4 +663,30 @@ def mx_pipeline_cpu(
     pv_all.free()
     pc_all.free()
     counter.free()
-    return 0
+    var rc = -5 if Int(failed[0]) != 0 else 0
+    failed.free()
+    return rc
+
+
+def _no_keys(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP) -> Bool:
+    return True
+
+
+@export
+def mx_pipeline_cpu(
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int,
+) abi("C") -> Int:
+    return _pipeline[keyed=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a,
+                                  gids_a, n_groups, start, end, out_vals_a, out_cnt_a, threads, _no_keys)
+
+
+def pipeline_keyed[E: def(Int, Int, IP, Int, Bool, IP) -> Bool](
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, n_groups: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+) -> Int:
+    """mx_pipeline_cpu with group ids made per morsel by `encode` (see _pipeline)."""
+    return _pipeline[keyed=True](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a,
+                                 0, n_groups, start, end, out_vals_a, out_cnt_a, threads, encode)
