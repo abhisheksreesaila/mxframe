@@ -59,7 +59,7 @@ packages = ["mxframe", "mxframe.kernels_aot"]
 [tool.setuptools.package-data]
 # Ship the pre-compiled AOT .so files and the Mojo package.
 "mxframe" = [
-    "kernels.mojopkg",
+    "kernels.mojoc",
 ]
 "mxframe.kernels_aot" = ["*.so"]
 

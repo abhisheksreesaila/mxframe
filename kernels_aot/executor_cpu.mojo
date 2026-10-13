@@ -34,17 +34,18 @@ Result (int64 words, caller-allocated, 3 + 2 * n_keys + n_outputs):
 Return: 0 ok; < 0 declined or failed (the caller falls back).
 """
 
-from std.memory import UnsafePointer, alloc
-from std.algorithm import parallelize
+from std.memory.alloc import unsafe_alloc
+from std.memory import Pointer
+from max.algorithm import parallelize
 from std.atomic import Atomic
 from std.ffi import external_call
 
 from pipeline_cpu import mx_pipeline_cpu
 
-comptime FP = UnsafePointer[Float64, MutAnyOrigin]
-comptime IP = UnsafePointer[Int32, MutAnyOrigin]
-comptime LP = UnsafePointer[Int64, MutAnyOrigin]
-comptime BP = UnsafePointer[UInt8, MutAnyOrigin]
+comptime FP = Pointer[Float64, MutUntrackedOrigin]
+comptime IP = Pointer[Int32, MutUntrackedOrigin]
+comptime LP = Pointer[Int64, MutUntrackedOrigin]
+comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 
 comptime MAGIC = 0x4D584531
 comptime MORSEL = 65536
@@ -132,13 +133,13 @@ struct Keys(Copyable, Movable):
     def __init__(out self, n: Int, n_chunks: Int):
         self.n = n
         self.n_chunks = n_chunks
-        self.kinds = alloc[Int64](max(n, 1))
-        self.base = alloc[Int64](max(n, 1))
-        self.card = alloc[Int64](max(n, 1))
-        self.stride = alloc[Int64](max(n, 1))
-        self.gchunk = alloc[Int64](max(n, 1))
-        self.gcode = alloc[Int64](max(n, 1))
-        self.remap = alloc[Int64](max(n, 1))
+        self.kinds = unsafe_alloc[Int64](max(n, 1))
+        self.base = unsafe_alloc[Int64](max(n, 1))
+        self.card = unsafe_alloc[Int64](max(n, 1))
+        self.stride = unsafe_alloc[Int64](max(n, 1))
+        self.gchunk = unsafe_alloc[Int64](max(n, 1))
+        self.gcode = unsafe_alloc[Int64](max(n, 1))
+        self.remap = unsafe_alloc[Int64](max(n, 1))
         for k in range(max(n, 1)):
             self.gchunk[k] = 0
             self.gcode[k] = 0
@@ -231,7 +232,7 @@ def _build_global_dict(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, cap: 
             continue
         prev_d = d
         var nd = _arr_len(d)
-        var rm = alloc[Int32](max(nd, 1))
+        var rm = unsafe_alloc[Int32](max(nd, 1))
         remaps[c] = Int64(Int(rm))
         for code in range(nd):
             var s0 = _dstart(d, code)
@@ -255,7 +256,7 @@ def _build_global_dict(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, cap: 
 
 def _global_ranks(arrays: LP, stride_a: Int, col: Int, n: Int, gchunk: LP, gcode: LP, ranks: LP):
     """ranks[entry] = position of global dictionary entry `entry` in byte order."""
-    var order = alloc[Int64](max(n, 1))
+    var order = unsafe_alloc[Int64](max(n, 1))
     for i in range(n):
         order[i] = Int64(i)
     for i in range(1, n):
@@ -362,7 +363,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     # ── 1. chunk table for the interpreter: row_start, row_end, per column base address ──────
     var tstride = 2 + n_cols
-    var tbl = alloc[Int64](n_chunks * tstride)
+    var tbl = unsafe_alloc[Int64](n_chunks * tstride)
     var row = 0
     for c in range(n_chunks):
         var first = Int(arrays[c * stride_a])
@@ -384,9 +385,9 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         K.kinds[k] = Int64(kind)
         var col = n_cols + k
         if kind == K_DICT:
-            var gch = alloc[Int64](DICT_CAP)
-            var gco = alloc[Int64](DICT_CAP)
-            var rms = alloc[Int64](n_chunks)
+            var gch = unsafe_alloc[Int64](DICT_CAP)
+            var gco = unsafe_alloc[Int64](DICT_CAP)
+            var rms = unsafe_alloc[Int64](n_chunks)
             for c in range(n_chunks):
                 rms[c] = 0
             K.gchunk[k] = Int64(Int(gch))
@@ -426,8 +427,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var G = D if grouped else 1
     var code_p = _ip(code)
     var n_slots = Int(code_p[5])
-    var vals = alloc[Float64](max(n_slots * G, 1))
-    var cnt = alloc[Int64](G)
+    var vals = unsafe_alloc[Float64](max(n_slots * G, 1))
+    var cnt = unsafe_alloc[Int64](G)
     var rc = 0
     var morsels = (n_rows + MORSEL - 1) // MORSEL
     var nt = max(1, min(threads, morsels))
@@ -439,19 +440,18 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         # ── fused: per 64k-row morsel, encode keys into a small reused buffer and aggregate it
         #    right away (no n_rows-sized group-id array: no page faults, cache-resident)
         var agg_base = HDR + (Int(code_p[2]) + Int(code_p[3]) + Int(code_p[4])) * 5
-        var acc_v = alloc[Float64](nt * max(n_slots * G, 1))
-        var acc_c = alloc[Int64](nt * G)
+        var acc_v = unsafe_alloc[Float64](nt * max(n_slots * G, 1))
+        var acc_c = unsafe_alloc[Int64](nt * G)
         var vstride = max(n_slots * G, 1)
-        var failed = alloc[Int64](1)
+        var failed = unsafe_alloc[Int64](1)
         failed[0] = 0
-        var counter = alloc[Int64](1)
+        var counter = unsafe_alloc[Int64](1)
         counter[0] = 0
 
-        @parameter
-        def fused_worker(wid: Int):
-            var gbuf = alloc[Int32](MORSEL)
-            var tv = alloc[Float64](vstride)
-            var tc = alloc[Int64](G)
+        def fused_worker(wid: Int) {imm}:
+            var gbuf = unsafe_alloc[Int32](MORSEL)
+            var tv = unsafe_alloc[Float64](vstride)
+            var tc = unsafe_alloc[Int64](G)
             var av = acc_v + wid * vstride
             var ac = acc_c + wid * G
             for a in range(n_slots):
@@ -462,7 +462,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for g in range(G):
                 ac[g] = 0
             while True:
-                var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
                 var lo = m * MORSEL
                 if lo >= n_rows:
                     break
@@ -495,7 +495,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 
         if nt > 1:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize[fused_worker](nt)
+            parallelize(fused_worker, nt)
         else:
             fused_worker(0)
         for a in range(n_slots):
@@ -524,16 +524,15 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     else:
         # ── many groups: one group-id array, then one interpreter pass (M1 replaces this with a
         #    hash-table aggregate)
-        var gids = alloc[Int32](max(n_rows, 1))
-        var counter = alloc[Int64](1)
+        var gids = unsafe_alloc[Int32](max(n_rows, 1))
+        var counter = unsafe_alloc[Int64](1)
         counter[0] = 0
-        var bad_key = alloc[Int64](1)
+        var bad_key = unsafe_alloc[Int64](1)
         bad_key[0] = 0
 
-        @parameter
-        def keys_worker(wid: Int):
+        def keys_worker(wid: Int) {imm}:
             while True:
-                var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
                 var lo = m * MORSEL
                 if lo >= n_rows:
                     break
@@ -542,7 +541,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 
         if nt > 1:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize[keys_worker](nt)
+            parallelize(keys_worker, nt)
         else:
             keys_worker(0)
         counter.free()
@@ -561,7 +560,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         return rc if rc == E_BAD_KEY else E_PIPELINE
 
     # ── 4. which groups exist, in output order ───────────────────────────────────────────────
-    var order = alloc[Int64](G)      # output position -> dense group id
+    var order = unsafe_alloc[Int64](G)      # output position -> dense group id
     var n_res = 0
     if not grouped:
         order[0] = 0
@@ -573,17 +572,17 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 n_res += 1
     else:
         # sort composite: sort keys first (ranks, flipped when descending), dense order otherwise
-        var ranks = alloc[LP](n_keys)
+        var ranks = unsafe_alloc[LP](n_keys)
         for k in range(n_keys):
             var card = Int(K.card[k])
-            ranks[k] = alloc[Int64](card)
+            ranks[k] = unsafe_alloc[Int64](card)
             if Int(K.kinds[k]) == K_DICT:
                 _global_ranks(arrays, stride_a, n_cols + k, card, _lp(Int(K.gchunk[k])),
                               _lp(Int(K.gcode[k])), ranks[k])
             else:
                 for v in range(card):
                     ranks[k][v] = Int64(v)
-        var slot_of = alloc[Int64](G)
+        var slot_of = unsafe_alloc[Int64](G)
         for g in range(G):
             var comp = 0
             for j in range(n_sort):
@@ -595,7 +594,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                     r = card - 1 - r
                 comp = comp * card + r
             slot_of[g] = Int64(comp)
-        var pos = alloc[Int64](G)
+        var pos = unsafe_alloc[Int64](G)
         for i in range(G):
             pos[i] = -1
         for g in range(G):
@@ -612,7 +611,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         ranks.free()
 
     # ── 5. output arena ─────────────────────────────────────────────────────────────────────
-    var key_bytes = alloc[Int64](max(n_keys, 1))
+    var key_bytes = unsafe_alloc[Int64](max(n_keys, 1))
     var total = 0
     for k in range(n_keys):
         var kind = Int(K.kinds[k])
@@ -637,7 +636,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         else:
             total += n_res * 8
     total += n_out * n_res * 8
-    var arena = alloc[UInt8](max(total, 8), alignment=64)
+    var arena = unsafe_alloc[UInt8](max(total, 8), alignment=64)
     var at = Int(arena)
 
     O[0] = Int64(n_res)

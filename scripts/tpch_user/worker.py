@@ -27,9 +27,9 @@ ENGINES = {
     "pandas":  ("q_pandas", None, ["pandas", "pyarrow.parquet"]),
     "polars":  ("q_polars", None, ["polars"]),
     "duckdb":  ("q_duckdb", None, ["duckdb"]),
-    "mx-cpu":  ("q_mx", "cpu", ["pyarrow.parquet", "pyarrow.compute"]),
-    "mx-gpu":  ("q_mx", "gpu", ["pyarrow.parquet", "pyarrow.compute"]),
-    "mx-auto": ("q_mx", "auto", ["pyarrow.parquet", "pyarrow.compute"]),
+    "mx-cpu":  ("q_mx", "cpu", ["pyarrow.parquet"]),     # pyarrow.compute loads on first use (F-035)
+    "mx-gpu":  ("q_mx", "gpu", ["pyarrow.parquet"]),
+    "mx-auto": ("q_mx", "auto", ["pyarrow.parquet"]),
 }
 
 

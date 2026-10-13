@@ -37,8 +37,9 @@ Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
          out_cnt int64[n_groups] (rows that passed the predicate per group).
 """
 
-from std.memory import UnsafePointer, alloc
-from std.algorithm import parallelize
+from std.memory.alloc import unsafe_alloc
+from std.memory import Pointer
+from max.algorithm import parallelize
 from std.sys import simd_width_of
 from std.atomic import Atomic
 from std.math import floor
@@ -53,10 +54,10 @@ comptime HDR = 16
 comptime BUDGET_BYTES = 768 * 1024 * 1024
 comptime MERGE_GROUPS = 16384
 
-comptime FP = UnsafePointer[Float64, MutAnyOrigin]
-comptime IP = UnsafePointer[Int32, MutAnyOrigin]
-comptime LP = UnsafePointer[Int64, MutAnyOrigin]
-comptime BP = UnsafePointer[UInt8, MutAnyOrigin]
+comptime FP = Pointer[Float64, MutUntrackedOrigin]
+comptime IP = Pointer[Int32, MutUntrackedOrigin]
+comptime LP = Pointer[Int64, MutUntrackedOrigin]
+comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 
 # ── opcodes (mirror pipeline_program.py) ───────────────────────────────────
 comptime OP_LOAD_COL = 1
@@ -107,7 +108,7 @@ def _bp(addr: Int) -> BP:
 
 @always_inline
 def _load_dense[T: DType](dst: FP, addr: Int, i0: Int, n: Int):
-    var src = UnsafePointer[Scalar[T], MutAnyOrigin](unsafe_from_address=addr) + i0
+    var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr) + i0
     var i = 0
     while i + W <= n:
         dst.store(i, src.load[width=W](i).cast[F64]())
@@ -118,7 +119,7 @@ def _load_dense[T: DType](dst: FP, addr: Int, i0: Int, n: Int):
 
 @always_inline
 def _load_gather[T: DType](dst: FP, addr: Int, i0: Int, sel: IP, n: Int):
-    var src = UnsafePointer[Scalar[T], MutAnyOrigin](unsafe_from_address=addr) + i0
+    var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr) + i0
     for j in range(n):
         dst[j] = src[Int(sel[j])].cast[F64]()
 
@@ -565,27 +566,26 @@ def mx_pipeline_cpu(
         nthreads = min(nthreads, max(1, BUDGET_BYTES // per_worker))
     nthreads = max(nthreads, 1)
 
-    var pv_all = alloc[Float64](nthreads * max(A * G * NL, 1))
-    var pc_all = alloc[Int64](nthreads * max(G * NL, 1))
-    var counter = alloc[Int64](1)
+    var pv_all = unsafe_alloc[Float64](nthreads * max(A * G * NL, 1))
+    var pc_all = unsafe_alloc[Int64](nthreads * max(G * NL, 1))
+    var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
     var pv_stride = max(A * G * NL, 1)
     var pc_stride = max(G * NL, 1)
 
-    @parameter
-    def worker(wid: Int):
-        var regs = alloc[Float64](p.n_regs * VEC + W, alignment=64)
+    def worker(wid: Int) {imm}:
+        var regs = unsafe_alloc[Float64](p.n_regs * VEC + W, alignment=64)
         for i in range(p.n_regs * VEC + W):
             regs[i] = 0.0
-        var sel = alloc[Int32](VEC)
-        var gscratch = alloc[Int32](VEC)
+        var sel = unsafe_alloc[Int32](VEC)
+        var gscratch = unsafe_alloc[Int32](VEC)
         var pv = pv_all + wid * pv_stride
         var pc = pc_all + wid * pc_stride
         _init_partials(p, pv, pc)
         # prologue (constants) once per worker
         _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
         while True:
-            var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             var lo = start + m * MORSEL
             if lo >= end:
                 break
@@ -600,11 +600,10 @@ def mx_pipeline_cpu(
         # A host process (Python via ctypes) has no Mojo async runtime yet:
         # create the global CPU device (thread pool) once, then parallelize.
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[worker](nthreads)
+        parallelize(worker, nthreads)
 
     # merge worker partials into the output (parallel over group ranges when there are many groups)
-    @parameter
-    def merge(chunk: Int):
+    def merge(chunk: Int) {imm}:
         var g0 = chunk * MERGE_GROUPS
         var g1 = min(g0 + MERGE_GROUPS, G)
         for a in range(A):
@@ -631,7 +630,7 @@ def mx_pipeline_cpu(
 
     var merge_chunks = (G + MERGE_GROUPS - 1) // MERGE_GROUPS
     if nthreads > 1 and merge_chunks > 1:
-        parallelize[merge](merge_chunks, nthreads)
+        parallelize(merge, merge_chunks, nthreads)
     else:
         for chunk in range(merge_chunks):
             merge(chunk)

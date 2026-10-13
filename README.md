@@ -136,6 +136,8 @@ Parquet scan; the cause is not yet profiled (F-025).
 The section below is the older warm-run benchmark on synthetic data: 1 warm-up, then the median
 of 3 runs. Its numbers are not comparable with the table above.
 
+> ⚠️ **Not a fair comparison; kept only as history.** MXFrame's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
+
 ### Historical: 📊 Performance — bounded v0.5.0 benchmark
 
 RTX 3090, warm median of three runs. Every query and engine ran in its own process so Arrow, Pandas, and CUDA allocations were released between measurements.

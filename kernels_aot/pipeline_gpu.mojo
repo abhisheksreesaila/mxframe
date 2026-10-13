@@ -35,12 +35,12 @@ Build:
         --emit shared-lib -o kernels_aot/libmxpipeline_gpu.so
 """
 
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from std.math import ceildiv, floor
-from std.gpu import thread_idx, block_idx, grid_dim, barrier
-from std.gpu.primitives.warp import shuffle_down
-from std.gpu.memory import AddressSpace, external_memory
-from std.memory import UnsafePointer, stack_allocation, bitcast
+from max.gpu import thread_idx, block_idx, grid_dim, barrier
+from max.gpu.primitives.warp import shuffle_down
+from max.gpu.memory import AddressSpace, external_memory
+from std.memory import Pointer, stack_allocation, bitcast
 
 comptime F64 = DType.float64
 comptime BLOCK: Int = 256
@@ -74,12 +74,12 @@ comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
 
 comptime SH = AddressSpace.SHARED
-comptime SFP = UnsafePointer[Float64, MutAnyOrigin, address_space=SH]
-comptime SIP = UnsafePointer[Int32, MutAnyOrigin, address_space=SH]
-comptime FP = UnsafePointer[Float64, MutAnyOrigin]
-comptime IP = UnsafePointer[Int32, MutAnyOrigin]
-comptime LP = UnsafePointer[Int64, MutAnyOrigin]
-comptime BP = UnsafePointer[UInt8, MutAnyOrigin]
+comptime SFP = Pointer[Float64, MutUntrackedOrigin, address_space=SH]
+comptime SIP = Pointer[Int32, MutUntrackedOrigin, address_space=SH]
+comptime FP = Pointer[Float64, MutUntrackedOrigin]
+comptime IP = Pointer[Int32, MutUntrackedOrigin]
+comptime LP = Pointer[Int64, MutUntrackedOrigin]
+comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 
 
 # ── monotonic atomics ────────────────────────────────────────────────────────
@@ -89,34 +89,34 @@ comptime BP = UnsafePointer[UInt8, MutAnyOrigin]
 # bin_op: add=1 (int), fadd=11, fmax=13, fmin=14; ordering: monotonic=2.
 
 @always_inline
-def _llvm_ptr[space: AddressSpace, T: DType](ptr: UnsafePointer[Scalar[T], MutAnyOrigin, address_space=space]) -> __mlir_type.`!llvm.ptr`:
+def _llvm_ptr[space: AddressSpace, T: DType](ptr: Pointer[Scalar[T], MutUntrackedOrigin, address_space=space]) -> __mlir_type.`!llvm.ptr`:
     comptime if space == AddressSpace.SHARED:
-        var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+        var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr._mlir_value)
         return __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
     else:
-        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
 
 
 @always_inline
-def _atomic_add_f64[space: AddressSpace](ptr: UnsafePointer[Float64, MutAnyOrigin, address_space=space], val: Float64):
+def _atomic_add_f64[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigin, address_space=space], val: Float64):
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f64](val)
     _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`11 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.f64](_llvm_ptr[space, F64](ptr), v)
 
 
 @always_inline
-def _atomic_min_f64[space: AddressSpace](ptr: UnsafePointer[Float64, MutAnyOrigin, address_space=space], val: Float64):
+def _atomic_min_f64[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigin, address_space=space], val: Float64):
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f64](val)
     _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`14 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.f64](_llvm_ptr[space, F64](ptr), v)
 
 
 @always_inline
-def _atomic_max_f64[space: AddressSpace](ptr: UnsafePointer[Float64, MutAnyOrigin, address_space=space], val: Float64):
+def _atomic_max_f64[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigin, address_space=space], val: Float64):
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f64](val)
     _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`13 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.f64](_llvm_ptr[space, F64](ptr), v)
 
 
 @always_inline
-def _atomic_add_i64(ptr: UnsafePointer[Int64, MutAnyOrigin], val: Int64):
+def _atomic_add_i64(ptr: Pointer[Int64, MutUntrackedOrigin], val: Int64):
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
     _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[AddressSpace.GENERIC, DType.int64](ptr), v)
 
@@ -141,7 +141,7 @@ def _bp(addr: Int) -> BP:
 @always_inline
 def _load(addr: Int, dtype: Int, row: Int) -> Float64:
     if dtype == 2:
-        return UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=addr)[row].cast[F64]()
+        return Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=addr)[row].cast[F64]()
     elif dtype == 0:
         return _ip(addr)[row].cast[F64]()
     elif dtype == 3:
@@ -212,7 +212,7 @@ def _cmp_i(cmp: Int, x: Int64, t: Int64) -> Bool:
 def _cmpc(addr: Int, dtype: Int, row: Int, thr: Float64, cmp: Int) -> Float64:
     """column[row] <cmp> thr in the column's own type (thr was rounded on the host)."""
     if dtype == 2:
-        var x = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=addr)[row]
+        var x = Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=addr)[row]
         return _b(_cmp_f(cmp, x, thr.cast[DType.float32]()))
     elif dtype == 0:
         return _b(_cmp_i(cmp, _ip(addr)[row].cast[DType.int64](), Int64(thr)))
@@ -374,11 +374,28 @@ def _run[RPT: Int, B: Int](
 
 
 def pipeline_kernel[RPT: Int, B: Int](
-    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
-    cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int, n_slots: Int,
-    row0: Int, row_end: Int, out_vals_a: Int, out_cnt_a: Int, scratch_a: Int,
-    n_regs: Int, code_ints: Int, mode: Int,
+    code_a_i64: Int64, consts_a_i64: Int64, set_bytes_a_i64: Int64, set_meta_a_i64: Int64,
+    cols_a_i64: Int64, dtypes_a_i64: Int64, gids_a_i64: Int64, n_groups_i64: Int64, n_slots_i64: Int64,
+    row0_i64: Int64, row_end_i64: Int64, out_vals_a_i64: Int64, out_cnt_a_i64: Int64, scratch_a_i64: Int64,
+    n_regs_i64: Int64, code_ints_i64: Int64, mode_i64: Int64,
 ):
+    var code_a = Int(code_a_i64)
+    var consts_a = Int(consts_a_i64)
+    var set_bytes_a = Int(set_bytes_a_i64)
+    var set_meta_a = Int(set_meta_a_i64)
+    var cols_a = Int(cols_a_i64)
+    var dtypes_a = Int(dtypes_a_i64)
+    var gids_a = Int(gids_a_i64)
+    var n_groups = Int(n_groups_i64)
+    var n_slots = Int(n_slots_i64)
+    var row0 = Int(row0_i64)
+    var row_end = Int(row_end_i64)
+    var out_vals_a = Int(out_vals_a_i64)
+    var out_cnt_a = Int(out_cnt_a_i64)
+    var scratch_a = Int(scratch_a_i64)
+    var n_regs = Int(n_regs_i64)
+    var code_ints = Int(code_ints_i64)
+    var mode = Int(mode_i64)
     comptime TILE = B * RPT
     comptime NWARPS = B // 32
     var tid = Int(thread_idx.x)
@@ -566,7 +583,12 @@ def pipeline_kernel[RPT: Int, B: Int](
             j += B
 
 
-def init_kernel(out_vals_a: Int, out_cnt_a: Int, ident_a: Int, n_groups: Int, total: Int):
+def init_kernel(out_vals_a_i64: Int64, out_cnt_a_i64: Int64, ident_a_i64: Int64, n_groups_i64: Int64, total_i64: Int64):
+    var out_vals_a = Int(out_vals_a_i64)
+    var out_cnt_a = Int(out_cnt_a_i64)
+    var ident_a = Int(ident_a_i64)
+    var n_groups = Int(n_groups_i64)
+    var total = Int(total_i64)
     var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     if t < total:
         _fp(out_vals_a)[t] = _fp(ident_a)[t // n_groups]
@@ -575,9 +597,18 @@ def init_kernel(out_vals_a: Int, out_cnt_a: Int, ident_a: Int, n_groups: Int, to
 
 
 def merge_kernel(
-    code_a: Int, scratch_a: Int, out_vals_a: Int, out_cnt_a: Int, n_blocks: Int,
-    n_groups: Int, n_slots: Int, agg_base: Int, ident_a: Int,
+    code_a_i64: Int64, scratch_a_i64: Int64, out_vals_a_i64: Int64, out_cnt_a_i64: Int64, n_blocks_i64: Int64,
+    n_groups_i64: Int64, n_slots_i64: Int64, agg_base_i64: Int64, ident_a_i64: Int64,
 ):
+    var code_a = Int(code_a_i64)
+    var scratch_a = Int(scratch_a_i64)
+    var out_vals_a = Int(out_vals_a_i64)
+    var out_cnt_a = Int(out_cnt_a_i64)
+    var n_blocks = Int(n_blocks_i64)
+    var n_groups = Int(n_groups_i64)
+    var n_slots = Int(n_slots_i64)
+    var agg_base = Int(agg_base_i64)
+    var ident_a = Int(ident_a_i64)
     """Merge the per-block partials in block order (deterministic)."""
     var s = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     var A = n_slots
@@ -644,34 +675,34 @@ def mx_pipeline_gpu(
         var total = A * G
         if small == 0 or end <= start:
             ctx.enqueue_function[init_kernel](
-                out_vals_a, out_cnt_a, ident_a, G, total,
+                Int64(out_vals_a), Int64(out_cnt_a), Int64(ident_a), Int64(G), Int64(total),
                 grid_dim=ceildiv(max(total, G), BLOCK), block_dim=BLOCK)
         if end > start:
             var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1) * per_sm)
             for _ in range(max(repeat, 1)):
                 if bsz == 128 and rpt == 2:
                     ctx.enqueue_function[pipeline_kernel[2, 128]](
-                        code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
-                        G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
-                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 elif bsz == 128:
                     ctx.enqueue_function[pipeline_kernel[1, 128]](
-                        code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
-                        G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
-                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 elif rpt == 2:
                     ctx.enqueue_function[pipeline_kernel[2, 256]](
-                        code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
-                        G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
-                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 else:
                     ctx.enqueue_function[pipeline_kernel[1, 256]](
-                        code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a,
-                        G, A, start, end, out_vals_a, out_cnt_a, scratch_a, n_regs, code_ints,
-                        mode, grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
             if small != 0:
                 ctx.enqueue_function[merge_kernel](
-                    code_a, scratch_a, out_vals_a, out_cnt_a, blocks, G, A, agg_base, ident_a,
+                    Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a),
                     grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
         return 0

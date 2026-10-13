@@ -1,8 +1,8 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
 from ._atomic import Atomic
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
@@ -84,7 +84,7 @@ def _join_count_left_gpu(
         n_left, table_size,
         grid_dim=ceildiv(n_left, BLOCK_SIZE), block_dim=BLOCK_SIZE)
 
-@compiler.register("join_count_left_cpu")
+@register("join_count_left_cpu")
 struct JoinCountLeftCPU:
     @staticmethod
     def execute[target: StaticString](
@@ -99,7 +99,7 @@ struct JoinCountLeftCPU:
         else:
             raise Error("join_count_left_cpu: only CPU target supported")
 
-@compiler.register("join_count_left_gpu")
+@register("join_count_left_gpu")
 struct JoinCountLeftGPU:
     @staticmethod
     def execute[target: StaticString](

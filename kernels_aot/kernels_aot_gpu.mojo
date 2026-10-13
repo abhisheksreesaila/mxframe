@@ -1,9 +1,9 @@
-from std.gpu.host import DeviceContext, DeviceAttribute
+from max.gpu.host import DeviceContext, DeviceAttribute
 from std.math import ceildiv
-from std.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
-from std.gpu.memory import AddressSpace, external_memory
-from std.gpu.primitives.warp import vote, shuffle_idx, shuffle_down
-from std.gpu.primitives.id import lane_id
+from max.gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
+from max.gpu.memory import AddressSpace, external_memory
+from max.gpu.primitives.warp import vote, shuffle_idx, shuffle_down
+from max.gpu.primitives.id import lane_id
 from std.bit import pop_count, count_trailing_zeros
 from std.sys._assembly import inlined_assembly
 from std.memory import stack_allocation
@@ -16,20 +16,20 @@ comptime F32_MAX: Float32 = 3.4028235e38
 comptime F32_MIN: Float32 = -3.4028235e38
 
 @always_inline
-def _f32(addr: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
-    return UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=addr)
+def _f32(addr: Int) -> Pointer[Float32, MutUntrackedOrigin]:
+    return Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _i32(addr: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
-    return UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=addr)
+def _i32(addr: Int) -> Pointer[Int32, MutUntrackedOrigin]:
+    return Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _i64(addr: Int) -> UnsafePointer[Int64, MutAnyOrigin]:
-    return UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=addr)
+def _i64(addr: Int) -> Pointer[Int64, MutUntrackedOrigin]:
+    return Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _u8(addr: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
-    return UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
+def _u8(addr: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
+    return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
 
 # ── UTF-8 predicates ──────────────────────────────────────────────────────
 # Arrow string layout: offsets[n+1] point into one contiguous UTF-8 byte
@@ -45,7 +45,9 @@ def utf8_startswith_mask_gpu(
     prefix_len: Int,
 ) abi("C"):
     @parameter
-    def kernel(n_: Int, prefix_len_: Int):
+    def kernel(n__i64: Int64, prefix_len__i64: Int64):
+        var n_ = Int(n__i64)
+        var prefix_len_ = Int(prefix_len__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_:
             return
@@ -67,8 +69,8 @@ def utf8_startswith_mask_gpu(
     try:
         var ctx = DeviceContext()
         if n > 0:
-            ctx.enqueue_function_experimental[kernel](
-                n, prefix_len, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), Int64(prefix_len), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -83,7 +85,9 @@ def utf8_contains_mask_gpu(
     pattern_len: Int,
 ) abi("C"):
     @parameter
-    def kernel(n_: Int, pattern_len_: Int):
+    def kernel(n__i64: Int64, pattern_len__i64: Int64):
+        var n_ = Int(n__i64)
+        var pattern_len_ = Int(pattern_len__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_:
             return
@@ -108,8 +112,8 @@ def utf8_contains_mask_gpu(
     try:
         var ctx = DeviceContext()
         if n > 0:
-            ctx.enqueue_function_experimental[kernel](
-                n, pattern_len, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), Int64(pattern_len), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -124,7 +128,9 @@ def utf8_equal_mask_gpu(
     pattern_len: Int,
 ) abi("C"):
     @parameter
-    def kernel(n_: Int, pattern_len_: Int):
+    def kernel(n__i64: Int64, pattern_len__i64: Int64):
+        var n_ = Int(n__i64)
+        var pattern_len_ = Int(pattern_len__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_:
             return
@@ -143,8 +149,8 @@ def utf8_equal_mask_gpu(
     try:
         var ctx = DeviceContext()
         if n > 0:
-            ctx.enqueue_function_experimental[kernel](
-                n, pattern_len, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), Int64(pattern_len), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -160,7 +166,9 @@ def utf8_isin_mask_gpu(
     n_patterns: Int,
 ) abi("C"):
     @parameter
-    def kernel(n_: Int, n_patterns_: Int):
+    def kernel(n__i64: Int64, n_patterns__i64: Int64):
+        var n_ = Int(n__i64)
+        var n_patterns_ = Int(n_patterns__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_:
             return
@@ -188,8 +196,8 @@ def utf8_isin_mask_gpu(
     try:
         var ctx = DeviceContext()
         if n > 0:
-            ctx.enqueue_function_experimental[kernel](
-                n, n_patterns, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), Int64(n_patterns), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -244,7 +252,7 @@ def _fold[op: Int](a: Float32, b: Float32) -> Float32:
 
 @always_inline
 def _atomic_fold[op: Int, space: AddressSpace](
-    ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space], v: Float32
+    ptr: Pointer[Float32, MutUntrackedOrigin, address_space=space], v: Float32
 ):
     comptime if op == OP_MIN:
         _ = Atomic.min[space](ptr, v)
@@ -263,18 +271,26 @@ def _row_value[op: Int](val_addr: Int, i: Int) -> Float32:
     else:
         return _f32(val_addr)[i]
 
-def group_init_kernel[op: Int](out_addr: Int, ng: Int):
+def group_init_kernel[op: Int](out_addr_i64: Int64, ng_i64: Int64):
+    var out_addr = Int(out_addr_i64)
+    var ng = Int(ng_i64)
     var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     if t < ng:
         _f32(out_addr)[t] = _ident[op]()
 
 def group_global_kernel[op: Int](
-    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+    out_addr_i64: Int64, val_addr_i64: Int64, lab_addr_i64: Int64, n_i64: Int64, ng_i64: Int64, stride_i64: Int64
 ):
+    var out_addr = Int(out_addr_i64)
+    var val_addr = Int(val_addr_i64)
+    var lab_addr = Int(lab_addr_i64)
+    var n = Int(n_i64)
+    var ng = Int(ng_i64)
+    var stride = Int(stride_i64)
     var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     while i + (GA_UNROLL - 1) * stride < n:
-        var g = InlineArray[Int, GA_UNROLL](fill=0)
-        var v = InlineArray[Float32, GA_UNROLL](fill=0.0)
+        var g = Array[Int, GA_UNROLL](fill=0)
+        var v = Array[Float32, GA_UNROLL](fill=0.0)
         comptime for u in range(GA_UNROLL):
             g[u] = Int(_i32(lab_addr)[i + u * stride])
             v[u] = _row_value[op](val_addr, i + u * stride)
@@ -304,8 +320,14 @@ def _match_any(x: Int32) -> UInt32:
 # Every lane runs every iteration (the shuffles need the full warp), rows past n are
 # lanes with group -1.
 def group_global_add_kernel[op: Int](
-    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+    out_addr_i64: Int64, val_addr_i64: Int64, lab_addr_i64: Int64, n_i64: Int64, ng_i64: Int64, stride_i64: Int64
 ):
+    var out_addr = Int(out_addr_i64)
+    var val_addr = Int(val_addr_i64)
+    var lab_addr = Int(lab_addr_i64)
+    var n = Int(n_i64)
+    var ng = Int(ng_i64)
+    var stride = Int(stride_i64)
     var lane = Int(lane_id())
     var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     for _ in range(ceildiv(n, stride)):
@@ -334,10 +356,16 @@ def group_global_add_kernel[op: Int](
         i += stride
 
 def group_shared_kernel[op: Int](
-    out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int, stride: Int
+    out_addr_i64: Int64, val_addr_i64: Int64, lab_addr_i64: Int64, n_i64: Int64, ng_i64: Int64, stride_i64: Int64
 ):
+    var out_addr = Int(out_addr_i64)
+    var val_addr = Int(val_addr_i64)
+    var lab_addr = Int(lab_addr_i64)
+    var n = Int(n_i64)
+    var ng = Int(ng_i64)
+    var stride = Int(stride_i64)
     var shmem = rebind[
-        UnsafePointer[Scalar[DType.float32], MutAnyOrigin,
+        Pointer[Scalar[DType.float32], MutUntrackedOrigin,
                       address_space=AddressSpace.SHARED]
     ](external_memory[
         Scalar[DType.float32],
@@ -353,8 +381,8 @@ def group_shared_kernel[op: Int](
     barrier()
     var i = Int(block_idx.x) * BLOCK + tid
     while i + (GA_UNROLL - 1) * stride < n:
-        var g = InlineArray[Int, GA_UNROLL](fill=0)
-        var v = InlineArray[Float32, GA_UNROLL](fill=0.0)
+        var g = Array[Int, GA_UNROLL](fill=0)
+        var v = Array[Float32, GA_UNROLL](fill=0.0)
         comptime for u in range(GA_UNROLL):
             g[u] = Int(_i32(lab_addr)[i + u * stride])
             v[u] = _row_value[op](val_addr, i + u * stride)
@@ -382,8 +410,8 @@ def run_group[op: Int](
     if ng <= 0:
         return
     var ctx = DeviceContext()
-    ctx.enqueue_function_experimental[group_init_kernel[op]](
-        out_addr, ng, grid_dim=ceildiv(ng, BLOCK), block_dim=BLOCK)
+    ctx.enqueue_function[group_init_kernel[op]](
+        Int64(out_addr), Int64(ng), grid_dim=ceildiv(ng, BLOCK), block_dim=BLOCK)
     if n > 0:
         var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
         if ng <= SHARED_MAX_GROUPS and n >= 4 * ng:
@@ -392,18 +420,18 @@ def run_group[op: Int](
             # each block must cover >= ~2 rows per slot it flushes
             var blocks = max(1, min(sms * per_sm, n // (2 * ng)))
             blocks = min(blocks, ceildiv(n, BLOCK * GA_UNROLL))
-            ctx.enqueue_function_experimental[group_shared_kernel[op]](
-                out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+            ctx.enqueue_function[group_shared_kernel[op]](
+                Int64(out_addr), Int64(val_addr), Int64(lab_addr), Int64(n), Int64(ng), Int64(blocks * BLOCK),
                 grid_dim=blocks, block_dim=BLOCK, shared_mem_bytes=smem)
         else:
             var blocks = min(sms * MAX_BLOCKS_PER_SM, ceildiv(n, BLOCK * GA_UNROLL))
             comptime if op == OP_SUM or op == OP_COUNT:
-                ctx.enqueue_function_experimental[group_global_add_kernel[op]](
-                    out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                ctx.enqueue_function[group_global_add_kernel[op]](
+                    Int64(out_addr), Int64(val_addr), Int64(lab_addr), Int64(n), Int64(ng), Int64(blocks * BLOCK),
                     grid_dim=blocks, block_dim=BLOCK)
             else:
-                ctx.enqueue_function_experimental[group_global_kernel[op]](
-                    out_addr, val_addr, lab_addr, n, ng, blocks * BLOCK,
+                ctx.enqueue_function[group_global_kernel[op]](
+                    Int64(out_addr), Int64(val_addr), Int64(lab_addr), Int64(n), Int64(ng), Int64(blocks * BLOCK),
                     grid_dim=blocks, block_dim=BLOCK)
     ctx.synchronize()
 
@@ -450,8 +478,8 @@ comptime MU: Int = 4                      # independent rows per thread per iter
 comptime MASKED_BLOCKS_PER_SM: Int = 6    # 6 * 256 = 1536 threads/SM
 
 @always_inline
-def _f64(addr: Int) -> UnsafePointer[Float64, MutAnyOrigin]:
-    return UnsafePointer[Float64, MutAnyOrigin](unsafe_from_address=addr)
+def _f64(addr: Int) -> Pointer[Float64, MutUntrackedOrigin]:
+    return Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
 def _warp_sum(v: Float64) -> Float64:
@@ -504,14 +532,20 @@ def _block_ext[is_min: Bool](v: Float32, ident: Float32) -> Float32:
 
 # a * b (prod) or a, in float64, of a live row; 0 for a masked-out row.
 def masked_sum_pass1[prod: Bool](
-    part_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int, stride: Int
+    part_addr_i64: Int64, a_addr_i64: Int64, b_addr_i64: Int64, mask_addr_i64: Int64, n_i64: Int64, stride_i64: Int64
 ):
+    var part_addr = Int(part_addr_i64)
+    var a_addr = Int(a_addr_i64)
+    var b_addr = Int(b_addr_i64)
+    var mask_addr = Int(mask_addr_i64)
+    var n = Int(n_i64)
+    var stride = Int(stride_i64)
     var acc = Float64(0)
     var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     while i + (MU - 1) * stride < n:
-        var m = InlineArray[Int32, MU](fill=0)
-        var x = InlineArray[Float32, MU](fill=0.0)
-        var y = InlineArray[Float32, MU](fill=0.0)
+        var m = Array[Int32, MU](fill=0)
+        var x = Array[Float32, MU](fill=0.0)
+        var y = Array[Float32, MU](fill=0.0)
         comptime for u in range(MU):
             m[u] = _i32(mask_addr)[i + u * stride]
             x[u] = _f32(a_addr)[i + u * stride]
@@ -536,14 +570,19 @@ def masked_sum_pass1[prod: Bool](
         _f64(part_addr)[Int(block_idx.x)] = total
 
 def masked_ext_pass1[is_min: Bool](
-    part_addr: Int, a_addr: Int, mask_addr: Int, n: Int, stride: Int
+    part_addr_i64: Int64, a_addr_i64: Int64, mask_addr_i64: Int64, n_i64: Int64, stride_i64: Int64
 ):
+    var part_addr = Int(part_addr_i64)
+    var a_addr = Int(a_addr_i64)
+    var mask_addr = Int(mask_addr_i64)
+    var n = Int(n_i64)
+    var stride = Int(stride_i64)
     var ident = F32_MAX if is_min else F32_MIN
     var best = ident
     var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     while i + (MU - 1) * stride < n:
-        var m = InlineArray[Int32, MU](fill=0)
-        var x = InlineArray[Float32, MU](fill=0.0)
+        var m = Array[Int32, MU](fill=0)
+        var x = Array[Float32, MU](fill=0.0)
         comptime for u in range(MU):
             m[u] = _i32(mask_addr)[i + u * stride]
             x[u] = _f32(a_addr)[i + u * stride]
@@ -567,7 +606,10 @@ def masked_ext_pass1[is_min: Bool](
         _f64(part_addr)[Int(block_idx.x)] = r.cast[DType.float64]()
 
 # One block folds the per-block partials (fixed order) into the float32 result.
-def masked_final_sum(out_addr: Int, part_addr: Int, nparts: Int):
+def masked_final_sum(out_addr_i64: Int64, part_addr_i64: Int64, nparts_i64: Int64):
+    var out_addr = Int(out_addr_i64)
+    var part_addr = Int(part_addr_i64)
+    var nparts = Int(nparts_i64)
     var acc = Float64(0)
     var t = Int(thread_idx.x)
     while t < nparts:
@@ -577,7 +619,10 @@ def masked_final_sum(out_addr: Int, part_addr: Int, nparts: Int):
     if Int(thread_idx.x) == 0:
         _f64(out_addr)[0] = total
 
-def masked_final_ext[is_min: Bool](out_addr: Int, part_addr: Int, nparts: Int):
+def masked_final_ext[is_min: Bool](out_addr_i64: Int64, part_addr_i64: Int64, nparts_i64: Int64):
+    var out_addr = Int(out_addr_i64)
+    var part_addr = Int(part_addr_i64)
+    var nparts = Int(nparts_i64)
     var ident = F32_MAX if is_min else F32_MIN
     var best = ident
     var t = Int(thread_idx.x)
@@ -606,11 +651,11 @@ def masked_global_sum_f32_gpu(
         var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
         var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[masked_sum_pass1[False]](
-                pa, val_addr, 0, mask_addr, n, blocks * BLOCK,
+            ctx.enqueue_function[masked_sum_pass1[False]](
+                Int64(pa), Int64(val_addr), Int64(0), Int64(mask_addr), Int64(n), Int64(blocks * BLOCK),
                 grid_dim=blocks, block_dim=BLOCK)
-        ctx.enqueue_function_experimental[masked_final_sum](
-            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.enqueue_function[masked_final_sum](
+            Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
     except: pass
@@ -625,11 +670,11 @@ def masked_global_sum_product_f32_gpu(
         var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
         var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[masked_sum_pass1[True]](
-                pa, a_addr, b_addr, mask_addr, n, blocks * BLOCK,
+            ctx.enqueue_function[masked_sum_pass1[True]](
+                Int64(pa), Int64(a_addr), Int64(b_addr), Int64(mask_addr), Int64(n), Int64(blocks * BLOCK),
                 grid_dim=blocks, block_dim=BLOCK)
-        ctx.enqueue_function_experimental[masked_final_sum](
-            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.enqueue_function[masked_final_sum](
+            Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
     except: pass
@@ -644,11 +689,11 @@ def masked_global_min_f32_gpu(
         var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
         var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[masked_ext_pass1[True]](
-                pa, val_addr, mask_addr, n, blocks * BLOCK,
+            ctx.enqueue_function[masked_ext_pass1[True]](
+                Int64(pa), Int64(val_addr), Int64(mask_addr), Int64(n), Int64(blocks * BLOCK),
                 grid_dim=blocks, block_dim=BLOCK)
-        ctx.enqueue_function_experimental[masked_final_ext[True]](
-            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.enqueue_function[masked_final_ext[True]](
+            Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
     except: pass
@@ -663,11 +708,11 @@ def masked_global_max_f32_gpu(
         var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
         var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[masked_ext_pass1[False]](
-                pa, val_addr, mask_addr, n, blocks * BLOCK,
+            ctx.enqueue_function[masked_ext_pass1[False]](
+                Int64(pa), Int64(val_addr), Int64(mask_addr), Int64(n), Int64(blocks * BLOCK),
                 grid_dim=blocks, block_dim=BLOCK)
-        ctx.enqueue_function_experimental[masked_final_ext[False]](
-            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.enqueue_function[masked_final_ext[False]](
+            Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
     except: pass
@@ -675,11 +720,21 @@ def masked_global_max_f32_gpu(
 # Fused range predicate + product reduction: five comparisons decide whether a[i]*b[i]
 # (float64) joins the sum.  Same two-pass structure as above.
 def range5_pass1(
-    part_addr: Int, a_addr: Int, b_addr: Int,
-    int_col_addr: Int, float_col_addr: Int, upper_col_addr: Int,
-    n: Int, ilo: Int, ihi: Int, flo: Float32, fhi: Float32, uhi: Float32,
-    stride: Int,
+    part_addr_i64: Int64, a_addr_i64: Int64, b_addr_i64: Int64,
+    int_col_addr_i64: Int64, float_col_addr_i64: Int64, upper_col_addr_i64: Int64,
+    n_i64: Int64, ilo_i64: Int64, ihi_i64: Int64, flo: Float32, fhi: Float32, uhi: Float32,
+    stride_i64: Int64,
 ):
+    var part_addr = Int(part_addr_i64)
+    var a_addr = Int(a_addr_i64)
+    var b_addr = Int(b_addr_i64)
+    var int_col_addr = Int(int_col_addr_i64)
+    var float_col_addr = Int(float_col_addr_i64)
+    var upper_col_addr = Int(upper_col_addr_i64)
+    var n = Int(n_i64)
+    var ilo = Int(ilo_i64)
+    var ihi = Int(ihi_i64)
+    var stride = Int(stride_i64)
     var acc = Float64(0)
     var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     while row < n:
@@ -716,12 +771,12 @@ def range5_sum_product_f32_gpu(
         var parts = ctx.enqueue_create_buffer[DType.float64](blocks)
         var pa = Int(parts.unsafe_ptr())
         if n > 0:
-            ctx.enqueue_function_experimental[range5_pass1](
-                pa, a_addr, b_addr, int_col_addr, float_col_addr, upper_col_addr,
-                n, int_lo, int_hi, float_lo, float_hi, upper_hi, blocks * BLOCK,
+            ctx.enqueue_function[range5_pass1](
+                Int64(pa), Int64(a_addr), Int64(b_addr), Int64(int_col_addr), Int64(float_col_addr), Int64(upper_col_addr),
+                Int64(n), Int64(int_lo), Int64(int_hi), float_lo, float_hi, upper_hi, Int64(blocks * BLOCK),
                 grid_dim=blocks, block_dim=BLOCK)
-        ctx.enqueue_function_experimental[masked_final_sum](
-            out_addr, pa, blocks if n > 0 else 0, grid_dim=1, block_dim=BLOCK)
+        ctx.enqueue_function[masked_final_sum](
+            Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
     except: pass
@@ -746,7 +801,9 @@ def semi_range_group_count_i32_gpu(
     left_hi: Int,
 ) abi("C"):
     @parameter
-    def init_buffers(table_size_: Int, n_groups_: Int):
+    def init_buffers(table_size__i64: Int64, n_groups__i64: Int64):
+        var table_size_ = Int(table_size__i64)
+        var n_groups_ = Int(n_groups__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row < table_size_:
             _i32(marks_addr)[row] = Int32(0)
@@ -754,7 +811,9 @@ def semi_range_group_count_i32_gpu(
             _i32(out_addr)[row] = Int32(0)
 
     @parameter
-    def mark_right(n_right_: Int, table_size_: Int):
+    def mark_right(n_right__i64: Int64, table_size__i64: Int64):
+        var n_right_ = Int(n_right__i64)
+        var table_size_ = Int(table_size__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row < n_right_ and _i32(right_a_addr)[row] < _i32(right_b_addr)[row]:
             var key = Int(_i32(right_keys_addr)[row])
@@ -762,7 +821,12 @@ def semi_range_group_count_i32_gpu(
                 _i32(marks_addr)[key] = Int32(1)
 
     @parameter
-    def count_left(n_left_: Int, table_size_: Int, n_groups_: Int, lo: Int, hi: Int):
+    def count_left(n_left__i64: Int64, table_size__i64: Int64, n_groups__i64: Int64, lo_i64: Int64, hi_i64: Int64):
+        var n_left_ = Int(n_left__i64)
+        var table_size_ = Int(table_size__i64)
+        var n_groups_ = Int(n_groups__i64)
+        var lo = Int(lo_i64)
+        var hi = Int(hi_i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_left_:
             return
@@ -776,16 +840,16 @@ def semi_range_group_count_i32_gpu(
 
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_buffers](
-            table_size, n_groups,
+        ctx.enqueue_function[init_buffers](
+            Int64(table_size), Int64(n_groups),
             grid_dim=ceildiv(max(table_size, n_groups), BLOCK), block_dim=BLOCK)
         if n_right > 0:
-            ctx.enqueue_function_experimental[mark_right](
-                n_right, table_size,
+            ctx.enqueue_function[mark_right](
+                Int64(n_right), Int64(table_size),
                 grid_dim=ceildiv(n_right, BLOCK), block_dim=BLOCK)
         if n_left > 0:
-            ctx.enqueue_function_experimental[count_left](
-                n_left, table_size, n_groups, left_lo, left_hi,
+            ctx.enqueue_function[count_left](
+                Int64(n_left), Int64(table_size), Int64(n_groups), Int64(left_lo), Int64(left_hi),
                 grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
@@ -803,13 +867,16 @@ def key_match_counts_i32_gpu(
     table_size: Int,
 ) abi("C"):
     @parameter
-    def init_counts(table_size_: Int):
+    def init_counts(table_size__i64: Int64):
+        var table_size_ = Int(table_size__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row < table_size_:
             _i32(counts_addr)[row] = Int32(0)
 
     @parameter
-    def count_right(n_right_: Int, table_size_: Int):
+    def count_right(n_right__i64: Int64, table_size__i64: Int64):
+        var n_right_ = Int(n_right__i64)
+        var table_size_ = Int(table_size__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row < n_right_:
             var key = Int(_i32(right_keys_addr)[row])
@@ -817,7 +884,9 @@ def key_match_counts_i32_gpu(
                 _ = Atomic.fetch_add(_i32(counts_addr) + key, Int32(1))
 
     @parameter
-    def gather_left(n_left_: Int, table_size_: Int):
+    def gather_left(n_left__i64: Int64, table_size__i64: Int64):
+        var n_left_ = Int(n_left__i64)
+        var table_size_ = Int(table_size__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row < n_left_:
             var key = Int(_i32(left_keys_addr)[row])
@@ -825,15 +894,15 @@ def key_match_counts_i32_gpu(
 
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_counts](
-            table_size, grid_dim=ceildiv(table_size, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[init_counts](
+            Int64(table_size), grid_dim=ceildiv(table_size, BLOCK), block_dim=BLOCK)
         if n_right > 0:
-            ctx.enqueue_function_experimental[count_right](
-                n_right, table_size,
+            ctx.enqueue_function[count_right](
+                Int64(n_right), Int64(table_size),
                 grid_dim=ceildiv(n_right, BLOCK), block_dim=BLOCK)
         if n_left > 0:
-            ctx.enqueue_function_experimental[gather_left](
-                n_left, table_size,
+            ctx.enqueue_function[gather_left](
+                Int64(n_left), Int64(table_size),
                 grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
@@ -860,7 +929,10 @@ def single_late_supplier_counts_i32_gpu(
     cap: Int,
 ) abi("C"):
     @parameter
-    def init_buffers(n_orders_: Int, n_suppliers_: Int, cap_: Int):
+    def init_buffers(n_orders__i64: Int64, n_suppliers__i64: Int64, cap__i64: Int64):
+        var n_orders_ = Int(n_orders__i64)
+        var n_suppliers_ = Int(n_suppliers__i64)
+        var cap_ = Int(cap__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row < cap_:
             _i32(states_addr)[row] = Int32(0)
@@ -870,7 +942,11 @@ def single_late_supplier_counts_i32_gpu(
             _i32(out_addr)[row] = Int32(0)
 
     @parameter
-    def insert_pairs(n_rows_: Int, n_orders_: Int, n_suppliers_: Int, cap_: Int):
+    def insert_pairs(n_rows__i64: Int64, n_orders__i64: Int64, n_suppliers__i64: Int64, cap__i64: Int64):
+        var n_rows_ = Int(n_rows__i64)
+        var n_orders_ = Int(n_orders__i64)
+        var n_suppliers_ = Int(n_suppliers__i64)
+        var cap_ = Int(cap__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_rows_ or _i32(receipt_addr)[row] <= _i32(commit_addr)[row]:
             return
@@ -903,7 +979,10 @@ def single_late_supplier_counts_i32_gpu(
             slot = (slot + 1) % cap_
 
     @parameter
-    def count_suppliers(n_rows_: Int, n_orders_: Int, n_suppliers_: Int):
+    def count_suppliers(n_rows__i64: Int64, n_orders__i64: Int64, n_suppliers__i64: Int64):
+        var n_rows_ = Int(n_rows__i64)
+        var n_orders_ = Int(n_orders__i64)
+        var n_suppliers_ = Int(n_suppliers__i64)
         var row = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if row >= n_rows_ or _i32(receipt_addr)[row] <= _i32(commit_addr)[row]:
             return
@@ -917,15 +996,15 @@ def single_late_supplier_counts_i32_gpu(
 
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[init_buffers](
-            n_orders, n_suppliers, cap,
+        ctx.enqueue_function[init_buffers](
+            Int64(n_orders), Int64(n_suppliers), Int64(cap),
             grid_dim=ceildiv(max(max(n_orders, n_suppliers), cap), BLOCK), block_dim=BLOCK)
         if n_rows > 0:
-            ctx.enqueue_function_experimental[insert_pairs](
-                n_rows, n_orders, n_suppliers, cap,
+            ctx.enqueue_function[insert_pairs](
+                Int64(n_rows), Int64(n_orders), Int64(n_suppliers), Int64(cap),
                 grid_dim=ceildiv(n_rows, BLOCK), block_dim=BLOCK)
-            ctx.enqueue_function_experimental[count_suppliers](
-                n_rows, n_orders, n_suppliers,
+            ctx.enqueue_function[count_suppliers](
+                Int64(n_rows), Int64(n_orders), Int64(n_suppliers),
                 grid_dim=ceildiv(n_rows, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
@@ -934,39 +1013,42 @@ def single_late_supplier_counts_i32_gpu(
 @export
 def gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _f32(out_addr)[i] = _f32(src_addr)[Int(_i32(idx_addr)[i])]
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
 @export
 def gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _i32(out_addr)[i] = _i32(src_addr)[Int(_i32(idx_addr)[i])]
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
 @export
 def gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _i64(out_addr)[i] = _i64(src_addr)[Int(_i32(idx_addr)[i])]
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -976,14 +1058,15 @@ def filter_gather_f32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
 ) abi("C"):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_ and _i32(mask_addr)[i] != 0:
             _f32(out_addr)[Int(_i32(offsets_addr)[i])] = _f32(src_addr)[i]
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -992,14 +1075,15 @@ def filter_gather_i32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
 ) abi("C"):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_ and _i32(mask_addr)[i] != 0:
             _i32(out_addr)[Int(_i32(offsets_addr)[i])] = _i32(src_addr)[i]
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -1008,14 +1092,15 @@ def filter_gather_i64_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
 ) abi("C"):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_ and _i32(mask_addr)[i] != 0:
             _i64(out_addr)[Int(_i32(offsets_addr)[i])] = _i64(src_addr)[i]
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -1059,7 +1144,8 @@ def group_encode_i32_gpu(
     cap: Int,
 ) abi("C"):
     @parameter
-    def init_tables(cap_: Int):
+    def init_tables(cap__i64: Int64):
+        var cap_ = Int(cap__i64)
         var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if t < cap_:
             _i32(htab_addr)[t] = Int32(0)
@@ -1068,7 +1154,9 @@ def group_encode_i32_gpu(
             _i32(out_ng_addr)[0] = Int32(0)
 
     @parameter
-    def insert(n_: Int, cap_: Int):
+    def insert(n__i64: Int64, cap__i64: Int64):
+        var n_ = Int(n__i64)
+        var cap_ = Int(cap__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i >= n_: return
 
@@ -1108,11 +1196,11 @@ def group_encode_i32_gpu(
     try:
         var ctx = DeviceContext()
         if cap > 0:
-            ctx.enqueue_function_experimental[init_tables](
-                cap, grid_dim=ceildiv(cap, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[init_tables](
+                Int64(cap), grid_dim=ceildiv(cap, BLOCK), block_dim=BLOCK)
         if n > 0 and cap > 0:
-            ctx.enqueue_function_experimental[insert](
-                n, cap, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[insert](
+                Int64(n), Int64(cap), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -1121,7 +1209,8 @@ def group_encode_i32_gpu(
 @export
 def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_:
             if i == 0:
@@ -1130,8 +1219,8 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
                 _i32(out_addr)[i] = Int32(1) if _i32(keys_addr)[i] != _i32(keys_addr)[i-1] else Int32(0)
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+        ctx.enqueue_function[kernel](
+            Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
 
@@ -1155,8 +1244,8 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
 # keys_addr int32[n]   input:  sort keys
 # desc_flag            0 = ascending, 1 = descending (ties keep row order)
 @always_inline
-def _u64(addr: Int) -> UnsafePointer[UInt64, MutAnyOrigin]:
-    return UnsafePointer[UInt64, MutAnyOrigin](unsafe_from_address=addr)
+def _u64(addr: Int) -> Pointer[UInt64, MutUntrackedOrigin]:
+    return Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=addr)
 
 comptime SORT_TILE: Int = 2048        # words sorted in shared memory (16 KB)
 
@@ -1181,7 +1270,7 @@ def _pair_index(p: Int, j: Int) -> Int:
 
 @always_inline
 def _cmpx(
-    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    sh: Pointer[Scalar[DType.uint64], MutUntrackedOrigin, address_space=AddressSpace.SHARED],
     i: Int, j: Int, asc: Bool,
 ):
     var a = sh[i]
@@ -1192,7 +1281,7 @@ def _cmpx(
 
 @always_inline
 def _sort_stages(
-    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    sh: Pointer[Scalar[DType.uint64], MutUntrackedOrigin, address_space=AddressSpace.SHARED],
     base: Int, tile: Int, tid: Int,
 ):
     """Bitonic stages k = 2..tile inside a shared-memory tile; the direction of each block
@@ -1213,7 +1302,7 @@ def _sort_stages(
 
 @always_inline
 def _merge_steps(
-    sh: UnsafePointer[Scalar[DType.uint64], MutAnyOrigin, address_space=AddressSpace.SHARED],
+    sh: Pointer[Scalar[DType.uint64], MutUntrackedOrigin, address_space=AddressSpace.SHARED],
     base: Int, tile: Int, k_val: Int, tid: Int,
 ):
     """The steps j = tile/2..1 of one bitonic merge stage of size k_val >= 2 * tile."""
@@ -1240,7 +1329,10 @@ def sort_topk_i32_gpu(
     desc_flag: Int,
 ) abi("C"):
     @parameter
-    def small_sort(n_: Int, padded_: Int, desc_: Int):
+    def small_sort(n__i64: Int64, padded__i64: Int64, desc__i64: Int64):
+        var n_ = Int(n__i64)
+        var padded_ = Int(padded__i64)
+        var desc_ = Int(desc__i64)
         # whole sort in one block: keys -> words -> shared sort -> rows
         var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
             address_space=AddressSpace.SHARED]()
@@ -1257,13 +1349,18 @@ def sort_topk_i32_gpu(
             t += BLOCK
 
     @parameter
-    def init_words(n_: Int, padded_: Int, desc_: Int, words_addr: Int):
+    def init_words(n__i64: Int64, padded__i64: Int64, desc__i64: Int64, words_addr_i64: Int64):
+        var n_ = Int(n__i64)
+        var padded_ = Int(padded__i64)
+        var desc_ = Int(desc__i64)
+        var words_addr = Int(words_addr_i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < padded_:
             _u64(words_addr)[i] = _sort_word(keys_addr, i, n_, desc_)
 
     @parameter
-    def tile_sort(words_addr: Int):
+    def tile_sort(words_addr_i64: Int64):
+        var words_addr = Int(words_addr_i64)
         var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -1280,7 +1377,9 @@ def sort_topk_i32_gpu(
             t += BLOCK
 
     @parameter
-    def tile_merge(k_val: Int, words_addr: Int):
+    def tile_merge(k_val_i64: Int64, words_addr_i64: Int64):
+        var k_val = Int(k_val_i64)
+        var words_addr = Int(words_addr_i64)
         var sh = stack_allocation[SORT_TILE, Scalar[DType.uint64],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -1297,7 +1396,11 @@ def sort_topk_i32_gpu(
             t += BLOCK
 
     @parameter
-    def global_step(padded_: Int, k_val: Int, j_val: Int, words_addr: Int):
+    def global_step(padded__i64: Int64, k_val_i64: Int64, j_val_i64: Int64, words_addr_i64: Int64):
+        var padded_ = Int(padded__i64)
+        var k_val = Int(k_val_i64)
+        var j_val = Int(j_val_i64)
+        var words_addr = Int(words_addr_i64)
         var p = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if p >= (padded_ >> 1): return
         var i = _pair_index(p, j_val)
@@ -1309,7 +1412,9 @@ def sort_topk_i32_gpu(
             _u64(words_addr)[i + j_val] = a
 
     @parameter
-    def extract(n_: Int, words_addr: Int):
+    def extract(n__i64: Int64, words_addr_i64: Int64):
+        var n_ = Int(n__i64)
+        var words_addr = Int(words_addr_i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_:
             _i32(out_addr)[i] = Int32(Int(_u64(words_addr)[i] & UInt64(0xFFFFFFFF)))
@@ -1321,29 +1426,29 @@ def sort_topk_i32_gpu(
             while padded < n:
                 padded *= 2
             if padded <= SORT_TILE:
-                ctx.enqueue_function_experimental[small_sort](
-                    n, padded, desc_flag, grid_dim=1, block_dim=BLOCK)
+                ctx.enqueue_function[small_sort](
+                    Int64(n), Int64(padded), Int64(desc_flag), grid_dim=1, block_dim=BLOCK)
             else:
                 var words = ctx.enqueue_create_buffer[DType.uint64](padded)
                 var w = Int(words.unsafe_ptr())
-                ctx.enqueue_function_experimental[init_words](
-                    n, padded, desc_flag, w,
+                ctx.enqueue_function[init_words](
+                    Int64(n), Int64(padded), Int64(desc_flag), Int64(w),
                     grid_dim=ceildiv(padded, BLOCK), block_dim=BLOCK)
-                ctx.enqueue_function_experimental[tile_sort](
-                    w, grid_dim=padded // SORT_TILE, block_dim=BLOCK)
+                ctx.enqueue_function[tile_sort](
+                    Int64(w), grid_dim=padded // SORT_TILE, block_dim=BLOCK)
                 var k = 2 * SORT_TILE
                 while k <= padded:
                     var j = k >> 1
                     while j >= SORT_TILE:
-                        ctx.enqueue_function_experimental[global_step](
-                            padded, k, j, w,
+                        ctx.enqueue_function[global_step](
+                            Int64(padded), Int64(k), Int64(j), Int64(w),
                             grid_dim=ceildiv(padded >> 1, BLOCK), block_dim=BLOCK)
                         j >>= 1
-                    ctx.enqueue_function_experimental[tile_merge](
-                        k, w, grid_dim=padded // SORT_TILE, block_dim=BLOCK)
+                    ctx.enqueue_function[tile_merge](
+                        Int64(k), Int64(w), grid_dim=padded // SORT_TILE, block_dim=BLOCK)
                     k <<= 1
-                ctx.enqueue_function_experimental[extract](
-                    n, w, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+                ctx.enqueue_function[extract](
+                    Int64(n), Int64(w), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
                 ctx.synchronize()
                 _ = words^          # keep the scratch alive until the kernels are done
             ctx.synchronize()
@@ -1353,14 +1458,16 @@ def sort_topk_i32_gpu(
 @export
 def fill_i32_gpu(ptr_addr: Int, n: Int, value: Int) abi("C"):
     @parameter
-    def kernel(n_: Int, v: Int):
+    def kernel(n__i64: Int64, v_i64: Int64):
+        var n_ = Int(n__i64)
+        var v = Int(v_i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_: _i32(ptr_addr)[i] = Int32(v)
     try:
         if n > 0:
             var ctx = DeviceContext()
-            ctx.enqueue_function_experimental[kernel](
-                n, value, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), Int64(value), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
             ctx.synchronize()
     except: pass
 
@@ -1368,7 +1475,8 @@ def fill_i32_gpu(ptr_addr: Int, n: Int, value: Int) abi("C"):
 @export
 def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C"):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var shmem = stack_allocation[BLOCK, Scalar[DType.int32],
             address_space=AddressSpace.SHARED]()
         var tid = Int(thread_idx.x)
@@ -1389,8 +1497,8 @@ def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C"):
     try:
         if n > 0:
             var ctx = DeviceContext()
-            ctx.enqueue_function_experimental[kernel](
-                n, grid_dim=min(ceildiv(n, BLOCK), 1024), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), grid_dim=min(ceildiv(n, BLOCK), 1024), block_dim=BLOCK)
             ctx.synchronize()
     except: pass
 
@@ -1398,7 +1506,8 @@ def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C"):
 @export
 def group_mean_finish_f32_gpu(out_addr: Int, sums_addr: Int, cnts_addr: Int, n: Int) abi("C"):
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_:
             var c = _f32(cnts_addr)[i]
@@ -1406,8 +1515,8 @@ def group_mean_finish_f32_gpu(out_addr: Int, sums_addr: Int, cnts_addr: Int, n: 
     try:
         if n > 0:
             var ctx = DeviceContext()
-            ctx.enqueue_function_experimental[kernel](
-                n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+            ctx.enqueue_function[kernel](
+                Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
             ctx.synchronize()
     except: pass
 
@@ -1420,7 +1529,8 @@ def _scan_tiles(
     ctx: DeviceContext, out_addr: Int, in_addr: Int, sums_addr: Int, n: Int
 ) raises:
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var sh = stack_allocation[BLOCK, Scalar[DType.int32],
             address_space=AddressSpace.SHARED]()
         var t = Int(thread_idx.x)
@@ -1447,17 +1557,18 @@ def _scan_tiles(
         if base + 2 < n_: _i32(out_addr)[base + 2] = e + x0 + x1
         if base + 3 < n_: _i32(out_addr)[base + 3] = e + x0 + x1 + x2
         if t == BLOCK - 1: _i32(sums_addr)[Int(block_idx.x)] = sh[t]
-    ctx.enqueue_function_experimental[kernel](
-        n, grid_dim=ceildiv(n, SCAN_TILE), block_dim=BLOCK)
+    ctx.enqueue_function[kernel](
+        Int64(n), grid_dim=ceildiv(n, SCAN_TILE), block_dim=BLOCK)
 
 def _scan_add_offsets(ctx: DeviceContext, out_addr: Int, offs_addr: Int, n: Int) raises:
     @parameter
-    def kernel(n_: Int):
+    def kernel(n__i64: Int64):
+        var n_ = Int(n__i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_:
             _i32(out_addr)[i] += _i32(offs_addr)[i // SCAN_TILE]
-    ctx.enqueue_function_experimental[kernel](
-        n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
+    ctx.enqueue_function[kernel](
+        Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
 
 def _scan_level(
     ctx: DeviceContext, out_addr: Int, in_addr: Int, total_addr: Int, n: Int
@@ -1504,7 +1615,9 @@ def join_count_i32_gpu(
     table_size:  Int,
 ) abi("C"):
     @parameter
-    def count_right(n_r: Int, ts: Int):
+    def count_right(n_r_i64: Int64, ts_i64: Int64):
+        var n_r = Int(n_r_i64)
+        var ts = Int(ts_i64)
         var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if tid < n_r:
             var k = Int(_i32(right_addr)[tid])
@@ -1512,7 +1625,9 @@ def join_count_i32_gpu(
                 _ = Atomic.fetch_add(_i32(table_addr) + k, Int32(1))
 
     @parameter
-    def probe_left(n_l: Int, ts: Int):
+    def probe_left(n_l_i64: Int64, ts_i64: Int64):
+        var n_l = Int(n_l_i64)
+        var ts = Int(ts_i64)
         var tid = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if tid < n_l:
             var k = Int(_i32(left_addr)[tid])
@@ -1520,11 +1635,11 @@ def join_count_i32_gpu(
 
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[count_right](
-            n_right, table_size,
+        ctx.enqueue_function[count_right](
+            Int64(n_right), Int64(table_size),
             grid_dim=ceildiv(n_right, BLOCK), block_dim=BLOCK)
-        ctx.enqueue_function_experimental[probe_left](
-            n_left, table_size,
+        ctx.enqueue_function[probe_left](
+            Int64(n_left), Int64(table_size),
             grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass
@@ -1555,7 +1670,9 @@ def join_scatter_i32_gpu(
     table_size:       Int,
 ) abi("C"):
     @parameter
-    def scatter(n_l: Int, ts: Int):
+    def scatter(n_l_i64: Int64, ts_i64: Int64):
+        var n_l = Int(n_l_i64)
+        var ts = Int(ts_i64)
         var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
         if i < n_l:
             var k = Int(_i32(left_addr)[i])
@@ -1569,8 +1686,8 @@ def join_scatter_i32_gpu(
 
     try:
         var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[scatter](
-            n_left, table_size,
+        ctx.enqueue_function[scatter](
+            Int64(n_left), Int64(table_size),
             grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
     except: pass

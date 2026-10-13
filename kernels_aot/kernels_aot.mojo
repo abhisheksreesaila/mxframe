@@ -2,7 +2,7 @@
 MXFrame AOT CPU kernels — compiled once to libmxkernels_aot.so at build time.
 
 All kernels accept raw Int addresses (pointer-as-int) and cast to
-UnsafePointer[T, MutAnyOrigin] inside. This satisfies @export's C-ABI requirement
+Pointer[T, MutUntrackedOrigin] inside. This satisfies @export's C-ABI requirement
 while giving fully typed pointer access. N is always a runtime parameter so one
 compiled binary handles any row count — no MAX Graph JIT cold starts.
 
@@ -39,8 +39,9 @@ Build:
     mojo build -I kernels_aot --emit shared-lib kernels_aot/kernels_aot.mojo -o kernels_aot/libmxkernels_aot.so
 """
 
-from std.memory import UnsafePointer, alloc, memset_zero
-from std.algorithm import sync_parallelize
+from std.memory.alloc import unsafe_alloc
+from std.memory import Pointer, unsafe_memset_zero
+from max.algorithm import sync_parallelize
 from std.sys.info import num_physical_cores
 from std.ffi import external_call
 
@@ -70,46 +71,46 @@ comptime OP_MEAN = 4
 # ─────────────────────────────────────────────────────────────────────────────
 
 @always_inline
-def _f32(addr: Int) -> UnsafePointer[F32, MutAnyOrigin]:
-    return UnsafePointer[F32, MutAnyOrigin](unsafe_from_address=addr)
+def _f32(addr: Int) -> Pointer[F32, MutUntrackedOrigin]:
+    return Pointer[F32, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _f64(addr: Int) -> UnsafePointer[F64, MutAnyOrigin]:
-    return UnsafePointer[F64, MutAnyOrigin](unsafe_from_address=addr)
+def _f64(addr: Int) -> Pointer[F64, MutUntrackedOrigin]:
+    return Pointer[F64, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _i32(addr: Int) -> UnsafePointer[I32, MutAnyOrigin]:
-    return UnsafePointer[I32, MutAnyOrigin](unsafe_from_address=addr)
+def _i32(addr: Int) -> Pointer[I32, MutUntrackedOrigin]:
+    return Pointer[I32, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _i64(addr: Int) -> UnsafePointer[I64, MutAnyOrigin]:
-    return UnsafePointer[I64, MutAnyOrigin](unsafe_from_address=addr)
+def _i64(addr: Int) -> Pointer[I64, MutUntrackedOrigin]:
+    return Pointer[I64, MutUntrackedOrigin](unsafe_from_address=addr)
 
 @always_inline
-def _sp[T: DType](addr: Int) -> UnsafePointer[Scalar[T], MutAnyOrigin]:
-    return UnsafePointer[Scalar[T], MutAnyOrigin](unsafe_from_address=addr)
+def _sp[T: DType](addr: Int) -> Pointer[Scalar[T], MutUntrackedOrigin]:
+    return Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr)
 
 
 comptime MORSEL = 1 << 17            # rows per dynamically claimed morsel
 
 
 @always_inline
-def _fetch_add_i32(ptr: UnsafePointer[I32, MutAnyOrigin], val: I32) -> I32:
+def _fetch_add_i32(ptr: Pointer[I32, MutUntrackedOrigin], val: I32) -> I32:
     """Atomic add (monotonic) via llvm.atomicrmw; same MLIR pattern as _atomic.mojo."""
-    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](val)
     var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i32](p, v)
     return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[I32]](r)
 
 
 @always_inline
-def _claim(ctr: UnsafePointer[I32, MutAnyOrigin]) -> Int:
+def _claim(ctr: Pointer[I32, MutUntrackedOrigin]) -> Int:
     """Next unclaimed morsel index (work-queue pop)."""
     return Int(_fetch_add_i32(ctr, I32(1)))
 
 
-def _new_queue() -> UnsafePointer[I32, MutAnyOrigin]:
-    var ctr = alloc[I32](1)
+def _new_queue() -> Pointer[I32, MutUntrackedOrigin]:
+    var ctr = unsafe_alloc[I32](1)
     ctr[0] = I32(0)
     return ctr
 
@@ -181,7 +182,7 @@ def _ident[OP: Int, VT: DType, AT: DType]() -> Scalar[AT]:
 
 
 @always_inline
-def _val[OP: Int, VT: DType](values: UnsafePointer[Scalar[VT], MutAnyOrigin], i: Int) -> Scalar[VT]:
+def _val[OP: Int, VT: DType](values: Pointer[Scalar[VT], MutUntrackedOrigin], i: Int) -> Scalar[VT]:
     comptime if OP == OP_COUNT:
         return Scalar[VT](0)
     else:
@@ -190,7 +191,7 @@ def _val[OP: Int, VT: DType](values: UnsafePointer[Scalar[VT], MutAnyOrigin], i:
 
 @always_inline
 def _step[OP: Int, VT: DType, AT: DType](
-    acc: UnsafePointer[Scalar[AT], MutAnyOrigin],
+    acc: Pointer[Scalar[AT], MutUntrackedOrigin],
     g: Int,
     v: Scalar[VT],
 ):
@@ -224,9 +225,9 @@ def _combine[OP: Int, AT: DType](a: Scalar[AT], b: Scalar[AT]) -> Scalar[AT]:
 
 
 def _accumulate[OP: Int, VT: DType, AT: DType](
-    acc: UnsafePointer[Scalar[AT], MutAnyOrigin],
-    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
-    labels: UnsafePointer[I32, MutAnyOrigin],
+    acc: Pointer[Scalar[AT], MutUntrackedOrigin],
+    values: Pointer[Scalar[VT], MutUntrackedOrigin],
+    labels: Pointer[I32, MutUntrackedOrigin],
     lo: Int, hi: Int, G: Int,
 ):
     for i in range(lo, hi):
@@ -236,9 +237,9 @@ def _accumulate[OP: Int, VT: DType, AT: DType](
 
 
 def _group_agg[OP: Int, VT: DType, AT: DType](
-    dst: UnsafePointer[Scalar[AT], MutAnyOrigin],
-    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
-    labels: UnsafePointer[I32, MutAnyOrigin],
+    dst: Pointer[Scalar[AT], MutUntrackedOrigin],
+    values: Pointer[Scalar[VT], MutUntrackedOrigin],
+    labels: Pointer[I32, MutUntrackedOrigin],
     n_rows: Int,
     n_groups: Int,
     threads: Int,
@@ -258,8 +259,8 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
     if W <= 1 or n_rows == 0:
         # ---- serial: accumulate straight into `out` (mean: into a pair array) ----
         comptime if OP == OP_MEAN:
-            var tmp = alloc[Scalar[AT]](2 * G)
-            memset_zero(tmp, 2 * G)
+            var tmp = unsafe_alloc[Scalar[AT]](2 * G)
+            unsafe_memset_zero(tmp, 2 * G)
             _accumulate[OP, VT, AT](tmp, values, labels, 0, n_rows, G)
             for g in range(G):
                 var c = tmp[2 * g + 1]
@@ -272,15 +273,14 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
     else:
         # ---- per-worker private partial arrays, merged by group range ----
         var stride = ((K * G + 15) // 16) * 16 + 16          # pad: no false sharing
-        var part = alloc[Scalar[AT]](W * stride)
+        var part = unsafe_alloc[Scalar[AT]](W * stride)
         var ctr = _new_queue()
         var n_m = _n_morsels(n_rows)
 
-        @parameter
-        def scan(w: Int):
+        def scan(w: Int) {imm}:
             var p = part + w * stride
             comptime if OP == OP_MEAN:
-                memset_zero(p, 2 * G)
+                unsafe_memset_zero(p, 2 * G)
             else:
                 for g in range(G):
                     p[g] = init
@@ -294,7 +294,7 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
                     hi = n_rows
                 _accumulate[OP, VT, AT](p, values, labels, lo, hi, G)
 
-        sync_parallelize[scan](W)
+        sync_parallelize(scan, W)
         ctr.free()
 
         var MT = G // 4096
@@ -303,8 +303,7 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
         if MT < 1:
             MT = 1
 
-        @parameter
-        def merge(t: Int):
+        def merge(t: Int) {imm}:
             var g0 = (t * G) // MT
             var g1 = ((t + 1) * G) // MT
             for g in range(g0, g1):
@@ -321,7 +320,7 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
                         a = _combine[OP, AT](a, part[w * stride + g])
                     out[g] = a
 
-        sync_parallelize[merge](MT)
+        sync_parallelize(merge, MT)
         part.free()
 
 
@@ -418,8 +417,7 @@ def group_composite(
     var ctr = _new_queue()
     var n_m = _n_morsels(n_rows)
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         while True:
             var m = _claim(ctr)
             if m >= n_m:
@@ -431,7 +429,7 @@ def group_composite(
             for i in range(lo, hi):
                 out[i] = I64(k0[i])*s0 + I64(k1[i])*s1 + I64(k2[i])*s2 + I64(k3[i])*s3
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
     ctr.free()
 
 
@@ -452,8 +450,8 @@ def _big[VT: DType]() -> Scalar[VT]:
 
 
 def _msum_range[VT: DType](
-    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
-    mask: UnsafePointer[I32, MutAnyOrigin], lo: Int, hi: Int,
+    values: Pointer[Scalar[VT], MutUntrackedOrigin],
+    mask: Pointer[I32, MutUntrackedOrigin], lo: Int, hi: Int,
 ) -> F64:
     var zero = SIMD[DType.float64, SW](0)
     var a0 = zero
@@ -476,9 +474,9 @@ def _msum_range[VT: DType](
 
 
 def _mprod_range[VT: DType](
-    a: UnsafePointer[Scalar[VT], MutAnyOrigin],
-    b: UnsafePointer[Scalar[VT], MutAnyOrigin],
-    mask: UnsafePointer[I32, MutAnyOrigin], lo: Int, hi: Int,
+    a: Pointer[Scalar[VT], MutUntrackedOrigin],
+    b: Pointer[Scalar[VT], MutUntrackedOrigin],
+    mask: Pointer[I32, MutUntrackedOrigin], lo: Int, hi: Int,
 ) -> F64:
     var zero = SIMD[DType.float64, SW](0)
     var a0 = zero
@@ -501,8 +499,8 @@ def _mprod_range[VT: DType](
 
 
 def _mext_range[VT: DType, IS_MIN: Bool](
-    values: UnsafePointer[Scalar[VT], MutAnyOrigin],
-    mask: UnsafePointer[I32, MutAnyOrigin], lo: Int, hi: Int,
+    values: Pointer[Scalar[VT], MutUntrackedOrigin],
+    mask: Pointer[I32, MutUntrackedOrigin], lo: Int, hi: Int,
 ) -> Scalar[VT]:
     """Masked min (IS_MIN) or max; NaN values are ignored like the scalar loop."""
     var ident: Scalar[VT]
@@ -542,17 +540,16 @@ def _mext_range[VT: DType, IS_MIN: Bool](
     return r
 
 
-def _masked_sum[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
-                           values: UnsafePointer[Scalar[VT], MutAnyOrigin],
-                           mask: UnsafePointer[I32, MutAnyOrigin], n: Int, threads: Int):
+def _masked_sum[VT: DType](dst: Pointer[F64, MutUntrackedOrigin],
+                           values: Pointer[Scalar[VT], MutUntrackedOrigin],
+                           mask: Pointer[I32, MutUntrackedOrigin], n: Int, threads: Int):
     var out = dst
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
-    var parts = alloc[F64](W)
+    var parts = unsafe_alloc[F64](W)
     var ctr = _new_queue()
     var n_m = _n_morsels(n)
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         var acc: F64 = 0.0
         while True:
             var m = _claim(ctr)
@@ -562,7 +559,7 @@ def _masked_sum[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
             acc += _msum_range[VT](values, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
         parts[w] = acc
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
     ctr.free()
     var total: F64 = 0.0
     for w in range(W):
@@ -571,18 +568,17 @@ def _masked_sum[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
     parts.free()
 
 
-def _masked_sum_product[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
-                                   a: UnsafePointer[Scalar[VT], MutAnyOrigin],
-                                   b: UnsafePointer[Scalar[VT], MutAnyOrigin],
-                                   mask: UnsafePointer[I32, MutAnyOrigin], n: Int, threads: Int):
+def _masked_sum_product[VT: DType](dst: Pointer[F64, MutUntrackedOrigin],
+                                   a: Pointer[Scalar[VT], MutUntrackedOrigin],
+                                   b: Pointer[Scalar[VT], MutUntrackedOrigin],
+                                   mask: Pointer[I32, MutUntrackedOrigin], n: Int, threads: Int):
     var out = dst
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
-    var parts = alloc[F64](W)
+    var parts = unsafe_alloc[F64](W)
     var ctr = _new_queue()
     var n_m = _n_morsels(n)
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         var acc: F64 = 0.0
         while True:
             var m = _claim(ctr)
@@ -592,7 +588,7 @@ def _masked_sum_product[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
             acc += _mprod_range[VT](a, b, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
         parts[w] = acc
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
     ctr.free()
     var total: F64 = 0.0
     for w in range(W):
@@ -601,12 +597,12 @@ def _masked_sum_product[VT: DType](dst: UnsafePointer[F64, MutAnyOrigin],
     parts.free()
 
 
-def _masked_ext[VT: DType, IS_MIN: Bool](dst: UnsafePointer[F64, MutAnyOrigin],
-                                         values: UnsafePointer[Scalar[VT], MutAnyOrigin],
-                                         mask: UnsafePointer[I32, MutAnyOrigin], n: Int, threads: Int):
+def _masked_ext[VT: DType, IS_MIN: Bool](dst: Pointer[F64, MutUntrackedOrigin],
+                                         values: Pointer[Scalar[VT], MutUntrackedOrigin],
+                                         mask: Pointer[I32, MutUntrackedOrigin], n: Int, threads: Int):
     var out = dst
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
-    var parts = alloc[Scalar[VT]](W)
+    var parts = unsafe_alloc[Scalar[VT]](W)
     var ctr = _new_queue()
     var n_m = _n_morsels(n)
     var ident: Scalar[VT]
@@ -615,8 +611,7 @@ def _masked_ext[VT: DType, IS_MIN: Bool](dst: UnsafePointer[F64, MutAnyOrigin],
     else:
         ident = -_big[VT]()
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         var best = ident
         while True:
             var m = _claim(ctr)
@@ -632,7 +627,7 @@ def _masked_ext[VT: DType, IS_MIN: Bool](dst: UnsafePointer[F64, MutAnyOrigin],
                     best = x
         parts[w] = best
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
     ctr.free()
     var r = parts[0]
     for w in range(1, W):
@@ -699,8 +694,7 @@ def _gather[T: DType](out_addr: Int, values_addr: Int, indices_addr: Int, m: Int
     var ctr = _new_queue()
     var n_m = _n_morsels(m)
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         while True:
             var q = _claim(ctr)
             if q >= n_m:
@@ -712,7 +706,7 @@ def _gather[T: DType](out_addr: Int, values_addr: Int, indices_addr: Int, m: Int
             for i in range(lo, hi):
                 out[i] = values[Int(indices[i])]
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
     ctr.free()
 
 
@@ -789,16 +783,15 @@ def _to_key[KIND: Int, UT: DType](raw: Scalar[UT], desc: Bool) -> Scalar[UT]:
 
 
 def _radix_pass[UT: DType](
-    src_k: UnsafePointer[Scalar[UT], MutAnyOrigin],
-    dst_k: UnsafePointer[Scalar[UT], MutAnyOrigin],
-    src_i: UnsafePointer[I32, MutAnyOrigin],
-    dst_i: UnsafePointer[I32, MutAnyOrigin],
-    hist: UnsafePointer[I32, MutAnyOrigin],
+    src_k: Pointer[Scalar[UT], MutUntrackedOrigin],
+    dst_k: Pointer[Scalar[UT], MutUntrackedOrigin],
+    src_i: Pointer[I32, MutUntrackedOrigin],
+    dst_i: Pointer[I32, MutUntrackedOrigin],
+    hist: Pointer[I32, MutUntrackedOrigin],
     n: Int, W: Int, shift: Int,
 ) -> Bool:
     """One stable counting-sort pass on byte `shift`; False if it was skipped."""
-    @parameter
-    def count(w: Int):
+    def count(w: Int) {imm}:
         var lo = (n * w) // W
         var hi = (n * (w + 1)) // W
         var h = hist + w * RADIX
@@ -808,7 +801,7 @@ def _radix_pass[UT: DType](
             var d = Int((src_k[i] >> Scalar[UT](shift)) & Scalar[UT](0xFF))
             h[d] += I32(1)
 
-    sync_parallelize[count](W)
+    sync_parallelize(count, W)
 
     # digit totals: a digit holding every row makes the pass a no-op
     var run = 0
@@ -823,8 +816,7 @@ def _radix_pass[UT: DType](
             hist[w * RADIX + d] = I32(run)
             run += c
 
-    @parameter
-    def scatter(w: Int):
+    def scatter(w: Int) {imm}:
         var lo = (n * w) // W
         var hi = (n * (w + 1)) // W
         var h = hist + w * RADIX
@@ -836,47 +828,45 @@ def _radix_pass[UT: DType](
             dst_k[p] = k
             dst_i[p] = src_i[i]
 
-    sync_parallelize[scatter](W)
+    sync_parallelize(scatter, W)
     return True
 
 
 def _radix_sort[UT: DType](
-    out_idx: UnsafePointer[I32, MutAnyOrigin],
-    keys: UnsafePointer[Scalar[UT], MutAnyOrigin],
+    out_idx: Pointer[I32, MutUntrackedOrigin],
+    keys: Pointer[Scalar[UT], MutUntrackedOrigin],
     n: Int, threads: Int,
 ):
     """Stable sort of the mapped `keys` (destroyed); out_idx gets the row order."""
     comptime NBYTES = 4 if UT == DType.uint32 else 8
     var W = _pick_workers(n, threads, MIN_ROWS)
-    var k_a: UnsafePointer[Scalar[UT], MutAnyOrigin] = keys
-    var k_b: UnsafePointer[Scalar[UT], MutAnyOrigin] = alloc[Scalar[UT]](n)
-    var i_a: UnsafePointer[I32, MutAnyOrigin] = alloc[I32](n)
-    var i_b: UnsafePointer[I32, MutAnyOrigin] = out_idx
-    var hist: UnsafePointer[I32, MutAnyOrigin] = alloc[I32](W * RADIX)
+    var k_a: Pointer[Scalar[UT], MutUntrackedOrigin] = keys
+    var k_b: Pointer[Scalar[UT], MutUntrackedOrigin] = unsafe_alloc[Scalar[UT]](n)
+    var i_a: Pointer[I32, MutUntrackedOrigin] = unsafe_alloc[I32](n)
+    var i_b: Pointer[I32, MutUntrackedOrigin] = out_idx
+    var hist: Pointer[I32, MutUntrackedOrigin] = unsafe_alloc[I32](W * RADIX)
 
-    @parameter
-    def init(w: Int):
+    def init(w: Int) {imm}:
         for i in range((n * w) // W, (n * (w + 1)) // W):
             i_a[i] = I32(i)
 
-    sync_parallelize[init](W)
+    sync_parallelize(init, W)
 
     for p in range(NBYTES):
         if _radix_pass[UT](k_a, k_b, i_a, i_b, hist, n, W, p * 8):
-            var tk: UnsafePointer[Scalar[UT], MutAnyOrigin] = k_a
+            var tk: Pointer[Scalar[UT], MutUntrackedOrigin] = k_a
             k_a = k_b
             k_b = tk
-            var ti: UnsafePointer[I32, MutAnyOrigin] = i_a
+            var ti: Pointer[I32, MutUntrackedOrigin] = i_a
             i_a = i_b
             i_b = ti
 
     if i_a != out_idx:                          # result ended in the scratch buffer
-        @parameter
-        def copy_out(w: Int):
+        def copy_out(w: Int) {imm}:
             for i in range((n * w) // W, (n * (w + 1)) // W):
                 out_idx[i] = i_a[i]
 
-        sync_parallelize[copy_out](W)
+        sync_parallelize(copy_out, W)
     # free the two scratch index/key buffers (never `keys`' owner or out_idx)
     if i_a != out_idx:
         i_a.free()
@@ -895,16 +885,15 @@ def _sort_impl[KIND: Int, UT: DType](
     if n <= 0:
         return
     var raw = _sp[UT](keys_addr)
-    var mapped = alloc[Scalar[UT]](n)
+    var mapped = unsafe_alloc[Scalar[UT]](n)
     var desc = descending > 0
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
 
-    @parameter
-    def map_keys(w: Int):
+    def map_keys(w: Int) {imm}:
         for i in range((n * w) // W, (n * (w + 1)) // W):
             mapped[i] = _to_key[KIND, UT](raw[i], desc)
 
-    sync_parallelize[map_keys](W)
+    sync_parallelize(map_keys, W)
     _radix_sort[UT](_i32(out_addr), mapped, n, threads)
     mapped.free()
 
@@ -937,8 +926,7 @@ def unique_mask(out_addr: Int, keys_addr: Int, n: Int, threads: Int) abi("C"):
     var keys = _i32(keys_addr)
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         var lo = (n * w) // W
         var hi = (n * (w + 1)) // W
         if lo == 0:
@@ -947,7 +935,7 @@ def unique_mask(out_addr: Int, keys_addr: Int, n: Int, threads: Int) abi("C"):
         for i in range(lo, hi):
             out[i] = I32(1) if keys[i] != keys[i - 1] else I32(0)
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -963,16 +951,15 @@ def prefix_sum_count(offsets_addr: Int, mask_addr: Int, n: Int, threads: Int) ab
         offsets[0] = I32(0)
         return
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
-    var sums = alloc[I32](W)
+    var sums = unsafe_alloc[I32](W)
 
-    @parameter
-    def total(w: Int):
+    def total(w: Int) {imm}:
         var s = I32(0)
         for i in range((n * w) // W, (n * (w + 1)) // W):
             s += mask[i]
         sums[w] = s
 
-    sync_parallelize[total](W)
+    sync_parallelize(total, W)
     var run = I32(0)
     for w in range(W):
         var s = sums[w]
@@ -980,14 +967,13 @@ def prefix_sum_count(offsets_addr: Int, mask_addr: Int, n: Int, threads: Int) ab
         run += s
     offsets[n] = run
 
-    @parameter
-    def fill(w: Int):
+    def fill(w: Int) {imm}:
         var acc = sums[w]
         for i in range((n * w) // W, (n * (w + 1)) // W):
             offsets[i] = acc
             acc += mask[i]
 
-    sync_parallelize[fill](W)
+    sync_parallelize(fill, W)
     sums.free()
 
 
@@ -1006,13 +992,12 @@ def _filter_gather[T: DType](
     var offsets = _i32(offsets_addr)
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
 
-    @parameter
-    def work(w: Int):
+    def work(w: Int) {imm}:
         for i in range((n * w) // W, (n * (w + 1)) // W):
             if mask[i] == I32(1):
                 out[Int(offsets[i])] = values[i]
 
-    sync_parallelize[work](W)
+    sync_parallelize(work, W)
 
 
 @export
@@ -1050,9 +1035,9 @@ comptime MIN_KEYS_PER_OWNER = 4096
 
 
 def _build_index(
-    A: UnsafePointer[I32, MutAnyOrigin],          # (table_size + 2) entries
-    positions: UnsafePointer[I32, MutAnyOrigin],  # n_right entries (fill only)
-    right_keys: UnsafePointer[I32, MutAnyOrigin],
+    A: Pointer[I32, MutUntrackedOrigin],          # (table_size + 2) entries
+    positions: Pointer[I32, MutUntrackedOrigin],  # n_right entries (fill only)
+    right_keys: Pointer[I32, MutUntrackedOrigin],
     n_right: Int,
     table_size: Int,
     fill: Bool,
@@ -1066,16 +1051,14 @@ def _build_index(
     if Wk > cap:
         Wk = cap
     var Wz = _pick_workers(T + 2, threads, 1 << 18)
-    var tot = alloc[Int](Wk + 1)
+    var tot = unsafe_alloc[Int](Wk + 1)
 
-    @parameter
-    def zero(w: Int):
+    def zero(w: Int) {imm}:
         var lo = (w * (T + 2)) // Wz
         var hi = ((w + 1) * (T + 2)) // Wz
-        memset_zero(A + lo, hi - lo)
+        unsafe_memset_zero(A + lo, hi - lo)
 
-    @parameter
-    def count(w: Int):
+    def count(w: Int) {imm}:
         var kl = (w * T) // Wk
         var kh = ((w + 1) * T) // Wk
         for i in range(n_right):
@@ -1083,8 +1066,7 @@ def _build_index(
             if k >= kl and k < kh:
                 A[k + 1] += 1
 
-    @parameter
-    def scan1(w: Int):
+    def scan1(w: Int) {imm}:
         var kl = (w * T) // Wk
         var kh = ((w + 1) * T) // Wk
         var run = 0
@@ -1093,8 +1075,7 @@ def _build_index(
             A[k + 1] = I32(run)
         tot[w] = run
 
-    @parameter
-    def scan2(w: Int):
+    def scan2(w: Int) {imm}:
         var kl = (w * T) // Wk
         var kh = ((w + 1) * T) // Wk
         var base = I32(tot[w])          # exclusive offset of this range (set below)
@@ -1102,8 +1083,7 @@ def _build_index(
             for k in range(kl, kh):
                 A[k + 1] += base
 
-    @parameter
-    def fill_pass(w: Int):
+    def fill_pass(w: Int) {imm}:
         var kl = (w * T) // Wk
         var kh = ((w + 1) * T) // Wk
         var i = n_right - 1
@@ -1115,9 +1095,9 @@ def _build_index(
                 positions[Int(p)] = I32(i)
             i -= 1
 
-    sync_parallelize[zero](Wz)
-    sync_parallelize[count](Wk)
-    sync_parallelize[scan1](Wk)
+    sync_parallelize(zero, Wz)
+    sync_parallelize(count, Wk)
+    sync_parallelize(scan1, Wk)
     # turn per-range totals into exclusive bases, in place
     var run = 0
     for w in range(Wk):
@@ -1125,14 +1105,14 @@ def _build_index(
         tot[w] = run
         run += t
     A[T + 1] = I32(run)                 # sentinel: total valid right rows
-    sync_parallelize[scan2](Wk)
+    sync_parallelize(scan2, Wk)
     if fill:
-        sync_parallelize[fill_pass](Wk)
+        sync_parallelize(fill_pass, Wk)
     tot.free()
 
 
 @always_inline
-def _run_bounds(A: UnsafePointer[I32, MutAnyOrigin], k: Int, sh: Int) -> Int:
+def _run_bounds(A: Pointer[I32, MutUntrackedOrigin], k: Int, sh: Int) -> Int:
     """Number of right rows matching key k (0 for out-of-range keys is handled
     by the caller)."""
     return Int(A[k + sh + 1]) - Int(A[k + sh])
@@ -1154,16 +1134,15 @@ def join_count(
     var T = max_key + 1
     if T < 1:
         T = 1
-    var A = alloc[I32](T + 2)
-    var pos = alloc[I32](1)
+    var A = unsafe_alloc[I32](T + 2)
+    var pos = unsafe_alloc[I32](1)
     _build_index(A, pos, right_keys, n_right, T, False, threads)
     var W = _pick_workers(n_left, threads, MIN_ROWS)
 
     var ctr = _new_queue()
     var n_m = _n_morsels(n_left)
 
-    @parameter
-    def probe(w: Int):
+    def probe(w: Int) {imm}:
         while True:
             var q = _claim(ctr)
             if q >= n_m:
@@ -1179,7 +1158,7 @@ def join_count(
                 else:
                     match_counts[i] = I32(0)
 
-    sync_parallelize[probe](W)
+    sync_parallelize(probe, W)
     ctr.free()
     A.free()
     pos.free()
@@ -1202,16 +1181,15 @@ def join_count_left(
     var T = max_key + 1
     if T < 1:
         T = 1
-    var A = alloc[I32](T + 2)
-    var pos = alloc[I32](1)
+    var A = unsafe_alloc[I32](T + 2)
+    var pos = unsafe_alloc[I32](1)
     _build_index(A, pos, right_keys, n_right, T, False, threads)
     var W = _pick_workers(n_left, threads, MIN_ROWS)
 
     var ctr = _new_queue()
     var n_m = _n_morsels(n_left)
 
-    @parameter
-    def probe(w: Int):
+    def probe(w: Int) {imm}:
         while True:
             var q = _claim(ctr)
             if q >= n_m:
@@ -1227,7 +1205,7 @@ def join_count_left(
                     cnt = _run_bounds(A, k, 0)
                 match_counts[i] = I32(cnt if cnt > 0 else 1)
 
-    sync_parallelize[probe](W)
+    sync_parallelize(probe, W)
     ctr.free()
     A.free()
     pos.free()
@@ -1252,16 +1230,15 @@ def _join_scatter_impl[LEFT: Bool](
     var T = max_key + 1
     if T < 1:
         T = 1
-    var A = alloc[I32](T + 2)
-    var pos = alloc[I32](n_right if n_right > 0 else 1)
+    var A = unsafe_alloc[I32](T + 2)
+    var pos = unsafe_alloc[I32](n_right if n_right > 0 else 1)
     _build_index(A, pos, right_keys, n_right, T, True, threads)
     var W = _pick_workers(n_left, threads, MIN_ROWS)
 
     var ctr = _new_queue()
     var n_m = _n_morsels(n_left)
 
-    @parameter
-    def probe(w: Int):
+    def probe(w: Int) {imm}:
         while True:
             var q = _claim(ctr)
             if q >= n_m:
@@ -1287,7 +1264,7 @@ def _join_scatter_impl[LEFT: Bool](
                         left_out[base + j]  = I32(i)
                         right_out[base + j] = pos[s + j]
 
-    sync_parallelize[probe](W)
+    sync_parallelize(probe, W)
     ctr.free()
     A.free()
     pos.free()

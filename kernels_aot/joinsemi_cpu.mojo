@@ -21,16 +21,17 @@ Build:
         --emit shared-lib -o kernels_aot/libmxjoin_cpu.so
 """
 
-from std.memory import UnsafePointer, alloc, memset_zero, memcpy
-from std.algorithm import parallelize
+from std.memory.alloc import unsafe_alloc
+from std.memory import Pointer, unsafe_memset_zero, unsafe_memcpy
+from max.algorithm import parallelize
 from std.atomic import Atomic
 from std.ffi import external_call
 
 comptime MORSEL = 1 << 16
 comptime ABI_VERSION = 1
 
-comptime IP = UnsafePointer[Int32, MutAnyOrigin]
-comptime UP = UnsafePointer[UInt64, MutAnyOrigin]
+comptime IP = Pointer[Int32, MutUntrackedOrigin]
+comptime UP = Pointer[UInt64, MutUntrackedOrigin]
 
 
 @always_inline
@@ -46,7 +47,7 @@ def _up(addr: Int) -> UP:
 @always_inline
 def _fetch_or_u64(ptr: UP, val: UInt64):
     """Atomic OR (monotonic) via llvm.atomicrmw (bin_op 5 = or); same MLIR pattern as kernels_aot.mojo."""
-    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
     _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`5 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](p, v)
 
@@ -75,22 +76,21 @@ def mx_join_semi_select(
     var out = _ip(out_a)
     var T = max_key + 1
     var n_words = (T + 63) // 64
-    var bits = alloc[UInt64](n_words)
-    memset_zero(bits, n_words)
+    var bits = unsafe_alloc[UInt64](n_words)
+    unsafe_memset_zero(bits, n_words)
 
     var nb_m = (n_build + MORSEL - 1) // MORSEL
     var np_m = (n_probe + MORSEL - 1) // MORSEL
     var w_build = max(1, min(threads, nb_m))
     var w_probe = max(1, min(threads, np_m))
-    var ctr = alloc[Int64](2)
+    var ctr = unsafe_alloc[Int64](2)
     ctr[0] = 0
     ctr[1] = 0
-    var counts = alloc[Int32](np_m)
+    var counts = unsafe_alloc[Int32](np_m)
 
-    @parameter
-    def set_bits(w: Int):
+    def set_bits(w: Int) {imm}:
         while True:
-            var m = Int(Atomic[DType.int64].fetch_add(ctr, 1))
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(ctr, 1))
             if m >= nb_m:
                 break
             var lo = m * MORSEL
@@ -100,10 +100,9 @@ def mx_join_semi_select(
                 if k >= 0 and k < T:
                     _fetch_or_u64(bits + (k >> 6), UInt64(1) << UInt64(k & 63))
 
-    @parameter
-    def probe_bits(w: Int):
+    def probe_bits(w: Int) {imm}:
         while True:
-            var m = Int(Atomic[DType.int64].fetch_add(ctr + 1, 1))
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(ctr + 1, 1))
             if m >= np_m:
                 break
             var lo = m * MORSEL
@@ -123,12 +122,12 @@ def mx_join_semi_select(
         set_bits(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[set_bits](w_build)
+        parallelize(set_bits, w_build)
     if w_probe == 1:
         probe_bits(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[probe_bits](w_probe)
+        parallelize(probe_bits, w_probe)
 
     # compact the per-morsel slots (each starts at m * MORSEL) into one ascending run
     var total = 0

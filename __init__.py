@@ -200,7 +200,7 @@ __all__ = [
 
 def _background_warm():
     try:
-        import pyarrow.compute  # noqa: F401
+        pass  # pyarrow.compute is not preloaded: it loads on first use (_lazy_pc), ~25 ms the native paths never need
         from . import custom_ops, pipeline_exec, pipeline_kernels, coproc_fused, auto_mode, arrow_dict  # noqa: F401
         custom_ops._load_aot_kernels()
         pipeline_kernels._load_cpu()

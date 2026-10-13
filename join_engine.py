@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.compute as pc
+from ._lazy_pc import pc
 
 from .lazy_frame import (join_output_names, Scan, Filter, Project, Aggregate, Sort, Limit,
                          Distinct, Tail, Join)

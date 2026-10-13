@@ -58,7 +58,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
-import pyarrow.compute as pc
+from ._lazy_pc import pc
 
 from .lazy_expr import Expr
 

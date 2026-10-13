@@ -2,13 +2,13 @@
 # Build the Mojo kernel package from source.
 # Usage:  bash scripts/build_kernels.sh
 #
-# Produces  mxframe/kernels.mojopkg  from  mxframe/kernels/*.mojo
+# Produces  mxframe/kernels.mojoc  from  mxframe/kernels/*.mojo
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/kernels"
-OUT_PKG="$REPO_ROOT/kernels.mojopkg"
+OUT_PKG="$REPO_ROOT/kernels.mojoc"
 STAGE_DIR="$(mktemp -d)"
 
 cleanup() {

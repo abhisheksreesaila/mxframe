@@ -1,7 +1,7 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 # ── Fused composite group-key encoding ───────────────────────────────────────
@@ -71,7 +71,7 @@ def _group_composite_gpu(
     )
 
 
-@compiler.register("group_composite")
+@register("group_composite")
 struct GroupComposite:
     @staticmethod
     def execute[

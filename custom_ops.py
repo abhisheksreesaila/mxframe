@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Union
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, value_set as _value_set,\
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate
-import pyarrow.compute as pc
+from ._lazy_pc import pc
 import numpy as np
 import time as _time
 import threading as _threading
@@ -48,9 +48,9 @@ except Exception:
 
 # %% ../nbs/04_custom_ops.ipynb 4
 def _find_kernels_path() -> str:
-    """Prefer pre-compiled kernels.mojopkg over source; search relative to this file."""
+    """Prefer the pre-compiled kernels.mojoc (Mojo >= 1.1 package format) over source; search relative to this file."""
     _here = Path(__file__).resolve().parent
-    _pkg = _here / "kernels.mojopkg"
+    _pkg = _here / "kernels.mojoc"
     if _pkg.exists():
         return str(_pkg)
     _src = _here / "kernels"
@@ -58,7 +58,7 @@ def _find_kernels_path() -> str:
         return str(_src)
     # Last resort: raise a clear error instead of returning a stale hardcoded path.
     raise FileNotFoundError(
-        f"mxframe: could not locate kernels.mojopkg or kernels/ next to {__file__}. "
+        f"mxframe: could not locate kernels.mojoc or kernels/ next to {__file__}. "
         "The installed package is missing its Mojo kernels."
     )
 

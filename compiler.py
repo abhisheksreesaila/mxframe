@@ -9,7 +9,7 @@ __all__ = ['GraphCompiler']
 from typing import Any, Dict, List, Union
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
-import pyarrow.compute as pc
+from ._lazy_pc import pc
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
@@ -32,16 +32,22 @@ def _max_dtype(arr):
     """Map a numpy dtype to the corresponding MAX DType."""
     return getattr(DType, _NP_TO_MAX_NAMES.get(arr.dtype, "float32"))
 
-_PC_CMP_OPS = {
-    "gt":  pc.greater,
-    "ge":  pc.greater_equal,
-    "lt":  pc.less,
-    "le":  pc.less_equal,
-    "eq":  pc.equal,
-    "ne":  pc.not_equal,
-    "and": pc.and_kleene,       # SQL three-valued logic: false AND null = false, true OR null = true
-    "or":  pc.or_kleene,
-}
+class _LazyPcOps(dict):
+    """op -> pyarrow.compute function, looked up on use: pyarrow.compute loads on first use (_lazy_pc)."""
+    def __getitem__(self, op):
+        return getattr(pc, dict.__getitem__(self, op))
+
+
+_PC_CMP_OPS = _LazyPcOps({
+    "gt":  "greater",
+    "ge":  "greater_equal",
+    "lt":  "less",
+    "le":  "less_equal",
+    "eq":  "equal",
+    "ne":  "not_equal",
+    "and": "and_kleene",       # SQL three-valued logic: false AND null = false, true OR null = true
+    "or":  "or_kleene",
+})
 
 def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)

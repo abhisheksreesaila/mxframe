@@ -20,16 +20,17 @@ Build:
         --emit shared-lib -o kernels_aot/libmxgroupkeys_cpu.so
 """
 
-from std.memory import UnsafePointer, alloc
-from std.algorithm import parallelize
+from std.memory.alloc import unsafe_alloc
+from std.memory import Pointer
+from max.algorithm import parallelize
 from std.atomic import Atomic
 from std.ffi import external_call
 
 comptime MORSEL = 16384
 
-comptime IP = UnsafePointer[Int32, MutAnyOrigin]
-comptime LP = UnsafePointer[Int64, MutAnyOrigin]
-comptime BP = UnsafePointer[UInt8, MutAnyOrigin]
+comptime IP = Pointer[Int32, MutUntrackedOrigin]
+comptime LP = Pointer[Int64, MutUntrackedOrigin]
+comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 
 
 @always_inline
@@ -49,7 +50,7 @@ def _bp(addr: Int) -> BP:
 def _pass[T: DType, REMAP: Bool, FIRST: Bool](
     dst: IP, addr: Int, remap: IP, stride: Int32, size: Int32, err: IP, a: Int, b: Int,
 ):
-    var src = UnsafePointer[Scalar[T], MutAnyOrigin](unsafe_from_address=addr)
+    var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr)
     var mn = Int32(2147483647)
     var mx = Int32(-2147483648)
     for i in range(a, b):
@@ -116,19 +117,18 @@ def mx_groupkeys_composite(
     var nthreads = max(1, min(threads, morsels))
     # Per-worker presence tables, padded so two workers never share a cache line.
     var pstride = ((space + 63) // 64) * 64 + 128
-    var local = alloc[UInt8](nthreads * pstride)
-    var counter = alloc[Int64](1)
+    var local = unsafe_alloc[UInt8](nthreads * pstride)
+    var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
-    var err = alloc[Int32](1)
+    var err = unsafe_alloc[Int32](1)
     err[0] = 0
 
-    @parameter
-    def worker(wid: Int):
+    def worker(wid: Int) {imm}:
         var pl = local + wid * pstride
         for s in range(space):
             pl[s] = 0
         while True:
-            var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             var lo = m * MORSEL
             if lo >= n_rows:
                 break
@@ -158,7 +158,7 @@ def mx_groupkeys_composite(
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[worker](nthreads)
+        parallelize(worker, nthreads)
     for t in range(nthreads):
         var pl = local + t * pstride
         for s in range(space):
@@ -182,13 +182,12 @@ def mx_groupkeys_remap(ids_a: Int, n: Int, table_a: Int, threads: Int) abi("C") 
         return 0
     var morsels = (n + MORSEL - 1) // MORSEL
     var nthreads = max(1, min(threads, morsels))
-    var counter = alloc[Int64](1)
+    var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
 
-    @parameter
-    def worker(wid: Int):
+    def worker(wid: Int) {imm}:
         while True:
-            var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             var lo = m * MORSEL * 4
             if lo >= n:
                 break
@@ -200,7 +199,7 @@ def mx_groupkeys_remap(ids_a: Int, n: Int, table_a: Int, threads: Int) abi("C") 
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[worker](nthreads)
+        parallelize(worker, nthreads)
     counter.free()
     return 0
 
@@ -221,8 +220,7 @@ def mx_gk_touch(addr: Int, nbytes: Int, threads: Int) abi("C") -> Int:
     var p = _bp(addr)
     var nthreads = max(1, min(threads, chunks))
 
-    @parameter
-    def worker(c: Int):
+    def worker(c: Int) {imm}:
         var lo = c * CH
         var hi = min(lo + CH, nbytes)
         for i in range(lo, hi):
@@ -233,7 +231,7 @@ def mx_gk_touch(addr: Int, nbytes: Int, threads: Int) abi("C") -> Int:
             worker(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[worker](chunks, nthreads)
+        parallelize(worker, chunks, nthreads)
     return 0
 
 
@@ -259,18 +257,18 @@ comptime IK_CHUNK = 262144
 @always_inline
 def _load(addr: Int, w: Int, i: Int) -> Int:
     if w == 3:
-        return Int(UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=addr)[i])
+        return Int(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=addr)[i])
     if w == 2:
-        return Int(UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=addr)[i])
+        return Int(Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=addr)[i])
     if w == 0:
-        return Int(UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=addr)[i])
+        return Int(Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=addr)[i])
     if w == 1:
-        return Int(UnsafePointer[Int16, MutAnyOrigin](unsafe_from_address=addr)[i])
+        return Int(Pointer[Int16, MutUntrackedOrigin](unsafe_from_address=addr)[i])
     if w == 4:
-        return Int(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)[i])
+        return Int(Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)[i])
     if w == 5:
-        return Int(UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=addr)[i])
-    return Int(UnsafePointer[UInt32, MutAnyOrigin](unsafe_from_address=addr)[i])
+        return Int(Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=addr)[i])
+    return Int(Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=addr)[i])
 
 
 def _workers(n: Int, threads: Int) -> Int:
@@ -284,10 +282,9 @@ def mx_ik_range(src_a: Int, w: Int, n: Int, out_a: Int, threads: Int) abi("C") -
     if n <= 0:
         return -1
     var nth = _workers(n, threads)
-    var part = alloc[Int64](nth * 16)     # padded: two workers never share a cache line
+    var part = unsafe_alloc[Int64](nth * 16)     # padded: two workers never share a cache line
 
-    @parameter
-    def worker(wid: Int):
+    def worker(wid: Int) {imm}:
         var lo = (n * wid) // nth
         var hi = (n * (wid + 1)) // nth
         var mn = _load(src_a, w, lo)
@@ -303,7 +300,7 @@ def mx_ik_range(src_a: Int, w: Int, n: Int, out_a: Int, threads: Int) abi("C") -
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[worker](nth)
+        parallelize(worker, nth)
     var mn = part[0]
     var mx = part[1]
     for t in range(1, nth):
@@ -323,9 +320,9 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
     var tab = _ip(tab_a)
     var nth = _workers(n, threads)
     var nn = Int32(n)
-    var err = alloc[Int32](1)
+    var err = unsafe_alloc[Int32](1)
     err[0] = 0
-    var counter = alloc[Int64](1)
+    var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
     var chunks = (n + IK_CHUNK - 1) // IK_CHUNK
     if nth > 1:
@@ -333,16 +330,15 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
 
     if r <= IK_LOCAL_MAX and nth > 1:
         var pstride = ((r + 15) // 16) * 16 + 16
-        var local = alloc[Int32](nth * pstride)
+        var local = unsafe_alloc[Int32](nth * pstride)
 
-        @parameter
-        def wl(wid: Int):
+        def wl(wid: Int) {imm}:
             var t = local + wid * pstride
             for s in range(r):
                 t[s] = nn
             var bad = False
             while True:
-                var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
                 if m >= chunks:
                     break
                 var a = m * IK_CHUNK
@@ -357,7 +353,7 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
             if bad:
                 err[0] = 1
 
-        parallelize[wl](nth)
+        parallelize(wl, nth)
         for s in range(r):
             var best = nn
             for t in range(nth):
@@ -368,8 +364,7 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
         # shared table: initialise in parallel, then atomic min per row
         var ich = (r + IK_CHUNK - 1) // IK_CHUNK
 
-        @parameter
-        def wi(c: Int):
+        def wi(c: Int) {imm}:
             var a = c * IK_CHUNK
             var b = min(a + IK_CHUNK, r)
             for s in range(a, b):
@@ -379,13 +374,12 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
             for c in range(ich):
                 wi(c)
         else:
-            parallelize[wi](ich, nth)
+            parallelize(wi, ich, nth)
 
-        @parameter
-        def ws(wid: Int):
+        def ws(wid: Int) {imm}:
             var bad = False
             while True:
-                var m = Int(Atomic[DType.int64].fetch_add(counter, 1))
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
                 if m >= chunks:
                     break
                 var a = m * IK_CHUNK
@@ -398,14 +392,14 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
                     # plain read racing other workers' atomic mins is benign: the entry only ever
                     # decreases, a stale (larger) value just makes one redundant atomic min
                     if Int32(i) < tab[c]:
-                        _ = Atomic[DType.int32].min(tab + c, Int32(i))
+                        _ = Atomic[Scalar[DType.int32]].min(tab + c, Int32(i))
             if bad:
                 err[0] = 1
 
         if nth == 1:
             ws(0)
         else:
-            parallelize[ws](nth)
+            parallelize(ws, nth)
     var bad_rc = err[0]
     err.free()
     counter.free()
@@ -426,15 +420,13 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
 
-    @parameter
-    def zero(c: Int):
+    def zero(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         for i in range(a, b):
             scr[i] = 0
 
-    @parameter
-    def mark(c: Int):
+    def mark(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, r)
         for s in range(a, b):
@@ -442,10 +434,9 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
             if p < nn:
                 scr[Int(p)] = 1
 
-    var sums = alloc[Int64](chunks_n + 1)
+    var sums = unsafe_alloc[Int64](chunks_n + 1)
 
-    @parameter
-    def count(c: Int):
+    def count(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         var s = Int64(0)
@@ -453,8 +444,7 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
             s += Int64(scr[i])
         sums[c] = s
 
-    @parameter
-    def scan(c: Int):
+    def scan(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         var run = Int32(sums[c])
@@ -471,9 +461,9 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
         for c in range(chunks_n):
             count(c)
     else:
-        parallelize[zero](chunks_n, nth)
-        parallelize[mark](chunks_r, nth)
-        parallelize[count](chunks_n, nth)
+        parallelize(zero, chunks_n, nth)
+        parallelize(mark, chunks_r, nth)
+        parallelize(count, chunks_n, nth)
     var total = Int64(0)
     for c in range(chunks_n):
         var s = sums[c]
@@ -483,7 +473,7 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
         for c in range(chunks_n):
             scan(c)
     else:
-        parallelize[scan](chunks_n, nth)
+        parallelize(scan, chunks_n, nth)
     sums.free()
     return Int(total)
 
@@ -500,8 +490,7 @@ def mx_ik_finish(tab_a: Int, r: Int, n: Int, lo: Int, scr_a: Int, uniq_a: Int, f
     var nth = _workers(r, threads)
     var chunks_r = (r + IK_CHUNK - 1) // IK_CHUNK
 
-    @parameter
-    def fin(c: Int):
+    def fin(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, r)
         for s in range(a, b):
@@ -519,7 +508,7 @@ def mx_ik_finish(tab_a: Int, r: Int, n: Int, lo: Int, scr_a: Int, uniq_a: Int, f
             fin(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[fin](chunks_r, nth)
+        parallelize(fin, chunks_r, nth)
     return 0
 
 
@@ -531,8 +520,7 @@ def mx_ik_apply(src_a: Int, w: Int, n: Int, lo: Int, tab_a: Int, ids_a: Int, thr
     var nth = _workers(n, threads)
     var chunks = (n + IK_CHUNK - 1) // IK_CHUNK
 
-    @parameter
-    def work(c: Int):
+    def work(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         for i in range(a, b):
@@ -543,7 +531,7 @@ def mx_ik_apply(src_a: Int, w: Int, n: Int, lo: Int, tab_a: Int, ids_a: Int, thr
             work(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[work](chunks, nth)
+        parallelize(work, chunks, nth)
     return 0
 
 
@@ -568,8 +556,7 @@ def mx_ik_composite(n_keys: Int, addrs_a: Int, widths_a: Int, strides_a: Int, n:
     var nth = _workers(n, threads)
     var chunks = (n + IK_CHUNK - 1) // IK_CHUNK
 
-    @parameter
-    def work(c: Int):
+    def work(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         for i in range(a, b):
@@ -586,7 +573,7 @@ def mx_ik_composite(n_keys: Int, addrs_a: Int, widths_a: Int, strides_a: Int, n:
             work(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[work](chunks, nth)
+        parallelize(work, chunks, nth)
     return 0
 
 
@@ -596,11 +583,10 @@ def mx_ik_present(src_a: Int, w: Int, n: Int, lo: Int, r: Int, pres_a: Int, thre
     var pres = _bp(pres_a)
     var nth = _workers(n, threads)
     var chunks = (n + IK_CHUNK - 1) // IK_CHUNK
-    var err = alloc[Int32](1)
+    var err = unsafe_alloc[Int32](1)
     err[0] = 0
 
-    @parameter
-    def work(c: Int):
+    def work(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         var bad = False
@@ -618,7 +604,7 @@ def mx_ik_present(src_a: Int, w: Int, n: Int, lo: Int, r: Int, pres_a: Int, thre
             work(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[work](chunks, nth)
+        parallelize(work, chunks, nth)
     var bad_rc = err[0]
     err.free()
     if bad_rc != 0:
@@ -633,10 +619,9 @@ def mx_ik_prefix(pres_a: Int, r: Int, tab_a: Int, threads: Int) abi("C") -> Int:
     var tab = _ip(tab_a)
     var nth = _workers(r, threads)
     var chunks = (r + IK_CHUNK - 1) // IK_CHUNK
-    var sums = alloc[Int64](chunks + 1)
+    var sums = unsafe_alloc[Int64](chunks + 1)
 
-    @parameter
-    def count(c: Int):
+    def count(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, r)
         var s = Int64(0)
@@ -644,8 +629,7 @@ def mx_ik_prefix(pres_a: Int, r: Int, tab_a: Int, threads: Int) abi("C") -> Int:
             s += Int64(pres[i])
         sums[c] = s
 
-    @parameter
-    def scan(c: Int):
+    def scan(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, r)
         var run = Int32(sums[c])
@@ -655,7 +639,7 @@ def mx_ik_prefix(pres_a: Int, r: Int, tab_a: Int, threads: Int) abi("C") -> Int:
 
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[count](chunks, nth)
+        parallelize(count, chunks, nth)
     else:
         for c in range(chunks):
             count(c)
@@ -665,7 +649,7 @@ def mx_ik_prefix(pres_a: Int, r: Int, tab_a: Int, threads: Int) abi("C") -> Int:
         sums[c] = total
         total += s
     if nth > 1:
-        parallelize[scan](chunks, nth)
+        parallelize(scan, chunks, nth)
     else:
         for c in range(chunks):
             scan(c)
@@ -682,8 +666,7 @@ def mx_ik_uniq(pres_a: Int, tab_a: Int, r: Int, lo: Int, uniq_a: Int, threads: I
     var nth = _workers(r, threads)
     var chunks = (r + IK_CHUNK - 1) // IK_CHUNK
 
-    @parameter
-    def work(c: Int):
+    def work(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, r)
         for i in range(a, b):
@@ -692,7 +675,7 @@ def mx_ik_uniq(pres_a: Int, tab_a: Int, r: Int, lo: Int, uniq_a: Int, threads: I
 
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[work](chunks, nth)
+        parallelize(work, chunks, nth)
     else:
         for c in range(chunks):
             work(c)
@@ -708,10 +691,9 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
     var first = _ip(first_a)
     var nth = _workers(n, threads)
     var chunks = (n + IK_CHUNK - 1) // IK_CHUNK
-    var sums = alloc[Int64](chunks + 1)
+    var sums = unsafe_alloc[Int64](chunks + 1)
 
-    @parameter
-    def count(c: Int):
+    def count(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         var s = Int64(0)
@@ -720,8 +702,7 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
                 s += 1
         sums[c] = s
 
-    @parameter
-    def emit(c: Int):
+    def emit(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         var g = Int(sums[c]) - 1
@@ -734,7 +715,7 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
 
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize[count](chunks, nth)
+        parallelize(count, chunks, nth)
     else:
         for c in range(chunks):
             count(c)
@@ -744,7 +725,7 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
         sums[c] = total
         total += s
     if nth > 1:
-        parallelize[emit](chunks, nth)
+        parallelize(emit, chunks, nth)
     else:
         for c in range(chunks):
             emit(c)
@@ -774,21 +755,18 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
     var nth = _workers(max(n, nb), threads)
     var chunks_n = (n + IK_CHUNK - 1) // IK_CHUNK
     var chunks_b = (nb + IK_CHUNK - 1) // IK_CHUNK
-    var err = alloc[Int32](1)
+    var err = unsafe_alloc[Int32](1)
     err[0] = 0
-    var sums = alloc[Int64](chunks_b + 1)
+    var sums = unsafe_alloc[Int64](chunks_b + 1)
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
 
-    @parameter
-    def zero(c: Int):
+    def zero(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, nb + 1)
         for j in range(a, b):
             cnt[j] = 0
-
-    @parameter
-    def hist(c: Int):
+    def hist(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         var bad = False
@@ -801,22 +779,19 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
             if bk >= nb:
                 bad = True
                 continue
-            _ = Atomic[DType.int32].fetch_add(cnt + bk, 1)
+            _ = Atomic[Scalar[DType.int32]].fetch_add(cnt + bk, 1)
         if bad:
             err[0] = 1
 
     # bucket offsets: cnt[b] becomes the start of bucket b (exclusive prefix), cnt[nb] = n
-    @parameter
-    def bsum(c: Int):
+    def bsum(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, nb)
         var s = Int64(0)
         for j in range(a, b):
             s += Int64(cnt[j])
         sums[c] = s
-
-    @parameter
-    def bscan(c: Int):
+    def bscan(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, nb)
         var run = Int32(sums[c])
@@ -826,18 +801,16 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
             run += v
 
     # scatter rows; cnt[b] advances to the end of bucket b (= start of b + 1)
-    @parameter
-    def scatter(c: Int):
+    def scatter(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, n)
         for i in range(a, b):
             var bk = Int(keys[i] // st)
-            var p = Atomic[DType.int32].fetch_add(cnt + bk, 1)
+            var p = Atomic[Scalar[DType.int32]].fetch_add(cnt + bk, 1)
             rows[Int(p)] = Int32(i)
 
     # sort each bucket by (key, row); count its distinct keys into sums
-    @parameter
-    def sort_count(c: Int):
+    def sort_count(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, nb)
         var s = Int64(0)
@@ -864,8 +837,7 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
                     s += 1
         sums[c] = s
 
-    @parameter
-    def emit(c: Int):
+    def emit(c: Int) {imm}:
         var a = c * IK_CHUNK
         var b = min(a + IK_CHUNK, nb)
         var g = Int(sums[c]) - 1
@@ -879,29 +851,22 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
                     first[g] = Int32(p)
                 ids[p] = Int32(g)
 
-    def run_n[f: def(Int) capturing -> None](chunks: Int):
-        if nth > 1:
-            parallelize[f](chunks, nth)
-        else:
-            for c in range(chunks):
-                f(c)
-
-    run_n[zero]((nb + 1 + IK_CHUNK - 1) // IK_CHUNK)
-    run_n[hist](chunks_n)
+    _run_n(zero, (nb + 1 + IK_CHUNK - 1) // IK_CHUNK, nth)
+    _run_n(hist, chunks_n, nth)
     if err[0] != 0:
         err.free()
         sums.free()
         return -5
-    run_n[bsum](chunks_b)
+    _run_n(bsum, chunks_b, nth)
     var total = Int64(0)
     for c in range(chunks_b):
         var s = sums[c]
         sums[c] = total
         total += s
-    run_n[bscan](chunks_b)
+    _run_n(bscan, chunks_b, nth)
     cnt[nb] = Int32(n)
-    run_n[scatter](chunks_n)
-    run_n[sort_count](chunks_b)
+    _run_n(scatter, chunks_n, nth)
+    _run_n(sort_count, chunks_b, nth)
     if err[0] != 0:
         err.free()
         sums.free()
@@ -911,7 +876,15 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
         var s = sums[c]
         sums[c] = total
         total += s
-    run_n[emit](chunks_b)
+    _run_n(emit, chunks_b, nth)
     err.free()
     sums.free()
     return Int(total)
+
+
+def _run_n[F: def(Int) -> None](f: F, chunks: Int, nth: Int):
+    if nth > 1:
+        parallelize(f, chunks, nth)
+    else:
+        for c in range(chunks):
+            f(c)

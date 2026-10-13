@@ -1,7 +1,7 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
@@ -68,7 +68,7 @@ def _unique_mask_gpu(
     )
 
 
-@compiler.register("unique_mask")
+@register("unique_mask")
 struct UniqueMask:
     @staticmethod
     def execute[

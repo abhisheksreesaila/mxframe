@@ -153,6 +153,8 @@ Called via ctypes — no MAX Graph session, cold start ≈ 0 ms.
 
 ## 1 M rows — hot median of 3 runs *(v0.2.3, July 10 2026)*
 
+> ⚠️ **Not a fair comparison; kept only as history.** MXFrame's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
+
 All times in **milliseconds · lower is better**. 🟢 = faster than Polars baseline; **bold** = MXFrame wins.
 
 Q1, Q3, Q5–Q8, Q10, Q13, Q19 re-measured July 10 2026 (v0.2.3, join-cache cleared per run);
@@ -195,6 +197,8 @@ Headline GPU wins: **Q9 6.0×**, **Q12 6.8×**, **Q20 5.4×**, **Q3 2.7×**.
 ---
 
 ## 10 M rows — hot median of 3 runs *(April 20 2026)*
+
+> ⚠️ **Not a fair comparison; kept only as history.** MXFrame's result caches (joins, group encodings, input conversions) were cleared between queries but not between the warm-up and the timed runs, so the timed runs reused work done in the warm-up (hence Q9 in 0.6 ms); Polars and pandas recomputed every run. The data came from our own synthetic generator, with some tables smaller than the label. Use the user-felt and engine-only scoreboards above.
 
 All times in **milliseconds · lower is better**. At 10 M rows the join-heavy queries show the biggest wins.
 
