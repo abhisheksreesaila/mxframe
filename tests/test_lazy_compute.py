@@ -170,7 +170,7 @@ def test_shim_errors_like_pyarrow_compute(monkeypatch):
 def test_background_warm_up_loads_compute_and_the_native_library(tpch_tiny_dir):
     """The warm-up thread (on by default) loads pyarrow._compute and the executor library, so the
     first query imports neither, and it does not load pyarrow.compute."""
-    out = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "1"})
+    out = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "1", "MXFRAME_WARM": "1"})
     assert out["core_loaded"] and out["lib_loaded"]
     assert not (out["after_import"] or out["after_query"]) and out["native"] == "native"
     off = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "1", "MXFRAME_WARM": "0"})
