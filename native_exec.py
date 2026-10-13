@@ -56,7 +56,7 @@ def _path():
 
 
 def available() -> bool:
-    return _path() is not None
+    return _lib is not None or _path() is not None      # loaded: no filesystem lookup per call
 
 
 def _load():
@@ -219,21 +219,6 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             return _decline("derived group key without a name")
         keys.append(e._alias)
         derived[i] = e
-    ranges = {}
-    if derived:
-        # an integer expression key (TPC-H's order year): its range from one native min / max pass,
-        # then the executor groups by the program's value of it (directly addressed)
-        from .lazy_expr import Expr
-        probe = Aggregate(plan.input, [], [a for i, e in derived.items()
-                                           for a in (Expr("min", e).alias(f"lo{i}"), Expr("max", e).alias(f"hi{i}"))])
-        r = try_execute(compiler, probe, None, None, gpu_fallback)
-        if r is None:
-            return _decline("derived group key: range pass declined")
-        for i in derived:
-            lo, hi = r.column(f"lo{i}")[0].as_py(), r.column(f"hi{i}")[0].as_py()
-            if lo is None or hi is None or lo != int(lo) or hi != int(hi) or hi - lo + 1 > MAX_GROUPS:
-                return _decline("derived group key: not a small integer range")
-            ranges[i] = (int(lo), int(hi))
     sort_node, limit = None, -1
     for op in post_ops or []:
         if isinstance(op, Sort) and sort_node is None and limit < 0:
@@ -264,6 +249,20 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         key_slot[i] = slot
     outputs = prog.outputs[:n_user]
     names = [name for name, _, _ in outputs]
+    ranges = {}
+    if derived:
+        # an integer expression key (TPC-H's order year): its range from one native min / max pass,
+        # then the executor groups by the program's value of it (directly addressed)
+        probe = Aggregate(plan.input, [], [a for i, e in derived.items()
+                                           for a in (Expr("min", e).alias(f"lo{i}"), Expr("max", e).alias(f"hi{i}"))])
+        r = try_execute(compiler, probe, None, None, gpu_fallback)
+        if r is None:
+            return _decline("derived group key: range pass declined")
+        for i in derived:
+            lo, hi = r.column(f"lo{i}")[0].as_py(), r.column(f"hi{i}")[0].as_py()
+            if lo is None or hi is None or lo != int(lo) or hi != int(hi) or hi - lo + 1 > MAX_GROUPS:
+                return _decline("derived group key: not a small integer range")
+            ranges[i] = (int(lo), int(hi))
     sorts = []
     for name, desc in sort_by:
         if name in keys:

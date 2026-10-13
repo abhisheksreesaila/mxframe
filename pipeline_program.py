@@ -221,7 +221,7 @@ class PipelineProgram:
     n_instr: int
     identity: np.ndarray = field(default=None)  # float64 [n_slots] initial value per slot
     nan_slots: Dict[str, int] = field(default_factory=dict)  # min / max output -> hidden NaN-count slot
-    slot_int: List[bool] = field(default_factory=list)       # slot input is integer-valued (exact in float64)
+    slot_int: List[bool] = field(default_factory=list)       # slot input is integer-valued (whole numbers; exact while within 2^53)
     dict_concat: Dict[str, Dict[tuple, int]] = field(default_factory=dict)   # concat_dicts mode: name -> {dictionary key: offset}
 
     @property

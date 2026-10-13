@@ -102,3 +102,17 @@ def test_a_filter_that_keeps_nothing(native, monkeypatch):
                       .groupby("y").agg(col("v").sum().alias("s")))
     got, old, path, log = _run(plan, _table(n=20_000), monkeypatch)
     assert got.num_rows == old.num_rows == 0
+
+
+def test_expression_keys_too_wide_together_decline_in_the_executor(native, monkeypatch):
+    """Two expression keys ~3000 wide each: 9M combinations need the compacted path, which takes
+    only column keys; the executor declines (E_BAD_KEY) and the Python path answers (M2l review)."""
+    r = np.random.default_rng(8)
+    n = 30_000
+    t = pa.table({"a": A(r.integers(0, 3000, n).astype(np.int64)), "b": A(r.integers(0, 3000, n).astype(np.int64)),
+                  "v": A(r.random(n))})
+    plan = lambda t: (LazyFrame(t).with_columns((col("a") + lit(1)).alias("a1"), (col("b") * lit(2)).alias("b2"))
+                      .groupby("a1", "b2").agg(col("v").sum().alias("s")))
+    got, old, path, log = _run(plan, t, monkeypatch)
+    assert any("executor declined (code -11)" in r for r in log), log
+    _same_values(got, old, ordered=False)
