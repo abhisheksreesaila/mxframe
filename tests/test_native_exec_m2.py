@@ -1,0 +1,185 @@
+"""F-032 (M2a): leaves under a join are filtered in Mojo.
+
+A ``Filter*(Scan)`` leaf of a join runs as one native call (`mx_filter`): the predicate runs on the
+bytecode interpreter per morsel, in parallel, and only the surviving rows of the columns the join
+needs are written out (numbers, dates, decimals, strings; dictionary strings decoded on the way out).
+Dictionary columns io_parquet used to decode in full because the plan has a join are now decoded
+after the leaf's filter, on the surviving rows only, whichever path filters."""
+import importlib
+import sys
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pytest
+
+import mxframe.native_exec as nx
+from mxframe import LazyFrame, col, lit
+from mxframe.np_arrow import array as A
+
+SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+from tpch_user import spec  # noqa: E402
+from tpch_user.compare import compare_tables  # noqa: E402
+
+pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
+
+
+@pytest.fixture
+def filters(monkeypatch):
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    calls = []
+    real = nx._call_filter
+
+    def counting(*a):
+        calls.append(1)
+        return real(*a)
+
+    monkeypatch.setattr(nx, "_call_filter", counting)
+    return calls
+
+
+def _fact(n=120_000, seed=1, chunks=3):
+    """A fact table whose chunks each carry their own dictionary (Parquet row groups)."""
+    r = np.random.default_rng(seed)
+    parts = []
+    for words in (["MAIL", "SHIP", "AIR"], ["SHIP", "TRUCK", "MAIL", "RAIL"], ["AIR", "MAIL"])[:chunks]:
+        m = n // chunks
+        parts.append(pa.table({
+            "ok": A(r.integers(0, 5000, m).astype(np.int64)),
+            "mode": pa.DictionaryArray.from_arrays(A(r.integers(0, len(words), m).astype(np.int32)), A(words)),
+            "note": pa.array([f"n{i % 97}" for i in range(m)], type=pa.string()),
+            "ship": A(r.integers(8000, 10000, m).astype(np.int32)),
+            "shipd": pa.array(r.integers(8000, 10000, m).astype(np.int32), type=pa.date32()),
+            "price": pa.array(r.integers(100, 100000, m).astype(np.int64)).cast(pa.decimal128(19, 0)),
+            "qty": A(r.integers(1, 50, m).astype(np.float32)),
+            "v": A(r.random(m) * 100),
+        }))
+    return pa.concat_tables(parts)
+
+
+def _dim(seed=2):
+    r = np.random.default_rng(seed)
+    n = 5000
+    return pa.table({
+        "ok": A(np.arange(n, dtype=np.int64)),
+        "pri": pa.DictionaryArray.from_arrays(A(r.integers(0, 3, n).astype(np.int32)),
+                                              A(["1-URGENT", "2-HIGH", "3-LOW"])),
+        "day": A(r.integers(8000, 10000, n).astype(np.int32)),
+    })
+
+
+def _same(got, old):
+    assert got.schema == old.schema, (got.schema, old.schema)
+    assert got.num_rows == old.num_rows
+    for c in got.column_names:
+        g, o = got.column(c).to_pylist(), old.column(c).to_pylist()
+        if pa.types.is_floating(got.schema.field(c).type):
+            np.testing.assert_allclose(g, o, rtol=1e-12, err_msg=c)
+        else:
+            assert g == o, c
+
+
+def _both(plan, monkeypatch):
+    got = plan().compute(device="cpu")
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    old = plan().compute(device="cpu")
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    return got, old
+
+
+PLANS = {
+    "string predicate, aggregate on top": lambda f, d: (
+        LazyFrame(f).filter(col("mode").isin(["MAIL", "SHIP"]) & (col("qty") < lit(30.0)))
+        .join(LazyFrame(d).filter(col("day") < lit(9500)), on="ok")
+        .groupby("mode", "pri").agg(col("v").sum().alias("s"), col("v").count().alias("n")).sort("mode", "pri")),
+    "rows out (strings, dates, decimals)": lambda f, d: (
+        LazyFrame(f).filter((col("ship") >= lit(9900)) & (col("qty") < lit(40.0)))
+        .join(LazyFrame(d), on="ok").select("ok", "mode", "note", "shipd", "price", "pri", "qty")
+        .sort("ok", "shipd", "note", "qty")),
+    "dictionary predicate, string and dictionary keys above": lambda f, d: (
+        LazyFrame(f).filter(col("mode").startswith("S") | (col("mode") == lit("AIR")))
+        .join(LazyFrame(d), on="ok").groupby("note", "mode").agg(col("v").sum().alias("s")).sort("note", "mode")),
+    "nothing survives": lambda f, d: (
+        LazyFrame(f).filter(col("qty") > lit(1000.0)).join(LazyFrame(d), on="ok")
+        .groupby("pri").agg(col("v").sum().alias("s")).sort("pri")),
+}
+
+
+@pytest.mark.parametrize("name", list(PLANS))
+def test_leaf_filters_run_natively_with_the_same_answer(filters, monkeypatch, name):
+    f, d = _fact(), _dim()
+    got, old = _both(lambda: PLANS[name](f, d), monkeypatch)
+    assert len(filters) >= 1, nx.last_filter()
+    _same(got, old)
+
+
+def test_morsels_cross_chunks_with_string_outputs(filters, monkeypatch):
+    """Morsels of 64k rows span chunk boundaries: the string bytes of one morsel continue across
+    chunks (pass 2), and every chunk keeps its own dictionary."""
+    f = _fact(n=300_000, chunks=3)
+    d = _dim()
+    plan = lambda: (LazyFrame(f).filter(col("mode") != lit("TRUCK")).join(LazyFrame(d), on="ok")
+                    .groupby("note", "mode", "pri").agg(col("v").sum().alias("s"), col("v").count().alias("n"))
+                    .sort("note", "mode", "pri"))
+    got, old = _both(plan, monkeypatch)
+    assert len(filters) >= 1
+    _same(got, old)
+
+
+def test_nulls_in_a_leaf_fall_back(filters, monkeypatch):
+    f = _fact(n=9000)
+    v = f.column("v").to_pylist()
+    v[5] = None
+    f = f.set_column(f.schema.get_field_index("v"), "v", pa.array(v, type=pa.float64()))
+    plan = lambda: (LazyFrame(f).filter(col("qty") < lit(20.0)).join(LazyFrame(_dim()), on="ok")
+                    .groupby("pri").agg(col("v").sum().alias("s")).sort("pri"))
+    got = plan().compute(device="cpu")
+    assert len(filters) == 0 and "nulls" in (nx.last_filter()[1] or ""), nx.last_filter()
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    _same(got, plan().compute(device="cpu"))
+
+
+def test_deferred_dictionary_columns_are_decoded_after_the_filter(monkeypatch):
+    """On the Python path too: resolve_plan no longer decodes a join leaf's dictionary column in
+    full; the leaf decodes it after its filter, so only surviving rows are decoded."""
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    import mxframe.arrow_dict as ad
+    import mxframe.join_engine as je
+    sizes = []
+    real = ad.decode
+
+    def spy(x, *a, **k):
+        sizes.append(len(x))
+        return real(x, *a, **k)
+
+    monkeypatch.setattr(ad, "decode", spy)
+    f, d = _fact(), _dim()
+    out = (LazyFrame(f).filter(col("qty") < lit(5.0)).join(LazyFrame(d), on="ok")
+           .groupby("mode").agg(col("v").sum().alias("s")).sort("mode").compute(device="cpu"))
+    assert pa.types.is_string(out.schema.field("mode").type)
+    assert sizes and max(sizes) < f.num_rows // 5, sizes          # ~8% of the fact rows survive
+    assert je  # (imported for the patch target's module)
+
+
+@pytest.fixture(scope="module")
+def tpch(tmp_path_factory):
+    gen = importlib.import_module("gen_tpch_parquet")
+    d = tmp_path_factory.mktemp("tpch") / "tpch_sf0.01_exact"
+    gen.generate(0.01, str(d))
+    return str(d)
+
+
+def test_tpch_join_queries_filter_their_leaves_natively(tpch, filters, monkeypatch):
+    q_mx = importlib.import_module("tpch_user.q_mx")
+    q_duckdb = importlib.import_module("tpch_user.q_duckdb")
+    native = []
+    for q in range(1, 23):
+        before = len(filters)
+        got = q_mx.run_mem(q, q_mx.load_mem(q, tpch), "cpu")
+        if len(filters) > before:
+            native.append(q)
+        cmp = compare_tables(got.rename_columns(spec.OUTPUT[q]), q_duckdb.run(q, tpch), order_by=spec.ORDER_BY.get(q))
+        assert cmp.ok, (q, cmp.message)
+    for q in (3, 5, 10, 12, 14, 19):
+        assert q in native, (q, native)

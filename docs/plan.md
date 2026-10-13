@@ -353,8 +353,13 @@ Needs: F-030
 - Review round 1 (NEEDS WORK) fixed: int64 group keys past 2^53 sorted through float64 lost order on the hash path (now ranked exactly); hash-path groups came out in first appearance while the other paths used key order (now key order everywhere); stale docstring; `last_path()` stale when MXFRAME_NATIVE=0
 - Not done in M1 (deferred): typed int64 registers (sums are still float64; exact for TPC-H's magnitudes), cached C Data exports, parallel compaction / hashing (both are single-threaded loops today)
 
-## F-032 Mojo executor M2: hash joins [todo]
+## F-032 Mojo executor M2: hash joins [doing]
 Needs: F-031 · Replaces F-029
+- Profile first (SF1, warm code, fresh tables): Q12 spent 136 of 165 ms in the Python path's leaf filter (Arrow compute over 6M lineitem rows, 85 ms) and in decoding dictionary strings (`arrow_dict.decode`, 46 ms: `io_parquet.resolve_plan` decoded every dictionary column of every leaf when a plan has a join, before any filter). The join kernels themselves took ~10 ms. So M2 starts with the leaves, not the hash join
+- [x] M2a, native leaf filters: a `Filter*(Scan)` leaf of a join is one `mx_filter` call. The predicate runs on the bytecode interpreter per 64k-row morsel in parallel (pass 1: mask, counts and string bytes per morsel), then the surviving rows of the columns the join needs are written into one arena (pass 2: fixed-width values, utf8, dictionary strings decoded on the way out). Dictionary predicates read codes + chunk offset (dtype 5, as in M1). Declines (nulls, other types, plain-string predicates) run the old path. `tests/test_native_exec_m2.py`
+- [x] M2a, deferred decode: a dictionary column resolve_plan decoded only because the plan has a join stays encoded until its leaf's filter has run (`Scan._mx_decode_after`; `join_engine.leaf_table` decodes the surviving rows), on either path
+- [ ] M2a numbers (engine-only and user-felt, SF1 / SF10, against M1 and Polars)
+- [ ] dictionaries through the join gather (decode only joined rows, or never: the final executor reads codes); today an unfiltered leaf still decodes in full (Q12 `o_orderpriority`, 11 ms at SF1)
 - [ ] inner, semi, anti and left hash joins (build sink + probe operator), multi-pipeline plans
 - [ ] Q3, Q4, Q5, Q7, Q10, Q12, Q14, Q19 fully native; SF10 engine-only within 2x Polars
 
