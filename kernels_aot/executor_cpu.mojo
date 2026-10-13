@@ -816,9 +816,15 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             if cnt[g] > 0:
                 order[n_res] = Int64(g)
                 n_res += 1
-    if use_hash and n_res > 1:
-        # the hash table numbers groups by first appearance; emit them in key order like the dense
-        # and compacted paths (pandas' groupby default), which is also the ORDER BY tie-break
+    var has_str_key = False
+    for k in range(n_keys):
+        var kd = Int(K.kinds[k])
+        has_str_key = has_str_key or kd == K_DICT or kd == K_STR
+    if (use_hash or has_str_key) and n_res > 1:
+        # key order (pandas' groupby default), which is also the ORDER BY tie-break: the hash table
+        # numbers groups by first appearance, and string codes are entry ids (first appearance in
+        # the dictionaries), so those groups are reordered by the keys' values (strings by bytes);
+        # integer keys on the dense / compacted paths are already in order
         var kvals = unsafe_alloc[Float64](n_keys * n_res)
         for k in range(n_keys):
             _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, n_cols,

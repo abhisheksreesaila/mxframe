@@ -334,3 +334,23 @@ def test_sort_by_int64_keys_past_2_53_is_exact(native, monkeypatch):
         assert got.column("k").to_pylist() == want
     got = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).compute(device="cpu")
     assert got.column("k").to_pylist() == sorted(set(keys))
+
+
+@pytest.mark.parametrize("spread", ["dense", "hash"])
+def test_string_keys_come_out_in_byte_order(native, monkeypatch, spread):
+    """String keys are numbered by first appearance in the dictionaries; output is still in byte
+    order, on the dense path and on the hash path (a wide second key)."""
+    r = np.random.default_rng(4)
+    words = ["z", "m", "a", "b", "Zz", "ab", ""]
+    n = 7000
+    s_codes = r.integers(0, len(words), n).astype(np.int32)
+    second = r.integers(0, 3, n).astype(np.int64) * (1 << 41 if spread == "hash" else 1)
+    t = pa.table({"s": pa.DictionaryArray.from_arrays(A(s_codes), A(words)), "i": A(second),
+                  "v": A(np.ones(n))})
+    got = LazyFrame(t).groupby("s", "i").agg(col("v").sum().alias("n")).compute(device="cpu")
+    assert nx.last_path() == "native", nx.last_decline()
+    pairs = list(zip(got.column("s").to_pylist(), got.column("i").to_pylist()))
+    assert pairs == sorted(pairs)
+    plain = pa.table({"s": pa.array([words[c] for c in s_codes], type=pa.string()), "v": A(np.ones(n))})
+    got2 = LazyFrame(plain).groupby("s").agg(col("v").sum().alias("n")).limit(3).compute(device="cpu")
+    assert got2.column("s").to_pylist() == sorted(words)[:3]
