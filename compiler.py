@@ -319,7 +319,20 @@ class GraphCompiler:
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
         if op == "isin":
+            if isinstance(args[0], Expr) and args[0].op == "str_slice" and isinstance(args[1], (list, tuple)):
+                # str_slice(col, ...).isin([...]): one native pass, no sliced array (F-043)
+                from . import native_exec
+                src = GraphCompiler._eval_predicate(args[0].args[0], table)
+                got = native_exec.try_str_slice_in(src, args[0].args[1], args[0].args[2], list(args[1]))
+                if got is not None:
+                    return got
             col_arr = GraphCompiler._eval_predicate(args[0], table)
+            if isinstance(args[1], (list, tuple)):
+                # a utf8 column against string values: one native pass (F-043)
+                from . import native_exec
+                got = native_exec.try_str_slice_in(col_arr, 0, None, list(args[1]))
+                if got is not None:
+                    return got
             return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
         if op == "str_slice":
             from .custom_ops import _str_slice

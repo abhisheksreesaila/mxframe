@@ -121,3 +121,94 @@ def test_sparse_key_range_rows_in_key_order(native, monkeypatch):
     assert nx.last_path() == "native"
     m, k = got.column("m").to_numpy(), got.column("k").to_numpy()
     assert (np.lexsort((k, m)) == np.arange(len(k))).all()
+
+
+# F-043: group-bys with millions of groups. Too many groups for a partial table per worker: sums and
+# counts are added by all workers into the output atomically; compacted key ranges are encoded per
+# block (no group id per row). Inputs of at least 1M rows, keys unsorted and sorted.
+def _big(n=1_500_000, groups=600_000, sort=False, seed=11, keys="uniform"):
+    r = np.random.default_rng(seed)
+    k = r.integers(0, groups * 3, n).astype(np.int64)          # range 3x the groups: compacted
+    if keys == "zipf":                                           # a few groups take most rows
+        k = np.minimum(r.zipf(1.3, n), groups * 3 - 1).astype(np.int64)
+    elif keys == "one hot":
+        k = np.where(r.random(n) < 0.95, 7, k).astype(np.int64)
+    if sort:
+        k = np.sort(k)
+    return pa.table({
+        "k": A(k),
+        "m": A(r.integers(0, 3, n).astype(np.int32)),
+        "v": A(r.integers(1, 50, n).astype(np.float64)),
+        "d": A(r.integers(0, 100, n).astype(np.int32)),
+    })
+
+
+BIG = {
+    "sum and count": (lambda t: LazyFrame(t).groupby("k").agg(col("v").sum().alias("s"),
+                                                               col("v").count().alias("n")), False),
+    "mean, filter": (lambda t: LazyFrame(t).filter(col("d") < lit(70)).groupby("k")
+        .agg(col("v").mean().alias("a")), False),
+    "two keys, sum": (lambda t: LazyFrame(t).groupby("m", "k").agg(col("v").sum().alias("s")), False),
+    "sum, HAVING": (lambda t: LazyFrame(t).groupby("k").agg(col("v").sum().alias("s"))
+        .filter(col("s") > lit(60.0)), False),
+    "min / max": (lambda t: LazyFrame(t).groupby("k")
+        .agg(col("v").min().alias("lo"), col("v").max().alias("hi")), False),
+}
+
+
+@pytest.mark.parametrize("keys", ["uniform", "sorted", "zipf", "one hot"])
+@pytest.mark.parametrize("name", list(BIG))
+def test_millions_of_groups_match_the_python_path(native, monkeypatch, name, keys):
+    # 8 workers: the partial-table caps leave one, so the shared output (atomics behind a per-worker
+    # cache of groups) is used on any machine
+    monkeypatch.setenv("MXFRAME_CPU_THREADS", "8")
+    plan, ordered = BIG[name]
+    t = _big(sort=keys == "sorted", keys="uniform" if keys == "sorted" else keys)
+    got, old, path, decline = _both(plan, t, monkeypatch)
+    assert path == "native", decline
+    _same(got, old, ordered=ordered)
+
+
+def test_millions_of_groups_with_nan_values(native, monkeypatch):
+    monkeypatch.setenv("MXFRAME_CPU_THREADS", "8")
+    t = _big()
+    v = t.column("v").to_numpy().copy()
+    v[::97] = np.nan
+    t = t.set_column(t.schema.get_field_index("v"), "v", A(v))
+    plan = lambda t: LazyFrame(t).groupby("k").agg(col("v").sum().alias("s"), col("v").min().alias("lo"),
+                                                   col("v").max().alias("hi"))
+    got, old, path, decline = _both(plan, t, monkeypatch)
+    assert path == "native", decline
+    _same(got, old, ordered=False)
+
+
+# F-043: with an ORDER BY in the same call, hashed / string-keyed groups are no longer sorted into key
+# order first; the keys become the sort's last tie-break columns. Ties must still come out in key order.
+@pytest.mark.parametrize("having", [False, True])
+@pytest.mark.parametrize("limit", [None, 7, 50])
+@pytest.mark.parametrize("desc", [True, False])
+def test_order_by_ties_fall_back_to_key_order(native, monkeypatch, limit, desc, having):
+    r = np.random.default_rng(21)
+    n = 60_000
+    names = np.array([f"n{i:03d}" for i in range(40)], dtype=object)
+    t = pa.table({
+        "k": A((r.integers(0, 3000, n) * 1_000_003_917).astype(np.int64)),   # far apart: hash path
+        "s": pa.array(names[r.integers(0, 40, n)].tolist(), pa.string()),
+        "v": A(r.integers(0, 3, n).astype(np.float64)),                        # few values: many ties
+    })
+
+    q = LazyFrame(t).groupby("s", "k").agg(col("v").max().alias("m"))
+    if having:
+        q = q.filter(col("m") > lit(0.0))
+    q = q.sort("m", descending=[desc])
+    got = (q.limit(limit) if limit else q).compute(device="cpu")
+    assert nx.last_path() == "native", nx.last_decline()
+    best = {}
+    for s, k, v in zip(t.column("s").to_pylist(), t.column("k").to_pylist(), t.column("v").to_pylist()):
+        best[(s, k)] = max(best.get((s, k), v), v)
+    if having:
+        best = {g: m for g, m in best.items() if m > 0.0}
+    exp = sorted(best.items(), key=lambda kv: ((-kv[1] if desc else kv[1]), kv[0][0], kv[0][1]))
+    exp = exp[:limit] if limit else exp
+    rows = list(zip(got.column("s").to_pylist(), got.column("k").to_pylist(), got.column("m").to_pylist()))
+    assert rows == [(s, k, m) for (s, k), m in exp]

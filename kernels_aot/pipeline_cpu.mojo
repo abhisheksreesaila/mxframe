@@ -53,6 +53,7 @@ comptime VEC = 1024
 comptime MORSEL = 65536
 comptime MAX_REGS = 64
 comptime HDR = 16
+comptime SHARED_MIN_ROWS = 1 << 20           # shared atomic accumulation: inputs of at least this many rows
 comptime BUDGET_BYTES = 128 * 1024 * 1024   # all workers' partials: each worker fills and merges its own
 comptime MERGE_GROUPS = 16384
 
@@ -481,6 +482,97 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                     q[0] = max(q[0], r[j])
 
 
+comptime SC = 4096          # per-worker cache of groups in front of the shared output (power of 2)
+
+
+def _flush_slot(p: Prog, cv: FP, cl: LP, s: Int):
+    """Add cache slot s into the shared output (atomically) and empty it."""
+    var g = Int(cl[2 + s])
+    if g < 0:
+        return
+    var G = p.n_groups
+    var ov = _fp(Int(cl[0]))
+    var oc = _lp(Int(cl[1]))
+    _ = Atomic[Scalar[DType.int64]].fetch_add(oc + g, cl[2 + SC + s])
+    for a in range(p.n_aggs):
+        var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+        var x = cv[a * SC + s]
+        if kind == OP_AGG_SUM:
+            _ = Atomic[Scalar[DType.float64]].fetch_add(ov + a * G + g, x)
+        elif kind == OP_AGG_MIN:
+            _ = Atomic[Scalar[DType.float64]].min(ov + a * G + g, x)
+        else:
+            _ = Atomic[Scalar[DType.float64]].max(ov + a * G + g, x)
+    cl[2 + s] = -1
+
+
+def _flush_all(p: Prog, cv: FP, cl: LP):
+    for s in range(SC):
+        _flush_slot(p, cv, cl, s)
+
+
+def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
+    """Accumulate n compacted rows for the output shared by all workers (group counts too large for
+    a partial table per worker). Rows go through this worker's small direct-mapped cache of groups
+    (cl: out_vals and out_cnt addresses, SC tags, SC counts; cv: SC values per aggregate): a repeat
+    of a cached group is added locally, another group evicts the slot into the output with atomic
+    add / min / max. Skewed keys stay in the cache instead of every worker retrying atomics on one
+    hot group."""
+    var G = p.n_groups
+    var A = p.n_aggs
+    var st = cl + (2 + 2 * SC)                     # hits, rows seen, direct (1: cache bypassed)
+    if Int(st[2]) != 0:
+        # keys spread over many groups: the cache only adds evictions, every row goes straight in
+        var ov = _fp(Int(cl[0]))
+        var oc = _lp(Int(cl[1]))
+        for j in range(n):
+            var g = Int(gp[j])
+            if g < 0 or g >= G:
+                continue
+            _ = Atomic[Scalar[DType.int64]].fetch_add(oc + g, 1)
+            for a in range(A):
+                var ins = p.instr(p.n_pro + p.n_pred + p.n_body, a)
+                var kind = Int(ins[0])
+                var x = regs[Int(ins[2]) * VEC + j]
+                if kind == OP_AGG_SUM:
+                    _ = Atomic[Scalar[DType.float64]].fetch_add(ov + a * G + g, x)
+                elif kind == OP_AGG_MIN:
+                    _ = Atomic[Scalar[DType.float64]].min(ov + a * G + g, x)
+                else:
+                    _ = Atomic[Scalar[DType.float64]].max(ov + a * G + g, x)
+        return
+    for j in range(n):
+        var g = Int(gp[j])
+        if g < 0 or g >= G:
+            continue
+        var s = Int((UInt64(g) * 0x9E3779B97F4A7C15) >> 52)        # top 12 bits: SC slots
+        st[1] += 1
+        if Int(cl[2 + s]) != g:
+            _flush_slot(p, cv, cl, s)
+            cl[2 + s] = Int64(g)
+            cl[2 + SC + s] = 1
+            for a in range(A):
+                var ins = p.instr(p.n_pro + p.n_pred + p.n_body, a)
+                cv[a * SC + s] = regs[Int(ins[2]) * VEC + j]
+            continue
+        st[0] += 1
+        cl[2 + SC + s] += 1
+        for a in range(A):
+            var ins = p.instr(p.n_pro + p.n_pred + p.n_body, a)
+            var kind = Int(ins[0])
+            var x = regs[Int(ins[2]) * VEC + j]
+            var q = cv + (a * SC + s)
+            if kind == OP_AGG_SUM:
+                q[0] += x
+            elif kind == OP_AGG_MIN:
+                q[0] = min(q[0], x)
+            else:
+                q[0] = max(q[0], x)
+    if Int(st[1]) >= 65536 and Int(st[0]) * 16 < Int(st[1]):    # under 1/16 hits: keys spread out
+        _flush_all(p, cv, cl)
+        st[2] = 1
+
+
 def _init_partials(p: Prog, pv: FP, pc: LP):
     var G = p.n_groups
     var NL = p.nl
@@ -511,7 +603,7 @@ def _find_chunk(p: Prog, row: Int) -> Int:
     return lo
 
 
-def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
+def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool, shared: Bool](
     p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP, lo: Int, hi: Int, encode: E,
 ) -> Bool:
     """Rows [lo, hi) in VEC blocks: predicate, selection, body, accumulate. `keyed`: group ids of
@@ -550,7 +642,10 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool]
                                 gscratch[j] = gsrc[Int(sel[j])]
                         else:
                             gp = gsrc
-                _accumulate(p, regs, gp, nsel, pv, pc)
+                comptime if shared:
+                    _accumulate_shared(p, regs, gp, nsel, pv, pc)
+                else:
+                    _accumulate(p, regs, gp, nsel, pv, pc)
             i0 += n
         pos = stop
     return True
@@ -608,9 +703,15 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
         nthreads = min(nthreads, max(1, BUDGET_BYTES // per_worker))
         nthreads = min(nthreads, max(1, total // max(G, 1)))
     nthreads = max(nthreads, 1)
+    # Too many groups for a partial per worker (the caps above leave under half the workers): all
+    # workers update the output itself with atomic add / min / max; no partials, no merge
+    var want = max(1, min(threads if threads > 0 else 1, morsels))
+    var shared = has_gids and A > 0 and want >= 4 and nthreads * 2 <= want and total >= SHARED_MIN_ROWS
+    if shared:
+        nthreads = want
 
-    var pv_all = _fp(big_alloc(nthreads * max(A * G * NL, 1) * 8))
-    var pc_all = _lp(big_alloc(nthreads * max(G * NL, 1) * 8))
+    var pv_all = _fp(big_alloc(1 if shared else nthreads * max(A * G * NL, 1) * 8))
+    var pc_all = _lp(big_alloc(1 if shared else nthreads * max(G * NL, 1) * 8))
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
     var failed = unsafe_alloc[Int64](1)
@@ -626,7 +727,17 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
         var gscratch = unsafe_alloc[Int32](VEC)
         var pv = pv_all + wid * pv_stride
         var pc = pc_all + wid * pc_stride
-        _init_partials(p, pv, pc)
+        if shared:                                 # this worker's group cache (see _accumulate_shared)
+            pc = unsafe_alloc[Int64](2 + 2 * SC + 3)
+            pv = unsafe_alloc[Float64](max(A, 1) * SC)
+            pc[0] = Int64(Int(out_vals))
+            pc[1] = Int64(Int(out_cnt))
+            for s in range(SC):
+                pc[2 + s] = -1
+            for s in range(3):
+                pc[2 + 2 * SC + s] = 0
+        else:
+            _init_partials(p, pv, pc)
         # prologue (constants) once per worker
         _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
         while True:
@@ -634,9 +745,20 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
             var lo = start + m * MORSEL
             if lo >= end:
                 break
-            if not _process_range[keyed=keyed](p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode):
+            var ok = True
+            if shared:
+                ok = _process_range[keyed=keyed, shared=True](p, regs, sel, gscratch, pv, pc, lo,
+                                                              min(lo + MORSEL, end), encode)
+            else:
+                ok = _process_range[keyed=keyed, shared=False](p, regs, sel, gscratch, pv, pc, lo,
+                                                               min(lo + MORSEL, end), encode)
+            if not ok:
                 failed[0] = 1
                 break
+        if shared:
+            _flush_all(p, pv, pc)
+            pv.free()
+            pc.free()
         regs.free()
         sel.free()
         gscratch.free()
@@ -675,7 +797,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
                     c += q[l]
             out_cnt[g] = c
 
-    var merge_chunks = (G + MERGE_GROUPS - 1) // MERGE_GROUPS
+    var merge_chunks = 0 if shared else (G + MERGE_GROUPS - 1) // MERGE_GROUPS
     if nthreads > 1 and merge_chunks > 1:
         parallelize(merge, merge_chunks, nthreads)
     else:

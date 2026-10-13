@@ -878,15 +878,31 @@ def _semi_keys(plan) -> Optional[Tuple[Scan, list, List[str]]]:
     return scan, preds, [e.args[0] for e in exprs]
 
 
-def _semi_partner(comp, plan, bkeys) -> Optional[pa.Table]:
-    """The key rows of a semi-join partner (repeats and all), filtered natively; None: not one."""
+def _rows_of(plan) -> int:
+    """Rows of the table under a semi partner's filters (0 when it is not that shape)."""
+    sk = _semi_keys(plan)
+    return sk[0].table.num_rows if sk is not None else 0
+
+
+def _semi_partner(comp, plan, bkeys, reduce=None) -> Optional[pa.Table]:
+    """The key rows of a semi-join partner (repeats and all), filtered natively; None: not one.
+    ``reduce``: a callable giving (the other side's filtered key columns, their names), or None.
+    When given, the partner's filter also keeps only rows whose keys occur there (a runtime join
+    filter: TPC-H Q4's 38M late lineitems shrink to those of the 570k orders in range)."""
     sk = _semi_keys(plan)
     if sk is None or set(sk[2]) != set(bkeys) or len(sk[2]) != len(bkeys):
         return None
     scan, preds, _ = sk
+    from . import native_exec
+    keep = reduce() if reduce is not None else None
+    if keep is not None:
+        ktab, knames = keep
+        out = native_exec.try_filter(comp, scan.table, preds, set(bkeys),
+                                     [native_exec.Lookup(list(bkeys), ktab, list(knames), [], [], semi=True)])
+        if out is not None:
+            return out.select(list(bkeys))
     if not preds:
         return scan.table.select(list(bkeys))
-    from . import native_exec
     out = native_exec.try_filter(comp, scan.table, preds, set(bkeys))
     return None if out is None else out.select(list(bkeys))
 
@@ -957,7 +973,15 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need) -> Optional[pa.Tabl
         probe, bkeys = (ac, bc) if a == fact else (bc, ac)
         S = members[c]
         if len(S) == 1 and set(deliver[c]) <= set(bkeys):
-            keys = _semi_partner(comp, fl.leaves[c], bkeys)
+            reduce = None
+            if preds and _rows_of(fl.leaves[c]) > 2 * scan.table.num_rows:
+                # a partner much larger than the (filtered) fact: filter it by the fact's keys first
+                def reduce(probe=probe):
+                    kt = native_exec.try_filter(comp, scan.table, preds, set(probe))
+                    if kt is None or 2 * kt.num_rows > scan.table.num_rows:
+                        return None           # a weak fact filter: the lookup would cost more than it saves
+                    return kt.select(list(probe)), list(probe)
+            keys = _semi_partner(comp, fl.leaves[c], bkeys, reduce)
             if keys is not None:
                 for pk, bk in zip(probe, bkeys):
                     via_probe[(c, bk)] = pk

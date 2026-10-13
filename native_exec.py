@@ -76,6 +76,10 @@ def _load():
             lib.mx_distinct.restype = ctypes.c_int64
             lib.mx_count_distinct.argtypes = [ctypes.c_int64, ctypes.c_int64]
             lib.mx_count_distinct.restype = ctypes.c_int64
+            lib.mx_str_slice_in.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_str_slice_in.restype = ctypes.c_int64
+            lib.mx_str_slice.argtypes = [ctypes.c_int64, ctypes.c_int64]
+            lib.mx_str_slice.restype = ctypes.c_int64
             _lib = lib
     return _lib
 
@@ -517,6 +521,99 @@ def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str)
         keys = pc.cast(keys, pa.int32())
     _last.update(path="native", decline=None)
     return pa.table({key: keys, name: cnts})
+
+
+SMAGIC = 0x4D585333
+SLICE_IN_MAX_VALUES = 32
+
+
+def try_str_slice_in(arr, offset: int, length, values) -> Optional[pa.Array]:
+    """``str_slice(arr, offset, length).isin(values)`` in one native pass (F-043): no sliced string
+    array is built. utf8 (int32 offsets) without nulls, string values; None otherwise (the caller
+    uses Arrow). Characters are code points, as in Arrow's utf8_slice_codeunits."""
+    if not enabled() or not available() or not isinstance(arr, (pa.Array, pa.ChunkedArray)):
+        return None
+    # each row is compared with each value: past a few dozen values Arrow's hash set wins
+    if len(values) > SLICE_IN_MAX_VALUES:
+        return None
+    if arr.type != pa.string() or arr.null_count or not all(isinstance(v, str) for v in values):
+        return None
+    if isinstance(arr, pa.ChunkedArray):
+        parts = [try_str_slice_in(c, offset, length, values) for c in arr.chunks]
+        if any(x is None for x in parts):
+            return None
+        return pa.chunked_array(parts, type=pa.bool_())
+    import numpy as np
+    n = len(arr)
+    if n == 0:                                   # (pa.array([]) would import pandas)
+        return pa.Array.from_buffers(pa.bool_(), 0, [None, pa.py_buffer(b"")])
+    enc = [v.encode("utf-8") for v in values]
+    data = b"".join(enc) or b"\0"
+    voff = np.zeros(len(enc) + 1, dtype=np.int64)
+    voff[1:] = np.cumsum([len(e) for e in enc])
+    dbuf = ctypes.create_string_buffer(data, len(data))
+    out = np.empty(n, dtype=np.uint8)
+    st = (ctypes.c_int64 * 10)()
+    arr._export_to_c(ctypes.addressof(st))
+    try:
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 9)(SMAGIC, ctypes.addressof(st), offset, -1 if length is None else length,
+                                 len(enc), ctypes.addressof(dbuf), voff.ctypes.data, out.ctypes.data,
+                                 default_threads(n))
+        rc = _load().mx_str_slice_in(ctypes.addressof(P), 0)
+    finally:
+        if st[8]:
+            _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return None
+    bits = np.packbits(out.view(bool), bitorder="little")
+    return pa.Array.from_buffers(pa.bool_(), n, [None, pa.py_buffer(bits)])
+
+
+LMAGIC = 0x4D58534C
+
+
+def try_str_slice(arr, offset: int, length) -> Optional[pa.Array]:
+    """``str_slice(arr, offset, length)`` as a new utf8 array in one native pass (F-043): code points,
+    like Arrow's utf8_slice_codeunits. utf8 (int32 offsets); nulls stay null. None otherwise."""
+    if not enabled() or not available() or not isinstance(arr, (pa.Array, pa.ChunkedArray)):
+        return None
+    if arr.type != pa.string():
+        return None
+    if isinstance(arr, pa.ChunkedArray):
+        parts = [try_str_slice(c, offset, length) for c in arr.chunks]
+        if any(x is None for x in parts):
+            return None
+        return pa.chunked_array(parts, type=pa.string())
+    n = len(arr)
+    if n == 0:
+        return pa.Array.from_buffers(pa.string(), 0, [None, pa.py_buffer(bytes(4)), pa.py_buffer(b"")])
+    st = (ctypes.c_int64 * 10)()
+    arr._export_to_c(ctypes.addressof(st))
+    try:
+        from .pipeline_kernels import default_threads
+        P = (ctypes.c_int64 * 5)(LMAGIC, ctypes.addressof(st), offset, -1 if length is None else length,
+                                 default_threads(n))
+        O = (ctypes.c_int64 * 2)()
+        lib = _load()
+        rc = lib.mx_str_slice(ctypes.addressof(P), ctypes.addressof(O))
+    finally:
+        if st[8]:
+            _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return None
+    total, base = int(O[0]), int(O[1])
+    owner = _Arena(lib, base)
+    obytes = ((n + 1) * 4 + 7) // 8 * 8
+    offs = pa.foreign_buffer(base, (n + 1) * 4, base=owner)
+    data = pa.foreign_buffer(base + obytes, max(total, 1), base=owner)
+    out = pa.Array.from_buffers(pa.string(), n, [None, offs, data])
+    if not arr.null_count:
+        return out
+    if arr.offset == 0:                            # the input's validity bitmap, as it is
+        return pa.Array.from_buffers(pa.string(), n, [arr.buffers()[0], offs, data], null_count=arr.null_count)
+    from ._lazy_pc import pc
+    return pc.if_else(pc.is_valid(arr), out, pa.scalar(None, pa.string()))
 
 
 # ── M2: native leaf filter (Filter*(Scan) under a join) ─────────────────────────────────────

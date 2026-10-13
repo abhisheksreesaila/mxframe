@@ -437,10 +437,10 @@ Needs: none · Pre-existing, found by the F-041 review
 
 ## F-043 SF10: the four queries DuckDB still wins, with general fixes only [todo]
 Needs: none · Agreed 2026-10-13 (Abhishek: focus on these, no TPC-H-only tuning)
-- [ ] Q18 (697 vs 395 ms): a group-by with millions of groups runs on one worker (each worker's partial table would be GBs, so the 128 MB budget leaves one); any query with that many groups is affected
-- [ ] Q4 (224 vs 170 ms): the semi join's two native filter scans
-- [ ] Q10 (187 vs 188 ms): the multi-key group-by with string keys
-- [ ] Q22 (148 vs 117 ms): the anti join runs in NumPy (`has_partner`) plus ~68 ms of Arrow compute calls
+- [x] Q18 (697 -> ~420 ms, DuckDB 395): too many groups for a partial table per worker -> all workers share the output, updated with atomic add / min / max behind a per-worker 4096-group cache (skewed keys stay local; under 1/16 hits it goes direct); compacted keys are encoded per block (no group id per row, no remap); survivors, HAVING and key decoding in parallel. Non-TPC-H: 20M rows / 5M groups random sum 608 -> ~390 ms, max 869 -> ~500, two keys 1181 -> ~620; skewed 8M rows: uniform 173 -> 61, hot key 22% 150 -> 57, 95% 29 -> 21
+- [x] Q4 (224 -> ~120-140 ms, DuckDB 170): runtime join filter: a semi partner more than 2x the fact's rows is filtered through the fact's filtered keys first (skipped when the fact keeps over half its rows)
+- [x] Q10 (187 -> ~170 ms, DuckDB 188): with an ORDER BY in the same call, hashed / string-keyed groups are not sorted into key order first; the keys are the sort's last tie-break columns (group-by 88 -> 48 ms)
+- [x] Q22 (148 -> ~94 ms, DuckDB 117): native Mojo `str_slice` (new utf8 array) and utf8 `isin` up to 32 values (code points like Arrow)
 - [ ] each change helps the general shape (checked on a non-TPC-H case), and no SF1 / SF10 query gets slower
 
 ## F-044 Random queries on the TPC-H data: performance beyond the 22 [todo]
@@ -448,6 +448,10 @@ Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
 - [ ] a seeded generator of random queries over the TPC-H tables (filters, group-bys on random keys, joins, aggregates, sorts / limits, DISTINCT, count distinct), each run in MXFrame, Polars and DuckDB the engine-only way
 - [ ] every MXFrame result checked against DuckDB; any mismatch or crash is a bug ticket
 - [ ] report: per-shape timing against Polars and DuckDB, how many run natively vs fall back, and where MXFrame is slow; also the 22 queries on shuffled tables
+
+## F-045 ORDER BY ties outside the native executor [todo]
+Needs: none · Found by the F-043 review
+- [ ] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks)
 
 ## F-039 The optimization story: README with visuals [doing]
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13

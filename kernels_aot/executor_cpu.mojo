@@ -979,92 +979,130 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                             G, 0, n_rows, Int(vals), Int(cnt), threads, enc)
         if rc == -5:
             rc = E_BAD_KEY
-    else:
-        # ── sparse keys (hash) or compacted composite codes: one group-id array, then one
-        #    interpreter pass
-        var gids = unsafe_alloc[Int32](max(n_rows, 1))
-        var counter = unsafe_alloc[Int64](1)
-        counter[0] = 0
-        var bad_key = unsafe_alloc[Int64](1)
-        bad_key[0] = 0
+    elif compact:
+        # ── compacted composite codes, keyed: one pass marks the codes present (encoded a morsel at
+        #    a time into a worker buffer, no n_rows-sized group-id array), they are numbered in code
+        #    order, and the interpreter encodes the rows that pass its predicate per block and maps
+        #    them through that numbering
+        var pres = _bp(big_alloc(D))
+        var cc = unsafe_alloc[Int64](1)
+        var bad = unsafe_alloc[Int64](1)
+        bad[0] = 0
+        var cblocks = max(1, min(nt * 4, (D + 65535) // 65536))
+        cc[0] = 0
 
-        def keys_worker(wid: Int) {imm}:
+        def zero_pres(wid: Int) {imm}:
             while True:
-                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(cc, 1))
+                if b >= cblocks:
+                    break
+                var c0 = b * D // cblocks
+                unsafe_memset_zero(pres + c0, (b + 1) * D // cblocks - c0)
+
+        _par(zero_pres, nt)
+        cc[0] = 0
+
+        def mark(wid: Int) {imm}:
+            var buf = unsafe_alloc[Int32](MORSEL)
+            while True:
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(cc, 1))
                 var lo = m * MORSEL
                 if lo >= n_rows:
                     break
-                if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, min(lo + MORSEL, n_rows), gids):
-                    bad_key[0] = 1
+                var hi = min(lo + MORSEL, n_rows)
+                if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, hi,
+                                    _ip(Int(buf) - lo * 4)):      # buf[i - lo] for row i
+                    bad[0] = 1
+                    continue
+                for i in range(hi - lo):
+                    pres[Int(buf[i])] = 1
+            buf.free()
 
-        if use_hash:
-            # sparse key tuples: a hash table numbers the groups in order of first appearance
-            for k in range(n_keys):
-                kv[k] = Int64(Int(unsafe_alloc[Int64](max(n_rows, 1))))
-            var ng = _hash_groups(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, n_chunks, gids, kv, n_rows)
-            if ng < 0:
-                bad_key[0] = 1
-            else:
-                G = max(ng, 1)
-                vals.free()
-                cnt.free()
-                vals = unsafe_alloc[Float64](max(n_slots * G, 1))
-                cnt = unsafe_alloc[Int64](G)
-                if nt > 1:
-                    _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        elif nt > 1:
-            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(keys_worker, nt)
+        _par(mark, nt)
+        if Int(bad[0]) != 0:
+            rc = E_BAD_KEY
         else:
-            keys_worker(0)
-        counter.free()
-        if Int(bad_key[0]) == 0 and compact:
-            # only the combinations that occur become groups, numbered in composite (key) order
-            var pres = unsafe_alloc[UInt8](D)
-            unsafe_memset_zero(pres, D)
-            for i in range(n_rows):
-                pres[Int(gids[i])] = 1
-            var dense = unsafe_alloc[Int32](D)
+            var bcount = unsafe_alloc[Int64](cblocks + 1)
+            cc[0] = 0
+
+            def count_present(wid: Int) {imm}:
+                while True:
+                    var b = Int(Atomic[Scalar[DType.int64]].fetch_add(cc, 1))
+                    if b >= cblocks:
+                        break
+                    var k = 0
+                    for c in range(b * D // cblocks, (b + 1) * D // cblocks):
+                        k += Int(pres[c])
+                    bcount[b] = Int64(k)
+
+            _par(count_present, nt)
             var ng = 0
-            for c in range(D):
-                if pres[c] != 0:
-                    dense[c] = Int32(ng)
-                    ng += 1
+            for b in range(cblocks):
+                var k = Int(bcount[b])
+                bcount[b] = Int64(ng)
+                ng += k
+            var dense = _ip(big_alloc(D * 4))
             comp.free()
             comp = unsafe_alloc[Int64](max(ng, 1))
-            for c in range(D):
-                if pres[c] != 0:
-                    comp[Int(dense[c])] = Int64(c)
-            pres.free()
-            var counter2 = unsafe_alloc[Int64](1)
-            counter2[0] = 0
+            cc[0] = 0
 
-            def remap_worker(wid: Int) {imm}:
+            def number(wid: Int) {imm}:
                 while True:
-                    var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter2, 1))
-                    var lo = m * MORSEL
-                    if lo >= n_rows:
+                    var b = Int(Atomic[Scalar[DType.int64]].fetch_add(cc, 1))
+                    if b >= cblocks:
                         break
-                    for i in range(lo, min(lo + MORSEL, n_rows)):
-                        gids[i] = dense[Int(gids[i])]
+                    var at = Int(bcount[b])
+                    for c in range(b * D // cblocks, (b + 1) * D // cblocks):
+                        if pres[c] != 0:
+                            dense[c] = Int32(at)
+                            comp[at] = Int64(c)
+                            at += 1
 
-            if nt > 1:
-                parallelize(remap_worker, nt)
-            else:
-                remap_worker(0)
-            counter2.free()
-            dense.free()
+            _par(number, nt)
+            bcount.free()
             G = max(ng, 1)
             vals.free()
             cnt.free()
             vals = unsafe_alloc[Float64](max(n_slots * G, 1))
             cnt = unsafe_alloc[Int64](G)
-        if Int(bad_key[0]) != 0:
+
+            def enc_dense(c: Int, i0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) {imm} -> Bool:
+                if not _encode_sel(K, arrays, stride_a, n_keys, n_cols, c, Int(tbl[c * tstride]), i0,
+                                   sel, nsel, use_sel, dst, regs):
+                    return False
+                for j in range(nsel):
+                    dst[j] = dense[Int(dst[j])]
+                return True
+
+            rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                G, 0, n_rows, Int(vals), Int(cnt), threads, enc_dense)
+            if rc == -5:
+                rc = E_BAD_KEY
+            free_big(Int(dense))
+        free_big(Int(pres))
+        cc.free()
+        bad.free()
+    else:
+        # ── sparse keys (hash): a hash table numbers the groups in order of first appearance and
+        #    writes one group-id array, then one interpreter pass
+        var gids = unsafe_alloc[Int32](max(n_rows, 1))
+        var bad_key = False
+        for k in range(n_keys):
+            kv[k] = Int64(Int(unsafe_alloc[Int64](max(n_rows, 1))))
+        var ng = _hash_groups(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, n_chunks, gids, kv, n_rows)
+        if ng < 0:
+            bad_key = True
+        else:
+            G = max(ng, 1)
+            vals.free()
+            cnt.free()
+            vals = unsafe_alloc[Float64](max(n_slots * G, 1))
+            cnt = unsafe_alloc[Int64](G)
+        if bad_key:
             rc = E_BAD_KEY
         else:
             rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
                                  Int(gids), G, 0, n_rows, Int(vals), Int(cnt), threads)
-        bad_key.free()
         gids.free()
     tbl.free()
     if rc < 0:
@@ -1081,30 +1119,24 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     if not grouped:
         order[0] = 0
         n_res = 1
-    else:
-        for g in range(G):                         # key order (hash path: first appearance)
-            if cnt[g] > 0:
-                order[n_res] = Int64(g)
-                n_res += 1
-    if grouped and not use_hash:
-        # per-key codes of the surviving groups, from their composite codes (dense: the group id
-        # itself); read as kv[k][order[i]] only, so a wide, sparsely used key range costs no
-        # divisions for the groups that never occur
-        for k in range(n_keys):
-            var a = unsafe_alloc[Int64](G)
-            var st = Int(K.stride[k])
-            var cd = Int(K.card[k])
-            for i in range(n_res):
-                var g = Int(order[i])
-                var c = Int(comp[g]) if compact else g
-                a[g] = Int64((c // st) % cd)
-            kv[k] = Int64(Int(a))
-    comp.free()
+    else:                                          # key order (hash path: first appearance)
+        n_res = _par_select(order, G, nt, cnt)
     var has_str_key = False
     for k in range(n_keys):
         var kd = Int(K.kinds[k])
         has_str_key = has_str_key or kd == K_DICT or kd == K_STR
-    if (use_hash or has_str_key) and n_res > 1:
+    # per-key codes of the groups that are read (kv[k][order[i]] only): before the key-order sort
+    # when string keys need it, else after HAVING, so a group-by HAVING keeps few of many groups
+    # (TPC-H Q18's 15M orders) decodes only the survivors
+    var kv_done = not grouped or use_hash
+    if not kv_done and has_str_key:
+        _fill_kv(K, kv, n_keys, order, n_res, comp, compact, G, nt)
+        kv_done = True
+    # an ORDER BY in this call sorts the result anyway: key order is then only its tie-break, added as
+    # the sort's last columns below, instead of a full sort of every group by key first (TPC-H Q10:
+    # 380k hashed groups, top 20 by revenue)
+    var keys_as_tiebreak = (use_hash or has_str_key) and n_sort > 0
+    if (use_hash or has_str_key) and n_res > 1 and not keys_as_tiebreak:
         # key order (pandas' groupby default), which is also the ORDER BY tie-break: the hash table
         # numbers groups by first appearance, and string codes are entry ids (first appearance in
         # the dictionaries), so those groups are reordered by the keys' values (strings by bytes);
@@ -1126,29 +1158,78 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         kvals.free()
     var empty_global = not grouped and cnt[0] == 0
     if n_having > 0:
+        # in parallel over blocks of the groups, keeping their order: which pass, per-block counts,
+        # prefix sums, then the survivors written in place of a copy
+        var hb = max(1, min(nt * 4, (n_res + 16383) // 16384))
+        var pass_ = _bp(big_alloc(max(n_res, 1)))
+        var hcount = unsafe_alloc[Int64](hb + 1)
+        var hc = unsafe_alloc[Int64](1)
+        hc[0] = 0
+        var nr0 = n_res
+
+        def having_blocks(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(hc, 1))
+                if b >= hb:
+                    break
+                var k = 0
+                for i in range(b * nr0 // hb, (b + 1) * nr0 // hb):
+                    var g = Int(order[i])
+                    var ok = True
+                    for h in range(n_having):
+                        var j = Int(having[3 * h])
+                        var op = Int(outs[3 * j])
+                        if empty_global and op != O_COUNT:    # NULL compares false
+                            ok = False
+                            break
+                        if not _cmp(_out_value(op, Int(outs[3 * j + 1]), Int(outs[3 * j + 2]), g, G, vals, cnt),
+                                    Int(having[3 * h + 1]), hconst[h]):
+                            ok = False
+                            break
+                    pass_[i] = 1 if ok else 0
+                    k += 1 if ok else 0
+                hcount[b] = Int64(k)
+
+        _par(having_blocks, nt if nr0 > 65536 else 1)
         var kept = 0
-        for i in range(n_res):
-            var g = Int(order[i])
-            var ok = True
-            for h in range(n_having):
-                var j = Int(having[3 * h])
-                var op = Int(outs[3 * j])
-                if empty_global and op != O_COUNT:    # NULL compares false
-                    ok = False
+        for b in range(hb):
+            var k = Int(hcount[b])
+            hcount[b] = Int64(kept)
+            kept += k
+        var horder = unsafe_alloc[Int64](max(G, 1))
+        hc[0] = 0
+
+        def having_write(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(hc, 1))
+                if b >= hb:
                     break
-                if not _cmp(_out_value(op, Int(outs[3 * j + 1]), Int(outs[3 * j + 2]), g, G, vals, cnt),
-                            Int(having[3 * h + 1]), hconst[h]):
-                    ok = False
-                    break
-            if ok:
-                order[kept] = Int64(g)
-                kept += 1
+                var at = Int(hcount[b])
+                for i in range(b * nr0 // hb, (b + 1) * nr0 // hb):
+                    if pass_[i] != 0:
+                        horder[at] = order[i]
+                        at += 1
+
+        _par(having_write, nt if nr0 > 65536 else 1)
+        order.free()
+        order = horder
         n_res = kept
+        free_big(Int(pass_))
+        hcount.free()
+        hc.free()
+    if not kv_done:
+        _fill_kv(K, kv, n_keys, order, n_res, comp, compact, G, nt)
+    comp.free()
 
     if n_sort > 0 and n_res > 1:
         # one float64 sort value per (sort column, row): key ranks or aggregate values, negated
         # when descending; ties fall back to key order, so the order is total and deterministic
-        var sv = unsafe_alloc[Float64](n_sort * n_res)
+        var ns_all = n_sort + (n_keys if keys_as_tiebreak else 0)
+        var sv = unsafe_alloc[Float64](ns_all * n_res)
+        if keys_as_tiebreak:
+            for k in range(n_keys):
+                _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, n_cols,
+                                 sv + (n_sort + k) * n_res, 1.0)
         var bad = False
         for j in range(n_sort):
             var what = Int(sorts[3 * j])
@@ -1177,11 +1258,11 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         var perm = unsafe_alloc[Int64](n_res)
         var n_keep = n_res
         if limit >= 0 and limit * 8 < n_res:
-            n_keep = _top_k(perm, n_res, limit, sv, n_sort)
+            n_keep = _top_k(perm, n_res, limit, sv, ns_all)
         else:
             for i in range(n_res):
                 perm[i] = Int64(i)
-        _merge_sort(perm, n_keep, sv, n_sort, n_res)
+        _merge_sort(perm, n_keep, sv, ns_all, n_res)
         var sorted = unsafe_alloc[Int64](max(n_keep, 1))
         for i in range(n_keep):
             sorted[i] = order[Int(perm[i])]
@@ -1287,6 +1368,75 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     _free_kv(kv, n_keys)
     K.free()
     return 0
+
+
+def _par_select(order: LP, G: Int, nt: Int, cnt: LP) -> Int:
+    """order[0 ..) = the groups g < G with cnt[g] > 0, ascending, in parallel (per-block counts,
+    prefix sums, writes). Returns how many."""
+    var nb = max(1, min(nt * 4, (G + 65535) // 65536))
+    var bc = unsafe_alloc[Int64](nb + 1)
+    var c = unsafe_alloc[Int64](1)
+    c[0] = 0
+
+    def count(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(c, 1))
+            if b >= nb:
+                break
+            var k = 0
+            for g in range(b * G // nb, (b + 1) * G // nb):
+                k += 1 if cnt[g] > 0 else 0
+            bc[b] = Int64(k)
+
+    _par(count, nt if G > 65536 else 1)
+    var tot = 0
+    for b in range(nb):
+        var k = Int(bc[b])
+        bc[b] = Int64(tot)
+        tot += k
+    c[0] = 0
+
+    def write(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(c, 1))
+            if b >= nb:
+                break
+            var at = Int(bc[b])
+            for g in range(b * G // nb, (b + 1) * G // nb):
+                if cnt[g] > 0:
+                    order[at] = Int64(g)
+                    at += 1
+
+    _par(write, nt if G > 65536 else 1)
+    bc.free()
+    c.free()
+    return tot
+
+
+def _fill_kv(K: Keys, kv: LP, n_keys: Int, order: LP, n_res: Int, comp: LP, compact: Bool, G: Int, nt: Int):
+    """Per-key codes of the groups order[0 .. n_res), from their composite codes (dense: the group id
+    itself), into kv[k] (int64[G], only those slots written), in parallel over blocks of order."""
+    var nb = max(1, min(nt * 4, (n_res + 65535) // 65536))
+    for k in range(n_keys):
+        var a = unsafe_alloc[Int64](max(G, 1))
+        var st = Int(K.stride[k])
+        var cd = Int(K.card[k])
+        var c = unsafe_alloc[Int64](1)
+        c[0] = 0
+
+        def fill(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(c, 1))
+                if b >= nb:
+                    break
+                for i in range(b * n_res // nb, (b + 1) * n_res // nb):
+                    var g = Int(order[i])
+                    var code = Int(comp[g]) if compact else g
+                    a[g] = Int64((code // st) % cd)
+
+        _par(fill, nt if n_res > 65536 else 1)
+        c.free()
+        kv[k] = Int64(Int(a))
 
 
 @always_inline
@@ -3008,4 +3158,177 @@ def mx_count_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
     unsorted.free()
     counter.free()
     nr.free()
+    return 0
+
+
+# ── F-043: str_slice(column, offset, length) IN (values), on utf8 without nulls ────────────────────
+#
+# Plan (int64 words):
+#   0 SMAGIC   1 ArrowArray* (utf8, int32 offsets, one chunk)   2 offset (characters, >= 0)
+#   3 length (characters; -1: to the end)   4 n_values   5 values' bytes (concatenated)
+#   6 values' offsets (int64[n_values + 1])   7 out (uint8[n]: 1 when the slice is one of the values)
+#   8 threads
+# Characters are UTF-8 code points, like Arrow's utf8_slice_codeunits; each row is walked from its
+# start, so the cost is the slice's end, not the string's length.
+# Inputs are validated Arrow utf8. On invalid UTF-8 (Arrow raises) the bounds still stay inside the
+# row; a stray continuation byte simply counts as a character start.
+
+comptime SMAGIC = 0x4D585333
+
+
+@always_inline
+def _u8len(b: UInt8) -> Int:
+    if b < 0x80:
+        return 1
+    if b < 0xE0:
+        return 2
+    if b < 0xF0:
+        return 3
+    return 4
+
+
+@export
+def mx_str_slice_in(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != SMAGIC:
+        return E_BAD_PLAN
+    var arr = Int(P[1])
+    var off = Int(P[2])
+    var ln = Int(P[3])
+    var nv = Int(P[4])
+    var vdata = Int(P[5])
+    var voff = _lp(Int(P[6]))
+    var dst = _bp(Int(P[7]))
+    var threads = max(1, Int(P[8]))
+    if off < 0 or nv < 0:
+        return E_BAD_PLAN
+    var n = _arr_len(arr)
+    var nb = max(1, min(threads * 4, (n + 65535) // 65536))
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def work(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                var s = _dstart(arr, i)
+                var p = 0
+                var q = 0
+                _slice_bounds(_bp(s), _dlen(arr, i), off, ln, p, q)
+                var m = q - p
+                var hit: UInt8 = 0
+                for k in range(nv):
+                    var v0 = Int(voff[k])
+                    if Int(voff[k + 1]) - v0 == m and _bytes_eq(s + p, vdata + v0, m):
+                        hit = 1
+                        break
+                dst[i] = hit
+
+    _par(work, max(1, min(threads, nb)))
+    counter.free()
+    return 0
+
+
+# ── F-043: str_slice(column, offset, length) as a new utf8 array ─────────────────────────────────
+#
+# Plan: 0 LMAGIC   1 ArrowArray* (utf8, int32 offsets, one chunk)   2 offset   3 length (-1: to the
+# end)   4 threads. Output: 0 total bytes   1 arena (mx_exec_free): int32 offsets[n + 1], padded to
+# 8 bytes, then the bytes. Same code points as mx_str_slice_in; per-block lengths, prefix sums,
+# copies, all in parallel.
+
+comptime LMAGIC = 0x4D58534C
+
+
+@always_inline
+def _slice_bounds(bp: BP, L: Int, off: Int, ln: Int, mut p: Int, mut q: Int):
+    p = 0
+    var c = 0
+    while p < L and c < off:
+        p += _u8len(bp[p])
+        c += 1
+    p = min(p, L)
+    q = L
+    if ln >= 0:
+        q = p
+        c = 0
+        while q < L and c < ln:
+            q += _u8len(bp[q])
+            c += 1
+        q = min(q, L)
+
+
+@export
+def mx_str_slice(plan_a: Int, out_a: Int) abi("C") -> Int:
+    var P = _lp(plan_a)
+    if Int(P[0]) != LMAGIC or Int(P[2]) < 0:
+        return E_BAD_PLAN
+    var arr = Int(P[1])
+    var off = Int(P[2])
+    var ln = Int(P[3])
+    var threads = max(1, Int(P[4]))
+    var O = _lp(out_a)
+    var n = _arr_len(arr)
+    var nb = max(1, min(threads * 4, (n + 65535) // 65536))
+    var nt = max(1, min(threads, nb))
+    var ps = _ip(big_alloc(max(n, 1) * 4))          # slice start inside its string
+    var pl = _ip(big_alloc(max(n, 1) * 4))          # slice length in bytes
+    var btot = unsafe_alloc[Int64](nb + 1)
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def bounds(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            var tot = 0
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                var p = 0
+                var q = 0
+                _slice_bounds(_bp(_dstart(arr, i)), _dlen(arr, i), off, ln, p, q)
+                ps[i] = Int32(p)
+                pl[i] = Int32(q - p)
+                tot += q - p
+            btot[b] = Int64(tot)
+
+    _par(bounds, nt)
+    var total = 0
+    for b in range(nb):
+        var k = Int(btot[b])
+        btot[b] = Int64(total)
+        total += k
+    if total >= 2147483647:
+        free_big(Int(ps))
+        free_big(Int(pl))
+        btot.free()
+        counter.free()
+        return E_OUTPUT_TOO_BIG
+    var obytes = _align8((n + 1) * 4)
+    var arena = unsafe_alloc[UInt8](obytes + max(total, 8), alignment=64)
+    var offs = _ip(Int(arena))
+    var data = Int(arena) + obytes
+    counter[0] = 0
+
+    def copy(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            var at = Int(btot[b])
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                offs[i] = Int32(at)
+                var m = Int(pl[i])
+                _copy_bytes(data + at, _dstart(arr, i) + Int(ps[i]), m)
+                at += m
+
+    _par(copy, nt)
+    offs[n] = Int32(total)
+    O[0] = Int64(total)
+    O[1] = Int64(Int(arena))
+    free_big(Int(ps))
+    free_big(Int(pl))
+    btot.free()
+    counter.free()
     return 0

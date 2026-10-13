@@ -221,6 +221,10 @@ def _str_slice(arr, offset: int, length):
     """Characters [offset, offset + length) of every string (to the end when length is None)."""
     if pa.types.is_dictionary(arr.type):
         arr = _decode_dict(arr)
+    from . import native_exec
+    got = native_exec.try_str_slice(arr, offset, length)     # one parallel native pass (F-043)
+    if got is not None:
+        return got
     return pc.utf8_slice_codeunits(arr, start=offset, stop=None if length is None else offset + length)
 
 
