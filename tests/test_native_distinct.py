@@ -119,3 +119,28 @@ def test_many_plain_string_keys_across_blocks_and_partitions(native, monkeypatch
         if not ordered:                       # no ORDER BY: native groups come out in key order
             s = got.column("s").to_pylist()
             assert s == sorted(s, key=lambda v: v.encode())
+
+
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_word_wise_string_hashing_and_block_repeats(native, monkeypatch, distinct_calls, chunks):
+    """M2i: strings are hashed / compared / copied 8 bytes at a time and repeats of an earlier row of
+    the same block reuse its entry. Strings of 0-19 bytes (Unicode too), pairs equal in their first
+    8 bytes, heavy repeats inside one block: the group-by and DISTINCT match the Python path."""
+    r = np.random.default_rng(17)
+    base = ["", "a", "abcdefgh", "abcdefgX", "abcdefghi", "abcdefghX", "é", "ééééé", "naïve-wörld-1234",
+            "naïve-wörld-1235", "xxxxxxxxxxxxxxxxxxx", "0123456789abcdef", "0123456789abcdeF"]
+    extra = [f"k{v:06d}" for v in range(3000)]
+    vocab = np.array(base + extra, dtype=object)
+    n = 300_000
+    idx = np.where(r.random(n) < 0.6, r.integers(0, len(base), n), r.integers(0, len(vocab), n))
+    t = pa.table({"s": pa.array(vocab[idx].tolist()), "j": A(r.integers(0, 3, n).astype(np.int32)),
+                  "v": A(r.random(n))})
+    if chunks > 1:
+        t = pa.Table.from_batches(t.slice(0, n // 3).to_batches() + t.slice(n // 3).to_batches())
+    got, old, path, decline = _both(lambda t: LazyFrame(t).groupby("s", "j").agg(col("v").sum().alias("x"),
+                                                                                   col("v").count().alias("c")), t, monkeypatch)
+    assert path == "native", decline
+    _same(got, old, ordered=False)
+    got, old, _, _ = _both(lambda t: LazyFrame(t).select("s", "j").distinct(), t, monkeypatch)
+    assert distinct_calls
+    assert got.to_pylist() == old.to_pylist()

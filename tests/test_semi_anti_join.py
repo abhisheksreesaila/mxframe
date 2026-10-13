@@ -9,8 +9,17 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+import mxframe as mx
+import mxframe.custom_ops as co
 from mxframe import LazyFrame, col, lit
 from mxframe.np_arrow import array as A
+
+
+def _gpu_usable() -> bool:
+    try:
+        return co._max_accelerator() is not None
+    except Exception:
+        return False
 
 
 def _tables(n=50_000, seed=5):
@@ -57,7 +66,8 @@ CASES = [
 
 @pytest.mark.parametrize("how", ["semi", "anti"])
 @pytest.mark.parametrize("name,lk,rk,cond", CASES, ids=[c[0] for c in CASES])
-@pytest.mark.parametrize("device", ["cpu", "auto"])
+@pytest.mark.parametrize("device", ["cpu", "auto", pytest.param(
+    "gpu", marks=pytest.mark.skipif(not _gpu_usable(), reason="no usable GPU"))])
 def test_semi_and_anti_joins_match_duckdb(how, name, lk, rk, cond, device):
     left, right = _tables()
     got = LazyFrame(left).join(LazyFrame(right), left_on=lk, right_on=rk, how=how).compute(device=device)
@@ -123,3 +133,104 @@ def test_str_slice(dictionary):
     assert got.column("b").to_pylist() == [None if v is None else v[3:] for v in vals]
     filt = LazyFrame(t).filter(col("p").str_slice(0, 2).isin(["13", "31"])).compute(device="cpu")
     assert filt.column("i").to_pylist() == [0, 1]
+
+
+# ── M2j review: joins of joins, the fallback path, SQL, reading only the right keys ─────────────
+
+def _dim(n=8000, seed=9):
+    r = np.random.default_rng(seed)
+    return pa.table({"dk": A(np.arange(n, dtype=np.int64)), "dg": A(r.integers(0, 4, n).astype(np.int32)),
+                     "dv": A(r.random(n))})
+
+
+def test_joins_of_joins_match_duckdb():
+    left, right = _tables()
+    dim = _dim()
+    con = duckdb.connect()
+    con.register("l", left.append_column("rowid_", A(np.arange(left.num_rows, dtype=np.int64))))
+    con.register("r", right)
+    con.register("d", dim)
+    L, R, D = LazyFrame(left), LazyFrame(right), LazyFrame(dim)
+    cases = [
+        # semi, then inner
+        (L.join(R, left_on="k", right_on="rk", how="semi").join(D, left_on="k", right_on="dk")
+         .select("k", "v", "dg"),
+         "SELECT l.k, l.v, d.dg FROM l JOIN d ON l.k = d.dk WHERE EXISTS (SELECT 1 FROM r WHERE r.rk = l.k) ORDER BY rowid_"),
+        # inner, then anti with a filter on the inner join's right column
+        (L.join(D, left_on="k", right_on="dk").filter(col("dg") > lit(1))
+         .join(R, left_on="k", right_on="rk", how="anti").select("k", "dg"),
+         "SELECT l.k, d.dg FROM l JOIN d ON l.k = d.dk WHERE d.dg > 1 AND NOT EXISTS (SELECT 1 FROM r WHERE r.rk = l.k) ORDER BY rowid_"),
+        # left, then semi
+        (L.join(D, left_on="k", right_on="dk", how="left").join(R, left_on="k", right_on="rk", how="semi")
+         .select("k", "dv"),
+         "SELECT l.k, d.dv FROM l LEFT JOIN d ON l.k = d.dk WHERE EXISTS (SELECT 1 FROM r WHERE r.rk = l.k) ORDER BY rowid_"),
+        # a right side that is itself a join
+        (L.join(R.join(D, left_on="rk", right_on="dk").filter(col("dg") == lit(2)), left_on="k", right_on="rk", how="anti")
+         .select("k", "s"),
+         "SELECT k, s FROM l WHERE NOT EXISTS (SELECT 1 FROM r JOIN d ON r.rk = d.dk WHERE d.dg = 2 AND r.rk = l.k) ORDER BY rowid_"),
+    ]
+    for q, sql in cases:
+        got = q.compute(device="cpu")
+        want = con.execute(sql).fetch_arrow_table()
+        assert got.num_rows == want.num_rows, sql
+        for c in got.column_names:
+            g, w = got.column(c).to_pylist(), want.column(c).to_pylist()
+            if pa.types.is_floating(got.schema.field(c).type):
+                np.testing.assert_allclose([np.nan if x is None else x for x in g],
+                                           [np.nan if x is None else x for x in w], rtol=1e-12)
+            else:
+                assert g == w, (sql, c)
+
+
+@pytest.mark.parametrize("how", ["semi", "anti"])
+def test_left_side_with_unknown_columns_takes_the_fallback(how):
+    """A left side whose columns the planner cannot name (an unnamed expression) goes through
+    `_execute_hash_join`'s semi / anti branch; same answer."""
+    left, right = _tables(5000)
+    lf = LazyFrame(left).select(col("k"), col("v") * lit(2.0))
+    got = lf.join(LazyFrame(right), left_on="k", right_on="rk", how=how).compute(device="cpu")
+    exists = "EXISTS" if how == "semi" else "NOT EXISTS"
+    want = _duck(f"SELECT k FROM l WHERE {exists} (SELECT 1 FROM r WHERE r.rk = l.k) ORDER BY rowid", left, right)
+    assert got.column("k").to_pylist() == want.column("k").to_pylist()
+
+
+def test_sql_join_types():
+    l = pa.table({"k": pa.array([1, 2, 3, None], pa.int64()), "a": pa.array([10, 20, 30, 40], pa.int64())})
+    r = pa.table({"k": pa.array([2, 4, 2], pa.int64()), "w": pa.array([0.5, 0.7, 0.9])})
+    run = lambda q: mx.sql(q, l=l, r=r).compute(device="cpu").to_pydict()
+    assert run("SELECT l.k, l.a, r.w FROM l LEFT JOIN r ON l.k = r.k ORDER BY a, w") == \
+        {"k": [1, 2, 2, 3, None], "a": [10, 20, 20, 30, 40], "w": [None, 0.5, 0.9, None, None]}
+    assert run("SELECT * FROM l SEMI JOIN r ON l.k = r.k") == {"k": [2], "a": [20]}
+    for q in ("SELECT * FROM l ANTI JOIN r ON l.k = r.k", "SELECT * FROM l LEFT ANTI JOIN r ON l.k = r.k"):
+        assert run(q) == {"k": [1, 3, None], "a": [10, 30, 40]}
+    assert run("SELECT l.k FROM l JOIN r ON l.k = r.k") == {"k": [2, 2]}
+    for q in ("SELECT * FROM l FULL OUTER JOIN r ON l.k = r.k", "SELECT * FROM l RIGHT JOIN r ON l.k = r.k",
+              "SELECT * FROM l CROSS JOIN r"):
+        with pytest.raises(ValueError, match="unsupported SQL join"):
+            mx.sql(q, l=l, r=r).compute(device="cpu")
+
+
+def test_only_the_right_keys_are_read_from_parquet(tmp_path):
+    import pyarrow.parquet as pq
+    from mxframe.io_parquet import resolve_plan
+    from mxframe.lazy_frame import ParquetScan
+    left, right = _tables(2000)
+    pq.write_table(left, tmp_path / "l.parquet")
+    pq.write_table(right, tmp_path / "r.parquet")
+    for how in ("semi", "anti"):
+        for top in (lambda q: q, lambda q: q.sort("k"), lambda q: q.select("s", "k")):
+            q = top(mx.scan_parquet(str(tmp_path / "l.parquet")).join(
+                mx.scan_parquet(str(tmp_path / "r.parquet")), left_on="k", right_on="rk", how=how))
+            from mxframe.optimizer import optimize_plan
+            plan = resolve_plan(optimize_plan(q.plan).plan, read=False)
+            scans = []
+
+            def walk(n):
+                if isinstance(n, ParquetScan):
+                    scans.append(n)
+                for ch in ("input", "left", "right"):
+                    if hasattr(n, ch):
+                        walk(getattr(n, ch))
+            walk(plan)
+            right_scan = [sc for sc in scans if sc.path.endswith("r.parquet")][0]
+            assert list(right_scan.columns) == ["rk"], (how, right_scan.columns)

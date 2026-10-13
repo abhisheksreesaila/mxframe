@@ -25,7 +25,7 @@ from ._lazy_pc import pc
 
 from .lazy_expr import Expr
 from .lazy_frame import (
-    Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan,
+    FILTERING_JOINS, Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan,
     ParquetScan, Project, Scan, Sort, Tail,
 )
 
@@ -639,7 +639,8 @@ def _analyze(plan: LogicalPlan) -> _Info:
             info.bad_expr.update(node.left_on)       # join keys and distinct subsets stay decoded
             info.bad_expr.update(node.right_on)      # up front, as before (only bare projections defer)
             lcut = walk(node.left, passthru)
-            rcut = walk(node.right, passthru)
+            # a semi / anti join's right columns never reach the output: only its keys are read
+            rcut = walk(node.right, passthru and node.how not in FILTERING_JOINS)
             return lcut or rcut
         info.has_join = True                       # unknown node: be conservative
         if hasattr(node, "input"):

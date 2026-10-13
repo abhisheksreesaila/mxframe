@@ -246,10 +246,11 @@ class PlanOptimizer:
                 return Distinct(walk(node.input, below), node.subset)
             if isinstance(node, Join):
                 lcols, rcols = _output_columns(node.left), _output_columns(node.right)
-                if node.how in FILTERING_JOINS and needed is not None and lcols is not None:
+                if node.how in FILTERING_JOINS:
                     # only the keys are read from the right side
-                    return Join(walk(node.left, (needed & set(lcols)) | set(node.left_on)),
-                                walk(node.right, set(node.right_on)), node.left_on, node.right_on, node.how)
+                    left_need = None if (needed is None or lcols is None) else (needed & set(lcols)) | set(node.left_on)
+                    return Join(walk(node.left, left_need), walk(node.right, set(node.right_on)),
+                                node.left_on, node.right_on, node.how)
                 if needed is None or lcols is None or rcols is None:
                     return Join(walk(node.left, None), walk(node.right, None), node.left_on, node.right_on, node.how)
                 mapping = join_output_names(lcols, rcols, node.right_on)

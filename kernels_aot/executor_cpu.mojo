@@ -350,7 +350,7 @@ def _hash_bytes(a: Int, n: Int) -> UInt64:
     var h = UInt64(0xCBF29CE484222325)
     var k = 0
     while k + 8 <= n:
-        h = _mix(h ^ UInt64(Int(_lp(a + k)[0])))
+        h = _mix(h ^ UInt64(Int(_lp(a + k).unsafe_load[alignment=1](0))))
         k += 8
     var tail = UInt64(0)
     var p = _bp(a)
@@ -364,7 +364,7 @@ def _copy_bytes(dst: Int, src: Int, n: Int):
     """n bytes from src to dst, 8 at a time (unaligned), never past dst + n."""
     var k = 0
     while k + 8 <= n:
-        _lp(dst + k)[0] = _lp(src + k)[0]
+        _lp(dst + k).unsafe_store[alignment=1](0, _lp(src + k).unsafe_load[alignment=1](0))
         k += 8
     var d = _bp(dst)
     var s = _bp(src)
@@ -377,7 +377,7 @@ def _bytes_eq(a: Int, b: Int, n: Int) -> Bool:
     """n bytes at a equal n bytes at b (8 at a time)."""
     var k = 0
     while k + 8 <= n:
-        if _lp(a + k)[0] != _lp(b + k)[0]:
+        if _lp(a + k).unsafe_load[alignment=1](0) != _lp(b + k).unsafe_load[alignment=1](0):
             return False
         k += 8
     var pa = _bp(a)
@@ -1549,19 +1549,8 @@ def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP
 #         partner's: fixed (values*, 0); strings (int32 offsets[n+1]*, bytes*)
 
 comptime FMAGIC = 0x4D584631
-comptime HUGE = 1 << 21
 
 
-def _big_alloc(n: Int) -> BP:
-    """A buffer written once, in parallel, right after allocation: 2 MiB-aligned and marked for
-    transparent huge pages above 2 MiB, so first-touch faults are 512x fewer (24 threads faulting
-    4 KiB pages serialize on the kernel's mm lock: ~25 ms for 50 MB at SF1)."""
-    if n < HUGE:
-        return unsafe_alloc[UInt8](n, alignment=64)
-    var size = (n + HUGE - 1) // HUGE * HUGE
-    var b = unsafe_alloc[UInt8](size, alignment=HUGE)
-    _ = external_call["madvise", Int32](Int(b), size, Int32(14))     # MADV_HUGEPAGE
-    return b
 comptime OK_FIXED = 0
 comptime OK_UTF8 = 1
 comptime OK_DICT = 2
@@ -2231,7 +2220,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             asize += _align8(n_sel * Int(tsz[j]))
         else:
             asize += _align8((n_sel + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
-    var arena = _big_alloc(max(asize, 8))
+    var arena = _bp(big_alloc(max(asize, 8)))
     var dst_a = unsafe_alloc[Int64](max(n_tot, 1))    # values / offsets
     var dst_b = unsafe_alloc[Int64](max(n_tot, 1))    # string bytes
     var at = Int(arena)
@@ -2519,7 +2508,7 @@ def mx_gather(plan_a: Int, out_a: Int) abi("C") -> Int:
             asize += _align8(n * Int(sizes[j]))
         else:
             asize += _align8((n + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
-    var arena = _big_alloc(max(asize, 8))
+    var arena = _bp(big_alloc(max(asize, 8)))
     var dst_a = unsafe_alloc[Int64](n_out)
     var dst_b = unsafe_alloc[Int64](n_out)
     var at = Int(arena)

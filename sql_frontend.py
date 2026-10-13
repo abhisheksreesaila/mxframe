@@ -57,6 +57,21 @@ def sql(query: str, **tables: pa.Table) -> LazyFrame:
 # internal translator
 # ---------------------------------------------------------------------------
 
+
+
+def _join_type(join) -> str:
+    """The engine's join type for a sqlglot join: sqlglot keeps LEFT / RIGHT / FULL in `side` and
+    SEMI / ANTI / OUTER / CROSS in `kind` (``LEFT ANTI JOIN``: side LEFT, kind ANTI)."""
+    side = str(join.args.get("side") or "").lower()
+    kind = str(join.args.get("kind") or "").lower()
+    if kind in ("semi", "anti"):
+        return kind
+    if kind in ("", "inner", "outer") and side == "left":
+        return "left"
+    if kind in ("", "inner") and side == "":
+        return "inner"
+    raise ValueError(f"unsupported SQL join: {' '.join(x for x in (side, kind) if x).upper() or 'JOIN'} "
+                     "(supported: [INNER] JOIN, LEFT [OUTER] JOIN, [LEFT] SEMI JOIN, [LEFT] ANTI JOIN)")
 class _SQLTranslator:
     def __init__(self, tables: Dict[str, pa.Table]):
         self._tables = tables
@@ -136,6 +151,7 @@ class _SQLTranslator:
             right_plan, right_cols = self._scan(join.this)
             right_schema = set(right_cols)
 
+            how = _join_type(join)
             on = join.args.get("on")
             using = join.args.get("using")
             if on is not None:
@@ -146,18 +162,11 @@ class _SQLTranslator:
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
-            how = "inner"
-            kind = join.args.get("kind")
-            if kind:
-                ks = str(kind).lower()
-                if "left" in ks:
-                    how = "left"
-                elif "right" in ks:
-                    how = "right"
-
             plan = Join(plan, right_plan, left_on, right_on, how)
-            # After this join, the accumulated left side grows to include right cols
-            self._left_schema |= right_schema
+            # After this join, the accumulated left side grows to include right cols (a semi / anti
+            # join outputs the left columns only)
+            if how not in ("semi", "anti"):
+                self._left_schema |= right_schema
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
                 if lk != rk:
