@@ -292,6 +292,18 @@ class PipelineProgram:
 
 # ── column access helpers ──────────────────────────────────────────────────
 
+DICT_MEMBER_PY_MAX = 200_000
+
+
+def _dict_member(d: pa.Array, test, arrow) -> np.ndarray:
+    """Membership of every dictionary value in a string predicate (dictionary-sized work, never
+    row work). Plain Python below DICT_MEMBER_PY_MAX values: importing pyarrow.compute costs
+    ~25 ms per process, more than the test itself on TPC-H's dictionaries; `arrow` above it."""
+    if len(d) <= DICT_MEMBER_PY_MAX:
+        return np.fromiter((v is not None and bool(test(v)) for v in d.to_pylist()), dtype=bool, count=len(d))
+    return np.asarray(_np_of(arrow().fill_null(_npscalar(False)), zero_copy_only=False))
+
+
 def _dict_codes(d: pa.DictionaryArray) -> np.ndarray:
     idx = d.indices
     if idx.type != pa.int32():
@@ -584,7 +596,9 @@ class _Builder:
                 if op not in ("eq", "ne"):
                     raise Unsupported("ordered string comparison")
                 d = self.dictionary(col_e.args[0])
-                member = np.asarray(_np_of(pc.equal(d, _npscalar(lit_e.args[0], type=d.type)).fill_null(_npscalar(False)), zero_copy_only=False))
+                lit_s = lit_e.args[0]
+                member = _dict_member(d, lambda v: v == lit_s,
+                                      lambda: pc.equal(d, _npscalar(lit_s, type=d.type)))
                 return self._dict_test(col_e.args[0], member, negate=(op == "ne"))
         cmpc = self._try_cmpc(op, lhs, rhs)
         if cmpc is not None:
@@ -656,8 +670,10 @@ class _Builder:
         if self.column_kind(name) != "str":
             raise Unsupported("string op on a numeric column")
         d = self.dictionary(name)
-        fn = pc.starts_with if op == "startswith" else pc.match_substring
-        member = np.asarray(_np_of(fn(d, pattern=pattern).fill_null(_npscalar(False)), zero_copy_only=False))
+        if op == "startswith":
+            member = _dict_member(d, lambda v: v.startswith(pattern), lambda: pc.starts_with(d, pattern=pattern))
+        else:
+            member = _dict_member(d, lambda v: pattern in v, lambda: pc.match_substring(d, pattern=pattern))
         return self._dict_test(name, member)
 
     def _isin(self, col_e: Expr, values):
@@ -666,7 +682,8 @@ class _Builder:
             if not all(isinstance(v, str) for v in values):
                 raise Unsupported("non-string values against a string column")
             d = self.dictionary(col_e.args[0])
-            member = np.asarray(_np_of(pc.is_in(d, value_set=_npa(values, type=d.type)), zero_copy_only=False))
+            vs = set(values)
+            member = _dict_member(d, lambda v: v in vs, lambda: pc.is_in(d, value_set=_npa(values, type=d.type)))
             return self._dict_test(col_e.args[0], member)
         x = self._need(col_e, "num")
         if isinstance(x, _Const):
