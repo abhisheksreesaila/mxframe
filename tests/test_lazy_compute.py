@@ -27,7 +27,8 @@ import json, sys
 import mxframe
 from mxframe import native_exec
 mxframe._warm_thread and mxframe._warm_thread.join()
-out = {"after_import": "pyarrow.compute" in sys.modules}
+out = {"after_import": "pyarrow.compute" in sys.modules, "core_loaded": "pyarrow._compute" in sys.modules,
+       "lib_loaded": native_exec._lib is not None}
 from tpch_user import q_mx
 q = int(sys.argv[2])
 t = q_mx.load_mem(q, sys.argv[1])
@@ -111,11 +112,17 @@ def _parity_cases():
 
 
 @pytest.mark.parametrize("name,args,kwargs", _parity_cases(), ids=lambda v: v if isinstance(v, str) else "")
-def test_fast_shim_matches_pyarrow_compute(name, args, kwargs):
+def test_fast_shim_matches_pyarrow_compute(name, args, kwargs, monkeypatch):
     import pyarrow.compute as real
-    from mxframe._lazy_pc import _LazyCompute
-    got = getattr(_LazyCompute(), name)(*args, **kwargs)
-    assert got.equals(getattr(real, name)(*args, **kwargs))
+    from mxframe import _lazy_pc
+    want = getattr(real, name)(*args, **kwargs)
+    # once pyarrow.compute is loaded the shim hands every name to it: unload it so the fast path runs
+    monkeypatch.delitem(sys.modules, "pyarrow.compute")
+    f = _lazy_pc._wrapper(name)
+    assert f is not None and getattr(f, "__module__", None) == "mxframe._lazy_pc"
+    got = f(*args, **kwargs)
+    assert "pyarrow.compute" not in sys.modules
+    assert got.equals(want)
 
 
 _SHIM = """
@@ -148,9 +155,10 @@ def test_generated_functions_do_not_import_pyarrow_compute():
     assert json.loads(line[0][2:]) == {"generic": False, "rebuilt": False, "index": True}
 
 
-def test_shim_errors_like_pyarrow_compute():
+def test_shim_errors_like_pyarrow_compute(monkeypatch):
     import pyarrow as pa
     from mxframe._lazy_pc import _LazyCompute
+    monkeypatch.delitem(sys.modules, "pyarrow.compute", raising=False)
     with pytest.raises(AttributeError):
         _LazyCompute().no_such_function
     with pytest.raises(TypeError):
@@ -160,6 +168,10 @@ def test_shim_errors_like_pyarrow_compute():
 
 
 def test_background_warm_up_loads_compute_and_the_native_library(tpch_tiny_dir):
-    """The warm-up thread (on by default) does not load pyarrow.compute either."""
+    """The warm-up thread (on by default) loads pyarrow._compute and the executor library, so the
+    first query imports neither, and it does not load pyarrow.compute."""
     out = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "1"})
+    assert out["core_loaded"] and out["lib_loaded"]
     assert not (out["after_import"] or out["after_query"]) and out["native"] == "native"
+    off = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "1", "MXFRAME_WARM": "0"})
+    assert not off["lib_loaded"]
