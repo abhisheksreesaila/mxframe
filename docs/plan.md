@@ -336,10 +336,19 @@ Needs: design approved · Design: docs/design/mojo-executor.md · Time-box: a fe
   - Still float64 everywhere inside the interpreter; typed vectors and a hash-table aggregate (merged dictionaries are capped at 4096 strings, dense groups at 2^20) are M1.
   - Opt-in (`MXFRAME_NATIVE=1`) until M1 makes it the default.
 
-## F-031 Mojo executor M1: single-table pipelines [todo]
+## F-031 Mojo executor M1: single-table pipelines [review]
 Needs: F-030
-- [ ] scan, filter, project, global and grouped aggregate (hash table on composite keys in Mojo), sort, top-k, limit, all in the executor, with typed vectors (int64 exact, float64 accumulation)
-- [ ] engine-only at 12k–1M rows within 1.5x Polars on the queries covered
+- Finding that set the scope: joins are materialized before the aggregate, so the executor sees the final aggregate stage of every query as a single-table plan; M1 coverage is per query, not just Q1/Q6
+- [x] `Limit? Sort? Having? Aggregate(Filter*(Scan))` in one `mx_execute` call (plan v2): grouped results without ORDER BY (key order); ORDER BY any mix of keys and aggregates (stable merge sort on float64 sort values, ties in key order; top-k with a heap when a LIMIT under 1/8 of the groups follows); HAVING as AND-ed `aggregate <op> number`; NaN-aware min / max (the hidden NaN-count slot); a NaN among ORDER BY values declines (`-15`)
+- [x] grouping for any key range: dense up to 2^20 combinations (fused per morsel up to 4096), compacted through a presence table + prefix sum up to 8x the rows (cap 2^27), otherwise a hash table on the tuple of per-key codes (groups in first-appearance order). Plain utf8 keys and the merge of per-chunk dictionaries hash the strings' bytes (the 4096-string cap and the linear merge are gone); strings sort by a merge sort of their bytes
+- [x] string predicates on dictionary columns: Python concatenates the chunks' dictionaries (dictionary-sized work), the interpreter loads `code + chunk offset` (column type 5); no `unify_dictionaries`, no row-sized remap
+- [x] on by default (`MXFRAME_NATIVE=0` turns it off); a GPU session answers plans its own pipeline declines through the executor (same digits as `device="cpu"`); a CPU+GPU co-processing policy keeps the split path
+- [x] tests: `tests/test_native_exec_m1.py` (sort / limit / having / unordered / large and sparse key ranges / plain and dictionary string keys / string predicates / all 22 TPC-H queries equal to DuckDB with the executor on), M0 tests updated; full suite 2081 passed with the executor on by default; legacy suites pass
+- [x] coverage (SF0.017): the final aggregate stage is native in 16/22 queries (M0: 6). Still declined: derived group keys (Q7, Q8, Q9: year of a date via CASE WHEN), string predicates on plain utf8 columns (Q12, Q14, Q19: join results are decoded, see below), a count(*)-only plan (Q13)
+- [x] engine-only first runs, executor vs the old path (load average 3-5 during the runs, so under ~15% is noise; `docs/bench/m1-sf{1,10}-native{1,0}.md`): SF1 Q1 13 vs 40 ms, Q13 37 vs 49, the rest equal within noise (total 2699 vs 2734; Polars 1391); SF10 Q1 65 vs 160 ms (Polars 2,879), Q10 1105 vs 1208, Q11 83 vs 98, nothing slower beyond noise (total 21.0 vs 21.2 s; Polars 15.0 s)
+- [ ] engine-only at 12k–1M rows within 1.5x Polars on the queries covered: **not met, and M1 can't meet it**: on 20 of 22 queries the time is in the joins and the Python orchestration around them, which the final-stage executor does not touch (SF1: Q12 198 ms vs Polars 19, Q19 236 vs 44, Q2/Q8/Q11/Q14/Q15/Q17 5-7x). That is M2
+- Found for M2: `io_parquet.resolve_plan` decodes every dictionary string column of every leaf when the plan has a join (and any column used in CASE WHEN): at SF10 that is ~60M `l_shipmode` strings for Q12 before the join starts. Joins should carry dictionaries as they are and let the executor read codes
+- Not done in M1 (deferred): typed int64 registers (sums are still float64; exact for TPC-H's magnitudes), cached C Data exports, parallel compaction / hashing (both are single-threaded loops today)
 
 ## F-032 Mojo executor M2: hash joins [todo]
 Needs: F-031 · Replaces F-029

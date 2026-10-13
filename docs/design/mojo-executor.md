@@ -110,6 +110,14 @@ Go. Q1 and Q6 run as one `mx_execute` call per query, results equal to DuckDB, P
 today's path (Polars 2,608 ms); at 12k rows the one-time Mojo runtime load (~20 ms, F-028) is now the
 largest cost. Details and the lessons for M1: `docs/plan.md`, F-030.
 
+## M1 result (2026-10-12)
+
+The executor is on by default. Because joins are materialized before the aggregate, it already runs the
+final aggregate stage of 16 of the 22 TPC-H queries (sort, top-k, HAVING, any key range, string keys,
+dictionary string predicates). Where the aggregate is the work it wins (SF10 Q1 65 ms vs 160 on the old
+path, Polars 2,879); elsewhere the totals barely move, because the time is in the joins and the Python
+orchestration around them: M2 is where the gap to Polars closes. Details: `docs/plan.md`, F-031.
+
 ## Risks
 
 - **Size.** This is the largest change to the engine so far: weeks, not days. The milestones are ordered so

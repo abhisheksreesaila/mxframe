@@ -51,6 +51,7 @@ def tpch(request):
 @pytest.fixture
 def fused_calls(monkeypatch):
     """Count how often the fused pipeline actually served a plan."""
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")   # these test the fused pipeline, the executor's fallback
     calls = {"served": 0, "declined": 0}
     real = custom_ops.try_fused_aggregate
 

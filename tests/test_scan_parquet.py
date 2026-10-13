@@ -469,9 +469,10 @@ def test_engine_caches_do_not_serve_stale_results_for_reused_table_ids(tmp_path)
     # (id reuse is likely but not guaranteed; the assertions above are what matter)
 
 
-def test_cache_entries_are_purged_when_table_dies():
+def test_cache_entries_are_purged_when_table_dies(monkeypatch):
     import gc
     from mxframe import custom_ops as co
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")   # the Python path's caches (the executor keeps none)
     t = pa.table({"g": ["a", "b", "a"], "v": np.ones(3, dtype=np.float32)})
     LazyFrame(t).groupby("g").agg(col("v").sum().alias("s")).compute(device=DEV)
     tid = id(t)
@@ -482,8 +483,9 @@ def test_cache_entries_are_purged_when_table_dies():
     assert not any(co._contains_id(k, tid) for k in co._INPUT_PREP_CACHE)
 
 
-def test_other_tables_caches_survive_scan_parquet_compute(parquet_file):
+def test_other_tables_caches_survive_scan_parquet_compute(parquet_file, monkeypatch):
     from mxframe import custom_ops as co
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")   # the Python path's caches (the executor keeps none)
     t = _base_table()
     LazyFrame(t).groupby("grp").agg(col("qty").sum().alias("s")).compute(device=DEV)
     before = len(co._GROUP_ENCODE_CACHE)

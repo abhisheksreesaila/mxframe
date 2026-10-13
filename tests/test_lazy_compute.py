@@ -28,19 +28,21 @@ from mxframe import native_exec
 mxframe._warm_thread and mxframe._warm_thread.join()
 out = {"after_import": "pyarrow.compute" in sys.modules}
 from tpch_user import q_mx
-t = q_mx.load_mem(6, sys.argv[1])
+q = int(sys.argv[2])
+t = q_mx.load_mem(q, sys.argv[1])
 out["after_load"] = "pyarrow.compute" in sys.modules
-q_mx.run_mem(6, t, "cpu")
+r = q_mx.run_mem(q, t, "cpu")
 out["native"] = native_exec.last_path()
 out["after_query"] = "pyarrow.compute" in sys.modules
+out["result"] = r.to_pydict()
 print("@@" + json.dumps(out))
 """
 
 
-def _run(data_dir, env_extra):
+def _run(data_dir, q, env_extra):
     env = worker_env("-1")
     env.update(env_extra)
-    p = subprocess.run([sys.executable, "-c", _RUN, str(data_dir)], capture_output=True, text=True,
+    p = subprocess.run([sys.executable, "-c", _RUN, str(data_dir), str(q)], capture_output=True, text=True,
                        env=env, cwd=str(REPO_ROOT), timeout=120)
     line = [l for l in p.stdout.splitlines() if l.startswith("@@")]
     assert line, p.stdout + p.stderr
@@ -48,10 +50,20 @@ def _run(data_dir, env_extra):
 
 
 def test_native_query_never_imports_pyarrow_compute(tpch_tiny_dir):
-    out = _run(tpch_tiny_dir, {"MXFRAME_NATIVE": "1"})
-    assert out == {"after_import": False, "after_load": False, "native": "native_m0", "after_query": False}
+    out = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "1"})
+    assert out["native"] == "native"
+    assert not (out["after_import"] or out["after_load"] or out["after_query"])
+    old = _run(tpch_tiny_dir, 6, {"MXFRAME_NATIVE": "0"})          # same answer on the Python path
+    assert old["result"]["revenue"][0] == pytest.approx(out["result"]["revenue"][0], rel=1e-12)
 
 
-def test_python_path_query_still_works_and_loads_compute_lazily(tpch_tiny_dir):
-    out = _run(tpch_tiny_dir, {"MXFRAME_NATIVE": "0"})
+def test_python_path_loads_compute_when_it_needs_it(tpch_tiny_dir):
+    """Q1 on the Python path sorts with Arrow compute: it loads on that first use, and works."""
+    out = _run(tpch_tiny_dir, 1, {"MXFRAME_NATIVE": "0"})
     assert out["after_import"] is False and out["after_load"] is False
+    assert out["after_query"] is True
+    nat = _run(tpch_tiny_dir, 1, {"MXFRAME_NATIVE": "1"})
+    assert nat["native"] == "native" and nat["after_query"] is False
+    assert out["result"].keys() == nat["result"].keys()
+    for c, vals in out["result"].items():
+        assert vals == pytest.approx(nat["result"][c], rel=1e-12) if isinstance(vals[0], float) else vals == nat["result"][c]

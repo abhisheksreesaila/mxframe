@@ -1,30 +1,44 @@
 """
-MXFrame native executor, CPU (F-030, milestone M0 of docs/design/mojo-executor.md).
+MXFrame native executor, CPU (F-030 / F-031, milestones M0-M1 of docs/design/mojo-executor.md).
 
 ONE call runs a whole plan: Python compiles it once into a small int64 plan buffer and calls
 `mx_execute`; everything that touches rows happens here. M0 covers the pipeline
 
-    Scan (Arrow C Data Interface) -> Filter* -> GroupBy(keys) + Aggregate -> Sort(keys)
+    Scan (Arrow C Data Interface) -> Filter* -> GroupBy(keys) + Aggregate -> Having? -> Sort? -> Limit?
 
   1. columns arrive as ArrowArray structs (one per chunk per column); nothing is copied or
      converted on the way in;
   2. group keys (dictionary-encoded strings, int32, int64) become dense group ids, in parallel;
   3. filter + aggregate expressions run on the existing bytecode interpreter (pipeline_cpu.mojo);
-  4. means / counts are finished, the groups are ordered by their key values (strings by their
-     bytes, through the dictionary), and the output columns are written, string keys included,
-     into one arena that Python wraps zero-copy and frees with `mx_exec_free`.
+  4. means / counts are finished; HAVING (aggregate <op> constant, AND-ed) drops groups; the groups
+     are ordered (key order by default; ORDER BY any mix of keys and aggregates, stable, top-k
+     when a LIMIT follows; strings by their bytes), cut to the LIMIT, and the output columns are
+     written, string keys included, into one arena that Python wraps zero-copy and frees with
+     `mx_exec_free`.
+
+Key ranges up to `max dense groups` are addressed directly (fused per morsel up to 4096 groups);
+up to `max compact range` the composite codes are compacted through a presence table and a prefix
+sum (only the combinations that occur become groups); sparser key tuples go through a hash table
+(groups numbered in order of first appearance). Strings (dictionary entries of every chunk, and
+plain utf8 keys) are merged by hashing their bytes.
 
 Anything the plan cannot express returns a negative code and Python runs its existing path.
 
 Plan buffer (int64 words):
-   0 magic 0x4d584531 ("MXE1")   1 version (1)
+   0 magic 0x4d584531 ("MXE1")   1 version (2)
    2 n_chunks   3 n_cols (bytecode value columns)   4 n_keys   5 n_outputs   6 n_sort
    7 code*  8 consts*  9 set_bytes*  10 set_meta*  11 dtypes* (int32 per value column)
   12 arrays* : int64[n_chunks][n_cols + n_keys] = ArrowArray* (value columns, then keys)
-  13 key_kinds* : int64[n_keys]  0 = dictionary<int32, utf8>, 1 = int32, 2 = int64
-  14 outputs* : int64[n_outputs][2] = (op, slot)  op 0 sum 1 min 2 max 3 mean 4 count
-  15 sort* : int64[n_sort][2] = (key index, descending)
+  13 key_kinds* : int64[n_keys]  0 = dictionary<int32, utf8>, 1 = int32, 2 = int64, 3 = utf8
+  14 outputs* : int64[n_outputs][3] = (op, slot, NaN-count slot or -1)  op 0 sum 1 min 2 max 3 mean 4 count
+  15 sort* : int64[n_sort][3] = (what, index, descending)  what 0 = group key, 1 = output
   16 threads   17 max dense groups
+  18 limit (-1: none)   19 n_having   20 having* : int64[n_having][3] = (output, cmp, 0)
+     cmp 0 <  1 <=  2 >  3 >=  4 ==  5 !=
+  21 max compact range (composite key range compacted through a presence table)
+  22 having constants* : float64[n_having]
+  23 n_dcols (dictionary-coded string columns in predicates)   24 doffs* : int64[n_chunks][n_dcols]
+     (offset of the chunk's dictionary in the concatenation Python built; read through dtype 5)
 
 Result (int64 words, caller-allocated, 3 + 2 * n_keys + n_outputs):
    0 n_rows   1 arena* (free with mx_exec_free)   2 flags (bit 0: global aggregate over no rows)
@@ -35,10 +49,12 @@ Return: 0 ok; < 0 declined or failed (the caller falls back).
 """
 
 from std.memory.alloc import unsafe_alloc
-from std.memory import Pointer
+from std.memory import Pointer, unsafe_memset_zero
 from max.algorithm import parallelize
 from std.atomic import Atomic
 from std.ffi import external_call
+
+from std.utils.numerics import nan
 
 from pipeline_cpu import mx_pipeline_cpu
 
@@ -53,6 +69,7 @@ comptime MORSEL = 65536
 comptime K_DICT = 0
 comptime K_I32 = 1
 comptime K_I64 = 2
+comptime K_STR = 3     # utf8 (int32 offsets), not dictionary-encoded: hashed to entry ids in Mojo
 
 comptime O_SUM = 0
 comptime O_MIN = 1
@@ -66,12 +83,12 @@ comptime E_BAD_KEY = -11
 comptime E_PIPELINE = -12
 comptime E_DICT_TOO_BIG = -13
 comptime E_OUTPUT_TOO_BIG = -14   # string keys past int32 offsets
+comptime E_NAN_SORT = -15         # NaN among ORDER BY values
 comptime FUSE_GROUPS = 4096   # up to this many groups: keys encoded and aggregated per morsel
 comptime HDR = 16
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime INF = Float64(1.7976931348623157e308) * 10.0
-comptime DICT_CAP = 4096      # M0: merged dictionary size (linear merge); M1 brings a hash table
 
 
 @always_inline
@@ -108,7 +125,7 @@ def _arr_dict(a: Int) -> Int:
 
 
 def _itemsize(dtype: Int) -> Int:
-    # pipeline dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8
+    # pipeline dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8, 5 dictionary codes (int32)
     if dtype == 1 or dtype == 3:
         return 8
     if dtype == 4:
@@ -129,6 +146,7 @@ struct Keys(Copyable, Movable):
     var gchunk: LP      # per key: address of int64[card] (source chunk of each global entry)
     var gcode: LP       # per key: address of int64[card] (code in that chunk's dictionary)
     var remap: LP       # per key: address of int64[n_chunks] of addresses of int32[dict len]
+    var rowcode: LP     # per utf8 key: address of int32[n_rows] (entry id of every row)
 
     def __init__(out self, n: Int, n_chunks: Int):
         self.n = n
@@ -140,10 +158,12 @@ struct Keys(Copyable, Movable):
         self.gchunk = unsafe_alloc[Int64](max(n, 1))
         self.gcode = unsafe_alloc[Int64](max(n, 1))
         self.remap = unsafe_alloc[Int64](max(n, 1))
+        self.rowcode = unsafe_alloc[Int64](max(n, 1))
         for k in range(max(n, 1)):
             self.gchunk[k] = 0
             self.gcode[k] = 0
             self.remap[k] = 0
+            self.rowcode[k] = 0
 
     def free(self):
         for k in range(self.n):
@@ -159,6 +179,9 @@ struct Keys(Copyable, Movable):
                         _ip(a).free()
                     prev = a
                 rm.free()
+            if Int(self.rowcode[k]) != 0:
+                _ip(Int(self.rowcode[k])).free()
+        self.rowcode.free()
         self.kinds.free()
         self.base.free()
         self.card.free()
@@ -219,10 +242,61 @@ def _same_dict(d1: Int, d2: Int) -> Bool:
             and _arr_buf(d1, 1) == _arr_buf(d2, 1) and _arr_buf(d1, 2) == _arr_buf(d2, 2))
 
 
+@always_inline
+def _mix(h: UInt64) -> UInt64:
+    """splitmix64 finalizer."""
+    var z = h
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    return z ^ (z >> 31)
+
+
+@always_inline
+def _hash_bytes(a: Int, n: Int) -> UInt64:
+    var h = UInt64(0xCBF29CE484222325)          # FNV-1a, then mixed
+    var p = _bp(a)
+    for i in range(n):
+        h = (h ^ UInt64(p[i])) * 0x100000001B3
+    return _mix(h ^ UInt64(n))
+
+
+def _pow2_at_least(n: Int) -> Int:
+    var t = 1024
+    while t < n:
+        t *= 2
+    return t
+
+
+@always_inline
+def _entry_src(kind: Int, arrays: LP, stride_a: Int, col: Int, chunk: Int) -> Int:
+    """The ArrowArray whose (offsets, bytes) hold a string key's entries in `chunk`: the chunk's
+    dictionary for dictionary keys, the chunk itself for utf8 keys (same buffer layout)."""
+    var arr = Int(arrays[chunk * stride_a + col])
+    return _arr_dict(arr) if kind == K_DICT else arr
+
+
+def _dict_entries(arrays: LP, stride_a: Int, n_chunks: Int, col: Int) -> Int:
+    """Total dictionary entries over the chunks (chunks sharing a dictionary counted once)."""
+    var total = 0
+    var prev_d = 0
+    for c in range(n_chunks):
+        var d = _arr_dict(Int(arrays[c * stride_a + col]))
+        if c > 0 and _same_dict(d, prev_d):
+            continue
+        prev_d = d
+        total += _arr_len(d)
+    return total
+
+
 def _build_global_dict(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, cap: Int,
                        gchunk: LP, gcode: LP, remaps: LP) -> Int:
-    """Merge the chunks' dictionaries: returns the number of distinct strings (or -1 past `cap`).
-    remaps[c] = address of int32[len(dict of chunk c)] mapping chunk codes to global entries."""
+    """Merge the chunks' dictionaries by hashing their strings: returns the number of distinct
+    strings (or -1 past `cap`). remaps[c] = address of int32[len(dict of chunk c)] mapping chunk
+    codes to global entries (first-appearance order)."""
+    var tsize = _pow2_at_least(2 * cap + 2)
+    var table = unsafe_alloc[Int32](tsize)
+    for i in range(tsize):
+        table[i] = -1
     var ng = 0
     var prev_d = 0
     for c in range(n_chunks):
@@ -237,44 +311,113 @@ def _build_global_dict(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, cap: 
         for code in range(nd):
             var s0 = _dstart(d, code)
             var l0 = _dlen(d, code)
-            var found = -1
-            for g in range(ng):
-                var dg = _arr_dict(Int(arrays[Int(gchunk[g]) * stride_a + col]))
-                if _bytes_cmp(s0, l0, _dstart(dg, Int(gcode[g])), _dlen(dg, Int(gcode[g]))) == 0:
-                    found = g
+            var pos = Int(_hash_bytes(s0, l0) & UInt64(tsize - 1))
+            var e = -1
+            while True:
+                e = Int(table[pos])
+                if e < 0:
+                    if ng >= cap:
+                        table.free()
+                        return -1
+                    gchunk[ng] = Int64(c)
+                    gcode[ng] = Int64(code)
+                    table[pos] = Int32(ng)
+                    e = ng
+                    ng += 1
                     break
-            if found < 0:
-                if ng >= cap:
-                    return -1
-                gchunk[ng] = Int64(c)
-                gcode[ng] = Int64(code)
-                found = ng
-                ng += 1
-            rm[code] = Int32(found)
+                var dg = _arr_dict(Int(arrays[Int(gchunk[e]) * stride_a + col]))
+                if _bytes_cmp(s0, l0, _dstart(dg, Int(gcode[e])), _dlen(dg, Int(gcode[e]))) == 0:
+                    break
+                pos = (pos + 1) & (tsize - 1)
+            rm[code] = Int32(e)
+    table.free()
     return ng
 
 
-def _global_ranks(arrays: LP, stride_a: Int, col: Int, n: Int, gchunk: LP, gcode: LP, ranks: LP):
-    """ranks[entry] = position of global dictionary entry `entry` in byte order."""
+def _build_row_strings(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, tbl: LP, tstride: Int,
+                       n_rows: Int, gchunk: LP, gcode: LP, rowcode: IP) -> Int:
+    """Distinct strings of a utf8 key column by hashing: entries (chunk, row) in first-appearance
+    order; rowcode[i] = entry of row i. Returns the number of entries."""
+    var tsize = _pow2_at_least(2 * n_rows + 2)
+    var table = unsafe_alloc[Int32](tsize)
+    for i in range(tsize):
+        table[i] = -1
+    var ng = 0
+    for c in range(n_chunks):
+        var arr = Int(arrays[c * stride_a + col])
+        var c0 = Int(tbl[c * tstride])
+        var n = _arr_len(arr)
+        for r in range(n):
+            var s0 = _dstart(arr, r)
+            var l0 = _dlen(arr, r)
+            var pos = Int(_hash_bytes(s0, l0) & UInt64(tsize - 1))
+            var e = -1
+            while True:
+                e = Int(table[pos])
+                if e < 0:
+                    gchunk[ng] = Int64(c)
+                    gcode[ng] = Int64(r)
+                    table[pos] = Int32(ng)
+                    e = ng
+                    ng += 1
+                    break
+                var ag = Int(arrays[Int(gchunk[e]) * stride_a + col])
+                if _bytes_cmp(s0, l0, _dstart(ag, Int(gcode[e])), _dlen(ag, Int(gcode[e]))) == 0:
+                    break
+                pos = (pos + 1) & (tsize - 1)
+            rowcode[c0 + r] = Int32(e)
+    table.free()
+    return ng
+
+
+def _global_ranks(kind: Int, arrays: LP, stride_a: Int, col: Int, n: Int, gchunk: LP, gcode: LP,
+                  ranks: LP):
+    """ranks[entry] = position of string entry `entry` in byte order (merge sort)."""
     var order = unsafe_alloc[Int64](max(n, 1))
+    var tmp = unsafe_alloc[Int64](max(n, 1))
     for i in range(n):
         order[i] = Int64(i)
-    for i in range(1, n):
-        var cur = Int(order[i])
-        var dc = _arr_dict(Int(arrays[Int(gchunk[cur]) * stride_a + col]))
-        var j = i - 1
-        while j >= 0:
-            var o = Int(order[j])
-            var do = _arr_dict(Int(arrays[Int(gchunk[o]) * stride_a + col]))
-            if _bytes_cmp(_dstart(dc, Int(gcode[cur])), _dlen(dc, Int(gcode[cur])),
-                          _dstart(do, Int(gcode[o])), _dlen(do, Int(gcode[o]))) >= 0:
-                break
-            order[j + 1] = order[j]
-            j -= 1
-        order[j + 1] = Int64(cur)
+    var src = order
+    var dst = tmp
+    var width = 1
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid and j < hi:
+                var ei = Int(src[i])
+                var ej = Int(src[j])
+                var di = _entry_src(kind, arrays, stride_a, col, Int(gchunk[ei]))
+                var dj = _entry_src(kind, arrays, stride_a, col, Int(gchunk[ej]))
+                if _bytes_cmp(_dstart(dj, Int(gcode[ej])), _dlen(dj, Int(gcode[ej])),
+                              _dstart(di, Int(gcode[ei])), _dlen(di, Int(gcode[ei]))) < 0:
+                    dst[k] = src[j]
+                    j += 1
+                else:
+                    dst[k] = src[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                dst[k] = src[i]
+                i += 1
+                k += 1
+            while j < hi:
+                dst[k] = src[j]
+                j += 1
+                k += 1
+            lo += 2 * width
+        var t = src
+        src = dst
+        dst = t
+        width *= 2
     for r in range(n):
-        ranks[Int(order[r])] = Int64(r)
+        ranks[Int(src[r])] = Int64(r)
     order.free()
+    tmp.free()
 
 
 def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, tbl: LP,
@@ -299,6 +442,11 @@ def _encode_keys(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, t
                 var b64 = Int64(Int(K.base[k]))
                 for i in range(r, c1):
                     var t = Int32(src[i] - b64) * sk
+                    gids[i] = t if first else gids[i] + t
+            elif kind == K_STR:
+                var rcode = _ip(Int(K.rowcode[k]))
+                for i in range(r, c1):
+                    var t = rcode[i] * sk
                     gids[i] = t if first else gids[i] + t
             elif kind == K_DICT:
                 var src = _ip(_arr_buf(arr, 1) + (_arr_off(arr) - c0) * 4)
@@ -338,7 +486,7 @@ def mx_exec_free(arena: Int) abi("C") -> Int:
 @export
 def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var P = _lp(plan_a)
-    if Int(P[0]) != MAGIC or Int(P[1]) != 1:
+    if Int(P[0]) != MAGIC or Int(P[1]) != 2:
         return E_BAD_PLAN
     var n_chunks = Int(P[2])
     var n_cols = Int(P[3])
@@ -356,13 +504,20 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var sorts = _lp(Int(P[15]))
     var threads = max(1, Int(P[16]))
     var max_groups = Int(P[17])
+    var limit = Int(P[18])
+    var n_having = Int(P[19])
+    var having = _lp(Int(P[20]))
+    var max_compact = Int(P[21])
+    var hconst = FP(unsafe_from_address=Int(P[22]))
+    var n_dcols = Int(P[23])
+    var doffs = _lp(Int(P[24]))
     var O = _lp(out_a)
     var stride_a = n_cols + n_keys
     if n_chunks < 1:
         return E_BAD_PLAN
 
     # ── 1. chunk table for the interpreter: row_start, row_end, per column base address ──────
-    var tstride = 2 + n_cols
+    var tstride = 2 + n_cols + n_dcols
     var tbl = unsafe_alloc[Int64](n_chunks * tstride)
     var row = 0
     for c in range(n_chunks):
@@ -372,32 +527,46 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         tbl[c * tstride + 1] = Int64(row + n)
         for j in range(n_cols):
             var arr = Int(arrays[c * stride_a + j])
-            var isz = _itemsize(Int(dtypes[j]))
+            var isz = _itemsize(Int(dtypes[j]) & 255)
             tbl[c * tstride + 2 + j] = Int64(_arr_buf(arr, 1) + (_arr_off(arr) - row) * isz)
+        for i in range(n_dcols):
+            tbl[c * tstride + 2 + n_cols + i] = doffs[c * n_dcols + i]
         row += n
     var n_rows = row
 
     # ── 2. group keys -> dense group ids ─────────────────────────────────────────────────────
     var K = Keys(n_keys, n_chunks)
     var D = 1
+    var use_hash = False
     for k in range(n_keys):
         var kind = Int(key_kinds[k])
         K.kinds[k] = Int64(kind)
         var col = n_cols + k
         if kind == K_DICT:
-            var gch = unsafe_alloc[Int64](DICT_CAP)
-            var gco = unsafe_alloc[Int64](DICT_CAP)
+            var cap = max(_dict_entries(arrays, stride_a, n_chunks, col), 1)
+            var gch = unsafe_alloc[Int64](cap)
+            var gco = unsafe_alloc[Int64](cap)
             var rms = unsafe_alloc[Int64](n_chunks)
             for c in range(n_chunks):
                 rms[c] = 0
             K.gchunk[k] = Int64(Int(gch))
             K.gcode[k] = Int64(Int(gco))
             K.remap[k] = Int64(Int(rms))
-            var ng = _build_global_dict(arrays, stride_a, n_chunks, col, DICT_CAP, gch, gco, rms)
+            var ng = _build_global_dict(arrays, stride_a, n_chunks, col, cap, gch, gco, rms)
             if ng < 0:
                 K.free()
                 tbl.free()
                 return E_DICT_TOO_BIG
+            K.base[k] = 0
+            K.card[k] = Int64(max(ng, 1))
+        elif kind == K_STR:
+            var gch = unsafe_alloc[Int64](max(n_rows, 1))
+            var gco = unsafe_alloc[Int64](max(n_rows, 1))
+            var rcode = unsafe_alloc[Int32](max(n_rows, 1))
+            K.gchunk[k] = Int64(Int(gch))
+            K.gcode[k] = Int64(Int(gco))
+            K.rowcode[k] = Int64(Int(rcode))
+            var ng = _build_row_strings(arrays, stride_a, n_chunks, col, tbl, tstride, n_rows, gch, gco, rcode)
             K.base[k] = 0
             K.card[k] = Int64(max(ng, 1))
         elif kind == K_I32 or kind == K_I64:
@@ -413,22 +582,30 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             K.free()
             tbl.free()
             return E_BAD_KEY
-        if Int(K.card[k]) <= 0 or D > max_groups // max(Int(K.card[k]), 1):
+        if Int(K.card[k]) <= 0:
             K.free()
             tbl.free()
-            return E_TOO_MANY_GROUPS
-        D *= Int(K.card[k])
+            return E_BAD_KEY
+        if use_hash or D > max(max_groups, max_compact) // Int(K.card[k]):
+            use_hash = True                       # too sparse for direct addressing: hash the tuples
+        else:
+            D *= Int(K.card[k])
     var s = 1
     for k in range(n_keys - 1, -1, -1):
         K.stride[k] = Int64(s)
-        s *= Int(K.card[k])
+        s *= Int(K.card[k]) if not use_hash else 1
 
     var grouped = n_keys > 0
-    var G = D if grouped else 1
+    var compact = grouped and not use_hash and D > max_groups   # composite codes compacted to the groups present
+    var G = D if (grouped and not use_hash) else 1
     var code_p = _ip(code)
     var n_slots = Int(code_p[5])
-    var vals = unsafe_alloc[Float64](max(n_slots * G, 1))
-    var cnt = unsafe_alloc[Int64](G)
+    var vals = unsafe_alloc[Float64](1 if (compact or use_hash) else max(n_slots * G, 1))
+    var cnt = unsafe_alloc[Int64](1 if (compact or use_hash) else G)
+    var comp = unsafe_alloc[Int64](1)             # group id -> composite key code (set below)
+    var kv = unsafe_alloc[Int64](max(n_keys, 1))   # per key: address of int64[G] key codes per group
+    for k in range(max(n_keys, 1)):
+        kv[k] = 0
     var rc = 0
     var morsels = (n_rows + MORSEL - 1) // MORSEL
     var nt = max(1, min(threads, morsels))
@@ -436,7 +613,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     if not grouped:
         rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
                              0, 1, 0, n_rows, Int(vals), Int(cnt), threads)
-    elif G <= FUSE_GROUPS:
+    elif not compact and not use_hash and G <= FUSE_GROUPS:
         # ── fused: per 64k-row morsel, encode keys into a small reused buffer and aggregate it
         #    right away (no n_rows-sized group-id array: no page faults, cache-resident)
         var agg_base = HDR + (Int(code_p[2]) + Int(code_p[3]) + Int(code_p[4])) * 5
@@ -539,12 +716,68 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, min(lo + MORSEL, n_rows), gids):
                     bad_key[0] = 1
 
-        if nt > 1:
+        if use_hash:
+            # sparse key tuples: a hash table numbers the groups in order of first appearance
+            for k in range(n_keys):
+                kv[k] = Int64(Int(unsafe_alloc[Int64](max(n_rows, 1))))
+            var ng = _hash_groups(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, n_chunks, gids, kv, n_rows)
+            if ng < 0:
+                bad_key[0] = 1
+            else:
+                G = max(ng, 1)
+                vals.free()
+                cnt.free()
+                vals = unsafe_alloc[Float64](max(n_slots * G, 1))
+                cnt = unsafe_alloc[Int64](G)
+                if nt > 1:
+                    _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        elif nt > 1:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
             parallelize(keys_worker, nt)
         else:
             keys_worker(0)
         counter.free()
+        if Int(bad_key[0]) == 0 and compact:
+            # only the combinations that occur become groups, numbered in composite (key) order
+            var pres = unsafe_alloc[UInt8](D)
+            unsafe_memset_zero(pres, D)
+            for i in range(n_rows):
+                pres[Int(gids[i])] = 1
+            var dense = unsafe_alloc[Int32](D)
+            var ng = 0
+            for c in range(D):
+                if pres[c] != 0:
+                    dense[c] = Int32(ng)
+                    ng += 1
+            comp.free()
+            comp = unsafe_alloc[Int64](max(ng, 1))
+            for c in range(D):
+                if pres[c] != 0:
+                    comp[Int(dense[c])] = Int64(c)
+            pres.free()
+            var counter2 = unsafe_alloc[Int64](1)
+            counter2[0] = 0
+
+            def remap_worker(wid: Int) {imm}:
+                while True:
+                    var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter2, 1))
+                    var lo = m * MORSEL
+                    if lo >= n_rows:
+                        break
+                    for i in range(lo, min(lo + MORSEL, n_rows)):
+                        gids[i] = dense[Int(gids[i])]
+
+            if nt > 1:
+                parallelize(remap_worker, nt)
+            else:
+                remap_worker(0)
+            counter2.free()
+            dense.free()
+            G = max(ng, 1)
+            vals.free()
+            cnt.free()
+            vals = unsafe_alloc[Float64](max(n_slots * G, 1))
+            cnt = unsafe_alloc[Int64](G)
         if Int(bad_key[0]) != 0:
             rc = E_BAD_KEY
         else:
@@ -556,77 +789,132 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     if rc < 0:
         vals.free()
         cnt.free()
+        comp.free()
+        _free_kv(kv, n_keys)
         K.free()
         return rc if rc == E_BAD_KEY else E_PIPELINE
+    if grouped and not use_hash:
+        # per-key codes of every group, from its composite code (dense: the group id itself)
+        for k in range(n_keys):
+            var a = unsafe_alloc[Int64](G)
+            var st = Int(K.stride[k])
+            var cd = Int(K.card[k])
+            for g in range(G):
+                var c = Int(comp[g]) if compact else g
+                a[g] = Int64((c // st) % cd)
+            kv[k] = Int64(Int(a))
+    comp.free()
 
-    # ── 4. which groups exist, in output order ───────────────────────────────────────────────
-    var order = unsafe_alloc[Int64](G)      # output position -> dense group id
+    # ── 4. which groups survive, in output order ─────────────────────────────────────────────
+    var order = unsafe_alloc[Int64](max(G, 1))     # output position -> group id
     var n_res = 0
     if not grouped:
         order[0] = 0
         n_res = 1
-    elif n_sort == 0:
-        for g in range(G):
+    else:
+        for g in range(G):                         # key order (hash path: first appearance)
             if cnt[g] > 0:
                 order[n_res] = Int64(g)
                 n_res += 1
-    else:
-        # sort composite: sort keys first (ranks, flipped when descending), dense order otherwise
-        var ranks = unsafe_alloc[LP](n_keys)
-        for k in range(n_keys):
-            var card = Int(K.card[k])
-            ranks[k] = unsafe_alloc[Int64](card)
-            if Int(K.kinds[k]) == K_DICT:
-                _global_ranks(arrays, stride_a, n_cols + k, card, _lp(Int(K.gchunk[k])),
-                              _lp(Int(K.gcode[k])), ranks[k])
+    var empty_global = not grouped and cnt[0] == 0
+    if n_having > 0:
+        var kept = 0
+        for i in range(n_res):
+            var g = Int(order[i])
+            var ok = True
+            for h in range(n_having):
+                var j = Int(having[3 * h])
+                var op = Int(outs[3 * j])
+                if empty_global and op != O_COUNT:    # NULL compares false
+                    ok = False
+                    break
+                if not _cmp(_out_value(op, Int(outs[3 * j + 1]), Int(outs[3 * j + 2]), g, G, vals, cnt),
+                            Int(having[3 * h + 1]), hconst[h]):
+                    ok = False
+                    break
+            if ok:
+                order[kept] = Int64(g)
+                kept += 1
+        n_res = kept
+
+    if n_sort > 0 and n_res > 1:
+        # one float64 sort value per (sort column, row): key ranks or aggregate values, negated
+        # when descending; ties fall back to key order, so the order is total and deterministic
+        var sv = unsafe_alloc[Float64](n_sort * n_res)
+        var bad = False
+        for j in range(n_sort):
+            var what = Int(sorts[3 * j])
+            var idx = Int(sorts[3 * j + 1])
+            var sign = -1.0 if Int(sorts[3 * j + 2]) != 0 else 1.0
+            if what == 0:
+                var kind = Int(K.kinds[idx])
+                var kvi = _lp(Int(kv[idx]))
+                if kind == K_DICT or kind == K_STR:
+                    var card = Int(K.card[idx])
+                    var rk = unsafe_alloc[Int64](max(card, 1))
+                    _global_ranks(kind, arrays, stride_a, n_cols + idx, card, _lp(Int(K.gchunk[idx])),
+                                  _lp(Int(K.gcode[idx])), rk)
+                    for i in range(n_res):
+                        sv[j * n_res + i] = sign * Float64(Int(rk[Int(kvi[Int(order[i])])]))
+                    rk.free()
+                else:                                  # value - base: exact in float64 below 2^53
+                    for i in range(n_res):
+                        sv[j * n_res + i] = sign * Float64(Int(kvi[Int(order[i])]))
             else:
-                for v in range(card):
-                    ranks[k][v] = Int64(v)
-        var slot_of = unsafe_alloc[Int64](G)
-        for g in range(G):
-            var comp = 0
-            for j in range(n_sort):
-                var k = Int(sorts[2 * j])
-                var desc = Int(sorts[2 * j + 1]) != 0
-                var card = Int(K.card[k])
-                var r = Int(ranks[k][(g // Int(K.stride[k])) % card])
-                if desc:
-                    r = card - 1 - r
-                comp = comp * card + r
-            slot_of[g] = Int64(comp)
-        var pos = unsafe_alloc[Int64](G)
-        for i in range(G):
-            pos[i] = -1
-        for g in range(G):
-            pos[Int(slot_of[g])] = Int64(g)
-        for i in range(G):
-            var g = Int(pos[i])
-            if g >= 0 and cnt[g] > 0:
-                order[n_res] = Int64(g)
-                n_res += 1
-        pos.free()
-        slot_of.free()
-        for k in range(n_keys):
-            ranks[k].free()
-        ranks.free()
+                var op = Int(outs[3 * idx])
+                var slot = Int(outs[3 * idx + 1])
+                var nslot = Int(outs[3 * idx + 2])
+                for i in range(n_res):
+                    var x = _out_value(op, slot, nslot, Int(order[i]), G, vals, cnt)
+                    if x != x:
+                        bad = True
+                    sv[j * n_res + i] = sign * x
+        if bad:                                    # NaN: the caller's sort decides where it goes
+            sv.free()
+            order.free()
+            vals.free()
+            cnt.free()
+            _free_kv(kv, n_keys)
+            K.free()
+            return E_NAN_SORT
+        var perm = unsafe_alloc[Int64](n_res)
+        var n_keep = n_res
+        if limit >= 0 and limit * 8 < n_res:
+            n_keep = _top_k(perm, n_res, limit, sv, n_sort)
+        else:
+            for i in range(n_res):
+                perm[i] = Int64(i)
+        _merge_sort(perm, n_keep, sv, n_sort, n_res)
+        var sorted = unsafe_alloc[Int64](max(n_keep, 1))
+        for i in range(n_keep):
+            sorted[i] = order[Int(perm[i])]
+        order.free()
+        order = sorted
+        n_res = n_keep
+        perm.free()
+        sv.free()
+    if limit >= 0 and limit < n_res:
+        n_res = limit
 
     # ── 5. output arena ─────────────────────────────────────────────────────────────────────
     var key_bytes = unsafe_alloc[Int64](max(n_keys, 1))
     var total = 0
     for k in range(n_keys):
         var kind = Int(K.kinds[k])
-        if kind == K_DICT:
+        if kind == K_DICT or kind == K_STR:
             var gch = _lp(Int(K.gchunk[k]))
             var gco = _lp(Int(K.gcode[k]))
+            var kvk = _lp(Int(kv[k]))
             var nb = 0
             for i in range(n_res):
-                var e = (Int(order[i]) // Int(K.stride[k])) % Int(K.card[k])
-                nb += _dlen(_arr_dict(Int(arrays[Int(gch[e]) * stride_a + n_cols + k])), Int(gco[e]))
+                var e = Int(kvk[Int(order[i])])
+                nb += _dlen(_entry_src(kind, arrays, stride_a, n_cols + k, Int(gch[e])), Int(gco[e]))
             if nb > 2147483647:
                 key_bytes.free()
                 order.free()
                 vals.free()
                 cnt.free()
+                _free_kv(kv, n_keys)
                 K.free()
                 return E_OUTPUT_TOO_BIG
             key_bytes[k] = Int64(nb)
@@ -641,12 +929,11 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     O[0] = Int64(n_res)
     O[1] = Int64(Int(arena))
-    O[2] = Int64(1 if (not grouped and cnt[0] == 0) else 0)
+    O[2] = Int64(1 if (empty_global and n_res == 1) else 0)
     for k in range(n_keys):
         var kind = Int(K.kinds[k])
-        var stride_k = Int(K.stride[k])
-        var card = Int(K.card[k])
-        if kind == K_DICT:
+        var kvk = _lp(Int(kv[k]))
+        if kind == K_DICT or kind == K_STR:
             var gch = _lp(Int(K.gchunk[k]))
             var gco = _lp(Int(K.gcode[k]))
             var offs = _ip(at)
@@ -656,8 +943,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var p = 0
             offs[0] = 0
             for i in range(n_res):
-                var e = (Int(order[i]) // stride_k) % card
-                var d = _arr_dict(Int(arrays[Int(gch[e]) * stride_a + n_cols + k]))
+                var e = Int(kvk[Int(order[i])])
+                var d = _entry_src(kind, arrays, stride_a, n_cols + k, Int(gch[e]))
                 var src = _bp(_dstart(d, Int(gco[e])))
                 var ln = _dlen(d, Int(gco[e]))
                 for b in range(ln):
@@ -670,20 +957,21 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var dst = _ip(at)
             at += _align8(n_res * 4)
             for i in range(n_res):
-                dst[i] = Int32((Int(order[i]) // stride_k) % card + Int(K.base[k]))
+                dst[i] = Int32(Int(kvk[Int(order[i])]) + Int(K.base[k]))
             O[3 + 2 * k] = Int64(Int(dst))
             O[4 + 2 * k] = 0
         else:
             var dst = _lp(at)
             at += n_res * 8
             for i in range(n_res):
-                dst[i] = Int64((Int(order[i]) // stride_k) % card + Int(K.base[k]))
+                dst[i] = Int64(Int(kvk[Int(order[i])]) + Int(K.base[k]))
             O[3 + 2 * k] = Int64(Int(dst))
             O[4 + 2 * k] = 0
     var obase = 3 + 2 * n_keys
     for j in range(n_out):
-        var op = Int(outs[2 * j])
-        var slot = Int(outs[2 * j + 1])
+        var op = Int(outs[3 * j])
+        var slot = Int(outs[3 * j + 1])
+        var nslot = Int(outs[3 * j + 2])
         if op == O_COUNT:
             var dst = _lp(at)
             for i in range(n_res):
@@ -692,12 +980,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         else:
             var dst = FP(unsafe_from_address=at)
             for i in range(n_res):
-                var g = Int(order[i])
-                var v = vals[slot * G + g]
-                if op == O_MEAN:
-                    var c = Int(cnt[g])
-                    v = v / Float64(c) if c > 0 else 0.0
-                dst[i] = v
+                dst[i] = _out_value(op, slot, nslot, Int(order[i]), G, vals, cnt)
             O[obase + j] = Int64(Int(dst))
         at += n_res * 8
 
@@ -705,6 +988,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     order.free()
     vals.free()
     cnt.free()
+    _free_kv(kv, n_keys)
     K.free()
     return 0
 
@@ -712,3 +996,197 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 @always_inline
 def _align8(n: Int) -> Int:
     return (n + 7) // 8 * 8
+
+
+@always_inline
+def _out_value(op: Int, slot: Int, nslot: Int, g: Int, G: Int, vals: FP, cnt: LP) -> Float64:
+    """Finished value of output (op, slot) for group g: mean = sum / count, count as a float;
+    min / max with a NaN-count slot are NaN when the group had a NaN (max) or only NaNs (min)."""
+    if op == O_COUNT:
+        return Float64(Int(cnt[g]))
+    var v = vals[slot * G + g]
+    if op == O_MEAN:
+        var c = Int(cnt[g])
+        v = v / Float64(c) if c > 0 else 0.0
+    elif nslot >= 0:
+        var n_nan = vals[nslot * G + g]
+        var c = Float64(Int(cnt[g]))
+        var hit = n_nan > 0.0 if op == O_MAX else (n_nan >= c and c > 0.0)
+        if hit:
+            v = nan[DType.float64]()
+    return v
+
+
+@always_inline
+def _cmp(x: Float64, op: Int, c: Float64) -> Bool:
+    if op == 0:
+        return x < c
+    if op == 1:
+        return x <= c
+    if op == 2:
+        return x > c
+    if op == 3:
+        return x >= c
+    if op == 4:
+        return x == c
+    return x != c
+
+
+@always_inline
+def _less(a: Int, b: Int, sv: FP, ns: Int, n: Int) -> Bool:
+    """Row a before row b: lexicographic on the sort values, then the original (key) order."""
+    for j in range(ns):
+        var x = sv[j * n + a]
+        var y = sv[j * n + b]
+        if x < y:
+            return True
+        if x > y:
+            return False
+    return a < b
+
+
+def _merge_sort(perm: LP, m: Int, sv: FP, ns: Int, n: Int):
+    """Sort perm[0..m) (row numbers) by _less; bottom-up merge sort."""
+    if m < 2:
+        return
+    var tmp = unsafe_alloc[Int64](m)
+    var src = perm
+    var dst = tmp
+    var width = 1
+    while width < m:
+        var lo = 0
+        while lo < m:
+            var mid = min(lo + width, m)
+            var hi = min(lo + 2 * width, m)
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid and j < hi:
+                if _less(Int(src[j]), Int(src[i]), sv, ns, n):
+                    dst[k] = src[j]
+                    j += 1
+                else:
+                    dst[k] = src[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                dst[k] = src[i]
+                i += 1
+                k += 1
+            while j < hi:
+                dst[k] = src[j]
+                j += 1
+                k += 1
+            lo += 2 * width
+        var t = src
+        src = dst
+        dst = t
+        width *= 2
+    if Int(src) != Int(perm):
+        for i in range(m):
+            perm[i] = src[i]
+    tmp.free()
+
+
+def _top_k(perm: LP, n: Int, k: Int, sv: FP, ns: Int) -> Int:
+    """The k first rows by _less into perm[0..k) (unordered): a max-heap whose root is the worst kept."""
+    if k <= 0:
+        return 0
+    var size = 0
+    for r in range(n):
+        if size < k:
+            var c = size
+            perm[c] = Int64(r)
+            size += 1
+            while c > 0:                            # sift up
+                var p = (c - 1) // 2
+                if _less(Int(perm[p]), Int(perm[c]), sv, ns, n):
+                    var t = perm[p]
+                    perm[p] = perm[c]
+                    perm[c] = t
+                    c = p
+                else:
+                    break
+        elif _less(r, Int(perm[0]), sv, ns, n):
+            perm[0] = Int64(r)
+            var c = 0
+            while True:                             # sift down
+                var l = 2 * c + 1
+                if l >= size:
+                    break
+                var w = l
+                if l + 1 < size and _less(Int(perm[l]), Int(perm[l + 1]), sv, ns, n):
+                    w = l + 1
+                if _less(Int(perm[c]), Int(perm[w]), sv, ns, n):
+                    var t = perm[c]
+                    perm[c] = perm[w]
+                    perm[w] = t
+                    c = w
+                else:
+                    break
+    return size
+
+
+def _free_kv(kv: LP, n_keys: Int):
+    for k in range(n_keys):
+        if Int(kv[k]) != 0:
+            _lp(Int(kv[k])).free()
+    kv.free()
+
+
+def _hash_groups(K: Keys, arrays: LP, stride_a: Int, n_cols: Int, n_keys: Int, tbl: LP, tstride: Int,
+                 n_chunks: Int, gids: IP, kv: LP, n_rows: Int) -> Int:
+    """Group ids for sparse key tuples: open addressing on the tuple of per-key codes (integer
+    value - base, or string entry id); groups are numbered in order of first appearance and their
+    codes stored in kv[k][g]. Returns the number of groups, or -1 on an invalid dictionary code."""
+    var tsize = _pow2_at_least(2 * n_rows + 2)
+    var table = unsafe_alloc[Int32](tsize)
+    for i in range(tsize):
+        table[i] = -1
+    var v = unsafe_alloc[Int64](max(n_keys, 1))
+    var ng = 0
+    for c in range(n_chunks):
+        var c0 = Int(tbl[c * tstride])
+        var c1 = Int(tbl[c * tstride + 1])
+        for i in range(c0, c1):
+            var h = UInt64(0x9E3779B97F4A7C15)
+            for k in range(n_keys):
+                var kind = Int(K.kinds[k])
+                var arr = Int(arrays[c * stride_a + n_cols + k])
+                var x = 0
+                if kind == K_STR:
+                    x = Int(_ip(Int(K.rowcode[k]))[i])
+                elif kind == K_DICT:
+                    var code = Int(_ip(_arr_buf(arr, 1))[_arr_off(arr) + i - c0])
+                    if code < 0 or code >= _arr_len(_arr_dict(arr)):
+                        table.free()
+                        v.free()
+                        return -1
+                    x = Int(_ip(Int(_lp(Int(K.remap[k]))[c]))[code])
+                else:
+                    x = _key_value(kind, arr, i - c0) - Int(K.base[k])
+                v[k] = Int64(x)
+                h = _mix(h ^ UInt64(x))
+            var pos = Int(h & UInt64(tsize - 1))
+            while True:
+                var g = Int(table[pos])
+                if g < 0:
+                    g = ng
+                    ng += 1
+                    table[pos] = Int32(g)
+                    for k in range(n_keys):
+                        _lp(Int(kv[k]))[g] = v[k]
+                    gids[i] = Int32(g)
+                    break
+                var same = True
+                for k in range(n_keys):
+                    if _lp(Int(kv[k]))[g] != v[k]:
+                        same = False
+                        break
+                if same:
+                    gids[i] = Int32(g)
+                    break
+                pos = (pos + 1) & (tsize - 1)
+    table.free()
+    v.free()
+    return ng

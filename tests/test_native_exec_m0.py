@@ -4,7 +4,7 @@ Python compiles the plan once and makes ONE native call (`mx_execute`); inputs g
 Arrow C Data Interface and the result comes back as Arrow buffers the executor allocated (no NumPy
 on the way in or out). Group keys, aggregate finishing (mean, count), sorting and building the
 output (string keys included) all happen in Mojo. Anything outside M0 falls back to the existing
-path with the same answer. Opt-in with MXFRAME_NATIVE=1 during the spike."""
+path with the same answer. On by default since F-031 (MXFRAME_NATIVE=0 turns it off)."""
 import importlib
 import subprocess
 import sys
@@ -29,6 +29,7 @@ pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not
 @pytest.fixture
 def native(monkeypatch):
     monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    monkeypatch.setitem(nx._last, "path", None)      # no stale path from an earlier test
     calls = []
     real = nx._call
 
@@ -60,7 +61,7 @@ def test_q1_q6_one_native_call_equal_to_duckdb_and_the_old_path(tpch, native, mo
     tables = q_mx.load_mem(q, tpch)
     got = q_mx.run_mem(q, tables, "cpu")
     assert len(native) == 1                                   # the whole plan: one call
-    assert nx.last_path() == "native_m0"
+    assert nx.last_path() == "native"
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = q_mx.run_mem(q, tables, "cpu")
     assert got.schema == old.schema
@@ -107,7 +108,7 @@ PLANS = {
 def test_shapes_match_the_old_path(native, monkeypatch, name, chunks):
     t = _table(chunks=chunks)
     got = PLANS[name](t).compute(device="cpu")
-    assert nx.last_path() == "native_m0", nx.last_decline()
+    assert nx.last_path() == "native", nx.last_decline()
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = PLANS[name](t).compute(device="cpu")
     assert got.schema == old.schema, (got.schema, old.schema)
@@ -126,7 +127,7 @@ def test_shapes_match_the_old_path(native, monkeypatch, name, chunks):
 def test_sliced_input_with_offsets(native, monkeypatch):
     t = _table(n=30_000).slice(1234, 20_000)
     got = PLANS["dict key, sort"](t).compute(device="cpu")
-    assert nx.last_path() == "native_m0"
+    assert nx.last_path() == "native"
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = PLANS["dict key, sort"](t).compute(device="cpu")
     np.testing.assert_allclose(got.column("s").to_pylist(), old.column("s").to_pylist(), rtol=1e-12)
@@ -134,11 +135,6 @@ def test_sliced_input_with_offsets(native, monkeypatch):
 
 
 DECLINED = {
-    "join": lambda t: LazyFrame(t).join(LazyFrame(t.select(["h", "d"]).slice(0, 10)), on="h")
-        .groupby("f").agg(col("v").sum().alias("s")).sort("f"),
-    "having": lambda t: LazyFrame(t).groupby("f").agg(col("v").sum().alias("s"))
-        .filter(col("s") > lit(1.0)).sort("f"),
-    "sort by an aggregate": lambda t: LazyFrame(t).groupby("f").agg(col("v").sum().alias("s")).sort("s"),
     "no aggregate": lambda t: LazyFrame(t).filter(col("d") < lit(5)).select("f", "v"),
 }
 
@@ -147,15 +143,31 @@ DECLINED = {
 def test_outside_m0_falls_back_with_the_same_answer(native, monkeypatch, name):
     t = _table()
     got = DECLINED[name](t).compute(device="cpu")
-    assert nx.last_path() != "native_m0"
+    assert nx.last_path() != "native"
     assert len(native) == 0                                   # declined before any native call
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = DECLINED[name](t).compute(device="cpu")
     assert got.equals(old)
 
 
-def test_off_by_default(monkeypatch):
+def test_aggregate_after_a_join_runs_natively_on_the_materialized_join(native, monkeypatch):
+    """The join is materialized first (Python orchestration until M2); the aggregate over its result
+    is a single-table plan, which the executor runs since M1."""
+    t = _table()
+    plan = lambda: (LazyFrame(t).join(LazyFrame(t.select(["h", "d"]).slice(0, 10)), on="h")
+                    .groupby("f").agg(col("v").sum().alias("s")).sort("f").compute(device="cpu"))
+    got = plan()
+    assert nx.last_path() == "native" and len(native) == 1
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    old = plan()
+    np.testing.assert_allclose(got.column("s").to_pylist(), old.column("s").to_pylist(), rtol=1e-12)
+    assert got.column("f").to_pylist() == old.column("f").to_pylist()
+
+
+def test_on_by_default_and_opt_out(monkeypatch):
     monkeypatch.delenv("MXFRAME_NATIVE", raising=False)
+    assert nx.enabled()                                       # default since F-031
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
     assert not nx.enabled()
 
 
@@ -178,7 +190,7 @@ print("@@", nx.last_path(), "pandas" in sys.modules)
     root = Path(__file__).resolve().parent
     code = f"import sys; sys.path.insert(0, {str(root)!r}); import conftest\n" + code
     p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
-    assert "@@ native_m0 False" in p.stdout, (p.stdout[-500:], p.stderr[-1500:])
+    assert "@@ native False" in p.stdout, (p.stdout[-500:], p.stderr[-1500:])
 
 
 def test_chunks_with_different_dictionaries(native, monkeypatch):
@@ -195,7 +207,7 @@ def test_chunks_with_different_dictionaries(native, monkeypatch):
     lf = lambda: (LazyFrame(t).filter(col("d") < lit(80)).groupby("f")
                   .agg(col("v").sum().alias("s"), col("v").count().alias("n")).sort("f", descending=[True]))
     got = lf().compute(device="cpu")
-    assert nx.last_path() == "native_m0", nx.last_decline()
+    assert nx.last_path() == "native", nx.last_decline()
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = lf().compute(device="cpu")
     assert got.column("f").to_pylist() == old.column("f").to_pylist() == ["R", "Q", "N", "A"]
@@ -212,7 +224,7 @@ def test_columns_chunked_differently(native, monkeypatch):
     v2 = pa.chunked_array([v.chunk(0).slice(0, 11000), v.chunk(0).slice(11000)])
     t2 = t.set_column(0, "f", cut).set_column(3, "v", v2)
     got = PLANS["dict key, sort"](t2).compute(device="cpu")
-    assert nx.last_path() == "native_m0", nx.last_decline()
+    assert nx.last_path() == "native", nx.last_decline()
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = PLANS["dict key, sort"](t).compute(device="cpu")
     assert got.column("n").to_pylist() == old.column("n").to_pylist()
@@ -227,7 +239,7 @@ def _check_same(lf_fn, monkeypatch, expect_native=True):
     path, why = nx.last_path(), nx.last_decline()
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     old = lf_fn().compute(device="cpu")
-    assert (path == "native_m0") == expect_native, why
+    assert (path == "native") == expect_native, why
     assert got.schema == old.schema and got.num_rows == old.num_rows
     for c in got.column_names:
         g, o = got.column(c).to_pylist(), old.column(c).to_pylist()
@@ -266,15 +278,19 @@ def test_more_than_4096_groups(monkeypatch):
                 .sort("big"), monkeypatch)
 
 
-def test_dictionary_too_big_to_merge_is_declined_after_the_call(native, monkeypatch):
+def test_large_dictionaries_merge_natively(native, monkeypatch):
+    """M0 capped merged dictionaries at 4096 strings (linear merge, declined past it); since M1 the
+    merge hashes the strings, so 5000 distinct strings over chunks with different dictionaries run."""
     n = 20_000
-    words = [f"w{i:05d}" for i in range(5000)]
     r = np.random.default_rng(2)
-    t = pa.table({"f": pa.DictionaryArray.from_arrays(A(r.integers(0, 5000, n).astype(np.int32)), A(words)),
-                  "v": A(r.random(n))})
-    why = _check_same(lambda: LazyFrame(t).groupby("f").agg(col("v").sum().alias("s")).sort("f"),
-                      monkeypatch, expect_native=False)
-    assert "code -13" in why and len(native) == 1      # Mojo looked, declined, the old path answered
+    parts = []
+    for shift in (0, 1700, 3400):
+        words = [f"w{(i + shift) % 5000:05d}" for i in range(5000)]
+        parts.append(pa.table({"f": pa.DictionaryArray.from_arrays(A(r.integers(0, 5000, n).astype(np.int32)), A(words)),
+                               "v": A(r.random(n))}))
+    t = pa.concat_tables(parts)
+    _check_same(lambda: LazyFrame(t).groupby("f").agg(col("v").sum().alias("s")).sort("f", descending=[True]),
+                monkeypatch)
 
 
 def test_dictionaries_repeating_in_non_adjacent_chunks(monkeypatch):

@@ -1714,7 +1714,7 @@ class CustomOpsCompiler(GraphCompiler):
         # into the aggregate first: the fused kernels accumulate float64 in float64, while the GPU
         # path it used to fall back to rounds float64 columns to float32 (F-016 fuzz seed 5061).
         plan = self._inline_project_into_aggregate(plan)
-        # F-030 -- native executor (opt-in during the M0 spike): the whole plan in one Mojo call
+        # F-030 / F-031 -- native executor: the whole plan in one Mojo call
         if _native_exec is not None and _native_exec.enabled():
             try:
                 _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
@@ -1726,6 +1726,15 @@ class CustomOpsCompiler(GraphCompiler):
             _fused = try_fused_aggregate(self, plan, having_pred, post_ops, optimizer_trace, t0)
             if _fused is not None:
                 return _fused
+        # A plan the GPU session's own pipeline declined is answered on the CPU: by the executor
+        # first, so CPU and GPU sessions give the same digits (F-022 / F-031)
+        if _native_exec is not None and _native_exec.enabled() and self._session_device == "gpu":
+            try:
+                _native = _native_exec.try_execute(self, plan, having_pred, post_ops, gpu_fallback=True)
+            except Exception as _exc:
+                _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
+            if _native is not None:
+                return _native
 
         # 1b2 -- Global aggregate shortcut: bypass MAX Engine for un-grouped aggs.
         # For large tables with a filter, try the fused masked-kernel path first

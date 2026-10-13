@@ -26,6 +26,8 @@ Program/ABI contract (keep in sync with pipeline_program.py):
   code   int32[]  : header (16 ints) then 5-int instructions [op,dst,a,b,c]
                     in the order prologue, pred, body, aggs.
   consts float64[], set_bytes uint8[], set_meta int64[] (offset, length, lo)*
+  column dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8, 5 | (slot << 8) = int32 dictionary codes plus the
+  integer in chunk-table column `slot` (the native executor's string predicates, F-031)
   chunk table int64[n_chunks, 2 + n_cols]: row_start, row_end, then per column the
                     chunk's base address minus row_start * itemsize, so that
                     `addr + row * itemsize` is valid for every row of the chunk
@@ -353,7 +355,16 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
         var d = regs + Int(ins[1]) * VEC
         if op == OP_LOAD_COL:
             var c = Int(ins[2])
-            _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
+            var dt = Int(p.dtypes[c])
+            if (dt & 255) == 5:
+                # dictionary codes of this chunk, shifted to its dictionary's place in the
+                # concatenation of all chunks' dictionaries (the offset sits in tbl slot dt >> 8)
+                _load_col(d, Int(cols[c]), 0, i0, sel, use_sel, n)
+                var off = Float64(Int(cols[dt >> 8]))
+                for i in range(n):
+                    d[i] += off
+            else:
+                _load_col(d, Int(cols[c]), dt, i0, sel, use_sel, n)
         elif op == OP_LOAD_CONST:
             var v = SIMD[F64, W](p.consts[Int(ins[2])])
             var i = 0

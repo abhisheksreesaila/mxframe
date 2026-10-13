@@ -1,4 +1,4 @@
-"""Native executor front end (F-030, milestone M0 of docs/design/mojo-executor.md).
+"""Native executor front end (F-030 / F-031, milestones M0-M1 of docs/design/mojo-executor.md).
 
 Python only plans: it checks the plan shape, compiles the expressions to bytecode (the existing
 `pipeline_program` compiler), hands the input columns over through the Arrow C Data Interface and
@@ -6,10 +6,14 @@ makes ONE call, `mx_execute` in ``libmxexec_cpu.so``. Group keys, filtering, agg
 means / counts, sorting and building the output columns all run in Mojo; the result buffers are
 wrapped zero-copy and freed by the executor when the table is garbage collected.
 
-M0 covers ``Sort(all group keys)? Aggregate(Filter*(Scan))`` on the CPU, with dictionary-encoded
-string keys (each chunk may have its own dictionary; up to 4096 distinct strings) and int32 / int64 keys, null-free numeric value columns, and sum / mean / count (min /
-max without NaN handling). Everything else returns ``None`` and the existing path runs: the
-executor never changes an answer. Opt-in during the spike: ``MXFRAME_NATIVE=1``.
+Covered: ``Limit? Sort? Having? Aggregate(Filter*(Scan))`` on the CPU, with string keys (utf8, or
+dictionary-encoded with a dictionary per chunk; merged by hashing in Mojo) and int32 / int64 keys
+(any range: direct, compacted or hashed),
+null-free numeric value columns, and sum / mean / count (min / max without NaN handling). HAVING is
+an AND of ``aggregate <op> number``; ORDER BY any mix of group keys and aggregates. Join results are
+materialized before the aggregate, so this is the final stage of most queries. Everything else
+returns ``None`` and the existing path runs: the executor never changes an answer.
+On by default; ``MXFRAME_NATIVE=0`` turns it off.
 """
 
 from __future__ import annotations
@@ -22,11 +26,14 @@ from typing import Optional
 
 import pyarrow as pa
 
-from .lazy_frame import Aggregate, Filter, Scan, Sort
+from .lazy_frame import Aggregate, Filter, Limit, Scan, Sort
 
 MAGIC = 0x4D584531
-MAX_GROUPS = 1 << 20
-K_DICT, K_I32, K_I64 = 0, 1, 2
+MAX_GROUPS = 1 << 20          # key ranges addressed directly
+MAX_COMPACT = 1 << 27         # key ranges compacted through a presence table (bytes + int32 per code)
+_CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
+_FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
+K_DICT, K_I32, K_I64, K_STR = 0, 1, 2, 3
 _OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4}
 _DT = {pa.int32(): 0, pa.int64(): 1, pa.float32(): 2, pa.float64(): 3}
 
@@ -37,7 +44,8 @@ _RELEASE = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
 
 
 def enabled() -> bool:
-    return os.environ.get("MXFRAME_NATIVE", "0") in ("1", "true", "on")
+    """On by default since F-031; MXFRAME_NATIVE=0 turns it off (the existing paths answer)."""
+    return os.environ.get("MXFRAME_NATIVE", "1") not in ("0", "false", "off")
 
 
 def _path():
@@ -105,6 +113,8 @@ def _key_kind(col: pa.ChunkedArray):
         if any(ch.dictionary.null_count for ch in col.chunks):
             return None
         return K_DICT          # chunks may carry different dictionaries: the executor merges them
+    if pa.types.is_string(t):
+        return K_STR           # hashed to entry ids in Mojo
     return {pa.int32(): K_I32, pa.int64(): K_I64}.get(t)
 
 
@@ -138,18 +148,48 @@ def _segments(columns):
     return out
 
 
-def try_execute(compiler, plan, having_pred, post_ops) -> Optional[pa.Table]:
-    """Run the whole plan in one native call, or None (the caller's path runs instead)."""
+def _having_terms(pred, names):
+    """AND-ed ``output <op> number`` terms as (output index, cmp code, constant), else None."""
+    if pred is None:
+        return []
+    if pred.op == "and":
+        out = []
+        for a in pred.args:
+            t = _having_terms(a, names)
+            if t is None:
+                return None
+            out += t
+        return out
+    if pred.op not in _CMP or len(pred.args) != 2:
+        return None
+    a, b = pred.args
+    op = pred.op
+    if getattr(a, "op", None) == "lit" and getattr(b, "op", None) == "col":
+        a, b, op = b, a, _FLIP[op]
+    if getattr(a, "op", None) != "col" or getattr(b, "op", None) != "lit":
+        return None
+    v = b.args[0]
+    if a.args[0] not in names or isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if isinstance(v, int) and abs(v) > 2 ** 53:
+        return None
+    return [(names.index(a.args[0]), _CMP[op], float(v))]
+
+
+def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = False) -> Optional[pa.Table]:
+    """Run the whole plan in one native call, or None (the caller's path runs instead).
+    `gpu_fallback`: a GPU session whose own pipeline declined the plan answers it here, on the CPU."""
     _last["path"] = None
     t_start = _time.perf_counter()
     if not enabled():
-        return _decline("disabled (MXFRAME_NATIVE != 1)")
-    if getattr(compiler, "_device_arg", None) != "cpu":
-        return _decline("M0 runs device='cpu' only")
+        return _decline("disabled (MXFRAME_NATIVE=0)")
+    if getattr(compiler, "_device_arg", None) != "cpu" and not gpu_fallback:
+        return _decline("CPU executor: device='cpu' (or a GPU session's fallback)")
+    from . import coproc_fused
+    if coproc_fused.current_policy() is not None:
+        return _decline("CPU+GPU co-processing policy active")
     if not available():
         return _decline("libmxexec_cpu.so not built")
-    if having_pred is not None:
-        return _decline("HAVING not in M0")
     if not isinstance(plan, Aggregate) or not plan.aggs:
         return _decline("plan is not an aggregate")
     preds, node = [], plan.input
@@ -167,29 +207,49 @@ def try_execute(compiler, plan, having_pred, post_ops) -> Optional[pa.Table]:
         if e.op != "col" or e._alias:
             return _decline("derived group key")
         keys.append(e.args[0])
-    sorts = []
+    sort_node, limit = None, -1
     for op in post_ops or []:
-        if not isinstance(op, Sort) or sorts:
-            return _decline(f"post-op {type(op).__name__} not in M0")
-        for e, desc in zip(op.by, op.descending):
-            if e.op != "col" or e.args[0] not in keys:
-                return _decline("sort by something other than the group keys")
-            sorts.append((keys.index(e.args[0]), bool(desc)))
-    if keys and sorted(k for k, _ in sorts) != list(range(len(keys))):
-        return _decline("grouped result without a sort on every group key")
+        if isinstance(op, Sort) and sort_node is None and limit < 0:
+            sort_node = op
+        elif isinstance(op, Limit) and limit < 0:
+            limit = int(op.n)
+        else:
+            return _decline(f"post-op {type(op).__name__} in this position")
+    sort_by = []                                  # (name, descending)
+    if sort_node is not None:
+        for e, desc in zip(sort_node.by, sort_node.descending):
+            if e.op != "col":
+                return _decline("sort by an expression")
+            sort_by.append((e.args[0], bool(desc)))
 
     from .pipeline_program import compile_pipeline
-    prog = compile_pipeline(preds, list(plan.aggs), table)
+    prog = compile_pipeline(preds, list(plan.aggs), table, concat_dicts=True)
     if prog is None:
         return _decline("expression not supported by the bytecode compiler")
-    if prog.dict_arrays or prog.nan_slots:
-        return _decline("string predicates / NaN-aware min-max not in M0")
+    names = [name for name, _, _ in prog.outputs]
+    sorts = []
+    for name, desc in sort_by:
+        if name in keys:
+            sorts.append((0, keys.index(name), int(desc)))
+        elif name in names:
+            sorts.append((1, names.index(name), int(desc)))
+        else:
+            return _decline("sort by a column that is not a key or an aggregate")
+    having = _having_terms(having_pred, names)
+    if having is None:
+        return _decline("HAVING other than AND-ed aggregate <op> number")
+    if prog.dict_arrays:
+        return _decline("string predicates outside concat mode")
+    dcols = [c for c in prog.columns if c in prog.dict_concat]      # string columns in predicates
 
     cols = [table.column(c) for c in prog.columns]
     dtypes = []
-    for c in cols:
+    for name, c in zip(prog.columns, cols):
+        if name in prog.dict_concat:                  # codes + the chunk's offset (dtype 5)
+            dtypes.append(5 | ((len(prog.columns) + dcols.index(name)) << 8))
+            continue
         if c.type not in _DT or c.null_count:
-            return _decline(f"value column type {c.type} or nulls not in M0")
+            return _decline(f"value column type {c.type} or nulls")
         dtypes.append(_DT[c.type])
     key_cols = [table.column(k) for k in keys]
     kinds = []
@@ -219,16 +279,31 @@ def try_execute(compiler, plan, having_pred, post_ops) -> Optional[pa.Table]:
         n_keys, n_out = len(keys), len(prog.outputs)
         c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
         c_kinds = (ctypes.c_int64 * max(n_keys, 1))(*kinds)
-        c_outs = (ctypes.c_int64 * max(2 * n_out, 1))(
-            *[v for _, op, slot in prog.outputs for v in (_OPS[op], slot if slot is not None else 0)])
-        c_sorts = (ctypes.c_int64 * max(2 * len(sorts), 1))(*[v for k, d in sorts for v in (k, int(d))])
+        c_outs = (ctypes.c_int64 * max(3 * n_out, 1))(
+            *[v for name, op, slot in prog.outputs
+              for v in (_OPS[op], slot if slot is not None else 0, prog.nan_slots.get(name, -1))])
+        c_sorts = (ctypes.c_int64 * max(3 * len(sorts), 1))(*[v for t in sorts for v in t])
+        c_having = (ctypes.c_int64 * max(3 * len(having), 1))(*[v for j, c, _ in having for v in (j, c, 0)])
+        c_hconst = (ctypes.c_double * max(len(having), 1))(*[x for _, _, x in having])
+        from .pipeline_program import _dict_key
+        doffs = []
+        for seg in segs:
+            for name in dcols:
+                doffs.append(prog.dict_concat[name][_dict_key(seg[prog.columns.index(name)].dictionary)])
+        c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
+        code = prog.code
+        if dcols:                                     # the chunk table gets one offset slot per column
+            code = code.copy()
+            code[7] = len(prog.columns) + len(dcols)
         from .pipeline_kernels import default_threads
-        P = (ctypes.c_int64 * 18)(
-            MAGIC, 1, len(segs), len(cols), n_keys, n_out, len(sorts),
-            prog.code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
+        P = (ctypes.c_int64 * 25)(
+            MAGIC, 2, len(segs), len(cols), n_keys, n_out, len(sorts),
+            code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
             ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
-            default_threads(), MAX_GROUPS)
+            default_threads(), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
+            min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)), ctypes.addressof(c_hconst),
+            len(dcols), ctypes.addressof(c_doffs))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -252,7 +327,7 @@ def try_execute(compiler, plan, having_pred, post_ops) -> Optional[pa.Table]:
     names, out_cols = [], []
     for k, (name, kind) in enumerate(zip(keys, kinds)):
         a, b = int(O[3 + 2 * k]), int(O[4 + 2 * k])
-        if kind == K_DICT:
+        if kind in (K_DICT, K_STR):
             nbytes = ctypes.c_int32.from_address(a + 4 * n).value
             arr = pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)])
         elif kind == K_I32:
@@ -272,9 +347,9 @@ def try_execute(compiler, plan, having_pred, post_ops) -> Optional[pa.Table]:
         out_cols.append(arr)
     result = pa.Table.from_arrays(out_cols, names=names)
     total_ms = (_time.perf_counter() - t_start) * 1000
-    _last.update(path="native_m0", decline=None, native_ms=native_ms, py_ms=total_ms - native_ms)
+    _last.update(path="native", decline=None, native_ms=native_ms, py_ms=total_ms - native_ms)
     compiler.last_compile_provenance = {
         "device": "cpu", "rows": int(n), "grouped": bool(keys), "n_groups": int(n) if keys else 0,
-        "cache_hit": None, "compile_ms": 0.0, "path": "native_m0", "gpu_input_path": "arrow_c_data",
+        "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data",
     }
     return result

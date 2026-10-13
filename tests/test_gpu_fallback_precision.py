@@ -5,6 +5,7 @@ import pyarrow as pa
 import pytest
 
 import mxframe.custom_ops as co
+import mxframe.native_exec as nx
 from mxframe import LazyFrame, col, lit
 from mxframe.aot_kernels import AOT_AVAILABLE, GPU_AOT_AVAILABLE
 from mxframe.lazy_expr import when
@@ -77,8 +78,9 @@ def test_declined_plan_keeps_float64_digits_on_gpu(no_fused, name):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(co.CustomOpsCompiler, "_execute_cpu_aot", spy)
         out = CASES[name](t).sort("k").compute(device="gpu").to_pydict()
-    # answered by the float64 CPU kernels inside the GPU session, not by the float32 GPU kernels
-    assert ("gpu", None, True) in seen
+    # answered on the CPU in float64 inside the GPU session (by the executor since F-031, else by the
+    # CPU AOT kernels), not by the float32 GPU kernels
+    assert ("gpu", None, True) in seen or nx.last_path() == "native"
     assert out["k"] == list(range(7))
     for c, want in _reference(name, t).items():
         np.testing.assert_allclose(out[c], want, rtol=1e-12, err_msg=f"{name}: {c}")

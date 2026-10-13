@@ -36,6 +36,7 @@ def make_table(n=30_000):
 
 @pytest.fixture
 def spy(monkeypatch):
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")   # these test the fused pipeline, the executor's fallback
     calls = {"served": 0, "declined": 0}
     real = custom_ops.try_fused_aggregate
 

@@ -221,6 +221,7 @@ class PipelineProgram:
     n_instr: int
     identity: np.ndarray = field(default=None)  # float64 [n_slots] initial value per slot
     nan_slots: Dict[str, int] = field(default_factory=dict)  # min / max output -> hidden NaN-count slot
+    dict_concat: Dict[str, Dict[tuple, int]] = field(default_factory=dict)   # concat_dicts mode: name -> {dictionary key: offset}
 
     @property
     def n_slots(self) -> int:
@@ -368,9 +369,20 @@ class _Section:
         self.cse: Dict[tuple, int] = {}
 
 
+def _dict_key(d: pa.Array) -> tuple:
+    """Identity of a chunk's dictionary: its buffers (chunks sharing one dictionary share it)."""
+    bufs = d.buffers()
+    return tuple(b.address if b is not None else 0 for b in bufs) + (d.offset, len(d))
+
+
 class _Builder:
-    def __init__(self, table: pa.Table):
+    def __init__(self, table: pa.Table, concat_dicts: bool = False):
         self.table = table
+        # native executor: a string column's dictionary is the concatenation of its chunks'
+        # dictionaries (no unify, no row work); dict_concat[name] = {dictionary key: offset}
+        self.concat_dicts = concat_dicts
+        self.dict_concat: Dict[str, Dict[tuple, int]] = {}
+        self.dict_values: Dict[str, pa.Array] = {}
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
@@ -437,6 +449,28 @@ class _Builder:
 
     def dictionary(self, name: str) -> pa.Array:
         """The dictionary (distinct values) of a string column, built once."""
+        if self.concat_dicts:
+            if name not in self.dict_values:
+                col = self.table.column(name)
+                if not pa.types.is_dictionary(col.type) or col.type.index_type != pa.int32():
+                    raise Unsupported("string predicate on a column without int32 dictionary codes")
+                if col.null_count:
+                    raise Unsupported("string column has nulls")
+                offs, parts, pos = {}, [], 0
+                for ch in col.chunks:
+                    d = ch.dictionary
+                    if d.null_count:
+                        raise Unsupported("string column has nulls")
+                    k = _dict_key(d)
+                    if k not in offs:
+                        offs[k] = pos
+                        parts.append(d)
+                        pos += len(d)
+                if not parts:
+                    raise Unsupported("no rows")
+                self.dict_concat[name] = offs
+                self.dict_values[name] = pa.concat_arrays(parts) if len(parts) > 1 else parts[0]
+            return self.dict_values[name]
         if name not in self.dict_arrays:
             col = self.table.column(name)
             arr = _single_array(col)
@@ -703,20 +737,23 @@ class _Builder:
         return _Val(self.emit(OP_BETWEEN, x.vreg, self.as_reg(lo), self.as_reg(hi)), "bool")
 
 
-def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Optional[PipelineProgram]:
+def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
+                     concat_dicts: bool = False) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
-    existing path).
+    existing path). ``concat_dicts`` (native executor): string predicates test codes against the
+    concatenation of the chunks' dictionaries (``PipelineProgram.dict_concat``) instead of a
+    unified dictionary built over the rows.
     """
     try:
-        return _compile(predicates, aggs, table)
+        return _compile(predicates, aggs, table, concat_dicts)
     except Unsupported:
         return None
 
 
-def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> PipelineProgram:
-    b = _Builder(table)
+def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False) -> PipelineProgram:
+    b = _Builder(table, concat_dicts)
 
     # ── predicate section (dense rows) ─────────────────────────────────────
     pred_sec = _Section()
@@ -853,6 +890,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table) -> Pipel
         set_meta=np.ascontiguousarray(set_meta),
         columns=list(b.columns),
         dict_arrays=dict(b.dict_arrays),
+        dict_concat={n: o for n, o in b.dict_concat.items() if n in b.columns},
         slot_kinds=slot_kinds,
         outputs=outputs,
         nan_slots=nan_slots,
