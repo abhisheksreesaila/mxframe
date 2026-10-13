@@ -83,3 +83,41 @@ def test_keyed_group_by_rows_come_out_in_key_order(native, monkeypatch):
     assert nx.last_path() == "native"
     k = got.column("k").to_numpy()
     assert (np.diff(k) > 0).all()
+
+
+# Key ranges far wider than the input: mx_execute compacts the groups present instead of addressing
+# the whole range (D >= 16384 and D > 2 x rows). The executor does not report which grouping mode
+# ran, so the branch is reached by shape: k spans 100k values over 20k rows, (m, k) 800k.
+SPARSE = {
+    "one wide key, filter": (lambda t: LazyFrame(t).filter(col("d") < lit(400))
+        .groupby("k").agg(col("v").sum().alias("s"), col("v").count().alias("n")), False),
+    "composite wide keys": (lambda t: LazyFrame(t).groupby("m", "k")
+        .agg(col("v").min().alias("lo"), col("v").max().alias("hi")), False),
+    "dictionary x wide key, filter": (lambda t: LazyFrame(t).filter(col("d") < lit(700))
+        .groupby("f", "k").agg(col("v").mean().alias("m")), False),
+    "wide key, top 5": (lambda t: LazyFrame(t).groupby("k").agg(col("v").sum().alias("s"))
+        .sort("s", descending=[True]).limit(5), True),
+    "wide key, HAVING": (lambda t: LazyFrame(t).groupby("k").agg(col("v").sum().alias("s"))
+        .filter(col("s") > lit(60.0)), False),
+    "wide key, filter keeps nothing": (lambda t: LazyFrame(t).filter(col("d") < lit(0))
+        .groupby("k").agg(col("v").sum().alias("s")), False),
+}
+
+
+@pytest.mark.parametrize("chunks", [1, 3])
+@pytest.mark.parametrize("name", list(SPARSE))
+def test_sparse_key_range_matches_the_python_path(native, monkeypatch, name, chunks):
+    # 20k rows over a 100k-wide key (TPC-H Q11's shape: a few thousand part keys out of 200k)
+    plan, ordered = SPARSE[name]
+    t = _table(n=20_000, chunks=chunks)
+    got, old, path, decline = _both(plan, t, monkeypatch)
+    assert path == "native", decline
+    _same(got, old, ordered=ordered)
+
+
+def test_sparse_key_range_rows_in_key_order(native, monkeypatch):
+    t = _table(n=20_000, chunks=2)
+    got = LazyFrame(t).groupby("m", "k").agg(col("v").sum().alias("s")).compute(device="cpu")
+    assert nx.last_path() == "native"
+    m, k = got.column("m").to_numpy(), got.column("k").to_numpy()
+    assert (np.lexsort((k, m)) == np.arange(len(k))).all()

@@ -58,6 +58,7 @@ from std.utils.numerics import nan
 
 from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, big_alloc, free_big, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
 
+comptime SPARSE_MIN_RANGE = 16384   # direct key ranges below this never compact on sparsity
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
@@ -937,7 +938,13 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         s *= Int(K.card[k]) if not use_hash else 1
 
     var grouped = n_keys > 0
-    var compact = grouped and not use_hash and D > max_groups   # composite codes compacted to the groups present
+    var any_expr = False
+    for k in range(n_keys):
+        any_expr = any_expr or Int(K.kinds[k]) == K_EXPR
+    # composite codes compacted to the groups present: past the direct-addressing limit, or when the
+    # key range is much wider than the input (most of a per-worker partial over D groups would stay
+    # empty, yet every worker would zero and merge all of it)
+    var compact = grouped and not use_hash and (D > max_groups or (not any_expr and D >= SPARSE_MIN_RANGE and D > 2 * n_rows))
     if use_hash or compact:
         for k in range(n_keys):
             if Int(K.kinds[k]) == K_EXPR:             # expression keys: directly addressed only
@@ -1067,17 +1074,6 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         _free_kv(kv, n_keys)
         K.free()
         return rc if rc == E_BAD_KEY else E_PIPELINE
-    if grouped and not use_hash:
-        # per-key codes of every group, from its composite code (dense: the group id itself)
-        for k in range(n_keys):
-            var a = unsafe_alloc[Int64](G)
-            var st = Int(K.stride[k])
-            var cd = Int(K.card[k])
-            for g in range(G):
-                var c = Int(comp[g]) if compact else g
-                a[g] = Int64((c // st) % cd)
-            kv[k] = Int64(Int(a))
-    comp.free()
 
     # ── 4. which groups survive, in output order ─────────────────────────────────────────────
     var order = unsafe_alloc[Int64](max(G, 1))     # output position -> group id
@@ -1090,6 +1086,20 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             if cnt[g] > 0:
                 order[n_res] = Int64(g)
                 n_res += 1
+    if grouped and not use_hash:
+        # per-key codes of the surviving groups, from their composite codes (dense: the group id
+        # itself); read as kv[k][order[i]] only, so a wide, sparsely used key range costs no
+        # divisions for the groups that never occur
+        for k in range(n_keys):
+            var a = unsafe_alloc[Int64](G)
+            var st = Int(K.stride[k])
+            var cd = Int(K.card[k])
+            for i in range(n_res):
+                var g = Int(order[i])
+                var c = Int(comp[g]) if compact else g
+                a[g] = Int64((c // st) % cd)
+            kv[k] = Int64(Int(a))
+    comp.free()
     var has_str_key = False
     for k in range(n_keys):
         var kd = Int(K.kinds[k])
