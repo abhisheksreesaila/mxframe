@@ -120,8 +120,8 @@ orchestration around them: M2 is where the gap to Polars closes. Details: `docs/
 
 ### Row order (decision proposed in M1, for Abhishek)
 
-Unsorted GROUP BY results come out in key order, whichever grouping path runs (dense, compacted,
-hashed); ORDER BY ties keep that order, and LIMIT without ORDER BY returns the first groups in key
+Unsorted GROUP BY results come out in key order (strings by their bytes, so "Zz" before "a", as
+pandas does), whichever grouping path runs (dense, compacted, hashed); ORDER BY ties keep that order, and LIMIT without ORDER BY returns the first groups in key
 order. This is pandas' default (`groupby(sort=True)`) and is deterministic. The old Python path
 returned first appearance; SQL defines neither. Alternative if wanted: first appearance among the
 rows that pass the filter, which needs the interpreter to report the first surviving row per group.

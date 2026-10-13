@@ -336,7 +336,8 @@ Needs: design approved · Design: docs/design/mojo-executor.md · Time-box: a fe
   - Still float64 everywhere inside the interpreter; typed vectors and a hash-table aggregate (merged dictionaries are capped at 4096 strings, dense groups at 2^20) are M1.
   - Opt-in (`MXFRAME_NATIVE=1`) until M1 makes it the default.
 
-## F-031 Mojo executor M1: single-table pipelines [review]
+## F-031 Mojo executor M1: single-table pipelines [done]
+Reviewer PASS (round 3, 2026-10-12). Two decisions wait for Abhishek: the row order below, and moving the "within 1.5x Polars" check to M2.
 Needs: F-030
 - Finding that set the scope: joins are materialized before the aggregate, so the executor sees the final aggregate stage of every query as a single-table plan; M1 coverage is per query, not just Q1/Q6
 - [x] `Limit? Sort? Having? Aggregate(Filter*(Scan))` in one `mx_execute` call (plan v2): grouped results without ORDER BY in key order on every grouping path (the hash path reorders its first-appearance groups); ORDER BY any mix of keys and aggregates (stable merge sort on exact sort values: string ranks by bytes, integer codes, or integer ranks when hash-path codes pass 2^53; ties in key order; top-k with a heap when a LIMIT under 1/8 of the groups follows); HAVING as AND-ed `aggregate <op> number`; NaN-aware min / max (the hidden NaN-count slot); a NaN among ORDER BY values declines (`-15`)
