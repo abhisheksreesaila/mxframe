@@ -342,3 +342,29 @@ def test_fused_pipeline_declines_int64_past_2_53_too(monkeypatch):
     got = (LazyFrame(t).filter(col("x") > lit(1 << 53)).groupby("g").agg(col("v").sum().alias("s"))
            .sort("g").compute(device="cpu"))
     assert sum(got.column("s").to_pylist()) == n - len(x[::4])
+
+
+def test_native_gather_on_sliced_misaligned_chunks_and_per_chunk_dictionaries():
+    """Columns chunked at different boundaries (cut into common segments, offsets > 0) and a
+    dictionary column with a different dictionary per chunk, decoded by the gather."""
+    import mxframe.custom_ops as co
+    r = np.random.default_rng(12)
+    n = 40_000
+    vals = A(r.integers(-1000, 1000, n).astype(np.int64))
+    strs = pa.array([f"s{i % 13}" * (i % 3) for i in range(n)], type=pa.string())
+    a = pa.chunked_array([vals.slice(0, 7_000), vals.slice(7_000, 20_000), vals.slice(27_000)])
+    b = pa.chunked_array([strs.slice(0, 15_000), strs.slice(15_000)])
+    dparts = []
+    for lo, hi, words in ((0, 10_000, ["x", "y"]), (10_000, 31_000, ["y", "zz", ""]), (31_000, n, ["q"])):
+        dparts.append(pa.DictionaryArray.from_arrays(A(r.integers(0, len(words), hi - lo).astype(np.int32)), A(words)))
+    c = pa.chunked_array(dparts)
+    t = pa.table({"a": a, "b": b, "c": c}).slice(1_234, 35_000)
+    comp = co.CustomOpsCompiler(device="cpu")
+    idx = r.integers(0, t.num_rows, 25_000).astype(np.int64)
+    assert nx.try_gather(comp, t, idx) is None                       # a dictionary column: only when decoding
+    got = nx.try_gather(comp, t, idx, decode_dicts=True)
+    want = t.take(pa.array(idx))
+    assert got.column("a").to_pylist() == want.column("a").to_pylist()
+    assert got.column("b").to_pylist() == want.column("b").to_pylist()
+    assert got.column("c").to_pylist() == want.column("c").to_pylist()
+    assert pa.types.is_string(got.schema.field("c").type)
