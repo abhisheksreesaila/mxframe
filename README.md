@@ -119,22 +119,23 @@ reused results. Every result is checked against DuckDB.
 
 | total of 22 queries | MXFrame (CPU) | Polars | DuckDB |
 |---|---:|---:|---:|
-| SF10 | **6.45 s** | 15.20 s | 6.66 s |
-| SF1 | **0.73 s** | 1.34 s | 2.31 s |
+| SF10 | **3.82 s** | 14.12 s | 6.57 s |
+| SF1 | **0.52 s** | 1.33 s | 2.20 s |
 
-- **Against Polars:** faster on 20 of the 21 verified queries at SF10 (Polars' Q1 result is wrong,
-  see below) and on 14 of 22 at SF1.
-- **Against DuckDB:** faster on 17 of 22 at SF10 and on all 22 at SF1.
+- **Against Polars:** faster on all 21 verified queries at SF10 (Polars' Q1 result is wrong, see
+  below) and on 15 of 22 at SF1.
+- **Against DuckDB:** faster on 18 of 22 at SF10 and on all 22 at SF1.
 
 Each optimization is explained with a diagram, its before/after numbers, and the Mojo feature it
 relies on (or a plain statement when it is ordinary engineering) in
 **[docs/optimizations.md](docs/optimizations.md)**. Caveats:
 
-- The machine was shared during this run; a quiet-machine rerun is still to do.
+- The machine was shared during this run (median load average 4.4); a quiet-machine rerun is
+  still to do.
 - `import mxframe` warms its kernel libraries in the background, and that finishes during the
   untimed staging. Polars and DuckDB have no equivalent step.
-- Polars' Q1 at SF10 takes 2.8 s and its result differs from DuckDB's, so it is not counted as a
-  win. Leaving Q1 out, SF10 totals are MXFrame 6.39 s, Polars 12.40 s, DuckDB 6.44 s.
+- Polars' Q1 at SF10 takes 2.6 s and its result differs from DuckDB's, so it is not counted as a
+  win. Leaving Q1 out, SF10 totals are MXFrame 3.75 s, Polars 11.54 s, DuckDB 6.35 s.
 - One thing works against MXFrame: it combines Arrow chunks inside the clock.
 - Import time and the Parquet read are reported separately, not hidden. The earlier scoreboards
   below include them and predate this work; MXFrame still reads Parquet through PyArrow (F-021).

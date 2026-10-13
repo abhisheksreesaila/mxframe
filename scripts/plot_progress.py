@@ -1,7 +1,7 @@
 """Charts for docs/optimizations.md and the README (F-039): plain SVG, light and dark, from the
 engine-only benchmark CSVs in docs/bench/.
 
-    pixi run python scripts/plot_progress.py docs/bench/m2l-engine.csv
+    pixi run python scripts/plot_progress.py docs/bench/m2n-engine.csv M2n
 
 1. docs/img/progress.svg: the 22-query total per milestone, SF10 and SF1 side by side (two panels,
    one axis each), MXFrame as a line, Polars and DuckDB (from the final run) as reference lines.
@@ -30,6 +30,7 @@ MILESTONES = [
     ("M2e", {"10": "m2e-engine", "1": "m2e-engine"}),
     ("M2g", {"10": "m2g-engine", "1": "m2g-engine"}),
     ("M2h", {"10": "m2h-engine", "1": "m2h-engine"}),
+    ("M2l", {"10": "m2l-engine", "1": "m2l-engine"}),
 ]
 
 STYLE = """
@@ -129,7 +130,11 @@ def per_query_svg(final_rows, sf, titles):
     mx, pl = per_query(final_rows, "mx-cpu", sf), per_query(final_rows, "polars", sf)
     qs = sorted(q for q in mx if q in pl)
     ratio = {q: pl[q] / mx[q] for q in qs}             # >1: MXFrame faster
-    wins = sum(r > 1 for r in ratio.values())
+    bad = {(r["engine"], int(r["query"])) for r in final_rows if r["sf"] == sf
+           and r["engine"] in ("mx-cpu", "polars") and r.get("verdict") not in ("ok", "drift")}
+    wrong = {q for _, q in bad}
+    verified = [q for q in qs if q not in wrong]       # a wrong result is never counted as a win
+    wins = sum(ratio[q] > 1 for q in verified)
     CAP = 16.0                                         # longer bars are cut here, their label says so
     W, row, top = 780, 22, 96
     right = math.log2(min(CAP, max(2.0, max(ratio.values()))))
@@ -140,7 +145,7 @@ def per_query_svg(final_rows, sf, titles):
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" '
            f'aria-label="Per-query speed against Polars at SF{sf}">', f"<style>{STYLE}</style>",
            f'<rect class="bg" width="{W}" height="{H}" rx="8"/>',
-           f'<text class="t1 title" x="24" y="32">SF{sf}: MXFrame against Polars, per TPC-H query ({wins} of {len(qs)} faster)</text>',
+           f'<text class="t1 title" x="24" y="32">SF{sf}: MXFrame against Polars, per TPC-H query ({wins} of {len(verified)} verified faster)</text>',
            '<text class="t2" x="24" y="52">times faster (right) or slower (left) than Polars, log scale; engine-only first runs</text>',
            f'<text class="t2" x="{mid + 8:.1f}" y="{top - 14}">faster \u2192</text>',
            f'<text class="t2" x="{mid - 8:.1f}" y="{top - 14}" text-anchor="end">\u2190 slower</text>']
@@ -154,7 +159,9 @@ def per_query_svg(final_rows, sf, titles):
         w = max(-left, min(right, math.log2(r))) * scale
         x1, ww = (mid, w) if w >= 0 else (mid + w, -w)
         cls = "fast" if r >= 1 else "slow"
-        out.append(f'<text class="t2" x="{24}" y="{yy + 14}">Q{q} {esc(titles.get(q, ""))}</text>')
+        who = [n for e, n in (("mx-cpu", "MXFrame"), ("polars", "Polars")) if (e, q) in bad]
+        note = f" ({' and '.join(who)} result wrong)" if who else ""
+        out.append(f'<text class="t2" x="{24}" y="{yy + 14}">Q{q} {esc(titles.get(q, ""))}{note}</text>')
         out.append(f'<rect class="{cls}" x="{x1:.1f}" y="{yy + 3}" width="{max(ww, 2):.1f}" height="{row - 6}" rx="3">'
                    f'<title>Q{q}: MXFrame {mx[q]:.0f} ms, Polars {pl[q]:.0f} ms</title></rect>')
         label = (f"{r:.1f}x" + (" \u2192" if r > CAP else "")) if r >= 1 else f"{1 / r:.1f}x slower"
@@ -167,8 +174,8 @@ def per_query_svg(final_rows, sf, titles):
 
 
 def main():
-    final = Path(sys.argv[1]) if len(sys.argv) > 1 else BENCH / "m2l-engine.csv"
-    label = sys.argv[2] if len(sys.argv) > 2 else "M2l"
+    final = Path(sys.argv[1]) if len(sys.argv) > 1 else BENCH / "m2n-engine.csv"
+    label = sys.argv[2] if len(sys.argv) > 2 else "M2n"
     rows = _rows(final)
     sys.path.insert(0, str(ROOT / "scripts"))
     from tpch_user.spec import TITLES
