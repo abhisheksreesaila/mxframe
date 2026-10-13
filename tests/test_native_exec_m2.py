@@ -58,9 +58,8 @@ def _fact(n=120_000, seed=1, chunks=3):
     return pa.concat_tables(parts)
 
 
-def _dim(seed=2):
+def _dim(seed=2, n=5000):
     r = np.random.default_rng(seed)
-    n = 5000
     return pa.table({
         "ok": A(np.arange(n, dtype=np.int64)),
         "pri": pa.DictionaryArray.from_arrays(A(r.integers(0, 3, n).astype(np.int32)),
@@ -183,3 +182,31 @@ def test_tpch_join_queries_filter_their_leaves_natively(tpch, filters, monkeypat
         assert cmp.ok, (q, cmp.message)
     for q in (3, 5, 10, 12, 14, 19):
         assert q in native, (q, native)
+
+
+@pytest.mark.parametrize("native_on", ["1", "0"])
+def test_case_when_column_above_a_join_is_decoded_on_the_joined_rows_only(monkeypatch, native_on):
+    """Q12's o_orderpriority: a dictionary column used in CASE WHEN above the join (a use the
+    Python path can't take on dictionaries) is no longer decoded in full up front: the join decodes
+    it after its final gather, so only joined rows are decoded."""
+    from mxframe.lazy_expr import when
+    import mxframe.arrow_dict as ad
+    monkeypatch.setenv("MXFRAME_NATIVE", native_on)
+    sizes = []
+    real = ad.decode
+
+    def spy(x, *a, **k):
+        sizes.append(len(x))
+        return real(x, *a, **k)
+
+    monkeypatch.setattr(ad, "decode", spy)
+    f, d = _fact(), _dim(n=50_000)            # fact keys are < 5000: ~4.9k joined rows of 50k
+    plan = lambda: (LazyFrame(f).filter(col("qty") < lit(3.0)).join(LazyFrame(d), on="ok")
+                    .groupby("mode").agg(when(col("pri").isin(["1-URGENT", "2-HIGH"]), lit(1.0), lit(0.0))
+                                         .sum().alias("high")).sort("mode"))
+    got = plan().compute(device="cpu")
+    assert sizes and max(sizes) < 10_000, sizes            # never the 50,000-row dimension in full
+    monkeypatch.setattr(ad, "decode", real)
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    monkeypatch.setattr("mxframe.io_parquet._leaf_filter_cols", lambda plan: {})
+    _same(got, plan().compute(device="cpu"))

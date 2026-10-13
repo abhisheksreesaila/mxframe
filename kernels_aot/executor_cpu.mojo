@@ -1292,6 +1292,19 @@ def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP
 #         (int32 offsets[n+1]*, bytes*)
 
 comptime FMAGIC = 0x4D584631
+comptime HUGE = 1 << 21
+
+
+def _big_alloc(n: Int) -> BP:
+    """A buffer written once, in parallel, right after allocation: 2 MiB-aligned and marked for
+    transparent huge pages above 2 MiB, so first-touch faults are 512x fewer (24 threads faulting
+    4 KiB pages serialize on the kernel's mm lock: ~25 ms for 50 MB at SF1)."""
+    if n < HUGE:
+        return unsafe_alloc[UInt8](n, alignment=64)
+    var size = (n + HUGE - 1) // HUGE * HUGE
+    var b = unsafe_alloc[UInt8](size, alignment=HUGE)
+    _ = external_call["madvise", Int32](Int(b), size, Int32(14))     # MADV_HUGEPAGE
+    return b
 comptime OK_FIXED = 0
 comptime OK_UTF8 = 1
 comptime OK_DICT = 2
@@ -1358,7 +1371,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
     var nt = max(1, min(threads, morsels))
-    var mask = unsafe_alloc[UInt8](max(n_rows, 1))
+    var mask = _big_alloc(max(n_rows, 1))
     var mcnt = unsafe_alloc[Int64](morsels)                    # surviving rows per morsel
     var mbytes = unsafe_alloc[Int64](morsels * max(n_out, 1))  # string bytes per morsel per column
     for i in range(morsels * max(n_out, 1)):
@@ -1451,7 +1464,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             asize += _align8(n_sel * Int(sizes[j]))
         else:
             asize += _align8((n_sel + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
-    var arena = unsafe_alloc[UInt8](max(asize, 8), alignment=64)
+    var arena = _big_alloc(max(asize, 8))
     var dst_a = unsafe_alloc[Int64](max(n_out, 1))    # values / offsets
     var dst_b = unsafe_alloc[Int64](max(n_out, 1))    # string bytes
     var at = Int(arena)
@@ -1490,15 +1503,33 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                     var rr = r
                     if kd == OK_FIXED:
                         var sz = Int(sizes[j])
-                        var src = _bp(_arr_buf(arr, 1) + _arr_off(arr) * sz)
-                        var dst = _bp(Int(dst_a[j]))
-                        for i in range(pos, stop):
-                            if mask[i] != 0:
-                                var s0 = (i - c0) * sz
-                                var d0 = rr * sz
-                                for b in range(sz):
-                                    dst[d0 + b] = src[s0 + b]
-                                rr += 1
+                        var base = _arr_buf(arr, 1) + _arr_off(arr) * sz
+                        if sz == 8 or sz == 16:             # int64 / float64 / dates64 / decimal128
+                            var w = sz // 8
+                            var src = _lp(base)
+                            var dst = _lp(Int(dst_a[j]))
+                            for i in range(pos, stop):
+                                if mask[i] != 0:
+                                    for b in range(w):
+                                        dst[rr * w + b] = src[(i - c0) * w + b]
+                                    rr += 1
+                        elif sz == 4:                         # int32 / float32 / date32
+                            var src = _ip(base)
+                            var dst = _ip(Int(dst_a[j]))
+                            for i in range(pos, stop):
+                                if mask[i] != 0:
+                                    dst[rr] = src[i - c0]
+                                    rr += 1
+                        else:
+                            var src = _bp(base)
+                            var dst = _bp(Int(dst_a[j]))
+                            for i in range(pos, stop):
+                                if mask[i] != 0:
+                                    var s0 = (i - c0) * sz
+                                    var d0 = rr * sz
+                                    for b in range(sz):
+                                        dst[d0 + b] = src[s0 + b]
+                                    rr += 1
                     else:
                         var offs = _ip(Int(dst_a[j]))
                         var data = _bp(Int(dst_b[j]))

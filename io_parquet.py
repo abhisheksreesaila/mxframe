@@ -647,6 +647,24 @@ def _renamed_ref(name: str, refs) -> bool:
     return any(r.startswith(stem) and (len(r) == len(stem) or r[len(stem):].isdigit()) for r in refs)
 
 
+def _leaf_filter_cols(plan: LogicalPlan) -> dict:
+    """id(leaf) -> columns read by the Filter chain directly above that leaf."""
+    out: dict = {}
+
+    def walk(node, above):
+        if isinstance(node, (Scan, ParquetScan)):
+            out[id(node)] = out.get(id(node), set()) | above
+        elif isinstance(node, Filter):
+            walk(node.input, above | set(_expr_cols(node.predicate)))
+        elif isinstance(node, Join):
+            walk(node.left, set())
+            walk(node.right, set())
+        elif hasattr(node, "input"):
+            walk(node.input, set())
+    walk(plan, set())
+    return out
+
+
 def _leaves(plan: LogicalPlan):
     if isinstance(plan, (Scan, ParquetScan)):
         yield plan
@@ -754,11 +772,17 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         return (name in info.refs and name not in info.bad
                 and not info.has_join and not info.passthrough.get(id(leaf), True))
 
+    leaf_preds = _leaf_filter_cols(plan) if info.has_join else {}
+
     def deferrable(name: str, leaf) -> bool:
-        """Decoded only because the plan has a join: leave it encoded until the leaf's filter has
-        run (join_engine.leaf_table decodes it then, on the surviving rows only; F-032)."""
-        return (info.has_join and name in info.refs and name not in info.bad
-                and not info.passthrough.get(id(leaf), True))
+        """Under a join, leave a dictionary column encoded: the join engine decodes it after the
+        leaf's filter, or after the final gather (joined rows only), so every consumer above the
+        join still sees plain strings (F-032). A use the Python path can't take on dictionaries
+        ("bad": CASE WHEN, arithmetic, ...) only matters in the leaf's own filter, where the
+        column is decoded first as before."""
+        if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
+            return False
+        return name not in info.bad or name not in leaf_preds.get(id(leaf), ())
 
     def _scan(table, defer):
         s = Scan(table)

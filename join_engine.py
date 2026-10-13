@@ -142,13 +142,14 @@ def _decode_deferred(table: pa.Table, cols) -> pa.Table:
     return table
 
 
-def leaf_table(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
+def leaf_table(comp, plan, needed: Optional[Set[str]], keep: Optional[Set[str]] = None) -> pa.Table:
     """``plan`` evaluated to a table holding (at least) the ``needed`` columns.
 
     A Filter*(Scan) leaf runs as one native call when the executor can (F-032: predicate per morsel
     in Mojo, only the surviving rows of the needed columns written, dictionary strings decoded on
     the way out). Otherwise the predicates are evaluated here, then the dictionary columns
-    resolve_plan deferred are decoded on the surviving rows."""
+    resolve_plan deferred are decoded on the surviving rows, except those in ``keep``: the caller
+    decodes them itself, after the join has gathered only the joined rows."""
     scan, preds = _scan_under_filters(plan)
     if scan is not None:
         if preds:
@@ -156,7 +157,7 @@ def leaf_table(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
             out = native_exec.try_filter(comp, scan.table, preds, needed)
             if out is not None:
                 return out
-        later = getattr(scan, "_mx_decode_after", None)
+        later = set(getattr(scan, "_mx_decode_after", None) or ()) - set(keep or ())
         out = _leaf_table_py(comp, plan, needed)
         return _decode_deferred(out, later) if later else out
     return _leaf_table_py(comp, plan, needed)
@@ -798,7 +799,19 @@ def _execute_inner(comp, node, needed, dict_ok=False):
     for _, cm in fl.residuals:
         for leaf, c in cm.values():
             leaf_need[leaf].add(c)
-    tables = [leaf_table(comp, fl.leaves[i], leaf_need[i]) for i in range(n_leaves)]
+    # dictionary columns resolve_plan deferred (decoded only because the plan has a join): decoded
+    # after the final gather, on the joined rows only, unless they are join keys or residual inputs
+    later: List[Set[str]] = []
+    for i in range(n_leaves):
+        sc, _ = _scan_under_filters(fl.leaves[i])
+        later.append(set(getattr(sc, "_mx_decode_after", None) or ()) if sc is not None else set())
+    for a, b, ac, bc in fl.edges:
+        later[a] -= set(ac)
+        later[b] -= set(bc)
+    for _, cm in fl.residuals:
+        for leaf, c in cm.values():
+            later[leaf].discard(c)
+    tables = [leaf_table(comp, fl.leaves[i], leaf_need[i], keep=later[i]) for i in range(n_leaves)]
     rows = [t.num_rows for t in tables]
     base = [_base_rows(fl.leaves[i], rows[i]) for i in range(n_leaves)]
 
@@ -866,6 +879,11 @@ def _execute_inner(comp, node, needed, dict_ok=False):
             if rest:
                 taken = _gather_table(comp, sub.select(rest), idx[leaf])
                 got.update({c: taken.column(c) for c in rest})
+        if later[leaf]:
+            from .arrow_dict import decode
+            for c in names_c:
+                if c in later[leaf] and pa.types.is_dictionary(got[c].type):
+                    got[c] = decode(got[c])
         for n, c in cols:
             arrays[n] = got[c]
     if _TRACE:
