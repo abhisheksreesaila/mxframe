@@ -309,7 +309,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
             ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
-            default_threads(), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
+            default_threads(table.num_rows), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
             min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)), ctypes.addressof(c_hconst),
             len(dcols), ctypes.addressof(c_doffs))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
@@ -401,7 +401,7 @@ def try_distinct(compiler, table: pa.Table) -> Optional[pa.Table]:
         c_kinds = (ctypes.c_int64 * len(kinds))(*kinds)
         from .pipeline_kernels import default_threads
         P = (ctypes.c_int64 * 5)(DMAGIC, len(flat), ctypes.addressof(c_cols), ctypes.addressof(c_kinds),
-                                 default_threads())
+                                 default_threads(table.num_rows))
         O = (ctypes.c_int64 * 2)()
         lib = _load()
         rc = _call_distinct(lib, ctypes.addressof(P), ctypes.addressof(O))
@@ -609,7 +609,7 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Opt
             FMAGIC, 2 if look_words else 1, len(segs), len(vcols), len(ocols), code.ctypes.data, prog.consts.ctypes.data,
             prog.set_bytes.ctypes.data, prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes),
             ctypes.addressof(arrays), ctypes.addressof(c_kinds), ctypes.addressof(c_sizes),
-            default_threads(), len(dcols), ctypes.addressof(c_doffs),
+            default_threads(table.num_rows), len(dcols), ctypes.addressof(c_doffs),
             len(look_words), ctypes.addressof(L), len(pk_names))
         O = (ctypes.c_int64 * (2 + 2 * len(out_names)))()
         lib = _load()
@@ -691,7 +691,7 @@ def try_gather(compiler, table: pa.Table, idx, decode_dicts: bool = False) -> Op
         from .pipeline_kernels import default_threads
         P = (ctypes.c_int64 * 11)(GMAGIC, 1, len(segs), width, ctypes.addressof(arrays),
                                   ctypes.addressof(c_kinds), ctypes.addressof(c_sizes),
-                                  idx.ctypes.data, len(idx), idx.dtype.itemsize, default_threads())
+                                  idx.ctypes.data, len(idx), idx.dtype.itemsize, default_threads(len(idx)))
         O = (ctypes.c_int64 * (2 + 2 * width))()
         lib = _load()
         rc = _call_gather(lib, ctypes.addressof(P), ctypes.addressof(O))

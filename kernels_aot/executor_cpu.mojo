@@ -1649,7 +1649,7 @@ def _probe(M: LP, v1: Int, v2: Int) -> Int:
         c = c * Int(M[5]) + (v2 - Int(M[3]))
     if Int(M[0]) == 0:
         # presence bitmap first (one bit per key: L2-resident where the slot array is not)
-        if (Int(_lp(Int(M[12]))[c >> 6]) >> (c & 63)) & 1 == 0:
+        if Int(M[12]) != 0 and (Int(_lp(Int(M[12]))[c >> 6]) >> (c & 63)) & 1 == 0:
             return -1
         return Int(_ip(Int(M[6]))[c]) - 1
     return _probe_hash(M, c)
@@ -1813,7 +1813,9 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
                         dup[0] = 1
 
         _par(check, nt)
-        if Int(dup[0]) == 0:              # (a duplicate declines: no bitmap needed)
+        # a presence bitmap pays off when most probes miss: keys sparse in their range (Q8's filtered
+        # part table, 0.7%); with dense keys (Q12's orders, 25%) the slot array answers as well
+        if Int(dup[0]) == 0 and n * 8 < rng:      # (a duplicate declines: no bitmap needed)
             # presence bitmap of the direct array (one bit per key), built in parallel by 64-key words
             var nwords = (rng + 63) // 64
             var bits = unsafe_alloc[Int64](max(nwords, 1))
@@ -2105,6 +2107,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                         var hi2 = Int(M[4])
                         var card2 = Int(M[5])
                         var direct = Int(M[0]) == 0
+                        var has_bits = Int(M[12]) != 0
                         var bits = _lp(Int(M[12]))
                         var slot = _ip(Int(M[6]))
                         var nn = 0
@@ -2123,7 +2126,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                                         c = c * card2 + (v2 - lo2)
                                 if ok:
                                     if direct:
-                                        if (Int(bits[c >> 6]) >> (c & 63)) & 1 != 0:
+                                        if not has_bits or (Int(bits[c >> 6]) >> (c & 63)) & 1 != 0:
                                             r = Int(slot[c]) - 1
                                     else:
                                         r = _probe_hash(M, c)

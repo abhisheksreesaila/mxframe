@@ -67,14 +67,43 @@ def gpu_available() -> bool:
     return _find("libmxpipeline_gpu.so", "MXFRAME_PIPELINE_GPU_LIB") is not None
 
 
-def default_threads() -> int:
+_PHYSICAL = None
+
+
+def physical_cores() -> int:
+    """Physical cores this process may run on (hyperthread siblings counted once); the logical CPU
+    count when the topology is not readable. The kernels are memory-bound: a second hyperthread
+    per core adds contention, not throughput (F-032 M2k: SF10 Q21 3.78 -> 3.54 s on 12 of 24)."""
+    global _PHYSICAL
+    if _PHYSICAL is None:
+        try:
+            cpus = os.sched_getaffinity(0)
+        except (AttributeError, OSError):
+            cpus = range(os.cpu_count() or 1)
+        cores = set()
+        try:
+            for c in cpus:
+                with open(f"/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list") as f:
+                    cores.add(f.read().strip())
+        except OSError:
+            cores = set(cpus)
+        _PHYSICAL = max(1, len(cores))
+    return _PHYSICAL
+
+
+def default_threads(rows: int = None) -> int:
+    """Worker threads for a kernel: MXFRAME_CPU_THREADS, else one per physical core, and fewer for
+    a small input (``rows``): one per 128k rows, so a 800k-row table does not wake every core."""
     env = os.environ.get("MXFRAME_CPU_THREADS")
     if env:
         try:
             return max(1, int(env))
         except ValueError:
             pass
-    return os.cpu_count() or 1
+    n = physical_cores()
+    if rows is not None:
+        n = min(n, max(1, rows >> 17))
+    return n
 
 
 def _load_cpu():
