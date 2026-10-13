@@ -647,21 +647,23 @@ def _renamed_ref(name: str, refs) -> bool:
     return any(r.startswith(stem) and (len(r) == len(stem) or r[len(stem):].isdigit()) for r in refs)
 
 
-def _leaf_filter_cols(plan: LogicalPlan) -> dict:
-    """id(leaf) -> columns read by the Filter chain directly above that leaf."""
+def _join_leaf_filters(plan: LogicalPlan) -> dict:
+    """id(leaf) -> columns read by its Filter chain, for every leaf that is a Filter*(Scan) input
+    of a Join (the join engine's leaf_table handles exactly these). Other leaves are absent."""
     out: dict = {}
 
-    def walk(node, above):
+    def walk(node, above, under_join):
         if isinstance(node, (Scan, ParquetScan)):
-            out[id(node)] = out.get(id(node), set()) | above
+            if under_join:
+                out[id(node)] = out.get(id(node), set()) | above
         elif isinstance(node, Filter):
-            walk(node.input, above | set(_expr_cols(node.predicate)))
+            walk(node.input, above | set(_expr_cols(node.predicate)), under_join)
         elif isinstance(node, Join):
-            walk(node.left, set())
-            walk(node.right, set())
+            walk(node.left, set(), True)
+            walk(node.right, set(), True)
         elif hasattr(node, "input"):
-            walk(node.input, set())
-    walk(plan, set())
+            walk(node.input, set(), False)
+    walk(plan, set(), False)
     return out
 
 
@@ -772,7 +774,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         return (name in info.refs and name not in info.bad
                 and not info.has_join and not info.passthrough.get(id(leaf), True))
 
-    leaf_preds = _leaf_filter_cols(plan) if info.has_join else {}
+    leaf_preds = _join_leaf_filters(plan) if info.has_join else {}
 
     def deferrable(name: str, leaf) -> bool:
         """Under a join, leave a dictionary column encoded: the join engine decodes it after the
@@ -782,7 +784,9 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
         column is decoded first as before."""
         if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
             return False
-        return name not in info.bad or name not in leaf_preds.get(id(leaf), ())
+        if id(leaf) not in leaf_preds:              # not a Filter*(Scan) input of a join
+            return False
+        return name not in info.bad or name not in leaf_preds[id(leaf)]
 
     def _scan(table, defer):
         s = Scan(table)
@@ -800,7 +804,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
             return dataclasses.replace(leaf, columns=tuple(cols), filters=pushed or None)
         candidates = dictionary_columns(leaf.path, leaf.schema, leaf.dictionary,
                                         leaf.max_dictionary_bytes, cols)
-        dict_cols = [n for n in candidates if keepable(n, leaf)]
+        dict_cols = [n for n in candidates if keepable(n, leaf) or deferrable(n, leaf)]
         mask_dict = [n for n in candidates if n not in dict_cols]
         import pyarrow.parquet as pq
         if os.path.isfile(leaf.path):

@@ -208,5 +208,66 @@ def test_case_when_column_above_a_join_is_decoded_on_the_joined_rows_only(monkey
     assert sizes and max(sizes) < 10_000, sizes            # never the 50,000-row dimension in full
     monkeypatch.setattr(ad, "decode", real)
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
-    monkeypatch.setattr("mxframe.io_parquet._leaf_filter_cols", lambda plan: {})
+    monkeypatch.setattr("mxframe.io_parquet._join_leaf_filters", lambda plan: {})   # reference: decode up front
     _same(got, plan().compute(device="cpu"))
+
+
+
+def test_int64_columns_past_2_53_are_declined_not_rounded(filters, monkeypatch):
+    """The interpreter computes in float64: an int64 value column beyond +-2^53 must not be compared
+    or summed there (2^53+1 > 2^53 would be false). The executor declines; the answer is exact."""
+    n = 50_000
+    x = np.full(n, (1 << 53) + 1, dtype=np.int64)
+    x[::7] = 5
+    f = pa.table({"ok": A((np.arange(n) % 5000).astype(np.int64)), "x": A(x), "v": A(np.ones(n))})
+    d = _dim()
+    plan = lambda: (LazyFrame(f).filter(col("x") > lit(1 << 53)).join(LazyFrame(d), on="ok")
+                    .groupby("pri").agg(col("v").sum().alias("s")).sort("pri"))
+    got = plan().compute(device="cpu")
+    assert "code -16" in (nx.last_filter()[1] or ""), nx.last_filter()
+    assert sum(got.column("s").to_pylist()) == n - len(x[::7])
+    single = LazyFrame(f).filter(col("x") > lit(1 << 53)).groupby().agg(col("v").sum().alias("s"))
+    got1 = single.compute(device="cpu")
+    assert got1.column("s").to_pylist() == [float(n - len(x[::7]))]
+    assert nx.last_path() != "native" and "code -16" in (nx.last_decline() or ""), nx.last_decline()
+
+
+@pytest.mark.parametrize("shape", ["limit", "sort-limit"])
+def test_leaves_other_than_filter_scan_are_decoded_before_the_join(monkeypatch, shape):
+    """Only Filter*(Scan) join inputs defer their dictionary decode (leaf_table decodes those);
+    any other leaf shape keeps resolve_plan's up-front decode, so nothing above the join ever
+    sees a dictionary column it didn't before."""
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    f, d = _fact(n=30_000), _dim()
+    left = LazyFrame(f).limit(20_000) if shape == "limit" else LazyFrame(f).sort("v").limit(20_000)
+    out = left.join(LazyFrame(d), on="ok").select("ok", "mode", "pri").compute(device="cpu")
+    assert pa.types.is_string(out.schema.field("mode").type)
+    assert pa.types.is_string(out.schema.field("pri").type)
+
+
+def test_left_join_with_deferred_columns_matches(monkeypatch, filters):
+    f, d = _fact(), _dim()
+    plan = lambda: (LazyFrame(f).filter(col("mode").isin(["MAIL", "AIR"]))
+                    .join(LazyFrame(d).filter(col("day") < lit(9000)), on="ok", how="left")
+                    .groupby("mode").agg(col("v").sum().alias("s"), col("day").count().alias("n")).sort("mode"))
+    got, old = _both(plan, monkeypatch)
+    _same(got, old)
+
+
+def test_parquet_source_with_join(tmp_path, filters, monkeypatch):
+    """scan_parquet: dictionary columns read as dictionaries, filtered natively at the leaf."""
+    import pyarrow.parquet as pq
+    import mxframe as mx
+    f, d = _fact(), _dim()
+    pq.write_table(f.cast(pa.schema([fld if not pa.types.is_dictionary(fld.type) else pa.field(fld.name, pa.string())
+                                     for fld in f.schema])), tmp_path / "f.parquet", row_group_size=30_000)
+    pq.write_table(d.cast(pa.schema([fld if not pa.types.is_dictionary(fld.type) else pa.field(fld.name, pa.string())
+                                     for fld in d.schema])), tmp_path / "d.parquet")
+    # (an `isin` on a string column is pushed into the Parquet reader; a float comparison stays a Filter)
+    plan = lambda: (mx.scan_parquet(str(tmp_path / "f.parquet"))
+                    .filter(col("mode").isin(["MAIL", "SHIP"]) & (col("qty") < lit(30.0)))
+                    .join(mx.scan_parquet(str(tmp_path / "d.parquet")), on="ok")
+                    .groupby("mode", "pri").agg(col("v").sum().alias("s")).sort("mode", "pri"))
+    got, old = _both(plan, monkeypatch)
+    assert len(filters) >= 1, nx.last_filter()
+    _same(got, old)

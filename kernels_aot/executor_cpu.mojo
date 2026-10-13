@@ -84,6 +84,7 @@ comptime E_PIPELINE = -12
 comptime E_DICT_TOO_BIG = -13
 comptime E_OUTPUT_TOO_BIG = -14   # string keys past int32 offsets
 comptime E_NAN_SORT = -15         # NaN among ORDER BY values
+comptime E_INEXACT = -16          # an int64 value column holds values past 2^53 (the interpreter is float64)
 comptime FUSE_GROUPS = 4096   # up to this many groups: keys encoded and aggregated per morsel
 comptime HDR = 16
 comptime OP_AGG_SUM = 50
@@ -240,6 +241,28 @@ def _bytes_cmp(a: Int, la: Int, b: Int, lb: Int) -> Int:
 def _same_dict(d1: Int, d2: Int) -> Bool:
     return (_arr_len(d1) == _arr_len(d2) and _arr_off(d1) == _arr_off(d2)
             and _arr_buf(d1, 1) == _arr_buf(d2, 1) and _arr_buf(d1, 2) == _arr_buf(d2, 2))
+
+
+def _i64_cols_exact(arrays: LP, stride_a: Int, n_chunks: Int, n_cols: Int, dtypes: IP) -> Bool:
+    """The bytecode interpreter computes in float64: an int64 value column is exact only within
+    +-2^53. False when any value of any int64 value column lies outside (the caller declines)."""
+    comptime LIM = Int64(1) << 53
+    for j in range(n_cols):
+        if (Int(dtypes[j]) & 255) != 1:
+            continue
+        for c in range(n_chunks):
+            var arr = Int(arrays[c * stride_a + j])
+            var src = _lp(_arr_buf(arr, 1)) + _arr_off(arr)
+            var n = _arr_len(arr)
+            var lo = Int64.MAX
+            var hi = Int64.MIN
+            for i in range(n):
+                var v = src[i]
+                lo = min(lo, v)
+                hi = max(hi, v)
+            if n > 0 and (hi > LIM or lo < -LIM):
+                return False
+    return True
 
 
 @always_inline
@@ -515,6 +538,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var stride_a = n_cols + n_keys
     if n_chunks < 1:
         return E_BAD_PLAN
+    if not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+        return E_INEXACT
 
     # ── 1. chunk table for the interpreter: row_start, row_end, per column base address ──────
     var tstride = 2 + n_cols + n_dcols
@@ -1343,6 +1368,8 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     var stride_a = n_cols + n_out
     if n_chunks < 1 or Int(code[0]) != 0x4D585031:
         return E_BAD_PLAN
+    if not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+        return E_INEXACT
 
     # chunk table: row_start, row_end, per value column its base address, then dictionary offsets
     var tstride = 2 + n_cols + n_dcols

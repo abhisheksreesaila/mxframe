@@ -93,6 +93,8 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     prog = compile_pipeline(predicates, list(agg_node.aggs), table)
     if prog is None:
         return _decline(compiler, "expression not supported by the bytecode compiler")
+    if _int64_past_2_53(table, prog.columns):
+        return _decline(compiler, "an int64 column holds values past 2^53 (the pipeline computes in float64)")
     try:
         cc = prog.bind_chunks(table)
     except Unsupported:
@@ -206,3 +208,21 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     if coproc_info is not None:
         compiler.last_compile_provenance["coproc"] = coproc_info
     return result
+
+
+def _int64_past_2_53(table, names) -> bool:
+    """The pipeline computes in float64, exact for integers only within +-2^53 (F-032 review)."""
+    import numpy as np
+    lim = 1 << 53
+    for n in names:
+        col = table.column(n)
+        if col.type != pa.int64():
+            continue
+        for ch in col.chunks:
+            if len(ch) and ch.null_count == 0:
+                a = np.frombuffer(ch.buffers()[1], dtype=np.int64, count=len(ch) + ch.offset)[ch.offset:]
+                if a.max() > lim or a.min() < -lim:
+                    return True
+            elif len(ch):
+                return True              # nulls: bind_chunks declines anyway
+    return False
