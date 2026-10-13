@@ -443,15 +443,25 @@ Needs: none · Agreed 2026-10-13 (Abhishek: focus on these, no TPC-H-only tuning
 - [x] Q22 (148 -> ~94 ms, DuckDB 117): native Mojo `str_slice` (new utf8 array) and utf8 `isin` up to 32 values (code points like Arrow)
 - [ ] each change helps the general shape (checked on a non-TPC-H case), and no SF1 / SF10 query gets slower
 
-## F-044 Random queries on the TPC-H data: performance beyond the 22 [todo]
+## F-044 Random queries on the TPC-H data: performance beyond the 22 [done]
 Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
-- [ ] a seeded generator of random queries over the TPC-H tables (filters, group-bys on random keys, joins, aggregates, sorts / limits, DISTINCT, count distinct), each run in MXFrame, Polars and DuckDB the engine-only way
-- [ ] every MXFrame result checked against DuckDB; any mismatch or crash is a bug ticket
-- [ ] report: per-shape timing against Polars and DuckDB, how many run natively vs fall back, and where MXFrame is slow; also the 22 queries on shuffled tables
+- [x] a seeded generator of random queries over the TPC-H tables (filters, group-bys on random keys, joins, aggregates, sorts / limits, DISTINCT, count distinct), each run in MXFrame, Polars and DuckDB the engine-only way (`scripts/bench_random/`)
+- [x] every MXFrame result checked against DuckDB: 250/250 equal (100 SF1, 100 SF1 shuffled, 50 SF10); no bug tickets needed
+- [x] report: `docs/bench/random-sf1.md`, `random-sf1-shuffled.md`, `random-sf10.md`; the 22 on shuffled tables: `docs/bench/m2p-engine-shuffled.md` (both alongside `m2p-engine.md`, all on commit dc88dca, a loaded machine: median load 7-8 from other projects)
+- [x] fixes it found: native top-k for ORDER BY ... LIMIT (a random top-N took 543 ms, now 14), native filter for WHERE-only plans, and a harness bug: DuckDB imported pyarrow inside its first query (~70 ms), which had inflated every DuckDB time
+- findings (honest): vs Polars, MXFrame is faster on most random queries (geo. mean 1.0-2.7x) and all 21 verified TPC-H queries at SF10. vs DuckDB, once its import is staged: DuckDB is faster on most random queries (MXFrame 0.63-0.91x geo. mean) and on 13 of 22 TPC-H queries at SF10 (MXFrame's 22-query total is still lower, 3.27 s vs 5.31 s, from Q21 / Q9 / Q13 / Q1); on shuffled tables DuckDB's SF10 total is lower (5.78 s vs 8.64 s: Q21 4.98 s vs 2.88, Q9, Q18) -> F-046
 
 ## F-045 ORDER BY ties outside the native executor [todo]
 Needs: none · Found by the F-043 review
 - [ ] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks)
+
+## F-046 Where DuckDB is still faster (from F-044) [todo]
+Needs: none · general fixes only
+- [ ] joins (random joins 0.64-0.86x DuckDB; TPC-H Q3 / Q5 / Q8 / Q12 / Q17 / Q22 at SF10)
+- [ ] COUNT(DISTINCT) and SELECT DISTINCT (0.3-0.6x DuckDB): unsorted keys fall back; dictionary columns are decoded for the whole table before the filter (q68: 26 ms on 6M rows to keep 1%)
+- [ ] shuffled data: Q21 without sorted runs (hash count-distinct), Q18, Q9
+- [ ] top-N 0.4-0.6x DuckDB: fuse the filter into the top-k (no filtered table)
+- [ ] a quiet-machine rerun of m2p (other projects ran at ~5 cores during it)
 
 ## F-039 The optimization story: README with visuals [doing]
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13
