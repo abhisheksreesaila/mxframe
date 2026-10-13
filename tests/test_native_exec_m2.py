@@ -292,7 +292,9 @@ def gathers(monkeypatch):
 
 def test_join_output_is_gathered_natively(gathers, monkeypatch):
     """The join's final gather: fixed-width columns (int, float, date, decimal), utf8 with empty
-    strings, and deferred dictionary columns (decoded in the gather), from several chunks."""
+    strings, and deferred dictionary columns (decoded in the gather), from several chunks. (Joins
+    the star path takes, M2d, gather nothing: pinned off here.)"""
+    monkeypatch.setenv("MXFRAME_STAR", "0")
     f, d = _fact(n=90_000), _dim()
     note = f.column("note").to_pylist()
     note[::5] = [""] * len(note[::5])

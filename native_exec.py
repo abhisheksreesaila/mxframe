@@ -24,7 +24,7 @@ import ctypes
 import os
 import threading
 import time as _time
-from typing import Optional
+from typing import List, Optional
 
 import pyarrow as pa
 
@@ -397,10 +397,30 @@ def _out_kind(t: pa.DataType):
     return None
 
 
-def try_filter(compiler, table: pa.Table, predicates, needed) -> Optional[pa.Table]:
-    """The rows of ``table`` that pass every predicate, holding the ``needed`` columns (None: all) in
-    table order, in one native call; dictionary string columns come back decoded (as the join path
-    expects). None: the caller filters as before."""
+_KEY_WIDTH = {pa.int32(): 4, pa.int64(): 8, pa.date32(): 4}
+
+
+class Lookup:
+    """A join partner fused into the leaf filter (F-032): rows of the scanned table whose ``probe``
+    columns equal ``build_keys`` of a row of ``build`` keep that row's ``outputs`` (written under
+    ``names``). ``build`` keys must be unique (a duplicate declines); 1 or 2 integer key columns."""
+    __slots__ = ("probe", "build", "build_keys", "outputs", "names")
+
+    def __init__(self, probe, build: pa.Table, build_keys, outputs, names=None):
+        self.probe, self.build, self.build_keys = list(probe), build, list(build_keys)
+        self.outputs = list(outputs)
+        self.names = list(names) if names is not None else list(outputs)
+
+
+def _lookup_key_kind(t: pa.DataType):
+    return "date" if t == pa.date32() else "int"
+
+
+def try_filter(compiler, table: pa.Table, predicates, needed, lookups=()) -> Optional[pa.Table]:
+    """The rows of ``table`` that pass every predicate (and find a partner row in every lookup),
+    holding the ``needed`` columns (None: all) in table order, then each lookup's outputs, in one
+    native call; dictionary string columns come back decoded (as the join path expects). None: the
+    caller filters (and joins) as before."""
     _filter_last["path"] = None
     if not enabled():
         return _filter_decline("disabled")
@@ -408,9 +428,11 @@ def try_filter(compiler, table: pa.Table, predicates, needed) -> Optional[pa.Tab
         return _filter_decline("CPU executor: device='cpu'")
     if not available():
         return _filter_decline("libmxexec_cpu.so not built")
-    if table.num_rows == 0 or not predicates:
+    if table.num_rows == 0 or not (predicates or lookups):
         return _filter_decline("nothing to filter")
-    names = [c for c in table.column_names if needed is None or c in needed] or table.column_names[:1]
+    names = [c for c in table.column_names if needed is None or c in needed]
+    if not names and not lookups:
+        names = table.column_names[:1]
 
     from .pipeline_program import compile_pipeline, _dict_key
     prog = compile_pipeline(list(predicates), [], table, concat_dicts=True)
@@ -438,21 +460,72 @@ def try_filter(compiler, table: pa.Table, predicates, needed) -> Optional[pa.Tab
             return _filter_decline(f"output column {n}: null in a dictionary")
         kinds.append(k[0])
         sizes.append(k[1])
-    every = vcols + ocols
+
+    # lookups: probe key columns ride along with the scanned table's chunks; partners are one chunk
+    pk_names: List[str] = []
+    look_words, bout_words, keep_alive = [], [], []
+    out_types, out_names = [c.type for c in ocols], list(names)
+    for lk in lookups:
+        if len(lk.probe) not in (1, 2) or len(lk.probe) != len(lk.build_keys):
+            return _filter_decline("lookup: 1 or 2 key columns")
+        b = lk.build.combine_chunks()     # one chunk per column; dictionaries unified, not decoded
+        if b.num_rows == 0 or any(b.column(c).num_chunks != 1 for c in b.column_names):
+            return _filter_decline("lookup: empty partner")
+        pks, widths = [], 0
+        for i, (pn, bn) in enumerate(zip(lk.probe, lk.build_keys)):
+            pc_, bc_ = table.column(pn), b.column(bn)
+            if (pc_.type not in _KEY_WIDTH or bc_.type not in _KEY_WIDTH or pc_.null_count or bc_.null_count
+                    or _lookup_key_kind(pc_.type) != _lookup_key_kind(bc_.type)):
+                return _filter_decline(f"lookup key {pn} = {bn}: types {pc_.type} / {bc_.type} or nulls")
+            if pn not in pk_names:
+                pk_names.append(pn)
+            pks.append(pk_names.index(pn))
+            widths |= _KEY_WIDTH[pc_.type] << (4 * i) | _KEY_WIDTH[bc_.type] << (8 + 4 * i)
+        bkeys = [b.column(bn).chunk(0) for bn in lk.build_keys]
+        bouts = []
+        for on, nm in zip(lk.outputs, lk.names):
+            col = b.column(on)
+            k = _out_kind(col.type)
+            if k is None or col.null_count:
+                return _filter_decline(f"lookup output {on}: type {col.type} or nulls")
+            if k[0] == 2 and col.chunk(0).dictionary.null_count:
+                return _filter_decline(f"lookup output {on}: null in a dictionary")
+            arr = col.chunk(0)
+            bouts.append((arr, k))
+            out_types.append(col.type)
+            out_names.append(nm)
+        look_words.append((len(pks), pks, bkeys, widths, bouts))
+    if not out_names:
+        return _filter_decline("no output columns")
+
+    pcols = [table.column(n) for n in pk_names]
+    every = vcols + ocols + pcols
     segs = _segments(every)
     if not segs:
         return _filter_decline("empty input")
 
     width = len(every)
     structs = []
+
+    def export(arr):
+        st = (ctypes.c_int64 * 10)()
+        arr._export_to_c(ctypes.addressof(st))
+        structs.append(st)
+        return ctypes.addressof(st)
+
     arrays = (ctypes.c_int64 * (len(segs) * width))()
     try:
         for r, seg in enumerate(segs):
             for j, piece in enumerate(seg):
-                st = (ctypes.c_int64 * 10)()
-                piece._export_to_c(ctypes.addressof(st))
-                structs.append(st)
-                arrays[r * width + j] = ctypes.addressof(st)
+                arrays[r * width + j] = export(piece)
+        L = (ctypes.c_int64 * max(8 * len(look_words), 1))()
+        for j, (nk, pks, bkeys, widths, bouts) in enumerate(look_words):
+            bo = (ctypes.c_int64 * max(3 * len(bouts), 1))()
+            for t, (arr, (kind, size)) in enumerate(bouts):
+                bo[3 * t], bo[3 * t + 1], bo[3 * t + 2] = export(arr), kind, size
+            keep_alive.append(bo)
+            L[8 * j: 8 * j + 8] = [nk, pks[0], pks[1] if nk == 2 else -1, export(bkeys[0]),
+                                   export(bkeys[1]) if nk == 2 else 0, widths, len(bouts), ctypes.addressof(bo)]
         doffs = [prog.dict_concat[n][_dict_key(seg[prog.columns.index(n)].dictionary)]
                  for seg in segs for n in dcols]
         c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
@@ -461,15 +534,16 @@ def try_filter(compiler, table: pa.Table, predicates, needed) -> Optional[pa.Tab
             code = code.copy()
             code[7] = len(prog.columns) + len(dcols)
         c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
-        c_kinds = (ctypes.c_int64 * len(kinds))(*kinds)
-        c_sizes = (ctypes.c_int64 * len(sizes))(*sizes)
+        c_kinds = (ctypes.c_int64 * max(len(kinds), 1))(*kinds)
+        c_sizes = (ctypes.c_int64 * max(len(sizes), 1))(*sizes)
         from .pipeline_kernels import default_threads
-        P = (ctypes.c_int64 * 16)(
-            FMAGIC, 1, len(segs), len(vcols), len(ocols), code.ctypes.data, prog.consts.ctypes.data,
+        P = (ctypes.c_int64 * 19)(
+            FMAGIC, 2 if look_words else 1, len(segs), len(vcols), len(ocols), code.ctypes.data, prog.consts.ctypes.data,
             prog.set_bytes.ctypes.data, prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes),
             ctypes.addressof(arrays), ctypes.addressof(c_kinds), ctypes.addressof(c_sizes),
-            default_threads(), len(dcols), ctypes.addressof(c_doffs))
-        O = (ctypes.c_int64 * (2 + 2 * len(ocols)))()
+            default_threads(), len(dcols), ctypes.addressof(c_doffs),
+            len(look_words), ctypes.addressof(L), len(pk_names))
+        O = (ctypes.c_int64 * (2 + 2 * len(out_names)))()
         lib = _load()
         rc = _call_filter(lib, ctypes.addressof(P), ctypes.addressof(O))
     finally:
@@ -486,15 +560,16 @@ def try_filter(compiler, table: pa.Table, predicates, needed) -> Optional[pa.Tab
         return pa.foreign_buffer(int(addr), max(nbytes, 0), base=owner)
 
     out = []
-    for j, (c, kind, size) in enumerate(zip(ocols, kinds, sizes)):
+    for j, t in enumerate(out_types):
+        kind, size = _out_kind(t)
         a, b = int(O[2 + 2 * j]), int(O[3 + 2 * j])
         if kind == 0:
-            out.append(pa.Array.from_buffers(c.type, n, [None, buf(a, n * size)]))
+            out.append(pa.Array.from_buffers(t, n, [None, buf(a, n * size)]))
         else:
             nbytes = ctypes.c_int32.from_address(a + 4 * n).value
             out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
-    _filter_last.update(path="native_filter", decline=None)
-    return pa.Table.from_arrays(out, names=names)
+    _filter_last.update(path="native_filter" if not lookups else "native_lookup", decline=None)
+    return pa.Table.from_arrays(out, names=out_names)
 
 
 # ── M2: native gather (a join's output rows) ───────────────────────────────────────────────

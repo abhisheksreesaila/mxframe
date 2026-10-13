@@ -1331,20 +1331,29 @@ def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP
 # ── M2: native leaf filter ─────────────────────────────────────────────────────────────────
 #
 # Filter*(Scan) leaves under a join: the predicate runs on the bytecode interpreter per morsel (in
-# parallel), and the surviving rows of the needed columns are written into one arena. Dictionary
+# parallel), and the surviving rows of the needed columns are written into one arena. With lookups
+# (M2d) the leaf is the fact table of a star join: each surviving row also finds its row in every
+# partner (maps built above) and the partners' columns are written next to its own. Dictionary
 # string columns are read as codes (predicates: dtype 5) and written out decoded, so only the rows
 # that survive are ever decoded.
 #
 # Plan (int64 words):
-#   0 magic 0x4d584631 ("MXF1")   1 version (1)   2 n_chunks   3 n_cols (bytecode value columns)
-#   4 n_out (output columns)   5 code*   6 consts*   7 set_bytes*   8 set_meta*   9 dtypes* (int32)
-#  10 arrays* : int64[n_chunks][n_cols + n_out] = ArrowArray*
+#   0 magic 0x4d584631 ("MXF1")   1 version (1, or 2 with lookups)   2 n_chunks
+#   3 n_cols (bytecode value columns)   4 n_out (output columns)   5 code*   6 consts*   7 set_bytes*
+#   8 set_meta*   9 dtypes* (int32)
+#  10 arrays* : int64[n_chunks][n_cols + n_out + n_pk] = ArrowArray*
 #  11 out_kinds* : int64[n_out]  0 fixed width, 1 utf8 (int32 offsets), 2 dictionary<int32, utf8>
 #                                (written as utf8)
 #  12 out_size* : int64[n_out]  bytes per value of fixed-width columns
 #  13 threads   14 n_dcols   15 doffs* : int64[n_chunks][n_dcols]
-# Result: 0 n_rows   1 arena*   then per output column (A, B): fixed (values*, 0); strings
-#         (int32 offsets[n+1]*, bytes*)
+# version 2 (M2d, join partners looked up in the same pass; a row without a partner is dropped):
+#  16 n_look   17 look* : int64[n_look][8] = (n_keys 1|2, probe key a, probe key b or -1 (indexes
+#     into the n_pk probe key columns), partner key ArrowArray* a, b or 0, widths (probe a | probe b
+#     << 4 | partner a << 8 | partner b << 12, 4 or 8 bytes), n_bout, bout* : int64[n_bout][3] =
+#     (ArrowArray*, kind, size)); partner arrays are one chunk each
+#  18 n_pk (probe key columns, after the output columns in `arrays`)
+# Result: 0 n_rows   1 arena*   then per output column (A, B), the scanned table's then each
+#         partner's: fixed (values*, 0); strings (int32 offsets[n+1]*, bytes*)
 
 comptime FMAGIC = 0x4D584631
 comptime HUGE = 1 << 21
@@ -1378,10 +1387,312 @@ def _out_str(kind: Int, arr: Int, local: Int, mut start: Int, mut ln: Int):
         ln = _dlen(arr, local)
 
 
+# ── M2: lookup joins fused into the filter (build: one map per join partner) ─────────────────
+#
+# A join partner B (a table Python already built: a dimension leaf, or a small join of several)
+# is indexed on its join key, 1 or 2 integer columns combined into one normalized int64
+# (v1 - lo1) * card2 + (v2 - lo2). Compact ranges get a direct array (row + 1 per key, 0 = none),
+# others a hash table split into P partitions by the top bits of the hash, built in parallel.
+# Keys must be unique on B (TPC-H foreign key -> primary key); a duplicate declines (E_DUP).
+
+comptime E_DUP = -18
+comptime E_NO_MEMORY = -19
+comptime LW = 8             # words per lookup in the plan
+comptime MW = 12            # words per built map
+comptime HP = 64            # hash partitions
+comptime HP_SHIFT = 58
+comptime DIRECT_MAX = 1 << 28
+
+
+def _par[F: def(Int) -> None](f: F, nt: Int):
+    """f(0) .. f(nt - 1) on nt workers (each pulls blocks from its own atomic counter)."""
+    if nt > 1:
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        parallelize(f, nt)
+    else:
+        f(0)
+
+
+@always_inline
+def _ival(arr: Int, w: Int, i: Int) -> Int:
+    """Integer value of row i (array-local, before the Arrow offset) of a 4- or 8-byte column."""
+    var off = _arr_off(arr)
+    var data = _arr_buf(arr, 1)
+    if w == 8:
+        return Int(_lp(data)[off + i])
+    return Int(_ip(data)[off + i])
+
+
+@always_inline
+def _probe(M: LP, v1: Int, v2: Int) -> Int:
+    """B row holding key (v1, v2), or -1."""
+    if v1 < Int(M[1]) or v1 > Int(M[2]):
+        return -1
+    var c = v1 - Int(M[1])
+    if Int(M[10]) == 2:
+        if v2 < Int(M[3]) or v2 > Int(M[4]):
+            return -1
+        c = c * Int(M[5]) + (v2 - Int(M[3]))
+    if Int(M[0]) == 0:
+        return Int(_ip(Int(M[6]))[c]) - 1
+    var h = _mix(UInt64(c))
+    var p = Int(h >> HP_SHIFT)
+    var cap = Int(_lp(Int(M[8]))[p])
+    var off = Int(_lp(Int(M[9]))[p])
+    var keys = _lp(Int(M[6])) + off
+    var vals = _ip(Int(M[7])) + off
+    var msk = UInt64(cap - 1)
+    var i = Int(h & msk)
+    while True:
+        var v = Int(vals[i])
+        if v == 0:
+            return -1
+        if Int(keys[i]) == c:
+            return v - 1
+        i = Int(UInt64(i + 1) & msk)
+
+
+def _free_map(M: LP):
+    if Int(M[6]) != 0:
+        if Int(M[0]) == 0:
+            _ = external_call["free", Int](Int(M[6]))
+        else:
+            _lp(Int(M[6])).free()
+            _ip(Int(M[7])).free()
+            _lp(Int(M[8])).free()
+            _lp(Int(M[9])).free()
+    M[6] = 0
+
+
+def _build_map(L: LP, M: LP, threads: Int) -> Int:
+    """Index partner B (plan entry L) into map M. 0, E_DUP, or E_BAD_PLAN."""
+    var nk = Int(L[0])
+    var ka = Int(L[3])
+    var kb = Int(L[4])
+    var widths = Int(L[5])
+    var wa = (widths >> 8) & 15
+    var wb = (widths >> 12) & 15
+    var n = _arr_len(ka)
+    M[0] = 0
+    M[6] = 0
+    M[10] = Int64(nk)
+    if n == 0:
+        M[1] = 1
+        M[2] = 0          # empty range: every probe misses
+        M[3] = 1
+        M[4] = 0
+        M[5] = 1
+        return 0
+    var nb = max(1, min(threads * 4, (n + 65535) // 65536))
+    var part = unsafe_alloc[Int64](nb * 4)
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+    var nt = max(1, min(threads, nb))
+
+    def ranges(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            var lo = b * n // nb
+            var hi = (b + 1) * n // nb
+            var l1 = Int(Int64.MAX)
+            var h1 = Int(Int64.MIN)
+            var l2 = Int(Int64.MAX)
+            var h2 = Int(Int64.MIN)
+            for i in range(lo, hi):
+                var v = _ival(ka, wa, i)
+                l1 = min(l1, v)
+                h1 = max(h1, v)
+                if nk == 2:
+                    var u = _ival(kb, wb, i)
+                    l2 = min(l2, u)
+                    h2 = max(h2, u)
+            part[b * 4] = Int64(l1)
+            part[b * 4 + 1] = Int64(h1)
+            part[b * 4 + 2] = Int64(l2)
+            part[b * 4 + 3] = Int64(h2)
+
+    _par(ranges, nt)
+    var lo1 = Int(Int64.MAX)
+    var hi1 = Int(Int64.MIN)
+    var lo2 = 0
+    var hi2 = 0
+    if nk == 2:
+        lo2 = Int(Int64.MAX)
+        hi2 = Int(Int64.MIN)
+    for b in range(nb):
+        lo1 = min(lo1, Int(part[b * 4]))
+        hi1 = max(hi1, Int(part[b * 4 + 1]))
+        if nk == 2:
+            lo2 = min(lo2, Int(part[b * 4 + 2]))
+            hi2 = max(hi2, Int(part[b * 4 + 3]))
+    part.free()
+    # ranges as Float64 first: a full int64 span would overflow
+    var card1f = Float64(hi1) - Float64(lo1) + 1.0
+    var card2f = Float64(hi2) - Float64(lo2) + 1.0
+    if card1f * card2f > Float64(1 << 62):
+        counter.free()
+        return E_BAD_PLAN
+    var card2 = hi2 - lo2 + 1
+    var rng = (hi1 - lo1 + 1) * card2
+    M[1] = Int64(lo1)
+    M[2] = Int64(hi1)
+    M[3] = Int64(lo2)
+    M[4] = Int64(hi2)
+    M[5] = Int64(card2)
+    M[11] = Int64(rng)
+    var dup = unsafe_alloc[Int64](1)
+    dup[0] = 0
+
+    if rng <= DIRECT_MAX and rng <= max(8 * n, 1 << 20):
+        # direct array, zeroed lazily by calloc; racing writes on a duplicate key are caught below
+        var slot_a = external_call["calloc", Int](rng, 4)
+        if slot_a == 0:
+            counter.free()
+            dup.free()
+            return E_NO_MEMORY
+        var slot = _ip(slot_a)
+        M[6] = Int64(Int(slot))
+        counter[0] = 0
+
+        def put(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if b >= nb:
+                    break
+                for i in range(b * n // nb, (b + 1) * n // nb):
+                    var c = _ival(ka, wa, i) - lo1
+                    if nk == 2:
+                        c = c * card2 + (_ival(kb, wb, i) - lo2)
+                    slot[c] = Int32(i + 1)
+
+        _par(put, nt)
+        counter[0] = 0
+
+        def check(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if b >= nb:
+                    break
+                for i in range(b * n // nb, (b + 1) * n // nb):
+                    var c = _ival(ka, wa, i) - lo1
+                    if nk == 2:
+                        c = c * card2 + (_ival(kb, wb, i) - lo2)
+                    if Int(slot[c]) != i + 1:
+                        dup[0] = 1
+
+        _par(check, nt)
+    else:
+        # partitioned hash table: count rows per (block, partition), scatter row numbers by
+        # partition, then each partition builds its own open-addressing table
+        M[0] = 1
+        var keys_n = unsafe_alloc[Int64](n)
+        var cnt = unsafe_alloc[Int64](nb * HP)
+        counter[0] = 0
+
+        def count(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if b >= nb:
+                    break
+                for p in range(HP):
+                    cnt[b * HP + p] = 0
+                for i in range(b * n // nb, (b + 1) * n // nb):
+                    var c = _ival(ka, wa, i) - lo1
+                    if nk == 2:
+                        c = c * card2 + (_ival(kb, wb, i) - lo2)
+                    keys_n[i] = Int64(c)
+                    cnt[b * HP + Int(_mix(UInt64(c)) >> HP_SHIFT)] += 1
+
+        _par(count, nt)
+        var pstart = unsafe_alloc[Int64](HP + 1)
+        var caps = unsafe_alloc[Int64](HP)
+        var offs = unsafe_alloc[Int64](HP)
+        var at = 0
+        var tot = 0
+        for p in range(HP):
+            pstart[p] = Int64(at)
+            for b in range(nb):
+                var x = Int(cnt[b * HP + p])
+                cnt[b * HP + p] = Int64(at)
+                at += x
+            var cp = Int(pstart[p])
+            var c_p = at - cp
+            var cap = 16
+            while cap < 2 * c_p:
+                cap *= 2
+            caps[p] = Int64(cap)
+            offs[p] = Int64(tot)
+            tot += cap
+        pstart[HP] = Int64(at)
+        var order = unsafe_alloc[Int32](n)
+        counter[0] = 0
+
+        def scatter(wid: Int) {imm}:
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if b >= nb:
+                    break
+                for i in range(b * n // nb, (b + 1) * n // nb):
+                    var p = Int(_mix(UInt64(Int(keys_n[i]))) >> HP_SHIFT)
+                    var q = Int(cnt[b * HP + p])
+                    order[q] = Int32(i)
+                    cnt[b * HP + p] = Int64(q + 1)
+
+        _par(scatter, nt)
+        var tkeys = unsafe_alloc[Int64](tot)
+        var tvals = unsafe_alloc[Int32](tot)
+        counter[0] = 0
+
+        def build(wid: Int) {imm}:
+            while True:
+                var p = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if p >= HP:
+                    break
+                var cap = Int(caps[p])
+                var kk = tkeys + Int(offs[p])
+                var vv = tvals + Int(offs[p])
+                for i in range(cap):
+                    vv[i] = 0
+                var msk = UInt64(cap - 1)
+                for q in range(Int(pstart[p]), Int(pstart[p + 1])):
+                    var r = Int(order[q])
+                    var c = Int(keys_n[r])
+                    var i = Int(_mix(UInt64(c)) & msk)
+                    while True:
+                        if Int(vv[i]) == 0:
+                            kk[i] = Int64(c)
+                            vv[i] = Int32(r + 1)
+                            break
+                        if Int(kk[i]) == c:
+                            dup[0] = 1
+                            break
+                        i = Int(UInt64(i + 1) & msk)
+
+        _par(build, max(1, min(threads, HP)))
+        M[6] = Int64(Int(tkeys))
+        M[7] = Int64(Int(tvals))
+        M[8] = Int64(Int(caps))
+        M[9] = Int64(Int(offs))
+        keys_n.free()
+        cnt.free()
+        pstart.free()
+        order.free()
+    counter.free()
+    var d = Int(dup[0])
+    dup.free()
+    if d != 0:
+        _free_map(M)
+        return E_DUP
+    return 0
+
+
 @export
 def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     var P = _lp(plan_a)
-    if Int(P[0]) != FMAGIC or Int(P[1]) != 1:
+    var ver = Int(P[1])
+    if Int(P[0]) != FMAGIC or (ver != 1 and ver != 2):
         return E_BAD_PLAN
     var n_chunks = Int(P[2])
     var n_cols = Int(P[3])
@@ -1394,12 +1705,53 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     var threads = max(1, Int(P[13]))
     var n_dcols = Int(P[14])
     var doffs = _lp(Int(P[15]))
+    var n_look = Int(P[16]) if ver == 2 else 0
+    var look = _lp(Int(P[17]) if ver == 2 else 0)
+    var n_pk = Int(P[18]) if ver == 2 else 0
     var O = _lp(out_a)
-    var stride_a = n_cols + n_out
+    var stride_a = n_cols + n_out + n_pk
     if n_chunks < 1 or Int(code[0]) != 0x4D585031:
         return E_BAD_PLAN
     if not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
         return E_INEXACT
+    if Int(code[1]) > MAX_REGS:          # before anything is allocated
+        return E_PIPELINE
+
+    # lookups (M2): one map per join partner; its output columns follow the scanned table's
+    var maps = unsafe_alloc[Int64](max(n_look, 1) * MW)
+    var n_bout = 0
+    for j in range(n_look):
+        n_bout += Int(look[j * LW + 6])
+    var n_tot = n_out + n_bout
+    var tk = unsafe_alloc[Int64](max(n_tot, 1))     # kind of every output column
+    var tsz = unsafe_alloc[Int64](max(n_tot, 1))    # bytes per value (fixed width)
+    var barr = unsafe_alloc[Int64](max(n_bout, 1))  # partner columns: ArrowArray* (one chunk)
+    var blk = unsafe_alloc[Int64](max(n_bout, 1))   # partner columns: their lookup
+    for j in range(n_out):
+        tk[j] = kinds[j]
+        tsz[j] = sizes[j]
+    var q = 0
+    for j in range(n_look):
+        var bo = _lp(Int(look[j * LW + 7]))
+        for t in range(Int(look[j * LW + 6])):
+            barr[q] = bo[t * 3]
+            tk[n_out + q] = bo[t * 3 + 1]
+            tsz[n_out + q] = bo[t * 3 + 2]
+            blk[q] = Int64(j)
+            q += 1
+    for j in range(n_look):
+        maps[j * MW + 6] = 0
+    for j in range(n_look):
+        var rc = _build_map(look + j * LW, maps + j * MW, threads)
+        if rc < 0:
+            for i in range(j):
+                _free_map(maps + i * MW)
+            maps.free()
+            tk.free()
+            tsz.free()
+            barr.free()
+            blk.free()
+            return rc
 
     # chunk table: row_start, row_end, per value column its base address, then dictionary offsets
     var tstride = 2 + n_cols + n_dcols
@@ -1421,18 +1773,17 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     var no_gids = unsafe_alloc[Int32](1)          # no group ids (Mojo has no null pointer)
     var p = Prog(code, FP(unsafe_from_address=Int(P[6])), _bp(Int(P[7])), _lp(Int(P[8])), tbl,
                  n_chunks, dtypes, no_gids, 1, False)
-    if p.n_regs > MAX_REGS:
-        no_gids.free()
-        tbl.free()
-        return E_PIPELINE
 
     var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
     var nt = max(1, min(threads, morsels))
     var mask = _big_alloc(max(n_rows, 1))
     var mcnt = unsafe_alloc[Int64](morsels)                    # surviving rows per morsel
-    var mbytes = unsafe_alloc[Int64](morsels * max(n_out, 1))  # string bytes per morsel per column
-    for i in range(morsels * max(n_out, 1)):
+    var mbytes = unsafe_alloc[Int64](morsels * max(n_tot, 1))  # string bytes per morsel per column
+    for i in range(morsels * max(n_tot, 1)):
         mbytes[i] = 0
+    var mlook = unsafe_alloc[Int64](morsels)       # per morsel: int32[kept][n_look] partner rows
+    for i in range(morsels):
+        mlook[i] = 0
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
 
@@ -1440,6 +1791,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     def pass1(wid: Int) {imm}:
         var regs = unsafe_alloc[Float64](max(p.n_regs, 1) * VEC)
         var sel = unsafe_alloc[Int32](VEC)
+        var tmp = unsafe_alloc[Int32](max(MORSEL * n_look, 1))
         _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)     # constants, once
         while True:
             var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
@@ -1468,19 +1820,50 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                             mask[i0 + i] = 1
                     for i in range(n):
                         if mask[i0 + i] != 0:
-                            kept += 1
+                            var hit = True
+                            for j in range(n_look):
+                                var lj = look + j * LW
+                                var w = Int(lj[5])
+                                var v1 = _ival(Int(arrays[k * stride_a + n_cols + n_out + Int(lj[1])]),
+                                               w & 15, i0 + i - c0)
+                                var v2 = 0
+                                if Int(lj[0]) == 2:
+                                    v2 = _ival(Int(arrays[k * stride_a + n_cols + n_out + Int(lj[2])]),
+                                               (w >> 4) & 15, i0 + i - c0)
+                                var r = _probe(maps + j * MW, v1, v2)
+                                if r < 0:
+                                    hit = False
+                                    break
+                                tmp[kept * n_look + j] = Int32(r)
+                            if not hit:
+                                mask[i0 + i] = 0
+                                continue
                             for j in range(n_out):
                                 var kd = Int(kinds[j])
                                 if kd != OK_FIXED:
                                     var st = 0
                                     var ln = 0
                                     _out_str(kd, Int(arrays[k * stride_a + n_cols + j]), i0 + i - c0, st, ln)
-                                    mbytes[m * n_out + j] += Int64(ln)
+                                    mbytes[m * n_tot + j] += Int64(ln)
+                            for t in range(n_bout):
+                                var kd = Int(tk[n_out + t])
+                                if kd != OK_FIXED:
+                                    var st = 0
+                                    var ln = 0
+                                    _out_str(kd, Int(barr[t]), Int(tmp[kept * n_look + Int(blk[t])]), st, ln)
+                                    mbytes[m * n_tot + n_out + t] += Int64(ln)
+                            kept += 1
                     i0 += n
                 pos = stop
             mcnt[m] = Int64(kept)
+            if n_look > 0 and kept > 0:
+                var keep = unsafe_alloc[Int32](kept * n_look)
+                for i in range(kept * n_look):
+                    keep[i] = tmp[i]
+                mlook[m] = Int64(Int(keep))
         regs.free()
         sel.free()
+        tmp.free()
 
     if nt > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
@@ -1495,41 +1878,55 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         mrow[m] = Int64(total)
         total += Int(mcnt[m])
     var n_sel = total
-    var col_bytes = unsafe_alloc[Int64](max(n_out, 1))
-    for j in range(n_out):
+    var col_bytes = unsafe_alloc[Int64](max(n_tot, 1))
+    var too_big = False
+    for j in range(n_tot):
         var b = 0
         for m in range(morsels):
-            var x = Int(mbytes[m * n_out + j])
-            mbytes[m * n_out + j] = Int64(b)
+            var x = Int(mbytes[m * n_tot + j])
+            mbytes[m * n_tot + j] = Int64(b)
             b += x
         col_bytes[j] = Int64(b)
-        if Int(kinds[j]) != OK_FIXED and b > 2147483647:
-            mask.free()
-            mcnt.free()
-            mbytes.free()
-            counter.free()
-            mrow.free()
-            col_bytes.free()
-            no_gids.free()
-            tbl.free()
-            return E_OUTPUT_TOO_BIG
+        if Int(tk[j]) != OK_FIXED and b > 2147483647:
+            too_big = True
+    if too_big:
+        for m in range(morsels):
+            if Int(mlook[m]) != 0:
+                _ip(Int(mlook[m])).free()
+        for j in range(n_look):
+            _free_map(maps + j * MW)
+        mlook.free()
+        maps.free()
+        tk.free()
+        tsz.free()
+        barr.free()
+        blk.free()
+        mask.free()
+        mcnt.free()
+        mbytes.free()
+        counter.free()
+        mrow.free()
+        col_bytes.free()
+        no_gids.free()
+        tbl.free()
+        return E_OUTPUT_TOO_BIG
 
     # ── arena ────────────────────────────────────────────────────────────────────────────
     var asize = 0
-    for j in range(n_out):
-        if Int(kinds[j]) == OK_FIXED:
-            asize += _align8(n_sel * Int(sizes[j]))
+    for j in range(n_tot):
+        if Int(tk[j]) == OK_FIXED:
+            asize += _align8(n_sel * Int(tsz[j]))
         else:
             asize += _align8((n_sel + 1) * 4) + _align8(max(Int(col_bytes[j]), 1))
     var arena = _big_alloc(max(asize, 8))
-    var dst_a = unsafe_alloc[Int64](max(n_out, 1))    # values / offsets
-    var dst_b = unsafe_alloc[Int64](max(n_out, 1))    # string bytes
+    var dst_a = unsafe_alloc[Int64](max(n_tot, 1))    # values / offsets
+    var dst_b = unsafe_alloc[Int64](max(n_tot, 1))    # string bytes
     var at = Int(arena)
-    for j in range(n_out):
-        if Int(kinds[j]) == OK_FIXED:
+    for j in range(n_tot):
+        if Int(tk[j]) == OK_FIXED:
             dst_a[j] = Int64(at)
             dst_b[j] = 0
-            at += _align8(n_sel * Int(sizes[j]))
+            at += _align8(n_sel * Int(tsz[j]))
         else:
             dst_a[j] = Int64(at)
             at += _align8((n_sel + 1) * 4)
@@ -1548,6 +1945,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                 break
             var hi = min(lo + MORSEL, n_rows)
             var r = Int(mrow[m])
+            var r0 = r
             var pos = lo
             while pos < hi:
                 var k = _find_chunk(p, pos)
@@ -1590,7 +1988,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                     else:
                         var offs = _ip(Int(dst_a[j]))
                         var data = _bp(Int(dst_b[j]))
-                        var bp = Int(mbytes[m * n_out + j])
+                        var bp = Int(mbytes[m * n_tot + j])
                         # rows of this morsel before `pos` (earlier chunks) already advanced bp:
                         # recompute it from the rows written so far in this morsel
                         for i in range(pos, stop):
@@ -1604,12 +2002,54 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                                     data[bp + b] = sp[b]
                                 bp += ln
                                 rr += 1
-                        mbytes[m * n_out + j] = Int64(bp)      # next chunk of this morsel continues here
+                        mbytes[m * n_tot + j] = Int64(bp)      # next chunk of this morsel continues here
                 var adv = 0
                 for i in range(pos, stop):
                     adv += Int(mask[i])
                 r += adv
                 pos = stop
+            # partner columns: the morsel's kept rows, in order, through their partner rows
+            var kept = Int(mcnt[m])
+            if kept > 0 and n_look > 0:
+                var rows = _ip(Int(mlook[m]))
+                for t in range(n_bout):
+                    var arr = Int(barr[t])
+                    var kd = Int(tk[n_out + t])
+                    var j = Int(blk[t])
+                    if kd == OK_FIXED:
+                        var sz = Int(tsz[n_out + t])
+                        var base = _arr_buf(arr, 1) + _arr_off(arr) * sz
+                        if sz == 8:
+                            var src = _lp(base)
+                            var dst = _lp(Int(dst_a[n_out + t])) + r0
+                            for i in range(kept):
+                                dst[i] = src[Int(rows[i * n_look + j])]
+                        elif sz == 4:
+                            var src = _ip(base)
+                            var dst = _ip(Int(dst_a[n_out + t])) + r0
+                            for i in range(kept):
+                                dst[i] = src[Int(rows[i * n_look + j])]
+                        else:
+                            var src = _bp(base)
+                            var dst = _bp(Int(dst_a[n_out + t]))
+                            for i in range(kept):
+                                var s0 = Int(rows[i * n_look + j]) * sz
+                                var d0 = (r0 + i) * sz
+                                for b in range(sz):
+                                    dst[d0 + b] = src[s0 + b]
+                    else:
+                        var offs = _ip(Int(dst_a[n_out + t]))
+                        var data = _bp(Int(dst_b[n_out + t]))
+                        var bp = Int(mbytes[m * n_tot + n_out + t])
+                        for i in range(kept):
+                            var st = 0
+                            var ln = 0
+                            _out_str(kd, arr, Int(rows[i * n_look + j]), st, ln)
+                            offs[r0 + i] = Int32(bp)
+                            var sp = _bp(st)
+                            for b in range(ln):
+                                data[bp + b] = sp[b]
+                            bp += ln
 
     if nt > 1:
         parallelize(pass2, nt)
@@ -1618,9 +2058,20 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     O[0] = Int64(n_sel)
     O[1] = Int64(Int(arena))
-    for j in range(n_out):
+    for j in range(n_tot):
         O[2 + 2 * j] = dst_a[j]
         O[3 + 2 * j] = dst_b[j]
+    for m in range(morsels):
+        if Int(mlook[m]) != 0:
+            _ip(Int(mlook[m])).free()
+    for j in range(n_look):
+        _free_map(maps + j * MW)
+    mlook.free()
+    maps.free()
+    tk.free()
+    tsz.free()
+    barr.free()
+    blk.free()
     mask.free()
     mcnt.free()
     mbytes.free()

@@ -826,7 +826,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             slot_kinds.append(kind)
             slot_src.append(b.as_reg(inner))
         outputs.append((name, e.op, slot_index[key]))
-    if not outputs and not (concat_dicts and predicates):
+    if not outputs and not concat_dicts:
         raise Unsupported("no aggregates")       # (a predicate-only program is the executor's leaf filter)
 
     # ── dead code, then keep only the columns still read ───────────────────

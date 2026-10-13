@@ -202,6 +202,8 @@ def _watch_table(table) -> None:
         return
 
     def _purge(_ref, tid=tid):
+        if _WATCHED_TABLES is None:          # interpreter shutdown: module globals already cleared
+            return
         if _WATCHED_TABLES.get(tid) is _ref:
             del _WATCHED_TABLES[tid]
         for cache in (_GROUP_ENCODE_CACHE, _INPUT_PREP_CACHE, _GPU_BUFFER_CACHE, _JOIN_RESULT_CACHE):

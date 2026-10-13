@@ -788,6 +788,194 @@ def _apply_residuals(comp, tables, idx, n_rel: int, pending):
     return idx, n_rel
 
 
+# ── star joins fused into the fact table's scan (F-032, M2d) ─────────────────────────────────
+
+def _star_fact(comp, fl) -> Optional[int]:
+    """The leaf to scan with its partners looked up in the same pass: the largest Filter*(Scan)
+    leaf, when the native executor runs this plan. None: join leaf by leaf."""
+    if os.environ.get("MXFRAME_STAR", "1") == "0" or len(fl.leaves) < 2 or getattr(comp, "_device_arg", None) != "cpu":
+        return None
+    from . import native_exec
+    if not (native_exec.enabled() and native_exec.available()):
+        return None
+    best, best_rows = None, -1
+    for i, leaf in enumerate(fl.leaves):
+        scan, _ = _scan_under_filters(leaf)
+        if scan is not None and scan.table.num_rows > best_rows:
+            best, best_rows = i, scan.table.num_rows
+    return best
+
+
+def _star_name(leaf: int, c: str) -> str:
+    return f"{leaf}:{c}"
+
+
+def _execute_star(comp, fl, fact: int, tables, want, leaf_need) -> Optional[pa.Table]:
+    """The join as one scan of leaf ``fact``: every other leaf belongs to the subtree of one of the
+    fact's neighbours (the edges form a tree); each subtree is joined on its own (small tables) and
+    becomes a partner looked up by key while the fact's filter runs (``native_exec.try_filter``).
+    Residual conditions across subtrees run on the joined rows. None: declined (non-unique partner
+    keys, unsupported types), the caller joins leaf by leaf."""
+    from . import native_exec
+    n = len(fl.leaves)
+    adj: Dict[int, List[int]] = {i: [] for i in range(n)}
+    for ei, (a, b, _, _) in enumerate(fl.edges):
+        adj[a].append(ei)
+        adj[b].append(ei)
+    group = {fact: -1}
+    roots = []
+    for ei in adj[fact]:
+        a, b, _, _ = fl.edges[ei]
+        c = b if a == fact else a
+        if c == fact or c in group:
+            return None
+        group[c] = c
+        roots.append((c, ei))
+    for c, _ in roots:
+        stack = [c]
+        while stack:
+            x = stack.pop()
+            for ei in adj[x]:
+                a, b, _, _ = fl.edges[ei]
+                y = b if a == x else a
+                if y not in group:
+                    group[y] = c
+                    stack.append(y)
+    if len(group) != n:
+        return None
+
+    scan, preds = _scan_under_filters(fl.leaves[fact])
+    if scan is None:
+        return None
+    members: Dict[int, List[int]] = {c: sorted(x for x, g in group.items() if g == c) for c, _ in roots}
+    inner_res: Dict[int, list] = {c: [] for c, _ in roots}
+    post_res = []
+    for pred, cm in fl.residuals:
+        gs = {group[leaf] for leaf, _ in cm.values()}
+        if len(gs) == 1 and -1 not in gs and len(members[next(iter(gs))]) > 1:
+            inner_res[gs.pop()].append((pred, cm))       # joined with its subtree
+        else:
+            post_res.append((pred, cm))                  # on the joined rows (a one-leaf partner too)
+    # columns each leaf must deliver to the joined rows: outputs and cross-subtree residual inputs
+    deliver: Dict[int, List[str]] = {i: [] for i in range(n)}
+    for nm in want:
+        leaf, c = fl.src[nm]
+        if c not in deliver[leaf]:
+            deliver[leaf].append(c)
+    for _, cm in post_res:
+        for leaf, c in cm.values():
+            if c not in deliver[leaf]:
+                deliver[leaf].append(c)
+
+    lookups = []
+    for c, ei in roots:
+        a, b, ac, bc = fl.edges[ei]
+        probe, bkeys = (ac, bc) if a == fact else (bc, ac)
+        S = members[c]
+        bnames = []
+        cols_of: Dict[int, List[str]] = {}
+        for x in S:
+            cols = list(deliver[x])
+            if x == c:
+                cols += [k for k in bkeys if k not in cols]
+            cols_of[x] = cols
+        if len(S) == 1:
+            t = tables[c].select(cols_of[c])
+            B = pa.Table.from_arrays([t.column(k) for k in cols_of[c]],
+                                     names=[_star_name(c, k) for k in cols_of[c]])
+        else:
+            loc = {x: i for i, x in enumerate(S)}
+            lt = [tables[x] for x in S]
+            rows = [t.num_rows for t in lt]
+            base = [_base_rows(fl.leaves[x], rows[loc[x]]) for x in S]
+            ledges = [(loc[a2], loc[b2], ac2, bc2) for a2, b2, ac2, bc2 in fl.edges
+                      if a2 in loc and b2 in loc]
+            lres = [(p, {k: (loc[leaf], col_) for k, (leaf, col_) in cm.items()}) for p, cm in inner_res[c]]
+            idx, _ = _join_indices(comp, lt, rows, base, ledges, lres, {loc[x] for x in S if cols_of[x]})
+            arrays, names = [], []
+            for x in S:
+                if not cols_of[x]:
+                    continue
+                t = lt[loc[x]].select(cols_of[x])
+                ix = idx.get(loc[x])
+                g = t if ix is None else _gather_table(comp, t, ix, decode_dicts=True)
+                arrays += [g.column(k) for k in cols_of[x]]
+                names += [_star_name(x, k) for k in cols_of[x]]
+            B = pa.Table.from_arrays(arrays, names=names)
+        outs = [nm for nm in B.column_names if nm.split(":", 1)[0] != str(c) or
+                nm.split(":", 1)[1] in deliver[c]]
+        lookups.append(native_exec.Lookup(probe, B, [_star_name(c, k) for k in bkeys], outs, outs))
+
+    t0 = time.perf_counter()
+    out = native_exec.try_filter(comp, scan.table, preds, set(deliver[fact]), lookups)
+    if _TRACE:
+        _trace(f"star: scan leaf {fact} ({scan.table.num_rows} rows) with partners "
+               f"{[(c, lk.build.num_rows) for (c, _), lk in zip(roots, lookups)]} -> "
+               f"{None if out is None else out.num_rows} rows, {1e3*(time.perf_counter()-t0):.0f} ms "
+               f"{'' if out is not None else native_exec.last_filter()[1]}")
+    if out is None:
+        return None
+
+    def name_of(leaf, c):
+        return c if leaf == fact else _star_name(leaf, c)
+
+    for pred, cm in post_res:
+        if out.num_rows == 0:
+            break
+        t = pa.Table.from_arrays([out.column(name_of(leaf, c)) for leaf, c in cm.values()], names=list(cm))
+        mask = comp._eval_predicate(pred, t)
+        keep = _np_of(pc.fill_null(mask, _npscalar(False, type=pa.bool_())), zero_copy_only=False)
+        if not keep.all():
+            out = _take_rows(out, np.flatnonzero(keep).astype(np.int32))
+    return pa.Table.from_arrays([out.column(name_of(*fl.src[nm])) for nm in want], names=want)
+
+
+def _join_indices(comp, tables, rows, base, edges, residuals, out_leaves):
+    """Row-index vectors (leaf -> rows of that leaf, None: all) of the inner join of ``tables`` over
+    ``edges``, in the order ``plan_order`` picks; residual conditions applied as soon as their leaves
+    are joined. Only leaves in ``out_leaves`` (and those still needed to join) keep an index."""
+    start, steps = plan_order(rows, base, edges)
+    if _TRACE:
+        _trace(f"leaves rows={rows} base={base} start={start} steps={[(n, r) for n, _, r in steps]}")
+    idx: Dict[int, Optional[np.ndarray]] = {start: None}     # leaf -> row index of the relation (None: identity)
+    n_rel = rows[start]
+    consumed: Set[int] = set()
+    pending = [(p, cm, {leaf for leaf, _ in cm.values()}) for p, cm in residuals]
+    if pending:
+        idx, n_rel = _apply_residuals(comp, tables, idx, n_rel, pending)
+    for new, ei, r_leaf in steps:
+        a, b, ac, bc = edges[ei]
+        if r_leaf == a:
+            rcols_r, rcols_new = ac, bc
+        else:
+            rcols_r, rcols_new = bc, ac
+        consumed.add(ei)
+        if n_rel == 0 or rows[new] == 0:
+            n_rel = 0
+            idx = {x: np.empty(0, dtype=np.int32) for x in list(idx) + [new]}
+            continue
+        t0 = time.perf_counter()
+        rel_keys = [_gather_key(tables[r_leaf].column(c), idx[r_leaf]) for c in rcols_r]
+        new_keys = [tables[new].column(c) for c in rcols_new]
+        t1 = time.perf_counter()
+        ri, ni, t2 = _join_pairs(comp, rel_keys, new_keys, n_rel, rows[new])
+        t3 = time.perf_counter()
+        pending_leaves = set().union(*[lv for _, _, lv in pending]) if pending else set()
+        alive = {x for x in idx if x in out_leaves or x in pending_leaves or any(
+            e not in consumed and (edges[e][0] == x or edges[e][1] == x) for e in range(len(edges)))}
+        idx = {x: (ri if idx[x] is None else _take(idx[x], ri)) for x in alive}
+        idx[new] = ni
+        if _TRACE:
+            t4 = time.perf_counter()
+            _trace(f"add leaf {new} via {r_leaf}: rel {n_rel} x {rows[new]} -> {len(ri)}  "
+                   f"keys {1e3*(t1-t0):.0f} ms, encode {1e3*(t2-t1):.0f} ms, join {1e3*(t3-t2):.0f} ms, compose {1e3*(t4-t3):.0f} ms")
+        n_rel = len(ri)
+        if pending:
+            idx, n_rel = _apply_residuals(comp, tables, idx, n_rel, pending)
+
+    return idx, n_rel
+
+
 def _execute_inner(comp, node, needed, dict_ok=False):
     fl = _flatten(node)
     if fl is None:
@@ -817,50 +1005,20 @@ def _execute_inner(comp, node, needed, dict_ok=False):
     for _, cm in fl.residuals:
         for leaf, c in cm.values():
             later[leaf].discard(c)
-    tables = [leaf_table(comp, fl.leaves[i], leaf_need[i], keep=later[i]) for i in range(n_leaves)]
+    tables: List[Optional[pa.Table]] = [None] * n_leaves
+    fact = _star_fact(comp, fl)
+    for i in range(n_leaves):
+        if i != fact:
+            tables[i] = leaf_table(comp, fl.leaves[i], leaf_need[i], keep=later[i])
+    if fact is not None:
+        out = _execute_star(comp, fl, fact, tables, want, leaf_need)
+        if out is not None:
+            return out
+        tables[fact] = leaf_table(comp, fl.leaves[fact], leaf_need[fact], keep=later[fact])
     rows = [t.num_rows for t in tables]
     base = [_base_rows(fl.leaves[i], rows[i]) for i in range(n_leaves)]
-
-    start, steps = plan_order(rows, base, fl.edges)
-    if _TRACE:
-        _trace(f"leaves rows={rows} base={base} start={start} steps={[(n, r) for n, _, r in steps]}")
     out_leaves = {fl.src[n][0] for n in want}
-
-    idx: Dict[int, Optional[np.ndarray]] = {start: None}     # leaf -> row index of the relation (None: identity)
-    n_rel = rows[start]
-    consumed: Set[int] = set()
-    pending = [(p, cm, {leaf for leaf, _ in cm.values()}) for p, cm in fl.residuals]
-    if pending:
-        idx, n_rel = _apply_residuals(comp, tables, idx, n_rel, pending)
-    for new, ei, r_leaf in steps:
-        a, b, ac, bc = fl.edges[ei]
-        if r_leaf == a:
-            rcols_r, rcols_new = ac, bc
-        else:
-            rcols_r, rcols_new = bc, ac
-        consumed.add(ei)
-        if n_rel == 0 or rows[new] == 0:
-            n_rel = 0
-            idx = {x: np.empty(0, dtype=np.int32) for x in list(idx) + [new]}
-            continue
-        t0 = time.perf_counter()
-        rel_keys = [_gather_key(tables[r_leaf].column(c), idx[r_leaf]) for c in rcols_r]
-        new_keys = [tables[new].column(c) for c in rcols_new]
-        t1 = time.perf_counter()
-        ri, ni, t2 = _join_pairs(comp, rel_keys, new_keys, n_rel, rows[new])
-        t3 = time.perf_counter()
-        pending_leaves = set().union(*[lv for _, _, lv in pending]) if pending else set()
-        alive = {x for x in idx if x in out_leaves or x in pending_leaves or any(
-            e not in consumed and (fl.edges[e][0] == x or fl.edges[e][1] == x) for e in range(len(fl.edges)))}
-        idx = {x: (ri if idx[x] is None else _take(idx[x], ri)) for x in alive}
-        idx[new] = ni
-        if _TRACE:
-            t4 = time.perf_counter()
-            _trace(f"add leaf {new} via {r_leaf}: rel {n_rel} x {rows[new]} -> {len(ri)}  "
-                   f"keys {1e3*(t1-t0):.0f} ms, encode {1e3*(t2-t1):.0f} ms, join {1e3*(t3-t2):.0f} ms, compose {1e3*(t4-t3):.0f} ms")
-        n_rel = len(ri)
-        if pending:
-            idx, n_rel = _apply_residuals(comp, tables, idx, n_rel, pending)
+    idx, n_rel = _join_indices(comp, tables, rows, base, fl.edges, fl.residuals, out_leaves)
 
     t_g = time.perf_counter()
     by_leaf: Dict[int, List[Tuple[str, str]]] = {}
