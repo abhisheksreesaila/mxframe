@@ -481,10 +481,10 @@ Needs: design (`docs/design/docs-site.md`) · Files: `docs/site/` (new), `.githu
 - [x] a Pages workflow deploys `docs/site/` on push to `main`; the bench CSV/JSON files are copied in at build
 - [ ] Blocked until merge: Abhishek turns on Pages (Settings → Pages → Source: GitHub Actions), or says OK for `gh api`
 
-## F-048 Simple README with API tables [todo]
+## F-048 Simple README with API tables [review]
 Needs: F-047 (links) · Files: `README.md`, `tests/test_readme_api.py` (new)
-- [ ] under ~120 lines: why (3 bullets), latest release (0.6.0 SF10 table + DuckDB caveat), install, a code + output "screenshot" (query, result, timing), API reference tables (LazyFrame methods, expressions, aggregations, SQL, devices), links to the pages; the long history moves to the pages / `optimizations.md` / `benchmarks.md`
-- [ ] a test runs every code sample and API call shown in the README; the headline numbers match `docs/bench/m2s-engine*.csv`
+- [x] under ~120 lines: why (3 bullets), latest release (0.6.0 SF10 table + DuckDB caveat), install, a code + output "screenshot" (query, result, timing), API reference tables (LazyFrame methods, expressions, aggregations, SQL, devices), links to the pages; the long history moves to the pages / `optimizations.md` / `benchmarks.md`
+- [x] a test runs every code sample and API call shown in the README; the headline numbers match `docs/bench/m2s-engine*.csv`
 
 ## F-049 Interactive benchmarks page [todo]
 Needs: F-047 · Files: `docs/site/benchmarks.html`, `docs/site/js/bench.js`
