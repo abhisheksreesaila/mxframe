@@ -157,3 +157,12 @@ def test_page_redraws_on_themechange_and_uses_engine_tokens():
     for tok in ("--mx", "--dk", "--pl"):
         assert tok in html
     assert "<details" in html and "legend" in html
+
+
+def test_progress_chart_is_drawn_at_container_width_with_readable_text():
+    html = PAGE.read_text()
+    assert "host.clientWidth" in html and "narrow" in html
+    assert 'width: "100%"' not in html.split("function drawProgress")[1].split("function progressTable")[0]
+    assert "#progress svg { min-width: 0" in html
+    css = (ROOT / "docs" / "site" / "site.css").read_text()
+    assert re.search(r"svg text \{[^}]*font-size: (1\d|[2-9]\d)px", css), "axis text stays at 10px or more"

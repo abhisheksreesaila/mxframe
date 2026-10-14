@@ -57,7 +57,7 @@ function svg(tag, attrs = {}, text) {
   return e;
 }
 
-// minimal CSV parser: header row, comma separated, no quoted commas (our bench CSVs have none)
+// minimal CSV parser: header row, comma separated, no quoted fields (tests/test_docs_site.py checks that no CSV a page reads has a quote)
 async function loadCSV(path) {
   const res = await fetch(path);
   if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);

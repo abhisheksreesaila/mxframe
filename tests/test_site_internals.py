@@ -166,3 +166,45 @@ def test_github_links_point_at_the_blob_path(page):
     html = PAGE.read_text()
     assert base in html or "BLOB" in html
     assert "const BLOB" in html and base in html
+
+
+def test_stack_story_matches_the_dispatch_code(page):
+    """Joins run first and non-aggregate plans call native helpers from the AOT path; the page says so."""
+    text = " ".join(page.text) + " " + json.dumps(page.json)
+    assert "never half-run" not in text and "is never half-run" not in text
+    custom = (ROOT / "custom_ops.py").read_text()
+    # order in compute: joins are materialised before the native/fused tries
+    assert custom.index("self._materialize_joins(plan)") < custom.index("_native_exec.try_execute(self, plan")
+    assert custom.index("_native_exec.try_execute(self, plan") < custom.index("try_fused_aggregate(self, plan")
+    # the AOT path calls these native helpers, which the layer text names
+    for fn in ("try_filter", "try_filter_topk", "try_topk", "try_distinct"):
+        assert f"native_exec.{fn}(" in custom, fn
+        assert re.search(rf"\bdef {fn}\b", (ROOT / "native_exec.py").read_text()), fn
+    join_src = (ROOT / "join_engine.py").read_text()
+    assert "native_exec.try_filter(" in join_src and "native_exec.try_gather(" in join_src
+    aot = next(l for l in page.json["layers"] if l["id"] == "aot")
+    assert "join" in aot["does"] and "try_filter_topk" in aot["does"]
+
+
+def test_thread_default_text_matches_the_code(page):
+    html = PAGE.read_text()
+    assert "hyperthreads included" in html
+    aot = (ROOT / "aot_kernels.py").read_text()
+    assert "sched_getaffinity" in aot and "physical" in (ROOT / "pipeline_kernels.py").read_text()
+
+
+def test_native_decline_list_covers_the_common_reasons(page):
+    native = next(l for l in page.json["layers"] if l["id"] == "native")["declines"]
+    assert "for example" in native
+    for needle in ("one table", "bytecode compiler", "HAVING", "sort is by an expression"):
+        assert needle in native, needle
+    src = (ROOT / "native_exec.py").read_text()
+    for reason in ("input is not a scan of one table", "expression not supported by the bytecode compiler",
+                   "HAVING other than", "sort by an expression"):
+        assert reason in src, reason
+
+
+def test_optimizer_arrow_does_not_claim_a_decline():
+    html = PAGE.read_text()
+    assert "never declines" in html
+    assert 'i === 3 ? " if it declines"' not in html

@@ -48,6 +48,13 @@ const median = (xs) => { const s = [...xs].sort((a, b) => a - b), n = s.length; 
 // queries where DuckDB is strictly faster than MXFrame
 const duckdbFaster = (m) => m.queries.filter((q) => m.ms.duckdb[q] < m.ms["mx-cpu"][q]);
 
+// Two totals within 1% of the larger one are a tie, not a win (at SF1 stored, without Q21: 386.9 vs 387.4 ms).
+const TIE_TOLERANCE = 0.01;
+function compareTotals(a, b, tol = TIE_TOLERANCE) {
+  const tie = Math.abs(a - b) <= tol * Math.max(a, b);
+  return { tie, aLower: a < b };
+}
+
 // random suite: per shape (and "all"), the geometric mean of DuckDB ms / MXFrame ms (above 1: MXFrame faster)
 function randomShapes(results) {
   const by = {};
@@ -65,7 +72,7 @@ function randomShapes(results) {
     .sort((x, y) => (x.shape === "all") - (y.shape === "all") || x.shape.localeCompare(y.shape));
 }
 
-if (typeof module !== "undefined") module.exports = { queryMatrix, total, wrongQueries, median, duckdbFaster, randomShapes };
+if (typeof module !== "undefined") module.exports = { compareTotals, TIE_TOLERANCE, queryMatrix, total, wrongQueries, median, duckdbFaster, randomShapes };
 
 // ---------- page ----------
 if (typeof document !== "undefined") (function () {
@@ -102,6 +109,7 @@ if (typeof document !== "undefined") (function () {
     const m = matrix(), list = engRows();
     const t = Object.fromEntries(list.map(([e]) => [e, total(m, e)]));
     const t21 = Object.fromEntries(list.map(([e]) => [e, total(m, e, 21)]));
+    const tied = (o, e) => Object.entries(o).some(([k, v]) => k !== e && v != null && compareTotals(v, o[e]).tie);   // a tie is not a win
     const low = (o) => Math.min(...Object.values(o).filter((v) => v != null));
     const best = low(t), best21 = low(t21);
     $("totals").innerHTML = list.map(([e, n, c]) => {
@@ -110,14 +118,16 @@ if (typeof document !== "undefined") (function () {
         (t[e] === best && list.length > 1 ? '<span class="badge ok">lowest total</span> ' : "") +
         (w.length ? `<span class="badge error">Q${w.join(", Q")} wrong</span>` : "") +
         `<div style="font-size:13px;margin-top:6px;color:var(--text-mid)">without Q21: <span class="num" style="font-size:15px">${t21[e] == null ? "n/a" : sec(t21[e])}</span>` +
-        (t21[e] === best21 && list.length > 1 ? ' <span class="badge ok">lowest</span>' : "") + `</div></div>`;
+        (t21[e] === best21 && list.length > 1 && !tied(t21, e) ? ' <span class="badge ok">lowest</span>' : "") + `</div></div>`;
     }).join("");
     const mx = total(m, "mx-cpu"), dk = total(m, "duckdb"), mx21 = total(m, "mx-cpu", 21), dk21 = total(m, "duckdb", 21);
     const sfTxt = "SF" + state.sf;
     let s = "";
     if (mx != null && dk != null) {
-      const lo = dk21 < mx21 ? ["DuckDB", dk21, "MXFrame", mx21] : ["MXFrame", mx21, "DuckDB", dk21];
-      s = `Without Q21, ${lo[0]}'s ${sfTxt} total is the lower one (${sec(lo[1])} against ${lo[2]}'s ${sec(lo[3])}), ` +
+      const cmp = compareTotals(dk21, mx21), lo = cmp.aLower ? ["DuckDB", dk21, "MXFrame", mx21] : ["MXFrame", mx21, "DuckDB", dk21];
+      s = (cmp.tie
+        ? `Without Q21, MXFrame and DuckDB tie at ${sfTxt} (${sec(mx21)} and ${sec(dk21)}, within 1%), `
+        : `Without Q21, ${lo[0]}'s ${sfTxt} total is the lower one (${sec(lo[1])} against ${lo[2]}'s ${sec(lo[3])}), `) +
         `and DuckDB is faster on ${duckdbFaster(m).length} of ${m.queries.length} queries. `;
     }
     $("totals-note").textContent = s + "Query time only: a fresh process per query, data already loaded, no warm-up.";
@@ -213,7 +223,7 @@ if (typeof document !== "undefined") (function () {
       const box = document.createElement("div");
       box.innerHTML = `<div class="label" style="margin:0 0 4px">${label} · ${all[k].at(-1).n} queries</div><div class="chart"></div>`;
       host.append(box);
-      const el = box.querySelector(".chart"), rows = all[k], W = Math.max(el.clientWidth, 260), rh = 22, L = 112, R = 44, H = rows.length * rh + 34;
+      const el = box.querySelector(".chart"), rows = all[k], W = Math.max(el.clientWidth, 260), rh = 22, L = 112, R = 52, H = rows.length * rh + 34;
       const half = (W - L - R) / 2, C = L + half, X = (r) => C + (Math.log10(r) / lg) * half;
       const s = frame(el, W, H);
       s.style.minWidth = "0";
@@ -225,7 +235,8 @@ if (typeof document !== "undefined") (function () {
         const y = i * rh + rh / 2 + 2, x = X(row.ratio), isAll = row.shape === "all";
         s.append(svg("text", { x: L - 8, y: y + 3, "text-anchor": "end", "font-weight": isAll ? 700 : 400 }, row.shape));
         s.append(svg("rect", { x: Math.min(C, x), y: y - 4, width: Math.max(2, Math.abs(x - C)), height: 8, rx: 1.5, fill: cssVar(row.ratio >= 1 ? "--fast" : "--slow") }));
-        s.append(svg("text", { x: row.ratio >= 1 ? x + 4 : x - 4, y: y + 3, "text-anchor": row.ratio >= 1 ? "start" : "end" }, row.ratio.toFixed(2) + "x"));
+        // the value sits in its own column at the right edge: a bar that points left would run into the shape name
+        s.append(svg("text", { x: W - 4, y: y + 3, "text-anchor": "end" }, row.ratio.toFixed(2) + "x"));
         const hit = svg("rect", { x: 0, y: y - rh / 2, width: W, height: rh, fill: "transparent" });
         hover(hit, () => `<b>${row.shape}</b> · ${label}<br>${row.n} queries, MXFrame correct ${row.correct}/${row.n}<br>` +
           `faster than DuckDB on ${row.faster}/${row.ran}<br>DuckDB / MXFrame, geo. mean: <b>${ratioTxt(row.ratio)}</b>`);
