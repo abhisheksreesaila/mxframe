@@ -58,8 +58,13 @@ out = (lf.filter(mx.col(<span class="s">"l_quantity"</span>) &lt; <span class="s
 </main>
 </div>
 <script>
-// one card per page; each page's ticket adds its card (F-049..F-052)
-const CARDS = [];
+// one card per page; thumbnails from scripts/site_thumbs.sh
+const CARDS = [
+  ["benchmarks.html", "Benchmarks", "All 22 TPC-H queries and 250 random ones against DuckDB and Polars, query by query. Switch scale, row order and engines.", "img/benchmarks.png"],
+  ["auto-mode.html", "How device=\"auto\" decides", "Pick a query and a data size and watch auto choose CPU, GPU or both, with the rule that decided it.", "img/auto-mode.png"],
+  ["internals.html", "Behind the scenes", "The path a query takes, layer by layer: files, seams, fallbacks and how to add an operator. For porting.", "img/internals.png"],
+  ["how-it-got-fast.html", "How it got fast", "Every optimization from 22.7 s to 3.15 s at SF10, and which wins come from Mojo and which don't.", "img/how-it-got-fast.png"],
+];
 document.getElementById("pages").innerHTML = CARDS.map(([href, title, what, img]) =>
   `<a class="card" href="${href}"><img class="thumb" src="${img}" alt="${title} page"><div class="card-b"><b>${title}</b><p style="margin:4px 0 0;font-size:13.5px">${what}</p></div></a>`).join("");
 

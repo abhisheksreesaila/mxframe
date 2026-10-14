@@ -486,21 +486,21 @@ Needs: F-047 (links) · Files: `README.md`, `tests/test_readme_api.py` (new)
 - [x] under ~120 lines: why (3 bullets), latest release (0.6.0 SF10 table + DuckDB caveat), install, a code + output "screenshot" (query, result, timing), API reference tables (LazyFrame methods, expressions, aggregations, SQL, devices), links to the pages; the long history moves to the pages / `optimizations.md` / `benchmarks.md`
 - [x] a test runs every code sample and API call shown in the README; the headline numbers match `docs/bench/m2s-engine*.csv`
 
-## F-049 Interactive benchmarks page [todo]
+## F-049 Interactive benchmarks page [review]
 Needs: F-047 · Files: `docs/site/benchmarks.html`, `docs/site/js/bench.js`
 - [ ] toggles: SF1 / SF10, stored / shuffled, engines; per-query bars and totals with and without Q21; random-query shapes vs DuckDB; correctness verdicts; run conditions (load, date, build)
 - [ ] reads the CSV/JSON in `docs/bench/`; a check script fails if a number on the page has no source row
 
-## F-050 Behind the scenes (for porting) page [todo]
+## F-050 Behind the scenes (for porting) page [review]
 Needs: F-047 · Files: `docs/site/internals.html`
 - [ ] the path a query takes, LazyFrame → plan → optimizer → native Mojo executor → fused pipeline → AOT kernels, as a clickable diagram; each layer shows its files, its seam (ctypes, Arrow C Data Interface), when it declines and who answers next, and the env switch (`MXFRAME_NATIVE`, `MXFRAME_FUSED_PIPELINE`)
 - [ ] "add an operator" walkthrough with the real file and function names; every path named on the page exists (checked by a test)
 
-## F-051 How it got fast page [todo]
+## F-051 How it got fast page [review]
 Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open items of F-039
 - [ ] one card per optimization from `optimizations.md` (what was slow, what changed, before / after numbers, Mojo feature or plain engineering), the progress chart, per-query wins over time
 
-## F-052 How device="auto" decides page [todo]
+## F-052 How device="auto" decides page [review]
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
 - [ ] restyled on `site.css`, "how to read this" header, numbers from the bench files
 

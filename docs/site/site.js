@@ -2,6 +2,10 @@
 // Every page includes this file and a <nav class="side"></nav>; pages are listed once, here.
 const PAGES = [
   ["index.html", "Overview"],
+  ["benchmarks.html", "Benchmarks"],
+  ["auto-mode.html", "How auto decides"],
+  ["internals.html", "Behind the scenes"],
+  ["how-it-got-fast.html", "How it got fast"],
 ];
 const REPO = "https://github.com/abhisheksreesaila/mxframe";
 
