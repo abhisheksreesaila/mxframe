@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Smoke test: verify AOT kernels and custom_ops.py AOT dispatch work correctly."""
+import os
 import sys
 
 import numpy as np
@@ -126,7 +127,10 @@ tbl = pa.table({"key": pa.array(key_col.astype(np.int64)),
 
 lf  = LazyFrame(Scan(tbl))
 
-# Grouped sum via compile_and_run (AOT cpu_aot path)
+# Grouped sum via compile_and_run (AOT cpu_aot path). The native executor and
+# the fused pipeline would answer first; they have their own tests.
+os.environ["MXFRAME_NATIVE"] = "0"
+os.environ["MXFRAME_FUSED_PIPELINE"] = "0"
 plan = lf.groupby("key").agg(Expr("col", "val").sum().alias("sum_val")).plan
 res  = comp.compile_and_run(plan)
 # Validate against numpy ground truth
