@@ -23,7 +23,7 @@ All are built ahead of time, committed, and shipped in the wheel; nothing compil
 | `libmxexec_cpu.so` | `kernels_aot/executor_cpu.mojo` | `bash scripts/build_pipeline.sh exec` |
 | `libmxpipeline_cpu.so`, `libmxpipeline_gpu.so` | `pipeline_cpu.mojo`, `pipeline_gpu.mojo` | `bash scripts/build_pipeline.sh cpu` / `gpu` |
 | `libmxkernels_aot.so`, `libmxkernels_aot_gpu.so` | `kernels_aot.mojo`, `kernels_aot_gpu.mojo` | step 2 of `scripts/release.sh` |
-| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | same form: `pixi run mojo build kernels_aot/<src>.mojo -I kernels_aot --target-cpu x86-64-v3 --emit shared-lib -o kernels_aot/<lib>.so` |
+| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | the `Build:` line in each source's header: `pixi run mojo build kernels_aot/<src>.mojo -I kernels_aot --target-cpu x86-64-v3 --emit shared-lib -o kernels_aot/<lib>.so` |
 | `kernels.mojoc` | `kernels/*.mojo` | `bash scripts/build_kernels.sh` (the MAX Graph custom ops) |
 
 ---
@@ -72,102 +72,17 @@ Run on a quiet machine (load under 2, no scheduled jobs); see `docs/lessons.md`.
 
 This is the older per-operator kernel path (layer 3). New engine work usually goes into the native executor instead (see step 3 above).
 
-### Step 1 — Write the kernel in `kernels/`
+Copy an existing kernel rather than writing one from a template; the Mojo toolchain moves fast and the code in the repo is what builds today. The pattern, using grouped sum as the example:
 
-Create `kernels/my_kernel.mojo`:
+| Step | CPU | GPU |
+|---|---|---|
+| 1. Export a C-ABI function (`@export`, `def … abi("C")`, buffers passed as integer addresses) | `group_sum_f32` in `kernels_aot/kernels_aot.mojo` | `group_sum_f32_gpu` in `kernels_aot/kernels_aot_gpu.mojo` (it calls the `run_group` helper; for a launch written out in full, `ctx.enqueue_function[...]` guarded by `if n > 0`, see `utf8_startswith_mask_gpu` in the same file) |
+| 2. Bind it with ctypes (sizes are `c_int64`; Mojo `Int` is 64-bit) | `AOTKernels._bind` in `aot_kernels.py` (`self._fn(name, argtypes)`) | `AOTKernelsGPU._bind` in `aot_kernels.py` (`_bind_gpu(L, name, argtypes)`; arguments are device pointers, uploaded first) |
+| 3. Call it from the operator path | `AOTKernels.group_sum` | the matching `AOTKernelsGPU` method |
 
-```mojo
-from math import ceildiv
-from gpu import block_dim, block_idx, thread_idx
-from os.atomic import Atomic
-from runtime.asyncrt import DeviceContextPtr
-from tensor import ManagedTensorSlice
+The MAX Graph custom ops in `kernels/*.mojo` (e.g. `kernels/group_sum.mojo`, registered with `@register` from `extensibility`) are packaged into `kernels.mojoc` by `scripts/build_kernels.sh`.
 
-comptime BLOCK_SIZE = 256
-
-fn _my_kernel_cpu(
-    out: ManagedTensorSlice[mut=True, dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
-    inp: ManagedTensorSlice[dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
-):
-    var n = inp.dim_size(0)
-    for i in range(n):
-        out[i] = inp[i] * 2.0          # example: double every element
-
-fn _my_kernel_gpu(
-    out: ManagedTensorSlice[mut=True, dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
-    inp: ManagedTensorSlice[dtype=DType.float32, rank=1, io_spec=_, static_spec=_],
-    ctx: DeviceContextPtr,
-) raises:
-    var n = inp.dim_size(0)
-    @parameter
-    fn kernel(n_: Int):
-        var i = block_dim.x * block_idx.x + thread_idx.x
-        if i < UInt(n_):
-            out[Int(i)] = inp[Int(i)] * 2.0
-    ctx.get_device_context().enqueue_function_experimental[kernel](
-        n, grid_dim=ceildiv(n, BLOCK_SIZE), block_dim=BLOCK_SIZE)
-```
-
-### Step 2 — Export in `kernels_aot/kernels_aot.mojo` (CPU)
-
-```mojo
-# In kernels_aot/kernels_aot.mojo, add:
-
-@export
-fn my_kernel_cpu(out_addr: Int, inp_addr: Int, n: Int):
-    var out_ptr = _f32(out_addr)
-    var inp_ptr = _f32(inp_addr)
-    for i in range(n):
-        out_ptr[i] = inp_ptr[i] * 2.0
-```
-
-### Step 3 — Export in `kernels_aot/kernels_aot_gpu.mojo` (GPU)
-
-```mojo
-@export
-fn my_kernel_gpu(out_addr: Int, inp_addr: Int, n: Int):
-    @parameter
-    fn kernel(n_: Int):
-        var i = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
-        if i < n_: _f32(out_addr)[i] = _f32(inp_addr)[i] * 2.0
-    try:
-        var ctx = DeviceContext()
-        ctx.enqueue_function_experimental[kernel](
-            n, grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
-        ctx.synchronize()
-    except: pass
-```
-
-### Step 4 — Bind in `aot_kernels.py`
-
-In `_bind` of class `AOTKernels` (CPU) or `AOTKernelsGPU` (GPU), add the binding:
-
-```python
-def _bind(self):
-    # ... existing bindings ...
-    self._lib.my_kernel_gpu.argtypes = [
-        ctypes.c_int64,   # out_addr
-        ctypes.c_int64,   # inp_addr
-        ctypes.c_int,     # n
-    ]
-    self._lib.my_kernel_gpu.restype = None
-```
-
-And the call wrapper:
-
-```python
-def my_kernel(self, inp: np.ndarray) -> np.ndarray:
-    n = len(inp)
-    out = np.zeros(n, dtype=np.float32)
-    self._lib.my_kernel_gpu(
-        out.ctypes.data_as(ctypes.c_void_p).value,
-        inp.ctypes.data_as(ctypes.c_void_p).value,
-        ctypes.c_int(n),
-    )
-    return out
-```
-
-### Step 5 — Rebuild and test
+### Rebuild and test
 
 ```sh
 pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
