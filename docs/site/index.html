@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MXFrame: a DataFrame engine written in Mojo</title>
+<meta name="description" content="MXFrame: a lazy DataFrame and SQL engine compiled with Mojo. Polars-style API; faster than DuckDB and Polars on the TPC-H SF10 total.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script src="site.js"></script>
+</head>
+<body>
+<div class="shell">
+<nav class="side"></nav>
+<main>
+  <div class="read"><b>What you're looking at</b>The front page of the MXFrame docs. The numbers below are computed in your browser from the benchmark file they came from (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>). Each card further down is one page of the docs.</div>
+
+  <span class="kick">// v0.6.0 · native Mojo CPU engine</span>
+  <h1>A DataFrame engine written in Mojo.<br>Polars-style API, faster than DuckDB on TPC-H SF10.</h1>
+  <p>MXFrame builds a lazy query plan from Python (DataFrame calls or SQL), then runs the whole plan in one call into a native Mojo executor, on all your CPU cores. The GPU is there when you have one.</p>
+
+  <div class="card" style="margin:22px 0">
+    <div class="card-h">TPC-H SF10 · all 22 queries · engine only</div>
+    <div class="card-b">
+      <div class="grid g3" id="totals"><div class="status">loading benchmark files…</div></div>
+      <p style="font-size:13.5px;margin:12px 0 0" id="totals-note"></p>
+    </div>
+  </div>
+
+  <div class="grid" style="grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);align-items:start">
+    <div class="card">
+      <div class="card-h">quickstart.py</div>
+<pre><span class="c"># pip install "mxframe[runtime]"</span>
+<span class="k">import</span> mxframe <span class="k">as</span> mx
+
+lf = mx.scan_parquet(<span class="s">"lineitem.parquet"</span>)
+out = (lf.filter(mx.col(<span class="s">"l_quantity"</span>) &lt; <span class="s">24</span>)
+         .groupby(<span class="s">"l_returnflag"</span>)
+         .agg(mx.col(<span class="s">"l_extendedprice"</span>).sum().alias(<span class="s">"revenue"</span>))
+         .sort(<span class="s">"l_returnflag"</span>)
+         .compute())       <span class="c"># a pyarrow Table</span></pre>
+    </div>
+    <div class="card">
+      <div class="card-h">out · TPC-H SF1 lineitem (6M rows)</div>
+      <table class="t">
+        <tr><th>l_returnflag</th><th class="r">revenue</th></tr>
+        <tr><td class="mono">A</td><td class="r num">12,224,287,050</td></tr>
+        <tr><td class="mono">N</td><td class="r num">25,204,209,794</td></tr>
+        <tr><td class="mono">R</td><td class="r num">12,231,597,084</td></tr>
+      </table>
+      <p style="font-size:13px;padding:0 16px">Nothing runs until <code>.compute()</code>; then the plan is optimized and executed in one native call.</p>
+    </div>
+  </div>
+
+  <h2>The docs</h2>
+  <div class="grid g2" id="pages"></div>
+</main>
+</div>
+<script>
+// one card per page; each page's ticket adds its card (F-049..F-052)
+const CARDS = [];
+document.getElementById("pages").innerHTML = CARDS.map(([href, title, what, img]) =>
+  `<a class="card" href="${href}"><img class="thumb" src="${img}" alt="${title} page"><div class="card-b"><b>${title}</b><p style="margin:4px 0 0;font-size:13.5px">${what}</p></div></a>`).join("");
+
+const ENGINES = [["mx-cpu", "MXFrame", "--mx"], ["duckdb", "DuckDB", "--dk"], ["polars", "Polars", "--pl"]];
+loadCSV("bench/m2s-engine.csv").then((rows) => {
+  const sf10 = rows.filter((r) => r.sf === "10");
+  const total = (e, skip) => sf10.filter((r) => r.engine === e && r.query !== skip).reduce((s, r) => s + +r.first_ms, 0);
+  const t = Object.fromEntries(ENGINES.map(([e]) => [e, total(e)]));
+  const best = Math.min(...Object.values(t));
+  document.getElementById("totals").innerHTML = ENGINES.map(([e, name, c]) =>
+    `<div class="card stat"><span class="label"><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:var(${c});margin-right:6px"></i>${name}</span>` +
+    `<span class="num">${(t[e] / 1000).toFixed(2)} s</span>${t[e] === best ? '<span class="badge ok">fastest total</span>' : ""}</div>`).join("");
+  const mx21 = total("mx-cpu", "21"), dk21 = total("duckdb", "21");
+  document.getElementById("totals-note").textContent =
+    `Q21 carries the lead: without it, DuckDB's total is ${(dk21 / 1000).toFixed(2)} s against MXFrame's ${(mx21 / 1000).toFixed(2)} s, and DuckDB is faster on ` +
+    `${sf10.filter((r) => r.engine === "duckdb" && +r.first_ms < +sf10.find((m) => m.engine === "mx-cpu" && m.query === r.query).first_ms).length} of the 22 queries. ` +
+    `Query time only: a fresh process per query, data already loaded, no warm-up.`;
+}).catch((err) => showError(document.getElementById("totals"), "bench/m2s-engine.csv", err));
+</script>
+</body>
+</html>

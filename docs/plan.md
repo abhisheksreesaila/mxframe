@@ -475,10 +475,10 @@ Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong 
 
 Shared rules: plain HTML + JS + one shared CSS in `docs/site/` (house style, Terminal Ledger); every page opens with "what you're looking at, how to read it"; numbers come from `docs/bench/*.csv` / `*.json`, never typed by hand (README headline table excepted, checked by a test).
 
-## F-047 Site skeleton and GitHub Pages deploy [todo]
+## F-047 Site skeleton and GitHub Pages deploy [review]
 Needs: design (`docs/design/docs-site.md`) · Files: `docs/site/` (new), `.github/workflows/pages.yml` (new)
-- [ ] `docs/site/index.html`: one card per page (thumbnail, one-line "what it shows"), shared nav and `site.css`, light and dark
-- [ ] a Pages workflow deploys `docs/site/` on push to `main`; the bench CSV/JSON files are copied in at build
+- [x] `docs/site/index.html`: one card per page (thumbnail, one-line "what it shows"), shared nav and `site.css`, light and dark
+- [x] a Pages workflow deploys `docs/site/` on push to `main`; the bench CSV/JSON files are copied in at build
 - [ ] Blocked until merge: Abhishek turns on Pages (Settings → Pages → Source: GitHub Actions), or says OK for `gh api`
 
 ## F-048 Simple README with API tables [todo]
