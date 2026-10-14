@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarks: MXFrame vs DuckDB vs Polars on TPC-H</title>
+<meta name="description" content="Interactive TPC-H SF1 and SF10 results for MXFrame, DuckDB and Polars, per query, with totals, correctness verdicts and random-query shapes.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<style>
+  .eng { font: 12px var(--font-mono); letter-spacing: .04em; display: inline-flex; align-items: center; gap: 4px; padding: 0 4px; color: var(--text); cursor: pointer; }
+  .eng input { accent-color: var(--accent); margin: 0 4px 0 0; }
+  .btns { margin-bottom: 18px; }
+  .stat .badge { margin-top: 4px; }
+  .rand { display: grid; gap: 22px; grid-template-columns: minmax(0, 1fr); }
+  .chart-card .card-b { padding-top: 10px; }
+  .note { font-size: 13.5px; }
+  main { min-width: 0; }
+  @media (max-width: 820px) { .rand { grid-template-columns: 1fr; } }
+</style>
+<script src="site.js"></script>
+</head>
+<body>
+<div class="shell">
+<nav class="side"></nav>
+<main>
+  <div class="read"><b>What you're looking at</b>First-run query times for MXFrame, DuckDB and Polars on TPC-H, 22 queries, scale factor 1 and 10. Each run is one fresh process per query, the data already loaded, no warm-up: engine time only. Pick a scale factor, a row order and the engines; the totals, the dot plot and the speedup chart follow. In the dot plot, left is faster, and the scale is logarithmic, so one gridline step is ten times. Every number is computed in your browser from the files in <a href="bench/m2s-engine.csv">bench/</a>.</div>
+
+  <span class="kick">// benchmarks · run m2s · v0.6.0</span>
+  <h1>TPC-H, query by query</h1>
+  <p>Stored rows are the files as the TPC-H generator wrote them. Shuffled rows are the same data in random order, which takes away the order MXFrame's sorted-run paths use.</p>
+
+  <div class="btns" id="controls" role="group" aria-label="Choose a run"></div>
+
+  <div class="card" style="margin:0 0 22px">
+    <div class="card-h" id="totals-head">TPC-H · engine only</div>
+    <div class="card-b">
+      <div class="grid g3" id="totals"><div class="status">loading benchmark files…</div></div>
+      <p class="note" style="margin:12px 0 0" id="totals-note"></p>
+    </div>
+  </div>
+
+  <h2>Time per query</h2>
+  <div class="card chart-card">
+    <div class="card-h">first-run time per query · log scale</div>
+    <div class="card-b">
+      <div class="legend" id="legendB"></div>
+      <div class="chart" id="chartB"><div class="status">loading benchmark files…</div></div>
+      <details><summary class="label">Data table</summary><table class="t" id="tblB"></table></details>
+    </div>
+  </div>
+  <p class="note">Hover a row for the three times and each result's verdict. A red ring marks a result that does not match the reference (DuckDB's answer is the reference): Polars' Q1 at SF10 is off by about 5% (float32 accumulation), so its time there is for a wrong answer.</p>
+
+  <h2>MXFrame against DuckDB</h2>
+  <div class="card chart-card">
+    <div class="card-h">DuckDB time / MXFrame time · log scale around 1x</div>
+    <div class="card-b">
+      <div class="legend"><span><i class="sq" style="background:var(--fast)"></i>MXFrame faster</span><span><i class="sq" style="background:var(--slow)"></i>DuckDB faster</span></div>
+      <div class="chart" id="chartC"><div class="status">loading benchmark files…</div></div>
+      <details><summary class="label">Data table</summary><table class="t" id="tblC"></table></details>
+    </div>
+  </div>
+  <p class="note">This view always compares MXFrame with DuckDB, whichever engines are ticked. A bar to the right of the line is a query MXFrame wins; the length is the ratio, not the difference.</p>
+
+  <h2>Random queries</h2>
+  <p class="note">The TPC-H queries are famous, so they are easy to tune for. These are seeded random queries over the same tables (<code>scripts/bench_random/</code>), grouped by shape. Each bar is the geometric mean of DuckDB's time over MXFrame's, per shape; "all" is every query in the run. Right of the line, MXFrame is faster. Three runs, one panel each, one above the other.</p>
+  <div class="card chart-card">
+    <div class="card-h">DuckDB time / MXFrame time by query shape · log scale around 1x</div>
+    <div class="card-b">
+      <div class="legend"><span><i class="sq" style="background:var(--fast)"></i>MXFrame faster</span><span><i class="sq" style="background:var(--slow)"></i>DuckDB faster</span></div>
+      <div class="rand" id="randoms"><div class="status">loading benchmark files…</div></div>
+      <details><summary class="label">Data table</summary><div style="overflow-x:auto"><table class="t" id="tblR"></table></div></details>
+    </div>
+  </div>
+  <p class="note">The shapes are <code>agg</code> (group by), <code>global</code> (aggregate without grouping), <code>join</code>, <code>distinct</code> (count distinct), <code>select_distinct</code> and <code>topn</code>.</p>
+
+  <h2>Run conditions</h2>
+  <div class="card">
+    <div class="card-b">
+      <ul style="margin:0;padding-left:20px">
+        <li><b>Date and build.</b> 2026-10-14, one build (v0.6.0), one machine. Shuffled TPC-H and the three random suites ran 01:21 to 01:50; they started after the load average had stayed under 2 for 5 minutes. The stored-rows TPC-H run was redone at 02:05, after 5 minutes under load 1.</li>
+        <li><b>The discarded run.</b> The first stored-rows pass overlapped a scheduled snapshot cleanup (snapper); every engine came out slower, so it was thrown away and redone. The only other processes sampled during the rerun were a browser at about a quarter of one core and, in the last sample, one short process at 98% of one core.</li>
+        <li><b>What the clock covers.</b> The first run of a query in a fresh process: the query and the materialized result. Reading Parquet into memory is staging, outside the clock, for every engine. DuckDB is timed without its pyarrow import for the same reason.</li>
+        <li><b>A staged warm-up.</b> <code>import mxframe</code> warms its kernel libraries in a background thread that finishes during the untimed load. Polars and DuckDB have no such step.</li>
+        <li><b>SF1 is noisy.</b> SF1 queries take a few milliseconds, so single figures can move by 10 to 20% between runs. Read SF1 totals more than single queries.</li>
+        <li><b>Load, as recorded in the files:</b></li>
+      </ul>
+      <table class="t" id="loadtbl" style="margin-top:8px"></table>
+      <p class="note" style="margin:12px 0 0">More on the method: <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md">optimizations.md</a>. The raw files are in <a href="https://github.com/abhisheksreesaila/mxframe/tree/main/docs/bench">docs/bench</a>.</p>
+    </div>
+  </div>
+</main>
+</div>
+<script src="js/bench.js"></script>
+</body>
+</html>
