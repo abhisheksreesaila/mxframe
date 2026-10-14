@@ -267,7 +267,7 @@ function select(i, scroll) {
 
 DATA.layers.forEach((l, i) => {
   if (i === DATA.layers.length - 1) stack.insertAdjacentHTML("beforeend", `<div class="arrow">beside the stack: picks the device</div>`);
-  else if (i) stack.insertAdjacentHTML("beforeend", `<div class="arrow">↓${i === 3 ? " the optimizer never declines; it hands the plan on" : i === 4 ? " if the native executor declines" : i === 5 ? " if the fused pipeline declines (joins and non-aggregate plans arrive here directly)" : ""}</div>`);
+  else if (i) stack.insertAdjacentHTML("beforeend", `<div class="arrow">↓${i === 3 ? " the optimizer never declines; it hands the plan on" : i === 4 ? " if the native executor declines" : i === 5 ? " if the fused pipeline declines (non-aggregate plans start here; joins are built here, then their aggregate goes back to 04)" : ""}</div>`);
   const b = document.createElement("button");
   b.type = "button";
   b.className = "layer" + (l.aside ? " auto" : "");

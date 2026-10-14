@@ -475,34 +475,34 @@ Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong 
 
 Shared rules: plain HTML + JS + one shared CSS in `docs/site/` (house style, Terminal Ledger); every page opens with "what you're looking at, how to read it"; numbers come from `docs/bench/*.csv` / `*.json`, never typed by hand (README headline table excepted, checked by a test).
 
-## F-047 Site skeleton and GitHub Pages deploy [review]
+## F-047 Site skeleton and GitHub Pages deploy [done]
 Needs: design (`docs/design/docs-site.md`) · Files: `docs/site/` (new), `.github/workflows/pages.yml` (new)
 - [x] `docs/site/index.html`: shared nav and `site.css`, light and dark, totals computed from the bench CSV; the page cards (thumbnail, one line on what each shows) are added as each page lands (F-049..F-052)
 - [x] a Pages workflow deploys `docs/site/` on push to `main`; the bench CSV/JSON files are copied in at build
 - [ ] Blocked until merge: Abhishek turns on Pages (Settings → Pages → Source: GitHub Actions), or says OK for `gh api`
 
-## F-048 Simple README with API tables [review]
+## F-048 Simple README with API tables [done]
 Needs: F-047 (links) · Files: `README.md`, `tests/test_readme_api.py` (new)
 - [x] under ~120 lines: why (3 bullets), latest release (0.6.0 SF10 table + DuckDB caveat), install, a code + output "screenshot" (query, result, timing), API reference tables (LazyFrame methods, expressions, aggregations, SQL, devices), links to the pages; the long history moves to the pages / `optimizations.md` / `benchmarks.md`
 - [x] a test runs every code sample and API call shown in the README; the headline numbers match `docs/bench/m2s-engine*.csv`
 
-## F-049 Interactive benchmarks page [review]
+## F-049 Interactive benchmarks page [done]
 Needs: F-047 · Files: `docs/site/benchmarks.html`, `docs/site/js/bench.js`
-- [ ] toggles: SF1 / SF10, stored / shuffled, engines; per-query bars and totals with and without Q21; random-query shapes vs DuckDB; correctness verdicts; run conditions (load, date, build)
-- [ ] reads the CSV/JSON in `docs/bench/`; a check script fails if a number on the page has no source row
+- [x] toggles: SF1 / SF10, stored / shuffled, engines; per-query bars and totals with and without Q21; random-query shapes vs DuckDB; correctness verdicts; run conditions (load, date, build)
+- [x] reads the CSV/JSON in `docs/bench/` at runtime; tests replay bench.js under node against Python readings of the same files (typed run-conditions prose is not machine-checked)
 
-## F-050 Behind the scenes (for porting) page [review]
+## F-050 Behind the scenes (for porting) page [done]
 Needs: F-047 · Files: `docs/site/internals.html`
-- [ ] the path a query takes, LazyFrame → plan → optimizer → native Mojo executor → fused pipeline → AOT kernels, as a clickable diagram; each layer shows its files, its seam (ctypes, Arrow C Data Interface), when it declines and who answers next, and the env switch (`MXFRAME_NATIVE`, `MXFRAME_FUSED_PIPELINE`)
-- [ ] "add an operator" walkthrough with the real file and function names; every path named on the page exists (checked by a test)
+- [x] the path a query takes, LazyFrame → plan → optimizer → native Mojo executor → fused pipeline → AOT kernels, as a clickable diagram; each layer shows its files, its seam (ctypes, Arrow C Data Interface), when it declines and who answers next, and the env switch (`MXFRAME_NATIVE`, `MXFRAME_FUSED_PIPELINE`)
+- [x] "add an operator" walkthrough with the real file and function names; every path named on the page exists (checked by a test)
 
-## F-051 How it got fast page [review]
+## F-051 How it got fast page [done]
 Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open items of F-039
-- [ ] one card per optimization from `optimizations.md` (what was slow, what changed, before / after numbers, Mojo feature or plain engineering), the progress chart, per-query wins over time
+- [x] one card per optimization from `optimizations.md` (what was slow, what changed, before / after numbers, Mojo feature or plain engineering), the progress chart, per-query wins over time
 
-## F-052 How device="auto" decides page [review]
+## F-052 How device="auto" decides page [done]
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
-- [ ] restyled on `site.css`, "how to read this" header, numbers from the bench files
+- [x] restyled on `site.css`, "how to read this" header, numbers from the bench files
 
 ## F-053 device="auto" never uses the native executor [todo]
 Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
