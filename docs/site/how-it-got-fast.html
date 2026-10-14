@@ -23,6 +23,7 @@
   .feat { margin: 10px 0 0; }
   .feat td:first-child { white-space: nowrap; }
   .chart-wrap { margin: 6px 0 0; }
+  #progress svg { min-width: 0; max-width: 100%; }
   .note-honest { border-left: 2px solid var(--yellow); background: var(--yellow-dim); padding: 8px 12px; margin: 10px 0 0; font-size: 13.5px; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
   svg .hit { cursor: pointer; fill: transparent; }
   .card-b { overflow-x: auto; }
@@ -341,12 +342,15 @@ function drawProgress() {
   const host = document.getElementById("progress");
   if (!state.progress) return;
   const sf = state.sf, pts = state.progress, ref = state.ref[sf];
-  const W = 900, H = 380, L = 56, R = 120, T = 20, B = 52, pw = W - L - R, ph = H - T - B;
+  // Drawn at the container's own width (1 SVG unit = 1 CSS pixel), so axis text keeps its 10px size on a phone.
+  // Narrow: no right margin for the reference labels (they sit on their lines) and slanted milestone labels.
+  const W = Math.max(Math.round(host.clientWidth) || 900, 300), narrow = W < 640;
+  const H = narrow ? 340 : 380, L = narrow ? 40 : 56, R = narrow ? 14 : 120, T = 20, B = narrow ? 64 : 52, pw = W - L - R, ph = H - T - B;
   const vals = pts.map((p) => p["t" + sf]);
   const ymax = Math.max(...vals, ref.polars, ref.duckdb) * 1.08, step = niceStep(ymax);
   const x = (i) => L + (i * pw) / (pts.length - 1), y = (v) => T + ph - (v / ymax) * ph;
   const css = { mx: cssVar("--mx"), dk: cssVar("--dk"), pl: cssVar("--pl"), grid: cssVar("--border"), axis: cssVar("--border-hi"), bg: cssVar("--surface"), txt: cssVar("--text") };
-  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `MXFrame SF${sf} total of 22 TPC-H queries per milestone, against Polars and DuckDB` });
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": `MXFrame SF${sf} total of 22 TPC-H queries per milestone, against Polars and DuckDB` });
   for (let v = 0; v <= ymax; v += step) {
     s.append(svg("line", { x1: L, x2: L + pw, y1: y(v), y2: y(v), stroke: v === 0 ? css.axis : css.grid, "stroke-width": 1 }));
     s.append(svg("text", { x: L - 8, y: y(v) + 3.5, "text-anchor": "end" }, +v.toFixed(2)));
@@ -354,14 +358,16 @@ function drawProgress() {
   s.append(svg("text", { x: 4, y: T - 6 }, "seconds"));
   for (const [v, c, name] of [[ref.polars, css.pl, "Polars"], [ref.duckdb, css.dk, "DuckDB"]]) {
     s.append(svg("line", { x1: L, x2: L + pw, y1: y(v), y2: y(v), stroke: c, "stroke-width": 2, "stroke-dasharray": "6 4" }));
-    s.append(svg("text", { x: L + pw + 8, y: y(v) + 3.5, style: `fill:${css.txt}` }, `${name} ${fmtS(v)}`));
+    if (narrow) s.append(svg("text", { x: L + pw, y: y(v) - 6, "text-anchor": "end", style: `fill:${css.txt}` }, `${name} ${fmtS(v)}`));
+    else s.append(svg("text", { x: L + pw + 8, y: y(v) + 3.5, style: `fill:${css.txt}` }, `${name} ${fmtS(v)}`));
   }
   s.append(svg("path", { d: pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p["t" + sf]).toFixed(1)}`).join(" "), fill: "none", stroke: css.mx, "stroke-width": 2.5 }));
   pts.forEach((p, i) => {
     const v = p["t" + sf], prev = i ? pts[i - 1]["t" + sf] : null;
     s.append(svg("circle", { cx: x(i), cy: y(v), r: 4.5, fill: css.mx, stroke: css.bg, "stroke-width": 2 }));
-    s.append(svg("text", { x: x(i), y: H - B + 18, "text-anchor": "middle" }, p.label));
-    if (i === 0 || i === pts.length - 1) s.append(svg("text", { x: x(i) + (i ? 0 : 8), y: y(v) + (i ? -10 : 20), "text-anchor": i ? "end" : "start", style: `fill:${css.txt};font-weight:700` }, fmtS(v)));
+    s.append(svg("text", narrow ? { x: x(i) + 3, y: H - B + 14, "text-anchor": "end", transform: `rotate(-50 ${x(i) + 3} ${H - B + 14})` }
+      : { x: x(i), y: H - B + 18, "text-anchor": "middle" }, p.label));
+    if (i === 0 || i === pts.length - 1) s.append(svg("text", { x: x(i) + (i ? 0 : narrow ? -4 : 8), y: y(v) + (i ? -10 : narrow ? -10 : 20), "text-anchor": i ? "end" : "start", style: `fill:${css.txt};font-weight:700` }, fmtS(v)));
     const hit = svg("circle", { class: "hit", cx: x(i), cy: y(v), r: 14, tabindex: 0, role: "link", "aria-label": `${p.title}: ${fmtS(v)}` });
     const tip = () => `<b>${p.title}</b><br><span class="num">${fmtS(v)}</span> total of 22 queries at SF${sf}` +
       (prev ? `<br>${v < prev ? "−" : "+"}${Math.abs(((v - prev) / prev) * 100).toFixed(0)}% against the previous milestone (${fmtS(prev)})` : "") +
@@ -482,6 +488,7 @@ document.querySelectorAll("#filter-btns .btn").forEach((b) => (b.onclick = () =>
 toggleGroup("sf-btns", "sf", drawProgress);
 toggleGroup("pq-btns", "pqsf", drawPerQuery);
 const redrawAll = () => { drawProgress(); drawPerQuery(); };
+{ let t, w = innerWidth; addEventListener("resize", () => { if (innerWidth === w) return; w = innerWidth; clearTimeout(t); t = setTimeout(() => state.progress && drawProgress(), 150); }); }
 document.addEventListener("themechange", redrawAll);
 loadAll().then(() => { redrawAll(); progressTable(); }).catch((err) => {
   for (const id of ["progress", "pq"]) showError(document.getElementById(id), "bench/" + (err.message.split(":")[0].replace(/^bench\//, "")), err);
