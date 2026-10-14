@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MXFrame docs site: design options</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--font-mono:'Space Mono','Courier New',monospace;--font-sans:'Inter','Helvetica Neue',sans-serif;--radius-sm:6px;--radius-md:10px;
+--bg:#0D0D14;--surface:#13131E;--surface-2:#1A1A28;--surface-3:#1F1F30;--border:#252538;--border-hi:#32324C;
+--accent:#7C3AED;--accent-hi:#9D5CF5;--accent-dim:rgba(124,58,237,.15);--accent-glow:rgba(124,58,237,.25);
+--green:#34D399;--red:#F87171;--yellow:#FBBF24;--green-dim:rgba(52,211,153,.15);--red-dim:rgba(248,113,113,.15);
+--text:#F5F5FF;--text-mid:#C0C0DC;--text-dim:#8E8EAE;
+--mx:#3987e5;--dk:#199e70;--pl:#d95926;--fast:#3987e5;--slow:#e66767;--mid:#8f8e88}
+:root[data-theme=light]{--bg:#F2EFE7;--surface:#FFFDF8;--surface-2:#F8F4EB;--surface-3:#ECE6DA;--border:#D8D0C2;--border-hi:#BEB4A4;
+--accent:#6C3E78;--accent-hi:#512B5C;--accent-dim:rgba(108,62,120,.12);--accent-glow:rgba(108,62,120,.18);
+--green:#18704F;--red:#B43C3C;--yellow:#9A6418;--green-dim:rgba(24,112,79,.12);--red-dim:rgba(180,60,60,.12);
+--text:#20221F;--text-mid:#4C5049;--text-dim:#6E716A;--mx:#2a78d6;--dk:#1baf7a;--pl:#eb6834;--fast:#2a78d6;--slow:#e34948}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 var(--font-sans)}
+a{color:var(--accent-hi)}
+.kick{font:700 11px var(--font-mono);letter-spacing:.14em;text-transform:uppercase;color:var(--accent-hi)}
+.label{font:11px var(--font-mono);letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim)}
+.mono{font-family:var(--font-mono)}.num{font-variant-numeric:tabular-nums;font-weight:700}
+.brand{font:800 15px var(--font-mono);letter-spacing:.22em}.brand .x{color:var(--accent-hi)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-md)}
+.card-h{font:12px var(--font-mono);letter-spacing:.1em;text-transform:uppercase;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--surface-2);border-radius:var(--radius-md) var(--radius-md) 0 0;display:flex;align-items:center;gap:8px}
+.win::before{content:'';width:8px;height:8px;border-radius:50%;background:var(--red);box-shadow:14px 0 0 var(--yellow),28px 0 0 var(--green);margin-right:30px}
+.badge{font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.08em;padding:3px 10px;border-radius:999px;display:inline-block}
+.badge.ok{background:var(--green-dim);color:var(--green)}.badge.brand{background:var(--accent-dim);color:var(--accent-hi)}.badge.warn{background:rgba(251,191,36,.15);color:var(--yellow)}
+.btn{font:700 11px var(--font-mono);letter-spacing:.13em;text-transform:uppercase;padding:9px 14px;border:1px solid var(--border-hi);background:transparent;color:var(--text);cursor:pointer;border-radius:0}
+.btn.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn:focus-visible,.layer:focus-visible{outline:2px solid var(--accent-hi);outline-offset:2px}
+table.t{width:100%;border-collapse:collapse;font-size:13px}table.t th{font:10px var(--font-mono);text-transform:uppercase;letter-spacing:.08em;text-align:left;padding:7px 10px;background:var(--surface-2);color:var(--text-dim);border-bottom:1px solid var(--border)}
+table.t td{padding:7px 10px;border-bottom:1px solid var(--border)}table.t tr:hover td{background:var(--surface-2)}
+code,pre{font-family:var(--font-mono);font-size:12.5px}pre{margin:0;padding:14px 16px;overflow:auto;color:var(--text-mid)}
+.k{color:var(--accent-hi)}.s{color:var(--green)}.c{color:var(--text-dim)}
+/* frame */
+.top{position:sticky;top:0;z-index:50;display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 24px;background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:blur(16px);border-bottom:1px solid var(--border)}
+.top .sp{flex:1}
+.board{max-width:1180px;margin:0 auto;padding:24px}
+.note{color:var(--text-mid);font-size:14px;max-width:760px}
+.art{margin:28px 0 44px}.art>.label{display:block;margin-bottom:10px}
+.read{border-left:2px solid var(--accent);background:var(--accent-dim);padding:12px 16px;border-radius:0 var(--radius-sm) var(--radius-sm) 0;font-size:14px;color:var(--text-mid)}
+.read b{color:var(--text);font-family:var(--font-mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;display:block;margin-bottom:4px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--text-mid)}.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+.tip{position:fixed;pointer-events:none;z-index:99;background:var(--surface-3);border:1px solid var(--border-hi);padding:8px 10px;border-radius:var(--radius-sm);font-size:12px;box-shadow:0 8px 28px rgba(0,0,0,.32);display:none}
+.opt{display:none}.opt.show{display:block}
+.grid{display:grid;gap:16px}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:1fr 1fr}
+@media(max-width:820px){.g3,.g2{grid-template-columns:1fr}.side{display:none}}
+.stat .num{font-size:30px;line-height:1.1}
+/* A: sidebar */
+.shellA{display:grid;grid-template-columns:200px 1fr;min-height:420px}
+.side{border-right:1px solid var(--border);padding:18px 14px;background:var(--surface)}
+.side a{display:block;padding:7px 10px;color:var(--text-mid);text-decoration:none;font:12px var(--font-mono);letter-spacing:.06em;border-radius:var(--radius-sm)}
+.side a.on{background:var(--accent-dim);color:var(--accent-hi)}
+/* layers */
+.layer{display:flex;gap:14px;align-items:center;padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);cursor:pointer;text-align:left;width:100%;color:var(--text);font:inherit}
+.layer:hover,.layer.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent-dim)}
+.layer .n{font:700 11px var(--font-mono);color:var(--accent-hi);width:22px}
+.layer .d{color:var(--text-dim);font-size:12.5px}
+.arrow{text-align:center;color:var(--text-dim);font:12px var(--font-mono);line-height:18px}
+.prompt::before{content:'$ ';color:var(--accent-hi)}
+.cursor::after{content:'█';animation:blink 1s step-end infinite;color:var(--accent-hi)}@keyframes blink{50%{opacity:0}}
+svg text{font-family:var(--font-mono);font-size:10px;fill:var(--text-dim)}
+</style>
+</head>
+<body>
+<div class="top">
+  <span class="brand">M<span class="x">X</span>FRAME</span><span class="label">docs site · design options</span>
+  <span class="sp"></span>
+  <button class="btn on" data-opt="A">A · Ledger</button>
+  <button class="btn" data-opt="B">B · Paper</button>
+  <button class="btn" data-opt="C">C · Console</button>
+  <button class="btn" id="theme">Light / dark</button>
+</div>
+<div class="tip" id="tip"></div>
+
+<div class="board">
+<p class="note">Three directions for the GitHub Pages site, all in the house style (Terminal Ledger) and with the real SF10 numbers from <code>docs/bench/m2s-engine.csv</code>. Each shows the landing page, the benchmark chart and the "behind the scenes" diagram. Hover any bar or dot for its value; click a layer in the diagram. They differ in layout and in how the benchmark chart reads.</p>
+
+<!-- ============ OPTION A ============ -->
+<section class="opt show" id="A">
+ <div class="art"><span class="label">A1 · Landing, sidebar layout (dark by default)</span>
+ <div class="card" style="overflow:hidden"><div class="shellA">
+  <nav class="side"><div class="brand" style="margin:4px 10px 16px">M<span class="x">X</span>FRAME</div>
+   <a class="on" href="#">Overview</a><a href="#">Benchmarks</a><a href="#">How auto decides</a><a href="#">Behind the scenes</a><a href="#">How it got fast</a><a href="#">API reference</a></nav>
+  <div style="padding:28px 32px">
+   <span class="kick">// v0.6.0 · native Mojo CPU engine</span>
+   <h1 style="margin:6px 0 10px;font-size:32px;line-height:1.15">A DataFrame engine written in Mojo.<br>Polars-style API, DuckDB-class speed.</h1>
+   <div class="read"><b>What you're looking at</b>The map of the docs. Each card is one page; the thumbnail is what you'll see on it.</div>
+   <div class="grid g3" style="margin-top:18px">
+    <div class="card stat" style="padding:14px"><span class="label">MXFrame · SF10</span><div class="num">3.15 s</div><span class="badge ok">fastest total</span></div>
+    <div class="card stat" style="padding:14px"><span class="label">DuckDB · SF10</span><div class="num">5.08 s</div><span class="label">2.27 s without Q21</span></div>
+    <div class="card stat" style="padding:14px"><span class="label">Polars · SF10</span><div class="num">14.40 s</div><span class="label">22 TPC-H queries</span></div>
+   </div>
+   <div class="grid g2" style="margin-top:16px">
+    <div class="card"><div class="card-h">Benchmarks</div><div style="padding:12px 14px;font-size:13.5px;color:var(--text-mid)">All 22 TPC-H queries and 250 random ones, against DuckDB and Polars. Switch scale and row order.</div></div>
+    <div class="card"><div class="card-h">Behind the scenes</div><div style="padding:12px 14px;font-size:13.5px;color:var(--text-mid)">The path a query takes, layer by layer, for anyone porting or extending the engine.</div></div>
+   </div>
+  </div></div></div></div>
+
+ <div class="art"><span class="label">A2 · Benchmarks: grouped bars per query (linear, ms)</span>
+ <div class="card"><div class="card-h">TPC-H SF10 · engine only · stored rows</div><div style="padding:16px">
+  <div class="read" style="margin-bottom:12px"><b>How to read this</b>One group per query; shorter is faster. Time is the query only, in a fresh process, data already loaded. Polars' Q1 (2.7 s) and Q21 run off the scale, so they're clipped and labelled.</div>
+  <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button class="btn on">SF10</button><button class="btn">SF1</button><span style="width:12px"></span><button class="btn on">Stored rows</button><button class="btn">Shuffled</button></div>
+  <div class="legend" style="margin-bottom:6px"><span><i style="background:var(--mx)"></i>MXFrame</span><span><i style="background:var(--dk)"></i>DuckDB</span><span><i style="background:var(--pl)"></i>Polars</span></div>
+  <div id="chartA"></div></div></div></div>
+
+ <div class="art"><span class="label">A3 · Behind the scenes: layer stack with a detail panel</span>
+ <div class="card"><div class="card-h">The path a query takes</div><div class="grid g2" style="padding:16px">
+  <div id="layersA"></div><div id="detailA" class="card" style="padding:16px"></div></div></div></div>
+</section>
+
+<!-- ============ OPTION B ============ -->
+<section class="opt" id="B">
+ <div class="art"><span class="label">B1 · Landing, editorial top nav (light "paper" by default)</span>
+ <div class="card" style="padding:0;overflow:hidden">
+  <div style="display:flex;gap:22px;align-items:center;padding:14px 28px;border-bottom:1px solid var(--border)"><span class="brand">M<span class="x">X</span>FRAME</span><span class="sp" style="flex:1"></span><span class="label">Benchmarks</span><span class="label">Auto mode</span><span class="label">Internals</span><span class="label">History</span><span class="label">API</span></div>
+  <div style="padding:40px 48px;display:grid;grid-template-columns:1.2fr 1fr;gap:40px">
+   <div><span class="kick">Why MXFrame</span>
+    <h1 style="font-family:Georgia,serif;font-weight:400;font-size:40px;line-height:1.1;margin:8px 0 14px">Write it like Polars. <i style="color:var(--accent-hi)">Run it in Mojo.</i></h1>
+    <p style="color:var(--text-mid)">A lazy DataFrame and SQL engine compiled ahead of time with Mojo. On TPC-H SF10 it runs the 22 queries in 3.15 s, against 5.08 s for DuckDB and 14.40 s for Polars.</p>
+    <div class="read"><b>What you're looking at</b>Every number on this site links to the benchmark file it came from.</div></div>
+   <div class="card"><div class="card-h win">quickstart.py</div><pre><span class="k">import</span> mxframe <span class="k">as</span> mx
+lf = mx.scan_parquet(<span class="s">"lineitem.parquet"</span>)
+lf.filter(mx.col(<span class="s">"l_shipdate"</span>) &lt;= <span class="s">"1998-09-02"</span>)
+  .groupby(<span class="s">"l_returnflag"</span>)
+  .agg(mx.col(<span class="s">"l_quantity"</span>).sum())
+  .compute()
+<span class="c"># → a pyarrow Table, one row per return flag</span></pre></div>
+  </div></div></div>
+
+ <div class="art"><span class="label">B2 · Benchmarks: dot plot, one row per query, log scale</span>
+ <div class="card"><div class="card-h">TPC-H SF10 · engine only · stored rows</div><div style="padding:16px">
+  <div class="read" style="margin-bottom:12px"><b>How to read this</b>One row per query, one dot per engine; further left is faster. The axis is logarithmic, so each gridline is 10x, which keeps 18 ms and 3.8 s on one chart.</div>
+  <div class="legend" style="margin-bottom:6px"><span><i style="background:var(--mx);border-radius:50%"></i>MXFrame</span><span><i style="background:var(--dk);border-radius:50%"></i>DuckDB</span><span><i style="background:var(--pl);border-radius:50%"></i>Polars</span></div>
+  <div id="chartB"></div></div></div></div>
+
+ <div class="art"><span class="label">B3 · Behind the scenes: horizontal flow, details below</span>
+ <div class="card" style="padding:16px"><div id="flowB" style="display:flex;gap:8px;align-items:stretch;overflow-x:auto"></div><div id="detailB" class="card" style="padding:16px;margin-top:14px"></div></div></div>
+</section>
+
+<!-- ============ OPTION C ============ -->
+<section class="opt" id="C">
+ <div class="art"><span class="label">C1 · Landing, single column of terminal windows</span>
+ <div style="max-width:760px;margin:0 auto">
+  <div class="card"><div class="card-h win">~/mxframe</div><div style="padding:22px 24px">
+   <div class="mono prompt" style="color:var(--text-mid)">pip install mxframe</div>
+   <h1 style="font-size:30px;margin:14px 0 6px">Fast DataFrames, <span style="color:var(--accent-hi)">compiled with Mojo</span><span class="cursor"></span></h1>
+   <p style="color:var(--text-mid);margin:0 0 14px">Polars-style API and SQL. Faster than DuckDB and Polars on the TPC-H SF10 total; the GPU when you have one.</p>
+   <div class="read"><b>What you're looking at</b>Start here, then pick a page below. Each page opens with a box like this one explaining how to read it.</div>
+  </div></div>
+  <div class="grid g2" style="margin-top:14px">
+   <div class="card" style="padding:14px"><span class="kick">01</span><div style="font-weight:600">Benchmarks</div><div class="label" style="text-transform:none;letter-spacing:0">speedup vs DuckDB, per query</div></div>
+   <div class="card" style="padding:14px"><span class="kick">02</span><div style="font-weight:600">Behind the scenes</div><div class="label" style="text-transform:none;letter-spacing:0">for porting and extending</div></div>
+  </div></div></div>
+
+ <div class="art"><span class="label">C2 · Benchmarks: speedup vs DuckDB, diverging around 1x</span>
+ <div class="card" style="max-width:760px;margin:0 auto"><div class="card-h win">speedup vs DuckDB · SF10</div><div style="padding:16px">
+  <div class="read" style="margin-bottom:12px"><b>How to read this</b>Each bar is DuckDB's time divided by MXFrame's. Right of the centre line (blue), MXFrame is faster; left (red), DuckDB is. Log scale, so 2x faster and 2x slower are the same length.</div>
+  <div class="legend" style="margin-bottom:6px"><span><i style="background:var(--fast)"></i>MXFrame faster</span><span><i style="background:var(--slow)"></i>DuckDB faster</span></div>
+  <div id="chartC"></div></div></div></div>
+
+ <div class="art"><span class="label">C3 · Behind the scenes: vertical pipeline, detail opens inline</span>
+ <div style="max-width:760px;margin:0 auto" id="layersC"></div></div>
+</section>
+
+<details style="margin-top:20px"><summary class="label" style="cursor:pointer">Data table (SF10, ms)</summary><table class="t" id="tbl" style="margin-top:10px"></table></details>
+</div>
+
+<script>
+const Q=[[1,65,138,2724],[2,18,30,51],[3,124,86,306],[4,114,101,966],[5,113,75,498],[6,32,33,45],[7,119,85,1100],[8,105,61,139],[9,426,451,951],[10,150,118,358],[11,24,16,31],[12,118,82,150],[13,94,235,641],[14,56,64,84],[15,49,52,66],[16,101,106,98],[17,65,28,66],[18,410,331,1513],[19,70,83,460],[20,64,49,121],[21,741,2814,3843],[22,94,42,191]];
+const ENG=[["MXFrame","--mx"],["DuckDB","--dk"],["Polars","--pl"]];
+const LAYERS=[
+ ["LazyFrame / SQL","Build a plan; nothing runs yet.","lazy_frame.py · lazy_expr.py · sql_frontend.py","Expr objects and a logical plan tree (Scan, Filter, Aggregate, Join, Sort, Limit)."],
+ ["Optimizer","Rewrite the plan before running it.","optimizer.py","Pushes filters and projections down, orders joins, picks dictionary-code paths. Records an optimizer trace."],
+ ["Native Mojo executor","One call runs the whole plan.","native_exec.py → libmxexec_cpu.so (executor_cpu.mojo)","Arrow C Data Interface in, Arrow out; one ctypes call, mx_execute. Declines plans it can't run. Off switch: MXFRAME_NATIVE=0."],
+ ["Fused pipeline","Filter + group + aggregate in one pass.","pipeline_exec.py → libmxpipeline_cpu.so / _gpu.so","Answers what the executor declined. Off switch: MXFRAME_FUSED_PIPELINE=0."],
+ ["AOT kernels","Single operators, CPU or GPU.","custom_ops.py → libmxkernels_aot.so / _gpu.so","The fallback for everything else: one kernel per operator (group sum, join, sort, gather)."]];
+const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const tip=document.getElementById('tip');
+function hover(el,html){el.addEventListener('mousemove',e=>{tip.innerHTML=html;tip.style.display='block';tip.style.left=(e.clientX+14)+'px';tip.style.top=(e.clientY+14)+'px'});el.addEventListener('mouseleave',()=>tip.style.display='none')}
+const NS='http://www.w3.org/2000/svg';const mk=(t,a)=>{const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e};
+function chartA(){const el=document.getElementById('chartA');el.innerHTML='';const W=1080,H=260,P=34,cap=1000,gw=(W-P)/Q.length,bw=(gw-8)/3;const s=mk('svg',{viewBox:`0 0 ${W} ${H+24}`,width:'100%'});
+ for(const g of [0,250,500,750,1000]){const y=H-g/cap*(H-16);s.append(mk('line',{x1:P,x2:W,y1:y,y2:y,stroke:css('--border')}));const t=mk('text',{x:P-4,y:y+3,'text-anchor':'end'});t.textContent=g;s.append(t)}
+ Q.forEach((r,i)=>{const x0=P+i*gw+4;[1,2,3].forEach(j=>{const v=r[j],h=Math.min(v,cap)/cap*(H-16),x=x0+(j-1)*(bw);const b=mk('rect',{x:x+1,y:H-h,width:bw-2,height:h,rx:2,fill:css(ENG[j-1][1])});s.append(b);hover(b,`<b>Q${r[0]}</b> · ${ENG[j-1][0]}: ${v} ms`);if(v>cap){const t=mk('text',{x:x+bw/2,y:H-h-3-(j==2?11:0),'text-anchor':'middle'});t.textContent=(v/1000).toFixed(1)+'s';s.append(t)}});const t=mk('text',{x:x0+gw/2-4,y:H+14,'text-anchor':'middle'});t.textContent='Q'+r[0];s.append(t)});el.append(s)}
+function chartB(){const el=document.getElementById('chartB');el.innerHTML='';const W=1080,rh=20,P=46,H=Q.length*rh+26,lo=Math.log10(10),hi=Math.log10(5000),X=v=>P+(Math.log10(v)-lo)/(hi-lo)*(W-P-10);const s=mk('svg',{viewBox:`0 0 ${W} ${H}`,width:'100%'});
+ for(const g of [10,100,1000]){s.append(mk('line',{x1:X(g),x2:X(g),y1:0,y2:H-20,stroke:css('--border')}));const t=mk('text',{x:X(g),y:H-6,'text-anchor':'middle'});t.textContent=g>=1000?'1 s':g+' ms';s.append(t)}
+ Q.forEach((r,i)=>{const y=i*rh+12;const vs=r.slice(1);s.append(mk('line',{x1:X(Math.min(...vs)),x2:X(Math.max(...vs)),y1:y,y2:y,stroke:css('--border-hi'),'stroke-width':2}));const t=mk('text',{x:P-8,y:y+3,'text-anchor':'end'});t.textContent='Q'+r[0];s.append(t);
+ [3,2,1].forEach(j=>{const c=mk('circle',{cx:X(r[j]),cy:y,r:5,fill:css(ENG[j-1][1]),stroke:css('--surface'),'stroke-width':2});s.append(c);hover(c,`<b>Q${r[0]}</b> · ${ENG[j-1][0]}: ${r[j]} ms`)})});el.append(s)}
+function chartC(){const el=document.getElementById('chartC');el.innerHTML='';const W=720,rh=19,P=40,H=Q.length*rh+24,m=Math.log10(5),C=P+(W-P)/2,X=v=>C+Math.log10(v)/m*((W-P)/2-10);const s=mk('svg',{viewBox:`0 0 ${W} ${H}`,width:'100%'});
+ for(const g of [0.25,0.5,2,4]){s.append(mk('line',{x1:X(g),x2:X(g),y1:0,y2:H-18,stroke:css('--border')}));const t=mk('text',{x:X(g),y:H-4,'text-anchor':'middle'});t.textContent=(g<1?'1/'+(1/g):g)+'x';s.append(t)}
+ Q.forEach((r,i)=>{const y=i*rh+4,sp=r[2]/r[1],x=X(sp),f=sp>=1;const b=mk('rect',{x:Math.min(C,x),y,width:Math.max(2,Math.abs(x-C)),height:rh-6,rx:2,fill:css(f?'--fast':'--slow')});s.append(b);hover(b,`<b>Q${r[0]}</b> · MXFrame ${r[1]} ms, DuckDB ${r[2]} ms<br>${f?'MXFrame '+sp.toFixed(2)+'x faster':'DuckDB '+(1/sp).toFixed(2)+'x faster'}`);const t=mk('text',{x:P-6,y:y+11,'text-anchor':'end'});t.textContent='Q'+r[0];s.append(t)});
+ s.append(mk('line',{x1:C,x2:C,y1:0,y2:H-18,stroke:css('--mid'),'stroke-width':1.5}));const t=mk('text',{x:C,y:H-4,'text-anchor':'middle'});t.textContent='1x';s.append(t);el.append(s)}
+function detail(l){return `<span class="kick">${l[0]}</span><p style="margin:6px 0;color:var(--text-mid)">${l[3]}</p><span class="label">Files</span><div class="mono" style="font-size:12.5px">${l[2]}</div>`}
+function layers(){const A=document.getElementById('layersA');A.innerHTML='';LAYERS.forEach((l,i)=>{if(i)A.insertAdjacentHTML('beforeend',`<div class="arrow">↓${i>=3?' if it declines, the next layer answers':''}</div>`);const b=document.createElement('button');b.className='layer'+(i==2?' on':'');b.innerHTML=`<span class="n">0${i+1}</span><span><b>${l[0]}</b><br><span class="d">${l[1]}</span></span>`;b.onclick=()=>{A.querySelectorAll('.layer').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('detailA').innerHTML=detail(l)};A.append(b)});document.getElementById('detailA').innerHTML=detail(LAYERS[2]);
+ const B=document.getElementById('flowB');B.innerHTML='';LAYERS.forEach((l,i)=>{if(i)B.insertAdjacentHTML('beforeend','<div class="arrow" style="align-self:center">→</div>');const b=document.createElement('button');b.className='layer'+(i==2?' on':'');b.style.cssText='flex-direction:column;align-items:flex-start;min-width:150px';b.innerHTML=`<span class="n">0${i+1}</span><b>${l[0]}</b><span class="d">${l[1]}</span>`;b.onclick=()=>{B.querySelectorAll('.layer').forEach(x=>x.classList.remove('on'));b.classList.add('on');document.getElementById('detailB').innerHTML=detail(l)};B.append(b)});document.getElementById('detailB').innerHTML=detail(LAYERS[2]);
+ const C=document.getElementById('layersC');C.innerHTML='';LAYERS.forEach((l,i)=>{const d=document.createElement('div');d.className='card';d.style.marginBottom='8px';d.innerHTML=`<div class="card-h win" style="cursor:pointer">0${i+1} · ${l[0]} <span class="label" style="margin-left:auto;text-transform:none">${l[1]}</span></div><div class="body" style="padding:14px 16px;display:${i==2?'block':'none'}">${detail(l)}</div>`;d.querySelector('.card-h').onclick=()=>{const x=d.querySelector('.body');x.style.display=x.style.display=='none'?'block':'none'};C.append(d)})}
+function table(){document.getElementById('tbl').innerHTML='<tr><th>Query</th><th>MXFrame</th><th>DuckDB</th><th>Polars</th></tr>'+Q.map(r=>`<tr><td class="mono">Q${r[0]}</td><td class="num">${r[1]}</td><td class="num">${r[2]}</td><td class="num">${r[3]}</td></tr>`).join('')}
+function draw(){chartA();chartB();chartC()}
+document.querySelectorAll('[data-opt]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-opt]').forEach(x=>x.classList.toggle('on',x==b));document.querySelectorAll('.opt').forEach(o=>o.classList.toggle('show',o.id==b.dataset.opt))});
+document.getElementById('theme').onclick=()=>{const r=document.documentElement;r.dataset.theme=r.dataset.theme=='light'?'':'light';if(!r.dataset.theme)delete r.dataset.theme;draw()};
+if(location.search.includes('light'))document.documentElement.dataset.theme='light';
+layers();table();draw();
+const h=location.hash.slice(1);if(h)document.querySelector(`[data-opt="${h}"]`)?.click();
+</script>
+</body>
+</html>
