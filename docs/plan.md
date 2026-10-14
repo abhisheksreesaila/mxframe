@@ -479,7 +479,7 @@ Shared rules: plain HTML + JS + one shared CSS in `docs/site/` (house style, Ter
 Needs: design (`docs/design/docs-site.md`) · Files: `docs/site/` (new), `.github/workflows/pages.yml` (new)
 - [x] `docs/site/index.html`: shared nav and `site.css`, light and dark, totals computed from the bench CSV; the page cards (thumbnail, one line on what each shows) are added as each page lands (F-049..F-052)
 - [x] a Pages workflow deploys `docs/site/` on push to `main`; the bench CSV/JSON files are copied in at build
-- [ ] Blocked until merge: Abhishek turns on Pages (Settings → Pages → Source: GitHub Actions), or says OK for `gh api`
+- [x] Pages on (2026-10-14, via `gh api`, build type workflow): https://abhisheksreesaila.github.io/mxframe/
 
 ## F-048 Simple README with API tables [done]
 Needs: F-047 (links) · Files: `README.md`, `tests/test_readme_api.py` (new)
