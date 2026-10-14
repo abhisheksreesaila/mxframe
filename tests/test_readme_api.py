@@ -137,3 +137,12 @@ def test_api_example_results(data, name):
         for c, vals in want.items():
             got = table.column(c).to_pylist()
             assert (sorted(got) if c == "n" else got) == vals
+
+
+def test_quickstart_runs_on_the_native_executor(data):
+    """The README's numbers are the native executor's; its quickstart must take that path."""
+    from mxframe import native_exec
+    code = re.findall(r"```python\n(.*?)```", README, re.S)[0]
+    ns = {}
+    exec(compile(code, "README.md", "exec"), ns)
+    assert native_exec.last_path() == "native", native_exec.last_decline()

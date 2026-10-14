@@ -39,7 +39,7 @@ out = (lf.filter(mx.col(<span class="s">"l_quantity"</span>) &lt; <span class="s
          .groupby(<span class="s">"l_returnflag"</span>)
          .agg(mx.col(<span class="s">"l_extendedprice"</span>).sum().alias(<span class="s">"revenue"</span>))
          .sort(<span class="s">"l_returnflag"</span>)
-         .compute())       <span class="c"># a pyarrow Table</span></pre>
+         .compute(device=<span class="s">"cpu"</span>))   <span class="c"># a pyarrow Table</span></pre>
     </div>
     <div class="card">
       <div class="card-h">out · TPC-H SF1 lineitem (6M rows)</div>

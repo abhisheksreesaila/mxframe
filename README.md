@@ -44,7 +44,7 @@ out = (lf.filter(mx.col("l_quantity") < 24)
          .groupby("l_returnflag")
          .agg(mx.col("l_extendedprice").sum().alias("revenue"))
          .sort("l_returnflag")
-         .compute())          # a pyarrow Table
+         .compute(device="cpu"))   # a pyarrow Table
 print(out.to_pandas())
 ```
 
@@ -55,7 +55,7 @@ print(out.to_pandas())
 2            R  1.223160e+10
 ```
 
-Nothing runs until `.compute()`; then the plan is optimized and executed in one native call.
+Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`. On a machine with a GPU, the default `device="auto"` currently splits work over CPU and GPU with the older fused pipeline instead of the native executor (being measured in F-053), so pass `device="cpu"` for now.
 
 Extras: `runtime` (the MAX engine; pixi users get it from conda instead), `sql` (sqlglot, for `mx.sql`), `polars` (for `.to_polars()`). The GPU path is validated on NVIDIA; AMD and Apple Silicon aren't yet. On import, MXFrame caps the Mojo runtime's GPU memory pool at 25% (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`, process-wide); set it higher before importing if a kernel needs more.
 
