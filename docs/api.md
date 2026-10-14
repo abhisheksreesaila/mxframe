@@ -1,182 +1,105 @@
-# 🔤 MXFrame — API Reference
+# MXFrame API notes
 
----
+The quick reference is the [API reference tables in the README](../README.md#api-reference). Every example there is run by `tests/test_readme_api.py`. This page covers what the tables leave out: arguments, inspection, SQL limits, devices and the source layout.
 
-## LazyFrame
-
-```python
-from mxframe import LazyFrame, Scan, col, lit, when
-
-lf = LazyFrame(Scan(arrow_table))
-```
-
-| Method | Description | Example |
-|---|---|---|
-| `.filter(expr)` | Row filter | `.filter(col("x") > lit(10))` |
-| `.select(*cols)` | Column projection | `.select("a", "b", col("c").alias("d"))` |
-| `.with_columns(*exprs)` | Add/replace columns | `.with_columns((col("a") * lit(2)).alias("a2"))` |
-| `.groupby(*keys)` | Start grouped aggregation | `.groupby("dept", "region")` |
-| `.agg(*exprs)` | Aggregation expressions (follows `.groupby`) | `.agg(col("x").sum().alias("s"))` |
-| `.join(other, left_on, right_on, how)` | Hash join | `.join(lf2, "id", "fk_id", how="inner")` |
-| `.sort(expr, descending)` | Sort rows | `.sort(col("revenue"), descending=True)` |
-| `.limit(n)` | Take first N rows | `.limit(100)` |
-| `.distinct()` | Deduplicate rows | `.distinct()` |
-| `.compute(device)` | Execute the plan | `.compute(device="gpu")` |
-
-`how` options: `"inner"` (default), `"left"`.
-
----
-
-## Expressions
+## Building a query
 
 ```python
+import mxframe as mx
 from mxframe import col, lit, when
+
+lf = mx.scan_parquet("lineitem.parquet")   # lazy; a file or a directory of Parquet files
+lf = mx.LazyFrame(arrow_table)             # or wrap a pyarrow.Table
+lf = mx.sql("SELECT ... FROM t", t=table)  # or SQL: returns a LazyFrame (needs the `sql` extra)
 ```
 
-### Arithmetic & comparison
+Nothing runs until `.compute()`, `.to_pandas()`, `.to_polars()` or `.to_arrow()`.
 
-```python
-col("price") * (lit(1.0) - col("discount"))   # arithmetic
-col("date") >= lit(19940101)                   # comparison
-(col("x") > lit(0)) & (col("y") < lit(100))   # boolean AND
-col("flag") | col("other")                     # boolean OR
-~col("active")                                 # boolean NOT
-```
+`scan_parquet(path, *, dictionary="auto", max_dictionary_bytes=...)` keeps low-cardinality string columns dictionary-encoded, so filters, group-bys and joins work on integer codes and decode only the rows that reach the output.
 
-### String predicates
+## Joins
 
-```python
-col("phone").startswith("13")
-col("comment").contains("special")
-col("type").isin(["PROMO", "BRAND"])
-```
+`lf.join(other, *, on=None, left_on=None, right_on=None, how="inner")`: the key arguments are keyword-only.
 
-### Date extraction
-
-```python
-col("orderdate").year()    # extract year as int32
-```
-
-### Conditional
-
-```python
-when(col("nation") == lit("BRAZIL"), col("revenue"), lit(0.0))
-```
-
-### Aggregations *(inside `.agg()`)*
-
-```python
-col("salary").sum()
-col("salary").mean()
-col("salary").min()
-col("salary").max()
-col("id").count()
-```
-
-### Aliasing
-
-```python
-col("x").sum().alias("total_x")
-```
-
----
-
-## SQL Frontend
-
-```python
-from mxframe.sql_frontend import sql
-
-result = sql("""
-    SELECT dept, SUM(salary) AS total, COUNT(*) AS n
-    FROM employees
-    WHERE age > 30
-    GROUP BY dept
-    ORDER BY total DESC
-""", employees=arrow_table)
-```
-
-Pass tables as keyword arguments matching the table names in the SQL string.
-Supported SQL: `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON`, `CASE WHEN`.
-
----
-
-## Supported Operations
-
-| Category | Operations |
+| `how` | Returns |
 |---|---|
-| **Filter** | `>`, `>=`, `<`, `<=`, `==`, `!=`, `&`, `|`, `~`, `isin`, `startswith`, `contains` |
-| **Aggregation** | `sum`, `mean`, `min`, `max`, `count` |
-| **Groupby** | Single key, multi-key, composite key |
-| **Join** | Inner, Left outer |
-| **Sort** | Single/multi column, ascending/descending |
-| **Date** | `year()` extraction |
-| **Projection** | `select`, `with_columns`, `alias`, arithmetic expressions |
-| **Semi-join** | Via unique-key inner join |
-| **Anti-join** | Via `isin` + invert |
-| **Distinct** | Full row deduplication |
-| **SQL** | `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN` |
+| `"inner"` | Matching pairs |
+| `"left"` | Every left row; right columns null without a partner |
+| `"semi"` | Left rows that have a partner, each once, left columns only (SQL `EXISTS`) |
+| `"anti"` | Left rows with no partner, left columns only (SQL `NOT EXISTS`) |
 
----
+Null keys never match.
 
-## Device Selection
+## Running: `.compute()`
 
-```python
-result = lf.compute(device="cpu")   # default — works everywhere
-result = lf.compute(device="gpu")   # requires NVIDIA/AMD/Apple Silicon + MAX runtime
-```
+`lf.compute(device="auto", verbose=False, optimize=True, validate=True, *, prefer=None, placement=None, gpu_fraction=None, strict=False, profile=False)` returns a `pyarrow.Table`.
 
-The GPU path uses Mojo's `DeviceContext` — same source compiles to PTX (NVIDIA), HSA/ROCm (AMD), or Metal (Apple Silicon).
+| Argument | Meaning |
+|---|---|
+| `device` | `"auto"` (default): estimate the query on each device from this machine's calibration and run it on the cheaper one. `"cpu"`: always the CPU. `"gpu"`: the GPU, raising `RuntimeError` if there is none. |
+| `verbose` | Print optimizer passes and compile/execute timing |
+| `optimize`, `validate` | Run the plan optimizer and the plan checks first (both on by default) |
+| `prefer` | Auto only: `"cpu"` or `"gpu"` biases the choice without forcing it |
+| `placement` | Auto only: e.g. `{"join": "gpu"}`; today any `"gpu"` value places the whole query on the GPU |
+| `gpu_fraction` | Auto only: a fixed GPU share of rows when a fused aggregate is split over CPU and GPU |
+| `strict` | Auto only: raise GPU errors instead of rerunning on the CPU |
+| `profile` | Auto only: record the actual time next to the estimate in `last_auto_decision` |
 
----
+**In 0.6.0, pass `device="cpu"`.** The native Mojo executor, which every 0.6.0 benchmark number measures, runs only under `device="cpu"`; `"auto"` runs the older fused pipeline when it picks the CPU (ticket F-053 in `docs/plan.md`).
 
-## Running Tests
+`mx.calibrate(full=False)` measures this machine for `"auto"`. `mx.set_cpu_threads(n)` / `mx.get_cpu_threads()` (or env `MXFRAME_CPU_THREADS`) set the CPU worker budget.
+
+## Inspecting a query
+
+| Call | What it gives |
+|---|---|
+| `lf.explain(optimized=True, validate=False, include_runtime=False, device=None, costs=False)` | The plan as text; `device="auto", costs=True` adds the device decision and per-operator estimates without running it |
+| `lf.last_compile_provenance` | After `compute()`: which path ran (`"native"`, `"fused_pipeline_cpu"`, `"cpu_aot"`, ...) and timings |
+| `lf.last_auto_decision` | After an auto `compute()`: the chosen device, the estimates and the reason |
+| `from mxframe import native_exec; native_exec.last_decline()` | Why the native executor declined the last plan, if it did |
+| `lf.schema` | The output schema without computing the result (a property) |
+| `lf.describe()` | count, mean, std, min, quartiles and max of the numeric columns |
+
+The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html) explains each path and the environment switches.
+
+## SQL
+
+`mx.sql(query, **tables)` parses with sqlglot into the same plan the DataFrame API builds. Table names in the query are the keyword names.
+
+Supported: `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON`, `CASE WHEN`, aggregates and arithmetic.
+
+Known limits in 0.6.0:
+- `COUNT(DISTINCT …)` raises `NotImplementedError`; use `lf.select(a, b).distinct().groupby(a).agg(col(b).count())`.
+- `HAVING` is dropped without an error (F-042); filter the aggregated frame instead.
+
+## Device selection and the GPU
+
+- `device="gpu"` needs the MAX runtime (`pip install "mxframe[runtime]"`, or `pixi` with Modular's conda channel). The GPU path is validated on NVIDIA.
+- `lf.to_gpu()` uploads the numeric columns once and returns a `GPUFrame`, so repeated queries on the same data skip the copy.
+- On import, MXFrame sets `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=25` unless you set it yourself, so the Mojo runtime doesn't reserve most of the GPU's memory. The setting is process-wide.
+
+## Tests
 
 ```bash
-# AOT kernel smoke tests (26 tests)
-pixi run python3 scripts/_test_aot_smoke.py
-
-# All 22 TPC-H correctness checks
-pixi run python3 scripts/_test_phase6_tpch_tier2.py
-
-# GPU device check
-pixi run python3 scripts/_check_gpu.py
-
-# Full 22-query benchmark (1M rows)
-pixi run python3 scripts/bench_simple.py --rows 1000000 --runs 3
+pixi run test        # pytest over tests/ (works from any checkout or worktree)
+pixi run test-all    # the older scripts/_test_*.py suites, as CI runs them
 ```
 
----
+## Source layout
 
-## Project Structure
-
-```
-mxframe/
-├── __init__.py            ← Public API (LazyFrame, Scan, col, lit, when, sql)
-├── lazy_frame.py          ← LazyFrame, LazyGroupBy, Scan
-├── lazy_expr.py           ← Expr, col(), lit(), when()
-├── compiler.py            ← LogicalPlan → MAX Graph compiler
-├── custom_ops.py          ← Dispatch: AOT kernels / PyArrow fallback
-├── optimizer.py           ← Plan rewrites (filter pushdown, join reordering)
-├── plan_validation.py     ← Pre-execution plan checks
-├── sql_frontend.py        ← SQL → LogicalPlan via sqlglot
-│
-├── kernels_aot/           ← Pre-compiled AOT shared libraries
-│   ├── libmxkernels_aot.so      ← CPU kernels (ctypes-callable)
-│   └── libmxkernels_aot_gpu.so  ← GPU kernels (CUDA/ROCm/Metal)
-│
-├── kernels/               ← Mojo kernel source (build time only)
-│   ├── group_sum.mojo, group_min.mojo, group_max.mojo ...
-│   ├── join_scatter.mojo, join_count.mojo
-│   ├── join_scatter_left.mojo, join_count_left.mojo
-│   └── filter_gather.mojo, unique_mask.mojo ...
-│
-├── kernels_aot/
-│   ├── kernels_aot.mojo         ← CPU AOT entry points
-│   └── kernels_aot_gpu.mojo     ← GPU AOT entry points
-│
-└── scripts/
-    ├── benchmark_tpch.py        ← All 22 TPC-H query implementations
-    ├── bench_simple.py          ← 4-column benchmark (Pandas|Polars|MX CPU|MX GPU)
-    ├── _test_aot_smoke.py       ← AOT kernel smoke tests
-    └── quickstart.py            ← Minimal hello-world example
-```
+| Path | What it holds |
+|---|---|
+| `__init__.py` | Public API: `LazyFrame`, `col`, `lit`, `when`, `scan_parquet`, `sql`, `calibrate`, thread settings |
+| `lazy_frame.py`, `lazy_expr.py` | The plan tree (`Scan`, `Filter`, `Aggregate`, `Join`, `Sort`, ...), `LazyFrame` and `Expr` |
+| `sql_frontend.py` | SQL → plan, via sqlglot |
+| `io_parquet.py`, `arrow_dict.py` | Lazy Parquet sources; dictionary-encoded column helpers |
+| `plan_validation.py`, `optimizer.py` | Plan checks; rewrites (filter merge and pushdown, column pruning, limits, sort flags) |
+| `native_exec.py` | Front end of the native Mojo executor: packs the plan, one ctypes call into `libmxexec_cpu.so` |
+| `pipeline_exec.py`, `pipeline_program.py`, `pipeline_kernels.py` | The fused filter + group + aggregate pipeline and its bytecode |
+| `custom_ops.py`, `aot_kernels.py`, `join_engine.py`, `group_keys.py`, `sort_check.py` | The per-operator path: dispatch, AOT kernel bindings, joins (with join reordering), group keys, verified sort |
+| `compiler.py`, `_max_lazy.py` | The MAX Graph compiler path |
+| `auto_mode.py`, `calibration.py`, `coproc.py`, `coproc_fused.py`, `residency.py`, `gpu_stream.py` | `device="auto"`: the device choice, calibration, CPU+GPU co-processing, GPU copies |
+| `kernels_aot/*.mojo` | Mojo sources: `executor_cpu.mojo` (native executor), `pipeline_cpu.mojo` / `pipeline_gpu.mojo`, `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo`, `kernels_aot.mojo` / `kernels_aot_gpu.mojo` |
+| `kernels_aot/*.so` | The compiled libraries, shipped in the wheel (`scripts/build_pipeline.sh`, `scripts/release.sh` rebuild them) |
+| `scripts/` | Benchmarks (`bench_user_felt.py`, `bench_random/`), release and build scripts, older test suites |
+| `docs/site/` | The docs site, deployed to GitHub Pages |

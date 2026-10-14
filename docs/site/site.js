@@ -28,6 +28,7 @@ function renderNav() {
   const here = location.pathname.split("/").pop() || "index.html";
   nav.innerHTML = `<a class="brand" href="index.html">M<span class="x">X</span>FRAME</a>` +
     PAGES.map(([href, name]) => `<a class="nav${href === here ? " on" : ""}" href="${href}"${href === here ? ' aria-current="page"' : ""}>${name}</a>`).join("") +
+    `<a class="nav" href="visualize/mxframe_pipeline.html">Kernel visualizer ↗</a>` +  // copied in by pages.yml
     `<a class="nav" href="${REPO}#api-reference">API reference ↗</a>` +
     `<div class="foot"><button class="btn" id="theme-btn" type="button" aria-pressed="${document.documentElement.dataset.theme === "dark"}">Light / dark</button>` +
     `<a class="label" href="${REPO}">GitHub ↗</a></div>`;

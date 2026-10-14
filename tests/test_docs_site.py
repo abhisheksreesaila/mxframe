@@ -91,3 +91,11 @@ def test_csv_files_the_pages_read_have_no_quotes():
     for n in sorted(names):
         assert (bench / n).is_file(), n
         assert '"' not in (bench / n).read_text(), f"{n} has a quote: site.js loadCSV cannot parse quoted fields"
+
+
+def test_pages_workflow_publishes_the_kernel_visualizer():
+    """site.js links visualize/mxframe_pipeline.html; it lives outside docs/site and is copied in at deploy."""
+    wf = (ROOT / ".github" / "workflows" / "pages.yml").read_text()
+    assert "cp -r visualize _site/visualize" in wf
+    assert (ROOT / "visualize" / "mxframe_pipeline.html").is_file()
+    assert "visualize/mxframe_pipeline.html" in (SITE / "site.js").read_text()

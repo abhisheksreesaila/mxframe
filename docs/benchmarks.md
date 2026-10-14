@@ -1,11 +1,13 @@
 # 📊 MXFrame — TPC-H Benchmarks
 
-> **Current headline (2026-10-13):** engine-only first runs, in [bench/m2p-engine.md](bench/m2p-engine.md)
-> (shuffled rows: [bench/m2p-engine-shuffled.md](bench/m2p-engine-shuffled.md); random queries:
-> [SF1](bench/random-sf1.md), [SF1 shuffled](bench/random-sf1-shuffled.md), [SF10](bench/random-sf10.md)) and [optimizations.md](optimizations.md):
-> SF10 MXFrame 3.27 s, Polars 14.94 s, DuckDB 5.31 s (DuckDB is faster on 13 of the 22 queries and
-> on shuffled data). Loading data is staging, outside the clock. Everything below is earlier and
-> kept for history; DuckDB times before 2026-10-13 include its pyarrow import (about 70 ms).
+> **Current headline (0.6.0, 2026-10-14):** engine-only first runs on a quiet machine, in
+> [bench/m2s-engine.md](bench/m2s-engine.md) (shuffled rows: [bench/m2s-engine-shuffled.md](bench/m2s-engine-shuffled.md);
+> random queries: [SF1](bench/random-sf1-m2s.md), [SF1 shuffled](bench/random-sf1-shuffled-m2s.md),
+> [SF10](bench/random-sf10-m2s.md)). SF10: MXFrame 3.15 s, DuckDB 5.08 s, Polars 14.40 s; without Q21
+> DuckDB is lower (2.27 s vs 2.41 s) and it is faster on 12 of the 22 queries. Explore every query on the
+> [interactive benchmarks page](https://abhisheksreesaila.github.io/mxframe/benchmarks.html); the story is in
+> [optimizations.md](optimizations.md). Loading data is staging, outside the clock. Everything below is earlier
+> and kept for history; DuckDB times before 2026-10-13 include its pyarrow import (about 70 ms).
 
 ---
 

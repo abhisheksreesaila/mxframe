@@ -3,7 +3,7 @@ name: 📖 Docs site
 on:
   push:
     branches: [main]
-    paths: ["docs/site/**", "docs/bench/**", ".github/workflows/pages.yml"]
+    paths: ["docs/site/**", "docs/bench/**", "visualize/**", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:
@@ -25,7 +25,9 @@ jobs:
       - uses: actions/checkout@v4
       # docs/site/bench is a link to docs/bench; -L copies the files it points to
       - name: Build site
-        run: cp -rL docs/site _site
+        run: |
+          cp -rL docs/site _site
+          cp -r visualize _site/visualize
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

@@ -7,6 +7,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Docs
+- **Docs site** at https://abhisheksreesaila.github.io/mxframe/ (GitHub Pages; `docs/site/`). It has interactive benchmarks, how `device="auto"` decides, the path a query takes (for porting), how the engine got fast, and the kernel visualizer. Every number on it is computed in the browser from `docs/bench`.
+- **README** is short now: why, the latest numbers, install and run, API reference tables. A test runs every example in it and checks its numbers against `docs/bench`.
+- `docs/api.md` and `CONTRIBUTING.md` are rewritten for the native executor.
+- **LICENSE** file added (Apache-2.0, as already declared in `pyproject.toml`).
+
+### Known issue
+- `device="auto"` (the default) doesn't use the native executor yet. Pass `device="cpu"` for the 0.6.0 numbers (F-053).
+
 ## [0.6.0] — 2026-10-14
 
 The CPU engine is now a native Mojo executor: one call per query stage runs the scan, filter,
