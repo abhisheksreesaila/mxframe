@@ -14,6 +14,7 @@ function toggleTheme() {
   const r = document.documentElement;
   r.dataset.theme = r.dataset.theme === "dark" ? "light" : "dark";
   localStorage.setItem("mx-theme", r.dataset.theme);
+  document.getElementById("theme-btn")?.setAttribute("aria-pressed", r.dataset.theme === "dark");
   document.dispatchEvent(new Event("themechange"));
 }
 
@@ -22,9 +23,9 @@ function renderNav() {
   if (!nav) return;
   const here = location.pathname.split("/").pop() || "index.html";
   nav.innerHTML = `<a class="brand" href="index.html">M<span class="x">X</span>FRAME</a>` +
-    PAGES.map(([href, name]) => `<a class="nav${href === here ? " on" : ""}" href="${href}">${name}</a>`).join("") +
+    PAGES.map(([href, name]) => `<a class="nav${href === here ? " on" : ""}" href="${href}"${href === here ? ' aria-current="page"' : ""}>${name}</a>`).join("") +
     `<a class="nav" href="${REPO}#api-reference">API reference ↗</a>` +
-    `<div class="foot"><button class="btn" id="theme-btn" type="button">Light / dark</button>` +
+    `<div class="foot"><button class="btn" id="theme-btn" type="button" aria-pressed="${document.documentElement.dataset.theme === "dark"}">Light / dark</button>` +
     `<a class="label" href="${REPO}">GitHub ↗</a></div>`;
   document.getElementById("theme-btn").onclick = toggleTheme;
 }

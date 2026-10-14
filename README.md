@@ -1,12 +1,12 @@
-<img src="visualize/mx-spark.svg" alt="MXFrame MX lightning mark" width="72">
+<img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/visualize/mx-spark.svg" alt="MXFrame MX lightning mark" width="72">
 
 # MXFrame
 
 **A DataFrame engine written in Mojo: Polars-style API, faster than DuckDB on the TPC-H SF10 total.**
 
 [![PyPI](https://img.shields.io/pypi/v/mxframe)](https://pypi.org/project/mxframe/)
-[![Python](https://img.shields.io/badge/python-3.12%2B-blue)](pyproject.toml)
-[![Platform](https://img.shields.io/badge/platform-linux--x86__64-lightgrey)](pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml)
+[![Platform](https://img.shields.io/badge/platform-linux--x86__64-lightgrey)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml)
 [![Docs](https://img.shields.io/badge/docs-interactive-6C3E78)](https://abhisheksreesaila.github.io/mxframe/)
 
 📖 **[Interactive docs](https://abhisheksreesaila.github.io/mxframe/)**: [benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) · [how `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [how it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html)
@@ -19,7 +19,7 @@
 
 ## Latest release: 0.6.0
 
-The native Mojo CPU executor ([release notes](RELEASE_NOTES_0.6.0.md)). All 22 TPC-H queries, query time only (fresh process, data already loaded, no warm-up), every MXFrame result equal to DuckDB's:
+The native Mojo CPU executor ([release notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md)). All 22 TPC-H queries, query time only (fresh process, data already loaded, no warm-up), every MXFrame result equal to DuckDB's:
 
 | Run | MXFrame | DuckDB | Polars |
 |---|---|---|---|
@@ -28,12 +28,12 @@ The native Mojo CPU executor ([release notes](RELEASE_NOTES_0.6.0.md)). All 22 T
 | SF10 shuffled | 4.97 s | 5.55 s | 15.06 s |
 | SF1 shuffled | 0.61 s | 0.66 s | 1.41 s |
 
-Honestly: Q21 carries the SF10 lead (without it DuckDB is ahead, 2.27 s to 2.41 s), and DuckDB is faster on 12 of the 22 queries, mostly join-heavy ones. On 250 random queries MXFrame is 1.09x DuckDB's speed at SF10 and 0.83x at SF1. [Every query, interactively →](https://abhisheksreesaila.github.io/mxframe/benchmarks.html)
+Honestly: Q21 carries the lead. Without it DuckDB is ahead, 2.27 s to 2.41 s at SF10 and 2.79 s to 3.63 s at SF10 shuffled, and DuckDB is faster on 12 of the 22 SF10 queries, mostly join-heavy ones. On seeded random queries over the same tables (geometric mean of DuckDB's time over MXFrame's), MXFrame is 1.09x at SF10 (50 queries), 0.83x at SF1 (100) and 1.21x at SF1 shuffled (100). [Every query, interactively →](https://abhisheksreesaila.github.io/mxframe/benchmarks.html)
 
 ## Install and run
 
 ```sh
-pip install "mxframe[runtime]"     # pixi users: pixi add mxframe (MAX comes from conda)
+pip install "mxframe[runtime,sql]"   # pixi: pixi add --pypi "mxframe[sql]" (MAX comes from conda)
 ```
 
 ```python
@@ -56,6 +56,8 @@ print(out.to_pandas())
 ```
 
 Nothing runs until `.compute()`; then the plan is optimized and executed in one native call.
+
+Extras: `runtime` (the MAX engine; pixi users get it from conda instead), `sql` (sqlglot, for `mx.sql`), `polars` (for `.to_polars()`). The GPU path is validated on NVIDIA; AMD and Apple Silicon aren't yet. On import, MXFrame caps the Mojo runtime's GPU memory pool at 25% (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`, process-wide); set it higher before importing if a kernel needs more.
 
 ## API reference
 
@@ -110,12 +112,14 @@ SQL covers `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON` and
 
 | | |
 |---|---|
-| [Benchmarks (interactive)](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) | Every TPC-H and random query, against DuckDB and Polars; full tables in [docs/benchmarks.md](docs/benchmarks.md) |
+| [Benchmarks (interactive)](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) | Every TPC-H and random query, against DuckDB and Polars; full tables in [docs/benchmarks.md](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/benchmarks.md) |
 | [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) | The path a query takes, for porting or extending the engine |
-| [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) | Each optimization, and which wins are Mojo; long form in [docs/optimizations.md](docs/optimizations.md) |
+| [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) | Each optimization, and which wins are Mojo; long form in [docs/optimizations.md](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md) |
 | [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) | CPU, GPU or both, from costs measured on your machine |
-| [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) | Release history; dev setup and writing Mojo kernels |
+| [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) | The longer API page; design and internal layers |
+| [Kernel visualizer](https://htmlpreview.github.io/?https://github.com/abhisheksreesaila/mxframe/blob/main/visualize/mxframe_pipeline.html) | Step-by-step GPU kernel plans for Q4, Q6, Q12, Q13, Q14 and Q21 |
+| [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.5.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.5.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md) | Release history; dev setup and writing Mojo kernels |
 
 Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`.
 
-License: Apache 2.0.
+License: Apache-2.0 (declared in `pyproject.toml`).

@@ -30,6 +30,7 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.65 var(--font-sans); }
 a { color: var(--accent); } a:hover { color: var(--accent-hi); }
+:root[data-theme="dark"] a { color: var(--accent-hi); } /* --accent on --bg is 3.4:1 in dark */
 h1 { font-size: 32px; line-height: 1.15; margin: 6px 0 14px; }
 h2 { font-size: 21px; margin: 36px 0 10px; }
 h3 { font-size: 16px; margin: 22px 0 6px; }
@@ -42,6 +43,8 @@ pre { margin: 0; padding: 14px 16px; overflow: auto; color: var(--text-mid); }
 /* dark-only texture */
 :root[data-theme="dark"] body::before { content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 9999;
   background: repeating-linear-gradient(0deg, transparent 0 2px, rgba(0,0,0,.055) 2px 4px); }
+:root[data-theme="dark"] body::after { content: ''; position: fixed; inset: 0; pointer-events: none; z-index: 9998; opacity: .02;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
 
 .kick { font: 700 11px var(--font-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--accent); }
 .label { font: 11px var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); }
@@ -58,7 +61,7 @@ pre { margin: 0; padding: 14px 16px; overflow: auto; color: var(--text-mid); }
 .side a.nav { display: block; padding: 7px 10px; color: var(--text-mid); text-decoration: none;
   font: 12px var(--font-mono); letter-spacing: .05em; border-radius: var(--radius-sm); }
 .side a.nav:hover { background: var(--surface-2); color: var(--text); }
-.side a.nav.on { background: var(--accent-dim); color: var(--accent); }
+.side a.nav.on { background: var(--accent-dim); color: var(--accent-hi); }
 .side .foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px; }
 main { padding: 36px 48px 80px; max-width: 1040px; min-width: 0; }
 
@@ -124,7 +127,7 @@ svg text { font-family: var(--font-mono); font-size: 10px; fill: var(--text-dim)
 .arrow { text-align: center; color: var(--text-dim); font: 11px var(--font-mono); line-height: 20px; }
 
 @media (max-width: 820px) {
-  .shell { grid-template-columns: 1fr; }
+  .shell { grid-template-columns: minmax(0, 1fr); }
   .side { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; border-bottom: 1px solid var(--border); padding: 10px; }
   .side .brand { margin: 0 12px 0 4px; width: 100%; }
   .side .foot { margin: 0; flex-direction: row; padding: 4px; }

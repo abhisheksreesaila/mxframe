@@ -93,3 +93,47 @@ def test_headline_numbers_match_bench_files(label, path, sf):
 
 def test_readme_is_short():
     assert len(README.splitlines()) <= 140
+
+
+def _rows(path, engine, sf):
+    with open(ROOT / "docs" / "bench" / path) as f:
+        return {r["query"]: float(r["first_ms"]) for r in csv.DictReader(f)
+                if r["engine"] == engine and r["sf"] == str(sf)}
+
+
+def test_release_prose_numbers_match_bench_files():
+    text = _section("Latest release")
+    for path, label in (("m2s-engine.csv", "2.27 s to 2.41 s at SF10"), ("m2s-engine-shuffled.csv", "2.79 s to 3.63 s at SF10 shuffled")):
+        dk = sum(v for q, v in _rows(path, "duckdb", 10).items() if q != "21") / 1000
+        mx_ = sum(v for q, v in _rows(path, "mx-cpu", 10).items() if q != "21") / 1000
+        assert f"{dk:.2f} s to {mx_:.2f} s" in label and label in text, (path, dk, mx_)
+    dk, mxr = _rows("m2s-engine.csv", "duckdb", 10), _rows("m2s-engine.csv", "mx-cpu", 10)
+    assert f"faster on {sum(dk[q] < mxr[q] for q in dk)} of the 22 SF10 queries" in text
+    for run, n in (("sf10", 50), ("sf1", 100), ("sf1-shuffled", 100)):
+        all_row = re.search(r"^\| all \| (\d+) \|(?:[^|]*\|){4} ([\d.]+x) \|", (ROOT / "docs" / "bench" / f"random-{run}-m2s.md").read_text(), re.M)
+        assert int(all_row.group(1)) == n and f"{all_row.group(2)} at {run.upper().replace('-SHUFFLED', ' shuffled')} ({n}" in text, (run, all_row.groups())
+
+
+# what the examples must return on the fixture data (rows, or a column's values)
+EXPECTED = {
+    "`.filter(expr)`": 2, "`.join(other, on, how)`": 4, "`.limit(n)` / `.head(n)`": 2,
+    "`.distinct(*subset)`": 2, "`.groupby(*keys).agg(*aggs)`": 2, "`mx.sql(query, **tables)`": 2,
+    "COUNT(DISTINCT b) per a": {"n": [2, 2]}, "`.isin(values)`": {"v": [True, False, True, False]},
+    "`.between(lo, hi)`": {"v": [True, False, True, False]}, "`.str_slice(offset, length)`": {"v": ["al", "be", "ga", "al"]},
+}
+
+
+@pytest.mark.parametrize("name", list(EXPECTED))
+def test_api_example_results(data, name):
+    example = dict(_examples())[name]
+    ns = {"mx": mx, "col": col, "lit": lit, "when": when, **data}
+    out = eval(example, ns)
+    out = out if not isinstance(out, mx.Expr) else data["lf"].select(out.alias("v"))
+    table = out.compute(device="cpu")
+    want = EXPECTED[name]
+    if isinstance(want, int):
+        assert table.num_rows == want
+    else:
+        for c, vals in want.items():
+            got = table.column(c).to_pylist()
+            assert (sorted(got) if c == "n" else got) == vals
