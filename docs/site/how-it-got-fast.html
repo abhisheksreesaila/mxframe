@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How MXFrame got fast</title>
+<meta name="description" content="The CPU engine's optimizations one at a time: what was slow, what changed, the before and after numbers, and which wins come from Mojo and which are ordinary engineering.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script src="site.js"></script>
+<style>
+  .card .pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+  .card .pair p { margin: 2px 0 10px; font-size: 14px; }
+  .card h4 { margin: 0; font: 700 10.5px var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); }
+  .card .tag { font: 700 11px var(--font-mono); color: var(--accent); }
+  .card-h .sp { flex: 1; }
+  .card-h .ttl { text-transform: none; letter-spacing: 0; font: 600 14px var(--font-sans); }
+  .card-h { flex-wrap: wrap; }
+  .card.hide { display: none; }
+  .src { font: 11.5px var(--font-mono); color: var(--text-dim); }
+  .mark { margin: 0 0 6px; }
+  .feat { margin: 10px 0 0; }
+  .feat td:first-child { white-space: nowrap; }
+  .chart-wrap { margin: 6px 0 0; }
+  .note-honest { border-left: 2px solid var(--yellow); background: var(--yellow-dim); padding: 8px 12px; margin: 10px 0 0; font-size: 13.5px; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+  svg .hit { cursor: pointer; fill: transparent; }
+  .card-b { overflow-x: auto; }
+  @media (max-width: 820px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    main { min-width: 0; }
+    .card .pair { grid-template-columns: 1fr; }
+    .feat td:first-child { white-space: normal; }
+    .feat, .feat tr, .feat td { display: block; }
+    .feat td { border: 0; padding: 2px 10px; }
+    .feat tr { border-bottom: 1px solid var(--border); padding: 6px 0; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+<nav class="side"></nav>
+<main>
+  <div class="read"><b>What you're looking at</b>The story of the CPU engine, one optimization at a time. The chart shows the total time of all 22 TPC-H queries after each milestone, with Polars and DuckDB as flat reference lines (lower is faster). Hover a dot for the milestone, its total and the benchmark file it came from; click it to jump to that optimization's card. Each card says what was slow, what the engine does now, the before and after numbers with where they come from, and whether the win relies on a Mojo feature or is ordinary engineering. Totals are computed in your browser from the CSV files in <a href="https://github.com/abhisheksreesaila/mxframe/tree/main/docs/bench">docs/bench</a>; numbers on the cards are quoted from <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md">docs/optimizations.md</a>.</div>
+
+  <span class="kick">// the optimization story</span>
+  <h1>How MXFrame got fast</h1>
+  <p>The same 22 TPC-H queries, run again after every optimization: each in a fresh Python process, data already in memory, no warm-up, the clock covering only the query and its materialized result, every result checked against DuckDB. The page is also an argument that Mojo is a good language for a data engine, so each card says which Mojo feature it relies on, and says so plainly when the win is ordinary engineering that any language would get.</p>
+
+  <h2>Progress, milestone by milestone</h2>
+  <div class="card">
+    <div class="card-h">TPC-H · total of 22 queries · engine only · lower is faster</div>
+    <div class="card-b">
+      <div class="btns" id="sf-btns" role="group" aria-label="Scale factor">
+        <button class="btn on" type="button" data-sf="10">SF10 (60M rows)</button>
+        <button class="btn" type="button" data-sf="1">SF1 (6M rows)</button>
+      </div>
+      <div class="legend" id="progress-legend"></div>
+      <div class="chart chart-wrap" id="progress"><div class="status">loading benchmark files…</div></div>
+      <p style="font-size:13.5px;margin:10px 0 0" id="progress-note"></p>
+      <details>
+        <summary class="label">Data table</summary>
+        <div id="progress-table"></div>
+      </details>
+    </div>
+  </div>
+  <p style="font-size:13px">Polars and DuckDB are drawn from the latest run (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>), the same as the progress chart in the README; MXFrame is measured at each milestone. Earlier runs of DuckDB included DuckDB's own pyarrow import (see the F-044 card), which is why the reference lines are not taken from the early files.</p>
+
+  <h2>Which Mojo features the engine uses</h2>
+  <div class="card"><div class="card-b" style="padding:6px 16px">
+    <table class="t feat">
+      <tr><td><b>AOT shared libraries over the Arrow C Data Interface</b></td><td><code>mojo build --emit shared-lib</code>, called from Python with <code>ctypes</code>; Mojo reads Arrow buffers in place and Arrow wraps the result without a copy. No JIT warm-up inside a query.</td></tr>
+      <tr><td><b>Closures inlined into <code>parallelize</code></b></td><td>Every pass over the rows is a capturing closure run on all cores (morsel-driven, work-stealing through an atomic counter).</td></tr>
+      <tr><td><b>Compile-time specialization</b></td><td>One interpreter body, compiled into specialized versions (<code>keyed</code>, <code>shared</code>); the key encoder closure is inlined, with no virtual call per row.</td></tr>
+      <tr><td><b>SIMD widths</b></td><td><code>SIMD[DType.float64, W]</code> with <code>W = simd_width_of[...]()</code>: aggregation lanes sized for the CPU it was compiled for.</td></tr>
+    </table>
+  </div></div>
+
+  <h2>One card per optimization</h2>
+  <div class="btns" id="filter-btns" role="group" aria-label="Filter cards">
+    <button class="btn on" type="button" data-f="all">All</button>
+    <button class="btn" type="button" data-f="mojo">Mojo feature</button>
+    <button class="btn" type="button" data-f="plain">Plain engineering</button>
+    <span class="label" id="filter-count"></span>
+  </div>
+  <div class="grid" id="cards"></div>
+
+  <h2>Per query: where MXFrame beats DuckDB</h2>
+  <div class="card">
+    <div class="card-h">MXFrame speed against DuckDB, per TPC-H query · log scale · before and after the latest milestone</div>
+    <div class="card-b">
+      <div class="btns" id="pq-btns" role="group" aria-label="Scale factor">
+        <button class="btn on" type="button" data-sf="10">SF10</button>
+        <button class="btn" type="button" data-sf="1">SF1</button>
+      </div>
+      <div class="legend" id="pq-legend"></div>
+      <div class="chart chart-wrap" id="pq"><div class="status">loading benchmark files…</div></div>
+      <p style="font-size:13.5px;margin:10px 0 0" id="pq-note"></p>
+      <details>
+        <summary class="label">Data table</summary>
+        <div id="pq-table"></div>
+      </details>
+    </div>
+  </div>
+  <p style="font-size:13px">A dot to the right of the 1x line means MXFrame was faster than DuckDB on that query. "Before" is the F-043 run, "after" is the F-046 run; each run measured MXFrame and DuckDB together in one session. Speed is DuckDB's time divided by MXFrame's time.</p>
+
+  <h2>Read these numbers honestly</h2>
+  <ul>
+    <li><b>The lead over DuckDB rests on Q21.</b> Leaving it out, DuckDB's SF10 total is lower than MXFrame's (the per-query chart above shows how many queries DuckDB still wins). Q21 benefits from TPC-H's stored order.</li>
+    <li><b>Engine-only is the headline.</b> Loading data is outside the clock. MXFrame still reads Parquet through PyArrow, which the user-felt scoreboard in the benchmarks document includes.</li>
+    <li><b>Not every win is Mojo.</b> Cards badged "plain engineering" are algorithms or fixed costs any engine could fix. The Mojo-specific part is everything that loops over rows, compiled ahead of time from code that reads like Python.</li>
+    <li><b>SF1 queries take a few milliseconds,</b> so single SF1 figures can move by 10 to 20 percent between runs.</li>
+  </ul>
+</main>
+</div>
+
+<script id="got-fast-data" type="application/json">
+{
+  "milestones": [
+    {"id": "before", "label": "before", "title": "Before the native executor", "md": "22.7", "card": "m1",
+     "sf10": {"file": "engine-sf10.csv", "total": 22.657}, "sf1": {"file": "engine-sf1.csv", "total": 2.524}},
+    {"id": "M1", "label": "M1", "title": "M1: native aggregates", "md": "21.0", "card": "m1",
+     "sf10": {"file": "m1-sf10-native1.csv", "total": 21.006}, "sf1": {"file": "m1-sf1-native1.csv", "total": 2.699}},
+    {"id": "M2a", "label": "M2a", "title": "M2a: native leaf filters", "md": "16.2", "card": "m2a",
+     "sf10": {"file": "m2a-sf10.csv", "total": 16.164}, "sf1": {"file": "m2a-sf1.csv", "total": 2.25}},
+    {"id": "M2b", "label": "M2b", "title": "M2b: decode after the join", "md": "15.7", "card": "m2b",
+     "sf10": {"file": "m2b-sf10.csv", "total": 15.684}, "sf1": {"file": "m2b-sf1.csv", "total": 2.209}},
+    {"id": "M2d", "label": "M2d", "title": "M2d: star joins in one scan", "md": "11.1", "card": "m2d",
+     "sf10": {"file": "m2d-engine.csv", "total": 11.08}, "sf1": {"file": "m2d-engine.csv", "total": 1.76}},
+    {"id": "M2e", "label": "M2e", "title": "M2e: semi joins", "md": "10.5", "card": "m2e",
+     "sf10": {"file": "m2e-engine.csv", "total": 10.462}, "sf1": {"file": "m2e-engine.csv", "total": 1.66}},
+    {"id": "M2g", "label": "M2g", "title": "M2g: keyed group-by", "md": "9.8", "card": "m2g",
+     "sf10": {"file": "m2g-engine.csv", "total": 9.824}, "sf1": {"file": "m2g-engine.csv", "total": 1.248}},
+    {"id": "M2h", "label": "M2h", "title": "M2h: native DISTINCT, leaner scans", "md": "7.3", "card": "m2h",
+     "sf10": {"file": "m2h-engine.csv", "total": 7.343}, "sf1": {"file": "m2h-engine.csv", "total": 0.986}},
+    {"id": "M2l", "label": "M2l", "title": "M2i-M2l: threads, semi/anti joins, expression keys", "md": "6.45", "card": "m2l",
+     "sf10": {"file": "m2l-engine.csv", "total": 6.454}, "sf1": {"file": "m2l-engine.csv", "total": 0.734}},
+    {"id": "M2n", "label": "M2n", "title": "M2m-M2n: sparse keys, count distinct on sorted keys", "md": "3.82", "card": "m2n",
+     "sf10": {"file": "m2n-engine.csv", "total": 3.817}, "sf1": {"file": "m2n-engine.csv", "total": 0.52}},
+    {"id": "F-043", "label": "F-043", "title": "F-043: many groups, runtime join filter, string kernels", "md": "3.27", "card": "f043",
+     "sf10": {"file": "m2p-engine.csv", "total": 3.269}, "sf1": {"file": "m2p-engine.csv", "total": 0.5}},
+    {"id": "F-046", "label": "F-046", "title": "F-046: dictionary codes, unsorted COUNT(DISTINCT), filtered top-N", "md": "3.15", "card": "f046",
+     "sf10": {"file": "m2s-engine.csv", "total": 3.152}, "sf1": {"file": "m2s-engine.csv", "total": 0.472}}
+  ],
+  "reference": {"file": "m2s-engine.csv",
+    "sf10": {"polars": 14.401, "duckdb": 5.082}, "sf1": {"polars": 1.309, "duckdb": 0.628}},
+  "perquery": {
+    "before": {"label": "F-043", "file": "m2p-engine.csv"},
+    "after": {"label": "F-046", "file": "m2s-engine.csv"},
+    "titles": {"1": "filter+groupby+8 aggs", "2": "min-cost supplier", "3": "3-join+top10", "4": "EXISTS semi-join",
+      "5": "4-join+groupby", "6": "filter+global sum", "7": "volume shipping", "8": "market share",
+      "9": "6-join profit", "10": "returned items top20", "11": "important stock", "12": "shipping modes",
+      "13": "customer distribution", "14": "promo revenue", "15": "top supplier", "16": "part/supplier",
+      "17": "small-qty revenue", "18": "large volume top100", "19": "discounted revenue",
+      "20": "potential promotion", "21": "suppliers waiting", "22": "global sales opportunity"}
+  },
+  "cards": [
+    {"id": "m1", "tag": "M0 / M1", "section": "M0 / M1", "title": "One native call runs a whole aggregate",
+     "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}, {"kind": "mojo", "name": "SIMD widths"}],
+     "slow": "Each operator was a separate kernel launch with Python glue between them, and intermediate results were copied back and forth.",
+     "now": "The whole Filter, GroupBy, Aggregate, Sort/Limit/Having pipeline is compiled into bytecode and run in one call. The data is read once in 64k-row morsels; one Mojo interpreter evaluates the bytecode over 1,024 rows at a time, with SIMD, on every core.",
+     "nums": [{"label": "SF10 total of 22 queries", "before": "22.7", "after": "21.0", "unit": "s", "source": "bench/engine-sf10.csv, bench/m1-sf10-native1.csv"}],
+     "detail": ["Mojo's part: <code>parallelize</code> over morsels and <code>SIMD</code> lanes in the accumulators; the executor is an AOT shared library called through ctypes.",
+                "The first step is a small one. At SF1 the total did not improve at all (2.52 s to 2.70 s, bench/engine-sf1.csv to bench/m1-sf1-native1.csv): the executor only covered the final aggregate, and the joins in front of it were still materialized one by one. The big wins came from taking over the joins (M2a to M2d)."]},
+    {"id": "m2a", "tag": "M2a", "section": "M2a / M2b / M2c", "title": "Native leaf filters",
+     "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "Each table under a join was filtered by Arrow, producing full intermediate tables.",
+     "now": "Each table under a join is filtered in Mojo, and only the surviving rows of the columns the join needs are written out.",
+     "nums": [{"label": "Q19, SF10", "before": "2,159", "after": "146", "unit": "ms", "source": "optimizations.md, section M2a / M2b / M2c"},
+              {"label": "SF10 total of 22 queries", "before": "21.0", "after": "16.2", "unit": "s", "source": "bench/m1-sf10-native1.csv, bench/m2a-sf10.csv"}],
+     "detail": []},
+    {"id": "m2b", "tag": "M2b", "section": "M2a / M2b / M2c", "title": "Decode strings after the join",
+     "badges": [{"kind": "plain"}],
+     "slow": "A dictionary-encoded string column, such as p_type with only 150 distinct values, was turned back into strings before the join, for every row.",
+     "now": "The column stays encoded until the join has decided which rows survive.",
+     "nums": [{"label": "Q12, SF10", "before": "1,788", "after": "511", "unit": "ms", "source": "optimizations.md, section M2a / M2b / M2c"},
+              {"label": "SF10 total of 22 queries", "before": "16.2", "after": "15.7", "unit": "s", "source": "bench/m2a-sf10.csv, bench/m2b-sf10.csv"}],
+     "detail": ["Not a Mojo feature: keeping dictionary codes until the last moment is an algorithm any engine could use. Mojo only runs the per-row loops that follow."]},
+    {"id": "m2c", "tag": "M2c", "section": "M2a / M2b / M2c", "title": "Native gather",
+     "badges": [{"kind": "mojo", "name": "AOT shared libraries over the Arrow C Data Interface"}],
+     "slow": "The join's final \"take these rows\" was Arrow's <code>take</code>.",
+     "now": "It is one Mojo call that reads the Arrow buffers in place.",
+     "nums": [],
+     "detail": ["optimizations.md records no separate before and after number for this step, so none is shown here. Its effect is inside the totals of the milestones around it."]},
+    {"id": "m2d", "tag": "M2d", "section": "M2d", "title": "Star joins in one scan",
+     "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "Every join was materialized one at a time: filter lineitem, join it to orders, join that to customer, and so on.",
+     "now": "The largest table (the fact table) is scanned once. Every other table becomes a lookup map on its join key, so each surviving fact row looks up its partners and only fully joined rows are written. Compact key ranges use a direct array; sparse keys use a hash table in 64 partitions, built in parallel.",
+     "nums": [{"label": "Q3, SF10", "before": "674", "after": "265", "unit": "ms", "source": "optimizations.md, section M2d"},
+              {"label": "Q9, SF10", "before": "1,496", "after": "667", "unit": "ms", "source": "optimizations.md, section M2d"},
+              {"label": "Q18, SF10", "before": "1,980", "after": "825", "unit": "ms", "source": "optimizations.md, section M2d"},
+              {"label": "SF10 total of 22 queries", "before": "15.9", "after": "11.1", "unit": "s", "source": "optimizations.md, section M2d; bench/m2d-engine.csv"}],
+     "detail": ["The 15.9 s start is the number written in optimizations.md for the run before this change; the chart's neighbouring point (15.7 s, M2b) comes from a different run."]},
+    {"id": "m2e", "tag": "M2e", "section": "M2e", "title": "Semi joins without the DISTINCT",
+     "badges": [{"kind": "plain"}],
+     "slow": "A partner that is DISTINCT(keys) joined on exactly those keys (Q4: orders that have a late lineitem) was computed in full.",
+     "now": "That partner only has to answer one question: does a match exist? The DISTINCT never runs.",
+     "nums": [{"label": "Q4, SF10", "before": "966", "after": "259", "unit": "ms", "source": "optimizations.md, section M2e"},
+              {"label": "SF10 total of 22 queries", "before": "11.1", "after": "10.5", "unit": "s", "source": "bench/m2d-engine.csv, bench/m2e-engine.csv"}],
+     "detail": ["A planning rewrite, not a language feature."]},
+    {"id": "m2f", "tag": "M2f", "section": "M2f", "title": "Not importing pyarrow.compute",
+     "badges": [{"kind": "plain"}],
+     "slow": "Importing <code>pyarrow.compute</code> costs about 22 ms per process (a docstring for each of roughly 270 functions). Arrow's own methods, such as <code>Array.cast</code> and <code>Table.filter</code>, import it as a side effect, so 15 of the 22 queries paid that inside their first run.",
+     "now": "MXFrame calls Arrow's compute core directly.",
+     "nums": [{"label": "Q17, SF1", "before": "41", "after": "17", "unit": "ms", "source": "optimizations.md, section M2f"},
+              {"label": "Q11, SF1", "before": "32", "after": "13", "unit": "ms", "source": "optimizations.md, section M2f"}],
+     "detail": ["Not a Mojo win. It shows that at small scale, fixed costs matter as much as kernels do."]},
+    {"id": "m2g", "tag": "M2g", "section": "M2g", "title": "A group-by specialized at compile time",
+     "badges": [{"kind": "mojo", "name": "compile-time specialization"}, {"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "A group-by with more than 4,096 groups first wrote a group id for every row of the table (60M rows at SF10), including rows the filter was about to drop, and then aggregated in a second pass.",
+     "now": "Group ids are computed per 1,024-row block, only for the rows that pass the filter, and are folded straight into per-worker partial sums.",
+     "nums": [{"label": "Q15 (100k-group view), SF10", "before": "158", "after": "63", "unit": "ms", "source": "optimizations.md, section M2g"},
+              {"label": "SF10 total of 22 queries", "before": "10.5", "after": "9.8", "unit": "s", "source": "bench/m2e-engine.csv, bench/m2g-engine.csv"}],
+     "detail": ["The interpreter is written once as <code>_pipeline[E, keyed: Bool]</code>. The compiler emits one version that reads a precomputed group-id array and one that calls the key encoder <code>E</code>, a closure inlined into the row loop: two specialized loops from one source, with no runtime dispatch."]},
+    {"id": "m2h", "tag": "M2h", "section": "M2h", "title": "Native DISTINCT, nested stars, leaner scans",
+     "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}, {"kind": "plain"}],
+     "slow": "DISTINCT ran outside the native engine, nested star joins were not recognized, and scans kept a 60M-entry row mask.",
+     "now": "Row tuples are hashed in parallel, repeats are dropped early by a small per-block cache, and the rest is spread over 64 partitions that keep the first row of each tuple, preserving first-appearance order exactly. A partner that is itself a chain of tables becomes its own star scan. The most selective lookup runs first, behind a one-bit-per-key presence bitmap small enough for L2 cache, and kept-row lists replace the row mask.",
+     "nums": [{"label": "Q16 DISTINCT, SF10", "before": "112", "after": "24", "unit": "ms", "source": "optimizations.md, section M2h"},
+              {"label": "Q8, SF10", "before": "212", "after": "100", "unit": "ms", "source": "optimizations.md, section M2h (written as \"about 100\")"},
+              {"label": "SF10 total of 22 queries", "before": "9.8", "after": "7.3", "unit": "s", "source": "bench/m2g-engine.csv, bench/m2h-engine.csv"}],
+     "detail": ["After this milestone the engine beat Polars on 20 of the 22 queries at SF10. The parallel hashing and partitioning are Mojo; the lookup order and the bitmap are ideas any engine could use."]},
+    {"id": "m2i", "tag": "M2i", "section": "M2i", "title": "Fewer threads can be faster",
+     "badges": [{"kind": "plain"}],
+     "slow": "With 1.5M groups, each of the 24 workers zeroed and later merged its own 24 MB partial table: 576 MB of memory traffic for 6M input rows.",
+     "now": "The partial budget is capped at 128 MB, and the workers at rows / groups.",
+     "nums": [{"label": "Q18, SF1", "before": "164", "after": "84", "unit": "ms", "source": "optimizations.md, section M2i"}],
+     "detail": ["More parallelism isn't free. Polars took 134 ms on this query in the same note."]},
+    {"id": "m2j", "tag": "M2j", "section": "M2j", "title": "Semi and anti joins in the API",
+     "badges": [{"kind": "plain"}],
+     "slow": "TPC-H Q22 (customers who never ordered) could not be written in MXFrame alone, so it dropped to PyArrow.",
+     "now": "<code>join(..., how=\"semi\" | \"anti\")</code> and <code>col(...).str_slice(offset, length)</code> let Q22 stay inside the engine.",
+     "nums": [{"label": "Q22, SF1", "before": "34", "after": "18", "unit": "ms", "source": "optimizations.md, section M2j"}],
+     "detail": ["An API addition, not a Mojo feature."]},
+    {"id": "m2k", "tag": "M2k", "section": "M2k", "title": "One thread per core, not per hyperthread",
+     "badges": [{"kind": "plain"}],
+     "slow": "The machine has 12 cores and 24 hardware threads. These kernels are limited by memory bandwidth, so the second hyperthread on a core only adds contention.",
+     "now": "One worker per physical core, and fewer for small inputs (one per 128k rows).",
+     "nums": [{"label": "Q21, SF10", "before": "3.78", "after": "3.54", "unit": "s", "source": "optimizations.md, section M2k"},
+              {"label": "Q8, SF1", "before": "22", "after": "19", "unit": "ms", "source": "optimizations.md, section M2k"}],
+     "detail": ["A tuning choice that would help any engine on this CPU."]},
+    {"id": "m2l", "tag": "M2l", "section": "M2l", "title": "Grouping by a computed key",
+     "badges": [{"kind": "mojo", "name": "compile-time specialization"}, {"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "TPC-H's \"order year\" is computed from a date with a CASE WHEN. Grouping by it pushed the whole aggregate back to Python and Arrow.",
+     "now": "One native min/max pass measures the key's range, the key expression is compiled into the same bytecode program as a hidden aggregate slot, and the group-by reads that slot's register straight from the interpreter, per block.",
+     "nums": [{"label": "Q9, SF10", "before": "666", "after": "439", "unit": "ms", "source": "optimizations.md, section M2l"},
+              {"label": "SF10 total of 22 queries", "before": "7.3", "after": "6.45", "unit": "s", "source": "optimizations.md (timeline); bench/m2h-engine.csv, bench/m2l-engine.csv"}],
+     "detail": ["The key encoder is a closure that receives the interpreter's registers, and the compiler inlines it into the specialized row loop. Polars took 930 ms on Q9 in the same note.",
+                "This milestone also covers M2i, M2j and M2k above, which landed between M2h and M2l; the total on the chart is their sum."]},
+    {"id": "m2m", "tag": "M2m", "section": "M2m", "title": "Small inputs over wide key ranges",
+     "badges": [{"kind": "plain"}],
+     "slow": "Python planning is only 2 to 3 ms per query; the real cost was the group-by kernel. Q11 groups about 32k rows by a key whose range is 200k, so every worker zeroed and merged a partial table sized for all 200k keys (about 13 MB).",
+     "now": "A key range of at least 16,384 that is more than twice the row count takes a compacted path: only the keys that occur are numbered, still in key order, and key codes are computed only for groups that survive.",
+     "nums": [{"label": "Q11, SF1", "before": "14.6", "after": "6.1", "unit": "ms", "source": "optimizations.md, section M2m"},
+              {"label": "Q17, SF1", "before": "29.5", "after": "9.7", "unit": "ms", "source": "optimizations.md, section M2m"},
+              {"label": "Q2, SF1", "before": "15.7", "after": "9.3", "unit": "ms", "source": "optimizations.md, section M2m"}],
+     "detail": ["Measured in-process right after the change. In the benchmark run Q11 took 10.9 ms: small queries move by several milliseconds from run to run.",
+                "The principle: work should be proportional to the data, not to the key range."]},
+    {"id": "m2n", "tag": "M2n", "section": "M2n", "title": "COUNT(DISTINCT) on sorted keys",
+     "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "TPC-H Q21 counted distinct suppliers per order as a 60M-row DISTINCT, a gather of the distinct table, and a second group-by: 2.5 s of Q21's 3.4 s at SF10.",
+     "now": "Lineitem is stored by order key, and a filter keeps that order. The engine checks that the key never decreases (one cheap pass); equal keys then sit in runs, and each run is one group. It counts distinct suppliers inside each run, a handful of rows, in one parallel pass.",
+     "nums": [{"label": "Q21, SF10", "before": "3.44", "after": "0.95", "unit": "s", "source": "optimizations.md, section M2n"},
+              {"label": "Q21, SF1", "before": "279", "after": "102", "unit": "ms", "source": "optimizations.md, section M2n"},
+              {"label": "SF10 total of 22 queries", "before": "6.45", "after": "3.82", "unit": "s", "source": "bench/m2l-engine.csv, bench/m2n-engine.csv"}],
+     "detail": ["Polars and DuckDB use the same idea when they know a column is sorted; MXFrame checks at run time. In the same run Polars took 3.93 s and DuckDB 2.81 s on Q21.",
+                "Caveat: this relies on TPC-H's stored order. On shuffled rows it does not apply (see F-046 below)."],
+     "honest": "Almost all of this step's gain comes from one query: Q21 alone saves 2.49 s (3.44 to 0.95) of the 2.63 s the total drops (6.45 to 3.82), and it depends on the way TPC-H happens to store its rows."},
+    {"id": "f043", "tag": "F-043", "section": "F-043", "title": "Four general fixes for the queries DuckDB led",
+     "badges": [{"kind": "mojo", "name": "compile-time specialization"}, {"kind": "plain"}],
+     "slow": "A group-by with millions of groups (Q18's 15M orders) ran on one worker, because each worker's partial table would have taken gigabytes. A semi-join partner much larger than the filtered side was fully materialized. A group-by with ORDER BY sorted twice. Two string functions ran outside the engine.",
+     "now": "All workers update one shared output with atomic add, min and max, with a small per-worker cache of 4,096 groups in front for hot keys. The large semi-join partner is filtered through the small side's keys first. The group keys become the sort's last tie-break columns, so there is one sort. <code>str_slice</code> and a string <code>IN (...)</code> run natively.",
+     "nums": [{"label": "Q18, SF10", "before": "697", "after": "400", "unit": "ms", "source": "optimizations.md, section F-043 (written as \"about 400\")"},
+              {"label": "Q4, SF10", "before": "224", "after": "120", "unit": "ms", "source": "optimizations.md, section F-043 (written as \"about 120\")"},
+              {"label": "Q10 group-by, SF10", "before": "88", "after": "48", "unit": "ms", "source": "optimizations.md, section F-043"},
+              {"label": "Q22, SF10", "before": "148", "after": "94", "unit": "ms", "source": "optimizations.md, section F-043 (written as \"about 94\")"},
+              {"label": "SF10 total of 22 queries", "before": "3.82", "after": "3.27", "unit": "s", "source": "bench/m2n-engine.csv, bench/m2p-engine.csv"}],
+     "detail": ["Mojo's part: <code>Atomic[Scalar[DType.float64]]</code> add, min and max, and a compile-time <code>shared</code> parameter on the interpreter loop. The runtime join filter and the single sort are plain planning ideas.",
+                "Outside TPC-H, 20M rows over 5M groups: sum 608 to about 390 ms; with 95% of rows on one key, 29 to 21 ms (optimizations.md, same section)."]},
+    {"id": "f044", "tag": "F-044", "section": "F-044", "title": "Random queries, and a fairness bug in our own benchmark",
+     "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "To check that none of this is TPC-H tuning, a seeded generator writes random queries over the TPC-H tables. It found two blind spots: ORDER BY ... LIMIT had no fast path, and WHERE-only queries were filtered by Arrow.",
+     "now": "A native top-k keeps a heap of the best k rows per worker, and WHERE-only queries go through the native filter. All 250 MXFrame results on the random queries matched DuckDB.",
+     "nums": [{"label": "one ORDER BY ... LIMIT query", "before": "543", "after": "14", "unit": "ms", "source": "optimizations.md, section F-044"}],
+     "detail": ["The same work found a bug in the benchmark that favoured MXFrame: DuckDB imports pyarrow inside its first <code>.arrow()</code> call, about 70 ms per process, and that had been counted in every DuckDB time. It explained most of the earlier \"faster than DuckDB on 22/22 at SF1\". The import is now staging, like MXFrame's own."],
+     "honest": "Earlier DuckDB figures (the first files on the chart) include that import; the DuckDB reference lines on this page do not."},
+    {"id": "f046", "tag": "F-046", "section": "F-046", "title": "Closing the gaps the random queries found",
+     "badges": [{"kind": "plain"}, {"kind": "mojo", "name": "closures inlined into parallelize"}],
+     "slow": "The random queries showed where DuckDB still led: joins, top-N with a filter, SELECT DISTINCT, COUNT(DISTINCT), and anything on shuffled rows. Decoding Parquet's dictionary strings back into strings for every row was the single biggest cost on string-heavy queries, and M2n's sorted-run count only works when the table is stored by the group key.",
+     "now": "Dictionary codes pass through joins, single-table filters, SELECT DISTINCT and COUNT(DISTINCT), and only the rows that reach the output are decoded. COUNT(DISTINCT) on unsorted keys picks a radix-partitioned hash aggregate, a byte map, or partitions by the hash of the (key, value) pair. WHERE + ORDER BY + LIMIT runs in one pass, with passing rows going straight into per-worker top-k heaps.",
+     "nums": [{"label": "join with a string group key (random, SF10)", "before": "1,597", "after": "639", "unit": "ms", "source": "optimizations.md, section F-046"},
+              {"label": "SELECT DISTINCT (random, SF10)", "before": "375", "after": "43", "unit": "ms", "source": "optimizations.md, section F-046"},
+              {"label": "Q21, SF10, rows shuffled", "before": "4.98", "after": "1.34", "unit": "s", "source": "optimizations.md, section F-046; bench/m2s-engine-shuffled.csv"},
+              {"label": "filtered top-N (random, SF10)", "before": "420", "after": "63", "unit": "ms", "source": "optimizations.md, section F-046"},
+              {"label": "SF10 total, rows shuffled", "before": "8.64", "after": "4.97", "unit": "s", "source": "optimizations.md, section F-046; bench/m2s-engine-shuffled.csv"},
+              {"label": "SF10 total, stored rows", "before": "3.27", "after": "3.15", "unit": "s", "source": "bench/m2p-engine.csv, bench/m2s-engine.csv"}],
+     "detail": ["Keeping dictionary codes, the byte map and the fused filter + top-k are algorithms any engine could use. Mojo's part is again the parallel per-row loops: the dictionary remaps, the byte map and the pair partitions are <code>parallelize</code> closures over raw Arrow buffers, with <code>Atomic[DType.int64]</code> adds for the per-key counts.",
+                "Against DuckDB on the random SF10 queries the geometric mean went from 0.75x to 1.09x (optimizations.md)."],
+     "honest": "The stored-rows total barely moved (3.27 s to 3.15 s, within run-to-run variation): no F-046 work targeted it. Its gains are on shuffled rows and on random queries."}
+  ]
+}
+</script>
+
+<script>
+const DATA = JSON.parse(document.getElementById("got-fast-data").textContent);
+const BENCH = (f) => "bench/" + f;
+const sum = (rows, engine, sf) => {
+  const r = rows.filter((x) => x.engine === engine && x.sf === sf && x.first_ms);
+  return r.length === 22 ? r.reduce((s, x) => s + +x.first_ms, 0) / 1000 : null;   // same rule as scripts/plot_progress.py
+};
+const byQuery = (rows, engine, sf) => Object.fromEntries(rows.filter((x) => x.engine === engine && x.sf === sf && x.first_ms).map((x) => [+x.query, +x.first_ms]));
+const fmtS = (v) => (v >= 10 ? v.toFixed(1) : v.toFixed(2)) + " s";
+const niceStep = (ymax) => { const raw = ymax / 5, mag = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw); };
+const FEATURE_ICON = { mojo: "Mojo feature", plain: "plain engineering" };
+
+const state = { sf: "10", pqsf: "10", files: {}, progress: null, pq: null };
+
+// ---------- loading ----------
+async function loadAll() {
+  const names = new Set([DATA.reference.file, DATA.perquery.before.file, DATA.perquery.after.file]);
+  DATA.milestones.forEach((m) => { names.add(m.sf10.file); names.add(m.sf1.file); });
+  await Promise.all([...names].map(async (n) => { state.files[n] = await loadCSV(BENCH(n)); }));
+  // milestone totals, from the files
+  state.progress = DATA.milestones.map((m) => {
+    const o = { ...m };
+    for (const sf of ["10", "1"]) {
+      const total = sum(state.files[m["sf" + sf].file], "mx-cpu", sf);
+      o["t" + sf] = total;
+      o["drift" + sf] = total === null || Math.abs(total - m["sf" + sf].total) > 0.01;   // page data disagrees with the file
+    }
+    return o;
+  });
+  state.ref = {};
+  for (const sf of ["10", "1"]) state.ref[sf] = { polars: sum(state.files[DATA.reference.file], "polars", sf), duckdb: sum(state.files[DATA.reference.file], "duckdb", sf) };
+}
+
+// ---------- legend ----------
+const dot = (c, kind) => `<span><i style="background:var(${c})${kind === "ring" ? ";background:transparent;border:2px solid var(" + c + ")" : ""}"></i>`;
+function legend(el, items) { el.innerHTML = items.map(([c, name, kind]) => `${dot(c, kind)}${name}</span>`).join(""); }
+
+// ---------- progress chart ----------
+function drawProgress() {
+  const host = document.getElementById("progress");
+  if (!state.progress) return;
+  const sf = state.sf, pts = state.progress, ref = state.ref[sf];
+  const W = 900, H = 380, L = 56, R = 120, T = 20, B = 52, pw = W - L - R, ph = H - T - B;
+  const vals = pts.map((p) => p["t" + sf]);
+  const ymax = Math.max(...vals, ref.polars, ref.duckdb) * 1.08, step = niceStep(ymax);
+  const x = (i) => L + (i * pw) / (pts.length - 1), y = (v) => T + ph - (v / ymax) * ph;
+  const css = { mx: cssVar("--mx"), dk: cssVar("--dk"), pl: cssVar("--pl"), grid: cssVar("--border"), axis: cssVar("--border-hi"), bg: cssVar("--surface"), txt: cssVar("--text") };
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `MXFrame SF${sf} total of 22 TPC-H queries per milestone, against Polars and DuckDB` });
+  for (let v = 0; v <= ymax; v += step) {
+    s.append(svg("line", { x1: L, x2: L + pw, y1: y(v), y2: y(v), stroke: v === 0 ? css.axis : css.grid, "stroke-width": 1 }));
+    s.append(svg("text", { x: L - 8, y: y(v) + 3.5, "text-anchor": "end" }, +v.toFixed(2)));
+  }
+  s.append(svg("text", { x: 4, y: T - 6 }, "seconds"));
+  for (const [v, c, name] of [[ref.polars, css.pl, "Polars"], [ref.duckdb, css.dk, "DuckDB"]]) {
+    s.append(svg("line", { x1: L, x2: L + pw, y1: y(v), y2: y(v), stroke: c, "stroke-width": 2, "stroke-dasharray": "6 4" }));
+    s.append(svg("text", { x: L + pw + 8, y: y(v) + 3.5, style: `fill:${css.txt}` }, `${name} ${fmtS(v)}`));
+  }
+  s.append(svg("path", { d: pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p["t" + sf]).toFixed(1)}`).join(" "), fill: "none", stroke: css.mx, "stroke-width": 2.5 }));
+  pts.forEach((p, i) => {
+    const v = p["t" + sf], prev = i ? pts[i - 1]["t" + sf] : null;
+    s.append(svg("circle", { cx: x(i), cy: y(v), r: 4.5, fill: css.mx, stroke: css.bg, "stroke-width": 2 }));
+    s.append(svg("text", { x: x(i), y: H - B + 18, "text-anchor": "middle" }, p.label));
+    if (i === 0 || i === pts.length - 1) s.append(svg("text", { x: x(i) + (i ? 0 : 8), y: y(v) + (i ? -10 : 20), "text-anchor": i ? "end" : "start", style: `fill:${css.txt};font-weight:700` }, fmtS(v)));
+    const hit = svg("circle", { class: "hit", cx: x(i), cy: y(v), r: 14, tabindex: 0, role: "link", "aria-label": `${p.title}: ${fmtS(v)}` });
+    const tip = () => `<b>${p.title}</b><br><span class="num">${fmtS(v)}</span> total of 22 queries at SF${sf}` +
+      (prev ? `<br>${v < prev ? "−" : "+"}${Math.abs(((v - prev) / prev) * 100).toFixed(0)}% against the previous milestone (${fmtS(prev)})` : "") +
+      `<br><span class="src">source: bench/${p["sf" + sf].file}</span>` + (p["drift" + sf] ? `<br><span style="color:var(--red)">page data differs from the file</span>` : "");
+    hover(hit, tip);
+    hit.addEventListener("click", () => document.getElementById("card-" + p.card)?.scrollIntoView({ behavior: "smooth", block: "start" }));
+    hit.addEventListener("keydown", (e) => { if (e.key === "Enter") hit.dispatchEvent(new Event("click")); });
+    s.append(hit);
+  });
+  host.replaceChildren(s);
+  legend(document.getElementById("progress-legend"), [["--mx", "MXFrame (CPU) at each milestone"], ["--pl", "Polars, latest run"], ["--dk", "DuckDB, latest run"]]);
+  const first = vals[0], last = vals[vals.length - 1];
+  const steps = pts.slice(1).map((p, i) => ({ id: p.id, d: vals[i] - vals[i + 1] })).sort((a, b) => b.d - a.d).slice(0, 2);
+  document.getElementById("progress-note").innerHTML = `<b>SF${sf}: ${fmtS(first)} → ${fmtS(last)}</b> (${(first / last).toFixed(1)}x faster than before the executor). ` +
+    `The biggest single steps are ${steps.map((t) => `${t.id} (−${fmtS(t.d)})`).join(" and ")}.` +
+    (sf === "1" ? " The SF1 line barely moves at first: small data is dominated by fixed costs, not kernels." : "");
+  const drift = pts.filter((p) => p["drift" + sf]);
+  if (drift.length) document.getElementById("progress-note").innerHTML += ` <span style="color:var(--red)">Check: ${drift.map((p) => p.id).join(", ")} differs from the value written on this page.</span>`;
+}
+
+function progressTable() {
+  const rows = state.progress.map((p, i) => {
+    const prev = i ? state.progress[i - 1] : null;
+    return `<tr><td>${p.title}</td><td class="r num">${fmtS(p.t10)}</td><td class="src">bench/${p.sf10.file}</td><td class="r num">${fmtS(p.t1)}</td><td class="src">bench/${p.sf1.file}</td></tr>`;
+  }).join("");
+  const r = state.ref;
+  document.getElementById("progress-table").innerHTML = `<table class="t"><tr><th>Milestone</th><th class="r">SF10 total</th><th>SF10 source</th><th class="r">SF1 total</th><th>SF1 source</th></tr>${rows}` +
+    `<tr><td>Polars (reference)</td><td class="r num">${fmtS(r["10"].polars)}</td><td class="src">bench/${DATA.reference.file}</td><td class="r num">${fmtS(r["1"].polars)}</td><td class="src">bench/${DATA.reference.file}</td></tr>` +
+    `<tr><td>DuckDB (reference)</td><td class="r num">${fmtS(r["10"].duckdb)}</td><td class="src">bench/${DATA.reference.file}</td><td class="r num">${fmtS(r["1"].duckdb)}</td><td class="src">bench/${DATA.reference.file}</td></tr></table>`;
+}
+
+// ---------- per-query chart ----------
+function pqData(sf) {
+  const b = state.files[DATA.perquery.before.file], a = state.files[DATA.perquery.after.file];
+  const mb = byQuery(b, "mx-cpu", sf), db = byQuery(b, "duckdb", sf), ma = byQuery(a, "mx-cpu", sf), da = byQuery(a, "duckdb", sf);
+  return Object.keys(ma).map(Number).sort((p, q) => p - q).map((q) => ({ q, title: DATA.perquery.titles[q] || "", mb: mb[q], db: db[q], ma: ma[q], da: da[q], rb: db[q] / mb[q], ra: da[q] / ma[q] }));
+}
+
+function drawPerQuery() {
+  const host = document.getElementById("pq");
+  if (!state.files[DATA.perquery.after.file]) return;
+  const sf = state.pqsf, rows = pqData(sf), narrow = false;
+  const W = 900, rowH = 24, T = 44, B = 40, L = 190, R = 30, pw = W - L - R, H = T + rowH * rows.length + B;
+  const all = rows.flatMap((r) => [r.rb, r.ra]);
+  const lo = Math.floor(Math.log2(Math.min(...all, 0.5))), hi = Math.ceil(Math.log2(Math.max(...all, 2)));
+  const x = (r) => L + ((Math.log2(r) - lo) / (hi - lo)) * pw;
+  const css = { mx: cssVar("--mx"), grid: cssVar("--border"), mid: cssVar("--mid"), bg: cssVar("--surface"), txt: cssVar("--text") };
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `Per-query speed of MXFrame against DuckDB at SF${sf}, before and after ${DATA.perquery.after.label}` });
+  for (let k = lo; k <= hi; k++) {
+    s.append(svg("line", { x1: x(2 ** k), x2: x(2 ** k), y1: T - 8, y2: T + rowH * rows.length, stroke: k === 0 ? css.mid : css.grid, "stroke-width": k === 0 ? 1.5 : 1 }));
+    s.append(svg("text", { x: x(2 ** k), y: T + rowH * rows.length + 16, "text-anchor": "middle" }, k >= 0 ? `${2 ** k}x` : `1/${2 ** -k}x`));
+  }
+  s.append(svg("text", { x: x(1) + 6, y: T - 16 }, "MXFrame faster →"));
+  s.append(svg("text", { x: x(1) - 6, y: T - 16, "text-anchor": "end" }, "← DuckDB faster"));
+  rows.forEach((r, i) => {
+    const yy = T + i * rowH + rowH / 2;
+    s.append(svg("text", { x: 8, y: yy + 3.5, style: `fill:${css.txt}` }, `Q${r.q} ${r.title}`));
+    s.append(svg("line", { x1: x(r.rb), x2: x(r.ra), y1: yy, y2: yy, stroke: css.mx, "stroke-width": 2, opacity: 0.45 }));
+    s.append(svg("circle", { cx: x(r.rb), cy: yy, r: 4.5, fill: css.bg, stroke: css.mx, "stroke-width": 2 }));
+    s.append(svg("circle", { cx: x(r.ra), cy: yy, r: 5, fill: css.mx, stroke: css.bg, "stroke-width": 1.5 }));
+    const hit = svg("rect", { class: "hit", x: 0, y: yy - rowH / 2, width: W, height: rowH });
+    hover(hit, () => `<b>Q${r.q} ${r.title}</b><br>${DATA.perquery.before.label}: MXFrame ${fmtMs(r.mb)}, DuckDB ${fmtMs(r.db)} (${r.rb.toFixed(2)}x)` +
+      `<br>${DATA.perquery.after.label}: MXFrame ${fmtMs(r.ma)}, DuckDB ${fmtMs(r.da)} (<b>${r.ra.toFixed(2)}x</b>)<br><span class="src">source: bench/${DATA.perquery.before.file}, bench/${DATA.perquery.after.file}</span>`);
+    s.append(hit);
+  });
+  host.replaceChildren(s);
+  legend(document.getElementById("pq-legend"), [["--mx", `before: ${DATA.perquery.before.label} run`, "ring"], ["--mx", `after: ${DATA.perquery.after.label} run`]]);
+  const wins = (k) => rows.filter((r) => r[k] > 1).length, tot = (f) => rows.reduce((s, r) => s + r[f], 0) / 1000;
+  const gained = rows.filter((r) => r.rb <= 1 && r.ra > 1).map((r) => "Q" + r.q), lost = rows.filter((r) => r.rb > 1 && r.ra <= 1).map((r) => "Q" + r.q);
+  const duckLeads = rows.filter((r) => r.ra <= 1).sort((p, q) => p.ra - q.ra).slice(0, 4).map((r) => `Q${r.q} (${r.ra.toFixed(2)}x)`);
+  document.getElementById("pq-note").innerHTML = `<b>MXFrame is faster than DuckDB on ${wins("rb")} of ${rows.length} queries before, ${wins("ra")} after</b> at SF${sf}.` +
+    (gained.length ? ` Newly won: ${gained.join(", ")}.` : "") + (lost.length ? ` Newly lost: ${lost.join(", ")}.` : "") +
+    (duckLeads.length ? ` DuckDB still leads most on ${duckLeads.join(", ")}.` : "");
+  document.getElementById("pq-table").innerHTML = `<table class="t"><tr><th>Query</th><th class="r">MXFrame before</th><th class="r">DuckDB before</th><th class="r">MXFrame after</th><th class="r">DuckDB after</th><th class="r">Speed before / after</th></tr>` +
+    rows.map((r) => `<tr><td>Q${r.q} ${r.title}</td><td class="r num">${fmtMs(r.mb)}</td><td class="r num">${fmtMs(r.db)}</td><td class="r num">${fmtMs(r.ma)}</td><td class="r num">${fmtMs(r.da)}</td><td class="r num">${r.rb.toFixed(2)}x / ${r.ra.toFixed(2)}x</td></tr>`).join("") +
+    `</table><p class="src">Sources: bench/${DATA.perquery.before.file} (before), bench/${DATA.perquery.after.file} (after). Speed is DuckDB's time divided by MXFrame's.</p>`;
+}
+
+// ---------- cards ----------
+function badge(b) {
+  return b.kind === "mojo" ? `<span class="badge brand">Mojo feature: ${b.name}</span>` : `<span class="badge warn">plain engineering</span>`;
+}
+function renderCards() {
+  document.getElementById("cards").innerHTML = DATA.cards.map((c) => {
+    const nums = c.nums.length
+      ? `<table class="t"><tr><th>What</th><th class="r">Before</th><th class="r">After</th><th>Source</th></tr>` +
+        c.nums.map((n) => `<tr><td>${n.label}</td><td class="r num">${n.before} ${n.unit}</td><td class="r num">${n.after} ${n.unit}</td><td class="src">${n.source}</td></tr>`).join("") + `</table>`
+      : `<p class="src" style="margin:0">No separate before / after number is recorded for this step.</p>`;
+    const detail = c.detail.length ? `<details><summary class="label">More detail</summary>${c.detail.map((d) => `<p>${d}</p>`).join("")}</details>` : "";
+    const kinds = [...new Set(c.badges.map((b) => b.kind))].join(" ");
+    return `<div class="card" id="card-${c.id}" data-kinds="${kinds}"><div class="card-h"><span class="tag">${c.tag}</span><span class="ttl">${c.title}</span><span class="sp"></span>${c.badges.map(badge).join(" ")}</div>` +
+      `<div class="card-b"><div class="pair"><div><h4>What was slow</h4><p>${c.slow}</p></div><div><h4>What the engine does now</h4><p>${c.now}</p></div></div>` +
+      `${nums}${c.honest ? `<div class="note-honest"><b>Honestly:</b> ${c.honest}</div>` : ""}${detail}</div></div>`;
+  }).join("");
+  applyFilter("all");
+}
+function applyFilter(f) {
+  let n = 0;
+  document.querySelectorAll("#cards .card").forEach((el) => {
+    const show = f === "all" || el.dataset.kinds.split(" ").includes(f);
+    el.classList.toggle("hide", !show);
+    n += show;
+  });
+  document.getElementById("filter-count").textContent = `${n} of ${DATA.cards.length} optimizations`;
+  document.querySelectorAll("#filter-btns .btn").forEach((b) => b.classList.toggle("on", b.dataset.f === f));
+}
+
+// ---------- wiring ----------
+function toggleGroup(id, key, redraw) {
+  document.querySelectorAll(`#${id} .btn`).forEach((b) => (b.onclick = () => {
+    state[key] = b.dataset.sf;
+    document.querySelectorAll(`#${id} .btn`).forEach((o) => o.classList.toggle("on", o === b));
+    redraw();
+  }));
+}
+renderCards();
+document.querySelectorAll("#filter-btns .btn").forEach((b) => (b.onclick = () => applyFilter(b.dataset.f)));
+toggleGroup("sf-btns", "sf", drawProgress);
+toggleGroup("pq-btns", "pqsf", drawPerQuery);
+const redrawAll = () => { drawProgress(); drawPerQuery(); };
+document.addEventListener("themechange", redrawAll);
+loadAll().then(() => { redrawAll(); progressTable(); }).catch((err) => {
+  for (const id of ["progress", "pq"]) showError(document.getElementById(id), "bench/" + (err.message.split(":")[0].replace(/^bench\//, "")), err);
+});
+</script>
+</body>
+</html>
