@@ -3033,7 +3033,9 @@ def mx_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
 #   0 CMAGIC   1 a (ArrowArray*, int32 / int64, one chunk)   2 a's kind (0 int32, 1 int64)
 #   3 b (ArrowArray*, one chunk, same length)   4 b's kind (0 int32, 1 int64, 2 utf8)   5 threads
 # Output: 0 number of groups, 1 arena: int64 keys[n], then int64 counts[n], in key order
-# (mx_exec_free). Returns E_UNSORTED when a is not non-decreasing (the caller's path answers).
+# (mx_exec_free), 2 the path that answered (CD_PATH_*). An unsorted a goes to the hash paths below;
+# E_UNSORTED when its range is too sparse for them (the caller's path answers). So does a sorted a
+# with fewer runs than twice the workers (one key: a single worker would count every row).
 # Equal keys form one run, so every run is a group: blocks are moved to the next run start, each
 # worker counts its runs, prefix sums give each block's first output slot, and a second pass counts
 # the distinct b of every run (pairwise for short runs, an open-addressing table for long ones).
@@ -3157,6 +3159,14 @@ def mx_count_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
         var r = Int(nr[blk])
         nr[blk] = Int64(tot)
         tot += r
+    # a few long runs: one worker each (F-046h); unless the range is too sparse for the hash paths
+    var span = _ival(a, wa, n - 1) - _ival(a, wa, 0) + 1
+    if tot < 2 * nt and nt > 1 and span > 0 and span <= max(1 << 26, 8 * n):
+        starts.free()
+        unsorted.free()
+        counter.free()
+        nr.free()
+        return _count_distinct_hash(a, wa, b, kb, n, threads, O)
     var arena = unsafe_alloc[UInt8](max(tot * 16, 16), alignment=64)
     var keys = _lp(Int(arena))
     var cnts = _lp(Int(arena) + tot * 8)
@@ -3185,6 +3195,7 @@ def mx_count_distinct(plan_a: Int, out_a: Int) abi("C") -> Int:
     _par(emit, nt)
     O[0] = Int64(tot)
     O[1] = Int64(Int(arena))
+    O[2] = Int64(CD_PATH_RUNS)
     starts.free()
     unsorted.free()
     counter.free()
@@ -3567,8 +3578,245 @@ def mx_topk(plan_a: Int, out_a: Int) abi("C") -> Int:
 # atomics. Partitions cover increasing key ranges, so writing each one's keys in order gives the
 # whole result in key order. Declines (E_UNSORTED) when the key range is past max(2^26, 8 rows):
 # the counters would outnumber the rows.
+#
+# Two cases skip the key-range partitions (F-046h). When b is an integer (or dictionary codes) and
+# (key range) x (b's range) is small, every row just sets one byte of a (key, value) map and each
+# key's count is its row of the map. When the key range fits in fewer partitions than there are
+# threads (a few dozen keys: one partition would hold every row), partitions are cut by the
+# hash of the (key, value) pair instead, each pair is still deduped in exactly one partition, and
+# each worker counts into its own per-key array, summed at the end.
 
 comptime CD_PART_KEYS_LOG = 16
+comptime CD_DENSE_MIN = 1 << 22                # byte-map size always allowed (else 2 bytes / row)
+# which path answered (out word 2): sorted runs, key-range partitions, byte map, pair-hash partitions
+comptime CD_PATH_RUNS = 0
+comptime CD_PATH_KEYS = 1
+comptime CD_PATH_DENSE = 2
+comptime CD_PATH_PAIRS = 3
+
+
+@always_inline
+def _cd_pair_hash(k: Int, v: Int) -> UInt64:
+    return _mix(UInt64(k) * 0x9E3779B97F4A7C15 ^ UInt64(v))
+
+
+def _cd_emit(cnt: LP, D: Int, lo: Int, nt: Int, O: LP, path: Int) -> Int:
+    """Groups (lo + k, cnt[k]) for every k with cnt[k] > 0, in key order, into O (arena)."""
+    var nb = max(1, min(nt * 4, (D + 4095) // 4096))
+    var bn = unsafe_alloc[Int64](nb + 1)
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def cnt_nz(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var c = 0
+            for k in range(blk * D // nb, (blk + 1) * D // nb):
+                c += 1 if Int(cnt[k]) > 0 else 0
+            bn[blk] = Int64(c)
+
+    _par(cnt_nz, min(nt, nb))
+    var tot = 0
+    for blk in range(nb):
+        var c = Int(bn[blk])
+        bn[blk] = Int64(tot)
+        tot += c
+    var arena = unsafe_alloc[UInt8](max(tot * 16, 16), alignment=64)
+    var keys = _lp(Int(arena))
+    var cnts = _lp(Int(arena) + tot * 8)
+    counter[0] = 0
+
+    def write(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var at = Int(bn[blk])
+            for k in range(blk * D // nb, (blk + 1) * D // nb):
+                if Int(cnt[k]) > 0:
+                    keys[at] = Int64(lo + k)
+                    cnts[at] = cnt[k]
+                    at += 1
+
+    _par(write, min(nt, nb))
+    O[0] = Int64(tot)
+    O[1] = Int64(Int(arena))
+    O[2] = Int64(path)
+    bn.free()
+    counter.free()
+    return 0
+
+
+def _cd_dense(a: Int, wa: Int, b: Int, wb: Int, n: Int, lo: Int, D: Int, vlo: Int, V: Int,
+              nb: Int, nt: Int, O: LP) -> Int:
+    """COUNT(DISTINCT b) per a through a byte per (key, value): D x V bytes, set by the rows."""
+    var M = D * V
+    var seen = _bp(big_alloc(M))
+    var mb = max(1, min(nt * 4, (M + 65535) // 65536))
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def clear(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= mb:
+                break
+            var s = blk * M // mb
+            unsafe_memset_zero(seen + s, (blk + 1) * M // mb - s)
+
+    _par(clear, min(nt, mb))
+    counter[0] = 0
+
+    def mark(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            for i in range(blk * n // nb, (blk + 1) * n // nb):
+                var at = (_ival(a, wa, i) - lo) * V + (_ival(b, wb, i) - vlo)
+                if seen[at] == 0:              # read first: a set byte's line stays shared
+                    seen[at] = 1
+
+    _par(mark, nt)
+    var cnt = _lp(big_alloc(D * 8))
+    unsafe_memset_zero(_bp(Int(cnt)), D * 8)
+    counter[0] = 0
+
+    def per_key(wid: Int) {imm}:
+        # blocks of the map, not of the keys: one key's row may span many blocks (D = 1)
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= mb:
+                break
+            var s = blk * M // mb
+            var e = (blk + 1) * M // mb
+            while s < e:
+                var k = s // V
+                var stop = min(e, (k + 1) * V)
+                var c = 0
+                for x in range(s, stop):
+                    c += Int(seen[x])
+                if c > 0:
+                    _ = Atomic[Scalar[DType.int64]].fetch_add(cnt + k, Int64(c))
+                s = stop
+
+    _par(per_key, min(nt, mb))
+    free_big(Int(seen))
+    var rc = _cd_emit(cnt, D, lo, nt, O, CD_PATH_DENSE)
+    free_big(Int(cnt))
+    counter.free()
+    return rc
+
+
+def _cd_pairs(a: Int, wa: Int, b: Int, kb: Int, n: Int, lo: Int, D: Int, nb: Int, nt: Int,
+              O: LP) -> Int:
+    """COUNT(DISTINCT b) per a for a few keys: partitions by the (key, value) pair's hash."""
+    var lg = 2
+    while (1 << lg) < nt * 4 or ((1 << lg) < 1024 and (n >> lg) > (1 << 16)):
+        lg += 1
+    var P = 1 << lg
+    var bc = unsafe_alloc[Int64](nb * P)
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def count(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var c = bc + blk * P
+            for p in range(P):
+                c[p] = 0
+            for i in range(blk * n // nb, (blk + 1) * n // nb):
+                var h = _cd_pair_hash(_ival(a, wa, i) - lo, _cd_bval(kb, b, i))
+                c[Int(h >> UInt64(64 - lg))] += 1
+
+    _par(count, nt)
+    var poff = unsafe_alloc[Int64](P + 1)
+    var run = 0
+    for p in range(P):
+        poff[p] = Int64(run)
+        for blk in range(nb):
+            var k = Int(bc[blk * P + p])
+            bc[blk * P + p] = Int64(run)
+            run += k
+    poff[P] = Int64(run)
+    var ek = _lp(big_alloc(max(n, 1) * 8))
+    var ev = _lp(big_alloc(max(n, 1) * 8))
+    var er = _lp(big_alloc(max(n, 1) * 8)) if kb == 2 else _lp(big_alloc(8))
+    counter[0] = 0
+
+    def scatter(wid: Int) {imm}:
+        while True:
+            var blk = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if blk >= nb:
+                break
+            var c = bc + blk * P
+            for i in range(blk * n // nb, (blk + 1) * n // nb):
+                var k = _ival(a, wa, i) - lo
+                var v = _cd_bval(kb, b, i)
+                var p = Int(_cd_pair_hash(k, v) >> UInt64(64 - lg))
+                var at = Int(c[p])
+                c[p] = Int64(at + 1)
+                ek[at] = Int64(k)
+                ev[at] = Int64(v)
+                if kb == 2:
+                    er[at] = Int64(i)
+
+    _par(scatter, nt)
+    bc.free()
+    var wc = _lp(big_alloc(nt * D * 8))          # per-worker counts per key
+    unsafe_memset_zero(_bp(Int(wc)), nt * D * 8)
+    counter[0] = 0
+
+    def work(wid: Int) {imm}:
+        var mine = wc + wid * D
+        while True:
+            var p = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if p >= P:
+                break
+            var s0 = Int(poff[p])
+            var s1 = Int(poff[p + 1])
+            if s1 == s0:
+                continue
+            var cap = _pow2_at_least(2 * (s1 - s0) + 2)
+            var tab = unsafe_alloc[Int64](cap)
+            for t in range(cap):
+                tab[t] = -1
+            for s in range(s0, s1):
+                var k = Int(ek[s])
+                var v = Int(ev[s])
+                var t = Int(_cd_pair_hash(k, v) & UInt64(cap - 1))
+                var new = True
+                while True:
+                    var o = Int(tab[t])
+                    if o < 0:
+                        break
+                    if Int(ek[o]) == k and Int(ev[o]) == v:
+                        if kb != 2 or _dval_eq(kb, b, Int(er[o]), Int(er[s])):
+                            new = False
+                            break
+                    t = (t + 1) & (cap - 1)
+                if new:
+                    tab[t] = Int64(s)
+                    mine[k] = mine[k] + 1
+            tab.free()
+
+    _par(work, nt)
+    for w in range(1, nt):                       # D is small here (fewer than 2 x threads x 4096)
+        var src = wc + w * D
+        for k in range(D):
+            wc[k] = wc[k] + src[k]
+    var rc = _cd_emit(wc, D, lo, nt, O, CD_PATH_PAIRS)
+    free_big(Int(wc))
+    free_big(Int(ek))
+    free_big(Int(ev))
+    free_big(Int(er))
+    poff.free()
+    counter.free()
+    return rc
 
 
 @always_inline
@@ -3583,8 +3831,8 @@ def _count_distinct_hash(a: Int, wa: Int, b: Int, kb: Int, n: Int, threads: Int,
     var nb = max(1, min(threads * 4, (n + 65535) // 65536))
     var nt = max(1, min(threads, nb))
     var counter = unsafe_alloc[Int64](1)
-    var blo = unsafe_alloc[Int64](nb)
-    var bhi = unsafe_alloc[Int64](nb)
+    var blo = unsafe_alloc[Int64](nb * 4)          # per block: a's min, max, b's min, max
+    var wb = 4 if kb == 0 else 8
     counter[0] = 0
 
     def rng(wid: Int) {imm}:
@@ -3594,31 +3842,50 @@ def _count_distinct_hash(a: Int, wa: Int, b: Int, kb: Int, n: Int, threads: Int,
                 break
             var l = Int(Int64.MAX)
             var h = Int(Int64.MIN)
+            var vl = Int(Int64.MAX)
+            var vh = Int(Int64.MIN)
             for i in range(blk * n // nb, (blk + 1) * n // nb):
                 var v = _ival(a, wa, i)
                 l = min(l, v)
                 h = max(h, v)
-            blo[blk] = Int64(l)
-            bhi[blk] = Int64(h)
+                if kb != 2:
+                    var x = _ival(b, wb, i)
+                    vl = min(vl, x)
+                    vh = max(vh, x)
+            blo[4 * blk] = Int64(l)
+            blo[4 * blk + 1] = Int64(h)
+            blo[4 * blk + 2] = Int64(vl)
+            blo[4 * blk + 3] = Int64(vh)
 
     _par(rng, nt)
     var lo = Int(Int64.MAX)
     var hi = Int(Int64.MIN)
+    var vlo = Int(Int64.MAX)
+    var vhi = Int(Int64.MIN)
     for blk in range(nb):
-        lo = min(lo, Int(blo[blk]))
-        hi = max(hi, Int(bhi[blk]))
+        lo = min(lo, Int(blo[4 * blk]))
+        hi = max(hi, Int(blo[4 * blk + 1]))
+        vlo = min(vlo, Int(blo[4 * blk + 2]))
+        vhi = max(vhi, Int(blo[4 * blk + 3]))
     blo.free()
-    bhi.free()
     var D = hi - lo + 1
     if D <= 0 or D > max(1 << 26, 8 * n):          # keys too sparse for per-partition counters
         counter.free()
         return E_UNSORTED
+    var V = vhi - vlo + 1 if kb != 2 else 0
+    # V > 0 also rules out a range that overflowed (b spanning most of int64)
+    if V > 0 and V <= max(CD_DENSE_MIN, 2 * n) and D <= max(CD_DENSE_MIN, 2 * n) // V:
+        counter.free()
+        return _cd_dense(a, wa, b, wb, n, lo, D, vlo, V, nb, nt, O)
     var shift = 0
     while (D >> shift) > (1 << 12) and shift < CD_PART_KEYS_LOG:   # at most 4096 partitions...
         shift += 1
     while (D >> shift) > (1 << 16):                                # ...unless the range is huge
         shift += 1
     var P = ((D - 1) >> shift) + 1
+    if P < 2 * nt and nt > 1:                      # a few keys: one partition would take every row
+        counter.free()
+        return _cd_pairs(a, wa, b, kb, n, lo, D, nb, nt, O)
     var bc = unsafe_alloc[Int64](nb * P)
     counter[0] = 0
 
@@ -3755,6 +4022,7 @@ def _count_distinct_hash(a: Int, wa: Int, b: Int, kb: Int, n: Int, threads: Int,
     _par(copy, min(nt, P))
     O[0] = Int64(tot)
     O[1] = Int64(Int(arena))
+    O[2] = Int64(CD_PATH_KEYS)
     free_big(Int(ek))
     free_big(Int(ev))
     free_big(Int(er))

@@ -577,7 +577,41 @@ def _expr_cols(expr) -> set:
     return out
 
 
-def _analyze(plan: LogicalPlan) -> _Info:
+def count_distinct_shape(plan) -> bool:
+    """``Aggregate(Distinct(input), group_by=[a], aggs=[count(b) or count(literal)])``: one bare key
+    and one count over a whole-row distinct (``select(a, b).distinct().groupby(a)``)."""
+    if not isinstance(plan, Aggregate) or not isinstance(plan.input, Distinct) or plan.input.subset:
+        return False
+    if len(plan.group_by) != 1 or len(plan.aggs) != 1:
+        return False
+    k, agg = plan.group_by[0], plan.aggs[0]
+    if not isinstance(k, Expr) or k.op != "col" or k._alias not in (None, k.args[0]):
+        return False
+    if not isinstance(agg, Expr) or agg.op != "count" or not agg._alias:
+        return False
+    arg = agg.args[0]
+    return isinstance(arg, Expr) and arg.op in ("col", "lit") and not (arg.op == "col" and arg.args[0] == k.args[0])
+
+
+def _bare_pair(project, agg) -> bool:
+    """``project`` selects exactly the group key and the counted column, bare and not renamed (or
+    is an in-memory scan of just those two columns: the optimizer drops a select of every column)."""
+    if isinstance(project, Scan):
+        names = project.table.column_names
+        key, arg = agg.group_by[0].args[0], agg.aggs[0].args[0]
+        return len(names) == 2 and key in names and (arg.op == "lit" or arg.args[0] in names)
+    if not isinstance(project, Project) or len(project.exprs) != 2:
+        return False
+    names = []
+    for e in project.exprs:
+        if not isinstance(e, Expr) or e.op != "col" or e._alias not in (None, e.args[0]):
+            return False
+        names.append(e.args[0])
+    key, arg = agg.group_by[0].args[0], agg.aggs[0].args[0]
+    return key in names and len(set(names)) == 2 and (arg.op == "lit" or arg.args[0] in names)
+
+
+def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
     """Walk the plan once.
 
     ``walk`` returns whether the subtree contains a Project/Aggregate.  Expressions
@@ -603,6 +637,17 @@ def _analyze(plan: LogicalPlan) -> _Info:
                 info.use_plain(e, bare_ok=True)
             return True
         if isinstance(node, Aggregate):
+            src = node.input.input if isinstance(node.input, Distinct) else None
+            if count_distinct_codes and count_distinct_shape(node) and _bare_pair(src, node):
+                # COUNT(DISTINCT b) per a: distinct (a, b) pairs are the same on codes of one
+                # dictionary as on values, so both columns may stay encoded (F-046h)
+                if isinstance(src, Project):
+                    walk(src.input, False)
+                    info.refs.update(_expr_cols(src.exprs[0]) | _expr_cols(src.exprs[1]))
+                else:                                # the scan is the pair (select of every column)
+                    walk(src, False)
+                    info.refs.update(src.table.column_names)
+                return True
             walk(node.input, False)
             for e in node.group_by:
                 if e.op == "col":
@@ -787,7 +832,7 @@ def _single_table_shape(plan) -> bool:
     return isinstance(node, (Scan, ParquetScan))
 
 
-def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
+def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: bool = False) -> LogicalPlan:
     """Replace every ``ParquetScan`` by a ``Scan`` of just the needed columns.
 
     Also makes dictionary columns safe for the engine: a dictionary column stays a
@@ -795,6 +840,9 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
     ``col <cmp> literal`` / isin / startswith / contains filters (and the scan's
     columns are not passed through to the output, and there is no join); every
     other dictionary column is decoded to its plain type.
+
+    ``count_distinct_codes`` (device="cpu", where the native count reads codes): both columns of a
+    COUNT(DISTINCT b) per a stay dictionaries (F-046h); other devices get them decoded as before.
 
     With ``read=False`` nothing is read: each ``ParquetScan`` just records the
     ``columns`` and ``filters`` it would read (for ``explain``).
@@ -805,7 +853,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True) -> LogicalPlan:
                    for l in leaves)
     if not has_parquet and not has_dict:
         return plan
-    info = _analyze(plan)
+    info = _analyze(plan, count_distinct_codes)
     single = _single_table_shape(plan)
 
     def keepable(name: str, leaf) -> bool:

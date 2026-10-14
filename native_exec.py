@@ -480,24 +480,62 @@ def _call_count_distinct(lib, plan_addr: int, out_addr: int) -> int:
     return lib.mx_count_distinct(plan_addr, out_addr)
 
 
+CD_PATHS = ("runs", "key partitions", "byte map", "pair partitions")
+
+
+def _dict_codes(column):
+    """A dictionary column as (int32 codes of one dictionary without duplicates, that dictionary):
+    chunks with their own dictionaries are remapped to a unified one (F-046h). None with nulls."""
+    import numpy as np
+    from .np_arrow import array as _arr, to_numpy
+    if column.null_count:
+        return None
+    chunks = column.chunks if isinstance(column, pa.ChunkedArray) else [column]
+    if not chunks:
+        return None
+    unified, maps = _unified_dictionary([c.dictionary for c in chunks])
+    if unified.null_count:
+        return None
+    same = all(len(m) == len(unified) and bool((m == np.arange(len(m), dtype=np.int32)).all()) for m in maps)
+    if same and len(chunks) == 1 and chunks[0].indices.type == pa.int32():
+        return chunks[0].indices, unified
+    parts = [to_numpy(c.indices).astype(np.int32, copy=False) for c in chunks]
+    codes = np.concatenate([p if same else m[p] for p, m in zip(parts, maps)]) if parts else np.zeros(0, np.int32)
+    return _arr(np.ascontiguousarray(codes, dtype=np.int32)), unified
+
+
 def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str) -> Optional[pa.Table]:
     """``table.distinct().group_by(key).count(val)`` without the distinct table. A non-decreasing
     ``key`` (TPC-H lineitem by order key, and any filter of it) is counted run by run (F-023); any
-    other key by a radix-partitioned hash aggregate over the key's range (F-046b). Returns ``key``
-    (its own type) and ``name`` (int64) in key order; None when the key range is too sparse (past
-    max(2^26, 8 x rows)) or the columns do not fit (int32 / int64 key, int32 / int64 / utf8 value,
-    no nulls), so the caller's path answers."""
+    other key by a hash aggregate (F-046b): a byte per (key, value) when both ranges are small,
+    partitions by the pair's hash for a few keys, by key range otherwise (F-046h). Dictionary
+    columns count on their codes. Returns ``key`` (its own type; a dictionary key decoded) and
+    ``name`` (int64) in key order; None when the key range is too sparse (past max(2^26, 8 x rows))
+    or the columns do not fit (int32 / int64 / dictionary key, int32 / int64 / utf8 / dictionary
+    value, no nulls), so the caller's path answers."""
     if not enabled() or not available():
         return _decline("count distinct: native executor off")
     if getattr(compiler, "_device_arg", None) != "cpu":
         return _decline("count distinct: device='cpu'")
     a, b = table.column(key), table.column(val)
+    adict = bdict = None
+    if pa.types.is_dictionary(a.type):
+        got = _dict_codes(a)
+        if got is None:
+            return _decline("count distinct: column types or nulls")
+        a, adict = got
+    if pa.types.is_dictionary(b.type):
+        got = _dict_codes(b)
+        if got is None:
+            return _decline("count distinct: column types or nulls")
+        b = got[0]
     if a.type not in (pa.int32(), pa.int64()) or b.type not in _DISTINCT_KIND or a.null_count or b.null_count:
         return _decline("count distinct: column types or nulls")
     if table.num_rows < 1:
         return _decline("count distinct: empty input")
     import numpy as np
-    flat = [c.combine_chunks() if c.num_chunks != 1 else c.chunk(0) for c in (a, b)]
+    flat = [c.combine_chunks() if isinstance(c, pa.ChunkedArray) and c.num_chunks != 1
+            else c.chunk(0) if isinstance(c, pa.ChunkedArray) else c for c in (a, b)]
     structs = []
     try:
         for arr in flat:
@@ -505,10 +543,10 @@ def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str)
             arr._export_to_c(ctypes.addressof(st))
             structs.append(st)
         from .pipeline_kernels import default_threads
-        P = (ctypes.c_int64 * 6)(CMAGIC, ctypes.addressof(structs[0]), 0 if a.type == pa.int32() else 1,
+        P = (ctypes.c_int64 * 6)(CMAGIC, ctypes.addressof(structs[0]), 0 if flat[0].type == pa.int32() else 1,
                                  ctypes.addressof(structs[1]), _DISTINCT_KIND[b.type],
                                  default_threads(table.num_rows))
-        O = (ctypes.c_int64 * 2)()
+        O = (ctypes.c_int64 * 3)()
         lib = _load()
         rc = _call_count_distinct(lib, ctypes.addressof(P), ctypes.addressof(O))
     finally:
@@ -524,10 +562,14 @@ def try_count_distinct(compiler, table: pa.Table, key: str, val: str, name: str)
     buf = pa.foreign_buffer(int(O[1]), 16 * n, base=owner)
     keys = pa.Array.from_buffers(pa.int64(), n, [None, buf], offset=0)
     cnts = pa.Array.from_buffers(pa.int64(), n, [None, buf], offset=n)
-    if a.type == pa.int32():
-        from ._lazy_pc import pc
+    from ._lazy_pc import pc
+    if adict is not None:                      # codes -> values, in value order (as when decoded first)
+        keys = pc.take(adict, keys)
+        order = pc.sort_indices(keys)
+        keys, cnts = pc.take(keys, order), pc.take(cnts, order)
+    elif a.type == pa.int32():
         keys = pc.cast(keys, pa.int32())
-    _last.update(path="native", decline=None)
+    _last.update(path="native", decline=None, cd_path=CD_PATHS[int(O[2])] if 0 <= int(O[2]) < 4 else None)
     return pa.table({key: keys, name: cnts})
 
 

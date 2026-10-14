@@ -1372,31 +1372,57 @@ class CustomOpsCompiler(GraphCompiler):
         """``Aggregate(Distinct(two columns a, b), group_by=[a], aggs=[count(b) or count(*)])``
         (TPC-H Q21's suppliers per order) as one native pass when ``a`` is sorted (F-023): no
         distinct table, no second group-by. Returns a Scan of the result, an equivalent plan when
-        the native call declines (the distinct input computed once), or None for other shapes."""
-        if _native_exec is None or not isinstance(plan.input, Distinct) or plan.input.subset:
-            return None
-        if not _native_exec.enabled() or getattr(self, "_device_arg", None) != "cpu":
-            return None                    # GPU / auto / executor off: the plan as it was
-        if len(plan.group_by) != 1 or len(plan.aggs) != 1:
+        the native call declines (the distinct input computed once), or None for other shapes.
+        The plan's dictionary columns arrive here as codes (io_parquet keeps both columns of this
+        shape encoded, F-046h): the native call counts codes, every other path decodes them first."""
+        from .io_parquet import count_distinct_shape
+        if not count_distinct_shape(plan):
             return None
         k, agg = plan.group_by[0], plan.aggs[0]
-        if k.op != "col" or k._alias not in (None, k.args[0]) or agg.op != "count" or not agg._alias:
-            return None
         key, arg = k.args[0], agg.args[0]
-        if not isinstance(arg, Expr) or (arg.op == "col" and arg.args[0] == key) or arg.op not in ("col", "lit"):
-            return None
-        table = self.compile_and_run(plan.input.input)
+        table = self._count_distinct_input(plan.input.input)
         names = table.column_names
         other = [c for c in names if c != key]
+
+        def equivalent():
+            plain = _decode_deferred_cols(table, set(names))
+            return Aggregate(Scan(self.compile_and_run(Distinct(Scan(plain), None))), plan.group_by, plan.aggs)
+
+        if (_native_exec is None or not _native_exec.enabled()
+                or getattr(self, "_device_arg", None) != "cpu"):
+            return equivalent()            # GPU / auto / executor off: the distinct table as before
         if len(names) != 2 or len(other) != 1 or (arg.op == "col" and arg.args[0] != other[0]):
-            return Aggregate(Scan(self.compile_and_run(Distinct(Scan(table), None))), plan.group_by, plan.aggs)
+            return equivalent()
         try:
             res = _native_exec.try_count_distinct(self, table, key, other[0], agg._alias)
         except Exception as exc:          # never fail the query: the equivalent plan answers
             res = _native_exec._decline(f"count distinct raised {type(exc).__name__}: {exc}")
         if res is None:
-            return Aggregate(Scan(self.compile_and_run(Distinct(Scan(table), None))), plan.group_by, plan.aggs)
+            return equivalent()
         return Scan(res)
+
+    def _count_distinct_input(self, project):
+        """The (a, b) rows under a count-distinct, with dictionary columns still as codes when
+        they come straight from a scan or a join's output (a bare Project would decode them)."""
+        node = self._materialize_joins(project)
+        if isinstance(node, Scan):
+            return node.table
+        if (_native_exec is not None and isinstance(node, Project)
+                and all(isinstance(e, Expr) and e.op == "col" and e._alias in (None, e.args[0]) for e in node.exprs)):
+            names = [e.args[0] for e in node.exprs]
+            src, preds = self._scan_of(node)
+            if src is not None and all(n in src.table.column_names for n in names):
+                t = src.table
+                if not preds:
+                    return t.select(names)
+                keep = {n for n in names if pa.types.is_dictionary(t.schema.field(n).type)}
+                try:
+                    got = _native_exec.try_filter(self, t, preds, set(names), keep_dict=keep)
+                except Exception:
+                    got = None
+                if got is not None:
+                    return got.select(names)
+        return self.compile_and_run(node)
 
     def _lower_row_ops(self, plan, top: bool = True):
         """Execute Sort/Limit/Distinct/Tail nodes that sit below a Filter/Project/Aggregate.

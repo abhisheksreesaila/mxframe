@@ -262,7 +262,7 @@ class LazyFrame:
                 for line in opt.trace:
                     print(f"  - {line}")
 
-        plan = resolve_plan(plan)
+        plan = resolve_plan(plan, count_distinct_codes=(device == "cpu"))
         if validate:
             from .plan_validation import validate_plan_or_raise
             validate_plan_or_raise(plan)
