@@ -1,8 +1,8 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
 from ._atomic import Atomic
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
@@ -123,7 +123,7 @@ def _join_count_gpu(
     )
 
 
-@compiler.register("join_count_cpu")
+@register("join_count_cpu")
 struct JoinCountCPU:
     """CPU-only join count kernel (3 inputs, 1 output)."""
 
@@ -143,7 +143,7 @@ struct JoinCountCPU:
             raise Error("join_count_cpu: only CPU target supported")
 
 
-@compiler.register("join_count_gpu")
+@register("join_count_gpu")
 struct JoinCountGPU:
     """GPU join count kernel with pre-allocated right_count buffer."""
 

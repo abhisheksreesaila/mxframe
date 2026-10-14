@@ -16,7 +16,7 @@ import polars as pl
 from scripts.benchmark_tpch import (
     make_lineitem,
     make_tpch_q3_tables, make_tpch_q12_tables, make_tpch_q14_tables,
-    make_tpch_q5_tables, make_tpch_q10_tables,
+    make_tpch_q5_tables, make_tpch_q10_tables, make_synthetic_supplier,
     make_tpch_q7_tables, make_tpch_q8_tables,
     make_tpch_q13_tables, make_tpch_q19_tables,
     make_tpch_q4_tables, make_tpch_q9_tables,
@@ -98,6 +98,9 @@ def t(fn, warmup=1, runs=3, synchronize=False):
     except Exception as e:
         return f"ERR:{str(e)[:40]}"
 
+SYN_SUP = make_synthetic_supplier()      # Q5 / Q8 need a supplier table (their lineitem has l_suppkey)
+
+
 def bench_scale(N, s=1, selected=None, output=None, rapids_only=False, engine=None):
     selected = set(selected or ALL_QUERIES)
     print(f"\n{'='*75}\n  Benchmarking at {N:,} rows  (scale factor s={s})\n{'='*75}")
@@ -175,10 +178,10 @@ def bench_scale(N, s=1, selected=None, output=None, rapids_only=False, engine=No
         2:("Min Cost Supplier",lambda:run_q2_mxframe(*data[2],"cpu"),lambda:run_q2_mxframe(*data[2],"gpu"),lambda:run_q2_polars(*data[2]),lambda:run_q2_pandas(*data[2])),
         3:("3-Table Join+Agg",lambda:run_q3_mxframe(*data[3],"cpu"),lambda:run_q3_mxframe(*data[3],"gpu"),lambda:run_q3_polars(*data[3]),lambda:run_q3_pandas(*data[3])),
         4:("Order Priority",lambda:run_q4_mxframe(*data[4],"cpu"),lambda:run_q4_mxframe(*data[4],"gpu"),lambda:run_q4_polars(*data[4]),lambda:run_q4_pandas(*data[4])),
-        5:("Multi-Join+GroupBy",lambda:run_q5_mxframe(*data[5],"cpu"),lambda:run_q5_mxframe(*data[5],"gpu"),lambda:run_q5_polars(*data[5]),lambda:run_q5_pandas(*data[5])),
+        5:("Multi-Join+GroupBy",lambda:run_q5_mxframe(*data[5],"cpu",supplier=SYN_SUP),lambda:run_q5_mxframe(*data[5],"gpu",supplier=SYN_SUP),lambda:run_q5_polars(*data[5],supplier=SYN_SUP),lambda:run_q5_pandas(*data[5],supplier=SYN_SUP)),
         6:("Masked GlobalAgg",lambda:run_q6_mxframe(data["li"],"cpu"),lambda:run_q6_mxframe(data["li"],"gpu"),lambda:run_q6_polars(data["li"]),lambda:run_q6_pandas(data["li"])),
         7:("Shipping Volume",lambda:run_q7_mxframe(*data[7],"cpu"),lambda:run_q7_mxframe(*data[7],"gpu"),lambda:run_q7_polars(*data[7]),lambda:run_q7_pandas(*data[7])),
-        8:("Market Share",lambda:run_q8_mxframe(*data[8],"cpu"),lambda:run_q8_mxframe(*data[8],"gpu"),lambda:run_q8_polars(*data[8]),lambda:run_q8_pandas(*data[8])),
+        8:("Market Share",lambda:run_q8_mxframe(*data[8],"cpu",supplier=SYN_SUP),lambda:run_q8_mxframe(*data[8],"gpu",supplier=SYN_SUP),lambda:run_q8_polars(*data[8],supplier=SYN_SUP),lambda:run_q8_pandas(*data[8],supplier=SYN_SUP)),
         9:("Product Profit",lambda:run_q9_mxframe(*data[9],"cpu"),lambda:run_q9_mxframe(*data[9],"gpu"),lambda:run_q9_polars(*data[9]),lambda:run_q9_pandas(*data[9])),
         10:("Customer Revenue",lambda:run_q10_mxframe(*data[10],"cpu"),lambda:run_q10_mxframe(*data[10],"gpu"),lambda:run_q10_polars(*data[10]),lambda:run_q10_pandas(*data[10])),
         11:("Important Stock",lambda:run_q11_mxframe(*data[11],"cpu"),lambda:run_q11_mxframe(*data[11],"gpu"),lambda:run_q11_polars(*data[11]),lambda:run_q11_pandas(*data[11])),

@@ -19,12 +19,12 @@ Usage in the MAX Graph compiler (Python side):
 Both kernels are dispatched via ops.custom().
 """
 
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import block_dim, block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu import block_dim, block_idx, thread_idx, barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime val_dtype = DType.float32
@@ -159,7 +159,7 @@ def _prefix_sum_count_gpu(
     )
 
 
-@compiler.register("prefix_sum_count")
+@register("prefix_sum_count")
 struct PrefixSumCount:
     @staticmethod
     def execute[
@@ -224,7 +224,7 @@ def _filter_gather_f32_gpu(
     )
 
 
-@compiler.register("filter_gather_f32")
+@register("filter_gather_f32")
 struct FilterGatherF32:
     @staticmethod
     def execute[

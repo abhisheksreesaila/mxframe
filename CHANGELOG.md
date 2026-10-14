@@ -5,6 +5,92 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+## [0.6.0] — 2026-10-14
+
+The CPU engine is now a native Mojo executor: one call per query stage runs the scan, filter,
+joins and aggregate over Arrow memory, compiled ahead of time. Engine-only TPC-H and a seeded
+random-query suite are the benchmarks, with every result checked against DuckDB. Numbers and the
+story behind each step: `docs/optimizations.md`.
+
+### 🧠 Native Mojo executor (F-030, F-031, M2a–M2n)
+- One native call (`libmxexec_cpu.so`, over the Arrow C Data Interface) runs a whole plan stage: a
+  bytecode interpreter for predicates and expressions, group-by specialized at compile time
+  (direct-mapped, compacted or hashed keys), and joins fused into the scan as lookups (star joins
+  in one pass, semi / anti joins without a DISTINCT, nested stars).
+- Native DISTINCT, ORDER BY ... LIMIT (per-worker heaps), WHERE-only filters, `str_slice` and
+  utf8 `isin`, COUNT(DISTINCT) on sorted runs.
+- One thread per physical core; fewer workers for small inputs; no `pyarrow.compute` or pandas
+  import on the query path; the Mojo runtime loads once.
+
+### ⚡ Closing the gaps to DuckDB (F-043, F-046)
+- Millions of groups aggregate into one shared output behind a per-worker cache; keys double as
+  ORDER BY tie-breaks; a runtime join filter for large semi-join partners.
+- Dictionary strings stay as codes through joins, single-table filters, SELECT DISTINCT and
+  COUNT(DISTINCT), and are decoded only for the rows that reach the output.
+- COUNT(DISTINCT) on unsorted keys: a byte map for small key x value ranges, hash partitions by
+  key range or by (key, value) pair, so few keys no longer stall on one worker.
+- WHERE + ORDER BY + LIMIT in one pass (`mx_filter_topk`).
+
+### 📥 Parquet, SQL and planning
+- `mx.scan_parquet` / `mx.read_parquet_table` with projection and filter pushdown and dictionary
+  strings (F-010, F-017); `mx.sql` front end on sqlglot (joins of every side, aliases, GROUP BY
+  keys by alias, F-041); `device="auto"` planner with explain and fallback (F-005).
+- Fixed: a group-by on an aliased column (F-040); a SQL `SELECT` alias on a group key (F-041).
+
+### 📊 Benchmarks
+- Engine-only TPC-H scoreboard (`scripts/bench_user_felt.py --mode engine`, also `--shuffle`d
+  rows) and a seeded random-query suite (`scripts/bench_random/`) rendered for MXFrame, Polars and
+  DuckDB, all checked against DuckDB. DuckDB's lazy pyarrow import is now staged like every
+  engine's import (it had inflated DuckDB's times).
+
+
+### 🔗 Join engine: lean, reordered, late-materialized (F-018)
+- **New `join_engine.py`.** A chain of inner joins is flattened into leaves (the inputs, filtered and cut to the columns the query reads) and key edges, joined in an order chosen from the leaves' real post-filter row counts (small filtered sides first, the larger side probes and the smaller builds), and carried as row-index vectors: a join gathers only the key columns it compares and composes the indices, every output column is gathered once at the end. Output column names and order are exactly those of the joins as written; left joins are barriers (their two sides are executed on their own). A `Filter` comparing columns of two leaves between joins (TPC-H Q5) is applied as soon as its leaves meet.
+- **Projection pushdown through joins:** each `Join` produces only the columns read above it (through `Filter`, `Project`, `Sort`, `Aggregate`, `Distinct`).
+- **Optimizer:** a filter is now optimized before the Parquet sources are read, so a predicate moved below a join lands on its `ParquetScan` and is applied while decoding (F-017). A disjunction across both sides of a join (`(a.x = 1 AND b.y = 2) OR (a.x = 3 AND b.y = 4)`, Q7, Q19) pushes what it implies to each side (`a.x IN (1, 3)`); the exact predicate stays above the join.
+- **Join keys:** a composite integer key joins on its widest column and checks the others on the matching pairs (dictionary-encoding 11M `(partkey, suppkey)` pairs took 2 s); sparse integer keys up to 32x the row count use the direct-address join instead of hashing every row into a dictionary; the prefilter kernel `libmxjoin_cpu.so` (`kernels_aot/joinsemi_cpu.mojo`) drops probe rows whose key is not in a small build side with a cache-resident bitmap before the table join (456K orders against 60M lineitem rows: 0.57 s to 0.25 s); NumPy passes over long key arrays run on several threads.
+- Strings of a small joined side (`n_name` of 25 nations over millions of rows) are gathered as dictionary codes when the consumer above is a filter, projection or aggregate.
+- A one-shot gather after a GPU join runs on the CPU (0.12 s against 0.5 s for 3.3M rows x 6 columns: the GPU one uploads its sources and downloads the result).
+- **Fixed:** the composite group id of two or more high-cardinality keys was `int32` and wrapped around, merging distinct groups (`Distinct` on `(l_orderkey, l_suppkey)` dropped 3,080 of 6M rows, TPC-H Q21 was wrong); it is `int64`, with a rank-fold fallback beyond 2^62 combinations. `count(col)` of a right-side column after a left join counts unmatched rows as 0 (regression test). `np_arrow.take_rows` no longer imports pandas for string columns.
+- **Optimizer, projection pushdown:** a new pass `prune_unused_columns` drops the outputs of a `Project` that its parent does not read. `with_columns` passes every input column through, so after a join it named every column of both tables, and `resolve_plan` read them all from Parquet (TPC-H Q8 SF10: 16 lineitem columns, 5.4 s of reading instead of 5 columns, 0.8 s).
+- **Join output limit:** the join kernels index their output with int32 offsets; a many-to-many join with more than 2,147,483,647 output rows (two 46,500-row tables on one key) wrote through wrapped offsets and segfaulted in `join_scatter`. It now raises `MemoryError` before any allocation. (The GPU join's prefix sum is int32 as well and is not guarded.)
+- New `MXFRAME_JOIN_TRACE=1` prints one line per join step (rows in and out, time of the key, encode, join and compose stages).
+
+### ✅ Correctness against DuckDB: counts, nulls, TPC-H queries (F-011)
+- **Counts** are exact `int64` on every path (grouped and global, fused and legacy, empty results); the fused path used to return float64 and the GPU count kernel saturates at 2^24 per group (the host now counts labels).
+- **Nulls follow SQL.** An aggregate that reads a column with nulls runs on Arrow's hash aggregate: a null group key is its own group, `sum/mean/min/max/count` skip null values, a comparison with null is not true, `AND`/`OR` are three-valued, a null `CASE` condition takes `ELSE`. Sorting with null keys puts them last (it raised `IndexError`).
+- A `Sort/Limit/Distinct/Tail` below a `Filter/Project/Aggregate` is applied first (a `Limit` under an `Aggregate` was ignored).
+- Join keys of different integer (or float) widths are cast to the wider type instead of raising; the join-result cache is keyed by device; the GPU gather no longer rounds `float64` columns to `float32` (it moves the 8-byte words) and defers nulls / other widths to Arrow.
+- A numeric literal next to a `float32` column is compared in `float32` on every path (`l_discount <= 0.07` dropped the rows equal to 0.07 on the unfused paths); `case_when` values are `float64` on the CPU; `min`/`max` of a group of only ±inf returns that infinity on the legacy AOT paths.
+- New `Expr.year_of_days()` for day-number date columns (`year()` reads YYYYMMDD integers).
+- **TPC-H benchmark queries** (`scripts/benchmark_tpch.py`) follow the TPC-H text and use day-number dates (Q4, Q5, Q7, Q8, Q10, Q15, Q20 returned no rows on real Parquet; Q12's date constants were 5 days off; Q19 lacked the ship mode/instruction filter, Q13 the comment filter, Q21 the EXISTS clause). Q5 and Q8 need the supplier table: `supplier=` keyword. The pandas and Polars versions changed with them.
+- `scripts/gen_tpch_parquet.py` casts DECIMAL to `float32` through `float64` (nearest); the direct cast truncated 0.05 to 0.049999997 and TPC-H Q6 came out 28% low. Regenerated data lives in `data/tpch_sf{1,10}_exact`.
+- **GPU memory pool:** `mxframe.aot_kernels` defaults `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT` to 25 (the Mojo runtime otherwise reserves ~90% of free GPU memory at the first kernel-side buffer and our own allocations ran out at SF10). It is process-wide, respects a value you set, and is documented in the README. `hash_join` raises instead of returning an empty join if its prefix sum is 0 over non-zero match counts.
+- Join outputs never hold two columns of one name: a right-side column whose name is taken is renamed `<name>_right` (`_right2`, ...), for inner and left joins; the optimizer's filter pushdown uses the same names.
+- `tests/test_tpch_duckdb.py`: all 22 queries against DuckDB (official SQL over the same Parquet files) on `cpu`, `gpu` and `auto`, plus the pandas/Polars baselines.
+
+### 🩺 Kernel health: GPU crashes, hangs and per-call overhead (F-012)
+- **GPU grouped aggregates** (`group_sum/min/max/count`): grid-stride kernels sized to the GPU with a block-private table in dynamic shared memory sized to the real group count (up to 12,288 groups) or straight global atomics beyond it. `group_min`/`group_max` no longer fault above 8,192 groups. The big win was in `_atomic.mojo`: atomics were `seq_cst`, which made NVPTX put a fence around every atomic; they are `monotonic` now (CUDA `atomicAdd` semantics). 30M rows, resident input: 8 to 4,096 groups went from 44 to 610 ms down to about 1 to 3 ms.
+- Skewed high-cardinality group-bys no longer collapse: a float `atomicrmw fadd` lowers to a compare-exchange loop, so a hot group cost O(k^2) retries (10M rows / 100k groups with one key at 25%: 40 s). The global path for sum/count now uses native `red.global.add.f32` and combines equal groups within a warp first (`match.any`); Zipf(1.3) is within 1.5x of uniform.
+- GPU wrappers bind the CUDA context to the calling thread, so the Router's GPU worker thread can call them.
+- **GPU `group_encode_i32`** no longer hangs (spin-wait on plain loads could read a stale L1 line) and accepts every int32 key including `INT32_MIN`. The Q21 hash-table kernel had the same spin-wait and was fixed the same way.
+- **GPU sort** is stable, correct for any length (the old network skipped out-of-range partners, so any non-power-of-two length could come back out of order), ascending or descending, and about 2.6x faster (64-bit key|row words, shared-memory tiles). Multi-key composite sort keys no longer overflow int32 (also fixed on the CPU path).
+- **GPU hash join** runs its prefix sums and the right-side argsort on the device.
+- **Device-resident chaining:** the `AOTKernelsGPU` wrappers take `DeviceArray` inputs (`DeviceArray.borrow(ptr, dtype, n)` for residency-tracker or stager pointers) and `device_out=True` to leave results on the device. NumPy signatures are unchanged.
+- **CPU `sort_indices`** is a stable parallel LSD radix sort for int32/int64/float32/float64 keys (10M rows: about 60 ms, was O(n^2) and hung at 10,000 rows); `unique_mask`, `prefix_sum_count` and `filter_gather_*` are parallel. Kernel ABI version 3 (these gained the trailing `threads` argument).
+- Auto mode no longer treats the GPU sort as broken; the GPU calibration probe for `group_encode` is enabled and the min/max group-count limit is gone.
+
+### ⚡ Multi-core CPU kernels with float64 accumulation (F-002)
+- CPU AOT kernels (`libmxkernels_aot.so`) now run on all cores: grouped sum/min/max/mean/count, masked global sum/min/max/sum-product (SIMD), join build/probe/scatter, gather, and group-key composition. Grouped kernels use per-worker partial arrays merged in parallel; the join build is parallel by key range.
+- Sums and means accumulate in **float64** and return float64 (counts are exact). At TPC-H SF10 the float32 accumulators were off by up to 4.6% (counts by 42%); Q1-style grouped sums now match DuckDB summing the same float32 values as doubles to ~1e-14 relative.
+- Compound aggregate expressions (`price * (1 - discount)`) are evaluated in float64 on the CPU path.
+- New thread budget: env `MXFRAME_CPU_THREADS` (default: all cores), `mxframe.set_cpu_threads(n)` / `mxframe.get_cpu_threads()`, and a per-call `threads=` on every `AOTKernels` method. The library keeps no global state, so several Python threads can call kernels at once.
+- The exported symbols gained a trailing `threads` argument (ABI version 2); a stale `.so` is rejected with a clear error. `device="gpu"` is untouched.
+
+---
+
 ## [0.5.0] — 2026-07-11
 
 Full narrative: [v0.5.0 release notes](RELEASE_NOTES_0.5.0.md).

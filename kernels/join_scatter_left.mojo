@@ -1,7 +1,7 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
@@ -99,7 +99,7 @@ def _join_scatter_left_gpu(
         block_dim=BLOCK_SIZE,
     )
 
-@compiler.register("join_scatter_left_cpu")
+@register("join_scatter_left_cpu")
 struct JoinScatterLeftCPU:
     @staticmethod
     def execute[target: StaticString](
@@ -116,7 +116,7 @@ struct JoinScatterLeftCPU:
         else:
             raise Error("join_scatter_left_cpu: only CPU target supported")
 
-@compiler.register("join_scatter_left_gpu")
+@register("join_scatter_left_gpu")
 struct JoinScatterLeftGPU:
     @staticmethod
     def execute[target: StaticString](

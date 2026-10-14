@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MXFrame Auto Mode</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+/* Layout: a single reading column of explainer prose, with full-width diagram panels drawn as SVG lanes (CPU / link / GPU) — like a ledger of where each millisecond went. */
+:root {
+  --font-mono: 'Space Mono', 'Courier New', monospace;
+  --font-sans: 'Inter', 'Helvetica Neue', sans-serif;
+  --bg: #0D0D14; --surface: #13131E; --surface-2: #1A1A28; --border: #252538; --border-hi: #32324C;
+  --accent: #7C3AED; --accent-hi: #9D5CF5; --accent-dim: rgba(124,58,237,.18);
+  --cpu: #2DD4BF; --cpu-dim: rgba(45,212,191,.16);
+  --green: #34D399; --green-dim: rgba(52,211,153,.15);
+  --red: #F87171; --red-dim: rgba(248,113,113,.15);
+  --yellow: #FBBF24; --yellow-dim: rgba(251,191,36,.15);
+  --text: #F5F5FF; --text-mid: #C0C0DC; --text-dim: #8E8EAE;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #F2EFE7; --surface: #FFFDF8; --surface-2: #F8F4EB; --border: #D8D0C2; --border-hi: #BEB4A4;
+    --accent: #6C3E78; --accent-hi: #512B5C; --accent-dim: rgba(108,62,120,.13);
+    --cpu: #0F766E; --cpu-dim: rgba(15,118,110,.12);
+    --green: #18704F; --green-dim: rgba(24,112,79,.12); --red: #B43C3C; --red-dim: rgba(180,60,60,.12);
+    --yellow: #9A6418; --yellow-dim: rgba(154,100,24,.12);
+    --text: #20221F; --text-mid: #4C5049; --text-dim: #6E716A; color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #F2EFE7; --surface: #FFFDF8; --surface-2: #F8F4EB; --border: #D8D0C2; --border-hi: #BEB4A4;
+  --accent: #6C3E78; --accent-hi: #512B5C; --accent-dim: rgba(108,62,120,.13);
+  --cpu: #0F766E; --cpu-dim: rgba(15,118,110,.12);
+  --green: #18704F; --green-dim: rgba(24,112,79,.12); --red: #B43C3C; --red-dim: rgba(180,60,60,.12);
+  --yellow: #9A6418; --yellow-dim: rgba(154,100,24,.12);
+  --text: #20221F; --text-mid: #4C5049; --text-dim: #6E716A; color-scheme: light;
+}
+body { background: var(--bg); color: var(--text); font-family: var(--font-sans); font-size: 15px; line-height: 1.7; }
+.wrap { max-width: 920px; margin: 0 auto; padding-inline: 20px; padding-block: 40px 72px; display: flex; flex-direction: column; gap: 44px; }
+.kicker { font-family: var(--font-mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--accent-hi); }
+h1 { font-family: var(--font-mono); font-size: clamp(26px, 5vw, 38px); line-height: 1.15; margin: 6px 0 12px; letter-spacing: -.01em; text-wrap: balance; }
+h2 { font-family: var(--font-mono); font-size: 18px; margin: 0 0 6px; text-wrap: balance; }
+p { margin: 0; max-width: 68ch; color: var(--text-mid); }
+p strong, li strong { color: var(--text); font-weight: 600; }
+section { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.lede { font-size: 17px; color: var(--text-mid); }
+.note { border: 1px solid var(--border-hi); background: var(--surface); border-radius: 10px; padding: 16px 18px; display: grid; gap: 8px; }
+.note .tag { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--yellow); }
+.pairs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.pair { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; display: grid; gap: 6px; min-width: 0; }
+.pair .h { font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); }
+.pair.no .h { color: var(--red); } .pair.yes .h { color: var(--green); }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px; overflow-x: auto; }
+.panel svg { display: block; min-width: 680px; width: 100%; height: auto; }
+.cap { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim); letter-spacing: .02em; }
+ol.steps { margin: 0; padding-left: 22px; display: grid; gap: 8px; max-width: 70ch; color: var(--text-mid); }
+ol.steps li::marker { font-family: var(--font-mono); color: var(--accent-hi); }
+ul.plain { margin: 0; padding-left: 20px; display: grid; gap: 6px; max-width: 70ch; color: var(--text-mid); }
+code { font-family: var(--font-mono); font-size: 13px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; color: var(--text); }
+.num { font-variant-numeric: tabular-nums; }
+/* SVG text + marks from tokens */
+.t { font-family: var(--font-mono); font-size: 12px; fill: var(--text-mid); }
+.t-sm { font-family: var(--font-mono); font-size: 10.5px; fill: var(--text-dim); }
+.t-b { font-family: var(--font-mono); font-size: 12.5px; font-weight: 700; fill: var(--text); }
+.box { fill: var(--surface-2); stroke: var(--border-hi); stroke-width: 1; }
+.box-acc { fill: var(--accent-dim); stroke: var(--accent); stroke-width: 1.2; }
+.box-cpu { fill: var(--cpu-dim); stroke: var(--cpu); stroke-width: 1.2; }
+.box-green { fill: var(--green-dim); stroke: var(--green); stroke-width: 1.2; }
+.box-red { fill: var(--red-dim); stroke: var(--red); stroke-width: 1.2; }
+.box-yel { fill: var(--yellow-dim); stroke: var(--yellow); stroke-width: 1.2; }
+.edge { stroke: var(--text-dim); stroke-width: 1.3; fill: none; }
+.edge-red { stroke: var(--red); stroke-width: 1.3; fill: none; stroke-dasharray: 4 3; }
+.grid-l { stroke: var(--border); stroke-width: 1; }
+.lane-l { fill: var(--surface-2); }
+.fill-cpu { fill: var(--cpu); } .fill-gpu { fill: var(--accent); } .fill-link { fill: var(--yellow); } .fill-dim { fill: var(--border-hi); }
+.bar-cpu { fill: var(--cpu); } .bar-gpu { fill: var(--accent); } .bar-mix { fill: var(--green); } .bar-bad { fill: var(--red); }
+.ah { fill: var(--text-dim); } .ah-red { fill: var(--red); }
+@media (prefers-reduced-motion: no-preference) { .pulse { animation: p 2.4s ease-in-out infinite; } @keyframes p { 50% { opacity: .55; } } }
+</style>
+<style>body{margin:0}</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <div class="kicker">mxframe · device="auto" · as built 2026-09-30</div>
+    <h1>MXFrame Auto Mode</h1>
+    <p class="lede">What the engine does when you call <code>compute(device="auto")</code> on a machine with a CPU and a GPU, drawn from the code on the <code>auto-mode</code> branch and the numbers measured on the reference box (Ryzen 9 5900X, 24 threads; RTX 3090 on PCIe 4.0 x8).</p>
+  </header>
+
+  <section>
+    <h2>The short version</h2>
+    <div class="pairs">
+      <div class="pair no"><div class="h">What it does not do</div><p>Stream every query's rows through a shared morsel queue to the CPU and the GPU at once. That scheduler is built and tested (<code>coproc.run_router</code>), but it lost on this hardware: moving host data over the link is slower than all 24 cores reading RAM.</p></div>
+      <div class="pair yes"><div class="h">What it does</div><p>Picks the cheaper device per query from measured costs, runs first scans on the CPU, copies hot columns to the GPU in the background, and on later queries splits the rows: the GPU takes its resident slice while every CPU core takes the rest, at the same time.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>1 · Every query: plan, price, place</h2>
+    <p>Before running anything, auto mode rewrites the plan and prices it on each device using this machine's calibration (<code>mx.calibrate()</code>: per-kernel cost fits, link bandwidth, GPU start-up). Filters and copies to the GPU count against the GPU; the GPU has to win by 10% or the CPU runs it.</p>
+    <div class="panel" role="img" aria-label="Flow: query, optimizer, cost model, device choice, CPU or GPU path, fallback from GPU error to CPU">
+      <svg viewBox="0 0 860 300">
+        <defs>
+          <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah"/></marker>
+          <marker id="ar" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah-red"/></marker>
+        </defs>
+        <rect x="10" y="110" width="120" height="70" rx="8" class="box"/>
+        <text x="70" y="140" text-anchor="middle" class="t-b">your query</text>
+        <text x="70" y="160" text-anchor="middle" class="t-sm">LazyFrame</text>
+
+        <rect x="165" y="95" width="170" height="100" rx="8" class="box"/>
+        <text x="250" y="122" text-anchor="middle" class="t-b">optimizer</text>
+        <text x="250" y="143" text-anchor="middle" class="t-sm">filters below joins</text>
+        <text x="250" y="160" text-anchor="middle" class="t-sm">only needed columns</text>
+        <text x="250" y="177" text-anchor="middle" class="t-sm">join order by size</text>
+
+        <rect x="370" y="80" width="180" height="130" rx="8" class="box-acc"/>
+        <text x="460" y="106" text-anchor="middle" class="t-b">cost model</text>
+        <text x="460" y="128" text-anchor="middle" class="t-sm">T = α + c·rows</text>
+        <text x="460" y="145" text-anchor="middle" class="t-sm">+ bytes ÷ link GB/s</text>
+        <text x="460" y="162" text-anchor="middle" class="t-sm">+ GPU start-up left</text>
+        <text x="460" y="184" text-anchor="middle" class="t-sm">&lt; 200K rows → CPU</text>
+
+        <rect x="600" y="30" width="245" height="95" rx="8" class="box-cpu"/>
+        <text x="722" y="58" text-anchor="middle" class="t-b">CPU plan</text>
+        <text x="722" y="80" text-anchor="middle" class="t-sm">fused kernel, 24 threads</text>
+        <text x="722" y="98" text-anchor="middle" class="t-sm">may co-process (section 2)</text>
+        <text x="722" y="115" text-anchor="middle" class="t-sm">most queries land here</text>
+
+        <rect x="600" y="175" width="245" height="95" rx="8" class="box-acc"/>
+        <text x="722" y="203" text-anchor="middle" class="t-b">GPU plan</text>
+        <text x="722" y="225" text-anchor="middle" class="t-sm">AOT kernels, no JIT</text>
+        <text x="722" y="243" text-anchor="middle" class="t-sm">when it wins by ≥ 10%</text>
+        <text x="722" y="261" text-anchor="middle" class="t-sm">incl. copies</text>
+
+        <path d="M130,145 H163" class="edge" marker-end="url(#a)"/>
+        <path d="M335,145 H368" class="edge" marker-end="url(#a)"/>
+        <path d="M550,125 C575,125 575,78 598,78" class="edge" marker-end="url(#a)"/>
+        <path d="M550,165 C575,165 575,222 598,222" class="edge" marker-end="url(#a)"/>
+        <path d="M845,222 C858,222 858,90 847,90" class="edge-red" marker-end="url(#ar)"/>
+        <text x="836" y="160" text-anchor="end" class="t-sm" style="fill: var(--red)">GPU error → rerun on CPU</text>
+      </svg>
+    </div>
+    <div class="cap">A CUDA error also switches the GPU off for the rest of the process; any GPU path not verified against DuckDB is never chosen.</div>
+  </section>
+
+  <section>
+    <h2>2 · One session: how the GPU gets involved</h2>
+    <p>The GPU pays off once the data already lives there. So the first scan of a table runs on the CPU, and once no query has run for 0.1 s the table's columns are copied to the GPU in the background, so back-to-back queries in a script finish first. The copy pauses whenever another query is running. From then on, a repeat query over that table splits its rows between both devices.</p>
+    <div class="panel" role="img" aria-label="Timeline of four queries across CPU, link and GPU lanes">
+      <svg viewBox="0 0 860 250">
+        <text x="12" y="62" class="t-b">CPU</text>
+        <text x="12" y="122" class="t-b">link</text>
+        <text x="12" y="182" class="t-b">GPU</text>
+        <rect x="70" y="40" width="780" height="36" rx="4" class="lane-l"/>
+        <rect x="70" y="100" width="780" height="36" rx="4" class="lane-l"/>
+        <rect x="70" y="160" width="780" height="36" rx="4" class="lane-l"/>
+
+        <!-- query 1 -->
+        <rect x="80" y="44" width="150" height="28" rx="3" class="fill-cpu"/>
+        <text x="155" y="30" text-anchor="middle" class="t">query 1 · first scan</text>
+        <rect x="236" y="104" width="160" height="28" rx="3" class="fill-link pulse"/>
+        <text x="316" y="150" text-anchor="middle" class="t-sm">columns copy up once idle</text>
+        <rect x="236" y="164" width="80" height="28" rx="3" class="fill-dim"/>
+        <text x="276" y="212" text-anchor="middle" class="t-sm">GPU start-up</text>
+
+        <!-- query 2 -->
+        <rect x="420" y="44" width="80" height="28" rx="3" class="fill-cpu"/>
+        <rect x="420" y="164" width="100" height="28" rx="3" class="fill-gpu" opacity=".55"/>
+        <text x="470" y="30" text-anchor="middle" class="t">query 2 · warm-up split</text>
+
+        <!-- query 3 -->
+        <rect x="560" y="44" width="70" height="28" rx="3" class="fill-cpu"/>
+        <rect x="560" y="164" width="70" height="28" rx="3" class="fill-gpu"/>
+        <text x="595" y="30" text-anchor="middle" class="t">query 3</text>
+        <!-- query 4 -->
+        <rect x="690" y="44" width="70" height="28" rx="3" class="fill-cpu"/>
+        <rect x="690" y="164" width="70" height="28" rx="3" class="fill-gpu"/>
+        <text x="725" y="30" text-anchor="middle" class="t">query 4</text>
+        <text x="725" y="232" text-anchor="middle" class="t-sm">both devices at once, partials merged</text>
+        <text x="595" y="232" text-anchor="middle" class="t-sm">no link traffic</text>
+      </svg>
+    </div>
+    <div class="cap">Measured, TPC-H SF10 Q1, one session, 0.5 s between queries: CPU-only 177 · 58 · 58–65 ms. Auto 185 · 71–73 · then 43–49 ms.</div>
+  </section>
+
+  <section>
+    <h2>3 · The split: one slice each, then merge</h2>
+    <p>For an aggregation the fused kernel reads each row once and keeps a running total per group, so any slice of rows can run anywhere and the totals just add up. Auto mode picks the GPU's share so both devices finish at the same moment, starting from calibration and tuning itself from each run's timings.</p>
+    <div class="panel" role="img" aria-label="60 million rows split: 60 percent to the GPU on resident columns, 40 percent to 24 CPU threads, merged into group totals">
+      <svg viewBox="0 0 860 230">
+        <text x="12" y="30" class="t">60M lineitem rows (SF10), columns already on the GPU</text>
+        <rect x="12" y="44" width="504" height="40" rx="4" class="fill-gpu"/>
+        <rect x="516" y="44" width="332" height="40" rx="4" class="fill-cpu"/>
+        <text x="264" y="69" text-anchor="middle" class="t-b" style="fill:#fff">GPU · rows 0 – 36M · one kernel call</text>
+        <text x="682" y="69" text-anchor="middle" class="t-b" style="fill:#0D0D14">CPU · rows 36M – 60M</text>
+        <g>
+          <rect x="530" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/><rect x="570" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/>
+          <rect x="610" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/><rect x="650" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/>
+          <rect x="690" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/><rect x="730" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/>
+          <rect x="770" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/><rect x="810" y="96" width="36" height="16" rx="2" class="fill-cpu" opacity=".6"/>
+          <text x="688" y="130" text-anchor="middle" class="t-sm">128K-row morsels across 24 threads</text>
+        </g>
+        <path d="M264,86 C264,160 380,170 404,172" class="edge" marker-end="url(#a2)"/>
+        <path d="M682,136 C682,168 520,172 490,172" class="edge" marker-end="url(#a2)"/>
+        <defs><marker id="a2" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="ah"/></marker></defs>
+        <rect x="406" y="152" width="82" height="40" rx="6" class="box-green"/>
+        <text x="447" y="177" text-anchor="middle" class="t-b">merge</text>
+        <text x="447" y="214" text-anchor="middle" class="t-sm">per-group sums, counts, min/max added</text>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>4 · Why this design, in numbers</h2>
+    <p>Same query and data every time: the fused aggregation stage of SF10 Q1 over 60M rows. Bars are to scale.</p>
+    <div class="panel" role="img" aria-label="Bar chart of milliseconds for each execution strategy">
+      <svg viewBox="0 0 860 300">
+        <g class="grid">
+          <line x1="300" y1="20" x2="300" y2="262" class="grid-l"/>
+          <line x1="440" y1="20" x2="440" y2="262" class="grid-l"/>
+          <line x1="580" y1="20" x2="580" y2="262" class="grid-l"/>
+          <line x1="720" y1="20" x2="720" y2="262" class="grid-l"/>
+          <text x="300" y="282" text-anchor="middle" class="t-sm">0</text>
+          <text x="440" y="282" text-anchor="middle" class="t-sm">100 ms</text>
+          <text x="580" y="282" text-anchor="middle" class="t-sm">200 ms</text>
+          <text x="720" y="282" text-anchor="middle" class="t-sm">300 ms</text>
+        </g>
+        <!-- scale: 1.4 px per ms, origin 300 -->
+        <text x="290" y="44" text-anchor="end" class="t">CPU only · 24 threads</text>
+        <rect x="300" y="30" width="79.8" height="22" rx="3" class="bar-cpu"/><text x="386" y="46" class="t num">57</text>
+
+        <text x="290" y="84" text-anchor="end" class="t">GPU only · data in RAM</text>
+        <rect x="300" y="70" width="494.2" height="22" rx="3" class="bar-bad"/><text x="800" y="86" class="t num">353</text>
+
+        <text x="290" y="124" text-anchor="end" class="t">morsel queue · streams RAM→GPU</text>
+        <rect x="300" y="110" width="93.8" height="22" rx="3" class="bar-bad" opacity=".45"/>
+        <rect x="393.8" y="110" width="130.2" height="22" rx="3" class="bar-bad"/><text x="530" y="126" class="t num">67–160</text>
+
+        <text x="290" y="164" text-anchor="end" class="t">GPU only · data resident</text>
+        <rect x="300" y="150" width="54.6" height="22" rx="3" class="bar-gpu"/><text x="361" y="166" class="t num">39</text>
+
+        <text x="290" y="204" text-anchor="end" class="t">morsel queue · resident</text>
+        <rect x="300" y="190" width="58.8" height="22" rx="3" class="bar-gpu" opacity=".6"/><text x="365" y="206" class="t num">42</text>
+
+        <text x="290" y="244" text-anchor="end" class="t-b">static split · resident</text>
+        <rect x="300" y="230" width="35" height="22" rx="3" class="bar-mix"/><text x="342" y="246" class="t-b num">25</text>
+      </svg>
+    </div>
+    <ul class="plain">
+      <li><strong>The link is the bottleneck.</strong> Host memory feeds all CPU cores at roughly 40–50 GB/s; the GPU's PCIe 4.0 x8 link carries about 10–13 GB/s. Shipping rows mid-query can't keep up with the CPU reading them in place.</li>
+      <li><strong>Once columns are resident, the GPU is fast</strong>, and splitting beats both devices: 25 ms against 57 (CPU) and 39 (GPU).</li>
+      <li><strong>One call per device beats many morsels on the GPU</strong>: each GPU call has about 4.5 ms of fixed cost, so a dynamic queue of small GPU morsels (42 ms) loses to one static slice (25 ms).</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>What's not in auto mode yet</h2>
+    <ul class="plain">
+      <li><strong>Joins on the GPU.</strong> Joins run on the CPU through the new join engine; placing large joins on the GPU per operator is ticket F-007.</li>
+      <li><strong>Streaming co-processing for first scans.</strong> Not worth it on PCIe x8. It becomes interesting on PCIe 5 or unified-memory machines (Grace Hopper, Apple silicon), where the router already exists.</li>
+      <li><strong>A native Parquet reader.</strong> Reading stays on PyArrow for now (F-021); on raw scans that is mxframe's largest remaining gap to Polars.</li>
+    </ul>
+  </section>
+</div>
+</body>
+</html>

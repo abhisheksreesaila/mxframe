@@ -22,8 +22,9 @@ kernels_aot/*.dll
 # Exception: ship pre-built GPU .so (cannot be built in CI without GPU hardware)
 !kernels_aot/libmxkernels_aot_gpu.so
 *.mojopkg
+*.mojoc
 # Exception: ship AOT kernels package
-!kernels.mojopkg
+!kernels.mojoc
 repro_kernels/
 repro_kernels.mojopkg
 
@@ -61,3 +62,4 @@ NUL
 
 # Local-only archive — not published
 docs/archive/
+.claude/worktrees/

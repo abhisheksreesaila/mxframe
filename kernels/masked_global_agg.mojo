@@ -13,13 +13,13 @@ Registered ops:
     masked_global_max  → float32[1]: max(values[i] where mask[i] != 0)  [CPU path]
 """
 
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import block_dim, block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu import block_dim, block_idx, thread_idx, barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from ._atomic import Atomic
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime val_dtype = DType.float32
@@ -103,7 +103,7 @@ def _masked_global_sum_gpu(
     )
 
 
-@compiler.register("masked_global_sum")
+@register("masked_global_sum")
 struct MaskedGlobalSum:
     @staticmethod
     def execute[
@@ -143,7 +143,7 @@ def _masked_global_min_cpu(
     output[0] = cur
 
 
-@compiler.register("masked_global_min")
+@register("masked_global_min")
 struct MaskedGlobalMin:
     @staticmethod
     def execute[
@@ -177,7 +177,7 @@ def _masked_global_max_cpu(
     output[0] = cur
 
 
-@compiler.register("masked_global_max")
+@register("masked_global_max")
 struct MaskedGlobalMax:
     @staticmethod
     def execute[
@@ -270,7 +270,7 @@ def _masked_global_sum_product_gpu(
     )
 
 
-@compiler.register("masked_global_sum_product")
+@register("masked_global_sum_product")
 struct MaskedGlobalSumProduct:
     @staticmethod
     def execute[

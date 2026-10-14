@@ -250,10 +250,10 @@ def main():
 
     # ── Q5 ─────────────────────────────────────────────────────────────────
     bench("Q5  5-join+groupby", 5,
-        lambda: bm.run_q5_pandas(nation, customer, orders, lineitem),
-        lambda: bm.run_q5_polars(nation, customer, orders, lineitem),
-        lambda: bm.run_q5_mxframe(nation, customer, orders, lineitem, device="cpu"),
-        lambda: bm.run_q5_mxframe(nation, customer, orders, lineitem, device="gpu"))
+        lambda: bm.run_q5_pandas(nation, customer, orders, lineitem, supplier=supplier),
+        lambda: bm.run_q5_polars(nation, customer, orders, lineitem, supplier=supplier),
+        lambda: bm.run_q5_mxframe(nation, customer, orders, lineitem, supplier=supplier, device="cpu"),
+        lambda: bm.run_q5_mxframe(nation, customer, orders, lineitem, supplier=supplier, device="gpu"))
 
     # ── Q6 ─────────────────────────────────────────────────────────────────
     bench("Q6  filter+global sum", 6,
@@ -271,10 +271,10 @@ def main():
 
     # ── Q8 ─────────────────────────────────────────────────────────────────
     bench("Q8  market share", 8,
-        lambda: bm.run_q8_pandas(nation, region, part, customer, orders, lineitem),
-        lambda: bm.run_q8_polars(nation, region, part, customer, orders, lineitem),
-        lambda: bm.run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="cpu"),
-        lambda: bm.run_q8_mxframe(nation, region, part, customer, orders, lineitem, device="gpu"))
+        lambda: bm.run_q8_pandas(nation, region, part, customer, orders, lineitem, supplier=supplier),
+        lambda: bm.run_q8_polars(nation, region, part, customer, orders, lineitem, supplier=supplier),
+        lambda: bm.run_q8_mxframe(nation, region, part, customer, orders, lineitem, supplier=supplier, device="cpu"),
+        lambda: bm.run_q8_mxframe(nation, region, part, customer, orders, lineitem, supplier=supplier, device="gpu"))
 
     # ── Q9 ─────────────────────────────────────────────────────────────────
     bench("Q9  6-join+profit", 9,

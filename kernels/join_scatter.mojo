@@ -1,7 +1,7 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
@@ -130,7 +130,7 @@ def _join_scatter_gpu(
     )
 
 
-@compiler.register("join_scatter_cpu")
+@register("join_scatter_cpu")
 struct JoinScatterCPU:
     """CPU-only join scatter kernel."""
 
@@ -152,7 +152,7 @@ struct JoinScatterCPU:
             raise Error("join_scatter_cpu: only CPU target supported")
 
 
-@compiler.register("join_scatter_gpu")
+@register("join_scatter_gpu")
 struct JoinScatterGPU:
     """GPU join scatter kernel with pre-built position arrays."""
 

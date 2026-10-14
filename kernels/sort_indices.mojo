@@ -1,7 +1,7 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
-from std.gpu.host import DeviceContext
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime key_dtype = DType.int32
@@ -158,7 +158,7 @@ def _sort_indices_gpu(
         k <<= 1
 
 
-@compiler.register("sort_indices")
+@register("sort_indices")
 struct SortIndices:
     @staticmethod
     def execute[

@@ -97,6 +97,7 @@ def main():
     ord_q12, li_q12         = _gen("q12", bm.make_tpch_q12_tables)
     part_q14, li_q14        = _gen("q14", bm.make_tpch_q14_tables)
     nat_q5, cust_q5, ord_q5, li_q5 = _gen("q5", bm.make_tpch_q5_tables)
+    sup_q5 = sup_q8 = bm.make_synthetic_supplier()
     nat_q10, cust_q10, ord_q10, li_q10 = _gen("q10", bm.make_tpch_q10_tables)
     nat_q7, sup_q7, cust_q7, ord_q7, li_q7 = _gen("q7", bm.make_tpch_q7_tables)
     nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8 = _gen("q8", bm.make_tpch_q8_tables)
@@ -155,10 +156,10 @@ def main():
         lambda: bm.run_q4_mxframe(ord_q4, li_q4, device="gpu"))
 
     bench("Q5  5-join+groupby", 5,
-        lambda: bm.run_q5_pandas(nat_q5, cust_q5, ord_q5, li_q5),
-        lambda: bm.run_q5_polars(nat_q5, cust_q5, ord_q5, li_q5),
-        lambda: bm.run_q5_mxframe(nat_q5, cust_q5, ord_q5, li_q5, device="cpu"),
-        lambda: bm.run_q5_mxframe(nat_q5, cust_q5, ord_q5, li_q5, device="gpu"))
+        lambda: bm.run_q5_pandas(nat_q5, cust_q5, ord_q5, li_q5, supplier=sup_q5),
+        lambda: bm.run_q5_polars(nat_q5, cust_q5, ord_q5, li_q5, supplier=sup_q5),
+        lambda: bm.run_q5_mxframe(nat_q5, cust_q5, ord_q5, li_q5, supplier=sup_q5, device="cpu"),
+        lambda: bm.run_q5_mxframe(nat_q5, cust_q5, ord_q5, li_q5, supplier=sup_q5, device="gpu"))
 
     bench("Q6  filter+global sum", 6,
         lambda: bm.run_q6_pandas(lineitem),
@@ -173,10 +174,10 @@ def main():
         lambda: bm.run_q7_mxframe(nat_q7, sup_q7, cust_q7, ord_q7, li_q7, device="gpu"))
 
     bench("Q8  market share", 8,
-        lambda: bm.run_q8_pandas(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8),
-        lambda: bm.run_q8_polars(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8),
-        lambda: bm.run_q8_mxframe(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8, device="cpu"),
-        lambda: bm.run_q8_mxframe(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8, device="gpu"))
+        lambda: bm.run_q8_pandas(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8, supplier=sup_q8),
+        lambda: bm.run_q8_polars(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8, supplier=sup_q8),
+        lambda: bm.run_q8_mxframe(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8, supplier=sup_q8, device="cpu"),
+        lambda: bm.run_q8_mxframe(nat_q8, reg_q8, part_q8, cust_q8, ord_q8, li_q8, supplier=sup_q8, device="gpu"))
 
     bench("Q9  6-join+profit", 9,
         lambda: bm.run_q9_pandas(nat_q9, sup_q9, ps_q9, part_q9, ord_q9, li_q9),

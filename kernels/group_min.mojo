@@ -1,10 +1,10 @@
-import compiler
+from extensibility import register
 from std.math import ceildiv
-from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
-from std.gpu.memory import AddressSpace
+from max.gpu import WARP_SIZE, block_dim, block_idx, thread_idx, barrier
+from max.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from ._atomic import Atomic
-from std.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext
 from extensibility import InputTensor, ManagedTensorSlice, OutputTensor
 
 comptime dtype = DType.float32
@@ -106,7 +106,7 @@ def _group_min_gpu(
     )
 
 
-@compiler.register("group_min")
+@register("group_min")
 struct GroupMin:
     @staticmethod
     def execute[

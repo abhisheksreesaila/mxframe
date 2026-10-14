@@ -1,17 +1,20 @@
 """mxframe - GPU-accelerated DataFrames with MAX Engine"""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Lazy expression layer
 from .lazy_expr import Expr, col, lit, when, row_number
 
 # Lazy frame & logical plan
 from .lazy_frame import (
-    LogicalPlan, Scan, Filter, Project, Aggregate,
+    LogicalPlan, Scan, ParquetScan, Filter, Project, Aggregate,
     Sort, Limit, Distinct, Join,
     LazyFrame, LazyGroupBy, GPUFrame,
     DeviceType,
 )
+
+# Lazy Parquet source (pyarrow.parquet is imported only when a file is scanned)
+from .io_parquet import scan_parquet, read_parquet_table
 
 # Optimizer
 from .optimizer import PlanOptimizer, OptimizationResult, optimize_plan
@@ -42,6 +45,10 @@ def __getattr__(name: str):
         raise _runtime_import_error() from exc
 
 
+# CPU worker budget (env MXFRAME_CPU_THREADS, default all cores).  Pure ctypes/numpy import.
+from .aot_kernels import get_cpu_threads, set_cpu_threads
+
+
 def clear_cache() -> None:
     try:
         from .custom_ops import clear_cache as _clear_cache
@@ -49,16 +56,31 @@ def clear_cache() -> None:
         raise _runtime_import_error() from exc
     _clear_cache()
 
-# SQL frontend (optional; requires `sqlglot`).
-# Imported lazily so `pip install mxframe` works without the sql extra.
-try:
-    from .sql_frontend import sql
-except ImportError:
-    def sql(*args, **kwargs):  # type: ignore[misc]
+# SQL frontend (optional; requires `sqlglot`). Imported on first call: sqlglot
+# costs ~37 ms at import and most programs never use SQL.
+def sql(*args, **kwargs):
+    """Run a SQL query over Arrow tables / LazyFrames, e.g. ``mx.sql("SELECT ... FROM t", t=table)``.
+
+    Parsed with sqlglot into the same LogicalPlan the DataFrame API builds.
+    """
+    try:
+        from .sql_frontend import sql as _sql
+    except ImportError:
         raise ImportError(
             "mxframe.sql requires the optional `sqlglot` dependency. "
             "Install with: pip install 'mxframe[sql]'"
-        )
+        ) from None
+    return _sql(*args, **kwargs)
+
+
+def calibrate(full: bool = False, **kwargs):
+    """Measure this machine (link bandwidth, GPU init, per-kernel cost fits) and save it
+    to ~/.mxframe/calibration.json.  Quick mode takes < 30 s.  See `mxframe.calibration`.
+
+    Imported lazily so `import mxframe` stays fast.
+    """
+    from .calibration import calibrate as _calibrate
+    return _calibrate(full, **kwargs)
 
 
 def warmup(device: str = "auto") -> float:
@@ -116,8 +138,6 @@ def warmup(device: str = "auto") -> float:
 
 # ── I/O & conversion helpers (Phase 7) ─────────────────────── #
 
-import pyarrow.csv as _pa_csv
-import pyarrow.parquet as _pq
 
 
 def from_arrow(table) -> "LazyFrame":
@@ -135,17 +155,23 @@ def from_polars(df) -> "LazyFrame":
 
 
 def read_csv(path: str, **kwargs) -> "LazyFrame":
+    import pyarrow.csv as _pa_csv
     return LazyFrame(Scan(_pa_csv.read_csv(path, **kwargs)))
 
 
 def read_parquet(path: str, **kwargs) -> "LazyFrame":
+    import os
+    if set(kwargs) <= {"columns"} and os.path.isfile(os.fspath(path)):
+        # ParquetFile path: pq.read_table imports pyarrow.dataset, which imports pandas (~150 ms)
+        return LazyFrame(Scan(read_parquet_table(path, columns=kwargs.get("columns"), dictionary=False)))
+    import pyarrow.parquet as _pq
     return LazyFrame(Scan(_pq.read_table(path, **kwargs)))
 
 __all__ = [
     # lazy_expr
     "Expr", "col", "lit", "when", "row_number",
     # lazy_frame
-    "LogicalPlan", "Scan", "Filter", "Project", "Aggregate",
+    "LogicalPlan", "Scan", "ParquetScan", "Filter", "Project", "Aggregate",
     "Sort", "Limit", "Distinct", "Join",
     "LazyFrame", "LazyGroupBy", "GPUFrame", "DeviceType",
     # compiler
@@ -157,9 +183,50 @@ __all__ = [
     # custom_ops
     "CustomOpsCompiler", "KERNELS_PATH",
     # caching
-    "clear_cache", "warmup",
+    "clear_cache", "warmup", "calibrate",
     # I/O
     "from_arrow", "from_pandas", "from_polars", "read_csv", "read_parquet",
+    "scan_parquet", "read_parquet_table",
     # SQL
     "sql",
 ]
+
+
+# ── background warm-up ─────────────────────────────────────────────────────────
+# Loading the CPU kernel libraries (Mojo runtime, dlopen ~45 ms) and the engine
+# modules happens on the first query otherwise. Doing it on a background thread
+# from import time overlaps it with whatever the program does next (typically
+# reading data). CPU only: the GPU is never touched here. MXFRAME_WARM=0 disables.
+
+def _background_warm():
+    try:
+        from . import custom_ops, pipeline_exec, pipeline_kernels, coproc_fused, auto_mode, arrow_dict  # noqa: F401
+        custom_ops._load_aot_kernels()
+        pipeline_kernels._load_cpu()
+        from . import group_keys
+        group_keys._load()
+        from . import io_parquet, plan_validation, optimizer, join_engine, np_arrow, lazy_expr, pipeline_program, native_exec  # noqa: F401
+        if native_exec.available():
+            native_exec._load()
+        # pyarrow.compute itself is not preloaded (~25 ms of wrapper docstrings): `_lazy_pc.pc` calls
+        # its functions through pyarrow._compute, and the engine avoids Arrow methods that import it
+        import pyarrow._compute  # noqa: F401
+    except Exception:
+        pass
+
+
+def _start_background_warm():
+    import os
+    import threading
+    if os.environ.get("MXFRAME_WARM", "1") == "0":
+        return None
+    t = threading.Thread(target=_background_warm, name="mxframe-warm", daemon=True)
+    t.start()
+    # A fork while the thread holds an import lock or is inside dlopen would leave
+    # the child waiting on a lock no thread will release: wait for it first.
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(before=lambda: t.join(30))
+    return t
+
+
+_warm_thread = _start_background_warm()

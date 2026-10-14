@@ -7,8 +7,8 @@ AtomicBinOp: add=1(int), fadd=11, fmax=13, fmin=14
 AtomicOrdering: monotonic=2, seq_cst=7
 """
 
-from std.gpu.memory import AddressSpace
-from std.memory import UnsafePointer
+from max.gpu.memory import AddressSpace
+from std.memory import Pointer
 
 
 @always_inline
@@ -25,76 +25,76 @@ struct Atomic:
 
     @staticmethod
     def fetch_add[space: AddressSpace = AddressSpace.GENERIC](
-        ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
+        ptr: Pointer[Float32, _, address_space=space],
         val: Float32,
     ) -> Float32:
         """Atomic float add via MLIR llvm.atomicrmw (fadd=11)."""
         var p: __mlir_type.`!llvm.ptr`
         comptime if space == AddressSpace.SHARED:
-            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr._mlir_value)
             p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
         else:
-            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
         var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f32](val)
         var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`11 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.f32](p, v)
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
     def fetch_add[space: AddressSpace = AddressSpace.GENERIC](
-        ptr: UnsafePointer[Int32, MutAnyOrigin, address_space=space],
+        ptr: Pointer[Int32, _, address_space=space],
         val: Int32,
     ) -> Int32:
         """Atomic int32 add via MLIR llvm.atomicrmw (add=1)."""
         var p: __mlir_type.`!llvm.ptr`
         comptime if space == AddressSpace.SHARED:
-            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr._mlir_value)
             p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
         else:
-            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
         var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](val)
         var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.i32](p, v)
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Int32]](r)
 
     @staticmethod
     def min[space: AddressSpace = AddressSpace.GENERIC](
-        ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
+        ptr: Pointer[Float32, _, address_space=space],
         val: Float32,
     ) -> Float32:
         """Atomic float min via MLIR llvm.atomicrmw (fmin=14)."""
         var p: __mlir_type.`!llvm.ptr`
         comptime if space == AddressSpace.SHARED:
-            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr._mlir_value)
             p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
         else:
-            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
         var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f32](val)
         var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`14 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.f32](p, v)
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
     def max[space: AddressSpace = AddressSpace.GENERIC](
-        ptr: UnsafePointer[Float32, MutAnyOrigin, address_space=space],
+        ptr: Pointer[Float32, _, address_space=space],
         val: Float32,
     ) -> Float32:
         """Atomic float max via MLIR llvm.atomicrmw (fmax=13)."""
         var p: __mlir_type.`!llvm.ptr`
         comptime if space == AddressSpace.SHARED:
-            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr.address)
+            var p3 = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr<3>`](ptr._mlir_value)
             p = __mlir_op.`llvm.addrspacecast`[_type = __mlir_type.`!llvm.ptr`](p3)
         else:
-            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+            p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
         var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.f32](val)
         var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`13 : i64`, ordering = __mlir_attr.`7 : i64`, _type = __mlir_type.f32](p, v)
         return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Float32]](r)
 
     @staticmethod
     def compare_exchange(
-        ptr: UnsafePointer[Int32, MutAnyOrigin],
+        ptr: Pointer[Int32, _],
         mut expected: Int32,
         desired: Int32,
     ) -> Bool:
         """True CAS on global int32 memory via MLIR llvm.cmpxchg."""
-        var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr.address)
+        var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
         var cmp = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](expected)
         var new = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i32](desired)
         var result = __mlir_op.`llvm.cmpxchg`[

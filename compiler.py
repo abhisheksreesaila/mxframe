@@ -8,50 +8,109 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
-import pyarrow.compute as pc
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
+from ._lazy_pc import pc
 import numpy as np
-from max import engine, driver
-from max.graph import Graph, TensorType, ops
-from max.graph.type import DType, DeviceRef
+# MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
+from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate
 
 # %% ../nbs/03_compiler.ipynb 4
 # ── dtype helpers ────────────────────────────────────────────────────────
 
-_NP_TO_MAX = {
-    np.dtype("int32"):   DType.int32,
-    np.dtype("int64"):   DType.int64,
-    np.dtype("float32"): DType.float32,
-    np.dtype("float64"): DType.float64,
-    np.dtype("bool"):    DType.bool,
+_NP_TO_MAX_NAMES = {
+    np.dtype("int32"):   "int32",
+    np.dtype("int64"):   "int64",
+    np.dtype("float32"): "float32",
+    np.dtype("float64"): "float64",
+    np.dtype("bool"):    "bool",
 }
 
-def _max_dtype(arr) -> DType:
+def _max_dtype(arr):
     """Map a numpy dtype to the corresponding MAX DType."""
-    return _NP_TO_MAX.get(arr.dtype, DType.float32)
+    return getattr(DType, _NP_TO_MAX_NAMES.get(arr.dtype, "float32"))
 
-_PC_CMP_OPS = {
-    "gt":  pc.greater,
-    "ge":  pc.greater_equal,
-    "lt":  pc.less,
-    "le":  pc.less_equal,
-    "eq":  pc.equal,
-    "ne":  pc.not_equal,
-    "and": pc.and_,
-    "or":  pc.or_,
-}
+class _LazyPcOps(dict):
+    """op -> pyarrow.compute function, looked up on use: pyarrow.compute loads on first use (_lazy_pc).
+    Only `in` and `[]` give functions; the stored values are names."""
+    def __getitem__(self, op):
+        return getattr(pc, dict.__getitem__(self, op))
 
-_CMP_OPS = {
-    "gt": ops.greater,
-    "ge": ops.greater_equal,
-    "lt": lambda a, b: ops.greater(b, a),
-    "le": lambda a, b: ops.greater_equal(b, a),
-    "eq": ops.equal,
-}
+    def get(self, op, default=None):
+        return self[op] if op in self else default
+
+    def values(self):
+        raise TypeError("_LazyPcOps holds function names; look ops up with [] instead")
+
+    items = values
 
 
-def _is_gpu_max_compatible(acc: driver.Accelerator) -> bool:
+_PC_CMP_OPS = _LazyPcOps({
+    "gt":  "greater",
+    "ge":  "greater_equal",
+    "lt":  "less",
+    "le":  "less_equal",
+    "eq":  "equal",
+    "ne":  "not_equal",
+    "and": "and_kleene",       # SQL three-valued logic: false AND null = false, true OR null = true
+    "or":  "or_kleene",
+})
+
+def _is_number(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _numeric_literal(x):
+    """The Python value of a numeric literal operand (a Python number or an Arrow scalar), else None."""
+    if _is_number(x):
+        return x
+    if isinstance(x, pa.Scalar) and (pa.types.is_integer(x.type) or pa.types.is_floating(x.type)):
+        return x.as_py()
+    return None
+
+
+def _align_literals(lhs, rhs):
+    """A numeric literal compared with a float32 column becomes a float32 scalar.
+
+    Arrow would widen the column to float64 and compare it with the double nearest the
+    decimal literal, so `l_discount <= 0.07` dropped every row whose float32 value is the
+    float32 nearest 0.07 (it is 0.07000000029802322 > 0.07).  Comparing in the column's
+    own precision is what DuckDB does on DECIMAL and what NumPy 2 does."""
+    def is_f32(x):
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float32(x.type)
+    r, l = _numeric_literal(rhs), _numeric_literal(lhs)
+    if r is not None and is_f32(lhs):
+        rhs = _npscalar(r, type=pa.float32())
+    elif l is not None and is_f32(rhs):
+        lhs = _npscalar(l, type=pa.float32())
+    return lhs, rhs
+
+
+# Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
+_DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
+
+class _LazyCmpOps:
+    """MAX comparison ops by name; ``ops`` is only touched when one is looked up."""
+    _KEYS = ("gt", "ge", "lt", "le", "eq")
+
+    def __contains__(self, op):
+        return op in self._KEYS
+
+    def __getitem__(self, op):
+        if op == "gt": return ops.greater
+        if op == "ge": return ops.greater_equal
+        if op == "lt": return lambda a, b: ops.greater(b, a)
+        if op == "le": return lambda a, b: ops.greater_equal(b, a)
+        if op == "eq": return ops.equal
+        raise KeyError(op)
+
+
+_CMP_OPS = _LazyCmpOps()
+
+
+def _is_gpu_max_compatible(acc) -> bool:
     """Return True if MAX's GPU runtime supports this accelerator.
 
     MAX only supports certain datacenter GPUs (A10, A100, H100, etc.).
@@ -85,6 +144,7 @@ class GraphCompiler:
         # ── device resolution ────────────────────────────────────────────
         self._has_gpu = False
         self._gpu_driver = None
+        self._auto_pending = False
         resolved = device.lower()
         self._device_arg = resolved   # kept for subclass auto-switching
 
@@ -107,34 +167,54 @@ class GraphCompiler:
             self._has_gpu = True
             self._session_device = "gpu"
         elif resolved == "auto":
-            if driver.accelerator_count() > 0:
-                try:
-                    acc = driver.Accelerator()
-                    if _is_gpu_max_compatible(acc):
-                        self._gpu_driver = acc
-                        self._driver_device = self._gpu_driver
-                        self._device_ref = DeviceRef.GPU(0)
-                        self._has_gpu = True
-                        self._session_device = "gpu"
-                    else:
-                        # GPU present but not supported by MAX -- silently use CPU
-                        self._driver_device = driver.CPU()
-                        self._device_ref = DeviceRef.CPU()
-                        self._session_device = "cpu"
-                except Exception:
-                    self._driver_device = driver.CPU()
-                    self._device_ref = DeviceRef.CPU()
-                    self._session_device = "cpu"
-            else:
-                self._driver_device = driver.CPU()
-                self._device_ref = DeviceRef.CPU()
-                self._session_device = "cpu"
+            # Start on the CPU without touching the GPU; the subclass picks the GPU
+            # (waiting on the background warm-up) once it knows the query is big enough.
+            self._driver_device = None      # created on first use (see the properties below)
+            self._device_ref = None
+            self._session_device = "cpu"
+            self._auto_pending = True
         else:  # "cpu" or any unrecognised string
-            self._driver_device = driver.CPU()
-            self._device_ref = DeviceRef.CPU()
+            self._driver_device = None
+            self._device_ref = None
             self._session_device = "cpu"
 
-        self.session = engine.InferenceSession(devices=[self._driver_device])
+        self._session_obj = None     # MAX InferenceSession: created on first real graph load
+
+    # The CPU driver device and DeviceRef need the MAX import: made on first use only.
+    @property
+    def _driver_device(self):
+        if self._driver_device_v is None:
+            self._driver_device_v = driver.CPU()
+        return self._driver_device_v
+
+    @_driver_device.setter
+    def _driver_device(self, value):
+        self._driver_device_v = value
+
+    @property
+    def _device_ref(self):
+        if self._device_ref_v is None:
+            self._device_ref_v = DeviceRef.CPU()
+        return self._device_ref_v
+
+    @_device_ref.setter
+    def _device_ref(self, value):
+        self._device_ref_v = value
+
+    # A MAX InferenceSession is only needed by the graph (JIT) fallbacks; creating one
+    # eagerly costs start-up time on paths that never load a graph.
+    @property
+    def session(self):
+        if self._session_obj is None:
+            self._session_obj = self._create_session()
+        return self._session_obj
+
+    @session.setter
+    def session(self, value):
+        self._session_obj = value
+
+    def _create_session(self):
+        return engine.InferenceSession(devices=[self._driver_device])
 
     # ── Post-op extraction ───────────────────────────────────────────
     @classmethod
@@ -168,7 +248,7 @@ class GraphCompiler:
                 table = table.slice(0, node.n)
             elif isinstance(node, Distinct):
                 cols = node.subset or table.column_names
-                table = table.group_by(cols).aggregate([])
+                table = _distinct_rows(table.select(cols)) if table.num_rows else table.select(cols)
             elif isinstance(node, Tail):
                 table = table.slice(max(0, table.num_rows - node.n), node.n)
         return table
@@ -197,7 +277,7 @@ class GraphCompiler:
         model = self.session.load(graph)
         output_vals = model.execute(*[col_arrays[n] for n in col_names])
         result_names = list(result_nodes.keys())
-        arrays = [pa.array(t.to_numpy()) for t in output_vals]
+        arrays = [_npa(_np_of(t)) for t in output_vals]
         result_table = pa.Table.from_arrays(arrays, names=result_names)
 
         # Apply Sort/Limit/Distinct as post-ops
@@ -212,23 +292,51 @@ class GraphCompiler:
         op, args = expr.op, expr.args
         if op == "col":
             arr = table.column(args[0])
+            if pa.types.is_dictionary(arr.type):
+                arr = _decode_dict(arr)
             if isinstance(arr, pa.ChunkedArray):
                 # Single-chunk: return Array directly, no 50ms copy from combine_chunks.
                 if len(arr.chunks) == 1:
                     return arr.chunks[0]
-                return arr.combine_chunks()
+                return _combine(arr)
             return arr
         if op == "lit":
-            return args[0]
+            # An Arrow scalar, not the Python value: PyArrow converting a Python
+            # literal inside a compute call imports pandas (~150-200 ms, once).
+            import datetime as _dt
+            v = args[0]
+            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date)) else v
+        if op in _DICT_PRED_OPS:
+            native = _dict_predicate(expr, table)
+            if native is not None:
+                return native
         if op in _PC_CMP_OPS:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
+            if op not in ("and", "or"):
+                lhs, rhs = _align_literals(lhs, rhs)
             return _PC_CMP_OPS[op](lhs, rhs)
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
         if op == "isin":
+            if isinstance(args[0], Expr) and args[0].op == "str_slice" and isinstance(args[1], (list, tuple)):
+                # str_slice(col, ...).isin([...]): one native pass, no sliced array (F-043)
+                from . import native_exec
+                src = GraphCompiler._eval_predicate(args[0].args[0], table)
+                got = native_exec.try_str_slice_in(src, args[0].args[1], args[0].args[2], list(args[1]))
+                if got is not None:
+                    return got
             col_arr = GraphCompiler._eval_predicate(args[0], table)
-            return pc.is_in(col_arr, value_set=pa.array(args[1]))
+            if isinstance(args[1], (list, tuple)):
+                # a utf8 column against string values: one native pass (F-043)
+                from . import native_exec
+                got = native_exec.try_str_slice_in(col_arr, 0, None, list(args[1]))
+                if got is not None:
+                    return got
+            return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
+        if op == "str_slice":
+            from .custom_ops import _str_slice
+            return _str_slice(GraphCompiler._eval_predicate(args[0], table), args[1], args[2])
         if op == "startswith":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.starts_with(col_arr, pattern=args[1])
@@ -239,16 +347,16 @@ class GraphCompiler:
             cond = GraphCompiler._eval_predicate(args[0], table)
             then = GraphCompiler._eval_predicate(args[1], table)
             else_ = GraphCompiler._eval_predicate(args[2], table)
-            return pc.if_else(cond, then, else_)
+            return pc.if_else(pc.fill_null(cond, _npscalar(False, type=pa.bool_())), then, else_)     # CASE: a null condition is not true
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
-                return pc.cast(pc.divide(col_arr, pa.scalar(10000, type=pa.int32())), pa.int32())
+                return pc.cast(pc.divide(col_arr, _npscalar(10000, type=pa.int32())), pa.int32())
             return pc.year(col_arr)
         if op in ("and", "or", "__and__", "__or__"):
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.and_(lhs, rhs) if "and" in op else pc.or_(lhs, rhs)
+            return pc.and_kleene(lhs, rhs) if "and" in op else pc.or_kleene(lhs, rhs)
         # Arithmetic ops inside predicates (e.g. lit(0.2) * col("avg_qty") as RHS of comparison)
         if op == "mul":
             lhs = GraphCompiler._eval_predicate(args[0], table)

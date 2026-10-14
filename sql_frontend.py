@@ -57,6 +57,24 @@ def sql(query: str, **tables: pa.Table) -> LazyFrame:
 # internal translator
 # ---------------------------------------------------------------------------
 
+
+
+def _join_type(join) -> str:
+    """The engine's join type for a sqlglot join: sqlglot keeps LEFT / RIGHT / FULL in `side` and
+    SEMI / ANTI / OUTER / CROSS in `kind` (``LEFT ANTI JOIN``: side LEFT, kind ANTI)."""
+    side = str(join.args.get("side") or "").lower()
+    kind = str(join.args.get("kind") or "").lower()
+    if kind in ("semi", "anti"):
+        if side not in ("", "left"):
+            raise ValueError(f"unsupported SQL join: {side.upper()} {kind.upper()} "
+                             "(supported: [INNER] JOIN, LEFT [OUTER] JOIN, [LEFT] SEMI JOIN, [LEFT] ANTI JOIN)")
+        return kind
+    if kind in ("", "inner", "outer") and side == "left":
+        return "left"
+    if kind in ("", "inner") and side == "":
+        return "inner"
+    raise ValueError(f"unsupported SQL join: {' '.join(x for x in (side, kind) if x).upper() or 'JOIN'} "
+                     "(supported: [INNER] JOIN, LEFT [OUTER] JOIN, [LEFT] SEMI JOIN, [LEFT] ANTI JOIN)")
 class _SQLTranslator:
     def __init__(self, tables: Dict[str, pa.Table]):
         self._tables = tables
@@ -93,8 +111,10 @@ class _SQLTranslator:
         group_node = node.args.get("group")
         has_aggs = any(self._contains_agg(e) for e in node.expressions)
 
+        final_proj = None
+        self._key_names = {}
         if group_node or has_aggs:
-            plan = self._build_aggregate(plan, node, group_node)
+            plan, final_proj = self._build_aggregate(plan, node, group_node)
         else:
             # pure projection (skip if SELECT *)
             non_star = [e for e in node.expressions if not isinstance(e, sge.Star)]
@@ -108,7 +128,10 @@ class _SQLTranslator:
         if order_node:
             by, desc = [], []
             for o in order_node.expressions:
-                by.append(self._expr(o.this))
+                # a group key is sorted on under its output name (ORDER BY s when SELECT says s AS b)
+                ex = self._expr(o.this)
+                src = self._key_names.get(ex.signature())
+                by.append(col(src) if src is not None else ex)
                 desc.append(bool(o.args.get("desc")))
             plan = Sort(plan, by, desc)
 
@@ -117,6 +140,8 @@ class _SQLTranslator:
         if limit_node:
             plan = Limit(plan, int(limit_node.expression.this))
 
+        if final_proj:
+            plan = Project(plan, final_proj)
         return plan
 
     # ------------------------------------------------------------------
@@ -136,28 +161,23 @@ class _SQLTranslator:
             right_plan, right_cols = self._scan(join.this)
             right_schema = set(right_cols)
 
+            how = _join_type(join)
             on = join.args.get("on")
             using = join.args.get("using")
             if on is not None:
                 left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
             elif using:
-                keys = [str(c.name) for c in using.expressions]
+                cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
+                keys = [str(c.name) for c in cols]
                 left_on = right_on = keys
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
-            how = "inner"
-            kind = join.args.get("kind")
-            if kind:
-                ks = str(kind).lower()
-                if "left" in ks:
-                    how = "left"
-                elif "right" in ks:
-                    how = "right"
-
             plan = Join(plan, right_plan, left_on, right_on, how)
-            # After this join, the accumulated left side grows to include right cols
-            self._left_schema |= right_schema
+            # After this join, the accumulated left side grows to include right cols (a semi / anti
+            # join outputs the left columns only)
+            if how not in ("semi", "anti"):
+                self._left_schema |= right_schema
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
                 if lk != rk:
@@ -210,12 +230,31 @@ class _SQLTranslator:
         inner = e.this if isinstance(e, sge.Alias) else e
         return isinstance(inner, (sge.Sum, sge.Avg, sge.Min, sge.Max, sge.Count))
 
-    def _build_aggregate(self, plan: LogicalPlan, node: sge.Select, group_node) -> LogicalPlan:
-        # Group-by keys
+    def _build_aggregate(self, plan: LogicalPlan, node: sge.Select, group_node):
+        """The Aggregate for a grouped SELECT, and the final projection (result columns in SELECT
+        order, applied after ORDER BY / LIMIT, which may use a key the SELECT list leaves out; None
+        when the columns are already in place or one of them has no name)."""
+        # Group-by keys. A SELECT alias names its key: GROUP BY may name the alias (when no input
+        # column has that name, as in DuckDB) or repeat the aliased expression (compared after
+        # translation, so t.s and s are the same key).
+        aliased = [(e.alias.lower(), self._expr(e.this).signature()) for e in node.expressions
+                   if isinstance(e, sge.Alias) and not self._contains_agg(e)]
+        alias_expr = {e.alias.lower(): e.this for e in node.expressions
+                      if isinstance(e, sge.Alias) and not self._contains_agg(e)}
+        scope = {c.lower() for c in self._scope_columns}
         group_by: List[Expr] = []
         if group_node:
             for gb in group_node.expressions:
-                group_by.append(self._expr(gb))
+                inner, name = gb, None
+                if (isinstance(gb, sge.Column) and not gb.table and gb.name.lower() in alias_expr
+                        and gb.name.lower() not in scope):
+                    name = gb.name.lower()
+                    inner = alias_expr[name]
+                else:
+                    sig = self._expr(gb).signature()
+                    name = next((a for a, s in aliased if s == sig), None)
+                key = self._expr(inner)
+                group_by.append(key.alias(name) if name else key)
 
         # Aggregate expressions (only the aggregate parts of SELECT)
         agg_exprs: List[Expr] = []
@@ -228,7 +267,38 @@ class _SQLTranslator:
             if mx is not None:
                 agg_exprs.append(mx)
 
-        return Aggregate(plan, group_by, agg_exprs)
+        # output name of every key, by its translated expression (ORDER BY and the final projection
+        # refer to a key through it, whatever name or qualification the query used)
+        self._key_names = {}
+        for k in group_by:
+            out = k._alias or (k.args[0] if k.op == "col" else None)
+            if out is not None:                    # (a signature leaves the alias out)
+                self._key_names.setdefault(k.signature(), out)
+
+        natural = [k._alias or (k.args[0] if k.op == "col" else None) for k in group_by]
+        natural += [a._alias for a in agg_exprs]
+        proj: Optional[List[Expr]] = []
+        for e in node.expressions:
+            if isinstance(e, sge.Star) or None in natural:
+                proj = None
+                break
+            name = e.alias.lower() if isinstance(e, sge.Alias) else None
+            if self._contains_agg(e):
+                if name is None:
+                    proj = None
+                    break
+                proj.append(col(name))
+                continue
+            inner = e.this if isinstance(e, sge.Alias) else e
+            src = self._key_names.get(self._expr(inner).signature())
+            if src is None:                        # not a group key: left as it was
+                proj = None
+                break
+            out = name or (inner.name.lower() if isinstance(inner, sge.Column) else src)
+            proj.append(col(src) if out == src else col(src).alias(out))
+        if proj is not None and [c._alias or c.args[0] for c in proj] == natural:
+            proj = None
+        return Aggregate(plan, group_by, agg_exprs), proj
 
     # ------------------------------------------------------------------
     # SELECT-column translation (handles Alias wrapper)
