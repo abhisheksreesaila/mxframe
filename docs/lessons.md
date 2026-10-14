@@ -43,3 +43,4 @@ Claude reads this at the start of each session. -->
 - 2026-10-14 · Benchmark runs for publication: log what else ran (ps samples) and check scheduled jobs (snapper, timers); a load gate at the start doesn't guarantee a quiet run.
 - 2026-10-14 · Before opening a PR, run every step in .github/workflows/test.yml locally (the scripts/_test_*.py smoke scripts aren't in pytest).
 - 2026-10-14 · Before a release, dry-run scripts/release.sh (no flags) end to end; it had gone stale (no twine, old kernels.mojopkg name) since the last release.
+- 2026-10-14 · Never `pkill -f` a pattern that can match your own shell command line (killed the shell twice); kill by PID.
