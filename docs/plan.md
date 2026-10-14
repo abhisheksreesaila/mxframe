@@ -504,8 +504,8 @@ Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open item
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
 - [ ] restyled on `site.css`, "how to read this" header, numbers from the bench files
 
-## F-053 device="auto" skips the native executor on GPU machines [todo]
-Found 2026-10-14 while documenting auto (F-052). With a GPU present, `auto` sets a CPU+GPU co-processing policy and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
+## F-053 device="auto" never uses the native executor [todo]
+Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
 - [ ] re-run the user-felt TPC-H scoreboard with `mx-auto` next to `mx-cpu` on 0.6.0 (quiet machine)
 - [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
 - [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again

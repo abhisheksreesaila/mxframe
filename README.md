@@ -15,7 +15,7 @@
 
 - **Fast on one machine.** A query plan runs in one call into a native Mojo executor, on every CPU core. It ran all 22 TPC-H queries at SF10 in 3.15 s, against 5.08 s for DuckDB and 14.40 s for Polars.
 - **Nothing new to learn.** A lazy, Polars-style DataFrame API plus SQL, over Apache Arrow. Results come back as `pyarrow` tables.
-- **The GPU when you have one.** `compute(device="auto")` measures your machine and splits work between the GPU and the CPU.
+- **The GPU when you have one.** `compute(device="gpu")` runs the plan on the GPU; `device="auto"` picks a device from costs it measures on your machine (it doesn't use the 0.6.0 native executor yet, see below).
 
 ## Latest release: 0.6.0
 
@@ -55,7 +55,7 @@ print(out.to_pandas())
 2            R  1.223160e+10
 ```
 
-Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`. On a machine with a GPU, the default `device="auto"` currently splits work over CPU and GPU with the older fused pipeline instead of the native executor (being measured in F-053), so pass `device="cpu"` for now.
+Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`. The default, `device="auto"`, doesn't use the native executor yet on any machine: when it picks the CPU it runs the older fused pipeline (fixing this is ticket F-053), so pass `device="cpu"` for now.
 
 Extras: `runtime` (the MAX engine; pixi users get it from conda instead), `sql` (sqlglot, for `mx.sql`), `polars` (for `.to_polars()`). The GPU path is validated on NVIDIA; AMD and Apple Silicon aren't yet. On import, MXFrame caps the Mojo runtime's GPU memory pool at 25% (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`, process-wide); set it higher before importing if a kernel needs more.
 
