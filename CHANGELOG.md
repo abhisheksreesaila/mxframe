@@ -7,7 +7,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-## [0.6.0] — 2026-10-13
+## [0.6.0] — 2026-10-14
 
 The CPU engine is now a native Mojo executor: one call per query stage runs the scan, filter,
 joins and aggregate over Arrow memory, compiled ahead of time. Engine-only TPC-H and a seeded

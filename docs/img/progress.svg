@@ -26,35 +26,37 @@
 <line class="grid" x1="56" x2="416" y1="125.4" y2="125.4"/>
 <text class="t2" x="48" y="129.4" text-anchor="end">20</text>
 <line class="axis" x1="56" x2="416" y1="310.0" y2="310.0"/>
-<line class="pl" stroke-width="2" stroke-dasharray="6 4" x1="56" x2="416" y1="172.1" y2="172.1"/>
-<text class="t2" x="422" y="176.1">Polars 14.94</text>
-<line class="dk" stroke-width="2" stroke-dasharray="6 4" x1="56" x2="416" y1="261.0" y2="261.0"/>
-<text class="t2" x="422" y="265.0">DuckDB 5.31</text>
-<path class="mxl" stroke-width="2" d="M56.0,100.9 L92.0,116.1 L128.0,160.8 L164.0,165.3 L200.0,207.7 L236.0,213.4 L272.0,219.3 L308.0,242.2 L344.0,250.4 L380.0,274.8 L416.0,279.8"/>
+<line class="pl" stroke-width="2" stroke-dasharray="6 4" x1="56" x2="416" y1="177.1" y2="177.1"/>
+<text class="t2" x="422" y="181.1">Polars 14.40</text>
+<line class="dk" stroke-width="2" stroke-dasharray="6 4" x1="56" x2="416" y1="263.1" y2="263.1"/>
+<text class="t2" x="422" y="267.1">DuckDB 5.08</text>
+<path class="mxl" stroke-width="2" d="M56.0,100.9 L88.7,116.1 L121.5,160.8 L154.2,165.3 L186.9,207.7 L219.6,213.4 L252.4,219.3 L285.1,242.2 L317.8,250.4 L350.5,274.8 L383.3,279.8 L416.0,280.9"/>
 <circle class="mx" cx="56.0" cy="100.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>before: 22.66 s</title></circle>
 <text class="t2" x="56.0" y="328" text-anchor="middle">before</text>
-<circle class="mx" cx="92.0" cy="116.1" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M1: 21.01 s</title></circle>
-<text class="t2" x="92.0" y="328" text-anchor="middle">M1</text>
-<circle class="mx" cx="128.0" cy="160.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2a: 16.16 s</title></circle>
-<text class="t2" x="128.0" y="328" text-anchor="middle">M2a</text>
-<circle class="mx" cx="164.0" cy="165.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2b: 15.68 s</title></circle>
-<text class="t2" x="164.0" y="328" text-anchor="middle">M2b</text>
-<circle class="mx" cx="200.0" cy="207.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2d: 11.08 s</title></circle>
-<text class="t2" x="200.0" y="328" text-anchor="middle">M2d</text>
-<circle class="mx" cx="236.0" cy="213.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2e: 10.46 s</title></circle>
-<text class="t2" x="236.0" y="328" text-anchor="middle">M2e</text>
-<circle class="mx" cx="272.0" cy="219.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2g: 9.82 s</title></circle>
-<text class="t2" x="272.0" y="328" text-anchor="middle">M2g</text>
-<circle class="mx" cx="308.0" cy="242.2" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2h: 7.34 s</title></circle>
-<text class="t2" x="308.0" y="328" text-anchor="middle">M2h</text>
-<circle class="mx" cx="344.0" cy="250.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2l: 6.45 s</title></circle>
-<text class="t2" x="344.0" y="328" text-anchor="middle">M2l</text>
-<circle class="mx" cx="380.0" cy="274.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2n: 3.82 s</title></circle>
-<text class="t2" x="380.0" y="328" text-anchor="middle">M2n</text>
-<circle class="mx" cx="416.0" cy="279.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>F-043: 3.27 s</title></circle>
-<text class="t2" x="416.0" y="328" text-anchor="middle">F-043</text>
+<circle class="mx" cx="88.7" cy="116.1" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M1: 21.01 s</title></circle>
+<text class="t2" x="88.7" y="328" text-anchor="middle">M1</text>
+<circle class="mx" cx="121.5" cy="160.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2a: 16.16 s</title></circle>
+<text class="t2" x="121.5" y="328" text-anchor="middle">M2a</text>
+<circle class="mx" cx="154.2" cy="165.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2b: 15.68 s</title></circle>
+<text class="t2" x="154.2" y="328" text-anchor="middle">M2b</text>
+<circle class="mx" cx="186.9" cy="207.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2d: 11.08 s</title></circle>
+<text class="t2" x="186.9" y="328" text-anchor="middle">M2d</text>
+<circle class="mx" cx="219.6" cy="213.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2e: 10.46 s</title></circle>
+<text class="t2" x="219.6" y="328" text-anchor="middle">M2e</text>
+<circle class="mx" cx="252.4" cy="219.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2g: 9.82 s</title></circle>
+<text class="t2" x="252.4" y="328" text-anchor="middle">M2g</text>
+<circle class="mx" cx="285.1" cy="242.2" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2h: 7.34 s</title></circle>
+<text class="t2" x="285.1" y="328" text-anchor="middle">M2h</text>
+<circle class="mx" cx="317.8" cy="250.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2l: 6.45 s</title></circle>
+<text class="t2" x="317.8" y="328" text-anchor="middle">M2l</text>
+<circle class="mx" cx="350.5" cy="274.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2n: 3.82 s</title></circle>
+<text class="t2" x="350.5" y="328" text-anchor="middle">M2n</text>
+<circle class="mx" cx="383.3" cy="279.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>F-043: 3.27 s</title></circle>
+<text class="t2" x="383.3" y="328" text-anchor="middle">F-043</text>
+<circle class="mx" cx="416.0" cy="280.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>F-046: 3.15 s</title></circle>
+<text class="t2" x="416.0" y="328" text-anchor="middle">F-046</text>
 <text class="t1" x="64.0" y="118.9">MXFrame 22.66</text>
-<text class="t1" x="416.0" y="269.8" text-anchor="end">3.27</text>
+<text class="t1" x="416.0" y="270.9" text-anchor="end">3.15</text>
 <text class="t1" x="546" y="72" font-weight="600">SF1</text>
 <line class="grid" x1="546" x2="906" y1="310.0" y2="310.0"/>
 <text class="t2" x="538" y="314.0" text-anchor="end">0</text>
@@ -63,33 +65,35 @@
 <line class="grid" x1="546" x2="906" y1="155.1" y2="155.1"/>
 <text class="t2" x="538" y="159.1" text-anchor="end">2</text>
 <line class="axis" x1="546" x2="906" y1="310.0" y2="310.0"/>
-<line class="pl" stroke-width="2" stroke-dasharray="6 4" x1="546" x2="906" y1="199.9" y2="199.9"/>
-<text class="t2" x="912" y="203.9">Polars 1.42</text>
-<line class="dk" stroke-width="2" stroke-dasharray="6 4" x1="546" x2="906" y1="261.5" y2="261.5"/>
-<text class="t2" x="912" y="265.5">DuckDB 0.63</text>
-<path class="mxl" stroke-width="2" d="M546.0,114.4 L582.0,100.9 L618.0,135.7 L654.0,138.9 L690.0,173.7 L726.0,181.4 L762.0,213.3 L798.0,233.6 L834.0,253.2 L870.0,269.8 L906.0,271.3"/>
+<line class="pl" stroke-width="2" stroke-dasharray="6 4" x1="546" x2="906" y1="208.6" y2="208.6"/>
+<text class="t2" x="912" y="212.6">Polars 1.31</text>
+<line class="dk" stroke-width="2" stroke-dasharray="6 4" x1="546" x2="906" y1="261.3" y2="261.3"/>
+<text class="t2" x="912" y="265.3">DuckDB 0.63</text>
+<path class="mxl" stroke-width="2" d="M546.0,114.4 L578.7,100.9 L611.5,135.7 L644.2,138.9 L676.9,173.7 L709.6,181.4 L742.4,213.3 L775.1,233.6 L807.8,253.2 L840.5,269.8 L873.3,271.3 L906.0,273.4"/>
 <circle class="mx" cx="546.0" cy="114.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>before: 2.52 s</title></circle>
 <text class="t2" x="546.0" y="328" text-anchor="middle">before</text>
-<circle class="mx" cx="582.0" cy="100.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M1: 2.70 s</title></circle>
-<text class="t2" x="582.0" y="328" text-anchor="middle">M1</text>
-<circle class="mx" cx="618.0" cy="135.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2a: 2.25 s</title></circle>
-<text class="t2" x="618.0" y="328" text-anchor="middle">M2a</text>
-<circle class="mx" cx="654.0" cy="138.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2b: 2.21 s</title></circle>
-<text class="t2" x="654.0" y="328" text-anchor="middle">M2b</text>
-<circle class="mx" cx="690.0" cy="173.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2d: 1.76 s</title></circle>
-<text class="t2" x="690.0" y="328" text-anchor="middle">M2d</text>
-<circle class="mx" cx="726.0" cy="181.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2e: 1.66 s</title></circle>
-<text class="t2" x="726.0" y="328" text-anchor="middle">M2e</text>
-<circle class="mx" cx="762.0" cy="213.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2g: 1.25 s</title></circle>
-<text class="t2" x="762.0" y="328" text-anchor="middle">M2g</text>
-<circle class="mx" cx="798.0" cy="233.6" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2h: 0.99 s</title></circle>
-<text class="t2" x="798.0" y="328" text-anchor="middle">M2h</text>
-<circle class="mx" cx="834.0" cy="253.2" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2l: 0.73 s</title></circle>
-<text class="t2" x="834.0" y="328" text-anchor="middle">M2l</text>
-<circle class="mx" cx="870.0" cy="269.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2n: 0.52 s</title></circle>
-<text class="t2" x="870.0" y="328" text-anchor="middle">M2n</text>
-<circle class="mx" cx="906.0" cy="271.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>F-043: 0.50 s</title></circle>
-<text class="t2" x="906.0" y="328" text-anchor="middle">F-043</text>
+<circle class="mx" cx="578.7" cy="100.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M1: 2.70 s</title></circle>
+<text class="t2" x="578.7" y="328" text-anchor="middle">M1</text>
+<circle class="mx" cx="611.5" cy="135.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2a: 2.25 s</title></circle>
+<text class="t2" x="611.5" y="328" text-anchor="middle">M2a</text>
+<circle class="mx" cx="644.2" cy="138.9" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2b: 2.21 s</title></circle>
+<text class="t2" x="644.2" y="328" text-anchor="middle">M2b</text>
+<circle class="mx" cx="676.9" cy="173.7" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2d: 1.76 s</title></circle>
+<text class="t2" x="676.9" y="328" text-anchor="middle">M2d</text>
+<circle class="mx" cx="709.6" cy="181.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2e: 1.66 s</title></circle>
+<text class="t2" x="709.6" y="328" text-anchor="middle">M2e</text>
+<circle class="mx" cx="742.4" cy="213.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2g: 1.25 s</title></circle>
+<text class="t2" x="742.4" y="328" text-anchor="middle">M2g</text>
+<circle class="mx" cx="775.1" cy="233.6" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2h: 0.99 s</title></circle>
+<text class="t2" x="775.1" y="328" text-anchor="middle">M2h</text>
+<circle class="mx" cx="807.8" cy="253.2" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2l: 0.73 s</title></circle>
+<text class="t2" x="807.8" y="328" text-anchor="middle">M2l</text>
+<circle class="mx" cx="840.5" cy="269.8" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>M2n: 0.52 s</title></circle>
+<text class="t2" x="840.5" y="328" text-anchor="middle">M2n</text>
+<circle class="mx" cx="873.3" cy="271.3" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>F-043: 0.50 s</title></circle>
+<text class="t2" x="873.3" y="328" text-anchor="middle">F-043</text>
+<circle class="mx" cx="906.0" cy="273.4" r="4" stroke-width="2" style="stroke: var(--bg, transparent)"><title>F-046: 0.47 s</title></circle>
+<text class="t2" x="906.0" y="328" text-anchor="middle">F-046</text>
 <text class="t1" x="554.0" y="132.4">MXFrame 2.52</text>
-<text class="t1" x="906.0" y="261.3" text-anchor="end">0.50</text>
+<text class="t1" x="906.0" y="263.4" text-anchor="end">0.47</text>
 </svg>

@@ -1,7 +1,7 @@
 """Charts for docs/optimizations.md and the README (F-039): plain SVG, light and dark, from the
 engine-only benchmark CSVs in docs/bench/.
 
-    pixi run python scripts/plot_progress.py docs/bench/m2r-engine.csv F-046
+    pixi run python scripts/plot_progress.py docs/bench/m2s-engine.csv F-046
 
 1. docs/img/progress.svg: the 22-query total per milestone, SF10 and SF1 side by side (two panels,
    one axis each), MXFrame as a line, Polars and DuckDB (from the final run) as reference lines.
@@ -176,7 +176,7 @@ def per_query_svg(final_rows, sf, titles):
 
 
 def main():
-    final = Path(sys.argv[1]) if len(sys.argv) > 1 else BENCH / "m2r-engine.csv"
+    final = Path(sys.argv[1]) if len(sys.argv) > 1 else BENCH / "m2s-engine.csv"
     label = sys.argv[2] if len(sys.argv) > 2 else "F-046"
     rows = _rows(final)
     sys.path.insert(0, str(ROOT / "scripts"))

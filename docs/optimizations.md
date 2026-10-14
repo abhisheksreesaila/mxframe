@@ -13,8 +13,9 @@ It is also an argument: that **Mojo** is a good language for building a data eng
 section says which Mojo feature the optimization relies on, or says plainly when the win is
 ordinary engineering that any language would get.
 
-> Numbers: [`docs/bench/m2p-engine.md`](bench/m2p-engine.md) and its shuffled-rows twin
-> (2026-10-13, mx-cpu, Polars and DuckDB in one run; Ryzen 9 5900X, 12 cores; a busy machine).
+> Numbers: [`docs/bench/m2s-engine.md`](bench/m2s-engine.md) and its shuffled-rows twin
+> (2026-10-14, mx-cpu, Polars and DuckDB in one run each; Ryzen 9 5900X, 12 cores; a quiet machine).
+> Each milestone's own section quotes the run that was current when it landed.
 > Earlier milestones' DuckDB figures included DuckDB's pyarrow import (see F-044 below); MXFrame's
 > own figures are unaffected. Charts: `pixi run python scripts/plot_progress.py`.
 
@@ -49,7 +50,7 @@ memory. Arrow then wraps that block without copying it.
 
 ```mermaid
 timeline
-    title SF10 engine-only total, 22 TPC-H queries (Polars: 14.9 s, DuckDB: 5.3 s)
+    title SF10 engine-only total, 22 TPC-H queries (Polars: 14.4 s, DuckDB: 5.1 s)
     before the executor : 22.7 s
     M1 native aggregates : 21.0 s
     M2a native leaf filters : 16.2 s
@@ -61,6 +62,7 @@ timeline
     M2i-M2l threads, semi/anti joins, expression keys : 6.45 s
     M2m-M2n sparse keys, count distinct on sorted keys : 3.82 s
     F-043 many groups, runtime join filter, string kernels : 3.27 s
+    F-046 dictionary codes, unsorted COUNT(DISTINCT), filtered top-N : 3.15 s (shuffled rows 8.64 → 4.97 s)
 ```
 
 ### M0 / M1: one native call runs a whole aggregate
@@ -278,28 +280,87 @@ first `.arrow()` call, about 70 ms per process. That had been counted in every D
 it explained most of the earlier "faster than DuckDB on 22/22 at SF1". The import is now staging,
 like MXFrame's own.
 
+### F-046: closing the gaps the random queries found
+
+F-044's random queries showed where DuckDB still led: joins, top-N with a filter, SELECT
+DISTINCT, COUNT(DISTINCT), and anything on shuffled rows. F-046 targeted those query shapes, not
+TPC-H queries. Its numbers are judged on the random suite and on shuffled tables first.
+
+- **Dictionary strings stay as codes** (F-046d, f, g, h).
+  - A Parquet string column arrives as a dictionary: small integer codes plus one list of
+    distinct values. Decoding it back into strings for every row was the single biggest cost on
+    string-heavy queries.
+  - Codes now pass through joins, single-table filters, SELECT DISTINCT and COUNT(DISTINCT).
+  - Chunks that carry their own dictionaries are remapped to one shared dictionary.
+  - Only the rows that reach the output are decoded.
+  - Random SF10 examples (measured when each slice landed):
+    - a join with a string group key: 1,597 → 639 ms;
+    - a SELECT DISTINCT: 375 → 43 ms.
+- **COUNT(DISTINCT) without sorted keys** (F-046b, h). M2n's sorted-run count only works when
+  the table is stored by the group key. On unsorted keys the count now picks one of three layouts:
+  - a radix-partitioned hash aggregate (partitions of about 64k consecutive keys, deduplicated in
+    cache, with no atomics);
+  - a byte map when (key range) x (value range) is small;
+  - partitions by the hash of the (key, value) pair when there are too few keys to keep every
+    core busy.
+
+  Shuffled SF10 Q21: 4.98 → 1.34 s in this run (DuckDB 2.77 s). The random COUNT(DISTINCT) queries at SF10
+  went from 0.31x to 0.89x of DuckDB's speed.
+- **WHERE + ORDER BY + LIMIT in one pass** (F-046e).
+  - The predicate runs per block, and rows that pass go straight into the per-worker top-k heaps.
+    No filtered table is built.
+  - Random SF10, when it landed: 420 → 63 ms (DuckDB 50 ms).
+
+*Mojo:* the dictionary remaps, the byte map and the pair partitions are `parallelize` closures
+over raw Arrow buffers. The byte map's per-key counts use `Atomic[DType.int64]` adds.
+
+**Result (one build, quiet machine, `docs/bench/m2s-*`, `random-*-m2s.md`):**
+
+| | before F-046 (F-044 run) | after F-046 |
+|---|---:|---:|
+| TPC-H SF10, rows shuffled: MXFrame total (DuckDB) | 8.64 s (5.78 s) | **4.97 s** (5.55 s) |
+| TPC-H SF10, stored rows: MXFrame total (DuckDB) | 3.27 s (5.31 s) | 3.15 s (5.08 s) |
+| random SF10 vs DuckDB, geometric mean | 0.75x | **1.09x** |
+| random SF1 shuffled vs DuckDB | 0.91x | **1.21x** |
+| random SF1 vs DuckDB | 0.63x | 0.83x |
+
+The stored-rows TPC-H total moved little (3.27 → 3.15 s, within run-to-run variation). No F-046
+work targeted it.
+
 ## Where it stands
 
 ![SF10: MXFrame against Polars per query](img/per-query-sf10.svg)
 
 | total of 22 queries | MXFrame (CPU) | Polars | DuckDB |
 |---|---:|---:|---:|
-| SF10, engine-only | **3.27 s** | 14.94 s | 5.31 s |
-| SF1, engine-only | **0.50 s** | 1.42 s | 0.63 s |
-| SF10, rows shuffled | 8.64 s | 15.21 s | **5.78 s** |
-| SF1, rows shuffled | 0.77 s | 1.34 s | **0.67 s** |
+| SF10, engine-only | **3.15 s** | 14.40 s | 5.08 s |
+| SF1, engine-only | **0.47 s** | 1.31 s | 0.63 s |
+| SF10, rows shuffled | **4.97 s** | 15.06 s | 5.55 s |
+| SF1, rows shuffled | **0.61 s** | 1.41 s | 0.66 s |
 
-- **Against Polars:** faster on all 21 verified queries at SF10 (the closest is Q16, about even;
-  Polars' Q1 result is wrong) and on 13 of 22 at SF1. On random queries it is faster at SF10 (40
-  of 50, 2.7x geometric mean) and on shuffled SF1 (2.4x), and about even on stock SF1 (1.04x).
-- **Against DuckDB:** MXFrame's lower total on stock TPC-H comes from Q21 alone (0.81 s against
-  3.04 s at SF10), which needs lineitem stored by order key. Leaving Q21 out, DuckDB's SF10 total
-  is lower (2.27 s against 2.46 s). DuckDB is faster on 13 of the 22 queries at SF10, on most
-  random queries (MXFrame runs at 0.63x, 0.91x and 0.75x DuckDB's speed on SF1, SF1 shuffled and
-  SF10, geometric mean) and on shuffled data. Next: joins, DISTINCT on unsorted keys, and top-N
-  with a filter (F-046).
-- MXFrame's results equal DuckDB's on all 44 TPC-H runs, the 44 shuffled ones, and 250 random
-  queries.
+- **Against Polars:**
+  - TPC-H: faster on 20 of the 21 verified queries at SF10 (Polars is 3% faster on Q16;
+    Polars' Q1 result is wrong) and on 11 of 22 at SF1.
+  - Random queries: faster at SF10 (43 of 50, 3.8x geometric mean), on shuffled SF1 (97 of 99,
+    3.1x), and on stock SF1 (57 of 99, 1.3x).
+- **Against DuckDB:**
+  - **The lower TPC-H totals rest on Q21:** 0.74 s against 2.81 s at SF10 on stored rows, and
+    1.34 s against 2.77 s shuffled. Leaving Q21 out, DuckDB's SF10 total is lower:
+    - stored rows: 2.27 s against MXFrame's 2.41 s;
+    - shuffled rows: 2.79 s against 3.63 s.
+  - DuckDB is faster on 12 of the 22 queries at SF10. The biggest gaps are joins: Q3, Q5, Q8,
+    Q11, Q12, Q17 and Q22 run at 0.44–0.69x DuckDB's speed.
+  - **Random queries** (geometric mean of DuckDB time / MXFrame time):
+
+    | | SF1 | SF1 shuffled | SF10 |
+    |---|---:|---:|---:|
+    | all queries | 0.83x | **1.21x** | **1.09x** |
+    | SELECT DISTINCT (where DuckDB leads most) | 0.57x | 0.99x | 0.62x |
+
+  - **Next:** joins on build sides that are not direct-addressable, SELECT DISTINCT, and the
+    TPC-H join queries above.
+- **Correctness:** MXFrame's results equal DuckDB's on all 44 TPC-H runs, the 44 shuffled ones,
+  and the 250 random queries.
 
 ![SF1: MXFrame against Polars per query](img/per-query-sf1.svg)
 
@@ -312,18 +373,28 @@ like MXFrame's own.
   Parquet through PyArrow, so that gap remains (F-021).
 - **MXFrame's kernel warm-up is staged.** `import mxframe` warms the kernel libraries in a
   background thread that finishes during the untimed load; Polars and DuckDB have no such step.
-- **Polars' Q1 is an outlier.** At SF10 its first run takes 2.6 s, and its result differs from
-  DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are MXFrame 3.20 s, Polars 12.28 s,
-  DuckDB 5.17 s.
+- **Polars' Q1 is an outlier.** At SF10 its first run takes 2.7 s, and its result differs from
+  DuckDB's (float32 accumulation). Leaving Q1 out, SF10 totals are MXFrame 3.09 s, Polars 11.68 s,
+  DuckDB 4.94 s.
 - **DuckDB is timed without its pyarrow import** (staging, like MXFrame's import); earlier
   versions of this page counted it and overstated MXFrame's lead.
-- **TPC-H's stored order helps MXFrame on Q21.** On shuffled rows the sorted-run count-distinct
-  doesn't apply and Q21 takes about 5 s at SF10 (DuckDB about 2.9 s).
-- **The machine was shared.** Other projects used about 5 cores during the run (median load
-  average about 7).
-  A quiet-machine rerun (F-009's protocol) is still to do before any
-  published claim.
+- **TPC-H's stored order helps MXFrame on Q21.** On stored rows Q21 uses the sorted-run
+  count-distinct (0.74 s at SF10). Shuffled, it uses the hash layouts from F-046 (1.34 s). DuckDB
+  takes about 2.8 s either way.
+- **One build, a quiet machine.** Numbers come from `docs/bench/m2s-engine*.md` and
+  `random-*-m2s.md`.
+  - Shuffled TPC-H and the three random suites ran 01:21–01:50 on 2026-10-14. They started after
+    the load average had stayed under 2 for 5 minutes.
+  - The first stored-rows TPC-H pass overlapped a scheduled snapshot cleanup, and every engine
+    came out slower. It was discarded.
+  - The stored-rows run shown here was rerun at 02:05, after 5 minutes under load 1. The only
+    processes sampled during it besides the benchmark were a browser at about a quarter of one
+    core and, in the last sample, one short process at 98% of one core.
+
+  SF1 queries take a few milliseconds, so single SF1 figures can move by 10–20% between runs.
 - **Some wins are not Mojo.** M2f (imports), M2i (fewer workers) and M2k (physical cores) are
   ordinary engineering. The Mojo-specific part is everything that runs per row: the interpreter,
   the lookups, the hash tables, the gathers, DISTINCT and the run-based count, compiled ahead of
   time from code that reads like Python. M2m (work proportional to the data) is engineering too.
+  So are F-046's ideas: keeping dictionary codes, the byte map and the fused filter + top-k are
+  algorithms any engine could use. Mojo's part there is again the parallel per-row loops.
