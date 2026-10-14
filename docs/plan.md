@@ -510,7 +510,15 @@ Found 2026-10-14 while documenting auto (F-052); the review showed it holds on e
 - [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
 - [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again
 
-## F-039 The optimization story: README with visuals [doing] (open items move to F-051)
+## F-054 Finish the docs [review]
+Asked 2026-10-14 ("add license, finish docs, hold off on new dev")
+- [x] `LICENSE` (Apache-2.0, official text), in the sdist via `MANIFEST.in`, linked from the README
+- [x] `docs/api.md` rewritten against the code: constructors, joins, `compute()` arguments, inspection, SQL limits, devices, source layout
+- [x] `CONTRIBUTING.md`: the three CPU layers, every compiled library and its build command, `pixi run test`, adding an operator, benchmarking
+- [x] `docs/auto-mode.md` links the site page and says its numbers predate 0.6.0 (F-053); `docs/benchmarks.md` headline is 0.6.0; `docs/vision-and-architecture.md` points to the current architecture
+- [x] kernel visualizer published on Pages and linked from the README and the site nav; CHANGELOG [Unreleased]
+
+## F-039 The optimization story: README with visuals [done] (open items closed by F-051, the how-it-got-fast page)
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13
 - [x] draft done 2026-10-13 (review by Abhishek pending): `docs/optimizations.md`, `docs/img/{progress,per-query-sf10,per-query-sf1}.svg` from `scripts/plot_progress.py` (dataviz palette validated, light and dark), README section "How the CPU engine got fast"
 - [ ] `docs/optimizations.md`: one section per optimization (M0 executor ... M2h distinct and later): what was slow and why, what the engine does now, a diagram (mermaid) of before / after, the before / after numbers from `docs/bench/`, and which Mojo feature it relies on (compile-time specialization of the keyed / plain pipeline, closures inlined into `parallelize`, SIMD widths from `simd_width_of`, AOT shared libraries over the Arrow C Data Interface) or that it is plain engineering (no `pyarrow.compute` import)

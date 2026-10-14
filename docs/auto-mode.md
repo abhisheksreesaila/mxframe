@@ -5,8 +5,12 @@ MXFrame can run a query on the CPU, on the GPU, or on both at once. With
 your machine. This page explains the algorithm we built during the auto-mode
 work and the measurements that shaped it.
 
-**Visual version:** [docs/auto-mode.html](https://htmlpreview.github.io/?https://github.com/abhisheksreesaila/mxframe/blob/main/docs/auto-mode.html)
-(the same content with drawn diagrams; the link renders the file from the repository).
+**Interactive version:** [How device="auto" decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) on the docs site (the rules with live inputs, and the measured results).
+
+> **Status in 0.6.0:** the measurements on this page are from 2026-10-12, before the native Mojo
+> executor. Under `device="auto"` the native executor doesn't run yet (when auto picks the CPU it
+> uses the fused pipeline), so the 0.6.0 benchmark numbers apply to `device="cpu"`, not to auto.
+> Re-measuring auto and fixing this is ticket F-053 in [plan.md](plan.md).
 
 All numbers below come from the reference machine: AMD Ryzen 9 5900X (24 threads,
 dual-channel DDR4) and an NVIDIA RTX 3090 on PCIe 4.0 x8, TPC-H data at scale factor 10.

@@ -11,3 +11,4 @@ prune llm-ctx
 prune scripts
 prune kernels
 global-exclude __pycache__ *.py[cod]
+include LICENSE

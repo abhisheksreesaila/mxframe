@@ -1,5 +1,10 @@
 # 🔭 MXFrame — Vision & Architecture
 
+> This is the original design document, kept for its reasoning. For how the engine works today
+> (the native Mojo executor, the fused pipeline, the per-operator AOT path, and which one answers
+> a query), see [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) and
+> [api.md](api.md#source-layout).
+
 ---
 
 ## 1. Vision

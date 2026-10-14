@@ -117,9 +117,9 @@ SQL covers `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON` and
 | [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) | Each optimization, and which wins are Mojo; long form in [docs/optimizations.md](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md) |
 | [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) | CPU, GPU or both, from costs measured on your machine |
 | [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) | The longer API page; design and internal layers |
-| [Kernel visualizer](https://htmlpreview.github.io/?https://github.com/abhisheksreesaila/mxframe/blob/main/visualize/mxframe_pipeline.html) | Step-by-step GPU kernel plans for Q4, Q6, Q12, Q13, Q14 and Q21 |
+| [Kernel visualizer](https://abhisheksreesaila.github.io/mxframe/visualize/mxframe_pipeline.html) | Step-by-step GPU kernel plans for Q4, Q6, Q12, Q13, Q14 and Q21 |
 | [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.5.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.5.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md) | Release history; dev setup and writing Mojo kernels |
 
 Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`.
 
-License: Apache-2.0 (declared in `pyproject.toml`).
+License: [Apache-2.0](https://github.com/abhisheksreesaila/mxframe/blob/main/LICENSE).

@@ -6,85 +6,25 @@
 
 ## 📐 Architecture Overview
 
-```
-Python API (LazyFrame / SQL)
-        │
-        ▼
-  LogicalPlan AST
-        │
-        ▼
-   Optimizer         ← filter pushdown, join reordering
-        │
-        ▼
-   Compiler          ← translates plan nodes → dispatch calls
-        │
-   ┌────┴─────────────────────────────┐
-   │                                  │
-   ▼                                  ▼
-AOT Kernels (ctypes)          PyArrow fallback
-libmxkernels_aot.so           (string ops, pc.* calls)
-libmxkernels_aot_gpu.so
-   │
-   ├── CPU: direct ctypes call → Mojo function runs on CPU
-   └── GPU: MAX Engine DeviceContext → kernel dispatched to GPU
-```
+A query is a lazy plan built in Python. At `.compute(device="cpu")` it is validated, optimized, and then answered by one of three CPU layers:
 
-### The Two Compile-Time Artifacts
+1. **Native Mojo executor** (`native_exec.py` → `kernels_aot/libmxexec_cpu.so`, source `executor_cpu.mojo`): one ctypes call over the Arrow C Data Interface runs a whole aggregate over a single table (filter, group keys, aggregates, HAVING, ORDER BY, LIMIT). It also serves filter, gather, DISTINCT, COUNT(DISTINCT), top-k and string-slice calls for the layers below.
+2. **Fused pipeline** (`pipeline_exec.py` → `libmxpipeline_cpu.so` / `libmxpipeline_gpu.so`): filter + group + aggregate in one pass, for aggregates the executor declines.
+3. **Per-operator path** (`custom_ops.py` → `libmxkernels_aot.so` / `libmxkernels_aot_gpu.so`, plus `join_engine.py`, `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so`): everything else, one kernel per operator. Joins are built here first; the aggregate on the joined table then goes back to layers 1 and 2.
 
-| File | Built how | Used how |
+The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html) walks through each layer, its seams, when it declines and the environment switches (`MXFRAME_NATIVE=0`, `MXFRAME_FUSED_PIPELINE=0`, ...). The file-by-file layout is in [docs/api.md](docs/api.md#source-layout).
+
+### The compiled libraries
+
+All are built ahead of time, committed, and shipped in the wheel; nothing compiles at run time. CPU libraries target `x86-64-v3` (AVX2), so a wheel doesn't SIGILL on older machines.
+
+| Library | Source | Build |
 |---|---|---|
-| `kernels_aot/libmxkernels_aot.so` | `mojo build --emit shared-lib kernels_aot/kernels_aot.mojo` | `ctypes.CDLL()` at process start, called directly |
-| `kernels_aot/libmxkernels_aot_gpu.so` | `mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo` | Loaded once, GPU kernels invoked via MAX DeviceContext |
-
-**Key insight:** These `.so` files are compiled **once** at build time and shipped in the wheel.  
-At runtime — `ctypes.CDLL()` takes ~1 ms. No JIT, no MLIR graph build, no recompilation ever.
-
----
-
-## 🗂️ Directory Map
-
-```
-┌── __init__.py              Public API re-exports
-├── lazy_expr.py             Expr AST nodes: col(), lit(), when(), arithmetic, agg
-├── lazy_frame.py            LazyFrame, LazyGroupBy, Scan, .compute()
-├── compiler.py              AST → MAX Graph (legacy) or AOT dispatch
-├── custom_ops.py            AOT kernel dispatch, join implementations,
-│                            group_encode, shape inference, caching
-├── optimizer.py             Plan rewrites
-├── plan_validation.py       Pre-run sanity checks
-├── sql_frontend.py          sqlglot → LogicalPlan
-│
-├── kernels/                 Mojo kernel SOURCE (not shipped in wheel)
-│   ├── __init__.mojo
-│   ├── group_sum.mojo        scatter-add by group label (CPU + GPU)
-│   ├── group_min.mojo        scatter-min
-│   ├── group_max.mojo        scatter-max
-│   ├── group_mean.mojo       scatter-mean
-│   ├── group_count.mojo      scatter-count
-│   ├── group_composite.mojo  multi-key groupby via composite int64 key
-│   ├── join_count.mojo       inner join: count matches per left row
-│   ├── join_scatter.mojo     inner join: emit (left_idx, right_idx) pairs
-│   ├── join_count_left.mojo  left-outer join: count (min 1 per left row)
-│   ├── join_scatter_left.mojo left-outer join: emit pairs, -1 for no-match
-│   ├── filter_gather.mojo    compacted gather with mask
-│   ├── gather_rows.mojo      permute rows by index array
-│   ├── sort_indices.mojo     argsort
-│   ├── unique_mask.mojo      mark first-in-sorted-run
-│   └── masked_global_agg.mojo masked sum / sum-of-products
-│
-├── kernels_aot/             AOT entry point Mojo files + compiled .so files
-│   ├── kernels_aot.mojo      @export CPU functions (ctypes ABI)
-│   ├── kernels_aot_gpu.mojo  @export GPU functions (MAX DeviceContext ABI)
-│   ├── libmxkernels_aot.so   ← COMPILED (tracked in git LFS or built locally)
-│   └── libmxkernels_aot_gpu.so
-│
-└── scripts/
-    ├── bench_simple.py       4-column benchmark: Pandas|Polars|MX CPU|MX GPU
-    ├── benchmark_tpch.py     All 22 TPC-H query implementations + data generators
-    ├── _test_aot_smoke.py    AOT kernel unit tests
-    ├── _test_phase*.py       Integration test suites
-    └── build_kernels.sh      Rebuild both .so files
-```
+| `libmxexec_cpu.so` | `kernels_aot/executor_cpu.mojo` | `bash scripts/build_pipeline.sh exec` |
+| `libmxpipeline_cpu.so`, `libmxpipeline_gpu.so` | `pipeline_cpu.mojo`, `pipeline_gpu.mojo` | `bash scripts/build_pipeline.sh cpu` / `gpu` |
+| `libmxkernels_aot.so`, `libmxkernels_aot_gpu.so` | `kernels_aot.mojo`, `kernels_aot_gpu.mojo` | step 2 of `scripts/release.sh` |
+| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | same form: `pixi run mojo build kernels_aot/<src>.mojo -I kernels_aot --target-cpu x86-64-v3 --emit shared-lib -o kernels_aot/<lib>.so` |
+| `kernels.mojoc` | `kernels/*.mojo` | `bash scripts/build_kernels.sh` (the MAX Graph custom ops) |
 
 ---
 
@@ -95,80 +35,42 @@ At runtime — `ctypes.CDLL()` takes ~1 ms. No JIT, no MLIR graph build, no reco
 ```sh
 git clone https://github.com/abhisheksreesaila/mxframe
 cd mxframe
-pixi install          # installs Python + Mojo + all deps into .pixi/envs/default/
-pixi run setup-mxframe   # creates mxframe symlink in site-packages
+pixi install             # Python, Mojo and all dependencies into .pixi/envs/default/
+pixi run setup-mxframe   # links the repo into site-packages as `mxframe`
 ```
 
-### 2. Make a Python Change
+Python changes take effect immediately; Mojo changes need the library rebuilt (table above).
 
-Edit any of the `.py` files directly (compiler, lazy_frame, custom_ops, etc.).  
-The editable install means changes take effect immediately — no reinstall needed.
+### 2. Test
 
 ```sh
-# Verify your change with smoke tests
-pixi run python3 scripts/_test_aot_smoke.py
-
-# Run specific query tests
-pixi run python3 scripts/_test_phase6_tpch_tier2.py
-
-# Quick benchmark check
-pixi run python3 scripts/bench_simple.py --rows 100000 --runs 2 --queries 1,3,6
+pixi run test        # pytest over tests/ (works from any checkout or worktree)
+pixi run test-all    # the older scripts/_test_*.py suites, as CI runs them
+pixi run python3 scripts/_check_gpu.py   # GPU sanity check
 ```
 
-### 3. Add a New Mojo Kernel
+New tests go in `tests/`. A change to the engine should test both the answer and the path that produced it (`native_exec.last_path()`, `lf.last_compile_provenance`), so a silent decline can't pass.
 
-See the [Kernel Writing Guide](#-writing-a-new-mojo-kernel) below.
+### 3. Add an operator to the native executor
 
-After writing the kernel:
+Follow the worked example on the [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html#add-operator): plan node, optimizer, the Python fallback, the encoding in `native_exec.py`, the Mojo function in `executor_cpu.mojo`, the rebuild, and tests against `MXFRAME_NATIVE=0` and DuckDB.
+
+### 4. Benchmark before and after
 
 ```sh
-# Rebuild the CPU .so
-pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
-    -o kernels_aot/libmxkernels_aot.so
-
-# Rebuild the GPU .so
-pixi run mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo \
-    -o kernels_aot/libmxkernels_aot_gpu.so
-
-# Verify
-pixi run python3 scripts/_test_aot_smoke.py
+# TPC-H, query time only, fresh process per query, checked against DuckDB
+pixi run python scripts/bench_user_felt.py --mode engine --sf 1 --engines duckdb,mx-cpu --name my-change
+# seeded random queries over the same tables
+pixi run python scripts/bench_random/run.py --sf 1 --n 100 --name random-sf1-my-change
 ```
 
-### 4. Run the Full Test Suite
-
-```sh
-# Unit tests (AOT kernel smoke)
-pixi run python3 scripts/_test_aot_smoke.py
-
-# Integration tests
-pixi run python3 scripts/_test_phase0_compiler.py
-pixi run python3 scripts/_test_phase1.py
-pixi run python3 scripts/_test_phase4.py
-pixi run python3 scripts/_test_phase5.py
-pixi run python3 scripts/_test_phase6_tpch_tier2.py
-pixi run python3 scripts/_test_phase_sql.py
-pixi run python3 scripts/_test_phase_q5_q10.py
-
-# Or run all at once
-pixi run test-all
-
-# GPU sanity check
-pixi run python3 scripts/_check_gpu.py
-```
-
-### 5. Benchmark Before/After
-
-```sh
-# Full 22 queries, 1M rows, 3 hot runs
-pixi run python3 scripts/bench_simple.py --rows 1000000 --runs 3
-
-# Specific queries only
-pixi run python3 scripts/bench_simple.py --rows 1000000 --runs 3 --queries 1,6,22
-```
+Run on a quiet machine (load under 2, no scheduled jobs); see `docs/lessons.md`.
 
 ---
 
-## ✏️ Writing a New Mojo Kernel
+## ✏️ Writing a New Mojo Kernel (per-operator path)
+
+This is the older per-operator kernel path (layer 3). New engine work usually goes into the native executor instead (see step 3 above).
 
 ### Step 1 — Write the kernel in `kernels/`
 
