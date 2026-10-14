@@ -55,14 +55,14 @@
 
   <span class="kick">// behind the scenes · for porting</span>
   <h1>How a query runs, layer by layer</h1>
-  <p>A query is built lazily in Python and handed down a stack. Each layer either answers the whole plan or declines and lets the next one try, so a plan is never half-run in one place and half in another: the first layer that accepts it runs all of it. Declining is cheap and silent; the answer is the same whichever layer gave it.</p>
+  <p>A query is built lazily in Python and handed down a stack. What happens next depends on the shape of the plan. For an aggregate over a single table (a scan with filters, then group and aggregate), each of layers 04 to 06 either runs the whole plan or declines and lets the next one try: the first to accept it runs all of it. A plan with joins is not one piece: the joins run first, in the join engine (with native filter and gather calls), and the aggregate on top of the joined table then goes down the stack. A plan that is not an aggregate (a filter, sort, limit or distinct on its own) runs in layer 06, which calls the native helpers one operator at a time. Declining is cheap and silent; the answer is the same whichever path produced it.</p>
 
   <h2 id="path">1. The path a query takes</h2>
   <div class="grid stackgrid">
     <div id="stack" role="group" aria-label="Layers a query passes through"></div>
     <div class="card" id="detail" aria-live="polite"></div>
   </div>
-  <p style="font-size:13.5px;margin-top:14px">Layers 04 to 06 are tried in that order on the CPU; the first to accept the plan runs it. Layer 07 is dashed because it sits beside the stack, not under it: <code>device="auto"</code> picks the device right after the optimizer, and then the stack runs on that device. The native executor is CPU only.</p>
+  <p style="font-size:13.5px;margin-top:14px">For a single-table aggregate, layers 04 to 06 are tried in that order on the CPU and the first to accept it runs all of it. Joins are materialised before that (see layer 06), and a plan that is not an aggregate goes straight to layer 06. Layer 07 is dashed because it sits beside the stack, not under it: <code>device="auto"</code> picks the device right after the optimizer, and then the stack runs on that device. The native executor is CPU only.</p>
 
   <h2 id="boundary">2. What crosses the Python ↔ Mojo boundary</h2>
   <p>One ctypes call per query into <code data-path="kernels_aot/libmxexec_cpu.so">kernels_aot/libmxexec_cpu.so</code>. Python only plans and packs; Mojo does the work. Nothing is copied on the way in, and the result is read in place on the way out.</p>
@@ -135,7 +135,7 @@ pixi run test                             <span class="c"># pytest on tests/, fr
     <tr><th>Variable</th><th>Default</th><th>What it does</th><th>Read in</th></tr>
     <tr><td><code data-env="MXFRAME_NATIVE">MXFRAME_NATIVE</code></td><td>on</td><td><code>0</code> turns the native executor off; the fused pipeline and kernel paths answer.</td><td><code data-path="native_exec.py">native_exec.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_FUSED_PIPELINE">MXFRAME_FUSED_PIPELINE</code></td><td>on</td><td><code>0</code> turns the fused pipeline off (A/B timing against the kernel path).</td><td><code data-path="pipeline_exec.py">pipeline_exec.py</code></td></tr>
-    <tr><td><code data-env="MXFRAME_CPU_THREADS">MXFRAME_CPU_THREADS</code></td><td>one per physical core</td><td>Worker threads for the Mojo kernels.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code>, <code data-path="aot_kernels.py">aot_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_CPU_THREADS">MXFRAME_CPU_THREADS</code></td><td>native executor and fused pipeline: one per physical core, fewer for a small input (one per 128k rows); AOT kernels: every core in the process's affinity mask, hyperthreads included</td><td>Worker threads for the Mojo kernels. One value sets all three.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code>, <code data-path="aot_kernels.py">aot_kernels.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_EXEC_CPU_LIB">MXFRAME_EXEC_CPU_LIB</code></td><td>kernels_aot/</td><td>Path to a <code>libmxexec_cpu.so</code> to load instead of the shipped one (your own build).</td><td><code data-path="native_exec.py">native_exec.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_PIPELINE_CPU_LIB">MXFRAME_PIPELINE_CPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxpipeline_cpu.so</code>.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code></td></tr>
     <tr><td><code data-env="MXFRAME_PIPELINE_GPU_LIB">MXFRAME_PIPELINE_GPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxpipeline_gpu.so</code>.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code></td></tr>
@@ -195,14 +195,14 @@ pixi run test                             <span class="c"># pytest on tests/, fr
   "next": "Layer 04 for device=\"cpu\"; under device=\"auto\", layer 07 first picks the device.",
   "see": "<code>compute(verbose=True)</code> prints the passes; the fused and kernel paths put them in <code>lf.last_compile_provenance[\"optimizer_trace\"]</code>.",
   "labels": []},
- {"id": "native", "name": "Native Mojo executor", "short": "One call runs the whole plan.",
+ {"id": "native", "name": "Native Mojo executor", "short": "One call runs a whole aggregate plan.",
   "does": "Runs Limit? Sort? Having? Aggregate(Filter*(Scan)) entirely in Mojo: filter, group keys (dictionary strings, int32, int64), sum, mean, count, min, max, HAVING, ORDER BY and LIMIT, on all physical cores. Separate calls in the same library serve filter, gather, distinct, count distinct, top-k and string slices for the operators around it.",
   "files": ["native_exec.py", "kernels_aot/executor_cpu.mojo", "kernels_aot/libmxexec_cpu.so", "pipeline_program.py"],
   "symbols": ["native_exec.py::try_execute", "native_exec.py::enabled", "native_exec.py::last_decline", "native_exec.py::last_path", "kernels_aot/executor_cpu.mojo::mx_execute"],
   "seam_in": "The plan, packed into an int64 plan block, and every input column chunk exported as an Arrow C Data Interface ArrowArray struct. One ctypes call: lib.mx_execute(plan_addr, out_addr).",
   "seam_out": "An output block of buffer addresses in a Mojo-owned arena, wrapped without copying into a pyarrow Table.",
-  "declines": "Returns None, and records the reason, when: the plan is not an aggregate; the device is not cpu (a GPU session's own fallback is the exception); a CPU+GPU co-processing policy is active; the library is not built; a column has nulls or an unsupported type; an int64 value is past 2^53; or the executor returns a negative code. It also declines when MXFRAME_NATIVE=0.",
-  "next": "Layer 05, the fused pipeline.",
+  "declines": "Returns None, and records the reason, when (for example): the plan is not an aggregate; its input is not a scan of one table (a join has been materialised by then, so a join's aggregate is a scan of the joined table); the device is not cpu (a GPU session's own fallback is the exception); a CPU+GPU co-processing policy is active; the library is not built; the input is empty; a column has nulls or an unsupported type; a filter or aggregate expression is outside the bytecode compiler; a derived group key is not a small integer range; a HAVING is anything but AND-ed aggregate-versus-number comparisons; a sort is by an expression or by something that is not a key or an aggregate; an int64 value is past 2^53; or the executor returns a negative code. It also declines when MXFRAME_NATIVE=0. native_exec.last_decline() gives the exact reason.",
+  "next": "Layer 05, the fused pipeline, for the same aggregate.",
   "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"native\"</code>. When it is not, <code>mxframe.native_exec.last_decline()</code> says why.",
   "switch": "MXFRAME_NATIVE", "switch_off": "0",
   "labels": ["native"]},
@@ -213,17 +213,17 @@ pixi run test                             <span class="c"># pytest on tests/, fr
   "seam_in": "Column buffers and the group-id array as raw pointers through ctypes, plus the bytecode program.",
   "seam_out": "Partial aggregates as NumPy arrays, which Python finalises into a pyarrow Table.",
   "declines": "Returns None, recording compiler.last_fused_decline, when: the plan is not Aggregate(Filter*(Scan)); a column has nulls or an unsupported type; an expression is outside the bytecode compiler; an int64 column holds values past 2^53; the kernel library is not built; or MXFRAME_FUSED_PIPELINE=0.",
-  "next": "Layer 06, the AOT kernels.",
+  "next": "Layer 06, the AOT kernels, for the same aggregate.",
   "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"fused_pipeline_cpu\"</code>, <code>\"fused_pipeline_gpu\"</code>, <code>\"fused_pipeline_split\"</code> (CPU and GPU together) or <code>\"fused_pipeline_gpu_resident\"</code>.",
   "switch": "MXFRAME_FUSED_PIPELINE", "switch_off": "0",
   "labels": ["fused_pipeline_"]},
  {"id": "aot", "name": "AOT kernels", "short": "Single operators, CPU or GPU.",
-  "does": "The general path. CustomOpsCompiler walks the plan one operator at a time and calls an ahead-of-time compiled Mojo kernel for each heavy step (group sum, join, sort, gather, filter), with PyArrow doing the glue. Joins are materialised here before the aggregate above them runs.",
+  "does": "The general path, and the only one that takes a plan that is not an aggregate. CustomOpsCompiler first materialises every join (join_engine.py, which calls the native filter and gather helpers of layer 04 around its Mojo join kernels). It then offers the aggregate on top, now over a plain table, to layers 04 and 05, and only if both decline does it walk the rest one operator at a time, calling an ahead-of-time compiled Mojo kernel for each heavy step (group sum, sort, gather, filter), with PyArrow doing the glue. For filter, top-k and distinct it calls the native executor's separate functions (try_filter, try_filter_topk, try_topk, try_distinct) from inside this path.",
   "files": ["custom_ops.py", "aot_kernels.py", "join_engine.py", "kernels_aot/kernels_aot.mojo", "kernels_aot/kernels_aot_gpu.mojo", "kernels_aot/libmxkernels_aot.so", "kernels_aot/libmxkernels_aot_gpu.so"],
-  "symbols": ["custom_ops.py::CustomOpsCompiler", "aot_kernels.py::AOTKernels", "aot_kernels.py::AOTKernelsGPU"],
+  "symbols": ["custom_ops.py::CustomOpsCompiler", "custom_ops.py::_materialize_joins", "join_engine.py::materialize", "native_exec.py::try_filter", "native_exec.py::try_filter_topk", "native_exec.py::try_topk", "native_exec.py::try_distinct", "aot_kernels.py::AOTKernels", "aot_kernels.py::AOTKernelsGPU"],
   "seam_in": "NumPy or Arrow buffers as pointers, one ctypes call per kernel.",
   "seam_out": "NumPy or Arrow arrays; the next operator picks them up.",
-  "declines": "A kernel that does not fit the data (type, size) falls back to PyArrow compute for that operator. If the kernel library is missing or stale, the AOT path is switched off with one warning and the PyArrow-based path runs instead of the query failing.",
+  "declines": "This layer takes whatever the two above it decline. A kernel that does not fit the data (type, size) falls back to PyArrow compute for that operator. If the kernel library is missing or stale, the AOT path is switched off with one warning and the PyArrow-based path runs instead of the query failing.",
   "next": "PyArrow compute is the floor; nothing sits below it, so a plan always gets an answer.",
   "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"cpu_aot\"</code>, <code>\"compiled\"</code>, <code>\"join_mojo_shortcut\"</code>, <code>\"pyarrow_shortcut\"</code>, <code>\"masked_global_agg_mojo\"</code>, <code>\"global_agg_pyarrow\"</code> or <code>\"arrow_null_semantics\"</code>.",
   "labels": ["cpu_aot", "compiled", "join_mojo_shortcut", "pyarrow_shortcut", "masked_global_agg_mojo", "global_agg_pyarrow", "arrow_null_semantics"]},
@@ -267,7 +267,7 @@ function select(i, scroll) {
 
 DATA.layers.forEach((l, i) => {
   if (i === DATA.layers.length - 1) stack.insertAdjacentHTML("beforeend", `<div class="arrow">beside the stack: picks the device</div>`);
-  else if (i) stack.insertAdjacentHTML("beforeend", `<div class="arrow">↓${i >= 4 ? " if it declines, the next layer answers" : i === 3 ? " if it declines" : ""}</div>`);
+  else if (i) stack.insertAdjacentHTML("beforeend", `<div class="arrow">↓${i === 3 ? " the optimizer never declines; it hands the plan on" : i === 4 ? " if the native executor declines" : i === 5 ? " if the fused pipeline declines (joins and non-aggregate plans arrive here directly)" : ""}</div>`);
   const b = document.createElement("button");
   b.type = "button";
   b.className = "layer" + (l.aside ? " auto" : "");
