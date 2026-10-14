@@ -1,0 +1,31 @@
+{
+  "about": "Co-processing numbers for device=\"auto\". They were measured by hand in one session and written up in markdown only (no benchmark script emits them), so each block cites the file it comes from; tests/test_site_auto_mode.py checks every value appears in that file.",
+  "machine": "Ryzen 9 5900X (24 threads), RTX 3090 on PCIe 4.0 x8, TPC-H SF10 lineitem (60M rows)",
+  "fused_stage": {
+    "query": "SF10 Q1, fused aggregation stage, 60M rows",
+    "source": "docs/auto-mode.md",
+    "unit": "ms",
+    "rows": [
+      {"key": "cpu", "label": "CPU only, 24 threads", "device": "cpu", "ms": 57},
+      {"key": "gpu_host", "label": "GPU only, data in host memory", "device": "gpu", "ms": 353},
+      {"key": "queue_host", "label": "Morsel queue streaming host to GPU", "device": "queue", "ms_lo": 67, "ms_hi": 160},
+      {"key": "gpu_resident", "label": "GPU only, data resident on the GPU", "device": "gpu", "ms": 39},
+      {"key": "queue_resident", "label": "Morsel queue, data resident", "device": "queue", "ms": 42},
+      {"key": "split_resident", "label": "Static split, data resident", "device": "split", "ms": 25}
+    ]
+  },
+  "session": {
+    "query": "SF10 Q1, one session, 0.5 s between queries; queries 1, 2, then 3 and later",
+    "source": "docs/auto-mode.md",
+    "unit": "ms",
+    "rows": [
+      {"key": "cpu", "label": "device=\"cpu\"", "q1": 177, "q2": 58, "q3_lo": 58, "q3_hi": 65},
+      {"key": "auto", "label": "device=\"auto\"", "q1": 185, "q2_lo": 71, "q2_hi": 73, "q3_lo": 43, "q3_hi": 49}
+    ]
+  },
+  "repeat_speedup": {
+    "label": "Repeat queries on resident data, vs CPU-only",
+    "factor": 1.35,
+    "source": "docs/benchmarks.md"
+  }
+}

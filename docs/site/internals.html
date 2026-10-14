@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Behind the scenes: how a query runs in MXFrame</title>
+<meta name="description" content="The path a MXFrame query takes from LazyFrame or SQL to the native Mojo executor, where each layer declines and who answers next, how to add an operator, and how to build the Mojo libraries.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script src="site.js"></script>
+<style>
+  .stackgrid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.55fr); align-items: start; }
+  #stack { display: flex; flex-direction: column; }
+  #stack .arrow { padding: 2px 0; }
+  #stack .layer .t { display: block; font-weight: 600; }
+  #stack .layer.auto { border-style: dashed; }
+  #detail { position: sticky; top: 16px; }
+  #detail h3 { margin: 0 0 4px; font-size: 18px; }
+  #detail dl { margin: 12px 0 0; }
+  #detail dt { font: 11px var(--font-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); margin-top: 14px; }
+  #detail dd { margin: 3px 0 0; color: var(--text-mid); }
+  #detail ul { margin: 3px 0 0; padding-left: 18px; }
+  #detail li { margin: 2px 0; overflow-wrap: anywhere; }
+  .off { display: inline-block; margin-top: 4px; }
+  .xing { display: grid; grid-template-columns: minmax(0, 1fr) 190px minmax(0, 1fr); gap: 0; align-items: stretch; }
+  .xing .box { border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); }
+  .xing .box ol { margin: 0; padding: 12px 16px 14px 34px; font-size: 13.5px; }
+  .xing .box li { margin: 5px 0; }
+  .xing .wire { display: flex; flex-direction: column; justify-content: center; gap: 22px; text-align: center; padding: 0 8px;
+    font: 11px/1.4 var(--font-mono); color: var(--text-dim); }
+  .xing .wire b { display: block; color: var(--accent); font-size: 18px; line-height: 1; }
+  .walk { counter-reset: step; list-style: none; padding: 0; margin: 12px 0; }
+  .walk > li { counter-increment: step; position: relative; padding: 0 0 14px 40px; }
+  .walk > li::before { content: counter(step); position: absolute; left: 0; top: 0; width: 26px; height: 26px; border-radius: 50%;
+    background: var(--accent-dim); color: var(--accent); font: 700 12px/26px var(--font-mono); text-align: center; }
+  .walk > li > b { color: var(--text); }
+  .walk p { margin: 3px 0 0; }
+  pre.cmd { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); }
+  td code, li code, p code { overflow-wrap: anywhere; }
+  .tablewrap { overflow-x: auto; }
+  @media (max-width: 820px) {
+    #detail { position: static; }
+    .xing { grid-template-columns: 1fr; }
+    .xing .wire { flex-direction: row; justify-content: center; padding: 12px 0; gap: 18px; }
+    .xing .wire b { transform: rotate(90deg); }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+<nav class="side"></nav>
+<main>
+  <div class="read"><b>What you're looking at</b>The path one query takes through the engine, for someone who wants to port it to another stack or add an operator. The numbered stack is clickable: pick a layer and the panel beside it shows what that layer does, its files, what goes in and out, when it says "not me" and which layer answers next, and how to see which one ran. Every file, function and environment variable named on this page exists in the repo, and a test checks that.</div>
+
+  <span class="kick">// behind the scenes · for porting</span>
+  <h1>How a query runs, layer by layer</h1>
+  <p>A query is built lazily in Python and handed down a stack. What happens next depends on the shape of the plan. For an aggregate over a single table (a scan with filters, then group and aggregate), each of layers 04 to 06 either runs the whole plan or declines and lets the next one try: the first to accept it runs all of it. A plan with joins is not one piece: the joins run first, in the join engine (with native filter and gather calls), and the aggregate on top of the joined table then goes down the stack. A plan that is not an aggregate (a filter, sort, limit or distinct on its own) runs in layer 06, which calls the native helpers one operator at a time. Declining is cheap and silent; the answer is the same whichever path produced it.</p>
+
+  <h2 id="path">1. The path a query takes</h2>
+  <div class="grid stackgrid">
+    <div id="stack" role="group" aria-label="Layers a query passes through"></div>
+    <div class="card" id="detail" aria-live="polite"></div>
+  </div>
+  <p style="font-size:13.5px;margin-top:14px">For a single-table aggregate, layers 04 to 06 are tried in that order on the CPU and the first to accept it runs all of it. Joins are materialised before that (see layer 06), and a plan that is not an aggregate goes straight to layer 06. Layer 07 is dashed because it sits beside the stack, not under it: <code>device="auto"</code> picks the device right after the optimizer, and then the stack runs on that device. The native executor is CPU only.</p>
+
+  <h2 id="boundary">2. What crosses the Python ↔ Mojo boundary</h2>
+  <p>One ctypes call per query into <code data-path="kernels_aot/libmxexec_cpu.so">kernels_aot/libmxexec_cpu.so</code>. Python only plans and packs; Mojo does the work. Nothing is copied on the way in, and the result is read in place on the way out.</p>
+  <div class="xing">
+    <div class="box">
+      <div class="card-h">Python · <code data-path="native_exec.py">native_exec.py</code></div>
+      <ol>
+        <li>Check the plan shape; compile the filter and aggregate expressions to bytecode (<code data-path="pipeline_program.py">pipeline_program.py</code>).</li>
+        <li>Export every input column chunk as an Arrow C Data Interface <code>ArrowArray</code> struct with <code>Array._export_to_c</code>. The buffers stay where they are.</li>
+        <li>Pack a plan block: an <code>int64</code> array of a magic number, counts, bytecode addresses and the struct addresses.</li>
+        <li>Make the call: <code data-sym="native_exec.py::_call">_call</code> runs <code>lib.mx_execute(plan_addr, out_addr)</code>.</li>
+      </ol>
+    </div>
+    <div class="wire"><span>Arrow C Data Interface arrays + plan block<b>→</b></span><span><b>←</b>output block: addresses of the result buffers</span></div>
+    <div class="box">
+      <div class="card-h">Mojo · <code data-path="kernels_aot/executor_cpu.mojo">executor_cpu.mojo</code></div>
+      <ol>
+        <li><code data-sym="kernels_aot/executor_cpu.mojo::mx_execute">mx_execute</code> checks the magic number and reads the structs in place.</li>
+        <li>Filters, encodes group keys, aggregates, sorts and limits on every physical core.</li>
+        <li>Writes result buffers into one arena and fills the output block.</li>
+      </ol>
+    </div>
+  </div>
+  <p style="font-size:13.5px;margin-top:12px">Back in Python the buffers are wrapped without copying (<code>pa.foreign_buffer</code> into a <code>pa.Table</code>), and the arena is freed by <code data-sym="kernels_aot/executor_cpu.mojo::mx_exec_free">mx_exec_free</code> when the table is garbage collected (<code data-sym="native_exec.py::_Arena">_Arena</code>). Python calls each input struct's release callback after the call. If the executor returns a negative code, <code data-sym="native_exec.py::_decline">_decline</code> records why and the next layer runs. Only the inputs follow the Arrow C Data Interface; the output is Arrow-layout buffers described by the output block, not exported structs. A port needs the same three things: arrays handed over as C structs, one plan buffer, one result arena.</p>
+
+  <h2 id="add-operator">3. Add an operator</h2>
+  <p>The worked example is <code>SELECT DISTINCT</code>, which got its native call in F-032 (M2h, <code data-path="tests/test_native_distinct.py">tests/test_native_distinct.py</code>). Two later operators followed the same steps: the top-k behind a filter, <code data-sym="native_exec.py::try_filter_topk">try_filter_topk</code> calling <code data-sym="kernels_aot/executor_cpu.mojo::mx_filter_topk">mx_filter_topk</code> (F-046e), and <code data-sym="native_exec.py::try_count_distinct">try_count_distinct</code> calling <code data-sym="kernels_aot/executor_cpu.mojo::mx_count_distinct">mx_count_distinct</code> (F-046h). The rule that shapes every step: the executor never changes an answer, so the old path stays in place and the new one returns <code>None</code> for anything it is unsure about.</p>
+  <ol class="walk">
+    <li><b>Give it a plan node.</b>
+      <p>The node is <code data-sym="lazy_frame.py::Distinct">Distinct</code> in <code data-path="lazy_frame.py">lazy_frame.py</code>, built by <code data-sym="lazy_frame.py::distinct">LazyFrame.distinct</code>. A new column expression instead goes in <code data-path="lazy_expr.py">lazy_expr.py</code> as an <code data-sym="lazy_expr.py::Expr">Expr</code> op. SQL reaches the node through <code data-path="sql_frontend.py">sql_frontend.py</code>, and <code data-sym="plan_validation.py::validate_plan">validate_plan</code> in <code data-path="plan_validation.py">plan_validation.py</code> gets a rule for its invariants (for <code>Distinct</code>: no duplicate subset columns).</p></li>
+    <li><b>Teach the optimizer about it.</b>
+      <p>Every pass in <code data-sym="optimizer.py::PlanOptimizer">PlanOptimizer</code> (<code data-path="optimizer.py">optimizer.py</code>) rebuilds the tree, so each needs a branch that rebuilds the new node, as the <code>isinstance(node, Distinct)</code> branches do. Add a rewrite there only if the operator can be pushed or merged.</p></li>
+    <li><b>Make the Python version work first.</b>
+      <p><code data-sym="custom_ops.py::_apply_distinct_custom">CustomOpsCompiler._apply_distinct_custom</code> in <code data-path="custom_ops.py">custom_ops.py</code> is the dispatcher: it tries the native call, then the group-key encoder, then <code data-sym="custom_ops.py::_distinct_rows">_distinct_rows</code>. Whatever the native call declines lands on the code below it.</p></li>
+    <li><b>Encode it for the executor.</b>
+      <p><code data-sym="native_exec.py::try_distinct">try_distinct</code> in <code data-path="native_exec.py">native_exec.py</code> exports the columns, packs the plan block (starting with <code data-sym="native_exec.py::DMAGIC">DMAGIC</code>) and calls through <code data-sym="native_exec.py::_call_distinct">_call_distinct</code>. Declare the function's <code>argtypes</code> and <code>restype</code> in <code data-sym="native_exec.py::_load">_load</code>. Return <code>_decline("reason")</code> for nulls, types or sizes it cannot take.</p></li>
+    <li><b>Write the Mojo function.</b>
+      <p><code data-sym="kernels_aot/executor_cpu.mojo::mx_distinct">mx_distinct</code> in <code data-path="kernels_aot/executor_cpu.mojo">kernels_aot/executor_cpu.mojo</code> is an <code>@export</code> function with <code>abi("C")</code> taking <code>(plan_a: Int, out_a: Int)</code>. It checks its magic number, returns <code data-sym="kernels_aot/executor_cpu.mojo::E_BAD_PLAN">E_BAD_PLAN</code> for a plan it does not recognise, and writes the output block.</p></li>
+    <li><b>Rebuild the library.</b>
+      <p>Run <code>bash scripts/build_pipeline.sh exec</code> (<code data-path="scripts/build_pipeline.sh">scripts/build_pipeline.sh</code>). It rewrites <code data-path="kernels_aot/libmxexec_cpu.so">libmxexec_cpu.so</code>, which is committed.</p></li>
+    <li><b>Test the path, not only the answer.</b>
+      <p><code data-path="tests/test_native_distinct.py">tests/test_native_distinct.py</code> compares native, <code>MXFRAME_NATIVE=0</code> and DuckDB on the same data, and asserts the native path ran (<code data-sym="native_exec.py::last_path">last_path</code>), because a test that only checks the answer passes just as well when the call quietly declined. It reuses the fixtures <code data-sym="tests/test_native_exec_m1.py::_both">_both</code>, <code data-sym="tests/test_native_exec_m1.py::_same">_same</code> and <code data-sym="tests/test_native_exec_m1.py::native">native</code> from <code data-path="tests/test_native_exec_m1.py">tests/test_native_exec_m1.py</code>.</p></li>
+  </ol>
+
+  <h2 id="build">4. Build it yourself</h2>
+  <p>The Mojo sources compile ahead of time into shared libraries that ship in the wheel; nothing compiles at run time. You need <code>pixi</code> (the Mojo compiler comes from its environment).</p>
+<pre class="cmd"><span class="c"># once</span>
+pixi install
+pixi run setup-mxframe
+
+<span class="c"># the CPU pipeline, the native executor and the GPU pipeline (scripts/build_pipeline.sh)</span>
+bash scripts/build_pipeline.sh            <span class="c"># all three</span>
+bash scripts/build_pipeline.sh exec       <span class="c"># only libmxexec_cpu.so</span>
+bash scripts/build_pipeline.sh cpu        <span class="c"># libmxpipeline_cpu.so + libmxexec_cpu.so</span>
+bash scripts/build_pipeline.sh gpu        <span class="c"># libmxpipeline_gpu.so</span>
+
+<span class="c"># the single-operator AOT kernels (step 2 of scripts/release.sh)</span>
+pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
+    --emit shared-lib -o kernels_aot/libmxkernels_aot.so
+pixi run mojo build kernels_aot/kernels_aot_gpu.mojo -I kernels_aot \
+    --emit shared-lib -o kernels_aot/libmxkernels_aot_gpu.so
+
+<span class="c"># the tests</span>
+pixi run test                             <span class="c"># pytest on tests/, from any checkout or worktree</span></pre>
+  <p style="font-size:13.5px">The pipeline and executor libraries are built for x86-64-v3 (AVX2, FMA, BMI2) rather than the build machine's own CPU, so a wheel does not crash on an older processor. The join and group-key libraries (<code data-path="kernels_aot/joinsemi_cpu.mojo">joinsemi_cpu.mojo</code>, <code data-path="kernels_aot/groupkeys_cpu.mojo">groupkeys_cpu.mojo</code>) carry their own build command in their file header. <code data-path="scripts/release.sh">scripts/release.sh</code> runs the whole sequence for a release. Tests that need a library skip themselves if it is not built, so a missing <code>.so</code> shows up as skipped tests, not failures.</p>
+
+  <h2 id="switches">5. Environment switches</h2>
+  <p>All are read from the environment of the Python process. The first four are the ones a port is most likely to touch.</p>
+  <div class="card"><div class="tablewrap"><table class="t">
+    <tr><th>Variable</th><th>Default</th><th>What it does</th><th>Read in</th></tr>
+    <tr><td><code data-env="MXFRAME_NATIVE">MXFRAME_NATIVE</code></td><td>on</td><td><code>0</code> turns the native executor off; the fused pipeline and kernel paths answer.</td><td><code data-path="native_exec.py">native_exec.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_FUSED_PIPELINE">MXFRAME_FUSED_PIPELINE</code></td><td>on</td><td><code>0</code> turns the fused pipeline off (A/B timing against the kernel path).</td><td><code data-path="pipeline_exec.py">pipeline_exec.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_CPU_THREADS">MXFRAME_CPU_THREADS</code></td><td>native executor and fused pipeline: one per physical core, fewer for a small input (one per 128k rows); AOT kernels: every core in the process's affinity mask, hyperthreads included</td><td>Worker threads for the Mojo kernels. One value sets all three.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code>, <code data-path="aot_kernels.py">aot_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_EXEC_CPU_LIB">MXFRAME_EXEC_CPU_LIB</code></td><td>kernels_aot/</td><td>Path to a <code>libmxexec_cpu.so</code> to load instead of the shipped one (your own build).</td><td><code data-path="native_exec.py">native_exec.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_PIPELINE_CPU_LIB">MXFRAME_PIPELINE_CPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxpipeline_cpu.so</code>.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_PIPELINE_GPU_LIB">MXFRAME_PIPELINE_GPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxpipeline_gpu.so</code>.</td><td><code data-path="pipeline_kernels.py">pipeline_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_AOT_LIB">MXFRAME_AOT_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxkernels_aot.so</code>.</td><td><code data-path="aot_kernels.py">aot_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_AOT_GPU_LIB">MXFRAME_AOT_GPU_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxkernels_aot_gpu.so</code>.</td><td><code data-path="aot_kernels.py">aot_kernels.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_JOIN_LIB">MXFRAME_JOIN_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxjoin_cpu.so</code>.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_GROUPKEYS_LIB">MXFRAME_GROUPKEYS_LIB</code></td><td>kernels_aot/</td><td>Path override for <code>libmxgroupkeys_cpu.so</code>.</td><td><code data-path="group_keys.py">group_keys.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_STAR">MXFRAME_STAR</code></td><td>on</td><td><code>0</code> stops star joins being fused into the fact table's scan; joins run leaf by leaf.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_COPROC">MXFRAME_COPROC</code></td><td>on</td><td><code>0</code> turns off CPU+GPU co-processing of fused aggregates under <code>device="auto"</code>.</td><td><code data-path="coproc_fused.py">coproc_fused.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_WARM">MXFRAME_WARM</code></td><td>on</td><td><code>0</code> disables the CPU warm-up thread that <code>import mxframe</code> starts (loads the Mojo runtime in the background).</td><td><code data-path="__init__.py">__init__.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_READ_THREADS">MXFRAME_READ_THREADS</code></td><td>half the cores, 2 to 8</td><td>Parquet decode threads.</td><td><code data-path="io_parquet.py">io_parquet.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_CALIBRATION">MXFRAME_CALIBRATION</code></td><td>~/.mxframe/calibration.json</td><td>Where auto mode keeps its measured constants.</td><td><code data-path="calibration.py">calibration.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_GPU_GATHER_MIN_ROWS">MXFRAME_GPU_GATHER_MIN_ROWS</code></td><td>never (gathers stay on the CPU)</td><td>Row count above which a join's gather runs on the GPU.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
+    <tr><td><code data-env="MXFRAME_JOIN_TRACE">MXFRAME_JOIN_TRACE</code></td><td>off</td><td>Any value prints one line per join step to stderr.</td><td><code data-path="join_engine.py">join_engine.py</code></td></tr>
+  </table></div></div>
+  <h3>Test suite only</h3>
+  <div class="card"><div class="tablewrap"><table class="t">
+    <tr><th>Variable</th><th>What it does</th></tr>
+    <tr><td><code data-env="MXFRAME_TEST_DEVICE">MXFRAME_TEST_DEVICE</code></td><td>Device (<code>cpu</code> or <code>gpu</code>) that <code data-path="scripts/_test_phase6_tpch_tier2.py">scripts/_test_phase6_tpch_tier2.py</code> runs on; <code>pixi run test6-gpu</code> sets it.</td></tr>
+    <tr><td><code data-env="MXFRAME_TPCH_DATA">MXFRAME_TPCH_DATA</code></td><td>Folder holding the TPC-H Parquet files the tests read.</td></tr>
+    <tr><td><code data-env="MXFRAME_TPCH_SF10">MXFRAME_TPCH_SF10</code></td><td>Adds the SF10 correctness run to <code data-path="tests/test_tpch_duckdb.py">tests/test_tpch_duckdb.py</code>.</td></tr>
+    <tr><td><code data-env="MXFRAME_FUZZ_SEEDS">MXFRAME_FUZZ_SEEDS</code></td><td>Number of random plans in the long fuzz run of <code data-path="tests/test_f016_fuzz.py">tests/test_f016_fuzz.py</code>.</td></tr>
+    <tr><td><code data-env="MXFRAME_FUZZ_LARGE_SEEDS">MXFRAME_FUZZ_LARGE_SEEDS</code></td><td>Number of large random plans in that file.</td></tr>
+  </table></div></div>
+</main>
+</div>
+
+<script id="layers-data" type="application/json">
+{"layers": [
+ {"id": "frontend", "name": "LazyFrame / SQL", "short": "Build a plan; nothing runs yet.",
+  "does": "Turns DataFrame calls or a SQL string into a logical plan: a tree of Scan, ParquetScan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail and Join nodes holding Expr objects. Nothing runs until .compute().",
+  "files": ["lazy_frame.py", "lazy_expr.py", "sql_frontend.py"],
+  "symbols": ["lazy_frame.py::LazyFrame", "lazy_frame.py::compute", "lazy_expr.py::Expr", "sql_frontend.py::sql"],
+  "seam_in": "Method calls such as filter, groupby, agg, sort, or a query string passed to mx.sql(...).",
+  "seam_out": "A LogicalPlan tree in lf.plan. No data has moved.",
+  "declines": "It does not decline. A SQL construct it cannot map raises an error instead of guessing.",
+  "next": "Layer 02 when you call .compute().",
+  "see": "<code>print(lf.explain())</code> shows the plan as a tree.",
+  "labels": []},
+ {"id": "validate", "name": "Plan validation", "short": "Check the plan's invariants.",
+  "does": "Walks the plan and checks it is well formed (for example, no duplicate columns in a Distinct subset) before any work is done. It runs at the start of compute() and again after the Parquet sources are resolved.",
+  "files": ["plan_validation.py"],
+  "symbols": ["plan_validation.py::validate_plan_or_raise", "plan_validation.py::PlanValidationError"],
+  "seam_in": "A LogicalPlan.",
+  "seam_out": "The same plan, untouched, or a raised error listing every problem with its path in the tree.",
+  "declines": "It rejects rather than declines: a bad plan stops here with an error and no later layer sees it. compute(validate=False) skips the check.",
+  "next": "Layer 03.",
+  "see": "<code>lf.explain(validate=True)</code> lists the problems without running the query.",
+  "labels": []},
+ {"id": "optimizer", "name": "Optimizer", "short": "Rewrite the plan before running it.",
+  "does": "Rewrites the plan into an equal, cheaper one: pushes filters and projections down (into the Parquet reader where it can), and records what each pass did. Then io_parquet.py resolves each Parquet scan into a read of just the columns the plan needs, with pushed filters applied while decoding.",
+  "files": ["optimizer.py", "io_parquet.py"],
+  "symbols": ["optimizer.py::optimize_plan", "optimizer.py::PlanOptimizer", "io_parquet.py::resolve_plan"],
+  "seam_in": "A validated LogicalPlan.",
+  "seam_out": "An OptimizationResult: the rewritten plan and a trace (list of strings, one per pass that fired).",
+  "declines": "A pass that does not apply leaves the node as it was. compute(optimize=False) skips the layer.",
+  "next": "Layer 04 for device=\"cpu\"; under device=\"auto\", layer 07 first picks the device.",
+  "see": "<code>compute(verbose=True)</code> prints the passes; the fused and kernel paths put them in <code>lf.last_compile_provenance[\"optimizer_trace\"]</code>.",
+  "labels": []},
+ {"id": "native", "name": "Native Mojo executor", "short": "One call runs a whole aggregate plan.",
+  "does": "Runs Limit? Sort? Having? Aggregate(Filter*(Scan)) entirely in Mojo: filter, group keys (dictionary strings, int32, int64), sum, mean, count, min, max, HAVING, ORDER BY and LIMIT, on all physical cores. Separate calls in the same library serve filter, gather, distinct, count distinct, top-k and string slices for the operators around it.",
+  "files": ["native_exec.py", "kernels_aot/executor_cpu.mojo", "kernels_aot/libmxexec_cpu.so", "pipeline_program.py"],
+  "symbols": ["native_exec.py::try_execute", "native_exec.py::enabled", "native_exec.py::last_decline", "native_exec.py::last_path", "kernels_aot/executor_cpu.mojo::mx_execute"],
+  "seam_in": "The plan, packed into an int64 plan block, and every input column chunk exported as an Arrow C Data Interface ArrowArray struct. One ctypes call: lib.mx_execute(plan_addr, out_addr).",
+  "seam_out": "An output block of buffer addresses in a Mojo-owned arena, wrapped without copying into a pyarrow Table.",
+  "declines": "Returns None, and records the reason, when (for example): the plan is not an aggregate; its input is not a scan of one table (a join has been materialised by then, so a join's aggregate is a scan of the joined table); the device is not cpu (a GPU session's own fallback is the exception); a CPU+GPU co-processing policy is active; the library is not built; the input is empty; a column has nulls or an unsupported type; a filter or aggregate expression is outside the bytecode compiler; a derived group key is not a small integer range; a HAVING is anything but AND-ed aggregate-versus-number comparisons; a sort is by an expression or by something that is not a key or an aggregate; an int64 value is past 2^53; or the executor returns a negative code. It also declines when MXFRAME_NATIVE=0. native_exec.last_decline() gives the exact reason.",
+  "next": "Layer 05, the fused pipeline, for the same aggregate.",
+  "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"native\"</code>. When it is not, <code>mxframe.native_exec.last_decline()</code> says why.",
+  "switch": "MXFRAME_NATIVE", "switch_off": "0",
+  "labels": ["native"]},
+ {"id": "fused", "name": "Fused pipeline", "short": "Filter + group + aggregate in one pass.",
+  "does": "Runs Aggregate(Filter*(Scan)) as one vectorised pass over the columns: the filter and arithmetic compile to bytecode, Python builds the group ids, and a Mojo kernel accumulates the partial sums on the CPU or GPU. Python finishes means and counts, then applies HAVING, ORDER BY and LIMIT. Under device=\"auto\" it can split rows between CPU and GPU.",
+  "files": ["pipeline_exec.py", "pipeline_program.py", "pipeline_kernels.py", "coproc_fused.py", "kernels_aot/pipeline_cpu.mojo", "kernels_aot/pipeline_gpu.mojo", "kernels_aot/libmxpipeline_cpu.so", "kernels_aot/libmxpipeline_gpu.so"],
+  "symbols": ["pipeline_exec.py::try_fused_aggregate", "pipeline_exec.py::enabled", "pipeline_kernels.py::run_pipeline_cpu"],
+  "seam_in": "Column buffers and the group-id array as raw pointers through ctypes, plus the bytecode program.",
+  "seam_out": "Partial aggregates as NumPy arrays, which Python finalises into a pyarrow Table.",
+  "declines": "Returns None, recording compiler.last_fused_decline, when: the plan is not Aggregate(Filter*(Scan)); a column has nulls or an unsupported type; an expression is outside the bytecode compiler; an int64 column holds values past 2^53; the kernel library is not built; or MXFRAME_FUSED_PIPELINE=0.",
+  "next": "Layer 06, the AOT kernels, for the same aggregate.",
+  "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"fused_pipeline_cpu\"</code>, <code>\"fused_pipeline_gpu\"</code>, <code>\"fused_pipeline_split\"</code> (CPU and GPU together) or <code>\"fused_pipeline_gpu_resident\"</code>.",
+  "switch": "MXFRAME_FUSED_PIPELINE", "switch_off": "0",
+  "labels": ["fused_pipeline_"]},
+ {"id": "aot", "name": "AOT kernels", "short": "Single operators, CPU or GPU.",
+  "does": "The general path, and the only one that takes a plan that is not an aggregate. CustomOpsCompiler first materialises every join (join_engine.py, which calls the native filter and gather helpers of layer 04 around its Mojo join kernels). It then offers the aggregate on top, now over a plain table, to layers 04 and 05, and only if both decline does it walk the rest one operator at a time, calling an ahead-of-time compiled Mojo kernel for each heavy step (group sum, sort, gather, filter), with PyArrow doing the glue. For filter, top-k and distinct it calls the native executor's separate functions (try_filter, try_filter_topk, try_topk, try_distinct) from inside this path.",
+  "files": ["custom_ops.py", "aot_kernels.py", "join_engine.py", "kernels_aot/kernels_aot.mojo", "kernels_aot/kernels_aot_gpu.mojo", "kernels_aot/libmxkernels_aot.so", "kernels_aot/libmxkernels_aot_gpu.so"],
+  "symbols": ["custom_ops.py::CustomOpsCompiler", "custom_ops.py::_materialize_joins", "join_engine.py::materialize", "native_exec.py::try_filter", "native_exec.py::try_filter_topk", "native_exec.py::try_topk", "native_exec.py::try_distinct", "aot_kernels.py::AOTKernels", "aot_kernels.py::AOTKernelsGPU"],
+  "seam_in": "NumPy or Arrow buffers as pointers, one ctypes call per kernel.",
+  "seam_out": "NumPy or Arrow arrays; the next operator picks them up.",
+  "declines": "This layer takes whatever the two above it decline. A kernel that does not fit the data (type, size) falls back to PyArrow compute for that operator. If the kernel library is missing or stale, the AOT path is switched off with one warning and the PyArrow-based path runs instead of the query failing.",
+  "next": "PyArrow compute is the floor; nothing sits below it, so a plan always gets an answer.",
+  "see": "<code>lf.last_compile_provenance[\"path\"]</code> is <code>\"cpu_aot\"</code>, <code>\"compiled\"</code>, <code>\"join_mojo_shortcut\"</code>, <code>\"pyarrow_shortcut\"</code>, <code>\"masked_global_agg_mojo\"</code>, <code>\"global_agg_pyarrow\"</code> or <code>\"arrow_null_semantics\"</code>.",
+  "labels": ["cpu_aot", "compiled", "join_mojo_shortcut", "pyarrow_shortcut", "masked_global_agg_mojo", "global_agg_pyarrow", "arrow_null_semantics"]},
+ {"id": "auto", "name": "GPU path and device=\"auto\"", "short": "Pick cpu or gpu from a cost model.", "aside": true,
+  "does": "Sits beside the stack. After the optimizer, choose_device estimates the plan's time on each device from this machine's measured constants (kernel speed, copy bandwidth, GPU start-up), counting copies only for columns not already resident on the GPU. The layers above then run on the winner. A GPU error reruns the query on the CPU and warns once per query shape.",
+  "files": ["auto_mode.py", "residency.py", "calibration.py", "coproc_fused.py", "gpu_stream.py"],
+  "symbols": ["auto_mode.py::choose_device", "auto_mode.py::AutoDecision", "residency.py::ResidencyTracker", "calibration.py::calibrate", "calibration.py::get_calibration", "lazy_frame.py::last_auto_decision"],
+  "seam_in": "The optimized plan, the calibration file and the set of columns already on the GPU.",
+  "seam_out": "An AutoDecision: device (cpu or gpu), the reason, and the estimates behind it.",
+  "declines": "It picks cpu when there is no usable GPU, when the GPU is still starting up, or when the estimate says the copies cost more than the kernels save. compute(strict=True) raises GPU errors instead of falling back.",
+  "next": "Layers 04 to 06 on the chosen device; on cpu, layer 04 first.",
+  "see": "<code>lf.last_auto_decision.explain()</code> prints the choice and both estimates; the provenance carries <code>auto_device</code> and <code>auto_reason</code>. Run <code>mx.calibrate()</code> once per machine.",
+  "labels": []}
+]}
+</script>
+<script>
+const BLOB = "https://github.com/abhisheksreesaila/mxframe/blob/main/";
+const DATA = JSON.parse(document.getElementById("layers-data").textContent);
+const stack = document.getElementById("stack"), detail = document.getElementById("detail");
+
+function detailHTML(l) {
+  const files = l.files.map((f) => `<li><a class="mono" href="${BLOB}${f}">${f}</a></li>`).join("");
+  const sw = l.switch ? `<dt>Off switch</dt><dd><code>${l.switch}=${l.switch_off}</code></dd>` : "";
+  return `<div class="card-h"><span class="badge brand">${String(DATA.layers.indexOf(l) + 1).padStart(2, "0")}</span> ${l.id}</div>` +
+    `<div class="card-b"><h3>${l.name}</h3><p style="margin:0">${l.short}</p><dl>` +
+    `<dt>What it does</dt><dd>${l.does}</dd>` +
+    `<dt>Files</dt><dd><ul>${files}</ul></dd>` +
+    `<dt>Seam: in</dt><dd>${l.seam_in}</dd>` +
+    `<dt>Seam: out</dt><dd>${l.seam_out}</dd>` +
+    `<dt>When it declines</dt><dd>${l.declines}</dd>` +
+    `<dt>Who answers next</dt><dd>${l.next}</dd>` +
+    `<dt>See which path ran</dt><dd>${l.see}</dd>${sw}</dl></div>`;
+}
+
+function select(i, scroll) {
+  stack.querySelectorAll(".layer").forEach((b, j) => { b.classList.toggle("on", i === j); b.setAttribute("aria-pressed", i === j); });
+  detail.innerHTML = detailHTML(DATA.layers[i]);
+  history.replaceState(null, "", "#" + DATA.layers[i].id);
+  if (scroll && matchMedia("(max-width: 820px)").matches) detail.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+DATA.layers.forEach((l, i) => {
+  if (i === DATA.layers.length - 1) stack.insertAdjacentHTML("beforeend", `<div class="arrow">beside the stack: picks the device</div>`);
+  else if (i) stack.insertAdjacentHTML("beforeend", `<div class="arrow">↓${i === 3 ? " the optimizer never declines; it hands the plan on" : i === 4 ? " if the native executor declines" : i === 5 ? " if the fused pipeline declines (non-aggregate plans start here; joins are built here, then their aggregate goes back to 04)" : ""}</div>`);
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "layer" + (l.aside ? " auto" : "");
+  b.innerHTML = `<span class="n">${String(i + 1).padStart(2, "0")}</span><span><span class="t">${l.name}</span><span class="d">${l.short}</span></span>`;
+  b.onclick = () => select(i, true);
+  stack.append(b);
+});
+const start = DATA.layers.findIndex((l) => l.id === location.hash.slice(1));
+select(start >= 0 ? start : 3, false);
+</script>
+</body>
+</html>

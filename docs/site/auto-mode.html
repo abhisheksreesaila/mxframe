@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How device="auto" decides · MXFrame</title>
+<meta name="description" content="What MXFrame does when you call compute(device=&quot;auto&quot;): the rules in order, a session replay you can change, the measured results, and the limits.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script src="site.js"></script>
+<style>
+/* page-local: device colours come from the shared tokens (cpu = MXFrame blue, gpu = accent, auto = green) */
+:root { --d-cpu: var(--mx); --d-gpu: var(--accent); --d-auto: var(--green); }
+.ctl { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 6px 14px; align-items: center; margin: 0 0 10px; }
+.ctl > .label { padding-top: 2px; }
+.ctl .btns { margin: 0; }
+.ctl .btn { padding: 7px 11px; }
+.ctl input[type=range] { width: min(100%, 360px); accent-color: var(--accent); }
+.ctl .val { font: 700 13px var(--font-mono); color: var(--text); margin-left: 10px; }
+.trace { list-style: none; margin: 0; padding: 0; }
+.trace li { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.trace li:last-child { border-bottom: 0; }
+.trace .mark { font: 700 12px var(--font-mono); text-align: center; padding-top: 1px; color: var(--text-dim); }
+.trace li.pass .mark { color: var(--green); } .trace li.stop .mark { color: var(--accent); }
+.trace li.skip { opacity: .5; }
+.trace b { color: var(--text); font-weight: 600; }
+.trace .why { font-size: 13px; color: var(--text-dim); display: block; }
+.verdict { padding: 14px 16px; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius-sm); background: var(--surface-2); margin: 0 0 12px; }
+.verdict .big { font: 700 22px var(--font-mono); color: var(--text); }
+.verdict .big i { display: inline-block; width: 11px; height: 11px; border-radius: 50%; margin-right: 8px; vertical-align: 0; }
+.cost { display: grid; grid-template-columns: 1fr auto; gap: 2px 14px; font: 13px var(--font-mono); margin: 8px 0 0; }
+.cost span:nth-child(even) { text-align: right; color: var(--text); }
+.sub { font-size: 13.5px; }
+.callout { border: 1px solid var(--border-hi); border-radius: var(--radius-sm); padding: 12px 16px; background: var(--surface); }
+.callout h3 { margin: 0 0 4px; font-size: 15px; }
+.callout p { margin: 4px 0; font-size: 14px; }
+.callout .chk { font: 12px var(--font-mono); color: var(--text-dim); }
+table.t td.nowrap { white-space: nowrap; }
+.sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
+main, .grid > *, .card, .card-b { min-width: 0; }
+.tbl { overflow-x: auto; }
+@media (max-width: 820px) { .ctl { grid-template-columns: minmax(0, 1fr); } .verdict .big { font-size: 18px; } }
+</style>
+</head>
+<body>
+<div class="shell">
+<nav class="side"></nav>
+<main>
+  <div class="read"><b>What you're looking at</b>How <code>compute(device="auto")</code> picks the CPU, the GPU, or both, and what it has measured. <b style="margin-top:8px">How to read it</b>Part 1 replays the planner's rules in order. Change the inputs (query shape, size, GPU state, the gap between your queries) and watch which rule stops the search; every threshold in it is read from the code. Part 2 plots the benchmark files it came from, loaded in your browser. Part 3 lists what <code>auto</code> does not do yet.</div>
+
+  <span class="kick">// device="auto" · MXFrame 0.6.0</span>
+  <h1>How <code style="font-size:.8em">device="auto"</code> decides</h1>
+  <p>With a CPU and a GPU, <code>compute(device="auto")</code> chooses a device for the <b>whole query</b> from costs it has measured on your machine. It does not stream every query's rows to both devices: on this hardware the link from host memory to the GPU is slower than the CPU cores reading the data in place. Instead it runs the first scan of a table on the CPU, copies that table's columns to the GPU in the background, and once they are there, splits an aggregate's rows between the two.</p>
+
+  <h2>1 · The decision, rule by rule</h2>
+  <div class="card">
+    <div class="card-h">Replay the planner · <span style="text-transform:none;letter-spacing:0;font-family:var(--font-sans);color:var(--text-dim)">prices use the built-in default fits, what you get before <code>mx.calibrate()</code></span></div>
+    <div class="card-b">
+      <div class="ctl"><span class="label">Query shape</span><div class="btns" id="c-shape" role="group" aria-label="Query shape"></div></div>
+      <div class="ctl"><span class="label">Rows scanned</span><div><div class="btns" id="c-rows" role="group" aria-label="Rows scanned"></div><input type="range" id="c-rows-r" min="4" max="8.6" step="0.01" aria-label="Rows scanned, log scale"><span class="val" id="c-rows-v"></span></div></div>
+      <div class="ctl" id="c-groups-row"><span class="label">Groups</span><div class="btns" id="c-groups" role="group" aria-label="Number of groups"></div></div>
+      <div class="ctl"><span class="label">GPU in this process</span><div class="btns" id="c-gpu" role="group" aria-label="GPU state"></div></div>
+      <div class="ctl"><span class="label">prefer=</span><div class="btns" id="c-prefer" role="group" aria-label="prefer"></div></div>
+      <div class="ctl"><span class="label">Gap between queries</span><div><input type="range" id="c-gap" min="0" max="1500" step="10" aria-label="Idle gap between your queries, ms"><span class="val" id="c-gap-v"></span></div></div>
+
+      <div class="grid g2" style="margin-top:18px;align-items:start">
+        <div>
+          <div class="btns" id="c-which" role="group" aria-label="Which query of the session"></div>
+          <ol class="trace" id="trace"></ol>
+        </div>
+        <div>
+          <div class="verdict" id="verdict"></div>
+          <div class="sub" id="stage-b"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:26px">The same session, five queries in a row</h3>
+  <p class="sub">Each query asks the rules above, with whatever the earlier queries and the idle gaps have left behind: the GPU start-up and the column copy only begin once no query has run for <span data-const="IDLE_BEFORE_BACKGROUND_S" data-fmt="ms">100 ms</span>, and the copy pauses while any query runs. Lanes show when each thing runs; times follow the estimates, so read them as shape, not as a stopwatch.</p>
+  <div class="card"><div class="card-b">
+    <div class="legend" id="tl-legend"></div>
+    <div class="chart" id="timeline"></div>
+    <div class="tbl"><table class="t" style="margin-top:12px;min-width:520px"><thead><tr><th>#</th><th>Device plan</th><th>Inside the plan</th><th class="r">Starts at</th></tr></thead><tbody id="session-rows"></tbody></table></div>
+  </div></div>
+
+  <h3>The rules, and where they live</h3>
+  <ol class="sub">
+    <li><b>Small inputs skip everything.</b> Under <span data-const="SMALL_QUERY_ROWS" data-fmt="rows">200,000</span> source rows the query goes to the CPU before the calibration is even loaded (loading it initialises CUDA). <code>prefer="gpu"</code> turns this off. <code>auto_mode.choose_device</code>, <code>SMALL_QUERY_ROWS</code>.</li>
+    <li><b>No GPU, a CUDA fault, or a shape that failed before</b> means CPU. A GPU error reruns the query on the CPU with one warning per shape; a CUDA fault switches the GPU off for the rest of the process. <code>strict=True</code> raises instead.</li>
+    <li><b>Price both plans.</b> Each operator costs <code>alpha + c·rows</code> (plus a group-count term) on each device, from the calibration. The GPU also pays the copy over the link, the copy back, and whatever is left of its start-up (<span data-const="_DEFAULT_GPU_INIT_MS" data-fmt="plain">400</span> ms by default, until measured). Joins use a measured end-to-end GPU join estimate, padded by <span data-const="JOIN_GPU_SAFETY" data-fmt="plain">1.15</span> because it ran low under load.</li>
+    <li><b>The GPU must win by a margin.</b> <span data-const="GPU_WIN_MARGIN" data-fmt="pct">10%</span> by default, so ties go to the CPU (no memory-capacity risk, no start-up). <code>prefer="cpu"</code> raises it to <span data-const="PREFER_CPU_MARGIN" data-fmt="pct">30%</span>; <code>prefer="gpu"</code> lowers it to zero. If the GPU would win but is still starting, the query runs on the CPU and says so.</li>
+    <li><b>A CPU plan can still use the GPU.</b> For a fused aggregate (filter, expressions and group-by in one pass) with at least <span data-const="MIN_UPLOAD_BYTES" data-fmt="mib">64 MiB</span> of input, the columns are uploaded in the background. Once they are resident, the rows are split statically: the GPU takes the share that makes both devices finish together, from the calibration's <code>pipeline</code> fits and its fixed per-call cost (<span data-const="DEFAULT_GPU_ALPHA_MS" data-fmt="plain">4.5</span> ms). A share under <span data-const="MIN_SHARE" data-fmt="pct">5%</span> either way is not worth it. The resident cache may use <span data-const="RESIDENT_MEM_FRACTION" data-fmt="pct">50%</span> of free GPU memory, and an upload that fails or does not fit is retried after <span data-const="FAILED_RETRY_S" data-fmt="s">120 s</span>. <code>coproc_fused.py</code>.</li>
+  </ol>
+
+  <h2>2 · What was measured</h2>
+  <div class="read" style="margin-top:0"><b>How to read this</b>Each dot is one TPC-H query, run once in a fresh process with Parquet on disk and no warm-up, on <code>device="cpu"</code>, <code>"gpu"</code> and <code>"auto"</code>. <code>auto</code> passes when it is within 10% of the faster of the other two. The counts are computed in your browser from the benchmark files named under each chart.</div>
+
+  <div class="grid g3" id="tiles"><div class="status">loading benchmark files…</div></div>
+  <p class="sub" id="tiles-note"></p>
+
+  <div class="card" style="margin-top:18px">
+    <div class="card-h">auto against the better of cpu and gpu · TPC-H, 22 queries</div>
+    <div class="card-b">
+      <div class="btns" id="m-sf" role="group" aria-label="Scale factor and run"></div>
+      <div class="btns" id="m-view" role="group" aria-label="View"></div>
+      <div class="legend" id="m-legend"></div>
+      <div class="chart" id="m-chart"><div class="status">loading benchmark files…</div></div>
+      <details><summary>Data table</summary><div style="overflow-x:auto"><table class="t" id="m-table"></table></div></details>
+      <p class="sub" id="m-note"></p>
+    </div>
+  </div>
+
+  <h3 style="margin-top:30px">Co-processing: both devices at once</h3>
+  <div class="grid g2" style="align-items:start">
+    <div class="card">
+      <div class="card-h" id="cp-title">Fused aggregation stage</div>
+      <div class="card-b">
+        <div class="legend" id="cp-legend"></div>
+        <div class="chart" id="cp-chart"><div class="status">loading benchmark files…</div></div>
+        <details><summary>Data table</summary><table class="t" id="cp-table"></table></details>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h" id="ss-title">One session</div>
+      <div class="card-b">
+        <div class="tbl"><table class="t" id="ss-table"><tr><td class="status">loading benchmark files…</td></tr></table></div>
+        <p class="sub" id="ss-note"></p>
+      </div>
+    </div>
+  </div>
+  <p class="sub" id="cp-note"></p>
+
+  <h2>3 · Honest limits</h2>
+  <div class="grid" style="gap:12px">
+    <div class="callout">
+      <h3>The 22 and 21 out of 22 were measured before the native Mojo executor</h3>
+      <p>The three-way runs (<code>cpu</code>, <code>gpu</code>, <code>auto</code>) are from 2026-10-12. The native CPU executor that 0.6.0 ships came after, and <code>auto</code> has not been re-run against it. The 0.6.0 numbers on the front page are <code>device="cpu"</code> only.</p>
+      <div class="grid g3" id="stale" style="margin-top:8px"></div>
+      <p class="sub" id="stale-note"></p>
+    </div>
+    <div class="callout">
+      <h3>Under <code>device="auto"</code>, the whole-plan native executor declines</h3>
+      <p>A CPU plan under <code>auto</code> runs with the co-processing policy switched on, and <code>native_exec.try_execute</code> declines whenever that policy is active. The per-operator native paths (filters, distinct, top-N) still run; the older fused pipeline answers the aggregate. I have not measured what this costs across the 22 queries. If you know your machine has no GPU, <code>device="cpu"</code> skips it.</p>
+      <p class="chk">check: native_exec.py "CPU+GPU co-processing policy active"</p>
+    </div>
+    <div class="callout">
+      <h3>The cost model prices the CPU with the older kernels</h3>
+      <p><code>calibration.py</code> and <code>auto_mode.py</code> know nothing about the native executor, so the CPU side of every price is the calibrated cost of the pre-native kernels. The calibration does refine itself from each run, but the first decisions on a new machine come from those fits.</p>
+    </div>
+    <div class="callout">
+      <h3>COUNT(DISTINCT) still decodes the counted column</h3>
+      <p>Counting on dictionary codes is a <code>device="cpu"</code> path (F-046h). Under <code>auto</code> the plan is resolved with <code>count_distinct_codes=False</code>, so the counted column is decoded first. This is listed as open in the 0.6.0 release notes.</p>
+      <p class="chk">check: lazy_frame.py count_distinct_codes=(device == "cpu")</p>
+    </div>
+    <div class="callout">
+      <h3>The whole query goes to one device, and there is no per-operator placement</h3>
+      <p>Placing each operator separately (a CPU filter feeding a GPU join) is ticket F-007 and is not built. <code>placement={"join": "gpu"}</code> sends the whole query to the GPU. The <code>Placer</code> class in <code>auto_mode.py</code> and the <code>ResidencyTracker</code> in <code>residency.py</code> are tested but not on the query path; the cache that matters is in <code>coproc_fused.py</code>.</p>
+    </div>
+    <div class="callout">
+      <h3>Co-processing is one machine, one query shape, and for fused aggregates only</h3>
+      <p>The split numbers come from a hand-run session on an RTX 3090 on PCIe 4.0 x8 and are in markdown only (<code>docs/auto-mode.md</code>), so they are cited rather than re-run by a script. It needs at least <span data-const="MIN_UPLOAD_BYTES" data-fmt="mib">64 MiB</span> of input already uploaded; a first scan never gets it. Streaming rows to the GPU for a first scan lost on this link; it may pay off on PCIe 5 or unified-memory machines, where the scheduler (<code>coproc.run_router</code>) already exists.</p>
+    </div>
+    <div class="callout">
+      <h3>Parquet is still read through PyArrow</h3>
+      <p>The three-way runs include the read in the clock (F-021 is the native reader). At SF1 a run takes 50 to 400 ms, so one run varies by about 10% either way, which is why the SF1 verdict is a median of four runs and the single runs are shown too.</p>
+    </div>
+  </div>
+  <p class="sub" style="margin-top:22px">Design notes and the research behind them: <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/spec-auto-mode.md">spec-auto-mode.md</a> · text version: <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/auto-mode.md">auto-mode.md</a>.</p>
+</main>
+</div>
+
+<script type="application/json" id="rules">
+{
+  "constants": {
+    "SMALL_QUERY_ROWS": {"file": "auto_mode.py", "value": 200000},
+    "GPU_WIN_MARGIN": {"file": "auto_mode.py", "value": 0.1},
+    "PREFER_CPU_MARGIN": {"file": "auto_mode.py", "value": 0.3},
+    "JOIN_GPU_SAFETY": {"file": "auto_mode.py", "value": 1.15},
+    "IDLE_BEFORE_BACKGROUND_S": {"file": "coproc_fused.py", "value": 0.1},
+    "MIN_UPLOAD_BYTES": {"file": "coproc_fused.py", "value": 67108864},
+    "MIN_SHARE": {"file": "coproc_fused.py", "value": 0.05},
+    "DEFAULT_GPU_ALPHA_MS": {"file": "coproc_fused.py", "value": 4.5},
+    "RESIDENT_MEM_FRACTION": {"file": "coproc_fused.py", "value": 0.5},
+    "FAILED_RETRY_S": {"file": "coproc_fused.py", "value": 120.0},
+    "_DEFAULT_GPU_INIT_MS": {"file": "calibration.py", "value": 400.0}
+  },
+  "fits": {
+    "group_encode@cpu": [0.02, 9.0, 0.0],
+    "group_sum@cpu": [0.005, 0.8, 2.5], "group_sum@gpu": [0.05, 0.3, 0.0],
+    "masked_sum@cpu": [0.005, 0.3, 0.0], "masked_sum@gpu": [0.05, 0.02, 0.0],
+    "join@cpu": [0.02, 11.0, 0.0], "join@gpu": [0.05, 0.25, 0.0],
+    "join_host@cpu": [0.01, 1.2, 0.0],
+    "sort_topk@cpu": [0.1, 7.0, 0.0], "sort_topk@gpu": [0.1, 2.5, 0.0],
+    "pipeline@cpu": [0.1, 0.9, 0.0], "pipeline@gpu": [0.1, 0.3, 0.0]
+  },
+  "link": {
+    "gbps": {"h2d_pageable": 9.0, "h2d_pinned": 11.0, "d2h_pageable": 7.0, "d2h_pinned": 11.0},
+    "latency_ms": {"h2d_pageable": 0.05, "h2d_pinned": 0.03, "d2h_pageable": 0.05, "d2h_pinned": 0.03}
+  }
+}
+</script>
+
+<script>
+/* ───────── part 1: the planner's rules, ported from auto_mode.choose_device and coproc_fused ───────── */
+const R = JSON.parse(document.getElementById("rules").textContent);
+const K = Object.fromEntries(Object.entries(R.constants).map(([k, v]) => [k, v.value]));
+const INF = Infinity;
+// The benchmark's pass criterion (docs/plan.md F-009: auto within 10% of the better of cpu and gpu).
+// Not the planner's GPU_WIN_MARGIN: the same number today, but a different rule.
+const BENCH_PASS_MARGIN = 0.10;
+const $ = (id) => document.getElementById(id);
+const fmtN = (n) => Math.round(n).toLocaleString("en-US");
+const fmtRows = (n) => (n >= 1e6 ? +(n / 1e6).toPrecision(3) + "M" : n >= 1e3 ? +(n / 1e3).toPrecision(3) + "K" : String(Math.round(n)));
+const fmtBytes = (b) => (b >= 2 ** 30 ? (b / 2 ** 30).toFixed(1) + " GiB" : Math.round(b / 2 ** 20) + " MiB");
+const ms1 = (x) => (x === INF ? "n/a" : x >= 100 ? Math.round(x) + " ms" : x.toFixed(1) + " ms");
+const fit = (name, n, card = 1000) => { const f = R.fits[name]; return f ? f[0] + (f[1] * n) / 1e6 + (f[2] * card) / 1e6 : INF; };
+const xfer = (bytes, dir) => (bytes <= 0 ? 0 : R.link.latency_ms[dir + "_pageable"] + (bytes / (R.link.gbps[dir + "_pageable"] * 1e9)) * 1e3);
+
+const SHAPES = {
+  groupby: ["Group-by aggregate", "e.g. TPC-H Q1: sum per group over one table"],
+  global: ["Global aggregate", "a filtered SUM with no groups"],
+  join: ["Join", "fact table joined to a dimension 1/8 its size"],
+  sort: ["Sort / top-N", "ORDER BY over the rows"],
+};
+const ROWS = [[1e5, "100K"], [1e6, "1M"], [6e6, "6M · SF1 lineitem"], [6e7, "60M · SF10 lineitem"]];
+const GROUPS = [[4, "4"], [1000, "1,000"], [100000, "100,000"]];
+const GPUS = [["yes", "GPU present"], ["none", "no GPU"], ["disabled", "CUDA fault earlier"], ["failed", "this shape failed before"]];
+const PREFERS = [["", "(default)"], ["gpu", '"gpu"'], ["cpu", '"cpu"']];
+const S = { shape: "groupby", rows: 6e7, groups: 4, gpu: "yes", prefer: "", gap: 500, which: 1 };
+
+// operator costs for the whole plan on each device: auto_mode.estimate_plan, default fits
+function estimate(shape, n, groups) {
+  const L = [];
+  if (shape === "groupby") {
+    const card = Math.max(1, Math.min(groups, n)), enc = fit("group_encode@cpu", n), nb = n * 12;
+    return { srcRows: n, cpu: enc + fit("group_sum@cpu", n, card), gpu: enc + fit("group_sum@gpu", n, card) + xfer(nb, "h2d") + xfer(card * 8, "d2h"), h2d: nb, card, fused: true };
+  }
+  if (shape === "global") {
+    const nb = n * 12;
+    return { srcRows: n, cpu: fit("masked_sum@cpu", n), gpu: fit("masked_sum@gpu", n) + xfer(nb, "h2d"), h2d: nb, card: 1, fused: true };
+  }
+  if (shape === "sort") {
+    const nb = n * 4;
+    return { srcRows: n, cpu: fit("sort_topk@cpu", n), gpu: fit("sort_topk@gpu", n) + xfer(nb, "h2d"), h2d: nb, card: 1, fused: false };
+  }
+  const nl = n, nr = n / 8, nb = (nl + nr) * 8;     // join: the measured GPU join total is not in the defaults, so its sum-of-parts fallback is used
+  const gjoin = fit("join@gpu", nl) + fit("join_host@cpu", nl) + xfer(4 * nl, "d2h") + xfer(4 * nl + 4 * nr + 12 * nr, "h2d") + xfer(8 * nl, "d2h");
+  return { srcRows: nl + nr, cpu: fit("join@cpu", nl + nr), gpu: gjoin * K.JOIN_GPU_SAFETY + xfer(nb, "h2d"), h2d: nb, card: 1, fused: false };
+}
+
+// auto_mode.choose_device, rule by rule. init = GPU start-up still to pay (ms).
+function decide(cfg, init) {
+  const est = estimate(cfg.shape, cfg.rows, cfg.groups);
+  const margin = cfg.prefer === "gpu" ? 0 : cfg.prefer === "cpu" ? K.PREFER_CPU_MARGIN : K.GPU_WIN_MARGIN;
+  const steps = [];
+  let out = null;
+  const rule = (title, why, test) => {
+    if (out) return steps.push({ title, why, state: "skip" });
+    const stop = test();
+    if (stop) { out = stop; steps.push({ title, why: stop.reason, state: "stop" }); } else steps.push({ title, why, state: "pass" });
+  };
+  rule(`Fewer than ${fmtN(K.SMALL_QUERY_ROWS)} source rows?`, `${fmtN(est.srcRows)} rows: not small${cfg.prefer === "gpu" ? ' (prefer="gpu" skips this check)' : ""}`,
+    () => (cfg.prefer !== "gpu" && est.srcRows < K.SMALL_QUERY_ROWS ? { device: "cpu", reason: `small input (${fmtN(est.srcRows)} rows): gpu start-up and copies cannot pay off`, est: null } : null));
+  rule("Is there a GPU?", "yes", () => (cfg.gpu === "none" ? { device: "cpu", reason: "no gpu", est, nogpu: true } : null));
+  rule("Was the GPU switched off after a CUDA fault?", "no", () => (cfg.gpu === "disabled" ? { device: "cpu", reason: "gpu disabled after error", est, nogpu: true } : null));
+  rule("Did this query shape fail on the GPU before?", "no", () => (cfg.gpu === "failed" ? { device: "cpu", reason: "this query shape failed on gpu before", est } : null));
+  rule("Is any operator blocked on the GPU?", "no (the blocked list is empty today)", () => null);
+  const gpuTotal = est.gpu + init, limit = est.cpu * (1 - margin);
+  rule(`Does the GPU win by ${+(margin * 100).toFixed(0)}% or more, copies and start-up included?`,
+    "", () => {
+      if (gpuTotal < limit) return { device: "gpu", reason: "gpu faster incl. copies", est };
+      if (est.gpu < limit && init > 0) return { device: "cpu", reason: "gpu faster but still starting up", est };
+      return { device: "cpu", reason: est.h2d ? "cpu faster (copies over the link cost more)" : "cpu faster", est };
+    });
+  return { ...out, calibrated: out.est !== null, est, steps, init, margin, gpuTotal, limit };
+}
+
+// five queries in a row: GPU start-up and uploads begin after an idle gap and run only while no query does
+function simulate(cfg) {
+  const bytes = cfg.rows * 44, uploadMs = xfer(bytes, "h2d");   // Q1-shaped input: five 8-byte columns and a 4-byte group id
+  const q = []; let t = 0, bgStart = null, ready = false, upDone = 0, gpuQueryRan = false;
+  const idle = [];                                    // [start, end] while no query runs, after bgStart
+  for (let k = 1; k <= 5; k++) {
+    const s = t;
+    let init = ready ? 0 : bgStart !== null && bgStart <= s ? Math.max(0, K._DEFAULT_GPU_INIT_MS - (s - bgStart)) : K._DEFAULT_GPU_INIT_MS;
+    if (init === 0) ready = true;
+    const d = decide(cfg, init);
+    // progress of the background copy: idle time since bgStart
+    let progress = 0;
+    for (const [a, b] of idle) progress += Math.max(0, b - Math.max(a, bgStart ?? INF));
+    const inner = { text: "", resident: false, f: null };
+    let dur = d.device === "gpu" ? d.est.gpu + init : d.est.cpu;
+    const gpuOk = cfg.gpu === "yes" && d.calibrated;
+    if (d.device === "gpu") { ready = true; inner.text = "runs every operator on the GPU; the copy and any start-up are in the time"; }
+    else if (!gpuOk) inner.text = d.calibrated ? "CPU kernels only: no usable GPU" : "CPU kernels only; no GPU work is queued";
+    else if (!d.est.fused) inner.text = "CPU only: only fused aggregates use the GPU next to the CPU";
+    else if (bytes < K.MIN_UPLOAD_BYTES) inner.text = `CPU kernel; input under ${Math.round(K.MIN_UPLOAD_BYTES / 2 ** 20)} MiB, so no upload`;
+    else if (progress >= uploadMs) {
+      const cpuP = fit("pipeline@cpu", cfg.rows, d.est.card), gpuP = fit("pipeline@gpu", cfg.rows, d.est.card), a = K.DEFAULT_GPU_ALPHA_MS;
+      let f = (cpuP - a) / (cpuP + Math.max(gpuP - a, 1e-9));
+      f = f < K.MIN_SHARE ? 0 : f > 1 - K.MIN_SHARE ? 1 : f;
+      inner.resident = true; inner.f = f;
+      inner.text = f === 0 ? "columns are resident, but the GPU's share is too small: CPU kernel" : f === 1 ? "columns are resident: the GPU takes all rows" : `columns are resident: static split, GPU ${Math.round(f * 100)}% of rows, CPU ${Math.round((1 - f) * 100)}%`;
+      dur = f === 0 ? d.est.cpu : d.est.cpu * (1 - f) + K.DEFAULT_GPU_ALPHA_MS;
+    } else inner.text = bgStart === null ? `CPU kernel; a ${fmtBytes(bytes)} column upload is queued, but it starts only after ${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms with no query` : `CPU kernel; the ${fmtBytes(bytes)} upload is ${Math.round((100 * progress) / uploadMs)}% done`;
+    const e = s + dur;
+    if (d.device === "cpu" && gpuOk && bgStart === null && cfg.gap >= K.IDLE_BEFORE_BACKGROUND_S * 1000) bgStart = e + K.IDLE_BEFORE_BACKGROUND_S * 1000;
+    q.push({ k, s, e, d, inner, init, progress });
+    t = e + cfg.gap;
+    idle.push([e, t]);
+  }
+  return { q, bgStart, uploadMs, bytes };
+}
+
+function btnGroup(id, items, key, onChange, labelOf = (x) => x[1]) {
+  const el = $(id);
+  el.innerHTML = items.map((it, i) => `<button class="btn" type="button" data-i="${i}" aria-pressed="false">${labelOf(it)}</button>`).join("");
+  el.onclick = (e) => { const b = e.target.closest("button"); if (!b) return; onChange(items[+b.dataset.i][0]); render(); };
+  return () => [...el.children].forEach((b, i) => { const on = items[i][0] === S[key]; b.classList.toggle("on", on); b.setAttribute("aria-pressed", on); });
+}
+
+const sync = [];
+sync.push(btnGroup("c-shape", Object.entries(SHAPES).map(([k, v]) => [k, v[0]]), "shape", (v) => (S.shape = v)));
+sync.push(btnGroup("c-rows", ROWS, "rows", (v) => (S.rows = v)));
+sync.push(btnGroup("c-groups", GROUPS, "groups", (v) => (S.groups = v)));
+sync.push(btnGroup("c-gpu", GPUS, "gpu", (v) => (S.gpu = v)));
+sync.push(btnGroup("c-prefer", PREFERS, "prefer", (v) => (S.prefer = v)));
+sync.push(btnGroup("c-which", [1, 2, 3, 4, 5].map((k) => [k, `Query ${k}`]), "which", (v) => (S.which = v)));
+$("c-rows-r").oninput = (e) => { S.rows = Math.round(10 ** +e.target.value); render(); };
+$("c-gap").oninput = (e) => { S.gap = +e.target.value; render(); };
+
+function laneChart(sim) {
+  const W = 760, H = 168, x0 = 56, x1 = W - 10, total = sim.q[4].e * 1.04 || 1, X = (t) => x0 + (t / total) * (x1 - x0);
+  const lanes = [["CPU", 36], ["link", 76], ["GPU", 116]];
+  const c = { cpu: cssVar("--d-cpu"), gpu: cssVar("--d-gpu"), link: cssVar("--yellow"), dim: cssVar("--border-hi"), text: cssVar("--text"), line: cssVar("--border") };
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "Timeline of five queries on the CPU, the link and the GPU" });
+  lanes.forEach(([n, y]) => { s.appendChild(svg("rect", { x: x0, y: y - 14, width: x1 - x0, height: 28, rx: 3, fill: cssVar("--surface-2") })); s.appendChild(svg("text", { x: 8, y: y + 4 }, n)); });
+  const block = (t0, t1, y, fill, tip, label, op = 1) => {
+    const w = Math.max(2, X(t1) - X(t0)), r = svg("rect", { x: X(t0), y: y - 10, width: w, height: 20, rx: 2, fill, opacity: op });
+    hover(r, tip); s.appendChild(r);
+    if (label && w > 22) s.appendChild(svg("text", { x: X(t0) + 4, y: y + 3.5, fill: "#fff", style: "fill:#fff;font-weight:700" }, label));
+  };
+  sim.q.forEach((q) => {
+    block(q.s, q.e, 36, q.d.device === "gpu" ? c.gpu : c.cpu, `<b>Query ${q.k}</b> · ${q.d.device === "gpu" ? "GPU plan" : "CPU plan"}<br>${q.inner.text}<br>est. ${ms1(q.e - q.s)}`, "Q" + q.k);
+    if (q.inner.resident && q.inner.f > 0) block(q.s, q.e, 116, c.gpu, `Query ${q.k}: GPU share ${Math.round(q.inner.f * 100)}% of the rows`, "");
+    if (q.d.device === "gpu") block(q.s, q.e, 116, c.gpu, `Query ${q.k} on the GPU`, "Q" + q.k);
+  });
+  if (sim.bgStart !== null) {
+    const e1 = sim.bgStart - K.IDLE_BEFORE_BACKGROUND_S * 1000;
+    const wait = svg("rect", { x: X(e1), y: 66, width: Math.max(2, X(sim.bgStart) - X(e1)), height: 20, rx: 2, fill: "none", stroke: c.dim, "stroke-dasharray": "3 2" });
+    hover(wait, `the background work waits until no query has run for ${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms`); s.appendChild(wait);
+    block(sim.bgStart, sim.bgStart + K._DEFAULT_GPU_INIT_MS, 116, c.dim, `GPU start-up (${K._DEFAULT_GPU_INIT_MS} ms by default)`, "init");
+    if (sim.q[0].d.calibrated && sim.q[0].d.est.fused && sim.bytes >= K.MIN_UPLOAD_BYTES) {
+      let left = sim.uploadMs;
+      sim.q.forEach((q, i) => {
+        const a = Math.max(q.e, sim.bgStart), b = i < 4 ? sim.q[i + 1].s : total;
+        if (b > a && left > 0) { const len = Math.min(b - a, left); left -= len; block(a, a + len, 76, c.link, `column copy to the GPU (${ms1(sim.uploadMs)} in all), paused while a query runs`, ""); }
+      });
+    }
+  }
+  [0, total / 2, total].forEach((t) => s.appendChild(svg("text", { x: X(t), y: H - 6, "text-anchor": t === 0 ? "start" : t === total ? "end" : "middle" }, ms1(t))));
+  $("timeline").replaceChildren(s);
+  $("tl-legend").innerHTML = [["--d-cpu", "CPU plan"], ["--d-gpu", "GPU plan / GPU share"], ["--yellow", "column copy over the link"], ["--border-hi", "GPU start-up"]]
+    .map(([v, n]) => `<span><i class="sq" style="background:var(${v})"></i>${n}</span>`).join("") + `<span><i class="sq" style="border:1px dashed var(--border-hi)"></i>${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms idle first</span>`;
+}
+
+function render() {
+  sync.forEach((f) => f());
+  $("c-rows-r").value = Math.log10(S.rows);
+  $("c-rows-v").textContent = fmtN(S.rows) + " rows";
+  $("c-gap-v").textContent = S.gap + " ms";
+  $("c-groups-row").style.display = S.shape === "groupby" ? "" : "none";
+  const sim = simulate(S), q = sim.q[S.which - 1], d = q.d;
+  $("trace").innerHTML = d.steps.map((st) => `<li class="${st.state}"><span class="mark">${st.state === "pass" ? "✓" : st.state === "stop" ? "■" : "·"}</span><div><b>${st.title}</b><span class="why">${st.state === "skip" ? "not reached" : st.state === "stop" ? "stops here: " + st.why : st.why}</span></div></li>`).join("");
+  const col = d.device === "gpu" ? "--d-gpu" : "--d-cpu";
+  const e = d.est;
+  $("verdict").innerHTML = `<div class="big"><i style="background:var(${col})"></i>auto → ${d.device}</div><div class="sub">reason: <span class="mono">${d.reason}</span></div>` +
+    (!d.calibrated ? `<div class="sub">The calibration was never loaded for this query.</div>` :
+      `<div class="cost"><span>estimated CPU plan</span><span>${ms1(e.cpu)}</span><span>estimated GPU plan, copies in</span><span>${ms1(e.gpu)}</span><span>GPU start-up still to pay</span><span>${ms1(q.init)}</span><span>GPU total</span><span>${ms1(e.gpu + q.init)}</span><span>GPU must beat</span><span>${ms1(e.cpu * (1 - d.margin))}</span></div>`);
+  $("stage-b").innerHTML = `<b>Then, inside the plan.</b> ${q.inner.text}.`;
+  $("session-rows").innerHTML = sim.q.map((x) => `<tr><td class="num">${x.k}</td><td><span class="mono">${x.d.device}</span> · ${x.d.reason}</td><td>${x.inner.text}</td><td class="r num nowrap">${ms1(x.s)}</td></tr>`).join("");
+  laneChart(sim);
+}
+document.addEventListener("themechange", () => laneChart(simulate(S)));
+render();
+
+/* ───────── part 2: measured results, from bench/ ───────── */
+const FILES = {
+  sf10: "bench/final-sf10.csv",
+  sf1: ["bench/final-sf1.csv", "bench/final-sf1-extra1.csv", "bench/final-sf1-extra2.csv", "bench/final-sf1-extra3.csv"],
+  eng10: "bench/engine-sf10.csv", now10: "bench/m2s-engine.csv", co: "bench/auto-coproc.json",
+};
+const DEV = { "mx-cpu": ["cpu", "--d-cpu"], "mx-gpu": ["gpu", "--d-gpu"], "mx-auto": ["auto", "--d-auto"] };
+const med = (a) => { const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
+
+// rows -> [{q, cpu, gpu, auto, best, ratio, ok}] using the first run of each; or the median over several runs
+function perQuery(runs, how) {
+  const get = (rows) => { const d = {}; rows.forEach((r) => { if (DEV[r.engine] && r.first_ms) (d[r.query] ??= {})[r.engine] = +r.first_ms; }); return d; };
+  const ds = runs.map(get);
+  return Array.from({ length: 22 }, (_, i) => {
+    const q = String(i + 1), v = (e) => (how === "median" ? med(ds.map((d) => d[q][e])) : ds[how][q][e]);
+    const cpu = v("mx-cpu"), gpu = v("mx-gpu"), auto = v("mx-auto"), best = Math.min(cpu, gpu), ratio = auto / best;
+    return { q: +q, cpu, gpu, auto, best: cpu <= gpu ? "cpu" : "gpu", ratio, ok: ratio <= 1 + BENCH_PASS_MARGIN + 1e-9 };
+  });
+}
+const count = (rows) => rows.filter((r) => r.ok).length;
+
+let M = null, MS = { sf: "sf10", view: "ratio" };
+function drawMeasured() {
+  if (!M) return;
+  const rows = MS.sf === "sf10" ? M.sf10 : MS.sf === "sf1m" ? M.sf1med : M.sf1runs[+MS.sf.slice(3) - 1];
+  const items = [["sf10", "SF10"], ["sf1m", "SF1 · median of 4 runs"], ...M.sf1runs.map((_, i) => ["run" + (i + 1), "SF1 · run " + (i + 1)])];
+  const grp = (id, list, key) => { $(id).innerHTML = list.map(([k, n]) => `<button class="btn${MS[key] === k ? " on" : ""}" type="button" data-k="${k}" aria-pressed="${MS[key] === k}">${n}</button>`).join(""); $(id).onclick = (e) => { const b = e.target.closest("button"); if (b) { MS[key] = b.dataset.k; drawMeasured(); } }; };
+  grp("m-sf", items, "sf"); grp("m-view", [["ratio", "Ratio to the better device"], ["ms", "Milliseconds, all three"]], "view");
+
+  const n = rows.length, W = 760, top = 22, rh = 20, H = top + n * rh + 34, x0 = 44, x1 = W - 120;
+  const c = { cpu: cssVar("--d-cpu"), gpu: cssVar("--d-gpu"), auto: cssVar("--d-auto"), slow: cssVar("--slow"), grid: cssVar("--border"), text: cssVar("--text") };
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "Per-query comparison of auto with cpu and gpu" });
+  let X;
+  if (MS.view === "ratio") {
+    const mx = Math.max(1.3, Math.min(2.0, Math.max(...rows.map((r) => r.ratio)) * 1.02)), lo = Math.min(0.9, Math.floor(Math.min(...rows.map((r) => r.ratio)) * 20) / 20);
+    X = (v) => x0 + ((Math.min(v, mx) - lo) / (mx - lo)) * (x1 - x0);
+    for (let v = 1.0; v <= mx + 1e-9; v += 0.1) { s.appendChild(svg("line", { x1: X(v), x2: X(v), y1: top - 6, y2: H - 28, stroke: c.grid })); s.appendChild(svg("text", { x: X(v), y: H - 14, "text-anchor": "middle" }, v.toFixed(1) + "×")); }
+    s.appendChild(svg("line", { x1: X(1 + BENCH_PASS_MARGIN), x2: X(1 + BENCH_PASS_MARGIN), y1: top - 8, y2: H - 28, stroke: c.slow, "stroke-dasharray": "4 3", "stroke-width": 1.5 }));
+    s.appendChild(svg("text", { x: X(1 + BENCH_PASS_MARGIN) + 4, y: top - 10, style: `fill:${c.slow}` }, "+10%"));
+  } else {
+    const all = rows.flatMap((r) => [r.cpu, r.gpu, r.auto]), lo = Math.log10(Math.min(...all) * 0.8), hi = Math.log10(Math.max(...all) * 1.2);
+    X = (v) => x0 + ((Math.log10(v) - lo) / (hi - lo)) * (x1 - x0);
+    for (let p = Math.ceil(lo); p <= hi; p++) { s.appendChild(svg("line", { x1: X(10 ** p), x2: X(10 ** p), y1: top - 6, y2: H - 28, stroke: c.grid })); s.appendChild(svg("text", { x: X(10 ** p), y: H - 14, "text-anchor": "middle" }, fmtMs(10 ** p))); }
+  }
+  const mark = (kind, x, y, fill, open) => {
+    const a = open ? { fill: cssVar("--surface"), stroke: fill, "stroke-width": 2 } : { fill };
+    return kind === "cpu" ? svg("circle", { cx: x, cy: y, r: 4.5, ...a }) : kind === "gpu" ? svg("path", { d: `M${x},${y - 5.5} L${x + 5.5},${y} L${x},${y + 5.5} L${x - 5.5},${y} Z`, ...a }) : svg("rect", { x: x - 4.5, y: y - 4.5, width: 9, height: 9, ...a });
+  };
+  rows.forEach((r, i) => {
+    const y = top + i * rh + rh / 2;
+    s.appendChild(svg("text", { x: x0 - 8, y: y + 3.5, "text-anchor": "end" }, "Q" + r.q));
+    const hit = svg("rect", { x: 0, y: y - rh / 2, width: W, height: rh, fill: "transparent" });
+    hover(hit, () => `<b>Q${r.q}</b><br>cpu ${fmtMs(r.cpu)} · gpu ${fmtMs(r.gpu)} · auto ${fmtMs(r.auto)}<br>auto is ${r.ratio.toFixed(2)}× the better device (${r.best}) · ${r.ok ? "within 10%" : "outside 10%"}`);
+    if (MS.view === "ratio") {
+      s.appendChild(svg("line", { x1: X(1), x2: X(r.ratio), y1: y, y2: y, stroke: r.ok ? c.auto : c.slow, "stroke-width": 1.5, opacity: 0.5 }));
+      s.appendChild(mark("auto", X(r.ratio), y, r.ok ? c.auto : c.slow, !r.ok));
+      s.appendChild(svg("text", { x: x1 + 14, y: y + 3.5 }, (r.ratio >= 1.995 ? "≥" : "") + r.ratio.toFixed(2) + "× · " + r.best));
+    } else {
+      s.appendChild(svg("line", { x1: X(Math.min(r.cpu, r.gpu, r.auto)), x2: X(Math.max(r.cpu, r.gpu, r.auto)), y1: y, y2: y, stroke: c.grid, "stroke-width": 2 }));
+      s.appendChild(mark("cpu", X(r.cpu), y, c.cpu)); s.appendChild(mark("gpu", X(r.gpu), y, c.gpu)); s.appendChild(mark("auto", X(r.auto), y, c.auto, !r.ok));
+      s.appendChild(svg("text", { x: x1 + 14, y: y + 3.5 }, r.ok ? "within 10%" : "outside 10%"));
+    }
+    s.appendChild(hit);
+  });
+  $("m-chart").replaceChildren(s);
+  const sw = (kind, v) => `<span><svg width="12" height="12" viewBox="-6 -6 12 12" style="vertical-align:-1px;margin-right:6px"><${kind === "cpu" ? "circle r='4.5'" : kind === "gpu" ? "path d='M0,-5.5 L5.5,0 L0,5.5 L-5.5,0Z'" : "rect x='-4.5' y='-4.5' width='9' height='9'"} fill="var(${v})"/></svg>`;
+  $("m-legend").innerHTML = MS.view === "ratio"
+    ? `${sw("auto", "--d-auto")}auto, within 10%</span><span><svg width="12" height="12" viewBox="-6 -6 12 12" style="vertical-align:-1px;margin-right:6px"><rect x="-4.5" y="-4.5" width="9" height="9" fill="var(--surface)" stroke="var(--slow)" stroke-width="2"/></svg>auto, outside 10%</span><span><i class="sq" style="background:none;border-top:2px dashed var(--slow);height:0;width:16px;vertical-align:3px"></i>the 10% line</span>`
+    : `${sw("cpu", "--d-cpu")}cpu</span>${sw("gpu", "--d-gpu")}gpu</span>${sw("auto", "--d-auto")}auto (hollow = outside 10%)</span>`;
+  $("m-table").innerHTML = `<tr><th>Query</th><th class="r">cpu ms</th><th class="r">gpu ms</th><th class="r">auto ms</th><th>better</th><th class="r">auto ÷ better</th><th>within 10%</th></tr>` +
+    rows.map((r) => `<tr><td>Q${r.q}</td><td class="r num">${r.cpu.toFixed(1)}</td><td class="r num">${r.gpu.toFixed(1)}</td><td class="r num">${r.auto.toFixed(1)}</td><td>${r.best}</td><td class="r num">${r.ratio.toFixed(3)}</td><td>${r.ok ? "yes" : "no"}</td></tr>`).join("");
+  const files = MS.sf === "sf10" ? [FILES.sf10] : MS.sf === "sf1m" ? FILES.sf1 : [FILES.sf1[+MS.sf.slice(3) - 1]];
+  $("m-note").innerHTML = `${count(rows)} of 22 within 10%${rows.filter((r) => !r.ok).length ? "; outside: " + rows.filter((r) => !r.ok).map((r) => "Q" + r.q).join(", ") : ""}. Source: ${files.map((f) => `<a href="${f}">${f}</a>`).join(", ")}${MS.sf === "sf1m" ? " (median of the four first-run times per engine and query)" : ""}.`;
+}
+
+function drawStale() {
+  if (!M || !M.eng10) return;
+  const sum = (rows, e) => rows.filter((r) => r.engine === e && r.sf === "10").reduce((t, r) => t + +r.first_ms, 0);
+  const t = { cpuOld: sum(M.eng10, "mx-cpu"), gpuOld: sum(M.eng10, "mx-gpu"), cpuNow: sum(M.now10, "mx-cpu") };
+  const q = (rows, e) => Object.fromEntries(rows.filter((r) => r.engine === e && r.sf === "10").map((r) => [r.query, +r.first_ms]));
+  const gpuOld = q(M.eng10, "mx-gpu"), cpuNow = q(M.now10, "mx-cpu");
+  const slower = Object.keys(gpuOld).filter((k) => gpuOld[k] > cpuNow[k]).length, n = Object.keys(gpuOld).length;
+  const tile = (label, v, color) => `<div class="card stat"><span class="label"><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:var(${color});margin-right:6px"></i>${label}</span><span class="num">${(v / 1000).toFixed(1)} s</span></div>`;
+  $("stale").innerHTML = tile("cpu path, 2026-10-12", t.cpuOld, "--d-cpu") + tile("gpu path, 2026-10-12", t.gpuOld, "--d-gpu") + tile("cpu, native executor", t.cpuNow, "--mx");
+  $("stale-note").innerHTML = `SF10, engine only (data already loaded), sum of the 22 first runs, from <a href="${FILES.eng10}">${FILES.eng10}</a> and <a href="${FILES.now10}">${FILES.now10}</a>. The 2026-10-12 GPU-path run is slower than today's CPU time on ${slower} of ${n} queries. Different days and machine load, and the GPU path itself has not changed since, so this is a gap to re-measure, not a result: the next three-way run on the 0.6.0 build is what would settle whether <code>auto</code> still tracks the better device.`;
+}
+
+function drawTiles() {
+  const n10 = count(M.sf10), n1 = count(M.sf1med), singles = M.sf1runs.map(count);
+  const tile = (label, big, sub, ok) => `<div class="card stat"><span class="label">${label}</span><span class="num">${big}</span><span class="badge ${ok ? "ok" : "warn"}">${sub}</span></div>`;
+  $("tiles").innerHTML = tile("SF10 · one run", `${n10}/22`, "within 10% of the better device", n10 >= 20) + tile("SF1 · median of 4 runs", `${n1}/22`, "within 10%", n1 >= 20) +
+    tile("SF1 · each single run", singles.join(" · "), singles.filter((x) => x >= 20).length + " of 4 reach 20", false);
+  $("tiles-note").innerHTML = `The SF1 queries take 50 to 400 ms, so one fresh-process run moves about 10% by itself and the queries that miss change from run to run. Judge it on the median of the four runs, and read the single runs as the spread. The three extra SF1 runs started while the machine was still busy from the SF10 run.`;
+}
+
+function drawCoproc() {
+  const co = M.co, fs = co.fused_stage, rows = fs.rows;
+  $("cp-title").textContent = fs.query;
+  const colOf = { cpu: "--d-cpu", gpu: "--d-gpu", queue: "--mid", split: "--d-auto" };
+  const W = 420, rh = 34, H = rows.length * rh + 24, x0 = 8, x1 = W - 20, max = Math.max(...rows.map((r) => r.ms_hi ?? r.ms)) * 1.14;
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": "Milliseconds for each execution strategy" });
+  rows.forEach((r, i) => {
+    const y = i * rh + 4, lo = r.ms ?? r.ms_lo, hi = r.ms ?? r.ms_hi, X = (v) => x0 + (v / max) * (x1 - x0), fill = cssVar(colOf[r.device]);
+    s.appendChild(svg("text", { x: x0, y: y + 9, style: `fill:${cssVar("--text-mid")}` }, r.label));
+    const bar = svg("rect", { x: x0, y: y + 14, width: Math.max(2, X(lo) - x0), height: 13, rx: 2, fill });
+    s.appendChild(bar);
+    if (hi !== lo) s.appendChild(svg("rect", { x: X(lo), y: y + 14, width: X(hi) - X(lo), height: 13, rx: 2, fill, opacity: 0.4 }));
+    s.appendChild(svg("text", { x: X(hi) + 6, y: y + 24, style: `fill:${cssVar("--text")};font-weight:700` }, hi !== lo ? `${lo}–${hi}` : String(lo)));
+    const hit = svg("rect", { x: 0, y: y - 2, width: W, height: rh, fill: "transparent" });
+    hover(hit, `<b>${r.label}</b><br>${hi !== lo ? lo + "–" + hi : lo} ms`); s.appendChild(hit);
+  });
+  $("cp-chart").replaceChildren(s);
+  $("cp-legend").innerHTML = [["--d-cpu", "CPU"], ["--d-gpu", "GPU"], ["--mid", "morsel queue"], ["--d-auto", "static split, both at once"]].map(([v, n]) => `<span><i class="sq" style="background:var(${v})"></i>${n}</span>`).join("");
+  $("cp-table").innerHTML = `<tr><th>Strategy</th><th class="r">ms</th></tr>` + rows.map((r) => `<tr><td>${r.label}</td><td class="r num">${r.ms ?? r.ms_lo + "–" + r.ms_hi}</td></tr>`).join("");
+}
+function drawSession() {
+  const ss = M.co.session, r = (a, b) => (b ? `${a}–${b}` : a);
+  $("ss-title").textContent = "One session · " + ss.query.split(";")[0];
+  $("ss-table").innerHTML = `<tr><th></th><th class="r">query 1</th><th class="r">query 2</th><th class="r">query 3 and later</th></tr>` + ss.rows.map((x) => `<tr><td class="mono">${x.label}</td><td class="r num">${x.q1}</td><td class="r num">${x.q2 ?? r(x.q2_lo, x.q2_hi)}</td><td class="r num">${r(x.q3_lo, x.q3_hi)}</td></tr>`).join("");
+  $("ss-note").textContent = "milliseconds. Query 1 pays for the GPU start-up and copy being scheduled; from query 3 the columns are resident and the split pays off.";
+  $("cp-note").innerHTML = `The split runs repeat queries on resident data about ${M.co.repeat_speedup.factor}× faster than the CPU alone. These numbers were measured by hand on ${M.co.machine} and exist only in markdown, so they sit in <a href="bench/auto-coproc.json">bench/auto-coproc.json</a> with the file each came from (<code>${ss.source}</code>, <code>${M.co.repeat_speedup.source}</code>).`;
+}
+
+Promise.all([loadCSV(FILES.sf10), Promise.all(FILES.sf1.map(loadCSV)), loadCSV(FILES.eng10), loadCSV(FILES.now10), loadJSON(FILES.co)])
+  .then(([sf10, sf1, eng10, now10, co]) => {
+    M = { sf10: perQuery([sf10], 0), sf1runs: sf1.map((r) => perQuery([r], 0)), sf1med: perQuery(sf1, "median"), eng10, now10, co };
+    drawTiles(); drawMeasured(); drawStale(); drawCoproc(); drawSession();
+  })
+  .catch((err) => { ["tiles", "m-chart", "cp-chart"].forEach((id) => showError($(id), err.message.split(":")[0], err)); });
+document.addEventListener("themechange", () => { if (M) { drawMeasured(); drawCoproc(); } });
+</script>
+</body>
+</html>

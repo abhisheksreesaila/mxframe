@@ -471,7 +471,46 @@ Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong 
 - [ ] remaining (next release): join + aggregate fusion (no joined rows written), partitioned hash join for TPC-H Q3 / Q5 / Q8 / Q11 / Q12 / Q17 / Q22 (0.44-0.69x DuckDB), SELECT DISTINCT (0.57-0.99x)
 - [x] release numbers on one build, quiet machine (`docs/bench/m2s-engine*.md`, `random-*-m2s.md`; shuffled + random 2026-10-14 01:21-01:50 after load < 2 for 5 min; stored rows rerun 02:05 after load < 1 for 5 min, the first pass overlapped a snapper cleanup and was discarded): TPC-H SF10 MXFrame 3.15 s, DuckDB 5.08, Polars 14.40 (without Q21: 2.41 vs 2.27); shuffled SF10 4.97 / 5.55 / 15.06 (without Q21: 3.63 vs 2.79); SF1 0.47 / 0.63 / 1.31, shuffled 0.61 / 0.66 / 1.41; random vs DuckDB (geo. mean) SF1 0.83x, SF1 shuffled 1.21x, SF10 1.09x; all MXFrame results equal DuckDB. README, optimizations.md, RELEASE_NOTES_0.6.0.md updated
 
-## F-039 The optimization story: README with visuals [doing]
+## Docs overhaul (brief: docs/briefs/docs-overhaul.md, approved 2026-10-14) · Branch: `docs-overhaul`
+
+Shared rules: plain HTML + JS + one shared CSS in `docs/site/` (house style, Terminal Ledger); every page opens with "what you're looking at, how to read it"; numbers come from `docs/bench/*.csv` / `*.json`, never typed by hand (README headline table excepted, checked by a test).
+
+## F-047 Site skeleton and GitHub Pages deploy [done]
+Needs: design (`docs/design/docs-site.md`) · Files: `docs/site/` (new), `.github/workflows/pages.yml` (new)
+- [x] `docs/site/index.html`: shared nav and `site.css`, light and dark, totals computed from the bench CSV; the page cards (thumbnail, one line on what each shows) are added as each page lands (F-049..F-052)
+- [x] a Pages workflow deploys `docs/site/` on push to `main`; the bench CSV/JSON files are copied in at build
+- [ ] Blocked until merge: Abhishek turns on Pages (Settings → Pages → Source: GitHub Actions), or says OK for `gh api`
+
+## F-048 Simple README with API tables [done]
+Needs: F-047 (links) · Files: `README.md`, `tests/test_readme_api.py` (new)
+- [x] under ~120 lines: why (3 bullets), latest release (0.6.0 SF10 table + DuckDB caveat), install, a code + output "screenshot" (query, result, timing), API reference tables (LazyFrame methods, expressions, aggregations, SQL, devices), links to the pages; the long history moves to the pages / `optimizations.md` / `benchmarks.md`
+- [x] a test runs every code sample and API call shown in the README; the headline numbers match `docs/bench/m2s-engine*.csv`
+
+## F-049 Interactive benchmarks page [done]
+Needs: F-047 · Files: `docs/site/benchmarks.html`, `docs/site/js/bench.js`
+- [x] toggles: SF1 / SF10, stored / shuffled, engines; per-query bars and totals with and without Q21; random-query shapes vs DuckDB; correctness verdicts; run conditions (load, date, build)
+- [x] reads the CSV/JSON in `docs/bench/` at runtime; tests replay bench.js under node against Python readings of the same files (typed run-conditions prose is not machine-checked)
+
+## F-050 Behind the scenes (for porting) page [done]
+Needs: F-047 · Files: `docs/site/internals.html`
+- [x] the path a query takes, LazyFrame → plan → optimizer → native Mojo executor → fused pipeline → AOT kernels, as a clickable diagram; each layer shows its files, its seam (ctypes, Arrow C Data Interface), when it declines and who answers next, and the env switch (`MXFRAME_NATIVE`, `MXFRAME_FUSED_PIPELINE`)
+- [x] "add an operator" walkthrough with the real file and function names; every path named on the page exists (checked by a test)
+
+## F-051 How it got fast page [done]
+Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open items of F-039
+- [x] one card per optimization from `optimizations.md` (what was slow, what changed, before / after numbers, Mojo feature or plain engineering), the progress chart, per-query wins over time
+
+## F-052 How device="auto" decides page [done]
+Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
+- [x] restyled on `site.css`, "how to read this" header, numbers from the bench files
+
+## F-053 device="auto" never uses the native executor [todo]
+Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
+- [ ] re-run the user-felt TPC-H scoreboard with `mx-auto` next to `mx-cpu` on 0.6.0 (quiet machine)
+- [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
+- [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again
+
+## F-039 The optimization story: README with visuals [doing] (open items move to F-051)
 Needs: F-032 (numbers from its final benchmark) · Asked by Abhishek 2026-10-13
 - [x] draft done 2026-10-13 (review by Abhishek pending): `docs/optimizations.md`, `docs/img/{progress,per-query-sf10,per-query-sf1}.svg` from `scripts/plot_progress.py` (dataviz palette validated, light and dark), README section "How the CPU engine got fast"
 - [ ] `docs/optimizations.md`: one section per optimization (M0 executor ... M2h distinct and later): what was slow and why, what the engine does now, a diagram (mermaid) of before / after, the before / after numbers from `docs/bench/`, and which Mojo feature it relies on (compile-time specialization of the keyed / plain pipeline, closures inlined into `parallelize`, SIMD widths from `simd_width_of`, AOT shared libraries over the Arrow C Data Interface) or that it is plain engineering (no `pyarrow.compute` import)
