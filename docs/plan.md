@@ -510,7 +510,7 @@ Found 2026-10-14 while documenting auto (F-052); the review showed it holds on e
 - [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
 - [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again
 
-## F-054 Finish the docs [review]
+## F-054 Finish the docs [done]
 Asked 2026-10-14 ("add license, finish docs, hold off on new dev")
 - [x] `LICENSE` (Apache-2.0, official text), in the sdist via `MANIFEST.in`, linked from the README
 - [x] `docs/api.md` rewritten against the code: constructors, joins, `compute()` arguments, inspection, SQL limits, devices, source layout
