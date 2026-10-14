@@ -42,3 +42,4 @@ Claude reads this at the start of each session. -->
 - 2026-10-13 · When a fast path hands its input to another path, check the second path accepts everything the first did: sending sorted few-run input to the hash count made sparse key ranges (which the runs path answered) decline to Python. Test the handoff with an input only the first path could take.
 - 2026-10-14 · Benchmark runs for publication: log what else ran (ps samples) and check scheduled jobs (snapper, timers); a load gate at the start doesn't guarantee a quiet run.
 - 2026-10-14 · Before opening a PR, run every step in .github/workflows/test.yml locally (the scripts/_test_*.py smoke scripts aren't in pytest).
+- 2026-10-14 · Before a release, dry-run scripts/release.sh (no flags) end to end; it had gone stale (no twine, old kernels.mojopkg name) since the last release.

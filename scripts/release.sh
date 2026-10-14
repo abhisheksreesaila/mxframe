@@ -84,7 +84,7 @@ wheel = next(Path("dist").glob("mxframe-*.whl"))
 with ZipFile(wheel) as archive:
     names = set(archive.namelist())
 required = (
-    "mxframe/kernels.mojopkg",
+    "mxframe/kernels.mojoc",
     "mxframe/kernels_aot/libmxkernels_aot.so",
     "mxframe/kernels_aot/libmxkernels_aot_gpu.so",
 )
