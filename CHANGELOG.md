@@ -7,6 +7,45 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-13
+
+The CPU engine is now a native Mojo executor: one call per query stage runs the scan, filter,
+joins and aggregate over Arrow memory, compiled ahead of time. Engine-only TPC-H and a seeded
+random-query suite are the benchmarks, with every result checked against DuckDB. Numbers and the
+story behind each step: `docs/optimizations.md`.
+
+### 🧠 Native Mojo executor (F-030, F-031, M2a–M2n)
+- One native call (`libmxexec_cpu.so`, over the Arrow C Data Interface) runs a whole plan stage: a
+  bytecode interpreter for predicates and expressions, group-by specialized at compile time
+  (direct-mapped, compacted or hashed keys), and joins fused into the scan as lookups (star joins
+  in one pass, semi / anti joins without a DISTINCT, nested stars).
+- Native DISTINCT, ORDER BY ... LIMIT (per-worker heaps), WHERE-only filters, `str_slice` and
+  utf8 `isin`, COUNT(DISTINCT) on sorted runs.
+- One thread per physical core; fewer workers for small inputs; no `pyarrow.compute` or pandas
+  import on the query path; the Mojo runtime loads once.
+
+### ⚡ Closing the gaps to DuckDB (F-043, F-046)
+- Millions of groups aggregate into one shared output behind a per-worker cache; keys double as
+  ORDER BY tie-breaks; a runtime join filter for large semi-join partners.
+- Dictionary strings stay as codes through joins, single-table filters, SELECT DISTINCT and
+  COUNT(DISTINCT), and are decoded only for the rows that reach the output.
+- COUNT(DISTINCT) on unsorted keys: a byte map for small key x value ranges, hash partitions by
+  key range or by (key, value) pair, so few keys no longer stall on one worker.
+- WHERE + ORDER BY + LIMIT in one pass (`mx_filter_topk`).
+
+### 📥 Parquet, SQL and planning
+- `mx.scan_parquet` / `mx.read_parquet_table` with projection and filter pushdown and dictionary
+  strings (F-010, F-017); `mx.sql` front end on sqlglot (joins of every side, aliases, GROUP BY
+  keys by alias, F-041); `device="auto"` planner with explain and fallback (F-005).
+- Fixed: a group-by on an aliased column (F-040); a SQL `SELECT` alias on a group key (F-041).
+
+### 📊 Benchmarks
+- Engine-only TPC-H scoreboard (`scripts/bench_user_felt.py --mode engine`, also `--shuffle`d
+  rows) and a seeded random-query suite (`scripts/bench_random/`) rendered for MXFrame, Polars and
+  DuckDB, all checked against DuckDB. DuckDB's lazy pyarrow import is now staged like every
+  engine's import (it had inflated DuckDB's times).
+
+
 ### 🔗 Join engine: lean, reordered, late-materialized (F-018)
 - **New `join_engine.py`.** A chain of inner joins is flattened into leaves (the inputs, filtered and cut to the columns the query reads) and key edges, joined in an order chosen from the leaves' real post-filter row counts (small filtered sides first, the larger side probes and the smaller builds), and carried as row-index vectors: a join gathers only the key columns it compares and composes the indices, every output column is gathered once at the end. Output column names and order are exactly those of the joins as written; left joins are barriers (their two sides are executed on their own). A `Filter` comparing columns of two leaves between joins (TPC-H Q5) is applied as soon as its leaves meet.
 - **Projection pushdown through joins:** each `Join` produces only the columns read above it (through `Filter`, `Project`, `Sort`, `Aggregate`, `Distinct`).

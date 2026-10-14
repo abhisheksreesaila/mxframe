@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mxframe"
-version = "0.5.0"
+version = "0.6.0"
 description = "GPU-accelerated DataFrame engine with Python ergonomics and Mojo AOT kernels."
 readme = "README.md"
 requires-python = ">=3.12"

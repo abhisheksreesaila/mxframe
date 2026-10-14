@@ -1,6 +1,6 @@
 """mxframe - GPU-accelerated DataFrames with MAX Engine"""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Lazy expression layer
 from .lazy_expr import Expr, col, lit, when, row_number
