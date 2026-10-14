@@ -16,7 +16,7 @@ The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/interna
 
 ### The compiled libraries
 
-All are built ahead of time, committed, and shipped in the wheel; nothing compiles at run time. CPU libraries target `x86-64-v3` (AVX2), so a wheel doesn't SIGILL on older machines.
+All are built ahead of time, committed, and shipped in the wheel; nothing compiles at run time. The native executor, pipeline, group-key and join libraries are built for `x86-64-v3` (AVX2), so a wheel doesn't SIGILL on older machines; `scripts/release.sh` builds the per-operator AOT kernels for Mojo's default target.
 
 | Library | Source | Build |
 |---|---|---|
@@ -138,9 +138,9 @@ fn my_kernel_gpu(out_addr: Int, inp_addr: Int, n: Int):
     except: pass
 ```
 
-### Step 4 — Bind in `custom_ops.py`
+### Step 4 — Bind in `aot_kernels.py`
 
-In the `AOTKernelsGPU` class (or `AOTKernelsCPU`), add the binding:
+In `_bind` of class `AOTKernels` (CPU) or `AOTKernelsGPU` (GPU), add the binding:
 
 ```python
 def _bind(self):
@@ -170,111 +170,13 @@ def my_kernel(self, inp: np.ndarray) -> np.ndarray:
 ### Step 5 — Rebuild and test
 
 ```sh
-pixi run mojo build --emit shared-lib kernels_aot/kernels_aot_gpu.mojo \
-    -o kernels_aot/libmxkernels_aot_gpu.so
+pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
+    --emit shared-lib -o kernels_aot/libmxkernels_aot.so
+pixi run mojo build kernels_aot/kernels_aot_gpu.mojo -I kernels_aot \
+    --emit shared-lib -o kernels_aot/libmxkernels_aot_gpu.so
 pixi run python3 scripts/_test_aot_smoke.py
+pixi run test
 ```
-
----
-
-## 🧬 How the Execute Path Works
-
-When you call `.compute(device="gpu")`:
-
-```
-LazyFrame.compute("gpu")
-    → custom_ops.CustomOpsCompiler._execute(plan, device="gpu")
-    → walks LogicalPlan tree bottom-up
-    → for each node:
-        Filter  → _execute_filter_aot()     → filter_gather_f32_gpu()
-        Groupby → _execute_grouped_aot()    → group_encode() + group_sum_f32_gpu()
-        Join    → _execute_hash_join()      → join_count_gpu() + join_scatter_gpu()
-        Sort    → _execute_sort()           → sort_indices_gpu() + gather rows
-        Limit   → pa.Table.slice() (trivial)
-```
-
-All AOT calls follow this pattern:
-
-```python
-# 1. Get contiguous NumPy array (zero-copy from Arrow when possible)
-arr = np.ascontiguousarray(column, dtype=np.float32)
-
-# 2. Get raw pointer
-ptr = arr.ctypes.data_as(ctypes.c_void_p).value
-
-# 3. Call AOT function
-self._aot_gpu.group_sum_f32(out_ptr, arr_ptr, labels_ptr, n_rows, n_groups)
-
-# 4. Wrap result back as Arrow array
-result = pa.array(out_np, type=pa.float32())
-```
-
----
-
-## 🧪 Test Structure
-
-### `scripts/_test_aot_smoke.py` — AOT Kernel Unit Tests
-
-Tests each kernel independently with small hand-crafted inputs:
-
-```
-✅ group_sum_f32       — 5 groups, 20 rows
-✅ group_min_f32       — boundary values
-✅ group_max_f32       — boundary values
-✅ group_mean_f32      — float precision
-✅ group_count         — empty groups
-✅ join_count / join_scatter    — inner join correctness
-✅ join_count_left / join_scatter_left  — left outer join, nulls
-✅ filter_gather_f32   — sparse mask
-✅ gather_rows_f32     — permutation
-✅ sort_indices        — ascending/descending
-✅ unique_mask         — consecutive duplicates
-✅ masked_global_sum   — masked reduce
-```
-
-### `scripts/_test_phase6_tpch_tier2.py` — TPC-H Integration Tests
-
-Runs all 22 TPC-H queries and checks output matches Pandas reference:
-
-```
-✅ Q1  — 8-agg groupby
-✅ Q3  — 3-table join + top-10 sort
-✅ Q4  — EXISTS semi-join
-...
-✅ Q22 — phone prefix anti-join
-```
-
-Each check uses `np.allclose(rtol=1e-2)` for float columns and exact match for integer/string columns.
-
-### Adding a New Test
-
-Add to `scripts/_test_aot_smoke.py`:
-
-```python
-def test_my_kernel():
-    inp = np.array([1.0, 2.0, 3.0], dtype=np.float32)
-    expected = np.array([2.0, 4.0, 6.0], dtype=np.float32)
-    result = aot.my_kernel(inp)
-    assert np.allclose(result, expected), f"Expected {expected}, got {result}"
-    print("✅ my_kernel")
-
-test_my_kernel()
-```
-
----
-
-## 🔢 Caching Architecture
-
-`custom_ops.py` maintains several module-level caches to avoid recomputing:
-
-| Cache | Key | Value | Purpose |
-|---|---|---|---|
-| `_GROUP_ENCODE_CACHE` | `(col_names, n_rows, device)` | `(labels, n_groups)` | Group label arrays |
-| `_JOIN_RESULT_CACHE` | `(id(left), id(right), col_names)` | `(left_idx, right_idx)` | Join index pairs |
-| `_Q7_PREJOINED` | `(id(nation), id(supplier), id(customer))` | pre-joined tables | Stable cross-call join input |
-| `_Q17_PRECOMP` | `(id(part), id(lineitem), n_rows)` | `(target_parts, avg_table)` | Cached sub-query results |
-
-The caches are **identity-keyed** (`id(table)`). As long as you pass the same Python object across hot benchmark runs, the caches hit and the join overhead is eliminated.
 
 ---
 
@@ -282,27 +184,20 @@ The caches are **identity-keyed** (`id(table)`). As long as you pass the same Py
 
 | ❌ Don't | ✅ Do instead |
 |---|---|
-| `.to_pandas()` in a hot path | Use `pc.*` (PyArrow compute) or `np.asarray()` |
-| `.to_pylist()` on large arrays | `np.asarray(arrow_array)` for numerics, `pc.*` for strings |
-| Python loops over rows | NumPy `isin`, `searchsorted`, `argsort`, vectorized ops |
-| `pd.merge()` on large tables | Mojo join kernels via LazyFrame |
-| Building Python sets from Arrow arrays | `pc.is_in(arr, value_set=other_arr)` |
+| Import `pyarrow.compute` at module level (it costs tens of ms at import) | `from ._lazy_pc import pc`, which imports it on first use |
+| `.to_pandas()` / `.to_pylist()` in a hot path | Keep Arrow buffers; hand them to Mojo over the Arrow C Data Interface, or `np.asarray()` for numerics |
+| Python loops over rows | A native call, or vectorized NumPy |
+| Special cases for one TPC-H query | General rules; check them on shuffled data and on the random suite (`scripts/bench_random/`) |
+| A native path that might answer differently | Decline (return `None`) and let the next layer answer; test against `MXFRAME_NATIVE=0` and DuckDB |
 
 ---
 
-## 🌿 Branch Strategy
+## 🌿 Branches and PRs
 
-| Branch | Purpose |
-|---|---|
-| `main` | Stable — all tests pass, benchmarks verified |
-| `dev` | Active development |
-| `feature/xxx` | New kernel or feature work |
-| `fix/xxx` | Bug fixes |
-
-PRs require:
-1. All `_test_phase*.py` tests passing
-2. `_test_aot_smoke.py` passing
-3. No regression in `bench_simple.py` vs previous `main`
+Work on a branch off `main` and open a PR into `main`. Before a PR:
+1. `pixi run test` and `pixi run test-all` pass (CI runs the `scripts/_test_*.py` suites).
+2. Engine changes come with a before/after from `scripts/bench_user_felt.py --mode engine` (and the random suite when the change is general), run on a quiet machine.
+3. Docs that quote numbers or describe the engine (`README.md`, `docs/site/`) still match; `tests/test_readme_api.py` and `tests/test_site_*.py` check most of it.
 
 ---
 

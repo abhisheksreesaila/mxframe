@@ -118,7 +118,7 @@ SQL covers `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON` and
 | [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) | CPU, GPU or both, from costs measured on your machine |
 | [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) | The longer API page; design and internal layers |
 | [Kernel visualizer](https://abhisheksreesaila.github.io/mxframe/visualize/mxframe_pipeline.html) | Step-by-step GPU kernel plans for Q4, Q6, Q12, Q13, Q14 and Q21 |
-| [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.5.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.5.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md) | Release history; dev setup and writing Mojo kernels |
+| [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.6.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md) · [0.5.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.5.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md) | Release history; dev setup and writing Mojo kernels |
 
 Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`.
 

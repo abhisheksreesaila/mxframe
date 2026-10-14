@@ -19,7 +19,7 @@ Nothing runs until `.compute()`, `.to_pandas()`, `.to_polars()` or `.to_arrow()`
 
 ## Joins
 
-`lf.join(other, on=None, left_on=None, right_on=None, how="inner")`
+`lf.join(other, *, on=None, left_on=None, right_on=None, how="inner")`: the key arguments are keyword-only.
 
 | `how` | Returns |
 |---|---|
@@ -57,7 +57,7 @@ Null keys never match.
 | `lf.last_compile_provenance` | After `compute()`: which path ran (`"native"`, `"fused_pipeline_cpu"`, `"cpu_aot"`, ...) and timings |
 | `lf.last_auto_decision` | After an auto `compute()`: the chosen device, the estimates and the reason |
 | `from mxframe import native_exec; native_exec.last_decline()` | Why the native executor declined the last plan, if it did |
-| `lf.schema()` | The output schema without computing the result |
+| `lf.schema` | The output schema without computing the result (a property) |
 | `lf.describe()` | count, mean, std, min, quartiles and max of the numeric columns |
 
 The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html) explains each path and the environment switches.
@@ -93,10 +93,10 @@ pixi run test-all    # the older scripts/_test_*.py suites, as CI runs them
 | `lazy_frame.py`, `lazy_expr.py` | The plan tree (`Scan`, `Filter`, `Aggregate`, `Join`, `Sort`, ...), `LazyFrame` and `Expr` |
 | `sql_frontend.py` | SQL → plan, via sqlglot |
 | `io_parquet.py`, `arrow_dict.py` | Lazy Parquet sources; dictionary-encoded column helpers |
-| `plan_validation.py`, `optimizer.py` | Plan checks; rewrites (pushdown, join order) |
+| `plan_validation.py`, `optimizer.py` | Plan checks; rewrites (filter merge and pushdown, column pruning, limits, sort flags) |
 | `native_exec.py` | Front end of the native Mojo executor: packs the plan, one ctypes call into `libmxexec_cpu.so` |
 | `pipeline_exec.py`, `pipeline_program.py`, `pipeline_kernels.py` | The fused filter + group + aggregate pipeline and its bytecode |
-| `custom_ops.py`, `aot_kernels.py`, `join_engine.py`, `group_keys.py`, `sort_check.py` | The per-operator path: dispatch, AOT kernel bindings, joins, group keys, verified sort |
+| `custom_ops.py`, `aot_kernels.py`, `join_engine.py`, `group_keys.py`, `sort_check.py` | The per-operator path: dispatch, AOT kernel bindings, joins (with join reordering), group keys, verified sort |
 | `compiler.py`, `_max_lazy.py` | The MAX Graph compiler path |
 | `auto_mode.py`, `calibration.py`, `coproc.py`, `coproc_fused.py`, `residency.py`, `gpu_stream.py` | `device="auto"`: the device choice, calibration, CPU+GPU co-processing, GPU copies |
 | `kernels_aot/*.mojo` | Mojo sources: `executor_cpu.mojo` (native executor), `pipeline_cpu.mojo` / `pipeline_gpu.mojo`, `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo`, `kernels_aot.mojo` / `kernels_aot_gpu.mojo` |
