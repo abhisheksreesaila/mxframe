@@ -252,3 +252,15 @@ def test_old_page_is_a_short_note_linking_to_the_new_one():
     old = (DOCS / "auto-mode.html").read_text()
     assert 'href="site/auto-mode.html"' in old
     assert len(old.splitlines()) < 40
+
+
+def test_benchmark_pass_margin_is_its_own_constant():
+    """'Within 10%' is the benchmark's criterion (F-009), not the planner's GPU_WIN_MARGIN."""
+    html = _page_text()
+    assert re.search(r"const BENCH_PASS_MARGIN = 0\.10;", html)
+    start = html.index("function perQuery")
+    assert "BENCH_PASS_MARGIN" in html[start:start + 900]
+    for m in re.finditer(r"ratio <= 1 \+ ([\w.]+)", html):
+        assert m.group(1) == "BENCH_PASS_MARGIN"
+    assert "X(1 + K.GPU_WIN_MARGIN)" not in html
+    assert "within 10%" in (DOCS / "plan.md").read_text()

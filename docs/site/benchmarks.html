@@ -83,7 +83,7 @@
         <li><b>What the clock covers.</b> The first run of a query in a fresh process: the query and the materialized result. Reading Parquet into memory is staging, outside the clock, for every engine. DuckDB is timed without its pyarrow import for the same reason.</li>
         <li><b>A staged warm-up.</b> <code>import mxframe</code> warms its kernel libraries in a background thread that finishes during the untimed load. Polars and DuckDB have no such step.</li>
         <li><b>SF1 is noisy.</b> SF1 queries take a few milliseconds, so single figures can move by 10 to 20% between runs. Read SF1 totals more than single queries.</li>
-        <li><b>Load, as recorded in the files:</b></li>
+        <li><b>Load, as recorded in the files.</b> The load gate (the load average under the limit for 5 minutes) was checked before each run started. The load1 figures below were sampled during the runs, and they include the benchmark's own worker threads: MXFrame and DuckDB use every core, so load1 rises while a query runs. A median of 4.7 or 7.3 is not a sign of other work on the machine.</li>
       </ul>
       <table class="t" id="loadtbl" style="margin-top:8px"></table>
       <p class="note" style="margin:12px 0 0">More on the method: <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md">optimizations.md</a>. The raw files are in <a href="https://github.com/abhisheksreesaila/mxframe/tree/main/docs/bench">docs/bench</a>.</p>

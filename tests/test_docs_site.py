@@ -79,3 +79,15 @@ def test_data_files_named_in_pages_exist(page):
 def test_pages_workflow_copies_bench_files():
     wf = (ROOT / ".github" / "workflows" / "pages.yml").read_text()
     assert "docs/site" in wf and "-L" in wf, "deploy must dereference the bench link"
+
+
+def test_csv_files_the_pages_read_have_no_quotes():
+    """site.js loadCSV splits on bare commas; a quoted field with a comma would be torn apart."""
+    bench = ROOT / "docs" / "bench"
+    names = set()
+    for f in [*SITE.glob("*.html"), *SITE.glob("*.js"), *(SITE / "js").glob("*.js")]:
+        names |= {Path(n).name for n in re.findall(r"bench/([\w.-]+\.csv)", f.read_text())}
+    assert len(names) >= 10
+    for n in sorted(names):
+        assert (bench / n).is_file(), n
+        assert '"' not in (bench / n).read_text(), f"{n} has a quote: site.js loadCSV cannot parse quoted fields"

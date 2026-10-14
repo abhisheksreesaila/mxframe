@@ -110,3 +110,25 @@ def test_js_random_shapes_match_the_md_summary(stem):
     res = json.load(open(BENCH / (stem + ".json")))
     logs = [math.log(r["duckdb"]["ms"] / r["mx"]["ms"]) for r in res]
     assert next(s for s in got if s["shape"] == "all")["ratio"] == pytest.approx(math.exp(sum(logs) / len(logs)))
+
+
+@node
+def test_totals_within_one_percent_are_a_tie():
+    got = _run_js("""console.log(JSON.stringify([b.compareTotals(386.9, 387.4), b.compareTotals(300, 387.4), b.compareTotals(387.4, 300)]));""")
+    assert got[0]["tie"] is True
+    assert got[1] == {"tie": False, "aLower": True} and got[2]["aLower"] is False
+    # the real SF1 stored numbers, without Q21
+    rows = _rows("m2s-engine.csv")
+    mx, dk = _total(rows, "mx-cpu", 1, skip=21), _total(rows, "duckdb", 1, skip=21)
+    assert abs(mx - dk) <= 0.01 * max(mx, dk)
+    assert "compareTotals" in JS.read_text() and "within 1%" in JS.read_text()
+
+
+def test_load_gate_is_explained_on_the_page():
+    html = PAGE.read_text()
+    assert "checked before each run started" in html and "worker threads" in html
+
+
+def test_random_panels_keep_value_labels_out_of_the_shape_column():
+    js = JS.read_text()
+    assert 'x: W - 4, y: y + 3, "text-anchor": "end" }, row.ratio.toFixed(2)' in js
