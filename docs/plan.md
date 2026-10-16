@@ -456,6 +456,11 @@ Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
 ## F-045 ORDER BY ties outside the native executor [review]
 Needs: none · Found by the F-043 review
 - [x] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks). Native order: ORDER BY columns, then every group key ascending (strings by bytes). `GraphCompiler._key_tiebreak` appends the keys to a Sort directly above an Aggregate for every non-native path (fused, kernels, GPU, null-key, base compiler); `tests/test_orderby_ties.py`
+  Open: unaliased derived keys get no tie-break; with a string key added, sort + LIMIT on fallback paths can't use the native top-k (numbers / dates only), so it ranks every row (correct, slower)
+
+## F-059 ORDER BY ties with a Project between Sort and Aggregate [todo]
+Needs: F-045
+- [ ] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate
 
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
 Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong baseline). General fixes only; every slice measured on TPC-H (stored and shuffled) and the random suite, and must not slow any other query. MojoFrame (illinoisdata/MojoFrame, arXiv 2505.04080) checked: its techniques (integer ids for low-cardinality strings, tuple-hash group-by, factorize-then-join) are already covered here; the slices below follow the database literature instead
