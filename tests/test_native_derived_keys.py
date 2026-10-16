@@ -89,11 +89,19 @@ def test_integer_expression_keys_run_natively(native, monkeypatch, name, chunks)
 
 @pytest.mark.parametrize("plan", [
     lambda t: LazyFrame(t).with_columns((col("v") * lit(2.0)).alias("y")).groupby("y").agg(col("g").count().alias("n")),
-    lambda t: LazyFrame(t).with_columns((col("x") * lit(100_000)).alias("y")).groupby("y").agg(col("v").sum().alias("s")),
-], ids=["float expression", "range too wide"])
+], ids=["float expression"])
 def test_other_expression_keys_decline_with_the_same_answer(native, monkeypatch, plan):
     got, old, path, log = _run(plan, _table(n=20_000), monkeypatch)
     assert any("derived group key" in r for r in log), log
+    _same_values(got, old, ordered=False)
+
+
+def test_an_expression_key_range_too_wide_for_direct_addressing_is_hashed(native, monkeypatch):
+    """x * 100000 spans 10 million codes: past MAX_GROUPS the executor groups by the key's values in the hashed
+    group-by (F-069; it used to decline "not a small integer range")."""
+    plan = lambda t: LazyFrame(t).with_columns((col("x") * lit(100_000)).alias("y")).groupby("y").agg(col("v").sum().alias("s"))
+    got, old, path, log = _run(plan, _table(n=20_000), monkeypatch)
+    assert path == "native" and not any("derived" in r for r in log), log
     _same_values(got, old, ordered=False)
 
 
@@ -104,9 +112,9 @@ def test_a_filter_that_keeps_nothing(native, monkeypatch):
     assert got.num_rows == old.num_rows == 0
 
 
-def test_expression_keys_too_wide_together_decline_in_the_executor(native, monkeypatch):
-    """Two expression keys ~3000 wide each: 9M combinations need the compacted path, which takes
-    only column keys; the executor declines (E_BAD_KEY) and the Python path answers (M2l review)."""
+def test_expression_keys_too_wide_together_are_hashed_in_the_executor(native, monkeypatch):
+    """Two expression keys ~3000 wide each: 9M combinations are past direct addressing and the compacted
+    path takes only column keys (M2l review: the executor declined, E_BAD_KEY); the hashed group-by takes them (F-069)."""
     r = np.random.default_rng(8)
     n = 30_000
     t = pa.table({"a": A(r.integers(0, 3000, n).astype(np.int64)), "b": A(r.integers(0, 3000, n).astype(np.int64)),
@@ -114,5 +122,6 @@ def test_expression_keys_too_wide_together_decline_in_the_executor(native, monke
     plan = lambda t: (LazyFrame(t).with_columns((col("a") + lit(1)).alias("a1"), (col("b") * lit(2)).alias("b2"))
                       .groupby("a1", "b2").agg(col("v").sum().alias("s")))
     got, old, path, log = _run(plan, t, monkeypatch)
-    assert any("executor declined (code -11)" in r for r in log), log
+    assert path == "native", log
+    assert not any("declined" in r for r in log), log
     _same_values(got, old, ordered=False)

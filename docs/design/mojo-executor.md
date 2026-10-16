@@ -130,6 +130,62 @@ rows that pass the filter, which needs the interpreter to report the first survi
 
 17 of 22 TPC-H queries are native end to end by the coverage script's criterion (`scripts/native_coverage.py`: every stage through the native hooks, no Python pipeline path, no PyArrow compute call over 1000 rows); M2 left 11. The 18/22 target is missed by one. What moved: SELECT DISTINCT runs as the keyed group-by with a hidden `MIN(row id)` (one call, fused with the filter or the star join; wide keys keep `mx_distinct`); a subquery's HAVING under a join runs in the executor (Q18, Q21); `LazyFrame.scalar` computes a scalar subquery natively and hands it to the next plan as a literal (Q11, Q15, Q22); nested star partners keep dictionary names as codes (Q5, Q10); `COUNT(col)` of a whole table needs no column (Q13). What is left: Q7 (renamed partner leaves), Q9 / Q16 / Q20 (plain-string predicates: M4), Q22 (M4 `isin` on plain utf8, native anti join). Details, per-query table and numbers: `docs/plan.md`, F-033.
 
+## Hashed groups (F-069, 2026-10-16)
+
+Group keys that cannot be addressed directly take a partitioned hash aggregate (`kernels_aot/hashagg_cpu.mojo`)
+instead of declining: float32 / float64 columns, key tuples whose ranges multiply past the direct limit (or an
+integer column spanning the whole int64 range), integer expression keys past it, and, in the fused join
+(`mx_execute` v3), float partner columns and every key space the direct path used to hand back with E_BAD_KEY.
+The single-table path it replaces (one thread, a hash over all n_rows, a group-id array and a key array per
+key of n_rows entries) is gone.
+
+**Keys.** Every key becomes an int64 *word* per row: integers and dictionary entry ids as they are, floats as
+order-preserving bits (`float_word`: all NaNs one value above +inf, -0.0 equal to 0.0, the rest IEEE order). Equal
+words are equal keys, and words sort as the keys do, so the finishing code (key order, ORDER BY tie-break,
+HAVING, output) is the one the other paths use; floats come back as the column's own type (float32 stays
+float32). Strings and dictionary keys are hashed by their entry ids as before.
+
+**Two phases, no atomics, no n_rows-sized array.**
+1. Workers claim morsels and run the same block loop as every other path (predicate, fused front stage,
+   aggregate inputs, `_accumulate`), but the group id of a selected row is its number in a per-worker *local*
+   table (open addressing on the word tuple; 8,192 groups, 16,384 slots, L2-sized). When a block could overflow it,
+   and at the end, the worker flushes: one record (hash, rows, one sub-total per aggregate, the words) per local
+   group goes to the worker's buffer of the partition the hash's top bits select, and the table resets.
+2. The partitions (a power of two from the row count, about 32k rows each, at most 1,024) are merged in parallel,
+   one worker per partition: all workers' records for it are folded into a table sized to the partition; the
+   groups are then copied side by side into `vals[agg * G + g]`, `cnt[g]` and the key words.
+
+**Order.** Output rows are in key order, like the dense paths (numbers ascending, strings by bytes, floats
+ascending with NaN last as in DuckDB); the hash decides nothing visible. `-0.0` and `0.0` are one group, written as
+`+0.0`. NULL in a key column declines (as before; DuckDB would make a NULL group).
+
+**Reproducible mode (F-064).** With `compute(reproducible=True)` the local table holds a whole morsel and flushes at
+the end of each, one lane per group, and a partition's records are folded in morsel order (every record carries its
+morsel number): a group's rows are added in row order within a morsel, the morsels' sub-totals in morsel order, the
+dense paths' definition for more than 1,024 groups. Bit-identical across runs, thread counts and aggregate lists
+(NumPy reference in `tests/test_f069_hashed_groups.py`). The default mode keeps the local table across morsels
+and four lanes per group, and folds the workers' records in buffer order: a float sum can differ in the last bits
+between runs. The cost of the reproducible mode is a table of 66k slots per worker (about 4 MB with a few
+aggregates) and a flush per morsel; measured numbers are in F-069's ticket.
+
+**Memory bound.** Phase 1 keeps its flushed records until the merge: one record of (3 + aggregates + key
+words) x 8 bytes per (worker flush, group), so up to one per row when the groups are many (a group seen again
+only after the local table of 8,192 groups has flushed). Measured at 10M rows, 1M groups (one int64 key, two
+aggregates): +630 MB over the input, against +140 MB on the Arrow path, i.e. about 1.25 x the record bytes
+(48 B x 10M = 480 MB) and about 4.5x Arrow's extra. The merge frees each partition's buffers as soon as it is
+folded and keeps only arrays of exactly the group count; the peak is still the end of phase 1. So the bound is
+rows x record bytes x 1.25, and it grows with rows, not groups. A guard makes that safe: the executor counts
+flushed record bytes (all workers, one atomic) and, past a third of `MemAvailable` (plan word 28, read in
+`native_exec._record_limit`, `MXFRAME_HASH_RECORD_MB` overrides), stops and returns E_NO_MEMORY (-19): the
+plan declines to the path that fits (Arrow), which answers in the same rows. A third leaves room for the 1.25x
+merge peak, the input and the engine's other buffers. Not done: spilling records or folding them early (a
+bounded-memory hash aggregate would need that).
+
+**Where it runs.** `last_group_path()` reports "dense", "compact" or "hash". Declines that remain: NULL in a key
+column, a float expression key (`GROUP BY a * 0.5`: the program's min-aggregate reads NaN as +inf, so the register is
+not the key), partner string keys with more than 65,536 distinct values, SELECT DISTINCT over such keys
+(`mx_distinct` answers wide integer ones; floats fall back).
+
 ## Risks
 
 - **Size.** This is the largest change to the engine so far: weeks, not days. The milestones are ordered so
