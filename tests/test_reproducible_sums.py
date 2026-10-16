@@ -40,11 +40,11 @@ def _bits(t, names):
     return [np.ascontiguousarray(t.column(n).to_numpy()).view(np.int64) for n in names]
 
 
-def _same_every_run(plan, names, runs=RUNS):
-    first = _bits(plan.compute(device="cpu"), names)
+def _same_every_run(plan, names, runs=RUNS, **kw):
+    first = _bits(plan.compute(device="cpu", **kw), names)
     differ = np.zeros(len(first[0]), bool)
     for _ in range(runs - 1):
-        got = _bits(plan.compute(device="cpu"), names)
+        got = _bits(plan.compute(device="cpu", **kw), names)
         for a, b in zip(first, got):
             assert len(a) == len(b)
             differ |= a != b
@@ -63,8 +63,8 @@ def _revenue(lf):
 
 
 def test_single_table_keyed_aggregate(calls):
-    """6M rows, 10k groups (a partial per worker, merged)."""
-    _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 10_000))), ["tot", "av"])
+    """6M rows, 8k groups, default mode (a table per morsel, merged in morsel order)."""
+    _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 8_000))), ["tot", "av"])      # default mode
     assert calls and 3 not in calls          # the single-table aggregate, not the fused join
 
 
@@ -76,9 +76,10 @@ def test_global_aggregate(calls):
 
 
 def test_many_groups_shared_output(calls):
-    """3M groups over 6M rows: a partial table per worker is over the memory budget, so the workers share
-    one output (the path that used to add with atomic float adds)."""
-    _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 3_000_000))), ["tot", "av"])
+    """3M groups over 6M rows, `reproducible=True`: a table per morsel is over the memory budget, so the
+    rows are staged and applied per group range (the default mode runs the faster atomic shared output
+    here, whose last bits vary between runs)."""
+    _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 3_000_000))), ["tot", "av"], reproducible=True)
     assert calls and 3 not in calls
 
 
@@ -99,20 +100,20 @@ def test_fused_join_aggregate(calls):
 
 
 def test_fused_join_aggregate_many_groups_shared_output(calls):
-    """Fused join + aggregate with 200k groups (shared output from 16384 groups on)."""
+    """Fused join + aggregate with 200k groups: staged above the table path, in the default mode too."""
     _same_every_run(_star(200_000), ["tot", "av"])
     assert 3 in calls
 
 
-def _tot(t, extra, threads, monkeypatch):
+def _tot(t, extra, threads, monkeypatch, **kw):
     """The `tot` column of a grouped revenue sum next to `extra` more aggregates, with `threads` workers."""
     monkeypatch.setenv("MXFRAME_CPU_THREADS", str(threads))
     aggs = [(col("p") * (lit(1.0) - col("d"))).sum().alias("tot")]
     aggs += [(col("p") * col("d") * lit(float(i + 2))).sum().alias(f"x{i}") for i in range(extra)]
-    return _bits(LazyFrame(t).groupby("s").agg(*aggs).compute(device="cpu"), ["tot"])[0]
+    return _bits(LazyFrame(t).groupby("s").agg(*aggs).compute(device="cpu", **kw), ["tot"])[0]
 
 
-@pytest.mark.parametrize("groups", [300, 800, 10_000])
+@pytest.mark.parametrize("groups", [300, 800, 8_000])
 def test_a_sum_does_not_depend_on_the_other_aggregates(calls, monkeypatch, groups):
     """`agg(tot)` and `agg(tot, x0, x1)` give the same bits for `tot` (the number of accumulator lanes
     used to depend on the aggregate list)."""
@@ -124,11 +125,11 @@ def test_a_sum_does_not_depend_on_the_other_aggregates(calls, monkeypatch, group
 
 @pytest.mark.parametrize("groups", [300, 10_000, 200_000])
 def test_a_sum_does_not_depend_on_the_thread_count(calls, monkeypatch, groups):
-    """4, 8 and 16 workers give the same bits (200k groups: the staged many-groups path)."""
+    """4, 8 and 16 workers give the same bits, with `reproducible=True` (200k groups: the staged path)."""
     t = _fact(6_000_000, groups)
-    base = _tot(t, 0, 4, monkeypatch)
+    base = _tot(t, 0, 4, monkeypatch, reproducible=True)
     for threads in (8, 16):
-        assert int((base != _tot(t, 0, threads, monkeypatch)).sum()) == 0
+        assert int((base != _tot(t, 0, threads, monkeypatch, reproducible=True)).sum()) == 0
 
 
 def _canonical(t, groups, morsel=65536):
@@ -144,12 +145,36 @@ def _canonical(t, groups, morsel=65536):
     return out.view(np.int64)
 
 
-@pytest.mark.parametrize("groups", [10_000, 60_000, 200_000])
+@pytest.mark.parametrize("groups", [5_000, 10_000, 60_000, 200_000])
 def test_the_per_morsel_table_path_and_the_staged_path_give_the_defined_order(calls, monkeypatch, groups):
-    """10k and 60k groups use a table per morsel, 200k the staged path (tables over the budget): all equal
-    the same NumPy reference of the defined order, bit for bit."""
+    """`reproducible=True`: 10k and 60k groups use a table per morsel, 200k the staged path (tables over
+    the budget): all equal the same NumPy reference of the defined order, bit for bit. The default mode
+    (a table per morsel up to 8,192 groups) gives the same bits at 5k groups."""
     t = _fact(3_000_000, groups)
-    assert int((_tot(t, 0, 8, monkeypatch) != _canonical(t, groups)).sum()) == 0
+    want = _canonical(t, groups)
+    assert int((_tot(t, 0, 8, monkeypatch, reproducible=True) != want).sum()) == 0
+    if groups <= 8_192:
+        assert int((_tot(t, 0, 8, monkeypatch) != want).sum()) == 0
+
+
+def test_the_environment_variable_turns_reproducible_mode_on(calls, monkeypatch):
+    """MXFRAME_REPRODUCIBLE=1 does what `reproducible=True` does (200k groups, staged), and
+    `reproducible=False` overrides it."""
+    t = _fact(3_000_000, 200_000)
+    want = _canonical(t, 200_000)
+    monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
+    assert int((_tot(t, 0, 8, monkeypatch) != want).sum()) == 0
+
+
+def test_a_view_compared_with_its_own_maximum_at_200k_groups_in_the_default_mode(calls):
+    """The uncomputed-view Q15 shape over 200k groups (the many-groups path, whose default sums can differ
+    between runs): the view is computed once and shared by the subquery and the outer plan, so it matches
+    its own maximum 20 times of 20."""
+    t = _fact(2_000_000, 200_000)
+    view = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
+    for _ in range(20):
+        got = view.filter(col("tot") == view.scalar(col("tot").max())).compute(device="cpu")
+        assert got.num_rows == 1
 
 
 def test_cpu_group_and_masked_sums_of_the_kernel_library():

@@ -234,6 +234,7 @@ class LazyFrame:
         gpu_fraction: Optional[float] = None,
         strict: bool = False,
         profile: bool = False,
+        reproducible: Optional[bool] = None,
     ) -> pa.Table:
         """Execute the logical plan and return the result.
 
@@ -260,7 +261,25 @@ class LazyFrame:
             profile: auto only; record the actual query time next to the estimate
                 (see `last_auto_decision`). Per-operator timings that refine the
                 calibration arrive with per-operator placement.
+            reproducible: ``True`` makes every native CPU float SUM / MEAN bit-identical from run to run
+                whatever the number of groups (default: ``MXFRAME_REPRODUCIBLE=1`` or off). By default
+                results are bit-reproducible with no groups, up to 8,192 groups and on fused joins;
+                a plain group-by with more groups takes a faster path whose sums can differ in the last
+                bits between runs. Costs up to ~20% on the many-groups aggregates. ``False`` overrides
+                the environment variable. GPU float sums are not covered (F-067).
         """
+        if reproducible is not None:
+            import os
+            prev = os.environ.get("MXFRAME_REPRODUCIBLE")
+            os.environ["MXFRAME_REPRODUCIBLE"] = "1" if reproducible else "0"
+            try:
+                return self.compute(device, verbose, optimize, validate, prefer=prefer, placement=placement,
+                                    gpu_fraction=gpu_fraction, strict=strict, profile=profile)
+            finally:
+                if prev is None:
+                    os.environ.pop("MXFRAME_REPRODUCIBLE", None)
+                else:
+                    os.environ["MXFRAME_REPRODUCIBLE"] = prev
         from .io_parquet import resolve_plan
         plan = _resolve_scalars(self.plan, device, strict)
         optimizer_trace = None
@@ -838,6 +857,66 @@ def _top_truth(p: Expr) -> Expr:
     return p
 
 
+def _plan_key(x):
+    """Hashable identity of a plan or expression: structure, aliases and literals, and the object identity of
+    in-memory tables (``Scan.signature`` has only the column names). None when it cannot be built."""
+    import dataclasses
+    try:
+        if isinstance(x, Scan):
+            return ("Scan", id(x.table))
+        if isinstance(x, LogicalPlan):
+            if isinstance(x, ParquetScan):
+                return x.signature()
+            return (type(x).__name__,) + tuple(_plan_key(getattr(x, f.name)) for f in dataclasses.fields(x))
+        if isinstance(x, Expr):
+            return ("e", x.op, tuple(_plan_key(a) for a in x.args), x._alias,
+                    tuple(sorted((k, repr(v)) for k, v in x.kwargs.items())))
+        if isinstance(x, (list, tuple)):
+            return ("l",) + tuple(_plan_key(a) for a in x)
+        hash(x)
+        return x
+    except Exception:
+        return None
+
+
+def _scalar_inputs(plan):
+    """Keys of the plans some scalar subquery of ``plan`` aggregates over, when that same plan also occurs in
+    ``plan`` itself outside any scalar (``view.filter(col("t") == view.scalar(col("t").max()))``)."""
+    import dataclasses
+    scalars, nodes = [], []
+
+    def expr(e):
+        if isinstance(e, Expr):
+            if e.op == "scalar":
+                scalars.append(e.args[0])
+            else:
+                for a in e.args:
+                    expr(a)
+        elif isinstance(e, (list, tuple)):
+            for a in e:
+                expr(a)
+
+    def walk(n):
+        if isinstance(n, LogicalPlan):
+            nodes.append(n)
+            for f in dataclasses.fields(n):
+                v = getattr(n, f.name)
+                if isinstance(v, LogicalPlan):
+                    walk(v)
+                else:
+                    expr(v)
+
+    walk(plan)
+    wanted = {}
+    for sc in scalars:
+        inp = getattr(sc, "input", None)
+        if isinstance(inp, LogicalPlan) and not isinstance(inp, (Scan, ParquetScan)):
+            k = _plan_key(inp)
+            if k is not None:
+                wanted[k] = None
+    return {k for k in wanted if any(_plan_key(n) == k for n in nodes)}
+
+
 def _resolve_scalars(plan, device: str, strict: bool):
     """``plan`` with every scalar subquery (``LazyFrame.scalar``) in its expressions replaced by the literal it
     computes: each is run first through ``compute`` (so it takes the native path like any plan). The same
@@ -846,11 +925,29 @@ def _resolve_scalars(plan, device: str, strict: bool):
     import dataclasses
     from .lazy_expr import lit
 
+    # A subquery over the same plan the outer plan also contains (Q15: `view.filter(tot == view.scalar(max))`)
+    # shares ONE result: the plan is computed once, the subquery aggregates that table and the outer plan
+    # reads it, so the comparison never depends on a float sum coming out twice with the same bits.
+    shared = _scalar_inputs(plan)
+    mats = {}
+
+    def materialized(inp):
+        k = _plan_key(inp)
+        if k not in shared:
+            return None
+        if k not in mats:
+            mats[k] = Scan(LazyFrame(inp).compute(device=device, strict=strict))
+        return mats[k]
+
     def expr(e):
         if not isinstance(e, Expr):
             return e
         if e.op == "scalar":
-            out = LazyFrame(e.args[0]).compute(device=device, strict=strict)
+            sub = e.args[0]
+            m = materialized(sub.input) if isinstance(sub, Aggregate) else None
+            if m is not None:
+                sub = dataclasses.replace(sub, input=m)
+            out = LazyFrame(sub).compute(device=device, strict=strict)
             new = lit(out.column(0)[0].as_py())          # None: the subquery had no rows (NULL)
             new._alias = e._alias
             return new
@@ -866,6 +963,10 @@ def _resolve_scalars(plan, device: str, strict: bool):
     def walk(node):
         if not isinstance(node, LogicalPlan):
             return node
+        if shared and not isinstance(node, (Scan, ParquetScan)):
+            m = materialized(node)
+            if m is not None:
+                return m
         changes = {}
         for f in dataclasses.fields(node):
             v = getattr(node, f.name)
