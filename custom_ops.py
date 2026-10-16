@@ -13,6 +13,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
 from ._lazy_pc import pc
 from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum
 import numpy as np
+import os as _os
 import time as _time
 import threading as _threading
 from pathlib import Path
@@ -1510,8 +1511,8 @@ class CustomOpsCompiler(GraphCompiler):
         above the DISTINCT. Only directly addressed key spaces (dictionary codes, small integer ranges); wide
         ones, plain strings, floats and nulls decline to ``mx_distinct`` / the old path. None: not that shape,
         or declined."""
-        if _native_exec is None or not _native_exec.enabled():
-            return None
+        if _native_exec is None or not _native_exec.enabled() or _os.environ.get("MXFRAME_DISTINCT_GROUPBY", "1") in ("0", "false", "off"):
+            return None                # (MXFRAME_DISTINCT_GROUPBY=0: mx_distinct as before, for A/B runs)
         core, post_ops = self._extract_post_ops(plan)
         if not post_ops or not isinstance(post_ops[0], Distinct):
             return None
