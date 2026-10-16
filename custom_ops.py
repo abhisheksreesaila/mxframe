@@ -591,7 +591,7 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
-        if expr.op in ("case_when", "isin", "startswith", "contains", "str_slice", "not", "year",
+        if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
                        "window"):
             return True
@@ -726,6 +726,9 @@ class CustomOpsCompiler(GraphCompiler):
                 if mask is not None:
                     return _npa(mask, type=pa.bool_())
             return pc.match_substring(col_arr, pattern=args[1])
+        if op == "like":
+            from .str_patterns import match_like
+            return match_like(self._eval_expr_arrow(args[0], table), args[1], args[2], args[3])
         if op == "year_days":
             col_arr = self._eval_expr_arrow(args[0], table)
             if pa.types.is_integer(col_arr.type):
@@ -795,7 +798,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains"):
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like"):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)
@@ -1653,6 +1656,23 @@ class CustomOpsCompiler(GraphCompiler):
             return Aggregate(below, plan.group_by, plan.aggs)
         return plan
 
+    @staticmethod
+    def _arrow_aggregate_reason(plan, preds, table, late=False):
+        """``(why, exact_sum)``: why Arrow's hash aggregate answers ``Aggregate(Filter*(Scan))`` instead of the
+        fused / native paths ("" when they do). A null in a column the plan reads, or an integer SUM that could
+        pass 2^53 (added exactly in int64, F-037). The split asks this too (``pipeline_exec.split_check``)."""
+        read = set()
+        for e in list(plan.group_by) + list(plan.aggs) + list(preds):
+            _expr_col_names(e, read)
+        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
+        if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
+            return "", False
+        from .pipeline_program import int_sum_inexact
+        exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
+        why = "a column the plan reads has nulls" if has_nulls else (
+            "an integer sum could pass 2^53 (added exactly in int64)" if exact_sum else "")
+        return why, exact_sum
+
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
         """``Aggregate(Filter*(Scan))`` over columns that contain nulls, by Arrow's hash
         aggregate; None when the plan has no null in a column it reads (or is another shape).
@@ -1668,16 +1688,8 @@ class CustomOpsCompiler(GraphCompiler):
         if not isinstance(node, Scan):
             return None
         table = node.table
-        read = set()
-        for e in list(plan.group_by) + list(plan.aggs) + preds:
-            _expr_col_names(e, read)
-        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
-        if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
-            return None
-        # an integer SUM whose total could pass 2^53 is added exactly (int64) here, not in float64 (F-037)
-        from .pipeline_program import int_sum_inexact
-        exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
-        if not has_nulls and not exact_sum:
+        why, exact_sum = self._arrow_aggregate_reason(plan, preds, table, late)
+        if not why:
             return None
 
         t_start = t0 if t0 is not None else _time.perf_counter()
@@ -3287,7 +3299,11 @@ class CustomOpsCompiler(GraphCompiler):
             node = node.input
         if not isinstance(node, Scan) or not preds:
             return None
-        t = node.table
+        return self._native_filter_table(node.table, preds, needed)
+
+    def _native_filter_table(self, t, preds, needed):
+        """The rows of table ``t`` passing every predicate in one native pass (a column the result keeps
+        must not be a dictionary), or None."""
         cols = [f for f in t.schema if needed is None or f.name in needed]
         if not cols or any(pa.types.is_dictionary(f.type) for f in cols):
             return None
@@ -3316,9 +3332,18 @@ class CustomOpsCompiler(GraphCompiler):
             got = self._native_filter_scan(plan, None)
             if got is not None:
                 return got
-            inner_table = self._plan_to_table(plan.input)
-            mask = self._eval_predicate(plan.predicate, inner_table)
-            return pc.filter(inner_table, mask)
+            preds, node = [], plan
+            while isinstance(node, Filter):
+                preds.append(node.predicate)
+                node = node.input
+            inner_table = self._plan_to_table(node)
+            if not isinstance(node, Scan) and _native_exec is not None:
+                got = self._native_filter_table(inner_table, preds, None)
+                if got is not None:                     # F-034: the filters over a computed table (TPC-H Q22's
+                    return got                            # select + isin + balance test) in one native pass
+            for p in reversed(preds):
+                inner_table = pc.filter(inner_table, self._eval_predicate(p, inner_table))
+            return inner_table
         if isinstance(plan, Project):
             inner_table = None
             if isinstance(plan.input, Filter):

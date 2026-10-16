@@ -121,6 +121,25 @@ def last_decline():
     return _last["decline"]
 
 
+def _record_limit() -> int:
+    """Bytes the hashed group-by may hold in flushed records before it gives up (plan word 28; the call then
+    returns E_NO_MEMORY and the caller's path answers). The records are about one per (worker flush, group),
+    so up to one per row when the groups are many, and the peak measured at 10M rows, 1M groups was 1.25 x the
+    record bytes: a third of MemAvailable leaves room for that, the input and the engine's other buffers.
+    MXFRAME_HASH_RECORD_MB overrides (tests)."""
+    v = os.environ.get("MXFRAME_HASH_RECORD_MB")
+    if v:
+        return int(float(v) * (1 << 20))
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024 // 3
+    except OSError:
+        pass
+    return 0
+
+
 def last_group_path():
     """How the last native group-by found its groups: "dense" (directly addressed), "compact" (key range
     compacted through a presence table) or "hash" (F-069: float keys, wide key tuples, partitioned hash
@@ -188,6 +207,45 @@ class _Arena:
         if self.addr:
             self.lib.mx_exec_free(self.addr)
             self.addr = 0
+
+
+class _Extras:
+    """The chunk table's extra words after a program's columns (one set per chunk): a string column held as
+    dictionary codes (dtype 5) has its dictionary's offset in the concatenation of all chunks' dictionaries;
+    a plain utf8 column (dtype 6, ``OP_STR``) has three: the chunk's bytes address, its validity bitmap address
+    (0: no nulls) and the bit index of the chunk table's row 0 in that bitmap (F-034)."""
+
+    def __init__(self, prog):
+        self.prog = prog
+        self.dcols = [c for c in prog.columns if c in prog.dict_concat]
+        self.scols = list(prog.str_cols)
+        self.n = len(self.dcols) + 3 * len(self.scols)
+        base = len(prog.columns)
+        self.slot = {c: base + i for i, c in enumerate(self.dcols)}
+        self.slot.update({c: base + len(self.dcols) + 3 * i for i, c in enumerate(self.scols)})
+
+    def dtype(self, name: str) -> Optional[int]:
+        """The program column's dtype word if it is one of these string columns, else None."""
+        return (((5 if name in self.prog.dict_concat else 6) | (self.slot[name] << 8)) if name in self.slot else None)
+
+    def words(self, piece_of, row0: int) -> list:
+        """The extra words of one chunk; ``piece_of(name)`` is the column's slice in it, ``row0`` its first row."""
+        from .pipeline_program import _dict_key
+        out = [self.prog.dict_concat[n][_dict_key(piece_of(n).dictionary)] for n in self.dcols]
+        for n in self.scols:
+            a = piece_of(n)
+            bufs = a.buffers()
+            out += [bufs[2].address if bufs[2] is not None else 0,
+                    bufs[0].address if bufs[0] is not None and a.null_count else 0, a.offset - row0]
+        return out
+
+    def patch(self, code):
+        """The program's code with the chunk table's width set to include these words."""
+        if not self.n:
+            return code
+        code = code.copy()
+        code[7] = len(self.prog.columns) + self.n
+        return code
 
 
 def _key_kind(col: pa.ChunkedArray):
@@ -295,19 +353,21 @@ def _sort_spec(sort_by, keys, names):
 
 
 def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = False,
-                distinct: bool = False) -> Optional[pa.Table]:
+                distinct: bool = False, coproc_share: bool = False) -> Optional[pa.Table]:
     """Run the whole plan in one native call, or None (the caller's path runs instead).
     `gpu_fallback`: a GPU session whose own pipeline declined the plan answers it here, on the CPU.
     `distinct`: the plan is a SELECT DISTINCT as a group-by (``distinct_plan``): only directly addressed key
-    spaces up to DISTINCT_MAX_GROUPS, no plain-string keys (``mx_distinct`` takes those and wider ones)."""
+    spaces up to DISTINCT_MAX_GROUPS, no plain-string keys (``mx_distinct`` takes those and wider ones).
+    `coproc_share`: this is the CPU share of a CPU+GPU split (``range_partials``): runs inside the policy
+    that makes every other native call decline."""
     _last["path"] = None
     t_start = _time.perf_counter()
     if not enabled():
         return _decline("disabled (MXFRAME_NATIVE=0)")
-    if getattr(compiler, "_device_arg", None) != "cpu" and not gpu_fallback:
+    if getattr(compiler, "_device_arg", None) != "cpu" and not gpu_fallback and not coproc_share:
         return _decline("CPU executor: device='cpu' (or a GPU session's fallback)")
     from . import coproc_fused
-    if coproc_fused.current_policy() is not None:
+    if coproc_fused.current_policy() is not None and not coproc_share:
         return _decline("CPU+GPU co-processing policy active")
     if not available():
         return _decline("libmxexec_cpu.so not built")
@@ -362,7 +422,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         # MAX_GROUPS is hashed instead, F-069)
         probe = Aggregate(plan.input, [], [a for i in derived
                                            for a in (Expr("min", derived[i]).alias(f"lo{i}"), Expr("max", derived[i]).alias(f"hi{i}"))])
-        r = try_execute(compiler, probe, None, None, gpu_fallback)
+        r = try_execute(compiler, probe, None, None, gpu_fallback, coproc_share=coproc_share)
         if r is None:
             return _decline("derived group key: range pass declined")
         for i in derived:
@@ -382,13 +442,13 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         return _decline("HAVING other than AND-ed aggregate <op> number")
     if prog.dict_arrays:
         return _decline("string predicates outside concat mode")
-    dcols = [c for c in prog.columns if c in prog.dict_concat]      # string columns in predicates
+    ex = _Extras(prog)                                # string columns in predicates
 
     cols = [table.column(c) for c in prog.columns]
     dtypes = []
     for name, c in zip(prog.columns, cols):
-        if name in prog.dict_concat:                  # codes + the chunk's offset (dtype 5)
-            dtypes.append(5 | ((len(prog.columns) + dcols.index(name)) << 8))
+        if ex.dtype(name) is not None:                # codes + the chunk's offset (dtype 5), or utf8 (dtype 6)
+            dtypes.append(ex.dtype(name))
             continue
         if c.type not in _DT or c.null_count:
             return _decline(f"value column type {c.type} or nulls")
@@ -455,29 +515,25 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         c_sorts = (ctypes.c_int64 * max(3 * len(sorts), 1))(*[v for t in sorts for v in t])
         c_having = (ctypes.c_int64 * max(3 * len(having), 1))(*[v for j, c, _ in having for v in (j, c, 0)])
         c_hconst = (ctypes.c_double * max(len(having), 1))(*[x for _, _, x in having])
-        from .pipeline_program import _dict_key
-        doffs = []
+        doffs, row0 = [], 0
         for seg in segs:
-            for name in dcols:
-                doffs.append(prog.dict_concat[name][_dict_key(seg[prog.columns.index(name)].dictionary)])
+            doffs += ex.words(lambda nm: seg[prog.columns.index(nm)], row0)
+            row0 += len(seg[0])
         c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
-        code = prog.code
-        if dcols:                                     # the chunk table gets one offset slot per column
-            code = code.copy()
-            code[7] = len(prog.columns) + len(dcols)
+        code = ex.patch(prog.code)                    # the chunk table gets the extra words
         from .pipeline_kernels import default_threads
         c_xkeys = (ctypes.c_int64 * max(3 * n_keys, 1))(
             *[v for i in range(n_keys) for v in ((key_slot[i],) + ranges[i] if i in derived else (0, 0, 0))])
         max_groups = DISTINCT_MAX_GROUPS if distinct else MAX_GROUPS
-        P = (ctypes.c_int64 * 28)(
+        P = (ctypes.c_int64 * 29)(
             MAGIC, 2, len(segs), len(cols), n_keys, n_out, len(sorts),
             code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
             ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
             default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
             max_groups if distinct else min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)),
-            ctypes.addressof(c_hconst), len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys),
-            0, (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0) | (HASH_FLAG if force_hash else 0))
+            ctypes.addressof(c_hconst), ex.n, ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys),
+            0, (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0) | (HASH_FLAG if force_hash else 0), _record_limit())
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -874,16 +930,16 @@ def try_filter_topk(compiler, table: pa.Table, predicates, names, descending, k:
         if kd is None or c.null_count:
             return None
         skinds.append(kd)
-    from .pipeline_program import compile_pipeline, _dict_key
+    from .pipeline_program import compile_pipeline
     prog = compile_pipeline(list(predicates), [], table, concat_dicts=True)
     if prog is None or prog.dict_arrays:
         return None
-    dcols = [c for c in prog.columns if c in prog.dict_concat]
+    ex = _Extras(prog)
     vcols = [table.column(c) for c in prog.columns]
     dtypes = []
     for name, c in zip(prog.columns, vcols):
-        if name in prog.dict_concat:
-            dtypes.append(5 | ((len(prog.columns) + dcols.index(name)) << 8))
+        if ex.dtype(name) is not None:
+            dtypes.append(ex.dtype(name))
             continue
         if c.type not in _DT or c.null_count:
             return None
@@ -903,12 +959,12 @@ def try_filter_topk(compiler, table: pa.Table, predicates, names, descending, k:
                 piece._export_to_c(ctypes.addressof(st))
                 structs.append(st)
                 arrays[r * width + j] = ctypes.addressof(st)
-        doffs = [prog.dict_concat[nm][_dict_key(seg[prog.columns.index(nm)].dictionary)] for seg in segs for nm in dcols]
+        doffs, row0 = [], 0
+        for seg in segs:
+            doffs += ex.words(lambda nm: seg[prog.columns.index(nm)], row0)
+            row0 += len(seg[0])
         c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
-        code = prog.code
-        if dcols:
-            code = code.copy()
-            code[7] = len(prog.columns) + len(dcols)
+        code = ex.patch(prog.code)
         c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
         c_sk = (ctypes.c_int64 * len(skinds))(*skinds)
         c_desc = (ctypes.c_int64 * len(skinds))(*[1 if d else 0 for d in descending])
@@ -916,7 +972,7 @@ def try_filter_topk(compiler, table: pa.Table, predicates, names, descending, k:
         P = (ctypes.c_int64 * 16)(TKMAGIC, len(segs), len(vcols), code.ctypes.data, prog.consts.ctypes.data,
                                   prog.set_bytes.ctypes.data, prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes),
                                   ctypes.addressof(arrays), len(scols), ctypes.addressof(c_sk),
-                                  ctypes.addressof(c_desc), k, default_threads(table.num_rows), len(dcols),
+                                  ctypes.addressof(c_desc), k, default_threads(table.num_rows), ex.n,
                                   ctypes.addressof(c_doffs))
         O = (ctypes.c_int64 * 2)()
         lib = _load()
@@ -1062,18 +1118,18 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
     if not names and not lookups:
         names = table.column_names[:1]
 
-    from .pipeline_program import compile_pipeline, _dict_key
+    from .pipeline_program import compile_pipeline
     prog = compile_pipeline(list(predicates), [], table, concat_dicts=True)
     if prog is None:
         return _filter_decline("predicate not supported by the bytecode compiler")
     if prog.dict_arrays:
         return _filter_decline("string predicates outside concat mode")
-    dcols = [c for c in prog.columns if c in prog.dict_concat]
+    ex = _Extras(prog)
     vcols = [table.column(c) for c in prog.columns]
     dtypes = []
     for name, c in zip(prog.columns, vcols):
-        if name in prog.dict_concat:
-            dtypes.append(5 | ((len(prog.columns) + dcols.index(name)) << 8))
+        if ex.dtype(name) is not None:
+            dtypes.append(ex.dtype(name))
             continue
         if c.type not in _DT or c.null_count:
             return _filter_decline(f"predicate column type {c.type} or nulls")
@@ -1163,13 +1219,12 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
             keep_alive.append(bo)
             L[8 * j: 8 * j + 8] = [nk, pks[0], pks[1] if nk == 2 else -1, export(bkeys[0]),
                                    export(bkeys[1]) if nk == 2 else 0, widths, len(bouts), ctypes.addressof(bo)]
-        doffs = [prog.dict_concat[n][_dict_key(seg[prog.columns.index(n)].dictionary)]
-                 for seg in segs for n in dcols]
+        doffs, row0 = [], 0
+        for seg in segs:
+            doffs += ex.words(lambda nm: seg[prog.columns.index(nm)], row0)
+            row0 += len(seg[0])
         c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
-        code = prog.code
-        if dcols:
-            code = code.copy()
-            code[7] = len(prog.columns) + len(dcols)
+        code = ex.patch(prog.code)
         c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
         c_kinds = (ctypes.c_int64 * max(len(kinds), 1))(*kinds)
         c_sizes = (ctypes.c_int64 * max(len(sizes), 1))(*sizes)
@@ -1179,7 +1234,7 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
             FMAGIC, 2 if look_words else 1, len(segs), len(vcols), len(ocols), code.ctypes.data, prog.consts.ctypes.data,
             prog.set_bytes.ctypes.data, prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes),
             ctypes.addressof(arrays), ctypes.addressof(c_kinds), ctypes.addressof(c_sizes),
-            default_threads(table.num_rows), len(dcols), ctypes.addressof(c_doffs),
+            default_threads(table.num_rows), ex.n, ctypes.addressof(c_doffs),
             len(look_words), ctypes.addressof(L), len(pk_names), ctypes.addressof(c_stats))
         O = (ctypes.c_int64 * (2 + 2 * len(out_names)))()
         lib = _load()
@@ -1419,6 +1474,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         return _decline("expression not supported by the bytecode compiler")
     if prog.dict_arrays:
         return _decline("string predicates outside concat mode")
+    if prog.str_cols:
+        return _decline("plain string predicate over joined columns")
     key_slot = {}
     for j, i in enumerate(sorted(derived)):
         slot = prog.outputs[n_user + j][2]
@@ -1520,12 +1577,12 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         return _decline("fact predicate not supported by the bytecode compiler")
     if pre.dict_arrays:
         return _decline("string predicates outside concat mode")
-    pdcols = [c for c in pre.columns if c in pre.dict_concat]
+    pex = _Extras(pre)
     pre_cols = [table.column(c) for c in pre.columns]
     pdtypes = []
     for name, c in zip(pre.columns, pre_cols):
-        if name in pre.dict_concat:
-            pdtypes.append(5 | ((len(pre.columns) + pdcols.index(name)) << 8))
+        if pex.dtype(name) is not None:
+            pdtypes.append(pex.dtype(name))
         elif c.type in _DT and not c.null_count:
             pdtypes.append(_DT[c.type])
         else:
@@ -1572,17 +1629,17 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
             for name in dcols:
                 d = seg[fpos[name]].dictionary if name in fpos else cols[name].chunk(0).dictionary
                 doffs.append(prog.dict_concat[name][_dict_key(d)])
-        pdoffs = [pre.dict_concat[n][_dict_key(seg[pre_off + pre.columns.index(n)].dictionary)]
-                  for seg in segs for n in pdcols]
+        pdoffs, row0 = [], 0
+        for seg in segs:
+            pdoffs += pex.words(lambda nm: seg[pre_off + pre.columns.index(nm)], row0)
+            row0 += len(seg[0])
         c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
         c_pdoffs = (ctypes.c_int64 * max(len(pdoffs), 1))(*pdoffs)
         code, pcode = prog.code, pre.code
         if dcols:
             code = code.copy()
             code[7] = len(prog.columns) + len(dcols)
-        if pdcols:
-            pcode = pcode.copy()
-            pcode[7] = len(pre.columns) + len(pdcols)
+        pcode = pex.patch(pcode)
         c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
         c_pdtypes = (ctypes.c_int32 * max(len(pdtypes), 1))(*pdtypes)
         c_colmap = (ctypes.c_int64 * max(len(colmap), 1))(*colmap)
@@ -1598,10 +1655,10 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
                                                  else (-1,) + fact_range[i] if i in fact_range else (0, 0, 0))])
         F = (ctypes.c_int64 * 18)(
             n_fa, ctypes.addressof(c_colmap), len(pre_cols), pcode.ctypes.data, pre.consts.ctypes.data,
-            pre.set_bytes.ctypes.data, pre.set_meta.ctypes.data, ctypes.addressof(c_pdtypes), len(pdcols),
+            pre.set_bytes.ctypes.data, pre.set_meta.ctypes.data, ctypes.addressof(c_pdtypes), pex.n,
             ctypes.addressof(c_pdoffs), pre_off, len(look_words), ctypes.addressof(L), probe_off,
             len(bspec), ctypes.addressof(c_bcols), 0, width)
-        P = (ctypes.c_int64 * 28)(
+        P = (ctypes.c_int64 * 29)(
             MAGIC, 3, len(segs), len(prog.columns), n_keys, n_out, len(sorts),
             code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
@@ -1609,7 +1666,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
             default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
             max_groups, ctypes.addressof(c_hconst),
             len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys), ctypes.addressof(F),
-            (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0) | (HASH_FLAG if hashed else 0))
+            (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0) | (HASH_FLAG if hashed else 0), _record_limit())
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -1916,3 +1973,76 @@ def try_gather(compiler, table: pa.Table, idx, decode_dicts: bool = False) -> Op
             nbytes = ctypes.c_int32.from_address(a + 4 * n).value
             out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
     return pa.Table.from_arrays(out, names=table.column_names)
+
+
+# ── the CPU share of a CPU+GPU split (F-057) ───────────────────────────────────────────────────────────────
+
+_GID = "__mx_gid__"
+_CNT = "__mx_cnt__"
+
+
+def range_partials(compiler, prog, table: pa.Table, predicates, agg_node, gids, n_groups: int,
+                   start: int, end: int):
+    """The native executor over rows ``[start, end)`` of ``table``, as the ``Partials`` the fused pipeline's
+    CPU kernel would return for that range (so they merge with the GPU's), or None when it declines
+    (the caller runs the pipeline kernel over the range instead).
+
+    The slice is a zero-copy ``table.slice`` and the rows are grouped by their group id (a column of
+    ``gids``), so the result's rows land at their group's position without comparing keys. Each of the
+    program's slots is computed by one aggregate of the same expression: a mean's slot is its sum
+    (``finalize`` divides by the count), and a float min / max (DuckDB: NaN above every number) is turned
+    into the pipeline's slot pair, the NaN-free extreme plus a NaN count (see ``pipeline_program``)."""
+    import numpy as np
+    from .lazy_expr import Expr, col, lit
+    from .np_arrow import array as _npa, to_numpy as _np_of
+    from .pipeline_program import Partials
+
+    vals = np.repeat(prog.identity[:, None], n_groups, axis=1)
+    cnt = np.zeros(n_groups, dtype=np.int64)
+    if end <= start:
+        return Partials(vals=vals, cnt=cnt)
+    grouped = gids is not None
+    sliced = table.slice(start, end - start)
+    if grouped:
+        sliced = sliced.append_column(_GID, pa.chunked_array([_npa(np.ascontiguousarray(gids[start:end]))]))
+    slot_agg = {}                                    # slot -> (aggregate name, op)
+    aggs = [Expr("count", lit(1)).alias(_CNT)]
+    for e, (name, op, slot) in zip(agg_node.aggs, prog.outputs):
+        if slot is None or slot in slot_agg:
+            continue
+        kind = "sum" if op == "mean" else op
+        slot_agg[slot] = f"__mx_s{slot}"
+        aggs.append(Expr(kind, e.args[0]).alias(slot_agg[slot]))
+    nan_of = {}                                      # hidden NaN-count slot -> [(aggregate name, op)]
+    out_of = {n: (o, sl) for n, o, sl in prog.outputs}
+    for name, nan_slot in prog.nan_slots.items():
+        op, slot = out_of[name]
+        nan_of.setdefault(nan_slot, []).append((slot_agg[slot], op))
+    node = Scan(sliced)
+    for p in reversed(predicates):
+        node = Filter(node, p)
+    plan = Aggregate(node, [col(_GID)] if grouped else [], aggs)
+    res = try_execute(compiler, plan, None, None, coproc_share=True)
+    if res is None:
+        return None
+    idx = _np_of(res.column(_GID), zero_copy_only=False).astype(np.int64) if grouped else np.zeros(1, np.int64)
+
+    def column(name):
+        return np.asarray(_np_of(res.column(name), zero_copy_only=False), dtype=np.float64)
+
+    c = column(_CNT).astype(np.int64)
+    if not grouped and c[0] == 0:                    # a global aggregate over no surviving rows
+        return Partials(vals=vals, cnt=cnt)
+    cnt[idx] = c
+    for slot, name in slot_agg.items():
+        v = column(name)
+        if prog.slot_kinds[slot] in ("min", "max"):      # the pipeline's slot never holds a NaN
+            v = np.where(np.isnan(v), prog.identity[slot], v)
+        vals[slot, idx] = v
+    for slot, users in nan_of.items():
+        n_nan = np.zeros(len(idx))
+        for name, op in users:
+            hit = np.isnan(column(name))
+            n_nan = np.maximum(n_nan, np.where(hit, c if op == "min" else 1.0, 0.0))
+        vals[slot, idx] = n_nan
+    return Partials(vals=vals, cnt=cnt)

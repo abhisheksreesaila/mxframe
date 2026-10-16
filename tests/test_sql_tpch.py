@@ -16,9 +16,7 @@ SF = "0.017"
 DATA = TPCH_DATA / f"tpch_sf{SF}_exact"
 
 UNSUPPORTED = {
-    2: "'%BRASS'",                                   # LIKE '%suffix': no suffix match in the engine
     13: "Cannot parse JOIN ON",                      # a non-equality condition in a LEFT JOIN's ON
-    16: "'%Customer%Complaints%'",                   # LIKE with two wildcards inside
     21: "l2.l_suppkey <> l1.l_suppkey",              # correlated <> (EXISTS with an inequality)
 }
 

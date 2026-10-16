@@ -168,6 +168,19 @@ and four lanes per group, and folds the workers' records in buffer order: a floa
 between runs. The cost of the reproducible mode is a table of 66k slots per worker (about 4 MB with a few
 aggregates) and a flush per morsel; measured numbers are in F-069's ticket.
 
+**Memory bound.** Phase 1 keeps its flushed records until the merge: one record of (3 + aggregates + key
+words) x 8 bytes per (worker flush, group), so up to one per row when the groups are many (a group seen again
+only after the local table of 8,192 groups has flushed). Measured at 10M rows, 1M groups (one int64 key, two
+aggregates): +630 MB over the input, against +140 MB on the Arrow path, i.e. about 1.25 x the record bytes
+(48 B x 10M = 480 MB) and about 4.5x Arrow's extra. The merge frees each partition's buffers as soon as it is
+folded and keeps only arrays of exactly the group count; the peak is still the end of phase 1. So the bound is
+rows x record bytes x 1.25, and it grows with rows, not groups. A guard makes that safe: the executor counts
+flushed record bytes (all workers, one atomic) and, past a third of `MemAvailable` (plan word 28, read in
+`native_exec._record_limit`, `MXFRAME_HASH_RECORD_MB` overrides), stops and returns E_NO_MEMORY (-19): the
+plan declines to the path that fits (Arrow), which answers in the same rows. A third leaves room for the 1.25x
+merge peak, the input and the engine's other buffers. Not done: spilling records or folding them early (a
+bounded-memory hash aggregate would need that).
+
 **Where it runs.** `last_group_path()` reports "dense", "compact" or "hash". Declines that remain: NULL in a key
 column, a float expression key (`GROUP BY a * 0.5`: the program's min-aggregate reads NaN as +inf, so the register is
 not the key), partner string keys with more than 65,536 distinct values, SELECT DISTINCT over such keys

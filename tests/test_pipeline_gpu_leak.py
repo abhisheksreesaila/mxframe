@@ -1,6 +1,5 @@
 """F-008 review: the Router spawns threads per run; the GPU kernel's scratch buffers must not be
 tied to a thread, or every short-lived thread leaks its share of device memory."""
-import ctypes
 import threading
 
 import numpy as np
@@ -23,7 +22,7 @@ def _gpu_ok():
 
 
 @pytest.mark.skipif(not _gpu_ok(), reason="no GPU")
-def test_short_lived_threads_do_not_leak_device_memory():
+def test_short_lived_threads_do_not_leak_device_memory(monkeypatch):
     n, g = 500_000, 250_000
     rng = np.random.default_rng(0)
     t = pa.table({"x": rng.random(n), "y": rng.random(n)})
@@ -35,15 +34,33 @@ def test_short_lived_threads_do_not_leak_device_memory():
     pk.run_pipeline_gpu(prog, cc, gids, g, 0, n)          # warm: context, program upload, pool
     cu = pk._get_cuda()
 
-    def free_mib():
-        f, tot = ctypes.c_size_t(), ctypes.c_size_t()
-        cu.bind_thread()
-        cu.lib.cuMemGetInfo_v2(ctypes.byref(f), ctypes.byref(tot))
-        return f.value / 2 ** 20
+    # Count this process's own live device bytes (malloc minus free), not cuMemGetInfo: that reads
+    # the whole device, so another process allocating on the GPU failed this test (F-075).
+    # Covers Python-side buffers only: Mojo's DeviceContext() (made per call in pipeline_gpu.mojo)
+    # allocates outside cu.malloc and is not visible here.
+    live, sizes, calls = [0], {}, [0]
+    malloc, free = cu.malloc, cu.free
 
-    before = free_mib()
+    def counting_malloc(nbytes):
+        calls[0] += 1
+        ptr = malloc(nbytes)
+        sizes[ptr] = max(int(nbytes), 8)
+        live[0] += sizes[ptr]
+        return ptr
+
+    def counting_free(ptr):
+        live[0] -= sizes.pop(ptr, 0)
+        free(ptr)
+
+    monkeypatch.setattr(cu, "malloc", counting_malloc)
+    monkeypatch.setattr(cu, "free", counting_free)
+    for ptr in list(cu._sizes) + [p for fl in cu._pool.values() for p, _ in fl]:
+        sizes.setdefault(ptr, 0)       # warm-up buffers were allocated before counting: not counted
+
+    before = live[0]
     for _ in range(20):
         th = threading.Thread(target=lambda: pk.run_pipeline_gpu(prog, cc, gids, g, 0, n))
         th.start()
         th.join()
-    assert before - free_mib() < 64, "device memory grew with the number of threads"
+    assert calls[0] >= 20, "allocation no longer goes through cu.malloc: the test would pass vacuously"
+    assert live[0] - before == 0, "device memory grew with the number of threads"

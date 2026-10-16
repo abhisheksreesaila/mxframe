@@ -36,7 +36,8 @@ j-th selected row of a block (the same block contract as `_encode_sel`).
 
 Result words (`res`, caller-allocated, 3 + n_keys): 0 G, 1 vals* (float64[n_aggs * max(G, 1)]),
 2 cnt* (int64[max(G, 1)]), 3 + k key words* (int64[max(G, 1)]); all from `unsafe_alloc`.
-Return: 0 ok, -1 bad program, -3 too many registers, -5 `keyw` failed (invalid dictionary code).
+Return: 0 ok, -1 bad program, -3 too many registers, -5 `keyw` failed (invalid dictionary code),
+-6 the flushed records passed `rec_limit` bytes (0: no limit; the caller's other path answers).
 """
 
 from std.memory.alloc import unsafe_alloc
@@ -75,7 +76,10 @@ comptime S_SEG = 7       # tag of the next flush: (morsel << 20) | flushes in th
 comptime S_WORDS = 8     # Int64[nk * VEC]: key words of a block
 comptime S_HH = 9        # UInt64[VEC]: hashes of a block
 comptime S_BUF = 10      # Int64[3 * nparts]: this worker's buffer per partition (address, words used, words capacity)
-comptime S_N = 11
+comptime S_RB = 11       # address of the shared Int64: record bytes flushed so far, all workers
+comptime S_LIM = 12      # the limit on it (0: none)
+comptime S_OVER = 13     # set when the record limit is passed (the morsel loop stops)
+comptime S_N = 14
 
 # partition result words (pr[i * PR_N + PR_*])
 comptime PR_G = 0
@@ -232,12 +236,16 @@ def _flush(p: Prog, hs: LP, nk: Int, cap: Int, lanes: Int, nparts: Int, pshift: 
         table[Int(used[g])] = -1
     hs[S_COUNT] = 0
     hs[S_SEG] = seg + 1
+    var tot = Int(Atomic[Scalar[DType.int64]].fetch_add(_lp(Int(hs[S_RB])), Int64(count * rw * 8))) + count * rw * 8
+    if Int(hs[S_LIM]) > 0 and tot > Int(hs[S_LIM]):
+        hs[S_OVER] = 1
 
 
 def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                    FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int, tbl_a: Int, n_chunks: Int, dtypes_a: Int,
     nk: Int, n_rows: Int, threads: Int, repro: Bool, keyw: KW, front: FR, ws_bytes: Int, res: LP,
+    rec_limit: Int,
 ) -> Int:
     var code = _ip(code_a)
     if Int(code[0]) != 0x4d585031:
@@ -276,6 +284,8 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
     counter[0] = 0
     var failed = unsafe_alloc[Int64](1)
     failed[0] = 0
+    var rbytes = unsafe_alloc[Int64](1)
+    rbytes[0] = 0
 
     def worker(wid: Int) {imm}:
         var st = wst + wid * 4
@@ -315,6 +325,8 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         hs[S_BUF] = Int64(Int(wbufs + wid * 3 * nparts))
         hs[S_COUNT] = 0
         hs[S_SEG] = Int64(wid) << 20
+        hs[S_RB] = Int64(Int(rbytes))
+        hs[S_LIM] = Int64(rec_limit)
 
         def enc(c: Int, i0: Int, sl: IP, nsel: Int, use_sel: Bool, dst: IP, rg: FP) {imm} -> Bool:
             if not keyw(c, i0, sl, nsel, use_sel, words, rg, ws):
@@ -360,7 +372,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         while True:
             var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             var lo = m * MORSEL
-            if lo >= n_rows:
+            if lo >= n_rows or Int(hs[S_OVER]) != 0 or Int(failed[0]) != 0:
                 break
             if repro:
                 hs[S_SEG] = Int64(m) << 20
@@ -388,7 +400,10 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
         parallelize(worker, nt)
 
-    var rc = -5 if Int(failed[0]) != 0 else 0
+    var over = False
+    for w in range(nt):
+        over = over or Int(hstate[w * S_N + S_OVER]) != 0
+    var rc = -5 if Int(failed[0]) != 0 else (-6 if over else 0)
     var pres = unsafe_alloc[Int64](nparts * PR_N)
     for i in range(nparts * PR_N):
         pres[i] = 0
@@ -483,12 +498,33 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                         cur[best] += Int64(rw)
                 tab.free()
                 ehash.free()
+                for w in range(nt):                       # this partition's records are folded: give them back now
+                    var b = wbufs + (w * nparts + pi) * 3
+                    if Int(b[0]) != 0:
+                        _free(Int(b[0]))
+                        b[0] = 0
+                        b[1] = 0
+                        b[2] = 0
+                # keep the groups, not the record-sized scratch: arrays of exactly ne entries
+                var nkeys2 = unsafe_alloc[Int64](max(ne * nk, 1))
+                var ncnt2 = unsafe_alloc[Int64](max(ne, 1))
+                var nvals2 = unsafe_alloc[Float64](max(A * ne, 1))
+                for e in range(ne * nk):
+                    nkeys2[e] = ekeys[e]
+                for e in range(ne):
+                    ncnt2[e] = ecnt[e]
+                for a in range(A):
+                    for e in range(ne):
+                        nvals2[a * ne + e] = evals[a * nrec + e]
+                ekeys.free()
+                ecnt.free()
+                evals.free()
                 var o = pres + pi * PR_N
                 o[PR_G] = Int64(ne)
-                o[PR_KEYS] = Int64(Int(ekeys))
-                o[PR_CNT] = Int64(Int(ecnt))
-                o[PR_VALS] = Int64(Int(evals))
-                o[PR_NREC] = Int64(nrec)
+                o[PR_KEYS] = Int64(Int(nkeys2))
+                o[PR_CNT] = Int64(Int(ncnt2))
+                o[PR_VALS] = Int64(Int(nvals2))
+                o[PR_NREC] = Int64(ne)                    # (the values' stride)
             cur.free()
 
         var nm = max(1, min(nt, nparts))
@@ -578,4 +614,5 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
     wst.free()
     counter.free()
     failed.free()
+    rbytes.free()
     return rc

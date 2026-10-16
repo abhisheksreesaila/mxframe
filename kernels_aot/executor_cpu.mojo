@@ -1388,12 +1388,12 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         var hrc = 0
         if fused:
             hrc = hash_aggregate[fused=True](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                             n_keys, n_rows, threads, repro, keyw, front, ws_bytes, hres)
+                                             n_keys, n_rows, threads, repro, keyw, front, ws_bytes, hres, Int(P[28]))
         else:
             hrc = hash_aggregate[fused=False](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                              n_keys, n_rows, threads, repro, keyw, _no_front, 0, hres)
+                                              n_keys, n_rows, threads, repro, keyw, _no_front, 0, hres, Int(P[28]))
         if hrc < 0:
-            rc = E_BAD_KEY if hrc == -5 else E_PIPELINE
+            rc = E_BAD_KEY if hrc == -5 else (E_NO_MEMORY if hrc == -6 else E_PIPELINE)
         else:
             G = max(Int(hres[0]), 1)
             vals.free()
@@ -1416,7 +1416,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         comp.free()
         _free_kv(kv, n_keys)
         K.free()
-        return rc if rc == E_BAD_KEY else E_PIPELINE
+        return rc if (rc == E_BAD_KEY or rc == E_NO_MEMORY) else E_PIPELINE
 
     # ── 4. which groups survive, in output order ─────────────────────────────────────────────
     var order = unsafe_alloc[Int64](max(G, 1))     # output position -> group id
@@ -1974,8 +1974,6 @@ def _sort_records(recs: LP, m: Int, nk: Int, nt: Int):
     var bounds = unsafe_alloc[Int64](nruns + 1)
     for r in range(nruns + 1):
         bounds[r] = Int64(r * m // nruns)
-    # bit flags: which buffer holds each run's result after its own sort
-    var inbuf = unsafe_alloc[Int64](nruns)
 
     def sort_run(r: Int) {imm}:
         var lo = Int(bounds[r])
@@ -2020,7 +2018,6 @@ def _sort_records(recs: LP, m: Int, nk: Int, nt: Int):
             recs[i] = src[i]
     tmp.free()
     bounds.free()
-    inbuf.free()
 
 
 def _merge_sort(perm: LP, m: Int, sv: FP, ns: Int, n: Int, nt: Int):

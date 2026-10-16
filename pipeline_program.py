@@ -39,6 +39,13 @@ FLOOR      dst = floor(a)                                   dst, a
 SELECT     dst = a if cond != 0 else b                      dst, cond, a, b
 BETWEEN    dst = lo <= x <= hi                              dst, x, lo, hi
 IN_SET     dst = set[int(x) - lo]  (dictionary codes)       dst, x, set
+STR        dst = utf8 column LIKE pattern / IN values (a      dst, col, pool, flags
+           plain, not dictionary-encoded column: offsets +
+           bytes); `pool` indexes the byte pool: a pattern
+           (``%`` = 0xFF, ``_`` = 0xFE, str_patterns.encode)
+           or, with flags bit 1, values as 4-byte length +
+           bytes; flags bit 0 negates; a NULL string is 0.0
+           either way
 AGG_SUM    slot += src (per group)                          slot, src
 AGG_MIN    slot = min(slot, src)                            slot, src
 AGG_MAX    slot = max(slot, src)                            slot, src
@@ -61,6 +68,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, co
 from ._lazy_pc import pc
 
 from .lazy_expr import Expr
+from .str_patterns import (parse_like, literal_like, regex as str_regex, arrow as str_arrow, encode as str_encode)
 
 MAGIC = 0x4D585031
 HEADER_INTS = 16
@@ -69,6 +77,7 @@ MAX_REGS = 48          # kernels keep registers on the stack / in local memory
 MAX_INSTR = 320        # GPU kernels stage the program in shared memory
 MAX_CONSTS = 64
 MAX_SET_SPAN = 1 << 22  # widest numeric IN_SET table we will build
+MAX_STR_IN = 32         # values an isin over a plain string column compares per row (linear)
 
 OP_LOAD_COL, OP_LOAD_CONST = 1, 2
 OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
@@ -76,6 +85,7 @@ OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
 OP_ROWID = 39
+OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the native executor only)
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 
 OP_NAMES = {
@@ -83,10 +93,11 @@ OP_NAMES = {
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
-    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID",
+    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX",
 }
 
+_COLUMN_OPS = (OP_LOAD_COL, OP_CMPC, OP_STR)     # instructions whose operand `a` is a column index
 _ARITH = {"add": OP_ADD, "sub": OP_SUB, "mul": OP_MUL, "div": OP_DIV}
 _CMP = {"lt": OP_LT, "le": OP_LE, "gt": OP_GT, "ge": OP_GE, "eq": OP_EQ, "ne": OP_NE}
 _FOLD = {
@@ -228,6 +239,7 @@ class PipelineProgram:
     nan_slots: Dict[str, int] = field(default_factory=dict)  # min / max output -> hidden NaN-count slot
     slot_int: List[bool] = field(default_factory=list)       # slot input is integer-valued (whole numbers; exact while within 2^53)
     dict_concat: Dict[str, Dict[tuple, int]] = field(default_factory=dict)   # concat_dicts mode: name -> {dictionary key: offset}
+    str_cols: List[str] = field(default_factory=list)   # concat_dicts mode: plain utf8 columns read by OP_STR
 
     @property
     def n_slots(self) -> int:
@@ -308,6 +320,24 @@ def _dict_member(d: pa.Array, test, arrow) -> np.ndarray:
     if len(d) <= DICT_MEMBER_PY_MAX:
         return np.fromiter((v is not None and bool(test(v)) for v in d.to_pylist()), dtype=bool, count=len(d))
     return np.asarray(_np_of(pc.fill_null(arrow(), _npscalar(False)), zero_copy_only=False))
+
+
+def _py_test(toks, nocase: bool, rx):
+    """A Python test of one string against LIKE tokens: str methods for the plain shapes, else the regex."""
+    kinds = [k for k, _ in toks]
+    text = next((t for k, t in toks if k == "lit"), "")
+    if not nocase:
+        if kinds == ["lit"]:
+            return lambda v: v == text
+        if kinds == ["lit", "run"]:
+            return lambda v: v.startswith(text)
+        if kinds == ["run", "lit"]:
+            return lambda v: v.endswith(text)
+        if kinds == ["run", "lit", "run"]:
+            return lambda v: text in v
+        if kinds == ["run"]:
+            return lambda v: True
+    return lambda v: rx.fullmatch(v) is not None
 
 
 def _dict_codes(d: pa.DictionaryArray) -> np.ndarray:
@@ -411,8 +441,11 @@ class _Builder:
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
         self.col_bounds: Dict[str, int] = {}
+        self.skip_bounds = False       # name the columns only: no exactness bound, no pass over the data
         self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
+        self.plain_str: List[str] = []                 # plain utf8 columns matched by OP_STR
+        self._neg = 0                                  # depth of generic NOTs around the expression being compiled
         self.consts: List[float] = []
         self.const_ix: Dict[float, int] = {}
         self.sets: List[Tuple[bytes, int]] = []      # (table bytes, lo)
@@ -498,6 +531,13 @@ class _Builder:
                 self.dict_concat[name] = offs
                 self.dict_values[name] = pa.concat_arrays(parts) if len(parts) > 1 else parts[0]
             return self.dict_values[name]
+        if self.skip_bounds and name not in self.dict_arrays:
+            # naming the columns only: the membership of the literal over an empty stand-in dictionary (no
+            # unify / combine / dictionary_encode, which rewrite or hash every row)
+            col = self.table.column(name)
+            if isinstance(col, pa.ChunkedArray) and col.num_chunks:
+                first = col.chunk(0)
+                return (first.dictionary if pa.types.is_dictionary(first.type) else first).slice(0, 0)
         if name not in self.dict_arrays:
             col = self.table.column(name)
             arr = _single_array(col)
@@ -561,6 +601,8 @@ class _Builder:
 
     def within_exact(self, t, scale: int = 1) -> bool:
         """Can ``scale * bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
+        if self.skip_bounds:
+            return True
         return (self._eval_bound(t, False) * scale <= EXACT or self._eval_bound(t, True) * scale <= EXACT)
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
@@ -601,14 +643,26 @@ class _Builder:
         if op in ("and", "or"):
             return self._logic(op, args)
         if op == "not":
-            x = self._need(args[0], "bool")
+            inner = args[0]
+            if isinstance(inner, Expr) and inner.op in ("startswith", "contains", "like"):
+                return self._str_match(inner, negate=True)       # NOT LIKE: a NULL string stays NULL (not kept)
+            if (isinstance(inner, Expr) and inner.op == "isin" and inner.args[0].op == "col"
+                    and self.column_kind(inner.args[0].args[0]) == "str"
+                    and self._is_plain_str(inner.args[0].args[0]) and isinstance(inner.args[1], (list, tuple))
+                    and all(isinstance(v, str) for v in inner.args[1])):
+                return self._str_isin(inner.args[0].args[0], list(inner.args[1]), negate=True)
+            self._neg += 1
+            try:
+                x = self._need(args[0], "bool")
+            finally:
+                self._neg -= 1
             if isinstance(x, _Const):
                 return _Const(float(x.value == 0), "bool")
             return _Val(self.emit(OP_NOT, x.vreg), "bool")
         if op == "isin":
             return self._isin(args[0], args[1])
-        if op in ("startswith", "contains"):
-            return self._str_match(op, args[0], args[1])
+        if op in ("startswith", "contains", "like"):
+            return self._str_match(e)
         if op == "case_when":
             cond = self._need(args[0], "bool")
             then = self._need(args[1], "num")
@@ -635,6 +689,8 @@ class _Builder:
         if arg.op != "col" or self.column_kind(arg.args[0]) != "int":
             raise Unsupported("year_days only on an integer column")
         name = arg.args[0]
+        if self.skip_bounds:           # the same columns, without the min / max pass that sizes the year chain
+            return self.compile(Expr("case_when", Expr("ge", arg, Expr("lit", 0)), Expr("lit", 1), Expr("lit", 0)))
         if name not in self.day_ranges:
             from .join_engine import _minmax
             col = self.table.column(name)
@@ -698,8 +754,10 @@ class _Builder:
                     raise Unsupported("string literal against a numeric column")
                 if op not in ("eq", "ne"):
                     raise Unsupported("ordered string comparison")
-                d = self.dictionary(col_e.args[0])
                 lit_s = lit_e.args[0]
+                if self._is_plain_str(col_e.args[0]):
+                    return self._str_plain(col_e.args[0], str_encode([("lit", lit_s)] if lit_s else []), op == "ne")
+                d = self.dictionary(col_e.args[0])
                 member = _dict_member(d, lambda v: v == lit_s,
                                       lambda: pc.equal(d, _npscalar(lit_s, type=d.type)))
                 return self._dict_test(col_e.args[0], member, negate=(op == "ne"))
@@ -777,24 +835,64 @@ class _Builder:
             r = self.emit(OP_NOT, r)
         return _Val(r, "bool")
 
-    def _str_match(self, op: str, col_e: Expr, pattern):
+    def _str_match(self, e: Expr, negate: bool = False):
+        """startswith / contains / LIKE of a string column: over a dictionary the pattern is tested once per
+        dictionary value (a code set, then IN_SET); over a plain utf8 column (native executor) it is
+        matched row by row in Mojo (OP_STR)."""
+        col_e, pattern = e.args[0], e.args[1]
         if col_e.op != "col" or not isinstance(pattern, str):
             raise Unsupported("string op on a non-column")
         name = col_e.args[0]
         if self.column_kind(name) != "str":
             raise Unsupported("string op on a numeric column")
+        escape, nocase = (e.args[2], e.args[3]) if e.op == "like" else (None, False)
+        toks = parse_like(pattern, escape) if e.op == "like" else literal_like(e.op, pattern)
+        if self._is_plain_str(name):
+            if nocase:
+                raise Unsupported("ILIKE over a plain string column")
+            return self._str_plain(name, str_encode(toks), negate)
         d = self.dictionary(name)
-        if op == "startswith":
-            member = _dict_member(d, lambda v: v.startswith(pattern), lambda: pc.starts_with(d, pattern=pattern))
-        else:
-            member = _dict_member(d, lambda v: pattern in v, lambda: pc.match_substring(d, pattern=pattern))
-        return self._dict_test(name, member)
+        if nocase and not (pattern.isascii() and all(v is None or v.isascii() for v in d.to_pylist())):
+            raise Unsupported("ILIKE over non-ASCII text (DuckDB's case folding)")
+        rx = str_regex(toks, nocase)
+        member = _dict_member(d, _py_test(toks, nocase, rx),
+                              lambda: pc.match_like(d, pattern=str_arrow(toks), ignore_case=nocase))
+        return self._dict_test(name, member, negate)
+
+    def _is_plain_str(self, name: str) -> bool:
+        """A plain (not dictionary) utf8 column read by the native executor's string op."""
+        t = self.table.schema.field(name).type
+        return self.concat_dicts and not pa.types.is_dictionary(t)
+
+    def _str_plain(self, name: str, pool: bytes, negate: bool, isin: bool = False):
+        """OP_STR over a plain utf8 column: ``pool`` is the pattern program (LIKE) or the length-prefixed
+        values (IN); a NULL string is 0.0 for either sense."""
+        t = self.table.schema.field(name).type
+        if t != pa.string():
+            raise Unsupported(f"string predicate on a {t} column")
+        if self.table.column(name).null_count and self._neg:
+            raise Unsupported("NOT over a predicate on a string column with nulls")
+        ix = self._column(name)
+        if name not in self.plain_str:
+            self.plain_str.append(name)
+        s = self.set_reg(name, np.frombuffer(pool, dtype=np.uint8))
+        return _Val(self.emit(OP_STR, ix, s, (1 if negate else 0) | (2 if isin else 0), key_extra=("str",)), "bool")
+
+    def _str_isin(self, name: str, values, negate: bool = False):
+        vals = sorted({v.encode("utf-8") for v in values})
+        if not vals:
+            return _Const(1.0 if negate else 0.0, "bool")
+        if len(vals) > MAX_STR_IN:
+            raise Unsupported("isin over a plain string column with many values")
+        return self._str_plain(name, b"".join(len(v).to_bytes(4, "little") + v for v in vals), negate, isin=True)
 
     def _isin(self, col_e: Expr, values):
         values = list(values)
         if col_e.op == "col" and self.column_kind(col_e.args[0]) == "str":
             if not all(isinstance(v, str) for v in values):
                 raise Unsupported("non-string values against a string column")
+            if self._is_plain_str(col_e.args[0]):
+                return self._str_isin(col_e.args[0], values)
             d = self.dictionary(col_e.args[0])
             vs = set(values)
             member = _dict_member(d, lambda v: v in vs, lambda: pc.is_in(d, value_set=_npa(values, type=d.type)))
@@ -869,16 +967,19 @@ class _Builder:
 
 
 def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
-                     concat_dicts: bool = False) -> Optional[PipelineProgram]:
+                     concat_dicts: bool = False, exact_bounds: bool = True) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
     existing path). ``concat_dicts`` (native executor): string predicates test codes against the
     concatenation of the chunks' dictionaries (``PipelineProgram.dict_concat``) instead of a
     unified dictionary built over the rows.
+
+    ``exact_bounds=False`` skips the integer-exactness bounds (the data's min / max, one pass per column):
+    the program is only good for naming its columns (``.columns``), never to run.
     """
     try:
-        return _compile(predicates, aggs, table, concat_dicts)
+        return _compile(predicates, aggs, table, concat_dicts, exact_bounds)
     except Unsupported:
         return None
 
@@ -936,8 +1037,10 @@ def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr
     return False
 
 
-def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False) -> PipelineProgram:
+def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False,
+             exact_bounds: bool = True) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
+    b.skip_bounds = not exact_bounds
 
     # ── predicate section (dense rows) ─────────────────────────────────────
     pred_sec = _Section()
@@ -1008,14 +1111,15 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
     body_sec.instrs = _dce(body_sec.instrs, list(slot_src))
     used: List[int] = []
     for ins in pred_sec.instrs + body_sec.instrs:
-        if ins[0] in (OP_LOAD_COL, OP_CMPC) and ins[2] not in used:
+        if ins[0] in _COLUMN_OPS and ins[2] not in used:
             used.append(ins[2])
     remap = {old: new for new, old in enumerate(used)}
     for ins in pred_sec.instrs + body_sec.instrs:
-        if ins[0] in (OP_LOAD_COL, OP_CMPC):
+        if ins[0] in _COLUMN_OPS:
             ins[2] = remap[ins[2]]
     b.columns = [b.columns[old] for old in used]
     b.dict_arrays = {n: d for n, d in b.dict_arrays.items() if n in b.columns}
+    b.plain_str = [n for n in b.plain_str if n in b.columns]
 
     # ── register allocation ────────────────────────────────────────────────
     const_vregs = [b.const_vregs[k] for k in sorted(b.const_vregs)]
@@ -1034,7 +1138,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         op = ins[0]
         if op == OP_LOAD_COL:
             return [op, phys_of(ins[1]), ins[2], 0, 0]
-        if op == OP_CMPC:
+        if op == OP_CMPC or op == OP_STR:
             return [op, phys_of(ins[1]), ins[2], ins[3], ins[4]]
         if op == OP_ROWID:
             return [op, phys_of(ins[1]), 0, 0, 0]
@@ -1084,6 +1188,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         columns=list(b.columns),
         dict_arrays=dict(b.dict_arrays),
         dict_concat={n: o for n, o in b.dict_concat.items() if n in b.columns},
+        str_cols=list(b.plain_str),
         slot_kinds=slot_kinds,
         slot_int=slot_int,
         outputs=outputs,
@@ -1194,7 +1299,7 @@ def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: 
 
 def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
-    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID):
+    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR):
         return []
     if op in (OP_NOT, OP_FLOOR, OP_IN_SET):
         return [ins[2]]

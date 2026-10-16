@@ -418,6 +418,25 @@ def test_reproducible_fused_wide_key_sums_are_bit_identical(hooks, calls, monkey
             assert int((_bits(runs[0], name) != _bits(other, name)).sum()) == 0, name
 
 
+# ── the memory bound ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_record_budget_passed_declines_to_the_path_that_fits_with_the_same_answer(hooks, monkeypatch):
+    """Flushed records grow with rows when groups are many; past MXFRAME_HASH_RECORD_MB the executor returns
+    E_NO_MEMORY (-19) and the Arrow path answers."""
+    r = np.random.default_rng(5)
+    n = 600_000
+    t = pa.table({"a": A(r.integers(-2**62, 2**62, 300_000)[r.integers(0, 300_000, n)]), "v": A(r.random(n))})
+    sql = "select a, sum(v) as sv, count(*) as n from t group by a"
+    monkeypatch.setenv("MXFRAME_HASH_RECORD_MB", "2")
+    got = _rows(mx.sql(sql, t=t).compute(device="cpu"))
+    _same(got, _duck(sql, t=t))
+    assert any(h[2] and "-19" in h[2] for h in hooks), hooks
+    hooks.clear()
+    monkeypatch.setenv("MXFRAME_HASH_RECORD_MB", "2000")
+    _same(_rows(mx.sql(sql, t=t).compute(device="cpu")), _duck(sql, t=t))
+    _hashed(hooks)
+
+
 # ── TPC-H Q10 and Q18 as SQL text ────────────────────────────────────────────────────────────────
 
 SF = "0.17"
@@ -427,7 +446,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 @pytest.mark.skipif(not (DATA / "lineitem.parquet").exists(), reason="TPC-H small data not present")
 @pytest.mark.parametrize("q", [10, 18])
-def test_tpch_sql_group_by_float_and_wide_keys_runs_fully_native(q, hooks, monkeypatch):
+def test_tpch_sql_float_and_wide_group_keys_equal_duckdb_with_no_native_decline(q, hooks, monkeypatch):
+    """Every aggregate hook ran and none declined, and the answer is DuckDB's. (Fully native in the coverage
+    script's sense is a stricter check: SF1 Q10 still dictionary-encodes four partner string columns in Arrow.)"""
     from tpch_sql import run
     from tpch_sql.queries import SQL
     text, d = SQL[q], run.data_dir(SF)
