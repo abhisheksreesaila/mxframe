@@ -610,6 +610,15 @@ From F-065: SQL Q10 and Q18 group by float / wide keys as the specification writ
 - [ ] float64 group keys (exact bit equality, NaN and -0.0 like DuckDB) and composite keys wider than the direct-address space take a hashed native group-by instead of declining
 - [ ] SQL Q10, Q18 fully native and equal to DuckDB; no DataFrame query slower
 
+## F-070 NaN compares like DuckDB [todo]
+From the F-068 review (2026-10-16): pre-existing silent wrong answer
+- [ ] DuckDB orders NaN above every value and treats NaN = NaN as true; MXFrame drops a NaN group in HAVING (`HAVING 0/0 > 1`) and in a WHERE over an aggregate result. Make comparisons on float columns follow DuckDB's NaN rules on every path (native bytecode, Arrow fallback, GPU), and sorts put NaN where DuckDB does
+- [ ] DuckDB-checked tests with expected answers built from a native DuckDB table (a registered Arrow table behaved differently in the review's probe), both native settings
+
+## F-071 SQL Q8 fully native [todo]
+From F-068: Q8's aggregates run natively but the nested supplier x nation partner star decodes `n_name` (one Arrow `dictionary_encode` over 10k rows); at SF10 the partner (100k rows) exceeds `_DICT_MAX`
+- [ ] the nested partner star keeps dictionary codes for columns the fused aggregate reads (drop the stashed partners if the fused call declines); SQL Q8 fully native at SF1 and SF10 per `scripts/native_coverage.py --sql`
+
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
