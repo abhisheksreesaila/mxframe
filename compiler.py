@@ -233,12 +233,13 @@ class GraphCompiler:
 
     @staticmethod
     def _tiebreak_names(plan):
-        """Output names of the group keys of the Aggregate under `plan` (Project*(Aggregate)),
+        """Output names of the group keys of the Aggregate under `plan` (Project / Filter nodes over it),
         as `plan` exposes them. A Project that drops a key (or computes a column in its place)
         takes it out: nothing is left to tie-break on for that key."""
         projects = []
-        while isinstance(plan, Project):
-            projects.append(plan)
+        while isinstance(plan, (Project, Filter)):
+            if isinstance(plan, Project):               # a Filter keeps every name
+                projects.append(plan)
             plan = plan.input
         if not (isinstance(plan, Aggregate) and plan.group_by):
             return []
@@ -259,12 +260,15 @@ class GraphCompiler:
         order is not deterministic)."""
         if not (post_ops and isinstance(post_ops[0], Sort)):
             return post_ops
+        names = cls._tiebreak_names(plan)
+        if not names:
+            return post_ops
         srt = post_ops[0]
         have = {e.args[0] for e in srt.by if e.op == "col"}
         desc = list(srt.descending) if isinstance(srt.descending, (list, tuple)) \
             else [bool(srt.descending)] * len(srt.by)
         by = list(srt.by)
-        for name in cls._tiebreak_names(plan):
+        for name in names:
             if name not in have:
                 by.append(Expr("col", name))
                 desc.append(False)

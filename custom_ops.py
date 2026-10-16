@@ -1760,7 +1760,7 @@ class CustomOpsCompiler(GraphCompiler):
         plan, post_ops = self._extract_post_ops(plan)
         # 0-a -- ORDER BY above Projects over a group-by: the barrier below turns the aggregate into
         # a table, so the group keys must join the sort columns now (the native path gets them too)
-        if isinstance(plan, Project):
+        if isinstance(plan, (Project, Filter)):
             post_ops = self._key_tiebreak(plan, post_ops)
         # 0-b -- Operators above an aggregate result run on the materialized aggregate
         plan = self._materialize_barrier(plan)

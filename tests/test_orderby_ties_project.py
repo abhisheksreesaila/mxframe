@@ -18,6 +18,7 @@ def _table(n=300, seed=11):
     sd = pa.array(names[r.integers(0, len(names), n)].tolist()).dictionary_encode()
     return pa.table({"s": sd,
                      "k": A(r.integers(0, 8, n).astype(np.int64)),
+                     "g": A(r.integers(0, 40, n).astype(np.int64)),    # 40 integer groups, shuffled
                      "v": A(r.integers(0, 3, n).astype(np.int64))})   # tiny sums -> many ties
 
 
@@ -58,11 +59,23 @@ QUERIES = {
         "SELECT s, k, z FROM (SELECT s, k, 2*x+1 z FROM (SELECT s, k, sum(v) x FROM t GROUP BY s, k)) "
         "ORDER BY z DESC, s, k LIMIT 8",
         ["s", "k", "z"]),
-    "one_key_with_columns": (
-        lambda lf: lf.groupby("s").agg(col("v").count().alias("c")).with_columns((col("c") * lit(2)).alias("y"))
+    "one_int_key_with_columns": (
+        lambda lf: lf.groupby("g").agg(col("v").count().alias("c")).with_columns((col("c") * lit(2)).alias("y"))
         .sort("y", descending=[True]),
-        "SELECT s, 2*c y FROM (SELECT s, count(v) c FROM t GROUP BY s) ORDER BY y DESC, s",
-        ["s", "y"]),
+        "SELECT g, 2*c y FROM (SELECT g, count(v) c FROM t GROUP BY g) ORDER BY y DESC, g",
+        ["g", "y"]),
+    "with_columns_then_filter": (
+        lambda lf: _agg(lf).with_columns((col("x") * lit(2)).alias("y")).filter(col("y") > lit(0))
+        .sort("y", descending=[True]).limit(10),
+        "SELECT s, k, y FROM (SELECT s, k, 2*x y FROM (SELECT s, k, sum(v) x FROM t GROUP BY s, k)) "
+        "WHERE y > 0 ORDER BY y DESC, s, k LIMIT 10",
+        ["s", "k", "y"]),
+    "filter_then_with_columns": (
+        lambda lf: _agg(lf).filter(col("x") > lit(0)).with_columns((col("x") * lit(2)).alias("y"))
+        .sort("y", descending=[True]).limit(10),
+        "SELECT s, k, 2*x y FROM (SELECT s, k, sum(v) x FROM t GROUP BY s, k) "
+        "WHERE x > 0 ORDER BY y DESC, s, k LIMIT 10",
+        ["s", "k", "y"]),
 }
 
 
@@ -84,6 +97,6 @@ def test_project_that_drops_a_key_still_sorts(native, monkeypatch):
     t = _table()
     res = _agg(LazyFrame(t)).select(col("s"), (col("x") * lit(2)).alias("y")) \
         .sort("y", descending=[True]).limit(5).compute(device="cpu")
-    ys = res.column("y").to_pylist()
+    rows = _rows(res, ["y", "s"])
     assert res.column_names == ["s", "y"]
-    assert ys == sorted(ys, reverse=True) and len(ys) == 5
+    assert len(rows) == 5 and rows == sorted(rows, key=lambda r: (-r[0], r[1]))
