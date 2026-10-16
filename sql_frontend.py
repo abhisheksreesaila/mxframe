@@ -415,11 +415,8 @@ class _SQLTranslator:
             return self._expr(node.this).max()
         if isinstance(node, sge.Count):
             if isinstance(node.this, sge.Star):
-                # COUNT(*) — count any in-scope column
-                c_name = self._scope_columns[0] if self._scope_columns else None
-                if c_name is None:
-                    raise ValueError("COUNT(*) with no tables in scope")
-                return col(c_name).count()
+                # COUNT(*) counts rows: a literal is never NULL (col(x).count() skips NULLs)
+                return lit(1).count()
             return self._expr(node.this).count()
 
         # ---- CASE WHEN ----

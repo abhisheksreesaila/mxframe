@@ -504,6 +504,12 @@ Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open item
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
 - [x] restyled on `site.css`, "how to read this" header, numbers from the bench files
 
+## F-078 COUNT(*) on a NULL group key counts the group's rows [review]
+Silent wrong answer found 2026-10-16: `SELECT k, count(*) ... GROUP BY k` returned 0 for the NULL-key group (DuckDB: the row count); a global `count(*)` skipped rows where the first column was NULL.
+- [x] root cause: the SQL front end translated `COUNT(*)` to `col(<first in-scope column>).count()`, and count skips NULLs; it is now `lit(1).count()` (the count-of-a-literal form every path already treats as count(*)). No kernel change.
+- [x] `tests/test_f078_count_star.py`, DuckDB-checked on cpu and gpu, 50 and 20,000 rows: NULL key, count(col) vs count(*), count(*) + sum, two keys with NULLs, global count, through a join; all 33 failed on main
+- [x] full suite green
+
 ## F-053 device="auto" never uses the native executor [todo]
 Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
 - [ ] re-run the user-felt TPC-H scoreboard with `mx-auto` next to `mx-cpu` on 0.6.0 (quiet machine)
