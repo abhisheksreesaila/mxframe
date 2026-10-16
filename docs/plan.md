@@ -366,9 +366,12 @@ Needs: none · From the F-035 review
 - [x] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
   - No longer needed for the RUNPATH (it is relative); still rebuild a library after changing its source
 
-## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [todo]
+## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [done]
 Needs: none · From the F-032 review (round 2); predates the executor (the fused pipeline has it too)
-- [ ] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+- [x] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+  - Built: `_Builder._arith` bounds every integer `+ - *` (and `case_when`, `year()`) as a lazy expression tree: column TYPE ranges first (no data read), the columns' real min / max (parallel, cached per compile) only when the type ranges could pass 2^53; constant folds use exact Python ints. Declines raise `Inexact` and the exact path answers. All entry points compile through it (`mx_execute`, `mx_filter`, `mx_filter_topk`, fused pipeline). No Mojo change.
+  - Integer SUM (review round 1): a `sum` whose rows * max|value| could pass 2^53 declines; `_aggregate_with_nulls` (Arrow path) then sums exactly in int64, and `np_arrow.group_aggregate` sums integers in three 21-bit limbs instead of `np.bincount`'s float64 weights. Result type change: integer SUMs on that path (also nullable integer columns) are int64, were float64; sums that fit stay float64 natively until the follow-up makes integer SUM int64 everywhere.
+  - Tests: `tests/test_int_arith_2_53.py`. Cost: integer `* + -` over int64 columns reads their min / max once per query (parallel) unless the type ranges suffice
 
 ## F-038 Two tests fail under load [done]
 Needs: none · Seen 2026-10-12 while other test runs and benchmarks shared the machine; both pass alone (3/3)

@@ -9,6 +9,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 - **Kernel libraries find the Mojo runtime from the environment they are installed in** (F-036). The 0.6.0 wheel still ships `kernels_aot/*.so` with an absolute RUNPATH of the build machine's pixi env; the next release carries a relocatable one (`scripts/set_runpath.sh`). Linux only; macOS is out of scope.
+- **Integers past 2^53 (F-037).** Integer `+ - *` whose result could pass 2^53 no longer rounds in the float64 interpreter: the compiler bounds each result (column types first, the data's min / max only when needed) and the exact path answers. An integer `SUM` whose total could pass 2^53 is now added exactly in int64.
+- **Changed result type:** a `SUM` of an integer column that has nulls, or whose total could pass 2^53, now returns int64 (it was float64). Sums that fit stay float64 on the native path for now; making every integer `SUM` int64 is the follow-up.
 
 ### Docs
 - **Docs site** at https://abhisheksreesaila.github.io/mxframe/ (GitHub Pages; `docs/site/`). It has interactive benchmarks, how `device="auto"` decides, the path a query takes (for porting), how the engine got fast, and the kernel visualizer. Every number on it is computed in the browser from `docs/bench`.
