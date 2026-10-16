@@ -62,3 +62,21 @@ def test_lag_lead_match_duckdb(c, fn, n, shape, default):
 def test_lag_of_null_gives_null_not_nan():
     t = pa.table({"id": pa.array([0, 1, 2]), "v": pa.array([1.0, None, 3.0])})
     assert _mx(t, col("v").lag(1).over()).to_pylist() == [None, 1.0, None]
+
+
+@pytest.mark.parametrize("c, d", [("i", 1.5), ("i", 2.5), ("i", -1.5), ("i", "7"), ("s", 5), ("f", 5)])
+@pytest.mark.parametrize("fn", ["lag", "lead"])
+def test_default_is_cast_to_the_column_type_like_duckdb(c, d, fn):
+    t = _table()
+    sql_d = repr(d)
+    want = _duck(t, f"{fn}({c}, 1, {sql_d}) OVER (ORDER BY id)")
+    _same(_mx(t, getattr(col(c), fn)(1, d).over()), want)
+
+
+@pytest.mark.parametrize("c, d", [("i", 1e30), ("i", "x")])
+def test_default_that_does_not_fit_raises_like_duckdb(c, d):
+    t = _table()
+    with pytest.raises(Exception):
+        _duck(t, f"lag({c}, 1, {d!r}) OVER (ORDER BY id)")
+    with pytest.raises(Exception):
+        _mx(t, col(c).lag(1, d).over())

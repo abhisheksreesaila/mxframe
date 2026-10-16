@@ -378,13 +378,27 @@ def _shift_rows(src, rows, args, lead):
         src[rows[k:]] = rows[:m - k]
 
 
+def _cast_default(value, typ):
+    """A lag / lead default cast to the column's type like DuckDB: a float into an integer column
+    rounds half away from zero, text parses, a number into a string column is its text; a value
+    that does not fit raises."""
+    if pa.types.is_string(typ) or pa.types.is_large_string(typ):
+        return pa.scalar(str(value), type=typ)
+    if pa.types.is_integer(typ):
+        if isinstance(value, str):
+            value = int(value)
+        elif isinstance(value, float):
+            value = int(np.sign(value) * np.floor(abs(value) + 0.5))
+    return pa.scalar(value, type=typ)
+
+
 def _take_shifted(arr, src, args):
     """The input array gathered at *src* (-1 gives NULL, or the default); dtype and NULLs kept."""
     none = src < 0
     out = pc.take(arr, pa.array(np.where(none, 0, src), mask=none) if len(arr) else pa.nulls(len(src), pa.int64()))
     default = args[2] if len(args) > 2 else None
     if default is not None:           # only rows that read nothing get it; a source NULL stays NULL
-        out = pc.if_else(pa.array(none), pa.scalar(default, type=out.type), out)
+        out = pc.if_else(pa.array(none), _cast_default(default, out.type), out)
     return out
 
 
