@@ -24,11 +24,7 @@ UNSUPPORTED = {
 
 
 @pytest.mark.skipif(not (DATA / "lineitem.parquet").exists(), reason="TPC-H small data not present")
-@pytest.mark.parametrize("q", [
-    pytest.param(q, marks=pytest.mark.xfail(
-        strict=False, reason="F-064: the CTE is computed twice and `total_revenue = (SELECT max(total_revenue) ...)` "
-                             "compares two float sums that are not bit-reproducible (equal on some runs, 0 rows on others)"))
-    if q == 15 else q for q in range(1, 23)])
+@pytest.mark.parametrize("q", range(1, 23))
 def test_tpch_sql_text(q):
     out = run.one(q, SF)
     if q in UNSUPPORTED:

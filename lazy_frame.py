@@ -263,23 +263,21 @@ class LazyFrame:
                 calibration arrive with per-operator placement.
             reproducible: ``True`` makes every native CPU float SUM / MEAN bit-identical from run to run
                 whatever the number of groups (default: ``MXFRAME_REPRODUCIBLE=1`` or off). By default
-                results are bit-reproducible with no groups, up to 8,192 groups and on fused joins;
+                results are bit-reproducible with no groups, up to 8,192 groups (any number of rows) and on fused joins;
                 a plain group-by with more groups takes a faster path whose sums can differ in the last
                 bits between runs. Costs up to ~20% on the many-groups aggregates. ``False`` overrides
                 the environment variable. GPU float sums are not covered (F-067).
         """
         if reproducible is not None:
-            import os
-            prev = os.environ.get("MXFRAME_REPRODUCIBLE")
-            os.environ["MXFRAME_REPRODUCIBLE"] = "1" if reproducible else "0"
+            # carried to the native call as a plan flag by a per-thread context variable (no process-wide
+            # state: concurrent computes in other threads keep their own mode)
+            from . import native_exec as _nx
+            tok = _nx._reproducible.set(bool(reproducible))
             try:
                 return self.compute(device, verbose, optimize, validate, prefer=prefer, placement=placement,
                                     gpu_fraction=gpu_fraction, strict=strict, profile=profile)
             finally:
-                if prev is None:
-                    os.environ.pop("MXFRAME_REPRODUCIBLE", None)
-                else:
-                    os.environ["MXFRAME_REPRODUCIBLE"] = prev
+                _nx._reproducible.reset(tok)
         from .io_parquet import resolve_plan
         plan = _resolve_scalars(self.plan, device, strict)
         optimizer_trace = None
@@ -861,25 +859,41 @@ def _top_truth(p: Expr) -> Expr:
 
 
 def _plan_key(x):
-    """Hashable identity of a plan or expression: structure, aliases and literals, and the object identity of
-    in-memory tables (``Scan.signature`` has only the column names). None when it cannot be built."""
+    """Hashable identity of a plan or expression: structure, aliases and literals (arrays by dtype, shape and
+    bytes), and the object identity of in-memory tables (``Scan.signature`` has only the column names).
+    None for the WHOLE key when any part cannot be keyed, so two plans are never merged on a guess."""
     import dataclasses
-    try:
+    import numpy as np
+
+    def key(x):
         if isinstance(x, Scan):
             return ("Scan", id(x.table))
         if isinstance(x, LogicalPlan):
             if isinstance(x, ParquetScan):
                 return x.signature()
-            return (type(x).__name__,) + tuple(_plan_key(getattr(x, f.name)) for f in dataclasses.fields(x))
+            return (type(x).__name__,) + tuple(key(getattr(x, f.name)) for f in dataclasses.fields(x))
         if isinstance(x, Expr):
-            return ("e", x.op, tuple(_plan_key(a) for a in x.args), x._alias,
-                    tuple(sorted((k, repr(v)) for k, v in x.kwargs.items())))
+            return ("e", x.op, tuple(key(a) for a in x.args), x._alias,
+                    tuple(sorted((k, key(v)) for k, v in x.kwargs.items())))
         if isinstance(x, (list, tuple)):
-            return ("l",) + tuple(_plan_key(a) for a in x)
-        hash(x)
-        return x
+            return ("l",) + tuple(key(a) for a in x)
+        if isinstance(x, np.ndarray):
+            return ("nd", x.dtype.str, x.shape, x.tobytes())
+        hash(x)                                   # TypeError: unhashable, the whole key is None
+        return (type(x).__name__, x)
+
+    try:
+        return key(x)
     except Exception:
         return None
+
+
+def _ends_in_aggregate(plan) -> bool:
+    """True when ``plan``'s output is an aggregate's (one row per group, possibly filtered / projected /
+    sorted / limited afterwards): small, and the only place float sums come from."""
+    while isinstance(plan, (Filter, Project, Sort, Limit)):
+        plan = plan.input
+    return isinstance(plan, Aggregate)
 
 
 def _scalar_inputs(plan):
@@ -913,7 +927,7 @@ def _scalar_inputs(plan):
     wanted = {}
     for sc in scalars:
         inp = getattr(sc, "input", None)
-        if isinstance(inp, LogicalPlan) and not isinstance(inp, (Scan, ParquetScan)):
+        if isinstance(inp, LogicalPlan) and _ends_in_aggregate(inp):       # small output; not a join or a scan
             k = _plan_key(inp)
             if k is not None:
                 wanted[k] = None
@@ -928,7 +942,7 @@ def _resolve_scalars(plan, device: str, strict: bool):
     import dataclasses
     from .lazy_expr import lit
 
-    # A subquery over the same plan the outer plan also contains (Q15: `view.filter(tot == view.scalar(max))`)
+    # A subquery over the same aggregate plan the outer plan also contains (Q15: `view.filter(tot == view.scalar(max))`)
     # shares ONE result: the plan is computed once, the subquery aggregates that table and the outer plan
     # reads it, so the comparison never depends on a float sum coming out twice with the same bits.
     shared = _scalar_inputs(plan)

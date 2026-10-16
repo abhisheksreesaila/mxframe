@@ -157,6 +157,83 @@ def test_the_per_morsel_table_path_and_the_staged_path_give_the_defined_order(ca
         assert int((_tot(t, 0, 8, monkeypatch) != want).sum()) == 0
 
 
+def test_reproducible_false_overrides_the_environment_variable(calls, monkeypatch):
+    """With MXFRAME_REPRODUCIBLE=1, `reproducible=False` runs the default mode again: above 8,192 groups that
+    is the faster path whose sums differ between runs (200k groups over 6M rows: many groups differ)."""
+    monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
+    t = _fact(6_000_000, 200_000)
+    plan = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
+    on = _bits(plan.compute(device="cpu"), ["tot"])[0]
+    assert int((on != _bits(plan.compute(device="cpu"), ["tot"])[0]).sum()) == 0
+    runs = [_bits(plan.compute(device="cpu", reproducible=False), ["tot"])[0] for _ in range(4)]
+    assert any(int((runs[0] != r).sum()) > 0 for r in runs[1:])
+
+
+def test_threads_computing_at_once_in_opposite_modes_each_keep_their_own(calls):
+    """The flag travels with the compute call (a per-thread context variable and a plan word), not through
+    process-wide state: while one thread computes in the default mode, another's reproducible results are
+    still the defined order, bit for bit, and the first's default results are untouched."""
+    import threading
+    t = _fact(3_000_000, 200_000)
+    want = _canonical(t, 200_000)
+    plan = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
+    bad, stop = [], threading.Event()
+
+    def reproducible_loop():
+        for _ in range(10):
+            if int((_bits(plan.compute(device="cpu", reproducible=True), ["tot"])[0] != want).sum()):
+                bad.append("reproducible result differs")
+
+    def default_loop():
+        while not stop.is_set():
+            got = plan.compute(device="cpu", reproducible=False).column("tot").to_numpy()
+            if not np.allclose(got, want.view(np.float64), rtol=1e-9):
+                bad.append("default result wrong")
+
+    a, b = threading.Thread(target=reproducible_loop), threading.Thread(target=default_loop)
+    b.start()
+    a.start()
+    a.join()
+    stop.set()
+    b.join()
+    assert bad == []
+
+
+def test_views_that_differ_only_in_an_array_literal_do_not_share(calls):
+    """`A.filter(tot == B.scalar(max))` with A and B differing in an `isin` array must not merge them (the
+    plan key keeps arrays by value): A holds {1, 2}, B {3}, so no group of A equals B's maximum."""
+    t = pa.table({"s": A(np.array([1, 2, 3, 4], np.int32)), "x": A(np.array([10.0, 20.0, 30.0, 40.0]))})
+
+    def view(keys):
+        return LazyFrame(t).filter(col("s").isin(keys)).groupby("s").agg(col("x").sum().alias("tot"))
+
+    a, b = view(np.array([1, 2])), view(np.array([3]))
+    assert a.filter(col("tot") == b.scalar(col("tot").max())).compute(device="cpu").num_rows == 0
+    same = view(np.array([1, 2]))
+    assert a.filter(col("tot") == same.scalar(col("tot").max())).compute(device="cpu").num_rows == 1
+
+
+def test_default_mode_is_reproducible_up_to_8192_groups_on_a_large_input(calls):
+    """The guarantee has no row limit: 24M rows, 8k groups, 6 sums (the tables are folded into the output
+    wave by wave, so memory does not grow with the rows), 10 runs."""
+    r = np.random.default_rng(5)
+    n = 24_000_000
+    t = pa.table({"s": A(r.integers(0, 8_000, n).astype(np.int32)), "p": A(r.random(n) * 1000), "d": A(r.random(n))})
+    aggs = [(col("p") * (lit(1.0) + lit(float(i)) * col("d"))).sum().alias(f"t{i}") for i in range(6)]
+    _same_every_run(LazyFrame(t).groupby("s").agg(*aggs), [f"t{i}" for i in range(6)], runs=10)
+
+
+def test_a_cte_joined_to_itself_on_a_float_sum_up_to_8192_groups(calls):
+    """A CTE used twice in FROM is still computed twice (only a scalar subquery over the outer plan's own
+    aggregate shares one result): up to 8,192 groups the two sums are the same bits anyway, above that a
+    self-join on the sum can miss rows in the default mode."""
+    import mxframe as mx
+    t = _fact(2_000_000, 5_000)
+    q = ("WITH a AS (SELECT s, SUM(p * (1.0 - d)) AS tot FROM t GROUP BY s) "
+         "SELECT x.s FROM a x JOIN a y ON x.tot = y.tot AND x.s = y.s")
+    assert mx.sql(q, t=t).compute(device="cpu").num_rows == 5_000
+
+
 def test_the_environment_variable_turns_reproducible_mode_on(calls, monkeypatch):
     """MXFRAME_REPRODUCIBLE=1 does what `reproducible=True` does (200k groups, staged), and
     `reproducible=False` overrides it."""

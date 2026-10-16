@@ -39,6 +39,8 @@ Plan buffer (int64 words):
   22 having constants* : float64[n_having]
   23 n_dcols (dictionary-coded string columns in predicates)   24 doffs* : int64[n_chunks][n_dcols]
      (offset of the chunk's dictionary in the concatenation Python built; read through dtype 5)
+  27 flags: bit 0 SELECT DISTINCT (directly addressed groups only), bit 1 reproducible float sums
+     (every aggregate runs the defined order of additions, F-064; `pipeline_cpu._pipeline`)
 
 Result (int64 words, caller-allocated, 3 + 2 * n_keys + n_outputs):
    0 n_rows   1 arena* (free with mx_exec_free)   2 flags (bit 0: global aggregate over no rows)
@@ -57,7 +59,7 @@ from std.sys import prefetch, PrefetchOptions
 
 from std.utils.numerics import nan
 
-from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, pipeline_fused, big_alloc, free_big, Prog, _run_ops, _find_chunk, _no_keys, VEC, MAX_REGS
+from pipeline_cpu import pipeline_plain, pipeline_keyed, pipeline_fused, big_alloc, free_big, Prog, _run_ops, _find_chunk, _no_keys, VEC, MAX_REGS
 
 comptime SPARSE_MIN_RANGE = 16384   # direct key ranges below this never compact on sparsity
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
@@ -894,6 +896,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var hconst = FP(unsafe_from_address=Int(P[22]))
     var n_dcols = Int(P[23])
     var doffs = _lp(Int(P[24]))
+    var repro = (Int(P[27]) & 2) != 0                             # flag 2: float sums in the defined order (F-064)
     var no_hash = (Int(P[27]) & 1) != 0                           # flag 1 (SELECT DISTINCT): directly addressed groups only
     var O = _lp(out_a)
     var F = _lp(Int(P[26]) if fused else 0)
@@ -1181,10 +1184,10 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     if not grouped:
         if fused:
             rc = pipeline_fused[keyed=False](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                             1, 0, n_rows, Int(vals), Int(cnt), threads, _no_keys, front, ws_bytes)
+                                             1, 0, n_rows, Int(vals), Int(cnt), threads, _no_keys, front, ws_bytes, repro)
         else:
-            rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                 0, 1, 0, n_rows, Int(vals), Int(cnt), threads)
+            rc = pipeline_plain(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                0, 1, 0, n_rows, Int(vals), Int(cnt), threads, repro)
     elif not compact and not use_hash:
         # ── direct group ids: made per 1024-row block for the rows that pass the predicate only (no
         #    n_rows-sized group-id array, keys of filtered-out rows never read), aggregated into
@@ -1195,10 +1198,10 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
 
         if fused:
             rc = pipeline_fused[keyed=True](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                            G, 0, n_rows, Int(vals), Int(cnt), threads, enc, front, ws_bytes)
+                                            G, 0, n_rows, Int(vals), Int(cnt), threads, enc, front, ws_bytes, repro)
         else:
             rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                G, 0, n_rows, Int(vals), Int(cnt), threads, enc)
+                                G, 0, n_rows, Int(vals), Int(cnt), threads, enc, repro)
         if rc == -5:
             rc = E_BAD_KEY
     elif compact:
@@ -1297,7 +1300,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 return True
 
             rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                G, 0, n_rows, Int(vals), Int(cnt), threads, enc_dense)
+                                G, 0, n_rows, Int(vals), Int(cnt), threads, enc_dense, repro)
             if rc == -5:
                 rc = E_BAD_KEY
             free_big(Int(dense))
@@ -1323,8 +1326,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         if bad_key:
             rc = E_BAD_KEY
         else:
-            rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                                 Int(gids), G, 0, n_rows, Int(vals), Int(cnt), threads)
+            rc = pipeline_plain(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                Int(gids), G, 0, n_rows, Int(vals), Int(cnt), threads, repro)
         gids.free()
     for j in range(n_look):
         _free_map(maps + j * MW)
