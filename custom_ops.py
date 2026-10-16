@@ -72,6 +72,7 @@ MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
 RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
+from . import sort_check as _sort_check
 from .sort_check import (is_sorted_permutation as _is_sorted_permutation, is_sorted_topk as _is_sorted_topk,
                          warn_fallback as _warn_radix_fallback)
 
@@ -2711,6 +2712,7 @@ class CustomOpsCompiler(GraphCompiler):
                 return self._aot_gpu.gather_table(table, sorted_indices)
             # F-055: a kernel that ran out of GPU memory only prints an `oom log` and returns a wrong
             # order (seen when another process held the GPU's memory): redo the sort on the CPU.
+            _sort_check.gpu_sort_fallbacks += 1
             _warn_radix_fallback("the GPU sort returned a wrong order (out of GPU memory?)")
             sorted_indices = np.argsort(composite_key, kind="stable")[:k]
             return pc.take(table, _npa(sorted_indices.astype(np.int64)))

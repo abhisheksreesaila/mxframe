@@ -29,9 +29,26 @@ def test_gpu_sort_with_a_failed_kernel_still_returns_the_right_rows(monkeypatch,
     t = pa.table({"k": rng.integers(0, 1000, n).astype(np.int32), "v": np.arange(n, dtype=np.int32)})
     monkeypatch.setattr(AOTKernelsGPU, "sort_topk",
                         lambda self, keys, k, descending=False, device_out=False: np.zeros(k, dtype=np.int32))
+    from mxframe import sort_check
+    before = sort_check.gpu_sort_fallbacks
     lf = LazyFrame(t).sort("k", descending=True)
     if limit:
         lf = lf.limit(limit)
     got = lf.compute(device="gpu").column("v").to_numpy()
     want = np.argsort(-t.column("k").to_numpy().astype(np.int64), kind="stable")[:limit or n]
     assert got.tolist() == want.tolist()
+    assert sort_check.gpu_sort_fallbacks == before + 1
+
+
+def test_the_backstop_counts_each_redone_sort_and_warns_once_per_kind(monkeypatch):
+    import warnings
+    from mxframe import sort_check
+    monkeypatch.setattr(sort_check, "_WARNED", set())
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        sort_check.warn_fallback()                                  # the radix sort's
+        sort_check.warn_fallback("the GPU sort returned a wrong order")
+        sort_check.warn_fallback()
+        sort_check.warn_fallback("the GPU sort returned a wrong order")
+    assert [str(x.message).split(";")[0] for x in w] == [
+        "mxframe: radix sort returned an unsorted order", "mxframe: the GPU sort returned a wrong order"]

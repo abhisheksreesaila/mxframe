@@ -154,7 +154,7 @@ def main():
     st = gen.stats(os.path.join(ROOT, "data", "tpch_sf1"))
     name = a.name or f"random-sf{a.sf}{'-shuffled' if a.shuffle else ''}"
     os.environ["MXBENCH_DEVICE"] = a.device
-    engines = a.engines.split(",")
+    engines = sorted(a.engines.split(","), key=lambda e: e != "duckdb")     # the reference first
     tmp = tempfile.mkdtemp(prefix="mxrand-")
     rows = []
     for seed in range(a.seed0, a.seed0 + a.n):

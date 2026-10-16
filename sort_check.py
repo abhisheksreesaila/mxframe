@@ -10,7 +10,8 @@ import warnings
 
 import numpy as np
 
-_WARNED = False
+_WARNED = set()
+gpu_sort_fallbacks = 0      # how many GPU top-k sorts were redone on the CPU (provenance reads the delta)
 
 
 def is_sorted_permutation(keys, idx) -> bool:
@@ -24,9 +25,9 @@ def is_sorted_permutation(keys, idx) -> bool:
 
 
 def warn_fallback(what="radix sort returned an unsorted order") -> None:
-    global _WARNED
-    if not _WARNED:
-        _WARNED = True
+    """One warning per kind of failure (the radix sort and the GPU sort do not share it)."""
+    if what not in _WARNED:
+        _WARNED.add(what)
         warnings.warn(f"mxframe: {what}; using np.argsort (please report)",
                       RuntimeWarning, stacklevel=3)
 

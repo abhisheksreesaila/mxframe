@@ -18,7 +18,7 @@ from . import spec
 
 CSV_FIELDS = ["engine", "sf", "query", "import_ms", "first_ms", "repeat_ms", "rows", "correct",
               "max_rel_err", "verdict", "repeat_verdict", "load1", "error", "repeat_note",
-              "compare_note", "mode", "load_ms", "paths"]
+              "compare_note", "mode", "load_ms", "paths", "repeat_paths"]
 _FLOATS = ("import_ms", "first_ms", "repeat_ms", "max_rel_err", "load1", "load_ms")
 MODES = ("user-felt", "engine")
 MX = ["mx-cpu", "mx-gpu", "mx-auto"]

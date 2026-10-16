@@ -96,16 +96,8 @@ def main() -> None:
         if modname == "q_mx":
             import mxframe
             out["mxframe_path"] = os.path.dirname(os.path.abspath(mxframe.__file__))
-            # F-055: which path each compute() took (a "correct" GPU result that ran on the CPU proves nothing)
-            from mxframe.lazy_frame import LazyFrame
-            _compute = LazyFrame.compute
-
-            def _recording(self, *args, **kw):
-                r = _compute(self, *args, **kw)
-                p = self.last_compile_provenance
-                prov.append(f"{p.get('path')}@{p.get('device')}" + ("(gpu_declined)" if p.get("gpu_declined") else ""))
-                return r
-            LazyFrame.compute = _recording
+            from tpch_user import provenance        # F-055: which path each compute() took
+            prov = provenance.install()
 
         engine_only = a.mode == "engine"
 
@@ -131,7 +123,7 @@ def main() -> None:
         first_ms = (time.perf_counter() - t0) * 1000.0
         out["first_ms"] = first_ms
         if prov:
-            out["paths"] = " ".join(f"{k}x{prov.count(k)}" for k in dict.fromkeys(prov))
+            out["paths"] = provenance.summary(prov)
             del prov[:]
 
         import pyarrow.parquet as pq
@@ -151,11 +143,14 @@ def main() -> None:
                     gc.collect()
                     tables, _ = load()
                     extra["repeat_reloaded"] = True
+                del prov[:]
                 t0 = time.perf_counter()
                 res = timed()
                 repeat_ms = (time.perf_counter() - t0) * 1000.0
                 # verified by the parent like the first result (written outside the clock)
                 pq.write_table(canonicalize(mod.to_arrow(res), spec.OUTPUT[a.query]), a.result + ".repeat")
+                if prov:
+                    extra["repeat_paths"] = provenance.summary(prov)
                 emit({"repeat_ms": repeat_ms, "repeat_written": True, **extra})
             except BaseException as e:  # noqa: BLE001
                 emit({"repeat_ms": None, "repeat_note": f"repeat failed: {type(e).__name__}: {str(e)[:200]}"})
