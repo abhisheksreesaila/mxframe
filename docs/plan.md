@@ -453,9 +453,9 @@ Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
 - [x] fixes it found: native top-k for ORDER BY ... LIMIT (a random top-N took 543 ms, now 14), native filter for WHERE-only plans, and a harness bug: DuckDB imported pyarrow inside its first query (~70 ms), which had inflated every DuckDB time
 - findings (honest): vs Polars, MXFrame is faster on most random queries (geo. mean 1.0-2.7x) and all 21 verified TPC-H queries at SF10. vs DuckDB, once its import is staged: DuckDB is faster on most random queries (MXFrame 0.63-0.91x geo. mean) and on 13 of 22 TPC-H queries at SF10 (MXFrame's 22-query total is still lower, 3.27 s vs 5.31 s, from Q21 / Q9 / Q13 / Q1); on shuffled tables DuckDB's SF10 total is lower (5.78 s vs 8.64 s: Q21 4.98 s vs 2.88, Q9, Q18) -> F-046
 
-## F-045 ORDER BY ties outside the native executor [todo]
+## F-045 ORDER BY ties outside the native executor [review]
 Needs: none · Found by the F-043 review
-- [ ] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks)
+- [x] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks). Native order: ORDER BY columns, then every group key ascending (strings by bytes). `GraphCompiler._key_tiebreak` appends the keys to a Sort directly above an Aggregate for every non-native path (fused, kernels, GPU, null-key, base compiler); `tests/test_orderby_ties.py`
 
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
 Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong baseline). General fixes only; every slice measured on TPC-H (stored and shuffled) and the random suite, and must not slow any other query. MojoFrame (illinoisdata/MojoFrame, arXiv 2505.04080) checked: its techniques (integer ids for low-cardinality strings, tuple-hash group-by, factorize-then-join) are already covered here; the slices below follow the database literature instead
