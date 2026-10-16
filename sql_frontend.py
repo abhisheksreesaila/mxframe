@@ -383,6 +383,8 @@ class _SQLTranslator:
             same = len(self._conj) == n_conj and all(a is b for a, b in zip(self._conj, _conjuncts(where.this)))
             plan = self._where(plan, where.this if same else _and_all(self._conj))
 
+        self._expand_stars(node)
+
         for o in (node.args.get("order").expressions if node.args.get("order") else []):
             if o.args.get("nulls_first"):
                 raise NotImplementedError("ORDER BY ... NULLS FIRST is not supported (NULLs sort last, as in DuckDB's default)")
@@ -400,6 +402,7 @@ class _SQLTranslator:
 
         final_proj = None
         names = None
+        alias_out: dict = {}
         sort_cols: dict = {}
         if group_node or has_aggs:
             plan, final_proj = self._build_aggregate(plan, node, group_node, having)
@@ -414,11 +417,9 @@ class _SQLTranslator:
                 for p, nm in zip(proj, names):
                     if nm is not None and nm != (p._alias or (p.args[0] if p.op == "col" else None)):
                         p.alias(nm)
-                if len(non_star) < len(node.expressions):
-                    if node.args.get("order"):
-                        raise ValueError("ORDER BY together with * mixed with other SELECT items is not supported "
-                                         "(list the columns, or use SELECT * alone)")
-                    names = None                       # a * shifts the positions
+                # ORDER BY a name two output columns share takes the aliased one (as DuckDB does)
+                alias_out = {e.alias.lower(): nm for e, nm in zip(non_star, names)
+                             if isinstance(e, sge.Alias) and e.alias.lower() != nm}
                 hidden, sort_cols = self._hidden_sort_keys(node, non_star, names, distinct is not None) if names else ([], {})
                 plan = Project(plan, proj + [ex.alias(nm) for nm, ex in hidden])
                 if hidden:                             # carried to the sort, dropped after it
@@ -436,7 +437,9 @@ class _SQLTranslator:
                 for o in order_node.expressions:
                     i = _ordinal(o.this, len(node.expressions))
                     ref = o.this
-                    if i is None and isinstance(ref, sge.Column) and ref.name.lower() in (names or []):
+                    if i is None and isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in alias_out:
+                        by.append(col(alias_out[ref.name.lower()]))
+                    elif i is None and isinstance(ref, sge.Column) and ref.name.lower() in (names or []):
                         by.append(col(ref.name.lower()))          # a SELECT output name
                     elif i is None:
                         ex = self._expr(o.this)
@@ -457,6 +460,41 @@ class _SQLTranslator:
         if final_proj:
             plan = Project(plan, final_proj)
         return plan
+
+    def _expand_stars(self, node: sge.Select) -> None:
+        """``*`` and ``t.*`` next to other SELECT items become the columns they stand for, in place and in
+        order (ORDER BY positions count them). A lone ``*`` stays: the plan needs no projection for it."""
+        items = list(node.expressions)
+
+        def table_star(e):
+            return isinstance(e, sge.Column) and isinstance(e.this, sge.Star)
+        if not any(isinstance(e, sge.Star) or table_star(e) for e in items) \
+                or (len(items) == 1 and isinstance(items[0], sge.Star)):
+            return
+        out = []
+        for e in items:
+            star = e if isinstance(e, sge.Star) else e.this if table_star(e) else None
+            if star is None:
+                out.append(e)
+                continue
+            if any(star.args.get(k) for k in ("except_", "replace", "rename")):
+                raise NotImplementedError("* EXCLUDE / REPLACE / RENAME next to other SELECT items is not supported "
+                                          "(list the columns)")
+            if isinstance(e, sge.Star):
+                cols, table = self._cur_cols, None
+            else:
+                table = e.table.lower()
+                if table not in {a for a, _ in self._table_cols}:
+                    raise ValueError(f"{e.sql(dialect='duckdb')}: unknown table {table!r} in the FROM clause")
+                if len(self._table_cols) == 1:
+                    cols = self._cur_cols
+                elif self._alias_schema.get(table) is not None:
+                    cols = self._alias_schema[table].names
+                else:
+                    raise NotImplementedError(f"{table}.*: the columns of this FROM item are not known, list them")
+            out += [sge.Column(this=sge.to_identifier(c), table=sge.to_identifier(table) if table else None)
+                    for c in cols]
+        node.set("expressions", out)
 
     def _hidden_sort_keys(self, node: sge.Select, items, names, distinct: bool):
         """ORDER BY keys of a plain SELECT that are not output columns: (the extra columns to carry

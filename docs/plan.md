@@ -837,10 +837,11 @@ Found by the F-083 review (2026-10-16); a silent wrong answer on main
 - [x] `ORDER BY c, i LIMIT 3 OFFSET 2` returned the first 3 rows (OFFSET dropped). `Limit` has an `offset` (default 0; `LazyFrame.limit(n, offset=0)`); OFFSET without LIMIT keeps every later row. `CustomOpsCompiler.compile_and_run` runs a top-level OFFSET window as `Limit(offset + n)` (so Sort + Limit still reach the top-n heaps, the native filter top-k and the aggregate top-k with k = offset + n) and cuts the first `offset` rows off the result; an OFFSET window under another Sort / Limit or under a Filter / Project / Aggregate runs first and is replaced by its table. Correlated subqueries still reject OFFSET
 - [x] DuckDB-checked tests (`tests/test_sql_offset.py`): OFFSET with and without LIMIT, ORDER BY ties broken by a unique key, hidden sort key, group-by, DISTINCT, join, FROM subqueries, CTEs, IN / NOT IN subqueries (also the hidden-key form), OFFSET past the end, LIMIT 0, no ORDER BY, DataFrame `limit(n, offset)`, a gpu case; top-n structure (sort `topk` and heap k = limit + offset); 53 of 62 failed before
 
-## F-088 SELECT *, expr returns only the expression [todo]
+## F-088 SELECT *, expr returns only the expression [review]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
-- [ ] `SELECT *, a+1 AS x FROM t` returns only `x`; DuckDB returns every column then `x`. Expand `*` in place among other select items (and `t.*`), with or without ORDER BY (F-083 made the ORDER BY form raise; replace that error with the real expansion)
-- [ ] DuckDB-checked tests: `*, expr`, `expr, *`, `t.*, u.c` over a join, with WHERE / ORDER BY / LIMIT, name clash between `*` and an alias; fails before
+- [x] `SELECT *, a+1 AS x FROM t` returned only `x`. `*` and `t.*` next to other items now expand in place (`_SQLTranslator._expand_stars`: the join output columns, or the table's own), so ORDER BY positions, hidden sort keys, DISTINCT, LIMIT / OFFSET work as for listed columns; F-083's "not supported" error is gone. A lone `*` is unchanged. `* EXCLUDE / REPLACE / RENAME` next to other items raises. Name clash with an alias: both columns are returned (second renamed `a_1`, as DuckDB's default connection does) and `ORDER BY a` takes the aliased one, `ORDER BY t.a` the table's column, like DuckDB
+- [x] DuckDB-checked tests (`tests/test_sql_star_mixed.py`): `*, expr`, `expr, *`, `t.*` over joins (JOIN ON and comma), WHERE / ORDER BY (alias, position, hidden key) / LIMIT / OFFSET, DISTINCT, subqueries / CTE / IN, name clashes, a gpu case; 48 of 49 failed before. `* + GROUP BY` still raises
+- Known gap (not this ticket): `w.*` over a JOIN where a non-key column name exists in both tables raises "the name exists in more than one joined table" (the existing `t.col` rule), not a wrong answer
 
 ## F-089 GPU ORDER BY ... LIMIT 0 crashes [todo]
 Found by the F-083 review (2026-10-16)
