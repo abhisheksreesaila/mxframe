@@ -38,8 +38,8 @@ def test_all_seven_libraries_are_there():
 
 @pytest.mark.parametrize("lib", LIBS, ids=lambda p: p.name)
 def test_runpath_is_relative_to_the_library(lib):
-    assert runpath(lib) == ["$ORIGIN/../../modular/lib", "$ORIGIN/../../../..",
-                            "$ORIGIN/../.pixi/envs/default/lib"]
+    assert runpath(lib) == ["$ORIGIN/../.pixi/envs/default/lib", "$ORIGIN/../../modular/lib",
+                            "$ORIGIN/../../../.."]
 
 
 def _env_lib() -> Path:
@@ -78,3 +78,25 @@ def test_the_same_copy_fails_without_the_runtime_so_the_check_means_something(tm
     code = f"import ctypes; ctypes.CDLL({str(kernels / 'libmxexec_cpu.so')!r})"
     r = subprocess.run([system_python, "-I", "-c", code], capture_output=True, text=True, env={})
     assert r.returncode != 0 and "libKGENCompilerRTShared.so" in r.stderr
+
+
+def test_a_checkout_prefers_its_own_pixi_env_over_a_runtime_planted_next_to_it(tmp_path):
+    """A checkout at /tmp/mxframe must not load /tmp/modular/lib (writable by anyone) when its
+    own pixi env has the runtime."""
+    system_python = shutil.which("python3", path="/usr/bin")
+    if system_python is None or not all((_env_lib() / n).exists() for n in RUNTIME):
+        pytest.skip("needs /usr/bin/python3 and the Mojo runtime in this environment")
+    repo = tmp_path / "mxframe"
+    (repo / "kernels_aot").mkdir(parents=True)
+    own = repo / ".pixi" / "envs" / "default" / "lib"
+    planted = tmp_path / "modular" / "lib"
+    own.mkdir(parents=True)
+    planted.mkdir(parents=True)
+    for n in RUNTIME:
+        shutil.copy(_env_lib() / n, own / n)
+    (planted / "libKGENCompilerRTShared.so").write_bytes(b"not an ELF file: the attacker's code")
+    lib = repo / "kernels_aot" / "libmxexec_cpu.so"
+    shutil.copy(KERNELS / lib.name, lib)
+    code = f"import ctypes; ctypes.CDLL({str(lib)!r}); print('loaded')"
+    r = subprocess.run([system_python, "-I", "-c", code], capture_output=True, text=True, env={})
+    assert (r.stdout.strip(), r.returncode) == ("loaded", 0), r.stderr
