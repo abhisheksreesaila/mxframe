@@ -33,16 +33,33 @@ def _big():
                      "v": pa.array(r.integers(1, 100, n), pa.int64())})
 
 
+def _typed():
+    """Integer widths and signedness: int32 and uint64 columns, values past 2**53 and 2**63."""
+    big = 2 ** 60 + 3
+    return pa.table({
+        "i": pa.array(range(8), pa.int64()),
+        "i32": pa.array([7, -7, 0, None, 2 ** 30, -(2 ** 30), 10, 3], pa.int32()),
+        "d32": pa.array([3, 0, -3, 2, None, 5, 0, 1], pa.int32()),
+        "u64": pa.array([2 ** 64 - 1, 2 ** 63, 5, None, 2 ** 63 + 7, 0, 18, 2 ** 64 - 2], pa.uint64()),
+        "s64": pa.array([10, -10, 3, 7, 0, -1, None, 2 ** 62], pa.int64()),
+        "b64": pa.array([big, -big, 2 ** 53 + 1, -(2 ** 53) - 1, 2 ** 62, 9, None, 2 ** 63 - 2], pa.int64()),
+    })
+
+
 def _norm(rows):
     return [tuple("nan" if isinstance(v, float) and math.isnan(v) else v for v in row) for row in rows]
 
 
 def _check(q, device="cpu"):
-    t, big = _t(), _big()                                       # noqa: F841 (DuckDB finds them by name)
+    t, big, ty = _t(), _big(), _typed()                         # noqa: F841 (DuckDB finds them by name)
     exp = duckdb.sql(q).arrow()
     exp = exp.read_all() if isinstance(exp, pa.RecordBatchReader) else exp
-    got = mx.sql(q, t=t, big=big).compute(device=device)
+    got = mx.sql(q, t=t, big=big, ty=ty).compute(device=device)
     assert got.column_names == exp.column_names, q
+    for g, e in zip(got.schema, exp.schema):                    # 1 == 1.0 in Python: compare the kinds too
+        if pa.types.is_integer(e.type) or pa.types.is_floating(e.type):
+            assert (pa.types.is_integer(g.type), pa.types.is_floating(g.type)) == \
+                (pa.types.is_integer(e.type), pa.types.is_floating(e.type)), (q, g, e)
     assert _norm(zip(*got.to_pydict().values())) == _norm(zip(*exp.to_pydict().values())), q
 
 
@@ -60,8 +77,8 @@ QUERIES = [
     "SELECT i, x % 2.5 AS r FROM t ORDER BY i",
     "SELECT i, a % y AS r FROM t ORDER BY i",                   # int % float
     "SELECT i, x % b AS r FROM t ORDER BY i",                   # float % int
-    "SELECT i, (a + 1) % (b - 1) AS r FROM t ORDER BY i",
-    "SELECT i, a % b + 1 AS r FROM t ORDER BY i",
+    "SELECT i, (a + b) % (b - a) AS r FROM t ORDER BY i",
+    "SELECT i, a % b + b AS r FROM t ORDER BY i",
     "SELECT i, a % b % 4 AS r FROM t ORDER BY i",
     # WHERE
     "SELECT i FROM t WHERE a % 2 = 0 ORDER BY i",
@@ -90,6 +107,45 @@ QUERIES = [
     # ORDER BY an expression, DISTINCT
     "SELECT i FROM t ORDER BY a % 3, i",
     "SELECT DISTINCT a % 4 AS m FROM t ORDER BY m",
+    # computed integers stay integers: from a subquery, an aggregate, a cast column
+    "SELECT i, m % 0 AS r FROM (SELECT i, i32 + s64 AS m FROM ty) ORDER BY i",
+    "SELECT i, m % 3 AS r FROM (SELECT i, i32 + d32 AS m FROM ty) ORDER BY i",
+    "SELECT i, m % d32 AS r FROM (SELECT i, i32 - s64 AS m, d32 FROM ty) ORDER BY i",
+    "SELECT sum(i32) % 2 AS r FROM ty",
+    "SELECT sum(i32) % 0 AS r FROM ty",
+    "SELECT i % 3 AS g, sum(s64) % 4 AS r FROM ty GROUP BY i % 3 ORDER BY g",
+    "SELECT count(*) % 3 AS r FROM big",
+    "SELECT i, i32 % 0 AS r FROM ty ORDER BY i",
+    "SELECT i, i32 % d32 AS r FROM ty ORDER BY i",
+    "SELECT i, i32 % 7 AS r FROM ty ORDER BY i",
+    "SELECT i, 100 % d32 AS r FROM ty ORDER BY i",
+    # past 2**53 and 2**63
+    "SELECT i, b64 % 10 AS r FROM ty ORDER BY i",
+    "SELECT i, b64 % -7 AS r FROM ty ORDER BY i",
+    "SELECT i, b64 % s64 AS r FROM ty ORDER BY i",
+    "SELECT i, (b64 - i) % 10 AS r FROM ty ORDER BY i",
+    "SELECT i, u64 % 10 AS r FROM ty ORDER BY i",
+    "SELECT i, u64 % 1000000007 AS r FROM ty ORDER BY i",
+    "SELECT i, u64 % u64 AS r FROM ty ORDER BY i",
+    "SELECT i, MOD(u64, 3) AS r FROM ty ORDER BY i",
+    "SELECT i FROM ty WHERE u64 % 10 = 5 ORDER BY i",
+    "SELECT u64 % 10 AS g, count(*) AS n FROM ty GROUP BY u64 % 10 ORDER BY g",
+    # a decimal literal is exact in DuckDB, also next to integers past 2**53; a decimal zero divisor is NULL
+    "SELECT i, b64 % 2.5 AS r FROM ty ORDER BY i",
+    "SELECT i, b64 % 0.1 AS r FROM ty ORDER BY i",
+    "SELECT i, MOD(i32, 0.0) AS r FROM ty ORDER BY i",
+    "SELECT i, i32 % 0.5 AS r FROM ty ORDER BY i",
+    "SELECT i, 7.5 % d32 AS r FROM ty ORDER BY i",
+    "SELECT i, -7.5 % s64 AS r FROM ty ORDER BY i",
+    "SELECT i, i32 % -2.5 AS r FROM ty ORDER BY i",
+    "SELECT i FROM ty WHERE b64 % 2.5 = 0.5 ORDER BY i",
+    "SELECT i, x % 0.0 AS r FROM t ORDER BY i",                  # a double column stays IEEE: NaN
+    # mixed signed / unsigned
+    "SELECT i, u64 % s64 AS r FROM ty ORDER BY i",
+    "SELECT i, s64 % u64 AS r FROM ty ORDER BY i",
+    "SELECT i, u64 % -10 AS r FROM ty ORDER BY i",
+    "SELECT i, u64 % i32 AS r FROM ty ORDER BY i",
+    "SELECT i, u64 % b64 AS r FROM ty ORDER BY i",
 ]
 
 

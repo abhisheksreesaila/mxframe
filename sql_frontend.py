@@ -1493,26 +1493,15 @@ class _SQLTranslator:
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
 
     def _mod_operand(self, node: sge.Expression) -> "Expr":
-        """An operand of ``%``. Arithmetic over integer columns and integer literals stays integer (``_float_expr``
-        would make ``(a + 1) % (b - 1)`` a float, and a float ``% 0`` is NaN where an integer one is NULL)."""
-        def ints(n):
-            n = _unparen(n)
-            if isinstance(n, sge.Literal):
-                return lit(int(n.this)) if not n.is_string and str(n.this).isdigit() else None
-            if isinstance(n, sge.Neg):
-                v = ints(n.this)
-                return None if v is None else lit(0) - v if v.op != "lit" else lit(-v.args[0])
-            if isinstance(n, sge.Column):
-                t = self._col_type(n)
-                return self._expr(n) if t is not None and pa.types.is_integer(t) else None
-            if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Mod)):
-                l, r = ints(n.this), ints(n.expression)
-                if l is None or r is None:
-                    return None
-                return {sge.Add: l + r, sge.Sub: l - r, sge.Mul: l * r, sge.Mod: l % r}[type(n)]
-            return None
-        out = ints(node)
-        return out if out is not None else self._float_expr(node)
+        """An operand of ``%``: a numeric literal (negated or not) stays a plain constant, an integer one an integer, anything else is evaluated
+        as it is, so ``np_arrow.modulo`` picks integer or float arithmetic from the real arrays."""
+        n = _unparen(node)
+        neg = isinstance(n, sge.Neg)
+        n = _unparen(n.this) if neg else n
+        if isinstance(n, sge.Literal) and not n.is_string:
+            v = int(n.this) if str(n.this).isdigit() else float(n.this)
+            return lit(-v if neg else v)
+        return self._expr(node)
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
         """Like _expr but promotes integer literals to float for arithmetic use.

@@ -440,32 +440,66 @@ def checked_arith(op, lhs, rhs):
 
 def modulo(lhs, rhs):
     """SQL ``lhs % rhs`` as DuckDB computes it: C ``fmod``, so the sign follows the dividend (-7 % 3 = -1, 7 % -3
-    = 1, not NumPy's ``%``), NULL when either side is NULL or an integer divisor is 0 (a float one gives NaN), NaN stays
-    NaN, ``x % inf`` is x. Operands are arrays or scalars; integers give int64, anything else float64 (float32
-    when every operand is). ``INT64_MIN % -1`` raises like DuckDB's division."""
+    = 1, not NumPy's ``%``), NULL when either side is NULL or an integer divisor is 0 (a float one gives NaN), NaN
+    stays NaN, ``x % inf`` is x. Operands are arrays or scalars, and the arrays decide the arithmetic: integers
+    stay integers (the operands' common type; int64 when signedness differs), exact for uint64 too (a mix of
+    uint64 and signed values is computed exactly and must fit int64 or uint64, or it raises); anything with a
+    float is float64 (float32 when both are float32). ``INT64_MIN % -1`` raises like DuckDB's division."""
     def parts(x):
         if isinstance(x, pa.Scalar):
-            return (np.array([x.as_py()]) if x.is_valid else np.array([0], np.int64)), np.array([x.is_valid]), x.type
+            v = x.as_py() if x.is_valid else 0
+            return np.array([v]), np.array([x.is_valid]), x.type, True
         a = combine(x)
         valid = to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else np.ones(len(a), bool)
         if pa.types.is_floating(a.type):
-            return _float_values(a), valid, a.type
-        return to_numpy(pc.fill_null(a, scalar(0, type=a.type))), valid, a.type
-    (a, av, at), (b, bv, bt) = parts(lhs), parts(rhs)
-    floats = pa.types.is_floating(at) or pa.types.is_floating(bt) or a.dtype.kind == "f" or b.dtype.kind == "f"
+            return _float_values(a), valid, a.type, False
+        return to_numpy(pc.fill_null(a, scalar(0, type=a.type))), valid, a.type, False
+    (a, av, at, a_sc), (b, bv, bt, b_sc) = parts(lhs), parts(rhs)
     valid = av & bv
-    with np.errstate(all="ignore"):
-        if floats:
-            out_t = pa.float32() if all(pa.types.is_float32(t) for t in (at, bt) if pa.types.is_floating(t)) \
-                and (pa.types.is_floating(at) and pa.types.is_floating(bt)) else pa.float64()
+    n = max(len(a), len(b))
+    lit_a = a_sc and a.dtype.kind == "f" and b.dtype.kind in "iu" and bool(np.isfinite(a[0]))
+    lit_b = b_sc and b.dtype.kind == "f" and a.dtype.kind in "iu" and bool(np.isfinite(b[0]))
+    if lit_a or lit_b:                       # an integer array against a decimal literal (2.5): DuckDB is exact
+        from decimal import Decimal
+        d = Decimal(repr(float((a if lit_a else b)[0])))
+        scale = 10 ** max(-d.as_tuple().exponent, 0)
+        k = int(d * scale)
+        ints = [int(x) * scale for x in np.broadcast_to((b if lit_a else a).astype(object), (n,))]
+        num, den = ([k] * n, ints) if lit_a else (ints, [k] * n)
+        valid = valid & np.array([y != 0 for y in den])
+        rem = [(abs(x) % (abs(y) or 1)) * (-1 if x < 0 else 1) / scale for x, y in zip(num, den)]
+        out_t, res = pa.float64(), np.array(rem, np.float64)
+    elif a.dtype.kind == "f" or b.dtype.kind == "f":
+        out_t = pa.float32() if pa.types.is_float32(at) and pa.types.is_float32(bt) else pa.float64()
+        with np.errstate(all="ignore"):
             res = np.fmod(a.astype(np.float64), b.astype(np.float64))
+    else:
+        valid = valid & (b != 0)
+        arrays = [t for t, sc in ((at, a_sc), (bt, b_sc)) if not sc]
+        signed = [pa.types.is_signed_integer(t) for t in arrays]
+        if a.dtype == np.uint64 or b.dtype == np.uint64:           # exact in uint64 unless a signed value is in play
+            a_u = a.dtype == np.uint64 or (a_sc and a[0] >= 0)
+            b_u = b.dtype == np.uint64 or (b_sc and b[0] >= 0)
+            if a_u and b_u and not any(signed):
+                out_t, res = pa.uint64(), np.fmod(a.astype(np.uint64), np.where(valid, b, 1).astype(np.uint64))
+            else:
+                ints = [(0 if not v else int(x)) for x, v in zip(np.broadcast_to(a.astype(object), (n,)), valid)]
+                den = [(1 if not v else int(y)) for y, v in zip(np.broadcast_to(b.astype(object), (n,)), valid)]
+                rem = [(abs(x) % abs(y)) * (-1 if x < 0 else 1) for x, y in zip(ints, den)]
+                lo, hi = (min(rem, default=0), max(rem, default=0))
+                if lo >= -(2 ** 63) and hi < 2 ** 63:
+                    out_t, res = pa.int64(), np.array(rem, np.int64)
+                elif lo >= 0 and hi < 2 ** 64:
+                    out_t, res = pa.uint64(), np.array(rem, np.uint64)
+                else:
+                    raise OverflowError("Overflow in modulo of UINT64 and a signed integer")
         else:
-            valid = valid & (b != 0)
             a, b = a.astype(np.int64), np.where(valid, b, 1).astype(np.int64)
             if np.any(valid & (a == np.iinfo(np.int64).min) & (b == -1)):
                 raise OverflowError("Overflow in division of INT64")
-            out_t, res = pa.int64(), np.fmod(a, b)
-    n = max(len(a), len(b))
+            res = np.fmod(a, b)
+            same_sign = bool(arrays) and (all(signed) or not any(signed))
+            out_t = max(arrays, key=lambda t: t.bit_width) if same_sign else pa.int64()
     return array(np.ma.array(np.broadcast_to(res, (n,)).copy(), mask=~np.broadcast_to(valid, (n,))), type=out_t)
 
 
