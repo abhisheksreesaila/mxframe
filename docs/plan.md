@@ -591,6 +591,12 @@ Needs: F-033 · From the F-033 review: SQL-phrased Q11, Q15, Q18, Q21, Q22 get n
 From the F-033 review: `libmxpipeline_cpu.so` was stale against `pipeline_cpu.mojo`; CI only builds `libmxkernels_aot.so` and the wheel ships the committed `.so` files
 - [x] store a source hash next to each committed `.so` at build time; a test fails when a `.mojo` source changed without its library being rebuilt (`kernels_aot/<lib>.so.sources.json` from `scripts/record_build_hash.py`, called by every build; `tests/test_kernel_hashes.py` and a CI step check it; after merging source changes run `bash scripts/build_pipeline.sh` with no argument)
 
+## F-067 Reproducible float aggregates on the GPU and across a CPU+GPU split [todo]
+Needs: F-064 · From the F-064 review (2026-10-16)
+- [ ] `pipeline_gpu.mojo` modes 1 and 2 (shared and global float64 atomics) and `kernels_aot_gpu.mojo` `_atomic_fold` / `red_add_global` (float32) add floats with atomics: results differ in the last bits per run; `coproc.py` splits rows between CPU and GPU and merges partials, so a split adds another order
+- [ ] per-block GPU partials combined in block order (behind a switch if it costs; measure); `auto` sends both sides of a self-comparison (Q15 shape) to the same device
+- [ ] the F-064 tests extended to `device="gpu"` and a forced split
+
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
