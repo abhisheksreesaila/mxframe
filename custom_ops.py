@@ -1867,8 +1867,6 @@ class CustomOpsCompiler(GraphCompiler):
         has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
             return "", False
-        if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
-            return "a min / max of a date or timestamp keeps its type (Arrow)", False
         from .pipeline_program import int_sum_inexact
         exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
         if not exact_sum:                  # F-090: float64 rounds the MIN / MAX of an integer past 2^53
@@ -1881,6 +1879,8 @@ class CustomOpsCompiler(GraphCompiler):
                         if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
                             exact_sum = True
                             break
+        if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
+            return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
             "an integer sum could pass 2^53, or a min / max past it (computed exactly in int64)" if exact_sum else "")
         return why, exact_sum

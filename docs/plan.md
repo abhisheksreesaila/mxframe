@@ -889,6 +889,7 @@ Found by the F-086 developer (2026-10-16)
 Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+- Note: a date64 input keeps date64 (DuckDB returns date32); a tz timestamp keeps its zone.
 
 ## F-094 SQL modulo operator [done]
 Found by the F-087 developer (2026-10-16)
@@ -968,4 +969,5 @@ Seen three times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run):
 Found by the F-093 developer (2026-10-16)
 - [ ] `TIMESTAMP '2024-01-01 10:00:00'` (and `CAST('...' AS TIMESTAMP)`) is unsupported in the SQL front end (`Unsupported SQL expression type: Cast ... TIMESTAMPNTZ`); map to a timestamp literal compared in the column's unit and zone like DuckDB
 - [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
+- [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
 - [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before

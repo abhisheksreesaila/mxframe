@@ -562,7 +562,7 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
         if op == "sum" and pa.types.is_integer(a.type):
             out.append(array(np.ma.array(_int_group_sum(a, valid, g, n_groups), mask=cnt == 0), type=pa.int64()))
             continue
-        if op in ("min", "max") and (pa.types.is_integer(a.type) or pa.types.is_temporal(a.type)):
+        if op in ("min", "max") and (pa.types.is_integer(a.type) or pa.types.is_date(a.type) or pa.types.is_timestamp(a.type)):
             # exact: float64 rounds past 2^53 (F-093: a date / timestamp is its integer storage)
             own = a.type
             if not pa.types.is_integer(own):
