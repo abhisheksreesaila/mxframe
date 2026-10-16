@@ -38,12 +38,14 @@ from .lazy_frame import (
 # public entry point
 # ---------------------------------------------------------------------------
 
-def sql(query: str, **tables: pa.Table) -> LazyFrame:
-    """Run a SQL query against the provided Arrow tables.
+def sql(query: str, **tables) -> LazyFrame:
+    """Run a SQL query against the provided tables.
 
     Args:
         query:   SQL string (DuckDB dialect).
-        **tables: named ``pa.Table`` objects referenced in the query.
+        **tables: named ``pa.Table`` or :class:`LazyFrame` objects referenced in the query. A LazyFrame
+            (``scan_parquet``, ``read_parquet`` or any plan) is used as that table's plan, so scan pushdown
+            (columns, filters, row groups) still applies.
 
     Returns:
         A :class:`LazyFrame` whose ``.compute()`` executes the query.
@@ -675,6 +677,8 @@ class _SQLTranslator:
             avail = list(self._tables.keys()) + list(self._ctes)
             raise ValueError(f"Unknown table {name!r}. Available: {avail}")
         tbl = self._tables[name]
+        if isinstance(tbl, LazyFrame):
+            return tbl.plan, tbl.schema.names
         return Scan(tbl), tbl.schema.names
 
     def _scan(self, table_node: sge.Expression) -> LogicalPlan:
