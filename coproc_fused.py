@@ -329,16 +329,45 @@ def _evict_locked(key) -> Optional[_Entry]:
     return e if e.users == 0 else None
 
 
+_dead_keys: list = []        # keys whose owner died while this thread (or another) held ``_lock``
+
+
 def _evict(key) -> None:
-    with _lock:
-        e = _evict_locked(key)
-        _finalized.discard(key)
-    if e is not None:
+    """Weakref finalizer for a cache key's owner.
+
+    It runs on whatever thread drops the last reference or runs the cyclic GC, and that can be a
+    thread already inside ``with _lock`` (``_start_thread`` holds it across ``Thread.start()``, which
+    allocates): blocking on the non-reentrant lock then waits for itself forever (F-107). So never
+    block here: when the lock is taken, queue the key for ``_drain_evictions`` (run before any lookup
+    of the cache, so a dead owner's entry is never found)."""
+    _dead_keys.append(key)                  # list.append is atomic
+    _drain_evictions(block=False)
+
+
+def _drain_evictions(block: bool = True) -> None:
+    """Evict the keys queued by ``_evict``. Query-side callers (which never hold ``_lock``) block, so a
+    dead owner's entry is gone before its address can be reused; the finalizer itself does not."""
+    if not _dead_keys:
+        return
+    if not _lock.acquire(blocking=block):
+        return
+    try:
+        freeable = []
+        while _dead_keys:
+            key = _dead_keys.pop()
+            e = _evict_locked(key)
+            _finalized.discard(key)
+            if e is not None:
+                freeable.append(e)
+    finally:
+        _lock.release()
+    for e in freeable:
         _free_entry(e)
 
 
 def clear_residency() -> None:
     wait_for_uploads(30)
+    _drain_evictions()
     with _lock:
         freeable = [e for e in (_evict_locked(k) for k in list(_cache)) if e is not None]
         _failed.clear()
@@ -366,6 +395,7 @@ def wait_for_uploads(timeout: float = 30.0) -> bool:
 
 
 def _acquire(key) -> Optional[_Entry]:
+    _drain_evictions()
     with _lock:
         e = _cache.get(key)
         if e is not None:
@@ -390,6 +420,7 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes, key, sig, by_source=Fal
     query never waits for GPU initialisation. An entry keyed by a file's identity holds no host
     buffers (a later read of the file brings its own) and lives until evicted or the file changes.
     """
+    _drain_evictions()
     with _lock:
         if key in _cache or key in _inflight or _recently_failed(key):
             return
@@ -497,6 +528,7 @@ def resident_for(source, columns, gkeys) -> bool:
     ``source`` is ``SplitInputs.source``; the answer decides whether auto may split the query (the exact
     key is checked again when it runs)."""
     columns, gkeys = frozenset(columns), tuple(gkeys)
+    _drain_evictions()
     with _lock:
         return any(e.sig and e.sig[0] == source and e.sig[1] == columns and e.sig[2] == gkeys
                    for e in _cache.values())

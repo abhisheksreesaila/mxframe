@@ -959,7 +959,12 @@ Found by the F-082 developer (2026-10-16)
 - [ ] a float32 column compared with a float64 literal casts the literal to float32: `x between -1e-30 and 1e-30` keeps the row holding float32(1e-30), DuckDB drops it. Compare in the wider type (widen the column, as DuckDB does) on every path (native bytecode, Arrow, GPU)
 - [ ] DuckDB-checked tests for both; fails before
 
-## F-107 Test process hangs on a futex while other suites share the GPUs [todo]
+## F-107 Test process hangs on a futex while other suites share the GPUs [review]
 Seen three times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes
-- [ ] capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
-- [ ] from the dump, find the waiting lock(s); if it is ours, fix the lock order and add a stress test (concurrent queries + background upload + warm-up); if it is the driver under cross-process contention, document it and make the GPU tests serialize on a file lock
+- [x] capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
+- [x] from the dump, find the waiting lock(s); if it is ours, fix the lock order and add a stress test (concurrent queries + background upload + warm-up); if it is the driver under cross-process contention, document it and make the GPU tests serialize on a file lock
+
+Finding (no dump was needed; found by reading the lock sites, reproduced deterministically): `coproc_fused._evict`, the `weakref.finalize` callback on a cached input's owner, took the non-reentrant `coproc_fused._lock`. A finalizer runs on whichever thread drops the last reference or runs the cyclic GC, and a GC can start at any allocation, including inside `with _lock:` (`_start_thread` holds it across `Thread.start()`, which allocates; so does every other locked block). The thread then waits for itself: main thread idle, all other threads parked in `futex_do_wait`, last stack in `try_split` -> thread start. Load only changes when the GC fires. Not the CUDA driver, not cross-process.
+Fix: `_evict` never blocks; it queues the key and evicts at once when the lock is free, else `_drain_evictions()` (blocking, called before every cache lookup: `_acquire`, `_start_upload`, `resident_for`, `clear_residency`) does it, so a dead owner's entry is still never found. Same pattern removed in `aot_kernels._get_cuda_driver` and `gpu_stream._driver` (DeviceArray `__del__` calls them while the init holds their lock): lock-free fast path once built.
+Tests: tests/test_f107_lock_reentry.py (3, child processes with timeouts; two hung before the fix).
+
