@@ -947,3 +947,9 @@ Found by the F-086 review (2026-10-16); a silent wrong answer on main
 Seen in the F-086 review (2026-10-16)
 - [ ] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
 - [ ] DuckDB-checked tests: string / date / int / mixed-number CASE results, with ELSE and without (NULL), in SELECT / GROUP BY / ORDER BY; fails before
+
+## F-106 SQL float literals: scientific notation and float32 columns [todo]
+Found by the F-082 developer (2026-10-16)
+- [ ] a scientific literal without a dot (`x > 1e-310`, `x < 2E5`) raises ValueError: `sql_frontend` does `lit(int(v)) if "." not in str(v)`. Parse numeric literals by their SQL type (sqlglot's `is_int` / `is_number`), not by looking for a dot
+- [ ] a float32 column compared with a float64 literal casts the literal to float32: `x between -1e-30 and 1e-30` keeps the row holding float32(1e-30), DuckDB drops it. Compare in the wider type (widen the column, as DuckDB does) on every path (native bytecode, Arrow, GPU)
+- [ ] DuckDB-checked tests for both; fails before
