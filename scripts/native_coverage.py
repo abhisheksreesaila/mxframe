@@ -1,6 +1,7 @@
 """F-033: which plans reach the native hooks, and why they decline (coverage before scoping a milestone).
 
     pixi run python scripts/native_coverage.py [--sf 1] [--queries 1,2,...]      # TPC-H, one fresh process per query
+    pixi run python scripts/native_coverage.py --sql                             # the same, from the SQL text (scripts/tpch_sql)
 
 Per query it prints one JSON line: every computed plan's path (`provenance`), every native hook call
 (ran, or declined + reason), the PyArrow compute calls on >= 1000 rows that ran (row-level work outside
@@ -93,17 +94,43 @@ def one_tpch(q, sf):
                                   "declines": nx.decline_counts()}), flush=True)
 
 
+def one_sql(q, sf):
+    """F-065: the query's SQL text (scripts/tpch_sql/queries.py) through mx.sql; a query the front end
+    raises on is reported with its error instead of a path."""
+    log, nx = install()
+    from tpch_sql import run as R
+    from tpch_sql.queries import SQL
+    from tpch_user import provenance
+    import mxframe as mx
+    data = str(Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Projects/mxframe/data")) / f"tpch_sf{sf}")
+    tables = R.load_tables(SQL[q], data)
+    prov = provenance.install()
+    nx.reset_decline_counts()
+    log["hooks"].clear()
+    log["arrow"].clear()
+    try:
+        lf = mx.sql(SQL[q], **tables)
+        lf.compute(device="cpu")
+    except Exception as e:                                   # noqa: BLE001
+        print("@@COV " + json.dumps({"q": q, "raised": f"{type(e).__name__}: {str(e).splitlines()[0][:200]}"}), flush=True)
+        return
+    print("@@COV " + json.dumps({"q": q, "paths": prov, "hooks": log["hooks"], "arrow": log["arrow"],
+                                  "declines": nx.decline_counts()}), flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sf", default="1")
     ap.add_argument("--queries", default=",".join(map(str, range(1, 23))))
     ap.add_argument("--one", type=int, help="(internal) run this query in this process")
+    ap.add_argument("--sql", action="store_true", help="run the SQL text of each query through mx.sql")
     a = ap.parse_args()
     if a.one:
-        return one_tpch(a.one, a.sf)
+        return (one_sql if a.sql else one_tpch)(a.one, a.sf)
     env = dict(os.environ, MXFRAME_STRICT_NATIVE="1", CUDA_VISIBLE_DEVICES="-1", PYTHONUNBUFFERED="1")
     for q in map(int, a.queries.split(",")):
-        p = subprocess.run([sys.executable, __file__, "--one", str(q), "--sf", a.sf], capture_output=True, text=True,
+        p = subprocess.run([sys.executable, __file__, "--one", str(q), "--sf", a.sf] + (["--sql"] if a.sql else []),
+                           capture_output=True, text=True,
                            env=env, cwd=ROOT)
         ls = [l for l in p.stdout.splitlines() if l.startswith("@@COV ")]
         print(ls[-1][6:] if ls else json.dumps({"q": q, "error": (p.stderr.strip().splitlines() or ["?"])[-1][:300]}),
