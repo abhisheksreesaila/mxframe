@@ -315,7 +315,25 @@ def _codes(col) -> np.ndarray:
     a = combine(col)
     if pa.types.is_dictionary(a.type):
         a = a.dictionary_decode()
+    a = canonical_floats(a)
     return to_numpy(pc.dictionary_encode(a, null_encoding="encode").indices).astype(np.int64)
+
+
+def canonical_floats(a):
+    """A float array grouped like SQL: -0.0 equals 0.0 and every NaN (any sign or payload) equals
+    every other NaN; NULLs stay NULL. Arrow's dictionary encoding compares floats bit for bit and
+    gave each of those its own group (F-077). Used for the codes only: a group still reports the
+    key value of its first row, which is what DuckDB does too."""
+    if a.type not in (pa.float32(), pa.float64()) or len(a) == 0:
+        return a
+    dt = np.dtype(np.float32 if a.type == pa.float32() else np.float64)
+    x = np.frombuffer(a.buffers()[1], dtype=dt, count=a.offset + len(a))
+    out = x + dt.type(0)                                    # -0.0 + 0.0 is 0.0 (a new array)
+    nan = np.isnan(x)
+    if nan.any():
+        out[nan] = dt.type("nan")
+    return pa.Array.from_buffers(a.type, len(a), [a.buffers()[0], pa.py_buffer(out)],
+                                 null_count=a.null_count, offset=a.offset)
 
 
 def _group_ids(table: pa.Table, cols):

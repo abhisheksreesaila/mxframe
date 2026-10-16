@@ -772,10 +772,11 @@ Needs: F-069 · Found in F-069 review (2026-10-16)
 - [ ] SQL Q10 at SF1 has no PyArrow compute over 1,000 rows (`scripts/native_coverage.py`): the 4 `dictionary_encode` calls over the 57k-row customer string columns (name, address, phone, comment) carried as partner columns are replaced by passing the strings through by row (or encoding once per source, like F-071 did for Q8)
 - [ ] `tests/test_f069_hashed_groups.py` (or a new test) asserts SQL Q10 fully native by the coverage script's rule, fails before
 
-## F-077 A NULL in a float group key: -0.0 and 0.0 are one group, NaNs one group [todo]
+## F-077 A NULL in a float group key: -0.0 and 0.0 are one group, NaNs one group [done]
 Needs: — · Found in F-069 review (2026-10-16); a wrong answer on main before F-069
-- [ ] a float group key with a NULL declines the native path (correct) and the Arrow fallback kept -0.0 and 0.0 (and NaN payloads) as separate groups: 12 groups where DuckDB gives 10 (reproduced through a fused-join partner column). Either the native hashed path takes NULL keys (a NULL group, last in key order like DuckDB) or the fallback canonicalises -0.0 → 0.0 and NaN → one NaN before grouping
-- [ ] test: float key with NULL, -0.0, 0.0, NaN of two payloads, single table and fused partner column, equals DuckDB group count and values; fails before
+- [x] (fallback canonicalises, via `np_arrow.canonical_floats` in `np_arrow._codes` and `arrow_dict.encode_key`; a group reports its first row's value, as DuckDB does) a float group key with a NULL declines the native path (correct) and the Arrow fallback kept -0.0 and 0.0 (and NaN payloads) as separate groups: 12 groups where DuckDB gives 10 (reproduced through a fused-join partner column). Either the native hashed path takes NULL keys (a NULL group, last in key order like DuckDB) or the fallback canonicalises -0.0 → 0.0 and NaN → one NaN before grouping
+- [ ] follow-up (kernel, after F-070 rebuilds the Mojo kernels; not touched here): the native hashed group-by (F-069, no NULL, float64 key) reports +0.0 for a group whose first row is -0.0 and the canonical NaN for a group whose first row is another NaN payload, where DuckDB (and the fused pipeline and the Arrow fallback since F-077) report the first row's bits. The key can't be repaired in `native_exec._wrap_result`: the executor doesn't return each group's first row. Keep the original key bits in the hash records (or the group's first row) and emit those. Pinned by two `xfail(strict=True)` cases in `tests/test_float_key_groups.py::test_group_reports_its_first_rows_bits_without_null[native-*]`; remove the marker when fixed
+- [x] `tests/test_float_key_groups.py`: float key with NULL, -0.0, 0.0, NaN of two payloads, single table and fused partner column, equals DuckDB group count and values; fails before
 
 ## F-078 COUNT(*) on a NULL group key counts the group's rows [done]
 - Finding (2026-10-16): already fixed on main by F-042 (`COUNT(*)` -> `lit(1).count()`); the F-077 developer saw it on a worktree based on the stale `origin/main`. Kept as regression tests: `tests/test_f078_count_star.py` (33 DuckDB-checked cases, cpu and gpu, Arrow and native sizes); test-only, reviewed in the main session
@@ -795,7 +796,7 @@ Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (
 - [ ] Q22: three `greater` / `and_kleene` passes over 150,000 rows in Arrow, `expression` / `predicate not supported` (the DataFrame Q22 is native since F-034)
 - [ ] `tests/test_native_strings_tpch.py`-style test over the SQL text of all 22 queries on SF 0.17: no Arrow compute over 1,000 rows, allowed declines listed by name; fails before
 
-## F-081 Window partitions over a float column: NaNs are one partition [todo]
+## F-081 Window partitions over a float column: NaNs are one partition [done]
 Found by the F-077 review (2026-10-16); a silent wrong answer on main
 - [ ] `custom_ops.py` (~1259) builds window partitions from a Python dict over `to_pylist()`, so each NaN row is its own partition (and -0.0 / 0.0 split): `sum(v).over("k")` gives `[1, 2, 7, 7]` where DuckDB gives `[3, 3, 7, 7]`. Partition through the same codes as group-by (`np_arrow.canonical_floats` / `_codes`), which also drops the per-row Python dict
 - [ ] DuckDB-checked tests: float partition key with NaN (two payloads), -0.0 / 0.0, NULL, ±inf; sum / count / rank over it; fails before
@@ -810,3 +811,11 @@ Found by the F-070 developer (2026-10-16); a silent wrong answer
 Found by the F-070 developer (2026-10-16)
 - [x] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
 - [x] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
+
+## F-084 Window functions: NULL values, NaN ties and DESC order like DuckDB [todo]
+Found by the F-081 review (2026-10-16); silent wrong answers on main before F-081
+- [ ] window min / max turn values to float64 first, so a NULL value becomes NaN: `max` over `[NULL, 2, 5]` gives NaN (DuckDB 5), an all-NULL partition gives NaN (DuckDB NULL); min skips NULL only through the NaN rule. Aggregate over the valid values, NULL when none
+- [ ] `_window_rank` ties rows with `==`, so tied NaNs rank apart: rank of `[nan, 1, nan, 2]` is `[3, 1, 4, 2]`, DuckDB `[3, 1, 3, 2]` (rank and dense_rank); tie through the canonical codes (`np_arrow.canonical_floats`)
+- [ ] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
+- [ ] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decide and document if not
+- [ ] DuckDB-checked tests for each; fail before
