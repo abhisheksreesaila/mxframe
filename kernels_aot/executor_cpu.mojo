@@ -39,11 +39,17 @@ Plan buffer (int64 words):
   22 having constants* : float64[n_having]
   23 n_dcols (dictionary-coded string columns in predicates)   24 doffs* : int64[n_chunks][n_dcols]
      (offset of the chunk's dictionary in the concatenation Python built; read through dtype 5)
+  25 xkeys* : int64[n_keys][3] = per key (program register / program column / -1 for a join key bounded by
+     the caller, range low, range high); expression keys and fused join keys only
+  26 F* : the fused join description (version 3 only; 0 otherwise)
   27 flags: bit 0 SELECT DISTINCT (directly addressed groups only), bit 1 reproducible float sums
-     (every aggregate runs the defined order of additions, F-064; `pipeline_cpu._pipeline`)
+     (every aggregate runs the defined order of additions, F-064; `pipeline_cpu._pipeline`),
+     bit 2 (value 4) hashed groups whatever the key ranges (F-069, hashagg_cpu.mojo)
+  28 hashed group-by record limit in bytes (0: none): past it the call returns E_NO_MEMORY (-19)
 
 Result (int64 words, caller-allocated, 3 + 2 * n_keys + n_outputs):
-   0 n_rows   1 arena* (free with mx_exec_free)   2 flags (bit 0: global aggregate over no rows)
+   0 n_rows   1 arena* (free with mx_exec_free)   2 flags (bit 0: global aggregate over no rows;
+     bits 1-2: how groups were found, 0 direct, 1 compacted, 2 hashed)
    then per key (A, B): dictionary key -> (int32 offsets[n+1]*, utf8 data*); int32 / int64 key -> (values*, 0)
    then per output: float64[n]* (int64[n]* for count)
 

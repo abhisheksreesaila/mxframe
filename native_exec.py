@@ -126,18 +126,24 @@ def _record_limit() -> int:
     returns E_NO_MEMORY and the caller's path answers). The records are about one per (worker flush, group),
     so up to one per row when the groups are many, and the peak measured at 10M rows, 1M groups was 1.25 x the
     record bytes: a third of MemAvailable leaves room for that, the input and the engine's other buffers.
-    MXFRAME_HASH_RECORD_MB overrides (tests)."""
-    v = os.environ.get("MXFRAME_HASH_RECORD_MB")
-    if v:
-        return int(float(v) * (1 << 20))
+    MXFRAME_HASH_RECORD_MB overrides (tests); a value that is not a positive number is ignored."""
+    try:
+        mb = float(os.environ.get("MXFRAME_HASH_RECORD_MB", ""))
+        if mb > 0:
+            return int(mb * (1 << 20))
+    except ValueError:
+        pass                                    # not a number: as if unset
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024 // 3
-    except OSError:
+    except (OSError, ValueError):
         pass
-    return 0
+    try:                                        # no /proc: a third of the physical memory (0 would mean unlimited)
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // 3
+    except (ValueError, OSError, AttributeError):
+        return 0
 
 
 def last_group_path():
