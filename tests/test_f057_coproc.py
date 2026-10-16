@@ -29,7 +29,9 @@ needs_native = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so n
 def data(n=600_000, groups=37, seed=0, nan=False):
     rng = np.random.default_rng(seed)
     w = rng.random(n)
-    if nan:
+    if nan == "group":                 # every row of group 0 is NaN, so its min and max are NaN
+        w[:] = np.where(np.arange(n) % groups == 0, np.nan, w)
+    elif nan:
         w[rng.random(n) < 0.01] = np.nan
     return pa.table({
         "k": pa.array(rng.integers(0, groups, n).astype(np.int32)),
@@ -157,12 +159,72 @@ def test_different_filters_pushed_into_the_read_are_different_sources(tmp_path):
         return (mx.scan_parquet(path).filter(col("i") < lit(limit)).groupby("k")
                 .agg(col("v").sum().alias("s"), col("w").max().alias("mx")).sort("k"))
 
+    from mxframe.io_parquet import resolve_plan, table_source
+    tokens = {limit: table_source(_scan_table(resolve_plan(frame(limit).plan))) for limit in (300, 700)}
+    assert tokens[300] != tokens[700] and all(tokens.values())
     with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
         for limit in (300, 700, 300, 700):
             got = frame(limit).compute(device="cpu")
             cf.wait_for_uploads(30)
             want = duck(f"select k, sum(v) s, max(w) mx from t where i < {limit} group by k order by k", t=t)
             same(got, want)
+
+
+def _scan_table(plan):
+    from mxframe.lazy_frame import Scan
+    while not isinstance(plan, Scan):
+        plan = plan.input
+    return plan.table
+
+
+@needs_gpu
+@needs_native
+def test_two_queries_alternating_on_one_file_are_both_resident(parquet_file):
+    """Q1 then Q6 on one file: each read of the file is its own source and they must not evict each other."""
+    path, t = parquet_file
+    cf.clear_residency()
+
+    def one(c):
+        return mx.scan_parquet(path).groupby("k").agg(col(c).sum().alias("s")).sort("k")
+
+    paths = []
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        for _ in range(3):
+            for c in ("v", "w"):
+                lf = one(c)
+                got = lf.compute(device="cpu")
+                paths.append((c, lf.last_compile_provenance["path"]))
+                cf.wait_for_uploads(30)
+                same(got, duck(f"select k, sum({c}) s from t group by k order by k", t=t))
+    assert paths[:2] == [("v", "fused_pipeline_cpu"), ("w", "fused_pipeline_cpu")]
+    assert all(p == "fused_pipeline_split" for _, p in paths[2:]), paths
+    assert cf.resident_count() == 2
+
+
+def test_residency_is_asked_for_exactly_the_programs_columns():
+    """A resident sum(v) says nothing about sum(v), sum(w): a split would be predicted and never run."""
+    cf.clear_residency()
+    src = ("parquet", "/x", 1, 2, 3, 4, ("v", "w"), "()", ())
+    with cf._lock:
+        cf._cache["fake"] = cf._Entry(dc=None, nbytes=0, owners=[], sig=(src, frozenset({"v"}), ("k",)))
+    try:
+        assert cf.resident_for(src, {"v"}, ("k",))
+        assert not cf.resident_for(src, {"v", "w"}, ("k",))
+        assert not cf.resident_for(src, {"v"}, ())
+    finally:
+        with cf._lock:
+            cf._cache.pop("fake")
+
+
+def test_the_prepared_registry_is_bounded_and_cleared(monkeypatch):
+    cf.clear_residency()
+    monkeypatch.setattr(cf, "MAX_PREPARED", 3)
+    src = lambda i: ("parquet", f"/f{i}", 1, 2, 3, 4, (), "()", ())
+    assert all(cf.begin_prepare(src(i), {"v"}, ()) for i in range(5))
+    assert len(cf._prepared) == 3
+    assert not cf.begin_prepare(src(4), {"v"}, ())          # still remembered: not redone
+    cf.clear_residency()
+    assert len(cf._prepared) == 0 and cf.begin_prepare(src(4), {"v"}, ())
 
 
 def test_a_file_read_carries_a_source_token_and_a_derived_table_does_not(parquet_file):
@@ -196,13 +258,15 @@ def _gids(compiler_cls, got):
 @needs_native
 @pytest.mark.skipif(not pk.cpu_available(), reason="needs libmxpipeline_cpu.so")
 @pytest.mark.parametrize("grouped", [True, False])
-@pytest.mark.parametrize("nan", [False, True])
+@pytest.mark.parametrize("nan", [False, True, "group"])
 def test_native_range_partials_merge_to_the_pipeline_kernels_partials(grouped, nan):
     """The executor's partials for two row ranges merge to what the pipeline kernel gives for all rows:
     every aggregate kind (sum, mean, min / max with and without NaN, count) and the NaN counts behind them."""
     from mxframe.custom_ops import CustomOpsCompiler
     from mxframe.pipeline_program import finalize, merge_partials
     t = data(200_000, groups=300, nan=nan)
+    if nan == "group" and not grouped:
+        pytest.skip("an all-NaN group needs keys")
     plan, got = _inputs(t, grouped)
     gids, n_groups = _gids(CustomOpsCompiler, got)
     comp = CustomOpsCompiler(device="cpu")
@@ -240,9 +304,9 @@ def test_native_range_over_an_empty_or_filtered_out_range_is_the_identity():
 @needs_gpu
 @needs_native
 @pytest.mark.parametrize("fraction", [0.25, 0.6, 1.0])
-@pytest.mark.parametrize("shape", ["grouped", "global", "nan"])
+@pytest.mark.parametrize("shape", ["grouped", "global", "nan", "nan group"])
 def test_forced_splits_equal_device_cpu_and_duckdb(fraction, shape, monkeypatch):
-    t = data(nan=shape == "nan")
+    t = data(nan={"nan": True, "nan group": "group"}.get(shape, False))
     make = lambda: agg_query(LazyFrame(t), grouped=shape != "global")
     want_cpu = make().compute(device="cpu")
     ran = []
@@ -265,7 +329,7 @@ def test_forced_splits_equal_device_cpu_and_duckdb(fraction, shape, monkeypatch)
     assert prov["coproc"]["gpu_fraction"] == fraction
     assert any(ran), "the native executor never took a CPU share: the test would prove nothing"
     same(got, want_cpu)
-    same(got, duck(GROUPED_SQL if shape != "global" else GLOBAL_SQL, t=t) if shape != "nan" else want_cpu)
+    same(got, duck(GROUPED_SQL if shape != "global" else GLOBAL_SQL, t=t))
 
 
 @needs_gpu
@@ -426,7 +490,7 @@ def test_explain_shows_the_numbers_of_a_split_it_chose(monkeypatch):
     lf, text = _decide(monkeypatch, data(), resident=True)
     line = next(l for l in text.splitlines() if "cpu path:" in l)
     assert "cpu path: cpu+gpu split (est " in line
-    for part in ("gpu share 0.", "cpu alone 100.0ms", "contention", "gpu alone 34.5ms (compute 30.0 + 4.5 per call)",
+    for part in ("gpu share 0.", "cpu alone 100.0ms", "contention when sharing (assumed, unmeasured)", "gpu alone 34.5ms (compute 30.0 + 4.5 per call)",
                  "merge ", "vs best single device 34.5ms", "needs 10%"):
         assert part in line, line
 
@@ -443,6 +507,26 @@ def test_without_resident_columns_the_query_runs_native_and_queues_the_upload(mo
     assert "native executor (columns not resident on the GPU yet, upload queued; once resident: est " in line
     d = am.choose_device(lf.plan, calib=_Calib(100.0, 30.0), gpu=_Warm())
     assert d.upload is True and d.split is False
+
+
+def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
+    """Deciding a query whose columns are not resident compiles the program and asks residency: no pass over
+    int64 columns or integer sums (they cost as much as a native query, on every decision, possibly forever)."""
+    scans = []
+    real_col, real_sum = pe._column_past_2_53, __import__("mxframe.pipeline_program", fromlist=["x"]).int_sum_inexact
+    monkeypatch.setattr(pe, "_column_past_2_53", lambda *a: scans.append("int64") or real_col(*a))
+    import mxframe.custom_ops as co
+    real_reason = co.CustomOpsCompiler._arrow_aggregate_reason
+    monkeypatch.setattr(co.CustomOpsCompiler, "_arrow_aggregate_reason",
+                        staticmethod(lambda *a, **k: scans.append("arrow") or real_reason(*a, **k)))
+    lf, text = _decide(monkeypatch, data(), resident=False)
+    assert "upload queued" in text
+    assert scans == []
+    # the same decision with the columns resident predicts the split, still without a scan
+    lf, text = _decide(monkeypatch, data(), resident=True)
+    assert "cpu path: cpu+gpu split" in text and scans == []
+    # the full check (background upload, the run) does scan
+    assert not isinstance(pe.split_check(lf.plan), str) and "int64" in scans and "arrow" in scans
 
 
 @needs_native

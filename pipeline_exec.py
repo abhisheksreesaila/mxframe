@@ -196,7 +196,8 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         stable = not grouped or coproc_fused.stable_group_keys(agg_node.group_by)
         split = coproc_fused.try_split(
             prog, cc, gids, n_groups, n_rows, table, stable_gids=stable, cpu_rows=cpu_range,
-            gid_fp=_gid_fingerprint(table, unique_key_cols, n_groups) if grouped else None,
+            gid_fp=(_gid_fingerprint(table, unique_key_cols, n_groups)
+                    if grouped and coproc_fused.current_policy() is not None else None),
             gkeys=tuple(group_keys))
         if split is not None:
             partials, used, coproc_info = split
@@ -293,13 +294,18 @@ class SplitInputs:
         self.columns = frozenset(prog.columns)
 
 
-def split_check(plan):
+def split_check(plan, full: bool = True):
     """``SplitInputs`` when the CPU+GPU split can take ``plan``, else the reason it cannot. This is the one
     predicate for the split: it asks the same ``_shape`` / ``_bind`` the fused pipeline runs, then adds what
     only the split needs (stable group ids, columns whose buffers a device copy can be keyed by). Joins,
     a Project or Distinct between the aggregate and the scan, nulls, int64 past 2^53 and shapes the
     bytecode compiler declines all come out of those, so a split is never predicted for a plan the pipeline
-    then declines (F-053 review)."""
+    then declines (F-053 review).
+
+    ``full=False`` stops after the program is compiled (shape, stable keys, the bytecode compiler): enough to
+    name the columns and ask whether they are resident, and it reads no column. The rest (nulls, int64 past
+    2^53, integer sums, binding the buffers) passes over the data, so it runs only for the background
+    upload and for the run itself; a query whose columns are resident passed it when they were uploaded."""
     from . import coproc_fused
     from .custom_ops import CustomOpsCompiler
     from .io_parquet import table_source
@@ -318,6 +324,16 @@ def split_check(plan):
     predicates, agg_node, table = got
     if agg_node.group_by and not coproc_fused.stable_group_keys(agg_node.group_by):
         return "derived or renamed group keys get fresh ids on every query"
+    source = table_source(table)
+    gkeys = tuple(e.args[0] for e in agg_node.group_by)
+    if not full:
+        try:
+            prog = compile_pipeline(predicates, list(agg_node.aggs), table)
+        except Exception as exc:
+            return f"compiling raised {type(exc).__name__}"
+        if prog is None:
+            return "expression not supported by the bytecode compiler"
+        return SplitInputs(prog, None, table, agg_node, source or ("memory", id(table)), gkeys)
     why, _ = CustomOpsCompiler._arrow_aggregate_reason(agg_node, predicates, table)   # answered before the pipelines
     if why:
         return f"Arrow's hash aggregate answers it: {why}"
@@ -328,11 +344,9 @@ def split_check(plan):
     if isinstance(bound, str):
         return bound
     prog, cc = bound
-    source = table_source(table)
     if source is None and not coproc_fused.stable_columns(cc):
         return "a column is converted on every query (dictionary codes, bool, narrow ints), so it has no stable buffer to keep on the GPU"
-    return SplitInputs(prog, cc, table, agg_node, source or ("memory", id(table)),
-                       tuple(e.args[0] for e in agg_node.group_by))
+    return SplitInputs(prog, cc, table, agg_node, source or ("memory", id(table)), gkeys)
 
 
 def queue_resident_upload(plan) -> None:
@@ -340,8 +354,11 @@ def queue_resident_upload(plan) -> None:
     the query: the CPU decision that predicted a split has not found them resident yet. A background thread
     calls this once the query has returned."""
     from . import coproc_fused
-    got = split_check(plan)
+    got = split_check(plan, full=False)
     if isinstance(got, str) or not coproc_fused.begin_prepare(got.source, got.columns, got.gkeys):
+        return
+    got = split_check(plan)                  # the passes over the data, once per source, on this background thread
+    if isinstance(got, str):
         return
     from .custom_ops import CustomOpsCompiler
     gids, n_groups, fp = None, 1, None
@@ -368,8 +385,8 @@ def _int64_past_2_53(table, names) -> bool:
         key = id(table)
         try:
             got = (weakref.ref(table, lambda _r, k=key: _I64_RANGE.pop(k, None)), {})
-        except TypeError:
-            got = (lambda: table, {})
+        except TypeError:                      # not weak-referenceable: nothing to remember it by, compute every time
+            return any(_column_past_2_53(table.column(n)) for n in names)
         _I64_RANGE[id(table)] = got
     seen = got[1]
     return any(seen[n] if n in seen else seen.setdefault(n, _column_past_2_53(table.column(n))) for n in names)

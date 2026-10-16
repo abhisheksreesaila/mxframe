@@ -267,7 +267,7 @@ def gid_fingerprint(unique_key_cols, n_groups: int) -> bytes:
         h.update(name.encode() + b"\0")
         v = unique_key_cols[name]
         for ch in (v.chunks if hasattr(v, "chunks") else [v]):
-            h.update(str(ch.type).encode() + len(ch).to_bytes(8, "little"))
+            h.update(str(ch.type).encode() + len(ch).to_bytes(8, "little") + ch.offset.to_bytes(8, "little"))
             for b in ch.buffers():
                 if b is not None:
                     h.update(memoryview(b))
@@ -343,6 +343,7 @@ def clear_residency() -> None:
         freeable = [e for e in (_evict_locked(k) for k in list(_cache)) if e is not None]
         _failed.clear()
         _finalized.clear()
+        _prepared.clear()
     for e in freeable:
         _free_entry(e)
 
@@ -482,23 +483,27 @@ def _evict_stale(source) -> None:
     if source is None or source[0] != "parquet":
         return
     with _lock:
-        stale = [k for k, e in _cache.items() if e.sig and e.sig[0][:2] == source[:2] and e.sig[0] != source]
+        # same file path, different file identity (dev, inode, mtime, size): other reads of the same file
+        # (other columns, filters, types) are different sources of the same file and stay
+        stale = [k for k, e in _cache.items()
+                 if e.sig and e.sig[0][:2] == source[:2] and e.sig[0][2:6] != source[2:6]]
         freeable = [e for e in (_evict_locked(k) for k in stale) if e is not None]
     for e in freeable:
         _free_entry(e)
 
 
 def resident_for(source, columns, gkeys) -> bool:
-    """Is there a device copy of (at least) the columns a query reads from this source, with its group ids?
+    """Is there a device copy of exactly the columns a query's program reads from this source, with its group ids?
     ``source`` is ``SplitInputs.source``; the answer decides whether auto may split the query (the exact
     key is checked again when it runs)."""
     columns, gkeys = frozenset(columns), tuple(gkeys)
     with _lock:
-        return any(e.sig and e.sig[0] == source and e.sig[1] <= columns and e.sig[2] == gkeys
+        return any(e.sig and e.sig[0] == source and e.sig[1] == columns and e.sig[2] == gkeys
                    for e in _cache.values())
 
 
-_prepared: Dict[tuple, float] = {}       # (source, columns, group keys) -> when a background prepare began
+_prepared: "OrderedDict[tuple, float]" = OrderedDict()   # (source, columns, group keys) -> when a prepare began
+MAX_PREPARED = 256
 
 
 def begin_prepare(source, columns, gkeys) -> bool:
@@ -512,6 +517,9 @@ def begin_prepare(source, columns, gkeys) -> bool:
         if any(e.sig == sig for e in _cache.values()):
             return False
         _prepared[sig] = time.monotonic()
+        _prepared.move_to_end(sig)
+        while len(_prepared) > MAX_PREPARED:
+            _prepared.popitem(last=False)
     return True
 
 
@@ -582,7 +590,7 @@ class SplitPlan:
         best = min(self.cpu_alone_ms, self.gpu_alone_ms)
         gain = 100.0 * (1 - self.split_ms / best) if best > 0 else 0.0
         return (f"est {self.split_ms:.1f}ms with gpu share {self.gpu_fraction:.2f} "
-                f"(cpu alone {self.cpu_alone_ms:.1f}ms, x{CPU_CONTENTION:g} contention when sharing = "
+                f"(cpu alone {self.cpu_alone_ms:.1f}ms, x{CPU_CONTENTION:g} contention when sharing (assumed, unmeasured) = "
                 f"{self.contended_cpu_ms:.1f}ms; {gpu}; merge {self.merge_ms:.1f}ms) "
                 f"vs best single device {best:.1f}ms: {gain:+.0f}%, needs {SPLIT_MARGIN * 100:.0f}%")
 
@@ -620,7 +628,7 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol, cpu_rows=None):
     card = max(n_groups, 1)
     cpu_ms = cal.estimate("pipeline", "cpu", n_rows, card=card)
     gpu_ms = cal.estimate("pipeline", "gpu", n_rows, card=card)
-    sp = plan_split(cpu_ms, gpu_ms, n_groups, prog.n_slots)
+    sp = plan_split(cpu_ms, gpu_ms, n_groups, prog.n_slots, auto_mode.NATIVE_CPU_FACTOR)   # one price, as auto's
     if pol.gpu_fraction is not None:
         f = pol.gpu_fraction
     else:      # resident data, split only when it beats the faster device by the margin; else the faster one alone

@@ -18,6 +18,7 @@ work and the measurements that shaped it.
 > executor. The model prices the native executor as equal to the older kernel
 > (`auto_mode.NATIVE_CPU_FACTOR = 1.0`). The numbers below have not been re-run; re-measuring auto on a
 > quiet machine is the open item of F-053 and F-057 in [plan.md](plan.md).
+> A file's residency is keyed by its identity (path, inode, mtime, size): a file rewritten in place with the same size within one mtime tick (coarse-mtime filesystems) can be served from the old GPU copy.
 
 All numbers below come from the reference machine: AMD Ryzen 9 5900X (24 threads,
 dual-channel DDR4) and an NVIDIA RTX 3090 on PCIe 4.0 x8, TPC-H data at scale factor 10.

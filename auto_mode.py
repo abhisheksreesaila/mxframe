@@ -659,12 +659,15 @@ def _cpu_path(d: AutoDecision, plan, calib, gpu):
     d.split_plan = sp
     if not sp.wins:
         return False, f"{native} (no cpu+gpu split: {sp.explain()})"
-    # the model likes a split: only now bind the program and columns (a pass over int64 columns), as the run will
-    got = pipeline_exec.split_check(plan)
+    # the model likes a split. Compile the program (it names the columns), ask residency, and stop there: the
+    # passes over the data (nulls, int64 range, integer sums) cost as much as a native query, so they run only
+    # for the background upload and for the run itself. Columns that are resident passed them when uploaded.
+    got = pipeline_exec.split_check(plan, full=False)
     if isinstance(got, str):
         return False, f"{native} (no cpu+gpu split: {got})"
     if not cf.resident_for(got.source, got.columns, got.gkeys):
         d.upload = True
+        # (the background upload runs the full check and drops a plan that fails it)
         return False, f"{native} (columns not resident on the GPU yet, upload queued; once resident: {sp.explain()})"
     return True, f"cpu+gpu split ({sp.explain()})"
 
