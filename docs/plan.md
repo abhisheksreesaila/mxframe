@@ -913,3 +913,8 @@ From the F-087 review (2026-10-16)
 Found by the F-092 developer and review (2026-10-16)
 - [ ] in `t x JOIN t y`, referencing a column that exists in both copies on the second side (`WHERE y.qty > 25`, `SELECT y.v`) raises "name exists in more than one joined table ... not supported yet". Joined tables with shared non-key column names are common (self-joins, fact-to-fact): carry both copies under distinct internal names (`v`, `v_right`) and resolve `x.v` / `y.v` to the right one in every clause
 - [ ] DuckDB-checked tests: self-join with filters on either side, SELECT of both copies, GROUP BY / ORDER BY on the second copy, a three-way join with a repeated name; fails before
+
+## F-100 SQL COALESCE and IS NULL over expressions [todo]
+Found by the F-094 developer (2026-10-16)
+- [ ] `COALESCE(expr, ...)` (and `IFNULL` / `NULLIF` if sqlglot parses them) and `expr IS NULL` over any expression (not only a column) are unsupported in the SQL front end. Map them onto the engine's null handling (`is_null` from F-086, a coalesce / fill_null expression), Arrow path; native where the bytecode can
+- [ ] DuckDB-checked tests: COALESCE over columns / literals / expressions with NULLs in SELECT, WHERE, GROUP BY; NULLIF with zero divisors; `(a + b) IS NULL`; fails before
