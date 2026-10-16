@@ -155,3 +155,74 @@ def test_the_gpu_session_does_not_wrap_either():
         LazyFrame(_sum_table(2)).groupby().agg(col("a").sum().alias("s")).compute(device="gpu")
     with pytest.raises(OverflowError, match="sum of INT64"):
         LazyFrame(_sum_table(8)).groupby("g").agg(col("a").sum().alias("s")).compute(device="gpu")
+
+
+# -- shapes where the pipelines decline for an unrelated reason (an ordered string predicate) --------
+
+def _ts():
+    t = _t()
+    return pa.table({"a": t.column("a"), "g": t.column("g"), "v": t.column("v"),
+                     "s": pa.array(["a", "b", "c", "d"] * (len(t) // 4))})
+
+
+@pytest.mark.parametrize("agg,sql", [
+    (lambda: (col("a") * col("a") * col("a")).max(), "max(a*a*a)"),
+    (lambda: (col("a") * col("a") * lit(1 << 40)).min(), "min(a*a*1099511627776)"),
+    (lambda: (col("a") * col("a") * col("a")).sum(), "sum(a*a*a)"),
+    (lambda: (col("a") * col("a") * col("a")).mean(), "avg(a*a*a)"),
+], ids=["max_cube", "min_shift", "sum_cube", "mean_cube"])
+@pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "global"])
+def test_an_uncompilable_predicate_does_not_hide_an_overflowing_aggregate(mode, agg, sql, grouped):
+    t = _ts()
+    lf = LazyFrame(t).filter(col("s") > lit("a"))
+    lf = lf.groupby("g").agg(agg().alias("x")) if grouped else lf.groupby().agg(agg().alias("x"))
+    q = f"select {'g, ' if grouped else ''}{sql} from t where s > 'a'{' group by g' if grouped else ''}"
+    _both_raise(t, q, lf, "Overflow in multiplication of INT64")
+
+
+def test_an_overflowing_aggregate_after_a_join_raises(mode):
+    t = _ts()
+    d = pa.table({"g": pa.array(np.arange(4, dtype=np.int64)), "name": pa.array(["w", "x", "y", "z"])})
+    con = duckdb.connect()
+    con.register("t", t)
+    con.register("d", d)
+    with pytest.raises(duckdb.OutOfRangeException, match="Overflow in multiplication"):
+        con.execute("select name, max(a*a*a) from t join d using(g) group by name").fetchall()
+    with pytest.raises(OverflowError, match="Overflow in multiplication of INT64"):
+        LazyFrame(t).join(LazyFrame(d), on="g").groupby("name").agg(
+            (col("a") * col("a") * col("a")).max().alias("x")).compute(device="cpu")
+
+
+# -- SUM with nulls ---------------------------------------------------------------------------------
+
+MAXI = (1 << 63) - 1
+
+
+def _nt(values):
+    return pa.table({"a": pa.array(values, type=pa.int64()), "g": pa.array([0] * len(values), type=pa.int64())})
+
+
+def _sums(t, grouped):
+    lf = LazyFrame(t)
+    lf = lf.groupby("g") if grouped else lf.groupby()
+    return lf.agg(col("a").sum().alias("s")).compute(device="cpu").column("s").to_pylist()
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["global", "grouped"])
+@pytest.mark.parametrize("values,want", [
+    ([1 << 62, None, -5], (1 << 62) - 5),
+    ([None, None], None),
+    ([MAXI, 1, None, -1], MAXI),
+    ([1 << 62, None, -(1 << 62), 7], 7),
+])
+def test_sums_with_nulls_equal_duckdb(mode, grouped, values, want):
+    t = _nt(values)
+    assert _con(t).execute("select sum(a) from t").fetchone()[0] == want
+    assert _sums(t, grouped) == [want]
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["global", "grouped"])
+def test_a_sum_with_nulls_past_int64_raises(mode, grouped):
+    t = _nt([1 << 62, None, 1 << 62])
+    with pytest.raises(OverflowError, match="sum of INT64"):
+        _sums(t, grouped)
