@@ -40,7 +40,7 @@ Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
 """
 
 from std.memory.alloc import unsafe_alloc
-from std.memory import Pointer
+from std.memory import Pointer, unsafe_memset_zero
 from max.algorithm import parallelize
 from std.sys import simd_width_of
 from std.atomic import Atomic
@@ -603,11 +603,17 @@ def _find_chunk(p: Prog, row: Int) -> Int:
     return lo
 
 
-def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool, shared: Bool](
+def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool, shared: Bool,
+                   FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP, lo: Int, hi: Int, encode: E,
+    front: FR, ws: BP,
 ) -> Bool:
     """Rows [lo, hi) in VEC blocks: predicate, selection, body, accumulate. `keyed`: group ids of
-    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst, regs)` (regs: the program's registers, for keys it computed) (False: bad key)."""
+    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst, regs)` (regs: the program's registers, for keys it computed) (False: bad key).
+    `fused` (F-046a slice 3, join + aggregate): the rows come from `front(chunk, row0, n, sel, ws)`,
+    which filters the block, looks the join partners up and fills `sel` with the surviving rows (their
+    count is returned) and the worker's column table at `ws` (the partner columns of those rows
+    gathered into block scratch); the program's predicate then runs on those rows only."""
     var pos = lo
     while pos < hi:
         var k = _find_chunk(p, pos)
@@ -619,17 +625,32 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             var n = min(VEC, stop - i0)
             var nsel = n
             var use_sel = False
-            if p.pred_reg >= 0:
-                _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
-                var pr = regs + p.pred_reg * VEC
-                var kk = 0
-                for i in range(n):
-                    sel[kk] = Int32(i)
-                    kk += 1 if pr[i] != 0.0 else 0
-                nsel = kk
+            var bcols = cols
+            comptime if fused:
+                nsel = front(k, i0, n, sel, ws)
+                bcols = LP(unsafe_from_address=Int(ws))
                 use_sel = nsel < n
+                if nsel > 0 and p.pred_reg >= 0:
+                    _run_ops(p, regs, bcols, p.n_pro, p.n_pred, i0, sel, use_sel, nsel)
+                    var pr = regs + p.pred_reg * VEC
+                    var kk = 0
+                    for j in range(nsel):
+                        sel[kk] = sel[j] if use_sel else Int32(j)
+                        kk += 1 if pr[j] != 0.0 else 0
+                    nsel = kk
+                    use_sel = nsel < n
+            else:
+                if p.pred_reg >= 0:
+                    _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                    var pr = regs + p.pred_reg * VEC
+                    var kk = 0
+                    for i in range(n):
+                        sel[kk] = Int32(i)
+                        kk += 1 if pr[i] != 0.0 else 0
+                    nsel = kk
+                    use_sel = nsel < n
             if nsel > 0:
-                _run_ops(p, regs, cols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
+                _run_ops(p, regs, bcols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
                 var gp = gscratch
                 comptime if keyed:
                     if not encode(k, i0, sel, nsel, use_sel, gscratch, regs):
@@ -651,10 +672,12 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     return True
 
 
-def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
+def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
+              FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+    front: FR, ws_bytes: Int,
 ) -> Int:
     """The interpreter over rows [start, end). `keyed`: no group-id array; the group ids of the rows
     that pass the predicate are made per VEC block by `encode` (see _process_range), so keys of
@@ -725,6 +748,8 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
             regs[i] = 0.0
         var sel = unsafe_alloc[Int32](VEC)
         var gscratch = unsafe_alloc[Int32](VEC)
+        var ws = unsafe_alloc[UInt8](max(ws_bytes, 64), alignment=64)      # the fused front stage's block state
+        unsafe_memset_zero(ws, max(ws_bytes, 64))
         var pv = pv_all + wid * pv_stride
         var pc = pc_all + wid * pc_stride
         if shared:                                 # this worker's group cache (see _accumulate_shared)
@@ -747,11 +772,11 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
                 break
             var ok = True
             if shared:
-                ok = _process_range[keyed=keyed, shared=True](p, regs, sel, gscratch, pv, pc, lo,
-                                                              min(lo + MORSEL, end), encode)
+                ok = _process_range[keyed=keyed, shared=True, fused=fused](
+                    p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws)
             else:
-                ok = _process_range[keyed=keyed, shared=False](p, regs, sel, gscratch, pv, pc, lo,
-                                                               min(lo + MORSEL, end), encode)
+                ok = _process_range[keyed=keyed, shared=False, fused=fused](
+                    p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws)
             if not ok:
                 failed[0] = 1
                 break
@@ -762,6 +787,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
         regs.free()
         sel.free()
         gscratch.free()
+        ws.free()
 
     if nthreads == 1:
         worker(0)
@@ -816,14 +842,19 @@ def _no_keys(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, 
     return True
 
 
+def _no_front(chunk: Int, row0: Int, n: Int, sel: IP, ws: BP) -> Int:
+    return n
+
+
 @export
 def mx_pipeline_cpu(
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int,
 ) abi("C") -> Int:
-    return _pipeline[keyed=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a,
-                                  gids_a, n_groups, start, end, out_vals_a, out_cnt_a, threads, _no_keys)
+    return _pipeline[keyed=False, fused=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                               dtypes_a, gids_a, n_groups, start, end, out_vals_a, out_cnt_a,
+                                               threads, _no_keys, _no_front, 0)
 
 
 def pipeline_keyed[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool](
@@ -832,5 +863,19 @@ def pipeline_keyed[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool](
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
 ) -> Int:
     """mx_pipeline_cpu with group ids made per morsel by `encode` (see _pipeline)."""
-    return _pipeline[keyed=True](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a,
-                                 0, n_groups, start, end, out_vals_a, out_cnt_a, threads, encode)
+    return _pipeline[keyed=True, fused=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                              dtypes_a, 0, n_groups, start, end, out_vals_a, out_cnt_a,
+                                              threads, encode, _no_front, 0)
+
+
+def pipeline_fused[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, FR: def(Int, Int, Int, IP, BP) -> Int,
+                   keyed: Bool](
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, n_groups: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+    front: FR, ws_bytes: Int,
+) -> Int:
+    """The pipeline over the rows `front` lets through (a fused join + aggregate, see _process_range)."""
+    return _pipeline[keyed=keyed, fused=True](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                              dtypes_a, 0, n_groups, start, end, out_vals_a, out_cnt_a,
+                                              threads, encode, front, ws_bytes)

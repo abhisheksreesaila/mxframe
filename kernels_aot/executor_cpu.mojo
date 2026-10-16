@@ -56,7 +56,7 @@ from std.ffi import external_call
 
 from std.utils.numerics import nan
 
-from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, big_alloc, free_big, Prog, _run_ops, _find_chunk, VEC, MAX_REGS
+from pipeline_cpu import mx_pipeline_cpu, pipeline_keyed, pipeline_fused, big_alloc, free_big, Prog, _run_ops, _find_chunk, _no_keys, VEC, MAX_REGS
 
 comptime SPARSE_MIN_RANGE = 16384   # direct key ranges below this never compact on sparsity
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
@@ -338,6 +338,40 @@ def _i64_cols_exact(arrays: LP, stride_a: Int, n_chunks: Int, n_cols: Int, dtype
     items.free()
     bad.free()
     return ok
+
+
+def _fused_exact(F: LP, arrays: LP, stride_a: Int, n_chunks: Int, n_cols: Int, dtypes: IP) -> Bool:
+    """_i64_cols_exact for a fused join + aggregate (plan version 3): the program's fact columns, the
+    pre-filter program's columns and the partner columns it reads (int64 values past 2^53)."""
+    var n_fa = Int(F[0])
+    var colmap = _lp(Int(F[1]))
+    var dchk = unsafe_alloc[Int32](max(n_fa, 1))
+    for j in range(max(n_fa, 1)):
+        dchk[j] = 3
+    for j in range(n_cols):
+        var m = Int(colmap[j])
+        if m >= 0:
+            dchk[m] = dtypes[j]
+    var ok = _i64_cols_exact(arrays, stride_a, n_chunks, n_fa, dchk)
+    dchk.free()
+    if not ok:
+        return False
+    var n_pre = Int(F[2])
+    if n_pre > 0 and not _i64_cols_exact(arrays + Int(F[10]), stride_a, n_chunks, n_pre, _ip(Int(F[7]))):
+        return False
+    var n_b = Int(F[14])
+    if n_b == 0:
+        return True
+    var bc = _lp(Int(F[15]))
+    var parr = unsafe_alloc[Int64](n_b)
+    var pdt = unsafe_alloc[Int32](n_b)
+    for u in range(n_b):
+        parr[u] = bc[4 * u + 1]
+        pdt[u] = Int32(Int(bc[4 * u + 2])) if Int(bc[4 * u + 3]) == 0 else Int32(0)
+    var ok2 = _i64_cols_exact(parr, n_b, 1, n_b, pdt)
+    parr.free()
+    pdt.free()
+    return ok2
 
 
 @always_inline
@@ -817,7 +851,8 @@ def mx_exec_free(arena: Int) abi("C") -> Int:
 @export
 def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var P = _lp(plan_a)
-    if Int(P[0]) != MAGIC or Int(P[1]) != 2:
+    var fused = Int(P[1]) == 3         # version 3: the table is the fact table of a join, see _fused_front
+    if Int(P[0]) != MAGIC or (Int(P[1]) != 2 and not fused):
         return E_BAD_PLAN
     var n_chunks = Int(P[2])
     var n_cols = Int(P[3])
@@ -843,10 +878,16 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var n_dcols = Int(P[23])
     var doffs = _lp(Int(P[24]))
     var O = _lp(out_a)
-    var stride_a = n_cols + n_keys
+    var F = _lp(Int(P[26]) if fused else 0)
+    var kc0 = Int(F[0]) if fused else n_cols                       # the key columns' place in an arrays row
+    var stride_a = Int(F[17]) if fused else n_cols + n_keys
+    var colmap = _lp(Int(F[1]) if fused else 0)                    # fused: program column -> arrays slot, or -(1 + partner column)
     if n_chunks < 1:
         return E_BAD_PLAN
-    if not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+    if fused:
+        if not _fused_exact(F, arrays, stride_a, n_chunks, n_cols, dtypes):
+            return E_INEXACT
+    elif not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
         return E_INEXACT
 
     # ── 1. chunk table for the interpreter: row_start, row_end, per column base address ──────
@@ -859,7 +900,11 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         tbl[c * tstride] = Int64(row)
         tbl[c * tstride + 1] = Int64(row + n)
         for j in range(n_cols):
-            var arr = Int(arrays[c * stride_a + j])
+            var m = Int(colmap[j]) if fused else j
+            if m < 0:                  # a partner column: the fused front stage fills its entry per block
+                tbl[c * tstride + 2 + j] = 0
+                continue
+            var arr = Int(arrays[c * stride_a + m])
             var isz = _itemsize(Int(dtypes[j]) & 255)
             tbl[c * tstride + 2 + j] = Int64(_arr_buf(arr, 1) + (_arr_off(arr) - row) * isz)
         for i in range(n_dcols):
@@ -874,7 +919,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     for k in range(n_keys):
         var kind = Int(key_kinds[k])
         K.kinds[k] = Int64(kind)
-        var col = n_cols + k
+        var col = kc0 + k
         if kind == K_DICT:
             var cap = max(_dict_entries(arrays, stride_a, n_chunks, col), 1)
             var gch = unsafe_alloc[Int64](cap)
@@ -944,13 +989,182 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     # composite codes compacted to the groups present: past the direct-addressing limit, or when the
     # key range is much wider than the input (most of a per-worker partial over D groups would stay
     # empty, yet every worker would zero and merge all of it)
-    var compact = grouped and not use_hash and (D > max_groups or (not any_expr and D >= SPARSE_MIN_RANGE and D > 2 * n_rows))
+    var compact = grouped and not use_hash and (D > max_groups or (not fused and not any_expr and D >= SPARSE_MIN_RANGE and D > 2 * n_rows))
     if use_hash or compact:
         for k in range(n_keys):
             if Int(K.kinds[k]) == K_EXPR:             # expression keys: directly addressed only
                 K.free()
                 tbl.free()
                 return E_BAD_KEY
+    if fused and (use_hash or compact):                # fused: directly addressed groups only
+        K.free()
+        tbl.free()
+        return E_BAD_KEY
+
+    # ── fused join + aggregate (version 3): the pre-filter program over the fact table, the partner maps,
+    #    and the block front stage that filters, looks partners up and gathers their columns (see
+    #    _process_range in pipeline_cpu.mojo). Without `fused` none of this is used.
+    var n_pre = Int(F[2]) if fused else 0
+    var pre_off = Int(F[10]) if fused else 0
+    var n_pdc = Int(F[8]) if fused else 0
+    var pre_dt = _ip(Int(F[7]) if fused else Int(dtypes))
+    var pre_doffs = _lp(Int(F[9]) if fused else 0)
+    var pstride = 2 + n_pre + n_pdc
+    var ptbl = tbl
+    if fused:
+        ptbl = unsafe_alloc[Int64](n_chunks * pstride)
+        var prow0 = 0
+        for c in range(n_chunks):
+            var cn = _arr_len(Int(arrays[c * stride_a]))
+            ptbl[c * pstride] = Int64(prow0)
+            ptbl[c * pstride + 1] = Int64(prow0 + cn)
+            for j in range(n_pre):
+                var arr = Int(arrays[c * stride_a + pre_off + j])
+                var isz = _itemsize(Int(pre_dt[j]) & 255)
+                ptbl[c * pstride + 2 + j] = Int64(_arr_buf(arr, 1) + (_arr_off(arr) - prow0) * isz)
+            for i in range(n_pdc):
+                ptbl[c * pstride + 2 + n_pre + i] = pre_doffs[c * n_pdc + i]
+            prow0 += cn
+    var no_gids = unsafe_alloc[Int32](1)
+    var pre = Prog(_ip(Int(F[3]) if fused else code), FP(unsafe_from_address=Int(F[4]) if fused else consts),
+                   _bp(Int(F[5]) if fused else set_bytes), _lp(Int(F[6]) if fused else set_meta), ptbl,
+                   n_chunks, pre_dt, no_gids, 1, False)
+    var n_look = Int(F[11]) if fused else 0
+    var look = _lp(Int(F[12]) if fused else 0)
+    var probe_off = Int(F[13]) if fused else 0
+    var n_bcols = Int(F[14]) if fused else 0
+    var bcols = _lp(Int(F[15]) if fused else 0)             # per partner column: (lookup, ArrowArray*, dtype, remap*)
+    var maps = unsafe_alloc[Int64](max(n_look, 1) * MW)
+    for j in range(n_look):
+        maps[j * MW + 6] = 0
+        maps[j * MW + 12] = 0
+    for j in range(n_look):
+        var mrc = _build_map(look + j * LW, maps + j * MW, threads)
+        if mrc < 0:
+            for i in range(j):
+                _free_map(maps + i * MW)
+            maps.free()
+            no_gids.free()
+            if fused:
+                ptbl.free()
+            K.free()
+            tbl.free()
+            return mrc
+    # the worker's block state (ws): the program's column table | init flag | the pre-filter's registers |
+    # partner rows per lookup | partner columns gathered by block row (8 bytes per value)
+    var n_words = n_cols + n_dcols
+    var off_flag = _align8(n_words * 8)
+    var off_regs = off_flag + 64
+    var off_prow = off_regs + _align8((pre.n_regs * VEC + 8) * 8)
+    var off_scr = off_prow + _align8(max(n_look, 1) * VEC * 4)
+    var ws_bytes = off_scr + max(n_bcols, 1) * VEC * 8 + 64
+
+    def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
+        var lc = _lp(Int(ws))
+        var flag = _lp(Int(ws) + off_flag)
+        var pregs = FP(unsafe_from_address=Int(ws) + off_regs)
+        var prow = _ip(Int(ws) + off_prow)
+        if flag[0] == 0:                                       # the pre-filter's constants, once per worker
+            _run_ops(pre, pregs, pre.tbl, 0, pre.n_pro, 0, sel, False, VEC)
+            flag[0] = 1
+        var rowp = pre.tbl + k * pre.tbl_stride
+        var c0 = Int(rowp[0])
+        var nc = 0
+        if pre.pred_reg >= 0:                                  # the fact leaf's own filter first
+            _run_ops(pre, pregs, rowp + 2, pre.n_pro, pre.n_pred, i0, sel, False, n)
+            var pr = pregs + pre.pred_reg * VEC
+            for i in range(n):
+                sel[nc] = Int32(i)
+                nc += 1 if pr[i] != 0.0 else 0
+        else:
+            for i in range(n):
+                sel[i] = Int32(i)
+            nc = n
+        # lookups one at a time over the surviving rows (column-wise); a miss drops the row
+        for j in range(n_look):
+            if nc == 0:
+                break
+            var lj = look + j * LW
+            var M = maps + j * MW
+            var w = Int(lj[5])
+            var two = Int(lj[0]) == 2
+            var w1 = w & 15
+            var w2 = (w >> 4) & 15
+            var b1 = _kbase(Int(arrays[k * stride_a + probe_off + Int(lj[1])]), w1)
+            var b2 = _kbase(Int(arrays[k * stride_a + probe_off + Int(lj[2])]), w2) if two else 0
+            var lo1 = Int(M[1])
+            var hi1 = Int(M[2])
+            var lo2 = Int(M[3])
+            var hi2 = Int(M[4])
+            var card2 = Int(M[5])
+            var direct = Int(M[0]) == 0
+            var has_bits = Int(M[12]) != 0
+            var bits = _lp(Int(M[12]))
+            var slot = _ip(Int(M[6]))
+            var nn = 0
+            for t in range(nc):
+                var i = Int(sel[t])
+                var v1 = _kval(b1, w1, i0 + i - c0)
+                var r = -1
+                if v1 >= lo1 and v1 <= hi1:
+                    var c = v1 - lo1
+                    var ok = True
+                    if two:
+                        var v2 = _kval(b2, w2, i0 + i - c0)
+                        if v2 < lo2 or v2 > hi2:
+                            ok = False
+                        else:
+                            c = c * card2 + (v2 - lo2)
+                    if ok:
+                        if direct:
+                            if not has_bits or (Int(bits[c >> 6]) >> (c & 63)) & 1 != 0:
+                                r = Int(slot[c]) - 1
+                        else:
+                            r = _probe_hash(M, c)
+                if r >= 0:
+                    sel[nn] = Int32(i)
+                    for q in range(j):
+                        prow[q * VEC + nn] = prow[q * VEC + t]
+                    prow[j * VEC + nn] = Int32(r)
+                    nn += 1
+            nc = nn
+        if nc == 0:
+            return 0
+        # the partner columns the program reads, gathered into block scratch by block row
+        var scr = Int(ws) + off_scr
+        for u in range(n_bcols):
+            var bc = bcols + 4 * u
+            var j = Int(bc[0])
+            var arr = Int(bc[1])
+            var rm = Int(bc[3])
+            var dst = scr + u * VEC * 8
+            if rm != 0:                                        # dictionary codes through a rank table: int32
+                var src = _ip(_arr_buf(arr, 1)) + _arr_off(arr)
+                var rmp = _ip(rm)
+                var d = _ip(dst)
+                for t in range(nc):
+                    d[Int(sel[t])] = rmp[Int(src[Int(prow[j * VEC + t])])]
+            elif _itemsize(Int(bc[2])) == 8:
+                var src = _lp(_arr_buf(arr, 1)) + _arr_off(arr)
+                var d = _lp(dst)
+                for t in range(nc):
+                    d[Int(sel[t])] = src[Int(prow[j * VEC + t])]
+            else:
+                var src = _ip(_arr_buf(arr, 1)) + _arr_off(arr)
+                var d = _ip(dst)
+                for t in range(nc):
+                    d[Int(sel[t])] = src[Int(prow[j * VEC + t])]
+        # the program's column table for this block: the chunk's columns, partner columns at the scratch
+        var arow = tbl + k * tstride + 2
+        for q in range(n_words):
+            lc[q] = arow[q]
+        for q in range(n_cols):
+            var m = Int(colmap[q])
+            if m < 0:
+                var u = -(m + 1)
+                var isz = 4 if Int(bcols[4 * u + 3]) != 0 else _itemsize(Int(bcols[4 * u + 2]))
+                lc[q] = Int64(scr + u * VEC * 8 - i0 * isz)
+        return nc
     var G = D if (grouped and not use_hash) else 1
     var code_p = _ip(code)
     var n_slots = Int(code_p[5])
@@ -965,18 +1179,26 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var nt = max(1, min(threads, morsels))
 
     if not grouped:
-        rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                             0, 1, 0, n_rows, Int(vals), Int(cnt), threads)
+        if fused:
+            rc = pipeline_fused[keyed=False](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                             1, 0, n_rows, Int(vals), Int(cnt), threads, _no_keys, front, ws_bytes)
+        else:
+            rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                 0, 1, 0, n_rows, Int(vals), Int(cnt), threads)
     elif not compact and not use_hash:
         # ── direct group ids: made per 1024-row block for the rows that pass the predicate only (no
         #    n_rows-sized group-id array, keys of filtered-out rows never read), aggregated into
         #    per-worker partials
         def enc(c: Int, i0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) {imm} -> Bool:
-            return _encode_sel(K, arrays, stride_a, n_keys, n_cols, c, Int(tbl[c * tstride]), i0,
+            return _encode_sel(K, arrays, stride_a, n_keys, kc0, c, Int(tbl[c * tstride]), i0,
                                sel, nsel, use_sel, dst, regs)
 
-        rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
-                            G, 0, n_rows, Int(vals), Int(cnt), threads, enc)
+        if fused:
+            rc = pipeline_fused[keyed=True](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                            G, 0, n_rows, Int(vals), Int(cnt), threads, enc, front, ws_bytes)
+        else:
+            rc = pipeline_keyed(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
+                                G, 0, n_rows, Int(vals), Int(cnt), threads, enc)
         if rc == -5:
             rc = E_BAD_KEY
     elif compact:
@@ -1010,7 +1232,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 if lo >= n_rows:
                     break
                 var hi = min(lo + MORSEL, n_rows)
-                if not _encode_keys(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, lo, hi,
+                if not _encode_keys(K, arrays, stride_a, kc0, n_keys, tbl, tstride, lo, hi,
                                     _ip(Int(buf) - lo * 4)):      # buf[i - lo] for row i
                     bad[0] = 1
                     continue
@@ -1067,7 +1289,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             cnt = unsafe_alloc[Int64](G)
 
             def enc_dense(c: Int, i0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) {imm} -> Bool:
-                if not _encode_sel(K, arrays, stride_a, n_keys, n_cols, c, Int(tbl[c * tstride]), i0,
+                if not _encode_sel(K, arrays, stride_a, n_keys, kc0, c, Int(tbl[c * tstride]), i0,
                                    sel, nsel, use_sel, dst, regs):
                     return False
                 for j in range(nsel):
@@ -1089,7 +1311,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         var bad_key = False
         for k in range(n_keys):
             kv[k] = Int64(Int(unsafe_alloc[Int64](max(n_rows, 1))))
-        var ng = _hash_groups(K, arrays, stride_a, n_cols, n_keys, tbl, tstride, n_chunks, gids, kv, n_rows)
+        var ng = _hash_groups(K, arrays, stride_a, kc0, n_keys, tbl, tstride, n_chunks, gids, kv, n_rows)
         if ng < 0:
             bad_key = True
         else:
@@ -1104,6 +1326,12 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             rc = mx_pipeline_cpu(code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
                                  Int(gids), G, 0, n_rows, Int(vals), Int(cnt), threads)
         gids.free()
+    for j in range(n_look):
+        _free_map(maps + j * MW)
+    maps.free()
+    no_gids.free()
+    if fused:
+        ptbl.free()
     tbl.free()
     if rc < 0:
         vals.free()
@@ -1143,7 +1371,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         # integer keys on the dense / compacted paths are already in order
         var kvals = unsafe_alloc[Float64](n_keys * n_res)
         for k in range(n_keys):
-            _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, n_cols,
+            _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, kc0,
                              kvals + k * n_res, 1.0)
         var kperm = unsafe_alloc[Int64](n_res)
         for i in range(n_res):
@@ -1228,7 +1456,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         var sv = unsafe_alloc[Float64](ns_all * n_res)
         if keys_as_tiebreak:
             for k in range(n_keys):
-                _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, n_cols,
+                _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, kc0,
                                  sv + (n_sort + k) * n_res, 1.0)
         var bad = False
         for j in range(n_sort):
@@ -1236,7 +1464,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var idx = Int(sorts[3 * j + 1])
             var sign = -1.0 if Int(sorts[3 * j + 2]) != 0 else 1.0
             if what == 0:
-                _key_sort_values(K, idx, _lp(Int(kv[idx])), order, n_res, arrays, stride_a, n_cols,
+                _key_sort_values(K, idx, _lp(Int(kv[idx])), order, n_res, arrays, stride_a, kc0,
                                  sv + j * n_res, sign)
             else:
                 var op = Int(outs[3 * idx])
@@ -1286,7 +1514,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var nb = 0
             for i in range(n_res):
                 var e = Int(kvk[Int(order[i])])
-                nb += _dlen(_entry_src(kind, arrays, stride_a, n_cols + k, Int(gch[e])), Int(gco[e]))
+                nb += _dlen(_entry_src(kind, arrays, stride_a, kc0 + k, Int(gch[e])), Int(gco[e]))
             if nb > 2147483647:
                 key_bytes.free()
                 order.free()
@@ -1322,7 +1550,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             offs[0] = 0
             for i in range(n_res):
                 var e = Int(kvk[Int(order[i])])
-                var d = _entry_src(kind, arrays, stride_a, n_cols + k, Int(gch[e]))
+                var d = _entry_src(kind, arrays, stride_a, kc0 + k, Int(gch[e]))
                 var src = _bp(_dstart(d, Int(gco[e])))
                 var ln = _dlen(d, Int(gco[e]))
                 _copy_bytes(Int(dst) + p, Int(src), ln)

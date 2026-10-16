@@ -194,6 +194,39 @@ def _having_terms(pred, names):
     return [(names.index(a.args[0]), _CMP[op], float(v))]
 
 
+def _split_post_ops(post_ops):
+    """([(sort column, descending)], limit or -1) of the Sort? Limit? above an aggregate, or the
+    reason it is not that shape (a str)."""
+    sort_node, limit = None, -1
+    for op in post_ops or []:
+        if isinstance(op, Sort) and sort_node is None and limit < 0:
+            sort_node = op
+        elif isinstance(op, Limit) and limit < 0:
+            limit = int(op.n)
+        else:
+            return f"post-op {type(op).__name__} in this position", -1
+    sort_by = []                                  # (name, descending)
+    if sort_node is not None:
+        for e, desc in zip(sort_node.by, sort_node.descending):
+            if e.op != "col":
+                return "sort by an expression", -1
+            sort_by.append((e.args[0], bool(desc)))
+    return sort_by, limit
+
+
+def _sort_spec(sort_by, keys, names):
+    """(what, index, descending) per ORDER BY column (0 = group key, 1 = output), or a reason (str)."""
+    sorts = []
+    for name, desc in sort_by:
+        if name in keys:
+            sorts.append((0, keys.index(name), int(desc)))
+        elif name in names:
+            sorts.append((1, names.index(name), int(desc)))
+        else:
+            return "sort by a column that is not a key or an aggregate"
+    return sorts
+
+
 def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = False) -> Optional[pa.Table]:
     """Run the whole plan in one native call, or None (the caller's path runs instead).
     `gpu_fallback`: a GPU session whose own pipeline declined the plan answers it here, on the CPU."""
@@ -229,20 +262,9 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             return _decline("derived group key without a name")
         keys.append(e._alias)
         derived[i] = e
-    sort_node, limit = None, -1
-    for op in post_ops or []:
-        if isinstance(op, Sort) and sort_node is None and limit < 0:
-            sort_node = op
-        elif isinstance(op, Limit) and limit < 0:
-            limit = int(op.n)
-        else:
-            return _decline(f"post-op {type(op).__name__} in this position")
-    sort_by = []                                  # (name, descending)
-    if sort_node is not None:
-        for e, desc in zip(sort_node.by, sort_node.descending):
-            if e.op != "col":
-                return _decline("sort by an expression")
-            sort_by.append((e.args[0], bool(desc)))
+    sort_by, limit = _split_post_ops(post_ops)
+    if isinstance(sort_by, str):
+        return _decline(sort_by)
 
     from .pipeline_program import compile_pipeline
     from .lazy_expr import Expr
@@ -273,14 +295,9 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             if lo is None or hi is None or lo != int(lo) or hi != int(hi) or hi - lo + 1 > MAX_GROUPS:
                 return _decline("derived group key: not a small integer range")
             ranges[i] = (int(lo), int(hi))
-    sorts = []
-    for name, desc in sort_by:
-        if name in keys:
-            sorts.append((0, keys.index(name), int(desc)))
-        elif name in names:
-            sorts.append((1, names.index(name), int(desc)))
-        else:
-            return _decline("sort by a column that is not a key or an aggregate")
+    sorts = _sort_spec(sort_by, keys, names)
+    if isinstance(sorts, str):
+        return _decline(sorts)
     having = _having_terms(having_pred, names)
     if having is None:
         return _decline("HAVING other than AND-ed aggregate <op> number")
@@ -369,7 +386,18 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
     if rc < 0:
         return _decline(f"executor declined (code {rc})")
 
-    # ── wrap the result: zero-copy views of the executor's arena ─────────────────────────────
+    result = _wrap_result(lib, O, keys, kinds, outputs)
+    total_ms = (_time.perf_counter() - t_start) * 1000
+    _last.update(path="native", decline=None, native_ms=native_ms, py_ms=total_ms - native_ms)
+    compiler.last_compile_provenance = {
+        "device": "cpu", "rows": int(result.num_rows), "grouped": bool(keys), "n_groups": int(result.num_rows) if keys else 0,
+        "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data",
+    }
+    return result
+
+
+def _wrap_result(lib, O, keys, kinds, outputs) -> pa.Table:
+    """The executor's result words (see mx_execute) as a table: zero-copy views of its arena."""
     n = int(O[0])
     owner = _Arena(lib, int(O[1]))
     empty_global = bool(O[2] & 1)
@@ -398,14 +426,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             arr = pa.Array.from_buffers(t, n, [None, buf(O[base + j], 8 * n)])
         names.append(name)
         out_cols.append(arr)
-    result = pa.Table.from_arrays(out_cols, names=names)
-    total_ms = (_time.perf_counter() - t_start) * 1000
-    _last.update(path="native", decline=None, native_ms=native_ms, py_ms=total_ms - native_ms)
-    compiler.last_compile_provenance = {
-        "device": "cpu", "rows": int(n), "grouped": bool(keys), "n_groups": int(n) if keys else 0,
-        "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data",
-    }
-    return result
+    return pa.Table.from_arrays(out_cols, names=names)
 
 
 _DISTINCT_KIND = {pa.int32(): 0, pa.int64(): 1, pa.string(): 2}
@@ -880,6 +901,31 @@ def _lookup_key_kind(t: pa.DataType):
     return "date" if t == pa.date32() else "int"
 
 
+def _lookup_keys(table: pa.Table, lk: Lookup, pk_names: List[str]):
+    """(the partner as one chunk per column, the slots in ``pk_names`` of its probe key columns, the key
+    widths word) of a lookup, adding its probe columns to ``pk_names``; or the reason it cannot run (str)."""
+    if len(lk.probe) not in (1, 2) or len(lk.probe) != len(lk.build_keys):
+        return "lookup: 1 or 2 key columns"
+    if lk.semi and lk.outputs:
+        return "lookup: a semi join has no outputs"
+    b = lk.build.combine_chunks()     # one chunk per column; dictionaries unified, not decoded
+    if b.num_rows == 0 or any(b.column(c).num_chunks != 1 for c in b.column_names):
+        return "lookup: empty partner"
+    pks, widths = [], 0
+    for i, (pn, bn) in enumerate(zip(lk.probe, lk.build_keys)):
+        pc_, bc_ = table.column(pn), b.column(bn)
+        if (pc_.type not in _KEY_WIDTH or bc_.type not in _KEY_WIDTH or pc_.null_count or bc_.null_count
+                or _lookup_key_kind(pc_.type) != _lookup_key_kind(bc_.type)):
+            return f"lookup key {pn} = {bn}: types {pc_.type} / {bc_.type} or nulls"
+        if pn not in pk_names:
+            pk_names.append(pn)
+        pks.append(pk_names.index(pn))
+        widths |= _KEY_WIDTH[pc_.type] << (4 * i) | _KEY_WIDTH[bc_.type] << (8 + 4 * i)
+    if lk.semi:
+        widths |= 1 << 16
+    return b, pks, widths
+
+
 def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_dict=()) -> Optional[pa.Table]:
     """The rows of ``table`` that pass every predicate (and find a partner row in every lookup),
     holding the ``needed`` columns (None: all) in table order, then each lookup's outputs, in one
@@ -934,25 +980,10 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
     look_words, bout_words, keep_alive = [], [], []
     out_types, out_names = [c.type for c in ocols], list(names)
     for lk in lookups:
-        if len(lk.probe) not in (1, 2) or len(lk.probe) != len(lk.build_keys):
-            return _filter_decline("lookup: 1 or 2 key columns")
-        if lk.semi and lk.outputs:
-            return _filter_decline("lookup: a semi join has no outputs")
-        b = lk.build.combine_chunks()     # one chunk per column; dictionaries unified, not decoded
-        if b.num_rows == 0 or any(b.column(c).num_chunks != 1 for c in b.column_names):
-            return _filter_decline("lookup: empty partner")
-        pks, widths = [], 0
-        for i, (pn, bn) in enumerate(zip(lk.probe, lk.build_keys)):
-            pc_, bc_ = table.column(pn), b.column(bn)
-            if (pc_.type not in _KEY_WIDTH or bc_.type not in _KEY_WIDTH or pc_.null_count or bc_.null_count
-                    or _lookup_key_kind(pc_.type) != _lookup_key_kind(bc_.type)):
-                return _filter_decline(f"lookup key {pn} = {bn}: types {pc_.type} / {bc_.type} or nulls")
-            if pn not in pk_names:
-                pk_names.append(pn)
-            pks.append(pk_names.index(pn))
-            widths |= _KEY_WIDTH[pc_.type] << (4 * i) | _KEY_WIDTH[bc_.type] << (8 + 4 * i)
-        if lk.semi:
-            widths |= 1 << 16
+        got = _lookup_keys(table, lk, pk_names)
+        if isinstance(got, str):
+            return _filter_decline(got)
+        b, pks, widths = got
         bkeys = [b.column(bn).chunk(0) for bn in lk.build_keys]
         bouts = []
         for on, nm in zip(lk.outputs, lk.names):
@@ -1068,6 +1099,327 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
             out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
     _filter_last.update(path="native_filter" if not lookups else "native_lookup", decline=None)
     return pa.Table.from_arrays(out, names=out_names)
+
+
+# ── F-046a slice 3: join + aggregate fusion (mx_execute plan version 3) ─────────────────────────────────
+#
+# `Aggregate([Filter] * (star join))` in one native call: per 1024-row block of the fact table, its own filter,
+# the partner lookups, the aggregate program's predicate (conditions across partners, filters above the
+# join) over the surviving rows with the partner columns gathered into block scratch, then the aggregate.
+# Extra plan words (version 3), `F` at P[26]:
+#    0 n_fa  fact value columns of the program (the first slots of an `arrays` row; then the n_keys key
+#            columns, the pre-filter's columns, the probe key columns: all columns of the fact table)
+#    1 colmap*  int64[n_cols]: program column -> its slot, or -(1 + k) for the k-th partner column
+#    2 n_pre  3 code*  4 consts*  5 set_bytes*  6 set_meta*  7 dtypes*  8 n_dcols  9 doffs*  (the fact
+#    leaf's own predicate program)   10 its first slot in an arrays row
+#    11 n_look  12 look*  (as mx_filter: key columns, partner key arrays, widths)  13 first probe key slot
+#    14 n_bcols  15 bcols*: int64[n_bcols][4] = (lookup, ArrowArray*, dtype, rank table* or 0)
+#    16 (unused)  17 words per arrays row
+# Group keys on partner columns (and derived keys) are expression keys: the executor groups by the program's
+# value of them. A partner string column's key is its rank in byte order (a dictionary-sized table the
+# executor applies while gathering), turned back into strings here.
+
+_DICT_MAX = 1 << 16        # a partner string column is encoded / ranked in Python up to this many distinct values
+
+
+class FusedJoin:
+    """A star join under an aggregate (``join_engine.fused_join_aggregate``): the fact table's scan and
+    predicates, the partner ``Lookup``s, where each column of the joined schema lives (``vcols``: name ->
+    ("fact", column) or ("partner", lookup index, column of the partner)) and the predicates over the
+    joined schema (conditions across partners, filters above the join)."""
+    __slots__ = ("scan", "preds", "lookups", "vcols", "post_preds")
+
+    def __init__(self, scan, preds, lookups, vcols, post_preds):
+        self.scan, self.preds, self.lookups, self.vcols, self.post_preds = scan, list(preds), lookups, vcols, post_preds
+
+
+class _VTable:
+    """The columns of a joined schema, each in the table it lives in (different lengths): just enough of a
+    table for ``compile_pipeline`` to read names, types and dictionaries."""
+
+    def __init__(self, cols):
+        self._cols = cols
+        self.column_names = list(cols)
+        self.schema = pa.schema([pa.field(n, c.type) for n, c in cols.items()])
+
+    def column(self, name):
+        return self._cols[name]
+
+
+def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Optional[pa.Table]:
+    """``plan``'s aggregate over the star join ``fj`` in one native call (plan version 3), or None (the
+    caller materializes the join and runs the aggregate as before). ``plan.input`` is not read."""
+    _last["path"] = None
+    t_start = _time.perf_counter()
+    if not enabled():
+        return _decline("disabled (MXFRAME_NATIVE=0)")
+    if os.environ.get("MXFRAME_FUSED_JOIN_AGG", "1") in ("0", "false", "off"):
+        return _decline("disabled (MXFRAME_FUSED_JOIN_AGG=0)")
+    if getattr(compiler, "_device_arg", None) != "cpu":
+        return _decline("CPU executor: device='cpu'")
+    from . import coproc_fused
+    if coproc_fused.current_policy() is not None:
+        return _decline("CPU+GPU co-processing policy active")
+    if not available():
+        return _decline("libmxexec_cpu.so not built")
+    table: pa.Table = fj.scan.table
+    if table.num_rows == 0 or not fj.lookups:
+        return _decline("empty input")
+    import numpy as np
+    from ._lazy_pc import pc
+    from .lazy_expr import Expr
+    from .np_arrow import array as _npa, to_numpy as _np_of
+    from .pipeline_kernels import default_threads
+    from .pipeline_program import compile_pipeline, _dict_key
+
+    # ── partners and the columns of the joined schema ───────────────────────────────────────────
+    pk_names: List[str] = []
+    bs, look_words = [], []
+    for lk in fj.lookups:
+        got = _lookup_keys(table, lk, pk_names)
+        if isinstance(got, str):
+            return _decline(got)
+        b, pks, widths = got
+        bs.append(b)
+        look_words.append((len(pks), pks, [b.column(bn).chunk(0) for bn in lk.build_keys], widths))
+    cols = {}
+    for name, src in fj.vcols.items():
+        c = table.column(src[1]) if src[0] == "fact" else bs[src[1]].column(src[2])
+        if src[0] == "partner" and pa.types.is_string(c.type) and 0 < len(c) <= _DICT_MAX:
+            c = pa.chunked_array([pc.dictionary_encode(c.chunk(0))])
+        cols[name] = c
+
+    # ── group keys: fact columns as they are; partner columns and expressions as expression keys ──
+    keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}
+    for i, e in enumerate(plan.group_by):
+        if e.op == "col" and e._alias in (None, e.args[0]):
+            name = e.args[0]
+            keys.append(name)
+            src = fj.vcols.get(name)
+            if src is None:
+                return _decline("group key outside the joined schema")
+            if src[0] == "fact":
+                fact_key[i] = src[1]
+                continue
+            c = cols[name]
+            if c.null_count:
+                return _decline("partner group key with nulls")
+            if c.type in (pa.int32(), pa.int64()):
+                a = _np_of(c.chunk(0), zero_copy_only=False)
+                derived[i], known[i], post[i] = e, (int(a.min()), int(a.max())), c.type
+            elif (pa.types.is_dictionary(c.type) and c.type.index_type == pa.int32()
+                  and pa.types.is_string(c.type.value_type)):
+                d = c.chunk(0).dictionary
+                if d.null_count or len(d) > _DICT_MAX:
+                    return _decline("partner string group key: dictionary too big or with nulls")
+                vals = d.to_pylist()
+                uniq = sorted(set(vals))
+                rank = {v: r for r, v in enumerate(uniq)}
+                rk = f"__rank:{name}"
+                cols[rk] = pa.chunked_array([c.chunk(0).indices])
+                extra[rk] = (src[1], np.array([rank[v] for v in vals], dtype=np.int32))
+                derived[i], known[i], post[i] = Expr("col", rk), (0, len(uniq) - 1), _npa(uniq, type=pa.string())
+            else:
+                return _decline(f"partner group key type {c.type}")
+        else:
+            if not e._alias:
+                return _decline("derived group key without a name")
+            keys.append(e._alias)
+            derived[i] = e
+    sort_by, limit = _split_post_ops(post_ops)
+    if isinstance(sort_by, str):
+        return _decline(sort_by)
+
+    n_user = len(plan.aggs)
+    hidden = [Expr("min", derived[i]).alias(f"__key{i}") for i in sorted(derived)]
+    prog = compile_pipeline(list(fj.post_preds), list(plan.aggs) + hidden, _VTable(cols), concat_dicts=True)
+    if prog is None:
+        return _decline("expression not supported by the bytecode compiler")
+    if prog.dict_arrays:
+        return _decline("string predicates outside concat mode")
+    key_slot = {}
+    for j, i in enumerate(sorted(derived)):
+        slot = prog.outputs[n_user + j][2]
+        if slot is None or not prog.slot_int[slot]:
+            return _decline("derived group key is not an integer expression")
+        key_slot[i] = slot
+    outputs = prog.outputs[:n_user]
+    names = [name for name, _, _ in outputs]
+    ranges = dict(known)
+    probe_idx = [i for i in sorted(derived) if i not in known]
+    if probe_idx:                      # an expression key's range: one fused min / max pass over the same join
+        probe = Aggregate(None, [], [a for i in probe_idx
+                                     for a in (Expr("min", derived[i]).alias(f"lo{i}"), Expr("max", derived[i]).alias(f"hi{i}"))])
+        r = try_execute_join(compiler, probe, fj, None, None)
+        if r is None:
+            return _decline("derived group key: range pass declined")
+        for i in probe_idx:
+            lo, hi = r.column(f"lo{i}")[0].as_py(), r.column(f"hi{i}")[0].as_py()
+            if lo is None or hi is None or lo != int(lo) or hi != int(hi):
+                return _decline("derived group key: not an integer range")
+            ranges[i] = (int(lo), int(hi))
+    if any(hi - lo + 1 > MAX_GROUPS for lo, hi in ranges.values()):
+        return _decline("group key: range too wide for direct addressing")
+    sorts = _sort_spec(sort_by, keys, names)
+    if isinstance(sorts, str):
+        return _decline(sorts)
+    having = _having_terms(having_pred, names)
+    if having is None:
+        return _decline("HAVING other than AND-ed aggregate <op> number")
+
+    # ── the program's columns: fact columns (read from the chunks), partner columns (gathered per block) ──
+    dcols = [c for c in prog.columns if c in prog.dict_concat]
+    fcols, fpos, colmap, dtypes, bspec = [], {}, [], [], []
+    for name in prog.columns:
+        c = cols[name]
+        if c.null_count:
+            return _decline(f"column {name} has nulls")
+        if name in prog.dict_concat:
+            dt = 5 | ((len(prog.columns) + dcols.index(name)) << 8)
+        elif c.type in _DT:
+            dt = _DT[c.type]
+        else:
+            return _decline(f"column {name}: type {c.type}")
+        dtypes.append(dt)
+        src = fj.vcols.get(name)
+        if src is not None and src[0] == "fact":
+            colmap.append(len(fcols))
+            fpos[name] = len(fcols)
+            fcols.append(c)
+        else:
+            j = src[1] if src is not None else extra[name][0]
+            colmap.append(-(len(bspec) + 1))
+            bspec.append((j, name, 0 if pa.types.is_dictionary(c.type) else _DT[c.type]))
+    key_cols, kinds = [], []
+    for i, k in enumerate(keys):
+        if i in derived:
+            key_cols.append(table.column(0))                 # placeholder: the key comes from the program
+            kinds.append(K_EXPR)
+            continue
+        c = table.column(fact_key[i])
+        kind = _key_kind(c)
+        if kind is None or c.null_count:
+            return _decline(f"group key type {c.type} or nulls")
+        key_cols.append(c)
+        kinds.append(kind)
+
+    # ── the fact leaf's own predicate (its columns ride along as more columns of the fact table) ──────
+    pre = compile_pipeline(list(fj.preds), [], table, concat_dicts=True)
+    if pre is None:
+        return _decline("fact predicate not supported by the bytecode compiler")
+    if pre.dict_arrays:
+        return _decline("string predicates outside concat mode")
+    pdcols = [c for c in pre.columns if c in pre.dict_concat]
+    pre_cols = [table.column(c) for c in pre.columns]
+    pdtypes = []
+    for name, c in zip(pre.columns, pre_cols):
+        if name in pre.dict_concat:
+            pdtypes.append(5 | ((len(pre.columns) + pdcols.index(name)) << 8))
+        elif c.type in _DT and not c.null_count:
+            pdtypes.append(_DT[c.type])
+        else:
+            return _decline(f"predicate column type {c.type} or nulls")
+    probe_cols = [table.column(n) for n in pk_names]
+    every = fcols + key_cols + pre_cols + probe_cols
+    segs = _segments(every)
+    if not segs:
+        return _decline("empty input")
+
+    # ── export (Arrow C Data Interface) and the plan buffer ──────────────────────────────────────
+    n_fa, n_keys, n_out = len(fcols), len(keys), len(outputs)
+    pre_off = n_fa + n_keys
+    probe_off = pre_off + len(pre_cols)
+    width = len(every)
+    structs, keep = [], []
+
+    def export(arr):
+        st = (ctypes.c_int64 * 10)()
+        arr._export_to_c(ctypes.addressof(st))
+        structs.append(st)
+        return ctypes.addressof(st)
+
+    arrays = (ctypes.c_int64 * (len(segs) * width))()
+    try:
+        for r, seg in enumerate(segs):
+            for j, piece in enumerate(seg):
+                arrays[r * width + j] = export(piece)
+        L = (ctypes.c_int64 * max(8 * len(look_words), 1))()
+        for j, (nk, pks, bkeys, widths) in enumerate(look_words):
+            L[8 * j: 8 * j + 8] = [nk, pks[0], pks[1] if nk == 2 else -1, export(bkeys[0]),
+                                   export(bkeys[1]) if nk == 2 else 0, widths, 0, 0]
+        bwords = []
+        for j, name, dcode in bspec:
+            rm = 0
+            if name in extra:
+                m = extra[name][1]
+                keep.append(m)
+                rm = m.ctypes.data
+            bwords += [j, export(cols[name].chunk(0)), dcode, rm]
+        c_bcols = (ctypes.c_int64 * max(len(bwords), 1))(*bwords)
+        doffs = []
+        for seg in segs:
+            for name in dcols:
+                d = seg[fpos[name]].dictionary if name in fpos else cols[name].chunk(0).dictionary
+                doffs.append(prog.dict_concat[name][_dict_key(d)])
+        pdoffs = [pre.dict_concat[n][_dict_key(seg[pre_off + pre.columns.index(n)].dictionary)]
+                  for seg in segs for n in pdcols]
+        c_doffs = (ctypes.c_int64 * max(len(doffs), 1))(*doffs)
+        c_pdoffs = (ctypes.c_int64 * max(len(pdoffs), 1))(*pdoffs)
+        code, pcode = prog.code, pre.code
+        if dcols:
+            code = code.copy()
+            code[7] = len(prog.columns) + len(dcols)
+        if pdcols:
+            pcode = pcode.copy()
+            pcode[7] = len(pre.columns) + len(pdcols)
+        c_dtypes = (ctypes.c_int32 * max(len(dtypes), 1))(*dtypes)
+        c_pdtypes = (ctypes.c_int32 * max(len(pdtypes), 1))(*pdtypes)
+        c_colmap = (ctypes.c_int64 * max(len(colmap), 1))(*colmap)
+        c_kinds = (ctypes.c_int64 * max(n_keys, 1))(*kinds)
+        c_outs = (ctypes.c_int64 * max(3 * n_out, 1))(
+            *[v for name, op, slot in outputs
+              for v in (_OPS[op], slot if slot is not None else 0, prog.nan_slots.get(name, -1))])
+        c_sorts = (ctypes.c_int64 * max(3 * len(sorts), 1))(*[v for t in sorts for v in t])
+        c_having = (ctypes.c_int64 * max(3 * len(having), 1))(*[v for j, c, _ in having for v in (j, c, 0)])
+        c_hconst = (ctypes.c_double * max(len(having), 1))(*[x for _, _, x in having])
+        c_xkeys = (ctypes.c_int64 * max(3 * n_keys, 1))(
+            *[v for i in range(n_keys) for v in ((key_slot[i],) + ranges[i] if i in derived else (0, 0, 0))])
+        F = (ctypes.c_int64 * 18)(
+            n_fa, ctypes.addressof(c_colmap), len(pre_cols), pcode.ctypes.data, pre.consts.ctypes.data,
+            pre.set_bytes.ctypes.data, pre.set_meta.ctypes.data, ctypes.addressof(c_pdtypes), len(pdcols),
+            ctypes.addressof(c_pdoffs), pre_off, len(look_words), ctypes.addressof(L), probe_off,
+            len(bspec), ctypes.addressof(c_bcols), 0, width)
+        P = (ctypes.c_int64 * 27)(
+            MAGIC, 3, len(segs), len(prog.columns), n_keys, n_out, len(sorts),
+            code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
+            prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
+            ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
+            default_threads(table.num_rows), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
+            MAX_GROUPS, ctypes.addressof(c_hconst),
+            len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys), ctypes.addressof(F))
+        O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
+        lib = _load()
+        t_call = _time.perf_counter()
+        rc = _call(lib, ctypes.addressof(P), ctypes.addressof(O))
+        native_ms = (_time.perf_counter() - t_call) * 1000
+    finally:
+        for st in structs:
+            if st[8]:
+                _RELEASE(st[8])(ctypes.addressof(st))
+    if rc < 0:
+        return _decline(f"executor declined (code {rc})")
+
+    result = _wrap_result(lib, O, keys, kinds, outputs)
+    for i, how in post.items():                      # expression keys back to the column's own values
+        c = result.column(i)
+        result = result.set_column(i, keys[i], pc.take(how, c) if isinstance(how, pa.Array) else pc.cast(c, how))
+    total_ms = (_time.perf_counter() - t_start) * 1000
+    _last.update(path="native", decline=None, native_ms=native_ms, py_ms=total_ms - native_ms)
+    compiler.last_compile_provenance = {
+        "device": "cpu", "rows": int(result.num_rows), "grouped": bool(keys), "n_groups": int(result.num_rows) if keys else 0,
+        "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data", "fused_join": True,
+    }
+    return result
 
 
 # ── M2: native gather (a join's output rows) ───────────────────────────────────────────────

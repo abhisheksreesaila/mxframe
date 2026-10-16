@@ -1462,6 +1462,22 @@ class CustomOpsCompiler(GraphCompiler):
             plan = getattr(plan, "input", None)
         return False
 
+    def _fused_join_aggregate(self, plan):
+        """``[Sort Limit] [HAVING] Aggregate`` over an inner-join tree as one native call
+        (``join_engine.fused_join_aggregate``); None when the plan has another shape or declines."""
+        core, post_ops = self._extract_post_ops(plan)
+        having = None
+        if isinstance(core, Filter) and isinstance(core.input, Aggregate) and core.input.group_by:
+            having, core = core.predicate, core.input
+        if not isinstance(core, Aggregate):
+            return None
+        from . import join_engine
+        try:
+            return join_engine.fused_join_aggregate(self, core, having, post_ops)
+        except Exception as exc:        # a plan is fully native or not at all: never fail the query
+            _native_exec._decline(f"fused join + aggregate raised {type(exc).__name__}: {exc}")
+            return None
+
     def _materialize_barrier(self, plan):
         """Compute what sits below an aggregate result as a table, so the operator above works on it.
 
@@ -1733,6 +1749,12 @@ class CustomOpsCompiler(GraphCompiler):
         # Used below to emit an accurate 'join_mojo_shortcut' provenance label
         # for plans whose only heavy work is a Mojo-executed hash join.
         _had_join = self._has_join_node(plan)
+
+        # -1a -- F-046a slice 3: an aggregate over inner joins runs as one native call, no joined rows
+        if _had_join and _native_exec is not None:
+            _fused = self._fused_join_aggregate(plan)
+            if _fused is not None:
+                return _fused
 
         # -1 -- Materialize Join nodes (bottom-up) --------------------
         plan = self._materialize_joins(plan)
