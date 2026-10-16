@@ -27,7 +27,7 @@ def test_every_library_is_registered():
 
 def test_source_sets_follow_imports():
     names = lambda lib: [p.name for p in rbh.sources(ROOT, lib)]
-    assert names("libmxexec_cpu.so") == ["executor_cpu.mojo", "pipeline_cpu.mojo"]
+    assert names("libmxexec_cpu.so") == ["executor_cpu.mojo", "hashagg_cpu.mojo", "pipeline_cpu.mojo"]
     assert names("libmxkernels_aot_gpu.so") == ["_atomic.mojo", "kernels_aot_gpu.mojo"]
     assert names("libmxgroupkeys_cpu.so") == ["groupkeys_cpu.mojo"]
 
@@ -63,7 +63,7 @@ def test_missing_record_is_stale(tree):
 
 def test_record_is_a_per_library_sorted_json_file(tree):
     data = json.loads((tree / "kernels_aot" / "libmxexec_cpu.so.sources.json").read_text())
-    assert list(data["sources"]) == ["executor_cpu.mojo", "pipeline_cpu.mojo"]
+    assert list(data["sources"]) == ["executor_cpu.mojo", "hashagg_cpu.mojo", "pipeline_cpu.mojo"]
     assert all(len(h) == 64 for h in data["sources"].values())
 
 

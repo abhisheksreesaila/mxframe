@@ -396,16 +396,16 @@ def test_int64_past_2_53_declines_with_the_exact_answer(calls, monkeypatch):
             _same(_rows(got), _duck(sql, fact=fact, dim=dim))
 
 
-def test_a_wide_group_key_range_declines(calls):
-    """k x g x d spans 3 million codes: past direct addressing the executor returns E_BAD_KEY (-11), the
-    old path answers (hashed keys, until the fused call takes them)."""
+def test_a_wide_group_key_range_is_hashed_by_the_fused_call(calls):
+    """k x g x d spans 3 million codes: past direct addressing the fused call hashes the key tuples (F-069;
+    it used to return E_BAD_KEY (-11) and leave the old path to answer)."""
     fact, dim1, _, _ = _tables()
     got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
            .groupby("k", "g", "d").agg(col("v").sum().alias("s")).compute(device="cpu"))
-    _declined(calls, -11)
+    _fused(calls)
+    assert nx.last_group_path() == "hash"
     exp = _duck("SELECT k, g, d, SUM(v) FROM fact JOIN dim1 ON k = dk GROUP BY k, g, d", fact=fact, dim1=dim1)
     _same(_rows(got, ["k", "g", "d", "s"]), exp)
-    assert calls["star"] > 0, calls
 
 
 def test_global_aggregate_over_a_fact_filter_that_keeps_nothing(calls):
@@ -449,8 +449,10 @@ def test_a_declined_fused_call_does_not_build_the_partners_again(calls, monkeypa
     real = je._star_setup
     monkeypatch.setattr(je, "_star_setup", lambda *a, **k: (built.append(1), real(*a, **k))[1])
     fact, dim1, _, _ = _tables()
-    got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
-           .groupby("k", "g", "d").agg(col("v").sum().alias("s")).compute(device="cpu"))
+    plan = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+            .groupby("k", "g").agg(col("v").sum().alias("s"), col("v").count().alias("n")))
+    monkeypatch.setattr(nx, "_probe_range", lambda fj, bs, name: (0, 100) if name == "k" else None)    # k reaches 4999: -11
+    got = plan.compute(device="cpu")
     _declined(calls, -11)
     assert len(built) == 1, built
     assert got.num_rows > 0
@@ -516,17 +518,18 @@ def test_negative_key_values_after_the_first_key_group_by_partner_row(calls):
 
 
 @pytest.mark.parametrize("keys", [["a", "b", "nm"], ["b", "a"], ["a", "b"]])
-def test_partner_keys_without_the_unique_key_decline_with_the_right_groups(calls, keys):
+def test_partner_keys_without_the_unique_key_are_hashed_with_the_right_groups(calls, keys):
     """Several partner rows share a key tuple (TPC-H Q10's per-customer keys through orders): grouping by
-    partner row would need a merge, so the fused call declines and the old path answers (negative key
-    values included)."""
+    partner row would need a merge, so the key tuples are hashed by the fused call (F-069; the call used to
+    decline and the old path answered), negative key values included."""
     fact, _, _, _ = _tables()
     dim = _wide_dim()
     fact = fact.set_column(0, "k", A((np.asarray(fact.column("k").to_numpy()) % 6000).astype(np.int64)))
     got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
            .groupby(*keys).agg((col("v") * col("w")).sum().alias("s"), col("v").count().alias("n"),
                                col("v").mean().alias("av")).compute(device="cpu"))
-    _declined(calls)
+    _fused(calls)
+    assert nx.last_group_path() == "hash"
     exp = _duck(f"SELECT {', '.join(keys)}, SUM(v * w) s, COUNT(v) n, AVG(v) av FROM fact JOIN dim ON k = dk "
                 f"GROUP BY {', '.join(keys)} ORDER BY {', '.join(keys)}", fact=fact, dim=dim)
     assert len(exp) > 100
@@ -619,18 +622,18 @@ def test_a_join_key_group_key_is_bounded_by_the_partners_keys_without_a_scan(cal
     _same(_rows(got, ["k", "g", "s", "n"]), exp)
 
 
-def test_a_join_key_group_key_with_a_wide_partner_range_declines_before_any_call(calls):
+def test_a_join_key_group_key_with_a_wide_partner_range_is_hashed(calls):
     """The partner's keys span 5 million: with another fact group key the key space is far past direct
-    addressing, known from the partner alone, so no native call is made at all."""
+    addressing, known from the partner alone, so the fused call hashes the tuples without a range pass (F-069;
+    it used to decline before any native call)."""
     fact, _, _, _ = _tables()
     r = np.random.default_rng(2)
     dim = pa.table({"dk": A(np.arange(5000, dtype=np.int64) * 1000), "w": A(np.round(r.random(5000), 3))})
     fact = fact.set_column(0, "k", A(r.integers(0, 5000, fact.num_rows).astype(np.int64) * 1000))
-    nx.reset_decline_counts()
     got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
            .groupby("k", "g").agg(col("v").sum().alias("s"), col("v").count().alias("n")).compute(device="cpu"))
-    assert 3 not in calls["exec"], calls
-    assert nx.decline_counts().get("group key space too wide for direct addressing") == 1, nx.decline_counts()
+    _fused(calls)
+    assert calls["exec"] == [3] and nx.last_group_path() == "hash", calls
     exp = _duck("SELECT k, g, SUM(v), COUNT(v) FROM fact JOIN dim ON k = dk GROUP BY k, g", fact=fact, dim=dim)
     _same(_rows(got, ["k", "g", "s", "n"]), exp)
 
