@@ -7,10 +7,13 @@ work and the measurements that shaped it.
 
 **Interactive version:** [How device="auto" decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) on the docs site (the rules with live inputs, and the measured results).
 
-> **Status in 0.6.0:** the measurements on this page are from 2026-10-12, before the native Mojo
-> executor. Under `device="auto"` the native executor doesn't run yet (when auto picks the CPU it
-> uses the fused pipeline), so the 0.6.0 benchmark numbers apply to `device="cpu"`, not to auto.
-> Re-measuring auto and fixing this is ticket F-053 in [plan.md](plan.md).
+> **Status:** the measurements on this page are from 2026-10-12, before the native Mojo
+> executor. Since F-053, a CPU decision under `device="auto"` runs the native executor exactly as
+> `device="cpu"` does; the older fused pipeline (which can split rows with the GPU) runs only when
+> the cost model predicts a split beats the native CPU executor, or when `gpu_fraction` forces one.
+> The model prices the native executor as equal to the older kernel (`auto_mode.NATIVE_CPU_FACTOR = 1.0`,
+> one warm measurement on a busy machine), so a split is chosen only if it beats that by 10%. The
+> numbers below have not been re-run; re-measuring auto is the open item of F-053 in [plan.md](plan.md).
 
 All numbers below come from the reference machine: AMD Ryzen 9 5900X (24 threads,
 dual-channel DDR4) and an NVIDIA RTX 3090 on PCIe 4.0 x8, TPC-H data at scale factor 10.

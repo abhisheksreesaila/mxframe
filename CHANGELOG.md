@@ -19,8 +19,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `docs/api.md` and `CONTRIBUTING.md` are rewritten for the native executor.
 - **LICENSE** file added (Apache-2.0, as already declared in `pyproject.toml`).
 
-### Known issue
-- `device="auto"` (the default) doesn't use the native executor yet. Pass `device="cpu"` for the 0.6.0 numbers (F-053).
+### Changed
+- `device="auto"` now runs the native executor on every CPU decision (F-053); the co-processing policy is set only for a predicted CPU+GPU split or an explicit `gpu_fraction`.
 
 ## [0.6.0] — 2026-10-14
 

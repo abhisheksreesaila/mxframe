@@ -52,6 +52,7 @@ Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
 - Research (2026-10-15, `docs/research/cpu-gpu-coprocessing.md`): keep F-006's design (host data -> CPU, resident data -> static split, one GPU call; Mordred 2022); split only if predicted time beats the faster device by 10% after per-call (4.5 ms), merge and contention costs; CPU threads take late GPU work; the second GPU as a third worker with its own resident share
+- Check first (review of F-053): a `read_parquet` frame may never find its data resident: sources are re-read on each compute and residency is keyed by buffer addresses. Verify a repeat query finds its columns resident before relying on resident-data splits.
 - [ ] the native CPU executor takes the CPU share of a split (today a split runs the older fused pipeline)
 - [ ] a split is chosen only where calibration predicts it beats both single devices, and `explain` says why
 - [ ] measured on a quiet machine: auto within 10% of min(cpu, gpu) on every query, faster than both on the shapes the split targets (high-volume aggregation on resident data)
@@ -590,11 +591,13 @@ Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open item
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
 - [x] restyled on `site.css`, "how to read this" header, numbers from the bench files
 
-## F-053 device="auto" never uses the native executor [todo]
+## F-053 device="auto" never uses the native executor [review]
 Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
 - [ ] re-run the user-felt TPC-H scoreboard with `mx-auto` next to `mx-cpu` on 0.6.0 (quiet machine)
-- [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
+- [x] auto sets the co-processing policy only when `auto_mode._cpu_path` predicts a CPU+GPU split beats the native CPU executor by 10% (or the caller passes `gpu_fraction`); every other CPU decision runs the native executor exactly as `device="cpu"`; `MXFRAME_COPROC=0` honoured. Split is priced on source rows (what the pipeline and upload read) and only predicted for shapes the split can take (no join below the aggregate, bare group keys; `coproc_fused.stable_group_keys` is shared with `pipeline_exec`). Decision: the native executor does NOT take the CPU share of a split (big change in native_exec, which another ticket is editing); a split stays on the older pipeline and is chosen only when it beats `pipeline@cpu * NATIVE_CPU_FACTOR`. Factor is 1.0: one warm Q1-shaped 6M-row measurement on a busy machine (load 12) gave native 7.7 ms vs fused 6.9 ms, so no native speed-up is assumed. Refresh it, and add a real native calibration probe, in the quiet-machine run. `explain(device="auto", costs=True)` prints `cpu path: ...` and why. Tests: `tests/test_f053_auto_native.py`
 - [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again
+  - note: the README, site, auto-mode.md and CHANGELOG were already changed to describe the current behaviour honestly (auto runs the native executor on a CPU decision; no speed claim), pending the quiet-machine check above
+- [ ] TODO quiet machine: `auto` within 10% of min(cpu, gpu) on >= 20/22 queries at SF1 and SF10 (median of fresh-process runs)
 
 ## F-054 Finish the docs [done]
 Asked 2026-10-14 ("add license, finish docs, hold off on new dev")
