@@ -172,33 +172,35 @@ def _nz(x: Float64) -> Bool:
 
 
 @always_inline
-def _cmp_f(cmp: Int, x: Float32, t: Float32) -> Bool:
+def _cmp_f(cmp: Int, x: Float32, t: Float32, na: Bool) -> Bool:
+    """x <cmp> t; na: NaN is above every number (+inf too) and NaN = NaN, as DuckDB (F-070)."""
     if cmp == OP_GE:
-        return x >= t
+        return x >= t or (na and not (x == x))
     elif cmp == OP_LT:
-        return x < t
+        return x < t or (na and not (t == t) and x == x)
     elif cmp == OP_LE:
-        return x <= t
+        return x <= t or (na and not (t == t))
     elif cmp == OP_GT:
-        return x > t
+        return x > t or (na and not (x == x) and t == t)
     elif cmp == OP_EQ:
-        return x == t
-    return x != t
+        return x == t or (na and not (x == x) and not (t == t))
+    return not (x == t or (na and not (x == x) and not (t == t)))
 
 
 @always_inline
-def _cmp_d(cmp: Int, x: Float64, t: Float64) -> Bool:
+def _cmp_d(cmp: Int, x: Float64, t: Float64, na: Bool) -> Bool:
+    """x <cmp> t; na: NaN is above every number (+inf too) and NaN = NaN, as DuckDB (F-070)."""
     if cmp == OP_GE:
-        return x >= t
+        return x >= t or (na and not (x == x))
     elif cmp == OP_LT:
-        return x < t
+        return x < t or (na and not (t == t) and x == x)
     elif cmp == OP_LE:
-        return x <= t
+        return x <= t or (na and not (t == t))
     elif cmp == OP_GT:
-        return x > t
+        return x > t or (na and not (x == x) and t == t)
     elif cmp == OP_EQ:
-        return x == t
-    return x != t
+        return x == t or (na and not (x == x) and not (t == t))
+    return not (x == t or (na and not (x == x) and not (t == t)))
 
 
 @always_inline
@@ -217,15 +219,15 @@ def _cmp_i(cmp: Int, x: Int64, t: Int64) -> Bool:
 
 
 @always_inline
-def _cmpc(addr: Int, dtype: Int, row: Int, thr: Float64, cmp: Int) -> Float64:
+def _cmpc(addr: Int, dtype: Int, row: Int, thr: Float64, cmp: Int, na: Bool) -> Float64:
     """column[row] <cmp> thr in the column's own type (thr was rounded on the host)."""
     if dtype == 2:
         var x = Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=addr)[row]
-        return _b(_cmp_f(cmp, x, thr.cast[DType.float32]()))
+        return _b(_cmp_f(cmp, x, thr.cast[DType.float32](), na))
     elif dtype == 0:
         return _b(_cmp_i(cmp, _ip(addr)[row].cast[DType.int64](), Int64(thr)))
     elif dtype == 3:
-        return _b(_cmp_d(cmp, _fp(addr)[row], thr))
+        return _b(_cmp_d(cmp, _fp(addr)[row], thr, na))
     elif dtype == 1:
         return _b(_cmp_i(cmp, _lp(addr)[row], Int64(thr)))
     return _b(_cmp_i(cmp, _bp(addr)[row].cast[DType.int64](), Int64(thr)))
@@ -294,10 +296,11 @@ def _run[RPT: Int, B: Int](
             var addr = Int(cols[c])
             var dt = Int(dts[c])
             var thr = consts[Int(ins[3])]
-            var cmp = Int(ins[4])
+            var cmp = Int(ins[4]) & 255
+            var na = (Int(ins[4]) >> 8) != 0
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    d[k * B] = _cmpc(addr, dt, row_base + tid + k * B, thr, cmp)
+                    d[k * B] = _cmpc(addr, dt, row_base + tid + k * B, thr, cmp, na)
         elif op < OP_LT:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid
@@ -316,22 +319,10 @@ def _run[RPT: Int, B: Int](
         elif op < OP_AND:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid
+            var na = Int(ins[4]) != 0
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
-                    var x = a[k * B]
-                    var y = b[k * B]
-                    var r = _b(x < y)
-                    if op == OP_LE:
-                        r = _b(x <= y)
-                    elif op == OP_GT:
-                        r = _b(x > y)
-                    elif op == OP_GE:
-                        r = _b(x >= y)
-                    elif op == OP_EQ:
-                        r = _b(x == y)
-                    elif op == OP_NE:
-                        r = _b(x != y)
-                    d[k * B] = r
+                    d[k * B] = _b(_cmp_d(op, a[k * B], b[k * B], na))
         elif op < OP_NOT:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid

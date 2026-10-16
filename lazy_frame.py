@@ -829,8 +829,8 @@ def _fold_subquery_value(op: str, args) -> Optional[Expr]:
                 r = a + b if op == "add" else a - b if op == "sub" else a * b
             return None if isinstance(r, int) and abs(r) > 2 ** 53 else lit(r)
         a, b = (_num_of(x) for x in args)          # two constants compared (NOT IN's emptiness / NULL test)
-        if a is None or b is None or abs(a) > 2 ** 53 or abs(b) > 2 ** 53:
-            return None
+        if a is None or b is None or abs(a) > 2 ** 53 or abs(b) > 2 ** 53 or a != a or b != b:
+            return None                            # (a NaN orders above every number: the engine's compares know that)
         return lit({"lt": a < b, "le": a <= b, "gt": a > b, "ge": a >= b, "eq": a == b, "ne": a != b}[op])
     if op == "not":
         if _is_null(args[0]):

@@ -120,6 +120,18 @@ def _and_all(nodes: List[sge.Expression]) -> Optional[sge.Expression]:
 _EPOCH = date(1970, 1, 1)
 
 
+def _float_cast(node: sge.Expression) -> Optional[float]:
+    """The value of ``CAST('nan' | 'inf' | '-inf' | '1.5' AS DOUBLE | FLOAT)``, else None: the way SQL writes
+    a NaN or infinity constant."""
+    if (isinstance(node, sge.Cast) and node.to.this in (sge.DataType.Type.DOUBLE, sge.DataType.Type.FLOAT)
+            and isinstance(node.this, sge.Literal) and node.this.is_string):
+        try:
+            return float(node.this.this)
+        except ValueError:
+            raise ValueError(f"not a number: CAST('{node.this.this}' AS {node.to.sql(dialect='duckdb')})") from None
+    return None
+
+
 def _date_of(node: sge.Expression) -> Optional[date]:
     """The date of a constant ``DATE 'yyyy-mm-dd'`` [+ / - INTERVAL 'n' DAY | MONTH | YEAR ...], else None."""
     node = _unparen(node)
@@ -1325,6 +1337,9 @@ class _SQLTranslator:
                 return lit(node.this)
             v = node.this
             return lit(int(v)) if "." not in str(v) else lit(float(v))
+        f = _float_cast(node)
+        if f is not None:
+            return lit(f)
 
         # ---- parentheses ----
         if isinstance(node, sge.Paren):
@@ -1467,6 +1482,9 @@ class _SQLTranslator:
             return int(v) if "." not in str(v) else float(v)
         if isinstance(node, sge.Neg):
             return -self._scalar(node.this)
+        f = _float_cast(node)
+        if f is not None:
+            return f
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
