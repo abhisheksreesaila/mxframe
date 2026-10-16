@@ -87,6 +87,7 @@ def _eq(x, y):
 
 
 def _check(sql, hooks, ordered=False, join=None, nrows=None):
+    """A derived table's schema is asked first on zero rows (LazyFrame.schema): those calls decline 'empty input'."""
     exp = _duck(sql)
     got_t = mx.sql(sql, **TABLES).compute(device="cpu")
     got = [tuple(got_t.column(i)[r].as_py() for i in range(got_t.num_columns)) for r in range(got_t.num_rows)]
@@ -98,6 +99,7 @@ def _check(sql, hooks, ordered=False, join=None, nrows=None):
     assert len(got) == len(exp), (got, exp)
     for g, e in zip(got, exp):
         assert len(g) == len(e) and all(_eq(x, y) for x, y in zip(g, e)), (g, e)
+    hooks = [h for h in hooks if h[1] or h[2] != "empty input"]
     declined = [h for h in hooks if not h[1]]
     assert not declined, declined
     assert hooks, "no native aggregate call was made"
@@ -234,3 +236,25 @@ def test_a_literal_column_next_to_a_computed_one_still_broadcasts(hooks):
     t = pa.table({"k": pa.array([1, 2], pa.int64()), "y": pa.array([1.5, 2.5], pa.float64())})
     got = mx.sql("select k, y * 2.0 as d, (select max(y) from u) as m from t", t=t, u=t).compute(device="cpu")
     assert got.to_pydict() == {"k": [1, 2], "d": [3.0, 5.0], "m": [2.5, 2.5]}
+
+
+def test_a_dictionary_column_passes_through_a_float_project_decoded():
+    from mxframe.custom_ops import _np_float_project
+    t = pa.table({"k": pa.array(["a", "b"]).dictionary_encode(), "y": pa.array([1.5, 2.5], pa.float64())})
+    got = _np_float_project([mx.col("k"), (mx.col("y") * 2.0).alias("d")], t)
+    assert got.schema.field("k").type == pa.string()
+    assert got.to_pydict() == {"k": ["a", "b"], "d": [3.0, 5.0]}
+
+
+def test_second_aggregate_over_an_aggregate_over_a_join(hooks):
+    got = _check("select max(r) as top, min(r) as bot, sum(r) / count(*) as m from "
+                 "(select g, sum(a) / sum(q) as r from f, d where fk = dk and g < 7 group by g) t",
+                 hooks, nrows=1, join=True)
+    assert got[0][0] > got[0][1]
+
+
+def test_filter_over_a_global_aggregate_over_a_join(hooks):
+    got = _check("select * from (select sum(a) / sum(q) as r from f, d where fk = dk) t where r > 0",
+                 hooks, nrows=1, join=True)
+    assert got[0][0] > 0
+    _check("select * from (select sum(a) / sum(q) as r from f, d where fk = dk) t where r < 0", hooks)

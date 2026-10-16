@@ -99,7 +99,9 @@ _NP_ARITH = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "div": np.di
 def _np_float_project(exprs, table):
     """F-068: a Project over an aggregate's result (``100 * a / b``, ``0.2 * avg``) whose computed columns are
     only ``+ - * /`` over float64 columns without nulls and numeric literals: one NumPy pass per operator over
-    the groups (IEEE like DuckDB: x / 0 is inf, 0 / 0 is NaN), no Arrow compute. Plain columns pass through.
+    the groups (IEEE like DuckDB: x / 0 is inf, 0 / 0 is NaN), no Arrow compute. Plain columns pass through
+    (dictionaries decoded). Runs for every Project in ``_plan_to_table``, not only over an aggregate: IEEE
+    float64 gives the same values either way.
     None when anything else is in it (integers need the checked kernels, strings and CASE the Arrow path)."""
     def ev(e):
         if e.op == "lit":
@@ -122,7 +124,7 @@ def _np_float_project(exprs, table):
     with np.errstate(all="ignore"):
         for e in exprs:
             if e.op == "col":
-                arr = table.column(e.args[0])
+                arr = _decode_dict(table.column(e.args[0]))          # as the Arrow branch does
             else:
                 got = ev(e)
                 if got is None or np.isscalar(got):          # a bare literal: the Arrow path broadcasts it
