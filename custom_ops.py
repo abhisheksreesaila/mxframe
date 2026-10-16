@@ -1676,12 +1676,19 @@ class CustomOpsCompiler(GraphCompiler):
         for c in wanted:
             held = [s for s in leaves if c in s.table.column_names]
             if held:
-                is_s = any(is_str(h.table.schema.field(c).type) for h in held)
+                is_s = is_str(held[0].table.schema.field(c).type)      # a bare name is the left-most copy (walk visits left first)
             else:                                     # a renamed copy (s_right), or a computed column
                 from .io_parquet import _renamed_ref
-                src = [s.table.schema.field(n).type for s in leaves for n in s.table.column_names if _renamed_ref(n, [c])]
+                src = []                              # the copy a join renamed: x_right is the 2nd holder of x, x_rightN the Nth
+                for n in dict.fromkeys(n for s in leaves for n in s.table.column_names):
+                    if _renamed_ref(n, [c]):
+                        k = int(c[len(n) + 6:] or 1)
+                        copies = [s.table.schema.field(n).type for s in leaves if n in s.table.column_names]
+                        if k < len(copies):
+                            src = [copies[k]]
+                            break
                 if src:
-                    is_s = any(is_str(t) for t in src)
+                    is_s = is_str(src[0])
                 elif not any_string:                  # no string column anywhere: nothing to rank
                     is_s = False
                 else:                                 # a computed column: its type needs a zero-row run

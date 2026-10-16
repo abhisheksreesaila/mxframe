@@ -235,3 +235,30 @@ def test_a_user_column_named_like_the_rank_column():
     got, prov = _run(mx.sql("SELECT k, MAX(s) hi, MAX(__rank_s__) r FROM t GROUP BY k", t=t))
     assert _rows(got) == _duck("SELECT k, MAX(s), MAX(__rank_s__) FROM t GROUP BY k", t=t)
     assert prov["path"] == "native"
+
+
+@pytest.mark.parametrize("string_side", ["right", "left"])
+def test_a_clashing_name_is_ranked_only_when_the_copy_it_names_is_a_string(monkeypatch, string_side):
+    import mxframe.custom_ops as co
+    calls = []
+    real = co._rank_strings
+    monkeypatch.setattr(co, "_rank_strings", lambda c: (calls.append(str(c.type)), real(c))[1])
+    r = np.random.default_rng(3)
+    n = 20_000
+    words = pa.array([WORDS[i % 7] for i in range(50)]).dictionary_encode()
+    nums = A(r.random(50))
+    fact = pa.table({"pk": A(r.integers(0, 50, n)), "g": A(r.integers(0, 5, n).astype(np.int32)), "v": A(r.random(n))})
+    part = pa.table({"pk": A(np.arange(50)), "v": words})
+    if string_side == "left":                      # string `v` on the left, numeric `v_right` on the right
+        fact = pa.table({"pk": A(np.arange(50)), "g": A((np.arange(50) % 5).astype(np.int32)), "v": words})
+        part = pa.table({"pk": A(np.arange(50)), "v": nums})
+    j = lambda: LazyFrame(fact).join(LazyFrame(part), on="pk").groupby("g")
+    num, string = ("v", "v_right") if string_side == "right" else ("v_right", "v")
+    got = j().agg(col(num).max().alias("m")).compute(device="cpu")
+    exp = _duck(f"SELECT g, MAX({'fact' if num == 'v' else 'part'}.v) FROM fact JOIN part USING (pk) GROUP BY g", fact=fact, part=part)
+    assert _rows(got) == exp and got.schema.field("m").type == pa.float64()
+    assert calls == []                              # the numeric copy is not ranked
+    got = j().agg(col(string).max().alias("m")).compute(device="cpu")
+    exp = _duck(f"SELECT g, MAX({'part' if string == 'v_right' else 'fact'}.v) FROM fact JOIN part USING (pk) GROUP BY g", fact=fact, part=part)
+    assert _rows(got) == exp and got.schema.field("m").type == pa.string()
+    assert len(calls) == 1                          # the string copy is
