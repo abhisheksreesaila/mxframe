@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from mxframe import LazyFrame, col, gpu_stream
+from mxframe import LazyFrame, col, custom_ops, gpu_stream
 from mxframe import auto_mode as am
 from mxframe.aot_kernels import _bind_gpu, get_aot_gpu
 
@@ -108,6 +108,8 @@ def _force_gpu(monkeypatch):
         .groupby("g").agg(col("v").sum().alias("s")).sort("g")),
 ])
 def test_auto_reruns_on_the_cpu_when_a_gpu_kernel_fails(monkeypatch, kernel, query):
+    """F-056: the piece that ran out of memory reruns on the CPU, the rest of the query stays on the GPU;
+    the query shape is remembered, so the next auto plans the CPU."""
     rng = np.random.default_rng(1)
     n = 20_000
     t = pa.table({"k": rng.integers(0, 500, n).astype(np.int32), "v": rng.random(n, dtype=np.float32),
@@ -118,14 +120,19 @@ def test_auto_reruns_on_the_cpu_when_a_gpu_kernel_fails(monkeypatch, kernel, que
     g = get_aot_gpu()
     _force_gpu(monkeypatch)
     _fail(monkeypatch, g, kernel, -2)
+    got = lf.compute(device="auto")
+    assert got.equals(want)
+    assert "ran on CPU, ran out of GPU memory" in lf.last_compile_provenance["gpu_pieces"]
+    assert "ran out of GPU memory" in lf.last_auto_decision.explain()
+    assert am._failed_shapes
+    custom_ops.clear_cache()                                 # (a cached join result would skip the join)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
-        got = lf.compute(device="auto")
-    assert got.equals(want)
-    assert lf.last_auto_decision.device == "cpu" and lf.last_auto_decision.fallback
-    assert any("fell back to CPU" in str(x.message) for x in w)
+        assert lf.compute(device="gpu").equals(want)         # an explicit gpu is served too, with a warning
+    assert any("ran on CPU" in str(x.message) for x in w)
+    custom_ops.clear_cache()
     with pytest.raises(MemoryError):
-        lf.compute(device="gpu")
+        lf.compute(device="gpu", strict=True)
     am.forget_gpu_failures()
 
 

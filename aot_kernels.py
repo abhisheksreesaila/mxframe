@@ -88,7 +88,8 @@ def check_join_output_size(total: int) -> None:
     """Refuse a join whose output has more rows than int32 offsets address: the scatter kernel would write
     through wrapped-around offsets and fault (a many-to-many join of two 46,500-row tables on one key)."""
     if total > MAX_JOIN_ROWS:
-        raise MemoryError(
+        from .gpu_budget import JoinOutputTooLarge
+        raise JoinOutputTooLarge(
             f"join output would have {total:,} rows, more than the {MAX_JOIN_ROWS:,} the join kernels can "
             "address: filter or aggregate one side first")
 
