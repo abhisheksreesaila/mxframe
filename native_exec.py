@@ -1138,8 +1138,9 @@ class _VTable:
     """The columns of a joined schema, each in the table it lives in (different lengths): just enough of a
     table for ``compile_pipeline`` to read names, types and dictionaries."""
 
-    def __init__(self, cols):
+    def __init__(self, cols, num_rows):
         self._cols = cols
+        self.num_rows = num_rows         # joined rows <= the fact table's (unique partner keys): bounds an integer sum
         self.column_names = list(cols)
         self.schema = pa.schema([pa.field(n, c.type) for n, c in cols.items()])
 
@@ -1260,7 +1261,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
 
     n_user = len(plan.aggs)
     hidden = [Expr("min", derived[i]).alias(f"__key{i}") for i in sorted(derived)]
-    prog = compile_pipeline(list(fj.post_preds), list(plan.aggs) + hidden, _VTable(cols), concat_dicts=True)
+    prog = compile_pipeline(list(fj.post_preds), list(plan.aggs) + hidden, _VTable(cols, table.num_rows), concat_dicts=True)
     if prog is None:
         return _decline("expression not supported by the bytecode compiler")
     if prog.dict_arrays:

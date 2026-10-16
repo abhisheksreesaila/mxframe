@@ -553,3 +553,17 @@ def test_top_k_by_a_count_with_heavy_ties_follows_the_key_tie_break(calls, havin
     _fused(calls)
     exp = _duck(sql + " ORDER BY n DESC, k, b, a LIMIT 7", fact=fact, dim=dim)
     _same(_rows(got, ["k", "b", "a", "n", "s"]), exp, ordered=True)
+
+
+def test_integer_sums_over_fact_and_partner_columns(calls):
+    """Sums of integer columns (and products of them) are checked against 2^53 from the joined row count:
+    the fused compile must see the same bounds as the single-table one, and not fail on them."""
+    fact, dim1, dim2, _ = _tables()
+    got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+           .join(LazyFrame(dim2), left_on="k2", right_on="ek")
+           .groupby("g").agg(col("q").sum().alias("sq"), col("cls").sum().alias("sc"),
+                             (col("q") * col("cls2")).sum().alias("sp")).compute(device="cpu"))
+    _fused(calls)
+    exp = _duck("SELECT g, SUM(q), SUM(cls), SUM(q * cls2) FROM fact JOIN dim1 ON k = dk JOIN dim2 ON k2 = ek GROUP BY g",
+                fact=fact, dim1=dim1, dim2=dim2)
+    _same(_rows(got, ["g", "sq", "sc", "sp"]), exp)
