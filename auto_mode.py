@@ -31,6 +31,11 @@ SPLIT_CPU_EFFICIENCY = 0.90
 SPLIT_OVERHEAD_MS = 0.5
 # A split that gives either side less than this share is not worth the overhead.
 MIN_SPLIT_SHARE = 0.05
+# Native CPU executor time per unit of the calibrated `pipeline@cpu` time (the older fused kernel
+# the calibration measures). Warm, Q1-shaped, 6M rows, 2026-10-16 on a busy machine (load 12): native
+# 7.7 ms vs fused 6.9 ms, so no speed-up is assumed: a split must beat the older kernel by the
+# margin to be chosen over the native executor. Refresh from the quiet-machine run (F-053).
+NATIVE_CPU_FACTOR = 1.0
 
 
 class CalibrationLike(Protocol):
@@ -258,6 +263,7 @@ class OpCost:
     gpu_ms: float
     h2d_bytes: int = 0
     note: str = ""
+    card: int = 1
 
     def line(self) -> str:
         g = "n/a" if self.gpu_ms == float("inf") else f"{self.gpu_ms:.1f}ms"
@@ -295,11 +301,15 @@ class AutoDecision:
     actual_ms: Optional[float] = None
     gpu_available: bool = True
     coproc: Optional[dict] = None     # set when a fused aggregate co-processed on cpu+gpu
+    split: bool = False               # a cpu decision whose fused aggregate may split with the gpu
+    cpu_path: str = ""                # which CPU path runs, and why (cpu decisions only)
 
     def explain(self) -> str:
         head = f"auto -> {self.device}  reason: {self.reason}"
         if self.fallback:
             head += "  [fell back to cpu after a gpu error]"
+        if self.cpu_path and self.device == "cpu":
+            head += f"\n  cpu path: {self.cpu_path}"
         if self.estimate is None:
             return head
         e = self.estimate
@@ -477,7 +487,7 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
                 nbytes = n * (4 + width)
                 g = enc + sum(calib.estimate(o, "gpu", n, card=card) for o in ops) + h2d(nbytes) \
                     + calib.transfer_ms(card * 8 * len(ops), "d2h")
-                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups"))
+                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups", card=card))
                 return card, ts, card
             # Global aggregates run masked kernels over the unfiltered input.
             nbytes = src * (width + 4)
@@ -562,7 +572,48 @@ def warn_fallback_once(plan, err: BaseException) -> None:
 
 def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
                   placement: Optional[Dict[str, str]] = None, quick: bool = True) -> AutoDecision:
-    """Pick cpu or gpu for the whole query (spec Phase 1)."""
+    """Pick cpu or gpu for the whole query (spec Phase 1). A cpu decision also says which CPU path
+    runs: the native executor (as with device="cpu"), or the older pipeline that can split its
+    fused aggregate with the GPU, when the model predicts that beats the native executor alone."""
+    d = _choose_device(plan, calib, gpu, prefer, placement, quick)
+    if d.device == "cpu" and not d.cpu_path:
+        d.cpu_path = f"native executor (no cpu+gpu split: {d.reason})"
+    return d
+
+
+def _with_cpu_path(d: AutoDecision, calib, gpu) -> AutoDecision:
+    """Fill `split` / `cpu_path` of a cpu decision taken with a usable GPU (F-053)."""
+    d.split, d.cpu_path = _cpu_path(d, calib, gpu)
+    return d
+
+
+def _cpu_path(d: AutoDecision, calib, gpu):
+    native = "native executor"
+    from . import coproc_fused as cf
+    if not cf.enabled_by_env():
+        return False, f"{native} (no cpu+gpu split: MXFRAME_COPROC=0)"
+    if gpu.remaining_init_ms() > 0:
+        return False, f"{native} (no cpu+gpu split: gpu not warm)"
+    aggs = [l for l in d.estimate.lines if l.op in ("group_agg", "global_agg")]
+    if not aggs:
+        return False, f"{native} (no cpu+gpu split: no aggregate to split)"
+    a = aggs[-1]
+    if a.h2d_bytes < cf.MIN_UPLOAD_BYTES:
+        return False, f"{native} (no cpu+gpu split: input under {_fmt_bytes(cf.MIN_UPLOAD_BYTES)}, nothing is uploaded)"
+    cpu = calib.estimate("pipeline", "cpu", a.rows, card=a.card)
+    gpu_ms = calib.estimate("pipeline", "gpu", a.rows, card=a.card)
+    if not (cpu < float("inf") and gpu_ms < float("inf")):
+        return False, f"{native} (no cpu+gpu split: no pipeline estimate)"
+    f = cf.balanced_fraction(cpu, gpu_ms, cf.DEFAULT_GPU_ALPHA_MS)
+    # f == 1: the resident GPU alone beats the CPU, which the whole-query pricing (copies included) misses
+    split_ms = cpu if f <= 0 else gpu_ms if f >= 1 else (1 - f) * cpu + SPLIT_OVERHEAD_MS
+    native_ms = cpu * NATIVE_CPU_FACTOR
+    if f > 0 and split_ms < native_ms * (1 - GPU_WIN_MARGIN):
+        return True, f"cpu+gpu split (est {split_ms:.1f}ms with gpu share {f:.2f} vs native cpu {native_ms:.1f}ms)"
+    return False, f"{native} (est {native_ms:.1f}ms; a split would take {split_ms:.1f}ms)"
+
+
+def _choose_device(plan, calib, gpu, prefer, placement, quick):
     if quick and calib is None and gpu is None and not placement and prefer != "gpu":
         rows = _source_rows(plan)
         if rows < SMALL_QUERY_ROWS:
@@ -595,9 +646,10 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
     if gpu_ms < cpu_ms * (1 - margin):
         return AutoDecision("gpu", "gpu faster incl. copies", est, init)
     if est.gpu_ms < cpu_ms * (1 - margin) and init > 0:
-        return AutoDecision("cpu", "gpu faster but still starting up", est, init)
-    return AutoDecision("cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster",
-                        est, init)
+        return _with_cpu_path(AutoDecision("cpu", "gpu faster but still starting up", est, init), calib, gpu)
+    return _with_cpu_path(AutoDecision(
+        "cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster", est, init),
+        calib, gpu)
 
 
 SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)
