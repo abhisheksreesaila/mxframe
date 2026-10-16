@@ -193,6 +193,64 @@ def test_an_overflowing_aggregate_after_a_join_raises(mode):
             (col("a") * col("a") * col("a")).max().alias("x")).compute(device="cpu")
 
 
+# -- group keys and projected columns ---------------------------------------------------------------
+
+def _cube():
+    return col("a") * col("a") * col("a")
+
+
+def _dim():
+    return pa.table({"g": pa.array(np.arange(4, dtype=np.int64)), "name": pa.array(["w", "x", "y", "z"])})
+
+
+MSG = "Overflow in multiplication of INT64"
+
+
+def test_a_group_key_past_int64_raises(mode):
+    t = _t()
+    _both_raise(t, "select a*a*a k, sum(v) from t group by k",
+                LazyFrame(t).groupby(_cube().alias("k")).agg(col("v").sum().alias("x")), MSG)
+
+
+@pytest.mark.parametrize("how", ["with_columns", "select"])
+def test_a_projected_column_past_int64_raises(mode, how):
+    t = _t()
+    lf = LazyFrame(t)
+    lf = lf.with_columns(_cube().alias("y")) if how == "with_columns" else lf.select(_cube().alias("y"))
+    _both_raise(t, "select a*a*a y from t", lf, MSG)
+
+
+def test_a_projection_then_sort_past_int64_raises(mode):
+    t = _t()
+    _both_raise(t, "select *, a*a*a x from t order by x limit 2",
+                LazyFrame(t).with_columns(_cube().alias("x")).sort("x").limit(2), MSG)
+
+
+def test_a_group_key_and_a_projection_after_a_join_raise(mode):
+    t, d = _t(), _dim()
+    con = duckdb.connect()
+    con.register("t", t)
+    con.register("d", d)
+    for sql in ("select a*a*a k, sum(v) from t join d using(g) group by k",
+                "select name, a*a*a y from t join d using(g)"):
+        with pytest.raises(duckdb.OutOfRangeException, match=MSG):
+            con.execute(sql).fetchall()
+    joined = LazyFrame(t).join(LazyFrame(d), on="g")
+    with pytest.raises(OverflowError, match=MSG):
+        joined.groupby(_cube().alias("k")).agg(col("v").sum().alias("x")).compute(device="cpu")
+    with pytest.raises(OverflowError, match=MSG):
+        joined.with_columns(_cube().alias("y")).compute(device="cpu")
+
+
+def test_small_integer_keys_and_projections_are_exact(mode):
+    t = pa.table({"a": A(np.arange(1, 9, dtype=np.int64)), "g": A(np.arange(8, dtype=np.int64) % 2)})
+    got = LazyFrame(t).groupby((col("a") * col("a")).alias("k")).agg(col("g").sum().alias("x")).sort("k").compute(device="cpu")
+    want = _con(t).execute("select a*a k, sum(g) from t group by k order by k").fetchall()
+    assert list(zip(got.column("k").to_pylist(), got.column("x").to_pylist())) == want
+    got = LazyFrame(t).with_columns((col("a") * col("a") * col("a")).alias("y")).compute(device="cpu")
+    assert got.column("y").to_pylist() == [x ** 3 for x in range(1, 9)]
+
+
 # -- SUM with nulls ---------------------------------------------------------------------------------
 
 MAXI = (1 << 63) - 1
