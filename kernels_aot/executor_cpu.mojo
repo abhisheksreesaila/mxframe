@@ -956,7 +956,12 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         elif kind == K_I32 or kind == K_I64:
             var lo = 0
             var hi = -1
-            _int_range(arrays, stride_a, n_chunks, col, kind, lo, hi)
+            var xk = _lp(Int(P[25])) + 3 * k
+            if fused and Int(xk[0]) == -1:        # fused: the caller bounded this join key by its partner's keys
+                lo = Int(xk[1])
+                hi = Int(xk[2])
+            else:
+                _int_range(arrays, stride_a, n_chunks, col, kind, lo, hi)
             if hi < lo:          # no rows
                 lo = 0
                 hi = 0

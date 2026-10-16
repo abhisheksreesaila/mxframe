@@ -1254,6 +1254,11 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
     space = 1                           # the partner keys alone already multiply past direct addressing: decline now,
     for e in plan.group_by:             # before a string column is ranked or anything is compiled
         src = fj.vcols.get(e.args[0]) if e.op == "col" else None
+        if src is not None and src[0] == "fact":
+            r = _probe_range(fj, bs, src[1])
+            if r is not None:                   # a join key: only values the partner has reach the aggregate
+                space *= max(1, r[1] - r[0] + 1)
+            continue
         c = cols.get(e.args[0]) if src is not None and src[0] == "partner" else None
         if c is not None and not c.null_count:
             if c.type in (pa.int32(), pa.int64()):
@@ -1265,6 +1270,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
                                 "group key space too wide for direct addressing")
     keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}
+    fact_range = {}                     # fact join keys bounded by their partners' keys: no scan for their range
     for i, e in enumerate(plan.group_by):
         if e.op == "col" and e._alias in (None, e.args[0]):
             name = e.args[0]
@@ -1274,6 +1280,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
                 return _decline("group key outside the joined schema")
             if src[0] == "fact":
                 fact_key[i] = src[1]
+                r = _probe_range(fj, bs, src[1])
+                if r is not None:
+                    fact_range[i] = r
                 continue
             c = cols[name]
             if c.null_count:
@@ -1328,9 +1337,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         bnd = _bounds(derived[i], lambda n: _partner_range(fj, cols, n))
         if bnd is not None:                  # an integer expression of partner columns: bounded without a pass
             known[i] = ranges[i] = bnd
-    if not fact_key and all(i in known for i in derived):
+    if all(i in fact_range for i in fact_key) and all(i in known for i in derived):
         d = 1                       # every key's range is known here: a key space too big declines before any pass
-        for lo, hi in known.values():
+        for lo, hi in list(known.values()) + list(fact_range.values()):
             d *= hi - lo + 1
         if d > MAX_GROUPS:
             return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
@@ -1347,7 +1356,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
             if lo is None or hi is None or lo != int(lo) or hi != int(hi):
                 return _decline("derived group key: not an integer range")
             ranges[i] = (int(lo), int(hi))
-    if any(hi - lo + 1 > MAX_GROUPS for lo, hi in ranges.values()):
+    if any(hi - lo + 1 > MAX_GROUPS for lo, hi in list(ranges.values()) + list(fact_range.values())):
         if not any(src[0] == "prow" for src in fj.vcols.values()):
             got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
             if got is not None:
@@ -1477,7 +1486,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         c_having = (ctypes.c_int64 * max(3 * len(having), 1))(*[v for j, c, _ in having for v in (j, c, 0)])
         c_hconst = (ctypes.c_double * max(len(having), 1))(*[x for _, _, x in having])
         c_xkeys = (ctypes.c_int64 * max(3 * n_keys, 1))(
-            *[v for i in range(n_keys) for v in ((key_slot[i],) + ranges[i] if i in derived else (0, 0, 0))])
+            *[v for i in range(n_keys) for v in ((key_slot[i],) + ranges[i] if i in derived
+                                                 else (-1,) + fact_range[i] if i in fact_range else (0, 0, 0))])
         F = (ctypes.c_int64 * 18)(
             n_fa, ctypes.addressof(c_colmap), len(pre_cols), pcode.ctypes.data, pre.consts.ctypes.data,
             pre.set_bytes.ctypes.data, pre.set_meta.ctypes.data, ctypes.addressof(c_pdtypes), len(pdcols),
@@ -1518,6 +1528,23 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data", "fused_join": True,
     }
     return result
+
+
+def _probe_range(fj: FusedJoin, bs, name):
+    """(min, max) a fact column can take among the rows that reach the aggregate when it is a join key: only
+    rows whose key finds a partner row count, so the partners' own key ranges bound it (the narrowest of them).
+    None: not a join key, or not a plain integer key."""
+    from .np_arrow import to_numpy as _np_of
+    out = None
+    for lk, b in zip(fj.lookups, bs):
+        for pn, bn in zip(lk.probe, lk.build_keys):
+            c = b.column(bn)
+            if pn != name or c.null_count or c.type not in (pa.int32(), pa.int64()):
+                continue
+            a = _np_of(c.chunk(0), zero_copy_only=False)
+            r = (int(a.min()), int(a.max()))
+            out = r if out is None else (max(out[0], r[0]), min(out[1], r[1]))
+    return out
 
 
 def _partner_range(fj: FusedJoin, cols, name):

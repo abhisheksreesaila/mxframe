@@ -600,3 +600,36 @@ def test_declines_are_counted_by_reason(calls):
      .groupby("g").agg(col("v").sum().alias("s")).compute(device="cpu"))
     # the fused call and then the star scan both meet the duplicate key
     assert nx.decline_counts() == {"executor declined (code -18)": 2}, nx.decline_counts()
+
+
+def test_a_join_key_group_key_is_bounded_by_the_partners_keys_without_a_scan(calls):
+    """Only fact rows whose key finds a partner reach the aggregate, so a group key that is also the join key
+    takes values in the partner's key range: here the fact column holds a few huge unmatched values (a scan
+    would see a 2^40 range and the executor would decline), the partner's keys span 5000."""
+    fact, dim1, _, _ = _tables()
+    k = np.asarray(fact.column("k").to_numpy()).copy()
+    k[::997] = 1 << 40
+    fact = fact.set_column(0, "k", A(k))
+    got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+           .groupby("k", "g").agg((col("v") * col("w")).sum().alias("s"), col("v").count().alias("n"))
+           .compute(device="cpu"))
+    _fused(calls)
+    assert calls["rc3"] == [0], calls                       # a fact-key range scan would have returned -11
+    exp = _duck("SELECT k, g, SUM(v * w), COUNT(v) FROM fact JOIN dim1 ON k = dk GROUP BY k, g", fact=fact, dim1=dim1)
+    _same(_rows(got, ["k", "g", "s", "n"]), exp)
+
+
+def test_a_join_key_group_key_with_a_wide_partner_range_declines_before_any_call(calls):
+    """The partner's keys span 5 million: with another fact group key the key space is far past direct
+    addressing, known from the partner alone, so no native call is made at all."""
+    fact, _, _, _ = _tables()
+    r = np.random.default_rng(2)
+    dim = pa.table({"dk": A(np.arange(5000, dtype=np.int64) * 1000), "w": A(np.round(r.random(5000), 3))})
+    fact = fact.set_column(0, "k", A(r.integers(0, 5000, fact.num_rows).astype(np.int64) * 1000))
+    nx.reset_decline_counts()
+    got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
+           .groupby("k", "g").agg(col("v").sum().alias("s"), col("v").count().alias("n")).compute(device="cpu"))
+    assert 3 not in calls["exec"], calls
+    assert nx.decline_counts().get("group key space too wide for direct addressing") == 1, nx.decline_counts()
+    exp = _duck("SELECT k, g, SUM(v), COUNT(v) FROM fact JOIN dim ON k = dk GROUP BY k, g", fact=fact, dim=dim)
+    _same(_rows(got, ["k", "g", "s", "n"]), exp)
