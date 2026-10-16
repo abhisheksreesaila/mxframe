@@ -290,7 +290,7 @@ class GraphCompiler:
                 idx = pc.sort_indices(table, sort_keys=sort_keys)
                 table = table.take(idx)
             elif isinstance(node, Limit):
-                table = table.slice(0, node.n)
+                table = table.slice(node.offset, node.n)
             elif isinstance(node, Distinct):
                 cols = node.subset or table.column_names
                 table = _distinct_rows(table.select(cols)) if table.num_rows else table.select(cols)
@@ -445,7 +445,7 @@ class GraphCompiler:
         if isinstance(plan, Sort):
             return Sort(cls._strip_filters(plan.input), plan.by, plan.descending)
         if isinstance(plan, Limit):
-            return Limit(cls._strip_filters(plan.input), plan.n)
+            return Limit(cls._strip_filters(plan.input), plan.n, plan.offset)
         if isinstance(plan, Distinct):
             return Distinct(cls._strip_filters(plan.input), plan.subset)
         if isinstance(plan, Tail):
@@ -463,7 +463,7 @@ class GraphCompiler:
         if isinstance(plan, Project): return Project(cls._replace_scan(plan.input, new_scan), plan.exprs)
         if isinstance(plan, Aggregate): return Aggregate(cls._replace_scan(plan.input, new_scan), plan.group_by, plan.aggs)
         if isinstance(plan, Sort): return Sort(cls._replace_scan(plan.input, new_scan), plan.by, plan.descending)
-        if isinstance(plan, Limit): return Limit(cls._replace_scan(plan.input, new_scan), plan.n)
+        if isinstance(plan, Limit): return Limit(cls._replace_scan(plan.input, new_scan), plan.n, plan.offset)
         if isinstance(plan, Distinct): return Distinct(cls._replace_scan(plan.input, new_scan), plan.subset)
         if isinstance(plan, Tail): return Tail(cls._replace_scan(plan.input, new_scan), plan.n)
         if hasattr(plan, "input"): plan.input = cls._replace_scan(plan.input, new_scan)

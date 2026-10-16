@@ -91,11 +91,12 @@ class Sort(LogicalPlan):
 
 @dataclass
 class Limit(LogicalPlan):
-    """Represents taking only the first N rows."""
+    """Represents taking N rows after skipping the first ``offset`` (OFFSET m LIMIT n)."""
     input: LogicalPlan
     n: int
+    offset: int = 0
     def signature(self) -> tuple:
-        return ("Limit", self.input.signature(), self.n)
+        return ("Limit", self.input.signature(), self.n, self.offset)
 
 @dataclass
 class Distinct(LogicalPlan):
@@ -456,9 +457,9 @@ class LazyFrame:
             desc_list = list(descending)
         return LazyFrame(Sort(self.plan, parsed_by, desc_list))
 
-    def limit(self, n: int):
-        """Take only the first N rows."""
-        return LazyFrame(Limit(self.plan, n))
+    def limit(self, n: int, offset: int = 0):
+        """Take N rows, after skipping the first ``offset`` (SQL ``LIMIT n OFFSET offset``)."""
+        return LazyFrame(Limit(self.plan, n, offset))
 
     def distinct(self, *subset):
         """Remove duplicate rows, optionally considering only a subset of columns.
@@ -506,7 +507,7 @@ class LazyFrame:
             if isinstance(p, Project):   return Project(_zero(p.input), p.exprs)
             if isinstance(p, Aggregate): return Aggregate(_zero(p.input), p.group_by, p.aggs)
             if isinstance(p, Sort):      return Sort(_zero(p.input), p.by, p.descending)
-            if isinstance(p, Limit):     return Limit(_zero(p.input), p.n)
+            if isinstance(p, Limit):     return Limit(_zero(p.input), p.n, p.offset)
             if isinstance(p, Tail):      return Tail(_zero(p.input), p.n)
             if isinstance(p, Distinct):  return Distinct(_zero(p.input), p.subset)
             return p
@@ -662,7 +663,7 @@ def _format_plan(plan: LogicalPlan, indent: int = 0) -> str:
         head = f"{pad}Sort(by={by}, descending={plan.descending})"
         return "\n".join([head, _format_plan(plan.input, indent + 1)])
     if isinstance(plan, Limit):
-        head = f"{pad}Limit(n={plan.n})"
+        head = f"{pad}Limit(n={plan.n}, offset={plan.offset})" if plan.offset else f"{pad}Limit(n={plan.n})"
         return "\n".join([head, _format_plan(plan.input, indent + 1)])
     if isinstance(plan, Distinct):
         head = f"{pad}Distinct(subset={plan.subset})"
@@ -718,8 +719,8 @@ class GPUFrame:
     def sort(self, *by, descending=False) -> 'GPUFrame':
         return GPUFrame(self._table, self._compiler).__with_lf(self._lf.sort(*by, descending=descending))
 
-    def limit(self, n: int) -> 'GPUFrame':
-        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.limit(n))
+    def limit(self, n: int, offset: int = 0) -> 'GPUFrame':
+        return GPUFrame(self._table, self._compiler).__with_lf(self._lf.limit(n, offset))
 
     def tail(self, n: int = 5) -> 'GPUFrame':
         return GPUFrame(self._table, self._compiler).__with_lf(self._lf.tail(n))

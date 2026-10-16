@@ -94,6 +94,8 @@ def validate_plan(plan: LogicalPlan) -> List[PlanValidationError]:
         if isinstance(node, Limit):
             if node.n < 0:
                 errors.append(PlanValidationError(path, "Limit.n must be >= 0"))
+            if node.offset < 0:
+                errors.append(PlanValidationError(path, "Limit.offset must be >= 0"))
             walk(node.input, f"{path}.input")
             return
 

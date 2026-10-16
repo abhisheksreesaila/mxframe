@@ -833,21 +833,23 @@ Found by the F-079 developer and the F-083 review (2026-10-16)
 - [ ] `WHERE x IS NULL` / `IS NOT NULL` (and in SELECT, CASE, HAVING, subqueries, joins' ON) raises `NotImplementedError: Unsupported SQL expression type: Is` in the SQL front end; map to the existing `is_null` / `is_not_null` expressions (native filter where the bytecode has a validity test; Arrow otherwise). Also `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` if sqlglot parses them, and `x IS TRUE / FALSE` if cheap
 - [ ] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
 
-## F-087 SQL OFFSET is ignored [todo]
+## F-087 SQL OFFSET is ignored [done]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
-- [ ] `ORDER BY c, i LIMIT 3 OFFSET 2` returns the first 3 rows (OFFSET dropped), top level and in subqueries (`IN (... LIMIT 5 OFFSET 2)`). Support OFFSET (slice after the sort, before / with LIMIT; top-n keeps `limit + offset` rows), or raise until then; never drop it
-- [ ] DuckDB-checked tests: OFFSET with and without LIMIT, with ORDER BY ties broken by a unique key, hidden sort key, in IN / FROM subqueries and CTEs, OFFSET past the end; fails before
+- [x] `ORDER BY c, i LIMIT 3 OFFSET 2` returned the first 3 rows (OFFSET dropped). `Limit` has an `offset` (default 0; `LazyFrame.limit(n, offset=0)`); OFFSET without LIMIT keeps every later row. `CustomOpsCompiler.compile_and_run` runs a top-level OFFSET window as `Limit(offset + n)` (so Sort + Limit still reach the top-n heaps, the native filter top-k and the aggregate top-k with k = offset + n) and cuts the first `offset` rows off the result; an OFFSET window under another Sort / Limit or under a Filter / Project / Aggregate is answered by the generic `slice(offset, n)` (`compiler.py`); only Sort / Limit / Distinct / Tail chains are resolved first by `_resolve_inner_offsets`. Correlated subqueries still reject OFFSET
+- [x] DuckDB-checked tests (`tests/test_sql_offset.py`): OFFSET with and without LIMIT, ORDER BY ties broken by a unique key, hidden sort key, group-by, DISTINCT, join, FROM subqueries, CTEs, IN / NOT IN subqueries (also the hidden-key form), OFFSET past the end, LIMIT 0, no ORDER BY, DataFrame `limit(n, offset)`, a gpu case; top-n structure (sort `topk` and heap k = limit + offset); 53 of 62 failed before
 
-## F-088 SELECT *, expr returns only the expression [todo]
+## F-088 SELECT *, expr returns only the expression [done]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
-- [ ] `SELECT *, a+1 AS x FROM t` returns only `x`; DuckDB returns every column then `x`. Expand `*` in place among other select items (and `t.*`), with or without ORDER BY (F-083 made the ORDER BY form raise; replace that error with the real expansion)
-- [ ] DuckDB-checked tests: `*, expr`, `expr, *`, `t.*, u.c` over a join, with WHERE / ORDER BY / LIMIT, name clash between `*` and an alias; fails before
+- [x] `SELECT *, a+1 AS x FROM t` returned only `x`. `*` and `t.*` next to other items now expand in place (`_SQLTranslator._expand_stars`: the join output columns, or the table's own), so ORDER BY positions, hidden sort keys, DISTINCT, LIMIT / OFFSET work as for listed columns; F-083's "not supported" error is gone. A lone `*` is unchanged. `* EXCLUDE / REPLACE / RENAME` next to other items raises. Name clash with an alias: both columns are returned (second renamed `a_1`, as DuckDB's default connection does) and `ORDER BY a` takes the aliased one, `ORDER BY t.a` the table's column, like DuckDB
+- [x] DuckDB-checked tests (`tests/test_sql_star_mixed.py`): `*, expr`, `expr, *`, `t.*` over joins (JOIN ON and comma), WHERE / ORDER BY (alias, position, hidden key) / LIMIT / OFFSET, DISTINCT, subqueries / CTE / IN, name clashes, a gpu case; 48 of 49 failed before. `* + GROUP BY` still raises
+- Known gap (not this ticket): `w.*` over a JOIN where a non-key column name exists in both tables raises "the name exists in more than one joined table" (the existing `t.col` rule), not a wrong answer
 
-## F-089 GPU ORDER BY ... LIMIT 0 crashes [todo]
+## F-089 GPU ORDER BY ... LIMIT 0 crashes [done]
 Found by the F-083 review (2026-10-16)
-- [ ] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
-- [ ] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
+- [x] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
+- [x] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
 
+- Review (2026-10-16): PASS. Follow-up fixed in the main session: `AOTKernelsGPU.gather_table` with no indices launched a 0-block grid (`gather_i32_gpu failed with status -1`); it returns `table.slice(0, 0)` now (`test_gather_table_with_no_indices_returns_an_empty_table`, fails before). Other per-`n` GPU wrappers in `aot_kernels.py` can launch 0 blocks the same way; no query shape reaches them with n = 0 today
 ## F-090 IN (SELECT max(i) ...) join key types differ [review]
 Found by the F-083 review (2026-10-16)
 - [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB
@@ -857,3 +859,44 @@ Found by the F-083 review (2026-10-16)
 Found by the F-084 review (2026-10-16); a silent wrong answer on main
 - [ ] `lag(v)` over `[1, NULL, 3]` gives `[nan, 1.0, nan]`; DuckDB `[NULL, 1.0, NULL]`: lag / lead turn NULL into NaN and fill with NaN. Shift the Arrow array with its validity (fill NULL, or the given default); keep the input dtype
 - [ ] DuckDB-checked tests: lag / lead with offsets 1 and 2, defaults, partitions, ORDER BY with NaN / NULL keys (F-084 order), int / float / string columns; fails before
+
+## F-092 mx.sql over a scan_parquet frame crashes [done]
+Found by the F-086 developer (2026-10-16)
+- [x] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
+- [x] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
+
+## F-093 MIN / MAX of a date column [todo]
+Found by the F-086 developer (2026-10-16)
+- [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
+- [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+
+## F-094 SQL modulo operator [todo]
+Found by the F-087 developer (2026-10-16)
+- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+
+## F-095 SQL over tables with uppercase or quoted column names [todo]
+Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
+- [ ] the SQL front end lowercases identifiers; a table with `CustomerID` or `"Order Date"` columns may fail to resolve (or resolve wrongly when two names differ only by case). Probe DuckDB's rules (unquoted identifiers are case-insensitive, quoted are case-sensitive; output keeps the source column's case) and match them on every SQL path (SELECT, `*`, WHERE, GROUP BY, ORDER BY, JOIN ON / USING, subqueries)
+- [ ] `SELECT *, i+1 AS x FROM u` with a column `Ab` raises `KeyError 'Field "ab"'` (F-088 expansion lowercases); `u.*` over a join returns `ab`, not `Ab`: fix with the rest of this ticket
+- [ ] DuckDB-checked tests over tables whose names have uppercase, spaces, and a case-only clash; fails before where wrong
+
+## F-096 SQL JOIN ON an expression [todo]
+Found by the F-087 developer (2026-10-16)
+- [ ] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
+- [ ] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
+
+## F-097 IS NULL skips row groups with no NULLs [todo]
+From the F-086 review (2026-10-16); a speedup, not a bug
+- [ ] `scan_parquet` never pushes `is_null` / `not is_null`: a row group whose `null_count` is 0 can be skipped for IS NULL (and one whose `null_count == num_values` for IS NOT NULL); a missing `null_count` statistic must never skip. Native validity test in the bytecode filter (so IS NULL filters stay native) belongs here too
+- [ ] tests: row groups skipped (counted), missing statistics not skipped, answers equal DuckDB; fails before
+
+## F-098 OFFSET without LIMIT: no sentinel row count [todo]
+From the F-087 review (2026-10-16)
+- [ ] OFFSET without LIMIT uses `n = 2**62` (`sql_frontend._ALL_ROWS`): `explain()` shows the sentinel and an OFFSET above ~2^62 overflows `n + offset` in int64 in native code. Model "no limit" as `n=None` in `Limit` (or clamp), every consumer handles it
+- [ ] tests: explain shows no sentinel; a huge OFFSET returns no rows without overflow; fails before
+
+## F-099 SQL self-join: columns of the second copy [todo]
+Found by the F-092 developer and review (2026-10-16)
+- [ ] in `t x JOIN t y`, referencing a column that exists in both copies on the second side (`WHERE y.qty > 25`, `SELECT y.v`) raises "name exists in more than one joined table ... not supported yet". Joined tables with shared non-key column names are common (self-joins, fact-to-fact): carry both copies under distinct internal names (`v`, `v_right`) and resolve `x.v` / `y.v` to the right one in every clause
+- [ ] DuckDB-checked tests: self-join with filters on either side, SELECT of both copies, GROUP BY / ORDER BY on the second copy, a three-way join with a repeated name; fails before
