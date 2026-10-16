@@ -14,6 +14,7 @@ from ._lazy_pc import pc
 from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum
 import numpy as np
 import os as _os
+import dataclasses
 import time as _time
 import threading as _threading
 from pathlib import Path
@@ -82,6 +83,17 @@ from .sort_check import (is_sorted_permutation as _is_sorted_permutation, is_sor
 # CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
 # float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
 _PRECISE = _threading.local()
+
+
+def _rank_strings(column):
+    """``(ranks, sorted_values)`` of a string column (dictionary or plain, one dictionary per chunk or not):
+    int32 ranks of each row's value in byte order (NULL stays NULL) and the distinct values in that order."""
+    d = _encode_key(column)
+    vals = d.dictionary
+    order = _np_of(pc.sort_indices(vals), zero_copy_only=False)
+    rank_of = np.empty(len(order), np.int32)
+    rank_of[order] = np.arange(len(order), dtype=np.int32)
+    return pc.take(_npa(rank_of), d.indices), pc.take(vals, _npa(order))
 
 
 def _decode_deferred_cols(table: pa.Table, names) -> pa.Table:
@@ -1611,7 +1623,11 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(core, Filter) and isinstance(core.input, Aggregate) and core.input.group_by:
             return plan                                   # HAVING: the aggregate paths take it
         post_ops = self._key_tiebreak(core, post_ops)
-        out = self._materialize_barrier(core)
+        return self._rewrap(self._materialize_barrier(core), post_ops)
+
+    @staticmethod
+    def _rewrap(out, post_ops):
+        """``out`` with the peeled-off Sort / Limit / Distinct / Tail nodes put back on top."""
         for op in post_ops:
             if isinstance(op, Sort):
                 out = Sort(out, op.by, op.descending)
@@ -1622,6 +1638,83 @@ class CustomOpsCompiler(GraphCompiler):
             else:
                 out = Tail(out, op.n)
         return out
+
+    def _string_minmax(self, plan):
+        """MIN / MAX of a string column (F-072): the column's distinct values are ranked once in byte order
+        (DuckDB's order), the aggregate runs on the integer ranks through every existing path (native
+        executor, fused join, Arrow's null semantics) and the ranks are turned back into strings.
+        ``[Sort Limit] [HAVING] Aggregate`` is the shape taken; the aggregate alone is computed and
+        HAVING / Sort / Limit run above its string result. None: no string MIN / MAX in this plan."""
+        core, post_ops = self._extract_post_ops(plan)
+        having = core if isinstance(core, Filter) and isinstance(core.input, Aggregate) else None
+        agg = core.input if having is not None else core
+        if not isinstance(agg, Aggregate) or self._contains_aggregate(agg.input):
+            return None
+        wanted = {e.args[0].args[0] for e in agg.aggs if e.op in ("min", "max") and e.args[0].op == "col"}
+        if not wanted:
+            return None
+        leaves, has_project = [], [False]
+
+        def walk(p):
+            if isinstance(p, Scan):
+                leaves.append(p)
+            elif isinstance(p, Join):
+                walk(p.left), walk(p.right)
+            else:
+                has_project[0] |= isinstance(p, Project)
+                walk(p.input)
+        walk(agg.input)
+        schema = None
+        strings = {}                                  # name -> the leaf Scans that hold it
+        for c in wanted:
+            held = [s for s in leaves if c in s.table.column_names]
+            if held:
+                t = held[0].table.schema.field(c).type
+            else:                                     # a renamed copy (s_right) or a computed column
+                from .lazy_frame import LazyFrame
+                schema = schema or LazyFrame(agg.input).schema
+                t = schema.field(c).type if schema is not None and c in schema.names else pa.null()
+            if pa.types.is_dictionary(t):
+                t = t.value_type
+            if pa.types.is_string(t) or pa.types.is_large_string(t):
+                strings[c] = held
+        if not strings:
+            return None
+
+        base = agg.input
+        if has_project[0] or any(len(h) != 1 for h in strings.values()):
+            base = Scan(self._plan_to_table(self._materialize_joins(agg.input)))   # names as the aggregate sees them
+            leaves = [base]
+        ranked, back = {}, {}
+        for c in strings:
+            ranked[c], back[c] = _rank_strings(next(s for s in leaves if c in s.table.column_names).table.column(c))
+        names = {c: f"__rank_{c}__" for c in strings}
+
+        def add_ranks(p):
+            if isinstance(p, Scan):
+                t = p.table
+                for c in strings:
+                    if c in t.column_names:
+                        t = t.append_column(names[c], ranked[c])
+                return Scan(t)
+            if isinstance(p, Join):
+                return Join(add_ranks(p.left), add_ranks(p.right), p.left_on, p.right_on, p.how)
+            return type(p)(add_ranks(p.input), *[getattr(p, f.name) for f in dataclasses.fields(p)[1:]])
+        aggs, out_names = [], {}
+        for i, e in enumerate(agg.aggs):
+            name = e._alias or f"agg_{i}"
+            if e.op in ("min", "max") and e.args[0].op == "col" and e.args[0].args[0] in strings:
+                c = e.args[0].args[0]
+                e = Expr(e.op, Expr("col", names[c])).alias(name)
+                out_names[name] = c
+            aggs.append(e)
+        res = self.compile_and_run(Aggregate(add_ranks(base), agg.group_by, aggs))
+        for name, c in out_names.items():
+            i = res.schema.get_field_index(name)
+            res = res.set_column(i, name, pc.take(back[c], pc.cast(res.column(i), pa.int64())))
+        if having is not None:
+            res = pc.filter(res, pc.fill_null(self._eval_predicate(having.predicate, res), _npscalar(False, type=pa.bool_())))
+        return self._compile_and_run(self._rewrap(Scan(res), post_ops)) if post_ops else res
 
     def _materialize_barrier(self, plan):
         """Compute what sits below an aggregate result as a table, so the operator above works on it.
@@ -1933,6 +2026,11 @@ class CustomOpsCompiler(GraphCompiler):
         # Aggregate above it) runs on the small result table: the aggregate below goes through every
         # native path first (fused join, star, single table) instead of the whole plan being declined
         plan = self._aggregate_consumers_first(plan)
+
+        # -1a1 -- F-072: MIN / MAX of a string column, computed on the byte-order ranks of its values
+        _strmm = self._string_minmax(plan)
+        if _strmm is not None:
+            return _strmm
 
         # -1a -- F-046a slice 3: an aggregate over inner joins runs as one native call, no joined rows
         if _had_join and _native_exec is not None:
