@@ -72,12 +72,14 @@ def test_global_aggregate(calls):
     t = _fact(6_000_000, 10)
     plan = LazyFrame(t).groupby().agg((col("p") * col("d")).sum().alias("tot"), col("d").mean().alias("av"))
     _same_every_run(plan, ["tot", "av"])
+    assert calls and 3 not in calls
 
 
 def test_many_groups_shared_output(calls):
     """3M groups over 6M rows: a partial table per worker is over the memory budget, so the workers share
     one output (the path that used to add with atomic float adds)."""
     _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 3_000_000))), ["tot", "av"])
+    assert calls and 3 not in calls
 
 
 def _star(groups):
@@ -100,6 +102,54 @@ def test_fused_join_aggregate_many_groups_shared_output(calls):
     """Fused join + aggregate with 200k groups (shared output from 16384 groups on)."""
     _same_every_run(_star(200_000), ["tot", "av"])
     assert 3 in calls
+
+
+def _tot(t, extra, threads, monkeypatch):
+    """The `tot` column of a grouped revenue sum next to `extra` more aggregates, with `threads` workers."""
+    monkeypatch.setenv("MXFRAME_CPU_THREADS", str(threads))
+    aggs = [(col("p") * (lit(1.0) - col("d"))).sum().alias("tot")]
+    aggs += [(col("p") * col("d") * lit(float(i + 2))).sum().alias(f"x{i}") for i in range(extra)]
+    return _bits(LazyFrame(t).groupby("s").agg(*aggs).compute(device="cpu"), ["tot"])[0]
+
+
+@pytest.mark.parametrize("groups", [300, 800, 10_000])
+def test_a_sum_does_not_depend_on_the_other_aggregates(calls, monkeypatch, groups):
+    """`agg(tot)` and `agg(tot, x0, x1)` give the same bits for `tot` (the number of accumulator lanes
+    used to depend on the aggregate list)."""
+    t = _fact(6_000_000, groups)
+    base = _tot(t, 0, 8, monkeypatch)
+    for extra in (2, 5):
+        assert int((base != _tot(t, extra, 8, monkeypatch)).sum()) == 0
+
+
+@pytest.mark.parametrize("groups", [300, 10_000, 200_000])
+def test_a_sum_does_not_depend_on_the_thread_count(calls, monkeypatch, groups):
+    """4, 8 and 16 workers give the same bits (200k groups: the staged many-groups path)."""
+    t = _fact(6_000_000, groups)
+    base = _tot(t, 0, 4, monkeypatch)
+    for threads in (8, 16):
+        assert int((base != _tot(t, 0, threads, monkeypatch)).sum()) == 0
+
+
+def _canonical(t, groups, morsel=65536):
+    """The defined order for more than 1024 groups: per morsel, each group's rows added in row order;
+    then the morsels' sub-totals added in morsel order."""
+    s = t.column("s").to_numpy()
+    v = t.column("p").to_numpy() * (1.0 - t.column("d").to_numpy())
+    out = np.zeros(groups)
+    for lo in range(0, len(s), morsel):
+        sub = np.zeros(groups)
+        np.add.at(sub, s[lo:lo + morsel], v[lo:lo + morsel])
+        out += sub
+    return out.view(np.int64)
+
+
+@pytest.mark.parametrize("groups", [10_000, 60_000, 200_000])
+def test_the_per_morsel_table_path_and_the_staged_path_give_the_defined_order(calls, monkeypatch, groups):
+    """10k and 60k groups use a table per morsel, 200k the staged path (tables over the budget): all equal
+    the same NumPy reference of the defined order, bit for bit."""
+    t = _fact(3_000_000, groups)
+    assert int((_tot(t, 0, 8, monkeypatch) != _canonical(t, groups)).sum()) == 0
 
 
 def test_cpu_group_and_masked_sums_of_the_kernel_library():
