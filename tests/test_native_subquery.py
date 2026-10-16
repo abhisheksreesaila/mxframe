@@ -177,11 +177,12 @@ def test_scalar_max_equality_on_a_computed_view_is_exact(counters):
     _same(_rows(got), want)
 
 
-@pytest.mark.xfail(strict=True, reason="F-064: executor float sums are not bit-reproducible, so a view recomputed "
-                                       "inside the main plan misses its own maximum")
-def test_scalar_max_equality_on_an_uncomputed_view_is_exact():
+@pytest.mark.xfail(strict=False, reason="F-064: executor float sums are not bit-reproducible with parallel workers, "
+                                        "so a view recomputed inside the main plan can miss its own maximum")
+def test_scalar_max_equality_on_an_uncomputed_view_is_exact(monkeypatch):
     """The same shape with the view left lazy: the scalar and the main plan each run the aggregate. 6M rows,
-    10k groups (the size at which the sums differ between runs; strict: it starts passing when F-064 lands)."""
+    10k groups, 8 workers (with one the sums are reproducible); F-064's acceptance owns the strict check."""
+    monkeypatch.setenv("MXFRAME_CPU_THREADS", "8")
     r = np.random.default_rng(7)
     n = 6_000_000
     t = pa.table({"s": A(r.integers(0, 10000, n).astype(np.int32)), "p": A(r.random(n) * 1000), "d": A(r.random(n))})
