@@ -20,6 +20,13 @@ Aggregation modes (chosen from the slot and group counts):
     shared memory, updates it with shared float64 atomics, and adds the table to
     the output once per block with global atomics.
   * 2, many groups: per-row float64 atomics (add / min / max) into the output.
+  * 4, reproducible mode (F-067) replaces modes 1 and 2 when the table fits shared memory: no atomics.
+    Per tile, every row's group id is written to shared memory; after a barrier the thread that owns a
+    group (group g belongs to thread g % BLOCK) walks the tile's rows in row order and adds the matching
+    ones to the block's table; at the end the table is written to a row of `scratch` and the same merge
+    kernel as modes 0 and 3 adds the per-block rows in block order. The order of additions is a function
+    of the row order, the grid size and the tile size only. More groups than fit, and mode 2's shape,
+    return -6 (the caller runs the CPU's defined order).
   Every accumulation atomic uses monotonic ordering: the default sequentially
   consistent ordering makes NVPTX fence around each one (~20x slower). Modes 0
   and 3 finish with a second kernel that merges the per-block rows of `scratch`
@@ -48,6 +55,7 @@ comptime SMALL: Int = 48            # per-thread accumulators (mode 0)
 comptime HDR: Int = 16
 comptime MAX_CONSTS: Int = 64
 comptime WARPS: Int = BLOCK // 32
+comptime REPRO_MAX_NS: Int = 4096   # most (slots + 1) * groups the ordered mode holds (pipeline_kernels.REPRO_MAX_NS)
 
 comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
@@ -408,7 +416,10 @@ def pipeline_kernel[RPT: Int, B: Int](
     var consts = smem + n_regs * TILE
     var wpart = consts + MAX_CONSTS
     var accs = wpart + NWARPS * SMALL     # per-thread accumulators in shared memory (mode 3)
-    var acc_words = (n_slots + 1) * n_groups * B if mode == 3 else ((n_slots + 1) * n_groups if mode == 1 else 0)
+    var acc_words = (n_slots + 1) * n_groups * B if mode == 3 else ((n_slots + 1) * n_groups if (mode == 1 or mode == 4) else 0)
+    var tg = (accs + acc_words).bitcast[Int32]()      # mode 4: this tile's group id per row (-1: not counted)
+    if mode == 4:
+        acc_words += TILE // 2
     var code = (accs + acc_words).bitcast[Int32]()
     var i = tid
     while i < code_ints:
@@ -453,7 +464,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                 accs[(a * G + g) * B + tid] = init
         for g in range(G):
             accs[(A * G + g) * B + tid] = 0.0
-    elif mode == 1:
+    elif mode == 1 or mode == 4:
         var j = tid
         while j < ns:
             accs[j] = _ident(Int(code[HDR + (agg_base + j // G) * 5])) if j < A * G else 0.0
@@ -477,11 +488,22 @@ def pipeline_kernel[RPT: Int, B: Int](
             comptime for k in range(RPT):
                 if (valid >> k) & 1 != 0 and _nz(regs[pred_reg * TILE + tid + k * B]):
                     active |= 1 << k
+        if mode == 4:
+            comptime for k in range(RPT):
+                tg[tid + k * B] = -1
         if active != 0:
             _run[RPT, B](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
                       set_meta, tid, row_base, active)
+            if mode == 4:
+                comptime for k in range(RPT):
+                    if (active >> k) & 1 != 0:
+                        var g = 0
+                        if has_gids:
+                            g = Int(gids[row_base + tid + k * B])
+                        if g >= 0 and g < G:
+                            tg[tid + k * B] = Int32(g)
             comptime for k in range(RPT):
-                if (active >> k) & 1 != 0:
+                if (active >> k) & 1 != 0 and mode != 4:
                     var g = 0
                     if has_gids:
                         g = Int(gids[row_base + tid + k * B])
@@ -538,9 +560,36 @@ def pipeline_kernel[RPT: Int, B: Int](
                                     _atomic_min_f64(p, v)
                                 else:
                                     _atomic_max_f64(p, v)
+        if mode == 4:
+            # the owner of group g walks this tile's rows in row order (no two threads add to one slot)
+            barrier()
+            var g = tid
+            while g < G:
+                for r in range(TILE):
+                    if Int(tg[r]) == g:
+                        accs[A * G + g] += 1.0
+                        for a in range(A):
+                            var ins = code + (HDR + (agg_base + a) * 5)
+                            var kind = Int(ins[0])
+                            var v = regs[Int(ins[2]) * TILE + r]
+                            var p = accs + (a * G + g)
+                            if kind == OP_AGG_SUM:
+                                p[0] += v
+                            elif kind == OP_AGG_MIN:
+                                p[0] = min(p[0], v)
+                            else:
+                                p[0] = max(p[0], v)
+                g += B
+            barrier()
         tile += step
 
-    if mode == 0 or mode == 3:
+    if mode == 4:
+        # the block's table is its row of `scratch`; merge_kernel adds the rows in block order
+        var j = tid
+        while j < ns:
+            _fp(scratch_a)[Int(block_idx.x) * ns + j] = accs[j]
+            j += B
+    elif mode == 0 or mode == 3:
         # reduce the block's per-thread partials: warp shuffles, then across warps
         var lane = tid & 31
         var warp = tid >> 5
@@ -629,20 +678,11 @@ def merge_kernel(
         _lp(out_cnt_a)[s - A * G] = Int64(r)
 
 
-@export
-def mx_pipeline_gpu(
-    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
-    cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int, n_slots: Int,
-    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, ident_a: Int,
-    scratch_a: Int, n_regs: Int, code_ints: Int, agg_base: Int,
-    n_blocks: Int, repeat: Int,
-) abi("C") -> Int:
-    if n_slots < 0 or n_groups < 1:
-        return -2
+def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int) -> Int:
+    """The aggregation mode (see the header) a program with these sizes runs in, or -5 (needs more shared
+    memory than a block has) / -6 (reproducible mode and the group table does not fit)."""
     var G = n_groups
     var A = n_slots
-    if gids_a == 0 and G != 1:
-        return -2
     var ns = (A + 1) * G
     var rpt = 2 if (n_regs <= 6 and G == 1 and A <= 2) else 1
     var mode = 0 if G == 1 and ns <= SMALL else 2
@@ -660,16 +700,60 @@ def mx_pipeline_gpu(
             var smem1 = n_regs * BLOCK * 8 + base_smem + WARPS * SMALL * 8 + ns * 8
             if smem1 <= 48 * 1024:
                 mode = 1
-    var tile = bsz * rpt
-    var smem = n_regs * tile * 8 + base_smem + (bsz // 32) * SMALL * 8
+    if repro != 0 and (mode == 1 or mode == 2):
+        # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory
+        if ns > REPRO_MAX_NS or n_regs * BLOCK * 8 + base_smem + WARPS * SMALL * 8 + ns * 8 + BLOCK * 4 > 48 * 1024:
+            return -6
+        mode = 4
+        rpt = 1
+    var smem = n_regs * bsz * rpt * 8 + base_smem + (bsz // 32) * SMALL * 8
     if mode == 3:
         smem += ns * bsz * 8
     elif mode == 1:
         smem += ns * 8
+    elif mode == 4:
+        smem += ns * 8 + BLOCK * 4
     if smem > 48 * 1024:
         return -5
+    return mode
+
+
+@export
+def mx_pipeline_gpu_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int) abi("C") -> Int:
+    """The mode ``mx_pipeline_gpu`` would run (0 to 4), or a negative status: Python asks this before it
+    splits rows, so a reproducible split never hands the GPU a share it would decline."""
+    return _choose_mode(n_groups, n_slots, n_regs, code_ints, repro)
+
+
+@export
+def mx_pipeline_gpu(
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int, n_slots: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, ident_a: Int,
+    scratch_a: Int, n_regs: Int, code_ints: Int, agg_base: Int,
+    n_blocks: Int, repeat: Int, repro: Int,
+) abi("C") -> Int:
+    if n_slots < 0 or n_groups < 1:
+        return -2
+    var G = n_groups
+    var A = n_slots
+    if gids_a == 0 and G != 1:
+        return -2
+    var mode = _choose_mode(G, A, n_regs, code_ints, repro)
+    if mode < 0:
+        return mode
+    var bsz = 128 if mode == 3 else BLOCK
+    var rpt = 2 if (n_regs <= 6 and G == 1 and A <= 2) else 1
+    var tile = bsz * rpt
+    var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + code_ints * 4 + (bsz // 32) * SMALL * 8
+    if mode == 3:
+        smem += (A + 1) * G * bsz * 8
+    elif mode == 1:
+        smem += (A + 1) * G * 8
+    elif mode == 4:
+        smem += (A + 1) * G * 8 + tile * 4
     var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
-    var small = 1 if (mode == 0 or mode == 3) else 0
+    var small = 1 if (mode == 0 or mode == 3 or mode == 4) else 0
     try:
         var ctx = DeviceContext()
         var total = A * G

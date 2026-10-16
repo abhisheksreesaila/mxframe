@@ -47,13 +47,25 @@ def _differing_groups(run, runs=RUNS):
     return int(differ.sum()), len(differ)
 
 
-# 200 groups: a shared-memory table per block (mode 1); 100k groups: per-row global atomics (mode 2)
+# 200 and 1,000 groups: the old kernel kept a shared-memory table per block with float64 atomics (mode 1)
 @needs_gpu
-@pytest.mark.parametrize("groups", [200, 100_000])
+@pytest.mark.parametrize("groups", [200, 1_000])
 def test_gpu_group_by_gives_the_same_bits_every_run(groups):
     plan = _revenue(_fact(2_000_000, groups))
     bad, total = _differing_groups(lambda: plan.compute(device="gpu", reproducible=True))
     assert plan.last_compile_provenance["path"] == "fused_pipeline_gpu"
+    assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
+
+
+@needs_gpu
+def test_gpu_many_groups_run_the_cpu_defined_order_and_say_so():
+    """100k groups: the old kernel added with per-row global atomics (70,803 of 100,000 groups differed between
+    runs). The ordered kernel holds a group table per block in shared memory (up to REPRO_MAX_NS slots); beyond
+    that the program is GpuUnsupported and the CPU's defined order runs (bit-identical too), recorded in the
+    provenance path."""
+    plan = _revenue(_fact(2_000_000, 100_000))
+    bad, total = _differing_groups(lambda: plan.compute(device="gpu", reproducible=True), runs=6)
+    assert plan.last_compile_provenance["path"] == "fused_pipeline_cpu"
     assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
 
 
@@ -121,14 +133,18 @@ def _compute_split(plan, fraction):
 
 
 @needs_gpu
-@pytest.mark.parametrize("groups", [200, 20_000])
-def test_forced_split_gives_the_same_bits_every_run(groups):
+@pytest.mark.parametrize("groups,path", [(200, "fused_pipeline_split"), (20_000, "fused_pipeline_cpu")])
+def test_forced_split_gives_the_same_bits_every_run(groups, path):
+    """200 groups: GPU share and CPU share run, merged GPU rows first. 20,000 groups: the GPU share is
+    GpuUnsupported in reproducible mode and the router redoes its rows on the CPU (same bits too)."""
     cf.clear_residency()
     plan = _revenue(_fact(2_000_000, groups))
     run = _resident_split(plan, 0.5)
     bad, total = _differing_groups(run, runs=8)
     prov = plan.last_compile_provenance
-    assert prov["path"] == "fused_pipeline_split" and prov["coproc"]["gpu_fraction"] == 0.5
+    assert prov["path"] == path
+    if path == "fused_pipeline_split":
+        assert prov["coproc"]["gpu_fraction"] == 0.5
     assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
 
 
@@ -171,16 +187,45 @@ def test_a_view_compared_with_its_own_maximum_runs_its_aggregate_once(device, mo
     from mxframe import pipeline_exec
     t = _fact(2_000_000, 20_000)
     view = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
-    calls = []
-    real = pipeline_exec.try_fused_aggregate
+    big, real = [], LazyFrame.compute
 
-    def spy(*a, **kw):
-        calls.append(1)
-        return real(*a, **kw)
+    def spy(self, *a, **kw):                 # every nested compute of the resolve step goes through here
+        got = pipeline_exec._table_of(self.plan)
+        if not isinstance(got, str) and got[2].num_rows >= 1_000_000:
+            big.append(kw.get("device", a[0] if a else "auto"))
+        return real(self, *a, **kw)
 
-    monkeypatch.setattr(pipeline_exec, "try_fused_aggregate", spy)
+    monkeypatch.setattr(LazyFrame, "compute", spy)
     for _ in range(5):
-        calls.clear()
+        big.clear()
         got = view.filter(col("tot") == view.scalar(col("tot").max())).compute(device=device)
         assert got.num_rows == 1
-        assert len(calls) <= 1
+        assert big == [device], big      # the 2M-row aggregate was computed once, on one device
+
+
+@needs_gpu
+def test_gpu_reproducible_min_max_count_and_a_filter_equal_the_cpu():
+    """The ordered kernel (filter masks rows out of a tile, min / max / count slots) agrees with the CPU."""
+    r = np.random.default_rng(3)
+    n = 1_500_000
+    t = pa.table({"s": A(r.integers(0, 300, n).astype(np.int32)), "p": A(r.random(n) * 1000),
+                  "d": A(r.random(n)), "q": A(r.integers(0, 50, n).astype(np.int32))})
+    plan = (LazyFrame(t).filter(col("q") > lit(10)).groupby("s")
+            .agg(col("p").sum().alias("tot"), col("p").min().alias("lo"), col("d").max().alias("hi"),
+                 col("p").count().alias("n")))
+    gpu = plan.compute(device="gpu", reproducible=True)
+    assert plan.last_compile_provenance["path"] == "fused_pipeline_gpu"
+    cpu = plan.compute(device="cpu")
+    og, oc = np.argsort(gpu.column("s").to_numpy()), np.argsort(cpu.column("s").to_numpy())
+    for c in ("tot", "lo", "hi"):
+        np.testing.assert_allclose(gpu.column(c).to_numpy()[og], cpu.column(c).to_numpy()[oc], rtol=1e-12)
+    assert gpu.column("n").to_numpy()[og].tolist() == cpu.column("n").to_numpy()[oc].tolist()
+
+
+@needs_gpu
+def test_the_ordered_kernel_asks_before_a_split_which_group_counts_it_takes():
+    from mxframe import pipeline_exec
+    t = _fact(1000, 10)
+    prog, _ = pipeline_exec._bind(*pipeline_exec._table_of(_revenue(t).plan)[:2], t)
+    assert [pk.gpu_reproducible_fits(prog, g) for g in (1, 10, 1_000, 1_365, 1_366, 100_000)] == \
+        [True, True, True, True, False, False]

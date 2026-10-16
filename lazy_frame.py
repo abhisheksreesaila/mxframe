@@ -266,7 +266,10 @@ class LazyFrame:
                 defined order of additions runs only where it is as fast as before: global aggregates and
                 fused joins with 16,384 or more groups; every other group-by keeps the previous fastest
                 code, whose sums can differ in the last bits between runs. Costs 0-20% on keyed group-bys.
-                ``False`` overrides the environment variable. GPU float sums are not covered (F-067).
+                ``False`` overrides the environment variable. On ``device="gpu"`` and in a CPU+GPU split the GPU adds without atomics (an ordered
+                table per block, blocks merged in block order) while (slots + 1) x groups <= 4,096 and the
+                table fits shared memory; with more groups the GPU declines and the CPU's defined order runs
+                (provenance path ``fused_pipeline_cpu``). Default mode keeps the faster atomics (F-067).
         """
         if reproducible is not None:
             # carried to the native call as a plan flag by a per-thread context variable (no process-wide
