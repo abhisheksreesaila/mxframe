@@ -833,12 +833,12 @@ Found by the F-079 developer and the F-083 review (2026-10-16)
 - [ ] `WHERE x IS NULL` / `IS NOT NULL` (and in SELECT, CASE, HAVING, subqueries, joins' ON) raises `NotImplementedError: Unsupported SQL expression type: Is` in the SQL front end; map to the existing `is_null` / `is_not_null` expressions (native filter where the bytecode has a validity test; Arrow otherwise). Also `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` if sqlglot parses them, and `x IS TRUE / FALSE` if cheap
 - [ ] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
 
-## F-087 SQL OFFSET is ignored [review]
+## F-087 SQL OFFSET is ignored [done]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
-- [x] `ORDER BY c, i LIMIT 3 OFFSET 2` returned the first 3 rows (OFFSET dropped). `Limit` has an `offset` (default 0; `LazyFrame.limit(n, offset=0)`); OFFSET without LIMIT keeps every later row. `CustomOpsCompiler.compile_and_run` runs a top-level OFFSET window as `Limit(offset + n)` (so Sort + Limit still reach the top-n heaps, the native filter top-k and the aggregate top-k with k = offset + n) and cuts the first `offset` rows off the result; an OFFSET window under another Sort / Limit or under a Filter / Project / Aggregate runs first and is replaced by its table. Correlated subqueries still reject OFFSET
+- [x] `ORDER BY c, i LIMIT 3 OFFSET 2` returned the first 3 rows (OFFSET dropped). `Limit` has an `offset` (default 0; `LazyFrame.limit(n, offset=0)`); OFFSET without LIMIT keeps every later row. `CustomOpsCompiler.compile_and_run` runs a top-level OFFSET window as `Limit(offset + n)` (so Sort + Limit still reach the top-n heaps, the native filter top-k and the aggregate top-k with k = offset + n) and cuts the first `offset` rows off the result; an OFFSET window under another Sort / Limit or under a Filter / Project / Aggregate is answered by the generic `slice(offset, n)` (`compiler.py`); only Sort / Limit / Distinct / Tail chains are resolved first by `_resolve_inner_offsets`. Correlated subqueries still reject OFFSET
 - [x] DuckDB-checked tests (`tests/test_sql_offset.py`): OFFSET with and without LIMIT, ORDER BY ties broken by a unique key, hidden sort key, group-by, DISTINCT, join, FROM subqueries, CTEs, IN / NOT IN subqueries (also the hidden-key form), OFFSET past the end, LIMIT 0, no ORDER BY, DataFrame `limit(n, offset)`, a gpu case; top-n structure (sort `topk` and heap k = limit + offset); 53 of 62 failed before
 
-## F-088 SELECT *, expr returns only the expression [review]
+## F-088 SELECT *, expr returns only the expression [done]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
 - [x] `SELECT *, a+1 AS x FROM t` returned only `x`. `*` and `t.*` next to other items now expand in place (`_SQLTranslator._expand_stars`: the join output columns, or the table's own), so ORDER BY positions, hidden sort keys, DISTINCT, LIMIT / OFFSET work as for listed columns; F-083's "not supported" error is gone. A lone `*` is unchanged. `* EXCLUDE / REPLACE / RENAME` next to other items raises. Name clash with an alias: both columns are returned (second renamed `a_1`, as DuckDB's default connection does) and `ORDER BY a` takes the aliased one, `ORDER BY t.a` the table's column, like DuckDB
 - [x] DuckDB-checked tests (`tests/test_sql_star_mixed.py`): `*, expr`, `expr, *`, `t.*` over joins (JOIN ON and comma), WHERE / ORDER BY (alias, position, hidden key) / LIMIT / OFFSET, DISTINCT, subqueries / CTE / IN, name clashes, a gpu case; 48 of 49 failed before. `* + GROUP BY` still raises
@@ -878,6 +878,7 @@ Found by the F-087 developer (2026-10-16)
 ## F-095 SQL over tables with uppercase or quoted column names [todo]
 Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
 - [ ] the SQL front end lowercases identifiers; a table with `CustomerID` or `"Order Date"` columns may fail to resolve (or resolve wrongly when two names differ only by case). Probe DuckDB's rules (unquoted identifiers are case-insensitive, quoted are case-sensitive; output keeps the source column's case) and match them on every SQL path (SELECT, `*`, WHERE, GROUP BY, ORDER BY, JOIN ON / USING, subqueries)
+- [ ] `SELECT *, i+1 AS x FROM u` with a column `Ab` raises `KeyError 'Field "ab"'` (F-088 expansion lowercases); `u.*` over a join returns `ab`, not `Ab`: fix with the rest of this ticket
 - [ ] DuckDB-checked tests over tables whose names have uppercase, spaces, and a case-only clash; fails before where wrong
 
 ## F-096 SQL JOIN ON an expression [todo]
@@ -889,3 +890,8 @@ Found by the F-087 developer (2026-10-16)
 From the F-086 review (2026-10-16); a speedup, not a bug
 - [ ] `scan_parquet` never pushes `is_null` / `not is_null`: a row group whose `null_count` is 0 can be skipped for IS NULL (and one whose `null_count == num_values` for IS NOT NULL); a missing `null_count` statistic must never skip. Native validity test in the bytecode filter (so IS NULL filters stay native) belongs here too
 - [ ] tests: row groups skipped (counted), missing statistics not skipped, answers equal DuckDB; fails before
+
+## F-098 OFFSET without LIMIT: no sentinel row count [todo]
+From the F-087 review (2026-10-16)
+- [ ] OFFSET without LIMIT uses `n = 2**62` (`sql_frontend._ALL_ROWS`): `explain()` shows the sentinel and an OFFSET above ~2^62 overflows `n + offset` in int64 in native code. Model "no limit" as `n=None` in `Limit` (or clamp), every consumer handles it
+- [ ] tests: explain shows no sentinel; a huge OFFSET returns no rows without overflow; fails before
