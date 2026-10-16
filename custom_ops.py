@@ -12,7 +12,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 from .np_arrow import is_in as _is_in
-from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum, float_extreme
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, float_extreme
 from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_values
 import numpy as np
 import os as _os
@@ -751,6 +751,8 @@ class CustomOpsCompiler(GraphCompiler):
                 return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return _npa([val] * n)
+        if op == "mod":
+            return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div":

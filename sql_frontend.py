@@ -17,6 +17,7 @@ Supports a large subset of TPC-H-style SQL:
 
 __all__ = ["sql"]
 
+import re
 import calendar
 import itertools
 from datetime import date, timedelta
@@ -96,6 +97,13 @@ def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
 
 
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+
+
+def _is_decimal_literal(n: sge.Expression) -> bool:
+    """``2.5`` or ``-2.5``: DuckDB types a number with a point and no exponent as DECIMAL (``1e3`` is DOUBLE)."""
+    n = _unparen(n)
+    n = _unparen(n.this) if isinstance(n, sge.Neg) else n
+    return isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"\d*\.\d*", str(n.this)) is not None
 
 
 def _unparen(n: sge.Expression) -> sge.Expression:
@@ -216,7 +224,7 @@ def _null_on_empty(n: sge.Expression) -> bool:
         return not n.is_string
     if isinstance(n, sge.Neg):
         return _null_on_empty(n.this)
-    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div)):
+    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div, sge.Mod)):
         return _null_on_empty(n.this) and _null_on_empty(n.expression) and bool(_aggs_in(n))
     return False
 
@@ -1444,6 +1452,12 @@ class _SQLTranslator:
             return self._float_expr(node.this) * self._float_expr(node.expression)
         if isinstance(node, sge.Div):
             return self._float_expr(node.this) / self._float_expr(node.expression)
+        if isinstance(node, sge.Mod):                    # `a % b` and MOD(a, b): DuckDB's fmod, NULL on zero
+            l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
+            if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
+                return lit(None if r.args[0] == 0 else (abs(l.args[0]) % abs(r.args[0])) * (-1 if l.args[0] < 0 else 1))   # two constants
+            dec = any(_is_decimal_literal(x) for x in (node.this, node.expression))
+            return Expr("mod", l, r, True) if dec else l % r      # a literal with a point (no exponent) is DECIMAL
 
         # ---- comparisons ----
         if isinstance(node, sge.EQ):
@@ -1607,6 +1621,17 @@ class _SQLTranslator:
         if f is not None:
             return f
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
+
+    def _mod_operand(self, node: sge.Expression) -> "Expr":
+        """An operand of ``%``: a numeric literal (negated or not) stays a plain constant, an integer one an integer, anything else is evaluated
+        as it is, so ``np_arrow.modulo`` picks integer or float arithmetic from the real arrays."""
+        n = _unparen(node)
+        neg = isinstance(n, sge.Neg)
+        n = _unparen(n.this) if neg else n
+        if isinstance(n, sge.Literal) and not n.is_string:
+            v = int(n.this) if str(n.this).isdigit() else float(n.this)
+            return lit(-v if neg else v)
+        return self._expr(node)
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
         """Like _expr but promotes integer literals to float for arithmetic use.
