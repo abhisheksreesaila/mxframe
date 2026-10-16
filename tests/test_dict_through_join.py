@@ -188,3 +188,33 @@ def test_join_cache_keeps_coded_and_plain_results_apart(coded):
                 fact=fact, dim=dim)
     _approx(_rows(b, ["w", "s"]), [tuple(float(x) for x in r) for r in exp])
     assert a.num_rows == 4
+
+
+def test_filtered_and_nested_partners_keep_their_string_group_key_as_codes(monkeypatch):
+    """F-033: a partner leaf with a filter (TPC-H Q5's `nation WHERE region = ..`) and a partner that is itself a
+    star (orders -> customer -> nation) deliver the name as codes; the aggregate groups by them and no Arrow
+    `dictionary_encode` runs over the partner's rows."""
+    from mxframe._lazy_pc import pc
+    r = np.random.default_rng(4)
+    n = 200_000
+    facts = pa.table({"ok": A(r.integers(0, 20_000, n).astype(np.int64)), "v": A(r.random(n))})
+    orders = pa.table({"o_k": A(np.arange(20_000, dtype=np.int64)), "o_c": A(r.integers(0, 3000, 20_000).astype(np.int32))})
+    cust = pa.table({"c_k": A(np.arange(3000, dtype=np.int32)), "c_n": A(r.integers(0, 25, 3000).astype(np.int32))})
+    names = pa.array([f"NATION{i:02d}" for i in range(25)])
+    nat = pa.table({"n_k": A(np.arange(25, dtype=np.int32)), "n_r": A((np.arange(25) // 5).astype(np.int32)),
+                    "n_name": pa.DictionaryArray.from_arrays(pa.array(np.arange(25, dtype=np.int32)), names)})
+    plain_nat = pa.table({"n_k": nat.column("n_k"), "n_r": nat.column("n_r"), "n_name": names})
+    encoded = []
+    real = pc.dictionary_encode
+    monkeypatch.setitem(pc._cache, "dictionary_encode", lambda *a, **k: (encoded.append(len(a[0])), real(*a, **k))[1])
+    got = (LazyFrame(facts).join(LazyFrame(orders), left_on="ok", right_on="o_k")
+           .join(LazyFrame(cust), left_on="o_c", right_on="c_k")
+           .join(LazyFrame(nat).filter(col("n_r") == lit(2)), left_on="c_n", right_on="n_k")
+           .groupby("n_name").agg(col("v").sum().alias("s"), col("v").count().alias("n"))
+           .sort("n_name").compute(device="cpu"))
+    want = _duck("""SELECT n_name, SUM(v), COUNT(*) FROM facts JOIN orders ON ok = o_k JOIN cust ON o_c = c_k
+                    JOIN nat ON c_n = n_k WHERE n_r = 2 GROUP BY n_name ORDER BY n_name""",
+                 facts=facts, orders=orders, cust=cust, nat=plain_nat)
+    _approx(_rows(got, ["n_name", "s", "n"]), want)
+    assert got.num_rows == 5
+    assert not [e for e in encoded if e >= 1000], encoded

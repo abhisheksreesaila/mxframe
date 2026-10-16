@@ -47,6 +47,8 @@ def install():
 
     def note(name, args):
         n = 0
+        if name == "take" and len(args) > 1:        # a take is as big as its indices, not its source
+            args = args[1:2]
         for a in args:
             try:
                 n = max(n, len(a))

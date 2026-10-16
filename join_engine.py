@@ -171,7 +171,7 @@ def leaf_table(comp, plan, needed: Optional[Set[str]], keep: Optional[Set[str]] 
             needed = set(sel) if needed is None else set(needed) & set(sel)
         if preds:
             from . import native_exec
-            out = native_exec.try_filter(comp, scan.table, preds, needed)
+            out = native_exec.try_filter(comp, scan.table, preds, needed, keep_dict=keep or ())   # (codes the caller decodes)
             if out is not None:
                 return out
         later = set(getattr(scan, "_mx_decode_after", None) or ()) - set(keep or ())
@@ -1083,8 +1083,10 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
                         {_star_name(x, k): (loc[x], k) for x in S for k in cols_of[x]}, lres)
             sub_fact = _star_fact(comp, sub)
             B = None
+            sub_coded = None if coded is None else [coded[x] for x in S]    # (the subtree's leaves in its own numbering)
             if sub_fact is not None:
-                B = _execute_star(comp, sub, sub_fact, lambda i: get(S[i]), bn, None)
+                B = _execute_star(comp, sub, sub_fact, lambda i: get(S[i]), bn, None, sub_coded)
+            nested_codes = B is not None and sub_coded is not None
             if B is None:
                 lt = [get(x) for x in S]
                 rows = [t.num_rows for t in lt]
@@ -1103,6 +1105,8 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
         outs = [nm for nm in B.column_names if nm.split(":", 1)[0] != str(c) or
                 nm.split(":", 1)[1] in deliver[c]]
         keep_b = {_star_name(c, k) for k in (coded[c] if coded is not None and len(S) == 1 else ())}
+        if len(S) > 1 and nested_codes:           # a nested star's dictionary columns stay codes up to the lookup
+            keep_b = {_star_name(x, k) for x in S for k in coded[x]}
         lookups.append(native_exec.Lookup(probe, B, [_star_name(c, k) for k in bkeys], outs, outs, keep=keep_b))
 
     # probe the most selective partner first: a row stops at its first miss (Q8: the filtered part
