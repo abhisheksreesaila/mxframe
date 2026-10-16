@@ -169,6 +169,12 @@ def policy(**opts):
         _policy.reset(token)
 
 
+def stable_group_keys(group_by) -> bool:
+    """Bare, unrenamed key columns give the same group ids on every query (so their columns can be
+    resident); derived or renamed keys get fresh ids each time and are never uploaded."""
+    return all(e.op == "col" and e._alias in (None, e.args[0]) for e in group_by)
+
+
 def enabled_by_env() -> bool:
     return os.environ.get("MXFRAME_COPROC", "1") != "0"
 

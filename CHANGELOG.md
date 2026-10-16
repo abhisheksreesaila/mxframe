@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- **Data bigger than GPU memory no longer fails (F-056 step 1).** Each GPU piece (fused aggregate, join, sort, gather) estimates its device memory first; over 90% of the GPU's free memory it runs on the CPU. A piece that runs out of memory anyway is halved and retried once (aggregates) and then rerun on the CPU, and the shape is remembered. `device="gpu"` warns, `device="auto"` stays quiet, `strict=True` raises `MemoryError` with the estimate; `explain(include_runtime=True)` (`gpu_pieces`) and the auto decision say when and why a piece left the GPU. `MXFRAME_GPU_MEM_BUDGET` (e.g. `512M`, or `0:512M,1:2G` per GPU) fakes a smaller GPU for tests.
+- **Changed:** `device="gpu"` served a join or sort that ran out of GPU memory with a `MemoryError`; it now returns the CPU's answer with a warning (`strict=True` keeps the error).
+
 ### Fixed
 - **Kernel libraries find the Mojo runtime from the environment they are installed in** (F-036). The 0.6.0 wheel still ships `kernels_aot/*.so` with an absolute RUNPATH of the build machine's pixi env; the next release carries a relocatable one (`scripts/set_runpath.sh`). Linux only; macOS is out of scope.
 - **Integers past 2^53 (F-037).** Integer `+ - *` whose result could pass 2^53 no longer rounds in the float64 interpreter: the compiler bounds each result (column types first, the data's min / max only when needed) and the exact path answers. An integer `SUM` whose total could pass 2^53 is now added exactly in int64.
@@ -19,8 +23,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `docs/api.md` and `CONTRIBUTING.md` are rewritten for the native executor.
 - **LICENSE** file added (Apache-2.0, as already declared in `pyproject.toml`).
 
-### Known issue
-- `device="auto"` (the default) doesn't use the native executor yet. Pass `device="cpu"` for the 0.6.0 numbers (F-053).
+### Changed
+- `device="auto"` now runs the native executor on every CPU decision (F-053); the co-processing policy is set only for a predicted CPU+GPU split or an explicit `gpu_fraction`.
 
 ## [0.6.0] — 2026-10-14
 

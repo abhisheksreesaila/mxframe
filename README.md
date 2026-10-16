@@ -55,7 +55,7 @@ print(out.to_pandas())
 2            R  1.223160e+10
 ```
 
-Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`. The default, `device="auto"`, doesn't use the native executor yet on any machine: when it picks the CPU it runs the older fused pipeline (fixing this is ticket F-053), so pass `device="cpu"` for now.
+Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`. The default, `device="auto"`, runs the same native executor whenever it decides on the CPU (no GPU, GPU not warm, data on the host, or the cost model says CPU). It switches to the older fused pipeline only when the cost model predicts a CPU+GPU split of a fused aggregate that beats the native CPU executor, or when you pass `gpu_fraction`. `explain(device="auto", costs=True)` says which. auto's speed against `device="cpu"` has not been re-measured since 0.6.0 (F-053).
 
 Extras: `runtime` (the MAX engine; pixi users get it from conda instead), `sql` (sqlglot, for `mx.sql`), `polars` (for `.to_polars()`). The GPU path is validated on NVIDIA; AMD and Apple Silicon aren't yet. On import, MXFrame caps the Mojo runtime's GPU memory pool at 25% (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`, process-wide); set it higher before importing if a kernel needs more.
 

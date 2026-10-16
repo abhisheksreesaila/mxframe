@@ -37,25 +37,30 @@ Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
 - [x] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`: none needed, it stays empty
 - [ ] open: statuses cover out-of-memory only (a real OOM sort and an oversized request are tested). A real fault such as `CUDA_ERROR_ILLEGAL_ADDRESS` kills the process (core dump) and no status comes back; the Mojo `ctx.synchronize()` of the other kernels is assumed to raise on OOM like the sort's does (not probed)
 
-## F-056 Data bigger than GPU memory never fails [todo]
+## F-056 Data bigger than GPU memory never fails [doing]
 Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
-- [ ] research first, written to `docs/research/gpu-out-of-core.md` and `docs/research/heavydb.md` (HeavyDB is the closest open-source GPU-native competitor; mine it for algorithms): how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
+- [x] research first, written to `docs/research/gpu-out-of-core.md` and `docs/research/heavydb.md` (HeavyDB is the closest open-source GPU-native competitor; mine it for algorithms): how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
 - [ ] `device="gpu"` and `"auto"` on a working set larger than free GPU memory finish with results equal to `cpu` (test with an artificially small GPU memory budget, so no 96 GB data is needed)
 - [ ] the plan chooses up front (estimated size vs free memory): GPU, GPU in partitions, or CPU; a GPU OOM mid-query reruns the failed part on CPU and is remembered
 - [ ] both GPUs on this box (2x RTX 3090, 24 GB each) are counted as separate memory pools, not one 48 GB pool
+- [x] Step 1, never fail (`gpu_budget.py`; tests `tests/test_gpu_budget.py`, real-GPU ones opt-in with `MXFRAME_TEST_GPU_BUDGET=1`): per-GPU budget (driver free memory, capped by the test override `MXFRAME_GPU_MEM_BUDGET`; the process runs on one GPU, a second GPU is a second pool/process later); each GPU piece (fused aggregate, join pairs, sort / top-k, gather) is pre-checked at 90% of free memory -> CPU; an OOM halves the aggregate's chunk and retries once, then reruns the piece on the CPU and remembers the shape (piece level, and the query shape for auto); `device="gpu"` falls back with a warning, `strict=True` raises `MemoryError` with the estimate; provenance `gpu_pieces`, `explain` and the auto decision say when and why. Aggregate, join and sort/top-k over a fake 1 MB GPU equal DuckDB on `gpu` and `auto`
+- Review fixes (step 1): a remembered shape is tried on the GPU again once 1.5x more memory is free (piece level and auto's `_failed_shapes`; non-OOM errors stay remembered), keyed by column names and dtypes; `forget_gpu_failures()` also forgets pieces; also guarded: GPU string filters, masked global sum/min/max/sum-product, range5 sum-product, group encode (the GPU left join already fell back to the CPU on any error; coproc and residency uploads are auto-only and covered); a join output past 2^31 rows is a distinct `JoinOutputTooLarge` (a `MemoryError` subclass, not remembered, not reported as OOM); the CPU join has the same limit, so it raises on every device
+- Open after step 1: joins and sorts go straight to the CPU (no halving: a join could split its probe side, a sort could merge sorted runs); estimates are lower bounds for a join's output size (one match per left row; a bigger output is caught by the OOM path); the MAX-graph (JIT) paths are not guarded (they run only without the AOT libraries); a fake budget does not count memory already resident from earlier queries; nothing yet uses the second GPU
 - Build order from the research (2026-10-15): (1) never fail: per-GPU budget with a test-only override, pre-check at 90% of free memory -> CPU, OOM -> halve the piece and retry once, then rerun the piece on CPU and remember the shape; pieces never change their inputs; (2) streaming probe through a resident hash table, for joins and many-group aggregates only, after a CPU filter + bitvector; (3) partition both sides so each pair fits one 24 GB GPU, the two GPUs as separate workers. Skip unified memory and generic host spilling. HeavyDB ideas: string filters run once over the dictionary (becomes an int IN-set), dense hash layouts sized from min/max with a group-count pre-pass
 - [ ] the two GPUs are joined by an NVLink bridge (NV4 in `nvidia-smi topo -m`): measure GPU-to-GPU bandwidth and whether Mojo can use peer access before relying on it
-- Note: 96 GB is also bigger than this box's 62 GB of RAM, so that case needs the CPU path to stream Parquet and spill too (a later ticket, after the GPU never-fail step)
+- Note: 96 GB is also bigger than this box's 62 GB of RAM, so that case needs the CPU path to stream Parquet row groups and spill to disk too (a later ticket: the CPU rerun of a piece is exact but holds its inputs in RAM, so step 1 alone does not make 96 GB work here)
 - Note from F-055: every GPU kernel returns a status and raises `MemoryError` on out-of-memory, so this ticket can rely on that for OOM only; a real GPU fault (illegal address) kills the process and returns no status
 
 ## F-057 Morsel co-processing that wins [todo]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
 - Research (2026-10-15, `docs/research/cpu-gpu-coprocessing.md`): keep F-006's design (host data -> CPU, resident data -> static split, one GPU call; Mordred 2022); split only if predicted time beats the faster device by 10% after per-call (4.5 ms), merge and contention costs; CPU threads take late GPU work; the second GPU as a third worker with its own resident share
+- Check first (review of F-053): a `read_parquet` frame may never find its data resident: sources are re-read on each compute and residency is keyed by buffer addresses. Verify a repeat query finds its columns resident before relying on resident-data splits.
 - [ ] the native CPU executor takes the CPU share of a split (today a split runs the older fused pipeline)
 - [ ] a split is chosen only where calibration predicts it beats both single devices, and `explain` says why
 - [ ] measured on a quiet machine: auto within 10% of min(cpu, gpu) on every query, faster than both on the shapes the split targets (high-volume aggregation on resident data)
 
+- [ ] `auto_mode._unsplittable` rules out joins and unstable keys only; other shapes the fused pipeline declines (Project/Distinct between aggregate and scan, nulls, int64 past 2^53, dictionary-code filters) can still be predicted a split, then native declines every repeat: make the split predicate match the split path exactly (from the F-053 review)
 ## F-058 Core gate scoreboard [todo]
 Needs: F-055, F-056, F-057 · Quiet machine only
 - [ ] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (warm, labelled) and `auto`, against DuckDB and Polars, every result checked against DuckDB
@@ -534,6 +539,12 @@ Needs: F-046a slice 3 · From its review (2026-10-16)
 - [ ] group keys that are columns of one partner but not its unique key (TPC-H Q10's shape) leave several partner rows per key tuple; slice 3 declines that case (the first version merged them in NumPy, which was per-row Python work and wrong for negative key values). Merge natively in the executor: code the key tuples per partner row (negative and repeated values), then fold the partner-row partials into key-tuple groups
 - [ ] tests vs DuckDB with negative and repeated key tuples, asserting the fused path; Q10 no slower fused than unfused on a quiet machine
 
+## F-063 Q17 on device="auto" aborts the process under load [todo]
+Needs: none · Seen 2026-10-16 in a full-suite run (test_tpch_duckdb, Q17 on auto: exit -6, glibc `pthread_mutex_lock` assertion); passed on rerun. Same family as the rare -11 under load in F-020 / F-022. An abort can't be caught or fallen back from, so it is worse than a wrong answer
+- [ ] loop Q17 on auto ~50 times (and under load) to measure the rate; capture a core dump / gdb backtrace
+- [ ] find the cause (suspects, unverified: native executor worker threads started from the auto path, the Mojo runtime initialized from two places, the GPU warm-up thread racing a CPU query) and fix it; a stress test that reproduces it before the fix
+- [ ] if it can't be reproduced in 200 runs, mark blocked on a repro with the evidence
+
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
@@ -591,11 +602,13 @@ Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open item
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
 - [x] restyled on `site.css`, "how to read this" header, numbers from the bench files
 
-## F-053 device="auto" never uses the native executor [todo]
+## F-053 device="auto" never uses the native executor [review]
 Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
 - [ ] re-run the user-felt TPC-H scoreboard with `mx-auto` next to `mx-cpu` on 0.6.0 (quiet machine)
-- [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
+- [x] auto sets the co-processing policy only when `auto_mode._cpu_path` predicts a CPU+GPU split beats the native CPU executor by 10% (or the caller passes `gpu_fraction`); every other CPU decision runs the native executor exactly as `device="cpu"`; `MXFRAME_COPROC=0` honoured. Split is priced on source rows (what the pipeline and upload read) and only predicted for shapes the split can take (no join below the aggregate, bare group keys; `coproc_fused.stable_group_keys` is shared with `pipeline_exec`). Decision: the native executor does NOT take the CPU share of a split (big change in native_exec, which another ticket is editing); a split stays on the older pipeline and is chosen only when it beats `pipeline@cpu * NATIVE_CPU_FACTOR`. Factor is 1.0: one warm Q1-shaped 6M-row measurement on a busy machine (load 12) gave native 7.7 ms vs fused 6.9 ms, so no native speed-up is assumed. Refresh it, and add a real native calibration probe, in the quiet-machine run. `explain(device="auto", costs=True)` prints `cpu path: ...` and why. Tests: `tests/test_f053_auto_native.py`
 - [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again
+  - note: the README, site, auto-mode.md and CHANGELOG were already changed to describe the current behaviour honestly (auto runs the native executor on a CPU decision; no speed claim), pending the quiet-machine check above
+- [ ] TODO quiet machine: `auto` within 10% of min(cpu, gpu) on >= 20/22 queries at SF1 and SF10 (median of fresh-process runs)
 
 ## F-054 Finish the docs [done]
 Asked 2026-10-14 ("add license, finish docs, hold off on new dev")

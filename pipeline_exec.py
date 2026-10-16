@@ -23,6 +23,7 @@ import pyarrow as pa
 from .np_arrow import array as _npa
 from ._lazy_pc import pc
 
+from . import gpu_budget
 from .lazy_frame import Aggregate, Filter, Scan
 from .pipeline_program import (
     ChunkedColumns, PipelineProgram, Unsupported, compile_pipeline, finalize, merge_partials,
@@ -52,11 +53,30 @@ def _shape(plan):
     return preds, plan, node
 
 
-def _run_gpu(pk, prog: PipelineProgram, cc: ChunkedColumns, gids, n_groups: int, n_rows: int):
+def _run_gpu(pk, prog: PipelineProgram, cc: ChunkedColumns, gids, n_groups: int, n_rows: int,
+             chunk_rows: int = GPU_CHUNK_ROWS):
     parts = []
-    for s in range(0, n_rows, GPU_CHUNK_ROWS):
-        parts.append(pk.run_pipeline_gpu(prog, cc, gids, n_groups, s, min(s + GPU_CHUNK_ROWS, n_rows)))
+    for s in range(0, n_rows, chunk_rows):
+        parts.append(pk.run_pipeline_gpu(prog, cc, gids, n_groups, s, min(s + chunk_rows, n_rows)))
     return merge_partials(prog, parts)
+
+
+def _gpu_aggregate(pk, prog: PipelineProgram, cc: ChunkedColumns, gids, n_groups: int, n_rows: int):
+    """The GPU piece of a fused aggregate (F-056): a chunk that does not fit the GPU's free memory, or that
+    runs out of it, is halved once, then the whole aggregate runs on the CPU. Returns (partials, device)."""
+    chunk = max(min(GPU_CHUNK_ROWS, n_rows), 1)
+    row_bytes = sum(b.itemsize for b in cc.chunks[0]) + (4 if n_groups > 1 else 0) if cc.chunks else 4
+    on_cpu = []
+
+    def cpu():
+        on_cpu.append(True)
+        return pk.run_pipeline_cpu(prog, cc, gids, n_groups, 0, n_rows)
+
+    partials = gpu_budget.run_piece(
+        "aggregate", gpu_budget.aggregate_bytes(row_bytes, chunk, n_groups, prog.n_slots),
+        lambda: _run_gpu(pk, prog, cc, gids, n_groups, n_rows, chunk), cpu,
+        shape=(n_rows, n_groups, prog.n_slots, tuple(prog.columns), row_bytes), retry=lambda: _run_gpu(pk, prog, cc, gids, n_groups, n_rows, (chunk + 1) // 2))
+    return partials, "cpu" if on_cpu else "gpu"
 
 
 def _decline(compiler, reason: str):
@@ -144,23 +164,15 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     coproc_info = None
     if device == "cpu":
         from . import coproc_fused
-        stable = not grouped or all(e.op == "col" and e._alias in (None, e.args[0])
-                                      for e in agg_node.group_by)   # derived or renamed keys: fresh ids per query
+        stable = not grouped or coproc_fused.stable_group_keys(agg_node.group_by)
         split = coproc_fused.try_split(prog, cc, gids, n_groups, n_rows, table, stable_gids=stable)
         if split is not None:
             partials, used, coproc_info = split
     if device == "gpu":
         try:
-            partials = _run_gpu(pk, prog, cc, gids, n_groups, n_rows)
-            used = "gpu"
+            partials, used = _gpu_aggregate(pk, prog, cc, gids, n_groups, n_rows)
         except pk.GpuUnsupported:
             partials = None            # this program does not fit the GPU kernel: CPU kernel
-        except MemoryError:
-            # Out of device memory: an explicit device="gpu" is served by the CPU kernel
-            # (provenance says cpu); under auto the caller's own fallback decides.
-            if getattr(compiler, "_device_arg", None) != "gpu":
-                raise
-            partials = None
         # any other GPU error propagates, so auto_mode sees it (is_sticky_gpu_error / disable_gpu)
     if partials is None:
         partials = pk.run_pipeline_cpu(prog, cc, gids, n_groups, 0, n_rows)

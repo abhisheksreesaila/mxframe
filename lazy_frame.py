@@ -228,7 +228,9 @@ class LazyFrame:
                          CPU↔GPU link and GPU start-up, and run it on the cheaper one.
                          A GPU error reruns the query on CPU (warning once per query shape).
                 "cpu"  — always run on CPU.
-                "gpu"  — run on GPU; raises RuntimeError if no GPU is available.
+                "gpu"  — run on GPU; raises RuntimeError if no GPU is available. A piece (aggregate,
+                         join, sort) that does not fit the GPU's free memory, or runs out of it, is
+                         rerun on the CPU with a warning (`explain(include_runtime=True)` says why).
             verbose: if True, print compile/execute timing and cache status.
             optimize: if True (default), run logical plan optimization passes first.
             validate: if True (default), validate logical plan invariants before execution.
@@ -237,7 +239,8 @@ class LazyFrame:
                 query: any "gpu" value runs the query on GPU, all "cpu" on CPU.
             gpu_fraction: auto only; fixed GPU share of rows when a fused aggregate
                 co-processes on CPU and GPU (default: balanced from calibration).
-            strict: auto only; raise GPU errors instead of falling back to CPU.
+            strict: raise GPU errors, including a piece that does not fit the GPU's memory or runs
+                out of it (a `MemoryError` with the estimate), instead of falling back to CPU.
             profile: auto only; record the actual query time next to the estimate
                 (see `last_auto_decision`). Per-operator timings that refine the
                 calibration arrive with per-operator placement.
@@ -269,7 +272,8 @@ class LazyFrame:
 
         self._last_optimizer_trace = list(optimizer_trace or [])
         if device != "auto":
-            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace)
+            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace,
+                                          strict=strict)
             self._last_compile_provenance = prov
             return result
 
@@ -282,11 +286,15 @@ class LazyFrame:
         t0 = _t.perf_counter()
         if decision.device == "gpu":
             try:
-                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace)
+                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace,
+                                              strict=strict, auto=True)
+                if prov.get("gpu_pieces_oom") is not None:      # a piece ran out of GPU memory and went to the CPU (F-056)
+                    _am.remember_gpu_failure(plan, prov["gpu_pieces_oom"])
+                decision.pieces = prov.get("gpu_pieces", "")
             except Exception as err:
                 if strict:
                     raise
-                _am.remember_gpu_failure(plan)
+                _am.remember_gpu_failure(plan, _oom_free(err))
                 if _am.is_sticky_gpu_error(err):
                     _am.disable_gpu(f"{type(err).__name__}: {err}")
                 _am.warn_fallback_once(plan, err)
@@ -295,12 +303,18 @@ class LazyFrame:
         else:
             # CPU plan: fused aggregates may still co-process with the GPU once their
             # columns are resident there (see coproc_fused), and start that upload otherwise.
+            import contextlib as _contextlib
             from . import coproc_fused as _cf
             with _cf.deferred_background() as _bg:
                 if decision.estimate is not None and decision.gpu_available:
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
-                with _cf.policy(gpu_fraction=gpu_fraction), _cf.query_running():
+                # The policy makes the native executor decline, so it is set only for a predicted
+                # CPU+GPU split (or one the caller forces with gpu_fraction); every other CPU
+                # decision runs exactly as device="cpu" (F-053).
+                forced = gpu_fraction is not None
+                pol = _cf.policy(gpu_fraction=gpu_fraction) if decision.split or forced else _contextlib.nullcontext()
+                with pol, _cf.query_running():
                     result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3
@@ -367,7 +381,10 @@ class LazyFrame:
             decision = _am.choose_device(plan, quick=not costs)
             text = decision.explain()
             lines.append("AutoDecision")
-            lines.extend(text.splitlines() if costs else text.splitlines()[:1])
+            shown = text.splitlines()
+            if not costs:
+                shown = shown[:2] if decision.cpu_path and decision.device == "cpu" else shown[:1]
+            lines.extend(shown)
         return "\n".join(lines)
 
     @property
@@ -723,9 +740,29 @@ class _GPUGroupBy:
 
 
 
-def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None):
-    """Execute an already optimized plan on one device; returns (result, provenance)."""
+def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,
+                   auto: bool = False):
+    """Execute an already optimized plan on one device; returns (result, provenance). A GPU piece that
+    left the GPU for memory reasons is listed in the provenance as ``gpu_pieces`` (F-056)."""
+    from mxframe import gpu_budget
     from mxframe.custom_ops import CustomOpsCompiler
     compiler = CustomOpsCompiler(device=device)
-    result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
-    return result, dict(compiler.last_compile_provenance or {})
+    with gpu_budget.track(strict=strict, device="auto" if auto else device) as run:
+        result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
+    prov = dict(compiler.last_compile_provenance or {})
+    if run.events:
+        prov["gpu_pieces"] = "; ".join(run.lines)
+        if run.oom_free is not None:
+            prov["gpu_pieces_oom"] = run.oom_free      # free GPU bytes when a piece ran out of memory
+    return result, prov
+
+
+def _oom_free(err: BaseException):
+    """Free GPU bytes now if `err` is an out-of-memory (the shape is retried once more is free), else None."""
+    if not isinstance(err, MemoryError):
+        return None
+    try:
+        from mxframe import gpu_budget
+        return gpu_budget.free_bytes()
+    except Exception:
+        return None
