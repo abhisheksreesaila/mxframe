@@ -1502,6 +1502,56 @@ class CustomOpsCompiler(GraphCompiler):
         except Exception as exc:        # a plan is fully native or not at all: never fail the query
             return _native_exec.swallowed(exc, "fused join + aggregate")
 
+    def _distinct_groupby(self, plan):
+        """``DISTINCT k1..kn`` over ``[Project of plain columns] Filter*(Scan | inner-join tree)`` as the keyed
+        group-by with a hidden ``MIN(row number)`` (F-033, design 3.4): one native call fused with the filter
+        (or, over a star join, with the lookups: the fused v3 call, no user aggregate), the groups sorted by
+        their first row (first appearance, as ``mx_distinct`` and the Python path give), then the post-ops
+        above the DISTINCT. Only directly addressed key spaces (dictionary codes, small integer ranges); wide
+        ones, plain strings, floats and nulls decline to ``mx_distinct`` / the old path. None: not that shape,
+        or declined."""
+        if _native_exec is None or not _native_exec.enabled():
+            return None
+        core, post_ops = self._extract_post_ops(plan)
+        if not post_ops or not isinstance(post_ops[0], Distinct):
+            return None
+        node, names = core, None
+        if isinstance(core, Project):
+            if not all(isinstance(e, Expr) and e.op == "col" and e._alias in (None, e.args[0]) for e in core.exprs):
+                return None
+            node, names = core.input, [e.args[0] for e in core.exprs]
+        from .join_engine import plan_columns
+        if names is None:
+            names = plan_columns(node)
+        keys = list(post_ops[0].subset or names or ())
+        if not keys or len(set(keys)) != len(keys) or any(k not in names for k in keys):
+            return None
+        below = node
+        while isinstance(below, Filter):
+            below = below.input
+        if not isinstance(below, (Scan, Join)):
+            return None
+        rest = post_ops[1:]
+        first = Sort(None, [Expr("col", "__first")], [False])
+        native_ops = [first] + ([rest[0]] if rest and isinstance(rest[0], Limit) else [])   # DISTINCT ... LIMIT: top-k groups
+        agg = Aggregate(node, [Expr("col", k) for k in keys], [Expr("min", Expr("rowid")).alias("__first")])
+        try:
+            if isinstance(below, Scan):
+                res = _native_exec.try_execute(self, agg, None, native_ops, distinct=True)
+            else:
+                from . import join_engine
+                if isinstance(below, Join) and below.how != "inner":
+                    return None
+                res = join_engine.fused_join_aggregate(self, agg, None, native_ops, distinct=True)
+                self._star_stash = None
+        except Exception as exc:       # a plan is fully native or not at all: never fail the query
+            res = _native_exec.swallowed(exc, "distinct as group-by")
+        if res is None:
+            return None
+        res = res.select(keys)
+        rest = rest[1:] if len(native_ops) == 2 else rest
+        return self._apply_post_ops_custom(res, rest) if rest else res
+
     def _materialize_barrier(self, plan):
         """Compute what sits below an aggregate result as a table, so the operator above works on it.
 
@@ -1793,6 +1843,11 @@ class CustomOpsCompiler(GraphCompiler):
         # Used below to emit an accurate 'join_mojo_shortcut' provenance label
         # for plans whose only heavy work is a Mojo-executed hash join.
         _had_join = self._has_join_node(plan)
+
+        # -1a0 -- F-033: SELECT DISTINCT as the keyed group-by with a hidden MIN(row number), one native call
+        _distinct = self._distinct_groupby(plan)
+        if _distinct is not None:
+            return _distinct
 
         # -1a -- F-046a slice 3: an aggregate over inner joins runs as one native call, no joined rows
         if _had_join and _native_exec is not None:

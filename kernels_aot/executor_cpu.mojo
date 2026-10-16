@@ -893,6 +893,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var hconst = FP(unsafe_from_address=Int(P[22]))
     var n_dcols = Int(P[23])
     var doffs = _lp(Int(P[24]))
+    var no_hash = (Int(P[27]) & 1) != 0                           # flag 1 (SELECT DISTINCT): directly addressed groups only
     var O = _lp(out_a)
     var F = _lp(Int(P[26]) if fused else 0)
     var kc0 = Int(F[0]) if fused else n_cols                       # the key columns' place in an arrays row
@@ -1009,6 +1010,10 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     # key range is much wider than the input (most of a per-worker partial over D groups would stay
     # empty, yet every worker would zero and merge all of it)
     var compact = grouped and not use_hash and (D > max_groups or (not fused and not any_expr and D >= SPARSE_MIN_RANGE and D > 2 * n_rows))
+    if no_hash and (use_hash or compact):             # DISTINCT over a wide key space: mx_distinct answers
+        K.free()
+        tbl.free()
+        return E_TOO_MANY_GROUPS
     if use_hash or compact:
         for k in range(n_keys):
             if Int(K.kinds[k]) == K_EXPR:             # expression keys: directly addressed only

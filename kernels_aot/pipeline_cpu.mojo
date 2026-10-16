@@ -83,6 +83,7 @@ comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
 comptime OP_CMPC = 38
+comptime OP_ROWID = 39      # the row's number in the whole input (SELECT DISTINCT: first appearance, F-033)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -396,6 +397,11 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             var c = Int(ins[2])
             _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
             _cmp_const(Int(ins[4]), d, p.consts[Int(ins[3])], npad)
+        elif op == OP_ROWID:
+            # i0 is the block's first row in the whole input (the column bases are rebased to it); sel
+            # holds the block offsets of the rows kept so far
+            for i in range(n):
+                d[i] = Float64(i0 + (Int(sel[i]) if use_sel else i))
         elif op < OP_NOT:
             _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad)
         elif op == OP_NOT:

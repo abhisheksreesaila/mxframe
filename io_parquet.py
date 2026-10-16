@@ -817,16 +817,19 @@ def _filters_expression(filters):
 
 def _single_table_shape(plan) -> bool:
     """``[Sort / Limit / Distinct(all columns)]* [Project(plain columns)] Filter+ (Scan | ParquetScan)``:
-    one table filtered and selected, with nothing that reads its columns as values on the way."""
+    one table filtered and selected, with nothing that reads its columns as values on the way. A DISTINCT
+    needs no filter (F-033: it runs on the codes as a group-by)."""
     node = plan
+    distinct = False
     while isinstance(node, (Sort, Limit, Tail)) or (isinstance(node, Distinct) and not node.subset):
+        distinct = distinct or isinstance(node, Distinct)
         node = node.input
     if isinstance(node, Project):
         if not all(isinstance(e, Expr) and e.op == "col" for e in node.exprs):
             return False
         node = node.input
     if not isinstance(node, Filter):
-        return False
+        return distinct and isinstance(node, (Scan, ParquetScan))
     while isinstance(node, Filter):
         node = node.input
     return isinstance(node, (Scan, ParquetScan))

@@ -33,6 +33,10 @@ from .lazy_frame import Aggregate, Filter, Limit, Scan, Sort
 MAGIC = 0x4D584531
 MAX_GROUPS = 1 << 20          # key ranges addressed directly
 MAX_COMPACT = 1 << 27         # key ranges compacted through a presence table (bytes + int32 per code)
+DISTINCT_MAX_GROUPS = 1 << 17     # SELECT DISTINCT through the group-by: directly addressed key spaces up to this,
+                                  # wider ones keep mx_distinct (measured: past ~2e5 groups its hash beats the
+                                  # group-by plus the sort by first row)
+DISTINCT_FLAG = 1                 # plan word 27: groups directly addressed or E_TOO_MANY_GROUPS
 _CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
 _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 K_DICT, K_I32, K_I64, K_STR, K_EXPR = 0, 1, 2, 3, 4
@@ -267,9 +271,12 @@ def _sort_spec(sort_by, keys, names):
     return sorts
 
 
-def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = False) -> Optional[pa.Table]:
+def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = False,
+                distinct: bool = False) -> Optional[pa.Table]:
     """Run the whole plan in one native call, or None (the caller's path runs instead).
-    `gpu_fallback`: a GPU session whose own pipeline declined the plan answers it here, on the CPU."""
+    `gpu_fallback`: a GPU session whose own pipeline declined the plan answers it here, on the CPU.
+    `distinct`: the plan is a SELECT DISTINCT as a group-by (``distinct_plan``): only directly addressed key
+    spaces up to DISTINCT_MAX_GROUPS, no plain-string keys (``mx_distinct`` takes those and wider ones)."""
     _last["path"] = None
     t_start = _time.perf_counter()
     if not enabled():
@@ -364,6 +371,8 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         kind = _key_kind(c)
         if kind is None or c.null_count:
             return _decline(f"group key type {c.type} or nulls not in M0")
+        if distinct and kind == K_STR:
+            return _decline("distinct: plain string keys")
         key_cols.append(c)
         kinds.append(kind)
     every = cols + key_cols
@@ -406,14 +415,16 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         from .pipeline_kernels import default_threads
         c_xkeys = (ctypes.c_int64 * max(3 * n_keys, 1))(
             *[v for i in range(n_keys) for v in ((key_slot[i],) + ranges[i] if i in derived else (0, 0, 0))])
-        P = (ctypes.c_int64 * 26)(
+        max_groups = DISTINCT_MAX_GROUPS if distinct else MAX_GROUPS
+        P = (ctypes.c_int64 * 28)(
             MAGIC, 2, len(segs), len(cols), n_keys, n_out, len(sorts),
             code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
             ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
-            default_threads(table.num_rows), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
-            min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)), ctypes.addressof(c_hconst),
-            len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys))
+            default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
+            max_groups if distinct else min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)),
+            ctypes.addressof(c_hconst), len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys),
+            0, DISTINCT_FLAG if distinct else 0)
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -1206,9 +1217,12 @@ def fused_join_blocked(compiler) -> Optional[str]:
     return None
 
 
-def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Optional[pa.Table]:
+def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, distinct: bool = False) -> Optional[pa.Table]:
     """``plan``'s aggregate over the star join ``fj`` in one native call (plan version 3), or None (the
-    caller materializes the join and runs the aggregate as before). ``plan.input`` is not read."""
+    caller materializes the join and runs the aggregate as before). ``plan.input`` is not read.
+    `distinct`: a SELECT DISTINCT as a group-by (see ``try_execute``): key spaces up to DISTINCT_MAX_GROUPS,
+    no partner-row grouping."""
+    max_groups = DISTINCT_MAX_GROUPS if distinct else MAX_GROUPS
     _last["path"] = None
     t_start = _time.perf_counter()
     why = fused_join_blocked(compiler)
@@ -1247,7 +1261,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         mem = fj.cache["partners"] = (pk_names, bs, look_words, base)
     pk_names, bs, look_words, base = mem
     cols = dict(base)
-    if plan.group_by and not any(src[0] == "prow" for src in fj.vcols.values()):
+    if plan.group_by and not distinct and not any(src[0] == "prow" for src in fj.vcols.values()):
         got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops, only_if_wide=True)
         if got is not None:                      # keys too many for direct addressing: group by partner row
             return got
@@ -1271,9 +1285,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
                 space *= int(a.max()) - int(a.min()) + 1
             elif pa.types.is_dictionary(c.type):
                 space *= max(1, len(c.chunk(0).dictionary))
-    if space > MAX_GROUPS:
+    if space > max_groups:
         return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
-                                "group key space too wide for direct addressing")
+                                "group key space too wide for direct addressing", distinct)
     keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}
     fact_range = {}                     # fact join keys bounded by their partners' keys: no scan for their range
     for i, e in enumerate(plan.group_by):
@@ -1346,9 +1360,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         d = 1                       # every key's range is known here: a key space too big declines before any pass
         for lo, hi in list(known.values()) + list(fact_range.values()):
             d *= hi - lo + 1
-        if d > MAX_GROUPS:
+        if d > max_groups:
             return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
-                                    "group key space too wide for direct addressing")
+                                    "group key space too wide for direct addressing", distinct)
     probe_idx = [i for i in sorted(derived) if i not in known]
     if probe_idx:                      # an expression key's range: one fused min / max pass over the same join
         probe = Aggregate(None, [], [a for i in probe_idx
@@ -1361,8 +1375,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
             if lo is None or hi is None or lo != int(lo) or hi != int(hi):
                 return _decline("derived group key: not an integer range")
             ranges[i] = (int(lo), int(hi))
-    if any(hi - lo + 1 > MAX_GROUPS for lo, hi in list(ranges.values()) + list(fact_range.values())):
-        if not any(src[0] == "prow" for src in fj.vcols.values()):
+    if any(hi - lo + 1 > max_groups for lo, hi in list(ranges.values()) + list(fact_range.values())):
+        if not distinct and not any(src[0] == "prow" for src in fj.vcols.values()):
             got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
             if got is not None:
                 return got
@@ -1498,14 +1512,15 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
             pre.set_bytes.ctypes.data, pre.set_meta.ctypes.data, ctypes.addressof(c_pdtypes), len(pdcols),
             ctypes.addressof(c_pdoffs), pre_off, len(look_words), ctypes.addressof(L), probe_off,
             len(bspec), ctypes.addressof(c_bcols), 0, width)
-        P = (ctypes.c_int64 * 27)(
+        P = (ctypes.c_int64 * 28)(
             MAGIC, 3, len(segs), len(prog.columns), n_keys, n_out, len(sorts),
             code.ctypes.data, prog.consts.ctypes.data, prog.set_bytes.ctypes.data,
             prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes), ctypes.addressof(arrays),
             ctypes.addressof(c_kinds), ctypes.addressof(c_outs), ctypes.addressof(c_sorts),
-            default_threads(table.num_rows), MAX_GROUPS, limit, len(having), ctypes.addressof(c_having),
-            MAX_GROUPS, ctypes.addressof(c_hconst),
-            len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys), ctypes.addressof(F))
+            default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
+            max_groups, ctypes.addressof(c_hconst),
+            len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys), ctypes.addressof(F),
+            DISTINCT_FLAG if distinct else 0)
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -1590,10 +1605,11 @@ def _bounds(e, rng):
     return None
 
 
-def _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops, reason):
+def _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops, reason, distinct=False):
     """A group key the expression-key route cannot take (a string column with too many distinct values, a
-    float): group by the partner's row when that shape fits, else decline with ``reason``."""
-    if not any(src[0] == "prow" for src in fj.vcols.values()):
+    float): group by the partner's row when that shape fits, else decline with ``reason``
+    (never for a SELECT DISTINCT: its wide key spaces are ``mx_distinct``'s)."""
+    if not distinct and not any(src[0] == "prow" for src in fj.vcols.values()):
         got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
         if got is not None:
             return got

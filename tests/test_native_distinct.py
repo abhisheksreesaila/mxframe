@@ -50,7 +50,10 @@ def distinct_calls(monkeypatch):
 def test_distinct_matches_the_python_path_in_first_appearance_order(native, monkeypatch, distinct_calls, cols, chunks):
     t = _table(chunks=chunks)
     got, old, _, _ = _both(lambda t: LazyFrame(t).select(*cols).distinct(), t, monkeypatch)
-    assert distinct_calls, nx.last_decline()
+    if cols == ["a"]:         # a small integer key space is the keyed group-by's (F-033), not mx_distinct's
+        assert not distinct_calls, nx.last_decline()
+    else:
+        assert distinct_calls, nx.last_decline()
     assert got.schema == old.schema
     assert got.num_rows == old.num_rows
     for c in cols:                                       # same rows, same order

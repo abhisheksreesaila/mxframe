@@ -1118,7 +1118,7 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
                  via_probe=via_probe, post_res=post_res, fact=fact)
 
 
-def fused_join_aggregate(comp, plan, having_pred, post_ops) -> Optional[pa.Table]:
+def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = False) -> Optional[pa.Table]:
     """``[Sort Limit] [HAVING] Aggregate([Filter]* (inner-join tree))`` as ONE native call (F-046a slice 3):
     the fact leaf's filter, the partner lookups, the conditions across partners (and filters above the join)
     and the aggregate run per block, and no joined row is written. The partners are built as the star scan
@@ -1167,7 +1167,7 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops) -> Optional[pa.Table
     if _TRACE:
         _trace(f"fused join + aggregate: scan leaf {fact} ({st.scan.table.num_rows} rows) with partners "
                f"{[(c, lk.build.num_rows) for (c, _), lk in zip(st.roots, st.lookups)]}")
-    out = native_exec.try_execute_join(comp, plan, fj, having_pred, post_ops)
+    out = native_exec.try_execute_join(comp, plan, fj, having_pred, post_ops, distinct)
     if out is not None:
         comp._star_stash = None
     return out

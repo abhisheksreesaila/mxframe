@@ -75,6 +75,7 @@ OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
+OP_ROWID = 39
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 
 OP_NAMES = {
@@ -82,7 +83,7 @@ OP_NAMES = {
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
-    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC",
+    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX",
 }
 
@@ -588,6 +589,10 @@ class _Builder:
                     raise Unsupported("NaN literal")
                 return _Const(float(v), "float")
             raise Unsupported(f"literal {type(v).__name__} outside a string predicate")
+        if op == "rowid":
+            # the row's number in the input (SELECT DISTINCT's first-appearance order, F-033); bounded far
+            # inside 2^53, so a sum or an arithmetic on it stays exact
+            return _Val(self.emit(OP_ROWID, key_extra=("rowid",)), "int", ("c", 1 << 40))
         if op in _ARITH:
             return self._arith(op, args)
         if op in _CMP:
@@ -998,6 +1003,8 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             return [op, phys_of(ins[1]), ins[2], 0, 0]
         if op == OP_CMPC:
             return [op, phys_of(ins[1]), ins[2], ins[3], ins[4]]
+        if op == OP_ROWID:
+            return [op, phys_of(ins[1]), 0, 0, 0]
         if op == OP_IN_SET:
             return [op, phys_of(ins[1]), phys_of(ins[2]), ins[3], 0]
         if op in (OP_NOT, OP_FLOOR):
@@ -1154,7 +1161,7 @@ def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: 
 
 def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
-    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC):
+    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID):
         return []
     if op in (OP_NOT, OP_FLOOR, OP_IN_SET):
         return [ins[2]]
