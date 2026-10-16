@@ -345,8 +345,30 @@ def test_env_var_sets_default_thread_count():
     assert _threads_in_fresh_process("0") == all_cores
 
 
+def _thread_cpu_ns():
+    """CPU nanoseconds each thread of this process has run (kernel scheduler accounting)."""
+    out = {}
+    for tid in os.listdir("/proc/self/task"):
+        try:
+            with open(f"/proc/self/task/{tid}/schedstat") as f:
+                out[tid] = int(f.read().split()[0])
+        except OSError:                    # thread ended between listdir and open
+            pass
+    return out
+
+
+def _busy_threads(fn, min_ns=500_000):
+    """How many threads each ran at least ``min_ns`` of CPU during ``fn``.  CPU time is the
+    work a thread did, so load from other processes stretches wall time but not this count."""
+    before = _thread_cpu_ns()
+    fn()
+    after = _thread_cpu_ns()
+    return sum(1 for t, ns in after.items() if ns - before.get(t, 0) >= min_ns)
+
+
 def test_thread_budget_changes_actual_parallelism(aot):
-    """threads=1 stays on one core; threads=4 burns more CPU time than wall time."""
+    """threads=1 keeps the work on one thread; threads=4 spreads it over four workers
+    (the calling thread also runs a share, so up to five threads are busy)."""
     if (os.cpu_count() or 1) < 4:
         pytest.skip("needs >= 4 cores")
     n = 30_000_000
@@ -354,17 +376,13 @@ def test_thread_budget_changes_actual_parallelism(aot):
     mask = np.ones(n, dtype=np.int32)
     aot.masked_global_sum(a, mask, threads=4)      # warm the pool and page in the data
 
-    def cpu_over_wall(threads):
-        best = 0.0
-        for _ in range(4):
-            c0, w0 = time.process_time(), time.perf_counter()
-            aot.masked_global_sum(a, mask, threads=threads)
-            c, w = time.process_time() - c0, time.perf_counter() - w0
-            best = max(best, c / max(w, 1e-9))
-        return best
+    def busy(threads):
+        return [_busy_threads(lambda: aot.masked_global_sum(a, mask, threads=threads))
+                for _ in range(4)]
 
-    assert cpu_over_wall(1) < 1.5
-    assert cpu_over_wall(4) > 1.5
+    assert max(busy(1)) == 1
+    four = busy(4)
+    assert 4 <= min(four) and max(four) <= 5        # 4 workers, plus the calling thread (measured: 5)
 
 
 def test_concurrent_calls_from_python_threads(aot):

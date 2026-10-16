@@ -231,6 +231,26 @@ class GraphCompiler:
         post_ops.reverse()  # innermost first = correct application order
         return plan, post_ops
 
+    @staticmethod
+    def _key_tiebreak(plan, post_ops):
+        """ORDER BY right above a group-by: add the group keys (ascending) as the last sort
+        columns, so ties come out in key order on every path, as the native executor and
+        `ORDER BY ..., keys` in DuckDB do (a hash table's own order is not deterministic)."""
+        if not (post_ops and isinstance(post_ops[0], Sort) and isinstance(plan, Aggregate) and plan.group_by):
+            return post_ops
+        srt = post_ops[0]
+        have = {e.args[0] for e in srt.by if e.op == "col"}
+        desc = list(srt.descending) if isinstance(srt.descending, (list, tuple)) \
+            else [bool(srt.descending)] * len(srt.by)
+        by = list(srt.by)
+        for e in plan.group_by:
+            name = e._alias or (e.args[0] if e.op == "col" else None)
+            if name is not None and name not in have:
+                by.append(Expr("col", name))
+                desc.append(False)
+                have.add(name)
+        return [Sort(srt.input, by, desc)] + list(post_ops[1:])
+
     @classmethod
     def _apply_post_ops(cls, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct operations on the Arrow result table.
@@ -257,6 +277,7 @@ class GraphCompiler:
         """Apply filters eagerly in PyArrow, then compile the rest to a MAX Graph."""
         # Peel off Sort/Limit/Distinct from top of plan
         core_plan, post_ops = self._extract_post_ops(plan)
+        post_ops = self._key_tiebreak(core_plan, post_ops)
 
         core_plan = self._strip_filters(core_plan)
         scan = self._find_scan(core_plan)

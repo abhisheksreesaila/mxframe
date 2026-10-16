@@ -1512,9 +1512,13 @@ class CustomOpsCompiler(GraphCompiler):
         read = set()
         for e in list(plan.group_by) + list(plan.aggs) + preds:
             _expr_col_names(e, read)
-        if not any(n in table.column_names and table.column(n).null_count for n in read):
-            return None
+        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
+            return None
+        # an integer SUM whose total could pass 2^53 is added exactly (int64) here, not in float64 (F-037)
+        from .pipeline_program import int_sum_inexact
+        exact_sum = int_sum_inexact(list(plan.aggs), table)
+        if not has_nulls and not exact_sum:
             return None
 
         t_start = t0 if t0 is not None else _time.perf_counter()
@@ -1538,8 +1542,17 @@ class CustomOpsCompiler(GraphCompiler):
                 agg_names.append(e._alias or f"agg_{i}")
                 if e.op == "count" and e.args[0].op == "lit":
                     agg_arrays.append(_npa(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
-                else:
-                    agg_arrays.append(self._eval_expr_arrow(e.args[0], table))
+                    continue
+                arr = None
+                if exact_sum and e.op == "sum":
+                    _PRECISE.on = False                 # integers stay int64
+                    try:
+                        arr = self._eval_expr_arrow(e.args[0], table)
+                    finally:
+                        _PRECISE.on = True
+                    if not pa.types.is_integer(arr.type):
+                        arr = None
+                agg_arrays.append(arr if arr is not None else self._eval_expr_arrow(e.args[0], table))
         finally:
             _PRECISE.on = prev
 
@@ -1552,7 +1565,8 @@ class CustomOpsCompiler(GraphCompiler):
             out_cols = [grouped.column(n) for n in key_names]
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
-                out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" else pc.cast(c, pa.float64()))
+                exact = e.op == "sum" and pa.types.is_integer(agg_arrays[i].type)
+                out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
             result = pa.Table.from_arrays(out_cols, names=key_names + agg_names)
         else:
             cols = []
@@ -1563,7 +1577,8 @@ class CustomOpsCompiler(GraphCompiler):
                 v = {"sum": pc.sum, "min": pc.min_max, "max": pc.min_max, "mean": pc.mean}[e.op](arr)
                 if e.op in ("min", "max"):
                     v = v[e.op]
-                cols.append(_npa([v.as_py()], type=pa.float64()))
+                exact = e.op == "sum" and pa.types.is_integer(arr.type)
+                cols.append(_npa([v.as_py()], type=pa.int64() if exact else pa.float64()))
             result = pa.Table.from_arrays(cols, names=agg_names)
 
         if having_pred is not None:
@@ -1756,6 +1771,11 @@ class CustomOpsCompiler(GraphCompiler):
                 having_pred = plan.predicate
                 plan = plan.input
 
+        # 0a1 -- ORDER BY ties: group keys are the last sort columns on every path below. The native
+        # executor adds them itself, so it gets the post-ops as written.
+        _native_post_ops = post_ops
+        post_ops = self._key_tiebreak(plan, post_ops)
+
         # 0a2 -- SQL null semantics.  The kernels have no notion of null (a null group key was
         # dropped, a null value turned a sum into NaN), so an aggregate that touches a column
         # with nulls is computed by Arrow's hash aggregate: a null key is its own group, sum /
@@ -1815,7 +1835,7 @@ class CustomOpsCompiler(GraphCompiler):
         # F-030 / F-031 -- native executor: the whole plan in one Mojo call
         if _native_exec is not None:          # (declines at once when MXFRAME_NATIVE=0)
             try:
-                _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
+                _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops)
             except Exception as _exc:      # a plan is fully native or not at all: never fail the query
                 _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
             if _native is not None:
@@ -1828,7 +1848,7 @@ class CustomOpsCompiler(GraphCompiler):
         # first, so CPU and GPU sessions give the same digits (F-022 / F-031)
         if _native_exec is not None and _native_exec.enabled() and self._session_device == "gpu":
             try:
-                _native = _native_exec.try_execute(self, plan, having_pred, post_ops, gpu_fallback=True)
+                _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops, gpu_fallback=True)
             except Exception as _exc:
                 _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
             if _native is not None:
