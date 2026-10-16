@@ -22,7 +22,7 @@ from pathlib import Path
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
-from .lazy_frame import join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
@@ -1848,8 +1848,18 @@ class CustomOpsCompiler(GraphCompiler):
             return "", False
         from .pipeline_program import int_sum_inexact
         exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
+        if not exact_sum:                  # F-090: float64 rounds the MIN / MAX of an integer past 2^53
+            for e in plan.aggs:
+                if e.op in ("min", "max") and e.args[0].op == "col" and e.args[0].args[0] in table.column_names:
+                    c = table.column(e.args[0].args[0])
+                    if pa.types.is_integer(c.type) and c.type.bit_width >= 64 and len(c):
+                        mm = pc.min_max(c)
+                        lo, hi = mm["min"].as_py(), mm["max"].as_py()
+                        if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
+                            exact_sum = True
+                            break
         why = "a column the plan reads has nulls" if has_nulls else (
-            "an integer sum could pass 2^53 (added exactly in int64)" if exact_sum else "")
+            "an integer sum could pass 2^53, or a min / max past it (computed exactly in int64)" if exact_sum else "")
         return why, exact_sum
 
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
@@ -1894,7 +1904,7 @@ class CustomOpsCompiler(GraphCompiler):
                     agg_arrays.append(_npa(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
                     continue
                 arr = None
-                if exact_sum and e.op == "sum":
+                if exact_sum and e.op in ("sum", "min", "max"):
                     _PRECISE.on = False                 # integers stay int64
                     try:
                         arr = self._eval_expr_arrow(e.args[0], table)
@@ -1915,7 +1925,7 @@ class CustomOpsCompiler(GraphCompiler):
             out_cols = [grouped.column(n) for n in key_names]
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
-                exact = e.op == "sum" and pa.types.is_integer(agg_arrays[i].type)
+                exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(agg_arrays[i].type)
                 out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
             result = pa.Table.from_arrays(out_cols, names=key_names + agg_names)
         else:
@@ -1924,9 +1934,12 @@ class CustomOpsCompiler(GraphCompiler):
                 if e.op == "count":
                     cols.append(_npa([pc.count(arr).as_py()], type=pa.int64()))
                     continue
-                exact = e.op == "sum" and pa.types.is_integer(arr.type)
-                if exact:
+                exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(arr.type)
+                if exact and e.op == "sum":
                     cols.append(_npa([_int_sum(arr)], type=pa.int64()))        # OverflowError past int64
+                    continue
+                if exact:
+                    cols.append(_npa([pc.min_max(arr)[e.op].as_py()], type=pa.int64()))
                     continue
                 v = {"sum": pc.sum, "min": pc.min_max, "max": pc.min_max, "mean": pc.mean}[e.op](arr)
                 if e.op in ("min", "max"):
@@ -2093,7 +2106,8 @@ class CustomOpsCompiler(GraphCompiler):
 
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:
-        """Cast the columns of ``count`` aggregates to int64 (the kernels return float32/float64)."""
+        """Cast the columns of ``count`` aggregates to int64, and of integer MIN / MAX to the column's integer type
+        (the kernels return float32/float64; values past 2^53 take the exact Arrow route before this)."""
         node = plan
         while isinstance(node, (Filter, Sort, Limit, Distinct, Tail)):
             node = node.input
@@ -2117,32 +2131,11 @@ class CustomOpsCompiler(GraphCompiler):
                 continue
             # F-090: MIN / MAX of an integer column is that integer type (DuckDB), not the kernels' float
             if int_cols is None:
-                int_cols = cls._integer_columns(agg.input)
+                int_cols = {n: t for n, t in column_types(agg.input).items() if pa.types.is_integer(t)}
             want = int_cols.get(e.args[0].args[0])
             if want is not None and pa.types.is_floating(col.type):
-                try:
-                    result = result.set_column(idx, name, pc.cast(col, want))   # safe cast: a fraction raises
-                except pa.ArrowInvalid:
-                    pass
+                result = result.set_column(idx, name, pc.cast(col, want))   # safe cast: a fraction raises
         return result
-
-    @classmethod
-    def _integer_columns(cls, plan) -> dict:
-        """{column name: integer type} for the columns of *plan* that are plain integer columns of a
-        table (through filters, sorts, joins and renaming selects); other columns are absent."""
-        if isinstance(plan, Scan):
-            return {f.name: f.type for f in plan.table.schema if pa.types.is_integer(f.type)}
-        if isinstance(plan, (Filter, Sort, Limit, Distinct, Tail)):
-            return cls._integer_columns(plan.input)
-        if isinstance(plan, Join):
-            left, right = cls._integer_columns(plan.left), cls._integer_columns(plan.right)
-            return {n: t for n, t in {**right, **left}.items()
-                    if n not in left or n not in right or left[n] == right[n]}
-        if isinstance(plan, Project):
-            inner = cls._integer_columns(plan.input)
-            return {(e._alias or e.args[0]): inner[e.args[0]]
-                    for e in plan.exprs if e.op == "col" and e.args[0] in inner}
-        return {}
 
     def _compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
         """Optimized execution with three-tier caching + post-ops.

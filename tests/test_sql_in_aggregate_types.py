@@ -74,3 +74,51 @@ def test_integer_max_through_filter_and_join_keeps_int64(device):
     assert got.schema.field("m").type == want.schema.field("m").type == pa.int64()
     assert got.schema.field("n").type == want.schema.field("n").type == pa.int64()
     assert got.to_pydict() == want.to_pydict()
+
+
+BIG = 2 ** 60
+
+
+def _big():
+    return pa.table({
+        "a": pa.array([1, 1, 2, 2, 2], pa.int64()),
+        "i": pa.array([BIG + 1, BIG + 3, -BIG - 1, 5, BIG + 7], pa.int64()),
+    })
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("fn", ["max", "min"])
+def test_integer_min_max_past_2_53_are_exact(fn, device):
+    t = _big()
+    want = _duck_types(f"SELECT a, {fn}(i) AS m FROM t GROUP BY a ORDER BY a", t)
+    got = LazyFrame(t).groupby("a").agg(getattr(col("i"), fn)().alias("m")).compute(device=device).sort_by("a")
+    assert got.column("m").to_pylist() == want.column("m").to_pylist()
+    want = _duck_types(f"SELECT {fn}(i) AS m FROM t", t)
+    got = LazyFrame(t).groupby().agg(getattr(col("i"), fn)().alias("m")).compute(device=device)
+    assert got.column("m").to_pylist() == want.column("m").to_pylist()
+    assert got.schema.field("m").type == pa.int64()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("neg", ["", "NOT "])
+@pytest.mark.parametrize("fn", ["max", "min"])
+def test_in_over_integer_max_past_2_53(fn, neg, device):
+    t = _big()
+    q = f"SELECT a, i FROM t WHERE i {neg}IN (SELECT {fn}(i) FROM t GROUP BY a) ORDER BY a, i"
+    want = _duck_types(q, t)
+    got = mx.sql(q, t=t).compute(device=device).sort_by([("a", "ascending"), ("i", "ascending")])
+    assert got.to_pydict() == want.to_pydict()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_int_float_join_keeps_each_sides_key_column(device):
+    t = pa.table({"i": pa.array([1, 2, 3, 4], pa.int64()), "p": pa.array([10, 20, 30, 40], pa.int64())})
+    u = pa.table({"x": pa.array([2.0, 4.0, 4.5], pa.float64()), "q": pa.array([1, 2, 3], pa.int64())})
+    q = "SELECT t.i, u.x, p, q FROM t JOIN u ON t.i = u.x ORDER BY t.i"
+    con = duckdb.connect()
+    con.register("t", t)
+    con.register("u", u)
+    want = con.execute(q).to_arrow_table()
+    got = mx.sql(q, t=t, u=u).compute(device=device).sort_by("i")
+    assert got.schema.types == want.schema.types
+    assert got.to_pydict() == want.to_pydict()
