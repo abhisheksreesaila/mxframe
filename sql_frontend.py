@@ -99,14 +99,30 @@ def _default_agg_name(node: sge.Expression) -> str:
     raise ValueError(f"give {node.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
 
 
-def _check_unique(names) -> None:
-    seen = set()
+def _dedupe(names) -> List[Optional[str]]:
+    """Output names as DuckDB returns them: a name already taken becomes ``x_1``, ``x_2`` ...
+    (the first free one, in SELECT order). Unnamed (None) stay unnamed."""
+    seen, out = set(), []
     for n in names:
-        if n is None:
-            continue
-        if n in seen:
-            raise ValueError(f"duplicate output column name {n!r}: give one of them an alias (AS name)")
-        seen.add(n)
+        if n is not None and n in seen:
+            i = 1
+            while f"{n}_{i}" in seen:
+                i += 1
+            n = f"{n}_{i}"
+        if n is not None:
+            seen.add(n)
+        out.append(n)
+    return out
+
+
+def _ordinal(node: sge.Expression, n_items: int) -> Optional[int]:
+    """0-based SELECT position when ``node`` is an integer literal (GROUP BY 1, ORDER BY 2)."""
+    if isinstance(node, sge.Literal) and not node.is_string:
+        i = int(node.this)
+        if not 1 <= i <= n_items:
+            raise ValueError(f"ORDER BY / GROUP BY position {i} is not in the SELECT list ({n_items} columns)")
+        return i - 1
+    return None
 
 
 class _SQLTranslator:
@@ -123,6 +139,10 @@ class _SQLTranslator:
         # right join keys of a LEFT JOIN: the join drops them, and they are NULL for unmatched rows,
         # so a left key cannot stand in for them
         self._dropped_right: dict = {}
+        # (table name or alias, its columns) of every scanned table, and join keys that have the
+        # same name on both sides (one copy survives the join, so t.k and u.k are the same column)
+        self._table_cols: List[tuple] = []
+        self._same_keys: set = set()
         # aggregate query state (see _build_aggregate)
         self._post = False          # translating an expression above the Aggregate
         self._key_names: dict = {}  # translated group key signature -> output name
@@ -130,6 +150,7 @@ class _SQLTranslator:
         self._sort = None
         self._aggs: List[Expr] = []
         self._agg_names: dict = {}
+        self._key_names_list: List[Expr] = []
         self._cd = None             # (argument, output name) of the one COUNT(DISTINCT x)
 
     # ------------------------------------------------------------------
@@ -150,6 +171,8 @@ class _SQLTranslator:
         # 2. WHERE
         where = node.args.get("where")
         if where:
+            if _aggs_in(where.this):
+                raise ValueError("aggregate functions are not allowed in WHERE (use HAVING)")
             plan = Filter(plan, self._expr(where.this))
 
         # 3. GROUP BY / aggregates / HAVING
@@ -157,7 +180,14 @@ class _SQLTranslator:
         having = node.args.get("having")
         has_aggs = any(_aggs_in(e) for e in node.expressions)
 
+        distinct = node.args.get("distinct")
+        if distinct is not None and distinct.args.get("on") is not None:
+            raise NotImplementedError("SELECT DISTINCT ON (...) is not supported")
+        if distinct is not None and (group_node or has_aggs):
+            raise NotImplementedError("SELECT DISTINCT together with GROUP BY or aggregates is not supported yet")
+
         final_proj = None
+        names = None
         if group_node or has_aggs:
             plan, final_proj = self._build_aggregate(plan, node, group_node, having)
         else:
@@ -167,8 +197,15 @@ class _SQLTranslator:
             non_star = [e for e in node.expressions if not isinstance(e, sge.Star)]
             if non_star:
                 proj = [self._select_expr(e) for e in non_star]
-                _check_unique([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])
+                names = _dedupe([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])
+                for p, nm in zip(proj, names):
+                    if nm is not None and nm != (p._alias or (p.args[0] if p.op == "col" else None)):
+                        p.alias(nm)
+                if len(non_star) < len(node.expressions):
+                    names = None                       # a * shifts the positions
                 plan = Project(plan, proj)
+            if distinct is not None:
+                plan = Distinct(plan, None)
 
         # 4. ORDER BY
         order_node = node.args.get("order")
@@ -176,7 +213,18 @@ class _SQLTranslator:
             if self._sort is not None:                 # an aggregate query translated it already
                 by, desc = self._sort
             else:
-                by = [self._expr(o.this) for o in order_node.expressions]
+                by = []
+                for o in order_node.expressions:
+                    i = _ordinal(o.this, len(node.expressions))
+                    ref = o.this
+                    if i is None and isinstance(ref, sge.Column) and ref.name.lower() in (names or []):
+                        by.append(col(ref.name.lower()))          # a SELECT output name
+                    elif i is None:
+                        by.append(self._expr(o.this))
+                    elif names is None or names[i] is None:
+                        raise ValueError("ORDER BY position needs a named SELECT column (give it an alias)")
+                    else:
+                        by.append(col(names[i]))
                 desc = [bool(o.args.get("desc")) for o in order_node.expressions]
             plan = Sort(plan, by, desc)
 
@@ -225,6 +273,8 @@ class _SQLTranslator:
                 self._left_schema |= right_schema
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
+                if lk == rk:
+                    self._same_keys.add(lk)
                 if lk != rk:
                     (self._dropped_right if how == "left" else self._col_aliases)[rk] = lk
 
@@ -239,6 +289,8 @@ class _SQLTranslator:
             raise ValueError(f"Unknown table {name!r}. Available: {avail}")
         tbl = self._tables[name]
         self._scope_columns.extend(tbl.schema.names)
+        alias = table_node.alias_or_name.lower()
+        self._table_cols.append((alias, {c.lower() for c in tbl.schema.names}))
         return Scan(tbl), tbl.schema.names
 
     def _parse_join_on(self, on_expr: sge.Expression,
@@ -303,7 +355,8 @@ class _SQLTranslator:
                 name = out or "__agg_cd"
                 self._cd = (ex, name)
             else:
-                name = out or f"__agg{len(self._aggs)}"
+                taken = {k._alias for k in self._key_names_list} | set(self._agg_names.values())
+                name = out if out and out not in taken else f"__agg{len(self._aggs)}"
                 self._aggs.append(ex.alias(name))
             self._agg_names[sig] = name
         return name
@@ -361,7 +414,12 @@ class _SQLTranslator:
         group_by: List[Expr] = []
         for n, gb in enumerate(group_exprs):
             inner = gb
-            if (isinstance(gb, sge.Column) and not gb.table and gb.name.lower() in alias_expr
+            i = _ordinal(gb, len(items))
+            if i is not None:
+                if _aggs_in(items[i]):
+                    raise ValueError("GROUP BY position refers to an aggregate")
+                inner = split(items[i])[0]
+            elif (isinstance(gb, sge.Column) and not gb.table and gb.name.lower() in alias_expr
                     and gb.name.lower() not in scope):
                 inner = alias_expr[gb.name.lower()]
             key = self._expr(inner)
@@ -374,6 +432,7 @@ class _SQLTranslator:
         # output name of every key, by its translated expression (ORDER BY, HAVING and the final
         # projection refer to a key through it, whatever name or qualification the query used)
         self._key_names = {k.signature(): k._alias for k in group_by}
+        self._key_names_list = group_by
 
         # SELECT items: (output name, column of the Aggregate output). Plain aggregates first, so
         # they keep their own names; then arithmetic on aggregates and group keys.
@@ -406,8 +465,10 @@ class _SQLTranslator:
             if alias is None and not isinstance(inner, sge.Column):
                 raise ValueError(f"give {inner.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
             outs[n] = (alias or inner.name.lower(), src)
-        _check_unique([o for o, _ in outs])
-        self._out_src = dict(outs)
+        outs = list(zip(_dedupe([o for o, _ in outs]), [src for _, src in outs]))
+        self._out_src = {}
+        for o, src in outs:
+            self._out_src.setdefault(o, src)
 
         # HAVING and ORDER BY, above the Aggregate (they may need aggregates the SELECT list lacks)
         self._post = True
@@ -418,7 +479,10 @@ class _SQLTranslator:
                 by = []
                 for o in order_node.expressions:
                     ref = o.this
-                    if isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in self._out_src:
+                    i = _ordinal(ref, len(items))
+                    if i is not None:
+                        by.append(col(outs[i][1]))
+                    elif isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in self._out_src:
                         by.append(col(self._out_src[ref.name.lower()]))   # a SELECT output name
                     else:
                         ex = self._expr(ref)
@@ -436,15 +500,32 @@ class _SQLTranslator:
 
         # the Aggregate
         if self._cd is not None:
-            if self._aggs:
-                raise NotImplementedError("COUNT(DISTINCT x) together with other aggregates is not supported yet")
             x, cd_name = self._cd
-            # distinct (keys, x) rows, then a count per key: the engine's count-distinct path
             names = [k._alias for k in group_by]
-            proj = [k for k in group_by] + [x.alias("__cd")]
-            agg_plan = Aggregate(Distinct(Project(plan, proj), None), [col(nm) for nm in names],
-                                 [col("__cd").count().alias(cd_name)])
-            frame = names + [cd_name]
+            if not self._aggs:
+                # distinct (keys, x) rows, then a count per key: the engine's count-distinct path
+                proj = [k for k in group_by] + [x.alias("__cd")]
+                agg_plan = Aggregate(Distinct(Project(plan, proj), None), [col(nm) for nm in names],
+                                     [col("__cd").count().alias(cd_name)])
+                frame = names + [cd_name]
+            else:
+                # aggregate per (keys, x) first, then combine the partials per key (sum of sums, min of
+                # mins, ...) and count the x values: no join, so null keys stay a group
+                inner, outer, avg_calcs = [], [], []
+                for a in self._aggs:
+                    kind, arg, nm = a.op, a.args[0], a._alias
+                    if kind == "mean":
+                        inner += [arg.sum().alias(f"__ps_{nm}"), arg.count().alias(f"__pc_{nm}")]
+                        outer += [col(f"__ps_{nm}").sum().alias(f"__s_{nm}"), col(f"__pc_{nm}").sum().alias(f"__c_{nm}")]
+                        avg_calcs.append((nm, col(f"__s_{nm}") / col(f"__c_{nm}")))
+                    else:
+                        inner.append(getattr(arg, kind)().alias(f"__p_{nm}"))
+                        outer.append(getattr(col(f"__p_{nm}"), "sum" if kind == "count" else kind)().alias(nm))
+                outer.append(col("__cdx").count().alias(cd_name))
+                agg_plan = Aggregate(Aggregate(plan, group_by + [x.alias("__cdx")], inner),
+                                     [col(nm) for nm in names], outer)
+                frame = names + [o._alias for o in outer]
+                calcs = avg_calcs + calcs
         else:
             if not self._aggs:
                 raise ValueError("GROUP BY without an aggregate function is not supported (use SELECT DISTINCT)")
@@ -475,7 +556,7 @@ class _SQLTranslator:
         else:
             inner = e
         mx = self._expr(inner)
-        if not alias_name and isinstance(inner, sge.Column) and not inner.table and mx.op == "col":
+        if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name.lower() if inner.name.lower() != mx.args[0] else None   # joined key: as written
         if alias_name:
             mx = mx.alias(alias_name)
@@ -495,6 +576,10 @@ class _SQLTranslator:
         # ---- column reference ----
         if isinstance(node, sge.Column):
             name = node.name.lower()
+            if node.table and name not in self._same_keys and \
+                    sum(name in cols for _, cols in self._table_cols) > 1:
+                raise ValueError(f"column {node.sql(dialect='duckdb')}: the name exists in more than one joined "
+                                 "table and the join keeps one copy, so this is not supported yet")
             if name in self._dropped_right:
                 raise ValueError(f"column {name!r} is the right key of a LEFT JOIN, which the join drops "
                                  f"(it is NULL where nothing matched); use the left key {self._dropped_right[name]!r}")

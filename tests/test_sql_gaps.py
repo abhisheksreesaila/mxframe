@@ -38,12 +38,16 @@ def _norm(x):
     return x
 
 
+def _w():
+    return pa.table({"k": A(np.arange(7, dtype=np.int64)), "v": A(np.arange(7, dtype=np.int64) * 100)})
+
+
 def _run(q):
-    t, u = _t(), _u()
+    t, u, w = _t(), _u(), _w()
     exp = duckdb.sql(q).arrow()
     if isinstance(exp, pa.RecordBatchReader):
         exp = exp.read_all()
-    got = mx.sql(q, t=t, u=u).compute(device="cpu")
+    got = mx.sql(q, t=t, u=u, w=w).compute(device="cpu")
     return got, exp
 
 
@@ -156,6 +160,69 @@ ARITHMETIC = [
 ]
 
 
+MIXED_DISTINCT = [
+    "SELECT s, COUNT(DISTINCT k) AS n, SUM(v) AS x FROM t GROUP BY s",
+    "SELECT s, SUM(v), COUNT(DISTINCT k) FROM t GROUP BY s",
+    "SELECT COUNT(DISTINCT k) AS n, SUM(v) AS x, MIN(v) AS lo, MAX(v) AS hi, COUNT(*) AS c, COUNT(v) AS cv FROM t",
+    "SELECT s, COUNT(DISTINCT x) AS n, AVG(v) AS a, COUNT(*) AS c FROM t GROUP BY s",
+    "SELECT s, COUNT(DISTINCT k) AS n, SUM(v) * 2 AS y FROM t GROUP BY s",
+    "SELECT s, k, COUNT(DISTINCT x) AS n, MAX(v) AS m FROM t GROUP BY s, k",
+    "SELECT s AS b, COUNT(DISTINCT k) AS n, SUM(v) AS x FROM t GROUP BY s HAVING SUM(v) > 125000",
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY s HAVING SUM(v) > 125000",
+    "SELECT s, COUNT(DISTINCT k) AS n, SUM(v) AS x FROM t GROUP BY s ORDER BY x DESC LIMIT 2",
+    "SELECT s, COUNT(DISTINCT x) AS n, SUM(x) AS sx FROM t GROUP BY s",
+    "SELECT x, COUNT(DISTINCT k) AS n, SUM(v) AS sv FROM t GROUP BY x",   # null group key
+    "SELECT name, COUNT(DISTINCT v) AS n, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY name",
+]
+
+DISTINCT = [
+    "SELECT DISTINCT s FROM t",
+    "SELECT DISTINCT s, k FROM t",
+    "SELECT DISTINCT s AS b FROM t ORDER BY b",
+    "SELECT DISTINCT s, k FROM t ORDER BY s, k LIMIT 5",
+    "SELECT DISTINCT k FROM t ORDER BY k DESC LIMIT 3",
+    "SELECT DISTINCT x FROM t",
+    "SELECT DISTINCT k + 1 AS k1 FROM t WHERE v > 50",
+    "SELECT DISTINCT name FROM t JOIN u ON k = kid",
+    "SELECT DISTINCT name, s FROM t JOIN u ON k = kid ORDER BY name, s",
+    "SELECT DISTINCT kid FROM t JOIN u ON k = kid ORDER BY kid LIMIT 4",
+]
+
+ORDINALS = [
+    "SELECT s, SUM(v) AS x FROM t GROUP BY 1",
+    "SELECT SUM(v) AS x, s FROM t GROUP BY 2",
+    "SELECT s, k, SUM(v) AS x FROM t GROUP BY 1, 2 ORDER BY 1, 2",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY 1 ORDER BY 2 DESC",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s ORDER BY 2 DESC, 1",
+    "SELECT s, SUM(v) FROM t GROUP BY 1 ORDER BY 2",
+    "SELECT k + 1 AS k1, SUM(v) AS x FROM t GROUP BY 1 ORDER BY 1",
+    "SELECT s, SUM(v) * 2 AS y FROM t GROUP BY 1 ORDER BY 2 DESC",
+    "SELECT s, k FROM t ORDER BY 2 DESC, 1 LIMIT 5",
+    "SELECT s AS b, v FROM t WHERE v > 95 ORDER BY 2, 1",
+    "SELECT DISTINCT s, k FROM t ORDER BY 2, 1",
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY 1 ORDER BY 2 DESC, 1",
+]
+
+RENAMED = [
+    "SELECT s, SUM(v) AS s FROM t GROUP BY s",
+    "SELECT x, SUM(v) AS x FROM t GROUP BY x",
+    "SELECT s, SUM(v), s FROM t GROUP BY s",
+    "SELECT s, SUM(v) AS s_1, SUM(k) AS s FROM t GROUP BY s",
+    "SELECT SUM(v) AS x_1, SUM(v) AS x, SUM(k) AS x FROM t",
+    "SELECT SUM(v), SUM(v) FROM t",
+    "SELECT s, s FROM t",
+    "SELECT k, v AS k FROM t",
+    "SELECT t.k, u.kid, t.k FROM t JOIN u ON t.k = u.kid",
+    "SELECT t.k, w.k FROM t JOIN w ON t.k = w.k",
+    "SELECT kid, name FROM t JOIN u ON k = kid ORDER BY kid, name LIMIT 5",
+]
+
+
+@pytest.mark.parametrize("q", MIXED_DISTINCT + DISTINCT + ORDINALS + RENAMED)
+def test_matches_duckdb_round2(q):
+    _check(q)
+
+
 @pytest.mark.parametrize("q", NAMING + JOIN_KEYS + GROUP_ALL + HAVING + COUNT_DISTINCT + ARITHMETIC)
 def test_matches_duckdb(q):
     _check(q)
@@ -191,20 +258,6 @@ def test_count_distinct_reaches_the_native_count(monkeypatch):
     assert rcs == [0]
 
 
-@pytest.mark.parametrize("q", [
-    "SELECT s AS x, SUM(v) AS x FROM t GROUP BY s",
-    "SELECT x, SUM(v) AS x FROM t GROUP BY x",
-    "SELECT s, SUM(v) AS s FROM t GROUP BY s",
-    "SELECT SUM(v), SUM(v) FROM t",
-    "SELECT SUM(v) AS y, SUM(k) AS y FROM t",
-    "SELECT s, s FROM t GROUP BY s",
-    "SELECT s, s FROM t",
-])
-def test_duplicate_output_name_raises(q):
-    with pytest.raises(ValueError, match="duplicate output column"):
-        mx.sql(q, t=_t())
-
-
 @pytest.mark.parametrize("q, exc, msg", [
     ("SELECT s, SUM(v) * 2 FROM t GROUP BY s", ValueError, "alias"),
     ("SELECT s, SUM(v + 1) FROM t GROUP BY s", ValueError, "alias"),
@@ -217,13 +270,18 @@ def test_duplicate_output_name_raises(q):
     ("SELECT SUM(DISTINCT v) AS x FROM t", NotImplementedError, "DISTINCT"),
     ("SELECT AVG(DISTINCT v) AS x FROM t", NotImplementedError, "DISTINCT"),
     ("SELECT COUNT(DISTINCT s, k) AS n FROM t", NotImplementedError, "DISTINCT"),
-    ("SELECT s, COUNT(DISTINCT k) AS n, SUM(v) AS x FROM t GROUP BY s", NotImplementedError, "COUNT\\(DISTINCT"),
     ("SELECT COUNT(DISTINCT k) AS n, COUNT(DISTINCT x) AS m FROM t", NotImplementedError, "COUNT\\(DISTINCT"),
-    ("SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY s HAVING SUM(v) > 1", NotImplementedError, "COUNT\\(DISTINCT"),
     ("SELECT s, STDDEV(v) AS d FROM t GROUP BY s", NotImplementedError, "STDDEV"),
     ("SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING STDDEV(v) > 1", NotImplementedError, "STDDEV"),
+    ("SELECT s FROM t WHERE SUM(v) > 1", ValueError, "WHERE"),
+    ("SELECT s, SUM(v) AS x FROM t WHERE COUNT(*) > 1 GROUP BY s", ValueError, "WHERE"),
+    ("SELECT DISTINCT ON (s) s, k FROM t", NotImplementedError, "DISTINCT ON"),
+    ("SELECT DISTINCT s, SUM(v) AS x FROM t GROUP BY s", NotImplementedError, "DISTINCT"),
+    ("SELECT s, k FROM t ORDER BY 3", ValueError, "position"),
+    ("SELECT s, SUM(v) AS x FROM t GROUP BY 2", ValueError, "aggregate"),
+    ("SELECT t.v, w.v FROM t JOIN w ON t.k = w.k", ValueError, "more than one joined table"),
     ("SELECT kid, SUM(v) AS x FROM t LEFT JOIN u ON k = kid GROUP BY kid", ValueError, "LEFT JOIN"),
 ])
 def test_unsupported_raises(q, exc, msg):
     with pytest.raises(exc, match=msg):
-        mx.sql(q, t=_t(), u=_u())
+        mx.sql(q, t=_t(), u=_u(), w=_w())
