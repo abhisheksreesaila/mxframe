@@ -11,6 +11,7 @@ import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, value_set as _value_set,\
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate
 from ._lazy_pc import pc
+from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum
 import numpy as np
 import time as _time
 import threading as _threading
@@ -617,8 +618,9 @@ class CustomOpsCompiler(GraphCompiler):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div" and pa.types.is_integer(lhs.type) and pa.types.is_integer(rhs.type):
                 lhs, rhs = pc.cast(lhs, pa.float64()), pc.cast(rhs, pa.float64())      # SQL `/` is true division
-            fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply, "div": pc.divide}[op]
-            return fn(lhs, rhs)
+            if op == "div":
+                return pc.divide(lhs, rhs)
+            return _checked_arith(op, lhs, rhs)
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)
             if native is not None:
@@ -1355,17 +1357,16 @@ class CustomOpsCompiler(GraphCompiler):
             r = self._eval_int_expr(expr.args[1], table)
             if l is None or r is None or (isinstance(l, int) and isinstance(r, int)):
                 return None
-            fn = {"add": pc.add, "sub": pc.subtract, "mul": pc.multiply}[expr.op]
             if isinstance(l, int):
                 l = _npscalar(l, type=r.type)
             if isinstance(r, int):
                 r = _npscalar(r, type=l.type)
             try:
-                return fn(l, r)
-            except pa.ArrowInvalid:            # overflow in the column's own width
+                return _checked_arith(expr.op, l, r)
+            except OverflowError:              # overflow in the column's own width
                 wide = pa.int64()
-                return fn(pc.cast(l, wide) if isinstance(l, pa.Array) else l,
-                          pc.cast(r, wide) if isinstance(r, pa.Array) else r)
+                return _checked_arith(expr.op, pc.cast(l, wide) if isinstance(l, pa.Array) else l,
+                                      pc.cast(r, wide) if isinstance(r, pa.Array) else r)
         return None
 
     def _count_distinct_by_key(self, plan):
@@ -1495,9 +1496,11 @@ class CustomOpsCompiler(GraphCompiler):
             return Aggregate(below, plan.group_by, plan.aggs)
         return plan
 
-    def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0):
+    def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
         """``Aggregate(Filter*(Scan))`` over columns that contain nulls, by Arrow's hash
-        aggregate; None when the plan has no null in a column it reads (or is another shape)."""
+        aggregate; None when the plan has no null in a column it reads (or is another shape).
+        ``late``: called after every pipeline declined, where the next stop is the compiled graph:
+        integer arithmetic that could pass 2^53 goes to Arrow's checked kernels instead (F-061)."""
         plan = self._inline_project_into_aggregate(plan)
         if not isinstance(plan, Aggregate):
             return None
@@ -1516,7 +1519,7 @@ class CustomOpsCompiler(GraphCompiler):
             return None
         # an integer SUM whose total could pass 2^53 is added exactly (int64) here, not in float64 (F-037)
         from .pipeline_program import int_sum_inexact
-        exact_sum = int_sum_inexact(list(plan.aggs), table)
+        exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
         if not has_nulls and not exact_sum:
             return None
 
@@ -1573,11 +1576,14 @@ class CustomOpsCompiler(GraphCompiler):
                 if e.op == "count":
                     cols.append(_npa([pc.count(arr).as_py()], type=pa.int64()))
                     continue
+                exact = e.op == "sum" and pa.types.is_integer(arr.type)
+                if exact:
+                    cols.append(_npa([_int_sum(arr)], type=pa.int64()))        # OverflowError past int64
+                    continue
                 v = {"sum": pc.sum, "min": pc.min_max, "max": pc.min_max, "mean": pc.mean}[e.op](arr)
                 if e.op in ("min", "max"):
                     v = v[e.op]
-                exact = e.op == "sum" and pa.types.is_integer(arr.type)
-                cols.append(_npa([v.as_py()], type=pa.int64() if exact else pa.float64()))
+                cols.append(_npa([v.as_py()], type=pa.float64()))
             result = pa.Table.from_arrays(cols, names=agg_names)
 
         if having_pred is not None:
@@ -1852,6 +1858,12 @@ class CustomOpsCompiler(GraphCompiler):
                 _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
             if _native is not None:
                 return _native
+
+        # F-061 -- the compiled graph and the global shortcuts below compute integers in int64 or
+        # float64 without an overflow check: arithmetic that could pass 2^53 runs in Arrow (checked)
+        _exact_result = self._aggregate_with_nulls(plan, having_pred, post_ops, optimizer_trace, t0, late=True)
+        if _exact_result is not None:
+            return _exact_result
 
         # 1b2 -- Global aggregate shortcut: bypass MAX Engine for un-grouped aggs.
         # For large tables with a filter, try the fused masked-kernel path first

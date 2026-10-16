@@ -845,17 +845,56 @@ def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
         return None
 
 
-def int_sum_inexact(aggs: List[Expr], table: pa.Table) -> bool:
+def _int_arith(e: Expr, table: pa.Table) -> bool:
+    """Does ``e`` hold an integer ``+ - *`` (every column under it an integer, no float literal)?"""
+    cols, floats = set(), []
+
+    def walk(x):
+        if x.op == "col":
+            cols.add(x.args[0])
+        elif x.op == "lit":
+            if isinstance(x.args[0], float):
+                floats.append(x)
+        else:
+            for a in x.args:
+                if isinstance(a, Expr):
+                    walk(a)
+    walk(e)
+    if floats or any(c not in table.column_names or not pa.types.is_integer(table.schema.field(c).type) for c in cols):
+        return False
+
+    def has(x):
+        return x.op in ("add", "sub", "mul") or any(isinstance(a, Expr) and has(a) for a in x.args if x.op != "lit")
+    return has(e)
+
+
+def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr]] = None) -> bool:
     """Would a ``sum`` in ``aggs`` add integers whose total could pass 2^53 (so float64 loses digits)?
-    The caller then sums exactly in Arrow (F-037)."""
-    if not any(e.op == "sum" for e in aggs):
+    The caller then sums exactly in Arrow (F-037). With ``preds``: would any predicate or aggregate
+    (not only a sum) compute an integer past 2^53 (F-061: the compiled graph wraps at int64)? Each
+    expression is bounded on its own, so one the compiler can't take (a string predicate) cannot hide
+    another; an integer ``+ - *`` the compiler can't take counts as inexact (Arrow's checked kernels
+    answer it)."""
+    if preds is None:
+        aggs = [e for e in aggs if e.op == "sum"]
+        if not aggs:
+            return False
+        try:
+            _compile([], aggs, table)
+        except Inexact:
+            return True
+        except Unsupported:
+            return False
         return False
-    try:
-        _compile([], [e for e in aggs if e.op == "sum"], table)
-    except Inexact:
-        return True
-    except Unsupported:
-        return False
+    count_all = Expr("count", Expr("lit", 1))
+    for e, as_pred in [(p, True) for p in preds] + [(a, False) for a in aggs if a.op != "count"]:
+        try:
+            _compile([e], [count_all], table) if as_pred else _compile([], [e], table)
+        except Inexact:
+            return True
+        except Unsupported:
+            if _int_arith(e, table):
+                return True
     return False
 
 
