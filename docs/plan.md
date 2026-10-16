@@ -580,7 +580,8 @@ Needs: F-037 · Found by the F-037 review (2026-10-16); high priority: silent wr
 - [x] tests vs DuckDB for each, both native settings
 - Built: `np_arrow.checked_arith` (Arrow `*_checked` kernels, OverflowError "Overflow in multiplication of INT64") at every exact-path `+ - *` (`custom_ops`, `compiler._eval_predicate`); `np_arrow.int_sum` / `_int_group_sum` raise "Overflow in sum of INT64" (a total past int64 raises rather than widening: the SUM column stays int64). Found on the way: when every pipeline declined, `max(a*a*a)` ran in the compiled graph and wrapped to 0. `_aggregate_with_nulls(late=True)` now runs just before the compiled graph and the global shortcuts: `int_sum_inexact(..., preds)` bounds each predicate and aggregate on its own (an uncompilable one cannot hide another; an integer `+ - *` the compiler cannot take counts as unbounded) and sends it to the Arrow path. Group keys, `with_columns` / `select` and sorts on a projection were checked and found to run in Arrow (checked kernels), so they raise too (tests added, each fails on the pre-F-061 code). Known difference: int32 * int32 past int32 but within int64 returns the exact value natively, where DuckDB raises an INT32 overflow. Native declines past 2^53 (F-037). `tests/test_int_overflow.py` (grouped, global, after a join, nulls, GPU).
 
-## F-062 Native merge for partner-row group keys (fused join + aggregate) [todo]
+## F-062 Native merge for partner-row group keys (fused join + aggregate) [superseded]
+- Superseded by F-069 (2026-10-16): partner-row group keys take the hashed group path in the fused join (negative and repeated tuples covered by `tests/test_f069_hashed_groups.py`); `scripts/native_coverage.py --sf 1` on main: DataFrame Q10 `native@cpu`, `try_execute_join:ran`, no declines, no Arrow work. The "no slower fused than unfused" timing goes to the F-058 quiet run
 Needs: F-046a slice 3 · From its review (2026-10-16)
 - [ ] group keys that are columns of one partner but not its unique key (TPC-H Q10's shape) leave several partner rows per key tuple; slice 3 declines that case (the first version merged them in NumPy, which was per-row Python work and wrong for negative key values). Merge natively in the executor: code the key tuples per partner row (negative and repeated values), then fold the partner-row partials into key-tuple groups
 - [ ] tests vs DuckDB with negative and repeated key tuples, asserting the fused path; Q10 no slower fused than unfused on a quiet machine
@@ -786,3 +787,10 @@ Found by the F-077 developer (2026-10-16); a silent wrong answer on main
 Found by the F-077 developer (2026-10-16); untested suspicion
 - [ ] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
 - [ ] DuckDB-checked tests over the key edge cases; fail before (or a test pinning that it already matches)
+
+## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q22 [todo]
+Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (2026-10-16, after F-072): 15 of 22 SQL queries have no decline and no Arrow work over 1,000 rows; Q8 ("nothing to filter") and Q15 ("empty input") only show trivial declines and do no Arrow work. The DataFrame forms are 22/22, so each gap is in how the SQL front end phrases the plan
+- [ ] Q5: `executor declined (code -18)` in the fused join (also on main before F-069)
+- [ ] Q7, Q9: one `expression not supported by the bytecode compiler` each (find the expression; compile it or rewrite it in the SQL front end to the DataFrame form)
+- [ ] Q22: three `greater` / `and_kleene` passes over 150,000 rows in Arrow, `expression` / `predicate not supported` (the DataFrame Q22 is native since F-034)
+- [ ] `tests/test_native_strings_tpch.py`-style test over the SQL text of all 22 queries on SF 0.17: no Arrow compute over 1,000 rows, allowed declines listed by name; fails before
