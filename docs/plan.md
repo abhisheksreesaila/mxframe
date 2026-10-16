@@ -581,7 +581,7 @@ Needs: F-033 merged · Found by the F-033 review (2026-10-16): silent wrong answ
 - [ ] same input and thread count give bit-identical SUM / MEAN on every native path (single table, fused join + aggregate, GPU fallback): fixed block-to-worker assignment or per-block partials merged in block order; measure the cost (work stealing helped skewed inputs)
 - [ ] checks: the F-033 xfail test (uncomputed-view Q15) passes 20 of 20 runs and equals DuckDB; SF1 revenue per supplier over 30 runs: 0 groups differ
 
-## F-065 SQL subqueries [review]
+## F-065 SQL subqueries [done]
 Needs: F-033 · From the F-033 review: SQL-phrased Q11, Q15, Q18, Q21, Q22 get none of the native subquery work
 - [x] scalar subquery in WHERE / HAVING / SELECT expressions maps to `LazyFrame.scalar` machinery (`Expr("scalar", plan)`); a correlated comparison in WHERE decorrelates to a join with the per-key aggregate (COUNT refused: the count bug); `x IN (SELECT ...)` / `EXISTS` are semi joins (correlated ones with the equalities as keys), `NOT IN` / `NOT EXISTS` anti joins; NOT IN keeps DuckDB's NULL rules (a NULL in the subquery: no rows; empty subquery: every row, NULL key too) through one scalar over the subquery (empty / no NULL / some NULL) and `x = x` as the NULL test. `WITH` and derived tables. `tests/test_sql_subqueries.py` (108 DuckDB-checked queries incl. NULL and empty cases, 20 forms that must raise)
 - [x] forms not supported raise naming the form (IN / EXISTS under OR / NOT / CASE / SELECT, correlated scalar outside a WHERE comparison, correlated `<>` / `<`, correlated NOT IN, UNION, RECURSIVE, ...); an aggregate in the outer WHERE keeps "aggregate functions are not allowed in WHERE"; aggregates inside a subquery are no longer taken for outer aggregates
