@@ -369,6 +369,9 @@ def _get_cuda() -> _Cuda:
     return _cuda
 
 
+REPRO_MAX_NS = 4096     # (slots + 1) * groups the reproducible GPU kernel holds: REPRO_MAX_NS in pipeline_gpu.mojo
+
+
 def _load_gpu():
     global _gpu_lib
     with _lock:
@@ -379,9 +382,19 @@ def _load_gpu():
             lib = ctypes.CDLL(str(path))
             fn = lib.mx_pipeline_gpu
             fn.restype = _I64
-            fn.argtypes = [_I64] * 20
+            fn.argtypes = [_I64] * 21
+            mode = lib.mx_pipeline_gpu_mode
+            mode.restype = _I64
+            mode.argtypes = [_I64] * 5
             _gpu_lib = lib
     return _gpu_lib
+
+
+def gpu_reproducible_fits(program: PipelineProgram, n_groups: int) -> bool:
+    """Can the GPU kernel add this program's floats in a fixed order (mode 0, 3 or the ordered table)? Asked by
+    the kernel library itself, so the answer is the one ``run_pipeline_gpu(reproducible=True)`` will get."""
+    return _load_gpu().mx_pipeline_gpu_mode(n_groups, program.n_slots, int(program.code[1]),
+                                            int(len(program.code)), 1) >= 0
 
 
 class _DeviceProgram:
@@ -483,8 +496,13 @@ def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray]
 
 def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarray], ChunkedColumns, DeviceColumns],
                      gids: Optional[np.ndarray], n_groups: int, start: int, end: int,
-                     _repeat: int = 1) -> Partials:
+                     _repeat: int = 1, reproducible: Optional[bool] = None) -> Partials:
     """Run the program over rows ``[start, end)`` on the GPU.
+
+    ``reproducible`` (default: the mode of the ``compute()`` running in this thread, as for the CPU kernel;
+    a worker thread started by the caller does not inherit it, so pass it in): float sums without atomics,
+    bit-identical from run to run (F-067). Raises :class:`GpuUnsupported` when the group count does not fit
+    the ordered kernel (``REPRO_MAX_NS``): the caller's CPU path then runs the defined order.
 
     ``columns`` are host arrays / chunked columns (only the row range is copied
     over) or a :class:`DeviceColumns` already on the device. ``_repeat`` re-runs
@@ -529,16 +547,19 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         cu.h2d(col_dt, np.array(dc.dtypes or [0], dtype=np.int32))
         out_vals = take("out_vals", max(n_slots * n_groups, 1) * 8)
         out_cnt = take("out_cnt", n_groups * 8)
+        repro = reproducible if reproducible is not None else _reproducible_now()
         ns = (n_slots + 1) * n_groups
-        block_rows = ns if ns <= 48 else 0
+        block_rows = ns if ns <= 48 or (repro and ns <= REPRO_MAX_NS) else 0
         scratch = take("scratch", max(max_blocks * block_rows * 8, 8))
         cu.sync()
         rc = lib.mx_pipeline_gpu(
             dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
             dc.gid_ptr if n_groups > 1 else 0, n_groups, n_slots, k_start, k_end,
             out_vals, out_cnt, dp.ident, scratch, dp.n_regs, dp.code_ints, dp.agg_base,
-            cu.sm_count, int(_repeat),
+            cu.sm_count, int(_repeat), 1 if repro else 0,
         )
+        if rc == -6:
+            raise GpuUnsupported("reproducible float sums need the group table in shared memory")
         if rc == -5:
             raise GpuUnsupported("program needs more shared memory than a block has")
         if rc != 0:

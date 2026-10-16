@@ -633,15 +633,19 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol, cpu_rows=None):
         f = pol.gpu_fraction
     else:      # resident data, split only when it beats the faster device by the margin; else the faster one alone
         f = sp.gpu_fraction if sp.wins else (1.0 if sp.gpu_alone_ms < sp.cpu_alone_ms else 0.0)
-    k = int(round(n_rows * f))
-    dc = entry.dc
     from . import native_exec
     repro = native_exec.reproducible()          # the router's worker threads do not inherit the context variable
+    if repro and pol.gpu_fraction is None:
+        f = 0.0     # the model's fraction is refined by every run: only an explicit gpu_fraction splits reproducibly
+    elif repro and f > 0 and not pk.gpu_reproducible_fits(prog, n_groups):
+        f = 0.0     # the GPU would decline its share: a failed share redone on the CPU would add the rows in a different order than the CPU alone
+    k = int(round(n_rows * f))
+    dc = entry.dc
     cpu_fn = cpu_rows or (lambda a, b: pk.run_pipeline_cpu(prog, cc, gids, n_groups, a, b, reproducible=repro))
     cpu = Worker("cpu", "cpu", n_rows, compute=lambda r: cpu_fn(r[0], r[1]))
     # Fallible: if the GPU share fails, the Router redoes its rows on the CPU worker.
     gpu = Worker("gpu", "gpu", n_rows, fallible=True,
-                 compute=lambda r: pk.run_pipeline_gpu(prog, dc, None, n_groups, r[0], r[1]))
+                 compute=lambda r: pk.run_pipeline_gpu(prog, dc, None, n_groups, r[0], r[1], reproducible=repro))
     if k <= 0:
         workers, fractions = [cpu], None
     elif k >= n_rows:

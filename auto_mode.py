@@ -676,6 +676,14 @@ def _cpu_path(d: AutoDecision, plan, calib, gpu):
 
 
 def _choose_device(plan, calib, gpu, prefer, placement, quick):
+    from . import native_exec
+    if native_exec.reproducible():
+        # F-067: a calibration-driven choice (device, and the split's fraction, which every run refines) would change
+        # the order of float additions from run to run: auto runs the CPU's defined order. The GPU's ordered kernel
+        # is for device="gpu", a split for an explicit gpu_fraction.
+        d = AutoDecision("cpu", "reproducible: cpu defined order (no gpu, no cpu+gpu split)", None)
+        d.cpu_path = "native executor (reproducible: cpu defined order)"
+        return d
     if quick and calib is None and gpu is None and not placement and prefer != "gpu":
         rows = _source_rows(plan)
         if rows < SMALL_QUERY_ROWS:
