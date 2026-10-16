@@ -845,13 +845,16 @@ def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
         return None
 
 
-def int_sum_inexact(aggs: List[Expr], table: pa.Table) -> bool:
+def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr]] = None) -> bool:
     """Would a ``sum`` in ``aggs`` add integers whose total could pass 2^53 (so float64 loses digits)?
-    The caller then sums exactly in Arrow (F-037)."""
-    if not any(e.op == "sum" for e in aggs):
-        return False
+    The caller then sums exactly in Arrow (F-037). With ``preds``: would any predicate or aggregate
+    (not only a sum) compute an integer past 2^53 (F-061: the compiled graph wraps at int64)."""
+    if preds is None:
+        aggs = [e for e in aggs if e.op == "sum"]
+        if not aggs:
+            return False
     try:
-        _compile([], [e for e in aggs if e.op == "sum"], table)
+        _compile(preds or [], aggs, table)
     except Inexact:
         return True
     except Unsupported:
