@@ -1441,9 +1441,10 @@ class _SQLTranslator:
 
         # ---- negation ----
         if isinstance(node, sge.Neg):
-            if self._is_int_expr(node.this) and isinstance(node.this, sge.Literal):
-                return lit(-int(node.this.this))                # a negative integer literal, not 0 - 1 (a float32 scalar)
-            return lit(0) - self._expr(node.this)
+            inner = self._expr(node.this)
+            if inner.op == "lit" and isinstance(inner.args[0], (int, float)) and not isinstance(inner.args[0], bool):
+                return lit(-inner.args[0])                      # a constant folds (`-1`, `-(-1)`), not 0 - 1 (a float32 scalar)
+            return lit(0) - inner
 
         # ---- arithmetic ----
         if isinstance(node, sge.Add):
@@ -1626,14 +1627,18 @@ class _SQLTranslator:
 
     def _is_int_expr(self, node: sge.Expression) -> bool:
         """True when ``node`` is certainly an integer: an integer literal, an integer column of a known table,
-        or + - * and negation of those. Unknown (aggregates, unresolved names) is False."""
+        or + - * % and negation of those, COUNT, or an integer MIN / MAX. Unknown (unresolved names) is False."""
         node = _unparen(node)
         if isinstance(node, sge.Literal):
             return not node.is_string and "." not in str(node.this) and "e" not in str(node.this).lower()
         if isinstance(node, sge.Neg):
             return self._is_int_expr(node.this)
-        if isinstance(node, (sge.Add, sge.Sub, sge.Mul)):
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Mod)):
             return self._is_int_expr(node.this) and self._is_int_expr(node.expression)
+        if isinstance(node, sge.Count):
+            return True
+        if isinstance(node, (sge.Min, sge.Max)):               # not SUM: the engine returns it as a double until F-060
+            return self._is_int_expr(node.this)
         t = self._col_type(node)
         return t is not None and pa.types.is_integer(t)
 

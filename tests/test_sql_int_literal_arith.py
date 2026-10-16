@@ -104,3 +104,43 @@ def test_overflow_raises_like_duckdb(mode):
         mx.sql("select i * 4 as x from t", t=t).compute()
     with pytest.raises(duckdb.Error):
         duckdb.connect().register("t", t).execute("select i * 4 as x from t")
+
+
+MORE = {
+    "mod_after_sub": "select (i - 1) % 10 as x from t order by i",
+    "mod_then_big_literal": "select (i % 10) + 9007199254740993 as x from t order by i",
+    "big_literal_times_mod": "select (s % 3) * 3002399751580331 + 9007199254740993 as x from t order by i",
+    "count_star_plus_big": "select count(*) + 9007199254740993 as x from t",
+    "count_col_plus_big": "select g, count(n) + 9007199254740993 as x from t group by g order by g",
+    "max_plus_big": "select max(s) + 9007199254740993 as x from t",
+    "min_plus_big": "select g, min(s) + 9007199254740993 as x from t group by g order by g",
+    "neg_neg": "select -(-1) + i as x from t order by i",
+    "neg_space_neg": "select - -1 + i as x from t order by i",
+    "neg_neg_big": "select -(-9007199254740993) + s as x from t order by i",
+    "neg_col_plus_big": "select -s + 9007199254740993 as x from t order by i",
+}
+
+
+@pytest.mark.parametrize("name", MORE)
+def test_more_equals_duckdb(name, mode):
+    got, want, tbl = _both(MORE[name])
+    assert got == want
+    assert all(pa.types.is_integer(c.type) for c in tbl.columns), [str(c.type) for c in tbl.columns]
+
+
+def test_mod_zero_over_a_subquery_is_null_and_integer(mode):
+    q = "select m % 0 as x from (select s + 1 as m from t) u order by x limit 3"
+    got, want, tbl = _both(q)
+    assert got == want == [(None,), (None,), (None,)]
+    assert pa.types.is_integer(tbl.column(0).type)
+
+
+@pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
+@pytest.mark.parametrize("q", ["select count(*) as c from t where s + 1 > 3",
+                               "select g, sum(s * 3 - 1) as x from t group by g order by g",
+                               "select sum(s * 3 - 1) as x from t"])
+def test_small_integer_arithmetic_still_runs_native(q, monkeypatch):
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    got, want, _ = _both(q)
+    assert nx.last_path() == "native"
+    assert got == want
