@@ -38,6 +38,7 @@ DISTINCT_MAX_GROUPS = 1 << 17     # SELECT DISTINCT through the group-by: direct
                                   # group-by plus the sort by first row)
 DISTINCT_FLAG = 1                 # plan word 27: groups directly addressed or E_TOO_MANY_GROUPS
 REPRO_FLAG = 2                    # plan word 27: float sums in the defined order (F-064)
+HASH_FLAG = 4                     # plan word 27: hashed groups whatever the key ranges (F-069)
 
 import contextvars as _contextvars
 _reproducible = _contextvars.ContextVar("mxframe_reproducible", default=None)    # per thread / task, never process-wide
@@ -53,13 +54,14 @@ def reproducible() -> bool:
 
 _CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
 _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
-K_DICT, K_I32, K_I64, K_STR, K_EXPR = 0, 1, 2, 3, 4
+K_DICT, K_I32, K_I64, K_STR, K_EXPR, K_F64, K_PF64, K_F32, K_PF32 = 0, 1, 2, 3, 4, 5, 6, 7, 8
+_GROUP_PATHS = {0: "dense", 1: "compact", 2: "hash"}
 _OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4}
 _DT = {pa.int32(): 0, pa.int64(): 1, pa.float32(): 2, pa.float64(): 3}
 
 _lib = None
 _lock = threading.Lock()
-_last = {"path": None, "decline": None, "py_ms": None, "native_ms": None}
+_last = {"path": None, "decline": None, "py_ms": None, "native_ms": None, "group_path": None}
 _RELEASE = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
 
 
@@ -119,6 +121,13 @@ def last_decline():
     return _last["decline"]
 
 
+def last_group_path():
+    """How the last native group-by found its groups: "dense" (directly addressed), "compact" (key range
+    compacted through a presence table) or "hash" (F-069: float keys, wide key tuples, partitioned hash
+    aggregate); None for a global aggregate or when it declined."""
+    return _last["group_path"]
+
+
 _decline_counts: dict = {}
 
 
@@ -144,7 +153,7 @@ def _count(key: str) -> None:
 
 
 def _decline(reason: str):
-    _last["path"], _last["decline"] = None, reason
+    _last["path"], _last["decline"], _last["group_path"] = None, reason, None
     _count(reason)
     return None
 
@@ -191,7 +200,7 @@ def _key_kind(col: pa.ChunkedArray):
         return K_DICT          # chunks may carry different dictionaries: the executor merges them
     if pa.types.is_string(t):
         return K_STR           # hashed to entry ids in Mojo
-    return {pa.int32(): K_I32, pa.int64(): K_I64}.get(t)
+    return {pa.int32(): K_I32, pa.int64(): K_I64, pa.float64(): K_F64, pa.float32(): K_F32}.get(t)
 
 
 def _segments(columns):
@@ -314,15 +323,19 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
     if table.num_rows == 0:
         return _decline("empty input")
 
-    keys, derived = [], {}                     # derived: key position -> integer expression
+    keys, derived, src_col = [], {}, {}        # derived: key position -> expression; src_col: key position -> its column
     for i, e in enumerate(plan.group_by):
         if e.op == "col" and e._alias in (None, e.args[0]):
             keys.append(e.args[0])
+            src_col[i] = e.args[0]
             continue
         if not e._alias:
             return _decline("derived group key without a name")
         keys.append(e._alias)
-        derived[i] = e
+        if e.op == "col" and e.args[0] in table.column_names:      # a column under another name (SQL `x AS y`)
+            src_col[i] = e.args[0]
+        else:
+            derived[i] = e
     sort_by, limit = _split_post_ops(post_ops)
     if isinstance(sort_by, str):
         return _decline(sort_by)
@@ -342,19 +355,24 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         key_slot[i] = slot
     outputs = prog.outputs[:n_user]
     names = [name for name, _, _ in outputs]
-    ranges = {}
+    ranges, force_hash = {}, False
     if derived:
         # an integer expression key (TPC-H's order year): its range from one native min / max pass,
-        # then the executor groups by the program's value of it (directly addressed)
-        probe = Aggregate(plan.input, [], [a for i, e in derived.items()
-                                           for a in (Expr("min", e).alias(f"lo{i}"), Expr("max", e).alias(f"hi{i}"))])
+        # then the executor groups by the program's value of it (directly addressed; a range past
+        # MAX_GROUPS is hashed instead, F-069)
+        probe = Aggregate(plan.input, [], [a for i in derived
+                                           for a in (Expr("min", derived[i]).alias(f"lo{i}"), Expr("max", derived[i]).alias(f"hi{i}"))])
         r = try_execute(compiler, probe, None, None, gpu_fallback)
         if r is None:
             return _decline("derived group key: range pass declined")
         for i in derived:
             lo, hi = r.column(f"lo{i}")[0].as_py(), r.column(f"hi{i}")[0].as_py()
-            if lo is None or hi is None or lo != int(lo) or hi != int(hi) or hi - lo + 1 > MAX_GROUPS:
-                return _decline("derived group key: not a small integer range")
+            if lo is None or hi is None or lo != int(lo) or hi != int(hi):
+                return _decline("derived group key: not an integer range")
+            if hi - lo + 1 > MAX_GROUPS:
+                if distinct:
+                    return _decline("derived group key: not a small integer range")
+                force_hash = True
             ranges[i] = (int(lo), int(hi))
     sorts = _sort_spec(sort_by, keys, names)
     if isinstance(sorts, str):
@@ -381,12 +399,12 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             key_cols.append(table.column(0))
             kinds.append(K_EXPR)
             continue
-        c = table.column(k)
+        c = table.column(src_col[i])
         kind = _key_kind(c)
         if kind is None or c.null_count:
             return _decline(f"group key type {c.type} or nulls not in M0")
-        if distinct and kind == K_STR:
-            return _decline("distinct: plain string keys")
+        if distinct and kind in (K_STR, K_F64, K_F32):
+            return _decline("distinct: plain string or float keys")
         key_cols.append(c)
         kinds.append(kind)
     every = cols + key_cols
@@ -459,7 +477,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
             max_groups if distinct else min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)),
             ctypes.addressof(c_hconst), len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys),
-            0, (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0))
+            0, (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0) | (HASH_FLAG if force_hash else 0))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -487,6 +505,7 @@ def _wrap_result(lib, O, keys, kinds, outputs) -> pa.Table:
     n = int(O[0])
     owner = _Arena(lib, int(O[1]))
     empty_global = bool(O[2] & 1)
+    _last["group_path"] = _GROUP_PATHS.get((int(O[2]) >> 1) & 3) if keys else None
 
     def buf(addr, nbytes):
         return pa.foreign_buffer(int(addr), max(nbytes, 0), base=owner)
@@ -499,6 +518,10 @@ def _wrap_result(lib, O, keys, kinds, outputs) -> pa.Table:
             arr = pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)])
         elif kind == K_I32:
             arr = pa.Array.from_buffers(pa.int32(), n, [None, buf(a, 4 * n)])
+        elif kind in (K_F64, K_PF64):
+            arr = pa.Array.from_buffers(pa.float64(), n, [None, buf(a, 8 * n)])
+        elif kind in (K_F32, K_PF32):
+            arr = pa.Array.from_buffers(pa.float32(), n, [None, buf(a, 4 * n)])
         else:
             arr = pa.Array.from_buffers(pa.int64(), n, [None, buf(a, 8 * n)])
         names.append(name)
@@ -1331,10 +1354,14 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
                 space *= int(a.max()) - int(a.min()) + 1
             elif pa.types.is_dictionary(c.type):
                 space *= max(1, len(c.chunk(0).dictionary))
+    hashed = False                      # F-069: key tuples past direct addressing are hashed (after the partner-row route)
     if space > max_groups:
-        return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
-                                "group key space too wide for direct addressing", distinct)
+        got, hashed = _prow_or_hash(compiler, plan, fj, bs, having_pred, post_ops,
+                                    "group key space too wide for direct addressing", distinct)
+        if not hashed:
+            return got
     keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}
+    pf64 = set()                        # float64 partner columns as keys: hashed by their exact values
     fact_range = {}                     # fact join keys bounded by their partners' keys: no scan for their range
     for i, e in enumerate(plan.group_by):
         if e.op == "col" and e._alias in (None, e.args[0]):
@@ -1370,6 +1397,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
                 cols[rk] = pa.chunked_array([c.chunk(0).indices])
                 extra[rk] = (src[1], np.array([rank[v] for v in vals], dtype=np.int32))
                 derived[i], known[i], post[i] = Expr("col", rk), (0, len(uniq) - 1), _npa(uniq, type=pa.string())
+            elif c.type in (pa.float64(), pa.float32()):
+                derived[i] = e
+                pf64.add(i)
             else:
                 return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
                                         f"partner group key type {c.type}")
@@ -1392,24 +1422,35 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     key_slot = {}
     for j, i in enumerate(sorted(derived)):
         slot = prog.outputs[n_user + j][2]
+        if i in pf64:                    # read from the program's column table: which column
+            key_slot[i] = prog.columns.index(derived[i].args[0])
+            continue
         if slot is None or not prog.slot_int[slot]:
             return _decline("derived group key is not an integer expression")
         key_slot[i] = slot
     outputs = prog.outputs[:n_user]
     names = [name for name, _, _ in outputs]
     ranges = dict(known)
-    for i in [i for i in sorted(derived) if i not in known]:
+    for i in pf64:
+        ranges[i] = (0, 0)
+    for i in [i for i in sorted(derived) if i not in known and i not in pf64]:
         bnd = _bounds(derived[i], lambda n: _partner_range(fj, cols, n))
         if bnd is not None:                  # an integer expression of partner columns: bounded without a pass
             known[i] = ranges[i] = bnd
-    if all(i in fact_range for i in fact_key) and all(i in known for i in derived):
-        d = 1                       # every key's range is known here: a key space too big declines before any pass
+    if not hashed and all(i in fact_range for i in fact_key) and all(i in known for i in derived if i not in pf64):
+        d = 1                       # every key's range is known here: a key space too big hashes before any pass
         for lo, hi in list(known.values()) + list(fact_range.values()):
             d *= hi - lo + 1
         if d > max_groups:
-            return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
-                                    "group key space too wide for direct addressing", distinct)
-    probe_idx = [i for i in sorted(derived) if i not in known]
+            got, hashed = _prow_or_hash(compiler, plan, fj, bs, having_pred, post_ops,
+                                        "group key space too wide for direct addressing", distinct)
+            if not hashed:
+                return got
+    probe_idx = [i for i in sorted(derived) if i not in known and i not in pf64]
+    if hashed:                         # the hashed groups need no range: a placeholder reaches the executor
+        for i in probe_idx:
+            ranges[i] = (0, 0)
+        probe_idx = []
     if probe_idx:                      # an expression key's range: one fused min / max pass over the same join
         probe = Aggregate(None, [], [a for i in probe_idx
                                      for a in (Expr("min", derived[i]).alias(f"lo{i}"), Expr("max", derived[i]).alias(f"hi{i}"))])
@@ -1421,12 +1462,14 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
             if lo is None or hi is None or lo != int(lo) or hi != int(hi):
                 return _decline("derived group key: not an integer range")
             ranges[i] = (int(lo), int(hi))
-    if any(hi - lo + 1 > max_groups for lo, hi in list(ranges.values()) + list(fact_range.values())):
-        if not distinct and not any(src[0] == "prow" for src in fj.vcols.values()):
+    if not hashed and any(hi - lo + 1 > max_groups for lo, hi in list(ranges.values()) + list(fact_range.values())):
+        if distinct:
+            return _decline("group key: range too wide for direct addressing")
+        if not any(src[0] == "prow" for src in fj.vcols.values()):
             got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
             if got is not None:
                 return got
-        return _decline("group key: range too wide for direct addressing")
+        hashed = True
     sorts = _sort_spec(sort_by, keys, names)
     if isinstance(sorts, str):
         return _decline(sorts)
@@ -1462,7 +1505,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     for i, k in enumerate(keys):
         if i in derived:
             key_cols.append(table.column(0))                 # placeholder: the key comes from the program
-            kinds.append(K_EXPR)
+            kinds.append((K_PF64 if cols[derived[i].args[0]].type == pa.float64() else K_PF32) if i in pf64 else K_EXPR)
             continue
         c = table.column(fact_key[i])
         kind = _key_kind(c)
@@ -1566,7 +1609,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
             default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
             max_groups, ctypes.addressof(c_hconst),
             len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys), ctypes.addressof(F),
-            (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0))
+            (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0) | (HASH_FLAG if hashed else 0))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -1660,6 +1703,19 @@ def _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops, reason, dist
         if got is not None:
             return got
     return _decline(reason)
+
+
+def _prow_or_hash(compiler, plan, fj, bs, having_pred, post_ops, reason, distinct=False):
+    """Keys past direct addressing: group by the partner's row when that shape fits (the result is returned),
+    else (F-069) hash the key tuples: (None, True). A SELECT DISTINCT declines instead (its wide key spaces
+    are ``mx_distinct``'s): (None, False)."""
+    if distinct:
+        return _decline(reason), False
+    if not any(src[0] == "prow" for src in fj.vcols.values()):
+        got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
+        if got is not None:
+            return got, False
+    return None, True
 
 
 def _npa_i32_empty():
