@@ -883,3 +883,8 @@ Found by the F-087 developer (2026-10-16); untested suspicion, important for rea
 Found by the F-087 developer (2026-10-16)
 - [ ] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
 - [ ] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
+
+## F-097 IS NULL skips row groups with no NULLs [todo]
+From the F-086 review (2026-10-16); a speedup, not a bug
+- [ ] `scan_parquet` never pushes `is_null` / `not is_null`: a row group whose `null_count` is 0 can be skipped for IS NULL (and one whose `null_count == num_values` for IS NOT NULL); a missing `null_count` statistic must never skip. Native validity test in the bytecode filter (so IS NULL filters stay native) belongs here too
+- [ ] tests: row groups skipped (counted), missing statistics not skipped, answers equal DuckDB; fails before
