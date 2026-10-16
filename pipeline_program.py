@@ -411,6 +411,7 @@ class _Builder:
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
         self.col_bounds: Dict[str, int] = {}
+        self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.consts: List[float] = []
         self.const_ix: Dict[float, int] = {}
@@ -624,7 +625,39 @@ class _Builder:
             d = self.const_reg(10000.0)
             q = self.emit(OP_DIV, x.vreg, d)
             return _Val(self.emit(OP_FLOOR, q), "int", ("div", self.bound_of(x), 10000))
+        if op == "year_days":
+            return self._year_days(args[0])
         raise Unsupported(f"op {op!r}")
+
+    def _year_days(self, arg: Expr):
+        """EXTRACT(YEAR) of a days-since-1970 column as ``y0 + sum(day >= first day of year y)`` over the
+        years its data spans (one min / max pass, cached): a few compares, no calendar in the interpreter."""
+        if arg.op != "col" or self.column_kind(arg.args[0]) != "int":
+            raise Unsupported("year_days only on an integer column")
+        name = arg.args[0]
+        if name not in self.day_ranges:
+            from .join_engine import _minmax
+            col = self.table.column(name)
+            lo = hi = None
+            for ch in (col.chunks if isinstance(col, pa.ChunkedArray) else [col]):
+                if ch.null_count:
+                    raise Unsupported("year_days over a column with nulls")
+                if len(ch):
+                    a, b = _minmax(_np_of(ch, zero_copy_only=False))
+                    lo, hi = (a, b) if lo is None else (min(lo, a), max(hi, b))
+            if lo is None:
+                raise Unsupported("year_days over an empty column")
+            self.day_ranges[name] = (lo, hi)
+        lo, hi = self.day_ranges[name]
+        to_year = lambda d: int((np.datetime64(int(d), "D").astype("datetime64[Y]")).astype(int)) + 1970
+        y0, y1 = to_year(lo), to_year(hi)
+        if y1 - y0 > 100:
+            raise Unsupported("year_days over more than 100 years")
+        e = Expr("lit", 0)
+        for y in range(y0 + 1, y1 + 1):
+            first = int(np.datetime64(f"{y:04d}-01-01", "D").astype(int))
+            e = Expr("add", e, Expr("case_when", Expr("ge", arg, Expr("lit", first)), Expr("lit", 1), Expr("lit", 0)))
+        return self.compile(Expr("add", e, Expr("lit", y0)))
 
     def _need(self, e: Expr, want: str):
         x = self.compile(e)

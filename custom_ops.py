@@ -93,6 +93,48 @@ def _decode_deferred_cols(table: pa.Table, names) -> pa.Table:
     return table
 
 
+_NP_ARITH = {"add": np.add, "sub": np.subtract, "mul": np.multiply, "div": np.divide}
+
+
+def _np_float_project(exprs, table):
+    """F-068: a Project over an aggregate's result (``100 * a / b``, ``0.2 * avg``) whose computed columns are
+    only ``+ - * /`` over float64 columns without nulls and numeric literals: one NumPy pass per operator over
+    the groups (IEEE like DuckDB: x / 0 is inf, 0 / 0 is NaN), no Arrow compute. Plain columns pass through
+    (dictionaries decoded). Runs for every Project in ``_plan_to_table``, not only over an aggregate: IEEE
+    float64 gives the same values either way.
+    None when anything else is in it (integers need the checked kernels, strings and CASE the Arrow path)."""
+    def ev(e):
+        if e.op == "lit":
+            v = e.args[0]
+            return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+        if e.op == "col":
+            c = table.column(e.args[0])
+            if c.type != pa.float64() or c.null_count:
+                return None
+            return _np_of(_combine(c) if isinstance(c, pa.ChunkedArray) else c, zero_copy_only=False)
+        f = _NP_ARITH.get(e.op)
+        if f is None or len(e.args) != 2:
+            return None
+        a, b = ev(e.args[0]), ev(e.args[1])
+        if a is None or b is None or (np.isscalar(a) and np.isscalar(b)):
+            return None
+        return f(a, b)
+
+    arrays, names = [], []
+    with np.errstate(all="ignore"):
+        for e in exprs:
+            if e.op == "col":
+                arr = _decode_dict(table.column(e.args[0]))          # as the Arrow branch does
+            else:
+                got = ev(e)
+                if got is None or np.isscalar(got):          # a bare literal: the Arrow path broadcasts it
+                    return None
+                arr = _npa(got)
+            arrays.append(arr)
+            names.append(e._alias or (e.args[0] if e.op == "col" else f"col_{len(arrays) - 1}"))
+    return pa.Table.from_arrays(arrays, names=names)
+
+
 def _expr_col_names(expr, out=None) -> set:
     """Names of every column an Expr tree reads."""
     if out is None:
@@ -620,9 +662,12 @@ class CustomOpsCompiler(GraphCompiler):
             return _npa([val] * n)
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
-            if op == "div" and pa.types.is_integer(lhs.type) and pa.types.is_integer(rhs.type):
-                lhs, rhs = pc.cast(lhs, pa.float64()), pc.cast(rhs, pa.float64())      # SQL `/` is true division
             if op == "div":
+                # SQL `/` is true division, in float64 like DuckDB's (an int64 past 2^53 rounds, it does not raise)
+                if pa.types.is_integer(lhs.type):
+                    lhs = pc.cast(lhs, pa.float64(), safe=False)
+                if pa.types.is_integer(rhs.type):
+                    rhs = pc.cast(rhs, pa.float64(), safe=False)
                 return pc.divide(lhs, rhs)
             return _checked_arith(op, lhs, rhs)
         if op in _DICT_PRED_OPS:
@@ -1553,6 +1598,28 @@ class CustomOpsCompiler(GraphCompiler):
         rest = rest[1:] if len(native_ops) == 2 else rest
         return self._apply_post_ops_custom(res, rest) if rest else res
 
+    def _aggregate_consumers_first(self, plan):
+        """``[Sort Limit] Project|Filter|Aggregate`` over an Aggregate: compute the part below as a table
+        now (``_materialize_barrier``), keeping the sort / limit above it, ties broken by the group keys
+        as before. Any other plan comes back as it was."""
+        core, post_ops = self._extract_post_ops(plan)
+        if not (isinstance(core, (Filter, Project, Aggregate)) and self._contains_aggregate(core.input)):
+            return plan
+        if isinstance(core, Filter) and isinstance(core.input, Aggregate) and core.input.group_by:
+            return plan                                   # HAVING: the aggregate paths take it
+        post_ops = self._key_tiebreak(core, post_ops)
+        out = self._materialize_barrier(core)
+        for op in post_ops:
+            if isinstance(op, Sort):
+                out = Sort(out, op.by, op.descending)
+            elif isinstance(op, Limit):
+                out = Limit(out, op.n)
+            elif isinstance(op, Distinct):
+                out = Distinct(out, op.subset)
+            else:
+                out = Tail(out, op.n)
+        return out
+
     def _materialize_barrier(self, plan):
         """Compute what sits below an aggregate result as a table, so the operator above works on it.
 
@@ -1849,6 +1916,11 @@ class CustomOpsCompiler(GraphCompiler):
         _distinct = self._distinct_groupby(plan)
         if _distinct is not None:
             return _distinct
+
+        # -1a- -- F-068: arithmetic / CASE / HAVING over an aggregate's output (a Project, Filter or second
+        # Aggregate above it) runs on the small result table: the aggregate below goes through every
+        # native path first (fused join, star, single table) instead of the whole plan being declined
+        plan = self._aggregate_consumers_first(plan)
 
         # -1a -- F-046a slice 3: an aggregate over inner joins runs as one native call, no joined rows
         if _had_join and _native_exec is not None:
@@ -3256,6 +3328,9 @@ class CustomOpsCompiler(GraphCompiler):
                 inner_table = self._native_filter_scan(plan.input, need)
             if inner_table is None:
                 inner_table = self._plan_to_table(plan.input)
+            got = _np_float_project(plan.exprs, inner_table)
+            if got is not None:
+                return got
             arrays, names = [], []
             for expr in plan.exprs:
                 arr = self._eval_expr_arrow(expr, inner_table)
