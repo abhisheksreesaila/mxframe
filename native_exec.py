@@ -1237,7 +1237,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
                   and pa.types.is_string(c.type.value_type)):
                 d = c.chunk(0).dictionary
                 if d.null_count or len(d) > _DICT_MAX:
-                    return _decline("partner string group key: dictionary too big or with nulls")
+                    return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
+                                            "partner string group key: dictionary too big or with nulls")
                 vals = d.to_pylist()
                 uniq = sorted(set(vals))
                 rank = {v: r for r, v in enumerate(uniq)}
@@ -1246,7 +1247,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
                 extra[rk] = (src[1], np.array([rank[v] for v in vals], dtype=np.int32))
                 derived[i], known[i], post[i] = Expr("col", rk), (0, len(uniq) - 1), _npa(uniq, type=pa.string())
             else:
-                return _decline(f"partner group key type {c.type}")
+                return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
+                                        f"partner group key type {c.type}")
         else:
             if not e._alias:
                 return _decline("derived group key without a name")
@@ -1497,6 +1499,16 @@ def _bounds(e, rng):
         p = [a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]]
         return min(p), max(p)
     return None
+
+
+def _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops, reason):
+    """A group key the expression-key route cannot take (a string column with too many distinct values, a
+    float): group by the partner's row when that shape fits, else decline with ``reason``."""
+    if not any(src[0] == "prow" for src in fj.vcols.values()):
+        got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
+        if got is not None:
+            return got
+    return _decline(reason)
 
 
 def _npa_i32_empty():
