@@ -70,12 +70,18 @@ def _encode_float(arr):
     """``dictionary_encode`` for a float key with SQL equality (F-077): -0.0 and 0.0 are one group
     and so are all NaNs. Each group still reports the value of its first row, like DuckDB."""
     enc = pc.dictionary_encode(_canonical_floats(arr))
-    if enc.indices.null_count or not len(arr):
+    if not len(arr):
         return enc
-    idx = _np_of(enc.indices, zero_copy_only=False)
+    ind = enc.indices                                     # int32, null where the key is NULL
+    idx = np.frombuffer(ind.buffers()[1], dtype=np.int32, count=ind.offset + len(ind))[ind.offset:]
+    if ind.null_count:
+        valid = _np_of(pc.is_valid(ind), zero_copy_only=False).astype(bool)
+        rows, idx = np.flatnonzero(valid), idx[valid]
+    else:
+        rows = np.arange(len(idx))
     run = np.maximum.accumulate(idx)                      # codes are numbered by first appearance
-    first = np.flatnonzero(np.concatenate(([True], run[1:] != run[:-1])))
-    return pa.DictionaryArray.from_arrays(enc.indices, pc.take(arr, _npa(first.astype(np.int64))))
+    first = rows[np.flatnonzero(np.concatenate(([True], run[1:] != run[:-1])))]
+    return pa.DictionaryArray.from_arrays(ind, pc.take(arr, _npa(first.astype(np.int64))))
 
 
 def encode_key(col):

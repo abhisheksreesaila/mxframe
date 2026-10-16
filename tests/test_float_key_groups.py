@@ -1,6 +1,8 @@
-"""F-077: a NULL in a float group key sends the grouping to the Arrow fallback; -0.0 and 0.0 must be
-one group (reported as +0.0) and every NaN one group, whatever its payload, like DuckDB. Keys with
--inf / +inf / NULL stay apart, and ORDER BY puts -inf ... inf, NaN, NULL in DuckDB's order."""
+"""F-077: -0.0 and 0.0 are one group and every NaN is one group, whatever its payload, like DuckDB,
+also when a NULL in the key sends the grouping to the Arrow fallback. A group reports the key value of
+its first row, bit for bit (DuckDB does not normalise a zero or a NaN): the bit tests compare the sign
+of a zero and the NaN payload. Keys with -inf / +inf / NULL stay apart, and ORDER BY puts
+-inf ... inf, NaN, NULL in DuckDB's order."""
 import math
 import struct
 
@@ -8,6 +10,8 @@ import duckdb
 import numpy as np
 import pyarrow as pa
 import pytest
+
+import mxframe.native_exec as nx
 
 from mxframe import LazyFrame, col, sql
 from mxframe.np_arrow import array as A
@@ -154,3 +158,119 @@ def test_no_null_float_key_groups_the_same_way(dt):
     ref2 = _duck("select k, g, sum(v)::double as s from t group by k, g", t=t)
     assert got2.num_rows == ref2.num_rows
     _same(got2, ref2, ["k", "g", "s"])
+
+
+# ---- the key value a group reports, bit for bit, on every grouping path -------------------------
+
+ODD_NAN = {np.float64: 0xFFF8000000001234, np.float32: 0xFFC01234}
+UINT = {np.float64: np.uint64, np.float32: np.uint32}
+
+
+def _bits(table, name):
+    """Raw bits of a float column (None for NULL): tells -0.0 from 0.0 and one NaN payload from another."""
+    a = table.column(name).combine_chunks()
+    x = np.frombuffer(a.buffers()[1], dtype=UINT[np.float64 if a.type == pa.float64() else np.float32],
+                      count=a.offset + len(a))[a.offset:]
+    return [None if not ok else int(b) for b, ok in zip(x, a.is_valid().to_pylist())]
+
+
+def _bit_rows(table, names):
+    d = {n: (_bits(table, n) if n == "k" else table.column(n).to_pylist()) for n in names}
+    return sorted(zip(*[d[n] for n in names]), key=str)
+
+
+def _native_duck(query, **tables):
+    """DuckDB over its own tables: a registered Arrow table is scanned on another path."""
+    con = duckdb.connect()
+    for name, t in tables.items():
+        con.register("_" + name, t)
+        con.execute(f"create table {name} as select * from _{name}")
+    return con.execute(query).fetch_arrow_table()
+
+
+def _first_row_table(dt, first_bits, with_null, n=1):
+    """First row is the value under test; the other forms of the same key follow it (x n)."""
+    u = UINT[dt]
+    zero_neg = u(1) << u(np.dtype(dt).itemsize * 8 - 1)
+    nan_a = u(0x7FF8000000000000 if dt is np.float64 else 0x7FC00000)
+    keys = [u(first_bits), zero_neg, u(0), nan_a, u(ODD_NAN[dt]), u(first_bits)] * n + [u(0)] * 2
+    k = np.array(keys, dtype=u).view(dt)
+    mask = np.zeros(len(k), bool)
+    if with_null:
+        mask[-1] = True
+    k = np.ma.array(k, mask=mask)
+    return pa.table({"k": A(k, type=pa.from_numpy_dtype(dt)), "v": A(np.arange(1, len(k) + 1, dtype=np.int64)),
+                     "id": A(np.arange(len(k), dtype=np.int64))})
+
+
+FIRSTS = {"neg_zero": lambda dt: UINT[dt](1) << UINT[dt](np.dtype(dt).itemsize * 8 - 1),
+          "pos_zero": lambda dt: UINT[dt](0),
+          "odd_nan": lambda dt: UINT[dt](ODD_NAN[dt])}
+
+
+@pytest.fixture(params=["fused", "native"])
+def grouping(request, monkeypatch):
+    """Which engine groups: the fused pipeline's Arrow key encoding, or the native hashed path."""
+    monkeypatch.setenv("MXFRAME_NATIVE", "0" if request.param == "fused" else "1")
+    return request.param
+
+
+def _assert_path(grouping, lf):
+    if grouping == "fused":
+        assert lf.last_compile_provenance["path"] == "fused_pipeline_cpu", lf.last_compile_provenance
+    else:
+        assert nx.last_group_path() == "hash"
+
+
+@pytest.mark.parametrize("first", list(FIRSTS))
+@pytest.mark.parametrize("dt", DTYPES)
+def test_group_reports_its_first_rows_bits_without_null(dt, first, grouping, request):
+    if grouping == "native" and first != "pos_zero":
+        request.applymarker(pytest.mark.xfail(strict=True, reason=(
+            "F-069's native hashed path stores the canonical key (+0.0, one NaN) in its hash records "
+            "and reports that, where DuckDB reports the first row's bits: a kernel change, see the "
+            "follow-up in docs/plan.md F-077")))
+    if grouping == "native" and dt is np.float32:
+        pytest.skip("the native hashed path takes float64 keys")
+    if not nx.available() and grouping == "native":
+        pytest.skip("libmxexec_cpu.so not built")
+    t = _first_row_table(dt, FIRSTS[first](dt), with_null=False, n=30_000 if grouping == "native" else 1)
+    lf = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s"))
+    got = lf.compute(device="cpu")
+    ref = _native_duck("select k, sum(v)::double as s from t group by k", t=t)
+    _assert_path(grouping, lf)
+    assert got.num_rows == ref.num_rows == 2
+    assert _bit_rows(got, ["k", "s"]) == _bit_rows(ref, ["k", "s"])
+
+
+@pytest.mark.parametrize("first", list(FIRSTS))
+@pytest.mark.parametrize("dt", DTYPES)
+def test_group_reports_its_first_rows_bits_with_null(dt, first):
+    """A NULL key row: the native path declines, the fused encoder and the Arrow fallback answer."""
+    t = _first_row_table(dt, FIRSTS[first](dt), with_null=True)
+    got = LazyFrame(t).groupby("k").agg(col("v").sum().alias("s")).compute(device="cpu")
+    ref = _native_duck("select k, sum(v)::double as s from t group by k", t=t)
+    assert got.num_rows == ref.num_rows == 3
+    assert _bit_rows(got, ["k", "s"]) == _bit_rows(ref, ["k", "s"])
+    got = LazyFrame(t.select(["k"])).distinct().compute(device="cpu")
+    ref = _native_duck("select distinct k from t", t=t)
+    assert _bit_rows(got, ["k"]) == _bit_rows(ref, ["k"])
+
+
+@pytest.mark.parametrize("first", list(FIRSTS))
+@pytest.mark.parametrize("dt", DTYPES)
+def test_fused_join_partner_key_without_null(dt, first):
+    """The partner column of a fused join reaches the fused pipeline's key encoder (no NULL, so no fallback)."""
+    import os
+    os.environ["MXFRAME_NATIVE"] = "0"
+    try:
+        dim = _first_row_table(dt, FIRSTS[first](dt), with_null=False).select(["id", "k"])
+        fact = pa.table({"id": A(np.arange(40, dtype=np.int64) % dim.num_rows), "v": A(np.arange(40, dtype=np.float64))})
+        lf = (LazyFrame(fact).join(LazyFrame(dim), on="id").groupby("k").agg(col("v").sum().alias("s")))
+        got = lf.compute(device="cpu")
+    finally:
+        del os.environ["MXFRAME_NATIVE"]
+    ref = _native_duck("select k, sum(v) as s from fact join dim using (id) group by k", fact=fact, dim=dim)
+    assert lf.last_compile_provenance["path"].startswith("fused_pipeline"), lf.last_compile_provenance
+    assert got.num_rows == ref.num_rows == 2
+    assert _bit_rows(got, ["k", "s"]) == _bit_rows(ref, ["k", "s"])

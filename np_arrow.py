@@ -327,10 +327,13 @@ def canonical_floats(a):
     if a.type not in (pa.float32(), pa.float64()) or len(a) == 0:
         return a
     dt = np.dtype(np.float32 if a.type == pa.float32() else np.float64)
-    x = np.frombuffer(a.buffers()[1], dtype=dt, count=a.offset + len(a))[a.offset:]
-    x = np.where(np.isnan(x), dt.type("nan"), x + dt.type(0))        # -0.0 + 0.0 is 0.0
-    mask = ~to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else None
-    return array(np.ma.array(x, mask=mask) if mask is not None else x, type=a.type)
+    x = np.frombuffer(a.buffers()[1], dtype=dt, count=a.offset + len(a))
+    out = x + dt.type(0)                                    # -0.0 + 0.0 is 0.0 (a new array)
+    nan = np.isnan(x)
+    if nan.any():
+        out[nan] = dt.type("nan")
+    return pa.Array.from_buffers(a.type, len(a), [a.buffers()[0], pa.py_buffer(out)],
+                                 null_count=a.null_count, offset=a.offset)
 
 
 def _group_ids(table: pa.Table, cols):
