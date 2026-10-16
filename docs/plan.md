@@ -516,9 +516,9 @@ Needs: none · Found by the F-043 review
 - [x] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks). Native order: ORDER BY columns, then every group key ascending (strings by bytes). `GraphCompiler._key_tiebreak` appends the keys to a Sort directly above an Aggregate for every non-native path (fused, kernels, GPU, null-key, base compiler); `tests/test_orderby_ties.py`
   Open: unaliased derived keys get no tie-break; with a string key added, sort + LIMIT on fallback paths can't use the native top-k (numbers / dates only), so it ranks every row (correct, slower)
 
-## F-059 ORDER BY ties with a Project between Sort and Aggregate [todo]
+## F-059 ORDER BY ties with a Project between Sort and Aggregate [review]
 Needs: F-045
-- [ ] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate
+- [x] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate. Done in `GraphCompiler._tiebreak_names` / `_key_tiebreak` (follows keys by name/alias through each Project) and an early call in `CustomOpsCompiler` before the materialize barrier, so the native path gets the extended sort too (no Mojo change). A Project that drops a key leaves nothing to tie-break on for that key: ties on it stay in input order (documented limit). `tests/test_orderby_ties_project.py`
 
 ## F-061 Integer overflow past int64 is silent on the exact path [todo]
 Needs: F-037 · Found by the F-037 review (2026-10-16); high priority: silent wrong results, and F-037 routes more queries here

@@ -232,20 +232,40 @@ class GraphCompiler:
         return plan, post_ops
 
     @staticmethod
-    def _key_tiebreak(plan, post_ops):
-        """ORDER BY right above a group-by: add the group keys (ascending) as the last sort
-        columns, so ties come out in key order on every path, as the native executor and
-        `ORDER BY ..., keys` in DuckDB do (a hash table's own order is not deterministic)."""
-        if not (post_ops and isinstance(post_ops[0], Sort) and isinstance(plan, Aggregate) and plan.group_by):
+    def _tiebreak_names(plan):
+        """Output names of the group keys of the Aggregate under `plan` (Project*(Aggregate)),
+        as `plan` exposes them. A Project that drops a key (or computes a column in its place)
+        takes it out: nothing is left to tie-break on for that key."""
+        projects = []
+        while isinstance(plan, Project):
+            projects.append(plan)
+            plan = plan.input
+        if not (isinstance(plan, Aggregate) and plan.group_by):
+            return []
+        names = [e._alias or (e.args[0] if e.op == "col" else None) for e in plan.group_by]
+        for prj in reversed(projects):                      # innermost Project first
+            out = []
+            for n in names:
+                hit = [e for e in prj.exprs if e.op == "col" and e.args[0] == n] if n is not None else []
+                out.append(hit[0]._alias or n if hit else None)
+            names = out
+        return [n for n in names if n is not None]
+
+    @classmethod
+    def _key_tiebreak(cls, plan, post_ops):
+        """ORDER BY right above a group-by (or above Projects over one that keep its keys): add the
+        group keys (ascending) as the last sort columns, so ties come out in key order on every
+        path, as the native executor and `ORDER BY ..., keys` in DuckDB do (a hash table's own
+        order is not deterministic)."""
+        if not (post_ops and isinstance(post_ops[0], Sort)):
             return post_ops
         srt = post_ops[0]
         have = {e.args[0] for e in srt.by if e.op == "col"}
         desc = list(srt.descending) if isinstance(srt.descending, (list, tuple)) \
             else [bool(srt.descending)] * len(srt.by)
         by = list(srt.by)
-        for e in plan.group_by:
-            name = e._alias or (e.args[0] if e.op == "col" else None)
-            if name is not None and name not in have:
+        for name in cls._tiebreak_names(plan):
+            if name not in have:
                 by.append(Expr("col", name))
                 desc.append(False)
                 have.add(name)
