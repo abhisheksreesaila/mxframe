@@ -29,12 +29,13 @@ Order, one stage at a time:
 4. **Gate:** F-058, the scoreboard that says the core is ready.
 Benchmarks run only on a quiet machine (see `docs/lessons.md`). With other agents running, do development and light SF1 correctness checks only.
 
-## F-055 GPU correctness sweep [todo]
-Needs: none · Agreed 2026-10-15
-- [ ] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB; every mismatch or crash gets a fix or a ticket
-- [ ] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (correctness mode, no timing)
-- [ ] F-014's flaky GPU sort test: memory pressure or a real ordering bug, settled
-- [ ] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`, so auto never picks it
+## F-055 GPU correctness sweep [review]
+Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
+- [x] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB (22/22 both; first and repeat run); every mismatch or crash gets a fix or a ticket: none found. Also on the GPU, per query: the path of every `compute()` and the GPU kernels it called (all 22 ran at least one GPU kernel; the join in a GPU session is the GPU hash join)
+- [x] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (`--device gpu --gpu <uuid> --engines mx,duckdb`): 100/100 stored and shuffled, 94 ran a GPU kernel
+- [x] F-014's flaky GPU sort test settled: memory pressure from other processes (about 0.5 GB free reproduces it), and behind it a real bug: every exported GPU function swallowed its errors (`except: pass`), so an out-of-memory sort or join returned garbage. All 31 now return a status and raise (`MemoryError` / `RuntimeError`), driver calls check their `CUresult`, `auto` reruns on the CPU (`tests/test_gpu_kernel_errors.py`); `is_sorted_topk` stays as a backstop
+- [x] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`: none needed, it stays empty
+- [ ] open: statuses cover out-of-memory only (a real OOM sort and an oversized request are tested). A real fault such as `CUDA_ERROR_ILLEGAL_ADDRESS` kills the process (core dump) and no status comes back; the Mojo `ctx.synchronize()` of the other kernels is assumed to raise on OOM like the sort's does (not probed)
 
 ## F-056 Data bigger than GPU memory never fails [todo]
 Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
@@ -45,6 +46,7 @@ Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96
 - Build order from the research (2026-10-15): (1) never fail: per-GPU budget with a test-only override, pre-check at 90% of free memory -> CPU, OOM -> halve the piece and retry once, then rerun the piece on CPU and remember the shape; pieces never change their inputs; (2) streaming probe through a resident hash table, for joins and many-group aggregates only, after a CPU filter + bitvector; (3) partition both sides so each pair fits one 24 GB GPU, the two GPUs as separate workers. Skip unified memory and generic host spilling. HeavyDB ideas: string filters run once over the dictionary (becomes an int IN-set), dense hash layouts sized from min/max with a group-count pre-pass
 - [ ] the two GPUs are joined by an NVLink bridge (NV4 in `nvidia-smi topo -m`): measure GPU-to-GPU bandwidth and whether Mojo can use peer access before relying on it
 - Note: 96 GB is also bigger than this box's 62 GB of RAM, so that case needs the CPU path to stream Parquet and spill too (a later ticket, after the GPU never-fail step)
+- Note from F-055: every GPU kernel returns a status and raises `MemoryError` on out-of-memory, so this ticket can rely on that for OOM only; a real GPU fault (illegal address) kills the process and returns no status
 
 ## F-057 Morsel co-processing that wins [todo]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
@@ -193,7 +195,7 @@ Needs: F-012 merged · Found by re-running calibration (2026-09-30)
 Needs: F-011, F-013 merged · Found by F-013
 - [x] CPU sort in `custom_ops._apply_sort_custom` uses `AOTKernels.sort_indices` (parallel radix, ~69 ms / 10M) instead of `np.argsort` / `argpartition`; `compiler.py` post-op sort likewise
 - [ ] `tests/test_cpu_sort.py::test_sort_indices_is_stable_and_matches_numpy[1000000-True-300001-int64]` failed once in a loaded full-suite run (F-018 branch); not reproducible in 5,600 isolated/concurrent stress runs of the exact input with 1–64 threads. The engine now verifies radix results in O(n) and falls back to np.argsort with a warning. Suspect cross-test memory corruption (F-018 fixed an out-of-bounds join write); watch for the warning.
-- [ ] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` is flaky on a shared GPU (fails ~1 in 3 even alone): find out whether it is memory pressure (cuMemAlloc 2) or a real ordering bug
+- [x] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` flaky on a shared GPU: settled in F-055: memory pressure from other processes (about 0.5 GB free reproduces it) and, behind it, a real bug: a sort kernel that runs out of memory returns a wrong order with no exception. The GPU top-k result is now verified and redone on the CPU (`sort_check.is_sorted_topk`); an honest `cuMemAlloc` failure remains under pressure (`docs/bench/gpu-correctness-sf1.md`)
 - [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
 
 ## F-015 Cold first query: 1.1 s vs 50 ms warm [done]

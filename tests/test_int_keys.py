@@ -133,7 +133,7 @@ def test_distinct_keeps_first_appearance_order():
 @pytest.mark.parametrize("damage", ["swap", "out_of_range"])
 def test_dense_sorted_survives_a_bad_radix_permutation(monkeypatch, damage):
     from mxframe import aot_kernels, sort_check
-    monkeypatch.setattr(sort_check, "_WARNED", False)
+    monkeypatch.setattr(sort_check, "_WARNED", set())
     real = aot_kernels.AOTKernels.sort_indices
 
     def bad(self, keys, *a, **k):
