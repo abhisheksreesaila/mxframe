@@ -164,8 +164,32 @@ def _load_col(dst: FP, addr: Int, dtype: Int, i0: Int, sel: IP, use_sel: Bool, n
 
 # ── vector ops: n is padded up to a multiple of W by the caller ────────────
 
+# ── NaN-aware compares (F-070): DuckDB puts NaN above every number (+inf too) and NaN = NaN ────────
+# Branch-free: IEEE's compare, then NaN's rows fixed with the (x != x) masks. Only float operands get them.
+
 @always_inline
-def _bin[OP: Int](d: FP, a: FP, b: FP, n: Int):
+def _lt_na(x: SIMD[F64, W], y: SIMD[F64, W]) -> SIMD[DType.bool, W]:
+    return x.lt(y) | (~y.eq(y) & x.eq(x))
+
+@always_inline
+def _le_na(x: SIMD[F64, W], y: SIMD[F64, W]) -> SIMD[DType.bool, W]:
+    return x.le(y) | ~y.eq(y)
+
+@always_inline
+def _gt_na(x: SIMD[F64, W], y: SIMD[F64, W]) -> SIMD[DType.bool, W]:
+    return x.gt(y) | (~x.eq(x) & y.eq(y))
+
+@always_inline
+def _ge_na(x: SIMD[F64, W], y: SIMD[F64, W]) -> SIMD[DType.bool, W]:
+    return x.ge(y) | ~x.eq(x)
+
+@always_inline
+def _eq_na(x: SIMD[F64, W], y: SIMD[F64, W]) -> SIMD[DType.bool, W]:
+    return x.eq(y) | (~x.eq(x) & ~y.eq(y))
+
+
+@always_inline
+def _bin[OP: Int, NA: Bool](d: FP, a: FP, b: FP, n: Int):
     var one = SIMD[F64, W](1.0)
     var zero = SIMD[F64, W](0.0)
     var i = 0
@@ -182,17 +206,35 @@ def _bin[OP: Int](d: FP, a: FP, b: FP, n: Int):
         elif OP == OP_DIV:
             r = x / y
         elif OP == OP_LT:
-            r = x.lt(y).select(one, zero)
+            comptime if NA:
+                r = _lt_na(x, y).select(one, zero)
+            else:
+                r = x.lt(y).select(one, zero)
         elif OP == OP_LE:
-            r = x.le(y).select(one, zero)
+            comptime if NA:
+                r = _le_na(x, y).select(one, zero)
+            else:
+                r = x.le(y).select(one, zero)
         elif OP == OP_GT:
-            r = x.gt(y).select(one, zero)
+            comptime if NA:
+                r = _gt_na(x, y).select(one, zero)
+            else:
+                r = x.gt(y).select(one, zero)
         elif OP == OP_GE:
-            r = x.ge(y).select(one, zero)
+            comptime if NA:
+                r = _ge_na(x, y).select(one, zero)
+            else:
+                r = x.ge(y).select(one, zero)
         elif OP == OP_EQ:
-            r = x.eq(y).select(one, zero)
+            comptime if NA:
+                r = _eq_na(x, y).select(one, zero)
+            else:
+                r = x.eq(y).select(one, zero)
         elif OP == OP_NE:
-            r = x.eq(y).select(zero, one)
+            comptime if NA:
+                r = _eq_na(x, y).select(zero, one)
+            else:
+                r = x.eq(y).select(zero, one)
         elif OP == OP_AND:
             r = (x.ne(zero) & y.ne(zero)).select(one, zero)
         else:
@@ -200,35 +242,53 @@ def _bin[OP: Int](d: FP, a: FP, b: FP, n: Int):
         d.store(i, r)
         i += W
 
-def _binop(op: Int, d: FP, a: FP, b: FP, n: Int):
+def _binop(op: Int, d: FP, a: FP, b: FP, n: Int, na: Bool):
     if op == OP_ADD:
-        _bin[OP_ADD](d, a, b, n)
+        _bin[OP_ADD, False](d, a, b, n)
     elif op == OP_SUB:
-        _bin[OP_SUB](d, a, b, n)
+        _bin[OP_SUB, False](d, a, b, n)
     elif op == OP_MUL:
-        _bin[OP_MUL](d, a, b, n)
+        _bin[OP_MUL, False](d, a, b, n)
     elif op == OP_DIV:
-        _bin[OP_DIV](d, a, b, n)
+        _bin[OP_DIV, False](d, a, b, n)
     elif op == OP_LT:
-        _bin[OP_LT](d, a, b, n)
+        if na:
+            _bin[OP_LT, True](d, a, b, n)
+        else:
+            _bin[OP_LT, False](d, a, b, n)
     elif op == OP_LE:
-        _bin[OP_LE](d, a, b, n)
+        if na:
+            _bin[OP_LE, True](d, a, b, n)
+        else:
+            _bin[OP_LE, False](d, a, b, n)
     elif op == OP_GT:
-        _bin[OP_GT](d, a, b, n)
+        if na:
+            _bin[OP_GT, True](d, a, b, n)
+        else:
+            _bin[OP_GT, False](d, a, b, n)
     elif op == OP_GE:
-        _bin[OP_GE](d, a, b, n)
+        if na:
+            _bin[OP_GE, True](d, a, b, n)
+        else:
+            _bin[OP_GE, False](d, a, b, n)
     elif op == OP_EQ:
-        _bin[OP_EQ](d, a, b, n)
+        if na:
+            _bin[OP_EQ, True](d, a, b, n)
+        else:
+            _bin[OP_EQ, False](d, a, b, n)
     elif op == OP_NE:
-        _bin[OP_NE](d, a, b, n)
+        if na:
+            _bin[OP_NE, True](d, a, b, n)
+        else:
+            _bin[OP_NE, False](d, a, b, n)
     elif op == OP_AND:
-        _bin[OP_AND](d, a, b, n)
+        _bin[OP_AND, False](d, a, b, n)
     else:
-        _bin[OP_OR](d, a, b, n)
+        _bin[OP_OR, False](d, a, b, n)
 
 @always_inline
-def _cmp_thr[OP: Int](d: FP, thr: Float64, n: Int):
-    """In place: d = 1.0 if d <OP> thr else 0.0."""
+def _cmp_thr[OP: Int, NA: Bool](d: FP, thr: Float64, n: Int):
+    """In place: d = 1.0 if d <OP> thr else 0.0 (NA: NaN above every number, as DuckDB)."""
     var t = SIMD[F64, W](thr)
     var one = SIMD[F64, W](1.0)
     var zero = SIMD[F64, W](0.0)
@@ -237,33 +297,69 @@ def _cmp_thr[OP: Int](d: FP, thr: Float64, n: Int):
         var x = d.load[width=W](i)
         var r: SIMD[F64, W]
         comptime if OP == OP_LT:
-            r = x.lt(t).select(one, zero)
+            comptime if NA:
+                r = _lt_na(x, t).select(one, zero)
+            else:
+                r = x.lt(t).select(one, zero)
         elif OP == OP_LE:
-            r = x.le(t).select(one, zero)
+            comptime if NA:
+                r = _le_na(x, t).select(one, zero)
+            else:
+                r = x.le(t).select(one, zero)
         elif OP == OP_GT:
-            r = x.gt(t).select(one, zero)
+            comptime if NA:
+                r = (x.gt(t) | ~x.eq(x)).select(one, zero)     # (thr is never NaN here: the host keeps NaN constants out of CMPC)
+            else:
+                r = x.gt(t).select(one, zero)
         elif OP == OP_GE:
-            r = x.ge(t).select(one, zero)
+            comptime if NA:
+                r = _ge_na(x, t).select(one, zero)
+            else:
+                r = x.ge(t).select(one, zero)
         elif OP == OP_EQ:
-            r = x.eq(t).select(one, zero)
+            comptime if NA:
+                r = _eq_na(x, t).select(one, zero)
+            else:
+                r = x.eq(t).select(one, zero)
         else:
-            r = x.eq(t).select(zero, one)
+            comptime if NA:
+                r = _eq_na(x, t).select(zero, one)
+            else:
+                r = x.eq(t).select(zero, one)
         d.store(i, r)
         i += W
 
-def _cmp_const(op: Int, d: FP, thr: Float64, n: Int):
+def _cmp_const(op: Int, d: FP, thr: Float64, n: Int, na: Bool):
     if op == OP_LT:
-        _cmp_thr[OP_LT](d, thr, n)
+        if na:
+            _cmp_thr[OP_LT, True](d, thr, n)
+        else:
+            _cmp_thr[OP_LT, False](d, thr, n)
     elif op == OP_LE:
-        _cmp_thr[OP_LE](d, thr, n)
+        if na:
+            _cmp_thr[OP_LE, True](d, thr, n)
+        else:
+            _cmp_thr[OP_LE, False](d, thr, n)
     elif op == OP_GT:
-        _cmp_thr[OP_GT](d, thr, n)
+        if na:
+            _cmp_thr[OP_GT, True](d, thr, n)
+        else:
+            _cmp_thr[OP_GT, False](d, thr, n)
     elif op == OP_GE:
-        _cmp_thr[OP_GE](d, thr, n)
+        if na:
+            _cmp_thr[OP_GE, True](d, thr, n)
+        else:
+            _cmp_thr[OP_GE, False](d, thr, n)
     elif op == OP_EQ:
-        _cmp_thr[OP_EQ](d, thr, n)
+        if na:
+            _cmp_thr[OP_EQ, True](d, thr, n)
+        else:
+            _cmp_thr[OP_EQ, False](d, thr, n)
     else:
-        _cmp_thr[OP_NE](d, thr, n)
+        if na:
+            _cmp_thr[OP_NE, True](d, thr, n)
+        else:
+            _cmp_thr[OP_NE, False](d, thr, n)
 
 def _not(d: FP, a: FP, n: Int):
     var one = SIMD[F64, W](1.0)
@@ -536,7 +632,7 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             # column <cmp> constant: widen exactly, compare against the pre-rounded threshold
             var c = Int(ins[2])
             _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
-            _cmp_const(Int(ins[4]), d, p.consts[Int(ins[3])], npad)
+            _cmp_const(Int(ins[4]) & 255, d, p.consts[Int(ins[3])], npad, (Int(ins[4]) >> 8) != 0)
         elif op == OP_STR:
             var c = Int(ins[2])
             var slot = Int(p.dtypes[c]) >> 8        # dtype 6 | (slot << 8): the chunk's bytes, validity, bit base
@@ -550,7 +646,7 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             for i in range(n):
                 d[i] = Float64(i0 + (Int(sel[i]) if use_sel else i))
         elif op < OP_NOT:
-            _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad)
+            _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad, Int(ins[4]) != 0)
         elif op == OP_NOT:
             _not(d, regs + Int(ins[2]) * VEC, npad)
         elif op == OP_FLOOR:

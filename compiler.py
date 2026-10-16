@@ -8,7 +8,7 @@ __all__ = ['GraphCompiler']
 # %% ../nbs/03_compiler.ipynb 2
 from typing import Any, Dict, List, Union
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, is_in as _is_in, distinct_rows as _distinct_rows
 from ._lazy_pc import pc
 from .np_arrow import checked_arith as _checked_arith, modulo as _modulo
 import numpy as np
@@ -33,11 +33,56 @@ def _max_dtype(arr):
     """Map a numpy dtype to the corresponding MAX DType."""
     return getattr(DType, _NP_TO_MAX_NAMES.get(arr.dtype, "float32"))
 
+def _is_float(x) -> bool:
+    return isinstance(x, float) or (hasattr(x, "type") and pa.types.is_floating(x.type))
+
+
+def _nan_mask(x):
+    """True where an operand is NaN, null where it is null (an integer is never NaN, but its NULLs must stay NULL:
+    a scalar False would let `NULL < NaN` come out true); a plain Python number gives a scalar."""
+    if isinstance(x, (int, float)):
+        return _npscalar(x != x)
+    if _is_float(x):
+        return pc.is_nan(x)
+    if hasattr(x, "type") and pa.types.is_integer(x.type):
+        return pc.is_nan(pc.cast(x, pa.float64()))
+    return _npscalar(False)
+
+
+def _valid(x):
+    return _npscalar(True) if isinstance(x, (int, float)) else pc.is_valid(x)
+
+
+def _nan_aware(op: str, name: str):
+    """A comparison that orders floats as DuckDB does (F-070): NaN is above every number, +inf included,
+    and NaN = NaN. Arrow's compares are IEEE's. NULL stays NULL (Kleene logic keeps it where it was)."""
+    base = getattr(pc, name)
+
+    def compare(a, b):
+        if not (_is_float(a) or _is_float(b)):
+            return base(a, b)
+        na, nb = _nan_mask(a), _nan_mask(b)
+        if op == "eq" or op == "ne":
+            eq = pc.or_kleene(pc.equal(a, b), pc.and_kleene(na, nb))
+            return eq if op == "eq" else pc.invert(eq)
+        if op == "gt":
+            extra = pc.and_kleene(na, pc.invert(nb))        # a is NaN, b is not
+        elif op == "lt":
+            extra = pc.and_kleene(nb, pc.invert(na))
+        elif op == "ge":
+            extra = pc.and_kleene(na, _valid(b))            # (a null or b null stays null)
+        else:
+            extra = pc.and_kleene(nb, _valid(a))
+        return pc.or_kleene(base(a, b), extra)
+    return compare
+
+
 class _LazyPcOps(dict):
     """op -> pyarrow.compute function, looked up on use: pyarrow.compute loads on first use (_lazy_pc).
-    Only `in` and `[]` give functions; the stored values are names."""
+    Only `in` and `[]` give functions; the stored values are names. The six comparisons are NaN-aware."""
     def __getitem__(self, op):
-        return getattr(pc, dict.__getitem__(self, op))
+        name = dict.__getitem__(self, op)
+        return _nan_aware(op, name) if op in ("gt", "ge", "lt", "le", "eq", "ne") else getattr(pc, name)
 
     def get(self, op, default=None):
         return self[op] if op in self else default
@@ -379,7 +424,7 @@ class GraphCompiler:
                 got = native_exec.try_str_slice_in(col_arr, 0, None, list(args[1]))
                 if got is not None:
                     return got
-            return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
+            return _is_in(col_arr, args[1])
         if op == "str_slice":
             from .custom_ops import _str_slice
             return _str_slice(GraphCompiler._eval_predicate(args[0], table), args[1], args[2])
