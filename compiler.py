@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Union
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
 from ._lazy_pc import pc
+from .np_arrow import checked_arith as _checked_arith
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
@@ -232,20 +233,44 @@ class GraphCompiler:
         return plan, post_ops
 
     @staticmethod
-    def _key_tiebreak(plan, post_ops):
-        """ORDER BY right above a group-by: add the group keys (ascending) as the last sort
-        columns, so ties come out in key order on every path, as the native executor and
-        `ORDER BY ..., keys` in DuckDB do (a hash table's own order is not deterministic)."""
-        if not (post_ops and isinstance(post_ops[0], Sort) and isinstance(plan, Aggregate) and plan.group_by):
+    def _tiebreak_names(plan):
+        """Output names of the group keys of the Aggregate under `plan` (Project / Filter nodes over it),
+        as `plan` exposes them. A Project that drops a key (or computes a column in its place)
+        takes it out: nothing is left to tie-break on for that key."""
+        projects = []
+        while isinstance(plan, (Project, Filter)):
+            if isinstance(plan, Project):               # a Filter keeps every name
+                projects.append(plan)
+            plan = plan.input
+        if not (isinstance(plan, Aggregate) and plan.group_by):
+            return []
+        names = [e._alias or (e.args[0] if e.op == "col" else None) for e in plan.group_by]
+        for prj in reversed(projects):                      # innermost Project first
+            out = []
+            for n in names:
+                hit = [e for e in prj.exprs if e.op == "col" and e.args[0] == n] if n is not None else []
+                out.append(hit[0]._alias or n if hit else None)
+            names = out
+        return [n for n in names if n is not None]
+
+    @classmethod
+    def _key_tiebreak(cls, plan, post_ops):
+        """ORDER BY right above a group-by (or above Projects over one that keep its keys): add the
+        group keys (ascending) as the last sort columns, so ties come out in key order on every
+        path, as the native executor and `ORDER BY ..., keys` in DuckDB do (a hash table's own
+        order is not deterministic)."""
+        if not (post_ops and isinstance(post_ops[0], Sort)):
+            return post_ops
+        names = cls._tiebreak_names(plan)
+        if not names:
             return post_ops
         srt = post_ops[0]
         have = {e.args[0] for e in srt.by if e.op == "col"}
         desc = list(srt.descending) if isinstance(srt.descending, (list, tuple)) \
             else [bool(srt.descending)] * len(srt.by)
         by = list(srt.by)
-        for e in plan.group_by:
-            name = e._alias or (e.args[0] if e.op == "col" else None)
-            if name is not None and name not in have:
+        for name in names:
+            if name not in have:
                 by.append(Expr("col", name))
                 desc.append(False)
                 have.add(name)
@@ -382,15 +407,15 @@ class GraphCompiler:
         if op == "mul":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.multiply(lhs, rhs)
+            return _checked_arith("mul", lhs, rhs)
         if op == "add":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.add(lhs, rhs)
+            return _checked_arith("add", lhs, rhs)
         if op == "sub":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.subtract(lhs, rhs)
+            return _checked_arith("sub", lhs, rhs)
         if op == "div":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)

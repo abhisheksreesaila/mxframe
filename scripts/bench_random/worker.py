@@ -51,8 +51,12 @@ def main():
             if hasattr(nx, name):
                 real = getattr(nx, name)
                 setattr(nx, name, lambda *a, _real=real, _n=name: (native.append(_n), _real(*a))[1])
+        device = os.environ.get("MXBENCH_DEVICE", "cpu")
+        from tpch_user import provenance        # F-055: which path each compute() took
+        prov = provenance.install()
         t0 = time.perf_counter()
-        result = gen.run_mx(spec, t)
+        result = gen.run_mx(spec, t, device)
+        res["paths"] = provenance.summary(prov)
         res["ms"] = (time.perf_counter() - t0) * 1e3
         res["native_calls"] = native
         res["declines"] = sorted(set(declines))

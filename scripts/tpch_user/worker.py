@@ -92,9 +92,12 @@ def main() -> None:
         mod = importlib.import_module(f"tpch_user.{modname}")
         out["import_ms"] = (time.perf_counter() - t0) * 1000.0
         from tpch_user import spec
+        prov = []
         if modname == "q_mx":
             import mxframe
             out["mxframe_path"] = os.path.dirname(os.path.abspath(mxframe.__file__))
+            from tpch_user import provenance        # F-055: which path each compute() took
+            prov = provenance.install()
 
         engine_only = a.mode == "engine"
 
@@ -119,6 +122,9 @@ def main() -> None:
         res = timed()
         first_ms = (time.perf_counter() - t0) * 1000.0
         out["first_ms"] = first_ms
+        if prov:
+            out["paths"] = provenance.summary(prov)
+            del prov[:]
 
         import pyarrow.parquet as pq
         tbl = canonicalize(mod.to_arrow(res), spec.OUTPUT[a.query])
@@ -137,11 +143,14 @@ def main() -> None:
                     gc.collect()
                     tables, _ = load()
                     extra["repeat_reloaded"] = True
+                del prov[:]
                 t0 = time.perf_counter()
                 res = timed()
                 repeat_ms = (time.perf_counter() - t0) * 1000.0
                 # verified by the parent like the first result (written outside the clock)
                 pq.write_table(canonicalize(mod.to_arrow(res), spec.OUTPUT[a.query]), a.result + ".repeat")
+                if prov:
+                    extra["repeat_paths"] = provenance.summary(prov)
                 emit({"repeat_ms": repeat_ms, "repeat_written": True, **extra})
             except BaseException as e:  # noqa: BLE001
                 emit({"repeat_ms": None, "repeat_note": f"repeat failed: {type(e).__name__}: {str(e)[:200]}"})

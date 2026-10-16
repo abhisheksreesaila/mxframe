@@ -338,6 +338,64 @@ def _float_values(a) -> np.ndarray:
     return np.frombuffer(a.buffers()[1], dtype=np.float64, count=a.offset + len(a))[a.offset:]
 
 
+_INT64_MIN, _INT64_MAX = -(1 << 63), (1 << 63) - 1
+
+
+def _sum_overflow():
+    return OverflowError("Overflow in sum of INT64: the total does not fit in a 64-bit integer "
+                         "(DuckDB widens it to a 128-bit HUGEINT)")
+
+
+def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
+    """Exact int64 per-group sum (np.bincount adds in float64, which loses digits past 2^53): the values
+    are cut into three 21-bit limbs, each limb's sums are exact in float64, then recombined in int64.
+    A group whose total does not fit int64 raises OverflowError instead of wrapping."""
+    if a.type != pa.int64():
+        a = pc.cast(a, pa.int64())
+    v = np.frombuffer(a.buffers()[1], dtype=np.int64, count=a.offset + len(a))[a.offset:][valid]
+    mask = (1 << 21) - 1
+    s0 = np.bincount(g, weights=(v & mask), minlength=n_groups)
+    s1 = np.bincount(g, weights=((v >> 21) & mask), minlength=n_groups)
+    s2 = np.bincount(g, weights=(v >> 42), minlength=n_groups)
+    # float64 estimate of the total: only groups near or past the int64 limits are rechecked exactly
+    for i in np.flatnonzero(np.abs(s2 * 2.0 ** 42 + s1 * 2.0 ** 21 + s0) > 2.0 ** 62):
+        if not _INT64_MIN <= (int(s2[i]) << 42) + (int(s1[i]) << 21) + int(s0[i]) <= _INT64_MAX:
+            raise _sum_overflow()
+    return (s2.astype(np.int64) << 42) + (s1.astype(np.int64) << 21) + s0.astype(np.int64)
+
+
+def int_sum(a):
+    """``pc.sum`` of an integer Array as a Python int (None when no value is valid); OverflowError
+    when the total does not fit int64 (``pc.sum`` wraps). Only a column whose rows * largest
+    magnitude could pass 2^63 pays for the exact limb sum."""
+    n = len(a) - a.null_count
+    if n == 0:
+        return None
+    mm = pc.min_max(a)
+    if max(abs(mm["min"].as_py()), abs(mm["max"].as_py())) * n <= _INT64_MAX:
+        return pc.sum(a).as_py()
+    valid = to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else np.ones(len(a), bool)
+    return int(_int_group_sum(a, valid, np.zeros(int(valid.sum()), np.intp), 1)[0])
+
+
+_ARITH = {"add": ("addition", "add_checked"), "sub": ("subtraction", "subtract_checked"),
+          "mul": ("multiplication", "multiply_checked")}
+
+
+def checked_arith(op, lhs, rhs):
+    """``add`` / ``sub`` / ``mul`` of two operands, raising OverflowError ("Overflow in
+    multiplication of INT64", DuckDB's message) where Arrow's plain kernels would wrap. Float
+    operands behave as with the plain kernels."""
+    word, name = _ARITH[op]
+    try:
+        return getattr(pc, name)(lhs, rhs)
+    except pa.ArrowInvalid as e:
+        if "overflow" not in str(e).lower():
+            raise
+        t = lhs.type if hasattr(lhs, "type") else rhs.type
+        raise OverflowError(f"Overflow in {word} of {str(t).upper()}") from e
+
+
 def distinct_rows(table: pa.Table) -> pa.Table:
     """Distinct rows of ``table`` (nulls equal to each other), first-appearance order."""
     if table.num_rows == 0:
@@ -369,6 +427,9 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
         cnt = np.bincount(g, minlength=n_groups)
         if op == "count":
             out.append(array(cnt.astype(np.int64)))
+            continue
+        if op == "sum" and pa.types.is_integer(a.type):
+            out.append(array(np.ma.array(_int_group_sum(a, valid, g, n_groups), mask=cnt == 0), type=pa.int64()))
             continue
         x = _float_values(a)[valid]
         if op in ("sum", "mean"):
