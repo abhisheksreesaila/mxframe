@@ -520,7 +520,7 @@ Needs: none · Found by the F-043 review
 Needs: F-045
 - [ ] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate
 
-## F-061 Integer overflow past int64 is silent on the exact path [review]
+## F-061 Integer overflow past int64 is silent on the exact path [done]
 Needs: F-037 · Found by the F-037 review (2026-10-16); high priority: silent wrong results, and F-037 routes more queries here
 - [x] `pc.add` / `subtract` / `multiply` in the exact path (`custom_ops.py` ~620) wrap past 2^63 (`a*a*a` with a = 2^30 gives 0, rows dropped); DuckDB raises "Overflow in multiplication of INT64". Use Arrow's `_checked` kernels and raise the same way
 - [x] `pc.sum` on int64 and the limb recombine in `np_arrow._int_group_sum` wrap at 2^63 (DuckDB sums int64 into a 128-bit integer): raise, or widen like DuckDB
