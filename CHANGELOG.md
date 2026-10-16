@@ -7,6 +7,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Kernel libraries find the Mojo runtime from the environment they are installed in** (F-036). The 0.6.0 wheel still ships `kernels_aot/*.so` with an absolute RUNPATH of the build machine's pixi env; the next release carries a relocatable one (`scripts/set_runpath.sh`). Linux only; macOS is out of scope.
+
 ### Docs
 - **Docs site** at https://abhisheksreesaila.github.io/mxframe/ (GitHub Pages; `docs/site/`). It has interactive benchmarks, how `device="auto"` decides, the path a query takes (for porting), how the engine got fast, and the kernel visualizer. Every number on it is computed in the browser from `docs/bench`.
 - **README** is short now: why, the latest numbers, install and run, API reference tables. A test runs every example in it and checks its numbers against `docs/bench`.
