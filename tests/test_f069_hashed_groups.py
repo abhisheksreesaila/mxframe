@@ -437,7 +437,7 @@ def test_a_record_budget_passed_declines_to_the_path_that_fits_with_the_same_ans
     _hashed(hooks)
 
 
-@pytest.mark.parametrize("value", ["abc", "", "0", "-5", "nan"])
+@pytest.mark.parametrize("value", ["abc", "", "0", "-5", "nan", "inf"])
 def test_an_unusable_record_limit_variable_is_ignored(monkeypatch, value):
     monkeypatch.delenv("MXFRAME_HASH_RECORD_MB", raising=False)
     default = nx._record_limit()

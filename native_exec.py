@@ -129,7 +129,7 @@ def _record_limit() -> int:
     MXFRAME_HASH_RECORD_MB overrides (tests); a value that is not a positive number is ignored."""
     try:
         mb = float(os.environ.get("MXFRAME_HASH_RECORD_MB", ""))
-        if mb > 0:
+        if 0 < mb < float("inf"):
             return int(mb * (1 << 20))
     except ValueError:
         pass                                    # not a number: as if unset
