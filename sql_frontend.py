@@ -334,6 +334,7 @@ class _SQLTranslator:
         # right side carries a copy of it (NULL where nothing matched). (alias, key) / bare key -> that copy
         self._marks: dict = {}
         self._marks_bare: dict = {}
+        self._renamed: dict = {}
         self._copies: set = set()            # the copies: internal, never part of a result
         # (table name or alias, its columns) of every scanned table, and join keys that have the
         # same name on both sides (one copy survives the join, so t.k and u.k are the same column)
@@ -584,6 +585,7 @@ class _SQLTranslator:
                     right_plan = Filter(right_plan, pred)
             using = join.args.get("using")
             if on is not None:
+                on = self._use_right_key_copies(on)      # u.k of an earlier LEFT JOIN: NULL where it missed
                 left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
             elif using:
                 cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
@@ -594,18 +596,25 @@ class _SQLTranslator:
 
             if how == "left":
                 right_plan = self._copy_right_keys(node, join, right_plan, right_cols, left_on, right_on)
+                self._left_schema |= self._copies            # a later ON may name a copy (u.k)
             plan = Join(plan, right_plan, left_on, right_on, how)
             # After this join, the accumulated left side grows to include right cols (a semi / anti
             # join outputs the left columns only)
             if how not in ("semi", "anti"):
                 self._left_schema |= right_schema
-                self._cur_cols += [o for _, o in join_output_names(self._cur_cols, right_cols, right_on)]
+                outs = join_output_names(self._cur_cols, right_cols, right_on)
+                self._cur_cols += [o for _, o in outs]
+                for c, o in outs:
+                    if c != o:                         # a clashing column is renamed (x.k -> k_right)
+                        self._renamed[(join.this.alias_or_name.lower(), c.lower())] = o
             self._joined.add(join.this.alias_or_name.lower())
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
                 if lk == rk:
                     self._same_keys.add(lk)
-                if lk != rk and how != "left":
+                if lk in self._copies and how != "left":
+                    self._marks[(join.this.alias_or_name.lower(), rk)] = lk       # x.k equals the copy it matched
+                elif lk != rk and how != "left":
                     self._col_aliases[rk] = lk
 
         while pending:
@@ -659,7 +668,9 @@ class _SQLTranslator:
         alias = join.this.alias_or_name.lower()
         pairs = dict(zip(right_on, left_on))
         asked = set()
-        for key, val in node.args.items():
+        joins = node.args["joins"]
+        later_on = [j.args["on"] for j in joins[[j is join for j in joins].index(True) + 1:] if j.args.get("on")]
+        for key, val in list(node.args.items()) + [("on", later_on)]:
             if key in ("joins", "from_", "with_") or val is None:
                 continue
             for e in (val if isinstance(val, list) else [val]):
@@ -683,6 +694,18 @@ class _SQLTranslator:
             self._copies.add(name)
             added.append(col(k).alias(name))
         return Project(right_plan, [col(c) for c in right_cols] + added)
+
+    def _use_right_key_copies(self, on):
+        """``on`` with every ``u.k`` that is an earlier LEFT JOIN's right key replaced by its copy (NULL where
+        that join matched nothing, so nothing matches it), and every earlier table's column that the join
+        renamed (``x.k`` -> ``k_right``) by its output name."""
+        on = on.copy()
+        for c in list(on.find_all(sge.Column)):
+            key = (c.table.lower(), c.name.lower()) if c.table else None
+            copy = self._marks.get(key) or self._renamed.get(key)
+            if copy:
+                c.replace(sge.Column(this=sge.to_identifier(copy)))
+        return on
 
     def _links(self, alias: str, cols: set):
         """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
@@ -813,7 +836,7 @@ class _SQLTranslator:
                 b_in_left  = b in left_schema
                 b_in_right = b in right_schema
                 # If a belongs to right and b belongs to left → swap
-                if a_in_right and b_in_left and not a_in_left:
+                if a_in_right and b_in_left and (not a_in_left or not b_in_right):
                     return [b], [a]
             return [a], [b]
         if isinstance(on_expr, sge.And):

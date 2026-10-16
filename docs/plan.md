@@ -938,10 +938,11 @@ Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
 - [ ] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
 - [ ] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
 
-## F-104 Chained LEFT JOIN on the previous right table's key [todo]
+## F-104 Chained LEFT JOIN on the previous right table's key [review]
 Found by the F-086 review (2026-10-16); a silent wrong answer on main
-- [ ] `t LEFT JOIN u ON t.k = u.k LEFT JOIN x ON u.k = x.k`: for a `t.k` with no match in `u`, `u.k` is NULL so `x` must not match (DuckDB z = NULL); mx joins `x` anyway (z = 300) because a later join's ON resolves `u.k` to `t.k`. Extend F-086's right-key copy (`_copy_right_keys`, which skips joins' ON clauses) to later ON clauses
-- [ ] DuckDB-checked tests: two and three chained LEFT JOINs keyed on the previous right table, mixed INNER / LEFT, unmatched rows at each step; fails before
+- [x] `t LEFT JOIN u ON t.k = u.k LEFT JOIN x ON u.k = x.k`: for a `t.k` with no match in `u`, `u.k` is NULL so `x` does not match (z = NULL, as DuckDB). `_copy_right_keys` also scans later joins' ON clauses for `u.k`, and `_use_right_key_copies` rewrites those ON references to the NULL-on-unmatched copy before `_parse_join_on` (which now swaps `x.k = u.k` written either way round, and registers a copy as the left key's name). After an INNER JOIN on a copy, `x.k` resolves to the copy. A right column the join renamed (`x.k` -> `k_right`, when it is not a key) is named by its output name in a later ON
+- [x] DuckDB-checked tests (`tests/test_sql_chained_left_join.py`, cpu and gpu): two and three chained LEFT JOINs on the previous right key (either operand order), mixed INNER / LEFT, a previous right table's non-key column (`u.v`), USING forms, aggregate over the chain, unmatched rows at each step; 29 of 45 failed before
+- Not changed: a bare `k` in a later ON stays the left table's (DuckDB calls it ambiguous)
 
 ## F-105 SQL CASE with string results [todo]
 Seen in the F-086 review (2026-10-16)
