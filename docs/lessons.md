@@ -45,3 +45,4 @@ Claude reads this at the start of each session. -->
 - 2026-10-14 · Before a release, dry-run scripts/release.sh (no flags) end to end; it had gone stale (no twine, old kernels.mojopkg name) since the last release.
 - 2026-10-14 · Never `pkill -f` a pattern that can match your own shell command line (killed the shell twice); kill by PID.
 - 2026-10-16 · In an agent worktree (folder name with hyphens), run tests with `pixi run test` (it runs pytest through an `mxframe`-named symlink); plain `pixi run pytest` can't import the repo package there and every test errors.
+- 2026-10-15 · A sort over a group-by must name the group keys as its last columns on every path (`_key_tiebreak`): relying on a hash table's output order or an unstable top-k partition gave different tie orders per path.
