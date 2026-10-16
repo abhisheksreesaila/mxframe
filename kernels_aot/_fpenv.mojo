@@ -10,18 +10,24 @@ workers through `par` / `par_n` / `sync_par` below, which reset MXCSR to the IEE
 """
 
 from max.algorithm import parallelize, sync_parallelize
+from std.sys import CompilationTarget
 from std.sys._assembly import inlined_assembly
+from std.memory import Pointer
 
 
 @always_inline
 def ieee_denormals():
-    """MXCSR = 0x1F80: all exceptions masked, round to nearest, FTZ and DAZ off."""
-    inlined_assembly[
-        "pushq $$0x1F80; ldmxcsr (%rsp); addq $$8, %rsp",
-        NoneType,
-        constraints="~{memory},~{rsp},~{flags}",
-        has_side_effect=True,
-    ]()
+    """x86: MXCSR = 0x1F80 (all exceptions masked, round to nearest, FTZ and DAZ off), loaded from a local variable.
+    Elsewhere a no-op: the ARM equivalent is the FPCR FZ bit, which is UNCHECKED here (no aarch64 build has been
+    made or tested; check whether Mojo's parallelize sets FZ there before shipping an ARM kernel)."""
+    comptime if CompilationTarget.is_x86():
+        var csr = Int32(0x1F80)
+        inlined_assembly[
+            "ldmxcsr ($0)",
+            NoneType,
+            constraints="r,~{memory}",
+            has_side_effect=True,
+        ](Pointer(to=csr))
 
 
 def par[F: def(Int) -> None](f: F, n: Int):
