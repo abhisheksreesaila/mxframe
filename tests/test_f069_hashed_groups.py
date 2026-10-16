@@ -440,6 +440,10 @@ def test_a_record_budget_passed_declines_to_the_path_that_fits_with_the_same_ans
 @pytest.mark.parametrize("value", ["abc", "", "0", "-5", "nan", "inf"])
 def test_an_unusable_record_limit_variable_is_ignored(monkeypatch, value):
     monkeypatch.delenv("MXFRAME_HASH_RECORD_MB", raising=False)
+    import builtins
+    real_open = builtins.open
+    meminfo = "MemAvailable:   8000000 kB\n"           # MemAvailable moves between reads: fix it
+    monkeypatch.setattr(builtins, "open", lambda f, *a, **k: __import__("io").StringIO(meminfo) if f == "/proc/meminfo" else real_open(f, *a, **k))
     default = nx._record_limit()
     monkeypatch.setenv("MXFRAME_HASH_RECORD_MB", value)
     assert nx._record_limit() == default > 0

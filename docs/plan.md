@@ -807,10 +807,10 @@ Found by the F-070 developer (2026-10-16); a silent wrong answer
 - [ ] with `MXFRAME_NATIVE=0` on 200,000 rows, `fused_pipeline_cpu` reads the denormal 5e-324 as 0 (`x > 0.0` counts 0 of 100,000): a flush-to-zero / denormals-are-zero mode in the CPU pipeline kernel (or its compile flags). Find where FTZ/DAZ is set; every CPU and GPU path compares and sums denormals like DuckDB
 - [ ] DuckDB-checked tests: filters and sums over denormals (5e-324, 2.2e-308), each CPU path forced (native, fused pipeline, Arrow) and GPU; fails before
 
-## F-083 ORDER BY a column not in the select list [todo]
+## F-083 ORDER BY a column not in the select list [done]
 Found by the F-070 developer (2026-10-16)
-- [ ] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
-- [ ] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
+- [x] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
+- [x] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
 
 ## F-084 Window functions: NULL values, NaN ties and DESC order like DuckDB [todo]
 Found by the F-081 review (2026-10-16); silent wrong answers on main before F-081
@@ -820,7 +820,34 @@ Found by the F-081 review (2026-10-16); silent wrong answers on main before F-08
 - [ ] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decide and document if not
 - [ ] DuckDB-checked tests for each; fail before
 
+## F-085 ORDER BY + LIMIT inside an IN / NOT IN subquery is dropped [done]
+Found by the F-083 review (2026-10-16); a silent wrong answer, also on main
+- [x] `WHERE i IN (SELECT i FROM t ORDER BY i DESC LIMIT 5)` returned 0..4 where DuckDB returns 45..49: the uncorrelated IN / NOT IN build side dropped the subquery ORDER BY and kept its LIMIT. It now keeps the ORDER BY when there is a LIMIT. Correlated IN, EXISTS and scalar subqueries reject LIMIT already (raise), so they never gave a wrong answer
+- [x] DuckDB-checked tests (`tests/test_sql_subquery_order_limit.py`): DESC, multi-key with ties, hidden sort key (F-083), WHERE in the subquery, alias, NOT IN, join to another table, outer LIMIT; fail before
+
+- F-083 note: the DataFrame side sorts before select (`f.sort("b").select("a")`); `select("a").sort("b")` raises a ValueError naming the column. A hidden-key Project above Sort/Limit is applied after the post-ops in `CustomOpsCompiler.compile_and_run`, so the top-n paths still see Sort + Limit.
+
 ## F-086 SQL IS NULL / IS NOT NULL [todo]
 Found by the F-079 developer and the F-083 review (2026-10-16)
 - [ ] `WHERE x IS NULL` / `IS NOT NULL` (and in SELECT, CASE, HAVING, subqueries, joins' ON) raises `NotImplementedError: Unsupported SQL expression type: Is` in the SQL front end; map to the existing `is_null` / `is_not_null` expressions (native filter where the bytecode has a validity test; Arrow otherwise). Also `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` if sqlglot parses them, and `x IS TRUE / FALSE` if cheap
 - [ ] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
+
+## F-087 SQL OFFSET is ignored [todo]
+Found by the F-083 review (2026-10-16); a silent wrong answer on main
+- [ ] `ORDER BY c, i LIMIT 3 OFFSET 2` returns the first 3 rows (OFFSET dropped), top level and in subqueries (`IN (... LIMIT 5 OFFSET 2)`). Support OFFSET (slice after the sort, before / with LIMIT; top-n keeps `limit + offset` rows), or raise until then; never drop it
+- [ ] DuckDB-checked tests: OFFSET with and without LIMIT, with ORDER BY ties broken by a unique key, hidden sort key, in IN / FROM subqueries and CTEs, OFFSET past the end; fails before
+
+## F-088 SELECT *, expr returns only the expression [todo]
+Found by the F-083 review (2026-10-16); a silent wrong answer on main
+- [ ] `SELECT *, a+1 AS x FROM t` returns only `x`; DuckDB returns every column then `x`. Expand `*` in place among other select items (and `t.*`), with or without ORDER BY (F-083 made the ORDER BY form raise; replace that error with the real expansion)
+- [ ] DuckDB-checked tests: `*, expr`, `expr, *`, `t.*, u.c` over a join, with WHERE / ORDER BY / LIMIT, name clash between `*` and an alias; fails before
+
+## F-089 GPU ORDER BY ... LIMIT 0 crashes [todo]
+Found by the F-083 review (2026-10-16)
+- [ ] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
+- [ ] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
+
+## F-090 IN (SELECT max(i) ...) join key types differ [todo]
+Found by the F-083 review (2026-10-16)
+- [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB
+- [ ] DuckDB-checked tests: IN / NOT IN over max / min / sum / count subqueries against int and float columns; fails before

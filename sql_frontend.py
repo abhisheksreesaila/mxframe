@@ -397,6 +397,7 @@ class _SQLTranslator:
 
         final_proj = None
         names = None
+        sort_cols: dict = {}
         if group_node or has_aggs:
             plan, final_proj = self._build_aggregate(plan, node, group_node, having)
         else:
@@ -411,8 +412,14 @@ class _SQLTranslator:
                     if nm is not None and nm != (p._alias or (p.args[0] if p.op == "col" else None)):
                         p.alias(nm)
                 if len(non_star) < len(node.expressions):
+                    if node.args.get("order"):
+                        raise ValueError("ORDER BY together with * mixed with other SELECT items is not supported "
+                                         "(list the columns, or use SELECT * alone)")
                     names = None                       # a * shifts the positions
-                plan = Project(plan, proj)
+                hidden, sort_cols = self._hidden_sort_keys(node, non_star, names, distinct is not None) if names else ([], {})
+                plan = Project(plan, proj + [ex.alias(nm) for nm, ex in hidden])
+                if hidden:                             # carried to the sort, dropped after it
+                    final_proj = [col(nm) for nm in names]
             if distinct is not None:
                 plan = Distinct(plan, None)
 
@@ -429,7 +436,8 @@ class _SQLTranslator:
                     if i is None and isinstance(ref, sge.Column) and ref.name.lower() in (names or []):
                         by.append(col(ref.name.lower()))          # a SELECT output name
                     elif i is None:
-                        by.append(self._expr(o.this))
+                        ex = self._expr(o.this)
+                        by.append(col(sort_cols[ex.signature()]) if ex.signature() in sort_cols else ex)
                     elif names is None or names[i] is None:
                         raise ValueError("ORDER BY position needs a named SELECT column (give it an alias)")
                     else:
@@ -445,6 +453,37 @@ class _SQLTranslator:
         if final_proj:
             plan = Project(plan, final_proj)
         return plan
+
+    def _hidden_sort_keys(self, node: sge.Select, items, names, distinct: bool):
+        """ORDER BY keys of a plain SELECT that are not output columns: (the extra columns to carry
+        through the projection as ``[(name, expr)]``, ``{signature: column}`` of every key that is a
+        column already). SELECT DISTINCT may not sort by anything it does not output (as in DuckDB)."""
+        order_node = node.args.get("order")
+        have = {}
+        for e, nm in zip(items, names):
+            if nm is not None:
+                have.setdefault(self._expr(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
+        hidden = []
+        taken = set(names) | {c.lower() for c in self._scope_columns}
+        for o in order_node.expressions if order_node else []:
+            ref = o.this
+            if _ordinal(ref, len(node.expressions)) is not None:
+                continue
+            if isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in names:
+                continue
+            ex = self._expr(ref)
+            if ex.signature() in have:
+                continue
+            if distinct:
+                raise ValueError("for SELECT DISTINCT, ORDER BY expressions must appear in the select list")
+            n = len(hidden)
+            while f"__ord{n}" in taken:                # never a name the query or its tables use
+                n += 1
+            nm = f"__ord{n}"
+            taken.add(nm)
+            have[ex.signature()] = nm
+            hidden.append((nm, ex))
+        return hidden, have
 
     # ------------------------------------------------------------------
     # FROM / JOIN
@@ -829,7 +868,8 @@ class _SQLTranslator:
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
         new.set("expressions", [_alias(item, "__in")])
-        new.set("order", None)
+        if not new.args.get("limit"):
+            new.set("order", None)                     # the order only matters to pick the LIMIT rows
         if int_lits:
             _keep_ints(new.expressions[0])
         inner_plan = self._child()._build_select(new)
