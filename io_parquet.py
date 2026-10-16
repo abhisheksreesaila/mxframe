@@ -553,7 +553,7 @@ def _metadata(path):
 _CMP_OPS = ("eq", "ne", "gt", "ge", "lt", "le")
 _FLIP = {"eq": "eq", "ne": "ne", "gt": "lt", "lt": "gt", "ge": "le", "le": "ge"}
 # Predicate forms the engine evaluates natively on dictionary columns.
-_NATIVE_DICT_PRED = ("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains")
+_NATIVE_DICT_PRED = ("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains", "like")
 
 
 class _Info:
@@ -655,7 +655,9 @@ def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
     """
     info = _Info()
 
-    def walk(node, passthru: bool) -> bool:
+    def walk(node, passthru: bool, native_keys=frozenset()) -> bool:
+        """``native_keys``: names the parent Aggregate reads only as bare group keys (dictionary-native):
+        a Project right below passes them through without forcing a decode (F-034, Q9's with_columns)."""
         if isinstance(node, (Scan, ParquetScan)):
             info.passthrough[id(node)] = info.passthrough.get(id(node), False) or passthru
             return False
@@ -669,7 +671,11 @@ def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
         if isinstance(node, Project):
             walk(node.input, False)
             for e in node.exprs:
-                info.use_plain(e, bare_ok=True)
+                if (native_keys and e.op == "col" and e._alias in (None, e.args[0]) and e.args[0] in native_keys
+                        and sum(e.args[0] in _expr_cols(o) for o in node.exprs) == 1):
+                    info.refs.add(e.args[0])            # a bare pass-through nothing else in the Project reads
+                else:
+                    info.use_plain(e, bare_ok=True)
             return True
         if isinstance(node, Aggregate):
             src = node.input.input if isinstance(node.input, Distinct) else None
@@ -683,7 +689,12 @@ def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
                     walk(src, False)
                     info.refs.update(src.table.column_names)
                 return True
-            walk(node.input, False)
+            used = set()
+            for e in list(node.aggs) + [g for g in node.group_by if g.op != "col"]:
+                used |= _expr_cols(e)
+            walk(node.input, False, frozenset(g.args[0] for g in node.group_by
+                                              if g.op == "col" and g._alias in (None, g.args[0])
+                                              and g.args[0] not in used))
             for e in node.group_by:
                 if e.op == "col":
                     info.refs.add(e.args[0])          # bare group key: dictionary-native
@@ -870,6 +881,24 @@ def _single_table_shape(plan) -> bool:
     return isinstance(node, (Scan, ParquetScan))
 
 
+def _fold_renames(node: LogicalPlan) -> LogicalPlan:
+    """A select that renames columns of an in-memory table (``nation.select(col("n_name").alias("supp_nation"))``,
+    TPC-H Q7) becomes a Scan of the same buffers under the new names (F-034): the dictionary analysis and the
+    join engine then see a plain leaf, so its dictionary columns stay codes through the join like any other."""
+    if isinstance(node, Project) and isinstance(node.input, Scan) and node.exprs \
+            and all(e.op == "col" for e in node.exprs) \
+            and any(e._alias not in (None, e.args[0]) for e in node.exprs):
+        inner = [e.args[0] for e in node.exprs]
+        outer = [e._alias or e.args[0] for e in node.exprs]
+        if len(set(outer)) == len(outer) and all(n in node.input.table.column_names for n in inner):
+            return Scan(node.input.table.select(inner).rename_columns(outer))
+    if isinstance(node, Join):
+        return dataclasses.replace(node, left=_fold_renames(node.left), right=_fold_renames(node.right))
+    if hasattr(node, "input") and node.input is not None:
+        return dataclasses.replace(node, input=_fold_renames(node.input))
+    return node
+
+
 def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: bool = False) -> LogicalPlan:
     """Replace every ``ParquetScan`` by a ``Scan`` of just the needed columns.
 
@@ -891,6 +920,8 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
                    for l in leaves)
     if not has_parquet and not has_dict:
         return plan
+    if has_dict:
+        plan = _fold_renames(plan)
     info = _analyze(plan, count_distinct_codes)
     single = _single_table_shape(plan)
 

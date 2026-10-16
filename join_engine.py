@@ -186,8 +186,12 @@ def _leaf_table_py(comp, plan, needed: Optional[Set[str]]) -> pa.Table:
         return _select(plan.table, needed)
     if isinstance(plan, Filter):
         inner = _leaf_table_py(comp, plan.input, _union(needed, _cols(plan.predicate)))
+        if not isinstance(plan.input, Scan):          # a computed table (F-034, Q22's anti join side): native filter
+            got = comp._native_filter_table(inner, [plan.predicate], needed)
+            if got is not None:
+                return got
         mask = comp._eval_predicate(plan.predicate, inner)
-        return pc.filter(_select(inner, needed), mask)      # the mask is done: drop the predicate-only columns first
+        return pc.filter(_select(inner, needed), mask)     # the mask is done: drop the predicate-only columns first
     if isinstance(plan, Join):
         return execute_join(comp, plan, needed, False)
     return comp._plan_to_table(materialize(comp, plan, needed, False))
