@@ -122,6 +122,8 @@ def main() -> None:
         res = timed()
         first_ms = (time.perf_counter() - t0) * 1000.0
         out["first_ms"] = first_ms
+        if "mxframe.native_exec" in sys.modules:       # why native paths declined (a slow or fast query that quietly
+            out["declines"] = sys.modules["mxframe.native_exec"].decline_counts()   # fell back is not what it looks like)
         if prov:
             out["paths"] = provenance.summary(prov)
             del prov[:]

@@ -567,3 +567,36 @@ def test_integer_sums_over_fact_and_partner_columns(calls):
     exp = _duck("SELECT g, SUM(q), SUM(cls), SUM(q * cls2) FROM fact JOIN dim1 ON k = dk JOIN dim2 ON k2 = ek GROUP BY g",
                 fact=fact, dim1=dim1, dim2=dim2)
     _same(_rows(got, ["g", "sq", "sc", "sp"]), exp)
+
+
+def test_an_unexpected_error_raises_under_strict_native_and_declines_quietly_without(calls, monkeypatch):
+    """MXFRAME_STRICT_NATIVE: a broken native path must not hide behind the fallback (twice a silent decline
+    did). Expected declines return None either way; only an unexpected exception is raised."""
+    fact, dim1, _, _ = _tables()
+    plan = lambda: (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+                    .groupby("g").agg(col("v").sum().alias("s")))
+    exp = plan().compute(device="cpu")
+    _fused(calls)
+
+    def boom(*a, **k):
+        raise RuntimeError("injected")
+
+    monkeypatch.setattr(nx, "try_execute_join", boom)
+    monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "1")
+    with pytest.raises(RuntimeError, match="injected"):
+        plan().compute(device="cpu")
+    monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "0")
+    nx.reset_decline_counts()
+    got = plan().compute(device="cpu")                      # the old path answers
+    _same(_rows(got), _rows(exp))
+    assert nx.decline_counts() == {"raised: RuntimeError": 1}, nx.decline_counts()
+
+
+def test_declines_are_counted_by_reason(calls):
+    fact, dim1, dim2, _ = _tables()
+    dup = pa.concat_tables([dim2, dim2.slice(0, 5)])
+    nx.reset_decline_counts()
+    (LazyFrame(fact).join(LazyFrame(dup), left_on="k2", right_on="ek")
+     .groupby("g").agg(col("v").sum().alias("s")).compute(device="cpu"))
+    # the fused call and then the star scan both meet the duplicate key
+    assert nx.decline_counts() == {"executor declined (code -18)": 2}, nx.decline_counts()

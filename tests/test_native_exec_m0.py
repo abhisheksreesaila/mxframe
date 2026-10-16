@@ -314,6 +314,7 @@ def test_dictionaries_repeating_in_non_adjacent_chunks(monkeypatch):
 
 
 def test_an_executor_exception_falls_back(native, monkeypatch):
+    monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "0")        # the fallback is what is tested
     def boom():
         raise OSError("library could not be loaded")
     monkeypatch.setattr(nx, "_load", boom)

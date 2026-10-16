@@ -101,8 +101,43 @@ def last_decline():
     return _last["decline"]
 
 
+_decline_counts: dict = {}
+
+
+def strict() -> bool:
+    """MXFRAME_STRICT_NATIVE=1: an unexpected exception in a native hook is raised, not turned into a quiet
+    decline (the tests set it, so a broken native path cannot hide behind the fallback). Declines the code
+    expects (a plan that does not fit) return None and never raise, either way."""
+    return os.environ.get("MXFRAME_STRICT_NATIVE", "0") not in ("0", "false", "off", "")
+
+
+def decline_counts() -> dict:
+    """{reason: count} of every decline since the last reset, unexpected exceptions as ``raised: <ExcType>``
+    (bench scripts print it: a speed-up or slow-down measured on a quietly declining path is not one)."""
+    return dict(_decline_counts)
+
+
+def reset_decline_counts() -> None:
+    _decline_counts.clear()
+
+
+def _count(key: str) -> None:
+    _decline_counts[key] = _decline_counts.get(key, 0) + 1
+
+
 def _decline(reason: str):
     _last["path"], _last["decline"] = None, reason
+    _count(reason)
+    return None
+
+
+def swallowed(exc: BaseException, where: str):
+    """Called from an ``except Exception`` around a native hook: raise ``exc`` under MXFRAME_STRICT_NATIVE,
+    else record the decline (``raised: <ExcType>``) and return None so the caller's fallback answers."""
+    if strict():
+        raise exc
+    _last["path"], _last["decline"] = None, f"{where} raised {type(exc).__name__}: {exc}"
+    _count(f"raised: {type(exc).__name__}")
     return None
 
 
@@ -838,6 +873,7 @@ def last_filter():
 
 def _filter_decline(reason: str):
     _filter_last["path"], _filter_last["decline"] = None, reason
+    _count(reason)
     return None
 
 
@@ -1215,6 +1251,19 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
             cols[name] = pa.chunked_array([_npa_i32_empty()])
 
     # ── group keys: fact columns as they are; partner columns and expressions as expression keys ──
+    space = 1                           # the partner keys alone already multiply past direct addressing: decline now,
+    for e in plan.group_by:             # before a string column is ranked or anything is compiled
+        src = fj.vcols.get(e.args[0]) if e.op == "col" else None
+        c = cols.get(e.args[0]) if src is not None and src[0] == "partner" else None
+        if c is not None and not c.null_count:
+            if c.type in (pa.int32(), pa.int64()):
+                a = _np_of(c.chunk(0), zero_copy_only=False)
+                space *= int(a.max()) - int(a.min()) + 1
+            elif pa.types.is_dictionary(c.type):
+                space *= max(1, len(c.chunk(0).dictionary))
+    if space > MAX_GROUPS:
+        return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
+                                "group key space too wide for direct addressing")
     keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}
     for i, e in enumerate(plan.group_by):
         if e.op == "col" and e._alias in (None, e.args[0]):
@@ -1279,6 +1328,13 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         bnd = _bounds(derived[i], lambda n: _partner_range(fj, cols, n))
         if bnd is not None:                  # an integer expression of partner columns: bounded without a pass
             known[i] = ranges[i] = bnd
+    if not fact_key and all(i in known for i in derived):
+        d = 1                       # every key's range is known here: a key space too big declines before any pass
+        for lo, hi in known.values():
+            d *= hi - lo + 1
+        if d > MAX_GROUPS:
+            return _prow_or_decline(compiler, plan, fj, bs, having_pred, post_ops,
+                                    "group key space too wide for direct addressing")
     probe_idx = [i for i in sorted(derived) if i not in known]
     if probe_idx:                      # an expression key's range: one fused min / max pass over the same join
         probe = Aggregate(None, [], [a for i in probe_idx

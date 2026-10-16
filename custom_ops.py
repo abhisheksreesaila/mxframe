@@ -1399,7 +1399,7 @@ class CustomOpsCompiler(GraphCompiler):
         try:
             res = _native_exec.try_count_distinct(self, table, key, other[0], agg._alias)
         except Exception as exc:          # never fail the query: the equivalent plan answers
-            res = _native_exec._decline(f"count distinct raised {type(exc).__name__}: {exc}")
+            res = _native_exec.swallowed(exc, "count distinct")
         if res is None:
             return equivalent()
         return Scan(res)
@@ -1421,8 +1421,8 @@ class CustomOpsCompiler(GraphCompiler):
                 keep = {n for n in names if pa.types.is_dictionary(t.schema.field(n).type)}
                 try:
                     got = _native_exec.try_filter(self, t, preds, set(names), keep_dict=keep)
-                except Exception:
-                    got = None
+                except Exception as exc:
+                    got = _native_exec.swallowed(exc, "leaf filter")
                 if got is not None:
                     return got.select(names)
         return self.compile_and_run(node)
@@ -1478,8 +1478,7 @@ class CustomOpsCompiler(GraphCompiler):
         try:
             return join_engine.fused_join_aggregate(self, core, having, post_ops)
         except Exception as exc:        # a plan is fully native or not at all: never fail the query
-            _native_exec._decline(f"fused join + aggregate raised {type(exc).__name__}: {exc}")
-            return None
+            return _native_exec.swallowed(exc, "fused join + aggregate")
 
     def _materialize_barrier(self, plan):
         """Compute what sits below an aggregate result as a table, so the operator above works on it.
@@ -1871,7 +1870,7 @@ class CustomOpsCompiler(GraphCompiler):
             try:
                 _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops)
             except Exception as _exc:      # a plan is fully native or not at all: never fail the query
-                _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
+                _native = _native_exec.swallowed(_exc, "executor")
             if _native is not None:
                 return _native
         if try_fused_aggregate is not None:
@@ -1884,7 +1883,7 @@ class CustomOpsCompiler(GraphCompiler):
             try:
                 _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops, gpu_fallback=True)
             except Exception as _exc:
-                _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
+                _native = _native_exec.swallowed(_exc, "executor")
             if _native is not None:
                 return _native
 
@@ -3054,8 +3053,8 @@ class CustomOpsCompiler(GraphCompiler):
         keep = (deferred & set(names)) if distinct else frozenset()
         try:
             out = _native_exec.try_filter(self, scan.table, preds, set(names), keep_dict=keep)
-        except Exception:
-            out = None
+        except Exception as exc:
+            out = _native_exec.swallowed(exc, "leaf filter")
         if out is None:
             return None, post_ops
         out = pa.Table.from_arrays([out.column(n) for n in names],
@@ -3107,8 +3106,8 @@ class CustomOpsCompiler(GraphCompiler):
             else [bool(srt.descending)] * len(by)
         try:
             idx = _native_exec.try_filter_topk(self, table, preds, by, desc, lim.n)
-        except Exception:
-            return None
+        except Exception as exc:
+            return _native_exec.swallowed(exc, "filter + top-k")
         if idx is None:
             return None
         keep = table if proj is None else table.select(list(dict.fromkeys(src.values())))
@@ -3136,8 +3135,8 @@ class CustomOpsCompiler(GraphCompiler):
             return None
         try:
             out = _native_exec.try_filter(self, t, preds, None if needed is None else set(needed))
-        except Exception:
-            return None
+        except Exception as exc:
+            return _native_exec.swallowed(exc, "leaf filter")
         return None if out is None else out.replace_schema_metadata(t.schema.metadata)
 
     def _plan_to_table(self, plan) -> pa.Table:

@@ -884,10 +884,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var colmap = _lp(Int(F[1]) if fused else 0)                    # fused: program column -> arrays slot, or -(1 + partner column)
     if n_chunks < 1:
         return E_BAD_PLAN
-    if fused:
-        if not _fused_exact(F, arrays, stride_a, n_chunks, n_cols, dtypes):
-            return E_INEXACT
-    elif not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
+    if not fused and not _i64_cols_exact(arrays, stride_a, n_chunks, n_cols, dtypes):
         return E_INEXACT
 
     # ── 1. chunk table for the interpreter: row_start, row_end, per column base address ──────
@@ -1000,6 +997,10 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         K.free()
         tbl.free()
         return E_BAD_KEY
+    if fused and not _fused_exact(F, arrays, stride_a, n_chunks, n_cols, dtypes):
+        K.free()                                        # (after the key check: a declined key space costs no value passes)
+        tbl.free()
+        return E_INEXACT
 
     # ── fused join + aggregate (version 3): the pre-filter program over the fact table, the partner maps,
     #    and the block front stage that filters, looks partners up and gathers their columns (see
