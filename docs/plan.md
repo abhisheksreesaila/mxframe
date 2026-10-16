@@ -614,10 +614,12 @@ Needs: F-065 · From F-065 (2026-10-16): the main reason SQL-phrased TPC-H is 8/
   - Known: `sum(int64) + 1` past 2^53 still raises ArrowInvalid (the SQL front end turns the literal into 1.0, `_float_expr`); only `/` is lossy-by-design like DuckDB
 - [x] SQL Q14 and Q17 fully native (`scripts/native_coverage.py --sql`), equal to DuckDB. Met. **SQL 8/22 -> 10/22** (Q1, 3, 4, 5, 6, 11, 12, 14, 17, 19); DataFrame coverage 17/22 unchanged. Q8 moved to F-071 below: its aggregates already run in `try_execute_join` and equal DuckDB, but one Arrow `dictionary_encode` of 10,000 rows (the supplier x nation partner's `n_name`) remains
 
-## F-069 Float and wide group keys in the native executor [todo]
+## F-069 Float and wide group keys in the native executor [review]
 From F-065: SQL Q10 and Q18 group by float / wide keys as the specification writes them, and the executor declines
-- [ ] float64 group keys (exact bit equality, NaN and -0.0 like DuckDB) and composite keys wider than the direct-address space take a hashed native group-by instead of declining
-- [ ] SQL Q10, Q18 fully native and equal to DuckDB; no DataFrame query slower
+- [x] float32 / float64 group keys (exact bit equality; every NaN one group, -0.0 with 0.0, NaN after +inf as DuckDB) and key tuples wider than direct addressing take a partitioned hash aggregate (`kernels_aot/hashagg_cpu.mojo`, design in docs/design/mojo-executor.md "Hashed groups") in the single-table executor and the fused join v3 (float partner columns, wide fact / partner keys, Q10's per-customer keys). Output in key order; NULL in a key declines; DISTINCT over float keys declines early. `tests/test_f069_hashed_groups.py` (28, vs DuckDB, path asserts via `nx.last_group_path()`; all failed on the old code), old tests that pinned the declines updated.
+- [x] reproducible mode follows F-064's defined order (bit-identical across runs and thread counts, equal to the NumPy reference)
+- [x] SQL Q10, Q18 fully native and equal to DuckDB at SF0.17 (test); full `scripts/native_coverage.py --sql` run still to do
+- [ ] **no DataFrame query slower / not slower than the old path: NOT MET.** One rough noisy A/B (6M rows, load 4-15; ms new / old executor / Arrow): float key 50 groups 7 / 45 / 43; 5k groups 37 / 48 / 42; fused float partner key 17 / 57 / 104; 3 wide int64 keys 5k groups 20 / 99 / 663; but float key 1M groups 767 / 328 / 345; float + wide key with filter 4049 / 850 / 933; wide int64 pair 1M groups 22,234 / 14,349 (old dense-compact) / 1,181 (Arrow); fused wide fact keys 15,313 / 10,215 / 892. The many-group cases are slow: probable cause (unmeasured) the final key-order sort of G groups (`_key_sort_values` / `_merge_sort`, single-threaded) and per-group record traffic; profile before tuning. Not in the committed tests.
 
 ## F-070 NaN compares like DuckDB [todo]
 From the F-068 review (2026-10-16): pre-existing silent wrong answer
