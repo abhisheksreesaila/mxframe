@@ -873,3 +873,13 @@ Found by the F-086 developer (2026-10-16)
 Found by the F-087 developer (2026-10-16)
 - [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
 - [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+
+## F-095 SQL over tables with uppercase or quoted column names [todo]
+Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
+- [ ] the SQL front end lowercases identifiers; a table with `CustomerID` or `"Order Date"` columns may fail to resolve (or resolve wrongly when two names differ only by case). Probe DuckDB's rules (unquoted identifiers are case-insensitive, quoted are case-sensitive; output keeps the source column's case) and match them on every SQL path (SELECT, `*`, WHERE, GROUP BY, ORDER BY, JOIN ON / USING, subqueries)
+- [ ] DuckDB-checked tests over tables whose names have uppercase, spaces, and a case-only clash; fails before where wrong
+
+## F-096 SQL JOIN ON an expression [todo]
+Found by the F-087 developer (2026-10-16)
+- [ ] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
+- [ ] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
