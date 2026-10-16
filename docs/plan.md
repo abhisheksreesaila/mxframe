@@ -918,3 +918,8 @@ Found by the F-092 developer and review (2026-10-16)
 Found by the F-094 developer (2026-10-16)
 - [ ] `COALESCE(expr, ...)` (and `IFNULL` / `NULLIF` if sqlglot parses them) and `expr IS NULL` over any expression (not only a column) are unsupported in the SQL front end. Map them onto the engine's null handling (`is_null` from F-086, a coalesce / fill_null expression), Arrow path; native where the bytecode can
 - [ ] DuckDB-checked tests: COALESCE over columns / literals / expressions with NULLs in SELECT, WHERE, GROUP BY; NULLIF with zero divisors; `(a + b) IS NULL`; fails before
+
+## F-101 Integer modulo in the native bytecode [todo]
+From the F-094 review (2026-10-16); speed
+- [ ] a `%` anywhere in WHERE moves the whole filter off the native path: `WHERE a > 500 GROUP BY k` runs native in 5 ms at 2M rows, adding `AND a % 7 = 0` takes it to `cpu_aot` at 50 ms. An integer `mod` op in the bytecode (sign follows the dividend; zero divisor gives NULL, so decline when the divisor column can be 0, or test it), CPU and GPU kernels
+- [ ] tests: the filter stays native (path asserted), equals DuckDB with negatives and a zero divisor; quiet-machine timing back near the no-`%` query
