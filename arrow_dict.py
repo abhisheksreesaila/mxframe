@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 
 __all__ = ["is_dictionary", "decode", "combine_dictionary", "encode_key", "dict_predicate"]
@@ -66,6 +66,18 @@ _NP_OF_ARROW = {pa.int8(): np.int8, pa.int16(): np.int16, pa.int32(): np.int32, 
                 pa.uint8(): np.uint8, pa.uint16(): np.uint16, pa.uint32(): np.uint32}
 
 
+def _encode_float(arr):
+    """``dictionary_encode`` for a float key with SQL equality (F-077): -0.0 and 0.0 are one group
+    and so are all NaNs. Each group still reports the value of its first row, like DuckDB."""
+    enc = pc.dictionary_encode(_canonical_floats(arr))
+    if enc.indices.null_count or not len(arr):
+        return enc
+    idx = _np_of(enc.indices, zero_copy_only=False)
+    run = np.maximum.accumulate(idx)                      # codes are numbered by first appearance
+    first = np.flatnonzero(np.concatenate(([True], run[1:] != run[:-1])))
+    return pa.DictionaryArray.from_arrays(enc.indices, pc.take(arr, _npa(first.astype(np.int64))))
+
+
 def encode_key(col):
     """Group-key encoding: an object with ``.indices`` and ``.dictionary``.
 
@@ -79,6 +91,8 @@ def encode_key(col):
         fast = _encode_int(arr)
         if fast is not None:
             return fast
+        if arr.type in (pa.float32(), pa.float64()):
+            return _encode_float(arr)
         return pc.dictionary_encode(arr)
     d = combine_dictionary(col)
     if d.null_count:
