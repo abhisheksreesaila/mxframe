@@ -815,7 +815,7 @@ Found by the F-077 review (2026-10-16); a silent wrong answer on main
 - [ ] DuckDB-checked tests: float partition key with NaN (two payloads), -0.0 / 0.0, NULL, ±inf; sum / count / rank over it; fails before
 - [ ] window `min` / `max` (numpy) propagate NaN; DuckDB's MAX is NaN when the frame holds one and MIN skips it (F-070 rule) (found by the F-070 developer)
 
-## F-082 Denormal floats are not flushed to zero [review]
+## F-082 Denormal floats are not flushed to zero [done]
 Found by the F-070 developer (2026-10-16); a silent wrong answer
 - [x] cause: Mojo's `parallelize` / `sync_parallelize` run every task with FTZ + DAZ set (MXCSR 0x9FE0, read with `stmxcsr` inside a task; main thread 0x1FA0). Not a compile flag, not a float32 conversion, not fast-math: any kernel that fanned out over threads read 5e-324 (and float32 1e-45) as 0. `fused_pipeline_cpu` fanned out from ~200,000 rows; the native executor, hash aggregate, group keys and joins from larger inputs (native: 20M rows `x > 0.0` counted 0 of 10M). The GPU kernels (float64 and float32), Arrow and the single-thread paths were right
 - [x] fix at the root: `kernels_aot/_fpenv.mojo` (`par`, `par_n`, `sync_par`) resets MXCSR to 0x1F80 at the start of every task; every `parallelize` / `sync_parallelize` in executor_cpu, pipeline_cpu, hashagg_cpu, groupkeys_cpu, joinsemi_cpu and kernels_aot now goes through it. Rebuilt with `scripts/build_pipeline.sh` (cpu, keys, join, aot) and hashes recorded. Rule: never call `parallelize` directly in kernels_aot
