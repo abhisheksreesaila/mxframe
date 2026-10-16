@@ -234,9 +234,26 @@ CONSTANTS = [
     "SELECT lsk FROM l WHERE qty * 2 > 5 * 5",
     "SELECT lsk FROM l WHERE qty > -(2 + 3) * 4",
     "SELECT SUM(qty) * 0.5 AS h FROM l WHERE qty < 2 * 10 + 5",
+    "SELECT lsk FROM l WHERE disc > 1e-3 * 2",
+    "SELECT lsk FROM l WHERE qty > 1.5e1 * 1",
+    "SELECT lsk FROM l WHERE qty < 2E1 + 3",
 ]
 
 
 @pytest.mark.parametrize("q", CONSTANTS)
 def test_constant_arithmetic_is_exact_like_sql_decimals(q):
+    _check(q)
+
+
+DATE32 = [
+    "SELECT k FROM dd WHERE dt >= DATE '1995-01-01'",
+    "SELECT k FROM dd WHERE dt < DATE '1995-06-07' + INTERVAL '1' DAY",
+    "SELECT k FROM dd WHERE dt BETWEEN DATE '1994-01-01' AND DATE '1995-12-31'",
+    "SELECT k FROM dd WHERE DATE '1996-01-01' <= dt",
+    "SELECT k FROM dd WHERE dt = DATE '1996-07-08'",
+]
+
+
+@pytest.mark.parametrize("q", DATE32)
+def test_date_literal_against_a_real_date32_column(q):
     _check(q)

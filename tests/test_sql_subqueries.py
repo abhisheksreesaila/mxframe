@@ -135,6 +135,8 @@ IN = [
     "SELECT s, SUM(v) AS tot FROM t WHERE k IN (SELECT k FROM u) GROUP BY s",
     "SELECT * FROM t WHERE k IN (SELECT k FROM u)",
     "SELECT k, v FROM t WHERE (k) IN (SELECT k FROM u)",
+    "SELECT k, v FROM t WHERE k IN (SELECT k + 0 FROM un)",
+    "SELECT k, v FROM t WHERE k IN (SELECT y - 3 FROM u WHERE u.k > 0)",
 ]
 
 
@@ -265,6 +267,11 @@ UNSUPPORTED = [
     ("SELECT k FROM t WHERE k + 1 IN (SELECT k FROM u)", "plain column"),
     ("SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k LIMIT 1)", "LIMIT"),
     ("SELECT k FROM t WHERE k IN (SELECT k FROM u UNION SELECT k FROM un)", "UNION"),
+    ("SELECT k, v FROM t WHERE v > (SELECT CASE WHEN MAX(y) > 5 THEN MAX(y) ELSE 1 END FROM u WHERE u.k = t.k)", "CASE"),
+    ("SELECT k, v FROM t WHERE v > (SELECT COALESCE(MAX(y), 1) FROM u WHERE u.k = t.k)", "COALESCE"),
+    ("SELECT k, v FROM t WHERE v > (SELECT MAX(y) IS NULL FROM u WHERE u.k = t.k)", "IS NULL"),
+    ("SELECT k, v FROM t WHERE k IN (SELECT y / 2 FROM u)", "float"),
+    ("SELECT k FROM t, u JOIN un ON u.k = un.k WHERE t.k = u.k", "mixed with JOIN"),
     ("WITH a(x, y) AS (SELECT k, v FROM t) SELECT x FROM a", "column list"),
     ("WITH RECURSIVE a AS (SELECT k FROM t) SELECT k FROM a", "RECURSIVE"),
 ]
@@ -285,3 +292,7 @@ def test_an_aggregate_in_the_outer_where_still_says_so():
 def test_an_aggregate_inside_a_subquery_in_where_is_not_an_outer_aggregate():
     got = mx.sql("SELECT k FROM t WHERE v = (SELECT MAX(v) FROM t)", **TABLES).compute(device="cpu")
     assert got.column("k").to_pylist() == [4]
+
+
+def test_a_correlated_aggregate_combined_by_arithmetic_is_still_decorrelated():
+    _check("SELECT k, v FROM t WHERE v > (SELECT 2 * MAX(y) - MIN(y) / 2 FROM u WHERE u.k = t.k)")

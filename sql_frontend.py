@@ -161,6 +161,21 @@ def _num_const(node: sge.Expression) -> Optional[Decimal]:
     return None
 
 
+def _null_on_empty(n: sge.Expression) -> bool:
+    """True when ``n`` is NULL over no rows: aggregates (not COUNT) under + - * / and numeric constants. A
+    correlated subquery is decorrelated to an inner join only for such an item."""
+    n = _unparen(n)
+    if isinstance(n, sge.AggFunc):
+        return not isinstance(n, sge.Count)
+    if isinstance(n, sge.Literal):
+        return not n.is_string
+    if isinstance(n, sge.Neg):
+        return _null_on_empty(n.this)
+    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div)):
+        return _null_on_empty(n.this) and _null_on_empty(n.expression) and bool(_aggs_in(n))
+    return False
+
+
 def _is_comma_join(join: sge.Join) -> bool:
     """FROM a, b: the join keys are in WHERE. (An explicit CROSS JOIN stays unsupported.)"""
     return (not join.args.get("on") and not join.args.get("using") and not join.args.get("side")
@@ -287,6 +302,8 @@ class _SQLTranslator:
         self._ctes: Dict[str, LogicalPlan] = {}
         self._ids = itertools.count()
         self._has_star = False
+        self._date_lit = False      # translating a comparison with a date32 column: DATE constants are dates
+        self._int_lits = False      # integer literals in arithmetic stay integers (IN (SELECT k + 0 ...))
         # comma joins: WHERE conditions not yet used as join keys; (table alias, column) -> its column in
         # the joined plan; aliases and output columns joined so far
         self._conj: List[sge.Expression] = []
@@ -294,9 +311,10 @@ class _SQLTranslator:
         self._joined: set = set()
         self._cur_cols: List[str] = []
 
-    def _child(self) -> "_SQLTranslator":
+    def _child(self, int_lits: bool = False) -> "_SQLTranslator":
         """A translator for a subquery: its own state, the same tables and WITH names."""
         c = _SQLTranslator(self._tables)
+        c._int_lits = int_lits
         c._ctes = dict(self._ctes)
         c._ids = self._ids
         return c
@@ -407,6 +425,10 @@ class _SQLTranslator:
         if from_clause is None:
             raise ValueError("No FROM clause found")
 
+        joins_ = node.args.get("joins") or []
+        if any(_is_comma_join(j) for j in joins_) and not all(_is_comma_join(j) for j in joins_):
+            raise NotImplementedError("comma joins (FROM a, b WHERE ...) mixed with JOIN ... ON are not supported: "
+                                      "write every join as JOIN ... ON, or every one as a comma join")
         plan, main_cols = self._scan(from_clause.this)
         # Seed the accumulated left-side schema with the main FROM table
         self._left_schema = set(main_cols)
@@ -740,19 +762,20 @@ class _SQLTranslator:
         left = self._expr(x).args[0]
         keys, rest = self._correlation(sel, what)
         i = next(self._ids)
+        int_lits = self._in_item_ints(x, item, what)
         if keys:
             if negated:
                 raise NotImplementedError("a correlated NOT IN (SELECT ...) is not supported (its NULL rules differ "
                                           "per outer row); use NOT EXISTS")
             _unsupported_shape(sel, what)
             items = [_alias(item, "__in")] + [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
-            inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
+            inner_plan = self._child(int_lits)._build_select(self._keyed_select(sel, rest, items))
             return Join(plan, inner_plan, [left] + [self._expr(o).args[0] for o, _ in keys],
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
         new.set("expressions", [_alias(item, "__in")])
         new.set("order", None)
-        inner_plan = self._child()._build_select(new)
+        inner_plan = self._child(int_lits)._build_select(new)
         if not negated:
             return Join(plan, inner_plan, [left], ["__in"], "semi")
         # NOT IN keeps a row with no partner when the subquery is empty, or when it has no NULL and the
@@ -763,6 +786,25 @@ class _SQLTranslator:
         anti = Join(plan, inner_plan, [left], ["__in"], "anti")
         return Filter(anti, (m == lit(1)) | ((m == lit(2)) & (col(left) == col(left))))
 
+    def _in_item_ints(self, x: sge.Column, item: sge.Expression, what: str) -> bool:
+        """Arithmetic in an IN subquery's item makes a float (integer literals are floats there), which cannot
+        join an integer key. When the key and every column of the item are integers (and there is no division)
+        the item is computed in integers; any other arithmetic against an integer key raises."""
+        ops = (sge.Add, sge.Sub, sge.Mul, sge.Div)
+        if not any(isinstance(n, ops) for n in item.walk()):
+            return False
+        kt = self._col_type(x)
+        if kt is None or not pa.types.is_integer(kt):
+            return False
+        cols = list(item.find_all(sge.Column))
+        ints = all((t := self._col_type(c)) is not None and pa.types.is_integer(t) for c in cols)
+        lits = all(str(n.this).isdigit() for n in item.find_all(sge.Literal) if not n.is_string)
+        if ints and lits and not any(isinstance(n, sge.Div) for n in item.walk()):
+            return True
+        raise NotImplementedError(f"{what}: the subquery computes {item.sql(dialect='duckdb')}, a float, against the "
+                                  f"integer column {x.sql(dialect='duckdb')}; keys of different types cannot join "
+                                  "(use integer columns and constants, without division)")
+
     def _scalar_form(self, plan, c: sge.Expression, _neg: bool):
         """``expr <op> (SELECT agg ... WHERE inner.k = outer.k)``: the aggregate per key, joined on the key."""
         sub = next(_unparen(s) for s in (c.this, c.expression)
@@ -771,9 +813,12 @@ class _SQLTranslator:
         sel = sub.this
         what = "correlated scalar subquery"
         self._check_scalar(sel, what)
-        if any(isinstance(a, sge.Count) for a in sel.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))):
-            raise NotImplementedError(f"{what} with COUNT is not supported: an outer row without partners must see 0, "
-                                      "which a join would drop")
+        item0 = _unparen(sel.expressions[0].this if isinstance(sel.expressions[0], sge.Alias) else sel.expressions[0])
+        if not _null_on_empty(item0):
+            raise NotImplementedError(
+                f"{what}: only aggregates other than COUNT combined by + - * / and constants are supported "
+                f"(got {item0.sql(dialect='duckdb')}): an outer row without partners must see the item's value on "
+                "no rows (NULL for these, but 0 for COUNT, or whatever CASE / COALESCE give), which a join would drop")
         keys, rest = self._correlation(sel, what)
         i = next(self._ids)
         item = sel.expressions[0]
@@ -1066,12 +1111,21 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what} is supported only as a condition joined by AND at the top of WHERE "
                                       "(it becomes a semi / anti join); not inside OR, NOT (...), CASE, SELECT or HAVING")
         d = _date_of(node)
-        if d is not None:
-            return lit((d - _EPOCH).days)                   # a day number, as the TPC-H Parquet dates are stored
+        if d is not None:                                   # next to a date32 column a date, else a day number
+            return lit(d) if self._date_lit else lit((d - _EPOCH).days)
+        if not self._date_lit and isinstance(node, _COMPARE + (sge.Between,)):
+            kids = [node.this, node.args["low"], node.args["high"]] if isinstance(node, sge.Between) \
+                else [node.this, node.expression]
+            if any(self._is_date_col(k) for k in kids):
+                self._date_lit = True
+                try:
+                    return self._expr(node)
+                finally:
+                    self._date_lit = False
         if isinstance(node, (sge.Add, sge.Sub, sge.Mul)):
             v = _num_const(node)
             if v is not None:
-                is_int = not any("." in str(x.this) for x in node.find_all(sge.Literal))
+                is_int = v == v.to_integral_value() and all(str(x.this).isdigit() for x in node.find_all(sge.Literal))
                 return lit(int(v)) if is_int else lit(float(v))
         if isinstance(node, sge.Extract):
             return self._extract(node)
@@ -1200,21 +1254,29 @@ class _SQLTranslator:
     # CASE WHEN helpers
     # ------------------------------------------------------------------
 
+    def _col_type(self, src: sge.Expression):
+        """The Arrow type of a plain column of one of the tables (looked up by name), else None."""
+        src = _unparen(src)
+        if isinstance(src, sge.Column):
+            for tbl in self._tables.values():
+                names = {n.lower(): n for n in tbl.schema.names}
+                if src.name.lower() in names:
+                    return tbl.schema.field(names[src.name.lower()]).type
+        return None
+
+    def _is_date_col(self, src: sge.Expression) -> bool:
+        t = self._col_type(src)
+        return t is not None and pa.types.is_date(t)
+
     def _extract(self, node: sge.Extract) -> Expr:
         """EXTRACT(YEAR FROM x): a date32 column through ``year()``; any other (integer day numbers since
         1970-01-01, as the TPC-H Parquet files store dates) through ``year_of_days()``."""
         if node.this.name.upper() != "YEAR":
             raise NotImplementedError(f"EXTRACT({node.this.name.upper()} FROM ...) is not supported, only YEAR")
         arg = self._expr(node.expression)
-        src = _unparen(node.expression)
-        if isinstance(src, sge.Column):
-            for tbl in self._tables.values():
-                names = {n.lower(): n for n in tbl.schema.names}
-                if src.name.lower() in names:
-                    t = tbl.schema.field(names[src.name.lower()]).type
-                    if pa.types.is_date(t) or pa.types.is_timestamp(t):
-                        return arg.year()
-                    break
+        t = self._col_type(node.expression)
+        if t is not None and (pa.types.is_date(t) or pa.types.is_timestamp(t)):
+            return arg.year()
         return arg.year_of_days()
 
     def _substring(self, node: sge.Substring) -> Expr:
@@ -1261,6 +1323,8 @@ class _SQLTranslator:
         operands of Add/Sub/Mul/Div avoids int64 vs float32 dtype mismatches in
         the MAX graph.
         """
+        if self._int_lits:
+            return self._expr(node)
         if isinstance(node, sge.Literal) and not node.is_string:
             return lit(float(node.this))
         if isinstance(node, sge.Neg) and isinstance(node.this, sge.Literal) and not node.this.is_string:
