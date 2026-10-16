@@ -2066,15 +2066,47 @@ class CustomOpsCompiler(GraphCompiler):
         agg = node if isinstance(node, Aggregate) else None
         if agg is None:
             return result
+        int_cols = None
         for i, e in enumerate(agg.aggs):
-            if e.op != "count":
+            minmax = e.op in ("min", "max") and e.args and getattr(e.args[0], "op", None) == "col"
+            if e.op != "count" and not minmax:
                 continue
             name = e._alias or f"agg_{i}"
             idx = result.schema.get_field_index(name)
-            if idx >= 0 and not pa.types.is_integer(result.schema.field(idx).type):
-                col = result.column(idx)
+            if idx < 0 or pa.types.is_integer(result.schema.field(idx).type):
+                continue
+            col = result.column(idx)
+            if e.op == "count":
                 result = result.set_column(idx, name, pc.cast(pc.round(col), pa.int64()))
+                continue
+            # F-090: MIN / MAX of an integer column is that integer type (DuckDB), not the kernels' float
+            if int_cols is None:
+                int_cols = cls._integer_columns(agg.input)
+            want = int_cols.get(e.args[0].args[0])
+            if want is not None and pa.types.is_floating(col.type):
+                try:
+                    result = result.set_column(idx, name, pc.cast(col, want))   # safe cast: a fraction raises
+                except pa.ArrowInvalid:
+                    pass
         return result
+
+    @classmethod
+    def _integer_columns(cls, plan) -> dict:
+        """{column name: integer type} for the columns of *plan* that are plain integer columns of a
+        table (through filters, sorts, joins and renaming selects); other columns are absent."""
+        if isinstance(plan, Scan):
+            return {f.name: f.type for f in plan.table.schema if pa.types.is_integer(f.type)}
+        if isinstance(plan, (Filter, Sort, Limit, Distinct, Tail)):
+            return cls._integer_columns(plan.input)
+        if isinstance(plan, Join):
+            left, right = cls._integer_columns(plan.left), cls._integer_columns(plan.right)
+            return {n: t for n, t in {**right, **left}.items()
+                    if n not in left or n not in right or left[n] == right[n]}
+        if isinstance(plan, Project):
+            inner = cls._integer_columns(plan.input)
+            return {(e._alias or e.args[0]): inner[e.args[0]]
+                    for e in plan.exprs if e.op == "col" and e.args[0] in inner}
+        return {}
 
     def _compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
         """Optimized execution with three-tier caching + post-ops.
@@ -3607,7 +3639,8 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _common_key_type(a, b):
         """The type both join key types convert to without changing any value, else None
-        (int32 with int64 -> int64; float32 with float64 -> float64; integers with floats or
+        (int32 with int64 -> int64; float32 with float64 -> float64; an integer with a float is
+        paired by join_engine.int_float_pair when exact; numbers with
         strings never match silently)."""
         if pa.types.is_dictionary(a):
             a = a.value_type
@@ -3643,6 +3676,7 @@ class CustomOpsCompiler(GraphCompiler):
         if len(left_cols) != len(right_cols) or not left_cols:
             raise ValueError("join key column lists must be non-empty and equal length")
 
+        from .join_engine import int_float_pair
         n_left = len(left_table)
         paired_codes = []
         for left_name, right_name in zip(left_cols, right_cols):
@@ -3650,12 +3684,15 @@ class CustomOpsCompiler(GraphCompiler):
             right_arr = _combine(right_table.column(right_name))
             if left_arr.type != right_arr.type:
                 common = CustomOpsCompiler._common_key_type(left_arr.type, right_arr.type)
-                if common is None:
+                if common is not None:
+                    left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
+                elif (pair := int_float_pair(left_arr, right_arr)) is not None:
+                    left_arr, right_arr = pair
+                else:
                     raise TypeError(
                         f"join key types differ: {left_name}={left_arr.type}, "
                         f"{right_name}={right_arr.type}"
                     )
-                left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
             left_arr, right_arr = _canonical_floats(left_arr), _canonical_floats(right_arr)   # F-079
 
             if (

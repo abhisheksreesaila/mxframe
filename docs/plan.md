@@ -848,12 +848,12 @@ Found by the F-083 review (2026-10-16)
 - [ ] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
 - [ ] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
 
-## F-090 IN (SELECT max(i) ...) join key types differ [todo]
+## F-090 IN (SELECT max(i) ...) join key types differ [review]
 Found by the F-083 review (2026-10-16)
 - [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB
 - [ ] DuckDB-checked tests: IN / NOT IN over max / min / sum / count subqueries against int and float columns; fails before
 
-## F-091 Window lag / lead: NULL stays NULL [todo]
+## F-091 Window lag / lead: NULL stays NULL [review]
 Found by the F-084 review (2026-10-16); a silent wrong answer on main
 - [ ] `lag(v)` over `[1, NULL, 3]` gives `[nan, 1.0, nan]`; DuckDB `[NULL, 1.0, NULL]`: lag / lead turn NULL into NaN and fill with NaN. Shift the Arrow array with its validity (fill NULL, or the given default); keep the input dtype
 - [ ] DuckDB-checked tests: lag / lead with offsets 1 and 2, defaults, partitions, ORDER BY with NaN / NULL keys (F-084 order), int / float / string columns; fails before
