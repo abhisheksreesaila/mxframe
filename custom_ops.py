@@ -364,6 +364,30 @@ def _order_codes(a, descending: bool = False) -> np.ndarray:
     return codes
 
 
+def _shift_rows(src, rows, args, lead):
+    """lag / lead: for the rows of one ordered partition, record the row each one reads (-1: none)."""
+    k = int(args[1]) if len(args) > 1 and args[1] is not None else 1
+    m = len(rows)
+    if k < 0:
+        k, lead = -k, not lead
+    if k >= m:
+        return
+    if lead:
+        src[rows[:m - k]] = rows[k:]
+    else:
+        src[rows[k:]] = rows[:m - k]
+
+
+def _take_shifted(arr, src, args):
+    """The input array gathered at *src* (-1 gives NULL, or the default); dtype and NULLs kept."""
+    none = src < 0
+    out = pc.take(arr, pa.array(np.where(none, 0, src), mask=none) if len(arr) else pa.nulls(len(src), pa.int64()))
+    default = args[2] if len(args) > 2 else None
+    if default is not None:           # only rows that read nothing get it; a source NULL stays NULL
+        out = pc.if_else(pa.array(none), pa.scalar(default, type=out.type), out)
+    return out
+
+
 def _window_rank(a, descending: bool = False) -> np.ndarray:
     """Standard competition ranking: ties share rank, gaps follow (1,2,2,4...)."""
     codes = _order_codes(a, descending)
@@ -801,22 +825,10 @@ class CustomOpsCompiler(GraphCompiler):
             a = self._eval_expr_arrow(args[0], table)
             out, nul = _cum_sum_skip_null(_np_of(a, zero_copy_only=False).astype(np.float64), _np_of(pc.is_valid(a)))
             return _npa(np.ma.array(out, mask=nul)) if nul.any() else _npa(out)
-        if op == "lag":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-            default = args[2] if len(args) > 2 else None
-            out = np.empty(len(arr), dtype=np.float64)
-            out[:n_shift] = float(default) if default is not None else np.nan
-            out[n_shift:] = arr[:-n_shift]
-            return _npa(out)
-        if op == "lead":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-            default = args[2] if len(args) > 2 else None
-            out = np.empty(len(arr), dtype=np.float64)
-            out[-n_shift:] = float(default) if default is not None else np.nan
-            out[:-n_shift] = arr[n_shift:]
-            return _npa(out)
+        if op in ("lag", "lead"):
+            src = np.full(table.num_rows, -1, dtype=np.int64)
+            _shift_rows(src, np.arange(table.num_rows), args, op == "lead")
+            return _take_shifted(self._eval_expr_arrow(args[0], table), src, args)
         if op == "window":
             return self._eval_window_arrow(args[0], args[1], table)
         raise NotImplementedError(f"_eval_expr_arrow: unsupported op '{op}'")
@@ -1377,6 +1389,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         okeys = [_order_codes(table.column(c), descending) for c in order_by] if order_by else []
         null_out = np.zeros(n, dtype=bool)          # rows whose window value is NULL
+        shift_src = np.full(n, -1, dtype=np.int64)  # lag / lead: source row per row, -1 for none
+        shifted = None
 
         def values(e, sub):
             a = self._eval_expr_arrow(e, sub)
@@ -1419,20 +1433,10 @@ class CustomOpsCompiler(GraphCompiler):
                 arr, valid = values(args[0], sub)
                 val, nul = _cum_sum_skip_null(arr, valid)
                 null_out[ordered_indices[nul]] = True
-            elif op == "lag":
-                n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-                fill    = args[2] if len(args) > 2 else None
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = np.empty(m, dtype=np.float64)
-                val[:n_shift] = float(fill) if fill is not None else np.nan
-                val[n_shift:] = arr[:-n_shift]
-            elif op == "lead":
-                n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-                fill    = args[2] if len(args) > 2 else None
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = np.empty(m, dtype=np.float64)
-                val[-n_shift:] = float(fill) if fill is not None else np.nan
-                val[:-n_shift] = arr[n_shift:]
+            elif op in ("lag", "lead"):
+                _shift_rows(shift_src, ordered_indices, args, op == "lead")
+                shifted = op
+                continue
             else:
                 raise NotImplementedError(
                     f"_eval_window_arrow: unsupported inner op '{op}'"
@@ -1440,6 +1444,8 @@ class CustomOpsCompiler(GraphCompiler):
 
             result[ordered_indices] = val
 
+        if shifted:                       # lag / lead keep the input's type and its NULLs
+            return _take_shifted(self._eval_expr_arrow(inner_expr.args[0], table), shift_src, inner_expr.args)
         if null_out.any():
             return _npa(np.ma.array(result, mask=null_out))
         return _npa(result, type=pa.float64())
