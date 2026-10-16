@@ -635,7 +635,9 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol, cpu_rows=None):
         f = sp.gpu_fraction if sp.wins else (1.0 if sp.gpu_alone_ms < sp.cpu_alone_ms else 0.0)
     from . import native_exec
     repro = native_exec.reproducible()          # the router's worker threads do not inherit the context variable
-    if repro and f > 0 and not pk.gpu_reproducible_fits(prog, n_groups):
+    if repro and pol.gpu_fraction is None:
+        f = 0.0     # the model's fraction is refined by every run: only an explicit gpu_fraction splits reproducibly
+    elif repro and f > 0 and not pk.gpu_reproducible_fits(prog, n_groups):
         f = 0.0     # the GPU would decline its share: a failed share redone on the CPU would add the rows in a different order than the CPU alone
     k = int(round(n_rows * f))
     dc = entry.dc

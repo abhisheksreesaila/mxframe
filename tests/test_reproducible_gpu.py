@@ -116,13 +116,15 @@ def test_default_mode_gpu_result_agrees_with_reproducible_mode_to_rounding():
 def test_the_environment_variable_runs_the_ordered_gpu_kernel(monkeypatch):
     """MXFRAME_REPRODUCIBLE=1 with no flag: a 200-group shape (mode 4) gives the same bits every run on the GPU."""
     monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
-    plan = _revenue(_fact(2_000_000, 200))
+    t = _fact(2_000_000, 200)
+    plan = _revenue(t)
     bad, total = _differing_groups(lambda: plan.compute(device="gpu"))
     assert plan.last_compile_provenance["path"] == "fused_pipeline_gpu"
     assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
-    monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
-    runs = [_bits(plan.compute(device="gpu", reproducible=False)) for _ in range(RUNS)]
-    assert any(int((runs[0][0] != r[0]).sum()) for r in runs[1:])     # reproducible=False overrides it: atomics again
+    from mxframe import pipeline_exec
+    prog, _ = pipeline_exec._bind(*pipeline_exec._table_of(plan.plan)[:2], t)
+    mode = lambda repro: pk._load_gpu().mx_pipeline_gpu_mode(200, prog.n_slots, int(prog.code[1]), int(len(prog.code)), repro)
+    assert (mode(0), mode(1)) == (1, 4)       # atomics in the default mode, the ordered table (mode 4) when reproducible
 
 
 # ── a forced CPU+GPU split ───────────────────────────────────────────────────
@@ -153,6 +155,25 @@ def test_forced_split_gives_the_same_bits_every_run(groups, path):
     assert prov["path"] == path
     if path == "fused_pipeline_split":
         assert prov["coproc"]["gpu_fraction"] == 0.5
+    assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
+
+
+@needs_gpu
+def test_a_resident_split_with_no_explicit_fraction_runs_the_cpu_defined_order():
+    """The policy `auto` sets for a predicted split has no gpu_fraction (the model picks it, refined every run):
+    with reproducible=True `_split` gives the GPU no share, so the bits are the same every run."""
+    cf.clear_residency()
+    plan = _revenue(_fact(2_000_000, 200))
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        plan.compute(device="cpu")
+        assert cf.wait_for_uploads(60)
+
+    def run():
+        with cf.policy(min_upload_bytes=0):
+            return plan.compute(device="cpu", reproducible=True)
+
+    bad, total = _differing_groups(run, runs=10)
+    assert plan.last_compile_provenance["coproc"]["gpu_fraction"] == 0.0
     assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
 
 
