@@ -657,6 +657,8 @@ _gpu_init_lock = threading.RLock()
 
 def _get_cuda_driver() -> Optional["_CUDADriver"]:
     global _cuda_driver
+    if _cuda_driver is not None:     # lock-free: a DeviceArray finalizer may run inside the init below (F-107)
+        return _cuda_driver
     with _gpu_init_lock:
         if _cuda_driver is None:
             try:
