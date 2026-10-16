@@ -228,7 +228,9 @@ class LazyFrame:
                          CPU↔GPU link and GPU start-up, and run it on the cheaper one.
                          A GPU error reruns the query on CPU (warning once per query shape).
                 "cpu"  — always run on CPU.
-                "gpu"  — run on GPU; raises RuntimeError if no GPU is available.
+                "gpu"  — run on GPU; raises RuntimeError if no GPU is available. A piece (aggregate,
+                         join, sort) that does not fit the GPU's free memory, or runs out of it, is
+                         rerun on the CPU with a warning (`explain(include_runtime=True)` says why).
             verbose: if True, print compile/execute timing and cache status.
             optimize: if True (default), run logical plan optimization passes first.
             validate: if True (default), validate logical plan invariants before execution.
@@ -237,7 +239,8 @@ class LazyFrame:
                 query: any "gpu" value runs the query on GPU, all "cpu" on CPU.
             gpu_fraction: auto only; fixed GPU share of rows when a fused aggregate
                 co-processes on CPU and GPU (default: balanced from calibration).
-            strict: auto only; raise GPU errors instead of falling back to CPU.
+            strict: raise GPU errors, including a piece that does not fit the GPU's memory or runs
+                out of it (a `MemoryError` with the estimate), instead of falling back to CPU.
             profile: auto only; record the actual query time next to the estimate
                 (see `last_auto_decision`). Per-operator timings that refine the
                 calibration arrive with per-operator placement.
@@ -269,7 +272,8 @@ class LazyFrame:
 
         self._last_optimizer_trace = list(optimizer_trace or [])
         if device != "auto":
-            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace)
+            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace,
+                                          strict=strict)
             self._last_compile_provenance = prov
             return result
 
@@ -282,7 +286,11 @@ class LazyFrame:
         t0 = _t.perf_counter()
         if decision.device == "gpu":
             try:
-                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace)
+                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace,
+                                              strict=strict, auto=True)
+                if prov.get("gpu_pieces_oom"):      # a piece ran out of GPU memory and went to the CPU (F-056)
+                    _am.remember_gpu_failure(plan)
+                decision.pieces = prov.get("gpu_pieces", "")
             except Exception as err:
                 if strict:
                     raise
@@ -732,9 +740,17 @@ class _GPUGroupBy:
 
 
 
-def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None):
-    """Execute an already optimized plan on one device; returns (result, provenance)."""
+def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,
+                   auto: bool = False):
+    """Execute an already optimized plan on one device; returns (result, provenance). A GPU piece that
+    left the GPU for memory reasons is listed in the provenance as ``gpu_pieces`` (F-056)."""
+    from mxframe import gpu_budget
     from mxframe.custom_ops import CustomOpsCompiler
     compiler = CustomOpsCompiler(device=device)
-    result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
-    return result, dict(compiler.last_compile_provenance or {})
+    with gpu_budget.track(strict=strict, device="auto" if auto else device) as run:
+        result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
+    prov = dict(compiler.last_compile_provenance or {})
+    if run.events:
+        prov["gpu_pieces"] = "; ".join(run.lines)
+        prov["gpu_pieces_oom"] = run.oom
+    return result, prov

@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
+from . import gpu_budget
 from ._lazy_pc import pc
 
 from .lazy_frame import (join_output_names, Scan, Filter, Project, Aggregate, Sort, Limit,
@@ -565,7 +566,11 @@ def semi_select(probe: np.ndarray, build: np.ndarray, max_key: int) -> Optional[
 def inner_pairs(comp, probe_keys: np.ndarray, build_keys: np.ndarray):
     """(probe_idx, build_idx) int32 pairs of the equal keys on the session device."""
     if comp._session_device == "gpu" and comp._aot_gpu is not None:
-        return comp._aot_gpu.hash_join(probe_keys, build_keys)
+        n_p, n_b = len(probe_keys), len(build_keys)
+        size = max(int(probe_keys.max(initial=0)), int(build_keys.max(initial=0))) + 1 if n_p and n_b else 0
+        return gpu_budget.run_piece(          # F-056: over the GPU's free memory, or out of it: the CPU join
+            "join", gpu_budget.join_bytes(n_p, n_b, size), lambda: comp._aot_gpu.hash_join(probe_keys, build_keys),
+            lambda: comp._hash_join_mojo_cpu(probe_keys, build_keys), shape=(n_p, n_b, size))
     if comp._session_device == "gpu" and comp._aot is None:
         return comp._hash_join_mojo_gpu(probe_keys, build_keys)
     return comp._hash_join_mojo_cpu(probe_keys, build_keys)
@@ -592,7 +597,9 @@ def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = F
     if table.num_columns == 0:
         return table
     if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
-        return comp._aot_gpu.gather_table(table, idx)
+        return gpu_budget.run_piece(
+            "gather", gpu_budget.gather_bytes(table, len(idx)), lambda: comp._aot_gpu.gather_table(table, idx),
+            lambda: _take_rows(table, idx), shape=(table.num_rows, len(idx), table.num_columns))
     from . import native_exec
     out = native_exec.try_gather(comp, table, idx, decode_dicts)
     if out is not None:

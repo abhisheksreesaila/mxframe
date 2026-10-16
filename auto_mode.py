@@ -305,6 +305,7 @@ class AutoDecision:
     coproc: Optional[dict] = None     # set when a fused aggregate co-processed on cpu+gpu
     split: bool = False               # a cpu decision whose fused aggregate may split with the gpu
     cpu_path: str = ""                # which CPU path runs, and why (cpu decisions only)
+    pieces: str = ""                  # GPU pieces that ran on the CPU for memory reasons (F-056)
 
     def explain(self) -> str:
         head = f"auto -> {self.device}  reason: {self.reason}"
@@ -312,6 +313,8 @@ class AutoDecision:
             head += "  [fell back to cpu after a gpu error]"
         if self.cpu_path and self.device == "cpu":
             head += f"\n  cpu path: {self.cpu_path}"
+        if self.pieces:
+            head += "".join(f"\n  gpu piece: {p}" for p in self.pieces.split("; "))
         if self.estimate is None:
             return head
         e = self.estimate

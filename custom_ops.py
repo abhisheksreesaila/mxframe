@@ -73,6 +73,7 @@ MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
 RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
+from . import gpu_budget
 from . import sort_check as _sort_check
 from .sort_check import (is_sorted_permutation as _is_sorted_permutation, is_sorted_topk as _is_sorted_topk,
                          warn_fallback as _warn_radix_fallback)
@@ -2720,18 +2721,26 @@ class CustomOpsCompiler(GraphCompiler):
         # ── GPU path ────────────────────────────────────────────────────────
         # Phase 5: prefer AOT GPU sort (no JIT, cached key array, AOT gather)
         if self._aot_gpu is not None:
-            sorted_indices = self._aot_gpu.sort_topk(
-                composite_key, k=k,
-                descending=False,  # _encode_sort_key already flips keys for descending
-            )
-            if _is_sorted_topk(composite_key, sorted_indices, k):
-                return self._aot_gpu.gather_table(table, sorted_indices)
-            # F-055: a kernel that ran out of GPU memory only prints an `oom log` and returns a wrong
-            # order (seen when another process held the GPU's memory): redo the sort on the CPU.
-            _sort_check.gpu_sort_fallbacks += 1
-            _warn_radix_fallback("the GPU sort returned a wrong order (out of GPU memory?)")
-            sorted_indices = np.argsort(composite_key, kind="stable")[:k]
-            return pc.take(table, _npa(sorted_indices.astype(np.int64)))
+            def cpu_sort():
+                idx = np.argsort(composite_key, kind="stable")[:k]
+                return pc.take(table, _npa(idx.astype(np.int64)))
+
+            def gpu_sort():
+                sorted_indices = self._aot_gpu.sort_topk(
+                    composite_key, k=k,
+                    descending=False,  # _encode_sort_key already flips keys for descending
+                )
+                if _is_sorted_topk(composite_key, sorted_indices, k):
+                    return self._aot_gpu.gather_table(table, sorted_indices)
+                # F-055: a kernel that ran out of GPU memory only prints an `oom log` and returns a wrong
+                # order (seen when another process held the GPU's memory): redo the sort on the CPU.
+                _sort_check.gpu_sort_fallbacks += 1
+                _warn_radix_fallback("the GPU sort returned a wrong order (out of GPU memory?)")
+                return cpu_sort()
+            # F-056: over the GPU's free memory, or out of it: the stable CPU argsort gives the same order
+            return gpu_budget.run_piece(
+                "sort", gpu_budget.sort_bytes(N, composite_key.itemsize) + gpu_budget.gather_bytes(table, k),
+                gpu_sort, cpu_sort, shape=(N, k, table.num_columns))
 
         # Fallback: MAX Graph bitonic sort + numpy gather
         cache_key = ("sort_indices", N, self._session_device)
@@ -3187,16 +3196,9 @@ class CustomOpsCompiler(GraphCompiler):
             left_table, right_table, left_on, right_on
         )
 
-        # Route by session device: GPU join kernels for GPU sessions,
-        # CPU join kernels for CPU sessions.
-        # Phase 4: AOT GPU path (no MAX Graph JIT, buffer caching, device-resident gather)
-        if self._session_device == "gpu" and self._aot_gpu is not None:
-            left_idx, right_idx = self._aot_gpu.hash_join(left_keys, right_keys)
-        elif self._session_device == "gpu" and self._aot is None:
-            # last resort: MAX Graph join (JIT); with CPU AOT present, host arrays join there
-            left_idx, right_idx = self._hash_join_mojo_gpu(left_keys, right_keys)
-        else:
-            left_idx, right_idx = self._hash_join_mojo_cpu(left_keys, right_keys)
+        # Route by session device (GPU join kernels for GPU sessions, CPU kernels otherwise): `inner_pairs`
+        from .join_engine import inner_pairs
+        left_idx, right_idx = inner_pairs(self, left_keys, right_keys)
 
         n_result = len(left_idx)
 
@@ -3204,8 +3206,11 @@ class CustomOpsCompiler(GraphCompiler):
         # Phase 4: AOT GPU gather (single index H2D, cached source columns).
         # Fallback: GPU MAX Graph gather for large results, PyArrow for small.
         if self._session_device == "gpu" and self._aot_gpu is not None and n_result > 0:
-            left_take  = self._aot_gpu.gather_table(left_table,  left_idx)
-            right_take = self._aot_gpu.gather_table(right_table, right_idx)
+            def gather(t, ix):
+                return gpu_budget.run_piece(
+                    "gather", gpu_budget.gather_bytes(t, len(ix)), lambda: self._aot_gpu.gather_table(t, ix),
+                    lambda: _take_rows(t, ix), shape=(t.num_rows, len(ix), t.num_columns))
+            left_take, right_take = gather(left_table, left_idx), gather(right_table, right_idx)
         else:
             left_take = _take_rows(left_table, left_idx)
             right_take = _take_rows(right_table, right_idx)
