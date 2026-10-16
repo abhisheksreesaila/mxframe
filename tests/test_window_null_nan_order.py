@@ -88,3 +88,34 @@ def test_window_dtype_is_float64():
     out = LazyFrame(t).with_columns(col("v").max().over("k").alias("r")).compute(device="cpu")
     assert out.schema.field("r").type == pa.float64()
     assert out.column("r").to_pylist() == [4.0, 4.0]
+
+
+# sum / mean / cum_sum skip NULLs: k=1 leading NULLs then values, k=2 a NaN among values,
+# k=3 all NULL, k=4 no NULLs
+SK = [1, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4]
+SV = [None, None, 2.0, None, 5.0, NAN, 1.0, None, None, 3.0, 4.0]
+SO = [1.0, 2, 3, 4, 5, 1, 2, 1, 2, 2, 1]
+
+
+def _sum_table(typ):
+    return pa.table({"k": pa.array(SK, pa.int64()), "v": pa.array(SV, typ), "o": pa.array(SO, typ),
+                     "id": pa.array(range(len(SK)), pa.int64())})
+
+
+@pytest.mark.parametrize("typ", TYPES, ids=str)
+@pytest.mark.parametrize("op,sql", [("sum", "sum"), ("mean", "avg")])
+def test_window_sum_mean_skip_null_and_give_null_when_none_valid(typ, op, sql):
+    t = _sum_table(typ)
+    _same(_mx(t, getattr(col("v"), op)().over("k")), _duck(t, f"{sql}(v) OVER (PARTITION BY k)"))
+
+
+@pytest.mark.parametrize("typ", TYPES, ids=str)
+def test_running_sum_is_null_until_first_valid_value(typ):
+    t = _sum_table(typ)
+    expr = col("v").cum_sum().over("k", order_by="o")
+    _same(_mx(t, expr), _duck(t, "sum(v) OVER (PARTITION BY k ORDER BY o, id ROWS UNBOUNDED PRECEDING)"))
+
+
+def test_running_sum_without_partition_skips_nulls():
+    t = pa.table({"v": [None, 1.0, None, 2.0], "id": [0, 1, 2, 3]})
+    assert _mx(t, col("v").cum_sum().over(order_by="id")) == [None, 1.0, 1.0, 3.0]

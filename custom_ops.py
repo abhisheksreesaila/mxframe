@@ -334,6 +334,12 @@ def _min_skip_nan(ok):
     return real.min() if real.size else np.nan
 
 
+def _cum_sum_skip_null(arr, valid):
+    """Running sum over valid values: NULL until the first valid one, then carried on (NaN
+    propagates). Returns (values, null mask)."""
+    return np.cumsum(np.where(valid, arr, 0.0)), np.cumsum(valid) == 0
+
+
 def _order_codes(a, descending: bool = False) -> np.ndarray:
     """int64 sort code per row, equal for rows that tie in a window ORDER BY like DuckDB: NaN is the
     largest value (so first under DESC), -0.0 ties with 0.0, NULL is last in both directions and
@@ -792,8 +798,9 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "dense_rank":
             return _npa(_window_dense_rank(self._eval_expr_arrow(args[0], table)))
         if op == "cum_sum":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            return _npa(np.cumsum(arr))
+            a = self._eval_expr_arrow(args[0], table)
+            out, nul = _cum_sum_skip_null(_np_of(a, zero_copy_only=False).astype(np.float64), _np_of(pc.is_valid(a)))
+            return _npa(np.ma.array(out, mask=nul)) if nul.any() else _npa(out)
         if op == "lag":
             arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
             n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
@@ -1395,9 +1402,13 @@ class CustomOpsCompiler(GraphCompiler):
                 else:                                    # MAX is NaN if any is (numpy propagates)
                     val = np.full(m, _min_skip_nan(ok) if op == "min" else ok.max())
             elif op in ("sum", "mean"):
-                arr = values(args[0], sub)[0]
-                if   op == "sum":  val = np.full(m, arr.sum())
-                elif op == "mean": val = np.full(m, arr.mean() if m else np.nan)
+                arr, valid = values(args[0], sub)
+                ok = arr[valid]                          # NULLs are skipped; none valid gives NULL
+                if ok.size == 0:
+                    val = np.zeros(m)
+                    null_out[ordered_indices] = True
+                else:
+                    val = np.full(m, ok.sum() if op == "sum" else ok.mean())
             elif op == "rank":
                 val = _window_rank(self._eval_expr_arrow(args[0], sub), descending)
             elif op == "dense_rank":
@@ -1405,8 +1416,9 @@ class CustomOpsCompiler(GraphCompiler):
             elif op == "row_number":
                 val = np.arange(1, m + 1, dtype=np.float64)
             elif op == "cum_sum":
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = np.cumsum(arr)
+                arr, valid = values(args[0], sub)
+                val, nul = _cum_sum_skip_null(arr, valid)
+                null_out[ordered_indices[nul]] = True
             elif op == "lag":
                 n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
                 fill    = args[2] if len(args) > 2 else None

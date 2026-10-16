@@ -818,4 +818,5 @@ Found by the F-081 review (2026-10-16); silent wrong answers on main before F-08
 - [x] `_window_rank` ties rows with `==`, so tied NaNs rank apart: rank of `[nan, 1, nan, 2]` is `[3, 1, 4, 2]`, DuckDB `[3, 1, 3, 2]` (rank and dense_rank); tie through the canonical codes (`np_arrow.canonical_floats`)
 - [x] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
 - [x] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decided: stay float64, documented in docs/api.md (DuckDB gives int64 rank, int min/max, decimal sum)
+- [x] window sum, mean and cum_sum turned a NULL value into NaN (silent wrong answer, added at review): skip NULLs, NULL when none valid, running sum NULL until the first valid value, NaN among valid values propagates; `count` is not a window op here
 - [x] DuckDB-checked tests for each; fail before

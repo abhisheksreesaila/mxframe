@@ -104,7 +104,8 @@ Known limits: `EXTRACT(YEAR …)` on an integer day-number column works in a pro
 rank / dense_rank tie NaNs, -0.0 with 0.0 and NULLs with each other, and in an ORDER BY NaN is the
 largest value (last ascending, first descending) while NULL is last in both directions. The result
 is always float64: DuckDB returns int64 for rank / row_number, the input type for integer min / max
-and decimal for integer sum. Sum, mean and cum_sum over a column with NULLs still give NaN.
+and decimal for integer sum. Sum and mean skip NULLs (NULL when none are valid), a running sum is NULL until its first valid
+value, and a NaN among the valid values propagates. `count` is not a window function here.
 
 ## Device selection and the GPU
 
