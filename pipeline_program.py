@@ -499,6 +499,13 @@ class _Builder:
                 self.dict_concat[name] = offs
                 self.dict_values[name] = pa.concat_arrays(parts) if len(parts) > 1 else parts[0]
             return self.dict_values[name]
+        if self.skip_bounds and name not in self.dict_arrays:
+            # naming the columns only: the membership of the literal over an empty stand-in dictionary (no
+            # unify / combine / dictionary_encode, which rewrite or hash every row)
+            col = self.table.column(name)
+            if isinstance(col, pa.ChunkedArray) and col.num_chunks:
+                first = col.chunk(0)
+                return (first.dictionary if pa.types.is_dictionary(first.type) else first).slice(0, 0)
         if name not in self.dict_arrays:
             col = self.table.column(name)
             arr = _single_array(col)

@@ -535,6 +535,40 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     assert "minmax" in scans and "col_bound" in scans      # the full check (and the run) do size the integer sum
 
 
+@pytest.mark.parametrize("kind", ["multi-chunk dictionary", "plain string"])
+def test_a_string_filter_in_a_non_resident_decision_does_no_row_work(monkeypatch, kind):
+    """A scan_parquet read of several row groups holds a multi-chunk dictionary column; building its program's
+    dictionary unifies and rewrites every row's code (and a plain string column is hash-encoded). The decision
+    only names columns: none of that runs for it, while the full check (the run) still does it."""
+    import mxframe.pipeline_program as pp
+    n = 400_000
+    rng = np.random.default_rng(4)
+    words = np.array(["A", "N", "R"])[rng.integers(0, 3, n)]
+    if kind == "plain string":
+        f = pa.chunked_array([pa.array(words)])
+    else:     # different dictionaries per chunk, as row groups give
+        f = pa.chunked_array([pa.array(words[:n // 2]).dictionary_encode(),
+                              pa.array(words[n // 2:][::-1]).dictionary_encode()])
+    t = pa.table({"k": pa.array(rng.integers(0, 4, n).astype(np.int32)), "v": pa.array(rng.random(n)), "f": f})
+    lf = LazyFrame(t).filter(col("f") == lit("R")).groupby("k").agg(col("v").sum().alias("s"))
+    work = []
+    real_pc, real_combine, real_single = pp.pc, pp._combine, pp._single_array
+
+    class CountingPc:
+        def __getattr__(self, name):
+            fn = getattr(real_pc, name)
+            return (lambda *a, **k: work.append(name) or fn(*a, **k)) if name == "dictionary_encode" else fn
+
+    monkeypatch.setattr(pp, "pc", CountingPc())
+    monkeypatch.setattr(pp, "_combine", lambda *a, **k: work.append("combine") or real_combine(*a, **k))
+    monkeypatch.setattr(pp, "_single_array", lambda *a, **k: work.append("single_array") or real_single(*a, **k))
+    light = pe.split_check(lf.plan, full=False)
+    assert not isinstance(light, str), light
+    assert light.columns == frozenset({"f", "v"}) and work == []
+    full = pe.split_check(lf.plan)
+    assert work, "the full check should build the dictionary: the test would prove nothing"
+
+
 def test_the_light_compile_names_the_same_columns_as_the_real_one():
     from mxframe.pipeline_program import compile_pipeline
     t = data(50_000)

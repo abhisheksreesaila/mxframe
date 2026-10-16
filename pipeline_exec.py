@@ -303,7 +303,9 @@ def split_check(plan, full: bool = True):
     then declines (F-053 review).
 
     ``full=False`` stops after the program is compiled without its exactness bounds (shape, stable keys, the
-    bytecode compiler): enough to name the columns and ask whether they are resident, and it reads no column. The rest (nulls, int64 past
+    bytecode compiler): enough to name the columns and ask whether they are resident. It does no work per row: no
+    exactness bound, and a string filter's dictionary is an empty stand-in (no unify / combine /
+    dictionary_encode). The rest (nulls, int64 past
     2^53, integer sums, binding the buffers) passes over the data, so it runs only for the background
     upload and for the run itself; a query whose columns are resident passed it when they were uploaded."""
     from . import coproc_fused
