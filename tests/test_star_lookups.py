@@ -216,20 +216,53 @@ def test_shuffled_rows_and_chunks(seen):
 
 
 def test_null_keys_never_match(seen):
+    """Null keys are not looked up natively: the star declines (naming nulls) and the leaf-by-leaf join answers,
+    with null keys matching nothing."""
     fact = _fact(n=20_000, nulls=True)
     dim = _dim(_repeating(900))
     got = LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk").select("id", "dv").compute(device="cpu")
+    assert seen["star"] == 0 and seen["leaf"] == 1, seen
+    assert any("nulls" in k for k in nx.decline_counts()), nx.decline_counts()
     exp = _duck("SELECT id, dv FROM fact JOIN dim ON k = dk", fact=fact, dim=dim)
     _same(_rows(got, ["id", "dv"]), exp)
-    assert not [k for k in nx.decline_counts() if k.startswith("raised")]
 
 
-def test_an_output_beyond_int32_raises_before_it_is_written(seen):
-    n = 70_000
-    fact = pa.table({"id": A(np.arange(n, dtype=np.int64)), "k": A(np.zeros(n, np.int64))})
-    dim = _dim(np.zeros(n, np.int64))
-    with pytest.raises(MemoryError):
-        LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk").select("id", "dv").compute(device="cpu")
+EXPLODE = """
+import resource, sys
+import numpy as np, pyarrow as pa
+import mxframe.native_exec as nx
+from mxframe import LazyFrame
+from mxframe.np_arrow import array as A
+n = 70_000                      # one key on both sides: 4.9e9 joined rows
+fact = pa.table({"id": A(np.arange(n, dtype=np.int64)), "k": A(np.zeros(n, np.int64))})
+dim = pa.table({"dk": A(np.zeros(n, np.int64)), "dv": A(np.arange(n, dtype=np.int32))})
+base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+try:
+    LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk").select("id", "dv").compute(device="cpu")
+except MemoryError:
+    pass
+else:
+    sys.exit("no MemoryError")
+print("GROWTH_MB", (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base) // 1024)
+print("DECLINES", nx.decline_counts())
+"""
+
+
+def test_an_output_beyond_the_limit_declines_before_anything_is_written():
+    """The star counts the expansion in pass 1 and declines (-14) without buffering joined rows; the leaf-by-leaf
+    join then refuses it (MemoryError). Peak memory stays near the normal footprint (a buffered expansion
+    needed 3.9 GB)."""
+    import os
+    import subprocess
+    import sys
+    from conftest import _shim
+    env = dict(os.environ, MXFRAME_NATIVE="1", MXFRAME_STRICT_NATIVE="1", MXFRAME_FUSED_JOIN_AGG="0",
+               PYTHONPATH=str(_shim) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    r = subprocess.run([sys.executable, "-c", EXPLODE], capture_output=True, text=True, env=env, timeout=600)
+    assert r.returncode == 0, r.stdout + r.stderr[-2000:]
+    growth = int(r.stdout.split("GROWTH_MB")[1].split()[0])
+    assert growth < 600, growth
+    assert "executor declined (code -14)" in r.stdout, r.stdout
 
 
 def test_aggregate_over_a_repeating_partner_runs_through_the_star(seen, monkeypatch):

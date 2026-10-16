@@ -2095,7 +2095,7 @@ def _lookup_col(M: LP, two: Bool, b1: Int, w1: Int, b2: Int, w2: Int, koff: Int,
     first row in `rows` (multi map), and `cnt[j * VEC + k]` its row count (multi maps only); the earlier
     lookups' entries are compacted with it (`cnt` too when `track`: some map of the plan is multi).
     Keys of all candidates are computed first and their cache lines prefetched (group prefetching), then
-    resolved. `cb`: VEC words of scratch. Returns the survivors."""
+    resolved. `cb`: 2 * VEC words of scratch (keys, then hashes). Returns the survivors."""
     var lo1 = Int(M[1])
     var hi1 = Int(M[2])
     var lo2 = Int(M[3])
@@ -2168,6 +2168,12 @@ def _lookup_col(M: LP, two: Bool, b1: Int, w1: Int, b2: Int, w2: Int, koff: Int,
                 cnt[j * VEC + nn] = Int32(k)
             nn += 1
     return nn
+
+
+@always_inline
+def _flag(p: LP) -> Int:
+    """Atomic read of a flag word."""
+    return Int(Atomic[Scalar[DType.int64]].fetch_add(p, 0))
 
 
 def _free_map(M: LP):
@@ -2777,9 +2783,14 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     var mbytes = unsafe_alloc[Int64](morsels * max(n_tot, 1))  # string bytes per morsel per column
     for i in range(morsels * max(n_tot, 1)):
         mbytes[i] = 0
-    var mlook = unsafe_alloc[Int64](morsels)       # per morsel: int32[kept][n_look] partner rows
+    var mlook = unsafe_alloc[Int64](morsels)       # per morsel: int32[survivors][n_look] first partner rows
     for i in range(morsels):
         mlook[i] = 0
+    var mcntl = unsafe_alloc[Int64](morsels)       # per morsel (repeating keys): int32[survivors][n_look] row counts
+    var msurv = unsafe_alloc[Int64](morsels)       # survivors per morsel (mcnt: the joined rows they give)
+    for i in range(morsels):
+        mcntl[i] = 0
+        msurv[i] = 0
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
 
@@ -2800,8 +2811,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     def pass1(wid: Int) {imm}:
         var regs = unsafe_alloc[Float64](max(p.n_regs, 1) * VEC)
         var sel = unsafe_alloc[Int32](VEC)
-        var cap = MORSEL                                        # kept rows the buffers hold
+        var cap = MORSEL                                        # survivors a morsel holds
         var tmp = unsafe_alloc[Int32](max(cap * n_look, 1))
+        var ctmp = unsafe_alloc[Int32](max(cap * n_look, 1))    # their row counts per lookup
         var kp = unsafe_alloc[Int64](max(n_look, 1) * 4)      # per lookup: key base, width (x2)
         var cand = unsafe_alloc[Int32](VEC)                     # a block's candidate rows
         var ktmp = unsafe_alloc[UInt16](cap)                    # the morsel's kept rows (offsets < 2^16)
@@ -2813,15 +2825,16 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             prow[i] = 0
             pcnt[i] = 0
         _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)     # constants, once
-        while out_total[1] == 0:
+        while _flag(out_total + 1) == 0:
             var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             var lo = m * MORSEL
             if lo >= n_rows:
                 break
             var hi = min(lo + MORSEL, n_rows)
             var pos = lo
-            var kept = 0
-            while pos < hi and out_total[1] == 0:
+            var kept = 0                                     # survivors of this morsel
+            var expanded = 0                                 # joined rows they give
+            while pos < hi and _flag(out_total + 1) == 0:
                 var k = _find_chunk(p, pos)
                 var rowp = p.tbl + k * p.tbl_stride
                 var cols = rowp + 2
@@ -2836,7 +2849,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                         kp[4 * j + 2] = Int64(_kbase(Int(arrays[k * stride_a + n_cols + n_out + Int(lj[2])]), (w >> 4) & 15))
                         kp[4 * j + 3] = Int64((w >> 4) & 15)
                 var i0 = pos
-                while i0 < stop and out_total[1] == 0:
+                while i0 < stop and _flag(out_total + 1) == 0:
                     var n = min(VEC, stop - i0)
                     # candidates: the block's rows passing the predicate
                     var nc = 0
@@ -2857,6 +2870,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                         nc = _lookup_col(maps + j * MW, two, Int(kp[4 * j]), Int(kp[4 * j + 1]),
                                          Int(kp[4 * j + 2]) if two else 0, Int(kp[4 * j + 3]) if two else 0,
                                          i0 - c0, cand, nc, prow, pcnt, j, any_multi, cb)
+                    # survivors are kept unexpanded: fact offset, per lookup its first partner row (a CSR position
+                    # when its keys repeat) and row count; only the expanded row count and string bytes are
+                    # computed here, pass 2 expands while writing
                     for t in range(nc):
                         var i = Int(cand[t])
                         var total = 1
@@ -2866,57 +2882,41 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                                     total = min(total * Int(pcnt[j * VEC + t]), OUT_ROWS_MAX + 1)
                             var so_far = Int(Atomic[Scalar[DType.int64]].fetch_add(out_total, Int64(total))) + total
                             if so_far > OUT_ROWS_MAX:
-                                out_total[1] = 1
+                                _ = Atomic[Scalar[DType.int64]].fetch_add(out_total + 1, 1)
                                 break
-                            if kept + total > cap:               # a repeating key: grow the buffers
-                                var ncap = max(cap * 2, kept + total)
-                                var tmp2 = unsafe_alloc[Int32](max(ncap * n_look, 1))
-                                var ktmp2 = unsafe_alloc[UInt16](ncap)
-                                for x in range(kept * n_look):
-                                    tmp2[x] = tmp[x]
-                                for x in range(kept):
-                                    ktmp2[x] = ktmp[x]
-                                tmp.free()
-                                ktmp.free()
-                                tmp = tmp2
-                                ktmp = ktmp2
-                                cap = ncap
-                            for j in range(n_look):
-                                ix[j] = 0
-                        for e in range(total):
-                            ktmp[kept] = UInt16(i0 + i - lo)
-                            for j in range(n_look):
-                                var r = Int(prow[j * VEC + t])
-                                if Int(mq[2 * j]) != 0:
-                                    r = Int(_ip(Int(mq[2 * j + 1]))[r + Int(ix[j])])
-                                tmp[kept * n_look + j] = Int32(r)
-                            for j in range(n_out):
-                                var kd = Int(tk[j])
-                                if kd != OK_FIXED:
-                                    var st = 0
-                                    var ln = 0
-                                    _out_str(kd, Int(arrays[k * stride_a + n_cols + j]), i0 + i - c0, st, ln)
-                                    mbytes[m * n_tot + j] += Int64(ln)
-                            for u in range(n_bout):
-                                var kd = Int(tk[n_out + u])
-                                if kd != OK_FIXED:
-                                    var st = 0
-                                    var ln = 0
-                                    _out_str(kd, Int(barr[u]), Int(tmp[kept * n_look + Int(blk[u])]), st, ln)
-                                    mbytes[m * n_tot + n_out + u] += Int64(ln)
-                            kept += 1
-                            if any_multi:                        # next combination: the last repeating lookup runs fastest
-                                var jj = n_look - 1
-                                while jj >= 0:
-                                    if Int(mq[2 * jj]) != 0:
-                                        ix[jj] += 1
-                                        if Int(ix[jj]) < Int(pcnt[jj * VEC + t]):
-                                            break
-                                        ix[jj] = 0
-                                    jj -= 1
+                        ktmp[kept] = UInt16(i0 + i - lo)
+                        for j in range(n_look):
+                            tmp[kept * n_look + j] = prow[j * VEC + t]
+                            ctmp[kept * n_look + j] = pcnt[j * VEC + t]
+                        for j in range(n_out):
+                            var kd = Int(tk[j])
+                            if kd != OK_FIXED:
+                                var st = 0
+                                var ln = 0
+                                _out_str(kd, Int(arrays[k * stride_a + n_cols + j]), i0 + i - c0, st, ln)
+                                mbytes[m * n_tot + j] += Int64(ln * total)
+                        for u in range(n_bout):
+                            var kd = Int(tk[n_out + u])
+                            if kd != OK_FIXED:
+                                var jl = Int(blk[u])
+                                var st = 0
+                                var ln = 0
+                                if Int(mq[2 * jl]) != 0:     # the partner's rows of this key, each repeated for the other repeaters
+                                    var c_j = Int(pcnt[jl * VEC + t])
+                                    var sum_ln = 0
+                                    for e in range(c_j):
+                                        _out_str(kd, Int(barr[u]), Int(_ip(Int(mq[2 * jl + 1]))[Int(prow[jl * VEC + t]) + e]), st, ln)
+                                        sum_ln += ln
+                                    mbytes[m * n_tot + n_out + u] += Int64(sum_ln * (total // c_j))
+                                else:
+                                    _out_str(kd, Int(barr[u]), Int(prow[jl * VEC + t]), st, ln)
+                                    mbytes[m * n_tot + n_out + u] += Int64(ln * total)
+                        expanded += total
+                        kept += 1
                     i0 += n
                 pos = stop
-            mcnt[m] = Int64(kept)
+            mcnt[m] = Int64(expanded)
+            msurv[m] = Int64(kept)
             if kept > 0:
                 var kr = unsafe_alloc[UInt16](kept)
                 for i in range(kept):
@@ -2927,7 +2927,13 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                 for i in range(kept * n_look):
                     keep[i] = tmp[i]
                 mlook[m] = Int64(Int(keep))
+                if any_multi:
+                    var cn = unsafe_alloc[Int32](kept * n_look)
+                    for i in range(kept * n_look):
+                        cn[i] = ctmp[i]
+                    mcntl[m] = Int64(Int(cn))
         regs.free()
+        ctmp.free()
         sel.free()
         tmp.free()
         kp.free()
@@ -2945,7 +2951,6 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         pass1(0)
     var past_limit = Int(out_total[1]) != 0
     out_total.free()
-    mq.free()
 
     # ── prefix sums: each morsel's first output row and first string byte ──────────────────
     var mrow = unsafe_alloc[Int64](morsels)
@@ -2972,6 +2977,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         for j in range(n_look):
             _free_map(maps + j * MW)
         mlook.free()
+        _free_lists(mcntl, morsels)
+        msurv.free()
+        mq.free()
         maps.free()
         tk.free()
         tsz.free()
@@ -3023,8 +3031,48 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             var hi = min(lo + MORSEL, n_rows)
             var r = Int(mrow[m])
             var r0 = r
-            var kr = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=Int(mkeep[m]))
             var nk = Int(mcnt[m])
+            var kr_a = Int(mkeep[m])
+            var rows_a = Int(mlook[m])
+            var expanded_here = False
+            if any_multi and nk > 0:
+                # expand the survivors into the joined rows: each survivor once per combination of its
+                # repeating partners' rows (the last repeating lookup runs fastest), in partner build order
+                var ns = Int(msurv[m])
+                var sk = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a)
+                var sr = _ip(rows_a)
+                var sc = _ip(Int(mcntl[m]))
+                var kr2 = unsafe_alloc[UInt16](nk)
+                var rows2 = unsafe_alloc[Int32](nk * n_look)
+                var ix = unsafe_alloc[Int32](max(n_look, 1))
+                var o = 0
+                for sv in range(ns):
+                    var total = 1
+                    for j in range(n_look):
+                        ix[j] = 0
+                        if Int(mq[2 * j]) != 0:
+                            total *= Int(sc[sv * n_look + j])
+                    for e in range(total):
+                        kr2[o] = sk[sv]
+                        for j in range(n_look):
+                            var rr = Int(sr[sv * n_look + j])
+                            if Int(mq[2 * j]) != 0:
+                                rr = Int(_ip(Int(mq[2 * j + 1]))[rr + Int(ix[j])])
+                            rows2[o * n_look + j] = Int32(rr)
+                        o += 1
+                        var jj = n_look - 1
+                        while jj >= 0:
+                            if Int(mq[2 * jj]) != 0:
+                                ix[jj] += 1
+                                if Int(ix[jj]) < Int(sc[sv * n_look + jj]):
+                                    break
+                                ix[jj] = 0
+                            jj -= 1
+                ix.free()
+                kr_a = Int(kr2)
+                rows_a = Int(rows2)
+                expanded_here = True
+            var kr = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a)
             var q = 0                                  # next kept row of this morsel
             var pos = lo
             while pos < hi and q < nk:
@@ -3094,7 +3142,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             # partner columns: the morsel's kept rows, in order, through their partner rows
             var kept = Int(mcnt[m])
             if kept > 0 and n_look > 0:
-                var rows = _ip(Int(mlook[m]))
+                var rows = _ip(rows_a)
                 for t in range(n_bout):
                     var arr = Int(barr[t])
                     var kd = Int(tk[n_out + t])
@@ -3138,6 +3186,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                             var sp = _bp(st)
                             _copy_bytes(Int(data) + bp, Int(sp), ln)
                             bp += ln
+            if expanded_here:
+                _ip(rows_a).free()
+                Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a).free()
 
     if nt > 1:
         parallelize(pass2, nt)
@@ -3155,6 +3206,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     for j in range(n_look):
         _free_map(maps + j * MW)
     mlook.free()
+    _free_lists(mcntl, morsels)
+    msurv.free()
+    mq.free()
     maps.free()
     tk.free()
     tsz.free()

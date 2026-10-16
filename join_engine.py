@@ -16,6 +16,7 @@ The output columns and their names are exactly those of the tree written by the 
 """
 from __future__ import annotations
 
+import functools
 import os
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -935,6 +936,7 @@ def _semi_partner(comp, plan, bkeys, reduce=None) -> Optional[pa.Table]:
 _MAP_BYTES_PER_ROW = 16            # a partner's map: a direct array over a key range of ~4x its rows, or a hash table
 
 
+@functools.lru_cache(maxsize=1)
 def _l3_bytes() -> int:
     """Size of the CPU's last-level cache (32 MB when unknown)."""
     try:
