@@ -984,3 +984,8 @@ Found by the F-093 developer (2026-10-16)
 - [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
 - [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
 - [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before
+
+## F-109 SQL JOIN ON ignores the table qualifier [todo]
+Found by the F-104 review (2026-10-16); a silent wrong answer on main
+- [ ] `_parse_join_on` matches columns by name only. `t JOIN x ON x.v = t.k`, where `k` and `v` are in both tables, joins `t.v = x.k`: mx returns ids 1, 2, 5 and DuckDB returns 2, 5. Decide each side of an equality from its qualifier (`t.` / alias in the tables joined so far, or the table being joined), falling back to the column name only for an unqualified column; an unqualified name found in both sides raises (DuckDB: ambiguous)
+- [ ] DuckDB-checked tests: qualified ON in either operand order with the same column names in both tables, two and three tables, LEFT / INNER, a USING form; fails before
