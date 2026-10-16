@@ -316,9 +316,10 @@ Needs: none · From the F-035 review
 - [ ] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
 - [ ] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
 
-## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [todo]
+## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [review]
 Needs: none · From the F-032 review (round 2); predates the executor (the fused pipeline has it too)
-- [ ] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+- [x] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+  - Done with the first option: `_Builder._arith` bounds every integer `+ - *` from its inputs (columns' real min / max, read lazily and only for arithmetic; literals exactly; constant folds in exact Python ints) and declines past 2^53, so the exact path answers; int32 * int32 of small values and int64 products of small values still run natively. All entry points compile through it (`mx_execute`, `mx_filter`, `mx_filter_topk`, fused pipeline). Tests: `tests/test_int_arith_2_53.py`. Not covered: SUM of integer expressions passing 2^53 (`slot_int`)
 
 ## F-038 Two tests fail under load [todo]
 Needs: none · Seen 2026-10-12 while other test runs and benchmarks shared the machine; both pass alone (3/3)

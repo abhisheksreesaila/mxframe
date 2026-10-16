@@ -372,6 +372,11 @@ class _Const:
 class _Val:
     vreg: int
     kind: str          # "int" | "float" | "bool"
+    bound: int = 0     # int kind: every value is within +-bound (exact Python int)
+    src: Optional[str] = None   # int kind: a bare column; its bound is read from the data when needed
+
+
+EXACT = 1 << 53        # integers within +-2^53 are exact in float64, and so are their sums / products
 
 
 class _Section:
@@ -398,6 +403,7 @@ class _Builder:
         self.dict_values: Dict[str, pa.Array] = {}
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
+        self.col_bounds: Dict[str, int] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.consts: List[float] = []
         self.const_ix: Dict[float, int] = {}
@@ -503,7 +509,31 @@ class _Builder:
         if kind == "str":
             raise Unsupported("string column used as a number")
         ix = self._column(name)
-        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind)
+        if kind != "int":
+            return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind)
+        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind, src=name)
+
+    def col_bound(self, name: str) -> int:
+        """max |value| of an integer column, from the data's own min / max (one pass, only when integer
+        arithmetic needs it; the type's range would decline int32 * int32)."""
+        if name not in self.col_bounds:
+            col = self.table.column(name)
+            tb: Optional[int] = 0
+            for ch in (col.chunks if isinstance(col, pa.ChunkedArray) else [col]):
+                if not len(ch):
+                    continue
+                if ch.null_count:
+                    tb = None
+                    break
+                a = _np_of(ch, zero_copy_only=False)
+                tb = max(tb, abs(int(a.max())), abs(int(a.min())))
+            self.col_bounds[name] = EXACT + 1 if tb is None else tb
+        return self.col_bounds[name]
+
+    def bound_of(self, x) -> int:
+        if isinstance(x, _Const):
+            return abs(int(x.value))
+        return self.col_bound(x.src) if x.src is not None else x.bound
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
         """IN_SET over a column's values / codes given a boolean membership table."""
@@ -554,14 +584,15 @@ class _Builder:
             kind = "int" if (then.kind == "int" and other.kind == "int") else "float"
             if isinstance(cond, _Const):
                 return then if cond.value != 0 else other
-            return _Val(self.emit(OP_SELECT, cond.vreg, self.as_reg(then), self.as_reg(other)), kind)
+            bound = max(self.bound_of(then), self.bound_of(other)) if kind == "int" else 0
+            return _Val(self.emit(OP_SELECT, cond.vreg, self.as_reg(then), self.as_reg(other)), kind, bound)
         if op == "year":
             x = self.compile(args[0])
             if isinstance(x, _Const) or x.kind != "int":
                 raise Unsupported("year() only on integer YYYYMMDD columns")
             d = self.const_reg(10000.0)
             q = self.emit(OP_DIV, x.vreg, d)
-            return _Val(self.emit(OP_FLOOR, q), "int")
+            return _Val(self.emit(OP_FLOOR, q), "int", self.bound_of(x) // 10000 + 1)
         raise Unsupported(f"op {op!r}")
 
     def _need(self, e: Expr, want: str):
@@ -579,13 +610,21 @@ class _Builder:
         if code == OP_DIV and a.kind == "int" and b.kind == "int":
             raise Unsupported("integer division has floor semantics in Arrow")
         kind = "float" if "float" in (a.kind, b.kind) or code == OP_DIV else "int"
+        bound = 0
+        if kind == "int":
+            # the interpreter is float64: an integer intermediate is exact only within +-2^53, so bound
+            # it from its inputs (columns' real min / max) and decline when it could pass (F-037)
+            ba, bb = self.bound_of(a), self.bound_of(b)
+            bound = ba * bb if code == OP_MUL else ba + bb
+            if bound > EXACT:
+                raise Unsupported("integer arithmetic could pass 2**53, not exact in float64")
         if isinstance(a, _Const) and isinstance(b, _Const):
             if code == OP_DIV:
                 if b.value == 0:
                     raise Unsupported("division by constant zero")
                 return _Const(a.value / b.value, kind)
             return _Const(_FOLD[code](a.value, b.value), kind)
-        return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), kind)
+        return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), kind, bound)
 
     def _compare(self, op: str, args):
         lhs, rhs = args
@@ -628,8 +667,19 @@ class _Builder:
                 return None
             if e.op == "div":
                 return a / b if b != 0 else None
+            if a.is_integer() and b.is_integer() and self._int_expr(e):
+                r = _FOLD[_ARITH[e.op]](int(a), int(b))       # exact Python integers
+                if abs(r) > EXACT:
+                    raise Unsupported("integer arithmetic could pass 2**53, not exact in float64")
+                return float(r)
             return _FOLD[_ARITH[e.op]](a, b)
         return None
+
+    def _int_expr(self, e: Expr) -> bool:
+        """A constant expression made of integer literals and + - * only."""
+        if e.op == "lit":
+            return isinstance(e.args[0], (int, np.integer)) and not isinstance(e.args[0], bool)
+        return e.op in ("add", "sub", "mul") and all(self._int_expr(a) for a in e.args)
 
     def _try_cmpc(self, op: str, lhs: Expr, rhs: Expr):
         """`column <cmp> constant` in the column's own type, or None if not that shape."""
