@@ -585,11 +585,12 @@ Needs: F-047 · Files: `docs/site/how-it-got-fast.html` · Absorbs the open item
 Needs: F-047 · Files: `docs/site/auto-mode.html` (from `docs/auto-mode.html`)
 - [x] restyled on `site.css`, "how to read this" header, numbers from the bench files
 
-## F-053 device="auto" never uses the native executor [todo]
+## F-053 device="auto" never uses the native executor [review]
 Found 2026-10-14 while documenting auto (F-052); the review showed it holds on every machine. On every CPU decision `auto` sets a co-processing policy (`lazy_frame.py` ~299, whatever the GPU state; `MXFRAME_COPROC=0` doesn't help) and `native_exec.try_execute` declines ("CPU+GPU co-processing policy active"), so the default `.compute()` runs the older fused pipeline; every 0.6.0 number is `device="cpu"`. SF10 group-by probe: cpu `path=native`, auto `path=fused_pipeline_cpu`. auto's 22/22 and 21/22 results are from 2026-10-12, before the native executor; the cost model prices the CPU with the older kernels.
 - [ ] re-run the user-felt TPC-H scoreboard with `mx-auto` next to `mx-cpu` on 0.6.0 (quiet machine)
-- [ ] calibration and the cost model know the native executor; auto picks native CPU when it beats the split (or the native executor takes the CPU share of a split)
-- [ ] README / site drop the "pass device=\"cpu\" for now" note once auto is within 10% of min(cpu, gpu) again
+- [x] auto sets the co-processing policy only when `auto_mode._cpu_path` predicts a CPU+GPU split beats the native CPU executor by 10% (or the caller passes `gpu_fraction`); every other CPU decision runs the native executor exactly as `device="cpu"`; `MXFRAME_COPROC=0` honoured. Decision: the native executor does NOT take the CPU share of a split (big change in native_exec, which another ticket is editing); a split stays on the older pipeline and is chosen only when it beats `pipeline@cpu * NATIVE_CPU_FACTOR`. Factor is 1.0: one warm Q1-shaped 6M-row measurement on a busy machine (load 12) gave native 7.7 ms vs fused 6.9 ms, so no native speed-up is assumed. Refresh it, and add a real native calibration probe, in the quiet-machine run. `explain(device="auto", costs=True)` prints `cpu path: ...` and why. Tests: `tests/test_f053_auto_native.py`
+- [x] README / site / auto-mode.md / CHANGELOG describe the current behaviour (no speed claim)
+- [ ] TODO quiet machine: `auto` within 10% of min(cpu, gpu) on >= 20/22 queries at SF1 and SF10 (median of fresh-process runs)
 
 ## F-054 Finish the docs [done]
 Asked 2026-10-14 ("add license, finish docs, hold off on new dev")
