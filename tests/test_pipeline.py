@@ -141,9 +141,16 @@ def test_compiles_q1_shaped_program_with_shared_subexpressions():
 
 def test_between_pattern_uses_fused_op():
     t = make_table(10)
-    prog = compile_pipeline([(col("f64") * lit(2.0)).between(0.5, 3.0)], [col("f32").sum()], t)
+    prog = compile_pipeline([(col("i32") * lit(2)).between(5, 30)], [col("f32").sum()], t)
     assert "BETWEEN" in prog.op_names()
     assert "AND" not in prog.op_names()
+
+
+def test_float_between_is_two_nan_aware_compares():
+    t = make_table(10)                         # BETWEEN is the integer instruction (F-070): NaN needs the flagged compares
+    prog = compile_pipeline([(col("f64") * lit(2.0)).between(0.5, 3.0)], [col("f32").sum()], t)
+    assert "BETWEEN" not in prog.op_names()
+    assert "AND" in prog.op_names()
 
 
 def test_constant_subexpressions_fold():

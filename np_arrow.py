@@ -158,7 +158,7 @@ def is_in(col, values):
             r = pc.or_kleene(r, pc.is_nan(col))
     else:
         r = pc.is_in(col, value_set=value_set(values, col.type))
-    if col.null_count:
+    if getattr(col, "null_count", 0):
         r = pc.if_else(pc.is_valid(col), r, pa.nulls(1, pa.bool_())[0])
     return r
 
