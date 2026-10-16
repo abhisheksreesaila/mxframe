@@ -74,6 +74,14 @@ def test_multi_column_partition_with_float_key():
     assert got == _duck(t, "sum(v) OVER (PARTITION BY k, k2)")
 
 
+def test_window_min_max_over_nan_values_follow_duckdb():
+    nan = float("nan")
+    t = pa.table({"k": [1, 1, 1, 2, 2, 3], "v": [nan, 2.0, 5.0, nan, nan, 4.0], "id": list(range(6))})
+    for op, expr in (("min", col("v").min().over("k")), ("max", col("v").max().over("k"))):
+        got, want = _mx(t, expr), _duck(t, f"{op}(v) OVER (PARTITION BY k)")
+        assert repr(got) == repr(want), (op, got, want)
+
+
 @pytest.mark.parametrize("keys,typ", [([1, 2, 1, None, 2, None], pa.int64()),
                                       (["a", "b", "a", None, "b", None], pa.string())],
                          ids=["int", "string"])

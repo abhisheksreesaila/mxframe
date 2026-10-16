@@ -328,6 +328,11 @@ def clear_cache():
 
 # ── Window-function helpers (module-level for reuse) ─────────────────────────
 
+def _min_skip_nan(arr):
+    ok = arr[~np.isnan(arr)]
+    return ok.min() if ok.size else np.nan
+
+
 def _canonical_partition_key(col):
     """A float key column with -0.0 as 0.0 and every NaN payload as one NaN, so equal-by-SQL keys share a
     code (nulls stay null). replace with np_arrow.canonical_floats after F-077 merges"""
@@ -1386,8 +1391,8 @@ class CustomOpsCompiler(GraphCompiler):
                 arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 if   op == "sum":  val = np.full(m, arr.sum())
                 elif op == "mean": val = np.full(m, arr.mean() if m else np.nan)
-                elif op == "min":  val = np.full(m, arr.min()  if m else np.nan)
-                elif op == "max":  val = np.full(m, arr.max()  if m else np.nan)
+                elif op == "min":  val = np.full(m, _min_skip_nan(arr))   # DuckDB: MIN skips NaN
+                elif op == "max":  val = np.full(m, arr.max() if m else np.nan)   # MAX is NaN if any is (numpy propagates)
             elif op == "rank":
                 arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = _window_rank(arr)
