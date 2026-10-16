@@ -57,6 +57,7 @@ Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Rout
 - [ ] a split is chosen only where calibration predicts it beats both single devices, and `explain` says why
 - [ ] measured on a quiet machine: auto within 10% of min(cpu, gpu) on every query, faster than both on the shapes the split targets (high-volume aggregation on resident data)
 
+- [ ] `auto_mode._unsplittable` rules out joins and unstable keys only; other shapes the fused pipeline declines (Project/Distinct between aggregate and scan, nulls, int64 past 2^53, dictionary-code filters) can still be predicted a split, then native declines every repeat: make the split predicate match the split path exactly (from the F-053 review)
 ## F-058 Core gate scoreboard [todo]
 Needs: F-055, F-056, F-057 · Quiet machine only
 - [ ] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (warm, labelled) and `auto`, against DuckDB and Polars, every result checked against DuckDB
