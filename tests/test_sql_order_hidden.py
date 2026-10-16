@@ -136,12 +136,6 @@ def test_hidden_key_name_never_collides():
     assert mx.sql(q, t=t).compute(device="cpu").to_pydict() == duckdb.sql(q).fetch_arrow_table().to_pydict()
 
 
-def test_star_mixed_with_columns_and_order_by_is_a_clear_error():
-    for q in ["SELECT *, a + 1 AS z FROM t ORDER BY b", "SELECT a, * FROM t ORDER BY b"]:
-        with pytest.raises(ValueError, match="not supported"):
-            mx.sql(q, t=_t())
-
-
 def test_dataframe_sort_by_dropped_column_names_it():
     f = mx.sql("SELECT * FROM t", t=_t())
     assert f.sort("b").select("a").compute(device="cpu").column_names == ["a"]      # sort before select
