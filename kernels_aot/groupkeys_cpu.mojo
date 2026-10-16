@@ -23,7 +23,7 @@ Build:
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer
-from max.algorithm import parallelize
+from _fpenv import par, par_n
 from std.atomic import Atomic
 from std.ffi import external_call
 
@@ -159,7 +159,7 @@ def mx_groupkeys_composite(
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(worker, nthreads)
+        par(worker, nthreads)
     for t in range(nthreads):
         var pl = local + t * pstride
         for s in range(space):
@@ -200,7 +200,7 @@ def mx_groupkeys_remap(ids_a: Int, n: Int, table_a: Int, threads: Int) abi("C") 
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(worker, nthreads)
+        par(worker, nthreads)
     counter.free()
     return 0
 
@@ -232,7 +232,7 @@ def mx_gk_touch(addr: Int, nbytes: Int, threads: Int) abi("C") -> Int:
             worker(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(worker, chunks, nthreads)
+        par_n(worker, chunks, nthreads)
     return 0
 
 
@@ -301,7 +301,7 @@ def mx_ik_range(src_a: Int, w: Int, n: Int, out_a: Int, threads: Int) abi("C") -
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(worker, nth)
+        par(worker, nth)
     var mn = part[0]
     var mx = part[1]
     for t in range(1, nth):
@@ -354,7 +354,7 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
             if bad:
                 err[0] = 1
 
-        parallelize(wl, nth)
+        par(wl, nth)
         for s in range(r):
             var best = nn
             for t in range(nth):
@@ -375,7 +375,7 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
             for c in range(ich):
                 wi(c)
         else:
-            parallelize(wi, ich, nth)
+            par_n(wi, ich, nth)
 
         def ws(wid: Int) {imm}:
             var bad = False
@@ -400,7 +400,7 @@ def mx_ik_first(src_a: Int, w: Int, n: Int, lo: Int, r: Int, tab_a: Int, threads
         if nth == 1:
             ws(0)
         else:
-            parallelize(ws, nth)
+            par(ws, nth)
     var bad_rc = err[0]
     err.free()
     counter.free()
@@ -462,9 +462,9 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
         for c in range(chunks_n):
             count(c)
     else:
-        parallelize(zero, chunks_n, nth)
-        parallelize(mark, chunks_r, nth)
-        parallelize(count, chunks_n, nth)
+        par_n(zero, chunks_n, nth)
+        par_n(mark, chunks_r, nth)
+        par_n(count, chunks_n, nth)
     var total = Int64(0)
     for c in range(chunks_n):
         var s = sums[c]
@@ -474,7 +474,7 @@ def mx_ik_rank(tab_a: Int, r: Int, n: Int, scr_a: Int, threads: Int) abi("C") ->
         for c in range(chunks_n):
             scan(c)
     else:
-        parallelize(scan, chunks_n, nth)
+        par_n(scan, chunks_n, nth)
     sums.free()
     return Int(total)
 
@@ -509,7 +509,7 @@ def mx_ik_finish(tab_a: Int, r: Int, n: Int, lo: Int, scr_a: Int, uniq_a: Int, f
             fin(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(fin, chunks_r, nth)
+        par_n(fin, chunks_r, nth)
     return 0
 
 
@@ -532,7 +532,7 @@ def mx_ik_apply(src_a: Int, w: Int, n: Int, lo: Int, tab_a: Int, ids_a: Int, thr
             work(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(work, chunks, nth)
+        par_n(work, chunks, nth)
     return 0
 
 
@@ -574,7 +574,7 @@ def mx_ik_composite(n_keys: Int, addrs_a: Int, widths_a: Int, strides_a: Int, n:
             work(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(work, chunks, nth)
+        par_n(work, chunks, nth)
     return 0
 
 
@@ -605,7 +605,7 @@ def mx_ik_present(src_a: Int, w: Int, n: Int, lo: Int, r: Int, pres_a: Int, thre
             work(c)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(work, chunks, nth)
+        par_n(work, chunks, nth)
     var bad_rc = err[0]
     err.free()
     if bad_rc != 0:
@@ -640,7 +640,7 @@ def mx_ik_prefix(pres_a: Int, r: Int, tab_a: Int, threads: Int) abi("C") -> Int:
 
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(count, chunks, nth)
+        par_n(count, chunks, nth)
     else:
         for c in range(chunks):
             count(c)
@@ -650,7 +650,7 @@ def mx_ik_prefix(pres_a: Int, r: Int, tab_a: Int, threads: Int) abi("C") -> Int:
         sums[c] = total
         total += s
     if nth > 1:
-        parallelize(scan, chunks, nth)
+        par_n(scan, chunks, nth)
     else:
         for c in range(chunks):
             scan(c)
@@ -676,7 +676,7 @@ def mx_ik_uniq(pres_a: Int, tab_a: Int, r: Int, lo: Int, uniq_a: Int, threads: I
 
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(work, chunks, nth)
+        par_n(work, chunks, nth)
     else:
         for c in range(chunks):
             work(c)
@@ -716,7 +716,7 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
 
     if nth > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(count, chunks, nth)
+        par_n(count, chunks, nth)
     else:
         for c in range(chunks):
             count(c)
@@ -726,7 +726,7 @@ def mx_ik_rank_sorted(keys_a: Int, perm_a: Int, n: Int, ids_a: Int, first_a: Int
         sums[c] = total
         total += s
     if nth > 1:
-        parallelize(emit, chunks, nth)
+        par_n(emit, chunks, nth)
     else:
         for c in range(chunks):
             emit(c)
@@ -885,7 +885,7 @@ def mx_ik_rank_bucketed(keys_a: Int, n: Int, stride: Int, nb: Int, ids_a: Int, f
 
 def _run_n[F: def(Int) -> None](f: F, chunks: Int, nth: Int):
     if nth > 1:
-        parallelize(f, chunks, nth)
+        par_n(f, chunks, nth)
     else:
         for c in range(chunks):
             f(c)

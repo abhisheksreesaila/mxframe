@@ -815,10 +815,13 @@ Found by the F-077 review (2026-10-16); a silent wrong answer on main
 - [ ] DuckDB-checked tests: float partition key with NaN (two payloads), -0.0 / 0.0, NULL, ±inf; sum / count / rank over it; fails before
 - [ ] window `min` / `max` (numpy) propagate NaN; DuckDB's MAX is NaN when the frame holds one and MIN skips it (F-070 rule) (found by the F-070 developer)
 
-## F-082 Denormal floats are not flushed to zero [todo]
+## F-082 Denormal floats are not flushed to zero [review]
 Found by the F-070 developer (2026-10-16); a silent wrong answer
-- [ ] with `MXFRAME_NATIVE=0` on 200,000 rows, `fused_pipeline_cpu` reads the denormal 5e-324 as 0 (`x > 0.0` counts 0 of 100,000): a flush-to-zero / denormals-are-zero mode in the CPU pipeline kernel (or its compile flags). Find where FTZ/DAZ is set; every CPU and GPU path compares and sums denormals like DuckDB
-- [ ] DuckDB-checked tests: filters and sums over denormals (5e-324, 2.2e-308), each CPU path forced (native, fused pipeline, Arrow) and GPU; fails before
+- [x] cause: Mojo's `parallelize` / `sync_parallelize` run every task with FTZ + DAZ set (MXCSR 0x9FE0, read with `stmxcsr` inside a task; main thread 0x1FA0). Not a compile flag, not a float32 conversion, not fast-math: any kernel that fanned out over threads read 5e-324 (and float32 1e-45) as 0. `fused_pipeline_cpu` fanned out from ~200,000 rows; the native executor, hash aggregate, group keys and joins from larger inputs (native: 20M rows `x > 0.0` counted 0 of 10M). The GPU kernels (float64 and float32), Arrow and the single-thread paths were right
+- [x] fix at the root: `kernels_aot/_fpenv.mojo` (`par`, `par_n`, `sync_par`) resets MXCSR to 0x1F80 at the start of every task; every `parallelize` / `sync_parallelize` in executor_cpu, pipeline_cpu, hashagg_cpu, groupkeys_cpu, joinsemi_cpu and kernels_aot now goes through it. Rebuilt with `scripts/build_pipeline.sh` (cpu, keys, join, aot) and hashes recorded. Rule: never call `parallelize` directly in kernels_aot
+- [x] DuckDB-checked tests (`tests/test_f082_denormals.py`): 5e-324, 2.2e-308 / 2, -5e-324, float32 1e-45, 1.1e-38, -1e-45 mixed with zeros and normals over 200,000 rows; filters (count, sum, grouped, 5000 groups), sums, min / max, row filter, float64 and float32, with and without NULLs, cpu native on / off and gpu; 68 fail on main's libraries (all cpu), all pass now
+- [ ] quiet-machine speed check (not run: shared machine): the wrapper adds one `ldmxcsr` per task (and per chunk for `par_n`). Compare SF1 / SF10 Q1, Q6, Q18 and the group-key / join micro-benchmarks before and after F-082 in fresh processes (median of several, load < 2); expect no change
+- [ ] follow-up (found while testing): the SQL front end fails on a scientific literal without a dot (`x > 1e-310` raises `ValueError: invalid literal for int()`; `sql_frontend.py` `lit(int(v)) if "." not in str(v)`), and a float32 column compared with a float64 literal casts the literal to float32 (`x between -1e-30 and 1e-30` on float32 keeps the row holding float32(1e-30), DuckDB compares as double and drops it)
 
 ## F-083 ORDER BY a column not in the select list [done]
 Found by the F-070 developer (2026-10-16)
