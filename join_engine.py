@@ -942,15 +942,15 @@ class _Star:
         return c if leaf == self.fact else _star_name(leaf, c)
 
 
-def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Optional[pa.Table]:
+def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None, star=None) -> Optional[pa.Table]:
     """The join as one scan of leaf ``fact``: every other leaf belongs to the subtree of one of the
     fact's neighbours (the edges form a tree); each subtree is joined on its own (small tables) and
     becomes a partner looked up by key while the fact's filter runs (``native_exec.try_filter``).
     Residual conditions across subtrees run on the joined rows. None: declined (non-unique partner
     keys, unsupported types), the caller joins leaf by leaf."""
     from . import native_exec
-    st = _star_setup(comp, fl, fact, get, want, leaf_need, coded)
-    if st is None:
+    st = _star_setup(comp, fl, fact, get, want, leaf_need, coded) if star is None else star
+    if not st:                       # declined (False: the fused attempt already found out)
         return None
     scan, preds, lookups, roots = st.scan, st.preds, st.lookups, st.roots
     deliver, post_res, name_of = st.deliver, st.post_res, st.name_of
@@ -1118,7 +1118,8 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops) -> Optional[pa.Table
     builds them (``_star_setup``); ``native_exec.try_execute_join`` compiles the aggregate over the joined
     schema. None: the plan does not fit (or ``MXFRAME_FUSED_JOIN_AGG=0``), the caller materializes the join."""
     from . import native_exec
-    if os.environ.get("MXFRAME_FUSED_JOIN_AGG", "1") in ("0", "false", "off"):
+    comp._star_stash = None
+    if native_exec.fused_join_blocked(comp) is not None:         # before any partner is built
         return None
     plan = comp._inline_project_into_aggregate(plan)
     if not isinstance(plan, Aggregate) or not plan.aggs:
@@ -1132,6 +1133,9 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops) -> Optional[pa.Table
     needed: Set[str] = set()
     for e in list(plan.group_by) + list(plan.aggs) + above:
         needed |= _cols(e)
+    if _join_cached(comp, node, needed):                         # the old path would answer from its cache
+        native_exec._decline("join result cached")
+        return None
     setup = _inner_setup(comp, node, needed)
     if setup is None:
         return None
@@ -1140,6 +1144,8 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops) -> Optional[pa.Table
     if fact is None:
         return None
     st = _star_setup(comp, fl, fact, get, want, leaf_need, coded)
+    # whatever the fused call does, the old path (should it run) must not build the partners again
+    comp._star_stash = (node, frozenset(needed), setup, st if st is not None else False)
     if st is None:
         return None
     lookup_of = {c: j for j, (c, _) in enumerate(st.roots)}
@@ -1154,7 +1160,20 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops) -> Optional[pa.Table
     if _TRACE:
         _trace(f"fused join + aggregate: scan leaf {fact} ({st.scan.table.num_rows} rows) with partners "
                f"{[(c, lk.build.num_rows) for (c, _), lk in zip(st.roots, st.lookups)]}")
-    return native_exec.try_execute_join(comp, plan, fj, having_pred, post_ops)
+    out = native_exec.try_execute_join(comp, plan, fj, having_pred, post_ops)
+    if out is not None:
+        comp._star_stash = None
+    return out
+
+
+def _join_cached(comp, node, needed) -> bool:
+    """True when ``execute_join`` holds this join's result already (a repeated query)."""
+    from . import custom_ops as _co
+    key = _stable_key(comp, node)
+    if key is None:
+        return False
+    return any((key, frozenset(needed), ok, _keep_sig(node), comp._session_device) in _co._JOIN_RESULT_CACHE
+               for ok in (True, False))
 
 
 def _join_indices(comp, tables, rows, base, edges, residuals, out_leaves):
@@ -1249,14 +1268,20 @@ def _inner_setup(comp, node, needed):
 
 
 def _execute_inner(comp, node, needed, dict_ok=False):
-    setup = _inner_setup(comp, node, needed)
+    stash, comp._star_stash = getattr(comp, "_star_stash", None), None       # from a declined fused attempt
+    star = None
+    if stash is not None and stash[0] is node and stash[1] == (None if needed is None else frozenset(needed)):
+        setup, star = stash[2], stash[3]
+    else:
+        setup = _inner_setup(comp, node, needed)
     if setup is None:
         return None
     fl, want, leaf_need, later, coded, tables, get = setup
     n_leaves = len(fl.leaves)
     fact = _star_fact(comp, fl)
     if fact is not None:
-        out = _execute_star(comp, fl, fact, get, want, leaf_need, coded)
+        out = _execute_star(comp, fl, fact, get, want, leaf_need, coded,
+                            star if star is not None and (star is False or star.fact == fact) else None)
         if out is not None:
             return out
     for i in range(n_leaves):

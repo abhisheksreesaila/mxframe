@@ -397,8 +397,72 @@ def test_int64_past_2_53_declines_with_the_exact_answer(calls, monkeypatch):
 
 
 def test_a_wide_group_key_range_declines(calls):
+    """k x g x d spans 3 million codes: past direct addressing the executor returns E_BAD_KEY (-11), the
+    old path answers (hashed keys, until the fused call takes them)."""
     fact, dim1, _, _ = _tables()
     got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
-           .groupby("k").agg(col("v").sum().alias("s")).compute(device="cpu"))
-    exp = _duck("SELECT k, SUM(v) FROM fact JOIN dim1 ON k = dk GROUP BY k", fact=fact, dim1=dim1)
-    _same(_rows(got), exp)
+           .groupby("k", "g", "d").agg(col("v").sum().alias("s")).compute(device="cpu"))
+    _declined(calls, -11)
+    exp = _duck("SELECT k, g, d, SUM(v) FROM fact JOIN dim1 ON k = dk GROUP BY k, g, d", fact=fact, dim1=dim1)
+    _same(_rows(got, ["k", "g", "d", "s"]), exp)
+    assert calls["star"] > 0, calls
+
+
+def test_global_aggregate_over_a_fact_filter_that_keeps_nothing(calls):
+    fact, dim1, _, _ = _tables()
+    got = (LazyFrame(fact).filter(col("d") > lit(1000)).join(LazyFrame(dim1), left_on="k", right_on="dk")
+           .groupby().agg(col("v").sum().alias("s"), col("v").count().alias("n"), col("w").max().alias("m"))
+           .compute(device="cpu"))
+    _fused(calls)
+    exp = _duck("SELECT SUM(v), COUNT(v), MAX(w) FROM fact JOIN dim1 ON k = dk WHERE d > 1000", fact=fact, dim1=dim1)
+    assert _rows(got) == exp == [(None, 0, None)]
+
+
+
+
+def test_a_repeated_query_is_answered_from_the_join_cache(calls, monkeypatch):
+    """The old path keeps a join's result for the next query; asking the fused call then would only add cost."""
+    import mxframe.custom_ops as co
+    fact, dim1, dim2, _ = _tables()
+    # tables holding exactly the columns the query reads (the cache is keyed by table identity, and column
+    # pruning would make a new table per query)
+    fact, dim1, dim2 = fact.select(["k", "k2", "g", "v"]), dim1.select(["dk", "w"]), dim2.select(["ek"])
+    plan = lambda: (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+                    .join(LazyFrame(dim2), left_on="k2", right_on="ek").groupby("g").agg(col("w").sum().alias("s")))
+    co._JOIN_RESULT_CACHE.clear()
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+    first = plan().compute(device="cpu")                    # fills the cache
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "1")
+    calls["exec"].clear()
+    again = plan().compute(device="cpu")
+    assert 3 not in calls["exec"], calls
+    _same(_rows(again), _rows(first))
+    co._JOIN_RESULT_CACHE.clear()
+    calls.update(exec=[], star=0, filter=0, rc3=[])
+    plan().compute(device="cpu")
+    _fused(calls)                                           # nothing cached: fused
+
+
+def test_a_declined_fused_call_does_not_build_the_partners_again(calls, monkeypatch):
+    import mxframe.join_engine as je
+    built = []
+    real = je._star_setup
+    monkeypatch.setattr(je, "_star_setup", lambda *a, **k: (built.append(1), real(*a, **k))[1])
+    fact, dim1, _, _ = _tables()
+    got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+           .groupby("k", "g", "d").agg(col("v").sum().alias("s")).compute(device="cpu"))
+    _declined(calls, -11)
+    assert len(built) == 1, built
+    assert got.num_rows > 0
+
+
+def test_nothing_is_built_when_the_executor_cannot_run_the_aggregate(calls, monkeypatch):
+    import mxframe.join_engine as je
+    built = []
+    real = je._star_setup
+    monkeypatch.setattr(je, "_star_setup", lambda *a, **k: (built.append(1), real(*a, **k))[1])
+    fact, dim1, _, _ = _tables()
+    plan = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk").groupby("g").agg(col("v").sum().alias("s")))
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    plan.compute(device="cpu")
+    assert built == [] and calls["exec"] == []

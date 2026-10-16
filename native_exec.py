@@ -1127,10 +1127,11 @@ class FusedJoin:
     predicates, the partner ``Lookup``s, where each column of the joined schema lives (``vcols``: name ->
     ("fact", column) or ("partner", lookup index, column of the partner)) and the predicates over the
     joined schema (conditions across partners, filters above the join)."""
-    __slots__ = ("scan", "preds", "lookups", "vcols", "post_preds")
+    __slots__ = ("scan", "preds", "lookups", "vcols", "post_preds", "cache")
 
     def __init__(self, scan, preds, lookups, vcols, post_preds):
         self.scan, self.preds, self.lookups, self.vcols, self.post_preds = scan, list(preds), lookups, vcols, post_preds
+        self.cache = {}              # what a second call over the same join (a key range pass) reuses
 
 
 class _VTable:
@@ -1146,22 +1147,31 @@ class _VTable:
         return self._cols[name]
 
 
+def fused_join_blocked(compiler) -> Optional[str]:
+    """Why a fused join + aggregate cannot run here (switched off, not the CPU executor, library missing),
+    else None. Cheap: asked before any partner is built."""
+    if not enabled():
+        return "disabled (MXFRAME_NATIVE=0)"
+    if os.environ.get("MXFRAME_FUSED_JOIN_AGG", "1") in ("0", "false", "off"):
+        return "disabled (MXFRAME_FUSED_JOIN_AGG=0)"
+    if getattr(compiler, "_device_arg", None) != "cpu":
+        return "CPU executor: device='cpu'"
+    from . import coproc_fused
+    if coproc_fused.current_policy() is not None:
+        return "CPU+GPU co-processing policy active"
+    if not available():
+        return "libmxexec_cpu.so not built"
+    return None
+
+
 def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Optional[pa.Table]:
     """``plan``'s aggregate over the star join ``fj`` in one native call (plan version 3), or None (the
     caller materializes the join and runs the aggregate as before). ``plan.input`` is not read."""
     _last["path"] = None
     t_start = _time.perf_counter()
-    if not enabled():
-        return _decline("disabled (MXFRAME_NATIVE=0)")
-    if os.environ.get("MXFRAME_FUSED_JOIN_AGG", "1") in ("0", "false", "off"):
-        return _decline("disabled (MXFRAME_FUSED_JOIN_AGG=0)")
-    if getattr(compiler, "_device_arg", None) != "cpu":
-        return _decline("CPU executor: device='cpu'")
-    from . import coproc_fused
-    if coproc_fused.current_policy() is not None:
-        return _decline("CPU+GPU co-processing policy active")
-    if not available():
-        return _decline("libmxexec_cpu.so not built")
+    why = fused_join_blocked(compiler)
+    if why is not None:
+        return _decline(why)
     table: pa.Table = fj.scan.table
     if table.num_rows == 0 or not fj.lookups:
         return _decline("empty input")
@@ -1173,21 +1183,26 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
     from .pipeline_program import compile_pipeline, _dict_key
 
     # ── partners and the columns of the joined schema ───────────────────────────────────────────
-    pk_names: List[str] = []
-    bs, look_words = [], []
-    for lk in fj.lookups:
-        got = _lookup_keys(table, lk, pk_names)
-        if isinstance(got, str):
-            return _decline(got)
-        b, pks, widths = got
-        bs.append(b)
-        look_words.append((len(pks), pks, [b.column(bn).chunk(0) for bn in lk.build_keys], widths))
-    cols = {}
-    for name, src in fj.vcols.items():
-        c = table.column(src[1]) if src[0] == "fact" else bs[src[1]].column(src[2])
-        if src[0] == "partner" and pa.types.is_string(c.type) and 0 < len(c) <= _DICT_MAX:
-            c = pa.chunked_array([pc.dictionary_encode(c.chunk(0))])
-        cols[name] = c
+    mem = fj.cache.get("partners")
+    if mem is None:
+        pk_names: List[str] = []
+        bs, look_words = [], []
+        for lk in fj.lookups:
+            got = _lookup_keys(table, lk, pk_names)
+            if isinstance(got, str):
+                return _decline(got)
+            b, pks, widths = got
+            bs.append(b)
+            look_words.append((len(pks), pks, [b.column(bn).chunk(0) for bn in lk.build_keys], widths))
+        base = {}
+        for name, src in fj.vcols.items():
+            c = table.column(src[1]) if src[0] == "fact" else bs[src[1]].column(src[2])
+            if src[0] == "partner" and pa.types.is_string(c.type) and 0 < len(c) <= _DICT_MAX:
+                c = pa.chunked_array([pc.dictionary_encode(c.chunk(0))])
+            base[name] = c
+        mem = fj.cache["partners"] = (pk_names, bs, look_words, base)
+    pk_names, bs, look_words, base = mem
+    cols = dict(base)
 
     # ── group keys: fact columns as they are; partner columns and expressions as expression keys ──
     keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}

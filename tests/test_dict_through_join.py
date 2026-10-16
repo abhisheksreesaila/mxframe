@@ -18,8 +18,8 @@ MODES = ["A", "N", "R", "Z"]
 
 
 
-@pytest.fixture(autouse=True)
-def _star_scan(monkeypatch):
+@pytest.fixture
+def star_scan(monkeypatch):
     """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
     an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
     monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
@@ -85,7 +85,7 @@ def _approx(got, exp):
 
 
 @pytest.mark.parametrize("chunks", [1, 4])
-def test_fact_dictionary_group_key_through_a_star_join(coded, chunks):
+def test_fact_dictionary_group_key_through_a_star_join(star_scan, coded, chunks):
     fact, dim = _tables(chunks=chunks)
     got = (LazyFrame(fact).filter(col("d") < lit(70)).join(LazyFrame(dim).filter(col("w") > lit(2)),
                                                             left_on="k", right_on="dk")
@@ -97,7 +97,7 @@ def test_fact_dictionary_group_key_through_a_star_join(coded, chunks):
     assert "flag" in coded
 
 
-def test_partner_dictionary_group_key(coded):
+def test_partner_dictionary_group_key(star_scan, coded):
     fact, dim = _tables()
     got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
            .groupby("nm", "flag").agg(col("v").sum().alias("s")).compute(device="cpu"))

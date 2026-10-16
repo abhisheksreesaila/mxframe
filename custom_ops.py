@@ -1758,6 +1758,7 @@ class CustomOpsCompiler(GraphCompiler):
 
         # -1 -- Materialize Join nodes (bottom-up) --------------------
         plan = self._materialize_joins(plan)
+        self._star_stash = None            # (a declined fused attempt's partners: used by now, or never)
         # -1b -- A Sort/Limit/Distinct/Tail below a Filter/Project/Aggregate changes which rows
         # the operators above see: run it now (the Filter/Aggregate paths below only look at the
         # Scan under them, so a Limit there used to be ignored).

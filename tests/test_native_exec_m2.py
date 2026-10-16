@@ -26,8 +26,8 @@ pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not
 
 
 
-@pytest.fixture(autouse=True)
-def _star_scan(monkeypatch):
+@pytest.fixture
+def star_scan(monkeypatch):
     """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
     an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
     monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
@@ -113,14 +113,14 @@ PLANS = {
 
 
 @pytest.mark.parametrize("name", list(PLANS))
-def test_leaf_filters_run_natively_with_the_same_answer(filters, monkeypatch, name):
+def test_leaf_filters_run_natively_with_the_same_answer(star_scan, filters, monkeypatch, name):
     f, d = _fact(), _dim()
     got, old = _both(lambda: PLANS[name](f, d), monkeypatch)
     assert len(filters) >= 1, nx.last_filter()
     _same(got, old)
 
 
-def test_morsels_cross_chunks_with_string_outputs(filters, monkeypatch):
+def test_morsels_cross_chunks_with_string_outputs(star_scan, filters, monkeypatch):
     """Morsels of 64k rows span chunk boundaries: the string bytes of one morsel continue across
     chunks (pass 2), and every chunk keeps its own dictionary."""
     f = _fact(n=300_000, chunks=3)
@@ -176,7 +176,7 @@ def tpch(tmp_path_factory):
     return str(d)
 
 
-def test_tpch_join_queries_filter_their_leaves_natively(tpch, filters, monkeypatch):
+def test_tpch_join_queries_filter_their_leaves_natively(star_scan, tpch, filters, monkeypatch):
     q_mx = importlib.import_module("tpch_user.q_mx")
     q_duckdb = importlib.import_module("tpch_user.q_duckdb")
     native = []
@@ -264,7 +264,7 @@ def test_left_join_with_deferred_columns_matches(monkeypatch, filters):
     _same(got, old)
 
 
-def test_parquet_source_with_join(tmp_path, filters, monkeypatch):
+def test_parquet_source_with_join(star_scan, tmp_path, filters, monkeypatch):
     """scan_parquet: dictionary columns read as dictionaries, filtered natively at the leaf."""
     import pyarrow.parquet as pq
     import mxframe as mx
