@@ -412,6 +412,9 @@ class _SQLTranslator:
                     if nm is not None and nm != (p._alias or (p.args[0] if p.op == "col" else None)):
                         p.alias(nm)
                 if len(non_star) < len(node.expressions):
+                    if node.args.get("order"):
+                        raise ValueError("ORDER BY together with * mixed with other SELECT items is not supported "
+                                         "(list the columns, or use SELECT * alone)")
                     names = None                       # a * shifts the positions
                 hidden, sort_cols = self._hidden_sort_keys(node, non_star, names, distinct is not None) if names else ([], {})
                 plan = Project(plan, proj + [ex.alias(nm) for nm, ex in hidden])
@@ -461,6 +464,7 @@ class _SQLTranslator:
             if nm is not None:
                 have.setdefault(self._expr(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
         hidden = []
+        taken = set(names) | {c.lower() for c in self._scope_columns}
         for o in order_node.expressions if order_node else []:
             ref = o.this
             if _ordinal(ref, len(node.expressions)) is not None:
@@ -472,7 +476,12 @@ class _SQLTranslator:
                 continue
             if distinct:
                 raise ValueError("for SELECT DISTINCT, ORDER BY expressions must appear in the select list")
-            have[ex.signature()] = nm = f"__ord{len(hidden)}"
+            n = len(hidden)
+            while f"__ord{n}" in taken:                # never a name the query or its tables use
+                n += 1
+            nm = f"__ord{n}"
+            taken.add(nm)
+            have[ex.signature()] = nm
             hidden.append((nm, ex))
         return hidden, have
 

@@ -2010,8 +2010,17 @@ class CustomOpsCompiler(GraphCompiler):
 
     def compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
         """Run ``plan``; the result of ``count`` aggregates is always exact int64."""
+        # F-083: a column-only Project above Sort / Limit just drops the sort keys the SELECT list
+        # leaves out. Run the Sort / Limit as post-ops (the top-n paths need them at the top), then pick.
+        keep = None
+        if isinstance(plan, Project) and isinstance(plan.input, (Sort, Limit)) \
+                and all(e.op == "col" for e in plan.exprs):
+            keep, plan = plan.exprs, plan.input
         result = self._compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
-        return self._exact_counts(plan, result)
+        result = self._exact_counts(plan, result)
+        if keep is not None:
+            result = result.select([e.args[0] for e in keep]).rename_columns([e._alias or e.args[0] for e in keep])
+        return result
 
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:

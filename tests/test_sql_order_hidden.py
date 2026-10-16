@@ -97,3 +97,53 @@ def test_distinct_order_by_selected_still_works(q):
 ])
 def test_hidden_sort_key_on_gpu(q):
     _compare(q, device="gpu")
+
+
+# ---- review fixes -------------------------------------------------------------------------------
+
+def _post_op_types(q, monkeypatch, **tables):
+    """The Sort / Limit nodes the compiler peeled off the top of the plan, per call."""
+    from mxframe.compiler import GraphCompiler
+    seen = []
+    orig = GraphCompiler._extract_post_ops.__func__
+
+    def spy(cls, plan):
+        core, ops = orig(cls, plan)
+        seen.append([type(o).__name__ for o in ops])
+        return core, ops
+    monkeypatch.setattr(GraphCompiler, "_extract_post_ops", classmethod(spy))
+    mx.sql(q, **tables).compute(device="cpu")
+    return seen
+
+
+def test_hidden_key_keeps_the_top_n_post_ops(monkeypatch):
+    t = _t()
+    hidden = _post_op_types("SELECT a FROM t ORDER BY b LIMIT 7", monkeypatch, t=t)
+    selected = _post_op_types("SELECT a, b FROM t ORDER BY b LIMIT 7", monkeypatch, t=t)
+    assert selected[0] == ["Sort", "Limit"]
+    assert hidden[0] == selected[0]
+
+
+def test_hidden_key_name_never_collides():
+    u = pa.table({"__ord0": pa.array([1, 2, 3], pa.int64()), "b": pa.array([3, 1, 2], pa.int64())})
+    for q in ["SELECT __ord0 FROM u ORDER BY b", "SELECT __ord0 FROM u ORDER BY b + 1",
+              "SELECT b AS __ord0 FROM u ORDER BY __ord0 + 1", "SELECT 1 AS __ord0 FROM u ORDER BY b"]:
+        exp = duckdb.sql(q).fetch_arrow_table()
+        got = mx.sql(q, u=u).compute(device="cpu")
+        assert got.to_pydict() == exp.to_pydict(), q
+    t = _t().append_column("__ord0", pa.array(np.arange(400)[::-1], pa.int64()))
+    q = "SELECT a AS __ord1 FROM t ORDER BY b + c, i"
+    assert mx.sql(q, t=t).compute(device="cpu").to_pydict() == duckdb.sql(q).fetch_arrow_table().to_pydict()
+
+
+def test_star_mixed_with_columns_and_order_by_is_a_clear_error():
+    for q in ["SELECT *, a + 1 AS z FROM t ORDER BY b", "SELECT a, * FROM t ORDER BY b"]:
+        with pytest.raises(ValueError, match="not supported"):
+            mx.sql(q, t=_t())
+
+
+def test_dataframe_sort_by_dropped_column_names_it():
+    f = mx.sql("SELECT * FROM t", t=_t())
+    assert f.sort("b").select("a").compute(device="cpu").column_names == ["a"]      # sort before select
+    with pytest.raises(ValueError, match="'b'.*sort before select"):
+        f.select("a").sort("b")
