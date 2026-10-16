@@ -950,10 +950,11 @@ Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
 - Review round 1: merged main (F-094 `%`); `_is_int_expr` also takes `%` of integers, COUNT and integer MIN / MAX, so a big literal next to them stays exact; negation folds any constant (`-(-1)`, `- -1`). SUM is not treated as integer: the engine still returns it as a double (F-060), so `sum(s) + 9007199254740993` rounds until F-060 lands. Tests for `(i - 1) % 10`, `m % 0` over a subquery, and small-int queries staying native.
 - Found, not fixed: global / grouped `max(i)` / `min(i)` on int64 past 2^53 returns double (or raises "not in range" for `min(i + 1)`); `int64 + float_col` past 2^53 raises ArrowInvalid instead of rounding to double like DuckDB; `%`, `//` unsupported (F-094); `-s` on int32 gives int64; `sum(int32)` is double (F-060).
 
-## F-104 Chained LEFT JOIN on the previous right table's key [todo]
+## F-104 Chained LEFT JOIN on the previous right table's key [review]
 Found by the F-086 review (2026-10-16); a silent wrong answer on main
-- [ ] `t LEFT JOIN u ON t.k = u.k LEFT JOIN x ON u.k = x.k`: for a `t.k` with no match in `u`, `u.k` is NULL so `x` must not match (DuckDB z = NULL); mx joins `x` anyway (z = 300) because a later join's ON resolves `u.k` to `t.k`. Extend F-086's right-key copy (`_copy_right_keys`, which skips joins' ON clauses) to later ON clauses
-- [ ] DuckDB-checked tests: two and three chained LEFT JOINs keyed on the previous right table, mixed INNER / LEFT, unmatched rows at each step; fails before
+- [x] `t LEFT JOIN u ON t.k = u.k LEFT JOIN x ON u.k = x.k`: for a `t.k` with no match in `u`, `u.k` is NULL so `x` does not match (z = NULL, as DuckDB). `_copy_right_keys` also scans later joins' ON clauses for `u.k`, and `_use_right_key_copies` rewrites those ON references to the NULL-on-unmatched copy before `_parse_join_on` (which now swaps `x.k = u.k` written either way round, and registers a copy as the left key's name). After an INNER JOIN on a copy, `x.k` resolves to the copy. A right column the join renamed (`x.k` -> `k_right`, when it is not a key) is named by its output name in a later ON
+- [x] DuckDB-checked tests (`tests/test_sql_chained_left_join.py`, cpu and gpu): two and three chained LEFT JOINs on the previous right key (either operand order), mixed INNER / LEFT, a previous right table's non-key column (`u.v`), USING forms, aggregate over the chain, unmatched rows at each step; 29 of 45 failed before
+- Not changed: a bare `k` in a later ON stays the left table's (DuckDB calls it ambiguous)
 
 ## F-105 SQL CASE with string results [todo]
 Seen in the F-086 review (2026-10-16)
@@ -983,3 +984,8 @@ Found by the F-093 developer (2026-10-16)
 - [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
 - [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
 - [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before
+
+## F-109 SQL JOIN ON ignores the table qualifier [todo]
+Found by the F-104 review (2026-10-16); a silent wrong answer on main
+- [ ] `_parse_join_on` matches columns by name only. `t JOIN x ON x.v = t.k`, where `k` and `v` are in both tables, joins `t.v = x.k`: mx returns ids 1, 2, 5 and DuckDB returns 2, 5. Decide each side of an equality from its qualifier (`t.` / alias in the tables joined so far, or the table being joined), falling back to the column name only for an unqualified column; an unqualified name found in both sides raises (DuckDB: ambiguous)
+- [ ] DuckDB-checked tests: qualified ON in either operand order with the same column names in both tables, two and three tables, LEFT / INNER, a USING form; fails before
