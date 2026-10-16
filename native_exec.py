@@ -1196,6 +1196,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
             look_words.append((len(pks), pks, [b.column(bn).chunk(0) for bn in lk.build_keys], widths))
         base = {}
         for name, src in fj.vcols.items():
+            if src[0] == "prow":
+                continue
             c = table.column(src[1]) if src[0] == "fact" else bs[src[1]].column(src[2])
             if src[0] == "partner" and pa.types.is_string(c.type) and 0 < len(c) <= _DICT_MAX:
                 c = pa.chunked_array([pc.dictionary_encode(c.chunk(0))])
@@ -1203,6 +1205,13 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         mem = fj.cache["partners"] = (pk_names, bs, look_words, base)
     pk_names, bs, look_words, base = mem
     cols = dict(base)
+    if plan.group_by and not any(src[0] == "prow" for src in fj.vcols.values()):
+        got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops, only_if_wide=True)
+        if got is not None:                      # keys too many for direct addressing: group by partner row
+            return got
+    for name, src in fj.vcols.items():
+        if src[0] == "prow":             # the partner's row number (group = partner row): an int32 column
+            cols[name] = pa.chunked_array([_npa_i32_empty()])
 
     # ── group keys: fact columns as they are; partner columns and expressions as expression keys ──
     keys, derived, known, post, fact_key, extra = [], {}, {}, {}, {}, {}
@@ -1219,7 +1228,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
             c = cols[name]
             if c.null_count:
                 return _decline("partner group key with nulls")
-            if c.type in (pa.int32(), pa.int64()):
+            if src[0] == "prow":
+                derived[i], known[i] = e, (0, bs[src[1]].num_rows - 1)
+            elif c.type in (pa.int32(), pa.int64()):
                 a = _np_of(c.chunk(0), zero_copy_only=False)
                 derived[i], known[i], post[i] = e, (int(a.min()), int(a.max())), c.type
             elif (pa.types.is_dictionary(c.type) and c.type.index_type == pa.int32()
@@ -1261,6 +1272,10 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
     outputs = prog.outputs[:n_user]
     names = [name for name, _, _ in outputs]
     ranges = dict(known)
+    for i in [i for i in sorted(derived) if i not in known]:
+        bnd = _bounds(derived[i], lambda n: _partner_range(fj, cols, n))
+        if bnd is not None:                  # an integer expression of partner columns: bounded without a pass
+            known[i] = ranges[i] = bnd
     probe_idx = [i for i in sorted(derived) if i not in known]
     if probe_idx:                      # an expression key's range: one fused min / max pass over the same join
         probe = Aggregate(None, [], [a for i in probe_idx
@@ -1274,6 +1289,10 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
                 return _decline("derived group key: not an integer range")
             ranges[i] = (int(lo), int(hi))
     if any(hi - lo + 1 > MAX_GROUPS for lo, hi in ranges.values()):
+        if not any(src[0] == "prow" for src in fj.vcols.values()):
+            got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)
+            if got is not None:
+                return got
         return _decline("group key: range too wide for direct addressing")
     sorts = _sort_spec(sort_by, keys, names)
     if isinstance(sorts, str):
@@ -1304,7 +1323,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         else:
             j = src[1] if src is not None else extra[name][0]
             colmap.append(-(len(bspec) + 1))
-            bspec.append((j, name, 0 if pa.types.is_dictionary(c.type) else _DT[c.type]))
+            bspec.append((j, name, 7 if src is not None and src[0] == "prow"
+                          else 0 if pa.types.is_dictionary(c.type) else _DT[c.type]))
     key_cols, kinds = [], []
     for i, k in enumerate(keys):
         if i in derived:
@@ -1369,7 +1389,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
                 m = extra[name][1]
                 keep.append(m)
                 rm = m.ctypes.data
-            bwords += [j, export(cols[name].chunk(0)), dcode, rm]
+            bwords += [j, export(look_words[j][2][0] if dcode == 7 else cols[name].chunk(0)), dcode, rm]
         c_bcols = (ctypes.c_int64 * max(len(bwords), 1))(*bwords)
         doffs = []
         for seg in segs:
@@ -1421,6 +1441,10 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         for st in structs:
             if st[8]:
                 _RELEASE(st[8])(ctypes.addressof(st))
+    if rc == -11 and not any(src[0] == "prow" for src in fj.vcols.values()):
+        got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops)   # E_BAD_KEY: keys past direct addressing
+        if got is not None:
+            return got
     if rc < 0:
         return _decline(f"executor declined (code {rc})")
 
@@ -1435,6 +1459,210 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops) -> Op
         "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data", "fused_join": True,
     }
     return result
+
+
+def _partner_range(fj: FusedJoin, cols, name):
+    """(min, max) of an integer partner column of the joined schema, else None (a fact column: no pass over it)."""
+    import numpy as np
+    from .np_arrow import to_numpy as _np_of
+    src = fj.vcols.get(name)
+    c = cols.get(name)
+    if src is None or src[0] != "partner" or c is None or c.null_count or c.type not in (pa.int32(), pa.int64()):
+        return None
+    a = _np_of(c.chunk(0), zero_copy_only=False)
+    return int(a.min()), int(a.max())
+
+
+def _bounds(e, rng):
+    """A (lo, hi) interval every value of integer expression ``e`` lies in, from the ranges ``rng(name)`` of its
+    columns, or None. Conservative: a CASE WHEN is the union of its branches. Group ids outside the values
+    that occur just stay empty."""
+    op = e.op
+    if op == "lit":
+        v = e.args[0]
+        return (int(v), int(v)) if isinstance(v, int) and not isinstance(v, bool) else None
+    if op == "col":
+        return rng(e.args[0])
+    if op == "case_when":
+        a, b = _bounds(e.args[1], rng), _bounds(e.args[2], rng)
+        return None if a is None or b is None else (min(a[0], b[0]), max(a[1], b[1]))
+    if op in ("add", "sub", "mul"):
+        a, b = _bounds(e.args[0], rng), _bounds(e.args[1], rng)
+        if a is None or b is None:
+            return None
+        if op == "add":
+            return a[0] + b[0], a[1] + b[1]
+        if op == "sub":
+            return a[0] - b[1], a[1] - b[0]
+        p = [a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]]
+        return min(p), max(p)
+    return None
+
+
+def _npa_i32_empty():
+    import numpy as np
+    from .np_arrow import array as _npa
+    return _npa(np.empty(0, dtype=np.int32))
+
+
+def _group_codes(t):
+    """Dense int64 codes (equal values, equal codes) of a key column: values as they are for integers,
+    dictionary indices of the strings (hashed, no sort)."""
+    import numpy as np
+    from ._lazy_pc import pc
+    from .np_arrow import to_numpy as _np_of, combine as _combine
+    arr = _combine(t) if isinstance(t, pa.ChunkedArray) else t
+    if not pa.types.is_integer(arr.type):
+        arr = pc.dictionary_encode(pc.cast(arr, pa.string()) if pa.types.is_dictionary(arr.type) else arr).indices
+    return np.asarray(_np_of(arr, zero_copy_only=False)).astype(np.int64)
+
+
+def _try_prow_groups(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops, only_if_wide=False) -> Optional[pa.Table]:
+    """Group keys past direct addressing (TPC-H Q3's per-order keys, Q10's per-customer keys): when every key is
+    a column of ONE partner (or the fact column equal to its join key), group by the partner's ROW (a dense id
+    below its row count: `K_PROW`, the executor gathers the row number like any partner column), then take
+    the key columns from the partner at those rows. Keys that do not include the partner's unique join key
+    make several partner rows share a key tuple: those groups are merged here (sums and counts add, min / max
+    fold, a mean is its sum over its count). HAVING and ORDER BY / LIMIT run on that small result, the
+    way the old path runs them. None: not this shape (or the partner has more rows than a direct id space)."""
+    import numpy as np
+    from ._lazy_pc import pc
+    from .lazy_expr import Expr
+    from .np_arrow import array as _npa, scalar as _npscalar, to_numpy as _np_of, combine as _combine
+    srcs = []
+    for e in plan.group_by:
+        if not (e.op == "col" and e._alias in (None, e.args[0])) or fj.vcols.get(e.args[0]) is None:
+            return None
+        srcs.append((e.args[0], fj.vcols[e.args[0]]))
+    if not srcs:
+        return None
+    owners = {src[1] for _, src in srcs if src[0] == "partner"}
+    if len(owners) > 1:
+        return None
+    if owners:
+        j = next(iter(owners))
+    else:
+        j = next((jj for jj, lk in enumerate(fj.lookups) if all(src[1] in lk.probe for _, src in srcs)), None)
+        if j is None:
+            return None
+    lk, b = fj.lookups[j], bs[j]
+    take_from = []                      # per key: its column of the partner
+    for name, src in srcs:
+        if src[0] == "partner":
+            take_from.append(src[2])
+        elif src[1] in lk.probe:
+            take_from.append(lk.build_keys[lk.probe.index(src[1])])
+        else:
+            return None
+    if b.num_rows > MAX_GROUPS:
+        return None
+    if only_if_wide:        # direct addressing would do when the keys' ranges multiply to few enough groups
+        from .np_arrow import to_numpy as _np
+        est = 1
+        for bn in take_from:
+            c = b.column(bn)
+            if c.null_count == 0 and c.type in (pa.int32(), pa.int64()):
+                a = _np(c.chunk(0), zero_copy_only=False)
+                est *= int(a.max()) - int(a.min()) + 1
+            elif pa.types.is_dictionary(c.type):
+                est *= max(1, len(c.chunk(0).dictionary))
+            else:
+                est *= max(1, b.num_rows)
+            if est > MAX_GROUPS:
+                break
+        if est <= MAX_GROUPS:
+            return None
+    merge = bool(set(lk.build_keys) - set(take_from))
+    extra = []
+    if merge:
+        extra = [Expr("sum", a.args[0]).alias(f"__hs{i}") for i, a in enumerate(plan.aggs) if a.op == "mean"]
+        extra.append(Expr("count", Expr("lit", 1)).alias("__hc"))
+    vcols = dict(fj.vcols)
+    vcols["__prow"] = ("prow", j)
+    fj2 = FusedJoin(fj.scan, fj.preds, fj.lookups, vcols, fj.post_preds)
+    fj2.cache = fj.cache
+    R = try_execute_join(compiler, Aggregate(None, [Expr("col", "__prow")], list(plan.aggs) + extra), fj2, None, None)
+    if R is None:
+        return None
+    out_names = [a._alias or f"agg_{i}" for i, a in enumerate(plan.aggs)]
+    gp = np.asarray(_np_of(_combine(R.column("__prow")), zero_copy_only=False)).astype(np.int64)    # partner row per group
+    agg_cols = [R.column(n) for n in out_names]
+    if merge and len(gp):
+        def num(n):
+            return np.asarray(_np_of(_combine(R.column(n)), zero_copy_only=False))
+        gid, span = None, 1
+        for bn in take_from:                       # codes per partner row, then per group; no string is materialized
+            c = _group_codes(b.column(bn))[gp]
+            w = int(c.max()) + 1
+            if gid is not None and span * w >= 1 << 62:      # compact the combined codes before they overflow
+                gid = np.unique(gid, return_inverse=True)[1].astype(np.int64)
+                span = int(gid.max()) + 1
+            gid = c if gid is None else gid * w + c
+            span *= w
+        order = np.argsort(gid, kind="stable")
+        sg = gid[order]
+        starts = np.flatnonzero(np.concatenate(([True], sg[1:] != sg[:-1])))
+        gp = gp[order[starts]]
+        cnt = np.add.reduceat(num("__hc")[order].astype(np.float64), starts)
+        agg_cols = []
+        for i, a in enumerate(plan.aggs):
+            v = num(out_names[i])[order]
+            if a.op == "sum":
+                agg_cols.append(_npa(np.add.reduceat(v.astype(np.float64), starts)))
+            elif a.op == "count":
+                agg_cols.append(_npa(np.add.reduceat(v.astype(np.int64), starts)))
+            elif a.op == "min":
+                agg_cols.append(_npa(np.fmin.reduceat(v.astype(np.float64), starts)))
+            elif a.op == "max":
+                agg_cols.append(_npa(np.maximum.reduceat(v.astype(np.float64), starts)))
+            else:
+                agg_cols.append(_npa(np.add.reduceat(num(f"__hs{i}")[order].astype(np.float64), starts) / cnt))
+
+    def subset(idx):
+        nonlocal gp, agg_cols
+        gp = gp[idx]
+        agg_cols = [pc.take(c, _npa(idx.astype(np.int64))) for c in agg_cols]
+
+    post = compiler._key_tiebreak(plan, list(post_ops or []))
+    names = [n for n, _ in srcs] + out_names
+    if having_pred is not None:
+        # HAVING reads aggregates: evaluate it before any key is materialized
+        from .optimizer import _expr_columns
+        hc = _expr_columns(having_pred)
+        if hc is not None and set(hc) <= set(out_names):
+            mask = compiler._eval_predicate(having_pred, pa.Table.from_arrays(agg_cols, names=out_names))
+            subset(np.flatnonzero(np.asarray(_np_of(pc.fill_null(mask, _npscalar(False, type=pa.bool_())),
+                                                    zero_copy_only=False))))
+            having_pred = None
+    sort = post_ops[0] if post_ops and isinstance(post_ops[0], Sort) else None
+    if (sort is not None and len(post_ops) == 2 and isinstance(post_ops[1], Limit) and len(gp) > 8 * max(post_ops[1].n, 1)
+            and sort.by[0].op == "col" and sort.by[0].args[0] in out_names):
+        # ORDER BY an aggregate LIMIT k: only the rows that can reach the top k need their keys (and the
+        # key tie-break): those at least as good as the k-th by the first sort column, ties included
+        desc = sort.descending[0] if isinstance(sort.descending, (list, tuple)) else bool(sort.descending)
+        v = np.asarray(_np_of(_combine(agg_cols[out_names.index(sort.by[0].args[0])]), zero_copy_only=False)).astype(np.float64)
+        k = max(post_ops[1].n, 1)
+        if not np.isnan(v).any():
+            w = -v if desc else v
+            thr = np.partition(w, k - 1)[k - 1]
+            subset(np.flatnonzero(w <= thr))
+    key_cols = []
+    for (name, src), bn in zip(srcs, take_from):
+        t = pc.take(b.column(bn), _npa(gp))
+        if pa.types.is_dictionary(t.type):
+            t = pc.cast(t, pa.string())
+        if src[0] == "fact" and t.type != fj.scan.table.column(src[1]).type:
+            t = pc.cast(t, fj.scan.table.column(src[1]).type)
+        key_cols.append(t)
+    t = pa.Table.from_arrays(key_cols + agg_cols, names=names)
+    if having_pred is not None:
+        mask = compiler._eval_predicate(having_pred, t)
+        t = pc.filter(t, pc.fill_null(mask, _npscalar(False, type=pa.bool_())))
+    if sort is None and t.num_rows > 1:
+        t = pc.take(t, pc.sort_indices(t, sort_keys=[(n, "ascending") for n, _ in srcs]))        # key order
+    if post:
+        t = compiler._apply_post_ops_custom(t, post)
+    return t
 
 
 # ── M2: native gather (a join's output rows) ───────────────────────────────────────────────

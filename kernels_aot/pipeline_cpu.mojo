@@ -730,8 +730,10 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     # workers update the output itself with atomic add / min / max; no partials, no merge
     var want = max(1, min(threads if threads > 0 else 1, morsels))
     # (fused: the rows read are the fact table's, most of the work is the front stage's lookups, and
-    # few rows may survive: all workers take part whatever the row count)
-    var shared = has_gids and A > 0 and want >= 4 and nthreads * 2 <= want and (total >= SHARED_MIN_ROWS or fused)
+    # few rows may survive: all workers take part whatever the row count, and many groups are accumulated
+    # in the shared output rather than as a zeroed and merged partial per worker)
+    var shared = has_gids and A > 0 and want >= 4 and ((nthreads * 2 <= want and (total >= SHARED_MIN_ROWS or fused))
+                                                       or (fused and G >= MERGE_GROUPS))
     if shared:
         nthreads = want
 

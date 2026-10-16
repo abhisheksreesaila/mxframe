@@ -1138,7 +1138,11 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var arr = Int(bc[1])
             var rm = Int(bc[3])
             var dst = scr + u * VEC * 8
-            if rm != 0:                                        # dictionary codes through a rank table: int32
+            if Int(bc[2]) == 7:                                # the partner row itself (group = partner row): int32
+                var d = _ip(dst)
+                for t in range(nc):
+                    d[Int(sel[t])] = prow[j * VEC + t]
+            elif rm != 0:                                      # dictionary codes through a rank table: int32
                 var src = _ip(_arr_buf(arr, 1)) + _arr_off(arr)
                 var rmp = _ip(rm)
                 var d = _ip(dst)

@@ -466,3 +466,60 @@ def test_nothing_is_built_when_the_executor_cannot_run_the_aggregate(calls, monk
     monkeypatch.setenv("MXFRAME_NATIVE", "0")
     plan.compute(device="cpu")
     assert built == [] and calls["exec"] == []
+
+
+# ── group keys past direct addressing: group by the partner's row (K_PROW), merged when keys repeat ───────
+
+def _wide_dim(m=6000, seed=11):
+    """A partner whose key columns multiply to 40 million codes, with only ~3500 distinct tuples (so several
+    partner rows share one tuple)."""
+    r = np.random.default_rng(seed)
+    return pa.table({
+        "dk": A(np.arange(m, dtype=np.int64)),
+        "a": A((r.integers(0, 50, m) * 40_000).astype(np.int64)),
+        "b": A(r.integers(0, 10, m).astype(np.int32)),
+        "nm": _dict_col([NAMES[i] for i in r.integers(0, 7, m)], 1, seed),
+        "w": A(np.round(r.random(m), 3)),
+    })
+
+
+def test_keys_with_the_partners_unique_key_group_by_partner_row(calls):
+    """TPC-H Q3's shape: the fact's join key plus partner columns; one group per partner row, no merge."""
+    fact, dim1, _, _ = _tables()
+    got = (LazyFrame(fact).filter(col("d") < lit(60)).join(LazyFrame(dim1), left_on="k", right_on="dk")
+           .groupby("k", "day", "cls").agg((col("v") * col("w")).sum().alias("rev"), col("v").count().alias("n"))
+           .sort("rev", descending=True).limit(10).compute(device="cpu"))
+    _fused(calls)
+    assert calls["rc3"] == [0], calls
+    exp = _duck("SELECT k, day, cls, SUM(v * w) rev, COUNT(v) n FROM fact JOIN dim1 ON k = dk WHERE d < 60 "
+                "GROUP BY k, day, cls ORDER BY rev DESC, k, day, cls LIMIT 10", fact=fact, dim1=dim1)
+    _same(_rows(got, ["k", "day", "cls", "rev", "n"]), exp, ordered=True)
+    assert got.schema.field("k").type == pa.int64() and got.schema.field("cls").type == pa.int32()
+
+
+@pytest.mark.parametrize("shape", ["unsorted", "top-k", "having"])
+def test_partner_keys_without_the_unique_key_are_merged(calls, shape):
+    """TPC-H Q10's shape: keys are columns of one partner but not its join key, so partner rows sharing a key
+    tuple are merged: sums and counts add, min / max fold, a mean is its sum over its count."""
+    fact, _, _, _ = _tables()
+    dim = _wide_dim()
+    fact = fact.set_column(0, "k", A((np.asarray(fact.column("k").to_numpy()) % 6000).astype(np.int64)))
+    lf = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
+          .groupby("a", "b", "nm").agg((col("v") * col("w")).sum().alias("s"), col("v").count().alias("n"),
+                                       col("v").min().alias("lo"), col("v").max().alias("hi"), col("v").mean().alias("av")))
+    sql = "SELECT a, b, nm, SUM(v * w) s, COUNT(v) n, MIN(v) lo, MAX(v) hi, AVG(v) av FROM fact JOIN dim ON k = dk GROUP BY a, b, nm"
+    if shape == "top-k":
+        lf, sql = lf.sort("s", descending=True).limit(5), sql + " ORDER BY s DESC, a, b, nm LIMIT 5"
+    elif shape == "having":
+        sums = sorted(r[0] for r in _duck(f"SELECT s FROM ({sql})", fact=fact, dim=dim))
+        cut = (sums[1500] + sums[1501]) / 2                     # between two groups: no tie on the last bits
+        lf, sql = lf.filter(col("s") > lit(cut)), sql + f" HAVING SUM(v * w) > {cut!r} ORDER BY a, b, nm"
+    else:
+        sql = sql + " ORDER BY a, b, nm"                                      # unsorted: key order
+    got = lf.compute(device="cpu")
+    _fused(calls)
+    assert calls["rc3"] == [0], calls
+    exp = _duck(sql, fact=fact, dim=dim)
+    assert len(exp) > 3
+    _same(_rows(got, ["a", "b", "nm", "s", "n", "lo", "hi", "av"]), exp, ordered=True)
+    assert got.schema.field("nm").type == pa.string() and got.schema.field("a").type == pa.int64()
