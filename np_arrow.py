@@ -562,14 +562,19 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
         if op == "sum" and pa.types.is_integer(a.type):
             out.append(array(np.ma.array(_int_group_sum(a, valid, g, n_groups), mask=cnt == 0), type=pa.int64()))
             continue
-        if op in ("min", "max") and pa.types.is_integer(a.type):      # exact: float64 rounds past 2^53
+        if op in ("min", "max") and (pa.types.is_integer(a.type) or pa.types.is_date(a.type) or pa.types.is_timestamp(a.type)):
+            # exact: float64 rounds past 2^53 (F-093: a date / timestamp is its integer storage)
+            own = a.type
+            if not pa.types.is_integer(own):
+                a = pc.cast(a, pa.int32() if pa.types.is_date32(own) else pa.int64())
             dt = np.dtype(f"{'u' if pa.types.is_unsigned_integer(a.type) else 'i'}{a.type.bit_width // 8}")
             xi = np.frombuffer(a.buffers()[1], dtype=dt, count=a.offset + len(a))[a.offset:][valid] if len(a) else np.zeros(0, dt)
             res = np.zeros(n_groups, dtype=dt)
             init = np.iinfo(dt).max if op == "min" else np.iinfo(dt).min
             res[:] = init
             (np.minimum if op == "min" else np.maximum).at(res, g, xi)
-            out.append(array(np.ma.array(res, mask=cnt == 0), type=a.type))
+            res = array(np.ma.array(res, mask=cnt == 0), type=a.type)
+            out.append(res if own == a.type else pc.cast(res, own))
             continue
         x = _float_values(a)[valid]
         if op in ("sum", "mean"):

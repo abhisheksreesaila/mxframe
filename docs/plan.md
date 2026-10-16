@@ -885,10 +885,11 @@ Found by the F-086 developer (2026-10-16)
 - [x] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
 - [x] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
 
-## F-093 MIN / MAX of a date column [todo]
+## F-093 MIN / MAX of a date column [done]
 Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+- Note: a date64 input keeps date64 (DuckDB returns date32); a tz timestamp keeps its zone.
 
 ## F-094 SQL modulo operator [done]
 Found by the F-087 developer (2026-10-16)
@@ -968,3 +969,9 @@ Finding (no dump was needed; found by reading the lock sites, reproduced determi
 Fix: `_evict` never blocks; it queues the key and evicts at once when the lock is free, else `_drain_evictions()` (blocking, called before every cache lookup: `_acquire`, `_start_upload`, `resident_for`, `clear_residency`) does it, so a dead owner's entry is still never found. Same pattern removed in `aot_kernels._get_cuda_driver` and `gpu_stream._driver` (DeviceArray `__del__` calls them while the init holds their lock): lock-free fast path once built.
 Tests: tests/test_f107_lock_reentry.py (3, child processes with timeouts; two hung before the fix).
 
+## F-108 SQL TIMESTAMP literals and temporal expressions in aggregates [todo]
+Found by the F-093 developer (2026-10-16)
+- [ ] `TIMESTAMP '2024-01-01 10:00:00'` (and `CAST('...' AS TIMESTAMP)`) is unsupported in the SQL front end (`Unsupported SQL expression type: Cast ... TIMESTAMPNTZ`); map to a timestamp literal compared in the column's unit and zone like DuckDB
+- [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
+- [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
+- [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before
