@@ -82,8 +82,7 @@ def test_each_path_serves_the_renamed_key(path, served, key, alias):
            .groupby(alias).agg(col("v").sum().alias("x")).compute(device="cpu"))
     assert res.column_names == [alias, "x"]
     assert _as_dict(res, alias, "x") == pytest.approx(_expected(t, key, "v"))
-    want = {"default": "native" if key == "k" else "fused", "no-native": "fused",
-            "no-native-no-fused": None}[path]
+    want = {"default": "native", "no-native": "fused", "no-native-no-fused": None}[path]       # (F-069: a renamed string key is native too)
     assert (served[0] if served else None) == want
 
 

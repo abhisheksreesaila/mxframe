@@ -82,6 +82,22 @@ class Expr:
         """True for rows where this string column contains *pattern* (substring match)."""
         return Expr("contains", self, pattern)
 
+    def endswith(self, suffix: str) -> 'Expr':
+        """True for rows where this string column ends with *suffix* (``%`` and ``_`` are plain characters)."""
+        return self.like("%" + "".join("\\" + c if c in "\\%_" else c for c in suffix), "\\")
+
+    def like(self, pattern: str, escape: str = None, ignore_case: bool = False) -> 'Expr':
+        """SQL ``LIKE``: ``%`` is any run of characters, ``_`` exactly one character (a UTF-8 code point).
+        Like DuckDB there is no escape character unless ``escape`` names one. A NULL string matches nothing,
+        and neither does its negation. ``ignore_case`` is ``ILIKE``."""
+        from .str_patterns import parse_like
+        parse_like(pattern, escape)                          # raises ValueError on a bad pattern / escape
+        return Expr("like", self, pattern, escape, bool(ignore_case))
+
+    def ilike(self, pattern: str, escape: str = None) -> 'Expr':
+        """SQL ``ILIKE``: :meth:`like` ignoring case."""
+        return self.like(pattern, escape, True)
+
     def between(self, lo, hi) -> 'Expr':
         """True for rows where lo <= value <= hi (inclusive on both ends)."""
         lo_expr = lit(lo) if not isinstance(lo, Expr) else lo
@@ -153,6 +169,7 @@ class Expr:
         """Return a hashable structural signature for graph caching."""
         def _sig(a):
             if isinstance(a, Expr): return a.signature()
+            if hasattr(a, "signature"): return a.signature()      # a subquery's plan
             if isinstance(a, list): return ("list", tuple(a))
             return a
         child_sigs = tuple(_sig(a) for a in self.args)

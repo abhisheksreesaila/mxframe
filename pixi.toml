@@ -44,6 +44,7 @@ pandas = ">=3.0.1,<4"
 ipykernel = ">=7.1.0,<8"
 pytest = ">=9.1.1,<10"
 twine = ">=7.0.0,<8"
+patchelf = ">=0.19.2,<0.20"
 
 [pypi-dependencies]
 polars = ">=1.29, <1.35"

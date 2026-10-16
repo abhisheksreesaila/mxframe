@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Union
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
 from ._lazy_pc import pc
+from .np_arrow import checked_arith as _checked_arith
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
@@ -89,7 +90,7 @@ def _align_literals(lhs, rhs):
 
 
 # Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
-_DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
+_DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains", "like"))
 
 class _LazyCmpOps:
     """MAX comparison ops by name; ``ops`` is only touched when one is looked up."""
@@ -231,6 +232,50 @@ class GraphCompiler:
         post_ops.reverse()  # innermost first = correct application order
         return plan, post_ops
 
+    @staticmethod
+    def _tiebreak_names(plan):
+        """Output names of the group keys of the Aggregate under `plan` (Project / Filter nodes over it),
+        as `plan` exposes them. A Project that drops a key (or computes a column in its place)
+        takes it out: nothing is left to tie-break on for that key."""
+        projects = []
+        while isinstance(plan, (Project, Filter)):
+            if isinstance(plan, Project):               # a Filter keeps every name
+                projects.append(plan)
+            plan = plan.input
+        if not (isinstance(plan, Aggregate) and plan.group_by):
+            return []
+        names = [e._alias or (e.args[0] if e.op == "col" else None) for e in plan.group_by]
+        for prj in reversed(projects):                      # innermost Project first
+            out = []
+            for n in names:
+                hit = [e for e in prj.exprs if e.op == "col" and e.args[0] == n] if n is not None else []
+                out.append(hit[0]._alias or n if hit else None)
+            names = out
+        return [n for n in names if n is not None]
+
+    @classmethod
+    def _key_tiebreak(cls, plan, post_ops):
+        """ORDER BY right above a group-by (or above Projects over one that keep its keys): add the
+        group keys (ascending) as the last sort columns, so ties come out in key order on every
+        path, as the native executor and `ORDER BY ..., keys` in DuckDB do (a hash table's own
+        order is not deterministic)."""
+        if not (post_ops and isinstance(post_ops[0], Sort)):
+            return post_ops
+        names = cls._tiebreak_names(plan)
+        if not names:
+            return post_ops
+        srt = post_ops[0]
+        have = {e.args[0] for e in srt.by if e.op == "col"}
+        desc = list(srt.descending) if isinstance(srt.descending, (list, tuple)) \
+            else [bool(srt.descending)] * len(srt.by)
+        by = list(srt.by)
+        for name in names:
+            if name not in have:
+                by.append(Expr("col", name))
+                desc.append(False)
+                have.add(name)
+        return [Sort(srt.input, by, desc)] + list(post_ops[1:])
+
     @classmethod
     def _apply_post_ops(cls, table: pa.Table, post_ops: list) -> pa.Table:
         """Apply Sort/Limit/Distinct operations on the Arrow result table.
@@ -257,6 +302,7 @@ class GraphCompiler:
         """Apply filters eagerly in PyArrow, then compile the rest to a MAX Graph."""
         # Peel off Sort/Limit/Distinct from top of plan
         core_plan, post_ops = self._extract_post_ops(plan)
+        post_ops = self._key_tiebreak(core_plan, post_ops)
 
         core_plan = self._strip_filters(core_plan)
         scan = self._find_scan(core_plan)
@@ -343,6 +389,9 @@ class GraphCompiler:
         if op == "contains":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.match_substring(col_arr, pattern=args[1])
+        if op == "like":
+            from .str_patterns import match_like
+            return match_like(GraphCompiler._eval_predicate(args[0], table), args[1], args[2], args[3])
         if op == "case_when":
             cond = GraphCompiler._eval_predicate(args[0], table)
             then = GraphCompiler._eval_predicate(args[1], table)
@@ -361,15 +410,15 @@ class GraphCompiler:
         if op == "mul":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.multiply(lhs, rhs)
+            return _checked_arith("mul", lhs, rhs)
         if op == "add":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.add(lhs, rhs)
+            return _checked_arith("add", lhs, rhs)
         if op == "sub":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
-            return pc.subtract(lhs, rhs)
+            return _checked_arith("sub", lhs, rhs)
         if op == "div":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)

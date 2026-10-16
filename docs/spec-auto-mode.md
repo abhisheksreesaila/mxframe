@@ -160,7 +160,7 @@ CPU threads take one of two roles from the same queue: **feeders** hand filtered
 
 ## Public API
 
-`device="cpu"` and `device="gpu"` keep working exactly as today; `"auto"` is additive. It becomes the default only at 1.0.
+`device="cpu"` and `device="gpu"` keep working as before, except that a GPU piece that does not fit the GPU's memory (or runs out of it) now reruns on the CPU with a `RuntimeWarning` instead of raising `MemoryError` (F-056; `strict=True` raises, `explain(include_runtime=True)` shows `gpu_pieces`); `"auto"` is additive. It becomes the default only at 1.0.
 
 ```python
 import mxframe as mx

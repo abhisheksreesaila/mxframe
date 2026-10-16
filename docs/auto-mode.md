@@ -7,10 +7,18 @@ work and the measurements that shaped it.
 
 **Interactive version:** [How device="auto" decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) on the docs site (the rules with live inputs, and the measured results).
 
-> **Status in 0.6.0:** the measurements on this page are from 2026-10-12, before the native Mojo
-> executor. Under `device="auto"` the native executor doesn't run yet (when auto picks the CPU it
-> uses the fused pipeline), so the 0.6.0 benchmark numbers apply to `device="cpu"`, not to auto.
-> Re-measuring auto and fixing this is ticket F-053 in [plan.md](plan.md).
+> **Status:** the measurements on this page are from 2026-10-12, before the native Mojo
+> executor. Since F-053, a CPU decision under `device="auto"` runs the native executor exactly as
+> `device="cpu"` does. Since F-057 a split is chosen only when (1) the split path can take the plan
+> (`pipeline_exec.split_check`, the same checks that path runs), (2) the query's columns are already
+> resident on the GPU (the first query runs native and queues the upload; a file's residency is keyed by
+> the file's identity, so each `scan_parquet` compute finds it), and (3) the calibrated price beats the faster
+> device alone by 10% after the GPU's 4.5 ms per call, the merge and a 5% CPU-contention allowance
+> (`coproc_fused.plan_split`; `explain` prints the numbers). The CPU share of a split runs on the native
+> executor. The model prices the native executor as equal to the older kernel
+> (`auto_mode.NATIVE_CPU_FACTOR = 1.0`). The numbers below have not been re-run; re-measuring auto on a
+> quiet machine is the open item of F-053 and F-057 in [plan.md](plan.md).
+> A file's residency is keyed by its identity (path, inode, mtime, size): a file rewritten in place with the same size within one mtime tick (coarse-mtime filesystems) can be served from the old GPU copy.
 
 All numbers below come from the reference machine: AMD Ryzen 9 5900X (24 threads,
 dual-channel DDR4) and an NVIDIA RTX 3090 on PCIe 4.0 x8, TPC-H data at scale factor 10.

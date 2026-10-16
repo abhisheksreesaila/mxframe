@@ -4,6 +4,21 @@
 # so tests run through a symlink called `mxframe`.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+# Test temp files (generated TPC-H data, pytest tmp_path) go to disk, not the RAM /tmp, which
+# several agents' suites filled until tests failed with "Disk quota exceeded".
+export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
+mkdir -p "$TMPDIR"
 shim="${TMPDIR:-/tmp}/mxframe-pytest-$(printf '%s' "$root" | sha1sum | cut -c1-10)"
 mkdir -p "$shim" && ln -sfn "$root" "$shim/mxframe"
-cd "$shim/mxframe" && exec pytest "$shim/mxframe/tests" "$@"
+# Test paths (`tests/test_x.py`, `tests/test_x.py::name`) run alone, through the shim;
+# with none, the whole tests directory runs. Other arguments pass through.
+args=() paths=()
+for a in "$@"; do
+  case "$a" in
+    -*) args+=("$a") ;;
+    tests/*|./tests/*|"$root"/tests/*) paths+=("$shim/mxframe/${a#"$root"/}") ;;
+    *) args+=("$a") ;;
+  esac
+done
+[ ${#paths[@]} -eq 0 ] && paths=("$shim/mxframe/tests")
+cd "$shim/mxframe" && exec pytest "${paths[@]}" "${args[@]}"

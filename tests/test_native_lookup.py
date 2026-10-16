@@ -3,7 +3,7 @@
 A scanned table is filtered and each of its rows looks its partner row up in a map Mojo builds over
 the partner's join key (a direct array for compact ranges, a partitioned hash table otherwise), in
 the same pass. Only joined rows are written: the scanned table's columns, then each partner's.
-Partner keys must be unique; a duplicate declines and the caller joins as before."""
+Partner keys may repeat (F-046a slice 2): a matching key gives one joined row per partner row, in build order."""
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -14,6 +14,13 @@ from mxframe.np_arrow import array as A
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
+
+
+@pytest.fixture
+def star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
 
 @pytest.fixture
 def comp(monkeypatch):
@@ -123,15 +130,24 @@ def test_two_partners_composite_key_and_no_predicate(comp):
     _check(got, fact, ["q"], _reference(fact, np.ones(fact.num_rows, bool), lookups), lookups)
 
 
-def test_duplicate_partner_keys_decline(comp):
+@pytest.mark.parametrize("scale", [1, 1 << 40])        # direct array / hash table
+def test_duplicate_partner_keys_expand_in_build_order(comp, scale):
+    """A repeated partner key gives one joined row per partner row, in build order (F-046a slice 2)."""
     fact = _fact(10_000)
-    dim = _dim([1, 2, 3, 2])
+    fact = fact.set_column(0, "k", A(fact.column("k").to_numpy() * scale))
+    dim = _dim(np.array([1, 2, 3, 2]) * scale)
     got = nx.try_filter(comp, fact, [], {"q"}, [_lk(["k"], dim, ["dk"], ["w"], 0)])
-    assert got is None
-    assert "-18" in nx.last_filter()[1]
-    # a wide range (hash table) too
-    dim = _dim([1, 2 << 40, 3, 2 << 40])
-    assert nx.try_filter(comp, fact, [], {"q"}, [_lk(["k"], dim, ["dk"], ["w"], 0)]) is None
+    assert got is not None, nx.last_filter()
+    ks = fact.column("k").to_pylist()
+    w = dim.column("w").to_pylist()
+    want_q, want_w = [], []
+    for i, k in enumerate(ks):
+        for row in {1 * scale: [0], 2 * scale: [1, 3], 3 * scale: [2]}.get(k, []):
+            want_q.append(fact.column("q")[i].as_py())
+            want_w.append(w[row])
+    assert got.column("q").to_pylist() == want_q
+    assert got.column("L0.w").to_pylist() == want_w
+    assert nx.last_filter_maps()[0]["multi"] is True
 
 
 def test_partner_split_into_chunks_and_dictionaries(comp):
@@ -260,7 +276,7 @@ def _same(got, old):
 
 
 @pytest.mark.parametrize("name", list(STAR_PLANS))
-def test_star_plans_match_the_leaf_by_leaf_join(monkeypatch, name):
+def test_star_plans_match_the_leaf_by_leaf_join(star_scan, monkeypatch, name):
     import mxframe.custom_ops as co
     t = _tables()
     star = []
@@ -273,8 +289,8 @@ def test_star_plans_match_the_leaf_by_leaf_join(monkeypatch, name):
     _same(got, old)
 
 
-def test_star_with_duplicate_partner_keys_falls_back(monkeypatch):
-    """A partner whose join key repeats (many-to-many) declines natively; the join runs leaf by leaf."""
+def test_star_with_duplicate_partner_keys_expands(monkeypatch):
+    """A partner whose join key repeats (one-to-many) is expanded by the star scan, as the leaf-by-leaf join does."""
     import mxframe.custom_ops as co
     t = _tables()
     dup = pa.concat_tables([t["supp"], t["supp"]])
@@ -361,7 +377,7 @@ SEMI_PLANS = {
 
 
 @pytest.mark.parametrize("name", list(SEMI_PLANS))
-def test_semi_plans_match_and_skip_the_distinct(monkeypatch, name):
+def test_semi_plans_match_and_skip_the_distinct(star_scan, monkeypatch, name):
     import mxframe.custom_ops as co
     t = _tables()
     semis, star = [], []
@@ -487,7 +503,7 @@ def test_a_filtered_string_also_selected_after_the_join_stays_encoded_in_its_lea
     _same(got, old)
 
 
-def test_a_condition_inside_a_nested_star_partner(monkeypatch):
+def test_a_condition_inside_a_nested_star_partner(star_scan, monkeypatch):
     """Q8's shape with a condition inside the partner subtree (M2h review): orders -> customer runs
     as a star of its own (a nested `_execute_star`) with the condition applied there, and the answer
     equals the leaf-by-leaf join's."""

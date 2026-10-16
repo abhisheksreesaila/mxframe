@@ -14,9 +14,10 @@ Per worker thread, per vector of VEC (1024) rows:
      only (LOAD_COL gathers through the selection vector; dense when every row
      survived). Registers are cache-resident float64 vectors (SIMD).
   3. AGG ops accumulate into worker-local float64 partials per group.
-Workers pull morsels from an atomic counter (dynamic balancing), and their
-partials are merged at the end. All arithmetic is float64 (integers and
-float32 columns are widened on load), so sums accumulate in float64.
+Workers claim morsels dynamically. Each morsel's partial table is folded into the output in morsel
+order (F-064: a float sum has one defined value, whatever the thread count; see _pipeline for the
+default mode, the reproducible mode and the staged many-groups path). All arithmetic is float64
+(integers and float32 columns are widened on load), so sums accumulate in float64.
 
 Build (mirrors scripts/release.sh):
     pixi run mojo build kernels_aot/pipeline_cpu.mojo \
@@ -27,7 +28,10 @@ Program/ABI contract (keep in sync with pipeline_program.py):
                     in the order prologue, pred, body, aggs.
   consts float64[], set_bytes uint8[], set_meta int64[] (offset, length, lo)*
   column dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8, 5 | (slot << 8) = int32 dictionary codes plus the
-  integer in chunk-table column `slot` (the native executor's string predicates, F-031)
+  integer in chunk-table column `slot` (the native executor's string predicates, F-031),
+  6 | (slot << 8) = utf8 offsets (int32; the column's base address is rebased like any other) plus, in
+  chunk-table columns `slot`, `slot + 1`, `slot + 2`: the chunk's bytes address, its validity bitmap
+  address (0 = no nulls) and the bit index of row 0 of the chunk table's row numbering (F-034)
   chunk table int64[n_chunks, 2 + n_cols]: row_start, row_end, then per column the
                     chunk's base address minus row_start * itemsize, so that
                     `addr + row * itemsize` is valid for every row of the chunk
@@ -40,7 +44,7 @@ Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
 """
 
 from std.memory.alloc import unsafe_alloc
-from std.memory import Pointer
+from std.memory import Pointer, unsafe_memset_zero
 from max.algorithm import parallelize
 from std.sys import simd_width_of
 from std.atomic import Atomic
@@ -53,9 +57,14 @@ comptime VEC = 1024
 comptime MORSEL = 65536
 comptime MAX_REGS = 64
 comptime HDR = 16
-comptime SHARED_MIN_ROWS = 1 << 20           # shared atomic accumulation: inputs of at least this many rows
-comptime BUDGET_BYTES = 128 * 1024 * 1024   # all workers' partials: each worker fills and merges its own
-comptime MERGE_GROUPS = 16384
+comptime BUDGET_BYTES = 128 * 1024 * 1024   # partial tables / staging slots alive at once
+comptime SHARED_MIN_ROWS = 1 << 20           # legacy shared output: inputs of at least this many rows
+comptime FUSED_GROUPS = 65536               # default mode, fused join: the table path up to this many groups
+comptime FUSED_MIN = 16384                  # default mode, fused join: the defined order from this many groups
+comptime LEGACY_MERGE_GROUPS = 16384        # the previous code's merge task size
+comptime MERGE_GROUPS = 256                 # groups per parallel merge task
+comptime TABLE_GROUPS = 131072              # more groups than this: staged output, no table per morsel
+comptime LANE_GROUPS = 1024                 # up to this many groups: 4 accumulator lanes per group
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -83,6 +92,8 @@ comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
 comptime OP_CMPC = 38
+comptime OP_ROWID = 39      # the row's number in the whole input (SELECT DISTINCT: first appearance, F-033)
+comptime OP_STR = 40        # a plain utf8 column LIKE a pattern (F-034)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -294,6 +305,136 @@ def _in_set(d: FP, a: FP, bytes: BP, off: Int, length: Int, lo: Int, n: Int):
         d[i] = hit
 
 
+# ── LIKE over a plain utf8 column (F-034) ──────────────────────────────────────────────────────
+# Pattern bytes: UTF-8 literals, 0xFF = '%' (any run), 0xFE = '_' (one UTF-8 character); neither byte
+# occurs in UTF-8 text. Byte semantics like DuckDB's: literals compare as bytes, '_' skips one code point.
+
+@always_inline
+def _ulen(b: UInt8) -> Int:
+    if b < 0x80:
+        return 1
+    if b < 0xE0:
+        return 2
+    if b < 0xF0:
+        return 3
+    return 4
+
+
+@always_inline
+def _eq_bytes(a: BP, b: BP, n: Int) -> Bool:
+    for i in range(n):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+def _like_general(s: BP, L: Int, pat: BP, pl: Int) -> Bool:
+    """Glob match with '%' and '_': one backtrack point (the last '%'), O(len * pattern) at worst."""
+    var si = 0
+    var pi = 0
+    var star = -1
+    var mark = 0
+    while si < L:
+        var pch = Int(pat[pi]) if pi < pl else -1
+        if pch == 0xFF:
+            star = pi
+            pi += 1
+            if pi == pl:
+                return True
+            mark = si
+        elif pch == 0xFE:
+            si += _ulen(s[si])
+            pi += 1
+        elif pch >= 0 and pch == Int(s[si]):
+            si += 1
+            pi += 1
+        elif star >= 0:
+            mark += _ulen(s[mark])
+            si = mark
+            pi = star + 1
+        else:
+            return False
+    while pi < pl and pat[pi] == 0xFF:
+        pi += 1
+    return pi == pl
+
+
+def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: Int, pat: BP, pl: Int,
+              negate: Bool, isin: Bool, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    """d[j] = 1.0 if row j's string matches the pattern (negated: does not), 0.0 for a NULL string.
+    isin: `pat` is a list of values, each a 4-byte little-endian length and its bytes; a row matches when
+    it equals one of them."""
+    var offs = IP(unsafe_from_address=offs_addr)
+    var data = _bp(data_addr)
+    var valid = _bp(valid_addr)
+    # the pattern's shape, once per call: 0 general, 1 exact, 2 prefix, 3 suffix, 4 substring
+    var markers = 0
+    var wild_one = False
+    for k in range(0 if isin else pl):
+        if pat[k] == 0xFF or pat[k] == 0xFE:
+            markers += 1
+        if pat[k] == 0xFE:
+            wild_one = True
+    var shape = 0
+    var lit = pat
+    var m = pl
+    if isin:
+        shape = 5
+    elif not wild_one:
+        if markers == 0:
+            shape = 1
+        elif markers == 1 and pat[pl - 1] == 0xFF:
+            shape = 2
+            m = pl - 1
+        elif markers == 1 and pat[0] == 0xFF:
+            shape = 3
+            lit = pat + 1
+            m = pl - 1
+        elif markers == 2 and pl >= 3 and pat[0] == 0xFF and pat[pl - 1] == 0xFF:
+            shape = 4
+            lit = pat + 1
+            m = pl - 2
+    var first = Int(lit[0]) if m > 0 else 0
+    for j in range(n):
+        var r = i0 + (Int(sel[j]) if use_sel else j)
+        if valid_addr != 0:
+            var bit = bit_base + r
+            if ((Int(valid[bit >> 3]) >> (bit & 7)) & 1) == 0:
+                d[j] = 0.0
+                continue
+        var a = Int(offs[r])
+        var L = Int(offs[r + 1]) - a
+        var s = data + a
+        var hit = False
+        if shape == 1:
+            hit = L == m and _eq_bytes(s, lit, m)
+        elif shape == 2:
+            hit = L >= m and _eq_bytes(s, lit, m)
+        elif shape == 3:
+            hit = L >= m and _eq_bytes(s + (L - m), lit, m)
+        elif shape == 5:
+            var q = 0
+            while q < pl:
+                var vl = Int(pat[q]) | (Int(pat[q + 1]) << 8) | (Int(pat[q + 2]) << 16) | (Int(pat[q + 3]) << 24)
+                if vl == L and _eq_bytes(s, pat + (q + 4), L):
+                    hit = True
+                    break
+                q += 4 + vl
+        elif shape == 4:
+            if m == 0:
+                hit = True
+            else:
+                var i = 0
+                while i + m <= L:
+                    if Int(s[i]) == first and _eq_bytes(s + i, lit, m):
+                        hit = True
+                        break
+                    i += 1
+        else:
+            hit = _like_general(s, L, pat, pl)
+        d[j] = 1.0 if hit != negate else 0.0
+
+
 comptime HUGE = 1 << 21
 
 
@@ -356,8 +497,8 @@ struct Prog(Copyable, Movable):
         self.pred_reg = Int(code[6])
         if not has_gids:
             self.nl = W
-        elif n_groups * (Int(code[5]) + 1) <= 2048:
-            self.nl = 4
+        elif n_groups <= LANE_GROUPS:       # a function of the group count alone: the order in which a
+            self.nl = 4                     # group's rows are added must not depend on the aggregate list
         else:
             self.nl = 1
 
@@ -396,6 +537,18 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             var c = Int(ins[2])
             _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
             _cmp_const(Int(ins[4]), d, p.consts[Int(ins[3])], npad)
+        elif op == OP_STR:
+            var c = Int(ins[2])
+            var slot = Int(p.dtypes[c]) >> 8        # dtype 6 | (slot << 8): the chunk's bytes, validity, bit base
+            var si = Int(ins[3])
+            _str_like(d, Int(cols[c]), Int(cols[slot]), Int(cols[slot + 1]), Int(cols[slot + 2]),
+                      p.set_bytes + Int(p.set_meta[si * 3]), Int(p.set_meta[si * 3 + 1]), (Int(ins[4]) & 1) != 0,
+                      (Int(ins[4]) & 2) != 0, i0, sel, use_sel, n)
+        elif op == OP_ROWID:
+            # i0 is the block's first row in the whole input (the column bases are rebased to it); sel
+            # holds the block offsets of the rows kept so far
+            for i in range(n):
+                d[i] = Float64(i0 + (Int(sel[i]) if use_sel else i))
         elif op < OP_NOT:
             _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad)
         elif op == OP_NOT:
@@ -480,6 +633,46 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 if g >= 0 and g < G:
                     var q = base + (g * NL + (j & lm))
                     q[0] = max(q[0], r[j])
+
+
+def _stage(p: Prog, regs: FP, gp: IP, n: Int, sv: FP, sc: LP):
+    """Append the n compacted rows of a block to the morsel's slot (staged output, see _pipeline):
+    sc[0] rows so far, sc[1] the address of the slot's group ids, sv[a * MORSEL + i] the value of
+    row i for aggregate a. Rows keep their order; nothing is added to a float here."""
+    var G = p.n_groups
+    var k = Int(sc[0])
+    var k0 = k
+    var sg = _ip(Int(sc[1]))
+    for j in range(n):
+        var g = Int(gp[j])
+        if g >= 0 and g < G:
+            sg[k] = Int32(g)
+            k += 1
+    for a in range(p.n_aggs):
+        var r = regs + Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[2]) * VEC
+        var q = sv + a * MORSEL + k0
+        var i = 0
+        for j in range(n):
+            var g = Int(gp[j])
+            if g >= 0 and g < G:
+                q[i] = r[j]
+                i += 1
+    sc[0] = Int64(k)
+
+
+def _init_values(p: Prog, pv: FP):
+    """Identity of every aggregate's slot for one morsel's table (the row counts are kept elsewhere)."""
+    var n = p.n_groups * p.nl
+    for a in range(p.n_aggs):
+        var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+        var init = 0.0
+        if kind == OP_AGG_MIN:
+            init = INF
+        elif kind == OP_AGG_MAX:
+            init = -INF
+        var base = pv + a * n
+        for i in range(n):
+            base[i] = init
 
 
 comptime SC = 4096          # per-worker cache of groups in front of the shared output (power of 2)
@@ -590,6 +783,24 @@ def _init_partials(p: Prog, pv: FP, pc: LP):
         pc[i] = 0
 
 
+def _worker_state(p: Prog, ws_bytes: Int, st: LP):
+    """A worker's block state (registers, selection and group-id scratch, the fused front stage's scratch),
+    allocated by the worker itself on its first morsel (in parallel, not in the calling thread) and kept
+    for the waves after it: st[0..3] = regs, sel, gscratch, ws."""
+    var regs = unsafe_alloc[Float64](p.n_regs * VEC + W, alignment=64)
+    for i in range(p.n_regs * VEC + W):
+        regs[i] = 0.0
+    var sel = unsafe_alloc[Int32](VEC)
+    var gscratch = unsafe_alloc[Int32](VEC)
+    var ws = unsafe_alloc[UInt8](max(ws_bytes, 64), alignment=64)      # the fused front stage's block state
+    unsafe_memset_zero(ws, max(ws_bytes, 64))
+    _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)           # prologue (constants)
+    st[0] = Int64(Int(regs))
+    st[1] = Int64(Int(sel))
+    st[2] = Int64(Int(gscratch))
+    st[3] = Int64(Int(ws))
+
+
 def _find_chunk(p: Prog, row: Int) -> Int:
     """Index of the chunk holding `row` (binary search on row_start)."""
     var lo = 0
@@ -603,11 +814,17 @@ def _find_chunk(p: Prog, row: Int) -> Int:
     return lo
 
 
-def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool, shared: Bool](
+def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool, mode: Int,
+                   FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP, lo: Int, hi: Int, encode: E,
+    front: FR, ws: BP,
 ) -> Bool:
     """Rows [lo, hi) in VEC blocks: predicate, selection, body, accumulate. `keyed`: group ids of
-    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst, regs)` (regs: the program's registers, for keys it computed) (False: bad key)."""
+    the selected rows only, from `encode(chunk, row0, sel, nsel, use_sel, dst, regs)` (regs: the program's registers, for keys it computed) (False: bad key).
+    `fused` (F-046a slice 3, join + aggregate): the rows come from `front(chunk, row0, n, sel, ws)`,
+    which filters the block, looks the join partners up and fills `sel` with the surviving rows (their
+    count is returned) and the worker's column table at `ws` (the partner columns of those rows
+    gathered into block scratch); the program's predicate then runs on those rows only."""
     var pos = lo
     while pos < hi:
         var k = _find_chunk(p, pos)
@@ -619,17 +836,32 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             var n = min(VEC, stop - i0)
             var nsel = n
             var use_sel = False
-            if p.pred_reg >= 0:
-                _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
-                var pr = regs + p.pred_reg * VEC
-                var kk = 0
-                for i in range(n):
-                    sel[kk] = Int32(i)
-                    kk += 1 if pr[i] != 0.0 else 0
-                nsel = kk
+            var bcols = cols
+            comptime if fused:
+                nsel = front(k, i0, n, sel, ws)
+                bcols = LP(unsafe_from_address=Int(ws))
                 use_sel = nsel < n
+                if nsel > 0 and p.pred_reg >= 0:
+                    _run_ops(p, regs, bcols, p.n_pro, p.n_pred, i0, sel, use_sel, nsel)
+                    var pr = regs + p.pred_reg * VEC
+                    var kk = 0
+                    for j in range(nsel):
+                        sel[kk] = sel[j] if use_sel else Int32(j)
+                        kk += 1 if pr[j] != 0.0 else 0
+                    nsel = kk
+                    use_sel = nsel < n
+            else:
+                if p.pred_reg >= 0:
+                    _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                    var pr = regs + p.pred_reg * VEC
+                    var kk = 0
+                    for i in range(n):
+                        sel[kk] = Int32(i)
+                        kk += 1 if pr[i] != 0.0 else 0
+                    nsel = kk
+                    use_sel = nsel < n
             if nsel > 0:
-                _run_ops(p, regs, cols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
+                _run_ops(p, regs, bcols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
                 var gp = gscratch
                 comptime if keyed:
                     if not encode(k, i0, sel, nsel, use_sel, gscratch, regs):
@@ -642,7 +874,9 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                                 gscratch[j] = gsrc[Int(sel[j])]
                         else:
                             gp = gsrc
-                comptime if shared:
+                comptime if mode == 2:
+                    _stage(p, regs, gp, nsel, pv, pc)
+                elif mode == 1:
                     _accumulate_shared(p, regs, gp, nsel, pv, pc)
                 else:
                     _accumulate(p, regs, gp, nsel, pv, pc)
@@ -651,10 +885,12 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     return True
 
 
-def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
+def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
+              FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+    front: FR, ws_bytes: Int, repro: Bool,
 ) -> Int:
     """The interpreter over rows [start, end). `keyed`: no group-id array; the group ids of the rows
     that pass the predicate are made per VEC block by `encode` (see _process_range), so keys of
@@ -693,25 +929,164 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
     if total <= 0:
         return 0
 
-    var per_worker = (A + 1) * G * NL * 8
-    var nthreads = threads if threads > 0 else 1
-    var morsels = (total + MORSEL - 1) // MORSEL
-    nthreads = min(nthreads, morsels)
-    if per_worker > 0:
-        # every worker initializes and merges a partial per group: with many groups, fewer workers
-        # (at most rows / groups of them) beat the extra passes over a large partial each
-        nthreads = min(nthreads, max(1, BUDGET_BYTES // per_worker))
-        nthreads = min(nthreads, max(1, total // max(G, 1)))
-    nthreads = max(nthreads, 1)
-    # Too many groups for a partial per worker (the caps above leave under half the workers): all
-    # workers update the output itself with atomic add / min / max; no partials, no merge
-    var want = max(1, min(threads if threads > 0 else 1, morsels))
-    var shared = has_gids and A > 0 and want >= 4 and nthreads * 2 <= want and total >= SHARED_MIN_ROWS
-    if shared:
-        nthreads = want
+    # Which implementation (F-064). Reproducible mode (`compute(reproducible=True)`, plan flag `repro`)
+    # always uses the defined order below. The default keeps main's speed everywhere it was measured
+    # (A/B, 6M rows, 12 threads, quiet machine): the previous code (a partial table per worker, or the
+    # shared output with atomic adds; its float sums can differ in the last bits between runs) runs every
+    # keyed aggregate and every fused join under FUSED_MIN groups, where a table per morsel costs 10-20%
+    # more; the defined order runs the global aggregate (no groups: as fast) and fused joins from
+    # FUSED_MIN groups (up to 2x faster than the atomic shared output it replaces).
+    var nt0 = max(1, min(threads if threads > 0 else 1, (total + MORSEL - 1) // MORSEL))
+    var mo0 = (total + MORSEL - 1) // MORSEL
+    var legacy = has_gids and not repro and (not fused or G < FUSED_MIN)
+    # the table path needs a wave of tables (two per worker, or all of them when fewer) and a count table
+    # per worker inside the budget; one wave when all tables fit
+    var table_bytes0 = A * G * NL * 8
+    var table_ok = (not has_gids) or (min(mo0, 2 * nt0) * table_bytes0 + nt0 * G * NL * 8 <= BUDGET_BYTES
+                                      and G <= (TABLE_GROUPS if repro else FUSED_GROUPS))
+    if legacy:
+        p.nl = 4 if G * (A + 1) <= 2048 else 1          # the previous lane rule (depends on the aggregate list)
+        NL = p.nl
+        var per_worker = (A + 1) * G * NL * 8
+        var nthreads = threads if threads > 0 else 1
+        var morsels = (total + MORSEL - 1) // MORSEL
+        nthreads = min(nthreads, morsels)
+        if per_worker > 0:
+            # every worker initializes and merges a partial per group: with many groups, fewer workers
+            # (at most rows / groups of them) beat the extra passes over a large partial each
+            nthreads = min(nthreads, max(1, BUDGET_BYTES // per_worker))
+            nthreads = min(nthreads, max(1, total // max(G, 1)))
+        nthreads = max(nthreads, 1)
+        # Too many groups for a partial per worker (the caps above leave under half the workers): all
+        # workers update the output itself with atomic add / min / max; no partials, no merge
+        var want = max(1, min(threads if threads > 0 else 1, morsels))
+        var shared = A > 0 and want >= 4 and nthreads * 2 <= want and total >= SHARED_MIN_ROWS
+        if shared:
+            nthreads = want
 
-    var pv_all = _fp(big_alloc(1 if shared else nthreads * max(A * G * NL, 1) * 8))
-    var pc_all = _lp(big_alloc(1 if shared else nthreads * max(G * NL, 1) * 8))
+        var pv_all = _fp(big_alloc(1 if shared else nthreads * max(A * G * NL, 1) * 8))
+        var pc_all = _lp(big_alloc(1 if shared else nthreads * max(G * NL, 1) * 8))
+        var counter = unsafe_alloc[Int64](1)
+        counter[0] = 0
+        var failed = unsafe_alloc[Int64](1)
+        failed[0] = 0
+        var pv_stride = max(A * G * NL, 1)
+        var pc_stride = max(G * NL, 1)
+
+        def lworker(wid: Int) {imm}:
+            var regs = unsafe_alloc[Float64](p.n_regs * VEC + W, alignment=64)
+            for i in range(p.n_regs * VEC + W):
+                regs[i] = 0.0
+            var sel = unsafe_alloc[Int32](VEC)
+            var gscratch = unsafe_alloc[Int32](VEC)
+            var ws = unsafe_alloc[UInt8](max(ws_bytes, 64), alignment=64)      # the fused front stage's block state
+            unsafe_memset_zero(ws, max(ws_bytes, 64))
+            var pv = pv_all + wid * pv_stride
+            var pc = pc_all + wid * pc_stride
+            if shared:                                 # this worker's group cache (see _accumulate_shared)
+                pc = unsafe_alloc[Int64](2 + 2 * SC + 3)
+                pv = unsafe_alloc[Float64](max(A, 1) * SC)
+                pc[0] = Int64(Int(out_vals))
+                pc[1] = Int64(Int(out_cnt))
+                for s in range(SC):
+                    pc[2 + s] = -1
+                for s in range(3):
+                    pc[2 + 2 * SC + s] = 0
+            else:
+                _init_partials(p, pv, pc)
+            # prologue (constants) once per worker
+            _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
+            while True:
+                var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                var lo = start + m * MORSEL
+                if lo >= end:
+                    break
+                var ok = True
+                if shared:
+                    ok = _process_range[keyed=keyed, mode=1, fused=fused](
+                        p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws)
+                else:
+                    ok = _process_range[keyed=keyed, mode=0, fused=fused](
+                        p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws)
+                if not ok:
+                    failed[0] = 1
+                    break
+            if shared:
+                _flush_all(p, pv, pc)
+                pv.free()
+                pc.free()
+            regs.free()
+            sel.free()
+            gscratch.free()
+            ws.free()
+
+        if nthreads == 1:
+            lworker(0)
+        else:
+            # A host process (Python via ctypes) has no Mojo async runtime yet:
+            # create the global CPU device (thread pool) once, then parallelize.
+            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+            parallelize(lworker, nthreads)
+
+        # merge worker partials into the output (parallel over group ranges when there are many groups)
+        def lmerge(chunk: Int) {imm}:
+            var g0 = chunk * LEGACY_MERGE_GROUPS
+            var g1 = min(g0 + LEGACY_MERGE_GROUPS, G)
+            for a in range(A):
+                var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+                for g in range(g0, g1):
+                    var acc = out_vals[a * G + g]
+                    for t in range(nthreads):
+                        var q = pv_all + t * pv_stride + (a * G + g) * NL
+                        for l in range(NL):
+                            if kind == OP_AGG_SUM:
+                                acc += q[l]
+                            elif kind == OP_AGG_MIN:
+                                acc = min(acc, q[l])
+                            else:
+                                acc = max(acc, q[l])
+                    out_vals[a * G + g] = acc
+            for g in range(g0, g1):
+                var c = Int64(0)
+                for t in range(nthreads):
+                    var q = pc_all + t * pc_stride + g * NL
+                    for l in range(NL):
+                        c += q[l]
+                out_cnt[g] = c
+
+        var merge_chunks = 0 if shared else (G + LEGACY_MERGE_GROUPS - 1) // LEGACY_MERGE_GROUPS
+        if nthreads > 1 and merge_chunks > 1:
+            parallelize(lmerge, merge_chunks, nthreads)
+        else:
+            for chunk in range(merge_chunks):
+                lmerge(chunk)
+
+        free_big(Int(pv_all))
+        free_big(Int(pc_all))
+        counter.free()
+        var rc = -5 if Int(failed[0]) != 0 else 0
+        failed.free()
+        return rc
+
+    var nthreads = nt0
+    var morsels = mo0
+
+    # Reproducible sums (F-064). Float adds are not associative, so a group's value is defined by an
+    # order that depends on neither the workers, the thread count nor the aggregate list: for each
+    # morsel (MORSEL rows from `start`), each group's rows are added in row order into a sub-total
+    # (`nl` lanes, a function of the group count only, summed in lane order), and the morsels'
+    # sub-totals are added in morsel order. Two ways to get there, with the same result:
+    #  - a table of sub-totals per MORSEL: morsels run in waves of `nslots` (all of them when their tables fit
+    #    the memory budget, so usually one wave, never more than the budget whatever the number of rows); workers claim a wave's morsels dynamically (work
+    #    stealing, so a busy core does not stall the tail) and fill that morsel's table; after each wave
+    #    the tables are folded into the output in morsel order, in parallel over group ranges;
+    #  - staged (too many groups for that): see below.
+    # (Row counts are integers, so they are kept per worker and summed in any order.)
+    var staged = has_gids and not table_ok
+
+    var nslots = min(morsels, (BUDGET_BYTES - nthreads * G * NL * 8) // max(table_bytes0, 1))
+    var pv_all = _fp(big_alloc(1 if staged else nslots * max(A * G * NL, 1) * 8))
+    var pc_all = _lp(big_alloc(1 if staged else nthreads * max(G * NL, 1) * 8))
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
     var failed = unsafe_alloc[Int64](1)
@@ -719,91 +1094,262 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool](
     var pv_stride = max(A * G * NL, 1)
     var pc_stride = max(G * NL, 1)
 
-    def worker(wid: Int) {imm}:
-        var regs = unsafe_alloc[Float64](p.n_regs * VEC + W, alignment=64)
-        for i in range(p.n_regs * VEC + W):
-            regs[i] = 0.0
-        var sel = unsafe_alloc[Int32](VEC)
-        var gscratch = unsafe_alloc[Int32](VEC)
-        var pv = pv_all + wid * pv_stride
-        var pc = pc_all + wid * pc_stride
-        if shared:                                 # this worker's group cache (see _accumulate_shared)
-            pc = unsafe_alloc[Int64](2 + 2 * SC + 3)
-            pv = unsafe_alloc[Float64](max(A, 1) * SC)
-            pc[0] = Int64(Int(out_vals))
-            pc[1] = Int64(Int(out_cnt))
-            for s in range(SC):
-                pc[2 + s] = -1
-            for s in range(3):
-                pc[2 + 2 * SC + s] = 0
-        else:
-            _init_partials(p, pv, pc)
-        # prologue (constants) once per worker
-        _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
-        while True:
-            var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-            var lo = start + m * MORSEL
-            if lo >= end:
+    if staged:
+        # Morsels run in waves of `nslots`: (1) workers claim the wave's morsels dynamically, run them
+        # into a worker-local staging area (group id and one value per aggregate of each surviving
+        # row, in row order) and then copy the rows, grouped by group range (`nbins` ranges, stable),
+        # into the morsel's own slot; (2) workers claim group ranges and each range is applied by one
+        # worker, slot by slot in morsel order: a group's rows of one slot are added in row order into
+        # a sub-total that is then added to the output. No atomics.
+        var nbins_target = min(4 * nthreads, 256)
+        var shift = 0
+        while ((G - 1) >> shift) >= nbins_target:
+            shift += 1
+        var nbins = ((G - 1) >> shift) + 1
+        var offs_bytes = ((nbins + 1) * 8 + 63) // 64 * 64
+        var ids_bytes = MORSEL * 4
+        var stage_bytes = ids_bytes + A * MORSEL * 8 + nbins * 8
+        var slot_bytes = offs_bytes + ids_bytes + A * MORSEL * 8        # offsets, group ids, values
+        var nslots = max(2, min(2 * nthreads, (BUDGET_BYTES // 2 - nthreads * stage_bytes) // slot_bytes))
+        nslots = min(nslots, morsels)
+        var slots = _bp(big_alloc(nslots * slot_bytes))
+        # per worker: regs, sel, gscratch, ws, [row count, ids address], staged ids, staged values, bin cursors
+        var wst = unsafe_alloc[Int64](nthreads * 8)             # made by each worker on its first morsel
+        for i in range(nthreads * 8):
+            wst[i] = 0
+        var ctl = unsafe_alloc[Int64](2)             # first morsel of the wave, morsels in it
+
+        def stage_morsels(wid: Int) {imm}:
+            var st = wst + wid * 8
+            if Int(st[0]) == 0:
+                _worker_state(p, ws_bytes, st)
+                var sc0 = unsafe_alloc[Int64](2)
+                var sids0 = unsafe_alloc[Int32](MORSEL)
+                sc0[0] = 0
+                sc0[1] = Int64(Int(sids0))
+                st[4] = Int64(Int(sc0))
+                st[5] = Int64(Int(sids0))
+                st[6] = Int64(Int(unsafe_alloc[Float64](max(A, 1) * MORSEL)))
+                st[7] = Int64(Int(unsafe_alloc[Int64](nbins)))
+            var regs = _fp(Int(st[0]))
+            var sel = _ip(Int(st[1]))
+            var gscratch = _ip(Int(st[2]))
+            var ws = _bp(Int(st[3]))
+            var sc = _lp(Int(st[4]))
+            var sids = _ip(Int(st[5]))
+            var sv = _fp(Int(st[6]))
+            var cur = _lp(Int(st[7]))
+            while True:
+                var i = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if i >= Int(ctl[1]):
+                    break
+                var lo = start + (Int(ctl[0]) + i) * MORSEL
+                sc[0] = 0
+                if not _process_range[keyed=keyed, mode=2, fused=fused](
+                    p, regs, sel, gscratch, sv, sc, lo, min(lo + MORSEL, end), encode, front, ws):
+                    failed[0] = 1
+                    break
+                var n = Int(sc[0])
+                var base = slots + i * slot_bytes
+                var offs = _lp(Int(base))
+                var gids = _ip(Int(base) + offs_bytes)
+                var vals = _fp(Int(base) + offs_bytes + ids_bytes)
+                for b in range(nbins + 1):
+                    offs[b] = 0
+                for r in range(n):
+                    offs[1 + (Int(sids[r]) >> shift)] += 1
+                for b in range(nbins):
+                    offs[b + 1] += offs[b]
+                    cur[b] = offs[b]
+                for r in range(n):
+                    var g = Int(sids[r])
+                    var b = g >> shift
+                    var pos = Int(cur[b])
+                    cur[b] = Int64(pos + 1)
+                    gids[pos] = Int32(g)
+                    for a in range(A):
+                        vals[a * MORSEL + pos] = sv[a * MORSEL + r]
+
+        def apply_bins(wid: Int) {imm}:
+            var width = 1 << shift
+            var sub = unsafe_alloc[Float64](max(A, 1) * width)        # a slot's sub-totals of the range
+            var cnt = unsafe_alloc[Int32](width)
+            var touched = unsafe_alloc[Int32](width)
+            for i in range(max(A, 1) * width):
+                sub[i] = 0.0
+            for i in range(width):
+                cnt[i] = 0
+            while True:
+                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if b >= nbins:
+                    break
+                var g0 = b << shift
+                for i in range(Int(ctl[1])):
+                    var base = slots + i * slot_bytes
+                    var offs = _lp(Int(base))
+                    var gids = _ip(Int(base) + offs_bytes)
+                    var vals = _fp(Int(base) + offs_bytes + ids_bytes)
+                    var r0 = Int(offs[b])
+                    var r1 = Int(offs[b + 1])
+                    var nt = 0
+                    for r in range(r0, r1):
+                        var g = Int(gids[r]) - g0
+                        if cnt[g] == 0:
+                            touched[nt] = Int32(g)
+                            nt += 1
+                        cnt[g] += 1
+                    for a in range(A):
+                        var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+                        var q = vals + a * MORSEL
+                        var o = out_vals + a * G + g0
+                        var sb = sub + a * width
+                        if kind == OP_AGG_SUM:
+                            for r in range(r0, r1):
+                                sb[Int(gids[r]) - g0] += q[r]
+                        elif kind == OP_AGG_MIN:
+                            for r in range(r0, r1):
+                                var t = o + (Int(gids[r]) - g0)
+                                t[0] = min(t[0], q[r])
+                        else:
+                            for r in range(r0, r1):
+                                var t = o + (Int(gids[r]) - g0)
+                                t[0] = max(t[0], q[r])
+                    for u in range(nt):
+                        var g = Int(touched[u])
+                        out_cnt[g0 + g] += Int64(cnt[g])
+                        cnt[g] = 0
+                    for a in range(A):
+                        if Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0]) == OP_AGG_SUM:
+                            var o = out_vals + a * G + g0
+                            var sb = sub + a * width
+                            for u in range(nt):
+                                var g = Int(touched[u])
+                                o[g] += sb[g]
+                                sb[g] = 0.0
+            sub.free()
+            cnt.free()
+            touched.free()
+
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        var wave0 = 0
+        while wave0 < morsels and failed[0] == 0:
+            ctl[0] = Int64(wave0)
+            ctl[1] = Int64(min(nslots, morsels - wave0))
+            counter[0] = 0
+            parallelize(stage_morsels, nthreads)
+            if failed[0] != 0:
                 break
-            var ok = True
-            if shared:
-                ok = _process_range[keyed=keyed, shared=True](p, regs, sel, gscratch, pv, pc, lo,
-                                                              min(lo + MORSEL, end), encode)
-            else:
-                ok = _process_range[keyed=keyed, shared=False](p, regs, sel, gscratch, pv, pc, lo,
-                                                               min(lo + MORSEL, end), encode)
-            if not ok:
+            counter[0] = 0
+            parallelize(apply_bins, nthreads)
+            wave0 += nslots
+        for w in range(nthreads):
+            var st = wst + w * 8
+            if Int(st[0]) != 0:
+                for f in range(8):
+                    Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(st[f])).free()
+        wst.free()
+        ctl.free()
+        free_big(Int(slots))
+        free_big(Int(pv_all))
+        free_big(Int(pc_all))
+        counter.free()
+        var rc_s = -5 if Int(failed[0]) != 0 else 0
+        failed.free()
+        return rc_s
+
+    # per worker: regs, sel, gscratch, ws (made by the worker on its first morsel; the waves reuse them)
+    var wst = unsafe_alloc[Int64](nthreads * 4)
+    for i in range(nthreads * 4):
+        wst[i] = 0
+    var ctl = unsafe_alloc[Int64](2)                 # first morsel of the wave, morsels in it
+
+    def worker(wid: Int) {imm}:
+        var st = wst + wid * 4
+        var pc = pc_all + wid * pc_stride
+        if Int(st[0]) == 0:
+            _worker_state(p, ws_bytes, st)
+            for i in range(pc_stride):                                     # this worker's row counts
+                pc[i] = 0
+        var regs = _fp(Int(st[0]))
+        var sel = _ip(Int(st[1]))
+        var gscratch = _ip(Int(st[2]))
+        var ws = _bp(Int(st[3]))
+        while True:
+            var j = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if j >= Int(ctl[1]):
+                break
+            var lo = start + (Int(ctl[0]) + j) * MORSEL
+            var pv = pv_all + j * pv_stride
+            _init_values(p, pv)
+            if not _process_range[keyed=keyed, mode=0, fused=fused](
+                p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws):
                 failed[0] = 1
                 break
-        if shared:
-            _flush_all(p, pv, pc)
-            pv.free()
-            pc.free()
-        regs.free()
-        sel.free()
-        gscratch.free()
 
-    if nthreads == 1:
-        worker(0)
-    else:
-        # A host process (Python via ctypes) has no Mojo async runtime yet:
-        # create the global CPU device (thread pool) once, then parallelize.
-        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(worker, nthreads)
-
-    # merge worker partials into the output (parallel over group ranges when there are many groups)
+    # fold the wave's tables into the output, in morsel order (parallel over group ranges)
     def merge(chunk: Int) {imm}:
         var g0 = chunk * MERGE_GROUPS
         var g1 = min(g0 + MERGE_GROUPS, G)
         for a in range(A):
             var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
-            for g in range(g0, g1):
-                var acc = out_vals[a * G + g]
-                for t in range(nthreads):
-                    var q = pv_all + t * pv_stride + (a * G + g) * NL
-                    for l in range(NL):
+            var o = out_vals + a * G
+            for j in range(Int(ctl[1])):
+                var q = pv_all + j * pv_stride + a * G * NL
+                for g in range(g0, g1):
+                    var x = q[g * NL]
+                    for l in range(1, NL):
                         if kind == OP_AGG_SUM:
-                            acc += q[l]
+                            x += q[g * NL + l]
                         elif kind == OP_AGG_MIN:
-                            acc = min(acc, q[l])
+                            x = min(x, q[g * NL + l])
                         else:
-                            acc = max(acc, q[l])
-                out_vals[a * G + g] = acc
-        for g in range(g0, g1):
+                            x = max(x, q[g * NL + l])
+                    if kind == OP_AGG_SUM:
+                        o[g] += x
+                    elif kind == OP_AGG_MIN:
+                        o[g] = min(o[g], x)
+                    else:
+                        o[g] = max(o[g], x)
+
+    var merge_chunks = (G + MERGE_GROUPS - 1) // MERGE_GROUPS
+    if nthreads > 1:
+        # A host process (Python via ctypes) has no Mojo async runtime yet:
+        # create the global CPU device (thread pool) once, then parallelize.
+        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+    var wave0 = 0
+    while wave0 < morsels and failed[0] == 0:
+        ctl[0] = Int64(wave0)
+        ctl[1] = Int64(min(nslots, morsels - wave0))
+        counter[0] = 0
+        if nthreads == 1:
+            worker(0)
+        else:
+            parallelize(worker, nthreads)
+        if failed[0] != 0:
+            break
+        if A > 0:
+            if nthreads > 1 and merge_chunks > 1:
+                parallelize(merge, merge_chunks, nthreads)
+            else:
+                for chunk in range(merge_chunks):
+                    merge(chunk)
+        wave0 += nslots
+    for t in range(nthreads):
+        if Int(wst[t * 4]) == 0:                 # a worker that never started has no counts
+            continue
+        var q = pc_all + t * pc_stride
+        for g in range(G):
             var c = Int64(0)
-            for t in range(nthreads):
-                var q = pc_all + t * pc_stride + g * NL
-                for l in range(NL):
-                    c += q[l]
-            out_cnt[g] = c
-
-    var merge_chunks = 0 if shared else (G + MERGE_GROUPS - 1) // MERGE_GROUPS
-    if nthreads > 1 and merge_chunks > 1:
-        parallelize(merge, merge_chunks, nthreads)
-    else:
-        for chunk in range(merge_chunks):
-            merge(chunk)
-
+            for l in range(NL):
+                c += q[g * NL + l]
+            out_cnt[g] += c
+    for w in range(nthreads):
+        var st = wst + w * 4
+        if Int(st[0]) != 0:
+            for f in range(4):
+                Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(st[f])).free()
+    wst.free()
+    ctl.free()
     free_big(Int(pv_all))
     free_big(Int(pc_all))
     counter.free()
@@ -816,21 +1362,52 @@ def _no_keys(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, 
     return True
 
 
+def _no_front(chunk: Int, row0: Int, n: Int, sel: IP, ws: BP) -> Int:
+    return n
+
+
 @export
 def mx_pipeline_cpu(
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
-    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, repro: Int,
 ) abi("C") -> Int:
-    return _pipeline[keyed=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a,
-                                  gids_a, n_groups, start, end, out_vals_a, out_cnt_a, threads, _no_keys)
+    """`repro` (15th argument, F-064): non-zero = float sums in the defined order whatever the group count."""
+    return _pipeline[keyed=False, fused=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                               dtypes_a, gids_a, n_groups, start, end, out_vals_a, out_cnt_a,
+                                               threads, _no_keys, _no_front, 0, repro != 0)
+
+
+def pipeline_plain(
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, repro: Bool,
+) -> Int:
+    """mx_pipeline_cpu with the reproducible-sums flag (the native executor's calls)."""
+    return _pipeline[keyed=False, fused=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                               dtypes_a, gids_a, n_groups, start, end, out_vals_a, out_cnt_a,
+                                               threads, _no_keys, _no_front, 0, repro)
 
 
 def pipeline_keyed[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, n_groups: Int,
-    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E, repro: Bool,
 ) -> Int:
     """mx_pipeline_cpu with group ids made per morsel by `encode` (see _pipeline)."""
-    return _pipeline[keyed=True](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a,
-                                 0, n_groups, start, end, out_vals_a, out_cnt_a, threads, encode)
+    return _pipeline[keyed=True, fused=False](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                              dtypes_a, 0, n_groups, start, end, out_vals_a, out_cnt_a,
+                                              threads, encode, _no_front, 0, repro)
+
+
+def pipeline_fused[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, FR: def(Int, Int, Int, IP, BP) -> Int,
+                   keyed: Bool](
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, n_groups: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+    front: FR, ws_bytes: Int, repro: Bool,
+) -> Int:
+    """The pipeline over the rows `front` lets through (a fused join + aggregate, see _process_range)."""
+    return _pipeline[keyed=keyed, fused=True](code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks,
+                                              dtypes_a, 0, n_groups, start, end, out_vals_a, out_cnt_a,
+                                              threads, encode, front, ws_bytes, repro)

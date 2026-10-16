@@ -31,6 +31,18 @@ def _i64(addr: Int) -> Pointer[Int64, MutUntrackedOrigin]:
 def _u8(addr: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
     return Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
 
+
+# Status of every exported GPU function: 0 ok, -2 out of GPU memory, -1 any other error. The
+# Python wrappers (aot_kernels.py) raise on a non-zero status; the old `except: pass` returned
+# garbage output with no error (F-055).
+# NOTE: the out-of-memory test reads the exception text, so a Mojo/MAX rewording would turn -2 into -1;
+# tests/test_gpu_kernel_errors.py::test_real_oversized_sort_returns_out_of_memory_status catches that.
+def _status(e: Error) -> Int:
+    var s = String(e)
+    if "OUT_OF_MEMORY" in s or "out of memory" in s or "Out of memory" in s:
+        return -2
+    return -1
+
 # ── UTF-8 predicates ──────────────────────────────────────────────────────
 # Arrow string layout: offsets[n+1] point into one contiguous UTF-8 byte
 # buffer. One GPU thread compares one row against the prefix bytes.
@@ -43,7 +55,7 @@ def utf8_startswith_mask_gpu(
     prefix_addr: Int,
     n: Int,
     prefix_len: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64, prefix_len__i64: Int64):
         var n_ = Int(n__i64)
@@ -72,7 +84,9 @@ def utf8_startswith_mask_gpu(
             ctx.enqueue_function[kernel](
                 Int64(n), Int64(prefix_len), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def utf8_contains_mask_gpu(
@@ -83,7 +97,7 @@ def utf8_contains_mask_gpu(
     pattern_addr: Int,
     n: Int,
     pattern_len: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64, pattern_len__i64: Int64):
         var n_ = Int(n__i64)
@@ -115,7 +129,9 @@ def utf8_contains_mask_gpu(
             ctx.enqueue_function[kernel](
                 Int64(n), Int64(pattern_len), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def utf8_equal_mask_gpu(
@@ -126,7 +142,7 @@ def utf8_equal_mask_gpu(
     pattern_addr: Int,
     n: Int,
     pattern_len: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64, pattern_len__i64: Int64):
         var n_ = Int(n__i64)
@@ -152,7 +168,9 @@ def utf8_equal_mask_gpu(
             ctx.enqueue_function[kernel](
                 Int64(n), Int64(pattern_len), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def utf8_isin_mask_gpu(
@@ -164,7 +182,7 @@ def utf8_isin_mask_gpu(
     pattern_data_addr: Int,
     n: Int,
     n_patterns: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64, n_patterns__i64: Int64):
         var n_ = Int(n__i64)
@@ -199,7 +217,9 @@ def utf8_isin_mask_gpu(
             ctx.enqueue_function[kernel](
                 Int64(n), Int64(n_patterns), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── grouped f32 aggregation (sum / count / min / max) ───────────────────────
 # One templated kernel family, two strategies picked on the host by group
@@ -438,30 +458,38 @@ def run_group[op: Int](
 @export
 def group_sum_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-) abi("C"):
+) abi("C") -> Int:
     try: run_group[OP_SUM](out_addr, val_addr, lab_addr, n_rows, n_groups)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def group_min_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-) abi("C"):
+) abi("C") -> Int:
     try: run_group[OP_MIN](out_addr, val_addr, lab_addr, n_rows, n_groups)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def group_max_f32_gpu(
     out_addr: Int, val_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-) abi("C"):
+) abi("C") -> Int:
     try: run_group[OP_MAX](out_addr, val_addr, lab_addr, n_rows, n_groups)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def group_count_f32_gpu(
     out_addr: Int, lab_addr: Int, n_rows: Int, n_groups: Int
-) abi("C"):
+) abi("C") -> Int:
     try: run_group[OP_COUNT](out_addr, 0, lab_addr, n_rows, n_groups)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── masked global aggregates ───────────────────────────────────────────────
 # sum / sum_product / min / max over rows whose int32 mask != 0, plus the fused
@@ -644,7 +672,7 @@ def masked_blocks(ctx: DeviceContext, n: Int) raises -> Int:
 @export
 def masked_global_sum_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     try:
         var ctx = DeviceContext()
         var blocks = masked_blocks(ctx, n)
@@ -658,12 +686,14 @@ def masked_global_sum_f32_gpu(
             Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def masked_global_sum_product_f32_gpu(
     out_addr: Int, a_addr: Int, b_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     try:
         var ctx = DeviceContext()
         var blocks = masked_blocks(ctx, n)
@@ -677,12 +707,14 @@ def masked_global_sum_product_f32_gpu(
             Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def masked_global_min_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     try:
         var ctx = DeviceContext()
         var blocks = masked_blocks(ctx, n)
@@ -696,12 +728,14 @@ def masked_global_min_f32_gpu(
             Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def masked_global_max_f32_gpu(
     out_addr: Int, val_addr: Int, mask_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     try:
         var ctx = DeviceContext()
         var blocks = masked_blocks(ctx, n)
@@ -715,7 +749,9 @@ def masked_global_max_f32_gpu(
             Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # Fused range predicate + product reduction: five comparisons decide whether a[i]*b[i]
 # (float64) joins the sum.  Same two-pass structure as above.
@@ -764,7 +800,7 @@ def range5_sum_product_f32_gpu(
     float_lo: Float32,
     float_hi: Float32,
     upper_hi: Float32,
-) abi("C"):
+) abi("C") -> Int:
     try:
         var ctx = DeviceContext()
         var blocks = masked_blocks(ctx, n)
@@ -779,7 +815,9 @@ def range5_sum_product_f32_gpu(
             Int64(out_addr), Int64(pa), Int64(blocks if n > 0 else 0), grid_dim=1, block_dim=BLOCK)
         ctx.synchronize()
         _ = len(parts)
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # Mark right-side keys satisfying right_a < right_b, then count left rows by
 # group when their key is marked and left_lo <= left_range < left_hi.
@@ -799,7 +837,7 @@ def semi_range_group_count_i32_gpu(
     n_groups: Int,
     left_lo: Int,
     left_hi: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def init_buffers(table_size__i64: Int64, n_groups__i64: Int64):
         var table_size_ = Int(table_size__i64)
@@ -852,7 +890,9 @@ def semi_range_group_count_i32_gpu(
                 Int64(n_left), Int64(table_size), Int64(n_groups), Int64(left_lo), Int64(left_hi),
                 grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # Count right-key occurrences, then emit one count for every left key. This is
 # the compact form of a left join followed by COUNT(right_key) per left row.
@@ -865,7 +905,7 @@ def key_match_counts_i32_gpu(
     n_left: Int,
     n_right: Int,
     table_size: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def init_counts(table_size__i64: Int64):
         var table_size_ = Int(table_size__i64)
@@ -905,7 +945,9 @@ def key_match_counts_i32_gpu(
                 Int64(n_left), Int64(table_size),
                 grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # Exact distinct (order, supplier) counting for Q21. Hash slots use a state
 # machine: 0=empty, -1=writer owns slot, 1=ready. Full key comparison resolves
@@ -927,7 +969,7 @@ def single_late_supplier_counts_i32_gpu(
     n_orders: Int,
     n_suppliers: Int,
     cap: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def init_buffers(n_orders__i64: Int64, n_suppliers__i64: Int64, cap__i64: Int64):
         var n_orders_ = Int(n_orders__i64)
@@ -1007,11 +1049,13 @@ def single_late_supplier_counts_i32_gpu(
                 Int64(n_rows), Int64(n_orders), Int64(n_suppliers),
                 grid_dim=ceildiv(n_rows, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── gather ─────────────────────────────────────────────────────────────────
 @export
-def gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
+def gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1022,10 +1066,12 @@ def gather_f32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
-def gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
+def gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1036,10 +1082,12 @@ def gather_i32_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
-def gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
+def gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1050,13 +1098,15 @@ def gather_i64_gpu(out_addr: Int, src_addr: Int, idx_addr: Int, n: Int):
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── filter_gather ──────────────────────────────────────────────────────────
 @export
 def filter_gather_f32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1068,12 +1118,14 @@ def filter_gather_f32_gpu(
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def filter_gather_i32_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1085,12 +1137,14 @@ def filter_gather_i32_gpu(
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 @export
 def filter_gather_i64_gpu(
     out_addr: Int, src_addr: Int, mask_addr: Int, offsets_addr: Int, n: Int
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1102,7 +1156,9 @@ def filter_gather_i64_gpu(
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── group_encode_i32 ──────────────────────────────────────────────────────
 # Open-addressing linear-probing hash table: assign dense int32 group IDs to an
@@ -1142,7 +1198,7 @@ def group_encode_i32_gpu(
     htid_addr: Int,
     n: Int,
     cap: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def init_tables(cap__i64: Int64):
         var cap_ = Int(cap__i64)
@@ -1202,12 +1258,14 @@ def group_encode_i32_gpu(
             ctx.enqueue_function[insert](
                 Int64(n), Int64(cap), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── unique_mask ────────────────────────────────────────────────────────────
 # Mark out[i]=1 where sorted keys[i] != keys[i-1] (first in run).
 @export
-def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
+def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1222,7 +1280,9 @@ def unique_mask_gpu(out_addr: Int, keys_addr: Int, n: Int):
         ctx.enqueue_function[kernel](
             Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── sort_topk_i32 ─────────────────────────────────────────────────────────
 # Stable GPU sort of an int32 key array into a row-index permutation.
@@ -1327,7 +1387,7 @@ def sort_topk_i32_gpu(
     keys_addr: Int,
     n:         Int,
     desc_flag: Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def small_sort(n__i64: Int64, padded__i64: Int64, desc__i64: Int64):
         var n_ = Int(n__i64)
@@ -1452,11 +1512,13 @@ def sort_topk_i32_gpu(
                 ctx.synchronize()
                 _ = words^          # keep the scratch alive until the kernels are done
             ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── small device utilities used by the join / chaining wrappers ────────────
 @export
-def fill_i32_gpu(ptr_addr: Int, n: Int, value: Int) abi("C"):
+def fill_i32_gpu(ptr_addr: Int, n: Int, value: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64, v_i64: Int64):
         var n_ = Int(n__i64)
@@ -1469,11 +1531,13 @@ def fill_i32_gpu(ptr_addr: Int, n: Int, value: Int) abi("C"):
             ctx.enqueue_function[kernel](
                 Int64(n), Int64(value), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
             ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # out[0] = max(out[0], max(in[0..n))): the caller seeds out[0].
 @export
-def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C"):
+def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1500,11 +1564,13 @@ def max_i32_gpu(out_addr: Int, in_addr: Int, n: Int) abi("C"):
             ctx.enqueue_function[kernel](
                 Int64(n), grid_dim=min(ceildiv(n, BLOCK), 1024), block_dim=BLOCK)
             ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # out[i] = counts[i] > 0 ? sums[i] / counts[i] : 0
 @export
-def group_mean_finish_f32_gpu(out_addr: Int, sums_addr: Int, cnts_addr: Int, n: Int) abi("C"):
+def group_mean_finish_f32_gpu(out_addr: Int, sums_addr: Int, cnts_addr: Int, n: Int) abi("C") -> Int:
     @parameter
     def kernel(n__i64: Int64):
         var n_ = Int(n__i64)
@@ -1518,7 +1584,9 @@ def group_mean_finish_f32_gpu(out_addr: Int, sums_addr: Int, cnts_addr: Int, n: 
             ctx.enqueue_function[kernel](
                 Int64(n), grid_dim=ceildiv(n, BLOCK), block_dim=BLOCK)
             ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── scan_i32: exclusive prefix sum ─────────────────────────────────────────
 # out[i] = sum(in[0..i)),  total_addr[0] = sum(in[0..n)).
@@ -1589,13 +1657,15 @@ def _scan_level(
     _ = offs^
 
 @export
-def scan_i32_gpu(out_addr: Int, in_addr: Int, total_addr: Int, n: Int) abi("C"):
+def scan_i32_gpu(out_addr: Int, in_addr: Int, total_addr: Int, n: Int) abi("C") -> Int:
     try:
         if n > 0:
             var ctx = DeviceContext()
             _scan_level(ctx, out_addr, in_addr, total_addr, n)
             ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── join_count_i32 ─────────────────────────────────────────────────────────# Two-pass GPU hash join — Phase 1: count right-key matches per left row.
 #
@@ -1613,7 +1683,7 @@ def join_count_i32_gpu(
     n_left:      Int,
     n_right:     Int,
     table_size:  Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def count_right(n_r_i64: Int64, ts_i64: Int64):
         var n_r = Int(n_r_i64)
@@ -1642,7 +1712,9 @@ def join_count_i32_gpu(
             Int64(n_left), Int64(table_size),
             grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0
 
 # ── join_scatter_i32 ───────────────────────────────────────────────────────
 # Two-pass GPU hash join — Phase 2: scatter (left_idx, right_idx) pairs.
@@ -1668,7 +1740,7 @@ def join_scatter_i32_gpu(
     right_count_addr: Int,  # in: int32[table_size]
     n_left:           Int,
     table_size:       Int,
-) abi("C"):
+) abi("C") -> Int:
     @parameter
     def scatter(n_l_i64: Int64, ts_i64: Int64):
         var n_l = Int(n_l_i64)
@@ -1690,4 +1762,6 @@ def join_scatter_i32_gpu(
             Int64(n_left), Int64(table_size),
             grid_dim=ceildiv(n_left, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
-    except: pass
+    except e:
+        return _status(e)
+    return 0

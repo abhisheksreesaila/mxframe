@@ -216,7 +216,7 @@ def test_split_shapes_match_cpu_for_thread_counts(monkeypatch, threads):
     from mxframe import aot_kernels as ak
     from mxframe import pipeline_kernels as pkm
     if threads:
-        monkeypatch.setattr(pkm, "default_threads", lambda: int(threads))
+        monkeypatch.setattr(pkm, "default_threads", lambda *a: int(threads))
     cf.clear_residency()
     t = table(700_000, groups=50)
     shapes = [

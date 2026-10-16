@@ -116,9 +116,14 @@ def _load_cpu():
             lib = ctypes.CDLL(str(path))
             fn = lib.mx_pipeline_cpu
             fn.restype = _I64
-            fn.argtypes = [_I64] * 14
+            fn.argtypes = [_I64] * 15
             _cpu_lib = lib
     return _cpu_lib
+
+
+def _reproducible_now() -> bool:
+    from . import native_exec
+    return native_exec.reproducible()
 
 
 def _addr(a: np.ndarray) -> int:
@@ -179,8 +184,13 @@ def _chunk_table(cc: ChunkedColumns, n_rows: int):
 
 
 def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarray], n_groups: int,
-                     start: int, end: int, threads: Optional[int] = None) -> Partials:
+                     start: int, end: int, threads: Optional[int] = None,
+                     reproducible: Optional[bool] = None) -> Partials:
     """Run the program over rows ``[start, end)`` on the CPU (all cores by default).
+
+    ``reproducible``: float sums in the defined order whatever the group count (F-064); default: the mode of
+    the ``compute()`` running in this thread (``native_exec.reproducible()``). A worker thread started by
+    the caller does not inherit it: read it first and pass it in.
 
     ``columns`` is a sequence of numpy arrays or a :class:`ChunkedColumns`
     (from ``program.bind_chunks(table)``, which avoids concatenating Arrow chunks).
@@ -202,6 +212,7 @@ def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarra
         _addr(program.set_meta), _addr(tbl), int(tbl.shape[0]), _addr(col_dt),
         _addr(gids) if gids is not None else 0, n_groups, start, end,
         _addr(vals), _addr(cnt), int(threads) if threads else default_threads(),
+        1 if (reproducible if reproducible is not None else _reproducible_now()) else 0,
     )
     if rc != 0:
         raise RuntimeError(f"mx_pipeline_cpu failed with code {rc}")
@@ -303,7 +314,11 @@ class _Cuda:
 
     def sync(self) -> None:
         self.bind_thread()
-        self.lib.cuCtxSynchronize()
+        err = self.lib.cuCtxSynchronize()
+        if err == 2:
+            raise MemoryError("CUDA_ERROR_OUT_OF_MEMORY: cuCtxSynchronize")
+        if err != 0:
+            raise RuntimeError(f"CUDA_ERROR {err}: cuCtxSynchronize failed")
 
     POOL_KEEP = 4                  # buffers kept per name
     POOL_MAX_BYTES = 32 << 20      # bigger ones are freed at check-in
@@ -354,6 +369,9 @@ def _get_cuda() -> _Cuda:
     return _cuda
 
 
+REPRO_MAX_NS = 4096     # (slots + 1) * groups the reproducible GPU kernel holds: REPRO_MAX_NS in pipeline_gpu.mojo
+
+
 def _load_gpu():
     global _gpu_lib
     with _lock:
@@ -364,9 +382,19 @@ def _load_gpu():
             lib = ctypes.CDLL(str(path))
             fn = lib.mx_pipeline_gpu
             fn.restype = _I64
-            fn.argtypes = [_I64] * 20
+            fn.argtypes = [_I64] * 21
+            mode = lib.mx_pipeline_gpu_mode
+            mode.restype = _I64
+            mode.argtypes = [_I64] * 5
             _gpu_lib = lib
     return _gpu_lib
+
+
+def gpu_reproducible_fits(program: PipelineProgram, n_groups: int) -> bool:
+    """Can the GPU kernel add this program's floats in a fixed order (mode 0, 3 or the ordered table)? Asked by
+    the kernel library itself, so the answer is the one ``run_pipeline_gpu(reproducible=True)`` will get."""
+    return _load_gpu().mx_pipeline_gpu_mode(n_groups, program.n_slots, int(program.code[1]),
+                                            int(len(program.code)), 1) >= 0
 
 
 class _DeviceProgram:
@@ -468,8 +496,13 @@ def upload_columns(program: PipelineProgram, columns, gids: Optional[np.ndarray]
 
 def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarray], ChunkedColumns, DeviceColumns],
                      gids: Optional[np.ndarray], n_groups: int, start: int, end: int,
-                     _repeat: int = 1) -> Partials:
+                     _repeat: int = 1, reproducible: Optional[bool] = None) -> Partials:
     """Run the program over rows ``[start, end)`` on the GPU.
+
+    ``reproducible`` (default: the mode of the ``compute()`` running in this thread, as for the CPU kernel;
+    a worker thread started by the caller does not inherit it, so pass it in): float sums without atomics,
+    bit-identical from run to run (F-067). Raises :class:`GpuUnsupported` when the group count does not fit
+    the ordered kernel (``REPRO_MAX_NS``): the caller's CPU path then runs the defined order.
 
     ``columns`` are host arrays / chunked columns (only the row range is copied
     over) or a :class:`DeviceColumns` already on the device. ``_repeat`` re-runs
@@ -514,16 +547,19 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         cu.h2d(col_dt, np.array(dc.dtypes or [0], dtype=np.int32))
         out_vals = take("out_vals", max(n_slots * n_groups, 1) * 8)
         out_cnt = take("out_cnt", n_groups * 8)
+        repro = reproducible if reproducible is not None else _reproducible_now()
         ns = (n_slots + 1) * n_groups
-        block_rows = ns if ns <= 48 else 0
+        block_rows = ns if ns <= 48 or (repro and ns <= REPRO_MAX_NS) else 0
         scratch = take("scratch", max(max_blocks * block_rows * 8, 8))
         cu.sync()
         rc = lib.mx_pipeline_gpu(
             dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
             dc.gid_ptr if n_groups > 1 else 0, n_groups, n_slots, k_start, k_end,
             out_vals, out_cnt, dp.ident, scratch, dp.n_regs, dp.code_ints, dp.agg_base,
-            cu.sm_count, int(_repeat),
+            cu.sm_count, int(_repeat), 1 if repro else 0,
         )
+        if rc == -6:
+            raise GpuUnsupported("reproducible float sums need the group table in shared memory")
         if rc == -5:
             raise GpuUnsupported("program needs more shared memory than a block has")
         if rc != 0:
