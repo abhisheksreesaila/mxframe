@@ -28,7 +28,10 @@ Program/ABI contract (keep in sync with pipeline_program.py):
                     in the order prologue, pred, body, aggs.
   consts float64[], set_bytes uint8[], set_meta int64[] (offset, length, lo)*
   column dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8, 5 | (slot << 8) = int32 dictionary codes plus the
-  integer in chunk-table column `slot` (the native executor's string predicates, F-031)
+  integer in chunk-table column `slot` (the native executor's string predicates, F-031),
+  6 | (slot << 8) = utf8 offsets (int32; the column's base address is rebased like any other) plus, in
+  chunk-table columns `slot`, `slot + 1`, `slot + 2`: the chunk's bytes address, its validity bitmap
+  address (0 = no nulls) and the bit index of row 0 of the chunk table's row numbering (F-034)
   chunk table int64[n_chunks, 2 + n_cols]: row_start, row_end, then per column the
                     chunk's base address minus row_start * itemsize, so that
                     `addr + row * itemsize` is valid for every row of the chunk
@@ -90,6 +93,7 @@ comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
 comptime OP_CMPC = 38
 comptime OP_ROWID = 39      # the row's number in the whole input (SELECT DISTINCT: first appearance, F-033)
+comptime OP_STR = 40        # a plain utf8 column LIKE a pattern (F-034)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -301,6 +305,124 @@ def _in_set(d: FP, a: FP, bytes: BP, off: Int, length: Int, lo: Int, n: Int):
         d[i] = hit
 
 
+# ── LIKE over a plain utf8 column (F-034) ──────────────────────────────────────────────────────
+# Pattern bytes: UTF-8 literals, 0xFF = '%' (any run), 0xFE = '_' (one UTF-8 character); neither byte
+# occurs in UTF-8 text. Byte semantics like DuckDB's: literals compare as bytes, '_' skips one code point.
+
+@always_inline
+def _ulen(b: UInt8) -> Int:
+    if b < 0x80:
+        return 1
+    if b < 0xE0:
+        return 2
+    if b < 0xF0:
+        return 3
+    return 4
+
+
+@always_inline
+def _eq_bytes(a: BP, b: BP, n: Int) -> Bool:
+    for i in range(n):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+def _like_general(s: BP, L: Int, pat: BP, pl: Int) -> Bool:
+    """Glob match with '%' and '_': one backtrack point (the last '%'), O(len * pattern) at worst."""
+    var si = 0
+    var pi = 0
+    var star = -1
+    var mark = 0
+    while si < L:
+        var pch = Int(pat[pi]) if pi < pl else -1
+        if pch == 0xFF:
+            star = pi
+            pi += 1
+            if pi == pl:
+                return True
+            mark = si
+        elif pch == 0xFE:
+            si += _ulen(s[si])
+            pi += 1
+        elif pch >= 0 and pch == Int(s[si]):
+            si += 1
+            pi += 1
+        elif star >= 0:
+            mark += _ulen(s[mark])
+            si = mark
+            pi = star + 1
+        else:
+            return False
+    while pi < pl and pat[pi] == 0xFF:
+        pi += 1
+    return pi == pl
+
+
+def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: Int, pat: BP, pl: Int,
+              negate: Bool, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    """d[j] = 1.0 if row j's string matches the pattern (negated: does not), 0.0 for a NULL string."""
+    var offs = IP(unsafe_from_address=offs_addr)
+    var data = _bp(data_addr)
+    var valid = _bp(valid_addr)
+    # the pattern's shape, once per call: 0 general, 1 exact, 2 prefix, 3 suffix, 4 substring
+    var markers = 0
+    var wild_one = False
+    for k in range(pl):
+        if pat[k] == 0xFF or pat[k] == 0xFE:
+            markers += 1
+        if pat[k] == 0xFE:
+            wild_one = True
+    var shape = 0
+    var lit = pat
+    var m = pl
+    if not wild_one:
+        if markers == 0:
+            shape = 1
+        elif markers == 1 and pat[pl - 1] == 0xFF:
+            shape = 2
+            m = pl - 1
+        elif markers == 1 and pat[0] == 0xFF:
+            shape = 3
+            lit = pat + 1
+            m = pl - 1
+        elif markers == 2 and pl >= 3 and pat[0] == 0xFF and pat[pl - 1] == 0xFF:
+            shape = 4
+            lit = pat + 1
+            m = pl - 2
+    var first = Int(lit[0]) if m > 0 else 0
+    for j in range(n):
+        var r = i0 + (Int(sel[j]) if use_sel else j)
+        if valid_addr != 0:
+            var bit = bit_base + r
+            if ((Int(valid[bit >> 3]) >> (bit & 7)) & 1) == 0:
+                d[j] = 0.0
+                continue
+        var a = Int(offs[r])
+        var L = Int(offs[r + 1]) - a
+        var s = data + a
+        var hit = False
+        if shape == 1:
+            hit = L == m and _eq_bytes(s, lit, m)
+        elif shape == 2:
+            hit = L >= m and _eq_bytes(s, lit, m)
+        elif shape == 3:
+            hit = L >= m and _eq_bytes(s + (L - m), lit, m)
+        elif shape == 4:
+            if m == 0:
+                hit = True
+            else:
+                var i = 0
+                while i + m <= L:
+                    if Int(s[i]) == first and _eq_bytes(s + i, lit, m):
+                        hit = True
+                        break
+                    i += 1
+        else:
+            hit = _like_general(s, L, pat, pl)
+        d[j] = 1.0 if hit != negate else 0.0
+
+
 comptime HUGE = 1 << 21
 
 
@@ -403,6 +525,13 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             var c = Int(ins[2])
             _load_col(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
             _cmp_const(Int(ins[4]), d, p.consts[Int(ins[3])], npad)
+        elif op == OP_STR:
+            var c = Int(ins[2])
+            var slot = Int(p.dtypes[c]) >> 8        # dtype 6 | (slot << 8): the chunk's bytes, validity, bit base
+            var si = Int(ins[3])
+            _str_like(d, Int(cols[c]), Int(cols[slot]), Int(cols[slot + 1]), Int(cols[slot + 2]),
+                      p.set_bytes + Int(p.set_meta[si * 3]), Int(p.set_meta[si * 3 + 1]), Int(ins[4]) != 0,
+                      i0, sel, use_sel, n)
         elif op == OP_ROWID:
             # i0 is the block's first row in the whole input (the column bases are rebased to it); sel
             # holds the block offsets of the rows kept so far

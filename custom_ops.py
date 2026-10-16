@@ -591,7 +591,7 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
-        if expr.op in ("case_when", "isin", "startswith", "contains", "str_slice", "not", "year",
+        if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
                        "window"):
             return True
@@ -726,6 +726,9 @@ class CustomOpsCompiler(GraphCompiler):
                 if mask is not None:
                     return _npa(mask, type=pa.bool_())
             return pc.match_substring(col_arr, pattern=args[1])
+        if op == "like":
+            from .str_patterns import match_like
+            return match_like(self._eval_expr_arrow(args[0], table), args[1], args[2], args[3])
         if op == "year_days":
             col_arr = self._eval_expr_arrow(args[0], table)
             if pa.types.is_integer(col_arr.type):
@@ -795,7 +798,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains"):
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like"):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)

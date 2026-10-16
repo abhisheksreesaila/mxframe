@@ -518,7 +518,7 @@ def _metadata(path):
 _CMP_OPS = ("eq", "ne", "gt", "ge", "lt", "le")
 _FLIP = {"eq": "eq", "ne": "ne", "gt": "lt", "lt": "gt", "ge": "le", "le": "ge"}
 # Predicate forms the engine evaluates natively on dictionary columns.
-_NATIVE_DICT_PRED = ("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains")
+_NATIVE_DICT_PRED = ("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains", "like")
 
 
 class _Info:

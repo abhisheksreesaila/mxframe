@@ -5,7 +5,7 @@ Supports a large subset of TPC-H-style SQL:
   Arithmetic: + - * /
   Comparisons: = != < <= > >=
   Boolean: AND OR NOT
-  BETWEEN, IN / NOT IN, LIKE (prefix% only)
+  BETWEEN, IN / NOT IN, LIKE / ILIKE [ESCAPE]
   Aggregates: SUM AVG MIN MAX COUNT(*) COUNT(DISTINCT x), arithmetic on aggregates, HAVING, GROUP BY ALL
   CASE WHEN ... THEN ... ELSE ... END
   INNER / LEFT JOIN ... ON ...
@@ -1160,6 +1160,29 @@ class _SQLTranslator:
     # expression translation
     # ------------------------------------------------------------------
 
+    def _like(self, node, escape_node):
+        """``x [I]LIKE 'pattern' [ESCAPE 'c']``; ``%x``-free shapes keep the cheaper prefix / substring ops."""
+        from .str_patterns import parse_like
+        def literal(n, what):
+            if not (isinstance(n, sge.Literal) and n.is_string):
+                raise NotImplementedError(f"LIKE: the {what} must be a string literal")
+            return n.this
+        pattern = literal(node.expression, "pattern")
+        escape = None if escape_node is None else literal(escape_node, "escape character")
+        c = self._expr(node.this)
+        ignore = isinstance(node, sge.ILike)
+        try:
+            kinds = [k for k, _ in parse_like(pattern, escape)]
+            text = "".join(t for k, t in parse_like(pattern, escape) if k == "lit")
+        except ValueError as e:
+            raise ValueError(f"LIKE {pattern!r}: {e}") from None
+        if not ignore and text:
+            if kinds == ["lit", "run"]:
+                return c.startswith(text)
+            if kinds == ["run", "lit", "run"]:
+                return c.contains(text)
+        return c.like(pattern, escape, ignore)
+
     def _expr(self, node: sge.Expression) -> Expr:
         """Translate a sqlglot expression to an MXFrame Expr."""
         if isinstance(node, sge.Subquery):
@@ -1271,18 +1294,11 @@ class _SQLTranslator:
             result = c.isin(values)
             return result
 
-        # ---- LIKE (prefix% patterns only) ----
-        if isinstance(node, sge.Like):
-            c = self._expr(node.this)
-            pattern = node.expression.this
-            if pattern.endswith("%") and "%" not in pattern[:-1] and "_" not in pattern:
-                return c.startswith(pattern[:-1])
-            if len(pattern) > 2 and pattern.startswith("%") and pattern.endswith("%") \
-                    and "%" not in pattern[1:-1] and "_" not in pattern:
-                return c.contains(pattern[1:-1])
-            raise NotImplementedError(
-                f"Only 'prefix%' and '%substring%' LIKE patterns are supported, got {pattern!r}"
-            )
+        # ---- LIKE / ILIKE [ESCAPE c] ----
+        if isinstance(node, sge.Escape) and isinstance(node.this, (sge.Like, sge.ILike)):
+            return self._like(node.this, node.expression)
+        if isinstance(node, (sge.Like, sge.ILike)):
+            return self._like(node, None)
 
         # ---- aggregates ----
         if isinstance(node, sge.Sum):

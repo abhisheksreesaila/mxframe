@@ -119,6 +119,9 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
         fn = lambda v: pc.starts_with(v, pattern=args[1])          # noqa: E731
     elif op == "contains":
         fn = lambda v: pc.match_substring(v, pattern=args[1])      # noqa: E731
+    elif op == "like":
+        from .str_patterns import match_like
+        fn = lambda v: match_like(v, args[1], args[2], args[3])    # noqa: E731
     else:
         return None
     target = args[0]
