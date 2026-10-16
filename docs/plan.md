@@ -799,3 +799,14 @@ Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (
 Found by the F-077 review (2026-10-16); a silent wrong answer on main
 - [ ] `custom_ops.py` (~1259) builds window partitions from a Python dict over `to_pylist()`, so each NaN row is its own partition (and -0.0 / 0.0 split): `sum(v).over("k")` gives `[1, 2, 7, 7]` where DuckDB gives `[3, 3, 7, 7]`. Partition through the same codes as group-by (`np_arrow.canonical_floats` / `_codes`), which also drops the per-row Python dict
 - [ ] DuckDB-checked tests: float partition key with NaN (two payloads), -0.0 / 0.0, NULL, ±inf; sum / count / rank over it; fails before
+- [ ] window `min` / `max` (numpy) propagate NaN; DuckDB's MAX is NaN when the frame holds one and MIN skips it (F-070 rule) (found by the F-070 developer)
+
+## F-082 Denormal floats are not flushed to zero [todo]
+Found by the F-070 developer (2026-10-16); a silent wrong answer
+- [ ] with `MXFRAME_NATIVE=0` on 200,000 rows, `fused_pipeline_cpu` reads the denormal 5e-324 as 0 (`x > 0.0` counts 0 of 100,000): a flush-to-zero / denormals-are-zero mode in the CPU pipeline kernel (or its compile flags). Find where FTZ/DAZ is set; every CPU and GPU path compares and sums denormals like DuckDB
+- [ ] DuckDB-checked tests: filters and sums over denormals (5e-324, 2.2e-308), each CPU path forced (native, fused pipeline, Arrow) and GPU; fails before
+
+## F-083 ORDER BY a column not in the select list [todo]
+Found by the F-070 developer (2026-10-16)
+- [ ] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
+- [ ] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
