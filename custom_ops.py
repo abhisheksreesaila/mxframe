@@ -3932,6 +3932,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         Returns (dense_ids, n_groups, unique_key_cols) or None on failure.
         """
+        if len(keys) > 4:
+            return None        # the kernel takes four key slots: a fifth key would be left out of the composite
         try:
             # Dictionary-encode each key column (PyArrow SIMD — not replicated in Mojo)
             encodings = []
