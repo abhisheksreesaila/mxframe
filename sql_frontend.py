@@ -1408,15 +1408,17 @@ class _SQLTranslator:
 
         # ---- negation ----
         if isinstance(node, sge.Neg):
+            if self._is_int_expr(node.this) and isinstance(node.this, sge.Literal):
+                return lit(-int(node.this.this))                # a negative integer literal, not 0 - 1 (a float32 scalar)
             return lit(0) - self._expr(node.this)
 
         # ---- arithmetic ----
         if isinstance(node, sge.Add):
-            return self._float_expr(node.this) + self._float_expr(node.expression)
+            return self._arith_operand(node, node.this) + self._arith_operand(node, node.expression)
         if isinstance(node, sge.Sub):
-            return self._float_expr(node.this) - self._float_expr(node.expression)
+            return self._arith_operand(node, node.this) - self._arith_operand(node, node.expression)
         if isinstance(node, sge.Mul):
-            return self._float_expr(node.this) * self._float_expr(node.expression)
+            return self._arith_operand(node, node.this) * self._arith_operand(node, node.expression)
         if isinstance(node, sge.Div):
             return self._float_expr(node.this) / self._float_expr(node.expression)
 
@@ -1580,6 +1582,26 @@ class _SQLTranslator:
         if f is not None:
             return f
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
+
+    def _is_int_expr(self, node: sge.Expression) -> bool:
+        """True when ``node`` is certainly an integer: an integer literal, an integer column of a known table,
+        or + - * and negation of those. Unknown (aggregates, unresolved names) is False."""
+        node = _unparen(node)
+        if isinstance(node, sge.Literal):
+            return not node.is_string and "." not in str(node.this) and "e" not in str(node.this).lower()
+        if isinstance(node, sge.Neg):
+            return self._is_int_expr(node.this)
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul)):
+            return self._is_int_expr(node.this) and self._is_int_expr(node.expression)
+        t = self._col_type(node)
+        return t is not None and pa.types.is_integer(t)
+
+    def _arith_operand(self, parent: sge.Expression, node: sge.Expression) -> "Expr":
+        """An operand of + - *: integer arithmetic stays integer (exact, checked overflow, like DuckDB) when both
+        operands are certainly integers; anything else promotes an integer literal to float (``_float_expr``)."""
+        if self._is_int_expr(parent.this) and self._is_int_expr(parent.expression):
+            return self._expr(node)
+        return self._float_expr(node)
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
         """Like _expr but promotes integer literals to float for arithmetic use.
