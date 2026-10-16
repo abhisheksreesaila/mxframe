@@ -85,6 +85,33 @@ def _yield_to_queries() -> None:
 _deferred: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_deferred", default=None)
 
 
+_closing = False
+
+
+def _start_thread(t: threading.Thread) -> None:
+    """Start an upload thread unless the process is exiting (see ``close_background``)."""
+    with _lock:
+        try:
+            if _closing:
+                raise RuntimeError("process is exiting")
+            t.start()
+        except Exception:      # exiting: free the key so a later query retries
+            for k in [k for k, v in _inflight.items() if v is t]:
+                _inflight.pop(k, None)
+
+
+def close_background(timeout: float) -> None:
+    """At exit: start no more uploads and wait for the running ones (F-063: a daemon thread
+    inside libcuda while `exit()` unloads the driver aborts or segfaults the process)."""
+    global _closing
+    with _lock:
+        _closing = True
+        running = [t for t in _inflight.values() if t.is_alive()]
+    deadline = time.monotonic() + timeout
+    for t in running:
+        t.join(max(0.0, deadline - time.monotonic()))
+
+
 class _Background:
     """GPU work queued while a query runs; started when the query has returned."""
 
@@ -108,12 +135,7 @@ class _Background:
                 except Exception:
                     pass
             for t in threads:
-                try:
-                    t.start()
-                except Exception:      # e.g. interpreter shutdown: free the key so a later query retries
-                    with _lock:
-                        for k in [k for k, v in _inflight.items() if v is t]:
-                            _inflight.pop(k, None)
+                _start_thread(t)
 
         if IDLE_BEFORE_BACKGROUND_S <= 0:
             launch()
@@ -390,7 +412,7 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
     if bg is not None:
         bg.threads.append(t)
     else:
-        t.start()
+        _start_thread(t)
 
 
 FAILED_RETRY_S = 120.0   # a failed or rejected upload (e.g. shared-GPU memory pressure) is retried after this
