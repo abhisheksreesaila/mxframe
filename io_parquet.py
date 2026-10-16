@@ -865,6 +865,9 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
 
     leaf_preds = _join_leaf_filters(plan) if info.has_join else {}
 
+    def hit(name: str, names) -> bool:
+        return name in names or (info.has_join and _renamed_ref(name, names))
+
     def deferrable(name: str, leaf) -> bool:
         """Under a join, leave a dictionary column encoded: the join engine decodes it after the
         leaf's filter, or after the final gather (joined rows only), so every consumer above the
@@ -877,11 +880,12 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
             # that pass, or keeps codes for a DISTINCT above; unless a filter reads the column in a
             # way the engine can't evaluate on codes (CASE WHEN, arithmetic, ...)
             return name not in info.bad_expr
-        if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
+        # a join renames a clashing right column (`n_name` -> `n_name_right`): the plan reads that name
+        if not info.has_join or not hit(name, info.refs) or info.passthrough.get(id(leaf), True):
             return False
         if id(leaf) not in leaf_preds:              # not a Filter*(Scan) input of a join
             return False
-        return name not in info.bad_expr or name not in leaf_preds[id(leaf)]
+        return not hit(name, info.bad_expr) or name not in leaf_preds[id(leaf)]
 
     def _scan(table, defer):
         s = Scan(table)
@@ -889,7 +893,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
             s._mx_decode_after = frozenset(defer)
             # read above the join only in dictionary-native ways (a bare group key, a predicate the
             # engine evaluates on codes): the join passes them on as dictionaries, never decoded
-            keep = frozenset(n for n in defer if n not in info.bad)
+            keep = frozenset(n for n in defer if not hit(n, info.bad))
             if keep:
                 s._mx_keep_dict = keep
         return s
