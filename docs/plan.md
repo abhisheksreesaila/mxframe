@@ -29,12 +29,13 @@ Order, one stage at a time:
 4. **Gate:** F-058, the scoreboard that says the core is ready.
 Benchmarks run only on a quiet machine (see `docs/lessons.md`). With other agents running, do development and light SF1 correctness checks only.
 
-## F-055 GPU correctness sweep [todo]
-Needs: none · Agreed 2026-10-15
-- [ ] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB; every mismatch or crash gets a fix or a ticket
-- [ ] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (correctness mode, no timing)
-- [ ] F-014's flaky GPU sort test: memory pressure or a real ordering bug, settled
-- [ ] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`, so auto never picks it
+## F-055 GPU correctness sweep [review]
+Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
+- [x] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB (22/22 both; first and repeat run); every mismatch or crash gets a fix or a ticket: none found. Also on the GPU, per query: the path of every `compute()` and the GPU kernels it called (all 22 ran at least one GPU kernel; the join in a GPU session is the GPU hash join)
+- [x] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (`--device gpu --gpu <uuid> --engines mx,duckdb`): 100/100 stored and shuffled, 94 ran a GPU kernel
+- [x] F-014's flaky GPU sort test settled: memory pressure from other processes (about 0.5 GB free reproduces it), and behind it a real bug: every exported GPU function swallowed its errors (`except: pass`), so an out-of-memory sort or join returned garbage. All 31 now return a status and raise (`MemoryError` / `RuntimeError`), driver calls check their `CUresult`, `auto` reruns on the CPU (`tests/test_gpu_kernel_errors.py`); `is_sorted_topk` stays as a backstop
+- [x] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`: none needed, it stays empty
+- [ ] not probed: the Mojo `ctx.synchronize()` of every kernel is assumed to raise on a fault the way it does on out-of-memory (checked for the sort only)
 
 ## F-056 Data bigger than GPU memory never fails [todo]
 Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
@@ -606,12 +607,3 @@ Needs: F-001, F-005..F-008
 - [x] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005): SF10 22/22; SF1 21/22 on the median of 4 fresh-process runs (single runs 17–21/22, only 2 of 4 reach 20; the misses move between runs, ±10% noise on 50–400 ms queries; the 3 extra runs started at load 2.8–4.4). Reaching it needed three fixes for auto's first-query overhead: a cheaper `_key_card` sample, lazy `calibration` imports, and background GPU work that waits for a 100 ms idle gap (before them SF1 was 12/22)
 - [x] full SF1 + SF10 user-felt run on an otherwise idle machine (2026-10-12 01:34, load1 0.13 at start, GPU 0 because GPU 1 drives the display): `docs/bench/final-sf1*.md`, `final-sf10.md`; summary and honest losses at the top of `docs/benchmarks.md`. All 132 mx results match DuckDB
 - [x] README `device="auto"` section with the real numbers; the README performance section now leads with the user-felt table, and the old synthetic warm-run tables are marked historical
-
-## F-055 GPU correctness sweep [review]
-Needs: F-014, F-022 · Results only, no speed claims; SF1, one GPU, shared machine. Report: `docs/bench/gpu-correctness-sf1.md`
-- [x] all 22 TPC-H queries on `device="gpu"` equal to DuckDB at SF1, stored and shuffled (22/22 both; first and repeat run each), with the path every `compute()` took (`paths` column in the scoreboard CSV)
-- [x] which queries ran a GPU kernel and which ran on the CPU: 20 ran the fused GPU aggregate; Q2 and Q20 ran no GPU kernel (CPU join engine and PyArrow only), so their match says nothing about the GPU
-- [x] random-query suite (100 queries, SF1) on `device="gpu"` equal to DuckDB, stored and shuffled (100/100 both; 78 ran a GPU aggregate kernel, 22 ran on the CPU or PyArrow: select/distinct/top-n shapes and one declined count-distinct)
-- [x] F-014's flaky GPU sort test settled and fixed at its cause (see F-014)
-- [x] mismatches and crashes: none found, so `auto_mode.KNOWN_BROKEN_GPU` stays empty and no new ticket
-- [ ] not probed: other GPU kernels that swallow an out-of-memory error the way the sort did (scan, group-by scratch, hash join scratch); a kernel-level check of "no `oom log` on stderr" in the sweep would catch them
