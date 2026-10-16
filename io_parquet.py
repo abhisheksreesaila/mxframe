@@ -823,7 +823,9 @@ def _pushable(expr: Expr, schema: pa.Schema) -> Optional[Tuple]:
     elif op == "is_null":
         op = "isnull"
     if op in ("isnull", "notnull"):
-        return (args[0].args[0], op, None) if args[0].op == "col" and args[0].args[0] in schema.names else None
+        # flat columns only: a list / struct column's leaf null_count counts NULLs inside the values, not NULL rows
+        ok = args[0].op == "col" and args[0].args[0] in schema.names and not pa.types.is_nested(schema.field(args[0].args[0]).type)
+        return (args[0].args[0], op, None) if ok else None
     if op in _CMP_OPS:
         a, b = args
         if a.op == "lit" and b.op == "col":
@@ -868,7 +870,8 @@ def _filters_expression(filters):
         f = ds.field(name)
         e = {"eq": lambda: f == value, "ne": lambda: f != value, "gt": lambda: f > value,
              "ge": lambda: f >= value, "lt": lambda: f < value, "le": lambda: f <= value,
-             "isin": lambda: f.isin(list(value))}[op]()
+             "isin": lambda: f.isin(list(value)), "isnull": lambda: f.is_null(),
+             "notnull": lambda: ~f.is_null()}[op]()
         out = e if out is None else (out & e)
     return out
 

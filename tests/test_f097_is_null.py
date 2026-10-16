@@ -146,6 +146,27 @@ def test_missing_statistics_never_skip(tmp_path):
         assert n_read == 8 * GROUP
 
 
+@pytest.mark.parametrize("name", ["l", "st"])
+def test_list_and_struct_columns_are_not_pruned_by_leaf_counts(tmp_path, name):
+    n = 2000
+    t = pa.table({"id": pa.array(np.arange(n)),
+                  "l": pa.array([[1, None]] * n, pa.list_(pa.int64())),
+                  "st": pa.array([{"a": None}] * n, pa.struct([("a", pa.int64())]))})
+    p = str(tmp_path / "nested.parquet")
+    pq.write_table(t, p, row_group_size=250)
+    n_read, lf = _read(p, ~col(name).is_null())
+    assert n_read == n                                # every row is NOT NULL: nothing may be skipped
+    assert lf.compute(device="cpu").num_rows == n
+    n_read, lf = _read(p, col(name).is_null())
+    assert n_read == n and lf.compute(device="cpu").num_rows == 0
+
+
+def test_filters_expression_maps_null_tests():
+    from mxframe.io_parquet import _filters_expression
+    e = _filters_expression([("v", "isnull", None), ("w", "notnull", None)])
+    assert "is_null(v" in str(e) and "invert(is_null(w" in str(e)
+
+
 # ── part 2: the native bytecode ─────────────────────────────────────────────────────────────
 
 N = 30_000
