@@ -12,6 +12,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum
+from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_values
 import numpy as np
 import os as _os
 import dataclasses
@@ -326,6 +327,22 @@ def clear_cache():
 
 
 # ── Window-function helpers (module-level for reuse) ─────────────────────────
+
+def _min_skip_nan(arr):
+    ok = arr[~np.isnan(arr)]
+    return ok.min() if ok.size else np.nan
+
+
+def _canonical_partition_key(col):
+    """A float key column with -0.0 as 0.0 and every NaN payload as one NaN, so equal-by-SQL keys share a
+    code (nulls stay null). replace with np_arrow.canonical_floats after F-077 merges"""
+    if not pa.types.is_floating(col.type):
+        return col
+    a = _combine(col)
+    f = _np_float_values(a)
+    v = np.where(np.isnan(f), np.nan, f + 0.0)
+    return _npa(np.ma.masked_array(v, mask=_np_of(pc.is_null(a), zero_copy_only=False)), type=pa.float64()) if a.null_count else _npa(v)
+
 
 def _window_rank(arr: np.ndarray) -> np.ndarray:
     """Standard competition ranking: ties share rank, gaps follow (1,2,2,4…)."""
@@ -1347,10 +1364,11 @@ class CustomOpsCompiler(GraphCompiler):
 
         # Build {key_tuple: [row_indices]} map
         if partition_by:
-            keys = list(zip(*[table.column(c).to_pylist() for c in partition_by]))
-            groups: dict = {}
-            for i, k in enumerate(keys):
-                groups.setdefault(k, []).append(i)
+            gid, _ = _np_group_ids(pa.table({c: _canonical_partition_key(table.column(c)) for c in partition_by}),
+                                   partition_by)
+            order = np.argsort(gid, kind="stable")
+            bounds = np.flatnonzero(np.diff(gid[order])) + 1
+            groups = {i: part.tolist() for i, part in enumerate(np.split(order, bounds))} if n else {}
         else:
             groups = {(): list(range(n))}
 
@@ -1373,8 +1391,8 @@ class CustomOpsCompiler(GraphCompiler):
                 arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 if   op == "sum":  val = np.full(m, arr.sum())
                 elif op == "mean": val = np.full(m, arr.mean() if m else np.nan)
-                elif op == "min":  val = np.full(m, arr.min()  if m else np.nan)
-                elif op == "max":  val = np.full(m, arr.max()  if m else np.nan)
+                elif op == "min":  val = np.full(m, _min_skip_nan(arr))   # DuckDB: MIN skips NaN
+                elif op == "max":  val = np.full(m, arr.max() if m else np.nan)   # MAX is NaN if any is (numpy propagates)
             elif op == "rank":
                 arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
                 val = _window_rank(arr)

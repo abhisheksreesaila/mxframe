@@ -796,7 +796,7 @@ Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (
 - [ ] Q22: three `greater` / `and_kleene` passes over 150,000 rows in Arrow, `expression` / `predicate not supported` (the DataFrame Q22 is native since F-034)
 - [ ] `tests/test_native_strings_tpch.py`-style test over the SQL text of all 22 queries on SF 0.17: no Arrow compute over 1,000 rows, allowed declines listed by name; fails before
 
-## F-081 Window partitions over a float column: NaNs are one partition [todo]
+## F-081 Window partitions over a float column: NaNs are one partition [review]
 Found by the F-077 review (2026-10-16); a silent wrong answer on main
 - [ ] `custom_ops.py` (~1259) builds window partitions from a Python dict over `to_pylist()`, so each NaN row is its own partition (and -0.0 / 0.0 split): `sum(v).over("k")` gives `[1, 2, 7, 7]` where DuckDB gives `[3, 3, 7, 7]`. Partition through the same codes as group-by (`np_arrow.canonical_floats` / `_codes`), which also drops the per-row Python dict
 - [ ] DuckDB-checked tests: float partition key with NaN (two payloads), -0.0 / 0.0, NULL, ±inf; sum / count / rank over it; fails before
