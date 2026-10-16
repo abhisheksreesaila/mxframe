@@ -467,7 +467,8 @@ class GraphCompiler:
             rhs = GraphCompiler._eval_predicate(args[1], table)
             return _checked_arith("sub", lhs, rhs)
         if op == "mod":
-            return _modulo(GraphCompiler._eval_predicate(args[0], table), GraphCompiler._eval_predicate(args[1], table))
+            return _modulo(GraphCompiler._eval_predicate(args[0], table), GraphCompiler._eval_predicate(args[1], table),
+                           decimal=len(args) > 2)
         if op == "div":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)

@@ -438,7 +438,7 @@ def checked_arith(op, lhs, rhs):
         raise OverflowError(f"Overflow in {word} of {str(t).upper()}") from e
 
 
-def modulo(lhs, rhs):
+def modulo(lhs, rhs, decimal=False):
     """SQL ``lhs % rhs`` as DuckDB computes it: C ``fmod``, so the sign follows the dividend (-7 % 3 = -1, 7 % -3
     = 1, not NumPy's ``%``), NULL when either side is NULL or an integer divisor is 0 (a float one gives NaN), NaN
     stays NaN, ``x % inf`` is x. Operands are arrays or scalars, and the arrays decide the arithmetic: integers
@@ -457,18 +457,31 @@ def modulo(lhs, rhs):
     (a, av, at, a_sc), (b, bv, bt, b_sc) = parts(lhs), parts(rhs)
     valid = av & bv
     n = max(len(a), len(b))
-    lit_a = a_sc and a.dtype.kind == "f" and b.dtype.kind in "iu" and bool(np.isfinite(a[0]))
-    lit_b = b_sc and b.dtype.kind == "f" and a.dtype.kind in "iu" and bool(np.isfinite(b[0]))
-    if lit_a or lit_b:                       # an integer array against a decimal literal (2.5): DuckDB is exact
+    lit_a = decimal and a_sc and a.dtype.kind == "f" and b.dtype.kind in "iu" and bool(np.isfinite(a[0]))
+    lit_b = decimal and b_sc and b.dtype.kind == "f" and a.dtype.kind in "iu" and bool(np.isfinite(b[0]))
+    if lit_a or lit_b:       # an integer array against a decimal literal k/s (2.5 = 25/10): DuckDB is exact
         from decimal import Decimal
         d = Decimal(repr(float((a if lit_a else b)[0])))
-        scale = 10 ** max(-d.as_tuple().exponent, 0)
-        k = int(d * scale)
-        ints = [int(x) * scale for x in np.broadcast_to((b if lit_a else a).astype(object), (n,))]
-        num, den = ([k] * n, ints) if lit_a else (ints, [k] * n)
-        valid = valid & np.array([y != 0 for y in den])
-        rem = [(abs(x) % (abs(y) or 1)) * (-1 if x < 0 else 1) / scale for x, y in zip(num, den)]
-        out_t, res = pa.float64(), np.array(rem, np.float64)
+        s_ = 10 ** max(-d.as_tuple().exponent, 0)
+        k = int(d * s_)
+        if abs(k) * s_ > np.iinfo(np.int64).max:
+            raise OverflowError(f"{d} has too many digits for an exact modulo")
+        x = b if lit_a else a
+        x = np.broadcast_to(x, (n,))
+        if lit_b:                                      # x % k/s = ((x % k) * s % k) / s, exact while k*s fits
+            valid = valid & (k != 0)
+            if x.dtype == np.uint64:
+                kk = np.uint64(abs(k) or 1)
+                r = np.fmod(np.fmod(x, kk) * np.uint64(s_), kk)
+            else:
+                kk = abs(k) or 1
+                r = np.fmod(np.fmod(x.astype(np.int64), kk) * s_, kk)
+        else:                                          # k/s % x = (k % (x * s)) / s
+            c = np.iinfo(np.int64).max // s_       # |x| * s overflows past c, and then |x| * s > |k|: the result is k
+            big = (x > c) | (x < -c) if x.dtype != np.uint64 else x > np.uint64(c)
+            valid = valid & (x != 0)
+            r = np.where(big, k, np.fmod(np.int64(k), np.where(valid & ~big, np.where(big, 0, x).astype(np.int64) * s_, 1)))
+        out_t, res = pa.float64(), r / s_
     elif a.dtype.kind == "f" or b.dtype.kind == "f":
         out_t = pa.float32() if pa.types.is_float32(at) and pa.types.is_float32(bt) else pa.float64()
         with np.errstate(all="ignore"):

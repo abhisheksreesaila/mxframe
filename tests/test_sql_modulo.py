@@ -2,6 +2,7 @@
 a zero divisor gives NULL (integers and floats), NULL in gives NULL out, NaN stays NaN, `x % inf` is x. Every
 shape is checked against DuckDB on the cpu and, where a CUDA GPU exists, on the gpu."""
 import math
+from decimal import Decimal
 
 import duckdb
 import numpy as np
@@ -46,8 +47,15 @@ def _typed():
     })
 
 
+def _dec(v):
+    """A whole DECIMAL (DuckDB's HUGEINT) as an int, a fractional one as the nearest double."""
+    return int(v) if v == v.to_integral_value() else float(v)
+
+
 def _norm(rows):
-    return [tuple("nan" if isinstance(v, float) and math.isnan(v) else v for v in row) for row in rows]
+    """Rows with NaN as a string and DuckDB's DECIMAL as the nearest double (what the engine returns)."""
+    return [tuple("nan" if isinstance(v, float) and math.isnan(v) else _dec(v) if isinstance(v, Decimal) else v
+                  for v in row) for row in rows]
 
 
 def _check(q, device="cpu"):
@@ -140,6 +148,13 @@ QUERIES = [
     "SELECT i, i32 % -2.5 AS r FROM ty ORDER BY i",
     "SELECT i FROM ty WHERE b64 % 2.5 = 0.5 ORDER BY i",
     "SELECT i, x % 0.0 AS r FROM t ORDER BY i",                  # a double column stays IEEE: NaN
+    "SELECT i, b64 % 1e3 AS r FROM ty ORDER BY i",              # an exponent makes it DOUBLE: b64 rounds first
+    "SELECT i, b64 % 1000.0 AS r FROM ty ORDER BY i",           # a point makes it DECIMAL: exact
+    "SELECT i, u64 % 2.5 AS r FROM ty ORDER BY i",
+    "SELECT i, b64 % 9.200000001 AS r FROM ty ORDER BY i",      # k * s = 9.2e18, the last that fits int64
+    "SELECT i, u64 % 9.200000001 AS r FROM ty ORDER BY i",
+    "SELECT i, 9.5 % s64 AS r FROM ty ORDER BY i",
+    "SELECT i, 9.5 % b64 AS r FROM ty ORDER BY i",
     # mixed signed / unsigned
     "SELECT i, u64 % s64 AS r FROM ty ORDER BY i",
     "SELECT i, s64 % u64 AS r FROM ty ORDER BY i",
@@ -163,3 +178,8 @@ def test_modulo_matches_duckdb_on_gpu(q):
 def test_values_a_user_reads():
     got = mx.sql("SELECT -7 % 3 AS a, 7 % -3 AS b, 7 % 0 AS c, MOD(-7.5, 2) AS d FROM t LIMIT 1", t=_t()).compute(device="cpu")
     assert got.to_pydict() == {"a": [-1], "b": [1], "c": [None], "d": [-1.5]}
+
+
+def test_decimal_literal_past_the_exact_range_raises_instead_of_rounding():
+    with pytest.raises(OverflowError, match="too many digits"):         # k * s = 9.3e18 > int64
+        mx.sql("SELECT b64 % 9.300000001 AS r FROM ty", ty=_typed()).compute(device="cpu")

@@ -17,6 +17,7 @@ Supports a large subset of TPC-H-style SQL:
 
 __all__ = ["sql"]
 
+import re
 import calendar
 import itertools
 from datetime import date, timedelta
@@ -96,6 +97,13 @@ def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
 
 
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+
+
+def _is_decimal_literal(n: sge.Expression) -> bool:
+    """``2.5`` or ``-2.5``: DuckDB types a number with a point and no exponent as DECIMAL (``1e3`` is DOUBLE)."""
+    n = _unparen(n)
+    n = _unparen(n.this) if isinstance(n, sge.Neg) else n
+    return isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"\d*\.\d*", str(n.this)) is not None
 
 
 def _unparen(n: sge.Expression) -> sge.Expression:
@@ -1448,7 +1456,8 @@ class _SQLTranslator:
             l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
             if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
                 return lit(None if r.args[0] == 0 else (abs(l.args[0]) % abs(r.args[0])) * (-1 if l.args[0] < 0 else 1))   # two constants
-            return l % r
+            dec = any(_is_decimal_literal(x) for x in (node.this, node.expression))
+            return Expr("mod", l, r, True) if dec else l % r      # a literal with a point (no exponent) is DECIMAL
 
         # ---- comparisons ----
         if isinstance(node, sge.EQ):

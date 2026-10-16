@@ -736,7 +736,7 @@ class CustomOpsCompiler(GraphCompiler):
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return _npa([val] * n)
         if op == "mod":
-            return _modulo(*self._arith_operands(args, table))
+            return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div":
