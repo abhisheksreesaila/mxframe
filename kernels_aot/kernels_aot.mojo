@@ -41,7 +41,7 @@ Build:
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero
-from max.algorithm import sync_parallelize
+from _fpenv import sync_par
 from std.sys.info import num_physical_cores
 from std.ffi import external_call
 
@@ -292,7 +292,7 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
                 _accumulate[OP, VT, AT](p, values, labels, lo, hi, G)
                 m += W
 
-        sync_parallelize(scan, W)
+        sync_par(scan, W)
 
         var MT = G // 4096
         if MT > W:
@@ -317,7 +317,7 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
                         a = _combine[OP, AT](a, part[w * stride + g])
                     out[g] = a
 
-        sync_parallelize(merge, MT)
+        sync_par(merge, MT)
         part.free()
 
 
@@ -426,7 +426,7 @@ def group_composite(
             for i in range(lo, hi):
                 out[i] = I64(k0[i])*s0 + I64(k1[i])*s1 + I64(k2[i])*s2 + I64(k3[i])*s3
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
     ctr.free()
 
 
@@ -554,7 +554,7 @@ def _masked_sum[VT: DType](dst: Pointer[F64, MutUntrackedOrigin],
             m += W
         parts[w] = acc
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
     var total: F64 = 0.0
     for w in range(W):
         total += parts[w]
@@ -580,7 +580,7 @@ def _masked_sum_product[VT: DType](dst: Pointer[F64, MutUntrackedOrigin],
             m += W
         parts[w] = acc
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
     var total: F64 = 0.0
     for w in range(W):
         total += parts[w]
@@ -618,7 +618,7 @@ def _masked_ext[VT: DType, IS_MIN: Bool](dst: Pointer[F64, MutUntrackedOrigin],
                     best = x
         parts[w] = best
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
     ctr.free()
     var r = parts[0]
     for w in range(1, W):
@@ -697,7 +697,7 @@ def _gather[T: DType](out_addr: Int, values_addr: Int, indices_addr: Int, m: Int
             for i in range(lo, hi):
                 out[i] = values[Int(indices[i])]
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
     ctr.free()
 
 
@@ -792,7 +792,7 @@ def _radix_pass[UT: DType](
             var d = Int((src_k[i] >> Scalar[UT](shift)) & Scalar[UT](0xFF))
             h[d] += I32(1)
 
-    sync_parallelize(count, W)
+    sync_par(count, W)
 
     # digit totals: a digit holding every row makes the pass a no-op
     var run = 0
@@ -819,7 +819,7 @@ def _radix_pass[UT: DType](
             dst_k[p] = k
             dst_i[p] = src_i[i]
 
-    sync_parallelize(scatter, W)
+    sync_par(scatter, W)
     return True
 
 
@@ -841,7 +841,7 @@ def _radix_sort[UT: DType](
         for i in range((n * w) // W, (n * (w + 1)) // W):
             i_a[i] = I32(i)
 
-    sync_parallelize(init, W)
+    sync_par(init, W)
 
     for p in range(NBYTES):
         if _radix_pass[UT](k_a, k_b, i_a, i_b, hist, n, W, p * 8):
@@ -857,7 +857,7 @@ def _radix_sort[UT: DType](
             for i in range((n * w) // W, (n * (w + 1)) // W):
                 out_idx[i] = i_a[i]
 
-        sync_parallelize(copy_out, W)
+        sync_par(copy_out, W)
     # free the two scratch index/key buffers (never `keys`' owner or out_idx)
     if i_a != out_idx:
         i_a.free()
@@ -884,7 +884,7 @@ def _sort_impl[KIND: Int, UT: DType](
         for i in range((n * w) // W, (n * (w + 1)) // W):
             mapped[i] = _to_key[KIND, UT](raw[i], desc)
 
-    sync_parallelize(map_keys, W)
+    sync_par(map_keys, W)
     _radix_sort[UT](_i32(out_addr), mapped, n, threads)
     mapped.free()
 
@@ -926,7 +926,7 @@ def unique_mask(out_addr: Int, keys_addr: Int, n: Int, threads: Int) abi("C"):
         for i in range(lo, hi):
             out[i] = I32(1) if keys[i] != keys[i - 1] else I32(0)
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -950,7 +950,7 @@ def prefix_sum_count(offsets_addr: Int, mask_addr: Int, n: Int, threads: Int) ab
             s += mask[i]
         sums[w] = s
 
-    sync_parallelize(total, W)
+    sync_par(total, W)
     var run = I32(0)
     for w in range(W):
         var s = sums[w]
@@ -964,7 +964,7 @@ def prefix_sum_count(offsets_addr: Int, mask_addr: Int, n: Int, threads: Int) ab
             offsets[i] = acc
             acc += mask[i]
 
-    sync_parallelize(fill, W)
+    sync_par(fill, W)
     sums.free()
 
 
@@ -988,7 +988,7 @@ def _filter_gather[T: DType](
             if mask[i] == I32(1):
                 out[Int(offsets[i])] = values[i]
 
-    sync_parallelize(work, W)
+    sync_par(work, W)
 
 
 @export
@@ -1086,9 +1086,9 @@ def _build_index(
                 positions[Int(p)] = I32(i)
             i -= 1
 
-    sync_parallelize(zero, Wz)
-    sync_parallelize(count, Wk)
-    sync_parallelize(scan1, Wk)
+    sync_par(zero, Wz)
+    sync_par(count, Wk)
+    sync_par(scan1, Wk)
     # turn per-range totals into exclusive bases, in place
     var run = 0
     for w in range(Wk):
@@ -1096,9 +1096,9 @@ def _build_index(
         tot[w] = run
         run += t
     A[T + 1] = I32(run)                 # sentinel: total valid right rows
-    sync_parallelize(scan2, Wk)
+    sync_par(scan2, Wk)
     if fill:
-        sync_parallelize(fill_pass, Wk)
+        sync_par(fill_pass, Wk)
     tot.free()
 
 
@@ -1149,7 +1149,7 @@ def join_count(
                 else:
                     match_counts[i] = I32(0)
 
-    sync_parallelize(probe, W)
+    sync_par(probe, W)
     ctr.free()
     A.free()
     pos.free()
@@ -1196,7 +1196,7 @@ def join_count_left(
                     cnt = _run_bounds(A, k, 0)
                 match_counts[i] = I32(cnt if cnt > 0 else 1)
 
-    sync_parallelize(probe, W)
+    sync_par(probe, W)
     ctr.free()
     A.free()
     pos.free()
@@ -1255,7 +1255,7 @@ def _join_scatter_impl[LEFT: Bool](
                         left_out[base + j]  = I32(i)
                         right_out[base + j] = pos[s + j]
 
-    sync_parallelize(probe, W)
+    sync_par(probe, W)
     ctr.free()
     A.free()
     pos.free()

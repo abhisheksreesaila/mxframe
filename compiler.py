@@ -409,6 +409,8 @@ class GraphCompiler:
             return _PC_CMP_OPS[op](lhs, rhs)
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
+        if op == "is_null":
+            return pc.is_null(GraphCompiler._eval_predicate(args[0], table))
         if op == "isin":
             if isinstance(args[0], Expr) and args[0].op == "str_slice" and isinstance(args[1], (list, tuple)):
                 # str_slice(col, ...).isin([...]): one native pass, no sliced array (F-043)

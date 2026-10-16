@@ -443,6 +443,20 @@ def _dense(lk: np.ndarray, rk: np.ndarray):
     return None
 
 
+def int_float_pair(la, ra):
+    """An integer key against a float key compares by value, like SQL: both as float64. Returns the
+    two cast arrays, or None when the types are not an int / float pair or an integer is past
+    2**53, where float64 would merge neighbouring integers (the caller then refuses, as before)."""
+    ints, flts = (la, ra) if pa.types.is_integer(la.type) else (ra, la)
+    if not (pa.types.is_integer(ints.type) and pa.types.is_floating(flts.type)):
+        return None
+    mm = pc.min_max(ints).as_py()
+    if mm["min"] is not None and max(abs(mm["min"]), abs(mm["max"])) > 2 ** 53:
+        return None
+    f64 = pa.float64()
+    return (pc.cast(la, f64), pc.cast(ra, f64))
+
+
 def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
     """Encode both join sides into one shared dense int32 key space.
 
@@ -482,9 +496,12 @@ def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
         la, ra = _as_pa(lc), _as_pa(rc)
         if la.type != ra.type:
             common = common_key_type(la.type, ra.type)
-            if common is None:
+            if common is not None:
+                la, ra = pc.cast(la, common), pc.cast(ra, common)
+            elif (pair := int_float_pair(la, ra)) is not None:
+                la, ra = pair
+            else:
                 raise TypeError(f"join key types differ: {la.type} and {ra.type}")
-            la, ra = pc.cast(la, common), pc.cast(ra, common)
         la, ra = _canonical_floats(la), _canonical_floats(ra)     # -0.0 = 0.0, one NaN: SQL key equality (F-079)
         enc = pc.dictionary_encode(pa.concat_arrays([la, ra]))
         codes = _np_of(pc.fill_null(enc.indices, _npscalar(-1, type=enc.indices.type)),
