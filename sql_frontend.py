@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 from .lazy_expr import Expr, col, lit, when
 from .lazy_frame import (
     LazyFrame, LogicalPlan,
-    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names,
+    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names, column_types,
 )
 
 
@@ -592,6 +592,7 @@ class _SQLTranslator:
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
+            right_plan, right_on, own = self._own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how)
             if how == "left":
                 right_plan = self._copy_right_keys(node, join, right_plan, right_cols, left_on, right_on)
             plan = Join(plan, right_plan, left_on, right_on, how)
@@ -605,7 +606,7 @@ class _SQLTranslator:
             for lk, rk in zip(left_on, right_on):
                 if lk == rk:
                     self._same_keys.add(lk)
-                if lk != rk and how != "left":
+                if lk != rk and how != "left" and rk not in own:
                     self._col_aliases[rk] = lk
 
         while pending:
@@ -683,6 +684,30 @@ class _SQLTranslator:
             self._copies.add(name)
             added.append(col(k).alias(name))
         return Project(right_plan, [col(c) for c in right_cols] + added)
+
+    @staticmethod
+    def _own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how):
+        """An inner join's right key column is dropped and read as the left key. When the two key
+        columns have different types (an int against a float), the right one must keep its own type
+        and values: join on a copy of it, so the original stays an ordinary right column.
+        Returns (right plan, right_on, names of the right keys kept as columns)."""
+        if how != "inner":
+            return right_plan, right_on, set()
+        lt, rt = column_types(plan), column_types(right_plan)
+        own = {rk for lk, rk in zip(left_on, right_on)
+               if lk != rk and lk in lt and rk in rt and lt[lk] != rt[rk] and rk not in lt}
+        if not own:
+            return right_plan, right_on, own
+        taken = set(lt) | set(rt) | set(right_cols)
+        copies = {}
+        for rk in sorted(own):
+            name = f"__key_{rk}"
+            while name in taken:
+                name = "_" + name
+            taken.add(name)
+            copies[rk] = name
+        exprs = [col(c) for c in right_cols] + [col(rk).alias(copies[rk]) for rk in copies]
+        return Project(right_plan, exprs), [copies.get(rk, rk) for rk in right_on], own
 
     def _links(self, alias: str, cols: set):
         """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
