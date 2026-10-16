@@ -25,12 +25,12 @@ ENGINES = ["duckdb", "mx", "polars"]
 TIE = 1e-6          # sort values this close (relative) may come out in either order
 
 
-def _run(engine, spec_path, data_dir, out, shuffle, timeout):
+def _run(engine, spec_path, data_dir, out, shuffle, timeout, gpu="-1"):
     sys.path.insert(0, os.path.join(ROOT, "scripts"))
     from tpch_user.runner import worker_env
     cmd = [sys.executable, os.path.join(HERE, "worker.py"), engine, spec_path, data_dir, out] + (["--shuffle"] if shuffle else [])
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, env=worker_env("-1"), cwd=ROOT, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, env=worker_env(gpu), cwd=ROOT, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"error": "TIMEOUT"}
     lines = [l for l in p.stdout.splitlines() if l.startswith("@@RESULT ")]
@@ -146,20 +146,26 @@ def main():
     ap.add_argument("--timeout", type=float, default=300)
     ap.add_argument("--out", default=os.path.join(ROOT, "docs", "bench"))
     ap.add_argument("--name", default=None)
+    ap.add_argument("--device", default="cpu", help="device for MXFrame's compute() (F-055: gpu)")
+    ap.add_argument("--gpu", default="-1", help="CUDA_VISIBLE_DEVICES for the workers (a UUID or index)")
+    ap.add_argument("--engines", default=",".join(ENGINES))
     a = ap.parse_args()
     data_dir = os.path.join(ROOT, "data", f"tpch_sf{a.sf}")
     st = gen.stats(os.path.join(ROOT, "data", "tpch_sf1"))
     name = a.name or f"random-sf{a.sf}{'-shuffled' if a.shuffle else ''}"
+    os.environ["MXBENCH_DEVICE"] = a.device
+    engines = a.engines.split(",")
     tmp = tempfile.mkdtemp(prefix="mxrand-")
     rows = []
     for seed in range(a.seed0, a.seed0 + a.n):
         spec = gen.make(seed, st)
         sp = os.path.join(tmp, f"q{seed}.json")
         json.dump(spec, open(sp, "w"))
-        rec = {"seed": seed, "shape": spec["shape"], "sql": gen.sql(spec)}
-        for e in ENGINES:
+        rec = {"seed": seed, "shape": spec["shape"], "sql": gen.sql(spec),
+               **{e: {"error": "not run"} for e in ENGINES if e not in engines}}
+        for e in engines:
             out = os.path.join(tmp, f"q{seed}-{e}.parquet")
-            r = _run(e, sp, data_dir, out, a.shuffle, a.timeout)
+            r = _run(e, sp, data_dir, out, a.shuffle, a.timeout, a.gpu if e == "mx" else "-1")
             rec[e] = r
             if e != "duckdb" and "error" not in r and "error" not in rec["duckdb"]:
                 rec[e]["verdict"], rec[e]["why"] = compare(spec, os.path.join(tmp, f"q{seed}-duckdb.parquet"), out)

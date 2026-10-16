@@ -92,9 +92,20 @@ def main() -> None:
         mod = importlib.import_module(f"tpch_user.{modname}")
         out["import_ms"] = (time.perf_counter() - t0) * 1000.0
         from tpch_user import spec
+        prov = []
         if modname == "q_mx":
             import mxframe
             out["mxframe_path"] = os.path.dirname(os.path.abspath(mxframe.__file__))
+            # F-055: which path each compute() took (a "correct" GPU result that ran on the CPU proves nothing)
+            from mxframe.lazy_frame import LazyFrame
+            _compute = LazyFrame.compute
+
+            def _recording(self, *args, **kw):
+                r = _compute(self, *args, **kw)
+                p = self.last_compile_provenance
+                prov.append(f"{p.get('path')}@{p.get('device')}" + ("(gpu_declined)" if p.get("gpu_declined") else ""))
+                return r
+            LazyFrame.compute = _recording
 
         engine_only = a.mode == "engine"
 
@@ -119,6 +130,9 @@ def main() -> None:
         res = timed()
         first_ms = (time.perf_counter() - t0) * 1000.0
         out["first_ms"] = first_ms
+        if prov:
+            out["paths"] = " ".join(f"{k}x{prov.count(k)}" for k in dict.fromkeys(prov))
+            del prov[:]
 
         import pyarrow.parquet as pq
         tbl = canonicalize(mod.to_arrow(res), spec.OUTPUT[a.query])

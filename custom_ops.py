@@ -72,7 +72,8 @@ MAX_GROUPS = 8192
 AUTO_GPU_THRESHOLD = 10_000   # rows; used by device='auto' to pick GPU vs CPU
 GPU_JOIN_THRESHOLD = 200_000  # result rows; threshold to use GPU gather after join
 RADIX_SORT_MIN_ROWS = 50_000  # below this np.argsort's lower fixed cost wins
-from .sort_check import is_sorted_permutation as _is_sorted_permutation, warn_fallback as _warn_radix_fallback
+from .sort_check import (is_sorted_permutation as _is_sorted_permutation, is_sorted_topk as _is_sorted_topk,
+                         warn_fallback as _warn_radix_fallback)
 
 # CPU aggregation evaluates compound expressions (a * (1 - b) ...) in float64 so
 # float32 inputs do not drift; the flag is thread-local so concurrent morsels are safe.
@@ -2686,7 +2687,13 @@ class CustomOpsCompiler(GraphCompiler):
                 composite_key, k=k,
                 descending=False,  # _encode_sort_key already flips keys for descending
             )
-            return self._aot_gpu.gather_table(table, sorted_indices)
+            if _is_sorted_topk(composite_key, sorted_indices, k):
+                return self._aot_gpu.gather_table(table, sorted_indices)
+            # F-055: a kernel that ran out of GPU memory only prints an `oom log` and returns a wrong
+            # order (seen when another process held the GPU's memory): redo the sort on the CPU.
+            _warn_radix_fallback("the GPU sort returned a wrong order (out of GPU memory?)")
+            sorted_indices = np.argsort(composite_key, kind="stable")[:k]
+            return pc.take(table, _npa(sorted_indices.astype(np.int64)))
 
         # Fallback: MAX Graph bitonic sort + numpy gather
         cache_key = ("sort_indices", N, self._session_device)
