@@ -415,6 +415,37 @@ def checked_arith(op, lhs, rhs):
         raise OverflowError(f"Overflow in {word} of {str(t).upper()}") from e
 
 
+def modulo(lhs, rhs):
+    """SQL ``lhs % rhs`` as DuckDB computes it: C ``fmod``, so the sign follows the dividend (-7 % 3 = -1, 7 % -3
+    = 1, not NumPy's ``%``), NULL when either side is NULL or an integer divisor is 0 (a float one gives NaN), NaN stays
+    NaN, ``x % inf`` is x. Operands are arrays or scalars; integers give int64, anything else float64 (float32
+    when every operand is). ``INT64_MIN % -1`` raises like DuckDB's division."""
+    def parts(x):
+        if isinstance(x, pa.Scalar):
+            return (np.array([x.as_py()]) if x.is_valid else np.array([0], np.int64)), np.array([x.is_valid]), x.type
+        a = combine(x)
+        valid = to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else np.ones(len(a), bool)
+        if pa.types.is_floating(a.type):
+            return _float_values(a), valid, a.type
+        return to_numpy(pc.fill_null(a, scalar(0, type=a.type))), valid, a.type
+    (a, av, at), (b, bv, bt) = parts(lhs), parts(rhs)
+    floats = pa.types.is_floating(at) or pa.types.is_floating(bt) or a.dtype.kind == "f" or b.dtype.kind == "f"
+    valid = av & bv
+    with np.errstate(all="ignore"):
+        if floats:
+            out_t = pa.float32() if all(pa.types.is_float32(t) for t in (at, bt) if pa.types.is_floating(t)) \
+                and (pa.types.is_floating(at) and pa.types.is_floating(bt)) else pa.float64()
+            res = np.fmod(a.astype(np.float64), b.astype(np.float64))
+        else:
+            valid = valid & (b != 0)
+            a, b = a.astype(np.int64), np.where(valid, b, 1).astype(np.int64)
+            if np.any(valid & (a == np.iinfo(np.int64).min) & (b == -1)):
+                raise OverflowError("Overflow in division of INT64")
+            out_t, res = pa.int64(), np.fmod(a, b)
+    n = max(len(a), len(b))
+    return array(np.ma.array(np.broadcast_to(res, (n,)).copy(), mask=~np.broadcast_to(valid, (n,))), type=out_t)
+
+
 def distinct_rows(table: pa.Table) -> pa.Table:
     """Distinct rows of ``table`` (nulls equal to each other), first-appearance order."""
     if table.num_rows == 0:

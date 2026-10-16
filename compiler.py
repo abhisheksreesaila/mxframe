@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Union
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, distinct_rows as _distinct_rows
 from ._lazy_pc import pc
-from .np_arrow import checked_arith as _checked_arith
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
@@ -419,6 +419,8 @@ class GraphCompiler:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
             return _checked_arith("sub", lhs, rhs)
+        if op == "mod":
+            return _modulo(GraphCompiler._eval_predicate(args[0], table), GraphCompiler._eval_predicate(args[1], table))
         if op == "div":
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)

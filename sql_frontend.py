@@ -202,7 +202,7 @@ def _null_on_empty(n: sge.Expression) -> bool:
         return not n.is_string
     if isinstance(n, sge.Neg):
         return _null_on_empty(n.this)
-    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div)):
+    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div, sge.Mod)):
         return _null_on_empty(n.this) and _null_on_empty(n.expression) and bool(_aggs_in(n))
     return False
 
@@ -1339,6 +1339,11 @@ class _SQLTranslator:
             return self._float_expr(node.this) * self._float_expr(node.expression)
         if isinstance(node, sge.Div):
             return self._float_expr(node.this) / self._float_expr(node.expression)
+        if isinstance(node, sge.Mod):                    # `a % b` and MOD(a, b): DuckDB's fmod, NULL on zero
+            l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
+            if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
+                return lit(None if r.args[0] == 0 else (abs(l.args[0]) % abs(r.args[0])) * (-1 if l.args[0] < 0 else 1))   # two constants
+            return l % r
 
         # ---- comparisons ----
         if isinstance(node, sge.EQ):
@@ -1464,6 +1469,28 @@ class _SQLTranslator:
         if isinstance(node, sge.Neg):
             return -self._scalar(node.this)
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
+
+    def _mod_operand(self, node: sge.Expression) -> "Expr":
+        """An operand of ``%``. Arithmetic over integer columns and integer literals stays integer (``_float_expr``
+        would make ``(a + 1) % (b - 1)`` a float, and a float ``% 0`` is NaN where an integer one is NULL)."""
+        def ints(n):
+            n = _unparen(n)
+            if isinstance(n, sge.Literal):
+                return lit(int(n.this)) if not n.is_string and str(n.this).isdigit() else None
+            if isinstance(n, sge.Neg):
+                v = ints(n.this)
+                return None if v is None else lit(0) - v if v.op != "lit" else lit(-v.args[0])
+            if isinstance(n, sge.Column):
+                t = self._col_type(n)
+                return self._expr(n) if t is not None and pa.types.is_integer(t) else None
+            if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Mod)):
+                l, r = ints(n.this), ints(n.expression)
+                if l is None or r is None:
+                    return None
+                return {sge.Add: l + r, sge.Sub: l - r, sge.Mul: l * r, sge.Mod: l % r}[type(n)]
+            return None
+        out = ints(node)
+        return out if out is not None else self._float_expr(node)
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
         """Like _expr but promotes integer literals to float for arithmetic use.

@@ -870,10 +870,11 @@ Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
 
-## F-094 SQL modulo operator [todo]
+## F-094 SQL modulo operator [review]
 Found by the F-087 developer (2026-10-16)
-- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
-- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+- [x] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [x] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+Done: DuckDB probed (sign follows the dividend; integer `% 0` is NULL, float `% 0.0` is NaN; NULL in, NULL out; NaN stays NaN; `x % inf` is x). New `mod` Expr op (`np_arrow.modulo`, fmod) on the Arrow path; the native bytecode has no modulo and declines it (`Unsupported`), the GPU runs it through the Arrow Project. `tests/test_sql_modulo.py` (77 DuckDB-checked, cpu + gpu). Not covered, found on the way: `expr IS NULL` and `COALESCE` are unsupported over expressions; `x + 1 > 0.5` with NaN in x differs from DuckDB.
 
 ## F-095 SQL over tables with uppercase or quoted column names [todo]
 Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
