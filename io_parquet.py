@@ -14,6 +14,8 @@ are decoded back to plain values before execution, so results match the
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import os
@@ -97,7 +99,7 @@ def read_parquet_table(path, columns: Optional[Sequence[str]] = None, filters=No
                          read_dictionary=dict_cols or None)
 
 
-def _read_file(path, columns, dict_cols, pushed=(), mask_dict=()) -> pa.Table:
+def _read_file(path, columns, dict_cols, pushed=(), mask_dict=(), only=None) -> pa.Table:
     """Read one Parquet file without ``pyarrow.dataset``.
 
     ``pq.read_table`` goes through ``pyarrow.dataset``, whose import pulls in
@@ -108,11 +110,15 @@ def _read_file(path, columns, dict_cols, pushed=(), mask_dict=()) -> pa.Table:
     exactly by the plan's Filter node.  String conjuncts are evaluated on dictionary codes: on the
     ``dict_cols`` the caller wants back as dictionaries and on ``mask_dict`` columns, which are read
     as dictionaries only to build the row mask and returned decoded.
+
+    ``only`` (F-056 step 2, streamed execution) restricts the read to those row groups: a batch.
     """
     import pyarrow.parquet as pq
     md = _metadata(path)
     pf = pq.ParquetFile(path, read_dictionary=dict_cols or None, metadata=md)
     groups = _row_groups_for(pf, pushed) if pushed else None
+    if only is not None:
+        groups = [g for g in (groups if groups is not None else range(md.num_row_groups)) if g in only]
     if groups is not None and not groups:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
     if groups is None:
@@ -516,13 +522,15 @@ def _metadata_cached(path, dev, ino, mtime_ns, size):
 _SOURCES: dict = {}                      # id(table) -> (weakref to the table, token)
 
 
-def source_token(path, columns, pushed) -> Optional[tuple]:
-    """Token of a read of ``columns`` of file ``path`` with ``pushed`` filters, or None for a directory."""
+def source_token(path, columns, pushed, groups=None) -> Optional[tuple]:
+    """Token of a read of ``columns`` of file ``path`` with ``pushed`` filters, or None for a directory.
+    ``groups`` (a streamed batch) names the row groups read: another batch is another source."""
     path = os.path.abspath(os.fspath(path))
     if not os.path.isfile(path):
         return None
     st = os.stat(path)
-    return ("parquet", path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, tuple(columns), repr(tuple(pushed or ())))
+    return ("parquet", path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, tuple(columns),
+            repr(tuple(pushed or ())) + (f"|groups={tuple(groups)}" if groups is not None else ""))
 
 
 def tag_source(table: pa.Table, token: Optional[tuple]) -> pa.Table:
@@ -546,6 +554,79 @@ def _metadata(path):
     st = os.stat(path)
     # the cached footer now drives data reads: key on file identity as well as mtime/size
     return _metadata_cached(os.path.abspath(os.fspath(path)), st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+# ── streamed execution (F-056 step 2) ──────────────────────────────────────
+# A query over a file bigger than memory runs once per batch of row groups (`streamed.py`). While it runs,
+# the streamed file reads only the current batch's groups and every other file is read once for all batches.
+class StreamContext:
+    def __init__(self, path):
+        self.path = os.path.abspath(os.fspath(path))
+        self.groups: Optional[tuple] = None          # the current batch's row groups
+        self._once: dict = {}
+
+    def is_streamed(self, path) -> bool:
+        return os.path.abspath(os.fspath(path)) == self.path
+
+    def once(self, key, read):
+        if key not in self._once:
+            self._once[key] = read()
+        return self._once[key]
+
+
+_stream: contextvars.ContextVar = contextvars.ContextVar("mxframe_stream", default=None)
+
+
+@contextlib.contextmanager
+def streaming(path):
+    st = StreamContext(path)
+    token = _stream.set(st)
+    try:
+        yield st
+    finally:
+        _stream.reset(token)
+
+
+def _fixed_width(t) -> Optional[int]:
+    try:
+        return max(t.bit_width // 8, 1)
+    except ValueError:                                   # strings, binary, nested
+        return None
+
+
+def kept_groups(path, schema, pushed) -> List[int]:
+    """The row groups of ``path`` the pushed filters leave (all of them without filters)."""
+    import pyarrow.parquet as pq
+    md = _metadata(path)
+    if not pushed:
+        return list(range(md.num_row_groups))
+    return _row_groups_for(pq.ParquetFile(path, metadata=md), pushed)
+
+
+def group_bytes(path, schema, columns, groups) -> List[int]:
+    """Decoded size in memory of ``columns`` for each of ``groups``: rows x width for fixed-width columns,
+    the uncompressed bytes plus a 4-byte offset per row for strings (an estimate from the footer)."""
+    md = _metadata(path)
+    names = list(schema.names)
+    flat = md.num_columns == len(names)
+    cols = [(n, names.index(n), _fixed_width(schema.field(n).type)) for n in columns if n in names]
+    out = []
+    for g in groups:
+        rg = md.row_group(g)
+        if not flat:                                     # nested columns: the group's whole uncompressed size
+            out.append(rg.total_byte_size)
+            continue
+        n = rg.num_rows
+        out.append(sum(n * w if w is not None else rg.column(j).total_uncompressed_size + 4 * n
+                       for _, j, w in cols))
+    return out
+
+
+def decoded_upper_bound(path, schema) -> int:
+    """An upper bound on what reading any columns of ``path`` decodes to, without visiting a column chunk."""
+    md = _metadata(path)
+    fixed = sum(w for w in (_fixed_width(f.type) for f in schema) if w is not None)
+    return md.num_rows * fixed + sum(md.row_group(g).total_byte_size for g in range(md.num_row_groups))
 
 
 # ── plan analysis ───────────────────────────────────────────────────────────
@@ -977,9 +1058,17 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
         dict_cols = [n for n in candidates if keepable(n, leaf) or deferrable(n, leaf)]
         mask_dict = [n for n in candidates if n not in dict_cols]
         import pyarrow.parquet as pq
-        token = source_token(leaf.path, cols, pushed)        # before the read: a file replaced meanwhile never matches
+        st = _stream.get()
+        batch = st.groups if st is not None and st.is_streamed(leaf.path) else None
+        token = source_token(leaf.path, cols, pushed, batch)  # before the read: a file replaced meanwhile never matches
         if os.path.isfile(leaf.path):
-            table = _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict)
+            if batch is not None:                              # the streamed file: this batch's row groups only
+                table = _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict, only=batch)
+            elif st is not None:                               # any other file is read once for all batches
+                table = st.once((token, tuple(dict_cols), tuple(mask_dict)),
+                                lambda: _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict))
+            else:
+                table = _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict)
         else:
             table = pq.read_table(leaf.path, columns=cols,
                                   filters=_filters_expression(pushed) if pushed else None,

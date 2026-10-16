@@ -18,7 +18,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mxframe import LazyFrame, col, gpu_stream, when
+from mxframe import LazyFrame, col, gpu_stream
 from mxframe.io_parquet import scan_parquet
 
 N = 6_000_000
@@ -191,33 +191,38 @@ def test_a_streamed_result_has_the_dtypes_of_the_in_memory_one(files, monkeypatc
     assert streamed.schema == whole.schema
 
 
-def test_batches_come_from_the_row_groups_the_filter_leaves(files):
-    """d is sorted, so d < 250 keeps the first tenth of the row groups: the rest are never read."""
+def test_batches_come_from_the_row_groups_the_filter_leaves(files, monkeypatch):
+    """d is sorted, so d < 250 keeps the first six of 60 row groups: the rest are never read."""
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "10M")
     small = scan_parquet(files["fact"]).filter(col("d") < 250).groupby("k").agg(col("v").sum().alias("s"))
     got = run(small, "cpu")
-    info = prov(small)["streamed"]
-    assert info["row_groups"] == 60 and info["row_groups_read"] == 7
+    info = assert_streamed(small, 3)
+    assert info["row_groups"] == 60 and info["row_groups_read"] == 6
     same(got, sql("SELECT k, sum(v) AS s FROM fact WHERE d < 250 GROUP BY k", files), ("k",))
 
 
 def test_every_batch_empty_gives_the_empty_answers(files):
-    keyed = scan_parquet(files["fact"]).filter(col("q") > 500).groupby("k").agg(col("v").sum().alias("s"))
+    """The filter cannot be answered from statistics, so every batch is read and filtered down to nothing."""
+    nothing = (col("q") + col("k")) > 500
+    keyed = scan_parquet(files["fact"]).filter(nothing).groupby("k").agg(col("v").sum().alias("s"))
     assert run(keyed, "cpu").num_rows == 0
-    glob = (scan_parquet(files["fact"]).filter(col("q") > 500)
+    assert_streamed(keyed)
+    glob = (scan_parquet(files["fact"]).filter(nothing)
             .groupby().agg(col("v").sum().alias("s"), col("q").sum().alias("sq"), col("v").count().alias("n"),
                            col("v").mean().alias("m"), col("q").min().alias("mn")))
     got = run(glob, "cpu")
-    assert prov(glob)["path"] == "streamed"
+    assert_streamed(glob)
     assert got.to_pylist() == [{"s": None, "sq": None, "n": 0, "m": None, "mn": None}]
-    same(got, sql("SELECT sum(v) AS s, sum(q) AS sq, count(v) AS n, avg(v) AS m, min(q) AS mn FROM fact WHERE q > 500",
-                  files))
+    same(got, sql("SELECT sum(v) AS s, sum(q) AS sq, count(v) AS n, avg(v) AS m, min(q) AS mn FROM fact "
+                  "WHERE q + k > 500", files))
 
 
-def test_a_group_found_in_one_batch_only_is_kept(files):
-    """d sorted: d >= 2490 lives in the last row groups only, the other batches contribute no groups."""
-    lf = scan_parquet(files["fact"]).filter(col("d") >= 2490).groupby("d").agg(col("v").count().alias("n"))
+def test_a_group_found_in_some_batches_only_is_kept(files):
+    """d is sorted: each of its 2,500 values lives in one or two batches, the other batches never see it."""
+    lf = scan_parquet(files["fact"]).groupby("d").agg(col("v").count().alias("n"), col("v").sum().alias("s"))
     got = run(lf, "cpu")
-    same(got, sql("SELECT d, count(v) AS n FROM fact WHERE d >= 2490 GROUP BY d", files), ("d",))
+    assert_streamed(lf)
+    same(got, sql("SELECT d, count(v) AS n, sum(v) AS s FROM fact GROUP BY d", files), ("d",))
 
 
 # --- exactness ----------------------------------------------------------------------------------------------
@@ -297,17 +302,15 @@ def test_reproducible_mode_gives_the_same_bits_every_run(files):
         assert a.column(name).to_numpy().tobytes() == b.column(name).to_numpy().tobytes()
 
 
-def test_reproducible_batches_do_not_depend_on_free_memory(files, monkeypatch):
+def test_reproducible_batches_do_not_depend_on_free_memory(monkeypatch):
     """With no override the budget is read from MemTotal in reproducible mode, not from what is free now."""
     from mxframe import streamed
     monkeypatch.delenv("MXFRAME_HOST_MEM_BUDGET")
-    with streamed.reproducible_budget():
-        a = streamed.host_budget()
-        monkeypatch.setattr(streamed, "_meminfo", lambda key: {"MemAvailable": 1 << 30, "MemTotal": 64 << 30}[key])
-        b = streamed.host_budget()
-    assert a == b == 32 << 30
-    monkeypatch.setattr(streamed, "_meminfo", lambda key: {"MemAvailable": 10 << 30, "MemTotal": 64 << 30}[key])
-    assert streamed.host_budget() == int(0.7 * (10 << 30))
+    monkeypatch.setattr(streamed, "_meminfo", lambda key: {"MemAvailable": 1 << 30, "MemTotal": 64 << 30}[key])
+    a = streamed.host_budget(reproducible=True)
+    monkeypatch.setattr(streamed, "_meminfo", lambda key: {"MemAvailable": 40 << 30, "MemTotal": 64 << 30}[key])
+    assert a == streamed.host_budget(reproducible=True) == 32 << 30
+    assert streamed.host_budget() == int(0.7 * (40 << 30))
 
 
 # --- what does not stream ---------------------------------------------------------------------------------
@@ -359,29 +362,38 @@ def test_a_dimension_bigger_than_half_the_budget_declines_with_the_reason(tmp_pa
 # --- memory is bounded ------------------------------------------------------------------------------------
 
 PEAK = textwrap.dedent("""
-    import json, resource, sys
+    import json, sys
     import pyarrow as pa
     from mxframe import col
     from mxframe.io_parquet import scan_parquet
-    base = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    def status(key):
+        with open("/proc/self/status") as f:
+            return next(int(l.split()[1]) * 1024 for l in f if l.startswith(key + ":"))
+
     lf = (scan_parquet(sys.argv[1]).filter(col("d") < 2400).groupby("k", "s")
           .agg(col("v").sum().alias("sv"), (col("v") * col("q")).sum().alias("svq"), col("q").mean().alias("aq")))
+    lf.schema                                       # imports and warms up before the peak is reset
+    lf.compute(device="cpu")
+    open("/proc/self/clear_refs", "w").write("5")   # VmHWM starts again from the current size
+    base = status("VmRSS")
     out = lf.compute(device=sys.argv[2])
     print(json.dumps({"rows": out.num_rows, "path": lf.last_compile_provenance["path"],
-                      "arrow_peak": pa.default_memory_pool().max_memory(),
-                      "rss_growth": (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base) * 1024}))
+                      "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": status("VmHWM") - base}))
 """)
 
 
 def peak(files, device, budget):
+    import json
     env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, MXFRAME_GPU_MEM_BUDGET=GPU)
     out = subprocess.run([sys.executable, "-c", PEAK, files["fact"], device], env=env, capture_output=True, text=True,
                          check=True, timeout=600)
-    import json
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
 def test_peak_memory_is_bounded_by_the_budget_not_the_file(files):
+    """Warm both runs (the first compute reads and frees everything once, so the allocator's pages are not
+    the difference), then compare the peak of a second compute."""
     decoded = N * (4 + 4 + 8 + 8 + 4 + 1)          # the file's columns as Arrow holds them (~170 MB)
     streamed = peak(files, "cpu", HOST)
     whole = peak(files, "cpu", "64G")
@@ -389,4 +401,4 @@ def test_peak_memory_is_bounded_by_the_budget_not_the_file(files):
     assert streamed["rows"] == whole["rows"] == 12
     assert streamed["arrow_peak"] < 40 << 20, streamed          # under the 40 MB budget
     assert whole["arrow_peak"] > 0.7 * decoded                  # the contrast: reading it whole holds the file
-    assert streamed["rss_growth"] < 0.5 * whole["rss_growth"], (streamed, whole)
+    assert streamed["rss_peak_growth"] < 0.5 * whole["rss_peak_growth"], (streamed, whole)
