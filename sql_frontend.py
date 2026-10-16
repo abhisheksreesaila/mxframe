@@ -1536,6 +1536,8 @@ class _SQLTranslator:
         return _type_in(src, self._alias_schema)
 
     def _is_date_col(self, src: sge.Expression) -> bool:
+        if isinstance(src, (sge.Min, sge.Max)):             # F-093: MIN / MAX of a date column is a date
+            src = src.this
         t = self._col_type(src)
         return t is not None and pa.types.is_date(t)
 
