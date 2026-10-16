@@ -812,13 +812,14 @@ Found by the F-070 developer (2026-10-16)
 - [x] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
 - [x] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
 
-## F-084 Window functions: NULL values, NaN ties and DESC order like DuckDB [todo]
+## F-084 Window functions: NULL values, NaN ties and DESC order like DuckDB [done]
 Found by the F-081 review (2026-10-16); silent wrong answers on main before F-081
-- [ ] window min / max turn values to float64 first, so a NULL value becomes NaN: `max` over `[NULL, 2, 5]` gives NaN (DuckDB 5), an all-NULL partition gives NaN (DuckDB NULL); min skips NULL only through the NaN rule. Aggregate over the valid values, NULL when none
-- [ ] `_window_rank` ties rows with `==`, so tied NaNs rank apart: rank of `[nan, 1, nan, 2]` is `[3, 1, 4, 2]`, DuckDB `[3, 1, 3, 2]` (rank and dense_rank); tie through the canonical codes (`np_arrow.canonical_floats`)
-- [ ] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
-- [ ] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decide and document if not
-- [ ] DuckDB-checked tests for each; fail before
+- [x] window min / max turn values to float64 first, so a NULL value becomes NaN: `max` over `[NULL, 2, 5]` gives NaN (DuckDB 5), an all-NULL partition gives NaN (DuckDB NULL); min skips NULL only through the NaN rule. Aggregate over the valid values, NULL when none
+- [x] `_window_rank` ties rows with `==`, so tied NaNs rank apart: rank of `[nan, 1, nan, 2]` is `[3, 1, 4, 2]`, DuckDB `[3, 1, 3, 2]` (rank and dense_rank); tie through the canonical codes (`np_arrow.canonical_floats`)
+- [x] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
+- [x] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decided: stay float64, documented in docs/api.md (DuckDB gives int64 rank, int min/max, decimal sum)
+- [x] window sum, mean and cum_sum turned a NULL value into NaN (silent wrong answer, added at review): skip NULLs, NULL when none valid, running sum NULL until the first valid value, NaN among valid values propagates; `count` is not a window op here
+- [x] DuckDB-checked tests for each; fail before
 
 ## F-085 ORDER BY + LIMIT inside an IN / NOT IN subquery is dropped [done]
 Found by the F-083 review (2026-10-16); a silent wrong answer, also on main
@@ -851,3 +852,8 @@ Found by the F-083 review (2026-10-16)
 Found by the F-083 review (2026-10-16)
 - [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB
 - [ ] DuckDB-checked tests: IN / NOT IN over max / min / sum / count subqueries against int and float columns; fails before
+
+## F-091 Window lag / lead: NULL stays NULL [todo]
+Found by the F-084 review (2026-10-16); a silent wrong answer on main
+- [ ] `lag(v)` over `[1, NULL, 3]` gives `[nan, 1.0, nan]`; DuckDB `[NULL, 1.0, NULL]`: lag / lead turn NULL into NaN and fill with NaN. Shift the Arrow array with its validity (fill NULL, or the given default); keep the input dtype
+- [ ] DuckDB-checked tests: lag / lead with offsets 1 and 2, defaults, partitions, ORDER BY with NaN / NULL keys (F-084 order), int / float / string columns; fails before

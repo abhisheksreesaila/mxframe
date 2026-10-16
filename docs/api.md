@@ -97,6 +97,16 @@ Everything else raises `NotImplementedError` or `ValueError` naming the form: `I
 
 Known limits: `EXTRACT(YEAR …)` on an integer day-number column works in a projection or group key, not in `WHERE` (the same `year_of_days()` limit as the DataFrame API). Integer literals in arithmetic are floats (`y + 1` is a float64), so `IN (SELECT y + 1 …)` against an integer column fails with a join key type error. A CTE used twice is computed twice (TPC-H Q15 compares two float sums: F-064). `scripts/tpch_sql/run.py` runs the specification's text of the 22 TPC-H queries through `mx.sql` and compares them with DuckDB.
 
+## Window functions
+
+`expr.over(*partition_by, order_by=None, descending=False)` follows DuckDB on NULL, NaN and ties
+(F-084): min / max aggregate the valid values only (NULL when none; a NaN follows the F-070 rule),
+rank / dense_rank tie NaNs, -0.0 with 0.0 and NULLs with each other, and in an ORDER BY NaN is the
+largest value (last ascending, first descending) while NULL is last in both directions. The result
+is always float64: DuckDB returns int64 for rank / row_number, the input type for integer min / max
+and decimal for integer sum. Sum and mean skip NULLs (NULL when none are valid), a running sum is NULL until its first valid
+value, and a NaN among the valid values propagates. `count` is not a window function here.
+
 ## Device selection and the GPU
 
 - `device="gpu"` needs the MAX runtime (`pip install "mxframe[runtime]"`, or `pixi` with Modular's conda channel). The GPU path is validated on NVIDIA.
