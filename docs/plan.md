@@ -427,15 +427,17 @@ Needs: none · Found by the M2h review (predates F-032)
 Needs: none · Found by the F-040 review
 - [x] `SELECT s AS b, SUM(v) AS x FROM t GROUP BY s` and `... GROUP BY b` return `b` like DuckDB. Keys are matched by their translated expression, so one rule covers aliases, `t.s` vs `s`, ORDER BY on the original name or expression, and a key selected twice; result columns follow the SELECT list (a projection after ORDER BY / LIMIT). `tests/test_sql_group_alias.py`: 19 queries checked against DuckDB. Reviewer PASS (round 2)
 
-## F-042 SQL front end gaps found in the F-041 review [todo]
+## F-042 SQL front end gaps found in the F-041 review [review]
 Needs: none · Pre-existing, found by the F-041 review
-- [ ] an aggregate without an alias is named `agg_0` (DuckDB: `sum(v)`) and its SELECT position is ignored
-- [ ] `SELECT kid ... JOIN ... ON k = kid GROUP BY kid` returns the column as `k`
-- [ ] `GROUP BY ALL` drops the keys
-- [ ] a duplicate output name (`SELECT x, SUM(v) AS x`) is accepted (DuckDB raises)
-- [ ] HAVING is dropped without an error (`... GROUP BY flag HAVING SUM(v) > 25000` gives no Filter); found by the F-046d review
-- [ ] `COUNT(DISTINCT x)` raises NotImplementedError
-- [ ] arithmetic on an aggregate (`SUM(v) * 2 AS y`) is not seen as an aggregate: raises "Aggregate.aggs cannot be empty", or the column is silently dropped when another aggregate is present
+- [x] an aggregate without an alias is named `agg_0` (DuckDB: `sum(v)`) and its SELECT position is ignored
+- [x] `SELECT kid ... JOIN ... ON k = kid GROUP BY kid` returns the column as `k`
+- [x] `GROUP BY ALL` drops the keys
+- [x] a duplicate output name (`SELECT x, SUM(v) AS x`) is accepted: now raises ValueError (note: DuckDB itself does not raise, it renames the second to `x_1`; we raise because the engine cannot hold two columns of one name)
+- [x] HAVING is dropped without an error (`... GROUP BY flag HAVING SUM(v) > 25000` gives no Filter); found by the F-046d review
+- [x] `COUNT(DISTINCT x)` raises NotImplementedError
+- [x] arithmetic on an aggregate (`SUM(v) * 2 AS y`) is not seen as an aggregate: raises "Aggregate.aggs cannot be empty", or the column is silently dropped when another aggregate is present
+- built in `sql_frontend.py` only; `tests/test_sql_gaps.py` (130 cases, each checked against DuckDB; unsupported variants raise). Unaliased aggregates take DuckDB's text (`sum(v)`, `count_star()`, `count(DISTINCT v)`); an unaliased expression (`SUM(v) * 2`, `SUM(v + 1)`) raises asking for an alias. HAVING is a Filter above the Aggregate (it may use aggregates the SELECT list lacks, SELECT aliases and group keys). ORDER BY may use an aggregate or an expression over aggregates. `COUNT(DISTINCT x)` becomes `Aggregate(Distinct(Project(keys, x)))` (the native count-distinct path); it must be the only aggregate (mixed with others, several of them, and `SUM(DISTINCT ..)` raise NotImplementedError). A LEFT JOIN's right key can no longer be referenced (the join drops it; the old code silently read the left key, which has no NULLs); `SELECT s FROM t GROUP BY s` without any aggregate raises. Also checked on SF1 (lineitem / orders, 6 queries equal to DuckDB)
+- follow-ups seen, not done: `SELECT DISTINCT` is ignored by the SQL front end; `ORDER BY 1` / `GROUP BY 1` ordinals; an aggregate inside WHERE is not refused; unaliased expression group keys (`SELECT k + 1 ...`) now need an alias (DuckDB names them `(k + 1)`); COUNT(DISTINCT) mixed with other aggregates
 
 ## F-043 SF10: the four queries DuckDB still wins, with general fixes only [todo]
 Needs: none · Agreed 2026-10-13 (Abhishek: focus on these, no TPC-H-only tuning)

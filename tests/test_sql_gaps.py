@@ -1,0 +1,229 @@
+"""F-042: SQL front end gaps found in the F-041 review. Unnamed aggregates take DuckDB's names and
+keep their SELECT position, a joined key keeps the name the query wrote, GROUP BY ALL, HAVING (a
+Filter above the Aggregate), COUNT(DISTINCT x) and arithmetic on aggregates. Every variant is checked
+against DuckDB; duplicate output names and constructs we cannot translate raise instead of changing
+meaning."""
+from decimal import Decimal
+
+import duckdb
+import numpy as np
+import pyarrow as pa
+import pytest
+
+import mxframe as mx
+from mxframe.np_arrow import array as A
+
+
+def _t(n=5_000, seed=11):
+    r = np.random.default_rng(seed)
+    s = np.array(["a", "b", "c", "d"])[r.integers(0, 4, n)].tolist()
+    x = r.integers(0, 6, n).tolist()
+    for i in range(0, n, 17):
+        x[i] = None                       # COUNT(DISTINCT x) skips nulls
+    return pa.table({
+        "s": pa.array(s, pa.string()),
+        "k": A(r.integers(0, 7, n).astype(np.int64)),
+        "v": A(r.integers(1, 100, n).astype(np.int64)),
+        "x": pa.array(x, pa.int64()),
+    })
+
+
+def _u():
+    return pa.table({"kid": A(np.arange(7, dtype=np.int64)), "name": pa.array(list("pqrstuv"), pa.string())})
+
+
+def _norm(x):
+    if isinstance(x, (int, float, Decimal)) and not isinstance(x, bool):
+        return round(float(x), 6)
+    return x
+
+
+def _run(q):
+    t, u = _t(), _u()
+    exp = duckdb.sql(q).arrow()
+    if isinstance(exp, pa.RecordBatchReader):
+        exp = exp.read_all()
+    got = mx.sql(q, t=t, u=u).compute(device="cpu")
+    return got, exp
+
+
+def _check(q):
+    got, exp = _run(q)
+    assert got.column_names == exp.column_names
+    cols = exp.column_names
+    g = list(zip(*[[_norm(x) for x in got.column(c).to_pylist()] for c in cols]))
+    e = list(zip(*[[_norm(x) for x in exp.column(c).to_pylist()] for c in cols]))
+    if "ORDER BY" not in q:
+        g, e = sorted(g, key=repr), sorted(e, key=repr)
+    assert g == e
+    assert len(e) > 0 or "HAVING" in q
+
+
+NAMING = [
+    "SELECT SUM(v), s FROM t GROUP BY s",
+    "SELECT s, SUM(v), COUNT(*), COUNT(v), AVG(v), MIN(v), MAX(v) FROM t GROUP BY s",
+    "SELECT SUM(t.v) FROM t",
+    "SELECT COUNT(*), SUM(V) FROM t",
+    "SELECT MAX(v), s, MIN(v) AS lo FROM t GROUP BY s",
+    "SELECT s AS b, SUM(v) FROM t GROUP BY s ORDER BY b",
+    "SELECT s, SUM(v) FROM t GROUP BY s ORDER BY SUM(v) DESC",
+    "SELECT s, SUM(v) FROM t GROUP BY s ORDER BY SUM(v) DESC, s LIMIT 2",
+    "SELECT s FROM t GROUP BY s ORDER BY SUM(v) DESC",
+]
+
+JOIN_KEYS = [
+    "SELECT kid FROM t JOIN u ON k = kid",
+    "SELECT kid, name FROM t JOIN u ON k = kid WHERE v > 90",
+    "SELECT kid, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY kid",
+    "SELECT kid, SUM(v) FROM t JOIN u ON k = kid GROUP BY kid",
+    "SELECT k, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY k",
+    "SELECT kid AS id, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY kid",
+    "SELECT u.kid, SUM(v) AS x FROM t JOIN u ON t.k = u.kid GROUP BY u.kid",
+]
+
+GROUP_ALL = [
+    "SELECT s, SUM(v) AS x FROM t GROUP BY ALL",
+    "SELECT SUM(v) AS x, s FROM t GROUP BY ALL",
+    "SELECT s AS b, k + 1 AS k1, SUM(v) AS x FROM t GROUP BY ALL",
+    "SELECT s, k, COUNT(*) AS n, MAX(v) AS m FROM t GROUP BY ALL ORDER BY s, k",
+    "SELECT s, SUM(v) FROM t GROUP BY ALL",
+    "SELECT s, SUM(v) * 2 AS y FROM t GROUP BY ALL",
+    "SELECT SUM(v) AS x FROM t GROUP BY ALL",
+    "SELECT s, SUM(v) AS x FROM t WHERE v > 50 GROUP BY ALL HAVING SUM(v) > 100000",
+]
+
+HAVING = [
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING SUM(v) > 125000",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING x > 125000",
+    "SELECT s, SUM(v) FROM t GROUP BY s HAVING SUM(v) > 125000",
+    "SELECT s FROM t GROUP BY s HAVING SUM(v) > 125000",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING AVG(v) > 50.5",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING COUNT(*) > 1200 AND s <> 'a'",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING s = 'a' OR SUM(v) > 125000",
+    "SELECT s AS b, SUM(v) AS x FROM t GROUP BY s HAVING b = 'a'",
+    "SELECT s AS b, SUM(v) AS x FROM t GROUP BY s HAVING s = 'a'",
+    "SELECT k + 1 AS k1, SUM(v) AS x FROM t GROUP BY k + 1 HAVING k + 1 > 3",
+    "SELECT SUM(v) AS x FROM t HAVING SUM(v) > 1",
+    "SELECT SUM(v) AS x FROM t HAVING SUM(v) > 1000000000",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING SUM(v) > 125000 ORDER BY x DESC LIMIT 2",
+    "SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING SUM(v) * 2 > 250000",
+    "SELECT s, SUM(v) * 2 AS y FROM t GROUP BY s HAVING y > 250000",
+    "SELECT name, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY name HAVING SUM(v) > 35000",
+    "SELECT s, SUM(v) AS x FROM t WHERE v > 20 GROUP BY s HAVING MAX(v) = 99 AND MIN(v) >= 21",
+]
+
+COUNT_DISTINCT = [
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY s",
+    "SELECT s, COUNT(DISTINCT k) FROM t GROUP BY s",
+    "SELECT COUNT(DISTINCT k) AS n FROM t",
+    "SELECT COUNT(DISTINCT k) FROM t",
+    "SELECT COUNT(DISTINCT x) AS n FROM t",
+    "SELECT s, COUNT(DISTINCT x) AS n FROM t GROUP BY s",
+    "SELECT k, COUNT(DISTINCT s) AS n FROM t GROUP BY k",
+    "SELECT s, COUNT(DISTINCT s) AS n FROM t GROUP BY s",
+    "SELECT s AS b, COUNT(DISTINCT k) AS n FROM t GROUP BY s",
+    "SELECT COUNT(DISTINCT k) AS n, s FROM t GROUP BY s",
+    "SELECT s, k, COUNT(DISTINCT x) AS n FROM t GROUP BY s, k",
+    "SELECT k + 1 AS k1, COUNT(DISTINCT x) AS n FROM t GROUP BY k + 1",
+    "SELECT s, COUNT(DISTINCT k + 1) AS n FROM t GROUP BY s",
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t WHERE v > 90 GROUP BY s",
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY s HAVING COUNT(DISTINCT k) > 6",
+    "SELECT s FROM t GROUP BY s HAVING COUNT(DISTINCT x) > 5",
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY s ORDER BY n DESC, s LIMIT 3",
+    "SELECT s, COUNT(DISTINCT k) * 10 AS n FROM t GROUP BY s",
+    "SELECT name, COUNT(DISTINCT v) AS n FROM t JOIN u ON k = kid GROUP BY name",
+    "SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY ALL",
+]
+
+ARITHMETIC = [
+    "SELECT s, SUM(v) * 2 AS y FROM t GROUP BY s",
+    "SELECT s, SUM(v) AS x, SUM(v) * 2 AS y FROM t GROUP BY s",
+    "SELECT s, SUM(v) * 2 AS y, SUM(v) AS x FROM t GROUP BY s",
+    "SELECT SUM(v) * 2 AS y, s FROM t GROUP BY s",
+    "SELECT s, SUM(v) / COUNT(*) AS m FROM t GROUP BY s",
+    "SELECT s, SUM(v) * 2 + MAX(k) AS z, MIN(v) AS lo FROM t GROUP BY s",
+    "SELECT s, 100 * SUM(v) / SUM(k + 1) AS pct FROM t GROUP BY s",
+    "SELECT SUM(v) * 2 AS y FROM t",
+    "SELECT SUM(v) * 2 AS y, COUNT(*) AS n FROM t",
+    "SELECT s, (SUM(v) - MIN(v)) * 2 AS y FROM t GROUP BY s",
+    "SELECT s, -SUM(v) AS y FROM t GROUP BY s",
+    "SELECT s, SUM(v) * 2 AS y FROM t GROUP BY s ORDER BY y DESC",
+    "SELECT s, SUM(v) * 2 AS y FROM t GROUP BY s ORDER BY SUM(v) * 2 DESC",
+    "SELECT s AS b, SUM(v) * 2 AS y FROM t GROUP BY s ORDER BY b",
+    "SELECT s, SUM(v) * k AS y FROM t GROUP BY s, k",
+    "SELECT s, CASE WHEN SUM(v) > 125000 THEN 1 ELSE 0 END AS big FROM t GROUP BY s",
+    "SELECT SUM(CASE WHEN v > 50 THEN v ELSE 0 END) * 2 AS y FROM t",
+]
+
+
+@pytest.mark.parametrize("q", NAMING + JOIN_KEYS + GROUP_ALL + HAVING + COUNT_DISTINCT + ARITHMETIC)
+def test_matches_duckdb(q):
+    _check(q)
+
+
+def test_having_is_a_filter_above_the_aggregate():
+    """HAVING is never dropped: the plan has a Filter over the Aggregate."""
+    from mxframe.lazy_frame import Filter, Aggregate
+    lf = mx.sql("SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING SUM(v) > 125000", t=_t())
+    p = lf.plan
+    while not isinstance(p, Filter):
+        p = p.input
+    assert isinstance(p.input, Aggregate)
+
+
+def test_count_distinct_reaches_the_native_count(monkeypatch):
+    import mxframe.native_exec as nx
+    if not nx.available():
+        pytest.skip("libmxexec_cpu.so not built")
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    rcs = []
+    real = nx._call_count_distinct
+
+    def counting(*a):
+        rc = real(*a)
+        rcs.append(rc)
+        return rc
+
+    monkeypatch.setattr(nx, "_call_count_distinct", counting)
+    got, exp = _run("SELECT k, COUNT(DISTINCT v) AS n FROM t GROUP BY k")
+    assert sorted(zip(got.column("k").to_pylist(), got.column("n").to_pylist())) == \
+        sorted(zip(exp.column("k").to_pylist(), exp.column("n").to_pylist()))
+    assert rcs == [0]
+
+
+@pytest.mark.parametrize("q", [
+    "SELECT s AS x, SUM(v) AS x FROM t GROUP BY s",
+    "SELECT x, SUM(v) AS x FROM t GROUP BY x",
+    "SELECT s, SUM(v) AS s FROM t GROUP BY s",
+    "SELECT SUM(v), SUM(v) FROM t",
+    "SELECT SUM(v) AS y, SUM(k) AS y FROM t",
+    "SELECT s, s FROM t GROUP BY s",
+    "SELECT s, s FROM t",
+])
+def test_duplicate_output_name_raises(q):
+    with pytest.raises(ValueError, match="duplicate output column"):
+        mx.sql(q, t=_t())
+
+
+@pytest.mark.parametrize("q, exc, msg", [
+    ("SELECT s, SUM(v) * 2 FROM t GROUP BY s", ValueError, "alias"),
+    ("SELECT s, SUM(v + 1) FROM t GROUP BY s", ValueError, "alias"),
+    ("SELECT s, k, SUM(v) AS x FROM t GROUP BY s", ValueError, "GROUP BY"),
+    ("SELECT s, SUM(v) AS x FROM t HAVING SUM(v) > 1", ValueError, "GROUP BY"),
+    ("SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING k > 1", ValueError, "GROUP BY"),
+    ("SELECT s FROM t HAVING s = 'a'", ValueError, "HAVING"),
+    ("SELECT s FROM t GROUP BY s", ValueError, "aggregate"),
+    ("SELECT s FROM t GROUP BY ALL", ValueError, "aggregate"),
+    ("SELECT SUM(DISTINCT v) AS x FROM t", NotImplementedError, "DISTINCT"),
+    ("SELECT AVG(DISTINCT v) AS x FROM t", NotImplementedError, "DISTINCT"),
+    ("SELECT COUNT(DISTINCT s, k) AS n FROM t", NotImplementedError, "DISTINCT"),
+    ("SELECT s, COUNT(DISTINCT k) AS n, SUM(v) AS x FROM t GROUP BY s", NotImplementedError, "COUNT\\(DISTINCT"),
+    ("SELECT COUNT(DISTINCT k) AS n, COUNT(DISTINCT x) AS m FROM t", NotImplementedError, "COUNT\\(DISTINCT"),
+    ("SELECT s, COUNT(DISTINCT k) AS n FROM t GROUP BY s HAVING SUM(v) > 1", NotImplementedError, "COUNT\\(DISTINCT"),
+    ("SELECT s, STDDEV(v) AS d FROM t GROUP BY s", NotImplementedError, "STDDEV"),
+    ("SELECT s, SUM(v) AS x FROM t GROUP BY s HAVING STDDEV(v) > 1", NotImplementedError, "STDDEV"),
+    ("SELECT kid, SUM(v) AS x FROM t LEFT JOIN u ON k = kid GROUP BY kid", ValueError, "LEFT JOIN"),
+])
+def test_unsupported_raises(q, exc, msg):
+    with pytest.raises(exc, match=msg):
+        mx.sql(q, t=_t(), u=_u())

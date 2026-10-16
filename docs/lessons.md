@@ -44,3 +44,4 @@ Claude reads this at the start of each session. -->
 - 2026-10-14 · Before opening a PR, run every step in .github/workflows/test.yml locally (the scripts/_test_*.py smoke scripts aren't in pytest).
 - 2026-10-14 · Before a release, dry-run scripts/release.sh (no flags) end to end; it had gone stale (no twine, old kernels.mojopkg name) since the last release.
 - 2026-10-14 · Never `pkill -f` a pattern that can match your own shell command line (killed the shell twice); kill by PID.
+- 2026-10-15 · Check a ticket's claim about DuckDB behaviour by running DuckDB before coding it: F-042 said a duplicate output name raises in DuckDB; it renames the second to `x_1`.
