@@ -42,12 +42,22 @@ def _w():
     return pa.table({"k": A(np.arange(7, dtype=np.int64)), "v": A(np.arange(7, dtype=np.int64) * 100)})
 
 
+def _n():
+    """NULLs in the first column and in the group keys; group 'c' has only NULL values, NULL keys
+    form a group of their own."""
+    return pa.table({
+        "x": pa.array([None, 1, 1, 2, None, 3, 3, 3, 4, None], pa.int64()),
+        "g": pa.array([None, "a", "a", "b", None, "a", "b", "b", "c", "c"], pa.string()),
+        "v": pa.array([5, 1, 2, None, None, 3, 4, 5, None, None], pa.int64()),
+    })
+
+
 def _run(q):
-    t, u, w = _t(), _u(), _w()
+    t, u, w, tn = _t(), _u(), _w(), _n()
     exp = duckdb.sql(q).arrow()
     if isinstance(exp, pa.RecordBatchReader):
         exp = exp.read_all()
-    got = mx.sql(q, t=t, u=u, w=w).compute(device="cpu")
+    got = mx.sql(q, t=t, u=u, w=w, tn=tn).compute(device="cpu")
     return got, exp
 
 
@@ -214,8 +224,40 @@ RENAMED = [
     "SELECT k, v AS k FROM t",
     "SELECT t.k, u.kid, t.k FROM t JOIN u ON t.k = u.kid",
     "SELECT t.k, w.k FROM t JOIN w ON t.k = w.k",
+    "SELECT t.v FROM t JOIN w ON t.k = w.k WHERE t.v > 95",
+    "SELECT t.s, SUM(t.v) AS x FROM t JOIN w ON t.k = w.k GROUP BY t.s",
     "SELECT kid, name FROM t JOIN u ON k = kid ORDER BY kid, name LIMIT 5",
 ]
+
+
+NULLS = [
+    "SELECT g, SUM(v) AS s FROM tn GROUP BY g HAVING COUNT(*) > 1",
+    "SELECT COUNT(*) AS c, COUNT(x) AS cx, COUNT(v) AS cv FROM tn",
+    "SELECT COUNT(DISTINCT x) AS n, COUNT(*) AS c FROM tn",
+    "SELECT g, COUNT(*) AS c, COUNT(x) AS cx, COUNT(v) AS cv FROM tn GROUP BY g",
+    "SELECT g, COUNT(DISTINCT x) AS n, COUNT(*) AS c FROM tn GROUP BY g",
+    "SELECT g, COUNT(DISTINCT x) AS n, COUNT(*) AS c, COUNT(v) AS cv, SUM(v) AS s, AVG(v) AS a, MIN(v) AS lo, MAX(v) AS hi FROM tn GROUP BY g",
+    "SELECT COUNT(DISTINCT g) AS n, SUM(v) AS s, AVG(v) AS a, COUNT(*) AS c FROM tn",
+    "SELECT g, AVG(v) AS a, SUM(v) AS s FROM tn GROUP BY g",
+    "SELECT x, COUNT(DISTINCT g) AS n, COUNT(*) AS c, AVG(v) AS a FROM tn GROUP BY x",
+    "SELECT g, x FROM tn ORDER BY g, x",
+    "SELECT g, x FROM tn ORDER BY g DESC, x DESC",
+    "SELECT g, x FROM tn ORDER BY g NULLS LAST, x NULLS LAST",
+    "SELECT g, COUNT(*) AS c FROM tn GROUP BY g ORDER BY g DESC NULLS LAST",
+]
+
+
+@pytest.mark.parametrize("q", NULLS)
+def test_nulls_match_duckdb(q):
+    _check(q)
+
+
+def test_count_star_counts_rows_in_the_dataframe_api():
+    from mxframe import LazyFrame, col, lit
+    got = LazyFrame(_n()).groupby("g").agg(lit(1).count().alias("c"), col("x").count().alias("cx")) \
+        .compute(device="cpu").to_pydict()
+    assert sorted(zip(got["g"], got["c"], got["cx"]), key=repr) == \
+        sorted([(None, 2, 0), ("a", 3, 3), ("b", 3, 3), ("c", 2, 1)], key=repr)
 
 
 @pytest.mark.parametrize("q", MIXED_DISTINCT + DISTINCT + ORDINALS + RENAMED)
@@ -280,8 +322,11 @@ def test_count_distinct_reaches_the_native_count(monkeypatch):
     ("SELECT s, k FROM t ORDER BY 3", ValueError, "position"),
     ("SELECT s, SUM(v) AS x FROM t GROUP BY 2", ValueError, "aggregate"),
     ("SELECT t.v, w.v FROM t JOIN w ON t.k = w.k", ValueError, "more than one joined table"),
+    ("SELECT w.v FROM t JOIN w ON t.k = w.k", ValueError, "more than one joined table"),
+    ("SELECT g FROM tn ORDER BY g NULLS FIRST", NotImplementedError, "NULLS FIRST"),
+    ("SELECT g, COUNT(*) AS c FROM tn GROUP BY g ORDER BY g DESC NULLS FIRST", NotImplementedError, "NULLS FIRST"),
     ("SELECT kid, SUM(v) AS x FROM t LEFT JOIN u ON k = kid GROUP BY kid", ValueError, "LEFT JOIN"),
 ])
 def test_unsupported_raises(q, exc, msg):
     with pytest.raises(exc, match=msg):
-        mx.sql(q, t=_t(), u=_u(), w=_w())
+        mx.sql(q, t=_t(), u=_u(), w=_w(), tn=_n())

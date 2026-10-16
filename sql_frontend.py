@@ -175,6 +175,10 @@ class _SQLTranslator:
                 raise ValueError("aggregate functions are not allowed in WHERE (use HAVING)")
             plan = Filter(plan, self._expr(where.this))
 
+        for o in (node.args.get("order").expressions if node.args.get("order") else []):
+            if o.args.get("nulls_first"):
+                raise NotImplementedError("ORDER BY ... NULLS FIRST is not supported (NULLs sort last, as in DuckDB's default)")
+
         # 3. GROUP BY / aggregates / HAVING
         group_node = node.args.get("group")
         having = node.args.get("having")
@@ -279,6 +283,14 @@ class _SQLTranslator:
                     (self._dropped_right if how == "left" else self._col_aliases)[rk] = lk
 
         return plan
+
+    def _copy_dropped(self, qualifier: str, name: str) -> bool:
+        """True when ``qualifier.name`` is the copy of a column the join dropped (an earlier joined
+        table has a column of that name; the join keeps the first one)."""
+        for i, (alias, _) in enumerate(self._table_cols):
+            if alias == qualifier:
+                return any(name in cols for _, cols in self._table_cols[:i])
+        return False
 
     def _scan(self, table_node: sge.Expression) -> LogicalPlan:
         if not isinstance(table_node, sge.Table):
@@ -576,10 +588,9 @@ class _SQLTranslator:
         # ---- column reference ----
         if isinstance(node, sge.Column):
             name = node.name.lower()
-            if node.table and name not in self._same_keys and \
-                    sum(name in cols for _, cols in self._table_cols) > 1:
+            if node.table and name not in self._same_keys and self._copy_dropped(node.table.lower(), name):
                 raise ValueError(f"column {node.sql(dialect='duckdb')}: the name exists in more than one joined "
-                                 "table and the join keeps one copy, so this is not supported yet")
+                                 "table and the join keeps the first copy, so this one is not supported yet")
             if name in self._dropped_right:
                 raise ValueError(f"column {name!r} is the right key of a LEFT JOIN, which the join drops "
                                  f"(it is NULL where nothing matched); use the left key {self._dropped_right[name]!r}")
@@ -672,11 +683,7 @@ class _SQLTranslator:
             if isinstance(node.this, sge.Distinct):
                 raise NotImplementedError("COUNT(DISTINCT x) is supported as a SELECT, HAVING or ORDER BY aggregate only")
             if isinstance(node.this, sge.Star):
-                # COUNT(*) — count any in-scope column
-                c_name = self._scope_columns[0] if self._scope_columns else None
-                if c_name is None:
-                    raise ValueError("COUNT(*) with no tables in scope")
-                return col(c_name).count()
+                return lit(1).count()          # rows, not the non-null values of some column
             return self._expr(node.this).count()
 
         # ---- CASE WHEN ----

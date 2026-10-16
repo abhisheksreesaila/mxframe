@@ -44,4 +44,5 @@ Claude reads this at the start of each session. -->
 - 2026-10-14 · Before opening a PR, run every step in .github/workflows/test.yml locally (the scripts/_test_*.py smoke scripts aren't in pytest).
 - 2026-10-14 · Before a release, dry-run scripts/release.sh (no flags) end to end; it had gone stale (no twine, old kernels.mojopkg name) since the last release.
 - 2026-10-14 · Never `pkill -f` a pattern that can match your own shell command line (killed the shell twice); kill by PID.
-- 2026-10-15 · Check a ticket's claim about DuckDB behaviour by running DuckDB before coding it: F-042 said a duplicate output name raises in DuckDB; it renames the second to `x_1`.
+- 2026-10-15 · Check a ticket's claim about DuckDB behaviour by running DuckDB before coding it: F-042 said a duplicate output name raises in DuckDB; `duckdb.sql(q).arrow()` / `.df()` renames the second to `x_1`, while `con.execute(q).to_arrow_table()` keeps both names.
+- 2026-10-16 · A count over "any column in scope" is not a row count: COUNT(*) must not read a column that can hold NULLs (F-042 review: HAVING COUNT(*) lost the NULL group). Test aggregates and keys on a fixture whose first column and group keys have NULLs.
