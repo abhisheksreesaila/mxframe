@@ -259,18 +259,21 @@ def test_group_reports_its_first_rows_bits_with_null(dt, first):
 
 @pytest.mark.parametrize("first", list(FIRSTS))
 @pytest.mark.parametrize("dt", DTYPES)
-def test_fused_join_partner_key_without_null(dt, first):
+def test_fused_join_partner_key_without_null(dt, first, monkeypatch):
     """The partner column of a fused join reaches the fused pipeline's key encoder (no NULL, so no fallback)."""
-    import os
-    os.environ["MXFRAME_NATIVE"] = "0"
-    try:
-        dim = _first_row_table(dt, FIRSTS[first](dt), with_null=False).select(["id", "k"])
-        fact = pa.table({"id": A(np.arange(40, dtype=np.int64) % dim.num_rows), "v": A(np.arange(40, dtype=np.float64))})
-        lf = (LazyFrame(fact).join(LazyFrame(dim), on="id").groupby("k").agg(col("v").sum().alias("s")))
-        got = lf.compute(device="cpu")
-    finally:
-        del os.environ["MXFRAME_NATIVE"]
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    dim = _first_row_table(dt, FIRSTS[first](dt), with_null=False).select(["id", "k"])
+    fact = pa.table({"id": A(np.arange(40, dtype=np.int64) % dim.num_rows), "v": A(np.arange(40, dtype=np.float64))})
+    lf = (LazyFrame(fact).join(LazyFrame(dim), on="id").groupby("k").agg(col("v").sum().alias("s")))
+    got = lf.compute(device="cpu")
+    monkeypatch.delenv("MXFRAME_NATIVE")
     ref = _native_duck("select k, sum(v) as s from fact join dim using (id) group by k", fact=fact, dim=dim)
     assert lf.last_compile_provenance["path"].startswith("fused_pipeline"), lf.last_compile_provenance
     assert got.num_rows == ref.num_rows == 2
     assert _bit_rows(got, ["k", "s"]) == _bit_rows(ref, ["k", "s"])
+
+
+def test_an_all_null_float_key_encodes_without_error():
+    from mxframe import arrow_dict
+    enc = arrow_dict.encode_key(pa.chunked_array([pa.array([None, None], pa.float64())]))
+    assert len(enc.dictionary) == 0 and enc.indices.null_count == 2

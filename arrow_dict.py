@@ -79,6 +79,8 @@ def _encode_float(arr):
         rows, idx = np.flatnonzero(valid), idx[valid]
     else:
         rows = np.arange(len(idx))
+    if not len(rows):                                     # every key NULL: no group has a first row
+        return enc
     run = np.maximum.accumulate(idx)                      # codes are numbered by first appearance
     first = rows[np.flatnonzero(np.concatenate(([True], run[1:] != run[:-1])))]
     return pa.DictionaryArray.from_arrays(ind, pc.take(arr, _npa(first.astype(np.int64))))
