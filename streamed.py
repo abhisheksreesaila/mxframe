@@ -25,7 +25,7 @@ from . import gpu_budget
 from ._lazy_pc import pc
 from .gpu_budget import fmt_bytes
 from .lazy_expr import Expr, col
-from .lazy_frame import (Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
+from .lazy_frame import (Aggregate, Distinct, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
                          Scan, Sort, Tail)
 
 WORKING_FACTOR = 3            # in-memory path: the table, the filtered copy, group ids / gather buffers
@@ -394,13 +394,13 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     spec, leaf = got.spec, got.leaf
     state = _State(spec, budget)
     devices, pieces, paths = Counter(), Counter(), Counter()
-    biggest = 0
+    biggest, size_of = 0, dict(zip(leaf.groups, leaf.sizes))
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st:
             for batch in got.batches:
                 st.groups = tuple(batch)
-                biggest = max(biggest, sum(leaf.sizes[leaf.groups.index(g)] for g in batch))
+                biggest = max(biggest, sum(size_of[g] for g in batch))
                 sub = LazyFrame(spec.partial)
                 part = sub.compute(device, optimize=False, validate=False, strict=strict, prefer=prefer,
                                    placement=placement, gpu_fraction=gpu_fraction)
