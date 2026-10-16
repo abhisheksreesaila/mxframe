@@ -18,6 +18,7 @@ strides int64[n_keys]: composite = sum(code_k * stride_k), must stay below `spac
 Build:
     pixi run mojo build kernels_aot/groupkeys_cpu.mojo -I kernels_aot --target-cpu x86-64-v3 \
         --emit shared-lib -o kernels_aot/libmxgroupkeys_cpu.so
+    bash scripts/set_runpath.sh kernels_aot/libmxgroupkeys_cpu.so
 """
 
 from std.memory.alloc import unsafe_alloc

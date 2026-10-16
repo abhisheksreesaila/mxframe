@@ -35,6 +35,7 @@ jobs:
             echo "Mojo available — building AOT kernels"
             pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
               -o kernels_aot/libmxkernels_aot.so
+            bash scripts/set_runpath.sh kernels_aot/libmxkernels_aot.so
           else
             echo "Using pre-built libmxkernels_aot.so from repository"
           fi
