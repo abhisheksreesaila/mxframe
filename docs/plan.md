@@ -536,6 +536,12 @@ Needs: F-046a slice 3 · From its review (2026-10-16)
 - [ ] group keys that are columns of one partner but not its unique key (TPC-H Q10's shape) leave several partner rows per key tuple; slice 3 declines that case (the first version merged them in NumPy, which was per-row Python work and wrong for negative key values). Merge natively in the executor: code the key tuples per partner row (negative and repeated values), then fold the partner-row partials into key-tuple groups
 - [ ] tests vs DuckDB with negative and repeated key tuples, asserting the fused path; Q10 no slower fused than unfused on a quiet machine
 
+## F-063 Q17 on device="auto" aborts the process under load [todo]
+Needs: none · Seen 2026-10-16 in a full-suite run (test_tpch_duckdb, Q17 on auto: exit -6, glibc `pthread_mutex_lock` assertion); passed on rerun. Same family as the rare -11 under load in F-020 / F-022. An abort can't be caught or fallen back from, so it is worse than a wrong answer
+- [ ] loop Q17 on auto ~50 times (and under load) to measure the rate; capture a core dump / gdb backtrace
+- [ ] find the cause (suspects, unverified: native executor worker threads started from the auto path, the Mojo runtime initialized from two places, the GPU warm-up thread racing a CPU query) and fix it; a stress test that reproduces it before the fix
+- [ ] if it can't be reproduced in 200 runs, mark blocked on a repro with the evidence
+
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
