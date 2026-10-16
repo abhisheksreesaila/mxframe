@@ -57,7 +57,7 @@ Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Rout
 ## F-058 Core gate scoreboard [todo]
 Needs: F-055, F-056, F-057 · Quiet machine only
 - [ ] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (warm, labelled) and `auto`, against DuckDB and Polars, every result checked against DuckDB
-- [ ] each device beats DuckDB on at least 90% of queries; the misses listed with a reason
+- [ ] each device beats DuckDB on at least 90% of queries; the misses listed with a reason (close misses are fine for the gate; the long tail is chased later, after the rings start, per Abhishek 2026-10-15)
 - [ ] when it passes: the rings below can start
 
 ## Rings (after the core gate, not before)
