@@ -83,11 +83,17 @@ The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/interna
 
 `mx.sql(query, **tables)` parses with sqlglot into the same plan the DataFrame API builds. Table names in the query are the keyword names.
 
-Supported: `SELECT`, `FROM`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON`, `CASE WHEN`, aggregates and arithmetic.
+Supported: `SELECT`, `FROM` (tables, `WITH` names, derived tables), `WHERE`, `GROUP BY` (also `ALL`), `HAVING`, `ORDER BY`, `LIMIT`, `JOIN … ON` / `USING` (inner, left, semi, anti), comma joins (`FROM a, b WHERE a.k = b.k`: the key equalities in `WHERE`, also one every branch of an `OR` has), `CASE WHEN`, aggregates (also `COUNT(DISTINCT x)`) and arithmetic, `DATE '…'` with `± INTERVAL 'n' DAY | MONTH | YEAR` (a day number: dates are int32 days since 1970-01-01, as in the TPC-H Parquet files), `EXTRACT(YEAR FROM x)`, `SUBSTRING(x FROM a FOR n)`, `LIKE 'prefix%'` and `LIKE '%substring%'`.
 
-Known limits in 0.6.0:
-- `COUNT(DISTINCT …)` raises `NotImplementedError`; use `lf.select(a, b).distinct().groupby(a).agg(col(b).count())`.
-- `HAVING` is dropped without an error (F-042); filter the aggregated frame instead.
+Subqueries (F-065):
+- `(SELECT agg FROM …)` in `WHERE`, `HAVING` or the `SELECT` list is `lf.scalar(agg)`: run first as a native plan, used as a literal. It must be one aggregate over an ungrouped query.
+- `x [NOT] IN (SELECT …)` and `[NOT] EXISTS (SELECT …)` as conditions joined by `AND` at the top of `WHERE` become semi / anti joins. `NOT IN` follows SQL's NULL rules (a NULL in the subquery, or a NULL `x` against a non-empty subquery, keeps no row; an empty subquery keeps every row).
+- A correlated comparison in `WHERE` (`v > (SELECT AVG(v) FROM u WHERE u.k = t.k)`) is a join with the per-key aggregate. The correlation must be `inner.col = outer.col` equalities; `COUNT` is refused (an outer row without partners must see 0).
+- `WITH name AS (…)` (not `RECURSIVE`, no column list).
+
+Everything else raises `NotImplementedError` or `ValueError` naming the form: `IN` / `EXISTS` under `OR`, `NOT (…)`, `CASE` or in the `SELECT` list, a correlated scalar subquery anywhere but a `WHERE` comparison, a correlated `<>` or `<`, a correlated `NOT IN`, `UNION`, `ANY` / `ALL`, `CROSS JOIN`, `LIKE '%suffix'` and patterns with an inner `%` or `_`, `EXTRACT` of anything but the year, other `INTERVAL` units.
+
+Known limits: `EXTRACT(YEAR …)` on an integer day-number column works in a projection or group key, not in `WHERE` (the same `year_of_days()` limit as the DataFrame API). Integer literals in arithmetic are floats (`y + 1` is a float64), so `IN (SELECT y + 1 …)` against an integer column fails with a join key type error. A CTE used twice is computed twice (TPC-H Q15 compares two float sums: F-064). `scripts/tpch_sql/run.py` runs the specification's text of the 22 TPC-H queries through `mx.sql` and compares them with DuckDB.
 
 ## Device selection and the GPU
 

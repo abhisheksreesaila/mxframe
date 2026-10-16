@@ -585,15 +585,34 @@ Needs: F-033 merged · Found by the F-033 review (2026-10-16): silent wrong answ
 - [x] checks: F-033's uncomputed-view Q15 test strict and 20 of 20; the same shape at 200k groups in default mode 20 of 20 (`tests/test_reproducible_sums.py`); that file, 6M rows, 30 runs, 0 groups differ bitwise: default mode for the cheap regimes (single-table keyed 8k groups, global, fused join 10k and 200k groups); `reproducible=True` for the many-groups shared output (3M groups); same `tot` bits for `agg(tot)` vs `agg(tot, x0, x1)` vs `agg(tot, x0..x4)` at 300, 800, 8k groups (default); same bits at 4 / 8 / 16 threads at 300, 10k, 200k groups (reproducible); table path (5k default and reproducible, 10k, 60k) and staged path (200k) equal a NumPy reference of the defined order bit for bit; `MXFRAME_REPRODUCIBLE=1` equals `reproducible=True`
 - [ ] open: reproducible mode as a default once the many-groups path is as fast (the staged apply costs 10-20%); GPU float atomics: F-067
 
-## F-065 SQL subqueries [todo]
+## F-065 SQL subqueries [done]
 Needs: F-033 · From the F-033 review: SQL-phrased Q11, Q15, Q18, Q21, Q22 get none of the native subquery work
-- [ ] scalar subquery in WHERE / HAVING (`WHERE v > (SELECT AVG(v) ...)`) maps to `LazyFrame.scalar`; `IN (SELECT ...)` / `EXISTS` map to semi joins, `NOT IN` / `NOT EXISTS` to anti joins (NULL semantics of NOT IN like DuckDB)
-- [ ] until a form is supported, a clear error instead of today's misleading "aggregate functions are not allowed in WHERE"
-- [ ] SQL versions of the 22 TPC-H queries run and equal DuckDB; `scripts/native_coverage.py` reports the same native coverage for SQL as for the DataFrame versions
+- [x] scalar subquery in WHERE / HAVING / SELECT expressions maps to `LazyFrame.scalar` machinery (`Expr("scalar", plan)`); a correlated comparison in WHERE decorrelates to a join with the per-key aggregate (COUNT refused: the count bug); `x IN (SELECT ...)` / `EXISTS` are semi joins (correlated ones with the equalities as keys), `NOT IN` / `NOT EXISTS` anti joins; NOT IN keeps DuckDB's NULL rules (a NULL in the subquery: no rows; empty subquery: every row, NULL key too) through one scalar over the subquery (empty / no NULL / some NULL) and `x = x` as the NULL test. `WITH` and derived tables. `tests/test_sql_subqueries.py` (108 DuckDB-checked queries incl. NULL and empty cases, 20 forms that must raise)
+- [x] forms not supported raise naming the form (IN / EXISTS under OR / NOT / CASE / SELECT, correlated scalar outside a WHERE comparison, correlated `<>` / `<`, correlated NOT IN, UNION, RECURSIVE, ...); an aggregate in the outer WHERE keeps "aggregate functions are not allowed in WHERE"; aggregates inside a subquery are no longer taken for outer aggregates
+- [x] what the specification's SQL text needs besides subqueries, added with DuckDB-checked tests (`tests/test_sql_tpch_forms.py`): comma joins (keys from WHERE, also a key every OR branch has: Q19; the same table twice under aliases), `DATE` / `INTERVAL` constants, `EXTRACT(YEAR ...)`, `SUBSTRING`, `LIKE '%x%'`, exact constant arithmetic (`0.06 - 0.01` is 0.05, not 0.04999...)
+- [x] SQL versions of the 22 TPC-H queries (`scripts/tpch_sql/queries.py`, the specification's text and default parameters) run through `mx.sql` and compared with DuckDB (`scripts/tpch_sql/run.py`; `tests/test_sql_tpch.py` at SF 0.017): SF1, 22 queries: **17 run and equal DuckDB** (Q1, 3-12, 14, 17-20, 22), **Q15 runs and is flaky** (equal on some runs, 0 rows on others: its CTE is computed twice and `total_revenue = (SELECT max(total_revenue) ...)` compares two float sums, F-064), **4 raise**: Q2 (`LIKE '%BRASS'`: no suffix match), Q13 (a `NOT LIKE` in a LEFT JOIN's ON), Q16 (`LIKE '%Customer%Complaints%'`), Q21 (correlated `<>`)
+- [x] found by the SQL Q18: a group-by on 5 or more keys kept four (the Mojo composite kernel has four slots; the fifth key's values came back as one value for every group, silently); fixed (`_build_group_ids_multikey_mojo` declines more than 4 keys), `tests/test_group_five_keys.py`
+- [ ] `scripts/native_coverage.py --sql`: **SQL 8/22 fully native** (Q1, 3, 4, 5, 6, 11, 12, 19) against **17/22 for the DataFrame versions**. Not native, with the reason: Q8, Q14, Q17 (a Project over an Aggregate, SQL's arithmetic on aggregates: `Project(Aggregate(join))` declines "expression not supported by the bytecode compiler", the DataFrame versions compute the aggregate and the arithmetic in two computes), Q10, Q18 (the specification groups by float / wide keys: "group key type float ... not in M0"), Q7, Q9, Q20, Q22 (as the DataFrame versions: M4 strings, renamed leaves), Q15 (equality of two float sums in Arrow), and Q2, Q13, Q16, Q21 raise. Next: the executor taking a Project (or a division) over an aggregate natively, float group keys, and the missing SQL forms above
 
 ## F-066 Committed kernel libraries match their source [done]
 From the F-033 review: `libmxpipeline_cpu.so` was stale against `pipeline_cpu.mojo`; CI only builds `libmxkernels_aot.so` and the wheel ships the committed `.so` files
 - [x] store a source hash next to each committed `.so` at build time; a test fails when a `.mojo` source changed without its library being rebuilt (`kernels_aot/<lib>.so.sources.json` from `scripts/record_build_hash.py`, called by every build; `tests/test_kernel_hashes.py` and a CI step check it; after merging source changes run `bash scripts/build_pipeline.sh` with no argument)
+
+## F-067 Reproducible float aggregates on the GPU and across a CPU+GPU split [todo]
+Needs: F-064 · From the F-064 review (2026-10-16)
+- [ ] `pipeline_gpu.mojo` modes 1 and 2 (shared and global float64 atomics) and `kernels_aot_gpu.mojo` `_atomic_fold` / `red_add_global` (float32) add floats with atomics: results differ in the last bits per run; `coproc.py` splits rows between CPU and GPU and merges partials, so a split adds another order
+- [ ] per-block GPU partials combined in block order (behind a switch if it costs; measure); `auto` sends both sides of a self-comparison (Q15 shape) to the same device
+- [ ] the F-064 tests extended to `device="gpu"` and a forced split
+
+## F-068 Arithmetic over an aggregate runs natively [todo]
+Needs: F-065 · From F-065 (2026-10-16): the main reason SQL-phrased TPC-H is 8/22 fully native vs 17/22 for the DataFrame versions
+- [ ] a Project (or division, CASE) over an Aggregate (SQL `100 * SUM(a) / SUM(b)`, Q8 / Q14 / Q17) runs the aggregate natively and the small per-group arithmetic after it, instead of declining the whole plan ("expression not supported by the bytecode compiler")
+- [ ] SQL Q8, Q14, Q17 fully native (`scripts/native_coverage.py --sql`), equal to DuckDB
+
+## F-069 Float and wide group keys in the native executor [todo]
+From F-065: SQL Q10 and Q18 group by float / wide keys as the specification writes them, and the executor declines
+- [ ] float64 group keys (exact bit equality, NaN and -0.0 like DuckDB) and composite keys wider than the direct-address space take a hashed native group-by instead of declining
+- [ ] SQL Q10, Q18 fully native and equal to DuckDB; no DataFrame query slower
 
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review

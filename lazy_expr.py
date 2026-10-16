@@ -153,6 +153,7 @@ class Expr:
         """Return a hashable structural signature for graph caching."""
         def _sig(a):
             if isinstance(a, Expr): return a.signature()
+            if hasattr(a, "signature"): return a.signature()      # a subquery's plan
             if isinstance(a, list): return ("list", tuple(a))
             return a
         child_sigs = tuple(_sig(a) for a in self.args)
