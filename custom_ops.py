@@ -1777,6 +1777,11 @@ class CustomOpsCompiler(GraphCompiler):
                 having_pred = plan.predicate
                 plan = plan.input
 
+        # 0a1 -- ORDER BY ties: group keys are the last sort columns on every path below. The native
+        # executor adds them itself, so it gets the post-ops as written.
+        _native_post_ops = post_ops
+        post_ops = self._key_tiebreak(plan, post_ops)
+
         # 0a2 -- SQL null semantics.  The kernels have no notion of null (a null group key was
         # dropped, a null value turned a sum into NaN), so an aggregate that touches a column
         # with nulls is computed by Arrow's hash aggregate: a null key is its own group, sum /
@@ -1836,7 +1841,7 @@ class CustomOpsCompiler(GraphCompiler):
         # F-030 / F-031 -- native executor: the whole plan in one Mojo call
         if _native_exec is not None:          # (declines at once when MXFRAME_NATIVE=0)
             try:
-                _native = _native_exec.try_execute(self, plan, having_pred, post_ops)
+                _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops)
             except Exception as _exc:      # a plan is fully native or not at all: never fail the query
                 _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
             if _native is not None:
@@ -1849,7 +1854,7 @@ class CustomOpsCompiler(GraphCompiler):
         # first, so CPU and GPU sessions give the same digits (F-022 / F-031)
         if _native_exec is not None and _native_exec.enabled() and self._session_device == "gpu":
             try:
-                _native = _native_exec.try_execute(self, plan, having_pred, post_ops, gpu_fallback=True)
+                _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops, gpu_fallback=True)
             except Exception as _exc:
                 _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
             if _native is not None:

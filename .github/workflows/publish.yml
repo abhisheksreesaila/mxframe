@@ -36,6 +36,7 @@ jobs:
         run: |
           pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
             -o kernels_aot/libmxkernels_aot.so
+          bash scripts/set_runpath.sh kernels_aot/libmxkernels_aot.so
           echo "Built libmxkernels_aot.so:"
           ls -lh kernels_aot/libmxkernels_aot.so
 

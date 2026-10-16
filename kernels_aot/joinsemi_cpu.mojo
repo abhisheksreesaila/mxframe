@@ -19,6 +19,7 @@ morsel-sized slot of `out`, and the slots are then compacted in order.
 Build:
     pixi run mojo build kernels_aot/joinsemi_cpu.mojo -I kernels_aot --target-cpu x86-64-v3 \
         --emit shared-lib -o kernels_aot/libmxjoin_cpu.so
+    bash scripts/set_runpath.sh kernels_aot/libmxjoin_cpu.so
 """
 
 from std.memory.alloc import unsafe_alloc

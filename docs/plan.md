@@ -359,18 +359,21 @@ Needs: Abhishek's go (given 2026-10-12) · Unblocks F-028
 - [x] review fixes: `MANIFEST.in` shipped a hand-kept module list that had gone stale (no `native_exec`, `io_parquet`, `join_engine`, `np_arrow`, ...) and `kernels.mojopkg`: now `include *.py` and `kernels.mojoc`; runtime extra `modular>=26.6`; `_lazy_pc` always imports through the module lock; `_LazyPcOps.get` returns functions and `.values()` / `.items()` raise
 - Follow-up: ~1,300 deprecation warnings (positional `ptr[i]` → `ptr[unsafe_offset=i]`, `.free()` → `.unsafe_free()`, `@parameter` closures); harmless on 1.1, to be cleaned before Modular removes them
 
-## F-036 Kernel libraries find the Mojo runtime wherever they are installed [todo]
+## F-036 Kernel libraries find the Mojo runtime wherever they are installed [done]
 Needs: none · From the F-035 review
-- [ ] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
-- [ ] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
+- [x] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
+  - Done: `scripts/set_runpath.sh` (patchelf, now a pixi dependency) sets RUNPATH `$ORIGIN/../.pixi/envs/default/lib:$ORIGIN/../../modular/lib:$ORIGIN/../../../..` (checkout or worktree first, so a checkout prefers its own env over a directory beside it; then pip wheel, venv / conda env). Linux only; macOS dylibs are out of scope. The 0.6.0 wheel still has the absolute RUNPATH (CHANGELOG); the build scripts, `release.sh`, both workflows and CONTRIBUTING call it after every `mojo build`. The runtime libraries carry their own `$ORIGIN` RPATH, so finding `libKGENCompilerRTShared.so` is enough for the rest. `tests/test_runpath.py` reads each shipped `.so`'s RUNPATH, and copies a library into a venv-like and a pip-`modular`-like layout and dlopens it from `/usr/bin/python3` (no conda RPATH of its own), with a control that fails without the runtime. Not done: a fresh venv with the real `pip install modular` wheel (large download); its layout (`site-packages/modular/lib`) is taken from `max/_core`'s own RPATH
+- [x] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
+  - No longer needed for the RUNPATH (it is relative); still rebuild a library after changing its source
 
 ## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [todo]
 Needs: none · From the F-032 review (round 2); predates the executor (the fused pipeline has it too)
 - [ ] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
 
-## F-038 Two tests fail under load [todo]
+## F-038 Two tests fail under load [done]
 Needs: none · Seen 2026-10-12 while other test runs and benchmarks shared the machine; both pass alone (3/3)
-- [ ] `tests/test_cpu_kernels.py::test_thread_budget_changes_actual_parallelism` (wall-clock speedup assertion) and `tests/test_gpu_kernels.py::test_failed_hash_join_frees_its_scratch_buffers` (GPU memory measured while other processes hold GPU memory), and `tests/test_auto_cold.py::test_a_short_query_inside_the_window_restarts_it` (timing window, failed once at load average 7 during the M2e review): measure what each test means without depending on a quiet machine (CPU time or per-process GPU accounting), or mark them as needing a quiet machine
+- [x] `tests/test_cpu_kernels.py::test_thread_budget_changes_actual_parallelism` (wall-clock speedup assertion) and `tests/test_gpu_kernels.py::test_failed_hash_join_frees_its_scratch_buffers` (GPU memory measured while other processes hold GPU memory), and `tests/test_auto_cold.py::test_a_short_query_inside_the_window_restarts_it` (timing window, failed once at load average 7 during the M2e review): measure what each test means without depending on a quiet machine (CPU time or per-process GPU accounting), or mark them as needing a quiet machine
+  - Done: the thread test counts the threads that ran CPU (`/proc/self/task/*/schedstat`): threads=1 gives 1, threads=4 gives 5, the same at load average 22; the GPU test reads this process's own GPU memory (`nvidia-smi --query-compute-apps`) instead of device-wide free memory; the window test runs on a fake clock (it was also order-dependent: alone it failed, because it relied on an earlier test having set `_last_end`). Nothing needed a `quiet_machine` marker. Same flavour, not changed: `test_background_work_waits_for_an_idle_gap` (real 50 ms sleeps between queries)
 
 ## F-029 CPU joins [superseded by F-032]
 Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17, Q20 with reading out of the clock (F-007 is GPU placement; this ticket is the CPU join itself)
@@ -501,9 +504,14 @@ Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
 - [x] fixes it found: native top-k for ORDER BY ... LIMIT (a random top-N took 543 ms, now 14), native filter for WHERE-only plans, and a harness bug: DuckDB imported pyarrow inside its first query (~70 ms), which had inflated every DuckDB time
 - findings (honest): vs Polars, MXFrame is faster on most random queries (geo. mean 1.0-2.7x) and all 21 verified TPC-H queries at SF10. vs DuckDB, once its import is staged: DuckDB is faster on most random queries (MXFrame 0.63-0.91x geo. mean) and on 13 of 22 TPC-H queries at SF10 (MXFrame's 22-query total is still lower, 3.27 s vs 5.31 s, from Q21 / Q9 / Q13 / Q1); on shuffled tables DuckDB's SF10 total is lower (5.78 s vs 8.64 s: Q21 4.98 s vs 2.88, Q9, Q18) -> F-046
 
-## F-045 ORDER BY ties outside the native executor [todo]
+## F-045 ORDER BY ties outside the native executor [done]
 Needs: none · Found by the F-043 review
-- [ ] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks)
+- [x] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks). Native order: ORDER BY columns, then every group key ascending (strings by bytes). `GraphCompiler._key_tiebreak` appends the keys to a Sort directly above an Aggregate for every non-native path (fused, kernels, GPU, null-key, base compiler); `tests/test_orderby_ties.py`
+  Open: unaliased derived keys get no tie-break; with a string key added, sort + LIMIT on fallback paths can't use the native top-k (numbers / dates only), so it ranks every row (correct, slower)
+
+## F-059 ORDER BY ties with a Project between Sort and Aggregate [todo]
+Needs: F-045
+- [ ] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate
 
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
 Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong baseline). General fixes only; every slice measured on TPC-H (stored and shuffled) and the random suite, and must not slow any other query. MojoFrame (illinoisdata/MojoFrame, arXiv 2505.04080) checked: its techniques (integer ids for low-cardinality strings, tuple-hash group-by, factorize-then-join) are already covered here; the slices below follow the database literature instead

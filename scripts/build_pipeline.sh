@@ -26,4 +26,5 @@ if [[ "$WHICH" == "all" || "$WHICH" == "gpu" ]]; then
     pixi run mojo build kernels_aot/pipeline_gpu.mojo -I kernels_aot --target-cpu x86-64-v3 \
         --emit shared-lib -o kernels_aot/libmxpipeline_gpu.so
 fi
+bash scripts/set_runpath.sh $(ls kernels_aot/libmxpipeline_*.so kernels_aot/libmxexec_cpu.so)
 echo "built: $(ls kernels_aot/libmxpipeline_*.so kernels_aot/libmxexec_cpu.so | tr '\n' ' ')"

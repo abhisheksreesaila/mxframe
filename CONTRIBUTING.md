@@ -23,7 +23,7 @@ All are built ahead of time, committed, and shipped in the wheel; nothing compil
 | `libmxexec_cpu.so` | `kernels_aot/executor_cpu.mojo` | `bash scripts/build_pipeline.sh exec` |
 | `libmxpipeline_cpu.so`, `libmxpipeline_gpu.so` | `pipeline_cpu.mojo`, `pipeline_gpu.mojo` | `bash scripts/build_pipeline.sh cpu` / `gpu` |
 | `libmxkernels_aot.so`, `libmxkernels_aot_gpu.so` | `kernels_aot.mojo`, `kernels_aot_gpu.mojo` | step 2 of `scripts/release.sh` |
-| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | the `Build:` line in each source's header: `pixi run mojo build kernels_aot/<src>.mojo -I kernels_aot --target-cpu x86-64-v3 --emit shared-lib -o kernels_aot/<lib>.so` |
+| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | the `Build:` line in each source's header: `pixi run mojo build kernels_aot/<src>.mojo -I kernels_aot --target-cpu x86-64-v3 --emit shared-lib -o kernels_aot/<lib>.so`, then `bash scripts/set_runpath.sh kernels_aot/<lib>.so` |
 | `kernels.mojoc` | `kernels/*.mojo` | `bash scripts/build_kernels.sh` (the MAX Graph custom ops) |
 
 ---
@@ -89,6 +89,7 @@ pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
     --emit shared-lib -o kernels_aot/libmxkernels_aot.so
 pixi run mojo build kernels_aot/kernels_aot_gpu.mojo -I kernels_aot \
     --emit shared-lib -o kernels_aot/libmxkernels_aot_gpu.so
+bash scripts/set_runpath.sh   # relocatable RUNPATH on every kernels_aot/*.so (F-036)
 pixi run python3 scripts/_test_aot_smoke.py
 pixi run test
 ```
