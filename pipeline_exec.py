@@ -302,8 +302,8 @@ def split_check(plan, full: bool = True):
     bytecode compiler declines all come out of those, so a split is never predicted for a plan the pipeline
     then declines (F-053 review).
 
-    ``full=False`` stops after the program is compiled (shape, stable keys, the bytecode compiler): enough to
-    name the columns and ask whether they are resident, and it reads no column. The rest (nulls, int64 past
+    ``full=False`` stops after the program is compiled without its exactness bounds (shape, stable keys, the
+    bytecode compiler): enough to name the columns and ask whether they are resident, and it reads no column. The rest (nulls, int64 past
     2^53, integer sums, binding the buffers) passes over the data, so it runs only for the background
     upload and for the run itself; a query whose columns are resident passed it when they were uploaded."""
     from . import coproc_fused
@@ -328,7 +328,7 @@ def split_check(plan, full: bool = True):
     gkeys = tuple(e.args[0] for e in agg_node.group_by)
     if not full:
         try:
-            prog = compile_pipeline(predicates, list(agg_node.aggs), table)
+            prog = compile_pipeline(predicates, list(agg_node.aggs), table, exact_bounds=False)
         except Exception as exc:
             return f"compiling raised {type(exc).__name__}"
         if prog is None:

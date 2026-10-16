@@ -668,8 +668,11 @@ def _cpu_path(d: AutoDecision, plan, calib, gpu):
     if not cf.resident_for(got.source, got.columns, got.gkeys):
         d.upload = True
         # (the background upload runs the full check and drops a plan that fails it)
-        return False, f"{native} (columns not resident on the GPU yet, upload queued; once resident: {sp.explain()})"
-    return True, f"cpu+gpu split ({sp.explain()})"
+        return False, (f"{native} (columns not resident on the GPU yet, upload queued (pending checks); "
+                       f"once resident: {sp.explain()})")
+    # predicted from residency and the light check: the run still checks nulls, int64 range and integer sums
+    # (a resident max(i) says nothing about a later sum(i) past 2^53): a plan it declines runs native
+    return True, f"cpu+gpu split ({sp.explain()}) (pending the run's data checks)"
 
 
 def _choose_device(plan, calib, gpu, prefer, placement, quick):

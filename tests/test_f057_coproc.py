@@ -504,7 +504,7 @@ def test_explain_says_why_not_when_the_split_does_not_win(monkeypatch):
 def test_without_resident_columns_the_query_runs_native_and_queues_the_upload(monkeypatch):
     lf, text = _decide(monkeypatch, data(), resident=False)
     line = next(l for l in text.splitlines() if "cpu path:" in l)
-    assert "native executor (columns not resident on the GPU yet, upload queued; once resident: est " in line
+    assert "native executor (columns not resident on the GPU yet, upload queued (pending checks); once resident: est " in line
     d = am.choose_device(lf.plan, calib=_Calib(100.0, 30.0), gpu=_Warm())
     assert d.upload is True and d.split is False
 
@@ -513,6 +513,11 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     """Deciding a query whose columns are not resident compiles the program and asks residency: no pass over
     int64 columns or integer sums (they cost as much as a native query, on every decision, possibly forever)."""
     scans = []
+    import mxframe.join_engine as je
+    import mxframe.pipeline_program as pp
+    real_mm, real_cb = je._minmax, pp._Builder.col_bound
+    monkeypatch.setattr(je, "_minmax", lambda *a: scans.append("minmax") or real_mm(*a))
+    monkeypatch.setattr(pp._Builder, "col_bound", lambda self, *a: scans.append("col_bound") or real_cb(self, *a))
     real_col, real_sum = pe._column_past_2_53, __import__("mxframe.pipeline_program", fromlist=["x"]).int_sum_inexact
     monkeypatch.setattr(pe, "_column_past_2_53", lambda *a: scans.append("int64") or real_col(*a))
     import mxframe.custom_ops as co
@@ -527,6 +532,20 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     assert "cpu path: cpu+gpu split" in text and scans == []
     # the full check (background upload, the run) does scan
     assert not isinstance(pe.split_check(lf.plan), str) and "int64" in scans and "arrow" in scans
+    assert "minmax" in scans and "col_bound" in scans      # the full check (and the run) do size the integer sum
+
+
+def test_the_light_compile_names_the_same_columns_as_the_real_one():
+    from mxframe.pipeline_program import compile_pipeline
+    t = data(50_000)
+    t = t.append_column("day", pa.array(np.arange(50_000, dtype=np.int32) % 4000))
+    aggs = [col("i").sum().alias("s"), (col("i") * col("j")).sum().alias("p"), col("v").sum().alias("v")]
+    preds = [col("d") > lit(5)]
+    full = compile_pipeline(preds, aggs, t)
+    light = compile_pipeline(preds, aggs, t, exact_bounds=False)
+    assert light.columns == full.columns and light.columns
+    yr = [col("day").year_of_days().sum().alias("y")]
+    assert compile_pipeline([], yr, t, exact_bounds=False).columns == compile_pipeline([], yr, t).columns
 
 
 @needs_native
