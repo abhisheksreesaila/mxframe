@@ -161,6 +161,37 @@ def _num_const(node: sge.Expression) -> Optional[Decimal]:
     return None
 
 
+def _keep_ints(item: sge.Expression) -> None:
+    """Mark the integer literals of an IN (SELECT ...) item: they stay integers in its arithmetic."""
+    for n in item.find_all(sge.Literal):
+        if not n.is_string:
+            n.meta["keep_int"] = True
+
+
+def _type_in(src: sge.Expression, schemas: dict):
+    """The Arrow type of a plain column, resolved through its table alias (or, unqualified, the one FROM item
+    that has the name; None when unknown or ambiguous). ``schemas``: alias -> pa.Schema or None."""
+    src = _unparen(src)
+    if not isinstance(src, sge.Column):
+        return None
+    name = src.name.lower()
+    if src.table:
+        cands = [schemas.get(src.table.lower())]
+    else:
+        cands = list(schemas.values())
+    types = []
+    for sch in cands:
+        if sch is None:
+            if src.table:
+                return None
+            continue
+        for n in sch.names:
+            if n.lower() == name:
+                types.append(sch.field(n).type)
+    unknown = (not src.table) and any(sc is None for sc in cands)
+    return types[0] if len(types) == 1 and not unknown else None
+
+
 def _null_on_empty(n: sge.Expression) -> bool:
     """True when ``n`` is NULL over no rows: aggregates (not COUNT) under + - * / and numeric constants. A
     correlated subquery is decorrelated to an inner join only for such an item."""
@@ -303,7 +334,7 @@ class _SQLTranslator:
         self._ids = itertools.count()
         self._has_star = False
         self._date_lit = False      # translating a comparison with a date32 column: DATE constants are dates
-        self._int_lits = False      # integer literals in arithmetic stay integers (IN (SELECT k + 0 ...))
+        self._alias_schema: dict = {}   # FROM alias -> Arrow schema (None when unknown)
         # comma joins: WHERE conditions not yet used as join keys; (table alias, column) -> its column in
         # the joined plan; aliases and output columns joined so far
         self._conj: List[sge.Expression] = []
@@ -311,10 +342,9 @@ class _SQLTranslator:
         self._joined: set = set()
         self._cur_cols: List[str] = []
 
-    def _child(self, int_lits: bool = False) -> "_SQLTranslator":
+    def _child(self) -> "_SQLTranslator":
         """A translator for a subquery: its own state, the same tables and WITH names."""
         c = _SQLTranslator(self._tables)
-        c._int_lits = int_lits
         c._ctes = dict(self._ctes)
         c._ids = self._ids
         return c
@@ -571,7 +601,30 @@ class _SQLTranslator:
         self._scope_columns.extend(cols)
         alias = table_node.alias_or_name.lower()
         self._table_cols.append((alias, {c.lower() for c in cols}))
+        self._alias_schema[alias] = self._schema_of(table_node, plan)
         return plan, cols
+
+    def _schema_of(self, table_node: sge.Expression, plan: LogicalPlan):
+        """The Arrow schema of a FROM item: a table's own, or (WITH name, derived table) a zero-row run; None if unknown."""
+        if isinstance(table_node, sge.Table) and table_node.name.lower() not in self._ctes \
+                and table_node.name.lower() in self._tables:
+            return self._tables[table_node.name.lower()].schema
+        try:
+            return LazyFrame(plan).schema
+        except Exception:                                    # noqa: BLE001 (unknown type: callers fall back)
+            return None
+
+    def _scope_schemas(self, sel: sge.Select) -> dict:
+        """alias -> schema of every FROM item of a subquery."""
+        items = []
+        if sel.args.get("from_") is not None:
+            items.append(sel.args["from_"].this)
+        items += [j.this for j in sel.args.get("joins") or []]
+        out = {}
+        for it in items:
+            plan, _ = self._child()._source(it)
+            out[it.alias_or_name.lower()] = self._schema_of(it, plan)
+        return out
 
     def _register_ctes(self, with_node) -> None:
         if with_node is None:
@@ -762,20 +815,24 @@ class _SQLTranslator:
         left = self._expr(x).args[0]
         keys, rest = self._correlation(sel, what)
         i = next(self._ids)
-        int_lits = self._in_item_ints(x, item, what)
+        int_lits = self._in_item_ints(x, item, sel, what)
         if keys:
             if negated:
                 raise NotImplementedError("a correlated NOT IN (SELECT ...) is not supported (its NULL rules differ "
                                           "per outer row); use NOT EXISTS")
             _unsupported_shape(sel, what)
             items = [_alias(item, "__in")] + [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
-            inner_plan = self._child(int_lits)._build_select(self._keyed_select(sel, rest, items))
+            if int_lits:
+                _keep_ints(items[0])
+            inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
             return Join(plan, inner_plan, [left] + [self._expr(o).args[0] for o, _ in keys],
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
         new.set("expressions", [_alias(item, "__in")])
         new.set("order", None)
-        inner_plan = self._child(int_lits)._build_select(new)
+        if int_lits:
+            _keep_ints(new.expressions[0])
+        inner_plan = self._child()._build_select(new)
         if not negated:
             return Join(plan, inner_plan, [left], ["__in"], "semi")
         # NOT IN keeps a row with no partner when the subquery is empty, or when it has no NULL and the
@@ -786,7 +843,7 @@ class _SQLTranslator:
         anti = Join(plan, inner_plan, [left], ["__in"], "anti")
         return Filter(anti, (m == lit(1)) | ((m == lit(2)) & (col(left) == col(left))))
 
-    def _in_item_ints(self, x: sge.Column, item: sge.Expression, what: str) -> bool:
+    def _in_item_ints(self, x: sge.Column, item: sge.Expression, sel: sge.Select, what: str) -> bool:
         """Arithmetic in an IN subquery's item makes a float (integer literals are floats there), which cannot
         join an integer key. When the key and every column of the item are integers (and there is no division)
         the item is computed in integers; any other arithmetic against an integer key raises."""
@@ -796,8 +853,9 @@ class _SQLTranslator:
         kt = self._col_type(x)
         if kt is None or not pa.types.is_integer(kt):
             return False
+        inner = self._scope_schemas(sel)
         cols = list(item.find_all(sge.Column))
-        ints = all((t := self._col_type(c)) is not None and pa.types.is_integer(t) for c in cols)
+        ints = all((t := _type_in(c, inner)) is not None and pa.types.is_integer(t) for c in cols)
         lits = all(str(n.this).isdigit() for n in item.find_all(sge.Literal) if not n.is_string)
         if ints and lits and not any(isinstance(n, sge.Div) for n in item.walk()):
             return True
@@ -1255,14 +1313,8 @@ class _SQLTranslator:
     # ------------------------------------------------------------------
 
     def _col_type(self, src: sge.Expression):
-        """The Arrow type of a plain column of one of the tables (looked up by name), else None."""
-        src = _unparen(src)
-        if isinstance(src, sge.Column):
-            for tbl in self._tables.values():
-                names = {n.lower(): n for n in tbl.schema.names}
-                if src.name.lower() in names:
-                    return tbl.schema.field(names[src.name.lower()]).type
-        return None
+        """The Arrow type of a plain column of this query's FROM items, through its alias; else None."""
+        return _type_in(src, self._alias_schema)
 
     def _is_date_col(self, src: sge.Expression) -> bool:
         t = self._col_type(src)
@@ -1323,7 +1375,7 @@ class _SQLTranslator:
         operands of Add/Sub/Mul/Div avoids int64 vs float32 dtype mismatches in
         the MAX graph.
         """
-        if self._int_lits:
+        if isinstance(node, sge.Literal) and node.meta.get("keep_int"):
             return self._expr(node)
         if isinstance(node, sge.Literal) and not node.is_string:
             return lit(float(node.this))

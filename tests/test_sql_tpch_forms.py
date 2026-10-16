@@ -39,7 +39,8 @@ def _tables():
                                     "pending green", "special", "requests", "x"])})
     dd = pa.table({"k": pa.array([1, 2, 3], pa.int64()),
                    "dt": pa.array([date(1994, 5, 1), date(1995, 6, 7), date(1996, 7, 8)], pa.date32())})
-    return dict(n=n, r=r, s=s, c=c, l=l, dd=dd)
+    fe = pa.table({"f": pa.array([0.001, 0.0015, 0.003, 0.5], pa.float64())})
+    return dict(n=n, r=r, s=s, c=c, l=l, dd=dd, fe=fe)
 
 
 TABLES = _tables()
@@ -257,3 +258,29 @@ DATE32 = [
 @pytest.mark.parametrize("q", DATE32)
 def test_date_literal_against_a_real_date32_column(q):
     _check(q)
+
+
+def test_an_exponent_literal_is_not_an_integer_constant():
+    """`1e-3 * 2` is 0.002 (it used to be folded to the integer 0, so every row passed)."""
+    got = mx.sql("SELECT f FROM fe WHERE f > 1e-3 * 2", **TABLES).compute(device="cpu")
+    assert sorted(got.column("f").to_pylist()) == [0.003, 0.5]
+    _check("SELECT f FROM fe WHERE f > 1e-3 * 2")
+
+
+def test_a_column_name_shared_by_two_tables_is_typed_through_its_own_table():
+    """Both tables have `d`: p's is a date32, q's an int32 day number. The type comes from the table the
+    query names, not from the first table that has the name."""
+    p = pa.table({"k": pa.array([1, 2, 3], pa.int64()),
+                  "d": pa.array([date(1994, 5, 1), date(1995, 6, 7), date(1996, 7, 8)], pa.date32())})
+    q = pa.table({"k": pa.array([1, 2, 3], pa.int64()),
+                  "d": pa.array([_days(1994, 5, 1), _days(1995, 6, 7), _days(1996, 7, 8)], pa.int32())})
+    con = duckdb.connect()
+    con.register("p", p)
+    con.register("_q", q)
+    con.execute("CREATE VIEW q AS SELECT k, DATE '1970-01-01' + d AS d FROM _q")
+    for text in ("SELECT q.k FROM q, p WHERE q.k = p.k AND q.d >= DATE '1995-01-01'",
+                 "SELECT q.k, EXTRACT(year FROM q.d) AS y FROM q",
+                 "SELECT p.k FROM q, p WHERE q.k = p.k AND p.d >= DATE '1995-01-01'"):
+        want = sorted(con.execute(text).fetchall())
+        got = mx.sql(text, p=p, q=q).compute(device="cpu")
+        assert sorted(zip(*[got.column(i).to_pylist() for i in range(got.num_columns)])) == want, text

@@ -294,5 +294,11 @@ def test_an_aggregate_inside_a_subquery_in_where_is_not_an_outer_aggregate():
     assert got.column("k").to_pylist() == [4]
 
 
+def test_integer_literals_apply_to_the_in_item_only_not_to_the_subquerys_where():
+    """`w / 2 > 1` inside the subquery is SQL division (1.5 > 1), not an integer one that floors."""
+    _check("SELECT k, v FROM t WHERE k IN (SELECT k * 1 FROM u WHERE w / 2 > 1)")
+    _check("SELECT k, v FROM t WHERE k IN (SELECT k FROM u GROUP BY k HAVING SUM(w) / 2 > 1)")
+
+
 def test_a_correlated_aggregate_combined_by_arithmetic_is_still_decorrelated():
     _check("SELECT k, v FROM t WHERE v > (SELECT 2 * MAX(y) - MIN(y) / 2 FROM u WHERE u.k = t.k)")
