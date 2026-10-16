@@ -317,6 +317,33 @@ def test_group_encoding_over_the_budget_hands_back_to_the_cpu_encoder(monkeypatc
     assert r.lines[0].startswith("group encode: ran on CPU, needs about ")
 
 
+def test_strict_raises_for_the_pieces_inside_error_swallowing_handlers(monkeypatch):
+    """range5 and group encode sit in `except Exception` blocks that continue on a CPU path."""
+    keys = pa.array((np.arange(N) % 50).astype(np.int32))
+    comp = custom_ops.CustomOpsCompiler(device="gpu")
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "1M")
+    with gpu_budget.track(strict=True, device="gpu"), pytest.raises(MemoryError, match="group encode: needs about"):
+        comp._build_group_ids_gpu_single_int(keys, "k", N)
+
+    monkeypatch.setenv("MXFRAME_FUSED_PIPELINE", "0")          # the Q6 shape reaches range5 only without
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")                  # the fused pipeline and the native executor
+    rng = np.random.default_rng(5)
+    t = pa.table({"d": rng.integers(0, 100, N).astype(np.int32), "f": rng.random(N, dtype=np.float32),
+                  "u": (rng.random(N) * 50).astype(np.float32), "a": rng.random(N, dtype=np.float32),
+                  "b": rng.random(N, dtype=np.float32)})
+    from mxframe.lazy_frame import Aggregate
+    pred = ((col("d") >= 10) & (col("d") < 60) & (col("f") >= 0.2) & (col("f") <= 0.7) & (col("u") < 24.0))
+    lf = LazyFrame(Aggregate(LazyFrame(t).filter(pred).plan, [], [(col("a") * col("b")).sum().alias("r")]))
+    with pytest.raises(MemoryError, match="range5 sum-product: needs about"):
+        lf.compute(device="gpu", strict=True)
+    got, _ = run(lf, "gpu", monkeypatch)
+    assert pieces(lf)[0].startswith("range5 sum-product: left the fused GPU path, needs about ")
+    m = (t["d"].to_numpy() >= 10) & (t["d"].to_numpy() < 60) & (t["f"].to_numpy() >= np.float32(0.2)) \
+        & (t["f"].to_numpy() <= np.float32(0.7)) & (t["u"].to_numpy() < np.float32(24.0))
+    want = (t["a"].to_numpy()[m].astype(np.float64) * t["b"].to_numpy()[m]).sum()
+    assert abs(got.column("r")[0].as_py() - want) < 1e-3 * want
+
+
 @pytest.mark.parametrize("kernel, name", [("join_count_i32_gpu", "join"), ("sort_topk_i32_gpu", "top-k")])
 def test_a_join_or_sort_that_runs_out_of_memory_reruns_on_the_cpu_and_is_remembered(tables, monkeypatch, kernel, name):
     lf, sql = QUERIES[name](*tables)

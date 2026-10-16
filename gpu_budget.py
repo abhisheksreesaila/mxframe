@@ -105,6 +105,12 @@ _remembered: dict = {}        # (piece, shape) that ran out of GPU memory -> fre
 _warned: set = set()
 
 
+def strict() -> bool:
+    """True inside a `compute(strict=True)`: handlers that swallow errors must let a MemoryError through."""
+    run = _run.get()
+    return bool(run and run.strict)
+
+
 def forget() -> None:
     _remembered.clear()
     _warned.clear()
@@ -121,13 +127,15 @@ def track(strict: bool = False, device: str = "gpu"):
 
 
 def run_piece(name: str, need: int, gpu: Callable, cpu: Callable, *, shape=None,
-              retry: Optional[Callable] = None):
+              retry: Optional[Callable] = None, left: str = "ran on CPU"):
     """Run one GPU piece with the memory safety net described at the top of this module.
 
     name:  what the piece is ("aggregate", "join", "sort", "gather"), shown in provenance and explain
     need:  estimated device bytes of `gpu()`
     gpu:   the GPU attempt; cpu: the exact CPU rerun; retry: an optional GPU attempt with half the working set
     shape: hashable key of the piece's size, for remembering a failure
+    left:  how the line says the piece left the GPU (a caller that continues on a CPU path of its own
+           says so instead of "ran on CPU")
     """
     run = _run.get() or Run()
     key = (name, shape)
@@ -139,7 +147,7 @@ def run_piece(name: str, need: int, gpu: Callable, cpu: Callable, *, shape=None,
                   "out of memory": f"ran out of GPU memory (needed about {fmt_bytes(need)}): {err}"}[why]
         if run.strict:
             raise MemoryError(f"{name}: {detail}")
-        line = f"{name}: ran on CPU, {detail}"
+        line = f"{name}: {left}, {detail}"
         run.events.append({"piece": name, "action": "cpu", "why": why, "need": need, "free": free, "line": line})
         if run.device == "gpu" and key + (why,) not in _warned:
             _warned.add(key + (why,))

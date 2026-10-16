@@ -1163,11 +1163,14 @@ class CustomOpsCompiler(GraphCompiler):
                     "range5 sum-product", sum(a.nbytes for a in r5) + 4096,
                     lambda: self._aot_gpu.range5_sum_product_f32(
                         *r5, int(int_lo), int(int_hi), float(float_lo), float(float_hi), float(upper_hi)),
-                    gpu_budget.leave_gpu, shape=(N, len(r5)))
+                    gpu_budget.leave_gpu, shape=(N, len(r5)), left="left the fused GPU path")
                 if value == 0.0:
                     raise ValueError("no row passed: the general path below returns SQL's NULL")
                 name = agg_node.aggs[0]._alias or "agg_0"
                 return pa.table({name: _npa([value], type=pa.float64())})
+            except MemoryError:
+                if gpu_budget.strict():
+                    raise
             except Exception:
                 pass
 
@@ -4082,6 +4085,10 @@ class CustomOpsCompiler(GraphCompiler):
             unique_keys = pc.take(col_arr, _npa(first_occurrence))
             return dense_ids, n_groups, {key_name: unique_keys}
 
+        except MemoryError:
+            if gpu_budget.strict():
+                raise
+            return None  # fall back to CPU path
         except Exception:
             return None  # fall back to CPU path
 
