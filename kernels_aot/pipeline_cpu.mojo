@@ -31,7 +31,10 @@ Program/ABI contract (keep in sync with pipeline_program.py):
   integer in chunk-table column `slot` (the native executor's string predicates, F-031),
   6 | (slot << 8) = utf8 offsets (int32; the column's base address is rebased like any other) plus, in
   chunk-table columns `slot`, `slot + 1`, `slot + 2`: the chunk's bytes address, its validity bitmap
-  address (0 = no nulls) and the bit index of row 0 of the chunk table's row numbering (F-034)
+  address (0 = no nulls) and the bit index of row 0 of the chunk table's row numbering (F-034),
+  7 | (slot << 8) = a column only tested by ISNULL (F-097): its values are never read (its chunk-table
+  address is unused); chunk-table columns `slot`, `slot + 1` hold the chunk's validity bitmap address
+  (0 = no nulls) and the bit index of row 0, as for dtype 6
   chunk table int64[n_chunks, 2 + n_cols]: row_start, row_end, then per column the
                     chunk's base address minus row_start * itemsize, so that
                     `addr + row * itemsize` is valid for every row of the chunk
@@ -45,7 +48,7 @@ Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero
-from max.algorithm import parallelize
+from _fpenv import par, par_n
 from std.sys import simd_width_of
 from std.atomic import Atomic
 from std.math import floor
@@ -94,6 +97,7 @@ comptime OP_IN_SET = 37
 comptime OP_CMPC = 38
 comptime OP_ROWID = 39      # the row's number in the whole input (SELECT DISTINCT: first appearance, F-033)
 comptime OP_STR = 40        # a plain utf8 column LIKE a pattern (F-034)
+comptime OP_ISNULL = 41     # the column's validity bit is clear (F-097)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -455,6 +459,18 @@ def _like_general(s: BP, L: Int, pat: BP, pl: Int) -> Bool:
     return pi == pl
 
 
+def _is_null(d: FP, valid_addr: Int, bit_base: Int, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    """d[j] = 1.0 where row j is NULL (its validity bit is clear), 0.0 where it is not or the chunk has no bitmap."""
+    if valid_addr == 0:
+        for j in range(n):
+            d[j] = 0.0
+        return
+    var valid = _bp(valid_addr)
+    for j in range(n):
+        var bit = bit_base + i0 + (Int(sel[j]) if use_sel else j)
+        d[j] = 1.0 if ((Int(valid[bit >> 3]) >> (bit & 7)) & 1) == 0 else 0.0
+
+
 def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: Int, pat: BP, pl: Int,
               negate: Bool, isin: Bool, i0: Int, sel: IP, use_sel: Bool, n: Int):
     """d[j] = 1.0 if row j's string matches the pattern (negated: does not), 0.0 for a NULL string.
@@ -640,6 +656,9 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             _str_like(d, Int(cols[c]), Int(cols[slot]), Int(cols[slot + 1]), Int(cols[slot + 2]),
                       p.set_bytes + Int(p.set_meta[si * 3]), Int(p.set_meta[si * 3 + 1]), (Int(ins[4]) & 1) != 0,
                       (Int(ins[4]) & 2) != 0, i0, sel, use_sel, n)
+        elif op == OP_ISNULL:
+            var slot = Int(p.dtypes[Int(ins[2])]) >> 8        # dtype 7 | (slot << 8): validity bitmap, bit base
+            _is_null(d, Int(cols[slot]), Int(cols[slot + 1]), i0, sel, use_sel, n)
         elif op == OP_ROWID:
             # i0 is the block's first row in the whole input (the column bases are rebased to it); sel
             # holds the block offsets of the rows kept so far
@@ -1122,7 +1141,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             # A host process (Python via ctypes) has no Mojo async runtime yet:
             # create the global CPU device (thread pool) once, then parallelize.
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(lworker, nthreads)
+            par(lworker, nthreads)
 
         # merge worker partials into the output (parallel over group ranges when there are many groups)
         def lmerge(chunk: Int) {imm}:
@@ -1152,7 +1171,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
 
         var merge_chunks = 0 if shared else (G + LEGACY_MERGE_GROUPS - 1) // LEGACY_MERGE_GROUPS
         if nthreads > 1 and merge_chunks > 1:
-            parallelize(lmerge, merge_chunks, nthreads)
+            par_n(lmerge, merge_chunks, nthreads)
         else:
             for chunk in range(merge_chunks):
                 lmerge(chunk)
@@ -1332,11 +1351,11 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             ctl[0] = Int64(wave0)
             ctl[1] = Int64(min(nslots, morsels - wave0))
             counter[0] = 0
-            parallelize(stage_morsels, nthreads)
+            par(stage_morsels, nthreads)
             if failed[0] != 0:
                 break
             counter[0] = 0
-            parallelize(apply_bins, nthreads)
+            par(apply_bins, nthreads)
             wave0 += nslots
         for w in range(nthreads):
             var st = wst + w * 8
@@ -1420,12 +1439,12 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
         if nthreads == 1:
             worker(0)
         else:
-            parallelize(worker, nthreads)
+            par(worker, nthreads)
         if failed[0] != 0:
             break
         if A > 0:
             if nthreads > 1 and merge_chunks > 1:
-                parallelize(merge, merge_chunks, nthreads)
+                par_n(merge, merge_chunks, nthreads)
             else:
                 for chunk in range(merge_chunks):
                     merge(chunk)

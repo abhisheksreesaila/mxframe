@@ -87,9 +87,10 @@ class _Driver:
 
 def _driver() -> _Driver:
     global _drv
-    with _lock:
-        if _drv is None:
-            _drv = _Driver()
+    if _drv is None:         # lock-free once built: a finalizer may run inside the init (F-107)
+        with _lock:
+            if _drv is None:
+                _drv = _Driver()
     _drv.bind()
     return _drv
 

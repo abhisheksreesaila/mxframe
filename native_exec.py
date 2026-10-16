@@ -219,20 +219,24 @@ class _Extras:
     """The chunk table's extra words after a program's columns (one set per chunk): a string column held as
     dictionary codes (dtype 5) has its dictionary's offset in the concatenation of all chunks' dictionaries;
     a plain utf8 column (dtype 6, ``OP_STR``) has three: the chunk's bytes address, its validity bitmap address
-    (0: no nulls) and the bit index of the chunk table's row 0 in that bitmap (F-034)."""
+    (0: no nulls) and the bit index of the chunk table's row 0 in that bitmap (F-034). A column only tested by
+    ``OP_ISNULL`` (dtype 7) has the last two (F-097); its values are never read."""
 
     def __init__(self, prog):
         self.prog = prog
         self.dcols = [c for c in prog.columns if c in prog.dict_concat]
         self.scols = list(prog.str_cols)
-        self.n = len(self.dcols) + 3 * len(self.scols)
+        self.ncols = list(prog.null_cols)
+        self.n = len(self.dcols) + 3 * len(self.scols) + 2 * len(self.ncols)
         base = len(prog.columns)
         self.slot = {c: base + i for i, c in enumerate(self.dcols)}
         self.slot.update({c: base + len(self.dcols) + 3 * i for i, c in enumerate(self.scols)})
+        self.slot.update({c: base + len(self.dcols) + 3 * len(self.scols) + 2 * i for i, c in enumerate(self.ncols)})
 
     def dtype(self, name: str) -> Optional[int]:
         """The program column's dtype word if it is one of these string columns, else None."""
-        return (((5 if name in self.prog.dict_concat else 6) | (self.slot[name] << 8)) if name in self.slot else None)
+        code = 5 if name in self.prog.dict_concat else 7 if name in self.ncols else 6
+        return (code | (self.slot[name] << 8)) if name in self.slot else None
 
     def words(self, piece_of, row0: int) -> list:
         """The extra words of one chunk; ``piece_of(name)`` is the column's slice in it, ``row0`` its first row."""
@@ -243,6 +247,11 @@ class _Extras:
             bufs = a.buffers()
             out += [bufs[2].address if bufs[2] is not None else 0,
                     bufs[0].address if bufs[0] is not None and a.null_count else 0, a.offset - row0]
+        for n in self.ncols:
+            a = piece_of(n)
+            a = a.indices if pa.types.is_dictionary(a.type) else a          # a dictionary column's validity is its indices'
+            bitmap = a.buffers()[0]
+            out += [bitmap.address if bitmap is not None and a.null_count else 0, a.offset - row0]
         return out
 
     def patch(self, code):
@@ -1480,8 +1489,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         return _decline("expression not supported by the bytecode compiler")
     if prog.dict_arrays:
         return _decline("string predicates outside concat mode")
-    if prog.str_cols:
-        return _decline("plain string predicate over joined columns")
+    if prog.str_cols or prog.null_cols:
+        return _decline("plain string predicate or IS NULL over joined columns")
     key_slot = {}
     for j, i in enumerate(sorted(derived)):
         slot = prog.outputs[n_user + j][2]

@@ -815,10 +815,13 @@ Found by the F-077 review (2026-10-16); a silent wrong answer on main
 - [ ] DuckDB-checked tests: float partition key with NaN (two payloads), -0.0 / 0.0, NULL, ±inf; sum / count / rank over it; fails before
 - [ ] window `min` / `max` (numpy) propagate NaN; DuckDB's MAX is NaN when the frame holds one and MIN skips it (F-070 rule) (found by the F-070 developer)
 
-## F-082 Denormal floats are not flushed to zero [todo]
+## F-082 Denormal floats are not flushed to zero [done]
 Found by the F-070 developer (2026-10-16); a silent wrong answer
-- [ ] with `MXFRAME_NATIVE=0` on 200,000 rows, `fused_pipeline_cpu` reads the denormal 5e-324 as 0 (`x > 0.0` counts 0 of 100,000): a flush-to-zero / denormals-are-zero mode in the CPU pipeline kernel (or its compile flags). Find where FTZ/DAZ is set; every CPU and GPU path compares and sums denormals like DuckDB
-- [ ] DuckDB-checked tests: filters and sums over denormals (5e-324, 2.2e-308), each CPU path forced (native, fused pipeline, Arrow) and GPU; fails before
+- [x] cause: Mojo's `parallelize` / `sync_parallelize` run every task with FTZ + DAZ set (MXCSR 0x9FE0, read with `stmxcsr` inside a task; main thread 0x1FA0). Not a compile flag, not a float32 conversion, not fast-math: any kernel that fanned out over threads read 5e-324 (and float32 1e-45) as 0. `fused_pipeline_cpu` fanned out from ~200,000 rows; the native executor, hash aggregate, group keys and joins from larger inputs (native: 20M rows `x > 0.0` counted 0 of 10M). The GPU kernels (float64 and float32), Arrow and the single-thread paths were right
+- [x] fix at the root: `kernels_aot/_fpenv.mojo` (`par`, `par_n`, `sync_par`) resets MXCSR to 0x1F80 at the start of every task; every `parallelize` / `sync_parallelize` in executor_cpu, pipeline_cpu, hashagg_cpu, groupkeys_cpu, joinsemi_cpu and kernels_aot now goes through it. Rebuilt with `scripts/build_pipeline.sh` (cpu, keys, join, aot) and hashes recorded. Rule: never call `parallelize` directly in kernels_aot
+- [x] DuckDB-checked tests (`tests/test_f082_denormals.py`): 5e-324, 2.2e-308 / 2, -5e-324, float32 1e-45, 1.1e-38, -1e-45 mixed with zeros and normals over 200,000 rows; filters (count, sum, grouped, 5000 groups), sums, min / max, row filter, float64 and float32, with and without NULLs, cpu native on / off and gpu; 68 fail on main's libraries (all cpu), all pass now
+- [ ] quiet-machine speed check (not run: shared machine): the wrapper adds one `ldmxcsr` per task (and per chunk for `par_n`). Compare SF1 / SF10 Q1, Q6, Q18 and the group-key / join micro-benchmarks before and after F-082 in fresh processes (median of several, load < 2); expect no change
+- [ ] follow-up (found while testing): the SQL front end fails on a scientific literal without a dot (`x > 1e-310` raises `ValueError: invalid literal for int()`; `sql_frontend.py` `lit(int(v)) if "." not in str(v)`), and a float32 column compared with a float64 literal casts the literal to float32 (`x between -1e-30 and 1e-30` on float32 keeps the row holding float32(1e-30), DuckDB compares as double and drops it)
 
 ## F-083 ORDER BY a column not in the select list [done]
 Found by the F-070 developer (2026-10-16)
@@ -867,12 +870,12 @@ Found by the F-083 review (2026-10-16)
 - [x] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
 
 - Review (2026-10-16): PASS. Follow-up fixed in the main session: `AOTKernelsGPU.gather_table` with no indices launched a 0-block grid (`gather_i32_gpu failed with status -1`); it returns `table.slice(0, 0)` now (`test_gather_table_with_no_indices_returns_an_empty_table`, fails before). Other per-`n` GPU wrappers in `aot_kernels.py` can launch 0 blocks the same way; no query shape reaches them with n = 0 today
-## F-090 IN (SELECT max(i) ...) join key types differ [todo]
+## F-090 IN (SELECT max(i) ...) join key types differ [done]
 Found by the F-083 review (2026-10-16)
 - [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB
 - [ ] DuckDB-checked tests: IN / NOT IN over max / min / sum / count subqueries against int and float columns; fails before
 
-## F-091 Window lag / lead: NULL stays NULL [todo]
+## F-091 Window lag / lead: NULL stays NULL [done]
 Found by the F-084 review (2026-10-16); a silent wrong answer on main
 - [ ] `lag(v)` over `[1, NULL, 3]` gives `[nan, 1.0, nan]`; DuckDB `[NULL, 1.0, NULL]`: lag / lead turn NULL into NaN and fill with NaN. Shift the Arrow array with its validity (fill NULL, or the given default); keep the input dtype
 - [ ] DuckDB-checked tests: lag / lead with offsets 1 and 2, defaults, partitions, ORDER BY with NaN / NULL keys (F-084 order), int / float / string columns; fails before
@@ -882,15 +885,17 @@ Found by the F-086 developer (2026-10-16)
 - [x] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
 - [x] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
 
-## F-093 MIN / MAX of a date column [todo]
+## F-093 MIN / MAX of a date column [done]
 Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+- Note: a date64 input keeps date64 (DuckDB returns date32); a tz timestamp keeps its zone.
 
-## F-094 SQL modulo operator [todo]
+## F-094 SQL modulo operator [done]
 Found by the F-087 developer (2026-10-16)
-- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
-- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+- [x] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [x] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+Done: DuckDB probed (sign follows the dividend; integer `% 0` is NULL, float `% 0.0` is NaN; NULL in, NULL out; NaN stays NaN; `x % inf` is x). New `mod` Expr op (`np_arrow.modulo`, fmod) on the Arrow path: the arrays decide integer or float arithmetic (integers keep their type, uint64 and signed/unsigned mixes are exact, a decimal literal such as `% 2.5` is exact against integers and its zero divisor is NULL); the native bytecode has no modulo and declines it (`Unsupported`), the GPU runs it through the Arrow Project. `tests/test_sql_modulo.py` (162 DuckDB-checked, cpu + gpu, result kinds compared). Left alone: COALESCE / IS NULL over expressions is F-100. Found on the way, not fixed: `int_col + 1` (an integer literal in + - *) returns double where DuckDB returns an integer (`_float_expr` promotes the literal), so `(a + 1) % 0` is NaN, not NULL, and past 2^53 it rounds; needs its own ticket. A decimal literal (a point, no exponent; `1e3` is DOUBLE) is exact against integers as ((x % k) * s % k) / s in NumPy (about 20 ms per 1M rows on the loaded machine); it raises past k * s > int64 (a literal with ~19 digits). Still a Python loop: modulo of uint64 mixed with signed values (exact, slow on millions of rows).
 
 ## F-095 SQL over tables with uppercase or quoted column names [todo]
 Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
@@ -903,10 +908,13 @@ Found by the F-087 developer (2026-10-16)
 - [ ] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
 - [ ] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
 
-## F-097 IS NULL skips row groups with no NULLs [todo]
+## F-097 IS NULL skips row groups with no NULLs [done]
 From the F-086 review (2026-10-16); a speedup, not a bug
-- [ ] `scan_parquet` never pushes `is_null` / `not is_null`: a row group whose `null_count` is 0 can be skipped for IS NULL (and one whose `null_count == num_values` for IS NOT NULL); a missing `null_count` statistic must never skip. Native validity test in the bytecode filter (so IS NULL filters stay native) belongs here too
-- [ ] tests: row groups skipped (counted), missing statistics not skipped, answers equal DuckDB; fails before
+- [x] `scan_parquet` pushes `is_null` / `not is_null` (`io_parquet._pushable`, ops `isnull` / `notnull`): a row group whose `null_count` is 0 is skipped for IS NULL, one whose `null_count` equals its rows for IS NOT NULL; a missing `null_count` statistic never skips. Composes with the other ANDed pushed conjuncts; an OR is not pushed at all (as before for every conjunct kind)
+- [x] native validity test in the bytecode: `OP_ISNULL` (41) reads the column's Arrow validity bitmap (chunk offsets and slices through the bit base, a dictionary column through its indices); the column's values are never read, so it may hold NULLs, of any integer / float / bool / temporal / decimal / utf8 / dictionary-utf8 type. `_Extras` gives such a column dtype 7 and two words (bitmap address, bit base). Native executor only (`concat_dicts`): the fused pipeline and GPU compilers still decline it. A column both tested and read for its values declines (as before); an aggregate whose only use of a nullable column is `IS NULL` is no longer sent to Arrow's null path before the executor (`_arrow_aggregate_reason`, early call only: the late call still catches it when every pipeline declined)
+- [x] tests (`tests/test_f097_is_null.py`): row groups read counted from the resolved scan, missing statistics not skipped, native path asserted (`native_filter`, `native`), answers equal DuckDB with NULLs on one-chunk, multi-chunk (odd cuts) and sliced (bit offset 3) tables, cpu and gpu; the pruning and native tests fail on main
+- [ ] quiet-machine speed check (not run: shared machine): `scan_parquet` of a 50M-row file in 50k-row groups with NULLs in 2 groups, `WHERE x IS NULL`: bytes read and wall time vs main (expect ~ groups with nulls / all groups); and `SELECT g, count(*) FROM t WHERE x IS NULL GROUP BY g` on a 10M-row table with 10% NULLs in memory: native vs the Arrow path on main (`MXFRAME_NATIVE=0` approximates it), median of 5 fresh-process runs, load < 2
+- Not done, for a follow-up: comparisons on nullable columns stay on the Arrow path. A comparison with a NULL operand is NULL and keeps no row, so under AND / OR it can be 0.0 (a NULL-masked compare: `cmp & valid(a) & valid(b)`, exact because filters drop NULL like false); NOT of it is the hard part (NOT NULL is NULL, not true), so it needs a three-valued AND / OR / NOT or a "known false" mask, or a decline while a NOT is above a nullable compare (what `OP_STR` does with `_neg`). Also the native filter still declines when an OUTPUT column has NULLs (no validity gather), so `SELECT * ... WHERE x IS NULL` over a nullable table is Arrow; only filters that output null-free columns, and aggregates, stay native
 
 ## F-098 OFFSET without LIMIT: no sentinel row count [todo]
 From the F-087 review (2026-10-16)
@@ -933,10 +941,14 @@ Found by the F-090 review (2026-10-16); a missing column on main
 - [ ] `SELECT * FROM t JOIN v ON t.i = v.x` (and the comma form `FROM t, v WHERE t.i = v.x`) leaves out `x` entirely, even when both keys are the same type; DuckDB keeps both columns. The comma form also reads `v.x` as the left key, so its type is the left side's (values equal, -0.0 shows as 0). Keep the right key as its own output column (USING / NATURAL keep one, like DuckDB)
 - [ ] DuckDB-checked tests: SELECT * and SELECT v.x over JOIN ON, comma join, USING; same-type and int-vs-float keys; LEFT JOIN with unmatched rows (right key NULL, F-086); fails before
 
-## F-103 SQL integer column plus integer literal stays integer [todo]
+## F-103 SQL integer column plus integer literal stays integer [done]
 Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
-- [ ] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
-- [ ] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
+- [x] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
+- [x] F-094 cases for the tests: `(a - 1) % 10` with `a` past 2^53 raises ArrowInvalid (`a - 1` is computed as a float), and `m % 0` over `(SELECT i32 + 1 AS m ...)` gives NaN instead of NULL
+- [x] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
+- Built: `_arith_operand` / `_is_int_expr` in `sql_frontend.py`. `_float_expr` promoted every literal because the MAX graph (`compiler._visit_expr`) cannot add an int64 constant to a float32 column. Now + - * keeps integers when both operands are certainly integers (integer literal, integer column of a known table, nested + - * / negation of those); anything else (float, aggregate, unresolved name, `/`) promotes exactly as before. A negative literal folds to `lit(-n)` (it was `0 - 1`, a float32 scalar that broke `i + -1`). `tests/test_sql_int_literal_arith.py` (74, native and Arrow, 58 fail on main). Exactness and checked overflow come from the existing F-037 bounds / F-061 kernels: native compiles small ints and declines past 2^53. Result width: Arrow widens `int32 + literal` to int64 where DuckDB keeps INTEGER (integer either way).
+- Review round 1: merged main (F-094 `%`); `_is_int_expr` also takes `%` of integers, COUNT and integer MIN / MAX, so a big literal next to them stays exact; negation folds any constant (`-(-1)`, `- -1`). SUM is not treated as integer: the engine still returns it as a double (F-060), so `sum(s) + 9007199254740993` rounds until F-060 lands. Tests for `(i - 1) % 10`, `m % 0` over a subquery, and small-int queries staying native.
+- Found, not fixed: global / grouped `max(i)` / `min(i)` on int64 past 2^53 returns double (or raises "not in range" for `min(i + 1)`); `int64 + float_col` past 2^53 raises ArrowInvalid instead of rounding to double like DuckDB; `%`, `//` unsupported (F-094); `-s` on int32 gives int64; `sum(int32)` is double (F-060).
 
 ## F-104 Chained LEFT JOIN on the previous right table's key [review]
 Found by the F-086 review (2026-10-16); a silent wrong answer on main
@@ -948,3 +960,27 @@ Found by the F-086 review (2026-10-16); a silent wrong answer on main
 Seen in the F-086 review (2026-10-16)
 - [ ] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
 - [ ] DuckDB-checked tests: string / date / int / mixed-number CASE results, with ELSE and without (NULL), in SELECT / GROUP BY / ORDER BY; fails before
+
+## F-106 SQL float literals: scientific notation and float32 columns [todo]
+Found by the F-082 developer (2026-10-16)
+- [ ] a scientific literal without a dot (`x > 1e-310`, `x < 2E5`) raises ValueError: `sql_frontend` does `lit(int(v)) if "." not in str(v)`. Parse numeric literals by their SQL type (sqlglot's `is_int` / `is_number`), not by looking for a dot
+- [ ] a float32 column compared with a float64 literal casts the literal to float32: `x between -1e-30 and 1e-30` keeps the row holding float32(1e-30), DuckDB drops it. Compare in the wider type (widen the column, as DuckDB does) on every path (native bytecode, Arrow, GPU)
+- [ ] DuckDB-checked tests for both; fails before
+
+## F-107 Test process hangs on a futex while other suites share the GPUs [review]
+Seen four times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run, F-103 developer): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes
+- [ ] (no dump was ever captured) capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
+- [x] from the dump, find the waiting lock(s); if it is ours, fix the lock order and add a stress test (concurrent queries + background upload + warm-up); if it is the driver under cross-process contention, document it and make the GPU tests serialize on a file lock
+
+Finding (no dump was captured: the stack "try_split -> thread start" is the F-103 developer's report of what they saw; the cause was found by reading the lock sites and reproduced): `coproc_fused._evict`, the `weakref.finalize` callback on a cached input's owner, took the non-reentrant `coproc_fused._lock`. A finalizer runs on whichever thread drops the last reference or runs the cyclic GC, and a GC can start at any allocation, including inside `with _lock:` (`_start_thread` holds it across `Thread.start()`, which allocates; so does every other locked block). The thread then waits for itself: main thread idle, all other threads parked in `futex_do_wait`, last stack in `try_split` -> thread start. Load only changes when the GC fires. Not the CUDA driver, not cross-process.
+Fix: `_evict` never blocks; it queues the key and evicts at once when the lock is free, else `_drain_evictions()` (blocking, called before every cache lookup: `_acquire`, `_start_upload`, `resident_for`, `clear_residency`) does it, so a dead owner's entry is still never found. Same pattern removed in `aot_kernels._get_cuda_driver` and `gpu_stream._driver` (DeviceArray `__del__` calls them while the init holds their lock): lock-free fast path once built.
+Tests: tests/test_f107_lock_reentry.py (3 deterministic, child processes with timeouts; two hung before the fix) and tests/test_f107_stress.py (a child process: 4 threads of concurrent `device="auto"` computes on fresh 400k-row tables, each queueing a resident upload, with the GPU warm-up running and the cyclic GC firing at nearly every allocation; a watchdog dumps all stacks with faulthandler and exits 97 when no compute finishes for 60 s). Short by default (48 computes, 2 s); `MXFRAME_F107_STRESS=1`: 6 threads x 1000 (6000 computes, ~75 s). Before the fix the long run stalled within the same time with the watchdog dump in `coproc_fused.resident_for -> deferred_background.flush -> request_upload -> _start_upload`; after the fix it passes.
+Full suite on this branch while other suites shared the GPUs (load 13-19): 10348 passed, 198 skipped, 4 xfailed in 15:51, no hang and no faulthandler dump (log kept at /tmp/f107_full.log).
+Review round 1: also drain in `begin_prepare` and `resident_count`; comment at `_dead_keys` on why a queued key cannot hit a new owner's entry.
+
+## F-108 SQL TIMESTAMP literals and temporal expressions in aggregates [todo]
+Found by the F-093 developer (2026-10-16)
+- [ ] `TIMESTAMP '2024-01-01 10:00:00'` (and `CAST('...' AS TIMESTAMP)`) is unsupported in the SQL front end (`Unsupported SQL expression type: Cast ... TIMESTAMPNTZ`); map to a timestamp literal compared in the column's unit and zone like DuckDB
+- [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
+- [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
+- [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before

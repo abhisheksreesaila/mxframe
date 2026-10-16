@@ -12,7 +12,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 from .np_arrow import is_in as _is_in
-from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum, float_extreme
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, float_extreme
 from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_values
 import numpy as np
 import os as _os
@@ -23,7 +23,7 @@ from pathlib import Path
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
-from .lazy_frame import join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
+from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
 from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
@@ -152,20 +152,39 @@ def _np_float_project(exprs, table):
     return pa.Table.from_arrays(arrays, names=names)
 
 
-def _expr_col_names(expr, out=None) -> set:
-    """Names of every column an Expr tree reads."""
+def _expr_col_names(expr, out=None, tests_ok=False) -> set:
+    """Names of every column an Expr tree reads. ``tests_ok``: a column that is only tested with ``is_null`` is
+    not read (its validity bitmap is, never its values)."""
     if out is None:
         out = set()
     if isinstance(expr, Expr):
         if expr.op == "col":
             out.add(expr.args[0])
+        elif tests_ok and expr.op == "is_null" and expr.args[0].op == "col":
+            pass
         else:
             for a in expr.args:
-                _expr_col_names(a, out)
+                _expr_col_names(a, out, tests_ok)
     elif isinstance(expr, (list, tuple)):
         for a in expr:
-            _expr_col_names(a, out)
+            _expr_col_names(a, out, tests_ok)
     return out
+
+
+def _temporal_extreme(e, table) -> bool:
+    """F-093: *e* is MIN / MAX of a plain date or timestamp column of *table*. Float64 holds neither a date
+    nor a ns timestamp past 2^53, so these aggregates are answered by Arrow in the column's own type."""
+    if e.op not in ("min", "max") or e.args[0].op != "col" or e.args[0].args[0] not in table.column_names:
+        return False
+    t = table.schema.field(e.args[0].args[0]).type
+    return pa.types.is_date(t) or pa.types.is_timestamp(t)
+
+
+def _temporal_scalar(scalar, typ) -> pa.Array:
+    """A one-row array of *typ* from an Arrow date / timestamp scalar, through its integer storage (``as_py``
+    would round a ns timestamp to a Python datetime, and import pandas)."""
+    store = pa.int32() if pa.types.is_date32(typ) else pa.int64()
+    return pa.array([scalar.value if scalar.is_valid else None], store).cast(typ)
 
 
 _AOT_WARNED = False
@@ -363,6 +382,44 @@ def _order_codes(a, descending: bool = False) -> np.ndarray:
         codes[valid] = k - 1 - codes[valid]
     codes[~valid] = k
     return codes
+
+
+def _shift_rows(src, rows, args, lead):
+    """lag / lead: for the rows of one ordered partition, record the row each one reads (-1: none)."""
+    k = int(args[1]) if len(args) > 1 and args[1] is not None else 1
+    m = len(rows)
+    if k < 0:
+        k, lead = -k, not lead
+    if k >= m:
+        return
+    if lead:
+        src[rows[:m - k]] = rows[k:]
+    else:
+        src[rows[k:]] = rows[:m - k]
+
+
+def _cast_default(value, typ):
+    """A lag / lead default cast to the column's type like DuckDB: a float into an integer column
+    rounds half away from zero, text parses, a number into a string column is its text; a value
+    that does not fit raises."""
+    if pa.types.is_string(typ) or pa.types.is_large_string(typ):
+        return pa.scalar(str(value), type=typ)
+    if pa.types.is_integer(typ):
+        if isinstance(value, str):
+            value = int(value)
+        elif isinstance(value, float):
+            value = int(np.sign(value) * np.floor(abs(value) + 0.5))
+    return pa.scalar(value, type=typ)
+
+
+def _take_shifted(arr, src, args):
+    """The input array gathered at *src* (-1 gives NULL, or the default); dtype and NULLs kept."""
+    none = src < 0
+    out = pc.take(arr, pa.array(np.where(none, 0, src), mask=none) if len(arr) else pa.nulls(len(src), pa.int64()))
+    default = args[2] if len(args) > 2 else None
+    if default is not None:           # only rows that read nothing get it; a source NULL stays NULL
+        out = pc.if_else(pa.array(none), _cast_default(default, out.type), out)
+    return out
 
 
 def _window_rank(a, descending: bool = False) -> np.ndarray:
@@ -697,6 +754,8 @@ class CustomOpsCompiler(GraphCompiler):
                 return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return _npa([val] * n)
+        if op == "mod":
+            return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div":
@@ -804,22 +863,10 @@ class CustomOpsCompiler(GraphCompiler):
             a = self._eval_expr_arrow(args[0], table)
             out, nul = _cum_sum_skip_null(_np_of(a, zero_copy_only=False).astype(np.float64), _np_of(pc.is_valid(a)))
             return _npa(np.ma.array(out, mask=nul)) if nul.any() else _npa(out)
-        if op == "lag":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-            default = args[2] if len(args) > 2 else None
-            out = np.empty(len(arr), dtype=np.float64)
-            out[:n_shift] = float(default) if default is not None else np.nan
-            out[n_shift:] = arr[:-n_shift]
-            return _npa(out)
-        if op == "lead":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-            default = args[2] if len(args) > 2 else None
-            out = np.empty(len(arr), dtype=np.float64)
-            out[-n_shift:] = float(default) if default is not None else np.nan
-            out[:-n_shift] = arr[n_shift:]
-            return _npa(out)
+        if op in ("lag", "lead"):
+            src = np.full(table.num_rows, -1, dtype=np.int64)
+            _shift_rows(src, np.arange(table.num_rows), args, op == "lead")
+            return _take_shifted(self._eval_expr_arrow(args[0], table), src, args)
         if op == "window":
             return self._eval_window_arrow(args[0], args[1], table)
         raise NotImplementedError(f"_eval_expr_arrow: unsupported op '{op}'")
@@ -1380,6 +1427,8 @@ class CustomOpsCompiler(GraphCompiler):
 
         okeys = [_order_codes(table.column(c), descending) for c in order_by] if order_by else []
         null_out = np.zeros(n, dtype=bool)          # rows whose window value is NULL
+        shift_src = np.full(n, -1, dtype=np.int64)  # lag / lead: source row per row, -1 for none
+        shifted = None
 
         def values(e, sub):
             a = self._eval_expr_arrow(e, sub)
@@ -1422,20 +1471,10 @@ class CustomOpsCompiler(GraphCompiler):
                 arr, valid = values(args[0], sub)
                 val, nul = _cum_sum_skip_null(arr, valid)
                 null_out[ordered_indices[nul]] = True
-            elif op == "lag":
-                n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-                fill    = args[2] if len(args) > 2 else None
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = np.empty(m, dtype=np.float64)
-                val[:n_shift] = float(fill) if fill is not None else np.nan
-                val[n_shift:] = arr[:-n_shift]
-            elif op == "lead":
-                n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
-                fill    = args[2] if len(args) > 2 else None
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = np.empty(m, dtype=np.float64)
-                val[-n_shift:] = float(fill) if fill is not None else np.nan
-                val[:-n_shift] = arr[n_shift:]
+            elif op in ("lag", "lead"):
+                _shift_rows(shift_src, ordered_indices, args, op == "lead")
+                shifted = op
+                continue
             else:
                 raise NotImplementedError(
                     f"_eval_window_arrow: unsupported inner op '{op}'"
@@ -1443,6 +1482,8 @@ class CustomOpsCompiler(GraphCompiler):
 
             result[ordered_indices] = val
 
+        if shifted:                       # lag / lead keep the input's type and its NULLs
+            return _take_shifted(self._eval_expr_arrow(inner_expr.args[0], table), shift_src, inner_expr.args)
         if null_out.any():
             return _npa(np.ma.array(result, mask=null_out))
         return _npa(result, type=pa.float64())
@@ -1825,14 +1866,26 @@ class CustomOpsCompiler(GraphCompiler):
         pass 2^53 (added exactly in int64, F-037). The split asks this too (``pipeline_exec.split_check``)."""
         read = set()
         for e in list(plan.group_by) + list(plan.aggs) + list(preds):
-            _expr_col_names(e, read)
+            _expr_col_names(e, read, tests_ok=not late)     # (late: every pipeline declined; the Arrow path keeps nulls)
         has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
             return "", False
         from .pipeline_program import int_sum_inexact
         exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
+        if not exact_sum:                  # F-090: float64 rounds the MIN / MAX of an integer past 2^53
+            for e in plan.aggs:
+                if e.op in ("min", "max") and e.args[0].op == "col" and e.args[0].args[0] in table.column_names:
+                    c = table.column(e.args[0].args[0])
+                    if pa.types.is_integer(c.type) and c.type.bit_width >= 64 and len(c):
+                        mm = pc.min_max(c)
+                        lo, hi = mm["min"].as_py(), mm["max"].as_py()
+                        if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
+                            exact_sum = True
+                            break
+        if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
+            return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
-            "an integer sum could pass 2^53 (added exactly in int64)" if exact_sum else "")
+            "an integer sum could pass 2^53, or a min / max past it (computed exactly in int64)" if exact_sum else "")
         return why, exact_sum
 
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
@@ -1877,7 +1930,10 @@ class CustomOpsCompiler(GraphCompiler):
                     agg_arrays.append(_npa(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
                     continue
                 arr = None
-                if exact_sum and e.op == "sum":
+                if _temporal_extreme(e, table):
+                    agg_arrays.append(_decode_dict(table.column(e.args[0].args[0])))      # F-093: stays a date / timestamp
+                    continue
+                if exact_sum and e.op in ("sum", "min", "max"):
                     _PRECISE.on = False                 # integers stay int64
                     try:
                         arr = self._eval_expr_arrow(e.args[0], table)
@@ -1898,8 +1954,13 @@ class CustomOpsCompiler(GraphCompiler):
             out_cols = [grouped.column(n) for n in key_names]
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
-                exact = e.op == "sum" and pa.types.is_integer(agg_arrays[i].type)
-                out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
+                exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(agg_arrays[i].type)
+                if _temporal_extreme(e, table):
+                    out_cols.append(c)                                         # F-093: the column's own date / timestamp type
+                elif exact and e.op in ("min", "max"):
+                    out_cols.append(pc.cast(c, agg_arrays[i].type))        # the column's own integer type
+                else:
+                    out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
             result = pa.Table.from_arrays(out_cols, names=key_names + agg_names)
         else:
             cols = []
@@ -1907,9 +1968,15 @@ class CustomOpsCompiler(GraphCompiler):
                 if e.op == "count":
                     cols.append(_npa([pc.count(arr).as_py()], type=pa.int64()))
                     continue
-                exact = e.op == "sum" and pa.types.is_integer(arr.type)
-                if exact:
+                if _temporal_extreme(e, table):
+                    cols.append(_temporal_scalar(pc.min_max(arr)[e.op], arr.type))
+                    continue
+                exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(arr.type)
+                if exact and e.op == "sum":
                     cols.append(_npa([_int_sum(arr)], type=pa.int64()))        # OverflowError past int64
+                    continue
+                if exact:
+                    cols.append(_npa([pc.min_max(arr)[e.op].as_py()], type=arr.type))      # the column's own integer type
                     continue
                 if e.op in ("min", "max"):
                     cols.append(_npa([float_extreme(arr, e.op)], type=pa.float64()))
@@ -2077,7 +2144,8 @@ class CustomOpsCompiler(GraphCompiler):
 
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:
-        """Cast the columns of ``count`` aggregates to int64 (the kernels return float32/float64)."""
+        """Cast the columns of ``count`` aggregates to int64, and of integer MIN / MAX to the column's integer type
+        (the kernels return float32/float64; values past 2^53 take the exact Arrow route before this)."""
         node = plan
         while isinstance(node, (Filter, Sort, Limit, Distinct, Tail)):
             node = node.input
@@ -2086,14 +2154,25 @@ class CustomOpsCompiler(GraphCompiler):
         agg = node if isinstance(node, Aggregate) else None
         if agg is None:
             return result
+        int_cols = None
         for i, e in enumerate(agg.aggs):
-            if e.op != "count":
+            minmax = e.op in ("min", "max") and e.args and getattr(e.args[0], "op", None) == "col"
+            if e.op != "count" and not minmax:
                 continue
             name = e._alias or f"agg_{i}"
             idx = result.schema.get_field_index(name)
-            if idx >= 0 and not pa.types.is_integer(result.schema.field(idx).type):
-                col = result.column(idx)
+            if idx < 0 or pa.types.is_integer(result.schema.field(idx).type):
+                continue
+            col = result.column(idx)
+            if e.op == "count":
                 result = result.set_column(idx, name, pc.cast(pc.round(col), pa.int64()))
+                continue
+            # F-090: MIN / MAX of an integer column is that integer type (DuckDB), not the kernels' float
+            if int_cols is None:
+                int_cols = {n: t for n, t in column_types(agg.input).items() if pa.types.is_integer(t)}
+            want = int_cols.get(e.args[0].args[0])
+            if want is not None and pa.types.is_floating(col.type):
+                result = result.set_column(idx, name, pc.cast(col, want))   # safe cast: a fraction raises
         return result
 
     def _compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
@@ -3627,7 +3706,8 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _common_key_type(a, b):
         """The type both join key types convert to without changing any value, else None
-        (int32 with int64 -> int64; float32 with float64 -> float64; integers with floats or
+        (int32 with int64 -> int64; float32 with float64 -> float64; an integer with a float is
+        paired by join_engine.int_float_pair when exact; numbers with
         strings never match silently)."""
         if pa.types.is_dictionary(a):
             a = a.value_type
@@ -3663,6 +3743,7 @@ class CustomOpsCompiler(GraphCompiler):
         if len(left_cols) != len(right_cols) or not left_cols:
             raise ValueError("join key column lists must be non-empty and equal length")
 
+        from .join_engine import int_float_pair
         n_left = len(left_table)
         paired_codes = []
         for left_name, right_name in zip(left_cols, right_cols):
@@ -3670,12 +3751,15 @@ class CustomOpsCompiler(GraphCompiler):
             right_arr = _combine(right_table.column(right_name))
             if left_arr.type != right_arr.type:
                 common = CustomOpsCompiler._common_key_type(left_arr.type, right_arr.type)
-                if common is None:
+                if common is not None:
+                    left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
+                elif (pair := int_float_pair(left_arr, right_arr)) is not None:
+                    left_arr, right_arr = pair
+                else:
                     raise TypeError(
                         f"join key types differ: {left_name}={left_arr.type}, "
                         f"{right_name}={right_arr.type}"
                     )
-                left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
             left_arr, right_arr = _canonical_floats(left_arr), _canonical_floats(right_arr)   # F-079
 
             if (

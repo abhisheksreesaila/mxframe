@@ -58,7 +58,7 @@ Return: 0 ok; < 0 declined or failed (the caller falls back).
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero
-from max.algorithm import parallelize
+from _fpenv import par, par_n
 from std.atomic import Atomic
 from std.ffi import external_call
 from std.sys import prefetch, PrefetchOptions
@@ -270,7 +270,7 @@ def _int_range(arrays: LP, stride_a: Int, n_chunks: Int, col: Int, kind: Int,
 
     if n_items > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(part, n_items)
+        par(part, n_items)
     else:
         part(0)
     for i in range(n_items):
@@ -350,7 +350,7 @@ def _i64_cols_exact(arrays: LP, stride_a: Int, n_chunks: Int, n_cols: Int, dtype
 
     if n_items > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(check, n_items)
+        par(check, n_items)
     else:
         check(0)
     var ok = Int(bad[0]) == 0
@@ -2219,7 +2219,7 @@ def _par[F: def(Int) -> None](f: F, nt: Int):
     """f(0) .. f(nt - 1) on nt workers (each pulls blocks from its own atomic counter)."""
     if nt > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(f, nt)
+        par(f, nt)
     else:
         f(0)
 
@@ -3146,7 +3146,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     if nt > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(pass1, nt)
+        par(pass1, nt)
     else:
         pass1(0)
     var past_limit = Int(out_total[1]) != 0
@@ -3391,7 +3391,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                 Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a).free()
 
     if nt > 1:
-        parallelize(pass2, nt)
+        par(pass2, nt)
     else:
         pass2(0)
 
@@ -3527,7 +3527,7 @@ def mx_gather(plan_a: Int, out_a: Int) abi("C") -> Int:
 
         if nt > 1:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(gpass1, nt)
+            par(gpass1, nt)
         else:
             gpass1(0)
 
@@ -3624,7 +3624,7 @@ def mx_gather(plan_a: Int, out_a: Int) abi("C") -> Int:
 
     if nt > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(gpass2, nt)
+        par(gpass2, nt)
     else:
         gpass2(0)
 

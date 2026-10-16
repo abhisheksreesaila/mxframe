@@ -17,6 +17,7 @@ Supports a large subset of TPC-H-style SQL:
 
 __all__ = ["sql"]
 
+import re
 import calendar
 import itertools
 from datetime import date, timedelta
@@ -30,7 +31,7 @@ from typing import Any, Dict, List, Optional
 from .lazy_expr import Expr, col, lit, when
 from .lazy_frame import (
     LazyFrame, LogicalPlan,
-    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names,
+    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names, column_types,
 )
 
 
@@ -96,6 +97,13 @@ def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
 
 
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+
+
+def _is_decimal_literal(n: sge.Expression) -> bool:
+    """``2.5`` or ``-2.5``: DuckDB types a number with a point and no exponent as DECIMAL (``1e3`` is DOUBLE)."""
+    n = _unparen(n)
+    n = _unparen(n.this) if isinstance(n, sge.Neg) else n
+    return isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"\d*\.\d*", str(n.this)) is not None
 
 
 def _unparen(n: sge.Expression) -> sge.Expression:
@@ -216,7 +224,7 @@ def _null_on_empty(n: sge.Expression) -> bool:
         return not n.is_string
     if isinstance(n, sge.Neg):
         return _null_on_empty(n.this)
-    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div)):
+    if isinstance(n, (sge.Add, sge.Sub, sge.Mul, sge.Div, sge.Mod)):
         return _null_on_empty(n.this) and _null_on_empty(n.expression) and bool(_aggs_in(n))
     return False
 
@@ -594,6 +602,7 @@ class _SQLTranslator:
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
+            right_plan, right_on, own = self._own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how)
             if how == "left":
                 right_plan = self._copy_right_keys(node, join, right_plan, right_cols, left_on, right_on)
                 self._left_schema |= self._copies            # a later ON may name a copy (u.k)
@@ -613,9 +622,9 @@ class _SQLTranslator:
             for lk, rk in zip(left_on, right_on):
                 if lk == rk:
                     self._same_keys.add(lk)
-                if lk in self._copies and how != "left":
+                if lk in self._copies and how != "left" and rk not in own:
                     self._marks[(join.this.alias_or_name.lower(), rk)] = lk       # x.k equals the copy it matched
-                elif lk != rk and how != "left":
+                elif lk != rk and how != "left" and rk not in own:
                     self._col_aliases[rk] = lk
 
         while pending:
@@ -707,6 +716,30 @@ class _SQLTranslator:
             if copy:
                 c.replace(sge.Column(this=sge.to_identifier(copy)))
         return on
+
+    @staticmethod
+    def _own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how):
+        """An inner join's right key column is dropped and read as the left key. When the two key
+        columns have different types (an int against a float), the right one must keep its own type
+        and values: join on a copy of it, so the original stays an ordinary right column.
+        Returns (right plan, right_on, names of the right keys kept as columns)."""
+        if how != "inner":
+            return right_plan, right_on, set()
+        lt, rt = column_types(plan), column_types(right_plan)
+        own = {rk for lk, rk in zip(left_on, right_on)
+               if lk != rk and lk in lt and rk in rt and lt[lk] != rt[rk] and rk not in lt}
+        if not own:
+            return right_plan, right_on, own
+        taken = set(lt) | set(rt) | set(right_cols)
+        copies = {}
+        for rk in sorted(own):
+            name = f"__key_{rk}"
+            while name in taken:
+                name = "_" + name
+            taken.add(name)
+            copies[rk] = name
+        exprs = [col(c) for c in right_cols] + [col(rk).alias(copies[rk]) for rk in copies]
+        return Project(right_plan, exprs), [copies.get(rk, rk) for rk in right_on], own
 
     def _links(self, alias: str, cols: set):
         """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
@@ -1432,17 +1465,26 @@ class _SQLTranslator:
 
         # ---- negation ----
         if isinstance(node, sge.Neg):
-            return lit(0) - self._expr(node.this)
+            inner = self._expr(node.this)
+            if inner.op == "lit" and isinstance(inner.args[0], (int, float)) and not isinstance(inner.args[0], bool):
+                return lit(-inner.args[0])                      # a constant folds (`-1`, `-(-1)`), not 0 - 1 (a float32 scalar)
+            return lit(0) - inner
 
         # ---- arithmetic ----
         if isinstance(node, sge.Add):
-            return self._float_expr(node.this) + self._float_expr(node.expression)
+            return self._arith_operand(node, node.this) + self._arith_operand(node, node.expression)
         if isinstance(node, sge.Sub):
-            return self._float_expr(node.this) - self._float_expr(node.expression)
+            return self._arith_operand(node, node.this) - self._arith_operand(node, node.expression)
         if isinstance(node, sge.Mul):
-            return self._float_expr(node.this) * self._float_expr(node.expression)
+            return self._arith_operand(node, node.this) * self._arith_operand(node, node.expression)
         if isinstance(node, sge.Div):
             return self._float_expr(node.this) / self._float_expr(node.expression)
+        if isinstance(node, sge.Mod):                    # `a % b` and MOD(a, b): DuckDB's fmod, NULL on zero
+            l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
+            if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
+                return lit(None if r.args[0] == 0 else (abs(l.args[0]) % abs(r.args[0])) * (-1 if l.args[0] < 0 else 1))   # two constants
+            dec = any(_is_decimal_literal(x) for x in (node.this, node.expression))
+            return Expr("mod", l, r, True) if dec else l % r      # a literal with a point (no exponent) is DECIMAL
 
         # ---- comparisons ----
         if isinstance(node, sge.EQ):
@@ -1535,6 +1577,8 @@ class _SQLTranslator:
         return _type_in(src, self._alias_schema)
 
     def _is_date_col(self, src: sge.Expression) -> bool:
+        if isinstance(src, (sge.Min, sge.Max)):             # F-093: MIN / MAX of a date column is a date
+            src = src.this
         t = self._col_type(src)
         return t is not None and pa.types.is_date(t)
 
@@ -1604,6 +1648,41 @@ class _SQLTranslator:
         if f is not None:
             return f
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
+
+    def _is_int_expr(self, node: sge.Expression) -> bool:
+        """True when ``node`` is certainly an integer: an integer literal, an integer column of a known table,
+        or + - * % and negation of those, COUNT, or an integer MIN / MAX. Unknown (unresolved names) is False."""
+        node = _unparen(node)
+        if isinstance(node, sge.Literal):
+            return not node.is_string and "." not in str(node.this) and "e" not in str(node.this).lower()
+        if isinstance(node, sge.Neg):
+            return self._is_int_expr(node.this)
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Mod)):
+            return self._is_int_expr(node.this) and self._is_int_expr(node.expression)
+        if isinstance(node, sge.Count):
+            return True
+        if isinstance(node, (sge.Min, sge.Max)):               # not SUM: the engine returns it as a double until F-060
+            return self._is_int_expr(node.this)
+        t = self._col_type(node)
+        return t is not None and pa.types.is_integer(t)
+
+    def _arith_operand(self, parent: sge.Expression, node: sge.Expression) -> "Expr":
+        """An operand of + - *: integer arithmetic stays integer (exact, checked overflow, like DuckDB) when both
+        operands are certainly integers; anything else promotes an integer literal to float (``_float_expr``)."""
+        if self._is_int_expr(parent.this) and self._is_int_expr(parent.expression):
+            return self._expr(node)
+        return self._float_expr(node)
+
+    def _mod_operand(self, node: sge.Expression) -> "Expr":
+        """An operand of ``%``: a numeric literal (negated or not) stays a plain constant, an integer one an integer, anything else is evaluated
+        as it is, so ``np_arrow.modulo`` picks integer or float arithmetic from the real arrays."""
+        n = _unparen(node)
+        neg = isinstance(n, sge.Neg)
+        n = _unparen(n.this) if neg else n
+        if isinstance(n, sge.Literal) and not n.is_string:
+            v = int(n.this) if str(n.this).isdigit() else float(n.this)
+            return lit(-v if neg else v)
+        return self._expr(node)
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
         """Like _expr but promotes integer literals to float for arithmetic use.

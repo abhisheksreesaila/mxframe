@@ -42,7 +42,7 @@ Return: 0 ok, -1 bad program, -3 too many registers, -5 `keyw` failed (invalid d
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, bitcast
-from max.algorithm import parallelize
+from _fpenv import par, par_n
 from std.atomic import Atomic
 from std.ffi import external_call
 
@@ -398,7 +398,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         worker(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(worker, nt)
+        par(worker, nt)
 
     var over = False
     for w in range(nt):
@@ -532,7 +532,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
             merge_part(0)
         else:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(merge_part, nm)
+            par(merge_part, nm)
 
     # the partitions' groups side by side
     var total = 0
@@ -583,7 +583,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
             copy_part(0)
         else:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(copy_part, nm)
+            par(copy_part, nm)
 
     for i in range(nparts):
         var o = pres + i * PR_N

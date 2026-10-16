@@ -433,6 +433,13 @@ def _row_groups_for(pf, pushed) -> List[int]:
         for name, op, value in pushed:
             j = names.index(name) if name in names else -1
             st = rg.column(j).statistics if j >= 0 else None
+            if op in ("isnull", "notnull"):
+                # null counts: none to find for IS NULL; every value NULL for IS NOT NULL (no count: no skip)
+                if st is not None and st.has_null_count:
+                    ok = st.null_count > 0 if op == "isnull" else st.null_count < rg.num_rows
+                if not ok:
+                    break
+                continue
             if st is None or not st.has_min_max:
                 continue
             lo, hi = st.min, st.max
@@ -810,6 +817,15 @@ def _pushable(expr: Expr, schema: pa.Schema) -> Optional[Tuple]:
     to the engine (float32 data vs a Python float literal is a precision hazard).
     """
     op, args = expr.op, expr.args
+    if op == "not" and args[0].op == "is_null":
+        expr, op = args[0], "notnull"
+        args = expr.args
+    elif op == "is_null":
+        op = "isnull"
+    if op in ("isnull", "notnull"):
+        # flat columns only: a list / struct column's leaf null_count counts NULLs inside the values, not NULL rows
+        ok = args[0].op == "col" and args[0].args[0] in schema.names and not pa.types.is_nested(schema.field(args[0].args[0]).type)
+        return (args[0].args[0], op, None) if ok else None
     if op in _CMP_OPS:
         a, b = args
         if a.op == "lit" and b.op == "col":
@@ -854,7 +870,8 @@ def _filters_expression(filters):
         f = ds.field(name)
         e = {"eq": lambda: f == value, "ne": lambda: f != value, "gt": lambda: f > value,
              "ge": lambda: f >= value, "lt": lambda: f < value, "le": lambda: f <= value,
-             "isin": lambda: f.isin(list(value))}[op]()
+             "isin": lambda: f.isin(list(value)), "isnull": lambda: f.is_null(),
+             "notnull": lambda: ~f.is_null()}[op]()
         out = e if out is None else (out & e)
     return out
 
