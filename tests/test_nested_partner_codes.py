@@ -160,6 +160,8 @@ def test_fused_decline_hands_strings_to_the_old_path(spy, monkeypatch):
     monkeypatch.setattr(nx, "try_execute_join", join_then_forget)
     got = _rows(mx.sql(sql, **tables).compute(device="cpu"))
     assert len(got) == len(exp) and all(_eq(x, y) for g, e in zip(got, exp) for x, y in zip(g, e))
+    assert spy["hooks"], "the fused call must have been reached (and declined)"
+    assert any("dictionary" in t for t in spy["partner_types"]), spy["partner_types"]   # widened before the decline
     assert all(h.startswith("join:declined") for h in spy["hooks"]), spy["hooks"]
     assert not [k for k in kept if k.endswith("n_name")], kept      # the old path's partners hold strings
 
