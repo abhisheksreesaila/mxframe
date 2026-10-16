@@ -62,12 +62,15 @@ def _fake_gpu(monkeypatch, ready, cpu_ms=100.0, gpu_ms=1.0):
     monkeypatch.setattr(am, "get_gpu_warmup", lambda calib=None, start=True: _Warmup(ready))
 
 
-@pytest.fixture(params=["small input", "no gpu", "cold gpu"])
+@pytest.fixture(params=["small input", "no gpu", "cold gpu", "warm gpu, split not worth it"])
 def gpu_state(request, monkeypatch):
     if request.param == "no gpu":
         monkeypatch.setattr(cal, "get_calibration", lambda: _Calib(False))
     elif request.param == "cold gpu":
         _fake_gpu(monkeypatch, ready=False)
+    elif request.param == "warm gpu, split not worth it":
+        monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)        # the model, not the size gate, says no
+        _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=1000.0)
     return request.param
 
 
@@ -194,6 +197,47 @@ def test_a_predicted_split_sets_the_policy_and_keeps_the_answer(monkeypatch, pol
     assert "cpu path: cpu+gpu split" in lf.last_auto_decision.explain()
     want = _duckdb("select k, sum(v) s from f group by k", f=f)
     assert _rows(got, False) == _rows(want, False)
+
+
+def test_a_predicted_split_on_host_data_starts_the_background_upload(monkeypatch, policies):
+    """The first query of a split-worthy aggregate runs on the CPU and queues the upload that later
+    queries split over (the policy is what lets coproc_fused start it)."""
+    n = 6_000_000                                             # 12 B/row of source: over the 64 MiB gate
+    r = np.random.default_rng(3)
+    f = pa.table({"k": A(r.integers(0, 50, n).astype(np.int64)), "v": A(r.random(n))})
+    _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
+    monkeypatch.setattr(cf, "_gpu_usable", lambda: True)
+    started = []
+    monkeypatch.setattr(cf, "_start_upload", lambda *a, **k: started.append(1))
+    lf = LazyFrame(f).groupby("k").agg(col("v").sum().alias("s"))
+    got = lf.compute(device="auto")
+    assert "cpu path: cpu+gpu split" in lf.last_auto_decision.explain()
+    assert started == [1]
+    want = _duckdb("select k, sum(v) s from f group by k", f=f)
+    assert _rows(got, False) == _rows(want, False)
+
+
+def test_split_is_priced_on_source_rows_not_filtered_rows(monkeypatch):
+    """A selective filter leaves few rows, but the pipeline (and the upload) read every source row."""
+    n = 6_000_000
+    f = pa.table({"k": A(np.zeros(n, dtype=np.int64)), "d": A(np.arange(n, dtype=np.int32) % 1000),
+                  "v": A(np.ones(n))})
+    _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
+    lf = LazyFrame(f).filter(col("d") < lit(3)).groupby("k").agg(col("v").sum().alias("s"))
+    assert "cpu path: cpu+gpu split" in lf.explain(device="auto", costs=True)
+
+
+def test_shapes_the_split_cannot_take_are_never_predicted_a_split(monkeypatch):
+    monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)
+    _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
+    f, dm = _fact(N), _dim()
+    joined = LazyFrame(f).join(LazyFrame(dm), on="dim").groupby("grp").agg(col("v").sum().alias("s"))
+    assert "cpu path: native executor (no cpu+gpu split: a join's output" in joined.explain(device="auto", costs=True)
+    derived = LazyFrame(f).groupby((col("k") + lit(1)).alias("k1")).agg(col("v").sum().alias("s"))
+    assert "cpu path: native executor (no cpu+gpu split: derived or renamed group keys" in derived.explain(
+        device="auto", costs=True)
+    renamed = LazyFrame(f).groupby(col("k").alias("kk")).agg(col("v").sum().alias("s"))
+    assert "no cpu+gpu split: derived or renamed" in renamed.explain(device="auto", costs=True)
 
 
 def test_gpu_fraction_forces_a_split_and_keeps_the_answer(monkeypatch, policies):

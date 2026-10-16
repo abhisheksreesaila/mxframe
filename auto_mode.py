@@ -264,6 +264,8 @@ class OpCost:
     h2d_bytes: int = 0
     note: str = ""
     card: int = 1
+    src_rows: int = 0       # rows the fused pipeline reads: every source row, before the filters
+    src_bytes: int = 0      # what an upload of those rows would copy
 
     def line(self) -> str:
         g = "n/a" if self.gpu_ms == float("inf") else f"{self.gpu_ms:.1f}ms"
@@ -487,7 +489,8 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
                 nbytes = n * (4 + width)
                 g = enc + sum(calib.estimate(o, "gpu", n, card=card) for o in ops) + h2d(nbytes) \
                     + calib.transfer_ms(card * 8 * len(ops), "d2h")
-                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups", card=card))
+                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups", card=card,
+                                   src_rows=src, src_bytes=src * (4 + width)))
                 return card, ts, card
             # Global aggregates run masked kernels over the unfiltered input.
             nbytes = src * (width + 4)
@@ -496,7 +499,7 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
                 est.lines.append(OpCost("global_agg", src, cpu, INF, note=KNOWN_BROKEN_GPU["global_agg"]))
                 return 1, ts, 1
             g = len(ops) * calib.estimate("masked_sum", "gpu", src) + h2d(nbytes)
-            est.lines.append(OpCost("global_agg", src, cpu, g, nbytes))
+            est.lines.append(OpCost("global_agg", src, cpu, g, nbytes, src_rows=src, src_bytes=nbytes))
             return 1, ts, 1
         if isinstance(p, Sort):
             n, ts, src = walk(p.input)
@@ -581,27 +584,50 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
     return d
 
 
-def _with_cpu_path(d: AutoDecision, calib, gpu) -> AutoDecision:
+def _with_cpu_path(d: AutoDecision, plan, calib, gpu) -> AutoDecision:
     """Fill `split` / `cpu_path` of a cpu decision taken with a usable GPU (F-053)."""
-    d.split, d.cpu_path = _cpu_path(d, calib, gpu)
+    d.split, d.cpu_path = _cpu_path(d, plan, calib, gpu)
     return d
 
 
-def _cpu_path(d: AutoDecision, calib, gpu):
+def _unsplittable(plan) -> str:
+    """Why the fused-aggregate split cannot take this plan, or "" (mirrors what pipeline_exec feeds
+    coproc_fused.try_split: a table the same buffers back on every query, stable group ids)."""
+    from . import coproc_fused as cf
+    from .lazy_frame import Aggregate, Join
+
+    def has_join(p):
+        return isinstance(p, Join) or any(has_join(getattr(p, a)) for a in ("input", "left", "right")
+                                          if getattr(p, a, None) is not None)
+
+    node = plan
+    while not isinstance(node, Aggregate):
+        if getattr(node, "input", None) is None:
+            return "no aggregate to split"
+        node = node.input
+    if has_join(node.input):
+        return "a join's output is rebuilt on every query, so it is never resident"
+    if node.group_by and not cf.stable_group_keys(node.group_by):
+        return "derived or renamed group keys get fresh ids on every query"
+    return ""
+
+
+def _cpu_path(d: AutoDecision, plan, calib, gpu):
     native = "native executor"
     from . import coproc_fused as cf
     if not cf.enabled_by_env():
         return False, f"{native} (no cpu+gpu split: MXFRAME_COPROC=0)"
     if gpu.remaining_init_ms() > 0:
         return False, f"{native} (no cpu+gpu split: gpu not warm)"
-    aggs = [l for l in d.estimate.lines if l.op in ("group_agg", "global_agg")]
-    if not aggs:
-        return False, f"{native} (no cpu+gpu split: no aggregate to split)"
-    a = aggs[-1]
-    if a.h2d_bytes < cf.MIN_UPLOAD_BYTES:
-        return False, f"{native} (no cpu+gpu split: input under {_fmt_bytes(cf.MIN_UPLOAD_BYTES)}, nothing is uploaded)"
-    cpu = calib.estimate("pipeline", "cpu", a.rows, card=a.card)
-    gpu_ms = calib.estimate("pipeline", "gpu", a.rows, card=a.card)
+    why = _unsplittable(plan)
+    if why:
+        return False, f"{native} (no cpu+gpu split: {why})"
+    a = [l for l in d.estimate.lines if l.op in ("group_agg", "global_agg")][-1]
+    if a.src_bytes < cf.MIN_UPLOAD_BYTES:
+        return False, (f"{native} (no cpu+gpu split: source input {_fmt_bytes(a.src_bytes)} is under "
+                       f"{_fmt_bytes(cf.MIN_UPLOAD_BYTES)}, nothing is uploaded)")
+    cpu = calib.estimate("pipeline", "cpu", a.src_rows, card=a.card)
+    gpu_ms = calib.estimate("pipeline", "gpu", a.src_rows, card=a.card)
     if not (cpu < float("inf") and gpu_ms < float("inf")):
         return False, f"{native} (no cpu+gpu split: no pipeline estimate)"
     f = cf.balanced_fraction(cpu, gpu_ms, cf.DEFAULT_GPU_ALPHA_MS)
@@ -646,10 +672,10 @@ def _choose_device(plan, calib, gpu, prefer, placement, quick):
     if gpu_ms < cpu_ms * (1 - margin):
         return AutoDecision("gpu", "gpu faster incl. copies", est, init)
     if est.gpu_ms < cpu_ms * (1 - margin) and init > 0:
-        return _with_cpu_path(AutoDecision("cpu", "gpu faster but still starting up", est, init), calib, gpu)
+        return _with_cpu_path(AutoDecision("cpu", "gpu faster but still starting up", est, init), plan, calib, gpu)
     return _with_cpu_path(AutoDecision(
         "cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster", est, init),
-        calib, gpu)
+        plan, calib, gpu)
 
 
 SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)

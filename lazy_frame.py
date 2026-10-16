@@ -373,7 +373,10 @@ class LazyFrame:
             decision = _am.choose_device(plan, quick=not costs)
             text = decision.explain()
             lines.append("AutoDecision")
-            lines.extend(text.splitlines() if costs else text.splitlines()[:2 if decision.cpu_path and decision.device == 'cpu' else 1])
+            shown = text.splitlines()
+            if not costs:
+                shown = shown[:2] if decision.cpu_path and decision.device == "cpu" else shown[:1]
+            lines.extend(shown)
         return "\n".join(lines)
 
     @property
