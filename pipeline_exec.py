@@ -85,19 +85,46 @@ def _decline(compiler, reason: str):
     return None
 
 
+def _table_of(plan):
+    """``(predicates, aggregate, table)`` of an ``Aggregate(Filter*(Scan))`` with rows and aggregates, else why not."""
+    shape = _shape(plan)
+    if shape is None:
+        return (f"plan is not Aggregate(Filter*(Scan)): {type(plan).__name__}"
+                f" over {type(getattr(plan, 'input', None)).__name__}")
+    predicates, agg_node, scan = shape
+    table: pa.Table = scan.table
+    if table.num_rows == 0 or not agg_node.aggs:
+        return "empty input or no aggregates"
+    return predicates, agg_node, table
+
+
+def _bind(predicates, agg_node, table):
+    """``(program, chunked columns)`` the fused pipeline runs on this table, else why it declines: the one
+    place that knows which tables and expressions it takes (``split_check`` asks it too)."""
+    n_rows = table.num_rows
+    prog = compile_pipeline(predicates, list(agg_node.aggs), table)
+    if prog is None:
+        return "expression not supported by the bytecode compiler"
+    if _int64_past_2_53(table, prog.columns):
+        return "an int64 column holds values past 2^53 (the pipeline computes in float64)"
+    try:
+        cc = prog.bind_chunks(table)
+    except Unsupported:
+        return "a column has nulls or an unsupported type"
+    if cc.n_cols and cc.n_rows != n_rows:
+        return "column lengths differ"
+    return prog, cc
+
+
 def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=None,
                         t0: Optional[float] = None) -> Optional[pa.Table]:
     if not enabled():
         return _decline(compiler, "disabled (MXFRAME_FUSED_PIPELINE=0)")
-    shape = _shape(plan)
-    if shape is None:
-        return _decline(compiler, f"plan is not Aggregate(Filter*(Scan)): {type(plan).__name__}"
-                                  f" over {type(getattr(plan, 'input', None)).__name__}")
-    predicates, agg_node, scan = shape
-    table: pa.Table = scan.table
+    got = _table_of(plan)
+    if isinstance(got, str):
+        return _decline(compiler, got)
+    predicates, agg_node, table = got
     n_rows = table.num_rows
-    if n_rows == 0 or not agg_node.aggs:
-        return _decline(compiler, "empty input or no aggregates")
     try:
         from . import pipeline_kernels as pk
     except Exception:
@@ -111,17 +138,10 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     if not pk.cpu_available():
         return _decline(compiler, "libmxpipeline_cpu.so not built")
 
-    prog = compile_pipeline(predicates, list(agg_node.aggs), table)
-    if prog is None:
-        return _decline(compiler, "expression not supported by the bytecode compiler")
-    if _int64_past_2_53(table, prog.columns):
-        return _decline(compiler, "an int64 column holds values past 2^53 (the pipeline computes in float64)")
-    try:
-        cc = prog.bind_chunks(table)
-    except Unsupported:
-        return _decline(compiler, "a column has nulls or an unsupported type")
-    if cc.n_cols and cc.n_rows != n_rows:
-        return _decline(compiler, "column lengths differ")
+    bound = _bind(predicates, agg_node, table)
+    if isinstance(bound, str):
+        return _decline(compiler, bound)
+    prog, cc = bound
 
     t_start = t0 if t0 is not None else _time.perf_counter()
     group_keys: List[str] = []
@@ -162,10 +182,19 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     used = "cpu"
     partials = None
     coproc_info = None
+    cpu_range = None
     if device == "cpu":
         from . import coproc_fused
+        if coproc_fused.current_policy() is not None:
+            # Under the co-processing policy the native executor declined the whole plan (it must not run
+            # beside the GPU's share), so it takes the CPU rows here: its range of a split, or all of them.
+            def cpu_range(a, b):
+                return _cpu_rows(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, a, b)
         stable = not grouped or coproc_fused.stable_group_keys(agg_node.group_by)
-        split = coproc_fused.try_split(prog, cc, gids, n_groups, n_rows, table, stable_gids=stable)
+        split = coproc_fused.try_split(
+            prog, cc, gids, n_groups, n_rows, table, stable_gids=stable, cpu_rows=cpu_range,
+            gid_fp=_gid_fingerprint(table, unique_key_cols, n_groups) if grouped else None,
+            gkeys=tuple(group_keys))
         if split is not None:
             partials, used, coproc_info = split
     if device == "gpu":
@@ -175,7 +204,7 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
             partials = None            # this program does not fit the GPU kernel: CPU kernel
         # any other GPU error propagates, so auto_mode sees it (is_sticky_gpu_error / disable_gpu)
     if partials is None:
-        partials = pk.run_pipeline_cpu(prog, cc, gids, n_groups, 0, n_rows)
+        partials = (cpu_range or (lambda a, b: pk.run_pipeline_cpu(prog, cc, gids, n_groups, a, b)))(0, n_rows)
 
     present, cols = finalize(prog, partials, grouped)
     if grouped:
@@ -225,19 +254,132 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     return result
 
 
+def _cpu_rows(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, start, end):
+    """CPU partials of rows ``[start, end)``: the native executor's (``native_exec.range_partials``), or the
+    older pipeline kernel's when the executor declines the range."""
+    from . import native_exec
+    try:
+        got = native_exec.range_partials(compiler, prog, table, predicates, agg_node, gids, n_groups, start, end)
+    except Exception as exc:
+        got = native_exec.swallowed(exc, "split share")
+    if got is not None:
+        return got
+    # TODO(F-064): pass the reproducible flag here once run_pipeline_cpu takes it (and to the call in
+    # try_fused_aggregate): a split's CPU share must sum in a fixed order like the rest of the CPU paths.
+    return pk.run_pipeline_cpu(prog, cc, gids, n_groups, start, end)
+
+
+def _gid_fingerprint(table, unique_key_cols, n_groups):
+    """What the group ids of a table read from a file mean (see ``coproc_fused.gid_fingerprint``), or None
+    for a table that is not a file read (its residency is keyed by buffer address, which fixes the ids)."""
+    from .io_parquet import table_source
+    if table_source(table) is None:
+        return None
+    from . import coproc_fused
+    return coproc_fused.gid_fingerprint(unique_key_cols, n_groups)
+
+
+class SplitInputs:
+    """What ``split_check`` found for a plan the CPU+GPU split can take."""
+
+    def __init__(self, prog, cc, table, agg_node, source, gkeys):
+        self.prog, self.cc, self.table, self.agg_node = prog, cc, table, agg_node
+        self.source, self.gkeys = source, gkeys
+        self.columns = frozenset(prog.columns)
+
+
+def split_check(plan):
+    """``SplitInputs`` when the CPU+GPU split can take ``plan``, else the reason it cannot. This is the one
+    predicate for the split: it asks the same ``_shape`` / ``_bind`` the fused pipeline runs, then adds what
+    only the split needs (stable group ids, columns whose buffers a device copy can be keyed by). Joins,
+    a Project or Distinct between the aggregate and the scan, nulls, int64 past 2^53 and shapes the
+    bytecode compiler declines all come out of those, so a split is never predicted for a plan the pipeline
+    then declines (F-053 review)."""
+    from . import coproc_fused
+    from .custom_ops import CustomOpsCompiler
+    from .io_parquet import table_source
+
+    node = plan
+    while not isinstance(node, Aggregate):
+        if getattr(node, "input", None) is None:
+            return "no aggregate to split"
+        node = node.input
+    node = CustomOpsCompiler._inline_project_into_aggregate(node)     # as compile_and_run does first
+    if not enabled():
+        return "disabled (MXFRAME_FUSED_PIPELINE=0)"
+    got = _table_of(node)
+    if isinstance(got, str):
+        return got
+    predicates, agg_node, table = got
+    if agg_node.group_by and not coproc_fused.stable_group_keys(agg_node.group_by):
+        return "derived or renamed group keys get fresh ids on every query"
+    why, _ = CustomOpsCompiler._arrow_aggregate_reason(agg_node, predicates, table)   # answered before the pipelines
+    if why:
+        return f"Arrow's hash aggregate answers it: {why}"
+    try:
+        bound = _bind(predicates, agg_node, table)
+    except Exception as exc:                                         # the run would raise the same and fall back
+        return f"binding raised {type(exc).__name__}"
+    if isinstance(bound, str):
+        return bound
+    prog, cc = bound
+    source = table_source(table)
+    if source is None and not coproc_fused.stable_columns(cc):
+        return "a column is converted on every query (dictionary codes, bool, narrow ints), so it has no stable buffer to keep on the GPU"
+    return SplitInputs(prog, cc, table, agg_node, source or ("memory", id(table)),
+                       tuple(e.args[0] for e in agg_node.group_by))
+
+
+def queue_resident_upload(plan) -> None:
+    """Start the background upload of what a split of ``plan`` reads (its columns and group ids), without running
+    the query: the CPU decision that predicted a split has not found them resident yet. A background thread
+    calls this once the query has returned."""
+    from . import coproc_fused
+    got = split_check(plan)
+    if isinstance(got, str) or not coproc_fused.begin_prepare(got.source, got.columns, got.gkeys):
+        return
+    from .custom_ops import CustomOpsCompiler
+    gids, n_groups, fp = None, 1, None
+    if got.gkeys:
+        gids, n_groups, uniq = CustomOpsCompiler._build_group_ids_cached(got.table, list(got.gkeys))
+        gids = np.ascontiguousarray(gids, dtype=np.int32)
+        if n_groups <= 0 or len(gids) != got.table.num_rows:
+            return
+        fp = _gid_fingerprint(got.table, uniq, n_groups)
+    coproc_fused.request_upload(got.prog, got.cc, gids, n_groups, got.table.num_rows, got.table,
+                                gid_fp=fp, gkeys=got.gkeys)
+
+
+_I64_RANGE: dict = {}          # id(table) -> (weakref to the table, {column: values past 2^53?})
+
+
 def _int64_past_2_53(table, names) -> bool:
-    """The pipeline computes in float64, exact for integers only within +-2^53 (F-032 review)."""
+    """The pipeline computes in float64, exact for integers only within +-2^53 (F-032 review). Remembered
+    per table and column: the split's decision and the run both ask, and a min / max pass over the rows
+    costs as much as a native query."""
+    import weakref
+    got = _I64_RANGE.get(id(table))
+    if got is None or got[0]() is not table:
+        key = id(table)
+        try:
+            got = (weakref.ref(table, lambda _r, k=key: _I64_RANGE.pop(k, None)), {})
+        except TypeError:
+            got = (lambda: table, {})
+        _I64_RANGE[id(table)] = got
+    seen = got[1]
+    return any(seen[n] if n in seen else seen.setdefault(n, _column_past_2_53(table.column(n))) for n in names)
+
+
+def _column_past_2_53(col) -> bool:
     import numpy as np
     lim = 1 << 53
-    for n in names:
-        col = table.column(n)
-        if col.type != pa.int64():
-            continue
-        for ch in col.chunks:
-            if len(ch) and ch.null_count == 0:
-                a = np.frombuffer(ch.buffers()[1], dtype=np.int64, count=len(ch) + ch.offset)[ch.offset:]
-                if a.max() > lim or a.min() < -lim:
-                    return True
-            elif len(ch):
-                return True              # nulls: bind_chunks declines anyway
+    if col.type != pa.int64():
+        return False
+    for ch in col.chunks:
+        if len(ch) and ch.null_count == 0:
+            a = np.frombuffer(ch.buffers()[1], dtype=np.int64, count=len(ch) + ch.offset)[ch.offset:]
+            if a.max() > lim or a.min() < -lim:
+                return True
+        elif len(ch):
+            return True              # nulls: bind_chunks declines anyway
     return False

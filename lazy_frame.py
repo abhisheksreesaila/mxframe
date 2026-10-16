@@ -325,6 +325,11 @@ class LazyFrame:
                 if decision.estimate is not None and decision.gpu_available:
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
+                if decision.upload:
+                    # A split would win once the columns are on the GPU (F-057): this query runs native, and the
+                    # upload (group ids, then the columns) starts when it has returned.
+                    from . import pipeline_exec as _pe
+                    _bg.later(lambda: _pe.queue_resident_upload(plan))
                 # The policy makes the native executor decline, so it is set only for a predicted
                 # CPU+GPU split (or one the caller forces with gpu_fraction); every other CPU
                 # decision runs exactly as device="cpu" (F-053).
