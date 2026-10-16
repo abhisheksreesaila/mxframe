@@ -57,11 +57,7 @@ pixi run test-all
 pixi run test6-gpu
 
 echo "[2/5] Rebuilding AOT libraries"
-pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
-    --emit shared-lib -o kernels_aot/libmxkernels_aot.so
-pixi run mojo build kernels_aot/kernels_aot_gpu.mojo -I kernels_aot \
-    --emit shared-lib -o kernels_aot/libmxkernels_aot_gpu.so
-bash scripts/set_runpath.sh kernels_aot/libmxkernels_aot.so kernels_aot/libmxkernels_aot_gpu.so
+bash scripts/build_pipeline.sh aot
 
 echo "[3/5] Building wheel and sdist"
 rm -rf dist build
