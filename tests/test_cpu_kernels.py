@@ -367,7 +367,8 @@ def _busy_threads(fn, min_ns=500_000):
 
 
 def test_thread_budget_changes_actual_parallelism(aot):
-    """threads=1 keeps the work on one thread; threads=4 spreads it over four."""
+    """threads=1 keeps the work on one thread; threads=4 spreads it over four workers
+    (the calling thread also runs a share, so up to five threads are busy)."""
     if (os.cpu_count() or 1) < 4:
         pytest.skip("needs >= 4 cores")
     n = 30_000_000
@@ -380,7 +381,8 @@ def test_thread_budget_changes_actual_parallelism(aot):
                 for _ in range(4)]
 
     assert max(busy(1)) == 1
-    assert min(busy(4)) >= 4
+    four = busy(4)
+    assert 4 <= min(four) and max(four) <= 5        # 4 workers, plus the calling thread (measured: 5)
 
 
 def test_concurrent_calls_from_python_threads(aot):
