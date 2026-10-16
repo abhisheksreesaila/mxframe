@@ -928,3 +928,8 @@ From the F-094 review (2026-10-16); speed
 Found by the F-090 review (2026-10-16); a missing column on main
 - [ ] `SELECT * FROM t JOIN v ON t.i = v.x` (and the comma form `FROM t, v WHERE t.i = v.x`) leaves out `x` entirely, even when both keys are the same type; DuckDB keeps both columns. The comma form also reads `v.x` as the left key, so its type is the left side's (values equal, -0.0 shows as 0). Keep the right key as its own output column (USING / NATURAL keep one, like DuckDB)
 - [ ] DuckDB-checked tests: SELECT * and SELECT v.x over JOIN ON, comma join, USING; same-type and int-vs-float keys; LEFT JOIN with unmatched rows (right key NULL, F-086); fails before
+
+## F-103 SQL integer column plus integer literal stays integer [todo]
+Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
+- [ ] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
+- [ ] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
