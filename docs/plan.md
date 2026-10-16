@@ -533,6 +533,7 @@ Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] integer SUM returns int64 on every path regardless of size or nulls (today: native double when it fits, int64 on the exact path), like DuckDB
 - [ ] `mean` of large int64 values: integer accumulation, not float64
 - [ ] integer `min` / `max` on the exact path return float64 (lossy past 2^53): return int64 (found by F-061)
+- [ ] `pipeline_program._int_arith` treats an uncompilable expression as unbounded only when all its columns are integers; one mixing a string or float column with an overflowing int product might still reach the compiled graph (no repro found by the F-061 review); the runtime overflow flag should close it
 - [ ] sums whose expression the compiler can't take keep the old float path today (`int_sum_inexact` returns False): cover them
 
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
