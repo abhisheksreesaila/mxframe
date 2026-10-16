@@ -693,8 +693,7 @@ class _SQLTranslator:
         """The Arrow schema of a FROM item: a table's own, or (WITH name, derived table) a zero-row run; None if unknown."""
         if isinstance(table_node, sge.Table) and table_node.name.lower() not in self._ctes \
                 and table_node.name.lower() in self._tables:
-            t = self._tables[table_node.name.lower()]
-            return t.schema
+            return self._tables[table_node.name.lower()].schema
         try:
             return LazyFrame(plan).schema
         except Exception:                                    # noqa: BLE001 (unknown type: callers fall back)

@@ -169,3 +169,58 @@ def test_pushdown_through_join_and_subquery(path, path2):
     assert all("unused" not in l.table.column_names and "note" not in l.table.column_names for l in leaves)
     assert min(l.table.num_rows for l in leaves) == 4        # u: whole file
     assert any(l.table.num_rows == 500 for l in leaves)      # t: pushed filter read one row group
+
+
+# -- regressions: the same query text over different sources ----------------
+
+def _write(tmp_path, name, seed):
+    rng = np.random.default_rng(seed)
+    t = pa.table({"id": pa.array(np.arange(600, dtype=np.int64)),
+                  "grp": pa.array(rng.choice(["a", "b", "c"], 600)),
+                  "qty": pa.array(rng.integers(1, 50, 600).astype(np.int64))})
+    p = str(tmp_path / name)
+    pq.write_table(t, p, row_group_size=200)
+    return p
+
+
+def test_same_join_query_over_two_files_back_to_back(tmp_path, src, dev):
+    q = ("SELECT t.grp, SUM(t.qty * u.w) AS s, COUNT(*) AS n FROM t JOIN u ON t.grp = u.grp "
+         "WHERE t.id >= 100 GROUP BY t.grp")
+    wp = str(tmp_path / "w.parquet")
+    pq.write_table(pa.table({"grp": ["a", "b", "c"], "w": [1, 2, 3]}), wp)
+    for p in (_write(tmp_path, "a.parquet", 1), _write(tmp_path, "b.parquet", 2), _write(tmp_path, "a.parquet", 1)):
+        _same(mx.sql(q, t=src(p), u=src(wp)).compute(device=dev), _duck(q, t=p, u=wp), ordered=False)
+
+
+def test_same_file_with_different_pre_filters(path, dev):
+    q = "SELECT grp, SUM(qty) AS s, COUNT(*) AS n FROM v GROUP BY grp"
+    for lo in (3000, 100, 3900):
+        v = mx.scan_parquet(path).filter(col("id") >= lo)
+        want = _duck(f"SELECT grp, SUM(qty) AS s, COUNT(*) AS n FROM (SELECT * FROM t WHERE id >= {lo}) v GROUP BY grp",
+                     t=path)
+        _same(mx.sql(q, v=v).compute(device=dev), want, ordered=False)
+
+
+@pytest.mark.parametrize("how", ["JOIN", "LEFT JOIN"])
+def test_self_join_filtered_on_one_side_only(path, src, dev, how):
+    q = (f"SELECT x.grp, COUNT(*) AS n, COUNT(y.id) AS ny FROM t x {how} t y "
+         "ON x.id = y.id WHERE x.id < 300 GROUP BY x.grp")
+    _same(mx.sql(q, t=src(path)).compute(device=dev), _duck(q, t=path), ordered=False)
+    q2 = (f"SELECT x.grp, COUNT(*) AS n FROM t x {how} t y ON x.id = y.id "
+          "WHERE x.qty > 25 AND x.id < 300 GROUP BY x.grp")
+    _same(mx.sql(q2, t=src(path)).compute(device=dev), _duck(q2, t=path), ordered=False)
+
+
+def test_aggregated_lazyframe_as_table(path, dev):
+    agg = mx.scan_parquet(path).groupby("grp").agg(col("qty").sum().alias("total"), col("id").count().alias("n"))
+    q = "SELECT grp, total, n FROM g WHERE total > 0 ORDER BY total DESC, grp"
+    want = _duck("SELECT grp, total, n FROM (SELECT grp, SUM(qty) AS total, COUNT(id) AS n FROM t GROUP BY grp) g "
+                 "WHERE total > 0 ORDER BY total DESC, grp", t=path)
+    _same(mx.sql(q, g=agg).compute(device=dev), want, ordered=True)
+
+
+def test_renamed_lazyframe_as_table(path, dev):
+    lf = mx.scan_parquet(path).select(col("id").alias("key"), col("qty").alias("amount"), "grp")
+    q = "SELECT grp, SUM(amount) AS s FROM r WHERE key < 2000 GROUP BY grp"
+    want = _duck("SELECT grp, SUM(qty) AS s FROM t WHERE id < 2000 GROUP BY grp", t=path)
+    _same(mx.sql(q, r=lf).compute(device=dev), want, ordered=False)
