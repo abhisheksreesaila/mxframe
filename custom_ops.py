@@ -1927,7 +1927,10 @@ class CustomOpsCompiler(GraphCompiler):
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
                 exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(agg_arrays[i].type)
-                out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
+                if exact and e.op in ("min", "max"):
+                    out_cols.append(pc.cast(c, agg_arrays[i].type))        # the column's own integer type
+                else:
+                    out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
             result = pa.Table.from_arrays(out_cols, names=key_names + agg_names)
         else:
             cols = []
@@ -1940,7 +1943,7 @@ class CustomOpsCompiler(GraphCompiler):
                     cols.append(_npa([_int_sum(arr)], type=pa.int64()))        # OverflowError past int64
                     continue
                 if exact:
-                    cols.append(_npa([pc.min_max(arr)[e.op].as_py()], type=pa.int64()))
+                    cols.append(_npa([pc.min_max(arr)[e.op].as_py()], type=arr.type))      # the column's own integer type
                     continue
                 if e.op in ("min", "max"):
                     cols.append(_npa([float_extreme(arr, e.op)], type=pa.float64()))

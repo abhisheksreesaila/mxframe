@@ -637,7 +637,14 @@ class _SQLTranslator:
                if lk != rk and lk in lt and rk in rt and lt[lk] != rt[rk] and rk not in lt}
         if not own:
             return right_plan, right_on, own
-        copies = {rk: f"__key_{rk}" for rk in own}
+        taken = set(lt) | set(rt) | set(right_cols)
+        copies = {}
+        for rk in sorted(own):
+            name = f"__key_{rk}"
+            while name in taken:
+                name = "_" + name
+            taken.add(name)
+            copies[rk] = name
         exprs = [col(c) for c in right_cols] + [col(rk).alias(copies[rk]) for rk in copies]
         return Project(right_plan, exprs), [copies.get(rk, rk) for rk in right_on], own
 

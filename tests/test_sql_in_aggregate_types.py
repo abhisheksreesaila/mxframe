@@ -122,3 +122,71 @@ def test_int_float_join_keeps_each_sides_key_column(device):
     got = mx.sql(q, t=t, u=u).compute(device=device).sort_by("i")
     assert got.schema.types == want.schema.types
     assert got.to_pydict() == want.to_pydict()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("variant", ["plain", "with_big_int64", "with_nulls"])
+@pytest.mark.parametrize("grouped", [True, False])
+def test_int32_min_max_keep_int32(variant, grouped, device):
+    t = pa.table({
+        "a": pa.array([1, 1, 2, 2], pa.int64()),
+        "j": pa.array([5, None if variant == "with_nulls" else 9, -3, 7], pa.int32()),
+        "b": pa.array([2 ** 60 + 1, 2 ** 60 + 3, 4, 5] if variant == "with_big_int64" else [1, 2, 3, 4], pa.int64()),
+    })
+    extra = ", max(b) AS mb" if variant == "with_big_int64" else ""
+    q = (f"SELECT a, max(j) AS mx, min(j) AS mn{extra} FROM t GROUP BY a ORDER BY a" if grouped
+         else f"SELECT max(j) AS mx, min(j) AS mn{extra} FROM t")
+    want = _duck_types(q, t)
+    got = mx.sql(q, t=t).compute(device=device)
+    if grouped:
+        got = got.sort_by("a")
+    assert got.schema.types == want.schema.types
+    assert got.to_pydict() == want.to_pydict()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_hidden_join_key_name_does_not_collide_with_a_user_column(device):
+    t = pa.table({"i": pa.array([1, 2, 3], pa.int64())})
+    u = pa.table({"x": pa.array([2.0, 3.0], pa.float64()), "__key_x": pa.array([1, 2], pa.int64())})
+    q = "SELECT t.i, u.x, __key_x FROM t JOIN u ON t.i = u.x ORDER BY t.i"
+    con = duckdb.connect()
+    con.register("t", t)
+    con.register("u", u)
+    want = con.execute(q).to_arrow_table()
+    got = mx.sql(q, t=t, u=u).compute(device=device).sort_by("i")
+    assert got.schema.types == want.schema.types
+    assert got.to_pydict() == want.to_pydict()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("variant", ["plain", "with_big_int64", "with_nulls"])
+@pytest.mark.parametrize("grouped", [True, False])
+def test_int32_min_max_keep_int32(variant, grouped, device):
+    t = pa.table({
+        "a": pa.array([1, 1, 2, 2], pa.int64()),
+        "j": pa.array([5, None if variant == "with_nulls" else 9, -3, 7], pa.int32()),
+        "b": pa.array([2 ** 60 + 1, 2 ** 60 + 3, 4, 5] if variant == "with_big_int64" else [1, 2, 3, 4], pa.int64()),
+    })
+    extra = ", max(b) AS mb" if variant == "with_big_int64" else ""
+    q = (f"SELECT a, max(j) AS mx, min(j) AS mn{extra} FROM t GROUP BY a ORDER BY a" if grouped
+         else f"SELECT max(j) AS mx, min(j) AS mn{extra} FROM t")
+    want = _duck_types(q, t)
+    got = mx.sql(q, t=t).compute(device=device)
+    if grouped:
+        got = got.sort_by("a")
+    assert got.schema.types == want.schema.types
+    assert got.to_pydict() == want.to_pydict()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_hidden_join_key_name_does_not_collide_with_a_user_column(device):
+    t = pa.table({"i": pa.array([1, 2, 3], pa.int64())})
+    u = pa.table({"x": pa.array([2.0, 3.0], pa.float64()), "__key_x": pa.array([1, 2], pa.int64())})
+    q = "SELECT t.i, u.x, __key_x FROM t JOIN u ON t.i = u.x ORDER BY t.i"
+    con = duckdb.connect()
+    con.register("t", t)
+    con.register("u", u)
+    want = con.execute(q).to_arrow_table()
+    got = mx.sql(q, t=t, u=u).compute(device=device).sort_by("i")
+    assert got.schema.types == want.schema.types
+    assert got.to_pydict() == want.to_pydict()
