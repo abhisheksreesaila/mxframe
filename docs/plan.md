@@ -547,6 +547,22 @@ Needs: none · Seen 2026-10-16 in a full-suite run (test_tpch_duckdb, Q17 on aut
 - [x] tests (`tests/test_f063_exit_drain.py`): two deterministic ones (exit waits for an in-flight warm-up; none starts once exiting), both fail before the fix; `MXFRAME_STRESS=1` opt-in test, 300 real warm-ups exited at random moments 0.28-0.42 s into CUDA init: 0 failures after the fix (about 1.3% failed before, so 300 runs would show ~4). After the fix `stress_auto_crash.py --runs 200 --queries 17,11,22,1 --load 2`: 200 of 200 exit 0
 - [ ] reviewer: a full-suite run on a loaded machine should show no more -6 / -11 in test_tpch_duckdb auto cases
 
+## F-064 Reproducible float aggregates [todo]
+Needs: F-033 merged · Found by the F-033 review (2026-10-16): silent wrong answers in natural use
+- [ ] the executor hands out row blocks through an atomic counter, so which worker sums which rows changes per run and float SUM / MEAN differ in the last bits (5,076 of 10k group sums differ between two runs at SF1). Q15 written with an uncomputed view (`view.filter(col("tot") == view.scalar(col("tot").max()))`) returns 0 rows in 8 of 8 runs; DuckDB returns 1
+- [ ] same input and thread count give bit-identical SUM / MEAN on every native path (single table, fused join + aggregate, GPU fallback): fixed block-to-worker assignment or per-block partials merged in block order; measure the cost (work stealing helped skewed inputs)
+- [ ] checks: the F-033 xfail test (uncomputed-view Q15) passes 20 of 20 runs and equals DuckDB; SF1 revenue per supplier over 30 runs: 0 groups differ
+
+## F-065 SQL subqueries [todo]
+Needs: F-033 · From the F-033 review: SQL-phrased Q11, Q15, Q18, Q21, Q22 get none of the native subquery work
+- [ ] scalar subquery in WHERE / HAVING (`WHERE v > (SELECT AVG(v) ...)`) maps to `LazyFrame.scalar`; `IN (SELECT ...)` / `EXISTS` map to semi joins, `NOT IN` / `NOT EXISTS` to anti joins (NULL semantics of NOT IN like DuckDB)
+- [ ] until a form is supported, a clear error instead of today's misleading "aggregate functions are not allowed in WHERE"
+- [ ] SQL versions of the 22 TPC-H queries run and equal DuckDB; `scripts/native_coverage.py` reports the same native coverage for SQL as for the DataFrame versions
+
+## F-066 Committed kernel libraries match their source [todo]
+From the F-033 review: `libmxpipeline_cpu.so` was stale against `pipeline_cpu.mojo`; CI only builds `libmxkernels_aot.so` and the wheel ships the committed `.so` files
+- [ ] store a source hash next to each committed `.so` at build time; a test fails when a `.mojo` source changed without its library being rebuilt
+
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
