@@ -24,7 +24,7 @@ Build:
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero, unsafe_memcpy
-from max.algorithm import parallelize
+from _fpenv import par, par_n
 from std.atomic import Atomic
 from std.ffi import external_call
 
@@ -123,12 +123,12 @@ def mx_join_semi_select(
         set_bits(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(set_bits, w_build)
+        par(set_bits, w_build)
     if w_probe == 1:
         probe_bits(0)
     else:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-        parallelize(probe_bits, w_probe)
+        par(probe_bits, w_probe)
 
     # compact the per-morsel slots (each starts at m * MORSEL) into one ascending run
     var total = 0
