@@ -1517,26 +1517,15 @@ def _npa_i32_empty():
     return _npa(np.empty(0, dtype=np.int32))
 
 
-def _group_codes(t):
-    """Dense int64 codes (equal values, equal codes) of a key column: values as they are for integers,
-    dictionary indices of the strings (hashed, no sort)."""
-    import numpy as np
-    from ._lazy_pc import pc
-    from .np_arrow import to_numpy as _np_of, combine as _combine
-    arr = _combine(t) if isinstance(t, pa.ChunkedArray) else t
-    if not pa.types.is_integer(arr.type):
-        arr = pc.dictionary_encode(pc.cast(arr, pa.string()) if pa.types.is_dictionary(arr.type) else arr).indices
-    return np.asarray(_np_of(arr, zero_copy_only=False)).astype(np.int64)
-
-
 def _try_prow_groups(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops, only_if_wide=False) -> Optional[pa.Table]:
     """Group keys past direct addressing (TPC-H Q3's per-order keys, Q10's per-customer keys): when every key is
     a column of ONE partner (or the fact column equal to its join key), group by the partner's ROW (a dense id
     below its row count: `K_PROW`, the executor gathers the row number like any partner column), then take
-    the key columns from the partner at those rows. Keys that do not include the partner's unique join key
-    make several partner rows share a key tuple: those groups are merged here (sums and counts add, min / max
-    fold, a mean is its sum over its count). HAVING and ORDER BY / LIMIT run on that small result, the
-    way the old path runs them. None: not this shape (or the partner has more rows than a direct id space)."""
+    key columns from the partner at those rows. Only when the keys include the partner's unique join key:
+    otherwise several partner rows share a key tuple (Q10's per-customer keys through orders) and their groups
+    would have to be merged, which is left to a native merge (declined here). HAVING and ORDER BY / LIMIT run
+    on that small result, the way the old path runs them. None: not this shape (or the partner has more rows
+    than a direct id space)."""
     import numpy as np
     from ._lazy_pc import pc
     from .lazy_expr import Expr
@@ -1584,51 +1573,18 @@ def _try_prow_groups(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops, o
                 break
         if est <= MAX_GROUPS:
             return None
-    merge = bool(set(lk.build_keys) - set(take_from))
-    extra = []
-    if merge:
-        extra = [Expr("sum", a.args[0]).alias(f"__hs{i}") for i, a in enumerate(plan.aggs) if a.op == "mean"]
-        extra.append(Expr("count", Expr("lit", 1)).alias("__hc"))
+    if set(lk.build_keys) - set(take_from):          # several partner rows per key tuple: needs a merge
+        return None
     vcols = dict(fj.vcols)
     vcols["__prow"] = ("prow", j)
     fj2 = FusedJoin(fj.scan, fj.preds, fj.lookups, vcols, fj.post_preds)
     fj2.cache = fj.cache
-    R = try_execute_join(compiler, Aggregate(None, [Expr("col", "__prow")], list(plan.aggs) + extra), fj2, None, None)
+    R = try_execute_join(compiler, Aggregate(None, [Expr("col", "__prow")], list(plan.aggs)), fj2, None, None)
     if R is None:
         return None
     out_names = [a._alias or f"agg_{i}" for i, a in enumerate(plan.aggs)]
     gp = np.asarray(_np_of(_combine(R.column("__prow")), zero_copy_only=False)).astype(np.int64)    # partner row per group
     agg_cols = [R.column(n) for n in out_names]
-    if merge and len(gp):
-        def num(n):
-            return np.asarray(_np_of(_combine(R.column(n)), zero_copy_only=False))
-        gid, span = None, 1
-        for bn in take_from:                       # codes per partner row, then per group; no string is materialized
-            c = _group_codes(b.column(bn))[gp]
-            w = int(c.max()) + 1
-            if gid is not None and span * w >= 1 << 62:      # compact the combined codes before they overflow
-                gid = np.unique(gid, return_inverse=True)[1].astype(np.int64)
-                span = int(gid.max()) + 1
-            gid = c if gid is None else gid * w + c
-            span *= w
-        order = np.argsort(gid, kind="stable")
-        sg = gid[order]
-        starts = np.flatnonzero(np.concatenate(([True], sg[1:] != sg[:-1])))
-        gp = gp[order[starts]]
-        cnt = np.add.reduceat(num("__hc")[order].astype(np.float64), starts)
-        agg_cols = []
-        for i, a in enumerate(plan.aggs):
-            v = num(out_names[i])[order]
-            if a.op == "sum":
-                agg_cols.append(_npa(np.add.reduceat(v.astype(np.float64), starts)))
-            elif a.op == "count":
-                agg_cols.append(_npa(np.add.reduceat(v.astype(np.int64), starts)))
-            elif a.op == "min":
-                agg_cols.append(_npa(np.fmin.reduceat(v.astype(np.float64), starts)))
-            elif a.op == "max":
-                agg_cols.append(_npa(np.maximum.reduceat(v.astype(np.float64), starts)))
-            else:
-                agg_cols.append(_npa(np.add.reduceat(num(f"__hs{i}")[order].astype(np.float64), starts) / cnt))
 
     def subset(idx):
         nonlocal gp, agg_cols

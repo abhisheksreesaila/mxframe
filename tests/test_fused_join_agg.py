@@ -477,7 +477,7 @@ def _wide_dim(m=6000, seed=11):
     return pa.table({
         "dk": A(np.arange(m, dtype=np.int64)),
         "a": A((r.integers(0, 50, m) * 40_000).astype(np.int64)),
-        "b": A(r.integers(0, 10, m).astype(np.int32)),
+        "b": A(r.integers(-5, 6, m).astype(np.int32)),                 # negative values among the keys
         "nm": _dict_col([NAMES[i] for i in r.integers(0, 7, m)], 1, seed),
         "w": A(np.round(r.random(m), 3)),
     })
@@ -497,29 +497,59 @@ def test_keys_with_the_partners_unique_key_group_by_partner_row(calls):
     assert got.schema.field("k").type == pa.int64() and got.schema.field("cls").type == pa.int32()
 
 
-@pytest.mark.parametrize("shape", ["unsorted", "top-k", "having"])
-def test_partner_keys_without_the_unique_key_are_merged(calls, shape):
-    """TPC-H Q10's shape: keys are columns of one partner but not its join key, so partner rows sharing a key
-    tuple are merged: sums and counts add, min / max fold, a mean is its sum over its count."""
+def test_negative_key_values_after_the_first_key_group_by_partner_row(calls):
+    """Keys with the partner's unique key (so one group per partner row), a negative value in a non-first key,
+    in every order."""
     fact, _, _, _ = _tables()
     dim = _wide_dim()
     fact = fact.set_column(0, "k", A((np.asarray(fact.column("k").to_numpy()) % 6000).astype(np.int64)))
+    for keys in (["k", "b", "a"], ["b", "k", "a"], ["a", "b", "k"]):
+        calls.update(exec=[], star=0, filter=0, rc3=[])
+        got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
+               .groupby(*keys).agg((col("v") * col("w")).sum().alias("s"), col("v").count().alias("n"),
+                                   col("v").mean().alias("av")).compute(device="cpu"))
+        _fused(calls)
+        assert calls["rc3"] == [0], (keys, calls)
+        exp = _duck(f"SELECT {', '.join(keys)}, SUM(v * w) s, COUNT(v) n, AVG(v) av FROM fact JOIN dim ON k = dk "
+                    f"GROUP BY {', '.join(keys)} ORDER BY {', '.join(keys)}", fact=fact, dim=dim)
+        _same(_rows(got, keys + ["s", "n", "av"]), exp, ordered=True)
+
+
+@pytest.mark.parametrize("keys", [["a", "b", "nm"], ["b", "a"], ["a", "b"]])
+def test_partner_keys_without_the_unique_key_decline_with_the_right_groups(calls, keys):
+    """Several partner rows share a key tuple (TPC-H Q10's per-customer keys through orders): grouping by
+    partner row would need a merge, so the fused call declines and the old path answers (negative key
+    values included)."""
+    fact, _, _, _ = _tables()
+    dim = _wide_dim()
+    fact = fact.set_column(0, "k", A((np.asarray(fact.column("k").to_numpy()) % 6000).astype(np.int64)))
+    got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
+           .groupby(*keys).agg((col("v") * col("w")).sum().alias("s"), col("v").count().alias("n"),
+                               col("v").mean().alias("av")).compute(device="cpu"))
+    _declined(calls)
+    exp = _duck(f"SELECT {', '.join(keys)}, SUM(v * w) s, COUNT(v) n, AVG(v) av FROM fact JOIN dim ON k = dk "
+                f"GROUP BY {', '.join(keys)} ORDER BY {', '.join(keys)}", fact=fact, dim=dim)
+    assert len(exp) > 100
+    _same(_rows(got, keys + ["s", "n", "av"]), exp, ordered=True)
+
+
+@pytest.mark.parametrize("having", [False, True])
+def test_top_k_by_a_count_with_heavy_ties_follows_the_key_tie_break(calls, having):
+    """ORDER BY count LIMIT 7 where most counts are equal: the rows that tie at the boundary come out in
+    key order, as DuckDB's `ORDER BY n DESC, keys` gives them."""
+    fact, _, _, _ = _tables()
+    dim = _wide_dim()
+    n = fact.num_rows
+    k = (12 + np.arange(n) % 138) * 40                               # 138 keys, about 870 rows each
+    k[: 12 * 1000] = np.arange(12 * 1000) % 12 * 40                  # 12 keys with exactly 1000 more: they tie for the top 7
+    k = k.astype(np.int64)
+    fact = fact.set_column(0, "k", A(k))
     lf = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
-          .groupby("a", "b", "nm").agg((col("v") * col("w")).sum().alias("s"), col("v").count().alias("n"),
-                                       col("v").min().alias("lo"), col("v").max().alias("hi"), col("v").mean().alias("av")))
-    sql = "SELECT a, b, nm, SUM(v * w) s, COUNT(v) n, MIN(v) lo, MAX(v) hi, AVG(v) av FROM fact JOIN dim ON k = dk GROUP BY a, b, nm"
-    if shape == "top-k":
-        lf, sql = lf.sort("s", descending=True).limit(5), sql + " ORDER BY s DESC, a, b, nm LIMIT 5"
-    elif shape == "having":
-        sums = sorted(r[0] for r in _duck(f"SELECT s FROM ({sql})", fact=fact, dim=dim))
-        cut = (sums[1500] + sums[1501]) / 2                     # between two groups: no tie on the last bits
-        lf, sql = lf.filter(col("s") > lit(cut)), sql + f" HAVING SUM(v * w) > {cut!r} ORDER BY a, b, nm"
-    else:
-        sql = sql + " ORDER BY a, b, nm"                                      # unsorted: key order
-    got = lf.compute(device="cpu")
+          .groupby("k", "b", "a").agg(col("v").count().alias("n"), col("v").sum().alias("s")))
+    sql = "SELECT k, b, a, COUNT(v) n, SUM(v) s FROM fact JOIN dim ON k = dk GROUP BY k, b, a"
+    if having:
+        lf, sql = lf.filter(col("n") > lit(3)), sql + " HAVING COUNT(v) > 3"
+    got = lf.sort("n", descending=True).limit(7).compute(device="cpu")
     _fused(calls)
-    assert calls["rc3"] == [0], calls
-    exp = _duck(sql, fact=fact, dim=dim)
-    assert len(exp) > 3
-    _same(_rows(got, ["a", "b", "nm", "s", "n", "lo", "hi", "av"]), exp, ordered=True)
-    assert got.schema.field("nm").type == pa.string() and got.schema.field("a").type == pa.int64()
+    exp = _duck(sql + " ORDER BY n DESC, k, b, a LIMIT 7", fact=fact, dim=dim)
+    _same(_rows(got, ["k", "b", "a", "n", "s"]), exp, ordered=True)
