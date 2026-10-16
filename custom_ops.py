@@ -3180,6 +3180,10 @@ class CustomOpsCompiler(GraphCompiler):
         """
         if isinstance(plan, Scan):
             return plan.table
+        if isinstance(plan, (Filter, Project)) and self._contains_aggregate(plan.input):
+            # F-033: a subquery's HAVING (a Filter over an Aggregate, with or without a select above it) is
+            # the executor's HAVING, not a predicate evaluated in Arrow over every group
+            return self.compile_and_run(plan)
         if isinstance(plan, Filter):
             got = self._native_filter_scan(plan, None)
             if got is not None:
