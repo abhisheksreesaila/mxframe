@@ -612,6 +612,8 @@ class _CUDADriver:
             self._tls.bound = True
 
     def malloc(self, nbytes: int) -> int:
+        if nbytes <= 0:
+            return 0        # null handle: cuMemAlloc(0) fails, and cuMemFree(0) is a no-op
         self.bind_thread()
         ptr = ctypes.c_uint64(0)
         err = self._lib.cuMemAlloc_v2(ctypes.byref(ptr), nbytes)

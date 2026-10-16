@@ -842,7 +842,7 @@ Found by the F-083 review (2026-10-16); a silent wrong answer on main
 - [ ] `SELECT *, a+1 AS x FROM t` returns only `x`; DuckDB returns every column then `x`. Expand `*` in place among other select items (and `t.*`), with or without ORDER BY (F-083 made the ORDER BY form raise; replace that error with the real expansion)
 - [ ] DuckDB-checked tests: `*, expr`, `expr, *`, `t.*, u.c` over a join, with WHERE / ORDER BY / LIMIT, name clash between `*` and an alias; fails before
 
-## F-089 GPU ORDER BY ... LIMIT 0 crashes [todo]
+## F-089 GPU ORDER BY ... LIMIT 0 crashes [review]
 Found by the F-083 review (2026-10-16)
 - [ ] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
 - [ ] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
