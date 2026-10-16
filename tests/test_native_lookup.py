@@ -3,7 +3,7 @@
 A scanned table is filtered and each of its rows looks its partner row up in a map Mojo builds over
 the partner's join key (a direct array for compact ranges, a partitioned hash table otherwise), in
 the same pass. Only joined rows are written: the scanned table's columns, then each partner's.
-Partner keys must be unique; a duplicate declines and the caller joins as before."""
+Partner keys may repeat (F-046a slice 2): a matching key gives one joined row per partner row, in build order."""
 import numpy as np
 import pyarrow as pa
 import pytest
