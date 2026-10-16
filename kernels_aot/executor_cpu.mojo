@@ -1808,17 +1808,20 @@ def _out_value(op: Int, slot: Int, nslot: Int, g: Int, G: Int, vals: FP, cnt: LP
 
 @always_inline
 def _cmp(x: Float64, op: Int, c: Float64) -> Bool:
+    """x <op> c with DuckDB's order for NaN (F-070): above every number (+inf too), and NaN = NaN."""
+    var xn = not (x == x)
+    var cn = not (c == c)
     if op == 0:
-        return x < c
+        return x < c or (cn and not xn)
     if op == 1:
-        return x <= c
+        return x <= c or cn
     if op == 2:
-        return x > c
+        return x > c or (xn and not cn)
     if op == 3:
-        return x >= c
+        return x >= c or xn
     if op == 4:
-        return x == c
-    return x != c
+        return x == c or (xn and cn)
+    return not (x == c or (xn and cn))
 
 
 @always_inline

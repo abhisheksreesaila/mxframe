@@ -144,6 +144,29 @@ def value_set(values, like) -> pa.Array:
     return array(values)
 
 
+def is_in(col, values):
+    """SQL ``col IN (values)`` as a boolean array: NULL where ``col`` is NULL (``pc.is_in`` answers False there,
+    which made ``NOT IN`` keep the NULL rows)."""
+    values = list(values)
+    has_null = any(v is None for v in values)          # x IN (1, NULL) is true or NULL, never false
+    values = [v for v in values if v is not None]
+    if pa.types.is_floating(col.type):
+        # DuckDB: -0.0 = 0.0 and NaN = NaN; Arrow's hash lookup tells -0.0 from 0.0 (F-070). Adding 0.0 turns
+        # -0.0 into 0.0, and NaN is looked up with a mask of its own.
+        has_nan = any(v != v for v in values)
+        zero = scalar(0.0, type=col.type)
+        r = pc.is_in(pc.add(col, zero), value_set=value_set([v + 0.0 for v in values if v == v], col.type))
+        if has_nan:
+            r = pc.or_kleene(r, pc.is_nan(col))
+    else:
+        r = pc.is_in(col, value_set=value_set(values, col.type))
+    if has_null:
+        r = pc.if_else(r, scalar(True, type=pa.bool_()), pa.nulls(1, pa.bool_())[0])
+    if getattr(col, "null_count", 0):
+        r = pc.if_else(pc.is_valid(col), r, pa.nulls(1, pa.bool_())[0])
+    return r
+
+
 def _masked(obj, type):
     """1-D masked numeric/bool array: values plus a validity bitmap, None if not supported."""
     data = np.ma.getdata(obj)
@@ -423,6 +446,17 @@ def distinct_rows(table: pa.Table) -> pa.Table:
     return pc.take(table, array(first.astype(np.int64)))
 
 
+def float_extreme(a, op: str):
+    """``min`` / ``max`` of an Arrow array as a Python number (None: no valid value), ordering NaN above every
+    number like DuckDB (F-070): min skips NaN (NaN if that is all there is), max is NaN if there is one."""
+    v = pc.min_max(a)[op].as_py()
+    if pa.types.is_floating(a.type):
+        n_nan = pc.sum(pc.is_nan(a)).as_py() or 0
+        if n_nan and (op == "max" or n_nan == len(a) - a.null_count):
+            return float("nan")
+    return v
+
+
 def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
     """``table.group_by(keys).aggregate(spec)`` for spec ops sum / min / max / mean / count (nulls
     skipped; a group with no valid value gives NULL, count 0). Columns: keys, then ``<col>_<op>``."""
@@ -466,11 +500,14 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
                 with np.errstate(invalid="ignore", divide="ignore"):
                     res = res / cnt
         else:
-            # NaN is skipped, like Table.group_by; a group of only NaN gives NaN (PyArrow gives +-inf)
+            # DuckDB orders NaN above every number (F-070): min skips NaN (a group of only NaN gives NaN), max is
+            # NaN when the group holds one (Table.group_by skips NaN in both and gives +-inf for only-NaN)
             num = ~np.isnan(x)
             res = np.full(n_groups, np.inf if op == "min" else -np.inf)
             (np.minimum if op == "min" else np.maximum).at(res, g[num], x[num])
             res[np.bincount(g[num], minlength=n_groups) == 0] = np.nan
+            if op == "max":
+                res[np.bincount(g[~num], minlength=n_groups) > 0] = np.nan
         t = a.type
         typ = (t if op in ("min", "max") else
                pa.int64() if op == "sum" and pa.types.is_integer(t) else pa.float64())

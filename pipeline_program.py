@@ -62,6 +62,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
+import math
 import numpy as np
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
@@ -100,11 +101,31 @@ OP_NAMES = {
 _COLUMN_OPS = (OP_LOAD_COL, OP_CMPC, OP_STR)     # instructions whose operand `a` is a column index
 _ARITH = {"add": OP_ADD, "sub": OP_SUB, "mul": OP_MUL, "div": OP_DIV}
 _CMP = {"lt": OP_LT, "le": OP_LE, "gt": OP_GT, "ge": OP_GE, "eq": OP_EQ, "ne": OP_NE}
+# Comparisons follow DuckDB's order for floats (F-070): NaN is above every number, +inf included, and NaN = NaN.
+# A compare instruction carries NAN_AWARE in its last word when it needs it; otherwise it is IEEE's, which is
+# DuckDB's wherever NaN cannot tell the difference: an integer is never NaN, and against a constant that is not
+# NaN only `x > c` and `x >= c` (and `c < x`, `c <= x`) differ (NaN is above c), so `x < 1.0`, `x = 1.5` and
+# friends run the unchanged instructions. CMPC keeps its compare code in the low byte and the flag in bit 8.
+NAN_AWARE = 1
+_NAN_ABOVE_CONST = {"gt", "ge"}               # `x <op> c` for a constant c that is not NaN: NaN is above c
+_NAN_BELOW_CONST = {"lt", "le"}               # `c <op> x`: the mirror image
+
+
+def _needs_nan_flag(op: str, a, b) -> bool:
+    """Does the compare ``a <op> b`` of numeric operands ``a``, ``b`` (a _Val or _Const each) have to order NaN?"""
+    if "float" not in (a.kind, b.kind):
+        return False
+    if isinstance(b, _Const) and b.value == b.value:
+        return op in _NAN_ABOVE_CONST
+    if isinstance(a, _Const) and a.value == a.value:
+        return op in _NAN_BELOW_CONST
+    return True
 _FOLD = {
     OP_ADD: lambda a, b: a + b, OP_SUB: lambda a, b: a - b, OP_MUL: lambda a, b: a * b,
-    OP_LT: lambda a, b: float(a < b), OP_LE: lambda a, b: float(a <= b),
-    OP_GT: lambda a, b: float(a > b), OP_GE: lambda a, b: float(a >= b),
-    OP_EQ: lambda a, b: float(a == b), OP_NE: lambda a, b: float(a != b),
+    OP_LT: lambda a, b: float(a < b or (b != b and a == a)), OP_LE: lambda a, b: float(a <= b or b != b),
+    OP_GT: lambda a, b: float(a > b or (a != a and b == b)), OP_GE: lambda a, b: float(a >= b or a != a),
+    OP_EQ: lambda a, b: float(a == b or (a != a and b != b)),
+    OP_NE: lambda a, b: float(not (a == b or (a != a and b != b))),
     OP_AND: lambda a, b: float(a != 0 and b != 0), OP_OR: lambda a, b: float(a != 0 or b != 0),
 }
 
@@ -628,8 +649,6 @@ class _Builder:
                     raise Unsupported("integer literal beyond 2**53 is not exact in float64")
                 return _Const(float(v), "int")
             if isinstance(v, (float, np.floating)):
-                if v != v:
-                    raise Unsupported("NaN literal")
                 return _Const(float(v), "float")
             raise Unsupported(f"literal {type(v).__name__} outside a string predicate")
         if op == "rowid":
@@ -769,7 +788,8 @@ class _Builder:
         code = _CMP[op]
         if isinstance(a, _Const) and isinstance(b, _Const):
             return _Const(_FOLD[code](a.value, b.value), "bool")
-        return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), "bool")
+        flag = NAN_AWARE if _needs_nan_flag(op, a, b) else 0
+        return _Val(self.emit(code, self.as_reg(a), self.as_reg(b), flag), "bool")
 
     _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 
@@ -822,7 +842,8 @@ class _Builder:
             thr, code = res
             ix = self._column(name)
             k = self.pool_index(thr)
-            return _Val(self.emit(OP_CMPC, ix, k, code, key_extra=("cmpc",)), "bool")
+            flag = NAN_AWARE << 8 if kind != "int" and eff in _NAN_ABOVE_CONST else 0
+            return _Val(self.emit(OP_CMPC, ix, k, code | flag, key_extra=("cmpc",)), "bool")
         return None
 
     def _dict_test(self, name: str, member: np.ndarray, negate: bool = False):
@@ -906,7 +927,7 @@ class _Builder:
             raise Unsupported("isin values must be numbers")
         if any(isinstance(v, (int, np.integer)) and abs(int(v)) > 2 ** 53 for v in values):
             raise Unsupported("integer literal beyond 2**53 is not exact in float64")
-        if x.kind == "int" and all(float(v) == int(v) for v in values):
+        if x.kind == "int" and all(math.isfinite(v) and float(v) == int(v) for v in values):
             ints = sorted({int(v) for v in values})
             lo, hi = ints[0], ints[-1]
             if hi - lo + 1 <= MAX_SET_SPAN:
@@ -920,7 +941,8 @@ class _Builder:
         for v in values:
             t = self._compare("eq", (col_e, Expr("lit", v))) if col_e.op == "col" else None
             if t is None:
-                t = _Val(self.emit(OP_EQ, x.vreg, self.const_reg(float(v))), "bool")
+                t = _Val(self.emit(OP_EQ, x.vreg, self.const_reg(float(v)), NAN_AWARE if x.kind == "float" and v != v else 0),
+                         "bool")          # (x = c is IEEE's unless c is NaN)
             if isinstance(t, _Const):
                 if t.value == 0:
                     continue
@@ -963,6 +985,10 @@ class _Builder:
             return None
         if isinstance(x, _Const):
             return None
+        if "float" in (x.kind, lo.kind, hi.kind) and not (
+                isinstance(lo, _Const) and isinstance(hi, _Const) and lo.value == lo.value and hi.value == hi.value):
+            return None        # a float BETWEEN is IEEE's (NaN fails `x <= hi`, as in DuckDB) only for constant bounds that are
+                               # not NaN; otherwise two NaN-aware compares
         return _Val(self.emit(OP_BETWEEN, x.vreg, self.as_reg(lo), self.as_reg(hi)), "bool")
 
 
@@ -1148,7 +1174,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             return [op, phys_of(ins[1]), phys_of(ins[2]), 0, 0]
         if op in (OP_SELECT, OP_BETWEEN):
             return [op, phys_of(ins[1]), phys_of(ins[2]), phys_of(ins[3]), phys_of(ins[4])]
-        return [op, phys_of(ins[1]), phys_of(ins[2]), phys_of(ins[3]), 0]
+        return [op, phys_of(ins[1]), phys_of(ins[2]), phys_of(ins[3]), ins[4] if OP_LT <= op <= OP_NE else 0]
 
     prologue = [[OP_LOAD_CONST, phys[b.const_vregs[k]], k, 0, 0] for k in sorted(b.const_vregs)]
     pred_code = [encode(i) for i in pred_sec.instrs]
