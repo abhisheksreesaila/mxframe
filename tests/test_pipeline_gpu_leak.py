@@ -36,10 +36,13 @@ def test_short_lived_threads_do_not_leak_device_memory(monkeypatch):
 
     # Count this process's own live device bytes (malloc minus free), not cuMemGetInfo: that reads
     # the whole device, so another process allocating on the GPU failed this test (F-075).
-    live, sizes = [0], {}
+    # Covers Python-side buffers only: Mojo's DeviceContext() (made per call in pipeline_gpu.mojo)
+    # allocates outside cu.malloc and is not visible here.
+    live, sizes, calls = [0], {}, [0]
     malloc, free = cu.malloc, cu.free
 
     def counting_malloc(nbytes):
+        calls[0] += 1
         ptr = malloc(nbytes)
         sizes[ptr] = max(int(nbytes), 8)
         live[0] += sizes[ptr]
@@ -59,4 +62,5 @@ def test_short_lived_threads_do_not_leak_device_memory(monkeypatch):
         th = threading.Thread(target=lambda: pk.run_pipeline_gpu(prog, cc, gids, g, 0, n))
         th.start()
         th.join()
-    assert (live[0] - before) / 2 ** 20 < 1, "device memory grew with the number of threads"
+    assert calls[0] >= 20, "allocation no longer goes through cu.malloc: the test would pass vacuously"
+    assert live[0] - before == 0, "device memory grew with the number of threads"
