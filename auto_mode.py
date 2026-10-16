@@ -742,10 +742,15 @@ def _close_background_gpu_work(timeout: float = 15.0) -> None:
     `device="auto"` (F-063).  A run that exits before the warm-up starts waits for nothing.
     """
     global _closing
-    _closing = True
     deadline = time.monotonic() + timeout
-    with _warmup_lock:
-        t = _warmup._thread if _warmup is not None else None
+    w = _warmup
+    if w is not None:
+        with w._lock:          # the lock GpuWarmup.start holds: no thread can begin after this
+            _closing = True
+            t = w._thread
+    else:
+        _closing = True
+        t = None
     if t is not None and t.is_alive():
         t.join(max(0.0, deadline - time.monotonic()))
     cf = sys.modules.get(__package__ + ".coproc_fused")
@@ -756,7 +761,12 @@ def _close_background_gpu_work(timeout: float = 15.0) -> None:
         wt.join(max(0.0, deadline - time.monotonic()))
 
 
-atexit.register(_close_background_gpu_work)
+# threading._register_atexit runs before every atexit hook (and before threads are joined), so
+# nothing else's exit work races a CUDA init still in flight; plain atexit where it is missing.
+try:
+    threading._register_atexit(_close_background_gpu_work)
+except (AttributeError, RuntimeError):
+    atexit.register(_close_background_gpu_work)
 
 
 def _init_gpu():
