@@ -890,10 +890,11 @@ Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
 
-## F-094 SQL modulo operator [todo]
+## F-094 SQL modulo operator [review]
 Found by the F-087 developer (2026-10-16)
-- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
-- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+- [x] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [x] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+Done: DuckDB probed (sign follows the dividend; integer `% 0` is NULL, float `% 0.0` is NaN; NULL in, NULL out; NaN stays NaN; `x % inf` is x). New `mod` Expr op (`np_arrow.modulo`, fmod) on the Arrow path: the arrays decide integer or float arithmetic (integers keep their type, uint64 and signed/unsigned mixes are exact, a decimal literal such as `% 2.5` is exact against integers and its zero divisor is NULL); the native bytecode has no modulo and declines it (`Unsupported`), the GPU runs it through the Arrow Project. `tests/test_sql_modulo.py` (162 DuckDB-checked, cpu + gpu, result kinds compared). Left alone: COALESCE / IS NULL over expressions is F-100. Found on the way, not fixed: `int_col + 1` (an integer literal in + - *) returns double where DuckDB returns an integer (`_float_expr` promotes the literal), so `(a + 1) % 0` is NaN, not NULL, and past 2^53 it rounds; needs its own ticket. A decimal literal (a point, no exponent; `1e3` is DOUBLE) is exact against integers as ((x % k) * s % k) / s in NumPy (about 20 ms per 1M rows on the loaded machine); it raises past k * s > int64 (a literal with ~19 digits). Still a Python loop: modulo of uint64 mixed with signed values (exact, slow on millions of rows).
 
 ## F-095 SQL over tables with uppercase or quoted column names [todo]
 Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
@@ -939,6 +940,7 @@ Found by the F-090 review (2026-10-16); a missing column on main
 ## F-103 SQL integer column plus integer literal stays integer [todo]
 Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
 - [ ] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
+- [ ] F-094 cases for the tests: `(a - 1) % 10` with `a` past 2^53 raises ArrowInvalid (`a - 1` is computed as a float), and `m % 0` over `(SELECT i32 + 1 AS m ...)` gives NaN instead of NULL
 - [ ] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
 
 ## F-104 Chained LEFT JOIN on the previous right table's key [todo]

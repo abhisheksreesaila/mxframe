@@ -35,6 +35,10 @@ class Expr:
     def __truediv__(self, other: Union['Expr', Any]) -> 'Expr':
         return Expr("div", self, lit(other) if not isinstance(other, Expr) else other)
 
+    def __mod__(self, other: Union['Expr', Any]) -> 'Expr':
+        """SQL ``%`` / ``MOD``: the sign follows the dividend (C ``fmod``), a zero divisor gives NULL."""
+        return Expr("mod", self, lit(other) if not isinstance(other, Expr) else other)
+
     def __eq__(self, other: Union['Expr', Any]) -> 'Expr': # type: ignore
         return Expr("eq", self, lit(other) if not isinstance(other, Expr) else other)
 
