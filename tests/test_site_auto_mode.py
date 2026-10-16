@@ -213,19 +213,19 @@ def test_coproc_numbers_are_cited_and_found_in_their_source():
 
 # ── honest limits: each claim is tied to the code it describes ──────────────
 
-def test_limit_auto_declines_the_whole_plan_native_executor():
-    src = (ROOT / "native_exec.py").read_text()
-    assert "CPU+GPU co-processing policy active" in src, "update the 'Honest limits' text: auto no longer declines the native executor"
-    assert "with _cf.policy(gpu_fraction=gpu_fraction)" in (ROOT / "lazy_frame.py").read_text()
+def test_limit_native_executor_declines_only_under_a_split_policy():
+    """The site says the policy (set only for a predicted split or gpu_fraction) is what makes it decline."""
+    assert "CPU+GPU co-processing policy active" in (ROOT / "native_exec.py").read_text()
+    assert "if decision.split or forced" in (ROOT / "lazy_frame.py").read_text()
 
 
 def test_limit_auto_decodes_count_distinct():
     assert 'count_distinct_codes=(device == "cpu")' in (ROOT / "lazy_frame.py").read_text()
 
 
-def test_limit_cost_model_does_not_know_the_native_executor():
-    for f in ("auto_mode.py", "calibration.py"):
-        assert "native" not in (ROOT / f).read_text().lower(), f"{f} now mentions the native executor: revisit the limits text"
+def test_limit_cost_model_prices_native_as_the_older_kernel():
+    assert _module_constants(ROOT / "auto_mode.py")["NATIVE_CPU_FACTOR"] == 1.0, "revisit the site's limits text"
+    assert "native" not in (ROOT / "calibration.py").read_text().lower(), "calibration now measures native: revisit the limits text"
 
 
 def test_limit_placer_and_residency_tracker_are_not_on_the_query_path():

@@ -141,13 +141,13 @@ main, .grid > *, .card, .card-b { min-width: 0; }
       <p class="sub" id="stale-note"></p>
     </div>
     <div class="callout">
-      <h3>Under <code>device="auto"</code>, the whole-plan native executor declines</h3>
-      <p>A CPU plan under <code>auto</code> runs with the co-processing policy switched on, and <code>native_exec.try_execute</code> declines whenever that policy is active. The per-operator native paths (filters, distinct, top-N) still run; the older fused pipeline answers the aggregate. I have not measured what this costs across the 22 queries. If you know your machine has no GPU, <code>device="cpu"</code> skips it.</p>
+      <h3>Under <code>device="auto"</code>, the native executor runs on a CPU decision</h3>
+      <p>A CPU decision under <code>auto</code> runs the native executor exactly as <code>device="cpu"</code> does. The co-processing policy, which makes <code>native_exec.try_execute</code> decline, is switched on only when the cost model predicts a CPU+GPU split of a fused aggregate that beats the native CPU executor by 10%, or when you pass <code>gpu_fraction</code>. <code>explain(device="auto", costs=True)</code> prints which path and why. I have not re-measured auto against <code>device="cpu"</code> across the 22 queries.</p>
       <p class="chk">check: native_exec.py "CPU+GPU co-processing policy active"</p>
     </div>
     <div class="callout">
-      <h3>The cost model prices the CPU with the older kernels</h3>
-      <p><code>calibration.py</code> and <code>auto_mode.py</code> know nothing about the native executor, so the CPU side of every price is the calibrated cost of the pre-native kernels. The calibration does refine itself from each run, but the first decisions on a new machine come from those fits.</p>
+      <h3>The cost model prices the native CPU executor as equal to the older kernel</h3>
+      <p>The calibration measures the older kernels. <code>auto_mode.NATIVE_CPU_FACTOR</code> (1.0, from one warm measurement on a busy machine) converts that to a native CPU price for the split-versus-native choice, so a split must beat the older kernel by 10%. The whole-query CPU price still comes from the older fits.</p>
     </div>
     <div class="callout">
       <h3>COUNT(DISTINCT) still decodes the counted column</h3>

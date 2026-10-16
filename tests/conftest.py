@@ -21,3 +21,13 @@ def pytest_configure(config):
 
 # Tests must never write observations into the user's real calibration file.
 os.environ.setdefault("MXFRAME_CALIBRATION", str(Path(tempfile.gettempdir()) / f"mxframe-test-calibration-{os.getpid()}.json"))
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _strict_native(monkeypatch):
+    """An unexpected exception in a native hook is raised in the tests, not turned into a quiet fallback
+    (a test that wants the fallback unsets it)."""
+    monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "1")

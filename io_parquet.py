@@ -91,7 +91,8 @@ def read_parquet_table(path, columns: Optional[Sequence[str]] = None, filters=No
     names = list(columns) if columns is not None else list(schema.names)
     dict_cols = dictionary_columns(path, schema, dictionary, max_dictionary_bytes, names)
     if filters is None and os.path.isfile(path):
-        return _read_file(path, names, dict_cols)
+        token = source_token(path, names, ())
+        return tag_source(_read_file(path, names, dict_cols), token)
     return pq.read_table(path, columns=names, filters=filters,
                          read_dictionary=dict_cols or None)
 
@@ -507,6 +508,40 @@ def _metadata_cached(path, dev, ino, mtime_ns, size):
     return pq.ParquetFile(path).metadata
 
 
+# ── source identity (F-057) ────────────────────────────────────────────────
+# Every compute of a `scan_parquet` frame reads the file again into new buffers, so the GPU
+# residency cache cannot key them by address. A table read from a file carries a token naming
+# what it holds: the file's identity (path, device, inode, mtime, size), the columns read and the
+# filters pushed into the reader. Two reads with the same token hold identical rows.
+_SOURCES: dict = {}                      # id(table) -> (weakref to the table, token)
+
+
+def source_token(path, columns, pushed) -> Optional[tuple]:
+    """Token of a read of ``columns`` of file ``path`` with ``pushed`` filters, or None for a directory."""
+    path = os.path.abspath(os.fspath(path))
+    if not os.path.isfile(path):
+        return None
+    st = os.stat(path)
+    return ("parquet", path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, tuple(columns), repr(tuple(pushed or ())))
+
+
+def tag_source(table: pa.Table, token: Optional[tuple]) -> pa.Table:
+    """Record ``token`` for ``table``, with its final column types (a string read as a dictionary or decoded
+    gives different codes, so those reads are different sources)."""
+    if token is not None:
+        import weakref
+        key = id(table)
+        token = token + (tuple(str(t) for t in table.schema.types),)
+        _SOURCES[key] = (weakref.ref(table, lambda _r, k=key: _SOURCES.pop(k, None)), token)
+    return table
+
+
+def table_source(table: pa.Table) -> Optional[tuple]:
+    """The token of a table read by `resolve_plan`, or None (an in-memory table, or one derived from a read)."""
+    got = _SOURCES.get(id(table))
+    return got[1] if got is not None and got[0]() is table else None
+
+
 def _metadata(path):
     st = os.stat(path)
     # the cached footer now drives data reads: key on file identity as well as mtime/size
@@ -518,7 +553,7 @@ def _metadata(path):
 _CMP_OPS = ("eq", "ne", "gt", "ge", "lt", "le")
 _FLIP = {"eq": "eq", "ne": "ne", "gt": "lt", "lt": "gt", "ge": "le", "le": "ge"}
 # Predicate forms the engine evaluates natively on dictionary columns.
-_NATIVE_DICT_PRED = ("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains")
+_NATIVE_DICT_PRED = ("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains", "like")
 
 
 class _Info:
@@ -620,7 +655,9 @@ def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
     """
     info = _Info()
 
-    def walk(node, passthru: bool) -> bool:
+    def walk(node, passthru: bool, native_keys=frozenset()) -> bool:
+        """``native_keys``: names the parent Aggregate reads only as bare group keys (dictionary-native):
+        a Project right below passes them through without forcing a decode (F-034, Q9's with_columns)."""
         if isinstance(node, (Scan, ParquetScan)):
             info.passthrough[id(node)] = info.passthrough.get(id(node), False) or passthru
             return False
@@ -634,7 +671,11 @@ def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
         if isinstance(node, Project):
             walk(node.input, False)
             for e in node.exprs:
-                info.use_plain(e, bare_ok=True)
+                if (native_keys and e.op == "col" and e._alias in (None, e.args[0]) and e.args[0] in native_keys
+                        and sum(e.args[0] in _expr_cols(o) for o in node.exprs) == 1):
+                    info.refs.add(e.args[0])            # a bare pass-through nothing else in the Project reads
+                else:
+                    info.use_plain(e, bare_ok=True)
             return True
         if isinstance(node, Aggregate):
             src = node.input.input if isinstance(node.input, Distinct) else None
@@ -648,7 +689,12 @@ def _analyze(plan: LogicalPlan, count_distinct_codes: bool = False) -> _Info:
                     walk(src, False)
                     info.refs.update(src.table.column_names)
                 return True
-            walk(node.input, False)
+            used = set()
+            for e in list(node.aggs) + [g for g in node.group_by if g.op != "col"]:
+                used |= _expr_cols(e)
+            walk(node.input, False, frozenset(g.args[0] for g in node.group_by
+                                              if g.op == "col" and g._alias in (None, g.args[0])
+                                              and g.args[0] not in used))
             for e in node.group_by:
                 if e.op == "col":
                     info.refs.add(e.args[0])          # bare group key: dictionary-native
@@ -817,19 +863,40 @@ def _filters_expression(filters):
 
 def _single_table_shape(plan) -> bool:
     """``[Sort / Limit / Distinct(all columns)]* [Project(plain columns)] Filter+ (Scan | ParquetScan)``:
-    one table filtered and selected, with nothing that reads its columns as values on the way."""
+    one table filtered and selected, with nothing that reads its columns as values on the way. A DISTINCT
+    needs no filter (F-033: it runs on the codes as a group-by)."""
     node = plan
+    distinct = False
     while isinstance(node, (Sort, Limit, Tail)) or (isinstance(node, Distinct) and not node.subset):
+        distinct = distinct or isinstance(node, Distinct)
         node = node.input
     if isinstance(node, Project):
         if not all(isinstance(e, Expr) and e.op == "col" for e in node.exprs):
             return False
         node = node.input
     if not isinstance(node, Filter):
-        return False
+        return distinct and isinstance(node, (Scan, ParquetScan))
     while isinstance(node, Filter):
         node = node.input
     return isinstance(node, (Scan, ParquetScan))
+
+
+def _fold_renames(node: LogicalPlan) -> LogicalPlan:
+    """A select that renames columns of an in-memory table (``nation.select(col("n_name").alias("supp_nation"))``,
+    TPC-H Q7) becomes a Scan of the same buffers under the new names (F-034): the dictionary analysis and the
+    join engine then see a plain leaf, so its dictionary columns stay codes through the join like any other."""
+    if isinstance(node, Project) and isinstance(node.input, Scan) and node.exprs \
+            and all(e.op == "col" for e in node.exprs) \
+            and any(e._alias not in (None, e.args[0]) for e in node.exprs):
+        inner = [e.args[0] for e in node.exprs]
+        outer = [e._alias or e.args[0] for e in node.exprs]
+        if len(set(outer)) == len(outer) and all(n in node.input.table.column_names for n in inner):
+            return Scan(node.input.table.select(inner).rename_columns(outer))
+    if isinstance(node, Join):
+        return dataclasses.replace(node, left=_fold_renames(node.left), right=_fold_renames(node.right))
+    if hasattr(node, "input") and node.input is not None:
+        return dataclasses.replace(node, input=_fold_renames(node.input))
+    return node
 
 
 def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: bool = False) -> LogicalPlan:
@@ -853,6 +920,8 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
                    for l in leaves)
     if not has_parquet and not has_dict:
         return plan
+    if has_dict:
+        plan = _fold_renames(plan)
     info = _analyze(plan, count_distinct_codes)
     single = _single_table_shape(plan)
 
@@ -861,6 +930,9 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
                 and not info.has_join and not info.passthrough.get(id(leaf), True))
 
     leaf_preds = _join_leaf_filters(plan) if info.has_join else {}
+
+    def hit(name: str, names) -> bool:
+        return name in names or (info.has_join and _renamed_ref(name, names))
 
     def deferrable(name: str, leaf) -> bool:
         """Under a join, leave a dictionary column encoded: the join engine decodes it after the
@@ -874,11 +946,12 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
             # that pass, or keeps codes for a DISTINCT above; unless a filter reads the column in a
             # way the engine can't evaluate on codes (CASE WHEN, arithmetic, ...)
             return name not in info.bad_expr
-        if not info.has_join or name not in info.refs or info.passthrough.get(id(leaf), True):
+        # a join renames a clashing right column (`n_name` -> `n_name_right`): the plan reads that name
+        if not info.has_join or not hit(name, info.refs) or info.passthrough.get(id(leaf), True):
             return False
         if id(leaf) not in leaf_preds:              # not a Filter*(Scan) input of a join
             return False
-        return name not in info.bad_expr or name not in leaf_preds[id(leaf)]
+        return not hit(name, info.bad_expr) or name not in leaf_preds[id(leaf)]
 
     def _scan(table, defer):
         s = Scan(table)
@@ -886,7 +959,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
             s._mx_decode_after = frozenset(defer)
             # read above the join only in dictionary-native ways (a bare group key, a predicate the
             # engine evaluates on codes): the join passes them on as dictionaries, never decoded
-            keep = frozenset(n for n in defer if n not in info.bad)
+            keep = frozenset(n for n in defer if not hit(n, info.bad))
             if keep:
                 s._mx_keep_dict = keep
         return s
@@ -904,6 +977,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
         dict_cols = [n for n in candidates if keepable(n, leaf) or deferrable(n, leaf)]
         mask_dict = [n for n in candidates if n not in dict_cols]
         import pyarrow.parquet as pq
+        token = source_token(leaf.path, cols, pushed)        # before the read: a file replaced meanwhile never matches
         if os.path.isfile(leaf.path):
             table = _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict)
         else:
@@ -911,7 +985,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
                                   filters=_filters_expression(pushed) if pushed else None,
                                   read_dictionary=dict_cols or None)
         table, defer = _decode_unkept(table, leaf)
-        return _scan(table, defer)
+        return _scan(tag_source(table, token), defer)
 
     def _decode_unkept(table, leaf):
         defer = []

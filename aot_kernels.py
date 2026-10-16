@@ -88,7 +88,8 @@ def check_join_output_size(total: int) -> None:
     """Refuse a join whose output has more rows than int32 offsets address: the scatter kernel would write
     through wrapped-around offsets and fault (a many-to-many join of two 46,500-row tables on one key)."""
     if total > MAX_JOIN_ROWS:
-        raise MemoryError(
+        from .gpu_budget import JoinOutputTooLarge
+        raise JoinOutputTooLarge(
             f"join output would have {total:,} rows, more than the {MAX_JOIN_ROWS:,} the join kernels can "
             "address: filter or aggregate one side first")
 
@@ -510,11 +511,29 @@ def _find_gpu_lib() -> Optional[Path]:
     return None
 
 
+gpu_call_log = None     # a list (set by the benchmark workers) collects the name of every GPU kernel call
+_GPU_OOM = -2       # status of an exported GPU function: 0 ok, -2 out of GPU memory, -1 any other error
+
+
 def _bind_gpu(lib, name: str, argtypes: list):
+    """An exported GPU function that raises when it fails. Each returns an Int status (F-055):
+    the old `except: pass` in the kernels swallowed errors (a sort that ran out of memory returned
+    garbage indices and every caller took them for the answer)."""
     fn = getattr(lib, name)
-    fn.restype = None
+    fn.restype = ctypes.c_int64
     fn.argtypes = argtypes
-    return fn
+
+    def call(*args):
+        if gpu_call_log is not None:
+            gpu_call_log.append(name)
+        rc = fn(*args)
+        if rc == _GPU_OOM:
+            raise MemoryError(f"CUDA_ERROR_OUT_OF_MEMORY: {name} ran out of GPU memory")
+        if rc != 0:
+            raise RuntimeError(f"CUDA_ERROR: {name} failed with status {rc}")
+        return rc
+    call.__name__ = name
+    return call
 
 
 _P64 = ctypes.c_int64   # GPU device pointer as int64
@@ -596,29 +615,35 @@ class _CUDADriver:
         self.bind_thread()
         ptr = ctypes.c_uint64(0)
         err = self._lib.cuMemAlloc_v2(ctypes.byref(ptr), nbytes)
-        if err != 0:
-            raise RuntimeError(f"cuMemAlloc failed: {err}")
+        self._check(err, f"cuMemAlloc({nbytes})")
         return int(ptr.value)
 
     def free(self, ptr: int):
         self.bind_thread()
         self._lib.cuMemFree_v2(ctypes.c_uint64(ptr))
 
+    @staticmethod
+    def _check(err: int, what: str):
+        if err == 2:
+            raise MemoryError(f"CUDA_ERROR_OUT_OF_MEMORY: {what}")
+        if err != 0:
+            raise RuntimeError(f"CUDA_ERROR {err}: {what} failed")
+
     def h2d(self, dev_ptr: int, arr: np.ndarray):
         self.bind_thread()
         hp = arr.ctypes.data_as(ctypes.c_void_p)
-        self._lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), hp,
-                                    ctypes.c_size_t(arr.nbytes))
+        self._check(self._lib.cuMemcpyHtoD_v2(ctypes.c_uint64(dev_ptr), hp,
+                                              ctypes.c_size_t(arr.nbytes)), "cuMemcpyHtoD")
 
     def d2h(self, arr: np.ndarray, dev_ptr: int):
         self.bind_thread()
         hp = arr.ctypes.data_as(ctypes.c_void_p)
-        self._lib.cuMemcpyDtoH_v2(hp, ctypes.c_uint64(dev_ptr),
-                                    ctypes.c_size_t(arr.nbytes))
+        self._check(self._lib.cuMemcpyDtoH_v2(hp, ctypes.c_uint64(dev_ptr),
+                                              ctypes.c_size_t(arr.nbytes)), "cuMemcpyDtoH")
 
     def sync(self):
         self.bind_thread()
-        self._lib.cuCtxSynchronize()
+        self._check(self._lib.cuCtxSynchronize(), "cuCtxSynchronize")
 
 
 # lazy singleton — initialized once per process
