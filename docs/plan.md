@@ -832,10 +832,10 @@ Found by the F-079 developer and the F-083 review (2026-10-16)
 - [ ] `WHERE x IS NULL` / `IS NOT NULL` (and in SELECT, CASE, HAVING, subqueries, joins' ON) raises `NotImplementedError: Unsupported SQL expression type: Is` in the SQL front end; map to the existing `is_null` / `is_not_null` expressions (native filter where the bytecode has a validity test; Arrow otherwise). Also `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` if sqlglot parses them, and `x IS TRUE / FALSE` if cheap
 - [ ] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
 
-## F-087 SQL OFFSET is ignored [todo]
+## F-087 SQL OFFSET is ignored [review]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
-- [ ] `ORDER BY c, i LIMIT 3 OFFSET 2` returns the first 3 rows (OFFSET dropped), top level and in subqueries (`IN (... LIMIT 5 OFFSET 2)`). Support OFFSET (slice after the sort, before / with LIMIT; top-n keeps `limit + offset` rows), or raise until then; never drop it
-- [ ] DuckDB-checked tests: OFFSET with and without LIMIT, with ORDER BY ties broken by a unique key, hidden sort key, in IN / FROM subqueries and CTEs, OFFSET past the end; fails before
+- [x] `ORDER BY c, i LIMIT 3 OFFSET 2` returned the first 3 rows (OFFSET dropped). `Limit` has an `offset` (default 0; `LazyFrame.limit(n, offset=0)`); OFFSET without LIMIT keeps every later row. `CustomOpsCompiler.compile_and_run` runs a top-level OFFSET window as `Limit(offset + n)` (so Sort + Limit still reach the top-n heaps, the native filter top-k and the aggregate top-k with k = offset + n) and cuts the first `offset` rows off the result; an OFFSET window under another Sort / Limit or under a Filter / Project / Aggregate runs first and is replaced by its table. Correlated subqueries still reject OFFSET
+- [x] DuckDB-checked tests (`tests/test_sql_offset.py`): OFFSET with and without LIMIT, ORDER BY ties broken by a unique key, hidden sort key, group-by, DISTINCT, join, FROM subqueries, CTEs, IN / NOT IN subqueries (also the hidden-key form), OFFSET past the end, LIMIT 0, no ORDER BY, DataFrame `limit(n, offset)`, a gpu case; top-n structure (sort `topk` and heap k = limit + offset); 53 of 62 failed before
 
 ## F-088 SELECT *, expr returns only the expression [todo]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main

@@ -103,7 +103,7 @@ def materialize(comp, plan, needed: Optional[Set[str]] = None, dict_ok: bool = T
             used |= _cols(e) if hasattr(e, "op") else {e}
         return Sort(materialize(comp, plan.input, _union(needed, used), False), plan.by, plan.descending)
     if isinstance(plan, Limit):
-        return Limit(materialize(comp, plan.input, needed, False), plan.n)
+        return Limit(materialize(comp, plan.input, needed, False), plan.n, plan.offset)
     if isinstance(plan, Tail):
         return Tail(materialize(comp, plan.input, needed, False), plan.n)
     if isinstance(plan, Distinct):

@@ -94,7 +94,7 @@ class PlanOptimizer:
             if isinstance(node, Sort):
                 return Sort(walk(node.input), node.by, node.descending)
             if isinstance(node, Limit):
-                return Limit(walk(node.input), node.n)
+                return Limit(walk(node.input), node.n, node.offset)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
             if isinstance(node, Tail):
@@ -182,7 +182,7 @@ class PlanOptimizer:
             if isinstance(node, Sort):
                 return Sort(walk(node.input), node.by, node.descending)
             if isinstance(node, Limit):
-                return Limit(walk(node.input), node.n)
+                return Limit(walk(node.input), node.n, node.offset)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
             if isinstance(node, Tail):
@@ -238,7 +238,7 @@ class PlanOptimizer:
                 more = cols_of(list(node.by))
                 return Sort(walk(node.input, None if needed is None else needed | more), node.by, node.descending)
             if isinstance(node, Limit):
-                return Limit(walk(node.input, needed), node.n)
+                return Limit(walk(node.input, needed), node.n, node.offset)
             if isinstance(node, Tail):
                 return Tail(walk(node.input, needed), node.n)
             if isinstance(node, Distinct):
@@ -273,10 +273,10 @@ class PlanOptimizer:
             nonlocal changed
             if isinstance(node, Limit):
                 child = walk(node.input)
-                if isinstance(child, Limit):
+                if isinstance(child, Limit) and not child.offset and not node.offset:
                     changed = True
                     return Limit(child.input, min(child.n, node.n))
-                return Limit(child, node.n)
+                return Limit(child, node.n, node.offset)
             if isinstance(node, Filter):
                 return Filter(walk(node.input), node.predicate)
             if isinstance(node, Project):
@@ -323,7 +323,7 @@ class PlanOptimizer:
             if isinstance(node, Aggregate):
                 return Aggregate(walk(node.input), node.group_by, node.aggs)
             if isinstance(node, Limit):
-                return Limit(walk(node.input), node.n)
+                return Limit(walk(node.input), node.n, node.offset)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
             if isinstance(node, Tail):
@@ -358,7 +358,7 @@ class PlanOptimizer:
             if isinstance(node, Sort):
                 return Sort(walk(node.input), node.by, node.descending)
             if isinstance(node, Limit):
-                return Limit(walk(node.input), node.n)
+                return Limit(walk(node.input), node.n, node.offset)
             if isinstance(node, Distinct):
                 return Distinct(walk(node.input), node.subset)
             if isinstance(node, Tail):

@@ -1531,7 +1531,7 @@ class CustomOpsCompiler(GraphCompiler):
             if isinstance(plan, Sort):
                 node = Sort(inner, plan.by, plan.descending)
             elif isinstance(plan, Limit):
-                node = Limit(inner, plan.n)
+                node = Limit(inner, plan.n, plan.offset)
             elif isinstance(plan, Distinct):
                 node = Distinct(inner, plan.subset)
             else:
@@ -1642,7 +1642,7 @@ class CustomOpsCompiler(GraphCompiler):
             if isinstance(op, Sort):
                 out = Sort(out, op.by, op.descending)
             elif isinstance(op, Limit):
-                out = Limit(out, op.n)
+                out = Limit(out, op.n, op.offset)
             elif isinstance(op, Distinct):
                 out = Distinct(out, op.subset)
             else:
@@ -1999,7 +1999,7 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(plan, Sort):
             return Sort(cls._strip_filter_nodes(plan.input), plan.by, plan.descending)
         if isinstance(plan, Limit):
-            return Limit(cls._strip_filter_nodes(plan.input), plan.n)
+            return Limit(cls._strip_filter_nodes(plan.input), plan.n, plan.offset)
         if isinstance(plan, Distinct):
             return Distinct(cls._strip_filter_nodes(plan.input), plan.subset)
         if isinstance(plan, Tail):
@@ -2016,11 +2016,33 @@ class CustomOpsCompiler(GraphCompiler):
         if isinstance(plan, Project) and isinstance(plan.input, (Sort, Limit)) \
                 and all(e.op == "col" for e in plan.exprs):
             keep, plan = plan.exprs, plan.input
+        # F-087: the paths below take "the first n rows". An OFFSET window is run as the first
+        # offset + n rows (the top-n paths see Sort + Limit as before) and the offset rows are cut off.
+        skip = 0
+        if isinstance(plan, Limit) and plan.offset:
+            skip, plan = plan.offset, Limit(plan.input, plan.n + plan.offset)
+        plan = self._resolve_inner_offsets(plan)
         result = self._compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
         result = self._exact_counts(plan, result)
+        if skip:
+            result = result.slice(skip)
         if keep is not None:
             result = result.select([e.args[0] for e in keep]).rename_columns([e._alias or e.args[0] for e in keep])
         return result
+
+    def _resolve_inner_offsets(self, plan):
+        """A Sort / Limit / Distinct / Tail chain with a Limit-with-OFFSET below its top node: that window
+        decides which rows the nodes above it see, so it is computed first and replaced by its table."""
+        chain = []
+        while isinstance(plan, (Sort, Limit, Distinct, Tail)):
+            chain.append(plan)
+            plan = plan.input
+        for i in range(len(chain) - 1, -1, -1):          # innermost first
+            if isinstance(chain[i], Limit) and chain[i].offset and i:
+                plan = Scan(self.compile_and_run(Limit(plan, chain[i].n, chain[i].offset)))
+            else:
+                plan = self._rewrap(plan, [chain[i]])
+        return plan
 
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:

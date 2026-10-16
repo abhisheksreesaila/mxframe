@@ -246,6 +246,9 @@ def _or_without(node: sge.Or, drop: set) -> Optional[sge.Expression]:
     return sge.Paren(this=r)
 
 
+_ALL_ROWS = 2 ** 62          # LIMIT of an OFFSET without LIMIT
+
+
 def _alias(node: sge.Expression, name: str) -> sge.Alias:
     return sge.Alias(this=node.copy(), alias=sge.to_identifier(name))
 
@@ -445,10 +448,11 @@ class _SQLTranslator:
                 desc = [bool(o.args.get("desc")) for o in order_node.expressions]
             plan = Sort(plan, by, desc)
 
-        # 5. LIMIT
-        limit_node = node.args.get("limit")
-        if limit_node:
-            plan = Limit(plan, int(limit_node.expression.this))
+        # 5. LIMIT / OFFSET (OFFSET alone keeps every row after the skipped ones)
+        limit_node, offset_node = node.args.get("limit"), node.args.get("offset")
+        if limit_node or offset_node:
+            plan = Limit(plan, int(limit_node.expression.this) if limit_node else _ALL_ROWS,
+                         int(offset_node.expression.this) if offset_node else 0)
 
         if final_proj:
             plan = Project(plan, final_proj)
@@ -868,7 +872,7 @@ class _SQLTranslator:
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
         new.set("expressions", [_alias(item, "__in")])
-        if not new.args.get("limit"):
+        if not (new.args.get("limit") or new.args.get("offset")):
             new.set("order", None)                     # the order only matters to pick the LIMIT rows
         if int_lits:
             _keep_ints(new.expressions[0])
@@ -939,8 +943,8 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what} over a {type(sel).__name__} (UNION / INTERSECT / EXCEPT) is not supported")
         if len(sel.expressions) != 1:
             raise ValueError(f"{what}: the subquery must return one column, it returns {len(sel.expressions)}")
-        if sel.args.get("group") or sel.args.get("having") or sel.args.get("limit") or sel.args.get("distinct") \
-                or not _aggs_in(sel.expressions[0]):
+        if sel.args.get("group") or sel.args.get("having") or sel.args.get("limit") or sel.args.get("offset") \
+                or sel.args.get("distinct") or not _aggs_in(sel.expressions[0]):
             raise NotImplementedError(f"{what}: only a single aggregate over an ungrouped query is supported "
                                       "(SELECT AVG(x) FROM ...), not a grouped, DISTINCT or LIMIT subquery or a plain column")
 
