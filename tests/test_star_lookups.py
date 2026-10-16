@@ -14,6 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
+import mxframe.custom_ops as co
 import mxframe.join_engine as je
 import mxframe.native_exec as nx
 from mxframe import LazyFrame, col, lit
@@ -279,6 +280,23 @@ def test_a_range_too_wide_for_a_bitmap_has_none(seen):
     assert seen["maps"] == [{"kind": "hash", "multi": False, "bitmap": False}]
 
 
+def test_a_large_hashed_map_without_a_bitmap_is_prefetched_and_exact(seen):
+    """100k keys over a 2^40 range: a hash table of ~2.4 MB (past the prefetch threshold), no bitmap; repeats
+    on a tenth of the keys; misses and hits both resolve."""
+    r = np.random.default_rng(23)
+    keys = np.unique(r.integers(0, 1 << 40, 100_000)).astype(np.int64)
+    keys = np.concatenate([keys, keys[:10_000]])
+    fact = pa.table({"id": A(np.arange(150_000, dtype=np.int64)),
+                     "k": A(np.where(r.random(150_000) < 0.5, r.choice(keys, 150_000),
+                                     r.integers(0, 1 << 40, 150_000)).astype(np.int64))})
+    dim = _dim(keys)
+    got = LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk").select("id", "dv").compute(device="cpu")
+    _star_only(seen)
+    assert seen["maps"] == [{"kind": "hash", "multi": True, "bitmap": False}]
+    exp = _duck("SELECT id, dv FROM fact JOIN dim ON k = dk", fact=fact, dim=dim)
+    _same(_rows(got, ["id", "dv"]), exp)
+
+
 # ── the runtime join filter ──────────────────────────────────────────────────────────────────────────
 
 def _runtime_case(q_below, dim_rows=100_000):
@@ -293,7 +311,8 @@ def _runtime_case(q_below, dim_rows=100_000):
     return fact, dim, plan, exp
 
 
-def test_runtime_filter_is_taken_when_the_partner_dwarfs_the_filtered_fact(seen):
+def test_runtime_filter_is_taken_when_the_partner_dwarfs_the_filtered_fact(seen, monkeypatch):
+    monkeypatch.setenv("MXFRAME_RUNTIME_JOIN_FILTER", "1")      # the row-count rules alone
     fact, dim, plan, exp = _runtime_case(q_below=3)
     kept = int(sum(x < 3 for x in fact.column("q").to_pylist()))
     got = plan.compute(device="cpu")
@@ -303,7 +322,8 @@ def test_runtime_filter_is_taken_when_the_partner_dwarfs_the_filtered_fact(seen)
     _same(_rows(got, ["id", "dv", "name"]), exp)
 
 
-def test_runtime_filter_is_skipped_when_the_fact_keeps_most_rows(seen):
+def test_runtime_filter_is_skipped_when_the_fact_keeps_most_rows(seen, monkeypatch):
+    monkeypatch.setenv("MXFRAME_RUNTIME_JOIN_FILTER", "1")
     fact, dim, plan, exp = _runtime_case(q_below=80)
     got = plan.compute(device="cpu")
     _star_only(seen)
@@ -311,15 +331,45 @@ def test_runtime_filter_is_skipped_when_the_fact_keeps_most_rows(seen):
     _same(_rows(got, ["id", "dv", "name"]), exp)
 
 
-def test_runtime_filter_is_skipped_for_a_small_partner(seen):
-    fact, dim, plan, exp = _runtime_case(q_below=3, dim_rows=5_000)
+def test_runtime_filter_is_skipped_when_the_partner_is_not_twice_the_filtered_fact(seen, monkeypatch):
+    monkeypatch.setenv("MXFRAME_RUNTIME_JOIN_FILTER", "1")
+    fact, dim, plan, exp = _runtime_case(q_below=3, dim_rows=5_000)      # ~6k fact rows survive, 5k partner rows
     got = plan.compute(device="cpu")
     _star_only(seen)
     assert seen["build"] == [5_000]
     _same(_rows(got, ["id", "dv", "name"]), exp)
 
 
-def test_runtime_filter_keeps_every_row_of_a_repeated_key(seen):
+def test_runtime_filter_waits_for_a_partner_map_that_leaves_the_cache(seen, monkeypatch):
+    """Default mode: the second pass over the fact's filter pays only when the partner's map (16 bytes per
+    row) would not fit the last-level cache. A 100k-row partner fits a real L3; with a 1 MB L3 it does not."""
+    fact, dim, plan, exp = _runtime_case(q_below=3)
+    got = plan.compute(device="cpu")
+    _star_only(seen)
+    assert seen["build"] == [dim.num_rows]
+    _same(_rows(got, ["id", "dv", "name"]), exp)
+    nx.reset_decline_counts()
+    seen.update(star=0, leaf=0)
+    monkeypatch.setattr(je, "_l3_bytes", lambda: 1 << 20)
+    co._JOIN_RESULT_CACHE.clear()                 # (the first answer would be served from it)
+    got = plan.compute(device="cpu")
+    _star_only(seen)
+    assert seen["build"][0] < dim.num_rows // 10
+    _same(_rows(got, ["id", "dv", "name"]), exp)
+
+
+def test_runtime_filter_can_be_switched_off(seen, monkeypatch):
+    monkeypatch.setenv("MXFRAME_RUNTIME_JOIN_FILTER", "0")
+    monkeypatch.setattr(je, "_l3_bytes", lambda: 1 << 20)
+    fact, dim, plan, exp = _runtime_case(q_below=3)
+    got = plan.compute(device="cpu")
+    _star_only(seen)
+    assert seen["build"] == [dim.num_rows]
+    _same(_rows(got, ["id", "dv", "name"]), exp)
+
+
+def test_runtime_filter_keeps_every_row_of_a_repeated_key(seen, monkeypatch):
+    monkeypatch.setenv("MXFRAME_RUNTIME_JOIN_FILTER", "1")
     r = np.random.default_rng(32)
     n = 150_000
     fact = pa.table({"id": A(np.arange(n, dtype=np.int64)), "k": A(r.integers(0, 60_000, n).astype(np.int64)),

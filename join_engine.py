@@ -932,15 +932,28 @@ def _semi_partner(comp, plan, bkeys, reduce=None) -> Optional[pa.Table]:
     return None if out is None else out.select(list(bkeys))
 
 
-_RUNTIME_MIN_ROWS = 1 << 16        # a smaller partner is cheap to index whole
+_MAP_BYTES_PER_ROW = 16            # a partner's map: a direct array over a key range of ~4x its rows, or a hash table
+
+
+def _l3_bytes() -> int:
+    """Size of the CPU's last-level cache (32 MB when unknown)."""
+    try:
+        txt = open("/sys/devices/system/cpu/cpu0/cache/index3/size").read().strip().upper()
+        return int(txt[:-1]) * {"K": 1 << 10, "M": 1 << 20}[txt[-1]]
+    except (OSError, ValueError, KeyError, IndexError):
+        return 32 << 20
 
 
 def _runtime_reduced(comp, t: pa.Table, bkeys, probe, preds, fact_keys, keep_dict) -> pa.Table:
     """The runtime join filter (F-043, generalized): a partner of more than twice the rows the fact's own
     filter keeps is cut to the rows whose keys occur among the fact's surviving keys before its map is built
-    (TPC-H Q12's orders: 1.5M rows indexed for 31k lineitems). Skipped when the fact keeps over half of its
-    rows, when the partner is small, or when the native filter cannot run (``t`` as it was)."""
-    if not preds or t.num_rows < _RUNTIME_MIN_ROWS:
+    (TPC-H Q12's orders: 1.5M rows indexed for 31k lineitems). It costs a second pass over the fact's filter
+    columns, so it is taken only when the partner's map would not fit the last-level cache (rows x 16 bytes
+    over L3: SF1's Q12 stays whole, SF10's 15M orders at 240 MB do not) and skipped when the fact keeps over
+    half of its rows or the native filter cannot run (``t`` as it was). ``MXFRAME_RUNTIME_JOIN_FILTER`` =
+    0 (never) | 1 (whenever the row counts allow) | auto (default)."""
+    mode = os.environ.get("MXFRAME_RUNTIME_JOIN_FILTER", "auto")
+    if mode == "0" or not preds or (mode != "1" and t.num_rows * _MAP_BYTES_PER_ROW <= _l3_bytes()):
         return t
     keys = fact_keys(probe)
     if keys is None or t.num_rows <= 2 * keys[0].num_rows:
@@ -992,7 +1005,7 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None, star=No
         _trace(f"star: scan leaf {fact} ({scan.table.num_rows} rows) with partners "
                f"{[(c, lk.build.num_rows) for (c, _), lk in zip(roots, lookups)]} -> "
                f"{None if out is None else out.num_rows} rows, {1e3*(time.perf_counter()-t0):.0f} ms "
-               f"{'' if out is not None else native_exec.last_filter()[1]}")
+               f"{native_exec.last_filter_maps() if out is not None else native_exec.last_filter()[1]}")
     if out is None:
         return None
     for pred, cm in post_res:

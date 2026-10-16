@@ -1081,8 +1081,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var off_regs = off_flag + 64
     var off_prow = off_regs + _align8((pre.n_regs * VEC + 8) * 8)
     var off_scr = off_prow + _align8(max(n_look, 1) * VEC * 4)
-    var off_cb = off_scr + max(n_bcols, 1) * VEC * 8             # the lookups' key scratch (VEC words)
-    var ws_bytes = off_cb + VEC * 8 + 64
+    var off_cb = off_scr + max(n_bcols, 1) * VEC * 8             # the lookups' key scratch (2 x VEC words)
+    var ws_bytes = off_cb + 2 * VEC * 8 + 64
 
     def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
         var lc = _lp(Int(ws))
@@ -2000,16 +2000,18 @@ def _out_str(kind: Int, arr: Int, local: Int, mut start: Int, mut ln: Int):
 # hash: keys*  7 hash: vals* (row + 1, or the key's row count when multi)  8 hash: capacity per partition*
 # 9 hash: offset per partition*  10 key columns  11 normalized range  12 presence bitmap* (0: none)
 # 13 multi (keys repeat)  14 rows* (multi: build rows grouped by key)  15 hash multi: starts*
+# 16 bytes of the structure a probe reads first (the bitmap, else the slot array / table)
 
 comptime E_DUP = -18
 comptime E_NO_MEMORY = -19
 comptime LW = 8             # words per lookup in the plan
-comptime MW = 16            # words per built map
+comptime MW = 17            # words per built map
 comptime HP = 64            # hash partitions
 comptime HP_SHIFT = 58
 comptime DIRECT_MAX = 1 << 28
 comptime BITMAP_MAX_RANGE = 1 << 26     # a hashed map's bitmap covers at most 8 MB of presence bits
 comptime BITMAP_MIN_KEYS = 4096         # smaller maps are cache-resident anyway
+comptime PREFETCH_MIN_BYTES = 1 << 18   # a first-probed structure under this stays in L2: no prefetch
 comptime OUT_ROWS_MAX = 1 << 28         # a star scan writes at most this many joined rows (more: it declines)
 
 
@@ -2067,9 +2069,8 @@ def _prefetch_rd(addr: Int):
 
 
 @always_inline
-def _probe_slot(M: LP, c: Int) -> Int:
-    """Slot (an index into the hash map's key / value arrays) of normalized key c, or -1."""
-    var h = _mix(UInt64(c))
+def _probe_slot(M: LP, c: Int, h: UInt64) -> Int:
+    """Slot (an index into the hash map's key / value arrays) of normalized key c (hash h), or -1."""
     var p = Int(h >> HP_SHIFT)
     var cap = Int(_lp(Int(M[8]))[p])
     var off = Int(_lp(Int(M[9]))[p])
@@ -2106,6 +2107,7 @@ def _lookup_col(M: LP, two: Bool, b1: Int, w1: Int, b2: Int, w2: Int, koff: Int,
     var tab = Int(M[6])
     var vals = Int(M[7])
     var starts = Int(M[15])
+    var prefetching = Int(M[16]) > PREFETCH_MIN_BYTES
     for t in range(nc):
         var i = Int(sel[t])
         var v1 = _kval(b1, w1, koff + i)
@@ -2119,17 +2121,19 @@ def _lookup_col(M: LP, two: Bool, b1: Int, w1: Int, b2: Int, w2: Int, koff: Int,
                 else:
                     c = c * card2 + (v2 - lo2)
         cb[t] = Int64(c)
-        if c >= 0:
-            if bits != 0:
-                _prefetch_rd(bits + (c >> 6) * 8)
-            elif direct:
-                _prefetch_rd(tab + c * 4)
-            else:
-                var h = _mix(UInt64(c))
+        if c >= 0 and bits == 0 and not direct:
+            var h = _mix(UInt64(c))                 # the hash is kept for the probe below
+            cb[VEC + t] = Int64(h)
+            if prefetching:
                 var p = Int(h >> HP_SHIFT)
                 var s = Int(_lp(Int(M[9]))[p]) + Int(h & UInt64(Int(_lp(Int(M[8]))[p]) - 1))
                 _prefetch_rd(tab + s * 8)
                 _prefetch_rd(vals + s * 4)
+        elif c >= 0 and prefetching:
+            if bits != 0:
+                _prefetch_rd(bits + (c >> 6) * 8)
+            else:
+                _prefetch_rd(tab + c * 4)
     var nn = 0
     for t in range(nc):
         var c = Int(cb[t])
@@ -2146,7 +2150,7 @@ def _lookup_col(M: LP, two: Bool, b1: Int, w1: Int, b2: Int, w2: Int, koff: Int,
                 else:
                     r = Int(_ip(tab)[c]) - 1
             else:
-                var s = _probe_slot(M, c)
+                var s = _probe_slot(M, c, UInt64(cb[VEC + t]) if bits == 0 else _mix(UInt64(c)))
                 if s >= 0:
                     if multi:
                         r = Int(_ip(starts)[s])
@@ -2420,6 +2424,19 @@ def _build_csr(ka: Int, kb: Int, nk: Int, wa: Int, wb: Int, n: Int, lo1: Int, lo
     return 0
 
 
+def _set_footprint(M: LP):
+    """Bytes of the structure a probe reads first (word 16)."""
+    if Int(M[12]) != 0:
+        M[16] = Int64(((Int(M[11]) + 63) // 64) * 8)
+    elif Int(M[0]) == 0:
+        M[16] = Int64((Int(M[11]) + 1) * 4)
+    else:
+        var tot = 0
+        for p in range(HP):
+            tot += Int(_lp(Int(M[8]))[p])
+        M[16] = Int64(tot * 12)
+
+
 def _build_map(L: LP, M: LP, threads: Int, allow_multi: Bool) -> Int:
     """Index partner B (plan entry L) into map M. 0, E_DUP (keys repeat and `allow_multi` is off), E_NO_MEMORY
     or E_BAD_PLAN."""
@@ -2437,6 +2454,7 @@ def _build_map(L: LP, M: LP, threads: Int, allow_multi: Bool) -> Int:
     M[13] = 0
     M[14] = 0
     M[15] = 0
+    M[16] = 0
     M[10] = Int64(nk)
     if n == 0:
         M[1] = 1
@@ -2632,8 +2650,12 @@ def _build_map(L: LP, M: LP, threads: Int, allow_multi: Bool) -> Int:
     if d != 0:
         _free_map(M)
         if allow_multi:
-            return _build_csr(ka, kb, nk, wa, wb, n, lo1, lo2, card2, rng, direct, use_bits, M, threads)
+            var rc = _build_csr(ka, kb, nk, wa, wb, n, lo1, lo2, card2, rng, direct, use_bits, M, threads)
+            if rc == 0:
+                _set_footprint(M)
+            return rc
         return E_DUP
+    _set_footprint(M)
     return 0
 
 
@@ -2785,7 +2807,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         var ktmp = unsafe_alloc[UInt16](cap)                    # the morsel's kept rows (offsets < 2^16)
         var prow = unsafe_alloc[Int32](max(n_look, 1) * VEC)    # their partner rows, per lookup
         var pcnt = unsafe_alloc[Int32](max(n_look, 1) * VEC)    # rows of a repeating key, per lookup
-        var cb = unsafe_alloc[Int64](VEC)
+        var cb = unsafe_alloc[Int64](2 * VEC)
         var ix = unsafe_alloc[Int32](max(n_look, 1))            # the odometer over repeating partners
         for i in range(max(n_look, 1) * VEC):
             prow[i] = 0
