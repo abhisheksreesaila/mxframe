@@ -53,6 +53,7 @@ from std.memory import Pointer, unsafe_memset_zero
 from max.algorithm import parallelize
 from std.atomic import Atomic
 from std.ffi import external_call
+from std.sys import prefetch, PrefetchOptions
 
 from std.utils.numerics import nan
 
@@ -1067,7 +1068,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         maps[j * MW + 6] = 0
         maps[j * MW + 12] = 0
     for j in range(n_look):
-        var mrc = _build_map(look + j * LW, maps + j * MW, threads)
+        var mrc = _build_map(look + j * LW, maps + j * MW, threads, False)   # the fused aggregate: unique keys
         if mrc < 0:
             for i in range(j):
                 _free_map(maps + i * MW)
@@ -1085,7 +1086,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     var off_regs = off_flag + 64
     var off_prow = off_regs + _align8((pre.n_regs * VEC + 8) * 8)
     var off_scr = off_prow + _align8(max(n_look, 1) * VEC * 4)
-    var ws_bytes = off_scr + max(n_bcols, 1) * VEC * 8 + 64
+    var off_cb = off_scr + max(n_bcols, 1) * VEC * 8             # the lookups' key scratch (2 x VEC words)
+    var ws_bytes = off_cb + 2 * VEC * 8 + 64
 
     def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
         var lc = _lp(Int(ws))
@@ -1120,42 +1122,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var w2 = (w >> 4) & 15
             var b1 = _kbase(Int(arrays[k * stride_a + probe_off + Int(lj[1])]), w1)
             var b2 = _kbase(Int(arrays[k * stride_a + probe_off + Int(lj[2])]), w2) if two else 0
-            var lo1 = Int(M[1])
-            var hi1 = Int(M[2])
-            var lo2 = Int(M[3])
-            var hi2 = Int(M[4])
-            var card2 = Int(M[5])
-            var direct = Int(M[0]) == 0
-            var has_bits = Int(M[12]) != 0
-            var bits = _lp(Int(M[12]))
-            var slot = _ip(Int(M[6]))
-            var nn = 0
-            for t in range(nc):
-                var i = Int(sel[t])
-                var v1 = _kval(b1, w1, i0 + i - c0)
-                var r = -1
-                if v1 >= lo1 and v1 <= hi1:
-                    var c = v1 - lo1
-                    var ok = True
-                    if two:
-                        var v2 = _kval(b2, w2, i0 + i - c0)
-                        if v2 < lo2 or v2 > hi2:
-                            ok = False
-                        else:
-                            c = c * card2 + (v2 - lo2)
-                    if ok:
-                        if direct:
-                            if not has_bits or (Int(bits[c >> 6]) >> (c & 63)) & 1 != 0:
-                                r = Int(slot[c]) - 1
-                        else:
-                            r = _probe_hash(M, c)
-                if r >= 0:
-                    sel[nn] = Int32(i)
-                    for q in range(j):
-                        prow[q * VEC + nn] = prow[q * VEC + t]
-                    prow[j * VEC + nn] = Int32(r)
-                    nn += 1
-            nc = nn
+            nc = _lookup_col(M, two, b1, w1, b2, w2, i0 - c0, sel, nc, prow, prow, j, False,
+                             _lp(Int(ws) + off_cb))
         if nc == 0:
             return 0
         # the partner columns the program reads, gathered into block scratch by block row
@@ -2022,17 +1990,34 @@ def _out_str(kind: Int, arr: Int, local: Int, mut start: Int, mut ln: Int):
 #
 # A join partner B (a table Python already built: a dimension leaf, or a small join of several)
 # is indexed on its join key, 1 or 2 integer columns combined into one normalized int64
-# (v1 - lo1) * card2 + (v2 - lo2). Compact ranges get a direct array (row + 1 per key, 0 = none),
-# others a hash table split into P partitions by the top bits of the hash, built in parallel.
-# Keys must be unique on B (TPC-H foreign key -> primary key); a duplicate declines (E_DUP).
+# c = (v1 - lo1) * card2 + (v2 - lo2). Compact ranges get a direct array, others a hash table split
+# into P partitions by the top bits of the hash, built in parallel. A presence bitmap (one bit per c)
+# answers a miss without touching the array or the table: always for sparse direct keys, and for hashed
+# keys whose range is small enough (BITMAP_MAX_RANGE) to keep the bitmap cache-resident.
+#
+# Keys unique on B: a direct slot holds row + 1 (0 = none), a hash slot holds row + 1.
+# Keys repeating on B (F-046a slice 2, `allow_multi`): CSR layout, rows of a key in build order
+# (HeavyDB's one-to-many layout): a direct map keeps ends[c + 1] (the rows of key c are
+# rows[ends[c] .. ends[c + 1]), ends[0] = 0), a hash slot keeps its count (vals) and first position
+# (starts) in rows. Without `allow_multi` (the fused aggregate) a duplicate declines (E_DUP).
+#
+# Words of a map M:  0 kind (0 direct, 1 hash)  1-5 lo1, hi1, lo2, hi2, card2  6 direct: slots / ends,
+# hash: keys*  7 hash: vals* (row + 1, or the key's row count when multi)  8 hash: capacity per partition*
+# 9 hash: offset per partition*  10 key columns  11 normalized range  12 presence bitmap* (0: none)
+# 13 multi (keys repeat)  14 rows* (multi: build rows grouped by key)  15 hash multi: starts*
+# 16 bytes of the structure a probe reads first (the bitmap, else the slot array / table)
 
 comptime E_DUP = -18
 comptime E_NO_MEMORY = -19
 comptime LW = 8             # words per lookup in the plan
-comptime MW = 13            # words per built map (12: presence bitmap of a direct map)
+comptime MW = 17            # words per built map
 comptime HP = 64            # hash partitions
 comptime HP_SHIFT = 58
 comptime DIRECT_MAX = 1 << 28
+comptime BITMAP_MAX_RANGE = 1 << 26     # a hashed map's bitmap covers at most 8 MB of presence bits
+comptime BITMAP_MIN_KEYS = 4096         # smaller maps are cache-resident anyway
+comptime PREFETCH_MIN_BYTES = 1 << 18   # a first-probed structure under this stays in L2: no prefetch
+comptime OUT_ROWS_MAX = 1 << 28         # a star scan writes at most this many joined rows (more: it declines)
 
 
 def _par[F: def(Int) -> None](f: F, nt: Int):
@@ -2076,27 +2061,21 @@ def _ival(arr: Int, w: Int, i: Int) -> Int:
 
 
 @always_inline
-def _probe(M: LP, v1: Int, v2: Int) -> Int:
-    """B row holding key (v1, v2), or -1."""
-    if v1 < Int(M[1]) or v1 > Int(M[2]):
-        return -1
-    var c = v1 - Int(M[1])
-    if Int(M[10]) == 2:
-        if v2 < Int(M[3]) or v2 > Int(M[4]):
-            return -1
-        c = c * Int(M[5]) + (v2 - Int(M[3]))
-    if Int(M[0]) == 0:
-        # presence bitmap first (one bit per key: L2-resident where the slot array is not)
-        if Int(M[12]) != 0 and (Int(_lp(Int(M[12]))[c >> 6]) >> (c & 63)) & 1 == 0:
-            return -1
-        return Int(_ip(Int(M[6]))[c]) - 1
-    return _probe_hash(M, c)
+def _or64(ptr: LP, val: Int64):
+    """Atomic OR (monotonic) via llvm.atomicrmw (bin_op 5 = or)."""
+    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`5 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](p, v)
 
 
 @always_inline
-def _probe_hash(M: LP, c: Int) -> Int:
-    """B row of normalized key c in a hash map (M[0] == 1), or -1."""
-    var h = _mix(UInt64(c))
+def _prefetch_rd(addr: Int):
+    prefetch[PrefetchOptions().for_read().high_locality().to_data_cache()](_lp(addr))
+
+
+@always_inline
+def _probe_slot(M: LP, c: Int, h: UInt64) -> Int:
+    """Slot (an index into the hash map's key / value arrays) of normalized key c (hash h), or -1."""
     var p = Int(h >> HP_SHIFT)
     var cap = Int(_lp(Int(M[8]))[p])
     var off = Int(_lp(Int(M[9]))[p])
@@ -2105,31 +2084,373 @@ def _probe_hash(M: LP, c: Int) -> Int:
     var msk = UInt64(cap - 1)
     var i = Int(h & msk)
     while True:
-        var v = Int(vals[i])
-        if v == 0:
+        if Int(vals[i]) == 0:
             return -1
         if Int(keys[i]) == c:
-            return v - 1
+            return off + i
         i = Int(UInt64(i + 1) & msk)
+
+
+def _lookup_col(M: LP, two: Bool, b1: Int, w1: Int, b2: Int, w2: Int, koff: Int, sel: IP, nc: Int,
+                prow: IP, cnt: IP, j: Int, track: Bool, cb: LP) -> Int:
+    """Lookup `j` over a block's candidates (the one lookup loop of the star scan and the fused aggregate).
+    `sel[0..nc)` are block rows whose key sits at `koff + row` of the key columns (`b1`, `b2`: _kbase,
+    widths `w1`, `w2`). Candidates whose key has no partner row are dropped (`sel` is compacted in place).
+    For each survivor `prow[j * VEC + k]` is the partner row (unique map) or the position of the key's
+    first row in `rows` (multi map), and `cnt[j * VEC + k]` its row count (multi maps only); the earlier
+    lookups' entries are compacted with it (`cnt` too when `track`: some map of the plan is multi).
+    Keys of all candidates are computed first and their cache lines prefetched (group prefetching), then
+    resolved. `cb`: 2 * VEC words of scratch (keys, then hashes). Returns the survivors."""
+    var lo1 = Int(M[1])
+    var hi1 = Int(M[2])
+    var lo2 = Int(M[3])
+    var hi2 = Int(M[4])
+    var card2 = Int(M[5])
+    var direct = Int(M[0]) == 0
+    var multi = Int(M[13]) != 0
+    var bits = Int(M[12])
+    var tab = Int(M[6])
+    var vals = Int(M[7])
+    var starts = Int(M[15])
+    var prefetching = Int(M[16]) > PREFETCH_MIN_BYTES
+    for t in range(nc):
+        var i = Int(sel[t])
+        var v1 = _kval(b1, w1, koff + i)
+        var c = -1
+        if v1 >= lo1 and v1 <= hi1:
+            c = v1 - lo1
+            if two:
+                var v2 = _kval(b2, w2, koff + i)
+                if v2 < lo2 or v2 > hi2:
+                    c = -1
+                else:
+                    c = c * card2 + (v2 - lo2)
+        cb[t] = Int64(c)
+        if c >= 0 and bits == 0 and not direct:
+            var h = _mix(UInt64(c))                 # the hash is kept for the probe below
+            cb[VEC + t] = Int64(h)
+            if prefetching:
+                var p = Int(h >> HP_SHIFT)
+                var s = Int(_lp(Int(M[9]))[p]) + Int(h & UInt64(Int(_lp(Int(M[8]))[p]) - 1))
+                _prefetch_rd(tab + s * 8)
+                _prefetch_rd(vals + s * 4)
+        elif c >= 0 and prefetching:
+            if bits != 0:
+                _prefetch_rd(bits + (c >> 6) * 8)
+            else:
+                _prefetch_rd(tab + c * 4)
+    var nn = 0
+    for t in range(nc):
+        var c = Int(cb[t])
+        var r = -1
+        var k = 1
+        if c >= 0 and (bits == 0 or (Int(_lp(bits)[c >> 6]) >> (c & 63)) & 1 != 0):
+            if direct:
+                if multi:
+                    var b = Int(_ip(tab)[c])
+                    var e = Int(_ip(tab)[c + 1])
+                    if e > b:
+                        r = b
+                        k = e - b
+                else:
+                    r = Int(_ip(tab)[c]) - 1
+            else:
+                var s = _probe_slot(M, c, UInt64(cb[VEC + t]) if bits == 0 else _mix(UInt64(c)))
+                if s >= 0:
+                    if multi:
+                        r = Int(_ip(starts)[s])
+                        k = Int(_ip(vals)[s])
+                    else:
+                        r = Int(_ip(vals)[s]) - 1
+        if r >= 0:
+            sel[nn] = sel[t]
+            for q in range(j):
+                prow[q * VEC + nn] = prow[q * VEC + t]
+                if track:
+                    cnt[q * VEC + nn] = cnt[q * VEC + t]
+            prow[j * VEC + nn] = Int32(r)
+            if multi:
+                cnt[j * VEC + nn] = Int32(k)
+            nn += 1
+    return nn
+
+
+@always_inline
+def _flag(p: LP) -> Int:
+    """Atomic read of a flag word."""
+    return Int(Atomic[Scalar[DType.int64]].fetch_add(p, 0))
 
 
 def _free_map(M: LP):
     if Int(M[6]) != 0:
         if Int(M[0]) == 0:
             _ = external_call["free", Int](Int(M[6]))
-            if Int(M[12]) != 0:
-                _lp(Int(M[12])).free()
-                M[12] = 0
         else:
             _lp(Int(M[6])).free()
             _ip(Int(M[7])).free()
             _lp(Int(M[8])).free()
             _lp(Int(M[9])).free()
+            if Int(M[15]) != 0:
+                _ip(Int(M[15])).free()
+        if Int(M[14]) != 0:
+            _ip(Int(M[14])).free()
+    if Int(M[12]) != 0:
+        _lp(Int(M[12])).free()
     M[6] = 0
+    M[12] = 0
+    M[14] = 0
+    M[15] = 0
 
 
-def _build_map(L: LP, M: LP, threads: Int) -> Int:
-    """Index partner B (plan entry L) into map M. 0, E_DUP, or E_BAD_PLAN."""
+def _partition_rows(ka: Int, kb: Int, nk: Int, wa: Int, wb: Int, n: Int, lo1: Int, lo2: Int, card2: Int,
+                    rng: Int, direct: Bool, nb: Int, nt: Int, keys_n: LP, order: IP, pstart: LP):
+    """The normalized key of every build row into keys_n, and the row numbers grouped by partition into
+    `order` (ascending within a partition: stable), partition p at order[pstart[p] .. pstart[p + 1]).
+    A partition is the top bits of the key's hash, or (direct: a contiguous range of keys) c * HP // rng."""
+    var cnt = unsafe_alloc[Int64](nb * HP)
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def count(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            for p in range(HP):
+                cnt[b * HP + p] = 0
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                var c = _ival(ka, wa, i) - lo1
+                if nk == 2:
+                    c = c * card2 + (_ival(kb, wb, i) - lo2)
+                keys_n[i] = Int64(c)
+                var p = c * HP // rng if direct else Int(_mix(UInt64(c)) >> HP_SHIFT)
+                cnt[b * HP + p] += 1
+
+    _par(count, nt)
+    var at = 0
+    for p in range(HP):
+        pstart[p] = Int64(at)
+        for b in range(nb):
+            var x = Int(cnt[b * HP + p])
+            cnt[b * HP + p] = Int64(at)
+            at += x
+    pstart[HP] = Int64(at)
+    counter[0] = 0
+
+    def scatter(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                var c = Int(keys_n[i])
+                var p = c * HP // rng if direct else Int(_mix(UInt64(c)) >> HP_SHIFT)
+                var q = Int(cnt[b * HP + p])
+                order[q] = Int32(i)
+                cnt[b * HP + p] = Int64(q + 1)
+
+    _par(scatter, nt)
+    cnt.free()
+    counter.free()
+
+
+def _hash_layout(pstart: LP, caps: LP, offs: LP) -> Int:
+    """Capacity (a power of two, load <= 0.5) and offset of every partition's table; the total slots."""
+    var tot = 0
+    for p in range(HP):
+        var c_p = Int(pstart[p + 1]) - Int(pstart[p])
+        var cap = 16
+        while cap < 2 * c_p:
+            cap *= 2
+        caps[p] = Int64(cap)
+        offs[p] = Int64(tot)
+        tot += cap
+    return tot
+
+
+def _bitmap_from_keys(M: LP, keys_n: LP, n: Int, rng: Int, nb: Int, nt: Int):
+    """Presence bitmap of the normalized keys (a hashed map's: one bit per key of its range)."""
+    var nwords = (rng + 63) // 64
+    var bits = unsafe_alloc[Int64](max(nwords, 1))
+    for w in range(nwords):
+        bits[w] = 0
+    M[12] = Int64(Int(bits))
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+
+    def mark(wid: Int) {imm}:
+        while True:
+            var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+            if b >= nb:
+                break
+            for i in range(b * n // nb, (b + 1) * n // nb):
+                var c = Int(keys_n[i])
+                _or64(bits + (c >> 6), Int64(1) << Int64(c & 63))
+
+    _par(mark, nt)
+    counter.free()
+
+
+def _build_csr(ka: Int, kb: Int, nk: Int, wa: Int, wb: Int, n: Int, lo1: Int, lo2: Int, card2: Int,
+               rng: Int, direct: Bool, use_bits: Bool, M: LP, threads: Int) -> Int:
+    """Index a partner whose keys repeat: rows grouped by key in CSR layout, rows of a key in build order.
+    Partitions (contiguous key ranges when direct) are laid out one after the other, so each worker owns
+    its partition's slice of every array: no atomics, and the same result on every run."""
+    var nb = max(1, min(threads * 4, (n + 65535) // 65536))
+    var nt = max(1, min(threads, nb))
+    var keys_n = unsafe_alloc[Int64](n)
+    var order = unsafe_alloc[Int32](n)
+    var pstart = unsafe_alloc[Int64](HP + 1)
+    _partition_rows(ka, kb, nk, wa, wb, n, lo1, lo2, card2, rng, direct, nb, nt, keys_n, order, pstart)
+    var rows = unsafe_alloc[Int32](n)
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = 0
+    M[13] = 1
+    M[14] = Int64(Int(rows))
+    if direct:
+        var ends_a = external_call["calloc", Int](rng + 1, 4)
+        if ends_a == 0:
+            rows.free()
+            M[14] = 0
+            keys_n.free()
+            order.free()
+            pstart.free()
+            counter.free()
+            return E_NO_MEMORY
+        var ends = _ip(ends_a)
+        M[0] = 0
+        M[6] = Int64(ends_a)
+
+        def build_direct(wid: Int) {imm}:
+            while True:
+                var p = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if p >= HP:
+                    break
+                var c_lo = (p * rng + HP - 1) // HP          # the keys of partition p: [c_lo, c_hi)
+                var c_hi = ((p + 1) * rng + HP - 1) // HP
+                var q0 = Int(pstart[p])
+                var q1 = Int(pstart[p + 1])
+                for q in range(q0, q1):
+                    ends[Int(keys_n[Int(order[q])]) + 1] += 1
+                var run = q0
+                for c in range(c_lo, c_hi):                  # counts -> first position of each key
+                    var x = Int(ends[c + 1])
+                    ends[c + 1] = Int32(run)
+                    run += x
+                for q in range(q0, q1):                      # fill (ends[c + 1] becomes the key's end)
+                    var r = Int(order[q])
+                    var at = Int(ends[Int(keys_n[r]) + 1])
+                    rows[at] = Int32(r)
+                    ends[Int(keys_n[r]) + 1] = Int32(at + 1)
+
+        _par(build_direct, max(1, min(threads, HP)))
+        if use_bits:
+            # a presence bit per key with rows: the keys' ends differ from the previous key's end
+            var nwords = (rng + 63) // 64
+            var bits = unsafe_alloc[Int64](max(nwords, 1))
+            M[12] = Int64(Int(bits))
+            var nwb = max(1, min(nb, (nwords + 4095) // 4096))
+            counter[0] = 0
+
+            def mark(wid: Int) {imm}:
+                while True:
+                    var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                    if b >= nwb:
+                        break
+                    for w in range(b * nwords // nwb, (b + 1) * nwords // nwb):
+                        var x = Int64(0)
+                        for t in range(64):
+                            var c = w * 64 + t
+                            if c < rng and ends[c + 1] != ends[c]:
+                                x |= Int64(1) << Int64(t)
+                        bits[w] = x
+
+            _par(mark, max(1, min(threads, nwb)))
+    else:
+        M[0] = 1
+        var caps = unsafe_alloc[Int64](HP)
+        var offs = unsafe_alloc[Int64](HP)
+        var tot = _hash_layout(pstart, caps, offs)
+        var tkeys = unsafe_alloc[Int64](tot)
+        var tvals = unsafe_alloc[Int32](tot)
+        var tstart = unsafe_alloc[Int32](tot)
+        M[6] = Int64(Int(tkeys))
+        M[7] = Int64(Int(tvals))
+        M[8] = Int64(Int(caps))
+        M[9] = Int64(Int(offs))
+        M[15] = Int64(Int(tstart))
+
+        def build_hash(wid: Int) {imm}:
+            while True:
+                var p = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+                if p >= HP:
+                    break
+                var cap = Int(caps[p])
+                var kk = tkeys + Int(offs[p])
+                var vv = tvals + Int(offs[p])
+                var st = tstart + Int(offs[p])
+                var msk = UInt64(cap - 1)
+                for i in range(cap):
+                    vv[i] = 0
+                var q0 = Int(pstart[p])
+                var q1 = Int(pstart[p + 1])
+                for q in range(q0, q1):                      # count the rows of each key
+                    var c = Int(keys_n[Int(order[q])])
+                    var i = Int(_mix(UInt64(c)) & msk)
+                    while True:
+                        if Int(vv[i]) == 0:
+                            kk[i] = Int64(c)
+                            vv[i] = 1
+                            break
+                        if Int(kk[i]) == c:
+                            vv[i] += 1
+                            break
+                        i = Int(UInt64(i + 1) & msk)
+                var run = q0                                 # first position of each key (slot order)
+                for i in range(cap):
+                    var x = Int(vv[i])
+                    if x != 0:
+                        st[i] = Int32(run)
+                        run += x
+                for q in range(q0, q1):                      # fill in build order
+                    var r = Int(order[q])
+                    var c = Int(keys_n[r])
+                    var i = Int(_mix(UInt64(c)) & msk)
+                    while Int(kk[i]) != c:
+                        i = Int(UInt64(i + 1) & msk)
+                    var at = Int(st[i])
+                    rows[at] = Int32(r)
+                    st[i] = Int32(at + 1)
+                for i in range(cap):
+                    if Int(vv[i]) != 0:
+                        st[i] -= vv[i]
+
+        _par(build_hash, max(1, min(threads, HP)))
+        if use_bits:
+            _bitmap_from_keys(M, keys_n, n, rng, nb, nt)
+    keys_n.free()
+    order.free()
+    pstart.free()
+    counter.free()
+    return 0
+
+
+def _set_footprint(M: LP):
+    """Bytes of the structure a probe reads first (word 16)."""
+    if Int(M[12]) != 0:
+        M[16] = Int64(((Int(M[11]) + 63) // 64) * 8)
+    elif Int(M[0]) == 0:
+        M[16] = Int64((Int(M[11]) + 1) * 4)
+    else:
+        var tot = 0
+        for p in range(HP):
+            tot += Int(_lp(Int(M[8]))[p])
+        M[16] = Int64(tot * 12)
+
+
+def _build_map(L: LP, M: LP, threads: Int, allow_multi: Bool) -> Int:
+    """Index partner B (plan entry L) into map M. 0, E_DUP (keys repeat and `allow_multi` is off), E_NO_MEMORY
+    or E_BAD_PLAN."""
     var nk = Int(L[0])
     var ka = Int(L[3])
     var kb = Int(L[4])
@@ -2141,6 +2462,10 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
     M[0] = 0
     M[6] = 0
     M[12] = 0
+    M[13] = 0
+    M[14] = 0
+    M[15] = 0
+    M[16] = 0
     M[10] = Int64(nk)
     if n == 0:
         M[1] = 1
@@ -2210,8 +2535,14 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
     M[11] = Int64(rng)
     var dup = unsafe_alloc[Int64](1)
     dup[0] = 0
+    var direct = rng <= DIRECT_MAX and rng <= max(8 * n, 1 << 20)
+    # a presence bitmap pays off when most probes miss: keys sparse in their range (Q8's filtered part
+    # table, 0.7%); with dense keys (Q12's orders, 25%) the slot array answers as well. A hashed map's
+    # bitmap is worth it while it stays much smaller than the table (cache-resident)
+    var use_bits = (n * 8 < rng) if direct else (rng <= BITMAP_MAX_RANGE and n >= BITMAP_MIN_KEYS
+                                                 and (rng + 7) // 8 <= 24 * n)
 
-    if rng <= DIRECT_MAX and rng <= max(8 * n, 1 << 20):
+    if direct:
         # direct array, zeroed lazily by calloc; racing writes on a duplicate key are caught below
         var slot_a = external_call["calloc", Int](rng, 4)
         if slot_a == 0:
@@ -2251,9 +2582,7 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
                         dup[0] = 1
 
         _par(check, nt)
-        # a presence bitmap pays off when most probes miss: keys sparse in their range (Q8's filtered
-        # part table, 0.7%); with dense keys (Q12's orders, 25%) the slot array answers as well
-        if Int(dup[0]) == 0 and n * 8 < rng:      # (a duplicate declines: no bitmap needed)
+        if Int(dup[0]) == 0 and use_bits:      # (a duplicate rebuilds the map below: no bitmap needed yet)
             # presence bitmap of the direct array (one bit per key), built in parallel by 64-key words
             var nwords = (rng + 63) // 64
             var bits = unsafe_alloc[Int64](max(nwords, 1))
@@ -2276,63 +2605,16 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
 
             _par(mark, max(1, min(threads, nwb)))
     else:
-        # partitioned hash table: count rows per (block, partition), scatter row numbers by
-        # partition, then each partition builds its own open-addressing table
+        # partitioned hash table: row numbers grouped by partition, then each partition builds its own
+        # open-addressing table
         M[0] = 1
         var keys_n = unsafe_alloc[Int64](n)
-        var cnt = unsafe_alloc[Int64](nb * HP)
-        counter[0] = 0
-
-        def count(wid: Int) {imm}:
-            while True:
-                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-                if b >= nb:
-                    break
-                for p in range(HP):
-                    cnt[b * HP + p] = 0
-                for i in range(b * n // nb, (b + 1) * n // nb):
-                    var c = _ival(ka, wa, i) - lo1
-                    if nk == 2:
-                        c = c * card2 + (_ival(kb, wb, i) - lo2)
-                    keys_n[i] = Int64(c)
-                    cnt[b * HP + Int(_mix(UInt64(c)) >> HP_SHIFT)] += 1
-
-        _par(count, nt)
+        var order = unsafe_alloc[Int32](n)
         var pstart = unsafe_alloc[Int64](HP + 1)
+        _partition_rows(ka, kb, nk, wa, wb, n, lo1, lo2, card2, rng, False, nb, nt, keys_n, order, pstart)
         var caps = unsafe_alloc[Int64](HP)
         var offs = unsafe_alloc[Int64](HP)
-        var at = 0
-        var tot = 0
-        for p in range(HP):
-            pstart[p] = Int64(at)
-            for b in range(nb):
-                var x = Int(cnt[b * HP + p])
-                cnt[b * HP + p] = Int64(at)
-                at += x
-            var cp = Int(pstart[p])
-            var c_p = at - cp
-            var cap = 16
-            while cap < 2 * c_p:
-                cap *= 2
-            caps[p] = Int64(cap)
-            offs[p] = Int64(tot)
-            tot += cap
-        pstart[HP] = Int64(at)
-        var order = unsafe_alloc[Int32](n)
-        counter[0] = 0
-
-        def scatter(wid: Int) {imm}:
-            while True:
-                var b = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-                if b >= nb:
-                    break
-                for i in range(b * n // nb, (b + 1) * n // nb):
-                    var p = Int(_mix(UInt64(Int(keys_n[i]))) >> HP_SHIFT)
-                    var q = Int(cnt[b * HP + p])
-                    order[q] = Int32(i)
-                    cnt[b * HP + p] = Int64(q + 1)
-
-        _par(scatter, nt)
+        var tot = _hash_layout(pstart, caps, offs)
         var tkeys = unsafe_alloc[Int64](tot)
         var tvals = unsafe_alloc[Int32](tot)
         counter[0] = 0
@@ -2368,8 +2650,9 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
         M[7] = Int64(Int(tvals))
         M[8] = Int64(Int(caps))
         M[9] = Int64(Int(offs))
+        if Int(dup[0]) == 0 and use_bits:
+            _bitmap_from_keys(M, keys_n, n, rng, nb, nt)
         keys_n.free()
-        cnt.free()
         pstart.free()
         order.free()
     counter.free()
@@ -2377,7 +2660,13 @@ def _build_map(L: LP, M: LP, threads: Int) -> Int:
     dup.free()
     if d != 0:
         _free_map(M)
+        if allow_multi:
+            var rc = _build_csr(ka, kb, nk, wa, wb, n, lo1, lo2, card2, rng, direct, use_bits, M, threads)
+            if rc == 0:
+                _set_footprint(M)
+            return rc
         return E_DUP
+    _set_footprint(M)
     return 0
 
 
@@ -2447,7 +2736,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         maps[j * MW + 6] = 0
         maps[j * MW + 12] = 0
     for j in range(n_look):
-        var rc = _build_map(look + j * LW, maps + j * MW, threads)
+        var rc = _build_map(look + j * LW, maps + j * MW, threads, True)
         if rc < 0:
             for i in range(j):
                 _free_map(maps + i * MW)
@@ -2458,6 +2747,14 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             barr.free()
             blk.free()
             return rc
+
+    if ver == 2 and Int(P[19]) != 0:         # how each partner was indexed (4 words per lookup): kind, multi, bitmap
+        for j in range(n_look):
+            var st = _lp(Int(P[19])) + 4 * j
+            st[0] = maps[j * MW]
+            st[1] = maps[j * MW + 13]
+            st[2] = 1 if Int(maps[j * MW + 12]) != 0 else 0
+            st[3] = 0
 
     # chunk table: row_start, row_end, per value column its base address, then dictionary offsets
     var tstride = 2 + n_cols + n_dcols
@@ -2486,34 +2783,63 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     for i in range(morsels):
         mkeep[i] = 0
     var mcnt = unsafe_alloc[Int64](morsels)                    # surviving rows per morsel
+    for i in range(morsels):
+        mcnt[i] = 0
     var mbytes = unsafe_alloc[Int64](morsels * max(n_tot, 1))  # string bytes per morsel per column
     for i in range(morsels * max(n_tot, 1)):
         mbytes[i] = 0
-    var mlook = unsafe_alloc[Int64](morsels)       # per morsel: int32[kept][n_look] partner rows
+    var mlook = unsafe_alloc[Int64](morsels)       # per morsel: int32[survivors][n_look] first partner rows
     for i in range(morsels):
         mlook[i] = 0
+    var mcntl = unsafe_alloc[Int64](morsels)       # per morsel (repeating keys): int32[survivors][n_look] row counts
+    var msurv = unsafe_alloc[Int64](morsels)       # survivors per morsel (mcnt: the joined rows they give)
+    for i in range(morsels):
+        mcntl[i] = 0
+        msurv[i] = 0
     var counter = unsafe_alloc[Int64](1)
     counter[0] = 0
 
     # ── pass 1: predicate and lookups -> kept rows, counts and string bytes per morsel ─────
+    # A key that repeats on the partner gives one kept row per partner row (the product over the
+    # partners that repeat, the last repeating partner running fastest); the joined rows are counted
+    # here, and a join past OUT_ROWS_MAX declines (the caller's leaf-by-leaf join then raises MemoryError).
+    var any_multi = False
+    var mq = unsafe_alloc[Int64](max(n_look, 1) * 2)         # per lookup: its keys repeat, its rows*
+    for j in range(n_look):
+        mq[2 * j] = maps[j * MW + 13]
+        mq[2 * j + 1] = maps[j * MW + 14]
+        any_multi = any_multi or Int(mq[2 * j]) != 0
+    var out_total = unsafe_alloc[Int64](2)                   # joined rows so far | 1: past OUT_ROWS_MAX
+    out_total[0] = 0
+    out_total[1] = 0
+
     def pass1(wid: Int) {imm}:
         var regs = unsafe_alloc[Float64](max(p.n_regs, 1) * VEC)
         var sel = unsafe_alloc[Int32](VEC)
-        var tmp = unsafe_alloc[Int32](max(MORSEL * n_look, 1))
+        var cap = MORSEL                                        # survivors a morsel holds
+        var tmp = unsafe_alloc[Int32](max(cap * n_look, 1))
+        var ctmp = unsafe_alloc[Int32](max(cap * n_look, 1))    # their row counts per lookup
         var kp = unsafe_alloc[Int64](max(n_look, 1) * 4)      # per lookup: key base, width (x2)
         var cand = unsafe_alloc[Int32](VEC)                     # a block's candidate rows
-        var ktmp = unsafe_alloc[UInt16](MORSEL)                 # the morsel's kept rows (offsets < 2^16)
+        var ktmp = unsafe_alloc[UInt16](cap)                    # the morsel's kept rows (offsets < 2^16)
         var prow = unsafe_alloc[Int32](max(n_look, 1) * VEC)    # their partner rows, per lookup
+        var pcnt = unsafe_alloc[Int32](max(n_look, 1) * VEC)    # rows of a repeating key, per lookup
+        var cb = unsafe_alloc[Int64](2 * VEC)
+        var ix = unsafe_alloc[Int32](max(n_look, 1))            # the odometer over repeating partners
+        for i in range(max(n_look, 1) * VEC):
+            prow[i] = 0
+            pcnt[i] = 0
         _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)     # constants, once
-        while True:
+        while _flag(out_total + 1) == 0:
             var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             var lo = m * MORSEL
             if lo >= n_rows:
                 break
             var hi = min(lo + MORSEL, n_rows)
             var pos = lo
-            var kept = 0
-            while pos < hi:
+            var kept = 0                                     # survivors of this morsel
+            var expanded = 0                                 # joined rows they give
+            while pos < hi and _flag(out_total + 1) == 0:
                 var k = _find_chunk(p, pos)
                 var rowp = p.tbl + k * p.tbl_stride
                 var cols = rowp + 2
@@ -2528,7 +2854,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                         kp[4 * j + 2] = Int64(_kbase(Int(arrays[k * stride_a + n_cols + n_out + Int(lj[2])]), (w >> 4) & 15))
                         kp[4 * j + 3] = Int64((w >> 4) & 15)
                 var i0 = pos
-                while i0 < stop:
+                while i0 < stop and _flag(out_total + 1) == 0:
                     var n = min(VEC, stop - i0)
                     # candidates: the block's rows passing the predicate
                     var nc = 0
@@ -2545,71 +2871,57 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                     # lookups one at a time over the remaining candidates (column-wise: the map's
                     # words are read once per block, and a miss drops the row from later lookups)
                     for j in range(n_look):
-                        var M = maps + j * MW
                         var two = Int(look[j * LW]) == 2
-                        var b1 = Int(kp[4 * j])
-                        var w1 = Int(kp[4 * j + 1])
-                        var b2 = Int(kp[4 * j + 2]) if two else 0
-                        var w2 = Int(kp[4 * j + 3]) if two else 0
-                        var lo1 = Int(M[1])
-                        var hi1 = Int(M[2])
-                        var lo2 = Int(M[3])
-                        var hi2 = Int(M[4])
-                        var card2 = Int(M[5])
-                        var direct = Int(M[0]) == 0
-                        var has_bits = Int(M[12]) != 0
-                        var bits = _lp(Int(M[12]))
-                        var slot = _ip(Int(M[6]))
-                        var nn = 0
-                        for t in range(nc):
-                            var i = Int(cand[t])
-                            var v1 = _kval(b1, w1, i0 + i - c0)
-                            var r = -1
-                            if v1 >= lo1 and v1 <= hi1:
-                                var c = v1 - lo1
-                                var ok = True
-                                if two:
-                                    var v2 = _kval(b2, w2, i0 + i - c0)
-                                    if v2 < lo2 or v2 > hi2:
-                                        ok = False
-                                    else:
-                                        c = c * card2 + (v2 - lo2)
-                                if ok:
-                                    if direct:
-                                        if not has_bits or (Int(bits[c >> 6]) >> (c & 63)) & 1 != 0:
-                                            r = Int(slot[c]) - 1
-                                    else:
-                                        r = _probe_hash(M, c)
-                            if r >= 0:
-                                cand[nn] = Int32(i)
-                                for q in range(j):
-                                    prow[q * VEC + nn] = prow[q * VEC + t]
-                                prow[j * VEC + nn] = Int32(r)
-                                nn += 1
-                        nc = nn
+                        nc = _lookup_col(maps + j * MW, two, Int(kp[4 * j]), Int(kp[4 * j + 1]),
+                                         Int(kp[4 * j + 2]) if two else 0, Int(kp[4 * j + 3]) if two else 0,
+                                         i0 - c0, cand, nc, prow, pcnt, j, any_multi, cb)
+                    # survivors are kept unexpanded: fact offset, per lookup its first partner row (a CSR position
+                    # when its keys repeat) and row count; only the expanded row count and string bytes are
+                    # computed here, pass 2 expands while writing
                     for t in range(nc):
                         var i = Int(cand[t])
+                        var total = 1
+                        if any_multi:
+                            for j in range(n_look):
+                                if Int(mq[2 * j]) != 0:
+                                    total = min(total * Int(pcnt[j * VEC + t]), OUT_ROWS_MAX + 1)
+                            var so_far = Int(Atomic[Scalar[DType.int64]].fetch_add(out_total, Int64(total))) + total
+                            if so_far > OUT_ROWS_MAX:
+                                _ = Atomic[Scalar[DType.int64]].fetch_add(out_total + 1, 1)
+                                break
                         ktmp[kept] = UInt16(i0 + i - lo)
                         for j in range(n_look):
                             tmp[kept * n_look + j] = prow[j * VEC + t]
+                            ctmp[kept * n_look + j] = pcnt[j * VEC + t]
                         for j in range(n_out):
                             var kd = Int(tk[j])
                             if kd != OK_FIXED:
                                 var st = 0
                                 var ln = 0
                                 _out_str(kd, Int(arrays[k * stride_a + n_cols + j]), i0 + i - c0, st, ln)
-                                mbytes[m * n_tot + j] += Int64(ln)
+                                mbytes[m * n_tot + j] += Int64(ln * total)
                         for u in range(n_bout):
                             var kd = Int(tk[n_out + u])
                             if kd != OK_FIXED:
+                                var jl = Int(blk[u])
                                 var st = 0
                                 var ln = 0
-                                _out_str(kd, Int(barr[u]), Int(tmp[kept * n_look + Int(blk[u])]), st, ln)
-                                mbytes[m * n_tot + n_out + u] += Int64(ln)
+                                if Int(mq[2 * jl]) != 0:     # the partner's rows of this key, each repeated for the other repeaters
+                                    var c_j = Int(pcnt[jl * VEC + t])
+                                    var sum_ln = 0
+                                    for e in range(c_j):
+                                        _out_str(kd, Int(barr[u]), Int(_ip(Int(mq[2 * jl + 1]))[Int(prow[jl * VEC + t]) + e]), st, ln)
+                                        sum_ln += ln
+                                    mbytes[m * n_tot + n_out + u] += Int64(sum_ln * (total // c_j))
+                                else:
+                                    _out_str(kd, Int(barr[u]), Int(prow[jl * VEC + t]), st, ln)
+                                    mbytes[m * n_tot + n_out + u] += Int64(ln * total)
+                        expanded += total
                         kept += 1
                     i0 += n
                 pos = stop
-            mcnt[m] = Int64(kept)
+            mcnt[m] = Int64(expanded)
+            msurv[m] = Int64(kept)
             if kept > 0:
                 var kr = unsafe_alloc[UInt16](kept)
                 for i in range(kept):
@@ -2620,19 +2932,30 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                 for i in range(kept * n_look):
                     keep[i] = tmp[i]
                 mlook[m] = Int64(Int(keep))
+                if any_multi:
+                    var cn = unsafe_alloc[Int32](kept * n_look)
+                    for i in range(kept * n_look):
+                        cn[i] = ctmp[i]
+                    mcntl[m] = Int64(Int(cn))
         regs.free()
+        ctmp.free()
         sel.free()
         tmp.free()
         kp.free()
         cand.free()
         ktmp.free()
         prow.free()
+        pcnt.free()
+        cb.free()
+        ix.free()
 
     if nt > 1:
         _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
         parallelize(pass1, nt)
     else:
         pass1(0)
+    var past_limit = Int(out_total[1]) != 0
+    out_total.free()
 
     # ── prefix sums: each morsel's first output row and first string byte ──────────────────
     var mrow = unsafe_alloc[Int64](morsels)
@@ -2642,7 +2965,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         total += Int(mcnt[m])
     var n_sel = total
     var col_bytes = unsafe_alloc[Int64](max(n_tot, 1))
-    var too_big = False
+    var too_big = past_limit
     for j in range(n_tot):
         var b = 0
         for m in range(morsels):
@@ -2659,6 +2982,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         for j in range(n_look):
             _free_map(maps + j * MW)
         mlook.free()
+        _free_lists(mcntl, morsels)
+        msurv.free()
+        mq.free()
         maps.free()
         tk.free()
         tsz.free()
@@ -2710,8 +3036,48 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             var hi = min(lo + MORSEL, n_rows)
             var r = Int(mrow[m])
             var r0 = r
-            var kr = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=Int(mkeep[m]))
             var nk = Int(mcnt[m])
+            var kr_a = Int(mkeep[m])
+            var rows_a = Int(mlook[m])
+            var expanded_here = False
+            if any_multi and nk > 0:
+                # expand the survivors into the joined rows: each survivor once per combination of its
+                # repeating partners' rows (the last repeating lookup runs fastest), in partner build order
+                var ns = Int(msurv[m])
+                var sk = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a)
+                var sr = _ip(rows_a)
+                var sc = _ip(Int(mcntl[m]))
+                var kr2 = unsafe_alloc[UInt16](nk)
+                var rows2 = unsafe_alloc[Int32](nk * n_look)
+                var ix = unsafe_alloc[Int32](max(n_look, 1))
+                var o = 0
+                for sv in range(ns):
+                    var total = 1
+                    for j in range(n_look):
+                        ix[j] = 0
+                        if Int(mq[2 * j]) != 0:
+                            total *= Int(sc[sv * n_look + j])
+                    for e in range(total):
+                        kr2[o] = sk[sv]
+                        for j in range(n_look):
+                            var rr = Int(sr[sv * n_look + j])
+                            if Int(mq[2 * j]) != 0:
+                                rr = Int(_ip(Int(mq[2 * j + 1]))[rr + Int(ix[j])])
+                            rows2[o * n_look + j] = Int32(rr)
+                        o += 1
+                        var jj = n_look - 1
+                        while jj >= 0:
+                            if Int(mq[2 * jj]) != 0:
+                                ix[jj] += 1
+                                if Int(ix[jj]) < Int(sc[sv * n_look + jj]):
+                                    break
+                                ix[jj] = 0
+                            jj -= 1
+                ix.free()
+                kr_a = Int(kr2)
+                rows_a = Int(rows2)
+                expanded_here = True
+            var kr = Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a)
             var q = 0                                  # next kept row of this morsel
             var pos = lo
             while pos < hi and q < nk:
@@ -2781,7 +3147,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             # partner columns: the morsel's kept rows, in order, through their partner rows
             var kept = Int(mcnt[m])
             if kept > 0 and n_look > 0:
-                var rows = _ip(Int(mlook[m]))
+                var rows = _ip(rows_a)
                 for t in range(n_bout):
                     var arr = Int(barr[t])
                     var kd = Int(tk[n_out + t])
@@ -2825,6 +3191,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
                             var sp = _bp(st)
                             _copy_bytes(Int(data) + bp, Int(sp), ln)
                             bp += ln
+            if expanded_here:
+                _ip(rows_a).free()
+                Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=kr_a).free()
 
     if nt > 1:
         parallelize(pass2, nt)
@@ -2842,6 +3211,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
     for j in range(n_look):
         _free_map(maps + j * MW)
     mlook.free()
+    _free_lists(mcntl, morsels)
+    msurv.free()
+    mq.free()
     maps.free()
     tk.free()
     tsz.free()

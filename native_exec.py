@@ -892,12 +892,19 @@ def try_filter_topk(compiler, table: pa.Table, predicates, names, descending, k:
 FMAGIC = 0x4D584631
 _FIXED_OK = (pa.types.is_integer, pa.types.is_floating, pa.types.is_date, pa.types.is_timestamp,
              pa.types.is_decimal, pa.types.is_time, pa.types.is_duration)
-_filter_last = {"path": None, "decline": None}
+_filter_last = {"path": None, "decline": None, "maps": []}
 
 
 def last_filter():
     """(path, decline reason) of the last native leaf-filter attempt."""
     return _filter_last["path"], _filter_last["decline"]
+
+
+def last_filter_maps():
+    """How the last native leaf filter indexed its partners, one dict per lookup: ``kind`` ("direct" array or
+    "hash" table), ``multi`` (the partner's keys repeat: rows in CSR layout) and ``bitmap`` (a presence bitmap
+    answers a miss first). Tests and the join trace read it."""
+    return list(_filter_last["maps"])
 
 
 def _filter_decline(reason: str):
@@ -950,8 +957,8 @@ def _unified_dictionary(dicts):
 class Lookup:
     """A join partner fused into the leaf filter (F-032): rows of the scanned table whose ``probe``
     columns equal ``build_keys`` of a row of ``build`` keep that row's ``outputs`` (written under
-    ``names``). ``build`` keys must be unique (a duplicate declines); 1 or 2 integer key columns.
-    ``semi``: only whether a partner row exists counts (keys may repeat, no outputs)."""
+    ``names``). ``build`` keys may repeat (each partner row of a matching key gives one joined row, in build order); 1 or 2
+    integer key columns. ``semi``: only whether a partner row exists counts (no outputs)."""
     __slots__ = ("probe", "build", "build_keys", "outputs", "names", "semi", "keep")
 
     def __init__(self, probe, build: pa.Table, build_keys, outputs, names=None, semi=False, keep=()):
@@ -997,6 +1004,7 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
     native call; dictionary string columns come back decoded (as the join path expects). None: the
     caller filters (and joins) as before."""
     _filter_last["path"] = None
+    _filter_last["maps"] = []
     if not enabled():
         return _filter_decline("disabled")
     if getattr(compiler, "_device_arg", None) != "cpu":
@@ -1121,12 +1129,13 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
         c_kinds = (ctypes.c_int64 * max(len(kinds), 1))(*kinds)
         c_sizes = (ctypes.c_int64 * max(len(sizes), 1))(*sizes)
         from .pipeline_kernels import default_threads
-        P = (ctypes.c_int64 * 19)(
+        c_stats = (ctypes.c_int64 * max(4 * len(look_words), 1))()
+        P = (ctypes.c_int64 * 20)(
             FMAGIC, 2 if look_words else 1, len(segs), len(vcols), len(ocols), code.ctypes.data, prog.consts.ctypes.data,
             prog.set_bytes.ctypes.data, prog.set_meta.ctypes.data, ctypes.addressof(c_dtypes),
             ctypes.addressof(arrays), ctypes.addressof(c_kinds), ctypes.addressof(c_sizes),
             default_threads(table.num_rows), len(dcols), ctypes.addressof(c_doffs),
-            len(look_words), ctypes.addressof(L), len(pk_names))
+            len(look_words), ctypes.addressof(L), len(pk_names), ctypes.addressof(c_stats))
         O = (ctypes.c_int64 * (2 + 2 * len(out_names)))()
         lib = _load()
         rc = _call_filter(lib, ctypes.addressof(P), ctypes.addressof(O))
@@ -1162,7 +1171,9 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
         else:
             nbytes = ctypes.c_int32.from_address(a + 4 * n).value
             out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
-    _filter_last.update(path="native_filter" if not lookups else "native_lookup", decline=None)
+    _filter_last.update(path="native_filter" if not lookups else "native_lookup", decline=None,
+                        maps=[{"kind": "hash" if c_stats[4 * j] else "direct", "multi": bool(c_stats[4 * j + 1]),
+                               "bitmap": bool(c_stats[4 * j + 2])} for j in range(len(look_words))])
     return pa.Table.from_arrays(out, names=out_names)
 
 
