@@ -627,7 +627,9 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol, cpu_rows=None):
         f = sp.gpu_fraction if sp.wins else (1.0 if sp.gpu_alone_ms < sp.cpu_alone_ms else 0.0)
     k = int(round(n_rows * f))
     dc = entry.dc
-    cpu_fn = cpu_rows or (lambda a, b: pk.run_pipeline_cpu(prog, cc, gids, n_groups, a, b))
+    from . import native_exec
+    repro = native_exec.reproducible()          # the router's worker threads do not inherit the context variable
+    cpu_fn = cpu_rows or (lambda a, b: pk.run_pipeline_cpu(prog, cc, gids, n_groups, a, b, reproducible=repro))
     cpu = Worker("cpu", "cpu", n_rows, compute=lambda r: cpu_fn(r[0], r[1]))
     # Fallible: if the GPU share fails, the Router redoes its rows on the CPU worker.
     gpu = Worker("gpu", "gpu", n_rows, fallible=True,

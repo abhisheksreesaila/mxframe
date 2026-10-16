@@ -188,8 +188,11 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         if coproc_fused.current_policy() is not None:
             # Under the co-processing policy the native executor declined the whole plan (it must not run
             # beside the GPU's share), so it takes the CPU rows here: its range of a split, or all of them.
+            from . import native_exec
+            repro = native_exec.reproducible()      # read here: the router's worker threads do not inherit it
+
             def cpu_range(a, b):
-                return _cpu_rows(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, a, b)
+                return _cpu_rows(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, a, b, repro)
         stable = not grouped or coproc_fused.stable_group_keys(agg_node.group_by)
         split = coproc_fused.try_split(
             prog, cc, gids, n_groups, n_rows, table, stable_gids=stable, cpu_rows=cpu_range,
@@ -254,19 +257,21 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
     return result
 
 
-def _cpu_rows(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, start, end):
+def _cpu_rows(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, start, end, reproducible):
     """CPU partials of rows ``[start, end)``: the native executor's (``native_exec.range_partials``), or the
-    older pipeline kernel's when the executor declines the range."""
+    older pipeline kernel's when the executor declines the range. Runs on a router worker thread, so the
+    caller's ``reproducible`` mode (F-064) is set here for the executor and passed to the kernel."""
     from . import native_exec
+    tok = native_exec._reproducible.set(reproducible)
     try:
         got = native_exec.range_partials(compiler, prog, table, predicates, agg_node, gids, n_groups, start, end)
     except Exception as exc:
         got = native_exec.swallowed(exc, "split share")
+    finally:
+        native_exec._reproducible.reset(tok)
     if got is not None:
         return got
-    # TODO(F-064): pass the reproducible flag here once run_pipeline_cpu takes it (and to the call in
-    # try_fused_aggregate): a split's CPU share must sum in a fixed order like the rest of the CPU paths.
-    return pk.run_pipeline_cpu(prog, cc, gids, n_groups, start, end)
+    return pk.run_pipeline_cpu(prog, cc, gids, n_groups, start, end, reproducible=reproducible)
 
 
 def _gid_fingerprint(table, unique_key_cols, n_groups):

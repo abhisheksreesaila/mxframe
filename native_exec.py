@@ -37,6 +37,20 @@ DISTINCT_MAX_GROUPS = 1 << 17     # SELECT DISTINCT through the group-by: direct
                                   # wider ones keep mx_distinct (measured: past ~2e5 groups its hash beats the
                                   # group-by plus the sort by first row)
 DISTINCT_FLAG = 1                 # plan word 27: groups directly addressed or E_TOO_MANY_GROUPS
+REPRO_FLAG = 2                    # plan word 27: float sums in the defined order (F-064)
+
+import contextvars as _contextvars
+_reproducible = _contextvars.ContextVar("mxframe_reproducible", default=None)    # per thread / task, never process-wide
+
+
+def reproducible() -> bool:
+    """Whether the compute() running in this thread asked for reproducible float sums: its explicit argument,
+    else MXFRAME_REPRODUCIBLE (read here, never written)."""
+    v = _reproducible.get()
+    if v is None:
+        return os.environ.get("MXFRAME_REPRODUCIBLE", "0") not in ("0", "false", "off", "")
+    return bool(v)
+
 _CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
 _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 K_DICT, K_I32, K_I64, K_STR, K_EXPR = 0, 1, 2, 3, 4
@@ -447,7 +461,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
             max_groups if distinct else min(MAX_COMPACT, max(MAX_GROUPS, 8 * table.num_rows)),
             ctypes.addressof(c_hconst), len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys),
-            0, DISTINCT_FLAG if distinct else 0)
+            0, (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()
@@ -1554,7 +1568,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
             default_threads(table.num_rows), max_groups, limit, len(having), ctypes.addressof(c_having),
             max_groups, ctypes.addressof(c_hconst),
             len(dcols), ctypes.addressof(c_doffs), ctypes.addressof(c_xkeys), ctypes.addressof(F),
-            DISTINCT_FLAG if distinct else 0)
+            (DISTINCT_FLAG if distinct else 0) | (REPRO_FLAG if reproducible() else 0))
         O = (ctypes.c_int64 * (3 + 2 * n_keys + n_out))()
         lib = _load()
         t_call = _time.perf_counter()

@@ -274,7 +274,6 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
         # ---- per-worker private partial arrays, merged by group range ----
         var stride = ((K * G + 15) // 16) * 16 + 16          # pad: no false sharing
         var part = unsafe_alloc[Scalar[AT]](W * stride)
-        var ctr = _new_queue()
         var n_m = _n_morsels(n_rows)
 
         def scan(w: Int) {imm}:
@@ -284,18 +283,16 @@ def _group_agg[OP: Int, VT: DType, AT: DType](
             else:
                 for g in range(G):
                     p[g] = init
-            while True:                                   # pull morsels until the queue is empty
-                var m = _claim(ctr)
-                if m >= n_m:
-                    break
+            var m = w                                     # worker w: morsels w, w + W, ... (fixed, so float
+            while m < n_m:                                # sums are bit-identical from run to run, F-064)
                 var lo = m * MORSEL
                 var hi = lo + MORSEL
                 if hi > n_rows:
                     hi = n_rows
                 _accumulate[OP, VT, AT](p, values, labels, lo, hi, G)
+                m += W
 
         sync_parallelize(scan, W)
-        ctr.free()
 
         var MT = G // 4096
         if MT > W:
@@ -546,21 +543,18 @@ def _masked_sum[VT: DType](dst: Pointer[F64, MutUntrackedOrigin],
     var out = dst
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
     var parts = unsafe_alloc[F64](W)
-    var ctr = _new_queue()
     var n_m = _n_morsels(n)
 
     def work(w: Int) {imm}:
         var acc: F64 = 0.0
-        while True:
-            var m = _claim(ctr)
-            if m >= n_m:
-                break
+        var m = w                       # worker w: morsels w, w + W, ... (fixed order, F-064)
+        while m < n_m:
             var lo = m * MORSEL
             acc += _msum_range[VT](values, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
+            m += W
         parts[w] = acc
 
     sync_parallelize(work, W)
-    ctr.free()
     var total: F64 = 0.0
     for w in range(W):
         total += parts[w]
@@ -575,21 +569,18 @@ def _masked_sum_product[VT: DType](dst: Pointer[F64, MutUntrackedOrigin],
     var out = dst
     var W = _pick_workers(n, threads, MIN_ROWS_STREAM)
     var parts = unsafe_alloc[F64](W)
-    var ctr = _new_queue()
     var n_m = _n_morsels(n)
 
     def work(w: Int) {imm}:
         var acc: F64 = 0.0
-        while True:
-            var m = _claim(ctr)
-            if m >= n_m:
-                break
+        var m = w                       # worker w: morsels w, w + W, ... (fixed order, F-064)
+        while m < n_m:
             var lo = m * MORSEL
             acc += _mprod_range[VT](a, b, mask, lo, lo + MORSEL if lo + MORSEL < n else n)
+            m += W
         parts[w] = acc
 
     sync_parallelize(work, W)
-    ctr.free()
     var total: F64 = 0.0
     for w in range(W):
         total += parts[w]
