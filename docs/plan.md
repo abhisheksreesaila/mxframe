@@ -29,7 +29,7 @@ Order, one stage at a time:
 4. **Gate:** F-058, the scoreboard that says the core is ready.
 Benchmarks run only on a quiet machine (see `docs/lessons.md`). With other agents running, do development and light SF1 correctness checks only.
 
-## F-055 GPU correctness sweep [review]
+## F-055 GPU correctness sweep [done]
 Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
 - [x] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB (22/22 both; first and repeat run); every mismatch or crash gets a fix or a ticket: none found. Also on the GPU, per query: the path of every `compute()` and the GPU kernels it called (all 22 ran at least one GPU kernel; the join in a GPU session is the GPU hash join)
 - [x] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (`--device gpu --gpu <uuid> --engines mx,duckdb`): 100/100 stored and shuffled, 94 ran a GPU kernel
