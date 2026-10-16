@@ -31,7 +31,10 @@ Program/ABI contract (keep in sync with pipeline_program.py):
   integer in chunk-table column `slot` (the native executor's string predicates, F-031),
   6 | (slot << 8) = utf8 offsets (int32; the column's base address is rebased like any other) plus, in
   chunk-table columns `slot`, `slot + 1`, `slot + 2`: the chunk's bytes address, its validity bitmap
-  address (0 = no nulls) and the bit index of row 0 of the chunk table's row numbering (F-034)
+  address (0 = no nulls) and the bit index of row 0 of the chunk table's row numbering (F-034),
+  7 | (slot << 8) = a column only tested by ISNULL (F-097): its values are never read (its chunk-table
+  address is unused); chunk-table columns `slot`, `slot + 1` hold the chunk's validity bitmap address
+  (0 = no nulls) and the bit index of row 0, as for dtype 6
   chunk table int64[n_chunks, 2 + n_cols]: row_start, row_end, then per column the
                     chunk's base address minus row_start * itemsize, so that
                     `addr + row * itemsize` is valid for every row of the chunk
@@ -94,6 +97,7 @@ comptime OP_IN_SET = 37
 comptime OP_CMPC = 38
 comptime OP_ROWID = 39      # the row's number in the whole input (SELECT DISTINCT: first appearance, F-033)
 comptime OP_STR = 40        # a plain utf8 column LIKE a pattern (F-034)
+comptime OP_ISNULL = 41     # the column's validity bit is clear (F-097)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -455,6 +459,18 @@ def _like_general(s: BP, L: Int, pat: BP, pl: Int) -> Bool:
     return pi == pl
 
 
+def _is_null(d: FP, valid_addr: Int, bit_base: Int, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    """d[j] = 1.0 where row j is NULL (its validity bit is clear), 0.0 where it is not or the chunk has no bitmap."""
+    if valid_addr == 0:
+        for j in range(n):
+            d[j] = 0.0
+        return
+    var valid = _bp(valid_addr)
+    for j in range(n):
+        var bit = bit_base + i0 + (Int(sel[j]) if use_sel else j)
+        d[j] = 1.0 if ((Int(valid[bit >> 3]) >> (bit & 7)) & 1) == 0 else 0.0
+
+
 def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: Int, pat: BP, pl: Int,
               negate: Bool, isin: Bool, i0: Int, sel: IP, use_sel: Bool, n: Int):
     """d[j] = 1.0 if row j's string matches the pattern (negated: does not), 0.0 for a NULL string.
@@ -640,6 +656,9 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             _str_like(d, Int(cols[c]), Int(cols[slot]), Int(cols[slot + 1]), Int(cols[slot + 2]),
                       p.set_bytes + Int(p.set_meta[si * 3]), Int(p.set_meta[si * 3 + 1]), (Int(ins[4]) & 1) != 0,
                       (Int(ins[4]) & 2) != 0, i0, sel, use_sel, n)
+        elif op == OP_ISNULL:
+            var slot = Int(p.dtypes[Int(ins[2])]) >> 8        # dtype 7 | (slot << 8): validity bitmap, bit base
+            _is_null(d, Int(cols[slot]), Int(cols[slot + 1]), i0, sel, use_sel, n)
         elif op == OP_ROWID:
             # i0 is the block's first row in the whole input (the column bases are rebased to it); sel
             # holds the block offsets of the rows kept so far

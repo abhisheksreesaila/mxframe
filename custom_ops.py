@@ -152,19 +152,22 @@ def _np_float_project(exprs, table):
     return pa.Table.from_arrays(arrays, names=names)
 
 
-def _expr_col_names(expr, out=None) -> set:
-    """Names of every column an Expr tree reads."""
+def _expr_col_names(expr, out=None, tests_ok=False) -> set:
+    """Names of every column an Expr tree reads. ``tests_ok``: a column that is only tested with ``is_null`` is
+    not read (its validity bitmap is, never its values)."""
     if out is None:
         out = set()
     if isinstance(expr, Expr):
         if expr.op == "col":
             out.add(expr.args[0])
+        elif tests_ok and expr.op == "is_null" and expr.args[0].op == "col":
+            pass
         else:
             for a in expr.args:
-                _expr_col_names(a, out)
+                _expr_col_names(a, out, tests_ok)
     elif isinstance(expr, (list, tuple)):
         for a in expr:
-            _expr_col_names(a, out)
+            _expr_col_names(a, out, tests_ok)
     return out
 
 
@@ -1845,7 +1848,7 @@ class CustomOpsCompiler(GraphCompiler):
         pass 2^53 (added exactly in int64, F-037). The split asks this too (``pipeline_exec.split_check``)."""
         read = set()
         for e in list(plan.group_by) + list(plan.aggs) + list(preds):
-            _expr_col_names(e, read)
+            _expr_col_names(e, read, tests_ok=not late)     # (late: every pipeline declined; the Arrow path keeps nulls)
         has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
             return "", False
