@@ -377,6 +377,19 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         kinds.append(kind)
     every = cols + key_cols
     if not every:
+        if (not keys and not preds and having_pred is None and not sort_by and limit < 0
+                and all(op == "count" for _, op, _ in outputs)):
+            # COUNT(col) over every row, no filter, no key: the table's row count (nulls were ruled out
+            # above); no column is read, so there is no array to hand the executor
+            import numpy as np
+            from .np_arrow import array as _npa
+            result = pa.Table.from_arrays([_npa(np.array([table.num_rows], dtype=np.int64)) for _ in names], names=names)
+            _last.update(path="native", decline=None, native_ms=0.0, py_ms=(_time.perf_counter() - t_start) * 1000)
+            compiler.last_compile_provenance = {
+                "device": "cpu", "rows": 1, "grouped": False, "n_groups": 0, "cache_hit": None,
+                "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data",
+            }
+            return result
         return _decline("no columns")
     segs = _segments(every)          # every column cut at the same row boundaries (zero-copy slices)
     if not segs:
