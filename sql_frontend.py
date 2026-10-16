@@ -397,6 +397,7 @@ class _SQLTranslator:
 
         final_proj = None
         names = None
+        sort_cols: dict = {}
         if group_node or has_aggs:
             plan, final_proj = self._build_aggregate(plan, node, group_node, having)
         else:
@@ -412,7 +413,10 @@ class _SQLTranslator:
                         p.alias(nm)
                 if len(non_star) < len(node.expressions):
                     names = None                       # a * shifts the positions
-                plan = Project(plan, proj)
+                hidden, sort_cols = self._hidden_sort_keys(node, non_star, names, distinct is not None) if names else ([], {})
+                plan = Project(plan, proj + [ex.alias(nm) for nm, ex in hidden])
+                if hidden:                             # carried to the sort, dropped after it
+                    final_proj = [col(nm) for nm in names]
             if distinct is not None:
                 plan = Distinct(plan, None)
 
@@ -429,7 +433,8 @@ class _SQLTranslator:
                     if i is None and isinstance(ref, sge.Column) and ref.name.lower() in (names or []):
                         by.append(col(ref.name.lower()))          # a SELECT output name
                     elif i is None:
-                        by.append(self._expr(o.this))
+                        ex = self._expr(o.this)
+                        by.append(col(sort_cols[ex.signature()]) if ex.signature() in sort_cols else ex)
                     elif names is None or names[i] is None:
                         raise ValueError("ORDER BY position needs a named SELECT column (give it an alias)")
                     else:
@@ -445,6 +450,31 @@ class _SQLTranslator:
         if final_proj:
             plan = Project(plan, final_proj)
         return plan
+
+    def _hidden_sort_keys(self, node: sge.Select, items, names, distinct: bool):
+        """ORDER BY keys of a plain SELECT that are not output columns: (the extra columns to carry
+        through the projection as ``[(name, expr)]``, ``{signature: column}`` of every key that is a
+        column already). SELECT DISTINCT may not sort by anything it does not output (as in DuckDB)."""
+        order_node = node.args.get("order")
+        have = {}
+        for e, nm in zip(items, names):
+            if nm is not None:
+                have.setdefault(self._expr(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
+        hidden = []
+        for o in order_node.expressions if order_node else []:
+            ref = o.this
+            if _ordinal(ref, len(node.expressions)) is not None:
+                continue
+            if isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in names:
+                continue
+            ex = self._expr(ref)
+            if ex.signature() in have:
+                continue
+            if distinct:
+                raise ValueError("for SELECT DISTINCT, ORDER BY expressions must appear in the select list")
+            have[ex.signature()] = nm = f"__ord{len(hidden)}"
+            hidden.append((nm, ex))
+        return hidden, have
 
     # ------------------------------------------------------------------
     # FROM / JOIN
