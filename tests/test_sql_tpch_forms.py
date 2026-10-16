@@ -215,18 +215,41 @@ LIKE = [
     "SELECT lsk FROM l WHERE note LIKE '%green%'",
     "SELECT lsk FROM l WHERE note NOT LIKE '%green%'",
     "SELECT lsk FROM l WHERE note NOT LIKE 'special%'",
+    # F-034: every other LIKE form
+    "SELECT lsk FROM l WHERE note LIKE '%pkg'",
+    "SELECT lsk FROM l WHERE note LIKE '%special%requests%'",
+    "SELECT lsk FROM l WHERE note NOT LIKE '%special%requests%'",
+    "SELECT lsk FROM l WHERE note LIKE 'sp_cial%'",
+    "SELECT lsk FROM l WHERE note LIKE 'a%g'",
+    "SELECT lsk FROM l WHERE note LIKE 'plain'",
+    "SELECT lsk FROM l WHERE note LIKE '_%'",
+    "SELECT lsk FROM l WHERE note ILIKE 'SPECIAL%'",
+    "SELECT lsk FROM l WHERE note NOT ILIKE '%GREEN%'",
+    "SELECT lsk FROM l WHERE note LIKE 'special!%' ESCAPE '!' OR note LIKE 'sp_cial_requests'",
+    "SELECT lsk FROM l WHERE note NOT LIKE '%!%%' ESCAPE '!'",
+    "SELECT lsk FROM l WHERE note LIKE '%green%' AND NOT note LIKE 'special%'",
 ]
 
 
 @pytest.mark.parametrize("q", LIKE)
-def test_like_prefix_and_substring(q):
+def test_like_forms(q):
     _check(q)
 
 
-@pytest.mark.parametrize("pattern", ["%pkg", "%special%requests%", "sp_cial%", "a%g", "plain"])
-def test_other_like_patterns_raise(pattern):
-    with pytest.raises(NotImplementedError, match="LIKE"):
-        mx.sql(f"SELECT lsk FROM l WHERE note LIKE '{pattern}'", **TABLES).compute(device="cpu")
+@pytest.mark.parametrize("q", ["SELECT lsk FROM l WHERE note LIKE ''",
+                               "SELECT lsk FROM l WHERE note LIKE 'sp!_cial%' ESCAPE '!'"])
+def test_like_forms_matching_nothing(q):
+    _check(q, nonempty=False)
+
+
+@pytest.mark.parametrize("sql,msg", [
+    ("SELECT lsk FROM l WHERE note LIKE note", "string literal"),
+    ("SELECT lsk FROM l WHERE note LIKE 'abc!' ESCAPE '!'", "escape character"),
+    ("SELECT lsk FROM l WHERE note LIKE 'abc' ESCAPE '!!'", "single character"),
+])
+def test_unsupported_like_forms_raise(sql, msg):
+    with pytest.raises((NotImplementedError, ValueError), match=msg):
+        mx.sql(sql, **TABLES).compute(device="cpu")
 
 
 CONSTANTS = [

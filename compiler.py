@@ -90,7 +90,7 @@ def _align_literals(lhs, rhs):
 
 
 # Ops whose `col <op> literal` form is evaluated natively on dictionary columns.
-_DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains"))
+_DICT_PRED_OPS = frozenset(("eq", "ne", "gt", "ge", "lt", "le", "isin", "startswith", "contains", "like"))
 
 class _LazyCmpOps:
     """MAX comparison ops by name; ``ops`` is only touched when one is looked up."""
@@ -389,6 +389,9 @@ class GraphCompiler:
         if op == "contains":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             return pc.match_substring(col_arr, pattern=args[1])
+        if op == "like":
+            from .str_patterns import match_like
+            return match_like(GraphCompiler._eval_predicate(args[0], table), args[1], args[2], args[3])
         if op == "case_when":
             cond = GraphCompiler._eval_predicate(args[0], table)
             then = GraphCompiler._eval_predicate(args[1], table)
