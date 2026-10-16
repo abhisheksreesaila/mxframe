@@ -43,6 +43,24 @@ def _u():
                      "v": pa.array([10, None, 30, None, 50, 60], pa.int64())})
 
 
+def _a(n):
+    """Same key name as u (k), a float pair with NaNs and NULLs."""
+    r = np.random.default_rng(87)
+    f = r.integers(0, 3, n).astype(np.float64)
+    f2 = r.integers(0, 3, n).astype(np.float64)
+    f[r.random(n) < 0.3] = np.nan
+    f2[r.random(n) < 0.3] = np.nan
+    return pa.table({"id": pa.array(np.arange(n, dtype=np.int64)),
+                     "k": pa.array(r.integers(0, 8, n).astype(np.int64), mask=r.random(n) < 0.25),
+                     "f": pa.array(f, mask=r.random(n) < 0.2), "f2": pa.array(f2, mask=r.random(n) < 0.2)})
+
+
+def _w():
+    """A column named like the engine's internal copy of u.k."""
+    return pa.table({"k": pa.array([0, 1, 7], pa.int64()), "__rk_u_k": pa.array([5, 6, 7], pa.int64()),
+                     "__m_u": pa.array([8, 9, 10], pa.int64())})
+
+
 def _norm(x):
     if isinstance(x, float):
         return "nan" if math.isnan(x) else round(x, 6)
@@ -54,15 +72,18 @@ def _rows(tbl):
     return cols, list(zip(*[[_norm(x) for x in tbl.column(c).to_pylist()] for c in cols]))
 
 
-def _check(q, n, device):
-    t, u = _t(n), _u()
+def _duck(q, tables):
     con = duckdb.connect()
-    con.register("t_arrow", t)
-    con.register("u_arrow", u)
-    con.execute("CREATE TABLE t AS SELECT * FROM t_arrow")
-    con.execute("CREATE TABLE u AS SELECT * FROM u_arrow")
-    exp = con.execute(q).to_arrow_table()
-    got = mx.sql(q, t=t, u=u).compute(device=device)
+    for name, tbl in tables.items():
+        con.register(name + "_arrow", tbl)
+        con.execute(f"CREATE TABLE {name} AS SELECT * FROM {name}_arrow")
+    return con.execute(q).to_arrow_table()
+
+
+def _check(q, n, device, **extra):
+    tables = {"t": _t(n), "u": _u(), **extra}
+    exp = _duck(q, tables)
+    got = mx.sql(q, **tables).compute(device=device)
     gc, g = _rows(got)
     ec, e = _rows(exp)
     assert gc == ec
@@ -158,3 +179,99 @@ def test_dataframe_filter_on_parquet(make, where, tmp_path):
     exp = [r[0] for r in duckdb.sql(f"SELECT id FROM '{path}' WHERE {where} ORDER BY id").fetchall()]
     got = mx.scan_parquet(path).filter(make(mx.col)).select(mx.col("id")).compute(device="cpu")
     assert sorted(got.column("id").to_pylist()) == exp
+
+
+# ---- review fixes: a LEFT JOIN's right key, NaN in DISTINCT FROM, the alias in the join cache, ON, constants ----
+
+RIGHT_KEY = [
+    "SELECT a.id, u.k FROM a LEFT JOIN u ON a.k = u.k ORDER BY a.id",
+    "SELECT a.id, u.k FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS NULL ORDER BY a.id",
+    "SELECT a.id FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS NOT DISTINCT FROM NULL ORDER BY a.id",
+    "SELECT a.id FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS DISTINCT FROM NULL ORDER BY a.id",
+    "SELECT a.id, u.k AS rk, a.k AS lk FROM a LEFT JOIN u ON a.k = u.k ORDER BY a.id",
+    "SELECT u.k, COUNT(*) AS n FROM a LEFT JOIN u ON a.k = u.k GROUP BY u.k ORDER BY u.k",
+    "SELECT a.id, u.k, u.v FROM a LEFT JOIN u ON a.k = u.k ORDER BY a.id",
+    "SELECT a.id, kk FROM a LEFT JOIN (SELECT k AS kk, v FROM u) x ON a.k = x.kk ORDER BY a.id",
+    "SELECT a.id FROM a LEFT JOIN (SELECT k AS kk, v FROM u) x ON a.k = x.kk WHERE x.kk IS NULL ORDER BY a.id",
+    "SELECT a.id, x.kk FROM a LEFT JOIN (SELECT k AS kk, v FROM u) x ON a.k = x.kk ORDER BY a.id",
+    "SELECT a.id FROM a LEFT JOIN u USING (k) WHERE k IS NULL ORDER BY a.id",
+    "SELECT a.id FROM a LEFT JOIN u USING (k) WHERE u.k IS NULL ORDER BY a.id",
+    "SELECT a.id, k FROM a LEFT JOIN u USING (k) ORDER BY a.id",
+    "SELECT a.id, u.k FROM a LEFT JOIN u USING (k) ORDER BY a.id",
+    "SELECT a.id FROM a LEFT JOIN u ON a.k = u.k LEFT JOIN u AS u2 ON a.id = u2.k WHERE u.k IS NULL AND u2.k IS NOT NULL "
+    "ORDER BY a.id",
+]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("q", RIGHT_KEY)
+def test_left_join_right_key_is_null_where_unmatched(q, device):
+    assert _check(q, 40, device, a=_a(40)) > 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_left_join_copy_never_in_a_result(device):
+    """SELECT * (also inside a subquery) has the columns of the tables, not the internal copy of the key."""
+    a = _a(40)
+    for q in ["SELECT * FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS NULL",
+              "SELECT * FROM (SELECT * FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS NULL) x"]:
+        got = mx.sql(q, a=a, u=_u()).compute(device=device)
+        assert got.column_names == ["id", "k", "f", "f2", "v"]
+        assert got.num_rows == _duck(q, {"a": a, "u": _u()}).num_rows > 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_left_join_copy_name_does_not_collide(device):
+    q = ("SELECT a.id, w.__rk_u_k, w.__m_u FROM a LEFT JOIN w ON a.k = w.k LEFT JOIN u ON a.k = u.k "
+         "WHERE u.k IS NULL ORDER BY a.id")
+    assert _check(q, 40, device, a=_a(40), w=_w()) > 0
+
+
+FLOAT_DISTINCT = [
+    "SELECT id FROM a WHERE f IS DISTINCT FROM f2 ORDER BY id",
+    "SELECT id FROM a WHERE f IS NOT DISTINCT FROM f2 ORDER BY id",
+    "SELECT id, f IS DISTINCT FROM f AS x, f IS NOT DISTINCT FROM f2 AS y FROM a ORDER BY id",
+    "SELECT id FROM a WHERE f IS DISTINCT FROM 1.0 ORDER BY id",
+]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("q", FLOAT_DISTINCT)
+def test_two_nans_are_not_distinct(q, device):
+    assert _check(q, 60, device, a=_a(60)) > 0
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_plans_differing_only_in_an_alias_do_not_share_a_join_result(device):
+    """The join cache key left out the output names: the second plan got the first one's column names."""
+    t = pa.table({"id": pa.array([1, 2, 3], pa.int64()), "k": pa.array([0, 1, 2], pa.int64())})
+    u = pa.table({"k": pa.array([0, 1], pa.int64()), "v": pa.array([10, 20], pa.int64())})
+    for name in ("p", "q", "p"):
+        right = mx.LazyFrame(u).select(mx.col("k"), (mx.col("v") + 0).alias(name))
+        got = mx.LazyFrame(t).join(right, left_on="k", right_on="k").compute(device=device)
+        assert got.column_names == ["id", "k", name]
+        assert got.column(name).to_pylist() == [10, 20]
+
+
+ON_NULL = [
+    "SELECT t.id FROM t LEFT JOIN u ON t.i = u.k AND u.v IS NULL ORDER BY t.id",
+    "SELECT t.id, u.v FROM t LEFT JOIN u ON t.i = u.k AND u.v IS NOT NULL ORDER BY t.id",
+    "SELECT t.id FROM t JOIN u ON t.i = u.k AND u.v IS NULL ORDER BY t.id",
+    "SELECT t.id FROM t LEFT JOIN u ON t.i = u.k AND u.v IS NULL WHERE u.k IS NULL ORDER BY t.id",
+]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("q", ON_NULL)
+def test_is_null_on_the_right_table_in_join_on(q, device):
+    assert _check(q, 60, device) > 0
+
+
+@pytest.mark.parametrize("q", [
+    "SELECT id FROM t WHERE 1 IS DISTINCT FROM 2",
+    "SELECT id FROM t WHERE NULL IS NULL",
+    "SELECT id FROM t WHERE 1 IS NOT DISTINCT FROM NULL",
+])
+def test_constants_only_raise_a_clear_error(q):
+    with pytest.raises(NotImplementedError, match="no column to filter"):
+        mx.sql(q, t=_t(10)).compute(device="cpu")

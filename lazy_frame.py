@@ -65,7 +65,7 @@ class Project(LogicalPlan):
     input: LogicalPlan
     exprs: List[Expr]
     def signature(self) -> tuple:
-        return ("Project", self.input.signature(), tuple(e.signature() for e in self.exprs))
+        return ("Project", self.input.signature(), tuple(e.signature(True) for e in self.exprs))
 
 @dataclass
 class Aggregate(LogicalPlan):
@@ -75,8 +75,8 @@ class Aggregate(LogicalPlan):
     aggs: List[Expr]
     def signature(self) -> tuple:
         return ("Aggregate", self.input.signature(),
-                tuple(e.signature() for e in self.group_by),
-                tuple(e.signature() for e in self.aggs))
+                tuple(e.signature(True) for e in self.group_by),
+                tuple(e.signature(True) for e in self.aggs))
 
 @dataclass
 class Sort(LogicalPlan):

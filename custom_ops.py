@@ -3335,7 +3335,7 @@ class CustomOpsCompiler(GraphCompiler):
             inner = CustomOpsCompiler._plan_stable_key(plan.input)
             if inner is None:
                 return None
-            return inner + ("project", tuple(e.signature() for e in plan.exprs))
+            return inner + ("project", tuple(e.signature(True) for e in plan.exprs))
         return None
 
     def _materialize_joins(self, plan, needed=None):

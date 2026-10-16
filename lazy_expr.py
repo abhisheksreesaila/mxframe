@@ -169,15 +169,16 @@ class Expr:
         """Count the number of rows. After a filter, reflects filtered row count."""
         return Expr("count", self)
 
-    def signature(self) -> tuple:
-        """Return a hashable structural signature for graph caching."""
+    def signature(self, alias: bool = False) -> tuple:
+        """Return a hashable structural signature for graph caching. Names an output (``alias=True``) only
+        where the key stands for a result, as in a plan's cache key; expression matching ignores them."""
         def _sig(a):
-            if isinstance(a, Expr): return a.signature()
+            if isinstance(a, Expr): return a.signature(alias)
             if hasattr(a, "signature"): return a.signature()      # a subquery's plan
             if isinstance(a, list): return ("list", tuple(a))
             return a
         child_sigs = tuple(_sig(a) for a in self.args)
-        return (self.op, child_sigs)
+        return (self.op, child_sigs, self._alias) if alias else (self.op, child_sigs)
 
     def __repr__(self) -> str:
         args_str = ", ".join(repr(a) for a in self.args)

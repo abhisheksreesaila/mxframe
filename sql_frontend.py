@@ -313,10 +313,11 @@ class _SQLTranslator:
         # the column that actually exists in the output (left side is kept,
         # right join key is dropped by the hash-join implementation)
         self._col_aliases: dict = {}
-        # right join keys of a LEFT JOIN: the join drops them, and they are NULL for unmatched rows,
-        # so a left key cannot stand in for them
-        self._dropped_right: dict = {}
-        self._marks: dict = {}               # (left-joined table, its key) -> a column that is NULL where unmatched
+        # a LEFT JOIN drops its right key, but `u.k` is NULL for unmatched rows: when the query reads it, the
+        # right side carries a copy of it (NULL where nothing matched). (alias, key) / bare key -> that copy
+        self._marks: dict = {}
+        self._marks_bare: dict = {}
+        self._copies: set = set()            # the copies: internal, never part of a result
         # (table name or alias, its columns) of every scanned table, and join keys that have the
         # same name on both sides (one copy survives the join, so t.k and u.k are the same column)
         self._table_cols: List[tuple] = []
@@ -406,6 +407,8 @@ class _SQLTranslator:
                 raise ValueError("HAVING needs GROUP BY or an aggregate function in SELECT")
             # pure projection (skip if SELECT *)
             non_star = [e for e in node.expressions if not isinstance(e, sge.Star)]
+            if not non_star and self._copies:
+                plan = Project(plan, [col(c) for c in self._cur_cols])        # SELECT *: without the copies
             if non_star:
                 proj = [self._select_expr(e) for e in non_star]
                 names = _dedupe([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])
@@ -516,6 +519,13 @@ class _SQLTranslator:
 
             how = _join_type(join)
             on = join.args.get("on")
+            if on is not None:
+                on, right_only = self._split_on(on, join.this.alias_or_name.lower(), right_schema)
+                if right_only:                        # ON ... AND u.v IS NULL: the right rows that may match
+                    pred = self._expr(right_only[0])
+                    for c in right_only[1:]:
+                        pred = pred & self._expr(c)
+                    right_plan = Filter(right_plan, pred)
             using = join.args.get("using")
             if on is not None:
                 left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
@@ -527,7 +537,7 @@ class _SQLTranslator:
                 raise ValueError("JOIN requires ON or USING clause")
 
             if how == "left":
-                right_plan = self._mark_right_keys(node, join, right_plan, right_cols, right_on)
+                right_plan = self._copy_right_keys(node, join, right_plan, right_cols, left_on, right_on)
             plan = Join(plan, right_plan, left_on, right_on, how)
             # After this join, the accumulated left side grows to include right cols (a semi / anti
             # join outputs the left columns only)
@@ -539,8 +549,8 @@ class _SQLTranslator:
             for lk, rk in zip(left_on, right_on):
                 if lk == rk:
                     self._same_keys.add(lk)
-                if lk != rk:
-                    (self._dropped_right if how == "left" else self._col_aliases)[rk] = lk
+                if lk != rk and how != "left":
+                    self._col_aliases[rk] = lk
 
         while pending:
             for i, (alias, right_plan, right_cols) in enumerate(pending):
@@ -570,20 +580,53 @@ class _SQLTranslator:
 
         return plan
 
-    def _mark_right_keys(self, node, join, right_plan, right_cols, right_on):
-        """The join keeps only the left key, so ``r.k IS NULL`` (the anti-join pattern: r.k is NULL where
-        nothing matched) has no column to test. When the query asks IS [NOT] NULL of a right key, give the
-        right side a constant column that is NULL exactly where nothing matched, and test that."""
+    def _split_on(self, on, alias, right_schema):
+        """(``on`` without its conjuncts that test only the right table for NULL, those conjuncts): they
+        decide which right rows may match, so they filter the right side before the join."""
+        keep, mine = [], []
+        for c in _conjuncts(on):
+            c0 = _unparen(c)
+            t = _unparen(c0.this if isinstance(c0, sge.Not) else c0)
+            x = _unparen(t.this) if isinstance(t, sge.Is) else None
+            right = isinstance(x, sge.Column) and (x.table.lower() == alias if x.table
+                                                   else x.name.lower() in right_schema
+                                                   and x.name.lower() not in self._left_schema)
+            (mine if right else keep).append(c)
+        if mine and not keep:
+            raise ValueError("JOIN ... ON needs a column = column condition besides IS [NOT] NULL")
+        return (_and_all(keep) if keep else on), mine
+
+    def _copy_right_keys(self, node, join, right_plan, right_cols, left_on, right_on):
+        """The join keeps only the left key. When the query reads a right key (``u.k``; a bare ``k`` that is
+        only the right table's), the right side carries a copy of it under a name no table has: NULL where
+        nothing matched, the key where it did. ``u.k`` resolves to the copy."""
         alias = join.this.alias_or_name.lower()
-        asked = {i.this.name.lower() for i in node.find_all(sge.Is)
-                 if isinstance(i.this, sge.Column) and (i.this.table or alias).lower() == alias}
-        keys = [k for k in right_on if k in asked]
-        if not keys:
+        pairs = dict(zip(right_on, left_on))
+        asked = set()
+        for key, val in node.args.items():
+            if key in ("joins", "from_", "with_") or val is None:
+                continue
+            for e in (val if isinstance(val, list) else [val]):
+                for c in (e.find_all(sge.Column) if isinstance(e, sge.Expression) else ()):
+                    name = c.name.lower()
+                    if name in pairs and (c.table.lower() == alias if c.table
+                                          else pairs[name] != name and name not in self._left_schema):
+                        asked.add(name)
+        if not asked:
             return right_plan
-        mark = f"__m_{alias}"
-        for k in keys:
-            self._marks[(alias, k)] = mark
-        return Project(right_plan, [col(c) for c in right_cols] + [lit(1).alias(mark)])
+        taken = set(right_cols) | set(self._cur_cols) | {c for t in self._tables.values()
+                                                          for c in getattr(t, "column_names", ())}
+        added = []
+        for k in sorted(asked):
+            name = f"__rk_{alias}_{k}"
+            while name in taken:
+                name += "_"
+            self._marks[(alias, k)] = name
+            if pairs[k] != k:
+                self._marks_bare[k] = name
+            self._copies.add(name)
+            added.append(col(k).alias(name))
+        return Project(right_plan, [col(c) for c in right_cols] + added)
 
     def _links(self, alias: str, cols: set):
         """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
@@ -1278,14 +1321,14 @@ class _SQLTranslator:
         # ---- column reference ----
         if isinstance(node, sge.Column):
             name = node.name.lower()
+            copy = self._marks.get((node.table.lower(), name)) if node.table else self._marks_bare.get(name)
+            if copy:                                    # a LEFT JOIN's right key: NULL where unmatched
+                return col(copy)
             if node.table and (node.table.lower(), name) in self._qual:
                 return col(self._qual[(node.table.lower(), name)])        # a comma-joined table's own copy
             if node.table and name not in self._same_keys and self._copy_dropped(node.table.lower(), name):
                 raise ValueError(f"column {node.sql(dialect='duckdb')}: the name exists in more than one joined "
                                  "table and the join keeps the first copy, so this one is not supported yet")
-            if name in self._dropped_right:
-                raise ValueError(f"column {name!r} is the right key of a LEFT JOIN, which the join drops "
-                                 f"(it is NULL where nothing matched); use the left key {self._dropped_right[name]!r}")
             # Remap right join keys to their left-side equivalents (hash join
             # drops the right join key and keeps the left one in the output)
             name = self._col_aliases.get(name, name)
@@ -1342,12 +1385,16 @@ class _SQLTranslator:
         if isinstance(node, sge.Is):
             return self._is(node)
         if isinstance(node, (sge.NullSafeEQ, sge.NullSafeNEQ)):
+            self._no_constants(node, node.this, node.expression)
             if isinstance(node.expression, sge.Null) or isinstance(node.this, sge.Null):
                 x = self._expr(node.this if isinstance(node.expression, sge.Null) else node.expression)
                 return x.is_null() if isinstance(node, sge.NullSafeEQ) else ~x.is_null()
             a, b = self._expr(node.this), self._expr(node.expression)
             an, bn = a.is_null(), b.is_null()
-            differ = (an & ~bn) | (~an & bn) | (~an & ~bn & (a != b))
+            unequal = a != b
+            if not any(isinstance(o, sge.Literal) for o in (node.this, node.expression)):
+                unequal = unequal & ~((a != a) & (b != b))          # two NaNs are not distinct (DuckDB)
+            differ = (an & ~bn) | (~an & bn) | (~an & ~bn & unequal)
             return ~differ if isinstance(node, sge.NullSafeEQ) else differ
 
         # ---- BETWEEN ----
@@ -1429,15 +1476,19 @@ class _SQLTranslator:
     def _is(self, node: sge.Is) -> Expr:
         """``x IS NULL`` / ``IS TRUE`` / ``IS FALSE``: never NULL themselves (``IS NOT ...`` is a NOT above)."""
         what = node.expression
-        t = node.this
-        marks = [m for (a, n), m in self._marks.items()
-                 if isinstance(t, sge.Column) and n == t.name.lower() and (not t.table or a == t.table.lower())]
-        x = col(marks[0]) if len(marks) == 1 else self._expr(t)
+        self._no_constants(node, node.this)
+        x = self._expr(node.this)
         if isinstance(what, sge.Null):
             return x.is_null()
         if isinstance(what, sge.Boolean):
             return (x if what.this else ~x) & ~x.is_null()     # a NULL x gives NULL & False = False
         raise NotImplementedError(f"IS {what.sql(dialect='duckdb')} is not supported: IS [NOT] NULL, TRUE, FALSE only")
+
+    @staticmethod
+    def _no_constants(node, *operands):
+        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) for o in operands):
+            raise NotImplementedError(f"{node.sql(dialect='duckdb')}: a test of constants only has no column to "
+                                      "filter or compute on; put a column in it")
 
     def _translate_case(self, node: sge.Case) -> Expr:
         ifs = node.args.get("ifs") or []
