@@ -82,6 +82,23 @@ def _same_multiset(ref, got, rel):
                                                                             sorted(got, key=_sortkey)))
 
 
+def out_of_order(a, b, pos, desc):
+    """True when row b follows row a against the ORDER BY. The first sort column on which the rows
+    are not exactly equal decides: a float pair within TIE of each other is a near-tie (two engines
+    sum in a different order and differ in the last bits), so either order is accepted and later
+    columns are NOT consulted. Checking them (an earlier version skipped near-equal values and went
+    on) demanded the key order inside runs of unequal values: with 30,000 groups the averages are
+    ~1e-6 apart, and seed 7129 was reported WRONG for rows that equal DuckDB's bit for bit."""
+    for p, d in zip(pos, desc):
+        x, y = a[p], b[p]
+        if x == y:
+            continue
+        if _close(x, y, TIE):
+            return False
+        return (x < y) if d else (x > y)
+    return False
+
+
 def compare(spec, ref_path, got_path):
     """DuckDB's rows against an engine's. Unordered queries: equal as multisets. Ordered ones: the
     engine's rows follow the ORDER BY, and equal DuckDB's as multisets, except that rows tied with the
@@ -112,7 +129,7 @@ def compare(spec, ref_path, got_path):
                 return (x > y) if d else (x < y)
             return False
 
-        if any(before(got[i + 1], got[i]) for i in range(len(got) - 1)):
+        if any(out_of_order(got[i], got[i + 1], pos, desc) for i in range(len(got) - 1)):
             unordered = True
             continue                                       # not in ORDER BY order
         if _same_multiset(ref, got, rel):
