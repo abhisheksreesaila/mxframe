@@ -333,17 +333,6 @@ def _min_skip_nan(arr):
     return ok.min() if ok.size else np.nan
 
 
-def _canonical_partition_key(col):
-    """A float key column with -0.0 as 0.0 and every NaN payload as one NaN, so equal-by-SQL keys share a
-    code (nulls stay null). replace with np_arrow.canonical_floats after F-077 merges"""
-    if not pa.types.is_floating(col.type):
-        return col
-    a = _combine(col)
-    f = _np_float_values(a)
-    v = np.where(np.isnan(f), np.nan, f + 0.0)
-    return _npa(np.ma.masked_array(v, mask=_np_of(pc.is_null(a), zero_copy_only=False)), type=pa.float64()) if a.null_count else _npa(v)
-
-
 def _window_rank(arr: np.ndarray) -> np.ndarray:
     """Standard competition ranking: ties share rank, gaps follow (1,2,2,4…)."""
     order = np.argsort(arr, kind="stable")
@@ -1364,7 +1353,7 @@ class CustomOpsCompiler(GraphCompiler):
 
         # Build {key_tuple: [row_indices]} map
         if partition_by:
-            gid, _ = _np_group_ids(pa.table({c: _canonical_partition_key(table.column(c)) for c in partition_by}),
+            gid, _ = _np_group_ids(pa.table({c: table.column(c) for c in partition_by}),
                                    partition_by)
             order = np.argsort(gid, kind="stable")
             bounds = np.flatnonzero(np.diff(gid[order])) + 1

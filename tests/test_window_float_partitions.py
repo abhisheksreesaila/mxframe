@@ -13,9 +13,9 @@ def _nan(payload):
     return struct.unpack("<d", struct.pack("<Q", 0x7FF8000000000000 | payload))[0]
 
 
-def _table(keys, key_type=pa.float64(), k2=None):
+def _table(keys, key_type=pa.float64(), k2=None, v=None):
     n = len(keys)
-    d = {"k": pa.array(keys, type=key_type), "v": pa.array([float(i + 1) for i in range(n)], pa.float64()),
+    d = {"k": pa.array(keys, type=key_type), "v": pa.array(v if v is not None else [float(i + 1) for i in range(n)], pa.float64()),
          "id": pa.array(list(range(n)), pa.int64())}
     if k2 is not None:
         d["k2"] = pa.array(k2)
@@ -59,8 +59,8 @@ def test_sum_over_two_nan_payloads_is_one_partition():
 
 
 def test_negative_zero_and_zero_are_one_partition():
-    t = _table([0.0, -0.0, 5.0])
-    assert _mx(t, col("v").sum().over("k")) == [3.0, 3.0, 3.0][:2] + [3.0]
+    t = _table([0.0, -0.0, 5.0], v=[1.0, 2.0, 10.0])
+    assert _mx(t, col("v").sum().over("k")) == [3.0, 3.0, 10.0]
 
 
 def test_null_is_its_own_partition_apart_from_nan():
