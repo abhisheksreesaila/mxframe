@@ -338,6 +338,19 @@ def _float_values(a) -> np.ndarray:
     return np.frombuffer(a.buffers()[1], dtype=np.float64, count=a.offset + len(a))[a.offset:]
 
 
+def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
+    """Exact int64 per-group sum (np.bincount adds in float64, which loses digits past 2^53): the values
+    are cut into three 21-bit limbs, each limb's sums are exact in float64, then recombined in int64."""
+    if a.type != pa.int64():
+        a = pc.cast(a, pa.int64())
+    v = np.frombuffer(a.buffers()[1], dtype=np.int64, count=a.offset + len(a))[a.offset:][valid]
+    mask = (1 << 21) - 1
+    s0 = np.bincount(g, weights=(v & mask), minlength=n_groups)
+    s1 = np.bincount(g, weights=((v >> 21) & mask), minlength=n_groups)
+    s2 = np.bincount(g, weights=(v >> 42), minlength=n_groups)
+    return (s2.astype(np.int64) << 42) + (s1.astype(np.int64) << 21) + s0.astype(np.int64)
+
+
 def distinct_rows(table: pa.Table) -> pa.Table:
     """Distinct rows of ``table`` (nulls equal to each other), first-appearance order."""
     if table.num_rows == 0:
@@ -369,6 +382,9 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
         cnt = np.bincount(g, minlength=n_groups)
         if op == "count":
             out.append(array(cnt.astype(np.int64)))
+            continue
+        if op == "sum" and pa.types.is_integer(a.type):
+            out.append(array(np.ma.array(_int_group_sum(a, valid, g, n_groups), mask=cnt == 0), type=pa.int64()))
             continue
         x = _float_values(a)[valid]
         if op in ("sum", "mean"):

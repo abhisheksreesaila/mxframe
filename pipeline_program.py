@@ -111,6 +111,10 @@ class Unsupported(Exception):
     """Raised inside the compiler; compile_pipeline turns it into ``None``."""
 
 
+class Inexact(Unsupported):
+    """The program would compute an integer past 2^53 in float64 (F-037)."""
+
+
 @dataclass
 class Partials:
     """Per-(aggregate slot, group) partial results of one or more row ranges."""
@@ -372,10 +376,12 @@ class _Const:
 class _Val:
     vreg: int
     kind: str          # "int" | "float" | "bool"
-    bound: int = 0     # int kind: every value is within +-bound (exact Python int)
-    src: Optional[str] = None   # int kind: a bare column; its bound is read from the data when needed
+    bound: Any = None  # int kind: a bound expression (see _eval_bound), evaluated only when a + - * needs it
 
 
+# A bound is a tuple tree: ("c", n) | ("col", name) | ("add", x, y) | ("mul", x, y) | ("max", x, y) |
+# ("div", x, k).  It is evaluated from the column TYPES first (no data read); only if that could pass
+# 2^53 is it evaluated again from the columns' real min / max.
 EXACT = 1 << 53        # integers within +-2^53 are exact in float64, and so are their sums / products
 
 
@@ -511,12 +517,18 @@ class _Builder:
         ix = self._column(name)
         if kind != "int":
             return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind)
-        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind, src=name)
+        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind, ("col", name))
 
-    def col_bound(self, name: str) -> int:
-        """max |value| of an integer column, from the data's own min / max (one pass, only when integer
-        arithmetic needs it; the type's range would decline int32 * int32)."""
+    def col_bound(self, name: str, tight: bool) -> int:
+        """max |value| of an integer column: its type's range, or (tight) the data's own min / max, one
+        parallel pass cached for the query. int64 is capped at 2^53 (wider values decline at bind)."""
+        t = self.table.schema.field(name).type
+        wide = EXACT if t.bit_width >= 64 else (1 << t.bit_width) - 1 if pa.types.is_unsigned_integer(t) \
+            else 1 << (t.bit_width - 1)
+        if not tight or wide <= 1 << 16:
+            return wide
         if name not in self.col_bounds:
+            from .join_engine import _minmax
             col = self.table.column(name)
             tb: Optional[int] = 0
             for ch in (col.chunks if isinstance(col, pa.ChunkedArray) else [col]):
@@ -525,15 +537,29 @@ class _Builder:
                 if ch.null_count:
                     tb = None
                     break
-                a = _np_of(ch, zero_copy_only=False)
-                tb = max(tb, abs(int(a.max())), abs(int(a.min())))
-            self.col_bounds[name] = EXACT + 1 if tb is None else tb
+                lo, hi = _minmax(_np_of(ch, zero_copy_only=False))
+                tb = max(tb, abs(lo), abs(hi))
+            self.col_bounds[name] = wide if tb is None else tb
         return self.col_bounds[name]
 
-    def bound_of(self, x) -> int:
-        if isinstance(x, _Const):
-            return abs(int(x.value))
-        return self.col_bound(x.src) if x.src is not None else x.bound
+    def bound_of(self, x):
+        return ("c", abs(int(x.value))) if isinstance(x, _Const) else x.bound
+
+    def _eval_bound(self, t, tight: bool) -> int:
+        k = t[0]
+        if k == "c":
+            return t[1]
+        if k == "col":
+            return self.col_bound(t[1], tight)
+        a = self._eval_bound(t[1], tight)
+        if k == "div":
+            return a // t[2] + 1
+        b = self._eval_bound(t[2], tight)
+        return a * b if k == "mul" else max(a, b) if k == "max" else a + b
+
+    def within_exact(self, t, scale: int = 1) -> bool:
+        """Can ``scale * bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
+        return (self._eval_bound(t, False) * scale <= EXACT or self._eval_bound(t, True) * scale <= EXACT)
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
         """IN_SET over a column's values / codes given a boolean membership table."""
@@ -584,7 +610,7 @@ class _Builder:
             kind = "int" if (then.kind == "int" and other.kind == "int") else "float"
             if isinstance(cond, _Const):
                 return then if cond.value != 0 else other
-            bound = max(self.bound_of(then), self.bound_of(other)) if kind == "int" else 0
+            bound = ("max", self.bound_of(then), self.bound_of(other)) if kind == "int" else None
             return _Val(self.emit(OP_SELECT, cond.vreg, self.as_reg(then), self.as_reg(other)), kind, bound)
         if op == "year":
             x = self.compile(args[0])
@@ -592,7 +618,7 @@ class _Builder:
                 raise Unsupported("year() only on integer YYYYMMDD columns")
             d = self.const_reg(10000.0)
             q = self.emit(OP_DIV, x.vreg, d)
-            return _Val(self.emit(OP_FLOOR, q), "int", self.bound_of(x) // 10000 + 1)
+            return _Val(self.emit(OP_FLOOR, q), "int", ("div", self.bound_of(x), 10000))
         raise Unsupported(f"op {op!r}")
 
     def _need(self, e: Expr, want: str):
@@ -610,14 +636,13 @@ class _Builder:
         if code == OP_DIV and a.kind == "int" and b.kind == "int":
             raise Unsupported("integer division has floor semantics in Arrow")
         kind = "float" if "float" in (a.kind, b.kind) or code == OP_DIV else "int"
-        bound = 0
+        bound = None
         if kind == "int":
             # the interpreter is float64: an integer intermediate is exact only within +-2^53, so bound
             # it from its inputs (columns' real min / max) and decline when it could pass (F-037)
-            ba, bb = self.bound_of(a), self.bound_of(b)
-            bound = ba * bb if code == OP_MUL else ba + bb
-            if bound > EXACT:
-                raise Unsupported("integer arithmetic could pass 2**53, not exact in float64")
+            bound = ("mul" if code == OP_MUL else "add", self.bound_of(a), self.bound_of(b))
+            if not self.within_exact(bound):
+                raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
         if isinstance(a, _Const) and isinstance(b, _Const):
             if code == OP_DIV:
                 if b.value == 0:
@@ -670,7 +695,7 @@ class _Builder:
             if a.is_integer() and b.is_integer() and self._int_expr(e):
                 r = _FOLD[_ARITH[e.op]](int(a), int(b))       # exact Python integers
                 if abs(r) > EXACT:
-                    raise Unsupported("integer arithmetic could pass 2**53, not exact in float64")
+                    raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
                 return float(r)
             return _FOLD[_ARITH[e.op]](a, b)
         return None
@@ -820,6 +845,20 @@ def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
         return None
 
 
+def int_sum_inexact(aggs: List[Expr], table: pa.Table) -> bool:
+    """Would a ``sum`` in ``aggs`` add integers whose total could pass 2^53 (so float64 loses digits)?
+    The caller then sums exactly in Arrow (F-037)."""
+    if not any(e.op == "sum" for e in aggs):
+        return False
+    try:
+        _compile([], [e for e in aggs if e.op == "sum"], table)
+    except Inexact:
+        return True
+    except Unsupported:
+        return False
+    return False
+
+
 def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
 
@@ -856,6 +895,10 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if e.op not in ("sum", "min", "max", "mean"):
             raise Unsupported(f"aggregate {e.op!r}")
         inner = b._need(e.args[0], "num")
+        if e.op == "sum" and inner.kind == "int" and \
+                not b.within_exact(b.bound_of(inner), max(1, table.num_rows)):
+            # the float64 accumulator keeps whole numbers only within 2^53: rows * max|value| could pass it
+            raise Inexact("integer sum could pass 2**53, not exact in float64")
         kind = "sum" if e.op == "mean" else e.op
         key = (kind, e.args[0].signature())
         if e.op in ("min", "max") and not isinstance(inner, _Const) and inner.kind == "float":
