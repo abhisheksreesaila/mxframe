@@ -868,7 +868,8 @@ class _SQLTranslator:
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
         new.set("expressions", [_alias(item, "__in")])
-        new.set("order", None)
+        if not new.args.get("limit"):
+            new.set("order", None)                     # the order only matters to pick the LIMIT rows
         if int_lits:
             _keep_ints(new.expressions[0])
         inner_plan = self._child()._build_select(new)

@@ -819,3 +819,10 @@ Found by the F-081 review (2026-10-16); silent wrong answers on main before F-08
 - [ ] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
 - [ ] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decide and document if not
 - [ ] DuckDB-checked tests for each; fail before
+
+## F-085 ORDER BY + LIMIT inside an IN / NOT IN subquery is dropped [review]
+Found by the F-083 review (2026-10-16); a silent wrong answer, also on main
+- [x] `WHERE i IN (SELECT i FROM t ORDER BY i DESC LIMIT 5)` returned 0..4 where DuckDB returns 45..49: the uncorrelated IN / NOT IN build side dropped the subquery ORDER BY and kept its LIMIT. It now keeps the ORDER BY when there is a LIMIT. Correlated IN, EXISTS and scalar subqueries reject LIMIT already (raise), so they never gave a wrong answer
+- [x] DuckDB-checked tests (`tests/test_sql_subquery_order_limit.py`): DESC, multi-key with ties, hidden sort key (F-083), WHERE in the subquery, alias, NOT IN, join to another table, outer LIMIT; fail before
+
+- F-083 note: the DataFrame side sorts before select (`f.sort("b").select("a")`); `select("a").sort("b")` raises a ValueError naming the column. A hidden-key Project above Sort/Limit is applied after the post-ops in `CustomOpsCompiler.compile_and_run`, so the top-n paths still see Sort + Limit.
