@@ -633,3 +633,72 @@ def test_a_join_key_group_key_with_a_wide_partner_range_declines_before_any_call
     assert nx.decline_counts().get("group key space too wide for direct addressing") == 1, nx.decline_counts()
     exp = _duck("SELECT k, g, SUM(v), COUNT(v) FROM fact JOIN dim ON k = dk GROUP BY k, g", fact=fact, dim=dim)
     _same(_rows(got, ["k", "g", "s", "n"]), exp)
+
+
+def test_a_wrong_caller_range_declines_instead_of_indexing_past_the_groups(calls, monkeypatch):
+    """The executor trusts a range the caller measured only as far as it checks it: a value outside it makes
+    the call return E_BAD_KEY (-11) rather than write outside the group arrays; the old path answers."""
+    fact, dim1, _, _ = _tables()
+    plan = lambda: (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+                    .groupby("k", "g").agg(col("v").sum().alias("s"), col("v").count().alias("n")))
+    exp = plan().compute(device="cpu")
+    _fused(calls)
+    calls.update(exec=[], star=0, filter=0, rc3=[])
+    monkeypatch.setattr(nx, "_probe_range", lambda fj, bs, name: (0, 100) if name == "k" else None)    # k reaches 4999
+    got = plan().compute(device="cpu")
+    assert calls["rc3"] == [-11], calls
+    _same(_rows(got), _rows(exp))
+
+
+@pytest.mark.parametrize("gpu", ["unavailable", "cold"])
+def test_device_auto_fuses_when_it_decides_on_the_cpu(calls, monkeypatch, gpu):
+    """The default device: a CPU decision (no GPU, or one not warm yet) runs as device='cpu', fused."""
+    import mxframe.auto_mode as am
+    import mxframe.calibration as cal
+
+    class Calib:
+        def __init__(self, has_gpu):
+            self.has_gpu = has_gpu
+
+        def estimate(self, op, device, rows, card=None, **k):
+            return 10.0 if device == "cpu" else 1e6
+
+        def estimate_gpu_join_total(self, *a, **k):
+            return 1e6
+
+        def transfer_ms(self, *a, **k):
+            return 0.0
+
+        def gpu_init_cost_ms(self):
+            return 200.0
+
+    class Warm:
+        available = True
+
+        def remaining_init_ms(self):
+            return 200.0
+
+        def start(self):
+            return self
+
+    monkeypatch.setattr(cal, "get_calibration", lambda: Calib(gpu == "cold"))
+    monkeypatch.setattr(am, "get_gpu_warmup", lambda calib=None, start=True: Warm())
+    fact, dim1, dim2, _ = _tables(n=400_000)
+    got = (LazyFrame(fact).join(LazyFrame(dim1), left_on="k", right_on="dk")
+           .join(LazyFrame(dim2), left_on="k2", right_on="ek")
+           .groupby("g").agg((col("v") * col("w2")).sum().alias("s"), col("v").count().alias("n")).compute(device="auto"))
+    assert calls["exec"].count(3) == 1, calls
+    assert calls["star"] == 0 and calls["rc3"] == [0], calls
+    exp = _duck("SELECT g, SUM(v * w2), COUNT(v) FROM fact JOIN dim1 ON k = dk JOIN dim2 ON k2 = ek GROUP BY g",
+                fact=fact, dim1=dim1, dim2=dim2)
+    _same(_rows(got, ["g", "s", "n"]), exp)
+
+
+def test_a_memory_error_is_not_swallowed_in_a_strict_compute(monkeypatch):
+    import mxframe.gpu_budget as gb
+    monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "0")
+    assert nx.swallowed(MemoryError("x"), "t") is None                  # not strict: a quiet decline
+    monkeypatch.setattr(gb, "strict", lambda: True)                     # inside compute(strict=True)
+    with pytest.raises(MemoryError):
+        nx.swallowed(MemoryError("x"), "t")
+    assert nx.swallowed(ValueError("x"), "t") is None                   # other errors still decline quietly

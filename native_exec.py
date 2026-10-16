@@ -133,9 +133,14 @@ def _decline(reason: str):
 
 def swallowed(exc: BaseException, where: str):
     """Called from an ``except Exception`` around a native hook: raise ``exc`` under MXFRAME_STRICT_NATIVE,
-    else record the decline (``raised: <ExcType>``) and return None so the caller's fallback answers."""
+    else record the decline (``raised: <ExcType>``) and return None so the caller's fallback answers.
+    A MemoryError is raised too inside a ``compute(strict=True)`` (``gpu_budget.strict()``)."""
     if strict():
         raise exc
+    if isinstance(exc, MemoryError):          # compute(strict=True) promises out-of-memory is never hidden
+        from . import gpu_budget
+        if gpu_budget.strict():
+            raise exc
     _last["path"], _last["decline"] = None, f"{where} raised {type(exc).__name__}: {exc}"
     _count(f"raised: {type(exc).__name__}")
     return None

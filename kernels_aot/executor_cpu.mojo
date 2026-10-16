@@ -150,6 +150,7 @@ struct Keys(Copyable, Movable):
     var remap: LP       # per key: address of int64[n_chunks] of addresses of int32[dict len]
     var rowcode: LP     # per utf8 key: address of int32[n_rows] (entry id of every row)
     var xreg: LP        # per expression key: the program register holding its value
+    var chk: LP         # per integer key: 1 when its range came from the caller (values are checked against it)
 
     def __init__(out self, n: Int, n_chunks: Int):
         self.n = n
@@ -163,7 +164,9 @@ struct Keys(Copyable, Movable):
         self.remap = unsafe_alloc[Int64](max(n, 1))
         self.rowcode = unsafe_alloc[Int64](max(n, 1))
         self.xreg = unsafe_alloc[Int64](max(n, 1))
+        self.chk = unsafe_alloc[Int64](max(n, 1))
         for k in range(max(n, 1)):
+            self.chk[k] = 0
             self.gchunk[k] = 0
             self.gcode[k] = 0
             self.remap[k] = 0
@@ -187,6 +190,7 @@ struct Keys(Copyable, Movable):
                 _ip(Int(self.rowcode[k])).free()
         self.rowcode.free()
         self.xreg.free()
+        self.chk.free()
         self.kinds.free()
         self.base.free()
         self.card.free()
@@ -805,6 +809,12 @@ def _encode_sel(K: Keys, arrays: LP, stride_a: Int, n_keys: Int, col0: Int, c: I
         elif kind == K_I64:
             var src = _lp(_arr_buf(arr, 1)) + _arr_off(arr) + r0
             var b64 = Int64(Int(K.base[k]))
+            if Int(K.chk[k]) != 0:
+                var card64 = K.card[k]
+                for j in range(nsel):
+                    var d = src[Int(sel[j]) if use_sel else j] - b64
+                    if d < 0 or d >= card64:
+                        return False
             for j in range(nsel):
                 var i = Int(sel[j]) if use_sel else j
                 var t = Int32(src[i] - b64) * sk
@@ -829,6 +839,12 @@ def _encode_sel(K: Keys, arrays: LP, stride_a: Int, n_keys: Int, col0: Int, c: I
         else:
             var src = _ip(_arr_buf(arr, 1)) + _arr_off(arr) + r0
             var bk = Int32(Int(K.base[k]))
+            if Int(K.chk[k]) != 0:
+                var card64 = K.card[k]
+                for j in range(nsel):
+                    var d = Int64(src[Int(sel[j]) if use_sel else j]) - Int64(bk)
+                    if d < 0 or d >= card64:
+                        return False
             for j in range(nsel):
                 var i = Int(sel[j]) if use_sel else j
                 var t = (src[i] - bk) * sk
@@ -960,6 +976,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             if fused and Int(xk[0]) == -1:        # fused: the caller bounded this join key by its partner's keys
                 lo = Int(xk[1])
                 hi = Int(xk[2])
+                K.chk[k] = 1                      # (a value outside it declines, never indexes past the groups)
             else:
                 _int_range(arrays, stride_a, n_chunks, col, kind, lo, hi)
             if hi < lo:          # no rows
