@@ -19,6 +19,56 @@ Shared rules for every ticket:
 - TPC-H data (gitignored) lives at `/home/abhisheksreesaila/Projects/mxframe/data/tpch_sf{1,10}`; worktrees read it from there.
 - Use glossary terms from the spec: `Morsel`, `DeviceCross`, `Router`, `ResidencyTracker`, `Calibration`.
 
+## Core gate (agreed 2026-10-15): nothing new until cpu, gpu and auto all hold up
+
+Abhishek, 2026-10-15: "the day we say GPU, CPU and auto work really well and 90% if not all of them are beating DuckDB, the core is ready; then the rings (vector, vision, Mojo API) stand on top of it."
+Order, one stage at a time:
+1. **CPU leftovers:** F-042, F-045, F-037, F-038, F-036, F-046a (partitioned hash join), F-033, F-034, then F-043's last check and F-025.
+2. **GPU correctness:** F-055 (results only, no speed claims yet).
+3. **Auto works:** F-053 (auto uses the native executor), then F-056 (data bigger than GPU memory never fails: spill or split to CPU, RAPIDS / BlazingSQL style), F-057 (morsel co-processing that wins), F-007 (per-operator placement for joins).
+4. **Gate:** F-058, the scoreboard that says the core is ready.
+Benchmarks run only on a quiet machine (see `docs/lessons.md`). With other agents running, do development and light SF1 correctness checks only.
+
+## F-055 GPU correctness sweep [done]
+Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
+- [x] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB (22/22 both; first and repeat run); every mismatch or crash gets a fix or a ticket: none found. Also on the GPU, per query: the path of every `compute()` and the GPU kernels it called (all 22 ran at least one GPU kernel; the join in a GPU session is the GPU hash join)
+- [x] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (`--device gpu --gpu <uuid> --engines mx,duckdb`): 100/100 stored and shuffled, 94 ran a GPU kernel
+- [x] F-014's flaky GPU sort test settled: memory pressure from other processes (about 0.5 GB free reproduces it), and behind it a real bug: every exported GPU function swallowed its errors (`except: pass`), so an out-of-memory sort or join returned garbage. All 31 now return a status and raise (`MemoryError` / `RuntimeError`), driver calls check their `CUresult`, `auto` reruns on the CPU (`tests/test_gpu_kernel_errors.py`); `is_sorted_topk` stays as a backstop
+- [x] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`: none needed, it stays empty
+- [ ] open: statuses cover out-of-memory only (a real OOM sort and an oversized request are tested). A real fault such as `CUDA_ERROR_ILLEGAL_ADDRESS` kills the process (core dump) and no status comes back; the Mojo `ctx.synchronize()` of the other kernels is assumed to raise on OOM like the sort's does (not probed)
+
+## F-056 Data bigger than GPU memory never fails [todo]
+Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
+- [ ] research first, written to `docs/research/gpu-out-of-core.md` and `docs/research/heavydb.md` (HeavyDB is the closest open-source GPU-native competitor; mine it for algorithms): how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
+- [ ] `device="gpu"` and `"auto"` on a working set larger than free GPU memory finish with results equal to `cpu` (test with an artificially small GPU memory budget, so no 96 GB data is needed)
+- [ ] the plan chooses up front (estimated size vs free memory): GPU, GPU in partitions, or CPU; a GPU OOM mid-query reruns the failed part on CPU and is remembered
+- [ ] both GPUs on this box (2x RTX 3090, 24 GB each) are counted as separate memory pools, not one 48 GB pool
+- Build order from the research (2026-10-15): (1) never fail: per-GPU budget with a test-only override, pre-check at 90% of free memory -> CPU, OOM -> halve the piece and retry once, then rerun the piece on CPU and remember the shape; pieces never change their inputs; (2) streaming probe through a resident hash table, for joins and many-group aggregates only, after a CPU filter + bitvector; (3) partition both sides so each pair fits one 24 GB GPU, the two GPUs as separate workers. Skip unified memory and generic host spilling. HeavyDB ideas: string filters run once over the dictionary (becomes an int IN-set), dense hash layouts sized from min/max with a group-count pre-pass
+- [ ] the two GPUs are joined by an NVLink bridge (NV4 in `nvidia-smi topo -m`): measure GPU-to-GPU bandwidth and whether Mojo can use peer access before relying on it
+- Note: 96 GB is also bigger than this box's 62 GB of RAM, so that case needs the CPU path to stream Parquet and spill too (a later ticket, after the GPU never-fail step)
+- Note from F-055: every GPU kernel returns a status and raises `MemoryError` on out-of-memory, so this ticket can rely on that for OOM only; a real GPU fault (illegal address) kills the process and returns no status
+
+## F-057 Morsel co-processing that wins [todo]
+Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
+- [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
+- Research (2026-10-15, `docs/research/cpu-gpu-coprocessing.md`): keep F-006's design (host data -> CPU, resident data -> static split, one GPU call; Mordred 2022); split only if predicted time beats the faster device by 10% after per-call (4.5 ms), merge and contention costs; CPU threads take late GPU work; the second GPU as a third worker with its own resident share
+- [ ] the native CPU executor takes the CPU share of a split (today a split runs the older fused pipeline)
+- [ ] a split is chosen only where calibration predicts it beats both single devices, and `explain` says why
+- [ ] measured on a quiet machine: auto within 10% of min(cpu, gpu) on every query, faster than both on the shapes the split targets (high-volume aggregation on resident data)
+
+## F-058 Core gate scoreboard [todo]
+Needs: F-055, F-056, F-057 · Quiet machine only
+- [ ] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (warm, labelled) and `auto`, against DuckDB and Polars, every result checked against DuckDB
+- [ ] each device beats DuckDB on at least 90% of queries; the misses listed with a reason (close misses are fine for the gate; the long tail is chased later, after the rings start, per Abhishek 2026-10-15)
+- [ ] when it passes: the rings below can start
+
+## Rings (after the core gate, not before)
+Proposed 2026-10-15, not yet briefed; each goes through `clarify` when its turn comes.
+- Mojo front end for MXFrame: a Mojo plan builder over `mx_execute`, so MX App / DataLens can use MXFrame where there is no Python (iPhone). Depends on F-033, F-034, F-021 (every query native, native Parquet).
+- Tables loaded once per process, shared read-only across sessions (MX App's `App.init_shared`, fh-saas dashboards).
+- Embedding columns and filtered top-k vector search (CPU, then GPU), built on the `mx_filter_topk` pattern.
+- Vision kernels, LLM operators, an MCP server: parked.
+
 ## Wave 1: foundations (parallel)
 
 ## F-001 User-felt TPC-H scoreboard [done]
@@ -145,7 +195,7 @@ Needs: F-012 merged · Found by re-running calibration (2026-09-30)
 Needs: F-011, F-013 merged · Found by F-013
 - [x] CPU sort in `custom_ops._apply_sort_custom` uses `AOTKernels.sort_indices` (parallel radix, ~69 ms / 10M) instead of `np.argsort` / `argpartition`; `compiler.py` post-op sort likewise
 - [ ] `tests/test_cpu_sort.py::test_sort_indices_is_stable_and_matches_numpy[1000000-True-300001-int64]` failed once in a loaded full-suite run (F-018 branch); not reproducible in 5,600 isolated/concurrent stress runs of the exact input with 1–64 threads. The engine now verifies radix results in O(n) and falls back to np.argsort with a warning. Suspect cross-test memory corruption (F-018 fixed an out-of-bounds join write); watch for the warning.
-- [ ] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` is flaky on a shared GPU (fails ~1 in 3 even alone): find out whether it is memory pressure (cuMemAlloc 2) or a real ordering bug
+- [x] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` flaky on a shared GPU: settled in F-055: memory pressure from other processes (about 0.5 GB free reproduces it) and, behind it, a real bug: a sort kernel that runs out of memory returns a wrong order with no exception. The GPU top-k result is now verified and redone on the CPU (`sort_check.is_sorted_topk`); an honest `cuMemAlloc` failure remains under pressure (`docs/bench/gpu-correctness-sf1.md`)
 - [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
 
 ## F-015 Cold first query: 1.1 s vs 50 ms warm [done]
@@ -311,18 +361,24 @@ Needs: Abhishek's go (given 2026-10-12) · Unblocks F-028
 - [x] review fixes: `MANIFEST.in` shipped a hand-kept module list that had gone stale (no `native_exec`, `io_parquet`, `join_engine`, `np_arrow`, ...) and `kernels.mojopkg`: now `include *.py` and `kernels.mojoc`; runtime extra `modular>=26.6`; `_lazy_pc` always imports through the module lock; `_LazyPcOps.get` returns functions and `.values()` / `.items()` raise
 - Follow-up: ~1,300 deprecation warnings (positional `ptr[i]` → `ptr[unsafe_offset=i]`, `.free()` → `.unsafe_free()`, `@parameter` closures); harmless on 1.1, to be cleaned before Modular removes them
 
-## F-036 Kernel libraries find the Mojo runtime wherever they are installed [todo]
+## F-036 Kernel libraries find the Mojo runtime wherever they are installed [done]
 Needs: none · From the F-035 review
-- [ ] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
-- [ ] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
+- [x] every `kernels_aot/*.so` carries a RUNPATH of the build machine's pixi env (`.../mxframe-mojo11/.pixi/envs/default/lib`, older builds `.claude/worktrees/agent-*`), and pixi sets no `LD_LIBRARY_PATH`: they find `libKGENCompilerRTShared.so` only while that directory exists. Use an `$ORIGIN`-relative or env-relative rpath (or preload the runtime from the active env before dlopen), and test it from a fresh checkout and an installed wheel
+  - Done: `scripts/set_runpath.sh` (patchelf, now a pixi dependency) sets RUNPATH `$ORIGIN/../.pixi/envs/default/lib:$ORIGIN/../../modular/lib:$ORIGIN/../../../..` (checkout or worktree first, so a checkout prefers its own env over a directory beside it; then pip wheel, venv / conda env). Linux only; macOS dylibs are out of scope. The 0.6.0 wheel still has the absolute RUNPATH (CHANGELOG); the build scripts, `release.sh`, both workflows and CONTRIBUTING call it after every `mojo build`. The runtime libraries carry their own `$ORIGIN` RPATH, so finding `libKGENCompilerRTShared.so` is enough for the rest. `tests/test_runpath.py` reads each shipped `.so`'s RUNPATH, and copies a library into a venv-like and a pip-`modular`-like layout and dlopens it from `/usr/bin/python3` (no conda RPATH of its own), with a control that fails without the runtime. Not done: a fresh venv with the real `pip install modular` wheel (large download); its layout (`site-packages/modular/lib`) is taken from `max/_core`'s own RPATH
+- [x] until then: rebuild the libraries in the checkout that will use them (`bash scripts/build_pipeline.sh` and the other targets)
+  - No longer needed for the RUNPATH (it is relative); still rebuild a library after changing its source
 
-## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [todo]
+## F-037 Integer arithmetic past 2^53 in the bytecode interpreter [done]
 Needs: none · From the F-032 review (round 2); predates the executor (the fused pipeline has it too)
-- [ ] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+- [x] `(a * b) - lit(2**53) == lit(261134297)` with `a = b = 94906267` returns no rows (every row should match): column values are guarded (F-032, `E_INEXACT`), intermediate results are not. Bound each `*`, `+`, `-` result from its inputs' min / max and decline when it could pass 2^53, or give the interpreter int64 registers (typed vectors, design decision 4)
+  - Built: `_Builder._arith` bounds every integer `+ - *` (and `case_when`, `year()`) as a lazy expression tree: column TYPE ranges first (no data read), the columns' real min / max (parallel, cached per compile) only when the type ranges could pass 2^53; constant folds use exact Python ints. Declines raise `Inexact` and the exact path answers. All entry points compile through it (`mx_execute`, `mx_filter`, `mx_filter_topk`, fused pipeline). No Mojo change.
+  - Integer SUM (review round 1): a `sum` whose rows * max|value| could pass 2^53 declines; `_aggregate_with_nulls` (Arrow path) then sums exactly in int64, and `np_arrow.group_aggregate` sums integers in three 21-bit limbs instead of `np.bincount`'s float64 weights. Result type change: integer SUMs on that path (also nullable integer columns) are int64, were float64; sums that fit stay float64 natively until the follow-up makes integer SUM int64 everywhere.
+  - Tests: `tests/test_int_arith_2_53.py`. Cost: integer `* + -` over int64 columns reads their min / max once per query (parallel) unless the type ranges suffice
 
-## F-038 Two tests fail under load [todo]
+## F-038 Two tests fail under load [done]
 Needs: none · Seen 2026-10-12 while other test runs and benchmarks shared the machine; both pass alone (3/3)
-- [ ] `tests/test_cpu_kernels.py::test_thread_budget_changes_actual_parallelism` (wall-clock speedup assertion) and `tests/test_gpu_kernels.py::test_failed_hash_join_frees_its_scratch_buffers` (GPU memory measured while other processes hold GPU memory), and `tests/test_auto_cold.py::test_a_short_query_inside_the_window_restarts_it` (timing window, failed once at load average 7 during the M2e review): measure what each test means without depending on a quiet machine (CPU time or per-process GPU accounting), or mark them as needing a quiet machine
+- [x] `tests/test_cpu_kernels.py::test_thread_budget_changes_actual_parallelism` (wall-clock speedup assertion) and `tests/test_gpu_kernels.py::test_failed_hash_join_frees_its_scratch_buffers` (GPU memory measured while other processes hold GPU memory), and `tests/test_auto_cold.py::test_a_short_query_inside_the_window_restarts_it` (timing window, failed once at load average 7 during the M2e review): measure what each test means without depending on a quiet machine (CPU time or per-process GPU accounting), or mark them as needing a quiet machine
+  - Done: the thread test counts the threads that ran CPU (`/proc/self/task/*/schedstat`): threads=1 gives 1, threads=4 gives 5, the same at load average 22; the GPU test reads this process's own GPU memory (`nvidia-smi --query-compute-apps`) instead of device-wide free memory; the window test runs on a fake clock (it was also order-dependent: alone it failed, because it relied on an earlier test having set `_last_end`). Nothing needed a `quiet_machine` marker. Same flavour, not changed: `test_background_work_waits_for_an_idle_gap` (real 50 ms sleeps between queries)
 
 ## F-029 CPU joins [superseded by F-032]
 Needs: F-026 · From the engine-only run: at SF10 mx-auto is 2.6x–5.0x behind Polars on Q2, Q3, Q8, Q10, Q16, Q17, Q20 with reading out of the clock (F-007 is GPU placement; this ticket is the CPU join itself)
@@ -362,7 +418,7 @@ Needs: F-030
 - Review round 1 (NEEDS WORK) fixed: int64 group keys past 2^53 sorted through float64 lost order on the hash path (now ranked exactly); hash-path groups came out in first appearance while the other paths used key order (now key order everywhere); stale docstring; `last_path()` stale when MXFRAME_NATIVE=0
 - Not done in M1 (deferred): typed int64 registers (sums are still float64; exact for TPC-H's magnitudes), cached C Data exports, parallel compaction / hashing (both are single-threaded loops today)
 
-## F-032 Mojo executor M2: hash joins [doing]
+## F-032 Mojo executor M2: hash joins [done]
 Needs: F-031 · Replaces F-029
 - Profile first (SF1, warm code, fresh tables): Q12 spent 136 of 165 ms in the Python path's leaf filter (Arrow compute over 6M lineitem rows, 85 ms) and in decoding dictionary strings (`arrow_dict.decode`, 46 ms: `io_parquet.resolve_plan` decoded every dictionary column of every leaf when a plan has a join, before any filter). The join kernels themselves took ~10 ms. So M2 starts with the leaves, not the hash join
 - [x] M2a, native leaf filters: a `Filter*(Scan)` leaf of a join is one `mx_filter` call. The predicate runs on the bytecode interpreter per 64k-row morsel in parallel (pass 1: mask, counts and string bytes per morsel), then the surviving rows of the columns the join needs are written into one arena (pass 2: fixed-width values, utf8, dictionary strings decoded on the way out). Dictionary predicates read codes + chunk offset (dtype 5, as in M1). Declines (nulls, other types, plain-string predicates) run the old path. `tests/test_native_exec_m2.py`
@@ -427,15 +483,19 @@ Needs: none · Found by the M2h review (predates F-032)
 Needs: none · Found by the F-040 review
 - [x] `SELECT s AS b, SUM(v) AS x FROM t GROUP BY s` and `... GROUP BY b` return `b` like DuckDB. Keys are matched by their translated expression, so one rule covers aliases, `t.s` vs `s`, ORDER BY on the original name or expression, and a key selected twice; result columns follow the SELECT list (a projection after ORDER BY / LIMIT). `tests/test_sql_group_alias.py`: 19 queries checked against DuckDB. Reviewer PASS (round 2)
 
-## F-042 SQL front end gaps found in the F-041 review [todo]
+## F-042 SQL front end gaps found in the F-041 review [done]
 Needs: none · Pre-existing, found by the F-041 review
-- [ ] an aggregate without an alias is named `agg_0` (DuckDB: `sum(v)`) and its SELECT position is ignored
-- [ ] `SELECT kid ... JOIN ... ON k = kid GROUP BY kid` returns the column as `k`
-- [ ] `GROUP BY ALL` drops the keys
-- [ ] a duplicate output name (`SELECT x, SUM(v) AS x`) is accepted (DuckDB raises)
-- [ ] HAVING is dropped without an error (`... GROUP BY flag HAVING SUM(v) > 25000` gives no Filter); found by the F-046d review
-- [ ] `COUNT(DISTINCT x)` raises NotImplementedError
-- [ ] arithmetic on an aggregate (`SUM(v) * 2 AS y`) is not seen as an aggregate: raises "Aggregate.aggs cannot be empty", or the column is silently dropped when another aggregate is present
+- [x] an aggregate without an alias is named `agg_0` (DuckDB: `sum(v)`) and its SELECT position is ignored
+- [x] `SELECT kid ... JOIN ... ON k = kid GROUP BY kid` returns the column as `k`
+- [x] `GROUP BY ALL` drops the keys
+- [x] a duplicate output name (`SELECT x, SUM(v) AS x`) is accepted: is renamed like DuckDB's `duckdb.sql(q).arrow()` / `.df()` does (`x_1`); DuckDB does not raise (`con.execute(q).to_arrow_table()` keeps the duplicate names)
+- [x] HAVING is dropped without an error (`... GROUP BY flag HAVING SUM(v) > 25000` gives no Filter); found by the F-046d review
+- [x] `COUNT(DISTINCT x)` raises NotImplementedError
+- [x] arithmetic on an aggregate (`SUM(v) * 2 AS y`) is not seen as an aggregate: raises "Aggregate.aggs cannot be empty", or the column is silently dropped when another aggregate is present
+- built in `sql_frontend.py` only; `tests/test_sql_gaps.py` (166 cases, each checked against DuckDB; unsupported variants raise). Unaliased aggregates take DuckDB's text (`sum(v)`, `count_star()`, `count(DISTINCT v)`); an unaliased expression (`SUM(v) * 2`, `SUM(v + 1)`) raises asking for an alias. HAVING is a Filter above the Aggregate (it may use aggregates the SELECT list lacks, SELECT aliases and group keys). ORDER BY may use an aggregate or an expression over aggregates. `COUNT(DISTINCT x)` becomes `Aggregate(Distinct(Project(keys, x)))` (the native count-distinct path); alone it takes that path; mixed with other aggregates see round 2 (several COUNT(DISTINCT) and `SUM(DISTINCT ..)` raise NotImplementedError). A LEFT JOIN's right key can no longer be referenced (the join drops it; the old code silently read the left key, which has no NULLs); `SELECT s FROM t GROUP BY s` without any aggregate raises. Also checked on SF1 (lineitem / orders, 6 queries equal to DuckDB)
+- round 2 (same ticket, from the coordinator): `SELECT DISTINCT` maps to the plan's Distinct (not with GROUP BY / aggregates, nor DISTINCT ON: NotImplementedError); `GROUP BY n` / `ORDER BY n` ordinals like DuckDB; an aggregate in WHERE raises; duplicate output names are renamed like DuckDB (`x`, `x_1`, `x_2`, first free name in SELECT order, also `SELECT a.k, b.k` over a join) instead of raising; COUNT(DISTINCT x) mixed with sum / min / max / count / avg is done by aggregating per (keys, x) and combining the partials per key (no join, so a NULL key stays a group); `t.v, w.v` where both joined tables have a column `v` (the join keeps one copy) now raises instead of returning the left one twice; an ORDER BY name that is a SELECT output name (`SELECT kid ... ORDER BY kid`) uses that column
+- review fixes: `COUNT(*)` is `lit(1).count()` (rows) instead of a count of the first column in scope, which was low when that column had NULLs (HAVING COUNT(*) dropped the NULL group, mixed COUNT(DISTINCT) gave 0, a global count was short); the DataFrame API's `col(x).count()` skips NULLs and `lit(1).count()` counts rows on every path, so it shared no cause; the joined-column guard raises only for the qualifier whose copy the join dropped (`t.v` over `t JOIN w` works, `w.v` raises); `ORDER BY .. NULLS FIRST` raises NotImplementedError (the engine sorts NULLs last, which is DuckDB's default, so NULLS LAST works); tests with NULLs in the first column and keys, an all-NULL group and AVG over NULLs
+- still open: more than one COUNT(DISTINCT ..) per query; `GROUP BY s` with no aggregate (SELECT DISTINCT is the form that works); unaliased expression group keys need an alias (DuckDB names them `(k + 1)`); `ORDER BY` an alias that names two SELECT columns (DuckDB's pick is unclear, we take the first)
 
 ## F-043 SF10: the four queries DuckDB still wins, with general fixes only [todo]
 Needs: none · Agreed 2026-10-13 (Abhishek: focus on these, no TPC-H-only tuning)
@@ -453,9 +513,30 @@ Needs: none · Agreed 2026-10-13 (Abhishek: don't overfit TPC-H)
 - [x] fixes it found: native top-k for ORDER BY ... LIMIT (a random top-N took 543 ms, now 14), native filter for WHERE-only plans, and a harness bug: DuckDB imported pyarrow inside its first query (~70 ms), which had inflated every DuckDB time
 - findings (honest): vs Polars, MXFrame is faster on most random queries (geo. mean 1.0-2.7x) and all 21 verified TPC-H queries at SF10. vs DuckDB, once its import is staged: DuckDB is faster on most random queries (MXFrame 0.63-0.91x geo. mean) and on 13 of 22 TPC-H queries at SF10 (MXFrame's 22-query total is still lower, 3.27 s vs 5.31 s, from Q21 / Q9 / Q13 / Q1); on shuffled tables DuckDB's SF10 total is lower (5.78 s vs 8.64 s: Q21 4.98 s vs 2.88, Q9, Q18) -> F-046
 
-## F-045 ORDER BY ties outside the native executor [todo]
+## F-045 ORDER BY ties outside the native executor [done]
 Needs: none · Found by the F-043 review
-- [ ] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks)
+- [x] plans the native executor declines (e.g. date + dictionary-string group keys, or `MXFRAME_NATIVE=0`) break ORDER BY ties in a different order than the native path's key order and than DuckDB; make the fallback's tie-break key order too (matters for F-044's DuckDB checks). Native order: ORDER BY columns, then every group key ascending (strings by bytes). `GraphCompiler._key_tiebreak` appends the keys to a Sort directly above an Aggregate for every non-native path (fused, kernels, GPU, null-key, base compiler); `tests/test_orderby_ties.py`
+  Open: unaliased derived keys get no tie-break; with a string key added, sort + LIMIT on fallback paths can't use the native top-k (numbers / dates only), so it ranks every row (correct, slower)
+
+## F-059 ORDER BY ties with a Project between Sort and Aggregate [done]
+Needs: F-045
+- [x] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate. Done in `GraphCompiler._tiebreak_names` / `_key_tiebreak` (follows keys by name/alias through each Project) and an early call in `CustomOpsCompiler` before the materialize barrier, so the native path gets the extended sort too (no Mojo change). A Project that drops a key leaves nothing to tie-break on for that key: the remaining keys still break ties, and ties on the dropped key stay in input order (documented limit); Filter nodes between Sort and Aggregate are walked too. `tests/test_orderby_ties_project.py`
+
+## F-061 Integer overflow past int64 is silent on the exact path [done]
+Needs: F-037 · Found by the F-037 review (2026-10-16); high priority: silent wrong results, and F-037 routes more queries here
+- [x] `pc.add` / `subtract` / `multiply` in the exact path (`custom_ops.py` ~620) wrap past 2^63 (`a*a*a` with a = 2^30 gives 0, rows dropped); DuckDB raises "Overflow in multiplication of INT64". Use Arrow's `_checked` kernels and raise the same way
+- [x] `pc.sum` on int64 and the limb recombine in `np_arrow._int_group_sum` wrap at 2^63 (DuckDB sums int64 into a 128-bit integer): raise, or widen like DuckDB
+- [x] tests vs DuckDB for each, both native settings
+- Built: `np_arrow.checked_arith` (Arrow `*_checked` kernels, OverflowError "Overflow in multiplication of INT64") at every exact-path `+ - *` (`custom_ops`, `compiler._eval_predicate`); `np_arrow.int_sum` / `_int_group_sum` raise "Overflow in sum of INT64" (a total past int64 raises rather than widening: the SUM column stays int64). Found on the way: when every pipeline declined, `max(a*a*a)` ran in the compiled graph and wrapped to 0. `_aggregate_with_nulls(late=True)` now runs just before the compiled graph and the global shortcuts: `int_sum_inexact(..., preds)` bounds each predicate and aggregate on its own (an uncompilable one cannot hide another; an integer `+ - *` the compiler cannot take counts as unbounded) and sends it to the Arrow path. Group keys, `with_columns` / `select` and sorts on a projection were checked and found to run in Arrow (checked kernels), so they raise too (tests added, each fails on the pre-F-061 code). Known difference: int32 * int32 past int32 but within int64 returns the exact value natively, where DuckDB raises an INT32 overflow. Native declines past 2^53 (F-037). `tests/test_int_overflow.py` (grouped, global, after a join, nulls, GPU).
+
+## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
+Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
+- [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
+- [ ] integer SUM returns int64 on every path regardless of size or nulls (today: native double when it fits, int64 on the exact path), like DuckDB
+- [ ] `mean` of large int64 values: integer accumulation, not float64
+- [ ] integer `min` / `max` on the exact path return float64 (lossy past 2^53): return int64 (found by F-061)
+- [ ] `pipeline_program._int_arith` treats an uncompilable expression as unbounded only when all its columns are integers; one mixing a string or float column with an overflowing int product might still reach the compiled graph (no repro found by the F-061 review); the runtime overflow flag should close it
+- [ ] sums whose expression the compiler can't take keep the old float path today (`int_sum_inexact` returns False): cover them
 
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
 Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong baseline). General fixes only; every slice measured on TPC-H (stored and shuffled) and the random suite, and must not slow any other query. MojoFrame (illinoisdata/MojoFrame, arXiv 2505.04080) checked: its techniques (integer ids for low-cardinality strings, tuple-hash group-by, factorize-then-join) are already covered here; the slices below follow the database literature instead
