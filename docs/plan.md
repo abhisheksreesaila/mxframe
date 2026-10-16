@@ -956,3 +956,8 @@ Found by the F-082 developer (2026-10-16)
 - [ ] a scientific literal without a dot (`x > 1e-310`, `x < 2E5`) raises ValueError: `sql_frontend` does `lit(int(v)) if "." not in str(v)`. Parse numeric literals by their SQL type (sqlglot's `is_int` / `is_number`), not by looking for a dot
 - [ ] a float32 column compared with a float64 literal casts the literal to float32: `x between -1e-30 and 1e-30` keeps the row holding float32(1e-30), DuckDB drops it. Compare in the wider type (widen the column, as DuckDB does) on every path (native bytecode, Arrow, GPU)
 - [ ] DuckDB-checked tests for both; fails before
+
+## F-107 Test process hangs on a futex while other suites share the GPUs [todo]
+Seen three times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes
+- [ ] capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
+- [ ] from the dump, find the waiting lock(s); if it is ours, fix the lock order and add a stress test (concurrent queries + background upload + warm-up); if it is the driver under cross-process contention, document it and make the GPU tests serialize on a file lock
