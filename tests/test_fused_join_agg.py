@@ -598,8 +598,8 @@ def test_declines_are_counted_by_reason(calls):
     nx.reset_decline_counts()
     (LazyFrame(fact).join(LazyFrame(dup), left_on="k2", right_on="ek")
      .groupby("g").agg(col("v").sum().alias("s")).compute(device="cpu"))
-    # the fused call and then the star scan both meet the duplicate key
-    assert nx.decline_counts() == {"executor declined (code -18)": 2}, nx.decline_counts()
+    # the fused call meets the duplicate key; the star scan indexes it (repeated keys expand) and answers
+    assert nx.decline_counts() == {"executor declined (code -18)": 1}, nx.decline_counts()
 
 
 def test_a_join_key_group_key_is_bounded_by_the_partners_keys_without_a_scan(calls):
