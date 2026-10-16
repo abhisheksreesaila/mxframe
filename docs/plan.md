@@ -923,3 +923,8 @@ Found by the F-094 developer (2026-10-16)
 From the F-094 review (2026-10-16); speed
 - [ ] a `%` anywhere in WHERE moves the whole filter off the native path: `WHERE a > 500 GROUP BY k` runs native in 5 ms at 2M rows, adding `AND a % 7 = 0` takes it to `cpu_aot` at 50 ms. An integer `mod` op in the bytecode (sign follows the dividend; zero divisor gives NULL, so decline when the divisor column can be 0, or test it), CPU and GPU kernels
 - [ ] tests: the filter stays native (path asserted), equals DuckDB with negatives and a zero divisor; quiet-machine timing back near the no-`%` query
+
+## F-102 SELECT * over a join keeps both key columns, each with its own type [todo]
+Found by the F-090 review (2026-10-16); a missing column on main
+- [ ] `SELECT * FROM t JOIN v ON t.i = v.x` (and the comma form `FROM t, v WHERE t.i = v.x`) leaves out `x` entirely, even when both keys are the same type; DuckDB keeps both columns. The comma form also reads `v.x` as the left key, so its type is the left side's (values equal, -0.0 shows as 0). Keep the right key as its own output column (USING / NATURAL keep one, like DuckDB)
+- [ ] DuckDB-checked tests: SELECT * and SELECT v.x over JOIN ON, comma join, USING; same-type and int-vs-float keys; LEFT JOIN with unmatched rows (right key NULL, F-086); fails before
