@@ -193,7 +193,9 @@ def _sum_table():
     n = 200_000
     a = r.integers(1 << 39, 1 << 40, n).astype(np.int64)          # total ~ 2^57
     b = r.integers(1, 10, n).astype(np.int64)
-    return pa.table({"a": A(a), "b": A(b), "i": A(r.integers(1, 100, n).astype(np.int32)),
+    m = r.integers(-(1 << 40), 1 << 40, n).astype(np.int64)        # mixed sign
+    nul = pa.array(r.integers(1 << 39, 1 << 40, n).astype(np.int64), mask=(np.arange(n) % 7 == 0))   # nullable
+    return pa.table({"a": A(a), "m": A(m), "nul": nul, "b": A(b), "i": A(r.integers(1, 100, n).astype(np.int32)),
                      "g": A((np.arange(n) % 3).astype(np.int64)), "v": A(r.random(n))})
 
 
@@ -230,3 +232,17 @@ def test_a_sum_small_enough_for_float64_still_compiles():
     t = _sum_table()
     assert compile_pipeline([], [col("i").sum()], t) is not None          # 200k * 100
     assert compile_pipeline([], [col("a").sum()], t) is None              # 200k * 2^40
+
+
+@pytest.mark.parametrize("column", ["m", "nul"])
+def test_mixed_sign_and_nullable_integer_sums_equal_duckdb_in_value_and_type(mode, column):
+    t = _sum_table()
+    con = _con(t=t)
+    want = con.execute(f"select sum({column}) from t").fetchone()[0]
+    got = LazyFrame(t).groupby().agg(col(column).sum().alias("s")).compute(device="cpu")
+    assert got.schema.field("s").type == pa.int64()           # an exact integer, as DuckDB's SUM of a BIGINT
+    assert got.column("s").to_pylist() == [int(want)]
+    want_g = {g: int(x) for g, x in con.execute(f"select g, sum({column}) from t group by g").fetchall()}
+    got = LazyFrame(t).groupby("g").agg(col(column).sum().alias("s")).sort("g").compute(device="cpu")
+    assert got.schema.field("s").type == pa.int64()
+    assert dict(zip(got.column("g").to_pylist(), got.column("s").to_pylist())) == want_g

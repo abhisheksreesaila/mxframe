@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **Integers past 2^53 (F-037).** Integer `+ - *` whose result could pass 2^53 no longer rounds in the float64 interpreter: the compiler bounds each result (column types first, the data's min / max only when needed) and the exact path answers. An integer `SUM` whose total could pass 2^53 is now added exactly in int64.
+- **Changed result type:** a `SUM` of an integer column that has nulls, or whose total could pass 2^53, now returns int64 (it was float64). Sums that fit stay float64 on the native path for now; making every integer `SUM` int64 is the follow-up.
+
 ### Docs
 - **Docs site** at https://abhisheksreesaila.github.io/mxframe/ (GitHub Pages; `docs/site/`). It has interactive benchmarks, how `device="auto"` decides, the path a query takes (for porting), how the engine got fast, and the kernel visualizer. Every number on it is computed in the browser from `docs/bench`.
 - **README** is short now: why, the latest numbers, install and run, API reference tables. A test runs every example in it and checks its numbers against `docs/bench`.
