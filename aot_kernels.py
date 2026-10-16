@@ -1353,6 +1353,8 @@ class AOTKernelsGPU:
         """
         import pyarrow as pa
         n = len(idx)
+        if n == 0:                      # a launch of 0 blocks fails: nothing to gather
+            return table.slice(0, 0)
         idx32 = np.ascontiguousarray(idx.astype(np.int32))
         idx_dev = self._upload(idx32)   # single H2D for index array
 

@@ -843,11 +843,12 @@ Found by the F-083 review (2026-10-16); a silent wrong answer on main
 - [ ] `SELECT *, a+1 AS x FROM t` returns only `x`; DuckDB returns every column then `x`. Expand `*` in place among other select items (and `t.*`), with or without ORDER BY (F-083 made the ORDER BY form raise; replace that error with the real expansion)
 - [ ] DuckDB-checked tests: `*, expr`, `expr, *`, `t.*, u.c` over a join, with WHERE / ORDER BY / LIMIT, name clash between `*` and an alias; fails before
 
-## F-089 GPU ORDER BY ... LIMIT 0 crashes [review]
+## F-089 GPU ORDER BY ... LIMIT 0 crashes [done]
 Found by the F-083 review (2026-10-16)
-- [ ] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
-- [ ] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
+- [x] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
+- [x] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
 
+- Review (2026-10-16): PASS. Follow-up fixed in the main session: `AOTKernelsGPU.gather_table` with no indices launched a 0-block grid (`gather_i32_gpu failed with status -1`); it returns `table.slice(0, 0)` now (`test_gather_table_with_no_indices_returns_an_empty_table`, fails before). Other per-`n` GPU wrappers in `aot_kernels.py` can launch 0 blocks the same way; no query shape reaches them with n = 0 today
 ## F-090 IN (SELECT max(i) ...) join key types differ [todo]
 Found by the F-083 review (2026-10-16)
 - [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB

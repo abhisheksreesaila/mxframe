@@ -61,3 +61,9 @@ def test_zero_byte_gpu_allocation_is_a_null_handle():
     assert cu.malloc(0) == 0
     cu.free(0)      # freeing the null handle is harmless
     assert cu.malloc(64) != 0
+
+
+def test_gather_table_with_no_indices_returns_an_empty_table():
+    t = pa.table({"a": pa.array([1, 2, 3], pa.int32()), "f": pa.array([1.0, 2.0, 3.0])})
+    out = get_aot_gpu().gather_table(t, np.array([], dtype=np.int64))
+    assert out.num_rows == 0 and out.schema == t.schema
