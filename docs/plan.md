@@ -35,7 +35,7 @@ Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
 - [x] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (`--device gpu --gpu <uuid> --engines mx,duckdb`): 100/100 stored and shuffled, 94 ran a GPU kernel
 - [x] F-014's flaky GPU sort test settled: memory pressure from other processes (about 0.5 GB free reproduces it), and behind it a real bug: every exported GPU function swallowed its errors (`except: pass`), so an out-of-memory sort or join returned garbage. All 31 now return a status and raise (`MemoryError` / `RuntimeError`), driver calls check their `CUresult`, `auto` reruns on the CPU (`tests/test_gpu_kernel_errors.py`); `is_sorted_topk` stays as a backstop
 - [x] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`: none needed, it stays empty
-- [ ] not probed: the Mojo `ctx.synchronize()` of every kernel is assumed to raise on a fault the way it does on out-of-memory (checked for the sort only)
+- [ ] open: statuses cover out-of-memory only (a real OOM sort and an oversized request are tested). A real fault such as `CUDA_ERROR_ILLEGAL_ADDRESS` kills the process (core dump) and no status comes back; the Mojo `ctx.synchronize()` of the other kernels is assumed to raise on OOM like the sort's does (not probed)
 
 ## F-056 Data bigger than GPU memory never fails [todo]
 Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
@@ -46,6 +46,7 @@ Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96
 - Build order from the research (2026-10-15): (1) never fail: per-GPU budget with a test-only override, pre-check at 90% of free memory -> CPU, OOM -> halve the piece and retry once, then rerun the piece on CPU and remember the shape; pieces never change their inputs; (2) streaming probe through a resident hash table, for joins and many-group aggregates only, after a CPU filter + bitvector; (3) partition both sides so each pair fits one 24 GB GPU, the two GPUs as separate workers. Skip unified memory and generic host spilling. HeavyDB ideas: string filters run once over the dictionary (becomes an int IN-set), dense hash layouts sized from min/max with a group-count pre-pass
 - [ ] the two GPUs are joined by an NVLink bridge (NV4 in `nvidia-smi topo -m`): measure GPU-to-GPU bandwidth and whether Mojo can use peer access before relying on it
 - Note: 96 GB is also bigger than this box's 62 GB of RAM, so that case needs the CPU path to stream Parquet and spill too (a later ticket, after the GPU never-fail step)
+- Note from F-055: every GPU kernel returns a status and raises `MemoryError` on out-of-memory, so this ticket can rely on that for OOM only; a real GPU fault (illegal address) kills the process and returns no status
 
 ## F-057 Morsel co-processing that wins [todo]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15

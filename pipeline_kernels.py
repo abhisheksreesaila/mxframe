@@ -303,7 +303,11 @@ class _Cuda:
 
     def sync(self) -> None:
         self.bind_thread()
-        self.lib.cuCtxSynchronize()
+        err = self.lib.cuCtxSynchronize()
+        if err == 2:
+            raise MemoryError("CUDA_ERROR_OUT_OF_MEMORY: cuCtxSynchronize")
+        if err != 0:
+            raise RuntimeError(f"CUDA_ERROR {err}: cuCtxSynchronize failed")
 
     POOL_KEEP = 4                  # buffers kept per name
     POOL_MAX_BYTES = 32 << 20      # bigger ones are freed at check-in

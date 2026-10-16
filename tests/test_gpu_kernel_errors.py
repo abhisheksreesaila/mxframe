@@ -74,6 +74,28 @@ def test_hash_join_raises_when_its_sort_of_the_right_keys_fails(monkeypatch):
         g.hash_join(lk, rk)
 
 
+def test_real_oversized_sort_returns_out_of_memory_status():
+    """The real library, no memory hog: asking for 2**34 rows makes the sort's scratch 128 GB, which fails
+    before any kernel runs. The raw exported function returns -2 (this also catches a rewording of the
+    exception text `_status` in kernels_aot_gpu.mojo matches), the wrapper raises MemoryError, and the
+    process is still usable afterwards."""
+    import ctypes
+    g = get_aot_gpu()
+    keys = g._upload(_keys())
+    out = g._alloc(len(_keys()) * 4)
+    try:
+        raw = g._lib.sort_topk_i32_gpu
+        raw.restype = ctypes.c_int64
+        raw.argtypes = [ctypes.c_int64] * 4
+        assert raw(out, keys, 2**34, 0) == -2
+        with pytest.raises(MemoryError, match="OUT_OF_MEMORY"):
+            g._sort_topk_gpu(g._ptr(out), g._ptr(keys), 2**34, 0)
+    finally:
+        g._free(keys, out)
+    assert g.sort_topk(np.array([9, 8, 7], dtype=np.int32), 3).tolist() == [2, 1, 0]
+    assert g.sort_topk(_keys(), 5).tolist() == [999, 998, 997, 996, 995]
+
+
 def _force_gpu(monkeypatch):
     monkeypatch.setattr(am, "choose_device", lambda plan, **kw: am.AutoDecision("gpu", "forced by test", None))
     am.forget_gpu_failures()
@@ -127,7 +149,7 @@ SORT = r"""
 import numpy as np, pyarrow as pa
 from mxframe import LazyFrame
 rng = np.random.default_rng(9)
-n = 2_000_000
+n = 30_000_000       # more scratch than the GPU has left
 t = pa.table({"k": rng.integers(0, 1000, n).astype(np.int32), "j": rng.integers(0, 7, n).astype(np.int32),
               "v": np.arange(n, dtype=np.int32)})
 want = np.lexsort((np.arange(n), -t.column("j").to_numpy(), -t.column("k").to_numpy()))[:10]
@@ -142,7 +164,7 @@ print("CORRECT")
 
 @pytest.mark.skipif(not os.environ.get("MXFRAME_TEST_GPU_HOG"), reason="holds most of one GPU's memory: set MXFRAME_TEST_GPU_HOG=<free MB to leave, e.g. 400>")
 def test_real_out_of_memory_raises(tmp_path):
-    """With the GPU's memory held by another process the sort raises or is exactly right; it is never wrong."""
+    """With the GPU's memory held by another process the sort raises MemoryError (it is never wrong)."""
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
                PYTHONPATH=os.pathsep.join([sys.path[0], os.environ.get("PYTHONPATH", "")]))
     hog = subprocess.Popen([sys.executable, "-c", HOG, os.environ["MXFRAME_TEST_GPU_HOG"], "120"], env=env,
@@ -153,4 +175,4 @@ def test_real_out_of_memory_raises(tmp_path):
     finally:
         hog.kill()
     assert r.returncode == 0, r.stderr[-2000:]
-    assert r.stdout.strip() in ("RAISED MemoryError", "CORRECT"), r.stdout
+    assert r.stdout.strip() == "RAISED MemoryError", r.stdout

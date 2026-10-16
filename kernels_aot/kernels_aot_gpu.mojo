@@ -35,6 +35,8 @@ def _u8(addr: Int) -> Pointer[UInt8, MutUntrackedOrigin]:
 # Status of every exported GPU function: 0 ok, -2 out of GPU memory, -1 any other error. The
 # Python wrappers (aot_kernels.py) raise on a non-zero status; the old `except: pass` returned
 # garbage output with no error (F-055).
+# NOTE: the out-of-memory test reads the exception text, so a Mojo/MAX rewording would turn -2 into -1;
+# tests/test_gpu_kernel_errors.py::test_real_oversized_sort_returns_out_of_memory_status catches that.
 def _status(e: Error) -> Int:
     var s = String(e)
     if "OUT_OF_MEMORY" in s or "out of memory" in s or "Out of memory" in s:
