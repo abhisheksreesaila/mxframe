@@ -40,7 +40,7 @@ big = (base.groupby("part").agg((col("cost") * col("qty")).sum().alias("value"))
        .filter(col("value") > total * lit(0.0001)))       # HAVING value > (SELECT sum(..) * 0.0001 ...)
 ```
 
-`compute()` runs each subquery first as a native plan of its own and puts its value in the expression as a literal, so the main plan is a plain filter or HAVING and needs no row-level Python in between. A subquery over no rows is NULL: a comparison with it keeps no rows (as in SQL, also in an `AND` / `OR`); NULL under `NOT` raises `ValueError`. If the main plan recomputes the same float aggregate, an equality test against the subquery can differ in the last bit (parallel sums add in different orders): `compute()` the aggregate once and compare on that table (TPC-H Q15).
+`compute()` runs each subquery first as a native plan of its own and puts its value in the expression as a literal, so the main plan is a plain filter or HAVING and needs no row-level Python in between. A subquery over no rows is NULL: a comparison with it keeps no rows (as in SQL, also in an `AND` / `OR`, and under a `NOT` of a plain comparison); a `NOT` over an `AND` / `OR` that contains the NULL raises `ValueError`, since it would need three-valued logic over rows. If the main plan recomputes the same float aggregate, an equality test against the subquery can differ in the last bit (the executor's parallel float sums are not yet bit-reproducible, F-064): `compute()` the aggregate once and compare on that table (TPC-H Q15).
 
 ## Running: `.compute()`
 

@@ -379,8 +379,13 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
     if not every:
         if (not keys and not preds and having_pred is None and not sort_by and limit < 0
                 and all(op == "count" for _, op, _ in outputs)):
-            # COUNT(col) over every row, no filter, no key: the table's row count (nulls were ruled out
-            # above); no column is read, so there is no array to hand the executor
+            # COUNT(col) over every row, no filter, no key: the table's row count when the counted
+            # columns have no nulls (COUNT skips them); no column is read, so there is no array to hand
+            # the executor
+            for a in plan.aggs:
+                if a.args and getattr(a.args[0], "op", None) == "col" and (
+                        a.args[0].args[0] not in table.column_names or table.column(a.args[0].args[0]).null_count):
+                    return _decline("count of a column with nulls")
             import numpy as np
             from .np_arrow import array as _npa
             result = pa.Table.from_arrays([_npa(np.array([table.num_rows], dtype=np.int64)) for _ in names], names=names)

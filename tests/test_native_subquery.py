@@ -102,6 +102,14 @@ def test_semi_and_anti_join_on_a_having_partner(counters):
         SELECT * FROM orders WHERE ok IN (SELECT lk FROM lines GROUP BY lk HAVING count(*) >= 6) ORDER BY ok""")
     _same(_rows(semi), want)
     assert 0 < len(want) < orders.num_rows
+    assert counters["arrow_predicates"] == 0 and counters["execute"] >= 1      # the partner's HAVING ran in the executor
+    counters["execute"] = 0
+    anti = LazyFrame(orders).join(big, left_on="ok", right_on="lk", how="anti").sort("ok").compute(device="cpu")
+    want_anti = _duck({"orders": orders, "lines": lines}, """
+        SELECT * FROM orders WHERE ok NOT IN (SELECT lk FROM lines GROUP BY lk HAVING count(*) >= 6) ORDER BY ok""")
+    _same(_rows(anti), want_anti)
+    assert 0 < len(want_anti) < orders.num_rows and len(want_anti) + len(want) == orders.num_rows
+    assert counters["arrow_predicates"] == 0 and counters["execute"] >= 1
 
 
 # ── scalar subqueries ───────────────────────────────────────────────────────────────────────────
@@ -149,14 +157,15 @@ def test_scalar_subquery_in_a_row_filter_with_a_float32_column(counters):
         SELECT code, count(*) n, sum(bal) t FROM cust
         WHERE bal > (SELECT avg(bal) FROM cust WHERE bal > 0) GROUP BY code ORDER BY code""")
     assert len(want) > 10
+    assert nx.last_path() == "native", nx.last_decline()             # the main plan after the subquery
+    assert counters["execute"] == 2 and counters["arrow_predicates"] == 0     # the subquery, then the grouped plan
     assert [r[:2] for r in _rows(got)] == [r[:2] for r in want]
     assert all(abs(g[2] - w[2]) < 1e-2 * max(1, abs(w[2])) for g, w in zip(_rows(got), want))
 
 
-def test_scalar_max_equality_is_exact(counters):
+def test_scalar_max_equality_on_a_computed_view_is_exact(counters):
     """Q15: the rows whose total equals the maximum total (float64 equal to the last bit). The view is computed
-    once: the executor's parallel float sums are not bitwise reproducible, so the same aggregate recomputed
-    inside the main plan could miss its own maximum."""
+    once, so both sides read the same table."""
     orders, lines = _orders()
     view = LazyFrame(LazyFrame(lines).groupby("supp").agg((col("qty") * lit(1.1)).sum().alias("rev"))
                      .compute(device="cpu"))
@@ -166,6 +175,20 @@ def test_scalar_max_equality_is_exact(counters):
         SELECT supp, rev FROM v WHERE rev = (SELECT max(rev) FROM v)""")
     assert len(want) == 1
     _same(_rows(got), want)
+
+
+@pytest.mark.xfail(strict=True, reason="F-064: executor float sums are not bit-reproducible, so a view recomputed "
+                                       "inside the main plan misses its own maximum")
+def test_scalar_max_equality_on_an_uncomputed_view_is_exact():
+    """The same shape with the view left lazy: the scalar and the main plan each run the aggregate. 6M rows,
+    10k groups (the size at which the sums differ between runs; strict: it starts passing when F-064 lands)."""
+    r = np.random.default_rng(7)
+    n = 6_000_000
+    t = pa.table({"s": A(r.integers(0, 10000, n).astype(np.int32)), "p": A(r.random(n) * 1000), "d": A(r.random(n))})
+    view = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
+    for _ in range(8):
+        got = view.filter(col("tot") == view.scalar(col("tot").max())).compute(device="cpu")
+        assert got.num_rows == 1
 
 
 def test_scalar_in_a_computed_column_and_a_count_scalar(counters):
