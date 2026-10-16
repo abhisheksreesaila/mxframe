@@ -201,6 +201,22 @@ class LazyFrame:
         """Filter rows based on a condition."""
         return LazyFrame(Filter(self.plan, predicate))
 
+    def scalar(self, agg) -> Expr:
+        """A one-value subquery: SQL's ``(SELECT <agg> FROM this)``, for use inside an expression of another
+        plan (a ``filter``, a ``with_columns``, a HAVING)::
+
+            total = sales.scalar(col("value").sum())
+            sales.groupby("k").agg(col("value").sum().alias("v")).filter(col("v") > total * lit(0.0001))
+
+        ``agg`` is one aggregate (sum, min, max, mean or count). ``compute()`` runs each subquery first, as its
+        own native plan, and puts the value in the expression as a literal (the same literal a hand-written
+        ``lit(value)`` would be, so comparisons against float32 columns behave as before); the main plan then
+        needs no Python round trip over rows. A subquery over no rows is NULL (a comparison with it keeps no
+        rows, as in SQL)."""
+        if not (isinstance(agg, Expr) and agg.op in ("sum", "min", "max", "mean", "count")):
+            raise ValueError("scalar() takes one aggregate expression: sum, min, max, mean or count")
+        return Expr("scalar", Aggregate(self.plan, [], [Expr(agg.op, *agg.args).alias("__scalar")]))
+
     def groupby(self, *by):
         """Group data by one or more columns."""
         parsed_by = [col(b) if isinstance(b, str) else b for b in by]
@@ -246,7 +262,7 @@ class LazyFrame:
                 calibration arrive with per-operator placement.
         """
         from .io_parquet import resolve_plan
-        plan = self.plan
+        plan = _resolve_scalars(self.plan, device, strict)
         optimizer_trace = None
 
         if validate:
@@ -738,6 +754,145 @@ class _GPUGroupBy:
 
 
 
+
+
+def _is_null(e) -> bool:
+    return isinstance(e, Expr) and e.op == "lit" and len(e.args) == 1 and e.args[0] is None
+
+
+def _bool_of(e):
+    """True / False for a boolean literal, else None."""
+    if isinstance(e, Expr) and e.op == "lit" and len(e.args) == 1 and isinstance(e.args[0], bool):
+        return e.args[0]
+    return None
+
+
+def _num_of(e):
+    if isinstance(e, Expr) and e.op == "lit" and len(e.args) == 1 and not isinstance(e.args[0], bool) \
+            and isinstance(e.args[0], (int, float)):
+        return e.args[0]
+    return None
+
+
+def _fold_subquery_value(op: str, args) -> Optional[Expr]:
+    """One node of an expression whose operands include a subquery's value, simplified when its operands are
+    constants: ``lit(a) <op> lit(b)`` as one literal (a HAVING compares an aggregate with a number only), NULL
+    through arithmetic, comparisons and NOT, boolean literals through AND / OR. None: nothing to simplify (an
+    integer division, a division by zero, integers past 2^53 are left to the engine)."""
+    from .lazy_expr import lit
+    if op in ("add", "sub", "mul", "div", "lt", "le", "gt", "ge", "eq", "ne"):
+        if any(_is_null(a) for a in args):
+            return lit(None)                       # NULL <op> x is NULL
+        if op in ("add", "sub", "mul", "div"):
+            a, b = (_num_of(x) for x in args)
+            if a is None or b is None:
+                return None
+            if op == "div":
+                if b == 0 or (isinstance(a, int) and isinstance(b, int)):
+                    return None
+                r = a / b
+            else:
+                r = a + b if op == "add" else a - b if op == "sub" else a * b
+            return None if isinstance(r, int) and abs(r) > 2 ** 53 else lit(r)
+        return None
+    if op == "not":
+        if _is_null(args[0]):
+            return lit(None)
+        b = _bool_of(args[0])
+        return None if b is None else lit(not b)
+    if op in ("and", "or"):
+        absorbing, identity = (False, True) if op == "and" else (True, False)
+        if any(_bool_of(a) is absorbing for a in args):
+            return lit(absorbing)
+        rest = [a for a in args if _bool_of(a) is not identity]
+        if not rest:
+            return lit(identity)
+        if all(_is_null(a) for a in rest):
+            return lit(None)
+        return rest[0] if len(rest) == 1 else Expr(op, *rest)
+    return None
+
+
+def _top_truth(p: Expr) -> Expr:
+    """A filter keeps a row only when its predicate is TRUE, so a NULL there (a comparison with an empty
+    subquery) is false, also inside AND / OR chains: ``a AND NULL`` is never true, ``a OR NULL`` is true
+    when ``a`` is. Under NOT (or in any other position) a NULL cannot be decided without evaluating rows:
+    that raises rather than answering wrongly."""
+    from .lazy_expr import lit
+    if _is_null(p):
+        return lit(False)
+    if isinstance(p, Expr) and p.op in ("and", "or"):
+        kids = [_top_truth(a) for a in p.args]
+        out = _fold_subquery_value(p.op, kids)
+        if out is None:
+            out = Expr(p.op, *kids)
+        out._alias = p._alias
+        return out
+
+    def has_null(e):
+        return _is_null(e) or (isinstance(e, Expr) and any(has_null(a) for a in e.args if isinstance(a, Expr)))
+
+    if has_null(p):
+        raise ValueError("a scalar subquery over no rows is NULL: not supported under NOT or inside an "
+                         "expression that is not a plain comparison")
+    return p
+
+
+def _resolve_scalars(plan, device: str, strict: bool):
+    """``plan`` with every scalar subquery (``LazyFrame.scalar``) in its expressions replaced by the literal it
+    computes: each is run first through ``compute`` (so it takes the native path like any plan). The same
+    object when the plan has none. A filter whose predicate is constant afterwards (an empty subquery) is
+    ``Limit(0)`` or nothing."""
+    import dataclasses
+    from .lazy_expr import lit
+
+    def expr(e):
+        if not isinstance(e, Expr):
+            return e
+        if e.op == "scalar":
+            out = LazyFrame(e.args[0]).compute(device=device, strict=strict)
+            new = lit(out.column(0)[0].as_py())          # None: the subquery had no rows (NULL)
+            new._alias = e._alias
+            return new
+        args = tuple(expr(a) if isinstance(a, Expr) else a for a in e.args)
+        if all(n is o for n, o in zip(args, e.args)):
+            return e
+        new = _fold_subquery_value(e.op, args)
+        if new is None:
+            new = Expr(e.op, *args, **e.kwargs)
+        new._alias = e._alias
+        return new
+
+    def walk(node):
+        if not isinstance(node, LogicalPlan):
+            return node
+        changes = {}
+        for f in dataclasses.fields(node):
+            v = getattr(node, f.name)
+            if isinstance(v, LogicalPlan):
+                nv = walk(v)
+            elif isinstance(v, Expr):
+                nv = expr(v)
+                if isinstance(node, Filter) and nv is not v:
+                    nv = _top_truth(nv)
+            elif isinstance(v, list) and any(isinstance(x, Expr) for x in v):
+                nv = [expr(x) for x in v]
+                if all(n is o for n, o in zip(nv, v)):
+                    nv = v
+            else:
+                continue
+            if nv is not v:
+                changes[f.name] = nv
+        out = dataclasses.replace(node, **changes) if changes else node
+        if isinstance(out, Filter) and "predicate" in changes:
+            b = _bool_of(out.predicate)
+            if b is True:
+                return out.input
+            if b is False:
+                return Limit(out.input, 0)
+        return out
+
+    return walk(plan)
 
 
 def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,
