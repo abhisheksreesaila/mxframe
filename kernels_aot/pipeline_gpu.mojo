@@ -678,42 +678,48 @@ def merge_kernel(
         _lp(out_cnt_a)[s - A * G] = Int64(r)
 
 
-def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int) -> Int:
-    """The aggregation mode (see the header) a program with these sizes runs in, or -5 (needs more shared
-    memory than a block has) / -6 (reproducible mode and the group table does not fit)."""
-    var G = n_groups
-    var A = n_slots
-    var ns = (A + 1) * G
-    var rpt = 2 if (n_regs <= 6 and G == 1 and A <= 2) else 1
-    var mode = 0 if G == 1 and ns <= SMALL else 2
-    var bsz = BLOCK
-    var base_smem = MAX_CONSTS * 8 + code_ints * 4
-    if G > 1:
-        # few groups: per-thread accumulators in shared memory (128-thread blocks)
-        var smem3 = n_regs * 128 * rpt * 8 + base_smem + 4 * SMALL * 8 + ns * 128 * 8
-        if ns <= SMALL and smem3 <= 48 * 1024:
-            mode = 3
-            bsz = 128
-        else:
-            # otherwise one shared table of accumulators per block, folded into the output
-            # with global atomics, if it fits next to the register file
-            var smem1 = n_regs * BLOCK * 8 + base_smem + WARPS * SMALL * 8 + ns * 8
-            if smem1 <= 48 * 1024:
-                mode = 1
-    if repro != 0 and (mode == 1 or mode == 2):
-        # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory
-        if ns > REPRO_MAX_NS or n_regs * BLOCK * 8 + base_smem + WARPS * SMALL * 8 + ns * 8 + BLOCK * 4 > 48 * 1024:
-            return -6
-        mode = 4
-        rpt = 1
-    var smem = n_regs * bsz * rpt * 8 + base_smem + (bsz // 32) * SMALL * 8
+def _rows_per_thread(n_regs: Int, n_groups: Int, n_slots: Int) -> Int:
+    return 2 if (n_regs <= 6 and n_groups == 1 and n_slots <= 2) else 1
+
+
+def _block_threads(mode: Int) -> Int:
+    return 128 if mode == 3 else BLOCK
+
+
+def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int) -> Int:
+    """Dynamic shared memory of a launch in `mode`: the one formula the mode choice and the launch share."""
+    var ns = (n_slots + 1) * n_groups
+    var bsz = _block_threads(mode)
+    var tile = bsz * _rows_per_thread(n_regs, n_groups, n_slots)
+    var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + code_ints * 4 + (bsz // 32) * SMALL * 8
     if mode == 3:
         smem += ns * bsz * 8
     elif mode == 1:
         smem += ns * 8
     elif mode == 4:
-        smem += ns * 8 + BLOCK * 4
-    if smem > 48 * 1024:
+        smem += ns * 8 + tile * 4
+    return smem
+
+
+def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int) -> Int:
+    """The aggregation mode (see the header) a program with these sizes runs in, or -5 (needs more shared
+    memory than a block has) / -6 (reproducible mode and the group table does not fit)."""
+    var G = n_groups
+    var ns = (n_slots + 1) * G
+    var mode = 0 if G == 1 and ns <= SMALL else 2
+    if G > 1:
+        # few groups: per-thread accumulators in shared memory (128-thread blocks); otherwise one shared
+        # table of accumulators per block, folded into the output with global atomics, if it fits
+        if ns <= SMALL and _smem_bytes(3, G, n_slots, n_regs, code_ints) <= 48 * 1024:
+            mode = 3
+        elif _smem_bytes(1, G, n_slots, n_regs, code_ints) <= 48 * 1024:
+            mode = 1
+    if repro != 0 and (mode == 1 or mode == 2):
+        # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory
+        if ns > REPRO_MAX_NS or _smem_bytes(4, G, n_slots, n_regs, code_ints) > 48 * 1024:
+            return -6
+        mode = 4
+    if _smem_bytes(mode, G, n_slots, n_regs, code_ints) > 48 * 1024:
         return -5
     return mode
 
@@ -742,16 +748,10 @@ def mx_pipeline_gpu(
     var mode = _choose_mode(G, A, n_regs, code_ints, repro)
     if mode < 0:
         return mode
-    var bsz = 128 if mode == 3 else BLOCK
-    var rpt = 2 if (n_regs <= 6 and G == 1 and A <= 2) else 1
+    var bsz = _block_threads(mode)
+    var rpt = _rows_per_thread(n_regs, G, A)
     var tile = bsz * rpt
-    var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + code_ints * 4 + (bsz // 32) * SMALL * 8
-    if mode == 3:
-        smem += (A + 1) * G * bsz * 8
-    elif mode == 1:
-        smem += (A + 1) * G * 8
-    elif mode == 4:
-        smem += (A + 1) * G * 8 + tile * 4
+    var smem = _smem_bytes(mode, G, A, n_regs, code_ints)
     var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
     var small = 1 if (mode == 0 or mode == 3 or mode == 4) else 0
     try:

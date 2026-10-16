@@ -103,8 +103,8 @@ def test_gpu_few_groups_and_global_aggregate_are_already_ordered(groups):
 
 
 @needs_gpu
-def test_the_default_mode_keeps_the_atomics():
-    """No flag: the many-groups kernel is the fast one, and still right (its last bits may differ per run)."""
+def test_default_mode_gpu_result_agrees_with_reproducible_mode_to_rounding():
+    """The default (atomic) kernel and the ordered one add the same numbers: equal to 1e-9, not to the bit."""
     t = _fact(2_000_000, 100_000)
     a = _revenue(t).compute(device="gpu")
     b = _revenue(t).compute(device="gpu", reproducible=True)
@@ -112,9 +112,17 @@ def test_the_default_mode_keeps_the_atomics():
     np.testing.assert_allclose(a.column("tot").to_numpy()[oa], b.column("tot").to_numpy()[ob], rtol=1e-9)
 
 
-def test_the_environment_variable_reaches_the_gpu_kernel(monkeypatch):
+@needs_gpu
+def test_the_environment_variable_runs_the_ordered_gpu_kernel(monkeypatch):
+    """MXFRAME_REPRODUCIBLE=1 with no flag: a 200-group shape (mode 4) gives the same bits every run on the GPU."""
     monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
-    assert nx.reproducible() is True
+    plan = _revenue(_fact(2_000_000, 200))
+    bad, total = _differing_groups(lambda: plan.compute(device="gpu"))
+    assert plan.last_compile_provenance["path"] == "fused_pipeline_gpu"
+    assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
+    monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
+    runs = [_bits(plan.compute(device="gpu", reproducible=False)) for _ in range(RUNS)]
+    assert any(int((runs[0][0] != r[0]).sum()) for r in runs[1:])     # reproducible=False overrides it: atomics again
 
 
 # ── a forced CPU+GPU split ───────────────────────────────────────────────────
@@ -135,8 +143,8 @@ def _compute_split(plan, fraction):
 @needs_gpu
 @pytest.mark.parametrize("groups,path", [(200, "fused_pipeline_split"), (20_000, "fused_pipeline_cpu")])
 def test_forced_split_gives_the_same_bits_every_run(groups, path):
-    """200 groups: GPU share and CPU share run, merged GPU rows first. 20,000 groups: the GPU share is
-    GpuUnsupported in reproducible mode and the router redoes its rows on the CPU (same bits too)."""
+    """200 groups: GPU share and CPU share run, merged GPU rows first. 20,000 groups: the ordered kernel cannot
+    hold the table, so the split gives the GPU no share and the CPU runs every row (same bits every run)."""
     cf.clear_residency()
     plan = _revenue(_fact(2_000_000, groups))
     run = _resident_split(plan, 0.5)
@@ -229,3 +237,39 @@ def test_the_ordered_kernel_asks_before_a_split_which_group_counts_it_takes():
     prog, _ = pipeline_exec._bind(*pipeline_exec._table_of(_revenue(t).plan)[:2], t)
     assert [pk.gpu_reproducible_fits(prog, g) for g in (1, 10, 1_000, 1_365, 1_366, 100_000)] == \
         [True, True, True, True, False, False]
+
+
+@needs_gpu
+def test_auto_with_reproducible_runs_the_cpu_defined_order_and_says_so(monkeypatch):
+    """A resident shape auto splits, its fraction drifting between runs the way every run's `observe` moves it
+    (emulated: 0.30 to 0.60): with reproducible=True auto takes no timing-based choice, runs the CPU defined
+    order, and gives the same bits every run. (Without the flag the same setup does split and the bits move.)"""
+    from mxframe import auto_mode
+    cf.clear_residency()
+    plan = _revenue(_fact(2_000_000, 200))
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        plan.compute(device="cpu")
+        assert cf.wait_for_uploads(60)
+    drift = iter(range(10_000))
+    real = cf.plan_split
+
+    def drifting(*a, **kw):
+        sp = real(*a, **kw)
+        sp.gpu_fraction, sp.wins = 0.30 + 0.03 * (next(drift) % 11), True
+        return sp
+
+    monkeypatch.setattr(cf, "plan_split", drifting)
+    monkeypatch.setattr(auto_mode, "_cpu_path", lambda d, plan, calib, gpu: (True, "cpu+gpu split (forced by the test)"))
+    monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 0)
+
+    def run(**kw):
+        return plan.compute(device="auto", **kw)
+
+    run()                                                      # without the flag auto splits here
+    assert plan.last_compile_provenance["path"] == "fused_pipeline_split"
+    bad, total = _differing_groups(lambda: run(reproducible=True), runs=10)
+    assert plan.last_compile_provenance["path"] == "native"      # the native executor: F-064's defined order
+    d = plan.last_auto_decision
+    assert d.device == "cpu" and d.split is False
+    assert "reproducible: cpu defined order" in d.explain()
+    assert bad == 0, f"{bad} of {total} groups differ bitwise between runs"
