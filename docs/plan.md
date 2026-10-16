@@ -587,7 +587,7 @@ Needs: F-033 · From the F-033 review: SQL-phrased Q11, Q15, Q18, Q21, Q22 get n
 - [ ] until a form is supported, a clear error instead of today's misleading "aggregate functions are not allowed in WHERE"
 - [ ] SQL versions of the 22 TPC-H queries run and equal DuckDB; `scripts/native_coverage.py` reports the same native coverage for SQL as for the DataFrame versions
 
-## F-066 Committed kernel libraries match their source [review]
+## F-066 Committed kernel libraries match their source [done]
 From the F-033 review: `libmxpipeline_cpu.so` was stale against `pipeline_cpu.mojo`; CI only builds `libmxkernels_aot.so` and the wheel ships the committed `.so` files
 - [x] store a source hash next to each committed `.so` at build time; a test fails when a `.mojo` source changed without its library being rebuilt (`kernels_aot/<lib>.so.sources.json` from `scripts/record_build_hash.py`, called by every build; `tests/test_kernel_hashes.py` and a CI step check it; after merging source changes run `bash scripts/build_pipeline.sh` with no argument)
 

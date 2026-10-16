@@ -58,6 +58,8 @@ pixi run test6-gpu
 
 echo "[2/5] Rebuilding AOT libraries"
 bash scripts/build_pipeline.sh aot
+# every committed kernel library must match its source before it ships (F-066)
+pixi run python scripts/record_build_hash.py --check
 
 echo "[3/5] Building wheel and sdist"
 rm -rf dist build
