@@ -860,7 +860,7 @@ Found by the F-084 review (2026-10-16); a silent wrong answer on main
 - [ ] `lag(v)` over `[1, NULL, 3]` gives `[nan, 1.0, nan]`; DuckDB `[NULL, 1.0, NULL]`: lag / lead turn NULL into NaN and fill with NaN. Shift the Arrow array with its validity (fill NULL, or the given default); keep the input dtype
 - [ ] DuckDB-checked tests: lag / lead with offsets 1 and 2, defaults, partitions, ORDER BY with NaN / NULL keys (F-084 order), int / float / string columns; fails before
 
-## F-092 mx.sql over a scan_parquet frame crashes [review]
+## F-092 mx.sql over a scan_parquet frame crashes [done]
 Found by the F-086 developer (2026-10-16)
 - [x] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
 - [x] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
@@ -895,3 +895,8 @@ From the F-086 review (2026-10-16); a speedup, not a bug
 From the F-087 review (2026-10-16)
 - [ ] OFFSET without LIMIT uses `n = 2**62` (`sql_frontend._ALL_ROWS`): `explain()` shows the sentinel and an OFFSET above ~2^62 overflows `n + offset` in int64 in native code. Model "no limit" as `n=None` in `Limit` (or clamp), every consumer handles it
 - [ ] tests: explain shows no sentinel; a huge OFFSET returns no rows without overflow; fails before
+
+## F-099 SQL self-join: columns of the second copy [todo]
+Found by the F-092 developer and review (2026-10-16)
+- [ ] in `t x JOIN t y`, referencing a column that exists in both copies on the second side (`WHERE y.qty > 25`, `SELECT y.v`) raises "name exists in more than one joined table ... not supported yet". Joined tables with shared non-key column names are common (self-joins, fact-to-fact): carry both copies under distinct internal names (`v`, `v_right`) and resolve `x.v` / `y.v` to the right one in every clause
+- [ ] DuckDB-checked tests: self-join with filters on either side, SELECT of both copies, GROUP BY / ORDER BY on the second copy, a three-way join with a repeated name; fails before
