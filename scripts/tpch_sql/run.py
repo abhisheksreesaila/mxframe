@@ -38,7 +38,8 @@ def load_tables(text: str, directory: str) -> dict:
     import mxframe as mx
     tree = sqlglot.parse_one(text, dialect="duckdb")
     names = {c.name.lower() for c in tree.find_all(sge.Column)}
-    used = {t.name.lower() for t in tree.find_all(sge.Table)}
+    ctes = {c.alias.lower() for c in tree.find_all(sge.CTE)}
+    used = {t.name.lower() for t in tree.find_all(sge.Table)} - ctes
     out = {}
     for t in used:
         path = f"{directory}/{t}.parquet"

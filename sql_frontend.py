@@ -17,7 +17,10 @@ Supports a large subset of TPC-H-style SQL:
 
 __all__ = ["sql"]
 
+import calendar
 import itertools
+from datetime import date, timedelta
+from decimal import Decimal
 
 import pyarrow as pa
 import sqlglot
@@ -27,7 +30,7 @@ from typing import Any, Dict, List, Optional
 from .lazy_expr import Expr, col, lit, when
 from .lazy_frame import (
     LazyFrame, LogicalPlan,
-    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join,
+    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names,
 )
 
 
@@ -110,6 +113,91 @@ def _and_all(nodes: List[sge.Expression]) -> Optional[sge.Expression]:
     for n in nodes:
         out = n if out is None else sge.And(this=out, expression=n)
     return out
+
+
+_EPOCH = date(1970, 1, 1)
+
+
+def _date_of(node: sge.Expression) -> Optional[date]:
+    """The date of a constant ``DATE 'yyyy-mm-dd'`` [+ / - INTERVAL 'n' DAY | MONTH | YEAR ...], else None."""
+    node = _unparen(node)
+    if isinstance(node, sge.Cast) and node.to.this == sge.DataType.Type.DATE:
+        if isinstance(node.this, sge.Literal) and node.this.is_string:
+            try:
+                return date.fromisoformat(node.this.this)
+            except ValueError:
+                raise ValueError(f"not a date: DATE '{node.this.this}'") from None
+        return None
+    if isinstance(node, (sge.Add, sge.Sub)):
+        d = _date_of(node.this)
+        iv = _unparen(node.expression)
+        if d is None or not isinstance(iv, sge.Interval):
+            return None
+        n = int(iv.this.this) * (1 if isinstance(node, sge.Add) else -1)
+        unit = iv.unit.name.upper() if iv.unit is not None else ""
+        if unit == "DAY":
+            return d + timedelta(days=n)
+        if unit in ("MONTH", "YEAR"):
+            m = d.year * 12 + d.month - 1 + n * (12 if unit == "YEAR" else 1)
+            y, mo = divmod(m, 12)
+            return date(y, mo + 1, min(d.day, calendar.monthrange(y, mo + 1)[1]))
+        raise NotImplementedError(f"INTERVAL unit {unit or '?'} is not supported (DAY, MONTH, YEAR)")
+    return None
+
+
+def _num_const(node: sge.Expression) -> Optional[Decimal]:
+    """The exact value of a constant number expression (+ - * of literals), as SQL decimals compute it."""
+    node = _unparen(node)
+    if isinstance(node, sge.Literal):
+        return None if node.is_string else Decimal(str(node.this))
+    if isinstance(node, sge.Neg):
+        v = _num_const(node.this)
+        return None if v is None else -v
+    if isinstance(node, (sge.Add, sge.Sub, sge.Mul)):
+        a, b = _num_const(node.this), _num_const(node.expression)
+        if a is None or b is None:
+            return None
+        return a + b if isinstance(node, sge.Add) else a - b if isinstance(node, sge.Sub) else a * b
+    return None
+
+
+def _is_comma_join(join: sge.Join) -> bool:
+    """FROM a, b: the join keys are in WHERE. (An explicit CROSS JOIN stays unsupported.)"""
+    return (not join.args.get("on") and not join.args.get("using") and not join.args.get("side")
+            and not join.args.get("kind"))
+
+
+def _disjuncts(n: sge.Expression) -> List[sge.Expression]:
+    n = _unparen(n)
+    return _disjuncts(n.this) + _disjuncts(n.expression) if isinstance(n, sge.Or) else [n]
+
+
+def _cond_key(c: sge.Expression):
+    """A condition's identity for comparing OR branches: ``a = b`` and ``b = a`` are one."""
+    if isinstance(c, sge.EQ):
+        return ("eq", frozenset((_unparen(c.this).sql(dialect="duckdb"), _unparen(c.expression).sql(dialect="duckdb"))))
+    return c.sql(dialect="duckdb")
+
+
+def _or_common_equalities(node: sge.Or) -> List[sge.EQ]:
+    """Column = column conditions that every branch of an OR has (TPC-H Q19's join key)."""
+    branches = [{_cond_key(c): c for c in _conjuncts(b)} for b in _disjuncts(node)]
+    common = set.intersection(*[set(b) for b in branches])
+    return [branches[0][k] for k in common if isinstance(branches[0][k], sge.EQ)]
+
+
+def _or_without(node: sge.Or, drop: set) -> Optional[sge.Expression]:
+    """The OR with the conditions whose SQL text is in ``drop`` removed from every branch."""
+    out = []
+    for b in _disjuncts(node):
+        rest = [c for c in _conjuncts(b) if _cond_key(c) not in drop]
+        if not rest:
+            return None                      # a branch that is only the dropped conditions: always true
+        out.append(sge.Paren(this=_and_all(rest)))
+    r = out[0]
+    for o in out[1:]:
+        r = sge.Or(this=r, expression=o)
+    return sge.Paren(this=r)
 
 
 def _alias(node: sge.Expression, name: str) -> sge.Alias:
@@ -199,6 +287,12 @@ class _SQLTranslator:
         self._ctes: Dict[str, LogicalPlan] = {}
         self._ids = itertools.count()
         self._has_star = False
+        # comma joins: WHERE conditions not yet used as join keys; (table alias, column) -> its column in
+        # the joined plan; aliases and output columns joined so far
+        self._conj: List[sge.Expression] = []
+        self._qual: dict = {}
+        self._joined: set = set()
+        self._cur_cols: List[str] = []
 
     def _child(self) -> "_SQLTranslator":
         """A translator for a subquery: its own state, the same tables and WITH names."""
@@ -224,15 +318,19 @@ class _SQLTranslator:
         self._register_ctes(node.args.get("with_"))
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
 
-        # 1. FROM + JOINs
+        where = node.args.get("where")
+        if where and _aggs_in(where.this):
+            raise ValueError("aggregate functions are not allowed in WHERE (use HAVING)")
+        self._conj = _conjuncts(where.this) if where else []
+        n_conj = len(self._conj)
+
+        # 1. FROM + JOINs (a comma join takes its keys from WHERE)
         plan = self._build_from(node)
 
-        # 2. WHERE
-        where = node.args.get("where")
-        if where:
-            if _aggs_in(where.this):
-                raise ValueError("aggregate functions are not allowed in WHERE (use HAVING)")
-            plan = self._where(plan, where.this)
+        # 2. WHERE (what the joins did not use)
+        if where and self._conj:
+            same = len(self._conj) == n_conj and all(a is b for a, b in zip(self._conj, _conjuncts(where.this)))
+            plan = self._where(plan, where.this if same else _and_all(self._conj))
 
         for o in (node.args.get("order").expressions if node.args.get("order") else []):
             if o.args.get("nulls_first"):
@@ -312,10 +410,17 @@ class _SQLTranslator:
         plan, main_cols = self._scan(from_clause.this)
         # Seed the accumulated left-side schema with the main FROM table
         self._left_schema = set(main_cols)
+        self._joined = {from_clause.this.alias_or_name.lower()}
+        self._cur_cols = list(main_cols)
+        self._qual = {(next(iter(self._joined)), c.lower()): c for c in main_cols}
+        pending = []
 
         for join in node.args.get("joins") or []:
             right_plan, right_cols = self._scan(join.this)
             right_schema = set(right_cols)
+            if _is_comma_join(join):
+                pending.append((join.this.alias_or_name.lower(), right_plan, right_cols))
+                continue
 
             how = _join_type(join)
             on = join.args.get("on")
@@ -334,6 +439,8 @@ class _SQLTranslator:
             # join outputs the left columns only)
             if how not in ("semi", "anti"):
                 self._left_schema |= right_schema
+                self._cur_cols += [o for _, o in join_output_names(self._cur_cols, right_cols, right_on)]
+            self._joined.add(join.this.alias_or_name.lower())
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
                 if lk == rk:
@@ -341,7 +448,69 @@ class _SQLTranslator:
                 if lk != rk:
                     (self._dropped_right if how == "left" else self._col_aliases)[rk] = lk
 
+        while pending:
+            for i, (alias, right_plan, right_cols) in enumerate(pending):
+                links = self._links(alias, {c.lower() for c in right_cols})
+                if links:
+                    break
+            else:
+                names = ", ".join(a for a, _, _ in pending)
+                raise NotImplementedError(f"no join condition links {names} to the other tables: FROM a, b needs "
+                                          "column = column conditions in WHERE (a cross product is not supported)")
+            pending.pop(i)
+            left_on = [self._expr(l).args[0] for l, _ in links]
+            right_on = [r.name.lower() for _, r in links]
+            plan = Join(plan, right_plan, left_on, right_on, "inner")
+            outs = join_output_names(self._cur_cols, right_cols, right_on)
+            for c, out in outs:
+                self._qual[(alias, c.lower())] = out
+            for lk, rk in zip(left_on, right_on):
+                self._qual[(alias, rk)] = lk
+                if lk == rk:
+                    self._same_keys.add(lk)
+                else:
+                    self._col_aliases[rk] = lk
+            self._cur_cols += [o for _, o in outs]
+            self._left_schema |= set(right_cols)
+            self._joined.add(alias)
+
         return plan
+
+    def _links(self, alias: str, cols: set):
+        """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
+        that equate the two; they are taken out of ``self._conj``. A condition every branch of an OR has
+        counts (it is removed from the branches)."""
+        def owner(c: sge.Column) -> Optional[str]:
+            name = c.name.lower()
+            if c.table:
+                t = c.table.lower()
+                return "R" if t == alias else "L" if t in self._joined else None
+            in_r = name in cols
+            in_l = any(name in cs for a, cs in self._table_cols if a in self._joined)
+            return "R" if in_r and not in_l else "L" if in_l and not in_r else None
+
+        links, keep = [], []
+        for c in self._conj:
+            c0 = _unparen(c)
+            eqs = _or_common_equalities(c0) if isinstance(c0, sge.Or) else [c0] if isinstance(c0, sge.EQ) else []
+            used = []
+            for e in eqs:
+                a, b = _unparen(e.this), _unparen(e.expression)
+                if isinstance(a, sge.Column) and isinstance(b, sge.Column):
+                    oa, ob = owner(a), owner(b)
+                    if {oa, ob} == {"L", "R"}:
+                        links.append((a, b) if oa == "L" else (b, a))
+                        used.append(e)
+            if not used:
+                keep.append(c)
+            elif isinstance(c0, sge.Or):
+                rest = _or_without(c0, {_cond_key(e) for e in used})
+                if rest is not None:
+                    keep.append(rest)
+            # a plain equality that was used is dropped
+        if links:
+            self._conj = keep
+        return links
 
     def _copy_dropped(self, qualifier: str, name: str) -> bool:
         """True when ``qualifier.name`` is the copy of a column the join dropped (an earlier joined
@@ -896,6 +1065,18 @@ class _SQLTranslator:
             what = "EXISTS (SELECT ...)" if isinstance(node, sge.Exists) else "IN (SELECT ...)"
             raise NotImplementedError(f"{what} is supported only as a condition joined by AND at the top of WHERE "
                                       "(it becomes a semi / anti join); not inside OR, NOT (...), CASE, SELECT or HAVING")
+        d = _date_of(node)
+        if d is not None:
+            return lit((d - _EPOCH).days)                   # a day number, as the TPC-H Parquet dates are stored
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul)):
+            v = _num_const(node)
+            if v is not None:
+                is_int = not any("." in str(x.this) for x in node.find_all(sge.Literal))
+                return lit(int(v)) if is_int else lit(float(v))
+        if isinstance(node, sge.Extract):
+            return self._extract(node)
+        if isinstance(node, sge.Substring):
+            return self._substring(node)
         if self._post:
             ref = self._post_ref(node)
             if ref is not None:
@@ -904,6 +1085,8 @@ class _SQLTranslator:
         # ---- column reference ----
         if isinstance(node, sge.Column):
             name = node.name.lower()
+            if node.table and (node.table.lower(), name) in self._qual:
+                return col(self._qual[(node.table.lower(), name)])        # a comma-joined table's own copy
             if node.table and name not in self._same_keys and self._copy_dropped(node.table.lower(), name):
                 raise ValueError(f"column {node.sql(dialect='duckdb')}: the name exists in more than one joined "
                                  "table and the join keeps the first copy, so this one is not supported yet")
@@ -982,8 +1165,11 @@ class _SQLTranslator:
             pattern = node.expression.this
             if pattern.endswith("%") and "%" not in pattern[:-1] and "_" not in pattern:
                 return c.startswith(pattern[:-1])
+            if len(pattern) > 2 and pattern.startswith("%") and pattern.endswith("%") \
+                    and "%" not in pattern[1:-1] and "_" not in pattern:
+                return c.contains(pattern[1:-1])
             raise NotImplementedError(
-                f"Only 'prefix%' LIKE patterns are supported, got {pattern!r}"
+                f"Only 'prefix%' and '%substring%' LIKE patterns are supported, got {pattern!r}"
             )
 
         # ---- aggregates ----
@@ -1013,6 +1199,32 @@ class _SQLTranslator:
     # ------------------------------------------------------------------
     # CASE WHEN helpers
     # ------------------------------------------------------------------
+
+    def _extract(self, node: sge.Extract) -> Expr:
+        """EXTRACT(YEAR FROM x): a date32 column through ``year()``; any other (integer day numbers since
+        1970-01-01, as the TPC-H Parquet files store dates) through ``year_of_days()``."""
+        if node.this.name.upper() != "YEAR":
+            raise NotImplementedError(f"EXTRACT({node.this.name.upper()} FROM ...) is not supported, only YEAR")
+        arg = self._expr(node.expression)
+        src = _unparen(node.expression)
+        if isinstance(src, sge.Column):
+            for tbl in self._tables.values():
+                names = {n.lower(): n for n in tbl.schema.names}
+                if src.name.lower() in names:
+                    t = tbl.schema.field(names[src.name.lower()]).type
+                    if pa.types.is_date(t) or pa.types.is_timestamp(t):
+                        return arg.year()
+                    break
+        return arg.year_of_days()
+
+    def _substring(self, node: sge.Substring) -> Expr:
+        start, length = node.args.get("start"), node.args.get("length")
+        ok = isinstance(start, sge.Literal) and not start.is_string and int(start.this) >= 1 \
+            and (length is None or (isinstance(length, sge.Literal) and not length.is_string))
+        if not ok:
+            raise NotImplementedError("SUBSTRING needs a constant start >= 1 and a constant length: "
+                                      f"{node.sql(dialect='duckdb')}")
+        return self._expr(node.this).str_slice(int(start.this) - 1, None if length is None else int(length.this))
 
     def _translate_case(self, node: sge.Case) -> Expr:
         ifs = node.args.get("ifs") or []
