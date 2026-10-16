@@ -130,15 +130,24 @@ def test_two_partners_composite_key_and_no_predicate(comp):
     _check(got, fact, ["q"], _reference(fact, np.ones(fact.num_rows, bool), lookups), lookups)
 
 
-def test_duplicate_partner_keys_decline(comp):
+@pytest.mark.parametrize("scale", [1, 1 << 40])        # direct array / hash table
+def test_duplicate_partner_keys_expand_in_build_order(comp, scale):
+    """A repeated partner key gives one joined row per partner row, in build order (F-046a slice 2)."""
     fact = _fact(10_000)
-    dim = _dim([1, 2, 3, 2])
+    fact = fact.set_column(0, "k", A(fact.column("k").to_numpy() * scale))
+    dim = _dim(np.array([1, 2, 3, 2]) * scale)
     got = nx.try_filter(comp, fact, [], {"q"}, [_lk(["k"], dim, ["dk"], ["w"], 0)])
-    assert got is None
-    assert "-18" in nx.last_filter()[1]
-    # a wide range (hash table) too
-    dim = _dim([1, 2 << 40, 3, 2 << 40])
-    assert nx.try_filter(comp, fact, [], {"q"}, [_lk(["k"], dim, ["dk"], ["w"], 0)]) is None
+    assert got is not None, nx.last_filter()
+    ks = fact.column("k").to_pylist()
+    w = dim.column("w").to_pylist()
+    want_q, want_w = [], []
+    for i, k in enumerate(ks):
+        for row in {1 * scale: [0], 2 * scale: [1, 3], 3 * scale: [2]}.get(k, []):
+            want_q.append(fact.column("q")[i].as_py())
+            want_w.append(w[row])
+    assert got.column("q").to_pylist() == want_q
+    assert got.column("L0.w").to_pylist() == want_w
+    assert nx.last_filter_maps()[0]["multi"] is True
 
 
 def test_partner_split_into_chunks_and_dictionaries(comp):
@@ -280,8 +289,8 @@ def test_star_plans_match_the_leaf_by_leaf_join(star_scan, monkeypatch, name):
     _same(got, old)
 
 
-def test_star_with_duplicate_partner_keys_falls_back(monkeypatch):
-    """A partner whose join key repeats (many-to-many) declines natively; the join runs leaf by leaf."""
+def test_star_with_duplicate_partner_keys_expands(monkeypatch):
+    """A partner whose join key repeats (one-to-many) is expanded by the star scan, as the leaf-by-leaf join does."""
     import mxframe.custom_ops as co
     t = _tables()
     dup = pa.concat_tables([t["supp"], t["supp"]])

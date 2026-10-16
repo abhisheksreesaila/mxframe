@@ -932,6 +932,30 @@ def _semi_partner(comp, plan, bkeys, reduce=None) -> Optional[pa.Table]:
     return None if out is None else out.select(list(bkeys))
 
 
+_RUNTIME_MIN_ROWS = 1 << 16        # a smaller partner is cheap to index whole
+
+
+def _runtime_reduced(comp, t: pa.Table, bkeys, probe, preds, fact_keys, keep_dict) -> pa.Table:
+    """The runtime join filter (F-043, generalized): a partner of more than twice the rows the fact's own
+    filter keeps is cut to the rows whose keys occur among the fact's surviving keys before its map is built
+    (TPC-H Q12's orders: 1.5M rows indexed for 31k lineitems). Skipped when the fact keeps over half of its
+    rows, when the partner is small, or when the native filter cannot run (``t`` as it was)."""
+    if not preds or t.num_rows < _RUNTIME_MIN_ROWS:
+        return t
+    keys = fact_keys(probe)
+    if keys is None or t.num_rows <= 2 * keys[0].num_rows:
+        return t
+    from . import native_exec
+    ktab, knames = keys
+    out = native_exec.try_filter(comp, t, [], set(t.column_names),
+                                 [native_exec.Lookup(list(bkeys), ktab, list(knames), [], [], semi=True)],
+                                 keep_dict=keep_dict)
+    if _TRACE:
+        _trace(f"runtime join filter: partner {t.num_rows} -> {None if out is None else out.num_rows} rows "
+               f"by {ktab.num_rows} fact keys")
+    return t if out is None else out
+
+
 class _Star:
     """A star join ready to run (``_star_setup``): the fact leaf's scan and predicates, one native
     ``Lookup`` per partner (most selective first) with the neighbour leaf it stands for, which partner
@@ -1035,6 +1059,19 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
             if c not in deliver[leaf]:
                 deliver[leaf].append(c)
 
+    # the fact's surviving key columns (its own filter, run natively once per probe columns), or None: the
+    # runtime join filter's input (F-043; generalized to every single-leaf partner, F-046a slice 2)
+    fact_keys_memo: Dict[tuple, Optional[tuple]] = {}
+
+    def fact_keys(probe):
+        key = tuple(probe)
+        if key not in fact_keys_memo:
+            kt = native_exec.try_filter(comp, scan.table, preds, set(probe))
+            if kt is None or 2 * kt.num_rows > scan.table.num_rows:
+                kt = None                     # a weak fact filter: the lookup would cost more than it saves
+            fact_keys_memo[key] = None if kt is None else (kt.select(list(probe)), list(probe))
+        return fact_keys_memo[key]
+
     lookups = []
     # semi partners' key columns, served from the fact's equal probe columns. Defensive: a join drops
     # its right key, so no output or residual can name one today
@@ -1048,10 +1085,7 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
             if preds and _rows_of(fl.leaves[c]) > 2 * scan.table.num_rows:
                 # a partner much larger than the (filtered) fact: filter it by the fact's keys first
                 def reduce(probe=probe):
-                    kt = native_exec.try_filter(comp, scan.table, preds, set(probe))
-                    if kt is None or 2 * kt.num_rows > scan.table.num_rows:
-                        return None           # a weak fact filter: the lookup would cost more than it saves
-                    return kt.select(list(probe)), list(probe)
+                    return fact_keys(probe)
             keys = _semi_partner(comp, fl.leaves[c], bkeys, reduce)
             if keys is not None:
                 for pk, bk in zip(probe, bkeys):
@@ -1069,6 +1103,8 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
             cols_of[x] = cols
         if len(S) == 1:
             t = get(c).select(cols_of[c])
+            t = _runtime_reduced(comp, t, bkeys, probe, preds, fact_keys,
+                                 coded[c] if coded is not None else ())
             B = pa.Table.from_arrays([t.column(k) for k in cols_of[c]],
                                      names=[_star_name(c, k) for k in cols_of[c]])
         else:

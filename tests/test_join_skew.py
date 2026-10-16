@@ -30,6 +30,7 @@ def test_skewed_widest_column_falls_back_to_hashing_the_pair(monkeypatch):
         return out
 
     monkeypatch.setattr(join_engine, "_residual_split", spy)
+    monkeypatch.setenv("MXFRAME_STAR", "0")        # repeated keys on both sides: the star scan would expand them natively
     got = (LazyFrame(left).join(LazyFrame(right), on=["a", "b"])
            .groupby().agg(col("v").count().alias("n"), col("w").sum().alias("s")).compute(device="cpu"))
     con = duckdb.connect()
