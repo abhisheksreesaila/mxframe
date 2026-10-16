@@ -534,3 +534,7 @@ Needs: F-001, F-005..F-008
 - [x] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005): SF10 22/22; SF1 21/22 on the median of 4 fresh-process runs (single runs 17–21/22, only 2 of 4 reach 20; the misses move between runs, ±10% noise on 50–400 ms queries; the 3 extra runs started at load 2.8–4.4). Reaching it needed three fixes for auto's first-query overhead: a cheaper `_key_card` sample, lazy `calibration` imports, and background GPU work that waits for a 100 ms idle gap (before them SF1 was 12/22)
 - [x] full SF1 + SF10 user-felt run on an otherwise idle machine (2026-10-12 01:34, load1 0.13 at start, GPU 0 because GPU 1 drives the display): `docs/bench/final-sf1*.md`, `final-sf10.md`; summary and honest losses at the top of `docs/benchmarks.md`. All 132 mx results match DuckDB
 - [x] README `device="auto"` section with the real numbers; the README performance section now leads with the user-felt table, and the old synthetic warm-run tables are marked historical
+
+## F-075 GPU leak test independent of other processes [review]
+Asked 2026-10-16 (the test failed once in a full run while other processes held ~7.6 GB of GPU 0)
+- [x] `test_short_lived_threads_do_not_leak_device_memory` counts this process's own live device bytes (wrapped `malloc` / `free`) instead of `cuMemGetInfo` over the whole device; with `checkin` made to leak, it fails (229 MiB over 20 threads), restored it passes
