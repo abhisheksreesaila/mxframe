@@ -885,7 +885,7 @@ Found by the F-086 developer (2026-10-16)
 - [x] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
 - [x] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
 
-## F-093 MIN / MAX of a date column [review]
+## F-093 MIN / MAX of a date column [done]
 Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
