@@ -79,9 +79,13 @@ def query_running():
 
 
 def _yield_to_queries() -> None:
+    """Called before every chunk copy of a background upload: wait for running queries, and
+    abandon the upload once the process is exiting (F-063: exit waits at most one chunk)."""
     with _active_cv:
-        if _active:
-            _active_cv.wait_for(lambda: _active == 0, timeout=YIELD_MAX_S)
+        if _active and not _closing:
+            _active_cv.wait_for(lambda: _active == 0 or _closing, timeout=YIELD_MAX_S)
+    if _closing:
+        raise RuntimeError("process is exiting")
 _deferred: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_deferred", default=None)
 
 
@@ -107,6 +111,8 @@ def close_background(timeout: float) -> None:
     with _lock:
         _closing = True
         running = [t for t in _inflight.values() if t.is_alive()]
+    with _active_cv:
+        _active_cv.notify_all()
     deadline = time.monotonic() + timeout
     for t in running:
         t.join(max(0.0, deadline - time.monotonic()))

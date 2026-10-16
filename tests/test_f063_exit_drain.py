@@ -87,3 +87,18 @@ time.sleep(float(sys.argv[1]))
     with ThreadPoolExecutor(3) as ex:
         bad = [r for r in ex.map(one, range(300)) if r[1] != 0]
     assert not bad, bad
+
+
+def test_a_resident_upload_stops_at_its_next_chunk_once_exiting(monkeypatch):
+    """Exit waits for an upload at most one chunk: the per-chunk hook raises (the upload's
+    existing error path frees its device buffers), without waiting out a running query."""
+    import time
+    sys.path.insert(0, str(HERE))
+    import conftest  # noqa: F401
+    from mxframe import coproc_fused as cf
+    monkeypatch.setattr(cf, "_closing", True)
+    monkeypatch.setattr(cf, "_active", 1)          # a query is running: would wait YIELD_MAX_S
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="process is exiting"):
+        cf._yield_to_queries()
+    assert time.monotonic() - t0 < 0.5

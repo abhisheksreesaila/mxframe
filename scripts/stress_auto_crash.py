@@ -15,7 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNNER = ROOT / "tests" / "_tpch_runner.py"
-DATA = Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Projects/mxframe/data")) / "tpch_sf1_exact"
+DATA = Path(os.environ.get("MXFRAME_TPCH_DATA", ROOT / "data")) / "tpch_sf1_exact"
 
 
 def one(q, device, out):
