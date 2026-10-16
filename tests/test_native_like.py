@@ -137,6 +137,18 @@ def test_multi_chunk_and_sliced_plain_columns(layout):
             assert got == _duck_ids(t, "s", pattern, escape, negate)
 
 
+@pytest.mark.parametrize("negate", [False, True])
+def test_dictionary_column_with_nulls_falls_back_and_answers_like_duckdb(tab, negate):
+    """Known decline (F-074 notes): a dictionary column holding NULLs is not matched natively (the code
+    set has no NULL); the Python path answers, and the answer is DuckDB's."""
+    t = tab.set_column(2, "d", tab.column("s").dictionary_encode())
+    assert t.column("d").null_count > 0
+    pred = col("d").like("%b%")
+    got = _ids(t, ~pred if negate else pred)
+    assert nx.last_filter() == (None, "predicate not supported by the bytecode compiler")
+    assert got == _duck_ids(t, "d", "%b%", None, negate)
+
+
 def test_dictionary_columns_with_different_dictionaries_per_chunk():
     parts = [_table(n, seed, nulls=False) for n, seed in ((40_000, 8), (30_000, 9))]
     # re-encode every chunk on its own so the dictionaries differ

@@ -40,17 +40,14 @@ def _coverage(q, root, sql=False, sf="0.17"):
     return json.loads(lines[-1][6:])
 
 
-@pytest.mark.parametrize("q,allowed_declines", [
-    (7, set()),                                                  # renamed partner leaves keep their codes
-    (9, set()),                                                  # LIKE on part, a group key through with_columns
-    (20, set()),                                                 # startswith on part
-    (22, set()),                                                 # isin on a computed plain column + the balance test, one native filter
-])
-def test_query_runs_fully_native(data_root, q, allowed_declines):
+@pytest.mark.parametrize("q", range(1, 23))
+def test_query_runs_fully_native(data_root, q):
+    """All 22 DataFrame TPC-H queries (the 22/22 claim); Q16's wide key space is the one decline the
+    star scan + mx_execute answer natively."""
     r = _coverage(q, data_root)
     assert r["arrow"] == [], r
     assert all(p.startswith(NATIVE_PATHS) for p in r["paths"]), r["paths"]
-    assert set(r["declines"]) <= allowed_declines, r["declines"]
+    assert set(r["declines"]) <= {"group key space too wide for direct addressing"}, r["declines"]
 
 
 def test_sql_q2_suffix_like_runs_fully_native(data_root):
