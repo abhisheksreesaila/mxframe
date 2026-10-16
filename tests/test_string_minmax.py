@@ -192,15 +192,46 @@ def test_parquet_scan(tmp_path):
     assert _rows(got) == _duck("SELECT k, MAX(s) FROM t GROUP BY k", t=t)
 
 
+def _gpu_usable():
+    try:
+        import mxframe.custom_ops as co
+        return co._max_accelerator() is not None
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _gpu_usable(), reason="no usable GPU")
 def test_ranks_past_the_gpu_float32_limit_stay_off_the_gpu(monkeypatch):
     import mxframe.custom_ops as co
-    monkeypatch.setattr(co, "_GPU_EXACT_RANKS", 5)            # 12 distinct words > 5, like 2^24 + 1 strings
     t = _table()
-    lf = mx.sql("SELECT k, MIN(s) lo, MAX(s) hi FROM t GROUP BY k", t=t)
+    sql = "SELECT k, MIN(s) lo, MAX(s) hi FROM t GROUP BY k"
+    lf = mx.sql(sql, t=t)
+    lf.compute(device="gpu")
+    assert lf.last_compile_provenance["path"] == "fused_pipeline_gpu"      # unguarded: the GPU answers
+    monkeypatch.setattr(co, "_GPU_EXACT_RANKS", 5)            # 12 distinct words > 5, like 2^24 + 1 strings
+    lf = mx.sql(sql, t=t)
     got = lf.compute(device="gpu")
     assert _rows(got) == _duck("SELECT k, MIN(s), MAX(s) FROM t GROUP BY k", t=t)
     assert lf.last_compile_provenance["path"] == "native"      # the CPU executor, not fused_pipeline_gpu
-    monkeypatch.setattr(co, "_GPU_EXACT_RANKS", 1 << 24)
-    lf = mx.sql("SELECT k, MAX(s) hi FROM t GROUP BY k", t=t)
-    lf.compute(device="gpu")
-    assert "gpu" in lf.last_compile_provenance["path"] or lf.last_compile_provenance["device"] == "cpu"
+
+
+def test_numeric_min_max_over_a_join_runs_no_dry_run(monkeypatch):
+    from mxframe.lazy_frame import LazyFrame as LF
+    runs = []
+    real = LF.schema.fget
+    monkeypatch.setattr(LF, "schema", property(lambda self: (runs.append(1), real(self))[1]))
+    fact, part = _join_tables()
+    part = part.append_column("v", A(np.arange(part.num_rows, dtype=np.float64)))     # fact.v clashes: v_right
+    got = (LazyFrame(fact).join(LazyFrame(part), on="pk").groupby("g")
+           .agg(col("v_right").max().alias("hi"), col("v").min().alias("lo")).compute(device="cpu"))
+    assert _rows(got) == _duck("SELECT g, MAX(part.v), MIN(fact.v) FROM fact JOIN part USING (pk) GROUP BY g", fact=fact, part=part)
+    only_numbers = pa.table({"pk": part.column("pk"), "w": part.column("v")})
+    LazyFrame(fact).join(LazyFrame(only_numbers), on="pk").groupby("g").agg(col("w").max().alias("m")).compute(device="cpu")
+    assert runs == []
+
+
+def test_a_user_column_named_like_the_rank_column():
+    t = _table().append_column("__rank_s__", A(np.arange(120_000, dtype=np.int32)))
+    got, prov = _run(mx.sql("SELECT k, MAX(s) hi, MAX(__rank_s__) r FROM t GROUP BY k", t=t))
+    assert _rows(got) == _duck("SELECT k, MAX(s), MAX(__rank_s__) FROM t GROUP BY k", t=t)
+    assert prov["path"] == "native"

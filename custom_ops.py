@@ -1667,19 +1667,28 @@ class CustomOpsCompiler(GraphCompiler):
                 has_project[0] |= isinstance(p, Project)
                 walk(p.input)
         walk(agg.input)
+        def is_str(t):
+            t = t.value_type if pa.types.is_dictionary(t) else t
+            return pa.types.is_string(t) or pa.types.is_large_string(t)
+        any_string = any(is_str(f.type) for s in leaves for f in s.table.schema)
         schema = None
         strings = {}                                  # name -> the leaf Scans that hold it
         for c in wanted:
             held = [s for s in leaves if c in s.table.column_names]
             if held:
-                t = held[0].table.schema.field(c).type
-            else:                                     # a renamed copy (s_right) or a computed column
-                from .lazy_frame import LazyFrame
-                schema = schema or LazyFrame(agg.input).schema
-                t = schema.field(c).type if schema is not None and c in schema.names else pa.null()
-            if pa.types.is_dictionary(t):
-                t = t.value_type
-            if pa.types.is_string(t) or pa.types.is_large_string(t):
+                is_s = any(is_str(h.table.schema.field(c).type) for h in held)
+            else:                                     # a renamed copy (s_right), or a computed column
+                from .io_parquet import _renamed_ref
+                src = [s.table.schema.field(n).type for s in leaves for n in s.table.column_names if _renamed_ref(n, [c])]
+                if src:
+                    is_s = any(is_str(t) for t in src)
+                elif not any_string:                  # no string column anywhere: nothing to rank
+                    is_s = False
+                else:                                 # a computed column: its type needs a zero-row run
+                    from .lazy_frame import LazyFrame
+                    schema = schema or LazyFrame(agg.input).schema
+                    is_s = schema is not None and c in schema.names and is_str(schema.field(c).type)
+            if is_s:
                 strings[c] = held
         if not strings:
             return None
@@ -1691,7 +1700,14 @@ class CustomOpsCompiler(GraphCompiler):
         ranked, back = {}, {}
         for c in strings:
             ranked[c], back[c] = _rank_strings(next(s for s in leaves if c in s.table.column_names).table.column(c))
-        names = {c: f"__rank_{c}__" for c in strings}
+        taken = {n for s in leaves for n in s.table.column_names}
+        names = {}
+        for c in strings:                             # a name no column holds, whatever the user called theirs
+            n = f"__rank_{c}__"
+            while n in taken:
+                n += "_"
+            taken.add(n)
+            names[c] = n
 
         def add_ranks(p):
             if isinstance(p, Scan):
