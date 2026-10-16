@@ -17,6 +17,8 @@ plus, for the GPU, whatever is left of its start-up cost.
 
 from __future__ import annotations
 
+import atexit
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -200,7 +202,10 @@ class GpuWarmup:
 
     def start(self) -> "GpuWarmup":
         with self._lock:
-            if self._thread is None:
+            if self._thread is None and _closing:     # the process is exiting: never begin CUDA now
+                self.error, self._ok = RuntimeError("process is exiting"), False
+                self._done.set()
+            elif self._thread is None:
                 self._t0 = time.perf_counter()
                 self._thread = threading.Thread(target=self._run, name="mxframe-gpu-warmup", daemon=True)
                 self._thread.start()
@@ -700,6 +705,33 @@ class _NoGpu:
 _NO_GPU = _NoGpu()
 _warmup: Optional[GpuWarmup] = None
 _warmup_lock = threading.Lock()
+_closing = False
+
+
+def _close_background_gpu_work(timeout: float = 15.0) -> None:
+    """At interpreter exit: start no more background GPU work and wait for what is running.
+
+    Their threads are daemons, but a daemon thread inside a ctypes call into libcuda keeps
+    running while libc's `exit()` tears the driver (and its mutexes) down under it: glibc
+    asserts (-6) or the process segfaults (-11) about once in 75 runs of a short query on
+    `device="auto"` (F-063).  A run that exits before the warm-up starts waits for nothing.
+    """
+    global _closing
+    _closing = True
+    deadline = time.monotonic() + timeout
+    with _warmup_lock:
+        t = _warmup._thread if _warmup is not None else None
+    if t is not None and t.is_alive():
+        t.join(max(0.0, deadline - time.monotonic()))
+    cf = sys.modules.get(__package__ + ".coproc_fused")
+    if cf is not None:
+        cf.close_background(max(0.0, deadline - time.monotonic()))
+    wt = getattr(sys.modules.get(__package__), "_warm_thread", None)
+    if wt is not None and wt.is_alive():
+        wt.join(max(0.0, deadline - time.monotonic()))
+
+
+atexit.register(_close_background_gpu_work)
 
 
 def _init_gpu():
