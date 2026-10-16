@@ -9,11 +9,15 @@ work and the measurements that shaped it.
 
 > **Status:** the measurements on this page are from 2026-10-12, before the native Mojo
 > executor. Since F-053, a CPU decision under `device="auto"` runs the native executor exactly as
-> `device="cpu"` does; the older fused pipeline (which can split rows with the GPU) runs only when
-> the cost model predicts a split beats the native CPU executor, or when `gpu_fraction` forces one.
-> The model prices the native executor as equal to the older kernel (`auto_mode.NATIVE_CPU_FACTOR = 1.0`,
-> one warm measurement on a busy machine), so a split is chosen only if it beats that by 10%. The
-> numbers below have not been re-run; re-measuring auto is the open item of F-053 in [plan.md](plan.md).
+> `device="cpu"` does. Since F-057 a split is chosen only when (1) the split path can take the plan
+> (`pipeline_exec.split_check`, the same checks that path runs), (2) the query's columns are already
+> resident on the GPU (the first query runs native and queues the upload; a file's residency is keyed by
+> the file's identity, so each `scan_parquet` compute finds it), and (3) the calibrated price beats the faster
+> device alone by 10% after the GPU's 4.5 ms per call, the merge and a 5% CPU-contention allowance
+> (`coproc_fused.plan_split`; `explain` prints the numbers). The CPU share of a split runs on the native
+> executor. The model prices the native executor as equal to the older kernel
+> (`auto_mode.NATIVE_CPU_FACTOR = 1.0`). The numbers below have not been re-run; re-measuring auto on a
+> quiet machine is the open item of F-053 and F-057 in [plan.md](plan.md).
 
 All numbers below come from the reference machine: AMD Ryzen 9 5900X (24 threads,
 dual-channel DDR4) and an NVIDIA RTX 3090 on PCIe 4.0 x8, TPC-H data at scale factor 10.

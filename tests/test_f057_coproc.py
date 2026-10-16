@@ -496,3 +496,28 @@ def test_auto_splits_once_the_background_upload_has_landed():
         assert second.last_compile_provenance["path"] in ("fused_pipeline_split", "fused_pipeline_gpu_resident")
     finally:
         cf.MIN_UPLOAD_BYTES, cal.get_calibration = orig, real_cal
+
+
+@needs_gpu
+@needs_native
+@pytest.mark.parametrize("mode", [True, False])
+def test_the_cpu_share_runs_in_the_callers_reproducible_mode(monkeypatch, mode):
+    """The router's worker threads do not inherit the context variable behind `compute(reproducible=...)`
+    (F-064): the share must be told, or a reproducible query's CPU half would sum in the default order."""
+    t = data()
+    seen = []
+    real = nx.range_partials
+
+    def spy(*a, **k):
+        seen.append(nx.reproducible())
+        return real(*a, **k)
+
+    monkeypatch.setattr(nx, "range_partials", spy)
+    cf.clear_residency()
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        agg_query(LazyFrame(t)).compute(device="cpu", reproducible=mode)
+        cf.wait_for_uploads(30)
+        seen.clear()
+        got = agg_query(LazyFrame(t)).compute(device="cpu", reproducible=mode)
+    assert seen and set(seen) == {mode}
+    same(got, duck(GROUPED_SQL, t=t))
