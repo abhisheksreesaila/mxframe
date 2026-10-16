@@ -770,3 +770,13 @@ Needs: F-069 · Found in F-069 review (2026-10-16)
 Needs: — · Found in F-069 review (2026-10-16); a wrong answer on main before F-069
 - [ ] a float group key with a NULL declines the native path (correct) and the Arrow fallback kept -0.0 and 0.0 (and NaN payloads) as separate groups: 12 groups where DuckDB gives 10 (reproduced through a fused-join partner column). Either the native hashed path takes NULL keys (a NULL group, last in key order like DuckDB) or the fallback canonicalises -0.0 → 0.0 and NaN → one NaN before grouping
 - [ ] test: float key with NULL, -0.0, 0.0, NaN of two payloads, single table and fused partner column, equals DuckDB group count and values; fails before
+
+## F-078 COUNT(*) on a NULL group key counts the group's rows [todo]
+Found by the F-077 developer (2026-10-16); a silent wrong answer on main
+- [ ] SQL `SELECT k, count(*) ... GROUP BY k` with NULLs in `k` returns 0 for the NULL-key group where DuckDB returns its row count (2 in the probe). Find which path (the SQL front end's `count(*)` → a column count, or the NULL-key fallback) and fix at the root; `count(*)` counts rows on every path and device
+- [ ] DuckDB-checked tests: NULL key with count(*), count(col with NULLs), count(*) + sum, single table and through a join, cpu and gpu; fail before
+
+## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [todo]
+Found by the F-077 developer (2026-10-16); untested suspicion
+- [ ] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
+- [ ] DuckDB-checked tests over the key edge cases; fail before (or a test pinning that it already matches)
