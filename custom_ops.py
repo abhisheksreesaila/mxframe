@@ -328,37 +328,52 @@ def clear_cache():
 
 # ── Window-function helpers (module-level for reuse) ─────────────────────────
 
-def _min_skip_nan(arr):
-    ok = arr[~np.isnan(arr)]
-    return ok.min() if ok.size else np.nan
+def _min_skip_nan(ok):
+    """MIN over valid values: NaN is skipped unless every value is NaN (DuckDB, F-070)."""
+    real = ok[~np.isnan(ok)]
+    return real.min() if real.size else np.nan
 
 
-def _window_rank(arr: np.ndarray) -> np.ndarray:
-    """Standard competition ranking: ties share rank, gaps follow (1,2,2,4…)."""
-    order = np.argsort(arr, kind="stable")
-    ranks = np.empty(len(arr), dtype=np.float64)
-    i = 0
-    while i < len(arr):
-        j = i + 1
-        while j < len(arr) and arr[order[j]] == arr[order[i]]:
-            j += 1
-        for k in range(i, j):
-            ranks[order[k]] = float(i + 1)
-        i = j
-    return ranks
+def _cum_sum_skip_null(arr, valid):
+    """Running sum over valid values: NULL until the first valid one, then carried on (NaN
+    propagates). Returns (values, null mask)."""
+    return np.cumsum(np.where(valid, arr, 0.0)), np.cumsum(valid) == 0
 
 
-def _window_dense_rank(arr: np.ndarray) -> np.ndarray:
-    """Dense ranking: ties share rank with no gaps (1,2,2,3…)."""
-    order = np.argsort(arr, kind="stable")
-    ranks = np.empty(len(arr), dtype=np.float64)
-    cur, last = 1, None
-    for idx in order:
-        if last is not None and arr[idx] != last:
-            cur += 1
-        ranks[idx] = float(cur)
-        last = arr[idx]
-    return ranks
+def _order_codes(a, descending: bool = False) -> np.ndarray:
+    """int64 sort code per row, equal for rows that tie in a window ORDER BY like DuckDB: NaN is the
+    largest value (so first under DESC), -0.0 ties with 0.0, NULL is last in both directions and
+    NULLs tie with each other (F-084)."""
+    a = _combine(a)
+    if pa.types.is_dictionary(a.type):
+        a = a.dictionary_decode()
+    valid = _np_of(pc.is_valid(a))
+    codes = np.zeros(len(a), dtype=np.int64)
+    if a.type in (pa.float32(), pa.float64()):
+        x = _np_of(pc.fill_null(_canonical_floats(a), _npscalar(0, type=a.type)))
+        uniq, inv = np.unique(x[valid], return_inverse=True)     # NaN sorts last and merges
+        k = len(uniq)
+        codes[valid] = inv.reshape(-1)
+    else:
+        dense = _np_of(pc.rank(a, sort_keys="ascending", null_placement="at_end", tiebreaker="dense"))
+        k = int(dense[valid].max()) if valid.any() else 0
+        codes[valid] = dense[valid].astype(np.int64) - 1
+    if descending:
+        codes[valid] = k - 1 - codes[valid]
+    codes[~valid] = k
+    return codes
+
+
+def _window_rank(a, descending: bool = False) -> np.ndarray:
+    """Standard competition ranking: ties share rank, gaps follow (1,2,2,4...)."""
+    codes = _order_codes(a, descending)
+    return (np.searchsorted(np.sort(codes), codes, side="left") + 1).astype(np.float64)
+
+
+def _window_dense_rank(a, descending: bool = False) -> np.ndarray:
+    """Dense ranking: ties share rank with no gaps (1,2,2,3...)."""
+    _, inv = np.unique(_order_codes(a, descending), return_inverse=True)
+    return (inv.reshape(-1) + 1).astype(np.float64)
 
 
 class CustomOpsCompiler(GraphCompiler):
@@ -781,14 +796,13 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
         if op == "rank":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            return _npa(_window_rank(arr))
+            return _npa(_window_rank(self._eval_expr_arrow(args[0], table)))
         if op == "dense_rank":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            return _npa(_window_dense_rank(arr))
+            return _npa(_window_dense_rank(self._eval_expr_arrow(args[0], table)))
         if op == "cum_sum":
-            arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
-            return _npa(np.cumsum(arr))
+            a = self._eval_expr_arrow(args[0], table)
+            out, nul = _cum_sum_skip_null(_np_of(a, zero_copy_only=False).astype(np.float64), _np_of(pc.is_valid(a)))
+            return _npa(np.ma.array(out, mask=nul)) if nul.any() else _npa(out)
         if op == "lag":
             arr = _np_of(self._eval_expr_arrow(args[0], table), zero_copy_only=False).astype(np.float64)
             n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
@@ -1363,38 +1377,50 @@ class CustomOpsCompiler(GraphCompiler):
         else:
             groups = {(): list(range(n))}
 
+        okeys = [_order_codes(table.column(c), descending) for c in order_by] if order_by else []
+        null_out = np.zeros(n, dtype=bool)          # rows whose window value is NULL
+
+        def values(e, sub):
+            a = self._eval_expr_arrow(e, sub)
+            return _np_of(a, zero_copy_only=False).astype(np.float64), _np_of(pc.is_valid(a))
+
         for row_indices in groups.values():
-            sub = pc.take(table, _npa(np.asarray(row_indices, dtype=np.int64)))
-            if order_by:
-                sort_keys = [(c, "descending" if descending else "ascending")
-                             for c in order_by]
-                perm = pc.sort_indices(sub, sort_keys=sort_keys).to_pylist()
-                sub = pc.take(sub, perm)
-                ordered_indices = [row_indices[i] for i in perm]
-            else:
-                ordered_indices = row_indices
+            ri = np.asarray(row_indices, dtype=np.int64)
+            if okeys:
+                ri = ri[np.lexsort([k[ri] for k in reversed(okeys)])]    # stable: ties keep row order
+            sub = pc.take(table, _npa(ri))
+            ordered_indices = ri
 
             op   = inner_expr.op
             args = inner_expr.args
             m    = len(ordered_indices)
 
-            if op in ("sum", "mean", "min", "max"):
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                if   op == "sum":  val = np.full(m, arr.sum())
-                elif op == "mean": val = np.full(m, arr.mean() if m else np.nan)
-                elif op == "min":  val = np.full(m, _min_skip_nan(arr))   # DuckDB: MIN skips NaN
-                elif op == "max":  val = np.full(m, arr.max() if m else np.nan)   # MAX is NaN if any is (numpy propagates)
+            if op in ("min", "max"):
+                arr, valid = values(args[0], sub)
+                ok = arr[valid]                          # NULL is not NaN: aggregate valid values only
+                if ok.size == 0:
+                    val = np.zeros(m)
+                    null_out[ordered_indices] = True
+                else:                                    # MAX is NaN if any is (numpy propagates)
+                    val = np.full(m, _min_skip_nan(ok) if op == "min" else ok.max())
+            elif op in ("sum", "mean"):
+                arr, valid = values(args[0], sub)
+                ok = arr[valid]                          # NULLs are skipped; none valid gives NULL
+                if ok.size == 0:
+                    val = np.zeros(m)
+                    null_out[ordered_indices] = True
+                else:
+                    val = np.full(m, ok.sum() if op == "sum" else ok.mean())
             elif op == "rank":
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = _window_rank(arr)
+                val = _window_rank(self._eval_expr_arrow(args[0], sub), descending)
             elif op == "dense_rank":
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = _window_dense_rank(arr)
+                val = _window_dense_rank(self._eval_expr_arrow(args[0], sub), descending)
             elif op == "row_number":
                 val = np.arange(1, m + 1, dtype=np.float64)
             elif op == "cum_sum":
-                arr = _np_of(self._eval_expr_arrow(args[0], sub), zero_copy_only=False).astype(np.float64)
-                val = np.cumsum(arr)
+                arr, valid = values(args[0], sub)
+                val, nul = _cum_sum_skip_null(arr, valid)
+                null_out[ordered_indices[nul]] = True
             elif op == "lag":
                 n_shift = int(args[1]) if len(args) > 1 and args[1] is not None else 1
                 fill    = args[2] if len(args) > 2 else None
@@ -1414,9 +1440,10 @@ class CustomOpsCompiler(GraphCompiler):
                     f"_eval_window_arrow: unsupported inner op '{op}'"
                 )
 
-            for i, orig_i in enumerate(ordered_indices):
-                result[orig_i] = val[i]
+            result[ordered_indices] = val
 
+        if null_out.any():
+            return _npa(np.ma.array(result, mask=null_out))
         return _npa(result, type=pa.float64())
 
     def _compute_cache_key(self, plan, all_names, all_arrays, n_groups, optimizer_trace=None):
@@ -2012,8 +2039,17 @@ class CustomOpsCompiler(GraphCompiler):
 
     def compile_and_run(self, plan, verbose=False, optimizer_trace=None) -> pa.Table:
         """Run ``plan``; the result of ``count`` aggregates is always exact int64."""
+        # F-083: a column-only Project above Sort / Limit just drops the sort keys the SELECT list
+        # leaves out. Run the Sort / Limit as post-ops (the top-n paths need them at the top), then pick.
+        keep = None
+        if isinstance(plan, Project) and isinstance(plan.input, (Sort, Limit)) \
+                and all(e.op == "col" for e in plan.exprs):
+            keep, plan = plan.exprs, plan.input
         result = self._compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
-        return self._exact_counts(plan, result)
+        result = self._exact_counts(plan, result)
+        if keep is not None:
+            result = result.select([e.args[0] for e in keep]).rename_columns([e._alias or e.args[0] for e in keep])
+        return result
 
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:
@@ -3014,9 +3050,9 @@ class CustomOpsCompiler(GraphCompiler):
         N = len(composite_key)
         k = topk if topk is not None and topk < N else N
 
-        if self._session_device != "gpu" or N == 0 or self._aot_gpu is None:
-            # CPU fast path: numpy argsort, no graph compilation (also for empty tables, where
-            # there is nothing to upload, and when the GPU AOT library is unavailable)
+        if self._session_device != "gpu" or N == 0 or k == 0 or self._aot_gpu is None:
+            # CPU fast path: numpy argsort, no graph compilation (also for empty tables and LIMIT 0, where
+            # there is nothing to upload or allocate (cuMemAlloc(0) fails), and when the GPU AOT library is unavailable)
             if k < N:
                 # Partial sort: np.argpartition + sort of k elements
                 part_idx = np.argpartition(composite_key, k)[:k]
@@ -3616,6 +3652,7 @@ class CustomOpsCompiler(GraphCompiler):
                         f"{right_name}={right_arr.type}"
                     )
                 left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
+            left_arr, right_arr = _canonical_floats(left_arr), _canonical_floats(right_arr)   # F-079
 
             if (
                 len(left_cols) == 1

@@ -328,7 +328,8 @@ def canonical_floats(a):
         return a
     dt = np.dtype(np.float32 if a.type == pa.float32() else np.float64)
     x = np.frombuffer(a.buffers()[1], dtype=dt, count=a.offset + len(a))
-    out = x + dt.type(0)                                    # -0.0 + 0.0 is 0.0 (a new array)
+    with np.errstate(invalid="ignore"):                     # a signalling NaN raises "invalid" here
+        out = x + dt.type(0)                                # -0.0 + 0.0 is 0.0 (a new array)
     nan = np.isnan(x)
     if nan.any():
         out[nan] = dt.type("nan")

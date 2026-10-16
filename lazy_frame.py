@@ -443,6 +443,13 @@ class LazyFrame:
             descending: bool or list of bool. If a single bool, applied to all keys.
         """
         parsed_by = [col(b) if isinstance(b, str) else b for b in by]
+        if isinstance(self.plan, Project):             # select() dropped the columns it does not list
+            have = [e._alias or (e.args[0] if e.op == "col" else None) for e in self.plan.exprs]
+            if None not in have:
+                for b in parsed_by:
+                    if b.op == "col" and b.args[0] not in have:
+                        raise ValueError(f"cannot sort by column {b.args[0]!r}: select() did not keep it "
+                                         f"(columns here: {have}); sort before select")
         if isinstance(descending, bool):
             desc_list = [descending] * len(parsed_by)
         else:

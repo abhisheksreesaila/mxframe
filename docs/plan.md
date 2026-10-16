@@ -784,10 +784,10 @@ Found by the F-077 developer (2026-10-16); a silent wrong answer on main
 - [x] root cause: the SQL front end translated `COUNT(*)` to `col(<first in-scope column>).count()`, which skips NULLs (a global count(*) also lost rows with a NULL first column); it is now `lit(1).count()`, the form every path already treats as count(*); no kernel change. SQL `SELECT k, count(*) ... GROUP BY k` with NULLs in `k` returns 0 for the NULL-key group where DuckDB returns its row count (2 in the probe). Find which path (the SQL front end's `count(*)` → a column count, or the NULL-key fallback) and fix at the root; `count(*)` counts rows on every path and device
 - [x] `tests/test_f078_count_star.py` (34 cases, 33 failed before the fix): DuckDB-checked, NULL key with count(*), count(col with NULLs), count(*) + sum, single table and through a join, cpu and gpu; fail before
 
-## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [todo]
+## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [done]
 Found by the F-077 developer (2026-10-16); untested suspicion
-- [ ] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
-- [ ] DuckDB-checked tests over the key edge cases; fail before (or a test pinning that it already matches)
+- [x] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
+- [x] DuckDB-checked tests over the key edge cases (tests/test_float_key_joins.py, 78 of 83 fail before); fail before (or a test pinning that it already matches)
 
 ## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q22 [todo]
 Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (2026-10-16, after F-072): 15 of 22 SQL queries have no decline and no Arrow work over 1,000 rows; Q8 ("nothing to filter") and Q15 ("empty input") only show trivial declines and do no Arrow work. The DataFrame forms are 22/22, so each gap is in how the SQL front end phrases the plan
@@ -807,18 +807,26 @@ Found by the F-070 developer (2026-10-16); a silent wrong answer
 - [ ] with `MXFRAME_NATIVE=0` on 200,000 rows, `fused_pipeline_cpu` reads the denormal 5e-324 as 0 (`x > 0.0` counts 0 of 100,000): a flush-to-zero / denormals-are-zero mode in the CPU pipeline kernel (or its compile flags). Find where FTZ/DAZ is set; every CPU and GPU path compares and sums denormals like DuckDB
 - [ ] DuckDB-checked tests: filters and sums over denormals (5e-324, 2.2e-308), each CPU path forced (native, fused pipeline, Arrow) and GPU; fails before
 
-## F-083 ORDER BY a column not in the select list [todo]
+## F-083 ORDER BY a column not in the select list [done]
 Found by the F-070 developer (2026-10-16)
-- [ ] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
-- [ ] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
+- [x] SQL `SELECT a FROM t ORDER BY b` raises KeyError; DuckDB sorts by `b` and returns `a`. Sort before the final projection (or carry `b` and drop it after), DataFrame and SQL
+- [x] DuckDB-checked tests incl. ORDER BY an expression not selected, with LIMIT, over a group-by (ORDER BY an aggregate not selected); fails before
 
-## F-084 Window functions: NULL values, NaN ties and DESC order like DuckDB [todo]
+## F-084 Window functions: NULL values, NaN ties and DESC order like DuckDB [done]
 Found by the F-081 review (2026-10-16); silent wrong answers on main before F-081
-- [ ] window min / max turn values to float64 first, so a NULL value becomes NaN: `max` over `[NULL, 2, 5]` gives NaN (DuckDB 5), an all-NULL partition gives NaN (DuckDB NULL); min skips NULL only through the NaN rule. Aggregate over the valid values, NULL when none
-- [ ] `_window_rank` ties rows with `==`, so tied NaNs rank apart: rank of `[nan, 1, nan, 2]` is `[3, 1, 4, 2]`, DuckDB `[3, 1, 3, 2]` (rank and dense_rank); tie through the canonical codes (`np_arrow.canonical_floats`)
-- [ ] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
-- [ ] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decide and document if not
-- [ ] DuckDB-checked tests for each; fail before
+- [x] window min / max turn values to float64 first, so a NULL value becomes NaN: `max` over `[NULL, 2, 5]` gives NaN (DuckDB 5), an all-NULL partition gives NaN (DuckDB NULL); min skips NULL only through the NaN rule. Aggregate over the valid values, NULL when none
+- [x] `_window_rank` ties rows with `==`, so tied NaNs rank apart: rank of `[nan, 1, nan, 2]` is `[3, 1, 4, 2]`, DuckDB `[3, 1, 3, 2]` (rank and dense_rank); tie through the canonical codes (`np_arrow.canonical_floats`)
+- [x] ORDER BY ... DESC inside a window puts NaN last (Arrow `sort_indices` puts NaN at the end both ways); DuckDB treats NaN as the largest value, first under DESC (row_number, rank, running sums differ)
+- [x] window results keep integer dtype where DuckDB does (int max returns 4.0 where DuckDB returns 4); decided: stay float64, documented in docs/api.md (DuckDB gives int64 rank, int min/max, decimal sum)
+- [x] window sum, mean and cum_sum turned a NULL value into NaN (silent wrong answer, added at review): skip NULLs, NULL when none valid, running sum NULL until the first valid value, NaN among valid values propagates; `count` is not a window op here
+- [x] DuckDB-checked tests for each; fail before
+
+## F-085 ORDER BY + LIMIT inside an IN / NOT IN subquery is dropped [done]
+Found by the F-083 review (2026-10-16); a silent wrong answer, also on main
+- [x] `WHERE i IN (SELECT i FROM t ORDER BY i DESC LIMIT 5)` returned 0..4 where DuckDB returns 45..49: the uncorrelated IN / NOT IN build side dropped the subquery ORDER BY and kept its LIMIT. It now keeps the ORDER BY when there is a LIMIT. Correlated IN, EXISTS and scalar subqueries reject LIMIT already (raise), so they never gave a wrong answer
+- [x] DuckDB-checked tests (`tests/test_sql_subquery_order_limit.py`): DESC, multi-key with ties, hidden sort key (F-083), WHERE in the subquery, alias, NOT IN, join to another table, outer LIMIT; fail before
+
+- F-083 note: the DataFrame side sorts before select (`f.sort("b").select("a")`); `select("a").sort("b")` raises a ValueError naming the column. A hidden-key Project above Sort/Limit is applied after the post-ops in `CustomOpsCompiler.compile_and_run`, so the top-n paths still see Sort + Limit.
 
 ## F-086 SQL IS NULL / IS NOT NULL [review]
 Found by the F-079 developer and the F-083 review (2026-10-16)
@@ -826,3 +834,59 @@ Found by the F-079 developer and the F-083 review (2026-10-16)
 - [x] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
 - Built (2026-10-16): new `Expr.is_null()` op (the engine had none; `~x.is_null()` is IS NOT NULL), evaluated by Arrow in `compiler._eval_predicate` and `custom_ops._eval_expr_arrow`; SQL `IS [NOT] NULL`, `IS [NOT] TRUE / FALSE`, `IS [NOT] DISTINCT FROM` (`sql_frontend._is`). `LEFT JOIN u ... WHERE u.k IS NULL` works through a marker column on the right side (the join drops the right key). `tests/test_sql_is_null.py`: 204 cases, all fail on main, cpu and gpu, 60 and 150k rows, plus a Parquet scan.
 - [ ] Follow-up (needs .mojo, so not done here): the native bytecode filter declines every column with NULLs and has no validity test, so `IS NULL` filters run on the Arrow path; add an OP that reads the validity bitmap. Also not done: `IS NULL` inside a JOIN ... ON condition; `IS DISTINCT FROM` on floats treats NaN != NaN (DuckDB: equal); `SELECT *` over a LEFT JOIN with an `IS NULL` test on its key also returns the marker column `__m_<alias>`
+
+## F-087 SQL OFFSET is ignored [todo]
+Found by the F-083 review (2026-10-16); a silent wrong answer on main
+- [ ] `ORDER BY c, i LIMIT 3 OFFSET 2` returns the first 3 rows (OFFSET dropped), top level and in subqueries (`IN (... LIMIT 5 OFFSET 2)`). Support OFFSET (slice after the sort, before / with LIMIT; top-n keeps `limit + offset` rows), or raise until then; never drop it
+- [ ] DuckDB-checked tests: OFFSET with and without LIMIT, with ORDER BY ties broken by a unique key, hidden sort key, in IN / FROM subqueries and CTEs, OFFSET past the end; fails before
+
+## F-088 SELECT *, expr returns only the expression [todo]
+Found by the F-083 review (2026-10-16); a silent wrong answer on main
+- [ ] `SELECT *, a+1 AS x FROM t` returns only `x`; DuckDB returns every column then `x`. Expand `*` in place among other select items (and `t.*`), with or without ORDER BY (F-083 made the ORDER BY form raise; replace that error with the real expansion)
+- [ ] DuckDB-checked tests: `*, expr`, `expr, *`, `t.*, u.c` over a join, with WHERE / ORDER BY / LIMIT, name clash between `*` and an alias; fails before
+
+## F-089 GPU ORDER BY ... LIMIT 0 crashes [done]
+Found by the F-083 review (2026-10-16)
+- [x] on `device="gpu"`, `... ORDER BY ... LIMIT 0` raises `cuMemAlloc(0) failed` (any key, on main too). LIMIT 0 (and any empty input to a GPU sort / top-n) returns an empty table with the right schema without allocating
+- [x] tests: LIMIT 0 and empty input on gpu and auto, schema equal to the cpu result; fails before
+
+- Review (2026-10-16): PASS. Follow-up fixed in the main session: `AOTKernelsGPU.gather_table` with no indices launched a 0-block grid (`gather_i32_gpu failed with status -1`); it returns `table.slice(0, 0)` now (`test_gather_table_with_no_indices_returns_an_empty_table`, fails before). Other per-`n` GPU wrappers in `aot_kernels.py` can launch 0 blocks the same way; no query shape reaches them with n = 0 today
+## F-090 IN (SELECT max(i) ...) join key types differ [todo]
+Found by the F-083 review (2026-10-16)
+- [ ] `i IN (SELECT max(i) FROM t GROUP BY a)` raises "join key types differ: int64 and double": the aggregate's int max comes back as double (window / aggregate result typed float64, see F-084 dtype note) or the semi-join key cast is missing. Integer MIN / MAX keep the integer type (DuckDB), and semi / anti join keys of int vs float compare by value like DuckDB
+- [ ] DuckDB-checked tests: IN / NOT IN over max / min / sum / count subqueries against int and float columns; fails before
+
+## F-091 Window lag / lead: NULL stays NULL [todo]
+Found by the F-084 review (2026-10-16); a silent wrong answer on main
+- [ ] `lag(v)` over `[1, NULL, 3]` gives `[nan, 1.0, nan]`; DuckDB `[NULL, 1.0, NULL]`: lag / lead turn NULL into NaN and fill with NaN. Shift the Arrow array with its validity (fill NULL, or the given default); keep the input dtype
+- [ ] DuckDB-checked tests: lag / lead with offsets 1 and 2, defaults, partitions, ORDER BY with NaN / NULL keys (F-084 order), int / float / string columns; fails before
+
+## F-092 mx.sql over a scan_parquet frame crashes [todo]
+Found by the F-086 developer (2026-10-16)
+- [ ] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
+- [ ] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
+
+## F-093 MIN / MAX of a date column [todo]
+Found by the F-086 developer (2026-10-16)
+- [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
+- [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+
+## F-094 SQL modulo operator [todo]
+Found by the F-087 developer (2026-10-16)
+- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+
+## F-095 SQL over tables with uppercase or quoted column names [todo]
+Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
+- [ ] the SQL front end lowercases identifiers; a table with `CustomerID` or `"Order Date"` columns may fail to resolve (or resolve wrongly when two names differ only by case). Probe DuckDB's rules (unquoted identifiers are case-insensitive, quoted are case-sensitive; output keeps the source column's case) and match them on every SQL path (SELECT, `*`, WHERE, GROUP BY, ORDER BY, JOIN ON / USING, subqueries)
+- [ ] DuckDB-checked tests over tables whose names have uppercase, spaces, and a case-only clash; fails before where wrong
+
+## F-096 SQL JOIN ON an expression [todo]
+Found by the F-087 developer (2026-10-16)
+- [ ] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
+- [ ] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
+
+## F-097 IS NULL skips row groups with no NULLs [todo]
+From the F-086 review (2026-10-16); a speedup, not a bug
+- [ ] `scan_parquet` never pushes `is_null` / `not is_null`: a row group whose `null_count` is 0 can be skipped for IS NULL (and one whose `null_count == num_values` for IS NOT NULL); a missing `null_count` statistic must never skip. Native validity test in the bytecode filter (so IS NULL filters stay native) belongs here too
+- [ ] tests: row groups skipped (counted), missing statistics not skipped, answers equal DuckDB; fails before

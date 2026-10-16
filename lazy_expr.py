@@ -125,7 +125,7 @@ class Expr:
         return Expr("window", self, spec)
 
     def rank(self) -> 'Expr':
-        """Rank in ascending order (ties share same rank, gaps follow: 1,2,2,4…)."""
+        """Rank within the window order (ascending, or descending with `over(descending=True)`) (ties share same rank, gaps follow: 1,2,2,4…)."""
         return Expr("rank", self)
 
     def dense_rank(self) -> 'Expr':

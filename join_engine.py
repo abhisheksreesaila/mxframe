@@ -28,7 +28,7 @@ from ._lazy_pc import pc
 
 from .lazy_frame import (join_output_names, Scan, Filter, Project, Aggregate, Sort, Limit,
                          Distinct, Tail, Join)
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, canonical_floats as _canonical_floats
 from .optimizer import _output_columns as plan_columns
 
 
@@ -485,6 +485,7 @@ def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
             if common is None:
                 raise TypeError(f"join key types differ: {la.type} and {ra.type}")
             la, ra = pc.cast(la, common), pc.cast(ra, common)
+        la, ra = _canonical_floats(la), _canonical_floats(ra)     # -0.0 = 0.0, one NaN: SQL key equality (F-079)
         enc = pc.dictionary_encode(pa.concat_arrays([la, ra]))
         codes = _np_of(pc.fill_null(enc.indices, _npscalar(-1, type=enc.indices.type)),
                        zero_copy_only=False).astype(np.int64)
