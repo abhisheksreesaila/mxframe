@@ -9,9 +9,15 @@ Supports a large subset of TPC-H-style SQL:
   Aggregates: SUM AVG MIN MAX COUNT(*) COUNT(DISTINCT x), arithmetic on aggregates, HAVING, GROUP BY ALL
   CASE WHEN ... THEN ... ELSE ... END
   INNER / LEFT JOIN ... ON ...
+  WITH name AS (...), derived tables (FROM (SELECT ...) AS d)
+  Subqueries (F-065): a scalar subquery in WHERE / HAVING / SELECT expressions; x [NOT] IN (SELECT ...) and
+  [NOT] EXISTS (SELECT ...) as top-level AND conditions of WHERE (semi / anti joins); a correlated scalar
+  comparison in WHERE (join + aggregate). Other forms raise NotImplementedError naming the form.
 """
 
 __all__ = ["sql"]
+
+import itertools
 
 import pyarrow as pa
 import sqlglot
@@ -80,8 +86,45 @@ _AGG_NAMES = {sge.Sum: "sum", sge.Avg: "avg", sge.Min: "min", sge.Max: "max", sg
 
 def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
     """The outermost aggregate calls in ``e`` (window functions are left to ``_expr``, which refuses them)."""
-    return [n for n in e.walk(prune=lambda n: isinstance(n, (sge.AggFunc, sge.Window)))
+    return [n for n in e.walk(prune=lambda n: isinstance(n, (sge.AggFunc, sge.Window, sge.Subquery, sge.Exists)))
             if isinstance(n, sge.AggFunc)]
+
+
+_COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+
+
+def _unparen(n: sge.Expression) -> sge.Expression:
+    while isinstance(n, sge.Paren):
+        n = n.this
+    return n
+
+
+def _conjuncts(n: sge.Expression) -> List[sge.Expression]:
+    """The conditions joined by AND at the top of ``n``."""
+    n = _unparen(n)
+    return _conjuncts(n.this) + _conjuncts(n.expression) if isinstance(n, sge.And) else [n]
+
+
+def _and_all(nodes: List[sge.Expression]) -> Optional[sge.Expression]:
+    out = None
+    for n in nodes:
+        out = n if out is None else sge.And(this=out, expression=n)
+    return out
+
+
+def _alias(node: sge.Expression, name: str) -> sge.Alias:
+    return sge.Alias(this=node.copy(), alias=sge.to_identifier(name))
+
+
+def _unsupported_shape(sel: sge.Expression, what: str, keys=("group", "having", "limit", "distinct", "offset", "qualify")):
+    """``what`` needs a subquery without these clauses (they change which rows a join would see)."""
+    names = {"group": "GROUP BY", "having": "HAVING", "limit": "LIMIT", "distinct": "DISTINCT",
+             "offset": "OFFSET", "qualify": "QUALIFY"}
+    for k in keys:
+        if sel.args.get(k):
+            raise NotImplementedError(f"{what}: {names[k]} in the subquery is not supported")
+    if _aggs_in(sge.Tuple(expressions=list(sel.expressions))):
+        raise NotImplementedError(f"{what}: an aggregate in the subquery's SELECT is not supported")
 
 
 def _default_agg_name(node: sge.Expression) -> str:
@@ -152,6 +195,17 @@ class _SQLTranslator:
         self._agg_names: dict = {}
         self._key_names_list: List[Expr] = []
         self._cd = None             # (argument, output name) of the one COUNT(DISTINCT x)
+        # WITH names -> their plans; unique names for the columns a decorrelated subquery adds
+        self._ctes: Dict[str, LogicalPlan] = {}
+        self._ids = itertools.count()
+        self._has_star = False
+
+    def _child(self) -> "_SQLTranslator":
+        """A translator for a subquery: its own state, the same tables and WITH names."""
+        c = _SQLTranslator(self._tables)
+        c._ctes = dict(self._ctes)
+        c._ids = self._ids
+        return c
 
     # ------------------------------------------------------------------
     # top-level dispatch
@@ -165,6 +219,11 @@ class _SQLTranslator:
         return LazyFrame(plan)
 
     def _build_select(self, node: sge.Select) -> LogicalPlan:
+        if not isinstance(node, sge.Select):
+            raise NotImplementedError(f"{type(node).__name__} (UNION / INTERSECT / EXCEPT) is not supported, only SELECT")
+        self._register_ctes(node.args.get("with_"))
+        self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
+
         # 1. FROM + JOINs
         plan = self._build_from(node)
 
@@ -173,7 +232,7 @@ class _SQLTranslator:
         if where:
             if _aggs_in(where.this):
                 raise ValueError("aggregate functions are not allowed in WHERE (use HAVING)")
-            plan = Filter(plan, self._expr(where.this))
+            plan = self._where(plan, where.this)
 
         for o in (node.args.get("order").expressions if node.args.get("order") else []):
             if o.args.get("nulls_first"):
@@ -292,18 +351,48 @@ class _SQLTranslator:
                 return any(name in cols for _, cols in self._table_cols[:i])
         return False
 
-    def _scan(self, table_node: sge.Expression) -> LogicalPlan:
+    def _source(self, table_node: sge.Expression):
+        """(plan, column names) of a FROM item: a WITH name, a table, or a derived table (SELECT ...)."""
+        from .optimizer import _output_columns
+        if isinstance(table_node, sge.Subquery):
+            plan = self._child()._build_select(table_node.this)
+            cols = _output_columns(plan)
+            if cols is None:
+                raise ValueError("every column of a derived table needs a name (give it an alias)")
+            return plan, cols
         if not isinstance(table_node, sge.Table):
             raise ValueError(f"Unsupported FROM target: {type(table_node).__name__}")
         name = table_node.name.lower()
+        if name in self._ctes:
+            plan = self._ctes[name]
+            cols = _output_columns(plan)
+            if cols is None:
+                raise ValueError(f"every column of WITH {name} needs a name (give it an alias)")
+            return plan, cols
         if name not in self._tables:
-            avail = list(self._tables.keys())
+            avail = list(self._tables.keys()) + list(self._ctes)
             raise ValueError(f"Unknown table {name!r}. Available: {avail}")
         tbl = self._tables[name]
-        self._scope_columns.extend(tbl.schema.names)
-        alias = table_node.alias_or_name.lower()
-        self._table_cols.append((alias, {c.lower() for c in tbl.schema.names}))
         return Scan(tbl), tbl.schema.names
+
+    def _scan(self, table_node: sge.Expression) -> LogicalPlan:
+        plan, cols = self._source(table_node)
+        self._scope_columns.extend(cols)
+        alias = table_node.alias_or_name.lower()
+        self._table_cols.append((alias, {c.lower() for c in cols}))
+        return plan, cols
+
+    def _register_ctes(self, with_node) -> None:
+        if with_node is None:
+            return
+        if with_node.args.get("recursive"):
+            raise NotImplementedError("WITH RECURSIVE is not supported")
+        for cte in with_node.expressions:
+            alias = cte.args["alias"]
+            if alias.args.get("columns"):
+                raise NotImplementedError("a column list on a WITH name (WITH a(x, y) AS ...) is not supported: "
+                                          "name the columns in the SELECT")
+            self._ctes[alias.name.lower()] = self._child()._build_select(cte.this)
 
     def _parse_join_on(self, on_expr: sge.Expression,
                        left_schema: set = None, right_schema: set = None):
@@ -334,6 +423,227 @@ class _SQLTranslator:
     # ------------------------------------------------------------------
     # aggregate building
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # subqueries (F-065): see the module docstring for the forms
+    # ------------------------------------------------------------------
+
+    def _scope_of(self, sel: sge.Select) -> List[tuple]:
+        """(alias, column names) of every FROM item of a subquery."""
+        items = []
+        if sel.args.get("from_") is not None:
+            items.append(sel.args["from_"].this)
+        items += [j.this for j in sel.args.get("joins") or []]
+        return [(it.alias_or_name.lower(), {c.lower() for c in self._child()._source(it)[1]}) for it in items]
+
+    def _outer_refs(self, node: sge.Expression, scope: List[tuple]) -> List[sge.Column]:
+        """The columns in ``node`` that the subquery's own FROM (``scope``) does not provide: they belong to
+        this query (a correlated reference). Columns of subqueries nested in ``node`` are theirs to resolve."""
+        mine = {a for a, _ in self._table_cols}
+        aliases = {a for a, _ in scope}
+        inner_cols = set().union(*[c for _, c in scope]) if scope else set()
+        out = []
+        for c in node.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists))):
+            if not isinstance(c, sge.Column):
+                continue
+            if c.table:
+                if c.table.lower() in aliases:
+                    continue
+                known = c.table.lower() in mine
+            else:
+                if c.name.lower() in inner_cols:
+                    continue
+                known = c.name.lower() in {x.lower() for x in self._scope_columns}
+            if not known:
+                raise ValueError(f"unknown column {c.sql(dialect='duckdb')} in a subquery")
+            out.append(c)
+        return out
+
+    def _correlation(self, sel: sge.Select, what: str):
+        """Split a subquery's WHERE into ([(outer column, inner expression)], [inner-only conditions]): the
+        equalities ``inner = outer`` become join keys. Any other reference to this query's columns raises."""
+        scope = self._scope_of(sel)
+        where = sel.args.get("where")
+        body = sel.copy()
+        body.set("where", None)
+        if self._outer_refs(body, scope):
+            raise NotImplementedError(f"{what}: the subquery uses a column of the outer query outside its WHERE "
+                                      "(only inner.col = outer.col conditions in WHERE can be decorrelated)")
+        keys, rest = [], []
+        for c in _conjuncts(where.this) if where else []:
+            if not self._outer_refs(c, scope):
+                rest.append(c)
+                continue
+            if isinstance(c, sge.EQ):
+                a, b = _unparen(c.this), _unparen(c.expression)
+                oa, ob = bool(self._outer_refs(a, scope)), bool(self._outer_refs(b, scope))
+                if oa != ob:
+                    outer, inner = (a, b) if oa else (b, a)
+                    if isinstance(outer, sge.Column):
+                        keys.append((outer, inner))
+                        continue
+            raise NotImplementedError(f"{what}: correlated predicate {c.sql(dialect='duckdb')} cannot be decorrelated "
+                                      "(only inner.col = outer.col equalities become a join)")
+        return keys, rest
+
+    @staticmethod
+    def _keyed_select(sel: sge.Select, rest, items) -> sge.Select:
+        """``sel`` with the given SELECT items and only its inner-only conditions."""
+        new = sel.copy()
+        new.set("expressions", items)
+        new.set("where", sge.Where(this=_and_all(rest)) if rest else None)
+        new.set("order", None)
+        return new
+
+    def _where(self, plan: LogicalPlan, cond: sge.Expression) -> LogicalPlan:
+        """WHERE: plain conditions as one Filter; IN / EXISTS subqueries (top-level AND conditions) as semi /
+        anti joins, a correlated scalar comparison as a join with the per-key aggregate."""
+        forms, plain = [], []
+        for c in _conjuncts(cond):
+            f = self._subquery_form(c)
+            if f:
+                forms.append(f)
+            else:
+                plain.append(c)
+        if not forms:
+            return Filter(plan, self._expr(cond))
+        before = None
+        if self._has_star:
+            from .optimizer import _output_columns
+            before = _output_columns(plan)
+        if plain:
+            plan = Filter(plan, self._expr(_and_all(plain)))
+        for kind, c, neg in forms:
+            plan = getattr(self, f"_{kind}_form")(plan, c, neg)
+        if before is not None:
+            plan = Project(plan, [col(n) for n in before])      # drop the columns a decorrelation added
+        return plan
+
+    def _subquery_form(self, c: sge.Expression):
+        """(kind, node, negated) when ``c`` is a condition that becomes a join, else None."""
+        neg = False
+        if isinstance(c, sge.Not):
+            c, neg = _unparen(c.this), True
+        if isinstance(c, sge.Exists):
+            return "exists", c, neg
+        if isinstance(c, sge.In) and c.args.get("query") is not None:
+            return "in", c, neg
+        if not neg and isinstance(c, _COMPARE):
+            for side in (c.this, c.expression):
+                side = _unparen(side)
+                if isinstance(side, sge.Subquery) and isinstance(side.this, sge.Select) \
+                        and self._outer_refs(side.this, self._scope_of(side.this)):
+                    return "scalar", c, False
+        return None
+
+    def _exists_form(self, plan, node: sge.Exists, negated: bool):
+        what = "NOT EXISTS" if negated else "EXISTS"
+        sel = node.this
+        if not isinstance(sel, sge.Select):
+            raise NotImplementedError(f"{what} over a {type(sel).__name__} is not supported")
+        _unsupported_shape(sel, what)
+        keys, rest = self._correlation(sel, what)
+        if not keys:         # no outer column: there are rows or there are none
+            flat = sel.copy()
+            flat.set("expressions", [sge.Star()])
+            n = Expr("scalar", Aggregate(self._child()._build_select(flat), [], [lit(1).count().alias("__scalar")]))
+            return Filter(plan, (n == lit(0)) if negated else (n > lit(0)))
+        i = next(self._ids)
+        items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
+        inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
+        return Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
+                    [f"__k{i}_{j}" for j in range(len(keys))], "anti" if negated else "semi")
+
+    def _in_form(self, plan, node: sge.In, negated: bool):
+        what = "NOT IN (SELECT ...)" if negated else "IN (SELECT ...)"
+        sel = node.args["query"].this
+        if not isinstance(sel, sge.Select):
+            raise NotImplementedError(f"{what} over a {type(sel).__name__} (UNION / INTERSECT / EXCEPT) is not supported")
+        x = _unparen(node.this)
+        if not isinstance(x, sge.Column):
+            raise NotImplementedError(f"{what}: the left side must be a plain column, got {x.sql(dialect='duckdb')}")
+        if len(sel.expressions) != 1:
+            raise ValueError(f"{what}: the subquery must return one column, it returns {len(sel.expressions)}")
+        item = sel.expressions[0]
+        if isinstance(item, sge.Star):
+            raise NotImplementedError(f"{what}: SELECT * in the subquery is not supported (name the column)")
+        item = item.this if isinstance(item, sge.Alias) else item
+        left = self._expr(x).args[0]
+        keys, rest = self._correlation(sel, what)
+        i = next(self._ids)
+        if keys:
+            if negated:
+                raise NotImplementedError("a correlated NOT IN (SELECT ...) is not supported (its NULL rules differ "
+                                          "per outer row); use NOT EXISTS")
+            _unsupported_shape(sel, what)
+            items = [_alias(item, "__in")] + [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
+            inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
+            return Join(plan, inner_plan, [left] + [self._expr(o).args[0] for o, _ in keys],
+                        ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
+        new = sel.copy()
+        new.set("expressions", [_alias(item, "__in")])
+        new.set("order", None)
+        inner_plan = self._child()._build_select(new)
+        if not negated:
+            return Join(plan, inner_plan, [left], ["__in"], "semi")
+        # NOT IN keeps a row with no partner when the subquery is empty, or when it has no NULL and the
+        # row's value is not NULL. m: 1 = empty, 2 = rows and no NULL, 0 = some NULL (nothing is kept)
+        stats = Aggregate(inner_plan, [], [lit(1).count().alias("n"), col("__in").count().alias("nn")])
+        m = Expr("scalar", Project(stats, [when(col("n") == lit(0), lit(1),
+                                                when(col("nn") == col("n"), lit(2), lit(0))).alias("__scalar")]))
+        anti = Join(plan, inner_plan, [left], ["__in"], "anti")
+        return Filter(anti, (m == lit(1)) | ((m == lit(2)) & (col(left) == col(left))))
+
+    def _scalar_form(self, plan, c: sge.Expression, _neg: bool):
+        """``expr <op> (SELECT agg ... WHERE inner.k = outer.k)``: the aggregate per key, joined on the key."""
+        sub = next(_unparen(s) for s in (c.this, c.expression)
+                   if isinstance(_unparen(s), sge.Subquery) and isinstance(_unparen(s).this, sge.Select)
+                   and self._outer_refs(_unparen(s).this, self._scope_of(_unparen(s).this)))
+        sel = sub.this
+        what = "correlated scalar subquery"
+        self._check_scalar(sel, what)
+        if any(isinstance(a, sge.Count) for a in sel.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))):
+            raise NotImplementedError(f"{what} with COUNT is not supported: an outer row without partners must see 0, "
+                                      "which a join would drop")
+        keys, rest = self._correlation(sel, what)
+        i = next(self._ids)
+        item = sel.expressions[0]
+        item = item.this if isinstance(item, sge.Alias) else item
+        items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)] + [_alias(item, f"__s{i}")]
+        new = self._keyed_select(sel, rest, items)
+        new.set("group", sge.Group(expressions=[inner.copy() for _, inner in keys]))
+        inner_plan = self._child()._build_select(new)
+        plan = Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
+                    [f"__k{i}_{j}" for j in range(len(keys))], "inner")
+        cmp = c.copy()
+        for side in ("this", "expression"):
+            if isinstance(_unparen(cmp.args[side]), sge.Subquery):
+                cmp.set(side, sge.Column(this=sge.to_identifier(f"__s{i}")))
+        return Filter(plan, self._expr(cmp))
+
+    @staticmethod
+    def _check_scalar(sel: sge.Expression, what: str) -> None:
+        if not isinstance(sel, sge.Select):
+            raise NotImplementedError(f"{what} over a {type(sel).__name__} (UNION / INTERSECT / EXCEPT) is not supported")
+        if len(sel.expressions) != 1:
+            raise ValueError(f"{what}: the subquery must return one column, it returns {len(sel.expressions)}")
+        if sel.args.get("group") or sel.args.get("having") or sel.args.get("limit") or sel.args.get("distinct") \
+                or not _aggs_in(sel.expressions[0]):
+            raise NotImplementedError(f"{what}: only a single aggregate over an ungrouped query is supported "
+                                      "(SELECT AVG(x) FROM ...), not a grouped, DISTINCT or LIMIT subquery or a plain column")
+
+    def _scalar_subquery(self, node: sge.Subquery) -> Expr:
+        """An uncorrelated ``(SELECT agg FROM ...)`` inside an expression: the engine runs it first
+        (``LazyFrame.scalar``) and uses its value as a literal."""
+        sel = node.this
+        self._check_scalar(sel, "scalar subquery")
+        if self._outer_refs(sel, self._scope_of(sel)):
+            raise NotImplementedError("a correlated scalar subquery is supported only as a comparison that is a "
+                                      "top-level AND condition of WHERE (decorrelated to a join), not here")
+        item = sel.expressions[0]
+        new = sel.copy()
+        new.set("expressions", [item if isinstance(item, sge.Alias) else _alias(item, "__scalar")])
+        return Expr("scalar", self._child()._build_select(new))
 
     def _agg_parts(self, node: sge.Expression):
         """(kind, expression) of an aggregate call: kind is sum / avg / min / max / count, or "cd" for
@@ -380,7 +690,7 @@ class _SQLTranslator:
             return None
         if isinstance(node, sge.AggFunc):
             return col(self._slot(node))
-        if node.find(sge.AggFunc) is not None:
+        if _aggs_in(node):
             return None                                   # its parts are resolved one by one
         self._post = False
         try:
@@ -580,6 +890,12 @@ class _SQLTranslator:
 
     def _expr(self, node: sge.Expression) -> Expr:
         """Translate a sqlglot expression to an MXFrame Expr."""
+        if isinstance(node, sge.Subquery):
+            return self._scalar_subquery(node)
+        if isinstance(node, sge.Exists) or (isinstance(node, sge.In) and node.args.get("query") is not None):
+            what = "EXISTS (SELECT ...)" if isinstance(node, sge.Exists) else "IN (SELECT ...)"
+            raise NotImplementedError(f"{what} is supported only as a condition joined by AND at the top of WHERE "
+                                      "(it becomes a semi / anti join); not inside OR, NOT (...), CASE, SELECT or HAVING")
         if self._post:
             ref = self._post_ref(node)
             if ref is not None:
