@@ -22,6 +22,11 @@ def _tables():
         "x": pa.table({"k": _i(0, 1, 2, 5, 6, 7), "w": _i(10, 20, 30, 50, 60, 70),
                        "z": _i(100, 200, 300, 500, 600, 700)}),
         "y": pa.table({"k": _i(0, 1, 5, 6), "q": _i(1000, 2000, 5000, 6000)}),
+        # a non-key column v in three tables (renamed v_right, v_right2 by the join)
+        "a": pa.table({"id": _i(1, 2, 3, 4, 5), "v": _i(1, 2, 3, 4, None)}),
+        "b": pa.table({"bk": _i(1, 2, 3, 9), "v": _i(1, 2, 7, 9)}),
+        "d": pa.table({"dk": _i(1, 2, 4, 9), "v": _i(1, 3, 4, 9), "dz": _i(111, 222, 444, 999)}),
+        "c": pa.table({"ck": _i(1, 3, 4, 9), "v": _i(1, 3, 4, 9), "cz": _i(11, 33, 44, 99)}),
     }
 
 
@@ -73,6 +78,17 @@ QUERIES = [
     "SELECT t.id, x.z FROM t LEFT JOIN u USING (k) LEFT JOIN x ON u.k = x.k",
     "SELECT t.id, y.q FROM t LEFT JOIN u USING (k) LEFT JOIN x ON u.k = x.k LEFT JOIN y ON x.k = y.k",
     "SELECT t.id, x.z FROM t JOIN u USING (k) LEFT JOIN x USING (k)",
+    # the same non-key name in three tables, both operand orders (renamed v_right / v_right2)
+    "SELECT a.id, b.bk, c.cz FROM a LEFT JOIN b ON a.id = b.bk LEFT JOIN c ON b.v = c.v",
+    "SELECT a.id, b.bk, c.cz FROM a LEFT JOIN b ON a.id = b.bk LEFT JOIN c ON c.v = b.v",
+    "SELECT a.id, c.cz FROM a LEFT JOIN b ON a.id = b.bk LEFT JOIN c ON a.v = c.v",
+    "SELECT a.id, c.cz FROM a LEFT JOIN b ON a.id = b.bk LEFT JOIN c ON c.v = a.v",
+    "SELECT a.id, c.cz FROM a LEFT JOIN b ON a.id = b.bk JOIN c ON c.v = b.v",
+    "SELECT a.id, c.cz FROM a JOIN b ON a.id = b.bk LEFT JOIN c ON c.v = b.v AND c.ck = a.id",
+    "SELECT a.id, b.bk, c.cz, d.dz FROM a LEFT JOIN b ON a.id = b.bk LEFT JOIN c ON c.v = b.v "
+    "LEFT JOIN d ON d.v = c.v",
+    "SELECT a.id, b.bk, c.cz, d.dz FROM a LEFT JOIN b ON a.id = b.bk LEFT JOIN c ON c.v = b.v "
+    "LEFT JOIN d ON b.v = d.v",
 ]
 
 

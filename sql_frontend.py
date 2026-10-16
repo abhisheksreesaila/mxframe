@@ -604,6 +604,7 @@ class _SQLTranslator:
                 self._left_schema |= right_schema
                 outs = join_output_names(self._cur_cols, right_cols, right_on)
                 self._cur_cols += [o for _, o in outs]
+                self._left_schema |= {o for _, o in outs}        # also the renamed names (v_right)
                 for c, o in outs:
                     if c != o:                         # a clashing column is renamed (x.k -> k_right)
                         self._renamed[(join.this.alias_or_name.lower(), c.lower())] = o
