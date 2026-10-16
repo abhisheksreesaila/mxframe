@@ -85,6 +85,9 @@ from .sort_check import (is_sorted_permutation as _is_sorted_permutation, is_sor
 _PRECISE = _threading.local()
 
 
+_GPU_EXACT_RANKS = 1 << 24      # the GPU paths carry integers as float32: ranks past 2^24 would round
+
+
 def _rank_strings(column):
     """``(ranks, sorted_values)`` of a string column (dictionary or plain, one dictionary per chunk or not):
     int32 ranks of each row's value in byte order (NULL stays NULL) and the distinct values in that order."""
@@ -1708,7 +1711,13 @@ class CustomOpsCompiler(GraphCompiler):
                 e = Expr(e.op, Expr("col", names[c])).alias(name)
                 out_names[name] = c
             aggs.append(e)
-        res = self.compile_and_run(Aggregate(add_ranks(base), agg.group_by, aggs))
+        ranked_plan = Aggregate(add_ranks(base), agg.group_by, aggs)
+        if self._session_device == "gpu" and any(len(v) > _GPU_EXACT_RANKS for v in back.values()):
+            cpu = CustomOpsCompiler(device="cpu")             # float32 ranks would round: this aggregate stays on the CPU
+            res = cpu.compile_and_run(ranked_plan)
+            self.last_compile_provenance = cpu.last_compile_provenance
+        else:
+            res = self.compile_and_run(ranked_plan)
         for name, c in out_names.items():
             i = res.schema.get_field_index(name)
             res = res.set_column(i, name, pc.take(back[c], pc.cast(res.column(i), pa.int64())))

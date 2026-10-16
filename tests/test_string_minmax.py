@@ -190,3 +190,17 @@ def test_parquet_scan(tmp_path):
                    p, row_group_size=30_000)
     got = mx.scan_parquet(p).groupby("k").agg(col("s").max().alias("m")).compute(device="cpu")
     assert _rows(got) == _duck("SELECT k, MAX(s) FROM t GROUP BY k", t=t)
+
+
+def test_ranks_past_the_gpu_float32_limit_stay_off_the_gpu(monkeypatch):
+    import mxframe.custom_ops as co
+    monkeypatch.setattr(co, "_GPU_EXACT_RANKS", 5)            # 12 distinct words > 5, like 2^24 + 1 strings
+    t = _table()
+    lf = mx.sql("SELECT k, MIN(s) lo, MAX(s) hi FROM t GROUP BY k", t=t)
+    got = lf.compute(device="gpu")
+    assert _rows(got) == _duck("SELECT k, MIN(s), MAX(s) FROM t GROUP BY k", t=t)
+    assert lf.last_compile_provenance["path"] == "native"      # the CPU executor, not fused_pipeline_gpu
+    monkeypatch.setattr(co, "_GPU_EXACT_RANKS", 1 << 24)
+    lf = mx.sql("SELECT k, MAX(s) hi FROM t GROUP BY k", t=t)
+    lf.compute(device="gpu")
+    assert "gpu" in lf.last_compile_provenance["path"] or lf.last_compile_provenance["device"] == "cpu"
