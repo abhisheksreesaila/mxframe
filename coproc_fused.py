@@ -307,6 +307,7 @@ def _budget_bytes() -> int:
 
 
 def resident_count() -> int:
+    _drain_evictions()
     with _lock:
         return len(_cache)
 
@@ -329,7 +330,11 @@ def _evict_locked(key) -> Optional[_Entry]:
     return e if e.users == 0 else None
 
 
-_dead_keys: list = []        # keys whose owner died while this thread (or another) held ``_lock``
+# Keys whose owner died while a lock was held. A queued key cannot evict a NEW owner's entry: the cached
+# entry holds its buffers (``_Entry.owners``; a file-keyed entry is keyed by file identity, not an address),
+# so an address in a key cannot be reused while its entry lives, and every reader and inserter drains this
+# queue before it looks at ``_cache`` -- the key is gone before anything can insert it again.
+_dead_keys: list = []
 
 
 def _evict(key) -> None:
@@ -542,6 +547,7 @@ def begin_prepare(source, columns, gkeys) -> bool:
     """True once per ``FAILED_RETRY_S`` for a source: the caller builds its group ids and starts the upload.
     (Building them costs a pass over the rows; a query repeated before the upload lands must not redo it.)"""
     sig = (source, frozenset(columns), tuple(gkeys))
+    _drain_evictions()
     with _lock:
         t = _prepared.get(sig)
         if t is not None and time.monotonic() - t < FAILED_RETRY_S:
