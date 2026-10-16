@@ -43,3 +43,9 @@ def test_last_bit_differences_between_engines_may_swap_rows(tmp_path):
     ref = [("a", 0.5000000000000001), ("b", 0.5)]
     got = [("b", 0.5), ("a", 0.5000000000000001)]
     assert verdict(tmp_path, ref, got)[0] == "ok"
+
+
+def test_nulls_sort_last_in_both_directions():
+    out_of_order = run.out_of_order
+    assert out_of_order((None,), (1.0,), [0], [False]) and out_of_order((None,), (1.0,), [0], [True])
+    assert not out_of_order((1.0,), (None,), [0], [False]) and not out_of_order((1.0,), (None,), [0], [True])

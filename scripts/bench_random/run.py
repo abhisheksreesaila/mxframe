@@ -93,6 +93,8 @@ def out_of_order(a, b, pos, desc):
         x, y = a[p], b[p]
         if x == y:
             continue
+        if x is None or y is None:                 # DuckDB's default: NULLS LAST in both directions
+            return x is None
         if _close(x, y, TIE):
             return False
         return (x < y) if d else (x > y)
