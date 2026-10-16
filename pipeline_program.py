@@ -46,6 +46,10 @@ STR        dst = utf8 column LIKE pattern / IN values (a      dst, col, pool, fl
            or, with flags bit 1, values as 4-byte length +
            bytes; flags bit 0 negates; a NULL string is 0.0
            either way
+ISNULL     dst = 1.0 where the column's value is NULL (its    dst, col
+           Arrow validity bitmap bit is clear), else 0.0; the
+           native executor only (F-097): the column's values
+           are never read, so it may hold NULLs
 AGG_SUM    slot += src (per group)                          slot, src
 AGG_MIN    slot = min(slot, src)                            slot, src
 AGG_MAX    slot = max(slot, src)                            slot, src
@@ -87,6 +91,7 @@ OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
 OP_ROWID = 39
 OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the native executor only)
+OP_ISNULL = 41         # dst = the column's validity bit is clear (the native executor only, F-097)
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 
 OP_NAMES = {
@@ -94,11 +99,11 @@ OP_NAMES = {
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
-    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR",
+    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR", OP_ISNULL: "ISNULL",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX",
 }
 
-_COLUMN_OPS = (OP_LOAD_COL, OP_CMPC, OP_STR)     # instructions whose operand `a` is a column index
+_COLUMN_OPS = (OP_LOAD_COL, OP_CMPC, OP_STR, OP_ISNULL)     # instructions whose operand `a` is a column index
 _ARITH = {"add": OP_ADD, "sub": OP_SUB, "mul": OP_MUL, "div": OP_DIV}
 _CMP = {"lt": OP_LT, "le": OP_LE, "gt": OP_GT, "ge": OP_GE, "eq": OP_EQ, "ne": OP_NE}
 # Comparisons follow DuckDB's order for floats (F-070): NaN is above every number, +inf included, and NaN = NaN.
@@ -261,6 +266,7 @@ class PipelineProgram:
     slot_int: List[bool] = field(default_factory=list)       # slot input is integer-valued (whole numbers; exact while within 2^53)
     dict_concat: Dict[str, Dict[tuple, int]] = field(default_factory=dict)   # concat_dicts mode: name -> {dictionary key: offset}
     str_cols: List[str] = field(default_factory=list)   # concat_dicts mode: plain utf8 columns read by OP_STR
+    null_cols: List[str] = field(default_factory=list)  # concat_dicts mode: columns only tested by OP_ISNULL (may hold NULLs)
 
     @property
     def n_slots(self) -> int:
@@ -466,6 +472,7 @@ class _Builder:
         self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.plain_str: List[str] = []                 # plain utf8 columns matched by OP_STR
+        self.null_cols: List[str] = []                 # columns whose validity OP_ISNULL tests (their values are never read)
         self._neg = 0                                  # depth of generic NOTs around the expression being compiled
         self.consts: List[float] = []
         self.const_ix: Dict[float, int] = {}
@@ -513,6 +520,8 @@ class _Builder:
     def _column(self, name: str) -> int:
         if name not in self.table.column_names:
             raise Unsupported(f"unknown column {name!r}")
+        if name in self.null_cols:
+            raise Unsupported(f"column {name!r} is read for its values and tested for NULL")
         if name not in self.columns:
             self.columns.append(name)
         return self.columns.index(name)
@@ -680,6 +689,8 @@ class _Builder:
             return _Val(self.emit(OP_NOT, x.vreg), "bool")
         if op == "isin":
             return self._isin(args[0], args[1])
+        if op == "is_null":
+            return self._is_null(args[0])
         if op in ("startswith", "contains", "like"):
             return self._str_match(e)
         if op == "case_when":
@@ -879,6 +890,31 @@ class _Builder:
         member = _dict_member(d, _py_test(toks, nocase, rx),
                               lambda: pc.match_like(d, pattern=str_arrow(toks), ignore_case=nocase))
         return self._dict_test(name, member, negate)
+
+    def _is_null(self, e: Expr):
+        """``col IS NULL`` from the column's validity bitmap (OP_ISNULL; native executor only). It is never NULL itself,
+        so AND / OR / NOT around it are plain two-valued logic. A column that is also read for its values, or whose
+        NULLs the comparisons would have to propagate, is not this op's business: those still decline."""
+        if not self.concat_dicts or e.op != "col" or e.args[0] not in self.table.column_names:
+            raise Unsupported("IS NULL outside the native executor, or of an expression")
+        name = e.args[0]
+        col = self.table.column(name)
+        t = col.type
+        v = t.value_type if pa.types.is_dictionary(t) else t
+        if not (pa.types.is_integer(v) or pa.types.is_floating(v) or pa.types.is_boolean(v) or pa.types.is_temporal(v)
+                or pa.types.is_decimal(v) or pa.types.is_string(v)):
+            raise Unsupported(f"IS NULL of a {t} column")
+        chunks = col.chunks if isinstance(col, pa.ChunkedArray) else [col]
+        if pa.types.is_dictionary(t) and any(ch.dictionary.null_count for ch in chunks):
+            raise Unsupported("a NULL in a dictionary")
+        if not col.null_count:
+            return _Const(0.0, "bool")
+        if name in self.columns and name not in self.null_cols:
+            raise Unsupported(f"column {name!r} is read for its values and tested for NULL")
+        if name not in self.null_cols:
+            self.null_cols.append(name)
+            self.columns.append(name)
+        return _Val(self.emit(OP_ISNULL, self.columns.index(name), key_extra=("isnull",)), "bool")
 
     def _is_plain_str(self, name: str) -> bool:
         """A plain (not dictionary) utf8 column read by the native executor's string op."""
@@ -1146,6 +1182,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
     b.columns = [b.columns[old] for old in used]
     b.dict_arrays = {n: d for n, d in b.dict_arrays.items() if n in b.columns}
     b.plain_str = [n for n in b.plain_str if n in b.columns]
+    b.null_cols = [n for n in b.null_cols if n in b.columns]
 
     # ── register allocation ────────────────────────────────────────────────
     const_vregs = [b.const_vregs[k] for k in sorted(b.const_vregs)]
@@ -1166,6 +1203,8 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             return [op, phys_of(ins[1]), ins[2], 0, 0]
         if op == OP_CMPC or op == OP_STR:
             return [op, phys_of(ins[1]), ins[2], ins[3], ins[4]]
+        if op == OP_ISNULL:
+            return [op, phys_of(ins[1]), ins[2], 0, 0]
         if op == OP_ROWID:
             return [op, phys_of(ins[1]), 0, 0, 0]
         if op == OP_IN_SET:
@@ -1215,6 +1254,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         dict_arrays=dict(b.dict_arrays),
         dict_concat={n: o for n, o in b.dict_concat.items() if n in b.columns},
         str_cols=list(b.plain_str),
+        null_cols=list(b.null_cols),
         slot_kinds=slot_kinds,
         slot_int=slot_int,
         outputs=outputs,
@@ -1325,7 +1365,7 @@ def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: 
 
 def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
-    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR):
+    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR, OP_ISNULL):
         return []
     if op in (OP_NOT, OP_FLOOR, OP_IN_SET):
         return [ins[2]]
