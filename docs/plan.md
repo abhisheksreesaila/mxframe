@@ -868,3 +868,8 @@ Found by the F-086 developer (2026-10-16)
 Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+
+## F-094 SQL modulo operator [todo]
+Found by the F-087 developer (2026-10-16)
+- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
