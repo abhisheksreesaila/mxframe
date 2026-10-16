@@ -774,7 +774,8 @@ Needs: — · Found in F-069 review (2026-10-16); a wrong answer on main before 
 - [ ] a float group key with a NULL declines the native path (correct) and the Arrow fallback kept -0.0 and 0.0 (and NaN payloads) as separate groups: 12 groups where DuckDB gives 10 (reproduced through a fused-join partner column). Either the native hashed path takes NULL keys (a NULL group, last in key order like DuckDB) or the fallback canonicalises -0.0 → 0.0 and NaN → one NaN before grouping
 - [ ] test: float key with NULL, -0.0, 0.0, NaN of two payloads, single table and fused partner column, equals DuckDB group count and values; fails before
 
-## F-078 COUNT(*) on a NULL group key counts the group's rows [review]
+## F-078 COUNT(*) on a NULL group key counts the group's rows [done]
+- Finding (2026-10-16): already fixed on main by F-042 (`COUNT(*)` -> `lit(1).count()`); the F-077 developer saw it on a worktree based on the stale `origin/main`. Kept as regression tests: `tests/test_f078_count_star.py` (33 DuckDB-checked cases, cpu and gpu, Arrow and native sizes); test-only, reviewed in the main session
 Found by the F-077 developer (2026-10-16); a silent wrong answer on main
 - [x] root cause: the SQL front end translated `COUNT(*)` to `col(<first in-scope column>).count()`, which skips NULLs (a global count(*) also lost rows with a NULL first column); it is now `lit(1).count()`, the form every path already treats as count(*); no kernel change. SQL `SELECT k, count(*) ... GROUP BY k` with NULLs in `k` returns 0 for the NULL-key group where DuckDB returns its row count (2 in the probe). Find which path (the SQL front end's `count(*)` → a column count, or the NULL-key fallback) and fix at the root; `count(*)` counts rows on every path and device
 - [x] `tests/test_f078_count_star.py` (34 cases, 33 failed before the fix): DuckDB-checked, NULL key with count(*), count(col with NULLs), count(*) + sum, single table and through a join, cpu and gpu; fail before
