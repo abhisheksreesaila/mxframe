@@ -14,6 +14,13 @@ from mxframe.custom_ops import CustomOpsCompiler
 from mxframe.lazy_frame import Join, Scan, Filter, Aggregate
 
 
+
+@pytest.fixture(autouse=True)
+def _star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 def _sql(sql, **tables):
     con = duckdb.connect()
     for name, t in tables.items():

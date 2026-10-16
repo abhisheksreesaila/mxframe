@@ -17,6 +17,13 @@ pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not
 MODES = ["A", "N", "R", "Z"]
 
 
+
+@pytest.fixture(autouse=True)
+def _star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 def _dict_chunks(values, n_chunks, r):
     """A dictionary column whose chunks each carry their own dictionary, in their own order."""
     cuts = np.linspace(0, len(values), n_chunks + 1).astype(int)

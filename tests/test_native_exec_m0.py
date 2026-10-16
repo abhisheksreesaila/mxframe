@@ -26,6 +26,13 @@ from tpch_user.compare import compare_tables  # noqa: E402
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
 
+
+@pytest.fixture(autouse=True)
+def _star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 @pytest.fixture
 def native(monkeypatch):
     monkeypatch.setenv("MXFRAME_NATIVE", "1")
