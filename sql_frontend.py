@@ -316,6 +316,7 @@ class _SQLTranslator:
         # right join keys of a LEFT JOIN: the join drops them, and they are NULL for unmatched rows,
         # so a left key cannot stand in for them
         self._dropped_right: dict = {}
+        self._marks: dict = {}               # (left-joined table, its key) -> a column that is NULL where unmatched
         # (table name or alias, its columns) of every scanned table, and join keys that have the
         # same name on both sides (one copy survives the join, so t.k and u.k are the same column)
         self._table_cols: List[tuple] = []
@@ -486,6 +487,8 @@ class _SQLTranslator:
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
+            if how == "left":
+                right_plan = self._mark_right_keys(node, join, right_plan, right_cols, right_on)
             plan = Join(plan, right_plan, left_on, right_on, how)
             # After this join, the accumulated left side grows to include right cols (a semi / anti
             # join outputs the left columns only)
@@ -527,6 +530,21 @@ class _SQLTranslator:
             self._joined.add(alias)
 
         return plan
+
+    def _mark_right_keys(self, node, join, right_plan, right_cols, right_on):
+        """The join keeps only the left key, so ``r.k IS NULL`` (the anti-join pattern: r.k is NULL where
+        nothing matched) has no column to test. When the query asks IS [NOT] NULL of a right key, give the
+        right side a constant column that is NULL exactly where nothing matched, and test that."""
+        alias = join.this.alias_or_name.lower()
+        asked = {i.this.name.lower() for i in node.find_all(sge.Is)
+                 if isinstance(i.this, sge.Column) and (i.this.table or alias).lower() == alias}
+        keys = [k for k in right_on if k in asked]
+        if not keys:
+            return right_plan
+        mark = f"__m_{alias}"
+        for k in keys:
+            self._marks[(alias, k)] = mark
+        return Project(right_plan, [col(c) for c in right_cols] + [lit(1).alias(mark)])
 
     def _links(self, alias: str, cols: set):
         """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
@@ -1280,6 +1298,18 @@ class _SQLTranslator:
         if isinstance(node, sge.Not):
             return ~self._expr(node.this)
 
+        # ---- IS [NOT] NULL / TRUE / FALSE, IS [NOT] DISTINCT FROM ----
+        if isinstance(node, sge.Is):
+            return self._is(node)
+        if isinstance(node, (sge.NullSafeEQ, sge.NullSafeNEQ)):
+            if isinstance(node.expression, sge.Null) or isinstance(node.this, sge.Null):
+                x = self._expr(node.this if isinstance(node.expression, sge.Null) else node.expression)
+                return x.is_null() if isinstance(node, sge.NullSafeEQ) else ~x.is_null()
+            a, b = self._expr(node.this), self._expr(node.expression)
+            an, bn = a.is_null(), b.is_null()
+            differ = (an & ~bn) | (~an & bn) | (~an & ~bn & (a != b))
+            return ~differ if isinstance(node, sge.NullSafeEQ) else differ
+
         # ---- BETWEEN ----
         if isinstance(node, sge.Between):
             c = self._expr(node.this)
@@ -1355,6 +1385,19 @@ class _SQLTranslator:
             raise NotImplementedError("SUBSTRING needs a constant start >= 1 and a constant length: "
                                       f"{node.sql(dialect='duckdb')}")
         return self._expr(node.this).str_slice(int(start.this) - 1, None if length is None else int(length.this))
+
+    def _is(self, node: sge.Is) -> Expr:
+        """``x IS NULL`` / ``IS TRUE`` / ``IS FALSE``: never NULL themselves (``IS NOT ...`` is a NOT above)."""
+        what = node.expression
+        t = node.this
+        marks = [m for (a, n), m in self._marks.items()
+                 if isinstance(t, sge.Column) and n == t.name.lower() and (not t.table or a == t.table.lower())]
+        x = col(marks[0]) if len(marks) == 1 else self._expr(t)
+        if isinstance(what, sge.Null):
+            return x.is_null()
+        if isinstance(what, sge.Boolean):
+            return (x if what.this else ~x) & ~x.is_null()     # a NULL x gives NULL & False = False
+        raise NotImplementedError(f"IS {what.sql(dialect='duckdb')} is not supported: IS [NOT] NULL, TRUE, FALSE only")
 
     def _translate_case(self, node: sge.Case) -> Expr:
         ifs = node.args.get("ifs") or []

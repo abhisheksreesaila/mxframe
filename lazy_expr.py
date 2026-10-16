@@ -63,6 +63,10 @@ class Expr:
         """Logical NOT — use as ~expr."""
         return Expr("not", self)
 
+    def is_null(self) -> 'Expr':
+        """True where the value is NULL (a float NaN is a value, not NULL); ``~expr.is_null()`` is IS NOT NULL."""
+        return Expr("is_null", self)
+
     def isin(self, values: list) -> 'Expr':
         """True for rows where this column's value is in *values*."""
         return Expr("isin", self, values)
