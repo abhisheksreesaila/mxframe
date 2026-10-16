@@ -885,15 +885,17 @@ Found by the F-086 developer (2026-10-16)
 - [x] `mx.sql(q, t=mx.scan_parquet(path))` raises `AttributeError: 'LazyFrame' object has no attribute 'column_names'` in `custom_ops._arrow_aggregate_reason`: a LazyFrame passed as a SQL table is treated as an Arrow table there. Accept a LazyFrame (scan or in-memory) as a SQL table on every path, keeping scan pushdown (filters, columns, row groups)
 - [x] tests: `mx.sql` over `scan_parquet` and `read_parquet` frames for filter, group-by, join, subquery; equals DuckDB over the same file; pushdown still happens (row groups skipped); fails before
 
-## F-093 MIN / MAX of a date column [todo]
+## F-093 MIN / MAX of a date column [done]
 Found by the F-086 developer (2026-10-16)
 - [ ] `MIN(date32)` fails with a cast error (seen in HAVING; check SELECT, GROUP BY, global, native and Arrow paths, GPU). Date MIN / MAX return date32 like DuckDB (also timestamp)
 - [ ] DuckDB-checked tests: date and timestamp MIN / MAX, with NULLs, grouped and global, in HAVING; fails before
+- Note: a date64 input keeps date64 (DuckDB returns date32); a tz timestamp keeps its zone.
 
-## F-094 SQL modulo operator [todo]
+## F-094 SQL modulo operator [done]
 Found by the F-087 developer (2026-10-16)
-- [ ] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
-- [ ] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+- [x] `i % 2` is unsupported in the SQL front end; map `%` (and `MOD(a, b)`) to the engine's modulo with DuckDB semantics (sign follows the dividend, NULL on zero divisor? probe DuckDB: it errors / returns NULL), native filter where the bytecode has it
+- [x] DuckDB-checked tests: int / float, negative operands, zero divisor, in WHERE / SELECT / GROUP BY; fails before
+Done: DuckDB probed (sign follows the dividend; integer `% 0` is NULL, float `% 0.0` is NaN; NULL in, NULL out; NaN stays NaN; `x % inf` is x). New `mod` Expr op (`np_arrow.modulo`, fmod) on the Arrow path: the arrays decide integer or float arithmetic (integers keep their type, uint64 and signed/unsigned mixes are exact, a decimal literal such as `% 2.5` is exact against integers and its zero divisor is NULL); the native bytecode has no modulo and declines it (`Unsupported`), the GPU runs it through the Arrow Project. `tests/test_sql_modulo.py` (162 DuckDB-checked, cpu + gpu, result kinds compared). Left alone: COALESCE / IS NULL over expressions is F-100. Found on the way, not fixed: `int_col + 1` (an integer literal in + - *) returns double where DuckDB returns an integer (`_float_expr` promotes the literal), so `(a + 1) % 0` is NaN, not NULL, and past 2^53 it rounds; needs its own ticket. A decimal literal (a point, no exponent; `1e3` is DOUBLE) is exact against integers as ((x % k) * s % k) / s in NumPy (about 20 ms per 1M rows on the loaded machine); it raises past k * s > int64 (a literal with ~19 digits). Still a Python loop: modulo of uint64 mixed with signed values (exact, slow on millions of rows).
 
 ## F-095 SQL over tables with uppercase or quoted column names [todo]
 Found by the F-087 developer (2026-10-16); untested suspicion, important for real files (DataLens)
@@ -942,6 +944,7 @@ Found by the F-090 review (2026-10-16); a missing column on main
 ## F-103 SQL integer column plus integer literal stays integer [todo]
 Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
 - [ ] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
+- [ ] F-094 cases for the tests: `(a - 1) % 10` with `a` past 2^53 raises ArrowInvalid (`a - 1` is computed as a float), and `m % 0` over `(SELECT i32 + 1 AS m ...)` gives NaN instead of NULL
 - [ ] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
 
 ## F-104 Chained LEFT JOIN on the previous right table's key [todo]
@@ -959,3 +962,15 @@ Found by the F-082 developer (2026-10-16)
 - [ ] a scientific literal without a dot (`x > 1e-310`, `x < 2E5`) raises ValueError: `sql_frontend` does `lit(int(v)) if "." not in str(v)`. Parse numeric literals by their SQL type (sqlglot's `is_int` / `is_number`), not by looking for a dot
 - [ ] a float32 column compared with a float64 literal casts the literal to float32: `x between -1e-30 and 1e-30` keeps the row holding float32(1e-30), DuckDB drops it. Compare in the wider type (widen the column, as DuckDB does) on every path (native bytecode, Arrow, GPU)
 - [ ] DuckDB-checked tests for both; fails before
+
+## F-107 Test process hangs on a futex while other suites share the GPUs [todo]
+Seen three times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes
+- [ ] capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
+- [ ] from the dump, find the waiting lock(s); if it is ours, fix the lock order and add a stress test (concurrent queries + background upload + warm-up); if it is the driver under cross-process contention, document it and make the GPU tests serialize on a file lock
+
+## F-108 SQL TIMESTAMP literals and temporal expressions in aggregates [todo]
+Found by the F-093 developer (2026-10-16)
+- [ ] `TIMESTAMP '2024-01-01 10:00:00'` (and `CAST('...' AS TIMESTAMP)`) is unsupported in the SQL front end (`Unsupported SQL expression type: Cast ... TIMESTAMPNTZ`); map to a timestamp literal compared in the column's unit and zone like DuckDB
+- [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
+- [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
+- [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before

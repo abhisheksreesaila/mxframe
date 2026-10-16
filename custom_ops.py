@@ -12,7 +12,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 from .np_arrow import is_in as _is_in
-from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum, float_extreme
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, float_extreme
 from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_values
 import numpy as np
 import os as _os
@@ -169,6 +169,22 @@ def _expr_col_names(expr, out=None, tests_ok=False) -> set:
         for a in expr:
             _expr_col_names(a, out, tests_ok)
     return out
+
+
+def _temporal_extreme(e, table) -> bool:
+    """F-093: *e* is MIN / MAX of a plain date or timestamp column of *table*. Float64 holds neither a date
+    nor a ns timestamp past 2^53, so these aggregates are answered by Arrow in the column's own type."""
+    if e.op not in ("min", "max") or e.args[0].op != "col" or e.args[0].args[0] not in table.column_names:
+        return False
+    t = table.schema.field(e.args[0].args[0]).type
+    return pa.types.is_date(t) or pa.types.is_timestamp(t)
+
+
+def _temporal_scalar(scalar, typ) -> pa.Array:
+    """A one-row array of *typ* from an Arrow date / timestamp scalar, through its integer storage (``as_py``
+    would round a ns timestamp to a Python datetime, and import pandas)."""
+    store = pa.int32() if pa.types.is_date32(typ) else pa.int64()
+    return pa.array([scalar.value if scalar.is_valid else None], store).cast(typ)
 
 
 _AOT_WARNED = False
@@ -738,6 +754,8 @@ class CustomOpsCompiler(GraphCompiler):
                 return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
             return _npa([val] * n)
+        if op == "mod":
+            return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div":
@@ -1864,6 +1882,8 @@ class CustomOpsCompiler(GraphCompiler):
                         if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
                             exact_sum = True
                             break
+        if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
+            return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
             "an integer sum could pass 2^53, or a min / max past it (computed exactly in int64)" if exact_sum else "")
         return why, exact_sum
@@ -1910,6 +1930,9 @@ class CustomOpsCompiler(GraphCompiler):
                     agg_arrays.append(_npa(np.zeros(table.num_rows, dtype=np.int8)))   # count(*)
                     continue
                 arr = None
+                if _temporal_extreme(e, table):
+                    agg_arrays.append(_decode_dict(table.column(e.args[0].args[0])))      # F-093: stays a date / timestamp
+                    continue
                 if exact_sum and e.op in ("sum", "min", "max"):
                     _PRECISE.on = False                 # integers stay int64
                     try:
@@ -1932,7 +1955,9 @@ class CustomOpsCompiler(GraphCompiler):
             for i, e in enumerate(plan.aggs):
                 c = grouped.column(f"__v{i}___{spec[i][1]}")
                 exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(agg_arrays[i].type)
-                if exact and e.op in ("min", "max"):
+                if _temporal_extreme(e, table):
+                    out_cols.append(c)                                         # F-093: the column's own date / timestamp type
+                elif exact and e.op in ("min", "max"):
                     out_cols.append(pc.cast(c, agg_arrays[i].type))        # the column's own integer type
                 else:
                     out_cols.append(pc.cast(c, pa.int64()) if e.op == "count" or exact else pc.cast(c, pa.float64()))
@@ -1942,6 +1967,9 @@ class CustomOpsCompiler(GraphCompiler):
             for e, arr in zip(plan.aggs, agg_arrays):
                 if e.op == "count":
                     cols.append(_npa([pc.count(arr).as_py()], type=pa.int64()))
+                    continue
+                if _temporal_extreme(e, table):
+                    cols.append(_temporal_scalar(pc.min_max(arr)[e.op], arr.type))
                     continue
                 exact = (e.op == "sum" or exact_sum and e.op in ("min", "max")) and pa.types.is_integer(arr.type)
                 if exact and e.op == "sum":
