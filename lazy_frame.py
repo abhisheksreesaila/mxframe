@@ -144,6 +144,26 @@ def join_output_names(left_names, right_names, right_on):
     return out
 
 
+def column_types(plan) -> dict:
+    """{column name: Arrow type} for the columns of *plan* that are plain columns of a table, carried
+    through filters, sorts, joins and renaming selects; computed columns are absent."""
+    if isinstance(plan, Scan):
+        return {f.name: f.type for f in plan.table.schema}
+    if isinstance(plan, ParquetScan):
+        return {f.name: f.type for f in plan.schema}
+    if isinstance(plan, (Filter, Sort, Limit, Distinct, Tail)):
+        return column_types(plan.input)
+    if isinstance(plan, Join):
+        left, right = column_types(plan.left), column_types(plan.right)
+        return {n: t for n, t in {**right, **left}.items()
+                if n not in left or n not in right or left[n] == right[n]}
+    if isinstance(plan, Project):
+        inner = column_types(plan.input)
+        return {(e._alias or e.args[0]): inner[e.args[0]]
+                for e in plan.exprs if e.op == "col" and e.args[0] in inner}
+    return {}
+
+
 @dataclass
 class Join(LogicalPlan):
     """Represents an inner join between two plan trees (first two-child node)."""

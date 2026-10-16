@@ -45,7 +45,7 @@ Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero
-from max.algorithm import parallelize
+from _fpenv import par, par_n
 from std.sys import simd_width_of
 from std.atomic import Atomic
 from std.math import floor
@@ -1122,7 +1122,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             # A host process (Python via ctypes) has no Mojo async runtime yet:
             # create the global CPU device (thread pool) once, then parallelize.
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
-            parallelize(lworker, nthreads)
+            par(lworker, nthreads)
 
         # merge worker partials into the output (parallel over group ranges when there are many groups)
         def lmerge(chunk: Int) {imm}:
@@ -1152,7 +1152,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
 
         var merge_chunks = 0 if shared else (G + LEGACY_MERGE_GROUPS - 1) // LEGACY_MERGE_GROUPS
         if nthreads > 1 and merge_chunks > 1:
-            parallelize(lmerge, merge_chunks, nthreads)
+            par_n(lmerge, merge_chunks, nthreads)
         else:
             for chunk in range(merge_chunks):
                 lmerge(chunk)
@@ -1332,11 +1332,11 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             ctl[0] = Int64(wave0)
             ctl[1] = Int64(min(nslots, morsels - wave0))
             counter[0] = 0
-            parallelize(stage_morsels, nthreads)
+            par(stage_morsels, nthreads)
             if failed[0] != 0:
                 break
             counter[0] = 0
-            parallelize(apply_bins, nthreads)
+            par(apply_bins, nthreads)
             wave0 += nslots
         for w in range(nthreads):
             var st = wst + w * 8
@@ -1420,12 +1420,12 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
         if nthreads == 1:
             worker(0)
         else:
-            parallelize(worker, nthreads)
+            par(worker, nthreads)
         if failed[0] != 0:
             break
         if A > 0:
             if nthreads > 1 and merge_chunks > 1:
-                parallelize(merge, merge_chunks, nthreads)
+                par_n(merge, merge_chunks, nthreads)
             else:
                 for chunk in range(merge_chunks):
                     merge(chunk)
