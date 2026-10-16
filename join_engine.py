@@ -1209,7 +1209,12 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = Fal
     fact = _star_fact(comp, fl)
     if fact is None:
         return None
-    st = _star_setup(comp, fl, fact, get, want, leaf_need, coded)
+    # The aggregate reads a partner's deferred dictionary column as codes whatever it does with it (CASE,
+    # group key, predicate): the bytecode compiler takes dictionaries. If the fused call declines, the old
+    # path needs strings: it gets `setup`'s own `coded`, and partners built with these codes are dropped.
+    fcoded = [set(c) if i == fact else set(c) | later[i] for i, c in enumerate(coded)]
+    widened = fcoded != coded
+    st = _star_setup(comp, fl, fact, get, want, leaf_need, fcoded)
     # whatever the fused call does, the old path (should it run) must not build the partners again
     comp._star_stash = (node, frozenset(needed), setup, st if st is not None else False)
     if st is None:
@@ -1229,6 +1234,8 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = Fal
     out = native_exec.try_execute_join(comp, plan, fj, having_pred, post_ops, distinct)
     if out is not None:
         comp._star_stash = None
+    elif widened and st:                           # partners holding codes the old path cannot read
+        comp._star_stash = (node, frozenset(needed), setup, None)
     return out
 
 
