@@ -145,7 +145,7 @@ Needs: F-012 merged · Found by re-running calibration (2026-09-30)
 Needs: F-011, F-013 merged · Found by F-013
 - [x] CPU sort in `custom_ops._apply_sort_custom` uses `AOTKernels.sort_indices` (parallel radix, ~69 ms / 10M) instead of `np.argsort` / `argpartition`; `compiler.py` post-op sort likewise
 - [ ] `tests/test_cpu_sort.py::test_sort_indices_is_stable_and_matches_numpy[1000000-True-300001-int64]` failed once in a loaded full-suite run (F-018 branch); not reproducible in 5,600 isolated/concurrent stress runs of the exact input with 1–64 threads. The engine now verifies radix results in O(n) and falls back to np.argsort with a warning. Suspect cross-test memory corruption (F-018 fixed an out-of-bounds join write); watch for the warning.
-- [ ] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` is flaky on a shared GPU (fails ~1 in 3 even alone): find out whether it is memory pressure (cuMemAlloc 2) or a real ordering bug
+- [x] `test_gpu_kernels.py::test_sort_end_to_end_single_and_multi_key_with_and_without_limit` flaky on a shared GPU: settled in F-055: memory pressure from other processes (about 0.5 GB free reproduces it) and, behind it, a real bug: a sort kernel that runs out of memory returns a wrong order with no exception. The GPU top-k result is now verified and redone on the CPU (`sort_check.is_sorted_topk`); an honest `cuMemAlloc` failure remains under pressure (`docs/bench/gpu-correctness-sf1.md`)
 - [ ] fused GPU pipeline kernel reaches ≥ 50% of memory bandwidth on the Q1 shape (77 GB/s today, 7.8 ms per 30M rows resident)
 
 ## F-015 Cold first query: 1.1 s vs 50 ms warm [done]
@@ -534,3 +534,12 @@ Needs: F-001, F-005..F-008
 - [x] `auto` is within 10% of min(cpu, gpu) on ≥ 20/22 queries at SF1 and SF10 (moved from F-005): SF10 22/22; SF1 21/22 on the median of 4 fresh-process runs (single runs 17–21/22, only 2 of 4 reach 20; the misses move between runs, ±10% noise on 50–400 ms queries; the 3 extra runs started at load 2.8–4.4). Reaching it needed three fixes for auto's first-query overhead: a cheaper `_key_card` sample, lazy `calibration` imports, and background GPU work that waits for a 100 ms idle gap (before them SF1 was 12/22)
 - [x] full SF1 + SF10 user-felt run on an otherwise idle machine (2026-10-12 01:34, load1 0.13 at start, GPU 0 because GPU 1 drives the display): `docs/bench/final-sf1*.md`, `final-sf10.md`; summary and honest losses at the top of `docs/benchmarks.md`. All 132 mx results match DuckDB
 - [x] README `device="auto"` section with the real numbers; the README performance section now leads with the user-felt table, and the old synthetic warm-run tables are marked historical
+
+## F-055 GPU correctness sweep [review]
+Needs: F-014, F-022 · Results only, no speed claims; SF1, one GPU, shared machine. Report: `docs/bench/gpu-correctness-sf1.md`
+- [x] all 22 TPC-H queries on `device="gpu"` equal to DuckDB at SF1, stored and shuffled (22/22 both; first and repeat run each), with the path every `compute()` took (`paths` column in the scoreboard CSV)
+- [x] which queries ran a GPU kernel and which ran on the CPU: 20 ran the fused GPU aggregate; Q2 and Q20 ran no GPU kernel (CPU join engine and PyArrow only), so their match says nothing about the GPU
+- [x] random-query suite (100 queries, SF1) on `device="gpu"` equal to DuckDB, stored and shuffled (100/100 both; 78 ran a GPU aggregate kernel, 22 ran on the CPU or PyArrow: select/distinct/top-n shapes and one declined count-distinct)
+- [x] F-014's flaky GPU sort test settled and fixed at its cause (see F-014)
+- [x] mismatches and crashes: none found, so `auto_mode.KNOWN_BROKEN_GPU` stays empty and no new ticket
+- [ ] not probed: other GPU kernels that swallow an out-of-memory error the way the sort did (scan, group-by scratch, hash join scratch); a kernel-level check of "no `oom log` on stderr" in the sweep would catch them
