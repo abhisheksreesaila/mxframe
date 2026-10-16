@@ -90,3 +90,103 @@ def test_semi_and_anti_join_on_a_having_partner(counters):
         SELECT * FROM orders WHERE ok IN (SELECT lk FROM lines GROUP BY lk HAVING count(*) >= 6) ORDER BY ok""")
     assert _rows(semi) == want
     assert 0 < len(want) < orders.num_rows
+
+
+# ── scalar subqueries ───────────────────────────────────────────────────────────────────────────
+
+def _stock(n=60_000, seed=3):
+    r = np.random.default_rng(seed)
+    ps = pa.table({
+        "pk": A(r.integers(0, 4000, n).astype(np.int32)),
+        "sk": A(r.integers(0, 120, n).astype(np.int32)),
+        "cost": A(np.round(r.random(n) * 900 + 1, 2)),
+        "qty": A(r.integers(1, 9999, n).astype(np.int32)),
+    })
+    sup = pa.table({"sk": A(np.arange(120, dtype=np.int32)), "nk": A(r.integers(0, 25, 120).astype(np.int32))})
+    return ps, sup
+
+
+def test_scalar_subquery_feeds_a_having(counters):
+    """Q11: groups whose value exceeds a fraction of the grand total (computed natively first)."""
+    ps, sup = _stock()
+    base = LazyFrame(ps).join(LazyFrame(sup).filter(col("nk") == lit(7)).select("sk"), on="sk")
+    got = (base.groupby("pk").agg((col("cost") * col("qty")).sum().alias("v"))
+           .filter(col("v") > base.scalar((col("cost") * col("qty")).sum()) * lit(0.0002))
+           .sort("v", descending=True).compute(device="cpu"))
+    want = _duck({"ps": ps, "sup": sup}, """
+        WITH j AS (SELECT ps.pk, ps.cost * ps.qty AS v FROM ps JOIN sup ON ps.sk = sup.sk WHERE sup.nk = 7)
+        SELECT pk, sum(v) v FROM j GROUP BY pk HAVING sum(v) > (SELECT sum(v) * 0.0002 FROM j) ORDER BY v DESC""")
+    assert 5 < len(want) < 4000
+    assert _rows(got) == want
+    assert counters["arrow_predicates"] == 0
+    assert counters["execute"] == 2                    # the scalar, then the grouped aggregate with its HAVING
+
+
+def test_scalar_subquery_in_a_row_filter_with_a_float32_column(counters):
+    """Q22: balance above the average of the positive balances (float32 column against a float64 mean)."""
+    r = np.random.default_rng(5)
+    n = 50_000
+    cust = pa.table({"ck": A(np.arange(n, dtype=np.int32)),
+                     "bal": A(np.round(r.random(n) * 12000 - 1000, 2).astype(np.float32)),
+                     "code": A(r.integers(10, 35, n).astype(np.int32))})
+    pos = LazyFrame(cust).filter(col("bal") > lit(0.0))
+    got = (LazyFrame(cust).filter(col("bal") > pos.scalar(col("bal").mean()))
+           .groupby("code").agg(col("ck").count().alias("n"), col("bal").sum().alias("t"))
+           .sort("code").compute(device="cpu"))
+    want = _duck({"cust": cust}, """
+        SELECT code, count(*) n, sum(bal) t FROM cust
+        WHERE bal > (SELECT avg(bal) FROM cust WHERE bal > 0) GROUP BY code ORDER BY code""")
+    assert len(want) > 10
+    assert [r[:2] for r in _rows(got)] == [r[:2] for r in want]
+    assert all(abs(g[2] - w[2]) < 1e-2 * max(1, abs(w[2])) for g, w in zip(_rows(got), want))
+
+
+def test_scalar_max_equality_is_exact(counters):
+    """Q15: the rows whose total equals the maximum total (float64 equal to the last bit)."""
+    orders, lines = _orders()
+    view = LazyFrame(lines).groupby("supp").agg((col("qty") * lit(1.1)).sum().alias("rev"))
+    got = view.filter(col("rev") == view.scalar(col("rev").max())).compute(device="cpu")
+    want = _duck({"lines": lines}, """
+        WITH v AS (SELECT supp, sum(qty * 1.1) rev FROM lines GROUP BY supp)
+        SELECT supp, rev FROM v WHERE rev = (SELECT max(rev) FROM v)""")
+    assert len(want) == 1
+    assert _rows(got) == want
+
+
+def test_scalar_in_a_computed_column_and_a_count_scalar(counters):
+    orders, lines = _orders()
+    lf = LazyFrame(lines)
+    share = (lf.groupby("supp").agg(col("qty").sum().alias("q"))
+             .with_columns((col("q") / lf.scalar(col("qty").sum())).alias("frac")).sort("supp").compute(device="cpu"))
+    want = _duck({"lines": lines}, """
+        SELECT supp, sum(qty) q, sum(qty) / (SELECT sum(qty) FROM lines) frac FROM lines GROUP BY supp ORDER BY supp""")
+    assert _rows(share) == want
+    n = (lf.filter(col("supp") < lf.scalar(col("qty").count()) * lit(0.0004))
+         .groupby().agg(col("qty").count().alias("n")).compute(device="cpu"))
+    assert n.column("n")[0].as_py() == _duck(
+        {"lines": lines}, "SELECT count(*) FROM lines WHERE supp < (SELECT count(*) FROM lines) * 0.0004")[0][0]
+
+
+def test_scalar_over_no_rows_is_null_and_keeps_no_rows(counters):
+    """SQL: `x > (SELECT max(y) FROM empty)` is NULL, so the filter keeps nothing (also under NOT)."""
+    orders, lines = _orders()
+    lf = LazyFrame(lines)
+    none = lf.filter(col("supp") > lit(10_000))
+    got = lf.filter(col("supp") > none.scalar(col("qty").max())).compute(device="cpu")
+    assert got.num_rows == 0
+    got_not = lf.filter(~(col("supp") > none.scalar(col("qty").max()))).compute(device="cpu")
+    assert got_not.num_rows == 0
+
+
+def test_null_subquery_inside_and_or_and_under_not(counters):
+    orders, lines = _orders()
+    lf = LazyFrame(lines)
+    nul = lf.filter(col("supp") > lit(10_000)).scalar(col("qty").max())
+    # AND with a NULL term is never true; OR with a NULL term is true where the other term is
+    both = lf.filter((col("supp") < lit(30)) & (col("supp") > nul)).compute(device="cpu")
+    either = lf.filter((col("supp") < lit(30)) | (col("supp") > nul)).compute(device="cpu")
+    assert both.num_rows == 0
+    assert either.num_rows == _duck({"lines": lines}, "SELECT count(*) FROM lines WHERE supp < 30")[0][0]
+    # NOT over a NULL term would need three-valued logic over rows: refused, never answered wrongly
+    with pytest.raises(ValueError, match="NULL"):
+        lf.filter(~((col("supp") < lit(30)) | (col("supp") > nul))).compute(device="cpu")
