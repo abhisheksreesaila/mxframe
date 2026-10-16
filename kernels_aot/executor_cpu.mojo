@@ -1446,21 +1446,37 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         # numbers groups by first appearance, and string codes are entry ids (first appearance in
         # the dictionaries), so those groups are reordered by the keys' values (strings by bytes);
         # integer keys on the dense / compacted paths are already in order
-        var kvals = unsafe_alloc[Float64](n_keys * n_res)
+        # one int64 per (key, result row): the key word itself (integers and floats: order-preserving), or
+        # the rank of a string / dictionary entry; the permutation is sorted on those tuples in parallel
+        var kc = unsafe_alloc[Int64](n_keys * n_res)
         for k in range(n_keys):
-            _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, kc0,
-                             kvals + k * n_res, 1.0)
-        var kperm = unsafe_alloc[Int64](n_res)
+            var kd = Int(K.kinds[k])
+            var kvk = _lp(Int(kv[k]))
+            var dstk = kc + k * n_res
+            if kd == K_DICT or kd == K_STR:
+                var card = Int(K.card[k])
+                var rk = unsafe_alloc[Int64](max(card, 1))
+                _global_ranks(kd, arrays, stride_a, kc0 + k, card, _lp(Int(K.gchunk[k])), _lp(Int(K.gcode[k])), rk)
+                for i in range(n_res):
+                    dstk[i] = rk[Int(kvk[Int(order[i])])]
+                rk.free()
+            else:
+                for i in range(n_res):
+                    dstk[i] = kvk[Int(order[i])]
+        var kw1 = n_keys + 1
+        var recs = unsafe_alloc[Int64](n_res * kw1)
         for i in range(n_res):
-            kperm[i] = Int64(i)
-        _merge_sort(kperm, n_res, kvals, n_keys, n_res)
+            for k in range(n_keys):
+                recs[i * kw1 + k] = kc[k * n_res + i]
+            recs[i * kw1 + n_keys] = Int64(i)
+        _sort_records(recs, n_res, n_keys, nt)
         var korder = unsafe_alloc[Int64](max(G, 1))
         for i in range(n_res):
-            korder[i] = order[Int(kperm[i])]
+            korder[i] = order[Int(recs[i * kw1 + n_keys])]
         order.free()
         order = korder
-        kperm.free()
-        kvals.free()
+        recs.free()
+        kc.free()
     var empty_global = not grouped and cnt[0] == 0
     if n_having > 0:
         # in parallel over blocks of the groups, keeping their order: which pass, per-block counts,
@@ -1534,7 +1550,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         if keys_as_tiebreak:
             for k in range(n_keys):
                 _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, kc0,
-                                 sv + (n_sort + k) * n_res, 1.0)
+                                 sv + (n_sort + k) * n_res, 1.0, nt)
         var bad = False
         for j in range(n_sort):
             var what = Int(sorts[3 * j])
@@ -1542,7 +1558,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             var sign = -1.0 if Int(sorts[3 * j + 2]) != 0 else 1.0
             if what == 0:
                 _key_sort_values(K, idx, _lp(Int(kv[idx])), order, n_res, arrays, stride_a, kc0,
-                                 sv + j * n_res, sign)
+                                 sv + j * n_res, sign, nt)
             else:
                 var op = Int(outs[3 * idx])
                 var slot = Int(outs[3 * idx + 1])
@@ -1567,7 +1583,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         else:
             for i in range(n_res):
                 perm[i] = Int64(i)
-        _merge_sort(perm, n_keep, sv, ns_all, n_res)
+        _merge_sort(perm, n_keep, sv, ns_all, n_res, nt)
         var sorted = unsafe_alloc[Int64](max(n_keep, 1))
         for i in range(n_keep):
             sorted[i] = order[Int(perm[i])]
@@ -1812,24 +1828,22 @@ def _less(a: Int, b: Int, sv: FP, ns: Int, n: Int) -> Bool:
     return a < b
 
 
-def _merge_sort(perm: LP, m: Int, sv: FP, ns: Int, n: Int):
-    """Sort perm[0..m) (row numbers) by _less; bottom-up merge sort."""
-    if m < 2:
-        return
-    var tmp = unsafe_alloc[Int64](m)
+def _msort_range[L: def(Int, Int) -> Bool](perm: LP, tmp: LP, lo: Int, hi: Int, less: L):
+    """Bottom-up merge sort of perm[lo..hi) (tmp: scratch of the same range), stable."""
     var src = perm
     var dst = tmp
     var width = 1
+    var m = hi - lo
     while width < m:
-        var lo = 0
-        while lo < m:
-            var mid = min(lo + width, m)
-            var hi = min(lo + 2 * width, m)
-            var i = lo
+        var a0 = lo
+        while a0 < hi:
+            var mid = min(a0 + width, hi)
+            var a1 = min(a0 + 2 * width, hi)
+            var i = a0
             var j = mid
-            var k = lo
-            while i < mid and j < hi:
-                if _less(Int(src[j]), Int(src[i]), sv, ns, n):
+            var k = a0
+            while i < mid and j < a1:
+                if less(Int(src[j]), Int(src[i])):
                     dst[k] = src[j]
                     j += 1
                 else:
@@ -1840,19 +1854,182 @@ def _merge_sort(perm: LP, m: Int, sv: FP, ns: Int, n: Int):
                 dst[k] = src[i]
                 i += 1
                 k += 1
-            while j < hi:
+            while j < a1:
                 dst[k] = src[j]
                 j += 1
                 k += 1
-            lo += 2 * width
+            a0 += 2 * width
         var t = src
         src = dst
         dst = t
         width *= 2
     if Int(src) != Int(perm):
+        for i in range(lo, hi):
+            perm[i] = src[i]
+
+
+def _psort[L: def(Int, Int) -> Bool](perm: LP, m: Int, less: L, nt: Int):
+    """Stable sort of perm[0..m) by `less` (on the row numbers in perm): runs of about m / nt sorted in
+    parallel, then pairs of runs merged in parallel, round by round (F-069: the key-order sort of millions
+    of hashed groups was single-threaded and took seconds)."""
+    if m < 2:
+        return
+    var tmp = unsafe_alloc[Int64](m)
+    var nruns = nt if (nt > 1 and m >= 32768) else 1
+    var bounds = unsafe_alloc[Int64](nruns + 1)
+    for r in range(nruns + 1):
+        bounds[r] = Int64(r * m // nruns)
+
+    def sort_run(r: Int) {imm}:
+        _msort_range(perm, tmp, Int(bounds[r]), Int(bounds[r + 1]), less)
+
+    _par(sort_run, nruns)
+    var src = perm
+    var dst = tmp
+    var cnt = nruns
+    while cnt > 1:
+        var pairs = (cnt + 1) // 2
+
+        def merge_pair(q: Int) {imm}:
+            var a0 = Int(bounds[2 * q])
+            var mid = Int(bounds[min(2 * q + 1, cnt)])
+            var a1 = Int(bounds[min(2 * q + 2, cnt)])
+            var i = a0
+            var j = mid
+            var k = a0
+            while i < mid and j < a1:
+                if less(Int(src[j]), Int(src[i])):
+                    dst[k] = src[j]
+                    j += 1
+                else:
+                    dst[k] = src[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                dst[k] = src[i]
+                i += 1
+                k += 1
+            while j < a1:
+                dst[k] = src[j]
+                j += 1
+                k += 1
+
+        _par(merge_pair, pairs)
+        for q in range(pairs + 1):                      # the merged runs' bounds
+            bounds[q] = bounds[min(2 * q, cnt)]
+        cnt = pairs
+        var t = src
+        src = dst
+        dst = t
+    if Int(src) != Int(perm):
         for i in range(m):
             perm[i] = src[i]
     tmp.free()
+    bounds.free()
+
+
+@always_inline
+def _rec_less(a: LP, b: LP, nk: Int) -> Bool:
+    for k in range(nk):
+        if a[k] != b[k]:
+            return a[k] < b[k]
+    return a[nk] < b[nk]
+
+
+def _merge_recs(src: LP, dst: LP, a0: Int, mid: Int, a1: Int, w: Int, nk: Int):
+    var i = a0
+    var j = mid
+    var k = a0
+    while i < mid and j < a1:
+        if _rec_less(src + j * w, src + i * w, nk):
+            for q in range(w):
+                dst[k * w + q] = src[j * w + q]
+            j += 1
+        else:
+            for q in range(w):
+                dst[k * w + q] = src[i * w + q]
+            i += 1
+        k += 1
+    while i < mid:
+        for q in range(w):
+            dst[k * w + q] = src[i * w + q]
+        i += 1
+        k += 1
+    while j < a1:
+        for q in range(w):
+            dst[k * w + q] = src[j * w + q]
+        j += 1
+        k += 1
+
+
+def _sort_records(recs: LP, m: Int, nk: Int, nt: Int):
+    """Sort m records of nk + 1 int64 words (nk key words, then the row number) on the key words, then the
+    row number, in parallel: runs sorted bottom-up, then merged pairwise. Records move with their keys, so
+    the merges read sequentially (an index sort over millions of hashed groups missed the cache on every compare)."""
+    if m < 2:
+        return
+    var w = nk + 1
+    var tmp = unsafe_alloc[Int64](m * w)
+    var nruns = nt if (nt > 1 and m >= 32768) else 1
+    var bounds = unsafe_alloc[Int64](nruns + 1)
+    for r in range(nruns + 1):
+        bounds[r] = Int64(r * m // nruns)
+    # bit flags: which buffer holds each run's result after its own sort
+    var inbuf = unsafe_alloc[Int64](nruns)
+
+    def sort_run(r: Int) {imm}:
+        var lo = Int(bounds[r])
+        var hi = Int(bounds[r + 1])
+        var src = recs
+        var dst = tmp
+        var width = 1
+        while width < hi - lo:
+            var a0 = lo
+            while a0 < hi:
+                _merge_recs(src, dst, a0, min(a0 + width, hi), min(a0 + 2 * width, hi), w, nk)
+                a0 += 2 * width
+            var t = src
+            src = dst
+            dst = t
+            width *= 2
+        if Int(src) != Int(recs):
+            for i in range(lo * w, hi * w):
+                recs[i] = src[i]
+
+    _par(sort_run, nruns)
+    var src = recs
+    var dst = tmp
+    var cnt = nruns
+    while cnt > 1:
+        var pairs = (cnt + 1) // 2
+        var cs = src
+        var cd = dst
+        var c0 = cnt
+
+        def merge_pair(q: Int) {imm}:
+            _merge_recs(cs, cd, Int(bounds[2 * q]), Int(bounds[min(2 * q + 1, c0)]), Int(bounds[min(2 * q + 2, c0)]), w, nk)
+
+        _par(merge_pair, pairs)
+        for q in range(pairs + 1):
+            bounds[q] = bounds[min(2 * q, cnt)]
+        cnt = pairs
+        src = cd
+        dst = cs
+    if Int(src) != Int(recs):
+        for i in range(m * w):
+            recs[i] = src[i]
+    tmp.free()
+    bounds.free()
+    inbuf.free()
+
+
+def _merge_sort(perm: LP, m: Int, sv: FP, ns: Int, n: Int, nt: Int):
+    """Sort perm[0..m) (row numbers) by _less."""
+
+    def lt(a: Int, b: Int) {imm} -> Bool:
+        return _less(a, b, sv, ns, n)
+
+    _psort(perm, m, lt, nt)
 
 
 def _top_k(perm: LP, n: Int, k: Int, sv: FP, ns: Int) -> Int:
@@ -1902,7 +2079,7 @@ def _free_kv(kv: LP, n_keys: Int):
 
 
 def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP, stride_a: Int,
-                     n_cols: Int, dst: FP, sign: Float64):
+                     n_cols: Int, dst: FP, sign: Float64, nt: Int):
     """dst[i] = sign * (exact rank of row i's value of key k): strings by their bytes; integers by
     their code when it fits in float64 exactly (dense and compacted codes are below 2^27), else by
     their rank among the rows (hashed codes are the raw values or, for floats, order-preserving key
@@ -1927,51 +2104,25 @@ def _key_sort_values(K: Keys, k: Int, kvi: LP, order: LP, n_res: Int, arrays: LP
             dst[i] = sign * Float64(Int(kvi[Int(order[i])]))
         return
     var perm = unsafe_alloc[Int64](n_res)
-    var tmp = unsafe_alloc[Int64](n_res)
     for i in range(n_res):
         perm[i] = Int64(i)
-    # merge sort of row numbers by their int64 code (ties by row number)
+
+    var codes = unsafe_alloc[Int64](n_res)          # the codes by result row: sequential reads in the sort
+    for i in range(n_res):
+        codes[i] = kvi[Int(order[i])]
+
+    def lt(a: Int, b: Int) {imm} -> Bool:          # by int64 code, ties by row number (stable)
+        return codes[a] < codes[b]
+
+    _psort(perm, n_res, lt, nt)
     var src = perm
-    var dstp = tmp
-    var width = 1
-    while width < n_res:
-        var lo = 0
-        while lo < n_res:
-            var mid = min(lo + width, n_res)
-            var hi2 = min(lo + 2 * width, n_res)
-            var a = lo
-            var b = mid
-            var t = lo
-            while a < mid and b < hi2:
-                var ca = kvi[Int(order[Int(src[a])])]
-                var cb = kvi[Int(order[Int(src[b])])]
-                if cb < ca or (cb == ca and src[b] < src[a]):
-                    dstp[t] = src[b]
-                    b += 1
-                else:
-                    dstp[t] = src[a]
-                    a += 1
-                t += 1
-            while a < mid:
-                dstp[t] = src[a]
-                a += 1
-                t += 1
-            while b < hi2:
-                dstp[t] = src[b]
-                b += 1
-                t += 1
-            lo += 2 * width
-        var sw = src
-        src = dstp
-        dstp = sw
-        width *= 2
     var r = 0
     for t in range(n_res):
-        if t > 0 and kvi[Int(order[Int(src[t])])] != kvi[Int(order[Int(src[t - 1])])]:
+        if t > 0 and codes[Int(src[t])] != codes[Int(src[t - 1])]:
             r += 1
         dst[Int(src[t])] = sign * Float64(r)
     perm.free()
-    tmp.free()
+    codes.free()
 # ── M2: native leaf filter ─────────────────────────────────────────────────────────────────
 #
 # Filter*(Scan) leaves under a join: the predicate runs on the bytecode interpreter per morsel (in
