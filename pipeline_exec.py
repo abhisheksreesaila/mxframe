@@ -75,7 +75,7 @@ def _gpu_aggregate(pk, prog: PipelineProgram, cc: ChunkedColumns, gids, n_groups
     partials = gpu_budget.run_piece(
         "aggregate", gpu_budget.aggregate_bytes(row_bytes, chunk, n_groups, prog.n_slots),
         lambda: _run_gpu(pk, prog, cc, gids, n_groups, n_rows, chunk), cpu,
-        shape=(n_rows, n_groups, prog.n_slots), retry=lambda: _run_gpu(pk, prog, cc, gids, n_groups, n_rows, (chunk + 1) // 2))
+        shape=(n_rows, n_groups, prog.n_slots, tuple(prog.columns), row_bytes), retry=lambda: _run_gpu(pk, prog, cc, gids, n_groups, n_rows, (chunk + 1) // 2))
     return partials, "cpu" if on_cpu else "gpu"
 
 

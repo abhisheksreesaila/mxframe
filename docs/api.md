@@ -36,14 +36,16 @@ Null keys never match.
 
 | Argument | Meaning |
 |---|---|
-| `device` | `"auto"` (default): estimate the query on each device from this machine's calibration and run it on the cheaper one. `"cpu"`: always the CPU. `"gpu"`: the GPU, raising `RuntimeError` if there is none. |
+| `device` | `"auto"` (default): estimate the query on each device from this machine's calibration and run it on the cheaper one. `"cpu"`: always the CPU. `"gpu"`: the GPU, raising `RuntimeError` if there is none. A GPU piece (fused aggregate, join, sort, gather, string filter, masked global aggregate) that does not fit the GPU's free memory, or runs out of it, reruns on the CPU with a `RuntimeWarning` (see `strict` and below). |
 | `verbose` | Print optimizer passes and compile/execute timing |
 | `optimize`, `validate` | Run the plan optimizer and the plan checks first (both on by default) |
 | `prefer` | Auto only: `"cpu"` or `"gpu"` biases the choice without forcing it |
 | `placement` | Auto only: e.g. `{"join": "gpu"}`; today any `"gpu"` value places the whole query on the GPU |
 | `gpu_fraction` | Auto only: a fixed GPU share of rows when a fused aggregate is split over CPU and GPU |
-| `strict` | Auto only: raise GPU errors instead of rerunning on the CPU |
+| `strict` | Raise GPU errors instead of rerunning on the CPU; for a GPU piece that does not fit or runs out of memory this is a `MemoryError` that names the piece, its estimate and the free budget (`device="gpu"` and `"auto"`) |
 | `profile` | Auto only: record the actual time next to the estimate in `last_auto_decision` |
+
+**Data bigger than GPU memory.** Each GPU piece estimates its device memory first; over 90% of the GPU's free memory it runs on the CPU. A piece that runs out of memory anyway is retried once with half the rows per chunk (aggregates), then rerun on the CPU, and the shape is remembered until clearly more (1.5x) memory is free. `lf.last_compile_provenance["gpu_pieces"]` and `lf.explain(include_runtime=True)` (`gpu_pieces=...`) say which piece left the GPU and why; under `"auto"`, `lf.last_auto_decision.explain()` lists them as `gpu piece:` lines. `MXFRAME_GPU_MEM_BUDGET` (for example `512M`, or `0:512M,1:2G` per GPU) fakes a smaller GPU for tests. A join whose output passes 2^31 rows raises `MemoryError` on every device (a size limit, not GPU memory).
 
 **In 0.6.0, pass `device="cpu"`.** The native Mojo executor, which every 0.6.0 benchmark number measures, runs only under `device="cpu"`; `"auto"` runs the older fused pipeline when it picks the CPU (ticket F-053 in `docs/plan.md`).
 

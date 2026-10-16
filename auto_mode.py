@@ -541,7 +541,8 @@ def is_sticky_gpu_error(err: BaseException) -> bool:
     return "CUDA_ERROR" in text or "cuda error" in text.lower()
 
 
-_failed_shapes: set = set()
+_failed_shapes: dict = {}      # shape -> GPU free bytes when it ran out of memory (None: any other error)
+RETRY_FREE_FACTOR = 1.5       # an out-of-memory shape is tried on the GPU again once this much more is free
 _warned_shapes: set = set()
 
 
@@ -552,16 +553,37 @@ def _shape_key(plan):
         return None
 
 
-def remember_gpu_failure(plan) -> None:
+def remember_gpu_failure(plan, free_bytes: Optional[int] = None) -> None:
+    """Remember a shape the GPU failed on. For out-of-memory pass the free GPU memory at that time: the
+    shape gets another GPU try once clearly more is free (another process may have let go)."""
     k = _shape_key(plan)
     if k is not None:
-        _failed_shapes.add(k)
+        _failed_shapes[k] = free_bytes
+
+
+def _shape_failed(plan) -> bool:
+    k = _shape_key(plan)
+    if k is None or k not in _failed_shapes:
+        return False
+    was = _failed_shapes[k]
+    if was is not None:
+        try:
+            from . import gpu_budget
+            if gpu_budget.free_bytes() >= RETRY_FREE_FACTOR * was:
+                del _failed_shapes[k]
+                _warned_shapes.discard(k)
+                return False
+        except Exception:
+            pass
+    return True
 
 
 def forget_gpu_failures() -> None:
     global _gpu_disabled
     _failed_shapes.clear()
     _warned_shapes.clear()
+    from . import gpu_budget
+    gpu_budget.forget()
     _gpu_disabled = None
 
 
@@ -658,7 +680,7 @@ def _choose_device(plan, calib, gpu, prefer, placement, quick):
         return AutoDecision("cpu", "no gpu", est, gpu_available=False)
     if _gpu_disabled is not None:
         return AutoDecision("cpu", f"gpu disabled after error: {_gpu_disabled}", est, gpu_available=False)
-    if _shape_key(plan) in _failed_shapes:
+    if _shape_failed(plan):
         return AutoDecision("cpu", "this query shape failed on gpu before", est)
     init = gpu.remaining_init_ms()
     blocked = [l for l in est.lines if l.gpu_ms == float("inf")]

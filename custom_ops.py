@@ -634,9 +634,10 @@ class CustomOpsCompiler(GraphCompiler):
                     and lhs_expr.op == "col" and rhs_expr.op == "lit"
                     and isinstance(rhs_expr.args[0], str)):
                 col_arr = self._eval_expr_arrow(lhs_expr, table)
-                if pa.types.is_string(col_arr.type):
-                    mask = self._aot_gpu.utf8_equal_mask(col_arr, rhs_expr.args[0])
-                    bool_mask = mask.astype(np.bool_, copy=False)
+                bool_mask = (self._gpu_mask("string filter", col_arr,
+                                            lambda: self._aot_gpu.utf8_equal_mask(col_arr, rhs_expr.args[0]))
+                             if pa.types.is_string(col_arr.type) else None)
+                if bool_mask is not None:
                     if op == "ne":
                         bool_mask = np.logical_not(bool_mask)
                         if col_arr.null_count:
@@ -655,8 +656,9 @@ class CustomOpsCompiler(GraphCompiler):
             if (self._session_device == "gpu" and self._aot_gpu is not None
                     and pa.types.is_string(col_arr.type) and args[1]
                     and all(isinstance(value, str) for value in args[1])):
-                mask = self._aot_gpu.utf8_isin_mask(col_arr, args[1])
-                return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
+                mask = self._gpu_mask("string filter", col_arr, lambda: self._aot_gpu.utf8_isin_mask(col_arr, args[1]))
+                if mask is not None:
+                    return _npa(mask, type=pa.bool_())
             return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
         if op == "str_slice":
             return _str_slice(self._eval_expr_arrow(args[0], table), args[1], args[2])
@@ -664,15 +666,19 @@ class CustomOpsCompiler(GraphCompiler):
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
                     and pa.types.is_string(col_arr.type)):
-                mask = self._aot_gpu.utf8_startswith_mask(col_arr, args[1])
-                return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
+                mask = self._gpu_mask("string filter", col_arr,
+                                      lambda: self._aot_gpu.utf8_startswith_mask(col_arr, args[1]))
+                if mask is not None:
+                    return _npa(mask, type=pa.bool_())
             return pc.starts_with(col_arr, pattern=args[1])
         if op == "contains":
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
                     and pa.types.is_string(col_arr.type)):
-                mask = self._aot_gpu.utf8_contains_mask(col_arr, args[1])
-                return _npa(mask.astype(np.bool_, copy=False), type=pa.bool_())
+                mask = self._gpu_mask("string filter", col_arr,
+                                      lambda: self._aot_gpu.utf8_contains_mask(col_arr, args[1]))
+                if mask is not None:
+                    return _npa(mask, type=pa.bool_())
             return pc.match_substring(col_arr, pattern=args[1])
         if op == "year_days":
             col_arr = self._eval_expr_arrow(args[0], table)
@@ -873,6 +879,19 @@ class CustomOpsCompiler(GraphCompiler):
             upper[0], comparisons[(upper[0], "lt")],
         )
 
+    def _gpu_mask(self, name, col_arr, gpu_fn):
+        """A bool numpy mask from a GPU string kernel, or None when the piece left the GPU (Arrow does it)."""
+        mask = gpu_budget.run_piece(name, col_arr.nbytes + 8 * len(col_arr), gpu_fn, lambda: None,
+                                    shape=(len(col_arr), col_arr.nbytes))
+        return None if mask is None else mask.astype(np.bool_, copy=False)
+
+    def _masked_on_gpu(self, name, gpu_fn, cpu_fn, *arrays):
+        """A masked global aggregate on the GPU, rerun by the CPU AOT kernel when the GPU is too small."""
+        if cpu_fn is None:
+            return gpu_fn(*arrays)
+        return gpu_budget.run_piece(name, sum(a.nbytes for a in arrays) + 4096, lambda: gpu_fn(*arrays),
+                                    lambda: cpu_fn(*arrays), shape=(len(arrays[-1]), len(arrays), arrays[0].dtype.str))
+
     def _run_masked_global_sum(
         self, arr_f32: np.ndarray, mask_np: np.ndarray, N: int
     ) -> float:
@@ -880,7 +899,7 @@ class CustomOpsCompiler(GraphCompiler):
         if self._cpu_aot_fallback():
             return self._aot.masked_global_sum(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
-            return self._aot_gpu.masked_global_sum_f32(arr_f32, mask_np)
+            return self._masked_on_gpu("masked_global_sum", self._aot_gpu.masked_global_sum_f32, self._aot and self._aot.masked_global_sum, arr_f32, mask_np)
         cache_key = ("_masked_global_sum_kernel", N, self._session_device)
         if cache_key not in _MODEL_CACHE:
             mg_graph = Graph(
@@ -924,7 +943,7 @@ class CustomOpsCompiler(GraphCompiler):
         if self._cpu_aot_fallback():
             return self._aot.masked_global_sum_product(a_f32, b_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
-            return self._aot_gpu.masked_global_sum_product_f32(a_f32, b_f32, mask_np)
+            return self._masked_on_gpu("masked_global_sum_product", self._aot_gpu.masked_global_sum_product_f32, self._aot and self._aot.masked_global_sum_product, a_f32, b_f32, mask_np)
         cache_key = ("_masked_global_sum_product_kernel", N, self._session_device)
         if cache_key not in _MODEL_CACHE:
             mg_graph = Graph(
@@ -964,7 +983,7 @@ class CustomOpsCompiler(GraphCompiler):
         if self._cpu_aot_fallback():
             return self._aot.masked_global_min(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
-            return self._aot_gpu.masked_global_min_f32(arr_f32, mask_np)
+            return self._masked_on_gpu("masked_global_min", self._aot_gpu.masked_global_min_f32, self._aot and self._aot.masked_global_min, arr_f32, mask_np)
         cache_key = ("_masked_global_min_kernel", N, self._session_device)
         if cache_key not in _MODEL_CACHE:
             mg_graph = Graph(
@@ -1002,7 +1021,7 @@ class CustomOpsCompiler(GraphCompiler):
         if self._cpu_aot_fallback():
             return self._aot.masked_global_max(arr_f32, mask_np)
         if self._session_device == "gpu" and self._aot_gpu is not None:
-            return self._aot_gpu.masked_global_max_f32(arr_f32, mask_np)
+            return self._masked_on_gpu("masked_global_max", self._aot_gpu.masked_global_max_f32, self._aot and self._aot.masked_global_max, arr_f32, mask_np)
         cache_key = ("_masked_global_max_kernel", N, self._session_device)
         if cache_key not in _MODEL_CACHE:
             mg_graph = Graph(
@@ -1137,15 +1156,14 @@ class CustomOpsCompiler(GraphCompiler):
             try:
                 (product, int_name, int_lo, int_hi, float_name, float_lo,
                  float_hi, upper_name, upper_hi) = range5_spec
-                value = self._aot_gpu.range5_sum_product_f32(
-                    self._get_col_as_f32(product[0], table),
-                    self._get_col_as_f32(product[1], table),
-                    np.ascontiguousarray(
-                        _np_of(table.column(int_name), zero_copy_only=False), dtype=np.int32),
-                    self._get_col_as_f32(float_name, table),
-                    self._get_col_as_f32(upper_name, table),
-                    int(int_lo), int(int_hi), float(float_lo), float(float_hi), float(upper_hi),
-                )
+                r5 = (self._get_col_as_f32(product[0], table), self._get_col_as_f32(product[1], table),
+                      np.ascontiguousarray(_np_of(table.column(int_name), zero_copy_only=False), dtype=np.int32),
+                      self._get_col_as_f32(float_name, table), self._get_col_as_f32(upper_name, table))
+                value = gpu_budget.run_piece(          # out of GPU memory: the general path below
+                    "range5 sum-product", sum(a.nbytes for a in r5) + 4096,
+                    lambda: self._aot_gpu.range5_sum_product_f32(
+                        *r5, int(int_lo), int(int_hi), float(float_lo), float(float_hi), float(upper_hi)),
+                    gpu_budget.leave_gpu, shape=(N, len(r5)))
                 if value == 0.0:
                     raise ValueError("no row passed: the general path below returns SQL's NULL")
                 name = agg_node.aggs[0]._alias or "agg_0"
@@ -2740,7 +2758,7 @@ class CustomOpsCompiler(GraphCompiler):
             # F-056: over the GPU's free memory, or out of it: the stable CPU argsort gives the same order
             return gpu_budget.run_piece(
                 "sort", gpu_budget.sort_bytes(N, composite_key.itemsize) + gpu_budget.gather_bytes(table, k),
-                gpu_sort, cpu_sort, shape=(N, k, table.num_columns))
+                gpu_sort, cpu_sort, shape=(N, k, composite_key.dtype.str, str(table.schema.types)))
 
         # Fallback: MAX Graph bitonic sort + numpy gather
         cache_key = ("sort_indices", N, self._session_device)
@@ -3209,7 +3227,7 @@ class CustomOpsCompiler(GraphCompiler):
             def gather(t, ix):
                 return gpu_budget.run_piece(
                     "gather", gpu_budget.gather_bytes(t, len(ix)), lambda: self._aot_gpu.gather_table(t, ix),
-                    lambda: _take_rows(t, ix), shape=(t.num_rows, len(ix), t.num_columns))
+                    lambda: _take_rows(t, ix), shape=(t.num_rows, len(ix), str(t.schema.types)))
             left_take, right_take = gather(left_table, left_idx), gather(right_table, right_idx)
         else:
             left_take = _take_rows(left_table, left_idx)
@@ -4007,7 +4025,9 @@ class CustomOpsCompiler(GraphCompiler):
 
             # ── AOT fast path (no JIT, no large table H2D uploads) ─────────────
             if self._aot_gpu is not None:
-                dense_ids, n_groups = self._aot_gpu.group_encode_i32(keys_np, cap)
+                dense_ids, n_groups = gpu_budget.run_piece(   # out of GPU memory: the caller encodes on the CPU
+                    "group encode", 4 * n + 8 * cap + 4 * n, lambda: self._aot_gpu.group_encode_i32(keys_np, cap),
+                    gpu_budget.leave_gpu, shape=(n, cap))
             else:
                 # ── MAX Graph fallback ────────────────────────────────────────
                 capacity_np = np.array([cap], dtype=np.int32)

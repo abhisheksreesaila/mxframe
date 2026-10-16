@@ -172,8 +172,11 @@ def limit_cuda_alloc(monkeypatch, biggest):
 
 
 @pytest.mark.parametrize("device", ["gpu", "auto"])
-def test_an_aggregate_that_runs_out_of_memory_is_halved_and_retried_on_the_gpu(tables, monkeypatch, device):
-    lf, sql = aggregate(*tables)
+@pytest.mark.parametrize("fn", ["sum", "min", "max", "mean"])
+def test_an_aggregate_that_runs_out_of_memory_is_halved_and_retried_on_the_gpu(tables, monkeypatch, device, fn):
+    lf = (LazyFrame(tables[0]).filter(col("v") > 10).groupby("k")
+          .agg(getattr(col("v"), fn)().alias("s"), col("v").count().alias("c")).sort("k"))
+    sql = f"SELECT k, {fn if fn != 'mean' else 'avg'}(v)::DOUBLE AS s, count(v) AS c FROM t WHERE v > 10 GROUP BY k ORDER BY k"
     limit_cuda_alloc(monkeypatch, N * 3)           # a column of all rows is 1.6 MB; half of them fit
     got, warned = run(lf, device, monkeypatch)
     same(got, reference(sql, *tables))
@@ -206,6 +209,112 @@ def test_auto_remembers_the_query_shape_after_a_piece_ran_out_of_memory(tables, 
     monkeypatch.undo()
     decision = am.choose_device(optimize_plan(lf.plan).plan)
     assert (decision.device, decision.reason) == ("cpu", "this query shape failed on gpu before")
+
+
+def test_a_remembered_shape_gets_another_gpu_try_once_much_more_memory_is_free(tables, monkeypatch):
+    lf, sql = aggregate(*tables)
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "10M")
+    with monkeypatch.context() as m:
+        limit_cuda_alloc(m, N)
+        run(lf, "gpu", monkeypatch)
+    assert pieces(lf)[0].startswith("aggregate: ran on CPU, ran out of GPU memory")
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "14M")           # not 1.5x more yet
+    run(lf, "gpu", monkeypatch)
+    assert pieces(lf) == ["aggregate: ran on CPU, this shape ran out of GPU memory before"]
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "15M")           # 1.5x: the GPU again
+    got, _ = run(lf, "gpu", monkeypatch)
+    same(got, reference(sql, *tables))
+    assert pieces(lf) == [] and lf.last_compile_provenance["path"] == "fused_pipeline_gpu"
+
+
+def test_auto_tries_the_gpu_again_when_much_more_memory_is_free(tables, monkeypatch):
+    lf, _ = aggregate(*tables)
+    real_choose = am.choose_device
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "10M")
+    with monkeypatch.context() as m:
+        limit_cuda_alloc(m, N)
+        run(lf, "auto", monkeypatch)
+    plan = optimize_plan(lf.plan).plan
+    monkeypatch.setattr(am, "choose_device", real_choose)
+    assert am.choose_device(plan).reason == "this query shape failed on gpu before"
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "15M")
+    assert am.choose_device(plan).reason != "this query shape failed on gpu before"
+
+
+def test_another_query_is_not_pinned_to_the_cpu_by_a_remembered_shape(tables, monkeypatch):
+    a, _ = aggregate(*tables)
+    with monkeypatch.context() as m:
+        limit_cuda_alloc(m, N)
+        run(a, "gpu", monkeypatch)
+    b = (LazyFrame(tables[0]).filter(col("v") > 10).groupby("k")        # same rows, groups and slots, other columns
+         .agg(col("j").sum().alias("s"), col("j").count().alias("c")).sort("k"))
+    run(b, "gpu", monkeypatch)
+    assert pieces(b) == []
+
+
+def test_forgetting_gpu_failures_forgets_remembered_pieces(tables, monkeypatch):
+    lf, _ = aggregate(*tables)
+    with monkeypatch.context() as m:
+        limit_cuda_alloc(m, N)
+        run(lf, "gpu", monkeypatch)
+    am.forget_gpu_failures()
+    run(lf, "gpu", monkeypatch)
+    assert pieces(lf) == []
+
+
+def test_a_join_output_past_the_kernel_limit_is_a_size_error_not_an_out_of_memory():
+    def too_big():
+        raise gpu_budget.JoinOutputTooLarge("join output would have 3,000,000,000 rows")
+    with pytest.raises(gpu_budget.JoinOutputTooLarge, match="3,000,000,000"):
+        gpu_budget.run_piece("join", 1, too_big, lambda: "cpu", shape=("x",))
+    assert gpu_budget._remembered == {}
+
+
+def test_a_string_filter_over_the_budget_runs_on_the_cpu(monkeypatch):
+    """The GPU string kernels upload the string bytes (the likeliest out-of-memory): at the expression level."""
+    names = np.array(["alpha", "beta", "gamma", "delta"])
+    t = pa.table({"s": pa.array(names[np.arange(N) % 4]), "v": np.arange(N, dtype=np.int32)})
+    comp = custom_ops.CustomOpsCompiler(device="gpu")
+    exprs = [col("s") == "beta", col("s") != "beta", col("s").isin(["beta", "gamma"]), col("s").startswith("g"),
+             col("s").contains("mm")]
+    for budget, pieces_expected in [(None, 0), ("1M", 1)]:
+        if budget:
+            monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", budget)
+        for e in exprs:
+            with gpu_budget.track(device="auto") as r:
+                got = comp._eval_expr_arrow(e, t).to_numpy(zero_copy_only=False)
+            want = {"eq": names[np.arange(N) % 4] == "beta", "ne": names[np.arange(N) % 4] != "beta",
+                    "isin": np.isin(names[np.arange(N) % 4], ["beta", "gamma"]),
+                    "startswith": names[np.arange(N) % 4] == "gamma", "contains": names[np.arange(N) % 4] == "gamma"}[e.op]
+            assert np.array_equal(got, want), e.op
+            assert len(r.events) == pieces_expected, e.op
+            if budget:
+                assert r.events[0]["line"].startswith("string filter: ran on CPU, needs about "), e.op
+
+
+def test_masked_global_aggregates_over_the_budget_run_on_the_cpu_kernel(monkeypatch):
+    comp = custom_ops.CustomOpsCompiler(device="gpu")
+    v = (np.arange(N) % 100).astype(np.float32)
+    mask = (np.arange(N) % 3 == 0).astype(np.int32)
+    want = {"sum": float(v[mask == 1].sum()), "min": float(v[mask == 1].min()), "max": float(v[mask == 1].max())}
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "1M")
+    for fn in want:
+        with gpu_budget.track(device="auto") as r:
+            got = getattr(comp, f"_run_masked_global_{fn}")(v, mask, N)
+        assert got == want[fn], fn
+        assert r.lines == [f"masked_global_{fn}: ran on CPU, needs about 3.1 MB of GPU memory, over 90% of the 1.0 MB free"]
+    with gpu_budget.track(device="auto") as r:
+        assert comp._run_masked_global_sum_product(v, v, mask, N) == float((v[mask == 1].astype(np.float64) ** 2).sum())
+    assert r.lines[0].startswith("masked_global_sum_product: ran on CPU")
+
+
+def test_group_encoding_over_the_budget_hands_back_to_the_cpu_encoder(monkeypatch):
+    comp = custom_ops.CustomOpsCompiler(device="gpu")
+    keys = pa.array((np.arange(N) % 50).astype(np.int32))
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "1M")
+    with gpu_budget.track(device="auto") as r:
+        assert comp._build_group_ids_gpu_single_int(keys, "k", N) is None
+    assert r.lines[0].startswith("group encode: ran on CPU, needs about ")
 
 
 @pytest.mark.parametrize("kernel, name", [("join_count_i32_gpu", "join"), ("sort_topk_i32_gpu", "top-k")])

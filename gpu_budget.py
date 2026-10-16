@@ -68,6 +68,19 @@ def free_bytes(pool: Optional[int] = None) -> int:
     return free if fake is None else min(free, fake)
 
 
+class JoinOutputTooLarge(MemoryError):
+    """A join output past what the kernels address (2^31 rows): a size limit on every device, not a GPU
+    out-of-memory, so it is neither retried on the CPU (which has the same limit) nor remembered."""
+
+
+class LeaveGpu(Exception):
+    """Raised by `leave_gpu` for callers that already catch errors and continue on a CPU path."""
+
+
+def leave_gpu():
+    raise LeaveGpu("left the GPU")
+
+
 class Run:
     """The GPU pieces of one `compute()`: what ran where, and why a piece left the GPU."""
 
@@ -80,12 +93,15 @@ class Run:
         return [e["line"] for e in self.events]
 
     @property
-    def oom(self) -> bool:
-        return any(e["why"] == "out of memory" for e in self.events)
+    def oom_free(self) -> Optional[int]:
+        """Free GPU bytes when a piece last ran out of memory, or None if none did."""
+        free = [e["free"] for e in self.events if e["why"] == "out of memory"]
+        return min(free) if free else None
 
 
 _run: contextvars.ContextVar = contextvars.ContextVar("mxframe_gpu_run", default=None)
-_remembered: set = set()      # (piece, shape) that ran out of GPU memory
+RETRY_FREE_FACTOR = 1.5       # a remembered shape gets another GPU try once this much more is free
+_remembered: dict = {}        # (piece, shape) that ran out of GPU memory -> free bytes when it did
 _warned: set = set()
 
 
@@ -130,13 +146,17 @@ def run_piece(name: str, need: int, gpu: Callable, cpu: Callable, *, shape=None,
             warnings.warn(f"mxframe gpu: {line}", RuntimeWarning, stacklevel=4)
         return cpu()
 
-    if key in _remembered:
-        return leave("remembered", None)
     free = free_bytes()
+    if key in _remembered:
+        if free < RETRY_FREE_FACTOR * _remembered[key]:
+            return leave("remembered", free)
+        del _remembered[key]                    # clearly more is free now: try the GPU again
     if need > PRECHECK_FRACTION * free:
         return leave("precheck", free)
     try:
         return gpu()
+    except JoinOutputTooLarge:
+        raise
     except MemoryError as err:
         if retry is not None and not run.strict:
             try:
@@ -147,7 +167,7 @@ def run_piece(name: str, need: int, gpu: Callable, cpu: Callable, *, shape=None,
                 return out
             except MemoryError as err2:
                 err = err2
-        _remembered.add(key)
+        _remembered[key] = free
         return leave("out of memory", free, err)
 
 

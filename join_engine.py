@@ -599,7 +599,7 @@ def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = F
     if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
         return gpu_budget.run_piece(
             "gather", gpu_budget.gather_bytes(table, len(idx)), lambda: comp._aot_gpu.gather_table(table, idx),
-            lambda: _take_rows(table, idx), shape=(table.num_rows, len(idx), table.num_columns))
+            lambda: _take_rows(table, idx), shape=(table.num_rows, len(idx), str(table.schema.types)))
     from . import native_exec
     out = native_exec.try_gather(comp, table, idx, decode_dicts)
     if out is not None:

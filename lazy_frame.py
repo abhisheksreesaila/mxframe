@@ -288,13 +288,13 @@ class LazyFrame:
             try:
                 result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace,
                                               strict=strict, auto=True)
-                if prov.get("gpu_pieces_oom"):      # a piece ran out of GPU memory and went to the CPU (F-056)
-                    _am.remember_gpu_failure(plan)
+                if prov.get("gpu_pieces_oom") is not None:      # a piece ran out of GPU memory and went to the CPU (F-056)
+                    _am.remember_gpu_failure(plan, prov["gpu_pieces_oom"])
                 decision.pieces = prov.get("gpu_pieces", "")
             except Exception as err:
                 if strict:
                     raise
-                _am.remember_gpu_failure(plan)
+                _am.remember_gpu_failure(plan, _oom_free(err))
                 if _am.is_sticky_gpu_error(err):
                     _am.disable_gpu(f"{type(err).__name__}: {err}")
                 _am.warn_fallback_once(plan, err)
@@ -752,5 +752,17 @@ def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=
     prov = dict(compiler.last_compile_provenance or {})
     if run.events:
         prov["gpu_pieces"] = "; ".join(run.lines)
-        prov["gpu_pieces_oom"] = run.oom
+        if run.oom_free is not None:
+            prov["gpu_pieces_oom"] = run.oom_free      # free GPU bytes when a piece ran out of memory
     return result, prov
+
+
+def _oom_free(err: BaseException):
+    """Free GPU bytes now if `err` is an out-of-memory (the shape is retried once more is free), else None."""
+    if not isinstance(err, MemoryError):
+        return None
+    try:
+        from mxframe import gpu_budget
+        return gpu_budget.free_bytes()
+    except Exception:
+        return None
