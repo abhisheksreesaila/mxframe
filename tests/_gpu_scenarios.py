@@ -379,21 +379,32 @@ def group_skew(kind: str):
     assert dt < max(6 * t_uni, 0.1), f"skew {kind}: {dt:.3f}s vs uniform {t_uni:.3f}s"
 
 
+def _own_gpu_bytes() -> int:
+    """GPU memory held by this process (the driver's per-process accounting), so other
+    processes allocating or freeing on the same GPU do not move it."""
+    import subprocess
+    out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                          "--format=csv,noheader,nounits"], capture_output=True, text=True, check=True).stdout
+    mine = [int(m) for p, m in (ln.split(",") for ln in out.splitlines() if ln.strip())
+            if int(p) == os.getpid()]
+    assert mine, f"nvidia-smi does not list pid {os.getpid()}:\n{out}"
+    return sum(mine) << 20
+
+
 def join_failure_frees_scratch():
     """A hash_join that dies mid-way (table for a huge key does not fit) leaks nothing."""
-    from mxframe import gpu_stream
     g = gpu()
     # warm up; 2M rows also make the recursive scan create its first kernel-side buffer, which is
     # when the kernel library's memory pool (a quarter of the GPU) is reserved: not a leak
     g.hash_join(np.arange(2_000_000, dtype=np.int32), np.array([2], np.int32))
-    free0, _ = gpu_stream.mem_info()
+    used0 = _own_gpu_bytes()
     for _ in range(5):
         try:
             g.hash_join(np.array([1, 2**31 - 2], np.int32), np.array([2**31 - 2], np.int32))
         except (RuntimeError, MemoryError, OverflowError):
             pass
-    free1, _ = gpu_stream.mem_info()
-    assert free0 - free1 < 64 << 20, (free0 - free1)
+    leaked = _own_gpu_bytes() - used0
+    assert leaked < 64 << 20, leaked
 
 
 def masked_aggs(n: str):
