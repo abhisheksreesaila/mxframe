@@ -908,7 +908,7 @@ Found by the F-087 developer (2026-10-16)
 - [ ] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
 - [ ] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
 
-## F-097 IS NULL skips row groups with no NULLs [review]
+## F-097 IS NULL skips row groups with no NULLs [done]
 From the F-086 review (2026-10-16); a speedup, not a bug
 - [x] `scan_parquet` pushes `is_null` / `not is_null` (`io_parquet._pushable`, ops `isnull` / `notnull`): a row group whose `null_count` is 0 is skipped for IS NULL, one whose `null_count` equals its rows for IS NOT NULL; a missing `null_count` statistic never skips. Composes with the other ANDed pushed conjuncts; an OR is not pushed at all (as before for every conjunct kind)
 - [x] native validity test in the bytecode: `OP_ISNULL` (41) reads the column's Arrow validity bitmap (chunk offsets and slices through the bit base, a dictionary column through its indices); the column's values are never read, so it may hold NULLs, of any integer / float / bool / temporal / decimal / utf8 / dictionary-utf8 type. `_Extras` gives such a column dtype 7 and two words (bitmap address, bit base). Native executor only (`concat_dicts`): the fused pipeline and GPU compilers still decline it. A column both tested and read for its values declines (as before); an aggregate whose only use of a nullable column is `IS NULL` is no longer sent to Arrow's null path before the executor (`_arrow_aggregate_reason`, early call only: the late call still catches it when every pipeline declined)
