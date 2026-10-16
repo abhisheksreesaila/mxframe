@@ -597,6 +597,16 @@ Needs: F-064 · From the F-064 review (2026-10-16)
 - [ ] per-block GPU partials combined in block order (behind a switch if it costs; measure); `auto` sends both sides of a self-comparison (Q15 shape) to the same device
 - [ ] the F-064 tests extended to `device="gpu"` and a forced split
 
+## F-068 Arithmetic over an aggregate runs natively [todo]
+Needs: F-065 · From F-065 (2026-10-16): the main reason SQL-phrased TPC-H is 8/22 fully native vs 17/22 for the DataFrame versions
+- [ ] a Project (or division, CASE) over an Aggregate (SQL `100 * SUM(a) / SUM(b)`, Q8 / Q14 / Q17) runs the aggregate natively and the small per-group arithmetic after it, instead of declining the whole plan ("expression not supported by the bytecode compiler")
+- [ ] SQL Q8, Q14, Q17 fully native (`scripts/native_coverage.py --sql`), equal to DuckDB
+
+## F-069 Float and wide group keys in the native executor [todo]
+From F-065: SQL Q10 and Q18 group by float / wide keys as the specification writes them, and the executor declines
+- [ ] float64 group keys (exact bit equality, NaN and -0.0 like DuckDB) and composite keys wider than the direct-address space take a hashed native group-by instead of declining
+- [ ] SQL Q10, Q18 fully native and equal to DuckDB; no DataFrame query slower
+
 ## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
 Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
