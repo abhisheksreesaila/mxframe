@@ -63,8 +63,9 @@ def _revenue(lf):
 
 
 def test_single_table_keyed_aggregate(calls):
-    """6M rows, 8k groups, default mode (a table per morsel, merged in morsel order)."""
-    _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 8_000))), ["tot", "av"])      # default mode
+    """6M rows, 8k groups, `reproducible=True` (a table per morsel, merged in morsel order). The default
+    mode keeps main's faster per-worker tables here, whose last bits vary between runs."""
+    _same_every_run(_revenue(LazyFrame(_fact(6_000_000, 8_000))), ["tot", "av"], reproducible=True)
     assert calls and 3 not in calls          # the single-table aggregate, not the fused join
 
 
@@ -94,8 +95,15 @@ def _star(groups):
 
 
 def test_fused_join_aggregate(calls):
-    """Join + aggregate in one native call (plan version 3), 10k groups."""
-    _same_every_run(_star(10_000), ["tot", "av"])
+    """Join + aggregate in one native call (plan version 3), 10k groups, `reproducible=True` (the default
+    mode runs main's faster code under 16,384 groups)."""
+    _same_every_run(_star(10_000), ["tot", "av"], reproducible=True)
+    assert 3 in calls
+
+
+def test_fused_join_aggregate_in_the_default_mode_from_16384_groups(calls):
+    """Default mode, no flag: 20k groups use a table per morsel (65k and more: staged), both reproducible."""
+    _same_every_run(_star(20_000), ["tot", "av"])
     assert 3 in calls
 
 
@@ -115,12 +123,12 @@ def _tot(t, extra, threads, monkeypatch, **kw):
 
 @pytest.mark.parametrize("groups", [300, 800, 8_000])
 def test_a_sum_does_not_depend_on_the_other_aggregates(calls, monkeypatch, groups):
-    """`agg(tot)` and `agg(tot, x0, x1)` give the same bits for `tot` (the number of accumulator lanes
-    used to depend on the aggregate list)."""
+    """`reproducible=True`: `agg(tot)` and `agg(tot, x0, x1)` give the same bits for `tot` (the number of
+    accumulator lanes used to depend on the aggregate list)."""
     t = _fact(6_000_000, groups)
-    base = _tot(t, 0, 8, monkeypatch)
+    base = _tot(t, 0, 8, monkeypatch, reproducible=True)
     for extra in (2, 5):
-        assert int((base != _tot(t, extra, 8, monkeypatch)).sum()) == 0
+        assert int((base != _tot(t, extra, 8, monkeypatch, reproducible=True)).sum()) == 0
 
 
 @pytest.mark.parametrize("groups", [300, 10_000, 200_000])
@@ -148,13 +156,10 @@ def _canonical(t, groups, morsel=65536):
 @pytest.mark.parametrize("groups", [5_000, 10_000, 60_000, 200_000])
 def test_the_per_morsel_table_path_and_the_staged_path_give_the_defined_order(calls, monkeypatch, groups):
     """`reproducible=True`: 10k and 60k groups use a table per morsel, 200k the staged path (tables over
-    the budget): all equal the same NumPy reference of the defined order, bit for bit. The default mode
-    (a table per morsel up to 8,192 groups) gives the same bits at 5k groups."""
+    the budget): all equal the same NumPy reference of the defined order, bit for bit."""
     t = _fact(3_000_000, groups)
     want = _canonical(t, groups)
     assert int((_tot(t, 0, 8, monkeypatch, reproducible=True) != want).sum()) == 0
-    if groups <= 8_192:
-        assert int((_tot(t, 0, 8, monkeypatch) != want).sum()) == 0
 
 
 def test_reproducible_false_overrides_the_environment_variable(calls, monkeypatch):
@@ -213,25 +218,46 @@ def test_views_that_differ_only_in_an_array_literal_do_not_share(calls):
     assert a.filter(col("tot") == same.scalar(col("tot").max())).compute(device="cpu").num_rows == 1
 
 
-def test_default_mode_is_reproducible_up_to_8192_groups_on_a_large_input(calls):
-    """The guarantee has no row limit: 24M rows, 8k groups, 6 sums (the tables are folded into the output
-    wave by wave, so memory does not grow with the rows), 10 runs."""
+def test_reproducible_mode_has_no_row_limit(calls):
+    """24M rows, 8k groups, 6 sums, `reproducible=True` (the tables are folded into the output wave by
+    wave, so memory does not grow with the rows), 10 runs."""
     r = np.random.default_rng(5)
     n = 24_000_000
     t = pa.table({"s": A(r.integers(0, 8_000, n).astype(np.int32)), "p": A(r.random(n) * 1000), "d": A(r.random(n))})
     aggs = [(col("p") * (lit(1.0) + lit(float(i)) * col("d"))).sum().alias(f"t{i}") for i in range(6)]
-    _same_every_run(LazyFrame(t).groupby("s").agg(*aggs), [f"t{i}" for i in range(6)], runs=10)
+    _same_every_run(LazyFrame(t).groupby("s").agg(*aggs), [f"t{i}" for i in range(6)], runs=10,
+                    reproducible=True)
 
 
-def test_a_cte_joined_to_itself_on_a_float_sum_up_to_8192_groups(calls):
+def test_a_cte_joined_to_itself_on_a_float_sum(calls):
     """A CTE used twice in FROM is still computed twice (only a scalar subquery over the outer plan's own
-    aggregate shares one result): up to 8,192 groups the two sums are the same bits anyway, above that a
-    self-join on the sum can miss rows in the default mode."""
+    aggregate shares one result): the two sums are the same bits with `reproducible=True`; in the default
+    mode a self-join on the sum can miss rows."""
     import mxframe as mx
     t = _fact(2_000_000, 5_000)
     q = ("WITH a AS (SELECT s, SUM(p * (1.0 - d)) AS tot FROM t GROUP BY s) "
          "SELECT x.s FROM a x JOIN a y ON x.tot = y.tot AND x.s = y.s")
-    assert mx.sql(q, t=t).compute(device="cpu").num_rows == 5_000
+    assert mx.sql(q, t=t).compute(device="cpu", reproducible=True).num_rows == 5_000
+
+
+def test_reproducible_applies_when_the_native_executor_is_off(calls, monkeypatch):
+    """MXFRAME_NATIVE=0 sends the aggregate through the older pipeline (`run_pipeline_cpu`, the same library's
+    `mx_pipeline_cpu` with a 15th argument): `reproducible=True` still gives the defined order, bit for bit,
+    at 200k groups (it used to differ in ~100k groups per rerun)."""
+    monkeypatch.setenv("MXFRAME_NATIVE", "0")
+    t = _fact(3_000_000, 200_000)
+    monkeypatch.setenv("MXFRAME_CPU_THREADS", "8")
+    plan = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))
+
+    def by_key():                                   # this path returns groups in first-appearance order
+        out = plan.compute(device="cpu", reproducible=True)
+        order = np.argsort(out.column("s").to_numpy())
+        return np.ascontiguousarray(out.column("tot").to_numpy()[order]).view(np.int64)
+
+    first = by_key()
+    assert calls == []                              # no mx_execute: the executor was off
+    assert int((first != _canonical(t, 200_000)).sum()) == 0
+    assert int((first != by_key()).sum()) == 0
 
 
 def test_the_environment_variable_turns_reproducible_mode_on(calls, monkeypatch):

@@ -116,9 +116,14 @@ def _load_cpu():
             lib = ctypes.CDLL(str(path))
             fn = lib.mx_pipeline_cpu
             fn.restype = _I64
-            fn.argtypes = [_I64] * 14
+            fn.argtypes = [_I64] * 15
             _cpu_lib = lib
     return _cpu_lib
+
+
+def _reproducible_now() -> bool:
+    from . import native_exec
+    return native_exec.reproducible()
 
 
 def _addr(a: np.ndarray) -> int:
@@ -179,8 +184,13 @@ def _chunk_table(cc: ChunkedColumns, n_rows: int):
 
 
 def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarray], n_groups: int,
-                     start: int, end: int, threads: Optional[int] = None) -> Partials:
+                     start: int, end: int, threads: Optional[int] = None,
+                     reproducible: Optional[bool] = None) -> Partials:
     """Run the program over rows ``[start, end)`` on the CPU (all cores by default).
+
+    ``reproducible``: float sums in the defined order whatever the group count (F-064); default: the mode of
+    the ``compute()`` running in this thread (``native_exec.reproducible()``). A worker thread started by
+    the caller does not inherit it: read it first and pass it in.
 
     ``columns`` is a sequence of numpy arrays or a :class:`ChunkedColumns`
     (from ``program.bind_chunks(table)``, which avoids concatenating Arrow chunks).
@@ -202,6 +212,7 @@ def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarra
         _addr(program.set_meta), _addr(tbl), int(tbl.shape[0]), _addr(col_dt),
         _addr(gids) if gids is not None else 0, n_groups, start, end,
         _addr(vals), _addr(cnt), int(threads) if threads else default_threads(),
+        1 if (reproducible if reproducible is not None else _reproducible_now()) else 0,
     )
     if rc != 0:
         raise RuntimeError(f"mx_pipeline_cpu failed with code {rc}")

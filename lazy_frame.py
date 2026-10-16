@@ -262,11 +262,11 @@ class LazyFrame:
                 (see `last_auto_decision`). Per-operator timings that refine the
                 calibration arrive with per-operator placement.
             reproducible: ``True`` makes every native CPU float SUM / MEAN bit-identical from run to run
-                whatever the number of groups (default: ``MXFRAME_REPRODUCIBLE=1`` or off). By default
-                results are bit-reproducible with no groups, up to 8,192 groups (any number of rows) and on fused joins;
-                a plain group-by with more groups takes a faster path whose sums can differ in the last
-                bits between runs. Costs up to ~20% on the many-groups aggregates. ``False`` overrides
-                the environment variable. GPU float sums are not covered (F-067).
+                whatever the number of groups (default: ``MXFRAME_REPRODUCIBLE=1`` or off). By default the
+                defined order of additions runs only where it is as fast as before: global aggregates and
+                fused joins with 16,384 or more groups; every other group-by keeps the previous fastest
+                code, whose sums can differ in the last bits between runs. Costs 0-20% on keyed group-bys.
+                ``False`` overrides the environment variable. GPU float sums are not covered (F-067).
         """
         if reproducible is not None:
             # carried to the native call as a plan flag by a per-thread context variable (no process-wide
