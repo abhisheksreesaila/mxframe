@@ -784,7 +784,7 @@ Found by the F-077 developer (2026-10-16); a silent wrong answer on main
 - [x] root cause: the SQL front end translated `COUNT(*)` to `col(<first in-scope column>).count()`, which skips NULLs (a global count(*) also lost rows with a NULL first column); it is now `lit(1).count()`, the form every path already treats as count(*); no kernel change. SQL `SELECT k, count(*) ... GROUP BY k` with NULLs in `k` returns 0 for the NULL-key group where DuckDB returns its row count (2 in the probe). Find which path (the SQL front end's `count(*)` → a column count, or the NULL-key fallback) and fix at the root; `count(*)` counts rows on every path and device
 - [x] `tests/test_f078_count_star.py` (34 cases, 33 failed before the fix): DuckDB-checked, NULL key with count(*), count(col with NULLs), count(*) + sum, single table and through a join, cpu and gpu; fail before
 
-## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [review]
+## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [done]
 Found by the F-077 developer (2026-10-16); untested suspicion
 - [x] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
 - [x] DuckDB-checked tests over the key edge cases (tests/test_float_key_joins.py, 78 of 83 fail before); fail before (or a test pinning that it already matches)
