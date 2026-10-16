@@ -3290,7 +3290,11 @@ class CustomOpsCompiler(GraphCompiler):
             node = node.input
         if not isinstance(node, Scan) or not preds:
             return None
-        t = node.table
+        return self._native_filter_table(node.table, preds, needed)
+
+    def _native_filter_table(self, t, preds, needed):
+        """The rows of table ``t`` passing every predicate in one native pass (a column the result keeps
+        must not be a dictionary), or None."""
         cols = [f for f in t.schema if needed is None or f.name in needed]
         if not cols or any(pa.types.is_dictionary(f.type) for f in cols):
             return None
@@ -3319,9 +3323,18 @@ class CustomOpsCompiler(GraphCompiler):
             got = self._native_filter_scan(plan, None)
             if got is not None:
                 return got
-            inner_table = self._plan_to_table(plan.input)
-            mask = self._eval_predicate(plan.predicate, inner_table)
-            return pc.filter(inner_table, mask)
+            preds, node = [], plan
+            while isinstance(node, Filter):
+                preds.append(node.predicate)
+                node = node.input
+            inner_table = self._plan_to_table(node)
+            if not isinstance(node, Scan) and _native_exec is not None:
+                got = self._native_filter_table(inner_table, preds, None)
+                if got is not None:                     # F-034: the filters over a computed table (TPC-H Q22's
+                    return got                            # select + isin + balance test) in one native pass
+            for p in reversed(preds):
+                inner_table = pc.filter(inner_table, self._eval_predicate(p, inner_table))
+            return inner_table
         if isinstance(plan, Project):
             inner_table = None
             if isinstance(plan.input, Filter):

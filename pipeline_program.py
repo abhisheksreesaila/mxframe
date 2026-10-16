@@ -39,11 +39,13 @@ FLOOR      dst = floor(a)                                   dst, a
 SELECT     dst = a if cond != 0 else b                      dst, cond, a, b
 BETWEEN    dst = lo <= x <= hi                              dst, x, lo, hi
 IN_SET     dst = set[int(x) - lo]  (dictionary codes)       dst, x, set
-STR        dst = utf8 column LIKE pattern (a plain, not        dst, col, pattern, flags
-           dictionary-encoded column: offsets + bytes);
-           `pattern` indexes the byte pool (``%`` = 0xFF,
-           ``_`` = 0xFE, see str_patterns.encode), flags bit 0
-           negates; a NULL string is 0.0 either way
+STR        dst = utf8 column LIKE pattern / IN values (a      dst, col, pool, flags
+           plain, not dictionary-encoded column: offsets +
+           bytes); `pool` indexes the byte pool: a pattern
+           (``%`` = 0xFF, ``_`` = 0xFE, str_patterns.encode)
+           or, with flags bit 1, values as 4-byte length +
+           bytes; flags bit 0 negates; a NULL string is 0.0
+           either way
 AGG_SUM    slot += src (per group)                          slot, src
 AGG_MIN    slot = min(slot, src)                            slot, src
 AGG_MAX    slot = max(slot, src)                            slot, src
@@ -75,6 +77,7 @@ MAX_REGS = 48          # kernels keep registers on the stack / in local memory
 MAX_INSTR = 320        # GPU kernels stage the program in shared memory
 MAX_CONSTS = 64
 MAX_SET_SPAN = 1 << 22  # widest numeric IN_SET table we will build
+MAX_STR_IN = 32         # values an isin over a plain string column compares per row (linear)
 
 OP_LOAD_COL, OP_LOAD_CONST = 1, 2
 OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
@@ -633,6 +636,11 @@ class _Builder:
             inner = args[0]
             if isinstance(inner, Expr) and inner.op in ("startswith", "contains", "like"):
                 return self._str_match(inner, negate=True)       # NOT LIKE: a NULL string stays NULL (not kept)
+            if (isinstance(inner, Expr) and inner.op == "isin" and inner.args[0].op == "col"
+                    and self.column_kind(inner.args[0].args[0]) == "str"
+                    and self._is_plain_str(inner.args[0].args[0]) and isinstance(inner.args[1], (list, tuple))
+                    and all(isinstance(v, str) for v in inner.args[1])):
+                return self._str_isin(inner.args[0].args[0], list(inner.args[1]), negate=True)
             self._neg += 1
             try:
                 x = self._need(args[0], "bool")
@@ -734,8 +742,10 @@ class _Builder:
                     raise Unsupported("string literal against a numeric column")
                 if op not in ("eq", "ne"):
                     raise Unsupported("ordered string comparison")
-                d = self.dictionary(col_e.args[0])
                 lit_s = lit_e.args[0]
+                if self._is_plain_str(col_e.args[0]):
+                    return self._str_plain(col_e.args[0], str_encode([("lit", lit_s)] if lit_s else []), op == "ne")
+                d = self.dictionary(col_e.args[0])
                 member = _dict_member(d, lambda v: v == lit_s,
                                       lambda: pc.equal(d, _npscalar(lit_s, type=d.type)))
                 return self._dict_test(col_e.args[0], member, negate=(op == "ne"))
@@ -825,8 +835,10 @@ class _Builder:
             raise Unsupported("string op on a numeric column")
         escape, nocase = (e.args[2], e.args[3]) if e.op == "like" else (None, False)
         toks = parse_like(pattern, escape) if e.op == "like" else literal_like(e.op, pattern)
-        if self.concat_dicts and not pa.types.is_dictionary(self.table.schema.field(name).type):
-            return self._str_plain(name, toks, nocase, negate)
+        if self._is_plain_str(name):
+            if nocase:
+                raise Unsupported("ILIKE over a plain string column")
+            return self._str_plain(name, str_encode(toks), negate)
         d = self.dictionary(name)
         if nocase and not (pattern.isascii() and all(v is None or v.isascii() for v in d.to_pylist())):
             raise Unsupported("ILIKE over non-ASCII text (DuckDB's case folding)")
@@ -835,25 +847,40 @@ class _Builder:
                               lambda: pc.match_like(d, pattern=str_arrow(toks), ignore_case=nocase))
         return self._dict_test(name, member, negate)
 
-    def _str_plain(self, name: str, toks, nocase: bool, negate: bool):
+    def _is_plain_str(self, name: str) -> bool:
+        """A plain (not dictionary) utf8 column read by the native executor's string op."""
+        t = self.table.schema.field(name).type
+        return self.concat_dicts and not pa.types.is_dictionary(t)
+
+    def _str_plain(self, name: str, pool: bytes, negate: bool, isin: bool = False):
+        """OP_STR over a plain utf8 column: ``pool`` is the pattern program (LIKE) or the length-prefixed
+        values (IN); a NULL string is 0.0 for either sense."""
         t = self.table.schema.field(name).type
         if t != pa.string():
             raise Unsupported(f"string predicate on a {t} column")
-        if nocase:
-            raise Unsupported("ILIKE over a plain string column")
         if self.table.column(name).null_count and self._neg:
             raise Unsupported("NOT over a predicate on a string column with nulls")
         ix = self._column(name)
         if name not in self.plain_str:
             self.plain_str.append(name)
-        s = self.set_reg(name, np.frombuffer(str_encode(toks), dtype=np.uint8))
-        return _Val(self.emit(OP_STR, ix, s, 1 if negate else 0, key_extra=("str",)), "bool")
+        s = self.set_reg(name, np.frombuffer(pool, dtype=np.uint8))
+        return _Val(self.emit(OP_STR, ix, s, (1 if negate else 0) | (2 if isin else 0), key_extra=("str",)), "bool")
+
+    def _str_isin(self, name: str, values, negate: bool = False):
+        vals = sorted({v.encode("utf-8") for v in values})
+        if not vals:
+            return _Const(1.0 if negate else 0.0, "bool")
+        if len(vals) > MAX_STR_IN:
+            raise Unsupported("isin over a plain string column with many values")
+        return self._str_plain(name, b"".join(len(v).to_bytes(4, "little") + v for v in vals), negate, isin=True)
 
     def _isin(self, col_e: Expr, values):
         values = list(values)
         if col_e.op == "col" and self.column_kind(col_e.args[0]) == "str":
             if not all(isinstance(v, str) for v in values):
                 raise Unsupported("non-string values against a string column")
+            if self._is_plain_str(col_e.args[0]):
+                return self._str_isin(col_e.args[0], values)
             d = self.dictionary(col_e.args[0])
             vs = set(values)
             member = _dict_member(d, lambda v: v in vs, lambda: pc.is_in(d, value_set=_npa(values, type=d.type)))

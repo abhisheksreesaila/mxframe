@@ -502,11 +502,13 @@ Needs: F-032 · Built on F-046a slice 3 (merged: `mx_execute` v3, `MXFRAME_STRIC
 - Review round 1: main merged (F-046a slice 2), `libmxexec_cpu.so` and `libmxpipeline_cpu.so` both rebuilt from the merged source; the uncomputed-view Q15 shape is a non-strict xfail (8 threads pinned) pointing at F-064 (bit-reproducible executor sums, whose acceptance owns the strict check), the computed-view variant passes; the whole-table COUNT checks nulls inside `native_exec`; the anti join and the Q22-shaped test assert their native paths.
 - Notes for the next developer: `pipeline_cpu.mojo` gained `OP_ROWID` (emitted only for the executor's DISTINCT); v3 attempts a DISTINCT over a join before `mx_distinct` and declines wide key spaces after the partners' string columns are dictionary-encoded (Q16: two 30k-row encodes, ~1 ms, in the decline)
 
-## F-034 Mojo executor M4: general strings [todo]
+## F-034 Mojo executor M4: general strings [review]
 Needs: F-033
-- [ ] LIKE / contains / substr and non-dictionary string keys in Mojo
-- [ ] Q7 (from F-033): an alias-aware leaf: `_scan_under_filters` and the dictionary-keep names look through a renaming `select` over a leaf, so the nested partners' name columns stay codes
-- [ ] 22/22 TPC-H queries fully native; the Python execution path retired for them
+- [x] LIKE / NOT LIKE / ILIKE [ESCAPE] / contains / startswith / endswith, `== 'x'`, `!=`, `isin` (up to 32 values) on plain utf8 columns: one bytecode op (`OP_STR`) in the native filter over the Arrow offsets and bytes (byte semantics like DuckDB, `_` = one UTF-8 character, NULL string = no match either way); dictionary columns test the pattern once per dictionary entry then the codes (ILIKE: ASCII dictionaries). SQL `LIKE` forms all translate (`str_patterns.py`). `tests/test_native_like.py` (222 cases vs DuckDB; plain vs dictionary, multi-chunk, sliced, NULLs, non-ASCII, escapes)
+- [x] Q7: a renaming select over an in-memory leaf is folded into the leaf (`io_parquet._fold_renames`); Q9: a bare group key through a `with_columns` keeps its dictionary (`_analyze` `native_keys`)
+- [x] Q22: filters over a computed table (`str_slice` + `isin` + balance test) run as one native filter (`_plan_to_table`, `join_engine._leaf_table_py`)
+- [x] `scripts/native_coverage.py` fully native: DataFrame **17/22 -> 22/22**, SQL **10/22 -> 11/22** (Q2 native; Q16 now runs and equals DuckDB but still does `equal`/`filter` in Arrow; Q7-10, 13, 15, 18, 20-22 as before). `tests/test_native_strings_tpch.py`
+- [ ] non-dictionary string JOIN keys in Mojo (not built: no TPC-H query needs them); plain-string group keys were already native (K_STR). Aggregates that read a string column with NULLs still take the null-aware Arrow path first
 
 ## F-040 A group-by on an aliased column fails [done]
 Needs: none · Found by the M2h review (predates F-032)

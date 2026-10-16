@@ -44,6 +44,7 @@ def _coverage(q, root, sql=False, sf="0.17"):
     (7, set()),                                                  # renamed partner leaves keep their codes
     (9, set()),                                                  # LIKE on part, a group key through with_columns
     (20, set()),                                                 # startswith on part
+    (22, set()),                                                 # isin on a computed plain column + the balance test, one native filter
 ])
 def test_query_runs_fully_native(data_root, q, allowed_declines):
     r = _coverage(q, data_root)

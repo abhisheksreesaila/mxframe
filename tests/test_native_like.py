@@ -162,6 +162,19 @@ def test_like_in_a_grouped_aggregate_runs_in_one_native_call(tab):
     assert got.column("sv").to_pylist() == pytest.approx(exp.column("sv").to_pylist(), rel=1e-9)
 
 
+def test_plain_string_group_key_with_a_like_filter_is_one_native_call(tab):
+    got = (LazyFrame(tab).filter(col("p").like("%a_c%") | col("p").endswith("本")).groupby("p")
+           .agg(col("v").sum().alias("sv"), col("id").count().alias("n")).sort("p").compute(device="cpu"))
+    assert nx.last_path() == "native"
+    con = duckdb.connect()
+    con.register("t", tab)
+    exp = con.sql("select p, sum(v) sv, count(id) n from t where p like '%a_c%' or p like '%本' group by p "
+                  "order by encode(p)").fetch_arrow_table()
+    assert got.column("p").to_pylist() == exp.column("p").to_pylist()
+    assert got.column("n").to_pylist() == exp.column("n").to_pylist()
+    assert got.column("sv").to_pylist() == pytest.approx(exp.column("sv").to_pylist(), rel=1e-9)
+
+
 def test_like_in_a_case_when_aggregate_argument(tab):
     # the match runs on the surviving rows of the body section (gathered through the selection vector)
     got = (LazyFrame(tab).filter(col("id") >= 1000).groupby("k")
@@ -203,3 +216,68 @@ def test_bad_like_arguments_raise():
         col("s").like("abc!", escape="!")             # ends with the escape character
     with pytest.raises(ValueError):
         col("s").like("abc", escape="!!")             # one character only
+
+
+# ── equality and IN on plain columns (the same string op, no pattern) ───────────────────────────────
+
+def _duck_where(t, where):
+    con = duckdb.connect()
+    con.register("t", t)
+    return [r[0] for r in con.sql(f"select id from t where {where} order by id").fetchall()]
+
+
+@pytest.mark.parametrize("values", [["ab"], ["", "a"], ["é", "日本", "abc"], ["x" * 70, "nope"], ["100%", "a_c", "a\\b"],
+                                    [f"w{i}" for i in range(31)] + ["abc"]])
+@pytest.mark.parametrize("negate", [False, True])
+def test_isin_on_plain_and_dictionary_columns(tab, values, negate):
+    for column in ("s", "d"):
+        pred = col(column).isin(values)
+        got = _ids(tab, ~pred if negate else pred)
+        assert nx.last_filter() == ("native_filter", None)
+        quoted = ", ".join("'" + v.replace("'", "''") + "'" for v in values)
+        assert got == _duck_where(tab, f"{column} {'not ' if negate else ''}in ({quoted})")
+
+
+def test_isin_with_more_values_than_the_native_op_takes_still_answers(tab):
+    values = [f"w{i}" for i in range(40)] + ["abc", "é"]
+    got = _ids(tab, col("s").isin(values))
+    quoted = ", ".join(f"'{v}'" for v in values)
+    assert got == _duck_where(tab, f"s in ({quoted})")
+
+
+@pytest.mark.parametrize("value", ["abc", "", "é", "x" * 70, "a%c", "a_c"])
+def test_equality_and_inequality_on_plain_columns(tab, value):
+    for op, sql in (("==", "="), ("!=", "<>")):
+        pred = (col("s") == value) if op == "==" else (col("s") != value)
+        got = _ids(tab, pred)
+        assert nx.last_filter() == ("native_filter", None)
+        assert got == _duck_where(tab, f"s {sql} '{value}'")
+
+
+def test_not_of_equality_keeps_null_rows_out(tab):
+    got = _ids(tab, ~(col("s") == "abc"))
+    assert got == _duck_where(tab, "not (s = 'abc')")
+
+
+def test_q22_shape_filters_over_a_computed_column_run_in_one_native_pass(monkeypatch):
+    r = np.random.default_rng(5)
+    n = 120_000
+    phones = [f"{r.integers(10, 35)}-{r.integers(100, 999)}" for _ in range(n)]
+    bal = r.random(n) * 10000 - 1000
+    t = pa.table({"id": pa.array(np.arange(n, dtype=np.int64)), "phone": pa.array(phones, pa.string()),
+                  "bal": pa.array(bal)})
+    codes = ["13", "31", "23", "29", "30", "18", "17"]
+    log = []
+    real = nx.try_filter
+
+    def spy(*a, **k):
+        out = real(*a, **k)
+        log.append(out is not None)
+        return out
+
+    monkeypatch.setattr(nx, "try_filter", spy)
+    got = (LazyFrame(t).with_columns(col("phone").str_slice(0, 2).alias("cc")).filter(col("cc").isin(codes))
+           .filter(col("bal") > 3000.0).select(col("id")).compute(device="cpu"))
+    assert log and all(log)
+    quoted = ", ".join(f"'{c}'" for c in codes)
+    assert sorted(got.column("id").to_pylist()) == _duck_where(t, f"substr(phone, 1, 2) in ({quoted}) and bal > 3000.0")

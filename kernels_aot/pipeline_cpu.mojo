@@ -360,15 +360,17 @@ def _like_general(s: BP, L: Int, pat: BP, pl: Int) -> Bool:
 
 
 def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: Int, pat: BP, pl: Int,
-              negate: Bool, i0: Int, sel: IP, use_sel: Bool, n: Int):
-    """d[j] = 1.0 if row j's string matches the pattern (negated: does not), 0.0 for a NULL string."""
+              negate: Bool, isin: Bool, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    """d[j] = 1.0 if row j's string matches the pattern (negated: does not), 0.0 for a NULL string.
+    isin: `pat` is a list of values, each a 4-byte little-endian length and its bytes; a row matches when
+    it equals one of them."""
     var offs = IP(unsafe_from_address=offs_addr)
     var data = _bp(data_addr)
     var valid = _bp(valid_addr)
     # the pattern's shape, once per call: 0 general, 1 exact, 2 prefix, 3 suffix, 4 substring
     var markers = 0
     var wild_one = False
-    for k in range(pl):
+    for k in range(0 if isin else pl):
         if pat[k] == 0xFF or pat[k] == 0xFE:
             markers += 1
         if pat[k] == 0xFE:
@@ -376,7 +378,9 @@ def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: 
     var shape = 0
     var lit = pat
     var m = pl
-    if not wild_one:
+    if isin:
+        shape = 5
+    elif not wild_one:
         if markers == 0:
             shape = 1
         elif markers == 1 and pat[pl - 1] == 0xFF:
@@ -408,6 +412,14 @@ def _str_like(d: FP, offs_addr: Int, data_addr: Int, valid_addr: Int, bit_base: 
             hit = L >= m and _eq_bytes(s, lit, m)
         elif shape == 3:
             hit = L >= m and _eq_bytes(s + (L - m), lit, m)
+        elif shape == 5:
+            var q = 0
+            while q < pl:
+                var vl = Int(pat[q]) | (Int(pat[q + 1]) << 8) | (Int(pat[q + 2]) << 16) | (Int(pat[q + 3]) << 24)
+                if vl == L and _eq_bytes(s, pat + (q + 4), L):
+                    hit = True
+                    break
+                q += 4 + vl
         elif shape == 4:
             if m == 0:
                 hit = True
@@ -530,8 +542,8 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             var slot = Int(p.dtypes[c]) >> 8        # dtype 6 | (slot << 8): the chunk's bytes, validity, bit base
             var si = Int(ins[3])
             _str_like(d, Int(cols[c]), Int(cols[slot]), Int(cols[slot + 1]), Int(cols[slot + 2]),
-                      p.set_bytes + Int(p.set_meta[si * 3]), Int(p.set_meta[si * 3 + 1]), Int(ins[4]) != 0,
-                      i0, sel, use_sel, n)
+                      p.set_bytes + Int(p.set_meta[si * 3]), Int(p.set_meta[si * 3 + 1]), (Int(ins[4]) & 1) != 0,
+                      (Int(ins[4]) & 2) != 0, i0, sel, use_sel, n)
         elif op == OP_ROWID:
             # i0 is the block's first row in the whole input (the column bases are rebased to it); sel
             # holds the block offsets of the rows kept so far
