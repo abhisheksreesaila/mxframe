@@ -1,0 +1,248 @@
+"""F-037: integer arithmetic whose intermediate result passes 2^53 is never computed in the
+float64 interpreter. The compiler bounds every int `*` `+` `-` from the columns' real min / max
+and declines (the caller's exact path answers); results equal DuckDB for every entry point that
+evaluates expressions: mx_execute (group-by and global aggregates), mx_filter (plain filters and
+star joins), mx_filter_topk, and the legacy fused pipeline."""
+import duckdb
+import numpy as np
+import pyarrow as pa
+import pytest
+
+import mxframe.native_exec as nx
+from mxframe import LazyFrame, col, lit, when
+from mxframe.np_arrow import array as A
+from mxframe.pipeline_program import compile_pipeline
+
+P52 = 1 << 52
+N = 3000
+
+# one predicate per operator; each is true for the "big" rows only when computed exactly
+PREDS = {
+    # bounds carried through case_when, year(), a negative factor and nested arithmetic
+    "case_when": (lambda: (when(col("g") >= lit(0), col("a"), col("b")) * col("a")) - lit(2 ** 53) == lit(261134297),
+                  "(case when t.g >= 0 then a else b end * a) - 9007199254740992 = 261134297"),
+    "mixed_sign": (lambda: (col("neg") * col("a")) + lit(2 ** 53) == lit(2 ** 53 - 94906267 * 94906267),
+                   "(neg * a) + 9007199254740992 = 9007199254740992 - 94906267::bigint * 94906267"),
+    "nested": (lambda: (col("c") * col("c") + col("c") * col("c")) - lit(2 ** 53) == lit(2 * 70_000_000 ** 2 - 2 ** 53),
+               "(c * c + c * c) - 9007199254740992 = %d" % (2 * 70_000_000 ** 2 - 2 ** 53)),
+    "mul": (lambda: (col("a") * col("b")) - lit(2 ** 53) == lit(261134297),
+            "(a * b) - 9007199254740992 = 261134297"),
+    "add": (lambda: (col("x") + col("y")) - lit(2 ** 53) == lit(7),
+            "(x + y) - 9007199254740992 = 7"),
+    "sub": (lambda: (col("u") - col("z")) - lit(2 ** 53) == lit(P52 + 3),
+            "(u - z) - 9007199254740992 = %d" % (P52 + 3)),
+}
+
+
+def _table():
+    r = np.random.default_rng(3)
+    big = np.arange(N) % 3 != 0                       # two thirds of the rows are the big ones
+    a = np.where(big, 94906267, r.integers(1, 1000, N)).astype(np.int64)
+    # add: x + y = 2^53 + 7 (odd, so float64 rounds it); sub: u - z = 2^53 + 2^52 + 3
+    x = np.where(big, 1 << 52, r.integers(1, 1000, N)).astype(np.int64)
+    y = np.where(big, P52 + 7, r.integers(1, 1000, N)).astype(np.int64)
+    u = np.where(big, 1 << 53, r.integers(1, 1000, N)).astype(np.int64)
+    z = np.where(big, -(P52 + 3), r.integers(1, 1000, N)).astype(np.int64)
+    c = np.where(big, 70_000_000, r.integers(1, 1000, N)).astype(np.int64)
+    neg = np.where(big, -94906267, r.integers(1, 1000, N)).astype(np.int64)
+    d = np.where(big, 949_062_673_333, r.integers(10_000, 90_000, N)).astype(np.int64)
+    return pa.table({
+        "c": A(c), "neg": A(neg), "d": A(d),
+        "row": A(np.arange(N, dtype=np.int64)), "g": A((np.arange(N) % 4).astype(np.int64)),
+        "a": A(a), "b": A(a.copy()), "x": A(x), "y": A(y), "u": A(u), "z": A(z), "v": A(np.ones(N)),
+    })
+
+
+def _con(**tables):
+    con = duckdb.connect()
+    for k, v in tables.items():
+        con.register(k, v)
+    return con
+
+
+@pytest.fixture(params=["1", "0"], ids=["native", "legacy"])
+def mode(request, monkeypatch):
+    if request.param == "1" and not nx.available():
+        pytest.skip("libmxexec_cpu.so not built")
+    monkeypatch.setenv("MXFRAME_NATIVE", request.param)
+    return request.param
+
+
+def _want_rows(t, sql):
+    return [r[0] for r in _con(t=t).execute(f"select row from t where {sql} order by row").fetchall()]
+
+
+@pytest.mark.parametrize("name", PREDS)
+def test_the_compiler_declines_an_intermediate_past_2_53(name):
+    t = _table()
+    assert compile_pipeline([PREDS[name][0]()], [col("v").sum()], t) is None
+    assert compile_pipeline([], [(col("a") * col("b")).max()], t) is None
+
+
+def test_small_integers_still_compile_even_when_the_type_could_overflow(monkeypatch):
+    t = pa.table({"p": A(np.arange(1, 100, dtype=np.int64)), "q": A(np.arange(1, 100, dtype=np.int64)),
+                  "i": A(np.arange(1, 100, dtype=np.int32)), "v": A(np.ones(99))})
+    assert compile_pipeline([(col("p") * col("q")) > lit(50)], [col("v").sum()], t) is not None
+    assert compile_pipeline([(col("i") * col("i") + lit(1)) > lit(50)], [col("v").sum()], t) is not None
+    assert compile_pipeline([], [(col("p") * lit(2) - col("q")).max()], t) is not None
+    # a product that stays exactly 2^53 is fine; a bigger one is not
+    big = pa.table({"p": A(np.array([1 << 26], dtype=np.int64)), "v": A(np.ones(1))})
+    assert compile_pipeline([(col("p") * col("p") * lit(2)) == lit(1 << 53)], [col("v").sum()], big) is not None
+    assert compile_pipeline([(col("p") * col("p") * lit(3)) > lit(1)], [col("v").sum()], big) is None
+    # and the query runs in the native executor, equal to DuckDB
+    if nx.available():
+        monkeypatch.setenv("MXFRAME_NATIVE", "1")
+        got = LazyFrame(t).filter((col("p") * col("q")) > lit(50)).groupby().agg(
+            (col("p") * lit(2) - col("q")).max().alias("m"), col("v").sum().alias("s")).compute(device="cpu")
+        assert nx.last_path() == "native"
+        want = _con(t=t).execute("select max(p * 2 - q), sum(v) from t where p * q > 50").fetchone()
+        assert (got.column("m").to_pylist()[0], got.column("s").to_pylist()[0]) == tuple(float(x) for x in want)
+
+
+def test_type_ranges_decide_without_reading_column_data(monkeypatch):
+    """int32 + int32, year(), int32 * a small literal and case_when never read the data."""
+    import mxframe.join_engine as je
+    reads = []
+    real = je._minmax
+    monkeypatch.setattr(je, "_minmax", lambda a: reads.append(len(a)) or real(a))
+    n = 5000
+    t = pa.table({"i": A(np.arange(n, dtype=np.int32)), "j": A(np.arange(n, dtype=np.int32)),
+                  "d": A(np.arange(n, dtype=np.int32)), "v": A(np.ones(n))})
+    for pred in (col("i") + col("j") > lit(5), col("d").year() + col("i") > lit(5), col("i") * lit(1000) > lit(5),
+                 when(col("i") > lit(3), col("i"), col("j")) + col("j") > lit(5)):
+        assert compile_pipeline([pred], [col("v").sum()], t) is not None
+    assert reads == []
+    # int32 * int32 and int64 * int64 do need the data (the type ranges alone would decline)
+    assert compile_pipeline([col("i") * col("j") > lit(5)], [col("v").sum()], t) is not None
+    t64 = pa.table({"p": A(np.arange(n, dtype=np.int64)), "v": A(np.ones(n))})
+    assert compile_pipeline([col("p") * col("p") > lit(5)], [col("v").sum()], t64) is not None
+    assert reads == [n, n, n]
+
+
+def test_year_carries_its_bound_into_a_later_product():
+    big = pa.table({"d": A(np.array([949_062_673_333], dtype=np.int64)), "v": A(np.ones(1))})     # year 94906267
+    small = pa.table({"d": A(np.array([20_240_101], dtype=np.int64)), "v": A(np.ones(1))})
+    pred = (col("d").year() * col("d").year()) > lit(5)
+    assert compile_pipeline([pred], [col("v").sum()], big) is None
+    assert compile_pipeline([pred], [col("v").sum()], small) is not None
+
+
+def test_constant_arithmetic_past_2_53_declines():
+    t = _table()
+    assert compile_pipeline([col("a") == lit(94906267) * lit(94906267) - lit(2 ** 53)], [col("v").sum()], t) is None
+    assert compile_pipeline([col("a") + lit(94906267) * lit(94906267) > lit(1)], [col("v").sum()], t) is None
+
+
+@pytest.mark.parametrize("name", PREDS)
+def test_filter_matches_duckdb(mode, name):
+    t = _table()
+    pred, sql = PREDS[name]
+    want = _want_rows(t, sql)
+    assert len(want) == 2000                                    # the big rows, every one
+    got = LazyFrame(t).filter(pred()).compute(device="cpu")
+    assert sorted(got.column("row").to_pylist()) == want
+
+
+@pytest.mark.parametrize("name", PREDS)
+def test_global_and_grouped_aggregate_match_duckdb(mode, name):
+    t = _table()
+    pred, sql = PREDS[name]
+    con = _con(t=t)
+    want_n = con.execute(f"select sum(v) from t where {sql}").fetchone()[0]
+    assert want_n == 2000.0
+    got = LazyFrame(t).filter(pred()).groupby().agg(col("v").sum().alias("s")).compute(device="cpu")
+    assert got.column("s").to_pylist() == [want_n]
+    want_g = dict(con.execute(f"select g, sum(v) from t where {sql} group by g").fetchall())
+    got = LazyFrame(t).filter(pred()).groupby("g").agg(col("v").sum().alias("s")).sort("g").compute(device="cpu")
+    assert dict(zip(got.column("g").to_pylist(), got.column("s").to_pylist())) == want_g
+
+
+def test_arithmetic_inside_an_aggregate_matches_duckdb(mode):
+    t = _table()
+    want = _con(t=t).execute("select min(a * b - 9007199254740992), max(a * b - 9007199254740992) from t").fetchone()
+    got = LazyFrame(t).groupby().agg(((col("a") * col("b")) - lit(2 ** 53)).min().alias("lo"),
+                                     ((col("a") * col("b")) - lit(2 ** 53)).max().alias("hi")).compute(device="cpu")
+    assert (got.column("lo").to_pylist()[0], got.column("hi").to_pylist()[0]) == tuple(float(w) for w in want)
+
+
+@pytest.mark.parametrize("name", PREDS)
+def test_filter_topk_matches_duckdb(mode, name):
+    t = _table()
+    pred, sql = PREDS[name]
+    want = [r[0] for r in _con(t=t).execute(
+        f"select row from t where {sql} order by row desc limit 7").fetchall()]
+    got = LazyFrame(t).filter(pred()).sort("row", descending=True).limit(7).compute(device="cpu")
+    assert got.column("row").to_pylist() == want
+
+
+@pytest.mark.parametrize("name", PREDS)
+def test_star_join_filter_matches_duckdb(mode, name):
+    t = _table()
+    dim = pa.table({"g": A(np.arange(4, dtype=np.int64)), "w": A(np.arange(4, dtype=np.int64) * 10)})
+    pred, sql = PREDS[name]
+    want = [r[0] for r in _con(t=t, d=dim).execute(
+        f"select row from t join d on t.g = d.g where {sql} order by row").fetchall()]
+    got = LazyFrame(t).filter(pred()).join(LazyFrame(dim), on="g").compute(device="cpu")
+    assert sorted(got.column("row").to_pylist()) == want
+
+
+# -- integer SUM: the float64 accumulator keeps whole numbers only within 2^53 ----------------------
+
+def _sum_table():
+    r = np.random.default_rng(5)
+    n = 200_000
+    a = r.integers(1 << 39, 1 << 40, n).astype(np.int64)          # total ~ 2^57
+    b = r.integers(1, 10, n).astype(np.int64)
+    m = r.integers(-(1 << 40), 1 << 40, n).astype(np.int64)        # mixed sign
+    nul = pa.array(r.integers(1 << 39, 1 << 40, n).astype(np.int64), mask=(np.arange(n) % 7 == 0))   # nullable
+    return pa.table({"a": A(a), "m": A(m), "nul": nul, "b": A(b), "i": A(r.integers(1, 100, n).astype(np.int32)),
+                     "g": A((np.arange(n) % 3).astype(np.int64)), "v": A(r.random(n))})
+
+
+def test_integer_sum_is_exact_past_2_53(mode):
+    t = _sum_table()
+    con = _con(t=t)
+    want = con.execute("select sum(a) from t").fetchone()[0]
+    assert want == int(t.column("a").to_numpy().sum()) and want > 1 << 53
+    got = LazyFrame(t).groupby().agg(col("a").sum().alias("s")).compute(device="cpu")
+    assert got.schema.field("s").type == pa.int64()
+    assert got.column("s").to_pylist() == [want]
+    # an integer expression, a filter, and groups
+    want_e = con.execute("select sum(a * b) from t where g = 1").fetchone()[0]
+    got = LazyFrame(t).filter(col("g") == lit(1)).groupby().agg((col("a") * col("b")).sum().alias("s")).compute(device="cpu")
+    assert got.column("s").to_pylist() == [want_e]
+    want_g = dict(con.execute("select g, sum(a) from t group by g").fetchall())
+    got = LazyFrame(t).groupby("g").agg(col("a").sum().alias("s")).sort("g").compute(device="cpu")
+    assert dict(zip(got.column("g").to_pylist(), got.column("s").to_pylist())) == want_g
+
+
+def test_integer_sums_that_stay_within_2_53_run_natively_and_equal_duckdb(monkeypatch):
+    if not nx.available():
+        pytest.skip("libmxexec_cpu.so not built")
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    t = _sum_table()
+    want = _con(t=t).execute("select g, sum(i), sum(b) from t group by g order by g").fetchall()
+    got = LazyFrame(t).groupby("g").agg(col("i").sum().alias("si"), col("b").sum().alias("sb")).sort("g").compute(device="cpu")
+    assert nx.last_path() == "native"
+    assert list(zip(got.column("g").to_pylist(), got.column("si").to_pylist(), got.column("sb").to_pylist())) == \
+        [(g, float(si), float(sb)) for g, si, sb in want]
+
+
+def test_a_sum_small_enough_for_float64_still_compiles():
+    t = _sum_table()
+    assert compile_pipeline([], [col("i").sum()], t) is not None          # 200k * 100
+    assert compile_pipeline([], [col("a").sum()], t) is None              # 200k * 2^40
+
+
+@pytest.mark.parametrize("column", ["m", "nul"])
+def test_mixed_sign_and_nullable_integer_sums_equal_duckdb_in_value_and_type(mode, column):
+    t = _sum_table()
+    con = _con(t=t)
+    want = con.execute(f"select sum({column}) from t").fetchone()[0]
+    got = LazyFrame(t).groupby().agg(col(column).sum().alias("s")).compute(device="cpu")
+    assert got.schema.field("s").type == pa.int64()           # an exact integer, as DuckDB's SUM of a BIGINT
+    assert got.column("s").to_pylist() == [int(want)]
+    want_g = {g: int(x) for g, x in con.execute(f"select g, sum({column}) from t group by g").fetchall()}
+    got = LazyFrame(t).groupby("g").agg(col(column).sum().alias("s")).sort("g").compute(device="cpu")
+    assert got.schema.field("s").type == pa.int64()
+    assert dict(zip(got.column("g").to_pylist(), got.column("s").to_pylist())) == want_g

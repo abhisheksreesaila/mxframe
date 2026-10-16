@@ -240,7 +240,7 @@ def _pre_split(spec):
     return own
 
 
-def run_mx(spec, t):
+def run_mx(spec, t, device="cpu"):
     """MXFrame: the spec on the LazyFrames `t`; returns the computed pyarrow.Table."""
     from mxframe import LazyFrame, col, lit
 
@@ -278,7 +278,7 @@ def run_mx(spec, t):
         lf = lf.sort(*[c for c, _ in spec["order"]], descending=[d for _, d in spec["order"]])
     if spec["limit"]:
         lf = lf.limit(spec["limit"])
-    return lf.compute(device="cpu")
+    return lf.compute(device=device)
 
 
 def run_polars(spec, t):

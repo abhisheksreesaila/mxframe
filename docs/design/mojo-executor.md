@@ -126,6 +126,10 @@ order. This is pandas' default (`groupby(sort=True)`) and is deterministic. The 
 returned first appearance; SQL defines neither. Alternative if wanted: first appearance among the
 rows that pass the filter, which needs the interpreter to report the first surviving row per group.
 
+## M3 result (2026-10-16)
+
+17 of 22 TPC-H queries are native end to end by the coverage script's criterion (`scripts/native_coverage.py`: every stage through the native hooks, no Python pipeline path, no PyArrow compute call over 1000 rows); M2 left 11. The 18/22 target is missed by one. What moved: SELECT DISTINCT runs as the keyed group-by with a hidden `MIN(row id)` (one call, fused with the filter or the star join; wide keys keep `mx_distinct`); a subquery's HAVING under a join runs in the executor (Q18, Q21); `LazyFrame.scalar` computes a scalar subquery natively and hands it to the next plan as a literal (Q11, Q15, Q22); nested star partners keep dictionary names as codes (Q5, Q10); `COUNT(col)` of a whole table needs no column (Q13). What is left: Q7 (renamed partner leaves), Q9 / Q16 / Q20 (plain-string predicates: M4), Q22 (M4 `isin` on plain utf8, native anti join). Details, per-query table and numbers: `docs/plan.md`, F-033.
+
 ## Risks
 
 - **Size.** This is the largest change to the engine so far: weeks, not days. The milestones are ordered so

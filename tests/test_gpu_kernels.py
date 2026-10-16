@@ -26,6 +26,8 @@ def run_scenario(*args, timeout=300):
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         pytest.fail(f"scenario {args} did not terminate within {timeout}s (hang)")
+    if r.returncode == 77:                  # _gpu_scenarios.SKIP
+        pytest.skip(r.stdout.strip())
     assert r.returncode == 0, f"scenario {args} failed:\n{r.stdout[-2000:]}\n{r.stderr[-4000:]}"
 
 

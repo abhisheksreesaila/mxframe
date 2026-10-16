@@ -201,6 +201,22 @@ class LazyFrame:
         """Filter rows based on a condition."""
         return LazyFrame(Filter(self.plan, predicate))
 
+    def scalar(self, agg) -> Expr:
+        """A one-value subquery: SQL's ``(SELECT <agg> FROM this)``, for use inside an expression of another
+        plan (a ``filter``, a ``with_columns``, a HAVING)::
+
+            total = sales.scalar(col("value").sum())
+            sales.groupby("k").agg(col("value").sum().alias("v")).filter(col("v") > total * lit(0.0001))
+
+        ``agg`` is one aggregate (sum, min, max, mean or count). ``compute()`` runs each subquery first, as its
+        own native plan, and puts the value in the expression as a literal (the same literal a hand-written
+        ``lit(value)`` would be, so comparisons against float32 columns behave as before); the main plan then
+        needs no Python round trip over rows. A subquery over no rows is NULL (a comparison with it keeps no
+        rows, as in SQL)."""
+        if not (isinstance(agg, Expr) and agg.op in ("sum", "min", "max", "mean", "count")):
+            raise ValueError("scalar() takes one aggregate expression: sum, min, max, mean or count")
+        return Expr("scalar", Aggregate(self.plan, [], [Expr(agg.op, *agg.args).alias("__scalar")]))
+
     def groupby(self, *by):
         """Group data by one or more columns."""
         parsed_by = [col(b) if isinstance(b, str) else b for b in by]
@@ -218,6 +234,7 @@ class LazyFrame:
         gpu_fraction: Optional[float] = None,
         strict: bool = False,
         profile: bool = False,
+        reproducible: Optional[bool] = None,
     ) -> pa.Table:
         """Execute the logical plan and return the result.
 
@@ -228,7 +245,9 @@ class LazyFrame:
                          CPU↔GPU link and GPU start-up, and run it on the cheaper one.
                          A GPU error reruns the query on CPU (warning once per query shape).
                 "cpu"  — always run on CPU.
-                "gpu"  — run on GPU; raises RuntimeError if no GPU is available.
+                "gpu"  — run on GPU; raises RuntimeError if no GPU is available. A piece (aggregate,
+                         join, sort) that does not fit the GPU's free memory, or runs out of it, is
+                         rerun on the CPU with a warning (`explain(include_runtime=True)` says why).
             verbose: if True, print compile/execute timing and cache status.
             optimize: if True (default), run logical plan optimization passes first.
             validate: if True (default), validate logical plan invariants before execution.
@@ -237,13 +256,30 @@ class LazyFrame:
                 query: any "gpu" value runs the query on GPU, all "cpu" on CPU.
             gpu_fraction: auto only; fixed GPU share of rows when a fused aggregate
                 co-processes on CPU and GPU (default: balanced from calibration).
-            strict: auto only; raise GPU errors instead of falling back to CPU.
+            strict: raise GPU errors, including a piece that does not fit the GPU's memory or runs
+                out of it (a `MemoryError` with the estimate), instead of falling back to CPU.
             profile: auto only; record the actual query time next to the estimate
                 (see `last_auto_decision`). Per-operator timings that refine the
                 calibration arrive with per-operator placement.
+            reproducible: ``True`` makes every native CPU float SUM / MEAN bit-identical from run to run
+                whatever the number of groups (default: ``MXFRAME_REPRODUCIBLE=1`` or off). By default the
+                defined order of additions runs only where it is as fast as before: global aggregates and
+                fused joins with 16,384 or more groups; every other group-by keeps the previous fastest
+                code, whose sums can differ in the last bits between runs. Costs 0-20% on keyed group-bys.
+                ``False`` overrides the environment variable. GPU float sums are not covered (F-067).
         """
+        if reproducible is not None:
+            # carried to the native call as a plan flag by a per-thread context variable (no process-wide
+            # state: concurrent computes in other threads keep their own mode)
+            from . import native_exec as _nx
+            tok = _nx._reproducible.set(bool(reproducible))
+            try:
+                return self.compute(device, verbose, optimize, validate, prefer=prefer, placement=placement,
+                                    gpu_fraction=gpu_fraction, strict=strict, profile=profile)
+            finally:
+                _nx._reproducible.reset(tok)
         from .io_parquet import resolve_plan
-        plan = self.plan
+        plan = _resolve_scalars(self.plan, device, strict)
         optimizer_trace = None
 
         if validate:
@@ -269,7 +305,8 @@ class LazyFrame:
 
         self._last_optimizer_trace = list(optimizer_trace or [])
         if device != "auto":
-            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace)
+            result, prov = _run_on_device(plan, device, verbose=verbose, optimizer_trace=optimizer_trace,
+                                          strict=strict)
             self._last_compile_provenance = prov
             return result
 
@@ -282,11 +319,15 @@ class LazyFrame:
         t0 = _t.perf_counter()
         if decision.device == "gpu":
             try:
-                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace)
+                result, prov = _run_on_device(plan, "gpu", verbose=verbose, optimizer_trace=optimizer_trace,
+                                              strict=strict, auto=True)
+                if prov.get("gpu_pieces_oom") is not None:      # a piece ran out of GPU memory and went to the CPU (F-056)
+                    _am.remember_gpu_failure(plan, prov["gpu_pieces_oom"])
+                decision.pieces = prov.get("gpu_pieces", "")
             except Exception as err:
                 if strict:
                     raise
-                _am.remember_gpu_failure(plan)
+                _am.remember_gpu_failure(plan, _oom_free(err))
                 if _am.is_sticky_gpu_error(err):
                     _am.disable_gpu(f"{type(err).__name__}: {err}")
                 _am.warn_fallback_once(plan, err)
@@ -295,12 +336,23 @@ class LazyFrame:
         else:
             # CPU plan: fused aggregates may still co-process with the GPU once their
             # columns are resident there (see coproc_fused), and start that upload otherwise.
+            import contextlib as _contextlib
             from . import coproc_fused as _cf
             with _cf.deferred_background() as _bg:
                 if decision.estimate is not None and decision.gpu_available:
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
-                with _cf.policy(gpu_fraction=gpu_fraction), _cf.query_running():
+                if decision.upload:
+                    # A split would win once the columns are on the GPU (F-057): this query runs native, and the
+                    # upload (group ids, then the columns) starts when it has returned.
+                    from . import pipeline_exec as _pe
+                    _bg.later(lambda: _pe.queue_resident_upload(plan))
+                # The policy makes the native executor decline, so it is set only for a predicted
+                # CPU+GPU split (or one the caller forces with gpu_fraction); every other CPU
+                # decision runs exactly as device="cpu" (F-053).
+                forced = gpu_fraction is not None
+                pol = _cf.policy(gpu_fraction=gpu_fraction) if decision.split or forced else _contextlib.nullcontext()
+                with pol, _cf.query_running():
                     result, prov = _run_on_device(plan, "cpu", verbose=verbose, optimizer_trace=optimizer_trace)
         if profile:
             decision.actual_ms = (_t.perf_counter() - t0) * 1e3
@@ -367,7 +419,10 @@ class LazyFrame:
             decision = _am.choose_device(plan, quick=not costs)
             text = decision.explain()
             lines.append("AutoDecision")
-            lines.extend(text.splitlines() if costs else text.splitlines()[:1])
+            shown = text.splitlines()
+            if not costs:
+                shown = shown[:2] if decision.cpu_path and decision.device == "cpu" else shown[:1]
+            lines.extend(shown)
         return "\n".join(lines)
 
     @property
@@ -723,9 +778,269 @@ class _GPUGroupBy:
 
 
 
-def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None):
-    """Execute an already optimized plan on one device; returns (result, provenance)."""
+def _is_null(e) -> bool:
+    return isinstance(e, Expr) and e.op == "lit" and len(e.args) == 1 and e.args[0] is None
+
+
+def _bool_of(e):
+    """True / False for a boolean literal, else None."""
+    if isinstance(e, Expr) and e.op == "lit" and len(e.args) == 1 and isinstance(e.args[0], bool):
+        return e.args[0]
+    return None
+
+
+def _num_of(e):
+    if isinstance(e, Expr) and e.op == "lit" and len(e.args) == 1 and not isinstance(e.args[0], bool) \
+            and isinstance(e.args[0], (int, float)):
+        return e.args[0]
+    return None
+
+
+def _fold_subquery_value(op: str, args) -> Optional[Expr]:
+    """One node of an expression whose operands include a subquery's value, simplified when its operands are
+    constants: ``lit(a) <op> lit(b)`` as one literal (a HAVING compares an aggregate with a number only), NULL
+    through arithmetic, comparisons and NOT, boolean literals through AND / OR. None: nothing to simplify (an
+    integer division, a division by zero, integers past 2^53 are left to the engine)."""
+    from .lazy_expr import lit
+    if op in ("add", "sub", "mul", "div", "lt", "le", "gt", "ge", "eq", "ne"):
+        if any(_is_null(a) for a in args):
+            return lit(None)                       # NULL <op> x is NULL
+        if op in ("add", "sub", "mul", "div"):
+            a, b = (_num_of(x) for x in args)
+            if a is None or b is None:
+                return None
+            if op == "div":
+                if b == 0 or (isinstance(a, int) and isinstance(b, int)):
+                    return None
+                r = a / b
+            else:
+                r = a + b if op == "add" else a - b if op == "sub" else a * b
+            return None if isinstance(r, int) and abs(r) > 2 ** 53 else lit(r)
+        a, b = (_num_of(x) for x in args)          # two constants compared (NOT IN's emptiness / NULL test)
+        if a is None or b is None or abs(a) > 2 ** 53 or abs(b) > 2 ** 53:
+            return None
+        return lit({"lt": a < b, "le": a <= b, "gt": a > b, "ge": a >= b, "eq": a == b, "ne": a != b}[op])
+    if op == "not":
+        if _is_null(args[0]):
+            return lit(None)
+        b = _bool_of(args[0])
+        return None if b is None else lit(not b)
+    if op in ("and", "or"):
+        absorbing, identity = (False, True) if op == "and" else (True, False)
+        if any(_bool_of(a) is absorbing for a in args):
+            return lit(absorbing)
+        rest = [a for a in args if _bool_of(a) is not identity]
+        if not rest:
+            return lit(identity)
+        if all(_is_null(a) for a in rest):
+            return lit(None)
+        return rest[0] if len(rest) == 1 else Expr(op, *rest)
+    return None
+
+
+def _top_truth(p: Expr) -> Expr:
+    """A filter keeps a row only when its predicate is TRUE, so a NULL there (a comparison with an empty
+    subquery) is false, also inside AND / OR chains: ``a AND NULL`` is never true, ``a OR NULL`` is true
+    when ``a`` is. Under NOT (or in any other position) a NULL cannot be decided without evaluating rows:
+    that raises rather than answering wrongly."""
+    from .lazy_expr import lit
+    if _is_null(p):
+        return lit(False)
+    if isinstance(p, Expr) and p.op in ("and", "or"):
+        kids = [_top_truth(a) for a in p.args]
+        out = _fold_subquery_value(p.op, kids)
+        if out is None:
+            out = Expr(p.op, *kids)
+        out._alias = p._alias
+        return out
+
+    def has_null(e):
+        return _is_null(e) or (isinstance(e, Expr) and any(has_null(a) for a in e.args if isinstance(a, Expr)))
+
+    if has_null(p):
+        raise ValueError("a scalar subquery over no rows is NULL: not supported under NOT or inside an "
+                         "expression that is not a plain comparison")
+    return p
+
+
+def _plan_key(x):
+    """Hashable identity of a plan or expression: structure, aliases and literals (arrays by dtype, shape and
+    bytes), and the object identity of in-memory tables (``Scan.signature`` has only the column names).
+    None for the WHOLE key when any part cannot be keyed, so two plans are never merged on a guess."""
+    import dataclasses
+    import numpy as np
+
+    def key(x):
+        if isinstance(x, Scan):
+            return ("Scan", id(x.table))
+        if isinstance(x, LogicalPlan):
+            if isinstance(x, ParquetScan):
+                return x.signature()
+            return (type(x).__name__,) + tuple(key(getattr(x, f.name)) for f in dataclasses.fields(x))
+        if isinstance(x, Expr):
+            return ("e", x.op, tuple(key(a) for a in x.args), x._alias,
+                    tuple(sorted((k, key(v)) for k, v in x.kwargs.items())))
+        if isinstance(x, (list, tuple)):
+            return ("l",) + tuple(key(a) for a in x)
+        if isinstance(x, np.ndarray):
+            return ("nd", x.dtype.str, x.shape, x.tobytes())
+        hash(x)                                   # TypeError: unhashable, the whole key is None
+        return (type(x).__name__, x)
+
+    try:
+        return key(x)
+    except Exception:
+        return None
+
+
+def _ends_in_aggregate(plan) -> bool:
+    """True when ``plan``'s output is an aggregate's (one row per group, possibly filtered / projected /
+    sorted / limited afterwards): small, and the only place float sums come from."""
+    while isinstance(plan, (Filter, Project, Sort, Limit)):
+        plan = plan.input
+    return isinstance(plan, Aggregate)
+
+
+def _scalar_inputs(plan):
+    """Keys of the plans some scalar subquery of ``plan`` aggregates over, when that same plan also occurs in
+    ``plan`` itself outside any scalar (``view.filter(col("t") == view.scalar(col("t").max()))``)."""
+    import dataclasses
+    scalars, nodes = [], []
+
+    def expr(e):
+        if isinstance(e, Expr):
+            if e.op == "scalar":
+                scalars.append(e.args[0])
+            else:
+                for a in e.args:
+                    expr(a)
+        elif isinstance(e, (list, tuple)):
+            for a in e:
+                expr(a)
+
+    def walk(n):
+        if isinstance(n, LogicalPlan):
+            nodes.append(n)
+            for f in dataclasses.fields(n):
+                v = getattr(n, f.name)
+                if isinstance(v, LogicalPlan):
+                    walk(v)
+                else:
+                    expr(v)
+
+    walk(plan)
+    wanted = {}
+    for sc in scalars:
+        inp = getattr(sc, "input", None)
+        if isinstance(inp, LogicalPlan) and _ends_in_aggregate(inp):       # small output; not a join or a scan
+            k = _plan_key(inp)
+            if k is not None:
+                wanted[k] = None
+    return {k for k in wanted if any(_plan_key(n) == k for n in nodes)}
+
+
+def _resolve_scalars(plan, device: str, strict: bool):
+    """``plan`` with every scalar subquery (``LazyFrame.scalar``) in its expressions replaced by the literal it
+    computes: each is run first through ``compute`` (so it takes the native path like any plan). The same
+    object when the plan has none. A filter whose predicate is constant afterwards (an empty subquery) is
+    ``Limit(0)`` or nothing."""
+    import dataclasses
+    from .lazy_expr import lit
+
+    # A subquery over the same aggregate plan the outer plan also contains (Q15: `view.filter(tot == view.scalar(max))`)
+    # shares ONE result: the plan is computed once, the subquery aggregates that table and the outer plan
+    # reads it, so the comparison never depends on a float sum coming out twice with the same bits.
+    shared = _scalar_inputs(plan)
+    mats = {}
+
+    def materialized(inp):
+        k = _plan_key(inp)
+        if k not in shared:
+            return None
+        if k not in mats:
+            mats[k] = Scan(LazyFrame(inp).compute(device=device, strict=strict))
+        return mats[k]
+
+    def expr(e):
+        if not isinstance(e, Expr):
+            return e
+        if e.op == "scalar":
+            sub = e.args[0]
+            m = materialized(sub.input) if isinstance(sub, Aggregate) else None
+            if m is not None:
+                sub = dataclasses.replace(sub, input=m)
+            out = LazyFrame(sub).compute(device=device, strict=strict)
+            new = lit(out.column(0)[0].as_py())          # None: the subquery had no rows (NULL)
+            new._alias = e._alias
+            return new
+        args = tuple(expr(a) if isinstance(a, Expr) else a for a in e.args)
+        if all(n is o for n, o in zip(args, e.args)):
+            return e
+        new = _fold_subquery_value(e.op, args)
+        if new is None:
+            new = Expr(e.op, *args, **e.kwargs)
+        new._alias = e._alias
+        return new
+
+    def walk(node):
+        if not isinstance(node, LogicalPlan):
+            return node
+        if shared and not isinstance(node, (Scan, ParquetScan)):
+            m = materialized(node)
+            if m is not None:
+                return m
+        changes = {}
+        for f in dataclasses.fields(node):
+            v = getattr(node, f.name)
+            if isinstance(v, LogicalPlan):
+                nv = walk(v)
+            elif isinstance(v, Expr):
+                nv = expr(v)
+                if isinstance(node, Filter) and nv is not v:
+                    nv = _top_truth(nv)
+            elif isinstance(v, list) and any(isinstance(x, Expr) for x in v):
+                nv = [expr(x) for x in v]
+                if all(n is o for n, o in zip(nv, v)):
+                    nv = v
+            else:
+                continue
+            if nv is not v:
+                changes[f.name] = nv
+        out = dataclasses.replace(node, **changes) if changes else node
+        if isinstance(out, Filter) and "predicate" in changes:
+            b = _bool_of(out.predicate)
+            if b is True:
+                return out.input
+            if b is False:
+                return Limit(out.input, 0)
+        return out
+
+    return walk(plan)
+
+
+def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,
+                   auto: bool = False):
+    """Execute an already optimized plan on one device; returns (result, provenance). A GPU piece that
+    left the GPU for memory reasons is listed in the provenance as ``gpu_pieces`` (F-056)."""
+    from mxframe import gpu_budget
     from mxframe.custom_ops import CustomOpsCompiler
     compiler = CustomOpsCompiler(device=device)
-    result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
-    return result, dict(compiler.last_compile_provenance or {})
+    with gpu_budget.track(strict=strict, device="auto" if auto else device) as run:
+        result = compiler.compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
+    prov = dict(compiler.last_compile_provenance or {})
+    if run.events:
+        prov["gpu_pieces"] = "; ".join(run.lines)
+        if run.oom_free is not None:
+            prov["gpu_pieces_oom"] = run.oom_free      # free GPU bytes when a piece ran out of memory
+    return result, prov
+
+
+def _oom_free(err: BaseException):
+    """Free GPU bytes now if `err` is an out-of-memory (the shape is retried once more is free), else None."""
+    if not isinstance(err, MemoryError):
+        return None
+    try:
+        from mxframe import gpu_budget
+        return gpu_budget.free_bytes()
+    except Exception:
+        return None

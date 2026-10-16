@@ -27,6 +27,9 @@ jobs:
       - name: Setup mxframe symlink
         run: pixi run setup-mxframe
 
+      - name: Kernel libraries match their sources (F-066)
+        run: pixi run python3 scripts/record_build_hash.py --check
+
       - name: Download pre-built AOT kernels
         run: |
           # In CI, download the pre-built .so files from a release artifact
@@ -35,6 +38,7 @@ jobs:
             echo "Mojo available — building AOT kernels"
             pixi run mojo build --emit shared-lib kernels_aot/kernels_aot.mojo \
               -o kernels_aot/libmxkernels_aot.so
+            bash scripts/set_runpath.sh kernels_aot/libmxkernels_aot.so
           else
             echo "Using pre-built libmxkernels_aot.so from repository"
           fi

@@ -354,3 +354,15 @@ def test_string_keys_come_out_in_byte_order(native, monkeypatch, spread):
     plain = pa.table({"s": pa.array([words[c] for c in s_codes], type=pa.string()), "v": A(np.ones(n))})
     got2 = LazyFrame(plain).groupby("s").agg(col("v").sum().alias("n")).limit(3).compute(device="cpu")
     assert got2.column("s").to_pylist() == sorted(words)[:3]
+
+
+def test_count_of_a_whole_table_reads_no_column(native):
+    """COUNT(col) over every row with no filter and no key (TPC-H Q13's customer count) is the row count: the
+    plan reads no column, so there is nothing to hand the executor, and the answer is still native and int64."""
+    t = pa.table({"a": A(np.arange(12_345, dtype=np.int32)), "b": A(np.ones(12_345))})
+    got = LazyFrame(t).groupby().agg(col("a").count().alias("n"), col("b").count().alias("m")).compute(device="cpu")
+    assert nx.last_path() == "native", nx.last_decline()
+    assert got.schema == pa.schema([("n", pa.int64()), ("m", pa.int64())])
+    assert got.to_pylist() == [{"n": 12_345, "m": 12_345}]
+    nulls = pa.table({"a": pa.array([1, None, 3, None, 5] * 100, pa.int32())})       # COUNT(col) skips nulls
+    assert LazyFrame(nulls).groupby().agg(col("a").count().alias("n")).compute(device="cpu").to_pylist() == [{"n": 300}]

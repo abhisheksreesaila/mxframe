@@ -44,6 +44,12 @@ MIN_UPLOAD_BYTES = 64 << 20      # smaller inputs finish on the CPU before an up
 RESIDENT_MEM_FRACTION = 0.5      # share of free GPU memory the resident cache may use
 MIN_SHARE = 0.05                 # a split giving a device less than this is not worth it
 DEFAULT_GPU_ALPHA_MS = 4.5       # fixed cost of one fused GPU call (measured)
+SPLIT_MARGIN = 0.10              # a split must beat the faster device alone by this much to be chosen
+# CPU share slowdown while the GPU runs beside it (launch thread, result copies; a resident GPU share reads no
+# host memory, so this is a small allowance, not measured: F-006's 25 ms split matches CPU 40% / GPU 60% unslowed)
+CPU_CONTENTION = 1.05
+SPLIT_MERGE_MS = 0.5             # thread hand-off and the merge of the partials, plus per group (below)
+MERGE_BYTES_PER_MS = 4_000_000   # partials copied back and merged: ~4 GB/s
 
 
 @dataclass
@@ -79,10 +85,43 @@ def query_running():
 
 
 def _yield_to_queries() -> None:
+    """Called before every chunk copy of a background upload: wait for running queries, and
+    abandon the upload once the process is exiting (F-063: exit waits at most one chunk)."""
     with _active_cv:
-        if _active:
-            _active_cv.wait_for(lambda: _active == 0, timeout=YIELD_MAX_S)
+        if _active and not _closing:
+            _active_cv.wait_for(lambda: _active == 0 or _closing, timeout=YIELD_MAX_S)
+    if _closing:
+        raise RuntimeError("process is exiting")
 _deferred: contextvars.ContextVar = contextvars.ContextVar("mxframe_coproc_deferred", default=None)
+
+
+_closing = False
+
+
+def _start_thread(t: threading.Thread) -> None:
+    """Start an upload thread unless the process is exiting (see ``close_background``)."""
+    with _lock:
+        try:
+            if _closing:
+                raise RuntimeError("process is exiting")
+            t.start()
+        except Exception:      # exiting: free the key so a later query retries
+            for k in [k for k, v in _inflight.items() if v is t]:
+                _inflight.pop(k, None)
+
+
+def close_background(timeout: float) -> None:
+    """At exit: start no more uploads and wait for the running ones (F-063: a daemon thread
+    inside libcuda while `exit()` unloads the driver aborts or segfaults the process)."""
+    global _closing
+    with _lock:
+        _closing = True
+        running = [t for t in _inflight.values() if t.is_alive()]
+    with _active_cv:
+        _active_cv.notify_all()
+    deadline = time.monotonic() + timeout
+    for t in running:
+        t.join(max(0.0, deadline - time.monotonic()))
 
 
 class _Background:
@@ -108,12 +147,7 @@ class _Background:
                 except Exception:
                     pass
             for t in threads:
-                try:
-                    t.start()
-                except Exception:      # e.g. interpreter shutdown: free the key so a later query retries
-                    with _lock:
-                        for k in [k for k, v in _inflight.items() if v is t]:
-                            _inflight.pop(k, None)
+                _start_thread(t)
 
         if IDLE_BEFORE_BACKGROUND_S <= 0:
             launch()
@@ -169,6 +203,12 @@ def policy(**opts):
         _policy.reset(token)
 
 
+def stable_group_keys(group_by) -> bool:
+    """Bare, unrenamed key columns give the same group ids on every query (so their columns can be
+    resident); derived or renamed keys get fresh ids each time and are never uploaded."""
+    return all(e.op == "col" and e._alias in (None, e.args[0]) for e in group_by)
+
+
 def enabled_by_env() -> bool:
     return os.environ.get("MXFRAME_COPROC", "1") != "0"
 
@@ -197,9 +237,10 @@ def balanced_fraction(cpu_ms: float, gpu_ms: float, gpu_alpha: float = 0.0) -> f
 class _Entry:
     dc: Any                  # pipeline_kernels.DeviceColumns
     nbytes: int
-    owners: list             # Arrow chunk owners + gids: keep every keyed address alive
+    owners: list             # Arrow chunk owners + gids: keep every keyed address alive (none for a file's read)
     users: int = 0
     evicted: bool = False
+    sig: tuple = ()          # (source, columns, group key names): what ``resident_for`` is asked
 
 
 _lock = threading.Lock()
@@ -211,15 +252,43 @@ _failed: Dict[tuple, float] = {}
 _finalized: set = set()
 
 
-def _stable_columns(cc) -> bool:
+def stable_columns(cc) -> bool:
     import pyarrow as pa
     return all(isinstance(b.owner, pa.Array) for arrs in cc.chunks for b in arrs)
 
 
-def _key(cc, gids) -> tuple:
+def gid_fingerprint(unique_key_cols, n_groups: int) -> bytes:
+    """What group id ``i`` means: a hash of the group keys in id order. Two encodings of the same rows with the
+    same fingerprint give every row the same id, so a device copy of one's ids is valid for the other's keys."""
+    import hashlib
+    h = hashlib.blake2b(digest_size=16)
+    h.update(int(n_groups).to_bytes(8, "little"))
+    for name in sorted(unique_key_cols):
+        h.update(name.encode() + b"\0")
+        v = unique_key_cols[name]
+        for ch in (v.chunks if hasattr(v, "chunks") else [v]):
+            h.update(str(ch.type).encode() + len(ch).to_bytes(8, "little") + ch.offset.to_bytes(8, "little"))
+            for b in ch.buffers():
+                if b is not None:
+                    h.update(memoryview(b))
+            if hasattr(ch, "dictionary"):
+                for b in ch.dictionary.buffers():
+                    if b is not None:
+                        h.update(memoryview(b))
+    return h.digest()
+
+
+def _key(cc, gids, source=None, columns=(), gid_fp=None) -> tuple:
+    """What a device copy holds. A table read from a file is keyed by the file's identity, the columns and the
+    group-id fingerprint, so the next compute, which reads the file into new buffers, finds it; any other
+    table by the addresses of its (immutable, kept alive) Arrow buffers."""
+    bounds = tuple(tuple(b) for b in cc.bounds)
+    if source is not None:
+        layout = tuple(tuple((int(b.n), int(b.itemsize), int(b.dt)) for b in arrs) for arrs in cc.chunks)
+        return ("source", source, tuple(columns), bounds, layout, gid_fp, len(gids) if gids is not None else None)
     cols = tuple(tuple((int(b.addr), int(b.n), int(b.itemsize), int(b.dt)) for b in arrs) for arrs in cc.chunks)
     g = (int(gids.ctypes.data), len(gids)) if gids is not None else None
-    return (tuple(tuple(b) for b in cc.bounds), cols, g)
+    return (bounds, cols, g)
 
 
 def _input_bytes(cc, gids, n_rows) -> int:
@@ -274,6 +343,7 @@ def clear_residency() -> None:
         freeable = [e for e in (_evict_locked(k) for k in list(_cache)) if e is not None]
         _failed.clear()
         _finalized.clear()
+        _prepared.clear()
     for e in freeable:
         _free_entry(e)
 
@@ -312,18 +382,18 @@ def _release(e: _Entry) -> None:
         _free_entry(e)
 
 
-def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
+def _start_upload(prog, cc, gids, n_rows, owner, nbytes, key, sig, by_source=False) -> None:
     """Upload the query's columns + group ids in the background (deduplicated per key).
 
     The query thread only registers the upload: every CUDA call (memory info,
     eviction frees, the copy itself) happens on the upload thread, so a first
-    query never waits for GPU initialisation.
+    query never waits for GPU initialisation. An entry keyed by a file's identity holds no host
+    buffers (a later read of the file brings its own) and lives until evicted or the file changes.
     """
-    key = _key(cc, gids)
     with _lock:
         if key in _cache or key in _inflight or _recently_failed(key):
             return
-        owners = [b.owner for arrs in cc.chunks for b in arrs] + ([gids] if gids is not None else [])
+        owners = [] if by_source else [b.owner for arrs in cc.chunks for b in arrs] + ([gids] if gids is not None else [])
 
         def run():
             global _bytes, _inflight_bytes
@@ -367,12 +437,12 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
             with _lock:   # leave in-flight and enter the cache atomically: no duplicate upload can slip in
                 _inflight.pop(key, None)
                 _inflight_bytes -= nbytes
-                _cache[key] = _Entry(dc, nbytes, owners)
+                _cache[key] = _Entry(dc, nbytes, owners, sig=sig)
                 _bytes += nbytes
                 _failed.pop(key, None)
                 register = key not in _finalized
                 _finalized.add(key)
-            if register:
+            if register and not by_source:
                 try:
                     weakref.finalize(owner, _evict, key)
                 except TypeError:
@@ -384,7 +454,7 @@ def _start_upload(prog, cc, gids, n_rows, owner, nbytes) -> None:
     if bg is not None:
         bg.threads.append(t)
     else:
-        t.start()
+        _start_thread(t)
 
 
 FAILED_RETRY_S = 120.0   # a failed or rejected upload (e.g. shared-GPU memory pressure) is retried after this
@@ -402,26 +472,152 @@ def _gpu_usable() -> bool:
     return enabled_by_env() and pk.gpu_available() and auto_mode._gpu_disabled is None
 
 
+def _source_of(owner):
+    """The token of the file read behind ``owner``, or None (an in-memory table)."""
+    from .io_parquet import table_source
+    return table_source(owner)
+
+
+def _evict_stale(source) -> None:
+    """A file that changed (new inode, mtime or size) leaves its old device copies unreachable: free them now."""
+    if source is None or source[0] != "parquet":
+        return
+    with _lock:
+        # same file path, different file identity (dev, inode, mtime, size): other reads of the same file
+        # (other columns, filters, types) are different sources of the same file and stay
+        stale = [k for k, e in _cache.items()
+                 if e.sig and e.sig[0][:2] == source[:2] and e.sig[0][2:6] != source[2:6]]
+        freeable = [e for e in (_evict_locked(k) for k in stale) if e is not None]
+    for e in freeable:
+        _free_entry(e)
+
+
+def resident_for(source, columns, gkeys) -> bool:
+    """Is there a device copy of exactly the columns a query's program reads from this source, with its group ids?
+    ``source`` is ``SplitInputs.source``; the answer decides whether auto may split the query (the exact
+    key is checked again when it runs)."""
+    columns, gkeys = frozenset(columns), tuple(gkeys)
+    with _lock:
+        return any(e.sig and e.sig[0] == source and e.sig[1] == columns and e.sig[2] == gkeys
+                   for e in _cache.values())
+
+
+_prepared: "OrderedDict[tuple, float]" = OrderedDict()   # (source, columns, group keys) -> when a prepare began
+MAX_PREPARED = 256
+
+
+def begin_prepare(source, columns, gkeys) -> bool:
+    """True once per ``FAILED_RETRY_S`` for a source: the caller builds its group ids and starts the upload.
+    (Building them costs a pass over the rows; a query repeated before the upload lands must not redo it.)"""
+    sig = (source, frozenset(columns), tuple(gkeys))
+    with _lock:
+        t = _prepared.get(sig)
+        if t is not None and time.monotonic() - t < FAILED_RETRY_S:
+            return False
+        if any(e.sig == sig for e in _cache.values()):
+            return False
+        _prepared[sig] = time.monotonic()
+        _prepared.move_to_end(sig)
+        while len(_prepared) > MAX_PREPARED:
+            _prepared.popitem(last=False)
+    return True
+
+
+def request_upload(prog, cc, gids, n_groups: int, n_rows: int, owner, *, gid_fp=None, gkeys=(),
+                   min_upload_bytes: Optional[int] = None) -> None:
+    """Start the background upload of a query's inputs (no-op for inputs not worth or not able to be kept)."""
+    source = _source_of(owner)
+    if source is not None and gids is not None and gid_fp is None:
+        source = None                                   # ids with no fingerprint cannot be told apart
+    if source is None and not stable_columns(cc):
+        return
+    nbytes = _input_bytes(cc, gids, n_rows)
+    if nbytes < (MIN_UPLOAD_BYTES if min_upload_bytes is None else min_upload_bytes):
+        return
+    _evict_stale(source)
+    key = _key(cc, gids, source, prog.columns, gid_fp)
+    sig = ((source if source is not None else ("memory", id(owner))), frozenset(prog.columns), tuple(gkeys))
+    _start_upload(prog, cc, gids, n_rows, owner, nbytes, key, sig, by_source=source is not None)
+
+
 def try_split(prog, cc, gids, n_groups: int, n_rows: int, owner,
-              stable_gids: bool = True) -> Optional[Tuple[Any, str, dict]]:
-    """Returns (partials, device label, info) when co-processing served the query, else None."""
+              stable_gids: bool = True, *, cpu_rows=None, gid_fp=None, gkeys=()
+              ) -> Optional[Tuple[Any, str, dict]]:
+    """Returns (partials, device label, info) when co-processing served the query, else None.
+
+    ``cpu_rows(start, end)`` computes the CPU share's partials (the native executor, see
+    ``pipeline_exec._cpu_rows``); the pipeline kernel when omitted."""
     pol = current_policy()
-    if pol is None or n_rows == 0 or not _gpu_usable() or not _stable_columns(cc):
+    if pol is None or n_rows == 0 or not _gpu_usable():
         return None
-    key = _key(cc, gids)
+    source = _source_of(owner)
+    if source is not None and gids is not None and gid_fp is None:
+        source = None
+    if source is None and not stable_columns(cc):
+        return None
+    key = _key(cc, gids, source, prog.columns, gid_fp)
     entry = _acquire(key)
     if entry is None:
-        nbytes = _input_bytes(cc, gids, n_rows)
-        if pol.background_upload and stable_gids and nbytes >= pol.min_upload_bytes:
-            _start_upload(prog, cc, gids, n_rows, owner, nbytes)
+        if pol.background_upload and stable_gids:
+            request_upload(prog, cc, gids, n_groups, n_rows, owner, gid_fp=gid_fp, gkeys=gkeys,
+                           min_upload_bytes=pol.min_upload_bytes)
         return None
     try:
-        return _split(prog, cc, gids, n_groups, n_rows, entry, key, pol)
+        return _split(prog, cc, gids, n_groups, n_rows, entry, key, pol, cpu_rows)
     finally:
         _release(entry)
 
 
-def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol):
+@dataclass
+class SplitPlan:
+    """What the cost model says about running a resident aggregate on both devices."""
+    gpu_fraction: float
+    split_ms: float
+    cpu_alone_ms: float
+    gpu_alone_ms: float        # compute + the per-call cost
+    gpu_compute_ms: float
+    merge_ms: float
+    contended_cpu_ms: float
+    wins: bool                 # beats the faster device alone by SPLIT_MARGIN
+
+    def explain(self) -> str:
+        gpu = (f"gpu alone {self.gpu_alone_ms:.1f}ms (compute {self.gpu_compute_ms:.1f} + "
+               f"{DEFAULT_GPU_ALPHA_MS:g} per call)")
+        if self.gpu_fraction >= 1.0:
+            return (f"resident gpu alone est {self.gpu_alone_ms:.1f}ms (compute {self.gpu_compute_ms:.1f} + "
+                    f"{DEFAULT_GPU_ALPHA_MS:g} per call) vs cpu alone {self.cpu_alone_ms:.1f}ms, "
+                    f"needs {SPLIT_MARGIN * 100:.0f}% less")
+        best = min(self.cpu_alone_ms, self.gpu_alone_ms)
+        gain = 100.0 * (1 - self.split_ms / best) if best > 0 else 0.0
+        return (f"est {self.split_ms:.1f}ms with gpu share {self.gpu_fraction:.2f} "
+                f"(cpu alone {self.cpu_alone_ms:.1f}ms, x{CPU_CONTENTION:g} contention when sharing (assumed, unmeasured) = "
+                f"{self.contended_cpu_ms:.1f}ms; {gpu}; merge {self.merge_ms:.1f}ms) "
+                f"vs best single device {best:.1f}ms: {gain:+.0f}%, needs {SPLIT_MARGIN * 100:.0f}%")
+
+
+def plan_split(cpu_ms: float, gpu_ms: float, n_groups: int = 1, n_slots: int = 1,
+               native_factor: float = 1.0) -> SplitPlan:
+    """Price a split of resident data. ``cpu_ms`` / ``gpu_ms``: calibrated compute time of one device over all
+    rows; every GPU call also pays DEFAULT_GPU_ALPHA_MS (F-006: launch, sync and the partials' copy back).
+    Both devices run at once, so the CPU share runs a little slower than alone (CPU_CONTENTION) and the
+    partials cost a merge. The split wins only if it beats the faster device alone by SPLIT_MARGIN: below
+    that a tie goes to the device with no merge and no GPU call."""
+    cpu_alone = cpu_ms * native_factor
+    gpu_alone = gpu_ms + DEFAULT_GPU_ALPHA_MS
+    merge_ms = SPLIT_MERGE_MS + n_groups * (n_slots + 1) * 8 / MERGE_BYTES_PER_MS
+    cpu_c = cpu_alone * CPU_CONTENTION
+    f = balanced_fraction(cpu_c, gpu_alone, DEFAULT_GPU_ALPHA_MS)
+    if f <= 0:
+        split_ms, wins = cpu_alone, False
+    elif f >= 1:                      # the resident GPU alone is the plan: it must beat the CPU by the margin
+        split_ms, wins = gpu_alone, gpu_alone < cpu_alone * (1 - SPLIT_MARGIN)
+    else:
+        split_ms = (1 - f) * cpu_c + merge_ms
+        wins = split_ms < min(cpu_alone, gpu_alone) * (1 - SPLIT_MARGIN)
+    return SplitPlan(f, split_ms, cpu_alone, gpu_alone, gpu_ms, merge_ms, cpu_c, wins)
+
+
+def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol, cpu_rows=None):
     from . import auto_mode
     from . import pipeline_kernels as pk
     from .calibration import get_calibration
@@ -432,11 +628,17 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol):
     card = max(n_groups, 1)
     cpu_ms = cal.estimate("pipeline", "cpu", n_rows, card=card)
     gpu_ms = cal.estimate("pipeline", "gpu", n_rows, card=card)
-    f = pol.gpu_fraction if pol.gpu_fraction is not None else balanced_fraction(cpu_ms, gpu_ms, DEFAULT_GPU_ALPHA_MS)
+    sp = plan_split(cpu_ms, gpu_ms, n_groups, prog.n_slots, auto_mode.NATIVE_CPU_FACTOR)   # one price, as auto's
+    if pol.gpu_fraction is not None:
+        f = pol.gpu_fraction
+    else:      # resident data, split only when it beats the faster device by the margin; else the faster one alone
+        f = sp.gpu_fraction if sp.wins else (1.0 if sp.gpu_alone_ms < sp.cpu_alone_ms else 0.0)
     k = int(round(n_rows * f))
     dc = entry.dc
-    cpu = Worker("cpu", "cpu", n_rows,
-                 compute=lambda r: pk.run_pipeline_cpu(prog, cc, gids, n_groups, r[0], r[1]))
+    from . import native_exec
+    repro = native_exec.reproducible()          # the router's worker threads do not inherit the context variable
+    cpu_fn = cpu_rows or (lambda a, b: pk.run_pipeline_cpu(prog, cc, gids, n_groups, a, b, reproducible=repro))
+    cpu = Worker("cpu", "cpu", n_rows, compute=lambda r: cpu_fn(r[0], r[1]))
     # Fallible: if the GPU share fails, the Router redoes its rows on the CPU worker.
     gpu = Worker("gpu", "gpu", n_rows, fallible=True,
                  compute=lambda r: pk.run_pipeline_gpu(prog, dc, None, n_groups, r[0], r[1]))
@@ -466,6 +668,7 @@ def _split(prog, cc, gids, n_groups, n_rows, entry, key, pol):
     label = "split" if used == {"cpu", "gpu"} else ("gpu_resident" if used == {"gpu"} else "cpu")
     info = {"resident": True, "gpu_fraction": round(k / n_rows, 3),
             "est_cpu_ms": round(cpu_ms, 1), "est_gpu_ms": round(gpu_ms, 1),
+            "est_split_ms": round(sp.split_ms, 1), "wall_ms": round(res.wall_ms, 1),
             "cpu_ms": round(res.stats["cpu"].busy_ms, 1),
             "gpu_ms": round(gstat.busy_ms, 1) if gstat is not None else 0.0,
             "gpu_failed": bool(gstat is not None and gstat.failed)}

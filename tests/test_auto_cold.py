@@ -143,17 +143,46 @@ def test_empty_dictionary_chunk_declines_to_old_path():
     assert group_keys.build(t, ["k"]) is None or True   # must not crash; empty chunk is skipped or declined
 
 
+class _FakeClock:
+    """A monotonic clock the test moves by hand, so machine load cannot stretch a window."""
+
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance_to(self, t):
+        self.t = t
+        with cf._active_cv:                  # wake the waiting background thread to re-read the clock
+            cf._active_cv.notify_all()
+
+
 def test_a_short_query_inside_the_window_restarts_it(monkeypatch):
     """Idle means no query for the whole gap, counted from when the last one ended."""
+    import types
+    clock = _FakeClock()
+    monkeypatch.setattr(cf, "time", types.SimpleNamespace(monotonic=clock, sleep=time.sleep))
     monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.2)
+    monkeypatch.setattr(cf, "_last_end", clock())          # a query has just ended at t = 1000.00
     ran = []
     with cf.deferred_background() as bg:
-        bg.later(lambda: ran.append(time.monotonic()))
-    time.sleep(0.12)
-    with cf.query_running():            # a short query 120 ms into the 200 ms window
-        time.sleep(0.02)
-    ended = time.monotonic()
-    deadline = ended + 5
+        bg.later(lambda: ran.append(clock()))
+    clock.advance_to(1000.12)
+    with cf.query_running():                               # a short query 120 ms into the 200 ms window
+        clock.t = 1000.14
+    assert cf._last_end == 1000.14
+
+    clock.advance_to(1000.25)       # past the first window (1000.20), inside the restarted one
+    time.sleep(0.1)                 # real time for the background thread to (wrongly) launch
+    assert ran == []
+
+    clock.advance_to(1000.339)      # 1 ms short of the restarted window
+    time.sleep(0.1)
+    assert ran == []
+
+    clock.advance_to(1000.34)       # the window, counted from the end of the short query, is over
+    deadline = time.monotonic() + 5
     while not ran and time.monotonic() < deadline:
         time.sleep(0.005)
-    assert ran and ran[0] - ended >= 0.19
+    assert ran == [1000.34]

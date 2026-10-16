@@ -18,13 +18,17 @@ The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/interna
 
 All are built ahead of time, committed, and shipped in the wheel; nothing compiles at run time. The native executor, pipeline, group-key and join libraries are built for `x86-64-v3` (AVX2), so a wheel doesn't SIGILL on older machines; `scripts/release.sh` builds the per-operator AOT kernels for Mojo's default target.
 
-| Library | Source | Build |
+| Library | Source | Build (`bash scripts/build_pipeline.sh <target>`) |
 |---|---|---|
-| `libmxexec_cpu.so` | `kernels_aot/executor_cpu.mojo` | `bash scripts/build_pipeline.sh exec` |
-| `libmxpipeline_cpu.so`, `libmxpipeline_gpu.so` | `pipeline_cpu.mojo`, `pipeline_gpu.mojo` | `bash scripts/build_pipeline.sh cpu` / `gpu` |
-| `libmxkernels_aot.so`, `libmxkernels_aot_gpu.so` | `kernels_aot.mojo`, `kernels_aot_gpu.mojo` | step 2 of `scripts/release.sh` |
-| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | the `Build:` line in each source's header: `pixi run mojo build kernels_aot/<src>.mojo -I kernels_aot --target-cpu x86-64-v3 --emit shared-lib -o kernels_aot/<lib>.so` |
+| `libmxexec_cpu.so` | `executor_cpu.mojo` (imports `pipeline_cpu.mojo`) | `exec` |
+| `libmxpipeline_cpu.so`, `libmxpipeline_gpu.so` | `pipeline_cpu.mojo`, `pipeline_gpu.mojo` | `cpu` (also rebuilds the executor) / `gpu` |
+| `libmxkernels_aot.so`, `libmxkernels_aot_gpu.so` | `kernels_aot.mojo`, `kernels_aot_gpu.mojo` (imports `_atomic.mojo`) | `aot` (also step 2 of `scripts/release.sh`) |
+| `libmxgroupkeys_cpu.so`, `libmxjoin_cpu.so` | `groupkeys_cpu.mojo`, `joinsemi_cpu.mojo` | `keys` / `join` |
 | `kernels.mojoc` | `kernels/*.mojo` | `bash scripts/build_kernels.sh` (the MAX Graph custom ops) |
+
+With no target the script rebuilds every library. Each build sets the relocatable RUNPATH and then runs `scripts/record_build_hash.py`, which writes `kernels_aot/<lib>.so.sources.json`: the SHA-256 of the library's own `.mojo` file and of every `kernels_aot/*.mojo` it imports (found by following `from X import` lines). Commit the `.so` and its `.sources.json` together. `tests/test_kernel_hashes.py` and the CI step `record_build_hash.py --check` fail with `libX.so is stale: <file> changed. Rebuild with bash scripts/build_pipeline.sh <target>` when a source changed without its library being rebuilt. A new library goes in the `LIBRARIES` table at the top of the script.
+
+**After merging branches that edited `kernels_aot/*.mojo`, the hashes (and the libraries) no longer match the merged sources: run `bash scripts/build_pipeline.sh` once, with no argument, and commit the result.** Never run `record_build_hash.py` by hand without rebuilding first: it would record a hash for a library that was not built from those sources.
 
 ---
 
@@ -85,10 +89,7 @@ The MAX Graph custom ops in `kernels/*.mojo` (e.g. `kernels/group_sum.mojo`, reg
 ### Rebuild and test
 
 ```sh
-pixi run mojo build kernels_aot/kernels_aot.mojo -I kernels_aot \
-    --emit shared-lib -o kernels_aot/libmxkernels_aot.so
-pixi run mojo build kernels_aot/kernels_aot_gpu.mojo -I kernels_aot \
-    --emit shared-lib -o kernels_aot/libmxkernels_aot_gpu.so
+bash scripts/build_pipeline.sh aot   # builds, sets the RUNPATH (F-036), records source hashes (F-066)
 pixi run python3 scripts/_test_aot_smoke.py
 pixi run test
 ```

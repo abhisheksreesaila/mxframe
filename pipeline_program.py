@@ -75,6 +75,7 @@ OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
+OP_ROWID = 39
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 
 OP_NAMES = {
@@ -82,7 +83,7 @@ OP_NAMES = {
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
-    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC",
+    OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX",
 }
 
@@ -109,6 +110,10 @@ def dtype_code(arr: np.ndarray) -> int:
 
 class Unsupported(Exception):
     """Raised inside the compiler; compile_pipeline turns it into ``None``."""
+
+
+class Inexact(Unsupported):
+    """The program would compute an integer past 2^53 in float64 (F-037)."""
 
 
 @dataclass
@@ -372,6 +377,13 @@ class _Const:
 class _Val:
     vreg: int
     kind: str          # "int" | "float" | "bool"
+    bound: Any = None  # int kind: a bound expression (see _eval_bound), evaluated only when a + - * needs it
+
+
+# A bound is a tuple tree: ("c", n) | ("col", name) | ("add", x, y) | ("mul", x, y) | ("max", x, y) |
+# ("div", x, k).  It is evaluated from the column TYPES first (no data read); only if that could pass
+# 2^53 is it evaluated again from the columns' real min / max.
+EXACT = 1 << 53        # integers within +-2^53 are exact in float64, and so are their sums / products
 
 
 class _Section:
@@ -398,6 +410,9 @@ class _Builder:
         self.dict_values: Dict[str, pa.Array] = {}
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
+        self.col_bounds: Dict[str, int] = {}
+        self.skip_bounds = False       # name the columns only: no exactness bound, no pass over the data
+        self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.consts: List[float] = []
         self.const_ix: Dict[float, int] = {}
@@ -484,6 +499,13 @@ class _Builder:
                 self.dict_concat[name] = offs
                 self.dict_values[name] = pa.concat_arrays(parts) if len(parts) > 1 else parts[0]
             return self.dict_values[name]
+        if self.skip_bounds and name not in self.dict_arrays:
+            # naming the columns only: the membership of the literal over an empty stand-in dictionary (no
+            # unify / combine / dictionary_encode, which rewrite or hash every row)
+            col = self.table.column(name)
+            if isinstance(col, pa.ChunkedArray) and col.num_chunks:
+                first = col.chunk(0)
+                return (first.dictionary if pa.types.is_dictionary(first.type) else first).slice(0, 0)
         if name not in self.dict_arrays:
             col = self.table.column(name)
             arr = _single_array(col)
@@ -503,7 +525,53 @@ class _Builder:
         if kind == "str":
             raise Unsupported("string column used as a number")
         ix = self._column(name)
-        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind)
+        if kind != "int":
+            return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind)
+        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind, ("col", name))
+
+    def col_bound(self, name: str, tight: bool) -> int:
+        """max |value| of an integer column: its type's range, or (tight) the data's own min / max, one
+        parallel pass cached for the query. int64 is capped at 2^53 (wider values decline at bind)."""
+        t = self.table.schema.field(name).type
+        wide = EXACT if t.bit_width >= 64 else (1 << t.bit_width) - 1 if pa.types.is_unsigned_integer(t) \
+            else 1 << (t.bit_width - 1)
+        if not tight or wide <= 1 << 16:
+            return wide
+        if name not in self.col_bounds:
+            from .join_engine import _minmax
+            col = self.table.column(name)
+            tb: Optional[int] = 0
+            for ch in (col.chunks if isinstance(col, pa.ChunkedArray) else [col]):
+                if not len(ch):
+                    continue
+                if ch.null_count:
+                    tb = None
+                    break
+                lo, hi = _minmax(_np_of(ch, zero_copy_only=False))
+                tb = max(tb, abs(lo), abs(hi))
+            self.col_bounds[name] = wide if tb is None else tb
+        return self.col_bounds[name]
+
+    def bound_of(self, x):
+        return ("c", abs(int(x.value))) if isinstance(x, _Const) else x.bound
+
+    def _eval_bound(self, t, tight: bool) -> int:
+        k = t[0]
+        if k == "c":
+            return t[1]
+        if k == "col":
+            return self.col_bound(t[1], tight)
+        a = self._eval_bound(t[1], tight)
+        if k == "div":
+            return a // t[2] + 1
+        b = self._eval_bound(t[2], tight)
+        return a * b if k == "mul" else max(a, b) if k == "max" else a + b
+
+    def within_exact(self, t, scale: int = 1) -> bool:
+        """Can ``scale * bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
+        if self.skip_bounds:
+            return True
+        return (self._eval_bound(t, False) * scale <= EXACT or self._eval_bound(t, True) * scale <= EXACT)
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
         """IN_SET over a column's values / codes given a boolean membership table."""
@@ -532,6 +600,10 @@ class _Builder:
                     raise Unsupported("NaN literal")
                 return _Const(float(v), "float")
             raise Unsupported(f"literal {type(v).__name__} outside a string predicate")
+        if op == "rowid":
+            # the row's number in the input (SELECT DISTINCT's first-appearance order, F-033); bounded far
+            # inside 2^53, so a sum or an arithmetic on it stays exact
+            return _Val(self.emit(OP_ROWID, key_extra=("rowid",)), "int", ("c", 1 << 40))
         if op in _ARITH:
             return self._arith(op, args)
         if op in _CMP:
@@ -554,15 +626,50 @@ class _Builder:
             kind = "int" if (then.kind == "int" and other.kind == "int") else "float"
             if isinstance(cond, _Const):
                 return then if cond.value != 0 else other
-            return _Val(self.emit(OP_SELECT, cond.vreg, self.as_reg(then), self.as_reg(other)), kind)
+            bound = ("max", self.bound_of(then), self.bound_of(other)) if kind == "int" else None
+            return _Val(self.emit(OP_SELECT, cond.vreg, self.as_reg(then), self.as_reg(other)), kind, bound)
         if op == "year":
             x = self.compile(args[0])
             if isinstance(x, _Const) or x.kind != "int":
                 raise Unsupported("year() only on integer YYYYMMDD columns")
             d = self.const_reg(10000.0)
             q = self.emit(OP_DIV, x.vreg, d)
-            return _Val(self.emit(OP_FLOOR, q), "int")
+            return _Val(self.emit(OP_FLOOR, q), "int", ("div", self.bound_of(x), 10000))
+        if op == "year_days":
+            return self._year_days(args[0])
         raise Unsupported(f"op {op!r}")
+
+    def _year_days(self, arg: Expr):
+        """EXTRACT(YEAR) of a days-since-1970 column as ``y0 + sum(day >= first day of year y)`` over the
+        years its data spans (one min / max pass, cached): a few compares, no calendar in the interpreter."""
+        if arg.op != "col" or self.column_kind(arg.args[0]) != "int":
+            raise Unsupported("year_days only on an integer column")
+        name = arg.args[0]
+        if self.skip_bounds:           # the same columns, without the min / max pass that sizes the year chain
+            return self.compile(Expr("case_when", Expr("ge", arg, Expr("lit", 0)), Expr("lit", 1), Expr("lit", 0)))
+        if name not in self.day_ranges:
+            from .join_engine import _minmax
+            col = self.table.column(name)
+            lo = hi = None
+            for ch in (col.chunks if isinstance(col, pa.ChunkedArray) else [col]):
+                if ch.null_count:
+                    raise Unsupported("year_days over a column with nulls")
+                if len(ch):
+                    a, b = _minmax(_np_of(ch, zero_copy_only=False))
+                    lo, hi = (a, b) if lo is None else (min(lo, a), max(hi, b))
+            if lo is None:
+                raise Unsupported("year_days over an empty column")
+            self.day_ranges[name] = (lo, hi)
+        lo, hi = self.day_ranges[name]
+        to_year = lambda d: int((np.datetime64(int(d), "D").astype("datetime64[Y]")).astype(int)) + 1970
+        y0, y1 = to_year(lo), to_year(hi)
+        if y1 - y0 > 100:
+            raise Unsupported("year_days over more than 100 years")
+        e = Expr("lit", 0)
+        for y in range(y0 + 1, y1 + 1):
+            first = int(np.datetime64(f"{y:04d}-01-01", "D").astype(int))
+            e = Expr("add", e, Expr("case_when", Expr("ge", arg, Expr("lit", first)), Expr("lit", 1), Expr("lit", 0)))
+        return self.compile(Expr("add", e, Expr("lit", y0)))
 
     def _need(self, e: Expr, want: str):
         x = self.compile(e)
@@ -579,13 +686,20 @@ class _Builder:
         if code == OP_DIV and a.kind == "int" and b.kind == "int":
             raise Unsupported("integer division has floor semantics in Arrow")
         kind = "float" if "float" in (a.kind, b.kind) or code == OP_DIV else "int"
+        bound = None
+        if kind == "int":
+            # the interpreter is float64: an integer intermediate is exact only within +-2^53, so bound
+            # it from its inputs (columns' real min / max) and decline when it could pass (F-037)
+            bound = ("mul" if code == OP_MUL else "add", self.bound_of(a), self.bound_of(b))
+            if not self.within_exact(bound):
+                raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
         if isinstance(a, _Const) and isinstance(b, _Const):
             if code == OP_DIV:
                 if b.value == 0:
                     raise Unsupported("division by constant zero")
                 return _Const(a.value / b.value, kind)
             return _Const(_FOLD[code](a.value, b.value), kind)
-        return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), kind)
+        return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), kind, bound)
 
     def _compare(self, op: str, args):
         lhs, rhs = args
@@ -628,8 +742,19 @@ class _Builder:
                 return None
             if e.op == "div":
                 return a / b if b != 0 else None
+            if a.is_integer() and b.is_integer() and self._int_expr(e):
+                r = _FOLD[_ARITH[e.op]](int(a), int(b))       # exact Python integers
+                if abs(r) > EXACT:
+                    raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
+                return float(r)
             return _FOLD[_ARITH[e.op]](a, b)
         return None
+
+    def _int_expr(self, e: Expr) -> bool:
+        """A constant expression made of integer literals and + - * only."""
+        if e.op == "lit":
+            return isinstance(e.args[0], (int, np.integer)) and not isinstance(e.args[0], bool)
+        return e.op in ("add", "sub", "mul") and all(self._int_expr(a) for a in e.args)
 
     def _try_cmpc(self, op: str, lhs: Expr, rhs: Expr):
         """`column <cmp> constant` in the column's own type, or None if not that shape."""
@@ -756,22 +881,80 @@ class _Builder:
 
 
 def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
-                     concat_dicts: bool = False) -> Optional[PipelineProgram]:
+                     concat_dicts: bool = False, exact_bounds: bool = True) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
     existing path). ``concat_dicts`` (native executor): string predicates test codes against the
     concatenation of the chunks' dictionaries (``PipelineProgram.dict_concat``) instead of a
     unified dictionary built over the rows.
+
+    ``exact_bounds=False`` skips the integer-exactness bounds (the data's min / max, one pass per column):
+    the program is only good for naming its columns (``.columns``), never to run.
     """
     try:
-        return _compile(predicates, aggs, table, concat_dicts)
+        return _compile(predicates, aggs, table, concat_dicts, exact_bounds)
     except Unsupported:
         return None
 
 
-def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False) -> PipelineProgram:
+def _int_arith(e: Expr, table: pa.Table) -> bool:
+    """Does ``e`` hold an integer ``+ - *`` (every column under it an integer, no float literal)?"""
+    cols, floats = set(), []
+
+    def walk(x):
+        if x.op == "col":
+            cols.add(x.args[0])
+        elif x.op == "lit":
+            if isinstance(x.args[0], float):
+                floats.append(x)
+        else:
+            for a in x.args:
+                if isinstance(a, Expr):
+                    walk(a)
+    walk(e)
+    if floats or any(c not in table.column_names or not pa.types.is_integer(table.schema.field(c).type) for c in cols):
+        return False
+
+    def has(x):
+        return x.op in ("add", "sub", "mul") or any(isinstance(a, Expr) and has(a) for a in x.args if x.op != "lit")
+    return has(e)
+
+
+def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr]] = None) -> bool:
+    """Would a ``sum`` in ``aggs`` add integers whose total could pass 2^53 (so float64 loses digits)?
+    The caller then sums exactly in Arrow (F-037). With ``preds``: would any predicate or aggregate
+    (not only a sum) compute an integer past 2^53 (F-061: the compiled graph wraps at int64)? Each
+    expression is bounded on its own, so one the compiler can't take (a string predicate) cannot hide
+    another; an integer ``+ - *`` the compiler can't take counts as inexact (Arrow's checked kernels
+    answer it)."""
+    if preds is None:
+        aggs = [e for e in aggs if e.op == "sum"]
+        if not aggs:
+            return False
+        try:
+            _compile([], aggs, table)
+        except Inexact:
+            return True
+        except Unsupported:
+            return False
+        return False
+    count_all = Expr("count", Expr("lit", 1))
+    for e, as_pred in [(p, True) for p in preds] + [(a, False) for a in aggs if a.op != "count"]:
+        try:
+            _compile([e], [count_all], table) if as_pred else _compile([], [e], table)
+        except Inexact:
+            return True
+        except Unsupported:
+            if _int_arith(e, table):
+                return True
+    return False
+
+
+def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False,
+             exact_bounds: bool = True) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
+    b.skip_bounds = not exact_bounds
 
     # ── predicate section (dense rows) ─────────────────────────────────────
     pred_sec = _Section()
@@ -806,6 +989,10 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if e.op not in ("sum", "min", "max", "mean"):
             raise Unsupported(f"aggregate {e.op!r}")
         inner = b._need(e.args[0], "num")
+        if e.op == "sum" and inner.kind == "int" and \
+                not b.within_exact(b.bound_of(inner), max(1, table.num_rows)):
+            # the float64 accumulator keeps whole numbers only within 2^53: rows * max|value| could pass it
+            raise Inexact("integer sum could pass 2**53, not exact in float64")
         kind = "sum" if e.op == "mean" else e.op
         key = (kind, e.args[0].signature())
         if e.op in ("min", "max") and not isinstance(inner, _Const) and inner.kind == "float":
@@ -866,6 +1053,8 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             return [op, phys_of(ins[1]), ins[2], 0, 0]
         if op == OP_CMPC:
             return [op, phys_of(ins[1]), ins[2], ins[3], ins[4]]
+        if op == OP_ROWID:
+            return [op, phys_of(ins[1]), 0, 0, 0]
         if op == OP_IN_SET:
             return [op, phys_of(ins[1]), phys_of(ins[2]), ins[3], 0]
         if op in (OP_NOT, OP_FLOOR):
@@ -1022,7 +1211,7 @@ def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: 
 
 def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
-    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC):
+    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID):
         return []
     if op in (OP_NOT, OP_FLOOR, OP_IN_SET):
         return [ins[2]]

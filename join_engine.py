@@ -16,12 +16,14 @@ The output columns and their names are exactly those of the tree written by the 
 """
 from __future__ import annotations
 
+import functools
 import os
 import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pyarrow as pa
+from . import gpu_budget
 from ._lazy_pc import pc
 
 from .lazy_frame import (join_output_names, Scan, Filter, Project, Aggregate, Sort, Limit,
@@ -170,7 +172,7 @@ def leaf_table(comp, plan, needed: Optional[Set[str]], keep: Optional[Set[str]] 
             needed = set(sel) if needed is None else set(needed) & set(sel)
         if preds:
             from . import native_exec
-            out = native_exec.try_filter(comp, scan.table, preds, needed)
+            out = native_exec.try_filter(comp, scan.table, preds, needed, keep_dict=keep or ())   # (codes the caller decodes)
             if out is not None:
                 return out
         later = set(getattr(scan, "_mx_decode_after", None) or ()) - set(keep or ())
@@ -565,7 +567,11 @@ def semi_select(probe: np.ndarray, build: np.ndarray, max_key: int) -> Optional[
 def inner_pairs(comp, probe_keys: np.ndarray, build_keys: np.ndarray):
     """(probe_idx, build_idx) int32 pairs of the equal keys on the session device."""
     if comp._session_device == "gpu" and comp._aot_gpu is not None:
-        return comp._aot_gpu.hash_join(probe_keys, build_keys)
+        n_p, n_b = len(probe_keys), len(build_keys)
+        size = max(int(probe_keys.max(initial=0)), int(build_keys.max(initial=0))) + 1 if n_p and n_b else 0
+        return gpu_budget.run_piece(          # F-056: over the GPU's free memory, or out of it: the CPU join
+            "join", gpu_budget.join_bytes(n_p, n_b, size), lambda: comp._aot_gpu.hash_join(probe_keys, build_keys),
+            lambda: comp._hash_join_mojo_cpu(probe_keys, build_keys), shape=(n_p, n_b, size))
     if comp._session_device == "gpu" and comp._aot is None:
         return comp._hash_join_mojo_gpu(probe_keys, build_keys)
     return comp._hash_join_mojo_cpu(probe_keys, build_keys)
@@ -592,7 +598,9 @@ def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = F
     if table.num_columns == 0:
         return table
     if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
-        return comp._aot_gpu.gather_table(table, idx)
+        return gpu_budget.run_piece(
+            "gather", gpu_budget.gather_bytes(table, len(idx)), lambda: comp._aot_gpu.gather_table(table, idx),
+            lambda: _take_rows(table, idx), shape=(table.num_rows, len(idx), str(table.schema.types)))
     from . import native_exec
     out = native_exec.try_gather(comp, table, idx, decode_dicts)
     if out is not None:
@@ -925,12 +933,96 @@ def _semi_partner(comp, plan, bkeys, reduce=None) -> Optional[pa.Table]:
     return None if out is None else out.select(list(bkeys))
 
 
-def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Optional[pa.Table]:
+_MAP_BYTES_PER_ROW = 16            # a partner's map: a direct array over a key range of ~4x its rows, or a hash table
+
+
+@functools.lru_cache(maxsize=1)
+def _l3_bytes() -> int:
+    """Size of the CPU's last-level cache (32 MB when unknown)."""
+    try:
+        txt = open("/sys/devices/system/cpu/cpu0/cache/index3/size").read().strip().upper()
+        return int(txt[:-1]) * {"K": 1 << 10, "M": 1 << 20}[txt[-1]]
+    except (OSError, ValueError, KeyError, IndexError):
+        return 32 << 20
+
+
+def _runtime_reduced(comp, t: pa.Table, bkeys, probe, preds, fact_keys, keep_dict) -> pa.Table:
+    """The runtime join filter (F-043, generalized): a partner of more than twice the rows the fact's own
+    filter keeps is cut to the rows whose keys occur among the fact's surviving keys before its map is built
+    (TPC-H Q12's orders: 1.5M rows indexed for 31k lineitems). It costs a second pass over the fact's filter
+    columns, so it is taken only when the partner's map would not fit the last-level cache (rows x 16 bytes
+    over L3: SF1's Q12 stays whole, SF10's 15M orders at 240 MB do not) and skipped when the fact keeps over
+    half of its rows or the native filter cannot run (``t`` as it was). ``MXFRAME_RUNTIME_JOIN_FILTER`` =
+    0 (never) | 1 (whenever the row counts allow) | auto (default)."""
+    mode = os.environ.get("MXFRAME_RUNTIME_JOIN_FILTER", "auto")
+    if mode == "0" or not preds or (mode != "1" and t.num_rows * _MAP_BYTES_PER_ROW <= _l3_bytes()):
+        return t
+    keys = fact_keys(probe)
+    if keys is None or t.num_rows <= 2 * keys[0].num_rows:
+        return t
+    from . import native_exec
+    ktab, knames = keys
+    out = native_exec.try_filter(comp, t, [], set(t.column_names),
+                                 [native_exec.Lookup(list(bkeys), ktab, list(knames), [], [], semi=True)],
+                                 keep_dict=keep_dict)
+    if _TRACE:
+        _trace(f"runtime join filter: partner {t.num_rows} -> {None if out is None else out.num_rows} rows "
+               f"by {ktab.num_rows} fact keys")
+    return t if out is None else out
+
+
+class _Star:
+    """A star join ready to run (``_star_setup``): the fact leaf's scan and predicates, one native
+    ``Lookup`` per partner (most selective first) with the neighbour leaf it stands for, which partner
+    every leaf belongs to, the columns each leaf delivers, and the residual conditions across partners."""
+    __slots__ = ("scan", "preds", "lookups", "roots", "group", "deliver", "via_probe", "post_res", "fact")
+
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+    def name_of(self, leaf: int, c: str) -> str:
+        """The column of the joined rows (the star scan's output) holding column ``c`` of leaf ``leaf``."""
+        if (leaf, c) in self.via_probe:
+            return self.via_probe[(leaf, c)]
+        return c if leaf == self.fact else _star_name(leaf, c)
+
+
+def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None, star=None) -> Optional[pa.Table]:
     """The join as one scan of leaf ``fact``: every other leaf belongs to the subtree of one of the
     fact's neighbours (the edges form a tree); each subtree is joined on its own (small tables) and
     becomes a partner looked up by key while the fact's filter runs (``native_exec.try_filter``).
     Residual conditions across subtrees run on the joined rows. None: declined (non-unique partner
     keys, unsupported types), the caller joins leaf by leaf."""
+    from . import native_exec
+    st = _star_setup(comp, fl, fact, get, want, leaf_need, coded) if star is None else star
+    if not st:                       # declined (False: the fused attempt already found out)
+        return None
+    scan, preds, lookups, roots = st.scan, st.preds, st.lookups, st.roots
+    deliver, post_res, name_of = st.deliver, st.post_res, st.name_of
+    t0 = time.perf_counter()
+    out = native_exec.try_filter(comp, scan.table, preds, set(deliver[fact]), lookups,
+                                 keep_dict=coded[fact] if coded is not None else ())
+    if _TRACE:
+        _trace(f"star: scan leaf {fact} ({scan.table.num_rows} rows) with partners "
+               f"{[(c, lk.build.num_rows) for (c, _), lk in zip(roots, lookups)]} -> "
+               f"{None if out is None else out.num_rows} rows, {1e3*(time.perf_counter()-t0):.0f} ms "
+               f"{native_exec.last_filter_maps() if out is not None else native_exec.last_filter()[1]}")
+    if out is None:
+        return None
+    for pred, cm in post_res:
+        if out.num_rows == 0:
+            break
+        t = pa.Table.from_arrays([out.column(name_of(leaf, c)) for leaf, c in cm.values()], names=list(cm))
+        mask = comp._eval_predicate(pred, t)
+        keep = _np_of(pc.fill_null(mask, _npscalar(False, type=pa.bool_())), zero_copy_only=False)
+        if not keep.all():
+            out = _take_rows(out, np.flatnonzero(keep).astype(np.int32))
+    return pa.Table.from_arrays([out.column(name_of(*fl.src[nm])) for nm in want], names=want)
+
+
+def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Optional[_Star]:
+    """Build the partners of the star join of leaf ``fact`` (see ``_execute_star``); None: declined."""
     from . import native_exec
     n = len(fl.leaves)
     adj: Dict[int, List[int]] = {i: [] for i in range(n)}
@@ -982,6 +1074,19 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Opti
             if c not in deliver[leaf]:
                 deliver[leaf].append(c)
 
+    # the fact's surviving key columns (its own filter, run natively once per probe columns), or None: the
+    # runtime join filter's input (F-043; generalized to every single-leaf partner, F-046a slice 2)
+    fact_keys_memo: Dict[tuple, Optional[tuple]] = {}
+
+    def fact_keys(probe):
+        key = tuple(probe)
+        if key not in fact_keys_memo:
+            kt = native_exec.try_filter(comp, scan.table, preds, set(probe))
+            if kt is None or 2 * kt.num_rows > scan.table.num_rows:
+                kt = None                     # a weak fact filter: the lookup would cost more than it saves
+            fact_keys_memo[key] = None if kt is None else (kt.select(list(probe)), list(probe))
+        return fact_keys_memo[key]
+
     lookups = []
     # semi partners' key columns, served from the fact's equal probe columns. Defensive: a join drops
     # its right key, so no output or residual can name one today
@@ -995,10 +1100,7 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Opti
             if preds and _rows_of(fl.leaves[c]) > 2 * scan.table.num_rows:
                 # a partner much larger than the (filtered) fact: filter it by the fact's keys first
                 def reduce(probe=probe):
-                    kt = native_exec.try_filter(comp, scan.table, preds, set(probe))
-                    if kt is None or 2 * kt.num_rows > scan.table.num_rows:
-                        return None           # a weak fact filter: the lookup would cost more than it saves
-                    return kt.select(list(probe)), list(probe)
+                    return fact_keys(probe)
             keys = _semi_partner(comp, fl.leaves[c], bkeys, reduce)
             if keys is not None:
                 for pk, bk in zip(probe, bkeys):
@@ -1016,6 +1118,8 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Opti
             cols_of[x] = cols
         if len(S) == 1:
             t = get(c).select(cols_of[c])
+            t = _runtime_reduced(comp, t, bkeys, probe, preds, fact_keys,
+                                 coded[c] if coded is not None else ())
             B = pa.Table.from_arrays([t.column(k) for k in cols_of[c]],
                                      names=[_star_name(c, k) for k in cols_of[c]])
         else:
@@ -1030,8 +1134,10 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Opti
                         {_star_name(x, k): (loc[x], k) for x in S for k in cols_of[x]}, lres)
             sub_fact = _star_fact(comp, sub)
             B = None
+            sub_coded = None if coded is None else [coded[x] for x in S]    # (the subtree's leaves in its own numbering)
             if sub_fact is not None:
-                B = _execute_star(comp, sub, sub_fact, lambda i: get(S[i]), bn, None)
+                B = _execute_star(comp, sub, sub_fact, lambda i: get(S[i]), bn, None, sub_coded)
+            nested_codes = B is not None and sub_coded is not None
             if B is None:
                 lt = [get(x) for x in S]
                 rows = [t.num_rows for t in lt]
@@ -1050,6 +1156,8 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Opti
         outs = [nm for nm in B.column_names if nm.split(":", 1)[0] != str(c) or
                 nm.split(":", 1)[1] in deliver[c]]
         keep_b = {_star_name(c, k) for k in (coded[c] if coded is not None and len(S) == 1 else ())}
+        if len(S) > 1 and nested_codes:           # a nested star's dictionary columns stay codes up to the lookup
+            keep_b = {_star_name(x, k) for x in S for k in coded[x]}
         lookups.append(native_exec.Lookup(probe, B, [_star_name(c, k) for k in bkeys], outs, outs, keep=keep_b))
 
     # probe the most selective partner first: a row stops at its first miss (Q8: the filtered part
@@ -1061,31 +1169,80 @@ def _execute_star(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Opti
 
     order = sorted(range(len(lookups)), key=lambda i: kept_share(roots[i][0], lookups[i]))
     roots, lookups = [roots[i] for i in order], [lookups[i] for i in order]
-    t0 = time.perf_counter()
-    out = native_exec.try_filter(comp, scan.table, preds, set(deliver[fact]), lookups,
-                                 keep_dict=coded[fact] if coded is not None else ())
-    if _TRACE:
-        _trace(f"star: scan leaf {fact} ({scan.table.num_rows} rows) with partners "
-               f"{[(c, lk.build.num_rows) for (c, _), lk in zip(roots, lookups)]} -> "
-               f"{None if out is None else out.num_rows} rows, {1e3*(time.perf_counter()-t0):.0f} ms "
-               f"{'' if out is not None else native_exec.last_filter()[1]}")
-    if out is None:
+    return _Star(scan=scan, preds=preds, lookups=lookups, roots=roots, group=group, deliver=deliver,
+                 via_probe=via_probe, post_res=post_res, fact=fact)
+
+
+def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = False) -> Optional[pa.Table]:
+    """``[Sort Limit] [HAVING] Aggregate([Filter]* (inner-join tree))`` as ONE native call (F-046a slice 3):
+    the fact leaf's filter, the partner lookups, the conditions across partners (and filters above the join)
+    and the aggregate run per block, and no joined row is written. The partners are built as the star scan
+    builds them (``_star_setup``); ``native_exec.try_execute_join`` compiles the aggregate over the joined
+    schema. None: the plan does not fit (or ``MXFRAME_FUSED_JOIN_AGG=0``), the caller materializes the join."""
+    from . import native_exec
+    comp._star_stash = None
+    if native_exec.fused_join_blocked(comp) is not None:         # before any partner is built
         return None
+    plan = comp._inline_project_into_aggregate(plan)
+    if not isinstance(plan, Aggregate) or not plan.aggs:
+        return None
+    above, node = [], plan.input
+    while isinstance(node, Filter):
+        above.append(node.predicate)
+        node = node.input
+    if not (isinstance(node, Join) and node.how == "inner"):
+        return None
+    needed: Set[str] = set()
+    for e in list(plan.group_by) + list(plan.aggs) + above:
+        needed |= _cols(e)
+    if _join_cached(comp, node, needed):                         # the old path would answer from its cache
+        native_exec._decline("join result cached")
+        return None
+    setup = _inner_setup(comp, node, needed)
+    if setup is None:
+        return None
+    fl, want, leaf_need, later, coded, tables, get = setup
+    fact = _star_fact(comp, fl)
+    if fact is None:
+        return None
+    # The aggregate reads a partner's deferred dictionary column as codes whatever it does with it (CASE,
+    # group key, predicate): the bytecode compiler takes dictionaries. If the fused call declines, the old
+    # path needs strings: it gets `setup`'s own `coded`, and partners built with these codes are dropped.
+    fcoded = [set(c) if i == fact else set(c) | later[i] for i, c in enumerate(coded)]
+    widened = fcoded != coded
+    st = _star_setup(comp, fl, fact, get, want, leaf_need, fcoded)
+    # whatever the fused call does, the old path (should it run) must not build the partners again
+    comp._star_stash = (node, frozenset(needed), setup, st if st is not None else False)
+    if st is None:
+        return None
+    lookup_of = {c: j for j, (c, _) in enumerate(st.roots)}
+    vcols = {}                      # a column of the joined schema -> where the executor reads it
+    for name in set(want) | {n for _, cm in st.post_res for n in cm}:
+        leaf, c = fl.src[name]
+        if (leaf, c) in st.via_probe or leaf == fact:
+            vcols[name] = ("fact", st.via_probe.get((leaf, c), c))
+        else:
+            vcols[name] = ("partner", lookup_of[st.group[leaf]], _star_name(leaf, c))
+    fj = native_exec.FusedJoin(st.scan, st.preds, st.lookups, vcols, above + [p for p, _ in st.post_res])
+    if _TRACE:
+        _trace(f"fused join + aggregate: scan leaf {fact} ({st.scan.table.num_rows} rows) with partners "
+               f"{[(c, lk.build.num_rows) for (c, _), lk in zip(st.roots, st.lookups)]}")
+    out = native_exec.try_execute_join(comp, plan, fj, having_pred, post_ops, distinct)
+    if out is not None:
+        comp._star_stash = None
+    elif widened and st:                           # partners holding codes the old path cannot read
+        comp._star_stash = (node, frozenset(needed), setup, None)
+    return out
 
-    def name_of(leaf, c):
-        if (leaf, c) in via_probe:
-            return via_probe[(leaf, c)]
-        return c if leaf == fact else _star_name(leaf, c)
 
-    for pred, cm in post_res:
-        if out.num_rows == 0:
-            break
-        t = pa.Table.from_arrays([out.column(name_of(leaf, c)) for leaf, c in cm.values()], names=list(cm))
-        mask = comp._eval_predicate(pred, t)
-        keep = _np_of(pc.fill_null(mask, _npscalar(False, type=pa.bool_())), zero_copy_only=False)
-        if not keep.all():
-            out = _take_rows(out, np.flatnonzero(keep).astype(np.int32))
-    return pa.Table.from_arrays([out.column(name_of(*fl.src[nm])) for nm in want], names=want)
+def _join_cached(comp, node, needed) -> bool:
+    """True when ``execute_join`` holds this join's result already (a repeated query)."""
+    from . import custom_ops as _co
+    key = _stable_key(comp, node)
+    if key is None:
+        return False
+    return any((key, frozenset(needed), ok, _keep_sig(node), comp._session_device) in _co._JOIN_RESULT_CACHE
+               for ok in (True, False))
 
 
 def _join_indices(comp, tables, rows, base, edges, residuals, out_leaves):
@@ -1134,7 +1291,9 @@ def _join_indices(comp, tables, rows, base, edges, residuals, out_leaves):
     return idx, n_rel
 
 
-def _execute_inner(comp, node, needed, dict_ok=False):
+def _inner_setup(comp, node, needed):
+    """What running a tree of inner joins needs: the flattened tree, the output columns wanted, what each
+    leaf must deliver, the deferred dictionary columns and a leaf evaluator. None: not flattenable."""
     fl = _flatten(node)
     if fl is None:
         return None
@@ -1174,9 +1333,24 @@ def _execute_inner(comp, node, needed, dict_ok=False):
             tables[i] = leaf_table(comp, fl.leaves[i], leaf_need[i], keep=later[i])
         return tables[i]
 
+    return fl, want, leaf_need, later, coded, tables, get
+
+
+def _execute_inner(comp, node, needed, dict_ok=False):
+    stash, comp._star_stash = getattr(comp, "_star_stash", None), None       # from a declined fused attempt
+    star = None
+    if stash is not None and stash[0] is node and stash[1] == (None if needed is None else frozenset(needed)):
+        setup, star = stash[2], stash[3]
+    else:
+        setup = _inner_setup(comp, node, needed)
+    if setup is None:
+        return None
+    fl, want, leaf_need, later, coded, tables, get = setup
+    n_leaves = len(fl.leaves)
     fact = _star_fact(comp, fl)
     if fact is not None:
-        out = _execute_star(comp, fl, fact, get, want, leaf_need, coded)
+        out = _execute_star(comp, fl, fact, get, want, leaf_need, coded,
+                            star if star is not None and (star is False or star.fact == fact) else None)
         if out is not None:
             return out
     for i in range(n_leaves):

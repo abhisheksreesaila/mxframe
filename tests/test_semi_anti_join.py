@@ -152,10 +152,10 @@ def test_joins_of_joins_match_duckdb():
     con.register("d", dim)
     L, R, D = LazyFrame(left), LazyFrame(right), LazyFrame(dim)
     cases = [
-        # semi, then inner
+        # semi, then inner (the inner join's rows come in the order of its largest leaf: compared sorted)
         (L.join(R, left_on="k", right_on="rk", how="semi").join(D, left_on="k", right_on="dk")
          .select("k", "v", "dg"),
-         "SELECT l.k, l.v, d.dg FROM l JOIN d ON l.k = d.dk WHERE EXISTS (SELECT 1 FROM r WHERE r.rk = l.k) ORDER BY rowid_"),
+         "SELECT l.k, l.v, d.dg FROM l JOIN d ON l.k = d.dk WHERE EXISTS (SELECT 1 FROM r WHERE r.rk = l.k) ORDER BY l.k, l.v"),
         # inner, then anti with a filter on the inner join's right column
         (L.join(D, left_on="k", right_on="dk").filter(col("dg") > lit(1))
          .join(R, left_on="k", right_on="rk", how="anti").select("k", "dg"),
@@ -173,6 +173,8 @@ def test_joins_of_joins_match_duckdb():
         got = q.compute(device="cpu")
         want = con.execute(sql).fetch_arrow_table()
         assert got.num_rows == want.num_rows, sql
+        if sql.endswith("ORDER BY l.k, l.v"):
+            got = got.sort_by([("k", "ascending"), ("v", "ascending")])
         for c in got.column_names:
             g, w = got.column(c).to_pylist(), want.column(c).to_pylist()
             if pa.types.is_floating(got.schema.field(c).type):

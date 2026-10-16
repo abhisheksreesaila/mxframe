@@ -26,6 +26,13 @@ from tpch_user.compare import compare_tables  # noqa: E402
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
 
+
+@pytest.fixture
+def star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 @pytest.fixture
 def native(monkeypatch):
     monkeypatch.setenv("MXFRAME_NATIVE", "1")
@@ -150,7 +157,7 @@ def test_outside_m0_falls_back_with_the_same_answer(native, monkeypatch, name):
     assert got.equals(old)
 
 
-def test_aggregate_after_a_join_runs_natively_on_the_materialized_join(native, monkeypatch):
+def test_aggregate_after_a_join_runs_natively_on_the_materialized_join(star_scan, native, monkeypatch):
     """The join is materialized first (Python orchestration until M2); the aggregate over its result
     is a single-table plan, which the executor runs since M1."""
     t = _table()
@@ -307,6 +314,7 @@ def test_dictionaries_repeating_in_non_adjacent_chunks(monkeypatch):
 
 
 def test_an_executor_exception_falls_back(native, monkeypatch):
+    monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "0")        # the fallback is what is tested
     def boom():
         raise OSError("library could not be loaded")
     monkeypatch.setattr(nx, "_load", boom)

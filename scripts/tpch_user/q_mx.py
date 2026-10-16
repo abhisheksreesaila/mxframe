@@ -231,19 +231,17 @@ def q10(t, dev):
 
 def q11(t, dev):
     ger = t["supplier"].filter(col("s_nationkey") == lit(S.Q11_NATIONKEY)).select("s_suppkey")
-    grouped = (
-        t["partsupp"]
-        .join(ger, left_on="ps_suppkey", right_on="s_suppkey")
-        .groupby("ps_partkey")
-        .agg((col("ps_supplycost") * col("ps_availqty")).sum().alias("value"))
+    base = t["partsupp"].join(ger, left_on="ps_suppkey", right_on="s_suppkey")
+    value = col("ps_supplycost") * col("ps_availqty")
+    # HAVING value > (SELECT sum(value) * fraction ...): the subquery is a native plan of its own (no rows:
+    # NULL, and `value > NULL` keeps nothing, as in SQL), its result a literal of the grouped plan's HAVING
+    return (
+        base.groupby("ps_partkey")
+        .agg(value.sum().alias("value"))
+        .filter(col("value") > base.scalar(value.sum()) * lit(S.q11_fraction()))
+        .sort("value", descending=True)
         .compute(device=dev)
     )
-    g = LazyFrame(grouped)
-    total = _scalar(g.groupby().agg(col("value").sum().alias("total")).compute(device=dev))
-    # no partsupp rows for the nation: SUM is NULL, and SQL's `value > NULL` keeps no rows
-    cut = total * S.q11_fraction() if total is not None else float("inf")
-    return (g.filter(col("value") > lit(cut))
-            .sort("value", descending=True).compute(device=dev))
 
 
 def q12(t, dev):
@@ -308,11 +306,13 @@ def q15(t, dev):
         .agg(_rev().sum().alias("total_revenue"))
         .compute(device=dev)
     )
+    # the view is computed once: `total_revenue == max(total_revenue)` compares float sums, which two
+    # separate runs of the aggregate may add in a different order (and differ in the last bit)
     v = LazyFrame(view)
-    top_rev = _scalar(v.groupby().agg(col("total_revenue").max().alias("m")).compute(device=dev))
     return (
         t["supplier"]
-        .join(v.filter(col("total_revenue") == lit(top_rev)), left_on="s_suppkey", right_on="l_suppkey")
+        .join(v.filter(col("total_revenue") == v.scalar(col("total_revenue").max())),
+              left_on="s_suppkey", right_on="l_suppkey")
         .select("s_suppkey", "s_name", "s_address", "s_phone", "total_revenue")
         .sort("s_suppkey")
         .compute(device=dev)
@@ -445,10 +445,9 @@ def q22(t, dev):
     c = (t["customer"].select("c_custkey", "c_phone", "c_acctbal")
          .with_columns(col("c_phone").str_slice(0, 2).alias("cntrycode"))
          .filter(col("cntrycode").isin(S.Q22_CODES)))
-    avg_bal = _scalar(c.filter(col("c_acctbal") > lit(0.0)).groupby().agg(col("c_acctbal").mean().alias("a"))
-                      .compute(device=dev))
+    avg_bal = c.filter(col("c_acctbal") > lit(0.0)).scalar(col("c_acctbal").mean())
     return (
-        c.filter(col("c_acctbal") > lit(avg_bal))
+        c.filter(col("c_acctbal") > avg_bal)
         .join(t["orders"], left_on="c_custkey", right_on="o_custkey", how="anti")
         .groupby("cntrycode")
         .agg(col("c_custkey").count().alias("numcust"), col("c_acctbal").sum().alias("totacctbal"))

@@ -17,6 +17,8 @@ plus, for the GPU, whatever is left of its start-up cost.
 
 from __future__ import annotations
 
+import atexit
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -31,6 +33,11 @@ SPLIT_CPU_EFFICIENCY = 0.90
 SPLIT_OVERHEAD_MS = 0.5
 # A split that gives either side less than this share is not worth the overhead.
 MIN_SPLIT_SHARE = 0.05
+# Native CPU executor time per unit of the calibrated `pipeline@cpu` time (the older fused kernel
+# the calibration measures). Warm, Q1-shaped, 6M rows, 2026-10-16 on a busy machine (load 12): native
+# 7.7 ms vs fused 6.9 ms, so no speed-up is assumed: a split must beat the older kernel by the
+# margin to be chosen over the native executor. Refresh from the quiet-machine run (F-053).
+NATIVE_CPU_FACTOR = 1.0
 
 
 class CalibrationLike(Protocol):
@@ -195,7 +202,10 @@ class GpuWarmup:
 
     def start(self) -> "GpuWarmup":
         with self._lock:
-            if self._thread is None:
+            if self._thread is None and _closing:     # the process is exiting: never begin CUDA now
+                self.error, self._ok = RuntimeError("process is exiting"), False
+                self._done.set()
+            elif self._thread is None:
                 self._t0 = time.perf_counter()
                 self._thread = threading.Thread(target=self._run, name="mxframe-gpu-warmup", daemon=True)
                 self._thread.start()
@@ -258,6 +268,9 @@ class OpCost:
     gpu_ms: float
     h2d_bytes: int = 0
     note: str = ""
+    card: int = 1
+    src_rows: int = 0       # rows the fused pipeline reads: every source row, before the filters
+    src_bytes: int = 0      # what an upload of those rows would copy
 
     def line(self) -> str:
         g = "n/a" if self.gpu_ms == float("inf") else f"{self.gpu_ms:.1f}ms"
@@ -295,11 +308,20 @@ class AutoDecision:
     actual_ms: Optional[float] = None
     gpu_available: bool = True
     coproc: Optional[dict] = None     # set when a fused aggregate co-processed on cpu+gpu
+    split: bool = False               # a cpu decision whose fused aggregate may split with the gpu
+    cpu_path: str = ""                # which CPU path runs, and why (cpu decisions only)
+    upload: bool = False              # a split would win once the columns are resident: queue their upload
+    split_plan: Optional[object] = None   # the cost model's numbers (coproc_fused.SplitPlan)
+    pieces: str = ""                  # GPU pieces that ran on the CPU for memory reasons (F-056)
 
     def explain(self) -> str:
         head = f"auto -> {self.device}  reason: {self.reason}"
         if self.fallback:
             head += "  [fell back to cpu after a gpu error]"
+        if self.cpu_path and self.device == "cpu":
+            head += f"\n  cpu path: {self.cpu_path}"
+        if self.pieces:
+            head += "".join(f"\n  gpu piece: {p}" for p in self.pieces.split("; "))
         if self.estimate is None:
             return head
         e = self.estimate
@@ -315,7 +337,8 @@ class AutoDecision:
         if self.coproc:
             c = self.coproc
             tail += (f"\n  co-processing: gpu_fraction={c.get('gpu_fraction')} cpu busy={c.get('cpu_ms')}ms "
-                     f"gpu busy={c.get('gpu_ms')}ms (resident columns)")
+                     f"gpu busy={c.get('gpu_ms')}ms wall={c.get('wall_ms')}ms (resident columns; "
+                     f"est cpu={c.get('est_cpu_ms')}ms gpu={c.get('est_gpu_ms')}ms split={c.get('est_split_ms')}ms)")
         lines = [l.line() if self.gpu_available else l.line().split(" gpu=")[0] for l in e.lines]
         return "\n".join([head] + lines + [tail])
 
@@ -477,7 +500,8 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
                 nbytes = n * (4 + width)
                 g = enc + sum(calib.estimate(o, "gpu", n, card=card) for o in ops) + h2d(nbytes) \
                     + calib.transfer_ms(card * 8 * len(ops), "d2h")
-                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups"))
+                est.lines.append(OpCost("group_agg", n, cpu, g, nbytes, note=f"~{card:,} groups", card=card,
+                                   src_rows=src, src_bytes=src * (4 + width)))
                 return card, ts, card
             # Global aggregates run masked kernels over the unfiltered input.
             nbytes = src * (width + 4)
@@ -486,7 +510,7 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
                 est.lines.append(OpCost("global_agg", src, cpu, INF, note=KNOWN_BROKEN_GPU["global_agg"]))
                 return 1, ts, 1
             g = len(ops) * calib.estimate("masked_sum", "gpu", src) + h2d(nbytes)
-            est.lines.append(OpCost("global_agg", src, cpu, g, nbytes))
+            est.lines.append(OpCost("global_agg", src, cpu, g, nbytes, src_rows=src, src_bytes=nbytes))
             return 1, ts, 1
         if isinstance(p, Sort):
             n, ts, src = walk(p.input)
@@ -525,7 +549,8 @@ def is_sticky_gpu_error(err: BaseException) -> bool:
     return "CUDA_ERROR" in text or "cuda error" in text.lower()
 
 
-_failed_shapes: set = set()
+_failed_shapes: dict = {}      # shape -> GPU free bytes when it ran out of memory (None: any other error)
+RETRY_FREE_FACTOR = 1.5       # an out-of-memory shape is tried on the GPU again once this much more is free
 _warned_shapes: set = set()
 
 
@@ -536,16 +561,37 @@ def _shape_key(plan):
         return None
 
 
-def remember_gpu_failure(plan) -> None:
+def remember_gpu_failure(plan, free_bytes: Optional[int] = None) -> None:
+    """Remember a shape the GPU failed on. For out-of-memory pass the free GPU memory at that time: the
+    shape gets another GPU try once clearly more is free (another process may have let go)."""
     k = _shape_key(plan)
     if k is not None:
-        _failed_shapes.add(k)
+        _failed_shapes[k] = free_bytes
+
+
+def _shape_failed(plan) -> bool:
+    k = _shape_key(plan)
+    if k is None or k not in _failed_shapes:
+        return False
+    was = _failed_shapes[k]
+    if was is not None:
+        try:
+            from . import gpu_budget
+            if gpu_budget.free_bytes() >= RETRY_FREE_FACTOR * was:
+                del _failed_shapes[k]
+                _warned_shapes.discard(k)
+                return False
+        except Exception:
+            pass
+    return True
 
 
 def forget_gpu_failures() -> None:
     global _gpu_disabled
     _failed_shapes.clear()
     _warned_shapes.clear()
+    from . import gpu_budget
+    gpu_budget.forget()
     _gpu_disabled = None
 
 
@@ -562,7 +608,74 @@ def warn_fallback_once(plan, err: BaseException) -> None:
 
 def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
                   placement: Optional[Dict[str, str]] = None, quick: bool = True) -> AutoDecision:
-    """Pick cpu or gpu for the whole query (spec Phase 1)."""
+    """Pick cpu or gpu for the whole query (spec Phase 1). A cpu decision also says which CPU path
+    runs: the native executor (as with device="cpu"), or the older pipeline that can split its
+    fused aggregate with the GPU, when the model predicts that beats the native executor alone."""
+    d = _choose_device(plan, calib, gpu, prefer, placement, quick)
+    if d.device == "cpu" and not d.cpu_path:
+        d.cpu_path = f"native executor (no cpu+gpu split: {d.reason})"
+    return d
+
+
+def _with_cpu_path(d: AutoDecision, plan, calib, gpu) -> AutoDecision:
+    """Fill `split` / `cpu_path` of a cpu decision taken with a usable GPU (F-053)."""
+    d.split, d.cpu_path = _cpu_path(d, plan, calib, gpu)
+    return d
+
+
+def _agg_node(plan):
+    from .lazy_frame import Aggregate
+    while not isinstance(plan, Aggregate):
+        plan = plan.input
+    return plan                       # (the estimate has an aggregate line, so there is one)
+
+
+def _cpu_path(d: AutoDecision, plan, calib, gpu):
+    """Which CPU path a cpu decision runs, and why (F-053, F-057): the native executor, or a CPU+GPU split of
+    the fused aggregate. A split needs (1) a plan the split path takes (``pipeline_exec.split_check``: the
+    same predicate that path runs), (2) columns already resident on the GPU, since over host data the CPU
+    wins on this box's PCIe x8 link, and (3) a calibrated price that beats the faster device alone by 10%
+    after the GPU's per-call cost, the merge and contention (``coproc_fused.plan_split``). Without residency
+    the query runs native and an upload is queued so a later one finds the columns there."""
+    native = "native executor"
+    from . import coproc_fused as cf, pipeline_exec
+    if not cf.enabled_by_env():
+        return False, f"{native} (no cpu+gpu split: MXFRAME_COPROC=0)"
+    if gpu.remaining_init_ms() > 0:
+        return False, f"{native} (no cpu+gpu split: gpu not warm)"
+    lines = [l for l in d.estimate.lines if l.op in ("group_agg", "global_agg")]
+    if not lines:
+        return False, f"{native} (no cpu+gpu split: no aggregate to split)"
+    a = lines[-1]
+    if a.src_bytes < cf.MIN_UPLOAD_BYTES:
+        return False, (f"{native} (no cpu+gpu split: source input {_fmt_bytes(a.src_bytes)} is under "
+                       f"{_fmt_bytes(cf.MIN_UPLOAD_BYTES)}, nothing is uploaded)")
+    cpu = calib.estimate("pipeline", "cpu", a.src_rows, card=a.card)
+    gpu_ms = calib.estimate("pipeline", "gpu", a.src_rows, card=a.card)
+    if not (cpu < float("inf") and gpu_ms < float("inf")):
+        return False, f"{native} (no cpu+gpu split: no pipeline estimate)"
+    n_aggs = max(len(_agg_node(plan).aggs), 1)       # slots ~ aggregates: only the (small) merge price depends on it
+    sp = cf.plan_split(cpu, gpu_ms, a.card or 1, n_aggs, NATIVE_CPU_FACTOR)
+    d.split_plan = sp
+    if not sp.wins:
+        return False, f"{native} (no cpu+gpu split: {sp.explain()})"
+    # the model likes a split. Compile the program (it names the columns), ask residency, and stop there: the
+    # passes over the data (nulls, int64 range, integer sums) cost as much as a native query, so they run only
+    # for the background upload and for the run itself. Columns that are resident passed them when uploaded.
+    got = pipeline_exec.split_check(plan, full=False)
+    if isinstance(got, str):
+        return False, f"{native} (no cpu+gpu split: {got})"
+    if not cf.resident_for(got.source, got.columns, got.gkeys):
+        d.upload = True
+        # (the background upload runs the full check and drops a plan that fails it)
+        return False, (f"{native} (columns not resident on the GPU yet, upload queued (pending checks); "
+                       f"once resident: {sp.explain()})")
+    # predicted from residency and the light check: the run still checks nulls, int64 range and integer sums
+    # (a resident max(i) says nothing about a later sum(i) past 2^53): a plan it declines runs native
+    return True, f"cpu+gpu split ({sp.explain()}) (pending the run's data checks)"
+
+
+def _choose_device(plan, calib, gpu, prefer, placement, quick):
     if quick and calib is None and gpu is None and not placement and prefer != "gpu":
         rows = _source_rows(plan)
         if rows < SMALL_QUERY_ROWS:
@@ -578,7 +691,7 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
         return AutoDecision("cpu", "no gpu", est, gpu_available=False)
     if _gpu_disabled is not None:
         return AutoDecision("cpu", f"gpu disabled after error: {_gpu_disabled}", est, gpu_available=False)
-    if _shape_key(plan) in _failed_shapes:
+    if _shape_failed(plan):
         return AutoDecision("cpu", "this query shape failed on gpu before", est)
     init = gpu.remaining_init_ms()
     blocked = [l for l in est.lines if l.gpu_ms == float("inf")]
@@ -595,9 +708,10 @@ def choose_device(plan, *, calib=None, gpu=None, prefer: Optional[str] = None,
     if gpu_ms < cpu_ms * (1 - margin):
         return AutoDecision("gpu", "gpu faster incl. copies", est, init)
     if est.gpu_ms < cpu_ms * (1 - margin) and init > 0:
-        return AutoDecision("cpu", "gpu faster but still starting up", est, init)
-    return AutoDecision("cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster",
-                        est, init)
+        return _with_cpu_path(AutoDecision("cpu", "gpu faster but still starting up", est, init), plan, calib, gpu)
+    return _with_cpu_path(AutoDecision(
+        "cpu", "cpu faster (copies over the link cost more)" if est.h2d_bytes else "cpu faster", est, init),
+        plan, calib, gpu)
 
 
 SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)
@@ -622,6 +736,43 @@ class _NoGpu:
 _NO_GPU = _NoGpu()
 _warmup: Optional[GpuWarmup] = None
 _warmup_lock = threading.Lock()
+_closing = False
+
+
+def _close_background_gpu_work(timeout: float = 15.0) -> None:
+    """At interpreter exit: start no more background GPU work and wait for what is running.
+
+    Their threads are daemons, but a daemon thread inside a ctypes call into libcuda keeps
+    running while libc's `exit()` tears the driver (and its mutexes) down under it: glibc
+    asserts (-6) or the process segfaults (-11) about once in 75 runs of a short query on
+    `device="auto"` (F-063).  A run that exits before the warm-up starts waits for nothing.
+    """
+    global _closing
+    deadline = time.monotonic() + timeout
+    w = _warmup
+    if w is not None:
+        with w._lock:          # the lock GpuWarmup.start holds: no thread can begin after this
+            _closing = True
+            t = w._thread
+    else:
+        _closing = True
+        t = None
+    if t is not None and t.is_alive():
+        t.join(max(0.0, deadline - time.monotonic()))
+    cf = sys.modules.get(__package__ + ".coproc_fused")
+    if cf is not None:
+        cf.close_background(max(0.0, deadline - time.monotonic()))
+    wt = getattr(sys.modules.get(__package__), "_warm_thread", None)
+    if wt is not None and wt.is_alive():
+        wt.join(max(0.0, deadline - time.monotonic()))
+
+
+# threading._register_atexit runs before every atexit hook (and before threads are joined), so
+# nothing else's exit work races a CUDA init still in flight; plain atexit where it is missing.
+try:
+    threading._register_atexit(_close_background_gpu_work)
+except (AttributeError, RuntimeError):
+    atexit.register(_close_background_gpu_work)
 
 
 def _init_gpu():

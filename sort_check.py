@@ -10,7 +10,8 @@ import warnings
 
 import numpy as np
 
-_WARNED = False
+_WARNED = set()
+gpu_sort_fallbacks = 0      # how many GPU top-k sorts were redone on the CPU (provenance reads the delta)
 
 
 def is_sorted_permutation(keys, idx) -> bool:
@@ -23,11 +24,11 @@ def is_sorted_permutation(keys, idx) -> bool:
     return bool(np.all(k[1:] >= k[:-1])) if len(k) > 1 else True
 
 
-def warn_fallback() -> None:
-    global _WARNED
-    if not _WARNED:
-        _WARNED = True
-        warnings.warn("mxframe: radix sort returned an unsorted order; using np.argsort (please report)",
+def warn_fallback(what="radix sort returned an unsorted order") -> None:
+    """One warning per kind of failure (the radix sort and the GPU sort do not share it)."""
+    if what not in _WARNED:
+        _WARNED.add(what)
+        warnings.warn(f"mxframe: {what}; using np.argsort (please report)",
                       RuntimeWarning, stacklevel=3)
 
 
@@ -38,3 +39,22 @@ def checked_sort_indices(aot, keys):
         warn_fallback()
         return np.argsort(keys, kind="stable").astype(np.int32)
     return idx
+
+
+def is_sorted_topk(keys, idx, k) -> bool:
+    """`idx` is exactly ``np.argsort(keys, kind="stable")[:k]`` (checked in O(n), no sort): valid
+    rows in strictly increasing (key, row) order, with no row outside it that sorts before the last."""
+    k = min(int(k), len(keys))
+    if len(idx) != k:
+        return False
+    if k == 0:
+        return True
+    if idx.min() < 0 or idx.max() >= len(keys):
+        return False
+    sel = keys[idx]
+    if k > 1:
+        step = sel[1:] > sel[:-1]
+        if not np.all(step | ((sel[1:] == sel[:-1]) & (idx[1:] > idx[:-1]))):
+            return False
+    last_key, last_row = sel[-1], int(idx[-1])
+    return int((keys < last_key).sum()) + int((keys[:last_row + 1] == last_key).sum()) == k
