@@ -784,10 +784,10 @@ Found by the F-077 developer (2026-10-16); a silent wrong answer on main
 - [x] root cause: the SQL front end translated `COUNT(*)` to `col(<first in-scope column>).count()`, which skips NULLs (a global count(*) also lost rows with a NULL first column); it is now `lit(1).count()`, the form every path already treats as count(*); no kernel change. SQL `SELECT k, count(*) ... GROUP BY k` with NULLs in `k` returns 0 for the NULL-key group where DuckDB returns its row count (2 in the probe). Find which path (the SQL front end's `count(*)` → a column count, or the NULL-key fallback) and fix at the root; `count(*)` counts rows on every path and device
 - [x] `tests/test_f078_count_star.py` (34 cases, 33 failed before the fix): DuckDB-checked, NULL key with count(*), count(col with NULLs), count(*) + sum, single table and through a join, cpu and gpu; fail before
 
-## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [todo]
+## F-079 Float join keys: -0.0 matches 0.0, NaN like DuckDB [review]
 Found by the F-077 developer (2026-10-16); untested suspicion
-- [ ] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
-- [ ] DuckDB-checked tests over the key edge cases; fail before (or a test pinning that it already matches)
+- [x] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
+- [x] DuckDB-checked tests over the key edge cases (tests/test_float_key_joins.py, 78 of 83 fail before); fail before (or a test pinning that it already matches)
 
 ## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q22 [todo]
 Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (2026-10-16, after F-072): 15 of 22 SQL queries have no decline and no Arrow work over 1,000 rows; Q8 ("nothing to filter") and Q15 ("empty input") only show trivial declines and do no Arrow work. The DataFrame forms are 22/22, so each gap is in how the SQL front end phrases the plan

@@ -3607,6 +3607,7 @@ class CustomOpsCompiler(GraphCompiler):
                         f"{right_name}={right_arr.type}"
                     )
                 left_arr, right_arr = pc.cast(left_arr, common), pc.cast(right_arr, common)
+            left_arr, right_arr = _canonical_floats(left_arr), _canonical_floats(right_arr)   # F-079
 
             if (
                 len(left_cols) == 1
