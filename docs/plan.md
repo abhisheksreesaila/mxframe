@@ -754,3 +754,13 @@ Needs: F-001, F-005..F-008
 ## F-075 GPU leak test independent of other processes [done]
 Needs: — · Found in F-057 review round 4 (2026-10-16)
 - [x] `tests/test_pipeline_gpu_leak.py::test_short_lived_threads_do_not_leak_device_memory` measures this process's allocations (the tracker's live bytes or the context's own pool), not `cuMemGetInfo` over the whole device, so another process allocating on GPU 0 cannot fail it; the test still fails on a real leak (prove by disabling the thread-exit release)
+
+## F-076 SQL Q10 partner strings native [todo]
+Needs: F-069 · Found in F-069 review (2026-10-16)
+- [ ] SQL Q10 at SF1 has no PyArrow compute over 1,000 rows (`scripts/native_coverage.py`): the 4 `dictionary_encode` calls over the 57k-row customer string columns (name, address, phone, comment) carried as partner columns are replaced by passing the strings through by row (or encoding once per source, like F-071 did for Q8)
+- [ ] `tests/test_f069_hashed_groups.py` (or a new test) asserts SQL Q10 fully native by the coverage script's rule, fails before
+
+## F-077 A NULL in a float group key: -0.0 and 0.0 are one group, NaNs one group [todo]
+Needs: — · Found in F-069 review (2026-10-16); a wrong answer on main before F-069
+- [ ] a float group key with a NULL declines the native path (correct) and the Arrow fallback kept -0.0 and 0.0 (and NaN payloads) as separate groups: 12 groups where DuckDB gives 10 (reproduced through a fused-join partner column). Either the native hashed path takes NULL keys (a NULL group, last in key order like DuckDB) or the fallback canonicalises -0.0 → 0.0 and NaN → one NaN before grouping
+- [ ] test: float key with NULL, -0.0, 0.0, NaN of two payloads, single table and fused partner column, equals DuckDB group count and values; fails before
