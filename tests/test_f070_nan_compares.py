@@ -31,7 +31,7 @@ X = [NAN, INF, -INF, 0.0, -0.0, 1.5, 2.0, 1.0, -3.0, NAN, 1.5, 0.5, -1.0, 1e30]
 Y = [NAN, 1.0, INF, -0.0, 0.0, NAN, 2.0, -INF, -3.0, 1.0, 1.5, NAN, 0.5, INF]
 N_ = [1, -1, 0, 2, 5, 3, -2, 0, 1, 4, 2, -3, 0, 1]
 G = [3, 0, 0, 1, 2, 2, 2, 2, 0, 3, 1, 2, 0, 1]        # group 0 sums +inf and -inf (a negative NaN), group 3 holds two NaNs
-NULL_X, NULL_Y, NULL_N = (6, 12), (3, 8), (4,)
+NULL_X, NULL_Y, NULL_N = (6, 12), (3, 8), (4, 0, 5)     # n is NULL on rows where x and / or y is NaN too
 
 
 def make_table(dtype, nulls):
@@ -158,7 +158,8 @@ PREDICATES = [
     # two columns, and a column with itself
     "x > y", "x >= y", "x < y", "x <= y", "x = y", "x <> y", "x <> x", "x >= x", "x = x", "x < x",
     # an integer column and a float one; arithmetic that makes NaN
-    "n < x", "n >= x", "n = x", "x + 1.0 > y", "x - x >= 0.0", "x - x = x - x", "x * 0.0 <> 0.0",
+    "n < x", "n >= x", "n = x", "n < y", "n > y", "n <= y", f"n < {NAN_}", f"n > {NAN_}", f"n >= {NAN_}", f"n <= {NAN_}",
+    f"{NAN_} > n", f"{NAN_} < n", f"n = {NAN_}", f"n <> {NAN_}", f"n not in (1, 2)", f"y > n", "x + 1.0 > y", "x - x >= 0.0", "x - x = x - x", "x * 0.0 <> 0.0",
     # BETWEEN, IN, NOT, AND / OR
     "x between 0.0 and 2.0", f"x between 1.0 and {INF_}", "x between y and 3.0", "x not between 0.0 and 2.0",
     f"x in (1.5, {NAN_}, 0.0)", f"x not in (1.5, {NAN_})", "x in (2.0, 1.0)", "x not in (2.0, 1.0)",
@@ -328,6 +329,10 @@ LAZY = [
     (lambda: col("x").between(0.0, math.inf), "x between 0.0 and {inf}"),
     (lambda: col("x").between(float("nan"), float("nan")), "x between {nan} and {nan}"),
     (lambda: ~(col("x") > 1.0), "not (x > 1.0)"),
+    # three-valued IN: x IN (1.0, NULL) is true or NULL, so NOT IN is never true
+    (lambda: col("x").isin([1.0, None]), "x in (1.0, NULL)"), (lambda: ~col("x").isin([1.0, None]), "x not in (1.0, NULL)"),
+    (lambda: ~col("x").isin([float("nan"), None]), "x not in ({nan}, NULL)"),
+    (lambda: ~col("n").isin([1, None]), "n not in (1, NULL)"),
 ]
 
 
@@ -394,3 +399,20 @@ def test_integer_compares_and_compares_nan_cannot_change_stay_ieee():
     assert _flags(col("x") > col("y"), x=f, y=f) == [(pp.OP_GT, 1)]                          # two columns: NaN-aware
     assert _flags((col("x") + 1.0) < 3.0, x=f) == [(pp.OP_LT, 0)]
     assert _flags(lit(3.0) < (col("x") + 1.0), x=f) == [(pp.OP_LT, 1)]                       # c < x: NaN is above c
+
+
+@pytest.mark.parametrize("native", ["1", "0"])
+@pytest.mark.parametrize("pred", [f"n < {NAN_}", f"n > {NAN_}", "n < y", "y > n", f"{NAN_} > n", "n >= y"])
+def test_null_integers_against_nan_at_50k_rows(monkeypatch, native, pred):
+    monkeypatch.setenv("MXFRAME_NATIVE", native)
+    rng = np.random.default_rng(3)
+    n = 50_000
+    y = np.where(rng.random(n) < 0.4, np.nan, rng.normal(0, 3, n))
+    t = pa.table({"i": pa.array(np.arange(n, dtype=np.int32)), "y": pa.array(y),
+                  "n": pa.array(rng.integers(-3, 4, n).astype(np.int64), mask=rng.random(n) < 0.2)})
+    con = duckdb.connect()
+    con.register("_t", t)
+    con.execute("create table t as select * from _t")
+    sql = f"select count(*) c, sum(i) s from t where {pred}".replace("{T}", "double")
+    got = _rows(mx.sql(sql, t=t).compute(device="cpu"))
+    _same(got, [tuple(r) for r in con.execute(sql).fetchall()])

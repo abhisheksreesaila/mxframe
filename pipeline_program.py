@@ -983,8 +983,12 @@ class _Builder:
             hi = self._need(hi_e, "num")
         except Unsupported:
             return None
-        if isinstance(x, _Const) or "float" in (x.kind, lo.kind, hi.kind):
-            return None        # floats: two NaN-aware compares (BETWEEN is IEEE's, for integers)
+        if isinstance(x, _Const):
+            return None
+        if "float" in (x.kind, lo.kind, hi.kind) and not (
+                isinstance(lo, _Const) and isinstance(hi, _Const) and lo.value == lo.value and hi.value == hi.value):
+            return None        # a float BETWEEN is IEEE's (NaN fails `x <= hi`, as in DuckDB) only for constant bounds that are
+                               # not NaN; otherwise two NaN-aware compares
         return _Val(self.emit(OP_BETWEEN, x.vreg, self.as_reg(lo), self.as_reg(hi)), "bool")
 
 

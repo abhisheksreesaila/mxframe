@@ -146,11 +146,13 @@ def test_between_pattern_uses_fused_op():
     assert "AND" not in prog.op_names()
 
 
-def test_float_between_is_two_nan_aware_compares():
-    t = make_table(10)                         # BETWEEN is the integer instruction (F-070): NaN needs the flagged compares
+def test_float_between_keeps_the_fused_op_for_constant_bounds_only():
+    t = make_table(10)                         # NaN fails `x <= hi` for a constant hi, so IEEE's BETWEEN is DuckDB's (F-070)
     prog = compile_pipeline([(col("f64") * lit(2.0)).between(0.5, 3.0)], [col("f32").sum()], t)
-    assert "BETWEEN" not in prog.op_names()
-    assert "AND" in prog.op_names()
+    assert "BETWEEN" in prog.op_names() and "AND" not in prog.op_names()
+    for lo, hi in ((col("f32"), 3.0), (0.5, col("f32")), (float("nan"), 3.0), (0.5, float("nan"))):
+        prog = compile_pipeline([(col("f64") * lit(2.0)).between(lo, hi)], [col("f32").sum()], t)
+        assert "BETWEEN" not in prog.op_names() and "AND" in prog.op_names(), (lo, hi)
 
 
 def test_constant_subexpressions_fold():

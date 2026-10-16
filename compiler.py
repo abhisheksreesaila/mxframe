@@ -38,10 +38,15 @@ def _is_float(x) -> bool:
 
 
 def _nan_mask(x):
-    """True where a float operand is NaN (null where it is null); a scalar False for anything else."""
-    if isinstance(x, float):
+    """True where an operand is NaN, null where it is null (an integer is never NaN, but its NULLs must stay NULL:
+    a scalar False would let `NULL < NaN` come out true); a plain Python number gives a scalar."""
+    if isinstance(x, (int, float)):
         return _npscalar(x != x)
-    return pc.is_nan(x) if _is_float(x) else _npscalar(False)
+    if _is_float(x):
+        return pc.is_nan(x)
+    if hasattr(x, "type") and pa.types.is_integer(x.type):
+        return pc.is_nan(pc.cast(x, pa.float64()))
+    return _npscalar(False)
 
 
 def _valid(x):

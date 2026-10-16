@@ -147,17 +147,21 @@ def value_set(values, like) -> pa.Array:
 def is_in(col, values):
     """SQL ``col IN (values)`` as a boolean array: NULL where ``col`` is NULL (``pc.is_in`` answers False there,
     which made ``NOT IN`` keep the NULL rows)."""
+    values = list(values)
+    has_null = any(v is None for v in values)          # x IN (1, NULL) is true or NULL, never false
+    values = [v for v in values if v is not None]
     if pa.types.is_floating(col.type):
         # DuckDB: -0.0 = 0.0 and NaN = NaN; Arrow's hash lookup tells -0.0 from 0.0 (F-070). Adding 0.0 turns
         # -0.0 into 0.0, and NaN is looked up with a mask of its own.
-        values = list(values)
-        has_nan = any(v is not None and v != v for v in values)
+        has_nan = any(v != v for v in values)
         zero = scalar(0.0, type=col.type)
-        r = pc.is_in(pc.add(col, zero), value_set=value_set([v + 0.0 for v in values if v is not None and v == v], col.type))
+        r = pc.is_in(pc.add(col, zero), value_set=value_set([v + 0.0 for v in values if v == v], col.type))
         if has_nan:
             r = pc.or_kleene(r, pc.is_nan(col))
     else:
         r = pc.is_in(col, value_set=value_set(values, col.type))
+    if has_null:
+        r = pc.if_else(r, scalar(True, type=pa.bool_()), pa.nulls(1, pa.bool_())[0])
     if getattr(col, "null_count", 0):
         r = pc.if_else(pc.is_valid(col), r, pa.nulls(1, pa.bool_())[0])
     return r
