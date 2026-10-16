@@ -29,6 +29,7 @@ from .lazy_frame import (Aggregate, Distinct, Filter, Join, LazyFrame, Limit, Lo
                          Scan, Sort, Tail)
 
 WORKING_FACTOR = 3            # in-memory path: the table, the filtered copy, group ids / gather buffers
+RESIDENT_FACTOR = 1.5         # a dimension table stays resident: its columns and the join index built on them
 HOST_FRACTION = 0.7           # of MemAvailable
 REPRODUCIBLE_FRACTION = 0.5   # of MemTotal: does not move with what other processes hold
 GPU_BATCH_DIVISOR = 1.3       # a GPU piece needs about this much per byte of batch (columns + group ids)
@@ -261,14 +262,14 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
             raise _Decline("the big file is read twice by the plan")
         sub = {id(l) for l in _leaves(agg.input)}
         others = sum(est(f) for l, f in zip(leaves, feet) if id(l) in sub and f is not big)
-        if others * WORKING_FACTOR > budget // 2:
+        if others * RESIDENT_FACTOR > budget // 2:
             raise _Decline(f"the other tables of the aggregate (about {fmt_bytes(others)}) do not fit "
                            f"half of the budget: a join of two big tables needs both sides partitioned")
         spec = _spec(agg)
         _argument_types(spec)
     except _Decline as why:
         return str(why)
-    batch = max(budget // (2 * WORKING_FACTOR) - others, 1)
+    batch = max(int((budget / 2 - others * RESIDENT_FACTOR) / WORKING_FACTOR), 1)
     cap = None
     if device != "cpu" and not reproducible:
         try:

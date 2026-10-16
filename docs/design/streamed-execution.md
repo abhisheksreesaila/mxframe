@@ -34,8 +34,7 @@ A plan streams when, after the optimizer:
 3. every aggregate of A is a top-level `sum / mean / count / min / max` (arguments may be any expression
    without an aggregate in it), every group key is a column or an aliased expression;
 4. L is read once in the plan (not a self-join of the big file);
-5. the **other** leaves under A (the dimension tables: the build sides) estimate, together, under half the
-   budget. They are read once, before the first batch, and stay resident for all batches.
+5. the **other** leaves under A (the dimension tables: the build sides) estimate, together and times 1.5 (columns plus the join index built on them), under half the budget. They are read once, before the first batch, and stay resident for all batches.
 
 Anything else runs the way it does today (no behaviour change when the data fits). When the data does not fit
 **and** the plan declines, `compute()` warns once (`RuntimeWarning`, reason named) and runs as before, because
@@ -55,8 +54,8 @@ copy and the group ids / gather buffers of the in-memory path.
 - **GPU budget**: step 1's `gpu_budget.free_bytes()` (driver free memory, capped by the fake budget). On
   `gpu` / `auto` with a CUDA device the batch size is also capped at what one GPU piece may use
   (90% of free / 1.3), so a batch can run on the GPU. Reproducible mode ignores this cap (same reason).
-- **Batch size** = `budget / (2 * WORKING_FACTOR) - dimension bytes` (half of the budget is kept for the group
-  state, the partials waiting to merge, and the merge's own copy), at least one row group. Row groups are
+- **Batch size** = `(budget / 2 - 1.5 * dimension bytes) / WORKING_FACTOR` (half of the budget is kept for the
+  group state, the partials waiting to merge, and the merge's own copy), at least one row group. Row groups are
   added in file order until the next would pass that size.
 - **Group state** (the merged partial table) over half the budget: raises `MemoryError` that names the number
   of groups, the size and "needs hash-partitioned groups (F-056 step 3)". Failing loudly and early beats the
@@ -101,9 +100,9 @@ bits. (A different budget is a different order of additions, and may differ in t
 
 ## 5. Reading a batch
 
-`ParquetScan` gets an optional `groups` field-less design: the streaming context (`io_parquet._stream`, a
+The plan is not copied per batch: the streaming context (`io_parquet._stream`, a
 `ContextVar` set around the batch computes) names the file and the row groups of the current batch.
-`resolve_plan` reads that file through `_read_file(..., groups=...)`, which intersects the batch with the
+`resolve_plan` reads that file through `_read_file(..., only=batch)`, which intersects the batch with the
 groups the pushed filters leave (row-group pruning by statistics still happens per batch, and an emptied batch
 reads nothing). Every other file in the plan is read once and cached in the context, so a dimension table is
 decoded once, not per batch, and keeps one device copy (its token is unchanged). The token of a batch read

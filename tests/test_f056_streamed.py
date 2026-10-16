@@ -225,6 +225,40 @@ def test_a_group_found_in_some_batches_only_is_kept(files):
     same(got, sql("SELECT d, count(v) AS n, sum(v) AS s FROM fact GROUP BY d", files), ("d",))
 
 
+@pytest.mark.parametrize("device", DEVICES)
+def test_batches_emptied_by_the_row_filter_next_to_batches_that_are_not(files, device):
+    """d is sorted and `d + k` cannot be answered from statistics: the early batches filter down to nothing
+    (a partial of no groups, whose column types may differ), the late ones do not."""
+    lf = (scan_parquet(files["fact"]).filter((col("d") + col("k")) > 2000).groupby("k")
+          .agg(col("q").sum().alias("sq"), col("v").mean().alias("m"), col("q").min().alias("lo"),
+               col("v").count().alias("n")))
+    got = run(lf, device)
+    assert_streamed(lf)
+    same(got, sql("SELECT k, sum(q) AS sq, avg(v) AS m, min(q) AS lo, count(v) AS n FROM fact WHERE d + k > 2000 "
+                  "GROUP BY k", files), ("k",))
+
+
+@pytest.mark.parametrize("how", ["left", "semi", "anti"])
+def test_the_streamed_table_is_the_left_side_of_left_semi_and_anti_joins(files, how):
+    fact, dim1 = scan_parquet(files["fact"]), scan_parquet(files["dim1"]).filter(col("w") < 3)
+    lf = (fact.join(dim1, left_on="j", right_on="id", how=how).groupby("k")
+          .agg(col("v").sum().alias("s"), col("v").count().alias("n")))
+    got = run(lf, "cpu")
+    assert_streamed(lf)
+    kind = {"left": "LEFT JOIN", "semi": "SEMI JOIN", "anti": "ANTI JOIN"}[how]
+    want = sql(f"SELECT k, sum(v) AS s, count(v) AS n FROM fact {kind} (SELECT * FROM dim1 WHERE w < 3) d "
+               f"ON fact.j = d.id GROUP BY k", files)
+    same(got, want, ("k",))
+
+
+def test_a_join_where_the_big_file_is_the_right_side_of_a_left_join_is_not_streamed(files):
+    fact, dim1 = scan_parquet(files["fact"]), scan_parquet(files["dim1"])
+    lf = dim1.join(fact, left_on="id", right_on="j", how="left").groupby("region").agg(col("v").sum().alias("s"))
+    with pytest.warns(RuntimeWarning, match="not streamed: the big file is the build side of a left join"):
+        lf.compute(device="cpu")
+    assert prov(lf)["path"] != "streamed"
+
+
 # --- exactness ----------------------------------------------------------------------------------------------
 
 def small_file(tmp_path, table, rows_per_group=2000):

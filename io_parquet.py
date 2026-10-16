@@ -623,7 +623,14 @@ def group_bytes(path, schema, columns, groups) -> List[int]:
 
 
 def decoded_upper_bound(path, schema) -> int:
-    """An upper bound on what reading any columns of ``path`` decodes to, without visiting a column chunk."""
+    """An upper bound on what reading any columns of ``path`` decodes to, without visiting a column chunk
+    (one number per file version, remembered: this runs on every compute of a lazy Parquet source)."""
+    st = os.stat(path)
+    return _upper_bound(os.path.abspath(os.fspath(path)), st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, schema)
+
+
+@functools.lru_cache(maxsize=64)
+def _upper_bound(path, dev, ino, mtime_ns, size, schema) -> int:
     md = _metadata(path)
     fixed = sum(w for w in (_fixed_width(f.type) for f in schema) if w is not None)
     return md.num_rows * fixed + sum(md.row_group(g).total_byte_size for g in range(md.num_row_groups))
