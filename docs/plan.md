@@ -531,6 +531,7 @@ Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
 - [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
 - [ ] integer SUM returns int64 on every path regardless of size or nulls (today: native double when it fits, int64 on the exact path), like DuckDB
 - [ ] `mean` of large int64 values: integer accumulation, not float64
+- [ ] integer `min` / `max` on the exact path return float64 (lossy past 2^53): return int64 (found by F-061)
 - [ ] sums whose expression the compiler can't take keep the old float path today (`int_sum_inexact` returns False): cover them
 
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
