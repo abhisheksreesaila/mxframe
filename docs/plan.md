@@ -743,6 +743,6 @@ Needs: F-001, F-005..F-008
 - [x] full SF1 + SF10 user-felt run on an otherwise idle machine (2026-10-12 01:34, load1 0.13 at start, GPU 0 because GPU 1 drives the display): `docs/bench/final-sf1*.md`, `final-sf10.md`; summary and honest losses at the top of `docs/benchmarks.md`. All 132 mx results match DuckDB
 - [x] README `device="auto"` section with the real numbers; the README performance section now leads with the user-felt table, and the old synthetic warm-run tables are marked historical
 
-## F-075 GPU leak test independent of other processes [todo]
+## F-075 GPU leak test independent of other processes [review]
 Needs: — · Found in F-057 review round 4 (2026-10-16)
-- [ ] `tests/test_pipeline_gpu_leak.py::test_short_lived_threads_do_not_leak_device_memory` measures this process's allocations (the tracker's live bytes or the context's own pool), not `cuMemGetInfo` over the whole device, so another process allocating on GPU 0 cannot fail it; the test still fails on a real leak (prove by disabling the thread-exit release)
+- [x] `tests/test_pipeline_gpu_leak.py::test_short_lived_threads_do_not_leak_device_memory` measures this process's allocations (the tracker's live bytes or the context's own pool), not `cuMemGetInfo` over the whole device, so another process allocating on GPU 0 cannot fail it; the test still fails on a real leak (prove by disabling the thread-exit release)
