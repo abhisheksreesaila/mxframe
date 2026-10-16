@@ -513,6 +513,19 @@ Needs: none · Found by the F-043 review
 Needs: F-045
 - [ ] `groupby(...).agg(...).with_columns(y=2*x).sort(y, desc).limit(10)` differs from DuckDB on both native settings (engine-wide; SQL is not affected because the translator puts the Sort directly on the Aggregate): the tie-break keys must reach a Sort that sits above a Project over the Aggregate
 
+## F-061 Integer overflow past int64 is silent on the exact path [todo]
+Needs: F-037 · Found by the F-037 review (2026-10-16); high priority: silent wrong results, and F-037 routes more queries here
+- [ ] `pc.add` / `subtract` / `multiply` in the exact path (`custom_ops.py` ~620) wrap past 2^63 (`a*a*a` with a = 2^30 gives 0, rows dropped); DuckDB raises "Overflow in multiplication of INT64". Use Arrow's `_checked` kernels and raise the same way
+- [ ] `pc.sum` on int64 and the limb recombine in `np_arrow._int_group_sum` wrap at 2^63 (DuckDB sums int64 into a 128-bit integer): raise, or widen like DuckDB
+- [ ] tests vs DuckDB for each, both native settings
+
+## F-060 Exact integers without a pre-pass; integer SUM is int64 everywhere [todo]
+Needs: F-037, F-046a slice 3 merged (same Mojo files) · From the F-037 review
+- [ ] replace F-037's min/max pre-pass (int32*int32, int64*int64 and every int64 SUM read the data once per query) with a runtime overflow flag in the bytecode interpreter: compute, flag any |result| past 2^53 per morsel, and rerun on the exact path only when flagged
+- [ ] integer SUM returns int64 on every path regardless of size or nulls (today: native double when it fits, int64 on the exact path), like DuckDB
+- [ ] `mean` of large int64 values: integer accumulation, not float64
+- [ ] sums whose expression the compiler can't take keep the old float path today (`int_sum_inexact` returns False): cover them
+
 ## F-046 Close the CPU gaps to DuckDB (next release) [doing]
 Needs: none · Agreed 2026-10-13 (Abhishek: for the next release, on the strong baseline). General fixes only; every slice measured on TPC-H (stored and shuffled) and the random suite, and must not slow any other query. MojoFrame (illinoisdata/MojoFrame, arXiv 2505.04080) checked: its techniques (integer ids for low-cardinality strings, tuple-hash group-by, factorize-then-join) are already covered here; the slices below follow the database literature instead
 - [ ] F-046a joins: profile the random joins (0.64-0.86x DuckDB) and TPC-H Q3 / Q5 / Q8 / Q12 / Q17 / Q22; a partitioned parallel hash join in Mojo for build sides that are not direct-addressable and for the leaf-by-leaf fallback
