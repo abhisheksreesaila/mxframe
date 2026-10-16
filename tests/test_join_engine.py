@@ -14,6 +14,13 @@ from mxframe.custom_ops import CustomOpsCompiler
 from mxframe.lazy_frame import Join, Scan, Filter, Aggregate
 
 
+
+@pytest.fixture
+def star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 def _sql(sql, **tables):
     con = duckdb.connect()
     for name, t in tables.items():
@@ -154,7 +161,7 @@ def test_empty_join_result_and_empty_leaf():
 
 # ── lean materialization ────────────────────────────────────────────────────────────────────
 
-def test_joins_carry_only_the_columns_read_above_them(monkeypatch):
+def test_joins_carry_only_the_columns_read_above_them(star_scan, monkeypatch):
     fact, da, db, dc = _star(6, n_fact=4_000)
     seen = []
     real = join_engine._execute_inner

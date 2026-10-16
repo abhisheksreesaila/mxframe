@@ -15,6 +15,13 @@ from mxframe.np_arrow import array as A
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
 
+
+@pytest.fixture
+def star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 @pytest.fixture
 def comp(monkeypatch):
     import mxframe.custom_ops as co
@@ -260,7 +267,7 @@ def _same(got, old):
 
 
 @pytest.mark.parametrize("name", list(STAR_PLANS))
-def test_star_plans_match_the_leaf_by_leaf_join(monkeypatch, name):
+def test_star_plans_match_the_leaf_by_leaf_join(star_scan, monkeypatch, name):
     import mxframe.custom_ops as co
     t = _tables()
     star = []
@@ -361,7 +368,7 @@ SEMI_PLANS = {
 
 
 @pytest.mark.parametrize("name", list(SEMI_PLANS))
-def test_semi_plans_match_and_skip_the_distinct(monkeypatch, name):
+def test_semi_plans_match_and_skip_the_distinct(star_scan, monkeypatch, name):
     import mxframe.custom_ops as co
     t = _tables()
     semis, star = [], []
@@ -487,7 +494,7 @@ def test_a_filtered_string_also_selected_after_the_join_stays_encoded_in_its_lea
     _same(got, old)
 
 
-def test_a_condition_inside_a_nested_star_partner(monkeypatch):
+def test_a_condition_inside_a_nested_star_partner(star_scan, monkeypatch):
     """Q8's shape with a condition inside the partner subtree (M2h review): orders -> customer runs
     as a star of its own (a nested `_execute_star`) with the condition applied there, and the answer
     equals the leaf-by-leaf join's."""

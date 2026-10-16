@@ -59,6 +59,7 @@ def main():
         res["paths"] = provenance.summary(prov)
         res["ms"] = (time.perf_counter() - t0) * 1e3
         res["native_calls"] = native
+        res["decline_counts"] = nx.decline_counts()          # {reason: count}, unexpected exceptions as "raised: <Type>"
         res["declines"] = sorted(set(declines))
     elif engine == "polars":
         import polars as pl

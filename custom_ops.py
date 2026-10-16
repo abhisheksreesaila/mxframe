@@ -1421,7 +1421,7 @@ class CustomOpsCompiler(GraphCompiler):
         try:
             res = _native_exec.try_count_distinct(self, table, key, other[0], agg._alias)
         except Exception as exc:          # never fail the query: the equivalent plan answers
-            res = _native_exec._decline(f"count distinct raised {type(exc).__name__}: {exc}")
+            res = _native_exec.swallowed(exc, "count distinct")
         if res is None:
             return equivalent()
         return Scan(res)
@@ -1443,8 +1443,8 @@ class CustomOpsCompiler(GraphCompiler):
                 keep = {n for n in names if pa.types.is_dictionary(t.schema.field(n).type)}
                 try:
                     got = _native_exec.try_filter(self, t, preds, set(names), keep_dict=keep)
-                except Exception:
-                    got = None
+                except Exception as exc:
+                    got = _native_exec.swallowed(exc, "leaf filter")
                 if got is not None:
                     return got.select(names)
         return self.compile_and_run(node)
@@ -1486,6 +1486,21 @@ class CustomOpsCompiler(GraphCompiler):
                 return True
             plan = getattr(plan, "input", None)
         return False
+
+    def _fused_join_aggregate(self, plan):
+        """``[Sort Limit] [HAVING] Aggregate`` over an inner-join tree as one native call
+        (``join_engine.fused_join_aggregate``); None when the plan has another shape or declines."""
+        core, post_ops = self._extract_post_ops(plan)
+        having = None
+        if isinstance(core, Filter) and isinstance(core.input, Aggregate) and core.input.group_by:
+            having, core = core.predicate, core.input
+        if not isinstance(core, Aggregate):
+            return None
+        from . import join_engine
+        try:
+            return join_engine.fused_join_aggregate(self, core, having, post_ops)
+        except Exception as exc:        # a plan is fully native or not at all: never fail the query
+            return _native_exec.swallowed(exc, "fused join + aggregate")
 
     def _materialize_barrier(self, plan):
         """Compute what sits below an aggregate result as a table, so the operator above works on it.
@@ -1779,8 +1794,15 @@ class CustomOpsCompiler(GraphCompiler):
         # for plans whose only heavy work is a Mojo-executed hash join.
         _had_join = self._has_join_node(plan)
 
+        # -1a -- F-046a slice 3: an aggregate over inner joins runs as one native call, no joined rows
+        if _had_join and _native_exec is not None:
+            _fused = self._fused_join_aggregate(plan)
+            if _fused is not None:
+                return _fused
+
         # -1 -- Materialize Join nodes (bottom-up) --------------------
         plan = self._materialize_joins(plan)
+        self._star_stash = None            # (a declined fused attempt's partners: used by now, or never)
         # -1b -- A Sort/Limit/Distinct/Tail below a Filter/Project/Aggregate changes which rows
         # the operators above see: run it now (the Filter/Aggregate paths below only look at the
         # Scan under them, so a Limit there used to be ignored).
@@ -1870,7 +1892,7 @@ class CustomOpsCompiler(GraphCompiler):
             try:
                 _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops)
             except Exception as _exc:      # a plan is fully native or not at all: never fail the query
-                _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
+                _native = _native_exec.swallowed(_exc, "executor")
             if _native is not None:
                 return _native
         if try_fused_aggregate is not None:
@@ -1883,7 +1905,7 @@ class CustomOpsCompiler(GraphCompiler):
             try:
                 _native = _native_exec.try_execute(self, plan, having_pred, _native_post_ops, gpu_fallback=True)
             except Exception as _exc:
-                _native = _native_exec._decline(f"executor raised {type(_exc).__name__}: {_exc}")
+                _native = _native_exec.swallowed(_exc, "executor")
             if _native is not None:
                 return _native
 
@@ -3061,8 +3083,8 @@ class CustomOpsCompiler(GraphCompiler):
         keep = (deferred & set(names)) if distinct else frozenset()
         try:
             out = _native_exec.try_filter(self, scan.table, preds, set(names), keep_dict=keep)
-        except Exception:
-            out = None
+        except Exception as exc:
+            out = _native_exec.swallowed(exc, "leaf filter")
         if out is None:
             return None, post_ops
         out = pa.Table.from_arrays([out.column(n) for n in names],
@@ -3114,8 +3136,8 @@ class CustomOpsCompiler(GraphCompiler):
             else [bool(srt.descending)] * len(by)
         try:
             idx = _native_exec.try_filter_topk(self, table, preds, by, desc, lim.n)
-        except Exception:
-            return None
+        except Exception as exc:
+            return _native_exec.swallowed(exc, "filter + top-k")
         if idx is None:
             return None
         keep = table if proj is None else table.select(list(dict.fromkeys(src.values())))
@@ -3143,8 +3165,8 @@ class CustomOpsCompiler(GraphCompiler):
             return None
         try:
             out = _native_exec.try_filter(self, t, preds, None if needed is None else set(needed))
-        except Exception:
-            return None
+        except Exception as exc:
+            return _native_exec.swallowed(exc, "leaf filter")
         return None if out is None else out.replace_schema_metadata(t.schema.metadata)
 
     def _plan_to_table(self, plan) -> pa.Table:

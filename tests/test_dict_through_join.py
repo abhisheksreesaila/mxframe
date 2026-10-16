@@ -17,6 +17,13 @@ pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not
 MODES = ["A", "N", "R", "Z"]
 
 
+
+@pytest.fixture
+def star_scan(monkeypatch):
+    """These tests check the star scan's own mechanics (what it writes, which columns it keeps coded);
+    an aggregate over the join would otherwise skip it (F-046a slice 3, tests/test_fused_join_agg.py)."""
+    monkeypatch.setenv("MXFRAME_FUSED_JOIN_AGG", "0")
+
 def _dict_chunks(values, n_chunks, r):
     """A dictionary column whose chunks each carry their own dictionary, in their own order."""
     cuts = np.linspace(0, len(values), n_chunks + 1).astype(int)
@@ -78,7 +85,7 @@ def _approx(got, exp):
 
 
 @pytest.mark.parametrize("chunks", [1, 4])
-def test_fact_dictionary_group_key_through_a_star_join(coded, chunks):
+def test_fact_dictionary_group_key_through_a_star_join(star_scan, coded, chunks):
     fact, dim = _tables(chunks=chunks)
     got = (LazyFrame(fact).filter(col("d") < lit(70)).join(LazyFrame(dim).filter(col("w") > lit(2)),
                                                             left_on="k", right_on="dk")
@@ -90,7 +97,7 @@ def test_fact_dictionary_group_key_through_a_star_join(coded, chunks):
     assert "flag" in coded
 
 
-def test_partner_dictionary_group_key(coded):
+def test_partner_dictionary_group_key(star_scan, coded):
     fact, dim = _tables()
     got = (LazyFrame(fact).join(LazyFrame(dim), left_on="k", right_on="dk")
            .groupby("nm", "flag").agg(col("v").sum().alias("s")).compute(device="cpu"))
