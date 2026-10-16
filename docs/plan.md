@@ -19,6 +19,50 @@ Shared rules for every ticket:
 - TPC-H data (gitignored) lives at `/home/abhisheksreesaila/Projects/mxframe/data/tpch_sf{1,10}`; worktrees read it from there.
 - Use glossary terms from the spec: `Morsel`, `DeviceCross`, `Router`, `ResidencyTracker`, `Calibration`.
 
+## Core gate (agreed 2026-10-15): nothing new until cpu, gpu and auto all hold up
+
+Abhishek, 2026-10-15: "the day we say GPU, CPU and auto work really well and 90% if not all of them are beating DuckDB, the core is ready; then the rings (vector, vision, Mojo API) stand on top of it."
+Order, one stage at a time:
+1. **CPU leftovers:** F-042, F-045, F-037, F-038, F-036, F-046a (partitioned hash join), F-033, F-034, then F-043's last check and F-025.
+2. **GPU correctness:** F-055 (results only, no speed claims yet).
+3. **Auto works:** F-053 (auto uses the native executor), then F-056 (data bigger than GPU memory never fails: spill or split to CPU, RAPIDS / BlazingSQL style), F-057 (morsel co-processing that wins), F-007 (per-operator placement for joins).
+4. **Gate:** F-058, the scoreboard that says the core is ready.
+Benchmarks run only on a quiet machine (see `docs/lessons.md`). With other agents running, do development and light SF1 correctness checks only.
+
+## F-055 GPU correctness sweep [todo]
+Needs: none · Agreed 2026-10-15
+- [ ] all 22 TPC-H queries (SF1, stored and shuffled) on `device="gpu"` equal DuckDB; every mismatch or crash gets a fix or a ticket
+- [ ] the random-query suite (`scripts/bench_random/`) runs on `device="gpu"` and checks every result against DuckDB (correctness mode, no timing)
+- [ ] F-014's flaky GPU sort test: memory pressure or a real ordering bug, settled
+- [ ] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`, so auto never picks it
+
+## F-056 Data bigger than GPU memory never fails [todo]
+Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
+- [ ] research first, written to `docs/research/gpu-out-of-core.md`: how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
+- [ ] `device="gpu"` and `"auto"` on a working set larger than free GPU memory finish with results equal to `cpu` (test with an artificially small GPU memory budget, so no 96 GB data is needed)
+- [ ] the plan chooses up front (estimated size vs free memory): GPU, GPU in partitions, or CPU; a GPU OOM mid-query reruns the failed part on CPU and is remembered
+- [ ] both GPUs on this box (2x RTX 3090, 24 GB each) are counted as separate memory pools, not one 48 GB pool
+
+## F-057 Morsel co-processing that wins [todo]
+Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
+- [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
+- [ ] the native CPU executor takes the CPU share of a split (today a split runs the older fused pipeline)
+- [ ] a split is chosen only where calibration predicts it beats both single devices, and `explain` says why
+- [ ] measured on a quiet machine: auto within 10% of min(cpu, gpu) on every query, faster than both on the shapes the split targets (high-volume aggregation on resident data)
+
+## F-058 Core gate scoreboard [todo]
+Needs: F-055, F-056, F-057 · Quiet machine only
+- [ ] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (warm, labelled) and `auto`, against DuckDB and Polars, every result checked against DuckDB
+- [ ] each device beats DuckDB on at least 90% of queries; the misses listed with a reason
+- [ ] when it passes: the rings below can start
+
+## Rings (after the core gate, not before)
+Proposed 2026-10-15, not yet briefed; each goes through `clarify` when its turn comes.
+- Mojo front end for MXFrame: a Mojo plan builder over `mx_execute`, so MX App / DataLens can use MXFrame where there is no Python (iPhone). Depends on F-033, F-034, F-021 (every query native, native Parquet).
+- Tables loaded once per process, shared read-only across sessions (MX App's `App.init_shared`, fh-saas dashboards).
+- Embedding columns and filtered top-k vector search (CPU, then GPU), built on the `mx_filter_topk` pattern.
+- Vision kernels, LLM operators, an MCP server: parked.
+
 ## Wave 1: foundations (parallel)
 
 ## F-001 User-felt TPC-H scoreboard [done]
@@ -362,7 +406,7 @@ Needs: F-030
 - Review round 1 (NEEDS WORK) fixed: int64 group keys past 2^53 sorted through float64 lost order on the hash path (now ranked exactly); hash-path groups came out in first appearance while the other paths used key order (now key order everywhere); stale docstring; `last_path()` stale when MXFRAME_NATIVE=0
 - Not done in M1 (deferred): typed int64 registers (sums are still float64; exact for TPC-H's magnitudes), cached C Data exports, parallel compaction / hashing (both are single-threaded loops today)
 
-## F-032 Mojo executor M2: hash joins [doing]
+## F-032 Mojo executor M2: hash joins [done]
 Needs: F-031 · Replaces F-029
 - Profile first (SF1, warm code, fresh tables): Q12 spent 136 of 165 ms in the Python path's leaf filter (Arrow compute over 6M lineitem rows, 85 ms) and in decoding dictionary strings (`arrow_dict.decode`, 46 ms: `io_parquet.resolve_plan` decoded every dictionary column of every leaf when a plan has a join, before any filter). The join kernels themselves took ~10 ms. So M2 starts with the leaves, not the hash join
 - [x] M2a, native leaf filters: a `Filter*(Scan)` leaf of a join is one `mx_filter` call. The predicate runs on the bytecode interpreter per 64k-row morsel in parallel (pass 1: mask, counts and string bytes per morsel), then the surviving rows of the columns the join needs are written into one arena (pass 2: fixed-width values, utf8, dictionary strings decoded on the way out). Dictionary predicates read codes + chunk offset (dtype 5, as in M1). Declines (nulls, other types, plain-string predicates) run the old path. `tests/test_native_exec_m2.py`
