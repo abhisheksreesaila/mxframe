@@ -93,6 +93,7 @@ JOIN_KEYS = [
     "SELECT k, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY k",
     "SELECT kid AS id, SUM(v) AS x FROM t JOIN u ON k = kid GROUP BY kid",
     "SELECT u.kid, SUM(v) AS x FROM t JOIN u ON t.k = u.kid GROUP BY u.kid",
+    "SELECT kid, SUM(v) AS x FROM t LEFT JOIN u ON k = kid GROUP BY kid",      # the right key: NULL where unmatched (F-086)
 ]
 
 GROUP_ALL = [
@@ -325,7 +326,6 @@ def test_count_distinct_reaches_the_native_count(monkeypatch):
     ("SELECT w.v FROM t JOIN w ON t.k = w.k", ValueError, "more than one joined table"),
     ("SELECT g FROM tn ORDER BY g NULLS FIRST", NotImplementedError, "NULLS FIRST"),
     ("SELECT g, COUNT(*) AS c FROM tn GROUP BY g ORDER BY g DESC NULLS FIRST", NotImplementedError, "NULLS FIRST"),
-    ("SELECT kid, SUM(v) AS x FROM t LEFT JOIN u ON k = kid GROUP BY kid", ValueError, "LEFT JOIN"),
 ])
 def test_unsupported_raises(q, exc, msg):
     with pytest.raises(exc, match=msg):

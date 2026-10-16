@@ -628,7 +628,7 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _needs_precompute(expr) -> bool:
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
-        if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year",
+        if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year", "is_null",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
                        "window"):
             return True
@@ -734,6 +734,8 @@ class CustomOpsCompiler(GraphCompiler):
             return _PC_CMP_OPS[op](*self._cmp_operands(args, table))
         if op == "not":
             return pc.invert(self._eval_expr_arrow(args[0], table))
+        if op == "is_null":
+            return pc.is_null(self._eval_expr_arrow(args[0], table))
         if op == "isin":
             col_arr = self._eval_expr_arrow(args[0], table)
             if (self._session_device == "gpu" and self._aot_gpu is not None
@@ -834,7 +836,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains", "like"):
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null"):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)
@@ -3357,7 +3359,7 @@ class CustomOpsCompiler(GraphCompiler):
             inner = CustomOpsCompiler._plan_stable_key(plan.input)
             if inner is None:
                 return None
-            return inner + ("project", tuple(e.signature() for e in plan.exprs))
+            return inner + ("project", tuple(e.signature(True) for e in plan.exprs))
         return None
 
     def _materialize_joins(self, plan, needed=None):

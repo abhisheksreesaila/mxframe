@@ -841,10 +841,14 @@ Found by the F-083 review (2026-10-16); a silent wrong answer, also on main
 
 - F-083 note: the DataFrame side sorts before select (`f.sort("b").select("a")`); `select("a").sort("b")` raises a ValueError naming the column. A hidden-key Project above Sort/Limit is applied after the post-ops in `CustomOpsCompiler.compile_and_run`, so the top-n paths still see Sort + Limit.
 
-## F-086 SQL IS NULL / IS NOT NULL [todo]
+## F-086 SQL IS NULL / IS NOT NULL [done]
 Found by the F-079 developer and the F-083 review (2026-10-16)
-- [ ] `WHERE x IS NULL` / `IS NOT NULL` (and in SELECT, CASE, HAVING, subqueries, joins' ON) raises `NotImplementedError: Unsupported SQL expression type: Is` in the SQL front end; map to the existing `is_null` / `is_not_null` expressions (native filter where the bytecode has a validity test; Arrow otherwise). Also `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` if sqlglot parses them, and `x IS TRUE / FALSE` if cheap
-- [ ] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
+- [x] `WHERE x IS NULL` / `IS NOT NULL` (and in SELECT, CASE, HAVING, subqueries, joins' ON) raises `NotImplementedError: Unsupported SQL expression type: Is` in the SQL front end; map to the existing `is_null` / `is_not_null` expressions (native filter where the bytecode has a validity test; Arrow otherwise). Also `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` if sqlglot parses them, and `x IS TRUE / FALSE` if cheap
+- [x] DuckDB-checked tests: int, float (NaN is not NULL), string, dictionary, date columns with NULLs; in WHERE, SELECT, CASE, HAVING over an aggregate, anti-join pattern (`LEFT JOIN ... WHERE r.k IS NULL`); fails before; assert the native filter where it applies
+- Built (2026-10-16): new `Expr.is_null()` op (the engine had none; `~x.is_null()` is IS NOT NULL), evaluated by Arrow in `compiler._eval_predicate` and `custom_ops._eval_expr_arrow`; SQL `IS [NOT] NULL`, `IS [NOT] TRUE / FALSE`, `IS [NOT] DISTINCT FROM` (two NaNs are not distinct). `tests/test_sql_is_null.py`: all fail on main, cpu and gpu, 60 and 150k rows, plus a Parquet scan.
+- Review round 1 (2026-10-16): a LEFT JOIN drops its right key, so `u.k` used to return the left key (wrong on main too). Now a query that reads `u.k` (or a bare right-only key) makes the right side carry a copy of it (`__rk_<alias>_<key>`, a name no table has), NULL where unmatched; column resolution maps `u.k` to it, so `IS NULL`, `IS [NOT] DISTINCT FROM NULL` and `SELECT u.k` agree with DuckDB. `USING (k)`: a bare `k` stays the left column. `SELECT *` hides the copy. `Expr.signature(alias=True)` puts the output name in plan cache keys (join result cache returned the previous join's column names). `IS NULL` conjuncts on the right table in `JOIN ... ON` filter the right side first; constants-only tests (`1 IS DISTINCT FROM 2`) raise a clear error.
+- Not done, other tickets: other non-equality in JOIN ON (F-096); `SELECT *` over a join omits the right key (F-102); RIGHT / FULL JOIN; chained LEFT JOIN on a previous right key (F-104)
+- Follow-up: the native bytecode filter has no validity test, so `IS NULL` filters run on the Arrow path: F-097
 
 ## F-087 SQL OFFSET is ignored [done]
 Found by the F-083 review (2026-10-16); a silent wrong answer on main
@@ -933,3 +937,13 @@ Found by the F-090 review (2026-10-16); a missing column on main
 Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
 - [ ] `int_col + 1` (and `-`, `*`) returns double in the SQL front end where DuckDB returns an integer: `_float_expr` promotes the literal. Values past 2^53 round (`i + 1` on 2^60+1 is wrong), `(i32 + 1) % 0` gives NaN instead of NULL, and integer-typed results come back as floats. Keep integer arithmetic integer (checked overflow, F-061) unless an operand is float / decimal / division; DuckDB's result-type rules decide (probe them: int32 + int32 widens?)
 - [ ] DuckDB-checked tests with exact ints past 2^53 and type asserts, in SELECT / WHERE / GROUP BY / subqueries / aggregates (`sum(i + 1)`), native and Arrow paths; fails before
+
+## F-104 Chained LEFT JOIN on the previous right table's key [todo]
+Found by the F-086 review (2026-10-16); a silent wrong answer on main
+- [ ] `t LEFT JOIN u ON t.k = u.k LEFT JOIN x ON u.k = x.k`: for a `t.k` with no match in `u`, `u.k` is NULL so `x` must not match (DuckDB z = NULL); mx joins `x` anyway (z = 300) because a later join's ON resolves `u.k` to `t.k`. Extend F-086's right-key copy (`_copy_right_keys`, which skips joins' ON clauses) to later ON clauses
+- [ ] DuckDB-checked tests: two and three chained LEFT JOINs keyed on the previous right table, mixed INNER / LEFT, unmatched rows at each step; fails before
+
+## F-105 SQL CASE with string results [todo]
+Seen in the F-086 review (2026-10-16)
+- [ ] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
+- [ ] DuckDB-checked tests: string / date / int / mixed-number CASE results, with ELSE and without (NULL), in SELECT / GROUP BY / ORDER BY; fails before
