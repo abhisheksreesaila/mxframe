@@ -11,7 +11,8 @@ import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, take_rows as _take_rows, combine as _combine, value_set as _value_set,\
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate
 from ._lazy_pc import pc
-from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum
+from .np_arrow import is_in as _is_in
+from .np_arrow import checked_arith as _checked_arith, int_sum as _int_sum, float_extreme
 import numpy as np
 import os as _os
 import time as _time
@@ -705,7 +706,7 @@ class CustomOpsCompiler(GraphCompiler):
                 mask = self._gpu_mask("string filter", col_arr, lambda: self._aot_gpu.utf8_isin_mask(col_arr, args[1]))
                 if mask is not None:
                     return _npa(mask, type=pa.bool_())
-            return pc.is_in(col_arr, value_set=_value_set(args[1], col_arr.type))
+            return _is_in(col_arr, args[1])
         if op == "str_slice":
             return _str_slice(self._eval_expr_arrow(args[0], table), args[1], args[2])
         if op == "startswith":
@@ -859,8 +860,8 @@ class CustomOpsCompiler(GraphCompiler):
                     result_cols[name] = _npa(np.ma.masked_all(1, dtype=np.float64), type=_pa.float64())
                     continue
                 if   op == "sum":  val = float(arr_np.sum())
-                elif op == "min":  val = float(arr_np.min())
-                elif op == "max":  val = float(arr_np.max())
+                elif op == "min":  val = float(np.fmin.reduce(arr_np))    # NaN is above every number (F-070): min skips it
+                elif op == "max":  val = float(arr_np.max())              # ... and max is NaN if there is one
                 else:              val = float(arr_np.mean())   # mean
                 result_cols[name] = _npa([val], type=_pa.float64())
             elif op == "count":
@@ -1749,9 +1750,10 @@ class CustomOpsCompiler(GraphCompiler):
                 if exact:
                     cols.append(_npa([_int_sum(arr)], type=pa.int64()))        # OverflowError past int64
                     continue
-                v = {"sum": pc.sum, "min": pc.min_max, "max": pc.min_max, "mean": pc.mean}[e.op](arr)
                 if e.op in ("min", "max"):
-                    v = v[e.op]
+                    cols.append(_npa([float_extreme(arr, e.op)], type=pa.float64()))
+                    continue
+                v = {"sum": pc.sum, "mean": pc.mean}[e.op](arr)
                 cols.append(_npa([v.as_py()], type=pa.float64()))
             result = pa.Table.from_arrays(cols, names=agg_names)
 
@@ -2810,11 +2812,14 @@ class CustomOpsCompiler(GraphCompiler):
             if isinstance(arr, pa.ChunkedArray):
                 arr = _combine(arr)
             if pa.types.is_floating(arr.type):
-                # -0.0 and 0.0 are equal in SQL but hash (and would rank) as two values
+                # -0.0 and 0.0 are equal in SQL but hash (and would rank) as two values; so are NaNs of different
+                # sign or payload (inf - inf is a negative NaN), which DuckDB treats as one value above +inf (F-070)
                 vals = _np_of(arr, zero_copy_only=False)
-                if (vals == 0).any() and np.signbit(vals[vals == 0]).any():
-                    arr = _npa(np.ma.masked_array(vals + vals.dtype.type(0.0), mask=_np_of(pc.is_null(arr), zero_copy_only=False)),
-                               type=arr.type)
+                nan = np.isnan(vals)
+                if nan.any() or ((vals == 0).any() and np.signbit(vals[vals == 0]).any()):
+                    vals = vals + vals.dtype.type(0.0)
+                    vals[nan] = np.nan
+                    arr = _npa(np.ma.masked_array(vals, mask=_np_of(pc.is_null(arr), zero_copy_only=False)), type=arr.type)
             # PyArrow dictionary_encode: O(N) hash → encounter-order indices
             enc = pc.dictionary_encode(arr)
             dict_arr = enc.dictionary
