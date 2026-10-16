@@ -186,8 +186,9 @@ def test_no_coproc_policy_unless_a_split_is_predicted(monkeypatch, policies):
 
 
 def test_a_predicted_split_sets_the_policy_and_keeps_the_answer(monkeypatch, policies):
-    """Warm GPU, GPU priced far below the CPU: the split path (old pipeline) runs and is correct."""
+    """Warm GPU, GPU priced far below the CPU, columns resident (F-057): the split path runs and is correct."""
     monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)          # a test-sized input still qualifies
+    monkeypatch.setattr(cf, "resident_for", lambda *a: True)
     _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
     monkeypatch.setattr(cf, "_gpu_usable", lambda: False)   # no real GPU work: try_split declines
     f = _fact(N)
@@ -199,20 +200,22 @@ def test_a_predicted_split_sets_the_policy_and_keeps_the_answer(monkeypatch, pol
     assert _rows(got, False) == _rows(want, False)
 
 
-def test_a_predicted_split_on_host_data_starts_the_background_upload(monkeypatch, policies):
-    """The first query of a split-worthy aggregate runs on the CPU and queues the upload that later
-    queries split over (the policy is what lets coproc_fused start it)."""
+def test_a_split_worthy_query_on_host_data_runs_native_and_queues_the_upload(monkeypatch, policies):
+    """The first query of a split-worthy aggregate has no resident columns: it runs exactly as device="cpu"
+    (native, no policy), and the upload that later queries split over starts once it has returned (F-057)."""
     n = 6_000_000                                             # 12 B/row of source: over the 64 MiB gate
     r = np.random.default_rng(3)
     f = pa.table({"k": A(r.integers(0, 50, n).astype(np.int64)), "v": A(r.random(n))})
     _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
     monkeypatch.setattr(cf, "_gpu_usable", lambda: True)
-    started = []
-    monkeypatch.setattr(cf, "_start_upload", lambda *a, **k: started.append(1))
+    monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.0)
+    queued = []
+    from mxframe import pipeline_exec
+    monkeypatch.setattr(pipeline_exec, "queue_resident_upload", lambda plan: queued.append(1))
     lf = LazyFrame(f).groupby("k").agg(col("v").sum().alias("s"))
     got = lf.compute(device="auto")
-    assert "cpu path: cpu+gpu split" in lf.last_auto_decision.explain()
-    assert started == [1]
+    assert "cpu path: native executor (columns not resident on the GPU yet, upload queued" in lf.last_auto_decision.explain()
+    assert policies == [None] and queued == [1]
     want = _duckdb("select k, sum(v) s from f group by k", f=f)
     assert _rows(got, False) == _rows(want, False)
 
@@ -223,6 +226,7 @@ def test_split_is_priced_on_source_rows_not_filtered_rows(monkeypatch):
     f = pa.table({"k": A(np.zeros(n, dtype=np.int64)), "d": A(np.arange(n, dtype=np.int32) % 1000),
                   "v": A(np.ones(n))})
     _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
+    monkeypatch.setattr(cf, "resident_for", lambda *a: True)
     lf = LazyFrame(f).filter(col("d") < lit(3)).groupby("k").agg(col("v").sum().alias("s"))
     assert "cpu path: cpu+gpu split" in lf.explain(device="auto", costs=True)
 
@@ -232,7 +236,8 @@ def test_shapes_the_split_cannot_take_are_never_predicted_a_split(monkeypatch):
     _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
     f, dm = _fact(N), _dim()
     joined = LazyFrame(f).join(LazyFrame(dm), on="dim").groupby("grp").agg(col("v").sum().alias("s"))
-    assert "cpu path: native executor (no cpu+gpu split: a join's output" in joined.explain(device="auto", costs=True)
+    assert "cpu path: native executor (no cpu+gpu split: plan is not Aggregate(Filter*(Scan))" in joined.explain(
+        device="auto", costs=True)
     derived = LazyFrame(f).groupby((col("k") + lit(1)).alias("k1")).agg(col("v").sum().alias("s"))
     assert "cpu path: native executor (no cpu+gpu split: derived or renamed group keys" in derived.explain(
         device="auto", costs=True)
@@ -258,15 +263,19 @@ def test_a_split_that_does_not_beat_native_cpu_is_not_chosen(monkeypatch):
     assert "cpu path: native executor" in lf.explain(device="auto", costs=True)
 
 
-def test_a_native_cpu_faster_than_the_old_kernel_beats_the_split(monkeypatch):
+def test_a_native_cpu_far_faster_than_the_gpu_is_not_split(monkeypatch):
+    """The CPU share of a split runs on the native executor, so its price scales with NATIVE_CPU_FACTOR: at
+    5 ms native against a 30 ms GPU (4.5 ms per call) no split is worth it."""
     monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)
-    monkeypatch.setattr(am, "NATIVE_CPU_FACTOR", 0.2)
-    _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)       # split would take ~24 ms; native 20
+    monkeypatch.setattr(cf, "resident_for", lambda *a: True)
+    monkeypatch.setattr(am, "NATIVE_CPU_FACTOR", 0.05)
+    _fake_gpu(monkeypatch, ready=True, cpu_ms=100.0, gpu_ms=30.0)
     lf = LazyFrame(_fact(N)).groupby("k").agg(col("v").sum().alias("s"))
-    assert "cpu path: native executor (est 20.0ms; a split would take 24.4ms)" in lf.explain(device="auto", costs=True)
+    text = lf.explain(device="auto", costs=True)
+    assert "cpu path: native executor (no cpu+gpu split: est " in text and "cpu alone 5.0ms" in text
     monkeypatch.setattr(am, "NATIVE_CPU_FACTOR", 1.0)
-    assert "cpu path: cpu+gpu split (est 24.4ms with gpu share 0.76 vs native cpu 100.0ms)" in lf.explain(
-        device="auto", costs=True)
+    text = lf.explain(device="auto", costs=True)
+    assert "cpu path: cpu+gpu split (est " in text and "cpu alone 100.0ms" in text
 
 
 def test_explain_says_which_cpu_path_and_why(monkeypatch):

@@ -286,19 +286,21 @@ def _sort_spec(sort_by, keys, names):
 
 
 def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = False,
-                distinct: bool = False) -> Optional[pa.Table]:
+                distinct: bool = False, coproc_share: bool = False) -> Optional[pa.Table]:
     """Run the whole plan in one native call, or None (the caller's path runs instead).
     `gpu_fallback`: a GPU session whose own pipeline declined the plan answers it here, on the CPU.
     `distinct`: the plan is a SELECT DISTINCT as a group-by (``distinct_plan``): only directly addressed key
-    spaces up to DISTINCT_MAX_GROUPS, no plain-string keys (``mx_distinct`` takes those and wider ones)."""
+    spaces up to DISTINCT_MAX_GROUPS, no plain-string keys (``mx_distinct`` takes those and wider ones).
+    `coproc_share`: this is the CPU share of a CPU+GPU split (``range_partials``): runs inside the policy
+    that makes every other native call decline."""
     _last["path"] = None
     t_start = _time.perf_counter()
     if not enabled():
         return _decline("disabled (MXFRAME_NATIVE=0)")
-    if getattr(compiler, "_device_arg", None) != "cpu" and not gpu_fallback:
+    if getattr(compiler, "_device_arg", None) != "cpu" and not gpu_fallback and not coproc_share:
         return _decline("CPU executor: device='cpu' (or a GPU session's fallback)")
     from . import coproc_fused
-    if coproc_fused.current_policy() is not None:
+    if coproc_fused.current_policy() is not None and not coproc_share:
         return _decline("CPU+GPU co-processing policy active")
     if not available():
         return _decline("libmxexec_cpu.so not built")
@@ -348,7 +350,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         # then the executor groups by the program's value of it (directly addressed)
         probe = Aggregate(plan.input, [], [a for i, e in derived.items()
                                            for a in (Expr("min", e).alias(f"lo{i}"), Expr("max", e).alias(f"hi{i}"))])
-        r = try_execute(compiler, probe, None, None, gpu_fallback)
+        r = try_execute(compiler, probe, None, None, gpu_fallback, coproc_share=coproc_share)
         if r is None:
             return _decline("derived group key: range pass declined")
         for i in derived:
@@ -1860,3 +1862,76 @@ def try_gather(compiler, table: pa.Table, idx, decode_dicts: bool = False) -> Op
             nbytes = ctypes.c_int32.from_address(a + 4 * n).value
             out.append(pa.Array.from_buffers(pa.string(), n, [None, buf(a, 4 * (n + 1)), buf(b, nbytes)]))
     return pa.Table.from_arrays(out, names=table.column_names)
+
+
+# ── the CPU share of a CPU+GPU split (F-057) ───────────────────────────────────────────────────────────────
+
+_GID = "__mx_gid__"
+_CNT = "__mx_cnt__"
+
+
+def range_partials(compiler, prog, table: pa.Table, predicates, agg_node, gids, n_groups: int,
+                   start: int, end: int):
+    """The native executor over rows ``[start, end)`` of ``table``, as the ``Partials`` the fused pipeline's
+    CPU kernel would return for that range (so they merge with the GPU's), or None when it declines
+    (the caller runs the pipeline kernel over the range instead).
+
+    The slice is a zero-copy ``table.slice`` and the rows are grouped by their group id (a column of
+    ``gids``), so the result's rows land at their group's position without comparing keys. Each of the
+    program's slots is computed by one aggregate of the same expression: a mean's slot is its sum
+    (``finalize`` divides by the count), and a float min / max (DuckDB: NaN above every number) is turned
+    into the pipeline's slot pair, the NaN-free extreme plus a NaN count (see ``pipeline_program``)."""
+    import numpy as np
+    from .lazy_expr import Expr, col, lit
+    from .np_arrow import array as _npa, to_numpy as _np_of
+    from .pipeline_program import Partials
+
+    vals = np.repeat(prog.identity[:, None], n_groups, axis=1)
+    cnt = np.zeros(n_groups, dtype=np.int64)
+    if end <= start:
+        return Partials(vals=vals, cnt=cnt)
+    grouped = gids is not None
+    sliced = table.slice(start, end - start)
+    if grouped:
+        sliced = sliced.append_column(_GID, pa.chunked_array([_npa(np.ascontiguousarray(gids[start:end]))]))
+    slot_agg = {}                                    # slot -> (aggregate name, op)
+    aggs = [Expr("count", lit(1)).alias(_CNT)]
+    for e, (name, op, slot) in zip(agg_node.aggs, prog.outputs):
+        if slot is None or slot in slot_agg:
+            continue
+        kind = "sum" if op == "mean" else op
+        slot_agg[slot] = f"__mx_s{slot}"
+        aggs.append(Expr(kind, e.args[0]).alias(slot_agg[slot]))
+    nan_of = {}                                      # hidden NaN-count slot -> [(aggregate name, op)]
+    out_of = {n: (o, sl) for n, o, sl in prog.outputs}
+    for name, nan_slot in prog.nan_slots.items():
+        op, slot = out_of[name]
+        nan_of.setdefault(nan_slot, []).append((slot_agg[slot], op))
+    node = Scan(sliced)
+    for p in reversed(predicates):
+        node = Filter(node, p)
+    plan = Aggregate(node, [col(_GID)] if grouped else [], aggs)
+    res = try_execute(compiler, plan, None, None, coproc_share=True)
+    if res is None:
+        return None
+    idx = _np_of(res.column(_GID), zero_copy_only=False).astype(np.int64) if grouped else np.zeros(1, np.int64)
+
+    def column(name):
+        return np.asarray(_np_of(res.column(name), zero_copy_only=False), dtype=np.float64)
+
+    c = column(_CNT).astype(np.int64)
+    if not grouped and c[0] == 0:                    # a global aggregate over no surviving rows
+        return Partials(vals=vals, cnt=cnt)
+    cnt[idx] = c
+    for slot, name in slot_agg.items():
+        v = column(name)
+        if prog.slot_kinds[slot] in ("min", "max"):      # the pipeline's slot never holds a NaN
+            v = np.where(np.isnan(v), prog.identity[slot], v)
+        vals[slot, idx] = v
+    for slot, users in nan_of.items():
+        n_nan = np.zeros(len(idx))
+        for name, op in users:
+            hit = np.isnan(column(name))
+            n_nan = np.maximum(n_nan, np.where(hit, c if op == "min" else 1.0, 0.0))
+        vals[slot, idx] = n_nan
+    return Partials(vals=vals, cnt=cnt)

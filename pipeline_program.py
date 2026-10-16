@@ -411,6 +411,7 @@ class _Builder:
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
         self.col_bounds: Dict[str, int] = {}
+        self.skip_bounds = False       # name the columns only: no exactness bound, no pass over the data
         self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.consts: List[float] = []
@@ -498,6 +499,13 @@ class _Builder:
                 self.dict_concat[name] = offs
                 self.dict_values[name] = pa.concat_arrays(parts) if len(parts) > 1 else parts[0]
             return self.dict_values[name]
+        if self.skip_bounds and name not in self.dict_arrays:
+            # naming the columns only: the membership of the literal over an empty stand-in dictionary (no
+            # unify / combine / dictionary_encode, which rewrite or hash every row)
+            col = self.table.column(name)
+            if isinstance(col, pa.ChunkedArray) and col.num_chunks:
+                first = col.chunk(0)
+                return (first.dictionary if pa.types.is_dictionary(first.type) else first).slice(0, 0)
         if name not in self.dict_arrays:
             col = self.table.column(name)
             arr = _single_array(col)
@@ -561,6 +569,8 @@ class _Builder:
 
     def within_exact(self, t, scale: int = 1) -> bool:
         """Can ``scale * bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
+        if self.skip_bounds:
+            return True
         return (self._eval_bound(t, False) * scale <= EXACT or self._eval_bound(t, True) * scale <= EXACT)
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
@@ -635,6 +645,8 @@ class _Builder:
         if arg.op != "col" or self.column_kind(arg.args[0]) != "int":
             raise Unsupported("year_days only on an integer column")
         name = arg.args[0]
+        if self.skip_bounds:           # the same columns, without the min / max pass that sizes the year chain
+            return self.compile(Expr("case_when", Expr("ge", arg, Expr("lit", 0)), Expr("lit", 1), Expr("lit", 0)))
         if name not in self.day_ranges:
             from .join_engine import _minmax
             col = self.table.column(name)
@@ -869,16 +881,19 @@ class _Builder:
 
 
 def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
-                     concat_dicts: bool = False) -> Optional[PipelineProgram]:
+                     concat_dicts: bool = False, exact_bounds: bool = True) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
     existing path). ``concat_dicts`` (native executor): string predicates test codes against the
     concatenation of the chunks' dictionaries (``PipelineProgram.dict_concat``) instead of a
     unified dictionary built over the rows.
+
+    ``exact_bounds=False`` skips the integer-exactness bounds (the data's min / max, one pass per column):
+    the program is only good for naming its columns (``.columns``), never to run.
     """
     try:
-        return _compile(predicates, aggs, table, concat_dicts)
+        return _compile(predicates, aggs, table, concat_dicts, exact_bounds)
     except Unsupported:
         return None
 
@@ -936,8 +951,10 @@ def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr
     return False
 
 
-def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False) -> PipelineProgram:
+def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False,
+             exact_bounds: bool = True) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
+    b.skip_bounds = not exact_bounds
 
     # ── predicate section (dense rows) ─────────────────────────────────────
     pred_sec = _Section()

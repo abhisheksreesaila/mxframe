@@ -1653,6 +1653,23 @@ class CustomOpsCompiler(GraphCompiler):
             return Aggregate(below, plan.group_by, plan.aggs)
         return plan
 
+    @staticmethod
+    def _arrow_aggregate_reason(plan, preds, table, late=False):
+        """``(why, exact_sum)``: why Arrow's hash aggregate answers ``Aggregate(Filter*(Scan))`` instead of the
+        fused / native paths ("" when they do). A null in a column the plan reads, or an integer SUM that could
+        pass 2^53 (added exactly in int64, F-037). The split asks this too (``pipeline_exec.split_check``)."""
+        read = set()
+        for e in list(plan.group_by) + list(plan.aggs) + list(preds):
+            _expr_col_names(e, read)
+        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
+        if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
+            return "", False
+        from .pipeline_program import int_sum_inexact
+        exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
+        why = "a column the plan reads has nulls" if has_nulls else (
+            "an integer sum could pass 2^53 (added exactly in int64)" if exact_sum else "")
+        return why, exact_sum
+
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
         """``Aggregate(Filter*(Scan))`` over columns that contain nulls, by Arrow's hash
         aggregate; None when the plan has no null in a column it reads (or is another shape).
@@ -1668,16 +1685,8 @@ class CustomOpsCompiler(GraphCompiler):
         if not isinstance(node, Scan):
             return None
         table = node.table
-        read = set()
-        for e in list(plan.group_by) + list(plan.aggs) + preds:
-            _expr_col_names(e, read)
-        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
-        if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
-            return None
-        # an integer SUM whose total could pass 2^53 is added exactly (int64) here, not in float64 (F-037)
-        from .pipeline_program import int_sum_inexact
-        exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
-        if not has_nulls and not exact_sum:
+        why, exact_sum = self._arrow_aggregate_reason(plan, preds, table, late)
+        if not why:
             return None
 
         t_start = t0 if t0 is not None else _time.perf_counter()

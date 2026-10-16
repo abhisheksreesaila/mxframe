@@ -310,6 +310,8 @@ class AutoDecision:
     coproc: Optional[dict] = None     # set when a fused aggregate co-processed on cpu+gpu
     split: bool = False               # a cpu decision whose fused aggregate may split with the gpu
     cpu_path: str = ""                # which CPU path runs, and why (cpu decisions only)
+    upload: bool = False              # a split would win once the columns are resident: queue their upload
+    split_plan: Optional[object] = None   # the cost model's numbers (coproc_fused.SplitPlan)
     pieces: str = ""                  # GPU pieces that ran on the CPU for memory reasons (F-056)
 
     def explain(self) -> str:
@@ -335,7 +337,8 @@ class AutoDecision:
         if self.coproc:
             c = self.coproc
             tail += (f"\n  co-processing: gpu_fraction={c.get('gpu_fraction')} cpu busy={c.get('cpu_ms')}ms "
-                     f"gpu busy={c.get('gpu_ms')}ms (resident columns)")
+                     f"gpu busy={c.get('gpu_ms')}ms wall={c.get('wall_ms')}ms (resident columns; "
+                     f"est cpu={c.get('est_cpu_ms')}ms gpu={c.get('est_gpu_ms')}ms split={c.get('est_split_ms')}ms)")
         lines = [l.line() if self.gpu_available else l.line().split(" gpu=")[0] for l in e.lines]
         return "\n".join([head] + lines + [tail])
 
@@ -620,39 +623,30 @@ def _with_cpu_path(d: AutoDecision, plan, calib, gpu) -> AutoDecision:
     return d
 
 
-def _unsplittable(plan) -> str:
-    """Why the fused-aggregate split cannot take this plan, or "" (mirrors what pipeline_exec feeds
-    coproc_fused.try_split: a table the same buffers back on every query, stable group ids)."""
-    from . import coproc_fused as cf
-    from .lazy_frame import Aggregate, Join
-
-    def has_join(p):
-        return isinstance(p, Join) or any(has_join(getattr(p, a)) for a in ("input", "left", "right")
-                                          if getattr(p, a, None) is not None)
-
-    node = plan
-    while not isinstance(node, Aggregate):
-        if getattr(node, "input", None) is None:
-            return "no aggregate to split"
-        node = node.input
-    if has_join(node.input):
-        return "a join's output is rebuilt on every query, so it is never resident"
-    if node.group_by and not cf.stable_group_keys(node.group_by):
-        return "derived or renamed group keys get fresh ids on every query"
-    return ""
+def _agg_node(plan):
+    from .lazy_frame import Aggregate
+    while not isinstance(plan, Aggregate):
+        plan = plan.input
+    return plan                       # (the estimate has an aggregate line, so there is one)
 
 
 def _cpu_path(d: AutoDecision, plan, calib, gpu):
+    """Which CPU path a cpu decision runs, and why (F-053, F-057): the native executor, or a CPU+GPU split of
+    the fused aggregate. A split needs (1) a plan the split path takes (``pipeline_exec.split_check``: the
+    same predicate that path runs), (2) columns already resident on the GPU, since over host data the CPU
+    wins on this box's PCIe x8 link, and (3) a calibrated price that beats the faster device alone by 10%
+    after the GPU's per-call cost, the merge and contention (``coproc_fused.plan_split``). Without residency
+    the query runs native and an upload is queued so a later one finds the columns there."""
     native = "native executor"
-    from . import coproc_fused as cf
+    from . import coproc_fused as cf, pipeline_exec
     if not cf.enabled_by_env():
         return False, f"{native} (no cpu+gpu split: MXFRAME_COPROC=0)"
     if gpu.remaining_init_ms() > 0:
         return False, f"{native} (no cpu+gpu split: gpu not warm)"
-    why = _unsplittable(plan)
-    if why:
-        return False, f"{native} (no cpu+gpu split: {why})"
-    a = [l for l in d.estimate.lines if l.op in ("group_agg", "global_agg")][-1]
+    lines = [l for l in d.estimate.lines if l.op in ("group_agg", "global_agg")]
+    if not lines:
+        return False, f"{native} (no cpu+gpu split: no aggregate to split)"
+    a = lines[-1]
     if a.src_bytes < cf.MIN_UPLOAD_BYTES:
         return False, (f"{native} (no cpu+gpu split: source input {_fmt_bytes(a.src_bytes)} is under "
                        f"{_fmt_bytes(cf.MIN_UPLOAD_BYTES)}, nothing is uploaded)")
@@ -660,13 +654,25 @@ def _cpu_path(d: AutoDecision, plan, calib, gpu):
     gpu_ms = calib.estimate("pipeline", "gpu", a.src_rows, card=a.card)
     if not (cpu < float("inf") and gpu_ms < float("inf")):
         return False, f"{native} (no cpu+gpu split: no pipeline estimate)"
-    f = cf.balanced_fraction(cpu, gpu_ms, cf.DEFAULT_GPU_ALPHA_MS)
-    # f == 1: the resident GPU alone beats the CPU, which the whole-query pricing (copies included) misses
-    split_ms = cpu if f <= 0 else gpu_ms if f >= 1 else (1 - f) * cpu + SPLIT_OVERHEAD_MS
-    native_ms = cpu * NATIVE_CPU_FACTOR
-    if f > 0 and split_ms < native_ms * (1 - GPU_WIN_MARGIN):
-        return True, f"cpu+gpu split (est {split_ms:.1f}ms with gpu share {f:.2f} vs native cpu {native_ms:.1f}ms)"
-    return False, f"{native} (est {native_ms:.1f}ms; a split would take {split_ms:.1f}ms)"
+    n_aggs = max(len(_agg_node(plan).aggs), 1)       # slots ~ aggregates: only the (small) merge price depends on it
+    sp = cf.plan_split(cpu, gpu_ms, a.card or 1, n_aggs, NATIVE_CPU_FACTOR)
+    d.split_plan = sp
+    if not sp.wins:
+        return False, f"{native} (no cpu+gpu split: {sp.explain()})"
+    # the model likes a split. Compile the program (it names the columns), ask residency, and stop there: the
+    # passes over the data (nulls, int64 range, integer sums) cost as much as a native query, so they run only
+    # for the background upload and for the run itself. Columns that are resident passed them when uploaded.
+    got = pipeline_exec.split_check(plan, full=False)
+    if isinstance(got, str):
+        return False, f"{native} (no cpu+gpu split: {got})"
+    if not cf.resident_for(got.source, got.columns, got.gkeys):
+        d.upload = True
+        # (the background upload runs the full check and drops a plan that fails it)
+        return False, (f"{native} (columns not resident on the GPU yet, upload queued (pending checks); "
+                       f"once resident: {sp.explain()})")
+    # predicted from residency and the light check: the run still checks nulls, int64 range and integer sums
+    # (a resident max(i) says nothing about a later sum(i) past 2^53): a plan it declines runs native
+    return True, f"cpu+gpu split ({sp.explain()}) (pending the run's data checks)"
 
 
 def _choose_device(plan, calib, gpu, prefer, placement, quick):

@@ -91,7 +91,8 @@ def read_parquet_table(path, columns: Optional[Sequence[str]] = None, filters=No
     names = list(columns) if columns is not None else list(schema.names)
     dict_cols = dictionary_columns(path, schema, dictionary, max_dictionary_bytes, names)
     if filters is None and os.path.isfile(path):
-        return _read_file(path, names, dict_cols)
+        token = source_token(path, names, ())
+        return tag_source(_read_file(path, names, dict_cols), token)
     return pq.read_table(path, columns=names, filters=filters,
                          read_dictionary=dict_cols or None)
 
@@ -507,6 +508,40 @@ def _metadata_cached(path, dev, ino, mtime_ns, size):
     return pq.ParquetFile(path).metadata
 
 
+# ── source identity (F-057) ────────────────────────────────────────────────
+# Every compute of a `scan_parquet` frame reads the file again into new buffers, so the GPU
+# residency cache cannot key them by address. A table read from a file carries a token naming
+# what it holds: the file's identity (path, device, inode, mtime, size), the columns read and the
+# filters pushed into the reader. Two reads with the same token hold identical rows.
+_SOURCES: dict = {}                      # id(table) -> (weakref to the table, token)
+
+
+def source_token(path, columns, pushed) -> Optional[tuple]:
+    """Token of a read of ``columns`` of file ``path`` with ``pushed`` filters, or None for a directory."""
+    path = os.path.abspath(os.fspath(path))
+    if not os.path.isfile(path):
+        return None
+    st = os.stat(path)
+    return ("parquet", path, st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size, tuple(columns), repr(tuple(pushed or ())))
+
+
+def tag_source(table: pa.Table, token: Optional[tuple]) -> pa.Table:
+    """Record ``token`` for ``table``, with its final column types (a string read as a dictionary or decoded
+    gives different codes, so those reads are different sources)."""
+    if token is not None:
+        import weakref
+        key = id(table)
+        token = token + (tuple(str(t) for t in table.schema.types),)
+        _SOURCES[key] = (weakref.ref(table, lambda _r, k=key: _SOURCES.pop(k, None)), token)
+    return table
+
+
+def table_source(table: pa.Table) -> Optional[tuple]:
+    """The token of a table read by `resolve_plan`, or None (an in-memory table, or one derived from a read)."""
+    got = _SOURCES.get(id(table))
+    return got[1] if got is not None and got[0]() is table else None
+
+
 def _metadata(path):
     st = os.stat(path)
     # the cached footer now drives data reads: key on file identity as well as mtime/size
@@ -911,6 +946,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
         dict_cols = [n for n in candidates if keepable(n, leaf) or deferrable(n, leaf)]
         mask_dict = [n for n in candidates if n not in dict_cols]
         import pyarrow.parquet as pq
+        token = source_token(leaf.path, cols, pushed)        # before the read: a file replaced meanwhile never matches
         if os.path.isfile(leaf.path):
             table = _read_file(leaf.path, cols, dict_cols, pushed or (), mask_dict)
         else:
@@ -918,7 +954,7 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
                                   filters=_filters_expression(pushed) if pushed else None,
                                   read_dictionary=dict_cols or None)
         table, defer = _decode_unkept(table, leaf)
-        return _scan(table, defer)
+        return _scan(tag_source(table, token), defer)
 
     def _decode_unkept(table, leaf):
         defer = []
