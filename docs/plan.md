@@ -38,7 +38,7 @@ Needs: none · Agreed 2026-10-15
 
 ## F-056 Data bigger than GPU memory never fails [todo]
 Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
-- [ ] research first, written to `docs/research/gpu-out-of-core.md`: how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
+- [ ] research first, written to `docs/research/gpu-out-of-core.md` and `docs/research/heavydb.md` (HeavyDB is the closest open-source GPU-native competitor; mine it for algorithms): how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
 - [ ] `device="gpu"` and `"auto"` on a working set larger than free GPU memory finish with results equal to `cpu` (test with an artificially small GPU memory budget, so no 96 GB data is needed)
 - [ ] the plan chooses up front (estimated size vs free memory): GPU, GPU in partitions, or CPU; a GPU OOM mid-query reruns the failed part on CPU and is remembered
 - [ ] both GPUs on this box (2x RTX 3090, 24 GB each) are counted as separate memory pools, not one 48 GB pool
