@@ -1033,3 +1033,8 @@ From the F-095 review (2026-10-16)
 From F-056 step 3a (2026-10-16): a query whose result itself is bigger than the host budget raises MemoryError, because `compute()` returns one in-memory table
 - [ ] `LazyFrame.sink_parquet(path)` (and SQL `COPY (...) TO 'file.parquet'` if cheap): stream the batches / spilled partitions straight to a Parquet file, bounded memory, so "result bigger than memory" has a way to finish. DataLens can then page through the file
 - [ ] tests: a filter keeping most of a file bigger than the budget, and an all-groups aggregate over budget, written with bounded peak memory, file equal to DuckDB's result
+
+## F-114 SQL IN / NOT IN list with a NULL literal [todo]
+Found by the F-056 step 3b review (2026-10-16)
+- [ ] `x NOT IN (1, 2, NULL)` and `x IN (1, NULL)` raise "Expected scalar literal in IN list, got Null" in the SQL front end. DuckDB: `x IN (..., NULL)` is TRUE or NULL (never FALSE); `x NOT IN (..., NULL)` is never TRUE. The engine's `np_arrow.is_in` already follows three-valued logic (F-070); map the SQL list onto it
+- [ ] DuckDB-checked tests: IN / NOT IN lists with NULL, int / float / string columns with NULLs, under NOT and in SELECT; fails before
