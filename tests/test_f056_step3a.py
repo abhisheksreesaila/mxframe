@@ -80,16 +80,20 @@ def all_groups(path):
                  col("v").min().alias("lo"), col("q").max().alias("hi"), col("v").count().alias("n")))
 
 
+def light_groups(path):
+    """150k groups and three result columns: the result (3.6 MB) fits the budget, the group state (4.8 MB) does not."""
+    return scan_parquet(path).groupby("g").agg(col("v").sum().alias("sv"), col("q").mean().alias("mq"))
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_group_state_bigger_than_the_budget_is_spilled_and_equals_duckdb(big, device, _env):
-    lf = all_groups(big)
+    lf = light_groups(big)
     got = run(lf, device)
     p = prov(lf)
     assert p["path"] == "streamed"
     assert p["streamed"]["spill"]["partitions"] >= 2
     assert p["streamed"]["spill"]["bytes"] > 0
-    want = duck("SELECT g, sum(v) AS sv, sum(q) AS sq, avg(v) AS mv, min(v) AS lo, max(q) AS hi, count(v) AS n "
-                "FROM big GROUP BY g", big)
+    want = duck("SELECT g, sum(v) AS sv, avg(q) AS mq FROM big GROUP BY g", big)
     assert got.num_rows == GROUPS
     same(got, want, ("g",))
     assert spill_leftovers(_env) == []
@@ -164,15 +168,15 @@ def test_integer_sums_past_2_53_stay_exact_when_spilled(tmp_path, monkeypatch):
 
 
 def test_a_reproducible_spilled_run_is_the_same_bits_in_the_same_order(big):
-    a = run(all_groups(big), "cpu", reproducible=True)
-    b = run(all_groups(big), "cpu", reproducible=True)
+    a = run(light_groups(big), "cpu", reproducible=True)
+    b = run(light_groups(big), "cpu", reproducible=True)
     assert a.equals(b)                                  # same rows in the same order, bit for bit
-    for name in ("sv", "mv"):
+    for name in ("sv", "mq"):
         assert a.column(name).to_numpy().tobytes() == b.column(name).to_numpy().tobytes()
 
 
 def test_the_spill_directory_is_removed_after_a_success(big, _env):
-    run(all_groups(big), "cpu")
+    run(light_groups(big), "cpu")
     assert spill_leftovers(_env) == []
 
 
@@ -186,7 +190,7 @@ def test_the_spill_directory_is_removed_after_an_error(big, _env, monkeypatch):
 
     monkeypatch.setattr(streamed, "_read_partition", broken)
     with pytest.raises(RuntimeError, match="disk on fire"):
-        run(all_groups(big), "cpu")
+        run(light_groups(big), "cpu")
     assert len(seen["dirs"]) == 1
     assert spill_leftovers(_env) == []
 
@@ -278,10 +282,10 @@ def test_limit_alone_stops_reading_once_it_has_enough(big):
 
 
 def test_limit_larger_than_what_matches_reads_everything_and_returns_it(big):
-    lf = scan_parquet(big).filter(col("id") < 25).select("id").limit(100)
+    lf = scan_parquet(big).filter((col("id") % 16_000) == 3).select("id").limit(100)
     got = run(lf, "cpu")
     assert prov(lf)["streamed"]["rows"]["batches_run"] == prov(lf)["streamed"]["batches"]
-    assert sorted(got.column("id").to_pylist()) == list(range(25))
+    assert sorted(got.column("id").to_pylist()) == list(range(3, N, 16_000))
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -304,13 +308,19 @@ def test_a_sort_without_limit_whose_result_fits_equals_duckdb(big):
 
 def test_a_result_bigger_than_the_budget_raises_an_error_naming_the_size(big):
     lf = scan_parquet(big).select("id", "g", "v", "q")                  # all 400k rows x 32 bytes = 12.8 MB
-    with pytest.raises(MemoryError, match=r"result of this query .* bigger than memory .*[\d.]+ MB .*budget of 6\.0 MB"):
+    with pytest.raises(MemoryError, match=r"result of this query is bigger than memory: .*[\d.]+ MB .*budget of 6\.0 MB"):
+        run(lf, "cpu")
+
+
+def test_a_sort_without_limit_of_more_than_fits_names_the_operator_and_the_size(big):
+    lf = scan_parquet(big).select("id", "g", "v", "q").sort("v")
+    with pytest.raises(MemoryError, match=r"the rows that the Sort above the big file needs are bigger than memory: .*[\d.]+ MB"):
         run(lf, "cpu")
 
 
 def test_a_join_to_a_small_table_keeps_the_top_k_streamed(big, tmp_path):
     dim = str(tmp_path / "dim.parquet")
-    pq.write_table(pa.table({"g": np.arange(GROUPS, dtype=np.int64), "w": (np.arange(GROUPS) % 11).astype(np.int64)}), dim)
+    pq.write_table(pa.table({"g": np.arange(2000, dtype=np.int64), "w": (np.arange(2000) % 11).astype(np.int64)}), dim)
     lf = (scan_parquet(big).join(scan_parquet(dim), on="g").filter(col("w") == 4)
           .select("id", "w", "q").sort("q", "id", descending=[True, False]).limit(8))
     got = run(lf, "cpu")
@@ -336,7 +346,9 @@ def one_group(tmp_path_factory):
     t = pa.table({"g2": (idx % 50).astype(np.int64), "v": (idx % 1000) / 10.0, "q": idx.astype(np.int64),
                   "g": (idx % 50).astype(np.int64)})
     path = str(tmp_path_factory.mktemp("onegroup") / "one.parquet")
-    pq.write_table(t, path, row_group_size=n)                            # a single 6.4 MB row group
+    # a single 6.4 MB row group; 32 KB pages: Arrow streams a column chunk page by page, so what is held while a
+    # slice is read is the slice plus about one page per column (the default page is 1 MB: more than this test's budget)
+    pq.write_table(t, path, row_group_size=n, data_page_size=32768, use_dictionary=False)
     assert pq.ParquetFile(path).metadata.num_row_groups == 1
     return path
 

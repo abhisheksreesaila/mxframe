@@ -12,6 +12,7 @@ Design, limits and the step 3 list: docs/design/streamed-execution.md.
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import dataclasses
 import os
@@ -25,8 +26,9 @@ from . import gpu_budget
 from ._lazy_pc import pc
 from .gpu_budget import fmt_bytes
 from .lazy_expr import Expr, col
-from .lazy_frame import (Aggregate, Distinct, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
+from .lazy_frame import (Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
                          Scan, Sort, Tail)
+from . import spill as _spill
 
 WORKING_FACTOR = 3            # in-memory path: the table, the filtered copy, group ids / gather buffers
 RESIDENT_FACTOR = 1.5         # a dimension table stays resident: its columns and the join index built on them
@@ -34,6 +36,8 @@ HOST_FRACTION = 0.7           # of MemAvailable
 REPRODUCIBLE_FRACTION = 0.5   # of MemTotal: does not move with what other processes hold
 GPU_BATCH_DIVISOR = 1.3       # a GPU piece needs about this much per byte of batch (columns + group ids)
 MIN_MERGE_BYTES = 8 << 20
+MERGE_FACTOR = 4             # the engine's group-by holds about this many times its input (measured: 5 MB in, 20 MB peak)
+MIN_SLICE_ROWS = 1024        # a slice of an oversized row group is never smaller
 
 _active: contextvars.ContextVar = contextvars.ContextVar("mxframe_streamed_active", default=False)
 _AGGS = ("sum", "mean", "count", "min", "max")
@@ -222,13 +226,16 @@ def _argument_types(spec: _Spec) -> None:
 
 @dataclasses.dataclass
 class Plan:
-    spec: _Spec
+    spec: Optional[_Spec]               # None: the plan returns rows (no aggregate above the big file)
     leaf: _Leaf
     batches: List[List[int]]
     batch_target: int
     gpu_cap: Optional[int]
     budget: int
     all_groups: int
+    top: LogicalPlan = None             # the node whose output the batches produce: the aggregate, or the top of the row-local part
+    slice_rows: dict = dataclasses.field(default_factory=dict)      # row group -> rows per slice (a group bigger than a batch)
+    prune: bool = False                 # rows: select only the columns the plan reads (a bare Filter over the file)
 
 
 def analyse(plan, budget: int, device: str, reproducible: bool):
@@ -251,25 +258,44 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
             raise _Decline("no Parquet file among the sources")
         chain = _chain(plan, big.node)
         agg_at = max((i for i, n in enumerate(chain[:-1]) if isinstance(n, Aggregate)), default=None)
-        if agg_at is None:
-            raise _Decline("no aggregate above the big file (a plan that returns rows is not streamed yet)")
-        for n, child in zip(chain[agg_at + 1:-1], chain[agg_at + 2:]):
-            if isinstance(n, (Sort, Limit, Distinct, Tail, Aggregate)):
-                raise _Decline(f"a {type(n).__name__} below the aggregate")
-            if isinstance(n, Project) and _has_op(n.exprs, _WINDOW):
-                raise _Decline("a window function below the aggregate")
-            if isinstance(n, Join) and child is n.right and n.how != "inner":
-                raise _Decline(f"the big file is the build side of a {n.how} join")
-        agg = chain[agg_at]
+        prune = False
+        if agg_at is None:                  # rows: the top of the part that works row by row on the big file
+            top_at = len(chain) - 1
+            for i in range(len(chain) - 2, -1, -1):
+                n = chain[i]
+                if isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)) \
+                        or (isinstance(n, Join) and (n.how == "inner" or chain[i + 1] is n.left)):
+                    top_at = i
+                else:
+                    break
+            top = chain[top_at]
+            prune = all(isinstance(n, Filter) for n in chain[top_at:-1])
+        else:
+            for n, child in zip(chain[agg_at + 1:-1], chain[agg_at + 2:]):
+                if isinstance(n, (Sort, Limit, Distinct, Tail, Aggregate)):
+                    raise _Decline(f"a {type(n).__name__} below the aggregate")
+                if isinstance(n, Project) and _has_op(n.exprs, _WINDOW):
+                    raise _Decline("a window function below the aggregate")
+                if isinstance(n, Join) and child is n.right and n.how != "inner":
+                    raise _Decline(f"the big file is the build side of a {n.how} join")
+            top = chain[agg_at]
+            for n in reversed(chain[:agg_at]):          # a HAVING filter / projection works group by group
+                if isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
+                    top = n
+                else:
+                    break
+        agg = chain[agg_at] if agg_at is not None else None
         if sum(1 for l in leaves if isinstance(l, ParquetScan) and os.path.abspath(l.path) == big.path) > 1:
             raise _Decline("the big file is read twice by the plan")
-        sub = {id(l) for l in _leaves(agg.input)}
+        sub = {id(l) for l in _leaves(agg.input if agg is not None else top)}
         others = sum(est(f) for l, f in zip(leaves, feet) if id(l) in sub and f is not big)
         if others * RESIDENT_FACTOR > budget // 2:
             raise _Decline(f"the other tables of the aggregate (about {fmt_bytes(others)}) do not fit "
                            f"half of the budget: a join of two big tables needs both sides partitioned")
-        spec = _spec(agg)
-        _argument_types(spec)
+        spec = None
+        if agg is not None:
+            spec = _spec(agg)
+            _argument_types(spec)
     except _Decline as why:
         return str(why)
     batch = max(int((budget / 2 - others * RESIDENT_FACTOR) / WORKING_FACTOR), 1)
@@ -282,8 +308,19 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
                 batch = min(batch, cap)
         except Exception:
             cap = None
-    batches, cur, size = [], [], 0
+    batches, cur, size, slices = [], [], 0, {}
+    from . import io_parquet as iop
+    md = iop._metadata(big.path)
     for g, b in zip(big.groups, big.sizes):
+        rows = md.row_group(g).num_rows
+        if b > batch and rows > 1:                  # one row group bigger than a batch: read it in slices of rows
+            if cur:
+                batches.append(cur)
+                cur, size = [], 0
+            per = max(-(-rows // -(-b // batch)), min(MIN_SLICE_ROWS, rows))
+            slices[g] = per
+            batches.extend([g] for _ in range(-(-rows // per)))
+            continue
         if cur and size + b > batch:
             batches.append(cur)
             cur, size = [], 0
@@ -291,8 +328,7 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
         size += b
     if cur:
         batches.append(cur)
-    from . import io_parquet as iop
-    return Plan(spec, big, batches, batch, cap, budget, iop._metadata(big.path).num_row_groups)
+    return Plan(spec, big, batches, batch, cap, budget, md.num_row_groups, top, slices, prune)
 
 
 # --- running the batches and merging ------------------------------------------------------------------------
@@ -312,17 +348,31 @@ def _normal(spec: _Spec, t: pa.Table, key_types: Optional[dict]) -> pa.Table:
     return pa.table(cols, names=t.column_names)
 
 
-class _State:
-    """The merged partials so far, plus the partials waiting to be merged."""
+def _read_partition(parts, i: int):
+    return parts.read(i)
 
-    def __init__(self, spec: _Spec, budget: int, probe=None):
+
+class _State:
+    """The merged partials so far, plus the partials waiting to be merged.
+
+    When the merged state passes half of the budget it is spilled (`spill.Partitioned`): the state so far and every
+    later partial go to hash partitions on disk, and `pieces()` merges one partition at a time (splitting a
+    partition again, with another salt, if even that one is too big)."""
+
+    def __init__(self, spec: _Spec, budget: int, probe=None, root=None, salt: int = 0, depth: int = 0):
         self.spec, self.budget, self.probe = spec, budget, probe
+        self.root, self.salt, self.depth = root, salt, depth
         self.merged: Optional[pa.Table] = None
         self.pending: List[pa.Table] = []
+        self.parts: Optional[_spill.Partitioned] = None
         self.key_types: Optional[dict] = None
         self.empty: Optional[pa.Table] = None             # a partial with no groups: the answer if all are
         self.merges = 0
         self.peak_state = 0
+
+    @property
+    def spilled(self) -> bool:
+        return self.parts is not None
 
     def add(self, partial: pa.Table) -> None:
         t = _normal(self.spec, partial, self.key_types)
@@ -331,6 +381,9 @@ class _State:
             return
         if self.key_types is None:                       # the first partial fixes the key types
             self.key_types = {n: t.schema.field(n).type for n in self.spec.key_names}
+        if self.parts is not None:
+            self.parts.write(t)
+            return
         self.pending.append(t)
         if sum(p.nbytes for p in self.pending) >= max(self.merged.nbytes if self.merged is not None else 0,
                                                       min(MIN_MERGE_BYTES, self.budget // 16)):
@@ -340,6 +393,18 @@ class _State:
         parts = ([self.merged] if self.merged is not None else []) + self.pending
         self.pending = []
         if not parts:
+            return
+        size = sum(p.nbytes for p in parts)
+        if size * MERGE_FACTOR > self.budget:               # merging this much would pass the budget: spill instead
+            if self.root is None or self.depth >= _spill.MAX_DEPTH:
+                raise MemoryError(
+                    f"group state of {sum(p.num_rows for p in parts):,} partial groups ({fmt_bytes(size)}) is too big "
+                    f"to merge in the host memory budget ({fmt_bytes(self.budget)}) even after splitting the groups "
+                    f"{self.depth} times by hash")
+            self.parts = _spill.Partitioned(self.root, self.spec.key_names, self.salt, self.depth + 1)
+            for p in parts:                                 # the state so far; every later partial follows it
+                self.parts.write(p)
+            self.merged = None
             return
         table = parts[0]
         if len(parts) > 1:
@@ -351,15 +416,30 @@ class _State:
         self.merged = table
         self.merges += 1
         self.peak_state = max(self.peak_state, table.num_rows)
-        if table.nbytes > self.budget // 2:
-            raise MemoryError(
-                f"group state of {table.num_rows:,} groups ({fmt_bytes(table.nbytes)}) is over half of the host "
-                f"memory budget ({fmt_bytes(self.budget)}): this query needs hash-partitioned groups "
-                f"(F-056 step 3)")
+
+    def pieces(self):
+        """The merged hidden-column tables: one when the state fits, else one per non-empty hash partition (a group
+        is in exactly one), in partition order."""
+        self.merge()
+        if self.parts is None:
+            t = self.merged if self.merged is not None else self.empty
+            if t is not None:
+                yield t
+            return
+        self.parts.finish()
+        for i in range(_spill.PARTITIONS):
+            sub = _State(self.spec, self.budget, None, self.root, self.salt + 1, self.depth + 1)
+            sub.key_types = self.key_types
+            for t in _read_partition(self.parts, i):
+                sub.add(t)
+            yield from sub.pieces()
 
     def result(self) -> pa.Table:
         self.merge()
-        t = self.merged if self.merged is not None else self.empty
+        return self.format(self.merged if self.merged is not None else self.empty)
+
+    def format(self, t: pa.Table) -> pa.Table:
+        """The original aggregate's output from merged hidden columns."""
         arrays, names = [t.column(k) for k in self.spec.key_names], list(self.spec.key_names)
         for kind, hidden, name in self.spec.finals:
             if kind == "mean":
@@ -373,6 +453,103 @@ class _State:
             arrays.append(arr)
             names.append(name)
         return pa.table(arrays, names=names)
+
+
+# --- what happens to the rows the streamed part of the plan produces ---------------------------------------------
+
+def _plain(t: pa.Table) -> pa.Table:
+    from .io_parquet import _decode_dict, _is_dict
+    for i, c in enumerate(t.columns):
+        if _is_dict(c.type):
+            t = t.set_column(i, t.column_names[i], _decode_dict(c))
+    return t
+
+
+class _Sink:
+    """Collects what the streamed part of a plan produces (batches of rows, or the merged groups) up to what is
+    above it: `top-k` (Sort then Limit: a running top n + offset, merged as the batches come), `limit` (stops as soon
+    as n + offset rows are in) or `collect` (everything, which must fit `limit` bytes: otherwise a MemoryError
+    naming the size). What sits above is run on `result()` by the caller, so offset, ties and ordering are the
+    engine's own."""
+
+    def __init__(self, kind: str, k: int, sort: Optional[Sort], limit: int, budget: int, above: str = ""):
+        self.kind, self.k, self.sort, self.limit, self.budget, self.above = kind, k, sort, limit, budget, above
+        self.tables: List[pa.Table] = []
+        self.rows = self.bytes = self.pending_rows = 0
+        self.empty: Optional[pa.Table] = None
+
+    @property
+    def full(self) -> bool:
+        return self.kind == "limit" and self.rows >= self.k
+
+    def batch_plan(self, top):
+        if self.kind == "top-k":
+            return Limit(dataclasses.replace(self.sort, input=top), self.k)
+        if self.kind == "limit":
+            return Limit(top, max(self.k - self.rows, 0))
+        return top
+
+    def add(self, t: pa.Table, progress: Optional[float] = None) -> None:
+        t = _plain(t)
+        if t.num_rows == 0:
+            self.empty = t
+            return
+        self.tables.append(t)
+        self.rows += t.num_rows
+        self.pending_rows += t.num_rows
+        self.bytes += t.nbytes
+        if self.kind == "top-k" and self.pending_rows >= max(self.k, 8192):
+            self._reduce()
+        if self.bytes > self.limit:
+            self._too_big(progress)
+
+    def _reduce(self) -> None:
+        table = self._concat()
+        out = LazyFrame(Limit(dataclasses.replace(self.sort, input=Scan(table)), self.k)).compute(
+            "cpu", optimize=False, validate=False)
+        self.tables, self.rows, self.pending_rows, self.bytes = [out], out.num_rows, 0, out.nbytes
+
+    def _concat(self) -> pa.Table:
+        if not self.tables:
+            return self.empty
+        return self.tables[0] if len(self.tables) == 1 else pa.concat_tables(self.tables, promote_options="default")
+
+    def _too_big(self, progress: Optional[float]) -> None:
+        if self.kind == "top-k":
+            self._reduce()
+            if self.bytes <= self.limit:
+                return
+            what = f"the {self.k:,} rows kept for ORDER BY ... LIMIT"
+        else:
+            what = f"the {self.rows:,} rows produced so far"
+        guess = f", about {fmt_bytes(int(self.bytes / progress))} in all" if progress and progress > 0.01 and self.kind == "collect" else ""
+        subject = f"the rows that the {self.above} above the big file needs are" if self.above else "the result of this query is"
+        raise MemoryError(
+            f"{subject} bigger than memory: {what} are {fmt_bytes(self.bytes)}{guess}, and only "
+            f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Add a LIMIT or a "
+            f"tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
+
+    def result(self) -> pa.Table:
+        if self.kind == "top-k" and len(self.tables) > 1:
+            self._reduce()
+        return self._concat()
+
+
+def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int) -> _Sink:
+    """The sink for what sits above `top` in `plan` (`_chain` finds it): a Sort then (optionally some row-local
+    Projects and) a Limit is a top-k, a Limit alone stops early, anything else collects."""
+    above = list(reversed(_chain(plan, top)[:-1]))
+    limit = limit_above if above else limit_direct
+    name = type(above[0]).__name__ if above else ""
+    if above and isinstance(above[0], Limit):
+        return _Sink("limit", above[0].n + above[0].offset, None, limit, budget, name)
+    if above and isinstance(above[0], Sort):
+        for n in above[1:]:
+            if isinstance(n, Limit):
+                return _Sink("top-k", n.n + n.offset, above[0], limit, budget, name)
+            if not (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
+                break
+    return _Sink("collect", 0, None, limit, budget, name)
 
 
 def describe(plan, device: str = "cpu") -> Optional[str]:
@@ -419,15 +596,32 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     from .pipeline_program import sum_probe
     devices, pieces, paths = Counter(), Counter(), Counter()
     biggest, size_of = 0, dict(zip(leaf.groups, leaf.sizes))
+    total_bytes, done_bytes, sliced = max(sum(leaf.sizes), 1), 0, Counter()
+    root = _spill.SpillDir()
+    sink, state, batches_run, rows_info = None, None, 0, None
+    n_slices = Counter(b[0] for b in got.batches if len(b) == 1 and b[0] in got.slice_rows)
+    if spec is None:
+        sink = _sink_for(plan, got.top, budget // 2, budget // WORKING_FACTOR, budget)
     token = _active.set(True)
     try:
-        with streaming(leaf.path) as st, sum_probe(names=spec.int_sums) as probe:
-            state = _State(spec, budget, probe)
+        with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
+            state = _State(spec, budget, probe, root) if spec else None
             for batch in got.batches:
                 st.groups = tuple(batch)
-                biggest = max(biggest, sum(size_of[g] for g in batch))
-                sub = LazyFrame(spec.partial)
-                probe.begin()
+                st.slice_rows = got.slice_rows.get(batch[0]) if len(batch) == 1 else None
+                if st.slice_rows:
+                    st.slice_no = sliced[batch[0]]
+                    sliced[batch[0]] += 1
+                share = size_of[batch[0]] / n_slices[batch[0]] if st.slice_rows \
+                    else sum(size_of[g] for g in batch)
+                biggest = max(biggest, int(share))
+                if spec is not None:
+                    plan_b = spec.partial
+                else:
+                    plan_b = sink.batch_plan(_pruned(got) if got.prune else got.top)
+                sub = LazyFrame(plan_b)
+                if probe:
+                    probe.begin()
                 part = sub.compute(device, optimize=False, validate=False, strict=strict, prefer=prefer,
                                    placement=placement, gpu_fraction=gpu_fraction)
                 p = sub.last_compile_provenance or {}
@@ -435,24 +629,62 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                 paths[p.get("path", "")] += 1
                 if p.get("gpu_pieces"):
                     pieces[p["gpu_pieces"]] += 1
-                probe.end()
-                state.add(part)
+                if probe:
+                    probe.end()
+                batches_run += 1
+                done_bytes += share
+                if spec is not None:
+                    state.add(part)
+                else:
+                    sink.add(part, done_bytes / total_bytes)
                 if verbose:
-                    print(f"[mxframe] streamed batch {sum(devices.values())}/{len(got.batches)}: "
-                          f"{len(batch)} row groups, {part.num_rows} partial rows")
-            merged = state.result()
+                    print(f"[mxframe] streamed batch {batches_run}/{len(got.batches)}: "
+                          f"{len(batch)} row groups, {part.num_rows} {'partial ' if spec else ''}rows")
+                if sink is not None and sink.full:
+                    break
+            if spec is not None and not state.spilled:
+                merged = state.result()                              # the usual case: the groups fit
+                above = _replace(plan, spec.agg, Scan(merged))
+                table = merged
+            else:
+                if spec is not None:                                 # spilled groups: one partition at a time
+                    sink = _sink_for(plan, got.top, budget, budget // WORKING_FACTOR, budget)
+                    rowwise = got.top is not spec.agg
+                    for piece in state.pieces():
+                        out = state.format(piece)
+                        if rowwise:
+                            out = LazyFrame(_replace(got.top, spec.agg, Scan(out))).compute(
+                                "cpu", optimize=False, validate=False)
+                        sink.add(out)
+                        if sink.full:
+                            break
+                table = sink.result()
+                above = _replace(plan, got.top, Scan(table))
+                rows_info = {"kind": sink.kind, "batches_run": batches_run}
     finally:
         _active.reset(token)
-    above = _replace(plan, spec.agg, Scan(merged))
-    result = merged if isinstance(above, Scan) else LazyFrame(above).compute(
+        root.close()
+    result = table if isinstance(above, Scan) else LazyFrame(above).compute(
         device, optimize=False, validate=False, strict=strict, prefer=prefer, placement=placement,
         gpu_fraction=gpu_fraction)
-    prov = {"path": "streamed", "device": device, "rows": result.num_rows,
-            "streamed": {"batches": len(got.batches), "row_groups": got.all_groups,
-                         "row_groups_read": len(leaf.groups), "host_budget": budget, "gpu_batch_cap": got.gpu_cap,
-                         "batch_target_bytes": got.batch_target, "largest_batch_bytes": biggest,
-                         "merges": state.merges, "group_state_rows": state.peak_state,
-                         "devices": dict(devices), "batch_paths": dict(paths)}}
+    info = {"batches": len(got.batches), "row_groups": got.all_groups,
+            "row_groups_read": len(leaf.groups), "host_budget": budget, "gpu_batch_cap": got.gpu_cap,
+            "batch_target_bytes": got.batch_target, "largest_batch_bytes": biggest,
+            "devices": dict(devices), "batch_paths": dict(paths)}
+    if spec is not None:
+        info.update(merges=state.merges, group_state_rows=state.peak_state)
+    if root.partitions:
+        info["spill"] = {"partitions": root.partitions, "bytes": root.bytes, "depth": root.depth}
+    if rows_info is not None and spec is None:
+        info["rows"] = rows_info
+    if got.slice_rows:
+        info["slices"] = {"row_groups": len(got.slice_rows), "rows_per_slice": min(got.slice_rows.values())}
+    prov = {"path": "streamed", "device": device, "rows": result.num_rows, "streamed": info}
     if pieces:
         prov["gpu_pieces"] = "; ".join(f"{n} batches: {s}" for s, n in pieces.items())
     return result, prov
+
+
+def _pruned(got: Plan):
+    """The rows plan, selecting only the columns the whole plan reads from the file."""
+    return Project(got.top, [col(c) for c in got.leaf.columns])
