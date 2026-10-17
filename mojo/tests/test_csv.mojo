@@ -335,6 +335,100 @@ def test_generated_file_in_parallel() raises:
     expect(par.table.get(0, 299_999) == 299_999, "last row")
 
 
+# ── review fixes ────────────────────────────────────────────────────────────────────────────────
+
+
+def test_max_columns_is_not_ragged() raises:
+    var r = read_csv(write_file("capped.csv", "a,b,c,d\n1,2,3,4\n5,6,7,8\n"), CsvOptions(max_columns=2))
+    expect(r.ragged_count == 0 and len(r.ragged) == 0, "dropping columns past max_columns is not a ragged row")
+    expect(r.rows == 2 and r.table.columns() == 2, "two columns kept")
+    var wide = read_csv(write_file("capped2.csv", "a,b,c\n1,2,3\n5,6,7,8\n"), CsvOptions(max_columns=2))
+    expect(wide.ragged_count == 1 and wide.ragged[0].row == 2, "a row longer than the header is still reported")
+
+
+def test_stray_quote_is_literal() raises:
+    var path = write_file("stray.csv", "a,b\n5\" pipe,x\n6,y\n7,z\n")
+    for threads in [1, 4]:
+        var r = read_csv(path, CsvOptions(threads=threads, chunk_bytes=3))
+        expect(r.rows == 3, "a quote inside an unquoted field is a character: 3 rows, got " + String(r.rows))
+        check_row(r, 0, "5\" pipe;x")
+        check_row(r, 2, "7;z")
+        expect(r.ragged_count == 0, "nothing ragged")
+    var mid = read("stray2.csv", "a,b\n\"quoted\"tail,x\nab\"cd,\"e\"\"f\"\n")
+    check_row(mid, 0, "quotedtail;x")
+    check_row(mid, 1, "ab\"cd;e\"f")
+
+
+def test_unclosed_quote_is_reported() raises:
+    var path = write_file("open.csv", "a,b\n1,\"open\n2,y\n")
+    for threads in [1, 4]:
+        var r = read_csv(path, CsvOptions(threads=threads, chunk_bytes=3))
+        expect(r.rows == 1, "the rest of the file is one cell: 1 row, got " + String(r.rows))
+        check_row(r, 0, "1;open\n2,y\n")
+        expect(r.ragged_count == 1 and r.ragged[0].row == 1, "reported")
+        expect(r.ragged[0].message() == "row 1: `1,\"open\n2,y\n` has an unmatched quote: the rest of the file was read as one cell",
+               r.ragged[0].message())
+
+
+def test_timestamp_zones_convert_to_utc() raises:
+    var r = read("zones.csv", "t\n2023-01-01T23:30:00-05:00\n2023-01-01T00:30:00+05:00\n2023-01-01T12:00:00Z\n" +
+                 "2023-01-01 23:30:00-0500\n2023-01-01T00:00:00+00:00\n2023-01-01T23:59:59.999-01\n")
+    expect(r.table.kind(0) == DATE, "timestamps with zones are DATE")
+    check_row(r, 0, "19359")   # 04:30 UTC on the 2nd
+    check_row(r, 1, "19357")   # 19:30 UTC on 31 December
+    check_row(r, 2, "19358")
+    check_row(r, 3, "19359")
+    check_row(r, 4, "19358")
+    check_row(r, 5, "19359")
+
+
+def test_decimal_widens_to_scale_4() raises:
+    var path = write_file("widen.csv", "x\n1.5\n2.25\n1.239\n0.005\n")
+    for threads in [1, 4]:
+        var r = read_csv(path, CsvOptions(infer_rows=2, threads=threads, chunk_bytes=4))
+        expect(r.table.scale(0) == 4 and r.columns[0].scale == 4, "scale 4 for the whole column")
+        expect(r.table.get(0, 0) == 15000 and r.table.get(0, 1) == 22500 and r.table.get(0, 2) == 12390 and
+               r.table.get(0, 3) == 50, "earlier values are multiplied by 100")
+        expect(r.columns[0].rounded == 0, "nothing rounded")
+    var round5 = read_csv(write_file("round.csv", "x\n1.5\n1.23456\n-1.23454\n"), CsvOptions(infer_rows=1))
+    expect(round5.table.scale(0) == 4 and round5.table.get(0, 1) == 12346 and round5.table.get(0, 2) == -12345,
+           "more than 4 places rounds half away from zero")
+    expect(round5.columns[0].rounded == 2, "and is counted: " + String(round5.columns[0].rounded))
+    var big = read_csv(write_file("widenbig.csv", "x\n92233720368547758.07\n1.239\n"), CsvOptions(infer_rows=1))
+    expect(big.table.scale(0) == 4 and big.table.is_null(0, 0) and big.table.get(0, 1) == 12390,
+           "a value too big for scale 4 becomes a failed cell")
+    expect(big.columns[0].failed_count == 1 and big.columns[0].failed[0].row == 1 and
+           big.columns[0].failed[0].text == "92233720368547758.07", "reported with its row and text")
+
+
+def test_overflow_inside_the_window_is_text() raises:
+    var r = read("overflow.csv", "x\n92233720368547758.08\n1.5\n")
+    expect(r.table.kind(0) == TEXT and r.columns[0].failed_count == 0, "a column that cannot hold its own values is text")
+    check_row(r, 0, "92233720368547758.08")
+    var fits = read("fits.csv", "x\n92233720368547758.07\n1.5\n")
+    expect(fits.table.kind(0) == DECIMAL and fits.table.get(0, 0) == Int64.MAX, "the largest value that fits")
+
+
+def test_stray_quotes_across_chunk_boundaries() raises:
+    var text = String("id,note\n")
+    for i in range(300):
+        var note = "5\" pipe " + String(i)
+        if i % 4 == 0:
+            note = "\"a\nb\"\"" + String(i) + "\"tail\"x"
+        elif i % 7 == 0:
+            note = "\"closed, \nnote\""
+        text += String(i) + "," + note + "\n"
+    var path = write_file("strayboundaries.csv", text)
+    var one = read_csv(path, CsvOptions(threads=1))
+    expect(one.rows == 300, "300 rows, got " + String(one.rows))
+    for size in [5, 17, 50, 211]:
+        tables_equal(one, read_csv(path, CsvOptions(threads=4, chunk_bytes=size)))
+    var broken = write_file("brokenboundaries.csv", text + "300,\"never closed\n301,x\n")
+    var b1 = read_csv(broken, CsvOptions(threads=1))
+    tables_equal(b1, read_csv(broken, CsvOptions(threads=4, chunk_bytes=40)))
+    expect(b1.rows == 301 and b1.ragged_count == 1, "the unclosed quote at the end is reported once")
+
+
 def main() raises:
     test_integers()
     test_decimals()
@@ -353,4 +447,11 @@ def main() raises:
     test_utf8_text()
     test_quote_boundaries_in_chunks()
     test_generated_file_in_parallel()
+    test_max_columns_is_not_ragged()
+    test_stray_quote_is_literal()
+    test_unclosed_quote_is_reported()
+    test_timestamp_zones_convert_to_utc()
+    test_decimal_widens_to_scale_4()
+    test_overflow_inside_the_window_is_text()
+    test_stray_quotes_across_chunk_boundaries()
     print("ok")

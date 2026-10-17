@@ -61,6 +61,9 @@ AWKWARD = {
     "nonl.csv": "a,b\n1,x\n2,y",
     "bom.csv": "﻿id,name\n1,a\n2,b\n",
     "unicode.csv": "name,n\nZürich,1\n東京,2\nZürich,3\n",
+    "stray_quote.csv": 'a,b\n5" pipe,x\n6,y\n7,z\n',
+    "zones.csv": "t\n2023-01-01T23:30:00-05:00\n2023-01-01T00:30:00+05:00\n2023-01-01T12:00:00+00:00\n"
+                 "2023-12-31T20:00:00-04:00\n2024-03-01T01:00:00+02:00\n",
     "negatives.csv": "a,b\n-1,-2.5\n3,0.25\n9007199254740993,1.5\n",
 }
 
