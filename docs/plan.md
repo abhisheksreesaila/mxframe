@@ -1289,11 +1289,13 @@ Needs: F-132 · Spec §5 · `mojo/mxframe/expr.mojo`, `query.mojo`, test `mojo/t
 - [x] equal to an independent plain-loop oracle on 300k-row random tables, with and without nulls: the app's five shapes (chart key, pivot `region * 7 + carrier`, bin `least(day // 7, 51)`, filtered report tile and chart), mean and a formula value, an overflow and an unknown column raise readable errors (DuckDB is not reachable from Mojo; F-139's Python bridge can add it)
 - Limit: the kernel cannot tell a running total that passes int64 from a final one, so a sum whose partial totals pass int64 raises even if the final total would fit (Python's path has an exact fallback; the Mojo API does not yet)
 
-## F-134 M3: CSV reader [todo]
-Needs: F-132 · Spec §2
-- [ ] type inference (INT, DECIMAL scale 2 / 4, DATE, BOOL, TEXT), quoting, embedded newlines, BOM, CRLF, TSV
-- [ ] import report per column: empty cells, distinct (text), sample values, failed rows with row number and text
-- [ ] multi-threaded, streaming; equal to pyarrow / DuckDB on a corpus of awkward files
+## F-134 M3: CSV reader [review]
+Needs: F-132 · Spec §2 · `mojo/mxframe/csv.mojo`, tests `mojo/tests/test_csv.mojo` (run by `pixi run mojo-test`) and `tests/test_mojo_csv.py` (pyarrow oracle through `mojo/tools/csv_dump.mojo`)
+- [x] type inference (INT, DECIMAL scale 2 / 4, DATE, BOOL, TEXT), quoting, embedded newlines, BOM, CRLF, TSV (by `.tsv` / `.tab` or `CsvOptions(delimiter=)`); decimals parsed from the digits (exact, no float; extra digits round half away from zero); empty cell = null; after the `infer_rows` window a value that does not fit becomes a null plus a failed row ("row 41,207: `12.x` isn't a number")
+- [x] import report per column: `empty`, `distinct` (text), `sample` (first 8 raw values), `failed` (row, text, reason; at most 1000, `failed_count` is the true number); also `skipped` (columns past `max_columns`) and `ragged` (rows with more cells than the header: the extra cells are dropped and the row is reported)
+- [x] multi-threaded, memory-mapped (no copy of the file): a quote-parity pre-scan gives every chunk its exact starting quote state, so chunks start on true row boundaries even inside quoted multi-line fields (no fallback needed); no String per cell (numbers parsed from bytes, text through a byte-keyed dictionary). Equal to the single-threaded parse on a 300k-row generated file and on files cut into 7-byte chunks; equal to pyarrow on awkward files (the empty text cell is a null here, "" in pyarrow)
+- Measured, informally (24-core machine, not a quiet-machine benchmark): a generated 1M-row, 6-column, 38 MB file reads in about 0.065 s on all cores (about 15M rows/s) and 0.23 s on one thread (about 4M rows/s); the spec's target was 0.5 s
+- Limits: a stray quote in the middle of an unquoted field toggles quoting (RFC-strict files are fine); no exponent numbers (`1e5` is TEXT), no thousands separators, a lone `\r` is not a line end, UTF-8 only (not validated); the chunks' columns are held next to the final columns while stitching (about 2x the table's size for a moment), so it is parallel but not constant-memory streaming; a high-cardinality text column is stitched serially (one String per distinct word per chunk)
 
 ## F-135 M4: Parquet read and write [todo]
 Needs: F-131, F-132 · Spec §2
