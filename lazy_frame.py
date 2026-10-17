@@ -91,9 +91,10 @@ class Sort(LogicalPlan):
 
 @dataclass
 class Limit(LogicalPlan):
-    """Represents taking N rows after skipping the first ``offset`` (OFFSET m LIMIT n)."""
+    """Represents taking N rows after skipping the first ``offset`` (OFFSET m LIMIT n). ``n`` is None for
+    "no limit" (SQL OFFSET without LIMIT): every row after the skipped ones."""
     input: LogicalPlan
-    n: int
+    n: Optional[int]
     offset: int = 0
     def signature(self) -> tuple:
         return ("Limit", self.input.signature(), self.n, self.offset)
@@ -242,6 +243,15 @@ class LazyFrame:
         """Group data by one or more columns."""
         parsed_by = [col(b) if isinstance(b, str) else b for b in by]
         return LazyGroupBy(self, parsed_by)
+
+    def sink_parquet(self, path, device: str = "cpu", *, compression: str = "zstd", **kwargs) -> int:
+        """Run the query and write the result to the Parquet file ``path``; returns the rows written (F-113).
+
+        Takes the arguments of ``compute``. A result bigger than the host memory budget (``compute()`` raises a
+        ``MemoryError`` for it) is streamed into the file piece by piece with bounded memory: the batches of a
+        filter, spilled groups, join pairs, sorted ranges. The file appears only when the query has finished."""
+        from . import streamed as _streamed
+        return _streamed.sink_parquet(self, path, device, compression=compression, **kwargs)
 
     def compute(
         self,
@@ -489,8 +499,8 @@ class LazyFrame:
             desc_list = list(descending)
         return LazyFrame(Sort(self.plan, parsed_by, desc_list))
 
-    def limit(self, n: int, offset: int = 0):
-        """Take N rows, after skipping the first ``offset`` (SQL ``LIMIT n OFFSET offset``)."""
+    def limit(self, n: Optional[int], offset: int = 0):
+        """Take N rows, after skipping the first ``offset`` (SQL ``LIMIT n OFFSET offset``); ``n=None``: all the rest."""
         return LazyFrame(Limit(self.plan, n, offset))
 
     def distinct(self, *subset):
@@ -695,7 +705,8 @@ def _format_plan(plan: LogicalPlan, indent: int = 0) -> str:
         head = f"{pad}Sort(by={by}, descending={plan.descending})"
         return "\n".join([head, _format_plan(plan.input, indent + 1)])
     if isinstance(plan, Limit):
-        head = f"{pad}Limit(n={plan.n}, offset={plan.offset})" if plan.offset else f"{pad}Limit(n={plan.n})"
+        args = ([] if plan.n is None else [f"n={plan.n}"]) + ([f"offset={plan.offset}"] if plan.offset else [])
+        head = f"{pad}Limit({', '.join(args)})"
         return "\n".join([head, _format_plan(plan.input, indent + 1)])
     if isinstance(plan, Distinct):
         head = f"{pad}Distinct(subset={plan.subset})"

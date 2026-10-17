@@ -136,6 +136,8 @@ def dict_predicate(expr, table) -> Optional[pa.Array]:
             return None
         fn = lambda v: getattr(pc, _CMP[op])(v, _npscalar(args[1].args[0]))   # noqa: E731
     elif op == "isin":
+        if None in args[1]:
+            return None                  # x IN (.., NULL) is TRUE or NULL: the generic is_in (F-114)
         fn = lambda v: pc.is_in(v, value_set=_npa(args[1], type=v.type))   # noqa: E731
     elif op == "startswith":
         fn = lambda v: pc.starts_with(v, pattern=args[1])          # noqa: E731

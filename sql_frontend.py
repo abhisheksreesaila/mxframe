@@ -85,6 +85,8 @@ def _rows_upper(plan: LogicalPlan) -> Optional[int]:
         return _metadata(plan.path).num_rows
     if isinstance(plan, Limit):
         inner = _rows_upper(plan.input)
+        if plan.n is None:                                   # OFFSET without LIMIT: what is left after the skipped rows
+            return None if inner is None else max(inner - plan.offset, 0)
         return min(plan.n + plan.offset, inner) if inner is not None else plan.n + plan.offset
     if isinstance(plan, Join):
         l, r = _rows_upper(plan.left), _rows_upper(plan.right)
@@ -121,7 +123,7 @@ def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
 def _fold_const_minmax(select: sge.Select) -> None:
     """``MIN(DATE '..')`` / ``MAX(DATE '..')``: that date when the query has rows, else NULL, as
     ``CASE WHEN COUNT(*) > 0 THEN DATE '..' END`` (the engine aggregates numbers; a constant date is no column)."""
-    for n in list(select.walk(prune=lambda m: isinstance(m, (sge.Subquery, sge.Exists)))):
+    for n in list(select.walk(prune=lambda m: isinstance(m, (sge.Subquery, sge.Exists, sge.Window)))):
         if isinstance(n, (sge.Min, sge.Max)) and _date_of(n.this) is not None:
             some = sge.GT(this=sge.Count(this=sge.Star()), expression=sge.Literal.number(0))
             n.replace(sge.Case(ifs=[sge.If(this=some, true=n.this.copy())]))
@@ -223,13 +225,22 @@ def _exact_lit(ex: Expr) -> Expr:
                else np.float64(v) if isinstance(v, float) else v)
 
 
+def _bare_select_item(node: sge.Expression) -> Optional[sge.Expression]:
+    """The item of ``(SELECT <item>)`` with nothing else in it (no FROM, WHERE, LIMIT, HAVING ...), else None."""
+    node = _unparen(node)
+    if isinstance(node, sge.Subquery) and isinstance(node.this, sge.Select) and len(node.this.expressions) == 1 \
+            and all(not v for k, v in node.this.args.items() if k != "expressions"):
+        item = node.this.expressions[0]
+        return item.this if isinstance(item, sge.Alias) else item
+    return None
+
+
 def _date_of(node: sge.Expression) -> Optional[date]:
     """The date of a constant ``DATE 'yyyy-mm-dd'`` [+ / - INTERVAL 'n' DAY | MONTH | YEAR ...], else None."""
     node = _unparen(node)
-    if isinstance(node, sge.Subquery) and isinstance(node.this, sge.Select) and node.this.args.get("from_") is None \
-            and len(node.this.expressions) == 1:                  # (SELECT DATE '..') is that date
-        item = node.this.expressions[0]
-        return _date_of(item.this if isinstance(item, sge.Alias) else item)
+    inner = _bare_select_item(node)
+    if inner is not None:                                          # (SELECT DATE '..') is that date
+        return _date_of(inner)
     if isinstance(node, sge.Cast) and node.to.this == sge.DataType.Type.DATE:
         if isinstance(node.this, sge.Literal) and node.this.is_string:
             try:
@@ -389,7 +400,7 @@ def _or_without(node: sge.Or, drop: set) -> Optional[sge.Expression]:
     return sge.Paren(this=r)
 
 
-_ALL_ROWS = 2 ** 62          # LIMIT of an OFFSET without LIMIT
+_MAX_ROWS = 2 ** 62          # a LIMIT / OFFSET above this is clamped to it: more rows than any table, and n + offset stays an int64
 
 
 def _alias(node: sge.Expression, name: str) -> sge.Alias:
@@ -410,7 +421,10 @@ def _unsupported_shape(sel: sge.Expression, what: str, keys=("group", "having", 
 def _default_agg_name(node: sge.Expression) -> str:
     """DuckDB's name for an aggregate without an alias: ``sum(v)``, ``count_star()``, ``count(DISTINCT v)``;
     the argument is written as in the query. Other arguments need an alias (we do not guess DuckDB's text)."""
-    fn = _AGG_NAMES[type(node)]
+    fn = _AGG_NAMES.get(type(node))
+    if fn is None:
+        raise NotImplementedError(f"Unsupported aggregate function: {node.sql_name()} (the engine has SUM, AVG, MIN, MAX, "
+                                  f"COUNT and COUNT(DISTINCT x); no MEDIAN, quantile, STDDEV or VARIANCE)")
     arg = node.this
     distinct = isinstance(arg, sge.Distinct)
     if distinct:
@@ -531,10 +545,34 @@ class _SQLTranslator:
 
     def translate(self, query: str) -> LazyFrame:
         tree = sqlglot.parse_one(query, dialect="duckdb")
+        if isinstance(tree, sge.Copy):
+            return self._copy(tree)
         if not isinstance(tree, sge.Select):
             raise ValueError(f"Only SELECT statements are supported, got {type(tree).__name__}")
         plan = self._build_select(tree)
         return LazyFrame(plan)
+
+    def _copy(self, tree: sge.Copy) -> LazyFrame:
+        """``COPY (SELECT ...) TO 'file.parquet' [(FORMAT PARQUET)]``: runs the query on the CPU now and streams the result
+        into the file (`LazyFrame.sink_parquet`, so a result bigger than memory finishes), then returns the one-row
+        table ``Count`` of the rows written, as DuckDB does (F-113)."""
+        body, files = tree.this, tree.args.get("files") or []
+        if tree.args.get("kind") or not isinstance(body, sge.Subquery) or not isinstance(body.this, sge.Select) \
+                or len(files) != 1 or not isinstance(files[0], sge.Literal) or not files[0].is_string:
+            raise NotImplementedError("COPY is supported as COPY (SELECT ...) TO 'file.parquet'")
+        path, explicit = files[0].name, False
+        for prm in tree.args.get("params") or []:
+            name = prm.this.name.upper() if hasattr(prm.this, "name") else str(prm.this).upper()
+            expr = prm.args.get("expression")
+            value = (expr.name if hasattr(expr, "name") else str(expr)).upper() if expr is not None else ""
+            if (name, value) != ("FORMAT", "PARQUET"):
+                shown = f"{name} {value}".strip()
+                raise NotImplementedError(f"COPY option {shown} is not supported (only FORMAT PARQUET)")
+            explicit = True
+        if not explicit and not path.lower().endswith((".parquet", ".parq")):
+            raise NotImplementedError(f"COPY writes Parquet only: name the file *.parquet or add (FORMAT PARQUET); got '{path}'")
+        n = LazyFrame(self._build_select(body.this)).sink_parquet(path)
+        return LazyFrame(Scan(pa.table({"Count": pa.array([n], pa.int64())})))
 
     def _build_select(self, node: sge.Select) -> LogicalPlan:
         if not isinstance(node, sge.Select):
@@ -640,8 +678,8 @@ class _SQLTranslator:
         # 5. LIMIT / OFFSET (OFFSET alone keeps every row after the skipped ones)
         limit_node, offset_node = node.args.get("limit"), node.args.get("offset")
         if limit_node or offset_node:
-            plan = Limit(plan, int(limit_node.expression.this) if limit_node else _ALL_ROWS,
-                         int(offset_node.expression.this) if offset_node else 0)
+            plan = Limit(plan, min(int(limit_node.expression.this), _MAX_ROWS) if limit_node else None,
+                         min(int(offset_node.expression.this), _MAX_ROWS) if offset_node else 0)
 
         if final_proj:
             plan = Project(plan, final_proj)
@@ -1621,7 +1659,7 @@ class _SQLTranslator:
         # without an aggregate.
         plain = [split(e) for e in items if not _aggs_in(e) and e.find(sge.Column) is not None]   # a constant is no key
         aliased = [(a, self._expr(i).signature()) for i, a in plain if a]
-        alias_expr = {a.lower(): i for i, a in plain if a}
+        alias_expr = {a.lower(): i for i, a in map(split, items) if a and not _aggs_in(i)}      # (a constant's too)
         scope = {c.lower() for c in self._scope_columns}
         if group_node is not None and group_node.args.get("all"):
             group_exprs = [i for i, _ in plain]
@@ -1638,6 +1676,8 @@ class _SQLTranslator:
             elif (isinstance(gb, sge.Column) and not gb.table and gb.name.lower() in alias_expr
                     and gb.name.lower() not in scope):
                 inner = alias_expr[gb.name.lower()]
+            if inner.find(sge.Column) is None:          # grouping by a constant: one group, as no key
+                continue
             key = self._expr(inner)
             if key.signature() in {k.signature() for k in group_by}:
                 continue
@@ -1788,10 +1828,9 @@ class _SQLTranslator:
             inner = e.this
         else:
             inner = e
-        day = _date_of(inner) if isinstance(inner, sge.Subquery) else None
-        mx = lit(day) if day is not None else self._expr(inner)        # (SELECT DATE '..') as output is a date
+        mx = self._value(inner)             # a DATE constant that is an output is a date32 (F-115)
         if isinstance(inner, sge.Extract):
-            mx = _exact_lit(mx)                                        # EXTRACT(YEAR FROM DATE '..') is an integer
+            mx = _exact_lit(mx)             # EXTRACT(YEAR FROM DATE '..') is an integer
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:
@@ -2098,7 +2137,7 @@ class _SQLTranslator:
 
     @staticmethod
     def _no_constants(node, *operands):
-        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) for o in operands):
+        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) or _date_of(o) is not None for o in operands):
             raise NotImplementedError(f"{node.sql(dialect='duckdb')}: a test of constants only has no column to "
                                       "filter or compute on; put a column in it")
 
@@ -2107,6 +2146,8 @@ class _SQLTranslator:
         (they are not elsewhere); the rest as usual."""
         d = _date_of(n)
         if d is not None:
+            if isinstance(_unparen(_bare_select_item(n) or n), (sge.Add, sge.Sub)):          # DATE +/- INTERVAL is a TIMESTAMP (microseconds)
+                return lit(np.datetime64(d, "us"))
             return lit(d)
         if isinstance(n, (sge.Null, sge.Boolean)):
             return lit(None if isinstance(n, sge.Null) else bool(n.this))
@@ -2175,6 +2216,8 @@ class _SQLTranslator:
     # ------------------------------------------------------------------
 
     def _scalar(self, node: sge.Expression) -> Any:
+        if isinstance(node, sge.Null):
+            return None                                 # IN (.., NULL): np_arrow.is_in's three-valued logic
         if isinstance(node, sge.Literal):
             if node.is_string:
                 return node.this

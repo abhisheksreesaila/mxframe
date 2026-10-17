@@ -238,6 +238,8 @@ BARE = {
     "subquery_vs_int32": "select id from t where dd = (select date '2024-01-01') order by id",
     "subquery_vs_int32_lt": "select id from t where dd < (select date '2024-06-01') order by id",
     "subquery_beside_aggregate": "select g, (select date '2020-01-02') as c, count(*) as n from t group by g order by g",
+    "subquery_plus_interval_is_a_timestamp": "select id, (select date '2020-01-02' + interval 1 day) as c from t order by id",
+    "subquery_plus_interval_vs_date32": "select id from t where d < (select date '2024-01-01' + interval 90 day) order by id",
     "min_date": "select min(date '2020-01-02') as m from t",
     "max_date": "select max(date '2020-01-02') as m from t",
     "min_date_grouped": "select g, min(date '2020-01-02') as m, count(*) as n from t group by g order by g",
@@ -255,3 +257,34 @@ BARE = {
 def test_date_constant_forms(cfg, name):
     want = _check(BARE[name], cfg[0])
     assert want.num_rows > 0 or "no_rows" in name or name.startswith("subquery_vs")
+
+
+# ---------------------------------------------------------------- reviewer round 1
+
+@pytest.mark.parametrize("q", [
+    "select id, (select date '2020-01-01' where 1 = 0) as c from t order by id",       # DuckDB: NULL on every row
+    "select count(*) as n from t where d = (select date '2020-01-01' limit 0)",         # DuckDB: no row matches
+    "select count(*) as n from t where d = (select date '2024-01-01' having 1 = 0)",
+])
+def test_a_date_subquery_with_other_clauses_is_refused_not_answered_as_the_date(cfg, q):
+    CON.execute(q)                                                      # DuckDB accepts it
+    with pytest.raises(NotImplementedError, match="scalar subquery"):
+        mx.sql(q, t=T).compute(device=cfg[0])
+
+
+def test_min_of_a_date_constant_in_a_window_is_refused(cfg):
+    with pytest.raises(NotImplementedError):
+        mx.sql("select g, min(date '2020-01-02') over (partition by g) as m from t", t=T).compute(device=cfg[0])
+
+
+@pytest.mark.parametrize("q", [
+    "select g, 1 as c, count(*) as n from t group by g, c order by g",
+    "select g, 1 as c, count(*) as n from t group by g, 2 order by g",
+    "select g, 1 as c, count(*) as n from t group by 1, 2 order by g",
+    "select g, 1 as c, count(*) as n from t group by all order by g",
+    "select 1 as c, count(*) as n from t group by c",
+    "select g, count(*) as n from t group by g, 1 order by g",
+    "select g, 'a' as c, null as z, count(*) as n from t group by g, c, z order by g",
+])
+def test_group_by_naming_a_constant_is_no_key(cfg, q):
+    _check(q, cfg[0])

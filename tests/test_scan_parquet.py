@@ -494,17 +494,21 @@ def test_other_tables_caches_survive_scan_parquet_compute(parquet_file, monkeypa
         co._contains_id(k, id(t)) for k in co._GROUP_ENCODE_CACHE)
 
 
-def test_isin_with_none_matches_arrow_semantics_on_dictionary():
+def test_isin_with_none_on_dictionary():
+    """Without a None the dictionary shortcut equals Arrow's is_in; with one (F-114) it declines, and the generic
+    path answers in SQL's three values: TRUE where matched, else NULL, and NULL for a NULL row."""
     vals = ["a", None, "b", "a"]
     plain = pa.table({"s": pa.array(vals), "v": np.arange(4, dtype=np.float32)})
     dic = pa.table({"s": pa.array(vals).dictionary_encode(), "v": plain["v"]})
     from mxframe.arrow_dict import dict_predicate
     import pyarrow.compute as pc
-    for values in (["a", None], ["a"], [None], ["a", "b"]):
-        e = col("s").isin(values)
+    for values in (["a"], ["a", "b"]):
         exp = pc.is_in(plain["s"], value_set=pa.array(values, pa.string()))
-        got = dict_predicate(e, dic)
-        assert got.to_pylist() == exp.to_pylist(), values
+        assert dict_predicate(col("s").isin(values), dic).to_pylist() == exp.to_pylist(), values
+    for values, want in ((["a", None], [True, None, None, True]), ([None], [None, None, None, None])):
+        e = col("s").isin(values)
+        assert dict_predicate(e, dic) is None
+        assert LazyFrame(Scan(dic)).select(e.alias("m")).compute().column("m").to_pylist() == want, values
 
 
 # ── F-020: a self-join of one scan_parquet frame ────────────────────────────
