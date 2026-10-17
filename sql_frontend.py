@@ -85,6 +85,8 @@ def _rows_upper(plan: LogicalPlan) -> Optional[int]:
         return _metadata(plan.path).num_rows
     if isinstance(plan, Limit):
         inner = _rows_upper(plan.input)
+        if plan.n is None:                                   # OFFSET without LIMIT: what is left after the skipped rows
+            return None if inner is None else max(inner - plan.offset, 0)
         return min(plan.n + plan.offset, inner) if inner is not None else plan.n + plan.offset
     if isinstance(plan, Join):
         l, r = _rows_upper(plan.left), _rows_upper(plan.right)

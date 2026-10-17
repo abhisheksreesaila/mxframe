@@ -790,6 +790,10 @@ class CustomOpsCompiler(GraphCompiler):
                 if pa.types.is_integer(rhs.type):
                     rhs = pc.cast(rhs, pa.float64(), safe=False)
                 return pc.divide(lhs, rhs)
+            if (op == "sub" and getattr(lhs, "type", None) == pa.date32()
+                    and getattr(rhs, "type", None) in (pa.date32(), pa.int32())):
+                # DATE - DATE is the number of days (BIGINT); an int32 column holds days since 1970 (F-115)
+                return pc.cast(pc.subtract(pc.cast(lhs, pa.int32()), pc.cast(rhs, pa.int32())), pa.int64())
             return _checked_arith(op, lhs, rhs)
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)

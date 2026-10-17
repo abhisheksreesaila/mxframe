@@ -176,3 +176,29 @@ def test_offset_zero_without_limit_keeps_every_row():
     out = mx.sql("select i from t order by c desc, i offset 0", t=T).compute()
     assert out.num_rows == N
     assert out.column("i").to_pylist() == CON.execute("select i from t order by c desc, i").to_arrow_table().column("i").to_pylist()
+
+
+# ---- a derived table with OFFSET and no LIMIT inside a cross / theta join (the F-096 cap reads its row count) --------
+
+U = pa.table({"k": pa.array([1, 2], pa.int64())})
+CON.register("_u", U)
+CON.execute("create table u as select * from _u")
+
+JOINS = [
+    "select a.i, u.k from (select i from t order by i offset 397) a cross join u",
+    "select a.i, u.k from (select i from t order by i offset 397) a, u where a.i > u.k",
+    "select a.i, u.k from (select i from t order by i offset 397) a join u on a.i > u.k",
+    "select i, k from u, (select i from t order by i offset 398) a",
+    "select a.i, u.k from (select i from t order by i offset 1000) a cross join u",
+]
+
+
+@pytest.mark.parametrize("q", JOINS)
+@pytest.mark.parametrize("device", ["cpu", pytest.param("gpu", marks=pytest.mark.skipif(not GPU, reason="no CUDA GPU")),
+                                    pytest.param("auto", marks=pytest.mark.skipif(not GPU, reason="no CUDA GPU"))])
+def test_join_over_an_offset_only_derived_table(q, device):
+    want = CON.execute(q).to_arrow_table()
+    got = mx.sql(q, t=T, u=U).compute(device=device)
+    rows = lambda x: sorted(zip(*(x.column(i).to_pylist() for i in range(x.num_columns))))     # noqa: E731
+    assert got.column_names == want.column_names
+    assert rows(got) == rows(want), q

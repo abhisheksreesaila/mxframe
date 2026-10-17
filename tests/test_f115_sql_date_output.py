@@ -82,6 +82,21 @@ QUERIES = {
     "cte_output": "with u as (select id, date '2024-01-01' as c from t) select id, c from u order by id",
     "order_by_output": "select id, date '2024-01-01' as c from t order by c, id",
     "next_to_day_column": "select id, date '2024-01-01' as c from t order by n, id",
+    # a date leaving a derived table, then meeting the int32 day column (all worked before F-115)
+    "derived_gt": "select id from (select id, n, date '2024-03-01' as x from t) where x > n order by id",
+    "derived_ge": "select id from (select id, n, date '2024-03-01' as x from t) where n >= x order by id",
+    "derived_eq": "select id from (select id, n, date '2024-03-01' as x from t) where x = n order by id",
+    "derived_ne": "select id from (select id, n, date '2024-03-01' as x from t) where x <> n order by id",
+    "derived_lt_out": "select id, x from (select id, n, date '2024-03-01' as x from t) where n < x order by id",
+    "derived_group": "select g, count(*) as c from (select g, n, date '2024-03-01' as x from t) where n > x "
+                     "group by g order by g",
+    "derived_interval": "select id from (select id, n, date '2024-03-01' + interval 1 day as x from t) where n < x "
+                        "order by id",
+    "derived_minus": "select id, x - n as c from (select id, n, date '2024-03-05' as x from t) order by id",
+    "derived_case": "select id from (select id, n, case when g = 0 then date '2024-03-01' else date '2024-04-10' end as x "
+                    "from t) where n < x order by id",
+    "case_of_dates_vs_day": "select id from t where n < case when g = 0 then date '2024-03-01' else date '2024-04-10' end "
+                            "order by id",
     # comparisons keep the day-number convention
     "where_day_column_ge": "select id from t where n >= date '2024-03-01' order by id",
     "where_day_column_between": "select id from t where n between date '2024-02-01' and date '2024-06-01' order by id",
