@@ -27,6 +27,11 @@ _NUMERIC = {
 }
 
 
+def empty(schema: pa.Schema) -> pa.Table:
+    """A table of `schema` with no rows. (the schema method for this imports pandas, 110-160 ms per process: F-026.)"""
+    return pa.Table.from_batches([], schema)
+
+
 def _is_masked(obj) -> bool:
     ma = sys.modules.get("numpy.ma")          # touching np.ma would import it (~9 ms)
     return ma is not None and isinstance(obj, ma.MaskedArray)

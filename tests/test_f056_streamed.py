@@ -405,12 +405,14 @@ def test_the_streamed_table_is_the_left_side_of_left_semi_and_anti_joins(files, 
     same(got, want, ("k",))
 
 
-def test_a_join_where_the_big_file_is_the_right_side_of_a_left_join_is_not_streamed(files):
+def test_a_join_where_the_big_file_is_the_right_side_of_a_left_join_is_a_grace_join(files):
+    """Step 2 declined this (a build side cannot stream); step 3b partitions both sides (tests/test_f056_step3b_grace.py)."""
     fact, dim1 = scan_parquet(files["fact"]), scan_parquet(files["dim1"])
     lf = dim1.join(fact, left_on="id", right_on="j", how="left").groupby("region").agg(col("v").sum().alias("s"))
-    with pytest.warns(RuntimeWarning, match="not streamed: the big file is the build side of a left join"):
-        lf.compute(device="cpu")
-    assert prov(lf)["path"] != "streamed"
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed" and prov(lf)["streamed"]["grace"]["how"] == "left"
+    same(got, sql("SELECT region, sum(v) AS s FROM dim1 LEFT JOIN fact ON dim1.id = fact.j GROUP BY region", files),
+         ("region",))
 
 
 # --- exactness ----------------------------------------------------------------------------------------------
@@ -503,15 +505,16 @@ def test_reproducible_batches_do_not_depend_on_free_memory(monkeypatch):
 
 # --- what does not stream ---------------------------------------------------------------------------------
 
-def test_a_plan_that_cannot_stream_warns_and_still_runs(tmp_path, monkeypatch):
+def test_a_plan_that_streams_through_a_grace_join_does_not_warn(tmp_path, monkeypatch):
     tiny(monkeypatch, "20K")
     t = pa.table({"k": np.arange(20_000, dtype=np.int32), "v": np.arange(20_000, dtype=np.float64)})
     path = small_file(tmp_path, t, 1000)
     big = scan_parquet(path)
     lf = big.select("k", "v").join(big.select("k"), on="k").sort("v", descending=True).limit(3)
-    with pytest.warns(RuntimeWarning, match="does not fit in memory .* not streamed: the big file is read twice"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)                       # (a self-join is a Grace join since step 3b)
         got = lf.compute(device="cpu")
-    assert prov(lf)["path"] != "streamed"
+    assert prov(lf)["path"] == "streamed" and prov(lf)["streamed"]["grace"]["how"] == "inner"
     assert got.column("v").to_pylist() == [19999.0, 19998.0, 19997.0]
 
 
@@ -536,7 +539,7 @@ def test_a_result_of_groups_bigger_than_the_budget_raises_a_clear_memory_error(t
         lf.compute(device="cpu")
 
 
-def test_a_dimension_bigger_than_half_the_budget_declines_with_the_reason(tmp_path, monkeypatch):
+def test_a_dimension_bigger_than_half_the_budget_is_joined_by_partitions(tmp_path, monkeypatch):
     tiny(monkeypatch, "300K")
     n = 40_000
     big = pa.table({"id": np.arange(n, dtype=np.int32), "x": np.ones(n)})
@@ -545,8 +548,8 @@ def test_a_dimension_bigger_than_half_the_budget_declines_with_the_reason(tmp_pa
     pq.write_table(big, a, row_group_size=2000)
     pq.write_table(other, b, row_group_size=2000)
     lf = scan_parquet(a).join(scan_parquet(b), on="id").groupby().agg(col("y").sum().alias("s"))
-    with pytest.warns(RuntimeWarning, match="not streamed: the other tables"):
-        got = lf.compute(device="cpu")
+    got = run(lf, "cpu")                                                      # step 3b: both sides are partitioned
+    assert prov(lf)["path"] == "streamed" and prov(lf)["streamed"]["grace"]["pairs"] >= 2
     assert got.column("s").to_pylist() == [float(n)]
 
 
@@ -617,10 +620,10 @@ def test_explain_says_a_query_streams_in_so_many_batches(files):
     assert line == f"streams in {prov(lf)['streamed']['batches']} batches of row groups (49 of 60 row groups read, host budget 40.0 MB)"
 
 
-def test_explain_says_why_a_query_would_not_stream(files):
+def test_explain_says_a_self_join_is_a_grace_join(files):
     fact = scan_parquet(files["fact"])
     lf = fact.select("j", "v").join(fact.select("j"), on="j").limit(5)
-    assert "would not stream: the big file is read twice by the plan" in lf.explain()
+    assert "grace join, 16 partitions" in lf.explain()
 
 
 def test_explain_says_when_the_data_fits(files, monkeypatch):
@@ -658,7 +661,7 @@ SILENT = {
         "SELECT g, count(x) AS n, count(*) AS c FROM dim LEFT JOIN fact ON fact.j = dim.id GROUP BY g", "left"),
     "self-join of the big file": (
         "SELECT f1.k, count(*) AS n FROM fact f1 JOIN (SELECT j, max(x) AS mx FROM fact GROUP BY j) f2 "
-        "ON f1.j = f2.j AND f1.x = f2.mx GROUP BY f1.k", None),
+        "ON f1.j = f2.j AND f1.x = f2.mx GROUP BY f1.k", "inner"),
     "scalar subquery over the big file in WHERE": (
         "SELECT k, count(*) AS n FROM fact WHERE x > (SELECT avg(x) FROM fact) GROUP BY k", None),
 }
@@ -681,9 +684,9 @@ def test_a_shape_that_cannot_stream_gives_the_in_memory_answer(silent, monkeypat
         warnings.simplefilter("always")
         got = lf.compute(device="cpu")
     said = [str(x.message) for x in w if "not streamed" in str(x.message)]
-    if why:                                    # a shape that must be declined says so, naming the join
-        assert said and why in said[0], said
-        assert prov(lf)["path"] != "streamed"
+    if why:                                    # a join of two big sides is a Grace join (step 3b), never declined
+        assert not said, said
+        assert prov(lf)["path"] == "streamed" and prov(lf)["streamed"]["grace"]["how"] == why
     want = silent_reference(query, silent)
     key = lambda r: tuple((v is None, str(v)) for v in r.values())            # noqa: E731
     g, w_ = sorted(got.to_pylist(), key=key), sorted(want.to_pylist(), key=key)
