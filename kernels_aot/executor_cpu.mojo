@@ -95,6 +95,8 @@ comptime O_MEAN = 3
 comptime O_COUNT = 4
 comptime O_ISUM = 5      # sum of an integer-valued input (program op OP_AGG_ISUM): the slot holds int64s, the output is int64 (F-060)
 comptime O_IMEAN = 6     # mean of such a slot: float64
+comptime O_IMIN = 7      # min / max of an integer column taken in int64 (OP_AGG_IMIN / IMAX, F-060c): int64 words, exact past 2^53
+comptime O_IMAX = 8
 
 comptime E_BAD_PLAN = -1
 comptime E_TOO_MANY_GROUPS = -10
@@ -144,8 +146,8 @@ def _arr_dict(a: Int) -> Int:
 
 
 def _itemsize(dtype: Int) -> Int:
-    # pipeline dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8, 5 dictionary codes (int32)
-    if dtype == 1 or dtype == 3:
+    # pipeline dtypes: 0 i32, 1 i64, 2 f32, 3 f64, 4 u8, 5 dictionary codes (int32), 8 i64 read only by OP_LOADI
+    if dtype == 1 or dtype == 3 or dtype == 8:
         return 8
     if dtype == 4:
         return 1
@@ -1514,7 +1516,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                             ok = False
                             break
                         var hv = _out_value(op, Int(outs[3 * j + 1]), Int(outs[3 * j + 2]), g, G, vals, cnt)
-                        if op == O_ISUM and (hv > 9007199254740992.0 or hv < -9007199254740992.0):
+                        if _int_out(op) and (hv > 9007199254740992.0 or hv < -9007199254740992.0):
                             hinex[0] = 1
                         if not _cmp(hv, Int(having[3 * h + 1]), hconst[h]):
                             ok = False
@@ -1590,7 +1592,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                     var x = _out_value(op, slot, nslot, Int(order[i]), G, vals, cnt)
                     if x != x:
                         bad = True
-                    if op == O_ISUM and (x > 9007199254740992.0 or x < -9007199254740992.0):
+                    if _int_out(op) and (x > 9007199254740992.0 or x < -9007199254740992.0):
                         inexact = True             # float64 sort values: neighbours past 2^53 would tie
                     sv[j * n_res + i] = sign * x
         if bad or inexact:                         # NaN: the caller's sort decides where it goes
@@ -1716,7 +1718,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for i in range(n_res):
                 dst[i] = cnt[Int(order[i])]
             O[obase + j] = Int64(Int(dst))
-        elif op == O_ISUM:                         # int64 words, exactly
+        elif _int_out(op):                         # int64 words, exactly (a sum, or an integer min / max)
             var dst = _lp(at)
             var iv = _ibits(vals)
             for i in range(n_res):
@@ -1808,6 +1810,12 @@ def _fill_kv(K: Keys, kv: LP, n_keys: Int, order: LP, n_res: Int, comp: LP, comp
 
 
 @always_inline
+def _int_out(op: Int) -> Bool:
+    """An output held as int64 words: an integer sum, or an integer min / max (the sort and HAVING see float64)."""
+    return op == O_ISUM or op == O_IMIN or op == O_IMAX
+
+
+@always_inline
 def _align8(n: Int) -> Int:
     return (n + 7) // 8 * 8
 
@@ -1818,9 +1826,9 @@ def _out_value(op: Int, slot: Int, nslot: Int, g: Int, G: Int, vals: FP, cnt: LP
     min / max with a NaN-count slot are NaN when the group had a NaN (max) or only NaNs (min)."""
     if op == O_COUNT:
         return Float64(Int(cnt[g]))
-    if op == O_ISUM or op == O_IMEAN:
+    if op == O_ISUM or op == O_IMEAN or op == O_IMIN or op == O_IMAX:
         var iv = _ibits(vals)[slot * G + g]
-        if op == O_ISUM:
+        if op != O_IMEAN:
             return Float64(iv)
         var ic = Int(cnt[g])
         return Float64(iv) / Float64(ic) if ic > 0 else 0.0

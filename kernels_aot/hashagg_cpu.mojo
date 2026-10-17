@@ -47,7 +47,7 @@ from _fpenv import par, par_n
 from std.atomic import Atomic
 from std.ffi import external_call
 
-from pipeline_cpu import Prog, _run_ops, _process_range, _worker_state, _no_front, _ibits, _iadd, VEC, MORSEL, MAX_REGS
+from pipeline_cpu import Prog, _run_ops, _process_range, _worker_state, _no_front, _ibits, _iadd, _is_iext, _iext, _fill_identity, VEC, MORSEL, MAX_REGS
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -222,6 +222,14 @@ def _flush(p: Prog, hs: LP, nk: Int, cap: Int, lanes: Int, nparts: Int, pshift: 
             elif kind == OP_AGG_MAX:
                 init = -INF
             var q = pv + (a * cap + g) * lanes
+            if _is_iext(kind):                            # F-060c: an int64 extreme, reduced over the lanes
+                var xq = _ibits(q)
+                var xacc = xq[0]
+                for l in range(1, lanes):
+                    xacc = _iext(kind, xacc, xq[l])
+                _fill_identity(q, lanes, kind)
+                _lp(rec + (3 + a) * 8)[0] = xacc
+                continue
             if kind == OP_AGG_ISUM:                       # an int64 total: the same words, read as int64
                 var iq = _ibits(q)
                 var iacc = iq[0]
@@ -319,14 +327,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         for i in range(tsize):
             table[i] = -1
         for a in range(A):
-            var kind = _kind(p, a)
-            var init = 0.0
-            if kind == OP_AGG_MIN:
-                init = INF
-            elif kind == OP_AGG_MAX:
-                init = -INF
-            for i in range(cap * lanes):
-                pv[a * cap * lanes + i] = init
+            _fill_identity(pv + a * cap * lanes, cap * lanes, _kind(p, a))
         for i in range(cap * lanes):
             pc[i] = 0
         hs[S_TABLE] = Int64(Int(table))
@@ -484,9 +485,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                                     ekeys[e * nk + k] = r[3 + A + k]
                                 ecnt[e] = 0
                                 for a in range(A):
-                                    var kind = _kind(p, a)
-                                    evals[a * nrec + e] = 0.0 if (kind == OP_AGG_SUM or kind == OP_AGG_ISUM) else (
-                                        INF if kind == OP_AGG_MIN else -INF)
+                                    _fill_identity(evals + (a * nrec + e), 1, _kind(p, a))
                                 break
                             if ehash[e] == h:
                                 var same = True
@@ -507,6 +506,9 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                             elif kind == OP_AGG_ISUM:
                                 var iq = _ibits(q)
                                 iq[0] = _iadd(iq[0], _lp(rec + (3 + a) * 8)[0], p.ovf)
+                            elif _is_iext(kind):
+                                var xq = _ibits(q)
+                                xq[0] = _iext(kind, xq[0], _lp(rec + (3 + a) * 8)[0])
                             elif kind == OP_AGG_MIN:
                                 q[0] = min(q[0], x)
                             else:

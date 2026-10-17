@@ -1978,7 +1978,16 @@ class CustomOpsCompiler(GraphCompiler):
         # int64 themselves; a plan that gets here after they declined is added by Arrow's checked sum, never by
         # a float64 path. With nulls in the plan Arrow answers anyway, and its sums of integers are int64 too.
         exact_sum = late and (has_int_sum(list(plan.aggs), table) or int_sum_inexact(list(plan.aggs), table, preds))
-        if not exact_sum:                  # F-090: float64 rounds the MIN / MAX of an integer past 2^53
+        wide_minmax = any(e.op in ("min", "max") and e.args[0].op == "col" and e.args[0].args[0] in table.column_names
+                          and pa.types.is_integer(table.column(e.args[0].args[0]).type)
+                          and table.column(e.args[0].args[0]).type.bit_width >= 64 for e in plan.aggs)
+        temporal = any(_temporal_extreme(e, table) for e in plan.aggs)     # F-093: float64 cannot hold a date / ns timestamp
+        if wide_minmax and (has_nulls or temporal):
+            exact_sum = True        # Arrow answers: it takes a 64-bit integer extreme in integers, whatever the values (F-090)
+        elif wide_minmax and late and not exact_sum:
+            # F-090: every kernel that computes in float64 rounds the MIN / MAX of an integer past 2^53. The executor
+            # and the fused pipelines take it in int64 (F-060c), so this is asked only once all of them have declined
+            # (it used to be a pass over the column for every min / max query, before any kernel ran)
             for e in plan.aggs:
                 if e.op in ("min", "max") and e.args[0].op == "col" and e.args[0].args[0] in table.column_names:
                     c = table.column(e.args[0].args[0])
@@ -1988,7 +1997,7 @@ class CustomOpsCompiler(GraphCompiler):
                         if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
                             exact_sum = True
                             break
-        if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
+        if temporal:
             return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
             "an integer sum or arithmetic the pipelines declined, or a min / max past 2^53 (computed exactly in int64)"
@@ -2275,17 +2284,20 @@ class CustomOpsCompiler(GraphCompiler):
                 continue
             name = e._alias or f"agg_{i}"
             idx = result.schema.get_field_index(name)
-            if idx < 0 or pa.types.is_integer(result.schema.field(idx).type):
+            if idx < 0:
                 continue
+            ftype = result.schema.field(idx).type
             col = result.column(idx)
             if e.op == "count":
-                result = result.set_column(idx, name, pc.cast(pc.round(col), pa.int64()))
+                if not pa.types.is_integer(ftype):
+                    result = result.set_column(idx, name, pc.cast(pc.round(col), pa.int64()))
                 continue
-            # F-090: MIN / MAX of an integer column is that integer type (DuckDB), not the kernels' float
+            # F-090: MIN / MAX of an integer column is that integer type (DuckDB), not the kernels' float; the
+            # kernels' int64 extreme (F-060c) takes the column's own width (int32, uint8 ...) here
             if int_cols is None:
                 int_cols = {n: t for n, t in column_types(agg.input).items() if pa.types.is_integer(t)}
             want = int_cols.get(e.args[0].args[0])
-            if want is not None and pa.types.is_floating(col.type):
+            if want is not None and ftype != want and (pa.types.is_floating(ftype) or pa.types.is_integer(ftype)):
                 result = result.set_column(idx, name, pc.cast(col, want))   # safe cast: a fraction raises
         return result
 

@@ -370,7 +370,8 @@ def _shapes():
                                     .groupby("k").agg(s(col("v2").sum())), True),
         "distinct below": (LazyFrame(t).select("k", "j").distinct().groupby("k").agg(s(col("j").count())), False),
         "nulls": (LazyFrame(nulls).groupby("k").agg(s(col("v").sum())), False),
-        "int64 past 2^53": (LazyFrame(big).groupby("k").agg(s(col("i").max())), False),
+        "int64 past 2^53": (LazyFrame(big).filter(col("i") > lit(5)).groupby("k").agg(s(col("i").max())), False),
+        "int64 max past 2^53, in int64 (F-060c)": (LazyFrame(big).groupby("k").agg(s(col("i").max())), True),
         "integer sum that could pass 2^53": (LazyFrame(big).groupby("k").agg(s(col("i").sum())), False),
         "dictionary-code filter, in-memory": (LazyFrame(strings).filter(col("s") == lit("a"))
                                               .groupby("k").agg(s(col("v").sum())), False),

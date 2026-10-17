@@ -59,6 +59,7 @@ comptime REPRO_MAX_NS: Int = 4096   # most (slots + 1) * groups the ordered mode
 
 comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
+comptime OP_LOADI = 3           # the column's values as int64 BITS in the register (read only by OP_AGG_IMIN / IMAX, F-060c)
 comptime OP_ADD = 10
 comptime OP_SUB = 11
 comptime OP_MUL = 12
@@ -82,6 +83,8 @@ comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
 comptime OP_AGG_ISUM = 53       # sum of integer-valued inputs in int64 (F-060): the slot's float64 word holds int64 bits
+comptime OP_AGG_IMIN = 54       # min / max of an OP_LOADI register in int64 (F-060c): the slot's float64 word holds int64 bits
+comptime OP_AGG_IMAX = 55
 
 comptime SH = AddressSpace.SHARED
 comptime SFP = Pointer[Float64, MutUntrackedOrigin, address_space=SH]
@@ -140,6 +143,20 @@ def _atomic_add_bits[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrig
 
 
 @always_inline
+def _atomic_min_bits[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigin, address_space=space], val: Int64):
+    """int64 atomic min on a float64 slot that holds int64 bits (llvm bin_op 8: signed min)."""
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`8 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[space, F64](ptr), v)
+
+
+@always_inline
+def _atomic_max_bits[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigin, address_space=space], val: Int64):
+    """int64 atomic max on a float64 slot that holds int64 bits (llvm bin_op 7: signed max)."""
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`7 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[space, F64](ptr), v)
+
+
+@always_inline
 def _i64_of(x: Float64) -> Int64:
     """The int64 a slot word holds."""
     return bitcast[DType.int64, 1](SIMD[F64, 1](x))[0]
@@ -156,6 +173,14 @@ def _note_ovf(a: Int64, b: Int64, ovf: LP):
     var s = a + b
     if ((a ^ s) & (b ^ s)) < 0:
         ovf[0] = 1
+
+
+@always_inline
+def _iext_words(kind: Int, a: Float64, b: Float64) -> Float64:
+    """The integer min / max (OP_AGG_IMIN / IMAX) of two slot words that hold int64s, as a slot word."""
+    var x = _i64_of(a)
+    var y = _i64_of(b)
+    return _word_of(min(x, y) if kind == OP_AGG_IMIN else max(x, y))
 
 
 @always_inline
@@ -205,6 +230,16 @@ def _load(addr: Int, dtype: Int, row: Int) -> Float64:
         return _lp(addr)[row].cast[F64]()
     else:
         return _bp(addr)[row].cast[F64]()
+
+
+@always_inline
+def _load_i(addr: Int, dtype: Int, row: Int) -> Float64:
+    """OP_LOADI: the column value widened to int64, as the bits of the register's float64 word."""
+    if dtype == 0:
+        return _word_of(_ip(addr)[row].cast[DType.int64]())
+    elif dtype == 4:
+        return _word_of(_bp(addr)[row].cast[DType.int64]())
+    return _word_of(_lp(addr)[row])                  # 1: int64, 8: int64 read only here (exact past 2^53)
 
 
 @always_inline
@@ -297,6 +332,8 @@ def _combine(kind: Int, a: Float64, b: Float64, ovf: LP) -> Float64:
         return max(a, b)
     elif kind == OP_AGG_ISUM:
         return _iadd_words(a, b, ovf)
+    elif kind == OP_AGG_IMIN or kind == OP_AGG_IMAX:
+        return _iext_words(kind, a, b)
     return a + b
 
 
@@ -316,6 +353,10 @@ def _ident(kind: Int) -> Float64:
         return Float64.MAX
     elif kind == OP_AGG_MAX:
         return -Float64.MAX
+    elif kind == OP_AGG_IMIN:
+        return _word_of(Int64.MAX)
+    elif kind == OP_AGG_IMAX:
+        return _word_of(Int64.MIN)
     return 0.0
 
 
@@ -336,6 +377,13 @@ def _run[RPT: Int, B: Int](
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
                     d[k * B] = _load(addr, dt, row_base + tid + k * B)
+        elif op == OP_LOADI:
+            var c = Int(ins[2])
+            var addr = Int(cols[c])
+            var dt = Int(dts[c])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = _load_i(addr, dt, row_base + tid + k * B)
         elif op == OP_LOAD_CONST:
             var v = consts[Int(ins[2])]
             comptime for k in range(RPT):
@@ -564,6 +612,8 @@ def pipeline_kernel[RPT: Int, B: Int](
                                     acc[q] += v
                                 elif kind == OP_AGG_ISUM:
                                     acc[q] = _iadd_value(acc[q], v, ovf)
+                                elif kind == OP_AGG_IMIN or kind == OP_AGG_IMAX:
+                                    acc[q] = _iext_words(kind, acc[q], v)
                                 elif kind == OP_AGG_MIN:
                                     acc[q] = min(acc[q], v)
                                 else:
@@ -579,6 +629,8 @@ def pipeline_kernel[RPT: Int, B: Int](
                                     p[0] += v
                                 elif kind == OP_AGG_ISUM:
                                     p[0] = _iadd_value(p[0], v, ovf)
+                                elif kind == OP_AGG_IMIN or kind == OP_AGG_IMAX:
+                                    p[0] = _iext_words(kind, p[0], v)
                                 elif kind == OP_AGG_MIN:
                                     p[0] = min(p[0], v)
                                 else:
@@ -595,6 +647,10 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 elif kind == OP_AGG_ISUM:
                                     var yv = Int64(v)
                                     _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
+                                elif kind == OP_AGG_IMIN:
+                                    _atomic_min_bits(p, _i64_of(v))
+                                elif kind == OP_AGG_IMAX:
+                                    _atomic_max_bits(p, _i64_of(v))
                                 elif kind == OP_AGG_MIN:
                                     _atomic_min_f64(p, v)
                                 else:
@@ -611,6 +667,10 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 elif kind == OP_AGG_ISUM:
                                     var yv = Int64(v)
                                     _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
+                                elif kind == OP_AGG_IMIN:
+                                    _atomic_min_bits(p, _i64_of(v))
+                                elif kind == OP_AGG_IMAX:
+                                    _atomic_max_bits(p, _i64_of(v))
                                 elif kind == OP_AGG_MIN:
                                     _atomic_min_f64(p, v)
                                 else:
@@ -632,6 +692,8 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 p[0] += v
                             elif kind == OP_AGG_ISUM:
                                 p[0] = _iadd_value(p[0], v, ovf)
+                            elif kind == OP_AGG_IMIN or kind == OP_AGG_IMAX:
+                                p[0] = _iext_words(kind, p[0], v)
                             elif kind == OP_AGG_MIN:
                                 p[0] = min(p[0], v)
                             else:
@@ -684,6 +746,12 @@ def pipeline_kernel[RPT: Int, B: Int](
             elif kind == OP_AGG_SUM:
                 if v != 0.0:
                     _atomic_add_f64(out_vals + j, v)
+            elif kind == OP_AGG_IMIN:
+                if _i64_of(v) != Int64.MAX:
+                    _atomic_min_bits(out_vals + j, _i64_of(v))
+            elif kind == OP_AGG_IMAX:
+                if _i64_of(v) != Int64.MIN:
+                    _atomic_max_bits(out_vals + j, _i64_of(v))
             elif kind == OP_AGG_MIN:
                 if v != Float64.MAX:
                     _atomic_min_f64(out_vals + j, v)
