@@ -505,6 +505,7 @@ class _SQLTranslator:
         self._any_star = False
         # aggregate query state (see _build_aggregate)
         self._post = False          # translating an expression above the Aggregate
+        self._order_expr = False    # inside an ORDER BY expression: a FROM column beats a SELECT output name
         self._key_names: dict = {}  # translated group key signature -> output name
         self._out_src: dict = {}    # SELECT output name -> its column in the Aggregate output
         self._sort = None
@@ -579,6 +580,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"{type(node).__name__} (UNION / INTERSECT / EXCEPT) is not supported, only SELECT")
         self._register_ctes(node.args.get("with_"))
         self._resolve_names(node)
+        self._inline_aliases(node, copy=False, order=True)       # WHERE kk > 0, ORDER BY h + 1 (F-117, F-123)
         _fold_const_minmax(node)
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
         self._any_star = any(isinstance(e, sge.Star) or (isinstance(e, sge.Column) and isinstance(e.this, sge.Star))
@@ -1437,25 +1439,42 @@ class _SQLTranslator:
         new.set("order", None)
         return new
 
-    def _unalias_where(self, sel: sge.Select) -> sge.Select:
-        """``sel`` with an inner SELECT alias used in its WHERE replaced by the expression it names (DuckDB lets
-        a WHERE use a SELECT alias; a column of the subquery's FROM with that name wins). The decorrelation
-        rebuilds the SELECT list, which would lose the alias."""
-        where = sel.args.get("where")
+    def _inline_aliases(self, sel: sge.Select, copy: bool = True, order: bool = False) -> sge.Select:
+        """``sel`` with a SELECT alias used in its WHERE (and, with ``order``, inside an ORDER BY expression)
+        replaced by the expression it names. DuckDB reads a bare name as a FROM column when one has that name,
+        else as the SELECT alias; a bare ``ORDER BY alias`` is the output column and stays. An alias of an
+        aggregate or window call is no WHERE condition. ``copy=False`` rewrites ``sel`` itself. Written once,
+        for the query's own clauses and for a correlated subquery, whose decorrelation rebuilds the SELECT list
+        (and would lose the alias)."""
         aliases = {e.alias.lower(): e.this for e in sel.expressions if isinstance(e, sge.Alias)}
-        if where is None or not aliases:
+        if not aliases:
+            return sel
+        targets = []                                   # (the expression to rewrite, whether it is the WHERE)
+        if sel.args.get("where") is not None:
+            targets.append((sel.args["where"], True))
+        if order and sel.args.get("order") is not None:
+            targets += [(o.this, False) for o in sel.args["order"].expressions
+                        if not isinstance(o.this, sge.Column)]       # ORDER BY alias alone: the output column
+
+        def named(root):                               # bare columns spelled like an alias (a subquery has its own scope)
+            return [c for c in root.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
+                    if isinstance(c, sge.Column) and not c.table and c.name.lower() in aliases]
+        if not any(named(root) for root, _ in targets):
             return sel
         inner = {c for _, cs in self._scope_of(sel) for c in cs}
-        hits = [c for c in where.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
-                if isinstance(c, sge.Column) and not c.table and c.name.lower() not in inner
-                and c.name.lower() in aliases]
-        if not hits:
-            return sel
-        sel = sel.copy()
-        for c in [c for c in sel.args["where"].walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
-                  if isinstance(c, sge.Column) and not c.table and c.name.lower() not in inner
-                  and c.name.lower() in aliases]:
-            c.replace(sge.Paren(this=aliases[c.name.lower()].copy()))
+        if not any(c.name.lower() not in inner for root, _ in targets for c in named(root)):
+            return sel                                 # every one is a FROM column, which wins
+        if copy:
+            return self._inline_aliases(sel.copy(), False, order)
+        for root, in_where in targets:
+            for c in named(root):
+                if c.name.lower() in inner:
+                    continue
+                value = aliases[c.name.lower()]
+                if in_where and (_aggs_in(value) or value.find(sge.Window) is not None):
+                    raise ValueError(f"{c.name} is {value.sql(dialect='duckdb')}: aggregate and window functions "
+                                     "are not allowed in WHERE")
+                c.replace(sge.Paren(this=value.copy()))
         return sel
 
     def _select_subqueries(self, plan: LogicalPlan, node: sge.Select) -> LogicalPlan:
@@ -1467,7 +1486,7 @@ class _SQLTranslator:
         for e in node.expressions:
             for n in e.walk(prune=lambda x: isinstance(x, (sge.Subquery, sge.Exists))):
                 if isinstance(n, sge.Subquery) and isinstance(n.this, sge.Select) \
-                        and self._outer_refs(self._unalias_where(n.this), self._scope_of(n.this)):
+                        and self._outer_refs(self._inline_aliases(n.this), self._scope_of(n.this)):
                     found.append(n)
         if not found:
             return plan
@@ -1476,7 +1495,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"a {what} together with GROUP BY or aggregates in the outer query is not "
                                       "supported (compute the aggregate in a subquery first)")
         for sub in found:
-            sel = self._unalias_where(sub.this)
+            sel = self._inline_aliases(sub.this)
             self._check_scalar(sel, what)
             keys, rest = self._correlation(sel, what)
             i = next(self._ids)
@@ -1538,7 +1557,7 @@ class _SQLTranslator:
             for side in (c.this, c.expression):
                 side = _unparen(side)
                 if isinstance(side, sge.Subquery) and isinstance(side.this, sge.Select) \
-                        and self._outer_refs(self._unalias_where(side.this), self._scope_of(side.this)):
+                        and self._outer_refs(self._inline_aliases(side.this), self._scope_of(side.this)):
                     return "scalar", c, False
         return None
 
@@ -1547,7 +1566,7 @@ class _SQLTranslator:
         sel = node.this
         if not isinstance(sel, sge.Select):
             raise NotImplementedError(f"{what} over a {type(sel).__name__} is not supported")
-        sel = self._unalias_where(sel)
+        sel = self._inline_aliases(sel)
         _unsupported_shape(sel, what)
         keys, rest = self._correlation(sel, what)
         if not keys:         # no outer column: there are rows or there are none
@@ -1571,7 +1590,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what}: the left side must be a plain column, got {x.sql(dialect='duckdb')}")
         if len(sel.expressions) != 1:
             raise ValueError(f"{what}: the subquery must return one column, it returns {len(sel.expressions)}")
-        sel = self._unalias_where(sel)
+        sel = self._inline_aliases(sel)
         item = sel.expressions[0]
         if isinstance(item, sge.Star):
             raise NotImplementedError(f"{what}: SELECT * in the subquery is not supported (name the column)")
@@ -1738,7 +1757,8 @@ class _SQLTranslator:
         if name is not None:
             return col(name)
         if isinstance(node, sge.Column):
-            src = None if node.table else self._out_src.get(_ci_find(self._out_src, node.name))
+            src = None if node.table or (self._order_expr and _ci_find(self._scope_columns, node.name)) \
+                else self._out_src.get(_ci_find(self._out_src, node.name))
             if src is None:
                 raise ValueError(f"column {node.sql(dialect='duckdb')} must appear in the GROUP BY clause "
                                  "or inside an aggregate function")
@@ -1863,7 +1883,11 @@ class _SQLTranslator:
                     elif isinstance(ref, sge.Column) and not ref.table and _ci_find(self._out_src, ref.name):
                         by.append(col(self._out_src[_ci_find(self._out_src, ref.name)]))   # a SELECT output name
                     else:
-                        ex = self._expr(ref)
+                        self._order_expr = True
+                        try:
+                            ex = self._expr(ref)
+                        finally:
+                            self._order_expr = False
                         if ex.op != "col":              # Sort takes columns: compute the expression first
                             sig = ex.signature()
                             nm = next((c for c, e in calcs if e.signature() == sig), None)
