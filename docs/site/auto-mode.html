@@ -88,8 +88,9 @@ main, .grid > *, .card, .card-b { min-width: 0; }
   <h3>The rules, and where they live</h3>
   <ol class="sub">
     <li><b>Small inputs skip everything.</b> Under <span data-const="SMALL_QUERY_ROWS" data-fmt="rows">200,000</span> source rows the query goes to the CPU before the calibration is even loaded (loading it initialises CUDA). <code>prefer="gpu"</code> turns this off. <code>auto_mode.choose_device</code>, <code>SMALL_QUERY_ROWS</code>.</li>
+    <li><b>A cold GPU skips pricing too.</b> Under <span data-const="COLD_GPU_SOURCE_ROWS" data-fmt="rows">25,000,000</span> source rows, while the GPU has not started in this process, the query goes to the CPU unpriced: the GPU's start-up alone costs more than the whole query on the native CPU, and pricing it (loading the calibration, sampling keys) would cost about 3 ms of the query's clock. The GPU's start-up is still queued, off the clock, for the queries after this one. <code>prefer="gpu"</code> turns this off. <code>auto_mode.COLD_GPU_SOURCE_ROWS</code>.</li>
     <li><b>No GPU, a CUDA fault, or a shape that failed before</b> means CPU. A GPU error reruns the query on the CPU with one warning per shape; a CUDA fault switches the GPU off for the rest of the process. <code>strict=True</code> raises instead.</li>
-    <li><b>Price both plans.</b> Each operator costs <code>alpha + c·rows</code> (plus a group-count term) on each device, from the calibration. The GPU also pays the copy over the link, the copy back, and whatever is left of its start-up (<span data-const="_DEFAULT_GPU_INIT_MS" data-fmt="plain">400</span> ms by default, until measured). Joins use a measured end-to-end GPU join estimate, padded by <span data-const="JOIN_GPU_SAFETY" data-fmt="plain">1.15</span> because it ran low under load.</li>
+    <li><b>Price both plans.</b> Each operator costs <code>alpha + c·rows</code> on each device, from the calibration. The CPU side is priced as the native executor runs it: a group-by by its group count and a join by its build-side rows, each interpolated between the sizes that were measured. The GPU side is its kernels, plus it pays the copy over the link, the copy back, and whatever is left of its start-up (<span data-const="_DEFAULT_GPU_INIT_MS" data-fmt="plain">400</span> ms by default, until measured). Joins use a measured end-to-end GPU join estimate, padded by <span data-const="JOIN_GPU_SAFETY" data-fmt="plain">1.15</span> because it ran low under load.</li>
     <li><b>The GPU must win by a margin.</b> <span data-const="GPU_WIN_MARGIN" data-fmt="pct">10%</span> by default, so ties go to the CPU (no memory-capacity risk, no start-up). <code>prefer="cpu"</code> raises it to <span data-const="PREFER_CPU_MARGIN" data-fmt="pct">30%</span>; <code>prefer="gpu"</code> lowers it to zero. If the GPU would win but is still starting, the query runs on the CPU and says so.</li>
     <li><b>A CPU plan can still use the GPU.</b> For a fused aggregate (filter, expressions and group-by in one pass) with at least <span data-const="MIN_UPLOAD_BYTES" data-fmt="mib">64 MiB</span> of input, the columns are uploaded in the background. Once they are resident, the rows are split statically: the GPU takes the share that makes both devices finish together, from the calibration's <code>pipeline</code> fits and its fixed per-call cost (<span data-const="DEFAULT_GPU_ALPHA_MS" data-fmt="plain">4.5</span> ms). A share under <span data-const="MIN_SHARE" data-fmt="pct">5%</span> either way is not worth it. The resident cache may use <span data-const="RESIDENT_MEM_FRACTION" data-fmt="pct">50%</span> of free GPU memory, and an upload that fails or does not fit is retried after <span data-const="FAILED_RETRY_S" data-fmt="s">120 s</span>. <code>coproc_fused.py</code>.</li>
   </ol>
@@ -176,6 +177,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
 {
   "constants": {
     "SMALL_QUERY_ROWS": {"file": "auto_mode.py", "value": 200000},
+    "COLD_GPU_SOURCE_ROWS": {"file": "auto_mode.py", "value": 25000000},
     "GPU_WIN_MARGIN": {"file": "auto_mode.py", "value": 0.1},
     "PREFER_CPU_MARGIN": {"file": "auto_mode.py", "value": 0.3},
     "JOIN_GPU_SAFETY": {"file": "auto_mode.py", "value": 1.15},
@@ -189,12 +191,18 @@ main, .grid > *, .card, .card-b { min-width: 0; }
   },
   "fits": {
     "group_encode@cpu": [0.02, 9.0, 0.0],
-    "group_sum@cpu": [0.005, 0.8, 2.5], "group_sum@gpu": [0.05, 0.3, 0.0],
-    "masked_sum@cpu": [0.005, 0.3, 0.0], "masked_sum@gpu": [0.05, 0.02, 0.0],
-    "join@cpu": [0.02, 11.0, 0.0], "join@gpu": [0.05, 0.25, 0.0],
+    "group_sum@gpu": [0.05, 0.3, 0.0],
+    "masked_sum@gpu": [0.05, 0.02, 0.0],
+    "join@gpu": [0.05, 0.25, 0.0],
     "join_host@cpu": [0.01, 1.2, 0.0],
     "sort_topk@cpu": [0.1, 7.0, 0.0], "sort_topk@gpu": [0.1, 2.5, 0.0],
-    "pipeline@cpu": [0.1, 0.9, 0.0], "pipeline@gpu": [0.1, 0.3, 0.0]
+    "pipeline@cpu": [0.1, 0.9, 0.0], "pipeline@gpu": [0.1, 0.3, 0.0],
+    "native_global@cpu": [0.3, 0.34, 0.0],
+    "native_filter@cpu": [0.3, 0.68, 0.0],
+    "native_group@cpu:g8": [0.5, 0.55, 0.0], "native_group@cpu:g1000": [0.5, 0.72, 0.0],
+    "native_group@cpu:g100000": [0.5, 1.0, 0.0], "native_group@cpu:g1000000": [0.5, 9.5, 0.0],
+    "native_join@cpu:g250000": [0.5, 0.95, 0.0], "native_join@cpu:g2000000": [0.5, 1.9, 0.0],
+    "native_join@cpu:g8000000": [0.5, 5.2, 0.0]
   },
   "link": {
     "gbps": {"h2d_pageable": 9.0, "h2d_pinned": 11.0, "d2h_pageable": 7.0, "d2h_pinned": 11.0},
@@ -217,6 +225,19 @@ const fmtRows = (n) => (n >= 1e6 ? +(n / 1e6).toPrecision(3) + "M" : n >= 1e3 ? 
 const fmtBytes = (b) => (b >= 2 ** 30 ? (b / 2 ** 30).toFixed(1) + " GiB" : Math.round(b / 2 ** 20) + " MiB");
 const ms1 = (x) => (x === INF ? "n/a" : x >= 100 ? Math.round(x) + " ms" : x.toFixed(1) + " ms");
 const fit = (name, n, card = 1000) => { const f = R.fits[name]; return f ? f[0] + (f[1] * n) / 1e6 + (f[2] * card) / 1e6 : INF; };
+// calibration.Calibration._predict: a per-size fit ("name:g<size>") is interpolated on log(size) between the two
+// measured sizes of the query's bucket (calibration.BUCKET_EDGES), clamped at the ends
+const BUCKET_EDGES = [64, 1024, 8192];
+const bucket = (c) => BUCKET_EDGES.find((e) => c <= e) ?? INF;
+function sized(name, n, size) {
+  const pts = Object.keys(R.fits).filter((k) => k.startsWith(name + ":g")).map((k) => [+k.slice(name.length + 2), R.fits[k]]);
+  const same = pts.filter((p) => bucket(p[0]) === bucket(size)), use = same.length ? same : pts;
+  const lo = use.filter((p) => p[0] <= size).sort((a, b) => b[0] - a[0])[0], hi = use.filter((p) => p[0] >= size).sort((a, b) => a[0] - b[0])[0];
+  const at = (p) => p[1][0] + (p[1][1] * n) / 1e6 + (p[1][2] * size) / 1e6;
+  if (!lo || !hi || lo[0] === hi[0]) return at(lo || hi);
+  const w = (Math.log(size) - Math.log(lo[0])) / (Math.log(hi[0]) - Math.log(lo[0]));
+  return (1 - w) * at(lo) + w * at(hi);
+}
 const xfer = (bytes, dir) => (bytes <= 0 ? 0 : R.link.latency_ms[dir + "_pageable"] + (bytes / (R.link.gbps[dir + "_pageable"] * 1e9)) * 1e3);
 
 const SHAPES = {
@@ -231,16 +252,16 @@ const GPUS = [["yes", "GPU present"], ["none", "no GPU"], ["disabled", "CUDA fau
 const PREFERS = [["", "(default)"], ["gpu", '"gpu"'], ["cpu", '"cpu"']];
 const S = { shape: "groupby", rows: 6e7, groups: 4, gpu: "yes", prefer: "", gap: 500, which: 1 };
 
-// operator costs for the whole plan on each device: auto_mode.estimate_plan, default fits
+// operator costs for the whole plan on each device: auto_mode.estimate_plan, default fits. The CPU side is the
+// native executor (what device="cpu" runs); the GPU side is its kernels plus the copies.
 function estimate(shape, n, groups) {
-  const L = [];
   if (shape === "groupby") {
     const card = Math.max(1, Math.min(groups, n)), enc = fit("group_encode@cpu", n), nb = n * 12;
-    return { srcRows: n, cpu: enc + fit("group_sum@cpu", n, card), gpu: enc + fit("group_sum@gpu", n, card) + xfer(nb, "h2d") + xfer(card * 8, "d2h"), h2d: nb, card, fused: true };
+    return { srcRows: n, cpu: sized("native_group@cpu", n, card), gpu: enc + fit("group_sum@gpu", n, card) + xfer(nb, "h2d") + xfer(card * 8, "d2h"), h2d: nb, card, fused: true };
   }
   if (shape === "global") {
     const nb = n * 12;
-    return { srcRows: n, cpu: fit("masked_sum@cpu", n), gpu: fit("masked_sum@gpu", n) + xfer(nb, "h2d"), h2d: nb, card: 1, fused: true };
+    return { srcRows: n, cpu: fit("native_filter@cpu", n), gpu: fit("masked_sum@gpu", n) + xfer(nb, "h2d"), h2d: nb, card: 1, fused: true };
   }
   if (shape === "sort") {
     const nb = n * 4;
@@ -248,11 +269,11 @@ function estimate(shape, n, groups) {
   }
   const nl = n, nr = n / 8, nb = (nl + nr) * 8;     // join: the measured GPU join total is not in the defaults, so its sum-of-parts fallback is used
   const gjoin = fit("join@gpu", nl) + fit("join_host@cpu", nl) + xfer(4 * nl, "d2h") + xfer(4 * nl + 4 * nr + 12 * nr, "h2d") + xfer(8 * nl, "d2h");
-  return { srcRows: nl + nr, cpu: fit("join@cpu", nl + nr), gpu: gjoin * K.JOIN_GPU_SAFETY + xfer(nb, "h2d"), h2d: nb, card: 1, fused: false };
+  return { srcRows: nl + nr, cpu: sized("native_join@cpu", nl + nr, nr), gpu: gjoin * K.JOIN_GPU_SAFETY + xfer(nb, "h2d"), h2d: nb, card: 1, fused: false };
 }
 
 // auto_mode.choose_device, rule by rule. init = GPU start-up still to pay (ms).
-function decide(cfg, init) {
+function decide(cfg, init, started) {
   const est = estimate(cfg.shape, cfg.rows, cfg.groups);
   const margin = cfg.prefer === "gpu" ? 0 : cfg.prefer === "cpu" ? K.PREFER_CPU_MARGIN : K.GPU_WIN_MARGIN;
   const steps = [];
@@ -263,7 +284,11 @@ function decide(cfg, init) {
     if (stop) { out = stop; steps.push({ title, why: stop.reason, state: "stop" }); } else steps.push({ title, why, state: "pass" });
   };
   rule(`Fewer than ${fmtN(K.SMALL_QUERY_ROWS)} source rows?`, `${fmtN(est.srcRows)} rows: not small${cfg.prefer === "gpu" ? ' (prefer="gpu" skips this check)' : ""}`,
-    () => (cfg.prefer !== "gpu" && est.srcRows < K.SMALL_QUERY_ROWS ? { device: "cpu", reason: `small input (${fmtN(est.srcRows)} rows): gpu start-up and copies cannot pay off`, est: null } : null));
+    () => (cfg.prefer !== "gpu" && est.srcRows < K.SMALL_QUERY_ROWS ? { device: "cpu", reason: `small input (${fmtN(est.srcRows)} rows): gpu start-up and copies cannot pay off`, est: null, small: true } : null));
+  rule(`Fewer than ${fmtN(K.COLD_GPU_SOURCE_ROWS)} source rows, and the GPU not started?`,
+    est.srcRows >= K.COLD_GPU_SOURCE_ROWS ? `${fmtN(est.srcRows)} rows: big enough that the GPU may pay off` : "the GPU has started in this process",
+    () => (cfg.prefer !== "gpu" && est.srcRows < K.COLD_GPU_SOURCE_ROWS && !started
+      ? { device: "cpu", reason: `gpu not started: its start-up costs more than this query on the cpu (${fmtN(est.srcRows)} source rows)`, est: null, warmLater: true } : null));
   rule("Is there a GPU?", "yes", () => (cfg.gpu === "none" ? { device: "cpu", reason: "no gpu", est, nogpu: true } : null));
   rule("Was the GPU switched off after a CUDA fault?", "no", () => (cfg.gpu === "disabled" ? { device: "cpu", reason: "gpu disabled after error", est, nogpu: true } : null));
   rule("Did this query shape fail on the GPU before?", "no", () => (cfg.gpu === "failed" ? { device: "cpu", reason: "this query shape failed on gpu before", est } : null));
@@ -287,15 +312,15 @@ function simulate(cfg) {
     const s = t;
     let init = ready ? 0 : bgStart !== null && bgStart <= s ? Math.max(0, K._DEFAULT_GPU_INIT_MS - (s - bgStart)) : K._DEFAULT_GPU_INIT_MS;
     if (init === 0) ready = true;
-    const d = decide(cfg, init);
+    const d = decide(cfg, init, ready || (bgStart !== null && bgStart <= s));
     // progress of the background copy: idle time since bgStart
     let progress = 0;
     for (const [a, b] of idle) progress += Math.max(0, b - Math.max(a, bgStart ?? INF));
     const inner = { text: "", resident: false, f: null };
     let dur = d.device === "gpu" ? d.est.gpu + init : d.est.cpu;
-    const gpuOk = cfg.gpu === "yes" && d.calibrated;
+    const gpuOk = cfg.gpu === "yes" && !d.small;      // the small-input rule queues nothing; the cold-GPU rule still queues the warm-up
     if (d.device === "gpu") { ready = true; inner.text = "runs every operator on the GPU; the copy and any start-up are in the time"; }
-    else if (!gpuOk) inner.text = d.calibrated ? "CPU kernels only: no usable GPU" : "CPU kernels only; no GPU work is queued";
+    else if (!gpuOk) inner.text = d.small ? "CPU kernels only; no GPU work is queued" : "CPU kernels only: no usable GPU";
     else if (!d.est.fused) inner.text = "CPU only: only fused aggregates use the GPU next to the CPU";
     else if (bytes < K.MIN_UPLOAD_BYTES) inner.text = `CPU kernel; input under ${Math.round(K.MIN_UPLOAD_BYTES / 2 ** 20)} MiB, so no upload`;
     else if (progress >= uploadMs) {
@@ -306,6 +331,7 @@ function simulate(cfg) {
       inner.text = f === 0 ? "columns are resident, but the GPU's share is too small: CPU kernel" : f === 1 ? "columns are resident: the GPU takes all rows" : `columns are resident: static split, GPU ${Math.round(f * 100)}% of rows, CPU ${Math.round((1 - f) * 100)}%`;
       dur = f === 0 ? d.est.cpu : d.est.cpu * (1 - f) + K.DEFAULT_GPU_ALPHA_MS;
     } else inner.text = bgStart === null ? `CPU kernel; a ${fmtBytes(bytes)} column upload is queued, but it starts only after ${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms with no query` : `CPU kernel; the ${fmtBytes(bytes)} upload is ${Math.round((100 * progress) / uploadMs)}% done`;
+    if (d.warmLater && gpuOk) inner.text += "; the GPU start-up is queued for after this query";
     const e = s + dur;
     if (d.device === "cpu" && gpuOk && bgStart === null && cfg.gap >= K.IDLE_BEFORE_BACKGROUND_S * 1000) bgStart = e + K.IDLE_BEFORE_BACKGROUND_S * 1000;
     q.push({ k, s, e, d, inner, init, progress });
@@ -353,7 +379,7 @@ function laneChart(sim) {
     const wait = svg("rect", { x: X(e1), y: 66, width: Math.max(2, X(sim.bgStart) - X(e1)), height: 20, rx: 2, fill: "none", stroke: c.dim, "stroke-dasharray": "3 2" });
     hover(wait, `the background work waits until no query has run for ${K.IDLE_BEFORE_BACKGROUND_S * 1000} ms`); s.appendChild(wait);
     block(sim.bgStart, sim.bgStart + K._DEFAULT_GPU_INIT_MS, 116, c.dim, `GPU start-up (${K._DEFAULT_GPU_INIT_MS} ms by default)`, "init");
-    if (sim.q[0].d.calibrated && sim.q[0].d.est.fused && sim.bytes >= K.MIN_UPLOAD_BYTES) {
+    if (!sim.q[0].d.small && sim.q[0].d.est.fused && sim.bytes >= K.MIN_UPLOAD_BYTES) {
       let left = sim.uploadMs;
       sim.q.forEach((q, i) => {
         const a = Math.max(q.e, sim.bgStart), b = i < 4 ? sim.q[i + 1].s : total;
@@ -378,7 +404,7 @@ function render() {
   const col = d.device === "gpu" ? "--d-gpu" : "--d-cpu";
   const e = d.est;
   $("verdict").innerHTML = `<div class="big"><i style="background:var(${col})"></i>auto → ${d.device}</div><div class="sub">reason: <span class="mono">${d.reason}</span></div>` +
-    (!d.calibrated ? `<div class="sub">The calibration was never loaded for this query.</div>` :
+    (!d.calibrated ? `<div class="sub">The calibration was never loaded for this query.${d.warmLater && S.gpu === "yes" ? " The GPU's start-up is queued for after it." : ""}</div>` :
       `<div class="cost"><span>estimated CPU plan</span><span>${ms1(e.cpu)}</span><span>estimated GPU plan, copies in</span><span>${ms1(e.gpu)}</span><span>GPU start-up still to pay</span><span>${ms1(q.init)}</span><span>GPU total</span><span>${ms1(e.gpu + q.init)}</span><span>GPU must beat</span><span>${ms1(e.cpu * (1 - d.margin))}</span></div>`);
   $("stage-b").innerHTML = `<b>Then, inside the plan.</b> ${q.inner.text}.`;
   $("session-rows").innerHTML = sim.q.map((x) => `<tr><td class="num">${x.k}</td><td><span class="mono">${x.d.device}</span> · ${x.d.reason}</td><td>${x.inner.text}</td><td class="r num nowrap">${ms1(x.s)}</td></tr>`).join("");
