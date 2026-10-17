@@ -1747,7 +1747,7 @@ class _SQLTranslator:
             inner = e.this
         else:
             inner = e
-        mx = self._expr(inner)
+        mx = self._value(inner)             # a DATE constant that is an output is a date32 (F-115)
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:
@@ -2047,7 +2047,7 @@ class _SQLTranslator:
 
     @staticmethod
     def _no_constants(node, *operands):
-        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) for o in operands):
+        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) or _date_of(o) is not None for o in operands):
             raise NotImplementedError(f"{node.sql(dialect='duckdb')}: a test of constants only has no column to "
                                       "filter or compute on; put a column in it")
 
@@ -2056,6 +2056,8 @@ class _SQLTranslator:
         (they are not elsewhere); the rest as usual."""
         d = _date_of(n)
         if d is not None:
+            if isinstance(_unparen(n), (sge.Add, sge.Sub)):          # DATE +/- INTERVAL is a TIMESTAMP (microseconds)
+                return lit(np.datetime64(d, "us"))
             return lit(d)
         if isinstance(n, (sge.Null, sge.Boolean)):
             return lit(None if isinstance(n, sge.Null) else bool(n.this))

@@ -773,6 +773,8 @@ class CustomOpsCompiler(GraphCompiler):
             if isinstance(val, (int, float)):
                 return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) or isinstance(val, np.float64) else np.float32))
+            if isinstance(val, (str, datetime.date)):          # (no rows: still a string / date32, not null)
+                return _npa([val] * n, type=_npscalar(val).type)
             return _npa([val] * n)
         if op == "mod":
             return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
