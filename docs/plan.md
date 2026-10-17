@@ -1252,4 +1252,4 @@ Needs: none · Found by the F-058 random suite (2026-10-17): SF1 MXFrame / DuckD
 - [x] auto on a fresh process paid ~3 ms to load the calibration and price a small query: below `COLD_GPU_SOURCE_ROWS` (25M source rows; 10 ms per M rows is twice the dearest native price, and the GPU's start-up alone is >= 250 ms) with the GPU not started, auto picks the CPU unpriced and queues the warm-up off the clock (`start_gpu_warmup_if_any`), so later queries can still split (test: no calibration import during the query, warm-up queued once)
 - [x] measured, fresh process, median of 3: seed 1 cpu 48 -> 25-27 ms, auto 25-27; seed 2 cpu 7.9 -> 5.5, auto 5.7 (0.6.0: 26 and 5.8)
 - [x] full suite 23,258 passed
-- [ ] the site's auto explainer (`docs/site/auto-mode.html`) still prices the CPU with the old fits and has no cold-GPU rule: being updated
+- [x] the site's auto explainer prices the CPU with the native fits (per-size interpolation ported from `_predict`), has the cold-GPU rule, and its simulated session queues the warm-up after a cold-rule query; the global shape's GPU side includes the host filter like `estimate_plan`

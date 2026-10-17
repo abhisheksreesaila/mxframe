@@ -192,7 +192,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
   "fits": {
     "group_encode@cpu": [0.02, 9.0, 0.0],
     "group_sum@gpu": [0.05, 0.3, 0.0],
-    "masked_sum@gpu": [0.05, 0.02, 0.0],
+    "filter_take@cpu": [0.02, 4.5, 0.0], "masked_sum@gpu": [0.05, 0.02, 0.0],
     "join@gpu": [0.05, 0.25, 0.0],
     "join_host@cpu": [0.01, 1.2, 0.0],
     "sort_topk@cpu": [0.1, 7.0, 0.0], "sort_topk@gpu": [0.1, 2.5, 0.0],
@@ -261,7 +261,8 @@ function estimate(shape, n, groups) {
   }
   if (shape === "global") {
     const nb = n * 12;
-    return { srcRows: n, cpu: fit("native_filter@cpu", n), gpu: fit("masked_sum@gpu", n) + xfer(nb, "h2d"), h2d: nb, card: 1, fused: true };
+    // the filter runs on the host on the gpu path (estimate_plan's filter line: filter_take@cpu)
+    return { srcRows: n, cpu: fit("native_filter@cpu", n), gpu: fit("filter_take@cpu", n) + fit("masked_sum@gpu", n) + xfer(nb, "h2d"), h2d: nb, card: 1, fused: true };
   }
   if (shape === "sort") {
     const nb = n * 4;
