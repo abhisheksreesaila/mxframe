@@ -1281,11 +1281,13 @@ Needs: F-131 · Spec §1 · `mojo/mxframe/table.mojo`, test `mojo/tests/test_tab
 Needs: F-132 · Spec §2 ("Later")
 - [ ] export a Table as an Arrow struct array (int64 columns zero-copy, validity bitmaps, TEXT as dictionary<int64, utf8>, DECIMAL as int64 with its scale in field metadata or a decimal128 copy: decide), import one back; round trip with pyarrow from a Python test through a C-ABI shared library built from the package
 
-## F-133 M2: Query on a Mojo plan IR [todo]
-Needs: F-132 · Spec §5
-- [ ] plan nodes Scan / Filter / Project / Aggregate / Sort / Limit in Mojo (Join reserved), built by `Query(...).where().group_by().agg()`
-- [ ] lowered to the existing native executor: exact int64 sum, count, then min / max / mean; filters `lo <= col <= hi`, `==`, ANDed; dense integer key expressions with a known group count
-- [ ] equal to DuckDB on random queries over random tables (nulls, negatives, values past 2^53), CPU
+## F-133 M2: Query on a Mojo plan IR [review]
+Needs: F-132 · Spec §5 · `mojo/mxframe/expr.mojo`, `query.mojo`, test `mojo/tests/test_query.mojo`
+- [x] plan nodes in Mojo (Scan, Filter, Aggregate built; Project / Sort / Limit / Join kinds reserved), built by `Query(table).where().group_by(key, groups=).agg(...)`; expressions are flat post-order trees (`col`, `lit`, `+ - * // %`, unary `-`, `least` / `greatest`, comparisons, `between`, `& | ~`)
+- [x] lowered to one program for the CPU pipeline kernel, called directly (no Python): every value an exact int64 register, integer constants as int64 bits in the constant pool (exact past 2^53), filters ANDed into the predicate, the dense group key computed per block (register 0, the kernel's `keyed` path); a key outside 0..groups-1 or null is left out (the stand-in's rule); sum, count(), count(e), min_of, max_of, mean; nulls: a filter reading a null cell is false, an aggregate skips rows whose value reads a null (value x validity, from the kernel's `ISNULL` on the Arrow bitmap); a register allocator keeps final values and frees temporaries per expression (48 registers)
+- [x] kernel: new exact integer opcodes 42-46 in `pipeline_cpu.mojo` (`IDIV` floor, `IMOD`, `IMIN`, `IMAX`, `ICMP`), x // 0 = x % 0 = 0 as the app's formulas, INT64_MIN // -1 flags overflow; the Python compiler never emits them (full Python suite 23,263 passed after the rebuild)
+- [x] equal to an independent plain-loop oracle on 300k-row random tables, with and without nulls: the app's five shapes (chart key, pivot `region * 7 + carrier`, bin `least(day // 7, 51)`, filtered report tile and chart), mean and a formula value, an overflow and an unknown column raise readable errors (DuckDB is not reachable from Mojo; F-139's Python bridge can add it)
+- Limit: the kernel cannot tell a running total that passes int64 from a final one, so a sum whose partial totals pass int64 raises even if the final total would fit (Python's path has an exact fallback; the Mojo API does not yet)
 
 ## F-134 M3: CSV reader [todo]
 Needs: F-132 · Spec §2

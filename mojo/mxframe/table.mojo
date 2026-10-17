@@ -74,6 +74,10 @@ struct Column(Movable):
                 self.validity[i // 8] &= ~(UInt8(1) << UInt8(i % 8))
                 self.nulls += 1
 
+    def validity_address(self) -> Int:
+        """The validity bitmap's address (Arrow layout), 0 when the column has no nulls (for the kernels)."""
+        return Int(self.validity.unsafe_ptr()) if len(self.validity) > 0 else 0
+
     def is_null(self, row: Int) -> Bool:
         if len(self.validity) == 0:
             return False

@@ -53,6 +53,7 @@ struct Expr(Copyable, Movable):
     def __init__(out self, var nodes: List[Node]):
         self.nodes = nodes^
 
+    @implicit
     def __init__(out self, value: Int):
         """An integer literal (so `col("a") + 1` works)."""
         self.nodes = [Node(N_LIT, Int64(value), "")]
