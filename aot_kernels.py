@@ -1367,7 +1367,8 @@ class AOTKernelsGPU:
             if isinstance(col, pa.ChunkedArray):
                 col = _combine(col)
             src_len = len(col)
-            value_buffer = col.buffers()[1]
+            bufs = col.buffers()                      # (a NULL-typed column has no value buffer: take_rows below)
+            value_buffer = bufs[1] if len(bufs) > 1 else None
             buffer_address = value_buffer.address if value_buffer is not None else 0
 
             def cached_source(src_np, target_dtype):
