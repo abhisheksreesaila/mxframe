@@ -1,7 +1,7 @@
 # F-131: the native kernels run from the package, with no Python: an exact int64 SUM and COUNT under a filter,
 # and the overflow flag when a total passes int64.
 from std.memory.alloc import unsafe_alloc
-from mxframe.kernels.pipeline_cpu import pipeline_plain
+from mxframe.kernels.pipeline_cpu import pipeline_plain, E_OVERFLOW
 
 
 def sum_where_ge3(w: Int, v: Int, n: Int) raises -> Tuple[Int, Int64, Int64]:
@@ -41,5 +41,5 @@ def main() raises:
                     ", want sum " + String(want_sum) + " count " + String(want_cnt))
     for i in range(n):
         v[i] = Int64(1 << 62)                                     # the total passes int64
-    if sum_where_ge3(Int(w), Int(v), n)[0] != -21:               # E_OVERFLOW: never a wrapped total
+    if sum_where_ge3(Int(w), Int(v), n)[0] != E_OVERFLOW:         # never a wrapped total
         raise Error("an int64 overflow was not flagged")

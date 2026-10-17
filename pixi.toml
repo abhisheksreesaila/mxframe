@@ -47,6 +47,8 @@ pytest = ">=9.1.1,<10"
 twine = ">=7.0.0,<8"
 patchelf = ">=0.19.2,<0.20"
 pytest-xdist = ">=3.8.0,<4"
+zstd = ">=1.5.7,<2"
+snappy = ">=1.2.2,<2"
 
 [pypi-dependencies]
 polars = ">=1.29, <1.35"

@@ -1258,12 +1258,13 @@ Needs: none · Found by the F-058 random suite (2026-10-17): SF1 MXFrame / DuckD
 ## Mojo API (brief `docs/briefs/mojo-api.md`, spec `docs/mxframe-mojo-api.md`)
 Agreed 2026-10-17. M1-M7 first; M8 (agent CLI, planner + SQL in Mojo) later. Benchmarks paused. Package source in `mojo/mxframe/`.
 
-## F-131 M0: Mojo package spike [review]
+## F-131 M0: Mojo package spike [done]
 Needs: none
 - [x] `scripts/build_mojo_pkg.sh` builds `build/mxframe.mojoc` (Mojo 1.1 packages are `.mojoc`) from `mojo/mxframe/` plus the kernels copied from `kernels_aot/` as `mxframe/kernels/` with package-relative imports. Measured why: a `.mojoc` built with `-I kernels_aot` left the consumer with "unable to locate module 'pipeline_cpu'", and a shared library that re-imports `@export` functions exported 0 symbols, so `kernels_aot/` stays the one source and the Python `.so` builds are untouched
-- [x] a Mojo binary built against the package alone runs the native CPU kernel: exact SUM / COUNT under a filter over 2M int64 values past 2^53 (cancelling, so a float64 sum would drop the +1s), and `E_OVERFLOW` (-21) when the total passes int64; `ldd` shows no libpython (only the Mojo runtime, libc, libstdc++)
+- [x] a Mojo binary built against the package alone runs the native CPU kernel: exact SUM / COUNT under a filter over 2M int64 values past 2^53 (cancelling, so a float64 sum would drop the +1s), and `E_OVERFLOW` (-21) when the total passes int64; no Python: `ldd` shows the Mojo runtime, libc, libm, libstdc++, libgcc_s (and libzstd / libsnappy, which every test links)
 - [x] Parquet codecs: zstd and snappy from the pixi env (pyarrow's), called by `external_call`, 1 MiB round trips (zstd 5 KB, snappy 60 KB compressed); linked with `-lzstd -lsnappy`; to vendor or link statically for iOS later (agreed: small C libraries, replaceable)
 - [x] `pixi run mojo-test` builds and runs `mojo/tests/test_*.mojo` and fails any test binary that links libpython; `mojo/README.md` says how to build, test and link
+- Review: NEEDS WORK, fixed: (1) `ldd` cannot see Mojo's Python interop (it dlopens libpython at run time): the runner also fails a binary with the interop's runtime symbols (`KGEN_CompilerRT_Python*`, `Py_Initialize`); checked on a scratch program that imports `math` through Python (FAIL as it should); (2) the package build logs to `build/pkg-build.log` (`mojo precompile --disable-warnings`; `package` is deprecated) and a failure prints only its `error:` lines; (3) `zstd` and `snappy` declared in `pixi.toml` (they came only through pyarrow); (4) the test imports `E_OVERFLOW`; (5) this list's linkage wording. Open for M6 / M7: build the kernel test on a Mac (the GPU modules import `max.gpu` at the top; a CPU-only package may have to leave them out), and static codecs for iOS
 - Lesson for M1: Mojo frees a value at its last use, so an address taken from a `List` dangled before the kernel ran (the program's magic check failed). The Table and Query API own their buffers; no raw addresses cross the API
 
 ## F-132 M1: Table and columns [todo]

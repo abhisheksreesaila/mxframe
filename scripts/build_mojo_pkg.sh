@@ -17,5 +17,5 @@ for f in "$root"/kernels_aot/*.mojo; do
   m="$(basename "$f" .mojo)"
   sed -i -E "s/^from $m import/from .$m import/" "$stage"/kernels/*.mojo
 done
-mojo package "$stage" -o "$root/build/mxframe.mojoc"
+mojo precompile --disable-warnings "$stage" -o "$root/build/mxframe.mojoc"
 echo "built build/mxframe.mojoc"

@@ -26,7 +26,7 @@ M4 Parquet → M5 edits, formulas, sort → M6 GPU → M7 omxplorer switched ove
 Later (M8, not now): the `mx` command line for agents, then the planner and SQL in Mojo, Python thinned to a binding.
 
 ## Decisions
-- Compression codecs (zstd, snappy, maybe gzip) are small C libraries linked statically, replaceable later.
+- Compression codecs (zstd, snappy, maybe gzip) are small C libraries, replaceable later: linked dynamically from the pixi env now, statically for iOS (M7).
 - The Python API keeps working throughout; nothing on today's path changes until M8.
 - Benchmarks are paused; checks are correctness against DuckDB and omxplorer's own numbers (`scripts/check`).
 - Speed targets from the spec are tracked, not gated: CSV parity with pyarrow, 100M-row GPU sum ~19 ms.
