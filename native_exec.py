@@ -56,8 +56,10 @@ _CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
 _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 K_DICT, K_I32, K_I64, K_STR, K_EXPR, K_F64, K_PF64, K_F32, K_PF32 = 0, 1, 2, 3, 4, 5, 6, 7, 8
 _GROUP_PATHS = {0: "dense", 1: "compact", 2: "hash"}
-_OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4, "isum": 5, "imean": 6}
+_OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4, "isum": 5, "imean": 6, "imin": 7, "imax": 8}
+_INT_OUT = ("count", "isum", "imin", "imax")      # outputs the executor writes as int64 words
 _DT = {pa.int32(): 0, pa.int64(): 1, pa.float32(): 2, pa.float64(): 3}
+DT_I64X = 8      # an int64 column only OP_LOADI reads (F-060c): exact past 2^53, so the executor's float64 range check skips it
 
 _lib = None
 _lock = threading.Lock()
@@ -467,7 +469,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
             continue
         if c.type not in _DT or c.null_count:
             return _decline(f"value column type {c.type} or nulls")
-        dtypes.append(_DT[c.type])
+        dtypes.append(DT_I64X if name in prog.exact_cols and c.type == pa.int64() else _DT[c.type])
     key_cols, kinds = [], []
     for i, k in enumerate(keys):
         if i in derived:                       # placeholder column: the key comes from the program
@@ -599,7 +601,7 @@ def _wrap_result(lib, O, keys, kinds, outputs) -> pa.Table:
         out_cols.append(arr)
     base = 3 + 2 * len(keys)
     for j, (name, op, _) in enumerate(outputs):
-        t = pa.int64() if op in ("count", "isum") else pa.float64()
+        t = pa.int64() if op in _INT_OUT else pa.float64()
         if empty_global and op != "count":
             arr = pa.nulls(1, t)
         else:
@@ -1497,7 +1499,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
 
     n_user = len(plan.aggs)
     hidden = [Expr("min", derived[i]).alias(f"__key{i}") for i in sorted(derived)]
-    prog = compile_pipeline(list(fj.post_preds), list(plan.aggs) + hidden, _VTable(cols, table.num_rows), concat_dicts=True)
+    prog = compile_pipeline(list(fj.post_preds), list(plan.aggs) + hidden, _VTable(cols, table.num_rows), concat_dicts=True,
+                            int_extremes=False)
     if prog is None:
         return _decline("expression not supported by the bytecode compiler")
     if prog.dict_arrays:
@@ -1766,6 +1769,12 @@ def _bounds(e, rng):
     if op == "case_when":
         a, b = _bounds(e.args[1], rng), _bounds(e.args[2], rng)
         return None if a is None or b is None else (min(a[0], b[0]), max(a[1], b[1]))
+    if op == "mod" and len(e.args) == 2 and e.args[1].op == "lit" and isinstance(e.args[1].args[0], int) and e.args[1].args[0]:
+        a = _bounds(e.args[0], rng)                      # the sign follows the dividend, |x % k| < |k|
+        if a is None:
+            return None
+        m = abs(e.args[1].args[0]) - 1
+        return (max(a[0], -m) if a[0] < 0 else 0, min(a[1], m) if a[1] > 0 else 0)
     if op in ("add", "sub", "mul"):
         a, b = _bounds(e.args[0], rng), _bounds(e.args[1], rng)
         if a is None or b is None:
@@ -2097,7 +2106,7 @@ def range_partials(compiler, prog, table: pa.Table, predicates, agg_node, gids, 
     for e, (name, op, slot) in zip(agg_node.aggs, prog.outputs):
         if slot is None or slot in slot_agg:
             continue
-        kind = {"mean": "sum", "isum": "sum", "imean": "sum"}.get(op, op)
+        kind = {"mean": "sum", "isum": "sum", "imean": "sum", "imin": "min", "imax": "max"}.get(op, op)
         slot_agg[slot] = f"__mx_s{slot}"
         aggs.append(Expr(kind, e.args[0]).alias(slot_agg[slot]))
     nan_of = {}                                      # hidden NaN-count slot -> [(aggregate name, op)]
@@ -2125,7 +2134,7 @@ def range_partials(compiler, prog, table: pa.Table, predicates, agg_node, gids, 
         return Partials(vals=vals, cnt=cnt)
     cnt[idx] = c
     for slot, name in slot_agg.items():
-        if prog.slot_kinds[slot] == "isum":
+        if prog.slot_kinds[slot] in ("isum", "imin", "imax"):
             vals[slot].view(np.int64)[idx] = ints(name)
             continue
         v = column(name)

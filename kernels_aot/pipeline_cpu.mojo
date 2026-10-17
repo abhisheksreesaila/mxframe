@@ -77,10 +77,12 @@ comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 # ── opcodes (mirror pipeline_program.py) ───────────────────────────────────
 comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
+comptime OP_LOADI = 3         # the column's values as int64 BITS in the register (read only by OP_AGG_IMIN / IMAX, F-060c)
 comptime OP_ADD = 10
 comptime OP_SUB = 11
 comptime OP_MUL = 12
 comptime OP_DIV = 13
+comptime OP_MOD = 14        # fmod: the sign follows the dividend (integer % a nonzero constant, F-101)
 comptime OP_LT = 20
 comptime OP_LE = 21
 comptime OP_GT = 22
@@ -102,6 +104,8 @@ comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
 comptime OP_AGG_ISUM = 53   # sum of an integer-valued input, accumulated in int64 (F-060); the slot holds int64 bits
+comptime OP_AGG_IMIN = 54   # min / max of an OP_LOADI register, accumulated in int64 (F-060c); the slot holds int64 bits
+comptime OP_AGG_IMAX = 55
 comptime E_OVERFLOW = -21   # an int64 sum passed its range (the caller's checked path answers)
 
 comptime INF = Float64(1.7976931348623157e308) * 10.0
@@ -124,6 +128,32 @@ def _iadd(a: Int64, b: Int64, ovf: LP) -> Int64:
     if ((a ^ s) & (b ^ s)) < 0:
         ovf[0] = 1
     return s
+
+@always_inline
+def _is_iext(kind: Int) -> Bool:
+    return kind == OP_AGG_IMIN or kind == OP_AGG_IMAX
+
+@always_inline
+def _iext(kind: Int, a: Int64, b: Int64) -> Int64:
+    """The integer extreme of two slot words (OP_AGG_IMIN / OP_AGG_IMAX, F-060c)."""
+    return min(a, b) if kind == OP_AGG_IMIN else max(a, b)
+
+def _fill_identity(base: FP, count: Int, kind: Int):
+    """`count` slot words at their aggregate's identity: 0 for sums, +-inf for float extremes, INT64_MAX / INT64_MIN
+    (as bits) for the integer extremes."""
+    if _is_iext(kind):
+        var ib = _ibits(base)
+        var v = Int64.MAX if kind == OP_AGG_IMIN else Int64.MIN
+        for i in range(count):
+            ib[i] = v
+        return
+    var init = 0.0
+    if kind == OP_AGG_MIN:
+        init = INF
+    elif kind == OP_AGG_MAX:
+        init = -INF
+    for i in range(count):
+        base[i] = init
 
 @always_inline
 def _ip(addr: Int) -> IP:
@@ -156,6 +186,26 @@ def _load_gather[T: DType](dst: FP, addr: Int, i0: Int, sel: IP, n: Int):
     var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr) + i0
     for j in range(n):
         dst[j] = src[Int(sel[j])].cast[F64]()
+
+@always_inline
+def _coli_t[T: DType](dst: FP, addr: Int, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    """OP_LOADI: the column's values widened to int64 and stored as that int64's bits (no float64 on the way)."""
+    var d = _ibits(dst)
+    var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr) + i0
+    if use_sel:
+        for j in range(n):
+            d[j] = src[Int(sel[j])].cast[DType.int64]()
+    else:
+        for j in range(n):
+            d[j] = src[j].cast[DType.int64]()
+
+def _load_coli(dst: FP, addr: Int, dtype: Int, i0: Int, sel: IP, use_sel: Bool, n: Int):
+    if dtype == 0:
+        _coli_t[DType.int32](dst, addr, i0, sel, use_sel, n)
+    elif dtype == 4:
+        _coli_t[DType.uint8](dst, addr, i0, sel, use_sel, n)
+    else:                                         # 1: int64, 8: int64 read only here (exact past 2^53)
+        _coli_t[DType.int64](dst, addr, i0, sel, use_sel, n)
 
 def _load_col(dst: FP, addr: Int, dtype: Int, i0: Int, sel: IP, use_sel: Bool, n: Int):
     if use_sel:
@@ -225,6 +275,11 @@ def _bin[OP: Int, NA: Bool](d: FP, a: FP, b: FP, n: Int):
             r = x * y
         elif OP == OP_DIV:
             r = x / y
+        elif OP == OP_MOD:
+            # Mojo's float % is floored (the sign follows the divisor); fmod's follows the dividend: step back
+            # by the divisor when the two signs differ and the remainder is not zero (exact for |x| < 2^53)
+            var m = x % y
+            r = (m.ne(zero) & (x.lt(zero) ^ y.lt(zero))).select(m - y, m)
         elif OP == OP_LT:
             comptime if NA:
                 r = _lt_na(x, y).select(one, zero)
@@ -271,6 +326,8 @@ def _binop(op: Int, d: FP, a: FP, b: FP, n: Int, na: Bool):
         _bin[OP_MUL, False](d, a, b, n)
     elif op == OP_DIV:
         _bin[OP_DIV, False](d, a, b, n)
+    elif op == OP_MOD:
+        _bin[OP_MOD, False](d, a, b, n)
     elif op == OP_LT:
         if na:
             _bin[OP_LT, True](d, a, b, n)
@@ -656,6 +713,9 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
                     d[i] += off
             else:
                 _load_col(d, Int(cols[c]), dt, i0, sel, use_sel, n)
+        elif op == OP_LOADI:
+            var c = Int(ins[2])
+            _load_coli(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n)
         elif op == OP_LOAD_CONST:
             var v = SIMD[F64, W](p.consts[Int(ins[2])])
             var i = 0
@@ -736,6 +796,21 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                     iacc[0] = _iadd(iacc[0], Int64(r[k]), p.ovf)
                     k += 1
                 continue
+            if _is_iext(kind):
+                # F-060c: the extreme of int64 values (the register holds their bits), in SIMD lanes
+                var xacc = _ibits(acc)
+                var xr = _ibits(r)
+                var xv = xacc.load[width=W]()
+                var k = 0
+                while k + W <= n:
+                    var x = xr.load[width=W](k)
+                    xv = min(xv, x) if kind == OP_AGG_IMIN else max(xv, x)
+                    k += W
+                xacc.store(xv)
+                while k < n:
+                    xacc[0] = _iext(kind, xacc[0], xr[k])
+                    k += 1
+                continue
             var accv = acc.load[width=W]()
             var j = 0
             while j + W <= n:
@@ -780,6 +855,14 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 if g >= 0 and g < G:
                     var q = ib + (g * NL + (j & lm))
                     q[0] = _iadd(q[0], Int64(r[j]), p.ovf)
+        elif _is_iext(kind):
+            var xb = _ibits(base)
+            var xr = _ibits(r)
+            for j in range(n):
+                var g = Int(gp[j])
+                if g >= 0 and g < G:
+                    var q = xb + (g * NL + (j & lm))
+                    q[0] = _iext(kind, q[0], xr[j])
         elif kind == OP_AGG_MIN:
             for j in range(n):
                 var g = Int(gp[j])
@@ -824,14 +907,7 @@ def _init_values(p: Prog, pv: FP):
     var n = p.n_groups * p.nl
     for a in range(p.n_aggs):
         var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
-        var init = 0.0
-        if kind == OP_AGG_MIN:
-            init = INF
-        elif kind == OP_AGG_MAX:
-            init = -INF
-        var base = pv + a * n
-        for i in range(n):
-            base[i] = init
+        _fill_identity(pv + a * n, n, kind)
 
 
 comptime SC = 4096          # per-worker cache of groups in front of the shared output (power of 2)
@@ -855,6 +931,10 @@ def _flush_slot(p: Prog, cv: FP, cl: LP, s: Int):
             var xi = _ibits(cv + (a * SC + s))[0]
             var old = Atomic[Scalar[DType.int64]].fetch_add(_ibits(ov + a * G + g), xi)
             _ = _iadd(old, xi, p.ovf)
+        elif kind == OP_AGG_IMIN:
+            _ = Atomic[Scalar[DType.int64]].min(_ibits(ov + a * G + g), _ibits(cv + (a * SC + s))[0])
+        elif kind == OP_AGG_IMAX:
+            _ = Atomic[Scalar[DType.int64]].max(_ibits(ov + a * G + g), _ibits(cv + (a * SC + s))[0])
         elif kind == OP_AGG_MIN:
             _ = Atomic[Scalar[DType.float64]].min(ov + a * G + g, x)
         else:
@@ -896,6 +976,10 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
                     var xi = Int64(x)
                     var old = Atomic[Scalar[DType.int64]].fetch_add(_ibits(ov + a * G + g), xi)
                     _ = _iadd(old, xi, p.ovf)
+                elif kind == OP_AGG_IMIN:
+                    _ = Atomic[Scalar[DType.int64]].min(_ibits(ov + a * G + g), _ibits(regs + Int(ins[2]) * VEC)[j])
+                elif kind == OP_AGG_IMAX:
+                    _ = Atomic[Scalar[DType.int64]].max(_ibits(ov + a * G + g), _ibits(regs + Int(ins[2]) * VEC)[j])
                 elif kind == OP_AGG_MIN:
                     _ = Atomic[Scalar[DType.float64]].min(ov + a * G + g, x)
                 else:
@@ -916,6 +1000,8 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
                 var x0 = regs[Int(ins[2]) * VEC + j]
                 if Int(ins[0]) == OP_AGG_ISUM:
                     _ibits(cv + (a * SC + s))[0] = Int64(x0)
+                elif _is_iext(Int(ins[0])):
+                    _ibits(cv + (a * SC + s))[0] = _ibits(regs + Int(ins[2]) * VEC)[j]
                 else:
                     cv[a * SC + s] = x0
             continue
@@ -931,6 +1017,9 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
             elif kind == OP_AGG_ISUM:
                 var iq = _ibits(q)
                 iq[0] = _iadd(iq[0], Int64(x), p.ovf)
+            elif _is_iext(kind):
+                var iq = _ibits(q)
+                iq[0] = _iext(kind, iq[0], _ibits(regs + Int(ins[2]) * VEC)[j])
             elif kind == OP_AGG_MIN:
                 q[0] = min(q[0], x)
             else:
@@ -945,14 +1034,7 @@ def _init_partials(p: Prog, pv: FP, pc: LP):
     var NL = p.nl
     for a in range(p.n_aggs):
         var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
-        var init = 0.0
-        if kind == OP_AGG_MIN:
-            init = INF
-        elif kind == OP_AGG_MAX:
-            init = -INF
-        var base = pv + a * G * NL
-        for i in range(G * NL):
-            base[i] = init
+        _fill_identity(pv + a * G * NL, G * NL, kind)
     for i in range(G * NL):
         pc[i] = 0
 
@@ -1110,13 +1192,7 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     # identities for the output
     for a in range(A):
         var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
-        var init = 0.0
-        if kind == OP_AGG_MIN:
-            init = INF
-        elif kind == OP_AGG_MAX:
-            init = -INF
-        for g in range(G):
-            out_vals[a * G + g] = init
+        _fill_identity(out_vals + a * G, G, kind)
     for g in range(G):
         out_cnt[g] = 0
     var total = end - start
@@ -1237,6 +1313,16 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                             for l in range(NL):
                                 iacc = _iadd(iacc, iq[l], p.ovf)
                         iout[a * G + g] = iacc
+                    continue
+                if _is_iext(kind):
+                    var xout = _ibits(out_vals)
+                    for g in range(g0, g1):
+                        var xacc = xout[a * G + g]
+                        for t in range(nthreads):
+                            var xq = _ibits(pv_all + t * pv_stride + (a * G + g) * NL)
+                            for l in range(NL):
+                                xacc = _iext(kind, xacc, xq[l])
+                        xout[a * G + g] = xacc
                     continue
                 for g in range(g0, g1):
                     var acc = out_vals[a * G + g]
@@ -1415,6 +1501,12 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                             for r in range(r0, r1):
                                 var at = Int(gids[r]) - g0
                                 isb[at] = _iadd(isb[at], Int64(q[r]), p.ovf)
+                        elif _is_iext(kind):
+                            var xo = _ibits(o)
+                            var xq = _ibits(q)
+                            for r in range(r0, r1):
+                                var t = xo + (Int(gids[r]) - g0)
+                                t[0] = _iext(kind, t[0], xq[r])
                         elif kind == OP_AGG_MIN:
                             for r in range(r0, r1):
                                 var t = o + (Int(gids[r]) - g0)
@@ -1520,6 +1612,15 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                         for l in range(1, NL):
                             xi = _iadd(xi, iq[g * NL + l], p.ovf)
                         io[g] = _iadd(io[g], xi, p.ovf)
+                    continue
+                if _is_iext(kind):
+                    var xq = _ibits(q)
+                    var xo = _ibits(o)
+                    for g in range(g0, g1):
+                        var xi = xq[g * NL]
+                        for l in range(1, NL):
+                            xi = _iext(kind, xi, xq[g * NL + l])
+                        xo[g] = _iext(kind, xo[g], xi)
                     continue
                 for g in range(g0, g1):
                     var x = q[g * NL]
