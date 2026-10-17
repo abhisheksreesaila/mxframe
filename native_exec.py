@@ -432,6 +432,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         key_slot[i] = slot
     outputs = prog.outputs[:n_user]
     names = [name for name, _, _ in outputs]
+    outputs, imeans = _exact_imeans(outputs)
     ranges, force_hash = {}, False
     if derived:
         # an integer expression key (TPC-H's order year): its range from one native min / max pass,
@@ -457,6 +458,8 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
     having = _having_terms(having_pred, names)
     if having is None:
         return _decline("HAVING other than AND-ed aggregate <op> number")
+    if imeans and _imean_ordered(names, imeans, sorts, having):
+        return _decline("ORDER BY / HAVING over an integer mean")
     if prog.dict_arrays:
         return _decline("string predicates outside concat mode")
     ex = _Extras(prog)                                # string columns in predicates
@@ -563,7 +566,7 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
     if rc < 0:
         return _decline(f"executor declined (code {rc})")
 
-    result = _wrap_result(lib, O, keys, kinds, outputs)
+    result = _finish_imeans(_wrap_result(lib, O, keys, kinds, outputs), imeans)
     total_ms = (_time.perf_counter() - t_start) * 1000
     _last.update(path="native", decline=None, native_ms=native_ms, py_ms=total_ms - native_ms)
     compiler.last_compile_provenance = {
@@ -571,6 +574,37 @@ def try_execute(compiler, plan, having_pred, post_ops, gpu_fallback: bool = Fals
         "cache_hit": None, "compile_ms": 0.0, "path": "native", "gpu_input_path": "arrow_c_data",
     }
     return result
+
+
+def _exact_imeans(outputs):
+    """F-126: the executor divides an integer mean's int64 total in its own lanes, which rounds a total past 2^53
+    twice (DuckDB divides its exact HUGEINT total once). Ask it for the total (`isum`) and a count instead, and
+    divide in `_finish_imeans`: (outputs to run, names of the integer means)."""
+    run, extra, names = [], [], []
+    for name, op, slot in outputs:
+        if op == "imean":
+            run.append((name, "isum", slot))
+            extra.append((f"__imean_n{len(names)}", "count", None))
+            names.append(name)
+        else:
+            run.append((name, op, slot))
+    return run + extra, names
+
+
+def _imean_ordered(names, imeans, sorts, having) -> bool:
+    """True when an ORDER BY or HAVING term reads an integer mean (the executor would see its total, not the mean)."""
+    idx = {names.index(n) for n in imeans}
+    return any(w == 1 and i in idx for w, i, _ in sorts) or any(t[0] in idx for t in having)
+
+
+def _finish_imeans(result: pa.Table, imeans) -> pa.Table:
+    if not imeans:
+        return result
+    from .np_arrow import int_mean_column
+    cols = {n: result.column(n) for n in result.column_names}
+    for k, name in enumerate(imeans):
+        cols[name] = int_mean_column(cols[name], cols.pop(f"__imean_n{k}"))
+    return pa.table(list(cols.values()), names=list(cols))
 
 
 def _wrap_result(lib, O, keys, kinds, outputs) -> pa.Table:
@@ -1518,6 +1552,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         key_slot[i] = slot
     outputs = prog.outputs[:n_user]
     names = [name for name, _, _ in outputs]
+    outputs, imeans = _exact_imeans(outputs)
     ranges = dict(known)
     for i in pf64:
         ranges[i] = (0, 0)
@@ -1564,6 +1599,8 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     having = _having_terms(having_pred, names)
     if having is None:
         return _decline("HAVING other than AND-ed aggregate <op> number")
+    if imeans and _imean_ordered(names, imeans, sorts, having):
+        return _decline("ORDER BY / HAVING over an integer mean")
 
     # ── the program's columns: fact columns (read from the chunks), partner columns (gathered per block) ──
     dcols = [c for c in prog.columns if c in prog.dict_concat]
@@ -1714,7 +1751,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     if rc < 0:
         return _decline(f"executor declined (code {rc})")
 
-    result = _wrap_result(lib, O, keys, kinds, outputs)
+    result = _finish_imeans(_wrap_result(lib, O, keys, kinds, outputs), imeans)
     for i, how in post.items() if not raw_keys else ():      # expression keys back to the column's own values
         c = result.column(i)
         result = result.set_column(i, keys[i], pc.take(how, c) if isinstance(how, pa.Array) else pc.cast(c, how))

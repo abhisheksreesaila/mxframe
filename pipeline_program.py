@@ -811,7 +811,8 @@ class _Builder:
     def _mod(self, e: Expr):
         """``int % k`` for a nonzero integer constant ``k`` (DuckDB: the sign follows the dividend, i.e. fmod; exact in
         float64 because the dividend is bound within 2^53). A column or zero divisor could give NULL, a float
-        or decimal operand has Arrow's semantics: those decline to Arrow (F-101)."""
+        or decimal operand has Arrow's semantics: those decline to Arrow (F-101), and so does ``-1``, whose
+        INT_MIN % -1 is an overflow only a checked operation can see (F-126)."""
         if len(e.args) > 2:
             raise Unsupported("decimal modulo")
         a = self._need(e.args[0], "num")
@@ -822,6 +823,8 @@ class _Builder:
             raise Unsupported("modulo by a column or by zero (NULL) stays on Arrow")
         if isinstance(a, _Const):
             return _Const(math.fmod(a.value, b.value), "int")
+        if b.value == -1:                               # INT_MIN % -1 overflows (DuckDB raises): Arrow's checked modulo answers
+            raise Unsupported("modulo by -1 stays on Arrow (overflow check)")
         k = abs(int(b.value))
         return _Val(self.emit(OP_MOD, a.vreg, self.as_reg(b)), "int", ("mod", self.bound_of(a), k))
 
@@ -1531,9 +1534,8 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
             continue
         if op == "imean":
             c = cnt[present]
-            v = partials.ints(slot)[present].astype(np.float64)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                v = np.where(c > 0, v / np.maximum(c, 1), 0.0)
+            from .np_arrow import int_mean_of_totals            # F-126: rounded once, like DuckDB's HUGEINT total / count
+            v = int_mean_of_totals(partials.ints(slot)[present], c)
             if not grouped and cnt[0] == 0:
                 v = np.ma.masked_all(v.shape, dtype=v.dtype)
             cols[name] = v
