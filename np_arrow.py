@@ -400,10 +400,9 @@ def _sum_overflow():
                          "(DuckDB widens it to a 128-bit HUGEINT)")
 
 
-def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
-    """Exact int64 per-group sum (np.bincount adds in float64, which loses digits past 2^53): the values
-    are cut into three 21-bit limbs, each limb's sums are exact in float64, then recombined in int64.
-    A group whose total does not fit int64 raises OverflowError instead of wrapping."""
+def _int_group_limbs(a, valid, g, n_groups):
+    """Exact per-group sums of an integer Array as three 21-bit limb sums (total = s2 * 2^42 + s1 * 2^21 + s0):
+    np.bincount adds in float64, which loses digits past 2^53, but each limb's sum is exact there."""
     if a.type != pa.int64():
         a = pc.cast(a, pa.int64())
     v = np.frombuffer(a.buffers()[1], dtype=np.int64, count=a.offset + len(a))[a.offset:][valid]
@@ -411,11 +410,99 @@ def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
     s0 = np.bincount(g, weights=(v & mask), minlength=n_groups)
     s1 = np.bincount(g, weights=((v >> 21) & mask), minlength=n_groups)
     s2 = np.bincount(g, weights=(v >> 42), minlength=n_groups)
+    return s0, s1, s2
+
+
+def _limb_total(s0, s1, s2, i) -> int:
+    return (int(s2[i]) << 42) + (int(s1[i]) << 21) + int(s0[i])
+
+
+def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
+    """Exact int64 per-group sum: the limb sums are recombined in int64. A group whose total does not
+    fit int64 raises OverflowError instead of wrapping."""
+    s0, s1, s2 = _int_group_limbs(a, valid, g, n_groups)
     # float64 estimate of the total: only groups near or past the int64 limits are rechecked exactly
     for i in np.flatnonzero(np.abs(s2 * 2.0 ** 42 + s1 * 2.0 ** 21 + s0) > 2.0 ** 62):
-        if not _INT64_MIN <= (int(s2[i]) << 42) + (int(s1[i]) << 21) + int(s0[i]) <= _INT64_MAX:
+        if not _INT64_MIN <= _limb_total(s0, s1, s2, i) <= _INT64_MAX:
             raise _sum_overflow()
     return (s2.astype(np.int64) << 42) + (s1.astype(np.int64) << 21) + s0.astype(np.int64)
+
+
+# DuckDB divides in an x87 80-bit long double. Where numpy's longdouble is only a double (macOS ARM, Windows) the
+# imitation cannot be built (upper * 2^64 + lower cancels), so the correctly rounded quotient is used: the
+# nearest thing to what DuckDB's own hardware gives. Tests flip this flag to run that path on x86-64.
+_X87 = np.finfo(np.longdouble).nmant >= 63
+
+
+def _ld_div(total: int, n: int) -> float:
+    """DuckDB's ``avg`` of an integer: the HUGEINT total, taken as a 64-bit-mantissa ``long double`` (upper * 2^64 +
+    lower, one rounding), divided by the count in ``long double`` and rounded to a double (F-126: probed, it is not
+    the correctly rounded total / n: 19 of 19 differing cases agree with this and with no other formula). Without
+    an x87 long double: Python's exact integer division, one rounding."""
+    if not _X87:
+        return total / n
+    L = np.longdouble
+    return float((L(total >> 64) * L(2.0 ** 64) + L(total & ((1 << 64) - 1))) / L(n))
+
+
+def _int_group_mean(a, valid, g, n_groups, cnt) -> np.ndarray:
+    """Per-group mean of an integer Array as DuckDB computes it (F-126): the total is exact in a wider integer
+    (it may pass int64: a mean never raises), then divided as `_ld_div` does."""
+    s0, s1, s2 = _int_group_limbs(a, valid, g, n_groups)
+    est = np.abs(s2 * 2.0 ** 42 + s1 * 2.0 ** 21 + s0)
+    tot = (s2.astype(np.int64) << 42) + (s1.astype(np.int64) << 21) + s0.astype(np.int64)     # wraps only where est is huge
+    res = int_mean_of_totals(tot, cnt)
+    for i in np.flatnonzero((est > 2.0 ** 62) & (cnt > 0)):          # a total that may not fit int64
+        res[i] = _ld_div(_limb_total(s0, s1, s2, i), int(cnt[i]))
+    return res
+
+
+def int_mean_of_totals(tot: np.ndarray, cnt: np.ndarray) -> np.ndarray:
+    """Means from exact int64 totals and counts, divided as DuckDB does (`_ld_div`). A count of 0 gives 0.0
+    (callers mask it)."""
+    safe = np.maximum(cnt, 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if _X87:
+            res = (tot.astype(np.longdouble) / safe.astype(np.longdouble)).astype(np.float64)
+        else:                                          # a total within 2^53 is exact as a double: one rounding
+            res = tot.astype(np.float64) / safe
+            for i in np.flatnonzero((tot > (1 << 53)) | (tot < -(1 << 53))):
+                res[i] = int(tot[i]) / int(safe[i])
+    return np.where(cnt > 0, res, 0.0)
+
+
+def int_mean_of_halves(lo: np.ndarray, hi: np.ndarray, cnt: np.ndarray) -> np.ndarray:
+    """`int_mean_of_totals` for totals kept as ``hi * 2^32 + lo`` (a total that may pass int64: streamed batches)."""
+    big = (hi > (1 << 29)) | (hi < -(1 << 29)) | (lo > (1 << 61)) | (lo < -(1 << 61))   # else the int64 total is exact
+    res = int_mean_of_totals(np.where(big, 0, hi << 32) + np.where(big, 0, lo), cnt)
+    for i in np.flatnonzero(big & (cnt > 0)):
+        res[i] = _ld_div((int(hi[i]) << 32) + int(lo[i]), int(cnt[i]))
+    return res
+
+
+def int_mean_column(tot, cnt) -> pa.Array:
+    """A float64 mean Array from an int64 total column and a count column (a NULL total, an empty global
+    aggregate, stays NULL)."""
+    tot, cnt = combine(tot), combine(cnt)
+    if tot.null_count:
+        return pa.nulls(len(tot), pa.float64())
+    return array(int_mean_of_totals(to_numpy(tot), to_numpy(cnt)))
+
+
+def int_total(a):
+    """The exact total of an integer Array as a Python int, whatever its size (None when no value is valid)."""
+    n = len(a) - a.null_count
+    if n == 0:
+        return None
+    valid = to_numpy(pc.is_valid(a)).astype(bool) if a.null_count else np.ones(len(a), bool)
+    s0, s1, s2 = _int_group_limbs(a, valid, np.zeros(int(valid.sum()), np.intp), 1)
+    return _limb_total(s0, s1, s2, 0)
+
+
+def int_mean(a):
+    """DuckDB's ``avg`` of an integer Array as a Python float (None when no value is valid); never an overflow."""
+    tot = int_total(a)
+    return None if tot is None else _ld_div(tot, len(a) - a.null_count)
 
 
 def int_sum(a):
@@ -468,7 +555,7 @@ def modulo(lhs, rhs, decimal=False):
         return to_numpy(pc.fill_null(a, scalar(0, type=a.type))), valid, a.type, False
     (a, av, at, a_sc), (b, bv, bt, b_sc) = parts(lhs), parts(rhs)
     valid = av & bv
-    n = max(len(a), len(b))
+    n = max(len(a) if not a_sc else 0, len(b) if not b_sc else 0) if not (a_sc and b_sc) else 1       # an empty array and a scalar: no rows
     lit_a = decimal and a_sc and a.dtype.kind == "f" and b.dtype.kind in "iu" and bool(np.isfinite(a[0]))
     lit_b = decimal and b_sc and b.dtype.kind == "f" and a.dtype.kind in "iu" and bool(np.isfinite(b[0]))
     if lit_a or lit_b:       # an integer array against a decimal literal k/s (2.5 = 25/10): DuckDB is exact
@@ -520,11 +607,13 @@ def modulo(lhs, rhs, decimal=False):
                     raise OverflowError("Overflow in modulo of UINT64 and a signed integer")
         else:
             a, b = a.astype(np.int64), np.where(valid, b, 1).astype(np.int64)
-            if np.any(valid & (a == np.iinfo(np.int64).min) & (b == -1)):
-                raise OverflowError("Overflow in division of INT64")
-            res = np.fmod(a, b)
             same_sign = bool(arrays) and (all(signed) or not any(signed))
             out_t = max(arrays, key=lambda t: t.bit_width) if same_sign else pa.int64()
+            # the minimum of the result's type % -1 overflows (DuckDB: INT32_MIN % -1 raises, INT32_MIN % BIGINT -1 is 0) (F-126)
+            low = np.iinfo(f"int{out_t.bit_width}").min if pa.types.is_signed_integer(out_t) else None
+            if low is not None and np.any(valid & (a == low) & (b == -1)):
+                raise OverflowError(f"Overflow in division of {low} / -1")
+            res = np.fmod(a, b)
     return array(np.ma.array(np.broadcast_to(res, (n,)).copy(), mask=~np.broadcast_to(valid, (n,))), type=out_t)
 
 
@@ -575,10 +664,8 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
             out.append(array(np.ma.array(_int_group_sum(a, valid, g, n_groups), mask=cnt == 0), type=pa.int64()))
             continue
         if op == "mean" and pa.types.is_integer(a.type):
-            # F-060: the integers are added exactly (int64, OverflowError past it), then divided: float64 sums lose digits
-            tot = _int_group_sum(a, valid, g, n_groups)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                res = tot.astype(np.float64) / cnt
+            # F-060 / F-126: the integers are added exactly (wider than int64: a mean never raises), then divided once
+            res = _int_group_mean(a, valid, g, n_groups, cnt)
             out.append(array(np.ma.array(res, mask=cnt == 0), type=pa.float64()))
             continue
         if op in ("min", "max") and (pa.types.is_integer(a.type) or pa.types.is_date(a.type) or pa.types.is_timestamp(a.type)):

@@ -12,7 +12,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 from .np_arrow import is_in as _is_in
-from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, float_extreme
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, int_mean as _int_mean, float_extreme
 from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_values
 import numpy as np
 import os as _os
@@ -2103,9 +2103,8 @@ class CustomOpsCompiler(GraphCompiler):
                 if e.op in ("min", "max"):
                     cols.append(_npa([float_extreme(arr, e.op)], type=pa.float64()))
                     continue
-                if e.op == "mean" and pa.types.is_integer(arr.type):       # F-060: added exactly in int64, then divided
-                    tot, n = _int_sum(arr), len(arr) - arr.null_count
-                    cols.append(_npa([None if tot is None else float(tot) / n], type=pa.float64()))
+                if e.op == "mean" and pa.types.is_integer(arr.type):       # F-060 / F-126: added exactly (wider than int64), divided once
+                    cols.append(_npa([_int_mean(arr)], type=pa.float64()))
                     continue
                 v = {"sum": pc.sum, "mean": pc.mean}[e.op](arr)
                 cols.append(_npa([v.as_py()], type=pa.float64()))
@@ -2271,8 +2270,10 @@ class CustomOpsCompiler(GraphCompiler):
 
     @classmethod
     def _exact_counts(cls, plan, result: pa.Table) -> pa.Table:
-        """Cast the columns of ``count`` aggregates to int64, and of integer MIN / MAX to the column's integer type
-        (the kernels return float32/float64; values past 2^53 take the exact Arrow route before this)."""
+        """Cast the columns of ``count`` aggregates to int64 (the older float kernels still return a rounded double),
+        and of integer MIN / MAX to the column's own integer type: the bytecode kernels return those as int64 since
+        F-060c (exact at any size), narrowed here to int32 / int16 / uint8 ...; the older float kernels' doubles are
+        cast too, and a fraction raises."""
         node = plan
         while isinstance(node, (Filter, Sort, Limit, Distinct, Tail)):
             node = node.input

@@ -29,7 +29,7 @@ import pyarrow as pa
 from . import gpu_budget
 from ._lazy_pc import pc
 from .gpu_budget import fmt_bytes
-from .lazy_expr import Expr, col
+from .lazy_expr import Expr, col, lit
 from .lazy_frame import (Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
                          Scan, Sort, Tail)
 from . import np_arrow
@@ -46,6 +46,8 @@ MIN_SLICE_ROWS = 1024        # a slice of an oversized row group is never smalle
 
 _active: contextvars.ContextVar = contextvars.ContextVar("mxframe_streamed_active", default=False)
 _out: contextvars.ContextVar = contextvars.ContextVar("mxframe_sink_out", default=None)     # F-113: the file a sink writes
+_wide: contextvars.ContextVar = contextvars.ContextVar("mxframe_wide_means", default=False)  # F-126: integer means in two int64 sums
+_HALF = 1 << 32
 _AGGS = ("sum", "mean", "count", "min", "max")
 _WINDOW = ("window", "rank", "dense_rank", "lag", "lead", "cum_sum", "row_number")
 
@@ -223,6 +225,27 @@ def _argument_types(spec: _Spec) -> None:
             spec.types[hidden[0]] = zero.field(name).type if zero is not None and name in zero.names else t
         if kind in ("count", "mean"):
             spec.types[hidden[-1]] = pa.int64()
+        if kind == "mean" and spec.types[hidden[0]] == pa.int64() and _wide.get():
+            _widen_mean(spec, i, e=agg.aggs[i], hidden=hidden)
+
+
+def _widen_mean(spec: _Spec, i: int, e, hidden) -> None:
+    """F-126: the mean of an integer whose total passed int64 in a batch or in the merge (the plain run raised and was
+    started again with this on). The hidden sum becomes two: the sum of ``x % 2^32`` and the sum of ``(x - x % 2^32) /
+    2^32``, each far from int64 (|part| < 2^32 and <= 2^31, so about 2^31 rows add up); the total ``hi * 2^32 + lo``
+    is put together as a Python integer in `_State.format`."""
+    x = e.args[0]
+    lo = x % lit(_HALF)
+    hi = ((x - lo) / lit(_HALF)).cast("int64")
+    s, c = hidden
+    h = f"{s[:-1]}h"
+    aggs = spec.partial.aggs
+    at = next(j for j, a in enumerate(aggs) if a._alias == s)
+    aggs[at] = Expr("sum", lo).alias(s)
+    aggs.insert(at + 1, Expr("sum", hi).alias(h))
+    spec.merge_ops.insert(at + 1, (h, "sum"))
+    spec.types[h] = pa.int64()
+    spec.finals[i] = ("imean", (s, h, c), spec.finals[i][2])
 
 
 @dataclasses.dataclass
@@ -515,7 +538,11 @@ class _State:
         """The original aggregate's output from merged hidden columns."""
         arrays, names = [t.column(k) for k in self.spec.key_names], list(self.spec.key_names)
         for kind, hidden, name in self.spec.finals:
-            if kind == "mean":
+            if kind == "imean":                               # F-126: hi * 2^32 + lo, divided once
+                arr = _wide_mean(t, hidden)
+            elif kind == "mean" and pa.types.is_integer(t.column(hidden[0]).type):     # an exact int64 total: no cast to a double
+                arr = _wide_mean(t, (hidden[0], None, hidden[1]))
+            elif kind == "mean":
                 s, c = t.column(hidden[0]), t.column(hidden[1])
                 arr = pc.if_else(pc.greater(c, 0), pc.divide(pc.cast(s, pa.float64()), pc.cast(c, pa.float64())),
                                  pa.scalar(None, pa.float64()))
@@ -524,6 +551,20 @@ class _State:
             arrays.append(arr)
             names.append(name)
         return pa.table(arrays, names=names)
+
+
+def _wide_mean(t: pa.Table, hidden) -> pa.Array:
+    """The mean column of merged hidden columns (sum of the low halves, sum of the high halves or None, count): NULL
+    for a group with no valid value, the total divided once like DuckDB's HUGEINT."""
+    import numpy as np
+    from .np_arrow import combine, scalar, to_numpy, array, int_mean_of_totals, int_mean_of_halves
+    zero = scalar(0, type=pa.int64())
+
+    def ints(name):
+        return to_numpy(pc.fill_null(combine(t.column(name)), zero))
+    lo, c = ints(hidden[0]), ints(hidden[2])
+    res = int_mean_of_totals(lo, c) if hidden[1] is None else int_mean_of_halves(lo, ints(hidden[1]), c)
+    return array(np.ma.array(res, mask=c == 0), type=pa.float64())
 
 
 # --- F-113: writing a result bigger than memory -------------------------------------------------------------------
@@ -605,6 +646,14 @@ class ParquetOut:
         self.writer = None
         os.replace(self.tmp, self.path)
         return self.rows
+
+    def reset(self) -> None:
+        """Forget everything written so far (F-126: a streamed run that raised is started again from its first batch):
+        the partial file is removed and the next write opens a fresh one."""
+        self.abort()
+        self.tmp, self.schema, self.empty = None, None, None
+        self.buffer, self.buffered, self.rows = [], 0, 0
+        self.streamed = False
 
     def abort(self) -> None:
         try:
@@ -866,7 +915,39 @@ def _stream_parts(got: Plan, st, plan_for, run):
 
 def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fraction, verbose: bool = False):
     """(table, provenance) if `plan` is streamed, None to run it in memory as before. Called by `compute()`
-    on the optimized plan, before any Parquet source is read."""
+    on the optimized plan, before any Parquet source is read.
+
+    F-126: an integer `avg` never raises on an overflow, but its hidden sum is an int64 like any `sum` (the fast
+    kernels). When a batch or the merge overflows, the whole run starts again with every integer mean kept as two
+    sums (`_widen_mean`); a real `sum` that overflows raises again there, as F-060 decided."""
+    kw = dict(strict=strict, prefer=prefer, placement=placement, gpu_fraction=gpu_fraction, verbose=verbose)
+    try:
+        return _try_stream(lf, plan, device, **kw)
+    except OverflowError:
+        if not any(e.op == "mean" for a in _walk_aggregates(plan) for e in a.aggs):
+            raise
+    if _out.get() is not None:
+        _out.get().reset()                       # rows a sink already received would be written again
+    token = _wide.set(True)
+    try:
+        return _try_stream(lf, plan, device, **kw)
+    finally:
+        _wide.reset(token)
+
+
+def _walk_aggregates(plan):
+    node = plan
+    while node is not None:
+        if isinstance(node, Aggregate):
+            yield node
+        if isinstance(node, Join):
+            yield from _walk_aggregates(node.left)
+            yield from _walk_aggregates(node.right)
+            return
+        node = getattr(node, "input", None)
+
+
+def _try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fraction, verbose: bool = False):
     if _active.get() or not enabled() or not any(isinstance(l, ParquetScan) for l in _leaves(plan)):
         return None
     from . import native_exec
