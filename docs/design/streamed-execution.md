@@ -71,15 +71,14 @@ plan over `Scan(concat(state, queue))` computed on the CPU (the partials are sma
 
 | aggregate | partial (per batch) | merge | final |
 |---|---|---|---|
-| `sum(x)` | `sum(x)`; **cast to int64 when x is an integer expression** | `sum` | as merged |
+| `sum(x)` | `sum(x)` (int64 when x is an integer expression, F-060) | `sum` | as merged |
 | `count(x)` | `count(x)` | `sum`, cast int64 | |
 | `min / max` | same | same | |
 | `mean(x)` | `sum(x)` (int64 for integers), `count(x)` | `sum`, `sum` | `s / c` in float64, NULL where `c = 0` |
 
-Why the cast: the engine returns a double for an integer sum it can prove below 2^53 and an int64 otherwise
-(F-037 / F-060). Merging doubles could round past 2^53; merging int64 partials is exact, and the merge goes
-through the same exactness gate. The type of x is read by a zero-row dry run of the plan's input (as
-`LazyFrame.schema` does).
+Why int64: an integer sum is int64 on every path (F-060), so a partial and the merged total have the same type
+whatever the batching, and merging int64 partials is exact. The type of x is read by a zero-row dry run of the
+plan's input (as `LazyFrame.schema` does).
 
 Rules that carry over, because the merge is the engine itself: NULL (an all-NULL group sums to NULL), NaN
 (NaN is the largest value for min / max; a NaN sum is NaN), -0.0 / NaN key canonicalization, int64 sums
@@ -157,19 +156,17 @@ On `main` these fail: the budget variable is ignored, nothing streams, and the p
 9. Quiet-machine checks: the overhead of streaming vs in-memory when the data fits (force the budget on a
    file that fits, SF1 Q1 / Q6 / Q3), and a real 30+ GB run.
 
-## 9. Result types follow the engine, not the batching
+## 9. Result types follow the input type, not the batching
 
-Partial integer sums are merged as int64; the *result* type of an integer sum is decided once, at the end, the way
-the engine decides it for the whole table. In memory that decision looks at the table below the Filter chain: its
-row count, the bound of each sum's argument (`col_bound` of the columns combined through the expression) and
-whether Arrow's exact path has to answer (NULLs in a column the plan reads, dates, values past 2^53). Per batch the
-compiler reports exactly those inputs to `pipeline_program.SumProbe` (a context variable set around the batches);
-the probe adds the rows, takes the maximum of each column bound, ORs the flags, and `SumProbe.inexact()` asks the
-engine's own `_Builder.within_exact` about the totals. int64 if inexact or Arrow answered, else a double. The
-read-time row filter (`io_parquet._read_file`, which changes the rows below the Filter) is decided once for the whole
-file and applied to every batch. min / max take the type of the original aggregate's zero-row schema. Known gap: the
-probe sees the engine's inputs only where the batch reaches `_arrow_aggregate_reason` / `_compile`; a plan that
-never does (a path that answers sums without either) gets a double.
+Partial integer sums are int64 and so is the result: the engine adds integers in int64 on every path and the type of
+a sum depends on the type of its argument only (F-060). Before that, an integer sum was a double when an F-037 bound
+(rows x largest value, from the table below the Filter chain) proved the total fits in 2^53 and int64 otherwise, so a
+batch that saw fewer rows or smaller values than the whole table could answer another type; `pipeline_program.SumProbe`
+(a context variable around the batches that merged each batch's row count, column bounds and exact-path flags) existed
+only to give the batches the type the whole table gives, and the end of `_State.result` cast the merged int64 to a
+double when the probe said the sum was small. All of that is gone: there is nothing to agree on. min / max take the type
+of the original aggregate's zero-row schema. The read-time row filter (`io_parquet._read_file`, which changes the rows
+below the Filter) is still decided once for the whole file and applied to every batch.
 
 
 ## 10. Step 3a: spilled groups, row queries, oversized row groups
@@ -183,7 +180,7 @@ NaN equals every NaN, as the engine groups them, F-077), the CRC32 of the text o
 own, and a per-level salt; no Python `hash()`, so the partition of a key is the same in every process and
 reproducible mode gets the same partitions and the same output order. After the last batch, `pieces()` reads one
 partition at a time into a fresh `_State` (the same merge, the same type rule as step 2: hidden columns, int64
-partials, `SumProbe` decides the type of integer sums at the end), splitting a partition again with salt + 1 when
+partials, int64 sums), splitting a partition again with salt + 1 when
 even it passes the budget (at most 6 levels: past that one group is the problem and it raises `MemoryError`). A
 group is in exactly one partition, so partition outputs just concatenate. Each partition file is deleted once read
 and the directory is removed in a `finally`, so an error leaves nothing behind. Provenance:
@@ -313,7 +310,7 @@ within 20-30%) also raises. Provenance: `streamed.rows = {kind: "sort", sort: {r
 - The inner aggregate is the streamed one: its partials are per (keys, x) pair and, when the pairs pass the merge limit,
   go to hash partitions on disk by `hash(keys, x)` (3a), each deduplicated on its own. The outer aggregate is then a
   *second stage* (`_next_stage`): each partition's groups are the batches of another partial aggregate (CPU), merged by the
-  same `_State` (which spills too when the per-key groups are many) with its own `SumProbe` for the integer sums. Exact: a pair is
+  same `_State` (which spills too when the per-key groups are many). Exact: a pair is
   in exactly one partition, and the outer count of a key is the sum of its partitions' counts. A group whose x are all NULL
   counts 0, as in DuckDB. When the pairs fit, the merged inner table goes to the in-memory outer aggregate as before.
 - **median / quantile / stddev / variance**: the engine has none of them (in memory either: `mx.sql` raised a bare
