@@ -75,9 +75,12 @@ class Expr:
         """ABS(x), in the argument's own type."""
         return Expr("abs", self)
 
-    def cast(self, dtype: str, decimal: bool = False) -> 'Expr':
+    def cast(self, dtype: str, decimal: bool = False, try_: bool = False) -> 'Expr':
         """CAST(x AS dtype) for a number type: ``float32``, ``float64``, ``int8`` ... ``int64``. A float rounds
-        half to even into an integer; ``decimal=True`` (x is a SQL DECIMAL) rounds half away from zero."""
+        half to even into an integer; ``decimal=True`` (x is a SQL DECIMAL) rounds half away from zero.
+        ``try_=True`` is TRY_CAST: NULL where the value does not fit instead of an error."""
+        if try_:
+            return Expr("cast", self, dtype, decimal, True)
         return Expr("cast", self, dtype, True) if decimal else Expr("cast", self, dtype)
 
     def add_us(self, micros: int) -> 'Expr':
@@ -185,6 +188,13 @@ class Expr:
     def count(self) -> 'Expr':
         """Count the number of rows. After a filter, reflects filtered row count."""
         return Expr("count", self)
+
+    def uses(self, *ops: str) -> bool:
+        """True when this expression, or any expression inside it, has one of the op names *ops*."""
+        def walk(a):
+            if isinstance(a, Expr): return a.uses(*ops)
+            return isinstance(a, (list, tuple)) and any(walk(x) for x in a)
+        return self.op in ops or any(walk(a) for a in self.args)
 
     def signature(self, alias: bool = False) -> tuple:
         """Return a hashable structural signature for graph caching. Names an output (``alias=True``) only
