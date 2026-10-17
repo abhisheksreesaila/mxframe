@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Union
 import pyarrow as pa
 from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine, value_set as _value_set, is_in as _is_in, distinct_rows as _distinct_rows
 from ._lazy_pc import pc
-from .np_arrow import checked_arith as _checked_arith, modulo as _modulo
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, SQL_MATH
 import numpy as np
 # MAX is imported lazily (~150 ms): the CPU paths never touch it (F-015).
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
@@ -190,6 +190,53 @@ def case_when_arrow(cond, then, else_):
     return pc.if_else(cond, _fit(then, want, cond), _fit(else_, want, cond))
 
 
+def eval_on_rows(ev, expr, table, mask):
+    """``ev(expr, table)`` computed only on the rows where *mask* holds, NULL elsewhere (so a sqrt / ln that DuckDB
+    never runs on a row cannot raise on it)."""
+    part = ev(expr, pc.filter(table, mask))
+    return pc.replace_with_mask(pa.nulls(len(table), part.type), mask, part)
+
+
+def guarded_logic(ev, expr, table):
+    """An AND / OR chain with a sqrt / ln in it. Kleene AND / OR commute, so every term without one runs first on
+    all rows, then each risky term only on the rows the terms before it leave open (AND: not false; OR: not true):
+    `ln(f) > 1 AND f > 0` does not raise on the rows `f > 0` removes, like DuckDB's."""
+    is_and = expr.op == "and"
+    terms = []
+
+    def flatten(e):
+        if e.op == expr.op:
+            flatten(e.args[0]), flatten(e.args[1])
+        else:
+            terms.append(e)
+    flatten(expr)
+    res = None
+    for t in [t for t in terms if not t.uses("sqrt", "ln")] + [t for t in terms if t.uses("sqrt", "ln")]:
+        if res is not None and t.uses("sqrt", "ln"):
+            open_ = pc.fill_null(res, True) if is_and else pc.invert(pc.fill_null(res, False))
+            v = eval_on_rows(ev, t, table, open_)
+        else:
+            v = ev(t, table)
+        res = v if res is None else (pc.and_kleene(res, v) if is_and else pc.or_kleene(res, v))
+    return res
+
+
+def case_when_guarded(ev, args, table):
+    """CASE WHEN with ``ev`` evaluating its parts: a branch with a sqrt / ln runs only on the rows that take it
+    (`CASE WHEN f > 0 THEN ln(f) END` does not raise on f <= 0, DuckDB's usual guard)."""
+    cond = ev(args[0], table)
+    taken = pc.fill_null(cond, _npscalar(False, type=pa.bool_()))
+    vals = []
+    for a, mask in zip(args[1:], (taken, pc.invert(taken))):
+        if a.op == "lit":
+            vals.append(case_literal(a.args[0]))
+        elif a.uses("sqrt", "ln"):
+            vals.append(eval_on_rows(ev, a, table, mask))
+        else:
+            vals.append(ev(a, table))
+    return case_when_arrow(cond, *vals)
+
+
 def coalesce_arrow(*vals):
     """Arrow COALESCE(a, b, ...): the first non-NULL value per row, of the common type of the arguments like
     DuckDB (``_supertype``, folded left to right). ``vals`` are Arrow values or None (a NULL literal); at least
@@ -219,15 +266,30 @@ _CAST_TYPES = {"float32": pa.float32, "float64": pa.float64, "int8": pa.int8, "i
                "int32": pa.int32, "int64": pa.int64}
 
 
-def cast_arrow(x, name, away=False):
+def cast_arrow(x, name, away=False, try_=False):
     """``CAST(x AS <name>)`` for the number types, as DuckDB casts: a float rounds half to even into an integer, a
     DECIMAL (``away``: the SQL front end saw a DECIMAL literal in the expression) half away from zero; a value that
-    does not fit raises (an integer into a float rounds, as DuckDB's does). Only numbers can be cast."""
+    does not fit raises (an integer into a float rounds, as DuckDB's does). Only numbers can be cast.
+    ``try_`` (TRY_CAST): a value that does not fit, or a NaN into an integer, is NULL instead."""
     t = _CAST_TYPES[name]()
     if not (pa.types.is_integer(x.type) or pa.types.is_floating(x.type)):
         raise NotImplementedError(f"CAST of {x.type} to {name} is not supported (numbers only)")
     if x.type == t:
         return x
+    if try_:
+        if pa.types.is_integer(t):
+            half = 1 << (t.bit_width - 1)
+            if pa.types.is_floating(x.type):          # DuckDB tests the unrounded value against [MIN, MAX]; NaN never fits
+                d = pc.cast(x, pa.float64())          # (float32 bounds would round MAX up)
+                top = pc.less(d, _npscalar(float(half), type=pa.float64())) if half == 1 << 63 else pc.less_equal(d, _npscalar(float(half - 1), type=pa.float64()))
+                fits = pc.and_(pc.greater_equal(d, _npscalar(float(-half), type=pa.float64())), top)
+            elif pa.types.is_signed_integer(x.type):
+                fits = pc.and_(pc.greater_equal(x, _npscalar(-half, type=pa.int64())), pc.less_equal(x, _npscalar(half - 1, type=pa.int64())))
+            else:
+                fits = pc.less_equal(x, _npscalar(half - 1, type=pa.uint64()))
+            return cast_arrow(pc.if_else(fits, x, pa.scalar(None, x.type)), name, away)
+        out = pc.cast(x, t, safe=False)             # a double too big for a FLOAT is inf: NULL
+        return pc.if_else(pc.and_(pc.is_inf(out), pc.is_finite(x)), pa.scalar(None, t), out)
     if pa.types.is_floating(x.type) and pa.types.is_integer(t):
         mode = "half_towards_infinity" if away else "half_to_even"
         return pc.cast(pc.round(x, 0, round_mode=mode), t)
@@ -245,6 +307,14 @@ def add_interval_arrow(x, micros):
         raise TypeError(f"an INTERVAL can be added to a DATE or TIMESTAMP, not to {t}")
     x = pc.cast(x, pa.timestamp("us", getattr(t, "tz", None)), safe=False)
     return pc.add(x, _npscalar(np.timedelta64(int(micros), "us")))
+
+
+def year_days_arrow(x):
+    """``Expr.year_of_days``: the year of int32 day numbers (TPC-H layout) via date32, or of a date column; NULL stays
+    NULL (F-119). Both evaluators (predicates here, expressions in ``custom_ops``) call this one."""
+    if pa.types.is_integer(x.type):
+        x = pc.cast(pc.cast(x, pa.int32()), pa.date32())
+    return pc.cast(pc.year(x), pa.int32())
 
 
 def abs_arrow(x):
@@ -605,6 +675,8 @@ class GraphCompiler:
             native = _dict_predicate(expr, table)
             if native is not None:
                 return native
+        if op in ("and", "or") and expr.uses("sqrt", "ln"):
+            return guarded_logic(GraphCompiler._eval_predicate, expr, table)
         if op in _PC_CMP_OPS:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
@@ -646,9 +718,7 @@ class GraphCompiler:
             from .str_patterns import match_like
             return match_like(GraphCompiler._eval_predicate(args[0], table), args[1], args[2], args[3])
         if op == "case_when":
-            return case_when_arrow(GraphCompiler._eval_predicate(args[0], table),
-                                   *(case_literal(a.args[0]) if a.op == "lit" else GraphCompiler._eval_predicate(a, table)
-                                     for a in args[1:]))
+            return case_when_guarded(GraphCompiler._eval_predicate, args, table)
         if op == "coalesce":
             return coalesce_arrow(*branch_values(args, lambda a: GraphCompiler._eval_predicate(a, table)))
         if op == "abs":
@@ -662,11 +732,8 @@ class GraphCompiler:
             if col_arr.type in (pa.int32(), pa.int64()):
                 return pc.cast(pc.divide(col_arr, _npscalar(10000, type=pa.int32())), pa.int32())
             return pc.year(col_arr)
-        if op == "year_days":                  # int32 day numbers (TPC-H layout) -> date32 -> year; NULL stays NULL (F-119)
-            col_arr = GraphCompiler._eval_predicate(args[0], table)
-            if pa.types.is_integer(col_arr.type):
-                col_arr = pc.cast(pc.cast(col_arr, pa.int32()), pa.date32())
-            return pc.cast(pc.year(col_arr), pa.int32())
+        if op == "year_days":
+            return year_days_arrow(GraphCompiler._eval_predicate(args[0], table))
         if op in ("and", "or", "__and__", "__or__"):
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
@@ -691,6 +758,8 @@ class GraphCompiler:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
             return pc.divide(lhs, rhs)
+        if op in SQL_MATH:                                       # idiv, pow, sqrt, ln, nullify (F-127)
+            return SQL_MATH[op](*(GraphCompiler._eval_predicate(a, table) for a in args))
         raise NotImplementedError(f"Cannot evaluate predicate op '{op}' in PyArrow.")
 
     @classmethod

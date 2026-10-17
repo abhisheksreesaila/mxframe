@@ -12,7 +12,7 @@ from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, ta
     distinct_rows as _distinct_rows, group_aggregate as _group_aggregate, canonical_floats as _canonical_floats
 from ._lazy_pc import pc
 from .np_arrow import is_in as _is_in
-from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, int_mean as _int_mean, float_extreme
+from .np_arrow import checked_arith as _checked_arith, modulo as _modulo, int_sum as _int_sum, int_mean as _int_mean, float_extreme, SQL_MATH
 from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_values
 import numpy as np
 import os as _os
@@ -25,7 +25,7 @@ from pathlib import Path
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import case_when_arrow, coalesce_arrow, branch_values, abs_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _is_number
+from .compiler import case_when_arrow, case_when_guarded, coalesce_arrow, branch_values, abs_arrow, year_days_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -175,9 +175,23 @@ def _expr_col_names(expr, out=None, tests_ok=False) -> set:
 _MAX_ROWS = 2 ** 62          # more rows than any table; offset + n stays an int64
 
 
+_ARROW_ONLY_OPS = ("mod", *SQL_MATH)     # ops only the Arrow evaluators know: the MAX graph and the bytecode never see them
+
+
+def _raising_last(preds):
+    """The filters in the order to run them one after the other: those that can raise (sqrt, ln of a rejected
+    value) last, so each sees only the rows the others kept (DuckDB: `WHERE f > 0 AND ln(f) > 1` is safe)."""
+    return sorted(preds, key=lambda p: p.uses("sqrt", "ln"))
+
+
 def _can_be_null(expr) -> bool:
-    """True when *expr* holds a CASE with a NULL branch (a missing ELSE is one): it yields NULL whatever its
-    columns hold, so the plan needs the paths that keep NULL (a CASE ... ELSE 0 does not, and stays native)."""
+    """True when *expr* can yield NULL whatever its columns hold, so the plan needs the paths that keep NULL
+    (the fused / native paths assume a computed value is never NULL). Every NULL source of an expression is here:
+    a CASE with a NULL branch (a missing ELSE is one; NULLIF is one), ``IN`` with a NULL in the list (F-114),
+    ``%`` and ``//`` by anything but a non-zero literal (F-125, F-127: a zero divisor gives NULL), arithmetic
+    with a NULL literal (``nullify``, F-127) and TRY_CAST (F-127). A CASE ... ELSE 0 does not, and stays native. ``sqrt`` / ``ln`` of
+    an argument they reject RAISE (DuckDB's rule) and ``x / 0`` is inf / NaN, so neither is a source; add a new
+    NULL-producing op here (``tests/test_f127_sql_arithmetic.py`` counts one over each)."""
     if isinstance(expr, Expr):
         if expr.op == "case_when" and any(isinstance(a, Expr) and a.op == "lit" and a.args[0] is None
                                           for a in expr.args[1:]):
@@ -185,7 +199,9 @@ def _can_be_null(expr) -> bool:
         if (expr.op == "isin" and isinstance(expr.args[1], (list, tuple))
                 and any(v is None for v in expr.args[1])):       # x IN (.., NULL) is TRUE or NULL (F-114)
             return True
-        if expr.op == "mod":                                     # a zero divisor gives NULL (F-125); a literal other than 0 never does
+        if expr.op == "nullify" or (expr.op == "cast" and len(expr.args) > 3):       # (TRY_CAST: NULL where it does not fit)
+            return True
+        if expr.op in ("mod", "idiv"):                           # a zero divisor gives NULL (F-125); a literal other than 0 never does
             d = expr.args[1]
             if not (isinstance(d, Expr) and d.op == "lit" and d.args[0] not in (None, 0)):
                 return True
@@ -709,7 +725,7 @@ class CustomOpsCompiler(GraphCompiler):
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
         if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year", "is_null",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
-                       "window", "coalesce", "abs", "cast", "add_us"):
+                       "window", "coalesce", "abs", "cast", "add_us", *_ARROW_ONLY_OPS):
             return True
         from .lazy_expr import Expr as _Expr
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
@@ -785,6 +801,10 @@ class CustomOpsCompiler(GraphCompiler):
             return _npa([val] * n)
         if op == "mod":
             return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
+        if op in ("idiv", "pow"):
+            return SQL_MATH[op](*self._arith_operands(args, table))
+        if op in SQL_MATH:                                       # sqrt, ln, nullify: one argument
+            return SQL_MATH[op](*(self._eval_expr_arrow(a, table) for a in args))
         if op in ("add", "sub", "mul", "div"):
             lhs, rhs = self._arith_operands(args, table)
             if op == "div":
@@ -861,10 +881,7 @@ class CustomOpsCompiler(GraphCompiler):
             from .str_patterns import match_like
             return match_like(self._eval_expr_arrow(args[0], table), args[1], args[2], args[3])
         if op == "year_days":
-            col_arr = self._eval_expr_arrow(args[0], table)
-            if pa.types.is_integer(col_arr.type):
-                col_arr = pc.cast(col_arr, pa.int32()).cast(pa.date32())
-            return pc.cast(pc.year(col_arr), pa.int32())
+            return year_days_arrow(self._eval_expr_arrow(args[0], table))
         if op == "year":
             col_arr = self._eval_expr_arrow(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
@@ -879,9 +896,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "case_when":
             # the common type of the branches (integers stay integers, numbers mixed are float64 on both
             # devices: float32 would lose integers above 2**24 and round float64 values, F-022)
-            return case_when_arrow(self._eval_expr_arrow(args[0], table),
-                                   *(case_literal(a.args[0]) if a.op == "lit" else self._eval_expr_arrow(a, table)
-                                     for a in args[1:]))
+            return case_when_guarded(self._eval_expr_arrow, args, table)
         if op == "coalesce":
             return coalesce_arrow(*branch_values(args, lambda a: self._eval_expr_arrow(a, table)))
         if op == "abs":
@@ -921,7 +936,8 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null", "coalesce", "abs", "cast", "add_us"):
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null", "coalesce", "abs", "cast", "add_us",
+                           *_ARROW_ONLY_OPS):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)
@@ -1798,7 +1814,7 @@ class CustomOpsCompiler(GraphCompiler):
                         else "int" if pa.types.is_integer(t) else None)
             if e.op == "add_us":                    # a DATE or timestamp plus an interval
                 return "temporal"
-            parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "add", "sub", "mul", "mod")
+            parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "add", "sub", "mul", *_ARROW_ONLY_OPS)
                      else ())
             return next((k for k in (kind(a) for a in parts if isinstance(a, Expr)) if k), None)
 
@@ -1975,6 +1991,7 @@ class CustomOpsCompiler(GraphCompiler):
             _expr_col_names(e, read, tests_ok=not late)     # (late: every pipeline declined; the Arrow path keeps nulls)
         has_nulls = any(n in table.column_names and table.column(n).null_count for n in read) \
             or _can_be_null([*plan.group_by, *plan.aggs, *preds])
+        arrow_ops = any(isinstance(e, Expr) and e.uses(*SQL_MATH) for e in [*plan.group_by, *plan.aggs, *preds])
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
             return "", False
         from .pipeline_program import has_int_sum, int_sum_inexact
@@ -2004,6 +2021,8 @@ class CustomOpsCompiler(GraphCompiler):
         if temporal:
             return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
+            "an expression only Arrow evaluates (//, power, sqrt, ln: exact in double, errors only for the rows kept)"
+            if arrow_ops else
             "an integer sum or arithmetic the pipelines declined, or a min / max past 2^53 (computed exactly in int64)"
             if exact_sum else "")
         return why, exact_sum
@@ -2032,7 +2051,10 @@ class CustomOpsCompiler(GraphCompiler):
         prev = getattr(_PRECISE, "on", False)
         _PRECISE.on = True                      # float64 arithmetic, like the CPU kernels
         try:
-            if preds:
+            if any(p.uses("sqrt", "ln") for p in preds):      # one filter at a time: a sqrt / ln sees only the kept rows
+                for pred in _raising_last(preds):
+                    table = pc.filter(table, pc.fill_null(self._eval_predicate(pred, table), _npscalar(False, type=pa.bool_())))
+            elif preds:
                 mask = None
                 for pred in preds:
                     m = pc.fill_null(self._eval_predicate(pred, table), _npscalar(False, type=pa.bool_()))   # null is not true
@@ -3765,7 +3787,7 @@ class CustomOpsCompiler(GraphCompiler):
                 got = self._native_filter_table(inner_table, preds, None)
                 if got is not None:                     # F-034: the filters over a computed table (TPC-H Q22's
                     return got                            # select + isin + balance test) in one native pass
-            for p in reversed(preds):
+            for p in _raising_last(reversed(preds)):
                 inner_table = pc.filter(inner_table, self._eval_predicate(p, inner_table))
             return inner_table
         if isinstance(plan, Project):

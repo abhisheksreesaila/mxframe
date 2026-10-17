@@ -1575,9 +1575,31 @@ class _SQLTranslator:
             out.append(c)
         return out
 
-    def _correlation(self, sel: sge.Select, what: str):
+    def _two_levels_out(self, node: sge.Expression, scope: List[tuple]):
+        """(the columns of this query, the columns of the subquery between) that the subqueries nested in ``node``
+        use without their own FROM providing them: ``w.k = t.k`` two levels out, ``w.k = u.k`` one level out."""
+        nested = list(node.find_all(sge.Select))
+        scopes = [sc for s in nested for sc in self._scope_of(s)]
+        own_a, own_c = {a for a, _ in scopes}, set().union(*[c for _, c in scopes]) if scopes else set()
+        mid_a, mid_c = {a for a, _ in scope}, set().union(*[c for _, c in scope]) if scope else set()
+        mine_a, mine_c = {a for a, _ in self._table_cols}, {x.lower() for x in self._scope_columns}
+        outer, middle = [], []
+        for c in node.find_all(sge.Column):
+            t, n = (c.table or "").lower(), c.name.lower()
+            if (t and t in own_a) or (not t and n in own_c):
+                continue
+            if (t and t in mid_a) or (not t and n in mid_c):
+                middle.append(c)
+            elif (t and t in mine_a) or (not t and n in mine_c):
+                outer.append(c)
+        return outer, middle
+
+    def _correlation(self, sel: sge.Select, what: str, lifted: Optional[list] = None):
         """Split a subquery's WHERE into ([(outer column, inner expression)], [inner-only conditions]): the
-        equalities ``inner = outer`` become join keys. Any other reference to this query's columns raises."""
+        equalities ``inner = outer`` become join keys. Any other reference to this query's columns raises.
+        A nested EXISTS / NOT EXISTS that reads this query's columns but none of the subquery's own is a
+        condition on the outer row alone: with a ``lifted`` list it is handed back there (to be decorrelated
+        like any EXISTS of this query, F-124); every other correlation two levels out raises."""
         scope = self._scope_of(sel)
         where = sel.args.get("where")
         body = sel.copy()
@@ -1588,6 +1610,17 @@ class _SQLTranslator:
         keys, rest = [], []
         for c in _conjuncts(where.this) if where else []:
             if not self._outer_refs(c, scope):
+                outer, middle = self._two_levels_out(c, scope)
+                if outer:
+                    nested = _unparen(c.this) if isinstance(c, sge.Not) else c
+                    if lifted is None or middle or not isinstance(_unparen(nested), sge.Exists):
+                        raise NotImplementedError(
+                            f"{what}: correlation two levels out is not supported ({outer[0].sql(dialect='duckdb')} "
+                            "is a column of the outer query used inside a nested subquery"
+                            + (", which also reads the subquery's own columns" if middle else "")
+                            + "; only a nested EXISTS / NOT EXISTS that needs the outer row alone inside an EXISTS is)")
+                    lifted.append(c)
+                    continue
                 rest.append(c)
                 continue
             if isinstance(c, sge.EQ):
@@ -1783,17 +1816,22 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what} over a {type(sel).__name__} is not supported")
         sel = self._inline_aliases(sel)
         _unsupported_shape(sel, what)
-        keys, rest = self._correlation(sel, what)
+        lifted: list = []
+        keys, rest = self._correlation(sel, what, None if negated else lifted)
         if not keys:         # no outer column: there are rows or there are none
-            flat = sel.copy()
-            flat.set("expressions", [sge.Star()])
-            n = Expr("scalar", Aggregate(self._child()._build_select(flat), [], [lit(1).count().alias("__scalar")]))
-            return Filter(plan, (n == lit(0)) if negated else (n > lit(0)))
-        i = next(self._ids)
-        items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
-        inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
-        return Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
-                    [f"__k{i}_{j}" for j in range(len(keys))], "anti" if negated else "semi")
+            n = Expr("scalar", Aggregate(self._child()._build_select(self._keyed_select(sel, rest, [sge.Star()])),
+                                         [], [lit(1).count().alias("__scalar")]))
+            plan = Filter(plan, (n == lit(0)) if negated else (n > lit(0)))
+        else:
+            i = next(self._ids)
+            items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
+            inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
+            plan = Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
+                        [f"__k{i}_{j}" for j in range(len(keys))], "anti" if negated else "semi")
+        for c in lifted:     # EXISTS (.. AND E(outer row)) is EXISTS (..) AND E(outer row)
+            kind, nested, neg = self._subquery_form(c)
+            plan = getattr(self, f"_{kind}_form")(plan, nested, neg)
+        return plan
 
     def _in_form(self, plan, node: sge.In, negated: bool):
         what = "NOT IN (SELECT ...)" if negated else "IN (SELECT ...)"
@@ -2316,6 +2354,9 @@ class _SQLTranslator:
             return lit(0) - inner
 
         # ---- arithmetic ----
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Div, sge.Mod, sge.IntDiv, sge.Pow)) and any(
+                isinstance(_unparen(x), sge.Null) for x in (node.this, node.expression)):
+            return self._arith_with_null(node)
         if isinstance(node, (sge.Add, sge.Sub)) and isinstance(_unparen(node.expression), sge.Interval):
             return self._interval(node)
         if isinstance(node, sge.Add):
@@ -2336,6 +2377,17 @@ class _SQLTranslator:
                 return lit(None if r.args[0] == 0 else (abs(l.args[0]) % abs(r.args[0])) * (-1 if l.args[0] < 0 else 1))   # two constants
             dec = any(_is_decimal_literal(x) for x in (node.this, node.expression))
             return Expr("mod", l, r, True) if dec else l % r      # a literal with a point (no exponent) is DECIMAL
+        if isinstance(node, sge.IntDiv):                 # `a // b`: integers truncate, a float or decimal operand divides; NULL on zero (F-127)
+            l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
+            if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
+                return lit(None if r.args[0] == 0 else (abs(l.args[0]) // abs(r.args[0])) * (-1 if (l.args[0] < 0) != (r.args[0] < 0) else 1))
+            return Expr("idiv", l, r)
+        if isinstance(node, sge.Pow):                    # `power(x, y)` / `x ** y`: a DOUBLE
+            self._no_constants(node, node.this, node.expression)
+            return Expr("pow", self._double_arg(node.this), self._double_arg(node.expression))
+        if isinstance(node, (sge.Sqrt, sge.Ln)):         # a DOUBLE; an argument they reject raises, like DuckDB's
+            self._no_constants(node, node.this)
+            return Expr("sqrt" if isinstance(node, sge.Sqrt) else "ln", self._expr(node.this))
 
         # ---- comparisons ----
         if isinstance(node, _COMPARE):
@@ -2543,7 +2595,8 @@ class _SQLTranslator:
         t = self._col_type(node.this)
         if t is not None and not (pa.types.is_integer(t) or pa.types.is_floating(t)):
             raise NotImplementedError(f"CAST of a {t} column to {node.to.sql(dialect='duckdb')} is not supported (numbers only)")
-        return self._expr(node.this).cast(name, decimal=name.startswith("int") and self._is_decimal_expr(node.this))
+        return self._expr(node.this).cast(name, decimal=name.startswith("int") and self._is_decimal_expr(node.this),
+                                          try_=isinstance(node, sge.TryCast))
 
     def _is_decimal_expr(self, node: sge.Expression) -> bool:
         """True when DuckDB types ``node`` as DECIMAL: a DECIMAL literal (a point, no exponent) or + - * of one with
@@ -2669,8 +2722,8 @@ class _SQLTranslator:
             return not node.is_string and "." not in str(node.this) and "e" not in str(node.this).lower()
         if isinstance(node, sge.Neg):
             return self._is_int_expr(node.this)
-        if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Mod)):
-            return self._is_int_expr(node.this) and self._is_int_expr(node.expression)
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Mod, sge.IntDiv)):       # (a NULL takes the other's type)
+            return all(isinstance(_unparen(x), sge.Null) or self._is_int_expr(x) for x in (node.this, node.expression))
         if isinstance(node, sge.Count):
             return True
         if isinstance(node, (sge.Min, sge.Max, sge.Sum)):      # (SUM of integers is int64, F-060)
@@ -2691,6 +2744,29 @@ class _SQLTranslator:
         if self._is_int_expr(parent.this) and self._is_int_expr(parent.expression):
             return self._expr(node)
         return self._float_expr(node)
+
+    def _arith_with_null(self, node: sge.Expression) -> "Expr":
+        """``x + NULL`` and the like (also ``power(x, NULL)``): NULL of the type the other operand gives the
+        expression, a DOUBLE for ``/`` and ``power`` (a typed NULL, F-127). Two NULLs are a bare NULL."""
+        a, b = node.this, node.expression
+        if isinstance(_unparen(a), sge.Null) and isinstance(_unparen(b), sge.Null):
+            return lit(None)
+        other = b if isinstance(_unparen(a), sge.Null) else a
+        self._no_constants(node, other)
+        if isinstance(node, (sge.Div, sge.Pow)):
+            return Expr("nullify", self._double_arg(other).cast("float64"))
+        if isinstance(node, (sge.Mod, sge.IntDiv)):
+            return Expr("nullify", self._mod_operand(other))
+        return Expr("nullify", self._arith_operand(node, other))
+
+    def _double_arg(self, node: sge.Expression) -> "Expr":
+        """An argument of ``power``: a numeric literal is a DOUBLE (exact in double next to a float32 column)."""
+        n = _unparen(node)
+        neg = isinstance(n, sge.Neg)
+        n = _unparen(n.this) if neg else n
+        if isinstance(n, sge.Literal) and not n.is_string:
+            return lit(np.float64(_number(n.this, neg)))
+        return self._expr(node)
 
     def _mod_operand(self, node: sge.Expression) -> "Expr":
         """An operand of ``%``: a numeric literal (negated or not) stays a plain constant, an integer one an integer, anything else is evaluated
