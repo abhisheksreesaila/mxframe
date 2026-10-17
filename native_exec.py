@@ -1434,9 +1434,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     pf64 = set()                        # float64 partner columns as keys: hashed by their exact values
     fact_range = {}                     # fact join keys bounded by their partners' keys: no scan for their range
     for i, e in enumerate(plan.group_by):
-        if e.op == "col" and e._alias in (None, e.args[0]):
+        if e.op == "col":                # (renamed by an alias: the result column takes the alias, F-080)
             name = e.args[0]
-            keys.append(name)
+            keys.append(e._alias or name)
             src = fj.vcols.get(name)
             if src is None:
                 return _decline("group key outside the joined schema")

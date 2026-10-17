@@ -211,6 +211,37 @@ class _Flat:
         self.residuals = list(residuals)   # (predicate, {column name: (leaf, column)}): a Filter between joins
 
 
+def _one_leaf(src, edges):
+    """Key columns drawn from several leaves, as columns of one leaf, when the joins below equate them (TPC-H Q9
+    in SQL: ``ps_partkey = l_partkey`` after ``p_partkey = l_partkey`` keeps part's column, and ``l_suppkey``
+    is lineitem's): an inner join's key columns hold the same values, so either side's column will do (F-080).
+    None: no leaf has an equal column for every key."""
+    same, nodes = {}, set()                     # union-find over the (leaf, column) pairs the joins equate
+
+    def find(x):
+        while same.get(x, x) != x:
+            x = same[x]
+        return x
+    for a, b, ac, bc in edges:
+        for x, y in zip(ac, bc):
+            nodes |= {(a, x), (b, y)}
+            same[find((a, x))] = find((b, y))
+    for leaf in dict.fromkeys(l for l, _ in src):
+        out = []
+        for l, c in src:
+            if l == leaf:
+                out.append((l, c))
+                continue
+            root = find((l, c))
+            alt = [k for k in sorted(nodes) if k[0] == leaf and find(k) == root]
+            if not alt:
+                break
+            out.append(alt[0])
+        else:
+            return out
+    return None
+
+
 def _flatten(node) -> Optional[_Flat]:
     if isinstance(node, Filter) and isinstance(node.input, Join) and node.input.how == "inner":
         # a condition across leaves between two joins (TPC-H Q5: c_nationkey = s_nationkey): applied as soon
@@ -229,6 +260,8 @@ def _flatten(node) -> Optional[_Flat]:
             rsrc = [right.src[k] for k in node.right_on]
         except KeyError:
             return None
+        if len({s[0] for s in lsrc}) > 1:
+            lsrc = _one_leaf(lsrc, left.edges) or lsrc
         if len({s[0] for s in lsrc}) == 1 and len({s[0] for s in rsrc}) == 1:
             off = len(left.leaves)
             mapping = join_output_names(left.names, right.names, node.right_on)
