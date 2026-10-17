@@ -65,7 +65,7 @@ from std.sys import prefetch, PrefetchOptions
 
 from std.utils.numerics import nan
 
-from pipeline_cpu import pipeline_plain, pipeline_keyed, pipeline_fused, big_alloc, free_big, Prog, _run_ops, _find_chunk, _no_keys, _no_front, VEC, MAX_REGS
+from pipeline_cpu import pipeline_plain, pipeline_keyed, pipeline_fused, big_alloc, free_big, Prog, _run_ops, _find_chunk, _no_keys, _no_front, _ibits, E_OVERFLOW, VEC, MAX_REGS
 from hashagg_cpu import hash_aggregate, float_word, word_bits, word_float
 
 comptime SPARSE_MIN_RANGE = 16384   # direct key ranges below this never compact on sparsity
@@ -93,6 +93,8 @@ comptime O_MIN = 1
 comptime O_MAX = 2
 comptime O_MEAN = 3
 comptime O_COUNT = 4
+comptime O_ISUM = 5      # sum of an integer-valued input (program op OP_AGG_ISUM): the slot holds int64s, the output is int64 (F-060)
+comptime O_IMEAN = 6     # mean of such a slot: float64
 
 comptime E_BAD_PLAN = -1
 comptime E_TOO_MANY_GROUPS = -10
@@ -1131,10 +1133,10 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for i in range(n_pdc):
                 ptbl[c * pstride + 2 + n_pre + i] = pre_doffs[c * n_pdc + i]
             prow0 += cn
-    var no_gids = unsafe_alloc[Int32](1)
+    var no_gids = unsafe_alloc[Int32](2)          # (also the flag cell the program's integer sums would set: it has none)
     var pre = Prog(_ip(Int(F[3]) if fused else code), FP(unsafe_from_address=Int(F[4]) if fused else consts),
                    _bp(Int(F[5]) if fused else set_bytes), _lp(Int(F[6]) if fused else set_meta), ptbl,
-                   n_chunks, pre_dt, no_gids, 1, False)
+                   n_chunks, pre_dt, no_gids, 1, False, _lp(Int(no_gids)))
     var n_look = Int(F[11]) if fused else 0
     var look = _lp(Int(F[12]) if fused else 0)
     var probe_off = Int(F[13]) if fused else 0
@@ -1399,7 +1401,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             hrc = hash_aggregate[fused=False](code, consts, set_bytes, set_meta, Int(tbl), n_chunks, Int(dtypes),
                                               n_keys, n_rows, threads, repro, keyw, _no_front, 0, hres, Int(P[28]))
         if hrc < 0:
-            rc = E_BAD_KEY if hrc == -5 else (E_NO_MEMORY if hrc == -6 else E_PIPELINE)
+            rc = E_BAD_KEY if hrc == -5 else (E_NO_MEMORY if hrc == -6 else (E_OVERFLOW if hrc == -7 else E_PIPELINE))
         else:
             G = max(Int(hres[0]), 1)
             vals.free()
@@ -1422,7 +1424,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         comp.free()
         _free_kv(kv, n_keys)
         K.free()
-        return rc if (rc == E_BAD_KEY or rc == E_NO_MEMORY) else E_PIPELINE
+        return rc if (rc == E_BAD_KEY or rc == E_NO_MEMORY or rc == E_OVERFLOW) else E_PIPELINE
 
     # ── 4. which groups survive, in output order ─────────────────────────────────────────────
     var order = unsafe_alloc[Int64](max(G, 1))     # output position -> group id
@@ -1493,6 +1495,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         var hc = unsafe_alloc[Int64](1)
         hc[0] = 0
         var nr0 = n_res
+        var hinex = unsafe_alloc[Int64](1)             # an integer sum past 2^53 meets a float64 constant: not exact
+        hinex[0] = 0
 
         def having_blocks(wid: Int) {imm}:
             while True:
@@ -1509,8 +1513,10 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                         if empty_global and op != O_COUNT:    # NULL compares false
                             ok = False
                             break
-                        if not _cmp(_out_value(op, Int(outs[3 * j + 1]), Int(outs[3 * j + 2]), g, G, vals, cnt),
-                                    Int(having[3 * h + 1]), hconst[h]):
+                        var hv = _out_value(op, Int(outs[3 * j + 1]), Int(outs[3 * j + 2]), g, G, vals, cnt)
+                        if op == O_ISUM and (hv > 9007199254740992.0 or hv < -9007199254740992.0):
+                            hinex[0] = 1
+                        if not _cmp(hv, Int(having[3 * h + 1]), hconst[h]):
                             ok = False
                             break
                     pass_[i] = 1 if ok else 0
@@ -1544,6 +1550,16 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
         free_big(Int(pass_))
         hcount.free()
         hc.free()
+        var hbad = hinex[0] != 0
+        hinex.free()
+        if hbad:
+            order.free()
+            vals.free()
+            cnt.free()
+            comp.free()
+            _free_kv(kv, n_keys)
+            K.free()
+            return E_INEXACT
     if not kv_done:
         _fill_kv(K, kv, n_keys, order, n_res, comp, compact, G, nt)
     comp.free()
@@ -1558,6 +1574,7 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                 _key_sort_values(K, k, _lp(Int(kv[k])), order, n_res, arrays, stride_a, kc0,
                                  sv + (n_sort + k) * n_res, 1.0, nt)
         var bad = False
+        var inexact = False
         for j in range(n_sort):
             var what = Int(sorts[3 * j])
             var idx = Int(sorts[3 * j + 1])
@@ -1573,15 +1590,17 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
                     var x = _out_value(op, slot, nslot, Int(order[i]), G, vals, cnt)
                     if x != x:
                         bad = True
+                    if op == O_ISUM and (x > 9007199254740992.0 or x < -9007199254740992.0):
+                        inexact = True             # float64 sort values: neighbours past 2^53 would tie
                     sv[j * n_res + i] = sign * x
-        if bad:                                    # NaN: the caller's sort decides where it goes
+        if bad or inexact:                         # NaN: the caller's sort decides where it goes
             sv.free()
             order.free()
             vals.free()
             cnt.free()
             _free_kv(kv, n_keys)
             K.free()
-            return E_NAN_SORT
+            return E_NAN_SORT if bad else E_INEXACT
         var perm = unsafe_alloc[Int64](n_res)
         var n_keep = n_res
         if limit >= 0 and limit * 8 < n_res:
@@ -1697,6 +1716,12 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for i in range(n_res):
                 dst[i] = cnt[Int(order[i])]
             O[obase + j] = Int64(Int(dst))
+        elif op == O_ISUM:                         # int64 words, exactly
+            var dst = _lp(at)
+            var iv = _ibits(vals)
+            for i in range(n_res):
+                dst[i] = iv[slot * G + Int(order[i])]
+            O[obase + j] = Int64(Int(dst))
         else:
             var dst = FP(unsafe_from_address=at)
             for i in range(n_res):
@@ -1793,6 +1818,12 @@ def _out_value(op: Int, slot: Int, nslot: Int, g: Int, G: Int, vals: FP, cnt: LP
     min / max with a NaN-count slot are NaN when the group had a NaN (max) or only NaNs (min)."""
     if op == O_COUNT:
         return Float64(Int(cnt[g]))
+    if op == O_ISUM or op == O_IMEAN:
+        var iv = _ibits(vals)[slot * G + g]
+        if op == O_ISUM:
+            return Float64(iv)
+        var ic = Int(cnt[g])
+        return Float64(iv) / Float64(ic) if ic > 0 else 0.0
     var v = vals[slot * G + g]
     if op == O_MEAN:
         var c = Int(cnt[g])
@@ -2968,9 +2999,9 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             tbl[c * tstride + 2 + n_cols + i] = doffs[c * n_dcols + i]
         row += n
     var n_rows = row
-    var no_gids = unsafe_alloc[Int32](1)          # no group ids (Mojo has no null pointer)
+    var no_gids = unsafe_alloc[Int32](2)          # no group ids (Mojo has no null pointer); also a flag cell nothing sets
     var p = Prog(code, FP(unsafe_from_address=Int(P[6])), _bp(Int(P[7])), _lp(Int(P[8])), tbl,
-                 n_chunks, dtypes, no_gids, 1, False)
+                 n_chunks, dtypes, no_gids, 1, False, _lp(Int(no_gids)))
 
     var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
     var nt = max(1, min(threads, morsels))
@@ -4934,9 +4965,9 @@ def mx_filter_topk(plan_a: Int, out_a: Int) abi("C") -> Int:
             tbl[c * tstride + 2 + n_cols + i] = doffs[c * n_dcols + i]
         row += n
     var n_rows = row
-    var no_gids = unsafe_alloc[Int32](1)
+    var no_gids = unsafe_alloc[Int32](2)
     var p = Prog(code, FP(unsafe_from_address=Int(P[4])), _bp(Int(P[5])), _lp(Int(P[6])), tbl,
-                 n_chunks, dtypes, no_gids, 1, False)
+                 n_chunks, dtypes, no_gids, 1, False, _lp(Int(no_gids)))
     var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
     var nt = max(1, min(threads, morsels))
     var hi_all = unsafe_alloc[Int64](nt * k * S)    # per worker: k entries of S integer sort values

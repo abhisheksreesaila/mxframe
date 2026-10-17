@@ -53,6 +53,9 @@ ISNULL     dst = 1.0 where the column's value is NULL (its    dst, col
 AGG_SUM    slot += src (per group)                          slot, src
 AGG_MIN    slot = min(slot, src)                            slot, src
 AGG_MAX    slot = max(slot, src)                            slot, src
+AGG_ISUM   slot += int64(src), checked: the slot holds int64s    slot, src
+           (a sum of integers is exact past 2^53; the kernels
+           return E_OVERFLOW (-21) when a total passes int64)
 =========  ===============================================  ===================
 
 Layout: 16-int header (magic, n_regs, n_prologue, n_pred, n_body, n_slots,
@@ -66,12 +69,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-import contextlib
-import contextvars
 import math
 import numpy as np
 import pyarrow as pa
-from .np_arrow import empty as _empty, array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
+from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
 from ._lazy_pc import pc
 
 from .lazy_expr import Expr
@@ -95,6 +96,7 @@ OP_ROWID = 39
 OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the native executor only)
 OP_ISNULL = 41         # dst = the column's validity bit is clear (the native executor only, F-097)
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
+OP_AGG_ISUM = 53       # sum of integer-valued inputs, accumulated in int64 (F-060); its slot holds int64 bits
 
 OP_NAMES = {
     OP_LOAD_COL: "LOAD_COL", OP_LOAD_CONST: "LOAD_CONST",
@@ -102,7 +104,7 @@ OP_NAMES = {
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
     OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR", OP_ISNULL: "ISNULL",
-    OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX",
+    OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX", OP_AGG_ISUM: "AGG_ISUM",
 }
 
 _COLUMN_OPS = (OP_LOAD_COL, OP_CMPC, OP_STR, OP_ISNULL)     # instructions whose operand `a` is a column index
@@ -159,12 +161,31 @@ class Inexact(Unsupported):
 class Partials:
     """Per-(aggregate slot, group) partial results of one or more row ranges."""
 
-    vals: np.ndarray   # float64 [n_slots, n_groups]: sum / min / max per slot
+    vals: np.ndarray   # float64 [n_slots, n_groups]: sum / min / max per slot (an "isum" slot holds int64 bits)
     cnt: np.ndarray    # int64   [n_groups]: rows that passed the predicate
 
     @property
     def n_groups(self) -> int:
         return int(self.cnt.shape[0])
+
+    def ints(self, slot: int) -> np.ndarray:
+        """An "isum" slot's row as int64 (a view: the kernels write int64s into the float64 matrix)."""
+        return self.vals[slot].view(np.int64)
+
+
+class SumOverflow(ArithmeticError):
+    """An integer SUM passed int64 (or a kernel's partial total did, F-060). DuckDB's HUGEINT holds such a
+    total; ours is int64, so Arrow's checked sum answers: it returns the exact total when the partial totals
+    only passed int64 on the way, and raises OverflowError when the total itself does not fit."""
+
+
+def checked_int_add(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """a + b in int64; ``SumOverflow`` when any element passes int64."""
+    with np.errstate(over="ignore"):
+        s = a + b
+    if bool((((a ^ s) & (b ^ s)) < 0).any()):
+        raise SumOverflow("Overflow in sum of INT64")
+    return s
 
 
 class Buf(NamedTuple):
@@ -259,7 +280,7 @@ class PipelineProgram:
     set_meta: np.ndarray              # int64 [n_sets, 3] = offset, length, lo
     columns: List[str]                # source column per LOAD_COL index
     dict_arrays: Dict[str, pa.DictionaryArray]   # string columns, as codes
-    slot_kinds: List[str]             # "sum" | "min" | "max" per slot
+    slot_kinds: List[str]             # "sum" | "isum" | "min" | "max" per slot
     outputs: List[Tuple[str, str, Optional[int]]]  # (name, op, slot) per user aggregate
     n_regs: int
     n_instr: int
@@ -631,11 +652,11 @@ class _Builder:
         b = self._eval_bound(t[2], tight)
         return a * b if k == "mul" else max(a, b) if k == "max" else a + b
 
-    def within_exact(self, t, scale: int = 1) -> bool:
-        """Can ``scale * bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
+    def within_exact(self, t) -> bool:
+        """Can ``bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
         if self.skip_bounds:
             return True
-        return (self._eval_bound(t, False) * scale <= EXACT or self._eval_bound(t, True) * scale <= EXACT)
+        return self._eval_bound(t, False) <= EXACT or self._eval_bound(t, True) <= EXACT
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
         """IN_SET over a column's values / codes given a boolean membership table."""
@@ -1071,108 +1092,43 @@ def _int_arith(e: Expr, table: pa.Table) -> bool:
     return has(e)
 
 
-_probe: contextvars.ContextVar = contextvars.ContextVar("mxframe_sum_probe", default=None)
-
-
-class SumProbe:
-    """What the engine looked at when it decided how to answer the integer sums of a query (F-056, streamed
-    execution). A streamed query runs the engine once per batch, but in memory the decision is made once on the
-    whole table: the number of rows below the Filter chain, the bound of each sum's argument (`_Builder.col_bound`
-    of its columns combined through the expression), and whether Arrow's exact path had to answer (nulls in a
-    column the plan reads, dates, values past 2^53). Per batch the compiler reports those inputs here; the batches
-    are merged (rows added, bounds maxed, flags or-ed) and `inexact` asks the engine's own `within_exact` about
-    the totals, so the answer is the one the same rows give in memory, whatever the batching.
-
-    Only aggregates whose output names start with `prefix` are recorded (the streamed query's partials)."""
-
-    def __init__(self, prefix: str = "__p", names=()):
-        self.prefix = prefix
-        self.names = frozenset(names)      # the integer sums whose decision every batch must report
-        self.unknown = False               # some batch did not report: nothing is assumed, the exact path answers
-        self.rows = 0
-        self.trees: Dict[str, Any] = {}
-        self.bounds: Dict[str, int] = {}
-        self.arrow = False
-        self.schema: Optional[pa.Schema] = None
-        self._batch: Optional[dict] = None
-
-    def begin(self) -> None:
-        self._batch = {"rows": None, "bounds": {}, "trees": {}, "arrow": False}
-
-    def note(self, builder, name: str, tree, table: pa.Table) -> None:
-        if self._batch is None or not name.startswith(self.prefix):
-            return
-        cols: List[str] = []
-
-        def walk(t):
-            if t[0] == "col":
-                cols.append(t[1])
-            elif t[0] != "c":
-                walk(t[1])
-                if t[0] != "div":
-                    walk(t[2])
-        walk(tree)
-        for c in cols:
-            self._batch["bounds"][c] = builder.col_bound(c, True)
-        self._batch["trees"][name] = tree
-        self._batch["rows"] = table.num_rows
-        self.schema = table.schema
-
-    def flag(self, arrow: bool) -> None:
-        if self._batch is not None:
-            self._batch["arrow"] = self._batch["arrow"] or arrow
-
-    def end(self) -> None:
-        b, self._batch = self._batch, None
-        if b is None:
-            return
-        if self.names and not b["arrow"] and not self.names <= set(b["trees"]):
-            self.unknown = True
-        self.rows += b["rows"] or 0
-        for c, v in b["bounds"].items():
-            self.bounds[c] = max(self.bounds.get(c, 0), v)
-        self.trees.update(b["trees"])
-        self.arrow = self.arrow or b["arrow"]
-
-    def inexact(self) -> bool:
-        """Does the engine answer these integer sums exactly in Arrow (int64) for the merged batches?"""
-        if self.arrow or self.unknown:
-            return True
-        if not self.trees or self.schema is None:
-            return bool(self.names)             # integer sums, but nothing recorded: not known to be exact
-        b = object.__new__(_Builder)                  # col_bound / within_exact need only these three attributes
-        b.table, b.col_bounds, b.skip_bounds = _empty(self.schema), dict(self.bounds), False
-        return any(not b.within_exact(t, max(1, self.rows)) for t in self.trees.values())
-
-
-@contextlib.contextmanager
-def sum_probe(prefix: str = "__p", names=()):
-    rec = SumProbe(prefix, names)
-    token = _probe.set(rec)
-    try:
-        yield rec
-    finally:
-        _probe.reset(token)
-
-
-def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr]] = None) -> bool:
-    """Would a ``sum`` in ``aggs`` add integers whose total could pass 2^53 (so float64 loses digits)?
-    The caller then sums exactly in Arrow (F-037). With ``preds``: would any predicate or aggregate
-    (not only a sum) compute an integer past 2^53 (F-061: the compiled graph wraps at int64)? Each
-    expression is bounded on its own, so one the compiler can't take (a string predicate) cannot hide
-    another; an integer ``+ - *`` the compiler can't take counts as inexact (Arrow's checked kernels
-    answer it)."""
-    if preds is None:
-        aggs = [e for e in aggs if e.op == "sum"]
-        if not aggs:
-            return False
+def has_int_sum(aggs: List[Expr], table: pa.Table) -> bool:
+    """Does one of ``aggs`` add integers (``sum``, or ``mean`` whose total is added in int64 too)? Those are exact
+    on every path (F-060); a path that cannot add in int64 (the compiled graph, the global shortcuts) must not
+    answer them: Arrow's checked sum does."""
+    for e in aggs:
+        if e.op not in ("sum", "mean"):
+            continue
         try:
-            _compile([], aggs, table)
+            if "isum" in _compile([], [e], table, exact_bounds=False).slot_kinds:
+                return True
         except Inexact:
-            return True
+            return True                          # integer arithmetic that could pass 2^53: integers all the same
         except Unsupported:
-            return False
+            if _int_valued(e.args[0], table):
+                return True
+    return False
+
+
+def _int_valued(e: Expr, table: pa.Table) -> bool:
+    """Is ``e`` made of integer columns and integer literals only, with no division (so Arrow adds it in int64)?"""
+    if e.op == "col":
+        return e.args[0] in table.column_names and pa.types.is_integer(table.schema.field(e.args[0]).type)
+    if e.op == "lit":
+        return isinstance(e.args[0], (int, np.integer)) and not isinstance(e.args[0], bool)
+    if e.op == "case_when":                        # (condition, then, otherwise): the condition's type is not the value's
+        return all(_int_valued(a, table) for a in e.args[1:])
+    if e.op not in ("add", "sub", "mul", "abs"):
         return False
+    return all(_int_valued(a, table) for a in e.args if isinstance(a, Expr))
+
+
+def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> bool:
+    """Would a predicate or an aggregate (``aggs``) compute an integer past 2^53 (F-061: the compiled graph wraps at
+    int64)? The caller then computes in Arrow with checked kernels. Each expression is bounded on its own, so one
+    the compiler can't take (a string predicate) cannot hide another; an integer ``+ - *`` the compiler can't take
+    counts as inexact (Arrow's checked kernels answer it). The total of a sum is not asked about: the kernels add
+    integers in int64 and say when a total passes it (F-060)."""
     count_all = Expr("count", Expr("lit", 1))
     for e, as_pred in [(p, True) for p in preds] + [(a, False) for a in aggs if a.op != "count"]:
         try:
@@ -1223,15 +1179,12 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if e.op not in ("sum", "min", "max", "mean"):
             raise Unsupported(f"aggregate {e.op!r}")
         inner = b._need(e.args[0], "num")
-        if e.op == "sum" and inner.kind == "int":
-            probe = _probe.get()
-            if probe is not None and not b.skip_bounds:
-                probe.note(b, name, b.bound_of(inner), table)
-        if e.op == "sum" and inner.kind == "int" and \
-                not b.within_exact(b.bound_of(inner), max(1, table.num_rows)):
-            # the float64 accumulator keeps whole numbers only within 2^53: rows * max|value| could pass it
-            raise Inexact("integer sum could pass 2**53, not exact in float64")
-        kind = "sum" if e.op == "mean" else e.op
+        # F-060: a sum (or mean) of integers is accumulated in int64 by the kernels, whatever the data. The inputs
+        # are whole numbers within +-2^53 (a column's values are checked when it is bound, an intermediate is
+        # bounded in `_arith`), so each converts to int64 exactly; a total past int64 makes the kernel return
+        # E_OVERFLOW and Arrow's checked sum answers.
+        is_int = inner.kind == "int" and e.op in ("sum", "mean")
+        kind = "isum" if is_int else "sum" if e.op == "mean" else e.op
         key = (kind, e.args[0].signature())
         if e.op in ("min", "max") and not isinstance(inner, _Const) and inner.kind == "float":
             # DuckDB orders NaN above every number: min skips NaN (NaN only if the group is all NaN),
@@ -1254,7 +1207,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             slot_kinds.append(kind)
             slot_src.append(b.as_reg(inner))
             slot_int.append(inner.kind in ("int", "bool"))
-        outputs.append((name, e.op, slot_index[key]))
+        outputs.append((name, "i" + e.op if is_int else e.op, slot_index[key]))
     if not outputs and not concat_dicts:
         raise Unsupported("no aggregates")       # (a predicate-only program is the executor's leaf filter)
 
@@ -1276,7 +1229,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
 
     # ── register allocation ────────────────────────────────────────────────
     const_vregs = [b.const_vregs[k] for k in sorted(b.const_vregs)]
-    agg_instrs = [[OP_AGG_SUM if k == "sum" else OP_AGG_MIN if k == "min" else OP_AGG_MAX,
+    agg_instrs = [[OP_AGG_SUM if k == "sum" else OP_AGG_ISUM if k == "isum" else OP_AGG_MIN if k == "min" else OP_AGG_MAX,
                    s, src, 0, 0] for s, (k, src) in enumerate(zip(slot_kinds, slot_src))]
     body_all = body_sec.instrs + agg_instrs
 
@@ -1333,7 +1286,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         set_meta[i] = (off, len(data), lo)
         off += len(data)
 
-    identity = np.array([0.0 if k == "sum" else np.inf if k == "min" else -np.inf for k in slot_kinds],
+    identity = np.array([0.0 if k in ("sum", "isum") else np.inf if k == "min" else -np.inf for k in slot_kinds],
                         dtype=np.float64)
     return PipelineProgram(
         code=np.asarray(flat, dtype=np.int32),
@@ -1483,6 +1436,8 @@ def merge_partials(program: PipelineProgram, parts: List[Partials]) -> Partials:
         for s, kind in enumerate(program.slot_kinds):
             if kind == "sum":
                 out.vals[s] += p.vals[s]
+            elif kind == "isum":
+                out.vals[s] = checked_int_add(out.ints(s), p.ints(s)).view(np.float64)
             elif kind == "min":
                 np.minimum(out.vals[s], p.vals[s], out=out.vals[s])
             else:
@@ -1497,8 +1452,8 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
     ``present`` is a boolean mask of groups that saw at least one row (grouped
     queries drop the others, like the existing path); ``columns`` maps each
     output name to a numpy array over the present groups (all of the single
-    group for a global aggregate). Sums and means are float64, min/max float64;
-    counts are int64. A global aggregate over no rows yields NULL (a masked
+    group for a global aggregate). Sums of floats and means are float64, min/max float64;
+    counts and sums of integers are int64 (F-060). A global aggregate over no rows yields NULL (a masked
     array) for sum / min / max / mean, and 0 for count, like SQL.
     """
     cnt = partials.cnt
@@ -1509,6 +1464,21 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
     for name, op, slot in program.outputs:
         if op == "count":
             cols[name] = cnt[present].astype(np.int64)
+            continue
+        if op == "isum":                                # an integer sum: int64, exactly
+            v = partials.ints(slot)[present].copy()
+            if not grouped and cnt[0] == 0:
+                v = np.ma.masked_all(v.shape, dtype=v.dtype)
+            cols[name] = v
+            continue
+        if op == "imean":
+            c = cnt[present]
+            v = partials.ints(slot)[present].astype(np.float64)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                v = np.where(c > 0, v / np.maximum(c, 1), 0.0)
+            if not grouped and cnt[0] == 0:
+                v = np.ma.masked_all(v.shape, dtype=v.dtype)
+            cols[name] = v
             continue
         v = partials.vals[slot][present].copy()
         if op == "mean":

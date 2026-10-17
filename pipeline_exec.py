@@ -179,6 +179,17 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
         if len(gids) != n_rows:
             return _decline(compiler, "group ids do not cover the rows")
 
+    from .pipeline_program import SumOverflow
+    try:
+        return _fused_run(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, group_keys,
+                          unique_key_cols, grouped, device, n_rows, having_pred, post_ops, optimizer_trace, t_start)
+    except SumOverflow:
+        # an integer sum passed int64 in a kernel (or a partial total did): Arrow's checked sum answers
+        return _decline(compiler, "an integer sum passed int64 in the kernel; Arrow's checked sum answers")
+
+
+def _fused_run(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_groups, group_keys, unique_key_cols,
+               grouped, device, n_rows, having_pred, post_ops, optimizer_trace, t_start):
     used = "cpu"
     partials = None
     coproc_info = None
@@ -218,14 +229,14 @@ def try_fused_aggregate(compiler, plan, having_pred, post_ops, optimizer_trace=N
             v = unique_key_cols[k]
             key_arrays.append(v if keep is None else pc.filter(v, keep))
         # counts stay exact int64 (float32/float64 would saturate at 2**24 / lose exactness)
-        agg_arrays = [_npa(cols[name].astype(np.int64 if op == "count" else np.float64))
+        agg_arrays = [_npa(cols[name].astype(np.int64 if op in ("count", "isum") else np.float64))
                       for name, op, _ in prog.outputs]
         result = pa.Table.from_arrays(key_arrays + agg_arrays,
                                       names=group_keys + [name for name, _, _ in prog.outputs])
     else:
         arrays = {}
         for name, op, _ in prog.outputs:
-            typ = pa.int64() if op == "count" else pa.float64()
+            typ = pa.int64() if op in ("count", "isum") else pa.float64()
             arrays[name] = _npa(cols[name], type=typ)
         result = pa.table(arrays)
 

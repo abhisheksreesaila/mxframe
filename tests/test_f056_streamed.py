@@ -204,8 +204,7 @@ def types_by_budget(path, build, budgets, device="cpu"):
 
 
 def test_an_integer_sum_has_the_type_it_has_in_memory_whatever_the_batch_count(tmp_path, monkeypatch):
-    """64k rows with one 2^41 value: rows x max value passes 2^53, so in memory the sum is int64. Every batch
-    alone (1,000 rows) is below 2^53, so the type must come from the totals, not from the batches."""
+    """64k rows with one 2^41 value: the sum is int64 in memory and in every batch (F-060: the type is the input's)."""
     n = 64_000
     x = np.zeros(n, dtype=np.int64)
     x[0] = 2 ** 41
@@ -228,9 +227,7 @@ def assert_same_type_at_every_budget(path, build, budgets=("6K", "40K", "200K", 
 
 
 def test_a_selective_filter_leaves_the_integer_sum_type_as_in_memory(tmp_path):
-    """A big value sits in the rows the filter drops. The engine bounds the sum by the unfiltered table (all
-    rows, the largest value of the column), so the type is int64 at every budget, not only where a batch
-    happens to hold the big value."""
+    """A big value sits in the rows the filter drops: int64 at every budget, whichever batches hold it."""
     n = 64_000
     y = np.random.default_rng(0).integers(0, 1000, n).astype(np.int64)
     y[::5000] = 2 ** 44
@@ -250,8 +247,8 @@ def test_a_filter_on_another_column_leaves_the_integer_sum_type_as_in_memory(tmp
 
 
 def test_a_product_of_columns_whose_large_values_sit_in_different_batches(tmp_path):
-    """max|a| x max|b| is 2^60 although no row has both: the engine multiplies the column bounds, so a batch
-    holding only the large a and another only the large b must give the type the whole table gives."""
+    """max|a| x max|b| is 2^60 although no row has both: a batch holding only the large a and another only the
+    large b give the type the whole table gives (int64)."""
     n = 64_000
     a, b = np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.int64)
     a[0], b[n - 1] = 2 ** 30, 2 ** 30
@@ -272,9 +269,9 @@ def test_an_integer_sum_after_a_join_has_the_in_memory_type(tmp_path):
         budgets=("20K", "200K", "64G")) == "int64"
 
 
-def test_a_sum_near_the_limit_is_a_double_in_memory_and_at_every_budget(tmp_path):
-    """rows x max|value| is just under 2^53 (with a filter on another column), so the engine answers a double:
-    a rule that always said int64 would fail here."""
+def test_a_sum_near_the_old_2_53_limit_is_int64_in_memory_and_at_every_budget(tmp_path):
+    """rows x max|value| just under 2^53 used to be a double (and one more row int64): the type depended on the values
+    (F-060). Both are int64 now, at every budget and in memory, with the exact totals."""
     n = 64_000
     big = (2 ** 53 - 1) // n                       # n x big < 2^53
     y = np.full(n, big, dtype=np.int64)
@@ -282,8 +279,7 @@ def test_a_sum_near_the_limit_is_a_double_in_memory_and_at_every_budget(tmp_path
     path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "y": y, "f": f}), 500)
     kind = assert_same_type_at_every_budget(
         path, lambda s: s.filter(col("f") == 1).groupby("k").agg(col("y").sum().alias("s")), budgets=("20K", "100K", "64G"))
-    assert kind == "double"
-    # one more row of the same value passes the limit: int64 everywhere
+    assert kind == "int64"
     path2 = small_file(tmp_path, pa.table({"k": np.zeros(n + 1, dtype=np.int32), "y": np.full(n + 1, big + 1, dtype=np.int64),
                                            "f": (np.arange(n + 1) % 4).astype(np.int32)}), 500)
     assert assert_same_type_at_every_budget(
@@ -291,42 +287,12 @@ def test_a_sum_near_the_limit_is_a_double_in_memory_and_at_every_budget(tmp_path
         budgets=("20K", "100K", "64G")) == "int64"
 
 
-def test_a_batch_the_probe_never_hears_from_makes_the_sum_int64_and_does_not_raise(tmp_path, monkeypatch):
-    """The only big value sits in the first batch, whose engine inputs are never reported (a compile on another
-    thread, say). Nothing is assumed: the sum is int64 and exact; casting the 2^60 total to double would raise."""
-    from mxframe import pipeline_program
-    n = 64_000
-    y = np.ones(n, dtype=np.int64)
-    y[0] = 2 ** 60
-    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "y": y}), 500)
-    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "20K")
-    real, seen = pipeline_program.SumProbe.note, []
-
-    def note(self, *a, **k):
-        if not any(self._batch is b for b in seen):
-            seen.append(self._batch)
-        if self._batch is not seen[0]:             # the first batch reports nothing
-            real(self, *a, **k)
-    real_flag = pipeline_program.SumProbe.flag
-
-    def flag(self, arrow):
-        if self._batch is not seen[0]:
-            real_flag(self, arrow)
-    monkeypatch.setattr(pipeline_program.SumProbe, "note", note)
-    monkeypatch.setattr(pipeline_program.SumProbe, "flag", flag)
-    lf = scan_parquet(path).groupby("k").agg(col("y").sum().alias("s"))
-    got = run(lf, "cpu")
-    assert prov(lf)["path"] == "streamed" and len(seen) > 3
-    assert got.schema.field("s").type == pa.int64()
-    assert got.column("s").to_pylist() == [2 ** 60 + n - 1]
-
-
-def test_a_small_integer_sum_is_a_double_in_memory_and_streamed(tmp_path):
+def test_a_small_integer_sum_is_int64_in_memory_and_streamed(tmp_path):
     n = 64_000
     path = small_file(tmp_path, pa.table({"k": (np.arange(n) % 2).astype(np.int32), "x": np.arange(n, dtype=np.int64)}), 1000)
     got = types_by_budget(path, lambda s: s.groupby("k").agg(col("x").sum().alias("s")), ["20K", "64G"])
-    assert {b: str(v[0].field("s").type) for b, v in got.items()} == {"20K": "double", "64G": "double"}
-    assert got["20K"][1] == got["64G"][1]
+    assert {b: str(v[0].field("s").type) for b, v in got.items()} == {"20K": "int64", "64G": "int64"}
+    assert got["20K"][1] == got["64G"][1] == [{"k": 0, "s": sum(range(0, n, 2))}, {"k": 1, "s": sum(range(1, n, 2))}]
 
 
 def test_float32_min_max_and_the_other_aggregates_have_the_in_memory_types(tmp_path):

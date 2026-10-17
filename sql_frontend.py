@@ -2405,7 +2405,7 @@ class _SQLTranslator:
 
     def _is_int_expr(self, node: sge.Expression) -> bool:
         """True when ``node`` is certainly an integer: an integer literal, an integer column of a known table,
-        or + - * % and negation of those, COUNT, or an integer MIN / MAX. Unknown (unresolved names) is False."""
+        or + - * % and negation of those, COUNT, or an integer SUM / MIN / MAX. Unknown (unresolved names) is False."""
         node = _unparen(node)
         if isinstance(node, sge.Literal):
             return not node.is_string and "." not in str(node.this) and "e" not in str(node.this).lower()
@@ -2415,7 +2415,7 @@ class _SQLTranslator:
             return self._is_int_expr(node.this) and self._is_int_expr(node.expression)
         if isinstance(node, sge.Count):
             return True
-        if isinstance(node, (sge.Min, sge.Max)):               # not SUM: the engine returns it as a double until F-060
+        if isinstance(node, (sge.Min, sge.Max, sge.Sum)):      # (SUM of integers is int64, F-060)
             return self._is_int_expr(node.this)
         if isinstance(node, (sge.Abs, sge.Nullif)):
             return self._is_int_expr(node.this)

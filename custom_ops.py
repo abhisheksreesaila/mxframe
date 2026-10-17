@@ -1963,8 +1963,9 @@ class CustomOpsCompiler(GraphCompiler):
     @staticmethod
     def _arrow_aggregate_reason(plan, preds, table, late=False):
         """``(why, exact_sum)``: why Arrow's hash aggregate answers ``Aggregate(Filter*(Scan))`` instead of the
-        fused / native paths ("" when they do). A null in a column the plan reads, or an integer SUM that could
-        pass 2^53 (added exactly in int64, F-037). The split asks this too (``pipeline_exec.split_check``)."""
+        fused / native paths ("" when they do). A null in a column the plan reads, or (``late``: every pipeline
+        declined) an integer SUM or arithmetic the compiled graph and the global shortcuts cannot add in int64.
+        ``exact_sum``: integers are computed in int64 (F-037, F-060) instead of float64."""
         read = set()
         for e in list(plan.group_by) + list(plan.aggs) + list(preds):
             _expr_col_names(e, read, tests_ok=not late)     # (late: every pipeline declined; the Arrow path keeps nulls)
@@ -1972,8 +1973,11 @@ class CustomOpsCompiler(GraphCompiler):
             or _can_be_null([*plan.group_by, *plan.aggs, *preds])
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
             return "", False
-        from .pipeline_program import int_sum_inexact
-        exact_sum = int_sum_inexact(list(plan.aggs), table, preds if late else None)
+        from .pipeline_program import has_int_sum, int_sum_inexact
+        # An integer SUM is int64 on every path (F-060): the native executor and the fused pipeline add it in
+        # int64 themselves; a plan that gets here after they declined is added by Arrow's checked sum, never by
+        # a float64 path. With nulls in the plan Arrow answers anyway, and its sums of integers are int64 too.
+        exact_sum = late and (has_int_sum(list(plan.aggs), table) or int_sum_inexact(list(plan.aggs), table, preds))
         if not exact_sum:                  # F-090: float64 rounds the MIN / MAX of an integer past 2^53
             for e in plan.aggs:
                 if e.op in ("min", "max") and e.args[0].op == "col" and e.args[0].args[0] in table.column_names:
@@ -1984,18 +1988,11 @@ class CustomOpsCompiler(GraphCompiler):
                         if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
                             exact_sum = True
                             break
-        from .pipeline_program import _probe
-        probe = _probe.get()
-        if probe is not None and not any((e._alias or "").startswith(probe.prefix) for e in plan.aggs):
-            probe = None                                   # not the streamed query's own aggregate
         if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
-            if probe is not None:
-                probe.flag(True)
             return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
-            "an integer sum could pass 2^53, or a min / max past it (computed exactly in int64)" if exact_sum else "")
-        if probe is not None:                              # a streamed batch: report what decided it (F-056)
-            probe.flag(bool(why))
+            "an integer sum or arithmetic the pipelines declined, or a min / max past 2^53 (computed exactly in int64)"
+            if exact_sum else "")
         return why, exact_sum
 
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
@@ -2017,6 +2014,7 @@ class CustomOpsCompiler(GraphCompiler):
         if not why:
             return None
 
+        from .pipeline_program import _int_valued
         t_start = t0 if t0 is not None else _time.perf_counter()
         prev = getattr(_PRECISE, "on", False)
         _PRECISE.on = True                      # float64 arithmetic, like the CPU kernels
@@ -2043,8 +2041,9 @@ class CustomOpsCompiler(GraphCompiler):
                 if _temporal_extreme(e, table):
                     agg_arrays.append(_decode_dict(table.column(e.args[0].args[0])))      # F-093: stays a date / timestamp
                     continue
-                if exact_sum and e.op in ("sum", "min", "max"):
-                    _PRECISE.on = False                 # integers stay int64
+                if e.op == "sum" or (e.op == "mean" and _int_valued(e.args[0], table)) \
+                        or (exact_sum and e.op in ("min", "max")):
+                    _PRECISE.on = False                 # integers stay int64 (a sum of integers is int64 on every path, F-060)
                     try:
                         arr = self._eval_expr_arrow(e.args[0], table)
                     finally:
@@ -2090,6 +2089,10 @@ class CustomOpsCompiler(GraphCompiler):
                     continue
                 if e.op in ("min", "max"):
                     cols.append(_npa([float_extreme(arr, e.op)], type=pa.float64()))
+                    continue
+                if e.op == "mean" and pa.types.is_integer(arr.type):       # F-060: added exactly in int64, then divided
+                    tot, n = _int_sum(arr), len(arr) - arr.null_count
+                    cols.append(_npa([None if tot is None else float(tot) / n], type=pa.float64()))
                     continue
                 v = {"sum": pc.sum, "mean": pc.mean}[e.op](arr)
                 cols.append(_npa([v.as_py()], type=pa.float64()))
