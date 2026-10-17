@@ -217,11 +217,13 @@ def _float_cast(node: sge.Expression) -> Optional[float]:
 
 def _exact_lit(ex: Expr) -> Expr:
     """A constant output column keeps its type: a bare Python int / bool / float literal in a Project is
-    broadcast as float32 / float64, a NumPy scalar as its own type."""
+    broadcast as float32 / float64, a NumPy scalar as its own type. An integer is INTEGER (int32) when it
+    fits, else BIGINT, as in DuckDB."""
     if ex.op != "lit":
         return ex
     v = ex.args[0]
-    return lit(np.bool_(v) if isinstance(v, bool) else np.int64(v) if isinstance(v, int)
+    return lit(np.bool_(v) if isinstance(v, bool) else (np.int32(v) if -2**31 <= v < 2**31 else np.int64(v))
+               if isinstance(v, int)
                else np.float64(v) if isinstance(v, float) else v)
 
 
@@ -732,7 +734,7 @@ class _SQLTranslator:
         have = {}
         for e, nm in zip(items, names):
             if nm is not None:
-                have.setdefault(self._expr(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
+                have.setdefault(self._value(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
         hidden = []
         taken = set(names) | {c.lower() for c in self._scope_columns}
         for o in order_node.expressions if order_node else []:
@@ -1957,9 +1959,7 @@ class _SQLTranslator:
             inner = e.this
         else:
             inner = e
-        mx = self._value(inner)             # a DATE constant that is an output is a date32 (F-115)
-        if isinstance(inner, sge.Extract):
-            mx = _exact_lit(mx)             # EXTRACT(YEAR FROM DATE '..') is an integer
+        mx = _exact_lit(self._value(inner))      # a DATE constant is a date32 (F-115), an integer one an int (F-118)
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:

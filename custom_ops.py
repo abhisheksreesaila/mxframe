@@ -771,7 +771,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "lit":
             val = args[0]
             n = len(table)
-            if isinstance(val, np.datetime64):
+            if isinstance(val, (np.datetime64, np.bool_, np.integer)):      # a NumPy scalar keeps its own type, also on 0 rows
                 return _npa(np.full(n, val))
             if isinstance(val, (int, float)):
                 return _npa(np.full(
