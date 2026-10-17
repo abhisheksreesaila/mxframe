@@ -199,6 +199,16 @@ def test_left_join_rows_keep_their_unmatched_orders_with_null_columns(files):
     assert any(r["l_id"] is None for r in got.to_pylist())
 
 
+@pytest.mark.parametrize("query", [Q3, LEFT, SEMI, ANTI], ids=["inner", "left", "semi", "anti"])
+def test_result_types_are_those_of_the_in_memory_run(files, query, monkeypatch):
+    """The partials of the pairs are merged as int64, and the result type is decided once at the end, as in memory."""
+    lf, got = run_sql(query, files)
+    grace(lf)
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "64G")
+    whole = mx.sql(query, **{n: scan_parquet(p) for n, p in files.items()}).compute(device="cpu")
+    assert got.schema == whole.schema
+
+
 # --- 3. a self-join of the big file -----------------------------------------------------------------------------
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -264,7 +274,19 @@ def test_keys_that_never_split_raise_a_memory_error_and_clean_up(tmp_path, monke
     assert spill_leftovers(_env) == []
 
 
-def test_a_hot_key_on_one_side_only_streams_the_big_side_against_the_small_partition(tmp_path, monkeypatch, _env):
+HOT = {
+    "inner, build right, left in chunks": "SELECT count(*) AS n, sum(w) AS s FROM a JOIN b ON a.k = b.k",
+    "inner, build left, right in chunks": "SELECT count(*) AS n, sum(w) AS s FROM b JOIN a ON a.k = b.k",
+    "left join, right built, left in chunks": "SELECT count(*) AS n, count(w) AS nw, sum(w) AS s FROM a LEFT JOIN b ON a.k = b.k",
+    "semi": "SELECT count(*) AS n, sum(v) AS s FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w > 100)",
+    "anti": "SELECT count(*) AS n, sum(v) AS s FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k AND b.w > 100)",
+}
+
+
+@pytest.mark.parametrize("name", sorted(HOT))
+def test_a_hot_key_on_one_side_only_streams_the_big_side_against_the_small_partition(tmp_path, monkeypatch, _env, name):
+    """90% of `a` has key 7: its partition is far over the budget, while the same partition of `b` is one small row
+    group's worth. No split is needed (and none would help): the small side is built, the big one is read in chunks."""
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "2M")
     n = 200_000
     a = pa.table({"k": np.where(np.arange(n) % 10 < 9, 7, np.arange(n)).astype(np.int64), "v": np.ones(n)})
@@ -272,9 +294,19 @@ def test_a_hot_key_on_one_side_only_streams_the_big_side_against_the_small_parti
     pq.write_table(a, str(tmp_path / "a.parquet"), row_group_size=10_000)
     pq.write_table(b, str(tmp_path / "b.parquet"), row_group_size=10_000)
     f = {"a": str(tmp_path / "a.parquet"), "b": str(tmp_path / "b.parquet")}
-    q = "SELECT count(*) AS n, sum(w) AS s FROM a JOIN b ON a.k = b.k"
-    lf, g = check(q, f, "cpu")
-    assert g["chunked"] >= 1, g
+    lf, g = check(HOT[name], f, "cpu")
+    assert g["chunked"] >= 1 and g["split"] == 0, g
+    assert spill_leftovers(_env) == []
+
+
+def test_a_limit_above_a_grace_join_stops_early_and_cleans_up(files, _env):
+    q = "SELECT l_id, o_id, o_tot, o_prio FROM l JOIN o ON l_ok = o_id LIMIT 5"
+    lf, got = run_sql(q, files)
+    g = grace(lf)
+    assert got.num_rows == 5 and g["pairs"] < 16, g
+    every = {(r["l_id"], r["o_id"]) for r in duck("SELECT l_id, o_id, o_tot, o_prio FROM l JOIN o ON l_ok = o_id", files).to_pylist()}
+    assert {(r["l_id"], r["o_id"]) for r in got.to_pylist()} <= every
+    assert spill_leftovers(_env) == []
 
 
 # --- 5. keys that need SQL rules to co-locate --------------------------------------------------------------------
@@ -304,6 +336,7 @@ def test_null_nan_and_signed_zero_keys_match_by_sql_rules(tmp_path, monkeypatch,
     f = key_files(tmp_path)
     q = f"SELECT count(*) AS n, count(w) AS nw, sum(v) AS sv, sum(w) AS sw FROM a {how} b ON a.k = b.k"
     check(q, f, "cpu")
+    assert duck(q, f).column("nw")[0].as_py() > 100_000              # the NaN / zero / NULL pool does meet
 
 
 def test_integer_keys_meet_float_keys_by_value(tmp_path, monkeypatch):
@@ -311,6 +344,7 @@ def test_integer_keys_meet_float_keys_by_value(tmp_path, monkeypatch):
     f = key_files(tmp_path, left_ints=True)
     q = "SELECT count(*) AS n, sum(v) AS sv, sum(w) AS sw FROM a JOIN b ON a.k = b.k"
     check(q, f, "cpu")
+    assert duck(q, f).column("n")[0].as_py() > 1_000
 
 
 def test_string_keys_with_different_dictionaries_per_row_group_meet(tmp_path, monkeypatch):

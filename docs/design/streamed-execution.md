@@ -144,7 +144,7 @@ On `main` these fail: the budget variable is ignored, nothing streams, and the p
 1. **Group state over the budget**: hash-partition the groups (filter by `hash(key) % P`, or range
    partition by key, one pass per partition) so each pass's state fits.
 2. **Big-to-big joins**: partition both sides by the join key so each pair fits (Li et al. 2025;
-   `docs/research/gpu-out-of-core.md`). A dimension over half the budget declines today.
+   `docs/research/gpu-out-of-core.md`). Built in step 3b, section 11.
 3. **Sorts larger than memory**: sorted runs per batch + k-way merge; a streamed top-k is already free (a
    batch's top-k merges as a partial) but is not built: Sort / Limit below an aggregate declines, and a plan
    with no aggregate (pure filter / sort of a big file) is not streamed.
@@ -218,3 +218,45 @@ file selects only the columns the plan reads. Provenance: `streamed.rows = {kind
 column, so the bound depends on the file's page size (the writer default is 1 MB). The slices are batches like any
 other (own source token, so residency never mistakes two slices for one source); the plan's Filter node filters
 exactly (the read-time row filter is not applied to a slice). Provenance: `streamed.slices`.
+
+
+## 11. Step 3b: Grace hash join
+
+**Which join.** `streamed._grace_at` walks the chain from the aggregate (or the root) down to the biggest leaf and takes
+the topmost join where (a) the big file is the right side of a left / semi / anti join (a build side cannot stream),
+(b) the other side's leaves, times 1.5, pass half the budget, or (c) the other side reads the same file (self-join).
+The nodes above it must still be row-local (Filter, Project without window functions, joins whose other side is
+resident), the tables of those joins are the *resident* part, and everything below it is a *side*. The pair target
+(`Plan.batch_target`) is the batch formula again: (budget / 2 - 1.5 x resident) / 3, capped by the GPU budget on
+`gpu` / `auto`.
+
+**Sides to partitions** (`grace.Grace`). Each side is streamed as a row query (a side with row-wise work above a big
+file runs batch by batch exactly like step 3a's rows queries; a side that is a join of big tables is a nested `Grace`;
+anything else, an aggregate over a big file or a side that fits, is an ordinary compute, which streams by itself), cut
+to the columns the rest of the plan reads, decoded, and written through `spill.Partitioned` into 16 partitions by
+`hash_keys(keys, salt)`. A join key that meets a float key on the other side hashes as a double (`as_float`), so 1
+and 1.0 co-locate; floats are canonicalised (-0.0 = 0.0, one NaN), dictionaries are decoded, NULL is a value of its
+own that never matches in the join. The partition files record their rows and bytes.
+
+**Pairs.** For partition i: no left rows, or no right rows for inner / semi, means nothing to emit (files dropped).
+Otherwise the side that is built is held whole in memory and the other is read in chunks of at most
+`target - build bytes`: the right side for left / semi / anti, the smaller for an inner join, when it is at most half
+the target. Each chunk's plan is the batch plan (partial aggregate or the rows sink's plan) with the join replaced by
+`Join(Scan(chunk), Scan(build))`, computed by the ordinary `compute(device)`: the GPU if the pair fits the GPU
+budget, else the CPU. A pair where no side fits is written again with `salt + 1` (16 sub-partitions each) and its
+pairs processed the same way, at most `spill.MAX_DEPTH` levels; past that, one key is repeated too often and a
+`MemoryError` says so (no partitioning can split one key). Partials go through `_State.add` (step 2's merge, spilling
+if the groups are many), rows through the 3a sinks, so top-k / LIMIT / HAVING / ORDER BY above run as before and a
+`LIMIT` stops reading pairs. Pairs run in partition order and chunks in file order, which keeps reproducible mode
+deterministic.
+
+**NOT IN.** `x NOT IN (SELECT ...)` is an anti join plus a Filter on a scalar subquery about the list (empty / has a
+NULL / no NULL). The scalar is resolved before streaming (it is an aggregate over the big side and streams itself);
+a NULL in the list makes the filter constant false, which `_resolve_scalars` now turns into an empty table of the
+same columns instead of `Limit(0)` over the join, so the join never runs.
+
+**Limits.** Memory per pair is the build side plus one chunk plus the join's own copies (the engine holds about three
+times its input); the output of a join with many matches per key is not bounded (a pair could produce more rows than
+it reads; the partial aggregate above it is what keeps it small). The sides' partition files are written one side
+after the other, then read pair by pair, so the disk needs about the size of the columns of both sides. A join of
+three big tables nests (sides are materialised to disk once per level); there is no cost-based order.
