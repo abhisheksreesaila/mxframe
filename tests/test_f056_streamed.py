@@ -303,7 +303,7 @@ def test_a_batch_the_probe_never_hears_from_makes_the_sum_int64_and_does_not_rai
     real, seen = pipeline_program.SumProbe.note, []
 
     def note(self, *a, **k):
-        if self._batch not in seen:
+        if not any(self._batch is b for b in seen):
             seen.append(self._batch)
         if self._batch is not seen[0]:             # the first batch reports nothing
             real(self, *a, **k)
