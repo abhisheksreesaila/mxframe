@@ -191,7 +191,7 @@ class Expr:
         def _sig(a):
             if isinstance(a, Expr): return a.signature(alias)
             if hasattr(a, "signature"): return a.signature()      # a subquery's plan
-            if isinstance(a, list): return ("list", tuple(a))
+            if isinstance(a, (list, tuple)): return ("list", tuple(_sig(x) for x in a))      # a window spec nests lists
             return a
         child_sigs = tuple(_sig(a) for a in self.args)
         return (self.op, child_sigs, self._alias) if alias else (self.op, child_sigs)

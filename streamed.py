@@ -241,6 +241,26 @@ class Plan:
     slice_rows: dict = dataclasses.field(default_factory=dict)      # row group -> rows per slice (a group bigger than a batch)
     resident: int = 0                   # bytes of the dimension tables kept for all batches
     prune: bool = False                 # rows: select only the columns the plan reads (a bare Filter over the file)
+    grace: Optional[Join] = None        # step 3b: the join of two big sides, run as a Grace hash join (grace.py)
+
+
+def _grace_at(chain, agg_at, leaves, feet, big, budget: int) -> Optional[int]:
+    """Index in `chain` of the topmost join that needs both its sides partitioned (step 3b), else None: the big
+    file is the right side of a left / semi / anti join (a build side cannot stream), the other side of the join
+    (together, times the join index) does not fit half of the budget, or the other side reads the same file."""
+    size = {id(l): (f if isinstance(f, int) else f.bytes) for l, f in zip(leaves, feet)}
+    for i, n in enumerate(chain[:-1]):
+        if agg_at is not None and i <= agg_at:
+            continue
+        if not isinstance(n, Join):
+            continue
+        child = chain[i + 1]
+        other = n.right if child is n.left else n.left
+        ls = _leaves(other)
+        if (n.how != "inner" and child is n.right) or sum(size[id(l)] for l in ls) * RESIDENT_FACTOR > budget // 2 \
+                or any(isinstance(l, ParquetScan) and os.path.abspath(l.path) == big.path for l in ls):
+            return i
+    return None
 
 
 def analyse(plan, budget: int, device: str, reproducible: bool):
@@ -263,10 +283,11 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
             raise _Decline("no Parquet file among the sources")
         chain = _chain(plan, big.node)
         agg_at = max((i for i, n in enumerate(chain[:-1]) if isinstance(n, Aggregate)), default=None)
+        gi = _grace_at(chain, agg_at, leaves, feet, big, budget)
         prune = False
         if agg_at is None:                  # rows: the top of the part that works row by row on the big file
-            top_at = len(chain) - 1
-            for i in range(len(chain) - 2, -1, -1):
+            top_at = len(chain) - 1 if gi is None else gi
+            for i in range(top_at - 1, -1, -1):
                 n = chain[i]
                 if isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)) \
                         or (isinstance(n, Join) and (n.how == "inner" or chain[i + 1] is n.left)):
@@ -276,7 +297,8 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
             top = chain[top_at]
             prune = all(isinstance(n, Filter) for n in chain[top_at:-1])
         else:
-            for n, child in zip(chain[agg_at + 1:-1], chain[agg_at + 2:]):
+            lower = len(chain) - 1 if gi is None else gi              # below a Grace join the sides are streamed on their own
+            for n, child in zip(chain[agg_at + 1:lower], chain[agg_at + 2:lower + 1]):
                 if isinstance(n, (Sort, Limit, Distinct, Tail, Aggregate)):
                     raise _Decline(f"a {type(n).__name__} below the aggregate")
                 if isinstance(n, Project) and _has_op(n.exprs, _WINDOW):
@@ -290,9 +312,11 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
                 else:
                     break
         agg = chain[agg_at] if agg_at is not None else None
-        if sum(1 for l in leaves if isinstance(l, ParquetScan) and os.path.abspath(l.path) == big.path) > 1:
+        if gi is None and sum(1 for l in leaves if isinstance(l, ParquetScan) and os.path.abspath(l.path) == big.path) > 1:
             raise _Decline("the big file is read twice by the plan")
         sub = {id(l) for l in _leaves(agg.input if agg is not None else top)}
+        if gi is not None:                                         # the two sides of the Grace join are not resident
+            sub -= {id(l) for l in _leaves(chain[gi])}
         others = sum(est(f) for l, f in zip(leaves, feet) if id(l) in sub and f is not big)
         if others * RESIDENT_FACTOR > budget // 2:
             raise _Decline(f"the other tables of the aggregate (about {fmt_bytes(others)}) do not fit "
@@ -316,6 +340,9 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
     batches, cur, size, slices = [], [], 0, {}
     from . import io_parquet as iop
     md = iop._metadata(big.path)
+    if gi is not None:                              # a Grace join: the pairs of partitions are the batches
+        return Plan(spec, big, [], batch, cap, budget, md.num_row_groups, top, {}, int(others * RESIDENT_FACTOR), False,
+                    chain[gi])
     for g, b in zip(big.groups, big.sizes):
         rows = md.row_group(g).num_rows
         if b > batch and rows > 1:                  # one row group bigger than a batch: read it in slices of rows
@@ -575,8 +602,54 @@ def describe(plan, device: str = "cpu") -> Optional[str]:
         return f"in memory: fits the host budget of {fmt_bytes(budget)}"
     if isinstance(got, str):
         return f"would not stream: {got}"
+    if got.grace is not None:
+        return (f"grace join, {_spill.PARTITIONS} partitions: both sides of the {got.grace.how} join on "
+                f"{', '.join(got.grace.left_on)} are hash-partitioned to disk and joined pair by pair "
+                f"(pair target {fmt_bytes(got.batch_target)}, host budget {fmt_bytes(budget)})")
     return (f"streams in {len(got.batches)} batches of row groups ({len(got.leaf.groups)} of {got.all_groups} row groups "
             f"read, host budget {fmt_bytes(budget)})")
+
+
+class _Runner:
+    """Computes one batch plan on the query's device and counts where it ran (provenance); feeds the SumProbe."""
+
+    def __init__(self, device, strict, prefer, placement, gpu_fraction, probe=None):
+        self.kw = dict(optimize=False, validate=False, strict=strict, prefer=prefer, placement=placement,
+                       gpu_fraction=gpu_fraction)
+        self.device, self.probe = device, probe
+        self.devices, self.pieces, self.paths = Counter(), Counter(), Counter()
+        self.biggest = 0
+
+    def __call__(self, plan_b) -> pa.Table:
+        sub = LazyFrame(plan_b)
+        if self.probe:
+            self.probe.begin()
+        part = sub.compute(self.device, **self.kw)
+        p = sub.last_compile_provenance or {}
+        self.devices[p.get("auto_device") or p.get("device") or self.device] += 1
+        self.paths[p.get("path", "")] += 1
+        if p.get("gpu_pieces"):
+            self.pieces[p["gpu_pieces"]] += 1
+        if self.probe:
+            self.probe.end()
+        return part
+
+
+def _stream_parts(got: Plan, st, plan_for, run):
+    """Run `plan_for()` once per batch of `got` (row groups, or slices of an oversized one) with the streamed scan
+    reading that batch: yields (result, bytes of the file read, description)."""
+    size_of = dict(zip(got.leaf.groups, got.leaf.sizes))
+    sliced = Counter()
+    n_slices = Counter(b[0] for b in got.batches if len(b) == 1 and b[0] in got.slice_rows)
+    for batch in got.batches:
+        st.groups = tuple(batch)
+        st.slice_rows = got.slice_rows.get(batch[0]) if len(batch) == 1 else None
+        if st.slice_rows:
+            st.slice_no = sliced[batch[0]]
+            sliced[batch[0]] += 1
+        share = size_of[batch[0]] / n_slices[batch[0]] if st.slice_rows else sum(size_of[g] for g in batch)
+        run.biggest = max(run.biggest, int(share))
+        yield run(plan_for()), share, f"{len(batch)} row groups"
 
 
 def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fraction, verbose: bool = False):
@@ -600,53 +673,35 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
         return None
     spec, leaf = got.spec, got.leaf
     from .pipeline_program import sum_probe
-    devices, pieces, paths = Counter(), Counter(), Counter()
-    biggest, size_of = 0, dict(zip(leaf.groups, leaf.sizes))
-    total_bytes, done_bytes, sliced = max(sum(leaf.sizes), 1), 0, Counter()
-    root = _spill.SpillDir()
-    sink, state, batches_run, rows_info = None, None, 0, None
-    n_slices = Counter(b[0] for b in got.batches if len(b) == 1 and b[0] in got.slice_rows)
+    root = _spill.SpillDir("join partitions" if got.grace is not None else "group state")
+    sink, state, batches_run, rows_info, graced = None, None, 0, None, None
     free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
     if spec is None:                                        # a batch is in flight (input x working factor) while rows are collected
         sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR, budget)
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
+            run = _Runner(device, strict, prefer, placement, gpu_fraction, probe)
             state = _State(spec, budget, probe, root, held=lambda: got.resident + (sink.bytes if sink else 0)) if spec else None
-            for batch in got.batches:
-                st.groups = tuple(batch)
-                st.slice_rows = got.slice_rows.get(batch[0]) if len(batch) == 1 else None
-                if st.slice_rows:
-                    st.slice_no = sliced[batch[0]]
-                    sliced[batch[0]] += 1
-                share = size_of[batch[0]] / n_slices[batch[0]] if st.slice_rows \
-                    else sum(size_of[g] for g in batch)
-                biggest = max(biggest, int(share))
-                if spec is not None:
-                    plan_b = spec.partial
-                else:
-                    plan_b = sink.batch_plan(_pruned(got) if got.prune else got.top)
-                sub = LazyFrame(plan_b)
-                if probe:
-                    probe.begin()
-                part = sub.compute(device, optimize=False, validate=False, strict=strict, prefer=prefer,
-                                   placement=placement, gpu_fraction=gpu_fraction)
-                p = sub.last_compile_provenance or {}
-                devices[p.get("auto_device") or p.get("device") or device] += 1
-                paths[p.get("path", "")] += 1
-                if p.get("gpu_pieces"):
-                    pieces[p["gpu_pieces"]] += 1
-                if probe:
-                    probe.end()
+            if got.grace is not None:
+                from . import grace
+                batch_of = (lambda: spec.partial) if spec else (lambda: sink.batch_plan(got.top))
+                graced = grace.Grace(plan, got, root, run, batch_of, _Runner("cpu", strict, prefer, placement, gpu_fraction))
+                parts = graced.pairs()
+            else:
+                parts = _stream_parts(got, st, (lambda: spec.partial) if spec else
+                                      (lambda: sink.batch_plan(_pruned(got) if got.prune else got.top)), run)
+            total_bytes, done_bytes = max(sum(leaf.sizes), 1), 0
+            for part, share, n_in in parts:
                 batches_run += 1
-                done_bytes += share
+                done_bytes += share or 0
                 if spec is not None:
                     state.add(part)
                 else:
-                    sink.add(part, done_bytes / total_bytes)
+                    sink.add(part, done_bytes / total_bytes if share is not None else None)
                 if verbose:
-                    print(f"[mxframe] streamed batch {batches_run}/{len(got.batches)}: "
-                          f"{len(batch)} row groups, {part.num_rows} {'partial ' if spec else ''}rows")
+                    print(f"[mxframe] streamed batch {batches_run}/{len(got.batches) or '?'}: "
+                          f"{n_in}, {part.num_rows} {'partial ' if spec else ''}rows")
                 if sink is not None and sink.full:
                     break
             if spec is not None and not state.spilled:
@@ -674,10 +729,12 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     result = table if isinstance(above, Scan) else LazyFrame(above).compute(
         device, optimize=False, validate=False, strict=strict, prefer=prefer, placement=placement,
         gpu_fraction=gpu_fraction)
-    info = {"batches": len(got.batches), "row_groups": got.all_groups,
+    info = {"batches": batches_run if got.grace is not None else len(got.batches), "row_groups": got.all_groups,
             "row_groups_read": len(leaf.groups), "host_budget": budget, "gpu_batch_cap": got.gpu_cap,
-            "batch_target_bytes": got.batch_target, "largest_batch_bytes": biggest,
-            "devices": dict(devices), "batch_paths": dict(paths)}
+            "batch_target_bytes": got.batch_target, "largest_batch_bytes": run.biggest,
+            "devices": dict(run.devices), "batch_paths": dict(run.paths)}
+    if graced is not None:
+        info["grace"] = graced.info()
     if spec is not None:
         info.update(merges=state.merges, group_state_rows=state.peak_state)
     if root.partitions:
@@ -687,8 +744,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     if got.slice_rows:
         info["slices"] = {"row_groups": len(got.slice_rows), "rows_per_slice": min(got.slice_rows.values())}
     prov = {"path": "streamed", "device": device, "rows": result.num_rows, "streamed": info}
-    if pieces:
-        prov["gpu_pieces"] = "; ".join(f"{n} batches: {s}" for s, n in pieces.items())
+    if run.pieces:
+        prov["gpu_pieces"] = "; ".join(f"{n} batches: {s}" for s, n in run.pieces.items())
     return result, prov
 
 

@@ -145,7 +145,9 @@ def _read_file(path, columns, dict_cols, pushed=(), mask_dict=(), only=None) -> 
         if st is not None and st.slice_rows and groups:
             return _next_slice(st, pf, path, columns, groups, dict_cols, md)
     if groups is not None and not groups:
-        return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
+        from .np_arrow import empty
+        t = empty(pf.schema_arrow)
+        return t.select(columns) if columns else t
     if groups is None:
         groups = list(range(md.num_row_groups))
     if only is None:
@@ -187,7 +189,9 @@ def _next_slice(st, pf, path, columns, groups, dict_cols, md) -> pa.Table:
     state[0] += 1
     rb = next(state[1], None)
     if rb is None:
-        return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
+        from .np_arrow import empty
+        t = empty(pf.schema_arrow)
+        return t.select(columns) if columns else t
     return pa.Table.from_batches([rb])
 
 

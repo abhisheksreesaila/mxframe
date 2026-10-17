@@ -71,7 +71,7 @@ import contextvars
 import math
 import numpy as np
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
+from .np_arrow import empty as _empty, array as _npa, to_numpy as _np_of, scalar as _npscalar, combine as _combine
 from ._lazy_pc import pc
 
 from .lazy_expr import Expr
@@ -1141,7 +1141,7 @@ class SumProbe:
         if not self.trees or self.schema is None:
             return bool(self.names)             # integer sums, but nothing recorded: not known to be exact
         b = object.__new__(_Builder)                  # col_bound / within_exact need only these three attributes
-        b.table, b.col_bounds, b.skip_bounds = self.schema.empty_table(), dict(self.bounds), False
+        b.table, b.col_bounds, b.skip_bounds = _empty(self.schema), dict(self.bounds), False
         return any(not b.within_exact(t, max(1, self.rows)) for t in self.trees.values())
 
 
