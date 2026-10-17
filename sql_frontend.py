@@ -29,10 +29,10 @@ import sqlglot
 import sqlglot.expressions as sge
 from typing import Any, Dict, List, Optional, Union
 
-from .lazy_expr import Expr, col, lit, when
+from .lazy_expr import Expr, col, lit, when, row_number
 from .lazy_frame import (
     LazyFrame, LogicalPlan,
-    Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names, column_types,
+    Scan, ParquetScan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names, column_types,
 )
 
 
@@ -70,6 +70,27 @@ def sql(query: str, **tables) -> LazyFrame:
 # internal translator
 # ---------------------------------------------------------------------------
 
+
+
+_CROSS_LIMIT = 4_000_000          # row pairs a join with no equality (a cross product) may build
+
+
+def _rows_upper(plan: LogicalPlan) -> Optional[int]:
+    """An upper bound on the rows ``plan`` yields (not its actual count), when that is cheap to know (tables, Parquet footers and what only
+    keeps or reshapes their rows); else None."""
+    if isinstance(plan, Scan):
+        return plan.table.num_rows
+    if isinstance(plan, ParquetScan):
+        from .io_parquet import _metadata
+        return _metadata(plan.path).num_rows
+    if isinstance(plan, Limit):
+        inner = _rows_upper(plan.input)
+        return min(plan.n + plan.offset, inner) if inner is not None else plan.n + plan.offset
+    if isinstance(plan, Join):
+        l, r = _rows_upper(plan.left), _rows_upper(plan.right)
+        return None if l is None or r is None else l if plan.how in ("semi", "anti") else l * max(r, 1)      # LEFT: an empty right side still keeps every left row
+    inner = getattr(plan, "input", None)
+    return _rows_upper(inner) if inner is not None else None
 
 
 def _join_type(join) -> str:
@@ -273,9 +294,9 @@ def _null_on_empty(n: sge.Expression) -> bool:
 
 
 def _is_comma_join(join: sge.Join) -> bool:
-    """FROM a, b: the join keys are in WHERE. (An explicit CROSS JOIN stays unsupported.)"""
+    """FROM a, b (or a CROSS JOIN b): the join keys, if any, are in WHERE."""
     return (not join.args.get("on") and not join.args.get("using") and not join.args.get("side")
-            and not join.args.get("kind") and not join.args.get("method"))
+            and str(join.args.get("kind") or "").lower() in ("", "cross") and not join.args.get("method"))
 
 
 def _disjuncts(n: sge.Expression) -> List[sge.Expression]:
@@ -404,6 +425,7 @@ class _SQLTranslator:
         self._marks_bare: dict = {}
         self._renamed: dict = {}
         self._copies: set = set()            # the copies: internal, never part of a result
+        self._used_names: set = set()        # internal column names handed out by _fresh
         # (table name or alias, its columns) of every scanned table
         self._table_cols: List[tuple] = []
         # SELECT * output: (column of the joined plan, name it has in the result) in DuckDB's order, both key
@@ -664,19 +686,29 @@ class _SQLTranslator:
                 continue
 
             how = _join_type(join)
+            alias = join.this.alias_or_name.lower()
             on = join.args.get("on")
+            mixed, temp, rid, lcols = [], set(), None, None
             if on is not None:
-                on, right_only = self._split_on(on, join.this.alias_or_name.lower(), right_schema)
+                on, right_only = self._split_on(on, alias, right_schema)
                 if right_only:                        # ON ... AND u.v IS NULL: the right rows that may match
                     pred = self._expr(right_only[0])
                     for c in right_only[1:]:
                         pred = pred & self._expr(c)
                     right_plan = Filter(right_plan, pred)
+                keys, lonly, ronly, mixed = self._split_join_on(on, alias, right_schema)
+                if (lonly or ronly or mixed) and how in ("semi", "anti"):
+                    raise NotImplementedError("a condition besides column = column in the ON of a SEMI / ANTI JOIN "
+                                              "is not supported")
+                plan, right_plan, left_on, right_on, temp = self._join_keys(
+                    plan, right_plan, right_cols, keys, lonly, ronly, how, alias)
+                if mixed and how == "left":           # a residual that needs both tables: see _left_residual
+                    lcols = self._columns_of(plan)
+                    rid = self._fresh("__rid")
+                    plan = Project(plan, [col(c) for c in lcols] + [row_number().alias(rid)])
+                    lcols = lcols + [rid]
             using = join.args.get("using")
-            if on is not None:
-                on = self._use_right_key_copies(on)      # u.k of an earlier LEFT JOIN: NULL where it missed
-                left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
-            elif using or join.args.get("method"):
+            if on is None and (using or join.args.get("method")):
                 if using:
                     cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
                     keys = [str(c.name) for c in cols]
@@ -686,19 +718,19 @@ class _SQLTranslator:
                         raise ValueError("NATURAL JOIN: the two sides share no column name")
                 left_on = [_ci_find(self._cur_cols, k) or k for k in keys]       # each side's own spelling
                 right_on = [_ci_find(right_cols, k) or k for k in keys]
-            else:
+            elif on is None:
                 raise ValueError("JOIN requires ON or USING clause")
 
-            alias = join.this.alias_or_name.lower()
             on_keys = right_on
             right_plan, right_on, own = self._own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how)
             if how == "left" or (how == "inner" and on is not None and self._any_star):
                 # SELECT * keeps both key columns of a JOIN ... ON: the right one is a copy (own-typed keys
                 # stay ordinary right columns already)
                 carried = list(right_cols) + [n for n in right_on if n not in right_cols]
-                right_plan = self._copy_right_keys(node, join, right_plan, carried, left_on,
-                                                   [k for k in on_keys if k not in own],
-                                                   all_keys=self._any_star and on is not None)
+                visible = [i for i, k in enumerate(on_keys) if k not in own and k not in temp]
+                right_plan = self._copy_right_keys(node, join, right_plan, carried, [left_on[i] for i in visible],
+                                                   [on_keys[i] for i in visible], all_keys=self._any_star and on is not None,
+                                                   extra=mixed)
                 self._left_schema |= self._copies            # a later ON may name a copy (u.k)
             plan = Join(plan, right_plan, left_on, right_on, how)
             # After this join, the accumulated left side grows to include right cols (a semi / anti
@@ -726,24 +758,34 @@ class _SQLTranslator:
                 elif lk != rk and how != "left" and rk not in own:
                     self._col_aliases[rk] = lk
                     self._marks.setdefault((alias, rk), lk)       # z.v equals the left key it matched
+            if mixed:                                   # a condition on both tables, once the names are final
+                res = self._expr(_and_all(mixed))
+                plan = Filter(plan, res) if how == "inner" else self._left_residual(plan, res, rid, lcols)
 
         while pending:
             for i, (alias, right_plan, right_cols) in enumerate(pending):
                 links = self._links(alias, set(right_cols))
                 if links:
                     break
-            else:
-                names = ", ".join(a for a, _, _ in pending)
-                raise NotImplementedError(f"no join condition links {names} to the other tables: FROM a, b needs "
-                                          "column = column conditions in WHERE (a cross product is not supported)")
+            else:                                      # nothing links them: a cross product the WHERE filters
+                i, links = 0, None
+                alias, right_plan, right_cols = pending[0]
             pending.pop(i)
-            left_on = [self._expr(l).args[0] for l, _ in links]
-            right_on = [r.name for _, r in links]
+            if links is None:
+                self._check_cross(plan, right_plan, alias)
+                const = self._fresh("__jc")
+                plan = Project(plan, [col(c) for c in self._columns_of(plan)] + [lit(1).alias(const)])
+                right_plan = Project(right_plan, [col(c) for c in right_cols] + [lit(1).alias(const)])
+                self._copies.add(const)
+                left_on = right_on = [const]
+            else:
+                left_on = [self._expr(l).args[0] for l, _ in links]
+                right_on = [r.name for _, r in links]
             # a right key the query can see (SELECT *) or whose type differs from the left key's is a column
             # of its own: the join would drop it and read the left key
             lt, rt = column_types(plan), column_types(right_plan)
             need = [rk for lk, rk in zip(left_on, right_on)
-                    if self._any_star or (lk in lt and rk in rt and lt[lk] != rt[rk])]
+                    if links is not None and (self._any_star or (lk in lt and rk in rt and lt[lk] != rt[rk]))]
             copied = {}
             if need:
                 taken = set(lt) | set(rt) | set(right_cols) | set(self._cur_cols) | self._copies
@@ -793,7 +835,7 @@ class _SQLTranslator:
             raise ValueError("JOIN ... ON needs a column = column condition besides IS [NOT] NULL")
         return (_and_all(keep) if keep else on), mine
 
-    def _copy_right_keys(self, node, join, right_plan, right_cols, left_on, right_on, all_keys=False):
+    def _copy_right_keys(self, node, join, right_plan, right_cols, left_on, right_on, all_keys=False, extra=()):
         """The join keeps only the left key. When the query reads a right key (``u.k``; a bare ``k`` that is
         only the right table's), the right side carries a copy of it under a name no table has: NULL where
         nothing matched, the key where it did. ``u.k`` resolves to the copy."""
@@ -802,7 +844,7 @@ class _SQLTranslator:
         asked = set()
         joins = node.args["joins"]
         later_on = [j.args["on"] for j in joins[[j is join for j in joins].index(True) + 1:] if j.args.get("on")]
-        for key, val in list(node.args.items()) + [("on", later_on)]:
+        for key, val in list(node.args.items()) + [("on", later_on), ("residual", list(extra))]:
             if key in ("joins", "from_", "with_") or val is None:
                 continue
             for e in (val if isinstance(val, list) else [val]):
@@ -828,18 +870,6 @@ class _SQLTranslator:
             self._copies.add(name)
             added.append(col(k).alias(name))
         return Project(right_plan, [col(c) for c in right_cols] + added)
-
-    def _use_right_key_copies(self, on):
-        """``on`` with every ``u.k`` that is an earlier LEFT JOIN's right key replaced by its copy (NULL where
-        that join matched nothing, so nothing matches it), and every earlier table's column that the join
-        renamed (``x.k`` -> ``k_right``) by its output name."""
-        on = on.copy()
-        for c in list(on.find_all(sge.Column)):
-            key = (c.table.lower(), c.name) if c.table else None
-            copy = self._marks.get(key) or self._renamed.get(key)
-            if copy:
-                c.replace(sge.Column(this=sge.to_identifier(copy)))
-        return on
 
     @staticmethod
     def _own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how):
@@ -1029,31 +1059,172 @@ class _SQLTranslator:
                                           "name the columns in the SELECT")
             self._ctes[alias.name.lower()] = self._child()._build_select(cte.this)
 
-    def _parse_join_on(self, on_expr: sge.Expression,
-                       left_schema: set = None, right_schema: set = None):
-        """Return ([left_cols], [right_cols]) from an ON expression.
+    def _on_side(self, c: sge.Column, alias: str, right_schema: set) -> str:
+        """"L" when column ``c`` of a JOIN's ON belongs to the tables joined so far, "R" when it is a column of
+        the table being joined (``alias``). A qualifier decides; a bare name must be in exactly one side."""
+        if c.table:
+            t = c.table.lower()
+            if t == alias:
+                return "R"
+            if t in self._joined:
+                return "L"
+            raise ValueError(f"JOIN ON: unknown table {c.table!r} in {c.sql(dialect='duckdb')}")
+        in_l, in_r = c.name in self._left_schema, c.name in right_schema
+        if in_l and in_r:
+            raise ValueError(f"JOIN ON: ambiguous reference to column {c.name!r} (in {alias!r} and an earlier table): "
+                             "qualify it with its table")
+        if not (in_l or in_r):
+            raise ValueError(f"JOIN ON: unknown column {c.name!r}")
+        return "L" if in_l else "R"
 
-        When *left_schema* and *right_schema* are provided we detect which
-        column belongs to which side and assign accordingly, handling cases
-        where the SQL author wrote them in right→left order.
-        """
-        if isinstance(on_expr, sge.EQ):
-            a = on_expr.this.name
-            b = on_expr.expression.name
-            if left_schema is not None and right_schema is not None:
-                a_in_left  = a in left_schema
-                a_in_right = a in right_schema
-                b_in_left  = b in left_schema
-                b_in_right = b in right_schema
-                # If a belongs to right and b belongs to left → swap
-                if a_in_right and b_in_left and (not a_in_left or not b_in_right):
-                    return [b], [a]
-            return [a], [b]
-        if isinstance(on_expr, sge.And):
-            ll, rl = self._parse_join_on(on_expr.this, left_schema, right_schema)
-            lr, rr = self._parse_join_on(on_expr.expression, left_schema, right_schema)
-            return ll + lr, rl + rr
-        raise ValueError(f"Cannot parse JOIN ON: {on_expr}")
+    def _split_join_on(self, on: sge.Expression, alias: str, right_schema: set):
+        """The AND-ed conditions of a JOIN's ON, sorted by the tables they read: ``(keys, left only, right only,
+        both)``. A key is ``a = b`` with all of ``a`` on one side and all of ``b`` on the other (either order, any
+        expression: ``t.a + 1 = u.b``), as ``(left expression, right expression)``. The rest are residual
+        conditions. ``AND TRUE`` is dropped."""
+        keys, lonly, ronly, both = [], [], [], []
+
+        def sides(n):
+            return {self._on_side(x, alias, right_schema) for x in n.find_all(sge.Column)}
+        for c in _conjuncts(on):
+            if isinstance(c, sge.Boolean) and c.this:
+                continue
+            if c.find(sge.Subquery, sge.Exists):
+                raise NotImplementedError(f"a subquery in a JOIN's ON ({c.sql(dialect='duckdb')}) is not supported")
+            if isinstance(c, sge.EQ):
+                a, b = _unparen(c.this), _unparen(c.expression)
+                sa, sb = sides(a), sides(b)
+                if sa == {"L"} and sb == {"R"}:
+                    keys.append((a, b))
+                    continue
+                if sa == {"R"} and sb == {"L"}:
+                    keys.append((b, a))
+                    continue
+            both_sides = sides(c)
+            if not both_sides:
+                raise NotImplementedError(f"the JOIN condition {c.sql(dialect='duckdb')} refers to no column of "
+                                          "either table")
+            (lonly if both_sides == {"L"} else ronly if both_sides == {"R"} else both).append(c)
+        return keys, lonly, ronly, both
+
+    def _fresh(self, base: str) -> str:
+        """An internal column name no table, copy or earlier internal column has."""
+        taken = set(self._scope_columns) | set(self._cur_cols) | self._copies | self._used_names
+        name = base
+        while name in taken:
+            name += "_"
+        self._used_names.add(name)
+        return name
+
+    @staticmethod
+    def _columns_of(plan: LogicalPlan) -> List[str]:
+        from .optimizer import _output_columns
+        cols = _output_columns(plan)
+        if cols is None:
+            raise NotImplementedError("this JOIN needs the columns of its input, which are not known here "
+                                      "(give the derived table's columns names)")
+        return cols
+
+    def _right_expr(self, node: sge.Expression, alias: str) -> Expr:
+        """``node`` (a condition or key over the table being joined only) as an expression over that table's own
+        columns: the names the earlier joins gave their columns do not apply to it."""
+        node = node.copy()
+        for c in node.find_all(sge.Column):
+            if not c.table:
+                c.set("table", sge.to_identifier(alias))
+        saved = self._col_aliases, self._marks_bare
+        self._col_aliases, self._marks_bare = {}, {}
+        try:
+            return self._expr(node)
+        finally:
+            self._col_aliases, self._marks_bare = saved
+
+    def _join_keys(self, plan, right_plan, right_cols, keys, lonly, ronly, how, alias):
+        """Everything an ON clause asks of the join itself, as plain key columns: ``(left plan, right plan,
+        left_on, right_on, names of the internal key columns)``.
+
+        - a key that is an expression (``t.a + 1 = u.b``) is computed into a column on its side first;
+        - a condition on the right table alone filters the right side (the right rows that may match);
+        - a condition on the left table alone filters the left side of an INNER join; in a LEFT join it decides
+          whether a left row may match at all, so it becomes one more key: 1 on the right, and on the left 1 where
+          it holds and 0 where it fails or is NULL;
+        - no equality at all: the key is a constant, a cross product (small inputs only) that the residual
+          conditions then filter."""
+        right_cols = list(right_cols)
+        if ronly:
+            right_plan = Filter(right_plan, self._right_expr(_and_all(ronly), alias))
+        left_on, right_on, names, left_add, right_add = [], [], [], [], []
+        for l, r in keys:
+            le = self._expr(l)
+            plain_l = le.op == "col"
+            plain_r = isinstance(r, sge.Column)
+            if plain_l and plain_r:
+                left_on.append(le.args[0])
+                right_on.append(r.name)
+                continue
+            name = self._fresh("__jk")
+            names.append(name)
+            if plain_l:
+                left_on.append(le.args[0])
+            else:
+                left_on.append(name)
+                left_add.append(le.alias(name))
+            if plain_r:
+                right_on.append(r.name)
+            else:
+                right_on.append(name)
+                right_add.append(self._right_expr(r, alias).alias(name))
+        if lonly:
+            cond = self._expr(_and_all(lonly))
+            if how == "inner":
+                plan = Filter(plan, cond)
+            else:
+                gate = self._fresh("__jg")
+                names.append(gate)
+                left_on.append(gate)
+                right_on.append(gate)
+                left_add.append(when(cond, 1, 0).alias(gate))
+                right_add.append(lit(1).alias(gate))
+        if not keys:
+            self._check_cross(plan, right_plan, alias)
+            if not left_on:
+                const = self._fresh("__jc")
+                names.append(const)
+                left_on.append(const)
+                right_on.append(const)
+                left_add.append(lit(1).alias(const))
+                right_add.append(lit(1).alias(const))
+        if left_add:
+            plan = Project(plan, [col(c) for c in self._columns_of(plan)] + left_add)
+            self._copies |= {a._alias for a in left_add}
+        if right_add:
+            right_plan = Project(right_plan, [col(c) for c in right_cols] + right_add)
+        return plan, right_plan, left_on, right_on, set(names)
+
+    @staticmethod
+    def _check_cross(plan: LogicalPlan, right_plan: LogicalPlan, alias: str) -> None:
+        """A join with no equality is a cross product: refuse it unless both inputs are known to be small."""
+        lrows, rrows = _rows_upper(plan), _rows_upper(right_plan)
+        if lrows is None or rrows is None or lrows * rrows > _CROSS_LIMIT:
+            size = "of an unknown size" if lrows is None or rrows is None else f"up to {lrows} x {rrows} rows"
+            raise NotImplementedError(
+                f"JOIN {alias}: no equality between the two tables, so it would run as a cross join "
+                f"({size}; up to {_CROSS_LIMIT} row pairs are supported): add a column = column condition")
+
+    def _left_residual(self, joined: LogicalPlan, res: Expr, rid: str, lcols: List[str]) -> LogicalPlan:
+        """``joined`` is ``L LEFT JOIN R ON <keys>`` with a row id on L; ``res`` is the ON's remaining condition
+        over both tables. In SQL it decides which right rows match: a left row none of whose partners satisfy
+        it still comes back, once, with NULLs for the right columns. So: keep the rows that satisfy it; for a
+        left row (``rid``) with no such row keep one row (its first), and blank its right columns."""
+        cols = self._columns_of(joined)
+        right = cols[len(lcols):]
+        ok, anyok, nth = self._fresh("__ok"), self._fresh("__any"), self._fresh("__nth")
+        plan = Project(joined, [col(c) for c in cols] + [when(res, 1, 0).alias(ok)])
+        plan = Project(plan, [col(c) for c in cols + [ok]]
+                       + [col(ok).max().over(rid).alias(anyok), row_number().over(rid).alias(nth)])
+        plan = Filter(plan, (col(ok) == 1) | ((col(anyok) == 0) & (col(nth) == 1)))
+        return Project(plan, [col(c) for c in lcols if c != rid]
+                       + [when(col(ok) == 1, col(c)).alias(c) for c in right])
 
     # ------------------------------------------------------------------
     # aggregate building
