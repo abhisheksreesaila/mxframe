@@ -299,6 +299,11 @@ def _align_temporal(lhs, rhs):
     if tl is None or tr is None:
         return lhs, rhs
     ts, date = pa.types.is_timestamp, pa.types.is_date
+    day_numbers = lambda t: t == pa.int32()          # the TPC-H layout: a date stored as days since 1970-01-01
+    if (ts(tl) or date(tl)) and day_numbers(tr):     # (F-115: a date constant that left a derived table)
+        rhs, tr = pc.cast(rhs, pa.date32()), pa.date32()
+    elif day_numbers(tl) and (ts(tr) or date(tr)):
+        lhs, tl = pc.cast(lhs, pa.date32()), pa.date32()
     if ts(tl) and date(tr):
         return lhs, pc.cast(rhs, tl)
     if date(tl) and ts(tr):
@@ -526,7 +531,7 @@ class GraphCompiler:
                 idx = pc.sort_indices(table, sort_keys=sort_keys)
                 table = table.take(idx)
             elif isinstance(node, Limit):
-                table = table.slice(node.offset, node.n)
+                table = table.slice(min(node.offset, table.num_rows), node.n)
             elif isinstance(node, Distinct):
                 cols = node.subset or table.column_names
                 table = _distinct_rows(table.select(cols)) if table.num_rows else table.select(cols)

@@ -85,6 +85,8 @@ def _rows_upper(plan: LogicalPlan) -> Optional[int]:
         return _metadata(plan.path).num_rows
     if isinstance(plan, Limit):
         inner = _rows_upper(plan.input)
+        if plan.n is None:                                   # OFFSET without LIMIT: what is left after the skipped rows
+            return None if inner is None else max(inner - plan.offset, 0)
         return min(plan.n + plan.offset, inner) if inner is not None else plan.n + plan.offset
     if isinstance(plan, Join):
         l, r = _rows_upper(plan.left), _rows_upper(plan.right)
@@ -366,7 +368,7 @@ def _or_without(node: sge.Or, drop: set) -> Optional[sge.Expression]:
     return sge.Paren(this=r)
 
 
-_ALL_ROWS = 2 ** 62          # LIMIT of an OFFSET without LIMIT
+_MAX_ROWS = 2 ** 62          # a LIMIT / OFFSET above this is clamped to it: more rows than any table, and n + offset stays an int64
 
 
 def _alias(node: sge.Expression, name: str) -> sge.Alias:
@@ -643,8 +645,8 @@ class _SQLTranslator:
         # 5. LIMIT / OFFSET (OFFSET alone keeps every row after the skipped ones)
         limit_node, offset_node = node.args.get("limit"), node.args.get("offset")
         if limit_node or offset_node:
-            plan = Limit(plan, int(limit_node.expression.this) if limit_node else _ALL_ROWS,
-                         int(offset_node.expression.this) if offset_node else 0)
+            plan = Limit(plan, min(int(limit_node.expression.this), _MAX_ROWS) if limit_node else None,
+                         min(int(offset_node.expression.this), _MAX_ROWS) if offset_node else 0)
 
         if final_proj:
             plan = Project(plan, final_proj)
@@ -1774,7 +1776,7 @@ class _SQLTranslator:
             inner = e.this
         else:
             inner = e
-        mx = self._expr(inner)
+        mx = self._value(inner)             # a DATE constant that is an output is a date32 (F-115)
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:
@@ -2074,7 +2076,7 @@ class _SQLTranslator:
 
     @staticmethod
     def _no_constants(node, *operands):
-        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) for o in operands):
+        if all(isinstance(o, (sge.Literal, sge.Null, sge.Boolean)) or _date_of(o) is not None for o in operands):
             raise NotImplementedError(f"{node.sql(dialect='duckdb')}: a test of constants only has no column to "
                                       "filter or compute on; put a column in it")
 
@@ -2083,6 +2085,8 @@ class _SQLTranslator:
         (they are not elsewhere); the rest as usual."""
         d = _date_of(n)
         if d is not None:
+            if isinstance(_unparen(n), (sge.Add, sge.Sub)):          # DATE +/- INTERVAL is a TIMESTAMP (microseconds)
+                return lit(np.datetime64(d, "us"))
             return lit(d)
         if isinstance(n, (sge.Null, sge.Boolean)):
             return lit(None if isinstance(n, sge.Null) else bool(n.this))
@@ -2151,6 +2155,8 @@ class _SQLTranslator:
     # ------------------------------------------------------------------
 
     def _scalar(self, node: sge.Expression) -> Any:
+        if isinstance(node, sge.Null):
+            return None                                 # IN (.., NULL): np_arrow.is_in's three-valued logic
         if isinstance(node, sge.Literal):
             if node.is_string:
                 return node.this

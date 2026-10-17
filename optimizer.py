@@ -275,7 +275,7 @@ class PlanOptimizer:
                 child = walk(node.input)
                 if isinstance(child, Limit) and not child.offset and not node.offset:
                     changed = True
-                    return Limit(child.input, min(child.n, node.n))
+                    return Limit(child.input, node.n if child.n is None else child.n if node.n is None else min(child.n, node.n))
                 return Limit(child, node.n, node.offset)
             if isinstance(node, Filter):
                 return Filter(walk(node.input), node.predicate)

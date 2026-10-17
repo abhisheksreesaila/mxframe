@@ -342,7 +342,7 @@ def _split_post_ops(post_ops):
         if isinstance(op, Sort) and sort_node is None and limit < 0:
             sort_node = op
         elif isinstance(op, Limit) and limit < 0:
-            limit = int(op.n)
+            limit = -1 if op.n is None else int(op.n)         # (no limit: the rows stay as they are)
         else:
             return f"post-op {type(op).__name__} in this position", -1
     sort_by = []                                  # (name, descending)
@@ -1882,7 +1882,8 @@ def _try_prow_groups(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops, o
                                                     zero_copy_only=False))))
             having_pred = None
     sort = post_ops[0] if post_ops and isinstance(post_ops[0], Sort) else None
-    if (sort is not None and len(post_ops) == 2 and isinstance(post_ops[1], Limit) and len(gp) > 8 * max(post_ops[1].n, 1)
+    if (sort is not None and len(post_ops) == 2 and isinstance(post_ops[1], Limit) and post_ops[1].n is not None
+            and len(gp) > 8 * max(post_ops[1].n, 1)
             and sort.by[0].op == "col" and sort.by[0].args[0] in out_names):
         # ORDER BY an aggregate LIMIT k: only the rows that can reach the top k need their keys (and the
         # key tie-break): those at least as good as the k-th by the first sort column, ties included

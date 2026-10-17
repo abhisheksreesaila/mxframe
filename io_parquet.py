@@ -997,7 +997,7 @@ def _pushable(expr: Expr, schema: pa.Schema) -> Optional[Tuple]:
         return None
     if op == "isin":
         target, values = args
-        if target.op != "col" or not values:
+        if target.op != "col" or not values or any(v is None for v in values):     # (a NULL in the list: F-114)
             return None
         name = target.args[0]
         kind = _kind(schema, name)

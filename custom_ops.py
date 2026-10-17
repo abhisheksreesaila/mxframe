@@ -172,12 +172,18 @@ def _expr_col_names(expr, out=None, tests_ok=False) -> set:
     return out
 
 
+_MAX_ROWS = 2 ** 62          # more rows than any table; offset + n stays an int64
+
+
 def _can_be_null(expr) -> bool:
     """True when *expr* holds a CASE with a NULL branch (a missing ELSE is one): it yields NULL whatever its
     columns hold, so the plan needs the paths that keep NULL (a CASE ... ELSE 0 does not, and stays native)."""
     if isinstance(expr, Expr):
         if expr.op == "case_when" and any(isinstance(a, Expr) and a.op == "lit" and a.args[0] is None
                                           for a in expr.args[1:]):
+            return True
+        if (expr.op == "isin" and isinstance(expr.args[1], (list, tuple))
+                and any(v is None for v in expr.args[1])):       # x IN (.., NULL) is TRUE or NULL (F-114)
             return True
         return any(_can_be_null(a) for a in expr.args)
     return isinstance(expr, (list, tuple)) and any(_can_be_null(a) for a in expr)
@@ -770,6 +776,8 @@ class CustomOpsCompiler(GraphCompiler):
             if isinstance(val, (int, float)):
                 return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) or isinstance(val, np.float64) else np.float32))
+            if isinstance(val, (str, datetime.date)):          # (no rows: still a string / date32, not null)
+                return _npa([val] * n, type=_npscalar(val).type)
             return _npa([val] * n)
         if op == "mod":
             return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)
@@ -782,6 +790,10 @@ class CustomOpsCompiler(GraphCompiler):
                 if pa.types.is_integer(rhs.type):
                     rhs = pc.cast(rhs, pa.float64(), safe=False)
                 return pc.divide(lhs, rhs)
+            if (op == "sub" and getattr(lhs, "type", None) == pa.date32()
+                    and getattr(rhs, "type", None) in (pa.date32(), pa.int32())):
+                # DATE - DATE is the number of days (BIGINT); an int32 column holds days since 1970 (F-115)
+                return pc.cast(pc.subtract(pc.cast(lhs, pa.int32()), pc.cast(rhs, pa.int32())), pa.int64())
             return _checked_arith(op, lhs, rhs)
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)
@@ -2215,13 +2227,14 @@ class CustomOpsCompiler(GraphCompiler):
         # F-087: the paths below take "the first n rows". An OFFSET window is run as the first
         # offset + n rows (the top-n paths see Sort + Limit as before) and the offset rows are cut off.
         skip = 0
-        if isinstance(plan, Limit) and plan.offset:
-            skip, plan = plan.offset, Limit(plan.input, plan.n + plan.offset)
+        if isinstance(plan, Limit) and (plan.offset or plan.n is None):
+            skip = plan.offset                               # (no limit: only the rows are skipped; the sum is kept in int64)
+            plan = plan.input if plan.n is None else Limit(plan.input, min(plan.n + plan.offset, _MAX_ROWS))
         plan = self._resolve_inner_offsets(plan)
         result = self._compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
         result = self._exact_counts(plan, result)
         if skip:
-            result = result.slice(skip)
+            result = result.slice(min(skip, result.num_rows))
         if keep is not None:
             result = result.select([e.args[0] for e in keep]).rename_columns([e._alias or e.args[0] for e in keep])
         return result
@@ -3625,7 +3638,7 @@ class CustomOpsCompiler(GraphCompiler):
         if _native_exec is None or self._session_device == "gpu" or not post_ops or len(post_ops) < 2:
             return None
         srt, lim = post_ops[0], post_ops[1]
-        if not (isinstance(srt, Sort) and isinstance(lim, Limit)) or not (0 < lim.n <= 65536):
+        if not (isinstance(srt, Sort) and isinstance(lim, Limit)) or lim.n is None or not (0 < lim.n <= 65536):
             return None
         proj, node = None, plan
         if isinstance(node, Project):

@@ -784,11 +784,13 @@ def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int, out: 
     above = list(reversed(_chain(plan, top)[:-1]))
     limit = limit_above if above else limit_direct
     name = type(above[0]).__name__ if above else ""
-    if above and isinstance(above[0], Limit):
+    if above and isinstance(above[0], Limit) and above[0].n is not None:
         return _Sink("limit", above[0].n + above[0].offset, None, limit, budget, name)
     if above and isinstance(above[0], Sort):
         for n in above[1:]:
             if isinstance(n, Limit):
+                if n.n is None:                           # no limit: every row is needed
+                    break
                 return _Sink("top-k", n.n + n.offset, above[0], limit, budget, name)
             if not (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
                 break
