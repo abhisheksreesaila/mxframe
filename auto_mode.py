@@ -464,9 +464,11 @@ _BYTES_EDGE = 128       # last 128 bytes): this is an estimate, not a result
 
 def _sample_distinct_bytes(chunks, starts, cuts, idx) -> int:
     """Distinct non-null strings among the sampled rows, read from the Arrow buffers with NumPy: the first
-    ``count_distinct`` imports ``pyarrow.compute`` (~25 ms on auto's first query; device="cpu" never pays it)."""
+    ``count_distinct`` imports ``pyarrow.compute`` (~25 ms on auto's first query; device="cpu" never pays it).
+    Every row is read with one window width, the longest sampled string's over all chunks: equal strings in
+    chunks of different widths must hash alike."""
     import numpy as np
-    lens, rows = [], []
+    picked = []                                     # (data buffer, start, length) of the sampled rows, per chunk
     for c, ch in enumerate(chunks):
         sel = idx[cuts[c]:cuts[c + 1]] - starts[c]
         if not len(sel):
@@ -478,27 +480,27 @@ def _sample_distinct_bytes(chunks, starts, cuts, idx) -> int:
         if ch.null_count and validity is not None:
             bits = np.unpackbits(np.frombuffer(validity, dtype=np.uint8), bitorder="little")
             sel = sel[bits[sel + ch.offset].astype(bool)]
-        if not len(sel):
-            continue
-        lo = off[sel].astype(np.int64)
-        n = off[sel + 1].astype(np.int64) - lo
-        top = int(n.max())
+        if len(sel):
+            lo = off[sel].astype(np.int64)
+            picked.append((data, lo, off[sel + 1].astype(np.int64) - lo))
+    if not picked:
+        return 0
+    top = max(int(n.max()) for _, _, n in picked)
+    hashes = []
+    for data, lo, n in picked:
         if top == 0 or data is None:
-            block = np.zeros((len(sel), 1), dtype=np.uint64)
+            block = np.zeros((len(lo), max(-(-top // 8) * 8, 8) if top <= _BYTES_FULL else 2 * _BYTES_EDGE),
+                             dtype=np.uint8)
         else:
             buf = np.frombuffer(data, dtype=np.uint8)
             if top <= _BYTES_FULL:
-                block = _bytes_at(buf, lo, -(-top // 8) * 8, lo + n)
+                block = _bytes_at(buf, lo, max(-(-top // 8) * 8, 8), lo + n)
             else:
                 tail = lo + np.maximum(n - _BYTES_EDGE, 0)
                 block = np.concatenate([_bytes_at(buf, lo, _BYTES_EDGE, lo + n),
                                         _bytes_at(buf, tail, _BYTES_EDGE, lo + n)], axis=1)
-            block = block.view(np.uint64)
-        lens.append(n)
-        rows.append(block)
-    if not rows:
-        return 0
-    h = np.concatenate([_row_hash(b, n) for b, n in zip(rows, lens)])
+        hashes.append(_row_hash(block.view(np.uint64), n))
+    h = np.concatenate(hashes)
     h.sort()
     return int(1 + np.count_nonzero(h[1:] != h[:-1]))
 

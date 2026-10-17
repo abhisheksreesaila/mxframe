@@ -343,8 +343,7 @@ class LazyFrame:
 
         # COUNT(DISTINCT b) per a counts dictionary codes on the native CPU path (F-046h); auto runs that shape
         # there too (F-058), unless the caller steers it to the GPU, which needs the columns decoded
-        cd_codes = device == "cpu" or (device == "auto" and prefer != "gpu"
-                                       and "gpu" not in (placement or {}).values() and _has_count_distinct(plan))
+        cd_codes = device == "cpu" or (device == "auto" and _auto_may_count_codes(plan, prefer, placement))
         plan = resolve_plan(plan, count_distinct_codes=cd_codes)
         if validate:
             from .plan_validation import validate_plan_or_raise
@@ -359,11 +358,8 @@ class LazyFrame:
 
         from . import auto_mode as _am
         import time as _t
-        if cd_codes:
-            decision = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
-            decision.cpu_path = "native executor (count distinct on codes)"
-        else:
-            decision = _am.choose_device(plan, prefer=prefer, placement=placement)
+        decision = (_auto_codes_decision(plan) if cd_codes else None) \
+            or _am.choose_device(plan, prefer=prefer, placement=placement)
         self.last_auto_decision = decision
         if verbose:
             print(decision.explain())
@@ -471,7 +467,8 @@ class LazyFrame:
                 lines.append("none (run compute() first)")
         if device == "auto":
             from . import auto_mode as _am
-            decision = _am.choose_device(plan, quick=not costs)
+            decision = (_auto_codes_decision(plan) if _auto_may_count_codes(plan, None, None) else None) \
+                or _am.choose_device(plan, quick=not costs)
             text = decision.explain()
             lines.append("AutoDecision")
             shown = text.splitlines()
@@ -1086,6 +1083,33 @@ def _resolve_scalars(plan, device: str, strict: bool):
         return out
 
     return walk(plan)
+
+
+def _auto_may_count_codes(plan, prefer, placement) -> bool:
+    """auto resolves a COUNT(DISTINCT b) per a with dictionary codes, as device="cpu" does (F-046h, F-058), unless
+    the caller steers it to the GPU, which needs the columns decoded."""
+    return prefer != "gpu" and "gpu" not in (placement or {}).values() and _has_count_distinct(plan)
+
+
+def _auto_codes_decision(plan):
+    """A CPU decision for a plan whose COUNT(DISTINCT) input kept dictionary codes (the native count reads them; the
+    GPU path cannot), else None and the cost model decides. A Parquet source not yet read (explain) counts as coded."""
+    from .io_parquet import _is_dict
+    from . import auto_mode as _am
+    stack, coded = [plan], False
+    while stack and not coded:
+        p = stack.pop()
+        if isinstance(p, ParquetScan):
+            coded = True
+        elif isinstance(p, Scan):
+            coded = any(_is_dict(t) for t in p.table.schema.types)
+        stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
+                     if x is not None)
+    if not coded:
+        return None
+    d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
+    d.cpu_path = "native executor (count distinct on codes)"
+    return d
 
 
 def _has_count_distinct(plan) -> bool:

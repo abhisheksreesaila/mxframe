@@ -250,3 +250,30 @@ def test_auto_counts_on_codes_like_cpu(seen, rows):
     assert seen and seen[0][0] == ("int64", "dictionary")
     assert lf.last_compile_provenance["auto_device"] == "cpu"
     assert "dictionary codes" in lf.last_compile_provenance["auto_reason"]
+
+
+def test_auto_steered_to_the_gpu_decodes(seen):
+    """prefer="gpu" asks for the GPU path, which needs plain columns: the plan is resolved decoded, as before."""
+    t = _table(n=30_000)
+    lf = LazyFrame(t).filter(col("d") < lit(70)).select("a", "s").distinct().groupby("a").agg(col("s").count().alias("n"))
+    got = lf.compute(device="auto", prefer="gpu")
+    exp = _duck("SELECT a, COUNT(DISTINCT s) FROM t WHERE d < 70 GROUP BY a", t=t)
+    assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)   # no ORDER BY: any order
+    assert all("dictionary" not in types for types, _ in seen)
+    assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
+
+
+def test_auto_with_plain_columns_is_priced_by_the_cost_model(seen):
+    t = _table(n=30_000)
+    lf = LazyFrame(t).select("a", "p").distinct().groupby("a").agg(col("p").count().alias("n"))
+    got = lf.compute(device="auto")
+    _same(got, _duck("SELECT a, COUNT(DISTINCT p) FROM t GROUP BY a", t=t), "a")
+    assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
+
+
+def test_explain_says_what_compute_does(seen):
+    t = _table(n=400_000)
+    lf = LazyFrame(t).select("a", "s").distinct().groupby("a").agg(col("s").count().alias("n"))
+    text = lf.explain(device="auto")
+    lf.compute(device="auto")
+    assert lf.last_compile_provenance["auto_reason"] in text

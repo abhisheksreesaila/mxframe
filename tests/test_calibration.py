@@ -826,3 +826,26 @@ def test_pipeline_probe_runs_the_q1_shaped_program_correctly(dev):
     np.testing.assert_array_equal(part.cnt, np.bincount(gids[keep], minlength=4))
     want_qty = np.bincount(gids[keep], weights=by_name["l_quantity"][keep].astype(np.float64), minlength=4)
     assert any(np.allclose(row, want_qty, rtol=1e-6) for row in part.vals)
+
+
+def test_a_measured_native_join_replaces_every_default_of_its_name():
+    """F-128 review: per-build-size defaults (`native_join@cpu:g...`) won over a measured plain fit in `_predict`,
+    so a calibrated box still priced joins from the reference box. Measured fits replace defaults of the same op."""
+    base = default_calibration(None)
+    d = base.to_dict()
+    d["fits"] = {"native_join@cpu": Fit(0.5, 10 * 5.2e-6, 0.0).to_dict()}      # a box 10x slower than the defaults
+    loaded = Calibration.from_dict(d)
+    assert not [k for k in loaded.fits if k.startswith("native_join@cpu:")]
+    assert loaded.estimate("native_join", "cpu", 9e6, card=1e6) == pytest.approx(0.5 + 10 * 5.2 * 9, rel=1e-6)
+    assert base.estimate("native_join", "cpu", 9e6, card=1e6) < 20                # the defaults still apply unmeasured
+    cal = default_calibration(None)
+    cal_mod._store_fits(cal, "native_group", "cpu", {"": Fit(0.1, 1e-6, 0.0), ":g1000": Fit(0.1, 2e-6, 0.0)})
+    assert sorted(k for k in cal.fits if k.startswith("native_group@cpu")) == ["native_group@cpu", "native_group@cpu:g1000"]
+
+
+def test_the_native_join_probe_measures_each_build_size():
+    p = cal_mod.PROBES[("native_join", "cpu")]
+    grid = p.grid(cal_mod.QUICK_SIZES)
+    for m in cal_mod.NATIVE_JOIN_BUILDS:
+        assert len({n for n, b in grid if b == m}) >= 3            # three sizes: a line per build size
+    assert p.bucketed and max(n for n, _ in grid) <= p.max_rows

@@ -79,9 +79,15 @@ def _str_cols():
     yield pa.chunked_array([pa.array(["same prefix that is longer than sixty-four bytes, then a tail #"
                                       + str(i % 300) for i in range(120_000)])])
     yield pa.chunked_array([pa.array([b"\x00" * (i % 3) for i in range(90_000)], pa.binary())])   # "", "\0", "\0\0"
+    # chunks whose longest strings differ (8 vs 16 bytes, 200 vs 300): equal values must count once (F-128 review)
+    yield pa.chunked_array([pa.array(["a", "b", "c"] * 20_000), pa.array(["a", "b", "c", "0123456789abc"] * 15_000)])
+    long = "y" * 200
+    yield pa.chunked_array([pa.array([long, "s"] * 30_000), pa.array([long, "z" * 300, "s"] * 20_000)])
+    yield pa.chunked_array([pa.array([f"v{i % 300}" for i in range(9_000)]),
+                            pa.array([f"v{i % 300}" if i % 7 else "x" * (60 + i % 5) for i in range(9_000)])])
 
 
-@pytest.mark.parametrize("i", range(7))
+@pytest.mark.parametrize("i", range(10))
 def test_string_keys_same_estimate_as_before(i):
     col = list(_str_cols())[i]
     n = len(col)

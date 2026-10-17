@@ -490,7 +490,8 @@ class Calibration:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Calibration":
         base = default_calibration(_identity_from_dict(d))
-        fits = dict(base.fits)
+        measured = {k.split(":")[0] for k in d["fits"]}          # a measured op replaces every default of its
+        fits = {k: f for k, f in base.fits.items() if k.split(":")[0] not in measured}   # base (per-size ones too)
         fits.update({k: Fit.from_dict(v) for k, v in d["fits"].items()})
         link = {**base.link_gbps, **{k: float(v) for k, v in d["link_gbps"].items()}}
         lat = {**base.link_latency_ms, **{k: float(v) for k, v in d["link_latency_ms"].items()}}
@@ -614,7 +615,9 @@ _DEFAULT_FITS: Dict[str, Tuple[float, float, float]] = {
     "native_filter@cpu": (0.3, 0.68, 0.0),               # filter + one sum (the filter alone is the difference)
     "native_group@cpu:g8": (0.5, 0.55, 0.0), "native_group@cpu:g1000": (0.5, 0.72, 0.0),
     "native_group@cpu:g100000": (0.5, 1.0, 0.0), "native_group@cpu:g1000000": (0.5, 9.5, 0.0),
-    "native_join@cpu:g250000": (0.5, 0.9, 0.0), "native_join@cpu:g2000000": (0.5, 1.9, 0.0),  # rows = both sides
+    # join: ms per M rows of both sides, by build-side rows (measured: 0.94-1.03 for 250k-1M builds, 1.9 for 2M,
+    # 5.2 for 8M; probe sides 4:1 and 32:1)
+    "native_join@cpu:g250000": (0.5, 0.95, 0.0), "native_join@cpu:g2000000": (0.5, 1.9, 0.0),
     "native_join@cpu:g8000000": (0.5, 5.2, 0.0),
 }
 _DEFAULT_GPU_INIT_MS = 400.0
@@ -1166,14 +1169,22 @@ def _p_native_group(ctx, n, card):
     return _native_run(LazyFrame(_native_table(ctx, n, card)).groupby("k").agg(col("v").sum().alias("s")))
 
 
-@probe("native_join", "cpu", max_rows=30_000_000)
+NATIVE_JOIN_BUILDS = (250_000, 2_000_000, 8_000_000)     # build-side rows: in cache, past L3, far past it
+
+
+def _native_join_grid(sizes):
+    """(rows of both sides, build-side rows): three sizes per build size, so each gets its own line."""
+    return [(int(m * k), m) for m in NATIVE_JOIN_BUILDS for k in (1.5, 2.5, 3.75)]
+
+
+@probe("native_join", "cpu", max_rows=30_000_000, uses_card=True, bucketed=True, grid=_native_join_grid)
 def _p_native_join(ctx, n, card):
-    """Key / foreign-key join + one sum; `n` counts both sides (8/9 probe rows, 1/9 build rows)."""
+    """Key / foreign-key join + one sum; `n` counts both sides, `card` is the build side's rows."""
     import numpy as np
     import pyarrow as pa
     from .lazy_frame import LazyFrame
     from .lazy_expr import col
-    m = max(n // 9, 1)
+    m = max(min(card, n // 2), 1)
     left = n - m
     fact = pa.table({"fk": (ctx.labels(left, 1 << 30) % m).astype(np.int64), "v": ctx.f32(left)})
     dim = pa.table({"pk": np.random.default_rng(ctx.seed + 5).permutation(m).astype(np.int64),
@@ -1215,15 +1226,15 @@ def _collect_points(p: Probe, ctx: Any, sizes: Tuple[int, ...], budget_s: float,
     last: Dict[int, Tuple[int, float]] = {}          # per group count: (rows, ms) of last run
     sizes_ok = [n for n in sizes if not (p.max_rows and n > p.max_rows)]
     cap = p.max_card or (1 << 30)
-    if p.bucketed:                        # every size at one representative card per bucket
+    if p.grid is not None:
+        grid = p.grid(tuple(sizes_ok))
+        budget_s = p.budget_s or budget_s
+    elif p.bucketed:                      # every size at one representative card per bucket
         cards = [c for c in BUCKET_REP_CARDS if c <= cap]
         big = [n for n in sizes_ok if n >= 100_000] or sizes_ok
         low_card_sizes = big[:-1] if len(big) >= 4 else big    # top size is slow for mid group counts
         grid = [(n, c) for c in cards
                 for n in (big if c >= 100_000 else low_card_sizes) if c <= max(n, 8)]
-    elif p.grid is not None:
-        grid = p.grid(tuple(sizes_ok))
-        budget_s = p.budget_s or budget_s
     else:
         grid = [(n, _card_for(n)) for n in sizes_ok]
         if p.uses_card:                   # cardinality sweep at a mid size
@@ -1361,6 +1372,9 @@ def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False,
 
 
 def _store_fits(cal: "Calibration", op: str, dev: str, fits: Dict[str, Fit]) -> None:
+    base = f"{op}@{dev}"
+    for k in [k for k in cal.fits if k.split(":")[0] == base]:      # measured fits replace the defaults (per-size
+        del cal.fits[k]                                            # defaults would otherwise win in _predict)
     for suffix, f in fits.items():
         cal.fits[f"{op}@{dev}{suffix}"] = f
 

@@ -221,7 +221,8 @@ def test_limit_native_executor_declines_only_under_a_split_policy():
 
 def test_limit_auto_counts_distinct_on_codes_unless_steered_to_the_gpu():
     src = (ROOT / "lazy_frame.py").read_text()
-    assert 'cd_codes = device == "cpu" or (device == "auto" and prefer != "gpu"' in src
+    assert 'cd_codes = device == "cpu" or (device == "auto" and _auto_may_count_codes(plan, prefer, placement))' in src
+    assert 'return prefer != "gpu" and "gpu" not in (placement or {}).values() and _has_count_distinct(plan)' in src
 
 
 def test_limit_whole_query_cpu_price_is_native_but_the_split_uses_the_older_kernel():

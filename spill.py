@@ -36,12 +36,17 @@ _NULL = np.uint64(0x9E3779B97F4A7C15)
 
 
 def _mix(x: np.ndarray) -> np.ndarray:
-    """The splitmix64 finalizer: spreads every input bit over the 64 output bits (uint64 arithmetic wraps)."""
-    x = x ^ (x >> np.uint64(30))
-    x = x * _M1
-    x = x ^ (x >> np.uint64(27))
-    x = x * _M2
-    return x ^ (x >> np.uint64(31))
+    """The splitmix64 finalizer: spreads every input bit over the 64 output bits (uint64 arithmetic wraps).
+    Two temporaries, not seven: on a 60M-row batch the allocations cost more than the arithmetic."""
+    y = np.right_shift(x, np.uint64(30))
+    y ^= x
+    y *= _M1
+    t = np.right_shift(y, np.uint64(27))
+    y ^= t
+    y *= _M2
+    np.right_shift(y, np.uint64(31), out=t)
+    y ^= t
+    return y
 
 
 def _value_hashes(values: pa.Array) -> np.ndarray:
@@ -77,6 +82,10 @@ def _column_hash(column, as_float: bool = False) -> np.ndarray:
             raise TypeError(f"join key types differ: {column.type} has values with no exact double, so it cannot be "
                             f"joined with a float key ({e})") from e
     a = np_arrow.canonical_floats(a)
+    if pa.types.is_integer(a.type) or pa.types.is_floating(a.type):
+        # the same hash per row as per distinct value below, without building a dictionary (F-058: encoding 60M
+        # int64 join keys took most of a Grace join's partition pass)
+        return _value_hashes(a)
     enc = pc.dictionary_encode(a, null_encoding="encode")
     return _value_hashes(enc.dictionary)[np_arrow.to_numpy(enc.indices).astype(np.int64)]
 
@@ -85,10 +94,12 @@ def hash_keys(table: pa.Table, names: List[str], salt: int = 0, as_float=None) -
     """A deterministic uint64 per row from the values of the key columns `names` (equal keys, equal hash).
     `as_float[i]`: key i is joined with a float column, so integers hash as the double of the same value (1 and 1.0
     must land in one partition; F-090)."""
-    h = _mix(np.full(table.num_rows, salt + 1, dtype=np.uint64))
+    h = _mix(np.array([salt + 1], dtype=np.uint64))         # the same for every row: one value, broadcast below
     for i, name in enumerate(names):
-        h = _mix(h * _M1 + _column_hash(table.column(name), bool(as_float and as_float[i])))
-    return h
+        c = _column_hash(table.column(name), bool(as_float and as_float[i]))
+        c += h * _M1
+        h = _mix(c)
+    return h if len(h) == table.num_rows else np.full(table.num_rows, h[0], dtype=np.uint64)
 
 
 class SpillError(OSError):
@@ -232,7 +243,7 @@ class Partitioned:
 
     def _write(self, table: pa.Table) -> None:
         part = ((hash_keys(table, self.keys, self.salt, self.as_float) >> np.uint64(33)) % np.uint64(PARTITIONS)).astype(np.int64)
-        order = np.argsort(part, kind="stable")                      # keeps the batch order inside a partition
+        order = np.argsort(part.astype(np.uint8), kind="stable")     # radix sort on 0..15; keeps the batch order
         counts = np.bincount(part, minlength=PARTITIONS)
         taken = np_arrow.take_rows(table, order)
         at = 0
