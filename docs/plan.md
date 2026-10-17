@@ -1071,8 +1071,9 @@ Found in the F-108 review (2026-10-16); also on main
 - Not done, found on the way (also on main): a constant next to an aggregate (`select g, 1 as c, count(*) ... group by g`) raises "must appear in the GROUP BY"; `(select date '..')` as a scalar subquery; `min(date '..')`; `extract(year from date '..')` on a bare literal.
 - Review fix (2026-10-16): a temporal value meeting an int32 day column is read as days (`compiler._align_temporal`: int32 -> date32), and `date - int32/date` is the day count (int64); derived-table shapes added to the test (139 total).
 
-## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [todo]
+## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [done]
 Found by the F-114 / F-115 developer (2026-10-16)
+<<<<<<< HEAD
 - [ ] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
 - [ ] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
 - [ ] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
@@ -1085,3 +1086,22 @@ Asked for by the user (2026-10-16), after the core benchmark. Second anxiety aft
 
 ## F-121 Mojo engine API without the Python front end [todo]
 From the user (2026-10-16): another project needs the Mojo engine directly, with no Python planning or SQL front end. The user will provide the spec; nothing to build until then (see also `docs/mxframe-mojo-api.md` and the "Rings" section)
+=======
+- [x] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
+- [x] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
+- [x] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
+- [x] DuckDB-checked tests for each; fails before
+- Note (2026-10-16): `upper()` is not in the engine (not part of this ticket). Also fixed: GPU `gather_table` crashed on a NULL-typed column (aot_kernels.py); GROUP BY naming a constant (alias or position) is no key. `(select date ..)` with WHERE / LIMIT / HAVING is refused, `min(date ..) over (...)` is refused. Follow-ups: F-117, F-118, F-119.
+
+## F-117 SQL ORDER BY an expression of a computed alias gives KeyError '__calc1' [todo]
+Found in the F-116 review (2026-10-16)
+- [ ] a grouped query that orders by an expression over a computed SELECT alias (e.g. `select g, 1 as c, count(*) as n ... group by g order by c + 1`) raises `KeyError: '__calc1'`; DuckDB orders by the value. Reproduce first, fix at the cause (ORDER BY translation in `_build_aggregate`), DuckDB-checked tests
+
+## F-118 SQL `select id, 1 as c from t` without aggregates gives a float, not an integer [todo]
+Found in the F-116 review (2026-10-16)
+- [ ] a bare integer (and boolean) literal in a plain SELECT list is broadcast as float32 / float64 by `_eval_expr_arrow` (`lit`); DuckDB returns INTEGER (BOOLEAN). F-116 keeps the type only for constants beside aggregates (`_exact_lit`). Give every constant output column its type; check CASE / COALESCE branches that rely on the float broadcast; DuckDB-checked tests
+
+## F-119 `extract(year from <int32 day column with NULLs>)` in WHERE raises [todo]
+Found in the F-116 review (2026-10-16); also on main
+- [ ] `WHERE extract(year from dd) = 2024` over an int32 day-number column that has NULLs raises "Cannot evaluate predicate op 'year_days' in PyArrow" (the native path declines "year_days over a column with nulls" and PyArrow has no kernel). Make the fallback evaluate it (NULL stays NULL, so the row is not kept); DuckDB-checked test with NULL days
+>>>>>>> worktree-agent-af73c9d831ef98cef
