@@ -1092,24 +1092,43 @@ def _auto_may_count_codes(plan, prefer, placement) -> bool:
 
 
 def _auto_codes_decision(plan):
-    """A CPU decision for a plan whose COUNT(DISTINCT) input kept dictionary codes (the native count reads them; the
-    GPU path cannot), else None and the cost model decides. A Parquet source not yet read (explain) counts as coded."""
-    from .io_parquet import _is_dict
+    """A CPU decision when a COUNT(DISTINCT b) per a counts dictionary codes (the native count reads them; the GPU
+    path cannot), else None and the cost model decides. Coded means a or b is a dictionary column in the resolved
+    plan; for a Parquet source not read yet (explain), a string column, which the reader keeps as a dictionary."""
+    from .io_parquet import count_distinct_shape
     from . import auto_mode as _am
-    stack, coded = [plan], False
-    while stack and not coded:
+    stack = [plan]
+    while stack:
         p = stack.pop()
-        if isinstance(p, ParquetScan):
-            coded = True
-        elif isinstance(p, Scan):
-            coded = any(_is_dict(t) for t in p.table.schema.types)
+        if count_distinct_shape(p):
+            arg = p.aggs[0].args[0]
+            names = {p.group_by[0].args[0]} | ({arg.args[0]} if arg.op == "col" else set())
+            # the pair's own columns, as stored by the sources (the shape takes bare columns; a plan's schema shows
+            # a dictionary's value type)
+            types = []
+            for leaf in _plan_leaves(p):
+                if isinstance(leaf, Scan):
+                    types += [(leaf.table.schema.field(n).type, False) for n in names if n in leaf.table.column_names]
+                elif isinstance(leaf, ParquetScan):
+                    types += [(leaf.schema.field(n).type, True) for n in names if n in leaf.schema.names]
+            if any(pa.types.is_dictionary(t) or (unread and (pa.types.is_string(t) or pa.types.is_large_string(t)))
+                   for t, unread in types):
+                d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
+                d.cpu_path = "native executor (count distinct on codes)"
+                return d
         stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
                      if x is not None)
-    if not coded:
-        return None
-    d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
-    d.cpu_path = "native executor (count distinct on codes)"
-    return d
+    return None
+
+
+def _plan_leaves(plan):
+    stack = [plan]
+    while stack:
+        p = stack.pop()
+        kids = [x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None)) if x is not None]
+        if not kids:
+            yield p
+        stack.extend(kids)
 
 
 def _has_count_distinct(plan) -> bool:

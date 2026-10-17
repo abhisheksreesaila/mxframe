@@ -849,3 +849,18 @@ def test_the_native_join_probe_measures_each_build_size():
     for m in cal_mod.NATIVE_JOIN_BUILDS:
         assert len({n for n, b in grid if b == m}) >= 3            # three sizes: a line per build size
     assert p.bucketed and max(n for n, _ in grid) <= p.max_rows
+
+
+def test_the_native_group_probe_measures_past_the_cache_cliff():
+    """F-128 review: a measured native_group replaces the defaults, so its probe must reach the 1M-group cliff."""
+    p = cal_mod.PROBES[("native_group", "cpu")]
+    grid = p.grid(cal_mod.QUICK_SIZES)
+    for c in cal_mod.NATIVE_GROUP_CARDS:
+        assert len({n for n, g in grid if g == c}) >= 3, c          # a line per group count
+    assert max(g for _, g in grid) >= 1_000_000
+
+
+def test_the_native_join_probe_builds_the_labelled_size():
+    p = cal_mod.PROBES[("native_join", "cpu")]
+    for n, m in p.grid(cal_mod.QUICK_SIZES):
+        assert m <= n // 2                                           # min(card, n // 2) keeps the label's size

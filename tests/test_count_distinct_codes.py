@@ -271,9 +271,33 @@ def test_auto_with_plain_columns_is_priced_by_the_cost_model(seen):
     assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
 
 
-def test_explain_says_what_compute_does(seen):
+@pytest.mark.parametrize("source,counted,coded", [("memory", "s", True), ("memory", "p", False),
+                                                  ("parquet", "p", True), ("parquet", "d", False)])
+def test_explain_says_what_compute_does(seen, tmp_path, source, counted, coded):
+    """F-128 review: explain treated every unread Parquet file as coded (an int-only Q16 shape said "codes" while
+    compute priced it). A string column read from Parquet is kept as a dictionary; an int one is not."""
+    import mxframe as mx
+    import pyarrow.parquet as pq
     t = _table(n=400_000)
-    lf = LazyFrame(t).select("a", "s").distinct().groupby("a").agg(col("s").count().alias("n"))
+    if source == "parquet":
+        pq.write_table(t.select(["a", "p", "d"]), tmp_path / "t.parquet")
+        base = mx.scan_parquet(str(tmp_path / "t.parquet"))
+    else:
+        base = LazyFrame(t)
+    lf = base.select("a", counted).distinct().groupby("a").agg(col(counted).count().alias("n"))
     text = lf.explain(device="auto")
     lf.compute(device="auto")
-    assert lf.last_compile_provenance["auto_reason"] in text
+    reason = lf.last_compile_provenance["auto_reason"]
+    assert reason in text
+    assert ("dictionary codes" in reason) == coded
+
+
+def test_a_dictionary_column_elsewhere_in_the_plan_does_not_count(seen):
+    """Only the counted pair matters: a dictionary column used in a filter leaves an int pair to the cost model."""
+    t = _table(n=30_000)
+    lf = (LazyFrame(t).filter(col("s") == lit("MAIL")).select("a", "v").distinct().groupby("a")
+          .agg(col("v").count().alias("n")))
+    got = lf.compute(device="auto")
+    exp = _duck("SELECT a, COUNT(DISTINCT v) FROM t WHERE s = 'MAIL' GROUP BY a", t=t)
+    assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
+    assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]

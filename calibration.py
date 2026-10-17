@@ -616,7 +616,7 @@ _DEFAULT_FITS: Dict[str, Tuple[float, float, float]] = {
     "native_group@cpu:g8": (0.5, 0.55, 0.0), "native_group@cpu:g1000": (0.5, 0.72, 0.0),
     "native_group@cpu:g100000": (0.5, 1.0, 0.0), "native_group@cpu:g1000000": (0.5, 9.5, 0.0),
     # join: ms per M rows of both sides, by build-side rows (measured: 0.94-1.03 for 250k-1M builds, 1.9 for 2M,
-    # 5.2 for 8M; probe sides 4:1 and 32:1)
+    # 5.2 for 8M, with probe:build sides 4:1 and 32:1; `mx.calibrate()` measures 1:1 to 2.75:1 per build size)
     "native_join@cpu:g250000": (0.5, 0.95, 0.0), "native_join@cpu:g2000000": (0.5, 1.9, 0.0),
     "native_join@cpu:g8000000": (0.5, 5.2, 0.0),
 }
@@ -1162,7 +1162,15 @@ def _p_native_filter(ctx, n, card):
                        .groupby().agg(col("v").sum().alias("s")))
 
 
-@probe("native_group", "cpu", uses_card=True, bucketed=True)
+NATIVE_GROUP_CARDS = (8, 1_000, 100_000, 1_000_000)      # 1M: past the cache cliff (~10x per row on the ref box)
+
+
+def _native_group_grid(sizes):
+    """(rows, groups): every size with at least as many rows as groups, so the 1M-group cliff is measured too."""
+    return [(n, c) for c in NATIVE_GROUP_CARDS for n in sizes if n >= max(c, 100_000)]
+
+
+@probe("native_group", "cpu", uses_card=True, bucketed=True, grid=_native_group_grid)
 def _p_native_group(ctx, n, card):
     from .lazy_frame import LazyFrame
     from .lazy_expr import col
@@ -1174,7 +1182,7 @@ NATIVE_JOIN_BUILDS = (250_000, 2_000_000, 8_000_000)     # build-side rows: in c
 
 def _native_join_grid(sizes):
     """(rows of both sides, build-side rows): three sizes per build size, so each gets its own line."""
-    return [(int(m * k), m) for m in NATIVE_JOIN_BUILDS for k in (1.5, 2.5, 3.75)]
+    return [(int(m * k), m) for m in NATIVE_JOIN_BUILDS for k in (2.0, 3.0, 3.75)]   # build <= half of n, n <= 30M
 
 
 @probe("native_join", "cpu", max_rows=30_000_000, uses_card=True, bucketed=True, grid=_native_join_grid)
