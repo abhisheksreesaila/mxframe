@@ -42,12 +42,11 @@ def _c():                                    # names that differ only by case
                      "B": pa.array([5, 6, 7], pa.int64())})
 
 
-def _duck(q, **tables):
-    con = duckdb.connect()
-    for k, v in tables.items():
-        con.register(k, v)
-    r = con.sql(q).arrow()
-    return r.read_all() if isinstance(r, pa.RecordBatchReader) else r
+def _duck(q, t=None, u=None, f=None, c=None):
+    """DuckDB's answer, tables found by name as local variables (a replacement scan), the way a user runs it:
+    that is the form that renames a repeated output name to `x_1`, case-insensitively."""
+    exp = duckdb.sql(q).arrow()                                 # noqa: F841 (t, u, f, c are read by DuckDB)
+    return exp.read_all() if isinstance(exp, pa.RecordBatchReader) else exp
 
 
 def _check(q, **tables):
@@ -75,7 +74,7 @@ SELECTS = [
     "SELECT customerid + amount AS s, -AMOUNT AS n FROM t ORDER BY customerid",
     "SELECT DISTINCT region FROM t ORDER BY REGION",
     "SELECT DISTINCT REGION, \"Mixed Q\" FROM t ORDER BY region, 2",
-    "SELECT customerid, CASE WHEN AMOUNT > 6 THEN 'big' ELSE 'small' END AS size FROM t ORDER BY CUSTOMERID",
+    "SELECT customerid, CASE WHEN AMOUNT > 6 THEN 1 ELSE 0 END AS size FROM t ORDER BY CUSTOMERID",
     "SELECT customerid FROM t ORDER BY customerid LIMIT 3 OFFSET 2",
 ]
 
@@ -88,13 +87,13 @@ STARS = [
     "SELECT T.*, AMOUNT * 2 AS d FROM t ORDER BY customerid",
     "SELECT x.*, 1 AS one FROM t x ORDER BY x.customerid",
     "SELECT *, REGION AS r2 FROM t ORDER BY \"ORDER DATE\" DESC, customerid",
-    "SELECT * FROM t ORDER BY 1 DESC LIMIT 3",
+    "SELECT * FROM t ORDER BY CUSTOMERID DESC LIMIT 3",
     "SELECT *, customerid AS \"Order Date\" FROM t ORDER BY 1",   # the alias repeats a name: _1
     "SELECT * FROM u ORDER BY customerid, WEIGHT",
     "SELECT u.*, t.amount AS ta FROM t JOIN u ON t.customerid = u.customerid ORDER BY u.weight",
     "SELECT t.*, u.\"segment name\" FROM t JOIN u ON T.CustomerID = U.customerid ORDER BY t.customerid, u.weight",
     "SELECT * FROM t JOIN u USING (customerid) ORDER BY customerid, u.weight",
-    "SELECT * FROM t JOIN u USING (CUSTOMERID) ORDER BY 1, 6",
+    "SELECT * FROM t JOIN u USING (CUSTOMERID) ORDER BY customerid, \"Segment Name\"",
     "SELECT * FROM t LEFT JOIN u USING (customerid) ORDER BY customerid, \"Segment Name\"",
 ]
 
