@@ -456,3 +456,59 @@ def test_peak_memory_of_a_grace_join_is_bounded_by_the_budget(files, _env):
     assert bounded["arrow_peak"] < 6 << 20, bounded
     assert whole["arrow_peak"] > 12 << 20, whole
     assert spill_leftovers(_env) == []
+
+
+# --- 7. NULL keys, big integers against floats, the hot key in the error -------------------------------------------
+
+NULL_JOINS = {
+    "inner": "SELECT count(*) AS n, sum(v) AS sv, sum(w) AS sw FROM a JOIN b ON a.k = b.k",
+    "left": "SELECT count(*) AS n, count(w) AS nw, sum(v) AS sv FROM a LEFT JOIN b ON a.k = b.k",
+    "semi": "SELECT count(*) AS n, sum(v) AS sv FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+    "anti": "SELECT count(*) AS n, sum(v) AS sv FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.k = a.k)",
+}
+
+
+@pytest.mark.parametrize("how", sorted(NULL_JOINS))
+def test_files_that_are_mostly_null_keys_join_without_a_hot_partition(tmp_path, monkeypatch, _env, how):
+    """80% NULL keys on both sides all hash to one partition at every salt. They never match, so they are never
+    partitioned: dropped, or (left, anti) emitted without a partner."""
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "1M")
+    rng = np.random.default_rng(31)
+    n = 150_000
+    f = {}
+    for name, extra in (("a", "v"), ("b", "w")):
+        t = pa.table({"k": pa.array(rng.integers(0, 30_000, n).astype(np.int64), mask=rng.random(n) < 0.8),
+                      extra: rng.integers(0, 10, n).astype(np.int64)})
+        f[name] = str(tmp_path / f"{name}.parquet")
+        pq.write_table(t, f[name], row_group_size=10_000)
+    lf, g = check(NULL_JOINS[how], f, "cpu")
+    assert g["null_key_rows"] > 100_000, g
+    assert spill_leftovers(_env) == []
+
+
+def test_an_integer_with_no_exact_double_against_a_float_key_is_a_type_error_like_in_memory(tmp_path, monkeypatch, _env):
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "300K")
+    n = 40_000
+    a = pa.table({"k": np.arange(n, dtype=np.int64) + 2 ** 53 + 1, "v": np.ones(n)})
+    b = pa.table({"k": np.arange(n, dtype=np.float64), "w": np.ones(n)})
+    f = {}
+    for name, t in (("a", a), ("b", b)):
+        f[name] = str(tmp_path / f"{name}.parquet")
+        pq.write_table(t, f[name], row_group_size=4_000)
+    with pytest.raises(TypeError, match="join key types differ"):
+        run_sql("SELECT count(*) AS n FROM a JOIN b ON a.k = b.k", f)
+    assert spill_leftovers(_env) == []
+
+
+def test_the_memory_error_names_the_hot_key_and_its_row_count(tmp_path, monkeypatch, _env):
+    from mxframe import spill
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "2M")
+    monkeypatch.setattr(spill, "MAX_DEPTH", 2)
+    n = 100_000
+    t = pa.table({"k": np.full(n, 7, dtype=np.int64), "v": np.arange(n, dtype=np.float64)})
+    f = {}
+    for name in ("a", "b"):
+        f[name] = str(tmp_path / f"{name}.parquet")
+        pq.write_table(t, f[name], row_group_size=10_000)
+    with pytest.raises(MemoryError, match=r"most repeated key is k=7, 100,000 (left|right) rows"):
+        run_sql("SELECT count(*) AS n FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.k)", f)

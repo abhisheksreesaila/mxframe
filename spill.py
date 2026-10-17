@@ -71,7 +71,11 @@ def _column_hash(column, as_float: bool = False) -> np.ndarray:
     if pa.types.is_dictionary(a.type):
         a = a.dictionary_decode()
     if as_float:                                   # a join key compared with a float key: hash the value as a double
-        a = pc.cast(a, pa.float64())
+        try:
+            a = pc.cast(a, pa.float64())
+        except pa.ArrowInvalid as e:                # same error as the in-memory join (join_engine)
+            raise TypeError(f"join key types differ: {column.type} has values with no exact double, so it cannot be "
+                            f"joined with a float key ({e})") from e
     a = np_arrow.canonical_floats(a)
     enc = pc.dictionary_encode(a, null_encoding="encode")
     return _value_hashes(enc.dictionary)[np_arrow.to_numpy(enc.indices).astype(np.int64)]
@@ -202,7 +206,6 @@ class Partitioned:
 
     def __init__(self, root: SpillDir, keys: List[str], salt: int, depth: int, as_float=None):
         self.root, self.keys, self.salt, self.as_float = root, list(keys), salt, as_float
-        self.schema: Optional[pa.Schema] = None      # of the first table written (a partition without a file has none)
         self._base = root.name()
         self._writers: dict = {}
         self._sinks: dict = {}
@@ -232,7 +235,6 @@ class Partitioned:
         order = np.argsort(part, kind="stable")                      # keeps the batch order inside a partition
         counts = np.bincount(part, minlength=PARTITIONS)
         taken = np_arrow.take_rows(table, order)
-        self.schema = self.schema or taken.schema
         at = 0
         for i, c in enumerate(counts.tolist()):
             if c:

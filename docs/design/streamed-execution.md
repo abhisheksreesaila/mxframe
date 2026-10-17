@@ -260,3 +260,10 @@ times its input); the output of a join with many matches per key is not bounded 
 it reads; the partial aggregate above it is what keeps it small). The sides' partition files are written one side
 after the other, then read pair by pair, so the disk needs about the size of the columns of both sides. A join of
 three big tables nests (sides are materialised to disk once per level); there is no cost-based order.
+
+**NULL keys (review fix).** A NULL key never matches, but every NULL hashes to one partition at every salt, which no split
+can divide. So they are never partitioned: right rows with any NULL key are dropped for every join kind; left ones are
+dropped for inner / semi, and for left / anti written to their own file and emitted after the right side is partitioned,
+each chunk joined against an empty right table (NULL columns for left, the row as is for anti). The right side is
+therefore partitioned first. A `MemoryError` for a key that cannot split names the most repeated key and its rows.
+An integer with no exact double joined with a float key raises the in-memory `TypeError: join key types differ`.

@@ -30,8 +30,10 @@ from typing import Iterator, Optional
 import pyarrow as pa
 
 from . import spill as _spill
+from .np_arrow import empty as _empty
 from . import streamed as _s
 from .gpu_budget import fmt_bytes
+from ._lazy_pc import pc
 from .lazy_expr import Expr, col
 from .lazy_frame import Join, LazyFrame, LogicalPlan, Project, Scan
 from .io_parquet import _renamed_ref, streaming
@@ -80,7 +82,7 @@ class Grace:
     def info(self) -> dict:
         return {"partitions": _spill.PARTITIONS, "partitions_total": self.root.partitions, "depth": self.root.depth,
                 "pairs": self.stats["pairs"], "chunked": self.stats["chunked"], "split": self.stats["split"],
-                "skipped": self.stats["skipped"], "how": self.join.how, "pair_target_bytes": self.target}
+                "skipped": self.stats["skipped"], "null_key_rows": self.stats["null_key_rows"], "how": self.join.how, "pair_target_bytes": self.target}
 
     # --- what each side has to deliver ---------------------------------------------------------------------------
 
@@ -137,7 +139,10 @@ class Grace:
             _s._active.reset(token)
         yield out
 
-    def _partition(self, side: LogicalPlan, other: LogicalPlan, keys, schema, which: int) -> _spill.Partitioned:
+    def _partition(self, side: LogicalPlan, other: LogicalPlan, keys, schema, which: int, nulls=None) -> _spill.Partitioned:
+        """Hash-partition one side. A row with a NULL key never matches, and all of them would hash to one partition
+        that no split can divide: right rows with a NULL key are dropped; left ones are dropped for inner / semi and
+        written to `nulls` for left / anti, which emit them without a partner."""
         cols = self._needed(side, other, schema, set(keys))
         plan = side if cols is None else Project(side, [col(c) for c in cols])
         parts = _spill.Partitioned(self.root, keys, 0, 1, self.as_float)
@@ -145,10 +150,19 @@ class Grace:
         for t in self._rows(plan):
             t = _s._plain(t)
             first = first or t.schema
+            null = None
+            for k in keys:
+                c = t.column(k)
+                null = pc.is_null(c) if null is None else pc.or_(null, pc.is_null(c))
+            if null is not None and pc.any(null).as_py():
+                self.stats["null_key_rows"] += pc.sum(pc.cast(null, pa.int64())).as_py()
+                if nulls is not None:
+                    nulls.write(t.filter(null))
+                t = t.filter(pc.invert(null))
             parts.write(t)
         parts.finish()
         if first is None and schema is not None:                      # a side with no rows: its declared columns
-            first = _s._plain(pa.schema([schema.field(c) for c in (cols or schema.names)]).empty_table()).schema
+            first = _s._plain(_empty(pa.schema([schema.field(c) for c in (cols or schema.names)]))).schema
         self.schemas[which] = first
         return parts
 
@@ -164,16 +178,42 @@ class Grace:
             rt = _value_type(rs.field(b).type) if rs is not None and b in rs.names else None
             self.as_float.append(bool(lt is not None and rt is not None and _numeric(lt) and _numeric(rt)
                                       and (pa.types.is_floating(lt) or pa.types.is_floating(rt))))
-        lp = self._partition(j.left, j.right, j.left_on, ls, 0)
         rp = self._partition(j.right, j.left, j.right_on, rs, 1)
+        nulls = _spill.Partitioned(self.root, j.left_on, 0, 1) if j.how in ("left", "anti") else None
+        lp = self._partition(j.left, j.right, j.left_on, ls, 0, nulls)
+        if nulls is not None:
+            nulls.finish()
+            empty = self._empty(1)
+            for i in range(_spill.PARTITIONS):
+                for chunk in self._chunks(nulls.read(i), self.target // 2):
+                    yield self._compute(chunk, empty), None, "left rows with a NULL key"
         for i in range(_spill.PARTITIONS):                 # (the resident tables are cached by the caller's stream context)
             yield from self._pair(lp, rp, i, 1, 0)
+
+    def _hot_key(self, lp, rp, i: int) -> str:
+        """', the most repeated key is K (N rows on the left side)': counted a table at a time, so it needs no
+        more memory than the partition's batches."""
+        best = None
+        for name, parts, keys in (("left", lp, self.join.left_on), ("right", rp, self.join.right_on)):
+            counts = []
+            for t in parts.read(i):
+                counts.append(t.select(keys).group_by(keys).aggregate([([], "count_all")]))
+            if not counts:
+                continue
+            total = pa.concat_tables(counts).group_by(keys).aggregate([("count_all", "sum")])
+            top = total.sort_by([("count_all_sum", "descending")]).slice(0, 1).to_pylist()[0]
+            if best is None or top["count_all_sum"] > best[1]:
+                best = (name, top["count_all_sum"], {k: top[k] for k in keys})
+        if best is None:
+            return ""
+        key = ", ".join(f"{k}={v!r}" for k, v in best[2].items())
+        return f" (the most repeated key is {key}, {best[1]:,} {best[0]} rows)"
 
     def _empty(self, side: int) -> pa.Table:
         sch = self.schemas[side]
         if sch is None:
             raise _spill.SpillError("grace join: a side produced no schema")
-        return sch.empty_table()
+        return _empty(sch)
 
     def _chunks(self, tables, limit: int):
         cur, size = [], 0
@@ -222,7 +262,8 @@ class Grace:
                     f"grace join: the rows of one join-key partition ({lrows:,} left rows, {fmt_bytes(lb)}, and "
                     f"{rrows:,} right rows, {fmt_bytes(rb)}) are still bigger than the share of the host memory "
                     f"budget ({fmt_bytes(self.target)}) after splitting the join key by hash {depth} times, and "
-                    f"cannot be split any further: one join key is repeated too often to join in memory")
+                    f"cannot be split any further: one join key is repeated too often to join in memory"
+                    f"{self._hot_key(lp, rp, i)}")
             self.stats["split"] += 1
             nl = _spill.Partitioned(self.root, self.join.left_on, salt + 1, depth + 1, self.as_float)
             for t in lp.read(i):
