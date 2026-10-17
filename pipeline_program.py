@@ -520,8 +520,10 @@ class _Builder:
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
         self.skip_bounds = False       # name the columns only: no pass over the data (year_days' range, a dictionary)
-        self.int_regs = True           # False: the columns are not the kernels' own arrays, or the caller only asks whether the
-                                       # type ranges prove the program exact: integer arithmetic stays in float64 or raises Inexact
+        self.int_regs = True           # False: the columns are not the kernels' own arrays (a fused join's gathered partner columns):
+                                       # no LOADI, an integer column is loaded as a double (range-checked) and converted with F2I
+        self.types_only = False        # True: the caller only asks whether the column TYPES prove the program exact in float64
+                                       # (the late stage, whose compiled graph has no int64): integer arithmetic past 2^53 raises Inexact
         self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.plain_str: List[str] = []                 # plain utf8 columns matched by OP_STR
@@ -829,7 +831,7 @@ class _Builder:
                 # now, F-060b): compute it in int64. A result outside int64 sets the kernel's flag and Arrow's
                 # checked kernels raise like DuckDB; a float operation that later reads it converts (I2F) and
                 # flags a value outside +-2^53.
-                if not self.int_regs:
+                if self.types_only:
                     raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
                 iop = {OP_ADD: OP_IADD, OP_SUB: OP_ISUB, OP_MUL: OP_IMUL}[code]
                 return _Val(self.emit(iop, self.int_reg(a), self.int_reg(b)), kind, bound, "i")
@@ -1117,7 +1119,7 @@ class _Builder:
 
 def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
                      concat_dicts: bool = False, exact_bounds: bool = True,
-                     int_regs: bool = True) -> Optional[PipelineProgram]:
+                     int_regs: bool = True, types_only: bool = False) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
@@ -1128,13 +1130,16 @@ def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
     ``exact_bounds=False`` skips what reads the data (``year_days``' range): the program is only good for naming its
     columns (``.columns``), never to run.
 
-    ``int_regs`` (F-060c, F-060b): integer arithmetic that the column types cannot keep within 2^53, and the MIN / MAX of
-    an integer column, run in int64 registers (``OP_LOADI`` / ``OP_IADD`` ..., ``imin`` / ``imax`` slots), exact past
-    2^53. False where the columns are not the kernels' own arrays (a fused join's gathered partner columns): the
-    program keeps float registers, and integer arithmetic the types cannot prove exact makes it ``None``.
+    ``int_regs`` (F-060c, F-060b): integer columns are read as int64 (``OP_LOADI``): the MIN / MAX of an integer column
+    (``imin`` / ``imax`` slots) and integer arithmetic the column types cannot keep within 2^53 are exact past 2^53.
+    False where the columns are not the kernels' own arrays (a fused join's gathered partner columns): they are loaded
+    as doubles (range-checked) and converted, so the arithmetic is still int64 but a column past 2^53 declines.
+
+    ``types_only`` (F-060b): ``None`` (via ``Inexact``) for integer arithmetic the column types cannot prove within
+    2^53, instead of int64 ops: the question the late stage asks, whose compiled graph has no int64.
     """
     try:
-        return _compile(predicates, aggs, table, concat_dicts, exact_bounds, int_regs)
+        return _compile(predicates, aggs, table, concat_dicts, exact_bounds, int_regs, types_only)
     except Unsupported:
         return None
 
@@ -1194,7 +1199,7 @@ def _int_valued(e: Expr, table: pa.Table) -> bool:
 def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> bool:
     """Could a predicate or an aggregate (``aggs``) compute an integer past 2^53 (F-061: the compiled graph wraps at
     int64)? The caller then computes in Arrow with checked kernels. The question is asked of the column TYPES only
-    (``int_regs=False``: a program that may not use int64 registers, since the graph has none): an integer ``+ - *`` the
+    (``types_only=True``: a program that may not use int64 ops, since the graph has none): an integer ``+ - *`` the
     types cannot keep within 2^53 is inexact, and so is one the compiler can't take (Arrow's checked kernels answer
     it). Each expression is asked on its own, so one the compiler can't take (a string predicate) cannot hide
     another. The total of a sum is not asked about: the kernels add integers in int64 and say when a total passes it
@@ -1202,7 +1207,7 @@ def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> boo
     count_all = Expr("count", Expr("lit", 1))
     for e, as_pred in [(p, True) for p in preds] + [(a, False) for a in aggs if a.op != "count"]:
         try:
-            _compile([e], [count_all], table, int_regs=False) if as_pred else _compile([], [e], table, int_regs=False)
+            _compile([e], [count_all], table, types_only=True) if as_pred else _compile([], [e], table, types_only=True)
         except Inexact:
             return True
         except Unsupported:
@@ -1212,10 +1217,11 @@ def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> boo
 
 
 def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False,
-             exact_bounds: bool = True, int_regs: bool = True) -> PipelineProgram:
+             exact_bounds: bool = True, int_regs: bool = True, types_only: bool = False) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
     b.skip_bounds = not exact_bounds
-    b.int_regs = int_regs or not exact_bounds       # (a names-only program never runs: it must not decline)
+    b.int_regs = int_regs
+    b.types_only = types_only and exact_bounds      # (a names-only program never runs: it must not decline)
 
     # ── predicate section (dense rows) ─────────────────────────────────────
     pred_sec = _Section()

@@ -13,6 +13,8 @@ int32 (units), l_extendedprice as int64 (cents), l_discount and l_tax as int32 (
        (100 + tax)), avg(qty), count(*)                         (four int sums, 4 groups)
   Q6   sum(price * disc) where shipdate in 1994, disc between 5 and 7, qty < 24    (one int sum, global)
   Q18  the inner query: group by l_orderkey having sum(qty) > 300         (an int sum over 1.5M groups at SF1)
+  A1-A3 (F-060b)  int64 * int32 arithmetic the types cannot prove within 2^53: a global sum, a grouped sum + max, a
+       filter. On `main` each reads `price`'s min / max first (F-037); with F-060b they run in int64 registers.
 
 One fresh process per query; the first compute is a warm-up (imports, kernel load), then the minimum and the median
 of `--repeat` computes, in milliseconds, with the result type of the first sum. `--device cpu` (default) or `gpu`."""
@@ -35,6 +37,12 @@ QUERIES = {
     "Q6": ("select sum(price * disc) as revenue from li "
            "where ship >= 8766 and ship < 9131 and disc between 5 and 7 and qty < 24"),
     "Q18": "select l_orderkey, sum(qty) as sq from li group by l_orderkey having sum(qty) > 300",
+    # F-060b: integer + - * whose result the column types cannot keep within 2^53 (an int64 factor). Before F-060b each of
+    # these read the factor's min / max first (one parallel pass over 6M rows); now it runs in int64 registers.
+    "A1": "select sum(price * qty) as sp from li",
+    "A2": "select l_returnflag, l_linestatus, sum(price * qty - price) as sp, max(price + qty) as mp from li "
+          "group by l_returnflag, l_linestatus",
+    "A3": "select sum(qty) as sq from li where price * qty > 500000000",
 }
 
 

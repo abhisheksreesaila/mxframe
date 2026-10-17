@@ -2,8 +2,8 @@
 interpreter. F-037 bounded every int `*` `+` `-` from the columns' real min / max and declined; F-060b computes it in
 int64 registers (OP_IADD / ISUB / IMUL) when the column TYPES cannot keep it within 2^53, with a runtime flag instead of a
 pass over the data. Results equal DuckDB for every entry point that evaluates expressions: mx_execute (group-by and global
-aggregates), mx_filter (plain filters and star joins), mx_filter_topk, and the legacy fused pipeline. The compiler without
-int64 registers (`int_regs=False`: a fused join's gathered columns, the late-stage question) still declines."""
+aggregates), mx_filter (plain filters and star joins), mx_filter_topk, and the legacy fused pipeline. The compiler asked
+only whether the types prove it (`types_only=True`, the late-stage question) still declines."""
 import duckdb
 import numpy as np
 import pyarrow as pa
@@ -78,10 +78,10 @@ def test_the_compiler_computes_an_intermediate_past_2_53_in_int64(name):
     t = _table()
     prog = compile_pipeline([PREDS[name][0]()], [col("v").sum()], t)
     assert any(op in ("IADD", "ISUB", "IMUL") for op in prog.op_names()), prog.op_names()
-    assert compile_pipeline([PREDS[name][0]()], [col("v").sum()], t, int_regs=False) is None      # types alone cannot prove it
+    assert compile_pipeline([PREDS[name][0]()], [col("v").sum()], t, types_only=True) is None      # types alone cannot prove it
     prog = compile_pipeline([], [(col("a") * col("b")).max()], t)
     assert "IMUL" in prog.op_names() and prog.slot_kinds == ["imax"]
-    assert compile_pipeline([], [(col("a") * col("b")).max()], t, int_regs=False) is None
+    assert compile_pipeline([], [(col("a") * col("b")).max()], t, types_only=True) is None
 
 
 def test_small_integers_compile_to_int64_ops_when_the_type_could_overflow(monkeypatch):
@@ -118,7 +118,7 @@ def test_the_types_decide_and_no_query_reads_column_data(monkeypatch):
                  when(col("i") > lit(3), col("i"), col("j")) + col("j") > lit(5)):
         names = compile_pipeline([pred], [col("v").sum()], t).op_names()
         assert not {"IADD", "ISUB", "IMUL", "I2F"} & set(names), names
-        assert compile_pipeline([pred], [col("v").sum()], t, int_regs=False) is not None
+        assert compile_pipeline([pred], [col("v").sum()], t, types_only=True) is not None
     assert "IMUL" in compile_pipeline([col("i") * col("j") > lit(5)], [col("v").sum()], t).op_names()
     t64 = pa.table({"p": A(np.arange(n, dtype=np.int64)), "v": A(np.ones(n))})
     assert "IMUL" in compile_pipeline([col("p") * col("p") > lit(5)], [col("v").sum()], t64).op_names()
