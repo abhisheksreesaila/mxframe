@@ -440,6 +440,10 @@ class LazyFrame:
         if optimized:
             lines.append("PassTrace")
             lines.extend(trace if trace else ["no-op"])
+        from . import streamed as _streamed
+        stream = _streamed.describe(plan, device if device in ("cpu", "gpu") else "cpu")
+        if stream is not None:                         # a lazy Parquet source: will it stream (F-056 step 2)?
+            lines.extend(["Streaming", stream])
         if include_runtime:
             lines.append("LastCompileProvenance")
             if self._last_compile_provenance:

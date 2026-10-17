@@ -156,12 +156,12 @@ class _Decline(Exception):
 class _Spec:
     agg: Aggregate
     key_names: List[str]
-    out_names: List[str]                # the aggregate's output names, keys then aggregates
     partial: Aggregate                  # the per-batch plan
     merge_ops: List[tuple]              # (hidden column, merge op) in partial order
     finals: List[tuple]                 # per original aggregate: (kind, hidden columns, output name)
     types: dict = dataclasses.field(default_factory=dict)       # hidden column -> Arrow type
-    int_sums: set = dataclasses.field(default_factory=set)      # hidden columns of integer sums (see _State.result)
+    int_sums: dict = dataclasses.field(default_factory=dict)    # integer sum's hidden column -> (min, max) hidden columns
+    rows: str = "__rows"                                          # hidden count of the rows that reach the aggregate
 
 
 def _spec(agg: Aggregate) -> _Spec:
@@ -171,7 +171,7 @@ def _spec(agg: Aggregate) -> _Spec:
         if name is None:
             raise _Decline("a group key that is an unnamed expression")
         keys.append(name)
-    partial, merge_ops, finals, out = [], [], [], []
+    partial, merge_ops, finals = [], [], []
 
     def add(op, e, name, merge):
         partial.append(Expr(op, *e.args, **e.kwargs).alias(name))
@@ -188,20 +188,25 @@ def _spec(agg: Aggregate) -> _Spec:
         else:
             add(e.op, e, f"__p{i}", {"sum": "sum", "count": "sum", "min": "min", "max": "max"}[e.op])
             finals.append((e.op, (f"__p{i}",), name))
-        out.append(name)
-    return _Spec(agg, keys, keys + out, Aggregate(agg.input, list(agg.group_by), partial), merge_ops, finals)
+    return _Spec(agg, keys, Aggregate(agg.input, list(agg.group_by), partial), merge_ops, finals)
 
 
 def _argument_types(spec: _Spec) -> None:
-    """Types the hidden columns must have, from a zero-row dry run of the aggregate's arguments: a sum of an
-    integer is merged as int64 (the engine answers a double only for sums it proved exact below 2^53, so
-    merging doubles could round past it), a count is int64, min / max keep the argument's type."""
+    """Fix the types of the hidden columns, and of the result, from the engine itself.
+
+    A zero-row dry run of the aggregate's arguments says which are integers; a dry run of the original
+    aggregate gives the type the engine answers min / max with (float32 comes back as double). An integer sum
+    is merged as int64 whatever the engine answered per batch, and its result type is decided at the end by
+    the engine's own rule on the totals (`_State.result`), so it does not depend on how the rows were batched:
+    the argument's min and max and the number of rows reaching the aggregate travel as hidden partials."""
     agg = spec.agg
     args = [Expr(e.args[0].op, *e.args[0].args, **e.args[0].kwargs).alias(f"__a{i}") for i, e in enumerate(agg.aggs)]
     got = LazyFrame(Project(agg.input, args)).schema
+    zero = LazyFrame(agg).schema
     if got is None:
         raise _Decline("the aggregate's arguments cannot be typed")
-    for i, (kind, hidden, _) in enumerate(spec.finals):
+    need_rows = False
+    for i, (kind, hidden, name) in enumerate(spec.finals):
         t = got.field(f"__a{i}").type
         if pa.types.is_dictionary(t):
             t = t.value_type
@@ -210,11 +215,22 @@ def _argument_types(spec: _Spec) -> None:
                 raise _Decline(f"{kind}() over {t}")
             spec.types[hidden[0]] = pa.int64() if pa.types.is_integer(t) else pa.float64()
             if kind == "sum" and pa.types.is_integer(t):
-                spec.int_sums.add(hidden[0])
+                lo, hi = f"__p{i}lo", f"__p{i}hi"
+                a = agg.aggs[i].args[0]
+                for op, h in (("min", lo), ("max", hi)):
+                    spec.partial.aggs.append(Expr(op, a).alias(h))
+                    spec.merge_ops.append((h, op))
+                    spec.types[h] = t
+                spec.int_sums[hidden[0]] = (lo, hi)
+                need_rows = True
         elif kind in ("min", "max"):
-            spec.types[hidden[0]] = t
+            spec.types[hidden[0]] = zero.field(name).type if zero is not None and name in zero.names else t
         if kind in ("count", "mean"):
             spec.types[hidden[-1]] = pa.int64()
+    if need_rows:
+        spec.partial.aggs.append(Expr("count", Expr("lit", 1)).alias(spec.rows))
+        spec.merge_ops.append((spec.rows, "sum"))
+        spec.types[spec.rows] = pa.int64()
 
 
 @dataclasses.dataclass
@@ -294,17 +310,15 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
 
 # --- running the batches and merging ------------------------------------------------------------------------
 
-def _normal(spec: _Spec, t: pa.Table, key_types: Optional[dict], final: bool = False) -> pa.Table:
-    """A partial (or merged) table with plain keys and the hidden columns in their fixed types. The final
-    merge leaves integer sums as the engine answers them (a double where it proved the sum exact, else
-    int64), the type the same query gives in memory."""
+def _normal(spec: _Spec, t: pa.Table, key_types: Optional[dict]) -> pa.Table:
+    """A partial (or merged) table with plain keys and the hidden columns in their fixed types."""
     from .io_parquet import _decode_dict, _is_dict
     cols = []
     for name in t.column_names:
         c = t.column(name)
         if _is_dict(c.type):
             c = _decode_dict(c)
-        want = None if final and name in spec.int_sums else spec.types.get(name) or (key_types or {}).get(name)
+        want = spec.types.get(name) or (key_types or {}).get(name)
         if want is not None and c.type != want:
             c = pc.cast(c, want)
         cols.append(c)
@@ -322,8 +336,13 @@ class _State:
         self.empty: Optional[pa.Table] = None             # a partial with no groups: the answer if all are
         self.merges = 0
         self.peak_state = 0
+        self.engine_int64: set = set()                   # integer sums some batch answered as int64 (nulls, big values)
 
     def add(self, partial: pa.Table) -> None:
+        if self.spec.int_sums and partial.num_rows and pc.sum(partial.column(self.spec.rows)).as_py():
+            for h in self.spec.int_sums:
+                if pa.types.is_integer(partial.schema.field(h).type):
+                    self.engine_int64.add(h)
         t = _normal(self.spec, partial, self.key_types)
         if t.num_rows == 0 and self.spec.key_names:
             self.empty = t                               # a keyed aggregate of no rows holds no groups
@@ -335,18 +354,18 @@ class _State:
                                                       min(MIN_MERGE_BYTES, self.budget // 16)):
             self.merge()
 
-    def merge(self, final: bool = False) -> None:
+    def merge(self) -> None:
         parts = ([self.merged] if self.merged is not None else []) + self.pending
         self.pending = []
         if not parts:
             return
         table = parts[0]
-        if len(parts) > 1 or final:
+        if len(parts) > 1:
             aggs = [Expr(op, col(name)).alias(name) for name, op in self.spec.merge_ops]
             keys = [col(k) for k in self.spec.key_names]
             out = LazyFrame(Aggregate(Scan(pa.concat_tables(parts)), keys, aggs)).compute(
                 "cpu", optimize=False, validate=False)
-            table = _normal(self.spec, out, self.key_types, final)
+            table = _normal(self.spec, out, self.key_types)
         self.merged = table
         self.merges += 1
         self.peak_state = max(self.peak_state, table.num_rows)
@@ -356,8 +375,18 @@ class _State:
                 f"memory budget ({fmt_bytes(self.budget)}): this query needs hash-partitioned groups "
                 f"(F-056 step 3)")
 
+    def _integer_sum_is_exact_in_double(self, t: pa.Table, h: str) -> bool:
+        """The engine's rule, on the totals: an integer sum is a double when rows x max |value| stays within
+        2^53 and no batch needed Arrow's exact path (nulls in a column it reads, values past 2^53)."""
+        if h in self.engine_int64:
+            return False
+        lo_col, hi_col = self.spec.int_sums[h]
+        lo, hi = pc.min(t.column(lo_col)).as_py(), pc.max(t.column(hi_col)).as_py()
+        rows = pc.sum(t.column(self.spec.rows)).as_py() or 0
+        return lo is None or max(abs(lo), abs(hi)) * max(rows, 1) <= 2 ** 53
+
     def result(self) -> pa.Table:
-        self.merge(final=True)
+        self.merge()
         t = self.merged if self.merged is not None else self.empty
         arrays, names = [t.column(k) for k in self.spec.key_names], list(self.spec.key_names)
         for kind, hidden, name in self.spec.finals:
@@ -367,9 +396,32 @@ class _State:
                                  pa.scalar(None, pa.float64()))
             else:
                 arr = t.column(hidden[0])
+                if hidden[0] in self.spec.int_sums and self._integer_sum_is_exact_in_double(t, hidden[0]):
+                    arr = pc.cast(arr, pa.float64())
             arrays.append(arr)
             names.append(name)
         return pa.table(arrays, names=names)
+
+
+def describe(plan, device: str = "cpu") -> Optional[str]:
+    """One line for `explain()`: whether the plan would stream (and in how many batches) or why it would
+    not, decided exactly as `compute()` decides. None when the plan reads no Parquet source."""
+    if not any(isinstance(l, ParquetScan) for l in _leaves(plan)):
+        return None
+    if not enabled():
+        return "in memory: streaming is off (MXFRAME_STREAM=0)"
+    from . import native_exec
+    repro = native_exec.reproducible()
+    budget = host_budget(repro)
+    if budget is None:
+        return "in memory: the host memory size is unknown here"
+    got = None if _cheap_fits(plan, budget) else analyse(plan, budget, device, repro)
+    if got is None:
+        return f"in memory: fits the host budget of {fmt_bytes(budget)}"
+    if isinstance(got, str):
+        return f"would not stream: {got}"
+    return (f"streams in {len(got.batches)} batches of row groups ({len(got.leaf.groups)} of {got.all_groups} row groups "
+            f"read, host budget {fmt_bytes(budget)})")
 
 
 def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fraction, verbose: bool = False):

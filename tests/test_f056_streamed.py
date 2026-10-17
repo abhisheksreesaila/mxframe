@@ -7,6 +7,7 @@ partials are merged, and the result must equal DuckDB's over the same file on cp
 """
 import math
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -189,6 +190,55 @@ def test_a_streamed_result_has_the_dtypes_of_the_in_memory_one(files, monkeypatc
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "64G")
     whole = run(q1(files)[0], "cpu")
     assert streamed.schema == whole.schema
+
+
+def types_by_budget(path, build, budgets, device="cpu"):
+    """{budget: (schema, rows)} of the same query at several host budgets (so several batch counts)."""
+    out = {}
+    for b, in [(b,) for b in budgets]:
+        os.environ["MXFRAME_HOST_MEM_BUDGET"] = b
+        lf = build(scan_parquet(path))
+        got = run(lf, device)
+        out[b] = (got.schema, got.sort_by("k").to_pylist(), prov(lf).get("streamed", {}).get("batches"))
+    return out
+
+
+def test_an_integer_sum_has_the_type_it_has_in_memory_whatever_the_batch_count(tmp_path, monkeypatch):
+    """64k rows with one 2^41 value: rows x max value passes 2^53, so in memory the sum is int64. Every batch
+    alone (1,000 rows) is below 2^53, so the type must come from the totals, not from the batches."""
+    n = 64_000
+    x = np.zeros(n, dtype=np.int64)
+    x[0] = 2 ** 41
+    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "x": x}), 1000)
+    got = types_by_budget(path, lambda s: s.groupby("k").agg(col("x").sum().alias("s")), ["20K", "200K", "64G"])
+    assert got["64G"][2] is None                                   # in memory
+    assert got["20K"][2] > got["200K"][2] > 1                      # two different batch counts
+    assert {b: str(v[0].field("s").type) for b, v in got.items()} == {"20K": "int64", "200K": "int64", "64G": "int64"}
+    assert all(v[1] == [{"k": 0, "s": 2 ** 41}] for v in got.values())
+
+
+def test_a_small_integer_sum_is_a_double_in_memory_and_streamed(tmp_path):
+    n = 64_000
+    path = small_file(tmp_path, pa.table({"k": (np.arange(n) % 2).astype(np.int32), "x": np.arange(n, dtype=np.int64)}), 1000)
+    got = types_by_budget(path, lambda s: s.groupby("k").agg(col("x").sum().alias("s")), ["20K", "64G"])
+    assert {b: str(v[0].field("s").type) for b, v in got.items()} == {"20K": "double", "64G": "double"}
+    assert got["20K"][1] == got["64G"][1]
+
+
+def test_float32_min_max_and_the_other_aggregates_have_the_in_memory_types(tmp_path):
+    n = 40_000
+    rng = np.random.default_rng(1)
+    path = small_file(tmp_path, pa.table({"k": (np.arange(n) % 3).astype(np.int8), "f": rng.random(n).astype(np.float32),
+                                          "i": np.arange(n, dtype=np.int16), "u": np.arange(n, dtype=np.uint32)}), 1000)
+
+    def build(s):
+        return s.groupby("k").agg(col("f").sum().alias("fs"), col("f").mean().alias("fm"), col("f").min().alias("fmin"),
+                                  col("f").max().alias("fmax"), col("i").sum().alias("isum"), col("i").max().alias("imax"),
+                                  col("u").sum().alias("us"), col("u").count().alias("n"))
+    got = types_by_budget(path, build, ["20K", "64G"])
+    assert got["20K"][2] > 3
+    assert got["20K"][0] == got["64G"][0], (got["20K"][0], got["64G"][0])
+    assert str(got["64G"][0].field("fmin").type) == "double"
 
 
 def test_batches_come_from_the_row_groups_the_filter_leaves(files, monkeypatch):
@@ -412,14 +462,22 @@ PEAK = textwrap.dedent("""
     open("/proc/self/clear_refs", "w").write("5")   # VmHWM starts again from the current size
     base = status("VmRSS")
     out = lf.compute(device=sys.argv[2])
-    print(json.dumps({"rows": out.num_rows, "path": lf.last_compile_provenance["path"],
+    import mxframe
+    print(json.dumps({"module": mxframe.__file__, "rows": out.num_rows, "path": lf.last_compile_provenance["path"],
                       "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": status("VmHWM") - base}))
 """)
 
 
+def conftest_root():
+    import conftest
+    return os.path.realpath(conftest._shim / "mxframe")
+
+
 def peak(files, device, budget):
     import json
-    env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, MXFRAME_GPU_MEM_BUDGET=GPU)
+    import conftest                                  # its shim directory holds `mxframe` -> this checkout
+    env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, MXFRAME_GPU_MEM_BUDGET=GPU,
+               PYTHONPATH=os.pathsep.join([str(conftest._shim)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
     out = subprocess.run([sys.executable, "-c", PEAK, files["fact"], device], env=env, capture_output=True, text=True,
                          check=True, timeout=600)
     return json.loads(out.stdout.strip().splitlines()[-1])
@@ -431,8 +489,110 @@ def test_peak_memory_is_bounded_by_the_budget_not_the_file(files):
     decoded = N * (4 + 4 + 8 + 8 + 4 + 1)          # the file's columns as Arrow holds them (~170 MB)
     streamed = peak(files, "cpu", HOST)
     whole = peak(files, "cpu", "64G")
+    here = os.path.join(conftest_root(), "__init__.py")        # the checkout under test, not an installed mxframe
+    assert os.path.realpath(streamed["module"]) == os.path.realpath(whole["module"]) == here
     assert streamed["path"] == "streamed" and whole["path"] != "streamed"
     assert streamed["rows"] == whole["rows"] == 12
     assert streamed["arrow_peak"] < 40 << 20, streamed          # under the 40 MB budget
     assert whole["arrow_peak"] > 0.7 * decoded                  # the contrast: reading it whole holds the file
     assert streamed["rss_peak_growth"] < 0.5 * whole["rss_peak_growth"], (streamed, whole)
+
+
+# --- explain says what will happen ------------------------------------------------------------------------
+
+def test_explain_says_a_query_streams_in_so_many_batches(files):
+    lf, _, _ = q1(files)
+    text = lf.explain(optimized=True)
+    assert "Streaming" in text
+    line = next(l for l in text.splitlines() if l.startswith("streams in "))
+    assert re.fullmatch(r"streams in \d+ batches of row groups \(49 of 60 row groups read, host budget 40\.0 MB\)", line), line
+    run(lf, "cpu")
+    assert line == f"streams in {prov(lf)['streamed']['batches']} batches of row groups (49 of 60 row groups read, host budget 40.0 MB)"
+
+
+def test_explain_says_why_a_query_would_not_stream(files):
+    lf = scan_parquet(files["fact"]).sort("v").limit(5)
+    assert "would not stream: no aggregate above the big file" in lf.explain()
+
+
+def test_explain_says_when_the_data_fits(files, monkeypatch):
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "64G")
+    lf, _, _ = q1(files)
+    assert "in memory: fits the host budget of 64.0 GB" in lf.explain()
+
+
+# --- declines where a wrong answer would be silent --------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def silent(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f056silent")
+    n = 60_000
+    rng = np.random.default_rng(5)
+    fact = pa.table({"a": pa.array(rng.random(n), mask=np.arange(n) % 3 == 0),         # the first column holds NULLs
+                     "k": pa.array((np.arange(n) % 5).astype(np.int32), mask=np.arange(n) % 17 == 0),
+                     "j": rng.integers(0, 300, n).astype(np.int32), "x": rng.integers(0, 100, n).astype(np.int64)})
+    dim = pa.table({"id": np.arange(200, dtype=np.int32), "g": (np.arange(200) % 7).astype(np.int32)})
+    paths = {"fact": str(d / "fact.parquet"), "dim": str(d / "dim.parquet")}
+    pq.write_table(fact, paths["fact"], row_group_size=2000)
+    pq.write_table(dim, paths["dim"])
+    return paths
+
+
+SILENT = {
+    "semi (EXISTS) with the big file on the right": (
+        "SELECT g, count(*) AS n FROM dim WHERE EXISTS (SELECT 1 FROM fact WHERE fact.j = dim.id) GROUP BY g", "semi"),
+    "anti (NOT EXISTS) with the big file on the right": (
+        "SELECT g, count(*) AS n FROM dim WHERE NOT EXISTS (SELECT 1 FROM fact WHERE fact.j = dim.id AND fact.x > 98) "
+        "GROUP BY g", "anti"),
+    "IN (subquery over the big file)": (
+        "SELECT g, count(*) AS n FROM dim WHERE id IN (SELECT j FROM fact WHERE x > 97) GROUP BY g", "semi"),
+    "left join with the big file on the right": (
+        "SELECT g, count(x) AS n, count(*) AS c FROM dim LEFT JOIN fact ON fact.j = dim.id GROUP BY g", "left"),
+    "self-join of the big file": (
+        "SELECT f1.k, count(*) AS n FROM fact f1 JOIN (SELECT j, max(x) AS mx FROM fact GROUP BY j) f2 "
+        "ON f1.j = f2.j AND f1.x = f2.mx GROUP BY f1.k", None),
+    "scalar subquery over the big file in WHERE": (
+        "SELECT k, count(*) AS n FROM fact WHERE x > (SELECT avg(x) FROM fact) GROUP BY k", None),
+}
+
+
+def silent_reference(query, paths):
+    con = duckdb.connect()
+    for n, p in paths.items():
+        con.execute(f"CREATE VIEW {n} AS SELECT * FROM read_parquet('{p}')")
+    return con.sql(query).arrow().read_all()
+
+
+@pytest.mark.parametrize("name", sorted(SILENT))
+def test_a_shape_that_cannot_stream_gives_the_in_memory_answer(silent, monkeypatch, name):
+    import mxframe as mx
+    query, why = SILENT[name]
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "100K")
+    lf = mx.sql(query, fact=scan_parquet(silent["fact"]), dim=scan_parquet(silent["dim"]))
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        got = lf.compute(device="cpu")
+    said = [str(x.message) for x in w if "not streamed" in str(x.message)]
+    if why:                                    # a shape that must be declined says so, naming the join
+        assert said and why in said[0], said
+        assert prov(lf)["path"] != "streamed"
+    want = silent_reference(query, silent)
+    key = lambda r: tuple((v is None, str(v)) for v in r.values())            # noqa: E731
+    g, w_ = sorted(got.to_pylist(), key=key), sorted(want.to_pylist(), key=key)
+    assert len(g) == len(w_)
+    for a, b in zip(g, w_):
+        assert all(close(float(a[c]) if a[c] is not None and not isinstance(a[c], str) else a[c], b[c]) for c in b), (a, b)
+
+
+def test_count_star_counts_rows_when_the_first_column_and_the_keys_hold_nulls(silent, monkeypatch):
+    import mxframe as mx
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "100K")
+    query = "SELECT k, count(*) AS n, count(a) AS na, avg(a) AS m FROM fact GROUP BY k"
+    lf = mx.sql(query, fact=scan_parquet(silent["fact"]))
+    got = lf.compute(device="cpu")
+    assert prov(lf)["path"] == "streamed"
+    want = silent_reference(query, silent)
+    key = lambda r: (r["k"] is None, r["k"])                                      # noqa: E731
+    g, w_ = sorted(got.to_pylist(), key=key), sorted(want.to_pylist(), key=key)
+    assert [r["n"] for r in g] == [r["n"] for r in w_] and None in [r["k"] for r in g]
+    assert all(close(a["m"], b["m"]) and a["na"] == b["na"] for a, b in zip(g, w_))
