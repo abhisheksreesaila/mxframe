@@ -965,12 +965,13 @@ Found by the F-086 review (2026-10-16); a silent wrong answer on main
 - Review round 2: a DECIMAL literal (point, no exponent) against an integer column or expression is compared exactly in `_compare` with `Decimal` (`< 2.5` is `< 3`, `> 2.5` is `> 2`, `= 2.5` never holds, a bound past int64 is a constant; BETWEEN and IN too); only a DOUBLE (`np.float64`) literal casts the integer column to double (`_align_literals`, `_double_vs_int`). The native decline for big float constants is gone; `_threshold` instead treats an integer column's float bound of exactly +-2^63 as a value, not as out of range. Tests: `test_decimal_literals_exact`
 - Not changed: a bare `k` in a later ON stays the left table's (DuckDB calls it ambiguous)
 
-## F-105 SQL CASE with string results [todo]
+## F-105 SQL CASE: string results, and NULL when no ELSE [todo]
 Seen in the F-086 review (2026-10-16)
 - [ ] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
+- [ ] a CASE with no ELSE gives 0 instead of NULL: `count(case when p then 1 end)` counts every row (silent wrong answer, found by the F-106 developer); a missing ELSE is NULL
 - [ ] DuckDB-checked tests: string / date / int / mixed-number CASE results, with ELSE and without (NULL), in SELECT / GROUP BY / ORDER BY; fails before
 
-## F-106 SQL float literals: scientific notation and float32 columns [review]
+## F-106 SQL float literals: scientific notation and float32 columns [done]
 Found by the F-082 developer (2026-10-16)
 - [x] a scientific literal without a dot (`x > 1e-310`, `x < 2E5`) raised ValueError: `sql_frontend` did `lit(int(v)) if "." not in str(v)`. `_number` now parses by SQL type: digits only (`1_000` too) is an int, a point and / or exponent a float, an integer past int64 (DuckDB HUGEINT) a float; `_is_double_literal` marks the exponent forms (DOUBLE in DuckDB; `.5` and `5.` stay DECIMAL, F-094's modulo flag unchanged). A double literal is `lit(np.float64(v))`, so a bare `select 1E-5` is float64, not float32
 - [x] a float32 column against a DOUBLE literal: DuckDB widens the column (`x between -1e-30 and 1e-30` drops float32(1e-30)) but casts a DECIMAL or INTEGER literal to float32 (`x = 0.1` and `x = 16777217` match; F-094 / Q6 rely on it). So only exponent literals widen: `_widened` multiplies the float32 column by `np.float64(1.0)` in a comparison, BETWEEN, IN, `+ - * /`. The bytecode (pipeline_program, cpu and gpu) already computes in double, so no kernel change; the Arrow path (`_arith_operands`) widens a float32 array next to an np.float64 literal. Parquet pushdown never pushes float columns, so nothing to change there
