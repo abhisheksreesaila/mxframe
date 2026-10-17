@@ -115,6 +115,8 @@ def scalar(value, type=None):
     if isinstance(value, pa.Scalar):
         return pc.cast(value, type) if type is not None and value.type != type else value
     import datetime as _dt
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return array(np.array([value]))[0]                    # a timestamp of the value's own unit (ns too)
     if type is None and isinstance(value, _dt.date) and not isinstance(value, _dt.datetime):
         days = (value - _dt.date(1970, 1, 1)).days
         return pc.cast(array(np.array([days], dtype=np.int32)), pa.date32())[0]
@@ -164,7 +166,12 @@ def is_in(col, values):
         if has_nan:
             r = pc.or_kleene(r, pc.is_nan(col))
     else:
-        r = pc.is_in(col, value_set=value_set(values, col.type))
+        vs = value_set(values, col.type)
+        if pa.types.is_timestamp(col.type) and pa.types.is_timestamp(vs.type) and vs.type != col.type:
+            units = ("s", "ms", "us", "ns")         # literals are TIMESTAMP (us): compare in the finer unit, in the column's zone
+            fine = pa.timestamp(max(col.type.unit, vs.type.unit, key=units.index), col.type.tz)
+            col, vs = pc.cast(col, fine), pc.cast(vs, fine)
+        r = pc.is_in(col, value_set=vs)
     if has_null:
         r = pc.if_else(r, scalar(True, type=pa.bool_()), pa.nulls(1, pa.bool_())[0])
     if getattr(col, "null_count", 0):

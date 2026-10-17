@@ -127,42 +127,129 @@ def case_literal(v):
     if isinstance(v, (float, np.floating)):
         x = _npscalar(float(v), type=pa.float64())
         return x if isinstance(v, np.floating) else _Weak(x)
-    return _npscalar(v) if isinstance(v, (str, _dt.date)) else v
+    return _npscalar(v) if isinstance(v, (str, _dt.date, np.datetime64)) else v
+
+
+def _supertype(ta, tb, weak_a=False, weak_b=False):
+    """DuckDB's common type of two branch types (CASE, COALESCE): equal types stay, integers widen to int64, a
+    FLOAT column next to an integer or a DECIMAL literal (``weak``) stays float32 (only a DOUBLE widens it), any
+    other number mix is float64, string and large_string are one family. A NULL branch (None) takes the other's
+    type. Mixing text with numbers raises, as DuckDB does."""
+    num = lambda t: pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t)
+    text = lambda t: pa.types.is_string(t) or pa.types.is_large_string(t)
+    if ta is None or tb is None or ta == tb:
+        return ta or tb
+    if pa.types.is_integer(ta) and pa.types.is_integer(tb):
+        return pa.int64()
+    if text(ta) and text(tb):
+        return pa.large_string()
+    if num(ta) and num(tb):
+        f32 = pa.float32()
+        keeps = lambda t, w: pa.types.is_integer(t) or w         # what a FLOAT column keeps its type next to
+        return f32 if (ta == f32 and keeps(tb, weak_b)) or (tb == f32 and keeps(ta, weak_a)) else pa.float64()
+    if pa.types.is_date(ta) and pa.types.is_date(tb):
+        return pa.date32()
+    if pa.types.is_temporal(ta) and pa.types.is_temporal(tb) and not (pa.types.is_time(ta) or pa.types.is_time(tb)
+                                                                     or pa.types.is_duration(ta) or pa.types.is_duration(tb)):
+        # a date next to a timestamp is a timestamp of that timestamp's unit and zone; two timestamps take the finer
+        # unit (DuckDB: TIMESTAMP_S next to TIMESTAMP_NS is TIMESTAMP_NS); a zone and no zone do not mix
+        if pa.types.is_date(ta) or pa.types.is_date(tb):
+            return tb if pa.types.is_date(ta) else ta
+        if (ta.tz is None) != (tb.tz is None):
+            raise TypeError(f"no common type: {ta} and {tb}")
+        units = ("s", "ms", "us", "ns")
+        return ta if units.index(ta.unit) >= units.index(tb.unit) else tb
+    raise TypeError(f"no common type: {ta} and {tb}")
+
+
+def _branches(vals):
+    """The branches of a CASE / COALESCE as Arrow values: a ``_Weak`` literal unwrapped (and flagged), dictionaries
+    decoded, NULL (None) kept."""
+    from .arrow_dict import decode as _decode
+    weak = [isinstance(x, _Weak) for x in vals]
+    return [None if x is None else _decode(x.scalar if isinstance(x, _Weak) else x) for x in vals], weak
+
+
+def _fit(x, want, like):
+    """Branch ``x`` as type ``want``; a NULL branch is NULL of that type, as long as ``like`` (an array or scalar)."""
+    if x is None:
+        return pa.scalar(None, type=want) if isinstance(like, pa.Scalar) else pa.nulls(len(like), want)
+    return x if x.type == want else pc.cast(x, want, safe=False)
 
 
 def case_when_arrow(cond, then, else_):
     """Arrow CASE WHEN: ``then`` / ``else_`` are Arrow values or None (a NULL branch). The result has the
-    common type of the branches like DuckDB: equal types stay, integers widen to int64, a FLOAT column next to
-    an integer or a DECIMAL literal stays float32 (only a DOUBLE widens it), any other number mix is float64,
-    string and large_string are one family, a NULL branch takes the other's type, all NULL is int32. A null
-    condition is not true. Mixing text with numbers raises, as DuckDB does."""
-    from .arrow_dict import decode as _decode
-    weak = [isinstance(x, _Weak) for x in (then, else_)]
-    then, else_ = (x.scalar if isinstance(x, _Weak) else x for x in (then, else_))
-    then, else_ = (None if x is None else _decode(x) for x in (then, else_))
+    common type of the branches like DuckDB (``_supertype``); all NULL is int32. A null condition is not true."""
+    (then, else_), weak = _branches([then, else_])
     ta, tb = (None if x is None else x.type for x in (then, else_))
-    num = lambda t: pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t)
-    text = lambda t: pa.types.is_string(t) or pa.types.is_large_string(t)
-    if ta is None or tb is None or ta == tb:
-        want = ta or tb or pa.int32()
-    elif pa.types.is_integer(ta) and pa.types.is_integer(tb):
-        want = pa.int64()
-    elif text(ta) and text(tb):
-        want = pa.large_string()
-    elif num(ta) and num(tb):
-        f32 = pa.float32()
-        keeps = lambda t, w: pa.types.is_integer(t) or w         # what a FLOAT column keeps its type next to
-        want = f32 if (ta == f32 and keeps(tb, weak[1])) or (tb == f32 and keeps(ta, weak[0])) else pa.float64()
-    elif pa.types.is_date(ta) and pa.types.is_date(tb):
-        want = pa.date32()
-    else:
-        raise TypeError(f"CASE branches have no common type: {ta} and {tb}")
-    def fit(x):
-        if x is None:
-            return pa.scalar(None, type=want) if isinstance(cond, pa.Scalar) else pa.nulls(len(cond), want)
-        return x if x.type == want else pc.cast(x, want, safe=False)
+    try:
+        want = _supertype(ta, tb, *weak) or pa.int32()
+    except TypeError:
+        raise TypeError(f"CASE branches have no common type: {ta} and {tb}") from None
     cond = pc.fill_null(cond, _npscalar(False, type=pa.bool_()))
-    return pc.if_else(cond, fit(then), fit(else_))
+    return pc.if_else(cond, _fit(then, want, cond), _fit(else_, want, cond))
+
+
+def coalesce_arrow(*vals):
+    """Arrow COALESCE(a, b, ...): the first non-NULL value per row, of the common type of the arguments like
+    DuckDB (``_supertype``, folded left to right). ``vals`` are Arrow values or None (a NULL literal); at least
+    one must be an array, the length of the result."""
+    vals, weak = _branches(vals)
+    want, acc_weak = None, False
+    for x, w in zip(vals, weak):
+        if x is None:
+            continue
+        if want is None:
+            want, acc_weak = x.type, w
+            continue
+        try:
+            want = _supertype(want, x.type, acc_weak, w)
+        except TypeError:
+            raise TypeError(f"COALESCE arguments have no common type: {want} and {x.type}") from None
+        acc_weak = acc_weak and w
+    return pc.coalesce(*(_fit(x, want, x) for x in vals if x is not None))
+
+
+def branch_values(args, ev):
+    """The branches of a CASE / COALESCE as Arrow values: a literal as ``case_literal`` (its SQL type), else ``ev(arg)``."""
+    return [case_literal(a.args[0]) if a.op == "lit" else ev(a) for a in args]
+
+
+_CAST_TYPES = {"float32": pa.float32, "float64": pa.float64, "int8": pa.int8, "int16": pa.int16,
+               "int32": pa.int32, "int64": pa.int64}
+
+
+def cast_arrow(x, name, away=False):
+    """``CAST(x AS <name>)`` for the number types, as DuckDB casts: a float rounds half to even into an integer, a
+    DECIMAL (``away``: the SQL front end saw a DECIMAL literal in the expression) half away from zero; a value that
+    does not fit raises (an integer into a float rounds, as DuckDB's does). Only numbers can be cast."""
+    t = _CAST_TYPES[name]()
+    if not (pa.types.is_integer(x.type) or pa.types.is_floating(x.type)):
+        raise NotImplementedError(f"CAST of {x.type} to {name} is not supported (numbers only)")
+    if x.type == t:
+        return x
+    if pa.types.is_floating(x.type) and pa.types.is_integer(t):
+        mode = "half_towards_infinity" if away else "half_to_even"
+        return pc.cast(pc.round(x, 0, round_mode=mode), t)
+    out = pc.cast(x, t, safe=pa.types.is_integer(t))
+    if pa.types.is_float32(t) and pa.types.is_float64(x.type) and bool(pc.any(pc.and_(pc.is_inf(out), pc.is_finite(x))).as_py()):
+        raise OverflowError("value out of range for FLOAT")
+    return out
+
+
+def add_interval_arrow(x, micros):
+    """``x + INTERVAL`` (a fixed length, in microseconds) for a DATE or a timestamp: DuckDB's result is a TIMESTAMP
+    (microseconds, in the argument's zone), a DATE too."""
+    t = x.type
+    if not (pa.types.is_date(t) or pa.types.is_timestamp(t)):
+        raise TypeError(f"an INTERVAL can be added to a DATE or TIMESTAMP, not to {t}")
+    x = pc.cast(x, pa.timestamp("us", getattr(t, "tz", None)), safe=False)
+    return pc.add(x, _npscalar(np.timedelta64(int(micros), "us")))
+
+
+def abs_arrow(x):
+    """``ABS(x)`` in the argument's own type; an integer minimum raises (DuckDB's overflow error)."""
+    return pc.abs_checked(x) if pa.types.is_integer(x.type) else pc.abs(x)
 
 
 def _numeric_literal(x):
@@ -200,6 +287,27 @@ def _align_literals(lhs, rhs):
         lhs = pc.cast(lhs, pa.float64(), safe=False)
     elif isinstance(l, np.float64) and is_int(rhs):
         rhs = pc.cast(rhs, pa.float64(), safe=False)
+    return lhs, rhs
+
+
+def _align_temporal(lhs, rhs):
+    """A timestamp next to a DATE, or to a timestamp with the other kind of zone, as DuckDB compares them: the DATE
+    becomes a timestamp of the other side's unit and zone; a naive timestamp (a literal) next to a zoned column is
+    an instant in UTC; two zones are one instant either way (the right side takes the left's zone). Units differ
+    freely (Arrow compares in the finer one)."""
+    tl, tr = getattr(lhs, "type", None), getattr(rhs, "type", None)
+    if tl is None or tr is None:
+        return lhs, rhs
+    ts, date = pa.types.is_timestamp, pa.types.is_date
+    if ts(tl) and date(tr):
+        return lhs, pc.cast(rhs, tl)
+    if date(tl) and ts(tr):
+        return pc.cast(lhs, tr), rhs
+    if ts(tl) and ts(tr) and tl.tz != tr.tz:
+        if tl.tz is None:
+            lhs = pc.cast(lhs, pa.timestamp(tl.unit, tr.tz))
+        else:
+            rhs = pc.cast(rhs, pa.timestamp(tr.unit, tl.tz))
     return lhs, rhs
 
 
@@ -479,7 +587,7 @@ class GraphCompiler:
             # literal inside a compute call imports pandas (~150-200 ms, once).
             import datetime as _dt
             v = args[0]
-            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date)) else v
+            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date, np.datetime64)) else v
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)
             if native is not None:
@@ -490,6 +598,7 @@ class GraphCompiler:
             if op not in ("and", "or"):
                 lhs, rhs = _align_literals(lhs, rhs)
                 lhs, rhs = _double_vs_int(args, lhs, rhs)
+                lhs, rhs = _align_temporal(lhs, rhs)
             return _PC_CMP_OPS[op](lhs, rhs)
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
@@ -527,6 +636,14 @@ class GraphCompiler:
             return case_when_arrow(GraphCompiler._eval_predicate(args[0], table),
                                    *(case_literal(a.args[0]) if a.op == "lit" else GraphCompiler._eval_predicate(a, table)
                                      for a in args[1:]))
+        if op == "coalesce":
+            return coalesce_arrow(*branch_values(args, lambda a: GraphCompiler._eval_predicate(a, table)))
+        if op == "abs":
+            return abs_arrow(GraphCompiler._eval_predicate(args[0], table))
+        if op == "add_us":
+            return add_interval_arrow(GraphCompiler._eval_predicate(args[0], table), args[1])
+        if op == "cast":
+            return cast_arrow(GraphCompiler._eval_predicate(args[0], table), *args[1:])
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
