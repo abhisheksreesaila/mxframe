@@ -272,6 +272,55 @@ def test_an_integer_sum_after_a_join_has_the_in_memory_type(tmp_path):
         budgets=("20K", "200K", "64G")) == "int64"
 
 
+def test_a_sum_near_the_limit_is_a_double_in_memory_and_at_every_budget(tmp_path):
+    """rows x max|value| is just under 2^53 (with a filter on another column), so the engine answers a double:
+    a rule that always said int64 would fail here."""
+    n = 64_000
+    big = (2 ** 53 - 1) // n                       # n x big < 2^53
+    y = np.full(n, big, dtype=np.int64)
+    f = (np.arange(n) % 4).astype(np.int32)
+    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "y": y, "f": f}), 500)
+    kind = assert_same_type_at_every_budget(
+        path, lambda s: s.filter(col("f") == 1).groupby("k").agg(col("y").sum().alias("s")), budgets=("20K", "100K", "64G"))
+    assert kind == "double"
+    # one more row of the same value passes the limit: int64 everywhere
+    path2 = small_file(tmp_path, pa.table({"k": np.zeros(n + 1, dtype=np.int32), "y": np.full(n + 1, big + 1, dtype=np.int64),
+                                           "f": (np.arange(n + 1) % 4).astype(np.int32)}), 500)
+    assert assert_same_type_at_every_budget(
+        path2, lambda s: s.filter(col("f") == 1).groupby("k").agg(col("y").sum().alias("s")),
+        budgets=("20K", "100K", "64G")) == "int64"
+
+
+def test_a_batch_the_probe_never_hears_from_makes_the_sum_int64_and_does_not_raise(tmp_path, monkeypatch):
+    """The only big value sits in the first batch, whose engine inputs are never reported (a compile on another
+    thread, say). Nothing is assumed: the sum is int64 and exact; casting the 2^60 total to double would raise."""
+    from mxframe import pipeline_program
+    n = 64_000
+    y = np.ones(n, dtype=np.int64)
+    y[0] = 2 ** 60
+    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "y": y}), 500)
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "20K")
+    real, seen = pipeline_program.SumProbe.note, []
+
+    def note(self, *a, **k):
+        if self._batch not in seen:
+            seen.append(self._batch)
+        if self._batch is not seen[0]:             # the first batch reports nothing
+            real(self, *a, **k)
+    real_flag = pipeline_program.SumProbe.flag
+
+    def flag(self, arrow):
+        if self._batch is not seen[0]:
+            real_flag(self, arrow)
+    monkeypatch.setattr(pipeline_program.SumProbe, "note", note)
+    monkeypatch.setattr(pipeline_program.SumProbe, "flag", flag)
+    lf = scan_parquet(path).groupby("k").agg(col("y").sum().alias("s"))
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed" and len(seen) > 3
+    assert got.schema.field("s").type == pa.int64()
+    assert got.column("s").to_pylist() == [2 ** 60 + n - 1]
+
+
 def test_a_small_integer_sum_is_a_double_in_memory_and_streamed(tmp_path):
     n = 64_000
     path = small_file(tmp_path, pa.table({"k": (np.arange(n) % 2).astype(np.int32), "x": np.arange(n, dtype=np.int64)}), 1000)

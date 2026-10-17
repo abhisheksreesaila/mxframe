@@ -1085,8 +1085,10 @@ class SumProbe:
 
     Only aggregates whose output names start with `prefix` are recorded (the streamed query's partials)."""
 
-    def __init__(self, prefix: str = "__p"):
+    def __init__(self, prefix: str = "__p", names=()):
         self.prefix = prefix
+        self.names = frozenset(names)      # the integer sums whose decision every batch must report
+        self.unknown = False               # some batch did not report: nothing is assumed, the exact path answers
         self.rows = 0
         self.trees: Dict[str, Any] = {}
         self.bounds: Dict[str, int] = {}
@@ -1124,6 +1126,8 @@ class SumProbe:
         b, self._batch = self._batch, None
         if b is None:
             return
+        if self.names and not b["arrow"] and not self.names <= set(b["trees"]):
+            self.unknown = True
         self.rows += b["rows"] or 0
         for c, v in b["bounds"].items():
             self.bounds[c] = max(self.bounds.get(c, 0), v)
@@ -1132,18 +1136,18 @@ class SumProbe:
 
     def inexact(self) -> bool:
         """Does the engine answer these integer sums exactly in Arrow (int64) for the merged batches?"""
-        if self.arrow:
+        if self.arrow or self.unknown:
             return True
         if not self.trees or self.schema is None:
-            return False
+            return bool(self.names)             # integer sums, but nothing recorded: not known to be exact
         b = object.__new__(_Builder)                  # col_bound / within_exact need only these three attributes
         b.table, b.col_bounds, b.skip_bounds = self.schema.empty_table(), dict(self.bounds), False
         return any(not b.within_exact(t, max(1, self.rows)) for t in self.trees.values())
 
 
 @contextlib.contextmanager
-def sum_probe(prefix: str = "__p"):
-    rec = SumProbe(prefix)
+def sum_probe(prefix: str = "__p", names=()):
+    rec = SumProbe(prefix, names)
     token = _probe.set(rec)
     try:
         yield rec

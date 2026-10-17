@@ -421,7 +421,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     biggest, size_of = 0, dict(zip(leaf.groups, leaf.sizes))
     token = _active.set(True)
     try:
-        with streaming(leaf.path) as st, sum_probe() as probe:
+        with streaming(leaf.path) as st, sum_probe(names=spec.int_sums) as probe:
             state = _State(spec, budget, probe)
             for batch in got.batches:
                 st.groups = tuple(batch)
