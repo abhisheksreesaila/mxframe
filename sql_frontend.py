@@ -404,10 +404,8 @@ class _SQLTranslator:
         self._marks_bare: dict = {}
         self._renamed: dict = {}
         self._copies: set = set()            # the copies: internal, never part of a result
-        # (table name or alias, its columns) of every scanned table, and join keys that have the
-        # same name on both sides (one copy survives the join, so t.k and u.k are the same column)
+        # (table name or alias, its columns) of every scanned table
         self._table_cols: List[tuple] = []
-        self._same_keys: set = set()
         # SELECT * output: (column of the joined plan, name it has in the result) in DuckDB's order, both key
         # columns of a JOIN ... ON included (the copies), one for USING / NATURAL
         self._star_items: List[tuple] = []
@@ -723,8 +721,6 @@ class _SQLTranslator:
             self._joined.add(join.this.alias_or_name.lower())
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
-                if lk == rk:
-                    self._same_keys.add(lk)
                 if lk in self._copies and how != "left" and rk not in own:
                     self._marks[(join.this.alias_or_name.lower(), rk)] = lk       # x.k equals the copy it matched
                 elif lk != rk and how != "left" and rk not in own:
@@ -774,9 +770,7 @@ class _SQLTranslator:
                 self._qual[(alias, rk)] = copied.get(rk, lk)
                 if rk in copied:
                     self._marks_bare[rk] = copied[rk]
-                elif lk == rk:
-                    self._same_keys.add(lk)
-                else:
+                elif lk != rk:
                     self._col_aliases[rk] = lk
             self._cur_cols += [o for _, o in outs]
             self._left_schema |= set(right_cols)
@@ -906,14 +900,6 @@ class _SQLTranslator:
         if links:
             self._conj = keep
         return links
-
-    def _copy_dropped(self, qualifier: str, name: str) -> bool:
-        """True when ``qualifier.name`` is the copy of a column the join dropped (an earlier joined
-        table has a column of that name; the join keeps the first one)."""
-        for i, (alias, _) in enumerate(self._table_cols):
-            if alias == qualifier:
-                return any(name in cols for _, cols in self._table_cols[:i])
-        return False
 
     def _resolve_names(self, sel: sge.Select) -> None:
         """The one place where a column's written spelling becomes its real one. DuckDB matches every
@@ -1636,9 +1622,6 @@ class _SQLTranslator:
                 return col(self._qual[(node.table.lower(), name)])        # a comma-joined table's own copy
             if node.table and (node.table.lower(), name) in self._renamed:
                 return col(self._renamed[(node.table.lower(), name)])     # a clashing column the join renamed
-            if node.table and name not in self._same_keys and self._copy_dropped(node.table.lower(), name):
-                raise ValueError(f"column {node.sql(dialect='duckdb')}: the name exists in more than one joined "
-                                 "table and the join keeps the first copy, so this one is not supported yet")
             # Remap right join keys to their left-side equivalents (hash join
             # drops the right join key and keeps the left one in the output)
             name = self._col_aliases.get(name, name)

@@ -1,7 +1,9 @@
 """F-102: `SELECT *` over `JOIN ... ON` (and the comma join) keeps both key columns, each with its own type and
-values; USING / NATURAL keep one. A key column a LEFT JOIN did not match is NULL. Expected answers come from
-DuckDB native tables; output names, types and values are all compared. A repeated output name becomes `k_1`
-(what DuckDB returns in a subquery and for Arrow tables, the kind `mx.sql` is given)."""
+values; USING / NATURAL keep one. A key column a LEFT JOIN did not match is NULL. Expected values and types come
+from DuckDB native tables. Output names: a native table (and `con.register`) keeps a repeated name (`k`, `k`)
+at the top level, but `duckdb.sql(q)` over Python Arrow variables (the replacement scan) and a subquery give
+`k_1`. mx keeps `k_1` (F-088's convention, and a result table with two columns of one name is a trap), so the
+expected names are renamed that way."""
 import duckdb
 import pyarrow as pa
 import pytest
@@ -42,8 +44,8 @@ def _run(con, q):
 
 
 def _renamed(names):
-    """A repeated output name becomes `k_1`, `k_2`: what DuckDB's `duckdb.sql(q)` returns for Arrow tables
-    (the kind `mx.sql` is given) and in a subquery; a native table keeps `k` twice at the top level."""
+    """A repeated output name becomes `k_1`, `k_2`: what `duckdb.sql(q)` over Python Arrow variables and a
+    subquery return; a native table or `con.register` view keeps `k` twice at the top level."""
     seen, out = set(), []
     for n in names:
         m, i = n, 0
