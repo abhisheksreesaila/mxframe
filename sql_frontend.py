@@ -2361,16 +2361,16 @@ class _SQLTranslator:
             return self._interval(node)
         if isinstance(node, sge.Add):
             a, b = self._widened(node.this, node.expression, self._arith_operand, node)
-            return a + b
+            return self._float_result(node, a + b)
         if isinstance(node, sge.Sub):
             a, b = self._widened(node.this, node.expression, self._arith_operand, node)
-            return a - b
+            return self._float_result(node, a - b)
         if isinstance(node, sge.Mul):
             a, b = self._widened(node.this, node.expression, self._arith_operand, node)
-            return a * b
+            return self._float_result(node, a * b)
         if isinstance(node, sge.Div):
             a, b = self._widened(node.this, node.expression, lambda _, n: self._float_expr(n))
-            return a / b
+            return self._float_result(node, a / b)
         if isinstance(node, sge.Mod):                    # `a % b` and MOD(a, b): DuckDB's fmod, NULL on zero
             l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
             if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
@@ -2426,6 +2426,7 @@ class _SQLTranslator:
             c = self._expr(node.this)
             if self._ftype(node.this) == "f32" and any(_is_double_literal(v) for v in node.expressions):
                 c = c * lit(np.float64(1.0))
+            f32_list = self._ftype(node.this) == "f32" and not any(_is_double_literal(v) for v in node.expressions)
             values = []
             for v in node.expressions:
                 day = _date_of(v)
@@ -2434,7 +2435,10 @@ class _SQLTranslator:
                     continue
                 d = _exact_decimal(v) if self._is_int_expr(node.this) else None
                 if d is None:
-                    values.append(self._scalar(v))
+                    x = self._scalar(v)
+                    if f32_list and isinstance(x, (int, float)) and not isinstance(x, (bool, np.floating)):
+                        x = float(np.float32(x))                     # a FLOAT is compared with the list cast to FLOAT (F-110)
+                    values.append(x)
                 elif d == d.to_integral_value() and -(1 << 63) <= d < (1 << 63):     # exactly: a fraction or a value past int64
                     values.append(int(d))                                              # never equals an integer
             return c.isin(values) if values else _folded(c, False)
@@ -2686,7 +2690,29 @@ class _SQLTranslator:
             x = x * lit(np.float64(1.0))
         elif kinds == ("f64", "f32"):
             y = y * lit(np.float64(1.0))
+        elif "f32" in kinds and "f64" not in kinds:
+            cmp = translate is None                 # (a comparison against a bare float32 column: the engines convert the literal)
+            x, y = self._as_f32(x, a, kinds[0] != "f32", y, cmp), self._as_f32(y, b, kinds[1] != "f32", x, cmp)
         return x, y
+
+    def _as_f32(self, x: "Expr", node: sge.Expression, other: bool, peer: "Expr", cmp: bool) -> "Expr":
+        """The operand of a FLOAT operation that is not FLOAT itself, cast to float32 first, as DuckDB does: a
+        DECIMAL / INTEGER literal is the float32 nearest to it (against a bare float32 column the engines already
+        compare it so), an integer expression is rounded to float32 (past 2^24 it is not exact). ``other`` is
+        False for the FLOAT operand, which is returned as it is."""
+        if not other:
+            return x
+        v = x.args[0] if x.op == "lit" else None
+        if isinstance(v, (int, float)) and not isinstance(v, (bool, np.floating)):
+            return x if cmp and peer.op == "col" else lit(np.float32(v))
+        if x.op != "lit" and self._is_int_expr(node):
+            return x.f32()
+        return x
+
+    def _float_result(self, node: sge.Expression, e: "Expr") -> "Expr":
+        """A FLOAT arithmetic result is rounded to float32 after the operation (DuckDB computes it in float32;
+        the engines compute in double, or Arrow widens an integer operand)."""
+        return e.f32() if self._ftype(node) == "f32" else e
 
     def _compare(self, cls, a: sge.Expression, b: sge.Expression) -> Expr:
         """``a <op> b``. Against an integer column or expression, an integer literal past int64 or a DECIMAL

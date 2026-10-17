@@ -727,6 +727,8 @@ class GraphCompiler:
             return add_interval_arrow(GraphCompiler._eval_predicate(args[0], table), args[1])
         if op == "cast":
             return cast_arrow(GraphCompiler._eval_predicate(args[0], table), *args[1:])
+        if op == "f32":
+            return cast_arrow(GraphCompiler._eval_predicate(args[0], table), "float32")
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):
