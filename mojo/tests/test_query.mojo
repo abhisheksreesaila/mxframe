@@ -290,8 +290,19 @@ def test_mean_and_minmax_with_nulls_and_an_all_null_group() raises:
 
 def test_where_after_group_by_and_one_group_by() raises:
     var t = small_table()
-    var r = Query(t).group_by(col("g"), groups=3).where(col("a") > 0).agg(count()).compute()
-    expect(len(r.counts) == 3, "where after group_by keeps the grouping")
+    var r = Query(t).group_by(col("g"), groups=3).where(col("a") > 0).agg(count(), sum(col("a"))).compute()
+    var want_n = List[Int](length=3, fill=0)
+    for i in range(t.rows()):
+        if not t.is_null(2, i) and t.get(0, i) > 0:
+            want_n[Int(t.get(2, i))] += 1
+    for g in range(3):
+        expect(r.counts[g] == want_n[g], "where after group_by: group " + String(g))
+    var msg = String("")
+    try:
+        _ = Query(t).agg(count()).group_by(col("g"), groups=3)
+    except e:
+        msg = String(e)
+    expect("group_by must come before agg" in msg, "agg then group_by: " + msg)
     var raised = False
     try:
         _ = Query(t).group_by(col("g"), groups=3).group_by(col("a"), groups=2)
@@ -327,6 +338,31 @@ def test_kinds_and_scales_are_checked() raises:
     expect(Query(s).agg(sum(col("d") * col("a"))).compute().sums[0] == 150, "a product may mix scales")
 
 
+def test_keys_past_int32_and_negative_are_left_out() raises:
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var keys: List[Int] = [(1 << 32) + 1, -1, 1, Int(Int64.MIN), 1 << 31, 3]
+    for key in keys:
+        t.append(k, Int64(key))
+    var s = t^.share()
+    var r = Query(s).group_by(col("k"), groups=4).agg(count()).compute()
+    expect(r.counts[0] == 0 and r.counts[1] == 1 and r.counts[2] == 0 and r.counts[3] == 1,
+           "2^32+1 must not land in group 1; -1, INT64_MIN and 2^31 are left out")
+
+
+def test_a_sum_over_only_nulls_is_not_present() raises:
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    t.append(k, 0)
+    t.append_null(v)
+    t.append(k, 1)
+    t.append(v, 5)
+    var s = t^.share()
+    var r = Query(s).group_by(col("k"), groups=2).agg(sum(col("v"))).compute()
+    expect(not r.present(0, 0) and r.present(0, 1) and r.sums[1] == 5, "sum presence follows non-null values")
+
+
 def test_a_key_formula_is_not_evaluated_on_filtered_rows() raises:
     var t = Table.empty()
     var x = t.add_column("x", INT)
@@ -346,6 +382,8 @@ def main() raises:
     test_where_after_group_by_and_one_group_by()
     test_kinds_and_scales_are_checked()
     test_a_key_formula_is_not_evaluated_on_filtered_rows()
+    test_keys_past_int32_and_negative_are_left_out()
+    test_a_sum_over_only_nulls_is_not_present()
     test_every_app_shape_equals_the_oracle()
     test_mean_and_a_formula_value()
     test_overflow_and_unknown_column_raise()

@@ -143,7 +143,10 @@ struct Query(Movable):
     def group_by(var self, key: Expr, groups: Int) raises -> Self:
         """Group by an integer key expression with values 0 .. groups-1 (dense: missing groups are zeros).
         `where` filters rows whether it comes before or after (there is no HAVING yet)."""
-        if self._aggregate() >= 0:
+        var at = self._aggregate()
+        if at >= 0 and len(self.nodes[at].exprs) == 0:
+            raise Error("group_by must come before agg")
+        if at >= 0:
             raise Error("a query has one group_by (and its aggregates); this one has a second")
         self.nodes.append(PlanNode(P_AGGREGATE, self._top(), [key.copy()], List[Agg](), groups))
         return self^
@@ -496,7 +499,7 @@ def _lower(q: Query) raises -> Program:
             continue
         p.section = 1
         var valid = _valid_of(p, a.arg, t)
-        if a.kind == A_COUNT_OF or a.kind == A_MEAN or a.kind == A_MIN or a.kind == A_MAX:
+        if a.kind != A_COUNT:
             if valid >= 0:                               # the rows this aggregate counts (non-null values)
                 var kept_valid = p.keep(valid, False)
                 p.section = 2
