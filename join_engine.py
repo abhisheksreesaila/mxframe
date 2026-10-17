@@ -490,6 +490,109 @@ def int_float_pair(la, ra):
     return (pc.cast(la, f64), pc.cast(ra, f64))
 
 
+KEYS_MAGIC = 0x4D584B43
+
+
+def _string_like(t) -> bool:
+    if pa.types.is_dictionary(t):
+        t = t.value_type
+    return pa.types.is_string(t) or pa.types.is_large_string(t)
+
+
+def _key_desc(x, keep: list):
+    """The kernel's 8-word descriptor of one key column (see ``mx_join_key_codes``) and its class
+    ("int" / "str"), or None for a type the kernel does not read.  Buffers the words point to are
+    appended to ``keep``."""
+    if isinstance(x, np.ndarray):
+        if x.dtype not in (np.int32, np.int64):
+            return None
+        x = np.ascontiguousarray(x)
+        keep.append(x)
+        return [0 if x.dtype == np.int32 else 1, x.ctypes.data, 0, 0, 0, 0, 0, 0], "int"
+    a = _as_pa(x)
+    t = a.type
+    if _string_like(t):
+        if pa.types.is_dictionary(t):
+            d = a.dictionary
+            if not (pa.types.is_int32(t.index_type) and pa.types.is_string(t.value_type)) or d.null_count:
+                return None
+            ib, db = a.indices.buffers(), d.buffers()
+            keep.extend([a, d])
+            return [4, ib[1].address, db[1].address, db[2].address if db[2] is not None else 0, a.offset,
+                    ib[0].address if a.null_count else 0, d.offset, 0], "str"
+        b = a.buffers()
+        keep.append(a)
+        return [3 if pa.types.is_large_string(t) else 2, b[1].address, b[2].address if b[2] is not None else 0, 0,
+                a.offset, b[0].address if a.null_count else 0, 0, 0], "str"
+    if t in (pa.int32(), pa.int64(), pa.date32()):
+        b = a.buffers()
+        keep.append(a)
+        return [1 if t == pa.int64() else 0, b[1].address, 0, 0, a.offset, b[0].address if a.null_count else 0, 0, 0], "int"
+    return None
+
+
+def _native_key_codes(left_cols: Sequence, right_cols: Sequence):
+    """Dense int32 codes of the key tuples of both sides from one native call (F-074), or None: no string
+    key among them, a type the kernel does not read (floats, other integer widths, a pair of different
+    classes), the native executor off, or the library missing.  Equal tuples (strings by their bytes,
+    integers by value) get equal codes; a NULL in any key gets a side-specific code, so it never matches."""
+    from . import native_exec
+    if not native_exec.enabled() or not any(_string_like(_type_of(c)) for c in list(left_cols) + list(right_cols)):
+        return None
+    lib = _semi_lib()
+    fn = getattr(lib, "mx_join_key_codes", None) if lib is not None else None
+    if fn is None:
+        return None
+    keep, words = [], []
+    for lc, rc in zip(left_cols, right_cols):
+        ld, rd = _key_desc(lc, keep), _key_desc(rc, keep)
+        if ld is None or rd is None or ld[1] != rd[1]:
+            return None
+        words += ld[0] + rd[0]
+    n_left, n_right = len(left_cols[0]), len(right_cols[0])
+    if n_left + n_right == 0 or n_left + n_right >= (1 << 31) - 1:
+        return None
+    import ctypes
+    from .pipeline_kernels import default_threads
+    descs = (ctypes.c_int64 * len(words))(*words)
+    codes = np.empty(n_left + n_right, dtype=np.int32)
+    plan = (ctypes.c_int64 * 7)(KEYS_MAGIC, len(left_cols), n_left, n_right, default_threads(n_left + n_right),
+                                ctypes.addressof(descs), codes.ctypes.data)
+    fn.restype, fn.argtypes = ctypes.c_int64, [ctypes.c_int64] * 2
+    n_codes = fn(ctypes.addressof(plan), 0)
+    if n_codes < 0:
+        return None
+    null = codes < 0
+    if null.any():
+        codes[:n_left][null[:n_left]] = n_codes
+        codes[n_left:][null[n_left:]] = n_codes + 1
+    return np.ascontiguousarray(codes[:n_left]), np.ascontiguousarray(codes[n_left:])
+
+
+def _plain(c):
+    """A dictionary key column decoded (the native encoder reads dictionaries as they are)."""
+    if isinstance(c, (pa.Array, pa.ChunkedArray)) and pa.types.is_dictionary(c.type):
+        from .arrow_dict import decode
+        return decode(c)
+    return c
+
+
+def _decode_keys(plan, table: pa.Table, keys, out_names=None) -> pa.Table:
+    """The key columns a leaf left dictionary-coded for ``encode_keys`` (the scan deferred their decode),
+    decoded in an output table that carries them (as ``out_names``, if renamed): the plan's result has
+    plain strings there."""
+    scan, _ = _scan_under_filters(plan)
+    if scan is None:
+        return table
+    deferred = set(getattr(scan, "_mx_decode_after", None) or ())
+    names = {o for k, o in zip(keys, out_names or keys) if k in deferred}
+    return _decode_deferred(table, names) if names else table
+
+
+def _type_of(c):
+    return pa.from_numpy_dtype(c.dtype) if isinstance(c, np.ndarray) else c.type
+
+
 def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
     """Encode both join sides into one shared dense int32 key space.
 
@@ -502,7 +605,12 @@ def encode_keys(left_cols: Sequence, right_cols: Sequence, common_key_type):
         raise ValueError("join key column lists must be non-empty and equal length")
     n_left = len(left_cols[0])
 
-    lints = [_as_np_int(c) for c in left_cols]
+    native = _native_key_codes(left_cols, right_cols)
+    if native is not None:
+        return native
+    left_cols, right_cols = [_plain(c) for c in left_cols], [_plain(c) for c in right_cols]
+
+    lints =[_as_np_int(c) for c in left_cols]
     rints = [_as_np_int(c) for c in right_cols]
     if all(a is not None for a in lints) and all(a is not None for a in rints):
         same_kind = all((a.dtype.kind == "u") == (b.dtype.kind == "u") or
@@ -647,17 +755,92 @@ def _dictionary_gather(col, idx: np.ndarray):
     return pa.DictionaryArray.from_arrays(_npa(codes), enc.dictionary)
 
 
-def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = False) -> pa.Table:
+def _valid_np(a: pa.Array) -> np.ndarray:
+    """Which rows of ``a`` are not NULL, as a bool array (from the validity bitmap: no Arrow compute)."""
+    buf = a.buffers()[0]
+    if buf is None or not a.null_count:
+        return np.ones(len(a), dtype=bool)
+    bits = np.unpackbits(np.frombuffer(buf, dtype=np.uint8), bitorder="little")
+    return bits[a.offset:a.offset + len(a)].astype(bool, copy=False)
+
+
+def _flat_type(t) -> bool:
+    """Types whose values are one fixed-width buffer or offsets + bytes (what the native gather copies)."""
+    from . import native_exec
+    return not pa.types.is_dictionary(t) and native_exec._out_kind(t) is not None
+
+
+def _with_validity(col, valid: np.ndarray):
+    """``col`` (gathered, without NULLs) with the rows where ``valid`` is False set to NULL."""
+    g = _combine(col)
+    bits = np.packbits(np.concatenate([np.ones(g.offset, dtype=bool), valid]), bitorder="little")
+    nulls = int(len(valid) - valid.sum())
+    if pa.types.is_dictionary(g.type):
+        return pa.Array.from_buffers(g.type, len(g), [pa.py_buffer(bits), g.indices.buffers()[1]], null_count=nulls,
+                                     offset=g.offset, dictionary=g.dictionary)
+    if not _flat_type(g.type):
+        return None
+    return pa.Array.from_buffers(g.type, len(g), [pa.py_buffer(bits)] + g.buffers()[1:], null_count=nulls, offset=g.offset)
+
+
+def _gather_with_nulls(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool, null_rows: bool):
+    """``table`` rows ``idx`` when the table has NULLs, or ``idx`` has holes (``null_rows``: a negative
+    row number is an all-NULL row): the data is gathered natively from the table without its validity
+    bitmaps (a NULL slot holds a harmless value), the NULLs are put back from NumPy.  None when a
+    column cannot be rebuilt that way (the caller takes with Arrow)."""
+    holes = (idx < 0) if null_rows else None
+    safe = np.where(holes, 0, idx) if holes is not None and holes.any() else idx
+    cols, valids = [], []
+    for c in table.columns:
+        v = None
+        if c.null_count:
+            if not _flat_type(c.type):
+                return None
+            v = np.concatenate([_valid_np(ch) for ch in c.chunks])
+            c = pa.chunked_array([pa.Array.from_buffers(ch.type, len(ch), [None] + ch.buffers()[1:], offset=ch.offset)
+                                  for ch in c.chunks], type=c.type)
+        cols.append(c)
+        valids.append(v)
+    out = _gather_table(comp, pa.Table.from_arrays(cols, names=table.column_names), safe, decode_dicts)
+    if safe is idx and all(v is None for v in valids):
+        return out
+    arrays = []
+    for j, v in enumerate(valids):
+        keep = None if v is None else v[safe]
+        if safe is not idx:
+            keep = ~holes if keep is None else keep & ~holes
+        a = out.column(j)
+        if keep is not None and not keep.all():
+            a = _with_validity(a, keep)
+            if a is None:
+                return None
+        arrays.append(a)
+    return pa.Table.from_arrays(arrays, names=table.column_names)
+
+
+def _gather_table(comp, table: pa.Table, idx: np.ndarray, decode_dicts: bool = False,
+                  null_rows: bool = False) -> pa.Table:
     """``table`` rows ``idx``. On the CPU one native call (F-032) gathers every column; dictionary
-    columns only when ``decode_dicts`` (they come back decoded). Else Arrow ``take``."""
+    columns only when ``decode_dicts`` (they come back decoded). Else Arrow ``take``.  A column with
+    NULLs, or ``null_rows`` (a negative row number gives a row of NULLs), is gathered without its
+    validity bitmap and the NULLs are rebuilt from NumPy (F-074)."""
     if table.num_columns == 0:
         return table
+    if null_rows and not (len(idx) and (idx < 0).any()):
+        null_rows = False
+    if null_rows or any(c.null_count for c in table.columns):
+        out = _gather_with_nulls(comp, table, idx, decode_dicts, null_rows)
+        if out is not None:
+            return out
+        if null_rows:           # unmatched rows carry a null index: Arrow's take turns those into null values
+            return pc.take(table, _index_with_nulls(idx, idx >= 0))
+        return _take_rows(table, idx)
     if comp._session_device == "gpu" and comp._aot_gpu is not None and len(idx) >= GPU_GATHER_MIN_ROWS:
         return gpu_budget.run_piece(
             "gather", gpu_budget.gather_bytes(table, len(idx)), lambda: comp._aot_gpu.gather_table(table, idx),
             lambda: _take_rows(table, idx), shape=(table.num_rows, len(idx), str(table.schema.types)))
     from . import native_exec
-    out = native_exec.try_gather(comp, table, idx, decode_dicts)
+    out = native_exec.try_gather(comp, table, idx, decode_dicts, any_device=True)
     if out is not None:
         return out
     return _take_rows(table, idx)
@@ -736,8 +919,8 @@ def _execute_filtering(comp, node, needed):
     if lcols is None:
         return None
     want = lcols if needed is None else [n for n in lcols if n in needed] or lcols[:1]
-    lt = leaf_table(comp, node.left, set(want) | set(node.left_on))
-    rt = leaf_table(comp, node.right, set(node.right_on))
+    lt = leaf_table(comp, node.left, set(want) | set(node.left_on), keep=set(node.left_on))
+    rt = leaf_table(comp, node.right, set(node.right_on), keep=set(node.right_on))
     if lt.num_rows and rt.num_rows:
         lk, rk = encode_keys([lt.column(c) for c in node.left_on], [rt.column(c) for c in node.right_on],
                              comp._common_key_type)
@@ -746,9 +929,9 @@ def _execute_filtering(comp, node, needed):
         hit = np.zeros(lt.num_rows, dtype=bool)
     keep = ~hit if node.how == "anti" else hit
     sub = lt.select(want)
-    if keep.all():
-        return sub
-    return _gather_table(comp, sub, np.flatnonzero(keep).astype(np.int64))
+    if not keep.all():
+        sub = _gather_table(comp, sub, np.flatnonzero(keep).astype(np.int64))
+    return _decode_keys(node.left, sub, node.left_on)
 
 
 def _execute_join(comp, node, needed, dict_ok=False):
@@ -781,8 +964,8 @@ def _execute_left(comp, node, needed):
     want = names if needed is None else [n for n in names if n in needed] or names[:1]
     lneed = {n for n in want if n in set(lcols)} | set(node.left_on)
     rneed = {orig for orig, out in mapping if out in set(want)} | set(node.right_on)
-    lt = leaf_table(comp, node.left, lneed)
-    rt = leaf_table(comp, node.right, rneed)
+    lt = leaf_table(comp, node.left, lneed, keep=set(node.left_on))
+    rt = leaf_table(comp, node.right, rneed, keep=set(node.right_on))
     lk, rk = encode_keys([lt.column(c) for c in node.left_on], [rt.column(c) for c in node.right_on],
                          comp._common_key_type)
     if comp._session_device == "gpu" and comp._aot is None:
@@ -793,7 +976,7 @@ def _execute_left(comp, node, needed):
     all_matched = bool(matched.all()) if len(ri) else True
     lwant = [n for n in want if n in set(lcols)]
     rwant = [(orig, out) for orig, out in mapping if out in set(want)]
-    ltake = _take_rows(lt.select(lwant), li) if lwant else None
+    ltake = _gather_table(comp, lt.select(lwant), li) if lwant else None
     arrays = {}
     for n in lwant:
         arrays[n] = ltake.column(n)
@@ -802,15 +985,13 @@ def _execute_left(comp, node, needed):
             for orig, out in rwant:
                 arrays[out] = pa.nulls(len(li), type=rt.schema.field(orig).type)
         else:
-            sub = rt.select([o for o, _ in rwant])
-            if all_matched:
-                rtake = _take_rows(sub, ri)
-            else:
-                # unmatched rows carry a null index: Arrow's take turns those into null values
-                rtake = pc.take(sub, _index_with_nulls(ri, matched))
+            rtake = _gather_table(comp, rt.select([o for o, _ in rwant]), ri, null_rows=not all_matched)
             for orig, out in rwant:
                 arrays[out] = rtake.column(orig)
-    return pa.Table.from_arrays([arrays[n] for n in want], names=want)
+    out = _decode_keys(node.left, pa.Table.from_arrays([arrays[n] for n in want], names=want), node.left_on)
+    rkeys = {o: out_ for o, out_ in rwant}
+    return _decode_keys(node.right, out, [k for k in node.right_on if k in rkeys],
+                        [rkeys[k] for k in node.right_on if k in rkeys])
 
 
 MAX_RESIDUAL_EXPANSION = 8.0     # a composite key joined on one column may emit this many candidate pairs per row
@@ -1479,10 +1660,7 @@ def _inner_setup(comp, node, needed):
         sc, _ = _scan_under_filters(fl.leaves[i])
         later.append(set(getattr(sc, "_mx_decode_after", None) or ()) if sc is not None else set())
         coded.append(set(getattr(sc, "_mx_keep_dict", None) or ()) if sc is not None else set())
-    for a, b, ac, bc in fl.edges:
-        later[a] -= set(ac)
-        later[b] -= set(bc)
-    for _, cm in fl.residuals:
+    for _, cm in fl.residuals:                # (a join key stays coded too: encode_keys reads dictionaries, F-074)
         for leaf, c in cm.values():
             later[leaf].discard(c)
     for i in range(n_leaves):
