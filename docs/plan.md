@@ -1073,20 +1073,6 @@ Found in the F-108 review (2026-10-16); also on main
 
 ## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [done]
 Found by the F-114 / F-115 developer (2026-10-16)
-<<<<<<< HEAD
-- [ ] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
-- [ ] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
-- [ ] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
-- [ ] DuckDB-checked tests for each; fails before
-
-## F-120 CPU and GPU in tandem, borrowing from AI training systems [todo]
-Asked for by the user (2026-10-16), after the core benchmark. Second anxiety after data bigger than memory (done in F-056 / F-113)
-- [ ] research first (`docs/research/cpu-gpu-tandem.md`): what AI training and inference systems do to keep CPUs and GPUs busy at once on data bigger than one device: pipeline parallelism (GPipe / 1F1B micro-batches), ZeRO-Offload / ZeRO-Infinity (CPU optimizer + GPU compute, NVMe tiering), FlexGen (offload scheduling as a linear program over CPU / GPU / disk), vLLM paged memory, overlap of host-to-device copies with compute (double buffering, CUDA streams), tensor / expert parallelism across GPUs. Which map onto morsels, streamed batches (F-056) and Grace partitions: e.g. GPU aggregates batch k while the CPU reads and filters batch k+1; both GPUs as workers on alternate Grace pairs; a cost model that schedules pieces across CPU / GPU / disk
-- [ ] then a design and slices, measured on a quiet machine (or the Mac M5 Ultra, where unified memory removes the copy)
-
-## F-121 Mojo engine API without the Python front end [todo]
-From the user (2026-10-16): another project needs the Mojo engine directly, with no Python planning or SQL front end. The user will provide the spec; nothing to build until then (see also `docs/mxframe-mojo-api.md` and the "Rings" section)
-=======
 - [x] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
 - [x] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
 - [x] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
@@ -1104,4 +1090,11 @@ Found in the F-116 review (2026-10-16)
 ## F-119 `extract(year from <int32 day column with NULLs>)` in WHERE raises [todo]
 Found in the F-116 review (2026-10-16); also on main
 - [ ] `WHERE extract(year from dd) = 2024` over an int32 day-number column that has NULLs raises "Cannot evaluate predicate op 'year_days' in PyArrow" (the native path declines "year_days over a column with nulls" and PyArrow has no kernel). Make the fallback evaluate it (NULL stays NULL, so the row is not kept); DuckDB-checked test with NULL days
->>>>>>> worktree-agent-af73c9d831ef98cef
+
+## F-120 CPU and GPU in tandem, borrowing from AI training systems [todo]
+Asked for by the user (2026-10-16), after the core benchmark. Second anxiety after data bigger than memory (done in F-056 / F-113)
+- [ ] research first (`docs/research/cpu-gpu-tandem.md`): what AI training and inference systems do to keep CPUs and GPUs busy at once on data bigger than one device: pipeline parallelism (GPipe / 1F1B micro-batches), ZeRO-Offload / ZeRO-Infinity (CPU optimizer + GPU compute, NVMe tiering), FlexGen (offload scheduling as a linear program over CPU / GPU / disk), vLLM paged memory, overlap of host-to-device copies with compute (double buffering, CUDA streams), tensor / expert parallelism across GPUs. Which map onto morsels, streamed batches (F-056) and Grace partitions: e.g. GPU aggregates batch k while the CPU reads and filters batch k+1; both GPUs as workers on alternate Grace pairs; a cost model that schedules pieces across CPU / GPU / disk
+- [ ] then a design and slices, measured on a quiet machine (or the Mac M5 Ultra, where unified memory removes the copy)
+
+## F-121 Mojo engine API without the Python front end [todo]
+From the user (2026-10-16): another project needs the Mojo engine directly, with no Python planning or SQL front end. The user will provide the spec; nothing to build until then (see also `docs/mxframe-mojo-api.md` and the "Rings" section)
