@@ -208,10 +208,11 @@ def test_sql_join_types():
     assert run("SELECT l.k FROM l JOIN r ON l.k = r.k") == {"k": [2, 2]}
     assert run("SELECT k, a FROM l JOIN r USING (k) ORDER BY a") == {"k": [2, 2], "a": [20, 20]}
     for q in ("SELECT * FROM l FULL OUTER JOIN r ON l.k = r.k", "SELECT * FROM l RIGHT JOIN r ON l.k = r.k",
-              "SELECT * FROM l CROSS JOIN r", "SELECT * FROM l RIGHT SEMI JOIN r ON l.k = r.k",
+              "SELECT * FROM l RIGHT SEMI JOIN r ON l.k = r.k",
               "SELECT * FROM l RIGHT ANTI JOIN r ON l.k = r.k"):
         with pytest.raises(ValueError, match="unsupported SQL join"):
             mx.sql(q, l=l, r=r).compute(device="cpu")
+    assert run("SELECT COUNT(*) AS n FROM l CROSS JOIN r") == {"n": [12]}          # F-096
 
 
 def test_only_the_right_keys_are_read_from_parquet(tmp_path):

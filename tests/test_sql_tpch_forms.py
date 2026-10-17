@@ -120,11 +120,11 @@ def test_one_table_twice_under_aliases(q):
     _check(q)
 
 
-def test_a_table_with_no_join_condition_raises():
-    with pytest.raises(NotImplementedError, match="join condition"):
-        mx.sql("SELECT sk FROM s, n WHERE bal > 3", **TABLES).compute(device="cpu")
-    with pytest.raises(NotImplementedError, match="join condition"):
-        mx.sql("SELECT sk FROM s, n, r WHERE snk = nk", **TABLES).compute(device="cpu")
+def test_a_table_with_no_join_condition_is_a_cross_join():
+    """F-096: nothing links the tables, so it is a cross product that the rest of WHERE filters (DuckDB does the same)."""
+    _check("SELECT sk, nm FROM s, n WHERE bal > 3")
+    _check("SELECT sk, rn FROM s, n, r WHERE snk = nk")
+    _check("SELECT sk, nm, rn FROM s, n, r WHERE snk = nk AND bal > 20")
 
 
 OR_COMMON = [         # TPC-H Q19: the join key sits in every branch of an OR
@@ -139,9 +139,8 @@ def test_a_join_key_shared_by_every_or_branch_joins(q):
     _check(q)
 
 
-def test_an_or_without_a_shared_key_does_not_join():
-    with pytest.raises(NotImplementedError, match="join condition"):
-        mx.sql("SELECT COUNT(*) AS n FROM l, s WHERE (lsk = sk AND qty > 20) OR bal = 60", **TABLES).compute(device="cpu")
+def test_an_or_without_a_shared_key_is_a_cross_join_with_a_filter():
+    _check("SELECT COUNT(*) AS n FROM l, s WHERE (lsk = sk AND qty > 20) OR bal = 60")
 
 
 DATES = [

@@ -17,6 +17,7 @@ from .np_arrow import _group_ids as _np_group_ids, _float_values as _np_float_va
 import numpy as np
 import os as _os
 import dataclasses
+import datetime
 import time as _time
 import threading as _threading
 from pathlib import Path
@@ -24,7 +25,7 @@ from pathlib import Path
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import case_when_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
+from .compiler import case_when_arrow, coalesce_arrow, branch_values, abs_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -698,7 +699,7 @@ class CustomOpsCompiler(GraphCompiler):
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
         if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year", "is_null",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
-                       "window"):
+                       "window", "coalesce", "abs", "cast", "add_us"):
             return True
         from .lazy_expr import Expr as _Expr
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
@@ -745,7 +746,7 @@ class CustomOpsCompiler(GraphCompiler):
                 return lhs, _npscalar(r_lit)
             lhs, rhs = _align_literals(lhs, r_lit)
             return lhs, (self._eval_expr_arrow(args[1], table) if rhs is r_lit else rhs)
-        return self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table)
+        return _align_temporal(self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table))
 
     def _eval_expr_arrow(self, expr, table):
         """Evaluate expr on an Arrow table, returning a pa.Array."""
@@ -764,6 +765,8 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "lit":
             val = args[0]
             n = len(table)
+            if isinstance(val, np.datetime64):
+                return _npa(np.full(n, val))
             if isinstance(val, (int, float)):
                 return _npa(np.full(
                     n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) or isinstance(val, np.float64) else np.float32))
@@ -863,6 +866,14 @@ class CustomOpsCompiler(GraphCompiler):
             return case_when_arrow(self._eval_expr_arrow(args[0], table),
                                    *(case_literal(a.args[0]) if a.op == "lit" else self._eval_expr_arrow(a, table)
                                      for a in args[1:]))
+        if op == "coalesce":
+            return coalesce_arrow(*branch_values(args, lambda a: self._eval_expr_arrow(a, table)))
+        if op == "abs":
+            return abs_arrow(self._eval_expr_arrow(args[0], table))
+        if op == "add_us":
+            return add_interval_arrow(self._eval_expr_arrow(args[0], table), args[1])
+        if op == "cast":
+            return cast_arrow(self._eval_expr_arrow(args[0], table), *args[1:])
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
@@ -894,7 +905,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null"):
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null", "coalesce", "abs", "cast", "add_us"):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)
@@ -1731,6 +1742,73 @@ class CustomOpsCompiler(GraphCompiler):
                 out = Tail(out, op.n)
         return out
 
+    def _computed_extremes(self, plan):
+        """MIN / MAX of a computed value that is text, a date or timestamp, or a 64-bit integer (a CASE or COALESCE
+        of such columns and literals, a date plus an interval, F-108): the aggregates evaluate their argument and cast it to float64, which
+        cannot hold a string, a date, a ns timestamp or an integer past 2^53. Evaluate the argument once by Arrow
+        into a column of the aggregate's input and aggregate that column, so the paths that already answer
+        ``MIN(s)`` (F-072 ranks), ``MIN(date)`` (F-093) and ``MIN(int64)`` (F-090) take it. ``[Sort Limit] [HAVING]
+        Aggregate`` is the shape taken; the rewritten plan is run (its integer MIN / MAX get their integer type
+        back in ``compile_and_run``); None: not that shape."""
+        core, post_ops = self._extract_post_ops(plan)
+        having = core if isinstance(core, Filter) and isinstance(core.input, Aggregate) else None
+        agg = core.input if having is not None else core
+        if not isinstance(agg, Aggregate) or self._contains_aggregate(agg.input):
+            return None
+        wanted = [i for i, e in enumerate(agg.aggs)
+                  if e.op in ("min", "max") and isinstance(e.args[0], Expr) and e.args[0].op not in ("col", "lit")]
+        if not wanted:
+            return None
+        node = agg.input
+        while isinstance(node, Filter):
+            node = node.input
+        if isinstance(node, Scan):
+            table, base = node.table, agg.input
+        else:                                       # a join or a Project below: the columns as the aggregate sees them
+            table = self._plan_to_table(self._materialize_joins(agg.input))
+            base = Scan(table)
+
+        def kind(e):                                # what the value of e is made of: text / temporal / int, else None
+            if e.op == "lit":
+                v = e.args[0]
+                return "text" if isinstance(v, str) else "temporal" if isinstance(v, (datetime.date, np.datetime64)) else None
+            if e.op == "col":
+                if e.args[0] not in table.column_names:
+                    return None
+                t = table.schema.field(e.args[0]).type
+                t = t.value_type if pa.types.is_dictionary(t) else t
+                return ("text" if pa.types.is_string(t) or pa.types.is_large_string(t)
+                        else "temporal" if pa.types.is_date(t) or pa.types.is_timestamp(t)
+                        else "int" if pa.types.is_integer(t) else None)
+            if e.op == "add_us":                    # a DATE or timestamp plus an interval
+                return "temporal"
+            parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "add", "sub", "mul", "mod")
+                     else ())
+            return next((k for k in (kind(a) for a in parts if isinstance(a, Expr)) if k), None)
+
+        wanted = [i for i in wanted if kind(agg.aggs[i].args[0])]
+        if not wanted:
+            return None
+        taken = set(table.column_names)
+        new_aggs = list(agg.aggs)
+        for i in wanted:
+            e = agg.aggs[i]
+            n = f"__mm_{i}__"
+            while n in taken:
+                n += "_"
+            taken.add(n)
+            table = table.append_column(n, self._eval_expr_arrow(e.args[0], table))
+            new_aggs[i] = Expr(e.op, Expr("col", n))
+            new_aggs[i]._alias = e._alias
+        def with_table(p):
+            if isinstance(p, Scan):
+                return Scan(table)
+            return type(p)(with_table(p.input), *[getattr(p, f.name) for f in dataclasses.fields(p)[1:]])
+        out = Aggregate(with_table(base), agg.group_by, new_aggs)
+        if having is not None:
+            out = Filter(out, having.predicate)
+        return self.compile_and_run(self._rewrap(out, post_ops))
+
     def _string_minmax(self, plan):
         """MIN / MAX of a string column (F-072): the column's distinct values are ranked once in byte order
         (DuckDB's order), the aggregate runs on the integer ranks through every existing path (native
@@ -2226,6 +2304,11 @@ class CustomOpsCompiler(GraphCompiler):
         # Aggregate above it) runs on the small result table: the aggregate below goes through every
         # native path first (fused join, star, single table) instead of the whole plan being declined
         plan = self._aggregate_consumers_first(plan)
+
+        # -1a1 -- F-108: MIN / MAX of a computed string / date / timestamp / 64-bit integer becomes a column
+        _cmm = self._computed_extremes(plan)
+        if _cmm is not None:
+            return _cmm
 
         # -1a1 -- F-072: MIN / MAX of a string column, computed on the byte-order ranks of its values
         _strmm = self._string_minmax(plan)
