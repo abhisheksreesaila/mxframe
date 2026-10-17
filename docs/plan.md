@@ -1037,7 +1037,7 @@ Found in the F-106 review (2026-10-16)
 - [ ] DuckDB-checked tests; fails before
 - Done in F-106 (round 2): a DECIMAL literal against an integer column or expression is compared exactly (`i < 9223372036854775807.0` keeps INT64_MAX-1)
 
-## F-107 Test process hangs on a futex while other suites share the GPUs [review]
+## F-107 Test process hangs on a futex while other suites share the GPUs [done]
 Seen four times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run, F-103 developer): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes
 - [ ] (no dump was ever captured) capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
 - [x] from the dump, find the waiting lock(s); if it is ours, fix the lock order and add a stress test (concurrent queries + background upload + warm-up); if it is the driver under cross-process contention, document it and make the GPU tests serialize on a file lock
