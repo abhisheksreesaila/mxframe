@@ -1273,6 +1273,8 @@ Needs: F-131 · Spec §1 · `mojo/mxframe/table.mojo`, test `mojo/tests/test_tab
 - [x] every value an Int64 (scaled for DECIMAL, a code for TEXT, days for DATE, 0 / 1 for BOOL; values past 2^53 exact); Arrow-layout validity bitmaps, made on the first null; `get`, `is_null`, `null_count`, `dictionary` (first-seen order), `text_of`, `code_of` (-1 if new), `index` (-1 if absent), `column` (raises "column `cost` not found"), `check` (ragged columns raise with both counts), borrowable `values(c) -> Span[Int64]`
 - [x] `share()` consumes the table into a read-only `SharedTable`; copies share the columns (same buffer address), spans from it are read-only. Frames on it come in M5
 - Moved out: the Arrow C Data Interface (spec §2 lists it under "Later"; the Python layer needs it) is F-139
+- Review: NEEDS WORK, fixed: (1) a session could write through `SharedTable.table`: now `_table` (internal), and every public method reads; (2) shared spans were `ImmutAnyOrigin` (could outlive every handle): now `origin_of(self)`, read-only and lifetime-tracked, as are the owner's (writing through one is a compile error, checked); (3) `dictionary(c)` on the shared handle; (4) bitmap edge cases as tests (every pattern up to 69 rows); (5) every error message tested; (6) `append` checks a TEXT code against the dictionary and BOOL 0 / 1, an unknown kind raises, `add_word` loads a dictionary without rows; (8) spec says the codes are Int64
+- For the switch-over (M7): the stand-in turns DECIMAL scale 0 into 2, MX frame keeps 0; a kind is a `ColumnKind`, not an `Int`; the app sets `col.dictionary = [...]` directly, here it is `add_word`
 
 ## F-139 Arrow C Data Interface, both ways [todo]
 Needs: F-132 · Spec §2 ("Later")

@@ -29,7 +29,7 @@ from mxframe import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 
 var t = Table.empty()                              # "New blank sheet"
 t.add_column("revenue", DECIMAL, scale=2)          # values stored as int64 hundredths
-t.add_column("region", TEXT)                       # dictionary-encoded: int32 codes + a string table
+t.add_column("region", TEXT)                       # dictionary-encoded: codes + a string table (MX frame stores the codes as Int64, like every value)
 t.rows(); t.columns(); t.name(c); t.kind(c); t.scale(c); t.index("region") -> Int  # -1 if absent
 t.get(c, row) -> Int64                             # the stored value (a code for TEXT, days for DATE)
 t.is_null(c, row) -> Bool

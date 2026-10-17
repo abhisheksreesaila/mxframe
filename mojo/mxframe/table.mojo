@@ -99,6 +99,8 @@ struct Table(Movable):
         """Adds an empty column; returns its index. A DECIMAL's scale is its number of decimal places."""
         if name in self.by_name:
             raise Error("column `" + name + "` already exists")
+        if kind.value < 0 or kind.value > 4:
+            raise Error("column `" + name + "`: unknown kind " + String(kind.value))
         if scale < 0 or scale > 18:
             raise Error("column `" + name + "`: scale " + String(scale) + " is outside 0..18")
         if kind != DECIMAL and scale != 0:
@@ -137,20 +139,28 @@ struct Table(Movable):
         """Raises when the columns do not all have the same number of rows."""
         for c in range(1, len(self.cols)):
             if len(self.cols[c].values) != self.rows():
-                raise Error("column `" + self.cols[c].name + "` has " + String(len(self.cols[c].values)) +
-                            " rows, column `" + self.cols[0].name + "` has " + String(self.rows()))
+                raise Error("column `" + self.cols[c].name + "` has " + _rows(len(self.cols[c].values)) +
+                            ", column `" + self.cols[0].name + "` has " + _rows(self.rows()))
 
     # ── building ────────────────────────────────────────────────────────────────────────────────
 
-    def append(mut self, c: Int, value: Int64):
-        """Appends a stored value (scaled for a DECIMAL, a code for TEXT, days for DATE, 0 / 1 for BOOL)."""
-        self.cols[c].push(value, True)
+    def append(mut self, c: Int, value: Int64) raises:
+        """Appends a stored value (scaled for a DECIMAL, a code for TEXT, days for DATE, 0 / 1 for BOOL). A TEXT
+        code must be one of the column's words (`add_word`), a BOOL 0 or 1."""
+        ref col = self.cols[c]
+        if col.kind == TEXT and (value < 0 or value >= Int64(len(col.words))):
+            raise Error("column `" + col.name + "`: code " + String(value) + " is not one of its " +
+                        String(len(col.words)) + " words")
+        if col.kind == BOOL and value != 0 and value != 1:
+            raise Error("column `" + col.name + "` is BOOL: " + String(value) + " is not 0 or 1")
+        col.push(value, True)
 
     def append_null(mut self, c: Int):
         self.cols[c].push(0, False)
 
-    def append_text(mut self, c: Int, word: String) raises:
-        """Appends a TEXT value: an existing word keeps its code, a new word gets the next one."""
+    def add_word(mut self, c: Int, word: String) raises -> Int:
+        """A TEXT column's code for `word`, adding it to the dictionary when new (no row is added): load a
+        dictionary once, then `append` codes."""
         if self.cols[c].kind != TEXT:
             raise Error("column `" + self.cols[c].name + "` is " + String(self.cols[c].kind) + ", not TEXT")
         var code = self.cols[c].codes.get(word, -1)
@@ -158,12 +168,17 @@ struct Table(Movable):
             code = len(self.cols[c].words)
             self.cols[c].words.append(word)
             self.cols[c].codes[word] = code
+        return code
+
+    def append_text(mut self, c: Int, word: String) raises:
+        """Appends a TEXT value: an existing word keeps its code, a new word gets the next one."""
+        var code = self.add_word(c, word)
         self.cols[c].push(Int64(code), True)
 
     # ── reading ─────────────────────────────────────────────────────────────────────────────────
 
     def get(self, c: Int, row: Int) -> Int64:
-        """The stored value (0 for a null: ask `is_null`)."""
+        """The stored value (0 for a null: ask `is_null`). Not range-checked (the hot path): c and row must exist."""
         return self.cols[c].values[row]
 
     def is_null(self, c: Int, row: Int) -> Bool:
@@ -172,14 +187,14 @@ struct Table(Movable):
     def null_count(self, c: Int) -> Int:
         return self.cols[c].nulls
 
-    def values(ref self, c: Int) -> Span[Int64, origin_of(self)]:
-        """The column's values without a copy, valid until the column next changes."""
-        var p = self.cols[c].values.unsafe_ptr().unsafe_origin_cast[origin_of(self)]()
+    def values(self, c: Int) -> Span[Int64, origin_of(self)]:
+        """The column's values, read-only and without a copy, valid until the column next changes."""
+        var p = Pointer[Int64, origin_of(self)](unsafe_from_address=Int(self.cols[c].values.unsafe_ptr()))
         return Span[Int64, origin_of(self)](unsafe_ptr=p, length=len(self.cols[c].values))
 
-    def dictionary(ref self, c: Int) -> Span[String, origin_of(self)]:
-        """A TEXT column's words, by code."""
-        var p = self.cols[c].words.unsafe_ptr().unsafe_origin_cast[origin_of(self)]()
+    def dictionary(self, c: Int) -> Span[String, origin_of(self)]:
+        """A TEXT column's words, by code, read-only."""
+        var p = Pointer[String, origin_of(self)](unsafe_from_address=Int(self.cols[c].words.unsafe_ptr()))
         return Span[String, origin_of(self)](unsafe_ptr=p, length=len(self.cols[c].words))
 
     def text_of(self, c: Int, code: Int) -> String:
@@ -195,49 +210,59 @@ struct Table(Movable):
 
 
 struct SharedTable(ImplicitlyCopyable):
-    """A read-only handle on a shared table. Copies share the columns; the table lives while any handle does."""
-    var table: ArcPointer[Table]
+    """A read-only handle on a shared table. Copies share the columns; the table lives while any handle does.
+    Everything public reads: `_table` is internal (Mojo has no private fields), never write through it."""
+    var _table: ArcPointer[Table]
 
     def __init__(out self, var table: Table):
-        self.table = ArcPointer(table^)
+        self._table = ArcPointer(table^)
 
     def rows(self) -> Int:
-        return self.table[].rows()
+        return self._table[].rows()
 
     def columns(self) -> Int:
-        return self.table[].columns()
+        return self._table[].columns()
 
     def name(self, c: Int) -> String:
-        return self.table[].name(c)
+        return self._table[].name(c)
 
     def kind(self, c: Int) -> ColumnKind:
-        return self.table[].kind(c)
+        return self._table[].kind(c)
 
     def scale(self, c: Int) -> Int:
-        return self.table[].scale(c)
+        return self._table[].scale(c)
 
     def index(self, name: String) -> Int:
-        return self.table[].index(name)
+        return self._table[].index(name)
 
     def column(self, name: String) raises -> Int:
-        return self.table[].column(name)
+        return self._table[].column(name)
 
     def get(self, c: Int, row: Int) -> Int64:
-        return self.table[].get(c, row)
+        return self._table[].get(c, row)
 
     def is_null(self, c: Int, row: Int) -> Bool:
-        return self.table[].is_null(c, row)
+        return self._table[].is_null(c, row)
 
     def null_count(self, c: Int) -> Int:
-        return self.table[].null_count(c)
+        return self._table[].null_count(c)
 
-    def values(self, c: Int) -> Span[Int64, ImmutAnyOrigin]:
-        """The column's values, read-only (the table is shared), without a copy."""
-        var p = Pointer[Int64, ImmutAnyOrigin](unsafe_from_address=Int(self.table[].cols[c].values.unsafe_ptr()))
-        return Span[Int64, ImmutAnyOrigin](unsafe_ptr=p, length=len(self.table[].cols[c].values))
+    def values(self, c: Int) -> Span[Int64, origin_of(self)]:
+        """The column's values, read-only, without a copy; the span lives no longer than this handle."""
+        var p = Pointer[Int64, origin_of(self)](unsafe_from_address=Int(self._table[].cols[c].values.unsafe_ptr()))
+        return Span[Int64, origin_of(self)](unsafe_ptr=p, length=len(self._table[].cols[c].values))
+
+    def dictionary(self, c: Int) -> Span[String, origin_of(self)]:
+        """A TEXT column's words, by code, read-only."""
+        var p = Pointer[String, origin_of(self)](unsafe_from_address=Int(self._table[].cols[c].words.unsafe_ptr()))
+        return Span[String, origin_of(self)](unsafe_ptr=p, length=len(self._table[].cols[c].words))
 
     def text_of(self, c: Int, code: Int) -> String:
-        return self.table[].text_of(c, code)
+        return self._table[].text_of(c, code)
 
     def code_of(self, c: Int, word: String) -> Int:
-        return self.table[].code_of(c, word)
+        return self._table[].code_of(c, word)
+
+
+def _rows(n: Int) -> String:
+    return String(n) + (" row" if n == 1 else " rows")

@@ -58,6 +58,79 @@ def test_values_nulls_and_text() raises:
     expect(t.null_count(r) == 1 and t.null_count(g) == 1, "null counts")
 
 
+def test_validity_bitmap_edges() raises:
+    """Every pattern up to 69 rows: no nulls, one null after k valid rows, nulls at multiples of 8, alternating, all."""
+    for n in range(1, 70):
+        for pattern in range(5):
+            for k in range(n if pattern == 1 else 1):
+                var t = Table.empty()
+                var a = t.add_column("a", INT)
+                var want = 0
+                for i in range(n):
+                    var null = (pattern == 1 and i == k) or (pattern == 2 and i % 8 == 0) or \
+                               (pattern == 3 and i % 2 == 1) or pattern == 4
+                    if null:
+                        t.append_null(a)
+                        want += 1
+                    else:
+                        t.append(a, Int64(i + 1))
+                expect(t.null_count(a) == want, "null count n=" + String(n) + " pattern " + String(pattern))
+                for i in range(n):
+                    var null = (pattern == 1 and i == k) or (pattern == 2 and i % 8 == 0) or \
+                               (pattern == 3 and i % 2 == 1) or pattern == 4
+                    expect(t.is_null(a, i) == null and t.get(a, i) == (0 if null else Int64(i + 1)),
+                           "row " + String(i) + " of " + String(n) + " pattern " + String(pattern))
+
+
+def test_bad_values_and_kinds_raise() raises:
+    var t = Table.empty()
+    var g = t.add_column("g", TEXT)
+    var b = t.add_column("b", BOOL)
+    var q = t.add_column("q", INT)
+    var cases = List[String]()
+    try:
+        t.append(g, 0)                    # no words yet
+    except e:
+        cases.append(String(e))
+    try:
+        t.append(b, 5)
+    except e:
+        cases.append(String(e))
+    try:
+        t.append_text(q, "x")
+    except e:
+        cases.append(String(e))
+    try:
+        _ = t.add_column("d", DECIMAL, scale=19)
+    except e:
+        cases.append(String(e))
+    try:
+        _ = t.add_column("i", INT, scale=2)
+    except e:
+        cases.append(String(e))
+    try:
+        _ = t.add_column("k", ColumnKind(42))
+    except e:
+        cases.append(String(e))
+    expect(len(cases) == 6, "six errors, got " + String(len(cases)))
+    expect("column `g`: code 0 is not one of its 0 words" in cases[0], cases[0])
+    expect("column `b` is BOOL: 5 is not 0 or 1" in cases[1], cases[1])
+    expect("column `q` is INT, not TEXT" in cases[2], cases[2])
+    expect("scale 19 is outside 0..18" in cases[3], cases[3])
+    expect("only a DECIMAL has a scale" in cases[4], cases[4])
+    expect("unknown kind 42" in cases[5], cases[5])
+
+
+def test_a_dictionary_loads_without_rows() raises:
+    var t = Table.empty()
+    var g = t.add_column("g", TEXT)
+    expect(t.add_word(g, "West") == 0 and t.add_word(g, "East") == 1 and t.add_word(g, "West") == 0, "codes")
+    expect(t.rows() == 0, "no rows added")
+    t.append(g, 1)
+    t.append(g, 0)
+    expect(t.text_of(g, Int(t.get(g, 0))) == "East" and t.null_count(g) == 0, "codes appended")
+
+
 def test_any_number_of_columns() raises:
     var t = Table.empty()
     for c in range(100):                  # the stand-in stopped at 16
@@ -77,7 +150,7 @@ def test_ragged_columns_raise() raises:
     try:
         t.check()
     except e:
-        expect("column `b` has 1 rows" in String(e), "ragged message: " + String(e))
+        expect("column `b` has 1 row, column `a` has 2 rows" in String(e), "ragged message: " + String(e))
         return
     raise Error("FAILED: check() accepted ragged columns")
 
@@ -103,6 +176,17 @@ def test_shared_table_is_read_only() raises:
     expect(Int(again.values(a).unsafe_ptr()) == Int(shared.values(a).unsafe_ptr()), "no copy between handles")
 
 
+def test_shared_text_reads() raises:
+    var t = Table.empty()
+    var g = t.add_column("g", TEXT)
+    t.append_text(g, "West")
+    t.append_null(g)
+    var shared = t^.share()
+    var words = shared.dictionary(g)
+    expect(len(words) == 1 and words[0] == "West", "dictionary through a shared handle")
+    expect(shared.text_of(g, 0) == "West" and shared.null_count(g) == 1 and shared.is_null(g, 1), "shared reads")
+
+
 def main() raises:
     test_kinds_and_metadata()
     test_values_nulls_and_text()
@@ -110,3 +194,7 @@ def main() raises:
     test_ragged_columns_raise()
     test_duplicate_column_name_raises()
     test_shared_table_is_read_only()
+    test_validity_bitmap_edges()
+    test_bad_values_and_kinds_raise()
+    test_a_dictionary_loads_without_rows()
+    test_shared_text_reads()
