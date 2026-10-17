@@ -706,6 +706,9 @@ class CustomOpsCompiler(GraphCompiler):
         arr = self._eval_expr_arrow(other, table)
         typ = arr.type
         if pa.types.is_floating(typ):
+            if isinstance(value, np.float64) and typ == pa.float32():     # a DOUBLE literal (F-106): the float32 array widens
+                arr = pc.cast(arr, pa.float64())
+                typ = arr.type
             scalar = _npscalar(float(value), type=typ)
         elif pa.types.is_integer(typ):
             scalar = _npscalar(value) if isinstance(value, int) else _npscalar(float(value), type=pa.float64())
@@ -752,7 +755,7 @@ class CustomOpsCompiler(GraphCompiler):
             n = len(table)
             if isinstance(val, (int, float)):
                 return _npa(np.full(
-                    n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) else np.float32))
+                    n, val, dtype=np.float64 if getattr(_PRECISE, 'on', False) or isinstance(val, np.float64) else np.float32))
             return _npa([val] * n)
         if op == "mod":
             return _modulo(*self._arith_operands(args, table), decimal=len(args) > 2)

@@ -21,12 +21,13 @@ import re
 import calendar
 import itertools
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
+import numpy as np
 import pyarrow as pa
 import sqlglot
 import sqlglot.expressions as sge
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .lazy_expr import Expr, col, lit, when
 from .lazy_frame import (
@@ -97,6 +98,48 @@ def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
 
 
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+
+
+def _number(text, neg: bool = False) -> Union[int, float]:
+    """A numeric literal by its SQL type, with its minus sign (`neg`) folded in before the range check, so
+    -9223372036854775808 is an int64: digits only (`1_000` too) is an integer; a point, an exponent or both make
+    it a float (DECIMAL and DOUBLE both read as a float64 here; `_is_decimal_literal` tells them apart). An
+    integer past int64 (DuckDB's HUGEINT) is a float here; `_huge_int` finds it where it is compared with an
+    integer column, and `_SQLTranslator._compare` answers that comparison exactly."""
+    s = str(text)
+    if re.fullmatch(r"\d[\d_]*", s):
+        i = -int(s) if neg else int(s)
+        if -(1 << 63) <= i < (1 << 63):
+            return i
+    return -float(s) if neg else float(s)
+
+
+def _folded(x: Expr, value: bool) -> Expr:
+    """A predicate decided at plan time (`i = 2.5`, `i < 99999999999999999999`): the constant where the integer
+    expression ``x`` has a value, NULL where it is NULL, so NOT, IS NULL and SELECT see SQL's three values.
+    ``x == x`` is true and ``x != x`` false for an integer, NULL for NULL."""
+    return x == x if value else x != x
+
+
+def _exact_decimal(n: sge.Expression) -> Optional[Decimal]:
+    """The exact value of an integer or DECIMAL literal (digits, a point, no exponent), negated or not, else None."""
+    n = _unparen(n)
+    neg = isinstance(n, sge.Neg)
+    n = _unparen(n.this) if neg else n
+    if not (isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"[\d_]*\.?[\d_]*", str(n.this))
+            and re.search(r"\d", str(n.this))):
+        return None
+    d = Decimal(str(n.this).replace("_", ""))
+    return -d if neg else d
+
+
+def _is_double_literal(n: sge.Expression) -> bool:
+    """`1e3`, `-1.5E-5`: DuckDB types a number with an exponent as DOUBLE, which widens a float32 column it is
+    compared with or added to (a DECIMAL or INTEGER literal is cast to the column's float32 instead)."""
+    n = _unparen(n)
+    n = _unparen(n.this) if isinstance(n, sge.Neg) else n
+    return isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"\d[\d_]*", str(n.this)) is None \
+        and "e" in str(n.this).lower()
 
 
 def _is_decimal_literal(n: sge.Expression) -> bool:
@@ -1511,7 +1554,9 @@ class _SQLTranslator:
             v = _num_const(node)
             if v is not None:
                 is_int = v == v.to_integral_value() and all(str(x.this).isdigit() for x in node.find_all(sge.Literal))
-                return lit(int(v)) if is_int else lit(float(v))
+                if is_int:
+                    return lit(int(v))
+                return lit(np.float64(v)) if any(_is_double_literal(x) for x in node.find_all(sge.Literal)) else lit(float(v))
         if isinstance(node, sge.Extract):
             return self._extract(node)
         if isinstance(node, sge.Substring):
@@ -1541,8 +1586,8 @@ class _SQLTranslator:
         if isinstance(node, sge.Literal):
             if node.is_string:
                 return lit(node.this)
-            v = node.this
-            return lit(int(v)) if "." not in str(v) else lit(float(v))
+            v = _number(node.this)
+            return lit(np.float64(v)) if _is_double_literal(node) else lit(v)      # np.float64: a DOUBLE, kept at 64 bits
         f = _float_cast(node)
         if f is not None:
             return lit(f)
@@ -1553,6 +1598,9 @@ class _SQLTranslator:
 
         # ---- negation ----
         if isinstance(node, sge.Neg):
+            n = _unparen(node.this)
+            if isinstance(n, sge.Literal) and not n.is_string and not _is_double_literal(n):
+                return lit(_number(n.this, neg=True))             # the sign belongs to the literal: -2^63 is an int64
             inner = self._expr(node.this)
             if inner.op == "lit" and isinstance(inner.args[0], (int, float)) and not isinstance(inner.args[0], bool):
                 return lit(-inner.args[0])                      # a constant folds (`-1`, `-(-1)`), not 0 - 1 (a float32 scalar)
@@ -1560,13 +1608,17 @@ class _SQLTranslator:
 
         # ---- arithmetic ----
         if isinstance(node, sge.Add):
-            return self._arith_operand(node, node.this) + self._arith_operand(node, node.expression)
+            a, b = self._widened(node.this, node.expression, self._arith_operand, node)
+            return a + b
         if isinstance(node, sge.Sub):
-            return self._arith_operand(node, node.this) - self._arith_operand(node, node.expression)
+            a, b = self._widened(node.this, node.expression, self._arith_operand, node)
+            return a - b
         if isinstance(node, sge.Mul):
-            return self._arith_operand(node, node.this) * self._arith_operand(node, node.expression)
+            a, b = self._widened(node.this, node.expression, self._arith_operand, node)
+            return a * b
         if isinstance(node, sge.Div):
-            return self._float_expr(node.this) / self._float_expr(node.expression)
+            a, b = self._widened(node.this, node.expression, lambda _, n: self._float_expr(n))
+            return a / b
         if isinstance(node, sge.Mod):                    # `a % b` and MOD(a, b): DuckDB's fmod, NULL on zero
             l, r = self._mod_operand(node.this), self._mod_operand(node.expression)
             if l.op == "lit" and r.op == "lit" and all(type(v.args[0]) is int for v in (l, r)):
@@ -1575,18 +1627,8 @@ class _SQLTranslator:
             return Expr("mod", l, r, True) if dec else l % r      # a literal with a point (no exponent) is DECIMAL
 
         # ---- comparisons ----
-        if isinstance(node, sge.EQ):
-            return self._expr(node.this) == self._expr(node.expression)
-        if isinstance(node, sge.NEQ):
-            return self._expr(node.this) != self._expr(node.expression)
-        if isinstance(node, sge.LT):
-            return self._expr(node.this) < self._expr(node.expression)
-        if isinstance(node, sge.LTE):
-            return self._expr(node.this) <= self._expr(node.expression)
-        if isinstance(node, sge.GT):
-            return self._expr(node.this) > self._expr(node.expression)
-        if isinstance(node, sge.GTE):
-            return self._expr(node.this) >= self._expr(node.expression)
+        if isinstance(node, _COMPARE):
+            return self._compare(type(node), node.this, node.expression)
 
         # ---- boolean ----
         if isinstance(node, sge.And):
@@ -1614,17 +1656,21 @@ class _SQLTranslator:
 
         # ---- BETWEEN ----
         if isinstance(node, sge.Between):
-            c = self._expr(node.this)
-            lo = self._expr(node.args["low"])
-            hi = self._expr(node.args["high"])
-            return (c >= lo) & (c <= hi)
+            return self._compare(sge.GTE, node.this, node.args["low"]) & self._compare(sge.LTE, node.this, node.args["high"])
 
         # ---- IN / NOT IN ----
         if isinstance(node, sge.In):
             c = self._expr(node.this)
-            values = [self._scalar(v) for v in node.expressions]
-            result = c.isin(values)
-            return result
+            if self._ftype(node.this) == "f32" and any(_is_double_literal(v) for v in node.expressions):
+                c = c * lit(np.float64(1.0))
+            values = []
+            for v in node.expressions:
+                d = _exact_decimal(v) if self._is_int_expr(node.this) else None
+                if d is None:
+                    values.append(self._scalar(v))
+                elif d == d.to_integral_value() and -(1 << 63) <= d < (1 << 63):     # exactly: a fraction or a value past int64
+                    values.append(int(d))                                              # never equals an integer
+            return c.isin(values) if values else _folded(c, False)
 
         # ---- LIKE / ILIKE [ESCAPE c] ----
         if isinstance(node, sge.Escape) and isinstance(node.this, (sge.Like, sge.ILike)):
@@ -1728,14 +1774,72 @@ class _SQLTranslator:
         if isinstance(node, sge.Literal):
             if node.is_string:
                 return node.this
-            v = node.this
-            return int(v) if "." not in str(v) else float(v)
+            return _number(node.this)
         if isinstance(node, sge.Neg):
+            n = _unparen(node.this)
+            if isinstance(n, sge.Literal) and not n.is_string:
+                return _number(n.this, neg=True)
             return -self._scalar(node.this)
         f = _float_cast(node)
         if f is not None:
             return f
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
+
+    def _ftype(self, node: sge.Expression) -> Optional[str]:
+        """"f64" / "f32" when ``node`` is certainly a DOUBLE / FLOAT expression, as DuckDB types it, else None:
+        a DOUBLE (exponent) literal or float64 column; a float32 column; and + - * / and negation, where any
+        DOUBLE operand makes DOUBLE, else any FLOAT operand FLOAT (an integer or DECIMAL operand is cast to it)."""
+        node = _unparen(node)
+        if isinstance(node, sge.Literal):
+            return "f64" if _is_double_literal(node) else None
+        if isinstance(node, sge.Neg):
+            return self._ftype(node.this)
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Div)):
+            kinds = {self._ftype(node.this), self._ftype(node.expression)}
+            return "f64" if "f64" in kinds else "f32" if "f32" in kinds else None
+        t = self._col_type(node)
+        return "f32" if t is not None and pa.types.is_float32(t) else "f64" if t is not None and pa.types.is_float64(t) else None
+
+    def _widened(self, a: sge.Expression, b: sge.Expression, translate=None, parent=None):
+        """The two operands of a comparison or + - * /. A FLOAT expression against a DOUBLE one (`1e-30`, `1e-30 * 1`,
+        a float64 column) is widened to double, as DuckDB does (a DECIMAL / INTEGER operand is cast to float32
+        instead): `g * np.float64(1.0)` is the expression in double on every path (the bytecode computes in
+        double; the Arrow path widens a float32 array next to an np.float64 literal, see ``_arith_operands``),
+        so the DOUBLE operand is never narrowed."""
+        tr = (lambda n: self._expr(n)) if translate is None else (lambda n: translate(parent, n))
+        x, y = tr(a), tr(b)
+        kinds = (self._ftype(a), self._ftype(b))
+        if kinds == ("f32", "f64"):
+            x = x * lit(np.float64(1.0))
+        elif kinds == ("f64", "f32"):
+            y = y * lit(np.float64(1.0))
+        return x, y
+
+    def _compare(self, cls, a: sge.Expression, b: sge.Expression) -> Expr:
+        """``a <op> b``. Against an integer column or expression, an integer literal past int64 or a DECIMAL
+        literal (a point, no exponent) is compared exactly, as DuckDB does: the DECIMAL becomes the integer bound
+        with the same answer (`< 2.5` is `< 3`, `> 2.5` is `> 2`, `= 2.5` never holds), and a bound past int64 is
+        a constant (above every value `<` `<=` `<>` hold, below every value `>` `>=`); NULL stays NULL. A DOUBLE
+        (exponent) literal compares in double instead, so it is left to the engine."""
+        kind = {sge.LT: "lt", sge.LTE: "le", sge.GT: "gt", sge.GTE: "ge", sge.EQ: "eq", sge.NEQ: "ne"}[cls]
+        for lit_node, x_node, flip in ((b, a, False), (a, b, True)):
+            d = _exact_decimal(lit_node)
+            if d is None or not self._is_int_expr(x_node):
+                continue
+            if flip:
+                kind = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}.get(kind, kind)
+            x = self._expr(x_node)
+            whole = d == d.to_integral_value()
+            if kind in ("eq", "ne") and not whole:
+                return _folded(x, kind == "ne")
+            n = int(d.to_integral_value(ROUND_CEILING if kind in ("lt", "ge") else ROUND_FLOOR)) if not whole else int(d)
+            if -(1 << 63) <= n < (1 << 63):
+                return {"lt": x < lit(n), "le": x <= lit(n), "gt": x > lit(n), "ge": x >= lit(n), "eq": x == lit(n),
+                        "ne": x != lit(n)}[kind]
+            keep = kind == "ne" or (kind in ("lt", "le")) == (n > 0) and kind != "eq"
+            return _folded(x, keep)
+        x, y = self._widened(a, b)
+        return {sge.EQ: x == y, sge.NEQ: x != y, sge.LT: x < y, sge.LTE: x <= y, sge.GT: x > y, sge.GTE: x >= y}[cls]
 
     def _is_int_expr(self, node: sge.Expression) -> bool:
         """True when ``node`` is certainly an integer: an integer literal, an integer column of a known table,
@@ -1768,8 +1872,7 @@ class _SQLTranslator:
         neg = isinstance(n, sge.Neg)
         n = _unparen(n.this) if neg else n
         if isinstance(n, sge.Literal) and not n.is_string:
-            v = int(n.this) if str(n.this).isdigit() else float(n.this)
-            return lit(-v if neg else v)
+            return lit(_number(n.this, neg))
         return self._expr(node)
 
     def _float_expr(self, node: sge.Expression) -> "Expr":
