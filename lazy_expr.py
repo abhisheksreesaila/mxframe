@@ -75,6 +75,11 @@ class Expr:
         """ABS(x), in the argument's own type."""
         return Expr("abs", self)
 
+    def f32(self) -> 'Expr':
+        """x rounded to float32 (a FLOAT result of arithmetic in DuckDB is rounded after every operation); an
+        integer is converted to the float32 nearest to it."""
+        return Expr("f32", self)
+
     def cast(self, dtype: str, decimal: bool = False, try_: bool = False) -> 'Expr':
         """CAST(x AS dtype) for a number type: ``float32``, ``float64``, ``int8`` ... ``int64``. A float rounds
         half to even into an integer; ``decimal=True`` (x is a SQL DECIMAL) rounds half away from zero.
