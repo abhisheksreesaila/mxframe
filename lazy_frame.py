@@ -1097,9 +1097,9 @@ def _auto_codes_decision(plan, prefer=None, placement=None):
     while stack:
         p = stack.pop()
         if count_distinct_shape(p):
-            d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key: the native cpu count (on dictionary codes where "
-                                        "the source keeps them)", None)
-            d.cpu_path = "native executor (count distinct)"
+            d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key: runs as device=\"cpu\" does (the gpu path decodes "
+                                        "the columns; SF10 6.7 s against 0.66 s)", None)
+            d.cpu_path = "as device=\"cpu\""
             return d
         stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
                      if x is not None)

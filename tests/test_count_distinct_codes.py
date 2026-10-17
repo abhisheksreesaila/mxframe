@@ -238,7 +238,7 @@ def test_other_devices_see_decoded_columns(seen, device):
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
 
 
-CD = "COUNT(DISTINCT) per key: the native cpu count"
+CD = "COUNT(DISTINCT) per key: runs as device=\"cpu\" does"
 
 
 @pytest.mark.parametrize("rows", [30_000, 400_000])          # under and over auto's small-input shortcut
@@ -323,4 +323,18 @@ def test_a_shared_column_name_across_a_join_counts_the_left_column(seen):
     exp = _duck("SELECT a, COUNT(DISTINCT l.s) FROM l JOIN r USING (k) GROUP BY a", l=left, r=right)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
     assert lf.last_compile_provenance["auto_reason"] in text
-    assert all("dictionary" not in types for types, _ in seen)
+    assert lf.last_compile_provenance["auto_device"] == "cpu"
+    assert seen and seen[0][0] == ("int64", "int64")              # the native count ran, on the left int s
+
+
+def test_a_shape_the_native_count_declines_still_runs_as_cpu_does(seen):
+    """Nulls in the counted column: the native count declines and the cpu path answers (the reason claims no more)."""
+    t = pa.table({"a": A(np.arange(20_000) % 40), "b": pa.array([None if i % 9 == 0 else i % 13 for i in range(20_000)])})
+    lf = LazyFrame(t).select("a", "b").distinct().groupby("a").agg(col("b").count().alias("n"))
+    got = lf.compute(device="auto")
+    exp = _duck("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a", t=t)
+    assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
+    want = LazyFrame(t).select("a", "b").distinct().groupby("a").agg(col("b").count().alias("n"))
+    want.compute(device="cpu")
+    assert lf.last_compile_provenance["path"] == want.last_compile_provenance["path"]
+    assert lf.last_compile_provenance["auto_reason"].startswith(CD)
