@@ -528,6 +528,70 @@ def modulo(lhs, rhs, decimal=False):
     return array(np.ma.array(np.broadcast_to(res, (n,)).copy(), mask=~np.broadcast_to(valid, (n,))), type=out_t)
 
 
+def _nonzero(x):
+    """*x* with its zeros replaced by NULL (a divisor: DuckDB gives NULL for a zero one, integer or float)."""
+    if isinstance(x, pa.Scalar):
+        return pa.scalar(None, x.type) if x.is_valid and x.as_py() == 0 else x
+    return pc.if_else(pc.equal(x, scalar(0, type=x.type)), pa.scalar(None, x.type), x)
+
+
+def int_divide(lhs, rhs):
+    """SQL ``lhs // rhs`` as DuckDB computes it: integers divide truncating toward zero (-7 // 2 = -3) in the
+    operands' common type (an integer literal takes the column's type when it fits: int32 // 2 is int32), any
+    float or decimal operand makes it a plain division in double, and a zero divisor gives NULL (float too).
+    NULL in, NULL out. ``INT64_MIN // -1`` raises like DuckDB's."""
+    if isinstance(lhs, pa.Scalar) != isinstance(rhs, pa.Scalar) and all(
+            pa.types.is_integer(x.type) for x in (lhs, rhs)):      # a literal next to a column: the column's type
+        lit_, col_ = (lhs, rhs) if isinstance(lhs, pa.Scalar) else (rhs, lhs)
+        try:
+            lit_ = lit_.cast(col_.type) if lit_.is_valid else pa.scalar(None, col_.type)
+            lhs, rhs = (lit_, col_) if isinstance(lhs, pa.Scalar) else (col_, lit_)
+        except pa.ArrowInvalid:
+            pass
+    rhs = _nonzero(rhs)
+    try:
+        return pc.divide_checked(lhs, rhs)
+    except pa.ArrowInvalid as e:
+        if "overflow" not in str(e).lower():
+            raise
+        raise OverflowError("Overflow in division of INT64") from e
+
+
+def power(base, exponent):
+    """SQL ``power(x, y)`` / ``x ** y``: a DOUBLE whatever the arguments (a negative base to a fraction is NaN,
+    ``0 ** -1`` is inf, an overflow is inf); NULL in, NULL out."""
+    return pc.power(pc.cast(base, pa.float64(), safe=False), pc.cast(exponent, pa.float64(), safe=False))
+
+
+def _domain_checked(x, bad, message):
+    """``x`` as a DOUBLE, after raising DuckDB's "Out of Range Error" for the first value the function rejects."""
+    x = pc.cast(x, pa.float64(), safe=False)
+    rejected = pc.filter(x, bad(x))
+    if len(rejected):
+        raise ValueError(message(rejected[0].as_py()))
+    return x
+
+
+def sqrt(x):
+    """SQL ``sqrt(x)``: a DOUBLE; a negative argument raises like DuckDB's, NULL gives NULL, NaN stays NaN."""
+    return pc.sqrt(_domain_checked(x, lambda v: pc.less(v, scalar(0.0)),
+                                   lambda _: "cannot take square root of a negative number"))
+
+
+def ln(x):
+    """SQL ``ln(x)``: a DOUBLE; zero and negative arguments raise like DuckDB's, NULL gives NULL, NaN stays NaN."""
+    return pc.ln(_domain_checked(x, lambda v: pc.less_equal(v, scalar(0.0)),
+                                 lambda v: "cannot take logarithm of zero" if v == 0 else "cannot take logarithm of a negative number"))
+
+
+def nullify(x):
+    """NULL of *x*'s type on every row (``x + NULL``: arithmetic with a NULL keeps the other operand's type)."""
+    return pa.nulls(len(x), x.type)
+
+
+SQL_MATH = {"idiv": int_divide, "pow": power, "sqrt": sqrt, "ln": ln, "nullify": nullify}   # (op name -> function of its evaluated arguments)
+
+
 def distinct_rows(table: pa.Table) -> pa.Table:
     """Distinct rows of ``table`` (nulls equal to each other), first-appearance order."""
     if table.num_rows == 0:
