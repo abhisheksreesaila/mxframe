@@ -507,8 +507,9 @@ def test_a_plan_that_cannot_stream_warns_and_still_runs(tmp_path, monkeypatch):
     tiny(monkeypatch, "20K")
     t = pa.table({"k": np.arange(20_000, dtype=np.int32), "v": np.arange(20_000, dtype=np.float64)})
     path = small_file(tmp_path, t, 1000)
-    lf = scan_parquet(path).sort("v", descending=True).limit(3)
-    with pytest.warns(RuntimeWarning, match="does not fit in memory .* not streamed: no aggregate"):
+    big = scan_parquet(path)
+    lf = big.select("k", "v").join(big.select("k"), on="k").sort("v", descending=True).limit(3)
+    with pytest.warns(RuntimeWarning, match="does not fit in memory .* not streamed: the big file is read twice"):
         got = lf.compute(device="cpu")
     assert prov(lf)["path"] != "streamed"
     assert got.column("v").to_pylist() == [19999.0, 19998.0, 19997.0]
@@ -524,12 +525,14 @@ def test_count_distinct_declines_with_the_reason(tmp_path, monkeypatch):
     assert sorted((r["k"], r["n"]) for r in got.to_pylist()) == [(0, 10), (1, 10), (2, 10)]
 
 
-def test_group_state_over_the_budget_raises_a_clear_memory_error(tmp_path, monkeypatch):
+def test_a_result_of_groups_bigger_than_the_budget_raises_a_clear_memory_error(tmp_path, monkeypatch):
+    """The group state spills to disk (F-056 step 3a); a result that is itself all the groups cannot come back in
+    less memory than it takes, and says so (with a LIMIT or HAVING above the groups it would finish)."""
     tiny(monkeypatch, "400K")
     n = 100_000
     t = pa.table({"k": np.arange(n, dtype=np.int64), "v": np.ones(n)})          # every row its own group
     lf = scan_parquet(small_file(tmp_path, t, 5000)).groupby("k").agg(col("v").sum().alias("s"))
-    with pytest.raises(MemoryError, match=r"group state of [\d,]+ groups .* needs hash-partitioned groups \(F-056 step 3\)"):
+    with pytest.raises(MemoryError, match=r"result of this query is bigger than memory: .*budget of 400\.0 KB"):
         lf.compute(device="cpu")
 
 
@@ -615,8 +618,9 @@ def test_explain_says_a_query_streams_in_so_many_batches(files):
 
 
 def test_explain_says_why_a_query_would_not_stream(files):
-    lf = scan_parquet(files["fact"]).sort("v").limit(5)
-    assert "would not stream: no aggregate above the big file" in lf.explain()
+    fact = scan_parquet(files["fact"])
+    lf = fact.select("j", "v").join(fact.select("j"), on="j").limit(5)
+    assert "would not stream: the big file is read twice by the plan" in lf.explain()
 
 
 def test_explain_says_when_the_data_fits(files, monkeypatch):

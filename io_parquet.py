@@ -142,6 +142,8 @@ def _read_file(path, columns, dict_cols, pushed=(), mask_dict=(), only=None) -> 
         decide = lambda: len(whole) >= 2 and mask_plan(whole, True) is not None      # noqa: E731
         use_mask = st.once(key, decide) if st is not None else decide()
         groups = [g for g in whole if g in only]
+        if st is not None and st.slice_rows and groups:
+            return _next_slice(st, pf, path, columns, groups, dict_cols, md)
     if groups is not None and not groups:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
     if groups is None:
@@ -157,6 +159,36 @@ def _read_file(path, columns, dict_cols, pushed=(), mask_dict=(), only=None) -> 
     if len(groups) == md.num_row_groups:
         return pf.read(columns=columns, use_threads=True)
     return pf.read_row_groups(groups, columns=columns, use_threads=True)
+
+
+SLICE_BUFFER = 1 << 16
+
+
+def _next_slice(st, pf, path, columns, groups, dict_cols, md) -> pa.Table:
+    """F-056 step 3a: one row group bigger than the budget is read ``st.slice_rows`` rows at a time. The first call
+    of a group opens the batch iterator and each call returns the next slice. The file is opened with a read buffer:
+    Arrow then streams each column chunk page by page instead of reading it whole, so what is held is the slice plus
+    about one data page per column (the writer's page size, 1 MB by default), not the row group. The plan's Filter
+    node still filters the rows exactly (no read-time row filter on a slice)."""
+    import pyarrow.parquet as pq
+
+    def open_iter():
+        return [0, _open()]
+
+    def _open():
+        f = pq.ParquetFile(path, read_dictionary=dict_cols or None, metadata=md, buffer_size=SLICE_BUFFER)
+        return iter(f.iter_batches(batch_size=st.slice_rows, row_groups=list(groups),
+                                   columns=list(columns) if columns else None, use_threads=True))
+
+    state = st.once(("slices", os.path.abspath(path), tuple(groups)), open_iter)
+    if state[0] != st.slice_no:                  # the iterator and the batch loop must be on the same slice
+        raise RuntimeError(f"row group slice {st.slice_no} of {path} was asked for but the reader is at slice "
+                           f"{state[0]}: the streamed file was read more than once (or not at all) in a batch")
+    state[0] += 1
+    rb = next(state[1], None)
+    if rb is None:
+        return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
+    return pa.Table.from_batches([rb])
 
 
 _ROW_OPS = {"eq": "__eq__", "ne": "__ne__", "lt": "__lt__", "le": "__le__", "gt": "__gt__", "ge": "__ge__"}
@@ -595,6 +627,8 @@ class StreamContext:
     def __init__(self, path):
         self.path = os.path.abspath(os.fspath(path))
         self.groups: Optional[tuple] = None          # the current batch's row groups
+        self.slice_rows: Optional[int] = None        # set: the batch is one row group read this many rows at a time
+        self.slice_no = 0                            # which slice of that group the current batch is
         self._once: dict = {}
 
     def is_streamed(self, path) -> bool:
@@ -1109,6 +1143,8 @@ def resolve_plan(plan: LogicalPlan, read: bool = True, count_distinct_codes: boo
         import pyarrow.parquet as pq
         st = _stream.get()
         batch = st.groups if st is not None and st.is_streamed(leaf.path) else None
+        if batch is not None and st.slice_rows:
+            batch = batch + (("slice", st.slice_no),)          # another slice is another source
         token = source_token(leaf.path, cols, pushed, batch)  # before the read: a file replaced meanwhile never matches
         if os.path.isfile(leaf.path):
             if batch is not None:                              # the streamed file: this batch's row groups only
