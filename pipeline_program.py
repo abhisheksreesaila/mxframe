@@ -847,6 +847,10 @@ class _Builder:
             eff = self._FLIP[op] if flip else op
             t = self.table.schema.field(name).type
             kind = "f32" if pa.types.is_float32(t) else "f64" if pa.types.is_floating(t) else "int"
+            if kind == "int" and abs(c) > 2.0 ** 53:
+                # a float constant this large was rounded on parsing (`9223372036854775807.0` reads as 2^63): the
+                # comparison with an int64 is not exact in float64, so the Arrow path answers (F-106)
+                raise Unsupported("float constant beyond 2**53 against an integer column is not exact in float64")
             res = _threshold(kind, eff, c)
             if isinstance(res, bool):
                 return _Const(float(res), "bool")

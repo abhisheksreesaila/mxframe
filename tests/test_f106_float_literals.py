@@ -108,6 +108,37 @@ def test_huge_integer_literals(cfg, v):
     _check(cfg, f"select i from t where f > {v} order by i")
 
 
+# ── int64 columns at the limits (review round 1) ──────────────────────────────────────────────────
+
+BIG = pa.table({"i": pa.array([1, 5, 2**53 + 1, 9223372036854775806, 9223372036854775807, -9223372036854775808, None],
+                              pa.int64()),
+                "j": pa.array([1, 2, 3, 4, 5, 6, None], pa.int32()),
+                "f": pa.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, None], pa.float64())})
+BIGCON = duckdb.connect()
+BIGCON.register("_b", BIG)
+BIGCON.execute("create table t as select * from _b")
+
+BIG_WHERE = [f"{c} {op} {v}" for v in ("-9223372036854775808", "9223372036854775807", "9223372036854775808",
+                                       "-9223372036854775809", "99999999999999999999", "-99999999999999999999")
+             for c in ("i", "j") for op in ("=", "<>", "<", "<=", ">", ">=")] + [
+    "i in (9223372036854775808, 1)", "i in (-9223372036854775808, 5)", "i not in (9223372036854775808, 1)",
+    "j in (99999999999999999999, 2)", "i between 1 and 9223372036854775808",
+    "i between -9223372036854775808 and 5", "9223372036854775808 > i", "-9223372036854775808 = i",
+    "i < 1e3", "i > 1e3", "i = 9007199254740992e0", "i > 9007199254740992e0", "i >= 9007199254740992e0",
+    "i < 9.3e18", "i > -9.3e18", "i = -9223372036854775808.0",
+    "i > -9223372036854775808.0", "i <= 9223372036854775807.0", "i + 0 > -9223372036854775808",
+    "i = 9007199254740993",
+]
+
+
+@pytest.mark.parametrize("w", BIG_WHERE)
+def test_int64_limits(cfg, w):
+    q = f"select i from t where {w} order by i"
+    want = BIGCON.execute(q).fetchall()
+    got = _rows(mx.sql(q, t=BIG).compute(device=cfg))
+    assert got == want, (q, got, want)
+
+
 # ── float32 column against literals ───────────────────────────────────────────────────────────────
 
 F32_WHERE = [
@@ -123,6 +154,8 @@ F32_WHERE = [
     "g > 1e-310", "g > 1e-39", "g = 1e-39",
     "g in (0.1, 1.5)", "g in (1e-1, 1.5)", "g in (1e-30, 0.0)",
     "(g > 1e-1 and g < 2) or g = 1e-30",
+    "g > 1e-30 * 1", "-g < -1e-30", "(g) > (1e-30)", "-g > -1e-30", "g * 1 > 1e-30", "g + 0 > 1e-30", "1e-30 * 1 < g",
+    "g * 0.5 > 1e-30", "g > h", "g > h * 1.0 - 1e-30", "(-g) between -1e-30 and 1e-30",
 ]
 
 

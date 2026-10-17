@@ -128,6 +128,8 @@ def _align_literals(lhs, rhs):
         return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float32(x.type)
     def is_f64(x):
         return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float64(x.type)
+    def is_int(x):
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_integer(x.type)
     r, l = _numeric_literal(rhs), _numeric_literal(lhs)
     if r is not None and is_f32(lhs):
         rhs = _npscalar(float(r), type=pa.float32())
@@ -137,6 +139,10 @@ def _align_literals(lhs, rhs):
         rhs = _npscalar(float(r), type=pa.float64())
     elif l is not None and is_f64(rhs):
         lhs = _npscalar(float(l), type=pa.float64())
+    elif isinstance(r, float) and is_int(lhs):          # an integer column against a float constant: compared in double, as DuckDB
+        lhs = pc.cast(lhs, pa.float64(), safe=False)
+    elif isinstance(l, float) and is_int(rhs):
+        rhs = pc.cast(rhs, pa.float64(), safe=False)
     return lhs, rhs
 
 
