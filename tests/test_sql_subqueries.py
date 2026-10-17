@@ -258,7 +258,7 @@ UNSUPPORTED = [
     ("SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.y <> t.x)", "correlated predicate"),
     ("SELECT k FROM t WHERE v > (SELECT AVG(y) FROM u WHERE u.k < t.k)", "correlated predicate"),
     ("SELECT k FROM t WHERE k NOT IN (SELECT k FROM u WHERE u.w = t.v)", "NOT IN"),
-    ("SELECT k, (SELECT AVG(y) FROM u WHERE u.k = t.k) AS a FROM t", "correlated scalar subquery"),
+    ("SELECT k, count(*), (SELECT AVG(y) FROM u WHERE u.k = t.k) AS a FROM t GROUP BY k", "correlated scalar subquery"),
     ("SELECT k FROM t WHERE v > (SELECT k, v FROM t)", "one column"),
     ("SELECT k FROM t WHERE v > (SELECT v FROM t)", "single aggregate"),
     ("SELECT k FROM t WHERE v > (SELECT AVG(v) FROM t GROUP BY s)", "single aggregate"),
