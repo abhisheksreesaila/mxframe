@@ -81,6 +81,7 @@ comptime OP_ADD = 10
 comptime OP_SUB = 11
 comptime OP_MUL = 12
 comptime OP_DIV = 13
+comptime OP_MOD = 14        # fmod: the sign follows the dividend (integer % a nonzero constant, F-101)
 comptime OP_LT = 20
 comptime OP_LE = 21
 comptime OP_GT = 22
@@ -225,6 +226,11 @@ def _bin[OP: Int, NA: Bool](d: FP, a: FP, b: FP, n: Int):
             r = x * y
         elif OP == OP_DIV:
             r = x / y
+        elif OP == OP_MOD:
+            # Mojo's float % is floored (the sign follows the divisor); fmod's follows the dividend: step back
+            # by the divisor when the two signs differ and the remainder is not zero (exact for |x| < 2^53)
+            var m = x % y
+            r = (m.ne(zero) & (x.lt(zero) ^ y.lt(zero))).select(m - y, m)
         elif OP == OP_LT:
             comptime if NA:
                 r = _lt_na(x, y).select(one, zero)
@@ -271,6 +277,8 @@ def _binop(op: Int, d: FP, a: FP, b: FP, n: Int, na: Bool):
         _bin[OP_MUL, False](d, a, b, n)
     elif op == OP_DIV:
         _bin[OP_DIV, False](d, a, b, n)
+    elif op == OP_MOD:
+        _bin[OP_MOD, False](d, a, b, n)
     elif op == OP_LT:
         if na:
             _bin[OP_LT, True](d, a, b, n)

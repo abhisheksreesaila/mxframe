@@ -89,6 +89,7 @@ MAX_STR_IN = 32         # values an isin over a plain string column compares per
 
 OP_LOAD_COL, OP_LOAD_CONST = 1, 2
 OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
+OP_MOD = 14            # fmod of two integer-valued registers; the divisor is a nonzero constant (F-101)
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
@@ -100,7 +101,7 @@ OP_AGG_ISUM = 53       # sum of integer-valued inputs, accumulated in int64 (F-0
 
 OP_NAMES = {
     OP_LOAD_COL: "LOAD_COL", OP_LOAD_CONST: "LOAD_CONST",
-    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
+    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV", OP_MOD: "MOD",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
     OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR", OP_ISNULL: "ISNULL",
@@ -649,6 +650,8 @@ class _Builder:
         a = self._eval_bound(t[1], tight)
         if k == "div":
             return a // t[2] + 1
+        if k == "mod":                                   # |x % k| < |k| and <= |x|
+            return min(a, t[2] - 1)
         b = self._eval_bound(t[2], tight)
         return a * b if k == "mul" else max(a, b) if k == "max" else a + b
 
@@ -689,6 +692,8 @@ class _Builder:
             return _Val(self.emit(OP_ROWID, key_extra=("rowid",)), "int", ("c", 1 << 40))
         if op in _ARITH:
             return self._arith(op, args)
+        if op == "mod":
+            return self._mod(e)
         if op in _CMP:
             return self._compare(op, args)
         if op in ("and", "or"):
@@ -797,6 +802,23 @@ class _Builder:
                 return _Const(a.value / b.value, kind)
             return _Const(_FOLD[code](a.value, b.value), kind)
         return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), kind, bound)
+
+    def _mod(self, e: Expr):
+        """``int % k`` for a nonzero integer constant ``k`` (DuckDB: the sign follows the dividend, i.e. fmod; exact in
+        float64 because the dividend is bound within 2^53). A column or zero divisor could give NULL, a float
+        or decimal operand has Arrow's semantics: those decline to Arrow (F-101)."""
+        if len(e.args) > 2:
+            raise Unsupported("decimal modulo")
+        a = self._need(e.args[0], "num")
+        b = self._need(e.args[1], "num")
+        if a.kind != "int" or b.kind != "int":
+            raise Unsupported("modulo of floats stays on Arrow")
+        if not isinstance(b, _Const) or b.value == 0:
+            raise Unsupported("modulo by a column or by zero (NULL) stays on Arrow")
+        if isinstance(a, _Const):
+            return _Const(math.fmod(a.value, b.value), "int")
+        k = abs(int(b.value))
+        return _Val(self.emit(OP_MOD, a.vreg, self.as_reg(b)), "int", ("mod", self.bound_of(a), k))
 
     def _compare(self, op: str, args):
         lhs, rhs = args
@@ -1118,7 +1140,7 @@ def _int_valued(e: Expr, table: pa.Table) -> bool:
         return isinstance(e.args[0], (int, np.integer)) and not isinstance(e.args[0], bool)
     if e.op == "case_when":                        # (condition, then, otherwise): the condition's type is not the value's
         return all(_int_valued(a, table) for a in e.args[1:])
-    if e.op not in ("add", "sub", "mul", "abs"):
+    if e.op not in ("add", "sub", "mul", "abs", "mod"):
         return False
     return all(_int_valued(a, table) for a in e.args if isinstance(a, Expr))
 

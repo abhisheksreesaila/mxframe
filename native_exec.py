@@ -1766,6 +1766,12 @@ def _bounds(e, rng):
     if op == "case_when":
         a, b = _bounds(e.args[1], rng), _bounds(e.args[2], rng)
         return None if a is None or b is None else (min(a[0], b[0]), max(a[1], b[1]))
+    if op == "mod" and len(e.args) == 2 and e.args[1].op == "lit" and isinstance(e.args[1].args[0], int) and e.args[1].args[0]:
+        a = _bounds(e.args[0], rng)                      # the sign follows the dividend, |x % k| < |k|
+        if a is None:
+            return None
+        m = abs(e.args[1].args[0]) - 1
+        return (max(a[0], -m) if a[0] < 0 else 0, min(a[1], m) if a[1] > 0 else 0)
     if op in ("add", "sub", "mul"):
         a, b = _bounds(e.args[0], rng), _bounds(e.args[1], rng)
         if a is None or b is None:

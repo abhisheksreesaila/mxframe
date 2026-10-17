@@ -63,6 +63,7 @@ comptime OP_ADD = 10
 comptime OP_SUB = 11
 comptime OP_MUL = 12
 comptime OP_DIV = 13
+comptime OP_MOD = 14            # fmod: the sign follows the dividend (integer % a nonzero constant, F-101)
 comptime OP_LT = 20
 comptime OP_LE = 21
 comptime OP_GT = 22
@@ -363,6 +364,10 @@ def _run[RPT: Int, B: Int](
                         r = x - y
                     elif op == OP_DIV:
                         r = x / y
+                    elif op == OP_MOD:
+                        r = x % y                      # floored (the sign follows the divisor); fmod's follows the dividend
+                        if r != 0.0 and ((x < 0.0) != (y < 0.0)):
+                            r = r - y
                     d[k * B] = r
         elif op < OP_AND:
             var a = regs + Int(ins[2]) * TILE + tid
