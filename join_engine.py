@@ -1228,6 +1228,34 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
                  via_probe=via_probe, post_res=post_res, fact=fact)
 
 
+def _dependent_keys(fl, plan, fact: int) -> Dict[str, str]:
+    """Group columns that are plain strings of a partner table, mapped to a unique integer key of the same table
+    that is also a group column (Q10: ``GROUP BY c_custkey, c_name, c_address, c_phone, c_comment``): the key
+    fixes the strings, so the executor can group without them and take them by row afterwards (F-076). Proven
+    on the leaf's own table: a Filter above a scan only removes rows, so a unique column stays unique."""
+    from .np_arrow import to_numpy as _np_of, combine as _combine
+    by_leaf: Dict[int, list] = {}
+    for e in plan.group_by:
+        if e.op == "col" and e.args[0] in fl.src and fl.src[e.args[0]][0] != fact:
+            by_leaf.setdefault(fl.src[e.args[0]][0], []).append((e.args[0], fl.src[e.args[0]][1]))
+    fd: Dict[str, str] = {}
+    for leaf, items in by_leaf.items():
+        scan, _ = _scan_under_filters(fl.leaves[leaf])
+        if len(items) < 2 or scan is None:
+            continue
+        t = scan.table
+        text = [n for n, c in items if pa.types.is_string(t.column(c).type) or pa.types.is_large_string(t.column(c).type)]
+        for n, c in items:
+            col_ = t.column(c)
+            if n in text or col_.null_count or not (pa.types.is_integer(col_.type) and t.num_rows):
+                continue
+            a = _np_of(_combine(col_), zero_copy_only=False)
+            if text and len(np.unique(a)) == len(a):
+                fd.update({m: n for m in text})
+                break
+    return fd
+
+
 def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = False) -> Optional[pa.Table]:
     """``[Sort Limit] [HAVING] Aggregate([Filter]* (inner-join tree))`` as ONE native call (F-046a slice 3):
     the fact leaf's filter, the partner lookups, the conditions across partners (and filters above the join)
@@ -1278,7 +1306,8 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = Fal
             vcols[name] = ("fact", st.via_probe.get((leaf, c), c))
         else:
             vcols[name] = ("partner", lookup_of[st.group[leaf]], _star_name(leaf, c))
-    fj = native_exec.FusedJoin(st.scan, st.preds, st.lookups, vcols, above + [p for p, _ in st.post_res])
+    fj = native_exec.FusedJoin(st.scan, st.preds, st.lookups, vcols, above + [p for p, _ in st.post_res],
+                               _dependent_keys(fl, plan, fact))
     if _TRACE:
         _trace(f"fused join + aggregate: scan leaf {fact} ({st.scan.table.num_rows} rows) with partners "
                f"{[(c, lk.build.num_rows) for (c, _), lk in zip(st.roots, st.lookups)]}")
