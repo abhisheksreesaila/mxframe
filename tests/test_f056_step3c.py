@@ -586,3 +586,22 @@ def test_reproducible_mode_gives_the_same_bits_for_a_spilled_count_distinct_and_
         sink(scan_parquet(messy).select("id", "f", "v").sort("f", "id"), str(tmp_path / f"{name}.parquet"), reproducible=True)
     assert pq.read_table(str(tmp_path / "a.parquet")).column("id").to_pylist() == \
         pq.read_table(str(tmp_path / "b.parquet")).column("id").to_pylist()
+
+
+def test_a_sort_that_keeps_no_row_of_a_streamed_file_writes_the_columns(messy, messy_env, tmp_path):
+    out = str(tmp_path / "none.parquet")
+    n = sink(scan_parquet(messy).filter(col("id") % 7 == 100).select("id", "s").sort("id"), out)
+    got = pq.read_table(out)
+    assert n == 0 and got.column_names == ["id", "s"] and got.schema.field("s").type == pa.string()
+
+
+def test_a_grace_side_that_is_a_streamed_aggregate_does_not_write_into_the_sink(big, tmp_path):
+    """The side's own streamed compute runs inside the sink's query: it must hand its table back, not write the file."""
+    agg = scan_parquet(big).groupby("g").agg(col("v").sum().alias("sv"), col("q").sum().alias("sq"))
+    lf = agg.join(scan_parquet(big).filter(col("q") > 990).select("g", "id"), on="g")
+    out = str(tmp_path / "side.parquet")
+    n = sink(lf, out)
+    want = duck("SELECT a.g, a.sv, a.sq, b.id FROM (SELECT g, sum(v) AS sv, sum(q) AS sq FROM big GROUP BY g) a "
+                "JOIN (SELECT g, id FROM big WHERE q > 990) b ON a.g = b.g", big)
+    assert n == want.num_rows
+    same(pq.read_table(out).sort_by("id"), want.sort_by("id"))

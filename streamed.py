@@ -730,6 +730,11 @@ class _Sink:
             f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Write it to a file "
             f"with sink_parquet(path), add a LIMIT or a tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
 
+    def _post(self, plan, above, r: pa.Table) -> pa.Table:
+        """`r` (rows in sorted order) through the row-local nodes above the Sort."""
+        return r if not above else LazyFrame(_replace(plan, self.sort, Scan(r))).compute(
+            "cpu", optimize=False, validate=False)
+
     def finish(self, plan, top) -> tuple:
         """(the table the streamed part produced, the plan to run on it): the rest of the original plan with the
         streamed part replaced by that table. A sorted result replaces the Sort node itself."""
@@ -740,12 +745,13 @@ class _Sink:
         local = all(isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)) for n in above)
         if self.sort_out is not None and local:                              # sorted ranges, each finished by the nodes above
             self.sort_out.attach(self.budget)
+            wrote = False
             for r in self.ext.ranges():
-                piece = r if not above else LazyFrame(_replace(plan, self.sort, Scan(r))).compute(
-                    "cpu", optimize=False, validate=False)
-                self.sort_out.write(piece)
-            table = self.sort_out.empty_table() if self.sort_out.schema or self.sort_out.empty is not None else \
-                _plain(self.ext.empty if self.ext.empty is not None else np_arrow.empty(pa.schema([])))
+                wrote = True
+                self.sort_out.write(self._post(plan, above, r))
+            if not wrote and self.ext.empty is not None:             # no rows: the columns the nodes above give
+                self.sort_out.write(self._post(plan, above, self.ext.empty))
+            table = self.sort_out.empty_table()
             return table, Scan(table)
         got, size = [], 0
         for r in self.ext.ranges():
@@ -882,12 +888,13 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     spec, leaf = got.spec, got.leaf
     from .pipeline_program import sum_probe
     root = _spill.SpillDir("join partitions" if got.grace is not None else "group state")
+    out = _out.get()
     sink, state, batches_run, rows_info, graced = None, None, 0, None, None
     free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
     if spec is None:                                        # a batch is in flight (input x working factor) while rows are collected
         sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR,
-                         budget, _out.get(), root, lambda: got.resident)
-    token = _active.set(True)
+                         budget, out, root, lambda: got.resident)
+    token, out_token = _active.set(True), _out.set(None)      # a nested streamed compute (a Grace side) must not write into the sink file
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
             run = _Runner(device, strict, prefer, placement, gpu_fraction, probe)
@@ -939,7 +946,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                                 probe2.end()
                             stage_spec, stage_state, stage_top, stages = spec2, state2, top2, stages + 1
                             continue
-                        sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, _out.get(), root,
+                        sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, out, root,
                                          lambda: got.resident)
                         for piece in stage_state.pieces():
                             out = stage_state.format(piece)
@@ -956,6 +963,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                     break
     finally:
         _active.reset(token)
+        _out.reset(out_token)
         root.close()
     result = table if isinstance(above, Scan) else LazyFrame(above).compute(
         device, optimize=False, validate=False, strict=strict, prefer=prefer, placement=placement,
