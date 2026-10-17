@@ -158,3 +158,61 @@ def test_a_key_that_is_not_unique_keeps_every_string_in_the_group(spy):
     assert {r[1] for r in got if r[0] == 0} <= {"Customer#000000", "Customer#000001"}
     _same(got, want)
     assert spy["dependent"] == 0
+
+
+# ---- Q13: COUNT(right column) per left key over a LEFT JOIN -------------------------------------
+
+Q13 = """select c_count, count(*) as custdist
+from (select c_custkey, count(o_orderkey) as c_count
+      from customer left outer join orders on c_custkey = o_custkey and o_orderkey % 5 <> 0
+      group by c_custkey) as c_orders
+group by c_count order by custdist desc, c_count desc"""
+
+
+@pytest.fixture
+def counted(monkeypatch):
+    """How many times the left-join counting route answered."""
+    import mxframe.join_engine as je
+    log = {"ran": 0}
+    real = getattr(je, "left_join_counts", lambda *a, **k: None)
+
+    def wrapped(*a, **k):
+        r = real(*a, **k)
+        log["ran"] += r is not None
+        return r
+    monkeypatch.setattr(je, "left_join_counts", wrapped, raising=False)
+    return log
+
+
+def test_left_join_counts_equal_duckdb_with_customers_that_have_no_orders(counted):
+    t = _tables()
+    _, got = _mx(Q13, t)
+    want = _duck(Q13, t)
+    assert any(r[0] == 0 for r in want), "the data must have customers without orders"
+    _same(got, want)
+    assert counted["ran"] == 1
+
+
+def test_left_join_counts_with_a_duplicate_left_key_keep_the_old_path(counted):
+    t = _tables(dup_customer_key=True)
+    _, got = _mx(Q13, t)
+    _same(got, _duck(Q13, t))
+    assert counted["ran"] == 0
+
+
+def test_left_join_counts_skip_nulls_of_the_counted_column(counted):
+    t = _tables()
+    vals = t["orders"].column("o_orderkey").to_pylist()
+    t["orders"] = t["orders"].set_column(0, "o_orderkey", pa.array([None if v % 3 == 0 else v for v in vals], type=pa.int64()))
+    _, got = _mx(Q13, t)
+    _same(got, _duck(Q13, t))
+
+
+def test_left_join_count_per_key_result_columns():
+    t = _tables()
+    sql = ("select c_custkey, count(o_orderkey) as n from customer left join orders on c_custkey = o_custkey "
+           "group by c_custkey order by c_custkey")
+    out, got = _mx(sql, t)
+    assert out.column_names == ["c_custkey", "n"]
+    assert str(out.schema.field("n").type) == "int64"
+    _same(got, _duck(sql, t))

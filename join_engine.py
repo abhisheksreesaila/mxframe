@@ -1319,6 +1319,49 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = Fal
     return out
 
 
+def left_join_counts(comp, plan, post_ops) -> Optional[pa.Table]:
+    """``SELECT k, COUNT(r.c) FROM l LEFT JOIN r ON l.k = r.k GROUP BY k`` (TPC-H Q13's inner query) without
+    joined rows: the native hash join gives each left row its matches, the counts are a ``bincount`` of those
+    pairs, and every left row is its own group when its key is unique (checked on the encoded keys). The
+    unmatched left rows count 0, with no NULL anywhere, so the aggregate above runs in the native executor
+    (F-080). None: another shape (more aggregates, a non-unique or NULL key, the GPU session, a nullable
+    counted column), and the old path answers."""
+    if comp._session_device == "gpu" or getattr(comp, "_device_arg", None) != "cpu":
+        return None
+    node = plan.input
+    if not (isinstance(node, Join) and node.how == "left") or not plan.aggs or not plan.group_by:
+        return None
+    lcols, rcols = plan_columns(node.left), plan_columns(node.right)
+    if lcols is None or rcols is None:
+        return None
+    mapping = join_output_names(lcols, rcols, node.right_on)
+    rout = {out: orig for orig, out in mapping}
+    gnames = [e.args[0] for e in plan.group_by]
+    if (any(e.op != "col" or e._alias not in (None, e.args[0]) for e in plan.group_by)
+            or not set(node.left_on) <= set(gnames) or not set(gnames) <= set(lcols)):
+        return None
+    counted = []
+    for a in plan.aggs:
+        if a.op != "count" or a.args[0].op != "col" or a.args[0].args[0] not in rout:
+            return None
+        counted.append(rout[a.args[0].args[0]])
+    lt = leaf_table(comp, node.left, set(gnames) | set(node.left_on))
+    rt = leaf_table(comp, node.right, set(counted) | set(node.right_on))
+    if lt.num_rows == 0 or rt.num_rows == 0 or any(rt.column(c).null_count for c in counted + list(node.right_on)) \
+            or any(lt.column(c).null_count for c in node.left_on):
+        return None
+    lk, rk = encode_keys([lt.column(c) for c in node.left_on], [rt.column(c) for c in node.right_on],
+                         comp._common_key_type)
+    if len(np.unique(lk)) != len(lk):
+        return None                                  # several left rows per key: the groups would merge them
+    li, ri = comp._hash_join_left_mojo_cpu(lk, rk)
+    per_row = np.bincount(li[ri >= 0], minlength=lt.num_rows).astype(np.int64)
+    from .np_arrow import array as _npa
+    cols = [lt.column(c) for c in gnames] + [_npa(per_row)] * len(counted)
+    out = pa.Table.from_arrays(cols, names=gnames + [a._alias or f"agg_{i}" for i, a in enumerate(plan.aggs)])
+    return comp._apply_post_ops_custom(out, post_ops) if post_ops else out
+
+
 def _join_cached(comp, node, needed) -> bool:
     """True when ``execute_join`` holds this join's result already (a repeated query)."""
     from . import custom_ops as _co
