@@ -17,7 +17,7 @@ values into one (three spellings of a customer): every reference to the column r
 from std.collections import Dict, Set
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
-                   N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT)
+                   N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool
 
 comptime SET = 0
@@ -190,6 +190,8 @@ struct Frame(Movable):
         if not ok:
             raise Error("column `" + self.base.name(c) + "`: `" + s + "` isn't " +
                         ("a date" if kind == DATE else "true or false" if kind == BOOL else "a number"))
+        if out == NULL_EDIT:
+            raise Error("column `" + self.base.name(c) + "`: `" + s + "` is reserved (it marks an empty cell)")
         return out
 
     # ── edits ───────────────────────────────────────────────────────────────────────────────────────
@@ -201,11 +203,14 @@ struct Frame(Movable):
             raise Error("the value " + String(value) + " is reserved for null; use set_null")
         self._set(c, row, value)
 
-    def _set(mut self, c: Int, row: Int, value: Int64) raises:
+    def _check_cell(self, c: Int, row: Int) raises:
         if c < 0 or c >= self.stored():
             raise Error("only stored columns are edited (a formula follows its inputs)")
         if not self.alive(row):
             raise Error("row " + String(row) + " does not exist")
+
+    def _set(mut self, c: Int, row: Int, value: Int64) raises:
+        self._check_cell(c, row)
         if self.base.kind(c) == TEXT and value != NULL_EDIT and \
                 (value < 0 or value >= Int64(len(self.base.dictionary(c)) + len(self.words[c]))):
             raise Error("column `" + self.base.name(c) + "`: code " + String(value) + " is not one of its words")
@@ -223,6 +228,7 @@ struct Frame(Movable):
 
     def set_text(mut self, c: Int, row: Int, text: String) raises:
         """Sets a cell from typed text (parsed by the column's kind; empty text makes it null)."""
+        self._check_cell(c, row)                            # before `parse` can add a word to a column
         self._set(c, row, self.parse(c, text))
 
     def append(mut self, values: List[String]) raises -> Int:
@@ -340,6 +346,45 @@ struct Frame(Movable):
         expressions only: + - * / // % min max, unary minus, numbers, parentheses. Decimal-aware as the app's:
         + - % min max bring both sides to one scale, * adds scales (then back to 2 places past 2), / gives 2 places
         (the numerator pre-scaled), // gives a whole number."""
+        var parsed = self._parse_formula(text)
+        var name = parsed[0]
+        var saved = self.formulas.copy()
+        try:
+            var at = -1
+            for k in range(len(self.formulas)):
+                if self.formulas[k].name == name:
+                    at = k
+            if at < 0:
+                self.formulas.append(Formula(name, text, parsed[1].copy(), parsed[2]))
+                _ = self.program(self.columns() - 1)         # a cycle raises here
+                self.edits += 1
+                return self.columns() - 1
+            var pending = self.dependants(self.stored() + at)    # their scales and factors were built on the old one
+            self.formulas[at] = Formula(name, text, parsed[1].copy(), parsed[2])
+            _ = self.program(self.stored() + at)             # a cycle raises here
+            while len(pending) > 0:                          # each after the formulas it reads
+                var later = List[String]()
+                for dep in pending:
+                    var j = self.index(dep) - self.stored()
+                    var ready = True
+                    for r in self.formulas[j].expr.columns():
+                        if r != dep and r in pending:
+                            ready = False
+                    if not ready:
+                        later.append(dep)
+                        continue
+                    var again = self._parse_formula(self.formulas[j].text)
+                    self.formulas[j] = Formula(dep, self.formulas[j].text, again[1].copy(), again[2])
+                if len(later) == len(pending):
+                    raise Error("formulas refer to each other in a cycle")
+                pending = later^
+            self.edits += 1
+            return self.stored() + at
+        except e:
+            self.formulas = saved^                           # a refused formula leaves the frame as it was
+            raise e^
+
+    def _parse_formula(self, text: String) raises -> Tuple[String, Expr, Int]:
         var eq = text.find("=")
         if eq < 0:
             raise Error("a formula looks like: margin = revenue - cost")
@@ -353,20 +398,7 @@ struct Frame(Movable):
         var r = p.expr()
         if p.peek() != "":
             raise Error("unexpected `" + p.peek() + "` in the formula")
-        for k in range(len(self.formulas)):
-            if self.formulas[k].name == name:
-                self.formulas[k] = Formula(name, text, r[0].copy(), r[1])
-                _ = self.program(self.stored() + k)          # a cycle raises here
-                self.edits += 1
-                return self.stored() + k
-        self.formulas.append(Formula(name, text, r[0].copy(), r[1]))
-        try:
-            _ = self.program(self.columns() - 1)
-        except e:
-            _ = self.formulas.pop()
-            raise e^
-        self.edits += 1
-        return self.columns() - 1
+        return (name, r[0].copy(), r[1])
 
     def formula_text(self, m: Int) -> String:
         return self.formulas[m - self.stored()].text
@@ -430,7 +462,8 @@ struct Frame(Movable):
         var n = self.base.rows()
         var changed = self.changed_rows()
         if len(changed) > 0:
-            o.mask = List[UInt8](length=(n + 7) // 8, fill=0xFF)
+            if changed[0] < n:                               # appended rows alone leave the shared rows untouched
+                o.mask = List[UInt8](length=(n + 7) // 8, fill=0xFF)
             for row in changed:
                 if row < n:
                     o.mask[row // 8] &= ~(UInt8(1) << UInt8(row % 8))
@@ -441,7 +474,7 @@ struct Frame(Movable):
     # ── sort ────────────────────────────────────────────────────────────────────────────────────────
 
     def permutation(self, c: Int, descending: Bool = False) raises -> List[Int]:
-        """The live rows in the column's order, stable (ties keep row order); text alphabetical (by bytes, merges
+        """The live rows in the column's order, stable (ties keep row order); text alphabetical (ignoring ASCII case, bytes break ties; merges
         applied), nulls last either way. The data never moves."""
         var keys = List[Int64]()
         var nulls = List[Bool]()
@@ -503,13 +536,23 @@ struct Frame(Movable):
         return t^
 
 
+def _ascii_lower(b: UInt8) -> UInt8:
+    return b + 32 if UInt8(65) <= b <= UInt8(90) else b
+
+
 def _text_less(f: Frame, c: Int, a: Int, b: Int) -> Bool:
+    """Alphabetical ignoring ASCII case ("apple" before "Zebra"); words equal that way fall back to byte order."""
     var x = f.text_of(c, Int64(a)).as_bytes()
     var y = f.text_of(c, Int64(b)).as_bytes()
     for i in range(min(len(x), len(y))):
+        if _ascii_lower(x[i]) != _ascii_lower(y[i]):
+            return _ascii_lower(x[i]) < _ascii_lower(y[i])
+    if len(x) != len(y):
+        return len(x) < len(y)
+    for i in range(len(x)):
         if x[i] != y[i]:
             return x[i] < y[i]
-    return len(x) < len(y)
+    return False
 
 
 def _merge_sort_by_text(mut idx: List[Int], f: Frame, c: Int):
@@ -721,12 +764,20 @@ struct _FormulaParser:
         raise Error("unexpected `" + c + "` in the formula")
 
 
+def _scaled_up(e: Expr, places: Int, scale: Int) -> Expr:
+    """e times 10^places, marked as having `scale` decimal places (a column times a literal would keep the column's
+    scale, and the query compiler's check would refuse the + - min max that follows)."""
+    var out = e * Expr(Int(_pow10(places)))
+    out.nodes.append(Node(N_SCALE_TO, Int64(scale), ""))
+    return out^
+
+
 def _align(var a: Tuple[Expr, Int], var b: Tuple[Expr, Int]) -> Tuple[Expr, Expr, Int]:
     """Both sides at one scale: the one with fewer decimal places is multiplied up."""
     if a[1] < b[1]:
-        return (a[0] * Expr(Int(_pow10(b[1] - a[1]))), b[0].copy(), b[1])
+        return (_scaled_up(a[0], b[1] - a[1], b[1]), b[0].copy(), b[1])
     if b[1] < a[1]:
-        return (a[0].copy(), b[0] * Expr(Int(_pow10(a[1] - b[1]))), a[1])
+        return (a[0].copy(), _scaled_up(b[0], a[1] - b[1], a[1]), a[1])
     return (a[0].copy(), b[0].copy(), a[1])
 
 
@@ -816,7 +867,7 @@ def _eval_row(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int6
         elif n.op == N_LIT:
             vals.append(n.value)
             nulls.append(False)
-        elif n.op == N_NEG or n.op == N_NOT or n.op == N_BOOL2INT:
+        elif n.op == N_NEG or n.op == N_NOT or n.op == N_BOOL2INT or n.op == N_SCALE_TO:
             var a = vals.pop()
             var an = nulls.pop()
             if n.op == N_NEG and a == Int64.MIN:

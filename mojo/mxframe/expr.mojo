@@ -28,6 +28,7 @@ comptime N_NE = 25
 comptime N_AND = 30
 comptime N_OR = 31
 comptime N_NOT = 32
+comptime N_SCALE_TO = 34     # no-op marking its operand as having `value` decimal places (internal: a formula's rescaled side)
 comptime N_BOOL2INT = 33     # a comparison as the number 1 / 0 (internal: merges remap text codes with it)
 
 
@@ -40,12 +41,12 @@ struct Node(Copyable, Movable):
     def arity(self) -> Int:
         if self.op == N_COL or self.op == N_LIT:
             return 0
-        if self.op == N_NEG or self.op == N_NOT or self.op == N_BOOL2INT:
+        if self.op == N_NEG or self.op == N_NOT or self.op == N_BOOL2INT or self.op == N_SCALE_TO:
             return 1
         return 2
 
     def is_bool(self) -> Bool:
-        return self.op >= N_LT and self.op != N_BOOL2INT
+        return self.op >= N_LT and self.op != N_BOOL2INT and self.op != N_SCALE_TO
 
 
 struct Expr(Copyable, Movable):
