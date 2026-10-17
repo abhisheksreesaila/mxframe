@@ -545,3 +545,32 @@ def test_a_grace_join_result_bigger_than_memory_is_written_pair_by_pair(big, tmp
     got = pq.read_table(out)
     same(got.sort_by("id"), want.sort_by("id"))
     assert spill_leftovers(_env) == []
+
+
+# --- SQL COPY ------------------------------------------------------------------------------------------------------
+
+def test_sql_copy_to_parquet_streams_a_result_bigger_than_memory(big, tmp_path):
+    out = str(tmp_path / "copy.parquet")
+    res = mx.sql(f"COPY (SELECT id, g, v, q, s FROM big WHERE q > 100) TO '{out}' (FORMAT PARQUET)",
+                 big=scan_parquet(big)).compute()
+    want = duck("SELECT id, g, v, q, s FROM big WHERE q > 100 ORDER BY id", big)
+    assert res.to_pylist() == [{"Count": want.num_rows}]
+    same(pq.read_table(out).sort_by("id"), want)
+
+
+def test_sql_copy_without_options_and_unsupported_forms(big, tmp_path):
+    out = str(tmp_path / "c2.parquet")
+    assert mx.sql(f"COPY (SELECT id FROM big LIMIT 5) TO '{out}'", big=scan_parquet(big)).compute().to_pylist() == [{"Count": 5}]
+    assert pq.read_table(out).num_rows == 5
+    with pytest.raises(NotImplementedError, match="FORMAT PARQUET"):
+        mx.sql(f"COPY (SELECT id FROM big) TO '{out}' (FORMAT CSV)", big=scan_parquet(big))
+    with pytest.raises(NotImplementedError, match=r"COPY \(SELECT"):
+        mx.sql(f"COPY big TO '{out}'", big=scan_parquet(big))
+
+
+def test_median_quantile_stddev_and_variance_are_refused_by_name_not_with_a_key_error():
+    """The engine has no such aggregate (in memory or streamed): a SQL query that asks for one says so."""
+    t = pa.table({"g": [1, 1, 2], "x": [1.0, 2.0, 4.0]})
+    for q in ("median(x)", "stddev(x)", "var_samp(x)", "quantile_cont(x, 0.5)"):
+        with pytest.raises(NotImplementedError, match="Unsupported aggregate function"):
+            mx.sql(f"SELECT g, {q} FROM t GROUP BY g", t=t)

@@ -332,7 +332,10 @@ def _unsupported_shape(sel: sge.Expression, what: str, keys=("group", "having", 
 def _default_agg_name(node: sge.Expression) -> str:
     """DuckDB's name for an aggregate without an alias: ``sum(v)``, ``count_star()``, ``count(DISTINCT v)``;
     the argument is written as in the query. Other arguments need an alias (we do not guess DuckDB's text)."""
-    fn = _AGG_NAMES[type(node)]
+    fn = _AGG_NAMES.get(type(node))
+    if fn is None:
+        raise NotImplementedError(f"Unsupported aggregate function: {node.sql_name()} (the engine has SUM, AVG, MIN, MAX, "
+                                  f"COUNT and COUNT(DISTINCT x); no MEDIAN, quantile, STDDEV or VARIANCE)")
     arg = node.this
     distinct = isinstance(arg, sge.Distinct)
     if distinct:
@@ -452,10 +455,28 @@ class _SQLTranslator:
 
     def translate(self, query: str) -> LazyFrame:
         tree = sqlglot.parse_one(query, dialect="duckdb")
+        if isinstance(tree, sge.Copy):
+            return self._copy(tree)
         if not isinstance(tree, sge.Select):
             raise ValueError(f"Only SELECT statements are supported, got {type(tree).__name__}")
         plan = self._build_select(tree)
         return LazyFrame(plan)
+
+    def _copy(self, tree: sge.Copy) -> LazyFrame:
+        """``COPY (SELECT ...) TO 'file.parquet' [(FORMAT PARQUET)]``: runs the query on the CPU now and streams the result
+        into the file (`LazyFrame.sink_parquet`, so a result bigger than memory finishes), then returns the one-row
+        table ``Count`` of the rows written, as DuckDB does (F-113)."""
+        body, files = tree.this, tree.args.get("files") or []
+        if tree.args.get("kind") or not isinstance(body, sge.Subquery) or not isinstance(body.this, sge.Select) \
+                or len(files) != 1 or not isinstance(files[0], sge.Literal) or not files[0].is_string:
+            raise NotImplementedError("COPY is supported as COPY (SELECT ...) TO 'file.parquet'")
+        for prm in tree.args.get("params") or []:
+            name, value = str(prm.this).upper(), str(prm.args.get("expression")).upper()
+            if (name, value) != ("FORMAT", "PARQUET"):
+                raise NotImplementedError(f"COPY option {name} {value} is not supported (only FORMAT PARQUET)")
+        path = files[0].name
+        n = LazyFrame(self._build_select(body.this)).sink_parquet(path)
+        return LazyFrame(Scan(pa.table({"Count": pa.array([n], pa.int64())})))
 
     def _build_select(self, node: sge.Select) -> LogicalPlan:
         if not isinstance(node, sge.Select):

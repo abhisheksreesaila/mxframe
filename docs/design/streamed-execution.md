@@ -267,3 +267,57 @@ dropped for inner / semi, and for left / anti written to their own file and emit
 each chunk joined against an empty right table (NULL columns for left, the row as is for anti). The right side is
 therefore partitioned first. A `MemoryError` for a key that cannot split names the most repeated key and its rows.
 An integer with no exact double joined with a float key raises the in-memory `TypeError: join key types differ`.
+
+
+## 12. Step 3c: sink, external sort, count distinct (F-113)
+
+**Sink.** `LazyFrame.sink_parquet(path, device="cpu", compression="zstd", **compute_args)` runs the query with a
+`streamed.ParquetOut` in a context variable (`streamed._out`). A streamed query hands its result to the file in pieces
+instead of building the table: the batches of a rows query with nothing row-wise-unfinished above it (a filter, a
+projection, a join to resident tables, the pairs of a Grace join), the hash partitions of a spilled aggregate (after
+HAVING / projections), and the key ranges of an external sort (below). Small pieces are buffered to row groups of
+`budget / 16` bytes (at least 256 KB, at most 32 MB). The file is written under `<path>.mxframe-partial-<pid>` and
+renamed when the query is complete, so an error leaves no partial file and keeps an old one. A query that was not streamed
+(it fits) is written from its table; an empty result writes a file with the columns. Plain `compute()` is unchanged and
+its "bigger than memory" `MemoryError` names `sink_parquet`. Provenance: `sink = {path, rows, streamed}`. SQL:
+`COPY (SELECT ...) TO 'f.parquet' [(FORMAT PARQUET)]` runs the query through `sink_parquet` at once (on the CPU) and returns
+the one-row `Count` table, as DuckDB does.
+
+**Sorts larger than memory** (`extsort.py`; ORDER BY with no LIMIT over a rows query or over spilled groups; Sort + LIMIT
+is still the running top-k of 3a). Not a heap merge: the comparison of two rows is the engine's `Sort` (F-070 / F-084: NaN
+largest, NULLs last, DESC, strings, several keys, expressions), and calling it per row would be slow and could disagree.
+
+1. Each batch is cut into pieces of `(budget - held) / 32` bytes (the engine's sort peaks at 4-5x its input, measured
+   with `pa.default_memory_pool().max_memory()`), each piece is sorted on the **CPU** (the GPU sort rounds floats to
+   float32) and written as a sorted *run* with a hidden `__seq` column (run number x 2^40 + position), plus 64 sampled rows
+   kept in memory. `(keys, __seq)` is a strict total order every run already follows; ties keep the order of the file.
+2. After the last batch the sorted samples give splitter rows so that a key range holds about `(budget - held) / 16` bytes
+   (at most 256 ranges). Each run is loaded alone, sorted together with the splitters (tagged so that a splitter sorts
+   before an equal row) which says how many of its rows come before each splitter, and its slices are appended to the range
+   files. Because the splitters are real rows with their `__seq`, a key repeated a million times still splits.
+3. Range by range the slices are read, sorted (a merge of k sorted pieces) and yielded without `__seq`. The ranges in order
+   are the sorted result: `compute()` concatenates them (they must fit the same limit as any collected result, otherwise
+   `MemoryError` naming the size and `sink_parquet`); a sink applies the row-local nodes above the Sort to each range and
+   writes it. Nodes above the Sort that are not row-local (Distinct, Aggregate) collect first.
+
+Limits: a sort can be about 256 ranges x `(budget - held) / 16`, i.e. 16x the budget (a larger one raises a `MemoryError`
+that says so); a range that comes out bigger than `(budget - held) / 3` (sampling variance, 64 samples per run keep it
+within 20-30%) also raises. Provenance: `streamed.rows = {kind: "sort", sort: {runs, ranges, bytes, rows}}`.
+
+**count(distinct x) and other non-decomposable aggregates.**
+- `Aggregate(Distinct(X), keys, aggs)` (the DataFrame form `select(a, b).distinct().groupby(a).agg(col(b).count())`)
+  is rewritten, when step 2 would decline for the Distinct, as `Aggregate(Aggregate(X, every column of X, [count(1)]),
+  keys, aggs)` (`_distinct_to_aggregate`): removing duplicate rows is grouping by all their columns, with the same rules
+  for NaN, -0.0 and NULL. SQL `COUNT(DISTINCT x)` is already two aggregates (the front end groups by keys + x first; with other
+  aggregates they are combined per key afterwards), so it needed no rewrite.
+- The inner aggregate is the streamed one: its partials are per (keys, x) pair and, when the pairs pass the merge limit,
+  go to hash partitions on disk by `hash(keys, x)` (3a), each deduplicated on its own. The outer aggregate is then a
+  *second stage* (`_next_stage`): each partition's groups are the batches of another partial aggregate (CPU), merged by the
+  same `_State` (which spills too when the per-key groups are many) with its own `SumProbe` for the integer sums. Exact: a pair is
+  in exactly one partition, and the outer count of a key is the sum of its partitions' counts. A group whose x are all NULL
+  counts 0, as in DuckDB. When the pairs fit, the merged inner table goes to the in-memory outer aggregate as before.
+- **median / quantile / stddev / variance**: the engine has none of them (in memory either: `mx.sql` raised a bare
+  `KeyError` for them, now `NotImplementedError: Unsupported aggregate function`). They are new engine aggregates, not a
+  streaming question: stddev / variance would stream as (count, sum, sum of squares) partials, but a sum of squares loses
+  digits to cancellation, so they need a Welford / Chan merge in the engine first (follow-up); median needs the group
+  partition of 3a plus an in-partition sort.
