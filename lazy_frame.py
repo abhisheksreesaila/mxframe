@@ -333,9 +333,16 @@ class LazyFrame:
                 for line in opt.trace:
                     print(f"  - {line}")
 
-        from . import streamed as _streamed
-        got = _streamed.try_stream(self, plan, device, strict=strict, prefer=prefer, placement=placement,
-                                   gpu_fraction=gpu_fraction, verbose=verbose)
+        # streamed execution needs a Parquet source (or a stream already running): importing it (and its spill
+        # machinery) on every first query cost ~1.5-2 ms of an in-memory query's clock (F-058)
+        import sys as _sys
+        from .io_parquet import _leaves as _plan_leaves
+        _streamed = _sys.modules.get(__package__ + ".streamed")
+        if _streamed is None and any(isinstance(l, ParquetScan) for l in _plan_leaves(plan)):
+            from . import streamed as _streamed
+        got = None if _streamed is None else _streamed.try_stream(
+            self, plan, device, strict=strict, prefer=prefer, placement=placement, gpu_fraction=gpu_fraction,
+            verbose=verbose)
         if got is not None:                 # the sources are bigger than memory: ran in batches of row groups (F-056)
             self._last_optimizer_trace = list(optimizer_trace or [])
             self._last_compile_provenance = got[1]
@@ -389,7 +396,9 @@ class LazyFrame:
                 if decision.estimate is not None and decision.gpu_available and not _am.gpu_warmup_started():
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
-                if decision.upload and not _streamed.active():     # a streamed batch is never seen again
+                elif decision.warm_later and not _am.gpu_warmup_started():
+                    _bg.later(_am.start_gpu_warmup_if_any)
+                if decision.upload and not (_streamed is not None and _streamed.active()):   # a batch is never seen again
                     # A split would win once the columns are on the GPU (F-057): this query runs native, and the
                     # upload (group ids, then the columns) starts when it has returned.
                     from . import pipeline_exec as _pe

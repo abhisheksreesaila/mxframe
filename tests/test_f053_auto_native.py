@@ -60,6 +60,7 @@ class _Warmup:
 def _fake_gpu(monkeypatch, ready, cpu_ms=100.0, gpu_ms=1.0):
     monkeypatch.setattr(cal, "get_calibration", lambda: _Calib(True, cpu_ms, gpu_ms))
     monkeypatch.setattr(am, "get_gpu_warmup", lambda calib=None, start=True: _Warmup(ready))
+    monkeypatch.setattr(am, "gpu_warmup_started", lambda: ready)      # a ready GPU has started (F-058 cold shortcut)
 
 
 @pytest.fixture(params=["small input", "no gpu", "cold gpu", "warm gpu, split not worth it"])

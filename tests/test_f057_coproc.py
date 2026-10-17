@@ -482,6 +482,7 @@ def _decide(monkeypatch, table_, cpu_ms=100.0, gpu_ms=30.0, resident=False, grou
     monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)
     monkeypatch.setattr(cal, "get_calibration", lambda: _Calib(cpu_ms, gpu_ms))
     monkeypatch.setattr(am, "get_gpu_warmup", lambda calib=None, start=True: _Warm())
+    monkeypatch.setattr(am, "gpu_warmup_started", lambda: True)
     monkeypatch.setattr(cf, "resident_for", lambda *a: resident)
     lf = agg_query(LazyFrame(table_), grouped=grouped)
     return lf, lf.explain(device="auto", costs=True)
@@ -590,6 +591,7 @@ def test_a_cpu_decision_with_a_queued_upload_runs_native_then_starts_the_upload(
     monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)
     monkeypatch.setattr(cal, "get_calibration", lambda: _Calib(100.0, 30.0))
     monkeypatch.setattr(am, "get_gpu_warmup", lambda calib=None, start=True: _Warm())
+    monkeypatch.setattr(am, "gpu_warmup_started", lambda: True)
     monkeypatch.setattr(cf, "IDLE_BEFORE_BACKGROUND_S", 0.0)
     policies = []
     import mxframe.lazy_frame as lfm

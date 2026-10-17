@@ -312,6 +312,7 @@ class AutoDecision:
     cpu_path: str = ""                # which CPU path runs, and why (cpu decisions only)
     upload: bool = False              # a split would win once the columns are resident: queue their upload
     split_plan: Optional[object] = None   # the cost model's numbers (coproc_fused.SplitPlan)
+    warm_later: bool = False          # not priced (cold GPU, small query): start the GPU warm-up after it
     pieces: str = ""                  # GPU pieces that ran on the CPU for memory reasons (F-056)
 
     def explain(self) -> str:
@@ -793,6 +794,14 @@ def _choose_device(plan, calib, gpu, prefer, placement, quick):
         if rows < SMALL_QUERY_ROWS:
             return AutoDecision("cpu", f"small input ({rows:,} rows): gpu start-up and copies cannot pay off",
                                 None)
+        if rows < COLD_GPU_SOURCE_ROWS and not gpu_warmup_started():
+            # F-058: the GPU has not started in this process, so its start-up alone costs more than this whole query
+            # on the native CPU; pricing it (calibration, key samples) cost ~3 ms of the query's clock. The warm-up
+            # is still queued, off the clock, for the queries after this one.
+            d = AutoDecision("cpu", f"gpu not started: its start-up costs more than this query on the cpu "
+                                    f"({rows:,} source rows)", None)
+            d.warm_later = True
+            return d
     if calib is None:
         from .calibration import get_calibration
         calib = get_calibration()
@@ -827,6 +836,20 @@ def _choose_device(plan, calib, gpu, prefer, placement, quick):
 
 
 SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)
+# below this many source rows (all scans summed) a query costs the native CPU at most ~250 ms (10 ms per M rows, twice
+# the dearest measured native price, a join past the cache), which is the GPU's start-up alone (F-058)
+COLD_GPU_SOURCE_ROWS = 25_000_000
+
+
+def start_gpu_warmup_if_any() -> None:
+    """Start the GPU warm-up when the machine has a GPU (loads the calibration: run it off a query's clock)."""
+    try:
+        from .calibration import get_calibration
+        calib = get_calibration()
+        if getattr(calib, "has_gpu", False):
+            get_gpu_warmup(calib).start()
+    except Exception:
+        pass
 
 
 def _source_rows(plan) -> int:

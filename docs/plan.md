@@ -1244,3 +1244,12 @@ Needs: F-056 · Found by the F-058 spill run (2026-10-17)
 - [x] tests: the 241 streamed / spill / Grace tests pass; full suite 23,243 passed
 - Review: PASS in round 2 of F-128 (old and new `hash_keys` bit-identical on every type and table shape tried)
 - [ ] next: the partition pass is now single-threaded NumPy passes of ~1 s each (read, filter, hash, take, write); overlapping them (step 3b (3), prefetch) or a native partition kernel is the next 2x
+
+## F-130 Small-query regressions since 0.6.0 [review]
+Needs: none · Found by the F-058 random suite (2026-10-17): SF1 MXFrame / DuckDB 0.83x (0.6.0) -> 0.60x, a median 5 ms per query slower; DuckDB's own times unchanged
+- [x] A/B against the 0.6.0 release-run code (worktree at 37265ea, same data, fresh process per run) and `git bisect` on random SF1 seeds: (1) seed 1 (MAX of a float expression over a join) 26 -> 48 ms from F-108 `92e77c1`: `_computed_extremes` materialized the join below the aggregate before checking whether the MIN / MAX argument is text, temporal or a 64-bit int, then left a float expression alone; (2) seed 2 5.8 -> 7.9 ms from F-056 `4cbab57`: every first `compute()` imported `streamed` and with it `spill` (shutil, tempfile, bz2, lzma), even for in-memory data
+- [x] fixes: the computed-extremes rewrite decides from `column_types` first and materializes only when a MIN / MAX needs it or a column is computed below the aggregate (`tests/test_f108_sql_timestamps.py`: no join materialized for a float MAX over a join; fails before); `streamed` is imported only for a plan with a Parquet source or while a stream runs (`tests/test_first_query_imports.py`)
+- [x] auto on a fresh process paid ~3 ms to load the calibration and price a small query: below `COLD_GPU_SOURCE_ROWS` (25M source rows; 10 ms per M rows is twice the dearest native price, and the GPU's start-up alone is >= 250 ms) with the GPU not started, auto picks the CPU unpriced and queues the warm-up off the clock (`start_gpu_warmup_if_any`), so later queries can still split (test: no calibration import during the query, warm-up queued once)
+- [x] measured, fresh process, median of 3: seed 1 cpu 48 -> 25-27 ms, auto 25-27; seed 2 cpu 7.9 -> 5.5, auto 5.7 (0.6.0: 26 and 5.8)
+- [x] full suite 23,258 passed
+- [ ] the site's auto explainer (`docs/site/auto-mode.html`) still prices the CPU with the old fits and has no cold-GPU rule: being updated

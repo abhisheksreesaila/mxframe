@@ -525,3 +525,35 @@ def test_interval_across_a_dst_change_equals_duckdb(q, cfg):
     got = mx.sql(q, dst=DST).compute(device=cfg[0])
     assert _rows(got) == _rows(want), (q, _rows(got), _rows(want))
     assert [_kind(f.type) for f in got.schema] == [_kind(f.type) for f in want.schema]
+
+
+def test_a_float_min_max_over_a_join_does_not_materialize_the_join(monkeypatch):
+    """F-058: deciding whether MIN / MAX of an expression needs the F-108 rewrite materialized the join below the
+    aggregate first, only to leave a float expression alone (random SF1 seed 1: 26 -> 48 ms). Types come first now."""
+    import mxframe.custom_ops as co
+    from mxframe import LazyFrame, col, lit
+    calls = []
+    real = co.CustomOpsCompiler._computed_extremes
+
+    def spy(self, plan):
+        before = self._materialize_joins
+        self._materialize_joins = lambda p: (calls.append(1), before(p))[1]
+        try:
+            return real(self, plan)
+        finally:
+            del self._materialize_joins
+
+    monkeypatch.setattr(co.CustomOpsCompiler, "_computed_extremes", spy)
+    rng = np.random.default_rng(1)
+    fact = pa.table({"k": rng.integers(0, 100, 5_000), "p": rng.random(5_000), "d": rng.random(5_000)})
+    dim = pa.table({"k": np.arange(100), "g": np.arange(100) % 3})
+    lf = (LazyFrame(fact).join(LazyFrame(dim), on="k").groupby("g")
+          .agg((col("p") * (lit(1.0) - col("d"))).max().alias("m"), col("p").sum().alias("s")).sort("g"))
+    got = lf.compute(device="cpu")
+    con = duckdb.connect()
+    con.register("f", fact), con.register("dm", dim)
+    want = con.execute("SELECT g, max(p * (1 - d)) AS m, sum(p) AS s FROM f JOIN dm USING (k) GROUP BY g ORDER BY g").fetchall()
+    rows = [tuple(r.values()) for r in got.to_pylist()]
+    assert [r[0] for r in rows] == [w[0] for w in want]
+    assert [v for r in rows for v in r[1:]] == pytest.approx([v for w in want for v in w[1:]])
+    assert calls == []

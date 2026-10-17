@@ -1793,23 +1793,14 @@ class CustomOpsCompiler(GraphCompiler):
                   if e.op in ("min", "max") and isinstance(e.args[0], Expr) and e.args[0].op not in ("col", "lit")]
         if not wanted:
             return None
-        node = agg.input
-        while isinstance(node, Filter):
-            node = node.input
-        if isinstance(node, Scan):
-            table, base = node.table, agg.input
-        else:                                       # a join or a Project below: the columns as the aggregate sees them
-            table = self._plan_to_table(self._materialize_joins(agg.input))
-            base = Scan(table)
-
-        def kind(e):                                # what the value of e is made of: text / temporal / int, else None
+        def kind(e, types):                         # what the value of e is made of: text / temporal / int, else None
             if e.op == "lit":
                 v = e.args[0]
                 return "text" if isinstance(v, str) else "temporal" if isinstance(v, (datetime.date, np.datetime64)) else None
             if e.op == "col":
-                if e.args[0] not in table.column_names:
+                if e.args[0] not in types:
                     return None
-                t = table.schema.field(e.args[0]).type
+                t = types[e.args[0]]
                 t = t.value_type if pa.types.is_dictionary(t) else t
                 return ("text" if pa.types.is_string(t) or pa.types.is_large_string(t)
                         else "temporal" if pa.types.is_date(t) or pa.types.is_timestamp(t)
@@ -1818,9 +1809,29 @@ class CustomOpsCompiler(GraphCompiler):
                 return "temporal"
             parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "f32", "add", "sub", "mul", *_ARROW_ONLY_OPS)
                      else ())
-            return next((k for k in (kind(a) for a in parts if isinstance(a, Expr)) if k), None)
+            return next((k for k in (kind(a, types) for a in parts if isinstance(a, Expr)) if k), None)
 
-        wanted = [i for i in wanted if kind(agg.aggs[i].args[0])]
+        # Decide from the column types first (F-058): materializing a join below the aggregate to learn them cost a
+        # whole join on every MIN / MAX of a float expression (random SF1 seed 1: 26 -> 48 ms), which this then left
+        # alone. A column the types cannot name (computed below the aggregate) still needs the table.
+        def cols(e):
+            return ({e.args[0]} if e.op == "col" else set()).union(
+                *[cols(a) for a in e.args if isinstance(a, Expr)])
+        known = column_types(agg.input)
+        unsure = [i for i in wanted if not cols(agg.aggs[i].args[0]) <= set(known)]
+        wanted = [i for i in wanted if i in unsure or kind(agg.aggs[i].args[0], known)]
+        if not wanted:
+            return None
+        node = agg.input
+        while isinstance(node, Filter):
+            node = node.input
+        if isinstance(node, Scan):
+            table, base = node.table, agg.input
+        else:                                       # a join or a Project below: the columns as the aggregate sees them
+            table = self._plan_to_table(self._materialize_joins(agg.input))
+            base = Scan(table)
+        real = {f.name: f.type for f in table.schema}
+        wanted = [i for i in wanted if kind(agg.aggs[i].args[0], real)]
         if not wanted:
             return None
         taken = set(table.column_names)
