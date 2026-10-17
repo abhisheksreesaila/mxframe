@@ -526,11 +526,17 @@ class _SQLTranslator:
         if tree.args.get("kind") or not isinstance(body, sge.Subquery) or not isinstance(body.this, sge.Select) \
                 or len(files) != 1 or not isinstance(files[0], sge.Literal) or not files[0].is_string:
             raise NotImplementedError("COPY is supported as COPY (SELECT ...) TO 'file.parquet'")
+        path, explicit = files[0].name, False
         for prm in tree.args.get("params") or []:
-            name, value = str(prm.this).upper(), str(prm.args.get("expression")).upper()
+            name = prm.this.name.upper() if hasattr(prm.this, "name") else str(prm.this).upper()
+            expr = prm.args.get("expression")
+            value = (expr.name if hasattr(expr, "name") else str(expr)).upper() if expr is not None else ""
             if (name, value) != ("FORMAT", "PARQUET"):
-                raise NotImplementedError(f"COPY option {name} {value} is not supported (only FORMAT PARQUET)")
-        path = files[0].name
+                shown = f"{name} {value}".strip()
+                raise NotImplementedError(f"COPY option {shown} is not supported (only FORMAT PARQUET)")
+            explicit = True
+        if not explicit and not path.lower().endswith((".parquet", ".parq")):
+            raise NotImplementedError(f"COPY writes Parquet only: name the file *.parquet or add (FORMAT PARQUET); got '{path}'")
         n = LazyFrame(self._build_select(body.this)).sink_parquet(path)
         return LazyFrame(Scan(pa.table({"Count": pa.array([n], pa.int64())})))
 

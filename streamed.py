@@ -543,7 +543,7 @@ class ParquetOut:
 
     def __init__(self, path, compression: str = "zstd"):
         self.path = os.path.abspath(os.fspath(path))
-        self.tmp = f"{self.path}.mxframe-partial-{os.getpid()}"
+        self.tmp = None                          # a unique file next to `path` (threads may sink to one path), made on open
         self.compression = compression
         self.writer = None
         self.schema: Optional[pa.Schema] = None
@@ -578,6 +578,12 @@ class ParquetOut:
     def _write(self, t: pa.Table) -> None:
         import pyarrow.parquet as pq
         if self.writer is None:
+            import tempfile
+            fd, self.tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=os.path.basename(self.path) + ".", suffix=".partial")
+            os.close(fd)
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(self.tmp, 0o666 & ~umask)
             self.schema = t.schema
             self.writer = pq.ParquetWriter(self.tmp, self.schema, compression=self.compression)
         elif not t.schema.equals(self.schema):
@@ -615,7 +621,8 @@ class ParquetOut:
             pass
         self.writer = None
         try:
-            os.remove(self.tmp)
+            if self.tmp:
+                os.remove(self.tmp)
         except OSError:
             pass
 
@@ -856,9 +863,11 @@ def _stream_parts(got: Plan, st, plan_for, run):
     for batch in got.batches:
         st.groups = tuple(batch)
         st.slice_rows = got.slice_rows.get(batch[0]) if len(batch) == 1 else None
+        st.slice_last = False
         if st.slice_rows:
             st.slice_no = sliced[batch[0]]
             sliced[batch[0]] += 1
+            st.slice_last = sliced[batch[0]] == n_slices[batch[0]]
         share = size_of[batch[0]] / n_slices[batch[0]] if st.slice_rows else sum(size_of[g] for g in batch)
         run.biggest = max(run.biggest, int(share))
         yield run(plan_for()), share, f"{len(batch)} row groups"
@@ -936,12 +945,12 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                             probe2 = probes.enter_context(sum_probe(names=spec2.int_sums))
                             state2 = _State(spec2, budget, probe2, root, held=lambda: got.resident)
                             for piece in stage_state.pieces():
-                                out = stage_state.format(piece)
+                                rows = stage_state.format(piece)
                                 if rowwise:
-                                    out = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(out))).compute(
+                                    rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
                                         "cpu", optimize=False, validate=False)
                                 probe2.begin()
-                                state2.add(LazyFrame(dataclasses.replace(spec2.partial, input=Scan(out))).compute(
+                                state2.add(LazyFrame(dataclasses.replace(spec2.partial, input=Scan(rows))).compute(
                                     "cpu", optimize=False, validate=False))
                                 probe2.end()
                             stage_spec, stage_state, stage_top, stages = spec2, state2, top2, stages + 1
@@ -949,11 +958,11 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                         sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, out, root,
                                          lambda: got.resident)
                         for piece in stage_state.pieces():
-                            out = stage_state.format(piece)
+                            rows = stage_state.format(piece)
                             if rowwise:
-                                out = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(out))).compute(
+                                rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
                                     "cpu", optimize=False, validate=False)
-                            sink.add(out)
+                            sink.add(rows)
                             if sink.full:
                                 break
                     table, above = sink.finish(plan, stage_top)

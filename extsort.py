@@ -206,10 +206,8 @@ class ExternalSort:
         """The sorted rows, in order, as tables of about `range_bytes` each (the runs are consumed)."""
         if not self.runs:
             return
-        hard = max((self.budget - self.held()) // 3, 64 << 10)
+        hard = max((self.budget - self.held()) // SORT_FACTOR, 64 << 10)         # sorting a range peaks at SORT_FACTOR x
         p = min(MAX_RANGES, max(1, -(-self.nbytes // self.range_bytes)))
-        if p == 1 and self.nbytes > hard:
-            p = 2
         split = self._splitters(p) if p > 1 else None
         if split is None:
             if self.nbytes > hard:
@@ -235,13 +233,15 @@ class ExternalSort:
                 files.write(i, t.slice(bounds[i], bounds[i + 1] - bounds[i]))
             del t, both
         files.finish()
-        hard_rows = hard
         for i in range(p):
-            if files.nbytes[i] > hard_rows:
+            if files.nbytes[i] > hard:
+                why = (f"the {self.rows:,} rows to sort ({fmt_bytes(self.nbytes)}) need more than {MAX_RANGES} ranges"
+                       if p >= MAX_RANGES else
+                       f"the splitters came from {SAMPLES_PER_RUN} sampled rows per run and left this range about "
+                       f"{files.nbytes[i] * p / max(self.nbytes, 1):.1f}x its fair share of the {p} ranges")
                 raise MemoryError(f"sort: one key range holds {files.rows[i]:,} rows, {fmt_bytes(files.nbytes[i])}, more than "
                                   f"the {fmt_bytes(hard)} that fits the host budget of {fmt_bytes(self.budget)} while it is "
-                                  f"sorted; the {self.rows:,} rows to sort ({fmt_bytes(self.nbytes)}) need more than "
-                                  f"{MAX_RANGES} ranges")
+                                  f"sorted; {why}")
             t = files.read(i)
             if t is not None:
                 yield self._finish(t)

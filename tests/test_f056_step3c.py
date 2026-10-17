@@ -605,3 +605,124 @@ def test_a_grace_side_that_is_a_streamed_aggregate_does_not_write_into_the_sink(
                 "JOIN (SELECT g, id FROM big WHERE q > 990) b ON a.g = b.g", big)
     assert n == want.num_rows
     same(pq.read_table(out).sort_by("id"), want.sort_by("id"))
+
+
+# --- review fixes ---------------------------------------------------------------------------------------------------
+
+def test_count_distinct_where_both_stages_spill_for_compute_and_sink(big, tmp_path, _env):
+    """150k groups: the (g, q) pairs spill in stage one and the per-group counts spill in stage two."""
+    q = "SELECT g, count(DISTINCT q) AS nd FROM big GROUP BY g"
+    want = duck(q, big)
+    out = str(tmp_path / "both.parquet")
+    lf = mx.sql(q, big=scan_parquet(big))
+    assert sink(lf, out) == want.num_rows == GROUPS
+    p = prov(lf)["streamed"]
+    assert p.get("stages") == 2 and p["spill"]["partitions"] >= 32               # two levels of 16 partitions
+    same(pq.read_table(out), want, ("g",))
+    assert spill_leftovers(_env) == []
+
+
+def test_count_distinct_with_sum_and_min_where_both_stages_spill_equals_duckdb_in_compute(dist, monkeypatch, _env):
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "1M")
+    q = "SELECT g, count(DISTINCT x) AS nd, sum(q) AS sq, min(v) AS lo FROM dist GROUP BY g"
+    lf = mx.sql(q, dist=scan_parquet(dist))
+    got = run(lf, "cpu")
+    p = prov(lf)["streamed"]
+    assert p.get("stages") == 2 and p["spill"]["partitions"] >= 32
+    same(got, duck_d(q, dist), ("g",))
+    assert spill_leftovers(_env) == []
+
+
+SLICE_PEAK = textwrap.dedent("""
+    import json, sys
+    import pyarrow as pa
+    from mxframe import col
+    from mxframe.io_parquet import scan_parquet
+
+    lf = scan_parquet(sys.argv[1]).filter(col("id") % 100000 == 3).select("id", "v")
+    lf.compute(device="cpu")
+    pa.default_memory_pool().release_unused()
+    n = lf.compute(device="cpu").num_rows
+    p = lf.last_compile_provenance
+    print(json.dumps({"rows": n, "path": p["path"], "slices": p["streamed"].get("slices"),
+                      "arrow_peak": pa.default_memory_pool().max_memory()}))
+""")
+
+
+def test_peak_memory_with_a_budget_below_the_row_group_does_not_grow_with_the_file(tmp_path, _env):
+    """Row groups of 12,000 rows (about 0.3 MB) against a 0.25 MB budget are read in slices; the readers of finished
+    groups are closed, so twice the groups hold no more."""
+    import conftest
+    peaks = {}
+    for groups in (30, 60):
+        n = 12_000 * groups
+        idx = np.arange(n)
+        path = str(tmp_path / f"s{groups}.parquet")
+        pq.write_table(pa.table({"id": idx.astype(np.int64), "v": np.random.default_rng(1).random(n),
+                                 "w": (idx * 7 % 1000).astype(np.int64)}), path, row_group_size=12_000)
+        env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET="250K", MXFRAME_SPILL_DIR=str(_env),
+                   PYTHONPATH=os.pathsep.join([str(conftest._shim)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
+        done = subprocess.run([sys.executable, "-c", SLICE_PEAK, path], env=env, capture_output=True, text=True, check=True, timeout=600)
+        peaks[groups] = json.loads(done.stdout.strip().splitlines()[-1])
+    for r in peaks.values():
+        assert r["path"] == "streamed" and r["slices"] is not None and r["rows"] >= 3
+    assert peaks[30]["arrow_peak"] < 4 << 20, peaks
+    assert peaks[60]["arrow_peak"] < peaks[30]["arrow_peak"] * 1.25 + (256 << 10), peaks
+
+
+def test_threads_sinking_to_one_path_leave_one_complete_file(big, tmp_path):
+    import threading
+    out = str(tmp_path / "shared.parquet")
+    errs = []
+
+    def go():
+        try:
+            sink(scan_parquet(big).filter(col("q") > 100).select("id", "g", "v", "q", "s"), out)
+        except Exception as e:             # noqa: BLE001
+            errs.append(e)
+    threads = [threading.Thread(target=go) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert errs == []
+    want = duck("SELECT id, g, v, q, s FROM big WHERE q > 100 ORDER BY id", big)
+    same(pq.read_table(out).sort_by("id"), want)
+    assert [f for f in os.listdir(tmp_path) if f not in ("tmp", "shared.parquet")] == []
+
+
+def test_a_write_that_fails_midway_keeps_the_old_file_and_leaves_no_partial(big, tmp_path, monkeypatch):
+    from mxframe import streamed
+    out = str(tmp_path / "keep.parquet")
+    pq.write_table(pa.table({"a": [1]}), out)
+    real, calls = streamed.ParquetOut._write, []
+
+    def flaky(self, t):
+        calls.append(1)
+        if len(calls) == 3:
+            raise OSError("disk on fire")
+        return real(self, t)
+    monkeypatch.setattr(streamed.ParquetOut, "_write", flaky)
+    with pytest.raises(OSError, match="disk on fire"):
+        sink(scan_parquet(big).filter(col("q") > 100).select("id", "g", "v", "q", "s"), out)
+    assert len(calls) == 3
+    assert pq.read_table(out).to_pylist() == [{"a": 1}]
+    assert [f for f in os.listdir(tmp_path) if f not in ("tmp", "keep.parquet")] == []
+
+
+def test_sql_copy_format_checks(big, tmp_path):
+    t = scan_parquet(big)
+    ok = str(tmp_path / "q.parquet")
+    assert mx.sql(f"COPY (SELECT id FROM big LIMIT 3) TO '{ok}' (FORMAT 'parquet')", big=t).compute().to_pylist() == [{"Count": 3}]
+    other = str(tmp_path / "x.dat")
+    assert mx.sql(f"COPY (SELECT id FROM big LIMIT 2) TO '{other}' (FORMAT PARQUET)", big=t).compute().to_pylist() == [{"Count": 2}]
+    with pytest.raises(NotImplementedError, match=r"Parquet only.*x\.csv"):
+        mx.sql(f"COPY (SELECT id FROM big) TO '{tmp_path}/x.csv'", big=t)
+    assert not os.path.exists(str(tmp_path / "x.csv"))
+    with pytest.raises(NotImplementedError, match=r"option HEADER NONE is not supported"):
+        mx.sql(f"COPY (SELECT id FROM big) TO '{ok}' (FORMAT PARQUET, HEADER NONE)", big=t)
+    with pytest.raises(NotImplementedError, match=r"option HEADER is not supported"):
+        mx.sql(f"COPY (SELECT id FROM big) TO '{ok}' (HEADER)", big=t)
+
+
+def test_several_count_distincts_in_one_query_are_refused_by_name(big):
+    with pytest.raises(NotImplementedError, match="more than one COUNT"):
+        mx.sql("SELECT g, count(DISTINCT q) AS a, count(DISTINCT v) AS b FROM big GROUP BY g", big=scan_parquet(big))
