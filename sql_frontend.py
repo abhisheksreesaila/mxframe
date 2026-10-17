@@ -1575,9 +1575,31 @@ class _SQLTranslator:
             out.append(c)
         return out
 
-    def _correlation(self, sel: sge.Select, what: str):
+    def _two_levels_out(self, node: sge.Expression, scope: List[tuple]):
+        """(the columns of this query, the columns of the subquery between) that the subqueries nested in ``node``
+        use without their own FROM providing them: ``w.k = t.k`` two levels out, ``w.k = u.k`` one level out."""
+        nested = list(node.find_all(sge.Select))
+        scopes = [sc for s in nested for sc in self._scope_of(s)]
+        own_a, own_c = {a for a, _ in scopes}, set().union(*[c for _, c in scopes]) if scopes else set()
+        mid_a, mid_c = {a for a, _ in scope}, set().union(*[c for _, c in scope]) if scope else set()
+        mine_a, mine_c = {a for a, _ in self._table_cols}, {x.lower() for x in self._scope_columns}
+        outer, middle = [], []
+        for c in node.find_all(sge.Column):
+            t, n = (c.table or "").lower(), c.name.lower()
+            if (t and t in own_a) or (not t and n in own_c):
+                continue
+            if (t and t in mid_a) or (not t and n in mid_c):
+                middle.append(c)
+            elif (t and t in mine_a) or (not t and n in mine_c):
+                outer.append(c)
+        return outer, middle
+
+    def _correlation(self, sel: sge.Select, what: str, lifted: Optional[list] = None):
         """Split a subquery's WHERE into ([(outer column, inner expression)], [inner-only conditions]): the
-        equalities ``inner = outer`` become join keys. Any other reference to this query's columns raises."""
+        equalities ``inner = outer`` become join keys. Any other reference to this query's columns raises.
+        A nested EXISTS / NOT EXISTS that reads this query's columns but none of the subquery's own is a
+        condition on the outer row alone: with a ``lifted`` list it is handed back there (to be decorrelated
+        like any EXISTS of this query, F-124); every other correlation two levels out raises."""
         scope = self._scope_of(sel)
         where = sel.args.get("where")
         body = sel.copy()
@@ -1588,6 +1610,17 @@ class _SQLTranslator:
         keys, rest = [], []
         for c in _conjuncts(where.this) if where else []:
             if not self._outer_refs(c, scope):
+                outer, middle = self._two_levels_out(c, scope)
+                if outer:
+                    nested = _unparen(c.this) if isinstance(c, sge.Not) else c
+                    if lifted is None or middle or not isinstance(_unparen(nested), sge.Exists):
+                        raise NotImplementedError(
+                            f"{what}: correlation two levels out is not supported ({outer[0].sql(dialect='duckdb')} "
+                            "is a column of the outer query used inside a nested subquery"
+                            + (", which also reads the subquery's own columns" if middle else "")
+                            + "; only a nested EXISTS / NOT EXISTS that needs the outer row alone inside an EXISTS is)")
+                    lifted.append(c)
+                    continue
                 rest.append(c)
                 continue
             if isinstance(c, sge.EQ):
@@ -1783,17 +1816,22 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what} over a {type(sel).__name__} is not supported")
         sel = self._inline_aliases(sel)
         _unsupported_shape(sel, what)
-        keys, rest = self._correlation(sel, what)
+        lifted: list = []
+        keys, rest = self._correlation(sel, what, None if negated else lifted)
         if not keys:         # no outer column: there are rows or there are none
-            flat = sel.copy()
-            flat.set("expressions", [sge.Star()])
-            n = Expr("scalar", Aggregate(self._child()._build_select(flat), [], [lit(1).count().alias("__scalar")]))
-            return Filter(plan, (n == lit(0)) if negated else (n > lit(0)))
-        i = next(self._ids)
-        items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
-        inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
-        return Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
-                    [f"__k{i}_{j}" for j in range(len(keys))], "anti" if negated else "semi")
+            n = Expr("scalar", Aggregate(self._child()._build_select(self._keyed_select(sel, rest, [sge.Star()])),
+                                         [], [lit(1).count().alias("__scalar")]))
+            plan = Filter(plan, (n == lit(0)) if negated else (n > lit(0)))
+        else:
+            i = next(self._ids)
+            items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)]
+            inner_plan = self._child()._build_select(self._keyed_select(sel, rest, items))
+            plan = Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
+                        [f"__k{i}_{j}" for j in range(len(keys))], "anti" if negated else "semi")
+        for c in lifted:     # EXISTS (.. AND E(outer row)) is EXISTS (..) AND E(outer row)
+            kind, nested, neg = self._subquery_form(c)
+            plan = getattr(self, f"_{kind}_form")(plan, nested, neg)
+        return plan
 
     def _in_form(self, plan, node: sge.In, negated: bool):
         what = "NOT IN (SELECT ...)" if negated else "IN (SELECT ...)"
