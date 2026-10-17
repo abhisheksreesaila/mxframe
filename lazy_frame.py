@@ -243,6 +243,15 @@ class LazyFrame:
         parsed_by = [col(b) if isinstance(b, str) else b for b in by]
         return LazyGroupBy(self, parsed_by)
 
+    def sink_parquet(self, path, device: str = "cpu", *, compression: str = "zstd", **kwargs) -> int:
+        """Run the query and write the result to the Parquet file ``path``; returns the rows written (F-113).
+
+        Takes the arguments of ``compute``. A result bigger than the host memory budget (``compute()`` raises a
+        ``MemoryError`` for it) is streamed into the file piece by piece with bounded memory: the batches of a
+        filter, spilled groups, join pairs, sorted ranges. The file appears only when the query has finished."""
+        from . import streamed as _streamed
+        return _streamed.sink_parquet(self, path, device, compression=compression, **kwargs)
+
     def compute(
         self,
         device: DeviceType = "auto",

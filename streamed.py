@@ -32,6 +32,7 @@ from .gpu_budget import fmt_bytes
 from .lazy_expr import Expr, col
 from .lazy_frame import (Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
                          Scan, Sort, Tail)
+from . import np_arrow
 from . import spill as _spill
 
 WORKING_FACTOR = 3            # in-memory path: the table, the filtered copy, group ids / gather buffers
@@ -44,6 +45,7 @@ MERGE_FACTOR = 4             # the engine's group-by holds about this many times
 MIN_SLICE_ROWS = 1024        # a slice of an oversized row group is never smaller
 
 _active: contextvars.ContextVar = contextvars.ContextVar("mxframe_streamed_active", default=False)
+_out: contextvars.ContextVar = contextvars.ContextVar("mxframe_sink_out", default=None)     # F-113: the file a sink writes
 _AGGS = ("sum", "mean", "count", "min", "max")
 _WINDOW = ("window", "rank", "dense_rank", "lag", "lead", "cum_sum", "row_number")
 
@@ -488,6 +490,113 @@ class _State:
         return pa.table(arrays, names=names)
 
 
+# --- F-113: writing a result bigger than memory -------------------------------------------------------------------
+
+class ParquetOut:
+    """The Parquet file `LazyFrame.sink_parquet` writes. A streamed query hands it the pieces of its result as they
+    are produced (`write`), small ones buffered into row groups of about `flush_bytes`; a query that was not
+    streamed hands it its table at the end. The file is written next to its final name and renamed when complete, so
+    a failed query leaves neither a partial file nor a damaged old one."""
+
+    def __init__(self, path, compression: str = "zstd"):
+        self.path = os.path.abspath(os.fspath(path))
+        self.tmp = f"{self.path}.mxframe-partial-{os.getpid()}"
+        self.compression = compression
+        self.writer = None
+        self.schema: Optional[pa.Schema] = None
+        self.empty: Optional[pa.Table] = None
+        self.buffer: List[pa.Table] = []
+        self.buffered = 0
+        self.rows = 0
+        self.streamed = False                    # a streamed query wrote into it (its returned table is empty)
+        self.flush_bytes = 32 << 20
+
+    def attach(self, budget: int) -> None:
+        self.streamed = True
+        self.flush_bytes = max(256 << 10, min(32 << 20, budget // 16))
+
+    def write(self, t: pa.Table) -> None:
+        t = _plain(t)
+        if t.num_rows == 0:
+            self.empty = t
+            return
+        self.buffer.append(t)
+        self.buffered += t.nbytes
+        if self.buffered >= self.flush_bytes:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        t = self.buffer[0] if len(self.buffer) == 1 else pa.concat_tables(self.buffer, promote_options="default")
+        self.buffer, self.buffered = [], 0
+        self._write(t)
+
+    def _write(self, t: pa.Table) -> None:
+        import pyarrow.parquet as pq
+        if self.writer is None:
+            self.schema = t.schema
+            self.writer = pq.ParquetWriter(self.tmp, self.schema, compression=self.compression)
+        elif not t.schema.equals(self.schema):
+            try:
+                t = t.select(self.schema.names).cast(self.schema)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, KeyError) as e:
+                raise TypeError(f"sink_parquet: a later piece of the result has columns {t.schema.names} of types "
+                                f"{[str(x) for x in t.schema.types]}, which do not fit the first piece's "
+                                f"{[str(x) for x in self.schema.types]}: {e}") from e
+        self.writer.write_table(t)
+        self.rows += t.num_rows
+
+    def empty_table(self) -> pa.Table:
+        sch = self.schema or (self.empty.schema if self.empty is not None else None)
+        return np_arrow.empty(sch if sch is not None else pa.schema([]))
+
+    def finish(self, table: Optional[pa.Table] = None) -> int:
+        """Close the file (writing `table` first when the query was not streamed) and move it into place."""
+        if table is not None and not self.streamed:
+            self.write(_plain(table))
+            self.empty = self.empty if self.empty is not None else _plain(table)
+        self.flush()
+        if self.writer is None:                                  # no rows: a file with the columns
+            self._write(self.empty if self.empty is not None else np_arrow.empty(pa.schema([])))
+        self.writer.close()
+        self.writer = None
+        os.replace(self.tmp, self.path)
+        return self.rows
+
+    def abort(self) -> None:
+        try:
+            if self.writer is not None:
+                self.writer.close()
+        except Exception:
+            pass
+        self.writer = None
+        try:
+            os.remove(self.tmp)
+        except OSError:
+            pass
+
+
+def sink_parquet(lf, path, device: str = "cpu", *, compression: str = "zstd", **kwargs) -> int:
+    """Run `lf` and write its result to the Parquet file `path`; returns the number of rows written. A result bigger
+    than the host memory budget is streamed into the file piece by piece (batches of a filter, spilled groups, join
+    pairs, sorted ranges) instead of being built as one table."""
+    out = ParquetOut(path, compression)
+    token = _out.set(out)
+    try:
+        table = lf.compute(device, **kwargs)
+        n = out.finish(table)
+    except BaseException:
+        out.abort()
+        raise
+    finally:
+        _out.reset(token)
+    prov = dict(lf.last_compile_provenance or {})
+    prov["sink"] = {"path": out.path, "rows": n, "streamed": out.streamed}
+    lf._last_compile_provenance = prov
+    return n
+
+
 # --- what happens to the rows the streamed part of the plan produces ---------------------------------------------
 
 def _plain(t: pa.Table) -> pa.Table:
@@ -510,6 +619,7 @@ class _Sink:
         self.tables: List[pa.Table] = []
         self.rows = self.bytes = self.pending_rows = 0
         self.empty: Optional[pa.Table] = None
+        self.out: Optional[ParquetOut] = None          # F-113: the rows go straight into this file, none are kept
 
     @property
     def full(self) -> bool:
@@ -524,6 +634,10 @@ class _Sink:
 
     def add(self, t: pa.Table, progress: Optional[float] = None) -> None:
         t = _plain(t)
+        if self.out is not None:
+            self.out.write(t)
+            self.rows += t.num_rows
+            return
         if t.num_rows == 0:
             self.empty = t
             return
@@ -559,16 +673,18 @@ class _Sink:
         subject = f"the rows that the {self.above} above the big file needs are" if self.above else "the result of this query is"
         raise MemoryError(
             f"{subject} bigger than memory: {what} are {fmt_bytes(self.bytes)}{guess}, and only "
-            f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Add a LIMIT or a "
-            f"tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
+            f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Write it to a file "
+            f"with sink_parquet(path), add a LIMIT or a tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
 
     def result(self) -> pa.Table:
+        if self.out is not None:
+            return self.out.empty_table()
         if self.kind == "top-k" and len(self.tables) > 1:
             self._reduce()
         return self._concat()
 
 
-def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int) -> _Sink:
+def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int, out: Optional[ParquetOut] = None) -> _Sink:
     """The sink for what sits above `top` in `plan` (`_chain` finds it): a Sort then (optionally some row-local
     Projects and) a Limit is a top-k, a Limit alone stops early, anything else collects."""
     above = list(reversed(_chain(plan, top)[:-1]))
@@ -582,7 +698,11 @@ def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int) -> _S
                 return _Sink("top-k", n.n + n.offset, above[0], limit, budget, name)
             if not (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
                 break
-    return _Sink("collect", 0, None, limit, budget, name)
+    sink = _Sink("collect", 0, None, limit, budget, name)
+    if out is not None and not above:                  # the rows are the result: write them as they come
+        sink.out = out
+        out.attach(budget)
+    return sink
 
 
 def describe(plan, device: str = "cpu") -> Optional[str]:
@@ -677,7 +797,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     sink, state, batches_run, rows_info, graced = None, None, 0, None, None
     free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
     if spec is None:                                        # a batch is in flight (input x working factor) while rows are collected
-        sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR, budget)
+        sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR,
+                         budget, _out.get())
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
@@ -710,7 +831,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                 table = merged
             else:
                 if spec is not None:                                 # spilled groups: one partition at a time
-                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget)
+                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget, _out.get())
                     rowwise = got.top is not spec.agg
                     for piece in state.pieces():
                         out = state.format(piece)
