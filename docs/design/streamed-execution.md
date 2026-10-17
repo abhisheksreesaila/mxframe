@@ -177,7 +177,7 @@ never does (a path that answers sums without either) gets a double.
 **Group state bigger than the budget** (`spill.py`, `streamed._State`). The engine's group-by holds about four times
 its input (measured: 5 MB merged in, 20 MB peak), so a merge whose input (`merged + pending`) times
 `MERGE_FACTOR = 4` passes the budget does not run: the state so far and every later partial are written instead
-to 16 Arrow IPC streams under `MXFRAME_SPILL_DIR` (default `~/.cache/mxframe/spill`, never `$TMPDIR`: tmpfs is RAM) in `mxframe-spill-<pid>-*`. A row goes to partition `hash(keys) >> 33 % 16`. The hash
+to 16 Arrow IPC streams under `MXFRAME_SPILL_DIR` (default `~/.cache/mxframe/spill`, never `$TMPDIR`: tmpfs is RAM) in `mxframe-spill-<host>-<pid namespace>-<pid>-*` (only that host and namespace sweep it). A row goes to partition `hash(keys) >> 33 % 16`. The hash
 (`spill.hash_keys`) is splitmix64 over the bits of integers and floats (canonicalised first: -0.0 equals 0.0, every
 NaN equals every NaN, as the engine groups them, F-077), the CRC32 of the text of anything else, NULL a value of its
 own, and a per-level salt; no Python `hash()`, so the partition of a key is the same in every process and

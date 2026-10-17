@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import socket
 import tempfile
 import warnings
 import zlib
@@ -113,7 +114,18 @@ def ram_backed(path: str) -> Optional[str]:
         return None
 
 
-_NAME = re.compile(r"mxframe-spill-(\d+)-")
+def _owner() -> str:
+    """`<host>-<pid namespace>`: who a folder belongs to. A cache directory shared by several machines or containers
+    must only be swept by the one that made the folder, since another one cannot see whether its pid is alive."""
+    host = re.sub(r"[^A-Za-z0-9.]", "", socket.gethostname()) or "host"
+    try:
+        ns = re.sub(r"\D", "", os.readlink("/proc/self/ns/pid")) or "0"
+    except OSError:
+        ns = "0"
+    return f"{host}-{ns}"
+
+
+_NAME = re.compile(r"mxframe-spill-([A-Za-z0-9.]+-\d+)-(\d+)-")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -134,7 +146,7 @@ def remove_stale(base: str) -> None:
         return
     for n in names:
         m = _NAME.match(n)
-        if m and int(m.group(1)) != os.getpid() and not _pid_alive(int(m.group(1))):
+        if m and m.group(1) == _owner() and int(m.group(2)) != os.getpid() and not _pid_alive(int(m.group(2))):
             shutil.rmtree(os.path.join(base, n), ignore_errors=True)
 
 
@@ -155,7 +167,7 @@ class SpillDir:
             try:
                 os.makedirs(base, exist_ok=True)
                 remove_stale(base)
-                self.path = tempfile.mkdtemp(prefix=f"mxframe-spill-{os.getpid()}-", dir=base)
+                self.path = tempfile.mkdtemp(prefix=f"mxframe-spill-{_owner()}-{os.getpid()}-", dir=base)
             except OSError as e:
                 raise SpillError(f"cannot spill group state to disk: the spill directory {base} cannot be created "
                                  f"({e}); set MXFRAME_SPILL_DIR to a writable directory on disk") from e
@@ -224,21 +236,35 @@ class Partitioned:
                 at += c
 
     def finish(self) -> None:
-        for i, w in self._writers.items():
-            w.close()
-            self._sinks[i].close()
-            self.root.bytes += os.path.getsize(self._path(i))
-        self._writers, self._sinks = {}, {}
+        try:
+            for i, w in self._writers.items():
+                w.close()
+                self._sinks[i].close()
+                self.root.bytes += os.path.getsize(self._path(i))
+        except OSError as e:                       # the last buffered bytes are written here: a full disk shows now
+            raise SpillError(f"spilling group state to {self.root.path} failed while finishing the partition files "
+                             f"(about {self.root.written:,} bytes written): {e}") from e
+        finally:
+            self._writers, self._sinks = {}, {}
 
     def read(self, i: int) -> Iterator[pa.Table]:
-        """The tables of partition `i` (none if nothing hashed there); the file is deleted once read."""
+        """The tables of partition `i` (none if nothing hashed there); the file is deleted once read. A partition
+        that had rows but is missing or short is an error, never an empty partition (it would drop groups silently)."""
         path = self._path(i)
         if not os.path.exists(path):
+            if self.rows[i]:
+                raise SpillError(f"spill partition {i} ({self.rows[i]:,} rows) is missing: {path} was removed while the "
+                                 f"query ran")
             return
+        got = 0
         try:
             with pa.OSFile(path, "rb") as f:
                 for rb in pa.ipc.open_stream(f):
+                    got += rb.num_rows
                     yield pa.Table.from_batches([rb])
+            if got != self.rows[i]:
+                raise SpillError(f"spill partition {i} of {self.root.path} holds {got:,} rows, {self.rows[i]:,} were "
+                                 f"written: the file was truncated or changed")
         finally:
             try:
                 os.remove(path)

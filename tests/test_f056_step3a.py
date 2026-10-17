@@ -287,16 +287,91 @@ def test_ram_backed_reads_the_mount_table(tmp_path, monkeypatch):
     assert spill.ram_backed("/home/someone") is None
 
 
-def test_spill_folders_of_dead_processes_are_removed_and_live_ones_kept(big, _env):
+def test_spill_folders_of_dead_processes_of_this_host_are_removed_and_the_rest_kept(big, _env):
+    """Only folders made by this host and pid namespace are swept: in a cache shared by several machines or containers
+    another one's pid cannot be looked up here, so its folder may belong to a live query."""
+    from mxframe import spill
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait()
-    (_env / f"mxframe-spill-{dead.pid}-abc").mkdir()
-    (_env / f"mxframe-spill-{dead.pid}-abc" / "s1").write_text("stale")
-    live = _env / f"mxframe-spill-{os.getppid()}-live"
+    mine = spill._owner()
+    (_env / f"mxframe-spill-{mine}-{dead.pid}-abc").mkdir()
+    (_env / f"mxframe-spill-{mine}-{dead.pid}-abc" / "s1").write_text("stale")
+    live = _env / f"mxframe-spill-{mine}-{os.getppid()}-live"
     live.mkdir()
+    elsewhere = _env / f"mxframe-spill-otherhost-4026531836-{dead.pid}-x"        # same dead pid, another machine
+    elsewhere.mkdir()
+    other_ns = _env / f"mxframe-spill-{mine.rsplit('-', 1)[0]}-1-{dead.pid}-y"     # same host, another pid namespace
+    other_ns.mkdir()
     (_env / "unrelated").mkdir()
     run(light_groups(big), "cpu")
-    assert spill_leftovers(_env) == sorted([live.name, "unrelated"])
+    assert spill_leftovers(_env) == sorted([live.name, elsewhere.name, other_ns.name, "unrelated"])
+
+
+def test_the_folder_name_carries_the_host_and_pid_namespace(big, _env, monkeypatch):
+    from mxframe import spill
+    seen = []
+    real = spill.Partitioned.finish
+    monkeypatch.setattr(spill.Partitioned, "finish", lambda self: (seen.extend(os.listdir(_env)), real(self))[1])
+    run(light_groups(big), "cpu")
+    assert seen and all(n.startswith(f"mxframe-spill-{spill._owner()}-{os.getpid()}-") for n in seen), seen
+
+
+def test_a_deleted_partition_file_is_an_error_not_missing_groups(big, _env, monkeypatch):
+    from mxframe import spill
+    real = spill.Partitioned.finish
+
+    def finish_then_delete_one(self):
+        real(self)
+        victim = next(i for i in range(spill.PARTITIONS) if self.rows[i])
+        os.remove(self._path(victim))
+
+    monkeypatch.setattr(spill.Partitioned, "finish", finish_then_delete_one)
+    with pytest.raises(spill.SpillError, match=r"spill partition \d+ \([\d,]+ rows\) is missing"):
+        run(light_groups(big), "cpu")
+    assert spill_leftovers(_env) == []
+
+
+def test_a_truncated_partition_file_is_an_error(big, _env, monkeypatch):
+    from mxframe import spill
+    real = spill.Partitioned.finish
+
+    def finish_then_truncate_one(self):
+        real(self)
+        victim = next(i for i in range(spill.PARTITIONS) if self.rows[i])
+        with open(self._path(victim), "r+b") as f:
+            f.truncate(os.path.getsize(self._path(victim)) // 2)
+
+    monkeypatch.setattr(spill.Partitioned, "finish", finish_then_truncate_one)
+    with pytest.raises((spill.SpillError, pa.ArrowInvalid, OSError)):
+        run(light_groups(big), "cpu")
+    assert spill_leftovers(_env) == []
+
+
+def test_an_error_while_finishing_the_partition_files_is_a_spill_error(big, _env, monkeypatch):
+    from mxframe import spill
+
+    class Broken:
+        def __init__(self, w):
+            self.w = w
+
+        def write_table(self, t):
+            self.w.write_table(t)
+
+        def close(self):
+            self.w.close()
+            raise OSError(28, "No space left on device")
+
+    real = spill.Partitioned._write
+
+    def write_then_break(self, table):
+        real(self, table)
+        for i in self._writers:
+            self._writers[i] = Broken(self._writers[i])
+
+    monkeypatch.setattr(spill.Partitioned, "_write", write_then_break)
+    with pytest.raises(spill.SpillError, match=r"failed while finishing the partition files .*No space left"):
+        run(light_groups(big), "cpu")
+    assert spill_leftovers(_env) == []
 
 
 def test_the_spill_directory_is_removed_after_an_error(big, _env, monkeypatch):

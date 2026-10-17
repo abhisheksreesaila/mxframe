@@ -607,8 +607,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     sink, state, batches_run, rows_info = None, None, 0, None
     n_slices = Counter(b[0] for b in got.batches if len(b) == 1 and b[0] in got.slice_rows)
     free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
-    if spec is None:                                        # a batch of input is in flight while rows are collected
-        sink = _sink_for(plan, got.top, max(free - got.batch_target, budget // 8), free // WORKING_FACTOR, budget)
+    if spec is None:                                        # a batch is in flight (input x working factor) while rows are collected
+        sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR, budget)
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
