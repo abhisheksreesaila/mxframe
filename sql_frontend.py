@@ -513,8 +513,12 @@ class _SQLTranslator:
             star_cols = [c for c, _ in self._star_items]
             outs = _dedupe([n for _, n in self._star_items])
             if not non_star and (self._copies or outs != star_cols):           # SELECT *: the key columns the join
-                plan = Project(plan, [col(c) if c == o else col(c).alias(o)    # kept, a repeated name renamed (k_1)
-                                      for c, o in zip(star_cols, outs)])
+                star_proj = [col(c) if c == o else col(c).alias(o)             # kept, a repeated name renamed (k_1)
+                             for c, o in zip(star_cols, outs)]
+                if node.args.get("order"):             # ORDER BY u.k names the plan's columns: rename after it
+                    final_proj = star_proj
+                else:
+                    plan = Project(plan, star_proj)
             if non_star:
                 proj = [self._select_expr(e) for e in non_star]
                 names = _dedupe([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])

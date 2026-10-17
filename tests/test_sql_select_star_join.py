@@ -140,3 +140,21 @@ def test_float_key_keeps_its_own_type_and_values():
     got = mx.sql("SELECT t.k, fl.x FROM t JOIN fl ON t.k = fl.x ORDER BY t.i", **_tables()).compute()
     assert got.schema.types == [pa.int64(), pa.float64()]
     assert got.column("x").to_pylist() == [1.0, 2.0, 2.0, 3.0]
+
+
+# ORDER BY a right key (a copy) or a renamed column next to a lone star
+ORDERED = [
+    "SELECT * FROM t JOIN u ON t.k = u.k ORDER BY u.k, t.i",
+    "SELECT * FROM t JOIN u ON t.k = u.k ORDER BY u.v DESC, t.i LIMIT 3",
+    "SELECT * FROM t LEFT JOIN w ON t.k = w.x ORDER BY w.x, t.i",
+    "SELECT * FROM t LEFT JOIN w ON t.k = w.x ORDER BY w.x DESC, t.i",
+    "SELECT * FROM t, u WHERE t.k = u.k ORDER BY u.v, t.i",
+    "SELECT * FROM t, fl WHERE t.k = fl.x ORDER BY fl.x, t.i",
+    "SELECT * FROM t JOIN u USING (k) ORDER BY u.v, t.i",
+]
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("q", ORDERED)
+def test_star_order_by_right_columns(q, device):
+    _check(q, device, ordered=True)

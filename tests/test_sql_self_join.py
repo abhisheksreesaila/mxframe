@@ -71,3 +71,14 @@ def test_self_join_over_scan_parquet(tmp_path):
         got = mx.sql(q, t=mx.scan_parquet(path)).compute()
         assert got.column_names == exp.column_names, q
         assert sorted(_rows(got), key=repr) == sorted(_rows(exp), key=repr), q
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("q", [
+    "SELECT * FROM t x JOIN t y ON x.k = y.k ORDER BY x.i, y.i",
+    "SELECT * FROM t x JOIN t y ON x.k = y.k ORDER BY y.v DESC, x.i",
+    "SELECT * FROM t x LEFT JOIN t y ON x.k = y.i ORDER BY y.v, x.i",
+    "SELECT * FROM t JOIN u ON t.k = u.k ORDER BY u.v, t.i",
+])
+def test_star_order_by_second_copy(q, device):
+    _check(q, device, ordered=True)
