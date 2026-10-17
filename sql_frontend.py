@@ -232,7 +232,7 @@ def _null_on_empty(n: sge.Expression) -> bool:
 def _is_comma_join(join: sge.Join) -> bool:
     """FROM a, b: the join keys are in WHERE. (An explicit CROSS JOIN stays unsupported.)"""
     return (not join.args.get("on") and not join.args.get("using") and not join.args.get("side")
-            and not join.args.get("kind"))
+            and not join.args.get("kind") and not join.args.get("method"))
 
 
 def _disjuncts(n: sge.Expression) -> List[sge.Expression]:
@@ -365,6 +365,10 @@ class _SQLTranslator:
         # same name on both sides (one copy survives the join, so t.k and u.k are the same column)
         self._table_cols: List[tuple] = []
         self._same_keys: set = set()
+        # SELECT * output: (column of the joined plan, name it has in the result) in DuckDB's order, both key
+        # columns of a JOIN ... ON included (the copies), one for USING / NATURAL
+        self._star_items: List[tuple] = []
+        self._any_star = False
         # aggregate query state (see _build_aggregate)
         self._post = False          # translating an expression above the Aggregate
         self._key_names: dict = {}  # translated group key signature -> output name
@@ -418,6 +422,8 @@ class _SQLTranslator:
         self._register_ctes(node.args.get("with_"))
         self._resolve_names(node)
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
+        self._any_star = any(isinstance(e, sge.Star) or (isinstance(e, sge.Column) and isinstance(e.this, sge.Star))
+                             for e in node.expressions)
 
         where = node.args.get("where")
         if where and _aggs_in(where.this):
@@ -461,10 +467,11 @@ class _SQLTranslator:
                 raise ValueError("HAVING needs GROUP BY or an aggregate function in SELECT")
             # pure projection (skip if SELECT *)
             non_star = [e for e in node.expressions if not isinstance(e, sge.Star)]
-            outs = _dedupe(self._cur_cols)
-            if not non_star and (self._copies or outs != self._cur_cols):      # SELECT *: without the copies,
-                plan = Project(plan, [col(c) if c == o else col(c).alias(o)    # a case-only repeat renamed (A_1)
-                                      for c, o in zip(self._cur_cols, outs)])
+            star_cols = [c for c, _ in self._star_items]
+            outs = _dedupe([n for _, n in self._star_items])
+            if not non_star and (self._copies or outs != star_cols):           # SELECT *: the key columns the join
+                plan = Project(plan, [col(c) if c == o else col(c).alias(o)    # kept, a repeated name renamed (k_1)
+                                      for c, o in zip(star_cols, outs)])
             if non_star:
                 proj = [self._select_expr(e) for e in non_star]
                 names = _dedupe([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])
@@ -535,19 +542,20 @@ class _SQLTranslator:
                 raise NotImplementedError("* EXCLUDE / REPLACE / RENAME next to other SELECT items is not supported "
                                           "(list the columns)")
             if isinstance(e, sge.Star):
-                cols, table = self._cur_cols, None
+                out += [sge.Column(this=sge.to_identifier(c)) if c == n
+                        else sge.Alias(this=sge.Column(this=sge.to_identifier(c)), alias=sge.to_identifier(n))
+                        for c, n in self._star_items]
+                continue
+            table = e.table.lower()
+            if table not in {a for a, _ in self._table_cols}:
+                raise ValueError(f"{e.sql(dialect='duckdb')}: unknown table {table!r} in the FROM clause")
+            if len(self._table_cols) == 1:
+                cols = self._cur_cols
+            elif self._alias_schema.get(table) is not None:
+                cols = self._alias_schema[table].names
             else:
-                table = e.table.lower()
-                if table not in {a for a, _ in self._table_cols}:
-                    raise ValueError(f"{e.sql(dialect='duckdb')}: unknown table {table!r} in the FROM clause")
-                if len(self._table_cols) == 1:
-                    cols = self._cur_cols
-                elif self._alias_schema.get(table) is not None:
-                    cols = self._alias_schema[table].names
-                else:
-                    raise NotImplementedError(f"{table}.*: the columns of this FROM item are not known, list them")
-            out += [sge.Column(this=sge.to_identifier(c), table=sge.to_identifier(table) if table else None)
-                    for c in cols]
+                raise NotImplementedError(f"{table}.*: the columns of this FROM item are not known, list them")
+            out += [sge.Column(this=sge.to_identifier(c), table=sge.to_identifier(table)) for c in cols]
         node.set("expressions", out)
 
     def _hidden_sort_keys(self, node: sge.Select, items, names, distinct: bool):
@@ -600,6 +608,7 @@ class _SQLTranslator:
         self._joined = {from_clause.this.alias_or_name.lower()}
         self._cur_cols = list(main_cols)
         self._qual = {(next(iter(self._joined)), c): c for c in main_cols}
+        self._star_items = [(c, c) for c in main_cols]
         pending = []
 
         for join in node.args.get("joins") or []:
@@ -622,17 +631,29 @@ class _SQLTranslator:
             if on is not None:
                 on = self._use_right_key_copies(on)      # u.k of an earlier LEFT JOIN: NULL where it missed
                 left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
-            elif using:
-                cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
-                keys = [str(c.name) for c in cols]
+            elif using or join.args.get("method"):
+                if using:
+                    cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
+                    keys = [str(c.name) for c in cols]
+                else:                                  # NATURAL: the columns both sides have
+                    keys = [c for c in self._cur_cols if _ci_find(right_cols, c)]
+                    if not keys:
+                        raise ValueError("NATURAL JOIN: the two sides share no column name")
                 left_on = [_ci_find(self._cur_cols, k) or k for k in keys]       # each side's own spelling
                 right_on = [_ci_find(right_cols, k) or k for k in keys]
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
+            alias = join.this.alias_or_name.lower()
+            on_keys = right_on
             right_plan, right_on, own = self._own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how)
-            if how == "left":
-                right_plan = self._copy_right_keys(node, join, right_plan, right_cols, left_on, right_on)
+            if how == "left" or (how == "inner" and on is not None and self._any_star):
+                # SELECT * keeps both key columns of a JOIN ... ON: the right one is a copy (own-typed keys
+                # stay ordinary right columns already)
+                carried = list(right_cols) + [n for n in right_on if n not in right_cols]
+                right_plan = self._copy_right_keys(node, join, right_plan, carried, left_on,
+                                                   [k for k in on_keys if k not in own],
+                                                   all_keys=self._any_star and on is not None)
                 self._left_schema |= self._copies            # a later ON may name a copy (u.k)
             plan = Join(plan, right_plan, left_on, right_on, how)
             # After this join, the accumulated left side grows to include right cols (a semi / anti
@@ -642,9 +663,16 @@ class _SQLTranslator:
                 outs = join_output_names(self._cur_cols, right_cols, right_on)
                 self._cur_cols += [o for _, o in outs]
                 self._left_schema |= {o for _, o in outs}        # also the renamed names (v_right)
+                out_of = dict(outs)
+                for c in right_cols:                   # the right table's columns in its own order
+                    key_copy = self._marks.get((alias, c))
+                    if c in out_of:
+                        self._star_items.append((out_of[c], c))
+                    elif on is not None and key_copy in self._copies:
+                        self._star_items.append((key_copy, c))
                 for c, o in outs:
                     if c != o:                         # a clashing column is renamed (x.k -> k_right)
-                        self._renamed[(join.this.alias_or_name.lower(), c)] = o
+                        self._renamed[(alias, c)] = o
             self._joined.add(join.this.alias_or_name.lower())
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
@@ -667,13 +695,38 @@ class _SQLTranslator:
             pending.pop(i)
             left_on = [self._expr(l).args[0] for l, _ in links]
             right_on = [r.name for _, r in links]
+            # a right key the query can see (SELECT *) or whose type differs from the left key's is a column
+            # of its own: the join would drop it and read the left key
+            lt, rt = column_types(plan), column_types(right_plan)
+            need = [rk for lk, rk in zip(left_on, right_on)
+                    if self._any_star or (lk in lt and rk in rt and lt[lk] != rt[rk])]
+            copied = {}
+            if need:
+                taken = set(lt) | set(rt) | set(right_cols) | set(self._cur_cols) | self._copies
+                for rk in need:
+                    name = f"__rk_{alias}_{rk}"
+                    while name in taken:
+                        name += "_"
+                    taken.add(name)
+                    copied[rk] = name
+                right_plan = Project(right_plan, [col(c) for c in right_cols]
+                                     + [col(rk).alias(n) for rk, n in copied.items()])
+                self._copies |= set(copied.values())
             plan = Join(plan, right_plan, left_on, right_on, "inner")
             outs = join_output_names(self._cur_cols, right_cols, right_on)
+            out_of = dict(outs)
+            for c in right_cols:
+                if c in out_of:
+                    self._star_items.append((out_of[c], c))
+                elif c in copied:
+                    self._star_items.append((copied[c], c))
             for c, out in outs:
                 self._qual[(alias, c)] = out
             for lk, rk in zip(left_on, right_on):
-                self._qual[(alias, rk)] = lk
-                if lk == rk:
+                self._qual[(alias, rk)] = copied.get(rk, lk)
+                if rk in copied:
+                    self._marks_bare[rk] = copied[rk]
+                elif lk == rk:
                     self._same_keys.add(lk)
                 else:
                     self._col_aliases[rk] = lk
@@ -698,7 +751,7 @@ class _SQLTranslator:
             raise ValueError("JOIN ... ON needs a column = column condition besides IS [NOT] NULL")
         return (_and_all(keep) if keep else on), mine
 
-    def _copy_right_keys(self, node, join, right_plan, right_cols, left_on, right_on):
+    def _copy_right_keys(self, node, join, right_plan, right_cols, left_on, right_on, all_keys=False):
         """The join keeps only the left key. When the query reads a right key (``u.k``; a bare ``k`` that is
         only the right table's), the right side carries a copy of it under a name no table has: NULL where
         nothing matched, the key where it did. ``u.k`` resolves to the copy."""
@@ -716,6 +769,8 @@ class _SQLTranslator:
                     if name in pairs and (c.table.lower() == alias if c.table
                                           else pairs[name] != name and name not in self._left_schema):
                         asked.add(name)
+        if all_keys:
+            asked |= set(pairs)
         if not asked:
             return right_plan
         taken = set(right_cols) | set(self._cur_cols) | {c for t in self._tables.values()
