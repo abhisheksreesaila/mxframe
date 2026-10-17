@@ -199,6 +199,22 @@ GUARDED = [
     "SELECT i FROM t WHERE f > 0 AND ln(f) > 1 ORDER BY i",
     "SELECT g, sum(p) AS x FROM t WHERE f >= 0 AND sqrt(f) > 1 GROUP BY g ORDER BY g",
     "SELECT g, count(*) AS c FROM t WHERE a >= 0 GROUP BY g HAVING sum(sqrt(a)) > 20 ORDER BY g",
+    # the guard written after the risky call, and three-term chains
+    "SELECT i FROM t WHERE ln(f) > 1 AND f > 0 ORDER BY i",
+    "SELECT i FROM t WHERE sqrt(f) > 1 AND g = 1 AND f >= 0 ORDER BY i",
+    "SELECT i FROM t WHERE f >= 0 AND sqrt(f) > 1 AND ln(f) > 0.5 ORDER BY i",
+    "SELECT i FROM t WHERE sqrt(f) > 1 AND ln(f) > 0.5 AND f > 0 ORDER BY i",
+    "SELECT i FROM t WHERE f < 0 OR sqrt(f) > 2 ORDER BY i",
+    "SELECT count(*) AS c FROM t WHERE ln(f) > 1 AND f > 0",
+    "SELECT g, count(*) AS c, sum(p) AS s FROM t WHERE sqrt(f) > 1 AND g >= 1 AND f >= 0 GROUP BY g ORDER BY g",
+    "SELECT g, sum(ln(f)) AS s FROM t WHERE ln(f) > 0 AND f > 0 GROUP BY g ORDER BY g",
+    # CASE guards
+    "SELECT i, CASE WHEN f > 0 THEN ln(f) END AS x FROM t ORDER BY i",
+    "SELECT i, CASE WHEN f > 0 THEN sqrt(f) ELSE 0 END AS x FROM t ORDER BY i",
+    "SELECT i, CASE WHEN f < 0 THEN 0 ELSE sqrt(f) END AS x FROM t ORDER BY i",
+    "SELECT sum(CASE WHEN f > 0 THEN ln(f) END) AS s, count(CASE WHEN f > 0 THEN ln(f) END) AS c FROM t",
+    "SELECT g, sum(CASE WHEN f >= 0 THEN sqrt(f) ELSE 0 END) AS s FROM t GROUP BY g ORDER BY g",
+    "SELECT i FROM t WHERE CASE WHEN f > 0 THEN ln(f) ELSE 0 END > 1 ORDER BY i",
 ]
 
 

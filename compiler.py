@@ -190,6 +190,53 @@ def case_when_arrow(cond, then, else_):
     return pc.if_else(cond, _fit(then, want, cond), _fit(else_, want, cond))
 
 
+def eval_on_rows(ev, expr, table, mask):
+    """``ev(expr, table)`` computed only on the rows where *mask* holds, NULL elsewhere (so a sqrt / ln that DuckDB
+    never runs on a row cannot raise on it)."""
+    part = ev(expr, pc.filter(table, mask))
+    return pc.replace_with_mask(pa.nulls(len(table), part.type), mask, part)
+
+
+def guarded_logic(ev, expr, table):
+    """An AND / OR chain with a sqrt / ln in it. Kleene AND / OR commute, so every term without one runs first on
+    all rows, then each risky term only on the rows the terms before it leave open (AND: not false; OR: not true):
+    `ln(f) > 1 AND f > 0` does not raise on the rows `f > 0` removes, like DuckDB's."""
+    is_and = expr.op == "and"
+    terms = []
+
+    def flatten(e):
+        if e.op == expr.op:
+            flatten(e.args[0]), flatten(e.args[1])
+        else:
+            terms.append(e)
+    flatten(expr)
+    res = None
+    for t in [t for t in terms if not t.uses("sqrt", "ln")] + [t for t in terms if t.uses("sqrt", "ln")]:
+        if res is not None and t.uses("sqrt", "ln"):
+            open_ = pc.fill_null(res, True) if is_and else pc.invert(pc.fill_null(res, False))
+            v = eval_on_rows(ev, t, table, open_)
+        else:
+            v = ev(t, table)
+        res = v if res is None else (pc.and_kleene(res, v) if is_and else pc.or_kleene(res, v))
+    return res
+
+
+def case_when_guarded(ev, args, table):
+    """CASE WHEN with ``ev`` evaluating its parts: a branch with a sqrt / ln runs only on the rows that take it
+    (`CASE WHEN f > 0 THEN ln(f) END` does not raise on f <= 0, DuckDB's usual guard)."""
+    cond = ev(args[0], table)
+    taken = pc.fill_null(cond, _npscalar(False, type=pa.bool_()))
+    vals = []
+    for a, mask in zip(args[1:], (taken, pc.invert(taken))):
+        if a.op == "lit":
+            vals.append(case_literal(a.args[0]))
+        elif a.uses("sqrt", "ln"):
+            vals.append(eval_on_rows(ev, a, table, mask))
+        else:
+            vals.append(ev(a, table))
+    return case_when_arrow(cond, *vals)
+
+
 def coalesce_arrow(*vals):
     """Arrow COALESCE(a, b, ...): the first non-NULL value per row, of the common type of the arguments like
     DuckDB (``_supertype``, folded left to right). ``vals`` are Arrow values or None (a NULL literal); at least
@@ -628,14 +675,8 @@ class GraphCompiler:
             native = _dict_predicate(expr, table)
             if native is not None:
                 return native
-        if op in ("and", "or") and args[1].uses("sqrt", "ln"):
-            # a right side that can raise sees only the rows the left side leaves open, as DuckDB's conjunction
-            # filters do (`f > 0 AND ln(f) > 1` does not raise on the rows `f > 0` removed)
-            lhs = GraphCompiler._eval_predicate(args[0], table)
-            open_ = pc.fill_null(lhs, True) if op == "and" else pc.invert(pc.fill_null(lhs, False))
-            part = GraphCompiler._eval_predicate(args[1], table.filter(open_))
-            rhs = pc.replace_with_mask(pa.nulls(len(table), pa.bool_()), open_, part)
-            return pc.and_kleene(lhs, rhs) if op == "and" else pc.or_kleene(lhs, rhs)
+        if op in ("and", "or") and expr.uses("sqrt", "ln"):
+            return guarded_logic(GraphCompiler._eval_predicate, expr, table)
         if op in _PC_CMP_OPS:
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)
@@ -677,9 +718,7 @@ class GraphCompiler:
             from .str_patterns import match_like
             return match_like(GraphCompiler._eval_predicate(args[0], table), args[1], args[2], args[3])
         if op == "case_when":
-            return case_when_arrow(GraphCompiler._eval_predicate(args[0], table),
-                                   *(case_literal(a.args[0]) if a.op == "lit" else GraphCompiler._eval_predicate(a, table)
-                                     for a in args[1:]))
+            return case_when_guarded(GraphCompiler._eval_predicate, args, table)
         if op == "coalesce":
             return coalesce_arrow(*branch_values(args, lambda a: GraphCompiler._eval_predicate(a, table)))
         if op == "abs":

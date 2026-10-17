@@ -25,7 +25,7 @@ from pathlib import Path
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import case_when_arrow, coalesce_arrow, branch_values, abs_arrow, year_days_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _is_number
+from .compiler import case_when_arrow, case_when_guarded, coalesce_arrow, branch_values, abs_arrow, year_days_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -896,9 +896,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "case_when":
             # the common type of the branches (integers stay integers, numbers mixed are float64 on both
             # devices: float32 would lose integers above 2**24 and round float64 values, F-022)
-            return case_when_arrow(self._eval_expr_arrow(args[0], table),
-                                   *(case_literal(a.args[0]) if a.op == "lit" else self._eval_expr_arrow(a, table)
-                                     for a in args[1:]))
+            return case_when_guarded(self._eval_expr_arrow, args, table)
         if op == "coalesce":
             return coalesce_arrow(*branch_values(args, lambda a: self._eval_expr_arrow(a, table)))
         if op == "abs":
