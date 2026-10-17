@@ -1258,12 +1258,13 @@ Needs: none · Found by the F-058 random suite (2026-10-17): SF1 MXFrame / DuckD
 ## Mojo API (brief `docs/briefs/mojo-api.md`, spec `docs/mxframe-mojo-api.md`)
 Agreed 2026-10-17. M1-M7 first; M8 (agent CLI, planner + SQL in Mojo) later. Benchmarks paused. Package source in `mojo/mxframe/`.
 
-## F-131 M0: Mojo package spike [doing]
+## F-131 M0: Mojo package spike [review]
 Needs: none
-- [ ] `mojo/mxframe/` builds as a `.mojopkg` from the existing kernel sources (no ctypes, no `.so` loading), and a tiny Mojo binary that imports it links and runs with no libpython (`ldd` shows none)
-- [ ] the binary sums an int64 column exactly through the existing executor code path, equal to a Python-side check
-- [ ] Parquet codecs: zstd and snappy available as C libraries from the pixi env (or vendored), callable by `external_call`, a round trip of a compressed page matches; decision recorded
-- [ ] `pixi run mojo-test` runs Mojo tests; how the package is built and tested is written in `mojo/README.md`
+- [x] `scripts/build_mojo_pkg.sh` builds `build/mxframe.mojoc` (Mojo 1.1 packages are `.mojoc`) from `mojo/mxframe/` plus the kernels copied from `kernels_aot/` as `mxframe/kernels/` with package-relative imports. Measured why: a `.mojoc` built with `-I kernels_aot` left the consumer with "unable to locate module 'pipeline_cpu'", and a shared library that re-imports `@export` functions exported 0 symbols, so `kernels_aot/` stays the one source and the Python `.so` builds are untouched
+- [x] a Mojo binary built against the package alone runs the native CPU kernel: exact SUM / COUNT under a filter over 2M int64 values past 2^53 (cancelling, so a float64 sum would drop the +1s), and `E_OVERFLOW` (-21) when the total passes int64; `ldd` shows no libpython (only the Mojo runtime, libc, libstdc++)
+- [x] Parquet codecs: zstd and snappy from the pixi env (pyarrow's), called by `external_call`, 1 MiB round trips (zstd 5 KB, snappy 60 KB compressed); linked with `-lzstd -lsnappy`; to vendor or link statically for iOS later (agreed: small C libraries, replaceable)
+- [x] `pixi run mojo-test` builds and runs `mojo/tests/test_*.mojo` and fails any test binary that links libpython; `mojo/README.md` says how to build, test and link
+- Lesson for M1: Mojo frees a value at its last use, so an address taken from a `List` dangled before the kernel ran (the program's magic check failed). The Table and Query API own their buffers; no raw addresses cross the API
 
 ## F-132 M1: Table and columns [todo]
 Needs: F-131 · Spec §1

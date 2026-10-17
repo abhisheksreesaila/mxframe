@@ -29,6 +29,7 @@ test-q5q10 = { cmd = "python scripts/_test_phase_q5_q10.py",    depends-on = ["s
 test-import = { cmd = "python scripts/_test_base_import.py", depends-on = ["setup-mxframe"] }
 test-all = { depends-on = ["test-import", "test0", "test1", "test4", "test5", "test6", "test-sql", "test-q5q10"] }
 test = "bash scripts/run_tests.sh"
+mojo-test = "bash scripts/mojo_test.sh"
 check-gpu = { cmd = "python scripts/_check_gpu.py",           depends-on = ["setup-mxframe"] }
 
 [dependencies]
