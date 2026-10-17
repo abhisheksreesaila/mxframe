@@ -269,7 +269,6 @@ def test_is_null_on_the_right_table_in_join_on(q, device):
 
 @pytest.mark.parametrize("q", [
     "SELECT id FROM t WHERE 1 IS DISTINCT FROM 2",
-    "SELECT id FROM t WHERE NULL IS NULL",
     "SELECT id FROM t WHERE 1 IS NOT DISTINCT FROM NULL",
 ])
 def test_constants_only_raise_a_clear_error(q):

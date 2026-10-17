@@ -575,7 +575,15 @@ class GraphCompiler:
 
     @staticmethod
     def _eval_predicate(expr, table: pa.Table):
-        """Evaluate a filter predicate against a PyArrow table."""
+        """Evaluate a filter predicate against a PyArrow table. A condition of constants only (``1 IN (1, 2)``)
+        comes out of Arrow as one boolean: it is that value on every row (F-122)."""
+        out = GraphCompiler._eval_predicate_node(expr, table)
+        if isinstance(out, pa.Scalar) and expr.op != "lit" and (pa.types.is_boolean(out.type) or pa.types.is_null(out.type)):
+            return _npa([out.as_py()] * len(table), type=pa.bool_())
+        return out
+
+    @staticmethod
+    def _eval_predicate_node(expr, table: pa.Table):
         op, args = expr.op, expr.args
         if op == "col":
             arr = table.column(args[0])

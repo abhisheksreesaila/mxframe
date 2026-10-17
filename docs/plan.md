@@ -1107,13 +1107,15 @@ Found by the F-114 / F-115 developer (2026-10-16)
 - [x] DuckDB-checked tests for each; fails before
 - Note (2026-10-16): `upper()` is not in the engine (not part of this ticket). Also fixed: GPU `gather_table` crashed on a NULL-typed column (aot_kernels.py); GROUP BY naming a constant (alias or position) is no key. `(select date ..)` with WHERE / LIMIT / HAVING is refused, `min(date ..) over (...)` is refused. Follow-ups: F-117, F-118, F-119.
 
-## F-117 SQL ORDER BY an expression of a computed alias gives KeyError '__calc1' [todo]
+## F-117 SQL ORDER BY an expression of a computed alias gives KeyError '__calc1' [review]
 Found in the F-116 review (2026-10-16)
-- [ ] a grouped query that orders by an expression over a computed SELECT alias (e.g. `select g, 1 as c, count(*) as n ... group by g order by c + 1`) raises `KeyError: '__calc1'`; DuckDB orders by the value. Reproduce first, fix at the cause (ORDER BY translation in `_build_aggregate`), DuckDB-checked tests
+- [x] a grouped query that orders by an expression over a computed SELECT alias (e.g. `select g, 1 as c, count(*) as n ... group by g order by c + 1`) raises `KeyError: '__calc1'`; DuckDB orders by the value. Reproduce first, fix at the cause (ORDER BY translation in `_build_aggregate`), DuckDB-checked tests
+- Note (2026-10-17): the fix is not in `_build_aggregate`: an alias inside an ORDER BY expression is replaced by the expression it names (`_inline_aliases`, the same function F-123 uses for WHERE and F-112 for subqueries), so it works in plain and grouped queries alike and `__calc` columns are never named by a sort key. A FROM column beats the alias inside an expression, as in DuckDB (`count(*) as x ... order by x + 1` raises, x is not grouped). Left: `SELECT DISTINCT g, 1 as c ... ORDER BY c + 1` (DuckDB accepts, we raise the DISTINCT message). Tests: tests/test_f117_order_by_alias_expr.py (112, 88 fail on main).
 
-## F-118 SQL `select id, 1 as c from t` without aggregates gives a float, not an integer [todo]
+## F-118 SQL `select id, 1 as c from t` without aggregates gives a float, not an integer [review]
 Found in the F-116 review (2026-10-16)
-- [ ] a bare integer (and boolean) literal in a plain SELECT list is broadcast as float32 / float64 by `_eval_expr_arrow` (`lit`); DuckDB returns INTEGER (BOOLEAN). F-116 keeps the type only for constants beside aggregates (`_exact_lit`). Give every constant output column its type; check CASE / COALESCE branches that rely on the float broadcast; DuckDB-checked tests
+- [x] a bare integer (and boolean) literal in a plain SELECT list is broadcast as float32 / float64 by `_eval_expr_arrow` (`lit`); DuckDB returns INTEGER (BOOLEAN). F-116 keeps the type only for constants beside aggregates (`_exact_lit`). Give every constant output column its type; check CASE / COALESCE branches that rely on the float broadcast; DuckDB-checked tests
+- Note (2026-10-17): `_select_expr` gives every constant output its own type (`_exact_lit`: int32 when it fits else int64, bool, float64, string, date32); a NumPy scalar literal keeps its type on zero rows too (`custom_ops._eval_expr_arrow`, it came out null-typed); `true` / `false` / `null` in a plain SELECT list no longer raise (hidden sort keys read them through `_value`). The F-116 constant beside an aggregate is int32 now too (was int64). Left: integers inside CASE / COALESCE come out int64 (DuckDB: int32) – values equal, type differs; `7 // 2` and `1::smallint` are unsupported. Tests: tests/test_f118_constant_output_types.py (228, 160 fail on main). Review fix: -2147483648 is int64 as in DuckDB.
 
 ## F-119 `extract(year from <int32 day column with NULLs>)` in WHERE raises [todo]
 Found in the F-116 review (2026-10-16); also on main
@@ -1127,15 +1129,17 @@ Asked for by the user (2026-10-16), after the core benchmark. Second anxiety aft
 ## F-121 Mojo engine API without the Python front end [todo]
 From the user (2026-10-16): another project needs the Mojo engine directly, with no Python planning or SQL front end. The user will provide the spec; nothing to build until then (see also `docs/mxframe-mojo-api.md` and the "Rings" section)
 
-## F-122 SQL constant WHERE conditions [todo]
+## F-122 SQL constant WHERE conditions [review]
 Found by the F-111 / F-112 review (2026-10-16); on main too
-- [ ] `WHERE 1 = 1` / `WHERE 1 = 0` raise `ArrowTypeError: Filter should be array-like`, `WHERE TRUE` raises "Unsupported SQL expression type: Boolean" (`WHERE 1 = 1 AND a > 1` works). Fold a constant predicate: true keeps every row, false / NULL keeps none (with the right schema)
-- [ ] DuckDB-checked tests incl. constant conditions in HAVING, ON, CASE, and under NOT; fails before
+- [x] `WHERE 1 = 1` / `WHERE 1 = 0` raise `ArrowTypeError: Filter should be array-like`, `WHERE TRUE` raises "Unsupported SQL expression type: Boolean" (`WHERE 1 = 1 AND a > 1` works). Fold a constant predicate: true keeps every row, false / NULL keeps none (with the right schema)
+- [x] DuckDB-checked tests incl. constant conditions in HAVING, ON, CASE, and under NOT; fails before
+- Note (2026-10-17): decided at translation, in the SQL tree (`_fold_conditions` / `_fold_cond` / `_const_truth`, three-valued): a TRUE WHERE / HAVING is dropped, FALSE or NULL becomes a Filter that is false on every row (`_never`; keeps the columns and types; an aggregate over it still returns its one row), a decided CASE branch is dropped or ends the CASE, a FALSE / NULL conjunct in an ON filters the right side (INNER empty, LEFT keeps the left rows with NULLs), `x OR TRUE` is TRUE, `x AND FALSE` FALSE, NOT keeps NULL. Left: `WHERE (select 1) = 1` (scalar subquery of a constant), a constant condition in the SELECT list (`select 1 = 1 as b`), a typed NULL from a CASE with no branch left (comes out null-typed). Tests: tests/test_f122_constant_conditions.py (680 across cpu/gpu x native on/off). Review fixes: exponent literals fold as DOUBLE (`0.1e0 + 0.2e0 = 0.3e0` is false), a constant predicate Arrow evaluates to one boolean is broadcast (`compiler._eval_predicate`: `1 IN (1, 2)`), `'true'` / `'false'` fold, a NULL beside a real condition under NOT is a boolean NULL, a FALSE ON conjunct keeps the keys beside it and an empty right side is not counted against the cross-join cap.
 
-## F-123 SQL WHERE using its own SELECT alias [todo]
+## F-123 SQL WHERE using its own SELECT alias [review]
 Found by the F-111 / F-112 review (2026-10-16); on main too
-- [ ] `SELECT v AS kk FROM t WHERE kk > 0` raises KeyError; DuckDB accepts a SELECT alias in WHERE when no FROM column has that name (the FROM column wins). F-112 did this inside correlated subqueries only; do it in every WHERE (and GROUP BY / HAVING, per DuckDB's rules)
-- [ ] DuckDB-checked tests incl. an alias shadowing a column, an alias of an aggregate (not allowed in WHERE), case-insensitive names; fails before
+- [x] `SELECT v AS kk FROM t WHERE kk > 0` raises KeyError; DuckDB accepts a SELECT alias in WHERE when no FROM column has that name (the FROM column wins). F-112 did this inside correlated subqueries only; do it in every WHERE (and GROUP BY / HAVING, per DuckDB's rules)
+- [x] DuckDB-checked tests incl. an alias shadowing a column, an alias of an aggregate (not allowed in WHERE), case-insensitive names; fails before
+- Note (2026-10-17): `_inline_aliases` (one function, WHERE + ORDER BY expressions + F-112 subqueries). Probed DuckDB: FROM column wins in WHERE; HAVING takes the alias even over a FROM column (already so); GROUP BY takes it only when no FROM column has the name (already so); alias in a JOIN ON is an error in DuckDB (still is). Alias of an aggregate or window: ValueError "not allowed in WHERE". Not done: a SELECT alias used by a later item of the same SELECT list (`select x as kk, kk + 1 as j`, DuckDB accepts). Tests: tests/test_f123_where_select_alias.py (200, 144 fail on main).
 
 ## F-124 SQL subquery correlated two levels out [todo]
 Found by the F-111 / F-112 review (2026-10-16)

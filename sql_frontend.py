@@ -75,6 +75,11 @@ def sql(query: str, **tables) -> LazyFrame:
 _CROSS_LIMIT = 4_000_000          # row pairs a join with no equality (a cross product) may build
 
 
+def _is_never(pred: Expr) -> bool:
+    """The predicate `_SQLTranslator._never` builds (``x IS NULL AND NOT x IS NULL``): no row passes."""
+    return pred.op == "and" and pred.args[0].op == "is_null" and pred.args[1].op == "not"
+
+
 def _rows_upper(plan: LogicalPlan) -> Optional[int]:
     """An upper bound on the rows ``plan`` yields (not its actual count), when that is cheap to know (tables, Parquet footers and what only
     keeps or reshapes their rows); else None."""
@@ -83,6 +88,8 @@ def _rows_upper(plan: LogicalPlan) -> Optional[int]:
     if isinstance(plan, ParquetScan):
         from .io_parquet import _metadata
         return _metadata(plan.path).num_rows
+    if isinstance(plan, Filter) and _is_never(plan.predicate):
+        return 0
     if isinstance(plan, Limit):
         inner = _rows_upper(plan.input)
         if plan.n is None:                                   # OFFSET without LIMIT: what is left after the skipped rows
@@ -130,6 +137,144 @@ def _fold_const_minmax(select: sge.Select) -> None:
 
 
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+_UNKNOWN = object()                  # "not a constant" (None is the SQL NULL)
+
+
+def _const_scalar(n: sge.Expression):
+    """The value of a constant scalar (a number as a Decimal, a string, a bool, None for NULL), else ``_UNKNOWN``."""
+    n = _unparen(n)
+    if isinstance(n, sge.Null):
+        return None
+    if isinstance(n, sge.Boolean):
+        return bool(n.this)
+    if isinstance(n, sge.Literal):
+        try:
+            if n.is_string:
+                return str(n.this)
+            text = str(n.this).replace("_", "")
+            return float(text) if re.search(r"[eE]", text) else Decimal(text)      # 1e0 is a DOUBLE, 1.5 a DECIMAL
+        except ArithmeticError:
+            return _UNKNOWN
+    if isinstance(n, sge.Neg):
+        v = _const_scalar(n.this)
+        return -v if isinstance(v, (Decimal, float)) else _UNKNOWN
+    if isinstance(n, (sge.Add, sge.Sub, sge.Mul)):
+        a, b = _const_scalar(n.this), _const_scalar(n.expression)
+        if isinstance(a, (Decimal, float)) and isinstance(b, (Decimal, float)):
+            a, b = _same_kind(a, b)
+            return a + b if isinstance(n, sge.Add) else a - b if isinstance(n, sge.Sub) else a * b
+    return _UNKNOWN
+
+
+def _same_kind(a, b):
+    """Two constant numbers in one type: a DOUBLE (float) next to a DECIMAL makes both DOUBLE, as in DuckDB."""
+    return (float(a), float(b)) if isinstance(a, float) or isinstance(b, float) else (a, b)
+
+
+def _const_truth(n: sge.Expression):
+    """The truth of a condition made of constants only, in SQL's three values (True, False, None = NULL), else
+    ``_UNKNOWN``. A number is true when it is not zero."""
+    n = _unparen(n)
+    v = _const_scalar(n)
+    if isinstance(v, str) and v.lower() in ("true", "t", "false", "f"):      # a string cast to BOOLEAN
+        return v.lower() in ("true", "t")
+    if v is not _UNKNOWN:
+        return None if v is None else bool(v) if isinstance(v, (bool, Decimal, float)) else _UNKNOWN
+    if isinstance(n, sge.Not):
+        t = _const_truth(n.this)
+        return t if t is _UNKNOWN or t is None else not t
+    if isinstance(n, (sge.And, sge.Or)):
+        a, b = _const_truth(n.this), _const_truth(n.expression)
+        if a is _UNKNOWN or b is _UNKNOWN:
+            return _UNKNOWN
+        stop = isinstance(n, sge.Or)                       # the value that decides: True for OR, False for AND
+        return stop if stop in (a, b) else None if None in (a, b) else not stop
+    if isinstance(n, _COMPARE):
+        a, b = _const_scalar(n.this), _const_scalar(n.expression)
+        if a is _UNKNOWN or b is _UNKNOWN:
+            return _UNKNOWN
+        if a is None or b is None:
+            return None
+        if isinstance(a, bool) or isinstance(b, bool) or isinstance(a, str) != isinstance(b, str):
+            return _UNKNOWN
+        if not isinstance(a, str):
+            a, b = _same_kind(a, b)
+        ops = {sge.EQ: a == b, sge.NEQ: a != b, sge.LT: a < b, sge.LTE: a <= b, sge.GT: a > b, sge.GTE: a >= b}
+        return ops[type(n)]
+    if isinstance(n, sge.Is):
+        what = n.expression
+        if isinstance(what, sge.Null):
+            v = _const_scalar(n.this)
+            return _UNKNOWN if v is _UNKNOWN else v is None
+        if isinstance(what, sge.Boolean):
+            t = _const_truth(n.this)
+            return _UNKNOWN if t is _UNKNOWN else t is not None and t == bool(what.this)
+    return _UNKNOWN
+
+
+def _bool_node(t) -> sge.Expression:
+    return sge.Null() if t is None else sge.Boolean(this=bool(t))
+
+
+def _fold_cond(n: sge.Expression, filt: bool = True) -> sge.Expression:
+    """A condition with its constant parts decided (F-122): ``1 = 1`` is TRUE, ``x AND TRUE`` is ``x``,
+    ``x OR TRUE`` is TRUE, ``NOT NULL`` is NULL. The result is a Boolean / Null node when nothing else is left.
+    ``filt``: the condition only keeps a row when it is TRUE (WHERE, HAVING, ON, a CASE branch), so NULL acts as
+    FALSE at its AND / OR level; below a NOT that no longer holds."""
+    t = _const_truth(n)
+    if t is not _UNKNOWN:
+        return _bool_node(t)
+    inner = _unparen(n)
+    if isinstance(inner, sge.Not):
+        c = _fold_cond(inner.this, False)
+        t = _const_truth(c)
+        return _bool_node(t if t is None else not t) if t is not _UNKNOWN else sge.Not(this=c)
+    if isinstance(inner, (sge.And, sge.Or)):
+        is_or = isinstance(inner, sge.Or)
+        a, b = _fold_cond(inner.this, filt), _fold_cond(inner.expression, filt)
+        ta, tb = _const_truth(a), _const_truth(b)
+        stop = is_or                                       # TRUE decides an OR, FALSE an AND
+        for t, other in ((ta, b), (tb, a)):
+            if t is stop:
+                return _bool_node(stop)
+            if t is (not stop):
+                return other                               # x AND TRUE, x OR FALSE
+            if t is None and filt:                         # NULL acts as FALSE: x OR NULL is x, x AND NULL is FALSE
+                return other if is_or else _bool_node(False)
+        return type(inner)(this=a, expression=b)
+    return n
+
+
+def _fold_conditions(select: sge.Select) -> None:
+    """Fold the constant conditions of WHERE, HAVING, every JOIN's ON and every CASE branch of ``select`` (a
+    TRUE WHERE / HAVING is dropped; what is left of a decided one is a Boolean / Null node)."""
+    for key in ("where", "having"):
+        clause = select.args.get(key)
+        if clause is not None:
+            folded = _fold_cond(clause.this)
+            select.set(key, None if _const_truth(folded) is True else type(clause)(this=folded))
+    for join in select.args.get("joins") or []:
+        if join.args.get("on") is not None:             # per conjunct: a FALSE one must keep the keys beside it
+            kept = [c for c in (_fold_cond(c) for c in _conjuncts(join.args["on"])) if _const_truth(c) is not True]
+            join.set("on", _and_all(kept) or sge.Boolean(this=True))
+    cases = [c for c in select.walk(prune=lambda m: isinstance(m, (sge.Subquery, sge.Exists)))
+             if isinstance(c, sge.Case) and c.args.get("this") is None]
+    for case in reversed(cases):                           # the inner CASE first: an outer one may copy it
+        ifs, default = [], case.args.get("default")
+        for branch in case.args.get("ifs") or []:
+            cond = _fold_cond(branch.this)
+            t = _const_truth(cond)
+            if t is True:                                  # this branch always matches: the later ones never run
+                default = branch.args["true"]
+                break
+            if t is _UNKNOWN:
+                branch.set("this", cond)
+                ifs.append(branch)
+        if ifs:
+            case.set("ifs", ifs)
+            case.set("default", default)
+        else:
+            case.replace(default.copy() if default is not None else sge.Null())
 
 
 def _number(text, neg: bool = False) -> Union[int, float]:
@@ -217,11 +362,13 @@ def _float_cast(node: sge.Expression) -> Optional[float]:
 
 def _exact_lit(ex: Expr) -> Expr:
     """A constant output column keeps its type: a bare Python int / bool / float literal in a Project is
-    broadcast as float32 / float64, a NumPy scalar as its own type."""
+    broadcast as float32 / float64, a NumPy scalar as its own type. An integer is INTEGER (int32) when it
+    fits, else BIGINT, as in DuckDB."""
     if ex.op != "lit":
         return ex
     v = ex.args[0]
-    return lit(np.bool_(v) if isinstance(v, bool) else np.int64(v) if isinstance(v, int)
+    return lit(np.bool_(v) if isinstance(v, bool) else (np.int32(v) if -2**31 < v < 2**31 else np.int64(v))
+               if isinstance(v, int)
                else np.float64(v) if isinstance(v, float) else v)
 
 
@@ -505,6 +652,7 @@ class _SQLTranslator:
         self._any_star = False
         # aggregate query state (see _build_aggregate)
         self._post = False          # translating an expression above the Aggregate
+        self._order_expr = False    # inside an ORDER BY expression: a FROM column beats a SELECT output name
         self._key_names: dict = {}  # translated group key signature -> output name
         self._out_src: dict = {}    # SELECT output name -> its column in the Aggregate output
         self._sort = None
@@ -580,6 +728,8 @@ class _SQLTranslator:
             raise NotImplementedError(f"{type(node).__name__} (UNION / INTERSECT / EXCEPT) is not supported, only SELECT")
         self._register_ctes(node.args.get("with_"))
         self._resolve_names(node)
+        self._inline_aliases(node, copy=False, order=True)       # WHERE kk > 0, ORDER BY h + 1 (F-117, F-123)
+        _fold_conditions(node)                                   # WHERE 1 = 1, HAVING false, CASE WHEN true (F-122)
         _fold_const_minmax(node)
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
         self._any_star = any(isinstance(e, sge.Star) or (isinstance(e, sge.Column) and isinstance(e.this, sge.Star))
@@ -733,7 +883,7 @@ class _SQLTranslator:
         have = {}
         for e, nm in zip(items, names):
             if nm is not None:
-                have.setdefault(self._expr(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
+                have.setdefault(self._value(e.this if isinstance(e, sge.Alias) else e).signature(), nm)
         hidden = []
         taken = set(names) | {c.lower() for c in self._scope_columns}
         for o in order_node.expressions if order_node else []:
@@ -1255,6 +1405,12 @@ class _SQLTranslator:
                     keys.append((b, a))
                     continue
             both_sides = sides(c)
+            if isinstance(c, (sge.Boolean, sge.Null)):         # ON ... AND FALSE / NULL (F-122): no right row matches
+                x = sge.Column(this=sge.to_identifier(min(right_schema)))
+                never = sge.And(this=sge.Is(this=x, expression=sge.Null()),
+                                expression=sge.Not(this=sge.Is(this=x.copy(), expression=sge.Null())))
+                ronly.append(never)
+                continue
             if not both_sides:
                 raise NotImplementedError(f"the JOIN condition {c.sql(dialect='duckdb')} refers to no column of "
                                           "either table")
@@ -1456,25 +1612,46 @@ class _SQLTranslator:
         new.set("order", None)
         return new
 
-    def _unalias_where(self, sel: sge.Select) -> sge.Select:
-        """``sel`` with an inner SELECT alias used in its WHERE replaced by the expression it names (DuckDB lets
-        a WHERE use a SELECT alias; a column of the subquery's FROM with that name wins). The decorrelation
-        rebuilds the SELECT list, which would lose the alias."""
-        where = sel.args.get("where")
+    def _inline_aliases(self, sel: sge.Select, copy: bool = True, order: bool = False) -> sge.Select:
+        """``sel`` with a SELECT alias used in its WHERE (and, with ``order``, inside an ORDER BY expression)
+        replaced by the expression it names. DuckDB reads a bare name as a FROM column when one has that name,
+        else as the SELECT alias; a bare ``ORDER BY alias`` is the output column and stays. An alias of an
+        aggregate or window call is no WHERE condition. ``copy=False`` rewrites ``sel`` itself. Written once,
+        for the query's own clauses and for a correlated subquery, whose decorrelation rebuilds the SELECT list
+        (and would lose the alias)."""
         aliases = {e.alias.lower(): e.this for e in sel.expressions if isinstance(e, sge.Alias)}
-        if where is None or not aliases:
+        if not aliases:
+            return sel
+        targets = []                                   # (the expression to rewrite, whether it is the WHERE)
+        if sel.args.get("where") is not None:
+            targets.append((sel.args["where"], True))
+        if order and sel.args.get("order") is not None:
+            targets += [(o.this, False) for o in sel.args["order"].expressions
+                        if not isinstance(o.this, sge.Column)]       # ORDER BY alias alone: the output column
+
+        def named(root):                               # bare columns spelled like an alias (a subquery has its own scope)
+            return [c for c in root.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
+                    if isinstance(c, sge.Column) and not c.table and c.name.lower() in aliases]
+        if not any(named(root) for root, _ in targets):
             return sel
         inner = {c for _, cs in self._scope_of(sel) for c in cs}
-        hits = [c for c in where.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
-                if isinstance(c, sge.Column) and not c.table and c.name.lower() not in inner
-                and c.name.lower() in aliases]
-        if not hits:
-            return sel
-        sel = sel.copy()
-        for c in [c for c in sel.args["where"].walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
-                  if isinstance(c, sge.Column) and not c.table and c.name.lower() not in inner
-                  and c.name.lower() in aliases]:
-            c.replace(sge.Paren(this=aliases[c.name.lower()].copy()))
+        if not any(c.name.lower() not in inner for root, _ in targets for c in named(root)):
+            return sel                                 # every one is a FROM column, which wins
+        if copy:
+            return self._inline_aliases(sel.copy(), False, order)
+        for root, in_where in targets:
+            for c in named(root):
+                if c.name.lower() in inner:
+                    continue
+                value = aliases[c.name.lower()]
+                if any(x is not c and isinstance(x, sge.Column) and not x.table and x.name.lower() == c.name.lower()
+                       for x in value.walk()):
+                    raise ValueError(f"{c.name} is defined in terms of itself ({value.sql(dialect='duckdb')}) and "
+                                     "no column of the FROM clause has that name")
+                if in_where and (_aggs_in(value) or value.find(sge.Window) is not None):
+                    raise ValueError(f"{c.name} is {value.sql(dialect='duckdb')}: aggregate and window functions "
+                                     "are not allowed in WHERE")
+                c.replace(sge.Paren(this=value.copy()))
         return sel
 
     def _select_subqueries(self, plan: LogicalPlan, node: sge.Select) -> LogicalPlan:
@@ -1486,7 +1663,7 @@ class _SQLTranslator:
         for e in node.expressions:
             for n in e.walk(prune=lambda x: isinstance(x, (sge.Subquery, sge.Exists))):
                 if isinstance(n, sge.Subquery) and isinstance(n.this, sge.Select) \
-                        and self._outer_refs(self._unalias_where(n.this), self._scope_of(n.this)):
+                        and self._outer_refs(self._inline_aliases(n.this), self._scope_of(n.this)):
                     found.append(n)
         if not found:
             return plan
@@ -1495,7 +1672,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"a {what} together with GROUP BY or aggregates in the outer query is not "
                                       "supported (compute the aggregate in a subquery first)")
         for sub in found:
-            sel = self._unalias_where(sub.this)
+            sel = self._inline_aliases(sub.this)
             self._check_scalar(sel, what)
             keys, rest = self._correlation(sel, what)
             i = next(self._ids)
@@ -1522,7 +1699,10 @@ class _SQLTranslator:
 
     def _where(self, plan: LogicalPlan, cond: sge.Expression) -> LogicalPlan:
         """WHERE: plain conditions as one Filter; IN / EXISTS subqueries (top-level AND conditions) as semi /
-        anti joins, a correlated scalar comparison as a join with the per-key aggregate."""
+        anti joins, a correlated scalar comparison as a join with the per-key aggregate. A condition decided at
+        plan time (F-122) is only ever FALSE or NULL here (a TRUE one was dropped): no row stays."""
+        if isinstance(cond, (sge.Boolean, sge.Null)):
+            return Filter(plan, self._never(self._columns_of(plan)[0]))
         forms, plain = [], []
         for c in _conjuncts(cond):
             f = self._subquery_form(c)
@@ -1545,6 +1725,11 @@ class _SQLTranslator:
         if before is not None:
             plan = Project(plan, [col(n) for n in before])      # drop the columns a decorrelation added
         return plan
+
+    @staticmethod
+    def _never(column: str) -> Expr:
+        """A predicate that is FALSE on every row (the engine's Filter takes an array, not a scalar)."""
+        return col(column).is_null() & ~col(column).is_null()
 
     def _hoist_slices(self, plan: LogicalPlan, pred: Expr):
         """A substring of a column inside a WHERE condition becomes a column computed below the Filter, as the
@@ -1587,7 +1772,7 @@ class _SQLTranslator:
             for side in (c.this, c.expression):
                 side = _unparen(side)
                 if isinstance(side, sge.Subquery) and isinstance(side.this, sge.Select) \
-                        and self._outer_refs(self._unalias_where(side.this), self._scope_of(side.this)):
+                        and self._outer_refs(self._inline_aliases(side.this), self._scope_of(side.this)):
                     return "scalar", c, False
         return None
 
@@ -1596,7 +1781,7 @@ class _SQLTranslator:
         sel = node.this
         if not isinstance(sel, sge.Select):
             raise NotImplementedError(f"{what} over a {type(sel).__name__} is not supported")
-        sel = self._unalias_where(sel)
+        sel = self._inline_aliases(sel)
         _unsupported_shape(sel, what)
         keys, rest = self._correlation(sel, what)
         if not keys:         # no outer column: there are rows or there are none
@@ -1620,7 +1805,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what}: the left side must be a plain column, got {x.sql(dialect='duckdb')}")
         if len(sel.expressions) != 1:
             raise ValueError(f"{what}: the subquery must return one column, it returns {len(sel.expressions)}")
-        sel = self._unalias_where(sel)
+        sel = self._inline_aliases(sel)
         item = sel.expressions[0]
         if isinstance(item, sge.Star):
             raise NotImplementedError(f"{what}: SELECT * in the subquery is not supported (name the column)")
@@ -1802,7 +1987,8 @@ class _SQLTranslator:
         if name is not None:
             return col(name)
         if isinstance(node, sge.Column):
-            src = None if node.table else self._out_src.get(_ci_find(self._out_src, node.name))
+            src = None if node.table or (self._order_expr and _ci_find(self._scope_columns, node.name)) \
+                else self._out_src.get(_ci_find(self._out_src, node.name))
             if src is None:
                 raise ValueError(f"column {node.sql(dialect='duckdb')} must appear in the GROUP BY clause "
                                  "or inside an aggregate function")
@@ -1915,7 +2101,8 @@ class _SQLTranslator:
         # HAVING and ORDER BY, above the Aggregate (they may need aggregates the SELECT list lacks)
         self._post = True
         try:
-            having_expr = self._expr(having.this) if having else None
+            decided = having is not None and isinstance(having.this, (sge.Boolean, sge.Null))
+            having_expr = self._expr(having.this) if having and not decided else None
             order_node = node.args.get("order")
             if order_node:
                 by = []
@@ -1927,7 +2114,11 @@ class _SQLTranslator:
                     elif isinstance(ref, sge.Column) and not ref.table and _ci_find(self._out_src, ref.name):
                         by.append(col(self._out_src[_ci_find(self._out_src, ref.name)]))   # a SELECT output name
                     else:
-                        ex = self._expr(ref)
+                        self._order_expr = True
+                        try:
+                            ex = self._expr(ref)
+                        finally:
+                            self._order_expr = False
                         if ex.op != "col":              # Sort takes columns: compute the expression first
                             sig = ex.signature()
                             nm = next((c for c, e in calcs if e.signature() == sig), None)
@@ -1979,6 +2170,8 @@ class _SQLTranslator:
             frame += [nm for nm, _ in calcs]
         if having_expr is not None:
             plan = Filter(plan, having_expr)
+        elif decided:                                  # HAVING FALSE / NULL (F-122): no group stays
+            plan = Filter(plan, self._never(frame[0]))
 
         if [src for _, src in outs] == frame and [o for o, _ in outs] == frame:
             return plan, None
@@ -1997,9 +2190,7 @@ class _SQLTranslator:
             inner = e.this
         else:
             inner = e
-        mx = self._value(inner)             # a DATE constant that is an output is a date32 (F-115)
-        if isinstance(inner, sge.Extract):
-            mx = _exact_lit(mx)             # EXTRACT(YEAR FROM DATE '..') is an integer
+        mx = _exact_lit(self._value(inner))      # a DATE constant is a date32 (F-115), an integer one an int (F-118)
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:
@@ -2041,6 +2232,9 @@ class _SQLTranslator:
             what = "EXISTS (SELECT ...)" if isinstance(node, sge.Exists) else "IN (SELECT ...)"
             raise NotImplementedError(f"{what} is supported only as a condition joined by AND at the top of WHERE "
                                       "(it becomes a semi / anti join); not inside OR, NOT (...), CASE, SELECT or HAVING")
+        if isinstance(node, sge.Null) and isinstance(node.parent, (sge.And, sge.Or, sge.Not, sge.Paren)) and self._cur_cols:
+            # a NULL condition next to a real one under a NOT (F-122): a boolean that is NULL on every row
+            return when(self._never(self._cur_cols[0]), lit(True))
         d = _date_of(node)
         if d is not None:                                   # next to a date32 column a date, else a day number
             return lit(d) if self._date_lit else lit((d - _EPOCH).days)
