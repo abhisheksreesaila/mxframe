@@ -662,6 +662,11 @@ class GraphCompiler:
             if col_arr.type in (pa.int32(), pa.int64()):
                 return pc.cast(pc.divide(col_arr, _npscalar(10000, type=pa.int32())), pa.int32())
             return pc.year(col_arr)
+        if op == "year_days":                  # int32 day numbers (TPC-H layout) -> date32 -> year; NULL stays NULL (F-119)
+            col_arr = GraphCompiler._eval_predicate(args[0], table)
+            if pa.types.is_integer(col_arr.type):
+                col_arr = pc.cast(pc.cast(col_arr, pa.int32()), pa.date32())
+            return pc.cast(pc.year(col_arr), pa.int32())
         if op in ("and", "or", "__and__", "__or__"):
             lhs = GraphCompiler._eval_predicate(args[0], table)
             rhs = GraphCompiler._eval_predicate(args[1], table)

@@ -185,6 +185,10 @@ def _can_be_null(expr) -> bool:
         if (expr.op == "isin" and isinstance(expr.args[1], (list, tuple))
                 and any(v is None for v in expr.args[1])):       # x IN (.., NULL) is TRUE or NULL (F-114)
             return True
+        if expr.op == "mod":                                     # a zero divisor gives NULL (F-125); a literal other than 0 never does
+            d = expr.args[1]
+            if not (isinstance(d, Expr) and d.op == "lit" and d.args[0] not in (None, 0)):
+                return True
         return any(_can_be_null(a) for a in expr.args)
     return isinstance(expr, (list, tuple)) and any(_can_be_null(a) for a in expr)
 
