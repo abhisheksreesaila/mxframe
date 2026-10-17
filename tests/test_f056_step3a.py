@@ -623,7 +623,7 @@ def test_memory_held_elsewhere_lowers_the_size_at_which_a_merge_spills(_env):
     results = {}
     for held in (0, 2_000_000):
         root = spill.SpillDir()
-        state = streamed._State(spec, 4_000_000, None, root, held=lambda h=held: h)
+        state = streamed._State(spec, 4_000_000, root, held=lambda h=held: h)
         state.add(partial)
         state.add(partial)
         state.merge()

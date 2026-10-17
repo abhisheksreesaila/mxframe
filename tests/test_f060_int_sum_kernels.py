@@ -148,3 +148,29 @@ def test_the_fused_join_sums_in_int64(monkeypatch):
     assert got.schema.field("sv").type == pa.int64() and got.schema.field("sb").type == pa.int64()
     want = con.execute("select g, sum(v), sum(bonus) from fact join dim using (k) group by g order by g").fetchall()
     assert [(r["g"], r["sv"], r["sb"]) for r in got.to_pylist()] == [(g, int(a), int(b)) for g, a, b in want]
+
+
+# -- ORDER BY and HAVING on a sum past 2^53 -------------------------------------------------------------
+
+@pytest.mark.parametrize("native", ["1", "0"], ids=["native", "pipeline"])
+def test_order_by_and_having_on_sums_past_2_53_are_exact(monkeypatch, native):
+    """Group totals 2^54 + 1 .. 2^54 + 40 differ by less than a double's spacing there (4), so a sort or a comparison
+    on doubles ties or misorders them. The executor declines such a sort / HAVING and the exact path answers."""
+    monkeypatch.setenv("MXFRAME_NATIVE", native)
+    if native == "1" and not nx.available():
+        pytest.skip("libmxexec_cpu.so not built")
+    perm = np.random.default_rng(1).permutation(40)
+    rows_g, rows_v = [], []
+    for k in perm:
+        rows_g += [int(k)] * 4
+        rows_v += [1 << 52, 1 << 52, 1 << 52, (1 << 52) + int(k) + 1]          # the group sums to 2^54 + k + 1
+    t = pa.table({"g": A(np.array(rows_g, dtype=np.int64)), "v": A(np.array(rows_v, dtype=np.int64))})
+    con = duckdb.connect()
+    con.register("t", t)
+    limit = (1 << 54) + 20
+    want = con.execute(f"select g, sum(v) s from t group by g having sum(v) > {limit} order by s desc").fetchall()
+    assert [s_ for _, s_ in want] == [(1 << 54) + k + 1 for k in range(39, 19, -1)]
+    lf = (LazyFrame(t).groupby("g").agg(col("v").sum().alias("s")).filter(col("s") > lit(limit)).sort("s", descending=True))
+    got = lf.compute(device="cpu")
+    assert got.schema.field("s").type == pa.int64()
+    assert [(r["g"], r["s"]) for r in got.to_pylist()] == [(g_, int(s_)) for g_, s_ in want]
