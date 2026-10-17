@@ -126,11 +126,17 @@ def _align_literals(lhs, rhs):
     own precision is what DuckDB does on DECIMAL and what NumPy 2 does."""
     def is_f32(x):
         return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float32(x.type)
+    def is_f64(x):
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float64(x.type)
     r, l = _numeric_literal(rhs), _numeric_literal(lhs)
     if r is not None and is_f32(lhs):
-        rhs = _npscalar(r, type=pa.float32())
+        rhs = _npscalar(float(r), type=pa.float32())
     elif l is not None and is_f32(rhs):
-        lhs = _npscalar(l, type=pa.float32())
+        lhs = _npscalar(float(l), type=pa.float32())
+    elif r is not None and is_f64(lhs):                  # an integer past 2**53: Arrow refuses the implicit cast, DuckDB rounds
+        rhs = _npscalar(float(r), type=pa.float64())
+    elif l is not None and is_f64(rhs):
+        lhs = _npscalar(float(l), type=pa.float64())
     return lhs, rhs
 
 
