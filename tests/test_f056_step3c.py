@@ -574,3 +574,15 @@ def test_median_quantile_stddev_and_variance_are_refused_by_name_not_with_a_key_
     for q in ("median(x)", "stddev(x)", "var_samp(x)", "quantile_cont(x, 0.5)"):
         with pytest.raises(NotImplementedError, match="Unsupported aggregate function"):
             mx.sql(f"SELECT g, {q} FROM t GROUP BY g", t=t)
+
+
+def test_reproducible_mode_gives_the_same_bits_for_a_spilled_count_distinct_and_a_sorted_sink(dist, messy, tmp_path, monkeypatch):
+    q = "SELECT g, count(DISTINCT x) AS nd, sum(v) AS sv, avg(v) AS av FROM dist GROUP BY g"
+    first = run(mx.sql(q, dist=scan_parquet(dist)), "cpu", reproducible=True)
+    again = run(mx.sql(q, dist=scan_parquet(dist)), "cpu", reproducible=True)
+    assert first.to_pylist() == again.to_pylist() and first.num_rows == KEYS + 1
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", MESSY_HOST)
+    for name in ("a", "b"):
+        sink(scan_parquet(messy).select("id", "f", "v").sort("f", "id"), str(tmp_path / f"{name}.parquet"), reproducible=True)
+    assert pq.read_table(str(tmp_path / "a.parquet")).column("id").to_pylist() == \
+        pq.read_table(str(tmp_path / "b.parquet")).column("id").to_pylist()
