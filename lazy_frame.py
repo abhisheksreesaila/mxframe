@@ -1085,41 +1085,25 @@ def _resolve_scalars(plan, device: str, strict: bool):
 
 
 def _auto_codes_decision(plan, prefer=None, placement=None):
-    """auto's decision for a COUNT(DISTINCT b) per a whose pair the source keeps as dictionary codes: the native
-    count reads them on the CPU, as device="cpu" does (F-046h, F-058), and the GPU path cannot. Taken on the plan
-    before it is resolved, by compute and explain alike, so the two agree and the plan is resolved with codes only
-    when this says so. None (decode as before, the cost model decides) when the caller steers to the GPU, when a
-    join or anything but filters and selects sits between the pair and its source, or when the source keeps
-    neither column as a dictionary (asked of the Parquet reader from metadata, never guessed from the type)."""
+    """auto runs a COUNT(DISTINCT b) per a on the native CPU count, as device="cpu" does, with the pair resolved as
+    dictionary codes wherever the source keeps them (F-046h, F-058). The GPU path decodes and loses this shape by
+    far (SF10, 100k keys: 6.7 s against 0.66 s), so it is not priced. Decided from the plan's shape alone, by compute
+    and explain alike; None (the cost model decides) when the caller steers to the GPU."""
     from . import auto_mode as _am
-    from .io_parquet import count_distinct_shape, dictionary_columns
+    from .io_parquet import count_distinct_shape
     if prefer == "gpu" or "gpu" in (placement or {}).values():
         return None
     stack = [plan]
     while stack:
         p = stack.pop()
-        if count_distinct_shape(p) and _pair_is_coded(p, dictionary_columns):
-            d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
-            d.cpu_path = "native executor (count distinct on codes)"
+        if count_distinct_shape(p):
+            d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key: the native cpu count (on dictionary codes where "
+                                        "the source keeps them)", None)
+            d.cpu_path = "native executor (count distinct)"
             return d
         stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
                      if x is not None)
     return None
-
-
-def _pair_is_coded(agg, dictionary_columns) -> bool:
-    arg = agg.aggs[0].args[0]
-    names = {agg.group_by[0].args[0]} | ({arg.args[0]} if arg.op == "col" else set())
-    src = agg.input.input                               # below the Distinct: the pair's select, filters, the source
-    while isinstance(src, (Project, Filter)):
-        src = src.input
-    if isinstance(src, Scan):
-        return any(pa.types.is_dictionary(src.table.schema.field(n).type) for n in names if n in src.table.column_names)
-    if isinstance(src, ParquetScan):
-        return bool(dictionary_columns(src.path, src.schema, src.dictionary, src.max_dictionary_bytes,
-                                       [n for n in names if n in src.schema.names]))
-    return False                                        # a join (or anything else) between: decode, price it
-
 
 def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,
                    auto: bool = False):

@@ -152,7 +152,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
     </div>
     <div class="callout">
       <h3>COUNT(DISTINCT) per key always runs on the CPU under auto</h3>
-      <p>Counting on dictionary codes is a native CPU path (F-046h). Since F-058, <code>auto</code> resolves a COUNT(DISTINCT b) per a with the codes too and, when the source keeps the counted pair as dictionary codes (asked of the Parquet reader; no join in between), runs it on the CPU without pricing the GPU: the GPU path needs the columns decoded, and at SF10 it took 6.7 s against 0.66 s on codes. With <code>prefer="gpu"</code> or a GPU placement the columns are decoded and the cost model decides as before.</p>
+      <p>Counting on dictionary codes is a native CPU path (F-046h). Since F-058, <code>auto</code> runs every COUNT(DISTINCT b) per a on the native CPU count, as <code>device="cpu"</code> does, with the pair resolved as codes wherever the source keeps them (the Parquet reader decides; otherwise the count reads plain values). The GPU is not priced for this shape: its path decodes the columns, and at SF10 it took 6.7 s against 0.66 s. With <code>prefer="gpu"</code> or a GPU placement the columns are decoded and the cost model decides as before.</p>
       <p class="chk">check: lazy_frame.py cd_codes = device == "cpu" or codes_decision is not None</p>
     </div>
     <div class="callout">

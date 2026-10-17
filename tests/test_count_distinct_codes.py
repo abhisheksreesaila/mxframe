@@ -238,18 +238,20 @@ def test_other_devices_see_decoded_columns(seen, device):
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
 
 
+CD = "COUNT(DISTINCT) per key: the native cpu count"
+
+
 @pytest.mark.parametrize("rows", [30_000, 400_000])          # under and over auto's small-input shortcut
 def test_auto_counts_on_codes_like_cpu(seen, rows):
     """F-058: auto resolved the plan with decoded columns, so COUNT(DISTINCT) per key decoded the counted strings
     first (J4 at SF10: the GPU path took 6.7 s, the CPU on codes 0.66 s). The shape now runs as device="cpu"."""
-    import mxframe as mx
     t = _table(n=rows)
     lf = LazyFrame(t).filter(col("d") < lit(70)).select("a", "s").distinct().groupby("a").agg(col("s").count().alias("n"))
     got = lf.compute(device="auto")
     _same(got, _duck("SELECT a, COUNT(DISTINCT s) FROM t WHERE d < 70 GROUP BY a", t=t), "a")
     assert seen and seen[0][0] == ("int64", "dictionary")
     assert lf.last_compile_provenance["auto_device"] == "cpu"
-    assert "dictionary codes" in lf.last_compile_provenance["auto_reason"]
+    assert lf.last_compile_provenance["auto_reason"].startswith(CD)
 
 
 def test_auto_steered_to_the_gpu_decodes(seen):
@@ -260,56 +262,57 @@ def test_auto_steered_to_the_gpu_decodes(seen):
     exp = _duck("SELECT a, COUNT(DISTINCT s) FROM t WHERE d < 70 GROUP BY a", t=t)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)   # no ORDER BY: any order
     assert all("dictionary" not in types for types, _ in seen)
-    assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
+    assert not lf.last_compile_provenance["auto_reason"].startswith(CD)
 
 
-def test_auto_with_plain_columns_is_priced_by_the_cost_model(seen):
-    t = _table(n=30_000)
-    lf = LazyFrame(t).select("a", "p").distinct().groupby("a").agg(col("p").count().alias("n"))
-    got = lf.compute(device="auto")
-    _same(got, _duck("SELECT a, COUNT(DISTINCT p) FROM t GROUP BY a", t=t), "a")
-    assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
-
-
-@pytest.mark.parametrize("source,counted,coded", [("memory", "s", True), ("memory", "p", False),
-                                                  ("parquet", "p", True), ("parquet", "d", False),
-                                                  ("parquet", "h", False),          # dictionary over 64 KB
-                                                  ("parquet-plain", "p", False),    # written without dictionaries
-                                                  ("parquet-nodict", "p", False)])  # scan_parquet(dictionary=False)
-def test_explain_says_what_compute_does(seen, tmp_path, source, counted, coded):
-    """F-128 review: explain treated every unread Parquet file as coded (an int-only Q16 shape said "codes" while
-    compute priced it). A string column read from Parquet is kept as a dictionary; an int one is not."""
+def _parquet_or_memory(tmp_path, source):
     import mxframe as mx
     import pyarrow.parquet as pq
     t = _table(n=400_000)
-    if source.startswith("parquet"):
-        t = t.append_column("h", pa.array([f"high-cardinality value {i:08d}" for i in range(t.num_rows)]))
-        pq.write_table(t.select(["a", "p", "d", "h"]), tmp_path / "t.parquet", use_dictionary=source != "parquet-plain")
-        base = mx.scan_parquet(str(tmp_path / "t.parquet"), **({"dictionary": False} if source == "parquet-nodict" else {}))
-    else:
-        base = LazyFrame(t)
-    lf = base.select("a", counted).distinct().groupby("a").agg(col(counted).count().alias("n"))
+    if source == "memory":
+        return t, LazyFrame
+    t = t.append_column("h", pa.array([f"high-cardinality value {i:08d}" for i in range(t.num_rows)]))
+    pq.write_table(t.select(["a", "p", "d", "h"]), tmp_path / "t.parquet", use_dictionary=source != "parquet-plain")
+    lf = mx.scan_parquet(str(tmp_path / "t.parquet"), **({"dictionary": False} if source == "parquet-nodict" else {}))
+    return t, lambda _t: lf
+
+
+# (source, plan, SQL filter, what the native count receives): coded only where the reader keeps the pair as codes (F-128 review)
+SHAPES = [
+    ("memory", lambda b: b.select("a", "s").distinct(), "", ("int64", "dictionary")),
+    ("memory", lambda b: b.select("a", "p").distinct(), "", ("int64", "string")),
+    ("parquet", lambda b: b.select("a", "p").distinct(), "", ("int64", "dictionary")),
+    ("parquet", lambda b: b.select("a", "d").distinct(), "", ("int64", "int32")),
+    ("parquet", lambda b: b.select("a", "h").distinct(), "", ("int64", "string")),          # dictionary over 64 KB
+    ("parquet-plain", lambda b: b.select("a", "p").distinct(), "", ("int64", "string")),    # written without dictionaries
+    ("parquet-nodict", lambda b: b.select("a", "p").distinct(), "", ("int64", "string")),   # dictionary=False
+    ("parquet", lambda b: b.select("a", "p").filter(col("a") > lit(5)).distinct(), " WHERE a > 5",
+     ("int64", "string")),                                                                   # a filter above the select
+    ("parquet", lambda b: b.filter(col("p") == col("p")).select("a", "p").distinct(), " WHERE p = p",
+     ("int64", "string")),                                                                   # a column-to-column filter
+]
+
+
+@pytest.mark.parametrize("i", range(len(SHAPES)))
+def test_auto_runs_the_native_count_and_explain_says_so(seen, tmp_path, i):
+    """explain and compute name the same path, the native count gets codes exactly where the source keeps them,
+    and the answer equals DuckDB's on every shape."""
+    source, shape, where, received = SHAPES[i]
+    t, base = _parquet_or_memory(tmp_path, source)
+    pair = shape(base(t))
+    b = [n for n in pair.schema.names if n != "a"][0]
+    lf = pair.groupby("a").agg(col(b).count().alias("n"))
     text = lf.explain(device="auto")
-    lf.compute(device="auto")
-    reason = lf.last_compile_provenance["auto_reason"]
-    assert reason in text
-    assert ("dictionary codes" in reason) == coded
-
-
-def test_a_dictionary_column_elsewhere_in_the_plan_does_not_count(seen):
-    """Only the counted pair matters: a dictionary column used in a filter leaves an int pair to the cost model."""
-    t = _table(n=30_000)
-    lf = (LazyFrame(t).filter(col("s") == lit("MAIL")).select("a", "v").distinct().groupby("a")
-          .agg(col("v").count().alias("n")))
     got = lf.compute(device="auto")
-    exp = _duck("SELECT a, COUNT(DISTINCT v) FROM t WHERE s = 'MAIL' GROUP BY a", t=t)
+    exp = _duck(f"SELECT a, COUNT(DISTINCT {b}) FROM t{where} GROUP BY a", t=t)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
-    assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
+    reason = lf.last_compile_provenance["auto_reason"]
+    assert reason.startswith(CD) and reason in text
+    assert seen and seen[0][0] == received
 
 
-def test_a_shared_column_name_across_a_join_is_priced(seen):
-    """F-128 review: the left s is int64, the right s a dictionary (it becomes s_right); the count reads the left
-    one, so nothing is coded and the cost model decides."""
+def test_a_shared_column_name_across_a_join_counts_the_left_column(seen):
+    """The left s is int64, the right s a dictionary (it becomes s_right); the count reads the left one."""
     r = np.random.default_rng(3)
     left = pa.table({"k": A(np.arange(40_000) % 500), "a": A(r.integers(0, 50, 40_000)), "s": A(r.integers(0, 9, 40_000))})
     right = pa.table({"k": A(np.arange(500)), "s": _dict_chunks([WORDS[i % 8] for i in range(500)], 1, 4)})
@@ -319,5 +322,5 @@ def test_a_shared_column_name_across_a_join_is_priced(seen):
     got = lf.compute(device="auto")
     exp = _duck("SELECT a, COUNT(DISTINCT l.s) FROM l JOIN r USING (k) GROUP BY a", l=left, r=right)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
-    reason = lf.last_compile_provenance["auto_reason"]
-    assert "dictionary codes" not in reason and reason in text
+    assert lf.last_compile_provenance["auto_reason"] in text
+    assert all("dictionary" not in types for types, _ in seen)
