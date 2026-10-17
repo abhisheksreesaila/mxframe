@@ -1032,7 +1032,7 @@ Found by the F-082 developer (2026-10-16)
 - Review round 1: the minus sign is folded into the literal before the int64 range check (`_number(text, neg)`), so `-9223372036854775808` is an int64 (native declines a float constant past 2^53 against an int column, `pipeline_program._try_cmpc`); an integer literal past int64 against an integer column is a constant (`_compare`, also BETWEEN and IN; NULL stays NULL); the Arrow path compares an integer column with a float constant in double like DuckDB instead of raising (`_align_literals`); widening is decided by the expression type (`_ftype`: DOUBLE literal or float64 column, through + - * / and negation), so `g > 1e-30 * 1` and `-g < -1e-30` widen. Tests add int64 rows at 2^53+1, INT64_MAX, INT64_MIN
 - Not changed: a bare `select 0.1` still returns float32 (DuckDB: DECIMAL); `i + 99999999999999999999` is a float (DuckDB: HUGEINT, exact)
 
-## F-110 SQL float32 arithmetic keeps a FLOAT result, and float32 through functions [review]
+## F-110 SQL float32 arithmetic keeps a FLOAT result, and float32 through functions [done]
 Found in the F-106 review (2026-10-16)
 - [x] float32 arithmetic runs in double while DuckDB keeps a FLOAT result, so `g * 0.5 > 0.05`, `g + 0.1 > 0.2` and `g * 2 = 0.2` on a float32 column differ from DuckDB on boundary rows (wrong on main too; repro `/tmp/rv106_f110.py`). Round each float32 intermediate to float32 (or compare at float32) on every path
 - [x] a float32 column through a function (`abs(g)`, `coalesce(g, 0)`, `cast(g as float)`) raises "Unsupported SQL expression type"; once supported, `_ftype` must give them the argument's type so `abs(g) > 1e-30` widens
@@ -1043,6 +1043,9 @@ Found in the F-106 review (2026-10-16)
 - Not done: `count(*) FILTER (WHERE ..)` is unsupported in the SQL front end (tests use CASE); float32 `%` is not rounded.
 
 
+- Review (2026-10-17): PASS. Trade-off recorded: SQL rounds float32 arithmetic like DuckDB, the DataFrame API still computes float32 in double, so SQL and DataFrame Q1 differ by ~1e-8 and SQL is now further from the exact DECIMAL answer (Q1 1.6e-9 -> 1.2e-8, Q3 2e-8 -> 5.4e-8; still 18x under the 1e-6 tolerance; equal to DuckDB on the same float32 Parquet)
+- [ ] quiet-machine check: SQL Q1 / Q3 on cpu against main (each float32 op adds an OP_F32 pass; Q1 charge goes from 4 to ~8 ops); expected a few percent on CPU, ~free on GPU
+- [ ] follow-ups: `test_aggregate` asserts result types (MIN / MAX FLOAT, SUM / AVG DOUBLE) via `typeof`; `count(*) FILTER (WHERE ...)` unsupported in SQL; float32 `%` (probe suggests it already matches DuckDB; pin with one test)
 ## F-107 Test process hangs on a futex while other suites share the GPUs [done]
 Seen four times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run, F-103 developer): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes
 - [ ] (no dump was ever captured) capture a stack: the test runner now dumps all threads after 15 minutes stuck (`faulthandler_timeout=900`); keep suite output in a file (lessons). ptrace is blocked here, so the dump is the only way
