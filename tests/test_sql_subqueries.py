@@ -258,7 +258,7 @@ UNSUPPORTED = [
     ("SELECT k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.y <> t.x)", "correlated predicate"),
     ("SELECT k FROM t WHERE v > (SELECT AVG(y) FROM u WHERE u.k < t.k)", "correlated predicate"),
     ("SELECT k FROM t WHERE k NOT IN (SELECT k FROM u WHERE u.w = t.v)", "NOT IN"),
-    ("SELECT k, (SELECT AVG(y) FROM u WHERE u.k = t.k) AS a FROM t", "correlated scalar subquery"),
+    ("SELECT k, count(*), (SELECT AVG(y) FROM u WHERE u.k = t.k) AS a FROM t GROUP BY k", "correlated scalar subquery"),
     ("SELECT k FROM t WHERE v > (SELECT k, v FROM t)", "one column"),
     ("SELECT k FROM t WHERE v > (SELECT v FROM t)", "single aggregate"),
     ("SELECT k FROM t WHERE v > (SELECT AVG(v) FROM t GROUP BY s)", "single aggregate"),
@@ -271,7 +271,7 @@ UNSUPPORTED = [
     ("SELECT k, v FROM t WHERE v > (SELECT COALESCE(MAX(y), 1) FROM u WHERE u.k = t.k)", "COALESCE"),
     ("SELECT k, v FROM t WHERE v > (SELECT MAX(y) IS NULL FROM u WHERE u.k = t.k)", "IS NULL"),
     ("SELECT k, v FROM t WHERE k IN (SELECT y / 2 FROM u)", "float"),
-    ("SELECT k FROM t, u JOIN un ON u.k = un.k WHERE t.k = u.k", "mixed with JOIN"),
+    ("SELECT t.k FROM t, u JOIN un ON u.k = un.k WHERE t.k = u.k", "mixed with JOIN"),
     ("WITH a(x, y) AS (SELECT k, v FROM t) SELECT x FROM a", "column list"),
     ("WITH RECURSIVE a AS (SELECT k FROM t) SELECT k FROM a", "RECURSIVE"),
 ]
