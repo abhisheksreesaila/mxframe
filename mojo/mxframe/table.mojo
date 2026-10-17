@@ -248,7 +248,8 @@ struct SharedTable(ImplicitlyCopyable):
         return self._table[].null_count(c)
 
     def values(self, c: Int) -> Span[Int64, origin_of(self)]:
-        """The column's values, read-only, without a copy; the span lives no longer than this handle."""
+        """The column's values, read-only, without a copy; the span lives no longer than this handle. Do not reassign
+        or drop the handle while using its spans (if it held the last reference, the columns are freed)."""
         var p = Pointer[Int64, origin_of(self)](unsafe_from_address=Int(self._table[].cols[c].values.unsafe_ptr()))
         return Span[Int64, origin_of(self)](unsafe_ptr=p, length=len(self._table[].cols[c].values))
 

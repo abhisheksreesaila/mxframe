@@ -88,6 +88,14 @@ comptime OP_ISUB = 16
 comptime OP_IMUL = 17
 comptime OP_F2I = 18        # dst = int64(a): a float register of whole numbers within +-2^53
 comptime OP_I2F = 19        # dst = float64(a) of an "int" register; a value outside +-2^53 sets *ovf
+# Exact integer operations over "int" registers, for the Mojo API (docs/mxframe-mojo-api.md: formulas, bins, int64
+# filters). The Python compiler does not emit them. Division and modulo follow Mojo's Int64 (floor, the remainder
+# takes the divisor's sign) and give 0 for a zero divisor, as the app's formula columns do.
+comptime OP_IDIV = 42       # dst = a // b
+comptime OP_IMOD = 43       # dst = a % b
+comptime OP_IMIN = 44       # dst = min(a, b)
+comptime OP_IMAX = 45       # dst = max(a, b)
+comptime OP_ICMP = 46       # dst = 1.0 if a <cmp> b else 0.0, cmp in operand c (OP_LT .. OP_NE): a float register
 comptime OP_LT = 20
 comptime OP_LE = 21
 comptime OP_GT = 22
@@ -240,6 +248,34 @@ def _i2f(d: FP, a: FP, n: Int, ovf: LP):
         if v > LIM53 or v < -LIM53:
             ovf[0] = 1
         i += 1
+
+def _int_op2[OP: Int](d: FP, a: FP, b: FP, cmp: Int, n: Int, ovf: LP):
+    """OP_IDIV / OP_IMOD / OP_IMIN / OP_IMAX / OP_ICMP over the first n lanes of two "int" registers. INT64_MIN // -1
+    does not fit: *ovf is set (the caller's exact path or error answers)."""
+    var dd = _ibits(d)
+    var xa = _ibits(a)
+    var xb = _ibits(b)
+    for i in range(n):
+        var x = xa[i]
+        var y = xb[i]
+        comptime if OP == OP_IDIV:
+            if y == 0:
+                dd[i] = 0
+            elif y == -1 and x == Int64.MIN:
+                ovf[0] = 1
+                dd[i] = x
+            else:
+                dd[i] = x // y
+        elif OP == OP_IMOD:
+            dd[i] = 0 if y == 0 or y == -1 else x % y
+        elif OP == OP_IMIN:
+            dd[i] = min(x, y)
+        elif OP == OP_IMAX:
+            dd[i] = max(x, y)
+        else:
+            var r = (x < y) if cmp == OP_LT else (x <= y) if cmp == OP_LE else (x > y) if cmp == OP_GT else \
+                    (x >= y) if cmp == OP_GE else (x == y) if cmp == OP_EQ else (x != y)
+            d[i] = 1.0 if r else 0.0
 
 def _fill_identity(base: FP, count: Int, kind: Int):
     """`count` slot words at their aggregate's identity: 0 for sums, +-inf for float extremes, INT64_MAX / INT64_MIN
@@ -862,6 +898,19 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
                 _f2i(d, regs + Int(ins[2]) * VEC, n)
             else:
                 _i2f(d, regs + Int(ins[2]) * VEC, n, p.ovf)
+        elif op >= OP_IDIV and op <= OP_ICMP:
+            var ra = regs + Int(ins[2]) * VEC
+            var rb = regs + Int(ins[3]) * VEC
+            if op == OP_IDIV:
+                _int_op2[OP_IDIV](d, ra, rb, 0, n, p.ovf)
+            elif op == OP_IMOD:
+                _int_op2[OP_IMOD](d, ra, rb, 0, n, p.ovf)
+            elif op == OP_IMIN:
+                _int_op2[OP_IMIN](d, ra, rb, 0, n, p.ovf)
+            elif op == OP_IMAX:
+                _int_op2[OP_IMAX](d, ra, rb, 0, n, p.ovf)
+            else:
+                _int_op2[OP_ICMP](d, ra, rb, Int(ins[4]), n, p.ovf)
         elif op < OP_NOT:
             _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad, Int(ins[4]) != 0)
         elif op == OP_NOT:
