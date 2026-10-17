@@ -195,11 +195,18 @@ def test_a_streamed_result_has_the_dtypes_of_the_in_memory_one(files, monkeypatc
 def types_by_budget(path, build, budgets, device="cpu"):
     """{budget: (schema, rows)} of the same query at several host budgets (so several batch counts)."""
     out = {}
-    for b, in [(b,) for b in budgets]:
-        os.environ["MXFRAME_HOST_MEM_BUDGET"] = b
-        lf = build(scan_parquet(path))
-        got = run(lf, device)
-        out[b] = (got.schema, got.sort_by(got.column_names[0]).to_pylist(), prov(lf).get("streamed", {}).get("batches"))
+    before = os.environ.get("MXFRAME_HOST_MEM_BUDGET")
+    try:
+        for b in budgets:
+            os.environ["MXFRAME_HOST_MEM_BUDGET"] = b
+            lf = build(scan_parquet(path))
+            got = run(lf, device)
+            out[b] = (got.schema, got.sort_by(got.column_names[0]).to_pylist(), prov(lf).get("streamed", {}).get("batches"))
+    finally:                   # the budget must not leak into later tests on this worker (it did, under xdist)
+        if before is None:
+            os.environ.pop("MXFRAME_HOST_MEM_BUDGET", None)
+        else:
+            os.environ["MXFRAME_HOST_MEM_BUDGET"] = before
     return out
 
 
