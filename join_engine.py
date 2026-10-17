@@ -1228,6 +1228,25 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
                  via_probe=via_probe, post_res=post_res, fact=fact)
 
 
+_UNIQUE_MEMO: dict = {}      # id(table) -> (table, {column: is it unique}); the table is held, so its id is not reused
+
+
+def _is_unique(t: pa.Table, c: str) -> bool:
+    """Is integer column ``c`` of ``t`` free of repeats? Remembered per table: a repeated query over the same
+    table does not sort the column again."""
+    from .np_arrow import to_numpy as _np_of, combine as _combine
+    entry = _UNIQUE_MEMO.get(id(t))
+    if entry is None or entry[0] is not t:
+        if len(_UNIQUE_MEMO) >= 32:
+            _UNIQUE_MEMO.clear()
+        entry = _UNIQUE_MEMO[id(t)] = (t, {})
+    known = entry[1]
+    if c not in known:
+        a = _np_of(_combine(t.column(c)), zero_copy_only=False)
+        known[c] = len(np.unique(a)) == len(a)
+    return known[c]
+
+
 def _dependent_keys(fl, plan, fact: int) -> Dict[str, str]:
     """Group columns that are plain strings of a partner table, mapped to a unique integer key of the same table
     that is also a group column (Q10: ``GROUP BY c_custkey, c_name, c_address, c_phone, c_comment``): the key
@@ -1249,8 +1268,7 @@ def _dependent_keys(fl, plan, fact: int) -> Dict[str, str]:
             col_ = t.column(c)
             if n in text or col_.null_count or not (pa.types.is_integer(col_.type) and t.num_rows):
                 continue
-            a = _np_of(_combine(col_), zero_copy_only=False)
-            if text and len(np.unique(a)) == len(a):
+            if text and _is_unique(t, c):
                 fd.update({m: n for m in text})
                 break
     return fd
@@ -1345,15 +1363,24 @@ def left_join_counts(comp, plan, post_ops) -> Optional[pa.Table]:
         if a.op != "count" or a.args[0].op != "col" or a.args[0].args[0] not in rout:
             return None
         counted.append(rout[a.args[0].args[0]])
+    # what the leaves' own scans already tell (a Filter only removes rows), before anything is materialized
+    for leaf, cols_ in ((node.left, list(node.left_on)), (node.right, counted + list(node.right_on))):
+        sc, _ = _scan_under_filters(leaf)
+        if sc is not None and (sc.table.num_rows == 0 or any(sc.table.column(c).null_count for c in cols_
+                                                              if c in sc.table.column_names)):
+            return None
     lt = leaf_table(comp, node.left, set(gnames) | set(node.left_on))
+    if lt.num_rows == 0 or any(lt.column(c).null_count for c in node.left_on):
+        return None
+    lkey = encode_keys([lt.column(c) for c in node.left_on], [lt.column(c) for c in node.left_on],
+                       comp._common_key_type)[0]
+    if len(np.unique(lkey)) != len(lkey):
+        return None                                  # several left rows per key: the groups would merge them
     rt = leaf_table(comp, node.right, set(counted) | set(node.right_on))
-    if lt.num_rows == 0 or rt.num_rows == 0 or any(rt.column(c).null_count for c in counted + list(node.right_on)) \
-            or any(lt.column(c).null_count for c in node.left_on):
+    if rt.num_rows == 0 or any(rt.column(c).null_count for c in counted + list(node.right_on)):
         return None
     lk, rk = encode_keys([lt.column(c) for c in node.left_on], [rt.column(c) for c in node.right_on],
                          comp._common_key_type)
-    if len(np.unique(lk)) != len(lk):
-        return None                                  # several left rows per key: the groups would merge them
     li, ri = comp._hash_join_left_mojo_cpu(lk, rk)
     per_row = np.bincount(li[ri >= 0], minlength=lt.num_rows).astype(np.int64)
     from .np_arrow import array as _npa

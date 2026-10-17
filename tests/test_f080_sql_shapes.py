@@ -216,3 +216,50 @@ def test_left_join_count_per_key_result_columns():
     assert out.column_names == ["c_custkey", "n"]
     assert str(out.schema.field("n").type) == "int64"
     _same(got, _duck(sql, t))
+
+
+# ---- review fixes ----------------------------------------------------------------------------
+
+def test_group_keys_from_another_partner_next_to_dependent_strings(spy):
+    sql = ("select c_custkey, c_name, s_nationkey, sum(l_price) as revenue "
+           "from customer, orders, lineitem, supplier "
+           "where c_custkey = o_custkey and o_orderkey = l_orderkey and l_suppkey = s_suppkey "
+           "group by c_custkey, c_name, s_nationkey order by revenue desc limit 20")
+    t = _tables()
+    _, got = _mx(sql, t)
+    _same(got, _duck(sql, t))
+
+
+@pytest.mark.parametrize("sql", [
+    "select ps_partkey from partsupp where ps_suppkey not in (select s_suppkey as x from supplier where s_nationkey = 1) order by 1, ps_suppkey",
+    "select ps_partkey from partsupp where ps_suppkey in (select S_SUPPKEY from supplier where s_nationkey = 1) order by 1, ps_suppkey",
+    "select ps_partkey from partsupp where ps_suppkey not in (select S_SUPPKEY from supplier where s_nationkey = 1) order by 1, ps_suppkey",
+    "select ps_partkey from partsupp where ps_suppkey in (select s_suppkey as x from supplier where s_nationkey = 1) order by 1, ps_suppkey",
+])
+def test_in_subquery_item_spelling_and_alias(sql):
+    t = _tables()
+    _, got = _mx(sql, t)
+    _same(got, _duck(sql, t))
+
+
+@pytest.mark.parametrize("name,sql,mod", [
+    ("right where", "select c_custkey, count(o_orderkey) as n from customer left join orders on c_custkey = o_custkey "
+                    "where o_orderkey % 2 = 0 group by c_custkey order by c_custkey", None),
+    ("inner", "select c_custkey, count(o_orderkey) as n from customer join orders on c_custkey = o_custkey "
+              "group by c_custkey order by c_custkey", None),
+    ("count star", "select c_custkey, count(*) as n from customer left join orders on c_custkey = o_custkey "
+                   "group by c_custkey order by c_custkey", None),
+    ("with sum", "select c_custkey, count(o_orderkey) as n, sum(o_orderkey) as s from customer left join orders "
+                 "on c_custkey = o_custkey group by c_custkey order by c_custkey", None),
+    ("null left key", "select c_custkey, count(o_orderkey) as n from customer left join orders on c_custkey = o_custkey "
+                      "group by c_custkey order by c_custkey", "null_key"),
+])
+def test_left_join_count_declines_keep_the_answer(counted, name, sql, mod):
+    t = _tables()
+    if mod == "null_key":
+        k = t["customer"].column("c_custkey").to_pylist()
+        k[5] = None
+        t["customer"] = t["customer"].set_column(0, "c_custkey", pa.array(k, type=pa.int64()))
+    _, got = _mx(sql, t)
+    _same(got, _duck(sql, t))
+    assert counted["ran"] == 0

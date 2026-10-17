@@ -1900,7 +1900,7 @@ def _try_dependent_keys(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops
         return None
     srcs = [(e._alias or e.args[0], fj.vcols[e.args[0]]) for e in plan.group_by]
     j = fj.vcols[next(iter(dep))][1]
-    if any(fj.vcols[n][0] == "partner" and fj.vcols[n][1] != j for n in dep | {fd[n] for n in dep}):
+    if any(fj.vcols[n][0] == "partner" and fj.vcols[n][1] != j for n in names):      # every partner key is j's
         return None
     b = bs[j]
     if b.num_rows > MAX_GROUPS * 64:
