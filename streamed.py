@@ -590,7 +590,7 @@ class ParquetOut:
         self.writer.write_table(t)
         self.rows += t.num_rows
 
-    def empty_table(self) -> pa.Table:
+    def no_rows(self) -> pa.Table:
         sch = self.schema or (self.empty.schema if self.empty is not None else None)
         return np_arrow.empty(sch if sch is not None else pa.schema([]))
 
@@ -751,7 +751,7 @@ class _Sink:
                 self.sort_out.write(self._post(plan, above, r))
             if not wrote and self.ext.empty is not None:             # no rows: the columns the nodes above give
                 self.sort_out.write(self._post(plan, above, self.ext.empty))
-            table = self.sort_out.empty_table()
+            table = self.sort_out.no_rows()
             return table, Scan(table)
         got, size = [], 0
         for r in self.ext.ranges():
@@ -764,7 +764,7 @@ class _Sink:
 
     def result(self) -> pa.Table:
         if self.out is not None:
-            return self.out.empty_table()
+            return self.out.no_rows()
         if self.kind == "top-k" and len(self.tables) > 1:
             self._reduce()
         return self._concat()
