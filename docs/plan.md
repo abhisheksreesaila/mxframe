@@ -1105,10 +1105,11 @@ Asked for by the user (2026-10-16), after the core benchmark. Second anxiety aft
 ## F-121 Mojo engine API without the Python front end [todo]
 From the user (2026-10-16): another project needs the Mojo engine directly, with no Python planning or SQL front end. The user will provide the spec; nothing to build until then (see also `docs/mxframe-mojo-api.md` and the "Rings" section)
 
-## F-122 SQL constant WHERE conditions [todo]
+## F-122 SQL constant WHERE conditions [review]
 Found by the F-111 / F-112 review (2026-10-16); on main too
-- [ ] `WHERE 1 = 1` / `WHERE 1 = 0` raise `ArrowTypeError: Filter should be array-like`, `WHERE TRUE` raises "Unsupported SQL expression type: Boolean" (`WHERE 1 = 1 AND a > 1` works). Fold a constant predicate: true keeps every row, false / NULL keeps none (with the right schema)
-- [ ] DuckDB-checked tests incl. constant conditions in HAVING, ON, CASE, and under NOT; fails before
+- [x] `WHERE 1 = 1` / `WHERE 1 = 0` raise `ArrowTypeError: Filter should be array-like`, `WHERE TRUE` raises "Unsupported SQL expression type: Boolean" (`WHERE 1 = 1 AND a > 1` works). Fold a constant predicate: true keeps every row, false / NULL keeps none (with the right schema)
+- [x] DuckDB-checked tests incl. constant conditions in HAVING, ON, CASE, and under NOT; fails before
+- Note (2026-10-17): decided at translation, in the SQL tree (`_fold_conditions` / `_fold_cond` / `_const_truth`, three-valued): a TRUE WHERE / HAVING is dropped, FALSE or NULL becomes a Filter that is false on every row (`_never`; keeps the columns and types; an aggregate over it still returns its one row), a decided CASE branch is dropped or ends the CASE, a FALSE / NULL conjunct in an ON filters the right side (INNER empty, LEFT keeps the left rows with NULLs), `x OR TRUE` is TRUE, `x AND FALSE` FALSE, NOT keeps NULL. Left: `WHERE (select 1) = 1` (scalar subquery of a constant), a constant condition in the SELECT list (`select 1 = 1 as b`), a typed NULL from a CASE with no branch left (comes out null-typed). Tests: tests/test_f122_constant_conditions.py (680 across cpu/gpu x native on/off).
 
 ## F-123 SQL WHERE using its own SELECT alias [review]
 Found by the F-111 / F-112 review (2026-10-16); on main too

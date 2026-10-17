@@ -130,6 +130,130 @@ def _fold_const_minmax(select: sge.Select) -> None:
 
 
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
+_UNKNOWN = object()                  # "not a constant" (None is the SQL NULL)
+
+
+def _const_scalar(n: sge.Expression):
+    """The value of a constant scalar (a number as a Decimal, a string, a bool, None for NULL), else ``_UNKNOWN``."""
+    n = _unparen(n)
+    if isinstance(n, sge.Null):
+        return None
+    if isinstance(n, sge.Boolean):
+        return bool(n.this)
+    if isinstance(n, sge.Literal):
+        try:
+            return str(n.this) if n.is_string else Decimal(str(n.this).replace("_", ""))
+        except ArithmeticError:
+            return _UNKNOWN
+    if isinstance(n, sge.Neg):
+        v = _const_scalar(n.this)
+        return -v if isinstance(v, Decimal) else _UNKNOWN
+    if isinstance(n, (sge.Add, sge.Sub, sge.Mul)):
+        a, b = _const_scalar(n.this), _const_scalar(n.expression)
+        if isinstance(a, Decimal) and isinstance(b, Decimal):
+            return a + b if isinstance(n, sge.Add) else a - b if isinstance(n, sge.Sub) else a * b
+    return _UNKNOWN
+
+
+def _const_truth(n: sge.Expression):
+    """The truth of a condition made of constants only, in SQL's three values (True, False, None = NULL), else
+    ``_UNKNOWN``. A number is true when it is not zero."""
+    n = _unparen(n)
+    v = _const_scalar(n)
+    if v is not _UNKNOWN:
+        return None if v is None else bool(v) if isinstance(v, (bool, Decimal)) else _UNKNOWN
+    if isinstance(n, sge.Not):
+        t = _const_truth(n.this)
+        return t if t is _UNKNOWN or t is None else not t
+    if isinstance(n, (sge.And, sge.Or)):
+        a, b = _const_truth(n.this), _const_truth(n.expression)
+        if a is _UNKNOWN or b is _UNKNOWN:
+            return _UNKNOWN
+        stop = isinstance(n, sge.Or)                       # the value that decides: True for OR, False for AND
+        return stop if stop in (a, b) else None if None in (a, b) else not stop
+    if isinstance(n, _COMPARE):
+        a, b = _const_scalar(n.this), _const_scalar(n.expression)
+        if a is _UNKNOWN or b is _UNKNOWN:
+            return _UNKNOWN
+        if a is None or b is None:
+            return None
+        if isinstance(a, bool) or isinstance(b, bool) or isinstance(a, str) != isinstance(b, str):
+            return _UNKNOWN
+        ops = {sge.EQ: a == b, sge.NEQ: a != b, sge.LT: a < b, sge.LTE: a <= b, sge.GT: a > b, sge.GTE: a >= b}
+        return ops[type(n)]
+    if isinstance(n, sge.Is):
+        what = n.expression
+        if isinstance(what, sge.Null):
+            v = _const_scalar(n.this)
+            return _UNKNOWN if v is _UNKNOWN else v is None
+        if isinstance(what, sge.Boolean):
+            t = _const_truth(n.this)
+            return _UNKNOWN if t is _UNKNOWN else t is not None and t == bool(what.this)
+    return _UNKNOWN
+
+
+def _bool_node(t) -> sge.Expression:
+    return sge.Null() if t is None else sge.Boolean(this=bool(t))
+
+
+def _fold_cond(n: sge.Expression, filt: bool = True) -> sge.Expression:
+    """A condition with its constant parts decided (F-122): ``1 = 1`` is TRUE, ``x AND TRUE`` is ``x``,
+    ``x OR TRUE`` is TRUE, ``NOT NULL`` is NULL. The result is a Boolean / Null node when nothing else is left.
+    ``filt``: the condition only keeps a row when it is TRUE (WHERE, HAVING, ON, a CASE branch), so NULL acts as
+    FALSE at its AND / OR level; below a NOT that no longer holds."""
+    t = _const_truth(n)
+    if t is not _UNKNOWN:
+        return _bool_node(t)
+    inner = _unparen(n)
+    if isinstance(inner, sge.Not):
+        c = _fold_cond(inner.this, False)
+        t = _const_truth(c)
+        return _bool_node(t if t is None else not t) if t is not _UNKNOWN else sge.Not(this=c)
+    if isinstance(inner, (sge.And, sge.Or)):
+        is_or = isinstance(inner, sge.Or)
+        a, b = _fold_cond(inner.this, filt), _fold_cond(inner.expression, filt)
+        ta, tb = _const_truth(a), _const_truth(b)
+        stop = is_or                                       # TRUE decides an OR, FALSE an AND
+        for t, other in ((ta, b), (tb, a)):
+            if t is stop:
+                return _bool_node(stop)
+            if t is (not stop):
+                return other                               # x AND TRUE, x OR FALSE
+            if t is None and filt:                         # NULL acts as FALSE: x OR NULL is x, x AND NULL is FALSE
+                return other if is_or else _bool_node(False)
+        return type(inner)(this=a, expression=b)
+    return n
+
+
+def _fold_conditions(select: sge.Select) -> None:
+    """Fold the constant conditions of WHERE, HAVING, every JOIN's ON and every CASE branch of ``select`` (a
+    TRUE WHERE / HAVING is dropped; what is left of a decided one is a Boolean / Null node)."""
+    for key in ("where", "having"):
+        clause = select.args.get(key)
+        if clause is not None:
+            folded = _fold_cond(clause.this)
+            select.set(key, None if _const_truth(folded) is True else type(clause)(this=folded))
+    for join in select.args.get("joins") or []:
+        if join.args.get("on") is not None:
+            join.set("on", _fold_cond(join.args["on"]))
+    cases = [c for c in select.walk(prune=lambda m: isinstance(m, (sge.Subquery, sge.Exists)))
+             if isinstance(c, sge.Case) and c.args.get("this") is None]
+    for case in reversed(cases):                           # the inner CASE first: an outer one may copy it
+        ifs, default = [], case.args.get("default")
+        for branch in case.args.get("ifs") or []:
+            cond = _fold_cond(branch.this)
+            t = _const_truth(cond)
+            if t is True:                                  # this branch always matches: the later ones never run
+                default = branch.args["true"]
+                break
+            if t is _UNKNOWN:
+                branch.set("this", cond)
+                ifs.append(branch)
+        if ifs:
+            case.set("ifs", ifs)
+            case.set("default", default)
+        else:
+            case.replace(default.copy() if default is not None else sge.Null())
 
 
 def _number(text, neg: bool = False) -> Union[int, float]:
@@ -583,6 +707,7 @@ class _SQLTranslator:
         self._register_ctes(node.args.get("with_"))
         self._resolve_names(node)
         self._inline_aliases(node, copy=False, order=True)       # WHERE kk > 0, ORDER BY h + 1 (F-117, F-123)
+        _fold_conditions(node)                                   # WHERE 1 = 1, HAVING false, CASE WHEN true (F-122)
         _fold_const_minmax(node)
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
         self._any_star = any(isinstance(e, sge.Star) or (isinstance(e, sge.Column) and isinstance(e.this, sge.Star))
@@ -1240,6 +1365,12 @@ class _SQLTranslator:
                     keys.append((b, a))
                     continue
             both_sides = sides(c)
+            if isinstance(c, (sge.Boolean, sge.Null)):         # ON ... AND FALSE / NULL (F-122): no right row matches
+                x = sge.Column(this=sge.to_identifier(min(right_schema)))
+                never = sge.And(this=sge.Is(this=x, expression=sge.Null()),
+                                expression=sge.Not(this=sge.Is(this=x.copy(), expression=sge.Null())))
+                ronly.append(never)
+                continue
             if not both_sides:
                 raise NotImplementedError(f"the JOIN condition {c.sql(dialect='duckdb')} refers to no column of "
                                           "either table")
@@ -1524,7 +1655,10 @@ class _SQLTranslator:
 
     def _where(self, plan: LogicalPlan, cond: sge.Expression) -> LogicalPlan:
         """WHERE: plain conditions as one Filter; IN / EXISTS subqueries (top-level AND conditions) as semi /
-        anti joins, a correlated scalar comparison as a join with the per-key aggregate."""
+        anti joins, a correlated scalar comparison as a join with the per-key aggregate. A condition decided at
+        plan time (F-122) is only ever FALSE or NULL here (a TRUE one was dropped): no row stays."""
+        if isinstance(cond, (sge.Boolean, sge.Null)):
+            return Filter(plan, self._never(self._columns_of(plan)[0]))
         forms, plain = [], []
         for c in _conjuncts(cond):
             f = self._subquery_form(c)
@@ -1545,6 +1679,11 @@ class _SQLTranslator:
         if before is not None:
             plan = Project(plan, [col(n) for n in before])      # drop the columns a decorrelation added
         return plan
+
+    @staticmethod
+    def _never(column: str) -> Expr:
+        """A predicate that is FALSE on every row (the engine's Filter takes an array, not a scalar)."""
+        return col(column).is_null() & ~col(column).is_null()
 
     def _subquery_form(self, c: sge.Expression):
         """(kind, node, negated) when ``c`` is a condition that becomes a join, else None."""
@@ -1873,7 +2012,8 @@ class _SQLTranslator:
         # HAVING and ORDER BY, above the Aggregate (they may need aggregates the SELECT list lacks)
         self._post = True
         try:
-            having_expr = self._expr(having.this) if having else None
+            decided = having is not None and isinstance(having.this, (sge.Boolean, sge.Null))
+            having_expr = self._expr(having.this) if having and not decided else None
             order_node = node.args.get("order")
             if order_node:
                 by = []
@@ -1941,6 +2081,8 @@ class _SQLTranslator:
             frame += [nm for nm, _ in calcs]
         if having_expr is not None:
             plan = Filter(plan, having_expr)
+        elif decided:                                  # HAVING FALSE / NULL (F-122): no group stays
+            plan = Filter(plan, self._never(frame[0]))
 
         if [src for _, src in outs] == frame and [o for o, _ in outs] == frame:
             return plan, None
