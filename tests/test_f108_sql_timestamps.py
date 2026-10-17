@@ -557,3 +557,16 @@ def test_a_float_min_max_over_a_join_does_not_materialize_the_join(monkeypatch):
     assert [r[0] for r in rows] == [w[0] for w in want]
     assert [v for r in rows for v in r[1:]] == pytest.approx([v for w in want for v in w[1:]])
     assert calls == []
+
+
+def test_min_max_over_a_join_with_clashing_column_names_equals_duckdb():
+    """F-130 review: column_types drops a name both join sides carry with different types, so MIN / MAX over the
+    renamed right column must still be rewritten (int64 past 2^53, text) after materializing the join."""
+    from mxframe import LazyFrame, col, lit
+    big = 2 ** 53
+    left = pa.table({"k": [1, 1, 2], "x": [1.5, 2.5, 3.5]})
+    right = pa.table({"k": [1, 2], "x": pa.array([big + 1, big + 3], pa.int64())})
+    lf = (LazyFrame(left).join(LazyFrame(right), on="k").groupby()
+          .agg((col("x_right") + lit(0)).max().alias("m"), (col("x_right") + lit(0)).min().alias("n")))
+    got = lf.compute(device="cpu").to_pylist()[0]
+    assert got == {"m": big + 3, "n": big + 1}

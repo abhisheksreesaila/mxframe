@@ -794,10 +794,12 @@ def _choose_device(plan, calib, gpu, prefer, placement, quick):
         if rows < SMALL_QUERY_ROWS:
             return AutoDecision("cpu", f"small input ({rows:,} rows): gpu start-up and copies cannot pay off",
                                 None)
-        if rows < COLD_GPU_SOURCE_ROWS and not gpu_warmup_started():
-            # F-058: the GPU has not started in this process, so its start-up alone costs more than this whole query
-            # on the native CPU; pricing it (calibration, key samples) cost ~3 ms of the query's clock. The warm-up
-            # is still queued, off the clock, for the queries after this one.
+        if _no_gpu:
+            return AutoDecision("cpu", "no gpu", None, gpu_available=False)
+        if not gpu_warmup_started() and _cold_cpu_bound_ms(plan, rows) < COLD_GPU_START_MS:
+            # F-058: the GPU has not started in this process, and even priced at the dearest native rates this whole
+            # query costs the CPU less than the GPU's start-up alone; pricing it (calibration, key samples) cost ~3 ms
+            # of the query's clock. The warm-up is still queued, off the clock, for the queries after this one.
             d = AutoDecision("cpu", f"gpu not started: its start-up costs more than this query on the cpu "
                                     f"({rows:,} source rows)", None)
             d.warm_later = True
@@ -836,20 +838,39 @@ def _choose_device(plan, calib, gpu, prefer, placement, quick):
 
 
 SMALL_QUERY_ROWS = 200_000   # below this, skip calibration (loading it initialises CUDA)
-# below this many source rows (all scans summed) a query costs the native CPU at most ~250 ms (10 ms per M rows, twice
-# the dearest measured native price, a join past the cache), which is the GPU's start-up alone (F-058)
-COLD_GPU_SOURCE_ROWS = 25_000_000
+# The cold-GPU shortcut (F-058): an upper bound of a query's native CPU cost against the GPU's start-up. Every operator
+# is priced at the dearest default native rate of its kind (calibration._DEFAULT_FITS, ms per M rows: a join with an
+# 8M-row build, a group-by with 1M groups, the radix sort) over all the plan's source rows; the start-up is the lowest
+# measured on the reference box (245.6 ms; the uncalibrated default is 400).
+COLD_NATIVE_MS_PER_MROW = {"join": 5.2, "aggregate": 9.5, "sort": 7.0, "filter": 0.34}
+COLD_GPU_START_MS = 240.0
+_no_gpu = False            # set once a background warm-up found no GPU: no more warm-ups are queued
+
+
+def _cold_cpu_bound_ms(plan, rows: int) -> float:
+    from .lazy_frame import Join, Aggregate, Sort, Filter
+    kinds = {Join: "join", Aggregate: "aggregate", Sort: "sort", Filter: "filter"}
+    per_row, stack = COLD_NATIVE_MS_PER_MROW["filter"], [plan]       # at least a scan's worth
+    while stack:
+        p = stack.pop()
+        k = kinds.get(type(p))
+        if k:
+            per_row += COLD_NATIVE_MS_PER_MROW[k]
+        stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
+                     if x is not None)
+    return rows / 1e6 * per_row
 
 
 def start_gpu_warmup_if_any() -> None:
-    """Start the GPU warm-up when the machine has a GPU (loads the calibration: run it off a query's clock)."""
-    try:
-        from .calibration import get_calibration
-        calib = get_calibration()
-        if getattr(calib, "has_gpu", False):
-            get_gpu_warmup(calib).start()
-    except Exception:
-        pass
+    """Start the GPU warm-up when the machine has a GPU (loads the calibration: run it off a query's clock, by
+    `coproc_fused._Background`, which also catches its errors). With no GPU, remember it: nothing more is queued."""
+    global _no_gpu
+    from .calibration import get_calibration
+    calib = get_calibration()
+    if getattr(calib, "has_gpu", False):
+        get_gpu_warmup(calib).start()
+    else:
+        _no_gpu = True
 
 
 def _source_rows(plan) -> int:

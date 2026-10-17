@@ -99,7 +99,7 @@ def test_rules_constants_match_the_code():
 
 def test_rules_cover_the_thresholds_the_explainer_uses():
     rules = _rules()["constants"]
-    for name in ("SMALL_QUERY_ROWS", "COLD_GPU_SOURCE_ROWS", "GPU_WIN_MARGIN", "PREFER_CPU_MARGIN", "JOIN_GPU_SAFETY", "IDLE_BEFORE_BACKGROUND_S",
+    for name in ("SMALL_QUERY_ROWS", "COLD_GPU_START_MS", "COLD_NATIVE_MS_PER_MROW", "GPU_WIN_MARGIN", "PREFER_CPU_MARGIN", "JOIN_GPU_SAFETY", "IDLE_BEFORE_BACKGROUND_S",
                  "MIN_UPLOAD_BYTES", "MIN_SHARE", "DEFAULT_GPU_ALPHA_MS", "RESIDENT_MEM_FRACTION", "FAILED_RETRY_S",
                  "_DEFAULT_GPU_INIT_MS"):
         assert name in rules, name

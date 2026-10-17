@@ -88,7 +88,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
   <h3>The rules, and where they live</h3>
   <ol class="sub">
     <li><b>Small inputs skip everything.</b> Under <span data-const="SMALL_QUERY_ROWS" data-fmt="rows">200,000</span> source rows the query goes to the CPU before the calibration is even loaded (loading it initialises CUDA). <code>prefer="gpu"</code> turns this off. <code>auto_mode.choose_device</code>, <code>SMALL_QUERY_ROWS</code>.</li>
-    <li><b>A cold GPU skips pricing too.</b> Under <span data-const="COLD_GPU_SOURCE_ROWS" data-fmt="rows">25,000,000</span> source rows, while the GPU has not started in this process, the query goes to the CPU unpriced: the GPU's start-up alone costs more than the whole query on the native CPU, and pricing it (loading the calibration, sampling keys) would cost about 3 ms of the query's clock. The GPU's start-up is still queued, off the clock, for the queries after this one. <code>prefer="gpu"</code> turns this off. <code>auto_mode.COLD_GPU_SOURCE_ROWS</code>.</li>
+    <li><b>A cold GPU skips pricing too.</b> While the GPU has not started in this process, a query whose native CPU cost is under the GPU's start-up (<span data-const="COLD_GPU_START_MS" data-fmt="plain">240</span> ms, the lowest measured on the reference box) goes to the CPU unpriced. The CPU cost is bounded high: every operator at the dearest default native rate of its kind (a join with an 8M-row build, a group-by with 1M groups, the radix sort) over all the plan's source rows. Pricing it properly (loading the calibration, sampling keys) would cost about 3 ms of the query's clock. The GPU's start-up is still queued, off the clock, for the queries after this one, unless that finds no GPU. <code>prefer="gpu"</code> turns this off. <code>auto_mode._cold_cpu_bound_ms</code>.</li>
     <li><b>No GPU, a CUDA fault, or a shape that failed before</b> means CPU. A GPU error reruns the query on the CPU with one warning per shape; a CUDA fault switches the GPU off for the rest of the process. <code>strict=True</code> raises instead.</li>
     <li><b>Price both plans.</b> Each operator costs <code>alpha + c·rows</code> on each device, from the calibration. The CPU side is priced as the native executor runs it: a group-by by its group count and a join by its build-side rows, each interpolated between the sizes that were measured. The GPU side is its kernels, plus it pays the copy over the link, the copy back, and whatever is left of its start-up (<span data-const="_DEFAULT_GPU_INIT_MS" data-fmt="plain">400</span> ms by default, until measured). Joins use a measured end-to-end GPU join estimate, padded by <span data-const="JOIN_GPU_SAFETY" data-fmt="plain">1.15</span> because it ran low under load.</li>
     <li><b>The GPU must win by a margin.</b> <span data-const="GPU_WIN_MARGIN" data-fmt="pct">10%</span> by default, so ties go to the CPU (no memory-capacity risk, no start-up). <code>prefer="cpu"</code> raises it to <span data-const="PREFER_CPU_MARGIN" data-fmt="pct">30%</span>; <code>prefer="gpu"</code> lowers it to zero. If the GPU would win but is still starting, the query runs on the CPU and says so.</li>
@@ -177,7 +177,8 @@ main, .grid > *, .card, .card-b { min-width: 0; }
 {
   "constants": {
     "SMALL_QUERY_ROWS": {"file": "auto_mode.py", "value": 200000},
-    "COLD_GPU_SOURCE_ROWS": {"file": "auto_mode.py", "value": 25000000},
+    "COLD_GPU_START_MS": {"file": "auto_mode.py", "value": 240.0},
+    "COLD_NATIVE_MS_PER_MROW": {"file": "auto_mode.py", "value": {"join": 5.2, "aggregate": 9.5, "sort": 7.0, "filter": 0.34}},
     "GPU_WIN_MARGIN": {"file": "auto_mode.py", "value": 0.1},
     "PREFER_CPU_MARGIN": {"file": "auto_mode.py", "value": 0.3},
     "JOIN_GPU_SAFETY": {"file": "auto_mode.py", "value": 1.15},
@@ -286,9 +287,12 @@ function decide(cfg, init, started) {
   };
   rule(`Fewer than ${fmtN(K.SMALL_QUERY_ROWS)} source rows?`, `${fmtN(est.srcRows)} rows: not small${cfg.prefer === "gpu" ? ' (prefer="gpu" skips this check)' : ""}`,
     () => (cfg.prefer !== "gpu" && est.srcRows < K.SMALL_QUERY_ROWS ? { device: "cpu", reason: `small input (${fmtN(est.srcRows)} rows): gpu start-up and copies cannot pay off`, est: null, small: true } : null));
-  rule(`Fewer than ${fmtN(K.COLD_GPU_SOURCE_ROWS)} source rows, and the GPU not started?`,
-    est.srcRows >= K.COLD_GPU_SOURCE_ROWS ? `${fmtN(est.srcRows)} rows: big enough that the GPU may pay off` : "the GPU has started in this process",
-    () => (cfg.prefer !== "gpu" && est.srcRows < K.COLD_GPU_SOURCE_ROWS && !started
+  // auto_mode._cold_cpu_bound_ms: every operator at the dearest default native rate of its kind, over all source rows
+  const OPS = { groupby: ["aggregate"], global: ["filter", "aggregate"], join: ["join"], sort: ["sort"] }[cfg.shape];
+  const bound = (est.srcRows / 1e6) * OPS.reduce((a, k) => a + K.COLD_NATIVE_MS_PER_MROW[k], K.COLD_NATIVE_MS_PER_MROW.filter);
+  rule(`GPU not started, and this query under ${K.COLD_GPU_START_MS} ms on the CPU even at the dearest native rates?`,
+    started ? "the GPU has started in this process" : `at most ${ms1(bound)} on the cpu: the GPU may pay off`,
+    () => (cfg.prefer !== "gpu" && !started && bound < K.COLD_GPU_START_MS
       ? { device: "cpu", reason: `gpu not started: its start-up costs more than this query on the cpu (${fmtN(est.srcRows)} source rows)`, est: null, warmLater: true } : null));
   rule("Is there a GPU?", "yes", () => (cfg.gpu === "none" ? { device: "cpu", reason: "no gpu", est, nogpu: true } : null));
   rule("Was the GPU switched off after a CUDA fault?", "no", () => (cfg.gpu === "disabled" ? { device: "cpu", reason: "gpu disabled after error", est, nogpu: true } : null));

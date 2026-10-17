@@ -26,6 +26,28 @@ os.environ.setdefault("MXFRAME_CALIBRATION", str(Path(tempfile.gettempdir()) / f
 import pytest  # noqa: E402
 
 
+def _mx_env():
+    return {k: v for k, v in os.environ.items() if k.startswith("MXFRAME_")}
+
+
+@pytest.fixture(autouse=True)
+def _no_env_leaks():
+    """A test that leaves an MXFRAME_* variable changed fails here, and the variable is put back. Leaks broke later
+    tests on the same xdist worker twice (`MXFRAME_HOST_MEM_BUDGET`: small in-memory queries streamed and failed
+    with a 0-byte budget). Use monkeypatch.setenv, or restore in a finally. Declared before the other autouse
+    fixtures, so it checks after their monkeypatch has undone its changes."""
+    before = _mx_env()
+    yield
+    after = _mx_env()
+    if after != before:
+        for k in after.keys() - before.keys():
+            del os.environ[k]
+        os.environ.update(before)
+        changed = sorted(k for k in before.keys() | after.keys() if before.get(k) != after.get(k))
+        pytest.fail(f"the test left environment variables changed: {changed} "
+                    f"(was {[before.get(k) for k in changed]}, now {[after.get(k) for k in changed]})")
+
+
 @pytest.fixture(autouse=True)
 def _strict_native(monkeypatch):
     """An unexpected exception in a native hook is raised in the tests, not turned into a quiet fallback
