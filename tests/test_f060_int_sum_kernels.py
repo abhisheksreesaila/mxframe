@@ -174,3 +174,26 @@ def test_order_by_and_having_on_sums_past_2_53_are_exact(monkeypatch, native):
     got = lf.compute(device="cpu")
     assert got.schema.field("s").type == pa.int64()
     assert [(r["g"], r["s"]) for r in got.to_pylist()] == [(g_, int(s_)) for g_, s_ in want]
+
+
+# -- the CPU + GPU split merges int64 partials ---------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GPU or not nx.available(), reason="needs a CUDA GPU and the native executor")
+@pytest.mark.parametrize("grouped", [True, False], ids=["grouped", "global"])
+def test_a_cpu_gpu_split_adds_int64_partials_exactly(monkeypatch, grouped):
+    from mxframe import coproc_fused as cf
+    monkeypatch.setenv("MXFRAME_NATIVE", "1")
+    rows, groups = 1_500_000, 7 if grouped else 1
+    t = _table(rows, groups)
+    want = _want(t, grouped)
+    make = lambda: (LazyFrame(t).groupby("g") if grouped else LazyFrame(t).groupby()).agg(
+        col("v").sum().alias("sv"), col("w").sum().alias("sw"))
+    cf.clear_residency()
+    with cf.policy(min_upload_bytes=0, gpu_fraction=0.5):
+        make().compute(device="cpu")                      # host data: all CPU; the columns are uploaded in the background
+        cf.wait_for_uploads(30)
+        lf = make().sort("g") if grouped else make()
+        got = lf.compute(device="cpu")                    # resident: half the rows on each device
+    assert lf.last_compile_provenance["path"] == "fused_pipeline_split", lf.last_compile_provenance
+    assert got.schema.field("sv").type == pa.int64() and got.schema.field("sw").type == pa.int64()
+    assert [(r.get("g"), r["sv"], r["sw"]) for r in got.to_pylist()] == want
