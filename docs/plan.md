@@ -971,7 +971,7 @@ Found by the F-086 review (2026-10-16); a silent wrong answer on main
 - Review round 2: a DECIMAL literal (point, no exponent) against an integer column or expression is compared exactly in `_compare` with `Decimal` (`< 2.5` is `< 3`, `> 2.5` is `> 2`, `= 2.5` never holds, a bound past int64 is a constant; BETWEEN and IN too); only a DOUBLE (`np.float64`) literal casts the integer column to double (`_align_literals`, `_double_vs_int`). The native decline for big float constants is gone; `_threshold` instead treats an integer column's float bound of exactly +-2^63 as a value, not as out of range. Tests: `test_decimal_literals_exact`
 - Not changed: a bare `k` in a later ON stays the left table's (DuckDB calls it ambiguous)
 
-## F-105 SQL CASE: string results, and NULL when no ELSE [review]
+## F-105 SQL CASE: string results, and NULL when no ELSE [done]
 Seen in the F-086 review (2026-10-16)
 - [x] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
 - [x] a CASE with no ELSE gives 0 instead of NULL: `count(case when p then 1 end)` counts every row (silent wrong answer, found by the F-106 developer); a missing ELSE is NULL
