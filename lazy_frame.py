@@ -11,7 +11,7 @@ from typing import Any, List, Literal, Optional, Union, Dict
 from dataclasses import dataclass
 from .lazy_expr import Expr, col
 import pyarrow as pa
-from .np_arrow import array as _npa, to_numpy as _np_of, combine as _combine
+from .np_arrow import empty as _empty, array as _npa, to_numpy as _np_of, combine as _combine
 
 
 # %% ../nbs/02_lazy_frame.ipynb 4
@@ -533,7 +533,7 @@ class LazyFrame:
             return self.plan.schema
         def _zero(p):
             if isinstance(p, Scan):      return Scan(p.table.slice(0, 0))
-            if isinstance(p, ParquetScan): return Scan(p.schema.empty_table())
+            if isinstance(p, ParquetScan): return Scan(_empty(p.schema))
             if isinstance(p, Join):      return Join(_zero(p.left), _zero(p.right), p.left_on, p.right_on, p.how)
             if isinstance(p, Filter):    return Filter(_zero(p.input), p.predicate)
             if isinstance(p, Project):   return Project(_zero(p.input), p.exprs)
@@ -1056,6 +1056,13 @@ def _resolve_scalars(plan, device: str, strict: bool):
             if b is True:
                 return out.input
             if b is False:
+                # no row can pass: an empty table of the same columns, so the input (a join of big Parquet files, say)
+                # is never run or streamed; Limit(0) where the columns cannot be named without running it
+                from .io_parquet import _leaves
+                if any(isinstance(l, ParquetScan) for l in _leaves(out.input)):       # (in-memory inputs run as before)
+                    names = LazyFrame(out.input).schema
+                    if names is not None:
+                        return Scan(_empty(names))
                 return Limit(out.input, 0)
         return out
 

@@ -66,20 +66,28 @@ def _value_hashes(values: pa.Array) -> np.ndarray:
     return h
 
 
-def _column_hash(column) -> np.ndarray:
+def _column_hash(column, as_float: bool = False) -> np.ndarray:
     a = np_arrow.combine(column)
     if pa.types.is_dictionary(a.type):
         a = a.dictionary_decode()
+    if as_float:                                   # a join key compared with a float key: hash the value as a double
+        try:
+            a = pc.cast(a, pa.float64())
+        except pa.ArrowInvalid as e:                # same error as the in-memory join (join_engine)
+            raise TypeError(f"join key types differ: {column.type} has values with no exact double, so it cannot be "
+                            f"joined with a float key ({e})") from e
     a = np_arrow.canonical_floats(a)
     enc = pc.dictionary_encode(a, null_encoding="encode")
     return _value_hashes(enc.dictionary)[np_arrow.to_numpy(enc.indices).astype(np.int64)]
 
 
-def hash_keys(table: pa.Table, names: List[str], salt: int = 0) -> np.ndarray:
-    """A deterministic uint64 per row from the values of the key columns `names` (equal keys, equal hash)."""
+def hash_keys(table: pa.Table, names: List[str], salt: int = 0, as_float=None) -> np.ndarray:
+    """A deterministic uint64 per row from the values of the key columns `names` (equal keys, equal hash).
+    `as_float[i]`: key i is joined with a float column, so integers hash as the double of the same value (1 and 1.0
+    must land in one partition; F-090)."""
     h = _mix(np.full(table.num_rows, salt + 1, dtype=np.uint64))
-    for name in names:
-        h = _mix(h * _M1 + _column_hash(table.column(name)))
+    for i, name in enumerate(names):
+        h = _mix(h * _M1 + _column_hash(table.column(name), bool(as_float and as_float[i])))
     return h
 
 
@@ -153,7 +161,8 @@ def remove_stale(base: str) -> None:
 class SpillDir:
     """The temporary directory of one query's spill files; `close()` removes it (also after an error)."""
 
-    def __init__(self):
+    def __init__(self, what: str = "group state"):
+        self.what = what               # named in error messages: "group state", "join partitions"
         self.path: Optional[str] = None          # made when the first file is named: a query that never spills has none
         self.bytes = 0                 # on disk, counted when a partition is finished
         self.written = 0               # handed to the writers so far (approximate, in memory size)
@@ -169,7 +178,7 @@ class SpillDir:
                 remove_stale(base)
                 self.path = tempfile.mkdtemp(prefix=f"mxframe-spill-{_owner()}-{os.getpid()}-", dir=base)
             except OSError as e:
-                raise SpillError(f"cannot spill group state to disk: the spill directory {base} cannot be created "
+                raise SpillError(f"cannot spill {self.what} to disk: the spill directory {base} cannot be created "
                                  f"({e}); set MXFRAME_SPILL_DIR to a writable directory on disk") from e
             kind = ram_backed(self.path)
             if kind:
@@ -182,7 +191,7 @@ class SpillDir:
     def check_space(self, need: int) -> None:
         free = shutil.disk_usage(self.path).free
         if free < need:
-            raise SpillError(f"not enough disk space to spill group state: {self.path} has {free:,} bytes free, "
+            raise SpillError(f"not enough disk space to spill {self.what}: {self.path} has {free:,} bytes free, "
                              f"{need:,} are needed for the next write ({self.written:,} written so far); set "
                              f"MXFRAME_SPILL_DIR to a bigger disk")
 
@@ -195,12 +204,13 @@ class Partitioned:
     """`PARTITIONS` Arrow IPC streams under a `SpillDir`: `write` splits a table by key hash, `read` yields the
     tables of one partition back in the order they were written."""
 
-    def __init__(self, root: SpillDir, keys: List[str], salt: int, depth: int):
-        self.root, self.keys, self.salt = root, list(keys), salt
+    def __init__(self, root: SpillDir, keys: List[str], salt: int, depth: int, as_float=None):
+        self.root, self.keys, self.salt, self.as_float = root, list(keys), salt, as_float
         self._base = root.name()
         self._writers: dict = {}
         self._sinks: dict = {}
         self.rows = [0] * PARTITIONS
+        self.nbytes = [0] * PARTITIONS               # in memory (Arrow) size of what each partition holds
         root.partitions += PARTITIONS
         root.depth = max(root.depth, depth)
 
@@ -217,11 +227,11 @@ class Partitioned:
         except SpillError:
             raise
         except OSError as e:                       # a full disk surfaces as OSError / ArrowIOError
-            raise SpillError(f"spilling group state to {self.root.path} failed after about "
+            raise SpillError(f"spilling {self.root.what} to {self.root.path} failed after about "
                              f"{self.root.written:,} bytes were written: {e}") from e
 
     def _write(self, table: pa.Table) -> None:
-        part = ((hash_keys(table, self.keys, self.salt) >> np.uint64(33)) % np.uint64(PARTITIONS)).astype(np.int64)
+        part = ((hash_keys(table, self.keys, self.salt, self.as_float) >> np.uint64(33)) % np.uint64(PARTITIONS)).astype(np.int64)
         order = np.argsort(part, kind="stable")                      # keeps the batch order inside a partition
         counts = np.bincount(part, minlength=PARTITIONS)
         taken = np_arrow.take_rows(table, order)
@@ -231,8 +241,10 @@ class Partitioned:
                 if i not in self._writers:
                     self._sinks[i] = pa.OSFile(self._path(i), "wb")
                     self._writers[i] = pa.ipc.new_stream(self._sinks[i], taken.schema)
-                self._writers[i].write_table(taken.slice(at, c))
+                piece = taken.slice(at, c)
+                self._writers[i].write_table(piece)
                 self.rows[i] += c
+                self.nbytes[i] += piece.nbytes
                 at += c
 
     def finish(self) -> None:
@@ -242,10 +254,17 @@ class Partitioned:
                 self._sinks[i].close()
                 self.root.bytes += os.path.getsize(self._path(i))
         except OSError as e:                       # the last buffered bytes are written here: a full disk shows now
-            raise SpillError(f"spilling group state to {self.root.path} failed while finishing the partition files "
+            raise SpillError(f"spilling {self.root.what} to {self.root.path} failed while finishing the partition files "
                              f"(about {self.root.written:,} bytes written): {e}") from e
         finally:
             self._writers, self._sinks = {}, {}
+
+    def drop(self, i: int) -> None:
+        """Forget partition `i` without reading it."""
+        try:
+            os.remove(self._path(i))
+        except OSError:
+            pass
 
     def read(self, i: int) -> Iterator[pa.Table]:
         """The tables of partition `i` (none if nothing hashed there); the file is deleted once read. A partition
