@@ -28,6 +28,7 @@ comptime N_NE = 25
 comptime N_AND = 30
 comptime N_OR = 31
 comptime N_NOT = 32
+comptime N_BOOL2INT = 33     # a comparison as the number 1 / 0 (internal: merges remap text codes with it)
 
 
 @fieldwise_init
@@ -39,12 +40,12 @@ struct Node(Copyable, Movable):
     def arity(self) -> Int:
         if self.op == N_COL or self.op == N_LIT:
             return 0
-        if self.op == N_NEG or self.op == N_NOT:
+        if self.op == N_NEG or self.op == N_NOT or self.op == N_BOOL2INT:
             return 1
         return 2
 
     def is_bool(self) -> Bool:
-        return self.op >= N_LT
+        return self.op >= N_LT and self.op != N_BOOL2INT
 
 
 struct Expr(Copyable, Movable):

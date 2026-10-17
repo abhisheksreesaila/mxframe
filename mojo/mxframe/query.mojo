@@ -26,8 +26,9 @@ from std.time import perf_counter_ns
 from std.sys.info import num_physical_cores
 from std.memory import Pointer
 from .table import SharedTable
+from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
-                   N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT)
+                   N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT)
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP
 
 # plan node kinds
@@ -118,13 +119,24 @@ struct PlanNode(Copyable, Movable):
 
 
 struct Query(Movable):
-    """A plan over one shared table, built by chaining; `compute` runs it."""
+    """A plan over one shared table, or over a session's view of it (`Query(frame)`: its edits, appended and removed
+    rows, merges and formula columns, copied when the query is built), built by chaining; `compute` runs it."""
     var table: SharedTable
     var nodes: List[PlanNode]
+    var framed: Bool
+    var overlay: Overlay
 
     def __init__(out self, table: SharedTable):
         self.table = table
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
+        self.framed = False
+        self.overlay = Overlay(table)
+
+    def __init__(out self, frame: Frame) raises:
+        self.table = frame.base
+        self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
+        self.framed = True
+        self.overlay = frame.overlay()
 
     def _top(self) -> Int:
         return len(self.nodes) - 1
@@ -165,8 +177,17 @@ struct Query(Movable):
         if device == GPU:
             raise Error("device GPU: the GPU path of the Mojo API is not built yet (F-137); use CPU or AUTO")
         var t0 = perf_counter_ns()
-        var prog = _lower(self)
-        var r = _run_cpu(self.table, prog)
+        var nodes = self.nodes.copy()
+        if self.framed:                                  # formulas inlined, merges remapped
+            for i in range(len(nodes)):
+                for k in range(len(nodes[i].exprs)):
+                    nodes[i].exprs[k] = self.overlay.expand(nodes[i].exprs[k])
+                for k in range(len(nodes[i].aggs)):
+                    nodes[i].aggs[k].arg = self.overlay.expand(nodes[i].aggs[k].arg)
+        var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
+        var r = _run_cpu(self.table, prog, Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0)
+        if self.framed and len(self.overlay.delta) > 0:
+            _add_delta(r, self.table, nodes, self.overlay)
         r.milliseconds = Float64(perf_counter_ns() - t0) / 1e6
         return r^
 
@@ -334,6 +355,13 @@ def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
             var r = p.reg()
             p.emit(OP_LOAD_CONST, r, p.const(n.value))
             stack.append(_Slot(r, False, -1))
+        elif n.op == N_BOOL2INT:                         # a comparison as the number 1 / 0 (merges)
+            var a = stack.pop()
+            if not a.boolean:
+                raise Error("internal: int() of a number")
+            var r = p.reg()
+            p.emit(OP_F2I, r, a.reg)
+            stack.append(_Slot(r, False, -1))
         elif n.op == N_NEG or n.op == N_NOT:
             var a = stack.pop()
             if a.boolean != (n.op == N_NOT):
@@ -430,22 +458,24 @@ def _valid_of(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
     return out
 
 
-def _lower(q: Query) raises -> Program:
-    var t = q.table
+def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bool) raises -> Program:
+    """The plan as one kernel program. `force_counts` (a frame's query): every non-count aggregate carries its non-null
+    count (an edit can null a cell of a column the shared data has no nulls in). `masked`: the predicate also skips
+    the shared rows the session changed (the frame mask, filled in by `_run_cpu`)."""
     var p = Program(t.columns())
     var filters = List[Expr]()
     var agg_node = -1
-    for i in range(len(q.nodes)):
-        ref node = q.nodes[i]
+    for i in range(len(nodes)):
+        ref node = nodes[i]
         if node.kind == P_FILTER:
             filters.append(node.exprs[0].copy())
         elif node.kind == P_AGGREGATE:
             agg_node = i
         elif node.kind != P_SCAN:
             raise Error("plan node kind " + String(node.kind) + " is not supported yet")
-    if agg_node < 0 or len(q.nodes[agg_node].aggs) == 0:
+    if agg_node < 0 or len(nodes[agg_node].aggs) == 0:
         raise Error("a query needs at least one aggregate (.agg(...))")
-    ref an = q.nodes[agg_node]
+    ref an = nodes[agg_node]
     p.groups = an.groups
     if p.groups < 1:
         raise Error("groups must be at least 1, got " + String(p.groups))
@@ -486,6 +516,12 @@ def _lower(q: Query) raises -> Program:
         p.section = 0
     elif p.groups != 1:
         raise Error("groups=" + String(p.groups) + " needs a group_by key")
+    if masked:                                           # the frame's changed shared rows: the delta adds them
+        var isnull = p.reg()
+        p.emit(OP_ISNULL, isnull, _frame_mask(p))
+        var keep = p.reg()
+        p.emit(OP_NOT, keep, isnull)
+        acc = _and_into(p, acc, keep)
     p.pred_reg = acc
     p.reset_temps()
 
@@ -499,6 +535,8 @@ def _lower(q: Query) raises -> Program:
             continue
         p.section = 1
         var valid = _valid_of(p, a.arg, t)
+        if valid < 0 and force_counts:
+            valid = _const_reg(p, 1)
         if a.kind != A_COUNT:
             if valid >= 0:                               # the rows this aggregate counts (non-null values)
                 var kept_valid = p.keep(valid, False)
@@ -554,6 +592,18 @@ def _and_into(mut p: Program, acc: Int, r: Int) raises -> Int:
     return acc
 
 
+def _frame_mask(mut p: Program) -> Int:
+    """The program column whose OP_ISNULL reads the frame mask (bit cleared: a shared row the session changed)."""
+    var at = len(p.cols)
+    p.cols.append(-5_000_000)                      # the mask column (never read)
+    p.dtypes.append(Int32(DT_NULLMASK | ((at + 1) << 8)))
+    p.cols.append(-4_000_000)                      # the mask bitmap's address (`_run_cpu`)
+    p.dtypes.append(DT_I64)
+    p.cols.append(-1_000_000)                      # bit base 0
+    p.dtypes.append(DT_I64)
+    return at
+
+
 def _const_reg(mut p: Program, v: Int64) raises -> Int:
     var r = p.reg()
     p.emit(OP_LOAD_CONST, r, p.const(v))
@@ -572,7 +622,7 @@ def _key_from_reg0(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst
     return True
 
 
-def _run_cpu(t: SharedTable, p: Program) raises -> QueryResult:
+def _run_cpu(t: SharedTable, p: Program, mask_addr: Int) raises -> QueryResult:
     var n = t.rows()
     var code = List[Int32]()
     var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
@@ -596,8 +646,10 @@ def _run_cpu(t: SharedTable, p: Program) raises -> QueryResult:
     for c in p.cols:
         if c >= 0:
             tbl.append(Int64(Int(t.values(c).unsafe_ptr())))
-        elif c == -1_000_000:
+        elif c == -1_000_000 or c == -5_000_000:
             tbl.append(0)
+        elif c == -4_000_000:
+            tbl.append(Int64(mask_addr))
         else:
             tbl.append(Int64(t._table[].cols[-1 - c].validity_address()))
     var dtypes = p.dtypes.copy()
@@ -639,3 +691,66 @@ def _run_cpu(t: SharedTable, p: Program) raises -> QueryResult:
             break
     _ = out_vals^
     return r^
+
+
+# ── a frame's changed and appended rows, on the CPU ──────────────────────────────────────────────────
+
+def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Overlay) raises:
+    """Adds the session's changed (live) and appended rows to the kernel's result over the unchanged shared rows,
+    with the kernel's rules: a filter reading a null is false, a null or out-of-range key leaves the row out, an
+    aggregate skips a null value, totals are exact (an overflow raises)."""
+    var filters = List[Expr]()
+    var keyed = False
+    var key = Expr(0)
+    var groups = 1
+    var aggs = List[Agg]()
+    for node in nodes:
+        if node.kind == P_FILTER:
+            filters.append(node.exprs[0].copy())
+        elif node.kind == P_AGGREGATE:
+            groups = node.groups
+            aggs = node.aggs.copy()
+            if len(node.exprs) > 0:
+                keyed = True
+                key = node.exprs[0].copy()
+    for raw in o.delta:
+        var keep = True
+        for f in filters:
+            var v = _eval_row(f, t, raw)
+            if v[1] or v[0] == 0:
+                keep = False
+                break
+        if not keep:
+            continue
+        var g = 0
+        if keyed:
+            var k = _eval_row(key, t, raw)
+            if k[1] or k[0] < 0 or k[0] >= Int64(groups):
+                continue
+            g = Int(k[0])
+        r.counts[g] += 1
+        for i in range(len(aggs)):
+            if aggs[i].kind == A_COUNT:
+                continue
+            var v = _eval_row(aggs[i].arg, t, raw)
+            if v[1]:
+                continue
+            if r.count_slot_of[i] >= 0:
+                r.slots[r.count_slot_of[i]][g] += 1
+            if aggs[i].kind == A_COUNT_OF:
+                continue
+            var s = r.slot_of[i]
+            var x = Int64(r.slots[s][g])
+            if aggs[i].kind == A_MIN:
+                r.slots[s][g] = Int(min(x, v[0]))
+            elif aggs[i].kind == A_MAX:
+                r.slots[s][g] = Int(max(x, v[0]))
+            else:
+                var y = x + v[0]
+                if ((x ^ y) & (v[0] ^ y)) < 0:
+                    raise Error("a sum or an expression passed the int64 range (about 9.2e18)")
+                r.slots[s][g] = Int(y)
+    for i in range(len(r.kinds)):
+        if r.kinds[i] == A_SUM:
+            r.sums = r.slots[r.slot_of[i]].copy()
+            break

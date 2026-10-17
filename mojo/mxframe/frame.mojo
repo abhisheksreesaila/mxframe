@@ -1,0 +1,872 @@
+"""A session's view of a shared table: its edits, rows, merges and formula columns (docs/mxframe-mojo-api.md
+sections 3, 4 and 6).
+
+    var f = Frame(shared)
+    f.set(c, row, 1250); f.set_text(c, row, "West")       # typed text is parsed by the column's kind
+    var row = f.append(["12.50", "East"]); f.remove(row)
+    f.undo(); f.edits                                      # one log for sets, appends, removes and merges
+    var m = f.formula("margin = revenue - cost")           # decimal-aware, never materialised
+    f.get(m, row); f.permutation(c, descending=False)
+    Query(f).group_by(col("region"), groups=n).agg(sum(col("margin"))).compute()   # includes the edits
+
+Nothing is copied from the shared table: an edit is a sparse cell, an appended row lives in the frame, a removed
+row is a tombstone. Formula columns follow the stored ones (index stored + k); their expressions are inlined
+where they are used, so an aggregation over a formula runs in the kernel like any expression. A merge folds text
+values into one (three spellings of a customer): every reference to the column reads the merged code.
+"""
+from std.collections import Dict, Set
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
+                   N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT)
+from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool
+
+comptime SET = 0
+comptime APPEND = 1
+comptime REMOVE = 2
+comptime MERGE = 3
+comptime REPOINT = 4
+comptime NULL_EDIT = Int64.MIN + 1        # an edited cell set to null: `set` refuses this one value
+
+
+@fieldwise_init
+struct Edit(Copyable, Movable):
+    var kind: Int
+    var col: Int
+    var row: Int
+    var old: Int64           # SET: the value before (NULL_EDIT: null); MERGE / REPOINT: the merged code
+    var new: Int64
+    var had: Bool            # SET: the cell was already edited before this edit
+
+
+@fieldwise_init
+struct Formula(Copyable, Movable):
+    var name: String
+    var text: String
+    var expr: Expr           # references other columns by name (formulas are expanded where used)
+    var scale: Int
+
+
+def _pow10(k: Int) -> Int64:
+    var v: Int64 = 1
+    for _ in range(k):
+        v *= 10
+    return v
+
+
+struct Frame(Movable):
+    var base: SharedTable
+    var cells: Dict[Int, Int64]           # (row << 20) | col -> edited value (NULL_EDIT: set to null)
+    var added: List[List[Int64]]          # appended rows, per row a value per stored column (NULL_EDIT: null)
+    var removed: Set[Int]
+    var words: List[List[String]]         # per stored column: words this session added (codes after the dictionary)
+    var word_codes: List[Dict[String, Int]]
+    var aliases: Dict[Int, Int64]         # (col << 32) | code -> the code it was merged into (one step deep)
+    var log: List[Edit]
+    var edits: Int                        # moves on every edit and undo: hosts re-aggregate when it moves
+    var formulas: List[Formula]
+
+    def __init__(out self, base: SharedTable):
+        self.base = base
+        self.cells = Dict[Int, Int64]()
+        self.added = List[List[Int64]]()
+        self.removed = Set[Int]()
+        self.words = List[List[String]]()
+        self.word_codes = List[Dict[String, Int]]()
+        for _ in range(base.columns()):
+            self.words.append(List[String]())
+            self.word_codes.append(Dict[String, Int]())
+        self.aliases = Dict[Int, Int64]()
+        self.log = List[Edit]()
+        self.edits = 0
+        self.formulas = List[Formula]()
+
+    # ── shape ───────────────────────────────────────────────────────────────────────────────────────
+
+    def stored(self) -> Int:
+        return self.base.columns()
+
+    def columns(self) -> Int:
+        return self.stored() + len(self.formulas)
+
+    def rows(self) -> Int:
+        """Base rows plus appended rows (removed rows keep their numbers: ask `alive`)."""
+        return self.base.rows() + len(self.added)
+
+    def alive(self, row: Int) -> Bool:
+        return 0 <= row < self.rows() and row not in self.removed
+
+    def name(self, c: Int) -> String:
+        return self.base.name(c) if c < self.stored() else self.formulas[c - self.stored()].name
+
+    def kind(self, c: Int) -> ColumnKind:
+        if c < self.stored():
+            return self.base.kind(c)
+        return DECIMAL if self.formulas[c - self.stored()].scale > 0 else INT
+
+    def scale(self, c: Int) -> Int:
+        return self.base.scale(c) if c < self.stored() else self.formulas[c - self.stored()].scale
+
+    def index(self, name: String) -> Int:
+        var c = self.base.index(name)
+        if c >= 0:
+            return c
+        for k in range(len(self.formulas)):
+            if self.formulas[k].name == name:
+                return self.stored() + k
+        return -1
+
+    def column(self, name: String) raises -> Int:
+        var c = self.index(name)
+        if c < 0:
+            raise Error("column `" + name + "` not found")
+        return c
+
+    # ── values ──────────────────────────────────────────────────────────────────────────────────────
+
+    def _raw(self, c: Int, row: Int) -> Int64:
+        """A stored column's value as edited (NULL_EDIT for null), before merges."""
+        var hit = self.cells.get((row << 20) | c)
+        if hit:
+            return hit.value()
+        var n = self.base.rows()
+        if row < n:
+            return NULL_EDIT if self.base.is_null(c, row) else self.base.get(c, row)
+        return self.added[row - n][c]
+
+    def is_null(self, c: Int, row: Int) raises -> Bool:
+        if c < self.stored():
+            return self._raw(c, row) == NULL_EDIT
+        return self.evaluate(self.program(c), row)[1]
+
+    def get(self, c: Int, row: Int) raises -> Int64:
+        """The value as this session sees it: edited, merged; a formula evaluated (0 for a null: ask `is_null`)."""
+        if c < self.stored():
+            var v = self._raw(c, row)
+            return 0 if v == NULL_EDIT else self.alias(c, v)
+        return self.evaluate(self.program(c), row)[0]
+
+    def text_of(self, c: Int, code: Int64) -> String:
+        """The word of a TEXT code: the shared dictionary's, then this session's."""
+        var n = len(self.base.dictionary(c))
+        var k = Int(code)
+        if k < n:
+            return self.base.text_of(c, k)
+        return self.words[c][k - n] if k - n < len(self.words[c]) else "?"
+
+    def code_of(self, c: Int, word: String) -> Int:
+        var k = self.base.code_of(c, word)
+        if k >= 0:
+            return k
+        var mine = self.word_codes[c].get(word, -1)
+        return len(self.base.dictionary(c)) + mine if mine >= 0 else -1
+
+    def parse(mut self, c: Int, text: String) raises -> Int64:
+        """A stored value from typed text (TEXT: its code, added if new; empty: null)."""
+        var s = String(text.strip())
+        if s.byte_length() == 0:
+            return NULL_EDIT
+        var kind = self.base.kind(c)
+        if kind == TEXT:
+            var k = self.code_of(c, s)
+            if k >= 0:
+                return Int64(k)
+            self.word_codes[c][s] = len(self.words[c])
+            self.words[c].append(s)
+            return Int64(len(self.base.dictionary(c)) + len(self.words[c]) - 1)
+        var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(s.unsafe_ptr()))
+        var n = s.byte_length()
+        var out: Int64 = 0
+        var places = 0
+        var ok: Bool
+        if kind == DATE:
+            ok = _parse_date(p, n, out)
+        elif kind == BOOL:
+            ok = _parse_bool(p, n, out)
+        elif kind == DECIMAL:
+            ok = _parse_decimal(p, n, self.base.scale(c), out, places)
+        else:
+            ok = _parse_int(p, n, out)
+        _ = s.byte_length()                             # keep s alive past the parse (p points into it)
+        if not ok:
+            raise Error("column `" + self.base.name(c) + "`: `" + s + "` isn't " +
+                        ("a date" if kind == DATE else "true or false" if kind == BOOL else "a number"))
+        return out
+
+    # ── edits ───────────────────────────────────────────────────────────────────────────────────────
+
+    def set(mut self, c: Int, row: Int, value: Int64) raises:
+        """Sets a stored cell (a TEXT code, a scaled DECIMAL, days for a DATE). INT64_MIN + 1 is reserved (it marks a
+        null edit: use `set_null`)."""
+        if value == NULL_EDIT:
+            raise Error("the value " + String(value) + " is reserved for null; use set_null")
+        self._set(c, row, value)
+
+    def _set(mut self, c: Int, row: Int, value: Int64) raises:
+        if c < 0 or c >= self.stored():
+            raise Error("only stored columns are edited (a formula follows its inputs)")
+        if not self.alive(row):
+            raise Error("row " + String(row) + " does not exist")
+        if self.base.kind(c) == TEXT and value != NULL_EDIT and \
+                (value < 0 or value >= Int64(len(self.base.dictionary(c)) + len(self.words[c]))):
+            raise Error("column `" + self.base.name(c) + "`: code " + String(value) + " is not one of its words")
+        if self.base.kind(c) == BOOL and value != NULL_EDIT and value != 0 and value != 1:
+            raise Error("column `" + self.base.name(c) + "` is BOOL: " + String(value) + " is not 0 or 1")
+        var key = (row << 20) | c
+        var had = key in self.cells
+        var old = self._raw(c, row)
+        self.cells[key] = value
+        self.log.append(Edit(SET, c, row, old, value, had))
+        self.edits += 1
+
+    def set_null(mut self, c: Int, row: Int) raises:
+        self._set(c, row, NULL_EDIT)
+
+    def set_text(mut self, c: Int, row: Int, text: String) raises:
+        """Sets a cell from typed text (parsed by the column's kind; empty text makes it null)."""
+        self._set(c, row, self.parse(c, text))
+
+    def append(mut self, values: List[String]) raises -> Int:
+        """A new row from typed values (one per stored column; missing or empty ones are null); returns its number."""
+        var r = List[Int64]()
+        for c in range(self.stored()):
+            r.append(self.parse(c, values[c]) if c < len(values) else NULL_EDIT)
+        self.added.append(r^)
+        var row = self.rows() - 1
+        self.log.append(Edit(APPEND, -1, row, 0, 0, False))
+        self.edits += 1
+        return row
+
+    def remove(mut self, row: Int):
+        if self.alive(row):
+            self.removed.add(row)
+            self.log.append(Edit(REMOVE, -1, row, 0, 0, False))
+            self.edits += 1
+
+    def undo(mut self) -> Bool:
+        """Takes back the last edit (a whole merge at once); False when there is nothing to undo."""
+        if len(self.log) == 0:
+            return False
+        var e = self.log.pop()
+        if e.kind == SET:
+            var key = (e.row << 20) | e.col
+            if e.had:
+                self.cells[key] = e.old
+            else:
+                _ = self.cells.pop(key, 0)
+        elif e.kind == MERGE or e.kind == REPOINT:
+            self._unmerge_step(e)
+            while len(self.log) > 0 and (self.log[len(self.log) - 1].kind == MERGE or
+                                         self.log[len(self.log) - 1].kind == REPOINT) and \
+                    self.log[len(self.log) - 1].row == e.row:
+                var more = self.log.pop()
+                self._unmerge_step(more)
+        elif e.kind == APPEND:
+            _ = self.added.pop()
+        else:
+            self.removed.discard(e.row)
+        self.edits += 1
+        return True
+
+    def changed_rows(self) -> List[Int]:
+        """Rows that differ from the shared data (edited, appended or removed), each once, ascending."""
+        var seen = Set[Int]()
+        for key in self.cells.keys():
+            seen.add(key >> 20)
+        for i in range(len(self.added)):
+            seen.add(self.base.rows() + i)
+        for row in self.removed:
+            seen.add(row)
+        var out = List[Int]()
+        for r in seen:
+            out.append(r)
+        sort(out)
+        return out^
+
+    # ── merges ──────────────────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _alias_key(c: Int, code: Int64) -> Int:
+        return (c << 32) | Int(code)
+
+    def alias(self, c: Int, code: Int64) -> Int64:
+        """The code a text value reads as: itself, or the one it was merged into (never a chain)."""
+        if len(self.aliases) == 0:
+            return code
+        var hit = self.aliases.get(Self._alias_key(c, code))
+        return hit.value() if hit else code
+
+    def _unmerge_step(mut self, e: Edit):
+        if e.kind == MERGE:
+            _ = self.aliases.pop(Self._alias_key(e.col, e.old), 0)
+        else:
+            self.aliases[Self._alias_key(e.col, e.old)] = e.new
+
+    def merge(mut self, c: Int, codes: List[Int64], into: Int64) raises -> Int:
+        """Folds the text values `codes` of column c into `into`: every row reads as `into` from now on. One undo
+        step however many rows; returns how many values were merged."""
+        if self.base.kind(c) != TEXT:
+            raise Error("column `" + self.base.name(c) + "` is not TEXT: only text values merge")
+        var number = 0
+        for e in self.log:
+            if e.kind == MERGE or e.kind == REPOINT:
+                number = max(number, e.row + 1)
+        var target = self.alias(c, into)
+        var count = 0
+        for code in codes:
+            if code == target or self.alias(c, code) == target:
+                continue
+            var moved = List[Int64]()
+            for item in self.aliases.items():
+                if (item.key >> 32) == c and item.value == code:
+                    moved.append(Int64(item.key & 0xFFFFFFFF))
+            for m in moved:
+                self.aliases[Self._alias_key(c, m)] = target
+                self.log.append(Edit(REPOINT, c, number, m, code, False))
+            var was = self.aliases.get(Self._alias_key(c, code))
+            self.aliases[Self._alias_key(c, code)] = target
+            if was:
+                self.log.append(Edit(REPOINT, c, number, code, was.value(), False))
+            else:
+                self.log.append(Edit(MERGE, c, number, code, target, False))
+            count += 1
+        if count > 0:
+            self.edits += 1
+        return count
+
+    # ── formulas ────────────────────────────────────────────────────────────────────────────────────
+
+    def formula(mut self, text: String) raises -> Int:
+        """Adds (or replaces) a formula column from "name = expression"; returns its column index. Column
+        expressions only: + - * / // % min max, unary minus, numbers, parentheses. Decimal-aware as the app's:
+        + - % min max bring both sides to one scale, * adds scales (then back to 2 places past 2), / gives 2 places
+        (the numerator pre-scaled), // gives a whole number."""
+        var eq = text.find("=")
+        if eq < 0:
+            raise Error("a formula looks like: margin = revenue - cost")
+        var name = String(String(text[byte=:eq]).strip())
+        if name.byte_length() == 0:
+            raise Error("the formula needs a name")
+        if self.base.index(name) >= 0:
+            raise Error("`" + name + "` is a stored column; a formula needs a new name")
+        var body = String(text[byte=eq + 1:])
+        var p = _FormulaParser(body, self)
+        var r = p.expr()
+        if p.peek() != "":
+            raise Error("unexpected `" + p.peek() + "` in the formula")
+        for k in range(len(self.formulas)):
+            if self.formulas[k].name == name:
+                self.formulas[k] = Formula(name, text, r[0].copy(), r[1])
+                _ = self.program(self.stored() + k)          # a cycle raises here
+                self.edits += 1
+                return self.stored() + k
+        self.formulas.append(Formula(name, text, r[0].copy(), r[1]))
+        try:
+            _ = self.program(self.columns() - 1)
+        except e:
+            _ = self.formulas.pop()
+            raise e^
+        self.edits += 1
+        return self.columns() - 1
+
+    def formula_text(self, m: Int) -> String:
+        return self.formulas[m - self.stored()].text
+
+    def program(self, c: Int) raises -> Expr:
+        """Column c as an expression over stored columns: formulas inlined, merges applied."""
+        return self.expand(col(self.name(c)))
+
+    def expand(self, e: Expr) raises -> Expr:
+        """e with every formula reference inlined and every merged text column remapped."""
+        return _expand(e, self.base, self.formulas, self.aliases, 0)
+
+    def depends(self, m: Int, c: Int) raises -> Bool:
+        """Does column m (a formula) read column c, directly or through other formulas?"""
+        var target = self.name(c)
+        for name in self._reads(m, 0):
+            if name == target:
+                return True
+        return False
+
+    def _reads(self, m: Int, depth: Int) raises -> List[String]:
+        if depth > 32:
+            raise Error("formulas refer to each other in a cycle")
+        var out = List[String]()
+        if m < self.stored():
+            return out^
+        for name in self.formulas[m - self.stored()].expr.columns():
+            out.append(name)
+            var k = self.index(name)
+            if k >= self.stored():
+                out.extend(self._reads(k, depth + 1))
+        return out^
+
+    def dependants(self, c: Int) raises -> List[String]:
+        """The formulas that read column c (directly or not)."""
+        var out = List[String]()
+        for k in range(len(self.formulas)):
+            if self.depends(self.stored() + k, c):
+                out.append(self.formulas[k].name)
+        return out^
+
+    # ── evaluating one row (the CPU side of queries over edits, and `get` on a formula) ──────────────
+
+    def evaluate(self, e: Expr, row: Int) raises -> Tuple[Int64, Bool]:
+        """(value, null) of an expression over stored columns (as `expand` gives) on one row."""
+        return _eval_row(e, self.base, self.raw_row(row))
+
+    def raw_row(self, row: Int) -> List[Int64]:
+        """The row's stored values as edited (NULL_EDIT for null), before merges."""
+        var out = List[Int64]()
+        for c in range(self.stored()):
+            out.append(self._raw(c, row))
+        return out^
+
+    def overlay(self) raises -> Overlay:
+        """What a query needs of this session, copied: its formulas and merges (to expand expressions), the shared
+        rows it changed (a bitmap the kernel skips) and the values of its changed and appended rows."""
+        var o = Overlay(self.base)
+        o.formulas = self.formulas.copy()
+        o.aliases = self.aliases.copy()
+        var n = self.base.rows()
+        var changed = self.changed_rows()
+        if len(changed) > 0:
+            o.mask = List[UInt8](length=(n + 7) // 8, fill=0xFF)
+            for row in changed:
+                if row < n:
+                    o.mask[row // 8] &= ~(UInt8(1) << UInt8(row % 8))
+                if self.alive(row):
+                    o.delta.append(self.raw_row(row))
+        return o^
+
+    # ── sort ────────────────────────────────────────────────────────────────────────────────────────
+
+    def permutation(self, c: Int, descending: Bool = False) raises -> List[Int]:
+        """The live rows in the column's order, stable (ties keep row order); text alphabetical (by bytes, merges
+        applied), nulls last either way. The data never moves."""
+        var keys = List[Int64]()
+        var nulls = List[Bool]()
+        var rows = List[Int]()
+        var rank = List[Int64]()
+        var text = c < self.stored() and self.base.kind(c) == TEXT
+        if text:                                             # each code's place among the words, alphabetically
+            var n = len(self.base.dictionary(c)) + len(self.words[c])
+            var order = List[Int]()
+            for k in range(n):
+                order.append(k)
+            _merge_sort_by_text(order, self, c)
+            rank = List[Int64](length=n, fill=0)
+            for i in range(n):
+                rank[order[i]] = Int64(i)
+        var prog = self.program(c) if c >= self.stored() else Expr(0)
+        for row in range(self.rows()):
+            if not self.alive(row):
+                continue
+            rows.append(row)
+            if c >= self.stored():
+                var v = self.evaluate(prog, row)
+                keys.append(v[0])
+                nulls.append(v[1])
+            else:
+                var raw = self._raw(c, row)
+                nulls.append(raw == NULL_EDIT)
+                var v = self.alias(c, raw) if raw != NULL_EDIT else 0
+                keys.append(rank[Int(v)] if text and raw != NULL_EDIT else v)
+        var idx = List[Int]()
+        for i in range(len(rows)):
+            idx.append(i)
+        _merge_sort_rows(idx, keys, nulls, descending)
+        var out = List[Int]()
+        for i in idx:
+            out.append(rows[i])
+        return out^
+
+    # ── saving ──────────────────────────────────────────────────────────────────────────────────────
+
+    def bake(self) raises -> Table:
+        """A new table with this session's edits applied (removed rows gone, merges folded, session words added);
+        formulas are not stored (their texts go in the document's metadata)."""
+        var t = Table.empty()
+        for c in range(self.stored()):
+            _ = t.add_column(self.base.name(c), self.base.kind(c), scale=self.base.scale(c))
+            if self.base.kind(c) == TEXT:
+                for k in range(len(self.base.dictionary(c)) + len(self.words[c])):
+                    _ = t.add_word(c, self.text_of(c, Int64(k)))
+        for row in range(self.rows()):
+            if not self.alive(row):
+                continue
+            for c in range(self.stored()):
+                var raw = self._raw(c, row)
+                if raw == NULL_EDIT:
+                    t.append_null(c)
+                else:
+                    t.append(c, self.alias(c, raw))
+        return t^
+
+
+def _text_less(f: Frame, c: Int, a: Int, b: Int) -> Bool:
+    var x = f.text_of(c, Int64(a)).as_bytes()
+    var y = f.text_of(c, Int64(b)).as_bytes()
+    for i in range(min(len(x), len(y))):
+        if x[i] != y[i]:
+            return x[i] < y[i]
+    return len(x) < len(y)
+
+
+def _merge_sort_by_text(mut idx: List[Int], f: Frame, c: Int):
+    var n = len(idx)
+    var tmp = List[Int](length=n, fill=0)
+    var width = 1
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid and j < hi:
+                if _text_less(f, c, idx[j], idx[i]):
+                    tmp[k] = idx[j]
+                    j += 1
+                else:
+                    tmp[k] = idx[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                tmp[k] = idx[i]
+                i += 1
+                k += 1
+            while j < hi:
+                tmp[k] = idx[j]
+                j += 1
+                k += 1
+            lo += 2 * width
+        for t in range(n):
+            idx[t] = tmp[t]
+        width *= 2
+
+
+def _before(keys: List[Int64], nulls: List[Bool], a: Int, b: Int, descending: Bool) -> Bool:
+    """Does row a sort strictly before row b? Nulls last; ties are not before (stability)."""
+    if nulls[a] or nulls[b]:
+        return not nulls[a] and nulls[b]
+    return keys[a] > keys[b] if descending else keys[a] < keys[b]
+
+
+def _merge_sort_rows(mut idx: List[Int], keys: List[Int64], nulls: List[Bool], descending: Bool):
+    """A stable bottom-up merge sort of row positions."""
+    var n = len(idx)
+    var tmp = List[Int](length=n, fill=0)
+    var width = 1
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid and j < hi:
+                if _before(keys, nulls, idx[j], idx[i], descending):
+                    tmp[k] = idx[j]
+                    j += 1
+                else:
+                    tmp[k] = idx[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                tmp[k] = idx[i]
+                i += 1
+                k += 1
+            while j < hi:
+                tmp[k] = idx[j]
+                j += 1
+                k += 1
+            lo += 2 * width
+        for t in range(n):
+            idx[t] = tmp[t]
+        width *= 2
+
+
+# ── the formula parser (the app's grammar and decimal rules) ──────────────────────────────────────────
+
+struct _FormulaParser:
+    var text: String
+    var pos: Int
+    var names: List[String]
+    var scales: List[Int]
+
+    def __init__(out self, text: String, f: Frame) raises:
+        self.text = text
+        self.pos = 0
+        self.names = List[String]()
+        self.scales = List[Int]()
+        for c in range(f.columns()):
+            self.names.append(f.name(c))
+            self.scales.append(f.scale(c))
+
+    def peek(mut self) -> String:
+        while self.pos < self.text.byte_length() and String(self.text[byte=self.pos:self.pos + 1]) == " ":
+            self.pos += 1
+        if self.pos >= self.text.byte_length():
+            return ""
+        return String(self.text[byte=self.pos:self.pos + 1])
+
+    def expr(mut self) raises -> Tuple[Expr, Int]:
+        var left = self.term()
+        while self.peek() == "+" or self.peek() == "-":
+            var op = self.peek()
+            self.pos += 1
+            var right = self.term()
+            var a = _align(left^, right^)
+            left = ((a[0] + a[1]) if op == "+" else (a[0] - a[1]), a[2])
+        return left^
+
+    def term(mut self) raises -> Tuple[Expr, Int]:
+        var left = self.factor()
+        while True:
+            var c = self.peek()
+            if c == "*":
+                self.pos += 1
+                var right = self.factor()
+                var e = left[0] * right[0]
+                var s = left[1] + right[1]
+                if s > 2:                                    # keep money at cents
+                    e = e // Expr(Int(_pow10(s - 2)))
+                    s = 2
+                left = (e^, s)
+            elif c == "/":
+                self.pos += 1
+                if self.pos < self.text.byte_length() and String(self.text[byte=self.pos:self.pos + 1]) == "/":
+                    self.pos += 1
+                    var right = self.factor()
+                    var a = _align(left^, right^)
+                    left = (a[0] // a[1], 0)
+                else:
+                    var right = self.factor()
+                    var k = 2 - left[1] + right[1]           # (a * 10^k) // b has 2 decimal places
+                    var num = left[0] * Expr(Int(_pow10(k))) if k > 0 else left[0].copy()
+                    var den = right[0] * Expr(Int(_pow10(-k))) if k < 0 else right[0].copy()
+                    left = (num // den, 2)
+            elif c == "%":
+                self.pos += 1
+                var right = self.factor()
+                var a = _align(left^, right^)
+                left = (a[0] % a[1], a[2])
+            else:
+                return left^
+
+    def factor(mut self) raises -> Tuple[Expr, Int]:
+        var c = self.peek()
+        if c == "":
+            raise Error("the formula ends early")
+        if c == "-":
+            self.pos += 1
+            var f = self.factor()
+            return (-f[0], f[1])
+        if c == "(":
+            self.pos += 1
+            var e = self.expr()
+            if self.peek() != ")":
+                raise Error("missing ) in the formula")
+            self.pos += 1
+            return e^
+        var o = ord(c)
+        if (ord("0") <= o <= ord("9")) or c == ".":
+            var start = self.pos
+            while self.pos < self.text.byte_length():
+                var ch = ord(String(self.text[byte=self.pos:self.pos + 1]))
+                if (ord("0") <= ch <= ord("9")) or ch == ord("."):
+                    self.pos += 1
+                else:
+                    break
+            var num = String(self.text[byte=start:self.pos])
+            var dot = num.find(".")
+            var scale = 0 if dot < 0 else num.byte_length() - dot - 1
+            var out: Int64 = 0
+            var places = 0
+            var np = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(num.unsafe_ptr()))
+            var ok = _parse_decimal(np, num.byte_length(), scale, out, places)
+            _ = num.byte_length()
+            if not ok:
+                raise Error("`" + num + "` isn't a number")
+            return (Expr(Int(out)), scale)
+        if c == "_" or (ord("a") <= o <= ord("z")) or (ord("A") <= o <= ord("Z")):
+            var start = self.pos
+            while self.pos < self.text.byte_length():
+                var ch = ord(String(self.text[byte=self.pos:self.pos + 1]))
+                if ch == ord("_") or (ord("a") <= ch <= ord("z")) or (ord("A") <= ch <= ord("Z")) or (ord("0") <= ch <= ord("9")):
+                    self.pos += 1
+                else:
+                    break
+            var word = String(self.text[byte=start:self.pos])
+            if word == "min" or word == "max":
+                if self.peek() != "(":
+                    raise Error(word + " needs (a, b)")
+                self.pos += 1
+                var a = self.expr()
+                if self.peek() != ",":
+                    raise Error(word + " needs two values: " + word + "(a, b)")
+                self.pos += 1
+                var b = self.expr()
+                if self.peek() != ")":
+                    raise Error("missing ) after " + word + "(a, b")
+                self.pos += 1
+                var al = _align(a^, b^)
+                return ((least(al[0], al[1]) if word == "min" else greatest(al[0], al[1])), al[2])
+            for k in range(len(self.names)):
+                if self.names[k] == word:
+                    return (col(word), self.scales[k])
+            raise Error("column `" + word + "` not found")
+        raise Error("unexpected `" + c + "` in the formula")
+
+
+def _align(var a: Tuple[Expr, Int], var b: Tuple[Expr, Int]) -> Tuple[Expr, Expr, Int]:
+    """Both sides at one scale: the one with fewer decimal places is multiplied up."""
+    if a[1] < b[1]:
+        return (a[0] * Expr(Int(_pow10(b[1] - a[1]))), b[0].copy(), b[1])
+    if b[1] < a[1]:
+        return (a[0].copy(), b[0] * Expr(Int(_pow10(a[1] - b[1]))), a[1])
+    return (a[0].copy(), b[0].copy(), a[1])
+
+
+
+# ── shared with queries: expanding expressions and evaluating rows ───────────────────────────────────
+
+struct Overlay(Copyable, Movable):
+    """A session's changes as a query sees them (copied when the query is built, see `Frame.overlay`)."""
+    var base: SharedTable
+    var formulas: List[Formula]
+    var aliases: Dict[Int, Int64]
+    var mask: List[UInt8]                # empty: no shared row changed; else bit 1 = the shared row is unchanged
+    var delta: List[List[Int64]]         # the live changed and appended rows' stored values (NULL_EDIT: null)
+
+    def __init__(out self, base: SharedTable):
+        self.base = base
+        self.formulas = List[Formula]()
+        self.aliases = Dict[Int, Int64]()
+        self.mask = List[UInt8]()
+        self.delta = List[List[Int64]]()
+
+    def expand(self, e: Expr) raises -> Expr:
+        return _expand(e, self.base, self.formulas, self.aliases, 0)
+
+
+def _has_aliases(aliases: Dict[Int, Int64], c: Int) -> Bool:
+    for k in aliases.keys():
+        if (k >> 32) == c:
+            return True
+    return False
+
+
+def _remapped(base: SharedTable, aliases: Dict[Int, Int64], c: Int) -> Expr:
+    """Column c with its merges applied, in exact integer arithmetic: c + sum_i int(c == a_i) * (t_i - a_i)."""
+    var e = col(base.name(c))
+    for item in aliases.items():
+        if (item.key >> 32) == c:
+            var a = Int(item.key & 0xFFFFFFFF)
+            var flag = Expr((col(base.name(c)) == Expr(a)).nodes.copy())
+            flag.nodes.append(Node(N_BOOL2INT, 0, ""))
+            e = e + flag * Expr(Int(item.value) - a)
+    return e^
+
+
+def _expand(e: Expr, base: SharedTable, formulas: List[Formula], aliases: Dict[Int, Int64], depth: Int) raises -> Expr:
+    """e with every formula reference inlined and every merged text column remapped."""
+    if depth > 32:
+        raise Error("formulas refer to each other in a cycle")
+    var nodes = List[Node]()
+    for n in e.nodes:
+        if n.op != N_COL:
+            nodes.append(n.copy())
+            continue
+        var c = base.index(n.name)
+        if c >= 0:
+            if base.kind(c) == TEXT and _has_aliases(aliases, c):
+                nodes.extend(_remapped(base, aliases, c).nodes.copy())
+            else:
+                nodes.append(n.copy())
+            continue
+        var found = False
+        for f in formulas:
+            if f.name == n.name:
+                nodes.extend(_expand(f.expr, base, formulas, aliases, depth + 1).nodes.copy())
+                found = True
+                break
+        if not found:
+            raise Error("column `" + n.name + "` not found")
+    return Expr(nodes^)
+
+
+def _overflow() -> Error:
+    return Error("a sum or an expression passed the int64 range (about 9.2e18)")
+
+
+def _eval_row(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int64, Bool]:
+    """(value, null) of an expression over stored columns on one row's values (NULL_EDIT: null), with the kernel's
+    semantics: exact int64 (overflow raises), Mojo's floor // and %, x // 0 = x % 0 = 0. A null operand makes the
+    result null, through comparisons and logic too (a filter reading a null is false as a whole)."""
+    var vals = List[Int64]()
+    var nulls = List[Bool]()
+    for n in e.nodes:
+        if n.op == N_COL:
+            var v = raw[base.column(n.name)]
+            vals.append(0 if v == NULL_EDIT else v)
+            nulls.append(v == NULL_EDIT)
+        elif n.op == N_LIT:
+            vals.append(n.value)
+            nulls.append(False)
+        elif n.op == N_NEG or n.op == N_NOT or n.op == N_BOOL2INT:
+            var a = vals.pop()
+            var an = nulls.pop()
+            if n.op == N_NEG and a == Int64.MIN:
+                raise _overflow()
+            vals.append(-a if n.op == N_NEG else Int64(a == 0) if n.op == N_NOT else a)
+            nulls.append(an)
+        else:
+            var b = vals.pop()
+            var a = vals.pop()
+            var bn = nulls.pop()
+            var an = nulls.pop()
+            var v: Int64 = 0
+            if n.op == N_ADD:
+                v = a + b
+                if ((a ^ v) & (b ^ v)) < 0:
+                    raise _overflow()
+            elif n.op == N_SUB:
+                v = a - b
+                if ((a ^ b) & (a ^ v)) < 0:
+                    raise _overflow()
+            elif n.op == N_MUL:
+                v = a * b
+                if (a == -1 and b == Int64.MIN) or (b == -1 and a == Int64.MIN) or (a != 0 and v // a != b):
+                    raise _overflow()
+            elif n.op == N_FLOORDIV:
+                if b == -1 and a == Int64.MIN:
+                    raise _overflow()
+                v = a // b if b != 0 else 0
+            elif n.op == N_MOD:
+                v = a % b if b != 0 and b != -1 else 0
+            elif n.op == N_LEAST:
+                v = min(a, b)
+            elif n.op == N_GREATEST:
+                v = max(a, b)
+            elif n.op == N_LT:
+                v = Int64(a < b)
+            elif n.op == N_LE:
+                v = Int64(a <= b)
+            elif n.op == N_GT:
+                v = Int64(a > b)
+            elif n.op == N_GE:
+                v = Int64(a >= b)
+            elif n.op == N_EQ:
+                v = Int64(a == b)
+            elif n.op == N_NE:
+                v = Int64(a != b)
+            elif n.op == N_AND:
+                v = Int64(a != 0 and b != 0)
+            else:
+                v = Int64(a != 0 or b != 0)
+            vals.append(v)
+            nulls.append(an or bn)
+    return (vals[0], nulls[0])

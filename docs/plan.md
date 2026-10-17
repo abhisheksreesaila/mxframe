@@ -1307,11 +1307,14 @@ Needs: F-131, F-132 · Spec §2 · `mojo/mxframe/thrift.mojo`, `parquet.mojo`, t
 - [x] unsupported input raises a readable error naming the column: DOUBLE / FLOAT / INT96 ("MX frame has no kind for it yet"), nested columns, DECIMAL past 18 digits, other encodings, corrupt offsets
 - [ ] open: the whole file is read into memory (no streaming or mmap); gzip / brotli / lz4 not linked; floats have no MX frame kind (spec §1 lists none); per-value appends (`push`) are not the fastest path for 100M rows
 
-## F-136 M5: edits, formulas, sort [todo]
-Needs: F-133 · Spec §3, §4, §6
-- [ ] `Frame` overlay: set / set_text / append / remove, one undo log, changed_rows, merge, bake
-- [ ] formulas (`+ - * / // % min max`, decimal-aware), dependencies, inlined into aggregations without materialising
-- [ ] `permutation(c, descending)`: stable, text alphabetical, over formulas and edited cells; queries include edits
+## F-136 M5: edits, formulas, sort [review]
+Needs: F-133 · Spec §3, §4, §6 · `mojo/mxframe/frame.mojo`, `query.mojo` (Query over a Frame), test `mojo/tests/test_frame.mojo`
+- [x] `Frame(shared)` overlay with no copy of the shared data: sparse cell edits (`set`, `set_null`, `set_text` parsed by kind with the CSV parsers, values checked: TEXT codes, BOOL 0 / 1), appended rows (`append(values)`, typed text), tombstones (`remove`, `alive`), session words after the shared dictionary, `merge(c, codes, into)` (one step deep, the stand-in's REPOINT bookkeeping), one undo log (a merge undoes as one step), `edits` counter, `changed_rows`, `bake()` (a plain Table: edits, merges, words applied, removed rows gone)
+- [x] formulas `f.formula("margin = revenue - cost")` with the app's grammar and decimal rules (+ - % min max align scales, * adds scales then floors back to 2 places, / pre-scales to 2 places, // whole), formulas over formulas, cycles and errors raise readably; `formula_text`, `depends`, `dependants`, `get`, `program` (formulas inlined, merges applied)
+- [x] queries over a Frame (`Query(f)`): the query copies the frame's overlay when built (formulas, merges, a bitmap of changed shared rows, the changed / appended rows' values: no pointer to the frame); formulas are inlined into the kernel program; a merged text column is remapped in exact integer arithmetic (`c + int(c == a) * (t - a)`, new internal node `N_BOOL2INT`), so keys, pivots and filters all see merges; the kernel skips the changed shared rows (the bitmap through `OP_ISNULL`) and a CPU pass adds the changed and appended rows with the kernel's rules; every aggregate carries a non-null count on a frame
+- [x] `permutation(c, descending)`: stable, nulls last, text alphabetical by bytes over shared and session words with merges applied, formulas evaluated, removed rows left out
+- [x] tests: 400 random edits (sets, nulls, new and old words, appends, removes, a merge) on 50k rows: three queries over the frame (grouped by text with sum / count / count(e) / min / max, a filtered pivot with mean, a filtered global) equal the same queries over `bake()`, and differ from the shared table; undoing everything returns the shared results exactly; formula values for each decimal rule; formula errors and a cycle; sort order with a new word, a null, ties, a removed row; edit value checks
+- [ ] open: sort is a merge sort over per-row values (O(n log n), not the stand-in's radix: 100M rows will be slow); `get` / `evaluate` on a formula expands it per call; formulas are not checked for decimal overflow beyond the int64 checks; the frame mask is rebuilt per query (O(rows / 8))
 
 ## F-137 M6: GPU [todo]
 Needs: F-133, F-136 · Spec §7
