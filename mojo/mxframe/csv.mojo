@@ -1,0 +1,928 @@
+"""CSV and TSV reader (docs/mxframe-mojo-api.md section 2): a file in, a typed `Table` and an import report out.
+
+    var r = read_csv("sales.csv", options=CsvOptions(infer_rows=100_000))
+    r.table; r.rows; r.seconds
+    for c in r.columns: c.name, c.kind, c.scale, c.empty, c.distinct, c.sample, c.failed
+
+How it reads (no Python, no float anywhere):
+  1. The file is memory-mapped (no copy of the whole file); a UTF-8 byte order mark is skipped.
+  2. The header row and then the first `infer_rows` rows choose each column's kind (below).
+  3. Rows are split at safe boundaries so threads can parse in parallel. A newline ends a row only outside quotes, and
+     quotes pair up (a doubled quote is two toggles), so the quote state at any byte is the parity of the quotes
+     before it: a parallel pass counts each chunk's quotes, a prefix XOR gives every chunk's starting state, and each
+     chunk then finds its first row start exactly. No guessing, no fallback.
+  4. Each chunk parses its rows straight into int64 columns (no String per cell: numbers are parsed from the bytes,
+     text goes through a byte-keyed dictionary), then the chunks are stitched together in file order.
+
+Kinds, by the first `infer_rows` rows, empty cells ignored:
+  every value a whole number                       INT
+  numbers, some with a decimal point               DECIMAL, scale 2 if no value has more than 2 decimal places
+                                                   (trailing zeros do not count), else scale 4. The stored value is
+                                                   parsed from the digits (exact); extra digits round half away
+                                                   from zero.
+  YYYY-MM-DD, or an ISO timestamp                  DATE (days since 1970; the time of day is dropped)
+  true / false in any case                         BOOL
+  anything else (or nothing but empty cells)       TEXT
+An empty cell (or `""`) is a null. A value past the window that does not fit its column's kind is not an error: the
+cell becomes a null and the column's report gets a failed row, "row 41,207: `12.x` isn't a number".
+
+File format decisions:
+  - RFC 4180 quoting; a quote anywhere in a field toggles quoting (so a stray quote in the middle of an unquoted
+    field swallows delimiters and newlines up to the next quote: write such fields quoted).
+  - Rows end at `\\n`; a `\\r` right before it is dropped. Completely empty lines are skipped.
+  - A row with fewer cells than the header gets nulls; a row with more keeps its first cells and is reported in
+    `ragged` (row number and the row's text), the extra cells are dropped.
+  - Row numbers count data rows from 1 (the header is not a row). Failed rows are capped at 1000 per column
+    (`failed_count` has the true number).
+  - Columns past `max_columns` are not read (`skipped` names them). Empty and repeated header names become
+    `column_N` and `name_2`, `name_3`...
+  - Not supported yet: exponent numbers (`1e5` is TEXT), thousands separators, a lone `\\r` as a line end, a
+    non-UTF-8 encoding. The parsed columns are held twice for a moment while the chunks are stitched together.
+"""
+from std.ffi import external_call
+from std.memory import Pointer
+from std.sys.info import num_physical_cores
+from std.time import perf_counter_ns
+from std.collections import Dict
+from .table import Table, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+from .kernels._fpenv import par_n
+
+comptime BP = Pointer[UInt8, MutUntrackedOrigin]
+comptime LP = Pointer[Int64, MutUntrackedOrigin]
+
+comptime _QUOTE = 34
+comptime _NL = 10
+comptime _CR = 13
+comptime _MAX_FAILED = 1000
+comptime _SAMPLE_ROWS = 8
+comptime _MAX_CHUNKS = 512
+
+
+# ── public types ────────────────────────────────────────────────────────────────────────────────
+
+
+struct CsvOptions(Copyable, Movable):
+    """`delimiter`: one byte, "" picks a tab for `.tsv` / `.tab` files and a comma for the rest. `threads` 0 uses
+    every core, 1 parses on one thread (the reference the tests compare to). `chunk_bytes`: the smallest piece
+    given to a thread (lower it only to test)."""
+
+    var delimiter: String
+    var has_header: Bool
+    var max_columns: Int
+    var infer_rows: Int
+    var threads: Int
+    var chunk_bytes: Int
+
+    def __init__(out self, delimiter: String = "", has_header: Bool = True, max_columns: Int = 4096,
+                 infer_rows: Int = 100_000, threads: Int = 0, chunk_bytes: Int = 1 << 22):
+        self.delimiter = delimiter
+        self.has_header = has_header
+        self.max_columns = max_columns
+        self.infer_rows = infer_rows
+        self.threads = threads
+        self.chunk_bytes = chunk_bytes
+
+
+struct FailedRow(Copyable, Movable):
+    """A row (or a cell in it) that could not be read: its number and the raw text, plus why."""
+
+    var row: Int
+    var text: String
+    var reason: String
+
+    def __init__(out self, row: Int, text: String, reason: String):
+        self.row = row
+        self.text = text
+        self.reason = reason
+
+    def message(self) -> String:
+        return "row " + _commas(self.row) + ": `" + self.text + "` " + self.reason
+
+
+struct CsvColumn(Copyable, Movable):
+    """The Import step's view of one column."""
+
+    var name: String
+    var kind: ColumnKind
+    var scale: Int
+    var empty: Int  # empty cells (nulls from short rows count too)
+    var distinct: Int  # TEXT: words in its dictionary, 0 for the other kinds
+    var sample: List[String]  # the first rows, as written (quotes removed)
+    var failed: List[FailedRow]  # cells that did not fit `kind`, now null (at most 1000)
+    var failed_count: Int
+
+    def __init__(out self, name: String, kind: ColumnKind, scale: Int):
+        self.name = name
+        self.kind = kind
+        self.scale = scale
+        self.empty = 0
+        self.distinct = 0
+        self.sample = List[String]()
+        self.failed = List[FailedRow]()
+        self.failed_count = 0
+
+
+struct CsvResult(Movable):
+    var table: Table
+    var rows: Int
+    var seconds: Float64
+    var columns: List[CsvColumn]
+    var skipped: List[String]  # header names past `max_columns`
+    var ragged: List[FailedRow]  # rows with more cells than the header (at most 1000)
+    var ragged_count: Int
+
+    def __init__(out self):
+        self.table = Table()
+        self.rows = 0
+        self.seconds = 0.0
+        self.columns = List[CsvColumn]()
+        self.skipped = List[String]()
+        self.ragged = List[FailedRow]()
+        self.ragged_count = 0
+
+
+# ── cell parsers (bytes in, exact int64 out; no String, no float) ──────────────────────────────
+
+
+@always_inline
+def _digit_ok(v: UInt64, d: UInt64, extra: UInt64) -> Bool:
+    """Whether v * 10 + d still fits int64 (extra = 1 allows 2^63, for a negative number)."""
+    return v < 922337203685477580 or (v == 922337203685477580 and d <= 7 + extra)
+
+
+def _parse_int(p: BP, n: Int, mut out: Int64) -> Bool:
+    var i = 0
+    var neg = p[0] == 45
+    if neg or p[0] == 43:
+        i = 1
+    if i >= n:
+        return False
+    var extra = UInt64(1) if neg else UInt64(0)
+    var v = UInt64(0)
+    while i < n:
+        var d = Int(p[i]) - 48
+        if d < 0 or d > 9 or not _digit_ok(v, UInt64(d), extra):
+            return False
+        v = v * 10 + UInt64(d)
+        i += 1
+    if neg:
+        out = Int64.MIN if v == 9223372036854775808 else -Int64(v)
+    else:
+        out = Int64(v)
+    return True
+
+
+def _parse_decimal(p: BP, n: Int, scale: Int, mut out: Int64, mut places: Int) -> Bool:
+    """"-12.5" at scale 2 is -1250. `places`: decimal places without trailing zeros (0 for "5", 1 for "1.50")."""
+    var i = 0
+    var neg = p[0] == 45
+    if neg or p[0] == 43:
+        i = 1
+    var extra = UInt64(1) if neg else UInt64(0)
+    var v = UInt64(0)
+    var digits = 0
+    var frac = 0  # decimal places seen
+    var kept = 0  # decimal places stored
+    var in_frac = False
+    var round_up = False
+    places = 0
+    while i < n:
+        var c = Int(p[i])
+        i += 1
+        if c == 46:
+            if in_frac:
+                return False
+            in_frac = True
+            continue
+        var d = c - 48
+        if d < 0 or d > 9:
+            return False
+        digits += 1
+        if in_frac:
+            frac += 1
+            if d != 0:
+                places = frac
+            if kept == scale:
+                if frac == scale + 1:
+                    round_up = d >= 5
+                continue
+            kept += 1
+        if not _digit_ok(v, UInt64(d), extra):
+            return False
+        v = v * 10 + UInt64(d)
+    if digits == 0:
+        return False
+    while kept < scale:
+        if not _digit_ok(v, 0, extra):
+            return False
+        v *= 10
+        kept += 1
+    if round_up:
+        if v >= 9223372036854775807 + extra:
+            return False
+        v += 1
+    if neg:
+        out = Int64.MIN if v == 9223372036854775808 else -Int64(v)
+    else:
+        out = Int64(v)
+    return True
+
+
+@always_inline
+def _two(p: BP, at: Int) -> Int:
+    """The two digits at p[at], p[at + 1] as a number, or -1."""
+    var a = Int(p[at]) - 48
+    var b = Int(p[at + 1]) - 48
+    return a * 10 + b if 0 <= a <= 9 and 0 <= b <= 9 else -1
+
+
+def days_from_civil(y: Int, m: Int, d: Int) -> Int:
+    """Days since 1970-01-01 of a calendar date (Howard Hinnant's algorithm)."""
+    var yy = y - (1 if m <= 2 else 0)
+    var era = (yy if yy >= 0 else yy - 399) // 400
+    var yoe = yy - era * 400
+    var doy = (153 * (m + (-3 if m > 2 else 9)) + 2) // 5 + d - 1
+    var doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def _days_in_month(y: Int, m: Int) -> Int:
+    if m == 2:
+        return 29 if (y % 4 == 0 and y % 100 != 0) or y % 400 == 0 else 28
+    return 30 if m == 4 or m == 6 or m == 9 or m == 11 else 31
+
+
+def _parse_date(p: BP, n: Int, mut out: Int64) -> Bool:
+    """YYYY-MM-DD, or that followed by `T` or a space and HH:MM[:SS[.fraction]][Z | +HH[:MM]]."""
+    if n < 10 or p[4] != 45 or p[7] != 45:
+        return False
+    var hi = _two(p, 0)
+    var lo = _two(p, 2)
+    var m = _two(p, 5)
+    var d = _two(p, 8)
+    if hi < 0 or lo < 0 or m < 1 or m > 12 or d < 1:
+        return False
+    var y = hi * 100 + lo
+    if d > _days_in_month(y, m):
+        return False
+    if n > 10:
+        if (p[10] != 84 and p[10] != 32) or n < 16 or p[13] != 58:
+            return False
+        var hh = _two(p, 11)
+        var mm = _two(p, 14)
+        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+            return False
+        var i = 16
+        if i < n and p[i] == 58:
+            if i + 3 > n:
+                return False
+            var ss = _two(p, i + 1)
+            if ss < 0 or ss > 60:
+                return False
+            i += 3
+            if i < n and p[i] == 46:
+                i += 1
+                var start = i
+                while i < n and p[i] >= 48 and p[i] <= 57:
+                    i += 1
+                if i == start:
+                    return False
+        if i < n:
+            if p[i] == 90:
+                i += 1
+            elif p[i] == 43 or p[i] == 45:
+                if i + 3 > n or _two(p, i + 1) < 0:
+                    return False
+                i += 3
+                if i < n and p[i] == 58:
+                    i += 1
+                if i < n:
+                    if i + 2 != n or _two(p, i) < 0:
+                        return False
+                    i += 2
+            if i != n:
+                return False
+    out = Int64(days_from_civil(y, m, d))
+    return True
+
+
+def _parse_bool(p: BP, n: Int, mut out: Int64) -> Bool:
+    """true / false in any case."""
+    if n == 4 and (p[0] | 32) == 116 and (p[1] | 32) == 114 and (p[2] | 32) == 117 and (p[3] | 32) == 101:
+        out = 1
+        return True
+    if n == 5 and (p[0] | 32) == 102 and (p[1] | 32) == 97 and (p[2] | 32) == 108 and (p[3] | 32) == 115 \
+            and (p[4] | 32) == 101:
+        out = 0
+        return True
+    return False
+
+
+# ── small helpers ───────────────────────────────────────────────────────────────────────────────
+
+
+def _str(p: BP, n: Int) -> String:
+    return String(unsafe_from_utf8=Span[UInt8, MutUntrackedOrigin](unsafe_ptr=p, length=n))
+
+
+def _clip(p: BP, n: Int, limit: Int) -> String:
+    """The bytes as text, cut to at most `limit` bytes without splitting a UTF-8 character."""
+    if n <= limit:
+        return _str(p, n)
+    var m = limit
+    while m > 0 and (p[m] & 0xC0) == 0x80:
+        m -= 1
+    return _str(p, m) + "..."
+
+
+def _commas(n: Int) -> String:
+    var s = String(n)
+    var out = String()
+    var first = s.byte_length() % 3
+    for i in range(s.byte_length()):
+        if i > 0 and (i - first) % 3 == 0:
+            out += ","
+        out += s[byte=i]
+    return out
+
+
+def _reason(kind: Int) -> String:
+    if kind == INT.value:
+        return "isn't a whole number"
+    if kind == DECIMAL.value:
+        return "isn't a number"
+    if kind == DATE.value:
+        return "isn't a date (YYYY-MM-DD)"
+    return "isn't true or false"
+
+
+struct WordTable(Movable):
+    """A dictionary keyed by bytes: the code of a text cell is found without building a String; a word is stored once."""
+
+    var arena: List[UInt8]
+    var starts: List[Int]
+    var lens: List[Int]
+    var hashes: List[UInt64]
+    var slots: List[Int32]  # code + 1, 0 = free
+    var mask: Int
+
+    def __init__(out self):
+        self.arena = List[UInt8]()
+        self.starts = List[Int]()
+        self.lens = List[Int]()
+        self.hashes = List[UInt64]()
+        self.slots = List[Int32](length=64, fill=0)
+        self.mask = 63
+
+    def code_of(mut self, p: BP, n: Int) -> Int:
+        var h = UInt64(14695981039346656037)
+        for i in range(n):
+            h = (h ^ UInt64(p[i])) * 1099511628211
+        h ^= h >> 29
+        var i = Int(h) & self.mask
+        while True:
+            var s = Int(self.slots[i])
+            if s == 0:
+                break
+            var code = s - 1
+            if self.hashes[code] == h and self.lens[code] == n:
+                var base = self.arena.unsafe_ptr() + self.starts[code]
+                var same = True
+                for k in range(n):
+                    if base[k] != p[k]:
+                        same = False
+                        break
+                if same:
+                    return code
+            i = (i + 1) & self.mask
+        var code = len(self.starts)
+        self.starts.append(len(self.arena))
+        self.lens.append(n)
+        self.hashes.append(h)
+        for k in range(n):
+            self.arena.append(p[k])
+        self.slots[i] = Int32(code + 1)
+        if (code + 1) * 2 > len(self.slots):
+            self._grow()
+        return code
+
+    def _grow(mut self):
+        var size = len(self.slots) * 2
+        self.slots = List[Int32](length=size, fill=0)
+        self.mask = size - 1
+        for code in range(len(self.starts)):
+            var i = Int(self.hashes[code]) & self.mask
+            while self.slots[i] != 0:
+                i = (i + 1) & self.mask
+            self.slots[i] = Int32(code + 1)
+
+    def word(self, code: Int) -> String:
+        return _str(BP(unsafe_from_address=Int(self.arena.unsafe_ptr()) + self.starts[code]), self.lens[code])
+
+
+# ── the row walker: splits bytes into rows and cells, hands each cell to a sink ────────────────
+
+
+trait CellSink:
+    def cell(mut self, col: Int, p: BP, n: Int): ...
+    def end_row(mut self, ncells: Int, row: BP, row_len: Int): ...
+
+
+def _walk[S: CellSink](data: BP, start: Int, end: Int, delim: UInt8, max_rows: Int, mut sink: S) -> Int:
+    """Reads rows from `start` up to `end` (a row start, or the end of the data) or `max_rows` rows, whichever
+    comes first; returns the position after the last row read. Quoted cells are unquoted into a scratch buffer
+    before the sink sees them; everything else is passed in place."""
+    var pos = start
+    var rows = 0
+    var scratch = List[UInt8]()
+    while pos < end and rows < max_rows:
+        if data[pos] == _NL:
+            pos += 1
+            continue
+        if data[pos] == _CR and (pos + 1 == end or data[pos + 1] == _NL):
+            pos += 2 if pos + 1 < end else 1
+            continue
+        var row_start = pos
+        var col = 0
+        while True:
+            var fstart = pos
+            var inq = False
+            var quoted = False
+            while pos < end:
+                var b = data[pos]
+                if b == _QUOTE:
+                    inq = not inq
+                    quoted = True
+                elif not inq and (b == delim or b == _NL):
+                    break
+                pos += 1
+            var fend = pos
+            var row_done = pos >= end or data[pos] == _NL
+            if row_done and not inq and fend > fstart and data[fend - 1] == _CR:
+                fend -= 1
+            if not quoted:
+                sink.cell(col, data + fstart, fend - fstart)
+            else:
+                if len(scratch) < fend - fstart:
+                    scratch.resize(fend - fstart, 0)
+                var out = scratch.unsafe_ptr()
+                var n = 0
+                var q = False
+                var i = fstart
+                while i < fend:
+                    var b = data[i]
+                    if b == _QUOTE:
+                        if q and i + 1 < fend and data[i + 1] == _QUOTE:
+                            out[n] = _QUOTE
+                            n += 1
+                            i += 1
+                        else:
+                            q = not q
+                    else:
+                        out[n] = b
+                        n += 1
+                    i += 1
+                sink.cell(col, BP(unsafe_from_address=Int(out)), n)
+            col += 1
+            if row_done:
+                sink.end_row(col, data + row_start, fend - row_start)
+                if pos < end:
+                    pos += 1
+                break
+            pos += 1
+        rows += 1
+    return pos
+
+
+# ── sinks ───────────────────────────────────────────────────────────────────────────────────────
+
+
+struct HeaderSink(CellSink, Movable):
+    var names: List[String]
+    var cells: Int
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.cells = 0
+
+    def cell(mut self, col: Int, p: BP, n: Int):
+        self.names.append(_str(p, n))
+
+    def end_row(mut self, ncells: Int, row: BP, row_len: Int):
+        self.cells = ncells
+
+
+struct InferCol(Copyable, Movable):
+    var can_int: Bool
+    var can_dec: Bool
+    var can_date: Bool
+    var can_bool: Bool
+    var places: Int
+    var nonempty: Int
+    var sample: List[String]
+
+    def __init__(out self):
+        self.can_int = True
+        self.can_dec = True
+        self.can_date = True
+        self.can_bool = True
+        self.places = 0
+        self.nonempty = 0
+        self.sample = List[String]()
+
+
+struct InferSink(CellSink, Movable):
+    """Chooses each column's kind from the rows it is given."""
+
+    var ncols: Int
+    var cols: List[InferCol]
+
+    def __init__(out self, ncols: Int):
+        self.ncols = ncols
+        self.cols = List[InferCol]()
+        for _ in range(ncols):
+            self.cols.append(InferCol())
+
+    def cell(mut self, col: Int, p: BP, n: Int):
+        if col >= self.ncols:
+            return
+        ref s = self.cols[col]
+        if len(s.sample) < _SAMPLE_ROWS:
+            s.sample.append(_clip(p, n, 100))
+        if n == 0:
+            return
+        s.nonempty += 1
+        var v = Int64(0)
+        if s.can_int and not _parse_int(p, n, v):
+            s.can_int = False
+        if s.can_dec:
+            var places = 0
+            if _parse_decimal(p, n, 0, v, places):  # (the scale is chosen from `places` afterwards)
+                if places > s.places:
+                    s.places = places
+            else:
+                s.can_dec = False
+        if s.can_date and not _parse_date(p, n, v):
+            s.can_date = False
+        if s.can_bool and not _parse_bool(p, n, v):
+            s.can_bool = False
+
+    def end_row(mut self, ncells: Int, row: BP, row_len: Int):
+        pass
+
+
+struct _Fail(Copyable, Movable):
+    var row: Int  # within the chunk
+    var text: String
+    var reason: String
+
+    def __init__(out self, row: Int, text: String, reason: String):
+        self.row = row
+        self.text = text
+        self.reason = reason
+
+
+struct ChunkCol(Movable):
+    var kind: Int
+    var scale: Int
+    var vals: List[Int64]
+    var nulls: List[Int]  # rows (within the chunk) that are null
+    var words: WordTable
+    var remap: List[Int64]  # chunk code -> table code
+    var empty: Int
+    var fails: List[_Fail]
+    var fail_count: Int
+
+    def __init__(out self, kind: Int, scale: Int):
+        self.kind = kind
+        self.scale = scale
+        self.vals = List[Int64]()
+        self.nulls = List[Int]()
+        self.words = WordTable()
+        self.remap = List[Int64]()
+        self.empty = 0
+        self.fails = List[_Fail]()
+        self.fail_count = 0
+
+
+struct ChunkSink(CellSink, Movable):
+    """Parses the rows of one chunk into typed columns."""
+
+    var ncols: Int
+    var cols: List[ChunkCol]
+    var rows: Int
+    var ragged: List[_Fail]
+    var ragged_count: Int
+
+    def __init__(out self, kinds: List[Int], scales: List[Int]):
+        self.ncols = len(kinds)
+        self.cols = List[ChunkCol]()
+        for c in range(len(kinds)):
+            self.cols.append(ChunkCol(kinds[c], scales[c]))
+        self.rows = 0
+        self.ragged = List[_Fail]()
+        self.ragged_count = 0
+
+    def cell(mut self, col: Int, p: BP, n: Int):
+        if col >= self.ncols:
+            return
+        ref c = self.cols[col]
+        if n == 0:
+            c.vals.append(0)
+            c.nulls.append(self.rows)
+            c.empty += 1
+            return
+        var v = Int64(0)
+        var ok = True
+        if c.kind == TEXT.value:
+            v = Int64(c.words.code_of(p, n))
+        elif c.kind == INT.value:
+            ok = _parse_int(p, n, v)
+        elif c.kind == DECIMAL.value:
+            var places = 0
+            ok = _parse_decimal(p, n, c.scale, v, places)
+        elif c.kind == DATE.value:
+            ok = _parse_date(p, n, v)
+        else:
+            ok = _parse_bool(p, n, v)
+        if ok:
+            c.vals.append(v)
+        else:
+            c.vals.append(0)
+            c.nulls.append(self.rows)
+            c.fail_count += 1
+            if len(c.fails) < _MAX_FAILED:
+                c.fails.append(_Fail(self.rows, _clip(p, n, 200), _reason(c.kind)))
+
+    def end_row(mut self, ncells: Int, row: BP, row_len: Int):
+        for col in range(ncells, self.ncols):  # a short row: the missing cells are empty
+            self.cols[col].vals.append(0)
+            self.cols[col].nulls.append(self.rows)
+            self.cols[col].empty += 1
+        if ncells > self.ncols:
+            self.ragged_count += 1
+            if len(self.ragged) < _MAX_FAILED:
+                self.ragged.append(_Fail(self.rows, _clip(row, row_len, 200),
+                                         "has " + String(ncells) + " cells, the header has " + String(self.ncols) +
+                                         "; the extra cells were dropped"))
+        self.rows += 1
+
+
+# ── the reader ──────────────────────────────────────────────────────────────────────────────────
+
+
+def read_csv(path: String, options: CsvOptions = CsvOptions()) raises -> CsvResult:
+    """Reads a CSV or TSV file into a `Table` with an import report. Raises (readable message) only when the file
+    cannot be opened or the options are unusable; bad values never raise, they become nulls and failed rows."""
+    var start_ns = perf_counter_ns()
+    var delim = _delimiter(path, options.delimiter)
+    if options.max_columns < 1:
+        raise Error("max_columns must be at least 1, not " + String(options.max_columns))
+    var file: FileHandle
+    try:
+        file = open(path, "r")
+    except:
+        raise Error("couldn't open `" + path + "`: no such file, or no permission to read it")
+    var fd = file._get_raw_fd()
+    var size = external_call["lseek", Int](fd, Int(0), Int32(2))
+    if size < 0:
+        file.close()
+        raise Error("couldn't read `" + path + "`: not a regular file")
+    var result = CsvResult()
+    if size > 0:
+        var addr = external_call["mmap", Int](Int(0), size, Int32(1), Int32(2), fd, Int(0))
+        file.close()  # the mapping stays valid
+        if addr == -1:
+            raise Error("couldn't read `" + path + "`: the file could not be mapped into memory")
+        try:
+            _parse(BP(unsafe_from_address=addr), size, delim, options, result)
+        except e:
+            _ = external_call["munmap", Int32](addr, size)
+            raise Error(String(e))
+        _ = external_call["munmap", Int32](addr, size)
+    else:
+        file.close()
+    result.seconds = Float64(perf_counter_ns() - start_ns) / 1e9
+    return result^
+
+
+def _delimiter(path: String, requested: String) raises -> UInt8:
+    if requested == "":
+        return 9 if path.endswith(".tsv") or path.endswith(".tab") else 44
+    if len(requested.as_bytes()) != 1:
+        raise Error("the delimiter must be one character, not `" + requested + "`")
+    var b = requested.as_bytes()[0]
+    if b == _QUOTE or b == _NL or b == _CR:
+        raise Error("the delimiter can't be a quote or a line break")
+    return b
+
+
+def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: CsvResult) raises:
+    var body = 0
+    if size >= 3 and data[0] == 0xEF and data[1] == 0xBB and data[2] == 0xBF:
+        body = 3
+
+    # header: the first row's cells (or their count, when the file has no header)
+    var head = HeaderSink()
+    var after_first = _walk(data, body, size, delim, 1, head)
+    if head.cells == 0:  # nothing but blank lines
+        return
+    var ncols = min(head.cells, options.max_columns)
+    var names = List[String]()
+    var seen = Dict[String, Int]()
+    for c in range(ncols):
+        var name = head.names[c] if options.has_header else String()
+        if name == "":
+            name = "column_" + String(c + 1)
+        if name in seen:
+            var k = seen[name] + 1
+            seen[name] = k
+            var alt = name + "_" + String(k)
+            while alt in seen:
+                k += 1
+                alt = name + "_" + String(k)
+            seen[name] = k
+            seen[alt] = 1
+            name = alt
+        else:
+            seen[name] = 1
+        names.append(name)
+    if options.has_header:
+        for c in range(ncols, head.cells):
+            result.skipped.append(head.names[c])
+    var first_row = after_first if options.has_header else body
+
+    # kinds from the first `infer_rows` rows
+    var infer = InferSink(ncols)
+    _ = _walk(data, first_row, size, delim, options.infer_rows, infer)
+    var kinds = List[Int]()
+    var scales = List[Int]()
+    for c in range(ncols):
+        ref s = infer.cols[c]
+        var kind = TEXT.value
+        var scale = 0
+        if s.nonempty > 0:
+            if s.can_int:
+                kind = INT.value
+            elif s.can_dec:
+                kind = DECIMAL.value
+                scale = 2 if s.places <= 2 else 4
+            elif s.can_date:
+                kind = DATE.value
+            elif s.can_bool:
+                kind = BOOL.value
+        kinds.append(kind)
+        scales.append(scale)
+
+    # chunks: safe row boundaries found with the quote-parity pre-scan
+    var workers = options.threads if options.threads > 0 else num_physical_cores()
+    var span = size - first_row
+    var nch = 1
+    if workers > 1 and span > 0:
+        nch = max(1, min(span // max(options.chunk_bytes, 1), _MAX_CHUNKS))
+    var bounds = List[Int](length=nch + 1, fill=0)
+    for i in range(nch + 1):
+        bounds[i] = first_row + span * i // nch
+    var parity = List[Int](length=nch, fill=0)
+    var rstart = List[Int](length=nch + 1, fill=0)
+    rstart[nch] = size
+    if nch > 1:
+        var parity_at = Int(parity.unsafe_ptr())
+        var bounds_at = Int(bounds.unsafe_ptr())
+        def count_quotes(i: Int) {imm}:
+            var b = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=bounds_at)
+            var out = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=parity_at)
+            var n = 0
+            for q in range(b[i], b[i + 1]):
+                n += Int(data[q] == _QUOTE)
+            out[i] = n & 1
+        par_n(count_quotes, nch, workers)
+        var state = List[Int](length=nch, fill=0)  # the quote state at the start of each chunk
+        for i in range(1, nch):
+            state[i] = state[i - 1] ^ parity[i - 1]
+        var rstart_at = Int(rstart.unsafe_ptr())
+        var state_at = Int(state.unsafe_ptr())
+        def find_start(t: Int) {imm}:
+            var i = t + 1  # task t finds where chunk t + 1 starts
+            var b = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=bounds_at)
+            var st = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=state_at)
+            var out = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=rstart_at)
+            # scan from the byte before the boundary, so a row starting exactly at the boundary is found
+            var q = b[i] - 1
+            var s = st[i] ^ Int(data[q] == _QUOTE)
+            var found = size
+            while q < size:
+                var byte = data[q]
+                if byte == _QUOTE:
+                    s ^= 1
+                elif byte == _NL and s == 0:
+                    found = q + 1
+                    break
+                q += 1
+            out[i] = found
+        par_n(find_start, nch - 1, workers)
+        _ = state^
+    rstart[0] = first_row
+    for i in range(1, nch):  # keep the starts in order (a chunk with no row start of its own is empty)
+        if rstart[i] < rstart[i - 1]:
+            rstart[i] = rstart[i - 1]
+    _ = parity^
+    _ = bounds^
+
+    var sinks = List[ChunkSink]()
+    for _ in range(nch):
+        sinks.append(ChunkSink(kinds, scales))
+    var sinks_at = Int(sinks.unsafe_ptr())
+    var rstart_at2 = Int(rstart.unsafe_ptr())
+    def parse_chunk(i: Int) {imm}:
+        var rs = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=rstart_at2)
+        var sp = Pointer[ChunkSink, MutUntrackedOrigin](unsafe_from_address=sinks_at)
+        _ = _walk(data, rs[i], rs[i + 1], delim, Int.MAX, (sp + i)[])
+    if nch == 1:
+        parse_chunk(0)
+    else:
+        par_n(parse_chunk, nch, workers)
+    _ = rstart^  # (the tasks read it by address)
+
+    _stitch(sinks, names, kinds, scales, infer, result)
+
+
+def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], scales: List[Int],
+            infer: InferSink, mut result: CsvResult) raises:
+    """Joins the chunks, in file order, into the table and the report."""
+    var nch = len(sinks)
+    var ncols = len(names)
+    var offsets = List[Int](length=nch + 1, fill=0)
+    for i in range(nch):
+        offsets[i + 1] = offsets[i] + sinks[i].rows
+    var total = offsets[nch]
+    var kind_of = List[ColumnKind]()
+    for c in range(ncols):
+        kind_of.append(ColumnKind(kinds[c]))
+        _ = result.table.add_column(names[c], kind_of[c], scales[c])
+        result.table.cols[c].values.resize(total, 0)
+        # a TEXT column's words: each chunk's words, in order, so codes follow first appearance in the file
+        if kinds[c] == TEXT.value:
+            for i in range(nch):
+                ref cc = sinks[i].cols[c]
+                for k in range(len(cc.words.starts)):
+                    cc.remap.append(Int64(result.table.add_word(c, cc.words.word(k))))
+
+    var sinks_at = Int(sinks.unsafe_ptr())
+    var offsets_at = Int(offsets.unsafe_ptr())
+    var tbl = Int(result.table.cols.unsafe_ptr())
+    def copy_chunk(i: Int) {imm}:
+        var sp = Pointer[ChunkSink, MutUntrackedOrigin](unsafe_from_address=sinks_at)
+        var off = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=offsets_at)
+        var cols = Pointer[Column, MutUntrackedOrigin](unsafe_from_address=tbl)
+        for c in range(ncols):
+            var dst = LP(unsafe_from_address=Int(cols[c].values.unsafe_ptr())) + off[i]
+            ref cc = (sp + i)[].cols[c]
+            var n = len(cc.vals)
+            var src = LP(unsafe_from_address=Int(cc.vals.unsafe_ptr()))
+            if cc.kind == TEXT.value and len(cc.remap) > 0:
+                var map = LP(unsafe_from_address=Int(cc.remap.unsafe_ptr()))
+                for r in range(n):
+                    dst[r] = map[Int(src[r])]
+            else:
+                for r in range(n):
+                    dst[r] = src[r]
+    if nch == 1:
+        copy_chunk(0)
+    else:
+        par_n(copy_chunk, nch, num_physical_cores())
+
+    for c in range(ncols):
+        var report = CsvColumn(names[c], kind_of[c], scales[c])
+        report.sample = infer.cols[c].sample.copy()
+        ref col = result.table.cols[c]
+        var nulls = 0
+        for i in range(nch):
+            nulls += len(sinks[i].cols[c].nulls)
+        if nulls > 0:
+            col.validity = List[UInt8](length=(total + 7) // 8, fill=0xFF)
+            col.nulls = nulls
+            for i in range(nch):
+                ref cc = sinks[i].cols[c]
+                for k in range(len(cc.nulls)):
+                    var row = offsets[i] + cc.nulls[k]
+                    col.validity[row >> 3] &= ~(UInt8(1) << UInt8(row & 7))
+                    col.values[row] = 0  # a null's slot holds 0, whatever the cell said
+        for i in range(nch):
+            ref cc = sinks[i].cols[c]
+            report.empty += cc.empty
+            report.failed_count += cc.fail_count
+            for k in range(len(cc.fails)):
+                if len(report.failed) < _MAX_FAILED:
+                    report.failed.append(FailedRow(offsets[i] + cc.fails[k].row + 1, cc.fails[k].text,
+                                                   cc.fails[k].reason))
+        if kinds[c] == TEXT.value:
+            report.distinct = len(col.words)
+        result.columns.append(report^)
+    for i in range(nch):
+        result.ragged_count += sinks[i].ragged_count
+        for k in range(len(sinks[i].ragged)):
+            if len(result.ragged) < _MAX_FAILED:
+                result.ragged.append(FailedRow(offsets[i] + sinks[i].ragged[k].row + 1, sinks[i].ragged[k].text,
+                                               sinks[i].ragged[k].reason))
+    result.rows = total
