@@ -428,10 +428,19 @@ def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
     return (s2.astype(np.int64) << 42) + (s1.astype(np.int64) << 21) + s0.astype(np.int64)
 
 
+# DuckDB divides in an x87 80-bit long double. Where numpy's longdouble is only a double (macOS ARM, Windows) the
+# imitation cannot be built (upper * 2^64 + lower cancels), so the correctly rounded quotient is used: the
+# nearest thing to what DuckDB's own hardware gives. Tests flip this flag to run that path on x86-64.
+_X87 = np.finfo(np.longdouble).nmant >= 63
+
+
 def _ld_div(total: int, n: int) -> float:
     """DuckDB's ``avg`` of an integer: the HUGEINT total, taken as a 64-bit-mantissa ``long double`` (upper * 2^64 +
     lower, one rounding), divided by the count in ``long double`` and rounded to a double (F-126: probed, it is not
-    the correctly rounded total / n: 19 of 19 differing cases agree with this and with no other formula)."""
+    the correctly rounded total / n: 19 of 19 differing cases agree with this and with no other formula). Without
+    an x87 long double: Python's exact integer division, one rounding."""
+    if not _X87:
+        return total / n
     L = np.longdouble
     return float((L(total >> 64) * L(2.0 ** 64) + L(total & ((1 << 64) - 1))) / L(n))
 
@@ -451,15 +460,21 @@ def _int_group_mean(a, valid, g, n_groups, cnt) -> np.ndarray:
 def int_mean_of_totals(tot: np.ndarray, cnt: np.ndarray) -> np.ndarray:
     """Means from exact int64 totals and counts, divided as DuckDB does (`_ld_div`). A count of 0 gives 0.0
     (callers mask it)."""
+    safe = np.maximum(cnt, 1)
     with np.errstate(divide="ignore", invalid="ignore"):
-        res = (tot.astype(np.longdouble) / np.maximum(cnt, 1).astype(np.longdouble)).astype(np.float64)
+        if _X87:
+            res = (tot.astype(np.longdouble) / safe.astype(np.longdouble)).astype(np.float64)
+        else:                                          # a total within 2^53 is exact as a double: one rounding
+            res = tot.astype(np.float64) / safe
+            for i in np.flatnonzero((tot > (1 << 53)) | (tot < -(1 << 53))):
+                res[i] = int(tot[i]) / int(safe[i])
     return np.where(cnt > 0, res, 0.0)
 
 
 def int_mean_of_halves(lo: np.ndarray, hi: np.ndarray, cnt: np.ndarray) -> np.ndarray:
     """`int_mean_of_totals` for totals kept as ``hi * 2^32 + lo`` (a total that may pass int64: streamed batches)."""
-    big = (hi > (1 << 29)) | (hi < -(1 << 29))                 # the int64 total below is exact for the others
-    res = int_mean_of_totals((hi << 32) + lo, cnt)
+    big = (hi > (1 << 29)) | (hi < -(1 << 29)) | (lo > (1 << 61)) | (lo < -(1 << 61))   # else the int64 total is exact
+    res = int_mean_of_totals(np.where(big, 0, hi << 32) + np.where(big, 0, lo), cnt)
     for i in np.flatnonzero(big & (cnt > 0)):
         res[i] = _ld_div((int(hi[i]) << 32) + int(lo[i]), int(cnt[i]))
     return res

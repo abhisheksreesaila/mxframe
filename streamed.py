@@ -647,6 +647,14 @@ class ParquetOut:
         os.replace(self.tmp, self.path)
         return self.rows
 
+    def reset(self) -> None:
+        """Forget everything written so far (F-126: a streamed run that raised is started again from its first batch):
+        the partial file is removed and the next write opens a fresh one."""
+        self.abort()
+        self.tmp, self.schema, self.empty = None, None, None
+        self.buffer, self.buffered, self.rows = [], 0, 0
+        self.streamed = False
+
     def abort(self) -> None:
         try:
             if self.writer is not None:
@@ -918,6 +926,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     except OverflowError:
         if not any(e.op == "mean" for a in _walk_aggregates(plan) for e in a.aggs):
             raise
+    if _out.get() is not None:
+        _out.get().reset()                       # rows a sink already received would be written again
     token = _wide.set(True)
     try:
         return _try_stream(lf, plan, device, **kw)
