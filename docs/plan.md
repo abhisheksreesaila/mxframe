@@ -1295,10 +1295,13 @@ Needs: F-132 · Spec §2
 - [ ] import report per column: empty cells, distinct (text), sample values, failed rows with row number and text
 - [ ] multi-threaded, streaming; equal to pyarrow / DuckDB on a corpus of awkward files
 
-## F-135 M4: Parquet read and write [todo]
-Needs: F-131, F-132 · Spec §2
-- [ ] read Parquet written by pyarrow and DuckDB (plain + dictionary encodings, zstd / snappy / none, nulls) into a Table
-- [ ] write with key-value metadata; pyarrow and DuckDB read it back equal; `.omx` metadata round trip
+## F-135 M4: Parquet read and write [review]
+Needs: F-131, F-132 · Spec §2 · `mojo/mxframe/thrift.mojo`, `parquet.mojo`, tools `mojo/tools/pq_write_sample.mojo`, `pq_dump.mojo`, test `tests/test_mojo_parquet.py`
+- [x] Thrift compact protocol codec (writer and a reader that skips unknown fields), the Parquet footer and page headers
+- [x] write: INT -> INT64, DECIMAL -> INT64 DECIMAL(18, scale), DATE -> INT32 DATE, BOOL -> BOOLEAN, TEXT -> BYTE_ARRAY STRING with a dictionary page and RLE_DICTIONARY indices (the table's codes, no remap); a column with nulls is OPTIONAL and its definition levels are the validity bitmap's bits; zstd (default), snappy, none; row groups of a multiple of 8 rows; the "omx" key-value metadata. pyarrow and DuckDB read every value, type, null and the metadata back exactly (3 codecs x 0 / 1 / 1,000 / 5,000 rows, 1 and several row groups)
+- [x] read: data pages v1 and v2, PLAIN, PLAIN_DICTIONARY / RLE_DICTIONARY, DELTA_BINARY_PACKED (INT32 wraps modulo 2^32), RLE booleans; zstd, snappy, none; INT32 / INT64 / BOOLEAN / BYTE_ARRAY, DECIMAL on INT32 / INT64 / FIXED_LEN_BYTE_ARRAY (precision <= 18), DATE, TIMESTAMP ms / us / ns -> its day (floored, the CSV rule); OPTIONAL and REQUIRED; a dictionary page's words become table codes once per page. Equal to pyarrow's reading on files pyarrow wrote with 8 option sets (codecs, dictionary on / off, page v1 / v2, delta ints, small row groups and pages) and on a DuckDB file; our own files round-trip with their metadata
+- [x] unsupported input raises a readable error naming the column: DOUBLE / FLOAT / INT96 ("MX frame has no kind for it yet"), nested columns, DECIMAL past 18 digits, other encodings, corrupt offsets
+- [ ] open: the whole file is read into memory (no streaming or mmap); gzip / brotli / lz4 not linked; floats have no MX frame kind (spec §1 lists none); per-value appends (`push`) are not the fastest path for 100M rows
 
 ## F-136 M5: edits, formulas, sort [todo]
 Needs: F-133 · Spec §3, §4, §6

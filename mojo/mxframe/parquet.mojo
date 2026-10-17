@@ -365,3 +365,562 @@ def _write(path: String, t: Table, metadata: String, codec: Int, row_group_rows:
     file.extend([UInt8(0x50), UInt8(0x41), UInt8(0x52), UInt8(0x31)])
     with open(path, "w") as f:
         f.write_bytes(Span(file))
+
+
+# ── reading ──────────────────────────────────────────────────────────────────────────────────────────
+
+struct ParquetResult(Movable):
+    var table: Table
+    var metadata: String             # the "omx" key-value metadata, "" when there is none
+
+    def __init__(out self, var table: Table, var metadata: String):
+        self.table = table^
+        self.metadata = metadata^
+
+
+@fieldwise_init
+struct _Leaf(Copyable, Movable):
+    var name: String
+    var ptype: Int
+    var type_length: Int
+    var repetition: Int
+    var converted: Int               # -1 when absent
+    var scale: Int
+    var precision: Int
+    var logical: Int                 # the LogicalType union's field id, -1 when absent
+    var ts_unit: Int                 # TIMESTAMP: 1 millis, 2 micros, 3 nanos
+    var children: Int
+
+
+@fieldwise_init
+struct _ChunkMeta(Copyable, Movable):
+    var ptype: Int
+    var codec: Int
+    var values: Int
+    var data_off: Int
+    var dict_off: Int
+
+
+struct _Bytes:
+    """A cursor over `n` bytes at `base`."""
+    var base: Int
+    var n: Int
+    var pos: Int
+
+    def __init__(out self, base: Int, n: Int):
+        self.base = base
+        self.n = n
+        self.pos = 0
+
+    def at(self, i: Int) -> Int:
+        return Int(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=self.base)[i])
+
+    def need(self, k: Int) raises:
+        if self.pos + k > self.n:
+            raise Error("a Parquet page ends early (corrupt file)")
+
+    def byte(mut self) raises -> Int:
+        self.need(1)
+        self.pos += 1
+        return self.at(self.pos - 1)
+
+    def le(mut self, k: Int) raises -> Int64:
+        self.need(k)
+        var v: UInt64 = 0
+        for i in range(k):
+            v |= UInt64(self.at(self.pos + i)) << UInt64(8 * i)
+        self.pos += k
+        if k < 8 and (v >> UInt64(8 * k - 1)) & 1 == 1:          # sign-extend
+            v |= ~UInt64(0) << UInt64(8 * k)
+        return Int64(v)
+
+    def varint(mut self) raises -> UInt64:
+        var v: UInt64 = 0
+        var shift = 0
+        while True:
+            var b = self.byte()
+            v |= UInt64(b & 0x7F) << UInt64(shift)
+            if b < 0x80:
+                return v
+            shift += 7
+            if shift > 63:
+                raise Error("a Parquet page has a bad varint")
+
+    def zigzag(mut self) raises -> Int64:
+        var u = self.varint()
+        return Int64(u >> 1) ^ -Int64(u & 1)
+
+
+def _unpack(mut c: _Bytes, width: Int, count: Int, mut out: List[Int64]) raises:
+    """`count` values of `width` bits, least significant first (Parquet's bit packing)."""
+    if width == 0:
+        for _ in range(count):
+            out.append(0)
+        return
+    var nbytes = (count * width + 7) // 8
+    c.need(nbytes)
+    var acc: UInt64 = 0
+    var have = 0
+    var p = c.pos
+    var mask = (UInt64(1) << UInt64(width)) - 1 if width < 64 else ~UInt64(0)
+    for _ in range(count):
+        while have < width:
+            acc |= UInt64(c.at(p)) << UInt64(have)
+            p += 1
+            have += 8
+            if have > 56 and have < width:      # widths past 56 bits: take the rest in a second word
+                break
+        if have >= width:
+            out.append(Int64(acc & mask))
+            acc = acc >> UInt64(width) if width < 64 else 0
+            have -= width
+        else:
+            var lo = acc
+            var got = have
+            acc = 0
+            have = 0
+            while got + have < width:
+                acc |= UInt64(c.at(p)) << UInt64(have)
+                p += 1
+                have += 8
+            var need = width - got
+            out.append(Int64(lo | ((acc & ((UInt64(1) << UInt64(need)) - 1)) << UInt64(got))))
+            acc >>= UInt64(need)
+            have -= need
+    c.pos += nbytes
+
+
+def _rle_hybrid(mut c: _Bytes, width: Int, count: Int, mut out: List[Int64]) raises:
+    """The RLE / bit-packing hybrid: runs of one repeated value and groups of 8 bit-packed values."""
+    var start = len(out)
+    while len(out) - start < count:
+        var h = Int(c.varint())
+        if h & 1 == 1:
+            var n = (h >> 1) * 8
+            _unpack(c, width, n, out)
+        else:
+            var v = c.le((width + 7) // 8) if width > 0 else 0
+            if width > 0 and width < 64:
+                v &= Int64((UInt64(1) << UInt64(width)) - 1)
+            for _ in range(h >> 1):
+                out.append(v)
+    out.resize(start + count, 0)
+
+
+def _wrap32(v: Int64) -> Int64:
+    """An INT32 column's value: the low 32 bits, sign-extended (its deltas wrap modulo 2^32)."""
+    var low = v & 0xFFFFFFFF
+    return low - (Int64(1) << 32) if low >= (Int64(1) << 31) else low
+
+
+def _delta_binary_packed(mut c: _Bytes, int32: Bool, mut out: List[Int64]) raises -> Int:
+    """DELTA_BINARY_PACKED integers; returns how many were read. INT32 arithmetic wraps modulo 2^32, as the writer's."""
+    var block = Int(c.varint())
+    var minis = Int(c.varint())
+    var total = Int(c.varint())
+    var prev = c.zigzag()
+    if total == 0:
+        return 0
+    out.append(prev)
+    var got = 1
+    var per_mini = block // minis if minis > 0 else 0
+    while got < total:
+        var min_delta = c.zigzag()
+        var widths = List[Int]()
+        for _ in range(minis):
+            widths.append(c.byte())
+        for m in range(minis):
+            if got >= total:
+                break                                   # trailing miniblocks of the last block may be absent
+            var deltas = List[Int64]()
+            _unpack(c, widths[m], per_mini, deltas)
+            for d in deltas:
+                if got >= total:
+                    break
+                prev = prev + min_delta + d
+                if int32:
+                    prev = _wrap32(prev)
+                out.append(prev)
+                got += 1
+    return total
+
+
+def _kind_of(leaf: _Leaf) raises -> Tuple[ColumnKind, Int]:
+    """The MX frame kind (and scale) a Parquet leaf column becomes."""
+    if leaf.ptype == PT_BOOLEAN:
+        return (BOOL, 0)
+    if leaf.ptype == PT_BYTE_ARRAY:
+        return (TEXT, 0)
+    var decimal = leaf.converted == CT_DECIMAL or leaf.logical == 5
+    if decimal:
+        if leaf.precision > 18:
+            raise Error("column `" + leaf.name + "`: DECIMAL(" + String(leaf.precision) + ", " + String(leaf.scale) +
+                        ") has more digits than an int64 holds (18)")
+        if leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64 or leaf.ptype == PT_FIXED:
+            return (DECIMAL, leaf.scale)
+    if leaf.converted == CT_DATE or leaf.logical == 6:
+        return (DATE, 0)
+    if leaf.ptype == PT_INT64 and (leaf.logical == 8 or leaf.converted == CT_TIMESTAMP_MILLIS or
+                                   leaf.converted == CT_TIMESTAMP_MICROS):
+        return (DATE, 0)                                # a timestamp becomes its day (the CSV reader's rule)
+    if leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64:
+        return (INT, 0)
+    var names: List[String] = ["BOOLEAN", "INT32", "INT64", "INT96", "FLOAT", "DOUBLE", "BYTE_ARRAY", "FIXED_LEN_BYTE_ARRAY"]
+    raise Error("column `" + leaf.name + "` is " + names[leaf.ptype] + ": MX frame has no kind for it yet")
+
+
+def _to_stored(leaf: _Leaf, raw: Int64) -> Int64:
+    """A plain value of the leaf's physical type as MX frame stores it (timestamps become days, floored)."""
+    if leaf.ptype == PT_INT64 and (leaf.logical == 8 or leaf.converted == CT_TIMESTAMP_MILLIS or
+                                   leaf.converted == CT_TIMESTAMP_MICROS):
+        var per_day = Int64(86_400_000) if (leaf.ts_unit == 1 or leaf.converted == CT_TIMESTAMP_MILLIS) else \
+                      Int64(86_400_000_000_000) if leaf.ts_unit == 3 else Int64(86_400_000_000)
+        return raw // per_day
+    return raw
+
+
+def _plain(mut c: _Bytes, leaf: _Leaf, count: Int, mut t: Table, col: Int, mut out: List[Int64]) raises:
+    """`count` PLAIN values as stored Int64s (TEXT words become the column's codes)."""
+    if leaf.ptype == PT_BOOLEAN:
+        _unpack(c, 1, count, out)
+    elif leaf.ptype == PT_INT32:
+        for _ in range(count):
+            out.append(_to_stored(leaf, c.le(4)))
+    elif leaf.ptype == PT_INT64:
+        for _ in range(count):
+            out.append(_to_stored(leaf, c.le(8)))
+    elif leaf.ptype == PT_BYTE_ARRAY:
+        for _ in range(count):
+            var n = Int(c.le(4)) & 0xFFFFFFFF
+            c.need(n)
+            var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](
+                unsafe_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos), length=n))
+            c.pos += n
+            out.append(Int64(t.add_word(col, s)))
+    elif leaf.ptype == PT_FIXED:                        # a big-endian two's-complement decimal
+        var w = leaf.type_length
+        c.need(w)
+        for _ in range(count):
+            var v: Int64 = -1 if c.at(c.pos) >= 0x80 else 0
+            for i in range(w):
+                v = (v << 8) | Int64(c.at(c.pos + i))
+            c.pos += w
+            out.append(v)
+    else:
+        raise Error("column `" + leaf.name + "`: its physical type cannot be read yet")
+
+
+def read_parquet(path: String) raises -> ParquetResult:
+    """Reads a Parquet file (written by MX frame, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata."""
+    var data: List[UInt8]
+    with open(path, "r") as f:
+        data = f.read_bytes()
+    var n = len(data)
+    if n < 12 or data[0] != 0x50 or data[1] != 0x41 or data[2] != 0x52 or data[3] != 0x31 or \
+       data[n - 4] != 0x50 or data[n - 3] != 0x41 or data[n - 2] != 0x52 or data[n - 1] != 0x31:
+        raise Error("`" + path + "` is not a Parquet file (no PAR1 magic)")
+    var flen = Int(data[n - 8]) | (Int(data[n - 7]) << 8) | (Int(data[n - 6]) << 16) | (Int(data[n - 5]) << 24)
+    if flen <= 0 or flen > n - 12:
+        raise Error("`" + path + "`: the Parquet footer length is wrong (corrupt file)")
+    var base = Int(data.unsafe_ptr())
+    var r = ThriftReader(base + n - 8 - flen, flen)
+
+    var leaves = List[_Leaf]()
+    var groups = List[List[_ChunkMeta]]()
+    var omx = String("")
+    while True:
+        var f = r.field()
+        if f[1] == T_STOP:
+            break
+        if f[0] == 2 and f[1] == T_LIST:                # schema
+            var h = r.list_header()
+            for _ in range(h[1]):
+                leaves.append(_read_schema_element(r))
+        elif f[0] == 4 and f[1] == T_LIST:              # row groups
+            var h = r.list_header()
+            for _ in range(h[1]):
+                groups.append(_read_row_group(r))
+        elif f[0] == 5 and f[1] == T_LIST:              # key-value metadata
+            var h = r.list_header()
+            for _ in range(h[1]):
+                r.enter()
+                var key = String("")
+                var value = String("")
+                while True:
+                    var g = r.field()
+                    if g[1] == T_STOP:
+                        break
+                    if g[0] == 1 and g[1] == T_BINARY:
+                        key = r.binary()
+                    elif g[0] == 2 and g[1] == T_BINARY:
+                        value = r.binary()
+                    else:
+                        r.skip(g[1])
+                r.leave()
+                if key == "omx":
+                    omx = value
+        else:
+            r.skip(f[1])
+
+    # the leaves: a flat schema (a root, then one element per column)
+    if len(leaves) == 0:
+        raise Error("`" + path + "`: the Parquet schema is empty")
+    var t = Table.empty()
+    var cols = List[_Leaf]()
+    for i in range(1, len(leaves)):
+        if leaves[i].children > 0 or leaves[i].repetition == REPEATED:
+            raise Error("column `" + leaves[i].name + "` is nested (a list or a struct): not supported yet")
+        var k = _kind_of(leaves[i])
+        _ = t.add_column(leaves[i].name, k[0], scale=k[1])
+        cols.append(leaves[i].copy())
+
+    for g in range(len(groups)):
+        if len(groups[g]) != len(cols):
+            raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(groups[g])) +
+                        " columns, the schema " + String(len(cols)))
+        for c in range(len(cols)):
+            _read_chunk(base, n, groups[g][c], cols[c], t, c)
+    t.check()
+    _ = data^
+    return ParquetResult(t^, omx^)
+
+
+def _read_schema_element(mut r: ThriftReader) raises -> _Leaf:
+    var leaf = _Leaf("", -1, 0, REQUIRED, -1, 0, 0, -1, 0, 0)
+    r.enter()
+    while True:
+        var f = r.field()
+        if f[1] == T_STOP:
+            break
+        if f[0] == 1 and f[1] == T_I32:
+            leaf.ptype = Int(r.zigzag())
+        elif f[0] == 2 and f[1] == T_I32:
+            leaf.type_length = Int(r.zigzag())
+        elif f[0] == 3 and f[1] == T_I32:
+            leaf.repetition = Int(r.zigzag())
+        elif f[0] == 4 and f[1] == T_BINARY:
+            leaf.name = r.binary()
+        elif f[0] == 5 and f[1] == T_I32:
+            leaf.children = Int(r.zigzag())
+        elif f[0] == 6 and f[1] == T_I32:
+            leaf.converted = Int(r.zigzag())
+        elif f[0] == 7 and f[1] == T_I32:
+            leaf.scale = Int(r.zigzag())
+        elif f[0] == 8 and f[1] == T_I32:
+            leaf.precision = Int(r.zigzag())
+        elif f[0] == 10 and f[1] == T_STRUCT:            # LogicalType: a union, one field set
+            r.enter()
+            while True:
+                var u = r.field()
+                if u[1] == T_STOP:
+                    break
+                leaf.logical = u[0]
+                if u[0] == 5 and u[1] == T_STRUCT:       # DECIMAL(scale, precision)
+                    r.enter()
+                    while True:
+                        var d = r.field()
+                        if d[1] == T_STOP:
+                            break
+                        if d[0] == 1 and d[1] == T_I32:
+                            leaf.scale = Int(r.zigzag())
+                        elif d[0] == 2 and d[1] == T_I32:
+                            leaf.precision = Int(r.zigzag())
+                        else:
+                            r.skip(d[1])
+                    r.leave()
+                elif u[0] == 8 and u[1] == T_STRUCT:     # TIMESTAMP(isAdjustedToUTC, unit)
+                    r.enter()
+                    while True:
+                        var d = r.field()
+                        if d[1] == T_STOP:
+                            break
+                        if d[0] == 2 and d[1] == T_STRUCT:   # TimeUnit: MILLIS 1, MICROS 2, NANOS 3
+                            r.enter()
+                            while True:
+                                var tu = r.field()
+                                if tu[1] == T_STOP:
+                                    break
+                                leaf.ts_unit = tu[0]
+                                r.skip(tu[1])
+                            r.leave()
+                        else:
+                            r.skip(d[1])
+                    r.leave()
+                else:
+                    r.skip(u[1])
+            r.leave()
+        else:
+            r.skip(f[1])
+    r.leave()
+    return leaf^
+
+
+def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
+    var chunks = List[_ChunkMeta]()
+    r.enter()
+    while True:
+        var f = r.field()
+        if f[1] == T_STOP:
+            break
+        if f[0] == 1 and f[1] == T_LIST:
+            var h = r.list_header()
+            for _ in range(h[1]):
+                var meta = _ChunkMeta(-1, 0, 0, -1, -1)
+                r.enter()
+                while True:
+                    var g = r.field()
+                    if g[1] == T_STOP:
+                        break
+                    if g[0] == 1 and g[1] == T_BINARY:
+                        raise Error("a Parquet column chunk lives in another file: not supported")
+                    if g[0] == 3 and g[1] == T_STRUCT:   # ColumnMetaData
+                        r.enter()
+                        while True:
+                            var m = r.field()
+                            if m[1] == T_STOP:
+                                break
+                            if m[0] == 1 and m[1] == T_I32:
+                                meta.ptype = Int(r.zigzag())
+                            elif m[0] == 4 and m[1] == T_I32:
+                                meta.codec = Int(r.zigzag())
+                            elif m[0] == 5 and m[1] == T_I64:
+                                meta.values = Int(r.zigzag())
+                            elif m[0] == 9 and m[1] == T_I64:
+                                meta.data_off = Int(r.zigzag())
+                            elif m[0] == 11 and m[1] == T_I64:
+                                meta.dict_off = Int(r.zigzag())
+                            else:
+                                r.skip(m[1])
+                        r.leave()
+                    else:
+                        r.skip(g[1])
+                r.leave()
+                chunks.append(meta^)
+        else:
+            r.skip(f[1])
+    r.leave()
+    return chunks^
+
+
+def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, col: Int) raises:
+    """Appends one column chunk's values to column `col`."""
+    var pos = meta.dict_off if meta.dict_off > 0 and meta.dict_off < meta.data_off else meta.data_off
+    var dictionary = List[Int64]()
+    var done = 0
+    var optional = leaf.repetition == OPTIONAL
+    while done < meta.values:
+        if pos <= 0 or pos >= n:
+            raise Error("column `" + leaf.name + "`: a page offset is outside the file (corrupt file)")
+        var h = ThriftReader(base + pos, n - pos)
+        var ptype = -1
+        var usize = 0
+        var csize = 0
+        var nvals = 0
+        var encoding = 0
+        var def_len = -1                 # v2: definition levels' byte length
+        var v2_compressed = True
+        while True:
+            var f = h.field()
+            if f[1] == T_STOP:
+                break
+            if f[0] == 1 and f[1] == T_I32:
+                ptype = Int(h.zigzag())
+            elif f[0] == 2 and f[1] == T_I32:
+                usize = Int(h.zigzag())
+            elif f[0] == 3 and f[1] == T_I32:
+                csize = Int(h.zigzag())
+            elif (f[0] == 5 or f[0] == 7 or f[0] == 8) and f[1] == T_STRUCT:
+                h.enter()
+                while True:
+                    var g = h.field()
+                    if g[1] == T_STOP:
+                        break
+                    if g[0] == 1 and g[1] == T_I32:
+                        nvals = Int(h.zigzag())
+                    elif f[0] != 8 and g[0] == 2 and g[1] == T_I32:
+                        encoding = Int(h.zigzag())
+                    elif f[0] == 8 and g[0] == 4 and g[1] == T_I32:
+                        encoding = Int(h.zigzag())
+                    elif f[0] == 8 and g[0] == 5 and g[1] == T_I32:
+                        def_len = Int(h.zigzag())
+                    elif f[0] == 8 and g[0] == 6 and g[1] == T_I32:
+                        if Int(h.zigzag()) != 0:
+                            raise Error("column `" + leaf.name + "` has repetition levels: not supported")
+                    elif f[0] == 8 and (g[1] == T_TRUE or g[1] == T_FALSE) and g[0] == 7:
+                        v2_compressed = g[1] == T_TRUE
+                    else:
+                        h.skip(g[1])
+                h.leave()
+            else:
+                h.skip(f[1])
+        var body_at = pos + h.pos
+        if body_at + csize > n:
+            raise Error("column `" + leaf.name + "`: a page runs past the end of the file (corrupt file)")
+        pos = body_at + csize
+        if ptype == PAGE_DICTIONARY:
+            var page = _decompress(meta.codec, base + body_at, csize, usize)
+            var c = _Bytes(Int(page.unsafe_ptr()), len(page))
+            dictionary.clear()
+            _plain(c, leaf, nvals, t, col, dictionary)
+            _ = page^
+            continue
+        if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
+            continue                                     # an index page: not needed
+        var levels = List[Int64]()
+        var page: List[UInt8]
+        var c: _Bytes
+        if ptype == PAGE_DATA_V2:
+            var lv = max(def_len, 0)
+            if optional:
+                var lc = _Bytes(base + body_at, lv)
+                _rle_hybrid(lc, 1, nvals, levels)
+            if v2_compressed:
+                page = _decompress(meta.codec, base + body_at + lv, csize - lv, usize - lv)
+            else:
+                page = _decompress(UNCOMPRESSED, base + body_at + lv, csize - lv, usize - lv)
+            c = _Bytes(Int(page.unsafe_ptr()), len(page))
+        else:
+            page = _decompress(meta.codec, base + body_at, csize, usize)
+            c = _Bytes(Int(page.unsafe_ptr()), len(page))
+            if optional:
+                var ln = Int(c.le(4)) & 0xFFFFFFFF
+                var lc = _Bytes(c.base + c.pos, ln)
+                _rle_hybrid(lc, 1, nvals, levels)
+                c.pos += ln
+        var present = nvals
+        if optional:
+            present = 0
+            for lvl in levels:
+                present += Int(lvl)
+        var vals = List[Int64]()
+        if encoding == ENC_PLAIN:
+            _plain(c, leaf, present, t, col, vals)
+        elif encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY:
+            var w = c.byte()
+            var idx = List[Int64]()
+            _rle_hybrid(c, w, present, idx)
+            for i in idx:
+                if i < 0 or Int(i) >= len(dictionary):
+                    raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
+                vals.append(dictionary[Int(i)])
+        elif encoding == ENC_DELTA_BINARY_PACKED and (leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64):
+            var raw = List[Int64]()
+            _ = _delta_binary_packed(c, leaf.ptype == PT_INT32, raw)
+            for v in raw:
+                vals.append(_to_stored(leaf, v))
+        elif encoding == ENC_RLE and leaf.ptype == PT_BOOLEAN:
+            _ = c.le(4)                                   # a length prefix
+            _rle_hybrid(c, 1, present, vals)
+        else:
+            raise Error("column `" + leaf.name + "`: Parquet encoding " + String(encoding) + " is not supported yet")
+        if len(vals) < present:
+            raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
+        var k = 0
+        for i in range(nvals):
+            if optional and levels[i] == 0:
+                t.append_null(col)
+            else:
+                t.cols[col].push(vals[k], True)             # already checked: codes from add_word, 0 / 1 bits
+                k += 1
+        done += nvals
+        _ = page^
