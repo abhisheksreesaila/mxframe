@@ -1142,7 +1142,7 @@ Found by the F-111 / F-112 review (2026-10-16); on main too
 - [x] DuckDB-checked tests incl. an alias shadowing a column, an alias of an aggregate (not allowed in WHERE), case-insensitive names; fails before
 - Note (2026-10-17): `_inline_aliases` (one function, WHERE + ORDER BY expressions + F-112 subqueries). Probed DuckDB: FROM column wins in WHERE; HAVING takes the alias even over a FROM column (already so); GROUP BY takes it only when no FROM column has the name (already so); alias in a JOIN ON is an error in DuckDB (still is). Alias of an aggregate or window: ValueError "not allowed in WHERE". Not done: a SELECT alias used by a later item of the same SELECT list (`select x as kk, kk + 1 as j`, DuckDB accepts). Tests: tests/test_f123_where_select_alias.py (200, 144 fail on main).
 
-## F-124 SQL subquery correlated two levels out [review]
+## F-124 SQL subquery correlated two levels out [done]
 Found by the F-111 / F-112 review (2026-10-16)
 - [x] `EXISTS (... AND EXISTS (SELECT 1 FROM w WHERE w.k = t.k))` raises "unknown column t.k in a subquery": the column exists, two scopes out. Support it (decorrelate through both levels) or raise "correlation two levels out is not supported"
 - [x] tests; also the F-112 review should-fixes: tests for the ORDER BY / non-equality / LIMIT refusals and repeated outer keys, `_unalias_where` written once, and the ORDER BY output-name exception matching case-insensitively where DuckDB raises
@@ -1184,7 +1184,7 @@ Found by the F-101 / F-060c review (2026-10-17)
 - Full suite once, output in `/tmp/full_f126.txt` (before the review fixes): 19,627 passed, 274 skipped, 5 xfailed, 0 failed (22 minutes at load 14 on the shared machine). No benchmarks run (shared machine); the kernels' hot loops are untouched, the native executor now returns a count next to an integer mean's total.
 - Follow-ups found, not done: a streamed mean past about 2^31 extreme rows still overflows in the merge; the Arrow `%` of two columns where one is a literal -1 typed by DuckDB's literal rules is approximated by "literals do not count in the result type".
 
-## F-127 SQL arithmetic gaps: NULL literals, integer division, math functions [review]
+## F-127 SQL arithmetic gaps: NULL literals, integer division, math functions [done]
 Found by the F-125 review (2026-10-17): raise rather than answer (missing features, not wrong answers)
 - [x] `a + NULL`, `a * NULL`, `a % NULL` ("Unsupported ... Null"): NULL is a typed NULL in arithmetic
 - [x] `a // b` integer division ("Unsupported ... IntDiv"), with DuckDB's zero-divisor rule
