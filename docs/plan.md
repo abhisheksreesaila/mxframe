@@ -1057,3 +1057,10 @@ Found in the F-108 review (2026-10-16); also on main
 - [ ] `select id, date '2024-01-01' as c from t` returns the day number as a float (19723.0), DuckDB a DATE. The front end turns every `DATE '..'` into a day number (`_date_lit` false) because the TPC-H Parquet files store dates as int32 day numbers; it is a date only next to a date32 / timestamp column. A DATE constant in the SELECT list (also `coalesce(x, DATE '..')` with no date operand, `DATE '..' + INTERVAL ..` as an output) should come out as date32. Decide by context: a comparison with an integer day column keeps the day number, everything that is output is a date
 - [ ] DuckDB-checked tests for SELECT, CASE and subquery outputs; TPC-H checks: all 22 SQL queries (`tests/test_sql_tpch*.py`, `scripts/native_coverage.py --sql`) unchanged in result and path
 
+
+## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [todo]
+Found by the F-114 / F-115 developer (2026-10-16)
+- [ ] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
+- [ ] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
+- [ ] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
+- [ ] DuckDB-checked tests for each; fails before
