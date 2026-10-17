@@ -1,4 +1,4 @@
-"""F-056 step 2: a query over a Parquet file bigger than memory runs in batches of row groups.
+"""F-056 steps 2 and 3a: a query over a Parquet file bigger than memory runs in batches of row groups.
 
 When the working set of a plan's `scan_parquet` source is bigger than the host budget, `try_stream` cuts the
 file's row groups into batches that fit the budget and runs the plan once per batch with the streamed scan
@@ -7,6 +7,10 @@ reading just that batch (`io_parquet.streaming`). The plan's lowest `Aggregate` 
 another aggregate and whatever sat above the aggregate runs on the merged table. Each batch is an ordinary
 `compute(device)`, so filters, the join to the resident dimension tables, the native executor, the GPU
 pipeline and step 1's budget safety net all apply per batch. Memory is one batch + the group state.
+
+Step 3a: group state bigger than the budget spills to hash partitions (`spill.py`, merged one partition at a time);
+a plan with no aggregate streams its rows into a `_Sink` (running top-k for ORDER BY + LIMIT, early stop for LIMIT,
+else collected and checked against the budget); a row group bigger than a batch is read in slices of rows.
 
 Design, limits and the step 3 list: docs/design/streamed-execution.md.
 """
@@ -601,7 +605,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     sink, state, batches_run, rows_info = None, None, 0, None
     n_slices = Counter(b[0] for b in got.batches if len(b) == 1 and b[0] in got.slice_rows)
     if spec is None:
-        sink = _sink_for(plan, got.top, budget // 2, budget // WORKING_FACTOR, budget)
+        sink = _sink_for(plan, got.top, budget, budget // WORKING_FACTOR, budget)
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:

@@ -299,6 +299,14 @@ def test_a_filter_whose_result_fits_is_streamed_and_concatenated(big, device):
     same(got.sort_by("id"), want.sort_by("id"))
 
 
+def test_a_bare_filter_returns_every_column_including_strings(big):
+    lf = scan_parquet(big).filter((col("id") % 20_000) == 3)
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed"
+    assert got.column_names == ["g", "v", "q", "id", "s"] and got.num_rows == 20
+    same(got.sort_by("id"), duck("SELECT * FROM big WHERE id % 20000 = 3 ORDER BY id", big))
+
+
 def test_a_sort_without_limit_whose_result_fits_equals_duckdb(big):
     lf = scan_parquet(big).filter((col("id") % 1000) == 3).select("id", "v").sort("v")
     got = run(lf, "cpu")
