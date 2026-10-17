@@ -931,7 +931,7 @@ From the F-087 review (2026-10-16)
 - [ ] OFFSET without LIMIT uses `n = 2**62` (`sql_frontend._ALL_ROWS`): `explain()` shows the sentinel and an OFFSET above ~2^62 overflows `n + offset` in int64 in native code. Model "no limit" as `n=None` in `Limit` (or clamp), every consumer handles it
 - [ ] tests: explain shows no sentinel; a huge OFFSET returns no rows without overflow; fails before
 
-## F-099 SQL self-join: columns of the second copy [review]
+## F-099 SQL self-join: columns of the second copy [done]
 Found by the F-092 developer and review (2026-10-16)
 - [x] in `t x JOIN t y`, referencing a column that exists in both copies on the second side (`WHERE y.qty > 25`, `SELECT y.v`) raises "name exists in more than one joined table ... not supported yet". Joined tables with shared non-key column names are common (self-joins, fact-to-fact): carry both copies under distinct internal names (`v`, `v_right`) and resolve `x.v` / `y.v` to the right one in every clause
 - [x] DuckDB-checked tests: self-join with filters on either side, SELECT of both copies, GROUP BY / ORDER BY on the second copy, a three-way join with a repeated name; fails before
@@ -948,7 +948,7 @@ From the F-094 review (2026-10-16); speed
 - [ ] a `%` anywhere in WHERE moves the whole filter off the native path: `WHERE a > 500 GROUP BY k` runs native in 5 ms at 2M rows, adding `AND a % 7 = 0` takes it to `cpu_aot` at 50 ms. An integer `mod` op in the bytecode (sign follows the dividend; zero divisor gives NULL, so decline when the divisor column can be 0, or test it), CPU and GPU kernels
 - [ ] tests: the filter stays native (path asserted), equals DuckDB with negatives and a zero divisor; quiet-machine timing back near the no-`%` query
 
-## F-102 SELECT * over a join keeps both key columns, each with its own type [review]
+## F-102 SELECT * over a join keeps both key columns, each with its own type [done]
 Found by the F-090 review (2026-10-16); a missing column on main
 - [x] `SELECT * FROM t JOIN v ON t.i = v.x` (and the comma form `FROM t, v WHERE t.i = v.x`) leaves out `x` entirely, even when both keys are the same type; DuckDB keeps both columns. The comma form also reads `v.x` as the left key, so its type is the left side's (values equal, -0.0 shows as 0). Keep the right key as its own output column (USING / NATURAL keep one, like DuckDB)
 - [x] DuckDB-checked tests: SELECT * and SELECT v.x over JOIN ON, comma join, USING; same-type and int-vs-float keys; LEFT JOIN with unmatched rows (right key NULL, F-086); fails before
