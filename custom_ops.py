@@ -172,6 +172,9 @@ def _expr_col_names(expr, out=None, tests_ok=False) -> set:
     return out
 
 
+_MAX_ROWS = 2 ** 62          # more rows than any table; offset + n stays an int64
+
+
 def _can_be_null(expr) -> bool:
     """True when *expr* holds a CASE with a NULL branch (a missing ELSE is one): it yields NULL whatever its
     columns hold, so the plan needs the paths that keep NULL (a CASE ... ELSE 0 does not, and stays native)."""
@@ -2220,13 +2223,14 @@ class CustomOpsCompiler(GraphCompiler):
         # F-087: the paths below take "the first n rows". An OFFSET window is run as the first
         # offset + n rows (the top-n paths see Sort + Limit as before) and the offset rows are cut off.
         skip = 0
-        if isinstance(plan, Limit) and plan.offset:
-            skip, plan = plan.offset, Limit(plan.input, plan.n + plan.offset)
+        if isinstance(plan, Limit) and (plan.offset or plan.n is None):
+            skip = plan.offset                               # (no limit: only the rows are skipped; the sum is kept in int64)
+            plan = plan.input if plan.n is None else Limit(plan.input, min(plan.n + plan.offset, _MAX_ROWS))
         plan = self._resolve_inner_offsets(plan)
         result = self._compile_and_run(plan, verbose=verbose, optimizer_trace=optimizer_trace)
         result = self._exact_counts(plan, result)
         if skip:
-            result = result.slice(skip)
+            result = result.slice(min(skip, result.num_rows))
         if keep is not None:
             result = result.select([e.args[0] for e in keep]).rename_columns([e._alias or e.args[0] for e in keep])
         return result
@@ -3630,7 +3634,7 @@ class CustomOpsCompiler(GraphCompiler):
         if _native_exec is None or self._session_device == "gpu" or not post_ops or len(post_ops) < 2:
             return None
         srt, lim = post_ops[0], post_ops[1]
-        if not (isinstance(srt, Sort) and isinstance(lim, Limit)) or not (0 < lim.n <= 65536):
+        if not (isinstance(srt, Sort) and isinstance(lim, Limit)) or lim.n is None or not (0 < lim.n <= 65536):
             return None
         proj, node = None, plan
         if isinstance(node, Project):

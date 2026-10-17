@@ -524,7 +524,9 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
         if isinstance(p, (Project, Limit, Distinct, Tail)):
             n, ts, src = walk(p.input)
             if isinstance(p, (Limit, Tail)):
-                n = min(max(n - getattr(p, "offset", 0), 0), p.n)
+                n = max(n - getattr(p, "offset", 0), 0)
+                if p.n is not None:
+                    n = min(n, p.n)
             return n, ts, src
         inner = getattr(p, "input", None)
         return walk(inner) if inner is not None else (0, [None], 0)

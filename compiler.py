@@ -526,7 +526,7 @@ class GraphCompiler:
                 idx = pc.sort_indices(table, sort_keys=sort_keys)
                 table = table.take(idx)
             elif isinstance(node, Limit):
-                table = table.slice(node.offset, node.n)
+                table = table.slice(min(node.offset, table.num_rows), node.n)
             elif isinstance(node, Distinct):
                 cols = node.subset or table.column_names
                 table = _distinct_rows(table.select(cols)) if table.num_rows else table.select(cols)

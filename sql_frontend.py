@@ -366,7 +366,7 @@ def _or_without(node: sge.Or, drop: set) -> Optional[sge.Expression]:
     return sge.Paren(this=r)
 
 
-_ALL_ROWS = 2 ** 62          # LIMIT of an OFFSET without LIMIT
+_MAX_ROWS = 2 ** 62          # a LIMIT / OFFSET above this is clamped to it: more rows than any table, and n + offset stays an int64
 
 
 def _alias(node: sge.Expression, name: str) -> sge.Alias:
@@ -616,8 +616,8 @@ class _SQLTranslator:
         # 5. LIMIT / OFFSET (OFFSET alone keeps every row after the skipped ones)
         limit_node, offset_node = node.args.get("limit"), node.args.get("offset")
         if limit_node or offset_node:
-            plan = Limit(plan, int(limit_node.expression.this) if limit_node else _ALL_ROWS,
-                         int(offset_node.expression.this) if offset_node else 0)
+            plan = Limit(plan, min(int(limit_node.expression.this), _MAX_ROWS) if limit_node else None,
+                         min(int(offset_node.expression.this), _MAX_ROWS) if offset_node else 0)
 
         if final_proj:
             plan = Project(plan, final_proj)
