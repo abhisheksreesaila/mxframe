@@ -1885,10 +1885,18 @@ class CustomOpsCompiler(GraphCompiler):
                         if lo is not None and max(abs(lo), abs(hi)) > 2 ** 53:
                             exact_sum = True
                             break
+        from .pipeline_program import _probe
+        probe = _probe.get()
+        if probe is not None and not any((e._alias or "").startswith(probe.prefix) for e in plan.aggs):
+            probe = None                                   # not the streamed query's own aggregate
         if any(_temporal_extreme(e, table) for e in plan.aggs):     # F-093: float64 cannot hold a date / ns timestamp
+            if probe is not None:
+                probe.flag(True)
             return "a min / max of a date or timestamp keeps its type (Arrow)", exact_sum
         why = "a column the plan reads has nulls" if has_nulls else (
             "an integer sum could pass 2^53, or a min / max past it (computed exactly in int64)" if exact_sum else "")
+        if probe is not None:                              # a streamed batch: report what decided it (F-056)
+            probe.flag(bool(why))
         return why, exact_sum
 
     def _aggregate_with_nulls(self, plan, having_pred, post_ops, optimizer_trace, t0, late=False):
