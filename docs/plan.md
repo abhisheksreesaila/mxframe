@@ -795,10 +795,12 @@ Needs: F-001, F-005..F-008
 Needs: — · Found in F-057 review round 4 (2026-10-16)
 - [x] `tests/test_pipeline_gpu_leak.py::test_short_lived_threads_do_not_leak_device_memory` measures this process's allocations (the tracker's live bytes or the context's own pool), not `cuMemGetInfo` over the whole device, so another process allocating on GPU 0 cannot fail it; the test still fails on a real leak (prove by disabling the thread-exit release)
 
-## F-076 SQL Q10 partner strings native [todo]
+## F-076 SQL Q10 partner strings native [review]
 Needs: F-069 · Found in F-069 review (2026-10-16)
-- [ ] SQL Q10 at SF1 has no PyArrow compute over 1,000 rows (`scripts/native_coverage.py`): the 4 `dictionary_encode` calls over the 57k-row customer string columns (name, address, phone, comment) carried as partner columns are replaced by passing the strings through by row (or encoding once per source, like F-071 did for Q8)
-- [ ] `tests/test_f069_hashed_groups.py` (or a new test) asserts SQL Q10 fully native by the coverage script's rule, fails before
+- [x] SQL Q10 at SF1 has no PyArrow compute over 1,000 rows (`scripts/native_coverage.py`): the 4 `dictionary_encode` calls over the 57k-row customer string columns (name, address, phone, comment) carried as partner columns are replaced by passing the strings through by row (or encoding once per source, like F-071 did for Q8)
+- [x] `tests/test_f069_hashed_groups.py` (or a new test) asserts SQL Q10 fully native by the coverage script's rule, fails before: `tests/test_sql_tpch_native.py[10]` (all 22 SQL texts, SF 0.17) and `tests/test_f080_sql_shapes.py::test_strings_fixed_by_a_unique_key_are_taken_by_partner_row`
+- Built (2026-10-16, with F-080): `join_engine._dependent_keys` finds group columns that are plain partner strings and another group column of the same leaf that is unique in the leaf's table (c_custkey fixes c_name, c_address, c_phone, c_comment; proven on the leaf's own scan, a Filter only removes rows); `native_exec._try_dependent_keys` groups by the other keys plus `min(partner row)` (the `K_PROW` machinery of `_try_prow_groups`), then `_keys_by_row` (the old tail of `_try_prow_groups`, now shared) cuts to the top k by the aggregates and takes every key column from the partner at those rows. No string is hashed or encoded. A key that is not unique keeps the old path (test). Also: partner strings are dictionary-encoded only when the program reads them (`used`), not for every partner column; `try_execute_join(raw_keys=True)` skips restoring key values the caller discards
+- Not measured (no benchmarks on this machine)
 
 ## F-077 A NULL in a float group key: -0.0 and 0.0 are one group, NaNs one group [done]
 Needs: — · Found in F-069 review (2026-10-16); a wrong answer on main before F-069
@@ -817,12 +819,25 @@ Found by the F-077 developer (2026-10-16); untested suspicion
 - [x] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
 - [x] DuckDB-checked tests over the key edge cases (tests/test_float_key_joins.py, 78 of 83 fail before); fail before (or a test pinning that it already matches)
 
-## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q22 [todo]
+## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q13, Q22 [review]
 Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (2026-10-16, after F-072): 15 of 22 SQL queries have no decline and no Arrow work over 1,000 rows; Q8 ("nothing to filter") and Q15 ("empty input") only show trivial declines and do no Arrow work. The DataFrame forms are 22/22, so each gap is in how the SQL front end phrases the plan
-- [ ] Q5: `executor declined (code -18)` in the fused join (also on main before F-069)
-- [ ] Q7, Q9: one `expression not supported by the bytecode compiler` each (find the expression; compile it or rewrite it in the SQL front end to the DataFrame form)
-- [ ] Q22: three `greater` / `and_kleene` passes over 150,000 rows in Arrow, `expression` / `predicate not supported` (the DataFrame Q22 is native since F-034)
-- [ ] `tests/test_native_strings_tpch.py`-style test over the SQL text of all 22 queries on SF 0.17: no Arrow compute over 1,000 rows, allowed declines listed by name; fails before
+- [x] Q5: `executor declined (code -18)` in the fused join (also on main before F-069)
+- [x] Q7, Q9: one `expression not supported by the bytecode compiler` each (find the expression; compile it or rewrite it in the SQL front end to the DataFrame form)
+- [x] Q22: three `greater` / `and_kleene` passes over 150,000 rows in Arrow, `expression` / `predicate not supported` (the DataFrame Q22 is native since F-034)
+- [x] Q13 (added): `take[1.5M]` x2 + `dictionary_encode` of the LEFT JOIN, then Arrow's null-skipping group-by
+- [x] `tests/test_native_strings_tpch.py`-style test over the SQL text of all 22 queries on SF 0.17: no Arrow compute over 1,000 rows, allowed declines listed by name; fails before: `tests/test_sql_tpch_native.py` (22 cases; Q21 is `xfail` while its correlated `<>` raises, F-112; 6 of the other 21 fail on main: 7, 9, 10, 13, 15, 16; 5 and 22 were fixed in the first commit, so measure them on main)
+- Built (2026-10-16). **SF1 SQL coverage 16/22 -> 21/22** (Q21 raises on main: `EXISTS: correlated predicate l2.l_suppkey <> l1.l_suppkey cannot be decorrelated`, F-112's branch; not touched). Root causes, one commit each:
+  - Q5 (code -18 = E_DUP): the comma join took `l_suppkey = s_suppkey AND c_nationkey = s_nationkey` as one two-column key whose left columns come from two leaves (lineitem, customer); `_flatten` then joined the sides as units and the fused join picked supplier as the fact, with a duplicate build key. `sql_frontend._build_from` now joins on the keys of the first table and leaves the other equalities in WHERE (the DataFrame form: join on suppkey, then `filter(c_nationkey == s_nationkey)`)
+  - Q22: `substring(c_phone, 1, 2) IN (...)` inside the WHERE filter has no bytecode form (the DataFrame form computes it with `with_columns` first). `_hoist_slices` computes a `str_slice` of a column below the Filter as a column (reused by the SELECT list item of the same expression), so the filter reads a plain string column
+  - Q7: the fused join declined `min(col n_name)` because the group keys came as `col n_name AS supp_nation` (the aliased Project inlined into the Aggregate; the DataFrame form renames in a leaf). `try_execute_join` takes an aliased column key like a plain one and names the result column by the alias
+  - Q9: `ps_partkey = l_partkey` after `p_partkey = l_partkey` kept part's column as the left key, so the composite key `(l_suppkey, p_partkey)` spanned two leaves (E_DUP again). `join_engine._one_leaf` takes the key from one leaf when the joins below equate the columns (union-find over the edges)
+  - Q10: see F-076
+  - Q13: `COUNT(o_orderkey)` over `customer LEFT JOIN orders` materialized 1.5M joined rows with NULLs and ran Arrow's group-by. `join_engine.left_join_counts` (hooked in `compile_and_run` before the join is materialized): the native left hash join gives the pairs, a `bincount` gives each left row its matches (0 where none), and when the left key is unique (checked) the groups are the left rows; nullable counted columns, duplicate keys, GPU and other aggregates decline to the old path. The Q13 outer aggregate and sort then run in the native executor
+  - Q16 (only at SF 0.17 / small data, where `s_comment` is a dictionary): `x NOT IN (SELECT col ...)` aliased the subquery column to `__in`, which made the subquery a renaming Project over Filter*(Scan), not a join leaf, so its dictionary column was decoded for all rows. A bare column is now its own key
+  - `scripts/tpch_user/provenance.py` no longer records `LazyFrame.schema`'s zero-row dry run (the SQL front end runs one per derived table, and it showed as a `cpu_aot` compute that did no query)
+  - No `.mojo` file touched
+- Not done: Q21 SQL (F-112); no timings (shared machine)
+- [ ] no DataFrame query slower; equal to DuckDB (timing on a quiet machine: not measured here). Equal to DuckDB: `scripts/tpch_sql/run.py --sf 1` for Q5, 7, 9, 10, 13, 22 `equal`; `-k "sql or tpch"` and the full suite in `/tmp` logs named in the report
 
 ## F-081 Window partitions over a float column: NaNs are one partition [done]
 Found by the F-077 review (2026-10-16); a silent wrong answer on main

@@ -1537,7 +1537,7 @@ class _SQLTranslator:
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
         key = "__in"
-        if isinstance(item, sge.Column) and not int_lits and item.name not in set(self._cur_cols) | self._copies:
+        if isinstance(item, sge.Column) and not int_lits and item.name.lower() not in {c.lower() for c in set(self._cur_cols) | self._copies}:
             key = item.name                # a bare column is its own key: the subquery stays a Filter*(Scan) leaf
         else:
             new.set("expressions", [_alias(item, key)])
