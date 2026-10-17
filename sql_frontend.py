@@ -600,6 +600,7 @@ class _SQLTranslator:
             plan = self._where(plan, where.this if same else _and_all(self._conj))
 
         self._expand_stars(node)
+        plan = self._select_subqueries(plan, node)
 
         for o in (node.args.get("order").expressions if node.args.get("order") else []):
             if o.args.get("nulls_first"):
@@ -1057,41 +1058,79 @@ class _SQLTranslator:
         items = ([sel.args["from_"].this] if sel.args.get("from_") is not None else []) \
             + [j.this for j in sel.args.get("joins") or []]
         scope = [(it.alias_or_name.lower(), list(self._source(it)[1])) for it in items]
+        joins = sel.args.get("joins") or []
+        # names a USING / NATURAL join merges into one column, per join (a bare reference to one is not ambiguous)
+        merged_at: List[set] = [set()]
+        for j, join in enumerate(joins):
+            using = join.args.get("using")
+            if using:
+                new = {str(c.name).lower() for c in (using if isinstance(using, list) else using.expressions)}
+            elif join.args.get("method") and join.args.get("on") is None:
+                new = {c.lower() for _, cs in scope[:j + 1] for c in cs} & {c.lower() for c in scope[j + 1][1]}
+            else:
+                new = set()
+            for n in new - merged_at[-1]:
+                self._check_unambiguous(n, scope[:j + 1], merged_at[-1])      # a USING key is one column on the left
+            merged_at.append(merged_at[-1] | new)
         self._aliases = {e.alias.lower(): e.alias for e in sel.expressions if isinstance(e, sge.Alias)}
-        self._levels = [scope, *self._outer]
+        semi = {scope[j + 1][0] for j, jn in enumerate(joins) if str(jn.args.get("kind") or "").lower() in ("semi", "anti")}
+        self._levels = [(scope, merged_at[-1], semi), *self._outer]      # a SEMI / ANTI table is seen by its own ON only
+        self._order_outputs = {(e.alias if isinstance(e, sge.Alias) else e.name).lower()
+                               for e in sel.expressions if isinstance(e, (sge.Alias, sge.Column))}
 
-        def visit(n: sge.Expression) -> None:
+        def visit(n: sge.Expression, upto=None, order=False) -> None:
             for x in n.walk(prune=lambda y: isinstance(y, sge.Select)):
                 if isinstance(x, sge.Column):
-                    self._resolve_col(x)
+                    self._resolve_col(x, upto, merged_at, order)
 
         for key, val in sel.args.items():
             if key in ("with_", "from_") or val is None:
                 continue
             for v in val if isinstance(val, list) else [val]:
                 if key == "joins":
+                    j = joins.index(v)
                     for k2, v2 in v.args.items():
                         for w in v2 if isinstance(v2, list) else [v2]:
                             if k2 != "this" and isinstance(w, sge.Expression):
-                                visit(w)
+                                visit(w, j + 2)             # an ON sees the tables up to its own
                 elif isinstance(v, sge.Expression):
-                    visit(v)
+                    visit(v, order=key == "order")
 
-    def _resolve_col(self, c: sge.Column) -> None:
-        """Rewrite column ``c`` to the spelling of the column it names in this query's scopes."""
+    @staticmethod
+    def _check_unambiguous(name: str, tables: List[tuple], merged: set) -> None:
+        """DuckDB's "Ambiguous reference to column name": a bare ``name`` that two or more of ``tables`` have
+        (case-insensitively) and no USING / NATURAL join merged into one column."""
+        owners = [a for a, cs in tables if _ci_find(cs, name)]
+        if len(owners) > 1 and name.lower() not in merged:
+            raise ValueError(f"ambiguous column reference: {name} (tables {', '.join(owners)}): "
+                             "qualify it with its table")
+
+    def _resolve_col(self, c: sge.Column, upto=None, merged_at=(), order=False) -> None:
+        """Rewrite column ``c`` to the spelling of the column it names in this query's scopes. A bare name that
+        two tables of one scope have is ambiguous (as in DuckDB), unless a USING / NATURAL join merged it or
+        ORDER BY means the SELECT output of that name. ``upto``: the ON of a join sees only the tables so far."""
         if isinstance(c.this, sge.Star):
             return
         hit = None
-        for i, lvl in enumerate(self._levels):
+        for i, (lvl, merged, semi) in enumerate(self._levels):
             if c.table:
                 cols = next((cs for a, cs in lvl if a == c.table.lower()), None)
                 if cols is None:
                     continue
                 hit = _ci_find(cols, c.name)
                 break
-            hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
-            if hit is None and i == 0:
-                hit = self._aliases.get(c.name.lower())
+            vis = lvl[:upto] if i == 0 and upto else lvl
+            vis = [t for k, t in enumerate(vis) if t[0] not in semi or (i == 0 and upto and k == upto - 1)]
+            if i == 0 and upto:
+                merged = merged_at[upto - 1]
+            hit = _ci_find([x for _, cs in vis for x in cs], c.name)
+            if hit is not None:
+                if not (order and i == 0 and c.name.lower() in self._order_outputs):
+                    self._check_unambiguous(c.name, vis, merged)
+            else:
+                hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
+                if hit is None and i == 0:
+                    hit = self._aliases.get(c.name.lower())
             if hit is not None:
                 break
         if hit is not None:
@@ -1417,6 +1456,70 @@ class _SQLTranslator:
         new.set("order", None)
         return new
 
+    def _unalias_where(self, sel: sge.Select) -> sge.Select:
+        """``sel`` with an inner SELECT alias used in its WHERE replaced by the expression it names (DuckDB lets
+        a WHERE use a SELECT alias; a column of the subquery's FROM with that name wins). The decorrelation
+        rebuilds the SELECT list, which would lose the alias."""
+        where = sel.args.get("where")
+        aliases = {e.alias.lower(): e.this for e in sel.expressions if isinstance(e, sge.Alias)}
+        if where is None or not aliases:
+            return sel
+        inner = {c for _, cs in self._scope_of(sel) for c in cs}
+        hits = [c for c in where.walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
+                if isinstance(c, sge.Column) and not c.table and c.name.lower() not in inner
+                and c.name.lower() in aliases]
+        if not hits:
+            return sel
+        sel = sel.copy()
+        for c in [c for c in sel.args["where"].walk(prune=lambda n: isinstance(n, (sge.Subquery, sge.Exists)))
+                  if isinstance(c, sge.Column) and not c.table and c.name.lower() not in inner
+                  and c.name.lower() in aliases]:
+            c.replace(sge.Paren(this=aliases[c.name.lower()].copy()))
+        return sel
+
+    def _select_subqueries(self, plan: LogicalPlan, node: sge.Select) -> LogicalPlan:
+        """Correlated scalar subqueries in the SELECT list: ``SELECT a, (SELECT max(b) FROM u WHERE u.k = t.k)
+        FROM t``. Each is the per-key aggregate LEFT-joined on the key, and the item is rewritten over the
+        aggregate columns. A key without partners sees every aggregate on no rows: NULL, except COUNT, which is
+        0 (so ``count(*) + 1`` is 1 and ``coalesce(sum(b), 0)`` is 0)."""
+        found = []
+        for e in node.expressions:
+            for n in e.walk(prune=lambda x: isinstance(x, (sge.Subquery, sge.Exists))):
+                if isinstance(n, sge.Subquery) and isinstance(n.this, sge.Select) \
+                        and self._outer_refs(self._unalias_where(n.this), self._scope_of(n.this)):
+                    found.append(n)
+        if not found:
+            return plan
+        what = "correlated scalar subquery in the SELECT list"
+        if node.args.get("group") or any(_aggs_in(e) for e in node.expressions):
+            raise NotImplementedError(f"a {what} together with GROUP BY or aggregates in the outer query is not "
+                                      "supported (compute the aggregate in a subquery first)")
+        for sub in found:
+            sel = self._unalias_where(sub.this)
+            self._check_scalar(sel, what)
+            keys, rest = self._correlation(sel, what)
+            i = next(self._ids)
+            item = sel.expressions[0]
+            item = _unparen(item.this if isinstance(item, sge.Alias) else item).copy()
+            holder = sge.Paren(this=item)
+            aggs = _aggs_in(holder)
+            items = [_alias(inner, f"__k{i}_{j}") for j, (_, inner) in enumerate(keys)] \
+                + [_alias(a, f"__a{i}_{j}") for j, a in enumerate(aggs)]
+            new = self._keyed_select(sel, rest, items)
+            new.set("group", sge.Group(expressions=[inner.copy() for _, inner in keys]))
+            inner_plan = self._child()._build_select(new)
+            plan = Join(plan, inner_plan, [self._expr(o).args[0] for o, _ in keys],
+                        [f"__k{i}_{j}" for j in range(len(keys))], "left")
+            for j, a in enumerate(aggs):
+                ref = sge.Column(this=sge.to_identifier(f"__a{i}_{j}"))
+                a.replace(sge.Coalesce(this=ref, expressions=[sge.Literal.number(0)]) if isinstance(a, sge.Count)
+                          else ref)
+            value = holder
+            if isinstance(sub.parent, sge.Select):                    # an unaliased item keeps a readable name
+                value = sge.Alias(this=holder, alias=sge.to_identifier(sub.sql(dialect="duckdb")))
+            sub.replace(value)
+        return plan
+
     def _where(self, plan: LogicalPlan, cond: sge.Expression) -> LogicalPlan:
         """WHERE: plain conditions as one Filter; IN / EXISTS subqueries (top-level AND conditions) as semi /
         anti joins, a correlated scalar comparison as a join with the per-key aggregate."""
@@ -1484,7 +1587,7 @@ class _SQLTranslator:
             for side in (c.this, c.expression):
                 side = _unparen(side)
                 if isinstance(side, sge.Subquery) and isinstance(side.this, sge.Select) \
-                        and self._outer_refs(side.this, self._scope_of(side.this)):
+                        and self._outer_refs(self._unalias_where(side.this), self._scope_of(side.this)):
                     return "scalar", c, False
         return None
 
@@ -1493,6 +1596,7 @@ class _SQLTranslator:
         sel = node.this
         if not isinstance(sel, sge.Select):
             raise NotImplementedError(f"{what} over a {type(sel).__name__} is not supported")
+        sel = self._unalias_where(sel)
         _unsupported_shape(sel, what)
         keys, rest = self._correlation(sel, what)
         if not keys:         # no outer column: there are rows or there are none
@@ -1516,6 +1620,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"{what}: the left side must be a plain column, got {x.sql(dialect='duckdb')}")
         if len(sel.expressions) != 1:
             raise ValueError(f"{what}: the subquery must return one column, it returns {len(sel.expressions)}")
+        sel = self._unalias_where(sel)
         item = sel.expressions[0]
         if isinstance(item, sge.Star):
             raise NotImplementedError(f"{what}: SELECT * in the subquery is not supported (name the column)")
