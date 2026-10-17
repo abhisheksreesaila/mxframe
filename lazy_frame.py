@@ -343,7 +343,8 @@ class LazyFrame:
 
         # COUNT(DISTINCT b) per a counts dictionary codes on the native CPU path (F-046h); auto runs that shape
         # there too (F-058), unless the caller steers it to the GPU, which needs the columns decoded
-        cd_codes = device == "cpu" or (device == "auto" and _auto_may_count_codes(plan, prefer, placement))
+        codes_decision = _auto_codes_decision(plan, prefer, placement) if device == "auto" else None
+        cd_codes = device == "cpu" or codes_decision is not None
         plan = resolve_plan(plan, count_distinct_codes=cd_codes)
         if validate:
             from .plan_validation import validate_plan_or_raise
@@ -358,8 +359,7 @@ class LazyFrame:
 
         from . import auto_mode as _am
         import time as _t
-        decision = (_auto_codes_decision(plan) if cd_codes else None) \
-            or _am.choose_device(plan, prefer=prefer, placement=placement)
+        decision = codes_decision or _am.choose_device(plan, prefer=prefer, placement=placement)
         self.last_auto_decision = decision
         if verbose:
             print(decision.explain())
@@ -467,8 +467,7 @@ class LazyFrame:
                 lines.append("none (run compute() first)")
         if device == "auto":
             from . import auto_mode as _am
-            decision = (_auto_codes_decision(plan) if _auto_may_count_codes(plan, None, None) else None) \
-                or _am.choose_device(plan, quick=not costs)
+            decision = _auto_codes_decision(plan) or _am.choose_device(plan, quick=not costs)
             text = decision.explain()
             lines.append("AutoDecision")
             shown = text.splitlines()
@@ -1085,63 +1084,41 @@ def _resolve_scalars(plan, device: str, strict: bool):
     return walk(plan)
 
 
-def _auto_may_count_codes(plan, prefer, placement) -> bool:
-    """auto resolves a COUNT(DISTINCT b) per a with dictionary codes, as device="cpu" does (F-046h, F-058), unless
-    the caller steers it to the GPU, which needs the columns decoded."""
-    return prefer != "gpu" and "gpu" not in (placement or {}).values() and _has_count_distinct(plan)
-
-
-def _auto_codes_decision(plan):
-    """A CPU decision when a COUNT(DISTINCT b) per a counts dictionary codes (the native count reads them; the GPU
-    path cannot), else None and the cost model decides. Coded means a or b is a dictionary column in the resolved
-    plan; for a Parquet source not read yet (explain), a string column, which the reader keeps as a dictionary."""
-    from .io_parquet import count_distinct_shape
+def _auto_codes_decision(plan, prefer=None, placement=None):
+    """auto's decision for a COUNT(DISTINCT b) per a whose pair the source keeps as dictionary codes: the native
+    count reads them on the CPU, as device="cpu" does (F-046h, F-058), and the GPU path cannot. Taken on the plan
+    before it is resolved, by compute and explain alike, so the two agree and the plan is resolved with codes only
+    when this says so. None (decode as before, the cost model decides) when the caller steers to the GPU, when a
+    join or anything but filters and selects sits between the pair and its source, or when the source keeps
+    neither column as a dictionary (asked of the Parquet reader from metadata, never guessed from the type)."""
     from . import auto_mode as _am
+    from .io_parquet import count_distinct_shape, dictionary_columns
+    if prefer == "gpu" or "gpu" in (placement or {}).values():
+        return None
     stack = [plan]
     while stack:
         p = stack.pop()
-        if count_distinct_shape(p):
-            arg = p.aggs[0].args[0]
-            names = {p.group_by[0].args[0]} | ({arg.args[0]} if arg.op == "col" else set())
-            # the pair's own columns, as stored by the sources (the shape takes bare columns; a plan's schema shows
-            # a dictionary's value type)
-            types = []
-            for leaf in _plan_leaves(p):
-                if isinstance(leaf, Scan):
-                    types += [(leaf.table.schema.field(n).type, False) for n in names if n in leaf.table.column_names]
-                elif isinstance(leaf, ParquetScan):
-                    types += [(leaf.schema.field(n).type, True) for n in names if n in leaf.schema.names]
-            if any(pa.types.is_dictionary(t) or (unread and (pa.types.is_string(t) or pa.types.is_large_string(t)))
-                   for t, unread in types):
-                d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
-                d.cpu_path = "native executor (count distinct on codes)"
-                return d
+        if count_distinct_shape(p) and _pair_is_coded(p, dictionary_columns):
+            d = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
+            d.cpu_path = "native executor (count distinct on codes)"
+            return d
         stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
                      if x is not None)
     return None
 
 
-def _plan_leaves(plan):
-    stack = [plan]
-    while stack:
-        p = stack.pop()
-        kids = [x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None)) if x is not None]
-        if not kids:
-            yield p
-        stack.extend(kids)
-
-
-def _has_count_distinct(plan) -> bool:
-    """Does the plan hold a COUNT(DISTINCT b) per a (the shape the native count runs on dictionary codes)?"""
-    from .io_parquet import count_distinct_shape
-    stack = [plan]
-    while stack:
-        p = stack.pop()
-        if count_distinct_shape(p):
-            return True
-        stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
-                     if x is not None)
-    return False
+def _pair_is_coded(agg, dictionary_columns) -> bool:
+    arg = agg.aggs[0].args[0]
+    names = {agg.group_by[0].args[0]} | ({arg.args[0]} if arg.op == "col" else set())
+    src = agg.input.input                               # below the Distinct: the pair's select, filters, the source
+    while isinstance(src, (Project, Filter)):
+        src = src.input
+    if isinstance(src, Scan):
+        return any(pa.types.is_dictionary(src.table.schema.field(n).type) for n in names if n in src.table.column_names)
+    if isinstance(src, ParquetScan):
+        return bool(dictionary_columns(src.path, src.schema, src.dictionary, src.max_dictionary_bytes,
+                                       [n for n in names if n in src.schema.names]))
+    return False                                        # a join (or anything else) between: decode, price it
 
 
 def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,

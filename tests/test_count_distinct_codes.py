@@ -272,16 +272,20 @@ def test_auto_with_plain_columns_is_priced_by_the_cost_model(seen):
 
 
 @pytest.mark.parametrize("source,counted,coded", [("memory", "s", True), ("memory", "p", False),
-                                                  ("parquet", "p", True), ("parquet", "d", False)])
+                                                  ("parquet", "p", True), ("parquet", "d", False),
+                                                  ("parquet", "h", False),          # dictionary over 64 KB
+                                                  ("parquet-plain", "p", False),    # written without dictionaries
+                                                  ("parquet-nodict", "p", False)])  # scan_parquet(dictionary=False)
 def test_explain_says_what_compute_does(seen, tmp_path, source, counted, coded):
     """F-128 review: explain treated every unread Parquet file as coded (an int-only Q16 shape said "codes" while
     compute priced it). A string column read from Parquet is kept as a dictionary; an int one is not."""
     import mxframe as mx
     import pyarrow.parquet as pq
     t = _table(n=400_000)
-    if source == "parquet":
-        pq.write_table(t.select(["a", "p", "d"]), tmp_path / "t.parquet")
-        base = mx.scan_parquet(str(tmp_path / "t.parquet"))
+    if source.startswith("parquet"):
+        t = t.append_column("h", pa.array([f"high-cardinality value {i:08d}" for i in range(t.num_rows)]))
+        pq.write_table(t.select(["a", "p", "d", "h"]), tmp_path / "t.parquet", use_dictionary=source != "parquet-plain")
+        base = mx.scan_parquet(str(tmp_path / "t.parquet"), **({"dictionary": False} if source == "parquet-nodict" else {}))
     else:
         base = LazyFrame(t)
     lf = base.select("a", counted).distinct().groupby("a").agg(col(counted).count().alias("n"))
@@ -301,3 +305,19 @@ def test_a_dictionary_column_elsewhere_in_the_plan_does_not_count(seen):
     exp = _duck("SELECT a, COUNT(DISTINCT v) FROM t WHERE s = 'MAIL' GROUP BY a", t=t)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
     assert "dictionary codes" not in lf.last_compile_provenance["auto_reason"]
+
+
+def test_a_shared_column_name_across_a_join_is_priced(seen):
+    """F-128 review: the left s is int64, the right s a dictionary (it becomes s_right); the count reads the left
+    one, so nothing is coded and the cost model decides."""
+    r = np.random.default_rng(3)
+    left = pa.table({"k": A(np.arange(40_000) % 500), "a": A(r.integers(0, 50, 40_000)), "s": A(r.integers(0, 9, 40_000))})
+    right = pa.table({"k": A(np.arange(500)), "s": _dict_chunks([WORDS[i % 8] for i in range(500)], 1, 4)})
+    lf = (LazyFrame(left).join(LazyFrame(right), on="k").select("a", "s").distinct().groupby("a")
+          .agg(col("s").count().alias("n")))
+    text = lf.explain(device="auto")
+    got = lf.compute(device="auto")
+    exp = _duck("SELECT a, COUNT(DISTINCT l.s) FROM l JOIN r USING (k) GROUP BY a", l=left, r=right)
+    assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
+    reason = lf.last_compile_provenance["auto_reason"]
+    assert "dictionary codes" not in reason and reason in text

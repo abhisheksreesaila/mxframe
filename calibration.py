@@ -490,9 +490,7 @@ class Calibration:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Calibration":
         base = default_calibration(_identity_from_dict(d))
-        measured = {k.split(":")[0] for k in d["fits"]}          # a measured op replaces every default of its
-        fits = {k: f for k, f in base.fits.items() if k.split(":")[0] not in measured}   # base (per-size ones too)
-        fits.update({k: Fit.from_dict(v) for k, v in d["fits"].items()})
+        fits = _merge_measured(base.fits, {k: Fit.from_dict(v) for k, v in d["fits"].items()})
         link = {**base.link_gbps, **{k: float(v) for k, v in d["link_gbps"].items()}}
         lat = {**base.link_latency_ms, **{k: float(v) for k, v in d["link_latency_ms"].items()}}
         if not all(math.isfinite(v) and v > 0 for v in link.values()):
@@ -1379,12 +1377,19 @@ def _fit_points(pts: List[List[float]], uses_card: bool, bucketed: bool = False,
     return fits, None
 
 
+def _merge_measured(defaults: Dict[str, Fit], measured: Dict[str, Fit]) -> Dict[str, Fit]:
+    """Measured fits over the defaults. A per-size fit (``op@dev:g<n>``) replaces the default of the same key, and a
+    size the probe did not reach (its time budget) keeps the default, so a cache cliff past it stays priced. An op
+    measured with no per-size fits (a plain line) replaces every default of its name: `_predict` prefers per-size
+    fits, so a default one would otherwise win over the measurement."""
+    plain_only = {k for k in measured if ":" not in k} - {k.split(":")[0] for k in measured if ":" in k}
+    out = {k: f for k, f in defaults.items() if k.split(":")[0] not in plain_only}
+    out.update(measured)
+    return out
+
+
 def _store_fits(cal: "Calibration", op: str, dev: str, fits: Dict[str, Fit]) -> None:
-    base = f"{op}@{dev}"
-    for k in [k for k in cal.fits if k.split(":")[0] == base]:      # measured fits replace the defaults (per-size
-        del cal.fits[k]                                            # defaults would otherwise win in _predict)
-    for suffix, f in fits.items():
-        cal.fits[f"{op}@{dev}{suffix}"] = f
+    cal.fits = _merge_measured(cal.fits, {f"{op}@{dev}{suffix}": f for suffix, f in fits.items()})
 
 
 # -- link + GPU init ------------------------------------------------------- #

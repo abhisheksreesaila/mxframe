@@ -840,7 +840,10 @@ def test_a_measured_native_join_replaces_every_default_of_its_name():
     assert base.estimate("native_join", "cpu", 9e6, card=1e6) < 20                # the defaults still apply unmeasured
     cal = default_calibration(None)
     cal_mod._store_fits(cal, "native_group", "cpu", {"": Fit(0.1, 1e-6, 0.0), ":g1000": Fit(0.1, 2e-6, 0.0)})
-    assert sorted(k for k in cal.fits if k.startswith("native_group@cpu")) == ["native_group@cpu", "native_group@cpu:g1000"]
+    # g1000 is measured; the sizes the probe did not reach (a slow box skips them) keep the reference price
+    assert cal.fits["native_group@cpu:g1000"].c == 2e-6
+    assert cal.fits["native_group@cpu:g1000000"].c == pytest.approx(9.5e-6)
+    assert cal.estimate("native_group", "cpu", 10e6, card=1e6) > 50                # the 1M-group cliff is still there
 
 
 def test_the_native_join_probe_measures_each_build_size():
