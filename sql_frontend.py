@@ -1005,41 +1005,79 @@ class _SQLTranslator:
         items = ([sel.args["from_"].this] if sel.args.get("from_") is not None else []) \
             + [j.this for j in sel.args.get("joins") or []]
         scope = [(it.alias_or_name.lower(), list(self._source(it)[1])) for it in items]
+        joins = sel.args.get("joins") or []
+        # names a USING / NATURAL join merges into one column, per join (a bare reference to one is not ambiguous)
+        merged_at: List[set] = [set()]
+        for j, join in enumerate(joins):
+            using = join.args.get("using")
+            if using:
+                new = {str(c.name).lower() for c in (using if isinstance(using, list) else using.expressions)}
+            elif join.args.get("method") and join.args.get("on") is None:
+                new = {c.lower() for _, cs in scope[:j + 1] for c in cs} & {c.lower() for c in scope[j + 1][1]}
+            else:
+                new = set()
+            for n in new - merged_at[-1]:
+                self._check_unambiguous(n, scope[:j + 1], merged_at[-1])      # a USING key is one column on the left
+            merged_at.append(merged_at[-1] | new)
         self._aliases = {e.alias.lower(): e.alias for e in sel.expressions if isinstance(e, sge.Alias)}
-        self._levels = [scope, *self._outer]
+        semi = {scope[j + 1][0] for j, jn in enumerate(joins) if str(jn.args.get("kind") or "").lower() in ("semi", "anti")}
+        self._levels = [(scope, merged_at[-1], semi), *self._outer]      # a SEMI / ANTI table is seen by its own ON only
+        self._order_outputs = {(e.alias if isinstance(e, sge.Alias) else e.name).lower()
+                               for e in sel.expressions if isinstance(e, (sge.Alias, sge.Column))}
 
-        def visit(n: sge.Expression) -> None:
+        def visit(n: sge.Expression, upto=None, order=False) -> None:
             for x in n.walk(prune=lambda y: isinstance(y, sge.Select)):
                 if isinstance(x, sge.Column):
-                    self._resolve_col(x)
+                    self._resolve_col(x, upto, merged_at, order)
 
         for key, val in sel.args.items():
             if key in ("with_", "from_") or val is None:
                 continue
             for v in val if isinstance(val, list) else [val]:
                 if key == "joins":
+                    j = joins.index(v)
                     for k2, v2 in v.args.items():
                         for w in v2 if isinstance(v2, list) else [v2]:
                             if k2 != "this" and isinstance(w, sge.Expression):
-                                visit(w)
+                                visit(w, j + 2)             # an ON sees the tables up to its own
                 elif isinstance(v, sge.Expression):
-                    visit(v)
+                    visit(v, order=key == "order")
 
-    def _resolve_col(self, c: sge.Column) -> None:
-        """Rewrite column ``c`` to the spelling of the column it names in this query's scopes."""
+    @staticmethod
+    def _check_unambiguous(name: str, tables: List[tuple], merged: set) -> None:
+        """DuckDB's "Ambiguous reference to column name": a bare ``name`` that two or more of ``tables`` have
+        (case-insensitively) and no USING / NATURAL join merged into one column."""
+        owners = [a for a, cs in tables if _ci_find(cs, name)]
+        if len(owners) > 1 and name.lower() not in merged:
+            raise ValueError(f"ambiguous column reference: {name} (tables {', '.join(owners)}): "
+                             "qualify it with its table")
+
+    def _resolve_col(self, c: sge.Column, upto=None, merged_at=(), order=False) -> None:
+        """Rewrite column ``c`` to the spelling of the column it names in this query's scopes. A bare name that
+        two tables of one scope have is ambiguous (as in DuckDB), unless a USING / NATURAL join merged it or
+        ORDER BY means the SELECT output of that name. ``upto``: the ON of a join sees only the tables so far."""
         if isinstance(c.this, sge.Star):
             return
         hit = None
-        for i, lvl in enumerate(self._levels):
+        for i, (lvl, merged, semi) in enumerate(self._levels):
             if c.table:
                 cols = next((cs for a, cs in lvl if a == c.table.lower()), None)
                 if cols is None:
                     continue
                 hit = _ci_find(cols, c.name)
                 break
-            hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
-            if hit is None and i == 0:
-                hit = self._aliases.get(c.name.lower())
+            vis = lvl[:upto] if i == 0 and upto else lvl
+            vis = [t for k, t in enumerate(vis) if t[0] not in semi or (i == 0 and upto and k == upto - 1)]
+            if i == 0 and upto:
+                merged = merged_at[upto - 1]
+            hit = _ci_find([x for _, cs in vis for x in cs], c.name)
+            if hit is not None:
+                if not (order and i == 0 and c.name.lower() in self._order_outputs):
+                    self._check_unambiguous(c.name, vis, merged)
+            else:
+                hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
+                if hit is None and i == 0:
+                    hit = self._aliases.get(c.name.lower())
             if hit is not None:
                 break
         if hit is not None:
