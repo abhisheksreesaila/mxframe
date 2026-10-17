@@ -527,7 +527,8 @@ def _key_desc(x, keep: list):
     if t in (pa.int32(), pa.int64(), pa.date32()):
         b = a.buffers()
         keep.append(a)
-        return [1 if t == pa.int64() else 0, b[1].address, 0, 0, a.offset, b[0].address if a.null_count else 0, 0, 0], "int"
+        return [1 if t == pa.int64() else 0, b[1].address, 0, 0, a.offset, b[0].address if a.null_count else 0, 0, 0], \
+            ("date" if t == pa.date32() else "int")        # a date is not a day number: only a date meets a date
     return None
 
 

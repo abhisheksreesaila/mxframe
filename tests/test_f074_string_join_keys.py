@@ -244,3 +244,82 @@ def test_a_join_big_enough_for_every_worker(distinct, spy):
     ids, rids = out.column("id").to_numpy(), out.column("rid").to_numpy()
     assert spy == [], spy
     assert (out.num_rows, int((ids * 7 + rids).sum())) == (want[0], int(want[1]))
+
+
+def test_a_date_key_never_meets_an_integer_key_in_a_composite():
+    """(str, date32) against (str, int32) must raise like the single-key join and like DuckDB, not match
+    the day number (1,500 silent rows before)."""
+    a = pa.table({"s": pa.array(["x"] * 1500), "d": pa.array(np.arange(1500, dtype=np.int32)).cast(pa.date32()),
+                  "id": A(np.arange(1500, dtype=np.int64))})
+    b = pa.table({"s": pa.array(["x"] * 1500), "i": A(np.arange(1500, dtype=np.int32)),
+                  "rid": A(np.arange(1500, dtype=np.int64))})
+    with pytest.raises(TypeError, match="join key types differ"):
+        LazyFrame(a).join(LazyFrame(b), left_on=["s", "d"], right_on=["s", "i"]).compute(device="cpu")
+    ok = LazyFrame(a).join(LazyFrame(a.rename_columns(["s", "rd", "rid"])), left_on=["s", "d"],
+                           right_on=["s", "rd"]).compute(device="cpu")
+    assert ok.num_rows == 1500           # a date against a date still joins
+
+
+@pytest.mark.parametrize("how", HOWS)
+def test_empty_string_keys_next_to_null_keys(how, spy):
+    """'' is a key that matches '' and not NULL; NULL matches nothing, on both sides."""
+    n = 3000
+    lk = ["" if i % 3 == 0 else (None if i % 3 == 1 else f"v{i % 7}") for i in range(n)]
+    rk = ["" if i % 5 == 0 else (None if i % 5 == 1 else f"v{i % 9}") for i in range(n)]
+    l = pa.table({"k": pa.array(lk), "id": A(np.arange(n, dtype=np.int64))})
+    r = pa.table({"rk": pa.array(rk), "rid": A(np.arange(n, dtype=np.int64)), "rv": A(np.arange(n, dtype=np.int64))})
+    assert _check(l, r, how, "cpu", spy) > 100
+
+
+def _bytes_col(values, n):
+    """n strings cycling through `values` (bytes, not necessarily UTF-8), built from raw buffers."""
+    picked = [values[i % len(values)] for i in range(n)]
+    offs = np.zeros(n + 1, dtype=np.int32)
+    offs[1:] = np.cumsum([len(b) for b in picked])
+    return pa.Array.from_buffers(pa.string(), n, [None, pa.py_buffer(offs.tobytes()), pa.py_buffer(b"".join(picked))])
+
+
+def test_invalid_utf8_keys_compare_by_their_bytes(spy):
+    vals = [b"\xff\xfe", b"\xff\xfe\x00", b"a\x80", b"", b"\xc3\xa9", b"e\xcc\x81"]
+    rvals = vals[::-1] + [b"zz"]
+    l = pa.table({"k": _bytes_col(vals, 2000), "id": A(np.arange(2000, dtype=np.int64))})
+    r = pa.table({"rk": _bytes_col(rvals, 1400), "rid": A(np.arange(1400, dtype=np.int64))})
+    by_key = {}
+    for j in range(1400):
+        by_key.setdefault(rvals[j % 7], []).append(j)
+    want = sorted((i, j) for i in range(2000) for j in by_key.get(vals[i % 6], []))
+    co._JOIN_RESULT_CACHE.clear()
+    spy.clear()
+    out = LazyFrame(l).join(LazyFrame(r), left_on="k", right_on="rk").select(col("id"), col("rid")).compute(device="cpu")
+    assert sorted(zip(out.column("id").to_pylist(), out.column("rid").to_pylist())) == want
+    assert len(want) > 1000 and spy == [], spy
+
+
+@pytest.mark.parametrize("sliced", [False, True], ids=["whole", "sliced"])
+@pytest.mark.parametrize("device", DEVICES)
+def test_left_join_payload_columns_with_nulls_and_unmatched_rows(sliced, device, spy):
+    """The restore after the native gather: unmatched rows are NULL, so are the payload's own NULLs (int,
+    utf8, float), also when the inputs are slices with non-zero offsets."""
+    rng = np.random.default_rng(1)
+    nl, nr = 5000, 3000
+    rnull, lnull = rng.random(nr) < 0.2, rng.random(nl) < 0.2
+    l = pa.table({"k": pa.array([f"k{i}" for i in rng.integers(0, 2000, nl)]), "id": A(np.arange(nl, dtype=np.int64)),
+                  "lv": pa.array([None if m else f"L{i}" for i, m in zip(range(nl), lnull)]),
+                  "lf": pa.array([None if m else float(i) for i, m in zip(range(nl), lnull)])})
+    r = pa.table({"rk": pa.array([f"k{i}" for i in rng.integers(1000, 3000, nr)]),      # keys 0-999 never match
+                  "rid": A(np.arange(nr, dtype=np.int64)),
+                  "rv": pa.array([None if m else i for i, m in zip(range(nr), rnull)], type=pa.int64()),
+                  "rs": pa.array([None if m else f"s{i}" for i, m in zip(range(nr), rnull)])})
+    if sliced:
+        l, r = l.slice(7, 4000), r.slice(13, 2500)
+    cols = ["id", "lv", "lf", "rid", "rv", "rs"]
+    want = sorted(_duck_tables(l, r).execute(
+        "select l.id, l.lv, l.lf, r.rid, r.rv, r.rs from l left join r on l.k = r.rk").fetchall(), key=repr)
+    co._JOIN_RESULT_CACHE.clear()
+    spy.clear()
+    out = LazyFrame(l).join(LazyFrame(r), left_on="k", right_on="rk", how="left") \
+        .select(*[col(c) for c in cols]).compute(device=device)
+    got = sorted(zip(*[out.column(c).to_pylist() for c in cols]), key=repr)
+    assert got == want
+    assert sum(1 for row in got if row[3] is None) > 500 and sum(1 for row in got if row[3] is not None and row[4] is None) > 100
+    assert spy == [], spy
