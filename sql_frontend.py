@@ -674,8 +674,7 @@ class _SQLTranslator:
                     right_plan = Filter(right_plan, pred)
             using = join.args.get("using")
             if on is not None:
-                on = self._use_right_key_copies(on)      # u.k of an earlier LEFT JOIN: NULL where it missed
-                left_on, right_on = self._parse_join_on(on, self._left_schema, right_schema)
+                left_on, right_on = self._parse_join_on(on, join.this.alias_or_name.lower(), right_schema)
             elif using or join.args.get("method"):
                 if using:
                     cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
@@ -828,18 +827,6 @@ class _SQLTranslator:
             self._copies.add(name)
             added.append(col(k).alias(name))
         return Project(right_plan, [col(c) for c in right_cols] + added)
-
-    def _use_right_key_copies(self, on):
-        """``on`` with every ``u.k`` that is an earlier LEFT JOIN's right key replaced by its copy (NULL where
-        that join matched nothing, so nothing matches it), and every earlier table's column that the join
-        renamed (``x.k`` -> ``k_right``) by its output name."""
-        on = on.copy()
-        for c in list(on.find_all(sge.Column)):
-            key = (c.table.lower(), c.name) if c.table else None
-            copy = self._marks.get(key) or self._renamed.get(key)
-            if copy:
-                c.replace(sge.Column(this=sge.to_identifier(copy)))
-        return on
 
     @staticmethod
     def _own_typed_keys(plan, right_plan, right_cols, left_on, right_on, how):
@@ -1029,31 +1016,43 @@ class _SQLTranslator:
                                           "name the columns in the SELECT")
             self._ctes[alias.name.lower()] = self._child()._build_select(cte.this)
 
-    def _parse_join_on(self, on_expr: sge.Expression,
-                       left_schema: set = None, right_schema: set = None):
-        """Return ([left_cols], [right_cols]) from an ON expression.
+    def _on_side(self, c: sge.Column, alias: str, right_schema: set) -> str:
+        """"L" when column ``c`` of a JOIN's ON belongs to the tables joined so far, "R" when it is a column of
+        the table being joined (``alias``). A qualifier decides; a bare name must be in exactly one side."""
+        if c.table:
+            t = c.table.lower()
+            if t == alias:
+                return "R"
+            if t in self._joined:
+                return "L"
+            raise ValueError(f"JOIN ON: unknown table {c.table!r} in {c.sql(dialect='duckdb')}")
+        in_l, in_r = c.name in self._left_schema, c.name in right_schema
+        if in_l and in_r:
+            raise ValueError(f"JOIN ON: ambiguous reference to column {c.name!r} (in {alias!r} and an earlier table): "
+                             "qualify it with its table")
+        if not (in_l or in_r):
+            raise ValueError(f"JOIN ON: unknown column {c.name!r}")
+        return "L" if in_l else "R"
 
-        When *left_schema* and *right_schema* are provided we detect which
-        column belongs to which side and assign accordingly, handling cases
-        where the SQL author wrote them in right→left order.
-        """
-        if isinstance(on_expr, sge.EQ):
-            a = on_expr.this.name
-            b = on_expr.expression.name
-            if left_schema is not None and right_schema is not None:
-                a_in_left  = a in left_schema
-                a_in_right = a in right_schema
-                b_in_left  = b in left_schema
-                b_in_right = b in right_schema
-                # If a belongs to right and b belongs to left → swap
-                if a_in_right and b_in_left and (not a_in_left or not b_in_right):
-                    return [b], [a]
-            return [a], [b]
-        if isinstance(on_expr, sge.And):
-            ll, rl = self._parse_join_on(on_expr.this, left_schema, right_schema)
-            lr, rr = self._parse_join_on(on_expr.expression, left_schema, right_schema)
-            return ll + lr, rl + rr
-        raise ValueError(f"Cannot parse JOIN ON: {on_expr}")
+    def _parse_join_on(self, on_expr: sge.Expression, alias: str, right_schema: set):
+        """([left columns], [right columns]) of ``a = b AND c = d ...``. Each side of an equality belongs to the
+        left (the tables joined so far) or to the table being joined (``alias``) by its table qualifier, in
+        either operand order; a bare name is told by the side that has it."""
+        left, right = [], []
+        for c in _conjuncts(on_expr):
+            if not (isinstance(c, sge.EQ) and isinstance(_unparen(c.this), sge.Column)
+                    and isinstance(_unparen(c.expression), sge.Column)):
+                raise ValueError(f"Cannot parse JOIN ON: {on_expr}")
+            a, b = _unparen(c.this), _unparen(c.expression)
+            sides = (self._on_side(a, alias, right_schema), self._on_side(b, alias, right_schema))
+            if sides == ("R", "L"):
+                a, b = b, a
+            elif sides != ("L", "R"):
+                raise ValueError(f"Cannot parse JOIN ON: {c.sql(dialect='duckdb')} must compare a column of the "
+                                 f"joined table {alias!r} with a column of an earlier table")
+            left.append(self._expr(a).args[0])           # the plan's own name for it (renamed, copied or aliased)
+            right.append(b.name)
+        return left, right
 
     # ------------------------------------------------------------------
     # aggregate building

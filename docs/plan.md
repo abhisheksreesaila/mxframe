@@ -1014,10 +1014,11 @@ Found by the F-093 developer (2026-10-16)
 - [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
 - [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before
 
-## F-109 SQL JOIN ON ignores the table qualifier [todo]
+## F-109 SQL JOIN ON ignores the table qualifier [review]
 Found by the F-104 review (2026-10-16); a silent wrong answer on main
 - [ ] `_parse_join_on` matches columns by name only. `t JOIN x ON x.v = t.k`, where `k` and `v` are in both tables, joins `t.v = x.k`: mx returns ids 1, 2, 5 and DuckDB returns 2, 5. Decide each side of an equality from its qualifier (`t.` / alias in the tables joined so far, or the table being joined), falling back to the column name only for an unqualified column; an unqualified name found in both sides raises (DuckDB: ambiguous)
-- [ ] DuckDB-checked tests: qualified ON in either operand order with the same column names in both tables, two and three tables, LEFT / INNER, a USING form; fails before
+- [x] DuckDB-checked tests: qualified ON in either operand order with the same column names in both tables, two and three tables, LEFT / INNER, a USING form; fails before
+- Built (2026-10-16): `_parse_join_on(on, alias, right_schema)` decides each side of an equality with `_on_side` (qualifier: the table being joined is R, a table in `self._joined` is L; a bare name must be in exactly one side, in both raises 'ambiguous', in neither 'unknown column'), either operand order, and names the left column through `_expr` (the same resolution F-095 / F-099 / F-104 use: renamed, copied, aliased). `_use_right_key_copies` is deleted: it rewrote qualified ON columns to bare names, which lost the side (`y.v = x.v` after `t JOIN x ON x.v = t.k` became ambiguous), and `_expr` does the same lookup. `tests/test_f109_join_on_qualifier.py` (81, cpu + gpu): 44 fail on main.
 
 ## F-111 SQL ambiguous bare column in a join silently picks the left one [todo]
 From the F-095 review (2026-10-16); a silent wrong answer
