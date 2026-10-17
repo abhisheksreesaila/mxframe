@@ -334,6 +334,7 @@ def test_a_shape_the_native_count_declines_still_runs_as_cpu_does(seen):
     got = lf.compute(device="auto")
     exp = _duck("SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a", t=t)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
+    assert seen == []                                               # the native count declined the nulls
     want = LazyFrame(t).select("a", "b").distinct().groupby("a").agg(col("b").count().alias("n"))
     want.compute(device="cpu")
     assert lf.last_compile_provenance["path"] == want.last_compile_provenance["path"]
