@@ -1111,9 +1111,10 @@ Found in the F-116 review (2026-10-16)
 Found in the F-116 review (2026-10-16)
 - [ ] a bare integer (and boolean) literal in a plain SELECT list is broadcast as float32 / float64 by `_eval_expr_arrow` (`lit`); DuckDB returns INTEGER (BOOLEAN). F-116 keeps the type only for constants beside aggregates (`_exact_lit`). Give every constant output column its type; check CASE / COALESCE branches that rely on the float broadcast; DuckDB-checked tests
 
-## F-119 `extract(year from <int32 day column with NULLs>)` in WHERE raises [todo]
+## F-119 `extract(year from <int32 day column with NULLs>)` in WHERE raises [review]
 Found in the F-116 review (2026-10-16); also on main
-- [ ] `WHERE extract(year from dd) = 2024` over an int32 day-number column that has NULLs raises "Cannot evaluate predicate op 'year_days' in PyArrow" (the native path declines "year_days over a column with nulls" and PyArrow has no kernel). Make the fallback evaluate it (NULL stays NULL, so the row is not kept); DuckDB-checked test with NULL days
+- [x] `WHERE extract(year from dd) = 2024` over an int32 day-number column that has NULLs raises "Cannot evaluate predicate op 'year_days' in PyArrow" (the native path declines "year_days over a column with nulls" and PyArrow has no kernel). Make the fallback evaluate it (NULL stays NULL, so the row is not kept); DuckDB-checked test with NULL days
+- Built (2026-10-17): `compiler._eval_predicate` gets `year_days` (integer day number -> int32 -> date32 -> `pc.year`, NULL stays NULL), the same steps `custom_ops._eval_expr_arrow` already had. `tests/test_f119_year_days_nulls.py` (289: int32 day column and date32 column; WHERE with =, <>, NOT, AND / OR, IN; aggregate; GROUP BY year; with and without NULLs; 50 and 20,000 rows; cpu + gpu; native on and off; DuckDB computes the year of `date '1970-01-01' + dd`, as it has no EXTRACT on an integer); 101 fail on main. Not done: the ticket's month / day: the SQL front end supports `EXTRACT(YEAR ...)` only (MONTH / DAY raise NotImplementedError) and no `month` / `day` Expr op exists, so adding them to the evaluator would be dead code; they need their own ticket (front end + op + native)
 
 ## F-120 CPU and GPU in tandem, borrowing from AI training systems [todo]
 Asked for by the user (2026-10-16), after the core benchmark. Second anxiety after data bigger than memory (done in F-056 / F-113)
@@ -1148,8 +1149,9 @@ Split from F-060 (2026-10-17)
 - [ ] integer `min` / `max` past 2^53 still come back as float64 on the native paths (F-090 routes values past 2^53 to the exact Arrow route and casts the type back, so values are exact; the kernels themselves compute in float). Compute integer MIN / MAX as int64 in the kernels (CPU and GPU), so no route-and-cast is needed
 - [ ] tests: exact 2^60-scale values, grouped and global, native / pipeline / GPU paths asserted; fails before
 
-## F-125 Modulo by zero: NULL rows in count and GROUP BY [todo]
+## F-125 Modulo by zero: NULL rows in count and GROUP BY [review]
 Found by the F-101 developer (2026-10-17); silent wrong answers on main (Arrow path)
-- [ ] `count(a % z)` counts rows whose remainder is NULL (z = 0): 10 where DuckDB gives 6. `count(expr)` must skip NULL results of the expression, not only NULL inputs
-- [ ] `GROUP BY a % 0` returns no rows where DuckDB returns one NULL group: NULL group keys from an expression form a group
-- [ ] DuckDB-checked tests for count / sum / avg / min over expressions that produce NULL (modulo by zero, NULLIF, CASE without ELSE), grouped and global, and GROUP BY on such expressions; fails before
+- [x] `count(a % z)` counts rows whose remainder is NULL (z = 0): 10 where DuckDB gives 6. `count(expr)` must skip NULL results of the expression, not only NULL inputs
+- [x] `GROUP BY a % 0` returns no rows where DuckDB returns one NULL group: NULL group keys from an expression form a group
+- [x] DuckDB-checked tests for count / sum / avg / min over expressions that produce NULL (modulo by zero, NULLIF, CASE without ELSE), grouped and global, and GROUP BY on such expressions; fails before
+- Built (2026-10-17): root cause was `custom_ops._can_be_null`, which knew CASE-without-ELSE and `IN (.., NULL)` but not `mod`: a plan whose only NULL source is a zero divisor went to the fused / native / group-id paths, which assume a computed value or key is never NULL (`present_mask[composite]` IndexError on a NULL key, an empty result for `GROUP BY a % 0`, and `count(a % z)` counting every row). `mod` by anything but a non-zero literal now counts as nullable, so `_arrow_aggregate_reason` sends the plan to Arrow's hash aggregate, which skips NULL results and keeps a NULL group; the same predicate keeps the F-101 `OP_MOD` kernel from being used on a nullable result. NULLIF and CASE without ELSE were already covered. `x / 0` is not NULL in DuckDB (count 7 of 7), not touched. `tests/test_f125_null_expressions.py` (514: 11 expressions x count / sum / avg / min / max, global, grouped, filtered; GROUP BY keys; with and without NULL inputs; 60 and 20,000 rows; cpu + gpu; native on and off); 54 of them fail on main (24 on gpu)
