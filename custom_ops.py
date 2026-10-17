@@ -179,6 +179,9 @@ def _can_be_null(expr) -> bool:
         if expr.op == "case_when" and any(isinstance(a, Expr) and a.op == "lit" and a.args[0] is None
                                           for a in expr.args[1:]):
             return True
+        if (expr.op == "isin" and isinstance(expr.args[1], (list, tuple))
+                and any(v is None for v in expr.args[1])):       # x IN (.., NULL) is TRUE or NULL (F-114)
+            return True
         return any(_can_be_null(a) for a in expr.args)
     return isinstance(expr, (list, tuple)) and any(_can_be_null(a) for a in expr)
 

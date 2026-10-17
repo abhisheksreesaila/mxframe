@@ -1047,10 +1047,12 @@ From F-056 step 3a (2026-10-16): a query whose result itself is bigger than the 
 - [ ] `LazyFrame.sink_parquet(path)` (and SQL `COPY (...) TO 'file.parquet'` if cheap): stream the batches / spilled partitions straight to a Parquet file, bounded memory, so "result bigger than memory" has a way to finish. DataLens can then page through the file
 - [ ] tests: a filter keeping most of a file bigger than the budget, and an all-groups aggregate over budget, written with bounded peak memory, file equal to DuckDB's result
 
-## F-114 SQL IN / NOT IN list with a NULL literal [todo]
+## F-114 SQL IN / NOT IN list with a NULL literal [review]
 Found by the F-056 step 3b review (2026-10-16)
 - [ ] `x NOT IN (1, 2, NULL)` and `x IN (1, NULL)` raise "Expected scalar literal in IN list, got Null" in the SQL front end. DuckDB: `x IN (..., NULL)` is TRUE or NULL (never FALSE); `x NOT IN (..., NULL)` is never TRUE. The engine's `np_arrow.is_in` already follows three-valued logic (F-070); map the SQL list onto it
-- [ ] DuckDB-checked tests: IN / NOT IN lists with NULL, int / float / string columns with NULLs, under NOT and in SELECT; fails before
+- [x] DuckDB-checked tests: IN / NOT IN lists with NULL, int / float / string columns with NULLs, under NOT and in SELECT; fails before
+- Built (2026-10-16): the front end keeps a NULL in the list (`_scalar` -> None) and `np_arrow.is_in` (F-070) does the three-valued logic on the Arrow path and the GPU (which falls to it). Declines so nothing ignores the NULL: the file-scan pushdown (`io_parquet`, a NULL list is not pushed), the dictionary shortcut (`arrow_dict`), the bytecode (`_isin` already raised Unsupported for a non-number), and `_can_be_null` (an `isin` with a NULL yields NULL, so a group-by over such a WHERE takes the null-aware path instead of crashing on a nullable mask). `tests/test_f114_sql_in_null.py` (155, cpu + gpu, native on and off): all 163 fail on main.
+- Not done, found on the way: `d IN (DATE '..')` (any list) still raises "Expected scalar literal in IN list, got Cast" on main; the date literal convention is F-115's.
 
 ## F-115 SQL `select date '..'` returns a float day number, not a date [todo]
 Found in the F-108 review (2026-10-16); also on main

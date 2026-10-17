@@ -2124,6 +2124,8 @@ class _SQLTranslator:
     # ------------------------------------------------------------------
 
     def _scalar(self, node: sge.Expression) -> Any:
+        if isinstance(node, sge.Null):
+            return None                                 # IN (.., NULL): np_arrow.is_in's three-valued logic
         if isinstance(node, sge.Literal):
             if node.is_string:
                 return node.this
