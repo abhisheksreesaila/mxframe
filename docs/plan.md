@@ -929,10 +929,12 @@ From the F-087 review (2026-10-16)
 - [ ] OFFSET without LIMIT uses `n = 2**62` (`sql_frontend._ALL_ROWS`): `explain()` shows the sentinel and an OFFSET above ~2^62 overflows `n + offset` in int64 in native code. Model "no limit" as `n=None` in `Limit` (or clamp), every consumer handles it
 - [ ] tests: explain shows no sentinel; a huge OFFSET returns no rows without overflow; fails before
 
-## F-099 SQL self-join: columns of the second copy [todo]
+## F-099 SQL self-join: columns of the second copy [review]
 Found by the F-092 developer and review (2026-10-16)
-- [ ] in `t x JOIN t y`, referencing a column that exists in both copies on the second side (`WHERE y.qty > 25`, `SELECT y.v`) raises "name exists in more than one joined table ... not supported yet". Joined tables with shared non-key column names are common (self-joins, fact-to-fact): carry both copies under distinct internal names (`v`, `v_right`) and resolve `x.v` / `y.v` to the right one in every clause
-- [ ] DuckDB-checked tests: self-join with filters on either side, SELECT of both copies, GROUP BY / ORDER BY on the second copy, a three-way join with a repeated name; fails before
+- [x] in `t x JOIN t y`, referencing a column that exists in both copies on the second side (`WHERE y.qty > 25`, `SELECT y.v`) raises "name exists in more than one joined table ... not supported yet". Joined tables with shared non-key column names are common (self-joins, fact-to-fact): carry both copies under distinct internal names (`v`, `v_right`) and resolve `x.v` / `y.v` to the right one in every clause
+- [x] DuckDB-checked tests: self-join with filters on either side, SELECT of both copies, GROUP BY / ORDER BY on the second copy, a three-way join with a repeated name; fails before
+- Built (2026-10-16): `_expr` looks a column up by its table alias in `_renamed` (the join renamed a clashing column `v` -> `v_right`, `v_right2`), the key a table matched on with a different name resolves to the left key (`z.v` in `ON z.v = y.v`). The select-list output keeps the written name (`v`, then `v_1`). `tests/test_sql_self_join.py` (81, cpu + gpu, F-092 self-join over `scan_parquet`): 73 fail on main. The two 'more than one joined table' cases of `test_sql_gaps` are removed (they work now); the guard stays for any shape not covered.
+- Not done: a bare `v` (no table) in a self-join stays the left table's (DuckDB calls it ambiguous).
 
 ## F-100 SQL COALESCE and IS NULL over expressions [todo]
 Found by the F-094 developer (2026-10-16)
@@ -944,10 +946,12 @@ From the F-094 review (2026-10-16); speed
 - [ ] a `%` anywhere in WHERE moves the whole filter off the native path: `WHERE a > 500 GROUP BY k` runs native in 5 ms at 2M rows, adding `AND a % 7 = 0` takes it to `cpu_aot` at 50 ms. An integer `mod` op in the bytecode (sign follows the dividend; zero divisor gives NULL, so decline when the divisor column can be 0, or test it), CPU and GPU kernels
 - [ ] tests: the filter stays native (path asserted), equals DuckDB with negatives and a zero divisor; quiet-machine timing back near the no-`%` query
 
-## F-102 SELECT * over a join keeps both key columns, each with its own type [todo]
+## F-102 SELECT * over a join keeps both key columns, each with its own type [review]
 Found by the F-090 review (2026-10-16); a missing column on main
-- [ ] `SELECT * FROM t JOIN v ON t.i = v.x` (and the comma form `FROM t, v WHERE t.i = v.x`) leaves out `x` entirely, even when both keys are the same type; DuckDB keeps both columns. The comma form also reads `v.x` as the left key, so its type is the left side's (values equal, -0.0 shows as 0). Keep the right key as its own output column (USING / NATURAL keep one, like DuckDB)
-- [ ] DuckDB-checked tests: SELECT * and SELECT v.x over JOIN ON, comma join, USING; same-type and int-vs-float keys; LEFT JOIN with unmatched rows (right key NULL, F-086); fails before
+- [x] `SELECT * FROM t JOIN v ON t.i = v.x` (and the comma form `FROM t, v WHERE t.i = v.x`) leaves out `x` entirely, even when both keys are the same type; DuckDB keeps both columns. The comma form also reads `v.x` as the left key, so its type is the left side's (values equal, -0.0 shows as 0). Keep the right key as its own output column (USING / NATURAL keep one, like DuckDB)
+- [x] DuckDB-checked tests: SELECT * and SELECT v.x over JOIN ON, comma join, USING; same-type and int-vs-float keys; LEFT JOIN with unmatched rows (right key NULL, F-086); fails before
+- Built (2026-10-16): when the query has a `*` or `t.*`, a `JOIN ... ON` (inner or left) carries its right keys as copies (`_copy_right_keys(all_keys)`, the F-086 machinery; no star, no copy, so plans of other queries are unchanged); `_star_items` lists the result columns in DuckDB's order (left table, then the right table's own order, key in place); USING / NATURAL (now parsed) keep one key; a repeated name becomes `k_1`. The comma join copies a right key when the query has a star or the key types differ (leftover of F-090: `fl.x` was the left key's int). `tests/test_sql_select_star_join.py` (63, cpu + gpu): 48 fail on main.
+- Probed DuckDB: a native table keeps the repeated name at the top level (`k`, `k`); in a subquery, and for Arrow tables via `duckdb.sql(q)` (what `mx.sql` is given), it is `k_1`. mx keeps its F-088 convention (`k_1`); `con.sql(q).arrow()` over native tables gives duplicates, which an Arrow-backed result here does not. `test_sql_is_null::test_left_join_copy_never_in_a_result` expected the missing right key; now both keys.
 
 ## F-103 SQL integer column plus integer literal stays integer [done]
 Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
