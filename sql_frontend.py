@@ -297,24 +297,41 @@ def _default_agg_name(node: sge.Expression) -> str:
     if isinstance(arg, sge.Star):
         return "count_star()"
     if isinstance(arg, (sge.Column, sge.Literal)):
-        return f"{fn}({'DISTINCT ' if distinct else ''}{arg.sql(dialect='duckdb')})"
+        return f"{fn}({'DISTINCT ' if distinct else ''}{_written(arg)})"
     raise ValueError(f"give {node.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
 
 
 def _dedupe(names) -> List[Optional[str]]:
-    """Output names as DuckDB returns them: a name already taken becomes ``x_1``, ``x_2`` ...
-    (the first free one, in SELECT order). Unnamed (None) stay unnamed."""
+    """Output names as DuckDB returns them: a name already taken (names are case-insensitive) becomes
+    ``x_1``, ``x_2`` ... (the first free one, in SELECT order). Unnamed (None) stay unnamed."""
     seen, out = set(), []
     for n in names:
-        if n is not None and n in seen:
+        if n is not None and n.lower() in seen:
             i = 1
-            while f"{n}_{i}" in seen:
+            while f"{n}_{i}".lower() in seen:
                 i += 1
             n = f"{n}_{i}"
         if n is not None:
-            seen.add(n)
+            seen.add(n.lower())
         out.append(n)
     return out
+
+
+def _ci_find(names, name: str) -> Optional[str]:
+    """The first of ``names`` equal to ``name`` ignoring case (DuckDB's rule for every identifier, quoted or
+    not; of two columns that differ only by case the first one answers to both spellings), else None."""
+    low = name.lower()
+    return next((n for n in names if n.lower() == low), None)
+
+
+def _written(col: sge.Expression) -> str:
+    """A column or literal as the query wrote it (DuckDB names an unaliased aggregate ``sum(AMOUNT)`` from
+    this text): name resolution rewrites a column to its source spelling and keeps the written one in meta."""
+    if not isinstance(col, sge.Column):
+        return col.sql(dialect="duckdb")
+    name = col.meta.get("written", col.name)
+    text = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) else '"' + name.replace('"', '""') + '"'
+    return f"{col.table}.{text}" if col.table else text
 
 
 def _ordinal(node: sge.Expression, n_items: int) -> Optional[int]:
@@ -369,11 +386,18 @@ class _SQLTranslator:
         self._qual: dict = {}
         self._joined: set = set()
         self._cur_cols: List[str] = []
+        self._sources: dict = {}        # id(FROM item) -> (item, plan, columns)
+        # name resolution (`_resolve_names`): the scopes of this query and then of the queries around it
+        # (each [(alias, columns)]), and its SELECT aliases
+        self._outer: list = []
+        self._levels: list = []
+        self._aliases: dict = {}
 
     def _child(self) -> "_SQLTranslator":
         """A translator for a subquery: its own state, the same tables and WITH names."""
         c = _SQLTranslator(self._tables)
         c._ctes = dict(self._ctes)
+        c._outer = self._levels
         c._ids = self._ids
         return c
 
@@ -392,6 +416,7 @@ class _SQLTranslator:
         if not isinstance(node, sge.Select):
             raise NotImplementedError(f"{type(node).__name__} (UNION / INTERSECT / EXCEPT) is not supported, only SELECT")
         self._register_ctes(node.args.get("with_"))
+        self._resolve_names(node)
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
 
         where = node.args.get("where")
@@ -436,8 +461,10 @@ class _SQLTranslator:
                 raise ValueError("HAVING needs GROUP BY or an aggregate function in SELECT")
             # pure projection (skip if SELECT *)
             non_star = [e for e in node.expressions if not isinstance(e, sge.Star)]
-            if not non_star and self._copies:
-                plan = Project(plan, [col(c) for c in self._cur_cols])        # SELECT *: without the copies
+            outs = _dedupe(self._cur_cols)
+            if not non_star and (self._copies or outs != self._cur_cols):      # SELECT *: without the copies,
+                plan = Project(plan, [col(c) if c == o else col(c).alias(o)    # a case-only repeat renamed (A_1)
+                                      for c, o in zip(self._cur_cols, outs)])
             if non_star:
                 proj = [self._select_expr(e) for e in non_star]
                 names = _dedupe([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])
@@ -446,7 +473,7 @@ class _SQLTranslator:
                         p.alias(nm)
                 # ORDER BY a name two output columns share takes the aliased one (as DuckDB does)
                 alias_out = {e.alias.lower(): nm for e, nm in zip(non_star, names)
-                             if isinstance(e, sge.Alias) and e.alias.lower() != nm}
+                             if isinstance(e, sge.Alias) and e.alias != nm}
                 hidden, sort_cols = self._hidden_sort_keys(node, non_star, names, distinct is not None) if names else ([], {})
                 plan = Project(plan, proj + [ex.alias(nm) for nm, ex in hidden])
                 if hidden:                             # carried to the sort, dropped after it
@@ -466,8 +493,8 @@ class _SQLTranslator:
                     ref = o.this
                     if i is None and isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in alias_out:
                         by.append(col(alias_out[ref.name.lower()]))
-                    elif i is None and isinstance(ref, sge.Column) and ref.name.lower() in (names or []):
-                        by.append(col(ref.name.lower()))          # a SELECT output name
+                    elif i is None and isinstance(ref, sge.Column) and not ref.table and _ci_find(names or [], ref.name):
+                        by.append(col(_ci_find(names, ref.name)))          # a SELECT output name
                     elif i is None:
                         ex = self._expr(o.this)
                         by.append(col(sort_cols[ex.signature()]) if ex.signature() in sort_cols else ex)
@@ -538,7 +565,7 @@ class _SQLTranslator:
             ref = o.this
             if _ordinal(ref, len(node.expressions)) is not None:
                 continue
-            if isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in names:
+            if isinstance(ref, sge.Column) and not ref.table and _ci_find(names, ref.name):
                 continue
             ex = self._expr(ref)
             if ex.signature() in have:
@@ -572,7 +599,7 @@ class _SQLTranslator:
         self._left_schema = set(main_cols)
         self._joined = {from_clause.this.alias_or_name.lower()}
         self._cur_cols = list(main_cols)
-        self._qual = {(next(iter(self._joined)), c.lower()): c for c in main_cols}
+        self._qual = {(next(iter(self._joined)), c): c for c in main_cols}
         pending = []
 
         for join in node.args.get("joins") or []:
@@ -598,7 +625,8 @@ class _SQLTranslator:
             elif using:
                 cols = using if isinstance(using, list) else using.expressions      # sqlglot versions differ
                 keys = [str(c.name) for c in cols]
-                left_on = right_on = keys
+                left_on = [_ci_find(self._cur_cols, k) or k for k in keys]       # each side's own spelling
+                right_on = [_ci_find(right_cols, k) or k for k in keys]
             else:
                 raise ValueError("JOIN requires ON or USING clause")
 
@@ -616,7 +644,7 @@ class _SQLTranslator:
                 self._left_schema |= {o for _, o in outs}        # also the renamed names (v_right)
                 for c, o in outs:
                     if c != o:                         # a clashing column is renamed (x.k -> k_right)
-                        self._renamed[(join.this.alias_or_name.lower(), c.lower())] = o
+                        self._renamed[(join.this.alias_or_name.lower(), c)] = o
             self._joined.add(join.this.alias_or_name.lower())
             # Record that right join keys should be referred to by left join keys
             for lk, rk in zip(left_on, right_on):
@@ -629,7 +657,7 @@ class _SQLTranslator:
 
         while pending:
             for i, (alias, right_plan, right_cols) in enumerate(pending):
-                links = self._links(alias, {c.lower() for c in right_cols})
+                links = self._links(alias, set(right_cols))
                 if links:
                     break
             else:
@@ -638,11 +666,11 @@ class _SQLTranslator:
                                           "column = column conditions in WHERE (a cross product is not supported)")
             pending.pop(i)
             left_on = [self._expr(l).args[0] for l, _ in links]
-            right_on = [r.name.lower() for _, r in links]
+            right_on = [r.name for _, r in links]
             plan = Join(plan, right_plan, left_on, right_on, "inner")
             outs = join_output_names(self._cur_cols, right_cols, right_on)
             for c, out in outs:
-                self._qual[(alias, c.lower())] = out
+                self._qual[(alias, c)] = out
             for lk, rk in zip(left_on, right_on):
                 self._qual[(alias, rk)] = lk
                 if lk == rk:
@@ -664,8 +692,7 @@ class _SQLTranslator:
             t = _unparen(c0.this if isinstance(c0, sge.Not) else c0)
             x = _unparen(t.this) if isinstance(t, sge.Is) else None
             right = isinstance(x, sge.Column) and (x.table.lower() == alias if x.table
-                                                   else x.name.lower() in right_schema
-                                                   and x.name.lower() not in self._left_schema)
+                                                   else x.name in right_schema and x.name not in self._left_schema)
             (mine if right else keep).append(c)
         if mine and not keep:
             raise ValueError("JOIN ... ON needs a column = column condition besides IS [NOT] NULL")
@@ -685,7 +712,7 @@ class _SQLTranslator:
                 continue
             for e in (val if isinstance(val, list) else [val]):
                 for c in (e.find_all(sge.Column) if isinstance(e, sge.Expression) else ()):
-                    name = c.name.lower()
+                    name = c.name
                     if name in pairs and (c.table.lower() == alias if c.table
                                           else pairs[name] != name and name not in self._left_schema):
                         asked.add(name)
@@ -711,7 +738,7 @@ class _SQLTranslator:
         renamed (``x.k`` -> ``k_right``) by its output name."""
         on = on.copy()
         for c in list(on.find_all(sge.Column)):
-            key = (c.table.lower(), c.name.lower()) if c.table else None
+            key = (c.table.lower(), c.name) if c.table else None
             copy = self._marks.get(key) or self._renamed.get(key)
             if copy:
                 c.replace(sge.Column(this=sge.to_identifier(copy)))
@@ -746,7 +773,7 @@ class _SQLTranslator:
         that equate the two; they are taken out of ``self._conj``. A condition every branch of an OR has
         counts (it is removed from the branches)."""
         def owner(c: sge.Column) -> Optional[str]:
-            name = c.name.lower()
+            name = c.name
             if c.table:
                 t = c.table.lower()
                 return "R" if t == alias else "L" if t in self._joined else None
@@ -785,7 +812,67 @@ class _SQLTranslator:
                 return any(name in cols for _, cols in self._table_cols[:i])
         return False
 
+    def _resolve_names(self, sel: sge.Select) -> None:
+        """The one place where a column's written spelling becomes its real one. DuckDB matches every
+        identifier case-insensitively, quoted or not, and returns the source column's spelling: each column
+        reference of ``sel`` is rewritten to the name of the column it finds (its FROM columns, then a SELECT
+        alias, then the scopes of the queries around it), so everything after this works on exact names. A
+        subquery's own columns are resolved when it is translated, by the translator that builds it (it is
+        given the scopes around it); only its references to this query are resolved here (`_correlation`).
+        The text as written stays in the node's meta (an aggregate is named from it)."""
+        items = ([sel.args["from_"].this] if sel.args.get("from_") is not None else []) \
+            + [j.this for j in sel.args.get("joins") or []]
+        scope = [(it.alias_or_name.lower(), list(self._source(it)[1])) for it in items]
+        self._aliases = {e.alias.lower(): e.alias for e in sel.expressions if isinstance(e, sge.Alias)}
+        self._levels = [scope, *self._outer]
+
+        def visit(n: sge.Expression) -> None:
+            for x in n.walk(prune=lambda y: isinstance(y, sge.Select)):
+                if isinstance(x, sge.Column):
+                    self._resolve_col(x)
+
+        for key, val in sel.args.items():
+            if key in ("with_", "from_") or val is None:
+                continue
+            for v in val if isinstance(val, list) else [val]:
+                if key == "joins":
+                    for k2, v2 in v.args.items():
+                        for w in v2 if isinstance(v2, list) else [v2]:
+                            if k2 != "this" and isinstance(w, sge.Expression):
+                                visit(w)
+                elif isinstance(v, sge.Expression):
+                    visit(v)
+
+    def _resolve_col(self, c: sge.Column) -> None:
+        """Rewrite column ``c`` to the spelling of the column it names in this query's scopes."""
+        if isinstance(c.this, sge.Star):
+            return
+        hit = None
+        for i, lvl in enumerate(self._levels):
+            if c.table:
+                cols = next((cs for a, cs in lvl if a == c.table.lower()), None)
+                if cols is None:
+                    continue
+                hit = _ci_find(cols, c.name)
+                break
+            hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
+            if hit is None and i == 0:
+                hit = self._aliases.get(c.name.lower())
+            if hit is not None:
+                break
+        if hit is not None:
+            c.meta.setdefault("written", c.name)
+            c.this.set("this", hit)
+
     def _source(self, table_node: sge.Expression):
+        """(plan, column names) of a FROM item, built once per translator."""
+        hit = self._sources.get(id(table_node))
+        if hit is None or hit[0] is not table_node:
+            plan, cols = self._load_source(table_node)
+            hit = self._sources[id(table_node)] = (table_node, plan, cols)
+        return hit[1], list(hit[2])
+
+    def _load_source(self, table_node: sge.Expression):
         """(plan, column names) of a FROM item: a WITH name, a table, or a derived table (SELECT ...)."""
         from .optimizer import _output_columns
         if isinstance(table_node, sge.Subquery):
@@ -815,7 +902,7 @@ class _SQLTranslator:
         plan, cols = self._source(table_node)
         self._scope_columns.extend(cols)
         alias = table_node.alias_or_name.lower()
-        self._table_cols.append((alias, {c.lower() for c in cols}))
+        self._table_cols.append((alias, set(cols)))
         self._alias_schema[alias] = self._schema_of(table_node, plan)
         return plan, cols
 
@@ -862,8 +949,8 @@ class _SQLTranslator:
         where the SQL author wrote them in right→left order.
         """
         if isinstance(on_expr, sge.EQ):
-            a = on_expr.this.name.lower()
-            b = on_expr.expression.name.lower()
+            a = on_expr.this.name
+            b = on_expr.expression.name
             if left_schema is not None and right_schema is not None:
                 a_in_left  = a in left_schema
                 a_in_right = a in right_schema
@@ -939,6 +1026,7 @@ class _SQLTranslator:
                 if oa != ob:
                     outer, inner = (a, b) if oa else (b, a)
                     if isinstance(outer, sge.Column):
+                        self._resolve_col(outer)          # its spelling in this query; the subquery does not know it
                         keys.append((outer, inner))
                         continue
             raise NotImplementedError(f"{what}: correlated predicate {c.sql(dialect='duckdb')} cannot be decorrelated "
@@ -1189,7 +1277,7 @@ class _SQLTranslator:
         if name is not None:
             return col(name)
         if isinstance(node, sge.Column):
-            src = None if node.table else self._out_src.get(node.name.lower())
+            src = None if node.table else self._out_src.get(_ci_find(self._out_src, node.name))
             if src is None:
                 raise ValueError(f"column {node.sql(dialect='duckdb')} must appear in the GROUP BY clause "
                                  "or inside an aggregate function")
@@ -1207,7 +1295,7 @@ class _SQLTranslator:
             raise ValueError("SELECT * cannot be combined with GROUP BY or aggregates")
 
         def split(e):
-            return (e.this, e.alias.lower()) if isinstance(e, sge.Alias) else (e, None)
+            return (e.this, e.alias) if isinstance(e, sge.Alias) else (e, None)
 
         # Group-by keys. A SELECT alias names its key: GROUP BY may name the alias (when no input
         # column has that name, as in DuckDB) or repeat the aliased expression (compared after
@@ -1215,7 +1303,7 @@ class _SQLTranslator:
         # without an aggregate.
         plain = [split(e) for e in items if not _aggs_in(e)]
         aliased = [(a, self._expr(i).signature()) for i, a in plain if a]
-        alias_expr = {a: i for i, a in plain if a}
+        alias_expr = {a.lower(): i for i, a in plain if a}
         scope = {c.lower() for c in self._scope_columns}
         if group_node is not None and group_node.args.get("all"):
             group_exprs = [i for i, _ in plain]
@@ -1274,7 +1362,7 @@ class _SQLTranslator:
                                  "or inside an aggregate function")
             if alias is None and not isinstance(inner, sge.Column):
                 raise ValueError(f"give {inner.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
-            outs[n] = (alias or inner.name.lower(), src)
+            outs[n] = (alias or inner.name, src)
         outs = list(zip(_dedupe([o for o, _ in outs]), [src for _, src in outs]))
         self._out_src = {}
         for o, src in outs:
@@ -1292,8 +1380,8 @@ class _SQLTranslator:
                     i = _ordinal(ref, len(items))
                     if i is not None:
                         by.append(col(outs[i][1]))
-                    elif isinstance(ref, sge.Column) and not ref.table and ref.name.lower() in self._out_src:
-                        by.append(col(self._out_src[ref.name.lower()]))   # a SELECT output name
+                    elif isinstance(ref, sge.Column) and not ref.table and _ci_find(self._out_src, ref.name):
+                        by.append(col(self._out_src[_ci_find(self._out_src, ref.name)]))   # a SELECT output name
                     else:
                         ex = self._expr(ref)
                         if ex.op != "col":              # Sort takes columns: compute the expression first
@@ -1361,13 +1449,13 @@ class _SQLTranslator:
             return None
         alias_name: Optional[str] = None
         if isinstance(e, sge.Alias):
-            alias_name = e.alias.lower()
+            alias_name = e.alias
             inner = e.this
         else:
             inner = e
         mx = self._expr(inner)
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
-            alias_name = inner.name.lower() if inner.name.lower() != mx.args[0] else None   # joined key: as written
+            alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:
             mx = mx.alias(alias_name)
         return mx
@@ -1435,7 +1523,7 @@ class _SQLTranslator:
 
         # ---- column reference ----
         if isinstance(node, sge.Column):
-            name = node.name.lower()
+            name = node.name
             copy = self._marks.get((node.table.lower(), name)) if node.table else self._marks_bare.get(name)
             if copy:                                    # a LEFT JOIN's right key: NULL where unmatched
                 return col(copy)
