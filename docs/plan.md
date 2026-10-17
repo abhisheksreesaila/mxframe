@@ -535,7 +535,7 @@ Needs: F-033
 - [x] `scripts/native_coverage.py` fully native: DataFrame **17/22 -> 22/22**, SQL **10/22 -> 11/22** (Q2 native; Q16 now runs and equals DuckDB but still does `equal`/`filter` in Arrow; Q7-10, 13, 15, 18, 20-22 as before). `tests/test_native_strings_tpch.py`
 - [x] split (coordinator, review round 1): plain-string join keys and retiring the Python execution path moved to F-074. `tests/test_native_strings_tpch.py` runs all 22 DataFrame queries on generated SF 0.17 data (arrow == [] and native paths), so the 22/22 claim has a CI test
 
-## F-074 Plain-string join keys native; retire the Python execution path [review]
+## F-074 Plain-string join keys native; retire the Python execution path [done]
 Needs: F-034 · Split out of F-034 (review round 1)
 - [x] a plain utf8 join key (single column, then composite), single- and multi-chunk, runs through the native join (`_build_map` / `mx_filter` lookups hash + byte compare) and equals DuckDB; a NULL key never matches (inner, semi and anti)
 - [x] the Python execution path is retired for the plans that are native (22/22 TPC-H DataFrame queries)
