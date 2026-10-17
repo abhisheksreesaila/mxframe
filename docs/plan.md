@@ -1083,9 +1083,10 @@ Found by the F-114 / F-115 developer (2026-10-16)
 - [x] DuckDB-checked tests for each; fails before
 - Note (2026-10-16): `upper()` is not in the engine (not part of this ticket). Also fixed: GPU `gather_table` crashed on a NULL-typed column (aot_kernels.py); GROUP BY naming a constant (alias or position) is no key. `(select date ..)` with WHERE / LIMIT / HAVING is refused, `min(date ..) over (...)` is refused. Follow-ups: F-117, F-118, F-119.
 
-## F-117 SQL ORDER BY an expression of a computed alias gives KeyError '__calc1' [todo]
+## F-117 SQL ORDER BY an expression of a computed alias gives KeyError '__calc1' [review]
 Found in the F-116 review (2026-10-16)
-- [ ] a grouped query that orders by an expression over a computed SELECT alias (e.g. `select g, 1 as c, count(*) as n ... group by g order by c + 1`) raises `KeyError: '__calc1'`; DuckDB orders by the value. Reproduce first, fix at the cause (ORDER BY translation in `_build_aggregate`), DuckDB-checked tests
+- [x] a grouped query that orders by an expression over a computed SELECT alias (e.g. `select g, 1 as c, count(*) as n ... group by g order by c + 1`) raises `KeyError: '__calc1'`; DuckDB orders by the value. Reproduce first, fix at the cause (ORDER BY translation in `_build_aggregate`), DuckDB-checked tests
+- Note (2026-10-17): the fix is not in `_build_aggregate`: an alias inside an ORDER BY expression is replaced by the expression it names (`_inline_aliases`, the same function F-123 uses for WHERE and F-112 for subqueries), so it works in plain and grouped queries alike and `__calc` columns are never named by a sort key. A FROM column beats the alias inside an expression, as in DuckDB (`count(*) as x ... order by x + 1` raises, x is not grouped). Left: `SELECT DISTINCT g, 1 as c ... ORDER BY c + 1` (DuckDB accepts, we raise the DISTINCT message). Tests: tests/test_f117_order_by_alias_expr.py (112, 88 fail on main).
 
 ## F-118 SQL `select id, 1 as c from t` without aggregates gives a float, not an integer [todo]
 Found in the F-116 review (2026-10-16)
@@ -1108,10 +1109,11 @@ Found by the F-111 / F-112 review (2026-10-16); on main too
 - [ ] `WHERE 1 = 1` / `WHERE 1 = 0` raise `ArrowTypeError: Filter should be array-like`, `WHERE TRUE` raises "Unsupported SQL expression type: Boolean" (`WHERE 1 = 1 AND a > 1` works). Fold a constant predicate: true keeps every row, false / NULL keeps none (with the right schema)
 - [ ] DuckDB-checked tests incl. constant conditions in HAVING, ON, CASE, and under NOT; fails before
 
-## F-123 SQL WHERE using its own SELECT alias [todo]
+## F-123 SQL WHERE using its own SELECT alias [review]
 Found by the F-111 / F-112 review (2026-10-16); on main too
-- [ ] `SELECT v AS kk FROM t WHERE kk > 0` raises KeyError; DuckDB accepts a SELECT alias in WHERE when no FROM column has that name (the FROM column wins). F-112 did this inside correlated subqueries only; do it in every WHERE (and GROUP BY / HAVING, per DuckDB's rules)
-- [ ] DuckDB-checked tests incl. an alias shadowing a column, an alias of an aggregate (not allowed in WHERE), case-insensitive names; fails before
+- [x] `SELECT v AS kk FROM t WHERE kk > 0` raises KeyError; DuckDB accepts a SELECT alias in WHERE when no FROM column has that name (the FROM column wins). F-112 did this inside correlated subqueries only; do it in every WHERE (and GROUP BY / HAVING, per DuckDB's rules)
+- [x] DuckDB-checked tests incl. an alias shadowing a column, an alias of an aggregate (not allowed in WHERE), case-insensitive names; fails before
+- Note (2026-10-17): `_inline_aliases` (one function, WHERE + ORDER BY expressions + F-112 subqueries). Probed DuckDB: FROM column wins in WHERE; HAVING takes the alias even over a FROM column (already so); GROUP BY takes it only when no FROM column has the name (already so); alias in a JOIN ON is an error in DuckDB (still is). Alias of an aggregate or window: ValueError "not allowed in WHERE". Not done: a SELECT alias used by a later item of the same SELECT list (`select x as kk, kk + 1 as j`, DuckDB accepts). Tests: tests/test_f123_where_select_alias.py (200, 144 fail on main).
 
 ## F-124 SQL subquery correlated two levels out [todo]
 Found by the F-111 / F-112 review (2026-10-16)
