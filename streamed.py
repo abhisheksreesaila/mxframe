@@ -620,6 +620,8 @@ class _Sink:
         self.rows = self.bytes = self.pending_rows = 0
         self.empty: Optional[pa.Table] = None
         self.out: Optional[ParquetOut] = None          # F-113: the rows go straight into this file, none are kept
+        self.ext = None                                # kind "sort": the external sort the rows are handed to
+        self.sort_out: Optional[ParquetOut] = None     # kind "sort": the file the sorted ranges are written to when the plan allows
 
     @property
     def full(self) -> bool:
@@ -636,6 +638,10 @@ class _Sink:
         t = _plain(t)
         if self.out is not None:
             self.out.write(t)
+            self.rows += t.num_rows
+            return
+        if self.ext is not None:
+            self.ext.add(t)
             self.rows += t.num_rows
             return
         if t.num_rows == 0:
@@ -661,7 +667,12 @@ class _Sink:
             return self.empty
         return self.tables[0] if len(self.tables) == 1 else pa.concat_tables(self.tables, promote_options="default")
 
-    def _too_big(self, progress: Optional[float]) -> None:
+    def _too_big(self, progress: Optional[float], size: Optional[int] = None) -> None:
+        if size is not None:                                     # a sorted result that does not fit
+            raise MemoryError(
+                f"the result of this query is bigger than memory: the {self.ext.rows:,} sorted rows are about "
+                f"{fmt_bytes(self.ext.nbytes)}, and only {fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Write it to a file "
+                f"with sink_parquet(path), add a LIMIT or a tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
         if self.kind == "top-k":
             self._reduce()
             if self.bytes <= self.limit:
@@ -676,6 +687,32 @@ class _Sink:
             f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Write it to a file "
             f"with sink_parquet(path), add a LIMIT or a tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
 
+    def finish(self, plan, top) -> tuple:
+        """(the table the streamed part produced, the plan to run on it): the rest of the original plan with the
+        streamed part replaced by that table. A sorted result replaces the Sort node itself."""
+        if self.ext is None:
+            table = self.result()
+            return table, _replace(plan, top, Scan(table))
+        above = list(reversed(_chain(plan, self.sort)[:-1]))                 # the nodes over the Sort, nearest first
+        local = all(isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)) for n in above)
+        if self.sort_out is not None and local:                              # sorted ranges, each finished by the nodes above
+            self.sort_out.attach(self.budget)
+            for r in self.ext.ranges():
+                piece = r if not above else LazyFrame(_replace(plan, self.sort, Scan(r))).compute(
+                    "cpu", optimize=False, validate=False)
+                self.sort_out.write(piece)
+            table = self.sort_out.empty_table() if self.sort_out.schema or self.sort_out.empty is not None else \
+                _plain(self.ext.empty if self.ext.empty is not None else np_arrow.empty(pa.schema([])))
+            return table, Scan(table)
+        got, size = [], 0
+        for r in self.ext.ranges():
+            size += r.nbytes
+            if size > self.limit:
+                self._too_big(None, size)
+            got.append(r)
+        table = got[0] if len(got) == 1 else pa.concat_tables(got) if got else self.ext.empty
+        return table, _replace(plan, self.sort, Scan(table))
+
     def result(self) -> pa.Table:
         if self.out is not None:
             return self.out.empty_table()
@@ -684,7 +721,8 @@ class _Sink:
         return self._concat()
 
 
-def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int, out: Optional[ParquetOut] = None) -> _Sink:
+def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int, out: Optional[ParquetOut] = None,
+              root=None, held=lambda: 0) -> _Sink:
     """The sink for what sits above `top` in `plan` (`_chain` finds it): a Sort then (optionally some row-local
     Projects and) a Limit is a top-k, a Limit alone stops early, anything else collects."""
     above = list(reversed(_chain(plan, top)[:-1]))
@@ -698,6 +736,11 @@ def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int, out: 
                 return _Sink("top-k", n.n + n.offset, above[0], limit, budget, name)
             if not (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
                 break
+    if above and isinstance(above[0], Sort) and root is not None:      # no LIMIT: sorted runs on disk, merged by key ranges
+        from .extsort import ExternalSort
+        sink = _Sink("sort", 0, above[0], limit, budget, name)
+        sink.ext, sink.sort_out = ExternalSort(above[0], root, budget, held), out
+        return sink
     sink = _Sink("collect", 0, None, limit, budget, name)
     if out is not None and not above:                  # the rows are the result: write them as they come
         sink.out = out
@@ -798,7 +841,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
     if spec is None:                                        # a batch is in flight (input x working factor) while rows are collected
         sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR,
-                         budget, _out.get())
+                         budget, _out.get(), root, lambda: got.resident)
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
@@ -831,7 +874,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                 table = merged
             else:
                 if spec is not None:                                 # spilled groups: one partition at a time
-                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget, _out.get())
+                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget, _out.get(), root,
+                                     lambda: got.resident)
                     rowwise = got.top is not spec.agg
                     for piece in state.pieces():
                         out = state.format(piece)
@@ -841,9 +885,10 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                         sink.add(out)
                         if sink.full:
                             break
-                table = sink.result()
-                above = _replace(plan, got.top, Scan(table))
+                table, above = sink.finish(plan, got.top)
                 rows_info = {"kind": sink.kind, "batches_run": batches_run}
+                if sink.ext is not None:
+                    rows_info["sort"] = dict(sink.ext.stats, rows=sink.ext.rows)
     finally:
         _active.reset(token)
         root.close()
@@ -860,7 +905,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
         info.update(merges=state.merges, group_state_rows=state.peak_state)
     if root.partitions:
         info["spill"] = {"partitions": root.partitions, "bytes": root.bytes, "depth": root.depth}
-    if rows_info is not None and spec is None:
+    if rows_info is not None and (spec is None or "sort" in rows_info):
         info["rows"] = rows_info
     if got.slice_rows:
         info["slices"] = {"row_groups": len(got.slice_rows), "rows_per_slice": min(got.slice_rows.values())}

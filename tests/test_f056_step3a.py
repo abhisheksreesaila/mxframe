@@ -514,9 +514,10 @@ def test_a_result_bigger_than_the_budget_raises_an_error_naming_the_size(big):
         run(lf, "cpu")
 
 
-def test_a_sort_without_limit_of_more_than_fits_names_the_operator_and_the_size(big):
+def test_a_sort_without_limit_of_more_than_fits_names_the_size_and_sink_parquet(big):
+    """Step 3c sorts it on disk, but the sorted result is one in-memory table: it must fit; sink_parquet has no limit."""
     lf = scan_parquet(big).select("id", "g", "v", "q").sort("v")
-    with pytest.raises(MemoryError, match=r"the rows that the Sort above the big file needs are bigger than memory: .*[\d.]+ MB"):
+    with pytest.raises(MemoryError, match=r"bigger than memory: the 400,000 sorted rows are about [\d.]+ MB.*sink_parquet"):
         run(lf, "cpu")
 
 
