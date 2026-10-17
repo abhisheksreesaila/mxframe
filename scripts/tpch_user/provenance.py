@@ -14,6 +14,8 @@ def install() -> list:
     orig = LazyFrame.compute
 
     def recording(self, *args, **kw):
+        if kw.get("validate") is False and kw.get("optimize") is False:
+            return orig(self, *args, **kw)       # `LazyFrame.schema`'s zero-row dry run (SQL derived tables): no query ran
         ak.gpu_call_log.clear()
         fallbacks = sc.gpu_sort_fallbacks
         result = orig(self, *args, **kw)

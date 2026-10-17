@@ -2337,6 +2337,21 @@ class CustomOpsCompiler(GraphCompiler):
             if _fused is not None:
                 return _fused
 
+        # -1a2 -- F-080: COUNT(right col) per left key over a LEFT JOIN, with no joined rows (TPC-H Q13)
+        if _had_join and _native_exec is not None:
+            _core, _post = self._extract_post_ops(plan)
+            if isinstance(_core, Aggregate) and isinstance(_core.input, Join) and _core.input.how == "left":
+                from . import join_engine
+                try:
+                    _counts = join_engine.left_join_counts(self, _core, _post)
+                except Exception as exc:        # a plan is fully native or not at all: never fail the query
+                    _counts = _native_exec.swallowed(exc, "left join counts")
+                if _counts is not None:
+                    self.last_compile_provenance = {
+                        "device": "cpu", "rows": int(_counts.num_rows), "grouped": True, "n_groups": int(_counts.num_rows),
+                        "cache_hit": None, "compile_ms": 0.0, "gpu_input_path": "numpy", "path": "join_mojo_shortcut"}
+                    return _counts
+
         # -1 -- Materialize Join nodes (bottom-up) --------------------
         plan = self._materialize_joins(plan)
         self._star_stash = None            # (a declined fused attempt's partners: used by now, or never)

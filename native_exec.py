@@ -1318,10 +1318,11 @@ class FusedJoin:
     predicates, the partner ``Lookup``s, where each column of the joined schema lives (``vcols``: name ->
     ("fact", column) or ("partner", lookup index, column of the partner)) and the predicates over the
     joined schema (conditions across partners, filters above the join)."""
-    __slots__ = ("scan", "preds", "lookups", "vcols", "post_preds", "cache")
+    __slots__ = ("scan", "preds", "lookups", "vcols", "post_preds", "cache", "fd")
 
-    def __init__(self, scan, preds, lookups, vcols, post_preds):
+    def __init__(self, scan, preds, lookups, vcols, post_preds, fd=None):
         self.scan, self.preds, self.lookups, self.vcols, self.post_preds = scan, list(preds), lookups, vcols, post_preds
+        self.fd = fd or {}           # group column (a plain partner string) -> the unique key of its table that fixes it
         self.cache = {}              # what a second call over the same join (a key range pass) reuses
 
 
@@ -1356,7 +1357,8 @@ def fused_join_blocked(compiler) -> Optional[str]:
     return None
 
 
-def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, distinct: bool = False) -> Optional[pa.Table]:
+def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, distinct: bool = False,
+                     raw_keys: bool = False) -> Optional[pa.Table]:
     """``plan``'s aggregate over the star join ``fj`` in one native call (plan version 3), or None (the
     caller materializes the join and runs the aggregate as before). ``plan.input`` is not read.
     `distinct`: a SELECT DISTINCT as a group-by (see ``try_execute``): key spaces up to DISTINCT_MAX_GROUPS,
@@ -1393,17 +1395,28 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         for name, src in fj.vcols.items():
             if src[0] == "prow":
                 continue
-            c = table.column(src[1]) if src[0] == "fact" else bs[src[1]].column(src[2])
-            if src[0] == "partner" and pa.types.is_string(c.type) and 0 < len(c) <= _DICT_MAX:
-                c = pa.chunked_array([pc.dictionary_encode(c.chunk(0))])
-            base[name] = c
+            base[name] = table.column(src[1]) if src[0] == "fact" else bs[src[1]].column(src[2])
         mem = fj.cache["partners"] = (pk_names, bs, look_words, base)
     pk_names, bs, look_words, base = mem
     cols = dict(base)
     if plan.group_by and not distinct and not any(src[0] == "prow" for src in fj.vcols.values()):
+        got = _try_dependent_keys(compiler, plan, fj, bs, having_pred, post_ops)
+        if got is not None:                      # strings fixed by another key: taken by partner row (F-076)
+            return got
         got = _try_prow_groups(compiler, plan, fj, bs, having_pred, post_ops, only_if_wide=True)
         if got is not None:                      # keys too many for direct addressing: group by partner row
             return got
+    from .join_engine import _cols as _expr_cols
+    used = set()
+    for e in list(plan.group_by) + list(plan.aggs) + list(fj.post_preds):
+        used |= _expr_cols(e)
+    for name, src in fj.vcols.items():         # partner strings become dictionaries only now, and only those the
+        c = cols.get(name)                     # query reads: a string taken by partner row is never encoded (F-076)
+        if name in used and src[0] == "partner" and pa.types.is_string(c.type) and 0 < len(c) <= _DICT_MAX:
+            enc = fj.cache.setdefault("encoded", {})
+            if name not in enc:
+                enc[name] = pa.chunked_array([pc.dictionary_encode(c.chunk(0))])
+            cols[name] = enc[name]
     for name, src in fj.vcols.items():
         if src[0] == "prow":             # the partner's row number (group = partner row): an int32 column
             cols[name] = pa.chunked_array([_npa_i32_empty()])
@@ -1434,9 +1447,9 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     pf64 = set()                        # float64 partner columns as keys: hashed by their exact values
     fact_range = {}                     # fact join keys bounded by their partners' keys: no scan for their range
     for i, e in enumerate(plan.group_by):
-        if e.op == "col" and e._alias in (None, e.args[0]):
+        if e.op == "col":                # (renamed by an alias: the result column takes the alias, F-080)
             name = e.args[0]
-            keys.append(name)
+            keys.append(e._alias or name)
             src = fj.vcols.get(name)
             if src is None:
                 return _decline("group key outside the joined schema")
@@ -1699,7 +1712,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         return _decline(f"executor declined (code {rc})")
 
     result = _wrap_result(lib, O, keys, kinds, outputs)
-    for i, how in post.items():                      # expression keys back to the column's own values
+    for i, how in post.items() if not raw_keys else ():      # expression keys back to the column's own values
         c = result.column(i)
         result = result.set_column(i, keys[i], pc.take(how, c) if isinstance(how, pa.Array) else pc.cast(c, how))
     total_ms = (_time.perf_counter() - t_start) * 1000
@@ -1863,7 +1876,65 @@ def _try_prow_groups(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops, o
         return None
     out_names = [a._alias or f"agg_{i}" for i, a in enumerate(plan.aggs)]
     gp = np.asarray(_np_of(_combine(R.column("__prow")), zero_copy_only=False)).astype(np.int64)    # partner row per group
-    agg_cols = [R.column(n) for n in out_names]
+    return _keys_by_row(compiler, plan, fj, b, srcs, take_from, gp, [R.column(n) for n in out_names], out_names,
+                        having_pred, post_ops)
+
+
+def _try_dependent_keys(compiler, plan, fj: FusedJoin, bs, having_pred, post_ops) -> Optional[pa.Table]:
+    """Group keys that are plain partner strings determined by another key of the same source table (Q10:
+    ``GROUP BY c_custkey, c_name, c_address, ...``; ``fj.fd`` maps each such column to the unique key that fixes
+    it, F-076): group by the other keys and one representative partner row per group (``min`` of the row
+    number), then take every key column from the partner at those rows after HAVING / ORDER BY / LIMIT, as
+    ``_try_prow_groups`` does. No string is hashed or encoded. None: not this shape."""
+    import numpy as np
+    from .lazy_expr import Expr
+    from .np_arrow import to_numpy as _np_of, combine as _combine
+    fd = fj.fd
+    names = [e.args[0] for e in plan.group_by if e.op == "col"]
+    if not fd or len(names) != len(plan.group_by) or not any(n in fd and fd[n] in names for n in names):
+        return None
+    if any(src[0] == "prow" for src in fj.vcols.values()):
+        return None
+    dep = {n for n in names if n in fd and fd[n] in names}
+    if any(fj.vcols.get(n) is None for n in names):
+        return None
+    srcs = [(e._alias or e.args[0], fj.vcols[e.args[0]]) for e in plan.group_by]
+    j = fj.vcols[next(iter(dep))][1]
+    if any(fj.vcols[n][0] == "partner" and fj.vcols[n][1] != j for n in names):      # every partner key is j's
+        return None
+    b = bs[j]
+    if b.num_rows > MAX_GROUPS * 64:
+        return None
+    take_from = []
+    for (nm, src), e in zip(srcs, plan.group_by):
+        if src[0] == "partner":
+            take_from.append(src[2])
+        else:                                           # a fact key: the partner's own copy of its join key
+            lk = fj.lookups[j]
+            if src[1] not in lk.probe:
+                return None
+            take_from.append(lk.build_keys[lk.probe.index(src[1])])
+    vcols = dict(fj.vcols)
+    vcols["__prow"] = ("prow", j)
+    fj2 = FusedJoin(fj.scan, fj.preds, fj.lookups, vcols, fj.post_preds)
+    fj2.cache = fj.cache
+    keep = [e for e in plan.group_by if e.args[0] not in dep]
+    R = try_execute_join(compiler, Aggregate(None, keep, list(plan.aggs) + [Expr("min", Expr("col", "__prow")).alias("__rep")]),
+                         fj2, None, None, raw_keys=True)         # (the keys come from the partner rows below)
+    if R is None:
+        return None
+    out_names = [a._alias or f"agg_{i}" for i, a in enumerate(plan.aggs)]
+    gp = np.asarray(_np_of(_combine(R.column("__rep")), zero_copy_only=False)).astype(np.int64)
+    return _keys_by_row(compiler, plan, fj, b, srcs, take_from, gp, [R.column(n) for n in out_names], out_names,
+                        having_pred, post_ops)
+
+
+def _keys_by_row(compiler, plan, fj: FusedJoin, b, srcs, take_from, gp, agg_cols, out_names, having_pred, post_ops):
+    """The result of a grouped aggregate whose groups are known by one partner row each: HAVING and the top-k
+    cut on the aggregates first, then the key columns taken from the partner at the surviving rows."""
+    import numpy as np
+    from ._lazy_pc import pc
+    from .np_arrow import array as _npa, scalar as _npscalar, to_numpy as _np_of, combine as _combine
 
     def subset(idx):
         nonlocal gp, agg_cols

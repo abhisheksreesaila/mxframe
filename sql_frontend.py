@@ -516,6 +516,7 @@ class _SQLTranslator:
         self._ctes: Dict[str, LogicalPlan] = {}
         self._ids = itertools.count()
         self._has_star = False
+        self._slices: dict = {}     # signature of a substring hoisted below a Filter -> its column (F-080)
         self._date_lit = False      # translating a comparison with a date32 column: DATE constants are dates
         self._alias_schema: dict = {}   # FROM alias -> Arrow schema (None when unknown)
         # comma joins: WHERE conditions not yet used as join keys; (table alias, column) -> its column in
@@ -638,6 +639,8 @@ class _SQLTranslator:
                     plan = Project(plan, star_proj)
             if non_star:
                 proj = [self._select_expr(e) for e in non_star]
+                proj = [col(self._slices[p.signature()]).alias(p._alias)
+                        if p.op == "str_slice" and p._alias and p.signature() in self._slices else p for p in proj]
                 names = _dedupe([p._alias or (p.args[0] if p.op == "col" else None) for p in proj])
                 for p, nm in zip(proj, names):
                     if nm is not None and nm != (p._alias or (p.args[0] if p.op == "col" else None)):
@@ -868,6 +871,15 @@ class _SQLTranslator:
                 i, links = 0, None
                 alias, right_plan, right_cols = pending[0]
             pending.pop(i)
+            if links and len({self._owner_alias(l) for l, _ in links}) > 1:
+                # keys read from several joined tables (Q5: l_suppkey = s_suppkey AND c_nationkey = s_nationkey):
+                # join on the first table's keys and filter on the rest, as the DataFrame form does; a join
+                # whose left keys span leaves cannot be a star (F-080)
+                first = self._owner_alias(links[0][0])
+                for l, r in links:
+                    if self._owner_alias(l) != first:
+                        self._conj.append(sge.EQ(this=l.copy(), expression=r.copy()))
+                links = [(l, r) for l, r in links if self._owner_alias(l) == first]
             if links is None:
                 self._check_cross(plan, right_plan, alias)
                 const = self._fresh("__jc")
@@ -991,6 +1003,13 @@ class _SQLTranslator:
             copies[rk] = name
         exprs = [col(c) for c in right_cols] + [col(rk).alias(copies[rk]) for rk in copies]
         return Project(right_plan, exprs), [copies.get(rk, rk) for rk in right_on], own
+
+    def _owner_alias(self, c: sge.Column) -> Optional[str]:
+        """The joined table a column belongs to (its qualifier, else the one joined table that has it)."""
+        if c.table:
+            return c.table.lower()
+        have = [a for a, cs in self._table_cols if a in self._joined and c.name in cs]
+        return have[0] if len(have) == 1 else None
 
     def _links(self, alias: str, cols: set):
         """[(column of the tables joined so far, column of table ``alias``)] from the WHERE conditions
@@ -1512,18 +1531,48 @@ class _SQLTranslator:
             else:
                 plain.append(c)
         if not forms:
-            return Filter(plan, self._expr(cond))
+            plan, pred = self._hoist_slices(plan, self._expr(cond))
+            return Filter(plan, pred)
         before = None
         if self._has_star:
             from .optimizer import _output_columns
             before = _output_columns(plan)
         if plain:
-            plan = Filter(plan, self._expr(_and_all(plain)))
+            plan, pred = self._hoist_slices(plan, self._expr(_and_all(plain)))
+            plan = Filter(plan, pred)
         for kind, c, neg in forms:
             plan = getattr(self, f"_{kind}_form")(plan, c, neg)
         if before is not None:
             plan = Project(plan, [col(n) for n in before])      # drop the columns a decorrelation added
         return plan
+
+    def _hoist_slices(self, plan: LogicalPlan, pred: Expr):
+        """A substring of a column inside a WHERE condition becomes a column computed below the Filter, as the
+        DataFrame form writes it (``with_columns(str_slice).filter(isin)``): the native filter reads plain
+        columns, not a string slice (F-080). The column is kept in ``self._slices`` for the SELECT list."""
+        if self._any_star:
+            return plan, pred
+        found: dict = {}
+
+        def walk(e):
+            if not isinstance(e, Expr):
+                return e
+            if e.op == "str_slice" and isinstance(e.args[0], Expr) and e.args[0].op == "col":
+                sig = e.signature()
+                if sig not in self._slices:
+                    self._slices[sig] = self._fresh("__slice")
+                found[self._slices[sig]] = e
+                return col(self._slices[sig])
+            args = tuple(walk(a) for a in e.args)
+            if all(n is o for n, o in zip(args, e.args)):
+                return e
+            new = Expr(e.op, *args, **e.kwargs)
+            new._alias = e._alias
+            return new
+        pred = walk(pred)
+        if found:
+            plan = Project(plan, [col(c) for c in self._columns_of(plan)] + [e.alias(n) for n, e in found.items()])
+        return plan, pred
 
     def _subquery_form(self, c: sge.Expression):
         """(kind, node, negated) when ``c`` is a condition that becomes a join, else None."""
@@ -1592,20 +1641,35 @@ class _SQLTranslator:
             return Join(plan, inner_plan, [left] + [self._expr(o).args[0] for o, _ in keys],
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
-        new.set("expressions", [_alias(item, "__in")])
         if not (new.args.get("limit") or new.args.get("offset")):
             new.set("order", None)                     # the order only matters to pick the LIMIT rows
-        if int_lits:
-            _keep_ints(new.expressions[0])
-        inner_plan = self._child()._build_select(new)
+        key, inner_plan = "__in", None
+        if isinstance(sel.expressions[0], sge.Column) and not int_lits:
+            # an unaliased bare column is its own key, under the plan's own spelling: the subquery stays a
+            # Filter*(Scan) leaf (F-080); an alias or an expression gets the `__in` Project below
+            bare = self._child()._build_select(new)
+            names = self._columns_of(bare)
+            if len(names) == 1:
+                if names[0].lower() not in {c.lower() for c in set(self._cur_cols) | self._copies}:
+                    key, inner_plan = names[0], bare
+                else:                                  # a name the outer query has: rename above (no second translation)
+                    inner_plan = Project(bare, [col(names[0]).alias(key)])
+        if inner_plan is None:
+            new = sel.copy()
+            if not (new.args.get("limit") or new.args.get("offset")):
+                new.set("order", None)
+            new.set("expressions", [_alias(item, key)])
+            if int_lits:
+                _keep_ints(new.expressions[0])
+            inner_plan = self._child()._build_select(new)
         if not negated:
-            return Join(plan, inner_plan, [left], ["__in"], "semi")
+            return Join(plan, inner_plan, [left], [key], "semi")
         # NOT IN keeps a row with no partner when the subquery is empty, or when it has no NULL and the
         # row's value is not NULL. m: 1 = empty, 2 = rows and no NULL, 0 = some NULL (nothing is kept)
-        stats = Aggregate(inner_plan, [], [lit(1).count().alias("n"), col("__in").count().alias("nn")])
+        stats = Aggregate(inner_plan, [], [lit(1).count().alias("n"), col(key).count().alias("nn")])
         m = Expr("scalar", Project(stats, [when(col("n") == lit(0), lit(1),
                                                 when(col("nn") == col("n"), lit(2), lit(0))).alias("__scalar")]))
-        anti = Join(plan, inner_plan, [left], ["__in"], "anti")
+        anti = Join(plan, inner_plan, [left], [key], "anti")
         return Filter(anti, (m == lit(1)) | ((m == lit(2)) & (col(left) == col(left))))
 
     def _in_item_ints(self, x: sge.Column, item: sge.Expression, sel: sge.Select, what: str) -> bool:
