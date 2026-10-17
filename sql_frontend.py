@@ -1536,20 +1536,24 @@ class _SQLTranslator:
             return Join(plan, inner_plan, [left] + [self._expr(o).args[0] for o, _ in keys],
                         ["__in"] + [f"__k{i}_{j}" for j in range(len(keys))], "semi")
         new = sel.copy()
-        new.set("expressions", [_alias(item, "__in")])
+        key = "__in"
+        if isinstance(item, sge.Column) and not int_lits and item.name not in set(self._cur_cols) | self._copies:
+            key = item.name                # a bare column is its own key: the subquery stays a Filter*(Scan) leaf
+        else:
+            new.set("expressions", [_alias(item, key)])
         if not (new.args.get("limit") or new.args.get("offset")):
             new.set("order", None)                     # the order only matters to pick the LIMIT rows
         if int_lits:
             _keep_ints(new.expressions[0])
         inner_plan = self._child()._build_select(new)
         if not negated:
-            return Join(plan, inner_plan, [left], ["__in"], "semi")
+            return Join(plan, inner_plan, [left], [key], "semi")
         # NOT IN keeps a row with no partner when the subquery is empty, or when it has no NULL and the
         # row's value is not NULL. m: 1 = empty, 2 = rows and no NULL, 0 = some NULL (nothing is kept)
-        stats = Aggregate(inner_plan, [], [lit(1).count().alias("n"), col("__in").count().alias("nn")])
+        stats = Aggregate(inner_plan, [], [lit(1).count().alias("n"), col(key).count().alias("nn")])
         m = Expr("scalar", Project(stats, [when(col("n") == lit(0), lit(1),
                                                 when(col("nn") == col("n"), lit(2), lit(0))).alias("__scalar")]))
-        anti = Join(plan, inner_plan, [left], ["__in"], "anti")
+        anti = Join(plan, inner_plan, [left], [key], "anti")
         return Filter(anti, (m == lit(1)) | ((m == lit(2)) & (col(left) == col(left))))
 
     def _in_item_ints(self, x: sge.Column, item: sge.Expression, sel: sge.Select, what: str) -> bool:
