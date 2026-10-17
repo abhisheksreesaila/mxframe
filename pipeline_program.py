@@ -119,6 +119,8 @@ OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
 OP_ROWID = 39
 OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the native executor only)
 OP_ISNULL = 41         # dst = the column's validity bit is clear (the native executor only, F-097)
+# 42-46 are taken by the Mojo API's exact integer ops (IDIV, IMOD, IMIN, IMAX, ICMP; kernels_aot/pipeline_cpu.mojo,
+# mojo/mxframe/query.mojo): this compiler does not emit them, but must not reuse the numbers
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 OP_AGG_ISUM = 53       # sum of an "int" register, accumulated in int64 (F-060, F-060b); its slot holds int64 bits
 OP_AGG_IMIN, OP_AGG_IMAX = 54, 55   # min / max of an "int" register, accumulated in int64 (F-060c); the slot holds int64 bits

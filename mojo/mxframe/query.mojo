@@ -15,7 +15,11 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 - groups are dense 0 .. groups-1; a row whose key is outside that range, or null, is left out;
 - a filter that reads a null cell is false for that row (the whole filter, not only the comparison);
 - sum / mean / min / max skip a row whose value reads a null cell; count() counts rows, count(e) rows where e
-  reads no null; a group with no rows has `is_empty(g)` (its min / max are meaningless);
+  reads no null; `present(i, g)`: aggregate i has a value in group g (its min / max / mean are meaningless otherwise);
+- values are the stored integers (a DECIMAL(2) literal 5 is 0.05); + - and comparisons refuse columns of different
+  scales (decimal-aware formulas: F-136);
+- the null rule for `|`: a filter reading a null cell is false as a whole, so `(a > 0) | (b == 1)` drops a row whose
+  a is null even when b == 1 (SQL would keep it);
 - a total that passes int64 raises (the stand-in wrapped silently).
 """
 from std.time import perf_counter_ns
@@ -130,16 +134,27 @@ struct Query(Movable):
         self.nodes.append(PlanNode(P_FILTER, self._top(), [predicate.copy()], List[Agg](), 0))
         return self^
 
-    def group_by(var self, key: Expr, groups: Int) -> Self:
-        """Group by an integer key expression with values 0 .. groups-1 (dense: missing groups are zeros)."""
+    def _aggregate(self) -> Int:
+        for i in range(len(self.nodes)):
+            if self.nodes[i].kind == P_AGGREGATE:
+                return i
+        return -1
+
+    def group_by(var self, key: Expr, groups: Int) raises -> Self:
+        """Group by an integer key expression with values 0 .. groups-1 (dense: missing groups are zeros).
+        `where` filters rows whether it comes before or after (there is no HAVING yet)."""
+        if self._aggregate() >= 0:
+            raise Error("a query has one group_by (and its aggregates); this one has a second")
         self.nodes.append(PlanNode(P_AGGREGATE, self._top(), [key.copy()], List[Agg](), groups))
         return self^
 
     def agg(var self, *aggs: Agg) -> Self:
-        if self.nodes[self._top()].kind != P_AGGREGATE:
+        var at = self._aggregate()
+        if at < 0:
             self.nodes.append(PlanNode(P_AGGREGATE, self._top(), List[Expr](), List[Agg](), 1))
+            at = self._top()
         for a in aggs:
-            self.nodes[self._top()].aggs.append(a.copy())
+            self.nodes[at].aggs.append(a.copy())
         return self^
 
     def compute(self, device: Int = AUTO) raises -> QueryResult:
@@ -189,7 +204,15 @@ struct QueryResult(Movable):
         return out^
 
     def is_empty(self, g: Int) -> Bool:
+        """Group g has no rows."""
         return self.counts[g] == 0
+
+    def present(self, i: Int, g: Int) -> Bool:
+        """Aggregate i has a value in group g: a row whose value is not null (a min / max / mean over only nulls
+        has none, and its number is meaningless)."""
+        if self.count_slot_of[i] >= 0:
+            return self.slots[self.count_slot_of[i]][g] > 0
+        return self.counts[g] > 0
 
 
 # ── lowering ─────────────────────────────────────────────────────────────────────────────────────────
@@ -280,60 +303,88 @@ struct Program(Movable):
         return len(self.cols) - 1
 
 
+def _op_name(op: Int) -> String:
+    var names: List[String] = ["+", "-", "*", "//", "%", "-", "least", "greatest", "", "", "<", "<=", ">", ">=",
+                               "==", "!=", "", "", "", "", "&", "|", "~"]
+    return names[op - N_ADD] if N_ADD <= op <= N_NOT else "operator " + String(op)
+
+
+@fieldwise_init
+struct _Slot(Copyable, Movable):
+    var reg: Int
+    var boolean: Bool       # a comparison's 1.0 / 0.0 (float) rather than an int64 value
+    var scale: Int          # a column's decimal places; -1 for a literal or a mix that has none
+
+
 def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
-    """Emits e into `code`; returns its register: an int register for a value, a float (1.0 / 0.0) for a boolean."""
-    var stack = List[Int]()
+    """Emits e; returns its register: an int register for a value, a float (1.0 / 0.0) for a boolean. Raises when an
+    operator gets the wrong kind (a number where a comparison is due, or the reverse) or when + - and comparisons
+    meet columns of different decimal scales (decimal-aware formulas are F-136: values are the stored integers)."""
+    var stack = List[_Slot]()
     for n in e.nodes:
         if n.op == N_COL:
+            var c = t.column(n.name)
             var r = p.reg()
-            p.emit(OP_LOADI, r, p.column(t.column(n.name)))
-            stack.append(r)
+            p.emit(OP_LOADI, r, p.column(c))
+            stack.append(_Slot(r, False, t.scale(c)))
         elif n.op == N_LIT:
             var r = p.reg()
             p.emit(OP_LOAD_CONST, r, p.const(n.value))
-            stack.append(r)
-        elif n.op == N_NEG:
+            stack.append(_Slot(r, False, -1))
+        elif n.op == N_NEG or n.op == N_NOT:
             var a = stack.pop()
-            var z = p.reg()
-            p.emit(OP_LOAD_CONST, z, p.const(0))
+            if a.boolean != (n.op == N_NOT):
+                raise Error("`" + _op_name(n.op) + "` needs " + ("a comparison" if n.op == N_NOT else "a number") +
+                            ", got " + ("a number" if n.op == N_NOT else "a comparison"))
             var r = p.reg()
-            p.emit(OP_ISUB, r, z, a)
-            stack.append(r)
-        elif n.op == N_NOT:
-            var a = stack.pop()
-            var r = p.reg()
-            p.emit(OP_NOT, r, a)
-            stack.append(r)
+            if n.op == N_NOT:
+                p.emit(OP_NOT, r, a.reg)
+            else:
+                var z = p.reg()
+                p.emit(OP_LOAD_CONST, z, p.const(0))
+                p.emit(OP_ISUB, r, z, a.reg)
+            stack.append(_Slot(r, n.op == N_NOT, a.scale))
         else:
             var b = stack.pop()
             var a = stack.pop()
+            var logical = n.op == N_AND or n.op == N_OR
+            if a.boolean != logical or b.boolean != logical:
+                raise Error("`" + _op_name(n.op) + "` needs " + ("comparisons" if logical else "numbers") + " on both sides")
+            var compare = n.op >= N_LT and n.op <= N_NE
+            if (n.op == N_ADD or n.op == N_SUB or n.op == N_LEAST or n.op == N_GREATEST or compare) and \
+               a.scale >= 0 and b.scale >= 0 and a.scale != b.scale:
+                raise Error("`" + _op_name(n.op) + "` meets values with " + String(a.scale) + " and " + String(b.scale) +
+                            " decimal places: the stored integers would not line up (decimal-aware formulas: F-136)")
             var r = p.reg()
+            var scale = a.scale if a.scale >= 0 else b.scale
             if n.op == N_ADD:
-                p.emit(OP_IADD, r, a, b)
+                p.emit(OP_IADD, r, a.reg, b.reg)
             elif n.op == N_SUB:
-                p.emit(OP_ISUB, r, a, b)
+                p.emit(OP_ISUB, r, a.reg, b.reg)
             elif n.op == N_MUL:
-                p.emit(OP_IMUL, r, a, b)
+                p.emit(OP_IMUL, r, a.reg, b.reg)
+                scale = a.scale + b.scale if a.scale >= 0 and b.scale >= 0 else scale
             elif n.op == N_FLOORDIV:
-                p.emit(OP_IDIV, r, a, b)
+                p.emit(OP_IDIV, r, a.reg, b.reg)
+                scale = -1
             elif n.op == N_MOD:
-                p.emit(OP_IMOD, r, a, b)
+                p.emit(OP_IMOD, r, a.reg, b.reg)
             elif n.op == N_LEAST:
-                p.emit(OP_IMIN, r, a, b)
+                p.emit(OP_IMIN, r, a.reg, b.reg)
             elif n.op == N_GREATEST:
-                p.emit(OP_IMAX, r, a, b)
-            elif n.op >= N_LT and n.op <= N_NE:
-                p.emit(OP_ICMP, r, a, b, n.op)          # N_LT .. N_NE are the kernel's OP_LT .. OP_NE
+                p.emit(OP_IMAX, r, a.reg, b.reg)
+            elif compare:
+                p.emit(OP_ICMP, r, a.reg, b.reg, n.op)      # N_LT .. N_NE are the kernel's OP_LT .. OP_NE
             elif n.op == N_AND:
-                p.emit(OP_AND, r, a, b)
+                p.emit(OP_AND, r, a.reg, b.reg)
             elif n.op == N_OR:
-                p.emit(OP_OR, r, a, b)
+                p.emit(OP_OR, r, a.reg, b.reg)
             else:
                 raise Error("unknown expression operator " + String(n.op))
-            stack.append(r)
+            stack.append(_Slot(r, compare or logical, -1 if compare or logical else scale))
     if len(stack) != 1:
         raise Error("malformed expression")
-    return stack[0]
+    return stack[0].reg
 
 
 def _null_mask(mut p: Program, table_col: Int) -> Int:
@@ -417,21 +468,13 @@ def _lower(q: Query) raises -> Program:
         ref key = an.exprs[0]
         if key.is_bool():
             raise Error("a group key must be a value, not a comparison")
-        var k = _compile_expr(p, key, t)
-        var ge = p.reg()
-        p.emit(OP_ICMP, ge, k, _const_reg(p, 0), 23)                # key >= 0
-        var lt = p.reg()
-        p.emit(OP_ICMP, lt, k, _const_reg(p, Int64(p.groups)), 20)  # key < groups
-        var both = p.reg()
-        p.emit(OP_AND, both, ge, lt)
-        var kv = _valid_of(p, key, t)
+        var kv = _valid_of(p, key, t)                      # a null key: the row is left out
         if kv >= 0:
             var vf = p.reg()
             p.emit(OP_ICMP, vf, kv, _const_reg(p, 1), 24)
-            var all3 = p.reg()
-            p.emit(OP_AND, all3, both, vf)
-            both = all3
-        acc = _and_into(p, acc, both)
+            acc = _and_into(p, acc, vf)
+        # (the key's range is checked per selected row by `_key_from_reg0`: a key formula is never evaluated on a
+        # row the filters left out, so it cannot raise there)
         # the body: the key into register 0, where `_key_from_reg0` reads it per block
         p.section = 1
         var kb = _compile_expr(p, key, t)
@@ -453,8 +496,8 @@ def _lower(q: Query) raises -> Program:
             continue
         p.section = 1
         var valid = _valid_of(p, a.arg, t)
-        if a.kind == A_COUNT_OF or a.kind == A_MEAN:
-            if valid >= 0:
+        if a.kind == A_COUNT_OF or a.kind == A_MEAN or a.kind == A_MIN or a.kind == A_MAX:
+            if valid >= 0:                               # the rows this aggregate counts (non-null values)
                 var kept_valid = p.keep(valid, False)
                 p.section = 2
                 p.emit(OP_AGG_ISUM, p.n_slots, kept_valid)
@@ -517,11 +560,12 @@ def _const_reg(mut p: Program, v: Int64) raises -> Int:
 # ── running ──────────────────────────────────────────────────────────────────────────────────────────
 
 def _key_from_reg0(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
-    """The group ids of a block's selected rows: register 0 holds the key as int64 bits (in range: the predicate
-    checked it)."""
+    """The group ids of a block's selected rows from register 0 (int64 bits). A key outside 0 .. 2^31-1 becomes -1;
+    the kernel's accumulators skip any id outside 0 .. groups-1, so out-of-range keys are left out (the app's rule)."""
     var k = LP(unsafe_from_address=Int(regs))
     for j in range(nsel):
-        dst[j] = Int32(k[j])
+        var v = k[j]
+        dst[j] = Int32(v) if v >= 0 and v <= Int64(Int32.MAX) else -1
     return True
 
 

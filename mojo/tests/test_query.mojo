@@ -1,6 +1,6 @@
 # F-133 (M2): Query on the plan IR, lowered to the native CPU kernel. Every result is checked against a plain loop
 # over the same random table (an independent oracle: no kernel, no program).
-from mxframe import Table, SharedTable, INT, DECIMAL, TEXT, Query, col, lit, least, greatest, sum, count, mean, min_of, max_of
+from mxframe import Table, SharedTable, Expr, INT, DECIMAL, TEXT, Query, col, lit, least, greatest, sum, count, mean, min_of, max_of
 
 
 struct Rng(Movable):
@@ -64,8 +64,8 @@ def make_table(seed: UInt64, null_every: Int) raises -> SharedTable:
 
 # ── the oracle ───────────────────────────────────────────────────────────────────────────────────────
 
-def ref_group(t: SharedTable, key_kind: Int, groups: Int, flt: Int) -> Tuple[List[Int64], List[Int64], List[Int64], List[Int64], List[Int64]]:
-    """(sum revenue, count(*), count(revenue), min cost, max cost) per group.
+def ref_group(t: SharedTable, key_kind: Int, groups: Int, flt: Int) -> Tuple[List[Int64], List[Int64], List[Int64], List[Int64], List[Int64], List[Int64], List[Int64]]:
+    """(sum revenue, count(*), count(revenue), min cost, max cost, min revenue, max revenue) per group.
     key_kind 0: carrier; 1: region * 7 + carrier (a pivot); 2: least(day // 7, 51) (a bin); 3: constant 0.
     flt 0: none; 1: region == 1 and 10 <= day <= 300."""
     var reg = t.index("region")
@@ -78,6 +78,8 @@ def ref_group(t: SharedTable, key_kind: Int, groups: Int, flt: Int) -> Tuple[Lis
     var nv = List[Int64](length=groups, fill=0)
     var lo = List[Int64](length=groups, fill=Int64.MAX)
     var hi = List[Int64](length=groups, fill=Int64.MIN)
+    var rlo = List[Int64](length=groups, fill=Int64.MAX)
+    var rhi = List[Int64](length=groups, fill=Int64.MIN)
     for i in range(t.rows()):
         if flt == 1 and (t.is_null(reg, i) or t.is_null(day, i) or t.get(reg, i) != 1 or
                          t.get(day, i) < 10 or t.get(day, i) > 300):
@@ -104,9 +106,11 @@ def ref_group(t: SharedTable, key_kind: Int, groups: Int, flt: Int) -> Tuple[Lis
         if not t.is_null(rev, i):
             s[g] += t.get(rev, i)
             nv[g] += 1
+            rlo[g] = min(rlo[g], t.get(rev, i))
+            rhi[g] = max(rhi[g], t.get(rev, i))
         lo[g] = min(lo[g], t.get(cost, i))
         hi[g] = max(hi[g], t.get(cost, i))
-    return (s^, n^, nv^, lo^, hi^)
+    return (s^, n^, nv^, lo^, hi^, rlo^, rhi^)
 
 
 def check_against_oracle(t: SharedTable, key_kind: Int, groups: Int, flt: Int, label: String) raises:
@@ -119,7 +123,8 @@ def check_against_oracle(t: SharedTable, key_kind: Int, groups: Int, flt: Int, l
         q = q^.group_by(col("region") * 7 + col("carrier"), groups=groups)
     elif key_kind == 2:
         q = q^.group_by(least(col("day") // 7, lit(51)), groups=groups)
-    var r = q^.agg(sum(col("revenue")), count(), count(col("revenue")), min_of(col("cost")), max_of(col("cost"))).compute()
+    var r = q^.agg(sum(col("revenue")), count(), count(col("revenue")), min_of(col("cost")), max_of(col("cost")),
+                   min_of(col("revenue")), max_of(col("revenue"))).compute()
     var want = ref_group(t, key_kind, groups, flt)
     expect(len(r.sums) == groups and len(r.counts) == groups, label + ": one entry per group")
     for g in range(groups):
@@ -130,6 +135,9 @@ def check_against_oracle(t: SharedTable, key_kind: Int, groups: Int, flt: Int, l
             expect(r.values(3)[g] == Int(want[3][g]) and r.values(4)[g] == Int(want[4][g]), label + " min/max group " + String(g))
         else:
             expect(r.is_empty(g), label + " empty group " + String(g))
+        if want[2][g] > 0:                           # min / max over revenue, which has nulls
+            expect(r.values(5)[g] == Int(want[5][g]) and r.values(6)[g] == Int(want[6][g]), label + " nullable min/max " + String(g))
+        expect(r.present(5, g) == (want[2][g] > 0), label + " present " + String(g))
 
 
 def test_every_app_shape_equals_the_oracle() raises:
@@ -141,6 +149,8 @@ def test_every_app_shape_equals_the_oracle() raises:
         check_against_oracle(t, 2, 52, 0, "bin" + tag)
         check_against_oracle(t, 3, 1, 1, "report tile, filtered" + tag)
         check_against_oracle(t, 0, 7, 1, "report chart, filtered" + tag)
+        check_against_oracle(t, 1, 35, 1, "pivot, filtered" + tag)
+        check_against_oracle(t, 2, 52, 1, "bin, filtered" + tag)
 
 
 def test_mean_and_a_formula_value() raises:
@@ -181,7 +191,161 @@ def test_overflow_and_unknown_column_raise() raises:
     expect(raised, "an unknown column raised")
 
 
+def small_table() raises -> SharedTable:
+    """a, b with negatives, zeros and int64 extremes, g with nulls (rows 2 and 5)."""
+    var t = Table.empty()
+    var a = t.add_column("a", INT)
+    var b = t.add_column("b", INT)
+    var g = t.add_column("g", INT)
+    var av: List[Int] = [-7, 7, -7, 7, 0, 5, 3, -9, 9, 1]
+    var bv: List[Int] = [2, -2, -2, 2, 3, 0, 0, 1, 2, 1]
+    for i in range(10):
+        t.append(a, Int64(av[i]))
+        t.append(b, Int64(bv[i]))
+        if i == 2 or i == 5:
+            t.append_null(g)
+        else:
+            t.append(g, Int64(i % 3))
+    return t^.share()
+
+
+def per_row(t: SharedTable, e: Expr) raises -> List[Int]:
+    """e's value on each row: group by the row (a key of 0 .. rows-1 needs a row id; use a sum per row instead)."""
+    var out = List[Int]()
+    for i in range(t.rows()):
+        var r = Query(t).where(col("a") == Int(t.get(0, i))).where(col("b") == Int(t.get(1, i))).agg(sum(e)).compute()
+        out.append(r.sums[0])
+    return out^
+
+
+def test_integer_arithmetic_matches_mojo() raises:
+    """// and % follow Mojo's Int64 (floor; the remainder takes the divisor's sign), x // 0 = x % 0 = 0, unary minus,
+    least / greatest; checked row by row against Mojo itself (rows are distinct (a, b) pairs)."""
+    var t = small_table()
+    var fd = per_row(t, col("a") // col("b"))
+    var md = per_row(t, col("a") % col("b"))
+    var mn = per_row(t, -col("a") + least(col("a"), col("b")) * 2 - greatest(col("a"), col("b")))
+    for i in range(t.rows()):
+        var a = t.get(0, i)
+        var b = t.get(1, i)
+        var want_fd = a // b if b != 0 else 0
+        var want_md = a % b if b != 0 else 0
+        expect(fd[i] == Int(want_fd), "a // b row " + String(i) + ": " + String(fd[i]) + " vs " + String(want_fd))
+        expect(md[i] == Int(want_md), "a % b row " + String(i) + ": " + String(md[i]) + " vs " + String(want_md))
+        expect(mn[i] == Int(-a + min(a, b) * 2 - max(a, b)), "neg / least / greatest row " + String(i))
+
+
+def test_int64_min_floordiv_minus_one_raises() raises:
+    var t = Table.empty()
+    var a = t.add_column("a", INT)
+    t.append(a, Int64.MIN)
+    var s = t^.share()
+    var raised = False
+    try:
+        _ = Query(s).agg(sum(col("a") // -1)).compute()
+    except e:
+        raised = "int64" in String(e)
+    expect(raised, "INT64_MIN // -1 raised")
+    expect(Query(s).agg(sum(col("a") % -1)).compute().sums[0] == 0, "INT64_MIN % -1 is 0")
+
+
+def test_or_not_and_ne_filters_and_the_null_rule() raises:
+    var t = small_table()
+    var n_or = Query(t).where((col("a") > 0) | (col("g") == 1)).agg(count()).compute().counts[0]
+    var n_not = Query(t).where(~(col("a") > 0)).agg(count()).compute().counts[0]
+    var n_ne = Query(t).where(col("a") != 7).agg(count()).compute().counts[0]
+    var want_or = 0
+    var want_not = 0
+    var want_ne = 0
+    for i in range(t.rows()):
+        var a = t.get(0, i)
+        if not t.is_null(2, i) and (a > 0 or t.get(2, i) == 1):   # the documented rule: a null makes the filter false
+            want_or += 1
+        if a <= 0:
+            want_not += 1
+        if a != 7:
+            want_ne += 1
+    expect(n_or == want_or, "OR with the null rule: " + String(n_or) + " vs " + String(want_or))
+    expect(n_not == want_not and n_ne == want_ne, "NOT, !=")
+
+
+def test_mean_and_minmax_with_nulls_and_an_all_null_group() raises:
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    var ks: List[Int] = [0, 0, 0, 1, 1, 2]
+    for i in range(6):
+        t.append(k, Int64(ks[i]))
+        if i == 1 or ks[i] == 1:
+            t.append_null(v)
+        else:
+            t.append(v, Int64(10 * i - 25))
+    var s = t^.share()
+    var r = Query(s).group_by(col("k"), groups=3).agg(mean(col("v")), min_of(col("v")), max_of(col("v"))).compute()
+    expect(abs(r.means(0)[0] - Float64(-25 + -5) / 2.0) < 1e-12, "mean skips nulls")
+    expect(r.values(1)[0] == -25 and r.values(2)[0] == -5 and r.values(1)[2] == 25, "min / max skip nulls")
+    expect(not r.present(1, 1) and not r.present(0, 1) and r.counts[1] == 2, "an all-null group has rows, no value")
+    expect(r.present(1, 0) and r.present(2, 2), "groups with values")
+
+
+def test_where_after_group_by_and_one_group_by() raises:
+    var t = small_table()
+    var r = Query(t).group_by(col("g"), groups=3).where(col("a") > 0).agg(count()).compute()
+    expect(len(r.counts) == 3, "where after group_by keeps the grouping")
+    var raised = False
+    try:
+        _ = Query(t).group_by(col("g"), groups=3).group_by(col("a"), groups=2)
+    except e:
+        raised = "one group_by" in String(e)
+    expect(raised, "a second group_by raised")
+
+
+def test_kinds_and_scales_are_checked() raises:
+    var t = Table.empty()
+    var a = t.add_column("a", INT)
+    var d = t.add_column("d", DECIMAL, scale=2)
+    t.append(a, 1)
+    t.append(d, 150)
+    var s = t^.share()
+    var msgs = List[String]()
+    try:
+        _ = Query(s).agg(sum((col("a") > 0) + 0)).compute()
+    except e:
+        msgs.append(String(e))
+    try:
+        _ = Query(s).where(col("a") & col("a")).agg(count()).compute()
+    except e:
+        msgs.append(String(e))
+    try:
+        _ = Query(s).agg(sum(col("a") + col("d"))).compute()
+    except e:
+        msgs.append(String(e))
+    expect(len(msgs) == 3, "three errors, got " + String(len(msgs)))
+    expect("`+` needs numbers on both sides" in msgs[0], msgs[0])
+    expect("`&` needs comparisons on both sides" in msgs[1], msgs[1])
+    expect("0 and 2 decimal places" in msgs[2], msgs[2])
+    expect(Query(s).agg(sum(col("d") * col("a"))).compute().sums[0] == 150, "a product may mix scales")
+
+
+def test_a_key_formula_is_not_evaluated_on_filtered_rows() raises:
+    var t = Table.empty()
+    var x = t.add_column("x", INT)
+    t.append(x, 1)
+    t.append(x, 2)
+    t.append(x, Int64(1 << 62))                    # x * 4 would overflow, but the filter leaves the row out
+    var s = t^.share()
+    var r = Query(s).where(col("x") < 10).group_by(col("x") * 4, groups=9).agg(count()).compute()
+    expect(r.counts[4] == 1 and r.counts[8] == 1, "keys 4 and 8")
+
+
 def main() raises:
+    test_integer_arithmetic_matches_mojo()
+    test_int64_min_floordiv_minus_one_raises()
+    test_or_not_and_ne_filters_and_the_null_rule()
+    test_mean_and_minmax_with_nulls_and_an_all_null_group()
+    test_where_after_group_by_and_one_group_by()
+    test_kinds_and_scales_are_checked()
+    test_a_key_formula_is_not_evaluated_on_filtered_rows()
     test_every_app_shape_equals_the_oracle()
     test_mean_and_a_formula_value()
     test_overflow_and_unknown_column_raise()
