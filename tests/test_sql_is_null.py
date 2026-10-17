@@ -211,12 +211,12 @@ def test_left_join_right_key_is_null_where_unmatched(q, device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_left_join_copy_never_in_a_result(device):
-    """SELECT * (also inside a subquery) has the columns of the tables, not the internal copy of the key."""
+    """SELECT * (also inside a subquery) has the columns of the tables (both keys), not the internal copy of the key."""
     a = _a(40)
     for q in ["SELECT * FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS NULL",
               "SELECT * FROM (SELECT * FROM a LEFT JOIN u ON a.k = u.k WHERE u.k IS NULL) x"]:
         got = mx.sql(q, a=a, u=_u()).compute(device=device)
-        assert got.column_names == ["id", "k", "f", "f2", "v"]
+        assert got.column_names == ["id", "k", "f", "f2", "k_1", "v"]       # both key columns, as DuckDB
         assert got.num_rows == _duck(q, {"a": a, "u": _u()}).num_rows > 0
 
 

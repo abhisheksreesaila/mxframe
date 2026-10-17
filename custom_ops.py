@@ -24,7 +24,7 @@ from pathlib import Path
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
+from .compiler import case_when_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -169,6 +169,17 @@ def _expr_col_names(expr, out=None, tests_ok=False) -> set:
         for a in expr:
             _expr_col_names(a, out, tests_ok)
     return out
+
+
+def _can_be_null(expr) -> bool:
+    """True when *expr* holds a CASE with a NULL branch (a missing ELSE is one): it yields NULL whatever its
+    columns hold, so the plan needs the paths that keep NULL (a CASE ... ELSE 0 does not, and stays native)."""
+    if isinstance(expr, Expr):
+        if expr.op == "case_when" and any(isinstance(a, Expr) and a.op == "lit" and a.args[0] is None
+                                          for a in expr.args[1:]):
+            return True
+        return any(_can_be_null(a) for a in expr.args)
+    return isinstance(expr, (list, tuple)) and any(_can_be_null(a) for a in expr)
 
 
 def _temporal_extreme(e, table) -> bool:
@@ -847,14 +858,11 @@ class CustomOpsCompiler(GraphCompiler):
             return pc.or_kleene(self._eval_expr_arrow(args[0], table),
                                 self._eval_expr_arrow(args[1], table))
         if op == "case_when":
-            cond  = pc.fill_null(self._eval_expr_arrow(args[0], table), _npscalar(False, type=pa.bool_()))   # null condition: ELSE
-            then  = self._eval_expr_arrow(args[1], table)
-            else_ = self._eval_expr_arrow(args[2], table)
-            result = pc.if_else(cond, then, else_)
-            # float64 on both devices: float32 would lose integers above 2**24 and round
-            # float64 values, so the device would change the digits (F-022)
-            want = pa.float64()
-            return pc.cast(result, want) if result.type != want else result
+            # the common type of the branches (integers stay integers, numbers mixed are float64 on both
+            # devices: float32 would lose integers above 2**24 and round float64 values, F-022)
+            return case_when_arrow(self._eval_expr_arrow(args[0], table),
+                                   *(case_literal(a.args[0]) if a.op == "lit" else self._eval_expr_arrow(a, table)
+                                     for a in args[1:]))
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
@@ -1870,7 +1878,8 @@ class CustomOpsCompiler(GraphCompiler):
         read = set()
         for e in list(plan.group_by) + list(plan.aggs) + list(preds):
             _expr_col_names(e, read, tests_ok=not late)     # (late: every pipeline declined; the Arrow path keeps nulls)
-        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read)
+        has_nulls = any(n in table.column_names and table.column(n).null_count for n in read) \
+            or _can_be_null([*plan.group_by, *plan.aggs, *preds])
         if any(e.op not in ("sum", "min", "max", "mean", "count") for e in plan.aggs):
             return "", False
         from .pipeline_program import int_sum_inexact

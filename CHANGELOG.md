@@ -29,6 +29,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **LICENSE** file added (Apache-2.0, as already declared in `pyproject.toml`).
 
 ### Changed
+- **`when(cond, then)` without `otherwise` is NULL, not 0 (F-105).** It was `otherwise=0`, so `when(p, 1).count()` counted every row and `.mean()` averaged the zeros; pass `0` explicitly to keep the old result. SQL `CASE` without `ELSE` follows (it was 0 too). A CASE result now has the common type of its branches like DuckDB (strings, dates, integers, `float32` next to an integer or DECIMAL literal; any other number mix is double) instead of always float; `CASE x WHEN v` compares `x = v`; `THEN NULL`, `THEN TRUE` and `THEN DATE '...'` work. A CASE that can be NULL is answered by the NULL-aware Arrow path (`sum(case ... else 0 end)` stays native).
 - `device="auto"` now runs the native executor on every CPU decision (F-053); the co-processing policy is set only for a predicted CPU+GPU split or an explicit `gpu_fraction`.
 
 ## [0.6.0] — 2026-10-14

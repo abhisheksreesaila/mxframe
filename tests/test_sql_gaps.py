@@ -322,8 +322,6 @@ def test_count_distinct_reaches_the_native_count(monkeypatch):
     ("SELECT DISTINCT s, SUM(v) AS x FROM t GROUP BY s", NotImplementedError, "DISTINCT"),
     ("SELECT s, k FROM t ORDER BY 3", ValueError, "position"),
     ("SELECT s, SUM(v) AS x FROM t GROUP BY 2", ValueError, "aggregate"),
-    ("SELECT t.v, w.v FROM t JOIN w ON t.k = w.k", ValueError, "more than one joined table"),
-    ("SELECT w.v FROM t JOIN w ON t.k = w.k", ValueError, "more than one joined table"),
     ("SELECT g FROM tn ORDER BY g NULLS FIRST", NotImplementedError, "NULLS FIRST"),
     ("SELECT g, COUNT(*) AS c FROM tn GROUP BY g ORDER BY g DESC NULLS FIRST", NotImplementedError, "NULLS FIRST"),
 ])

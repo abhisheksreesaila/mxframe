@@ -100,7 +100,7 @@ Examples use `lf` (a `LazyFrame` over columns `id, dept, x, price, name, day`) a
 | `.startswith(s)`, `.contains(s)` | String predicates | `col("name").startswith("al")` |
 | `.str_slice(offset, length)` | Substring | `col("name").str_slice(0, 2)` |
 | `.year()` | Year of a date | `col("day").year()` |
-| `when(cond, then, otherwise)` | Conditional | `when(col("x") > 10, col("price"), 0.0)` |
+| `when(cond, then, otherwise)` | Conditional (no `otherwise` is NULL) | `when(col("x") > 10, col("price"), 0.0)` |
 | `.sum() .mean() .min() .max() .count()` | Aggregates (in `.agg`) | `lf.groupby("dept").agg(col("x").mean().alias("m"))` |
 | `.over(*by, order_by)` | Window | `lf.select("id", col("price").sum().over("dept").alias("w"))` |
 | `.rank() .dense_rank() .lag(n) .lead(n) .cum_sum()` | Window functions | `lf.select("id", col("price").cum_sum().over("dept", order_by="id").alias("c"))` |
