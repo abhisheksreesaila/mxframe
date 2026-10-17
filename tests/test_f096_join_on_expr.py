@@ -314,6 +314,17 @@ def test_parquet_frames_with_dictionary_text_and_dates(tmp_path, device):
     assert sorted(got.column("id").to_pylist()) == [1, 2, 3, 4, 5]
 
 
+def test_cross_join_cap_counts_a_left_join_with_an_empty_right_side_as_its_left_rows():
+    """A LEFT JOIN to an empty table still yields every left row: its bound is not 0, so 3000 x 3000 is refused."""
+    big = pa.table({"a": pa.array(range(3000), pa.int64())})
+    other = pa.table({"b": pa.array(range(3000), pa.int64())})
+    empty = pa.table({"k": pa.array([], pa.int64())})
+    q = ("SELECT d.a, other.b FROM (SELECT big.a FROM big LEFT JOIN empty ON big.a = empty.k) d "
+         "JOIN other ON d.a > other.b")
+    with pytest.raises(NotImplementedError, match="up to 3000 x 3000 rows"):
+        mx.sql(q, big=big, other=other, empty=empty).compute()
+
+
 def test_cross_join_of_large_inputs_is_a_clear_error():
     big = pa.table({"a": pa.array(range(5000), pa.int64())})
     other = pa.table({"b": pa.array(range(5000), pa.int64())})

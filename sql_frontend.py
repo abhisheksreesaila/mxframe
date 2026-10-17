@@ -76,22 +76,19 @@ _CROSS_LIMIT = 4_000_000          # row pairs a join with no equality (a cross p
 
 
 def _rows_upper(plan: LogicalPlan) -> Optional[int]:
-    """At most how many rows ``plan`` yields, when that is cheap to know (tables, Parquet footers and what only
+    """An upper bound on the rows ``plan`` yields (not its actual count), when that is cheap to know (tables, Parquet footers and what only
     keeps or reshapes their rows); else None."""
     if isinstance(plan, Scan):
         return plan.table.num_rows
     if isinstance(plan, ParquetScan):
-        try:
-            import pyarrow.parquet as pq
-            return pq.read_metadata(plan.path).num_rows
-        except Exception:                                   # noqa: BLE001 (unreadable footer: unknown)
-            return None
+        from .io_parquet import _metadata
+        return _metadata(plan.path).num_rows
     if isinstance(plan, Limit):
         inner = _rows_upper(plan.input)
         return min(plan.n + plan.offset, inner) if inner is not None else plan.n + plan.offset
     if isinstance(plan, Join):
         l, r = _rows_upper(plan.left), _rows_upper(plan.right)
-        return None if l is None or r is None else l if plan.how in ("semi", "anti") else l * r
+        return None if l is None or r is None else l if plan.how in ("semi", "anti") else l * max(r, 1)      # LEFT: an empty right side still keeps every left row
     inner = getattr(plan, "input", None)
     return _rows_upper(inner) if inner is not None else None
 
@@ -1209,10 +1206,10 @@ class _SQLTranslator:
         """A join with no equality is a cross product: refuse it unless both inputs are known to be small."""
         lrows, rrows = _rows_upper(plan), _rows_upper(right_plan)
         if lrows is None or rrows is None or lrows * rrows > _CROSS_LIMIT:
-            size = "of an unknown size" if lrows is None or rrows is None else f"{lrows} x {rrows} rows"
+            size = "of an unknown size" if lrows is None or rrows is None else f"up to {lrows} x {rrows} rows"
             raise NotImplementedError(
                 f"JOIN {alias}: no equality between the two tables, so it would run as a cross join "
-                f"({size}; at most {_CROSS_LIMIT} row pairs are supported): add a column = column condition")
+                f"({size}; up to {_CROSS_LIMIT} row pairs are supported): add a column = column condition")
 
     def _left_residual(self, joined: LogicalPlan, res: Expr, rid: str, lcols: List[str]) -> LogicalPlan:
         """``joined`` is ``L LEFT JOIN R ON <keys>`` with a row id on L; ``res`` is the ON's remaining condition
@@ -1228,24 +1225,6 @@ class _SQLTranslator:
         plan = Filter(plan, (col(ok) == 1) | ((col(anyok) == 0) & (col(nth) == 1)))
         return Project(plan, [col(c) for c in lcols if c != rid]
                        + [when(col(ok) == 1, col(c)).alias(c) for c in right])
-
-    def _on_side(self, c: sge.Column, alias: str, right_schema: set) -> str:
-        """"L" when column ``c`` of a JOIN's ON belongs to the tables joined so far, "R" when it is a column of
-        the table being joined (``alias``). A qualifier decides; a bare name must be in exactly one side."""
-        if c.table:
-            t = c.table.lower()
-            if t == alias:
-                return "R"
-            if t in self._joined:
-                return "L"
-            raise ValueError(f"JOIN ON: unknown table {c.table!r} in {c.sql(dialect='duckdb')}")
-        in_l, in_r = c.name in self._left_schema, c.name in right_schema
-        if in_l and in_r:
-            raise ValueError(f"JOIN ON: ambiguous reference to column {c.name!r} (in {alias!r} and an earlier table): "
-                             "qualify it with its table")
-        if not (in_l or in_r):
-            raise ValueError(f"JOIN ON: unknown column {c.name!r}")
-        return "L" if in_l else "R"
 
     # ------------------------------------------------------------------
     # aggregate building
