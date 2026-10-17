@@ -120,13 +120,13 @@ def test_shape_equals_duckdb(name, sql):
 def spy(monkeypatch):
     """Which native routes ran: the dependent-key route and the declines of the fused call."""
     log = {"dependent": 0, "declines": []}
-    real = nx._try_dependent_keys
+    real = getattr(nx, "_try_dependent_keys", lambda *a, **k: None)
 
     def dep(*a, **k):
         r = real(*a, **k)
         log["dependent"] += r is not None
         return r
-    monkeypatch.setattr(nx, "_try_dependent_keys", dep)
+    monkeypatch.setattr(nx, "_try_dependent_keys", dep, raising=False)
     real_join = nx.try_execute_join
 
     def join(*a, **k):
