@@ -523,11 +523,24 @@ _ARITH = {"add": ("addition", "add_checked"), "sub": ("subtraction", "subtract_c
           "mul": ("multiplication", "multiply_checked")}
 
 
+def _int_beside_double(lhs, rhs):
+    """An integer operand next to a DOUBLE one converts to double the way DuckDB's cast does (rounding to the nearest
+    double). Arrow's own promotion refuses an int64 past 2^53 ("Integer value ... not in range", F-060b)."""
+    lt, rt = getattr(lhs, "type", None), getattr(rhs, "type", None)
+    if lt is not None and rt is not None:
+        if pa.types.is_integer(lt) and rt == pa.float64():
+            lhs = pc.cast(lhs, pa.float64(), safe=False)
+        elif pa.types.is_integer(rt) and lt == pa.float64():
+            rhs = pc.cast(rhs, pa.float64(), safe=False)
+    return lhs, rhs
+
+
 def checked_arith(op, lhs, rhs):
     """``add`` / ``sub`` / ``mul`` of two operands, raising OverflowError ("Overflow in
     multiplication of INT64", DuckDB's message) where Arrow's plain kernels would wrap. Float
     operands behave as with the plain kernels."""
     word, name = _ARITH[op]
+    lhs, rhs = _int_beside_double(lhs, rhs)
     try:
         return getattr(pc, name)(lhs, rhs)
     except pa.ArrowInvalid as e:

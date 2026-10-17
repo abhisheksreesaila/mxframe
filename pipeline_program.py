@@ -6,8 +6,12 @@ program that the ahead-of-time compiled kernels ``libmxpipeline_cpu.so`` and
 ``libmxpipeline_gpu.so`` interpret (MonetDB/X100-style vectorized
 interpretation). Nothing here compiles at run time: no MAX Graph, no JIT.
 
-Everything is evaluated in float64: integer and float32 columns are widened on
-load, comparisons produce 1.0 / 0.0. String predicates are supported on
+Everything is evaluated in float64 (integer and float32 columns are widened on load, comparisons produce
+1.0 / 0.0), except integer arithmetic whose result the column TYPES cannot keep within +-2^53 (F-060b): that runs in
+"int" registers, int64 values held as the bits of a float64 word (LOADI, IADD / ISUB / IMUL, F2I), which the integer
+aggregates (ISUM / IMIN / IMAX) read as they are and every float operation reads through I2F. No pass over the data
+decides which: a kernel that computes an int64 result outside int64, or converts one outside +-2^53 to a double,
+sets a flag and the caller's exact path answers. String predicates are supported on
 dictionary-encoded columns: literals are translated to dictionary codes here in
 Python and the kernel only does an integer set-membership test (``IN_SET``).
 
@@ -22,9 +26,19 @@ float64 vectors, ``k`` a constant-pool index, ``col`` a column index):
 op         meaning                                          operands
 =========  ===============================================  ===================
 LOAD_COL   dst = float64(col[rows])                         dst, col
+LOADI      dst = int64(col[rows]), as the BITS of the        dst, col
+           register's float64 words (an "int" register, F-060c)
 LOAD_CONST dst = broadcast(consts[k])                       dst, k
 ADD SUB    dst = a (+|-|*|/) b                              dst, a, b
 MUL DIV
+IADD ISUB  dst = a (+|-|*) b in int64 over two "int"        dst, a, b
+IMUL       registers; a result outside int64 sets the
+           kernel's flag (E_OVERFLOW, F-060b)
+F2I        dst = int64(a): a float register of whole        dst, a
+           numbers within +-2^53, as an "int" register
+I2F        dst = float64(a) of an "int" register; a value   dst, a
+           outside +-2^53 (not exact as a double) sets the
+           flag (F-060b)
 LT LE GT   dst = 1.0 if a (<|<=|>|>=|==|!=) b else 0.0      dst, a, b
 GE EQ NE
 CMPC       dst = column <cmp> constant, compared in the      dst, col, k, cmp
@@ -54,9 +68,12 @@ ISNULL     dst = 1.0 where the column's value is NULL (its    dst, col
 AGG_SUM    slot += src (per group)                          slot, src
 AGG_MIN    slot = min(slot, src)                            slot, src
 AGG_MAX    slot = max(slot, src)                            slot, src
-AGG_ISUM   slot += int64(src), checked: the slot holds int64s    slot, src
-           (a sum of integers is exact past 2^53; the kernels
-           return E_OVERFLOW (-21) when a total passes int64)
+AGG_ISUM   slot += src, checked, over an "int" register: the   slot, src
+           slot holds int64s (a sum of integers is exact past
+           2^53; the kernels return E_OVERFLOW (-21) when a
+           total passes int64)
+AGG_IMIN   slot = min / max (int64) of an "int" register        slot, src
+AGG_IMAX
 =========  ===============================================  ===================
 
 Layout: 16-int header (magic, n_regs, n_prologue, n_pred, n_body, n_slots,
@@ -89,9 +106,12 @@ MAX_SET_SPAN = 1 << 22  # widest numeric IN_SET table we will build
 MAX_STR_IN = 32         # values an isin over a plain string column compares per row (linear)
 
 OP_LOAD_COL, OP_LOAD_CONST = 1, 2
-OP_LOADI = 3           # dst = an integer column's values as int64 BITS in the float64 register (read only by OP_AGG_IMIN / IMAX, F-060c)
+OP_LOADI = 3           # dst = an integer column's values as int64 BITS in the float64 register (an "int" register: F-060c, F-060b)
 OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
 OP_MOD = 14            # fmod of two integer-valued registers; the divisor is a nonzero constant (F-101)
+OP_IADD, OP_ISUB, OP_IMUL = 15, 16, 17   # int64 + - * of two "int" registers (bits in the float64 words); a result outside int64 sets the flag (F-060b)
+OP_F2I = 18            # dst = int64(a): a float register of whole numbers within +-2^53 as an "int" register
+OP_I2F = 19            # dst = float64(a): an "int" register to a float one; a value outside +-2^53 sets the flag
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_F32 = 34            # dst = float64(float32(a)): a FLOAT result rounded to float32 after each operation (F-110)
@@ -100,12 +120,13 @@ OP_ROWID = 39
 OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the native executor only)
 OP_ISNULL = 41         # dst = the column's validity bit is clear (the native executor only, F-097)
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
-OP_AGG_ISUM = 53       # sum of integer-valued inputs, accumulated in int64 (F-060); its slot holds int64 bits
-OP_AGG_IMIN, OP_AGG_IMAX = 54, 55   # min / max of a LOADI register, accumulated in int64 (F-060c); the slot holds int64 bits
+OP_AGG_ISUM = 53       # sum of an "int" register, accumulated in int64 (F-060, F-060b); its slot holds int64 bits
+OP_AGG_IMIN, OP_AGG_IMAX = 54, 55   # min / max of an "int" register, accumulated in int64 (F-060c); the slot holds int64 bits
 
 OP_NAMES = {
     OP_LOAD_COL: "LOAD_COL", OP_LOAD_CONST: "LOAD_CONST", OP_LOADI: "LOADI",
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV", OP_MOD: "MOD",
+    OP_IADD: "IADD", OP_ISUB: "ISUB", OP_IMUL: "IMUL", OP_F2I: "F2I", OP_I2F: "I2F",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR", OP_F32: "F32",
     OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR", OP_ISNULL: "ISNULL",
@@ -465,11 +486,13 @@ class _Val:
     vreg: int
     kind: str          # "int" | "float" | "bool"
     bound: Any = None  # int kind: a bound expression (see _eval_bound), evaluated only when a + - * needs it
+    rep: str = "f"     # "f": vreg is a float64 register; "i": an "int" register (int64 bits, F-060b); "c": a bare integer
+                       # column not loaded yet (vreg -1): loaded as a double by `as_reg`, as int64 by `int_reg`
 
 
 # A bound is a tuple tree: ("c", n) | ("col", name) | ("add", x, y) | ("mul", x, y) | ("max", x, y) |
-# ("div", x, k).  It is evaluated from the column TYPES first (no data read); only if that could pass
-# 2^53 is it evaluated again from the columns' real min / max.
+# ("div", x, k) | ("mod", x, k).  It is evaluated from the column TYPES only (no data read): an integer + - * whose
+# bound could pass 2^53 runs in int64 registers (F-060b), where overflow is a flag, not a decision.
 INT64_MAX, INT64_MIN = (1 << 63) - 1, -(1 << 63)
 EXACT = 1 << 53        # integers within +-2^53 are exact in float64, and so are their sums / products
 
@@ -498,8 +521,11 @@ class _Builder:
         self.dict_values: Dict[str, pa.Array] = {}
         self.columns: List[str] = []
         self.col_kind: Dict[str, str] = {}
-        self.col_bounds: Dict[str, int] = {}
-        self.skip_bounds = False       # name the columns only: no exactness bound, no pass over the data
+        self.skip_bounds = False       # name the columns only: no pass over the data (year_days' range, a dictionary)
+        self.int_regs = True           # False: the columns are not the kernels' own arrays (a fused join's gathered partner columns):
+                                       # no LOADI, an integer column is loaded as a double (range-checked) and converted with F2I
+        self.types_only = False        # True: the caller only asks whether the column TYPES prove the program exact in float64
+                                       # (the late stage, whose compiled graph has no int64): integer arithmetic past 2^53 raises Inexact
         self.day_ranges: Dict[str, Tuple[int, int]] = {}
         self.dict_arrays: Dict[str, pa.DictionaryArray] = {}
         self.plain_str: List[str] = []                 # plain utf8 columns matched by OP_STR
@@ -535,7 +561,26 @@ class _Builder:
         return self.const_vregs[k]
 
     def as_reg(self, x) -> int:
-        return self.const_reg(x.value) if isinstance(x, _Const) else x.vreg
+        """The float64 register of a value: a constant's, a loaded column's, or an "int" register converted (I2F,
+        which flags a value that is not exact as a double)."""
+        if isinstance(x, _Const):
+            return self.const_reg(x.value)
+        if x.rep == "i":
+            return self.emit(OP_I2F, x.vreg)
+        if x.rep == "c":
+            return self.emit(OP_LOAD_COL, self._column(x.bound[1]), key_extra=("col",))
+        return x.vreg
+
+    def int_reg(self, x) -> int:
+        """The "int" register (int64 bits) of an integer value: a column loaded as int64 (LOADI: exact past 2^53, never
+        range-checked), a constant or a float register of whole numbers converted (F2I)."""
+        if isinstance(x, _Const):
+            return self.emit(OP_F2I, self.const_reg(x.value))
+        if x.rep == "i":
+            return x.vreg
+        if x.rep == "c" and self.int_regs:
+            return self.emit(OP_LOADI, self._column(x.bound[1]), key_extra=("coli",))
+        return self.emit(OP_F2I, self.as_reg(x))
 
     def emit(self, op: int, a: int = 0, b: int = 0, c: int = 0, key_extra: tuple = ()) -> int:
         key = (op, a, b, c) + key_extra
@@ -617,56 +662,33 @@ class _Builder:
         kind = self.column_kind(name)
         if kind == "str":
             raise Unsupported("string column used as a number")
-        ix = self._column(name)
         if kind != "int":
-            return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind)
-        return _Val(self.emit(OP_LOAD_COL, ix, key_extra=("col",)), kind, ("col", name))
+            return _Val(self.emit(OP_LOAD_COL, self._column(name), key_extra=("col",)), kind)
+        self._column(name)                  # (an unknown column, or one tested for NULL, is refused here)
+        return _Val(-1, kind, ("col", name), "c")
 
-    def col_bound(self, name: str, tight: bool) -> int:
-        """max |value| of an integer column: its type's range, or (tight) the data's own min / max, one
-        parallel pass cached for the query. int64 is capped at 2^53 (wider values decline at bind)."""
+    def type_bound(self, name: str) -> int:
+        """max |value| of an integer column from its TYPE: no pass over the data (F-060b)."""
         t = self.table.schema.field(name).type
-        wide = EXACT if t.bit_width >= 64 else (1 << t.bit_width) - 1 if pa.types.is_unsigned_integer(t) \
+        return 1 << 63 if t.bit_width >= 64 else (1 << t.bit_width) - 1 if pa.types.is_unsigned_integer(t) \
             else 1 << (t.bit_width - 1)
-        if not tight or wide <= 1 << 16:
-            return wide
-        if name not in self.col_bounds:
-            from .join_engine import _minmax
-            col = self.table.column(name)
-            tb: Optional[int] = 0
-            for ch in (col.chunks if isinstance(col, pa.ChunkedArray) else [col]):
-                if not len(ch):
-                    continue
-                if ch.null_count:
-                    tb = None
-                    break
-                lo, hi = _minmax(_np_of(ch, zero_copy_only=False))
-                tb = max(tb, abs(lo), abs(hi))
-            self.col_bounds[name] = wide if tb is None else tb
-        return self.col_bounds[name]
 
     def bound_of(self, x):
         return ("c", abs(int(x.value))) if isinstance(x, _Const) else x.bound
 
-    def _eval_bound(self, t, tight: bool) -> int:
+    def _eval_bound(self, t) -> int:
         k = t[0]
         if k == "c":
             return t[1]
         if k == "col":
-            return self.col_bound(t[1], tight)
-        a = self._eval_bound(t[1], tight)
+            return self.type_bound(t[1])
+        a = self._eval_bound(t[1])
         if k == "div":
             return a // t[2] + 1
         if k == "mod":                                   # |x % k| < |k| and <= |x|
             return min(a, t[2] - 1)
-        b = self._eval_bound(t[2], tight)
+        b = self._eval_bound(t[2])
         return a * b if k == "mul" else max(a, b) if k == "max" else a + b
-
-    def within_exact(self, t) -> bool:
-        """Can ``bound`` stay within 2^53?  Type ranges first; the data only if they are not enough."""
-        if self.skip_bounds:
-            return True
-        return self._eval_bound(t, False) <= EXACT or self._eval_bound(t, True) <= EXACT
 
     def set_reg(self, src_col: str, member: np.ndarray, lo: int = 0):
         """IN_SET over a column's values / codes given a boolean membership table."""
@@ -736,13 +758,16 @@ class _Builder:
             if isinstance(cond, _Const):
                 return then if cond.value != 0 else other
             bound = ("max", self.bound_of(then), self.bound_of(other)) if kind == "int" else None
+            if kind == "int" and "i" in (getattr(then, "rep", "f"), getattr(other, "rep", "f")):
+                # an int64 branch: select the int64 bits (a branch that is a double or a constant is converted, exactly)
+                return _Val(self.emit(OP_SELECT, cond.vreg, self.int_reg(then), self.int_reg(other)), kind, bound, "i")
             return _Val(self.emit(OP_SELECT, cond.vreg, self.as_reg(then), self.as_reg(other)), kind, bound)
         if op == "year":
             x = self.compile(args[0])
             if isinstance(x, _Const) or x.kind != "int":
                 raise Unsupported("year() only on integer YYYYMMDD columns")
             d = self.const_reg(10000.0)
-            q = self.emit(OP_DIV, x.vreg, d)
+            q = self.emit(OP_DIV, self.as_reg(x), d)
             return _Val(self.emit(OP_FLOOR, q), "int", ("div", self.bound_of(x), 10000))
         if op == "year_days":
             return self._year_days(args[0])
@@ -750,7 +775,7 @@ class _Builder:
             x = self._need(args[0], "num")
             if isinstance(x, _Const):
                 return _Const(float(np.float32(x.value)), "float")
-            return _Val(self.emit(OP_F32, x.vreg), "float")
+            return _Val(self.emit(OP_F32, self.as_reg(x)), "float")
         raise Unsupported(f"op {op!r}")
 
     def _year_days(self, arg: Expr):
@@ -802,11 +827,21 @@ class _Builder:
         kind = "float" if "float" in (a.kind, b.kind) or code == OP_DIV else "int"
         bound = None
         if kind == "int":
-            # the interpreter is float64: an integer intermediate is exact only within +-2^53, so bound
-            # it from its inputs (columns' real min / max) and decline when it could pass (F-037)
             bound = ("mul" if code == OP_MUL else "add", self.bound_of(a), self.bound_of(b))
-            if not self.within_exact(bound):
-                raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
+            if isinstance(a, _Const) and isinstance(b, _Const):
+                r = _FOLD[code](int(a.value), int(b.value))           # exact Python integers
+                if abs(r) > EXACT:
+                    raise Inexact("integer arithmetic past 2**53 in a constant")
+                return _Const(float(r), kind)
+            if self._eval_bound(bound) > EXACT:
+                # the column TYPES cannot keep this within float64's exact integers (F-037 asked the data; no pass
+                # now, F-060b): compute it in int64. A result outside int64 sets the kernel's flag and Arrow's
+                # checked kernels raise like DuckDB; a float operation that later reads it converts (I2F) and
+                # flags a value outside +-2^53.
+                if self.types_only:
+                    raise Inexact("integer arithmetic could pass 2**53, not exact in float64")
+                iop = {OP_ADD: OP_IADD, OP_SUB: OP_ISUB, OP_MUL: OP_IMUL}[code]
+                return _Val(self.emit(iop, self.int_reg(a), self.int_reg(b)), kind, bound, "i")
         if isinstance(a, _Const) and isinstance(b, _Const):
             if code == OP_DIV:
                 if b.value == 0:
@@ -817,7 +852,8 @@ class _Builder:
 
     def _mod(self, e: Expr):
         """``int % k`` for a nonzero integer constant ``k`` (DuckDB: the sign follows the dividend, i.e. fmod; exact in
-        float64 because the dividend is bound within 2^53). A column or zero divisor could give NULL, a float
+        float64 because the dividend is within 2^53: a column's values are range-checked when it is bound, an int64
+        expression is converted by I2F, which flags a value outside). A column or zero divisor could give NULL, a float
         or decimal operand has Arrow's semantics: those decline to Arrow (F-101), and so does ``-1``, whose
         INT_MIN % -1 is an overflow only a checked operation can see (F-126)."""
         if len(e.args) > 2:
@@ -833,7 +869,7 @@ class _Builder:
         if b.value == -1:                               # INT_MIN % -1 overflows (DuckDB raises): Arrow's checked modulo answers
             raise Unsupported("modulo by -1 stays on Arrow (overflow check)")
         k = abs(int(b.value))
-        return _Val(self.emit(OP_MOD, a.vreg, self.as_reg(b)), "int", ("mod", self.bound_of(a), k))
+        return _Val(self.emit(OP_MOD, self.as_reg(a), self.as_reg(b)), "int", ("mod", self.bound_of(a), k))
 
     def _compare(self, op: str, args):
         lhs, rhs = args
@@ -1030,14 +1066,14 @@ class _Builder:
                 member = np.zeros(hi - lo + 1, dtype=np.uint8)
                 member[np.array(ints, dtype=np.int64) - lo] = 1
                 s = self.set_reg("", member, lo)
-                return _Val(self.emit(OP_IN_SET, x.vreg, s, key_extra=("set",)), "bool")
+                return _Val(self.emit(OP_IN_SET, self.as_reg(x), s, key_extra=("set",)), "bool")
         if len(values) > 16:
             raise Unsupported("wide float isin")
         acc = None
         for v in values:
             t = self._compare("eq", (col_e, Expr("lit", v))) if col_e.op == "col" else None
             if t is None:
-                t = _Val(self.emit(OP_EQ, x.vreg, self.const_reg(float(v)), NAN_AWARE if x.kind == "float" and v != v else 0),
+                t = _Val(self.emit(OP_EQ, self.as_reg(x), self.const_reg(float(v)), NAN_AWARE if x.kind == "float" and v != v else 0),
                          "bool")          # (x = c is IEEE's unless c is NaN)
             if isinstance(t, _Const):
                 if t.value == 0:
@@ -1085,12 +1121,12 @@ class _Builder:
                 isinstance(lo, _Const) and isinstance(hi, _Const) and lo.value == lo.value and hi.value == hi.value):
             return None        # a float BETWEEN is IEEE's (NaN fails `x <= hi`, as in DuckDB) only for constant bounds that are
                                # not NaN; otherwise two NaN-aware compares
-        return _Val(self.emit(OP_BETWEEN, x.vreg, self.as_reg(lo), self.as_reg(hi)), "bool")
+        return _Val(self.emit(OP_BETWEEN, self.as_reg(x), self.as_reg(lo), self.as_reg(hi)), "bool")
 
 
 def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
                      concat_dicts: bool = False, exact_bounds: bool = True,
-                     int_extremes: bool = True) -> Optional[PipelineProgram]:
+                     int_regs: bool = True, types_only: bool = False) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
@@ -1098,15 +1134,19 @@ def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
     concatenation of the chunks' dictionaries (``PipelineProgram.dict_concat``) instead of a
     unified dictionary built over the rows.
 
-    ``exact_bounds=False`` skips the integer-exactness bounds (the data's min / max, one pass per column):
-    the program is only good for naming its columns (``.columns``), never to run.
+    ``exact_bounds=False`` skips what reads the data (``year_days``' range): the program is only good for naming its
+    columns (``.columns``), never to run.
 
-    ``int_extremes`` (F-060c): the MIN / MAX of a bare integer column accumulates in int64 (``imin`` / ``imax`` slots
-    fed by ``OP_LOADI``), exact past 2^53. False where the columns are not the kernels' own arrays (a fused join's
-    gathered partner columns): those keep the float slots.
+    ``int_regs`` (F-060c, F-060b): integer columns are read as int64 (``OP_LOADI``): the MIN / MAX of an integer column
+    (``imin`` / ``imax`` slots) and integer arithmetic the column types cannot keep within 2^53 are exact past 2^53.
+    False where the columns are not the kernels' own arrays (a fused join's gathered partner columns): they are loaded
+    as doubles (range-checked) and converted, so the arithmetic is still int64 but a column past 2^53 declines.
+
+    ``types_only`` (F-060b): ``None`` (via ``Inexact``) for integer arithmetic the column types cannot prove within
+    2^53, instead of int64 ops: the question the late stage asks, whose compiled graph has no int64.
     """
     try:
-        return _compile(predicates, aggs, table, concat_dicts, exact_bounds, int_extremes)
+        return _compile(predicates, aggs, table, concat_dicts, exact_bounds, int_regs, types_only)
     except Unsupported:
         return None
 
@@ -1144,8 +1184,6 @@ def has_int_sum(aggs: List[Expr], table: pa.Table) -> bool:
         try:
             if "isum" in _compile([], [e], table, exact_bounds=False).slot_kinds:
                 return True
-        except Inexact:
-            return True                          # integer arithmetic that could pass 2^53: integers all the same
         except Unsupported:
             if _int_valued(e.args[0], table):
                 return True
@@ -1166,15 +1204,17 @@ def _int_valued(e: Expr, table: pa.Table) -> bool:
 
 
 def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> bool:
-    """Would a predicate or an aggregate (``aggs``) compute an integer past 2^53 (F-061: the compiled graph wraps at
-    int64)? The caller then computes in Arrow with checked kernels. Each expression is bounded on its own, so one
-    the compiler can't take (a string predicate) cannot hide another; an integer ``+ - *`` the compiler can't take
-    counts as inexact (Arrow's checked kernels answer it). The total of a sum is not asked about: the kernels add
-    integers in int64 and say when a total passes it (F-060)."""
+    """Could a predicate or an aggregate (``aggs``) compute an integer past 2^53 (F-061: the compiled graph wraps at
+    int64)? The caller then computes in Arrow with checked kernels. The question is asked of the column TYPES only
+    (``types_only=True``: a program that may not use int64 ops, since the graph has none): an integer ``+ - *`` the
+    types cannot keep within 2^53 is inexact, and so is one the compiler can't take (Arrow's checked kernels answer
+    it). Each expression is asked on its own, so one the compiler can't take (a string predicate) cannot hide
+    another. The total of a sum is not asked about: the kernels add integers in int64 and say when a total passes it
+    (F-060)."""
     count_all = Expr("count", Expr("lit", 1))
     for e, as_pred in [(p, True) for p in preds] + [(a, False) for a in aggs if a.op != "count"]:
         try:
-            _compile([e], [count_all], table) if as_pred else _compile([], [e], table)
+            _compile([e], [count_all], table, types_only=True) if as_pred else _compile([], [e], table, types_only=True)
         except Inexact:
             return True
         except Unsupported:
@@ -1184,9 +1224,11 @@ def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> boo
 
 
 def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False,
-             exact_bounds: bool = True, int_extremes: bool = True) -> PipelineProgram:
+             exact_bounds: bool = True, int_regs: bool = True, types_only: bool = False) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
     b.skip_bounds = not exact_bounds
+    b.int_regs = int_regs
+    b.types_only = types_only and exact_bounds      # (a names-only program never runs: it must not decline)
 
     # ── predicate section (dense rows) ─────────────────────────────────────
     pred_sec = _Section()
@@ -1221,7 +1263,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if e.op not in ("sum", "min", "max", "mean"):
             raise Unsupported(f"aggregate {e.op!r}")
         inner = b._need(e.args[0], "num")
-        if (int_extremes and e.op in ("min", "max") and e.args[0].op == "col" and not isinstance(inner, _Const)
+        if (int_regs and e.op in ("min", "max") and e.args[0].op == "col" and not isinstance(inner, _Const)
                 and inner.kind == "int" and e.args[0].args[0] not in b.dict_arrays):
             # F-060c: the MIN / MAX of an integer column is taken in int64, from the column's own values (OP_LOADI):
             # no float64 round trip, so a value past 2^53 is exact and the result is the column's integer type
@@ -1230,14 +1272,26 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             if key not in slot_index:
                 slot_index[key] = len(slot_kinds)
                 slot_kinds.append(kind)
-                slot_src.append(b.emit(OP_LOADI, b._column(e.args[0].args[0]), key_extra=("coli",)))
+                slot_src.append(b.int_reg(inner))
                 slot_int.append(True)
             outputs.append((name, kind, slot_index[key]))
             continue
-        # F-060: a sum (or mean) of integers is accumulated in int64 by the kernels, whatever the data. The inputs
-        # are whole numbers within +-2^53 (a column's values are checked when it is bound, an intermediate is
-        # bounded in `_arith`), so each converts to int64 exactly; a total past int64 makes the kernel return
-        # E_OVERFLOW and Arrow's checked sum answers.
+        if (e.op in ("min", "max") and not isinstance(inner, _Const) and getattr(inner, "rep", "f") == "i"
+                and not name.startswith("__key")):
+            # F-060b: the MIN / MAX of an int64 expression is taken in int64 too (a derived group key, `__key`, is read
+            # by the executor as a float register, so it converts, and flags a value outside +-2^53)
+            kind = "i" + e.op
+            key = (kind, e.args[0].signature())
+            if key not in slot_index:
+                slot_index[key] = len(slot_kinds)
+                slot_kinds.append(kind)
+                slot_src.append(inner.vreg)
+                slot_int.append(True)
+            outputs.append((name, kind, slot_index[key]))
+            continue
+        # F-060: a sum (or mean) of integers is accumulated in int64 by the kernels, whatever the data: the input is an
+        # int64 register (F-060b: a column loaded as int64, int64 arithmetic, or a double of whole numbers within
+        # +-2^53 converted), a total past int64 makes the kernel return E_OVERFLOW and Arrow's checked sum answers.
         is_int = inner.kind == "int" and e.op in ("sum", "mean")
         kind = "isum" if is_int else "sum" if e.op == "mean" else e.op
         key = (kind, e.args[0].signature())
@@ -1260,7 +1314,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if key not in slot_index:
             slot_index[key] = len(slot_kinds)
             slot_kinds.append(kind)
-            slot_src.append(b.as_reg(inner))
+            slot_src.append(b.int_reg(inner) if is_int else b.as_reg(inner))
             slot_int.append(inner.kind in ("int", "bool"))
         outputs.append((name, "i" + e.op if is_int else e.op, slot_index[key]))
     if not outputs and not concat_dicts:
@@ -1312,7 +1366,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             return [op, phys_of(ins[1]), 0, 0, 0]
         if op == OP_IN_SET:
             return [op, phys_of(ins[1]), phys_of(ins[2]), ins[3], 0]
-        if op in (OP_NOT, OP_FLOOR, OP_F32):
+        if op in (OP_NOT, OP_FLOOR, OP_F32, OP_F2I, OP_I2F):
             return [op, phys_of(ins[1]), phys_of(ins[2]), 0, 0]
         if op in (OP_SELECT, OP_BETWEEN):
             return [op, phys_of(ins[1]), phys_of(ins[2]), phys_of(ins[3]), phys_of(ins[4])]
@@ -1474,7 +1528,7 @@ def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
     if op in (OP_LOAD_COL, OP_LOADI, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR, OP_ISNULL):
         return []
-    if op in (OP_NOT, OP_FLOOR, OP_F32, OP_IN_SET):
+    if op in (OP_NOT, OP_FLOOR, OP_F32, OP_IN_SET, OP_F2I, OP_I2F):
         return [ins[2]]
     if op in (OP_SELECT, OP_BETWEEN):
         return [ins[2], ins[3], ins[4]]

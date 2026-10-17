@@ -397,6 +397,10 @@ def _double_vs_int(args, lhs, rhs):
         lhs = pc.cast(lhs, pa.float64(), safe=False)
     elif is_double(args[0]) and is_int(rhs):
         rhs = pc.cast(rhs, pa.float64(), safe=False)
+    elif is_int(lhs) and not isinstance(rhs, pa.Scalar) and getattr(rhs, "type", None) == pa.float64():
+        lhs = pc.cast(lhs, pa.float64(), safe=False)          # two arrays: an int64 expression past 2**53 beside a double column (F-060b)
+    elif is_int(rhs) and not isinstance(lhs, pa.Scalar) and getattr(lhs, "type", None) == pa.float64():
+        rhs = pc.cast(rhs, pa.float64(), safe=False)
     return lhs, rhs
 
 

@@ -372,7 +372,7 @@ def _shapes():
         "nulls": (LazyFrame(nulls).groupby("k").agg(s(col("v").sum())), False),
         "int64 past 2^53": (LazyFrame(big).filter(col("i") > lit(5)).groupby("k").agg(s(col("i").max())), False),
         "int64 max past 2^53, in int64 (F-060c)": (LazyFrame(big).groupby("k").agg(s(col("i").max())), True),
-        "integer sum that could pass 2^53": (LazyFrame(big).groupby("k").agg(s(col("i").sum())), False),
+        "integer sum of int64 past 2^53, in int64 (F-060b)": (LazyFrame(big).groupby("k").agg(s(col("i").sum())), True),
         "dictionary-code filter, in-memory": (LazyFrame(strings).filter(col("s") == lit("a"))
                                               .groupby("k").agg(s(col("v").sum())), False),
         "join": (LazyFrame(t).join(LazyFrame(dim), on="k").groupby("g").agg(s(col("v").sum())), False),
@@ -516,9 +516,8 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     scans = []
     import mxframe.join_engine as je
     import mxframe.pipeline_program as pp
-    real_mm, real_cb = je._minmax, pp._Builder.col_bound
+    real_mm = je._minmax
     monkeypatch.setattr(je, "_minmax", lambda *a: scans.append("minmax") or real_mm(*a))
-    monkeypatch.setattr(pp._Builder, "col_bound", lambda self, *a: scans.append("col_bound") or real_cb(self, *a))
     real_col, real_sum = pe._column_past_2_53, __import__("mxframe.pipeline_program", fromlist=["x"]).int_sum_inexact
     monkeypatch.setattr(pe, "_column_past_2_53", lambda *a: scans.append("int64") or real_col(*a))
     import mxframe.custom_ops as co
@@ -533,7 +532,7 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     assert "cpu path: cpu+gpu split" in text and scans == []
     # the full check (background upload, the run) does scan
     assert not isinstance(pe.split_check(lf.plan), str) and "int64" in scans and "arrow" in scans
-    assert "minmax" not in scans and "col_bound" not in scans      # F-060: an integer sum is not sized (no pass over its column)
+    assert "minmax" not in scans      # F-060: an integer sum is not sized (no pass over its column)
 
 
 @pytest.mark.parametrize("kind", ["multi-chunk dictionary", "plain string"])

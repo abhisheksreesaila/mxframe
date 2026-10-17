@@ -1,8 +1,9 @@
-"""F-037: integer arithmetic whose intermediate result passes 2^53 is never computed in the
-float64 interpreter. The compiler bounds every int `*` `+` `-` from the columns' real min / max
-and declines (the caller's exact path answers); results equal DuckDB for every entry point that
-evaluates expressions: mx_execute (group-by and global aggregates), mx_filter (plain filters and
-star joins), mx_filter_topk, and the legacy fused pipeline."""
+"""F-037, F-060b: integer arithmetic whose intermediate result passes 2^53 is never computed in the float64
+interpreter. F-037 bounded every int `*` `+` `-` from the columns' real min / max and declined; F-060b computes it in
+int64 registers (OP_IADD / ISUB / IMUL) when the column TYPES cannot keep it within 2^53, with a runtime flag instead of a
+pass over the data. Results equal DuckDB for every entry point that evaluates expressions: mx_execute (group-by and global
+aggregates), mx_filter (plain filters and star joins), mx_filter_topk, and the legacy fused pipeline. The compiler asked
+only whether the types prove it (`types_only=True`, the late-stage question) still declines."""
 import duckdb
 import numpy as np
 import pyarrow as pa
@@ -73,22 +74,26 @@ def _want_rows(t, sql):
 
 
 @pytest.mark.parametrize("name", PREDS)
-def test_the_compiler_declines_an_intermediate_past_2_53(name):
+def test_the_compiler_computes_an_intermediate_past_2_53_in_int64(name):
     t = _table()
-    assert compile_pipeline([PREDS[name][0]()], [col("v").sum()], t) is None
-    assert compile_pipeline([], [(col("a") * col("b")).max()], t) is None
+    prog = compile_pipeline([PREDS[name][0]()], [col("v").sum()], t)
+    assert any(op in ("IADD", "ISUB", "IMUL") for op in prog.op_names()), prog.op_names()
+    assert compile_pipeline([PREDS[name][0]()], [col("v").sum()], t, types_only=True) is None      # types alone cannot prove it
+    prog = compile_pipeline([], [(col("a") * col("b")).max()], t)
+    assert "IMUL" in prog.op_names() and prog.slot_kinds == ["imax"]
+    assert compile_pipeline([], [(col("a") * col("b")).max()], t, types_only=True) is None
 
 
-def test_small_integers_still_compile_even_when_the_type_could_overflow(monkeypatch):
+def test_small_integers_compile_to_int64_ops_when_the_type_could_overflow(monkeypatch):
     t = pa.table({"p": A(np.arange(1, 100, dtype=np.int64)), "q": A(np.arange(1, 100, dtype=np.int64)),
                   "i": A(np.arange(1, 100, dtype=np.int32)), "v": A(np.ones(99))})
-    assert compile_pipeline([(col("p") * col("q")) > lit(50)], [col("v").sum()], t) is not None
-    assert compile_pipeline([(col("i") * col("i") + lit(1)) > lit(50)], [col("v").sum()], t) is not None
-    assert compile_pipeline([], [(col("p") * lit(2) - col("q")).max()], t) is not None
-    # a product that stays exactly 2^53 is fine; a bigger one is not
+    assert "IMUL" in compile_pipeline([(col("p") * col("q")) > lit(50)], [col("v").sum()], t).op_names()
+    assert "IMUL" in compile_pipeline([(col("i") * col("i") + lit(1)) > lit(50)], [col("v").sum()], t).op_names()
+    assert "ISUB" in compile_pipeline([], [(col("p") * lit(2) - col("q")).max()], t).op_names()
+    # the data does not decide any more: a product of 2^26 squared is computed in int64 whatever the values
     big = pa.table({"p": A(np.array([1 << 26], dtype=np.int64)), "v": A(np.ones(1))})
     assert compile_pipeline([(col("p") * col("p") * lit(2)) == lit(1 << 53)], [col("v").sum()], big) is not None
-    assert compile_pipeline([(col("p") * col("p") * lit(3)) > lit(1)], [col("v").sum()], big) is None
+    assert compile_pipeline([(col("p") * col("p") * lit(3)) > lit(1)], [col("v").sum()], big) is not None
     # and the query runs in the native executor, equal to DuckDB
     if nx.available():
         monkeypatch.setenv("MXFRAME_NATIVE", "1")
@@ -96,11 +101,12 @@ def test_small_integers_still_compile_even_when_the_type_could_overflow(monkeypa
             (col("p") * lit(2) - col("q")).max().alias("m"), col("v").sum().alias("s")).compute(device="cpu")
         assert nx.last_path() == "native"
         want = _con(t=t).execute("select max(p * 2 - q), sum(v) from t where p * q > 50").fetchone()
-        assert (got.column("m").to_pylist()[0], got.column("s").to_pylist()[0]) == tuple(float(x) for x in want)
+        assert (got.column("m").to_pylist()[0], float(got.column("s").to_pylist()[0])) == tuple(float(x) for x in want)
 
 
-def test_type_ranges_decide_without_reading_column_data(monkeypatch):
-    """int32 + int32, year(), int32 * a small literal and case_when never read the data."""
+def test_the_types_decide_and_no_query_reads_column_data(monkeypatch):
+    """int32 + int32, year(), int32 * a small literal and case_when stay float64 ops; int32 * int32 and int64 * int64
+    are int64 ops. None of them reads the data (F-037 read it for the last two)."""
     import mxframe.join_engine as je
     reads = []
     real = je._minmax
@@ -110,21 +116,24 @@ def test_type_ranges_decide_without_reading_column_data(monkeypatch):
                   "d": A(np.arange(n, dtype=np.int32)), "v": A(np.ones(n))})
     for pred in (col("i") + col("j") > lit(5), col("d").year() + col("i") > lit(5), col("i") * lit(1000) > lit(5),
                  when(col("i") > lit(3), col("i"), col("j")) + col("j") > lit(5)):
-        assert compile_pipeline([pred], [col("v").sum()], t) is not None
-    assert reads == []
-    # int32 * int32 and int64 * int64 do need the data (the type ranges alone would decline)
-    assert compile_pipeline([col("i") * col("j") > lit(5)], [col("v").sum()], t) is not None
+        names = compile_pipeline([pred], [col("v").sum()], t).op_names()
+        assert not {"IADD", "ISUB", "IMUL", "I2F"} & set(names), names
+        assert compile_pipeline([pred], [col("v").sum()], t, types_only=True) is not None
+    assert "IMUL" in compile_pipeline([col("i") * col("j") > lit(5)], [col("v").sum()], t).op_names()
     t64 = pa.table({"p": A(np.arange(n, dtype=np.int64)), "v": A(np.ones(n))})
-    assert compile_pipeline([col("p") * col("p") > lit(5)], [col("v").sum()], t64) is not None
-    assert reads == [n, n, n]
+    assert "IMUL" in compile_pipeline([col("p") * col("p") > lit(5)], [col("v").sum()], t64).op_names()
+    assert reads == []
 
 
 def test_year_carries_its_bound_into_a_later_product():
     big = pa.table({"d": A(np.array([949_062_673_333], dtype=np.int64)), "v": A(np.ones(1))})     # year 94906267
     small = pa.table({"d": A(np.array([20_240_101], dtype=np.int64)), "v": A(np.ones(1))})
     pred = (col("d").year() * col("d").year()) > lit(5)
-    assert compile_pipeline([pred], [col("v").sum()], big) is None
-    assert compile_pipeline([pred], [col("v").sum()], small) is not None
+    # an int64 column's year is up to 9.2e14: its square is an int64 op, whatever the values
+    assert "IMUL" in compile_pipeline([pred], [col("v").sum()], big).op_names()
+    assert "IMUL" in compile_pipeline([pred], [col("v").sum()], small).op_names()
+    int32_year = pa.table({"d": A(np.array([20_240_101], dtype=np.int32)), "v": A(np.ones(1))})     # 2.1e9 / 1e4: squares within 2^53
+    assert "IMUL" not in compile_pipeline([pred], [col("v").sum()], int32_year).op_names()
 
 
 def test_constant_arithmetic_past_2_53_declines():

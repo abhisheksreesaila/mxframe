@@ -1135,7 +1135,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
             for i in range(n_pdc):
                 ptbl[c * pstride + 2 + n_pre + i] = pre_doffs[c * n_pdc + i]
             prow0 += cn
-    var no_gids = unsafe_alloc[Int32](2)          # (also the flag cell the program's integer sums would set: it has none)
+    var no_gids = unsafe_alloc[Int32](2)          # (also the pre-filter's flag cell: an int64 op that overflows sets it, F-060b)
+    _lp(Int(no_gids))[0] = 0
     var pre = Prog(_ip(Int(F[3]) if fused else code), FP(unsafe_from_address=Int(F[4]) if fused else consts),
                    _bp(Int(F[5]) if fused else set_bytes), _lp(Int(F[6]) if fused else set_meta), ptbl,
                    n_chunks, pre_dt, no_gids, 1, False, _lp(Int(no_gids)))
@@ -1416,6 +1417,8 @@ def mx_execute(plan_a: Int, out_a: Int) abi("C") -> Int:
     for j in range(n_look):
         _free_map(maps + j * MW)
     maps.free()
+    if rc == 0 and _lp(Int(no_gids))[0] != 0:         # the fact leaf's own filter computed an int64 outside int64 (F-060b)
+        rc = E_OVERFLOW
     no_gids.free()
     if fused:
         ptbl.free()
@@ -3007,7 +3010,8 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
             tbl[c * tstride + 2 + n_cols + i] = doffs[c * n_dcols + i]
         row += n
     var n_rows = row
-    var no_gids = unsafe_alloc[Int32](2)          # no group ids (Mojo has no null pointer); also a flag cell nothing sets
+    var no_gids = unsafe_alloc[Int32](2)          # no group ids (Mojo has no null pointer); also the predicates' flag cell (F-060b)
+    _lp(Int(no_gids))[0] = 0
     var p = Prog(code, FP(unsafe_from_address=Int(P[6])), _bp(Int(P[7])), _lp(Int(P[8])), tbl,
                  n_chunks, dtypes, no_gids, 1, False, _lp(Int(no_gids)))
 
@@ -3209,7 +3213,8 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         col_bytes[j] = Int64(b)
         if Int(tk[j]) != OK_FIXED and b > 2147483647:
             too_big = True
-    if too_big:
+    var flagged = _lp(Int(no_gids))[0] != 0           # an int64 op of the predicate overflowed, or met a double past 2^53 (F-060b)
+    if too_big or flagged:
         for m in range(morsels):
             if Int(mlook[m]) != 0:
                 _ip(Int(mlook[m])).free()
@@ -3233,7 +3238,7 @@ def mx_filter(plan_a: Int, out_a: Int) abi("C") -> Int:
         col_bytes.free()
         no_gids.free()
         tbl.free()
-        return E_OUTPUT_TOO_BIG
+        return E_OVERFLOW if flagged else E_OUTPUT_TOO_BIG
 
     # ── arena ────────────────────────────────────────────────────────────────────────────
     var asize = 0
@@ -4974,6 +4979,7 @@ def mx_filter_topk(plan_a: Int, out_a: Int) abi("C") -> Int:
         row += n
     var n_rows = row
     var no_gids = unsafe_alloc[Int32](2)
+    _lp(Int(no_gids))[0] = 0                            # (the predicate's flag cell, F-060b)
     var p = Prog(code, FP(unsafe_from_address=Int(P[4])), _bp(Int(P[5])), _lp(Int(P[6])), tbl,
                  n_chunks, dtypes, no_gids, 1, False, _lp(Int(no_gids)))
     var morsels = max((n_rows + MORSEL - 1) // MORSEL, 1)
@@ -5097,7 +5103,9 @@ def mx_filter_topk(plan_a: Int, out_a: Int) abi("C") -> Int:
     var rc = 0
     var n_out = 0
     var arena = unsafe_alloc[UInt8](max(k * 8, 8), alignment=64)
-    if Int(nan[0]) != 0:
+    if _lp(Int(no_gids))[0] != 0:
+        rc = E_OVERFLOW                                 # an int64 op overflowed, or met a double past 2^53 (F-060b)
+    elif Int(nan[0]) != 0:
         rc = E_NAN_SORT
     else:
         # every worker's entries, merge-sorted by (values, row); the first k

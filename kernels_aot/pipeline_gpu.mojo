@@ -55,16 +55,22 @@ comptime SMALL: Int = 48            # per-thread accumulators (mode 0)
 comptime HDR: Int = 16
 comptime MAX_CONSTS: Int = 64
 comptime WARPS: Int = BLOCK // 32
+comptime LIM53 = Int64(1) << 53         # an int64 value outside +-2^53 is not exact as a double
 comptime REPRO_MAX_NS: Int = 4096   # most (slots + 1) * groups the ordered mode holds (pipeline_kernels.REPRO_MAX_NS)
 
 comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
-comptime OP_LOADI = 3           # the column's values as int64 BITS in the register (read only by OP_AGG_IMIN / IMAX, F-060c)
+comptime OP_LOADI = 3           # the column's values as int64 BITS in the register (an "int" register: F-060c, F-060b)
 comptime OP_ADD = 10
 comptime OP_SUB = 11
 comptime OP_MUL = 12
 comptime OP_DIV = 13
 comptime OP_MOD = 14            # fmod: the sign follows the dividend (integer % a nonzero constant, F-101)
+comptime OP_IADD = 15           # int64 + - * of two "int" registers (int64 bits in the float64 words); a result outside int64 sets *ovf (F-060b)
+comptime OP_ISUB = 16
+comptime OP_IMUL = 17
+comptime OP_F2I = 18            # dst = int64(a): a float register of whole numbers within +-2^53
+comptime OP_I2F = 19            # dst = float64(a) of an "int" register; a value outside +-2^53 sets *ovf
 comptime OP_LT = 20
 comptime OP_LE = 21
 comptime OP_GT = 22
@@ -83,8 +89,8 @@ comptime OP_CMPC = 38
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
-comptime OP_AGG_ISUM = 53       # sum of integer-valued inputs in int64 (F-060): the slot's float64 word holds int64 bits
-comptime OP_AGG_IMIN = 54       # min / max of an OP_LOADI register in int64 (F-060c): the slot's float64 word holds int64 bits
+comptime OP_AGG_ISUM = 53       # sum of an "int" register in int64 (F-060, F-060b): the slot's float64 word holds int64 bits
+comptime OP_AGG_IMIN = 54       # min / max of an "int" register in int64 (F-060c): the slot's float64 word holds int64 bits
 comptime OP_AGG_IMAX = 55
 
 comptime SH = AddressSpace.SHARED
@@ -195,11 +201,26 @@ def _iadd_words(a: Float64, b: Float64, ovf: LP) -> Float64:
 
 @always_inline
 def _iadd_value(a: Float64, v: Float64, ovf: LP) -> Float64:
-    """The slot word `a` (int64 bits) plus the whole number `v` (a register value, within +-2^53)."""
+    """The slot word `a` (int64 bits) plus `v`, an "int" register's word (int64 bits)."""
     var x = _i64_of(a)
-    var y = Int64(v)
+    var y = _i64_of(v)
     _note_ovf(x, y, ovf)
     return _word_of(x + y)
+
+
+@always_inline
+def _imul_ovf(x: Int64, y: Int64) -> Bool:
+    """Does x * y pass int64? Both inside [-2^31, 2^31) cannot; otherwise exact (divide back, after the two
+    quotients that trap)."""
+    if ((x + 2147483648) | (y + 2147483648)) >> 32 == 0:
+        return False
+    if x == 0 or y == 0:
+        return False
+    if x == -1:
+        return y == Int64.MIN
+    if y == -1:
+        return x == Int64.MIN
+    return (x * y) // x != y
 
 
 @always_inline
@@ -363,9 +384,10 @@ def _ident(kind: Int) -> Float64:
 
 def _run[RPT: Int, B: Int](
     code: SIP, base: Int, count: Int, regs: SFP, consts: SFP, cols: LP, dts: IP,
-    set_bytes: BP, set_meta: LP, tid: Int, row_base: Int, mask: Int,
+    set_bytes: BP, set_meta: LP, tid: Int, row_base: Int, mask: Int, ovf: LP,
 ):
-    """Run `count` instructions for this thread's RPT rows; bit k of `mask` = row k is live."""
+    """Run `count` instructions for this thread's RPT rows; bit k of `mask` = row k is live. `ovf`: the flag cell an
+    int64 op sets when its result passes int64, or an int64 value past 2^53 is converted to a double (F-060b)."""
     comptime TILE = B * RPT
     for n in range(count):
         var ins = code + (HDR + (base + n) * 5)
@@ -399,6 +421,33 @@ def _run[RPT: Int, B: Int](
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
                     d[k * B] = _cmpc(addr, dt, row_base + tid + k * B, thr, cmp, na)
+        elif op >= OP_IADD and op <= OP_I2F:
+            var a = regs + Int(ins[2]) * TILE + tid
+            var b = regs + Int(ins[3]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    if op == OP_F2I:
+                        d[k * B] = _word_of(Int64(a[k * B]))
+                    elif op == OP_I2F:
+                        var v = _i64_of(a[k * B])
+                        if v > LIM53 or v < -LIM53:
+                            ovf[0] = 1
+                        d[k * B] = Float64(v)
+                    else:
+                        var x = _i64_of(a[k * B])
+                        var y = _i64_of(b[k * B])
+                        var r = x + y
+                        if op == OP_ISUB:
+                            r = x - y
+                            if ((x ^ y) & (x ^ r)) < 0:
+                                ovf[0] = 1
+                        elif op == OP_IMUL:
+                            r = x * y
+                            if _imul_ovf(x, y):
+                                ovf[0] = 1
+                        elif ((x ^ r) & (y ^ r)) < 0:
+                            ovf[0] = 1
+                        d[k * B] = _word_of(r)
         elif op < OP_LT:
             var a = regs + Int(ins[2]) * TILE + tid
             var b = regs + Int(ins[3]) * TILE + tid
@@ -545,7 +594,7 @@ def pipeline_kernel[RPT: Int, B: Int](
     var out_cnt = _lp(out_cnt_a)
 
     var all_rows = (1 << RPT) - 1
-    _run[RPT, B](code, 0, n_pro, regs, consts, cols, dts, set_bytes, set_meta, tid, 0, all_rows)
+    _run[RPT, B](code, 0, n_pro, regs, consts, cols, dts, set_bytes, set_meta, tid, 0, all_rows, ovf)
 
     var acc = stack_allocation[SMALL, Scalar[F64]]()
     var ns = (A + 1) * G
@@ -582,7 +631,7 @@ def pipeline_kernel[RPT: Int, B: Int](
         var active = valid
         if pred_reg >= 0:
             _run[RPT, B](code, n_pro, n_pred, regs, consts, cols, dts, set_bytes, set_meta,
-                      tid, row_base, valid)
+                      tid, row_base, valid, ovf)
             active = 0
             comptime for k in range(RPT):
                 if (valid >> k) & 1 != 0 and _nz(regs[pred_reg * TILE + tid + k * B]):
@@ -592,7 +641,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                 tg[tid + k * B] = -1
         if active != 0:
             _run[RPT, B](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
-                      set_meta, tid, row_base, active)
+                      set_meta, tid, row_base, active, ovf)
             if mode == 4:
                 comptime for k in range(RPT):
                     if (active >> k) & 1 != 0:
@@ -651,7 +700,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 if kind == OP_AGG_SUM:
                                     _atomic_add_f64(p, v)
                                 elif kind == OP_AGG_ISUM:
-                                    var yv = Int64(v)
+                                    var yv = _i64_of(v)
                                     _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
                                 elif kind == OP_AGG_IMIN:
                                     _atomic_min_bits(p, _i64_of(v))
@@ -671,7 +720,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 if kind == OP_AGG_SUM:
                                     _atomic_add_f64(p, v)
                                 elif kind == OP_AGG_ISUM:
-                                    var yv = Int64(v)
+                                    var yv = _i64_of(v)
                                     _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
                                 elif kind == OP_AGG_IMIN:
                                     _atomic_min_bits(p, _i64_of(v))
