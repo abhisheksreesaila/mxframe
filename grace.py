@@ -24,7 +24,6 @@ Everything is in plan order (partition number, then file order), so reproducible
 from __future__ import annotations
 
 import dataclasses
-import warnings
 from collections import Counter
 from typing import Iterator, Optional
 
@@ -129,10 +128,14 @@ class Grace:
                 for part, _, _ in _s._stream_parts(got, st, lambda: got.top, self.side_run):
                     yield part
             return
-        if isinstance(got, str):
-            warnings.warn(f"mxframe: a side of a Grace join cannot be streamed ({got}); computing it in memory, which "
-                          f"may run out of memory.", RuntimeWarning, stacklevel=2)
-        yield self.side_run(plan)
+        # an aggregate over a big file (or a side that fits) is an ordinary compute, which streams by itself: lift the
+        # "no nested streaming" flag for it (its result must fit, as any query's does)
+        token = _s._active.set(False)
+        try:
+            out = self.side_run(plan)
+        finally:
+            _s._active.reset(token)
+        yield out
 
     def _partition(self, side: LogicalPlan, other: LogicalPlan, keys, schema, which: int) -> _spill.Partitioned:
         cols = self._needed(side, other, schema, set(keys))

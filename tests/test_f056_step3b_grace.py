@@ -110,7 +110,35 @@ Q3 = ("SELECT o_prio, l_flag, count(*) AS n, sum(l_q) AS sq, sum(l_p * (1 - o_cu
 def test_lineitem_join_orders_both_over_budget_with_an_aggregate_equals_duckdb(files, device, _env):
     lf, g = check(Q3, files, device, ("o_prio", "l_flag"))
     assert g["pairs"] >= 16
-    assert lf.last_compile_provenance["streamed"]["devices"]
+    devices = lf.last_compile_provenance["streamed"]["devices"]
+    assert sum(devices.values()) == g["pairs"]
+    if device == "gpu":
+        assert devices == {"gpu": g["pairs"]}
+    assert spill_leftovers(_env) == []
+
+
+@pytest.mark.skipif(not HAS_GPU, reason="no CUDA GPU")
+def test_a_pair_that_does_not_fit_the_gpu_budget_runs_on_the_cpu(files, monkeypatch):
+    monkeypatch.setenv("MXFRAME_GPU_MEM_BUDGET", "100K")
+    lf, g = check(Q3, files, "gpu", ("o_prio", "l_flag"))
+    assert lf.last_compile_provenance["streamed"]["devices"] == {"cpu": g["pairs"]}
+
+
+def test_three_big_tables_join_through_nested_grace_joins(tmp_path, monkeypatch, _env):
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "1500K")
+    rng = np.random.default_rng(21)
+    n = 60_000
+    f = {}
+    for name, ks in (("a", ("x",)), ("b", ("x", "y")), ("c", ("y",))):
+        cols = {k: rng.integers(0, 40_000, n).astype(np.int64) for k in ks}
+        cols[f"v{name}"] = rng.integers(0, 10, n).astype(np.int64)
+        f[name] = str(tmp_path / f"{name}.parquet")
+        pq.write_table(pa.table(cols), f[name], row_group_size=5_000)
+    q = "SELECT count(*) AS n, sum(va * vb * vc) AS s FROM a JOIN b ON a.x = b.x JOIN c ON b.y = c.y"
+    lf, got = run_sql(q, f)
+    g = grace(lf)
+    assert g["pairs"] > 16 and g["partitions_total"] >= 64, g
+    same(got, duck(q, f))
     assert spill_leftovers(_env) == []
 
 
