@@ -873,7 +873,7 @@ class CustomOpsCompiler(GraphCompiler):
         if op == "add_us":
             return add_interval_arrow(self._eval_expr_arrow(args[0], table), args[1])
         if op == "cast":
-            return cast_arrow(self._eval_expr_arrow(args[0], table), args[1])
+            return cast_arrow(self._eval_expr_arrow(args[0], table), *args[1:])
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
@@ -1748,16 +1748,17 @@ class CustomOpsCompiler(GraphCompiler):
         cannot hold a string, a date, a ns timestamp or an integer past 2^53. Evaluate the argument once by Arrow
         into a column of the aggregate's input and aggregate that column, so the paths that already answer
         ``MIN(s)`` (F-072 ranks), ``MIN(date)`` (F-093) and ``MIN(int64)`` (F-090) take it. ``[Sort Limit] [HAVING]
-        Aggregate`` is the shape taken; any other plan comes back as it was."""
+        Aggregate`` is the shape taken; the rewritten plan is run (its integer MIN / MAX get their integer type
+        back in ``compile_and_run``); None: not that shape."""
         core, post_ops = self._extract_post_ops(plan)
         having = core if isinstance(core, Filter) and isinstance(core.input, Aggregate) else None
         agg = core.input if having is not None else core
         if not isinstance(agg, Aggregate) or self._contains_aggregate(agg.input):
-            return plan
+            return None
         wanted = [i for i, e in enumerate(agg.aggs)
                   if e.op in ("min", "max") and isinstance(e.args[0], Expr) and e.args[0].op not in ("col", "lit")]
         if not wanted:
-            return plan
+            return None
         node = agg.input
         while isinstance(node, Filter):
             node = node.input
@@ -1778,15 +1779,16 @@ class CustomOpsCompiler(GraphCompiler):
                 t = t.value_type if pa.types.is_dictionary(t) else t
                 return ("text" if pa.types.is_string(t) or pa.types.is_large_string(t)
                         else "temporal" if pa.types.is_date(t) or pa.types.is_timestamp(t)
-                        else "int" if pa.types.is_integer(t) and t.bit_width >= 64 else None)
+                        else "int" if pa.types.is_integer(t) else None)
             if e.op == "add_us":                    # a DATE or timestamp plus an interval
                 return "temporal"
-            parts = e.args[1:] if e.op == "case_when" else e.args if e.op == "coalesce" else ()
+            parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "add", "sub", "mul", "mod")
+                     else ())
             return next((k for k in (kind(a) for a in parts if isinstance(a, Expr)) if k), None)
 
         wanted = [i for i in wanted if kind(agg.aggs[i].args[0])]
         if not wanted:
-            return plan
+            return None
         taken = set(table.column_names)
         new_aggs = list(agg.aggs)
         for i in wanted:
@@ -1805,7 +1807,7 @@ class CustomOpsCompiler(GraphCompiler):
         out = Aggregate(with_table(base), agg.group_by, new_aggs)
         if having is not None:
             out = Filter(out, having.predicate)
-        return self._rewrap(out, post_ops)
+        return self.compile_and_run(self._rewrap(out, post_ops))
 
     def _string_minmax(self, plan):
         """MIN / MAX of a string column (F-072): the column's distinct values are ranked once in byte order
@@ -2304,7 +2306,9 @@ class CustomOpsCompiler(GraphCompiler):
         plan = self._aggregate_consumers_first(plan)
 
         # -1a1 -- F-108: MIN / MAX of a computed string / date / timestamp / 64-bit integer becomes a column
-        plan = self._computed_extremes(plan)
+        _cmm = self._computed_extremes(plan)
+        if _cmm is not None:
+            return _cmm
 
         # -1a1 -- F-072: MIN / MAX of a string column, computed on the byte-order ranks of its values
         _strmm = self._string_minmax(plan)

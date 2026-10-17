@@ -219,14 +219,18 @@ _CAST_TYPES = {"float32": pa.float32, "float64": pa.float64, "int8": pa.int8, "i
                "int32": pa.int32, "int64": pa.int64}
 
 
-def cast_arrow(x, name):
+def cast_arrow(x, name, away=False):
     """``CAST(x AS <name>)`` for the number types, as DuckDB casts: a float rounds half to even into an integer, a
-    value that does not fit raises (an integer into a float rounds, as DuckDB's does)."""
+    DECIMAL (``away``: the SQL front end saw a DECIMAL literal in the expression) half away from zero; a value that
+    does not fit raises (an integer into a float rounds, as DuckDB's does). Only numbers can be cast."""
     t = _CAST_TYPES[name]()
+    if not (pa.types.is_integer(x.type) or pa.types.is_floating(x.type)):
+        raise NotImplementedError(f"CAST of {x.type} to {name} is not supported (numbers only)")
     if x.type == t:
         return x
     if pa.types.is_floating(x.type) and pa.types.is_integer(t):
-        return pc.cast(pc.round(x, 0, round_mode="half_to_even"), t)
+        mode = "half_towards_infinity" if away else "half_to_even"
+        return pc.cast(pc.round(x, 0, round_mode=mode), t)
     out = pc.cast(x, t, safe=pa.types.is_integer(t))
     if pa.types.is_float32(t) and pa.types.is_float64(x.type) and bool(pc.any(pc.and_(pc.is_inf(out), pc.is_finite(x))).as_py()):
         raise OverflowError("value out of range for FLOAT")
@@ -639,7 +643,7 @@ class GraphCompiler:
         if op == "add_us":
             return add_interval_arrow(GraphCompiler._eval_predicate(args[0], table), args[1])
         if op == "cast":
-            return cast_arrow(GraphCompiler._eval_predicate(args[0], table), args[1])
+            return cast_arrow(GraphCompiler._eval_predicate(args[0], table), *args[1:])
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):

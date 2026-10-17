@@ -385,3 +385,40 @@ def test_aggregate_without_coalesce_stays_native(monkeypatch):
     got, want, _, _ = _run("select g, sum(id) as s from t group by g order by g", "cpu")
     assert nx.last_path() == "native", nx.last_decline()
     assert _same(got, want)
+
+
+# -- CAST: a DECIMAL rounds half away from zero, a float half to even; only numbers can be cast -----------------
+
+DECIMAL_CAST = [
+    "select id, cast(id * 0.5 as int) as c from t order by id",                # 0.5, 1.5, 2.5 ...: away from zero
+    "select id, cast(id * 0.5 - 2 as int) as c from t order by id",            # negative halves
+    "select id, cast(-id * 0.5 as bigint) as c from t order by id",
+    "select id, cast(i * 0.5 as int) as c from t order by id",
+    "select id, cast((id - 6) * 0.25 as smallint) as c from t order by id",
+    "select id, cast(2.5 * id - 7.5 as int) as c from t order by id",
+    "select id, cast(id + 0.5 as int) as c from t order by id",
+    "select id, cast(id * 0.5 as double) as c from t order by id",
+    "select id, cast(f * 0.5 as int) as c from t where f = f and f < 1000 order by id",    # a float column: half to even
+    "select id, cast(r * 0.5 as int) as c from t order by id",
+    "select id, cast(id * 0.5e0 as int) as c from t order by id",              # an exponent literal is a DOUBLE: half to even
+    "select id, cast(h as int) as c from t order by id",
+]
+
+
+@pytest.mark.parametrize("q", DECIMAL_CAST)
+def test_cast_of_decimal_rounds_half_away_from_zero(q, cfg):
+    got, want, _, _ = _run(q, cfg[0])
+    assert _same(got, want), (q, got, want)
+
+
+def test_cast_decimal_values(cfg):
+    got, _, _, _ = _run("select cast(id * 0.5 as int) as c from t order by id limit 6", cfg[0])
+    assert got == [(0,), (1,), (1,), (2,), (2,), (3,)]            # 0 .5 -> 1 (not 0), 1.5 -> 2, 2.5 -> 3
+
+
+@pytest.mark.parametrize("q", ["select cast(s as int) as c from t", "select min(cast(s as int)) as c from t",
+                               "select cast(d as double) as c from t", "select cast(ds as bigint) as c from t",
+                               "select cast(coalesce(s, 'x') as int) as c from t"])
+def test_cast_from_a_non_number_is_not_supported(q, cfg):
+    with pytest.raises(NotImplementedError):
+        mx.sql(q, t=T).compute(device=cfg[0])

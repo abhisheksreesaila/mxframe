@@ -399,6 +399,13 @@ AGG = {
     "min_max_case_big": "select min(case when id > 3 then big end) as a, max(case when id > 3 then big end) as b from t",
     "grouped_max_coalesce_big": "select g, max(coalesce(big, 5)) as m from t group by g order by g",
     "grouped_min_case_big_else": "select g, min(case when id > 3 then big else 9223372036854775807 end) as m from t group by g order by g",
+    "max_abs_big": "select max(abs(big)) as a, min(abs(big)) as b from t",
+    "max_abs_big_shifted": "select max(abs(big - 2305843009213693952)) as a, min(abs(big - 2305843009213693952)) as b from t",
+    "grouped_max_big_plus": "select g, max(big + 1) as m, min(big - 1) as n from t group by g order by g",
+    "grouped_max_abs_cast": "select g, max(abs(cast(big as bigint))) as m from t group by g order by g",
+    "max_coalesce_small_int": "select max(coalesce(g, 5)) as a, min(coalesce(g, 5)) as b from t",
+    "max_coalesce_small_int_filled": "select max(coalesce(case when id > 99 then g end, 5)) as a from t",
+    "grouped_case_small_int": "select g, max(case when id > 3 then g else 1 end) as m from t group by g order by g",
     "grouped_big_two_columns": "select g, max(coalesce(big, id)) as m, min(coalesce(big, id)) as n from t group by g order by g",
 }
 
@@ -493,3 +500,28 @@ def test_constant_date_minus_interval_stays_a_day_number_next_to_an_integer_date
     got = mx.sql("select day from days where day <= date '1998-12-01' - interval '90' day order by day",
                  days=days).compute(device=cfg[0])
     assert got.column("day").to_pylist() == [d for d in (10_000, 10_400, 11_000, 11_300) if d <= cutoff] == [10_000, 10_400]
+
+
+# -- INTERVAL across a daylight-saving change: the interval is a fixed length in UTC, the session zone ---------
+
+DST = pa.table({"id": pa.array([0, 1, 2, 3], pa.int64()), "g": pa.array([0, 0, 1, 1], pa.int32()),
+                "zm": pa.array([int(np.datetime64(x, "ms").astype("int64")) for x in
+                                ("2024-03-09T06:59:00", "2024-03-10T06:59:00", "2024-03-10T07:01:00", "2024-11-03T05:30:00")],
+                               pa.int64()).cast(pa.timestamp("ms", "America/New_York"))})        # 2024-03-10 2:00 EST -> 3:00 EDT
+CON.register("_dst", DST)
+CON.execute("create table dst as select * from _dst")
+
+
+@pytest.mark.parametrize("q", [
+    "select id, zm + interval 1 day as c from dst order by id",
+    "select id, zm - interval 24 hour as c from dst order by id",
+    "select id, zm + interval 2 minute as c from dst order by id",
+    "select id from dst where zm + interval 1 day > timestamp '2024-03-11 06:59:30' order by id",
+    "select g, max(zm + interval 1 day) as m from dst group by g order by g",
+    "select g, min(zm - interval 1 hour) as m from dst group by g order by g",
+])
+def test_interval_across_a_dst_change_equals_duckdb(q, cfg):
+    want = CON.execute(q).to_arrow_table()
+    got = mx.sql(q, dst=DST).compute(device=cfg[0])
+    assert _rows(got) == _rows(want), (q, _rows(got), _rows(want))
+    assert [_kind(f.type) for f in got.schema] == [_kind(f.type) for f in want.schema]

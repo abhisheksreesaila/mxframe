@@ -2085,7 +2085,24 @@ class _SQLTranslator:
         if name is None:
             raise NotImplementedError(f"Unsupported SQL expression type: Cast: {node}")
         self._no_constants(node, node.this)
-        return self._expr(node.this).cast(name)
+        t = self._col_type(node.this)
+        if t is not None and not (pa.types.is_integer(t) or pa.types.is_floating(t)):
+            raise NotImplementedError(f"CAST of a {t} column to {node.to.sql(dialect='duckdb')} is not supported (numbers only)")
+        return self._expr(node.this).cast(name, decimal=name.startswith("int") and self._is_decimal_expr(node.this))
+
+    def _is_decimal_expr(self, node: sge.Expression) -> bool:
+        """True when DuckDB types ``node`` as DECIMAL: a DECIMAL literal (a point, no exponent) or + - * of one with
+        integers or other DECIMALs (`i * 0.5`); a float or double operand makes it a float."""
+        node = _unparen(node)
+        if _is_decimal_literal(node):
+            return True
+        if isinstance(node, sge.Neg):
+            return self._is_decimal_expr(node.this)
+        if isinstance(node, (sge.Add, sge.Sub, sge.Mul)):
+            a, b = node.this, node.expression
+            da, db = self._is_decimal_expr(a), self._is_decimal_expr(b)
+            return (da and (db or self._is_int_expr(b))) or (db and self._is_int_expr(a))
+        return False
 
     def _translate_case(self, node: sge.Case) -> Expr:
         ifs = node.args.get("ifs") or []

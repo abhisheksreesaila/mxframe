@@ -75,9 +75,10 @@ class Expr:
         """ABS(x), in the argument's own type."""
         return Expr("abs", self)
 
-    def cast(self, dtype: str) -> 'Expr':
-        """CAST(x AS dtype) for a number type: ``float32``, ``float64``, ``int8`` ... ``int64``."""
-        return Expr("cast", self, dtype)
+    def cast(self, dtype: str, decimal: bool = False) -> 'Expr':
+        """CAST(x AS dtype) for a number type: ``float32``, ``float64``, ``int8`` ... ``int64``. A float rounds
+        half to even into an integer; ``decimal=True`` (x is a SQL DECIMAL) rounds half away from zero."""
+        return Expr("cast", self, dtype, True) if decimal else Expr("cast", self, dtype)
 
     def add_us(self, micros: int) -> 'Expr':
         """A DATE or timestamp plus a fixed interval (microseconds, negative to subtract): a TIMESTAMP, like DuckDB."""
