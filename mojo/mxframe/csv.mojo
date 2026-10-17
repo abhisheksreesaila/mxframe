@@ -368,9 +368,21 @@ def _commas(n: Int) -> String:
     return out
 
 
+def _add_fail_in_order(mut fails: List[_Fail], var f: _Fail):
+    """Keeps a chunk's failed cells in row order (the first `_MAX_FAILED`), whichever pass found them."""
+    var at = len(fails)
+    while at > 0 and fails[at - 1].row > f.row:
+        at -= 1
+    if at >= _MAX_FAILED:
+        return
+    fails.insert(at, f^)
+    if len(fails) > _MAX_FAILED:
+        _ = fails.pop()
+
+
 def _scaled_text(v: Int64, scale: Int) -> String:
     """A stored decimal as written: 123456 at scale 2 is "1234.56"."""
-    var digits = String(abs(Int(v)))
+    var digits = String(UInt64(v) if v >= 0 else UInt64(0) - UInt64(v))  # INT64_MIN has no positive Int64
     while digits.byte_length() <= scale:
         digits = "0" + digits
     var cut = digits.byte_length() - scale
@@ -1041,9 +1053,8 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
                         dst[r] = 0
                         cc.nulls.append(r)
                         cc.fail_count += 1
-                        if len(cc.fails) < _MAX_FAILED:
-                            cc.fails.append(_Fail(r, _scaled_text(v, 2), "is too big to keep 4 decimal places " +
-                                                  "(the column needed them)"))
+                        _add_fail_in_order(cc.fails, _Fail(r, _scaled_text(v, 2),
+                                           "is too big to keep 4 decimal places (the column needed them)"))
                     else:
                         dst[r] = v * 100
                 for k in range(len(cc.wide_rows)):

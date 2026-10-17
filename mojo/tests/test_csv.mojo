@@ -399,6 +399,14 @@ def test_decimal_widens_to_scale_4() raises:
            "a value too big for scale 4 becomes a failed cell")
     expect(big.columns[0].failed_count == 1 and big.columns[0].failed[0].row == 1 and
            big.columns[0].failed[0].text == "92233720368547758.07", "reported with its row and text")
+    var mixed = read_csv(write_file("widenorder.csv", "x\n92233720368547758.07\n1.5\n1.x\n1.239\n"),
+                         CsvOptions(infer_rows=2, threads=1))
+    ref fails = mixed.columns[0].failed
+    expect(len(fails) == 2 and fails[0].row == 1 and fails[1].row == 3,
+           "failed cells come in row order whichever pass found them")
+    var low = read_csv(write_file("widenmin.csv", "x\n-92233720368547758.08\n1.239\n"), CsvOptions(infer_rows=1))
+    expect(low.columns[0].failed_count == 0 or not low.columns[0].failed[0].text.startswith("--"),
+           "a widened INT64_MIN is written with one minus sign")
 
 
 def test_overflow_inside_the_window_is_text() raises:
