@@ -1,7 +1,7 @@
 """F-056 step 3a: three things that used to be "decline with a warning or MemoryError" now finish, in bounded memory.
 
 1. Group state bigger than the budget: the partial of every batch is hash-partitioned to disk (Arrow IPC under
-   TMPDIR), each partition is merged on its own and the outputs are concatenated.
+   MXFRAME_SPILL_DIR), each partition is merged on its own and the outputs are concatenated.
 2. A query that returns rows (no aggregate): ORDER BY + LIMIT keeps a running top-k, LIMIT alone stops early, and a
    filter with no LIMIT concatenates when the result fits and raises a clear error naming the size when it does not.
 3. One row group bigger than the budget is read in slices of rows.
@@ -58,7 +58,7 @@ def _env(monkeypatch, tmp_path):
     monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", HOST)
     spill = tmp_path / "tmp"
     spill.mkdir()
-    monkeypatch.setenv("TMPDIR", str(spill))
+    monkeypatch.setenv("MXFRAME_SPILL_DIR", str(spill))
     return spill
 
 
@@ -180,6 +180,125 @@ def test_the_spill_directory_is_removed_after_a_success(big, _env):
     assert spill_leftovers(_env) == []
 
 
+def tiny_state(tmp_path, monkeypatch, budget="300K"):
+    """100k groups (2.4 MB of partials) under a 300 KB budget: one of 16 partitions (150 KB, x4) is still too big, so
+    it splits again."""
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", budget)
+    n = 100_000
+    idx = np.arange(n)
+    t = pa.table({"k": ((idx * 7919) % 100_000).astype(np.int64), "v": (idx % 10).astype(np.float64)})
+    path = str(tmp_path / "t.parquet")
+    pq.write_table(t, path, row_group_size=5_000)
+    lf = (scan_parquet(path).groupby("k").agg(col("v").sum().alias("sv"), col("v").count().alias("n"))
+          .sort("sv", "k", descending=[True, False]).limit(5))
+    want = duck_file("SELECT k, sum(v) AS sv, count(v) AS n FROM t GROUP BY k ORDER BY sv DESC, k LIMIT 5", path)
+    return lf, want
+
+
+def test_a_partition_that_is_still_too_big_is_split_again(tmp_path, monkeypatch, _env):
+    lf, want = tiny_state(tmp_path, monkeypatch)
+    got = run(lf, "cpu")
+    assert prov(lf)["streamed"]["spill"]["depth"] >= 2
+    assert prov(lf)["streamed"]["spill"]["partitions"] >= 16 + 2 * 16 // 2        # the second level split some partitions
+    same(got, want)
+    assert spill_leftovers(_env) == []
+
+
+def test_splitting_past_the_depth_limit_raises_a_memory_error_and_cleans_up(tmp_path, monkeypatch, _env):
+    from mxframe import streamed
+    lf, _ = tiny_state(tmp_path, monkeypatch)
+    monkeypatch.setattr(streamed._spill, "MAX_DEPTH", 1)
+    with pytest.raises(MemoryError, match=r"too big to merge in the host memory budget .* after splitting the groups 1 times"):
+        run(lf, "cpu")
+    assert spill_leftovers(_env) == []
+
+
+def test_the_spill_directory_is_removed_after_a_keyboard_interrupt(big, _env, monkeypatch):
+    from mxframe import streamed
+
+    def interrupt(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(streamed, "_read_partition", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        run(light_groups(big), "cpu")
+    assert spill_leftovers(_env) == []
+
+
+def test_a_full_disk_is_reported_as_a_spill_failure_naming_the_directory(big, _env, monkeypatch):
+    from mxframe import spill
+    real = pa.ipc.new_stream
+    calls = []
+
+    def full(*a, **k):
+        calls.append(1)
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(spill.pa.ipc, "new_stream", full)
+    with pytest.raises(spill.SpillError, match=rf"spilling group state to {_env}/mxframe-spill-.* failed after about [\d,]+ bytes were written: .*No space left"):
+        run(light_groups(big), "cpu")
+    assert calls and spill_leftovers(_env) == []
+    monkeypatch.setattr(spill.pa.ipc, "new_stream", real)
+
+
+def test_too_little_free_space_is_reported_before_writing(big, _env, monkeypatch):
+    from mxframe import spill
+    monkeypatch.setattr(spill.shutil, "disk_usage", lambda p: type("U", (), {"free": 1000})())
+    with pytest.raises(spill.SpillError, match=rf"not enough disk space to spill group state: {_env}/mxframe-spill-.* has 1,000 bytes free, [\d,]+ are needed"):
+        run(light_groups(big), "cpu")
+    assert spill_leftovers(_env) == []
+
+
+def test_an_unwritable_spill_directory_is_reported(big, monkeypatch, tmp_path):
+    from mxframe import spill
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setenv("MXFRAME_SPILL_DIR", str(blocker / "sub"))
+    with pytest.raises(spill.SpillError, match=r"spill directory .*file/sub cannot be created .*MXFRAME_SPILL_DIR"):
+        run(light_groups(big), "cpu")
+
+
+def test_the_default_spill_directory_is_on_disk_not_tmpdir(monkeypatch, tmp_path):
+    from mxframe import spill
+    monkeypatch.delenv("MXFRAME_SPILL_DIR")
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmpfs"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    assert spill.spill_base() == str(tmp_path / "cache" / "mxframe" / "spill")
+    monkeypatch.delenv("XDG_CACHE_HOME")
+    assert spill.spill_base() == os.path.join(os.path.expanduser("~"), ".cache", "mxframe", "spill")
+
+
+def test_a_spill_directory_in_ram_warns(big, _env, monkeypatch):
+    from mxframe import spill
+    monkeypatch.setattr(spill, "ram_backed", lambda path: "tmpfs")
+    with pytest.warns(RuntimeWarning, match=rf"spill directory {_env} is on tmpfs \(RAM\).*MXFRAME_SPILL_DIR"):
+        lf = light_groups(big)
+        lf.compute(device="cpu")
+
+
+def test_ram_backed_reads_the_mount_table(tmp_path, monkeypatch):
+    from mxframe import spill
+    here = str(tmp_path.resolve())
+    table = f"/dev/sda1 / ext4 rw 0 0\ntmpfs {here} tmpfs rw 0 0\n"
+    import builtins
+    real = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: __import__("io").StringIO(table) if p == "/proc/mounts" else real(p, *a, **k))
+    assert spill.ram_backed(here + "/x/y") == "tmpfs"
+    assert spill.ram_backed("/home/someone") is None
+
+
+def test_spill_folders_of_dead_processes_are_removed_and_live_ones_kept(big, _env):
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    (_env / f"mxframe-spill-{dead.pid}-abc").mkdir()
+    (_env / f"mxframe-spill-{dead.pid}-abc" / "s1").write_text("stale")
+    live = _env / f"mxframe-spill-{os.getppid()}-live"
+    live.mkdir()
+    (_env / "unrelated").mkdir()
+    run(light_groups(big), "cpu")
+    assert spill_leftovers(_env) == sorted([live.name, "unrelated"])
+
+
 def test_the_spill_directory_is_removed_after_an_error(big, _env, monkeypatch):
     from mxframe import streamed
     seen = {}
@@ -225,7 +344,7 @@ PEAK = textwrap.dedent("""
 
 def peak(path, mode, budget, tmp):
     import conftest
-    env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, TMPDIR=str(tmp),
+    env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, MXFRAME_SPILL_DIR=str(tmp),
                PYTHONPATH=os.pathsep.join([str(conftest._shim)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
     out = subprocess.run([sys.executable, "-c", PEAK, path, mode], env=env, capture_output=True, text=True, check=True,
                          timeout=600)
@@ -393,3 +512,45 @@ def test_peak_memory_of_a_row_group_bigger_than_the_budget_is_bounded(one_group,
     out = peak(one_group, "one", "3M", _env)
     assert out["path"] == "streamed" and out["rows"] == 50
     assert out["arrow_peak"] < 3 << 20, out
+
+
+def test_a_slice_read_out_of_step_with_the_batch_loop_raises(one_group, monkeypatch):
+    """The slice iterator and the batch loop count slices separately; a plan that read the streamed file twice in a
+    batch would silently skip rows, so it raises."""
+    from mxframe import io_parquet
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "3M")
+    real = io_parquet._next_slice
+    seen = []
+
+    def twice(st, *a, **k):
+        seen.append(st.slice_no)
+        real(st, *a, **k)
+        return real(st, *a, **k)
+
+    monkeypatch.setattr(io_parquet, "_next_slice", twice)
+    lf = scan_parquet(one_group).groupby("g2").agg(col("q").sum().alias("sq"))
+    with pytest.raises(RuntimeError, match=r"slice 0 of .* was asked for but the reader is at slice 1"):
+        run(lf, "cpu")
+
+
+def test_memory_held_elsewhere_lowers_the_size_at_which_a_merge_spills(_env):
+    """The same partials merge in memory with nothing held and spill when resident tables / the sink hold most of the
+    budget: the merge trigger counts what the query already holds."""
+    from mxframe import spill, streamed
+    n = 20_000
+    tab = pa.table({"k": np.arange(n, dtype=np.int64), "v": np.ones(n)})
+    path = os.path.join(str(_env), "h.parquet")
+    pq.write_table(tab, path)
+    spec = streamed._spec(scan_parquet(path).groupby("k").agg(col("v").sum().alias("sv")).plan)
+    streamed._argument_types(spec)
+    partial = pa.table({"k": tab.column("k"), "__p0": tab.column("v")})
+    results = {}
+    for held in (0, 2_000_000):
+        root = spill.SpillDir()
+        state = streamed._State(spec, 4_000_000, None, root, held=lambda h=held: h)
+        state.add(partial)
+        state.add(partial)
+        state.merge()
+        results[held] = state.spilled
+        root.close()
+    assert results == {0: False, 2_000_000: True}

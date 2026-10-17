@@ -239,6 +239,7 @@ class Plan:
     all_groups: int
     top: LogicalPlan = None             # the node whose output the batches produce: the aggregate, or the top of the row-local part
     slice_rows: dict = dataclasses.field(default_factory=dict)      # row group -> rows per slice (a group bigger than a batch)
+    resident: int = 0                   # bytes of the dimension tables kept for all batches
     prune: bool = False                 # rows: select only the columns the plan reads (a bare Filter over the file)
 
 
@@ -332,7 +333,7 @@ def analyse(plan, budget: int, device: str, reproducible: bool):
         size += b
     if cur:
         batches.append(cur)
-    return Plan(spec, big, batches, batch, cap, budget, md.num_row_groups, top, slices, prune)
+    return Plan(spec, big, batches, batch, cap, budget, md.num_row_groups, top, slices, int(others * RESIDENT_FACTOR), prune)
 
 
 # --- running the batches and merging ------------------------------------------------------------------------
@@ -363,8 +364,9 @@ class _State:
     later partial go to hash partitions on disk, and `pieces()` merges one partition at a time (splitting a
     partition again, with another salt, if even that one is too big)."""
 
-    def __init__(self, spec: _Spec, budget: int, probe=None, root=None, salt: int = 0, depth: int = 0):
+    def __init__(self, spec: _Spec, budget: int, probe=None, root=None, salt: int = 0, depth: int = 0, held=None):
         self.spec, self.budget, self.probe = spec, budget, probe
+        self.held = held or (lambda: 0)          # bytes the query holds elsewhere: resident tables, the sink
         self.root, self.salt, self.depth = root, salt, depth
         self.merged: Optional[pa.Table] = None
         self.pending: List[pa.Table] = []
@@ -399,7 +401,7 @@ class _State:
         if not parts:
             return
         size = sum(p.nbytes for p in parts)
-        if size * MERGE_FACTOR > self.budget:               # merging this much would pass the budget: spill instead
+        if size * MERGE_FACTOR > max(self.budget - self.held(), self.budget // 16):               # merging this much would pass the budget: spill instead
             if self.root is None or self.depth >= _spill.MAX_DEPTH:
                 raise MemoryError(
                     f"group state of {sum(p.num_rows for p in parts):,} partial groups ({fmt_bytes(size)}) is too big "
@@ -432,7 +434,7 @@ class _State:
             return
         self.parts.finish()
         for i in range(_spill.PARTITIONS):
-            sub = _State(self.spec, self.budget, None, self.root, self.salt + 1, self.depth + 1)
+            sub = _State(self.spec, self.budget, None, self.root, self.salt + 1, self.depth + 1, self.held)
             sub.key_types = self.key_types
             for t in _read_partition(self.parts, i):
                 sub.add(t)
@@ -604,12 +606,13 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     root = _spill.SpillDir()
     sink, state, batches_run, rows_info = None, None, 0, None
     n_slices = Counter(b[0] for b in got.batches if len(b) == 1 and b[0] in got.slice_rows)
-    if spec is None:
-        sink = _sink_for(plan, got.top, budget, budget // WORKING_FACTOR, budget)
+    free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
+    if spec is None:                                        # a batch of input is in flight while rows are collected
+        sink = _sink_for(plan, got.top, max(free - got.batch_target, budget // 8), free // WORKING_FACTOR, budget)
     token = _active.set(True)
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
-            state = _State(spec, budget, probe, root) if spec else None
+            state = _State(spec, budget, probe, root, held=lambda: got.resident + (sink.bytes if sink else 0)) if spec else None
             for batch in got.batches:
                 st.groups = tuple(batch)
                 st.slice_rows = got.slice_rows.get(batch[0]) if len(batch) == 1 else None
@@ -652,7 +655,7 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                 table = merged
             else:
                 if spec is not None:                                 # spilled groups: one partition at a time
-                    sink = _sink_for(plan, got.top, budget, budget // WORKING_FACTOR, budget)
+                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget)
                     rowwise = got.top is not spec.agg
                     for piece in state.pieces():
                         out = state.format(piece)

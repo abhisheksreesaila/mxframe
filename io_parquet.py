@@ -173,11 +173,19 @@ def _next_slice(st, pf, path, columns, groups, dict_cols, md) -> pa.Table:
     import pyarrow.parquet as pq
 
     def open_iter():
+        return [0, _open()]
+
+    def _open():
         f = pq.ParquetFile(path, read_dictionary=dict_cols or None, metadata=md, buffer_size=SLICE_BUFFER)
         return iter(f.iter_batches(batch_size=st.slice_rows, row_groups=list(groups),
                                    columns=list(columns) if columns else None, use_threads=True))
 
-    rb = next(st.once(("slices", os.path.abspath(path), tuple(groups)), open_iter), None)
+    state = st.once(("slices", os.path.abspath(path), tuple(groups)), open_iter)
+    if state[0] != st.slice_no:                  # the iterator and the batch loop must be on the same slice
+        raise RuntimeError(f"row group slice {st.slice_no} of {path} was asked for but the reader is at slice "
+                           f"{state[0]}: the streamed file was read more than once (or not at all) in a batch")
+    state[0] += 1
+    rb = next(state[1], None)
     if rb is None:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
     return pa.Table.from_batches([rb])
