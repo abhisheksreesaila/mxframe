@@ -944,7 +944,7 @@ Found by the F-092 developer and review (2026-10-16)
 - Built (2026-10-16): `_expr` looks a column up by its table alias in `_renamed` (the join renamed a clashing column `v` -> `v_right`, `v_right2`), the key a table matched on with a different name resolves to the left key (`z.v` in `ON z.v = y.v`). The select-list output keeps the written name (`v`, then `v_1`). `tests/test_sql_self_join.py` (81, cpu + gpu, F-092 self-join over `scan_parquet`): 73 fail on main. The two 'more than one joined table' cases of `test_sql_gaps` are removed (they work now); the guard stays for any shape not covered.
 - Not done: a bare `v` (no table) in a self-join stays the left table's (DuckDB calls it ambiguous).
 
-## F-100 SQL COALESCE and IS NULL over expressions [review]
+## F-100 SQL COALESCE and IS NULL over expressions [done]
 Found by the F-094 developer (2026-10-16)
 - [x] `COALESCE(expr, ...)` (and `IFNULL` / `NULLIF` if sqlglot parses them) and `expr IS NULL` over any expression (not only a column) are unsupported in the SQL front end. Map them onto the engine's null handling (`is_null` from F-086, a coalesce / fill_null expression), Arrow path; native where the bytecode can
 - [x] DuckDB-checked tests: COALESCE over columns / literals / expressions with NULLs in SELECT, WHERE, GROUP BY; NULLIF with zero divisors; `(a + b) IS NULL`; fails before
@@ -1016,7 +1016,7 @@ Tests: tests/test_f107_lock_reentry.py (3 deterministic, child processes with ti
 Full suite on this branch while other suites shared the GPUs (load 13-19): 10348 passed, 198 skipped, 4 xfailed in 15:51, no hang and no faulthandler dump (log kept at /tmp/f107_full.log).
 Review round 1: also drain in `begin_prepare` and `resident_count`; comment at `_dead_keys` on why a queued key cannot hit a new owner's entry.
 
-## F-108 SQL TIMESTAMP literals and temporal expressions in aggregates [review]
+## F-108 SQL TIMESTAMP literals and temporal expressions in aggregates [done]
 Found by the F-093 developer (2026-10-16)
 - [x] `TIMESTAMP '2024-01-01 10:00:00'` (and `CAST('...' AS TIMESTAMP)`) is unsupported in the SQL front end (`Unsupported SQL expression type: Cast ... TIMESTAMPNTZ`); map to a timestamp literal compared in the column's unit and zone like DuckDB
 - [x] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only); the same for a CASE with date results, and MIN / MAX of a CASE with string results (found in F-105: `_aggregate_with_nulls` evaluates the argument then casts it to float64, and `np_arrow.group_aggregate` has no string min / max; plain `min(s)` is answered elsewhere)
