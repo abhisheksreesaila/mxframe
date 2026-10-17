@@ -916,7 +916,7 @@ Found by the F-087 developer (2026-10-16); untested suspicion, important for rea
 - Built: `_SQLTranslator._resolve_names` (the single step: runs at the start of every `_build_select`, rewrites each `sge.Column` to the first case-insensitive match in its FROM scope, then SELECT aliases, then outer scopes for subqueries; the written text stays in the node's meta for `_default_agg_name`). Everything after it works on exact names: the `.lower()` calls on column names are gone (table names and aliases stay case-insensitive), `_dedupe` is case-insensitive, aliases keep their spelling (they were lowercased), USING takes each side's own spelling, a lone `*` renames a case-only repeat to `A_1`. `_source` is cached per translator so the extra scope lookup builds a FROM item once
 - Not done, found on the way: window functions and `FILTER (WHERE ...)` are unsupported in the SQL front end (clear NotImplementedError, no ticket yet); a non-key column that two joined tables spell differently by case only (`Region` / `region`) is not renamed `region_1` as DuckDB does; `SELECT * ... ORDER BY 1` (a position over a lone star) raises "needs a named SELECT column" (not case related)
 
-## F-096 SQL JOIN ON an expression [review]
+## F-096 SQL JOIN ON an expression [done]
 Found by the F-087 developer (2026-10-16)
 - [x] `JOIN u ON t.a + 1 = u.b` (and non-equi residual predicates `ON t.k = u.k AND t.x > u.y`) are unsupported; equi-join on computed keys (compute the key column first) and a residual filter after the equi-join, like DuckDB
 - [x] DuckDB-checked tests, inner and left (a residual on a left join filters matches, not rows); fails before
