@@ -220,8 +220,9 @@ def test_no_equality_with_small_inputs_runs():
 
 
 def test_a_condition_with_no_column_is_a_clear_error():
+    # (a constant comparison such as `1 = 1` is folded since F-122: tests/test_f122_constant_conditions.py)
     with pytest.raises(NotImplementedError, match="refers to no column"):
-        mx.sql("SELECT t.id FROM t JOIN u ON t.k = u.k AND 1 = 1", **_tables()).compute()
+        mx.sql("SELECT t.id FROM t JOIN u ON t.k = u.k AND 1 IS DISTINCT FROM 2", **_tables()).compute()
 
 
 def test_comma_join_with_a_non_equality_where():
