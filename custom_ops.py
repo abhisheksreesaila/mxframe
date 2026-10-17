@@ -24,7 +24,7 @@ from pathlib import Path
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import case_when_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
+from .compiler import case_when_arrow, coalesce_arrow, branch_values, abs_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -698,7 +698,7 @@ class CustomOpsCompiler(GraphCompiler):
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
         if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year", "is_null",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
-                       "window"):
+                       "window", "coalesce", "abs", "cast"):
             return True
         from .lazy_expr import Expr as _Expr
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
@@ -863,6 +863,12 @@ class CustomOpsCompiler(GraphCompiler):
             return case_when_arrow(self._eval_expr_arrow(args[0], table),
                                    *(case_literal(a.args[0]) if a.op == "lit" else self._eval_expr_arrow(a, table)
                                      for a in args[1:]))
+        if op == "coalesce":
+            return coalesce_arrow(*branch_values(args, lambda a: self._eval_expr_arrow(a, table)))
+        if op == "abs":
+            return abs_arrow(self._eval_expr_arrow(args[0], table))
+        if op == "cast":
+            return cast_arrow(self._eval_expr_arrow(args[0], table), args[1])
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
@@ -894,7 +900,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null"):
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null", "coalesce", "abs", "cast"):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
                 new_expr = _Expr("col", name)

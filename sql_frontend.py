@@ -29,7 +29,7 @@ import sqlglot
 import sqlglot.expressions as sge
 from typing import Any, Dict, List, Optional, Union
 
-from .lazy_expr import Expr, col, lit, when
+from .lazy_expr import Expr, col, lit, when, coalesce
 from .lazy_frame import (
     LazyFrame, LogicalPlan,
     Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Join, join_output_names, column_types,
@@ -1637,6 +1637,16 @@ class _SQLTranslator:
         if f is not None:
             return lit(f)
 
+        if isinstance(node, sge.Cast):
+            return self._cast(node)
+        if isinstance(node, sge.Coalesce):
+            return self._coalesce(node)
+        if isinstance(node, sge.Nullif):
+            return self._nullif(node)
+        if isinstance(node, sge.Abs):
+            self._no_constants(node, node.this)
+            return self._expr(node.this).abs()
+
         # ---- parentheses ----
         if isinstance(node, sge.Paren):
             return self._expr(node.this)
@@ -1765,6 +1775,10 @@ class _SQLTranslator:
             src = src.this
         if isinstance(src, sge.Case):                       # a CASE with a date result is a date
             return any(_date_of(r) is not None or self._is_date_col(r) for r in self._case_results(src))
+        if isinstance(src, sge.Coalesce):
+            return any(_date_of(a) is not None or self._is_date_col(a) for a in [src.this] + list(src.expressions))
+        if isinstance(src, sge.Nullif):
+            return self._is_date_col(src.this)
         t = self._col_type(src)
         return t is not None and pa.types.is_date(t)
 
@@ -1805,18 +1819,48 @@ class _SQLTranslator:
             raise NotImplementedError(f"{node.sql(dialect='duckdb')}: a test of constants only has no column to "
                                       "filter or compute on; put a column in it")
 
+    def _value(self, n: sge.Expression) -> Expr:
+        """A CASE result or COALESCE / NULLIF argument: NULL, TRUE / FALSE and DATE constants are allowed here
+        (they are not elsewhere); the rest as usual."""
+        d = _date_of(n)
+        if d is not None:
+            return lit(d)
+        if isinstance(n, (sge.Null, sge.Boolean)):
+            return lit(None if isinstance(n, sge.Null) else bool(n.this))
+        return self._expr(n)
+
+    def _coalesce(self, node: sge.Coalesce) -> Expr:
+        """``COALESCE(a, b, ...)`` / ``IFNULL``: the first non-NULL argument, of their common type."""
+        args = [node.this] + list(node.expressions)
+        self._no_constants(node, *args)
+        return coalesce(*(self._value(a) for a in args))
+
+    def _nullif(self, node: sge.Nullif) -> Expr:
+        """``NULLIF(a, b)``: NULL where ``a = b``, else ``a`` (the type of ``a``)."""
+        if isinstance(node.expression, sge.Null):
+            return self._value(node.this)
+        self._no_constants(node, node.this)
+        same = self._expr(sge.EQ(this=node.this.copy(), expression=node.expression.copy()))    # as `a = b` is written
+        return when(same, lit(None), self._value(node.this))
+
+    _CAST_NAMES = {sge.DataType.Type.FLOAT: "float32", sge.DataType.Type.DOUBLE: "float64",
+                   sge.DataType.Type.TINYINT: "int8", sge.DataType.Type.SMALLINT: "int16",
+                   sge.DataType.Type.INT: "int32", sge.DataType.Type.BIGINT: "int64"}
+
+    def _cast(self, node: sge.Cast) -> Expr:
+        """``CAST(x AS FLOAT | DOUBLE | TINYINT | SMALLINT | INT | BIGINT)``; other targets are unsupported."""
+        name = self._CAST_NAMES.get(node.to.this)
+        if name is None:
+            raise NotImplementedError(f"Unsupported SQL expression type: Cast: {node}")
+        self._no_constants(node, node.this)
+        return self._expr(node.this).cast(name)
+
     def _translate_case(self, node: sge.Case) -> Expr:
         ifs = node.args.get("ifs") or []
         default_node = node.args.get("default")
         if not ifs:
             raise ValueError("CASE requires at least one WHEN clause")
-        def branch(n):          # NULL, TRUE / FALSE and DATE constants only as a CASE result; the rest as usual
-            d = _date_of(n)
-            if d is not None:
-                return lit(d)
-            if isinstance(n, (sge.Null, sge.Boolean)):
-                return lit(None if isinstance(n, sge.Null) else bool(n.this))
-            return self._expr(n)
+        branch = self._value
         otherwise: Expr = branch(default_node) if default_node else lit(None)         # no ELSE is ELSE NULL
         # Build right-to-left so the first WHEN is outermost
         for if_node in reversed(ifs):
@@ -1857,6 +1901,13 @@ class _SQLTranslator:
         if isinstance(node, (sge.Add, sge.Sub, sge.Mul, sge.Div)):
             kinds = {self._ftype(node.this), self._ftype(node.expression)}
             return "f64" if "f64" in kinds else "f32" if "f32" in kinds else None
+        if isinstance(node, (sge.Abs, sge.Nullif)):
+            return self._ftype(node.this)
+        if isinstance(node, sge.Coalesce):                  # DOUBLE if any argument is, else FLOAT if any is
+            kinds = {self._ftype(a) for a in [node.this] + list(node.expressions)}
+            return "f64" if "f64" in kinds else "f32" if "f32" in kinds else None
+        if isinstance(node, sge.Cast):
+            return {"float32": "f32", "float64": "f64"}.get(self._CAST_NAMES.get(node.to.this))
         t = self._col_type(node)
         return "f32" if t is not None and pa.types.is_float32(t) else "f64" if t is not None and pa.types.is_float64(t) else None
 
@@ -1915,6 +1966,10 @@ class _SQLTranslator:
             return True
         if isinstance(node, (sge.Min, sge.Max)):               # not SUM: the engine returns it as a double until F-060
             return self._is_int_expr(node.this)
+        if isinstance(node, (sge.Abs, sge.Nullif)):
+            return self._is_int_expr(node.this)
+        if isinstance(node, sge.Coalesce):
+            return all(self._is_int_expr(a) for a in [node.this] + list(node.expressions) if not isinstance(a, sge.Null))
         if isinstance(node, sge.Case):                          # integer results (a NULL branch takes the other's type)
             res = [r for r in self._case_results(node) if not isinstance(r, sge.Null)]
             return bool(res) and all(self._is_int_expr(r) for r in res)
