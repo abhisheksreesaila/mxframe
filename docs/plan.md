@@ -1064,3 +1064,10 @@ Found in the F-108 review (2026-10-16); also on main
 - Built (2026-10-16): a SELECT item goes through `_value` (the CASE / COALESCE path of F-108), so a DATE constant that is an output is a date32; comparisons never reach it and keep the day number against an int32 column. `DATE +/- INTERVAL` as an output is a TIMESTAMP (us), as DuckDB (the ticket said date32; probed). Root cause behind derived tables: a zero-row Project of a string / date literal had type null (`_eval_expr_arrow` `lit`), so `FROM (select date '..' as c ...) WHERE c > DATE '..'` took the date for a day number. `_no_constants` counts date constants, so `coalesce(NULL, DATE '..')` is refused like `coalesce(NULL, 5)` instead of crashing. `tests/test_f115_sql_date_output.py` (99, cpu + gpu, native on and off; the int32 day column is a DATE in the DuckDB reference, which refuses INTEGER vs DATE). `native_coverage.py --sf 1` and `--sql` output identical to before; `pixi run test -k tpch` 314 passed.
 - Not done, found on the way (also on main): a constant next to an aggregate (`select g, 1 as c, count(*) ... group by g`) raises "must appear in the GROUP BY"; `(select date '..')` as a scalar subquery; `min(date '..')`; `extract(year from date '..')` on a bare literal.
 
+
+## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [todo]
+Found by the F-114 / F-115 developer (2026-10-16)
+- [ ] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
+- [ ] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
+- [ ] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
+- [ ] DuckDB-checked tests for each; fails before
