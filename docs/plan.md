@@ -86,10 +86,10 @@ Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Rout
 - [ ] measured on a quiet machine: auto within 10% of min(cpu, gpu) on every query, faster than both on the shapes the split targets (high-volume aggregation on resident data). Not run (machine shared). Rough, noisy hint on the loaded box (12M rows, 4 groups, 5 aggregates, resident, min of 15): CPU alone 15.5 ms, forced split at GPU share 0.3 / 0.5 / 0.7 = 11.8 / 8.8 / 6.5 ms, GPU alone 4.3 ms: here the resident GPU alone beats any split, as the model says for a query this cheap per row
 - Tests added (2026-10-16): `tests/test_f057_coproc.py` (residency of three source kinds, changed file, pushed filters, native range partials against the pipeline kernel incl. NaN, forced splits at 0.25 / 0.6 / 1.0 equal `device="cpu"` and DuckDB for grouped / global / NaN, the CPU share is the executor and not the old kernel, predicate over 13 shapes, `plan_split` numbers, explain numbers, upload queued on host data, end to end auto split after the upload on the real GPU); `tests/test_f053_auto_native.py` updated for residency-gated splits
 
-## F-058 Core gate scoreboard [todo]
-Needs: F-055, F-056, F-057 · Quiet machine only
-- [ ] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (warm, labelled) and `auto`, against DuckDB and Polars, every result checked against DuckDB
-- [ ] each device beats DuckDB on at least 90% of queries; the misses listed with a reason (close misses are fine for the gate; the long tail is chased later, after the rings start, per Abhishek 2026-10-15)
+## F-058 Core gate scoreboard [doing]
+Needs: F-055, F-056, F-057 · Quiet machine only · Report: `docs/bench/f058-report.md`
+- [x] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (cold) and `auto`, against DuckDB and Polars, every result checked against DuckDB (2026-10-17): all 388 MXFrame results equal DuckDB. SF10 cpu 2.67 s / auto 2.75 / DuckDB 4.83 / Polars 11.58; SF1 445 / 482 / 618 / 1,307 ms; random auto vs DuckDB 0.99x (SF1), 1.35x (SF1 shuffled), 1.38x (SF10). The first pass found auto at 11.7 s (F-128) and two small-query regressions (F-130); spill at 512 MB measured and sped up (F-129). `gpu` was measured cold only (0/22 wins against cpu); warm, resident GPU runs are F-057's open item
+- [ ] each device beats DuckDB on at least 90% of queries: NOT met. auto beats DuckDB on 10/22 TPC-H at SF10 (8/22 shuffled, 8/22 SF1), 49-78% of random queries; faster in total at every scale. Misses (report table): multi-stage queries Q17, Q11, Q22, Q20 (2.1-2.3x: several computes with Python between them) and the lineitem x orders family Q12, Q3, Q18 (1.2-1.6x); Q6, Q10, Q16, Q8, Q15 close
 - [ ] when it passes: the rings below can start
 
 ## Rings (after the core gate, not before)

@@ -1,5 +1,12 @@
 # 📊 MXFrame — TPC-H Benchmarks
 
+> **Current headline (2026-10-17, F-058):** engine-only first runs, [bench/f058-report.md](bench/f058-report.md).
+> TPC-H SF10: MXFrame `cpu` 2.67 s, `auto` 2.75 s, DuckDB 4.83 s, Polars 11.58 s; SF1 445 / 482 / 618 / 1,307 ms.
+> MXFrame is faster in total at every scale, but DuckDB still wins 12 of 22 queries at SF10 (multi-stage Q17, Q11,
+> Q22, Q20 and the lineitem x orders family). Random queries vs DuckDB (geo. mean): 0.99x SF1, 1.35x SF1 shuffled,
+> 1.38x SF10. Data bigger than memory: SF10 joins under a 512 MB budget finish and equal DuckDB (DuckDB runs out of
+> memory on one), 2-4x slower than DuckDB under the same limit. The 0.6.0 headline below is kept for history.
+
 > **Current headline (0.6.0, 2026-10-14):** engine-only first runs on a quiet machine, in
 > [bench/m2s-engine.md](bench/m2s-engine.md) (shuffled rows: [bench/m2s-engine-shuffled.md](bench/m2s-engine-shuffled.md);
 > random queries: [SF1](bench/random-sf1-m2s.md), [SF1 shuffled](bench/random-sf1-shuffled-m2s.md),

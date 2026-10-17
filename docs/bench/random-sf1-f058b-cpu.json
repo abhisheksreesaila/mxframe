@@ -1,0 +1,3350 @@
+[
+ {
+  "seed": 0,
+  "shape": "topn",
+  "sql": "SELECT c_custkey, c_acctbal FROM customer WHERE (c_mktsegment IN ('BUILDING', 'FURNITURE', 'MACHINERY')) AND (c_acctbal < 3166.7) ORDER BY c_acctbal ASC, c_custkey ASC LIMIT 200",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 0,
+   "ms": 3.3785590203478932,
+   "rows": 200
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 0,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 6.208768987562507,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 0,
+   "ms": 2.801969996653497,
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 1,
+  "shape": "join",
+  "sql": "SELECT l_linestatus, SUM(l_extendedprice * (1 - l_discount)) AS a0, AVG(l_quantity) AS a1, MAX(l_extendedprice * (1 - l_discount)) AS a2 FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN supplier ON l_suppkey = s_suppkey WHERE (l_extendedprice < 10826.64) AND (o_orderpriority IN ('4-NOT SPECIFIED', '5-LOW')) AND (l_shipinstruct = 'TAKE BACK RETURN') GROUP BY l_linestatus ORDER BY a0 DESC, l_linestatus ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 1,
+   "ms": 36.6076759819407,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 1,
+   "paths": "native@cpu x1",
+   "ms": 24.41421800176613,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 1,
+   "ms": 34.00895599042997,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 2,
+  "shape": "agg",
+  "sql": "SELECT l_linestatus, l_shipmode, AVG(l_extendedprice) AS a0, AVG(l_extendedprice) AS a1, COUNT(l_tax) AS a2 FROM lineitem WHERE TRUE GROUP BY l_linestatus, l_shipmode",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 2,
+   "ms": 15.893747011432424,
+   "rows": 14
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 2,
+   "paths": "native@cpu x1",
+   "ms": 5.611981003312394,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 14,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 2,
+   "ms": 157.0706210040953,
+   "rows": 14,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 3,
+  "shape": "join",
+  "sql": "SELECT s_nationkey, p_size, SUM(p_size) AS a0, AVG(l_tax) AS a1 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN part ON l_partkey = p_partkey WHERE TRUE GROUP BY s_nationkey, p_size",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 3,
+   "ms": 14.274212007876486,
+   "rows": 1250
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 3,
+   "paths": "native@cpu x1",
+   "ms": 15.619607002008706,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1250,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 3,
+   "ms": 198.38149199495092,
+   "rows": 1250,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 4,
+  "shape": "join",
+  "sql": "SELECT o_orderpriority, o_orderstatus, SUM(o_totalprice) AS a0, COUNT(c_acctbal) AS a1, MIN(o_totalprice) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey WHERE (o_totalprice < 144409.04) AND (o_orderdate >= 8952 AND o_orderdate <= 9240) AND (c_acctbal < 6265.79) GROUP BY o_orderpriority, o_orderstatus HAVING COUNT(c_acctbal) > 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 4,
+   "ms": 11.45536100375466,
+   "rows": 15
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 4,
+   "paths": "native@cpu x1",
+   "ms": 7.263265986694023,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 15,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 4,
+   "ms": 10.574184998404235,
+   "rows": 15,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 5,
+  "shape": "join",
+  "sql": "SELECT p_container, SUM(s_acctbal) AS a0, AVG(ps_availqty) AS a1, AVG(ps_supplycost) AS a2, SUM(ps_supplycost) AS a3 FROM partsupp JOIN part ON ps_partkey = p_partkey JOIN supplier ON ps_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey WHERE TRUE GROUP BY p_container ORDER BY a0 DESC, p_container ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 5,
+   "ms": 15.651738009182736,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 5,
+   "paths": "native@cpu x1",
+   "ms": 7.053256005747244,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 5,
+   "ms": 43.211223994148895,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 6,
+  "shape": "agg",
+  "sql": "SELECT p_mfgr, p_size, SUM(p_size) AS a0 FROM part WHERE (p_size < 43) AND (p_mfgr IN ('Manufacturer#1', 'Manufacturer#2', 'Manufacturer#3', 'Manufacturer#5')) GROUP BY p_mfgr, p_size",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 6,
+   "ms": 7.811934017809108,
+   "rows": 168
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 6,
+   "paths": "native@cpu x1",
+   "ms": 11.423901014495641,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 168,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 6,
+   "ms": 6.096989003708586,
+   "rows": 168,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 7,
+  "shape": "global",
+  "sql": "SELECT MAX(l_extendedprice * (1 - l_discount)) AS a0 FROM lineitem WHERE (l_quantity < 24.0) AND (l_extendedprice >= 5087.0 AND l_extendedprice <= 19458.72) AND (l_returnflag <> 'A')",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 7,
+   "ms": 8.544950978830457,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 7,
+   "paths": "native@cpu x1",
+   "ms": 7.23867499618791,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 7,
+   "ms": 14.290132006863132,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 8,
+  "shape": "join",
+  "sql": "SELECT p_type, MAX(ps_availqty) AS a0, MAX(s_acctbal) AS a1 FROM partsupp JOIN part ON ps_partkey = p_partkey JOIN supplier ON ps_suppkey = s_suppkey WHERE TRUE GROUP BY p_type ORDER BY a0 DESC, p_type ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 8,
+   "ms": 17.37369198235683,
+   "rows": 150
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 8,
+   "paths": "native@cpu x1",
+   "ms": 6.560627982253209,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 150,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 8,
+   "ms": 42.11145802401006,
+   "rows": 150,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 9,
+  "shape": "distinct",
+  "sql": "SELECT ps_partkey, COUNT(DISTINCT p_container) AS n FROM partsupp JOIN part ON ps_partkey = p_partkey WHERE (p_mfgr = 'Manufacturer#3') GROUP BY ps_partkey ORDER BY n DESC, ps_partkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 9,
+   "ms": 13.0532160110306,
+   "rows": 40304
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 9,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 13.865033019101247,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call_count_distinct"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 40304,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 9,
+   "ms": 12.342418020125479,
+   "rows": 40304,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 10,
+  "shape": "agg",
+  "sql": "SELECT c_mktsegment, c_nationkey, SUM(c_acctbal) AS a0, SUM(c_acctbal) AS a1, MAX(c_acctbal) AS a2 FROM customer WHERE (c_acctbal >= 5817.34) AND (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE', 'MACHINERY')) GROUP BY c_mktsegment, c_nationkey ORDER BY a0 DESC, c_mktsegment ASC, c_nationkey ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 10,
+   "ms": 6.191018997924402,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 10,
+   "paths": "native@cpu x1",
+   "ms": 9.424738003872335,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 10,
+   "ms": 3.3325779950246215,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 11,
+  "shape": "distinct",
+  "sql": "SELECT p_partkey, COUNT(DISTINCT p_size) AS n FROM part WHERE (p_mfgr IN ('Manufacturer#1', 'Manufacturer#2', 'Manufacturer#4', 'Manufacturer#5')) AND (p_brand IN ('Brand#13', 'Brand#43')) AND (p_size >= 3 AND p_size <= 13) GROUP BY p_partkey ORDER BY n DESC, p_partkey ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 11,
+   "ms": 5.404541996540502,
+   "rows": 100
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 11,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 9.214909019647166,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct",
+    "_call_gather"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 11,
+   "ms": 2.7452910144347697,
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 12,
+  "shape": "distinct",
+  "sql": "SELECT c_nationkey, COUNT(DISTINCT o_orderpriority) AS n FROM orders JOIN customer ON o_custkey = c_custkey WHERE (o_orderdate >= 10008) AND (o_orderpriority IN ('1-URGENT', '2-HIGH', '3-MEDIUM', '5-LOW')) AND (o_orderstatus <> 'O') GROUP BY c_nationkey HAVING COUNT(DISTINCT o_orderpriority) > 1 ORDER BY n DESC, c_nationkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 12,
+   "ms": 3.5586479934863746,
+   "rows": 0
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 12,
+   "paths": "cpu_aot@cpu x1",
+   "ms": 13.675514026544988,
+   "native_calls": [
+    "_call_filter"
+   ],
+   "decline_counts": {
+    "count distinct: empty input": 1,
+    "empty input": 2
+   },
+   "declines": [
+    "count distinct: empty input",
+    "empty input"
+   ],
+   "rows": 0,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 12,
+   "ms": 4.533383995294571,
+   "rows": 0,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 13,
+  "shape": "join",
+  "sql": "SELECT o_orderstatus, COUNT(c_acctbal) AS a0, SUM(c_acctbal) AS a1 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (n_name <> 'RUSSIA') GROUP BY o_orderstatus HAVING COUNT(c_acctbal) > 20",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 13,
+   "ms": 9.433138999156654,
+   "rows": 3
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 13,
+   "paths": "native@cpu x1",
+   "ms": 13.36807498591952,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 13,
+   "ms": 82.01362399267964,
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 14,
+  "shape": "agg",
+  "sql": "SELECT o_custkey, o_orderpriority, o_orderstatus, SUM(o_totalprice) AS a0, MIN(o_totalprice) AS a1, MIN(o_totalprice) AS a2 FROM orders WHERE (o_orderpriority = '4-NOT SPECIFIED') AND (o_totalprice >= 166120.84) GROUP BY o_custkey, o_orderpriority, o_orderstatus ORDER BY a0 DESC, o_custkey ASC, o_orderpriority ASC, o_orderstatus ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 14,
+   "ms": 10.859693982638419,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 14,
+   "paths": "native@cpu x1",
+   "ms": 24.781676998827606,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 14,
+   "ms": 20.35331100341864,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 15,
+  "shape": "join",
+  "sql": "SELECT o_orderstatus, l_shipinstruct, l_linestatus, MAX(o_totalprice) AS a0, MAX(l_discount) AS a1, SUM(p_size) AS a2 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN orders ON l_orderkey = o_orderkey JOIN part ON l_partkey = p_partkey WHERE (l_quantity < 43.0) GROUP BY o_orderstatus, l_shipinstruct, l_linestatus ORDER BY a0 DESC, o_orderstatus ASC, l_shipinstruct ASC, l_linestatus ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 15,
+   "ms": 62.961297982838005,
+   "rows": 16
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 15,
+   "paths": "native@cpu x1",
+   "ms": 24.78816598886624,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 16,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 15,
+   "ms": 515.8373439917341,
+   "rows": 16,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 16,
+  "shape": "global",
+  "sql": "SELECT MIN(p_size) AS a0, COUNT(p_size) AS a1, SUM(p_size) AS a2 FROM part WHERE (p_container IN ('MED BAG', 'SM CAN')) AND (p_type <> 'MEDIUM BRUSHED COPPER') AND (p_size < 19)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 16,
+   "ms": 2.2131630103103817,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 16,
+   "paths": "native@cpu x1",
+   "ms": 8.191413013264537,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 16,
+   "ms": 1.4918250089976937,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 17,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT n_name, c_mktsegment FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE (c_acctbal < -784.52) AND (c_mktsegment <> 'HOUSEHOLD')",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 17,
+   "ms": 4.058096994413063,
+   "rows": 100
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 17,
+   "paths": "native@cpu x1",
+   "ms": 8.831350016407669,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 17,
+   "ms": 1.799813995603472,
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 18,
+  "shape": "join",
+  "sql": "SELECT p_brand, l_shipinstruct, COUNT(l_quantity) AS a0, MIN(p_size) AS a1, SUM(o_totalprice) AS a2 FROM lineitem JOIN part ON l_partkey = p_partkey JOIN supplier ON l_suppkey = s_suppkey JOIN orders ON l_orderkey = o_orderkey WHERE (o_totalprice >= 177206.8 AND o_totalprice <= 212358.46) GROUP BY p_brand, l_shipinstruct ORDER BY a0 DESC, p_brand ASC, l_shipinstruct ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 18,
+   "ms": 33.15137801109813,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 18,
+   "paths": "native@cpu x1",
+   "ms": 21.92276599816978,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 18,
+   "ms": 302.04159300774336,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 19,
+  "shape": "agg",
+  "sql": "SELECT l_shipmode, MIN(l_discount) AS a0, MIN(l_extendedprice * (1 - l_discount)) AS a1, AVG(l_extendedprice) AS a2, SUM(l_quantity) AS a3 FROM lineitem WHERE (l_shipinstruct IN ('COLLECT COD', 'DELIVER IN PERSON', 'NONE', 'TAKE BACK RETURN')) GROUP BY l_shipmode ORDER BY a0 ASC, l_shipmode ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 19,
+   "ms": 31.6670429892838,
+   "rows": 7
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 19,
+   "paths": "native@cpu x1",
+   "ms": 10.097335005411878,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 7,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 19,
+   "ms": 64.65130299329758,
+   "rows": 7,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 20,
+  "shape": "join",
+  "sql": "SELECT o_orderpriority, MAX(c_acctbal) AS a0, MAX(o_totalprice) AS a1, SUM(c_acctbal) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderdate >= 9336) GROUP BY o_orderpriority",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 20,
+   "ms": 12.6691069744993,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 20,
+   "paths": "native@cpu x1",
+   "ms": 8.122472994728014,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 20,
+   "ms": 36.7313270107843,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 21,
+  "shape": "join",
+  "sql": "SELECT c_mktsegment, COUNT(c_acctbal) AS a0, MAX(c_acctbal) AS a1 FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE', 'MACHINERY')) AND (c_acctbal >= 7136.99) GROUP BY c_mktsegment ORDER BY a0 DESC, c_mktsegment ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 21,
+   "ms": 6.151020003017038,
+   "rows": 4
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 21,
+   "paths": "native@cpu x1",
+   "ms": 8.87580998823978,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 21,
+   "ms": 3.4580290084704757,
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 22,
+  "shape": "join",
+  "sql": "SELECT o_orderpriority, SUM(c_acctbal) AS a0, AVG(o_totalprice) AS a1, AVG(c_acctbal) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey WHERE (c_mktsegment = 'FURNITURE') GROUP BY o_orderpriority",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 22,
+   "ms": 9.347238985355943,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 22,
+   "paths": "native@cpu x1",
+   "ms": 5.3306119807530195,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 22,
+   "ms": 15.736567991552874,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 23,
+  "shape": "join",
+  "sql": "SELECT l_returnflag, s_nationkey, COUNT(l_tax) AS a0 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey WHERE (l_shipinstruct IN ('DELIVER IN PERSON', 'TAKE BACK RETURN')) AND (s_acctbal >= -787.58) GROUP BY l_returnflag, s_nationkey",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 23,
+   "ms": 16.424005007138476,
+   "rows": 75
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 23,
+   "paths": "native@cpu x1",
+   "ms": 10.690994007745758,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 75,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 23,
+   "ms": 130.37252199137583,
+   "rows": 75,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 24,
+  "shape": "topn",
+  "sql": "SELECT l_orderkey, l_linenumber, l_quantity, l_discount FROM lineitem WHERE (l_receiptdate < 10180) ORDER BY l_quantity ASC, l_orderkey ASC, l_linenumber ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 24,
+   "ms": 7.790582982124761,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 24,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 9.063859994057566,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 24,
+   "ms": 167.53883598721586,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 25,
+  "shape": "topn",
+  "sql": "SELECT l_orderkey, l_linenumber, l_tax, l_quantity FROM lineitem WHERE (l_extendedprice >= 5087.0) AND (l_quantity >= 37.0) ORDER BY l_tax DESC, l_orderkey ASC, l_linenumber ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 25,
+   "ms": 9.039099997607991,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 25,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 10.254564986098558,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 25,
+   "ms": 56.051841005682945,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 26,
+  "shape": "join",
+  "sql": "SELECT o_orderpriority, SUM(c_acctbal) AS a0, MAX(c_acctbal) AS a1 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderdate >= 8567 AND o_orderdate <= 9048) AND (c_mktsegment IN ('BUILDING', 'HOUSEHOLD')) AND (c_acctbal >= -784.52 AND c_acctbal <= 1429.5) GROUP BY o_orderpriority ORDER BY a0 DESC, o_orderpriority ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 26,
+   "ms": 8.433232025709003,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 26,
+   "paths": "native@cpu x1",
+   "ms": 5.860200006281957,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 26,
+   "ms": 7.853763992898166,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 27,
+  "shape": "distinct",
+  "sql": "SELECT o_shippriority, COUNT(DISTINCT c_mktsegment) AS n FROM orders JOIN customer ON o_custkey = c_custkey WHERE TRUE GROUP BY o_shippriority ORDER BY n DESC, o_shippriority ASC LIMIT 20",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 27,
+   "ms": 12.868055986473337,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 27,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 16.200985002797097,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 27,
+   "ms": 77.46811900869943,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 28,
+  "shape": "agg",
+  "sql": "SELECT l_shipinstruct, l_linestatus, SUM(l_extendedprice * (1 - l_discount)) AS a0, SUM(l_extendedprice * (1 - l_discount)) AS a1 FROM lineitem WHERE (l_receiptdate < 10084) GROUP BY l_shipinstruct, l_linestatus ORDER BY a0 DESC, l_shipinstruct ASC, l_linestatus ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 28,
+   "ms": 20.872230001259595,
+   "rows": 8
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 28,
+   "paths": "native@cpu x1",
+   "ms": 7.713714003330097,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 8,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 28,
+   "ms": 147.4679630191531,
+   "rows": 8,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 29,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT l_shipinstruct FROM lineitem JOIN supplier ON l_suppkey = s_suppkey WHERE (l_discount >= 0.05) AND (l_shipmode = 'AIR')",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 29,
+   "ms": 14.213062997441739,
+   "rows": 4
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 29,
+   "paths": "native@cpu x1",
+   "ms": 7.949063001433387,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 29,
+   "ms": 29.78486000210978,
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 30,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT o_orderpriority, o_orderstatus FROM orders WHERE (o_orderpriority = '4-NOT SPECIFIED')",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 30,
+   "ms": 5.517751007573679,
+   "rows": 3
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 30,
+   "paths": "native@cpu x1",
+   "ms": 3.0291200091596693,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 30,
+   "ms": 9.432097984245047,
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 31,
+  "shape": "agg",
+  "sql": "SELECT p_mfgr, p_brand, SUM(p_size) AS a0, COUNT(p_size) AS a1 FROM part WHERE TRUE GROUP BY p_mfgr, p_brand HAVING COUNT(p_size) > 2",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 31,
+   "ms": 6.551688013132662,
+   "rows": 25
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 31,
+   "paths": "native@cpu x1",
+   "ms": 8.124432992190123,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 31,
+   "ms": 5.786001012893394,
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 32,
+  "shape": "agg",
+  "sql": "SELECT o_orderstatus, MIN(o_totalprice) AS a0 FROM orders WHERE (o_orderpriority <> '4-NOT SPECIFIED') GROUP BY o_orderstatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 32,
+   "ms": 4.30468498962,
+   "rows": 3
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 32,
+   "paths": "native@cpu x1",
+   "ms": 3.69929798762314,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 32,
+   "ms": 15.567547990940511,
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 33,
+  "shape": "join",
+  "sql": "SELECT n_name, MIN(c_acctbal) AS a0, AVG(o_totalprice) AS a1, SUM(o_totalprice) AS a2, MIN(c_acctbal) AS a3 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE')) AND (c_acctbal >= 3166.7) GROUP BY n_name",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 33,
+   "ms": 13.888482993934304,
+   "rows": 25
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 33,
+   "paths": "native@cpu x1",
+   "ms": 8.721610007341951,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 33,
+   "ms": 35.45909098465927,
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 34,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT ps_suppkey FROM partsupp WHERE (ps_availqty >= 4605)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 34,
+   "ms": 4.726233979454264,
+   "rows": 10000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 34,
+   "paths": "native@cpu x1",
+   "ms": 3.223728999728337,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 34,
+   "ms": 5.173131998162717,
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 35,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT ps_suppkey FROM partsupp WHERE (ps_availqty >= 3409) AND (ps_supplycost >= 61.36 AND ps_supplycost <= 260.84)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 35,
+   "ms": 4.330055002355948,
+   "rows": 10000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 35,
+   "paths": "native@cpu x1",
+   "ms": 11.705251003149897,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 35,
+   "ms": 2.391921996604651,
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 36,
+  "shape": "global",
+  "sql": "SELECT SUM(l_quantity) AS a0, SUM(l_extendedprice) AS a1, COUNT(l_tax) AS a2 FROM lineitem WHERE TRUE",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 36,
+   "ms": 3.575757989892736,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 36,
+   "paths": "native@cpu x1",
+   "ms": 5.357092013582587,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 36,
+   "ms": 2.884949994040653,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 37,
+  "shape": "agg",
+  "sql": "SELECT l_linestatus, l_returnflag, MAX(l_quantity) AS a0 FROM lineitem WHERE (l_extendedprice < 65867.5) AND (l_returnflag IN ('A', 'N', 'R')) GROUP BY l_linestatus, l_returnflag",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 37,
+   "ms": 21.016979007981718,
+   "rows": 4
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 37,
+   "paths": "native@cpu x1",
+   "ms": 7.498494000174105,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 37,
+   "ms": 118.04521302110516,
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 38,
+  "shape": "topn",
+  "sql": "SELECT c_custkey, c_acctbal FROM customer WHERE TRUE ORDER BY c_acctbal ASC, c_custkey ASC LIMIT 50",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 38,
+   "ms": 1.9232029735576361,
+   "rows": 50
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 38,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 10.403714986750856,
+   "native_calls": [
+    "_call_gather"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 38,
+   "ms": 3.671526996186003,
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 39,
+  "shape": "join",
+  "sql": "SELECT o_shippriority, o_orderpriority, o_orderstatus, COUNT(o_totalprice) AS a0, MIN(o_totalprice) AS a1, SUM(c_acctbal) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderstatus = 'P') GROUP BY o_shippriority, o_orderpriority, o_orderstatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 39,
+   "ms": 11.971069005085155,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 39,
+   "paths": "native@cpu x1",
+   "ms": 7.695724023506045,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 39,
+   "ms": 7.777443999657407,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 40,
+  "shape": "distinct",
+  "sql": "SELECT l_suppkey, COUNT(DISTINCT l_returnflag) AS n FROM lineitem WHERE (l_receiptdate >= 8932) AND (l_discount >= 0.06 AND l_discount <= 0.07) GROUP BY l_suppkey ORDER BY n DESC, l_suppkey ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 40,
+   "ms": 16.025745018851012,
+   "rows": 100
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 40,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 14.248141989810392,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct",
+    "_call_gather"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 40,
+   "ms": 19.116755021968856,
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 41,
+  "shape": "topn",
+  "sql": "SELECT ps_partkey, ps_suppkey, ps_supplycost, ps_availqty FROM partsupp WHERE (ps_supplycost >= 380.85 AND ps_supplycost <= 580.1) ORDER BY ps_supplycost ASC, ps_partkey ASC, ps_suppkey ASC LIMIT 200",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 41,
+   "ms": 2.9849910060875118,
+   "rows": 200
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 41,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 3.286768973339349,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 41,
+   "ms": 5.4466319852508605,
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 42,
+  "shape": "agg",
+  "sql": "SELECT l_suppkey, l_returnflag, l_shipmode, SUM(l_extendedprice * (1 - l_discount)) AS a0, SUM(l_quantity) AS a1, COUNT(l_tax) AS a2, SUM(l_tax) AS a3 FROM lineitem WHERE (l_receiptdate < 10373) AND (l_discount < 0.09) GROUP BY l_suppkey, l_returnflag, l_shipmode ORDER BY a0 ASC, l_suppkey ASC, l_returnflag ASC, l_shipmode ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 42,
+   "ms": 123.63849399844185,
+   "rows": 100
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 42,
+   "paths": "native@cpu x1",
+   "ms": 59.44025999633595,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 42,
+   "ms": 319.73406398901716,
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 43,
+  "shape": "agg",
+  "sql": "SELECT o_custkey, o_shippriority, o_orderstatus, AVG(o_totalprice) AS a0, AVG(o_totalprice) AS a1, MAX(o_totalprice) AS a2, SUM(o_totalprice) AS a3 FROM orders WHERE (o_orderstatus IN ('F', 'O', 'P')) GROUP BY o_custkey, o_shippriority, o_orderstatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 43,
+   "ms": 42.03419899567962,
+   "rows": 230540
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 43,
+   "paths": "native@cpu x1",
+   "ms": 33.67883697501384,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 230540,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 43,
+   "ms": 61.11858499934897,
+   "rows": 230540,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 44,
+  "shape": "topn",
+  "sql": "SELECT l_orderkey, l_linenumber, l_discount, l_tax FROM lineitem WHERE (l_receiptdate < 8450) AND (l_shipdate >= 8143 AND l_shipdate <= 8434) AND (l_quantity < 49.0) ORDER BY l_discount ASC, l_orderkey ASC, l_linenumber ASC LIMIT 200",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 44,
+   "ms": 6.927666021510959,
+   "rows": 200
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 44,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 10.907043993938714,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 44,
+   "ms": 27.299818000756204,
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 45,
+  "shape": "join",
+  "sql": "SELECT c_mktsegment, SUM(c_acctbal) AS a0, MIN(c_acctbal) AS a1, MIN(c_acctbal) AS a2, AVG(c_acctbal) AS a3 FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE TRUE GROUP BY c_mktsegment ORDER BY a0 ASC, c_mktsegment ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 45,
+   "ms": 7.147325988626108,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 45,
+   "paths": "native@cpu x1",
+   "ms": 8.784729987382889,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 45,
+   "ms": 5.758510989835486,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 46,
+  "shape": "agg",
+  "sql": "SELECT c_mktsegment, c_nationkey, SUM(c_acctbal) AS a0 FROM customer WHERE TRUE GROUP BY c_mktsegment, c_nationkey",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 46,
+   "ms": 4.885744012426585,
+   "rows": 125
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 46,
+   "paths": "native@cpu x1",
+   "ms": 7.539665006333962,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 125,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 46,
+   "ms": 3.7054279819130898,
+   "rows": 125,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 47,
+  "shape": "global",
+  "sql": "SELECT MIN(l_tax) AS a0 FROM lineitem WHERE (l_extendedprice >= 48251.5) AND (l_returnflag IN ('A', 'N', 'R')) AND (l_shipdate >= 8143 AND l_shipdate <= 8434)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 47,
+   "ms": 7.1519560005981475,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 47,
+   "paths": "native@cpu x1",
+   "ms": 6.617177015868947,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 47,
+   "ms": 10.32471499638632,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 48,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT ps_suppkey FROM partsupp WHERE (ps_availqty < 1802) AND (ps_supplycost >= 141.43 AND ps_supplycost <= 300.97) ORDER BY ps_suppkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 48,
+   "ms": 4.5961239957250655,
+   "rows": 9021
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 48,
+   "paths": "native@cpu x1",
+   "ms": 5.072762985946611,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 9021,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 48,
+   "ms": 2.032032993156463,
+   "rows": 9021,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 49,
+  "shape": "agg",
+  "sql": "SELECT ps_suppkey, COUNT(ps_availqty) AS a0, COUNT(ps_availqty) AS a1, AVG(ps_supplycost) AS a2, AVG(ps_supplycost) AS a3 FROM partsupp WHERE (ps_availqty >= 6603 AND ps_availqty <= 7798) AND (ps_supplycost >= 61.36 AND ps_supplycost <= 260.84) GROUP BY ps_suppkey ORDER BY a0 DESC, ps_suppkey ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 49,
+   "ms": 5.835340009070933,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 49,
+   "paths": "native@cpu x1",
+   "ms": 6.2524990062229335,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 49,
+   "ms": 3.4113290021196008,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 50,
+  "shape": "distinct",
+  "sql": "SELECT o_shippriority, COUNT(DISTINCT o_orderpriority) AS n FROM orders JOIN customer ON o_custkey = c_custkey WHERE (o_orderpriority <> '5-LOW') AND (o_orderdate < 8469) AND (c_mktsegment IN ('FURNITURE', 'MACHINERY')) GROUP BY o_shippriority HAVING COUNT(DISTINCT o_orderpriority) > 2 ORDER BY n DESC, o_shippriority ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 50,
+   "ms": 10.933612997177988,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 50,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 9.710527985589579,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call_count_distinct",
+    "_call_filter"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 50,
+   "ms": 12.325958989094943,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 51,
+  "shape": "join",
+  "sql": "SELECT l_linestatus, AVG(l_extendedprice * (1 - l_discount)) AS a0 FROM lineitem JOIN orders ON l_orderkey = o_orderkey WHERE (l_shipinstruct IN ('COLLECT COD', 'DELIVER IN PERSON', 'NONE', 'TAKE BACK RETURN')) AND (o_orderdate >= 9240) GROUP BY l_linestatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 51,
+   "ms": 43.67042300873436,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 51,
+   "paths": "native@cpu x1",
+   "ms": 16.458294994663447,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 51,
+   "ms": 128.8276769919321,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 52,
+  "shape": "join",
+  "sql": "SELECT l_returnflag, l_shipinstruct, SUM(l_extendedprice) AS a0 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN part ON l_partkey = p_partkey JOIN nation ON s_nationkey = n_nationkey WHERE (l_quantity >= 12.0) AND (l_shipdate >= 9492) AND (p_mfgr = 'Manufacturer#1') GROUP BY l_returnflag, l_shipinstruct",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 52,
+   "ms": 20.33505099825561,
+   "rows": 4
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 52,
+   "paths": "native@cpu x1",
+   "ms": 14.43688099971041,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 52,
+   "ms": 117.92584400973283,
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 53,
+  "shape": "join",
+  "sql": "SELECT p_size, SUM(p_size) AS a0, SUM(p_size) AS a1 FROM part WHERE (p_mfgr IN ('Manufacturer#1', 'Manufacturer#2', 'Manufacturer#4', 'Manufacturer#5')) AND (p_container <> 'MED BAG') AND (p_type = 'LARGE PLATED STEEL') GROUP BY p_size",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 53,
+   "ms": 2.4039120180532336,
+   "rows": 50
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 53,
+   "paths": "native@cpu x1",
+   "ms": 10.737193981185555,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 53,
+   "ms": 2.3851020087022334,
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 54,
+  "shape": "join",
+  "sql": "SELECT p_size, p_brand, p_container, AVG(p_size) AS a0, MAX(p_size) AS a1, AVG(p_size) AS a2 FROM part WHERE (p_type IN ('PROMO BRUSHED TIN', 'SMALL BURNISHED TIN')) AND (p_mfgr IN ('Manufacturer#1', 'Manufacturer#2')) GROUP BY p_size, p_brand, p_container ORDER BY a0 DESC, p_size ASC, p_brand ASC, p_container ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 54,
+   "ms": 7.281745987711474,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 54,
+   "paths": "fused_pipeline_cpu@cpu x1",
+   "ms": 19.074176001595333,
+   "native_calls": [],
+   "decline_counts": {
+    "ORDER BY / HAVING over an integer mean": 1
+   },
+   "declines": [
+    "ORDER BY / HAVING over an integer mean",
+    "top-k declined"
+   ],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 54,
+   "ms": 7.910004002042115,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 55,
+  "shape": "agg",
+  "sql": "SELECT o_orderstatus, o_orderpriority, AVG(o_totalprice) AS a0, MAX(o_totalprice) AS a1, MIN(o_totalprice) AS a2, AVG(o_totalprice) AS a3 FROM orders WHERE (o_orderpriority = '2-HIGH') GROUP BY o_orderstatus, o_orderpriority",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 55,
+   "ms": 6.0591300134547055,
+   "rows": 3
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 55,
+   "paths": "native@cpu x1",
+   "ms": 3.8382070197258145,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 55,
+   "ms": 7.800182997016236,
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 56,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT s_nationkey FROM lineitem JOIN supplier ON l_suppkey = s_suppkey WHERE (s_acctbal >= 2328.24 AND s_acctbal <= 3623.7) AND (l_shipinstruct IN ('COLLECT COD', 'DELIVER IN PERSON', 'NONE', 'TAKE BACK RETURN')) ORDER BY s_nationkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 56,
+   "ms": 19.585275003919378,
+   "rows": 25
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 56,
+   "paths": "native@cpu x1",
+   "ms": 7.688404992222786,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 56,
+   "ms": 39.76143599720672,
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 57,
+  "shape": "agg",
+  "sql": "SELECT ps_suppkey, MIN(ps_supplycost) AS a0, COUNT(ps_supplycost) AS a1, SUM(ps_availqty) AS a2, AVG(ps_supplycost) AS a3 FROM partsupp WHERE TRUE GROUP BY ps_suppkey",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 57,
+   "ms": 7.1707860042806715,
+   "rows": 10000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 57,
+   "paths": "native@cpu x1",
+   "ms": 4.242476017680019,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 57,
+   "ms": 6.577817985089496,
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 58,
+  "shape": "join",
+  "sql": "SELECT o_shippriority, o_orderstatus, MAX(o_totalprice) AS a0 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderstatus IN ('F', 'O', 'P')) GROUP BY o_shippriority, o_orderstatus ORDER BY a0 DESC, o_shippriority ASC, o_orderstatus ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 58,
+   "ms": 14.202263002516702,
+   "rows": 3
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 58,
+   "paths": "native@cpu x1",
+   "ms": 8.467181993182749,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 58,
+   "ms": 59.87296797684394,
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 59,
+  "shape": "join",
+  "sql": "SELECT o_shippriority, COUNT(l_extendedprice) AS a0, AVG(l_extendedprice * (1 - l_discount)) AS a1, COUNT(l_quantity) AS a2 FROM lineitem JOIN part ON l_partkey = p_partkey JOIN orders ON l_orderkey = o_orderkey JOIN supplier ON l_suppkey = s_suppkey WHERE (l_quantity >= 26.0) AND (s_acctbal >= 6720.91) GROUP BY o_shippriority ORDER BY a0 DESC, o_shippriority ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 59,
+   "ms": 46.503813995514065,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 59,
+   "paths": "native@cpu x1",
+   "ms": 20.80513001419604,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 59,
+   "ms": 125.15566000365652,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 60,
+  "shape": "join",
+  "sql": "SELECT o_orderpriority, SUM(o_totalprice) AS a0, COUNT(o_totalprice) AS a1, MAX(o_totalprice) AS a2, SUM(c_acctbal) AS a3 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (n_name IN ('ARGENTINA', 'BRAZIL', 'INDONESIA')) GROUP BY o_orderpriority",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 60,
+   "ms": 7.764324021991342,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 60,
+   "paths": "native@cpu x1",
+   "ms": 6.617748003918678,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 60,
+   "ms": 52.95116198249161,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 61,
+  "shape": "distinct",
+  "sql": "SELECT l_suppkey, COUNT(DISTINCT l_shipinstruct) AS n FROM lineitem WHERE (l_returnflag = 'N') AND (l_shipdate >= 9205) GROUP BY l_suppkey ORDER BY n DESC, l_suppkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 61,
+   "ms": 54.25234799622558,
+   "rows": 10000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 61,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 26.350201980676502,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 61,
+   "ms": 68.26837101834826,
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 62,
+  "shape": "join",
+  "sql": "SELECT l_shipmode, l_linestatus, MAX(l_tax) AS a0 FROM lineitem JOIN part ON l_partkey = p_partkey WHERE (p_container <> 'WRAP BAG') AND (l_shipmode <> 'FOB') GROUP BY l_shipmode, l_linestatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 62,
+   "ms": 26.660010014893487,
+   "rows": 12
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 62,
+   "paths": "native@cpu x1",
+   "ms": 13.768303993856534,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 12,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 62,
+   "ms": 275.6869339791592,
+   "rows": 12,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 63,
+  "shape": "distinct",
+  "sql": "SELECT p_size, COUNT(DISTINCT p_container) AS n FROM part WHERE (p_container = 'SM BAG') AND (p_type = 'ECONOMY PLATED TIN') GROUP BY p_size HAVING COUNT(DISTINCT p_container) > 3 ORDER BY n DESC, p_size ASC LIMIT 20",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 63,
+   "ms": 5.284642014885321,
+   "rows": 0
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 63,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 9.055258997250348,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct",
+    "_call_filter"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 0,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 63,
+   "ms": 1.3370450178626925,
+   "rows": 0,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 64,
+  "shape": "distinct",
+  "sql": "SELECT s_nationkey, COUNT(DISTINCT l_shipmode) AS n FROM lineitem JOIN supplier ON l_suppkey = s_suppkey WHERE TRUE GROUP BY s_nationkey ORDER BY n DESC, s_nationkey ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 64,
+   "ms": 16.99213299434632,
+   "rows": 25
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 64,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 35.24317100527696,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 64,
+   "ms": 183.5642330115661,
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 65,
+  "shape": "topn",
+  "sql": "SELECT o_orderkey, o_totalprice, c_acctbal FROM orders JOIN customer ON o_custkey = c_custkey WHERE (o_orderstatus IN ('F', 'O', 'P')) AND (c_acctbal >= 5368.49 AND c_acctbal <= 7136.99) AND (c_mktsegment <> 'HOUSEHOLD') ORDER BY o_totalprice DESC, o_orderkey ASC LIMIT 200",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 65,
+   "ms": 10.624884016579017,
+   "rows": 200
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 65,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 10.99473299109377,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call_gather"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 65,
+   "ms": 12.884447001852095,
+   "rows": 200,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 66,
+  "shape": "agg",
+  "sql": "SELECT o_orderstatus, o_shippriority, o_orderpriority, MAX(o_totalprice) AS a0, COUNT(o_totalprice) AS a1 FROM orders WHERE (o_totalprice >= 200197.57) AND (o_orderstatus = 'P') AND (o_orderpriority IN ('2-HIGH', '4-NOT SPECIFIED')) GROUP BY o_orderstatus, o_shippriority, o_orderpriority",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 66,
+   "ms": 5.332002998329699,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 66,
+   "paths": "native@cpu x1",
+   "ms": 4.803073999937624,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 66,
+   "ms": 5.015403003199026,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 67,
+  "shape": "agg",
+  "sql": "SELECT l_shipmode, SUM(l_extendedprice * (1 - l_discount)) AS a0 FROM lineitem WHERE (l_extendedprice >= 39600.72 AND l_extendedprice <= 51216.75) AND (l_receiptdate >= 8932 AND l_receiptdate <= 9220) AND (l_shipdate >= 8241 AND l_shipdate <= 8723) GROUP BY l_shipmode",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 67,
+   "ms": 3.766537003684789,
+   "rows": 0
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 67,
+   "paths": "native@cpu x1",
+   "ms": 6.119009980466217,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 0,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 67,
+   "ms": 4.932273004669696,
+   "rows": 0,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 68,
+  "shape": "distinct",
+  "sql": "SELECT l_orderkey, COUNT(DISTINCT l_returnflag) AS n FROM lineitem WHERE (l_extendedprice >= 30974.34 AND l_extendedprice <= 42480.4) AND (l_shipdate >= 9205 AND l_shipdate <= 9492) AND (l_shipmode = 'AIR') GROUP BY l_orderkey ORDER BY n DESC, l_orderkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 68,
+   "ms": 12.362548004603013,
+   "rows": 15666
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 68,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 9.182929003145546,
+   "native_calls": [
+    "_call_filter",
+    "_call_count_distinct"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 15666,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 68,
+   "ms": 10.389375005615875,
+   "rows": 15666,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 69,
+  "shape": "agg",
+  "sql": "SELECT l_shipinstruct, l_suppkey, l_linestatus, AVG(l_discount) AS a0, MAX(l_extendedprice) AS a1, MAX(l_quantity) AS a2, SUM(l_extendedprice * (1 - l_discount)) AS a3 FROM lineitem WHERE (l_discount >= 0.05 AND l_discount <= 0.06) GROUP BY l_shipinstruct, l_suppkey, l_linestatus ORDER BY a0 DESC, l_shipinstruct ASC, l_suppkey ASC, l_linestatus ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 69,
+   "ms": 26.662260002922267,
+   "rows": 100
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 69,
+   "paths": "native@cpu x1",
+   "ms": 25.944902998162434,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 100,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 69,
+   "ms": 40.093874995363876,
+   "rows": 100,
+   "verdict": "WRONG",
+   "why": "first differing row (sorted) 0"
+  }
+ },
+ {
+  "seed": 70,
+  "shape": "agg",
+  "sql": "SELECT o_custkey, AVG(o_totalprice) AS a0 FROM orders WHERE (o_orderstatus = 'F') AND (o_orderdate >= 8663 AND o_orderdate <= 9144) AND (o_totalprice >= 155188.18 AND o_totalprice <= 200197.57) GROUP BY o_custkey",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 70,
+   "ms": 6.351399002596736,
+   "rows": 37134
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 70,
+   "paths": "native@cpu x1",
+   "ms": 15.376297989860177,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 37134,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 70,
+   "ms": 4.450264998013154,
+   "rows": 37134,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 71,
+  "shape": "global",
+  "sql": "SELECT AVG(l_extendedprice) AS a0 FROM lineitem WHERE (l_shipdate < 8916) AND (l_shipinstruct = 'DELIVER IN PERSON')",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 71,
+   "ms": 7.477345003280789,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 71,
+   "paths": "native@cpu x1",
+   "ms": 6.611638003960252,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 71,
+   "ms": 9.073288994841278,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 72,
+  "shape": "agg",
+  "sql": "SELECT l_linestatus, l_returnflag, MAX(l_quantity) AS a0, MIN(l_quantity) AS a1 FROM lineitem WHERE (l_shipmode <> 'SHIP') AND (l_shipdate >= 9109 AND l_shipdate <= 9396) GROUP BY l_linestatus, l_returnflag",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 72,
+   "ms": 10.324105009203777,
+   "rows": 4
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 72,
+   "paths": "native@cpu x1",
+   "ms": 8.00242301193066,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 72,
+   "ms": 20.70764100062661,
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 73,
+  "shape": "join",
+  "sql": "SELECT p_mfgr, AVG(l_tax) AS a0, MAX(l_extendedprice) AS a1, MIN(p_size) AS a2 FROM lineitem JOIN part ON l_partkey = p_partkey JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey WHERE (c_mktsegment IN ('BUILDING', 'HOUSEHOLD', 'MACHINERY')) AND (l_shipdate < 8143) GROUP BY p_mfgr",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 73,
+   "ms": 37.063354975543916,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 73,
+   "paths": "native@cpu x1",
+   "ms": 20.63239100971259,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 73,
+   "ms": 25.38055501645431,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 74,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT l_suppkey, o_shippriority, l_linestatus FROM lineitem JOIN orders ON l_orderkey = o_orderkey WHERE (l_shipdate >= 8434) AND (l_receiptdate >= 9507) ORDER BY l_suppkey ASC, o_shippriority ASC, l_linestatus ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 74,
+   "ms": 35.792129987385124,
+   "rows": 10000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 74,
+   "paths": "native@cpu x1",
+   "ms": 29.06827299739234,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 74,
+   "ms": 132.45370500953868,
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 75,
+  "shape": "distinct",
+  "sql": "SELECT n_name, COUNT(DISTINCT c_custkey) AS n FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE (n_name IN ('GERMANY', 'VIETNAM')) AND (c_mktsegment IN ('BUILDING', 'FURNITURE', 'HOUSEHOLD')) AND (c_acctbal >= -784.52) GROUP BY n_name ORDER BY n DESC, n_name ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 75,
+   "ms": 6.841816997621208,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 75,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 11.215361999347806,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call_count_distinct"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 75,
+   "ms": 3.0412589840125293,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 76,
+  "shape": "global",
+  "sql": "SELECT AVG(p_size) AS a0, SUM(p_size) AS a1, AVG(p_size) AS a2 FROM part WHERE (p_brand IN ('Brand#25', 'Brand#55')) AND (p_container IN ('JUMBO JAR', 'LG PACK', 'MED JAR')) AND (p_size >= 15)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 76,
+   "ms": 3.2829190022312105,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 76,
+   "paths": "native@cpu x1",
+   "ms": 9.779168001841754,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 76,
+   "ms": 1.8649640260264277,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 77,
+  "shape": "join",
+  "sql": "SELECT p_size, p_brand, p_type, MIN(ps_availqty) AS a0 FROM partsupp JOIN part ON ps_partkey = p_partkey WHERE (p_mfgr = 'Manufacturer#3') GROUP BY p_size, p_brand, p_type",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 77,
+   "ms": 14.777080999920145,
+   "rows": 24675
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 77,
+   "paths": "native@cpu x1",
+   "ms": 15.244489011820406,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 24675,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 77,
+   "ms": 10.234535991912708,
+   "rows": 24675,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 78,
+  "shape": "join",
+  "sql": "SELECT l_returnflag, l_linestatus, l_shipmode, MIN(l_tax) AS a0, COUNT(l_tax) AS a1 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey WHERE (l_shipinstruct <> 'TAKE BACK RETURN') AND (l_quantity >= 14.0 AND l_quantity <= 24.0) GROUP BY l_returnflag, l_linestatus, l_shipmode ORDER BY a0 ASC, l_returnflag ASC, l_linestatus ASC, l_shipmode ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 78,
+   "ms": 22.645754012046382,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 78,
+   "paths": "native@cpu x1",
+   "ms": 12.901025998871773,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 78,
+   "ms": 87.2194679977838,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 79,
+  "shape": "join",
+  "sql": "SELECT p_size, SUM(p_size) AS a0, MAX(p_size) AS a1, AVG(p_size) AS a2 FROM part WHERE (p_mfgr <> 'Manufacturer#2') AND (p_brand IN ('Brand#13', 'Brand#32')) GROUP BY p_size ORDER BY a0 DESC, p_size ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 79,
+   "ms": 3.27538899728097,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 79,
+   "paths": "native@cpu x1",
+   "ms": 12.337908992776647,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 79,
+   "ms": 3.09970899252221,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 80,
+  "shape": "join",
+  "sql": "SELECT c_mktsegment, SUM(c_acctbal) AS a0 FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE (c_mktsegment IN ('HOUSEHOLD', 'MACHINERY')) AND (n_name <> 'ROMANIA') GROUP BY c_mktsegment",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 80,
+   "ms": 5.846281012054533,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 80,
+   "paths": "native@cpu x1",
+   "ms": 12.430687987944111,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 80,
+   "ms": 4.046446003485471,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 81,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT p_container FROM part WHERE (p_mfgr IN ('Manufacturer#2', 'Manufacturer#5')) AND (p_type IN ('ECONOMY ANODIZED BRASS', 'MEDIUM POLISHED STEEL', 'PROMO BRUSHED COPPER', 'PROMO PLATED COPPER'))",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 81,
+   "ms": 5.202241998631507,
+   "rows": 40
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 81,
+   "paths": "native@cpu x1",
+   "ms": 8.827150013530627,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 40,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 81,
+   "ms": 1.9820430024992675,
+   "rows": 40,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 82,
+  "shape": "join",
+  "sql": "SELECT p_brand, SUM(p_size) AS a0, MIN(p_size) AS a1, SUM(p_size) AS a2, SUM(p_size) AS a3 FROM part WHERE (p_brand IN ('Brand#12', 'Brand#55')) AND (p_mfgr IN ('Manufacturer#1', 'Manufacturer#4', 'Manufacturer#5')) GROUP BY p_brand ORDER BY a0 ASC, p_brand ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 82,
+   "ms": 4.5333150192163885,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 82,
+   "paths": "native@cpu x1",
+   "ms": 12.728446978144348,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 82,
+   "ms": 3.1070899858605117,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 83,
+  "shape": "distinct",
+  "sql": "SELECT p_size, COUNT(DISTINCT p_type) AS n FROM part WHERE TRUE GROUP BY p_size HAVING COUNT(DISTINCT p_type) > 3 ORDER BY n DESC, p_size ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 83,
+   "ms": 7.192646007752046,
+   "rows": 50
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 83,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 8.039673004532233,
+   "native_calls": [
+    "_call_count_distinct",
+    "_call_filter"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 83,
+   "ms": 3.053040010854602,
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 84,
+  "shape": "join",
+  "sql": "SELECT l_suppkey, c_mktsegment, o_shippriority, COUNT(l_discount) AS a0, AVG(l_extendedprice * (1 - l_discount)) AS a1, MAX(l_quantity) AS a2, SUM(l_extendedprice * (1 - l_discount)) AS a3 FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey WHERE (c_mktsegment IN ('FURNITURE', 'HOUSEHOLD', 'MACHINERY')) AND (l_receiptdate < 9797) GROUP BY l_suppkey, c_mktsegment, o_shippriority ORDER BY a0 DESC, l_suppkey ASC, c_mktsegment ASC, o_shippriority ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 84,
+   "ms": 94.47456200723536,
+   "rows": 30000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 84,
+   "paths": "native@cpu x1",
+   "ms": 67.18054399243556,
+   "native_calls": [
+    "_call_filter",
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 30000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 84,
+   "ms": 212.89542500744574,
+   "rows": 30000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 85,
+  "shape": "join",
+  "sql": "SELECT p_brand, p_mfgr, MAX(l_extendedprice * (1 - l_discount)) AS a0, SUM(l_extendedprice) AS a1, SUM(l_discount) AS a2, SUM(l_tax) AS a3 FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN part ON l_partkey = p_partkey WHERE (o_orderstatus IN ('F', 'O', 'P')) AND (l_extendedprice >= 39600.72 AND l_extendedprice <= 48251.5) AND (o_orderpriority = '5-LOW') GROUP BY p_brand, p_mfgr",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 85,
+   "ms": 33.383058005711064,
+   "rows": 25
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 85,
+   "paths": "native@cpu x1",
+   "ms": 22.91231299750507,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 85,
+   "ms": 34.43371399771422,
+   "rows": 25,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 86,
+  "shape": "agg",
+  "sql": "SELECT ps_suppkey, SUM(ps_availqty) AS a0, MAX(ps_supplycost) AS a1, SUM(ps_availqty) AS a2, SUM(ps_supplycost) AS a3 FROM partsupp WHERE TRUE GROUP BY ps_suppkey ORDER BY a0 ASC, ps_suppkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 86,
+   "ms": 9.342598001239821,
+   "rows": 10000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 86,
+   "paths": "native@cpu x1",
+   "ms": 8.037282997975126,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 86,
+   "ms": 8.585061004851013,
+   "rows": 10000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 87,
+  "shape": "join",
+  "sql": "SELECT n_name, o_orderstatus, MIN(o_totalprice) AS a0, COUNT(o_totalprice) AS a1 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE', 'MACHINERY')) AND (c_acctbal >= 9779.74) GROUP BY n_name, o_orderstatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 87,
+   "ms": 8.616911014541984,
+   "rows": 75
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 87,
+   "paths": "native@cpu x1",
+   "ms": 5.74262099689804,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 75,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 87,
+   "ms": 5.411190999438986,
+   "rows": 75,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 88,
+  "shape": "topn",
+  "sql": "SELECT o_orderkey, o_totalprice, c_acctbal FROM orders JOIN customer ON o_custkey = c_custkey WHERE TRUE ORDER BY o_totalprice ASC, o_orderkey ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 88,
+   "ms": 9.616468014428392,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 88,
+   "paths": "join_mojo_shortcut@cpu x1",
+   "ms": 14.634900988312438,
+   "native_calls": [
+    "_call_filter",
+    "_call_gather"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 88,
+   "ms": 44.58224002155475,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 89,
+  "shape": "agg",
+  "sql": "SELECT o_shippriority, o_orderstatus, COUNT(o_totalprice) AS a0, SUM(o_totalprice) AS a1, MAX(o_totalprice) AS a2 FROM orders WHERE (o_orderpriority = '2-HIGH') GROUP BY o_shippriority, o_orderstatus HAVING COUNT(o_totalprice) > 19 ORDER BY a0 ASC, o_shippriority ASC, o_orderstatus ASC LIMIT 100",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 89,
+   "ms": 4.703824000898749,
+   "rows": 3
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 89,
+   "paths": "native@cpu x1",
+   "ms": 11.224401998333633,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 89,
+   "ms": 11.377232003724203,
+   "rows": 3,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 90,
+  "shape": "join",
+  "sql": "SELECT l_shipinstruct, MAX(l_extendedprice * (1 - l_discount)) AS a0, AVG(l_extendedprice * (1 - l_discount)) AS a1, SUM(l_extendedprice * (1 - l_discount)) AS a2 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey WHERE (l_shipmode IN ('MAIL', 'RAIL', 'SHIP')) AND (l_extendedprice < 51216.75) GROUP BY l_shipinstruct ORDER BY a0 ASC, l_shipinstruct ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 90,
+   "ms": 22.935793007491156,
+   "rows": 4
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 90,
+   "paths": "native@cpu x1",
+   "ms": 11.439002002589405,
+   "native_calls": [
+    "_call_filter",
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 90,
+   "ms": 113.51483900216408,
+   "rows": 4,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 91,
+  "shape": "agg",
+  "sql": "SELECT l_linestatus, MAX(l_extendedprice) AS a0, SUM(l_tax) AS a1, SUM(l_tax) AS a2 FROM lineitem WHERE (l_shipinstruct IN ('COLLECT COD', 'DELIVER IN PERSON', 'NONE', 'TAKE BACK RETURN')) GROUP BY l_linestatus",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 91,
+   "ms": 20.896489004371688,
+   "rows": 2
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 91,
+   "paths": "native@cpu x1",
+   "ms": 7.202384993433952,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 91,
+   "ms": 51.60472699208185,
+   "rows": 2,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 92,
+  "shape": "topn",
+  "sql": "SELECT o_orderkey, o_totalprice FROM orders WHERE (o_totalprice < 25803.23) AND (o_orderdate < 10008) AND (o_orderstatus <> 'P') ORDER BY o_totalprice ASC, o_orderkey ASC LIMIT 10",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 92,
+   "ms": 4.473984998185188,
+   "rows": 10
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 92,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 3.8455280009657145,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 92,
+   "ms": 5.007762985769659,
+   "rows": 10,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 93,
+  "shape": "distinct",
+  "sql": "SELECT ps_partkey, COUNT(DISTINCT ps_suppkey) AS n FROM partsupp WHERE TRUE GROUP BY ps_partkey HAVING COUNT(DISTINCT ps_suppkey) > 1 ORDER BY n DESC, ps_partkey ASC",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 93,
+   "ms": 25.150636007310823,
+   "rows": 200000
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 93,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 30.35544799058698,
+   "native_calls": [
+    "_call_count_distinct",
+    "_call_filter"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 200000,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 93,
+   "ms": 29.00386301917024,
+   "rows": 200000,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 94,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT l_shipinstruct, l_shipmode FROM lineitem WHERE (l_returnflag = 'R') AND (l_receiptdate >= 9220)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 94,
+   "ms": 13.608004985144362,
+   "rows": 28
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 94,
+   "paths": "native@cpu x1",
+   "ms": 5.992249993141741,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 28,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 94,
+   "ms": 10.40712499525398,
+   "rows": 28,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 95,
+  "shape": "select_distinct",
+  "sql": "SELECT DISTINCT l_shipinstruct, l_returnflag FROM lineitem JOIN orders ON l_orderkey = o_orderkey WHERE (l_quantity >= 6.0 AND l_quantity <= 16.0)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 95,
+   "ms": 36.48672701092437,
+   "rows": 12
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 95,
+   "paths": "native@cpu x1",
+   "ms": 13.403784978436306,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 12,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 95,
+   "ms": 108.23837699717842,
+   "rows": 12,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 96,
+  "shape": "global",
+  "sql": "SELECT SUM(ps_supplycost) AS a0 FROM partsupp WHERE (ps_availqty >= 9799) AND (ps_supplycost < 899.89)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 96,
+   "ms": 2.1719929936807603,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 96,
+   "paths": "native@cpu x1",
+   "ms": 2.127532003214583,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 96,
+   "ms": 1.0787070204969496,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 97,
+  "shape": "join",
+  "sql": "SELECT c_mktsegment, MIN(c_acctbal) AS a0, SUM(c_acctbal) AS a1, MAX(c_acctbal) AS a2 FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE TRUE GROUP BY c_mktsegment",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 97,
+   "ms": 6.1701799859292805,
+   "rows": 5
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 97,
+   "paths": "native@cpu x1",
+   "ms": 8.980549988336861,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 97,
+   "ms": 6.131408998044208,
+   "rows": 5,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 98,
+  "shape": "global",
+  "sql": "SELECT SUM(l_quantity) AS a0, MIN(l_extendedprice * (1 - l_discount)) AS a1, COUNT(l_tax) AS a2 FROM lineitem WHERE (l_shipinstruct IN ('COLLECT COD', 'DELIVER IN PERSON', 'TAKE BACK RETURN')) AND (l_quantity >= 4.0)",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 98,
+   "ms": 18.650607991730794,
+   "rows": 1
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 98,
+   "paths": "native@cpu x1",
+   "ms": 7.586735009681433,
+   "native_calls": [
+    "_call"
+   ],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 98,
+   "ms": 33.822157012764364,
+   "rows": 1,
+   "verdict": "ok",
+   "why": ""
+  }
+ },
+ {
+  "seed": 99,
+  "shape": "topn",
+  "sql": "SELECT c_custkey, c_acctbal FROM customer WHERE (c_acctbal < 990.7) ORDER BY c_acctbal DESC, c_custkey ASC LIMIT 50",
+  "duckdb": {
+   "engine": "duckdb",
+   "seed": 99,
+   "ms": 1.5153049898799509,
+   "rows": 50
+  },
+  "mx": {
+   "engine": "mx",
+   "seed": 99,
+   "paths": "pyarrow_shortcut@cpu x1",
+   "ms": 10.050575976492837,
+   "native_calls": [],
+   "decline_counts": {},
+   "declines": [],
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  },
+  "polars": {
+   "engine": "polars",
+   "seed": 99,
+   "ms": 1.7715239955578,
+   "rows": 50,
+   "verdict": "ok",
+   "why": ""
+  }
+ }
+]
