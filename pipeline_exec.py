@@ -105,7 +105,7 @@ def _bind(predicates, agg_node, table):
     prog = compile_pipeline(predicates, list(agg_node.aggs), table)
     if prog is None:
         return "expression not supported by the bytecode compiler"
-    if _int64_past_2_53(table, prog.columns):
+    if _int64_past_2_53(table, [n for n in prog.columns if n not in prog.exact_cols]):      # (OP_LOADI reads int64 exactly)
         return "an int64 column holds values past 2^53 (the pipeline computes in float64)"
     try:
         cc = prog.bind_chunks(table)
@@ -229,14 +229,14 @@ def _fused_run(compiler, pk, prog, cc, table, predicates, agg_node, gids, n_grou
             v = unique_key_cols[k]
             key_arrays.append(v if keep is None else pc.filter(v, keep))
         # counts stay exact int64 (float32/float64 would saturate at 2**24 / lose exactness)
-        agg_arrays = [_npa(cols[name].astype(np.int64 if op in ("count", "isum") else np.float64))
+        agg_arrays = [_npa(cols[name].astype(np.int64 if op in _INT_OUT else np.float64))
                       for name, op, _ in prog.outputs]
         result = pa.Table.from_arrays(key_arrays + agg_arrays,
                                       names=group_keys + [name for name, _, _ in prog.outputs])
     else:
         arrays = {}
         for name, op, _ in prog.outputs:
-            typ = pa.int64() if op in ("count", "isum") else pa.float64()
+            typ = pa.int64() if op in _INT_OUT else pa.float64()
             arrays[name] = _npa(cols[name], type=typ)
         result = pa.table(arrays)
 
@@ -385,6 +385,7 @@ def queue_resident_upload(plan) -> None:
                                 gid_fp=fp, gkeys=got.gkeys)
 
 
+_INT_OUT = ("count", "isum", "imin", "imax")      # outputs held as int64 (a count, an integer sum, an integer extreme)
 _I64_RANGE: dict = {}          # id(table) -> (weakref to the table, {column: values past 2^53?})
 
 

@@ -88,7 +88,9 @@ MAX_SET_SPAN = 1 << 22  # widest numeric IN_SET table we will build
 MAX_STR_IN = 32         # values an isin over a plain string column compares per row (linear)
 
 OP_LOAD_COL, OP_LOAD_CONST = 1, 2
+OP_LOADI = 3           # dst = an integer column's values as int64 BITS in the float64 register (read only by OP_AGG_IMIN / IMAX, F-060c)
 OP_ADD, OP_SUB, OP_MUL, OP_DIV = 10, 11, 12, 13
+OP_MOD = 14            # fmod of two integer-valued registers; the divisor is a nonzero constant (F-101)
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
@@ -97,17 +99,19 @@ OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the nati
 OP_ISNULL = 41         # dst = the column's validity bit is clear (the native executor only, F-097)
 OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX = 50, 51, 52
 OP_AGG_ISUM = 53       # sum of integer-valued inputs, accumulated in int64 (F-060); its slot holds int64 bits
+OP_AGG_IMIN, OP_AGG_IMAX = 54, 55   # min / max of a LOADI register, accumulated in int64 (F-060c); the slot holds int64 bits
 
 OP_NAMES = {
-    OP_LOAD_COL: "LOAD_COL", OP_LOAD_CONST: "LOAD_CONST",
-    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV",
+    OP_LOAD_COL: "LOAD_COL", OP_LOAD_CONST: "LOAD_CONST", OP_LOADI: "LOADI",
+    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV", OP_MOD: "MOD",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
     OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
     OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR", OP_ISNULL: "ISNULL",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX", OP_AGG_ISUM: "AGG_ISUM",
+    OP_AGG_IMIN: "AGG_IMIN", OP_AGG_IMAX: "AGG_IMAX",
 }
 
-_COLUMN_OPS = (OP_LOAD_COL, OP_CMPC, OP_STR, OP_ISNULL)     # instructions whose operand `a` is a column index
+_COLUMN_OPS = (OP_LOAD_COL, OP_LOADI, OP_CMPC, OP_STR, OP_ISNULL)     # instructions whose operand `a` is a column index
 _ARITH = {"add": OP_ADD, "sub": OP_SUB, "mul": OP_MUL, "div": OP_DIV}
 _CMP = {"lt": OP_LT, "le": OP_LE, "gt": OP_GT, "ge": OP_GE, "eq": OP_EQ, "ne": OP_NE}
 # Comparisons follow DuckDB's order for floats (F-070): NaN is above every number, +inf included, and NaN = NaN.
@@ -161,7 +165,7 @@ class Inexact(Unsupported):
 class Partials:
     """Per-(aggregate slot, group) partial results of one or more row ranges."""
 
-    vals: np.ndarray   # float64 [n_slots, n_groups]: sum / min / max per slot (an "isum" slot holds int64 bits)
+    vals: np.ndarray   # float64 [n_slots, n_groups]: sum / min / max per slot (an "isum" / "imin" / "imax" slot holds int64 bits)
     cnt: np.ndarray    # int64   [n_groups]: rows that passed the predicate
 
     @property
@@ -169,7 +173,7 @@ class Partials:
         return int(self.cnt.shape[0])
 
     def ints(self, slot: int) -> np.ndarray:
-        """An "isum" slot's row as int64 (a view: the kernels write int64s into the float64 matrix)."""
+        """An "isum" / "imin" / "imax" slot's row as int64 (a view: the kernels write int64s into the float64 matrix)."""
         return self.vals[slot].view(np.int64)
 
 
@@ -280,13 +284,14 @@ class PipelineProgram:
     set_meta: np.ndarray              # int64 [n_sets, 3] = offset, length, lo
     columns: List[str]                # source column per LOAD_COL index
     dict_arrays: Dict[str, pa.DictionaryArray]   # string columns, as codes
-    slot_kinds: List[str]             # "sum" | "isum" | "min" | "max" per slot
+    slot_kinds: List[str]             # "sum" | "isum" | "min" | "max" | "imin" | "imax" per slot
     outputs: List[Tuple[str, str, Optional[int]]]  # (name, op, slot) per user aggregate
     n_regs: int
     n_instr: int
     identity: np.ndarray = field(default=None)  # float64 [n_slots] initial value per slot
     nan_slots: Dict[str, int] = field(default_factory=dict)  # min / max output -> hidden NaN-count slot
     slot_int: List[bool] = field(default_factory=list)       # slot input is integer-valued (whole numbers; exact while within 2^53)
+    exact_cols: List[str] = field(default_factory=list)      # columns read only by OP_LOADI: int64 bits, exact past 2^53 (F-060c)
     dict_concat: Dict[str, Dict[tuple, int]] = field(default_factory=dict)   # concat_dicts mode: name -> {dictionary key: offset}
     str_cols: List[str] = field(default_factory=list)   # concat_dicts mode: plain utf8 columns read by OP_STR
     null_cols: List[str] = field(default_factory=list)  # concat_dicts mode: columns only tested by OP_ISNULL (may hold NULLs)
@@ -463,6 +468,7 @@ class _Val:
 # A bound is a tuple tree: ("c", n) | ("col", name) | ("add", x, y) | ("mul", x, y) | ("max", x, y) |
 # ("div", x, k).  It is evaluated from the column TYPES first (no data read); only if that could pass
 # 2^53 is it evaluated again from the columns' real min / max.
+INT64_MAX, INT64_MIN = (1 << 63) - 1, -(1 << 63)
 EXACT = 1 << 53        # integers within +-2^53 are exact in float64, and so are their sums / products
 
 
@@ -649,6 +655,8 @@ class _Builder:
         a = self._eval_bound(t[1], tight)
         if k == "div":
             return a // t[2] + 1
+        if k == "mod":                                   # |x % k| < |k| and <= |x|
+            return min(a, t[2] - 1)
         b = self._eval_bound(t[2], tight)
         return a * b if k == "mul" else max(a, b) if k == "max" else a + b
 
@@ -689,6 +697,8 @@ class _Builder:
             return _Val(self.emit(OP_ROWID, key_extra=("rowid",)), "int", ("c", 1 << 40))
         if op in _ARITH:
             return self._arith(op, args)
+        if op == "mod":
+            return self._mod(e)
         if op in _CMP:
             return self._compare(op, args)
         if op in ("and", "or"):
@@ -797,6 +807,23 @@ class _Builder:
                 return _Const(a.value / b.value, kind)
             return _Const(_FOLD[code](a.value, b.value), kind)
         return _Val(self.emit(code, self.as_reg(a), self.as_reg(b)), kind, bound)
+
+    def _mod(self, e: Expr):
+        """``int % k`` for a nonzero integer constant ``k`` (DuckDB: the sign follows the dividend, i.e. fmod; exact in
+        float64 because the dividend is bound within 2^53). A column or zero divisor could give NULL, a float
+        or decimal operand has Arrow's semantics: those decline to Arrow (F-101)."""
+        if len(e.args) > 2:
+            raise Unsupported("decimal modulo")
+        a = self._need(e.args[0], "num")
+        b = self._need(e.args[1], "num")
+        if a.kind != "int" or b.kind != "int":
+            raise Unsupported("modulo of floats stays on Arrow")
+        if not isinstance(b, _Const) or b.value == 0:
+            raise Unsupported("modulo by a column or by zero (NULL) stays on Arrow")
+        if isinstance(a, _Const):
+            return _Const(math.fmod(a.value, b.value), "int")
+        k = abs(int(b.value))
+        return _Val(self.emit(OP_MOD, a.vreg, self.as_reg(b)), "int", ("mod", self.bound_of(a), k))
 
     def _compare(self, op: str, args):
         lhs, rhs = args
@@ -1052,7 +1079,8 @@ class _Builder:
 
 
 def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
-                     concat_dicts: bool = False, exact_bounds: bool = True) -> Optional[PipelineProgram]:
+                     concat_dicts: bool = False, exact_bounds: bool = True,
+                     int_extremes: bool = True) -> Optional[PipelineProgram]:
     """Compile ``predicates`` (ANDed) and ``aggs`` against ``table``.
 
     Returns ``None`` when anything is unsupported (the caller falls back to its
@@ -1062,9 +1090,13 @@ def compile_pipeline(predicates: List[Expr], aggs: List[Expr], table: pa.Table,
 
     ``exact_bounds=False`` skips the integer-exactness bounds (the data's min / max, one pass per column):
     the program is only good for naming its columns (``.columns``), never to run.
+
+    ``int_extremes`` (F-060c): the MIN / MAX of a bare integer column accumulates in int64 (``imin`` / ``imax`` slots
+    fed by ``OP_LOADI``), exact past 2^53. False where the columns are not the kernels' own arrays (a fused join's
+    gathered partner columns): those keep the float slots.
     """
     try:
-        return _compile(predicates, aggs, table, concat_dicts, exact_bounds)
+        return _compile(predicates, aggs, table, concat_dicts, exact_bounds, int_extremes)
     except Unsupported:
         return None
 
@@ -1118,7 +1150,7 @@ def _int_valued(e: Expr, table: pa.Table) -> bool:
         return isinstance(e.args[0], (int, np.integer)) and not isinstance(e.args[0], bool)
     if e.op == "case_when":                        # (condition, then, otherwise): the condition's type is not the value's
         return all(_int_valued(a, table) for a in e.args[1:])
-    if e.op not in ("add", "sub", "mul", "abs"):
+    if e.op not in ("add", "sub", "mul", "abs", "mod"):
         return False
     return all(_int_valued(a, table) for a in e.args if isinstance(a, Expr))
 
@@ -1142,7 +1174,7 @@ def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: List[Expr]) -> boo
 
 
 def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_dicts: bool = False,
-             exact_bounds: bool = True) -> PipelineProgram:
+             exact_bounds: bool = True, int_extremes: bool = True) -> PipelineProgram:
     b = _Builder(table, concat_dicts)
     b.skip_bounds = not exact_bounds
 
@@ -1179,6 +1211,19 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if e.op not in ("sum", "min", "max", "mean"):
             raise Unsupported(f"aggregate {e.op!r}")
         inner = b._need(e.args[0], "num")
+        if (int_extremes and e.op in ("min", "max") and e.args[0].op == "col" and not isinstance(inner, _Const)
+                and inner.kind == "int" and e.args[0].args[0] not in b.dict_arrays):
+            # F-060c: the MIN / MAX of an integer column is taken in int64, from the column's own values (OP_LOADI):
+            # no float64 round trip, so a value past 2^53 is exact and the result is the column's integer type
+            kind = "i" + e.op
+            key = (kind, e.args[0].signature())
+            if key not in slot_index:
+                slot_index[key] = len(slot_kinds)
+                slot_kinds.append(kind)
+                slot_src.append(b.emit(OP_LOADI, b._column(e.args[0].args[0]), key_extra=("coli",)))
+                slot_int.append(True)
+            outputs.append((name, kind, slot_index[key]))
+            continue
         # F-060: a sum (or mean) of integers is accumulated in int64 by the kernels, whatever the data. The inputs
         # are whole numbers within +-2^53 (a column's values are checked when it is bound, an intermediate is
         # bounded in `_arith`), so each converts to int64 exactly; a total past int64 makes the kernel return
@@ -1226,11 +1271,16 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
     b.dict_arrays = {n: d for n, d in b.dict_arrays.items() if n in b.columns}
     b.plain_str = [n for n in b.plain_str if n in b.columns]
     b.null_cols = [n for n in b.null_cols if n in b.columns]
+    exact_cols = [b.columns[ins[2]] for ins in pred_sec.instrs + body_sec.instrs if ins[0] == OP_LOADI]
+    exact_cols = [n for n in dict.fromkeys(exact_cols)
+                  if all(ins[0] == OP_LOADI for ins in pred_sec.instrs + body_sec.instrs
+                         if ins[0] in _COLUMN_OPS and b.columns[ins[2]] == n)]
 
     # ── register allocation ────────────────────────────────────────────────
     const_vregs = [b.const_vregs[k] for k in sorted(b.const_vregs)]
-    agg_instrs = [[OP_AGG_SUM if k == "sum" else OP_AGG_ISUM if k == "isum" else OP_AGG_MIN if k == "min" else OP_AGG_MAX,
-                   s, src, 0, 0] for s, (k, src) in enumerate(zip(slot_kinds, slot_src))]
+    agg_op = {"sum": OP_AGG_SUM, "isum": OP_AGG_ISUM, "min": OP_AGG_MIN, "max": OP_AGG_MAX,
+              "imin": OP_AGG_IMIN, "imax": OP_AGG_IMAX}
+    agg_instrs = [[agg_op[k], s, src, 0, 0] for s, (k, src) in enumerate(zip(slot_kinds, slot_src))]
     body_all = body_sec.instrs + agg_instrs
 
     phys, n_regs = _allocate_sections(const_vregs, pred_sec.instrs, pred_reg_v, body_all)
@@ -1242,7 +1292,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
 
     def encode(ins: List[int]) -> List[int]:
         op = ins[0]
-        if op == OP_LOAD_COL:
+        if op == OP_LOAD_COL or op == OP_LOADI:
             return [op, phys_of(ins[1]), ins[2], 0, 0]
         if op == OP_CMPC or op == OP_STR:
             return [op, phys_of(ins[1]), ins[2], ins[3], ins[4]]
@@ -1288,6 +1338,9 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
 
     identity = np.array([0.0 if k in ("sum", "isum") else np.inf if k == "min" else -np.inf for k in slot_kinds],
                         dtype=np.float64)
+    for s_, k in enumerate(slot_kinds):          # an integer extreme starts at the largest / smallest int64 (as bits)
+        if k in ("imin", "imax"):
+            identity.view(np.int64)[s_] = INT64_MAX if k == "imin" else INT64_MIN
     return PipelineProgram(
         code=np.asarray(flat, dtype=np.int32),
         consts=np.asarray(b.consts if b.consts else [0.0], dtype=np.float64),
@@ -1300,6 +1353,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         null_cols=list(b.null_cols),
         slot_kinds=slot_kinds,
         slot_int=slot_int,
+        exact_cols=exact_cols,
         outputs=outputs,
         nan_slots=nan_slots,
         n_regs=n_regs,
@@ -1408,7 +1462,7 @@ def _allocate_sections(const_vregs: List[int], pred: List[List[int]], pred_reg: 
 
 def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
-    if op in (OP_LOAD_COL, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR, OP_ISNULL):
+    if op in (OP_LOAD_COL, OP_LOADI, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR, OP_ISNULL):
         return []
     if op in (OP_NOT, OP_FLOOR, OP_IN_SET):
         return [ins[2]]
@@ -1440,6 +1494,10 @@ def merge_partials(program: PipelineProgram, parts: List[Partials]) -> Partials:
                 out.vals[s] = checked_int_add(out.ints(s), p.ints(s)).view(np.float64)
             elif kind == "min":
                 np.minimum(out.vals[s], p.vals[s], out=out.vals[s])
+            elif kind == "imin":
+                np.minimum(out.ints(s), p.ints(s), out=out.ints(s))
+            elif kind == "imax":
+                np.maximum(out.ints(s), p.ints(s), out=out.ints(s))
             else:
                 np.maximum(out.vals[s], p.vals[s], out=out.vals[s])
         out.cnt += p.cnt
@@ -1465,7 +1523,7 @@ def finalize(program: PipelineProgram, partials: Partials, grouped: bool):
         if op == "count":
             cols[name] = cnt[present].astype(np.int64)
             continue
-        if op == "isum":                                # an integer sum: int64, exactly
+        if op in ("isum", "imin", "imax"):              # an integer sum / extreme: int64, exactly
             v = partials.ints(slot)[present].copy()
             if not grouped and cnt[0] == 0:
                 v = np.ma.masked_all(v.shape, dtype=v.dtype)
