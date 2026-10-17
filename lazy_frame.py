@@ -1058,8 +1058,12 @@ def _resolve_scalars(plan, device: str, strict: bool):
             if b is False:
                 # no row can pass: an empty table of the same columns, so the input (a join of big Parquet files, say)
                 # is never run or streamed; Limit(0) where the columns cannot be named without running it
-                names = LazyFrame(out.input).schema
-                return Scan(names.empty_table()) if names is not None else Limit(out.input, 0)
+                from .io_parquet import _leaves
+                if any(isinstance(l, ParquetScan) for l in _leaves(out.input)):       # (in-memory inputs run as before)
+                    names = LazyFrame(out.input).schema
+                    if names is not None:
+                        return Scan(names.empty_table())
+                return Limit(out.input, 0)
         return out
 
     return walk(plan)
