@@ -1822,6 +1822,9 @@ class _SQLTranslator:
                                       f"({', '.join(self._INTERVAL_US)}); MONTH and YEAR only on a constant DATE")
         n = int(iv.this.this) * (1 if isinstance(node, sge.Add) else -1)
         self._no_constants(node, node.this)
+        t = self._col_type(node.this)
+        if t is not None and not (pa.types.is_date(t) or pa.types.is_timestamp(t)):      # (an int day number column: TPC-H files)
+            raise NotImplementedError(f"INTERVAL can be added to a DATE or TIMESTAMP column, not to {t}: {node.sql(dialect='duckdb')}")
         return self._expr(node.this).add_us(n * self._INTERVAL_US[unit])
 
     def _is_date_col(self, src: sge.Expression) -> bool:
@@ -1830,7 +1833,7 @@ class _SQLTranslator:
         if isinstance(src, sge.Case):                       # a CASE with a date result is a date
             return any(_date_of(r) is not None or self._is_date_col(r) for r in self._case_results(src))
         if isinstance(src, (sge.Add, sge.Sub)) and isinstance(_unparen(src.expression), sge.Interval):
-            return True                                     # DATE / timestamp + INTERVAL is a timestamp
+            return self._is_date_col(src.this)              # a DATE / timestamp column + INTERVAL is a timestamp
         if isinstance(src, sge.Coalesce):
             return any(_date_of(a) is not None or self._is_date_col(a) for a in [src.this] + list(src.expressions))
         if isinstance(src, sge.Nullif):

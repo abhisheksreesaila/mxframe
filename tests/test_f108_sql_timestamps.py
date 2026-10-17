@@ -482,3 +482,14 @@ def test_date_filter_still_native(monkeypatch):
     got, want, _, _ = _run("select g, sum(id) as s from t where id > 2 group by g order by g", "cpu")
     assert nx.last_path() == "native", nx.last_decline()
     assert got == want
+
+
+def test_constant_date_minus_interval_stays_a_day_number_next_to_an_integer_date_column(cfg):
+    """TPC-H Parquet files store dates as int32 day numbers: `l_shipdate <= date '1998-12-01' - interval '90' day`
+    is a day-number compare (a date literal there raised "no kernel matching int32, date32", seen in the SQL
+    native-coverage run)."""
+    days = pa.table({"day": pa.array([10_000, 10_400, 11_000, 11_300], pa.int32())})
+    cutoff = (dt.date(1998, 12, 1) - dt.timedelta(days=90) - dt.date(1970, 1, 1)).days            # 10_471
+    got = mx.sql("select day from days where day <= date '1998-12-01' - interval '90' day order by day",
+                 days=days).compute(device=cfg[0])
+    assert got.column("day").to_pylist() == [d for d in (10_000, 10_400, 11_000, 11_300) if d <= cutoff] == [10_000, 10_400]
