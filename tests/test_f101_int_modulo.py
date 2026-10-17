@@ -148,17 +148,60 @@ def test_a_row_filter_with_a_modulo_is_the_native_filter(run, q):
 
 # -- negatives, zero divisors, NULLs: the sign follows the dividend; the rest declines and stays exact -----
 
-def test_the_sign_follows_the_dividend_in_the_kernels():
-    """-7 % 3 = -1, 7 % -3 = 1, -7 % -3 = -1, 0 % 5 = 0 (DuckDB): through the bytecode, not Arrow."""
-    t = pa.table({"a": A(np.array([-7, 7, -7, 0, -6, 6, -1, 1, 2 ** 53 - 1, -(2 ** 53 - 1)] * 3000, dtype=np.int64)),
-                  "g": A(np.zeros(30000, dtype=np.int64))})
-    for k in (3, -3, 1, -1, 7, 2 ** 40):
-        q = f"select a % {k} as m, count(*) as c from t group by a % {k}"
-        con = duckdb.connect()
-        con.register("t", t)
-        want = _norm(con.execute(q).fetchall())
-        got = mx.sql(q, t=t).compute(device="cpu")
-        assert _norm(zip(got.column("m").to_pylist(), got.column("c").to_pylist())) == want, k
+@pytest.mark.parametrize("k", [3, -3, 1, -1, 7, 2 ** 40])
+@pytest.mark.parametrize("native,device", CPU_GPU)
+def test_the_sign_follows_the_dividend_in_the_kernels(run, native, device, k):
+    """-7 % 3 = -1, 7 % -3 = 1: through the bytecode, not Arrow (asserted), for both signs and values up to 2^53.
+    The one divisor that is not compiled is -1 (F-126: INT_MIN % -1 overflows, which only Arrow's checked modulo can
+    see): same answer, from Arrow."""
+    q = (f"select g, sum(edge % {k}) as s, sum(i32 % {k}) as r, count(*) as c from t "
+         f"where edge % {k} < 0 or i32 % {k} > 0 group by g")
+    rows, paths, _, _ = run(q, native, device)
+    assert rows == _norm(_want(q))
+    if k == -1:
+        assert not set(paths) & {"native", "fused_pipeline_cpu", "fused_pipeline_gpu"}, paths
+    else:
+        assert _on_the_bytecode(paths, native, device), paths
+
+
+@pytest.mark.parametrize("native,device", CPU_GPU)
+@pytest.mark.parametrize("dt,low", [(np.int8, -128), (np.int16, -2 ** 15), (np.int32, -2 ** 31), (np.int64, I64_MIN)])
+@pytest.mark.parametrize("shape", ["global", "grouped", "filter", "key"])
+def test_the_minimum_of_a_type_modulo_minus_one_raises_like_duckdb(monkeypatch, native, device, dt, low, shape):
+    """INT_MIN % -1 is an overflow in DuckDB ("Overflow in division of -2147483648 / -1"), never 0, on every path."""
+    monkeypatch.setenv("MXFRAME_NATIVE", native)
+    if native == "1" and not nx.available():
+        pytest.skip("libmxexec_cpu.so not built")
+    n = 40_000
+    x = ((np.arange(n) % 100) - 50).astype(dt)
+    x[17] = low
+    t = pa.table({"x": A(x), "g": A((np.arange(n) % 3).astype(np.int64))})
+    q = {"global": "select sum(x % -1) as s from t", "grouped": "select g, sum(x % -1) as s from t group by g",
+         "filter": "select count(*) as n from t where x % -1 = 0", "key": "select x % -1 as m, count(*) as n from t group by x % -1"}[shape]
+    con = duckdb.connect()
+    con.register("t", t)
+    with pytest.raises(duckdb.OutOfRangeException, match="Overflow in division of"):
+        con.execute(q).fetchall()
+    with pytest.raises(OverflowError, match=f"Overflow in division of {low} / -1"):
+        mx.sql(q, t=t).compute(device=device)
+
+
+@pytest.mark.parametrize("native,device", CPU_GPU)
+def test_modulo_minus_one_without_the_minimum_is_zero_and_a_wider_divisor_does_not_overflow(monkeypatch, native, device):
+    monkeypatch.setenv("MXFRAME_NATIVE", native)
+    if native == "1" and not nx.available():
+        pytest.skip("libmxexec_cpu.so not built")
+    n = 40_000
+    x = ((np.arange(n) % 100) - 50).astype(np.int32)
+    lowest = x.copy()
+    lowest[17] = -2 ** 31
+    t = pa.table({"x": A(x), "lowest": A(lowest), "m": A(np.full(n, -1, dtype=np.int64)), "g": A((np.arange(n) % 3).astype(np.int64))})
+    con = duckdb.connect()
+    con.register("t", t)
+    for q in ("select g, sum(x % -1) as s, count(*) as n from t group by g order by g",
+              "select g, sum(lowest % m) as s, count(*) as n from t group by g order by g"):    # INT32_MIN % BIGINT -1 = 0
+        got = mx.sql(q, t=t).compute(device=device)
+        assert [tuple(r.values()) for r in got.to_pylist()] == con.execute(q).fetchall(), q
 
 
 DECLINED = [
