@@ -323,6 +323,14 @@ class LazyFrame:
                 for line in opt.trace:
                     print(f"  - {line}")
 
+        from . import streamed as _streamed
+        got = _streamed.try_stream(self, plan, device, strict=strict, prefer=prefer, placement=placement,
+                                   gpu_fraction=gpu_fraction, verbose=verbose)
+        if got is not None:                 # the sources are bigger than memory: ran in batches of row groups (F-056)
+            self._last_optimizer_trace = list(optimizer_trace or [])
+            self._last_compile_provenance = got[1]
+            return got[0]
+
         plan = resolve_plan(plan, count_distinct_codes=(device == "cpu"))
         if validate:
             from .plan_validation import validate_plan_or_raise
@@ -367,7 +375,7 @@ class LazyFrame:
                 if decision.estimate is not None and decision.gpu_available:
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
-                if decision.upload:
+                if decision.upload and not _streamed.active():     # a streamed batch is never seen again
                     # A split would win once the columns are on the GPU (F-057): this query runs native, and the
                     # upload (group ids, then the columns) starts when it has returned.
                     from . import pipeline_exec as _pe
@@ -432,6 +440,10 @@ class LazyFrame:
         if optimized:
             lines.append("PassTrace")
             lines.extend(trace if trace else ["no-op"])
+        from . import streamed as _streamed
+        stream = _streamed.describe(plan, device if device in ("cpu", "gpu") else "cpu")
+        if stream is not None:                         # a lazy Parquet source: will it stream (F-056 step 2)?
+            lines.extend(["Streaming", stream])
         if include_runtime:
             lines.append("LastCompileProvenance")
             if self._last_compile_provenance:
