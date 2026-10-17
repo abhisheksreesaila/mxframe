@@ -32,6 +32,7 @@ from .gpu_budget import fmt_bytes
 from .lazy_expr import Expr, col
 from .lazy_frame import (Aggregate, Distinct, Filter, Join, LazyFrame, Limit, LogicalPlan, ParquetScan, Project,
                          Scan, Sort, Tail)
+from . import np_arrow
 from . import spill as _spill
 
 WORKING_FACTOR = 3            # in-memory path: the table, the filtered copy, group ids / gather buffers
@@ -44,6 +45,7 @@ MERGE_FACTOR = 4             # the engine's group-by holds about this many times
 MIN_SLICE_ROWS = 1024        # a slice of an oversized row group is never smaller
 
 _active: contextvars.ContextVar = contextvars.ContextVar("mxframe_streamed_active", default=False)
+_out: contextvars.ContextVar = contextvars.ContextVar("mxframe_sink_out", default=None)     # F-113: the file a sink writes
 _AGGS = ("sum", "mean", "count", "min", "max")
 _WINDOW = ("window", "rank", "dense_rank", "lag", "lead", "cum_sum", "row_number")
 
@@ -242,6 +244,7 @@ class Plan:
     resident: int = 0                   # bytes of the dimension tables kept for all batches
     prune: bool = False                 # rows: select only the columns the plan reads (a bare Filter over the file)
     grace: Optional[Join] = None        # step 3b: the join of two big sides, run as a Grace hash join (grace.py)
+    plan: LogicalPlan = None            # the plan to run: the one given, or its count-distinct rewrite (step 3c)
 
 
 def _grace_at(chain, agg_at, leaves, feet, big, budget: int) -> Optional[int]:
@@ -263,9 +266,51 @@ def _grace_at(chain, agg_at, leaves, feet, big, budget: int) -> Optional[int]:
     return None
 
 
+def _distinct_to_aggregate(plan):
+    """The plan with every `Aggregate(Distinct(X), keys, aggs)` rewritten as `Aggregate(Aggregate(X, every column of X,
+    [count(1)]), keys, aggs)`, or None when there is none (F-056 step 3c: count(distinct x) per group).
+
+    Removing duplicate rows is grouping by all their columns, which the engine does with the same rules (one group for
+    every NaN, -0.0 with 0.0, one for NULL), so the answer is the same; and a group-by is what streams: its partials
+    merge, and when the (keys, x) pairs are more than fit they are hash-partitioned to disk, each partition
+    deduplicated on its own."""
+    changed = [False]
+
+    def walk(n):
+        if isinstance(n, Join):
+            return dataclasses.replace(n, left=walk(n.left), right=walk(n.right))
+        if getattr(n, "input", None) is None:
+            return n
+        n = dataclasses.replace(n, input=walk(n.input))
+        if isinstance(n, Aggregate) and isinstance(n.input, Distinct) and not n.input.subset:
+            names = (LazyFrame(n.input.input).schema or pa.schema([])).names
+            if names:
+                changed[0] = True
+                inner = Aggregate(n.input.input, [col(c) for c in names], [Expr("count", Expr("lit", 1)).alias("__dn")])
+                return dataclasses.replace(n, input=inner)
+        return n
+    out = walk(plan)
+    return out if changed[0] else None
+
+
 def analyse(plan, budget: int, device: str, reproducible: bool):
     """A `Plan` if the plan should and can stream, None if it fits in memory, else the reason it cannot
-    (a string)."""
+    (a string). A plan with a Distinct below an Aggregate that declines for it is tried again as the group-by it
+    stands for (`_distinct_to_aggregate`); the `Plan` then names the rewritten plan to run."""
+    got = _analyse(plan, budget, device, reproducible)
+    if isinstance(got, Plan):
+        got.plan = plan
+    elif isinstance(got, str) and "Distinct" in got:
+        alt = _distinct_to_aggregate(plan)
+        if alt is not None:
+            again = _analyse(alt, budget, device, reproducible)
+            if isinstance(again, Plan):
+                again.plan = alt
+                return again
+    return got
+
+
+def _analyse(plan, budget: int, device: str, reproducible: bool):
     from .io_parquet import resolve_plan
     resolved = resolve_plan(plan, read=False)
     leaves, rleaves = _leaves(plan), _leaves(resolved)
@@ -488,6 +533,120 @@ class _State:
         return pa.table(arrays, names=names)
 
 
+# --- F-113: writing a result bigger than memory -------------------------------------------------------------------
+
+class ParquetOut:
+    """The Parquet file `LazyFrame.sink_parquet` writes. A streamed query hands it the pieces of its result as they
+    are produced (`write`), small ones buffered into row groups of about `flush_bytes`; a query that was not
+    streamed hands it its table at the end. The file is written next to its final name and renamed when complete, so
+    a failed query leaves neither a partial file nor a damaged old one."""
+
+    def __init__(self, path, compression: str = "zstd"):
+        self.path = os.path.abspath(os.fspath(path))
+        self.tmp = None                          # a unique file next to `path` (threads may sink to one path), made on open
+        self.compression = compression
+        self.writer = None
+        self.schema: Optional[pa.Schema] = None
+        self.empty: Optional[pa.Table] = None
+        self.buffer: List[pa.Table] = []
+        self.buffered = 0
+        self.rows = 0
+        self.streamed = False                    # a streamed query wrote into it (its returned table is empty)
+        self.flush_bytes = 32 << 20
+
+    def attach(self, budget: int) -> None:
+        self.streamed = True
+        self.flush_bytes = max(256 << 10, min(32 << 20, budget // 16))
+
+    def write(self, t: pa.Table) -> None:
+        t = _plain(t)
+        if t.num_rows == 0:
+            self.empty = t
+            return
+        self.buffer.append(t)
+        self.buffered += t.nbytes
+        if self.buffered >= self.flush_bytes:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.buffer:
+            return
+        t = self.buffer[0] if len(self.buffer) == 1 else pa.concat_tables(self.buffer, promote_options="default")
+        self.buffer, self.buffered = [], 0
+        self._write(t)
+
+    def _write(self, t: pa.Table) -> None:
+        import pyarrow.parquet as pq
+        if self.writer is None:
+            import tempfile
+            fd, self.tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=os.path.basename(self.path) + ".", suffix=".partial")
+            os.close(fd)
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(self.tmp, 0o666 & ~umask)
+            self.schema = t.schema
+            self.writer = pq.ParquetWriter(self.tmp, self.schema, compression=self.compression)
+        elif not t.schema.equals(self.schema):
+            try:
+                t = t.select(self.schema.names).cast(self.schema)
+            except (pa.ArrowInvalid, pa.ArrowNotImplementedError, KeyError) as e:
+                raise TypeError(f"sink_parquet: a later piece of the result has columns {t.schema.names} of types "
+                                f"{[str(x) for x in t.schema.types]}, which do not fit the first piece's "
+                                f"{[str(x) for x in self.schema.types]}: {e}") from e
+        self.writer.write_table(t)
+        self.rows += t.num_rows
+
+    def no_rows(self) -> pa.Table:
+        sch = self.schema or (self.empty.schema if self.empty is not None else None)
+        return np_arrow.empty(sch if sch is not None else pa.schema([]))
+
+    def finish(self, table: Optional[pa.Table] = None) -> int:
+        """Close the file (writing `table` first when the query was not streamed) and move it into place."""
+        if table is not None and not self.streamed:
+            self.write(_plain(table))
+            self.empty = self.empty if self.empty is not None else _plain(table)
+        self.flush()
+        if self.writer is None:                                  # no rows: a file with the columns
+            self._write(self.empty if self.empty is not None else np_arrow.empty(pa.schema([])))
+        self.writer.close()
+        self.writer = None
+        os.replace(self.tmp, self.path)
+        return self.rows
+
+    def abort(self) -> None:
+        try:
+            if self.writer is not None:
+                self.writer.close()
+        except Exception:
+            pass
+        self.writer = None
+        try:
+            if self.tmp:
+                os.remove(self.tmp)
+        except OSError:
+            pass
+
+
+def sink_parquet(lf, path, device: str = "cpu", *, compression: str = "zstd", **kwargs) -> int:
+    """Run `lf` and write its result to the Parquet file `path`; returns the number of rows written. A result bigger
+    than the host memory budget is streamed into the file piece by piece (batches of a filter, spilled groups, join
+    pairs, sorted ranges) instead of being built as one table."""
+    out = ParquetOut(path, compression)
+    token = _out.set(out)
+    try:
+        table = lf.compute(device, **kwargs)
+        n = out.finish(table)
+    except BaseException:
+        out.abort()
+        raise
+    finally:
+        _out.reset(token)
+    prov = dict(lf.last_compile_provenance or {})
+    prov["sink"] = {"path": out.path, "rows": n, "streamed": out.streamed}
+    lf._last_compile_provenance = prov
+    return n
+
+
 # --- what happens to the rows the streamed part of the plan produces ---------------------------------------------
 
 def _plain(t: pa.Table) -> pa.Table:
@@ -510,6 +669,9 @@ class _Sink:
         self.tables: List[pa.Table] = []
         self.rows = self.bytes = self.pending_rows = 0
         self.empty: Optional[pa.Table] = None
+        self.out: Optional[ParquetOut] = None          # F-113: the rows go straight into this file, none are kept
+        self.ext = None                                # kind "sort": the external sort the rows are handed to
+        self.sort_out: Optional[ParquetOut] = None     # kind "sort": the file the sorted ranges are written to when the plan allows
 
     @property
     def full(self) -> bool:
@@ -524,6 +686,14 @@ class _Sink:
 
     def add(self, t: pa.Table, progress: Optional[float] = None) -> None:
         t = _plain(t)
+        if self.out is not None:
+            self.out.write(t)
+            self.rows += t.num_rows
+            return
+        if self.ext is not None:
+            self.ext.add(t)
+            self.rows += t.num_rows
+            return
         if t.num_rows == 0:
             self.empty = t
             return
@@ -547,7 +717,12 @@ class _Sink:
             return self.empty
         return self.tables[0] if len(self.tables) == 1 else pa.concat_tables(self.tables, promote_options="default")
 
-    def _too_big(self, progress: Optional[float]) -> None:
+    def _too_big(self, progress: Optional[float], size: Optional[int] = None) -> None:
+        if size is not None:                                     # a sorted result that does not fit
+            raise MemoryError(
+                f"the result of this query is bigger than memory: the {self.ext.rows:,} sorted rows are about "
+                f"{fmt_bytes(self.ext.nbytes)}, and only {fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Write it to a file "
+                f"with sink_parquet(path), add a LIMIT or a tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
         if self.kind == "top-k":
             self._reduce()
             if self.bytes <= self.limit:
@@ -559,16 +734,51 @@ class _Sink:
         subject = f"the rows that the {self.above} above the big file needs are" if self.above else "the result of this query is"
         raise MemoryError(
             f"{subject} bigger than memory: {what} are {fmt_bytes(self.bytes)}{guess}, and only "
-            f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Add a LIMIT or a "
-            f"tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
+            f"{fmt_bytes(self.limit)} fits the host memory budget of {fmt_bytes(self.budget)}. Write it to a file "
+            f"with sink_parquet(path), add a LIMIT or a tighter filter, aggregate it, or raise MXFRAME_HOST_MEM_BUDGET")
+
+    def _post(self, plan, above, r: pa.Table) -> pa.Table:
+        """`r` (rows in sorted order) through the row-local nodes above the Sort."""
+        return r if not above else LazyFrame(_replace(plan, self.sort, Scan(r))).compute(
+            "cpu", optimize=False, validate=False)
+
+    def finish(self, plan, top) -> tuple:
+        """(the table the streamed part produced, the plan to run on it): the rest of the original plan with the
+        streamed part replaced by that table. A sorted result replaces the Sort node itself."""
+        if self.ext is None:
+            table = self.result()
+            return table, _replace(plan, top, Scan(table))
+        above = list(reversed(_chain(plan, self.sort)[:-1]))                 # the nodes over the Sort, nearest first
+        local = all(isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)) for n in above)
+        if self.sort_out is not None and local:                              # sorted ranges, each finished by the nodes above
+            self.sort_out.attach(self.budget)
+            wrote = False
+            for r in self.ext.ranges():
+                wrote = True
+                self.sort_out.write(self._post(plan, above, r))
+            if not wrote and self.ext.empty is not None:             # no rows: the columns the nodes above give
+                self.sort_out.write(self._post(plan, above, self.ext.empty))
+            table = self.sort_out.no_rows()
+            return table, Scan(table)
+        got, size = [], 0
+        for r in self.ext.ranges():
+            size += r.nbytes
+            if size > self.limit:
+                self._too_big(None, size)
+            got.append(r)
+        table = got[0] if len(got) == 1 else pa.concat_tables(got) if got else self.ext.empty
+        return table, _replace(plan, self.sort, Scan(table))
 
     def result(self) -> pa.Table:
+        if self.out is not None:
+            return self.out.no_rows()
         if self.kind == "top-k" and len(self.tables) > 1:
             self._reduce()
         return self._concat()
 
 
-def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int) -> _Sink:
+def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int, out: Optional[ParquetOut] = None,
+              root=None, held=lambda: 0) -> _Sink:
     """The sink for what sits above `top` in `plan` (`_chain` finds it): a Sort then (optionally some row-local
     Projects and) a Limit is a top-k, a Limit alone stops early, anything else collects."""
     above = list(reversed(_chain(plan, top)[:-1]))
@@ -582,7 +792,16 @@ def _sink_for(plan, top, limit_direct: int, limit_above: int, budget: int) -> _S
                 return _Sink("top-k", n.n + n.offset, above[0], limit, budget, name)
             if not (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
                 break
-    return _Sink("collect", 0, None, limit, budget, name)
+    if above and isinstance(above[0], Sort) and root is not None:      # no LIMIT: sorted runs on disk, merged by key ranges
+        from .extsort import ExternalSort
+        sink = _Sink("sort", 0, above[0], limit, budget, name)
+        sink.ext, sink.sort_out = ExternalSort(above[0], root, budget, held), out
+        return sink
+    sink = _Sink("collect", 0, None, limit, budget, name)
+    if out is not None and not above:                  # the rows are the result: write them as they come
+        sink.out = out
+        out.attach(budget)
+    return sink
 
 
 def describe(plan, device: str = "cpu") -> Optional[str]:
@@ -644,9 +863,11 @@ def _stream_parts(got: Plan, st, plan_for, run):
     for batch in got.batches:
         st.groups = tuple(batch)
         st.slice_rows = got.slice_rows.get(batch[0]) if len(batch) == 1 else None
+        st.slice_last = False
         if st.slice_rows:
             st.slice_no = sliced[batch[0]]
             sliced[batch[0]] += 1
+            st.slice_last = sliced[batch[0]] == n_slices[batch[0]]
         share = size_of[batch[0]] / n_slices[batch[0]] if st.slice_rows else sum(size_of[g] for g in batch)
         run.biggest = max(run.biggest, int(share))
         yield run(plan_for()), share, f"{len(batch)} row groups"
@@ -666,6 +887,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     got = analyse(plan, budget, device, repro)
     if got is None:
         return None
+    if isinstance(got, Plan):
+        plan = got.plan
     if isinstance(got, str):
         warnings.warn(f"mxframe: this query's working set does not fit in memory (budget {fmt_bytes(budget)}); "
                       f"not streamed: {got}. Running it in memory, which may run out of memory.",
@@ -674,11 +897,13 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     spec, leaf = got.spec, got.leaf
     from .pipeline_program import sum_probe
     root = _spill.SpillDir("join partitions" if got.grace is not None else "group state")
+    out = _out.get()
     sink, state, batches_run, rows_info, graced = None, None, 0, None, None
     free = max(budget - got.resident, budget // 8)          # what the dimension tables kept resident leave
     if spec is None:                                        # a batch is in flight (input x working factor) while rows are collected
-        sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR, budget)
-    token = _active.set(True)
+        sink = _sink_for(plan, got.top, max(free - got.batch_target * WORKING_FACTOR, budget // 8), free // WORKING_FACTOR,
+                         budget, out, root, lambda: got.resident)
+    token, out_token = _active.set(True), _out.set(None)      # a nested streamed compute (a Grace side) must not write into the sink file
     try:
         with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
             run = _Runner(device, strict, prefer, placement, gpu_fraction, probe)
@@ -704,27 +929,50 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                           f"{n_in}, {part.num_rows} {'partial ' if spec else ''}rows")
                 if sink is not None and sink.full:
                     break
-            if spec is not None and not state.spilled:
-                merged = state.result()                              # the usual case: the groups fit
-                above = _replace(plan, spec.agg, Scan(merged))
-                table = merged
-            else:
-                if spec is not None:                                 # spilled groups: one partition at a time
-                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget)
-                    rowwise = got.top is not spec.agg
-                    for piece in state.pieces():
-                        out = state.format(piece)
-                        if rowwise:
-                            out = LazyFrame(_replace(got.top, spec.agg, Scan(out))).compute(
-                                "cpu", optimize=False, validate=False)
-                        sink.add(out)
-                        if sink.full:
-                            break
-                table = sink.result()
-                above = _replace(plan, got.top, Scan(table))
-                rows_info = {"kind": sink.kind, "batches_run": batches_run}
+            stage_spec, stage_state, stage_top, stages = spec, state, got.top, 1
+            with contextlib.ExitStack() as probes:                   # a later stage's SumProbe stays open until its result is read
+                while True:
+                    if stage_spec is not None and not stage_state.spilled:
+                        merged = stage_state.result()                # the usual case: the groups fit
+                        above = _replace(plan, stage_spec.agg, Scan(merged))
+                        table = merged
+                        break
+                    if stage_spec is not None:                       # spilled groups: one partition at a time
+                        rowwise = stage_top is not stage_spec.agg
+                        nxt = _next_stage(plan, stage_top)
+                        if nxt is not None:                          # count(distinct x): another group-by over the groups
+                            spec2, top2 = nxt
+                            probe2 = probes.enter_context(sum_probe(names=spec2.int_sums))
+                            state2 = _State(spec2, budget, probe2, root, held=lambda: got.resident)
+                            for piece in stage_state.pieces():
+                                rows = stage_state.format(piece)
+                                if rowwise:
+                                    rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
+                                        "cpu", optimize=False, validate=False)
+                                probe2.begin()
+                                state2.add(LazyFrame(dataclasses.replace(spec2.partial, input=Scan(rows))).compute(
+                                    "cpu", optimize=False, validate=False))
+                                probe2.end()
+                            stage_spec, stage_state, stage_top, stages = spec2, state2, top2, stages + 1
+                            continue
+                        sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, out, root,
+                                         lambda: got.resident)
+                        for piece in stage_state.pieces():
+                            rows = stage_state.format(piece)
+                            if rowwise:
+                                rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
+                                    "cpu", optimize=False, validate=False)
+                            sink.add(rows)
+                            if sink.full:
+                                break
+                    table, above = sink.finish(plan, stage_top)
+                    rows_info = {"kind": sink.kind, "batches_run": batches_run}
+                    if sink.ext is not None:
+                        rows_info["sort"] = dict(sink.ext.stats, rows=sink.ext.rows)
+                    break
     finally:
         _active.reset(token)
+        _out.reset(out_token)
         root.close()
     result = table if isinstance(above, Scan) else LazyFrame(above).compute(
         device, optimize=False, validate=False, strict=strict, prefer=prefer, placement=placement,
@@ -739,14 +987,38 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
         info.update(merges=state.merges, group_state_rows=state.peak_state)
     if root.partitions:
         info["spill"] = {"partitions": root.partitions, "bytes": root.bytes, "depth": root.depth}
-    if rows_info is not None and spec is None:
+    if rows_info is not None and (spec is None or "sort" in rows_info):
         info["rows"] = rows_info
+    if stages > 1:
+        info["stages"] = stages
     if got.slice_rows:
         info["slices"] = {"row_groups": len(got.slice_rows), "rows_per_slice": min(got.slice_rows.values())}
     prov = {"path": "streamed", "device": device, "rows": result.num_rows, "streamed": info}
     if run.pieces:
         prov["gpu_pieces"] = "; ".join(f"{n} batches: {s}" for s, n in run.pieces.items())
     return result, prov
+
+
+def _next_stage(plan, top):
+    """(_Spec, top) of a second group-by right above the streamed one (`top` is the topmost row-local node over the
+    first Aggregate), else None: the shape of `count(distinct x)` per group, `Aggregate(Aggregate(...))`. The first
+    aggregate's groups, one hash partition at a time, are then the batches of the second, and the second's own
+    partials merge like any other (it spills too when its groups are many)."""
+    above = list(reversed(_chain(plan, top)[:-1]))
+    if not above or not isinstance(above[0], Aggregate):
+        return None
+    try:
+        spec = _spec(above[0])
+        _argument_types(spec)
+    except _Decline:
+        return None
+    top2 = above[0]
+    for n in above[1:]:                                 # a HAVING filter / projection works group by group
+        if isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
+            top2 = n
+        else:
+            break
+    return spec, top2
 
 
 def _pruned(got: Plan):

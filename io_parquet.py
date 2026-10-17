@@ -188,6 +188,12 @@ def _next_slice(st, pf, path, columns, groups, dict_cols, md) -> pa.Table:
                            f"{state[0]}: the streamed file was read more than once (or not at all) in a batch")
     state[0] += 1
     rb = next(state[1], None)
+    if st.slice_last:                            # drop the reader (and its page buffers) with the group's last slice
+        st._once.pop(("slices", os.path.abspath(path), tuple(groups)), None)
+        close = getattr(state[1], "close", None)
+        if close:
+            close()
+        state[1] = None
     if rb is None:
         from .np_arrow import empty
         t = empty(pf.schema_arrow)
@@ -633,6 +639,7 @@ class StreamContext:
         self.groups: Optional[tuple] = None          # the current batch's row groups
         self.slice_rows: Optional[int] = None        # set: the batch is one row group read this many rows at a time
         self.slice_no = 0                            # which slice of that group the current batch is
+        self.slice_last = False                      # the current batch is the last slice of its group: its reader is closed after it
         self._once: dict = {}
 
     def is_streamed(self, path) -> bool:
