@@ -15,7 +15,7 @@ import mxframe as mx
 from _sql_reference import T, check, cfg  # noqa: F401  (cfg is the fixture)
 
 CONSTANTS = {
-    "int": "1", "negative": "-7", "zero": "0", "big": "3000000000", "int32_max": "2147483647",
+    "int": "1", "negative": "-7", "int32_min": "-2147483648", "above_int32_min": "-2147483647", "zero": "0", "big": "3000000000", "int32_max": "2147483647",
     "past_int32": "2147483648", "float": "1.5", "double": "1e0", "string": "'a'", "empty_string": "''",
     "quoted": "'it''s'", "date": "date '2020-01-02'", "true": "true", "false": "false", "null": "null",
     "sum": "1 + 1", "product": "2 * 3", "paren": "(5)", "neg_paren": "-(1)", "plus": "+1",

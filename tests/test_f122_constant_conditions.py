@@ -17,10 +17,10 @@ from _sql_reference import check, cfg  # noqa: F401  (cfg is the fixture)
 
 TRUE_ = ["1 = 1", "true", "1", "2 > 1", "'a' = 'a'", "not false", "not (1 = 0)", "1 = 1 and true", "false or true",
          "null is null", "1 is not null", "not null is not null", "true is true", "-1 < 0",
-         "1.5 > 1", "'a' < 'b'", "(1 = 1)", "((true))", "not not true", "null or true", "1 <> 2", "2 >= 2", "1 <= 1"]
+         "1.5 > 1", "0.1 + 0.2 = 0.3", "1 in (1, 2)", "'true'", "'a' in ('a')", "'a' < 'b'", "(1 = 1)", "((true))", "not not true", "null or true", "1 <> 2", "2 >= 2", "1 <= 1"]
 FALSE_ = ["1 = 0", "false", "0", "1 > 2", "'a' = 'b'", "not true", "not (1 = 1)", "1 = 1 and false", "false and true",
           "null is not null", "1 is null", "true is false", "null is true", "(1 = 0)", "0.0 = 1", "1 > 1",
-          "not 1", "'b' < 'a'", "not not false"]
+          "not 1", "'b' < 'a'", "not not false", "0.1e0 + 0.2e0 = 0.3e0", "1e0 = 2", "1 in (3)", "'false'"]
 NULL_ = ["null", "not null", "1 = null", "null = null", "null and true", "null or false", "null > 1", "null <> null",
          "(null)", "not (null = 1)", "not not null", "null and null"]
 
@@ -69,6 +69,11 @@ def test_constant_where_with_aggregates(cfg, cond):
     "select id from t where not (x > 3 or true) order by id",
     "select id from t where not (x > 3 or false) order by id",                   # NULL x: NOT NULL is NULL, not kept
     "select id from t where not (x > 3 and true) order by id",
+    "select id from t where not (x > 3 or null) order by id",                    # NOT (x OR NULL): never TRUE (F-122 review)
+    "select id from t where not (x > 3 and null) order by id",
+    "select id from t where not (null or null) order by id",
+    "select id from t where not (x is null and null) order by id",
+    "select id from t where not (not (x > 3 or null)) order by id",
     "select id from t where not (1 = 1 and x > 3) order by id",
     "select id from t where (x > 3 and 1 = 1) or (x < 3 and 1 = 0) order by id",
     "select id from t where 1 = 1 and (g = 'a' or 1 = 0) and not (1 = 0) order by id",
@@ -173,3 +178,27 @@ def test_a_constant_condition_in_a_subquery_and_a_cte(cfg):
     check("select id from t where id in (select id from t where 1 = 1 and x > 8) order by id", cfg[0])
     check("select (select count(*) from t where 1 = 0) as n from u limit 1", cfg[0], types=False)
     check("select (select count(*) from t where 1 = 1) as n from u limit 1", cfg[0], types=False)
+
+
+def test_a_false_on_does_not_build_the_cross_product_of_big_inputs():
+    # 3000 x 3000 is past the 4M cross-join cap; the right side is already empty, so the cap does not apply
+    import duckdb
+    import numpy as np
+    import pyarrow as pa
+    import mxframe as mx
+    n = 3000
+    a = pa.table({"k": pa.array(np.arange(n)), "v": pa.array(np.arange(n))})
+    b = pa.table({"k": pa.array(np.arange(n)), "w": pa.array(np.arange(n))})
+    con = duckdb.connect()
+    con.register("a", a)
+    con.register("b", b)
+    for q in ["select a.k, b.w from a left join b on false order by a.k",
+              "select a.k, b.w from a join b on false",
+              "select a.k, b.w from a left join b on a.k = b.k and false order by a.k",
+              "select a.k, b.w from a join b on a.k = b.k and 1 = 0",
+              "select a.k, b.w from a left join b on a.k = b.k and null order by a.k",
+              "select a.k, b.w from a left join b on a.k = b.k and 1 = 1 order by a.k"]:
+        want = con.execute(q).to_arrow_table()
+        got = mx.sql(q, a=a, b=b).compute()
+        assert got.column_names == want.column_names and got.num_rows == want.num_rows, q
+        assert got.to_pylist() == want.to_pylist(), q

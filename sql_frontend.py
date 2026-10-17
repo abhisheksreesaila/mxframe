@@ -75,6 +75,11 @@ def sql(query: str, **tables) -> LazyFrame:
 _CROSS_LIMIT = 4_000_000          # row pairs a join with no equality (a cross product) may build
 
 
+def _is_never(pred: Expr) -> bool:
+    """The predicate `_SQLTranslator._never` builds (``x IS NULL AND NOT x IS NULL``): no row passes."""
+    return pred.op == "and" and pred.args[0].op == "is_null" and pred.args[1].op == "not"
+
+
 def _rows_upper(plan: LogicalPlan) -> Optional[int]:
     """An upper bound on the rows ``plan`` yields (not its actual count), when that is cheap to know (tables, Parquet footers and what only
     keeps or reshapes their rows); else None."""
@@ -83,6 +88,8 @@ def _rows_upper(plan: LogicalPlan) -> Optional[int]:
     if isinstance(plan, ParquetScan):
         from .io_parquet import _metadata
         return _metadata(plan.path).num_rows
+    if isinstance(plan, Filter) and _is_never(plan.predicate):
+        return 0
     if isinstance(plan, Limit):
         inner = _rows_upper(plan.input)
         if plan.n is None:                                   # OFFSET without LIMIT: what is left after the skipped rows
@@ -142,17 +149,26 @@ def _const_scalar(n: sge.Expression):
         return bool(n.this)
     if isinstance(n, sge.Literal):
         try:
-            return str(n.this) if n.is_string else Decimal(str(n.this).replace("_", ""))
+            if n.is_string:
+                return str(n.this)
+            text = str(n.this).replace("_", "")
+            return float(text) if re.search(r"[eE]", text) else Decimal(text)      # 1e0 is a DOUBLE, 1.5 a DECIMAL
         except ArithmeticError:
             return _UNKNOWN
     if isinstance(n, sge.Neg):
         v = _const_scalar(n.this)
-        return -v if isinstance(v, Decimal) else _UNKNOWN
+        return -v if isinstance(v, (Decimal, float)) else _UNKNOWN
     if isinstance(n, (sge.Add, sge.Sub, sge.Mul)):
         a, b = _const_scalar(n.this), _const_scalar(n.expression)
-        if isinstance(a, Decimal) and isinstance(b, Decimal):
+        if isinstance(a, (Decimal, float)) and isinstance(b, (Decimal, float)):
+            a, b = _same_kind(a, b)
             return a + b if isinstance(n, sge.Add) else a - b if isinstance(n, sge.Sub) else a * b
     return _UNKNOWN
+
+
+def _same_kind(a, b):
+    """Two constant numbers in one type: a DOUBLE (float) next to a DECIMAL makes both DOUBLE, as in DuckDB."""
+    return (float(a), float(b)) if isinstance(a, float) or isinstance(b, float) else (a, b)
 
 
 def _const_truth(n: sge.Expression):
@@ -160,8 +176,10 @@ def _const_truth(n: sge.Expression):
     ``_UNKNOWN``. A number is true when it is not zero."""
     n = _unparen(n)
     v = _const_scalar(n)
+    if isinstance(v, str) and v.lower() in ("true", "t", "false", "f"):      # a string cast to BOOLEAN
+        return v.lower() in ("true", "t")
     if v is not _UNKNOWN:
-        return None if v is None else bool(v) if isinstance(v, (bool, Decimal)) else _UNKNOWN
+        return None if v is None else bool(v) if isinstance(v, (bool, Decimal, float)) else _UNKNOWN
     if isinstance(n, sge.Not):
         t = _const_truth(n.this)
         return t if t is _UNKNOWN or t is None else not t
@@ -179,6 +197,8 @@ def _const_truth(n: sge.Expression):
             return None
         if isinstance(a, bool) or isinstance(b, bool) or isinstance(a, str) != isinstance(b, str):
             return _UNKNOWN
+        if not isinstance(a, str):
+            a, b = _same_kind(a, b)
         ops = {sge.EQ: a == b, sge.NEQ: a != b, sge.LT: a < b, sge.LTE: a <= b, sge.GT: a > b, sge.GTE: a >= b}
         return ops[type(n)]
     if isinstance(n, sge.Is):
@@ -234,8 +254,9 @@ def _fold_conditions(select: sge.Select) -> None:
             folded = _fold_cond(clause.this)
             select.set(key, None if _const_truth(folded) is True else type(clause)(this=folded))
     for join in select.args.get("joins") or []:
-        if join.args.get("on") is not None:
-            join.set("on", _fold_cond(join.args["on"]))
+        if join.args.get("on") is not None:             # per conjunct: a FALSE one must keep the keys beside it
+            kept = [c for c in (_fold_cond(c) for c in _conjuncts(join.args["on"])) if _const_truth(c) is not True]
+            join.set("on", _and_all(kept) or sge.Boolean(this=True))
     cases = [c for c in select.walk(prune=lambda m: isinstance(m, (sge.Subquery, sge.Exists)))
              if isinstance(c, sge.Case) and c.args.get("this") is None]
     for case in reversed(cases):                           # the inner CASE first: an outer one may copy it
@@ -346,7 +367,7 @@ def _exact_lit(ex: Expr) -> Expr:
     if ex.op != "lit":
         return ex
     v = ex.args[0]
-    return lit(np.bool_(v) if isinstance(v, bool) else (np.int32(v) if -2**31 <= v < 2**31 else np.int64(v))
+    return lit(np.bool_(v) if isinstance(v, bool) else (np.int32(v) if -2**31 < v < 2**31 else np.int64(v))
                if isinstance(v, int)
                else np.float64(v) if isinstance(v, float) else v)
 
@@ -1623,6 +1644,10 @@ class _SQLTranslator:
                 if c.name.lower() in inner:
                     continue
                 value = aliases[c.name.lower()]
+                if any(x is not c and isinstance(x, sge.Column) and not x.table and x.name.lower() == c.name.lower()
+                       for x in value.walk()):
+                    raise ValueError(f"{c.name} is defined in terms of itself ({value.sql(dialect='duckdb')}) and "
+                                     "no column of the FROM clause has that name")
                 if in_where and (_aggs_in(value) or value.find(sge.Window) is not None):
                     raise ValueError(f"{c.name} is {value.sql(dialect='duckdb')}: aggregate and window functions "
                                      "are not allowed in WHERE")
@@ -2207,6 +2232,9 @@ class _SQLTranslator:
             what = "EXISTS (SELECT ...)" if isinstance(node, sge.Exists) else "IN (SELECT ...)"
             raise NotImplementedError(f"{what} is supported only as a condition joined by AND at the top of WHERE "
                                       "(it becomes a semi / anti join); not inside OR, NOT (...), CASE, SELECT or HAVING")
+        if isinstance(node, sge.Null) and isinstance(node.parent, (sge.And, sge.Or, sge.Not, sge.Paren)) and self._cur_cols:
+            # a NULL condition next to a real one under a NOT (F-122): a boolean that is NULL on every row
+            return when(self._never(self._cur_cols[0]), lit(True))
         d = _date_of(node)
         if d is not None:                                   # next to a date32 column a date, else a day number
             return lit(d) if self._date_lit else lit((d - _EPOCH).days)

@@ -106,3 +106,11 @@ def test_group_by_and_having_aliases_keep_working(cfg, q):
 ])
 def test_where_with_a_name_that_is_a_column_and_an_aggregate_alias(cfg, q):
     check(q, cfg[0])
+
+
+@pytest.mark.parametrize("q", [
+    "select kk + 1 as kk from t where kk > 5",                  # kk is defined in terms of itself and is no column
+    "select id, kk + 1 as kk from t order by kk + 1",
+])
+def test_an_alias_defined_by_itself_is_a_clear_error(cfg, q):
+    refused(q, cfg[0], match="in terms of itself")
