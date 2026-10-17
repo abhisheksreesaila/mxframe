@@ -1267,12 +1267,16 @@ Needs: none
 - Review: NEEDS WORK, fixed: (1) `ldd` cannot see Mojo's Python interop (it dlopens libpython at run time): the runner also fails a binary with the interop's runtime symbols (`KGEN_CompilerRT_Python*`, `Py_Initialize`); checked on a scratch program that imports `math` through Python (FAIL as it should); (2) the package build logs to `build/pkg-build.log` (`mojo precompile --disable-warnings`; `package` is deprecated) and a failure prints only its `error:` lines; (3) `zstd` and `snappy` declared in `pixi.toml` (they came only through pyarrow); (4) the test imports `E_OVERFLOW`; (5) this list's linkage wording. Open for M6 / M7: build the kernel test on a Mac (the GPU modules import `max.gpu` at the top; a CPU-only package may have to leave them out), and static codecs for iOS
 - Lesson for M1: Mojo frees a value at its last use, so an address taken from a `List` dangled before the kernel ran (the program's magic check failed). The Table and Query API own their buffers; no raw addresses cross the API
 
-## F-132 M1: Table and columns [todo]
-Needs: F-131 · Spec §1
-- [ ] `Table.empty()`, `add_column(name, kind, scale)`, kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days), BOOL; any number of columns
-- [ ] validity bitmaps; `get`, `is_null`, `dictionary`, `text_of`, `code_of`, `index` (-1 if absent), borrowable `Span[Int64]`
-- [ ] Arrow C Data Interface export and import, zero-copy, round trip with pyarrow checked from a Python test
-- [ ] a shared table is read-only and outlives frames on it (ownership rules in the spec)
+## F-132 M1: Table and columns [review]
+Needs: F-131 · Spec §1 · `mojo/mxframe/table.mojo`, test `mojo/tests/test_table.mojo`
+- [x] `Table.empty()`, `add_column(name, kind, scale)` (duplicate name, bad scale, a scale on a non-DECIMAL raise), kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days), BOOL; 100 columns tested (the stand-in stopped at 16)
+- [x] every value an Int64 (scaled for DECIMAL, a code for TEXT, days for DATE, 0 / 1 for BOOL; values past 2^53 exact); Arrow-layout validity bitmaps, made on the first null; `get`, `is_null`, `null_count`, `dictionary` (first-seen order), `text_of`, `code_of` (-1 if new), `index` (-1 if absent), `column` (raises "column `cost` not found"), `check` (ragged columns raise with both counts), borrowable `values(c) -> Span[Int64]`
+- [x] `share()` consumes the table into a read-only `SharedTable`; copies share the columns (same buffer address), spans from it are read-only. Frames on it come in M5
+- Moved out: the Arrow C Data Interface (spec §2 lists it under "Later"; the Python layer needs it) is F-139
+
+## F-139 Arrow C Data Interface, both ways [todo]
+Needs: F-132 · Spec §2 ("Later")
+- [ ] export a Table as an Arrow struct array (int64 columns zero-copy, validity bitmaps, TEXT as dictionary<int64, utf8>, DECIMAL as int64 with its scale in field metadata or a decimal128 copy: decide), import one back; round trip with pyarrow from a Python test through a C-ABI shared library built from the package
 
 ## F-133 M2: Query on a Mojo plan IR [todo]
 Needs: F-132 · Spec §5
