@@ -937,7 +937,7 @@ From the F-086 review (2026-10-16); a speedup, not a bug
 - [ ] quiet-machine speed check (not run: shared machine): `scan_parquet` of a 50M-row file in 50k-row groups with NULLs in 2 groups, `WHERE x IS NULL`: bytes read and wall time vs main (expect ~ groups with nulls / all groups); and `SELECT g, count(*) FROM t WHERE x IS NULL GROUP BY g` on a 10M-row table with 10% NULLs in memory: native vs the Arrow path on main (`MXFRAME_NATIVE=0` approximates it), median of 5 fresh-process runs, load < 2
 - Not done, for a follow-up: comparisons on nullable columns stay on the Arrow path. A comparison with a NULL operand is NULL and keeps no row, so under AND / OR it can be 0.0 (a NULL-masked compare: `cmp & valid(a) & valid(b)`, exact because filters drop NULL like false); NOT of it is the hard part (NOT NULL is NULL, not true), so it needs a three-valued AND / OR / NOT or a "known false" mask, or a decline while a NOT is above a nullable compare (what `OP_STR` does with `_neg`). Also the native filter still declines when an OUTPUT column has NULLs (no validity gather), so `SELECT * ... WHERE x IS NULL` over a nullable table is Arrow; only filters that output null-free columns, and aggregates, stay native
 
-## F-098 OFFSET without LIMIT: no sentinel row count [review]
+## F-098 OFFSET without LIMIT: no sentinel row count [done]
 From the F-087 review (2026-10-16)
 - [x] OFFSET without LIMIT uses `n = 2**62` (`sql_frontend._ALL_ROWS`): `explain()` shows the sentinel and an OFFSET above ~2^62 overflows `n + offset` in int64 in native code. Model "no limit" as `n=None` in `Limit` (or clamp), every consumer handles it
 - [x] tests: explain shows no sentinel; a huge OFFSET returns no rows without overflow; fails before
@@ -1056,14 +1056,14 @@ From F-056 step 3a (2026-10-16): a query whose result itself is bigger than the 
 - [x] tests: a filter keeping most of a file bigger than the budget, and an all-groups aggregate over budget, written with bounded peak memory, file equal to DuckDB's result (`tests/test_f056_step3c.py`, subprocess peaks 4.6-4.7 MB at a 6 MB budget against 32-33 MB without it)
 - [ ] open: no streaming *result* API on `compute()` (an iterator of tables); the sink is the only way out. Compression is zstd by default; row group size follows the buffer (budget / 16), not a tunable
 
-## F-114 SQL IN / NOT IN list with a NULL literal [review]
+## F-114 SQL IN / NOT IN list with a NULL literal [done]
 Found by the F-056 step 3b review (2026-10-16)
 - [x] `x NOT IN (1, 2, NULL)` and `x IN (1, NULL)` raise "Expected scalar literal in IN list, got Null" in the SQL front end. DuckDB: `x IN (..., NULL)` is TRUE or NULL (never FALSE); `x NOT IN (..., NULL)` is never TRUE. The engine's `np_arrow.is_in` already follows three-valued logic (F-070); map the SQL list onto it
 - [x] DuckDB-checked tests: IN / NOT IN lists with NULL, int / float / string columns with NULLs, under NOT and in SELECT; fails before
 - Built (2026-10-16): the front end keeps a NULL in the list (`_scalar` -> None) and `np_arrow.is_in` (F-070) does the three-valued logic on the Arrow path and the GPU (which falls to it). Declines so nothing ignores the NULL: the file-scan pushdown (`io_parquet`, a NULL list is not pushed), the dictionary shortcut (`arrow_dict`), the bytecode (`_isin` already raised Unsupported for a non-number), and `_can_be_null` (an `isin` with a NULL yields NULL, so a group-by over such a WHERE takes the null-aware path instead of crashing on a nullable mask). `tests/test_f114_sql_in_null.py` (155, cpu + gpu, native on and off): all 163 fail on main.
 - Not done, found on the way: `d IN (DATE '..')` (any list) still raises "Expected scalar literal in IN list, got Cast" on main; the date literal convention is F-115's.
 
-## F-115 SQL `select date '..'` returns a float day number, not a date [review]
+## F-115 SQL `select date '..'` returns a float day number, not a date [done]
 Found in the F-108 review (2026-10-16); also on main
 - [x] `select id, date '2024-01-01' as c from t` returns the day number as a float (19723.0), DuckDB a DATE. The front end turns every `DATE '..'` into a day number (`_date_lit` false) because the TPC-H Parquet files store dates as int32 day numbers; it is a date only next to a date32 / timestamp column. A DATE constant in the SELECT list (also `coalesce(x, DATE '..')` with no date operand, `DATE '..' + INTERVAL ..` as an output) should come out as date32. Decide by context: a comparison with an integer day column keeps the day number, everything that is output is a date
 - [x] DuckDB-checked tests for SELECT, CASE and subquery outputs; TPC-H checks: all 22 SQL queries (`tests/test_sql_tpch*.py`, `scripts/native_coverage.py --sql`) unchanged in result and path
