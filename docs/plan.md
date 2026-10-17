@@ -1254,3 +1254,52 @@ Needs: none · Found by the F-058 random suite (2026-10-17): SF1 MXFrame / DuckD
 - [x] full suite 23,258 passed
 - Review: PASS (no must-fix). Should-fixes taken: (1) the 25M-row bound and its comment were wrong (1M-group native price is 9.5 ms per M rows, and costs add over operators): the cold shortcut now bounds the query's CPU cost with every operator at the dearest default native rate of its kind (`COLD_NATIVE_MS_PER_MROW`) over all source rows, against `COLD_GPU_START_MS` (240 ms, the lowest start-up measured here: 245.6); a test checks the rates bound the default fits, another that a dear plan is priced; (2) on a machine with no GPU every query queued a warm-up thread: the first one remembers "no gpu" (`_no_gpu`) and no more are queued (test); (3) the redundant try/except is gone; plus a regression test for MIN / MAX over a join with clashing column names (int64 past 2^53)
 - [x] the site's auto explainer prices the CPU with the native fits (per-size interpolation ported from `_predict`), has the cold-GPU rule, and its simulated session queues the warm-up after a cold-rule query; the global shape's GPU side includes the host filter like `estimate_plan`
+
+## Mojo API (brief `docs/briefs/mojo-api.md`, spec `docs/mxframe-mojo-api.md`)
+Agreed 2026-10-17. M1-M7 first; M8 (agent CLI, planner + SQL in Mojo) later. Benchmarks paused. Package source in `mojo/mxframe/`.
+
+## F-131 M0: Mojo package spike [doing]
+Needs: none
+- [ ] `mojo/mxframe/` builds as a `.mojopkg` from the existing kernel sources (no ctypes, no `.so` loading), and a tiny Mojo binary that imports it links and runs with no libpython (`ldd` shows none)
+- [ ] the binary sums an int64 column exactly through the existing executor code path, equal to a Python-side check
+- [ ] Parquet codecs: zstd and snappy available as C libraries from the pixi env (or vendored), callable by `external_call`, a round trip of a compressed page matches; decision recorded
+- [ ] `pixi run mojo-test` runs Mojo tests; how the package is built and tested is written in `mojo/README.md`
+
+## F-132 M1: Table and columns [todo]
+Needs: F-131 · Spec §1
+- [ ] `Table.empty()`, `add_column(name, kind, scale)`, kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days), BOOL; any number of columns
+- [ ] validity bitmaps; `get`, `is_null`, `dictionary`, `text_of`, `code_of`, `index` (-1 if absent), borrowable `Span[Int64]`
+- [ ] Arrow C Data Interface export and import, zero-copy, round trip with pyarrow checked from a Python test
+- [ ] a shared table is read-only and outlives frames on it (ownership rules in the spec)
+
+## F-133 M2: Query on a Mojo plan IR [todo]
+Needs: F-132 · Spec §5
+- [ ] plan nodes Scan / Filter / Project / Aggregate / Sort / Limit in Mojo (Join reserved), built by `Query(...).where().group_by().agg()`
+- [ ] lowered to the existing native executor: exact int64 sum, count, then min / max / mean; filters `lo <= col <= hi`, `==`, ANDed; dense integer key expressions with a known group count
+- [ ] equal to DuckDB on random queries over random tables (nulls, negatives, values past 2^53), CPU
+
+## F-134 M3: CSV reader [todo]
+Needs: F-132 · Spec §2
+- [ ] type inference (INT, DECIMAL scale 2 / 4, DATE, BOOL, TEXT), quoting, embedded newlines, BOM, CRLF, TSV
+- [ ] import report per column: empty cells, distinct (text), sample values, failed rows with row number and text
+- [ ] multi-threaded, streaming; equal to pyarrow / DuckDB on a corpus of awkward files
+
+## F-135 M4: Parquet read and write [todo]
+Needs: F-131, F-132 · Spec §2
+- [ ] read Parquet written by pyarrow and DuckDB (plain + dictionary encodings, zstd / snappy / none, nulls) into a Table
+- [ ] write with key-value metadata; pyarrow and DuckDB read it back equal; `.omx` metadata round trip
+
+## F-136 M5: edits, formulas, sort [todo]
+Needs: F-133 · Spec §3, §4, §6
+- [ ] `Frame` overlay: set / set_text / append / remove, one undo log, changed_rows, merge, bake
+- [ ] formulas (`+ - * / // % min max`, decimal-aware), dependencies, inlined into aggregations without materialising
+- [ ] `permutation(c, descending)`: stable, text alphabetical, over formulas and edited cells; queries include edits
+
+## F-137 M6: GPU [todo]
+Needs: F-133, F-136 · Spec §7
+- [ ] device copy uploaded once per process and shared, int64 values, `release()`; the app's `DeviceContext` usable
+- [ ] GPU aggregation equal to the CPU path, including a session's edits without re-uploading
+
+## F-138 M7: omxplorer on MX frame [todo]
+Needs: F-134, F-135, F-136, F-137
+- [ ] omxplorer imports a CSV, edits, adds formulas, sorts, builds charts / pivots / a filtered Report, saves and reopens a `.omx` with `from mxframe import ...`; `scripts/check` passes with the same numbers; `scripts/build.sh omxplorer mac` links with no libpython
