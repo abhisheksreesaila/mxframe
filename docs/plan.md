@@ -800,7 +800,7 @@ Needs: F-001, F-005..F-008
 Needs: — · Found in F-057 review round 4 (2026-10-16)
 - [x] `tests/test_pipeline_gpu_leak.py::test_short_lived_threads_do_not_leak_device_memory` measures this process's allocations (the tracker's live bytes or the context's own pool), not `cuMemGetInfo` over the whole device, so another process allocating on GPU 0 cannot fail it; the test still fails on a real leak (prove by disabling the thread-exit release)
 
-## F-076 SQL Q10 partner strings native [review]
+## F-076 SQL Q10 partner strings native [done]
 Needs: F-069 · Found in F-069 review (2026-10-16)
 - [x] SQL Q10 at SF1 has no PyArrow compute over 1,000 rows (`scripts/native_coverage.py`): the 4 `dictionary_encode` calls over the 57k-row customer string columns (name, address, phone, comment) carried as partner columns are replaced by passing the strings through by row (or encoding once per source, like F-071 did for Q8)
 - [x] `tests/test_f069_hashed_groups.py` (or a new test) asserts SQL Q10 fully native by the coverage script's rule, fails before: `tests/test_sql_tpch_native.py[10]` (all 22 SQL texts, SF 0.17) and `tests/test_f080_sql_shapes.py::test_strings_fixed_by_a_unique_key_are_taken_by_partner_row`
@@ -824,7 +824,7 @@ Found by the F-077 developer (2026-10-16); untested suspicion
 - [x] joins on float keys encode with bit-for-bit `dictionary_encode` (`join_engine`, `custom_ops`): -0.0 against 0.0 and NaN payloads probably mismatch DuckDB (DuckDB: -0.0 = 0.0, NaN = NaN in joins). Probe first; if wrong, canonicalise with `np_arrow.canonical_floats` (F-077) at the join-key boundary, every join kind (inner, left, semi, anti), native and GPU
 - [x] DuckDB-checked tests over the key edge cases (tests/test_float_key_joins.py, 78 of 83 fail before); fail before (or a test pinning that it already matches)
 
-## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q13, Q22 [review]
+## F-080 SQL TPC-H fully native: Q5, Q7, Q9, Q13, Q22 [done]
 Needs: F-076 for Q10 · From `scripts/native_coverage.py --sf 1 --sql` on main (2026-10-16, after F-072): 15 of 22 SQL queries have no decline and no Arrow work over 1,000 rows; Q8 ("nothing to filter") and Q15 ("empty input") only show trivial declines and do no Arrow work. The DataFrame forms are 22/22, so each gap is in how the SQL front end phrases the plan
 - [x] Q5: `executor declined (code -18)` in the fused join (also on main before F-069)
 - [x] Q7, Q9: one `expression not supported by the bytecode compiler` each (find the expression; compile it or rewrite it in the SQL front end to the DataFrame form)
