@@ -1058,9 +1058,10 @@ Found in the F-108 review (2026-10-16); also on main
 - [ ] DuckDB-checked tests for SELECT, CASE and subquery outputs; TPC-H checks: all 22 SQL queries (`tests/test_sql_tpch*.py`, `scripts/native_coverage.py --sql`) unchanged in result and path
 
 
-## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [todo]
+## F-116 SQL constants beside aggregates, date IN lists, date literal subqueries [review]
 Found by the F-114 / F-115 developer (2026-10-16)
-- [ ] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
-- [ ] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
-- [ ] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
-- [ ] DuckDB-checked tests for each; fails before
+- [x] a constant next to an aggregate (`select g, 1 as c, count(*) from t group by g`) raises "must appear in the GROUP BY"; DuckDB accepts constants (and expressions of grouped columns only) in the select list. Common in real queries
+- [x] `d IN (DATE '..', DATE '..')` raises "Expected scalar literal in IN list, got Cast"
+- [x] `(select date '..')` as a scalar subquery, `min(date '..')`, `extract(year from date '..')` on a bare literal
+- [x] DuckDB-checked tests for each; fails before
+- Note (2026-10-16): `upper()` is not in the engine (not part of this ticket). Follow-ups: `WHERE extract(year from <int32 day column with NULLs>) = n` raises "Cannot evaluate predicate op 'year_days' in PyArrow" (also on main); a bare `select date '..'` / `select 1 as c from t` outputs stay F-115's. Also fixed: GPU `gather_table` crashed on a NULL-typed column (aot_kernels.py).

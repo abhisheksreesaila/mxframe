@@ -118,6 +118,15 @@ def _aggs_in(e: sge.Expression) -> List[sge.Expression]:
             if isinstance(n, sge.AggFunc)]
 
 
+def _fold_const_minmax(select: sge.Select) -> None:
+    """``MIN(DATE '..')`` / ``MAX(DATE '..')``: that date when the query has rows, else NULL, as
+    ``CASE WHEN COUNT(*) > 0 THEN DATE '..' END`` (the engine aggregates numbers; a constant date is no column)."""
+    for n in list(select.walk(prune=lambda m: isinstance(m, (sge.Subquery, sge.Exists)))):
+        if isinstance(n, (sge.Min, sge.Max)) and _date_of(n.this) is not None:
+            some = sge.GT(this=sge.Count(this=sge.Star()), expression=sge.Literal.number(0))
+            n.replace(sge.Case(ifs=[sge.If(this=some, true=n.this.copy())]))
+
+
 _COMPARE = (sge.EQ, sge.NEQ, sge.LT, sge.LTE, sge.GT, sge.GTE)
 
 
@@ -204,9 +213,23 @@ def _float_cast(node: sge.Expression) -> Optional[float]:
     return None
 
 
+def _exact_lit(ex: Expr) -> Expr:
+    """A constant output column keeps its type: a bare Python int / bool / float literal in a Project is
+    broadcast as float32 / float64, a NumPy scalar as its own type."""
+    if ex.op != "lit":
+        return ex
+    v = ex.args[0]
+    return lit(np.bool_(v) if isinstance(v, bool) else np.int64(v) if isinstance(v, int)
+               else np.float64(v) if isinstance(v, float) else v)
+
+
 def _date_of(node: sge.Expression) -> Optional[date]:
     """The date of a constant ``DATE 'yyyy-mm-dd'`` [+ / - INTERVAL 'n' DAY | MONTH | YEAR ...], else None."""
     node = _unparen(node)
+    if isinstance(node, sge.Subquery) and isinstance(node.this, sge.Select) and node.this.args.get("from_") is None \
+            and len(node.this.expressions) == 1:                  # (SELECT DATE '..') is that date
+        item = node.this.expressions[0]
+        return _date_of(item.this if isinstance(item, sge.Alias) else item)
     if isinstance(node, sge.Cast) and node.to.this == sge.DataType.Type.DATE:
         if isinstance(node.this, sge.Literal) and node.this.is_string:
             try:
@@ -518,6 +541,7 @@ class _SQLTranslator:
             raise NotImplementedError(f"{type(node).__name__} (UNION / INTERSECT / EXCEPT) is not supported, only SELECT")
         self._register_ctes(node.args.get("with_"))
         self._resolve_names(node)
+        _fold_const_minmax(node)
         self._has_star = any(isinstance(e, sge.Star) for e in node.expressions)
         self._any_star = any(isinstance(e, sge.Star) or (isinstance(e, sge.Column) and isinstance(e.this, sge.Star))
                              for e in node.expressions)
@@ -1595,7 +1619,7 @@ class _SQLTranslator:
         # column has that name, as in DuckDB) or repeat the aliased expression (compared after
         # translation, so t.s and s are the same key). GROUP BY ALL groups by every SELECT item
         # without an aggregate.
-        plain = [split(e) for e in items if not _aggs_in(e)]
+        plain = [split(e) for e in items if not _aggs_in(e) and e.find(sge.Column) is not None]   # a constant is no key
         aliased = [(a, self._expr(i).signature()) for i, a in plain if a]
         alias_expr = {a.lower(): i for i, a in plain if a}
         scope = {c.lower() for c in self._scope_columns}
@@ -1650,10 +1674,27 @@ class _SQLTranslator:
                 calcs.append((f"__calc{n}", ex))
                 outs[n] = (alias, f"__calc{n}")
                 continue
+            if inner.find(sge.Column) is None:                  # a constant: one value on every output row
+                if alias is None:
+                    raise ValueError(f"give {inner.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
+                calcs.append((f"__calc{n}", _exact_lit(self._value(inner))))
+                outs[n] = (alias, f"__calc{n}")
+                continue
             src = self._key_names.get(self._expr(inner).signature())
-            if src is None:
-                raise ValueError(f"column {inner.sql(dialect='duckdb')} must appear in the GROUP BY clause "
-                                 "or inside an aggregate function")
+            if src is None:                                     # not a key: allowed when built from keys and aggregates
+                if isinstance(inner, sge.Column):
+                    raise ValueError(f"column {inner.sql(dialect='duckdb')} must appear in the GROUP BY clause "
+                                     "or inside an aggregate function")
+                if alias is None:
+                    raise ValueError(f"give {inner.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
+                self._post = True
+                try:
+                    ex = self._expr(inner)
+                finally:
+                    self._post = False
+                calcs.append((f"__calc{n}", ex))
+                outs[n] = (alias, f"__calc{n}")
+                continue
             if alias is None and not isinstance(inner, sge.Column):
                 raise ValueError(f"give {inner.sql(dialect='duckdb')} an alias (AS name): the output column has no name")
             outs[n] = (alias or inner.name, src)
@@ -1747,7 +1788,10 @@ class _SQLTranslator:
             inner = e.this
         else:
             inner = e
-        mx = self._expr(inner)
+        day = _date_of(inner) if isinstance(inner, sge.Subquery) else None
+        mx = lit(day) if day is not None else self._expr(inner)        # (SELECT DATE '..') as output is a date
+        if isinstance(inner, sge.Extract):
+            mx = _exact_lit(mx)                                        # EXTRACT(YEAR FROM DATE '..') is an integer
         if not alias_name and isinstance(inner, sge.Column) and mx.op == "col":
             alias_name = inner.name if inner.name != mx.args[0] else None   # joined key: as written
         if alias_name:
@@ -1783,7 +1827,7 @@ class _SQLTranslator:
 
     def _expr(self, node: sge.Expression) -> Expr:
         """Translate a sqlglot expression to an MXFrame Expr."""
-        if isinstance(node, sge.Subquery):
+        if isinstance(node, sge.Subquery) and _date_of(node) is None:
             return self._scalar_subquery(node)
         if isinstance(node, sge.Exists) or (isinstance(node, sge.In) and node.args.get("query") is not None):
             what = "EXISTS (SELECT ...)" if isinstance(node, sge.Exists) else "IN (SELECT ...)"
@@ -1930,6 +1974,10 @@ class _SQLTranslator:
                 c = c * lit(np.float64(1.0))
             values = []
             for v in node.expressions:
+                day = _date_of(v)
+                if day is not None:                       # a date32 column holds dates, an integer column day numbers
+                    values.append(day if self._is_date_col(node.this) else (day - _EPOCH).days)
+                    continue
                 d = _exact_decimal(v) if self._is_int_expr(node.this) else None
                 if d is None:
                     values.append(self._scalar(v))
@@ -2019,6 +2067,9 @@ class _SQLTranslator:
         1970-01-01, as the TPC-H Parquet files store dates) through ``year_of_days()``."""
         if node.this.name.upper() != "YEAR":
             raise NotImplementedError(f"EXTRACT({node.this.name.upper()} FROM ...) is not supported, only YEAR")
+        day = _date_of(node.expression)
+        if day is not None:
+            return lit(day.year)
         arg = self._expr(node.expression)
         t = self._col_type(node.expression)
         if t is not None and (pa.types.is_date(t) or pa.types.is_timestamp(t)):
