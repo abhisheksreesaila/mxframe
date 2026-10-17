@@ -79,6 +79,10 @@ class Expr:
         """CAST(x AS dtype) for a number type: ``float32``, ``float64``, ``int8`` ... ``int64``."""
         return Expr("cast", self, dtype)
 
+    def add_us(self, micros: int) -> 'Expr':
+        """A DATE or timestamp plus a fixed interval (microseconds, negative to subtract): a TIMESTAMP, like DuckDB."""
+        return Expr("add_us", self, micros)
+
     def isin(self, values: list) -> 'Expr':
         """True for rows where this column's value is in *values*."""
         return Expr("isin", self, values)

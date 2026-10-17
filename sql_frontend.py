@@ -210,6 +210,40 @@ def _date_of(node: sge.Expression) -> Optional[date]:
     return None
 
 
+_TS_UNITS = {sge.DataType.Type.TIMESTAMPNTZ: "us", sge.DataType.Type.TIMESTAMP: "us", sge.DataType.Type.TIMESTAMP_S: "s",
+             sge.DataType.Type.TIMESTAMP_MS: "ms", sge.DataType.Type.TIMESTAMP_NS: "ns"}
+
+
+def _timestamp_of(node: sge.Expression) -> Optional[np.datetime64]:
+    """The value of ``TIMESTAMP '2024-01-01 10:00:00.123'`` / ``CAST('...' AS TIMESTAMP)`` (also ``TIMESTAMP_S`` /
+    ``_MS`` / ``_NS``) as a numpy datetime64 of that type's unit (TIMESTAMP is microseconds, finer digits are cut
+    as DuckDB cuts them), else None. A zone offset is not supported."""
+    node = _unparen(node)
+    if not (isinstance(node, sge.Cast) and isinstance(node.this, sge.Literal) and node.this.is_string):
+        return None
+    if node.to.this == sge.DataType.Type.TIMESTAMPTZ:
+        raise NotImplementedError(f"TIMESTAMPTZ literals are not supported: {node.sql(dialect='duckdb')}")
+    unit = _TS_UNITS.get(node.to.this)
+    if unit is None:
+        return None
+    text = node.this.this.strip()
+    if re.search(r"\d(\s*Z|\s*[+-]\d\d(:?\d\d)?)$", text, re.I) and re.search(r"\d:\d", text):
+        raise NotImplementedError(f"a time zone offset in a TIMESTAMP literal is not supported: {text}")
+    m = re.fullmatch(r"(-?\d{4,}-\d\d-\d\d)(?:[ T](\d\d:\d\d(?::\d\d)?)(?:\.(\d+))?)?", text)
+    try:
+        if m is None:
+            raise ValueError(text)
+        hms = m.group(2) or "00:00:00"
+        seconds = int(np.datetime64(f"{m.group(1)}T{hms}{':00' if hms.count(':') == 1 else ''}", "s").astype("int64"))
+    except ValueError:
+        raise ValueError(f"not a timestamp: {node.to.sql(dialect='duckdb')} '{text}'") from None
+    per_second = {"s": 1, "ms": 10 ** 3, "us": 10 ** 6, "ns": 10 ** 9}[unit]
+    ticks = seconds * per_second + int((m.group(3) or "0").ljust(9, "0")[:9]) * per_second // 10 ** 9      # finer digits are cut
+    if not -(1 << 63) <= ticks < (1 << 63):
+        raise ValueError(f"out of range for {node.to.sql(dialect='duckdb')}: '{text}'")
+    return np.datetime64(ticks, unit)
+
+
 def _num_const(node: sge.Expression) -> Optional[Decimal]:
     """The exact value of a constant number expression (+ - * of literals), as SQL decimals compute it."""
     node = _unparen(node)
@@ -1587,6 +1621,9 @@ class _SQLTranslator:
         d = _date_of(node)
         if d is not None:                                   # next to a date32 column a date, else a day number
             return lit(d) if self._date_lit else lit((d - _EPOCH).days)
+        t = _timestamp_of(node)
+        if t is not None:
+            return lit(t)
         if not self._date_lit and isinstance(node, _COMPARE + (sge.Between,)):
             kids = [node.this, node.args["low"], node.args["high"]] if isinstance(node, sge.Between) \
                 else [node.this, node.expression]
@@ -1662,6 +1699,8 @@ class _SQLTranslator:
             return lit(0) - inner
 
         # ---- arithmetic ----
+        if isinstance(node, (sge.Add, sge.Sub)) and isinstance(_unparen(node.expression), sge.Interval):
+            return self._interval(node)
         if isinstance(node, sge.Add):
             a, b = self._widened(node.this, node.expression, self._arith_operand, node)
             return a + b
@@ -1770,17 +1809,36 @@ class _SQLTranslator:
         """The result expressions of a CASE: every THEN and the ELSE."""
         return [i.args["true"] for i in node.args.get("ifs") or []] + ([node.args["default"]] if node.args.get("default") else [])
 
+    _INTERVAL_US = {"DAY": 86_400_000_000, "HOUR": 3_600_000_000, "MINUTE": 60_000_000, "SECOND": 1_000_000,
+                    "MILLISECOND": 1_000, "MICROSECOND": 1}
+
+    def _interval(self, node) -> Expr:
+        """``x + INTERVAL n DAY | HOUR | MINUTE | SECOND ...`` (also ``-``) on a DATE or timestamp expression: a
+        TIMESTAMP, as in DuckDB. MONTH and YEAR depend on the calendar and are only supported on a constant date."""
+        iv = _unparen(node.expression)
+        unit = iv.unit.name.upper() if iv.unit is not None else ""
+        if unit not in self._INTERVAL_US or not isinstance(iv.this, sge.Literal):
+            raise NotImplementedError(f"INTERVAL {iv.sql(dialect='duckdb')} on a column is not supported "
+                                      f"({', '.join(self._INTERVAL_US)}); MONTH and YEAR only on a constant DATE")
+        n = int(iv.this.this) * (1 if isinstance(node, sge.Add) else -1)
+        self._no_constants(node, node.this)
+        return self._expr(node.this).add_us(n * self._INTERVAL_US[unit])
+
     def _is_date_col(self, src: sge.Expression) -> bool:
         if isinstance(src, (sge.Min, sge.Max)):             # F-093: MIN / MAX of a date column is a date
             src = src.this
         if isinstance(src, sge.Case):                       # a CASE with a date result is a date
             return any(_date_of(r) is not None or self._is_date_col(r) for r in self._case_results(src))
+        if isinstance(src, (sge.Add, sge.Sub)) and isinstance(_unparen(src.expression), sge.Interval):
+            return True                                     # DATE / timestamp + INTERVAL is a timestamp
         if isinstance(src, sge.Coalesce):
             return any(_date_of(a) is not None or self._is_date_col(a) for a in [src.this] + list(src.expressions))
         if isinstance(src, sge.Nullif):
             return self._is_date_col(src.this)
+        if _timestamp_of(src) is not None:
+            return True
         t = self._col_type(src)
-        return t is not None and pa.types.is_date(t)
+        return t is not None and (pa.types.is_date(t) or pa.types.is_timestamp(t))
 
     def _extract(self, node: sge.Extract) -> Expr:
         """EXTRACT(YEAR FROM x): a date32 column through ``year()``; any other (integer day numbers since
@@ -1887,6 +1945,9 @@ class _SQLTranslator:
         f = _float_cast(node)
         if f is not None:
             return f
+        t = _timestamp_of(node)
+        if t is not None:
+            return t
         raise ValueError(f"Expected scalar literal in IN list, got {type(node).__name__}")
 
     def _ftype(self, node: sge.Expression) -> Optional[str]:

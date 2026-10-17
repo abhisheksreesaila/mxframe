@@ -127,7 +127,7 @@ def case_literal(v):
     if isinstance(v, (float, np.floating)):
         x = _npscalar(float(v), type=pa.float64())
         return x if isinstance(v, np.floating) else _Weak(x)
-    return _npscalar(v) if isinstance(v, (str, _dt.date)) else v
+    return _npscalar(v) if isinstance(v, (str, _dt.date, np.datetime64)) else v
 
 
 def _supertype(ta, tb, weak_a=False, weak_b=False):
@@ -149,6 +149,16 @@ def _supertype(ta, tb, weak_a=False, weak_b=False):
         return f32 if (ta == f32 and keeps(tb, weak_b)) or (tb == f32 and keeps(ta, weak_a)) else pa.float64()
     if pa.types.is_date(ta) and pa.types.is_date(tb):
         return pa.date32()
+    if pa.types.is_temporal(ta) and pa.types.is_temporal(tb) and not (pa.types.is_time(ta) or pa.types.is_time(tb)
+                                                                     or pa.types.is_duration(ta) or pa.types.is_duration(tb)):
+        # a date next to a timestamp is a timestamp of that timestamp's unit and zone; two timestamps take the finer
+        # unit (DuckDB: TIMESTAMP_S next to TIMESTAMP_NS is TIMESTAMP_NS); a zone and no zone do not mix
+        if pa.types.is_date(ta) or pa.types.is_date(tb):
+            return tb if pa.types.is_date(ta) else ta
+        if (ta.tz is None) != (tb.tz is None):
+            raise TypeError(f"no common type: {ta} and {tb}")
+        units = ("s", "ms", "us", "ns")
+        return ta if units.index(ta.unit) >= units.index(tb.unit) else tb
     raise TypeError(f"no common type: {ta} and {tb}")
 
 
@@ -223,6 +233,16 @@ def cast_arrow(x, name):
     return out
 
 
+def add_interval_arrow(x, micros):
+    """``x + INTERVAL`` (a fixed length, in microseconds) for a DATE or a timestamp: DuckDB's result is a TIMESTAMP
+    (microseconds, in the argument's zone), a DATE too."""
+    t = x.type
+    if not (pa.types.is_date(t) or pa.types.is_timestamp(t)):
+        raise TypeError(f"an INTERVAL can be added to a DATE or TIMESTAMP, not to {t}")
+    x = pc.cast(x, pa.timestamp("us", getattr(t, "tz", None)), safe=False)
+    return pc.add(x, _npscalar(np.timedelta64(int(micros), "us")))
+
+
 def abs_arrow(x):
     """``ABS(x)`` in the argument's own type; an integer minimum raises (DuckDB's overflow error)."""
     return pc.abs_checked(x) if pa.types.is_integer(x.type) else pc.abs(x)
@@ -263,6 +283,27 @@ def _align_literals(lhs, rhs):
         lhs = pc.cast(lhs, pa.float64(), safe=False)
     elif isinstance(l, np.float64) and is_int(rhs):
         rhs = pc.cast(rhs, pa.float64(), safe=False)
+    return lhs, rhs
+
+
+def _align_temporal(lhs, rhs):
+    """A timestamp next to a DATE, or to a timestamp with the other kind of zone, as DuckDB compares them: the DATE
+    becomes a timestamp of the other side's unit and zone; a naive timestamp (a literal) next to a zoned column is
+    an instant in UTC; two zones are one instant either way (the right side takes the left's zone). Units differ
+    freely (Arrow compares in the finer one)."""
+    tl, tr = getattr(lhs, "type", None), getattr(rhs, "type", None)
+    if tl is None or tr is None:
+        return lhs, rhs
+    ts, date = pa.types.is_timestamp, pa.types.is_date
+    if ts(tl) and date(tr):
+        return lhs, pc.cast(rhs, tl)
+    if date(tl) and ts(tr):
+        return pc.cast(lhs, tr), rhs
+    if ts(tl) and ts(tr) and tl.tz != tr.tz:
+        if tl.tz is None:
+            lhs = pc.cast(lhs, pa.timestamp(tl.unit, tr.tz))
+        else:
+            rhs = pc.cast(rhs, pa.timestamp(tr.unit, tl.tz))
     return lhs, rhs
 
 
@@ -542,7 +583,7 @@ class GraphCompiler:
             # literal inside a compute call imports pandas (~150-200 ms, once).
             import datetime as _dt
             v = args[0]
-            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date)) else v
+            return _npscalar(v) if isinstance(v, (bool, int, float, str, _dt.date, np.datetime64)) else v
         if op in _DICT_PRED_OPS:
             native = _dict_predicate(expr, table)
             if native is not None:
@@ -553,6 +594,7 @@ class GraphCompiler:
             if op not in ("and", "or"):
                 lhs, rhs = _align_literals(lhs, rhs)
                 lhs, rhs = _double_vs_int(args, lhs, rhs)
+                lhs, rhs = _align_temporal(lhs, rhs)
             return _PC_CMP_OPS[op](lhs, rhs)
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))
@@ -594,6 +636,8 @@ class GraphCompiler:
             return coalesce_arrow(*branch_values(args, lambda a: GraphCompiler._eval_predicate(a, table)))
         if op == "abs":
             return abs_arrow(GraphCompiler._eval_predicate(args[0], table))
+        if op == "add_us":
+            return add_interval_arrow(GraphCompiler._eval_predicate(args[0], table), args[1])
         if op == "cast":
             return cast_arrow(GraphCompiler._eval_predicate(args[0], table), args[1])
         if op == "year":
