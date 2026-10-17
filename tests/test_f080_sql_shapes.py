@@ -263,3 +263,18 @@ def test_left_join_count_declines_keep_the_answer(counted, name, sql, mod):
     _, got = _mx(sql, t)
     _same(got, _duck(sql, t))
     assert counted["ran"] == 0
+
+
+def test_unique_memo_does_not_keep_a_released_table_alive():
+    import gc
+    import weakref
+    import mxframe.join_engine as je
+    t = pa.table({"k": A(np.arange(1000, dtype=np.int64))})
+    ref = weakref.ref(t)
+    assert je._is_unique(t, "k") is True
+    key = id(t)
+    assert je._UNIQUE_MEMO[key][1] == {"k": True}
+    del t
+    gc.collect()
+    assert ref() is None                      # the memo never held the table
+    assert key not in je._UNIQUE_MEMO         # and its entry went with it

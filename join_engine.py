@@ -1228,18 +1228,25 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
                  via_probe=via_probe, post_res=post_res, fact=fact)
 
 
-_UNIQUE_MEMO: dict = {}      # id(table) -> (table, {column: is it unique}); the table is held, so its id is not reused
+_UNIQUE_MEMO: dict = {}      # table key -> (weakref to the table or None, {column: is it unique}); holds booleans only
 
 
 def _is_unique(t: pa.Table, c: str) -> bool:
-    """Is integer column ``c`` of ``t`` free of repeats? Remembered per table: a repeated query over the same
-    table does not sort the column again."""
+    """Is integer column ``c`` of ``t`` free of repeats? Remembered per table, never keeping the table alive
+    (F-056's bounded memory). A table read from a file is keyed by its source token (a re-read of the same
+    file hits); any other by its id, with a weakref whose callback drops the entry. The callback runs on
+    whatever thread frees the table, so it only does an atomic ``dict.pop``: no lock (F-107)."""
+    import weakref
+    from .io_parquet import table_source
     from .np_arrow import to_numpy as _np_of, combine as _combine
-    entry = _UNIQUE_MEMO.get(id(t))
-    if entry is None or entry[0] is not t:
-        if len(_UNIQUE_MEMO) >= 32:
+    token = table_source(t)
+    key = token if token is not None else id(t)
+    entry = _UNIQUE_MEMO.get(key)
+    if entry is None or (token is None and entry[0]() is not t):
+        if len(_UNIQUE_MEMO) >= 64:
             _UNIQUE_MEMO.clear()
-        entry = _UNIQUE_MEMO[id(t)] = (t, {})
+        ref = None if token is not None else weakref.ref(t, lambda _r, k=key: _UNIQUE_MEMO.pop(k, None))
+        entry = _UNIQUE_MEMO[key] = (ref, {})
     known = entry[1]
     if c not in known:
         a = _np_of(_combine(t.column(c)), zero_copy_only=False)
