@@ -114,6 +114,13 @@ def _number(text, neg: bool = False) -> Union[int, float]:
     return -float(s) if neg else float(s)
 
 
+def _folded(x: Expr, value: bool) -> Expr:
+    """A predicate decided at plan time (`i = 2.5`, `i < 99999999999999999999`): the constant where the integer
+    expression ``x`` has a value, NULL where it is NULL, so NOT, IS NULL and SELECT see SQL's three values.
+    ``x == x`` is true and ``x != x`` false for an integer, NULL for NULL."""
+    return x == x if value else x != x
+
+
 def _exact_decimal(n: sge.Expression) -> Optional[Decimal]:
     """The exact value of an integer or DECIMAL literal (digits, a point, no exponent), negated or not, else None."""
     n = _unparen(n)
@@ -1663,7 +1670,7 @@ class _SQLTranslator:
                     values.append(self._scalar(v))
                 elif d == d.to_integral_value() and -(1 << 63) <= d < (1 << 63):     # exactly: a fraction or a value past int64
                     values.append(int(d))                                              # never equals an integer
-            return c.isin(values) if values else c.is_null() & ~c.is_null()
+            return c.isin(values) if values else _folded(c, False)
 
         # ---- LIKE / ILIKE [ESCAPE c] ----
         if isinstance(node, sge.Escape) and isinstance(node.this, (sge.Like, sge.ILike)):
@@ -1824,13 +1831,13 @@ class _SQLTranslator:
             x = self._expr(x_node)
             whole = d == d.to_integral_value()
             if kind in ("eq", "ne") and not whole:
-                return ~x.is_null() if kind == "ne" else x.is_null() & ~x.is_null()
+                return _folded(x, kind == "ne")
             n = int(d.to_integral_value(ROUND_CEILING if kind in ("lt", "ge") else ROUND_FLOOR)) if not whole else int(d)
             if -(1 << 63) <= n < (1 << 63):
                 return {"lt": x < lit(n), "le": x <= lit(n), "gt": x > lit(n), "ge": x >= lit(n), "eq": x == lit(n),
                         "ne": x != lit(n)}[kind]
             keep = kind == "ne" or (kind in ("lt", "le")) == (n > 0) and kind != "eq"
-            return ~x.is_null() if keep else x.is_null() & ~x.is_null()
+            return _folded(x, keep)
         x, y = self._widened(a, b)
         return {sge.EQ: x == y, sge.NEQ: x != y, sge.LT: x < y, sge.LTE: x <= y, sge.GT: x > y, sge.GTE: x >= y}[cls]
 

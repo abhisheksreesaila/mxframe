@@ -166,6 +166,24 @@ def test_decimal_literals_exact(cfg, w):
     assert got == want, (q, got, want)
 
 
+# ── a folded compare is NULL on a NULL row (NOT, IS NULL, SELECT) ─────────────────────────────────
+
+FOLDED = ["i = 2.5", "i <> 2.5", "i in (2.5)", "i not in (2.5)", "i > 9223372036854775808", "i < 9223372036854775808",
+          "i = 99999999999999999999", "i >= -99999999999999999999", "i + 0 = 2.5", "i between 2.5 and 2.7", "j <> 3.5"]
+
+
+@pytest.mark.parametrize("w", FOLDED)
+def test_folded_compare_is_null_on_null(cfg, w):
+    for q in (f"select i from t where not ({w}) order by i nulls last",
+              f"select i from t where ({w}) is null order by i nulls last",
+              f"select i from t where ({w}) is not null order by i nulls last",
+              f"select i, ({w}) as p from t order by i nulls last",
+              f"select i, not ({w}) as p from t order by i nulls last"):
+        want = DECCON.execute(q).fetchall()
+        got = [tuple(r.values()) for r in mx.sql(q, t=DEC).compute(device=cfg).to_pylist()]
+        assert got == want, (q, got, want)
+
+
 # ── float32 column against literals ───────────────────────────────────────────────────────────────
 
 F32_WHERE = [
