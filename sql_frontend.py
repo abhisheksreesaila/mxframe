@@ -682,6 +682,7 @@ class _SQLTranslator:
                     self._marks[(join.this.alias_or_name.lower(), rk)] = lk       # x.k equals the copy it matched
                 elif lk != rk and how != "left" and rk not in own:
                     self._col_aliases[rk] = lk
+                    self._marks.setdefault((alias, rk), lk)       # z.v equals the left key it matched
 
         while pending:
             for i, (alias, right_plan, right_cols) in enumerate(pending):
@@ -1584,6 +1585,8 @@ class _SQLTranslator:
                 return col(copy)
             if node.table and (node.table.lower(), name) in self._qual:
                 return col(self._qual[(node.table.lower(), name)])        # a comma-joined table's own copy
+            if node.table and (node.table.lower(), name) in self._renamed:
+                return col(self._renamed[(node.table.lower(), name)])     # a clashing column the join renamed
             if node.table and name not in self._same_keys and self._copy_dropped(node.table.lower(), name):
                 raise ValueError(f"column {node.sql(dialect='duckdb')}: the name exists in more than one joined "
                                  "table and the join keeps the first copy, so this one is not supported yet")
