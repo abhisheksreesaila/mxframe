@@ -40,6 +40,9 @@ def _table():
         "s": pa.array(["hit", "miss", None, "hit", "other", "hit", "miss", "hit", "other", "miss", "hit", "hit"]),
         "d": pa.array([D0 + dt.timedelta(days=k * 40) for k in range(n)], pa.date32()),
         "g": pa.array([k % 3 for k in range(n)], pa.int32()),
+        "ls": pa.array(["hit", "miss", None, "hit", "other", "hit", "miss", "hit", "other", "miss", "hit", "hit"],
+                       pa.large_string()),
+        "ds": pa.array(["a", "b", "c", "a"] * 3).dictionary_encode(),
         "k": pa.array(["x", "y", "z"] * 4),                                                    # no NULLs
     })
 
@@ -108,6 +111,17 @@ SELECT = {
     "int_double": ("select id, case when p = 1 then 1 else 2.5e0 end as c from t order by id", ["int", "float"]),
     "int_float_col": ("select id, case when p = 1 then 1 else f end as c from t order by id", ["int", "float"]),
     "float32_col_int": ("select id, case when p = 1 then r else 0 end as c from t order by id", ["int", "float"]),
+    "large_string_literal": ("select id, case when p = 1 then ls else 'x' end as c from t order by id", ["int", "string"]),
+    "large_string_and_string": ("select id, case when p = 1 then ls else s end as c from t order by id", ["int", "string"]),
+    "large_string_no_else": ("select id, case when p = 1 then ls end as c from t order by id", ["int", "string"]),
+    "dictionary_string": ("select id, case when p = 1 then ds else 'x' end as c from t order by id", ["int", "string"]),
+    "dictionary_and_large": ("select id, case when p = 1 then ds else ls end as c from t order by id", ["int", "string"]),
+    "float32_decimal_literal": ("select id, case when p = 1 then r else 0.1 end as c from t order by id", ["int", "float"]),
+    "float32_double_literal": ("select id, case when p = 1 then r else 1e-1 end as c from t order by id", ["int", "float"]),
+    "float32_int_col": ("select id, case when p = 1 then r else i end as c from t order by id", ["int", "float"]),
+    "float32_big_int_literal": ("select id, case when p = 1 then r else 16777217 end as c from t order by id",
+                                ["int", "float"]),
+    "float32_float64_col": ("select id, case when p = 1 then r else f end as c from t order by id", ["int", "float"]),
     "null_then": ("select id, case when p = 1 then null else 7 end as c from t order by id", ["int", "int"]),
     "null_else_string": ("select id, case when p = 1 then 'a' else null end as c from t order by id",
                          ["int", "string"]),
@@ -131,6 +145,30 @@ def test_select_equals_duckdb(name, cfg):
     got, want, tbl, _ = _run(q, dev)
     assert got == want
     assert [_kind(f.type) for f in tbl.schema] == kinds, [str(f.type) for f in tbl.schema]
+
+
+FLOAT_TYPE = {"float32_decimal_literal": pa.float32(), "float32_double_literal": pa.float64(),
+              "float32_int_col": pa.float32(), "float32_big_int_literal": pa.float32(),
+              "float32_float64_col": pa.float64()}
+
+
+@pytest.mark.parametrize("name", FLOAT_TYPE)
+def test_float32_branch_keeps_float_unless_a_double_meets_it(name, cfg):
+    """DuckDB: FLOAT next to an integer or a DECIMAL literal is FLOAT (0.1 becomes 0.10000000149011612), only a
+    DOUBLE (exponent literal, float64 column) widens it."""
+    got, want, tbl, wtbl = _run(SELECT[name][0], cfg[0])
+    assert got == want
+    assert tbl.column("c").type == FLOAT_TYPE[name] == wtbl.column("c").type
+
+
+def test_float32_decimal_literal_value(cfg):
+    got, _, _, _ = _run(SELECT["float32_decimal_literal"][0], cfg[0])
+    assert got[0] == (0, 0.10000000149011612)
+
+
+def test_large_string_stays_text(cfg):
+    _, _, tbl, _ = _run(SELECT["large_string_literal"][0], cfg[0])
+    assert tbl.column("c").to_pylist()[:2] == ["x", "miss"]
 
 
 AGG = {

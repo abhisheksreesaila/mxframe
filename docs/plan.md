@@ -973,9 +973,12 @@ Found by the F-086 review (2026-10-16); a silent wrong answer on main
 
 ## F-105 SQL CASE: string results, and NULL when no ELSE [review]
 Seen in the F-086 review (2026-10-16)
-- [ ] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
-- [ ] a CASE with no ELSE gives 0 instead of NULL: `count(case when p then 1 end)` counts every row (silent wrong answer, found by the F-106 developer); a missing ELSE is NULL
-- [ ] DuckDB-checked tests: string / date / int / mixed-number CASE results, with ELSE and without (NULL), in SELECT / GROUP BY / ORDER BY; fails before
+- [x] a CASE whose branches are strings raises "Failed to parse string 'hit' as double": the result type is forced to float. Infer the CASE result type from its branches like DuckDB (common supertype), strings and dates included
+- [x] a CASE with no ELSE gives 0 instead of NULL: `count(case when p then 1 end)` counts every row (silent wrong answer, found by the F-106 developer); a missing ELSE is NULL
+- [x] DuckDB-checked tests: string / date / int / mixed-number CASE results, with ELSE and without (NULL), in SELECT / GROUP BY / ORDER BY; fails before
+- Built: `compiler.case_when_arrow` / `case_literal` (Arrow evaluation in `_eval_predicate` and `_eval_expr_arrow`; the GPU precomputes a CASE through the same code). Result type = DuckDB's common supertype: equal types stay, integers int64, `float32` next to an integer or a DECIMAL literal stays float32 and only a DOUBLE widens it (F-106's rule), other number mixes float64, `string` / `large_string` / dictionary one text family, NULL branch takes the other's type, all NULL int32. `when()` without `otherwise` and SQL without ELSE are NULL (the DataFrame default changed from 0; CHANGELOG and docs/api.md say so). `_translate_case`: `CASE x WHEN v` (it ignored `x`), `THEN NULL / TRUE / DATE '..'`. `_arrow_aggregate_reason` counts a CASE with a NULL branch as "has nulls" (`_can_be_null`), so the fused pipeline no longer drops the NULL group of a CASE key; the bytecode declines a NULL literal and `sum(case .. else 0 end)` stays native (Q8, Q12, Q14 unchanged vs main). `tests/test_f105_sql_case.py` (326, cpu / gpu, native on / off; 195 of the first 258 failed on main).
+- Review round 1: float32 branches keep float32 (`case when p then r else 0.1 end` is 0.10000000149011612), large_string and dictionary strings; tests for both.
+- Follow-ups, not fixed: `max(case when .. then big end)` past 2^53 raises (float64 in the NULL-aware aggregate); `CASE x WHEN NULL` is unsupported; a timestamp branch next to a date branch should promote to timestamp (now raises); int + DECIMAL branches give double, DuckDB gives an exact DECIMAL; MIN / MAX of a string or date CASE raises "could not convert 'hit' to double" (moved to F-108)
 
 ## F-106 SQL float literals: scientific notation and float32 columns [done]
 Found by the F-082 developer (2026-10-16)
@@ -1007,7 +1010,7 @@ Review round 1: also drain in `begin_prepare` and `resident_count`; comment at `
 ## F-108 SQL TIMESTAMP literals and temporal expressions in aggregates [todo]
 Found by the F-093 developer (2026-10-16)
 - [ ] `TIMESTAMP '2024-01-01 10:00:00'` (and `CAST('...' AS TIMESTAMP)`) is unsupported in the SQL front end (`Unsupported SQL expression type: Cast ... TIMESTAMPNTZ`); map to a timestamp literal compared in the column's unit and zone like DuckDB
-- [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only)
+- [ ] MIN / MAX of a computed date expression (`MIN(d + INTERVAL 1 DAY)`) keeps the date type (F-093 covered plain columns only); the same for a CASE with date results, and MIN / MAX of a CASE with string results (found in F-105: `_aggregate_with_nulls` evaluates the argument then casts it to float64, and `np_arrow.group_aggregate` has no string min / max; plain `min(s)` is answered elsewhere)
 - [ ] `HAVING min(ts) > DATE '2024-01-01'` raises ArrowNotImplementedError (timestamp vs date32 compare); DuckDB accepts it (date promoted to timestamp)
 - [ ] DuckDB-checked tests: timestamp literals in WHERE / HAVING / BETWEEN against s / ms / us / ns columns, with and without time zone; MIN / MAX of date expressions; fails before
 
