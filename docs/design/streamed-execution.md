@@ -57,9 +57,8 @@ copy and the group ids / gather buffers of the in-memory path.
 - **Batch size** = `(budget / 2 - 1.5 * dimension bytes) / WORKING_FACTOR` (half of the budget is kept for the
   group state, the partials waiting to merge, and the merge's own copy), at least one row group. Row groups are
   added in file order until the next would pass that size.
-- **Group state** (the merged partial table) over half the budget: raises `MemoryError` that names the number
-  of groups, the size and "needs hash-partitioned groups (F-056 step 3)". Failing loudly and early beats the
-  kernel's OOM killer. This is the one piece declined at run time.
+- **Group state** (the merged partial table): a merge whose input passes a quarter of the budget spills to hash
+  partitions on disk instead (section 10; step 2 raised `MemoryError` here).
 
 ## 4. Merge
 
@@ -140,7 +139,7 @@ partials.
 
 On `main` these fail: the budget variable is ignored, nothing streams, and the peak is the file.
 
-## 8. Step 3 (out of scope here, written into the plan)
+## 8. Step 3 (out of scope here, written into the plan; items 1, 3 (top-k only) and 5 are built, section 10)
 
 1. **Group state over the budget**: hash-partition the groups (filter by `hash(key) % P`, or range
    partition by key, one pass per partition) so each pass's state fits.
@@ -171,3 +170,51 @@ read-time row filter (`io_parquet._read_file`, which changes the rows below the 
 file and applied to every batch. min / max take the type of the original aggregate's zero-row schema. Known gap: the
 probe sees the engine's inputs only where the batch reaches `_arrow_aggregate_reason` / `_compile`; a plan that
 never does (a path that answers sums without either) gets a double.
+
+
+## 10. Step 3a: spilled groups, row queries, oversized row groups
+
+**Group state bigger than the budget** (`spill.py`, `streamed._State`). The engine's group-by holds about four times
+its input (measured: 5 MB merged in, 20 MB peak), so a merge whose input (`merged + pending`) times
+`MERGE_FACTOR = 4` passes the budget does not run: the state so far and every later partial are written instead
+to 16 Arrow IPC streams under `MXFRAME_SPILL_DIR` (default `~/.cache/mxframe/spill`, never `$TMPDIR`: tmpfs is RAM) in `mxframe-spill-<host>-<pid namespace>-<pid>-*` (only that host and namespace sweep it). A row goes to partition `hash(keys) >> 33 % 16`. The hash
+(`spill.hash_keys`) is splitmix64 over the bits of integers and floats (canonicalised first: -0.0 equals 0.0, every
+NaN equals every NaN, as the engine groups them, F-077), the CRC32 of the text of anything else, NULL a value of its
+own, and a per-level salt; no Python `hash()`, so the partition of a key is the same in every process and
+reproducible mode gets the same partitions and the same output order. After the last batch, `pieces()` reads one
+partition at a time into a fresh `_State` (the same merge, the same type rule as step 2: hidden columns, int64
+partials, `SumProbe` decides the type of integer sums at the end), splitting a partition again with salt + 1 when
+even it passes the budget (at most 6 levels: past that one group is the problem and it raises `MemoryError`). A
+group is in exactly one partition, so partition outputs just concatenate. Each partition file is deleted once read
+and the directory is removed in a `finally`, so an error leaves nothing behind. Provenance:
+`streamed.spill = {partitions, bytes, depth}`.
+
+**Above the aggregate.** The HAVING filter and projections (row-local nodes) run on every partition's output; what
+is then above (Sort + Limit, Limit) is a *sink* over the pieces: a running top-(n + offset) or an early stop. The
+sink's `result()` is placed where the aggregate / row-local part was and the original plan above it (Sort, Limit,
+OFFSET) runs on that, so ties and offsets are the engine's own. A result that is all the groups has to fit the
+budget: the API hands back one in-memory table.
+
+**Plans that return rows** (no aggregate above the big file). The row-local part of the plan above the file (Filter,
+Project without window functions, Join with the file on the probe side) is the batch plan; the sink is chosen by
+what sits right above it:
+
+| above the row-local part | per batch | at the end |
+|---|---|---|
+| Sort then Limit (Projects may sit between) | `Limit(Sort(part), n + offset)`, merged into the running best | the original Sort / Limit / Project on the best rows |
+| Limit | `Limit(part, n + offset - rows so far)`; stops at n + offset | the original Limit (OFFSET) |
+| anything else, or nothing | `part` | the original plan on the concatenation |
+
+Collected rows must fit the budget (budget / 3 when an operator above will work on them, since it needs about
+three times its input); otherwise `MemoryError`: "the result of this query is bigger than memory: the 100,000 rows
+produced so far are 3.1 MB, about 12.4 MB in all, and only 6.0 MB fits ..." (or "the rows that the Sort above the big
+file needs are ..."). The total is an extrapolation from the share of the file read so far. A bare Filter over the
+file selects only the columns the plan reads. Provenance: `streamed.rows = {kind, batches_run}`.
+
+**A row group bigger than a batch** is read in slices of rows (`io_parquet._next_slice`): `iter_batches` over a
+`ParquetFile` opened with a 64 KB read buffer. Without the buffer Arrow reads each column chunk whole, and
+`iter_batches` on an unbuffered file decodes the whole row group before slicing it (measured: 5.0 MB peak for a
+4.8 MB group; 1.6 MB with the buffer and 32 KB pages). What is held is the slice plus about one data page per
+column, so the bound depends on the file's page size (the writer default is 1 MB). The slices are batches like any
+other (own source token, so residency never mistakes two slices for one source); the plan's Filter node filters
+exactly (the read-time row filter is not applied to a slice). Provenance: `streamed.slices`.

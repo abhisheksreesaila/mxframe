@@ -126,11 +126,37 @@ def _align_literals(lhs, rhs):
     own precision is what DuckDB does on DECIMAL and what NumPy 2 does."""
     def is_f32(x):
         return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float32(x.type)
+    def is_f64(x):
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_float64(x.type)
+    def is_int(x):
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_integer(x.type)
     r, l = _numeric_literal(rhs), _numeric_literal(lhs)
     if r is not None and is_f32(lhs):
-        rhs = _npscalar(r, type=pa.float32())
+        rhs = _npscalar(float(r), type=pa.float32())
     elif l is not None and is_f32(rhs):
-        lhs = _npscalar(l, type=pa.float32())
+        lhs = _npscalar(float(l), type=pa.float32())
+    elif r is not None and is_f64(lhs):                  # an integer past 2**53: Arrow refuses the implicit cast, DuckDB rounds
+        rhs = _npscalar(float(r), type=pa.float64())
+    elif l is not None and is_f64(rhs):
+        lhs = _npscalar(float(l), type=pa.float64())
+    elif isinstance(r, np.float64) and is_int(lhs):     # an integer column against a DOUBLE: compared in double, as DuckDB
+        lhs = pc.cast(lhs, pa.float64(), safe=False)
+    elif isinstance(l, np.float64) and is_int(rhs):
+        rhs = pc.cast(rhs, pa.float64(), safe=False)
+    return lhs, rhs
+
+
+def _double_vs_int(args, lhs, rhs):
+    """An integer array against a DOUBLE literal (an ``np.float64`` constant, F-106) is compared in double, as
+    DuckDB does; Arrow would refuse the implicit cast of values past 2**53."""
+    def is_int(x):
+        return not isinstance(x, pa.Scalar) and hasattr(x, "type") and pa.types.is_integer(x.type)
+    def is_double(e):
+        return isinstance(e, Expr) and e.op == "lit" and isinstance(e.args[0], np.float64)
+    if is_double(args[1]) and is_int(lhs):
+        lhs = pc.cast(lhs, pa.float64(), safe=False)
+    elif is_double(args[0]) and is_int(rhs):
+        rhs = pc.cast(rhs, pa.float64(), safe=False)
     return lhs, rhs
 
 
@@ -406,6 +432,7 @@ class GraphCompiler:
             rhs = GraphCompiler._eval_predicate(args[1], table)
             if op not in ("and", "or"):
                 lhs, rhs = _align_literals(lhs, rhs)
+                lhs, rhs = _double_vs_int(args, lhs, rhs)
             return _PC_CMP_OPS[op](lhs, rhs)
         if op == "not":
             return pc.invert(GraphCompiler._eval_predicate(args[0], table))

@@ -1375,9 +1375,9 @@ def _threshold(kind: str, op: str, c: float):
             return float(np.float32(c)), code
     # integer column (int8..int64, bool)
     import math
-    if c >= 2.0 ** 63 or c == np.inf:
+    if c > 2.0 ** 63 or c == np.inf:
         return op in ("lt", "le", "ne")
-    if c <= -(2.0 ** 63) or c == -np.inf:
+    if c < -(2.0 ** 63) or c == -np.inf:
         return op in ("gt", "ge", "ne")
     lo, hi = math.ceil(c), math.floor(c)
     if op == "ge":
