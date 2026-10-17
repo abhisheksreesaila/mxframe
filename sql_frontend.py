@@ -21,7 +21,7 @@ import re
 import calendar
 import itertools
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 import numpy as np
 import pyarrow as pa
@@ -114,15 +114,16 @@ def _number(text, neg: bool = False) -> Union[int, float]:
     return -float(s) if neg else float(s)
 
 
-def _huge_int(n: sge.Expression) -> Optional[int]:
-    """The value of an integer literal (negated or not) past the int64 range, else None."""
+def _exact_decimal(n: sge.Expression) -> Optional[Decimal]:
+    """The exact value of an integer or DECIMAL literal (digits, a point, no exponent), negated or not, else None."""
     n = _unparen(n)
     neg = isinstance(n, sge.Neg)
     n = _unparen(n.this) if neg else n
-    if not (isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"\d[\d_]*", str(n.this))):
+    if not (isinstance(n, sge.Literal) and not n.is_string and re.fullmatch(r"[\d_]*\.?[\d_]*", str(n.this))
+            and re.search(r"\d", str(n.this))):
         return None
-    i = -int(str(n.this)) if neg else int(str(n.this))
-    return None if -(1 << 63) <= i < (1 << 63) else i
+    d = Decimal(str(n.this).replace("_", ""))
+    return -d if neg else d
 
 
 def _is_double_literal(n: sge.Expression) -> bool:
@@ -1655,9 +1656,13 @@ class _SQLTranslator:
             c = self._expr(node.this)
             if self._ftype(node.this) == "f32" and any(_is_double_literal(v) for v in node.expressions):
                 c = c * lit(np.float64(1.0))
-            ct = self._col_type(_unparen(node.this))
-            drop = ct is not None and pa.types.is_integer(ct)       # a literal past int64 never equals an integer column
-            values = [self._scalar(v) for v in node.expressions if not (drop and _huge_int(v) is not None)]
+            values = []
+            for v in node.expressions:
+                d = _exact_decimal(v) if self._is_int_expr(node.this) else None
+                if d is None:
+                    values.append(self._scalar(v))
+                elif d == d.to_integral_value() and -(1 << 63) <= d < (1 << 63):     # exactly: a fraction or a value past int64
+                    values.append(int(d))                                              # never equals an integer
             return c.isin(values) if values else c.is_null() & ~c.is_null()
 
         # ---- LIKE / ILIKE [ESCAPE c] ----
@@ -1804,20 +1809,28 @@ class _SQLTranslator:
         return x, y
 
     def _compare(self, cls, a: sge.Expression, b: sge.Expression) -> Expr:
-        """``a <op> b``. An integer literal past int64 against an integer column is a constant (DuckDB compares
-        HUGEINT exactly): above every value, `<` `<=` `<>` hold and `>` `>=` `=` do not, below every value the
-        other way round; NULL stays NULL (the column's null check is the predicate)."""
-        for lit_node, col_node, flip in ((b, a, False), (a, b, True)):
-            big = _huge_int(lit_node)
-            t = self._col_type(_unparen(col_node)) if big is not None else None
-            if t is not None and pa.types.is_integer(t):
-                above = big > 0
-                kind = {sge.LT: "lt", sge.LTE: "lt", sge.GT: "gt", sge.GTE: "gt", sge.EQ: "eq", sge.NEQ: "ne"}[cls]
-                if flip:
-                    kind = {"lt": "gt", "gt": "lt"}.get(kind, kind)
-                keep = kind == "ne" or (kind == "lt") == above and kind != "eq"
-                x = self._expr(col_node)
-                return ~x.is_null() if keep else x.is_null() & ~x.is_null()
+        """``a <op> b``. Against an integer column or expression, an integer literal past int64 or a DECIMAL
+        literal (a point, no exponent) is compared exactly, as DuckDB does: the DECIMAL becomes the integer bound
+        with the same answer (`< 2.5` is `< 3`, `> 2.5` is `> 2`, `= 2.5` never holds), and a bound past int64 is
+        a constant (above every value `<` `<=` `<>` hold, below every value `>` `>=`); NULL stays NULL. A DOUBLE
+        (exponent) literal compares in double instead, so it is left to the engine."""
+        kind = {sge.LT: "lt", sge.LTE: "le", sge.GT: "gt", sge.GTE: "ge", sge.EQ: "eq", sge.NEQ: "ne"}[cls]
+        for lit_node, x_node, flip in ((b, a, False), (a, b, True)):
+            d = _exact_decimal(lit_node)
+            if d is None or not self._is_int_expr(x_node):
+                continue
+            if flip:
+                kind = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le"}.get(kind, kind)
+            x = self._expr(x_node)
+            whole = d == d.to_integral_value()
+            if kind in ("eq", "ne") and not whole:
+                return ~x.is_null() if kind == "ne" else x.is_null() & ~x.is_null()
+            n = int(d.to_integral_value(ROUND_CEILING if kind in ("lt", "ge") else ROUND_FLOOR)) if not whole else int(d)
+            if -(1 << 63) <= n < (1 << 63):
+                return {"lt": x < lit(n), "le": x <= lit(n), "gt": x > lit(n), "ge": x >= lit(n), "eq": x == lit(n),
+                        "ne": x != lit(n)}[kind]
+            keep = kind == "ne" or (kind in ("lt", "le")) == (n > 0) and kind != "eq"
+            return ~x.is_null() if keep else x.is_null() & ~x.is_null()
         x, y = self._widened(a, b)
         return {sge.EQ: x == y, sge.NEQ: x != y, sge.LT: x < y, sge.LTE: x <= y, sge.GT: x > y, sge.GTE: x >= y}[cls]
 

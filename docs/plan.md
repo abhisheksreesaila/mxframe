@@ -957,6 +957,7 @@ Found by the F-094 developer (2026-10-16); a silent wrong answer past 2^53
 Found by the F-086 review (2026-10-16); a silent wrong answer on main
 - [x] `t LEFT JOIN u ON t.k = u.k LEFT JOIN x ON u.k = x.k`: for a `t.k` with no match in `u`, `u.k` is NULL so `x` does not match (z = NULL, as DuckDB). `_copy_right_keys` also scans later joins' ON clauses for `u.k`, and `_use_right_key_copies` rewrites those ON references to the NULL-on-unmatched copy before `_parse_join_on` (which now swaps `x.k = u.k` written either way round, and registers a copy as the left key's name). After an INNER JOIN on a copy, `x.k` resolves to the copy. A right column the join renamed (`x.k` -> `k_right`, when it is not a key) is named by its output name in a later ON
 - [x] DuckDB-checked tests (`tests/test_sql_chained_left_join.py`, cpu and gpu): two and three chained LEFT JOINs on the previous right key (either operand order), mixed INNER / LEFT, a previous right table's non-key column (`u.v`), USING forms, aggregate over the chain, unmatched rows at each step; 29 of 45 failed before
+- Review round 2: a DECIMAL literal (point, no exponent) against an integer column or expression is compared exactly in `_compare` with `Decimal` (`< 2.5` is `< 3`, `> 2.5` is `> 2`, `= 2.5` never holds, a bound past int64 is a constant; BETWEEN and IN too); only a DOUBLE (`np.float64`) literal casts the integer column to double (`_align_literals`, `_double_vs_int`). The native decline for big float constants is gone; `_threshold` instead treats an integer column's float bound of exactly +-2^63 as a value, not as out of range. Tests: `test_decimal_literals_exact`
 - Not changed: a bare `k` in a later ON stays the left table's (DuckDB calls it ambiguous)
 
 ## F-105 SQL CASE with string results [todo]
@@ -973,12 +974,12 @@ Found by the F-082 developer (2026-10-16)
 - Review round 1: the minus sign is folded into the literal before the int64 range check (`_number(text, neg)`), so `-9223372036854775808` is an int64 (native declines a float constant past 2^53 against an int column, `pipeline_program._try_cmpc`); an integer literal past int64 against an integer column is a constant (`_compare`, also BETWEEN and IN; NULL stays NULL); the Arrow path compares an integer column with a float constant in double like DuckDB instead of raising (`_align_literals`); widening is decided by the expression type (`_ftype`: DOUBLE literal or float64 column, through + - * / and negation), so `g > 1e-30 * 1` and `-g < -1e-30` widen. Tests add int64 rows at 2^53+1, INT64_MAX, INT64_MIN
 - Not changed: a bare `select 0.1` still returns float32 (DuckDB: DECIMAL); `i + 99999999999999999999` is a float (DuckDB: HUGEINT, exact)
 
-## F-110 SQL literal exactness at the int64 limits and float32 through functions [todo]
+## F-110 SQL float32 arithmetic keeps a FLOAT result, and float32 through functions [todo]
 Found in the F-106 review (2026-10-16)
-- [ ] a DECIMAL literal is read as a float64, so `i < 9223372036854775807.0` on an int64 column holding 9223372036854775806 is wrong (DuckDB compares the DECIMAL exactly and keeps the row; the engine sees 2^63). Parse a decimal literal past 2^53 as `Decimal` and compare an integer column with it exactly (ceil / floor to int64)
-- [ ] `g * 0.5 > 0.05` on a float32 column: DuckDB casts the DECIMAL to float32, the engine differs on one boundary row (33 vs 34 rows in `tests/test_f106_float_literals.py` fixture)
+- [ ] float32 arithmetic runs in double while DuckDB keeps a FLOAT result, so `g * 0.5 > 0.05`, `g + 0.1 > 0.2` and `g * 2 = 0.2` on a float32 column differ from DuckDB on boundary rows (wrong on main too; repro `/tmp/rv106_f110.py`). Round each float32 intermediate to float32 (or compare at float32) on every path
 - [ ] a float32 column through a function (`abs(g)`, `coalesce(g, 0)`, `cast(g as float)`) raises "Unsupported SQL expression type"; once supported, `_ftype` must give them the argument's type so `abs(g) > 1e-30` widens
 - [ ] DuckDB-checked tests; fails before
+- Done in F-106 (round 2): a DECIMAL literal against an integer column or expression is compared exactly (`i < 9223372036854775807.0` keeps INT64_MAX-1)
 
 ## F-107 Test process hangs on a futex while other suites share the GPUs [review]
 Seen four times on 2026-10-16 (F-070 developer, F-094 review, a main-repo run, F-103 developer): a full-suite process idles at ~0% CPU for 30+ minutes, 145 threads in `futex_do_wait`, holding the GPU device handles, while 3-4 other suites use the same GPUs. Killing and rerunning passes. Could be load, could be a lock-order deadlock between our GPU warm-up / residency upload threads (F-057, F-063) and a query, or a CUDA context lock across processes

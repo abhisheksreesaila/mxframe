@@ -139,6 +139,33 @@ def test_int64_limits(cfg, w):
     assert got == want, (q, got, want)
 
 
+# ── DECIMAL literals against int64 columns are exact; DOUBLE ones compare in double ────────────────
+
+DEC = pa.table({"i": pa.array([1, 2, 3, 2**53, 2**53 + 1, 9223372036854775806, 9223372036854775807, None], pa.int64()),
+                "j": pa.array([1, 2, 3, 4, 5, 6, 7, None], pa.int32())})
+DECCON = duckdb.connect()
+DECCON.register("_d", DEC)
+DECCON.execute("create table t as select * from _d")
+
+DEC_WHERE = [f"{c} {op} {v}" for v in ("9007199254740992.0", "9007199254740993.0", "9223372036854775806.0",
+                                       "9223372036854775807.0", "9223372036854775807.5", "2.5", "-2.5", "2.0", ".5", "3.")
+             for c in ("i", "j") for op in ("=", "<>", "<", "<=", ">", ">=")] + [
+    "2.5 > i", "2.5 = i", "9007199254740992.0 < i", "i between 2.5 and 9007199254740992.0",
+    "i in (9007199254740992.0, 2.5, 3.0)", "i not in (9007199254740992.0, 2.5)",
+    "i + 0 = 9007199254740992.0", "i + 0 > 9007199254740992.0", "i * 1 < 9223372036854775807.0",
+    "i + 0 = 9223372036854775806.0", "i - 0 < 2.5", "i = 9007199254740992e0", "i > 9007199254740992e0",
+    "i < 9223372036854775807e0", "i >= 9223372036854775807e0", "i = 2e0", "i < 2.5e0",
+]
+
+
+@pytest.mark.parametrize("w", DEC_WHERE)
+def test_decimal_literals_exact(cfg, w):
+    q = f"select i from t where {w} order by i"
+    want = DECCON.execute(q).fetchall()
+    got = _rows(mx.sql(q, t=DEC).compute(device=cfg))
+    assert got == want, (q, got, want)
+
+
 # ── float32 column against literals ───────────────────────────────────────────────────────────────
 
 F32_WHERE = [
