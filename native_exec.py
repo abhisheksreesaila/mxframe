@@ -994,7 +994,7 @@ def try_filter_topk(compiler, table: pa.Table, predicates, names, descending, k:
             continue
         if c.type not in _DT or c.null_count:
             return None
-        dtypes.append(_DT[c.type])
+        dtypes.append(DT_I64X if name in prog.exact_cols and c.type == pa.int64() else _DT[c.type])
     scols = [table.column(nm) for nm in names]
     segs = _segments(vcols + scols)
     if not segs:
@@ -1184,7 +1184,7 @@ def try_filter(compiler, table: pa.Table, predicates, needed, lookups=(), keep_d
             continue
         if c.type not in _DT or c.null_count:
             return _filter_decline(f"predicate column type {c.type} or nulls")
-        dtypes.append(_DT[c.type])
+        dtypes.append(DT_I64X if name in prog.exact_cols and c.type == pa.int64() else _DT[c.type])
     ocols = [table.column(n) for n in names]
     kinds, sizes = [], []
     coded = []                                  # output positions written as dictionary codes
@@ -1534,7 +1534,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
     n_user = len(plan.aggs)
     hidden = [Expr("min", derived[i]).alias(f"__key{i}") for i in sorted(derived)]
     prog = compile_pipeline(list(fj.post_preds), list(plan.aggs) + hidden, _VTable(cols, table.num_rows), concat_dicts=True,
-                            int_extremes=False)
+                            int_regs=False)
     if prog is None:
         return _decline("expression not supported by the bytecode compiler")
     if prog.dict_arrays:
@@ -1652,7 +1652,7 @@ def try_execute_join(compiler, plan, fj: FusedJoin, having_pred, post_ops, disti
         if pex.dtype(name) is not None:
             pdtypes.append(pex.dtype(name))
         elif c.type in _DT and not c.null_count:
-            pdtypes.append(_DT[c.type])
+            pdtypes.append(DT_I64X if name in pre.exact_cols and c.type == pa.int64() else _DT[c.type])
         else:
             return _decline(f"predicate column type {c.type} or nulls")
     probe_cols = [table.column(n) for n in pk_names]

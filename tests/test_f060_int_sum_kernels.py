@@ -60,6 +60,22 @@ def _run(t, keyed, device, **kw):
     return [(r.get("g"), r["sv"], r["sw"]) for r in rows], lf.last_compile_provenance
 
 
+# The mode the GPU kernel picks for the two-slot sums above (pipeline_gpu.mojo `_choose_mode`): 0 per-thread partials (one
+# group), 3 per-thread partials in shared memory (a few groups), 1 one table per block + shared atomics (a thousand),
+# 2 global atomics (many), 4 the ordered per-block table (reproducible), -6 when the ordered table cannot hold the groups
+# (the CPU's defined order answers)
+GPU_MODES = {"global": (0, 0), "few": (3, 3), "thousands": (1, 4), "many": (2, -6), "staged": (2, -6)}
+
+
+def _gpu_mode(t, groups, repro):
+    """The mode (0 to 4, negative: declined) the kernel library picks for this query's program: the same function
+    `mx_pipeline_gpu` calls."""
+    import mxframe.pipeline_kernels as pk
+    from mxframe.pipeline_program import compile_pipeline
+    prog = compile_pipeline([], [col("v").sum().alias("sv"), col("w").sum().alias("sw")], t)
+    return pk._load_gpu().mx_pipeline_gpu_mode(groups, prog.n_slots, int(prog.code[1]), int(len(prog.code)), int(repro))
+
+
 MODES = [
     pytest.param("1", "cpu", False, id="native"),
     pytest.param("1", "cpu", True, id="native-repro"),
@@ -89,10 +105,14 @@ def test_the_sums_equal_duckdbs_exact_totals(monkeypatch, native, device, repro,
         assert max(abs(w[1]) for w in want) > 2 ** 53
     if native == "1" and device == "cpu":
         assert prov["path"] == "native", prov
+    elif device == "cpu":
+        assert prov["path"] == "fused_pipeline_cpu", prov                    # the older pipeline answered (F-060b review item)
     elif device == "gpu" and not repro:
         assert prov["path"] == "fused_pipeline_gpu", prov                    # (modes 0, 3, 1 and 2 by the group count)
     elif device == "gpu" and shape in ("global", "few", "thousands"):
         assert prov["path"] == "fused_pipeline_gpu", prov                    # the ordered mode 4 holds these
+    if device == "gpu":
+        assert _gpu_mode(t, groups, repro) == GPU_MODES[shape][1 if repro else 0]
 
 
 # -- a total past int64 raises on every kernel ---------------------------------------------------------

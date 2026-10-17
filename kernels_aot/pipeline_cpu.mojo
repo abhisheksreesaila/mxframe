@@ -77,12 +77,17 @@ comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 # ── opcodes (mirror pipeline_program.py) ───────────────────────────────────
 comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
-comptime OP_LOADI = 3         # the column's values as int64 BITS in the register (read only by OP_AGG_IMIN / IMAX, F-060c)
+comptime OP_LOADI = 3         # the column's values as int64 BITS in the register (an "int" register: F-060c, F-060b)
 comptime OP_ADD = 10
 comptime OP_SUB = 11
 comptime OP_MUL = 12
 comptime OP_DIV = 13
 comptime OP_MOD = 14        # fmod: the sign follows the dividend (integer % a nonzero constant, F-101)
+comptime OP_IADD = 15       # int64 + - * of two "int" registers (int64 bits in the float64 words); a result outside int64 sets *ovf (F-060b)
+comptime OP_ISUB = 16
+comptime OP_IMUL = 17
+comptime OP_F2I = 18        # dst = int64(a): a float register of whole numbers within +-2^53
+comptime OP_I2F = 19        # dst = float64(a) of an "int" register; a value outside +-2^53 sets *ovf
 comptime OP_LT = 20
 comptime OP_LE = 21
 comptime OP_GT = 22
@@ -103,10 +108,12 @@ comptime OP_ISNULL = 41     # the column's validity bit is clear (F-097)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
-comptime OP_AGG_ISUM = 53   # sum of an integer-valued input, accumulated in int64 (F-060); the slot holds int64 bits
-comptime OP_AGG_IMIN = 54   # min / max of an OP_LOADI register, accumulated in int64 (F-060c); the slot holds int64 bits
+comptime OP_AGG_ISUM = 53   # sum of an "int" register, accumulated in int64 (F-060, F-060b); the slot holds int64 bits
+comptime OP_AGG_IMIN = 54   # min / max of an "int" register, accumulated in int64 (F-060c); the slot holds int64 bits
 comptime OP_AGG_IMAX = 55
-comptime E_OVERFLOW = -21   # an int64 sum passed its range (the caller's checked path answers)
+comptime E_OVERFLOW = -21   # an int64 sum or result passed its range, or an int64 value past 2^53 met a float op (the caller's exact path answers)
+comptime LIM53 = Int64(1) << 53
+comptime B62 = 4611686018427387904.0     # 2^62 as a double: |a double product| below it proves an int64 product fits
 
 comptime INF = Float64(1.7976931348623157e308) * 10.0
 
@@ -137,6 +144,101 @@ def _is_iext(kind: Int) -> Bool:
 def _iext(kind: Int, a: Int64, b: Int64) -> Int64:
     """The integer extreme of two slot words (OP_AGG_IMIN / OP_AGG_IMAX, F-060c)."""
     return min(a, b) if kind == OP_AGG_IMIN else max(a, b)
+
+@always_inline
+def _imul_ovf(x: Int64, y: Int64) -> Bool:
+    """Does x * y pass int64? (exact; the wrapped product is checked by dividing back, and the two quotients that
+    trap are decided first)."""
+    if x == 0 or y == 0:
+        return False
+    if x == -1:
+        return y == Int64.MIN
+    if y == -1:
+        return x == Int64.MIN
+    return (x * y) // x != y
+
+@always_inline
+def _int_bin[OP: Int](d: FP, a: FP, b: FP, n: Int, ovf: LP):
+    """OP_IADD / OP_ISUB / OP_IMUL over the first n lanes of two "int" registers (int64 bits in the float64 words), in
+    int64. A result outside int64 sets *ovf (the lanes past n hold stale words: never looked at). A product is
+    checked from its double: below 2^62 in magnitude it fits, otherwise the lane is checked exactly."""
+    var dd = _ibits(d)
+    var xa = _ibits(a)
+    var xb = _ibits(b)
+    var ov = SIMD[DType.int64, W](0)
+    var i = 0
+    while i + W <= n:
+        var x = xa.load[width=W](i)
+        var y = xb.load[width=W](i)
+        comptime if OP == OP_IADD:
+            var r = x + y
+            ov |= (x ^ r) & (y ^ r)
+            dd.store(i, r)
+        elif OP == OP_ISUB:
+            var r = x - y
+            ov |= (x ^ y) & (x ^ r)
+            dd.store(i, r)
+        else:
+            var fp = x.cast[F64]() * y.cast[F64]()
+            var big = fp.ge(SIMD[F64, W](B62)) | fp.le(SIMD[F64, W](-B62))
+            dd.store(i, x * y)
+            if big.reduce_or():
+                for l in range(W):
+                    if big[l] and _imul_ovf(x[l], y[l]):
+                        ovf[0] = 1
+        i += W
+    if ov.reduce_or() < 0:
+        ovf[0] = 1
+    while i < n:
+        var x = xa[i]
+        var y = xb[i]
+        comptime if OP == OP_IADD:
+            var r = x + y
+            if ((x ^ r) & (y ^ r)) < 0:
+                ovf[0] = 1
+            dd[i] = r
+        elif OP == OP_ISUB:
+            var r = x - y
+            if ((x ^ y) & (x ^ r)) < 0:
+                ovf[0] = 1
+            dd[i] = r
+        else:
+            if _imul_ovf(x, y):
+                ovf[0] = 1
+            dd[i] = x * y
+        i += 1
+
+def _f2i(d: FP, a: FP, n: Int):
+    """OP_F2I: the first n lanes of a float register of whole numbers within +-2^53, as int64 bits."""
+    var dd = _ibits(d)
+    var i = 0
+    while i + W <= n:
+        dd.store(i, a.load[width=W](i).cast[DType.int64]())
+        i += W
+    while i < n:
+        dd[i] = Int64(a[i])
+        i += 1
+
+def _i2f(d: FP, a: FP, n: Int, ovf: LP):
+    """OP_I2F: the first n lanes of an "int" register as doubles. A value outside +-2^53 is not exact as a double: *ovf is
+    set and the caller's exact path answers."""
+    var xa = _ibits(a)
+    var lim = SIMD[DType.int64, W](LIM53)
+    var oor = SIMD[DType.bool, W](fill=False)
+    var i = 0
+    while i + W <= n:
+        var v = xa.load[width=W](i)
+        d.store(i, v.cast[F64]())
+        oor = oor | v.gt(lim) | v.lt(-lim)
+        i += W
+    if oor.reduce_or():
+        ovf[0] = 1
+    while i < n:
+        var v = xa[i]
+        d[i] = Float64(v)
+        if v > LIM53 or v < -LIM53:
+            ovf[0] = 1
+        i += 1
 
 def _fill_identity(base: FP, count: Int, kind: Int):
     """`count` slot words at their aggregate's identity: 0 for sums, +-inf for float extremes, INT64_MAX / INT64_MIN
@@ -742,6 +844,17 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             # holds the block offsets of the rows kept so far
             for i in range(n):
                 d[i] = Float64(i0 + (Int(sel[i]) if use_sel else i))
+        elif op >= OP_IADD and op <= OP_I2F:
+            if op == OP_IADD:
+                _int_bin[OP_IADD](d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, n, p.ovf)
+            elif op == OP_ISUB:
+                _int_bin[OP_ISUB](d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, n, p.ovf)
+            elif op == OP_IMUL:
+                _int_bin[OP_IMUL](d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, n, p.ovf)
+            elif op == OP_F2I:
+                _f2i(d, regs + Int(ins[2]) * VEC, n)
+            else:
+                _i2f(d, regs + Int(ins[2]) * VEC, n, p.ovf)
         elif op < OP_NOT:
             _binop(op, d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC, npad, Int(ins[4]) != 0)
         elif op == OP_NOT:
@@ -778,13 +891,14 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
             var r = regs + Int(ins[2]) * VEC
             var acc = pv + a * NL
             if kind == OP_AGG_ISUM:
-                # exact: the inputs are whole numbers within +-2^53, added as int64 in the SIMD lanes
+                # exact: the input is an "int" register, its int64 values added in the SIMD lanes
                 var iacc = _ibits(acc)
+                var ir = _ibits(r)
                 var iv = iacc.load[width=W]()
                 var ov = SIMD[DType.int64, W](0)
                 var k = 0
                 while k + W <= n:
-                    var x = r.load[width=W](k).cast[DType.int64]()
+                    var x = ir.load[width=W](k)
                     var t = iv + x
                     ov |= (iv ^ t) & (x ^ t)
                     iv = t
@@ -793,7 +907,7 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 if ov.reduce_or() < 0:
                     p.ovf[0] = 1
                 while k < n:
-                    iacc[0] = _iadd(iacc[0], Int64(r[k]), p.ovf)
+                    iacc[0] = _iadd(iacc[0], ir[k], p.ovf)
                     k += 1
                 continue
             if _is_iext(kind):
@@ -854,7 +968,7 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 var g = Int(gp[j])
                 if g >= 0 and g < G:
                     var q = ib + (g * NL + (j & lm))
-                    q[0] = _iadd(q[0], Int64(r[j]), p.ovf)
+                    q[0] = _iadd(q[0], _ibits(r)[j], p.ovf)
         elif _is_iext(kind):
             var xb = _ibits(base)
             var xr = _ibits(r)
@@ -973,7 +1087,7 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
                 if kind == OP_AGG_SUM:
                     _ = Atomic[Scalar[DType.float64]].fetch_add(ov + a * G + g, x)
                 elif kind == OP_AGG_ISUM:
-                    var xi = Int64(x)
+                    var xi = _ibits(regs + Int(ins[2]) * VEC)[j]
                     var old = Atomic[Scalar[DType.int64]].fetch_add(_ibits(ov + a * G + g), xi)
                     _ = _iadd(old, xi, p.ovf)
                 elif kind == OP_AGG_IMIN:
@@ -998,9 +1112,7 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
             for a in range(A):
                 var ins = p.instr(p.n_pro + p.n_pred + p.n_body, a)
                 var x0 = regs[Int(ins[2]) * VEC + j]
-                if Int(ins[0]) == OP_AGG_ISUM:
-                    _ibits(cv + (a * SC + s))[0] = Int64(x0)
-                elif _is_iext(Int(ins[0])):
+                if Int(ins[0]) == OP_AGG_ISUM or _is_iext(Int(ins[0])):
                     _ibits(cv + (a * SC + s))[0] = _ibits(regs + Int(ins[2]) * VEC)[j]
                 else:
                     cv[a * SC + s] = x0
@@ -1016,7 +1128,7 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
                 q[0] += x
             elif kind == OP_AGG_ISUM:
                 var iq = _ibits(q)
-                iq[0] = _iadd(iq[0], Int64(x), p.ovf)
+                iq[0] = _iadd(iq[0], _ibits(regs + Int(ins[2]) * VEC)[j], p.ovf)
             elif _is_iext(kind):
                 var iq = _ibits(q)
                 iq[0] = _iext(kind, iq[0], _ibits(regs + Int(ins[2]) * VEC)[j])
@@ -1500,7 +1612,7 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                             var isb = _ibits(sb)
                             for r in range(r0, r1):
                                 var at = Int(gids[r]) - g0
-                                isb[at] = _iadd(isb[at], Int64(q[r]), p.ovf)
+                                isb[at] = _iadd(isb[at], _ibits(q)[r], p.ovf)
                         elif _is_iext(kind):
                             var xo = _ibits(o)
                             var xq = _ibits(q)

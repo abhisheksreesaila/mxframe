@@ -25,7 +25,7 @@ from pathlib import Path
 from ._max_lazy import engine, driver, Graph, TensorType, ops, DType, DeviceRef
 from .lazy_expr import Expr
 from .lazy_frame import column_types, join_output_names, LogicalPlan, Scan, Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
-from .compiler import case_when_arrow, case_when_guarded, coalesce_arrow, branch_values, abs_arrow, year_days_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _is_number
+from .compiler import case_when_arrow, case_when_guarded, coalesce_arrow, branch_values, abs_arrow, year_days_arrow, add_interval_arrow, cast_arrow, case_literal, GraphCompiler, _max_dtype, _CMP_OPS, _PC_CMP_OPS, _DICT_PRED_OPS, _align_literals, _align_temporal, _double_vs_int, _is_number
 from . import group_keys as _group_keys
 from .arrow_dict import decode as _decode_dict, dict_predicate as _dict_predicate, encode_key as _encode_key
 try:
@@ -772,7 +772,7 @@ class CustomOpsCompiler(GraphCompiler):
                 return lhs, _npscalar(r_lit)
             lhs, rhs = _align_literals(lhs, r_lit)
             return lhs, (self._eval_expr_arrow(args[1], table) if rhs is r_lit else rhs)
-        return _align_temporal(self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table))
+        return _double_vs_int(args, *_align_temporal(self._eval_expr_arrow(args[0], table), self._eval_expr_arrow(args[1], table)))
 
     def _eval_expr_arrow(self, expr, table):
         """Evaluate expr on an Arrow table, returning a pa.Array."""
