@@ -387,11 +387,17 @@ class _SQLTranslator:
         self._joined: set = set()
         self._cur_cols: List[str] = []
         self._sources: dict = {}        # id(FROM item) -> (item, plan, columns)
+        # name resolution (`_resolve_names`): the scopes of this query and then of the queries around it
+        # (each [(alias, columns)]), and its SELECT aliases
+        self._outer: list = []
+        self._levels: list = []
+        self._aliases: dict = {}
 
     def _child(self) -> "_SQLTranslator":
         """A translator for a subquery: its own state, the same tables and WITH names."""
         c = _SQLTranslator(self._tables)
         c._ctes = dict(self._ctes)
+        c._outer = self._levels
         c._ids = self._ids
         return c
 
@@ -806,46 +812,24 @@ class _SQLTranslator:
                 return any(name in cols for _, cols in self._table_cols[:i])
         return False
 
-    def _resolve_names(self, sel: sge.Select, outer=()) -> None:
+    def _resolve_names(self, sel: sge.Select) -> None:
         """The one place where a column's written spelling becomes its real one. DuckDB matches every
         identifier case-insensitively, quoted or not, and returns the source column's spelling: each column
-        reference of ``sel`` (and of the subqueries in it, which also see ``outer`` scopes) is rewritten to the
-        name of the column it finds, so everything after this works on exact names. A SELECT alias is found
-        by its written spelling. The text as written stays in the node's meta (an aggregate is named from it)."""
+        reference of ``sel`` is rewritten to the name of the column it finds (its FROM columns, then a SELECT
+        alias, then the scopes of the queries around it), so everything after this works on exact names. A
+        subquery's own columns are resolved when it is translated, by the translator that builds it (it is
+        given the scopes around it); only its references to this query are resolved here (`_correlation`).
+        The text as written stays in the node's meta (an aggregate is named from it)."""
         items = ([sel.args["from_"].this] if sel.args.get("from_") is not None else []) \
             + [j.this for j in sel.args.get("joins") or []]
         scope = [(it.alias_or_name.lower(), list(self._source(it)[1])) for it in items]
-        aliases = {e.alias.lower(): e.alias for e in sel.expressions if isinstance(e, sge.Alias)}
-        levels = [scope, *outer]
-
-        def fix(c: sge.Column) -> None:
-            if isinstance(c.this, sge.Star):
-                return
-            hit = None
-            for i, lvl in enumerate(levels):
-                if c.table:
-                    cols = next((cs for a, cs in lvl if a == c.table.lower()), None)
-                    if cols is None:
-                        continue
-                    hit = _ci_find(cols, c.name)
-                    break
-                hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
-                if hit is None and i == 0:
-                    hit = aliases.get(c.name.lower())
-                if hit is not None:
-                    break
-            if hit is not None:
-                c.meta.setdefault("written", c.name)
-                c.this.set("this", hit)
+        self._aliases = {e.alias.lower(): e.alias for e in sel.expressions if isinstance(e, sge.Alias)}
+        self._levels = [scope, *self._outer]
 
         def visit(n: sge.Expression) -> None:
             for x in n.walk(prune=lambda y: isinstance(y, sge.Select)):
                 if isinstance(x, sge.Column):
-                    fix(x)
-                elif isinstance(x, sge.Select):
-                    sub = self._child()
-                    sub._register_ctes(x.args.get("with_"))
-                    sub._resolve_names(x, levels)
+                    self._resolve_col(x)
 
         for key, val in sel.args.items():
             if key in ("with_", "from_") or val is None:
@@ -858,6 +842,27 @@ class _SQLTranslator:
                                 visit(w)
                 elif isinstance(v, sge.Expression):
                     visit(v)
+
+    def _resolve_col(self, c: sge.Column) -> None:
+        """Rewrite column ``c`` to the spelling of the column it names in this query's scopes."""
+        if isinstance(c.this, sge.Star):
+            return
+        hit = None
+        for i, lvl in enumerate(self._levels):
+            if c.table:
+                cols = next((cs for a, cs in lvl if a == c.table.lower()), None)
+                if cols is None:
+                    continue
+                hit = _ci_find(cols, c.name)
+                break
+            hit = _ci_find([x for _, cs in lvl for x in cs], c.name)
+            if hit is None and i == 0:
+                hit = self._aliases.get(c.name.lower())
+            if hit is not None:
+                break
+        if hit is not None:
+            c.meta.setdefault("written", c.name)
+            c.this.set("this", hit)
 
     def _source(self, table_node: sge.Expression):
         """(plan, column names) of a FROM item, built once per translator."""
@@ -1021,6 +1026,7 @@ class _SQLTranslator:
                 if oa != ob:
                     outer, inner = (a, b) if oa else (b, a)
                     if isinstance(outer, sge.Column):
+                        self._resolve_col(outer)          # its spelling in this query; the subquery does not know it
                         keys.append((outer, inner))
                         continue
             raise NotImplementedError(f"{what}: correlated predicate {c.sql(dialect='duckdb')} cannot be decorrelated "

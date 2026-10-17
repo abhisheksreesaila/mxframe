@@ -37,15 +37,20 @@ def _f():                                    # keys of another type (F-090): flo
                      "Score": pa.array([1, 2, 3, 4], pa.int64())})
 
 
+def _w():                                    # columns that differ from t's only by case (amount / Amount)
+    return pa.table({"customerid": pa.array([1, 2, 3, 9], pa.int64()), "amount": pa.array([5, 7, 7, 13], pa.int64()),
+                     "weight": pa.array([1, 2, 3, 4], pa.int64())})
+
+
 def _c():                                    # names that differ only by case
     return pa.table({"a": pa.array([1, 2, 3], pa.int64()), "A": pa.array([10, 20, 30], pa.int64()),
                      "B": pa.array([5, 6, 7], pa.int64())})
 
 
-def _duck(q, t=None, u=None, f=None, c=None):
+def _duck(q, t=None, u=None, f=None, c=None, w=None):
     """DuckDB's answer, tables found by name as local variables (a replacement scan), the way a user runs it:
     that is the form that renames a repeated output name to `x_1`, case-insensitively."""
-    exp = duckdb.sql(q).arrow()                                 # noqa: F841 (t, u, f, c are read by DuckDB)
+    exp = duckdb.sql(q).arrow()                                 # noqa: F841 (t, u, f, c, w are read by DuckDB)
     return exp.read_all() if isinstance(exp, pa.RecordBatchReader) else exp
 
 
@@ -57,7 +62,7 @@ def _check(q, **tables):
 
 
 def _tables():
-    return dict(t=_t(), u=_u(), f=_f())
+    return dict(t=_t(), u=_u(), f=_f(), w=_w())
 
 
 # --- SELECT, aliases, qualifiers -------------------------------------------------------------------------
@@ -199,7 +204,30 @@ CLASHES = [
     "SELECT a FROM c ORDER BY A DESC",
 ]
 
-ALL = SELECTS + STARS + WHERES + GROUPS + ORDERS + JOINS + SUBQUERIES
+# --- a SELECT alias that swaps names with a column: ORDER BY takes the alias, GROUP BY the column ----------
+SWAPS = [
+    "SELECT amount AS customerid, customerid AS amount FROM t ORDER BY amount",
+    "SELECT amount AS customerid, customerid AS amount FROM t ORDER BY AMOUNT DESC",
+    "SELECT customerid AS Amount, amount AS CustomerID FROM t ORDER BY CUSTOMERID, amount",
+    "SELECT customerid AS Region, region AS CustomerID FROM t ORDER BY region DESC, CUSTOMERID",
+    "SELECT region AS R, SUM(amount) AS Region FROM t GROUP BY region ORDER BY region",
+    "SELECT region AS r, SUM(amount) AS s FROM t GROUP BY REGION HAVING SUM(AMOUNT) > 15 ORDER BY R",
+    "SELECT region, SUM(amount) AS Amount FROM t GROUP BY region HAVING SUM(amount) > 15 ORDER BY AMOUNT DESC",
+    "SELECT region, SUM(amount) AS Amount FROM t GROUP BY REGION ORDER BY AMOUNT, region",
+    "SELECT SUM(amount) AS Region, region AS Amount FROM t GROUP BY region ORDER BY REGION",
+    "SELECT customerid AS Amount FROM t WHERE AMOUNT > 5 ORDER BY amount",             # WHERE sees the column
+]
+
+# --- a correlated subquery whose inner and outer columns differ only by case -----------------------------
+CORRELATED = [
+    "SELECT customerid FROM t WHERE EXISTS (SELECT 1 FROM w WHERE W.AMOUNT = T.AMOUNT) ORDER BY 1",
+    "SELECT customerid FROM t WHERE EXISTS (SELECT 1 FROM w WHERE AMOUNT = t.Amount) ORDER BY 1",
+    "SELECT customerid FROM t WHERE NOT EXISTS (SELECT 1 FROM w WHERE amount = T.AMOUNT) ORDER BY 1",
+    "SELECT customerid FROM t WHERE \"Order Date\" > (SELECT MIN(w.WEIGHT) * 10 FROM w WHERE w.amount = t.AMOUNT) ORDER BY 1",
+    "SELECT customerid FROM t WHERE customerid IN (SELECT w.CUSTOMERID FROM w WHERE w.AMOUNT = t.amount) ORDER BY 1",
+]
+
+ALL = SWAPS + CORRELATED + SELECTS + STARS + WHERES + GROUPS + ORDERS + JOINS + SUBQUERIES
 
 
 @pytest.mark.parametrize("q", ALL)
@@ -226,8 +254,28 @@ def test_named_results():
 
 
 def test_unknown_column_still_raises():
-    with pytest.raises(Exception):
+    with pytest.raises(KeyError, match="nope"):
         mx.sql("SELECT nope FROM t", t=_t()).compute()
+
+
+def test_nested_subqueries_translate_each_query_once():
+    """IN over a derived table, 8 deep: names are resolved by the translator that builds each query, not by
+    an extra throwaway copy (which doubled the work per level: 0.4 s -> 6 s)."""
+    from mxframe import sql_frontend as sf
+    q = "SELECT CUSTOMERID FROM t"
+    for k in range(8):
+        q = f"SELECT customerid FROM t WHERE customerid IN (SELECT customerid FROM ({q}) AS d{k})"
+    builds, orig = [0], sf._SQLTranslator._build_select
+
+    def counted(self, node):
+        builds[0] += 1
+        return orig(self, node)
+    sf._SQLTranslator._build_select = counted
+    try:
+        mx.sql(q, t=_t())
+    finally:
+        sf._SQLTranslator._build_select = orig
+    assert builds[0] == 766        # the number of queries translated before F-095 too
 
 
 # --- a Parquet file with such names (F-092) --------------------------------------------------------------

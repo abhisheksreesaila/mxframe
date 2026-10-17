@@ -992,3 +992,13 @@ Found by the F-093 developer (2026-10-16)
 Found by the F-104 review (2026-10-16); a silent wrong answer on main
 - [ ] `_parse_join_on` matches columns by name only. `t JOIN x ON x.v = t.k`, where `k` and `v` are in both tables, joins `t.v = x.k`: mx returns ids 1, 2, 5 and DuckDB returns 2, 5. Decide each side of an equality from its qualifier (`t.` / alias in the tables joined so far, or the table being joined), falling back to the column name only for an unqualified column; an unqualified name found in both sides raises (DuckDB: ambiguous)
 - [ ] DuckDB-checked tests: qualified ON in either operand order with the same column names in both tables, two and three tables, LEFT / INNER, a USING form; fails before
+
+## F-111 SQL ambiguous bare column in a join silently picks the left one [todo]
+From the F-095 review (2026-10-16); a silent wrong answer
+- [ ] a bare column name present in two joined tables resolves to the left table's column; DuckDB raises "Ambiguous reference to column name". Case-insensitive matching (F-095) extends this to `Region` vs `region`. Raise a ValueError naming both tables (qualified names stay fine); applies to SELECT, WHERE, GROUP BY, ORDER BY and ON, but not to USING / NATURAL keys (one merged column)
+- [ ] DuckDB-checked tests: the error for each clause, same-spelling and case-only clashes, two and three tables; fails before
+
+## F-112 SQL correlated subqueries: inner SELECT alias in WHERE, scalar in the SELECT list [todo]
+From the F-095 review (2026-10-16)
+- [ ] a correlated EXISTS whose inner WHERE uses an inner SELECT alias raises NotImplementedError (DuckDB accepts the alias there), and a correlated scalar subquery in the SELECT list is unsupported (only a WHERE comparison is decorrelated). Support both: resolve the alias to its expression in the inner WHERE; decorrelate a scalar subquery in the SELECT list to a left join with the per-key aggregate (an outer row without partners gets NULL)
+- [ ] DuckDB-checked tests with mixed-case names, EXISTS / NOT EXISTS and a scalar in SELECT; fails before
