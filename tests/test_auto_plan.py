@@ -19,8 +19,12 @@ class Calib:
             return float("inf")
         if op in ("filter_take", "group_encode") and device == "gpu":
             return float("inf")
+        if op.startswith("native_") and device == "gpu":
+            return float("inf")
+        if op == "native_global":                    # the native filter's price is native_filter - native_global
+            return 0.01
         per = {"cpu": self.cpu, "gpu": self.gpu}[device]
-        if op == "join":
+        if op in ("join", "native_join"):
             per = self.join_cpu if device == "cpu" else self.join_gpu
         return 0.01 + per * rows / 1e6
 
@@ -67,10 +71,12 @@ def test_estimate_lists_every_costed_operator():
     assert est.cpu_ms > 0 and est.gpu_ms > 0
 
 
-def test_filter_cost_is_the_same_on_both_paths():
+def test_filter_is_priced_as_the_native_filter_on_cpu_and_the_host_filter_on_gpu():
     est = am.estimate_plan(LazyFrame(table(1000)).filter(col("d") > lit(3)).plan, Calib(), Gpu())
     (f,) = est.lines
-    assert f.cpu_ms == f.gpu_ms  # filters are evaluated on the host on either path
+    # cpu: native_filter - native_global (the scan's sum is not the filter's); gpu path: filter_take on the host
+    assert f.cpu_ms == 0.01 + 1.0 * 1000 / 1e6 - 0.01
+    assert f.gpu_ms == 0.01 + 1.0 * 1000 / 1e6
 
 
 def test_cheap_cpu_aggregate_stays_on_cpu_because_of_copy():

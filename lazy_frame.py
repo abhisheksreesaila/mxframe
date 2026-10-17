@@ -341,7 +341,11 @@ class LazyFrame:
             self._last_compile_provenance = got[1]
             return got[0]
 
-        plan = resolve_plan(plan, count_distinct_codes=(device == "cpu"))
+        # COUNT(DISTINCT b) per a counts dictionary codes on the native CPU path (F-046h); auto runs that shape
+        # there too (F-058), unless the caller steers it to the GPU, which needs the columns decoded
+        cd_codes = device == "cpu" or (device == "auto" and prefer != "gpu"
+                                       and "gpu" not in (placement or {}).values() and _has_count_distinct(plan))
+        plan = resolve_plan(plan, count_distinct_codes=cd_codes)
         if validate:
             from .plan_validation import validate_plan_or_raise
             validate_plan_or_raise(plan)
@@ -355,7 +359,11 @@ class LazyFrame:
 
         from . import auto_mode as _am
         import time as _t
-        decision = _am.choose_device(plan, prefer=prefer, placement=placement)
+        if cd_codes:
+            decision = _am.AutoDecision("cpu", "COUNT(DISTINCT) per key counts dictionary codes on the cpu", None)
+            decision.cpu_path = "native executor (count distinct on codes)"
+        else:
+            decision = _am.choose_device(plan, prefer=prefer, placement=placement)
         self.last_auto_decision = decision
         if verbose:
             print(decision.explain())
@@ -382,7 +390,7 @@ class LazyFrame:
             import contextlib as _contextlib
             from . import coproc_fused as _cf
             with _cf.deferred_background() as _bg:
-                if decision.estimate is not None and decision.gpu_available:
+                if decision.estimate is not None and decision.gpu_available and not _am.gpu_warmup_started():
                     # GPU start-up for later queries waits until this CPU query has returned.
                     _bg.later(lambda: _am.get_gpu_warmup().start())
                 if decision.upload and not _streamed.active():     # a streamed batch is never seen again
@@ -1078,6 +1086,19 @@ def _resolve_scalars(plan, device: str, strict: bool):
         return out
 
     return walk(plan)
+
+
+def _has_count_distinct(plan) -> bool:
+    """Does the plan hold a COUNT(DISTINCT b) per a (the shape the native count runs on dictionary codes)?"""
+    from .io_parquet import count_distinct_shape
+    stack = [plan]
+    while stack:
+        p = stack.pop()
+        if count_distinct_shape(p):
+            return True
+        stack.extend(x for x in (getattr(p, "input", None), getattr(p, "left", None), getattr(p, "right", None))
+                     if x is not None)
+    return False
 
 
 def _run_on_device(plan, device: str, *, verbose: bool = False, optimizer_trace=None, strict: bool = False,

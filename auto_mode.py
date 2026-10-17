@@ -351,6 +351,7 @@ KNOWN_BROKEN_GPU = {
 _AGG_OP = {"sum": "group_sum", "mean": "group_sum", "count": "group_count",
            "min": "group_min", "max": "group_max"}
 _SAMPLE_ROWS = 65_536
+_SMALL_SAMPLE = 8_192
 _UNKNOWN_COL_BYTES = 8
 
 
@@ -395,8 +396,6 @@ def _col_bytes(tables, names) -> int:
 
 def _key_card(name, tables, rows) -> int:
     import pyarrow as pa
-    import pyarrow.compute as pc
-    from .np_arrow import array as _npa
     for t in tables:
         if t is None or name not in t.column_names:
             continue
@@ -412,6 +411,13 @@ def _key_card(name, tables, rows) -> int:
             idx = np.arange(n, dtype=np.int64)
         else:   # linspace(0, n - 1, S) in integers: strictly increasing, no np.unique needed
             idx = np.arange(_SAMPLE_ROWS, dtype=np.int64) * (n - 1) // (_SAMPLE_ROWS - 1)
+        if len(idx) > _SMALL_SAMPLE and not (pa.types.is_integer(column.type) or pa.types.is_floating(column.type)):
+            # strings cost ~10x more per sampled row (scattered reads): a key with few values (each seen ~10
+            # times in a small sample) is answered by the small sample alone
+            small = np.arange(_SMALL_SAMPLE, dtype=np.int64) * (n - 1) // (_SMALL_SAMPLE - 1)
+            d = _sample_distinct(column, small)
+            if d < 0.1 * _SMALL_SAMPLE:
+                return max(1, d)
         d = _sample_distinct(column, idx)
         if d < 0.5 * len(idx):             # saturated: the sample saw (nearly) every value
             return max(1, d)
@@ -425,13 +431,15 @@ def _sample_distinct(column, idx) -> int:
     (``np.unique`` pulls in ``numpy.ma``; the first ``count_distinct`` initialises Arrow compute)."""
     import numpy as np
     import pyarrow as pa
-    import pyarrow.compute as pc
-    from .np_arrow import array as _npa, to_numpy as _np_of
+    from .np_arrow import to_numpy as _np_of
     typ = column.type
+    chunks = column.chunks
+    starts = np.cumsum([0] + [len(ch) for ch in chunks])
+    cuts = np.searchsorted(idx, starts)              # idx is sorted: one slice of it per chunk
+    if pa.types.is_string(typ) or pa.types.is_large_string(typ) or pa.types.is_binary(typ) \
+            or pa.types.is_large_binary(typ):
+        return _sample_distinct_bytes(chunks, starts, cuts, idx)
     if (pa.types.is_integer(typ) or pa.types.is_floating(typ)) and column.null_count == 0:
-        chunks = column.chunks
-        starts = np.cumsum([0] + [len(ch) for ch in chunks])
-        cuts = np.searchsorted(idx, starts)          # idx is sorted: one slice of it per chunk
         parts = []
         for c, ch in enumerate(chunks):
             sel = idx[cuts[c]:cuts[c + 1]]
@@ -445,7 +453,86 @@ def _sample_distinct(column, idx) -> int:
             if len(v) == 0:
                 return 0
         return int(1 + np.count_nonzero(v[1:] != v[:-1]))
+    import pyarrow.compute as pc
+    from .np_arrow import array as _npa
     return int(pc.count_distinct(column.take(_npa(idx))).as_py())
+
+
+_BYTES_FULL = 256       # string sample keys compare in full up to this length, longer ones on (length, first and
+_BYTES_EDGE = 128       # last 128 bytes): this is an estimate, not a result
+
+
+def _sample_distinct_bytes(chunks, starts, cuts, idx) -> int:
+    """Distinct non-null strings among the sampled rows, read from the Arrow buffers with NumPy: the first
+    ``count_distinct`` imports ``pyarrow.compute`` (~25 ms on auto's first query; device="cpu" never pays it)."""
+    import numpy as np
+    lens, rows = [], []
+    for c, ch in enumerate(chunks):
+        sel = idx[cuts[c]:cuts[c + 1]] - starts[c]
+        if not len(sel):
+            continue
+        validity, offsets, data = ch.buffers()[:3]
+        wide = str(ch.type) in ("large_string", "large_binary")
+        off = np.frombuffer(offsets, dtype=np.int64 if wide else np.int32,
+                            count=ch.offset + len(ch) + 1)[ch.offset:]
+        if ch.null_count and validity is not None:
+            bits = np.unpackbits(np.frombuffer(validity, dtype=np.uint8), bitorder="little")
+            sel = sel[bits[sel + ch.offset].astype(bool)]
+        if not len(sel):
+            continue
+        lo = off[sel].astype(np.int64)
+        n = off[sel + 1].astype(np.int64) - lo
+        top = int(n.max())
+        if top == 0 or data is None:
+            block = np.zeros((len(sel), 1), dtype=np.uint64)
+        else:
+            buf = np.frombuffer(data, dtype=np.uint8)
+            if top <= _BYTES_FULL:
+                block = _bytes_at(buf, lo, -(-top // 8) * 8, lo + n)
+            else:
+                tail = lo + np.maximum(n - _BYTES_EDGE, 0)
+                block = np.concatenate([_bytes_at(buf, lo, _BYTES_EDGE, lo + n),
+                                        _bytes_at(buf, tail, _BYTES_EDGE, lo + n)], axis=1)
+            block = block.view(np.uint64)
+        lens.append(n)
+        rows.append(block)
+    if not rows:
+        return 0
+    h = np.concatenate([_row_hash(b, n) for b, n in zip(rows, lens)])
+    h.sort()
+    return int(1 + np.count_nonzero(h[1:] != h[:-1]))
+
+
+def _bytes_at(buf, start, width, end):
+    """``width`` bytes from each ``start`` (one row gather from a strided window: the rows are scattered over the
+    buffer, so each must be touched once), bytes at or past ``end`` zeroed; rows near the buffer's end come from a
+    padded copy of its last ``width`` bytes."""
+    import numpy as np
+    from numpy.lib.stride_tricks import as_strided
+    size = len(buf)
+    out = np.zeros((len(start), width), dtype=np.uint8)
+    near = start > size - width
+    if size >= width:
+        far = ~near
+        out[far] = as_strided(buf, shape=(size - width + 1, width), strides=(1, 1))[start[far]]
+    if near.any():
+        base = max(size - width, 0)
+        pad = np.zeros(2 * width, dtype=np.uint8)
+        pad[:size - base] = buf[base:]
+        out[near] = pad[(start[near] - base)[:, None] + np.arange(width)[None, :]]
+    out[(start[:, None] + np.arange(width)[None, :]) >= end[:, None]] = 0
+    return out
+
+
+def _row_hash(words, n):
+    """One 64-bit hash per row of uint64 words plus its length (a collision only lowers an estimate)."""
+    import numpy as np
+    h = n.astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+    with np.errstate(over="ignore"):
+        for j in range(words.shape[1]):
+            h = (h ^ words[:, j]) * np.uint64(0xBF58476D1CE4E5B9)
+            h ^= h >> np.uint64(31)
+    return h
 
 
 def _group_card(keys, tables, rows) -> int:
@@ -456,13 +543,26 @@ def _group_card(keys, tables, rows) -> int:
     return int(max(1, min(card, max(rows, 1))))
 
 
+NATIVE_EXTRA_AGG = 0.35     # each aggregate past the first adds this share to a native aggregate (one fused pass)
+
+
+def _more_aggs(k: int) -> float:
+    return 1.0 + NATIVE_EXTRA_AGG * max(k - 1, 0)
+
+
 def estimate_plan(plan, calib, gpu) -> PlanEstimate:
+    """Per-operator prices of the plan on each device. The CPU side is the native executor (what
+    device="cpu" runs: `native_*` probes, F-058); the GPU side is its kernels plus every copy."""
     from .lazy_frame import Filter, Project, Aggregate, Sort, Limit, Distinct, Tail, Join
     est = PlanEstimate()
     INF = float("inf")
 
     def h2d(nbytes):
         return calib.transfer_ms(nbytes, "h2d")
+
+    def native_filter(n):
+        """The native executor fuses the filter into the scan: its price is filter + sum minus the sum."""
+        return max(calib.estimate("native_filter", "cpu", n) - calib.estimate("native_global", "cpu", n), 0.0)
 
     def walk(p):
         """Returns (rows, source tables, rows before the filters since the last materialisation)."""
@@ -471,13 +571,13 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
             return rows, [table], rows
         if isinstance(p, Filter):
             n, ts, src = walk(p.input)
-            c = calib.estimate("filter_take", "cpu", n)
-            est.lines.append(OpCost("filter", n, c, c, note="host on both paths"))
+            c = calib.estimate("filter_take", "cpu", n)       # the GPU path filters on the host
+            est.lines.append(OpCost("filter", n, native_filter(n), c, note="host on the gpu path"))
             return max(1, int(n * FILTER_SELECTIVITY)), ts, src
         if isinstance(p, Join):
             nl, tl, _ = walk(p.left)
             nr, tr, _ = walk(p.right)
-            cpu = calib.estimate("join", "cpu", nl + nr)
+            cpu = calib.estimate("native_join", "cpu", nl + nr, card=nr)
             nbytes = nl * _col_bytes(tl, p.left_on) + nr * _col_bytes(tr, p.right_on)
             try:
                 g = calib.estimate_gpu_join_total(nl, nr) * JOIN_GPU_SAFETY
@@ -496,7 +596,7 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
             if p.group_by:
                 card = _group_card(p.group_by, ts, n)
                 enc = calib.estimate("group_encode", "cpu", n)
-                cpu = enc + sum(calib.estimate(o, "cpu", n, card=card) for o in ops)
+                cpu = calib.estimate("native_group", "cpu", n, card=card) * _more_aggs(len(ops))
                 nbytes = n * (4 + width)
                 g = enc + sum(calib.estimate(o, "gpu", n, card=card) for o in ops) + h2d(nbytes) \
                     + calib.transfer_ms(card * 8 * len(ops), "d2h")
@@ -505,7 +605,7 @@ def estimate_plan(plan, calib, gpu) -> PlanEstimate:
                 return card, ts, card
             # Global aggregates run masked kernels over the unfiltered input.
             nbytes = src * (width + 4)
-            cpu = len(ops) * calib.estimate("masked_sum", "cpu", src)
+            cpu = calib.estimate("native_global", "cpu", src) * _more_aggs(len(ops))
             if "global_agg" in KNOWN_BROKEN_GPU:
                 est.lines.append(OpCost("global_agg", src, cpu, INF, note=KNOWN_BROKEN_GPU["global_agg"]))
                 return 1, ts, 1
@@ -792,6 +892,13 @@ def _init_gpu():
     if gpu is None:
         raise RuntimeError("GPU AOT kernels unavailable")
     return gpu
+
+
+def gpu_warmup_started() -> bool:
+    """Has the process-wide GPU warm-up begun? (A query need not queue it again: F-058, each queued start cost
+    a launcher thread per query.)"""
+    w = _warmup
+    return w is not None and w._thread is not None
 
 
 def get_gpu_warmup(calib=None, start: bool = True) -> GpuWarmup:

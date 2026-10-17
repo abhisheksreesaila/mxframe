@@ -15,8 +15,8 @@ work and the measurements that shaped it.
 > the file's identity, so each `scan_parquet` compute finds it), and (3) the calibrated price beats the faster
 > device alone by 10% after the GPU's 4.5 ms per call, the merge and a 5% CPU-contention allowance
 > (`coproc_fused.plan_split`; `explain` prints the numbers). The CPU share of a split runs on the native
-> executor. The model prices the native executor as equal to the older kernel
-> (`auto_mode.NATIVE_CPU_FACTOR = 1.0`). The numbers below have not been re-run; re-measuring auto on a
+> executor. The split is priced against the older kernel (`auto_mode.NATIVE_CPU_FACTOR = 1.0`); since
+> F-058 the whole-query CPU price is the native executor's own (`native_*` fits in `calibration.py`). The numbers below have not been re-run; re-measuring auto on a
 > quiet machine is the open item of F-053 and F-057 in [plan.md](plan.md).
 > A file's residency is keyed by its identity (path, inode, mtime, size): a file rewritten in place with the same size within one mtime tick (coarse-mtime filesystems) can be served from the old GPU copy.
 

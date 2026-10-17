@@ -1177,7 +1177,8 @@ _MAP_BYTES_PER_ROW = 16            # a partner's map: a direct array over a key 
 def _l3_bytes() -> int:
     """Size of the CPU's last-level cache (32 MB when unknown)."""
     try:
-        txt = open("/sys/devices/system/cpu/cpu0/cache/index3/size").read().strip().upper()
+        with open("/sys/devices/system/cpu/cpu0/cache/index3/size") as f:
+            txt = f.read().strip().upper()
         return int(txt[:-1]) * {"K": 1 << 10, "M": 1 << 20}[txt[-1]]
     except (OSError, ValueError, KeyError, IndexError):
         return 32 << 20

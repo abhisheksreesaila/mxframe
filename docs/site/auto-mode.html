@@ -146,13 +146,14 @@ main, .grid > *, .card, .card-b { min-width: 0; }
       <p class="chk">check: native_exec.py "CPU+GPU co-processing policy active"</p>
     </div>
     <div class="callout">
-      <h3>The cost model prices the native CPU executor as equal to the older kernel</h3>
-      <p>The calibration measures the older kernels. <code>auto_mode.NATIVE_CPU_FACTOR</code> (1.0, from one warm measurement on a busy machine) converts that to a native CPU price for the split-versus-native choice, so a split must beat the older kernel by 10%. The whole-query CPU price still comes from the older fits.</p>
+      <h3>The CPU+GPU split is still priced against the older kernel</h3>
+      <p>Since F-058 the whole-query CPU price is the native executor's own: <code>native_global</code>, <code>native_filter</code>, <code>native_group</code> (by group count) and <code>native_join</code> (by build-side rows), measured through <code>compute(device="cpu")</code> on the reference box. Before that, the CPU side was priced from the older kernels, up to 18 times too high on joins, and <code>auto</code> sent five of the 22 SF10 queries to the GPU, where they ran 5 to 9 times slower. The split-versus-native choice still converts the older fused kernel with <code>auto_mode.NATIVE_CPU_FACTOR</code> (1.0), so a split must beat the older kernel by 10%.</p>
+      <p class="chk">check: auto_mode.py calib.estimate("native_join", "cpu"</p>
     </div>
     <div class="callout">
-      <h3>COUNT(DISTINCT) still decodes the counted column</h3>
-      <p>Counting on dictionary codes is a <code>device="cpu"</code> path (F-046h). Under <code>auto</code> the plan is resolved with <code>count_distinct_codes=False</code>, so the counted column is decoded first. This is listed as open in the 0.6.0 release notes.</p>
-      <p class="chk">check: lazy_frame.py count_distinct_codes=(device == "cpu")</p>
+      <h3>COUNT(DISTINCT) per key always runs on the CPU under auto</h3>
+      <p>Counting on dictionary codes is a native CPU path (F-046h). Since F-058, <code>auto</code> resolves a COUNT(DISTINCT b) per a with the codes too and runs it on the CPU without pricing the GPU: the GPU path needs the columns decoded, and at SF10 it took 6.7 s against 0.66 s on codes. With <code>prefer="gpu"</code> or a GPU placement the columns are decoded and the cost model decides as before.</p>
+      <p class="chk">check: lazy_frame.py cd_codes = device == "cpu" or (device == "auto" and prefer != "gpu"</p>
     </div>
     <div class="callout">
       <h3>The whole query goes to one device, and there is no per-operator placement</h3>

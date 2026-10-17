@@ -229,10 +229,24 @@ def _gpu_usable():
         return False
 
 
-@pytest.mark.parametrize("device", ["auto", pytest.param("gpu", marks=pytest.mark.skipif(not _gpu_usable(), reason="no usable GPU"))])
+@pytest.mark.parametrize("device", [pytest.param("gpu", marks=pytest.mark.skipif(not _gpu_usable(), reason="no usable GPU"))])
 def test_other_devices_see_decoded_columns(seen, device):
     t = _table(n=30_000)
     got = (LazyFrame(t).filter(col("d") < lit(70)).select("a", "s").distinct().groupby("a")
            .agg(col("s").count().alias("n")).compute(device=device))
     exp = _duck("SELECT a, COUNT(DISTINCT s) FROM t WHERE d < 70 GROUP BY a", t=t)
     assert dict(zip(got.column("a").to_pylist(), got.column("n").to_pylist())) == dict(exp)
+
+
+@pytest.mark.parametrize("rows", [30_000, 400_000])          # under and over auto's small-input shortcut
+def test_auto_counts_on_codes_like_cpu(seen, rows):
+    """F-058: auto resolved the plan with decoded columns, so COUNT(DISTINCT) per key decoded the counted strings
+    first (J4 at SF10: the GPU path took 6.7 s, the CPU on codes 0.66 s). The shape now runs as device="cpu"."""
+    import mxframe as mx
+    t = _table(n=rows)
+    lf = LazyFrame(t).filter(col("d") < lit(70)).select("a", "s").distinct().groupby("a").agg(col("s").count().alias("n"))
+    got = lf.compute(device="auto")
+    _same(got, _duck("SELECT a, COUNT(DISTINCT s) FROM t WHERE d < 70 GROUP BY a", t=t), "a")
+    assert seen and seen[0][0] == ("int64", "dictionary")
+    assert lf.last_compile_provenance["auto_device"] == "cpu"
+    assert "dictionary codes" in lf.last_compile_provenance["auto_reason"]

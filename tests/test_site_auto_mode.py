@@ -219,13 +219,16 @@ def test_limit_native_executor_declines_only_under_a_split_policy():
     assert "if decision.split or forced" in (ROOT / "lazy_frame.py").read_text()
 
 
-def test_limit_auto_decodes_count_distinct():
-    assert 'count_distinct_codes=(device == "cpu")' in (ROOT / "lazy_frame.py").read_text()
+def test_limit_auto_counts_distinct_on_codes_unless_steered_to_the_gpu():
+    src = (ROOT / "lazy_frame.py").read_text()
+    assert 'cd_codes = device == "cpu" or (device == "auto" and prefer != "gpu"' in src
 
 
-def test_limit_cost_model_prices_native_as_the_older_kernel():
+def test_limit_whole_query_cpu_price_is_native_but_the_split_uses_the_older_kernel():
     assert _module_constants(ROOT / "auto_mode.py")["NATIVE_CPU_FACTOR"] == 1.0, "revisit the site's limits text"
-    assert "native" not in (ROOT / "calibration.py").read_text().lower(), "calibration now measures native: revisit the limits text"
+    src = (ROOT / "auto_mode.py").read_text()
+    assert 'calib.estimate("native_join", "cpu"' in src and 'calib.estimate("native_group", "cpu"' in src
+    assert '"native_join@cpu:g8000000"' in (ROOT / "calibration.py").read_text()
 
 
 def test_limit_placer_and_residency_tracker_are_not_on_the_query_path():

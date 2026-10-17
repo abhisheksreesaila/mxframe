@@ -72,6 +72,7 @@ DEVICES = ("cpu", "gpu")
 OPS = (
     "pipeline", "join_host", "join_total", "group_sum", "group_count", "group_min", "group_max",
     "masked_sum", "join", "gather", "sort_topk", "group_encode", "filter_take",
+    "native_global", "native_filter", "native_group", "native_join",
 )
 
 QUICK_SIZES = (10_000, 100_000, 1_000_000, 6_000_000, 30_000_000)
@@ -606,6 +607,15 @@ _DEFAULT_FITS: Dict[str, Tuple[float, float, float]] = {
     # resident input (F-013 probe): CPU ~0.85 ms/Mrow on 24 threads, GPU ~0.26 ms/Mrow.
     "pipeline@cpu": (0.1, 0.9, 0.0), "pipeline@gpu": (0.1, 0.3, 0.0),
     "generic@cpu": (0.05, 6.0, 0.0), "generic@gpu": (1.0, 6.0, 0.0),
+    # native executor (F-058; what device="cpu" runs), measured warm on the reference box, 24 threads, float64:
+    # end to end through compute(device="cpu") on 2M / 8M / 32M in-memory rows. Group-by is keyed by group count
+    # and a join by build-side rows (``card=``): both get slower per row once their table leaves the cache.
+    "native_global@cpu": (0.3, 0.34, 0.0),               # one sum
+    "native_filter@cpu": (0.3, 0.68, 0.0),               # filter + one sum (the filter alone is the difference)
+    "native_group@cpu:g8": (0.5, 0.55, 0.0), "native_group@cpu:g1000": (0.5, 0.72, 0.0),
+    "native_group@cpu:g100000": (0.5, 1.0, 0.0), "native_group@cpu:g1000000": (0.5, 9.5, 0.0),
+    "native_join@cpu:g250000": (0.5, 0.9, 0.0), "native_join@cpu:g2000000": (0.5, 1.9, 0.0),  # rows = both sides
+    "native_join@cpu:g8000000": (0.5, 5.2, 0.0),
 }
 _DEFAULT_GPU_INIT_MS = 400.0
 
@@ -1116,6 +1126,60 @@ def _p_ft_cpu(ctx, n, card):
     import pyarrow.compute as pc
     t = ctx.arrow_table(n)
     return lambda: t.filter(pc.less(t["v"], pa.scalar(0.3, pa.float32())))
+
+
+# Native executor (F-058): what device="cpu" really runs. One plan per operator over in-memory Arrow
+# tables, timed end to end through `compute(device="cpu")` (fused scan + operator + result). auto prices
+# the CPU side of a plan with these; the kernel probes above price the GPU path and the co-processing split.
+def _native_table(ctx, n, card=None):
+    import pyarrow as pa
+    cols = {"v": ctx.f32(n), "w": ctx.f32(n)[::-1].copy(), "m": ctx.mask(n)}
+    if card is not None:
+        cols["k"] = ctx.labels(n, card)
+    return pa.table(cols)
+
+
+def _native_run(lf):
+    return lambda: lf.compute(device="cpu")
+
+
+@probe("native_global", "cpu")
+def _p_native_global(ctx, n, card):
+    from .lazy_frame import LazyFrame
+    from .lazy_expr import col
+    return _native_run(LazyFrame(_native_table(ctx, n)).groupby().agg(col("v").sum().alias("s")))
+
+
+@probe("native_filter", "cpu")
+def _p_native_filter(ctx, n, card):
+    """Filter + one sum: the filter's own price is this minus native_global."""
+    from .lazy_frame import LazyFrame
+    from .lazy_expr import col, lit
+    return _native_run(LazyFrame(_native_table(ctx, n)).filter(col("w") < lit(0.3))
+                       .groupby().agg(col("v").sum().alias("s")))
+
+
+@probe("native_group", "cpu", uses_card=True, bucketed=True)
+def _p_native_group(ctx, n, card):
+    from .lazy_frame import LazyFrame
+    from .lazy_expr import col
+    return _native_run(LazyFrame(_native_table(ctx, n, card)).groupby("k").agg(col("v").sum().alias("s")))
+
+
+@probe("native_join", "cpu", max_rows=30_000_000)
+def _p_native_join(ctx, n, card):
+    """Key / foreign-key join + one sum; `n` counts both sides (8/9 probe rows, 1/9 build rows)."""
+    import numpy as np
+    import pyarrow as pa
+    from .lazy_frame import LazyFrame
+    from .lazy_expr import col
+    m = max(n // 9, 1)
+    left = n - m
+    fact = pa.table({"fk": (ctx.labels(left, 1 << 30) % m).astype(np.int64), "v": ctx.f32(left)})
+    dim = pa.table({"pk": np.random.default_rng(ctx.seed + 5).permutation(m).astype(np.int64),
+                    "w": ctx.f32(m)})
+    return _native_run(LazyFrame(fact).join(LazyFrame(dim), left_on="fk", right_on="pk")
+                       .groupby().agg((col("v") * col("w")).sum().alias("s")))
 
 
 # --------------------------------------------------------------------------- #
