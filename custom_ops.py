@@ -725,7 +725,7 @@ class CustomOpsCompiler(GraphCompiler):
         """True if expr contains case_when, isin, startswith, or window ops anywhere."""
         if expr.op in ("case_when", "isin", "startswith", "contains", "like", "str_slice", "not", "year", "is_null",
                        "year_days", "rank", "dense_rank", "row_number", "lag", "lead", "cum_sum",
-                       "window", "coalesce", "abs", "cast", "add_us", *_ARROW_ONLY_OPS):
+                       "window", "coalesce", "abs", "cast", "f32", "add_us", *_ARROW_ONLY_OPS):
             return True
         from .lazy_expr import Expr as _Expr
         return any(isinstance(a, _Expr) and CustomOpsCompiler._needs_precompute(a)
@@ -905,6 +905,8 @@ class CustomOpsCompiler(GraphCompiler):
             return add_interval_arrow(self._eval_expr_arrow(args[0], table), args[1])
         if op == "cast":
             return cast_arrow(self._eval_expr_arrow(args[0], table), *args[1:])
+        if op == "f32":
+            return cast_arrow(self._eval_expr_arrow(args[0], table), "float32")
         # ── Window / analytic functions (global scope — whole table, no partition) ─
         if op == "row_number":
             return _npa(np.arange(1, table.num_rows + 1, dtype=np.float64))
@@ -936,7 +938,7 @@ class CustomOpsCompiler(GraphCompiler):
         def _rewrite_expr(expr):
             if not CustomOpsCompiler._needs_precompute(expr):
                 return expr
-            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null", "coalesce", "abs", "cast", "add_us",
+            if expr.op in ("case_when", "isin", "startswith", "contains", "like", "is_null", "coalesce", "abs", "cast", "f32", "add_us",
                            *_ARROW_ONLY_OPS):
                 name = f"__cw_{len(derived_specs)}__"
                 derived_specs.append((name, expr))
@@ -1814,7 +1816,7 @@ class CustomOpsCompiler(GraphCompiler):
                         else "int" if pa.types.is_integer(t) else None)
             if e.op == "add_us":                    # a DATE or timestamp plus an interval
                 return "temporal"
-            parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "add", "sub", "mul", *_ARROW_ONLY_OPS)
+            parts = (e.args[1:] if e.op == "case_when" else e.args if e.op in ("coalesce", "abs", "cast", "f32", "add", "sub", "mul", *_ARROW_ONLY_OPS)
                      else ())
             return next((k for k in (kind(a) for a in parts if isinstance(a, Expr)) if k), None)
 

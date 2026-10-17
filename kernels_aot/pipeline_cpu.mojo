@@ -98,6 +98,7 @@ comptime OP_AND = 30
 comptime OP_OR = 31
 comptime OP_NOT = 32
 comptime OP_FLOOR = 33
+comptime OP_F32 = 34        # float64(float32(a)): a FLOAT result rounded after each operation (F-110)
 comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
@@ -554,6 +555,12 @@ def _floor(d: FP, a: FP, n: Int):
         d.store(i, floor(a.load[width=W](i)))
         i += W
 
+def _f32(d: FP, a: FP, n: Int):
+    var i = 0
+    while i < n:
+        d.store(i, a.load[width=W](i).cast[DType.float32]().cast[DType.float64]())
+        i += W
+
 def _select(d: FP, c: FP, a: FP, b: FP, n: Int):
     var zero = SIMD[F64, W](0.0)
     var i = 0
@@ -861,6 +868,8 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             _not(d, regs + Int(ins[2]) * VEC, npad)
         elif op == OP_FLOOR:
             _floor(d, regs + Int(ins[2]) * VEC, npad)
+        elif op == OP_F32:
+            _f32(d, regs + Int(ins[2]) * VEC, npad)
         elif op == OP_SELECT:
             _select(d, regs + Int(ins[2]) * VEC, regs + Int(ins[3]) * VEC,
                     regs + Int(ins[4]) * VEC, npad)

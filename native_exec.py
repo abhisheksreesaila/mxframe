@@ -2040,12 +2040,13 @@ def _call_gather(lib, plan_addr: int, out_addr: int) -> int:
     return lib.mx_gather(plan_addr, out_addr)
 
 
-def try_gather(compiler, table: pa.Table, idx, decode_dicts: bool = False) -> Optional[pa.Table]:
+def try_gather(compiler, table: pa.Table, idx, decode_dicts: bool = False, any_device: bool = False) -> Optional[pa.Table]:
     """``table.take(idx)`` in one native call (rows in ``idx`` order; ``idx`` an int32 / int64 NumPy
     array of row numbers). Dictionary string columns come back decoded, so only when
-    ``decode_dicts`` (the caller decodes them anyway); else None. None: the caller takes as before."""
+    ``decode_dicts`` (the caller decodes them anyway); else None. None: the caller takes as before.
+    ``any_device``: also for a ``device="gpu"`` session (a join's gather of strings is CPU work there too)."""
     import numpy as np
-    if not enabled() or getattr(compiler, "_device_arg", None) != "cpu" or not available():
+    if not enabled() or (getattr(compiler, "_device_arg", None) != "cpu" and not any_device) or not available():
         return None
     if table.num_columns == 0 or table.num_rows == 0:
         return None

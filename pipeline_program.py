@@ -50,6 +50,7 @@ CMPC       dst = column <cmp> constant, compared in the      dst, col, k, cmp
 AND OR     dst = logical and / or of a, b (non-zero = true) dst, a, b
 NOT        dst = 1.0 if a == 0 else 0.0                     dst, a
 FLOOR      dst = floor(a)                                   dst, a
+F32        dst = float64(float32(a)), round to nearest even  dst, a
 SELECT     dst = a if cond != 0 else b                      dst, cond, a, b
 BETWEEN    dst = lo <= x <= hi                              dst, x, lo, hi
 IN_SET     dst = set[int(x) - lo]  (dictionary codes)       dst, x, set
@@ -113,6 +114,7 @@ OP_F2I = 18            # dst = int64(a): a float register of whole numbers withi
 OP_I2F = 19            # dst = float64(a): an "int" register to a float one; a value outside +-2^53 sets the flag
 OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE = 20, 21, 22, 23, 24, 25
 OP_AND, OP_OR, OP_NOT, OP_FLOOR = 30, 31, 32, 33
+OP_F32 = 34            # dst = float64(float32(a)): a FLOAT result rounded to float32 after each operation (F-110)
 OP_SELECT, OP_BETWEEN, OP_IN_SET, OP_CMPC = 35, 36, 37, 38
 OP_ROWID = 39
 OP_STR = 40            # dst = a LIKE pattern over a plain utf8 column (the native executor only)
@@ -126,7 +128,7 @@ OP_NAMES = {
     OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_DIV: "DIV", OP_MOD: "MOD",
     OP_IADD: "IADD", OP_ISUB: "ISUB", OP_IMUL: "IMUL", OP_F2I: "F2I", OP_I2F: "I2F",
     OP_LT: "LT", OP_LE: "LE", OP_GT: "GT", OP_GE: "GE", OP_EQ: "EQ", OP_NE: "NE",
-    OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR",
+    OP_AND: "AND", OP_OR: "OR", OP_NOT: "NOT", OP_FLOOR: "FLOOR", OP_F32: "F32",
     OP_SELECT: "SELECT", OP_BETWEEN: "BETWEEN", OP_IN_SET: "IN_SET", OP_CMPC: "CMPC", OP_ROWID: "ROWID", OP_STR: "STR", OP_ISNULL: "ISNULL",
     OP_AGG_SUM: "AGG_SUM", OP_AGG_MIN: "AGG_MIN", OP_AGG_MAX: "AGG_MAX", OP_AGG_ISUM: "AGG_ISUM",
     OP_AGG_IMIN: "AGG_IMIN", OP_AGG_IMAX: "AGG_IMAX",
@@ -769,6 +771,11 @@ class _Builder:
             return _Val(self.emit(OP_FLOOR, q), "int", ("div", self.bound_of(x), 10000))
         if op == "year_days":
             return self._year_days(args[0])
+        if op == "f32":                                  # DuckDB's FLOAT arithmetic: each result is a float32 (F-110)
+            x = self._need(args[0], "num")
+            if isinstance(x, _Const):
+                return _Const(float(np.float32(x.value)), "float")
+            return _Val(self.emit(OP_F32, self.as_reg(x)), "float")
         raise Unsupported(f"op {op!r}")
 
     def _year_days(self, arg: Expr):
@@ -1359,7 +1366,7 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
             return [op, phys_of(ins[1]), 0, 0, 0]
         if op == OP_IN_SET:
             return [op, phys_of(ins[1]), phys_of(ins[2]), ins[3], 0]
-        if op in (OP_NOT, OP_FLOOR, OP_F2I, OP_I2F):
+        if op in (OP_NOT, OP_FLOOR, OP_F32, OP_F2I, OP_I2F):
             return [op, phys_of(ins[1]), phys_of(ins[2]), 0, 0]
         if op in (OP_SELECT, OP_BETWEEN):
             return [op, phys_of(ins[1]), phys_of(ins[2]), phys_of(ins[3]), phys_of(ins[4])]
@@ -1521,7 +1528,7 @@ def _uses_ext(ins: List[int]) -> List[int]:
     op = ins[0]
     if op in (OP_LOAD_COL, OP_LOADI, OP_LOAD_CONST, OP_CMPC, OP_ROWID, OP_STR, OP_ISNULL):
         return []
-    if op in (OP_NOT, OP_FLOOR, OP_IN_SET, OP_F2I, OP_I2F):
+    if op in (OP_NOT, OP_FLOOR, OP_F32, OP_IN_SET, OP_F2I, OP_I2F):
         return [ins[2]]
     if op in (OP_SELECT, OP_BETWEEN):
         return [ins[2], ins[3], ins[4]]

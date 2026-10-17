@@ -81,6 +81,7 @@ comptime OP_AND = 30
 comptime OP_OR = 31
 comptime OP_NOT = 32
 comptime OP_FLOOR = 33
+comptime OP_F32 = 34            # float64(float32(a)): a FLOAT result rounded after each operation (F-110)
 comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
@@ -491,6 +492,11 @@ def _run[RPT: Int, B: Int](
             comptime for k in range(RPT):
                 if (mask >> k) & 1 != 0:
                     d[k * B] = floor(a[k * B])
+        elif op == OP_F32:
+            var a = regs + Int(ins[2]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = Float64(Float32(a[k * B]))
         elif op == OP_SELECT:
             var c = regs + Int(ins[2]) * TILE + tid
             var a = regs + Int(ins[3]) * TILE + tid
