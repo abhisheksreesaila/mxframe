@@ -1056,7 +1056,10 @@ def _resolve_scalars(plan, device: str, strict: bool):
             if b is True:
                 return out.input
             if b is False:
-                return Limit(out.input, 0)
+                # no row can pass: an empty table of the same columns, so the input (a join of big Parquet files, say)
+                # is never run or streamed; Limit(0) where the columns cannot be named without running it
+                names = LazyFrame(out.input).schema
+                return Scan(names.empty_table()) if names is not None else Limit(out.input, 0)
         return out
 
     return walk(plan)
