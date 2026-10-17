@@ -1147,3 +1147,9 @@ Split from F-060 (2026-10-17)
 Split from F-060 (2026-10-17)
 - [ ] integer `min` / `max` past 2^53 still come back as float64 on the native paths (F-090 routes values past 2^53 to the exact Arrow route and casts the type back, so values are exact; the kernels themselves compute in float). Compute integer MIN / MAX as int64 in the kernels (CPU and GPU), so no route-and-cast is needed
 - [ ] tests: exact 2^60-scale values, grouped and global, native / pipeline / GPU paths asserted; fails before
+
+## F-125 Modulo by zero: NULL rows in count and GROUP BY [todo]
+Found by the F-101 developer (2026-10-17); silent wrong answers on main (Arrow path)
+- [ ] `count(a % z)` counts rows whose remainder is NULL (z = 0): 10 where DuckDB gives 6. `count(expr)` must skip NULL results of the expression, not only NULL inputs
+- [ ] `GROUP BY a % 0` returns no rows where DuckDB returns one NULL group: NULL group keys from an expression form a group
+- [ ] DuckDB-checked tests for count / sum / avg / min over expressions that produce NULL (modulo by zero, NULLIF, CASE without ELSE), grouped and global, and GROUP BY on such expressions; fails before
