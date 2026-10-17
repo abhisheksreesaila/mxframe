@@ -66,6 +66,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
+import contextlib
+import contextvars
 import math
 import numpy as np
 import pyarrow as pa
@@ -1069,6 +1071,86 @@ def _int_arith(e: Expr, table: pa.Table) -> bool:
     return has(e)
 
 
+_probe: contextvars.ContextVar = contextvars.ContextVar("mxframe_sum_probe", default=None)
+
+
+class SumProbe:
+    """What the engine looked at when it decided how to answer the integer sums of a query (F-056, streamed
+    execution). A streamed query runs the engine once per batch, but in memory the decision is made once on the
+    whole table: the number of rows below the Filter chain, the bound of each sum's argument (`_Builder.col_bound`
+    of its columns combined through the expression), and whether Arrow's exact path had to answer (nulls in a
+    column the plan reads, dates, values past 2^53). Per batch the compiler reports those inputs here; the batches
+    are merged (rows added, bounds maxed, flags or-ed) and `inexact` asks the engine's own `within_exact` about
+    the totals, so the answer is the one the same rows give in memory, whatever the batching.
+
+    Only aggregates whose output names start with `prefix` are recorded (the streamed query's partials)."""
+
+    def __init__(self, prefix: str = "__p"):
+        self.prefix = prefix
+        self.rows = 0
+        self.trees: Dict[str, Any] = {}
+        self.bounds: Dict[str, int] = {}
+        self.arrow = False
+        self.schema: Optional[pa.Schema] = None
+        self._batch: Optional[dict] = None
+
+    def begin(self) -> None:
+        self._batch = {"rows": None, "bounds": {}, "trees": {}, "arrow": False}
+
+    def note(self, builder, name: str, tree, table: pa.Table) -> None:
+        if self._batch is None or not name.startswith(self.prefix):
+            return
+        cols: List[str] = []
+
+        def walk(t):
+            if t[0] == "col":
+                cols.append(t[1])
+            elif t[0] != "c":
+                walk(t[1])
+                if t[0] != "div":
+                    walk(t[2])
+        walk(tree)
+        for c in cols:
+            self._batch["bounds"][c] = builder.col_bound(c, True)
+        self._batch["trees"][name] = tree
+        self._batch["rows"] = table.num_rows
+        self.schema = table.schema
+
+    def flag(self, arrow: bool) -> None:
+        if self._batch is not None:
+            self._batch["arrow"] = self._batch["arrow"] or arrow
+
+    def end(self) -> None:
+        b, self._batch = self._batch, None
+        if b is None:
+            return
+        self.rows += b["rows"] or 0
+        for c, v in b["bounds"].items():
+            self.bounds[c] = max(self.bounds.get(c, 0), v)
+        self.trees.update(b["trees"])
+        self.arrow = self.arrow or b["arrow"]
+
+    def inexact(self) -> bool:
+        """Does the engine answer these integer sums exactly in Arrow (int64) for the merged batches?"""
+        if self.arrow:
+            return True
+        if not self.trees or self.schema is None:
+            return False
+        b = object.__new__(_Builder)                  # col_bound / within_exact need only these three attributes
+        b.table, b.col_bounds, b.skip_bounds = self.schema.empty_table(), dict(self.bounds), False
+        return any(not b.within_exact(t, max(1, self.rows)) for t in self.trees.values())
+
+
+@contextlib.contextmanager
+def sum_probe(prefix: str = "__p"):
+    rec = SumProbe(prefix)
+    token = _probe.set(rec)
+    try:
+        yield rec
+    finally:
+        _probe.reset(token)
+
+
 def int_sum_inexact(aggs: List[Expr], table: pa.Table, preds: Optional[List[Expr]] = None) -> bool:
     """Would a ``sum`` in ``aggs`` add integers whose total could pass 2^53 (so float64 loses digits)?
     The caller then sums exactly in Arrow (F-037). With ``preds``: would any predicate or aggregate
@@ -1137,6 +1219,10 @@ def _compile(predicates: List[Expr], aggs: List[Expr], table: pa.Table, concat_d
         if e.op not in ("sum", "min", "max", "mean"):
             raise Unsupported(f"aggregate {e.op!r}")
         inner = b._need(e.args[0], "num")
+        if e.op == "sum" and inner.kind == "int":
+            probe = _probe.get()
+            if probe is not None and not b.skip_bounds:
+                probe.note(b, name, b.bound_of(inner), table)
         if e.op == "sum" and inner.kind == "int" and \
                 not b.within_exact(b.bound_of(inner), max(1, table.num_rows)):
             # the float64 accumulator keeps whole numbers only within 2^53: rows * max|value| could pass it

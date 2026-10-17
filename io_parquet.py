@@ -117,17 +117,42 @@ def _read_file(path, columns, dict_cols, pushed=(), mask_dict=(), only=None) -> 
     md = _metadata(path)
     pf = pq.ParquetFile(path, read_dictionary=dict_cols or None, metadata=md)
     groups = _row_groups_for(pf, pushed) if pushed else None
+    rowwise = [p for p in pushed if _row_filterable(p, pf.schema_arrow, tuple(dict_cols or ()) + tuple(mask_dict))]
+
+    def mask_plan(gs, whole):
+        """The per-group masks of the read-time row filter, or None when it does not pay (a big read of several
+        row groups, a filter that drops most rows, F-020). ``whole``: the decision for a full read; False applies it to a batch of a read already decided."""
+        if not (rowwise and md.num_columns == len(pf.schema_arrow.names)):
+            return None
+        if whole and (len(gs) < 2 or sum(md.row_group(g).num_rows for g in gs) < MIN_ROWS_FOR_ROW_FILTER):
+            return None
+        need = _mask_needs(md, pf.schema_arrow.names, gs, rowwise)
+        if not any(need.values()):
+            return None
+        return need if not whole or _estimated_pass(md, pf.schema_arrow.names, need) < 0.6 else None
+
+    use_mask = None
     if only is not None:
-        groups = [g for g in (groups if groups is not None else range(md.num_row_groups)) if g in only]
+        # a streamed batch: whether the row filter applies is decided once for the whole file (what an
+        # in-memory read of it would do), not per batch, so every batch is read the way the whole would be
+        whole = list(groups) if groups is not None else list(range(md.num_row_groups))
+        st = _stream.get()
+        key = ("rowfilter", os.path.abspath(path), tuple(columns or ()), repr(tuple(pushed)), tuple(dict_cols or ()),
+               tuple(mask_dict))
+        decide = lambda: len(whole) >= 2 and mask_plan(whole, True) is not None      # noqa: E731
+        use_mask = st.once(key, decide) if st is not None else decide()
+        groups = [g for g in whole if g in only]
     if groups is not None and not groups:
         return pf.schema_arrow.empty_table().select(columns) if columns else pf.schema_arrow.empty_table()
     if groups is None:
         groups = list(range(md.num_row_groups))
-    rowwise = [p for p in pushed if _row_filterable(p, pf.schema_arrow, tuple(dict_cols or ()) + tuple(mask_dict))]
-    if (len(groups) >= 2 and rowwise and md.num_columns == len(pf.schema_arrow.names)
-            and sum(md.row_group(g).num_rows for g in groups) >= MIN_ROWS_FOR_ROW_FILTER):
-        need = _mask_needs(md, pf.schema_arrow.names, groups, rowwise)
-        if any(need.values()) and _estimated_pass(md, pf.schema_arrow.names, need) < 0.6:
+    if only is None:
+        need = mask_plan(groups, True) if len(groups) >= 2 else None
+        if need is not None:
+            return _read_groups(path, md, pf.schema_arrow, columns, dict_cols, groups, need, mask_dict)
+    elif use_mask:
+        need = mask_plan(groups, False)
+        if need is not None:
             return _read_groups(path, md, pf.schema_arrow, columns, dict_cols, groups, need, mask_dict)
     if len(groups) == md.num_row_groups:
         return pf.read(columns=columns, use_threads=True)

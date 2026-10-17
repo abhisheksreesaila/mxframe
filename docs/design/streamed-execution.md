@@ -157,3 +157,17 @@ On `main` these fail: the budget variable is ignored, nothing streams, and the p
 8. Directory datasets (several files): each file is a natural batch; not wired.
 9. Quiet-machine checks: the overhead of streaming vs in-memory when the data fits (force the budget on a
    file that fits, SF1 Q1 / Q6 / Q3), and a real 30+ GB run.
+
+## 9. Result types follow the engine, not the batching
+
+Partial integer sums are merged as int64; the *result* type of an integer sum is decided once, at the end, the way
+the engine decides it for the whole table. In memory that decision looks at the table below the Filter chain: its
+row count, the bound of each sum's argument (`col_bound` of the columns combined through the expression) and
+whether Arrow's exact path has to answer (NULLs in a column the plan reads, dates, values past 2^53). Per batch the
+compiler reports exactly those inputs to `pipeline_program.SumProbe` (a context variable set around the batches);
+the probe adds the rows, takes the maximum of each column bound, ORs the flags, and `SumProbe.inexact()` asks the
+engine's own `_Builder.within_exact` about the totals. int64 if inexact or Arrow answered, else a double. The
+read-time row filter (`io_parquet._read_file`, which changes the rows below the Filter) is decided once for the whole
+file and applied to every batch. min / max take the type of the original aggregate's zero-row schema. Known gap: the
+probe sees the engine's inputs only where the batch reaches `_arrow_aggregate_reason` / `_compile`; a plan that
+never does (a path that answers sums without either) gets a double.

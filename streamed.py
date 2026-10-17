@@ -160,8 +160,7 @@ class _Spec:
     merge_ops: List[tuple]              # (hidden column, merge op) in partial order
     finals: List[tuple]                 # per original aggregate: (kind, hidden columns, output name)
     types: dict = dataclasses.field(default_factory=dict)       # hidden column -> Arrow type
-    int_sums: dict = dataclasses.field(default_factory=dict)    # integer sum's hidden column -> (min, max) hidden columns
-    rows: str = "__rows"                                          # hidden count of the rows that reach the aggregate
+    int_sums: set = dataclasses.field(default_factory=set)      # hidden columns of integer sums (typed by _State.result)
 
 
 def _spec(agg: Aggregate) -> _Spec:
@@ -197,15 +196,14 @@ def _argument_types(spec: _Spec) -> None:
     A zero-row dry run of the aggregate's arguments says which are integers; a dry run of the original
     aggregate gives the type the engine answers min / max with (float32 comes back as double). An integer sum
     is merged as int64 whatever the engine answered per batch, and its result type is decided at the end by
-    the engine's own rule on the totals (`_State.result`), so it does not depend on how the rows were batched:
-    the argument's min and max and the number of rows reaching the aggregate travel as hidden partials."""
+    the engine's own rule on the merged inputs of every batch (`pipeline_program.SumProbe`), so it does not
+    depend on how the rows were batched."""
     agg = spec.agg
     args = [Expr(e.args[0].op, *e.args[0].args, **e.args[0].kwargs).alias(f"__a{i}") for i, e in enumerate(agg.aggs)]
     got = LazyFrame(Project(agg.input, args)).schema
     zero = LazyFrame(agg).schema
     if got is None:
         raise _Decline("the aggregate's arguments cannot be typed")
-    need_rows = False
     for i, (kind, hidden, name) in enumerate(spec.finals):
         t = got.field(f"__a{i}").type
         if pa.types.is_dictionary(t):
@@ -215,22 +213,11 @@ def _argument_types(spec: _Spec) -> None:
                 raise _Decline(f"{kind}() over {t}")
             spec.types[hidden[0]] = pa.int64() if pa.types.is_integer(t) else pa.float64()
             if kind == "sum" and pa.types.is_integer(t):
-                lo, hi = f"__p{i}lo", f"__p{i}hi"
-                a = agg.aggs[i].args[0]
-                for op, h in (("min", lo), ("max", hi)):
-                    spec.partial.aggs.append(Expr(op, a).alias(h))
-                    spec.merge_ops.append((h, op))
-                    spec.types[h] = t
-                spec.int_sums[hidden[0]] = (lo, hi)
-                need_rows = True
+                spec.int_sums.add(hidden[0])
         elif kind in ("min", "max"):
             spec.types[hidden[0]] = zero.field(name).type if zero is not None and name in zero.names else t
         if kind in ("count", "mean"):
             spec.types[hidden[-1]] = pa.int64()
-    if need_rows:
-        spec.partial.aggs.append(Expr("count", Expr("lit", 1)).alias(spec.rows))
-        spec.merge_ops.append((spec.rows, "sum"))
-        spec.types[spec.rows] = pa.int64()
 
 
 @dataclasses.dataclass
@@ -328,21 +315,16 @@ def _normal(spec: _Spec, t: pa.Table, key_types: Optional[dict]) -> pa.Table:
 class _State:
     """The merged partials so far, plus the partials waiting to be merged."""
 
-    def __init__(self, spec: _Spec, budget: int):
-        self.spec, self.budget = spec, budget
+    def __init__(self, spec: _Spec, budget: int, probe=None):
+        self.spec, self.budget, self.probe = spec, budget, probe
         self.merged: Optional[pa.Table] = None
         self.pending: List[pa.Table] = []
         self.key_types: Optional[dict] = None
         self.empty: Optional[pa.Table] = None             # a partial with no groups: the answer if all are
         self.merges = 0
         self.peak_state = 0
-        self.engine_int64: set = set()                   # integer sums some batch answered as int64 (nulls, big values)
 
     def add(self, partial: pa.Table) -> None:
-        if self.spec.int_sums and partial.num_rows and pc.sum(partial.column(self.spec.rows)).as_py():
-            for h in self.spec.int_sums:
-                if pa.types.is_integer(partial.schema.field(h).type):
-                    self.engine_int64.add(h)
         t = _normal(self.spec, partial, self.key_types)
         if t.num_rows == 0 and self.spec.key_names:
             self.empty = t                               # a keyed aggregate of no rows holds no groups
@@ -375,16 +357,6 @@ class _State:
                 f"memory budget ({fmt_bytes(self.budget)}): this query needs hash-partitioned groups "
                 f"(F-056 step 3)")
 
-    def _integer_sum_is_exact_in_double(self, t: pa.Table, h: str) -> bool:
-        """The engine's rule, on the totals: an integer sum is a double when rows x max |value| stays within
-        2^53 and no batch needed Arrow's exact path (nulls in a column it reads, values past 2^53)."""
-        if h in self.engine_int64:
-            return False
-        lo_col, hi_col = self.spec.int_sums[h]
-        lo, hi = pc.min(t.column(lo_col)).as_py(), pc.max(t.column(hi_col)).as_py()
-        rows = pc.sum(t.column(self.spec.rows)).as_py() or 0
-        return lo is None or max(abs(lo), abs(hi)) * max(rows, 1) <= 2 ** 53
-
     def result(self) -> pa.Table:
         self.merge()
         t = self.merged if self.merged is not None else self.empty
@@ -396,7 +368,7 @@ class _State:
                                  pa.scalar(None, pa.float64()))
             else:
                 arr = t.column(hidden[0])
-                if hidden[0] in self.spec.int_sums and self._integer_sum_is_exact_in_double(t, hidden[0]):
+                if hidden[0] in self.spec.int_sums and self.probe is not None and not self.probe.inexact():
                     arr = pc.cast(arr, pa.float64())
             arrays.append(arr)
             names.append(name)
@@ -444,16 +416,18 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                       RuntimeWarning, stacklevel=3)
         return None
     spec, leaf = got.spec, got.leaf
-    state = _State(spec, budget)
+    from .pipeline_program import sum_probe
     devices, pieces, paths = Counter(), Counter(), Counter()
     biggest, size_of = 0, dict(zip(leaf.groups, leaf.sizes))
     token = _active.set(True)
     try:
-        with streaming(leaf.path) as st:
+        with streaming(leaf.path) as st, sum_probe() as probe:
+            state = _State(spec, budget, probe)
             for batch in got.batches:
                 st.groups = tuple(batch)
                 biggest = max(biggest, sum(size_of[g] for g in batch))
                 sub = LazyFrame(spec.partial)
+                probe.begin()
                 part = sub.compute(device, optimize=False, validate=False, strict=strict, prefer=prefer,
                                    placement=placement, gpu_fraction=gpu_fraction)
                 p = sub.last_compile_provenance or {}
@@ -461,11 +435,12 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                 paths[p.get("path", "")] += 1
                 if p.get("gpu_pieces"):
                     pieces[p["gpu_pieces"]] += 1
+                probe.end()
                 state.add(part)
                 if verbose:
                     print(f"[mxframe] streamed batch {sum(devices.values())}/{len(got.batches)}: "
                           f"{len(batch)} row groups, {part.num_rows} partial rows")
-        merged = state.result()
+            merged = state.result()
     finally:
         _active.reset(token)
     above = _replace(plan, spec.agg, Scan(merged))

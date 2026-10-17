@@ -199,7 +199,7 @@ def types_by_budget(path, build, budgets, device="cpu"):
         os.environ["MXFRAME_HOST_MEM_BUDGET"] = b
         lf = build(scan_parquet(path))
         got = run(lf, device)
-        out[b] = (got.schema, got.sort_by("k").to_pylist(), prov(lf).get("streamed", {}).get("batches"))
+        out[b] = (got.schema, got.sort_by(got.column_names[0]).to_pylist(), prov(lf).get("streamed", {}).get("batches"))
     return out
 
 
@@ -215,6 +215,61 @@ def test_an_integer_sum_has_the_type_it_has_in_memory_whatever_the_batch_count(t
     assert got["20K"][2] > got["200K"][2] > 1                      # two different batch counts
     assert {b: str(v[0].field("s").type) for b, v in got.items()} == {"20K": "int64", "200K": "int64", "64G": "int64"}
     assert all(v[1] == [{"k": 0, "s": 2 ** 41}] for v in got.values())
+
+
+def assert_same_type_at_every_budget(path, build, budgets=("6K", "40K", "200K", "64G"), column="s"):
+    got = types_by_budget(path, build, list(budgets))
+    batches = [v[2] for v in got.values()]
+    assert batches[-1] is None and len({b for b in batches[:-1]}) > 1, batches       # several batch counts, then in memory
+    types = {b: str(v[0].field(column).type) for b, v in got.items()}
+    assert len(set(types.values())) == 1, types
+    assert len({repr(v[1]) for v in got.values()}) == 1                                # and the same sums
+    return types["64G"]
+
+
+def test_a_selective_filter_leaves_the_integer_sum_type_as_in_memory(tmp_path):
+    """A big value sits in the rows the filter drops. The engine bounds the sum by the unfiltered table (all
+    rows, the largest value of the column), so the type is int64 at every budget, not only where a batch
+    happens to hold the big value."""
+    n = 64_000
+    y = np.random.default_rng(0).integers(0, 1000, n).astype(np.int64)
+    y[::5000] = 2 ** 44
+    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "y": y}), 256)
+    kind = assert_same_type_at_every_budget(path, lambda s: s.filter(col("y") < 1000).groupby("k").agg(col("y").sum().alias("s")))
+    assert kind == "int64"
+
+
+def test_a_filter_on_another_column_leaves_the_integer_sum_type_as_in_memory(tmp_path):
+    n = 64_000
+    y = np.random.default_rng(0).integers(0, 1000, n).astype(np.int64)
+    y[5] = 2 ** 41
+    f = (np.arange(n) * 7919 % 100).astype(np.int32)
+    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "y": y, "f": f}), 1000)
+    assert assert_same_type_at_every_budget(
+        path, lambda s: s.filter(col("f") == 3).groupby("k").agg(col("y").sum().alias("s"))) == "int64"
+
+
+def test_a_product_of_columns_whose_large_values_sit_in_different_batches(tmp_path):
+    """max|a| x max|b| is 2^60 although no row has both: the engine multiplies the column bounds, so a batch
+    holding only the large a and another only the large b must give the type the whole table gives."""
+    n = 64_000
+    a, b = np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.int64)
+    a[0], b[n - 1] = 2 ** 30, 2 ** 30
+    path = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "a": a, "b": b}), 250)
+    assert assert_same_type_at_every_budget(
+        path, lambda s: s.groupby("k").agg((col("a") * col("b")).sum().alias("s")), budgets=("20K", "200K", "64G")) == "int64"
+
+
+def test_an_integer_sum_after_a_join_has_the_in_memory_type(tmp_path):
+    n = 64_000
+    x = np.zeros(n, dtype=np.int64)
+    x[0] = 2 ** 41
+    fact = small_file(tmp_path, pa.table({"k": np.zeros(n, dtype=np.int32), "j": (np.arange(n) % 10).astype(np.int32), "x": x}), 1000)
+    dim = str(tmp_path / "dim.parquet")
+    pq.write_table(pa.table({"id": np.arange(10, dtype=np.int32), "g": np.zeros(10, dtype=np.int32)}), dim)
+    assert assert_same_type_at_every_budget(
+        fact, lambda s: s.join(scan_parquet(dim), left_on="j", right_on="id").groupby("g").agg(col("x").sum().alias("s")),
+        budgets=("20K", "200K", "64G")) == "int64"
 
 
 def test_a_small_integer_sum_is_a_double_in_memory_and_streamed(tmp_path):
