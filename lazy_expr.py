@@ -199,8 +199,8 @@ def lit(value: Any) -> Expr:
     """Create a literal value expression."""
     return Expr("lit", value)
 
-def when(condition: 'Expr', then: Any, otherwise: Any = 0) -> 'Expr':
-    """CASE WHEN condition THEN then ELSE otherwise END."""
+def when(condition: 'Expr', then: Any, otherwise: Any = None) -> 'Expr':
+    """CASE WHEN condition THEN then ELSE otherwise END; without ``otherwise`` the else is NULL."""
     if not isinstance(then, Expr):      then      = lit(then)
     if not isinstance(otherwise, Expr): otherwise = lit(otherwise)
     return Expr("case_when", condition, then, otherwise)

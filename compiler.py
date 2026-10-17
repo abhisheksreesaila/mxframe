@@ -108,6 +108,47 @@ def _is_number(v) -> bool:
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def case_literal(v):
+    """A CASE branch literal as an Arrow scalar of its SQL type: integers int64, floats float64 (a DECIMAL
+    literal is already a float here), bool, str; None (the NULL branch) stays None."""
+    import datetime as _dt
+    if v is None:
+        return None
+    if isinstance(v, (bool, np.bool_)):
+        return _npscalar(bool(v), type=pa.bool_())
+    if isinstance(v, (int, np.integer)):
+        return _npscalar(int(v), type=pa.int64())
+    if isinstance(v, (float, np.floating)):
+        return _npscalar(float(v), type=pa.float64())
+    return _npscalar(v) if isinstance(v, (str, _dt.date)) else v
+
+
+def case_when_arrow(cond, then, else_):
+    """Arrow CASE WHEN: ``then`` / ``else_`` are Arrow values or None (a NULL branch). The result has the
+    common type of the branches like DuckDB: equal types stay, integers widen to int64, any other number mix
+    is float64, a NULL branch takes the other's type, all NULL is int32. A null condition is not true.
+    Mixing text with numbers raises, as DuckDB does."""
+    from .arrow_dict import decode as _decode
+    then, else_ = (None if x is None else _decode(x) for x in (then, else_))
+    ta, tb = (None if x is None else x.type for x in (then, else_))
+    if ta is None or tb is None or ta == tb:
+        want = ta or tb or pa.int32()
+    elif pa.types.is_integer(ta) and pa.types.is_integer(tb):
+        want = pa.int64()
+    elif all(pa.types.is_integer(t) or pa.types.is_floating(t) or pa.types.is_decimal(t) for t in (ta, tb)):
+        want = pa.float64()
+    elif pa.types.is_date(ta) and pa.types.is_date(tb):
+        want = pa.date32()
+    else:
+        raise TypeError(f"CASE branches have no common type: {ta} and {tb}")
+    def fit(x):
+        if x is None:
+            return pa.scalar(None, type=want) if isinstance(cond, pa.Scalar) else pa.nulls(len(cond), want)
+        return x if x.type == want else pc.cast(x, want, safe=False)
+    cond = pc.fill_null(cond, _npscalar(False, type=pa.bool_()))
+    return pc.if_else(cond, fit(then), fit(else_))
+
+
 def _numeric_literal(x):
     """The Python value of a numeric literal operand (a Python number or an Arrow scalar), else None."""
     if _is_number(x):
@@ -467,10 +508,9 @@ class GraphCompiler:
             from .str_patterns import match_like
             return match_like(GraphCompiler._eval_predicate(args[0], table), args[1], args[2], args[3])
         if op == "case_when":
-            cond = GraphCompiler._eval_predicate(args[0], table)
-            then = GraphCompiler._eval_predicate(args[1], table)
-            else_ = GraphCompiler._eval_predicate(args[2], table)
-            return pc.if_else(pc.fill_null(cond, _npscalar(False, type=pa.bool_())), then, else_)     # CASE: a null condition is not true
+            return case_when_arrow(GraphCompiler._eval_predicate(args[0], table),
+                                   *(case_literal(a.args[0]) if a.op == "lit" else GraphCompiler._eval_predicate(a, table)
+                                     for a in args[1:]))
         if op == "year":
             col_arr = GraphCompiler._eval_predicate(args[0], table)
             if col_arr.type in (pa.int32(), pa.int64()):

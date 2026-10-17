@@ -1710,9 +1710,16 @@ class _SQLTranslator:
         """The Arrow type of a plain column of this query's FROM items, through its alias; else None."""
         return _type_in(src, self._alias_schema)
 
+    @staticmethod
+    def _case_results(node: sge.Case) -> list:
+        """The result expressions of a CASE: every THEN and the ELSE."""
+        return [i.args["true"] for i in node.args.get("ifs") or []] + ([node.args["default"]] if node.args.get("default") else [])
+
     def _is_date_col(self, src: sge.Expression) -> bool:
         if isinstance(src, (sge.Min, sge.Max)):             # F-093: MIN / MAX of a date column is a date
             src = src.this
+        if isinstance(src, sge.Case):                       # a CASE with a date result is a date
+            return any(_date_of(r) is not None or self._is_date_col(r) for r in self._case_results(src))
         t = self._col_type(src)
         return t is not None and pa.types.is_date(t)
 
@@ -1758,11 +1765,19 @@ class _SQLTranslator:
         default_node = node.args.get("default")
         if not ifs:
             raise ValueError("CASE requires at least one WHEN clause")
-        otherwise: Expr = self._expr(default_node) if default_node else lit(0)
+        def branch(n):          # NULL, TRUE / FALSE and DATE constants only as a CASE result; the rest as usual
+            d = _date_of(n)
+            if d is not None:
+                return lit(d)
+            if isinstance(n, (sge.Null, sge.Boolean)):
+                return lit(None if isinstance(n, sge.Null) else bool(n.this))
+            return self._expr(n)
+        otherwise: Expr = branch(default_node) if default_node else lit(None)         # no ELSE is ELSE NULL
         # Build right-to-left so the first WHEN is outermost
         for if_node in reversed(ifs):
-            cond = self._expr(if_node.this)
-            then = self._expr(if_node.args["true"])
+            cond = (self._expr(node.this) == self._expr(if_node.this)) if node.this is not None \
+                else self._expr(if_node.this)               # CASE x WHEN v: x = v
+            then = branch(if_node.args["true"])
             otherwise = when(cond, then, otherwise)
         return otherwise
 
@@ -1855,6 +1870,9 @@ class _SQLTranslator:
             return True
         if isinstance(node, (sge.Min, sge.Max)):               # not SUM: the engine returns it as a double until F-060
             return self._is_int_expr(node.this)
+        if isinstance(node, sge.Case):                          # integer results (a NULL branch takes the other's type)
+            res = [r for r in self._case_results(node) if not isinstance(r, sge.Null)]
+            return bool(res) and all(self._is_int_expr(r) for r in res)
         t = self._col_type(node)
         return t is not None and pa.types.is_integer(t)
 
