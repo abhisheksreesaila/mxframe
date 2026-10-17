@@ -170,7 +170,6 @@ class _Spec:
     merge_ops: List[tuple]              # (hidden column, merge op) in partial order
     finals: List[tuple]                 # per original aggregate: (kind, hidden columns, output name)
     types: dict = dataclasses.field(default_factory=dict)       # hidden column -> Arrow type
-    int_sums: set = dataclasses.field(default_factory=set)      # hidden columns of integer sums (typed by _State.result)
 
 
 def _spec(agg: Aggregate) -> _Spec:
@@ -205,9 +204,7 @@ def _argument_types(spec: _Spec) -> None:
 
     A zero-row dry run of the aggregate's arguments says which are integers; a dry run of the original
     aggregate gives the type the engine answers min / max with (float32 comes back as double). An integer sum
-    is merged as int64 whatever the engine answered per batch, and its result type is decided at the end by
-    the engine's own rule on the merged inputs of every batch (`pipeline_program.SumProbe`), so it does not
-    depend on how the rows were batched."""
+    is int64 in every batch and in the merge (F-060), so its type does not depend on how the rows were batched."""
     agg = spec.agg
     args = [Expr(e.args[0].op, *e.args[0].args, **e.args[0].kwargs).alias(f"__a{i}") for i, e in enumerate(agg.aggs)]
     got = LazyFrame(Project(agg.input, args)).schema
@@ -222,8 +219,6 @@ def _argument_types(spec: _Spec) -> None:
             if not (pa.types.is_integer(t) or pa.types.is_floating(t)):
                 raise _Decline(f"{kind}() over {t}")
             spec.types[hidden[0]] = pa.int64() if pa.types.is_integer(t) else pa.float64()
-            if kind == "sum" and pa.types.is_integer(t):
-                spec.int_sums.add(hidden[0])
         elif kind in ("min", "max"):
             spec.types[hidden[0]] = zero.field(name).type if zero is not None and name in zero.names else t
         if kind in ("count", "mean"):
@@ -436,8 +431,8 @@ class _State:
     later partial go to hash partitions on disk, and `pieces()` merges one partition at a time (splitting a
     partition again, with another salt, if even that one is too big)."""
 
-    def __init__(self, spec: _Spec, budget: int, probe=None, root=None, salt: int = 0, depth: int = 0, held=None):
-        self.spec, self.budget, self.probe = spec, budget, probe
+    def __init__(self, spec: _Spec, budget: int, root=None, salt: int = 0, depth: int = 0, held=None):
+        self.spec, self.budget = spec, budget
         self.held = held or (lambda: 0)          # bytes the query holds elsewhere: resident tables, the sink
         self.root, self.salt, self.depth = root, salt, depth
         self.merged: Optional[pa.Table] = None
@@ -506,7 +501,7 @@ class _State:
             return
         self.parts.finish()
         for i in range(_spill.PARTITIONS):
-            sub = _State(self.spec, self.budget, None, self.root, self.salt + 1, self.depth + 1, self.held)
+            sub = _State(self.spec, self.budget, self.root, self.salt + 1, self.depth + 1, self.held)
             sub.key_types = self.key_types
             for t in _read_partition(self.parts, i):
                 sub.add(t)
@@ -526,8 +521,6 @@ class _State:
                                  pa.scalar(None, pa.float64()))
             else:
                 arr = t.column(hidden[0])
-                if hidden[0] in self.spec.int_sums and self.probe is not None and not self.probe.inexact():
-                    arr = pc.cast(arr, pa.float64())
             arrays.append(arr)
             names.append(name)
         return pa.table(arrays, names=names)
@@ -832,27 +825,23 @@ def describe(plan, device: str = "cpu") -> Optional[str]:
 
 
 class _Runner:
-    """Computes one batch plan on the query's device and counts where it ran (provenance); feeds the SumProbe."""
+    """Computes one batch plan on the query's device and counts where it ran (provenance)."""
 
-    def __init__(self, device, strict, prefer, placement, gpu_fraction, probe=None):
+    def __init__(self, device, strict, prefer, placement, gpu_fraction):
         self.kw = dict(optimize=False, validate=False, strict=strict, prefer=prefer, placement=placement,
                        gpu_fraction=gpu_fraction)
-        self.device, self.probe = device, probe
+        self.device = device
         self.devices, self.pieces, self.paths = Counter(), Counter(), Counter()
         self.biggest = 0
 
     def __call__(self, plan_b) -> pa.Table:
         sub = LazyFrame(plan_b)
-        if self.probe:
-            self.probe.begin()
         part = sub.compute(self.device, **self.kw)
         p = sub.last_compile_provenance or {}
         self.devices[p.get("auto_device") or p.get("device") or self.device] += 1
         self.paths[p.get("path", "")] += 1
         if p.get("gpu_pieces"):
             self.pieces[p["gpu_pieces"]] += 1
-        if self.probe:
-            self.probe.end()
         return part
 
 
@@ -897,7 +886,6 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                       RuntimeWarning, stacklevel=3)
         return None
     spec, leaf = got.spec, got.leaf
-    from .pipeline_program import sum_probe
     root = _spill.SpillDir("join partitions" if got.grace is not None else "group state")
     out = _out.get()
     sink, state, batches_run, rows_info, graced = None, None, 0, None, None
@@ -907,9 +895,9 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                          budget, out, root, lambda: got.resident)
     token, out_token = _active.set(True), _out.set(None)      # a nested streamed compute (a Grace side) must not write into the sink file
     try:
-        with streaming(leaf.path) as st, (sum_probe(names=spec.int_sums) if spec else contextlib.nullcontext()) as probe:
-            run = _Runner(device, strict, prefer, placement, gpu_fraction, probe)
-            state = _State(spec, budget, probe, root, held=lambda: got.resident + (sink.bytes if sink else 0)) if spec else None
+        with streaming(leaf.path) as st:
+            run = _Runner(device, strict, prefer, placement, gpu_fraction)
+            state = _State(spec, budget, root, held=lambda: got.resident + (sink.bytes if sink else 0)) if spec else None
             if got.grace is not None:
                 from . import grace
                 batch_of = (lambda: spec.partial) if spec else (lambda: sink.batch_plan(got.top))
@@ -932,46 +920,42 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                 if sink is not None and sink.full:
                     break
             stage_spec, stage_state, stage_top, stages = spec, state, got.top, 1
-            with contextlib.ExitStack() as probes:                   # a later stage's SumProbe stays open until its result is read
-                while True:
-                    if stage_spec is not None and not stage_state.spilled:
-                        merged = stage_state.result()                # the usual case: the groups fit
-                        above = _replace(plan, stage_spec.agg, Scan(merged))
-                        table = merged
-                        break
-                    if stage_spec is not None:                       # spilled groups: one partition at a time
-                        rowwise = stage_top is not stage_spec.agg
-                        nxt = _next_stage(plan, stage_top)
-                        if nxt is not None:                          # count(distinct x): another group-by over the groups
-                            spec2, top2 = nxt
-                            probe2 = probes.enter_context(sum_probe(names=spec2.int_sums))
-                            state2 = _State(spec2, budget, probe2, root, held=lambda: got.resident)
-                            for piece in stage_state.pieces():
-                                rows = stage_state.format(piece)
-                                if rowwise:
-                                    rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
-                                        "cpu", optimize=False, validate=False)
-                                probe2.begin()
-                                state2.add(LazyFrame(dataclasses.replace(spec2.partial, input=Scan(rows))).compute(
-                                    "cpu", optimize=False, validate=False))
-                                probe2.end()
-                            stage_spec, stage_state, stage_top, stages = spec2, state2, top2, stages + 1
-                            continue
-                        sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, out, root,
-                                         lambda: got.resident)
+            while True:
+                if stage_spec is not None and not stage_state.spilled:
+                    merged = stage_state.result()                # the usual case: the groups fit
+                    above = _replace(plan, stage_spec.agg, Scan(merged))
+                    table = merged
+                    break
+                if stage_spec is not None:                       # spilled groups: one partition at a time
+                    rowwise = stage_top is not stage_spec.agg
+                    nxt = _next_stage(plan, stage_top)
+                    if nxt is not None:                          # count(distinct x): another group-by over the groups
+                        spec2, top2 = nxt
+                        state2 = _State(spec2, budget, root, held=lambda: got.resident)
                         for piece in stage_state.pieces():
                             rows = stage_state.format(piece)
                             if rowwise:
                                 rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
                                     "cpu", optimize=False, validate=False)
-                            sink.add(rows)
-                            if sink.full:
-                                break
-                    table, above = sink.finish(plan, stage_top)
-                    rows_info = {"kind": sink.kind, "batches_run": batches_run}
-                    if sink.ext is not None:
-                        rows_info["sort"] = dict(sink.ext.stats, rows=sink.ext.rows)
-                    break
+                            state2.add(LazyFrame(dataclasses.replace(spec2.partial, input=Scan(rows))).compute(
+                                "cpu", optimize=False, validate=False))
+                        stage_spec, stage_state, stage_top, stages = spec2, state2, top2, stages + 1
+                        continue
+                    sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, out, root,
+                                     lambda: got.resident)
+                    for piece in stage_state.pieces():
+                        rows = stage_state.format(piece)
+                        if rowwise:
+                            rows = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(rows))).compute(
+                                "cpu", optimize=False, validate=False)
+                        sink.add(rows)
+                        if sink.full:
+                            break
+                table, above = sink.finish(plan, stage_top)
+                rows_info = {"kind": sink.kind, "batches_run": batches_run}
+                if sink.ext is not None:
+                    rows_info["sort"] = dict(sink.ext.stats, rows=sink.ext.rows)
+                break
     finally:
         _active.reset(token)
         _out.reset(out_token)

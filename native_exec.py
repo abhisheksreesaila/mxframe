@@ -56,7 +56,7 @@ _CMP = {"lt": 0, "le": 1, "gt": 2, "ge": 3, "eq": 4, "ne": 5}
 _FLIP = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
 K_DICT, K_I32, K_I64, K_STR, K_EXPR, K_F64, K_PF64, K_F32, K_PF32 = 0, 1, 2, 3, 4, 5, 6, 7, 8
 _GROUP_PATHS = {0: "dense", 1: "compact", 2: "hash"}
-_OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4}
+_OPS = {"sum": 0, "min": 1, "max": 2, "mean": 3, "count": 4, "isum": 5, "imean": 6}
 _DT = {pa.int32(): 0, pa.int64(): 1, pa.float32(): 2, pa.float64(): 3}
 
 _lib = None
@@ -599,7 +599,7 @@ def _wrap_result(lib, O, keys, kinds, outputs) -> pa.Table:
         out_cols.append(arr)
     base = 3 + 2 * len(keys)
     for j, (name, op, _) in enumerate(outputs):
-        t = pa.int64() if op == "count" else pa.float64()
+        t = pa.int64() if op in ("count", "isum") else pa.float64()
         if empty_global and op != "count":
             arr = pa.nulls(1, t)
         else:
@@ -2026,7 +2026,7 @@ def range_partials(compiler, prog, table: pa.Table, predicates, agg_node, gids, 
     for e, (name, op, slot) in zip(agg_node.aggs, prog.outputs):
         if slot is None or slot in slot_agg:
             continue
-        kind = "sum" if op == "mean" else op
+        kind = {"mean": "sum", "isum": "sum", "imean": "sum"}.get(op, op)
         slot_agg[slot] = f"__mx_s{slot}"
         aggs.append(Expr(kind, e.args[0]).alias(slot_agg[slot]))
     nan_of = {}                                      # hidden NaN-count slot -> [(aggregate name, op)]
@@ -2046,11 +2046,17 @@ def range_partials(compiler, prog, table: pa.Table, predicates, agg_node, gids, 
     def column(name):
         return np.asarray(_np_of(res.column(name), zero_copy_only=False), dtype=np.float64)
 
+    def ints(name):                                  # an integer sum: int64 (the executor adds it exactly), not a float
+        return np.asarray(_np_of(res.column(name), zero_copy_only=False), dtype=np.int64)
+
     c = column(_CNT).astype(np.int64)
     if not grouped and c[0] == 0:                    # a global aggregate over no surviving rows
         return Partials(vals=vals, cnt=cnt)
     cnt[idx] = c
     for slot, name in slot_agg.items():
+        if prog.slot_kinds[slot] == "isum":
+            vals[slot].view(np.int64)[idx] = ints(name)
+            continue
         v = column(name)
         if prog.slot_kinds[slot] in ("min", "max"):      # the pipeline's slot never holds a NaN
             v = np.where(np.isnan(v), prog.identity[slot], v)

@@ -26,6 +26,7 @@ from .pipeline_program import (
     ChunkedColumns,
     Partials,
     PipelineProgram,
+    SumOverflow,
     dtype_code,
     empty_partials,
     finalize,
@@ -43,6 +44,7 @@ _cpu_lib = None
 _gpu_lib = None
 
 _I64 = ctypes.c_int64
+E_OVERFLOW = -21          # the kernels' code for an integer sum past int64 (pipeline_cpu.mojo)
 
 
 class GpuUnsupported(Exception):
@@ -214,6 +216,8 @@ def run_pipeline_cpu(program: PipelineProgram, columns, gids: Optional[np.ndarra
         _addr(vals), _addr(cnt), int(threads) if threads else default_threads(),
         1 if (reproducible if reproducible is not None else _reproducible_now()) else 0,
     )
+    if rc == E_OVERFLOW:
+        raise SumOverflow("Overflow in sum of INT64")
     if rc != 0:
         raise RuntimeError(f"mx_pipeline_cpu failed with code {rc}")
     return Partials(vals=vals, cnt=cnt)
@@ -382,7 +386,7 @@ def _load_gpu():
             lib = ctypes.CDLL(str(path))
             fn = lib.mx_pipeline_gpu
             fn.restype = _I64
-            fn.argtypes = [_I64] * 21
+            fn.argtypes = [_I64] * 22
             mode = lib.mx_pipeline_gpu_mode
             mode.restype = _I64
             mode.argtypes = [_I64] * 5
@@ -551,12 +555,14 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         ns = (n_slots + 1) * n_groups
         block_rows = ns if ns <= 48 or (repro and ns <= REPRO_MAX_NS) else 0
         scratch = take("scratch", max(max_blocks * block_rows * 8, 8))
+        ovf = take("ovf", 8)                       # the kernel sets it when an integer sum passes int64 (F-060)
+        cu.h2d(ovf, np.zeros(1, dtype=np.int64))
         cu.sync()
         rc = lib.mx_pipeline_gpu(
             dp.code, dp.consts, dp.set_bytes, dp.set_meta, col_ptrs, col_dt,
             dc.gid_ptr if n_groups > 1 else 0, n_groups, n_slots, k_start, k_end,
             out_vals, out_cnt, dp.ident, scratch, dp.n_regs, dp.code_ints, dp.agg_base,
-            cu.sm_count, int(_repeat), 1 if repro else 0,
+            cu.sm_count, int(_repeat), 1 if repro else 0, ovf,
         )
         if rc == -6:
             raise GpuUnsupported("reproducible float sums need the group table in shared memory")
@@ -569,6 +575,10 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         if n_slots:
             cu.d2h(vals, out_vals)
         cu.d2h(cnt, out_cnt)
+        flag = np.zeros(1, dtype=np.int64)
+        cu.d2h(flag, ovf)
+        if flag[0]:
+            raise SumOverflow("Overflow in sum of INT64")
         return Partials(vals=vals, cnt=cnt)
     finally:
         for name, ptr in taken:

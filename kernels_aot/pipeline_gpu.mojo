@@ -80,6 +80,7 @@ comptime OP_CMPC = 38
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
+comptime OP_AGG_ISUM = 53       # sum of integer-valued inputs in int64 (F-060): the slot's float64 word holds int64 bits
 
 comptime SH = AddressSpace.SHARED
 comptime SFP = Pointer[Float64, MutUntrackedOrigin, address_space=SH]
@@ -127,6 +128,51 @@ def _atomic_max_f64[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigi
 def _atomic_add_i64(ptr: Pointer[Int64, MutUntrackedOrigin], val: Int64):
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
     _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[AddressSpace.GENERIC, DType.int64](ptr), v)
+
+
+@always_inline
+def _atomic_add_bits[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigin, address_space=space], val: Int64) -> Int64:
+    """int64 atomic add on a float64 slot that holds int64 bits (the pointer is untyped in LLVM); returns the old value."""
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
+    var r = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[space, F64](ptr), v)
+    return __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type[Int64]](r)
+
+
+@always_inline
+def _i64_of(x: Float64) -> Int64:
+    """The int64 a slot word holds."""
+    return bitcast[DType.int64, 1](SIMD[F64, 1](x))[0]
+
+
+@always_inline
+def _word_of(x: Int64) -> Float64:
+    return bitcast[F64, 1](SIMD[DType.int64, 1](x))[0]
+
+
+@always_inline
+def _note_ovf(a: Int64, b: Int64, ovf: LP):
+    """Flags *ovf when a + b (computed with wrapping) passed int64."""
+    var s = a + b
+    if ((a ^ s) & (b ^ s)) < 0:
+        ovf[0] = 1
+
+
+@always_inline
+def _iadd_words(a: Float64, b: Float64, ovf: LP) -> Float64:
+    """The sum of two slot words that hold int64s, as a slot word."""
+    var x = _i64_of(a)
+    var y = _i64_of(b)
+    _note_ovf(x, y, ovf)
+    return _word_of(x + y)
+
+
+@always_inline
+def _iadd_value(a: Float64, v: Float64, ovf: LP) -> Float64:
+    """The slot word `a` (int64 bits) plus the whole number `v` (a register value, within +-2^53)."""
+    var x = _i64_of(a)
+    var y = Int64(v)
+    _note_ovf(x, y, ovf)
+    return _word_of(x + y)
 
 
 @always_inline
@@ -243,20 +289,22 @@ def _shfl_down(v: Float64, off: Int) -> Float64:
 
 
 @always_inline
-def _combine(kind: Int, a: Float64, b: Float64) -> Float64:
+def _combine(kind: Int, a: Float64, b: Float64, ovf: LP) -> Float64:
     if kind == OP_AGG_MIN:
         return min(a, b)
     elif kind == OP_AGG_MAX:
         return max(a, b)
+    elif kind == OP_AGG_ISUM:
+        return _iadd_words(a, b, ovf)
     return a + b
 
 
 @always_inline
-def _warp_reduce(kind: Int, v: Float64) -> Float64:
+def _warp_reduce(kind: Int, v: Float64, ovf: LP) -> Float64:
     var x = v
     var off = 16
     while off > 0:
-        x = _combine(kind, x, _shfl_down(x, off))
+        x = _combine(kind, x, _shfl_down(x, off), ovf)
         off >>= 1
     return x
 
@@ -376,7 +424,7 @@ def pipeline_kernel[RPT: Int, B: Int](
     code_a_i64: Int64, consts_a_i64: Int64, set_bytes_a_i64: Int64, set_meta_a_i64: Int64,
     cols_a_i64: Int64, dtypes_a_i64: Int64, gids_a_i64: Int64, n_groups_i64: Int64, n_slots_i64: Int64,
     row0_i64: Int64, row_end_i64: Int64, out_vals_a_i64: Int64, out_cnt_a_i64: Int64, scratch_a_i64: Int64,
-    n_regs_i64: Int64, code_ints_i64: Int64, mode_i64: Int64,
+    n_regs_i64: Int64, code_ints_i64: Int64, mode_i64: Int64, ovf_a_i64: Int64,
 ):
     var code_a = Int(code_a_i64)
     var consts_a = Int(consts_a_i64)
@@ -395,6 +443,7 @@ def pipeline_kernel[RPT: Int, B: Int](
     var n_regs = Int(n_regs_i64)
     var code_ints = Int(code_ints_i64)
     var mode = Int(mode_i64)
+    var ovf = _lp(Int(ovf_a_i64))
     comptime TILE = B * RPT
     comptime NWARPS = B // 32
     var tid = Int(thread_idx.x)
@@ -508,6 +557,8 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 var q = a * G + g
                                 if kind == OP_AGG_SUM:
                                     acc[q] += v
+                                elif kind == OP_AGG_ISUM:
+                                    acc[q] = _iadd_value(acc[q], v, ovf)
                                 elif kind == OP_AGG_MIN:
                                     acc[q] = min(acc[q], v)
                                 else:
@@ -521,6 +572,8 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 var p = accs + ((a * G + g) * B + tid)
                                 if kind == OP_AGG_SUM:
                                     p[0] += v
+                                elif kind == OP_AGG_ISUM:
+                                    p[0] = _iadd_value(p[0], v, ovf)
                                 elif kind == OP_AGG_MIN:
                                     p[0] = min(p[0], v)
                                 else:
@@ -534,6 +587,9 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 var p = accs + (a * G + g)
                                 if kind == OP_AGG_SUM:
                                     _atomic_add_f64(p, v)
+                                elif kind == OP_AGG_ISUM:
+                                    var yv = Int64(v)
+                                    _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
                                 elif kind == OP_AGG_MIN:
                                     _atomic_min_f64(p, v)
                                 else:
@@ -547,6 +603,9 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 var p = out_vals + (a * G + g)
                                 if kind == OP_AGG_SUM:
                                     _atomic_add_f64(p, v)
+                                elif kind == OP_AGG_ISUM:
+                                    var yv = Int64(v)
+                                    _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
                                 elif kind == OP_AGG_MIN:
                                     _atomic_min_f64(p, v)
                                 else:
@@ -566,6 +625,8 @@ def pipeline_kernel[RPT: Int, B: Int](
                             var p = accs + (a * G + g)
                             if kind == OP_AGG_SUM:
                                 p[0] += v
+                            elif kind == OP_AGG_ISUM:
+                                p[0] = _iadd_value(p[0], v, ovf)
                             elif kind == OP_AGG_MIN:
                                 p[0] = min(p[0], v)
                             else:
@@ -588,7 +649,7 @@ def pipeline_kernel[RPT: Int, B: Int](
             var kind = OP_AGG_SUM
             if s_ < A * G:
                 kind = Int(code[HDR + (agg_base + s_ // G) * 5])
-            var w = _warp_reduce(kind, acc[s_] if mode == 0 else accs[s_ * B + tid])
+            var w = _warp_reduce(kind, acc[s_] if mode == 0 else accs[s_ * B + tid], ovf)
             if lane == 0:
                 wpart[warp * SMALL + s_] = w
         barrier()
@@ -598,7 +659,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                 kind = Int(code[HDR + (agg_base + tid // G) * 5])
             var r = wpart[tid]
             for w in range(1, NWARPS):
-                r = _combine(kind, r, wpart[w * SMALL + tid])
+                r = _combine(kind, r, wpart[w * SMALL + tid], ovf)
             _fp(scratch_a)[Int(block_idx.x) * ns + tid] = r
     elif mode == 1:
         barrier()
@@ -611,6 +672,10 @@ def pipeline_kernel[RPT: Int, B: Int](
             if j >= A * G:
                 if v != 0.0:
                     _atomic_add_i64(out_cnt + (j - A * G), Int64(v))
+            elif kind == OP_AGG_ISUM:
+                if _i64_of(v) != 0:
+                    var yv = _i64_of(v)
+                    _note_ovf(_atomic_add_bits(out_vals + j, yv), yv, ovf)
             elif kind == OP_AGG_SUM:
                 if v != 0.0:
                     _atomic_add_f64(out_vals + j, v)
@@ -638,7 +703,7 @@ def init_kernel(out_vals_a_i64: Int64, out_cnt_a_i64: Int64, ident_a_i64: Int64,
 
 def merge_kernel(
     code_a_i64: Int64, scratch_a_i64: Int64, out_vals_a_i64: Int64, out_cnt_a_i64: Int64, n_blocks_i64: Int64,
-    n_groups_i64: Int64, n_slots_i64: Int64, agg_base_i64: Int64, ident_a_i64: Int64,
+    n_groups_i64: Int64, n_slots_i64: Int64, agg_base_i64: Int64, ident_a_i64: Int64, ovf_a_i64: Int64,
 ):
     var code_a = Int(code_a_i64)
     var scratch_a = Int(scratch_a_i64)
@@ -649,6 +714,7 @@ def merge_kernel(
     var n_slots = Int(n_slots_i64)
     var agg_base = Int(agg_base_i64)
     var ident_a = Int(ident_a_i64)
+    var ovf = _lp(Int(ovf_a_i64))
     """Merge the per-block partials in block order (deterministic)."""
     var s = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     var A = n_slots
@@ -662,7 +728,7 @@ def merge_kernel(
         kind = Int(_ip(code_a)[HDR + (agg_base + s // G) * 5])
         r = _fp(ident_a)[s // G]
     for b in range(n_blocks):
-        r = _combine(kind, r, _fp(scratch_a)[b * ns + s])
+        r = _combine(kind, r, _fp(scratch_a)[b * ns + s], ovf)
     if s < A * G:
         _fp(out_vals_a)[s] = r
     else:
@@ -728,7 +794,7 @@ def mx_pipeline_gpu(
     cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int, n_slots: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, ident_a: Int,
     scratch_a: Int, n_regs: Int, code_ints: Int, agg_base: Int,
-    n_blocks: Int, repeat: Int, repro: Int,
+    n_blocks: Int, repeat: Int, repro: Int, ovf_a: Int,
 ) abi("C") -> Int:
     if n_slots < 0 or n_groups < 1:
         return -2
@@ -759,25 +825,25 @@ def mx_pipeline_gpu(
                     ctx.enqueue_function[pipeline_kernel[2, 128]](
                         Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                         Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 elif bsz == 128:
                     ctx.enqueue_function[pipeline_kernel[1, 128]](
                         Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                         Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 elif rpt == 2:
                     ctx.enqueue_function[pipeline_kernel[2, 256]](
                         Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                         Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
                 else:
                     ctx.enqueue_function[pipeline_kernel[1, 256]](
                         Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                         Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
             if small != 0:
                 ctx.enqueue_function[merge_kernel](
-                    Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a),
+                    Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a), Int64(ovf_a),
                     grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
         ctx.synchronize()
         return 0

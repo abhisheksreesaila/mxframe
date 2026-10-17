@@ -574,6 +574,13 @@ def group_aggregate(table: pa.Table, keys, spec) -> pa.Table:
         if op == "sum" and pa.types.is_integer(a.type):
             out.append(array(np.ma.array(_int_group_sum(a, valid, g, n_groups), mask=cnt == 0), type=pa.int64()))
             continue
+        if op == "mean" and pa.types.is_integer(a.type):
+            # F-060: the integers are added exactly (int64, OverflowError past it), then divided: float64 sums lose digits
+            tot = _int_group_sum(a, valid, g, n_groups)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                res = tot.astype(np.float64) / cnt
+            out.append(array(np.ma.array(res, mask=cnt == 0), type=pa.float64()))
+            continue
         if op in ("min", "max") and (pa.types.is_integer(a.type) or pa.types.is_date(a.type) or pa.types.is_timestamp(a.type)):
             # exact: float64 rounds past 2^53 (F-093: a date / timestamp is its integer storage)
             own = a.type
