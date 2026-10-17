@@ -211,6 +211,37 @@ class _Flat:
         self.residuals = list(residuals)   # (predicate, {column name: (leaf, column)}): a Filter between joins
 
 
+def _one_leaf(src, edges):
+    """Key columns drawn from several leaves, as columns of one leaf, when the joins below equate them (TPC-H Q9
+    in SQL: ``ps_partkey = l_partkey`` after ``p_partkey = l_partkey`` keeps part's column, and ``l_suppkey``
+    is lineitem's): an inner join's key columns hold the same values, so either side's column will do (F-080).
+    None: no leaf has an equal column for every key."""
+    same, nodes = {}, set()                     # union-find over the (leaf, column) pairs the joins equate
+
+    def find(x):
+        while same.get(x, x) != x:
+            x = same[x]
+        return x
+    for a, b, ac, bc in edges:
+        for x, y in zip(ac, bc):
+            nodes |= {(a, x), (b, y)}
+            same[find((a, x))] = find((b, y))
+    for leaf in dict.fromkeys(l for l, _ in src):
+        out = []
+        for l, c in src:
+            if l == leaf:
+                out.append((l, c))
+                continue
+            root = find((l, c))
+            alt = [k for k in sorted(nodes) if k[0] == leaf and find(k) == root]
+            if not alt:
+                break
+            out.append(alt[0])
+        else:
+            return out
+    return None
+
+
 def _flatten(node) -> Optional[_Flat]:
     if isinstance(node, Filter) and isinstance(node.input, Join) and node.input.how == "inner":
         # a condition across leaves between two joins (TPC-H Q5: c_nationkey = s_nationkey): applied as soon
@@ -229,6 +260,8 @@ def _flatten(node) -> Optional[_Flat]:
             rsrc = [right.src[k] for k in node.right_on]
         except KeyError:
             return None
+        if len({s[0] for s in lsrc}) > 1:
+            lsrc = _one_leaf(lsrc, left.edges) or lsrc
         if len({s[0] for s in lsrc}) == 1 and len({s[0] for s in rsrc}) == 1:
             off = len(left.leaves)
             mapping = join_output_names(left.names, right.names, node.right_on)
@@ -1195,6 +1228,59 @@ def _star_setup(comp, fl, fact: int, get, want, leaf_need, coded=None) -> Option
                  via_probe=via_probe, post_res=post_res, fact=fact)
 
 
+_UNIQUE_MEMO: dict = {}      # table key -> (weakref to the table or None, {column: is it unique}); holds booleans only
+
+
+def _is_unique(t: pa.Table, c: str) -> bool:
+    """Is integer column ``c`` of ``t`` free of repeats? Remembered per table, never keeping the table alive
+    (F-056's bounded memory). A table read from a file is keyed by its source token (a re-read of the same
+    file hits); any other by its id, with a weakref whose callback drops the entry. The callback runs on
+    whatever thread frees the table, so it only does an atomic ``dict.pop``: no lock (F-107)."""
+    import weakref
+    from .io_parquet import table_source
+    from .np_arrow import to_numpy as _np_of, combine as _combine
+    token = table_source(t)
+    key = token if token is not None else id(t)
+    entry = _UNIQUE_MEMO.get(key)
+    if entry is None or (token is None and entry[0]() is not t):
+        if len(_UNIQUE_MEMO) >= 64:
+            _UNIQUE_MEMO.clear()
+        ref = None if token is not None else weakref.ref(t, lambda _r, k=key: _UNIQUE_MEMO.pop(k, None))
+        entry = _UNIQUE_MEMO[key] = (ref, {})
+    known = entry[1]
+    if c not in known:
+        a = _np_of(_combine(t.column(c)), zero_copy_only=False)
+        known[c] = len(np.unique(a)) == len(a)
+    return known[c]
+
+
+def _dependent_keys(fl, plan, fact: int) -> Dict[str, str]:
+    """Group columns that are plain strings of a partner table, mapped to a unique integer key of the same table
+    that is also a group column (Q10: ``GROUP BY c_custkey, c_name, c_address, c_phone, c_comment``): the key
+    fixes the strings, so the executor can group without them and take them by row afterwards (F-076). Proven
+    on the leaf's own table: a Filter above a scan only removes rows, so a unique column stays unique."""
+    from .np_arrow import to_numpy as _np_of, combine as _combine
+    by_leaf: Dict[int, list] = {}
+    for e in plan.group_by:
+        if e.op == "col" and e.args[0] in fl.src and fl.src[e.args[0]][0] != fact:
+            by_leaf.setdefault(fl.src[e.args[0]][0], []).append((e.args[0], fl.src[e.args[0]][1]))
+    fd: Dict[str, str] = {}
+    for leaf, items in by_leaf.items():
+        scan, _ = _scan_under_filters(fl.leaves[leaf])
+        if len(items) < 2 or scan is None:
+            continue
+        t = scan.table
+        text = [n for n, c in items if pa.types.is_string(t.column(c).type) or pa.types.is_large_string(t.column(c).type)]
+        for n, c in items:
+            col_ = t.column(c)
+            if n in text or col_.null_count or not (pa.types.is_integer(col_.type) and t.num_rows):
+                continue
+            if text and _is_unique(t, c):
+                fd.update({m: n for m in text})
+                break
+    return fd
+
+
 def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = False) -> Optional[pa.Table]:
     """``[Sort Limit] [HAVING] Aggregate([Filter]* (inner-join tree))`` as ONE native call (F-046a slice 3):
     the fact leaf's filter, the partner lookups, the conditions across partners (and filters above the join)
@@ -1245,7 +1331,8 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = Fal
             vcols[name] = ("fact", st.via_probe.get((leaf, c), c))
         else:
             vcols[name] = ("partner", lookup_of[st.group[leaf]], _star_name(leaf, c))
-    fj = native_exec.FusedJoin(st.scan, st.preds, st.lookups, vcols, above + [p for p, _ in st.post_res])
+    fj = native_exec.FusedJoin(st.scan, st.preds, st.lookups, vcols, above + [p for p, _ in st.post_res],
+                               _dependent_keys(fl, plan, fact))
     if _TRACE:
         _trace(f"fused join + aggregate: scan leaf {fact} ({st.scan.table.num_rows} rows) with partners "
                f"{[(c, lk.build.num_rows) for (c, _), lk in zip(st.roots, st.lookups)]}")
@@ -1255,6 +1342,58 @@ def fused_join_aggregate(comp, plan, having_pred, post_ops, distinct: bool = Fal
     elif widened and st:                           # partners holding codes the old path cannot read
         comp._star_stash = (node, frozenset(needed), setup, None)
     return out
+
+
+def left_join_counts(comp, plan, post_ops) -> Optional[pa.Table]:
+    """``SELECT k, COUNT(r.c) FROM l LEFT JOIN r ON l.k = r.k GROUP BY k`` (TPC-H Q13's inner query) without
+    joined rows: the native hash join gives each left row its matches, the counts are a ``bincount`` of those
+    pairs, and every left row is its own group when its key is unique (checked on the encoded keys). The
+    unmatched left rows count 0, with no NULL anywhere, so the aggregate above runs in the native executor
+    (F-080). None: another shape (more aggregates, a non-unique or NULL key, the GPU session, a nullable
+    counted column), and the old path answers."""
+    if comp._session_device == "gpu" or getattr(comp, "_device_arg", None) != "cpu":
+        return None
+    node = plan.input
+    if not (isinstance(node, Join) and node.how == "left") or not plan.aggs or not plan.group_by:
+        return None
+    lcols, rcols = plan_columns(node.left), plan_columns(node.right)
+    if lcols is None or rcols is None:
+        return None
+    mapping = join_output_names(lcols, rcols, node.right_on)
+    rout = {out: orig for orig, out in mapping}
+    gnames = [e.args[0] for e in plan.group_by]
+    if (any(e.op != "col" or e._alias not in (None, e.args[0]) for e in plan.group_by)
+            or not set(node.left_on) <= set(gnames) or not set(gnames) <= set(lcols)):
+        return None
+    counted = []
+    for a in plan.aggs:
+        if a.op != "count" or a.args[0].op != "col" or a.args[0].args[0] not in rout:
+            return None
+        counted.append(rout[a.args[0].args[0]])
+    # what the leaves' own scans already tell (a Filter only removes rows), before anything is materialized
+    for leaf, cols_ in ((node.left, list(node.left_on)), (node.right, counted + list(node.right_on))):
+        sc, _ = _scan_under_filters(leaf)
+        if sc is not None and (sc.table.num_rows == 0 or any(sc.table.column(c).null_count for c in cols_
+                                                              if c in sc.table.column_names)):
+            return None
+    lt = leaf_table(comp, node.left, set(gnames) | set(node.left_on))
+    if lt.num_rows == 0 or any(lt.column(c).null_count for c in node.left_on):
+        return None
+    lkey = encode_keys([lt.column(c) for c in node.left_on], [lt.column(c) for c in node.left_on],
+                       comp._common_key_type)[0]
+    if len(np.unique(lkey)) != len(lkey):
+        return None                                  # several left rows per key: the groups would merge them
+    rt = leaf_table(comp, node.right, set(counted) | set(node.right_on))
+    if rt.num_rows == 0 or any(rt.column(c).null_count for c in counted + list(node.right_on)):
+        return None
+    lk, rk = encode_keys([lt.column(c) for c in node.left_on], [rt.column(c) for c in node.right_on],
+                         comp._common_key_type)
+    li, ri = comp._hash_join_left_mojo_cpu(lk, rk)
+    per_row = np.bincount(li[ri >= 0], minlength=lt.num_rows).astype(np.int64)
+    from .np_arrow import array as _npa
+    cols = [lt.column(c) for c in gnames] + [_npa(per_row)] * len(counted)
+    out = pa.Table.from_arrays(cols, names=gnames + [a._alias or f"agg_{i}" for i, a in enumerate(plan.aggs)])
+    return comp._apply_post_ops_custom(out, post_ops) if post_ops else out
 
 
 def _join_cached(comp, node, needed) -> bool:

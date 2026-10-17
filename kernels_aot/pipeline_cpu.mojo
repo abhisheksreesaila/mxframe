@@ -101,6 +101,8 @@ comptime OP_ISNULL = 41     # the column's validity bit is clear (F-097)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
+comptime OP_AGG_ISUM = 53   # sum of an integer-valued input, accumulated in int64 (F-060); the slot holds int64 bits
+comptime E_OVERFLOW = -21   # an int64 sum passed its range (the caller's checked path answers)
 
 comptime INF = Float64(1.7976931348623157e308) * 10.0
 
@@ -108,6 +110,20 @@ comptime INF = Float64(1.7976931348623157e308) * 10.0
 @always_inline
 def _fp(addr: Int) -> FP:
     return FP(unsafe_from_address=addr)
+
+@always_inline
+def _ibits(p: FP) -> LP:
+    """An integer sum's slots (OP_AGG_ISUM) are float64 words that hold int64 values: same memory, read as int64."""
+    return LP(unsafe_from_address=Int(p))
+
+@always_inline
+def _iadd(a: Int64, b: Int64, ovf: LP) -> Int64:
+    """a + b in int64 (wrapping); sets *ovf when the true sum does not fit. A partial total that passes int64 and
+    comes back (rows of both signs) flags too: the caller then adds exactly in the checked path."""
+    var s = a + b
+    if ((a ^ s) & (b ^ s)) < 0:
+        ovf[0] = 1
+    return s
 
 @always_inline
 def _ip(addr: Int) -> IP:
@@ -587,9 +603,11 @@ struct Prog(Copyable, Movable):
     var n_aggs: Int
     var pred_reg: Int
     var nl: Int      # partial lanes per (agg, group)
+    var ovf: LP      # set to 1 by any integer sum (OP_AGG_ISUM) that passes int64; the caller's flag cell
 
     def __init__(out self, code: IP, consts: FP, set_bytes: BP, set_meta: LP,
-                 tbl: LP, n_chunks: Int, dtypes: IP, gids: IP, n_groups: Int, has_gids: Bool):
+                 tbl: LP, n_chunks: Int, dtypes: IP, gids: IP, n_groups: Int, has_gids: Bool, ovf: LP):
+        self.ovf = ovf
         self.code = code
         self.consts = consts
         self.set_bytes = set_bytes
@@ -699,6 +717,25 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
             var kind = Int(ins[0])
             var r = regs + Int(ins[2]) * VEC
             var acc = pv + a * NL
+            if kind == OP_AGG_ISUM:
+                # exact: the inputs are whole numbers within +-2^53, added as int64 in the SIMD lanes
+                var iacc = _ibits(acc)
+                var iv = iacc.load[width=W]()
+                var ov = SIMD[DType.int64, W](0)
+                var k = 0
+                while k + W <= n:
+                    var x = r.load[width=W](k).cast[DType.int64]()
+                    var t = iv + x
+                    ov |= (iv ^ t) & (x ^ t)
+                    iv = t
+                    k += W
+                iacc.store(iv)
+                if ov.reduce_or() < 0:
+                    p.ovf[0] = 1
+                while k < n:
+                    iacc[0] = _iadd(iacc[0], Int64(r[k]), p.ovf)
+                    k += 1
+                continue
             var accv = acc.load[width=W]()
             var j = 0
             while j + W <= n:
@@ -736,6 +773,13 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 var g = Int(gp[j])
                 if g >= 0 and g < G:
                     base[g * NL + (j & lm)] += r[j]
+        elif kind == OP_AGG_ISUM:
+            var ib = _ibits(base)
+            for j in range(n):
+                var g = Int(gp[j])
+                if g >= 0 and g < G:
+                    var q = ib + (g * NL + (j & lm))
+                    q[0] = _iadd(q[0], Int64(r[j]), p.ovf)
         elif kind == OP_AGG_MIN:
             for j in range(n):
                 var g = Int(gp[j])
@@ -807,6 +851,10 @@ def _flush_slot(p: Prog, cv: FP, cl: LP, s: Int):
         var x = cv[a * SC + s]
         if kind == OP_AGG_SUM:
             _ = Atomic[Scalar[DType.float64]].fetch_add(ov + a * G + g, x)
+        elif kind == OP_AGG_ISUM:
+            var xi = _ibits(cv + (a * SC + s))[0]
+            var old = Atomic[Scalar[DType.int64]].fetch_add(_ibits(ov + a * G + g), xi)
+            _ = _iadd(old, xi, p.ovf)
         elif kind == OP_AGG_MIN:
             _ = Atomic[Scalar[DType.float64]].min(ov + a * G + g, x)
         else:
@@ -844,6 +892,10 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
                 var x = regs[Int(ins[2]) * VEC + j]
                 if kind == OP_AGG_SUM:
                     _ = Atomic[Scalar[DType.float64]].fetch_add(ov + a * G + g, x)
+                elif kind == OP_AGG_ISUM:
+                    var xi = Int64(x)
+                    var old = Atomic[Scalar[DType.int64]].fetch_add(_ibits(ov + a * G + g), xi)
+                    _ = _iadd(old, xi, p.ovf)
                 elif kind == OP_AGG_MIN:
                     _ = Atomic[Scalar[DType.float64]].min(ov + a * G + g, x)
                 else:
@@ -861,7 +913,11 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
             cl[2 + SC + s] = 1
             for a in range(A):
                 var ins = p.instr(p.n_pro + p.n_pred + p.n_body, a)
-                cv[a * SC + s] = regs[Int(ins[2]) * VEC + j]
+                var x0 = regs[Int(ins[2]) * VEC + j]
+                if Int(ins[0]) == OP_AGG_ISUM:
+                    _ibits(cv + (a * SC + s))[0] = Int64(x0)
+                else:
+                    cv[a * SC + s] = x0
             continue
         st[0] += 1
         cl[2 + SC + s] += 1
@@ -872,6 +928,9 @@ def _accumulate_shared(p: Prog, regs: FP, gp: IP, n: Int, cv: FP, cl: LP):
             var q = cv + (a * SC + s)
             if kind == OP_AGG_SUM:
                 q[0] += x
+            elif kind == OP_AGG_ISUM:
+                var iq = _ibits(q)
+                iq[0] = _iadd(iq[0], Int64(x), p.ovf)
             elif kind == OP_AGG_MIN:
                 q[0] = min(q[0], x)
             else:
@@ -1007,6 +1066,26 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
     front: FR, ws_bytes: Int, repro: Bool,
 ) -> Int:
+    """`_pipeline_run`, then E_OVERFLOW when an integer sum (OP_AGG_ISUM) passed int64 anywhere on the way:
+    the totals are then wrong, and the caller's checked path (Arrow) answers or raises."""
+    var ovf = unsafe_alloc[Int64](1)
+    ovf[0] = 0
+    var rc = _pipeline_run[keyed=keyed, fused=fused](
+        code_a, consts_a, set_bytes_a, set_meta_a, tbl_a, n_chunks, dtypes_a, gids_a, n_groups, start, end,
+        out_vals_a, out_cnt_a, threads, encode, front, ws_bytes, repro, ovf)
+    if rc == 0 and ovf[0] != 0:
+        rc = E_OVERFLOW
+    ovf.free()
+    return rc
+
+
+def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
+                  FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
+    front: FR, ws_bytes: Int, repro: Bool, ovf: LP,
+) -> Int:
     """The interpreter over rows [start, end). `keyed`: no group-id array; the group ids of the rows
     that pass the predicate are made per VEC block by `encode` (see _process_range), so keys of
     filtered-out rows are never read and no n_rows-sized array is written. -5 when `encode` fails."""
@@ -1017,7 +1096,7 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     if (not has_gids) and n_groups != 1:
         return -2
     var p = Prog(code, _fp(consts_a), _bp(set_bytes_a), _lp(set_meta_a), _lp(tbl_a),
-                 n_chunks, _ip(dtypes_a), _ip(gids_a), n_groups, has_gids)
+                 n_chunks, _ip(dtypes_a), _ip(gids_a), n_groups, has_gids, ovf)
     if p.n_regs > MAX_REGS:
         return -3
     if n_chunks < 1 and end > start:
@@ -1149,6 +1228,16 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             var g1 = min(g0 + LEGACY_MERGE_GROUPS, G)
             for a in range(A):
                 var kind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+                if kind == OP_AGG_ISUM:
+                    var iout = _ibits(out_vals)
+                    for g in range(g0, g1):
+                        var iacc = iout[a * G + g]
+                        for t in range(nthreads):
+                            var iq = _ibits(pv_all + t * pv_stride + (a * G + g) * NL)
+                            for l in range(NL):
+                                iacc = _iadd(iacc, iq[l], p.ovf)
+                        iout[a * G + g] = iacc
+                    continue
                 for g in range(g0, g1):
                     var acc = out_vals[a * G + g]
                     for t in range(nthreads):
@@ -1321,6 +1410,11 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                         if kind == OP_AGG_SUM:
                             for r in range(r0, r1):
                                 sb[Int(gids[r]) - g0] += q[r]
+                        elif kind == OP_AGG_ISUM:
+                            var isb = _ibits(sb)
+                            for r in range(r0, r1):
+                                var at = Int(gids[r]) - g0
+                                isb[at] = _iadd(isb[at], Int64(q[r]), p.ovf)
                         elif kind == OP_AGG_MIN:
                             for r in range(r0, r1):
                                 var t = o + (Int(gids[r]) - g0)
@@ -1334,13 +1428,21 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                         out_cnt[g0 + g] += Int64(cnt[g])
                         cnt[g] = 0
                     for a in range(A):
-                        if Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0]) == OP_AGG_SUM:
+                        var akind = Int(p.instr(p.n_pro + p.n_pred + p.n_body, a)[0])
+                        if akind == OP_AGG_SUM:
                             var o = out_vals + a * G + g0
                             var sb = sub + a * width
                             for u in range(nt):
                                 var g = Int(touched[u])
                                 o[g] += sb[g]
                                 sb[g] = 0.0
+                        elif akind == OP_AGG_ISUM:
+                            var io = _ibits(out_vals + a * G + g0)
+                            var isb = _ibits(sub + a * width)
+                            for u in range(nt):
+                                var g = Int(touched[u])
+                                io[g] = _iadd(io[g], isb[g], p.ovf)
+                                isb[g] = 0
             sub.free()
             cnt.free()
             touched.free()
@@ -1410,6 +1512,15 @@ def _pipeline[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             var o = out_vals + a * G
             for j in range(Int(ctl[1])):
                 var q = pv_all + j * pv_stride + a * G * NL
+                if kind == OP_AGG_ISUM:
+                    var iq = _ibits(q)
+                    var io = _ibits(o)
+                    for g in range(g0, g1):
+                        var xi = iq[g * NL]
+                        for l in range(1, NL):
+                            xi = _iadd(xi, iq[g * NL + l], p.ovf)
+                        io[g] = _iadd(io[g], xi, p.ovf)
+                    continue
                 for g in range(g0, g1):
                     var x = q[g * NL]
                     for l in range(1, NL):

@@ -37,7 +37,8 @@ j-th selected row of a block (the same block contract as `_encode_sel`).
 Result words (`res`, caller-allocated, 3 + n_keys): 0 G, 1 vals* (float64[n_aggs * max(G, 1)]),
 2 cnt* (int64[max(G, 1)]), 3 + k key words* (int64[max(G, 1)]); all from `unsafe_alloc`.
 Return: 0 ok, -1 bad program, -3 too many registers, -5 `keyw` failed (invalid dictionary code),
--6 the flushed records passed `rec_limit` bytes (0: no limit; the caller's other path answers).
+-6 the flushed records passed `rec_limit` bytes (0: no limit; the caller's other path answers),
+-7 an integer sum (OP_AGG_ISUM) passed int64 (the caller's checked path answers).
 """
 
 from std.memory.alloc import unsafe_alloc
@@ -46,7 +47,7 @@ from _fpenv import par, par_n
 from std.atomic import Atomic
 from std.ffi import external_call
 
-from pipeline_cpu import Prog, _run_ops, _process_range, _worker_state, _no_front, VEC, MORSEL, MAX_REGS
+from pipeline_cpu import Prog, _run_ops, _process_range, _worker_state, _no_front, _ibits, _iadd, VEC, MORSEL, MAX_REGS
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -56,6 +57,7 @@ comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
+comptime OP_AGG_ISUM = 53
 comptime INF = Float64(1.7976931348623157e308) * 10.0
 
 comptime DEF_CAP = 8192          # default mode: groups a worker's local table holds before it flushes
@@ -220,6 +222,15 @@ def _flush(p: Prog, hs: LP, nk: Int, cap: Int, lanes: Int, nparts: Int, pshift: 
             elif kind == OP_AGG_MAX:
                 init = -INF
             var q = pv + (a * cap + g) * lanes
+            if kind == OP_AGG_ISUM:                       # an int64 total: the same words, read as int64
+                var iq = _ibits(q)
+                var iacc = iq[0]
+                iq[0] = 0
+                for l in range(1, lanes):
+                    iacc = _iadd(iacc, iq[l], p.ovf)
+                    iq[l] = 0
+                _lp(rec + (3 + a) * 8)[0] = iacc
+                continue
             var acc = q[0]
             q[0] = init
             for l in range(1, lanes):
@@ -252,8 +263,10 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         return -1
     var cap = (MORSEL + VEC) if repro else DEF_CAP
     var lanes = 1 if repro else DEF_LANES
+    var ovf = unsafe_alloc[Int64](1)                  # set by an integer sum that passes int64 (pipeline_cpu._iadd)
+    ovf[0] = 0
     var p = Prog(code, _fp(consts_a), BP(unsafe_from_address=set_bytes_a), _lp(set_meta_a), _lp(tbl_a),
-                 n_chunks, _ip(dtypes_a), _ip(0), cap, True)
+                 n_chunks, _ip(dtypes_a), _ip(0), cap, True, ovf)
     if p.n_regs > MAX_REGS:
         return -3
     p.nl = lanes
@@ -472,7 +485,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                                 ecnt[e] = 0
                                 for a in range(A):
                                     var kind = _kind(p, a)
-                                    evals[a * nrec + e] = 0.0 if kind == OP_AGG_SUM else (
+                                    evals[a * nrec + e] = 0.0 if (kind == OP_AGG_SUM or kind == OP_AGG_ISUM) else (
                                         INF if kind == OP_AGG_MIN else -INF)
                                 break
                             if ehash[e] == h:
@@ -491,6 +504,9 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                             var q = evals + (a * nrec + e)
                             if kind == OP_AGG_SUM:
                                 q[0] += x
+                            elif kind == OP_AGG_ISUM:
+                                var iq = _ibits(q)
+                                iq[0] = _iadd(iq[0], _lp(rec + (3 + a) * 8)[0], p.ovf)
                             elif kind == OP_AGG_MIN:
                                 q[0] = min(q[0], x)
                             else:
@@ -533,6 +549,9 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         else:
             _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
             par(merge_part, nm)
+
+    if rc == 0 and ovf[0] != 0:
+        rc = -7                                           # an integer sum passed int64: the caller's checked path answers
 
     # the partitions' groups side by side
     var total = 0
@@ -615,4 +634,5 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
     counter.free()
     failed.free()
     rbytes.free()
+    ovf.free()
     return rc

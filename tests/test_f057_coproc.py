@@ -532,7 +532,7 @@ def test_a_non_resident_auto_decision_reads_no_column(monkeypatch):
     assert "cpu path: cpu+gpu split" in text and scans == []
     # the full check (background upload, the run) does scan
     assert not isinstance(pe.split_check(lf.plan), str) and "int64" in scans and "arrow" in scans
-    assert "minmax" in scans and "col_bound" in scans      # the full check (and the run) do size the integer sum
+    assert "minmax" not in scans and "col_bound" not in scans      # F-060: an integer sum is not sized (no pass over its column)
 
 
 @pytest.mark.parametrize("kind", ["multi-chunk dictionary", "plain string"])

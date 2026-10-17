@@ -228,10 +228,14 @@ def test_integer_sums_that_stay_within_2_53_run_natively_and_equal_duckdb(monkey
         [(g, float(si), float(sb)) for g, si, sb in want]
 
 
-def test_a_sum_small_enough_for_float64_still_compiles():
+def test_integer_sums_compile_whatever_rows_times_the_largest_value_is():
+    """F-060: the kernels add integers in int64, so a sum no longer declines when rows x max|value| passes 2^53
+    (it did, because the float64 accumulator lost digits); its slot is an int64 one in both cases."""
     t = _sum_table()
-    assert compile_pipeline([], [col("i").sum()], t) is not None          # 200k * 100
-    assert compile_pipeline([], [col("a").sum()], t) is None              # 200k * 2^40
+    for c in ("i", "a"):                                                   # 200k * 100, and 200k * 2^40
+        prog = compile_pipeline([], [col(c).sum()], t)
+        assert prog is not None and prog.slot_kinds == ["isum"] and prog.outputs[0][1] == "isum"
+    assert compile_pipeline([], [col("v").sum()], t).slot_kinds == ["sum"]   # a float sum stays a float one
 
 
 @pytest.mark.parametrize("column", ["m", "nul"])
