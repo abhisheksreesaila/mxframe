@@ -372,3 +372,176 @@ def test_peak_memory_of_an_external_sort_is_bounded_by_the_budget(messy, tmp_pat
     assert res[MESSY_HOST]["arrow_peak"] < 4 << 20, res
     assert res["64G"]["arrow_peak"] > 8 << 20, res
     assert pq.read_table(str(tmp_path / f"{MESSY_HOST}.parquet")).column("id").equals(pq.read_table(str(tmp_path / "64G.parquet")).column("id"))
+
+
+# --- count(distinct x) over the budget -----------------------------------------------------------------------
+
+D = 400_000
+KEYS = 3_000
+
+
+@pytest.fixture(scope="module")
+def dist(tmp_path_factory):
+    """3,000 groups with up to 300 distinct x each (about 340k distinct (g, x) pairs, 5 MB of state: over the budget),
+    NULLs in the group key and in x, a float column with NaN and both zeros, strings."""
+    d = tmp_path_factory.mktemp("f056s3c_dist")
+    rng = np.random.default_rng(5)
+    idx = np.arange(D)
+    x = rng.integers(0, 300, D)
+    fx = x.astype(np.float64) / 4
+    fx[idx % 211 == 0] = np.nan
+    nan_neg = np.frombuffer(np.uint64(0xFFF8000000000001).tobytes(), dtype=np.float64)[0]
+    fx[idx % 223 == 0] = nan_neg
+    fx[idx % 227 == 0] = -0.0
+    fx[idx % 229 == 0] = 0.0
+    g = rng.integers(0, KEYS, D).astype(np.int64)
+    t = pa.table({
+        "g": pa.array(g, mask=(idx % 97 == 0)),
+        "k": pa.array(g % 50, mask=(idx % 97 == 0)),                      # 50 groups with many x each
+        "x": pa.array(x.astype(np.int64), mask=(idx % 13 == 0)),
+        "fx": pa.array(fx, mask=(idx % 191 == 0)),
+        "sx": pa.array(np.array([f"v{i:03d}" for i in range(300)])[x], mask=(idx % 17 == 0)),
+        "v": rng.random(D),
+        "q": rng.integers(1, 1000, D).astype(np.int64),
+    })
+    path = str(d / "dist.parquet")
+    pq.write_table(t, path, row_group_size=20_000)
+    return path
+
+
+def duck_d(query, path):
+    con = duckdb.connect()
+    con.execute(f"CREATE VIEW dist AS SELECT * FROM read_parquet('{path}')")
+    return con.sql(query).arrow().read_all()
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_count_distinct_per_group_over_the_budget_equals_duckdb(dist, device, _env):
+    lf = mx.sql("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist=scan_parquet(dist))
+    got = run(lf, device)
+    p = prov(lf)
+    assert p["path"] == "streamed" and p["streamed"]["spill"]["partitions"] >= 2
+    want = duck_d("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist)
+    assert got.num_rows == want.num_rows == KEYS + 1                       # the NULL group is one of them
+    same(got, want, ("g",))
+    assert spill_leftovers(_env) == []
+
+
+def test_count_distinct_ignores_nulls_and_counts_a_group_of_only_nulls_as_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("MXFRAME_HOST_MEM_BUDGET", "1M")
+    n = 120_000
+    idx = np.arange(n)
+    g = (idx % 4_000).astype(np.int64)
+    x = pa.array((idx * 7 % 5_000).astype(np.int64), mask=(g % 10 == 0) | (idx % 11 == 0))      # groups 0, 10, ... have only NULLs
+    path = str(tmp_path / "n.parquet")
+    pq.write_table(pa.table({"g": g, "x": x}), path, row_group_size=4_000)
+    lf = mx.sql("SELECT g, count(DISTINCT x) AS nd FROM n GROUP BY g", n=scan_parquet(path))
+    got = run(lf, "cpu")
+    assert prov(lf)["streamed"]["spill"]["partitions"] >= 2
+    con = duckdb.connect()
+    want = con.execute(f"SELECT g, count(DISTINCT x) AS nd FROM read_parquet('{path}') GROUP BY g").arrow().read_all()
+    same(got, want, ("g",))
+    zeros = [r["g"] for r in got.to_pylist() if r["nd"] == 0]
+    assert 0 in zeros and 10 in zeros and len(zeros) == 400
+
+
+def test_a_global_count_distinct_over_the_budget(dist):
+    lf = mx.sql("SELECT count(DISTINCT g) AS nd FROM dist", dist=scan_parquet(dist))
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed"
+    same(got, duck_d("SELECT count(DISTINCT g) AS nd FROM dist", dist))
+
+
+def test_count_distinct_with_other_aggregates_equals_duckdb(dist, _env):
+    q = ("SELECT g, count(DISTINCT x) AS nd, sum(v) AS sv, sum(q) AS sq, avg(q) AS aq, min(v) AS lo, max(q) AS hi, "
+         "count(*) AS n FROM dist GROUP BY g")
+    lf = mx.sql(q, dist=scan_parquet(dist))
+    got = run(lf, "cpu")
+    p = prov(lf)
+    assert p["path"] == "streamed" and p["streamed"]["spill"]["partitions"] >= 2 and p["streamed"].get("stages") == 2
+    same(got, duck_d(q, dist), ("g",))
+    assert spill_leftovers(_env) == []
+
+
+def test_count_distinct_with_having_order_by_and_limit(dist):
+    q = ("SELECT g, count(DISTINCT x) AS nd, sum(q) AS sq FROM dist GROUP BY g HAVING count(DISTINCT x) > 150 "
+         "ORDER BY nd DESC, g LIMIT 25")
+    lf = mx.sql(q, dist=scan_parquet(dist))
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed"
+    same(got, duck_d(q, dist))
+
+
+def test_the_dataframe_form_select_distinct_groupby_count_equals_duckdb(dist):
+    lf = scan_parquet(dist).select("g", "x").distinct().groupby("g").agg(col("x").count().alias("nd"))
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed" and prov(lf)["streamed"]["spill"]["partitions"] >= 2
+    same(got, duck_d("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist), ("g",))
+
+
+@pytest.mark.parametrize("key", ["k", "g"])
+@pytest.mark.parametrize("column", ["fx", "sx"])
+def test_count_distinct_of_floats_with_nan_and_signed_zero_and_of_strings(dist, column, key):
+    """NaN of any bit pattern is one value, -0.0 and 0.0 are one value, NULL is none; with 50 groups the pairs fit and
+    are merged, with 3,000 they are spilled and deduplicated one hash partition at a time."""
+    q = f"SELECT {key}, count(DISTINCT {column}) AS nd FROM dist GROUP BY {key}"
+    lf = mx.sql(q, dist=scan_parquet(dist))
+    got = run(lf, "cpu")
+    assert prov(lf)["path"] == "streamed"
+    assert ("spill" in prov(lf)["streamed"]) == (key == "g")
+    same(got, duck_d(q, dist), (key,))
+
+
+def test_a_sink_of_count_distinct_writes_the_groups(dist, tmp_path):
+    lf = mx.sql("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist=scan_parquet(dist))
+    out = str(tmp_path / "cd.parquet")
+    assert sink(lf, out) == KEYS + 1
+    same(pq.read_table(out), duck_d("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist), ("g",))
+
+
+CD_PEAK = textwrap.dedent("""
+    import json, sys
+    import pyarrow as pa
+    import mxframe as mx
+    from mxframe.io_parquet import scan_parquet
+
+    lf = mx.sql("SELECT g, count(DISTINCT x) AS nd FROM dist GROUP BY g", dist=scan_parquet(sys.argv[1]))
+    lf.compute(device="cpu")
+    pa.default_memory_pool().release_unused()
+    n = lf.compute(device="cpu").num_rows
+    print(json.dumps({"rows": n, "path": lf.last_compile_provenance["path"],
+                      "arrow_peak": pa.default_memory_pool().max_memory()}))
+""")
+
+
+def test_peak_memory_of_a_spilled_count_distinct_is_bounded_by_the_budget(dist, _env):
+    import conftest
+    res = {}
+    for budget in (HOST, "64G"):
+        env = dict(os.environ, MXFRAME_HOST_MEM_BUDGET=budget, MXFRAME_SPILL_DIR=str(_env),
+                   PYTHONPATH=os.pathsep.join([str(conftest._shim)] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])))
+        done = subprocess.run([sys.executable, "-c", CD_PEAK, dist], env=env, capture_output=True, text=True, check=True, timeout=600)
+        res[budget] = json.loads(done.stdout.strip().splitlines()[-1])
+    assert res[HOST]["path"] == "streamed" and res["64G"]["path"] != "streamed"
+    assert res[HOST]["rows"] == res["64G"]["rows"] == KEYS + 1
+    assert res[HOST]["arrow_peak"] < 6 << 20, res
+    assert res["64G"]["arrow_peak"] > 8 << 20, res
+    assert spill_leftovers(_env) == []
+
+
+# --- the other streams, into a sink -------------------------------------------------------------------------------
+
+def test_a_grace_join_result_bigger_than_memory_is_written_pair_by_pair(big, tmp_path, _env):
+    left = scan_parquet(big).select("id", "g", "v")
+    right = scan_parquet(big).filter(col("q") > 400).select("id", "q")
+    lf = left.join(right, on="id")
+    with pytest.raises(MemoryError, match="sink_parquet"):
+        run(lf, "cpu")
+    out = str(tmp_path / "join.parquet")
+    n = sink(lf, out)
+    assert "grace" in prov(lf)["streamed"]
+    want = duck("SELECT a.id, a.g, a.v, b.q FROM big a JOIN (SELECT id, q FROM big WHERE q > 400) b ON a.id = b.id", big)
+    assert n == want.num_rows
+    got = pq.read_table(out)
+    same(got.sort_by("id"), want.sort_by("id"))
+    assert spill_leftovers(_env) == []

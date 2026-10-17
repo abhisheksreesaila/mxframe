@@ -244,6 +244,7 @@ class Plan:
     resident: int = 0                   # bytes of the dimension tables kept for all batches
     prune: bool = False                 # rows: select only the columns the plan reads (a bare Filter over the file)
     grace: Optional[Join] = None        # step 3b: the join of two big sides, run as a Grace hash join (grace.py)
+    plan: LogicalPlan = None            # the plan to run: the one given, or its count-distinct rewrite (step 3c)
 
 
 def _grace_at(chain, agg_at, leaves, feet, big, budget: int) -> Optional[int]:
@@ -265,9 +266,51 @@ def _grace_at(chain, agg_at, leaves, feet, big, budget: int) -> Optional[int]:
     return None
 
 
+def _distinct_to_aggregate(plan):
+    """The plan with every `Aggregate(Distinct(X), keys, aggs)` rewritten as `Aggregate(Aggregate(X, every column of X,
+    [count(1)]), keys, aggs)`, or None when there is none (F-056 step 3c: count(distinct x) per group).
+
+    Removing duplicate rows is grouping by all their columns, which the engine does with the same rules (one group for
+    every NaN, -0.0 with 0.0, one for NULL), so the answer is the same; and a group-by is what streams: its partials
+    merge, and when the (keys, x) pairs are more than fit they are hash-partitioned to disk, each partition
+    deduplicated on its own."""
+    changed = [False]
+
+    def walk(n):
+        if isinstance(n, Join):
+            return dataclasses.replace(n, left=walk(n.left), right=walk(n.right))
+        if getattr(n, "input", None) is None:
+            return n
+        n = dataclasses.replace(n, input=walk(n.input))
+        if isinstance(n, Aggregate) and isinstance(n.input, Distinct) and not n.input.subset:
+            names = (LazyFrame(n.input.input).schema or pa.schema([])).names
+            if names:
+                changed[0] = True
+                inner = Aggregate(n.input.input, [col(c) for c in names], [Expr("count", Expr("lit", 1)).alias("__dn")])
+                return dataclasses.replace(n, input=inner)
+        return n
+    out = walk(plan)
+    return out if changed[0] else None
+
+
 def analyse(plan, budget: int, device: str, reproducible: bool):
     """A `Plan` if the plan should and can stream, None if it fits in memory, else the reason it cannot
-    (a string)."""
+    (a string). A plan with a Distinct below an Aggregate that declines for it is tried again as the group-by it
+    stands for (`_distinct_to_aggregate`); the `Plan` then names the rewritten plan to run."""
+    got = _analyse(plan, budget, device, reproducible)
+    if isinstance(got, Plan):
+        got.plan = plan
+    elif isinstance(got, str) and "Distinct" in got:
+        alt = _distinct_to_aggregate(plan)
+        if alt is not None:
+            again = _analyse(alt, budget, device, reproducible)
+            if isinstance(again, Plan):
+                again.plan = alt
+                return again
+    return got
+
+
+def _analyse(plan, budget: int, device: str, reproducible: bool):
     from .io_parquet import resolve_plan
     resolved = resolve_plan(plan, read=False)
     leaves, rleaves = _leaves(plan), _leaves(resolved)
@@ -829,6 +872,8 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
     got = analyse(plan, budget, device, repro)
     if got is None:
         return None
+    if isinstance(got, Plan):
+        plan = got.plan
     if isinstance(got, str):
         warnings.warn(f"mxframe: this query's working set does not fit in memory (budget {fmt_bytes(budget)}); "
                       f"not streamed: {got}. Running it in memory, which may run out of memory.",
@@ -868,27 +913,47 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
                           f"{n_in}, {part.num_rows} {'partial ' if spec else ''}rows")
                 if sink is not None and sink.full:
                     break
-            if spec is not None and not state.spilled:
-                merged = state.result()                              # the usual case: the groups fit
-                above = _replace(plan, spec.agg, Scan(merged))
-                table = merged
-            else:
-                if spec is not None:                                 # spilled groups: one partition at a time
-                    sink = _sink_for(plan, got.top, free, free // WORKING_FACTOR, budget, _out.get(), root,
-                                     lambda: got.resident)
-                    rowwise = got.top is not spec.agg
-                    for piece in state.pieces():
-                        out = state.format(piece)
-                        if rowwise:
-                            out = LazyFrame(_replace(got.top, spec.agg, Scan(out))).compute(
-                                "cpu", optimize=False, validate=False)
-                        sink.add(out)
-                        if sink.full:
-                            break
-                table, above = sink.finish(plan, got.top)
-                rows_info = {"kind": sink.kind, "batches_run": batches_run}
-                if sink.ext is not None:
-                    rows_info["sort"] = dict(sink.ext.stats, rows=sink.ext.rows)
+            stage_spec, stage_state, stage_top, stages = spec, state, got.top, 1
+            with contextlib.ExitStack() as probes:                   # a later stage's SumProbe stays open until its result is read
+                while True:
+                    if stage_spec is not None and not stage_state.spilled:
+                        merged = stage_state.result()                # the usual case: the groups fit
+                        above = _replace(plan, stage_spec.agg, Scan(merged))
+                        table = merged
+                        break
+                    if stage_spec is not None:                       # spilled groups: one partition at a time
+                        rowwise = stage_top is not stage_spec.agg
+                        nxt = _next_stage(plan, stage_top)
+                        if nxt is not None:                          # count(distinct x): another group-by over the groups
+                            spec2, top2 = nxt
+                            probe2 = probes.enter_context(sum_probe(names=spec2.int_sums))
+                            state2 = _State(spec2, budget, probe2, root, held=lambda: got.resident)
+                            for piece in stage_state.pieces():
+                                out = stage_state.format(piece)
+                                if rowwise:
+                                    out = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(out))).compute(
+                                        "cpu", optimize=False, validate=False)
+                                probe2.begin()
+                                state2.add(LazyFrame(dataclasses.replace(spec2.partial, input=Scan(out))).compute(
+                                    "cpu", optimize=False, validate=False))
+                                probe2.end()
+                            stage_spec, stage_state, stage_top, stages = spec2, state2, top2, stages + 1
+                            continue
+                        sink = _sink_for(plan, stage_top, free, free // WORKING_FACTOR, budget, _out.get(), root,
+                                         lambda: got.resident)
+                        for piece in stage_state.pieces():
+                            out = stage_state.format(piece)
+                            if rowwise:
+                                out = LazyFrame(_replace(stage_top, stage_spec.agg, Scan(out))).compute(
+                                    "cpu", optimize=False, validate=False)
+                            sink.add(out)
+                            if sink.full:
+                                break
+                    table, above = sink.finish(plan, stage_top)
+                    rows_info = {"kind": sink.kind, "batches_run": batches_run}
+                    if sink.ext is not None:
+                        rows_info["sort"] = dict(sink.ext.stats, rows=sink.ext.rows)
+                    break
     finally:
         _active.reset(token)
         root.close()
@@ -907,12 +972,36 @@ def try_stream(lf, plan, device: str, *, strict: bool, prefer, placement, gpu_fr
         info["spill"] = {"partitions": root.partitions, "bytes": root.bytes, "depth": root.depth}
     if rows_info is not None and (spec is None or "sort" in rows_info):
         info["rows"] = rows_info
+    if stages > 1:
+        info["stages"] = stages
     if got.slice_rows:
         info["slices"] = {"row_groups": len(got.slice_rows), "rows_per_slice": min(got.slice_rows.values())}
     prov = {"path": "streamed", "device": device, "rows": result.num_rows, "streamed": info}
     if run.pieces:
         prov["gpu_pieces"] = "; ".join(f"{n} batches: {s}" for s, n in run.pieces.items())
     return result, prov
+
+
+def _next_stage(plan, top):
+    """(_Spec, top) of a second group-by right above the streamed one (`top` is the topmost row-local node over the
+    first Aggregate), else None: the shape of `count(distinct x)` per group, `Aggregate(Aggregate(...))`. The first
+    aggregate's groups, one hash partition at a time, are then the batches of the second, and the second's own
+    partials merge like any other (it spills too when its groups are many)."""
+    above = list(reversed(_chain(plan, top)[:-1]))
+    if not above or not isinstance(above[0], Aggregate):
+        return None
+    try:
+        spec = _spec(above[0])
+        _argument_types(spec)
+    except _Decline:
+        return None
+    top2 = above[0]
+    for n in above[1:]:                                 # a HAVING filter / projection works group by group
+        if isinstance(n, Filter) or (isinstance(n, Project) and not _has_op(n.exprs, _WINDOW)):
+            top2 = n
+        else:
+            break
+    return spec, top2
 
 
 def _pruned(got: Plan):
