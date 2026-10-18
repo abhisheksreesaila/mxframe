@@ -21,7 +21,7 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 - the null rule for `|`: a filter reading a null cell is false as a whole, so `(a > 0) | (b == 1)` drops a row whose
   a is null even when b == 1 (SQL would keep it);
 - a total that passes int64 raises (the stand-in wrapped silently);
-- `count_distinct(e)`, `median(e)` / `percentile(e, p)` (DuckDB's quantile_disc) and `top_k(e, k)` (F-148) are exact
+- `count_distinct(e)`, `median(e)` (DuckDB's median, exact at scale + 1) / `percentile(e, p)` (quantile_disc) and `top_k(e, k)` (F-148) are exact
   per group over a table, a Frame and a scan, ignore nulls, and run on the CPU: the kernel's per-block hook writes the
   (group, value) pairs and holistic.mojo consumes them (`r.values(i)`, `r.present(i, g)`, `r.top(i, g)`).
 """
@@ -38,7 +38,7 @@ from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE
-from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, A_DISTINCT, A_PCT, A_TOPK
+from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
 from .frame import text_ranks
 
 # plan node kinds
@@ -141,9 +141,11 @@ def percentile(e: Expr, p: Float64) -> Agg:
 
 
 def median(e: Expr) -> Agg:
-    """`percentile(e, 0.5)`: for an even count, the lower of the two middle values (DuckDB's `quantile_disc(e, 0.5)`,
-    not its `median`, which interpolates)."""
-    return Agg(A_PCT, e.copy(), 0.5)
+    """DuckDB's `median` (quantile_cont at 0.5): the middle value, or for an even count the mean of the two middle ones,
+    exactly, so the answer is the stored value times 10 (the column's scale plus one decimal place): [1, 2, 3, 4] gives
+    25. A TEXT column has no mean: its median is the lower middle word (a code), unscaled. The value `percentile(e, 0.5)`
+    returns is the lower middle, unscaled."""
+    return Agg(A_MEDIAN, e.copy())
 
 
 def top_k(e: Expr, k: Int) -> Agg:
@@ -169,14 +171,14 @@ struct Query(Movable):
     var overlay: Overlay
     var device: Optional[DeviceTable]
     var scan: Optional[ParquetScan]      # a Parquet file streamed one row group at a time (`Query(scan)`)
-    var window_rows: Int                 # rows per window of a count_distinct / percentile / top_k query (0: as many as
+    var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
 
     def __init__(out self, table: SharedTable):
         self.table = table
         self.device = None
         self.scan = None
-        self.window_rows = 0
+        self._window_rows = 0
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
         self.overlay = Overlay(table)
@@ -187,7 +189,7 @@ struct Query(Movable):
         `read_parquet` + the same query, exactly, and the peak memory is one row group plus the result."""
         self.table = scan.schema
         self.device = None
-        self.window_rows = 0
+        self._window_rows = 0
         self.scan = scan.copy()
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
@@ -196,7 +198,7 @@ struct Query(Movable):
     def __init__(out self, frame: Frame) raises:
         self.table = frame.base
         self.device = None
-        self.window_rows = 0
+        self._window_rows = 0
         self.scan = None
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
@@ -286,7 +288,7 @@ struct Query(Movable):
         var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
         var hs = HolStates(1, List[HolSpec](), List[List[Int64]]())
         if prog.mat:
-            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words)
+            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows())
         var r = QueryResult()
         var done = False
         if use_gpu:
@@ -299,7 +301,7 @@ struct Query(Movable):
         if not done:
             var mask_addr = Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0
             if prog.mat:
-                r = _run_mat(self.table, prog, mask_addr, hs, self.window_rows)
+                r = _run_mat(self.table, prog, mask_addr, hs, self._window_rows)
             else:
                 r = _run_cpu(self.table, prog, mask_addr)
             r.fallback_reason = fallback^
@@ -370,6 +372,8 @@ struct QueryResult(Movable):
         than k when the group has fewer; a TEXT column's codes, ordered alphabetically)."""
         var h = self.hol_of[i]
         var out = List[Int]()
+        if h < 0 or len(self.htop_off[h]) == 0:                  # not a top_k aggregate
+            return out^
         for x in range(self.htop_off[h][g], self.htop_off[h][g + 1]):
             out.append(self.htop[h][x])
         return out^
@@ -1126,11 +1130,15 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
             _merge_partial(acc, rw, ops)
         first = False
         done = end
+    for i in range(len(acc.kinds)):                      # `sums` was copied from the first window's slot
+        if acc.kinds[i] == A_SUM:
+            acc.sums = acc.slots[acc.slot_of[i]].copy()
+            break
     return acc^
 
 
 def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable, extra: List[List[String]],
-                  scan: Optional[ParquetScan] = None) raises -> HolStates:
+                  scan: Optional[ParquetScan] = None, max_rows: Int = -1) raises -> HolStates:
     """The states for the plan's holistic aggregates (none: an empty set). `nodes` are the plan with a frame's formulas
     and merges expanded (they decide which aggregates share a value source), `orig` the plan as built (to see which
     values are a plain TEXT column, whose percentile / top_k order is the words' alphabetical order, not the codes').
@@ -1174,10 +1182,10 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
                     for w in extra[c]:
                         words.append(w)
                 ranks[src_of[i]] = text_ranks(words)
-    return HolStates(nodes[at].groups, specs^, ranks^)
+    return HolStates(nodes[at].groups, specs^, ranks^, max_rows)
 
 
-def _finish_holistic(mut r: QueryResult, mut hs: HolStates):
+def _finish_holistic(mut r: QueryResult, mut hs: HolStates) raises:
     """Puts the states' answers into the result."""
     var res = hs.finish()
     r.hvals = res.vals.copy()
@@ -1504,7 +1512,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             todo.append(g)
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var hs = _build_states(nodes, nodes, scan.schema, List[List[String]](), Optional[ParquetScan](scan.copy()))    # (text order needs the words)
+    var hs = _build_states(nodes, nodes, scan.schema, List[List[String]](), Optional[ParquetScan](scan.copy()), scan.rows())    # (text order needs the words)
     var cur = Table.empty()
     if len(todo) > 0:
         cur = scan.read_group(todo[0], used)

@@ -1,8 +1,9 @@
-"""F-148: count distinct, median / percentile (DuckDB's quantile_disc) and top-k as aggregates of the Mojo Query API,
+"""F-148: count distinct, median (DuckDB's median, exact at one more decimal place), percentile (quantile_disc) and top-k as aggregates of the Mojo Query API,
 equal to DuckDB on random data: nulls, negatives, ties, decimals, text, one group to 100,000 groups, over a table read
 whole (`read`), a Parquet file streamed one row group at a time (`scan`) and a Frame after a few hundred edits
 (`frame`, checked on the table it bakes to). The Mojo side is mojo/tools/holistic_probe.mojo run as a subprocess."""
 import decimal
+from fractions import Fraction
 import json
 import subprocess
 from pathlib import Path
@@ -37,7 +38,7 @@ def make_file(path, n, groups, seed, ties=False, wide=False, words=300, null_rat
         x = np.where(pick, np.where(rng.random(n) < 0.5, (1 << 62) - rng.integers(0, 5, n), -(1 << 62) + rng.integers(0, 5, n)), x)
     cents = rng.integers(-2_000_000, 2_000_000, n) if not ties else rng.integers(-3, 4, n)
     pool = ["".join(rng.choice(list("abcdefgh"), size=rng.integers(1, 7))) for _ in range(words)]
-    pool += ["ab", "abc", "abcd", "b", "ba"]
+    pool += ["ab", "abc", "abcd", "b", "ba", "Ab", "ABC", "aB", "Abcd", "BA", "bA", "B"]       # mixed case: our text order ignores it
     s = rng.choice(pool, n)
     gm = rng.random(n) < 0.02
     xm = rng.random(n) < null_rate
@@ -62,14 +63,16 @@ def run_probe(probe, path, mode, which, groups, baked=None):
 
 AGGS = [  # (index in the probe's list, how DuckDB computes it, kind)
     ("count_distinct(x)", "count(DISTINCT x)", "distinct", "int"),
-    ("median(x)", "quantile_disc(x, 0.5)", "value", "int"),
+    ("median(x)", "median(x)", "median", "int"),
     ("p25(x)", "quantile_disc(x, 0.25)", "value", "int"),
     ("p90(x)", "quantile_disc(x, 0.9)", "value", "int"),
     ("top3(x)", "max(x, 3)", "top", "int"),
     ("count_distinct(s)", "count(DISTINCT s)", "distinct", "int"),
-    ("median(s)", "quantile_disc(s, 0.5)", "value", "text"),
-    ("top2(s)", "max(s, 2)", "top", "text"),
-    ("median(d)", "quantile_disc(d, 0.5)", "value", "dec"),
+    # text orders alphabetically ignoring ASCII case (the order of Frame.permutation), not DuckDB's byte order, and
+    # DuckDB's NOCASE collation is not honoured by quantile_disc / max: the oracle sorts lower(s) and we compare lowered
+    ("median(s)", "quantile_disc(lower(s), 0.5)", "value", "text"),
+    ("top2(s)", "max(lower(s), 2)", "top", "text"),
+    ("median(d)", "median(d)", "median", "dec"),
     ("p75(d)", "quantile_disc(d, 0.75)", "value", "dec"),
     ("count_distinct(d)", "count(DISTINCT d)", "distinct", "int"),
     ("p0(x)", "quantile_disc(x, 0.0)", "value", "int"),
@@ -111,13 +114,24 @@ def compare(got, want, groups, which, label):
                 exp = 0 if w is None else w
                 assert a["vals"][gi] == exp, f"{tag}: {a['vals'][gi]} != {exp}"
                 assert (a["present"][gi] == 1) == (exp > 0), f"{tag}: present"
+            elif kind == "median":
+                assert (a["present"][gi] == 1) == (w is not None), f"{tag}: present"
+                if w is None:
+                    continue
+                if ty == "int":                      # at scale 1: the mean of the two middle ints, exact; DuckDB's is a double
+                    exact, want_f = Fraction(a["vals"][gi], 10), Fraction(w)
+                    assert abs(exact - want_f) <= abs(want_f) * Fraction(1, 10**9), f"{tag}: {exact} != {want_f}"
+                    if abs(want_f) < 2**50:
+                        assert exact == want_f, f"{tag}: {exact} != {want_f}"
+                else:                                # a DECIMAL(18, 2): ours at scale 3 is exact, DuckDB's is rounded to scale 2
+                    assert abs(Fraction(a["vals"][gi], 1000) - Fraction(w)) <= Fraction(1, 200), f"{tag}: {a['vals'][gi]} vs {w}"
             elif kind == "value":
                 assert (a["present"][gi] == 1) == (w is not None), f"{tag}: present {a['present'][gi]} vs {w}"
                 if w is None:
                     continue
                 v = a["vals"][gi]
                 if ty == "text":
-                    v = words[v]
+                    v = words[v].lower()
                 elif ty == "dec":
                     w = int(w.scaleb(2))
                 assert v == w, f"{tag}: {v!r} != {w!r}"
@@ -126,7 +140,7 @@ def compare(got, want, groups, which, label):
                 assert (a["present"][gi] == 1) == (len(exp) > 0), f"{tag}: present"
                 v = a["top"][gi]
                 if ty == "text":
-                    v = [words[c] for c in v]
+                    v = [words[c].lower() for c in v]
                 assert v == exp, f"{tag}: {v} != {exp}"
 
 

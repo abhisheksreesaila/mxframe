@@ -16,8 +16,9 @@ is not null, packed block by block (a `Window`). This file consumes those pairs:
   scattered by group so that one task owns each group's heap. The state is k values a group, and merging windows is
   just offering their values.
 - percentile: the value at index max(ceil(p * n) - 1, 0) of the group's sorted non-null values, which is DuckDB's
-  `quantile_disc` (an actual value, exact in the stored integers; `median` is p = 0.5, the lower middle value for an
-  even n, so it differs from DuckDB's `median`, which is `quantile_cont`). Exact percentiles need every value: the
+  `quantile_disc` (an actual value, exact in the stored integers; `median` is DuckDB's `median` (quantile_cont at 0.5): the mean of the lower and the
+  upper middle value, found with one extra select and kept exact as 5 * (a + b), the stored value x 10; text stays the
+  lower middle word). Exact percentiles need every value: the
   pairs are kept (12 bytes a non-null row, plus 8 bytes a row while the answer is computed), grouped with a parallel
   counting sort, then each group is selected, not sorted: quickselect (three-way, O(n)) for small groups, and for a
   group of 262,144 values or more a parallel most-significant-byte radix select, which reads the values
@@ -42,6 +43,8 @@ comptime HLL_M = 256               # registers of a HyperLogLog sketch (standard
 comptime A_DISTINCT = 6
 comptime A_PCT = 7
 comptime A_TOPK = 8
+comptime A_MEDIAN = 9                 # DuckDB's `median` (quantile_cont): the mean of the two middle values, at scale + 1
+comptime UPPER_MIDDLE = 2.0          # a `p` that asks _percentiles for the upper middle value, index n // 2
 
 comptime BLOCK = 65536               # entries in a block made from a flat array
 comptime RADIX_MIN = 262_144         # a group at least this big is selected by the parallel radix select
@@ -414,6 +417,8 @@ def _radix_select(addr: Int, n: Int, k: Int, threads: Int) -> Int64:
 @always_inline
 def _percentile_index(p: Float64, n: Int) -> Int:
     """DuckDB's `quantile_disc` index in n sorted values: ceil(p * n) - 1, at least 0."""
+    if p > 1.5:                                  # UPPER_MIDDLE: the lower middle, or the one after it when n is even
+        return n // 2
     var i = Int(ceil(p * Float64(n))) - 1
     return min(max(i, 0), n - 1)
 
@@ -819,7 +824,7 @@ struct TopKState(Movable):
         var size = _np(Int(self.size.unsafe_ptr()))
         if tp == 1:
             _offer_blocks(b, 0, nb, heap, size, k, rank)
-        elif tp * G * k <= PRIVATE_HEAPS:
+        elif k <= PRIVATE_HEAPS // (tp * G):
             # few groups: every task keeps its own heaps over its blocks; they are merged into the state after
             var ph = List[Int64](length=tp * G * k, fill=0)
             var ps = List[Int](length=tp * G, fill=0)
@@ -972,7 +977,7 @@ struct HolStates(Movable):
     var raw: List[RawState]              # per source
     var topk: List[TopKState]            # per spec (k = 0 for the others)
 
-    def __init__(out self, groups: Int, var specs: List[HolSpec], var ranks: List[List[Int64]]) raises:
+    def __init__(out self, groups: Int, var specs: List[HolSpec], var ranks: List[List[Int64]], max_rows: Int = -1) raises:
         self.groups = groups
         self.threads = core_count()
         var nsrc = len(ranks)
@@ -990,9 +995,12 @@ struct HolStates(Movable):
             for c in range(len(ranks[s])):
                 un[Int(ranks[s][c])] = Int64(c)
             self.unranks.append(un^)
+        for i in range(len(specs)):
+            if specs[i].kind == A_TOPK and specs[i].k >= 1 and max_rows >= 0:
+                specs[i].k = min(specs[i].k, max(max_rows, 1))        # no group holds more values than the input has rows
         for spec in specs:
-            if spec.kind == A_PCT:
-                if not (spec.p >= 0.0 and spec.p <= 1.0):
+            if spec.kind == A_PCT or spec.kind == A_MEDIAN:
+                if spec.kind == A_PCT and not (spec.p >= 0.0 and spec.p <= 1.0):
                     raise Error("percentile: p must be between 0 and 1, got " + String(spec.p))
                 self.has_raw[spec.src] = True
             elif spec.kind == A_DISTINCT:
@@ -1000,7 +1008,7 @@ struct HolStates(Movable):
             elif spec.kind == A_TOPK:
                 if spec.k < 1:
                     raise Error("top_k: k must be at least 1, got " + String(spec.k))
-                if spec.k * groups > MAX_TOPK_WORDS:
+                if spec.k > MAX_TOPK_WORDS // groups:           # (a product could overflow Int)
                     raise Error("top_k: k=" + String(spec.k) + " for " + String(groups) + " groups would hold more than "
                                 + String(MAX_TOPK_WORDS) + " values")
         for s in range(nsrc):
@@ -1025,7 +1033,7 @@ struct HolStates(Movable):
                 if self.specs[h].kind != A_TOPK or found >= 0:
                     return -1
                 found = h
-        if found >= 0 and workers * self.groups * self.specs[found].k > PRIVATE_HEAPS:
+        if found >= 0 and self.specs[found].k > PRIVATE_HEAPS // (workers * self.groups):
             return -1
         return found
 
@@ -1056,7 +1064,16 @@ struct HolStates(Movable):
         _ = gids
         _ = vals
 
-    def finish(mut self) -> HolResult:
+    def _entries(self, h: Int) -> Int:
+        """How many selections aggregate h asks of its source's raw values: a percentile one, a median of numbers two
+        (the lower and the upper middle), a median of text one (the lower middle: words have no mean)."""
+        if self.specs[h].kind == A_PCT:
+            return 1
+        if self.specs[h].kind == A_MEDIAN:
+            return 1 if len(self.ranks[self.specs[h].src]) > 0 else 2
+        return 0
+
+    def finish(mut self) raises -> HolResult:
         var res = HolResult()
         var G = self.groups
         var distinct_of = List[List[Int]]()
@@ -1065,9 +1082,11 @@ struct HolStates(Movable):
         var pct_of = List[Percentiles]()           # per source
         for s in range(len(self.distinct)):
             var ps = List[Float64]()
-            for spec in self.specs:
-                if spec.kind == A_PCT and spec.src == s:
-                    ps.append(spec.p)
+            for h in range(len(self.specs)):
+                if self.specs[h].src == s and self._entries(h) > 0:
+                    ps.append(self.specs[h].p if self.specs[h].kind == A_PCT else 0.5)
+                    if self._entries(h) == 2:
+                        ps.append(UPPER_MIDDLE)
             if self.has_raw[s]:
                 pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, self.rank_of(s), self._unrank(s), self.threads))
             else:
@@ -1079,18 +1098,30 @@ struct HolStates(Movable):
                 res.counts.append(distinct_of[spec.src].copy())
                 res.top.append(List[Int]())
                 res.top_off.append(List[Int]())
-            elif spec.kind == A_PCT:
-                var q = 0                          # this p's place among its source's percentiles
+            elif spec.kind == A_PCT or spec.kind == A_MEDIAN:
+                var q = 0                          # this aggregate's first selection among its source's
                 for h2 in range(h):
-                    if self.specs[h2].kind == A_PCT and self.specs[h2].src == spec.src:
-                        q += 1
-                res.vals.append(pct_of[spec.src].vals[q].copy())
+                    if self.specs[h2].src == spec.src:
+                        q += self._entries(h2)
+                if self._entries(h) == 2:
+                    # mean of the two middle values at scale + 1: 10 * (a + b) / 2 = 5 * (a + b), exact
+                    var m = List[Int](length=G, fill=0)
+                    for g in range(G):
+                        var lo = pct_of[spec.src].vals[q][g]
+                        var hi = pct_of[spec.src].vals[q + 1][g]
+                        var sum = Int64(lo) + Int64(hi)
+                        if ((Int64(lo) ^ sum) & (Int64(hi) ^ sum)) < 0 or sum > Int64.MAX // 5 or sum < Int64.MIN // 5:
+                            raise Error("median: the middle of group " + String(g) + " is too large for its mean at one more decimal place in int64 (about 9.2e17 at the column's scale)")
+                        m[g] = Int(sum * 5)
+                    res.vals.append(m^)
+                else:
+                    res.vals.append(pct_of[spec.src].vals[q].copy())
                 res.counts.append(pct_of[spec.src].counts.copy())
                 res.top.append(List[Int]())
                 res.top_off.append(List[Int]())
             else:
                 var t = self.topk[h].finish(self._unrank(spec.src))
-                res.counts.append(List[Int](self.topk[h].size))
+                res.counts.append(self.topk[h].size.copy())
                 res.vals.append(List[Int](length=G, fill=0))
                 res.top.append(t[0].copy())
                 res.top_off.append(t[1].copy())
