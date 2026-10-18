@@ -2377,11 +2377,25 @@ struct ParquetScan(Copyable, Movable):
         return self._info[].extra.copy()
 
     def narrowing(self, c: Int) -> String:
-        """What reading column `c` into MX frame's kinds loses that writing it back would not restore, "" when
-        nothing: a TIMESTAMP is held as its UTC day, a DECIMAL as DECIMAL(18, s), an ENUM or JSON string as text."""
+        """The VALUES reading column `c` lost that saving would not restore, "" when none: a TIMESTAMP is held as its
+        UTC day (the time of day is gone). `save` refuses this unless asked. A change of type that keeps every value
+        is `type_change(c)` instead."""
         ref leaf = self._info[].leaves[c]
         if _is_timestamp(leaf):
             return "TIMESTAMP in the file and is held as a DATE: saving would lose the time of day"
+        return ""
+
+    def type_change(self, c: Int) -> String:
+        """How saving column `c` would change its type while keeping every value, "" when it would not: a DECIMAL(p, s)
+        is written as DECIMAL(18, s), an ENUM or JSON string as plain text, a narrower or unsigned integer as a signed
+        64-bit one (values past int64 are refused when read). `save` writes these without asking."""
+        ref leaf = self._info[].leaves[c]
+        var is_decimal = (leaf.converted == CT_DECIMAL or leaf.logical == 5)
+        var is_date = (leaf.converted == CT_DATE or leaf.logical == 6)
+        if leaf.ptype == PT_INT32 and not is_decimal and not is_date:
+            return ("an unsigned " if _is_unsigned(leaf) else "a ") + "32-bit or narrower integer in the file: saving writes a signed 64-bit one"
+        if leaf.ptype == PT_INT64 and _is_unsigned(leaf):
+            return "an unsigned 64-bit integer in the file: saving writes a signed one"
         if (leaf.converted == CT_DECIMAL or leaf.logical == 5) and leaf.precision > 0 and leaf.precision != 18:
             return "DECIMAL(" + String(leaf.precision) + ", " + String(leaf.scale) + ") in the file: saving would write DECIMAL(18, " + \
                    String(leaf.scale) + ")"

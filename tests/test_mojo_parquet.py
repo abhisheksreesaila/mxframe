@@ -1369,9 +1369,19 @@ def test_saving_keeps_foreign_key_value_metadata(editor, tmp_path):
     assert json.loads(md[b"omx"]) == {"edited": True}              # omx is the caller's, not the source's
 
 
+def test_a_type_change_that_keeps_every_value_saves_without_asking(editor, tmp_path):
+    """DECIMAL(9, 2) is held as DECIMAL(18, 2): no value is lost, so save writes it (pandas / pyarrow write decimals at
+    the data's precision, so refusing would refuse most foreign decimal files)."""
+    path, out = tmp_path / "d.parquet", tmp_path / "d.out.parquet"
+    small_edit_file(path, revenue_type=pa.decimal128(9, 2))
+    run_edit_probe(editor, path, out, 4)
+    saved = pq.read_table(out)
+    assert saved.schema.field("revenue").type == pa.decimal128(18, 2)
+    assert len(saved) > 0
+
+
 @pytest.mark.parametrize("column,kind,lost", [
     ("day", pa.timestamp("us"), "time of day"),
-    ("revenue", pa.decimal128(9, 2), "DECIMAL(9, 2)"),
 ])
 def test_a_save_that_would_lose_what_reading_narrowed_is_refused_unless_allowed(editor, tmp_path, column, kind, lost):
     path, out = tmp_path / "n.parquet", tmp_path / "n.out.parquet"

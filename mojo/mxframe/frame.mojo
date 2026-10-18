@@ -799,8 +799,10 @@ struct Frame(Movable):
         DEFAULT_ROW_GROUP), so the memory is one row group, the file's dictionaries and the edits, whatever the size.
         The saved row groups are the source's, less the removed rows. A frame over a table writes `bake()`. Formulas
         are not stored. The file's other key-value metadata is written back (not Arrow's schema, which describes the
-        source's types). A column that reading narrowed (TIMESTAMP held as DATE, DECIMAL(9, 2) as DECIMAL(18, 2), ENUM or
-        JSON as text) makes `save` raise, naming the column and what would be lost, unless `allow_narrowing`."""
+        source's types). A column whose type reading changed but whose every value it kept (DECIMAL(9, 2) as DECIMAL(18, 2), ENUM
+        or JSON as text, a narrower or unsigned integer as int64: `scan.type_change(c)`) is written as held. Only a loss
+        of values (a TIMESTAMP held as its UTC day: `scan.narrowing(c)`) makes `save` raise, before writing anything and
+        naming the column, unless `allow_narrowing`."""
         if not self.scan:
             write_parquet(path, self.bake(), metadata, compression)
             return
