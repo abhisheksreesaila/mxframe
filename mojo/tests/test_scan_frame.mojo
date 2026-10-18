@@ -3,6 +3,7 @@
 # every batch of random edits (sets, nulls, typed text with new words, appends, removes, merges, formulas) and after
 # undoing them. The oracle is the in-memory Frame, whose own correctness F-136 checks against `bake()`.
 from std.os import getenv, setenv, makedirs
+from std.time import perf_counter_ns
 from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, mean, min_of, max_of,
                      count_distinct, median, percentile, top_k, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet,
                      read_parquet, scan_parquet, ZSTD, SNAPPY, UNCOMPRESSED)
@@ -341,7 +342,36 @@ def test_an_empty_result_and_codecs() raises:
     expect(again.table.rows() == 1 and again.table.text_of(0, Int(again.table.get(0, 0))) == "a", "only an appended row")
 
 
+def test_a_walk_over_thousands_of_row_groups_stays_fast() raises:
+    """2M rows in 2,000 row groups of 1,000: the cache holds 4,000 chunks and every get finds its chunk in O(1) (a
+    linear search took 2 s for this walk, a table frame 21 ms)."""
+    var t = Table.empty()
+    var v = t.add_column("v", INT)
+    var w = t.add_column("w", INT)
+    for i in range(2_000_000):
+        t.append(v, Int64(i))
+        t.append(w, Int64(i % 7))
+    var path = scratch("walk.parquet")
+    write_parquet(path, t, "", UNCOMPRESSED, 1_000)
+    var f = Frame(scan_parquet(path))
+    var t0 = perf_counter_ns()
+    var sum: Int64 = 0
+    for r in range(f.rows()):
+        sum += f.get(v, r) + f.get(w, r)
+    var ms = Float64(perf_counter_ns() - t0) / 1e6
+    expect(sum == Int64(1_999_999) * 2_000_000 // 2 + 2_000_000 // 7 * 21 + (2_000_000 % 7) * ((2_000_000 % 7) - 1) // 2, "the walk reads every value: " + String(sum))
+    expect(f.cache_loads() == 4_000, "each chunk decoded once: " + String(f.cache_loads()))
+    expect(ms < 700, "a walk of 4M gets over 4,000 cached chunks took " + String(ms) + " ms")
+    f.set_cache_limit(100 * 8_000)                           # room for 100 chunks: the walk evicts, results unchanged
+    var again: Int64 = 0
+    for r in range(0, f.rows(), 3):
+        again += f.get(v, r)
+    expect(f.cache_held() <= 100 * 8_000 + 8_000, "bound holds under churn: " + String(f.cache_held()))
+    expect(again == (Int64(1_999_998) // 3 + 1) * 1_999_998 // 2, "values under churn")
+
+
 def main() raises:
+    test_a_walk_over_thousands_of_row_groups_stays_fast()
     test_baking_a_streamed_frame_is_refused_and_save_is_the_way()
     test_save_over_the_file_that_is_open()
     test_an_empty_result_and_codecs()
