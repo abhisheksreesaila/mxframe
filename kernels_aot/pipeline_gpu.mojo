@@ -86,6 +86,12 @@ comptime OP_SELECT = 35
 comptime OP_BETWEEN = 36
 comptime OP_IN_SET = 37
 comptime OP_CMPC = 38
+comptime OP_ISNULL = 41         # 1.0 where the column's validity bit is clear (device bitmap: 3-entry column table, as the CPU)
+comptime OP_IDIV = 42           # exact int64 ops of the Mojo API's programs (F-137), the CPU's semantics:
+comptime OP_IMOD = 43           #   floor //, Mojo's Int64 %, x // 0 = x % 0 = 0, x % -1 = 0,
+comptime OP_IMIN = 44           #   INT64_MIN // -1 sets *ovf
+comptime OP_IMAX = 45
+comptime OP_ICMP = 46           # 1.0 / 0.0 float register: a <cmp in operand c> b
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -526,6 +532,50 @@ def _run[RPT: Int, B: Int](
                         if set_bytes[off + Int(x)] != 0:
                             hit = 1.0
                     d[k * B] = hit
+        elif op == OP_ISNULL:
+            var slot = Int(dts[Int(ins[2])]) >> 8              # dtype 7 | (slot << 8): bitmap address, bit base
+            var valid = _bp(Int(cols[slot]))
+            var has = Int(cols[slot]) != 0
+            var bit_base = Int(cols[slot + 1])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    var null = 0.0
+                    if has:
+                        var bit = bit_base + row_base + tid + k * B
+                        if ((Int(valid[bit >> 3]) >> (bit & 7)) & 1) == 0:
+                            null = 1.0
+                    d[k * B] = null
+        elif op >= OP_IDIV and op <= OP_ICMP:
+            var a = regs + Int(ins[2]) * TILE + tid
+            var b = regs + Int(ins[3]) * TILE + tid
+            var cmp = Int(ins[4])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    var x = _i64_of(a[k * B])
+                    var y = _i64_of(b[k * B])
+                    if op == OP_IDIV:
+                        var q = Int64(0)
+                        if y == -1 and x == Int64.MIN:
+                            ovf[0] = 1
+                            q = x
+                        elif y != 0:
+                            q = x // y
+                        d[k * B] = _word_of(q)
+                    elif op == OP_IMOD:
+                        d[k * B] = _word_of(0 if y == 0 or y == -1 else x % y)
+                    elif op == OP_IMIN:
+                        d[k * B] = _word_of(min(x, y))
+                    elif op == OP_IMAX:
+                        d[k * B] = _word_of(max(x, y))
+                    else:
+                        d[k * B] = _b(_cmp_i(cmp, x, y))
+
+
+@always_inline
+def _key_group(word: Float64, groups: Int) -> Int:
+    """Keyed mode: register 0 holds the row's group key as int64 bits; a key outside 0 .. groups-1 leaves the row out."""
+    var v = _i64_of(word)
+    return Int(v) if v >= 0 and v < Int64(groups) else -1
 
 
 def pipeline_kernel[RPT: Int, B: Int](
@@ -588,8 +638,9 @@ def pipeline_kernel[RPT: Int, B: Int](
     var dts = _ip(dtypes_a)
     var set_bytes = _bp(set_bytes_a)
     var set_meta = _lp(set_meta_a)
-    var gids = _ip(gids_a)
-    var has_gids = gids_a != 0
+    var keyed = gids_a == -1                     # keyed mode (F-137): the group id comes from register 0 of the body
+    var gids = _ip(gids_a) if not keyed else _ip(0)
+    var has_gids = gids_a != 0 and not keyed
     var out_vals = _fp(out_vals_a)
     var out_cnt = _lp(out_cnt_a)
 
@@ -646,14 +697,18 @@ def pipeline_kernel[RPT: Int, B: Int](
                 comptime for k in range(RPT):
                     if (active >> k) & 1 != 0:
                         var g = 0
-                        if has_gids:
+                        if keyed:
+                            g = _key_group(regs[tid + k * B], G)
+                        elif has_gids:
                             g = Int(gids[row_base + tid + k * B])
                         if g >= 0 and g < G:
                             tg[tid + k * B] = Int32(g)
             comptime for k in range(RPT):
                 if (active >> k) & 1 != 0 and mode != 4:
                     var g = 0
-                    if has_gids:
+                    if keyed:
+                        g = _key_group(regs[tid + k * B], G)
+                    elif has_gids:
                         g = Int(gids[row_base + tid + k * B])
                     if g >= 0 and g < G:
                         if mode == 0:
@@ -871,10 +926,11 @@ def _block_threads(mode: Int) -> Int:
     return 128 if mode == 3 else BLOCK
 
 
-def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int) -> Int:
-    """Dynamic shared memory of a launch in `mode`: the one formula the mode choice and the launch share."""
+def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, narrow: Bool = False) -> Int:
+    """Dynamic shared memory of a launch in `mode`: the one formula the mode choice and the launch share. `narrow`
+    (the Mojo API's big programs): 128-thread blocks, half the register file per block."""
     var ns = (n_slots + 1) * n_groups
-    var bsz = _block_threads(mode)
+    var bsz = 128 if narrow else _block_threads(mode)
     var tile = bsz * _rows_per_thread(n_regs, n_groups, n_slots)
     var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + code_ints * 4 + (bsz // 32) * SMALL * 8
     if mode == 3:
@@ -886,7 +942,7 @@ def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: 
     return smem
 
 
-def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int) -> Int:
+def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int, allow_narrow: Bool = False) -> Int:
     """The aggregation mode (see the header) a program with these sizes runs in, or -5 (needs more shared
     memory than a block has) / -6 (reproducible mode and the group table does not fit)."""
     var G = n_groups
@@ -905,8 +961,17 @@ def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro
             return -6
         mode = 4
     if _smem_bytes(mode, G, n_slots, n_regs, code_ints) > 48 * 1024:
+        if allow_narrow and _smem_bytes(mode, G, n_slots, n_regs, code_ints, True) <= 48 * 1024:
+            return mode
         return -5
     return mode
+
+
+def _narrow(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int) -> Bool:
+    """The Mojo API's programs keep many registers (a pivot with ten aggregates needs 23): when 256-thread blocks do
+    not fit in shared memory, 128-thread blocks (rpt 1) may. Modes 3 and 4 already differ and keep their shape."""
+    return mode != 3 and mode != 4 and _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints) > 48 * 1024 and \
+        _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints, True) <= 48 * 1024
 
 
 @export
@@ -914,6 +979,72 @@ def mx_pipeline_gpu_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: In
     """The mode ``mx_pipeline_gpu`` would run (0 to 4), or a negative status: Python asks this before it
     splits rows, so a reproducible split never hands the GPU a share it would decline."""
     return _choose_mode(n_groups, n_slots, n_regs, code_ints, repro)
+
+
+def run_pipeline_gpu(
+    ctx: DeviceContext,
+    code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
+    cols_a: Int, dtypes_a: Int, gids_a: Int, n_groups: Int, n_slots: Int,
+    start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, ident_a: Int,
+    scratch_a: Int, n_regs: Int, code_ints: Int, agg_base: Int,
+    n_blocks: Int, repeat: Int, repro: Int, ovf_a: Int, narrow_ok: Bool = False,
+) raises -> Int:
+    """`mx_pipeline_gpu` on a DeviceContext the caller owns (F-137): the Mojo API runs the kernel on the app's
+    context, so its buffers, the app's own kernels and this one share one stream and need no extra synchronization.
+    `narrow_ok`: the Mojo API's programs keep many registers, so a launch that does not fit 256-thread blocks in
+    shared memory may use 128-thread ones (the Python path never asks: it declines with -5 as before).
+    `gids_a` == -1 selects keyed mode: the group id of each row is register 0 of the body (int64 bits), an id
+    outside 0 .. n_groups-1 leaves the row out. Returns 0 or a negative status (see `mx_pipeline_gpu`)."""
+    if n_slots < 0 or n_groups < 1:
+        return -2
+    var G = n_groups
+    var A = n_slots
+    if gids_a == 0 and G != 1:
+        return -2
+    var mode = _choose_mode(G, A, n_regs, code_ints, repro, narrow_ok)
+    if mode < 0:
+        return mode
+    var narrow = narrow_ok and _narrow(mode, G, A, n_regs, code_ints)
+    var bsz = 128 if narrow else _block_threads(mode)
+    var rpt = 1 if narrow else _rows_per_thread(n_regs, G, A)
+    var tile = bsz * rpt
+    var smem = _smem_bytes(mode, G, A, n_regs, code_ints, narrow)
+    var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
+    var small = 1 if (mode == 0 or mode == 3 or mode == 4) else 0
+    var total = A * G
+    if small == 0 or end <= start:
+        ctx.enqueue_function[init_kernel](
+            Int64(out_vals_a), Int64(out_cnt_a), Int64(ident_a), Int64(G), Int64(total),
+            grid_dim=ceildiv(max(total, G), BLOCK), block_dim=BLOCK)
+    if end > start:
+        var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1) * per_sm)
+        for _ in range(max(repeat, 1)):
+            if bsz == 128 and rpt == 2:
+                ctx.enqueue_function[pipeline_kernel[2, 128]](
+                    Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                    Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                    Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+            elif bsz == 128:
+                ctx.enqueue_function[pipeline_kernel[1, 128]](
+                    Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                    Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                    Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+            elif rpt == 2:
+                ctx.enqueue_function[pipeline_kernel[2, 256]](
+                    Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                    Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                    Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+            else:
+                ctx.enqueue_function[pipeline_kernel[1, 256]](
+                    Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                    Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                    Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+        if small != 0:
+            ctx.enqueue_function[merge_kernel](
+                Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a), Int64(ovf_a),
+                grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
+    ctx.synchronize()
+    return 0
 
 
 @export
@@ -924,56 +1055,10 @@ def mx_pipeline_gpu(
     scratch_a: Int, n_regs: Int, code_ints: Int, agg_base: Int,
     n_blocks: Int, repeat: Int, repro: Int, ovf_a: Int,
 ) abi("C") -> Int:
-    if n_slots < 0 or n_groups < 1:
-        return -2
-    var G = n_groups
-    var A = n_slots
-    if gids_a == 0 and G != 1:
-        return -2
-    var mode = _choose_mode(G, A, n_regs, code_ints, repro)
-    if mode < 0:
-        return mode
-    var bsz = _block_threads(mode)
-    var rpt = _rows_per_thread(n_regs, G, A)
-    var tile = bsz * rpt
-    var smem = _smem_bytes(mode, G, A, n_regs, code_ints)
-    var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
-    var small = 1 if (mode == 0 or mode == 3 or mode == 4) else 0
     try:
         var ctx = DeviceContext()
-        var total = A * G
-        if small == 0 or end <= start:
-            ctx.enqueue_function[init_kernel](
-                Int64(out_vals_a), Int64(out_cnt_a), Int64(ident_a), Int64(G), Int64(total),
-                grid_dim=ceildiv(max(total, G), BLOCK), block_dim=BLOCK)
-        if end > start:
-            var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1) * per_sm)
-            for _ in range(max(repeat, 1)):
-                if bsz == 128 and rpt == 2:
-                    ctx.enqueue_function[pipeline_kernel[2, 128]](
-                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
-                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
-                elif bsz == 128:
-                    ctx.enqueue_function[pipeline_kernel[1, 128]](
-                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
-                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
-                elif rpt == 2:
-                    ctx.enqueue_function[pipeline_kernel[2, 256]](
-                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
-                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
-                else:
-                    ctx.enqueue_function[pipeline_kernel[1, 256]](
-                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
-                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
-                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
-            if small != 0:
-                ctx.enqueue_function[merge_kernel](
-                    Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a), Int64(ovf_a),
-                    grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
-        ctx.synchronize()
-        return 0
+        return run_pipeline_gpu(ctx, code_a, consts_a, set_bytes_a, set_meta_a, cols_a, dtypes_a, gids_a, n_groups, n_slots,
+                                start, end, out_vals_a, out_cnt_a, ident_a, scratch_a, n_regs, code_ints, agg_base,
+                                n_blocks, repeat, repro, ovf_a)
     except:
         return -1
