@@ -1072,6 +1072,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
         var part = cur^.share()
         var r = QueryResult()
         var nxt = Table.empty()
+        var pending = String()
         if ix + 1 < len(todo):
             # group ix + 1 decodes while the kernel aggregates group ix (two groups in memory); a serial build runs the
             # two tasks one after the other. The partials are still merged below in row-group order.
@@ -1106,8 +1107,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             par_n(both, 2, 2)
             if e0.byte_length() > 0:                 # the earlier group's error comes first
                 raise Error(e0)
-            if e1.byte_length() > 0:
-                raise Error(e1)
+            pending = e1^                            # the next group's decode error waits until this group is merged
         else:
             r = _run_cpu(part, _lower(part, nodes, True, False), 0)
         for k in range(len(used)):                   # this group's buffers go back for the group after next
@@ -1131,6 +1131,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
                     acc.slots[s][x] = Int(y)
         for x in range(shape.groups):
             acc.counts[x] += r.counts[x]
+        if pending.byte_length() > 0:                # only now, after this group's partial was merged (its overflow comes first)
+            raise Error(pending)
     # the layout of a whole-file run: lowered over the columns with the null counts the file turned out to have
     var proto = Table.empty()
     for k in range(len(used)):

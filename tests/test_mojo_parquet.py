@@ -1117,3 +1117,19 @@ def test_a_sum_whose_partials_pass_int64_raises_the_same_streamed_and_whole(prob
     outs = [subprocess.run([str(prober), str(path), mode, "sum_v"], capture_output=True, text=True) for mode in ("scan", "read")]
     assert [o.returncode for o in outs] == [1, 1]
     assert all("a sum or an expression passed the int64 range" in o.stdout + o.stderr for o in outs)
+
+
+def test_an_overflow_while_merging_a_group_beats_the_decode_error_of_the_next(prober, tmp_path):
+    """Groups [2^62, 2^62-1] (the partial fits), [1, 0] (adding it to the running total overflows) and a corrupt third:
+    the group that is merged before the third is reached reports its overflow, not the third's corrupt page."""
+    big = 2**62
+    path = tmp_path / "t.parquet"
+    pq.write_table(pa.table({"v": pa.array([big, big - 1, 1, 0, 8, 9], pa.int64())}), path, row_group_size=2,
+                   compression="NONE", use_dictionary=False)
+    md = pq.read_metadata(path)
+    raw = bytearray(path.read_bytes())
+    off = md.row_group(2).column(0).data_page_offset
+    raw[off:off + 8] = b"\xff" * 8
+    path.write_bytes(raw)
+    p = subprocess.run([str(prober), str(path), "scan", "sum_v"], capture_output=True, text=True)
+    assert p.returncode == 1 and "a sum or an expression passed the int64 range" in p.stdout + p.stderr, p.stdout + p.stderr
