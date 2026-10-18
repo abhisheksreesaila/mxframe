@@ -1,6 +1,7 @@
 # F-140: a query over a Parquet file one row group at a time (`Query(scan_parquet(path))`) gives exactly the answer of
 # `read_parquet(path)` + the same query: every slot, count, sum, min / max, mean and `present`, TEXT keys and filters
 # through the file-wide dictionary, nulls, a row group where a column is all null, overflow.
+from std.ffi import external_call
 from mxframe import (Table, SharedTable, Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of,
                      INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ParquetScan, ZSTD, SNAPPY,
                      UNCOMPRESSED, CPU, GPU, AUTO)
@@ -191,7 +192,47 @@ def test_overflow_raises_like_the_in_memory_run() raises:
     expect(want != "" and got == want, "overflow: " + got + " vs " + want)
 
 
+def test_a_file_that_changes_after_it_was_opened_is_refused() raises:
+    """A truncation or an in-place rewrite changes the size: refused before any row group is mapped (a mapping of
+    pages that vanish would be a bus error). A file replaced by rename leaves the open file as it was: the answer is
+    the one for the file that was opened."""
+    var mem = make_table()
+    var path = String("/tmp/f140_scan_chg.parquet")
+    write_parquet(path, mem, "", ZSTD, GROUP)
+    var want = Query(mem).agg(sum(col("cost")), count()).compute()
+    var scan = scan_parquet(path)
+    write_parquet("/tmp/f140_scan_chg_other.parquet", make_table(), "", ZSTD, GROUP // 2)
+    _ = external_call["rename", Int32]("/tmp/f140_scan_chg_other.parquet".as_c_string_span().ptr(), path.as_c_string_span().ptr())
+    var got = Query(scan).agg(sum(col("cost")), count()).compute()
+    expect(got.sums[0] == want.sums[0] and got.counts[0] == want.counts[0], "a renamed-over file: the opened file is read")
+    var scan2 = scan_parquet(path)
+    with open(path, "w") as f:                                  # rewritten in place: truncated, then shorter
+        f.write("PAR1 and not much more")
+    var msg = String("")
+    try:
+        _ = Query(scan2).agg(sum(col("cost")), count()).compute()
+    except e:
+        msg = String(e)
+    expect(msg == "the file changed since it was opened (`" + path + "`)", "truncated in place: `" + msg + "`")
+
+
+def test_a_text_column_nobody_reads_is_never_decoded() raises:
+    var mem = make_table()
+    write_parquet("/tmp/f140_scan_lazy.parquet", mem, "", ZSTD, GROUP)
+    var scan = scan_parquet("/tmp/f140_scan_lazy.parquet")
+    var region = scan.index("region")
+    var note = scan.index("note")
+    expect(not scan.dictionary_loaded(region) and not scan.dictionary_loaded(note), "nothing is built when the file is opened")
+    _ = Query(scan).agg(sum(col("cost"))).compute()
+    expect(not scan.dictionary_loaded(region) and not scan.dictionary_loaded(note), "a sum over an int reads no dictionary")
+    _ = Query(scan).group_by(col("region"), groups=8).agg(count()).compute()
+    expect(scan.dictionary_loaded(region) and not scan.dictionary_loaded(note), "a query on region builds region's only")
+    expect(scan.word_count(note) > 0 and scan.dictionary_loaded(note), "asking for a column's words builds them")
+
+
 def main() raises:
+    test_a_file_that_changes_after_it_was_opened_is_refused()
+    test_a_text_column_nobody_reads_is_never_decoded()
     test_equals_read_parquet_for_every_codec()
     test_errors_are_readable()
     test_overflow_raises_like_the_in_memory_run()

@@ -771,3 +771,19 @@ def test_random_byte_flips_never_crash_a_scan(prober, tmp_path):
         bad.write_bytes(flipped)
         p = subprocess.run([str(prober), str(bad), "scan", "by_region"], capture_output=True, text=True)
         assert p.returncode in (0, 1), (k, p.returncode)                 # an answer or a readable error, never a signal
+
+
+def test_an_unused_unique_id_text_column_costs_nothing(prober, tmp_path):
+    """500k unique 30-byte ids that the writer's dictionary limit pushed to PLAIN pages, never read by the query: the
+    stream stays near one row group, where the whole-file read holds the ids."""
+    path = tmp_path / "hc.parquet"
+    n, g = 2_000_000, 250_000
+    w = pq.ParquetWriter(path, pa.schema([("t", pa.string()), ("v", pa.int64())]), compression="none")
+    for lo in range(0, n, g):
+        ids = pa.array([f"id-{i:012d}-padpadpad" for i in range(lo, lo + g)])
+        w.write_table(pa.table([ids, pa.array(range(lo, lo + g), pa.int64())], schema=w.schema))
+    w.close()
+    scanned, read = probe(prober, path, "scan", "sum_v"), probe(prober, path, "read", "sum_v")
+    same_answer(scanned, read)
+    assert scanned["slots"][0][0] == n * (n - 1) // 2 and scanned["counts"][0] == n
+    assert scanned["peak_kb"] < 90_000 and scanned["peak_kb"] * 4 < read["peak_kb"], (scanned["peak_kb"], read["peak_kb"])
