@@ -29,7 +29,7 @@ from .parquet import ParquetScan
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
-from .kernels._fpenv import core_count
+from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
@@ -1056,14 +1056,66 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
         acc.slots.append(List[Int](length=shape.groups, fill=ident))
     acc.counts = List[Int](length=shape.groups, fill=0)
     var nulls = List[Int](length=len(used), fill=0)
+    var todo = List[Int]()                   # the row groups with rows, in file order
     for g in range(scan.row_groups()):
-        if scan.group_rows(g) == 0:
-            continue
-        var rg = scan.read_group(g, used)
+        if scan.group_rows(g) > 0:
+            todo.append(g)
+    for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
+        scan.ensure_words(c)
+    var spare = List[List[Int64]]()          # the value buffers of finished groups, written into again by the next decode
+    var cur = Table.empty()
+    if len(todo) > 0:
+        cur = scan.read_group_reusing(todo[0], used, spare)
+    for ix in range(len(todo)):
         for k in range(len(used)):
-            nulls[k] += rg.null_count(k)
-        var part = rg^.share()
-        var r = _run_cpu(part, _lower(part, nodes, True, False), 0)
+            nulls[k] += cur.null_count(k)
+        var part = cur^.share()
+        var r = QueryResult()
+        var nxt = Table.empty()
+        if ix + 1 < len(todo):
+            # group ix + 1 decodes while the kernel aggregates group ix (two groups in memory); a serial build runs the
+            # two tasks one after the other. The partials are still merged below in row-group order.
+            var e0 = String()
+            var e1 = String()
+            var rp = Int(UnsafePointer(to=r))
+            var np = Int(UnsafePointer(to=nxt))
+            var e0p = Int(UnsafePointer(to=e0))
+            var e1p = Int(UnsafePointer(to=e1))
+            var sp = Int(UnsafePointer(to=scan))
+            var pp = Int(UnsafePointer(to=part))
+            var up = Int(UnsafePointer(to=used))
+            var spp = Int(UnsafePointer(to=spare))
+            var np_nodes = Int(UnsafePointer(to=nodes))
+            var next_group = todo[ix + 1]
+            def both(i: Int) {imm}:
+                if i == 0:
+                    try:
+                        var tbl = Pointer[SharedTable, MutUntrackedOrigin](unsafe_from_address=pp)[]
+                        var nds = Pointer[List[PlanNode], MutUntrackedOrigin](unsafe_from_address=np_nodes)[].copy()
+                        Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=rp)[] = _run_cpu(tbl, _lower(tbl, nds, True, False), 0)
+                    except e:
+                        Pointer[String, MutUntrackedOrigin](unsafe_from_address=e0p)[] = String(e)
+                else:
+                    try:
+                        Pointer[Table, MutUntrackedOrigin](unsafe_from_address=np)[] = Pointer[ParquetScan, MutUntrackedOrigin](
+                            unsafe_from_address=sp)[].read_group_reusing(
+                            next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
+                            Pointer[List[List[Int64]], MutUntrackedOrigin](unsafe_from_address=spp)[])
+                    except e:
+                        Pointer[String, MutUntrackedOrigin](unsafe_from_address=e1p)[] = String(e)
+            par_n(both, 2, 2)
+            if e0.byte_length() > 0:                 # the earlier group's error comes first
+                raise Error(e0)
+            if e1.byte_length() > 0:
+                raise Error(e1)
+        else:
+            r = _run_cpu(part, _lower(part, nodes, True, False), 0)
+        for k in range(len(used)):                   # this group's buffers go back for the group after next
+            var done = List[Int64]()
+            swap(done, part._table[].cols[k].values)
+            spare.append(done^)
+        _ = part^
+        cur = nxt^
         for s in range(shape.n_slots):
             for x in range(shape.groups):
                 var a = acc.slots[s][x]

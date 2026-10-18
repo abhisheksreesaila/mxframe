@@ -14,14 +14,16 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import duckdb
 
 ROOT = Path(__file__).resolve().parent.parent
-D = Path("/tmp/f141_bench")
+D = Path.home() / ".cache/mxframe-bench/f143"
 
 
 def make_numeric(path, n, group, codec):
@@ -88,7 +90,17 @@ def main():
             make_numeric(num, 20_000_000, 1_000_000, a.codec)
             make_text(txt, 5_000_000, 1_000_000, a.codec)
         print(f"load average {os.getloadavg()}; numeric {num.stat().st_size >> 20} MB, text {txt.stat().st_size >> 20} MB, codec {a.codec}")
+        sql = ("SELECT carrier, sum(cost), sum(CAST(revenue * 100 AS BIGINT)), count(*), max(CAST(day AS DATE) - DATE '1970-01-01') "
+               f"FROM read_parquet('{num}') WHERE carrier BETWEEN 0 AND 9 GROUP BY carrier")
         for serial in (True, False):
+            con = duckdb.connect()
+            con.execute(f"SET threads={1 if serial else os.cpu_count()}")
+            ts = []
+            for _ in range(5):
+                t0 = time.perf_counter()
+                con.execute(sql).fetchall()
+                ts.append(time.perf_counter() - t0)
+            print(f"DuckDB {'1 thread ' if serial else 'all cores'}: streamed numeric query {min(ts):.3f} s")
             b = build(serial)
             tag = "1 thread " if serial else "all cores"
             s = run(b, num, "scan", "numeric")

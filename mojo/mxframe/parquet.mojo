@@ -141,7 +141,7 @@ def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
     if codec == UNCOMPRESSED:
         if n != size:
             raise Error("an uncompressed Parquet page has two different sizes (corrupt file)")
-        var out = List[UInt8](length=max(size, 1), fill=0)
+        var out = List[UInt8](unsafe_uninit_length=max(size, 1))
         var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=src)
         for i in range(size):
             out[i] = p[i]
@@ -156,7 +156,7 @@ def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
             var stated = external_call["ZSTD_getFrameContentSize", UInt64](src, n)
             if stated < (UInt64(1) << 62) and stated != UInt64(size):
                 raise Error("a zstd page did not decompress to its stated size (corrupt file)")
-            var out = List[UInt8](length=max(size, 1), fill=0)
+            var out = List[UInt8](unsafe_uninit_length=max(size, 1))
             var got = external_call["ZSTD_decompress", Int](out.unsafe_ptr(), size, src, n)
             if external_call["ZSTD_isError", UInt32](got) != 0 or got != size:
                 raise Error("a zstd page did not decompress to its stated size (corrupt file)")
@@ -166,7 +166,7 @@ def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
             var stated = 0
             if external_call["snappy_uncompressed_length", Int32](src, n, UnsafePointer(to=stated)) != 0 or stated != size:
                 raise Error("a snappy page did not decompress to its stated size (corrupt file)")
-            var out = List[UInt8](length=max(size, 1), fill=0)
+            var out = List[UInt8](unsafe_uninit_length=max(size, 1))
             var got = size
             if external_call["snappy_uncompress", Int32](src, n, out.unsafe_ptr(), UnsafePointer(to=got)) != 0 or got != size:
                 raise Error("a snappy page did not decompress to its stated size (corrupt file)")
@@ -1654,7 +1654,8 @@ def _dedupe_misses(mut pages: List[_Page], ctx: Int, total: Int):
 
 
 def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf_ids: List[Int], out_cols: List[Int],
-                  widxs: List[Int], add_words: Bool, leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False) raises:
+                  widxs: List[Int], add_words: Bool, leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False,
+                  spare: Int = 0) raises:
     """Decodes one row group: chunk k (`metas[k]`, at `bases[k]` / `ns[k]`, leaf `leaf_ids[k]`) becomes rows
     row0.. of table column `out_cols[k]`, whose TEXT words are found in `widxs[k]` (a `_WordIndex` over the table's
     column) and, when `add_words`, added to it. `words_only`: only the TEXT words are added to the table (a dictionary build)."""
@@ -1685,7 +1686,17 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                 raise Error("column `" + col.name + "`: rows do not line up (corrupt file)")
             if len(col.values) < row0 + rows:            # (read_parquet sizes the whole column up front)
                 if row0 == 0:                            # every row is written below, values or a zero for a null
-                    col.values = List[Int64](unsafe_uninit_length=rows)
+                    var reused = False
+                    if spare != 0:                       # a finished group's buffer: no fresh pages to fault in
+                        ref pool = UnsafePointer[List[List[Int64]], MutAnyOrigin](unsafe_from_address=spare)[]
+                        if len(pool) > 0:
+                            var b = pool.pop()
+                            if len(b) >= rows:
+                                b.shrink(rows)
+                                col.values = b^
+                                reused = True
+                    if not reused:
+                        col.values = List[Int64](unsafe_uninit_length=rows)
                 else:
                     col.values.resize(row0 + rows, 0)
             if 0 < len(col.validity) < (len(col.values) + 7) // 8:      # a bitmap that exists covers every row
@@ -1966,6 +1977,12 @@ struct ParquetScan(Copyable, Movable):
     def read_group(self, g: Int, cols: List[Int]) raises -> Table:
         """Row group `g` as a table of just the columns `cols` (in that order), decoded: a TEXT value is the code the
         whole-file read gives its word (looked up in the file-wide dictionary while the pages are decoded)."""
+        var none = List[List[Int64]]()
+        return self.read_group_reusing(g, cols, none)
+
+    def read_group_reusing(self, g: Int, cols: List[Int], mut spare: List[List[Int64]]) raises -> Table:
+        """`read_group`, taking the value buffers of earlier groups from `spare` (when big enough) instead of
+        allocating new ones, so a stream of row groups keeps writing into the same pages of memory."""
         for c in cols:
             self.ensure_words(c)
         ref info = self._info[]
@@ -1986,7 +2003,7 @@ struct ParquetScan(Copyable, Movable):
             metas.append(info.groups[g][c].copy())
             outs.append(k)
             widxs.append(Int(info.widx.unsafe_ptr() + c) if self.schema.kind(c) == TEXT else 0)
-        _decode_group(bases, ns, metas, cols, outs, widxs, False, info.leaves, 0, t)
+        _decode_group(bases, ns, metas, cols, outs, widxs, False, info.leaves, 0, t, spare=Int(UnsafePointer(to=spare)))
         _ = maps^
         t.check()
         return t^

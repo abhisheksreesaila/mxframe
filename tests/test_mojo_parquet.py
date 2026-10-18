@@ -1088,3 +1088,32 @@ def test_text_words_and_codes_through_the_two_phase_decode(cells, tmp_path, vers
         for mode in ("read", "scan"):
             assert subprocess.run([str(binary), str(path), mode], capture_output=True, text=True, check=True).stdout == want_words
             assert subprocess.run([str(binary), str(path), mode, "codes"], capture_output=True, text=True, check=True).stdout == want_codes
+
+
+# ── F-143: the next row group decodes while the kernel runs; errors and sums still follow row-group order ──
+
+def test_a_kernel_error_in_an_earlier_group_beats_a_decode_error_in_the_next(prober, tmp_path):
+    """Group 1's sum overflows (the kernel, task 0) while group 2 is being decoded beside it and is corrupt (task 1):
+    the error of the earlier group is the one raised, as when the groups ran one after the other."""
+    big = 2**62
+    t = pa.table({"v": pa.array([1, 2, 3, big, big, 7, 8, 9], pa.int64())})
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=3, compression="NONE", use_dictionary=False)       # groups: [1 2 3] [big big 7] [8 9]
+    md = pq.read_metadata(path)
+    assert md.num_row_groups == 3
+    raw = bytearray(path.read_bytes())
+    off = md.row_group(2).column(0).data_page_offset
+    raw[off:off + 8] = b"\xff" * 8                                                          # group 2's page header
+    path.write_bytes(raw)
+    p = subprocess.run([str(prober), str(path), "scan", "sum_v"], capture_output=True, text=True)
+    assert p.returncode == 1 and "a sum or an expression passed the int64 range" in p.stdout + p.stderr, p.stdout + p.stderr
+
+
+def test_a_sum_whose_partials_pass_int64_raises_the_same_streamed_and_whole(prober, tmp_path):
+    big = 2**62
+    path = tmp_path / "t.parquet"
+    pq.write_table(pa.table({"v": pa.array([big, big, big, big, -big, 5], pa.int64())}), path, row_group_size=2,
+                   compression="NONE", use_dictionary=False)
+    outs = [subprocess.run([str(prober), str(path), mode, "sum_v"], capture_output=True, text=True) for mode in ("scan", "read")]
+    assert [o.returncode for o in outs] == [1, 1]
+    assert all("a sum or an expression passed the int64 range" in o.stdout + o.stderr for o in outs)
