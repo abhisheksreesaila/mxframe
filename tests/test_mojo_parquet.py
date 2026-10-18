@@ -1039,3 +1039,52 @@ def test_the_first_error_in_page_order_is_the_one_raised(cells, tmp_path):
     multi_page_file(path, [(2, 2, 0, words), (0, 3, 0, short_plain), (0, 3, 8, bad_index)], ptype=6, text=True)
     p = subprocess.run([str(cells), str(path), "read"], capture_output=True, text=True)
     assert p.returncode == 1 and "a Parquet page ends early" in p.stdout + p.stderr, p.stdout + p.stderr
+
+
+# ── F-142: text pages decoded in parallel, words coded in file order ─────────────────────────────────
+
+def text_table(n, seed=5):
+    """uid: unique ids with nulls (every row of a group misses the word index), rep: 60k words repeated across pages
+    with nulls, fb: a few words, then unique ones (dictionary fallback mid-column), small: eight words (dictionary)."""
+    r = _random.Random(seed)
+    vocab = [f"vocab-{j:06d}-padding" for j in range(60_000)]
+    return pa.table({
+        "uid": pa.array([None if r.random() < 0.05 else f"id-{i:09d}-{r.randint(0, 10**6)}" for i in range(n)], pa.string()),
+        "rep": pa.array([None if r.random() < 0.1 else r.choice(vocab) for _ in range(n)], pa.string()),
+        "fb": pa.array([None if i % 11 == 1 else (f"few{r.randint(0, 9)}" if i < n // 4 else f"u{i}-{r.randint(0, 10**6)}") for i in range(n)], pa.string()),
+        "small": pa.array([f"s{r.randint(0, 7)}" for _ in range(n)], pa.string()),
+    })
+
+
+def first_seen_codes(column):
+    codes, out = {}, []
+    for v in column.to_pylist():
+        if v is None:
+            out.append("N")
+        else:
+            out.append(str(codes.setdefault(v, len(codes))))
+    return out
+
+
+@pytest.mark.parametrize("version", ["1.0", "2.0"])
+@pytest.mark.parametrize("codec", ["NONE", "SNAPPY"])
+def test_text_words_and_codes_through_the_two_phase_decode(cells, tmp_path, version, codec):
+    """Every group misses 100k+ words at once (the parallel dedupe runs), pages are small, words repeat across pages
+    and groups: the words AND the codes (first seen, in file order) equal pyarrow's values and a serial first-seen
+    numbering, through read_parquet and the scan, and the serial build gives the same bytes."""
+    n = 240_000
+    t = text_table(n)
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=120_000, data_page_size=64 * 1024, data_page_version=version, compression=codec)
+    want_words = "".join("\t".join(cell_text(t.column(c)[i].as_py(), t.schema.field(c).type) for c in range(4)) + "\n" for i in range(n))
+    cols = [first_seen_codes(t.column(c)) for c in range(4)]
+    want_codes = "".join("\t".join(cols[c][i] for c in range(4)) + "\n" for i in range(n))
+    import os
+    env = dict(os.environ)
+    serial = tmp_path / "pq_cells_serial"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_cells.mojo"), str(serial)],
+                   check=True, capture_output=True, text=True, env={**env, "MXFRAME_BUILD_FLAGS": "-D MXFRAME_SERIAL"})
+    for binary in (cells, serial):
+        for mode in ("read", "scan"):
+            assert subprocess.run([str(binary), str(path), mode], capture_output=True, text=True, check=True).stdout == want_words
+            assert subprocess.run([str(binary), str(path), mode, "codes"], capture_output=True, text=True, check=True).stdout == want_codes
