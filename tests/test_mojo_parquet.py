@@ -1338,3 +1338,49 @@ def test_an_edited_streamed_file_equals_an_outside_replay_and_its_memory_stays_b
     for phase in ("edit_peak_kb", "query_peak_kb", "get_peak_kb", "save_peak_kb"):
         assert res[phase] * 3 < size_kb, (phase, res[phase], size_kb)
     assert res["save_peak_kb"] < 120_000, res["save_peak_kb"]
+
+
+def small_edit_file(path, day_type=None, revenue_type=None, metadata=None, rows=2000):
+    """The probe's five columns (region, carrier, day, revenue, cost) in 500-row groups, with the types asked for."""
+    day_type = day_type or pa.date32()
+    revenue_type = revenue_type or pa.decimal128(18, 2)
+    r = _random.Random(5)
+    days = [_dt.date(2020, 1, 1) + _dt.timedelta(days=i % 300) for i in range(rows)]
+    if pa.types.is_timestamp(day_type):
+        day = pa.array([_dt.datetime(d.year, d.month, d.day, 13, 45) for d in days], day_type)
+    else:
+        day = pa.array(days, day_type)
+    t = pa.table({"region": pa.array([WORDS[i % 3] for i in range(rows)], pa.string()),
+                  "carrier": pa.array([i % 9 for i in range(rows)], pa.int64()), "day": day,
+                  "revenue": pa.array([_dec.Decimal(r.randint(-10**6, 10**6)).scaleb(-2) for _ in range(rows)], revenue_type),
+                  "cost": pa.array([r.randint(-5000, 5000) for _ in range(rows)], pa.int64())})
+    if metadata:
+        t = t.replace_schema_metadata(metadata)
+    pq.write_table(t, path, row_group_size=500, compression="snappy")
+    return t
+
+
+def test_saving_keeps_foreign_key_value_metadata(editor, tmp_path):
+    path, out = tmp_path / "kv.parquet", tmp_path / "kv.out.parquet"
+    small_edit_file(path, metadata={"other": "keep me", "omx": "{\"old\": 1}"})
+    run_edit_probe(editor, path, out, 4)
+    md = pq.read_table(out).schema.metadata
+    assert md[b"other"] == b"keep me"
+    assert json.loads(md[b"omx"]) == {"edited": True}              # omx is the caller's, not the source's
+
+
+@pytest.mark.parametrize("column,kind,lost", [
+    ("day", pa.timestamp("us"), "time of day"),
+    ("revenue", pa.decimal128(9, 2), "DECIMAL(9, 2)"),
+])
+def test_a_save_that_would_lose_what_reading_narrowed_is_refused_unless_allowed(editor, tmp_path, column, kind, lost):
+    path, out = tmp_path / "n.parquet", tmp_path / "n.out.parquet"
+    small_edit_file(path, **{"day_type" if column == "day" else "revenue_type": kind})
+    p = subprocess.run([str(editor), str(path), str(out), "4"], capture_output=True, text=True)
+    said = p.stdout + p.stderr
+    assert p.returncode != 0
+    assert f"column `{column}`" in said and lost in said and "allow_narrowing=True" in said, said
+    assert not out.exists() and not list(tmp_path.glob("*.tmp"))        # nothing written, no temp file left
+    run_edit_probe(editor, path, out, 4, "allow")
+    saved = pq.read_table(out)
+    assert saved.schema.field(column).type == (pa.date32() if column == "day" else pa.decimal128(18, 2))

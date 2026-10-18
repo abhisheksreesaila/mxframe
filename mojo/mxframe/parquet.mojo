@@ -424,8 +424,10 @@ struct ParquetWriter(Movable):
             pass
         _ = external_call["unlink", Int32](self.tmp.as_c_string_span().ptr())
 
-    def finish(mut self, metadata: String) raises:
-        var meta = _footer(self.schema, self.optional, self.total, self.groups, self.rows, metadata, self.codec)
+    def finish(mut self, metadata: String, extra: List[String] = List[String]()) raises:
+        """Writes the footer and moves the file into place. `extra`: other key-value metadata to keep, key then value,
+        key then value... (a scan's `extra_metadata()`)."""
+        var meta = _footer(self.schema, self.optional, self.total, self.groups, self.rows, metadata, self.codec, extra)
         var tail = List[UInt8]()
         var footer = len(meta)
         tail.extend(meta^)
@@ -440,7 +442,7 @@ struct ParquetWriter(Movable):
 
 
 def _footer(t: Table, optional: List[Bool], n: Int, groups: List[List[_Chunk]], rows_of: List[Int], metadata: String,
-            codec: Int) raises -> List[UInt8]:
+            codec: Int, extra: List[String]) raises -> List[UInt8]:
     """The file metadata (Thrift) for the row groups written: `t` supplies the columns' names, kinds and scales."""
     var ncols = t.columns()
     var w = ThriftWriter()
@@ -519,12 +521,19 @@ def _footer(t: Table, optional: List[Bool], n: Int, groups: List[List[_Chunk]], 
         w.i64(2, Int64(total))
         w.i64(3, Int64(rows))
         w.end_struct()
-    if metadata.byte_length() > 0:
-        w.list_header(5, T_STRUCT, 1)
-        w.begin_list_element_struct()
-        w.binary(1, "omx")
-        w.binary(2, metadata)
-        w.end_struct()
+    var pairs = len(extra) // 2 + (1 if metadata.byte_length() > 0 else 0)
+    if pairs > 0:
+        w.list_header(5, T_STRUCT, pairs)
+        if metadata.byte_length() > 0:
+            w.begin_list_element_struct()
+            w.binary(1, "omx")
+            w.binary(2, metadata)
+            w.end_struct()
+        for i in range(len(extra) // 2):
+            w.begin_list_element_struct()
+            w.binary(1, extra[2 * i])
+            w.binary(2, extra[2 * i + 1])
+            w.end_struct()
     w.binary(6, "MX frame version 0.6.0")
     w.end()
     return w^.take()
@@ -879,6 +888,7 @@ struct _Footer(Movable):
     var leaves: List[_Leaf]
     var groups: List[List[_ChunkMeta]]
     var omx: String
+    var extra: List[String]          # the other key-value metadata, key then value (not "omx", not Arrow's schema)
 
 
 def _read_footer(mut r: ThriftReader) raises -> _Footer:
@@ -886,6 +896,7 @@ def _read_footer(mut r: ThriftReader) raises -> _Footer:
     var leaves = List[_Leaf]()
     var groups = List[List[_ChunkMeta]]()
     var omx = String("")
+    var extra = List[String]()
     while True:
         var f = r.field()
         if f[1] == T_STOP:
@@ -917,10 +928,13 @@ def _read_footer(mut r: ThriftReader) raises -> _Footer:
                 r.leave()
                 if key == "omx":
                     omx = value
+                elif key != "ARROW:schema":              # it describes the source's types, which a saved file does not keep
+                    extra.append(key)
+                    extra.append(value)
         else:
             r.skip(f[1])
 
-    return _Footer(leaves^, groups^, omx^)
+    return _Footer(leaves^, groups^, omx^, extra^)
 
 
 def _read_schema_element(mut r: ThriftReader) raises -> _Leaf:
@@ -2296,6 +2310,7 @@ struct _ScanInfo(Movable):
     var dicts: Table                 # TEXT columns' file-wide words, each built on first use
     var widx: List[_WordIndex]       # and their indexes by bytes
     var loaded: List[Bool]
+    var extra: List[String]          # the file's other key-value metadata (key, value, ...)
 
     def __init__(out self, path: String, var file: FileHandle, size: Int, var leaves: List[_Leaf],
                  var groups: List[List[_ChunkMeta]], var rows_of: List[Int], var metadata: String, var dicts: Table):
@@ -2303,6 +2318,7 @@ struct _ScanInfo(Movable):
         self.file = file^
         self.size = size
         self.loaded = List[Bool](length=len(leaves), fill=False)
+        self.extra = List[String]()
         self.widx = List[_WordIndex]()
         for _ in range(len(leaves)):
             self.widx.append(_WordIndex())
@@ -2354,6 +2370,26 @@ struct ParquetScan(Copyable, Movable):
     def metadata(self) -> String:
         """The file's "omx" key-value metadata, "" when there is none."""
         return self._info[].metadata
+
+    def extra_metadata(self) -> List[String]:
+        """The file's key-value metadata other than "omx" and Arrow's schema, key then value, key then value...
+        (`ParquetWriter.finish(.., extra)` writes it back)."""
+        return self._info[].extra.copy()
+
+    def narrowing(self, c: Int) -> String:
+        """What reading column `c` into MX frame's kinds loses that writing it back would not restore, "" when
+        nothing: a TIMESTAMP is held as its UTC day, a DECIMAL as DECIMAL(18, s), an ENUM or JSON string as text."""
+        ref leaf = self._info[].leaves[c]
+        if _is_timestamp(leaf):
+            return "TIMESTAMP in the file and is held as a DATE: saving would lose the time of day"
+        if (leaf.converted == CT_DECIMAL or leaf.logical == 5) and leaf.precision > 0 and leaf.precision != 18:
+            return "DECIMAL(" + String(leaf.precision) + ", " + String(leaf.scale) + ") in the file: saving would write DECIMAL(18, " + \
+                   String(leaf.scale) + ")"
+        if leaf.converted == CT_ENUM or leaf.logical == 4:
+            return "an ENUM in the file: saving would write plain text"
+        if leaf.converted == CT_JSON or leaf.logical == 12:
+            return "JSON in the file: saving would write plain text"
+        return ""
 
     def nullable(self, c: Int) -> Bool:
         """Column `c` is declared OPTIONAL in the file (it may hold nulls; a REQUIRED column holds none)."""
@@ -2659,4 +2695,6 @@ def scan_parquet(path: String) raises -> ParquetScan:
                         " columns, the schema " + String(n_cols))
         rows_of.append(footer.groups[g][0].values if n_cols > 0 else 0)
         groups.append(footer.groups[g].copy())
-    return ParquetScan(_ScanInfo(path, file^, size, cols^, groups^, rows_of^, footer.omx.copy(), dicts^), schema^.share())
+    var info = _ScanInfo(path, file^, size, cols^, groups^, rows_of^, footer.omx.copy(), dicts^)
+    info.extra = footer.extra.copy()
+    return ParquetScan(info^, schema^.share())

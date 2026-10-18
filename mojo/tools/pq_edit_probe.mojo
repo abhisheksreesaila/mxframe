@@ -5,7 +5,7 @@
 #   region of row (k * 7919 + 5) % rows := "Fresh" (a word the file lacks)   for k in 0..99
 #   rows (k * 999983 + 17) % rows removed                      for k in 0..199
 #   50 rows appended: region "Appended", carrier 3, day 2020-01-01, revenue 1.50, cost 77
-# Usage: pq_edit_probe <path> <out path> <cache MiB> [permute]     (the file is the one pq_scan_probe reads)
+# Usage: pq_edit_probe <path> <out path> <cache MiB> [permute] [allow]     (the file is the one pq_scan_probe reads)
 from std.sys import argv
 from std.time import perf_counter_ns
 from mxframe import Frame, Query, col, sum, count, scan_parquet, AUTO
@@ -29,7 +29,11 @@ def main() raises:
     var path = String(args[1])
     var out = String(args[2])
     var cache = Int(String(args[3])) * 1024 * 1024
-    var permute = len(args) > 4 and String(args[4]) == "permute"
+    var permute = False
+    var allow = False                                        # "allow": save even if a column was narrowed on read
+    for i in range(4, len(args)):
+        permute = permute or String(args[i]) == "permute"
+        allow = allow or String(args[i]) == "allow"
     var t0 = perf_counter_ns()
     var scan = scan_parquet(path)
     var f = Frame(scan)
@@ -76,6 +80,6 @@ def main() raises:
         var order = f.permutation(cost, False)
         json += ', "permute_ms": ' + String(ms_since(t0)) + ', "permute_len": ' + String(len(order)) + ', "permute_first": ' + String(order[0]) + ', "permute_peak_kb": ' + String(peak_kb())
     t0 = perf_counter_ns()
-    f.save(out, "{\"edited\": true}")
+    f.save(out, "{\"edited\": true}", allow_narrowing=allow)
     json += ', "save_ms": ' + String(ms_since(t0)) + ', "save_peak_kb": ' + String(peak_kb()) + ', "opened_peak_kb": ' + String(opened_kb)
     print(json + "}")

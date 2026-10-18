@@ -65,55 +65,96 @@ def _pow10(k: Int) -> Int64:
 struct _ChunkCache(Movable):
     """What a Frame over a scan keeps of the file: decoded column chunks (one column of one row group) up to `limit`
     bytes, least recently used out first (the newest chunk is always kept, so a chunk bigger than the limit still
-    reads), and the base values of the rows the session touched (`rows`, filled by `Frame.overlay`)."""
-    var keys: List[Int]              # (group << 20) | column
-    var tables: List[Table]          # one column each
-    var used: List[Int]              # the clock at each chunk's last use
+    reads), and the base values of the rows the session touched (`rows`, filled by `Frame.overlay`). A chunk lives in a
+    slot of `tables`; `slot_of` finds a key's slot and a doubly linked list through the slots keeps the use order, so a
+    lookup, a use and an eviction are all O(1)."""
+    var slot_of: Dict[Int, Int]      # (group << 20) | column -> slot
+    var tables: List[Table]          # per slot: one column (an empty table in a free slot)
+    var keys: List[Int]              # per slot: its key
+    var newer: List[Int]             # per slot: the next more recently used slot, -1 for the newest
+    var older: List[Int]             # per slot: the next less recently used slot, -1 for the oldest
+    var free: List[Int]              # slots with no chunk
+    var newest: Int
+    var oldest: Int
     var held: Int                    # bytes in `tables`
     var limit: Int
-    var clock: Int
     var loads: Int                   # chunks decoded so far
     var rows: Dict[Int, List[Int64]] # touched row -> its stored values from the file (NULL_EDIT: null)
 
     def __init__(out self):
-        self.keys = List[Int]()
+        self.slot_of = Dict[Int, Int]()
         self.tables = List[Table]()
-        self.used = List[Int]()
+        self.keys = List[Int]()
+        self.newer = List[Int]()
+        self.older = List[Int]()
+        self.free = List[Int]()
+        self.newest = -1
+        self.oldest = -1
         self.held = 0
         self.limit = CACHE_BYTES
-        self.clock = 0
         self.loads = 0
         self.rows = Dict[Int, List[Int64]]()
 
+    def _unlink(mut self, i: Int):
+        var n = self.newer[i]
+        var o = self.older[i]
+        if o >= 0:
+            self.newer[o] = n
+        else:
+            self.oldest = n
+        if n >= 0:
+            self.older[n] = o
+        else:
+            self.newest = o
+
+    def _push_newest(mut self, i: Int):
+        self.older[i] = self.newest
+        self.newer[i] = -1
+        if self.newest >= 0:
+            self.newer[self.newest] = i
+        else:
+            self.oldest = i
+        self.newest = i
+
     def evict(mut self, keep: Int):
         """Drops least recently used chunks until the rest fit `keep` bytes."""
-        while len(self.keys) > 0 and self.held > keep:
-            var at = 0
-            for i in range(1, len(self.keys)):
-                if self.used[i] < self.used[at]:
-                    at = i
-            self.held -= _chunk_bytes(self.tables[at])
-            _ = self.keys.pop(at)
-            _ = self.tables.pop(at)
-            _ = self.used.pop(at)
+        while self.oldest >= 0 and self.held > keep:
+            var i = self.oldest
+            self._unlink(i)
+            self.held -= _chunk_bytes(self.tables[i])
+            _ = self.slot_of.pop(self.keys[i], 0)
+            self.tables[i] = Table.empty()
+            self.free.append(i)
 
     def fetch(mut self, scan: ParquetScan, g: Int, c: Int) raises -> Int:
-        """The index in `tables` of column c of row group g, decoded now if it is not held."""
+        """The slot in `tables` of column c of row group g, decoded now if it is not held."""
         var key = (g << 20) | c
-        self.clock += 1
-        for i in range(len(self.keys)):
-            if self.keys[i] == key:
-                self.used[i] = self.clock
-                return i
+        var hit = self.slot_of.get(key)
+        if hit:
+            var i = hit.value()
+            if self.newest != i:
+                self._unlink(i)
+                self._push_newest(i)
+            return i
         var t = scan.read_group(g, [c])
         var size = _chunk_bytes(t)
         self.evict(self.limit - size)
-        self.keys.append(key)
-        self.tables.append(t^)
-        self.used.append(self.clock)
+        var i: Int
+        if len(self.free) > 0:
+            i = self.free.pop()
+            self.tables[i] = t^
+            self.keys[i] = key
+        else:
+            i = len(self.tables)
+            self.tables.append(t^)
+            self.keys.append(key)
+            self.newer.append(-1)
+            self.older.append(-1)
+        self.slot_of[key] = i
+        self._push_newest(i)
         self.held += size
         self.loads += 1
-        return len(self.keys) - 1
+        return i
 
 
 def _chunk_bytes(t: Table) -> Int:
@@ -751,18 +792,25 @@ struct Frame(Movable):
                     t.append(c, self.alias(c, raw))
         return t^
 
-    def save(self, path: String, metadata: String = "", compression: Int = ZSTD) raises:
+    def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False) raises:
         """Writes the edited rows to a new Parquet file (`metadata` under the key "omx"; the file replaces `path` by
         rename, so `path` may be the file this frame reads). A frame over a scan streams: one row group of the file at
         a time (all its columns decoded, edits applied, encoded and written; appended rows follow in groups of
         DEFAULT_ROW_GROUP), so the memory is one row group, the file's dictionaries and the edits, whatever the size.
         The saved row groups are the source's, less the removed rows. A frame over a table writes `bake()`. Formulas
-        are not stored."""
+        are not stored. The file's other key-value metadata is written back (not Arrow's schema, which describes the
+        source's types). A column that reading narrowed (TIMESTAMP held as DATE, DECIMAL(9, 2) as DECIMAL(18, 2), ENUM or
+        JSON as text) makes `save` raise, naming the column and what would be lost, unless `allow_narrowing`."""
         if not self.scan:
             write_parquet(path, self.bake(), metadata, compression)
             return
         ref scan = self.scan.value()
         var stored = self.stored()
+        if not allow_narrowing:
+            for c in range(stored):
+                var lost = scan.narrowing(c)
+                if lost.byte_length() > 0:
+                    raise Error("column `" + self.base.name(c) + "` is " + lost + ". Nothing was written; pass allow_narrowing=True to save anyway")
         var out = Table.empty()                              # one row group's rows at a time; its words are the file's
         var null_edit = List[Bool](length=stored, fill=False)
         for item in self.cells.items():
@@ -825,13 +873,14 @@ struct Frame(Movable):
                 if not self.alive(row):
                     continue
                 for c in range(stored):
-                    _push_value(out, c, self.added[row - self.nbase][c], remap[c])
+                    var hit = self.cells.get((row << 20) | c)        # an appended row can be edited too
+                    _push_value(out, c, hit.value() if hit else self.added[row - self.nbase][c], remap[c])
                 if out.rows() >= DEFAULT_ROW_GROUP:
                     w.write_group(out)
                     _clear_rows(out)
             if out.rows() > 0 or w.group_count() == 0:
                 w.write_group(out)
-            w.finish(metadata)
+            w.finish(metadata, scan.extra_metadata())
         except e:
             w.abort()
             raise e^
