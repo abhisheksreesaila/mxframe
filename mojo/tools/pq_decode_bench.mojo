@@ -11,6 +11,8 @@ from mxframe.kernels._fpenv import core_count
 def plan(var q: Query, which: String) raises -> Query:
     if which == "numeric":
         return q^.group_by(col("carrier"), groups=10).agg(sum(col("cost")), sum(col("revenue")), count(), max_of(col("day")))
+    if which == "plain":
+        return q^.group_by(col("carrier"), groups=10).agg(sum(col("cost")), count())
     return q^.group_by(col("region"), groups=8).agg(count(), sum(col("cost")))
 
 

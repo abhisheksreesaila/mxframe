@@ -28,7 +28,7 @@ referenced, so nothing links. On Linux both codecs work as before.
 """
 from std.ffi import external_call
 from std.sys import is_defined, CompilationTarget
-from std.bit import pop_count
+from std.bit import pop_count, byte_swap
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
@@ -714,51 +714,6 @@ def _to_stored(leaf: _Leaf, raw: Int64) raises -> Int64:
     return raw
 
 
-def _plain(mut c: _Bytes, leaf: _Leaf, count: Int, mut t: Table, col: Int, mut out: List[Int64], gcol: Int = 0) raises:
-    """`count` PLAIN values as stored Int64s (TEXT words become the column's codes; with `gcol`, the address of a
-    finished file-wide TEXT `Column`, the codes of that dictionary, so a scan never builds a chunk-local one)."""
-    if count < 0:
-        raise Error("column `" + leaf.name + "`: a page has a negative value count (corrupt file)")
-    if leaf.ptype == PT_BOOLEAN:
-        _unpack(c, 1, count, out)
-    elif leaf.ptype == PT_INT32:
-        for _ in range(count):
-            out.append(_to_stored(leaf, c.le(4)))
-    elif leaf.ptype == PT_INT64:
-        for _ in range(count):
-            out.append(_to_stored(leaf, c.le(8)))
-    elif leaf.ptype == PT_BYTE_ARRAY:
-        for _ in range(count):
-            var n = Int(c.le(4)) & 0xFFFFFFFF
-            c.need(n)
-            if not _valid_utf8(c.base + c.pos, n):
-                raise Error("column `" + leaf.name + "`: a text value is not valid UTF-8")
-            var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](
-                unsafe_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos), length=n))
-            c.pos += n
-            if gcol != 0:
-                var code = UnsafePointer[Column, MutAnyOrigin](unsafe_from_address=gcol)[].codes.get(s, -1)
-                if code < 0:
-                    raise Error("column `" + leaf.name + "`: a word is missing from the file's dictionary (corrupt file)")
-                out.append(Int64(code))
-            else:
-                out.append(Int64(t.add_word(col, s)))
-    elif leaf.ptype == PT_FIXED:                        # a big-endian two's-complement decimal
-        var w = leaf.type_length
-        if w < 1 or w > 16:
-            raise Error("column `" + leaf.name + "` has a fixed length of " + String(w) + " bytes (corrupt file)")
-        if count > (c.n - c.pos) // w:
-            raise Error("a Parquet page ends early (corrupt file)")
-        for _ in range(count):
-            var v: Int64 = -1 if c.at(c.pos) >= 0x80 else 0
-            for i in range(w):
-                v = (v << 8) | Int64(c.at(c.pos + i))
-            c.pos += w
-            out.append(v)
-    else:
-        raise Error("column `" + leaf.name + "`: its physical type cannot be read yet")
-
-
 def read_parquet(path: String) raises -> ParquetResult:
     """Reads a Parquet file (written by MX frame, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata."""
     var file = _open_file(path)
@@ -785,28 +740,39 @@ def read_parquet(path: String) raises -> ParquetResult:
     var ids = List[Int]()
     var bases = List[Int]()
     var ns = List[Int]()
-    var gcols = List[Int]()
+    var widx = List[_WordIndex]()
+    var widxs = List[Int]()
     var total = 0
     for c in range(len(cols)):
         ids.append(c)
         bases.append(base)
         ns.append(n)
-        gcols.append(0)
+        widx.append(_WordIndex())
+        widx[c].col = Int(t.cols.unsafe_ptr() + c)
+    for c in range(len(cols)):
+        widxs.append(Int(widx.unsafe_ptr() + c))
     for g in range(len(groups)):
         if len(cols) > 0 and len(groups[g]) == len(cols):
             total += groups[g][0].values
-    for c in range(len(cols)):                                  # room for every row: a hint, bounded by the file
-        t.cols[c].values.reserve(max(0, min(total, 64 * n + 1024)))
+    if total <= 64 * n + 1024:                                  # size every column once (a corrupt count cannot ask for more
+        for c in range(len(cols)):                              # than the file could plausibly hold); the pages write every row
+            t.cols[c].values = List[Int64](unsafe_uninit_length=total)
     var row0 = 0
     for g in range(len(groups)):
         if len(groups[g]) != len(cols):
             raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(groups[g])) +
                         " columns, the schema " + String(len(cols)))
-        _decode_group(bases, ns, groups[g], ids, ids, gcols, cols, row0, t)
+        _decode_group(bases, ns, groups[g], ids, ids, widxs, True, cols, row0, t)
         if len(cols) > 0:
             row0 += groups[g][0].values
+    for c in range(len(cols)):                                  # (a presized column holds exactly the rows read)
+        if len(t.cols[c].values) > row0:
+            t.cols[c].values.shrink(row0)
+        if len(t.cols[c].validity) > (row0 + 7) // 8:
+            t.cols[c].validity.shrink((row0 + 7) // 8)
     t.check()
     map.release()
+    _ = widx^                                                   # the word indexes are read by address above
     return ParquetResult(t^, footer.omx.copy())
 
 
@@ -1043,10 +1009,81 @@ struct _Ctx(Copyable, Movable):
     var col: Int                     # the output column
     var codec: Int
     var optional: Bool
-    var gcol: Int                    # address of the file-wide TEXT `Column` to look words up in, 0: add to the table
+    var widx: Int                    # address of the TEXT column's `_WordIndex` (0 for other kinds)
+    var add: Bool                    # new words are added to the table (else a word that is missing is a corrupt file)
     var dict: List[Int64]            # the chunk's dictionary page as stored values (file-wide codes for TEXT)
     var row0: Int                    # the chunk's first row in the output column
     var rows: Int
+
+
+struct _WordIndex(Movable):
+    """A TEXT column's words by their bytes: an open-addressing table over the words of the table's `Column` (found by
+    its address), so a value that is already a word is found without making a String. Reads are safe from many
+    threads; `insert` runs on the calling thread only."""
+    var col: Int                     # address of the table's TEXT Column (its `words` hold the bytes)
+    var slots: List[Int32]           # -1 empty, else a code
+    var hashes: List[UInt64]         # by code
+    var mask: Int
+
+    def __init__(out self):
+        self.col = 0
+        self.slots = List[Int32](length=1024, fill=-1)
+        self.hashes = List[UInt64]()
+        self.mask = 1023
+
+    def find(self, p: UnsafePointer[UInt8, MutAnyOrigin], n: Int, h: UInt64) -> Int:
+        var words = UnsafePointer[Column, MutAnyOrigin](unsafe_from_address=self.col)[].words.unsafe_ptr()
+        var i = Int(h) & self.mask
+        while True:
+            var code = Int(self.slots[i])
+            if code < 0:
+                return -1
+            if self.hashes[code] == h and words[code].byte_length() == n:
+                var q = words[code].unsafe_ptr()
+                var same = True
+                for k in range(n):
+                    if q[k] != p[k]:
+                        same = False
+                        break
+                if same:
+                    return code
+            i = (i + 1) & self.mask
+
+    def insert(mut self, h: UInt64, code: Int):
+        if code >= len(self.hashes):
+            self.hashes.append(h)
+        if (len(self.hashes) + 1) * 2 > len(self.slots):         # load factor 1/2: double and re-place every code
+            var size = len(self.slots) * 2
+            self.slots = List[Int32](length=size, fill=-1)
+            self.mask = size - 1
+            for c in range(len(self.hashes)):
+                var j = Int(self.hashes[c]) & self.mask
+                while self.slots[j] >= 0:
+                    j = (j + 1) & self.mask
+                self.slots[j] = Int32(c)
+            return
+        var j = Int(h) & self.mask
+        while self.slots[j] >= 0:
+            j = (j + 1) & self.mask
+        self.slots[j] = Int32(code)
+
+
+def _hash_bytes(p: UnsafePointer[UInt8, MutAnyOrigin], n: Int) -> UInt64:
+    var h = UInt64(0x9E3779B97F4A7C15) ^ UInt64(n)
+    var i = 0
+    while i + 8 <= n:
+        h = (h ^ (p + i).bitcast[UInt64]().load[alignment=1]()) * UInt64(0xFF51AFD7ED558CCD)
+        h ^= h >> 32
+        i += 8
+    var tail: UInt64 = 0
+    var k = 0
+    while i < n:
+        tail |= UInt64(p[i]) << UInt64(8 * k)
+        i += 1
+        k += 1
+    h = (h ^ tail) * UInt64(0xC4CEB9FE1A85EC53)
+    h ^= h >> 29
+    return h
 
 
 def _get_bit(p: UnsafePointer[UInt8, MutAnyOrigin], i: Int) -> Bool:
@@ -1191,16 +1228,17 @@ def _plain_into(mut c: _Bytes, leaf: _Leaf, ctx: _Ctx, count: Int, dout: UnsafeP
             c.need(n)
             if not _valid_utf8(c.base + c.pos, n):
                 raise Error("column `" + leaf.name + "`: a text value is not valid UTF-8")
-            var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](
-                unsafe_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos), length=n))
+            var wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
             c.pos += n
-            var code: Int
-            if ctx.gcol != 0:
-                code = UnsafePointer[Column, MutAnyOrigin](unsafe_from_address=ctx.gcol)[].codes.get(s, -1)
-                if code < 0:
+            var h = _hash_bytes(wp, n)
+            var wi = UnsafePointer[_WordIndex, MutAnyOrigin](unsafe_from_address=ctx.widx)
+            var code = wi[].find(wp, n, h)
+            if code < 0:
+                if not ctx.add:
                     raise Error("column `" + leaf.name + "`: a word is missing from the file's dictionary (corrupt file)")
-            else:
+                var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](unsafe_ptr=wp, length=n))
                 code = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=tbl)[].add_word(ctx.col, s)
+                wi[].insert(h, code)
             if store:
                 dout[i] = Int64(code)
     elif leaf.ptype == PT_FIXED:                        # a big-endian two's-complement decimal
@@ -1209,12 +1247,18 @@ def _plain_into(mut c: _Bytes, leaf: _Leaf, ctx: _Ctx, count: Int, dout: UnsafeP
             raise Error("column `" + leaf.name + "` has a fixed length of " + String(w) + " bytes (corrupt file)")
         if count > (c.n - c.pos) // w:
             raise Error("a Parquet page ends early (corrupt file)")
-        for i in range(count):
-            var v: Int64 = -1 if c.at(c.pos) >= 0x80 else 0
-            for k in range(w):
-                v = (v << 8) | Int64(c.at(c.pos + k))
-            c.pos += w
-            dout[i] = v
+        if w >= 8:                                       # only the last 8 bytes survive an int64: one byte swap each
+            var q = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos + (w - 8))
+            for i in range(count):
+                dout[i] = byte_swap((q + i * w).bitcast[Int64]().load[alignment=1]())
+            c.pos += count * w
+        else:
+            for i in range(count):
+                var v: Int64 = -1 if c.at(c.pos) >= 0x80 else 0
+                for k in range(w):
+                    v = (v << 8) | Int64(c.at(c.pos + k))
+                c.pos += w
+                dout[i] = v
     else:
         raise Error("column `" + leaf.name + "`: its physical type cannot be read yet")
 
@@ -1359,7 +1403,7 @@ def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) r
     _ = nowhere^
 
 
-def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx, ctx_at: Int, mut t: Table,
+def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx, ctx_at: Int, tbl: Int,
                 mut pages: List[_Page], words_only: Bool) raises:
     """Reads a chunk's page headers (`base` + file offset = the page's address; `n` bounds the offsets). A dictionary
     page is decoded now; each data page is appended to `pages`."""
@@ -1426,10 +1470,13 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             raise Error("column `" + leaf.name + "`: a page runs past the end of the file (corrupt file)")
         pos = body_at + csize
         if ptype == PAGE_DICTIONARY:
-            var page = _decompress(meta.codec, base + body_at, csize, usize)
-            var c = _Bytes(Int(page.unsafe_ptr()), len(page))
-            ctx.dict.clear()
-            _plain(c, leaf, nvals, t, ctx.col, ctx.dict, ctx.gcol)
+            if nvals > 8 * usize + 8:
+                raise Error("column `" + leaf.name + "`: a dictionary page holds more values than its bytes can (corrupt file)")
+            var page = List[UInt8]()
+            var c = _Bytes(_page_bytes(meta.codec, base + body_at, csize, usize, page), usize)
+            ctx.dict = List[Int64](unsafe_uninit_length=nvals)
+            _plain_into(c, leaf, ctx, nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(ctx.dict.unsafe_ptr())),
+                        tbl, True)
             _ = page^
             continue
         if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
@@ -1440,40 +1487,44 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
         if words_only and dict_coded:
             done += nvals
             continue
-        var serial = leaf.ptype == PT_BYTE_ARRAY and ctx.gcol == 0 and encoding == ENC_PLAIN
+        var serial = leaf.ptype == PT_BYTE_ARRAY and ctx.add and encoding == ENC_PLAIN
         pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
                            v2_compressed, ctx_at, ctx.row0 + done, serial, 0, List[UInt8](), String()))
         done += nvals
 
 
 def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf_ids: List[Int], out_cols: List[Int],
-                  gcols: List[Int], leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False) raises:
+                  widxs: List[Int], add_words: Bool, leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False) raises:
     """Decodes one row group: chunk k (`metas[k]`, at `bases[k]` / `ns[k]`, leaf `leaf_ids[k]`) becomes rows
-    row0.. of table column `out_cols[k]`, whose TEXT words come from `gcols[k]` (a file-wide dictionary) or are added
-    to the table (0). `words_only`: only the TEXT words are added to the table (a dictionary build)."""
+    row0.. of table column `out_cols[k]`, whose TEXT words are found in `widxs[k]` (a `_WordIndex` over the table's
+    column) and, when `add_words`, added to it. `words_only`: only the TEXT words are added to the table (a dictionary build)."""
     if len(metas) == 0:
         return
+    var tbl = Int(UnsafePointer(to=t))
     var ctxs = List[_Ctx]()
     var pages = List[_Page]()
     var rows = -1
     for k in range(len(metas)):
-        ctxs.append(_Ctx(leaf_ids[k], out_cols[k], metas[k].codec, leaves[leaf_ids[k]].repetition == OPTIONAL, gcols[k],
-                         List[Int64](), row0, metas[k].values))
+        ctxs.append(_Ctx(leaf_ids[k], out_cols[k], metas[k].codec, leaves[leaf_ids[k]].repetition == OPTIONAL, widxs[k],
+                         add_words, List[Int64](), row0, metas[k].values))
         if rows < 0:
             rows = metas[k].values
         elif metas[k].values != rows:
             raise Error("column `" + leaves[leaf_ids[k]].name + "` has " + String(metas[k].values) + " rows in this row group, column `" +
                         leaves[leaf_ids[0]].name + "` has " + String(rows) + " (corrupt file)")
-        _walk_chunk(bases[k], ns[k], metas[k], leaves[leaf_ids[k]], ctxs[k], k, t, pages, words_only)
-    var tbl = Int(UnsafePointer(to=t))
+        _walk_chunk(bases[k], ns[k], metas[k], leaves[leaf_ids[k]], ctxs[k], k, tbl, pages, words_only)
     if not words_only:
         for k in range(len(out_cols)):                  # size the columns once: the pages add up to the rows
             ref col = t.cols[out_cols[k]]
-            if len(col.values) != row0:
+            if len(col.values) < row0:
                 raise Error("column `" + col.name + "`: rows do not line up (corrupt file)")
-            col.values.resize(row0 + rows, 0)
-            if len(col.validity) > 0:                    # a bitmap that exists covers every row
-                col.validity.resize((row0 + rows + 7) // 8, 0xFF)
+            if len(col.values) < row0 + rows:            # (read_parquet sizes the whole column up front)
+                if row0 == 0:                            # every row is written below, values or a zero for a null
+                    col.values = List[Int64](unsafe_uninit_length=rows)
+                else:
+                    col.values.resize(row0 + rows, 0)
+            if 0 < len(col.validity) < (len(col.values) + 7) // 8:      # a bitmap that exists covers every row
+                col.validity.resize((len(col.values) + 7) // 8, 0xFF)
     for i in range(len(pages)):                         # words are added in file order
         if pages[i].serial:
             ref ctx = ctxs[pages[i].ctx]
@@ -1597,6 +1648,7 @@ struct _ScanInfo(Movable):
     var rows_of: List[Int]
     var metadata: String
     var dicts: Table                 # TEXT columns' file-wide words, each built on first use
+    var widx: List[_WordIndex]       # and their indexes by bytes
     var loaded: List[Bool]
 
     def __init__(out self, path: String, var file: FileHandle, size: Int, var leaves: List[_Leaf],
@@ -1605,6 +1657,9 @@ struct _ScanInfo(Movable):
         self.file = file^
         self.size = size
         self.loaded = List[Bool](length=len(leaves), fill=False)
+        self.widx = List[_WordIndex]()
+        for _ in range(len(leaves)):
+            self.widx.append(_WordIndex())
         self.leaves = leaves^
         self.groups = groups^
         self.rows_of = rows_of^
@@ -1682,10 +1737,12 @@ struct ParquetScan(Copyable, Movable):
             return
         ref info = self._info[]
         info.check_unchanged()
+        info.widx[c].col = Int(info.dicts.cols.unsafe_ptr() + c)
         for g in range(len(info.groups)):
             var maps = List[_Mapped]()
             var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
-            _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [0], info.leaves, 0, info.dicts, words_only=True)
+            _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [Int(info.widx.unsafe_ptr() + c)], True,
+                          info.leaves, 0, info.dicts, words_only=True)
             _ = maps^
         info.loaded[c] = True
 
@@ -1716,7 +1773,7 @@ struct ParquetScan(Copyable, Movable):
         var ns = List[Int]()
         var metas = List[_ChunkMeta]()
         var outs = List[Int]()
-        var gcols = List[Int]()
+        var widxs = List[Int]()
         for k in range(len(cols)):
             var c = cols[k]
             _ = t.add_column(self.schema.name(c), self.schema.kind(c), scale=self.schema.scale(c))
@@ -1725,8 +1782,8 @@ struct ParquetScan(Copyable, Movable):
             ns.append(src[1])
             metas.append(info.groups[g][c].copy())
             outs.append(k)
-            gcols.append(Int(info.dicts.cols.unsafe_ptr() + c) if self.schema.kind(c) == TEXT else 0)
-        _decode_group(bases, ns, metas, cols, outs, gcols, info.leaves, 0, t)
+            widxs.append(Int(info.widx.unsafe_ptr() + c) if self.schema.kind(c) == TEXT else 0)
+        _decode_group(bases, ns, metas, cols, outs, widxs, False, info.leaves, 0, t)
         _ = maps^
         t.check()
         return t^
