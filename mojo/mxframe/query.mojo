@@ -37,7 +37,7 @@ from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
-from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext
+from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
 from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
 from .frame import text_ranks
 
@@ -173,7 +173,7 @@ struct Query(Movable):
     var scan: Optional[ParquetScan]      # a Parquet file streamed one row group at a time (`Query(scan)`)
     var _morsels: Int                    # a Parquet scan by morsels: MORSELS_AUTO, MORSELS_ON or MORSELS_OFF (F-149)
     var _block_rows: Int                 # ... in blocks of this many rows (0: SCAN_BLOCK_ROWS)
-    var _gpu_ops: Int                    # AUTO sends a streamed file to the GPU above this many kernel instructions a row per core
+    var _gpu_ops: Int                    # AUTO sends a streamed file to the GPU above this many kernel instructions a row per core per column read
     var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
 
@@ -184,7 +184,7 @@ struct Query(Movable):
         self._window_rows = 0
         self._morsels = MORSELS_AUTO
         self._block_rows = 0
-        self._gpu_ops = AUTO_GPU_OPS_PER_CORE
+        self._gpu_ops = AUTO_GPU_OPS_PER_CORE_COLUMN
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
         self.overlay = Overlay(table)
@@ -198,7 +198,7 @@ struct Query(Movable):
         self._window_rows = 0
         self._morsels = MORSELS_AUTO
         self._block_rows = 0
-        self._gpu_ops = AUTO_GPU_OPS_PER_CORE
+        self._gpu_ops = AUTO_GPU_OPS_PER_CORE_COLUMN
         self.scan = scan.copy()
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
@@ -210,7 +210,7 @@ struct Query(Movable):
         self._window_rows = 0
         self._morsels = MORSELS_AUTO
         self._block_rows = 0
-        self._gpu_ops = AUTO_GPU_OPS_PER_CORE
+        self._gpu_ops = AUTO_GPU_OPS_PER_CORE_COLUMN
         self.scan = frame.scan.copy()                    # a Frame over a scan streams the file with the overlay (F-147)
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
@@ -256,10 +256,10 @@ struct Query(Movable):
         self._morsels = mode
         return self^
 
-    def auto_gpu_ops(var self, ops_per_core: Int) -> Self:
+    def auto_gpu_ops(var self, ops_per_core_column: Int) -> Self:
         """For a Parquet scan on AUTO: the GPU when the plan runs more than this many kernel instructions a row per core
-        (default AUTO_GPU_OPS_PER_CORE); 0 sends every big enough file to the GPU (tests, timing)."""
-        self._gpu_ops = ops_per_core
+        per column read (default AUTO_GPU_OPS_PER_CORE_COLUMN); 0 sends every file to the GPU (tests, timing)."""
+        self._gpu_ops = ops_per_core_column
         return self^
 
     def block_rows(var self, rows: Int) -> Self:
@@ -1307,13 +1307,22 @@ struct _QueryBuffers(Movable):
 
 
 def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool, mut fallback: String) raises -> Optional[QueryResult]:
+    var data = List[Int]()
+    var valid = List[Int]()
+    for c in range(t.columns()):
+        data.append(dt.data_address(c))
+        valid.append(dt.validity_address(c))
+    return _run_gpu_cols(dt.context(), data, valid, t.rows(), t, p, mask, strict, fallback)
+
+
+def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int], n_rows: Int, t: SharedTable, p: Program,
+                  mask: List[UInt8], strict: Bool, mut fallback: String) raises -> Optional[QueryResult]:
     """The lowered program on the device table (kernels/pipeline_gpu.mojo, keyed mode: the group id is register 0).
     Same answers as `_run_cpu`: exact int64 totals, the overflow flag raises the same error.
 
     `strict` (device=GPU) raises on every failure. On AUTO only two things send the query to the CPU, and `fallback`
     says which: the device cannot hold the query's buffers (an allocation failed), or the kernel declined the
     program (needs more shared memory than a block has: -5). A launch error, an illegal address or an int64 overflow is a bug or an answer: it always raises."""
-    var ctx = dt.context()
     var ins = p.pred.copy()
     ins.extend(p.body.copy())
     ins.extend(p.aggs.copy())
@@ -1359,13 +1368,13 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
     var cols = List[Int64]()
     for c in p.cols:
         if c >= 0:
-            cols.append(Int64(dt.data_address(c)))
+            cols.append(Int64(data_addr[c]))
         elif c == -1_000_000 or c == -5_000_000:
             cols.append(0)
         elif c == -4_000_000:
             cols.append(Int64(Int(b.mask.unsafe_ptr())))
         else:
-            cols.append(Int64(dt.validity_address(-1 - c)))
+            cols.append(Int64(valid_addr[-1 - c]))
     if len(cols) == 0:
         cols.append(0)
     var dtypes = p.dtypes.copy()
@@ -1389,7 +1398,7 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
     var agg_base = (len(p.pred) + len(p.body)) // 5
     var rc = run_pipeline_gpu(ctx, Int(d_code.unsafe_ptr()), Int(d_consts.unsafe_ptr()), Int(d_set.unsafe_ptr()),
                               Int(d_set.unsafe_ptr()), Int(d_cols.unsafe_ptr()), Int(d_dt.unsafe_ptr()),
-                              -1 if p.keyed else 0, G, A, 0, t.rows(), Int(d_vals.unsafe_ptr()),
+                              -1 if p.keyed else 0, G, A, 0, n_rows, Int(d_vals.unsafe_ptr()),
                               Int(d_cnt.unsafe_ptr()), Int(d_ident.unsafe_ptr()), Int(d_scratch.unsafe_ptr()),
                               n_regs, len(code), agg_base, n_blocks, 1, 0, Int(d_ovf.unsafe_ptr()), True)
     if rc != 0:
@@ -1496,12 +1505,14 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
 
 comptime SCAN_BLOCK_ROWS = 32768
 # AUTO runs a streamed file on the GPU when the file has at least this many rows and the plan costs the CPU more than the
-# trip to the device: a row group is decoded on the CPU either way and then moved over the bus (~10 ns a row for four
-# columns), while the CPU kernel costs ~1 ns a row per instruction per core (F-146 in docs/plan.md has the measurements:
-# 20M rows, 12 cores: the CPU scan wins even for 35 instructions a row; 2 cores: the GPU wins by 2.2x; 4 cores: a tie).
-# So the GPU is picked when instructions a row > AUTO_GPU_OPS_PER_CORE x cores.
+# trip to the device. A row group is decoded on the CPU either way (into pinned memory when the GPU takes it) and then
+# copied over the bus: that costs per column read (8 bytes a row each); the CPU kernel costs per instruction of the plan,
+# spread over the cores. Measured on 20M rows (F-146 in docs/plan.md), a light plan (28 instructions, 4 columns) and a heavy
+# one (90 instructions, 3 columns): 12 cores: the CPU wins both; 4 cores: light is a tie, heavy goes to the GPU by 1.9x;
+# 2 cores: light goes to the GPU by 1.25x, heavy by 2.7x. So the GPU is picked when
+#     instructions a row > AUTO_GPU_OPS_PER_CORE_COLUMN x columns read x cores.
 comptime AUTO_GPU_SCAN_MIN_ROWS = 5_000_000
-comptime AUTO_GPU_OPS_PER_CORE = 8
+comptime AUTO_GPU_OPS_PER_CORE_COLUMN = 3
 comptime MORSELS_AUTO = 0
 comptime MORSELS_ON = 1
 comptime MORSELS_OFF = 2
@@ -1717,39 +1728,46 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
 
 
 def _run_part_gpu(t: SharedTable, nodes: List[PlanNode], gm: List[UInt8], strict: Bool, ctx_addr: Int,
-                  mut fallback: String) raises -> Optional[QueryResult]:
-    """One decoded row group of a scan on the GPU: its used columns uploaded (exact int64, validity bitmaps beside them),
-    the program run in keyed mode, the group's partial result copied back and the device copy freed again, so the device
-    holds one row group of the columns the plan reads at a time. `gm` (F-147): the frame mask slice of the group. None
-    (with `fallback` saying why) when the device could not hold the group or the kernel declined the program and
-    `strict` is off: the caller runs that group on the CPU. The partial has the layout of `_run_part`'s."""
+                  mut fallback: String, rows: Int, ext: List[Int]) raises -> Optional[QueryResult]:
+    """One decoded row group of a scan on the GPU: its used columns copied into the scan's device buffers (exact int64,
+    validity bitmaps beside them), the program run in keyed mode and the group's partial result copied back, so the device
+    holds one row group of the columns the plan reads. `gm` (F-147): the frame mask slice of the group. None (with
+    `fallback` saying why) when the device could not hold the group or the kernel declined the program and `strict` is
+    off: the caller runs that group on the CPU. The partial has the layout of `_run_part`'s."""
     comptime if HAS_GPU:
         var p = _lower(t, nodes, True, len(gm) > 0)
-        var ctx = Pointer[DeviceContext, MutUntrackedOrigin](unsafe_from_address=ctx_addr)[].copy()
-        var made = Optional[DeviceTable](None)
         try:
-            made = DeviceTable(t, ctx)
+            _stage_load(ctx_addr, t, ext, rows)
         except e:
             if strict:
                 raise e^
-            fallback = "the GPU could not hold a row group of " + String(t.rows()) + " rows: " + String(e)
+            fallback = "the GPU could not hold a row group of " + String(rows) + " rows: " + String(e)
             return None
-        var dt = made.take()
-        var r = _run_gpu(dt, t, p, gm, strict, fallback)
-        dt.release()
-        return r^
+        var data = List[Int]()
+        var valid = List[Int]()
+        for c in range(t.columns()):
+            data.append(_stage_data(ctx_addr, c))
+            valid.append(_stage_valid(ctx_addr, c))
+        return _run_gpu_cols(_scan_context(ctx_addr), data, valid, rows, t, p, gm, strict, fallback)
     else:
         return None
 
 
 def _run_part_dev(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, gm: List[UInt8], use_gpu: Bool, strict: Bool,
-                  ctx_addr: Int, mut fallback: String, mut gpu_groups: Int) raises -> QueryResult:
-    """A scan's row group on the GPU when the scan runs there (the CPU when the group falls back), else on the CPU."""
+                  ctx_addr: Int, mut fallback: String, mut gpu_groups: Int, rows: Int, ext: List[Int]) raises -> QueryResult:
+    """A scan's row group on the GPU when the scan runs there (the CPU when the group falls back), else on the CPU. `ext`:
+    the group's values are in these pinned buffers (`read_group_into`), not in `t`, which a CPU run then gets them in."""
     if use_gpu:
-        var g = _run_part_gpu(t, nodes, gm, strict, ctx_addr, fallback)
+        var g = _run_part_gpu(t, nodes, gm, strict, ctx_addr, fallback, rows, ext)
         if g:
             gpu_groups += 1
             return g.take()
+        for c in range(t._table[].columns()):                # the CPU takes the group: its values go into the table
+            var v = List[Int64](unsafe_uninit_length=rows)
+            var src = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=ext[c])
+            for i in range(rows):
+                v[i] = src[i]
+            t._table[].cols[c].values = v^
     return _run_part(t, nodes, hs, Int(gm.unsafe_ptr()) if len(gm) > 0 else 0)
 
 
@@ -1807,7 +1825,7 @@ def _range_mask(m: _ScanMask, g: Int, r0: Int, r1: Int) -> List[UInt8]:
 # ── a Parquet scan: one row group at a time (F-140) ──────────────────────────────────────────────────
 
 def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: List[PlanNode], o: Overlay,
-                  framed: Bool, morsels: Int = 0, block_rows: Int = 0, gpu_ops: Int = AUTO_GPU_OPS_PER_CORE) raises -> QueryResult:
+                  framed: Bool, morsels: Int = 0, block_rows: Int = 0, gpu_ops: Int = AUTO_GPU_OPS_PER_CORE_COLUMN) raises -> QueryResult:
     """The plan over a file, a row group at a time: decode the columns the plan reads, run the CPU kernel on that
     group, merge its partial result into the running one (sums and counts add, min / max combine; a sum passing
     int64 raises, as one run does). Each group is lowered on its own table, so its null-free columns skip the null
@@ -1862,8 +1880,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
             why = "count_distinct / percentile / top_k run on the CPU"
         elif scan.rows() < AUTO_GPU_SCAN_MIN_ROWS and gpu_ops > 0:
             why = "the file has " + String(scan.rows()) + " rows, under AUTO's " + String(AUTO_GPU_SCAN_MIN_ROWS) + " for the GPU"
-        elif ops_row <= gpu_ops * core_count():
-            why = "the plan runs " + String(ops_row) + " kernel instructions a row on " + String(core_count()) + " cores: cheaper on the CPU than moving the file to the GPU"
+        elif ops_row <= gpu_ops * len(used) * core_count():
+            why = "the plan runs " + String(ops_row) + " kernel instructions a row over " + String(len(used)) + " columns on " + String(core_count()) + " cores: cheaper on the CPU than moving the file to the GPU"
         else:
             use_gpu = True
     var gown = _ScanContext(use_gpu)                          # frees the device context on every way out of this function
@@ -1923,8 +1941,13 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         todo = List[Int]()
     # ---- end F-149 ------------------------------------------------------------------------------------------------
     var cur = Table.empty()
+    var ext_cur = List[Int]()                # (GPU) the pinned buffers the group being aggregated was decoded into
     if len(todo) > 0:
-        cur = scan.read_group(todo[0], used)
+        if use_gpu:
+            ext_cur = _pinned_prepare(gctx, 0, len(used), scan.group_rows(todo[0]))
+            cur = scan.read_group_into(todo[0], used, ext_cur)
+        else:
+            cur = scan.read_group(todo[0], used)
     for ix in range(len(todo)):
         for k in range(len(used)):
             nulls[k] += cur.null_count(k)
@@ -1934,6 +1957,10 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         var r = QueryResult()
         var nxt = Table.empty()
         var pending = String()
+        var ext_nxt = List[Int]()
+        if use_gpu and ix + 1 < len(todo):       # the next group decodes into the other set of pinned buffers
+            ext_nxt = _pinned_prepare(gctx, (ix + 1) % 2, len(used), scan.group_rows(todo[ix + 1]))
+        var rows_cur = scan.group_rows(todo[ix])
         if ix + 1 < len(todo):
             # group ix + 1 decodes while the kernel aggregates group ix (two groups in memory); a serial build runs the
             # two tasks one after the other. The partials are still merged below in row-group order.
@@ -1951,6 +1978,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
             var gmp = Int(UnsafePointer(to=gm))
             var whyp = Int(UnsafePointer(to=why))
             var ggp = Int(UnsafePointer(to=gpu_groups))
+            var extc = Int(UnsafePointer(to=ext_cur))
+            var extn = Int(UnsafePointer(to=ext_nxt))
             var next_group = todo[ix + 1]
             def both(i: Int) {imm}:
                 if i == 0:
@@ -1961,25 +1990,33 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
                             tbl, nds, Pointer[HolStates, MutUntrackedOrigin](unsafe_from_address=hsp)[],
                             Pointer[List[UInt8], MutUntrackedOrigin](unsafe_from_address=gmp)[], use_gpu, device == GPU, gctx,
                             Pointer[String, MutUntrackedOrigin](unsafe_from_address=whyp)[],
-                            Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ggp)[])
+                            Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ggp)[], rows_cur,
+                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=extc)[])
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e0p)[] = String(e)
                 else:
                     try:
-                        Pointer[Table, MutUntrackedOrigin](unsafe_from_address=np)[] = Pointer[ParquetScan, MutUntrackedOrigin](
-                            unsafe_from_address=sp)[].read_group(
-                            next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[])
+                        ref scn = Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp)[]
+                        if use_gpu:
+                            Pointer[Table, MutUntrackedOrigin](unsafe_from_address=np)[] = scn.read_group_into(
+                                next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
+                                Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=extn)[])
+                        else:
+                            Pointer[Table, MutUntrackedOrigin](unsafe_from_address=np)[] = scn.read_group(
+                                next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[])
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e1p)[] = String(e)
             par_n(both, 2, 2)
+            _ = len(ext_cur) + len(ext_nxt)           # (both lists are read by address inside the tasks: alive to here)
             if e0.byte_length() > 0:                 # the earlier group's error comes first
                 raise Error(e0)
             pending = e1^                            # the next group's decode error waits until this group is merged
         else:
-            r = _run_part_dev(part, nodes, hs, gm, use_gpu, device == GPU, gctx, why, gpu_groups)
+            r = _run_part_dev(part, nodes, hs, gm, use_gpu, device == GPU, gctx, why, gpu_groups, rows_cur, ext_cur)
         _ = part^
         _ = gm^
         cur = nxt^
+        ext_cur = ext_nxt^
         _merge_partial(acc, r, ops)
         if pending.byte_length() > 0:                # only now, after this group's partial was merged (its overflow comes first)
             raise Error(pending)
