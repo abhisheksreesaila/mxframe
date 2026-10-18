@@ -1020,6 +1020,7 @@ struct _Slices(Copyable, Movable):
     var row: List[Int]
     var pos: List[Int]
     var pend: List[Int]
+    var skip: List[Int]              # values to drop from the start of the entry point (a cut inside a run)
     var err: List[String]
 
     def __init__(out self):
@@ -1030,6 +1031,7 @@ struct _Slices(Copyable, Movable):
         self.row = List[Int]()
         self.pos = List[Int]()
         self.pend = List[Int]()
+        self.skip = List[Int]()
         self.err = List[String]()
 
 
@@ -1392,13 +1394,51 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
     _dict_runs(c, leaf, w, dict, count, dout, 0)
 
 
+def _bitpacked_run(mut c: _Bytes, leaf: _Leaf, w: Int, take: Int, d: UnsafePointer[Int64, MutAnyOrigin], dn: Int,
+                   dout: UnsafePointer[Int64, MutAnyOrigin]) raises:
+    """`take` bit-packed dictionary indices (width w) gathered through the dictionary d into dout."""
+    if w == 0:
+        if dn < 1:
+            raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
+        for i in range(take):
+            dout[i] = d[0]
+    elif w <= 32:
+        if take > ((c.n - c.pos) * 8) // w:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
+        var mask = (UInt64(1) << UInt64(w)) - 1
+        var acc: UInt64 = 0
+        var have = 0
+        var at = 0
+        for i in range(take):
+            while have < w:
+                acc |= UInt64(p[at]) << UInt64(have)
+                at += 1
+                have += 8
+            var ix = Int(acc & mask)
+            acc >>= UInt64(w)
+            have -= w
+            if ix >= dn:
+                raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
+            dout[i] = d[ix]
+        c.pos += (take * w + 7) // 8
+    else:
+        var idx = List[Int64]()
+        _unpack(c, w, take, idx)
+        for i in range(take):
+            if idx[i] < 0 or Int(idx[i]) >= dn:
+                raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
+            dout[i] = d[Int(idx[i])]
+
+
 def _dict_runs(mut c: _Bytes, leaf: _Leaf, w: Int, dict: List[Int64], count: Int, dout: UnsafePointer[Int64, MutAnyOrigin],
-               pending: Int) raises:
-    """The runs of a dictionary-index page from the cursor, which is at a run header, or (`pending` > 0) inside a
-    bit-packed run with `pending` groups of 8 values still to read (a slice that starts mid-run)."""
+               pending: Int, skip: Int = 0) raises:
+    """`count` values of a dictionary-index page from the cursor, which is at a run header, or (`pending` > 0) inside a
+    bit-packed run with `pending` groups of 8 values still to read (a slice that starts mid-run); the first `skip` values
+    from there are read and dropped (a cut inside a run)."""
     var d = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(dict.unsafe_ptr()))
     var dn = len(dict)
-    var got = 0
+    var got = -skip                                      # negative while values are still being dropped
     var pend = pending
     while got < count:
         var h = (pend << 1) | 1 if pend > 0 else c.small()
@@ -1407,38 +1447,14 @@ def _dict_runs(mut c: _Bytes, leaf: _Leaf, w: Int, dict: List[Int64], count: Int
         if h & 1 == 1:
             var groups = h >> 1
             var take = left if groups >= (left + 7) // 8 else groups * 8
-            if w == 0:
-                if dn < 1:
-                    raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
-                for i in range(take):
-                    dout[got + i] = d[0]
-            elif w <= 32:
-                if take > ((c.n - c.pos) * 8) // w:
-                    raise Error("a Parquet page ends early (corrupt file)")
-                var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
-                var mask = (UInt64(1) << UInt64(w)) - 1
-                var acc: UInt64 = 0
-                var have = 0
-                var at = 0
-                for i in range(take):
-                    while have < w:
-                        acc |= UInt64(p[at]) << UInt64(have)
-                        at += 1
-                        have += 8
-                    var ix = Int(acc & mask)
-                    acc >>= UInt64(w)
-                    have -= w
-                    if ix >= dn:
-                        raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
-                    dout[got + i] = d[ix]
-                c.pos += (take * w + 7) // 8
+            if got < 0:                                  # decode, then keep only what follows the dropped values
+                var tmp = List[Int64](unsafe_uninit_length=take)
+                _bitpacked_run(c, leaf, w, take, d, dn, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(tmp.unsafe_ptr())))
+                for i in range(-got, min(take, count - got)):
+                    dout[got + i] = tmp[i]
+                _ = tmp^
             else:
-                var idx = List[Int64]()
-                _unpack(c, w, take, idx)
-                for i in range(take):
-                    if idx[i] < 0 or Int(idx[i]) >= dn:
-                        raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
-                    dout[got + i] = d[Int(idx[i])]
+                _bitpacked_run(c, leaf, w, take, d, dn, dout + got)
             got += take
         else:
             var v = c.le((w + 7) // 8) if w > 0 else 0
@@ -1448,7 +1464,7 @@ def _dict_runs(mut c: _Bytes, leaf: _Leaf, w: Int, dict: List[Int64], count: Int
                 raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
             var run = min(h >> 1, left)
             var x = d[Int(v)]
-            for i in range(run):
+            for i in range(max(0, -got), run):
                 dout[got + i] = x
             got += run
 
@@ -1565,12 +1581,20 @@ comptime SPLIT_MIN = 262_144        # a page with at least this many rows is dec
 comptime SLICE_MIN = 65_536         # and no slice is smaller than this many values
 
 
-def _plan_dict_slices(mut c: _Bytes, w: Int, present: Int, step: Int, mut p: _Page) raises:
-    """One serial pass over a dictionary-index page's run headers (the cursor is after the bit width): every `step`
-    values or so a slice starts, at a run boundary or at a group of 8 values inside a bit-packed run."""
+def _plan_dict_cuts(mut c: _Bytes, w: Int, present: Int, vts: List[Int], mut p: _Page) raises:
+    """One serial pass over a dictionary-index page's run headers (the cursor is after the bit width): an entry point for
+    each target value index in `vts` (ascending): inside a bit-packed run at the group of 8 holding it, inside a repeated
+    run at the run's header, each with the number of values to drop to reach the target exactly."""
     var v = 0
-    var next_t = step
-    while v < present and next_t < present:
+    var idx = 0
+    while idx < len(vts):
+        if vts[idx] >= present:                          # nothing left to read from there
+            p.sl.pos.append(c.pos)
+            p.sl.pend.append(0)
+            p.sl.skip.append(0)
+            idx += 1
+            continue
+        var start = c.pos
         var h = c.small()
         if h & 1 == 1:
             var groups = h >> 1
@@ -1578,46 +1602,76 @@ def _plan_dict_slices(mut c: _Bytes, w: Int, present: Int, step: Int, mut p: _Pa
                 raise Error("a Parquet page ends early (corrupt file)")
             var data = c.pos
             var span = groups * 8
-            while next_t < v + span and next_t < present:
-                var g = (next_t - v + 7) // 8
-                var vv = v + g * 8
-                if vv >= v + span or vv >= present:
-                    break
-                p.sl.v.append(vv)
+            while idx < len(vts) and vts[idx] < v + span and vts[idx] < present:
+                var off = vts[idx] - v
+                var g = off // 8
                 p.sl.pos.append(data + g * w)
                 p.sl.pend.append(groups - g)
-                next_t = vv + step
+                p.sl.skip.append(off - 8 * g)
+                idx += 1
             v += span
             c.pos = data + groups * w
         else:
             var run = h >> 1
+            while idx < len(vts) and vts[idx] < v + run and vts[idx] < present:
+                p.sl.pos.append(start)
+                p.sl.pend.append(0)
+                p.sl.skip.append(vts[idx] - v)
+                idx += 1
             c.need((w + 7) // 8)
             c.pos += (w + 7) // 8
             v += run
-            if v < present and v >= next_t:
-                p.sl.v.append(v)
-                p.sl.pos.append(c.pos)
-                p.sl.pend.append(0)
-                next_t = v + step
 
 
-def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf) raises:
-    """The serial part of a big page: decompress, definition levels, and where the slices start; the values are decoded
-    by `_decode_slice` jobs. The decompressed page stays in `p.keep` until they are done."""
+def _step_cuts(nvals: Int) -> List[Int]:
+    """The rows at which a big page is cut into slices for the workers of a row group (F-145)."""
+    var step = max(SLICE_MIN, (nvals + 2 * core_count() - 1) // (2 * core_count()))
+    var cuts = List[Int]()
+    var r = step
+    while r < nvals:
+        cuts.append(r)
+        r += step
+    return cuts^
+
+
+def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, cut_rows: List[Int]) raises:
+    """The serial part of a page decoded in slices: decompress, definition levels, and the entry point of a slice at each
+    of `cut_rows` (ascending rows of the page, each below its row count) besides the one at the start; the values are
+    decoded by `_decode_slice` jobs. The decompressed page stays in `p.keep` until they are done."""
     var owner = List[UInt8]()
     var c = _open_page(p, ctx, leaf, owner)
     var present = p.present
-    var step = max(SLICE_MIN, (present + 2 * core_count() - 1) // (2 * core_count()))
+    var vts = List[Int]()                                # the number of non-null values before each cut row
+    if present == p.nvals:
+        for r in cut_rows:
+            vts.append(r)
+    else:
+        var bits = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
+        var seen = 0
+        var done_rows = 0
+        for r in cut_rows:
+            while done_rows + 8 <= r:
+                seen += Int(pop_count(bits[done_rows >> 3]))
+                done_rows += 8
+            var extra = 0
+            for row in range(done_rows, r):
+                if _get_bit(bits, row):
+                    extra += 1
+            vts.append(seen + extra)
     p.sl.v.append(0)
-    p.sl.pos.append(0)
-    p.sl.pend.append(0)
+    p.sl.row.append(0)
+    p.sl.skip.append(0)
+    for i in range(len(cut_rows)):
+        p.sl.v.append(vts[i])
+        p.sl.row.append(cut_rows[i])
     if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
         var w = c.byte()
         if w > 64:
             raise Error("a Parquet page has a bit width of " + String(w) + " (corrupt file)")
         p.sl.width = w
-        p.sl.pos[0] = c.pos
-        _plan_dict_slices(c, w, present, step, p)
+        p.sl.pos.append(c.pos)
+        p.sl.pend.append(0)
+        _plan_dict_cuts(c, w, present, vts, p)
     else:
         var width = 4 if leaf.ptype == PT_INT32 else 8 if leaf.ptype == PT_INT64 else leaf.type_length
         if width < 1 or width > 16:
@@ -1625,35 +1679,12 @@ def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf) raises:
         if present > (c.n - c.pos) // width:
             raise Error("a Parquet page ends early (corrupt file)")
         p.sl.width = width
-        p.sl.pos[0] = c.pos
-        var v = step
-        while v < present:
-            p.sl.v.append(v)
+        p.sl.pos.append(c.pos)
+        p.sl.pend.append(0)
+        for v in vts:
             p.sl.pos.append(c.pos + v * width)
             p.sl.pend.append(0)
-            v += step
-    p.sl.row.append(0)                                   # the row of each later slice's first value
-    if present == p.nvals:
-        for k in range(1, len(p.sl.v)):
-            p.sl.row.append(p.sl.v[k])
-    else:
-        var bits = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
-        var k = 1
-        var seen = 0
-        for byte in range((p.nvals + 7) // 8):
-            var pc = Int(pop_count(bits[byte]))
-            while k < len(p.sl.v) and p.sl.v[k] < seen + pc:
-                var want = p.sl.v[k] - seen              # the want-th set bit of this byte
-                var row = byte * 8
-                for b in range(8):
-                    if (bits[byte] >> UInt8(b)) & 1 == 1:
-                        if want == 0:
-                            row = byte * 8 + b
-                            break
-                        want -= 1
-                p.sl.row.append(row)
-                k += 1
-            seen += pc
+            p.sl.skip.append(0)
     p.sl.err = List[String](length=len(p.sl.v), fill=String())
     p.sl.base = c.base
     p.sl.end = c.n
@@ -1671,7 +1702,7 @@ def _decode_slice(p: _Page, k: Int, ctx: _Ctx, leaf: _Leaf, dst: Int) raises:
     var c = _Bytes(p.sl.base, p.sl.end)
     c.pos = p.sl.pos[k]
     if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
-        _dict_runs(c, leaf, p.sl.width, ctx.dict, cnt, dout, p.sl.pend[k])
+        _dict_runs(c, leaf, p.sl.width, ctx.dict, cnt, dout, p.sl.pend[k], p.sl.skip[k])
     else:
         _plain_into(c, leaf, ctx, cnt, dout, 0, True, 0)
     if r1 - r0 > cnt:
@@ -1962,7 +1993,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                     ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
                     ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
                     if p.split:
-                        _prep_page(p, ctx, leaf)
+                        _prep_page(p, ctx, leaf, _step_cuts(p.nvals))
                     else:
                         _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
             except e:
