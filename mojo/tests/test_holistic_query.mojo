@@ -224,6 +224,11 @@ def check_agg(r: QueryResult, i: Int, kind: String, param: Float64, k: Int, list
                 if x == 0 or key[x] != key[x - 1]:
                     d += 1
             expect(r.values(i)[g] == d, tag + ": count distinct is " + String(d) + ", got " + String(r.values(i)[g]))
+        elif kind == "median":                       # the mean of the two middle values at scale + 1: 5 * (a + b)
+            var want = 0
+            if m > 0:
+                want = Int(5 * (key[ceil_index(0.5, m)] + key[m // 2]))
+            expect(r.values(i)[g] == want, tag + ": median is " + String(want) + ", got " + String(r.values(i)[g]))
         elif kind == "pct":
             var want = 0
             if m > 0:
@@ -265,7 +270,7 @@ def table_results(t: SharedTable, nreg: Int, window_rows: Int) raises -> List[Qu
     var out = List[QueryResult]()
     for s in range(6):
         var q = plan(Query(t), s, nreg)
-        q.window_rows = window_rows
+        q._window_rows = window_rows
         out.append(q.compute())
     return out^
 
@@ -278,7 +283,7 @@ def check_all(t: SharedTable, rs: List[QueryResult], label: String) raises:
     var by_car_rev = gather(t, K_CARRIER, 7, False, V_REVENUE)
     var by_car_cost = gather(t, K_CARRIER, 7, False, V_COST)
     check_agg(rs[0], 2, "distinct", 0.0, 0, by_car_cust, no_rank(), label + " 0 distinct(cust)")
-    check_agg(rs[0], 3, "pct", 0.5, 0, by_car_rev, no_rank(), label + " 0 median(revenue)")
+    check_agg(rs[0], 3, "median", 0.5, 0, by_car_rev, no_rank(), label + " 0 median(revenue)")
     check_agg(rs[0], 4, "pct", 0.9, 0, by_car_rev, no_rank(), label + " 0 p90(revenue)")
     check_agg(rs[0], 5, "top", 0.0, 3, by_car_cost, no_rank(), label + " 0 top3(cost)")
     var g_cust = gather(t, K_NONE, 1, True, V_CUST)
@@ -286,7 +291,7 @@ def check_all(t: SharedTable, rs: List[QueryResult], label: String) raises:
     var g_rev = gather(t, K_NONE, 1, True, V_REVENUE)
     var g_reg = gather(t, K_NONE, 1, True, V_REGION)
     check_agg(rs[1], 0, "distinct", 0.0, 0, g_cust, no_rank(), label + " 1 distinct(cust)")
-    check_agg(rs[1], 1, "pct", 0.5, 0, g_cost, no_rank(), label + " 1 median(cost)")
+    check_agg(rs[1], 1, "median", 0.5, 0, g_cost, no_rank(), label + " 1 median(cost)")
     check_agg(rs[1], 2, "pct", 0.0, 0, g_cost, no_rank(), label + " 1 p0(cost)")
     check_agg(rs[1], 3, "pct", 1.0, 0, g_cost, no_rank(), label + " 1 p100(cost)")
     check_agg(rs[1], 4, "top", 0.0, 5, g_rev, no_rank(), label + " 1 top5(revenue)")
@@ -318,7 +323,9 @@ def check_plain(t: SharedTable, rs: List[QueryResult], nreg: Int, label: String)
         if k[1] and k[0] >= 0 and k[0] < 7:
             cnt[k[0]] += 1
             sd[k[0]] += Int(t.get(day, row))
+    expect(len(rs[0].sums) == 7, label + ": r.sums has a value per carrier")
     for g in range(7):
+        expect(rs[0].sums[g] == sd[g], label + ": r.sums (sum(day)) of carrier " + String(g) + " is " + String(sd[g]) + ", got " + String(rs[0].sums[g]))
         expect(rs[0].counts[g] == cnt[g], label + ": count of carrier " + String(g) + " is " + String(cnt[g]) + ", got " + String(rs[0].counts[g]))
         expect(rs[0].values(1)[g] == sd[g], label + ": sum(day) of carrier " + String(g))
     var cr = List[Int](length=nreg, fill=0)
@@ -329,6 +336,7 @@ def check_plain(t: SharedTable, rs: List[QueryResult], nreg: Int, label: String)
             cr[k[0]] += 1
             sr[k[0]] += Int(t.get(day, row))
     for g in range(nreg):
+        expect(rs[4].sums[g] == sr[g], label + ": r.sums of region " + String(g))
         expect(rs[4].values(3)[g] == cr[g] and rs[4].values(4)[g] == sr[g], label + ": count and sum(day) of region " + String(g))
 
 
@@ -357,8 +365,8 @@ def test_one_row_no_rows_all_null() raises:
     t.append(k, 1)
     var s = t^.share()
     var r = Query(s).group_by(col("k"), groups=3).agg(count_distinct(col("cust")), median(col("cust")), top_k(col("cust"), 4)).compute()
-    expect(r.values(0)[0] == 1 and r.values(1)[0] == 5 and len(r.top(2, 0)) == 1 and r.top(2, 0)[0] == 5, "group 0: one value among a null")
-    expect(r.values(0)[1] == 1 and r.values(1)[1] == 5, "group 1")
+    expect(r.values(0)[0] == 1 and r.values(1)[0] == 50 and len(r.top(2, 0)) == 1 and r.top(2, 0)[0] == 5, "group 0: one value among a null")
+    expect(r.values(0)[1] == 1 and r.values(1)[1] == 50, "group 1")
     expect(r.values(0)[2] == 0 and not r.present(0, 2) and not r.present(1, 2) and len(r.top(2, 2)) == 0, "an empty group has no value")
     var e = Table.empty()
     _ = e.add_column("cust", INT)
@@ -367,15 +375,67 @@ def test_one_row_no_rows_all_null() raises:
     expect(r0.values(0)[0] == 0 and not r0.present(1, 0) and len(r0.top(2, 0)) == 0, "no rows")
 
 
-def test_a_median_of_an_even_count_is_the_lower_middle_value() raises:
+def test_median_is_the_mean_of_the_middle_values_percentile_the_lower() raises:
     var t = Table.empty()
     var v = t.add_column("v", INT)
+    var w = t.add_column("w", DECIMAL, scale=2)
     for x in [4, 1, 3, 2]:
         t.append(v, Int64(x))
+        t.append(w, Int64(x * 100 + 1))
     var s = t^.share()
-    var r = Query(s).agg(median(col("v")), percentile(col("v"), 0.25), percentile(col("v"), 0.26), percentile(col("v"), 1.0)).compute()
-    expect(r.values(0)[0] == 2, "median of 1 2 3 4 is the lower middle value, 2 (DuckDB quantile_disc)")
-    expect(r.values(1)[0] == 1 and r.values(2)[0] == 2 and r.values(3)[0] == 4, "ceil(p * n) - 1: p25 of 4 values is the 1st, p26 the 2nd")
+    var r = Query(s).agg(median(col("v")), percentile(col("v"), 0.5), percentile(col("v"), 0.25), percentile(col("v"), 0.26),
+                         percentile(col("v"), 1.0), median(col("w"))).compute()
+    expect(r.values(0)[0] == 25, "median of 1 2 3 4 is 2.5, returned at one more decimal place: 25, got " + String(r.values(0)[0]))
+    expect(r.values(1)[0] == 2, "percentile(v, 0.5) is DuckDB's quantile_disc: the lower middle value, 2")
+    expect(r.values(2)[0] == 1 and r.values(3)[0] == 2 and r.values(4)[0] == 4, "ceil(p * n) - 1: p25 of 4 values is the 1st, p26 the 2nd")
+    expect(r.values(5)[0] == 2510, "median of 1.01 2.01 3.01 4.01 (scale 2) is 2.51 at scale 3: 2510, got " + String(r.values(5)[0]))
+    var odd = Table.empty()
+    var o = odd.add_column("v", INT)
+    for x in [9, 1, 5]:
+        odd.append(o, Int64(x))
+    var ro = Query(odd^.share()).agg(median(col("v"))).compute()
+    expect(ro.values(0)[0] == 50, "median of 1 5 9 is 5, returned as 50")
+
+
+def test_a_median_too_large_for_one_more_decimal_place_raises() raises:
+    var t = Table.empty()
+    var v = t.add_column("v", INT)
+    t.append(v, Int64.MAX - 5)
+    t.append(v, Int64.MAX - 7)
+    var msg = String("")
+    try:
+        _ = Query(t^.share()).agg(median(col("v"))).compute()
+    except e:
+        msg = String(e)
+    expect("median" in msg and "too large" in msg, "an overflowing median says so: " + msg)
+
+
+def test_a_huge_k_is_clamped_or_refused_never_wrapped() raises:
+    """k * groups used to overflow Int: top_k(x, 2^61) over 6 groups passed the size guard and read another group's heap."""
+    var t = make_table(5_000, 8)
+    var huge = 1 << 61
+    var r = Query(t).group_by(col("carrier"), groups=6).agg(top_k(col("cost"), huge), count()).compute()
+    var lists = gather(t, K_CARRIER, 6, False, V_COST)
+    check_agg(r, 0, "top", 0.0, huge, lists, no_rank(), "huge k over a table")
+    var f = Frame(t)
+    var msg = String("")
+    try:
+        _ = Query(f).group_by(col("carrier"), groups=6).agg(top_k(col("cost"), huge)).compute()
+    except e:
+        msg = String(e)
+    expect("top_k" in msg and "would hold more than" in msg, "a frame cannot clamp k to its rows: " + msg)
+    msg = ""
+    try:
+        _ = Query(t).group_by(col("carrier"), groups=6).agg(top_k(col("cost"), 0)).compute()
+    except e:
+        msg = String(e)
+    expect("k must be at least 1" in msg, "k = 0: " + msg)
+
+
+def test_top_is_empty_for_other_aggregates() raises:
+    var t = make_table(2_000, 9)
+    var r = Query(t).group_by(col("carrier"), groups=7).agg(count_distinct(col("cust")), sum(col("day")), top_k(col("cost"), 2)).compute()
+    expect(len(r.top(0, 0)) == 0 and len(r.top(1, 0)) == 0 and len(r.top(2, 0)) == 2, "top() is for top_k aggregates only")
 
 
 def test_errors_are_readable() raises:
@@ -427,7 +487,7 @@ def test_a_group_key_out_of_range_and_the_same_value_twice() raises:
                                                             percentile(col("cust"), 0.9)).compute()
     var lists = gather(t, K_CARRIER, 4, False, V_CUST)
     check_agg(r, 0, "distinct", 0.0, 0, lists, no_rank(), "groups=4 distinct")
-    check_agg(r, 1, "pct", 0.5, 0, lists, no_rank(), "groups=4 median")
+    check_agg(r, 1, "median", 0.5, 0, lists, no_rank(), "groups=4 median")
     check_agg(r, 2, "top", 0.0, 2, lists, no_rank(), "groups=4 top2")
     check_agg(r, 3, "pct", 0.9, 0, lists, no_rank(), "groups=4 p90")
 
@@ -590,7 +650,10 @@ def test_a_device_table_does_not_move_them_to_the_gpu() raises:
 def main() raises:
     test_over_a_table()
     test_one_row_no_rows_all_null()
-    test_a_median_of_an_even_count_is_the_lower_middle_value()
+    test_median_is_the_mean_of_the_middle_values_percentile_the_lower()
+    test_a_median_too_large_for_one_more_decimal_place_raises()
+    test_a_huge_k_is_clamped_or_refused_never_wrapped()
+    test_top_is_empty_for_other_aggregates()
     test_errors_are_readable()
     test_a_group_key_out_of_range_and_the_same_value_twice()
     test_over_a_frame_with_edits()

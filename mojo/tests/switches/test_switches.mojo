@@ -68,7 +68,7 @@ def main() raises:
         if Float64(idx9) < 0.9 * Float64(m):
             idx9 += 1
         expect(hol.values(0)[g] == 1000, "count_distinct(v % 1000) of group " + String(g) + ": " + String(hol.values(0)[g]))
-        expect(hol.values(1)[g] == g + 3 * (idx - 1), "median of group " + String(g) + ": " + String(hol.values(1)[g]))
+        expect(hol.values(1)[g] == 5 * ((g + 3 * (idx - 1)) + (g + 3 * (m // 2))), "median of group " + String(g) + ": " + String(hol.values(1)[g]))
         expect(hol.values(2)[g] == g + 3 * (idx9 - 1), "p90 of group " + String(g) + ": " + String(hol.values(2)[g]))
         var top = hol.top(3, g)
         expect(len(top) == 2 and top[0] == g + 3 * (m - 1) and top[1] == g + 3 * (m - 2), "top 2 of group " + String(g))

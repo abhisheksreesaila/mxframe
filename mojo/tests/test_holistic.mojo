@@ -1,6 +1,6 @@
 # F-148: the holistic states (count distinct, percentiles, top-k) on (group, value) pairs, against a plain oracle:
 # per group, collect the values, sort them (a merge sort written here), and read the answers off the sorted list.
-from mxframe.holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_TOPK
+from mxframe.holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
 
 
 struct Rng(Movable):
@@ -87,7 +87,7 @@ def make(seed: UInt64, n: Int, groups: Int, lo: Int, hi: Int, wide: Bool) -> Cas
     return c^
 
 
-def check(name: String, c: Case, groups: Int, windows: Int, k: Int, reverse_rank: Int) raises:
+def check(name: String, c: Case, groups: Int, windows: Int, k: Int, reverse_rank: Int, median_too: Bool = True) raises:
     """Run the states over `windows` windows of the case and compare with the oracle. reverse_rank > 0: values are
     codes 0 .. reverse_rank-1 whose order is reversed (rank = reverse_rank - 1 - code)."""
     var specs = List[HolSpec]()
@@ -96,6 +96,7 @@ def check(name: String, c: Case, groups: Int, windows: Int, k: Int, reverse_rank
     for i in range(len(ps)):
         specs.append(HolSpec(1 + i, A_PCT, ps[i], 0, 0))
     specs.append(HolSpec(1 + len(ps), A_TOPK, 0.0, k, 0))
+    specs.append(HolSpec(2 + len(ps), A_MEDIAN, 0.0, 0, 0))
     var ranks = List[List[Int64]]()
     var rk = List[Int64]()
     for code in range(reverse_rank):
@@ -133,6 +134,14 @@ def check(name: String, c: Case, groups: Int, windows: Int, k: Int, reverse_rank
                 want = Int(Int64(reverse_rank - 1) - v if reverse_rank > 0 else v)
             expect(res.vals[1 + q][g] == want, name + ": p" + String(ps[q]) + " of group " + String(g) + " is " + String(want) + " got " + String(res.vals[1 + q][g]))
             expect(res.counts[1 + q][g] == m, name + ": count of group " + String(g))
+        var mid = 2 + len(ps)
+        var want_mid = 0
+        if m > 0:
+            if reverse_rank > 0:               # text: the lower middle word
+                want_mid = Int(Int64(reverse_rank - 1) - key[ceil_index(0.5, m)])
+            else:
+                want_mid = Int(5 * (key[ceil_index(0.5, m)] + key[m // 2]))
+        expect(res.vals[mid][g] == want_mid, name + ": median of group " + String(g) + " is " + String(want_mid) + ", got " + String(res.vals[mid][g]))
         var t = 1 + len(ps)
         var off = res.top_off[t][g]
         var cnt = res.top_off[t][g + 1] - off
