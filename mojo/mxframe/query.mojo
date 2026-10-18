@@ -29,7 +29,7 @@ from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
 from .table import SharedTable, Table, TEXT
-from .parquet import ParquetScan, GroupPlan, GroupReader, open_plan, _copy_bits, _count_bits
+from .parquet import ParquetScan, _GroupPlan, _GroupReader, _open_plan, _copy_bits, _count_bits
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
@@ -1526,14 +1526,14 @@ struct _MorselRun(Movable):
         self.gerrs = List[String]()
 
 
-def _morsel_task(plan: GroupPlan, gfile: Int, r0: Int, r1: Int, used: List[Int], nodes: List[PlanNode], n_slots: Int,
+def _morsel_task(plan: _GroupPlan, gfile: Int, r0: Int, r1: Int, used: List[Int], nodes: List[PlanNode], n_slots: Int,
                  groups: Int, ops: List[Int], block: Int, sm: _ScanMask, mut part: QueryResult, mut tally: List[Int],
                  mut kernel_error: String) raises:
     """Rows [r0, r1) of row group `gfile` on one worker: decode block after block, run the kernel (one thread) on each,
     fold the block's partial into the morsel's in block order. A kernel error is kept and the remaining blocks are still
     decoded (not aggregated), so a decode error later in the range is the one raised, as when the group was decoded first.
     `sm` (F-147): the frame mask, of which the morsel takes its rows' slice."""
-    var reader = GroupReader(plan, r0, r1, block)
+    var reader = _GroupReader(plan, r0, r1, block)
     var bt = Table.empty()
     for k in range(len(used)):
         _ = bt.add_column(plan.scan.name(used[k]), plan.scan.kind(used[k]), scale=plan.scan.scale(used[k]))
@@ -1591,10 +1591,10 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
         var ge1 = Int(run.gerrs.unsafe_ptr())
         var sm1 = Int(UnsafePointer(to=sm))
         def whole_group(i: Int) {imm}:
-            var plan = GroupPlan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[].copy(),
+            var plan = _GroupPlan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[].copy(),
                                  Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up1)[])
             try:
-                plan = open_plan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[],
+                plan = _open_plan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[],
                                  Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=tp1)[][i],
                                  Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up1)[])
             except e:
@@ -1616,9 +1616,9 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
     var w0 = 0
     while w0 < len(todo):
         var nb = min(batch, len(todo) - w0)
-        var plans = List[GroupPlan]()
+        var plans = List[_GroupPlan]()
         for _ in range(nb):
-            plans.append(GroupPlan(scan.copy(), used))
+            plans.append(_GroupPlan(scan.copy(), used))
         var sp = Int(UnsafePointer(to=scan))
         var up = Int(UnsafePointer(to=used))
         var tp = Int(UnsafePointer(to=todo))
@@ -1627,7 +1627,7 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
         var base = w0
         def open_job(i: Int) {imm}:
             try:
-                (Pointer[GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + i)[] = open_plan(
+                (Pointer[_GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + i)[] = _open_plan(
                     Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp)[],
                     Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=tp)[][base + i],
                     Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[])
@@ -1676,7 +1676,7 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
             var gi = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=tga)[t]
             var at = first + t
             try:
-                _morsel_task((Pointer[GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + gi)[],
+                _morsel_task((Pointer[_GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + gi)[],
                              Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=tp)[][w0 + gi],
                              Pointer[Int, MutUntrackedOrigin](unsafe_from_address=r0a)[t],
                              Pointer[Int, MutUntrackedOrigin](unsafe_from_address=r1a)[t],

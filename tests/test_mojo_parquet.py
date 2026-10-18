@@ -1384,3 +1384,45 @@ def test_a_save_that_would_lose_what_reading_narrowed_is_refused_unless_allowed(
     run_edit_probe(editor, path, out, 4, "allow")
     saved = pq.read_table(out)
     assert saved.schema.field(column).type == (pa.date32() if column == "day" else pa.decimal128(18, 2))
+
+
+@pytest.fixture(scope="module")
+def edger(tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_edge_probe"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_edge_probe.mojo"), str(out)],
+                   check=True, capture_output=True, text=True)
+    return out
+
+
+EDGE_ROWS = [0, 1, 999, 1000, 1001, 4095, 4096, 4097, 13336, 13337, 13338, 26673, 26674, 26675, 40010]
+
+
+@pytest.mark.parametrize("mode,block", [(0, 0), (1, 1000), (1, 4096), (1, 64), (2, 0)])
+def test_frame_edits_at_group_and_block_edges_of_a_pyarrow_file_with_odd_row_groups(edger, tmp_path, mode, block):
+    """Three row groups of 13,337 rows (not a multiple of 8: the second and third start mid-byte), edits and removals on
+    either side of every group start and block edge, queried under every scan loop: three groups are fewer than the
+    cores of any machine that has more than three, so MORSELS_ON takes the row-range path there whatever the box, and the
+    group path and AUTO give what numpy replaying the same edits gives."""
+    t = scan_table(40_011)
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=13_337, compression="snappy")
+    assert [pq.read_metadata(path).row_group(i).num_rows for i in range(3)] == [13_337, 13_337, 13_337]
+    p = subprocess.run([str(edger), str(path), str(mode), str(block)], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    got = json.loads(p.stdout.strip().split("\n")[-1])
+    region = t.column("region").to_pylist()
+    cost = t.column("cost").to_pylist()
+    alive = [True] * len(region)
+    for i, row in enumerate(EDGE_ROWS):
+        cost[row] = 10_000_000 + i
+        if i % 2 == 0:
+            region[row] = "Edge"
+    for i, row in enumerate(EDGE_ROWS):
+        if i % 4 == 1:
+            alive[row] = False
+    want = {}
+    for r, c, a in zip(region, cost, alive):
+        if a and r is not None:
+            s, n = want.get(r, (0, 0))
+            want[r] = (s + c, n + 1)
+    assert {w: (s, n) for w, s, n in zip(got["words"], got["sums"], got["counts"]) if n} == want
