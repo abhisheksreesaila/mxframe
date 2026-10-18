@@ -1351,7 +1351,7 @@ Needs: F-133, F-136 · Spec §7 · `mojo/mxframe/gpu.mojo` (`DeviceTable`, `gpu_
 - [ ] open: the register file lives in shared memory, so a program needing more than about 45 registers at 128 threads (or many groups with many aggregates) returns "needs more GPU shared memory" (AUTO falls back to the CPU); the whole table must fit on the device (no chunking yet); a sum whose partial totals pass int64 raises on the GPU as on the CPU, but the order of partials differs, so such borderline inputs may raise on one and not the other; the changed-rows mask is uploaded per query (rows / 8 bytes, not cached per edit count)
 - Review round 2: PASS (3M groups on AUTO runs on the GPU and equals the CPU; a 0-row table works; 40 / 44 aggregates fall back on AUTO). Follow-ups moved to F-138b: the fallback test fills GPU 0 (cap it or make it opt-in); AUTO's catch-all fallback could hide a kernel bug (narrow it to allocation failures or record why it fell back); `uploads()` adds nothing over the address check
 
-## F-138 M7: omxplorer on MX frame [doing]
+## F-138 M7: omxplorer on MX frame [done]
 Needs: F-134, F-135, F-136, F-137
 - [ ] omxplorer imports a CSV, edits, adds formulas, sorts, builds charts / pivots / a filtered Report, saves and reopens a `.omx` with `from mxframe import ...`; `scripts/check` passes with the same numbers; `scripts/build.sh omxplorer mac` links with no libpython
 
@@ -1379,10 +1379,11 @@ Needs: F-137 · `query.mojo`, `gpu.mojo`, `kernels_aot/_fpenv.mojo`, `parquet.mo
 - Review: NEEDS WORK, fixed: the switch test now reads a quoted-newline CSV in 4 KB chunks on 4 "threads" and compares it cell for cell with one chunk, and checks `core_count() == 1` (a no-op serial loop now fails it: 20000 vs 0 rows; before, the test never ran `par`); Android (Mojo's Linux) needs all three `-D` flags, in the README; serial tasks must not wait on each other (in `_fpenv`); a no-codec build names the right reason for gzip / brotli; the unreachable -6 fallback dropped; `fallback_reason` and "no GPU on this build" in the API doc. Left (unsure, untested): a sticky CUDA error raised while allocating a later AUTO query's buffers would be labelled an allocation failure (its text is kept in `fallback_reason`)
 - Review round 2: NEEDS WORK (the `_fpenv` docstring left five CPU libraries stale: `test_kernel_hashes` 5 failed), fixed by rebuilding them; a pre-commit hook (`scripts/git-hooks/pre-commit`, `core.hooksPath`) now refuses a staged `kernels_aot/*.mojo` while a library is stale. Full suite: 23,348 passed, 288 skipped. Reviewer: PASS once rebuilt and green
 
-## F-138c omxplorer on the package (app repo, `mxapp/mojo-ui`) [todo]
+## F-138c omxplorer on the package (app repo, `mxapp/mojo-ui`) [done]
 Needs: F-138a, F-138b (can start on Linux before them)
 - [ ] a `Sheet` in `mojoui/` (package `Frame` + column formats) implements `GridSource` and the formatting; nulls shown blank; `decimal_text` / `date_text` / `parse_decimal` move to `numformat.mojo`
 - [ ] aggregation through `Query(...).on_device(dt).compute(AUTO)`: status-bar totals, charts, pivots, bins, Report tiles and the West filter; averages use `count(col)`
 - [ ] CSV import through `read_csv`; BOOL shown; empty cells are nulls
 - [ ] `.omx` v2: `write_parquet(f.bake(), metadata=json)` / `read_parquet`; a small Mojo JSON reader; v1 files refused with a clear message (or migrated); Report filter stored as a word
 - [ ] `scripts/check` passes with the same numbers (checker needles and tests updated where the behaviour rightly changed, recorded in `docs/decisions.md`); the omxplorer Linux binary passes the no-libpython guard; mxstudio and the workbook keep the stand-in
+- Review round 1: NEEDS WORK (a lone JSON surrogate and a 0-column file aborted the app), fixed with a 40k-input JSON fuzz; round 2: PASS (360/360 blank-group cells against a row-by-row count, Mac M4 check real). Merged with the app's Goal 19 (agent host: omxplorer driven over MCP passes on the package). App main fast-forwarded to 93f6dbe (local, not pushed). Goals 14 / 15 / 17 / 19 pass; the only failure is goal 7 M2's Android emulator install (a debug-keystore mismatch, environmental). Owner calls pending: case-insensitive sort, (blank) group, uncompressed .omx (63 MB at 1M rows until Mac codecs)
