@@ -47,7 +47,7 @@ def build(serial):
     return out
 
 
-def best(f, reps=3):
+def best(f, reps=7):
     t = []
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -71,13 +71,15 @@ def main():
         for serial in (True, False):
             b = build(serial)
             runs = [json.loads(subprocess.run([str(b), str(path), "read", "text"], check=True, capture_output=True, text=True).stdout)
-                    for _ in range(3)]
+                    for _ in range(7)]
             r = min(runs, key=lambda x: x["decode_s"])
             print(f"mojo read_parquet {'1 thread ' if serial else 'all cores'}: {r['decode_s']:.3f} s (check {r['check']})")
         pa.set_cpu_count(os.cpu_count())
-        print(f"pyarrow all cores: {best(lambda: pq.read_table(path, use_threads=True)):.3f} s")
+        print(f"pyarrow all cores: {best(lambda: pq.read_table(path, use_threads=True)):.3f} s (plain strings); "
+              f"{best(lambda: pq.read_table(path, use_threads=True, read_dictionary=['region', 'name'])):.3f} s (dictionary-encoded, as ours)")
         pa.set_cpu_count(1)
-        print(f"pyarrow 1 thread : {best(lambda: pq.read_table(path, use_threads=False)):.3f} s")
+        print(f"pyarrow 1 thread : {best(lambda: pq.read_table(path, use_threads=False)):.3f} s (plain strings); "
+              f"{best(lambda: pq.read_table(path, use_threads=False, read_dictionary=['region', 'name'])):.3f} s (dictionary-encoded, as ours)")
     finally:
         if not a.keep:
             shutil.rmtree(D, ignore_errors=True)
