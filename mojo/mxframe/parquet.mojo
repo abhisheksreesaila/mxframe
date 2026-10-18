@@ -1227,7 +1227,7 @@ struct _ScanInfo(Movable):
         self.dicts = dicts^
 
     def check_unchanged(self) raises:
-        """A truncated or rewritten file has another size: refuse before mapping pages that may be gone."""
+        """A truncated or resized file: refuse before mapping pages that may be gone (a same-size rewrite is not seen)."""
         if external_call["lseek", Int](self.file._get_raw_fd(), Int(0), Int32(2)) != self.size:
             raise Error("the file changed since it was opened (`" + self.path + "`)")
 
@@ -1242,8 +1242,10 @@ struct ParquetScan(Copyable, Movable):
     text page, as after a writer's dictionary fallback, is decoded for its words); a column nobody reads costs
     nothing. Limit: a high-cardinality text column that IS read keeps all its distinct words in memory.
 
-    The file is held open. If it is truncated or rewritten in place, the next row group raises "the file changed since
-    it was opened"; a truncation during the decoding of one column chunk is a bus error (known limit)."""
+    The file is held open (a file replaced by rename keeps reading the one opened). If it is truncated or resized, the
+    next row group raises "the file changed since it was opened". Known limits: a rewrite in place that keeps the size
+    is not detected (only the size is compared), and a truncation during the decoding of one column chunk is a bus
+    error. No reader is safe against a concurrent writer; `write_parquet` replaces files by rename."""
     var _info: ArcPointer[_ScanInfo]
     var schema: SharedTable          # the columns (kinds and scales), no rows and no words
 
