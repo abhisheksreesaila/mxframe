@@ -5,7 +5,7 @@
 from std.sys import argv
 from std.os import getenv
 from mxframe import (Table, SharedTable, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
-                     gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, ZSTD, SNAPPY)
+                     gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY)
 from mxframe.query import AUTO_GPU_MIN_ROWS
 from mxframe.kernels._fpenv import core_count
 
@@ -98,10 +98,22 @@ def main() raises:
     var back = read_parquet(path)
     expect(back.table.rows() == 1000 and back.table.get(0, 999) == Int64(999) * 0x9E3779B97F4A7C15, "and read back exactly")
 
+    # a streamed query (F-140) over it: the same numbers, on the CPU
+    var streamed = Query(scan_parquet(path)).agg(count(), min_of(col("x")), max_of(col("x"))).compute(AUTO)
+    var whole = Query(back.take_table().share()).agg(count(), min_of(col("x")), max_of(col("x"))).compute(AUTO)
+    expect(streamed.device == CPU and streamed.counts[0] == 1000 and streamed.values(1)[0] == whole.values(1)[0] and
+           streamed.values(2)[0] == whole.values(2)[0], "a streamed query gives the whole-file answer")
+
     # ... and refuses a compressed file, naming the column
     expect(len(args) >= 3, "run with a zstd file and a snappy file")
     var z = refusal(String(args[1]))
     expect("`qty`" in z and "zstd" in z and "no zstd or snappy" in z, "a zstd file is refused: `" + z + "`")
     var s = refusal(String(args[2]))
     expect("`qty`" in s and "snappy" in s and "no zstd or snappy" in s, "a snappy file is refused: `" + s + "`")
+    var scanned = String("")
+    try:
+        _ = scan_parquet(String(args[1]))
+    except e:
+        scanned = String(e)
+    expect("zstd" in scanned and "no zstd or snappy" in scanned, "a zstd file cannot be scanned: `" + scanned + "`")
     print("ok")
