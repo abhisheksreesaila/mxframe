@@ -1005,6 +1005,7 @@ struct _Page(Copyable, Movable):
     var v2_compressed: Bool
     var ctx: Int                     # its chunk's `_Ctx`
     var row: Int                     # its first row in the output column
+    var is_dict: Bool                # a dictionary page: decoded into its chunk's `_Ctx.dict` in the first parallel round
     var defer: Bool                  # PLAIN text that may add words: misses are recorded, and coded in file order afterwards
     var nulls: Int
     var bits: List[UInt8]            # validity bits of its rows (an OPTIONAL column with nulls on this page)
@@ -1381,6 +1382,16 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
             got += run
 
 
+def _decode_dict_page(mut p: _Page, mut ctx: _Ctx, leaf: _Leaf, tbl: Int) raises:
+    """A dictionary page as stored values (file-wide codes for TEXT looked up in the finished dictionary)."""
+    var owner = List[UInt8]()
+    var c = _Bytes(_page_bytes(ctx.codec, p.addr, p.csize, p.usize, owner), p.usize)
+    var d = List[Int64](unsafe_uninit_length=p.nvals)
+    _plain_into(c, leaf, ctx, p.nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(d.unsafe_ptr())), tbl, True)
+    ctx.dict = d^
+    _ = owner^
+
+
 def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raises:
     """Decodes one data page into the column slice at `dst` (0: only add the words of a TEXT page, store nothing)."""
     var owner = List[UInt8]()
@@ -1538,12 +1549,17 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             ctx.dict_seen = True
             if nvals > 8 * usize + 8:
                 raise Error("column `" + leaf.name + "`: a dictionary page holds more values than its bytes can (corrupt file)")
-            var page = List[UInt8]()
-            var c = _Bytes(_page_bytes(meta.codec, base + body_at, csize, usize, page), usize)
-            ctx.dict = List[Int64](unsafe_uninit_length=nvals)
-            _plain_into(c, leaf, ctx, nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(ctx.dict.unsafe_ptr())),
-                        tbl, True)
-            _ = page^
+            if ctx.add and leaf.ptype == PT_BYTE_ARRAY:  # text words are added to the table here, in file order
+                var page = List[UInt8]()
+                var c = _Bytes(_page_bytes(meta.codec, base + body_at, csize, usize, page), usize)
+                ctx.dict = List[Int64](unsafe_uninit_length=nvals)
+                _plain_into(c, leaf, ctx, nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(ctx.dict.unsafe_ptr())),
+                            tbl, True)
+                _ = page^
+            else:                                        # a job of the first parallel round
+                pages.append(_Page(base + body_at, csize, usize, nvals, ENC_PLAIN, False, 0, ENC_RLE, True, ctx_at, 0, True, False, 0,
+                                   List[UInt8](), String(), List[Int](), List[Int](), List[UInt64](), List[Int](), List[Int32](),
+                                   List[Int](), List[UInt8]()))
             continue
         if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
             continue                                     # an index page: not needed
@@ -1555,7 +1571,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             continue
         var defer = leaf.ptype == PT_BYTE_ARRAY and ctx.add and encoding == ENC_PLAIN
         pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
-                           v2_compressed, ctx_at, ctx.row0 + done, defer, 0, List[UInt8](), String(), List[Int](), List[Int](),
+                           v2_compressed, ctx_at, ctx.row0 + done, False, defer, 0, List[UInt8](), String(), List[Int](), List[Int](),
                            List[UInt64](), List[Int](), List[Int32](), List[Int](), List[UInt8]()))
         done += nvals
 
@@ -1694,9 +1710,30 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
     var ca = Int(ctxs.unsafe_ptr())
     var la = Int(leaves.unsafe_ptr())
     var cola = Int(t.cols.unsafe_ptr())
+    var dicts = List[Int]()                             # round 1: the dictionary pages, in parallel (the data pages need them)
+    for i in range(len(pages)):
+        if pages[i].is_dict:
+            dicts.append(i)
+    if len(dicts) > 0:
+        var da = Int(dicts.unsafe_ptr())
+        def dict_job(j: Int) {imm}:
+            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=da)[j])[]
+            ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+            ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
+            try:
+                _decode_dict_page(p, ctx, leaf, tbl)
+            except e:
+                p.err = String(e)
+        if len(dicts) == 1:
+            dict_job(0)
+        else:
+            par_n(dict_job, len(dicts), min(len(dicts), core_count()))
+    _ = dicts^
     def job(j: Int) {imm}:
         var page = Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa)
         ref p = (page + j)[]
+        if p.is_dict:
+            return
         ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
         ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
         ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
