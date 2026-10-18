@@ -13,12 +13,20 @@ Nothing is copied from the shared table: an edit is a sparse cell, an appended r
 row is a tombstone. Formula columns follow the stored ones (index stored + k); their expressions are inlined
 where they are used, so an aggregation over a formula runs in the kernel like any expression. A merge folds text
 values into one (three spellings of a customer): every reference to the column reads the merged code.
+
+A Frame also sits over a Parquet file that is not in memory (F-147): `Frame(scan_parquet(path))` has this same API,
+with the file's rows as the base. Edits are the same sparse cells; `get` / `is_null` read the row group that holds the
+row through a bounded cache of decoded column chunks (`set_cache_limit`, 128 MiB by default); `Query(frame)` streams
+the file with the overlay applied; `permutation` streams the column (O(rows) keys in memory); `bake` is refused (it
+would hold the file) and `save(path)` streams the edited file out, a row group at a time.
 """
 from std.collections import Dict, Set
+from std.memory import ArcPointer
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool
+from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP
 
 comptime SET = 0
 comptime APPEND = 1
@@ -26,6 +34,7 @@ comptime REMOVE = 2
 comptime MERGE = 3
 comptime REPOINT = 4
 comptime NULL_EDIT = Int64.MIN + 1        # an edited cell set to null: `set` refuses this one value
+comptime CACHE_BYTES = 128 * 1024 * 1024  # the default bound of a scan frame's cache of decoded column chunks
 
 
 @fieldwise_init
@@ -53,8 +62,70 @@ def _pow10(k: Int) -> Int64:
     return v
 
 
+struct _ChunkCache(Movable):
+    """What a Frame over a scan keeps of the file: decoded column chunks (one column of one row group) up to `limit`
+    bytes, least recently used out first (the newest chunk is always kept, so a chunk bigger than the limit still
+    reads), and the base values of the rows the session touched (`rows`, filled by `Frame.overlay`)."""
+    var keys: List[Int]              # (group << 20) | column
+    var tables: List[Table]          # one column each
+    var used: List[Int]              # the clock at each chunk's last use
+    var held: Int                    # bytes in `tables`
+    var limit: Int
+    var clock: Int
+    var loads: Int                   # chunks decoded so far
+    var rows: Dict[Int, List[Int64]] # touched row -> its stored values from the file (NULL_EDIT: null)
+
+    def __init__(out self):
+        self.keys = List[Int]()
+        self.tables = List[Table]()
+        self.used = List[Int]()
+        self.held = 0
+        self.limit = CACHE_BYTES
+        self.clock = 0
+        self.loads = 0
+        self.rows = Dict[Int, List[Int64]]()
+
+    def evict(mut self, keep: Int):
+        """Drops least recently used chunks until the rest fit `keep` bytes."""
+        while len(self.keys) > 0 and self.held > keep:
+            var at = 0
+            for i in range(1, len(self.keys)):
+                if self.used[i] < self.used[at]:
+                    at = i
+            self.held -= _chunk_bytes(self.tables[at])
+            _ = self.keys.pop(at)
+            _ = self.tables.pop(at)
+            _ = self.used.pop(at)
+
+    def fetch(mut self, scan: ParquetScan, g: Int, c: Int) raises -> Int:
+        """The index in `tables` of column c of row group g, decoded now if it is not held."""
+        var key = (g << 20) | c
+        self.clock += 1
+        for i in range(len(self.keys)):
+            if self.keys[i] == key:
+                self.used[i] = self.clock
+                return i
+        var t = scan.read_group(g, [c])
+        var size = _chunk_bytes(t)
+        self.evict(self.limit - size)
+        self.keys.append(key)
+        self.tables.append(t^)
+        self.used.append(self.clock)
+        self.held += size
+        self.loads += 1
+        return len(self.keys) - 1
+
+
+def _chunk_bytes(t: Table) -> Int:
+    return len(t.cols[0].values) * 8 + len(t.cols[0].validity)
+
+
 struct Frame(Movable):
-    var base: SharedTable
+    var base: SharedTable                 # the shared table; over a scan, its schema (columns, no rows)
+    var scan: Optional[ParquetScan]       # set: the base rows are this file's, read a row group at a time
+    var nbase: Int                        # the base's rows
+    var starts: List[Int]                 # a scan's first row of each row group, then its total
+    var cache: ArcPointer[_ChunkCache]
     var cells: Dict[Int, Int64]           # (row << 20) | col -> edited value (NULL_EDIT: set to null)
     var added: List[List[Int64]]          # appended rows, per row a value per stored column (NULL_EDIT: null)
     var removed: Set[Int]
@@ -67,6 +138,10 @@ struct Frame(Movable):
 
     def __init__(out self, base: SharedTable):
         self.base = base
+        self.scan = None
+        self.nbase = base.rows()
+        self.starts = List[Int]()
+        self.cache = ArcPointer(_ChunkCache())
         self.cells = Dict[Int, Int64]()
         self.added = List[List[Int64]]()
         self.removed = Set[Int]()
@@ -80,6 +155,17 @@ struct Frame(Movable):
         self.edits = 0
         self.formulas = List[Formula]()
 
+    def __init__(out self, scan: ParquetScan):
+        """A session over a Parquet file that stays on disk: the same API as `Frame(shared)`."""
+        self = Self(scan.schema)
+        self.scan = scan.copy()
+        self.nbase = scan.rows()
+        var at = 0
+        for g in range(scan.row_groups()):
+            self.starts.append(at)
+            at += scan.group_rows(g)
+        self.starts.append(at)
+
     # ── shape ───────────────────────────────────────────────────────────────────────────────────────
 
     def stored(self) -> Int:
@@ -90,7 +176,7 @@ struct Frame(Movable):
 
     def rows(self) -> Int:
         """Base rows plus appended rows (removed rows keep their numbers: ask `alive`)."""
-        return self.base.rows() + len(self.added)
+        return self.nbase + len(self.added)
 
     def alive(self, row: Int) -> Bool:
         return 0 <= row < self.rows() and row not in self.removed
@@ -123,23 +209,70 @@ struct Frame(Movable):
 
     # ── values ──────────────────────────────────────────────────────────────────────────────────────
 
-    def _raw(self, c: Int, row: Int) -> Int64:
+    def _raw(self, c: Int, row: Int) raises -> Int64:
         """A stored column's value as edited (NULL_EDIT for null), before merges."""
         var hit = self.cells.get((row << 20) | c)
         if hit:
             return hit.value()
-        var n = self.base.rows()
-        if row < n:
+        if row < self.nbase:
+            return self._base_value(c, row)
+        return self.added[row - self.nbase][c]
+
+    def _group_of(self, row: Int) -> Int:
+        """The row group of a scan that holds `row`."""
+        var lo = 0
+        var hi = len(self.starts) - 2
+        while lo < hi:
+            var mid = (lo + hi + 1) // 2
+            if self.starts[mid] <= row:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def _base_value(self, c: Int, row: Int) raises -> Int64:
+        """The file's (or shared table's) value of a base row, NULL_EDIT for null. A scan: from the rows the session
+        touched, else from the cache, which decodes the column chunk of the row's group on a miss."""
+        if not self.scan:
             return NULL_EDIT if self.base.is_null(c, row) else self.base.get(c, row)
-        return self.added[row - n][c]
+        ref cache = self.cache[]
+        if row in cache.rows:
+            return cache.rows[row][c]
+        var g = self._group_of(row)
+        var i = cache.fetch(self.scan.value(), g, c)
+        ref t = cache.tables[i]
+        var r = row - self.starts[g]
+        return NULL_EDIT if t.is_null(0, r) else t.get(0, r)
+
+    def set_cache_limit(mut self, bytes: Int):
+        """Bounds the decoded column chunks a scan frame keeps for `get` and `is_null` (8 bytes a value plus the null
+        bits; the chunk just read is always kept, so one chunk bigger than the limit still reads)."""
+        ref cache = self.cache[]
+        cache.limit = bytes
+        cache.evict(bytes)
+
+    def cache_held(self) -> Int:
+        """Bytes of decoded column chunks the cache holds now."""
+        return self.cache[].held
+
+    def cache_loads(self) -> Int:
+        """Column chunks decoded so far (a chunk read again after eviction counts again)."""
+        return self.cache[].loads
+
+    def _shared_words(self, c: Int) raises -> Int:
+        """The words of TEXT column c in the shared table or the file (a file's are built on first use)."""
+        if self.scan:
+            return self.scan.value().word_count(c)
+        return len(self.base.dictionary(c))
 
     def edited(self, c: Int, row: Int) -> Bool:
         """Does the cell hold a session edit (set, set_null or set_text) that undo has not taken back?"""
         return ((row << 20) | c) in self.cells
 
-    def word_count(self, c: Int) -> Int:
-        """A TEXT column's words: the shared dictionary's plus this session's (codes run 0 up to this)."""
-        return len(self.base.dictionary(c)) + len(self.words[c])
+    def word_count(self, c: Int) raises -> Int:
+        """A TEXT column's words: the shared dictionary's (a file's, built on first use) plus this session's (codes run
+        0 up to this)."""
+        return self._shared_words(c) + len(self.words[c])
 
     def is_null(self, c: Int, row: Int) raises -> Bool:
         if c < self.stored():
@@ -153,20 +286,20 @@ struct Frame(Movable):
             return 0 if v == NULL_EDIT else self.alias(c, v)
         return self.evaluate(self.program(c), row)[0]
 
-    def text_of(self, c: Int, code: Int64) -> String:
+    def text_of(self, c: Int, code: Int64) raises -> String:
         """The word of a TEXT code: the shared dictionary's, then this session's."""
-        var n = len(self.base.dictionary(c))
+        var n = self._shared_words(c)
         var k = Int(code)
         if k < n:
-            return self.base.text_of(c, k)
+            return self.scan.value().text_of(c, k) if self.scan else self.base.text_of(c, k)
         return self.words[c][k - n] if k - n < len(self.words[c]) else "?"
 
-    def code_of(self, c: Int, word: String) -> Int:
-        var k = self.base.code_of(c, word)
+    def code_of(self, c: Int, word: String) raises -> Int:
+        var k = self.scan.value().code_of(c, word) if self.scan else self.base.code_of(c, word)
         if k >= 0:
             return k
         var mine = self.word_codes[c].get(word, -1)
-        return len(self.base.dictionary(c)) + mine if mine >= 0 else -1
+        return self._shared_words(c) + mine if mine >= 0 else -1
 
     def parse(mut self, c: Int, text: String) raises -> Int64:
         """A stored value from typed text (TEXT: its code, added if new; empty: null)."""
@@ -180,7 +313,7 @@ struct Frame(Movable):
                 return Int64(k)
             self.word_codes[c][s] = len(self.words[c])
             self.words[c].append(s)
-            return Int64(len(self.base.dictionary(c)) + len(self.words[c]) - 1)
+            return Int64(self._shared_words(c) + len(self.words[c]) - 1)
         var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(s.unsafe_ptr()))
         var n = s.byte_length()
         var out: Int64 = 0
@@ -220,7 +353,7 @@ struct Frame(Movable):
     def _set(mut self, c: Int, row: Int, value: Int64) raises:
         self._check_cell(c, row)
         if self.base.kind(c) == TEXT and value != NULL_EDIT and \
-                (value < 0 or value >= Int64(len(self.base.dictionary(c)) + len(self.words[c]))):
+                (value < 0 or value >= Int64(self._shared_words(c) + len(self.words[c]))):
             raise Error("column `" + self.base.name(c) + "`: code " + String(value) + " is not one of its words")
         if self.base.kind(c) == BOOL and value != NULL_EDIT and value != 0 and value != 1:
             raise Error("column `" + self.base.name(c) + "` is BOOL: " + String(value) + " is not 0 or 1")
@@ -287,7 +420,7 @@ struct Frame(Movable):
         for key in self.cells.keys():
             seen.add(key >> 20)
         for i in range(len(self.added)):
-            seen.add(self.base.rows() + i)
+            seen.add(self.nbase + i)
         for row in self.removed:
             seen.add(row)
         var out = List[Int]()
@@ -452,14 +585,45 @@ struct Frame(Movable):
 
     def evaluate(self, e: Expr, row: Int) raises -> Tuple[Int64, Bool]:
         """(value, null) of an expression over stored columns (as `expand` gives) on one row."""
-        return _eval_row(e, self.base, self.raw_row(row))
+        var raw = List[Int64](length=self.stored(), fill=0)
+        for name in e.columns():                             # only the columns the expression reads (over a scan each is a chunk)
+            var c = self.base.column(name)
+            raw[c] = self._raw(c, row)
+        return _eval_row(e, self.base, raw)
 
-    def raw_row(self, row: Int) -> List[Int64]:
+    def raw_row(self, row: Int) raises -> List[Int64]:
         """The row's stored values as edited (NULL_EDIT for null), before merges."""
         var out = List[Int64]()
         for c in range(self.stored()):
             out.append(self._raw(c, row))
         return out^
+
+    def _load_base_rows(self, rows: List[Int]) raises:
+        """A scan: puts the file's values of the base rows `rows` (ascending) into the touched-rows memo, one pass per
+        row group and column, each chunk decoded for the purpose and let go (not through the cache)."""
+        if not self.scan:
+            return
+        ref cache = self.cache[]
+        var i = 0
+        while i < len(rows) and rows[i] < self.nbase:
+            var g = self._group_of(rows[i])
+            var need = List[Int]()
+            while i < len(rows) and rows[i] < self.starts[g + 1]:
+                if rows[i] not in cache.rows:
+                    need.append(rows[i])
+                i += 1
+            if len(need) == 0:
+                continue
+            var vals = List[List[Int64]]()
+            for _ in range(len(need)):
+                vals.append(List[Int64](length=self.stored(), fill=0))
+            for c in range(self.stored()):
+                var t = self.scan.value().read_group(g, [c])
+                for k in range(len(need)):
+                    var r = need[k] - self.starts[g]
+                    vals[k][c] = NULL_EDIT if t.is_null(0, r) else t.get(0, r)
+            for k in range(len(need)):
+                cache.rows[need[k]] = vals[k].copy()
 
     def overlay(self) raises -> Overlay:
         """What a query needs of this session, copied: its formulas and merges (to expand expressions), the shared
@@ -468,16 +632,20 @@ struct Frame(Movable):
         o.formulas = self.formulas.copy()
         o.aliases = self.aliases.copy()
         o.words = self.words.copy()
-        var n = self.base.rows()
+        var n = self.nbase
         var changed = self.changed_rows()
         if len(changed) > 0:
             if changed[0] < n:                               # appended rows alone leave the shared rows untouched
                 o.mask = List[UInt8](length=(n + 7) // 8, fill=0xFF)
+            var live = List[Int]()
             for row in changed:
                 if row < n:
                     o.mask[row // 8] &= ~(UInt8(1) << UInt8(row % 8))
                 if self.alive(row):
-                    o.delta.append(self.raw_row(row))
+                    live.append(row)
+            self._load_base_rows(live)                       # a scan: the file's rows, a chunk at a time, once
+            for row in live:
+                o.delta.append(self.raw_row(row))
         return o^
 
     # ── sort ────────────────────────────────────────────────────────────────────────────────────────
@@ -486,7 +654,7 @@ struct Frame(Movable):
         """The live rows in the column's order, stable (ties keep row order); text alphabetical (ignoring ASCII case, bytes break ties; merges
         applied), nulls last either way. The data never moves. A radix sort over Int64 keys; a column with no edits
         is read straight from the shared values."""
-        var n = self.base.rows()
+        var n = self.nbase
         var text = c < self.stored() and self.base.kind(c) == TEXT
         var rank = List[Int64]()
         if text:                                             # each code's place among the words, alphabetically
@@ -513,28 +681,47 @@ struct Frame(Movable):
                     edited = True
                     break
             var merged = text and len(self.aliases) > 0
-            var some_nulls = self.base.null_count(c) > 0
             var has_removed = len(self.removed) > 0
-            var vals = self.base.values(c)
-            for row in range(self.rows()):
-                if has_removed and row in self.removed:
-                    continue
-                var raw: Int64
-                if edited:
-                    raw = self._raw(c, row)
-                elif row >= n:
-                    raw = self.added[row - n][c]
-                elif some_nulls and self.base.is_null(c, row):
-                    raw = NULL_EDIT
-                else:
-                    raw = vals[row]
-                if raw == NULL_EDIT:
-                    nulls.append(row)
-                    continue
-                if merged:
-                    raw = self.alias(c, raw)
-                keys.append(rank[Int(raw)] if text else raw)
-                rows.append(row)
+            # The rows come in segments: the shared table whole, or a scan's row groups one at a time (the column's
+            # chunk decoded for the pass and let go), then the appended rows.
+            var segments = (len(self.starts) - 1 if self.scan else 1) + 1
+            for seg in range(segments):
+                var lo = n
+                var hi = self.rows()
+                var tbl = self.base
+                var tc = c
+                if seg < segments - 1:
+                    lo = self.starts[seg] if self.scan else 0
+                    hi = self.starts[seg + 1] if self.scan else n
+                    if self.scan:
+                        if hi == lo:
+                            continue
+                        tbl = self.scan.value().read_group(seg, [c])^.share()
+                        tc = 0
+                var some_nulls = tbl.null_count(tc) > 0
+                var vals = tbl.values(tc)
+                for row in range(lo, hi):
+                    if has_removed and row in self.removed:
+                        continue
+                    var raw: Int64
+                    var hit = Optional[Int64](None)
+                    if edited:
+                        hit = self.cells.get((row << 20) | c)
+                    if hit:
+                        raw = hit.value()
+                    elif row >= n:
+                        raw = self.added[row - n][c]
+                    elif some_nulls and tbl.is_null(tc, row - lo):
+                        raw = NULL_EDIT
+                    else:
+                        raw = vals[row - lo]
+                    if raw == NULL_EDIT:
+                        nulls.append(row)
+                        continue
+                    if merged:
+                        raw = self.alias(c, raw)
+                    keys.append(rank[Int(raw)] if text else raw)
+                    rows.append(row)
         var out = _radix_order(keys, rows, descending)
         out.extend(nulls^)
         return out^
@@ -543,12 +730,15 @@ struct Frame(Movable):
 
     def bake(self) raises -> Table:
         """A new table with this session's edits applied (removed rows gone, merges folded, session words added);
-        formulas are not stored (their texts go in the document's metadata)."""
+        formulas are not stored (their texts go in the document's metadata). Over a scan it is refused: the table
+        would hold the whole file; `save(path)` streams it out instead."""
+        if self.scan:
+            raise Error("a Frame over a streamed file cannot be baked into memory: save it to a new file with `save(path)`")
         var t = Table.empty()
         for c in range(self.stored()):
             _ = t.add_column(self.base.name(c), self.base.kind(c), scale=self.base.scale(c))
             if self.base.kind(c) == TEXT:
-                for k in range(len(self.base.dictionary(c)) + len(self.words[c])):
+                for k in range(self.word_count(c)):
                     _ = t.add_word(c, self.text_of(c, Int64(k)))
         for row in range(self.rows()):
             if not self.alive(row):
@@ -561,12 +751,123 @@ struct Frame(Movable):
                     t.append(c, self.alias(c, raw))
         return t^
 
+    def save(self, path: String, metadata: String = "", compression: Int = ZSTD) raises:
+        """Writes the edited rows to a new Parquet file (`metadata` under the key "omx"; the file replaces `path` by
+        rename, so `path` may be the file this frame reads). A frame over a scan streams: one row group of the file at
+        a time (all its columns decoded, edits applied, encoded and written; appended rows follow in groups of
+        DEFAULT_ROW_GROUP), so the memory is one row group, the file's dictionaries and the edits, whatever the size.
+        The saved row groups are the source's, less the removed rows. A frame over a table writes `bake()`. Formulas
+        are not stored."""
+        if not self.scan:
+            write_parquet(path, self.bake(), metadata, compression)
+            return
+        ref scan = self.scan.value()
+        var stored = self.stored()
+        var out = Table.empty()                              # one row group's rows at a time; its words are the file's
+        var null_edit = List[Bool](length=stored, fill=False)
+        for item in self.cells.items():
+            if item.value == NULL_EDIT:
+                null_edit[item.key & 0xFFFFF] = True
+        for row in self.added:
+            for c in range(stored):
+                if row[c] == NULL_EDIT:
+                    null_edit[c] = True
+        var optional = List[Bool]()
+        var remap = List[List[Int64]]()                      # per column: a merged text code -> the code it reads as
+        for c in range(stored):
+            _ = out.add_column(self.base.name(c), self.base.kind(c), scale=self.base.scale(c))
+            optional.append(scan.nullable(c) or null_edit[c])
+            var map = List[Int64]()
+            if self.base.kind(c) == TEXT:
+                var words = self.word_count(c)
+                for k in range(words):
+                    _ = out.add_word(c, self.text_of(c, Int64(k)))
+                if _has_aliases(self.aliases, c):
+                    for k in range(words):
+                        map.append(self.alias(c, Int64(k)))
+            remap.append(map^)
+        var all = List[Int]()
+        for c in range(stored):
+            all.append(c)
+        var w = ParquetWriter(path, out, optional, compression)
+        try:
+            var changed = self.changed_rows()                # ascending; the rows whose values are not the file's
+            var ci = 0
+            for g in range(scan.row_groups()):
+                var n = scan.group_rows(g)
+                if n == 0:
+                    continue
+                var lo = self.starts[g]
+                var tbl = scan.read_group(g, all)
+                _clear_rows(out)
+                var r = 0
+                while r < n:
+                    var stop = n                             # the rows lo + r .. lo + stop are the file's
+                    if ci < len(changed) and changed[ci] < lo + n:
+                        stop = changed[ci] - lo
+                    for c in range(stored):
+                        for i in range(r, stop):
+                            _push(out, c, tbl, c, i, remap[c])
+                    r = stop
+                    if r < n:                                # row lo + r is edited, removed or both
+                        var row = lo + r
+                        ci += 1
+                        if self.alive(row):
+                            for c in range(stored):
+                                var hit = self.cells.get((row << 20) | c)
+                                if hit:
+                                    _push_value(out, c, hit.value(), remap[c])
+                                else:
+                                    _push(out, c, tbl, c, r, remap[c])
+                        r += 1
+                w.write_group(out)
+            _clear_rows(out)
+            for row in range(self.nbase, self.rows()):
+                if not self.alive(row):
+                    continue
+                for c in range(stored):
+                    _push_value(out, c, self.added[row - self.nbase][c], remap[c])
+                if out.rows() >= DEFAULT_ROW_GROUP:
+                    w.write_group(out)
+                    _clear_rows(out)
+            if out.rows() > 0 or w.group_count() == 0:
+                w.write_group(out)
+            w.finish(metadata)
+        except e:
+            w.abort()
+            raise e^
+
+
+def _clear_rows(mut t: Table):
+    """Empties every column's values and nulls, keeping the columns and their words."""
+    for c in range(len(t.cols)):
+        t.cols[c].values.clear()
+        t.cols[c].validity.clear()
+        t.cols[c].nulls = 0
+
+
+def _push_value(mut t: Table, c: Int, raw: Int64, remap: List[Int64]) raises:
+    """Appends a stored value as edited (NULL_EDIT: null) to column c, a merged text code as the code it reads as."""
+    if raw == NULL_EDIT:
+        t.append_null(c)
+    else:
+        t.append(c, remap[Int(raw)] if len(remap) > 0 else raw)
+
+
+def _push(mut t: Table, c: Int, src: Table, sc: Int, row: Int, remap: List[Int64]) raises:
+    """Appends row `row` of `src`'s column sc to column c of t (the file's value, untouched by edits)."""
+    if src.cols[sc].is_null(row):
+        t.append_null(c)
+    else:
+        var v = src.cols[sc].values[row]
+        t.append(c, remap[Int(v)] if len(remap) > 0 else v)
+
 
 def _ascii_lower(b: UInt8) -> UInt8:
     return b + 32 if UInt8(65) <= b <= UInt8(90) else b
 
 
-def _text_ranks(f: Frame, c: Int) -> List[Int64]:
+def _text_ranks(f: Frame, c: Int) raises -> List[Int64]:
     """Every code's place among the column's words (shared and session), alphabetical ignoring ASCII case with
     bytes as the tie-break: rank[code], computed once."""
     var words = List[String]()
