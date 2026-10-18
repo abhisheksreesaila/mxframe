@@ -78,9 +78,6 @@ comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
 comptime INT32_MAX = 2147483647
-# A page can claim at most this many values per byte (+ 8 bytes): a repeated RLE value, or an all-null level run, is the
-# densest thing a writer emits. Past it the file is refused instead of sizing a column for the claim.
-comptime MAX_VALUES_PER_BYTE = 1 << 20
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
 
 
@@ -493,6 +490,7 @@ struct _ChunkMeta(Copyable, Movable):
     var data_off: Int
     var dict_off: Int
     var size: Int                    # total_compressed_size: the bytes of the chunk's pages (headers included)
+    var group_rows: Int              # its row group's num_rows, -1 when the footer has none
 
 
 struct _Bytes:
@@ -757,9 +755,9 @@ def read_parquet(path: String) raises -> ParquetResult:
     for g in range(len(groups)):
         if len(cols) > 0 and len(groups[g]) == len(cols):
             total += groups[g][0].values
-    if total <= 64 * n + 1024:                                  # size every column once (a corrupt count cannot ask for more
-        for c in range(len(cols)):                              # than the file could plausibly hold); the pages write every row
-            t.cols[c].values = List[Int64](unsafe_uninit_length=total)
+    _check_claim("`" + path + "`", total, len(cols))
+    for c in range(len(cols)):                                  # size every column once; the pages write every row
+        t.cols[c].values = List[Int64](unsafe_uninit_length=total)
     var row0 = 0
     for g in range(len(groups)):
         if len(groups[g]) != len(cols):
@@ -926,6 +924,7 @@ def _read_schema_element(mut r: ThriftReader) raises -> _Leaf:
 
 def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
     var chunks = List[_ChunkMeta]()
+    var group_rows = -1
     r.enter()
     while True:
         var f = r.field()
@@ -934,7 +933,7 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
         if f[0] == 1 and f[1] == T_LIST:
             var h = r.list_header()
             for _ in range(h[1]):
-                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0)
+                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0, -1)
                 r.enter()
                 while True:
                     var g = r.field()
@@ -967,8 +966,12 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
                         r.skip(g[1])
                 r.leave()
                 chunks.append(meta^)
+        elif f[0] == 3 and f[1] == T_I64:
+            group_rows = Int(r.zigzag())
         else:
             r.skip(f[1])
+    for i in range(len(chunks)):
+        chunks[i].group_rows = group_rows
     r.leave()
     return chunks^
 
@@ -1489,9 +1492,6 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             continue                                     # an index page: not needed
         if nvals > meta.values - done:
             raise Error("column `" + leaf.name + "`: a page holds more values than its column chunk (corrupt file)")
-        if nvals > (usize + 8) * MAX_VALUES_PER_BYTE:           # the columns are sized from these claims: refuse what no page of that size holds
-            raise Error("column `" + leaf.name + "`: a page claims " + String(nvals) + " values in only " + String(usize) +
-                        " bytes (corrupt file)")
         var dict_coded = encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY
         if words_only and dict_coded:
             done += nvals
@@ -1500,6 +1500,31 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
         pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
                            v2_compressed, ctx_at, ctx.row0 + done, serial, 0, List[UInt8](), String()))
         done += nvals
+
+
+def _physical_memory() -> Int:
+    """The machine's physical memory in bytes (sysconf), 0 when it cannot be told."""
+    comptime if CompilationTarget.is_linux():
+        var pages = external_call["sysconf", Int](Int32(85))         # _SC_PHYS_PAGES
+        var size = external_call["sysconf", Int](Int32(30))          # _SC_PAGESIZE
+        return pages * size if pages > 0 and size > 0 else 0
+    else:
+        var pages = external_call["sysconf", Int](Int32(200))        # Darwin's _SC_PHYS_PAGES
+        var size = external_call["sysconf", Int](Int32(29))          # Darwin's _SC_PAGESIZE
+        return pages * size if pages > 0 and size > 0 else 0
+
+
+def _check_claim(what: String, rows: Int, ncols: Int) raises:
+    """Refuses a row count whose decoded columns (8 bytes a value) could not fit in the machine's memory. The columns
+    are sized from the counts a file states, so this is what stops a file of a few KB from asking for terabytes.
+    Limits: a claim below the machine's memory (or an address-space cap lower than it) is still sized, untouched until
+    its pages decode, and a corrupt page raises when it does."""
+    var ram = _physical_memory()
+    if ram > 0 and rows > ram // (8 * max(ncols, 1)):
+        var need = Float64(rows) * 8.0 * Float64(max(ncols, 1))
+        raise Error(what + " claims " + String(rows) + " rows: " + String(need / 1e9) + " GB for " + String(ncols) +
+                    (" column" if ncols == 1 else " columns") + ", more than this machine's memory (" + String(Float64(ram) / 1e9) +
+                    " GB); a corrupt file, or too big to read whole (stream it with scan_parquet)")
 
 
 def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf_ids: List[Int], out_cols: List[Int],
@@ -1523,6 +1548,11 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                         leaves[leaf_ids[0]].name + "` has " + String(rows) + " (corrupt file)")
         _walk_chunk(bases[k], ns[k], metas[k], leaves[leaf_ids[k]], ctxs[k], k, tbl, pages, words_only)
     if not words_only:
+        for k in range(len(metas)):                     # the pages add up to the chunk (the walk); the chunk to the group
+            if metas[k].group_rows >= 0 and metas[k].values != metas[k].group_rows:
+                raise Error("column `" + leaves[leaf_ids[k]].name + "` has " + String(metas[k].values) + " values in a row group of " +
+                            String(metas[k].group_rows) + " rows (corrupt file)")
+        _check_claim("row group", rows, len(out_cols))
         for k in range(len(out_cols)):                  # size the columns once: the pages add up to the rows
             ref col = t.cols[out_cols[k]]
             if len(col.values) < row0:

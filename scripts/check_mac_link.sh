@@ -46,8 +46,8 @@ bad="$(echo "$missing" | grep -E 'AsyncRT|Tracy|KGEN|ZSTD|snappy|^_Py|python|cud
 if [ -n "$bad" ]; then echo "FAIL: symbols this build must not need:"; echo "$bad" | sed 's/^/  /'; exit 1; fi
 
 # The app's apple/sdk/macos/libSystem.tbd lists, by hand, the libSystem functions the app uses. The package adds the
-# file-system and process calls below (all POSIX / libc, in libSystem on macOS).
-libc_ok=" _close _lseek _lstat _mkdir _mmap _munmap _open _read _rename _stat _strerror _unlink _getpid ___error "
+# file-system, process and memory-size (sysconf) calls below (all POSIX / libc, in libSystem on macOS).
+libc_ok=" _close _lseek _lstat _mkdir _mmap _munmap _open _read _rename _stat _strerror _unlink _getpid _sysconf ___error "
 have="$(grep -o '_[A-Za-z0-9_]*' "$app/apple/sdk/macos/libSystem.tbd" | sort -u)"
 need="$(comm -23 <(echo "$missing") <(echo "$have") | tr '\n' ' ')"
 for s in $need; do

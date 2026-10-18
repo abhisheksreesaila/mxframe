@@ -866,7 +866,7 @@ def test_every_cell_through_read_and_scan_with_odd_pages(cells, tmp_path, k, ver
         assert got == want, (mode, next(i for i, (a, b) in enumerate(zip(got.split("\n"), want.split("\n"))) if a != b))
 
 
-def multi_page_file(path, pages, ptype=2, rep=0):
+def multi_page_file(path, pages, ptype=2, rep=0, text=False, group_rows=None):
     """One INT64 column `x`, one row group, one chunk made of `pages`: (kind, nvals, encoding, body) with kind 0 a data
     page and 2 a dictionary page. Sizes are the body's."""
     data = b"PAR1"
@@ -889,13 +889,16 @@ def multi_page_file(path, pages, ptype=2, rep=0):
     m = Compact()
     m.i32(1, 1); m.lst(2, 12, 2)
     m.el(); m.bin(4, b"schema"); m.i32(5, 1); m.end()
-    m.el(); m.i32(1, ptype); m.i32(3, rep); m.bin(4, b"x"); m.end()
+    m.el(); m.i32(1, ptype); m.i32(3, rep); m.bin(4, b"x")
+    if text:
+        m.i32(6, 0)                                           # converted type UTF8
+    m.end()
     m.i64(3, total); m.lst(4, 12, 1)
     m.el(); m.lst(1, 12, 1)
     m.el(); m.i64(2, off)
     m.st(3); m.i32(1, ptype); m.lst(2, 5, 1); m.b += zz(0); m.lst(3, 8, 1); m.b += uv(1) + b"x"
     m.i32(4, 0); m.i64(5, total); m.i64(6, len(chunk)); m.i64(7, len(chunk)); m.i64(9, off); m.end(); m.end()
-    m.i64(2, len(chunk)); m.i64(3, total); m.end(); m.b.append(0)
+    m.i64(2, len(chunk)); m.i64(3, total if group_rows is None else group_rows); m.end(); m.b.append(0)
     data += bytes(m.b) + struct.pack("<i", len(m.b)) + b"PAR1"
     Path(path).write_bytes(data)
 
@@ -917,13 +920,51 @@ def refused_by_both(cells, path, message):
 I31 = 2**31 - 1
 
 
-def test_pages_that_claim_rows_their_bytes_cannot_hold_are_refused_not_allocated(cells, tmp_path):
-    """64 empty pages that each claim 2^31-1 rows (a 2 KB file) asked for a terabyte of column: a readable error now."""
+def bomb_file(path, npages, per, usize, codec):
+    """One INT64 column of `npages` header-only pages (no bodies), each claiming `per` rows and `usize` bytes."""
+    data = b"PAR1"
+    off = len(data)
+    chunk = b""
+    for _ in range(npages):
+        h = Compact(); h.i32(1, 0); h.i32(2, usize); h.i32(3, 0)
+        h.st(5); h.i32(1, per); h.i32(2, 0); h.i32(3, 3); h.i32(4, 3); h.end(); h.b.append(0)
+        chunk += bytes(h.b)
+    data += chunk
+    total = npages * per
+    m = Compact(); m.i32(1, 1); m.lst(2, 12, 2)
+    m.el(); m.bin(4, b"schema"); m.i32(5, 1); m.end()
+    m.el(); m.i32(1, 2); m.i32(3, 0); m.bin(4, b"x"); m.end()
+    m.i64(3, total); m.lst(4, 12, 1)
+    m.el(); m.lst(1, 12, 1)
+    m.el(); m.i64(2, off)
+    m.st(3); m.i32(1, 2); m.lst(2, 5, 1); m.b += zz(0); m.lst(3, 8, 1); m.b += uv(1) + b"x"
+    m.i32(4, codec); m.i64(5, total); m.i64(6, len(chunk)); m.i64(7, len(chunk)); m.i64(9, off); m.end(); m.end()
+    m.i64(2, len(chunk)); m.i64(3, total); m.end(); m.b.append(0)
+    data += bytes(m.b) + struct.pack("<i", len(m.b)) + b"PAR1"
+    Path(path).write_bytes(data)
+
+
+def test_row_counts_beyond_the_machines_memory_are_refused_before_anything_is_sized(cells, tmp_path):
+    """The row counts are consistent (pages = chunk = row group = file) and the bytes are tiny, so only the memory the
+    claim would need can refuse it: 4,096 empty pages of 2^23 rows (275 GB), a snappy chunk of 64 pages claiming 2^31-1
+    rows and bytes each, a single page of 2^31-1 rows in 24 bytes (the last needs 16 GB: only a small machine refuses it)."""
     path = tmp_path / "bomb.parquet"
-    multi_page_file(path, [(0, I31, 0, b"")] * 64)
-    refused_by_both(cells, path, "column `x`: a page claims 2147483647 values in only 0 bytes (corrupt file)")
-    multi_page_file(path, [(0, I31, 0, struct.pack("<qqq", 1, 2, 3))])
-    refused_by_both(cells, path, "column `x`: a page claims 2147483647 values in only 24 bytes (corrupt file)")
+    bomb_file(path, 4096, 1 << 23, 0, 0)
+    refused_by_both(cells, path, "claims 34359738368 rows")
+    refused_by_both(cells, path, "more than this machine's memory")
+    bomb_file(path, 64, I31, I31, 1)
+    refused_by_both(cells, path, "claims 137438953408 rows")
+    bomb_file(path, 64, I31, 0, 0)
+    refused_by_both(cells, path, "more than this machine's memory")
+
+
+def test_a_row_group_whose_pages_disagree_with_its_row_count_is_refused(cells, tmp_path):
+    path = tmp_path / "rows.parquet"
+    multi_page_file(path, [(0, 3, 0, struct.pack("<qqq", 1, 2, 3))])        # num_rows 3, one page of 3: fine
+    out = subprocess.run([str(cells), str(path), "read"], capture_output=True, text=True, check=True).stdout
+    assert out == "1\n2\n3\n"
+    multi_page_file(path, [(0, 3, 0, struct.pack("<qqq", 1, 2, 3))], group_rows=4)     # the row group says 4
+    refused_by_both(cells, path, "column `x` has 3 values in a row group of 4 rows (corrupt file)")
 
 
 def test_a_second_dictionary_page_is_refused(cells, tmp_path):
@@ -946,13 +987,16 @@ def test_a_dictionary_index_past_the_dictionary_says_so(cells, tmp_path):
 
 
 def test_the_first_error_in_page_order_is_the_one_raised(cells, tmp_path):
-    """A bad PLAIN text page (serial) after a bad numeric-looking page: whichever page comes first in the file wins,
-    whatever thread or phase decoded it."""
+    """TEXT under read_parquet: its PLAIN pages add words and so run serially, its dictionary-indexed pages run in
+    parallel. A bad dictionary index page that comes BEFORE a truncated PLAIN page in the file is the error reported
+    (the serial page used to raise first, whatever the file order), and the other way round."""
     path = tmp_path / "order.parquet"
-    d = struct.pack("<qq", 10, 20)
-    bad_index = bytes([2]) + uv((1 << 1) | 1) + bytes([0b11, 0])
-    short_plain = struct.pack("<q", 1)                      # 1 value of the 3 it claims
-    multi_page_file(path, [(2, 2, 0, d), (0, 3, 8, bad_index), (0, 3, 0, short_plain)])
-    refused_by_both(cells, path, "a dictionary index is out of range")
-    multi_page_file(path, [(2, 2, 0, d), (0, 3, 0, short_plain), (0, 3, 8, bad_index)])
-    refused_by_both(cells, path, "a Parquet page ends early")
+    words = struct.pack("<I", 1) + b"a" + struct.pack("<I", 1) + b"b"
+    bad_index = bytes([2]) + uv((1 << 1) | 1) + bytes([0b11, 0])             # index 3 of a 2-word dictionary
+    short_plain = struct.pack("<I", 1) + b"a"                                # 1 word of the 3 it claims
+    multi_page_file(path, [(2, 2, 0, words), (0, 3, 8, bad_index), (0, 3, 0, short_plain)], ptype=6, text=True)
+    p = subprocess.run([str(cells), str(path), "read"], capture_output=True, text=True)
+    assert p.returncode == 1 and "a dictionary index is out of range" in p.stdout + p.stderr, p.stdout + p.stderr
+    multi_page_file(path, [(2, 2, 0, words), (0, 3, 0, short_plain), (0, 3, 8, bad_index)], ptype=6, text=True)
+    p = subprocess.run([str(cells), str(path), "read"], capture_output=True, text=True)
+    assert p.returncode == 1 and "a Parquet page ends early" in p.stdout + p.stderr, p.stdout + p.stderr
