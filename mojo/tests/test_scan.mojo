@@ -4,7 +4,7 @@
 from std.ffi import external_call
 from mxframe import (Table, SharedTable, Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of,
                      INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ParquetScan, ZSTD, SNAPPY,
-                     UNCOMPRESSED, CPU, GPU, AUTO)
+                     UNCOMPRESSED, CPU, GPU, AUTO, MORSELS_ON, MORSELS_OFF)
 
 
 struct Rng(Movable):
@@ -90,7 +90,7 @@ def same(a: QueryResult, b: QueryResult, label: String) raises:
         expect(a.sums[g] == b.sums[g], label + ": sums group " + String(g))
 
 
-def check_all(path: String, mem: SharedTable) raises:
+def check_all(path: String, mem: SharedTable, mode: Int = MORSELS_OFF) raises:
     var scan = scan_parquet(path)
     expect(scan.rows() == N and scan.row_groups() == 8, "the scan knows the file's shape: " + String(scan.rows()) +
            " rows in " + String(scan.row_groups()) + " row groups")
@@ -108,34 +108,34 @@ def check_all(path: String, mem: SharedTable) raises:
     expect(far > 0, "Far is a word the file has")
 
     # 1. a TEXT key, every kind of aggregate, nulls, an all-null row group
-    same(Query(scan).group_by(col("region"), groups=nreg)
+    same(Query(scan).morsels(mode).block_rows(1500).group_by(col("region"), groups=nreg)
          .agg(sum(col("revenue")), count(), count(col("revenue")), min_of(col("cost")), max_of(col("cost")),
               min_of(col("revenue")), max_of(col("revenue")), mean(col("revenue")), mean(col("cost"))).compute(),
          Query(mem).group_by(col("region"), groups=nreg)
          .agg(sum(col("revenue")), count(), count(col("revenue")), min_of(col("cost")), max_of(col("cost")),
               min_of(col("revenue")), max_of(col("revenue")), mean(col("revenue")), mean(col("cost"))).compute(), "text key")
     # 2. a filter on a TEXT code and a column that is null in a whole row group
-    same(Query(scan).where(col("region") == lit(far)).group_by(col("carrier"), groups=7)
+    same(Query(scan).morsels(mode).block_rows(1500).where(col("region") == lit(far)).group_by(col("carrier"), groups=7)
          .agg(sum(col("revenue")), count(), min_of(col("revenue"))).compute(),
          Query(mem).where(col("region") == lit(far)).group_by(col("carrier"), groups=7)
          .agg(sum(col("revenue")), count(), min_of(col("revenue"))).compute(), "filter on a word")
     # 3. a pivot, a bin, a nullable TEXT key
-    same(Query(scan).group_by(col("region") * 7 + col("carrier"), groups=nreg * 7).agg(sum(col("cost")), count(col("revenue"))).compute(),
+    same(Query(scan).morsels(mode).block_rows(1500).group_by(col("region") * 7 + col("carrier"), groups=nreg * 7).agg(sum(col("cost")), count(col("revenue"))).compute(),
          Query(mem).group_by(col("region") * 7 + col("carrier"), groups=nreg * 7).agg(sum(col("cost")), count(col("revenue"))).compute(), "pivot")
-    same(Query(scan).group_by(col("note"), groups=nnote).agg(count(), sum(col("cost"))).compute(),
+    same(Query(scan).morsels(mode).block_rows(1500).group_by(col("note"), groups=nnote).agg(count(), sum(col("cost"))).compute(),
          Query(mem).group_by(col("note"), groups=nnote).agg(count(), sum(col("cost"))).compute(), "nullable text key")
     # 4. one group, only count(), a filter that keeps nothing
-    same(Query(scan).where(col("cost").between(0, 100)).agg(sum(col("cost")), count()).compute(),
+    same(Query(scan).morsels(mode).block_rows(1500).where(col("cost").between(0, 100)).agg(sum(col("cost")), count()).compute(),
          Query(mem).where(col("cost").between(0, 100)).agg(sum(col("cost")), count()).compute(), "global")
-    same(Query(scan).agg(count()).compute(), Query(mem).agg(count()).compute(), "only count()")
-    same(Query(scan).where(col("cost") > 99999).group_by(col("carrier"), groups=7).agg(sum(col("revenue")), max_of(col("cost"))).compute(),
+    same(Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(), Query(mem).agg(count()).compute(), "only count()")
+    same(Query(scan).morsels(mode).block_rows(1500).where(col("cost") > 99999).group_by(col("carrier"), groups=7).agg(sum(col("revenue")), max_of(col("cost"))).compute(),
          Query(mem).where(col("cost") > 99999).group_by(col("carrier"), groups=7).agg(sum(col("revenue")), max_of(col("cost"))).compute(), "nothing kept")
     # the result says where it ran
-    var r = Query(scan).agg(count()).compute(AUTO)
+    var r = Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(AUTO)
     expect(r.device == CPU and r.fallback_reason == "", "AUTO on a scan runs on the CPU")
     var raised = False
     try:
-        _ = Query(scan).agg(count()).compute(GPU)
+        _ = Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(GPU)
     except e:
         raised = "CPU" in String(e)
     expect(raised, "compute(GPU) on a scan says that a scan runs on the CPU")
@@ -152,6 +152,8 @@ def test_equals_read_parquet_for_every_codec() raises:
         check_all(path, read)
         # and the table that was written, not only the table that was read back
         check_all(path, mem)
+        # by row-range morsels in blocks of 1,500 rows (row groups of 16,000 rows cut into three ranges of whole blocks)
+        check_all(path, read, MORSELS_ON)
 
 
 def test_errors_are_readable() raises:

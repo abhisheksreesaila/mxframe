@@ -2,11 +2,11 @@
 # with the same edits: queries (plain and holistic), get / is_null / edited, permutation and the saved file, after
 # every batch of random edits (sets, nulls, typed text with new words, appends, removes, merges, formulas) and after
 # undoing them. The oracle is the in-memory Frame, whose own correctness F-136 checks against `bake()`.
-from std.os import getenv, setenv, makedirs
+from std.os import getenv, makedirs
 from std.time import perf_counter_ns
 from mxframe import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, mean, min_of, max_of,
                      count_distinct, median, percentile, top_k, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet,
-                     read_parquet, scan_parquet, ParquetWriter, ZSTD, SNAPPY, UNCOMPRESSED)
+                     read_parquet, scan_parquet, ParquetWriter, ZSTD, SNAPPY, UNCOMPRESSED, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
 
 
 struct Rng(Movable):
@@ -99,21 +99,21 @@ def same(a: QueryResult, b: QueryResult, label: String) raises:
                 expect(ta[x] == tb[x], label + ": top " + String(i) + " group " + String(g))
 
 
-def run_queries(f: Frame, formulas: Bool) raises -> List[QueryResult]:
+def run_queries(f: Frame, formulas: Bool, mode: Int, block: Int) raises -> List[QueryResult]:
     var c = f.column("region")
     var n = f.word_count(c)
     var out = List[QueryResult]()
-    out.append(Query(f).group_by(col("region"), groups=n).agg(sum(col("revenue")), count(), count(col("revenue")),
+    out.append(Query(f).morsels(mode).block_rows(block).group_by(col("region"), groups=n).agg(sum(col("revenue")), count(), count(col("revenue")),
                                                               min_of(col("revenue")), max_of(col("cost")), mean(col("cost"))).compute())
-    out.append(Query(f).where(col("carrier").between(1, 4)).where(col("day") > 18_100)
+    out.append(Query(f).morsels(mode).block_rows(block).where(col("carrier").between(1, 4)).where(col("day") > 18_100)
                .group_by(col("region") * 8 + col("carrier"), groups=n * 8).agg(sum(col("cost")), mean(col("revenue"))).compute())
-    out.append(Query(f).where(col("region") == 0).agg(sum(col("revenue") - col("cost")), count()).compute())
-    out.append(Query(f).group_by(col("note"), groups=f.word_count(f.column("note"))).agg(count(), sum(col("cost"))).compute())
-    out.append(Query(f).group_by(col("region"), groups=n).agg(count_distinct(col("carrier")), median(col("revenue")),
+    out.append(Query(f).morsels(mode).block_rows(block).where(col("region") == 0).agg(sum(col("revenue") - col("cost")), count()).compute())
+    out.append(Query(f).morsels(mode).block_rows(block).group_by(col("note"), groups=f.word_count(f.column("note"))).agg(count(), sum(col("cost"))).compute())
+    out.append(Query(f).morsels(mode).block_rows(block).group_by(col("region"), groups=n).agg(count_distinct(col("carrier")), median(col("revenue")),
                                                               top_k(col("cost"), 3), percentile(col("cost"), 0.9),
                                                               median(col("note")), sum(col("cost"))).compute())
     if formulas:
-        out.append(Query(f).where(col("half") > 0).group_by(col("region"), groups=n).agg(sum(col("margin")), count(col("margin")),
+        out.append(Query(f).morsels(mode).block_rows(block).where(col("half") > 0).group_by(col("region"), groups=n).agg(sum(col("margin")), count(col("margin")),
                                                                                          max_of(col("half"))).compute())
     return out^
 
@@ -151,7 +151,7 @@ def same_file(path: String, want: Table, label: String) raises:
                     expect(got.get(c, row) == want.get(c, row), label + ": value at " + want.name(c) + " row " + String(row))
 
 
-def check(a: Frame, b: Frame, rng: Rng, label: String, formulas: Bool, saved: String) raises:
+def check(a: Frame, b: Frame, rng: Rng, label: String, formulas: Bool, saved: String, mode: Int, block: Int) raises:
     """`a` is Frame(read_parquet), `b` Frame(scan_parquet): both ways of seeing the same file and the same edits."""
     var rng2 = rng.s
     expect(a.rows() == b.rows(), label + ": rows")
@@ -160,8 +160,8 @@ def check(a: Frame, b: Frame, rng: Rng, label: String, formulas: Bool, saved: St
     for c in range(a.stored()):
         if a.kind(c) == TEXT:
             expect(a.word_count(c) == b.word_count(c), label + ": word count of " + a.name(c))
-    var qa = run_queries(a, formulas)
-    var qb = run_queries(b, formulas)
+    var qa = run_queries(a, formulas, mode, block)
+    var qb = run_queries(b, formulas, mode, block)
     for i in range(len(qa)):
         same(qb[i], qa[i], label + ": query " + String(i))
     var r = Rng(rng2)
@@ -189,14 +189,14 @@ def write_groups(path: String, table: SharedTable, group: Int) raises:
     w.finish("")
 
 
-def test_random_edits_undo_and_save_equal_the_in_memory_frame() raises:
+def test_random_edits_undo_and_save_equal_the_in_memory_frame(mode: Int, block: Int) raises:
     var table = make_table(N)
     var path = scratch("edit.parquet")
     write_parquet(path, table, "", ZSTD, GROUP)
-    random_session(path)
+    random_session(path, "", mode, block)
 
 
-def random_session(path: String, tag: String = "") raises:
+def random_session(path: String, tag: String, mode: Int, block: Int) raises:
     var rp = read_parquet(path)
     var a = Frame(rp.take_table().share())
     var scan = scan_parquet(path)
@@ -204,7 +204,7 @@ def random_session(path: String, tag: String = "") raises:
     b.set_cache_limit(3 * 8 * GROUP)                         # a handful of column chunks: the cache evicts all the time
     var saved = scratch("edit.saved.parquet")
     var rng = Rng(11)
-    check(a, b, rng, tag + "untouched", False, saved)
+    check(a, b, rng, tag + "untouched", False, saved, mode, block)
     var rc = a.column("region")
     var nc = a.column("note")
     var rv = a.column("revenue")
@@ -271,15 +271,15 @@ def random_session(path: String, tag: String = "") raises:
         if round == 1:
             expect(a.formula("margin = revenue - cost") == b.formula("margin = revenue - cost"), "formula column")
             expect(a.formula("half = margin / 2") == b.formula("half = margin / 2"), "formula over a formula")
-        check(a, b, rng, tag + "after " + String(steps) + " edits", round >= 1, saved)
+        check(a, b, rng, tag + "after " + String(steps) + " edits", round >= 1, saved, mode, block)
     var undone = 0
     while a.undo():
         expect(b.undo(), "undo in the scan frame as often as in the memory frame")
         undone += 1
         if undone % 150 == 0:
-            check(a, b, rng, tag + "after " + String(undone) + " undos", a.columns() > a.stored(), saved)
+            check(a, b, rng, tag + "after " + String(undone) + " undos", a.columns() > a.stored(), saved, mode, block)
     expect(not b.undo(), "nothing left to undo")
-    check(a, b, rng, tag + "all undone", a.columns() > a.stored(), saved)
+    check(a, b, rng, tag + "all undone", a.columns() > a.stored(), saved, mode, block)
     # fully undone, the saved file holds the original rows
     same_file(saved, a.bake(), "undone")
 
@@ -415,7 +415,9 @@ def test_row_groups_that_are_not_multiples_of_eight() raises:
         var path = scratch("odd" + String(size) + ".parquet")
         write_groups(path, table, size)
         expect(scan_parquet(path).row_groups() == (1_500 + size - 1) // size, "odd groups written")
-        random_session(path, "groups of " + String(size) + ": ")
+        random_session(path, "groups of " + String(size) + ": ", MORSELS_AUTO, 0)
+        random_session(path, "groups of " + String(size) + ", morsels: ", MORSELS_ON, 40)       # blocks that cut a group mid-byte
+        random_session(path, "groups of " + String(size) + ", by group: ", MORSELS_OFF, 0)
 
 
 def test_other_key_value_metadata_survives_a_save() raises:
@@ -446,11 +448,7 @@ def main() raises:
     test_save_over_the_file_that_is_open()
     test_an_empty_result_and_codecs()
     test_the_cache_is_bounded_and_serves_a_scrolling_grid()
-    # F-149 scans row groups on the workers by blocks, or one group at a time: the overlay must hold on both
-    _ = setenv("MXFRAME_SCAN_MORSELS", "0")
-    test_random_edits_undo_and_save_equal_the_in_memory_frame()
-    _ = setenv("MXFRAME_SCAN_MORSELS", "1")
-    _ = setenv("MXFRAME_MORSEL_ROWS", "200")                 # blocks of 200 rows: 8 per group of 1,600, not all aligned to a page
-    test_random_edits_undo_and_save_equal_the_in_memory_frame()
-    _ = setenv("MXFRAME_SCAN_MORSELS", "")
-    _ = setenv("MXFRAME_MORSEL_ROWS", "")
+    # F-149 scans row groups on the workers by row-range morsels, or one group at a time: the overlay must hold on both
+    test_random_edits_undo_and_save_equal_the_in_memory_frame(MORSELS_AUTO, 0)
+    test_random_edits_undo_and_save_equal_the_in_memory_frame(MORSELS_OFF, 0)
+    test_random_edits_undo_and_save_equal_the_in_memory_frame(MORSELS_ON, 200)       # blocks of 200 rows: not all aligned to a page
