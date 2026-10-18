@@ -7,8 +7,21 @@
 # only on the -I path, and a shared library that re-imports @export functions does not export them.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-stage="$root/build/pkg/mxframe"
-rm -rf "$root/build/pkg"
+out="$root/build/mxframe.mojoc"
+mkdir -p "$root/build"
+# Many builds may run at once (pytest -n workers, mojo-test beside pytest): one at a time behind a lock, staged in
+# a private directory and published by rename, so a reader never sees a half-written package; skipped when the
+# sources and the compiler are unchanged.
+exec 9>"$root/build/.mxframe-pkg.lock"
+flock 9
+stamp="$( { mojo --version 2>/dev/null; cat "$root"/mojo/mxframe/*.mojo "$root"/kernels_aot/*.mojo "$0"; } | sha1sum | cut -c1-40)"
+if [ -f "$out" ] && [ "$(cat "$out.stamp" 2>/dev/null)" = "$stamp" ]; then
+  echo "build/mxframe.mojoc is up to date"
+  exit 0
+fi
+work="$(mktemp -d "$root/build/pkg.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+stage="$work/mxframe"
 mkdir -p "$stage/kernels"
 cp "$root"/mojo/mxframe/*.mojo "$stage/"
 cp "$root"/kernels_aot/*.mojo "$stage/kernels/"
@@ -17,5 +30,7 @@ for f in "$root"/kernels_aot/*.mojo; do
   m="$(basename "$f" .mojo)"
   sed -i -E "s/^from $m import/from .$m import/" "$stage"/kernels/*.mojo
 done
-mojo precompile --disable-warnings "$stage" -o "$root/build/mxframe.mojoc"
+mojo precompile --disable-warnings "$stage" -o "$work/mxframe.mojoc"
+mv -f "$work/mxframe.mojoc" "$out"
+echo "$stamp" > "$out.stamp"
 echo "built build/mxframe.mojoc"
