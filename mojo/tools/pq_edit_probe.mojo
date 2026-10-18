@@ -20,7 +20,7 @@ def peak_kb() raises -> Int:
     return -1
 
 
-def ms_since(t0: UInt) -> Float64:
+def ms_since(t0: Int) -> Float64:
     return Float64(perf_counter_ns() - t0) / 1e6
 
 

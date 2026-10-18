@@ -806,8 +806,7 @@ struct Frame(Movable):
                     if ci < len(changed) and changed[ci] < lo + n:
                         stop = changed[ci] - lo
                     for c in range(stored):
-                        for i in range(r, stop):
-                            _push(out, c, tbl, c, i, remap[c])
+                        _push_run(out.cols[c], tbl.cols[c], r, stop, remap[c])
                     r = stop
                     if r < n:                                # row lo + r is edited, removed or both
                         var row = lo + r
@@ -861,6 +860,21 @@ def _push(mut t: Table, c: Int, src: Table, sc: Int, row: Int, remap: List[Int64
     else:
         var v = src.cols[sc].values[row]
         t.append(c, remap[Int(v)] if len(remap) > 0 else v)
+
+
+def _push_run(mut dst: Column, src: Column, lo: Int, hi: Int, remap: List[Int64]):
+    """Appends rows lo..hi of `src` (the file's values; text codes already the file-wide ones) to `dst`, a merged text
+    code as the code it reads as. A column with no nulls so far is copied as it is."""
+    if src.nulls == 0 and len(dst.validity) == 0 and len(remap) == 0:
+        dst.values.reserve(len(dst.values) + hi - lo)
+        for i in range(lo, hi):
+            dst.values.append(src.values[i])
+        return
+    for i in range(lo, hi):
+        if src.is_null(i):
+            dst.push(0, False)
+        else:
+            dst.push(remap[Int(src.values[i])] if len(remap) > 0 else src.values[i], True)
 
 
 def _ascii_lower(b: UInt8) -> UInt8:
