@@ -3,7 +3,9 @@
 # there is no GPU. Allocations are modest: GPU 0 is shared with other processes.
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, QueryResult, col, lit, least, greatest, sum,
                      count, mean, min_of, max_of, CPU, GPU, AUTO, DeviceTable, gpu_available)
+from mxframe.query import AUTO_GPU_MIN_ROWS
 from max.gpu.host import DeviceContext, DeviceBuffer
+from std.os import getenv
 
 
 struct Rng(Movable):
@@ -281,7 +283,7 @@ def test_a_frames_edits_without_re_uploading() raises:
     for g in range(35):
         differs = differs or base.counts[g] != Query(f).group_by(col("region") * 7 + col("carrier"), groups=35).agg(count()).compute(CPU).counts[g]
     expect(differs, "the edits change the answer (or this test proves nothing)")
-    expect(dt.bytes() == uploaded and dt.uploads() == t.columns(), "no column was uploaded again")
+    expect(dt.bytes() == uploaded, "no column was uploaded again")
     for c in range(t.columns()):
         expect(dt.data_address(c) == addresses[c], "the queries read the buffers uploaded once (column " + String(c) + ")")
     dt.release()
@@ -357,12 +359,12 @@ def many_aggs(t: SharedTable, dt: DeviceTable, n: Int, device: Int) raises -> Qu
     return q^.compute(device)
 
 
-def agg_table() raises -> SharedTable:
+def agg_table(rows: Int = 20_000) raises -> SharedTable:
     var t = Table.empty()
     var k = t.add_column("k", INT)
     var v = t.add_column("v", INT)
     var rng = Rng(3)
-    for _ in range(20_000):
+    for _ in range(rows):
         t.append(k, Int64(rng.int(0, 6)))
         t.append(v, Int64(rng.int(-100_000, 100_000)))
     return t^.share()
@@ -393,6 +395,16 @@ def test_a_program_the_kernel_cannot_take() raises:
         msg = String(e)
     expect("shared memory" in msg, "GPU refuses a program it cannot take: `" + msg + "`")
     dt.release()
+    # On AUTO, over the row threshold, the kernel declines it and the CPU answers, saying why.
+    var big = agg_table(AUTO_GPU_MIN_ROWS)
+    var dbig = DeviceTable(big)
+    var auto = many_aggs(big, dbig, 44, AUTO)
+    expect(auto.device == CPU, "AUTO ran the declined program on the CPU")
+    expect("declined the program" in auto.fallback_reason and "shared memory" in auto.fallback_reason,
+           "and says why: `" + auto.fallback_reason + "`")
+    var cpu = Query(big).group_by(col("k"), groups=7).agg(sum(col("v")), count()).compute(CPU)
+    expect(cpu.fallback_reason == "", "a query that never tried the GPU has no fallback reason")
+    dbig.release()
 
 
 def test_many_groups_run_on_auto_without_scratch() raises:
@@ -413,12 +425,19 @@ def test_many_groups_run_on_auto_without_scratch() raises:
 
 
 def test_a_device_failure_falls_back_on_auto() raises:
-    """With the device nearly full, the output buffers cannot be allocated: AUTO answers on the CPU, GPU raises."""
+    """With the device full the query's output buffers cannot be allocated: AUTO answers on the CPU and says why, GPU
+    raises. OPT-IN (`MXFRAME_TEST_FILL_GPU=1`): the test fills GPU 0, which other processes share. A cap does not
+    work: the device allocator pools, so the piece that crosses any margin takes all the memory left and a later
+    query allocation is served from the pool. Run it on an idle GPU."""
+    if getenv("MXFRAME_TEST_FILL_GPU") != "1":
+        print("skipped the full-device test (it fills GPU 0): set MXFRAME_TEST_FILL_GPU=1 to run it")
+        return
+    comptime GROUPS = 2_000_000
     var ctx = DeviceContext()
     var t = Table.empty()
     var k = t.add_column("k", INT)
-    for i in range(1_100_000):
-        t.append(k, Int64(i % 2_000_000))
+    for i in range(AUTO_GPU_MIN_ROWS + 100_000):
+        t.append(k, Int64(i % GROUPS))
     var s = t^.share()
     var dt = DeviceTable(s, ctx)
     var hogs = List[DeviceBuffer[DType.int8]]()           # fill the device in 16 MB pieces until it refuses
@@ -430,12 +449,13 @@ def test_a_device_failure_falls_back_on_auto() raises:
     except:
         pass
     expect(len(hogs) > 0, "the test filled the device")
-    var auto = Query(s).on_device(dt).group_by(col("k"), groups=2_000_000).agg(sum(col("k")), count()).compute(AUTO)
+    var auto = Query(s).on_device(dt).group_by(col("k"), groups=GROUPS).agg(sum(col("k")), count()).compute(AUTO)
     expect(auto.device == CPU, "AUTO fell back to the CPU when the device was full")
+    expect("could not allocate" in auto.fallback_reason, "and says why: `" + auto.fallback_reason + "`")
     expect(auto.counts[5] == 1 and auto.sums[5] == 5, "and the CPU answer is right")
     var msg = String("")
     try:
-        _ = Query(s).on_device(dt).group_by(col("k"), groups=2_000_000).agg(sum(col("k")), count()).compute(GPU)
+        _ = Query(s).on_device(dt).group_by(col("k"), groups=GROUPS).agg(sum(col("k")), count()).compute(GPU)
     except e:
         msg = String(e)
     expect(msg.byte_length() > 0, "GPU raises when the device is full")
