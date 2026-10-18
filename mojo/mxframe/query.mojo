@@ -30,7 +30,7 @@ from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP
-from .kernels.pipeline_gpu import run_pipeline_gpu
+from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from .gpu import DeviceTable
 
 # plan node kinds
@@ -214,7 +214,7 @@ struct Query(Movable):
         var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
         var r = QueryResult()
         var done = False
-        if use_gpu and self.table.rows() > 0:
+        if use_gpu:
             var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU)
             if g:
                 r = g.take()
@@ -783,7 +783,21 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
     return (n, Int(map[pred_reg]) if pred_reg >= 0 else -1)
 
 
+comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (about 9.2e18)"
+
+
 def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool) raises -> Optional[QueryResult]:
+    """`_run_gpu_on`, and on AUTO (not `strict`) any failure of the device itself (out of memory for the output, a
+    launch error) returns None so the CPU answers; an int64 overflow is an answer and always raises."""
+    try:
+        return _run_gpu_on(dt, t, p, mask, strict)
+    except e:
+        if strict or OVERFLOW_MESSAGE in String(e):
+            raise e^
+        return None
+
+
+def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool) raises -> Optional[QueryResult]:
     """The lowered program on the device table (kernels/pipeline_gpu.mojo, keyed mode: the group id is register 0).
     Same answers as `_run_cpu`: exact int64 totals, the overflow flag raises the same error. `strict` (device=GPU):
     a program the kernel cannot take raises; otherwise (AUTO) it returns None and the CPU answers."""
@@ -831,7 +845,10 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
         elif op == OP_AGG_IMAX:
             ident[slot] = Float64(from_bits=UInt64(Int64.MIN))
     var n_blocks = ctx.default_device_info.sm_count
-    var scratch_words = n_blocks * 8 * (A + 1) * G       # at most sm_count x 8 blocks, one row of (slots + 1) x groups each
+    # the per-block partial rows exist only in the small-group modes (0, 3, 4): at most sm_count x 8 blocks, one row
+    # of (slots + 1) x groups each. Many groups run in the atomic modes, which write the output directly.
+    var mode = _choose_mode(G, A, n_regs, len(code), 0, True)
+    var scratch_words = n_blocks * 8 * (A + 1) * G if mode == 0 or mode == 3 or mode == 4 else 1
     var d_code = ctx.enqueue_create_buffer[DType.int32](len(code))
     var d_consts = ctx.enqueue_create_buffer[DType.float64](MAX_CONSTS)
     var d_cols = ctx.enqueue_create_buffer[DType.int64](len(cols))
@@ -871,7 +888,7 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
     _ = code^, consts^, cols^, dtypes^, ident^
     _ = dmask^, d_code^, d_consts^, d_cols^, d_dt^, d_ident^, d_set^, d_vals^, d_cnt^, d_scratch^, d_ovf^   # Mojo frees at last use: the device buffers must outlive the kernel
     if ovf[0] != 0:
-        raise Error("a sum or an expression passed the int64 range (about 9.2e18)")
+        raise Error(OVERFLOW_MESSAGE)
     return _make_result(p, out_vals, out_cnt)
 
 

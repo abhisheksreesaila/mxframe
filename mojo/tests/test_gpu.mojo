@@ -3,7 +3,7 @@
 # there is no GPU. Allocations are modest: GPU 0 is shared with other processes.
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, QueryResult, col, lit, least, greatest, sum,
                      count, mean, min_of, max_of, CPU, GPU, AUTO, DeviceTable, gpu_available)
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceContext, DeviceBuffer
 
 
 struct Rng(Movable):
@@ -253,6 +253,9 @@ def test_a_frames_edits_without_re_uploading() raises:
     var t = make_table(21, 13, 60_000)
     var dt = DeviceTable(t)
     var uploaded = dt.bytes()
+    var addresses = List[Int]()
+    for c in range(t.columns()):
+        addresses.append(dt.data_address(c))
     var f = Frame(t)
     var rng = Rng(99)
     for step in range(300):
@@ -278,7 +281,9 @@ def test_a_frames_edits_without_re_uploading() raises:
     for g in range(35):
         differs = differs or base.counts[g] != Query(f).group_by(col("region") * 7 + col("carrier"), groups=35).agg(count()).compute(CPU).counts[g]
     expect(differs, "the edits change the answer (or this test proves nothing)")
-    expect(dt.bytes() == uploaded, "the device copy was not re-uploaded")
+    expect(dt.bytes() == uploaded and dt.uploads() == t.columns(), "no column was uploaded again")
+    for c in range(t.columns()):
+        expect(dt.data_address(c) == addresses[c], "the queries read the buffers uploaded once (column " + String(c) + ")")
     dt.release()
 
 
@@ -338,10 +343,120 @@ def test_the_apps_device_context_is_shared() raises:
     var dt = DeviceTable(t, ctx)
     var r = Query(t).on_device(dt).group_by(col("carrier"), groups=7).agg(sum(col("cost"))).compute(GPU)
     same(r, Query(t).group_by(col("carrier"), groups=7).agg(sum(col("cost"))).compute(CPU), "on the app's context")
-    var host = List[Int64](length=1, fill=0)
+    var host = List[Int64](length=1000, fill=0)       # the whole buffer comes back: 1000 values
     ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=mine)
     ctx.synchronize()
-    expect(host[0] == 7, "the app's buffer is intact beside the table")
+    expect(host[0] == 7 and host[999] == 7, "the app's buffer is intact beside the table")
+    dt.release()
+
+
+def many_aggs(t: SharedTable, dt: DeviceTable, n: Int, device: Int) raises -> QueryResult:
+    var q = Query(t).on_device(dt).group_by(col("k"), groups=7)
+    for i in range(n):
+        q = q^.agg(sum(col("v") + i) if i % 3 == 0 else min_of(col("v") * (i + 1)) if i % 3 == 1 else max_of(col("v") - i))
+    return q^.compute(device)
+
+
+def agg_table() raises -> SharedTable:
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    var rng = Rng(3)
+    for _ in range(20_000):
+        t.append(k, Int64(rng.int(0, 6)))
+        t.append(v, Int64(rng.int(-100_000, 100_000)))
+    return t^.share()
+
+
+def test_a_big_program_runs_in_narrow_blocks() raises:
+    """30 aggregates keep more registers than 256-thread blocks have shared memory for: the launch must narrow."""
+    var t = agg_table()
+    var dt = DeviceTable(t)
+    var r = many_aggs(t, dt, 30, GPU)
+    expect(r.device == GPU, "30 aggregates ran on the GPU")
+    var plain = Query(t).group_by(col("k"), groups=7)
+    for i in range(30):
+        plain = plain^.agg(sum(col("v") + i) if i % 3 == 0 else min_of(col("v") * (i + 1)) if i % 3 == 1 else max_of(col("v") - i))
+    same(r, plain^.compute(CPU), "30 aggregates")
+    dt.release()
+
+
+def test_a_program_the_kernel_cannot_take() raises:
+    """44 aggregates need more registers than even 128-thread blocks hold: GPU raises readably, AUTO answers on the CPU
+    (here with the table under the AUTO threshold, so the GPU is forced through `compute(GPU)` only)."""
+    var t = agg_table()
+    var dt = DeviceTable(t)
+    var msg = String("")
+    try:
+        _ = many_aggs(t, dt, 44, GPU)
+    except e:
+        msg = String(e)
+    expect("shared memory" in msg, "GPU refuses a program it cannot take: `" + msg + "`")
+    dt.release()
+
+
+def test_many_groups_run_on_auto_without_scratch() raises:
+    """3M groups used to ask for sm_count x 8 x (slots + 1) x groups doubles of scratch (25 GB) and fail."""
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    var n = 1_200_000
+    for i in range(n):
+        t.append(k, Int64((i * 7) % 3_000_000))
+        t.append(v, Int64(i))
+    var s = t^.share()
+    var dt = DeviceTable(s)
+    var g = Query(s).on_device(dt).group_by(col("k"), groups=3_000_000).agg(sum(col("v")), count()).compute(AUTO)
+    expect(g.device == GPU, "3M groups on a 1.2M-row table ran on the GPU")
+    same(g, Query(s).group_by(col("k"), groups=3_000_000).agg(sum(col("v")), count()).compute(CPU), "3M groups")
+    dt.release()
+
+
+def test_a_device_failure_falls_back_on_auto() raises:
+    """With the device nearly full, the output buffers cannot be allocated: AUTO answers on the CPU, GPU raises."""
+    var ctx = DeviceContext()
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    for i in range(1_100_000):
+        t.append(k, Int64(i % 2_000_000))
+    var s = t^.share()
+    var dt = DeviceTable(s, ctx)
+    var hogs = List[DeviceBuffer[DType.int8]]()           # fill the device in 16 MB pieces until it refuses
+    try:
+        while True:
+            var piece = ctx.enqueue_create_buffer[DType.int8](16 << 20)
+            ctx.synchronize()
+            hogs.append(piece^)
+    except:
+        pass
+    expect(len(hogs) > 0, "the test filled the device")
+    var auto = Query(s).on_device(dt).group_by(col("k"), groups=2_000_000).agg(sum(col("k")), count()).compute(AUTO)
+    expect(auto.device == CPU, "AUTO fell back to the CPU when the device was full")
+    expect(auto.counts[5] == 1 and auto.sums[5] == 5, "and the CPU answer is right")
+    var msg = String("")
+    try:
+        _ = Query(s).on_device(dt).group_by(col("k"), groups=2_000_000).agg(sum(col("k")), count()).compute(GPU)
+    except e:
+        msg = String(e)
+    expect(msg.byte_length() > 0, "GPU raises when the device is full")
+    hogs.clear()
+    dt.release()
+
+
+def test_an_empty_table() raises:
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    _ = k
+    _ = v
+    var s = t^.share()
+    var dt = DeviceTable(s)
+    expect(dt.rows() == 0, "a 0-row device table")
+    var r = Query(s).on_device(dt).group_by(col("k"), groups=3).agg(sum(col("v")), count(), min_of(col("v"))).compute(GPU)
+    expect(r.device == GPU, "compute(GPU) on 0 rows runs on the GPU")
+    same(r, Query(s).group_by(col("k"), groups=3).agg(sum(col("v")), count(), min_of(col("v"))).compute(CPU), "0 rows")
+    var g = Query(s).on_device(dt).agg(sum(col("v"))).compute(GPU)
+    expect(g.sums[0] == 0 and g.counts[0] == 0, "a global sum of nothing")
     dt.release()
 
 
@@ -359,3 +474,8 @@ def main() raises:
     test_release_frees_the_device_memory()
     test_auto_picks_the_gpu_for_big_tables_only()
     test_the_apps_device_context_is_shared()
+    test_an_empty_table()
+    test_a_big_program_runs_in_narrow_blocks()
+    test_a_program_the_kernel_cannot_take()
+    test_many_groups_run_on_auto_without_scratch()
+    test_a_device_failure_falls_back_on_auto()
