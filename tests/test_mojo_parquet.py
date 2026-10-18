@@ -1236,3 +1236,15 @@ def test_a_decode_error_later_in_a_morsel_beats_an_earlier_blocks_kernel_error(p
             env["MXFRAME_MORSEL_ROWS"] = env_rows
         p = subprocess.run([str(prober), str(path), "scan", "sum_v"], capture_output=True, text=True, env=env)
         assert p.returncode == 1 and "a bit width of 65" in p.stdout + p.stderr, (env_rows, mode, p.stdout + p.stderr)
+
+
+@pytest.mark.parametrize("group", [1_200, 12_000, 36_000])
+def test_morsels_with_many_few_and_one_row_groups(prober, tmp_path, group):
+    """30 row groups (a group a core or more: one morsel per group), 3 (cut into row ranges of whole blocks) and 1 (all
+    ranges of one group): the same answer as read_parquet and DuckDB, blocks of 1,000 rows."""
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(), path, row_group_size=group, compression="snappy")
+    for q in SCAN_QUERIES:
+        got = probe_morsels(prober, path, q, 1000)
+        same_answer(got, probe(prober, path, "read", q))
+        check_against_duckdb(path, got, q)

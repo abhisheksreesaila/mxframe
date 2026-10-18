@@ -41,7 +41,7 @@ def main() raises:
     if mode == "scan":
         var scan = scan_parquet(path)
         rows = scan.rows()
-        var r = plan(Query(scan), which).morsels(_morsel_mode()).block_rows(_block_rows()).compute(AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
+        var r = plan(Query(scan), which).morsels(_morsel_mode()).block_rows(_block_rows()).compute(AUTO)
         for s in range(len(r.slots)):
             for v in r.slots[s]:
                 check = check * 31 + v

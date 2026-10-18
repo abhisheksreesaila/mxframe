@@ -1547,14 +1547,55 @@ def _morsel_task(plan: GroupPlan, r0: Int, r1: Int, used: List[Int], nodes: List
 
 def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], todo: List[Int], n_slots: Int, groups: Int,
                   ops: List[Int], block: Int) raises -> _MorselRun:
-    """The row groups of `todo` in waves of one group per core: the wave's groups are opened in parallel (headers walked,
-    dictionaries decoded once and then shared read only), then cut into row-range morsels of whole blocks (about
-    MORSELS_PER_WORKER a worker) that all the cores take in turn. The morsels come back in (group, range) order."""
+    """The row groups of `todo`: with at least a group a core, one morsel per group; with fewer, in waves of two groups a
+    core: the wave's groups are opened in parallel (headers walked, dictionaries decoded once and then shared read only),
+    then cut into row-range morsels of whole blocks (about MORSELS_PER_WORKER a worker) that all the cores take in turn.
+    The morsels come back in (group, range) order."""
     var run = _MorselRun()
     var workers = core_count()
-    var batch = max(1, workers)
+    var batch = max(1, 2 * workers)
     for _ in range(len(todo)):
         run.gerrs.append(String())
+    if len(todo) >= workers:
+        # Every worker has a row group of its own at least: one morsel per group, opened by the worker that runs it (no
+        # barrier between opening and aggregating, no row group read twice at a range boundary).
+        for i in range(len(todo)):
+            run.tgroup.append(i)
+            run.parts.append(QueryResult())
+            run.derrs.append(String())
+            run.kerrs.append(String())
+            run.nulls.append(List[Int](length=len(used), fill=0))
+        var sp1 = Int(UnsafePointer(to=scan))
+        var up1 = Int(UnsafePointer(to=used))
+        var tp1 = Int(UnsafePointer(to=todo))
+        var np1 = Int(UnsafePointer(to=nodes))
+        var op1 = Int(UnsafePointer(to=ops))
+        var pa1 = Int(run.parts.unsafe_ptr())
+        var de1 = Int(run.derrs.unsafe_ptr())
+        var ke1 = Int(run.kerrs.unsafe_ptr())
+        var na1 = Int(run.nulls.unsafe_ptr())
+        var ge1 = Int(run.gerrs.unsafe_ptr())
+        def whole_group(i: Int) {imm}:
+            var plan = GroupPlan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[].copy(),
+                                 Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up1)[])
+            try:
+                plan = open_plan(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp1)[],
+                                 Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=tp1)[][i],
+                                 Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up1)[])
+            except e:
+                (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ge1) + i)[] = String(e)
+                return
+            try:
+                _morsel_task(plan, 0, plan.rows, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up1)[],
+                             Pointer[List[PlanNode], MutUntrackedOrigin](unsafe_from_address=np1)[], n_slots, groups,
+                             Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=op1)[], block,
+                             (Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=pa1) + i)[],
+                             (Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=na1) + i)[],
+                             (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ke1) + i)[])
+            except e:
+                (Pointer[String, MutUntrackedOrigin](unsafe_from_address=de1) + i)[] = String(e)
+        par_n(whole_group, len(todo), min(len(todo), workers))
+        return run^
     var w0 = 0
     while w0 < len(todo):
         var nb = min(batch, len(todo) - w0)
