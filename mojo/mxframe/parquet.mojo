@@ -1422,8 +1422,11 @@ def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) r
     if ctx.optional:
         present = _count_bits(bits_p, p.nvals)
     var store = dst != 0
-    var nowhere = List[Int64](length=8, fill=0)               # a words-only build stores nothing (a TEXT page never reaches this)
-    var dout = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=dst if store else Int(nowhere.unsafe_ptr()))
+    if not store and not (p.encoding == ENC_PLAIN and leaf.ptype == PT_BYTE_ARRAY):
+        # a words-only build (dst 0) only adds the words of PLAIN text; any other page would write through a null
+        # pointer, so it is refused here, before a decoder can reach one
+        raise Error("column `" + leaf.name + "`: only PLAIN text pages are read for their words (internal error)")
+    var dout = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=dst)
     if p.encoding == ENC_PLAIN:
         _plain_into(c, leaf, ctx, present, dout, tbl, store, Int(UnsafePointer(to=p)) if p.defer else 0)
     elif p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
@@ -1461,7 +1464,6 @@ def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) r
     else:
         _ = owner^
     _ = nobits^
-    _ = nowhere^
 
 
 def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx, ctx_at: Int, tbl: Int,
@@ -1688,18 +1690,13 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                     col.values.resize(row0 + rows, 0)
             if 0 < len(col.validity) < (len(col.values) + 7) // 8:      # a bitmap that exists covers every row
                 col.validity.resize((len(col.values) + 7) // 8, 0xFF)
-    var parallel = List[Int]()
-    for i in range(len(pages)):
-        parallel.append(i)
     var pa = Int(pages.unsafe_ptr())
     var ca = Int(ctxs.unsafe_ptr())
     var la = Int(leaves.unsafe_ptr())
     var cola = Int(t.cols.unsafe_ptr())
-    var ja = Int(parallel.unsafe_ptr())
     def job(j: Int) {imm}:
         var page = Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa)
-        var i = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ja)[j]
-        ref p = (page + i)[]
+        ref p = (page + j)[]
         ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
         ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
         ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
@@ -1707,11 +1704,10 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
             _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
         except e:
             p.err = String(e)
-    if len(parallel) == 1:
+    if len(pages) == 1:
         job(0)
-    elif len(parallel) > 1:
-        par_n(job, len(parallel), min(len(parallel), core_count()))
-    _ = parallel^
+    elif len(pages) > 1:
+        par_n(job, len(pages), min(len(pages), core_count()))
     for i in range(len(pages)):
         if pages[i].err.byte_length() > 0:
             raise Error(pages[i].err)
