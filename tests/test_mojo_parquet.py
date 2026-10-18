@@ -801,3 +801,158 @@ def test_the_serial_build_decodes_the_same_numbers_as_the_parallel_one(prober, t
     for q in SCAN_QUERIES:
         for mode in ("scan", "read"):
             same_answer(probe(prober, path, mode, q), probe(serial, path, mode, q))
+
+
+# ── F-141 review: every cell through read and scan, claims a page cannot back ───────────────────────
+
+@pytest.fixture(scope="module")
+def cells(tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_cells"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_cells.mojo"), str(out)],
+                   check=True, capture_output=True, text=True)
+    return out
+
+
+def cell_text(v, t):
+    if v is None:
+        return "N"
+    if pa.types.is_decimal(t):
+        return str(int(v.scaleb(t.scale)))
+    if pa.types.is_date(t):
+        return str((v - _dt.date(1970, 1, 1)).days)
+    if pa.types.is_boolean(t):
+        return str(int(v))
+    return str(v)
+
+
+def page_edge_table(n, k, seed):
+    """Nulls on both edges of every k-row page (and some at random), a null-free column, int32, decimals of both
+    widths, bool, dictionary text, text that falls back from dictionary to PLAIN mid-column, an all-null column."""
+    r = _random.Random(seed)
+
+    def edge(i):
+        return i % k == 0 or i % k == k - 1 or r.random() < 0.15
+
+    words = [f"w{j}" for j in range(40)]
+    return pa.table({
+        "i64": pa.array([None if edge(i) else r.randint(-2**62, 2**62) for i in range(n)], pa.int64()),
+        "i32": pa.array([None if i % 9 == 3 else r.randint(-2**31, 2**31 - 1) for i in range(n)], pa.int32()),
+        "req": pa.array([r.randint(-10**12, 10**12) for i in range(n)], pa.int64()),
+        "dec": pa.array([None if edge(i) else _dec.Decimal(r.randint(-10**9, 10**9)).scaleb(-2) for i in range(n)], pa.decimal128(12, 2)),
+        "dec18": pa.array([None if i % 5 == 0 else _dec.Decimal(r.randint(-10**17, 10**17)).scaleb(-4) for i in range(n)], pa.decimal128(18, 4)),
+        "d": pa.array([None if edge(i) else _dt.date(1960, 1, 1) + _dt.timedelta(days=r.randint(0, 40000)) for i in range(n)], pa.date32()),
+        "b": pa.array([None if edge(i) else r.random() < 0.5 for i in range(n)], pa.bool_()),
+        "s": pa.array([None if edge(i) else r.choice(words) for i in range(n)], pa.string()),
+        "fb": pa.array([None if i % 7 == 1 else (r.choice(words) if i < n // 3 else f"u{i}-{r.randint(0, 10**6)}") for i in range(n)], pa.string()),
+        "allnull": pa.array([None] * n, pa.int64()),
+    })
+
+
+@pytest.mark.parametrize("k", [1, 3, 7, 13])
+@pytest.mark.parametrize("version", ["1.0", "2.0"])
+@pytest.mark.parametrize("codec", ["NONE", "ZSTD"])
+@pytest.mark.parametrize("dict_limit", [256, 1 << 20])
+def test_every_cell_through_read_and_scan_with_odd_pages(cells, tmp_path, k, version, codec, dict_limit):
+    """Pages of k rows (nulls on their edges), v1 and v2, a dictionary that overflows mid-column, two row groups."""
+    n = 1500
+    t = page_edge_table(n, k, k * 31 + dict_limit)
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=997, data_page_size=1, write_batch_size=k, data_page_version=version,
+                   compression=codec, dictionary_pagesize_limit=dict_limit)
+    want = "".join("\t".join(cell_text(t.column(c)[i].as_py(), t.schema.field(c).type) for c in range(t.num_columns)) + "\n"
+                   for i in range(n))
+    for mode in ("read", "scan"):
+        got = subprocess.run([str(cells), str(path), mode], capture_output=True, text=True, check=True).stdout
+        assert got == want, (mode, next(i for i, (a, b) in enumerate(zip(got.split("\n"), want.split("\n"))) if a != b))
+
+
+def multi_page_file(path, pages, ptype=2, rep=0):
+    """One INT64 column `x`, one row group, one chunk made of `pages`: (kind, nvals, encoding, body) with kind 0 a data
+    page and 2 a dictionary page. Sizes are the body's."""
+    data = b"PAR1"
+    off = len(data)
+    chunk = b""
+    total = 0
+    for kind, nvals, enc, body in pages:
+        h = Compact()
+        h.i32(1, kind)
+        h.i32(2, len(body))
+        h.i32(3, len(body))
+        if kind == 2:
+            h.st(7); h.i32(1, nvals); h.i32(2, enc); h.end()
+        else:
+            h.st(5); h.i32(1, nvals); h.i32(2, enc); h.i32(3, 3); h.i32(4, 3); h.end()
+            total += nvals
+        h.b.append(0)
+        chunk += bytes(h.b) + body
+    data += chunk
+    m = Compact()
+    m.i32(1, 1); m.lst(2, 12, 2)
+    m.el(); m.bin(4, b"schema"); m.i32(5, 1); m.end()
+    m.el(); m.i32(1, ptype); m.i32(3, rep); m.bin(4, b"x"); m.end()
+    m.i64(3, total); m.lst(4, 12, 1)
+    m.el(); m.lst(1, 12, 1)
+    m.el(); m.i64(2, off)
+    m.st(3); m.i32(1, ptype); m.lst(2, 5, 1); m.b += zz(0); m.lst(3, 8, 1); m.b += uv(1) + b"x"
+    m.i32(4, 0); m.i64(5, total); m.i64(6, len(chunk)); m.i64(7, len(chunk)); m.i64(9, off); m.end(); m.end()
+    m.i64(2, len(chunk)); m.i64(3, total); m.end(); m.b.append(0)
+    data += bytes(m.b) + struct.pack("<i", len(m.b)) + b"PAR1"
+    Path(path).write_bytes(data)
+
+
+def refused_by_both(cells, path, message):
+    """read_parquet and the scan raise `message` (a normal error exit) under a 32 GB address-space cap, so a build that
+    allocates what the file claims would abort instead."""
+    import resource
+
+    def cap():
+        resource.setrlimit(resource.RLIMIT_AS, (32 << 30, 32 << 30))
+
+    for mode in ("read", "scan"):
+        p = subprocess.run([str(cells), str(path), mode], capture_output=True, text=True, preexec_fn=cap)
+        assert p.returncode == 1, (mode, p.returncode, p.stderr[-300:])
+        assert message in p.stdout + p.stderr, (mode, p.stdout + p.stderr)
+
+
+I31 = 2**31 - 1
+
+
+def test_pages_that_claim_rows_their_bytes_cannot_hold_are_refused_not_allocated(cells, tmp_path):
+    """64 empty pages that each claim 2^31-1 rows (a 2 KB file) asked for a terabyte of column: a readable error now."""
+    path = tmp_path / "bomb.parquet"
+    multi_page_file(path, [(0, I31, 0, b"")] * 64)
+    refused_by_both(cells, path, "column `x`: a page claims 2147483647 values in only 0 bytes (corrupt file)")
+    multi_page_file(path, [(0, I31, 0, struct.pack("<qqq", 1, 2, 3))])
+    refused_by_both(cells, path, "column `x`: a page claims 2147483647 values in only 24 bytes (corrupt file)")
+
+
+def test_a_second_dictionary_page_is_refused(cells, tmp_path):
+    path = tmp_path / "two_dicts.parquet"
+    d = struct.pack("<qq", 10, 20)
+    multi_page_file(path, [(2, 2, 0, d), (2, 2, 0, d), (0, 3, 8, bytes([1]) + uv((1 << 1) | 1) + bytes([0b010]))])
+    refused_by_both(cells, path, "column `x`: a chunk has two dictionary pages (corrupt file)")
+    multi_page_file(path, [(2, 2, 0, d), (0, 3, 8, bytes([1]) + uv((1 << 1) | 1) + bytes([0b010]))])
+    for mode in ("read", "scan"):                                     # one dictionary page: the indices 0, 1, 0 read
+        out = subprocess.run([str(cells), str(path), mode], capture_output=True, text=True, check=True).stdout
+        assert out == "10\n20\n10\n"
+
+
+def test_a_dictionary_index_past_the_dictionary_says_so(cells, tmp_path):
+    path = tmp_path / "index.parquet"
+    d = struct.pack("<qq", 10, 20)
+    # width 2, one bit-packed group of 8 indices: 3, 0, 0, ... (3 is past the two words)
+    multi_page_file(path, [(2, 2, 0, d), (0, 3, 8, bytes([2]) + uv((1 << 1) | 1) + bytes([0b11, 0]))])
+    refused_by_both(cells, path, "column `x`: a dictionary index is out of range (corrupt file)")
+
+
+def test_the_first_error_in_page_order_is_the_one_raised(cells, tmp_path):
+    """A bad PLAIN text page (serial) after a bad numeric-looking page: whichever page comes first in the file wins,
+    whatever thread or phase decoded it."""
+    path = tmp_path / "order.parquet"
+    d = struct.pack("<qq", 10, 20)
+    bad_index = bytes([2]) + uv((1 << 1) | 1) + bytes([0b11, 0])
+    short_plain = struct.pack("<q", 1)                      # 1 value of the 3 it claims
+    multi_page_file(path, [(2, 2, 0, d), (0, 3, 8, bad_index), (0, 3, 0, short_plain)])
+    refused_by_both(cells, path, "a dictionary index is out of range")
+    multi_page_file(path, [(2, 2, 0, d), (0, 3, 0, short_plain), (0, 3, 8, bad_index)])
+    refused_by_both(cells, path, "a Parquet page ends early")
