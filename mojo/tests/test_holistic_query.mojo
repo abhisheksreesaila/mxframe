@@ -3,7 +3,7 @@
 # is checked against an oracle written here: plain loops over the cells, sorting with a merge sort, no kernel.
 from mxframe import (Table, SharedTable, Query, QueryResult, Frame, col, lit, least, sum, count, mean, min_of, max_of,
                      count_distinct, percentile, median, top_k, INT, DECIMAL, TEXT, write_parquet, read_parquet,
-                     scan_parquet, ZSTD, CPU, GPU, AUTO)
+                     scan_parquet, ZSTD, CPU, GPU, AUTO, DeviceTable, gpu_available)
 
 
 struct Rng(Movable):
@@ -559,6 +559,28 @@ def test_a_scan_with_an_all_null_row_group_and_words_that_come_late() raises:
     check_agg(a, 1, "top", 0.0, 3, lists, ranks, "late words top3")
 
 
+def test_a_device_table_does_not_move_them_to_the_gpu() raises:
+    """AUTO with a DeviceTable attached and enough rows would use the GPU for plain aggregates; these run on the CPU
+    and say why. compute(GPU) refuses. (Skipped without a GPU.)"""
+    if not gpu_available():
+        return
+    var t = make_table(1_000_000, 6)
+    var dt = DeviceTable(t)
+    var r = Query(t).on_device(dt).group_by(col("carrier"), groups=7).agg(median(col("cost")), count_distinct(col("cust")), sum(col("day"))).compute(AUTO)
+    expect(r.device == CPU and "CPU" in r.fallback_reason, "AUTO ran on the CPU and said why: " + r.fallback_reason)
+    var plain = Query(t).group_by(col("carrier"), groups=7).agg(median(col("cost")), count_distinct(col("cust")), sum(col("day"))).compute(CPU)
+    for g in range(7):
+        expect(r.values(0)[g] == plain.values(0)[g] and r.values(1)[g] == plain.values(1)[g] and r.values(2)[g] == plain.values(2)[g],
+               "the same answers as the CPU run, group " + String(g))
+    var msg = String("")
+    try:
+        _ = Query(t).on_device(dt).agg(median(col("cost"))).compute(GPU)
+    except e:
+        msg = String(e)
+    expect("run on the CPU" in msg, "compute(GPU): " + msg)
+    dt.release()
+
+
 def main() raises:
     test_over_a_table()
     test_one_row_no_rows_all_null()
@@ -568,4 +590,5 @@ def main() raises:
     test_over_a_frame_with_edits()
     test_over_a_scan_of_several_row_groups()
     test_a_scan_with_an_all_null_row_group_and_words_that_come_late()
+    test_a_device_table_does_not_move_them_to_the_gpu()
     print("ok")

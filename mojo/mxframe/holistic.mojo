@@ -8,7 +8,7 @@ is not null, packed block by block (a `Window`). This file consumes those pairs:
 - count distinct: a hash set of (group, value) pairs, split into P partitions by the pair's hash. A window's pairs are
   first scattered to their partitions (parallel, two passes), then each partition inserts its own pairs (parallel, no
   locks). The set persists between windows, so a streamed scan merges row group after row group exactly. Memory:
-  12 bytes a slot, 2 to 4 slots per distinct (group, value) pair.
+  16 bytes a slot, about 1.5 slots per distinct (group, value) pair.
 - top-k: the k largest values of a group, duplicates kept (SQL `ORDER BY e DESC LIMIT k`): a bounded min-heap of k
   values per group (O(rows log k), almost all rows rejected by one compare with the heap's smallest). Few groups: every
   task keeps private heaps over its blocks and they are merged; many groups: the pairs are scattered by group so that
@@ -24,14 +24,17 @@ is not null, packed block by block (a `Window`). This file consumes those pairs:
   the values are mapped to their rank before ordering and back to the code after (`ranks`, `unranks`).
 """
 from std.memory import Pointer
+from std.sys import prefetch, PrefetchOptions
 from std.atomic import Atomic
 from std.bit import count_leading_zeros
-from std.math import ceil
+from std.math import ceil, log
 from .kernels._fpenv import core_count, par_n
 
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
 comptime NP = Pointer[Int, MutUntrackedOrigin]
+comptime BP = Pointer[UInt8, MutUntrackedOrigin]
+comptime HLL_M = 256               # registers of a HyperLogLog sketch (standard error about 6.5%)
 
 # aggregate kinds (the plain ones are in query.mojo)
 comptime A_DISTINCT = 6
@@ -56,6 +59,10 @@ def _ip(a: Int) -> IP:
 
 def _np(a: Int) -> NP:
     return NP(unsafe_from_address=a)
+
+
+def _bp(a: Int) -> BP:
+    return BP(unsafe_from_address=a)
 
 
 @always_inline
@@ -125,11 +132,13 @@ struct Scattered(Movable):
     var seg: List[Int]
     var vals: List[Int64]
     var gids: List[Int32]
+    var hll: List[UInt8]       # when asked for: HyperLogLog registers, `tasks x parts x HLL_M`, of the pairs' hashes
 
     def __init__(out self):
         self.seg = List[Int]()
         self.vals = List[Int64]()
         self.gids = List[Int32]()
+        self.hll = List[UInt8]()
 
 
 @always_inline
@@ -139,28 +148,45 @@ def _owner(v: Int64, g: Int32, nparts: Int, by_hash: Bool) -> Int:
     return Int(g) % nparts
 
 
-def _scatter(b: Blocks, nparts: Int, by_hash: Bool, rank: Int, threads: Int) -> Scattered:
+def _scatter(b: Blocks, nparts: Int, by_hash: Bool, rank: Int, threads: Int, want_hll: Bool = False) -> Scattered:
     """Regroup the pairs into `nparts` parts: by the hash of (group, value) (`nparts` a power of two) or by group
     modulo `nparts`; values are mapped through `rank` (an Int64 table, 0: none). Two parallel passes over the blocks
-    (count, then place); the order inside a part follows the blocks."""
+    (count, then place); the order inside a part follows the blocks. `want_hll` (by hash): the count pass also fills
+    a HyperLogLog sketch per task and part, to size the tables the pairs go into."""
     var nb = len(b.n)
     var tp = _tasks(b.total, nb, threads)
     var cnt = List[Int](length=tp * nparts, fill=0)
     var cnt_at = Int(cnt.unsafe_ptr())
+    var sketch = List[UInt8](length=tp * nparts * HLL_M if want_hll else 1, fill=0)
+    var sketch_at = Int(sketch.unsafe_ptr())
     var bg = Int(b.g.unsafe_ptr())
     var bv = Int(b.v.unsafe_ptr())
     var bn = Int(b.n.unsafe_ptr())
 
     def count(t: Int) {imm}:
         var c = _np(cnt_at) + t * nparts
+        var regs = _bp(sketch_at) + t * nparts * HLL_M
         for k in range(_cut(nb, tp, t), _cut(nb, tp, t + 1)):
             var gp = _ip(_np(bg)[k])
             var vp = _lp(_np(bv)[k])
-            for j in range(_np(bn)[k]):
-                c[_owner(vp[j], gp[j], nparts, by_hash)] += 1
+            if want_hll:
+                for j in range(_np(bn)[k]):
+                    var h = _mix(vp[j], gp[j])
+                    var p = Int((h >> 40) & UInt64(nparts - 1))
+                    c[p] += 1
+                    var h2 = (h ^ (h >> 29)) * 0xBF58476D1CE4E5B9
+                    var r = regs + (p * HLL_M + Int(h2 >> 56))
+                    var rho = UInt8(count_leading_zeros((h2 << 8) | 128)) + 1
+                    if r[0] < rho:
+                        r[0] = rho
+            else:
+                for j in range(_np(bn)[k]):
+                    c[_owner(vp[j], gp[j], nparts, by_hash)] += 1
 
     par_n(count, tp, tp)
     var out = Scattered()
+    if want_hll:
+        out.hll = sketch^
     out.seg = List[Int](length=nparts + 1, fill=0)
     var run = 0
     for p in range(nparts):
@@ -467,119 +493,197 @@ def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: I
 
 # ── count distinct ───────────────────────────────────────────────────────────────────────────────────
 
-def _dist_grow(mut keys: List[Int64], mut g1: List[Int32], cap: Int):
-    """Rehash one partition's table into `cap` slots (a power of two)."""
-    var old_keys = keys^
-    var old_g1 = g1^
-    keys = List[Int64](length=cap, fill=0)
-    g1 = List[Int32](length=cap, fill=0)
-    var mask = cap - 1
-    var okp = _lp(Int(old_keys.unsafe_ptr()))
-    var ogp = _ip(Int(old_g1.unsafe_ptr()))
-    var nkp = _lp(Int(keys.unsafe_ptr()))
-    var ngp = _ip(Int(g1.unsafe_ptr()))
-    for i in range(len(old_keys)):
-        var e = ogp[i]
+comptime PREFETCH_AHEAD = 12     # entries ahead whose table slot is prefetched while inserting
+
+
+def _hll_estimate(regs: BP) -> Float64:
+    """The distinct count a HyperLogLog sketch of HLL_M registers stands for."""
+    var total = 0.0
+    var zeros = 0
+    for i in range(HLL_M):
+        total += 1.0 / Float64(UInt64(1) << UInt64(regs[i]))
+        zeros += Int(regs[i] == 0)
+    var m = Float64(HLL_M)
+    var e = 0.7213 / (1.0 + 1.079 / m) * m * m / total
+    if e <= 2.5 * m and zeros > 0:
+        e = m * log(m / Float64(zeros))               # few distinct values: linear counting
+    return e
+
+
+def _cap_for(est: Float64) -> Int:
+    """Slots for `est` pairs, plus a little for the sketch's error, at about 70% full (any number: a slot is found by
+    multiplying, not masking)."""
+    return max(Int(est * 1.1 / 0.7) + 64, 1024)
+
+
+@always_inline
+def _slot(h: UInt64, cap: Int) -> Int:
+    """The home slot of hash h in a table of `cap` slots: the low 32 bits scaled to 0 .. cap-1."""
+    return Int(((h & 0xFFFFFFFF) * UInt64(cap)) >> 32)
+
+
+def _dist_grow(mut tab: List[Int64], old_cap: Int, cap: Int):
+    """Rehash one partition's table of `old_cap` slots into a new one of `cap`. A slot is two words:
+    the value, and the group + 1 (0: empty); both on one cache line, so a probe is one miss."""
+    var old = tab^
+    tab = List[Int64](length=2 * cap, fill=0)
+    var op = _lp(Int(old.unsafe_ptr()))
+    var np = _lp(Int(tab.unsafe_ptr()))
+    for i in range(old_cap):
+        var e = op[2 * i + 1]
         if e != 0:
-            var s = Int(_mix(okp[i], e - 1) & UInt64(mask))
-            while ngp[s] != 0:
-                s = (s + 1) & mask
-            nkp[s] = okp[i]
-            ngp[s] = e
-    _ = old_keys^
-    _ = old_g1^
+            var s = _slot(_mix(op[2 * i], Int32(e - 1)), cap)
+            while np[2 * s + 1] != 0:
+                s += 1
+                if s == cap:
+                    s = 0
+            np[2 * s] = op[2 * i]
+            np[2 * s + 1] = e
+    _ = old^
 
 
-def _dist_add(mut keys: List[Int64], mut g1: List[Int32], used: Int, sv: LP, sg: IP, n: Int) -> Int:
-    """Insert n (value, group) pairs into one partition's open-addressing table (linear probing, load at most 1/2);
-    returns the number of distinct pairs it holds."""
+def _dist_add(mut tab: List[Int64], mut cap: Int, used: Int, sv: LP, sg: IP, n: Int, min_cap: Int) -> Int:
+    """Insert n (value, group) pairs into one partition's open-addressing table of `cap` slots (the first 2 * cap
+    words of `tab`; linear probing). It doubles when 4/5 full, after being made at least `min_cap` slots up front,
+    which a sketch's estimate makes the usual size. Returns the number of distinct pairs it holds. The slots of the
+    next PREFETCH_AHEAD pairs are prefetched: with millions of distinct pairs every probe is a cache miss, and
+    overlapping them is most of the speed."""
     var u = used
-    var cap = len(keys)
-    var kp = _lp(Int(keys.unsafe_ptr()))
-    var gp = _ip(Int(g1.unsafe_ptr()))
+    if cap < min_cap:
+        _dist_grow(tab, cap, min_cap)
+        cap = min_cap
+    var tp = _lp(Int(tab.unsafe_ptr()))
     for i in range(n):
-        if (u + 1) * 2 > cap:
-            _dist_grow(keys, g1, max(cap * 2, 1024))
-            cap = len(keys)
-            kp = _lp(Int(keys.unsafe_ptr()))
-            gp = _ip(Int(g1.unsafe_ptr()))
+        if (u + 1) * 5 > cap * 4:
+            var bigger = max(cap * 2, 1024)
+            _dist_grow(tab, cap, bigger)
+            cap = bigger
+            tp = _lp(Int(tab.unsafe_ptr()))
+        if i + PREFETCH_AHEAD < n:
+            var hs = _slot(_mix(sv[i + PREFETCH_AHEAD], sg[i + PREFETCH_AHEAD]), cap)
+            prefetch[PrefetchOptions().for_write().high_locality().to_data_cache()](tp + 2 * hs)
         var v = sv[i]
         var g = sg[i]
-        var mask = cap - 1
-        var s = Int(_mix(v, g) & UInt64(mask))
-        var tag = g + 1
+        var s = _slot(_mix(v, g), cap)
+        var tag = Int64(g) + 1
         while True:
-            var e = gp[s]
+            var e = tp[2 * s + 1]
             if e == 0:
-                kp[s] = v
-                gp[s] = tag
+                tp[2 * s] = v
+                tp[2 * s + 1] = tag
                 u += 1
                 break
-            if e == tag and kp[s] == v:
+            if e == tag and tp[2 * s] == v:
                 break
-            s = (s + 1) & mask
+            s += 1
+            if s == cap:
+                s = 0
     return u
 
 
+def _tally(tab: LP, slots: Int, dense: IP, atomic: LP, use_dense: Bool):
+    """Add one to the counter of the group of every pair in the table (a private counter per partition, or an atomic one)."""
+    for i in range(slots):
+        var e = tab[2 * i + 1]
+        if e != 0:
+            if use_dense:
+                dense[Int(e) - 1] += 1
+            else:
+                _ = Atomic[Scalar[DType.int64]].fetch_add(atomic + (Int(e) - 1), 1)
+
+
 struct DistinctState(Movable):
-    """Every distinct (group, value) pair seen so far, in `parts` hash partitions (a power of two)."""
+    """The distinct (group, value) pairs seen so far, in `parts` hash partitions (a power of two).
+
+    The first window's pairs are only partitioned and kept (`pending`), not inserted: a query that fits one window
+    (most tables) counts them with a table per partition that lives for one task, never holding more than a few
+    partitions' tables at once. From a second window on, the pairs go into persistent tables, sized from a
+    HyperLogLog sketch per partition (of everything seen, so a window that repeats values does not grow them)."""
     var parts: Int
-    var keys: List[List[Int64]]
-    var g1: List[List[Int32]]          # group + 1 of each slot, 0 for an empty slot
+    var tabs: List[List[Int64]]        # per partition: 2 words a slot, (value, group + 1), group + 1 = 0 for an empty slot
     var used: List[Int]
+    var hll: List[UInt8]               # parts x HLL_M
+    var pending: Scattered
+    var has_pending: Bool
+    var tabled: Bool                   # the persistent tables hold the pairs seen so far
 
     def __init__(out self, parts: Int):
         self.parts = parts
-        self.keys = List[List[Int64]]()
-        self.g1 = List[List[Int32]]()
+        self.tabs = List[List[Int64]]()
         self.used = List[Int]()
         for _ in range(parts):
-            self.keys.append(List[Int64]())
-            self.g1.append(List[Int32]())
+            self.tabs.append(List[Int64]())
             self.used.append(0)
+        self.hll = List[UInt8](length=parts * HLL_M, fill=0)
+        self.pending = Scattered()
+        self.has_pending = False
+        self.tabled = False
 
     def absorb(mut self, b: Blocks, threads: Int):
-        var sc = _scatter(b, self.parts, True, 0, threads)
-        var keys_at = Int(self.keys.unsafe_ptr())
-        var g1_at = Int(self.g1.unsafe_ptr())
-        var used_at = Int(self.used.unsafe_ptr())
-        var seg_at = Int(sc.seg.unsafe_ptr())
-        var sv = Int(sc.vals.unsafe_ptr())
-        var sg = Int(sc.gids.unsafe_ptr())
+        var sc = _scatter(b, self.parts, True, 0, threads, True)
+        var tp = len(sc.hll) // (self.parts * HLL_M)
+        for t in range(tp):
+            for i in range(self.parts * HLL_M):
+                self.hll[i] = max(self.hll[i], sc.hll[t * self.parts * HLL_M + i])
+        if not self.tabled and not self.has_pending:
+            self.pending = sc^
+            self.has_pending = True
+            return
+        if self.has_pending:
+            _insert(self.tabs, self.used, self.hll, self.pending, self.parts, threads)
+            self.pending = Scattered()
+            self.has_pending = False
+        self.tabled = True
+        _insert(self.tabs, self.used, self.hll, sc, self.parts, threads)
 
-        def insert(p: Int) {imm}:
-            var lo = _np(seg_at)[p]
-            var n = _np(seg_at)[p + 1] - lo
-            if n == 0:
-                return
-            var kp = Pointer[List[Int64], MutUntrackedOrigin](unsafe_from_address=keys_at) + p
-            var gp = Pointer[List[Int32], MutUntrackedOrigin](unsafe_from_address=g1_at) + p
-            var up = _np(used_at) + p
-            up[0] = _dist_add(kp[], gp[], up[0], _lp(sv) + lo, _ip(sg) + lo, n)
-
-        par_n(insert, self.parts, threads)
-        _ = sc^
-
-    def counts(self, groups: Int, threads: Int) -> List[Int]:
+    def counts(mut self, groups: Int, threads: Int) -> List[Int]:
         """The number of distinct values of each group."""
         var P = self.parts
         var out = List[Int](length=groups, fill=0)
-        var keys_at = Int(self.keys.unsafe_ptr())
-        var g1_at = Int(self.g1.unsafe_ptr())
-        if P * groups <= (1 << 23):
-            # a counter per (partition, group), summed after: no shared writes
-            var loc = List[Int32](length=P * groups, fill=0)
-            var loc_at = Int(loc.unsafe_ptr())
+        if not self.tabled and not self.has_pending:
+            return out^
+        var dense = P * groups <= (1 << 23)           # a counter per (partition, group), summed after; many groups: atomics
+        var loc = List[Int32](length=P * groups if dense else 1, fill=0)
+        var acc = List[Int64](length=1 if dense else groups, fill=0)
+        var loc_at = Int(loc.unsafe_ptr())
+        var acc_at = Int(acc.unsafe_ptr())
+        if self.has_pending:
+            var seg_at = Int(self.pending.seg.unsafe_ptr())
+            var sv = Int(self.pending.vals.unsafe_ptr())
+            var sg = Int(self.pending.gids.unsafe_ptr())
+            var hll_at = Int(self.hll.unsafe_ptr())
 
-            def tally(p: Int) {imm}:
-                ref gl = (Pointer[List[Int32], MutUntrackedOrigin](unsafe_from_address=g1_at) + p)[]
-                var gp = _ip(Int(gl.unsafe_ptr()))
-                var c = _ip(loc_at) + p * groups
-                for i in range(len(gl)):
-                    if gp[i] != 0:
-                        c[Int(gp[i]) - 1] += 1
+            var workers = max(1, min(threads, P))
 
-            par_n(tally, P, threads)
+            def transient(w: Int) {imm}:
+                # worker w takes partitions w, w + workers, ... and reuses one table buffer (cleared, not reallocated):
+                # a fresh table per partition spends more on page faults and zeroing than on the counting
+                var tab = List[Int64]()
+                for p in range(w, P, workers):
+                    var lo = _np(seg_at)[p]
+                    var n = _np(seg_at)[p + 1] - lo
+                    if n == 0:
+                        continue
+                    var cap = _cap_for(_hll_estimate(_bp(hll_at) + p * HLL_M))
+                    if len(tab) >= 2 * cap:
+                        var tq = _lp(Int(tab.unsafe_ptr()))
+                        for i in range(2 * cap):
+                            tq[i] = 0
+                    else:
+                        tab = List[Int64](length=2 * cap, fill=0)
+                    _ = _dist_add(tab, cap, 0, _lp(sv) + lo, _ip(sg) + lo, n, 0)
+                    _tally(_lp(Int(tab.unsafe_ptr())), cap, _ip(loc_at) + p * groups if dense else _ip(loc_at), _lp(acc_at), dense)
+
+            par_n(transient, workers, workers)
+        else:
+            var tabs_at = Int(self.tabs.unsafe_ptr())
+
+            def persistent(p: Int) {imm}:
+                ref tl = (Pointer[List[Int64], MutUntrackedOrigin](unsafe_from_address=tabs_at) + p)[]
+                _tally(_lp(Int(tl.unsafe_ptr())), len(tl) // 2, _ip(loc_at) + p * groups if dense else _ip(loc_at), _lp(acc_at), dense)
+
+            par_n(persistent, P, threads)
+        if dense:
             var out_at = Int(out.unsafe_ptr())
             var tp = _tasks(groups, groups, threads)
 
@@ -593,25 +697,34 @@ struct DistinctState(Movable):
                     o[g] = s
 
             par_n(total, tp, tp)
-            _ = loc^
         else:
-            # many groups: atomic adds into one counter per group (contention is low when groups are many)
-            var acc = List[Int64](length=groups, fill=0)
-            var acc_at = Int(acc.unsafe_ptr())
-
-            def tally_atomic(p: Int) {imm}:
-                ref gl = (Pointer[List[Int32], MutUntrackedOrigin](unsafe_from_address=g1_at) + p)[]
-                var gp = _ip(Int(gl.unsafe_ptr()))
-                var c = _lp(acc_at)
-                for i in range(len(gl)):
-                    if gp[i] != 0:
-                        _ = Atomic[Scalar[DType.int64]].fetch_add(c + (Int(gp[i]) - 1), 1)
-
-            par_n(tally_atomic, P, threads)
             for g in range(groups):
                 out[g] = Int(acc[g])
-            _ = acc^
+        _ = loc^
+        _ = acc^
         return out^
+
+
+def _insert(mut tabs: List[List[Int64]], mut used: List[Int], hll: List[UInt8], sc: Scattered, parts: Int, threads: Int):
+    """Insert a window's partitioned pairs into the persistent tables, a task per partition."""
+    var tabs_at = Int(tabs.unsafe_ptr())
+    var used_at = Int(used.unsafe_ptr())
+    var hll_at = Int(hll.unsafe_ptr())
+    var seg_at = Int(sc.seg.unsafe_ptr())
+    var sv = Int(sc.vals.unsafe_ptr())
+    var sg = Int(sc.gids.unsafe_ptr())
+
+    def insert(p: Int) {imm}:
+        var lo = _np(seg_at)[p]
+        var n = _np(seg_at)[p + 1] - lo
+        if n == 0:
+            return
+        var tp = Pointer[List[Int64], MutUntrackedOrigin](unsafe_from_address=tabs_at) + p
+        var up = _np(used_at) + p
+        var cap = len(tp[]) // 2
+        up[0] = _dist_add(tp[], cap, up[0], _lp(sv) + lo, _ip(sg) + lo, n, _cap_for(_hll_estimate(_bp(hll_at) + p * HLL_M)))
+
+    par_n(insert, parts, threads)
 
 
 # ── top-k ────────────────────────────────────────────────────────────────────────────────────────────
