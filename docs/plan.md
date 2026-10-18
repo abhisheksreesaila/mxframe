@@ -1325,6 +1325,14 @@ Needs: F-142 · `table.mojo`, `parquet.mojo`, `csv.mojo`, `frame.mojo` · Naming
 - [ ] then: big PLAIN text pages split into value slices so the one-page tail of a row group shrinks
 - [ ] measured: the 5M-row text read (F-142 bench) and the CSV 1M-row read, before / after
 
+
+## F-145 Mojo API: every core busy inside a row group (parallel dictionary pages, big pages split by row range) [todo]
+Needs: F-143 · `mojo/mxframe/parquet.mojo` · F-143 review: decode is the critical path and ~3-4 ms per group does not parallelise: a 1M-row single-page dictionary-index column decodes on one worker, ~1 MB dictionary pages decode serially inside the header walk, snappy is ~12 of 18 single-thread ms. Bar: within 1.5x of DuckDB on the streamed numeric query (0.149-0.164 s vs 0.072-0.086 s at 20M rows)
+- [ ] dictionary pages decoded as parallel jobs in a first round before the data pages (the scan's are lookups only; `read_parquet`'s text dictionaries still add words in file order)
+- [ ] pages with many rows split by row range: a dictionary-index page by one cheap serial pass over its run headers, a PLAIN fixed-width page by byte offset; nulls (def levels) split with them
+- [ ] exact (all oracles, cell probes, serial build); measured against DuckDB, 1 thread and all cores
+- [ ] open (product call, not this ticket): DuckDB's model, a worker per row group scanning and aggregating in small vectors (decoded columns never hit memory), trades the two-group memory bound for speed
+
 ## F-133 M2: Query on a Mojo plan IR [done]
 Needs: F-132 · Spec §5 · `mojo/mxframe/expr.mojo`, `query.mojo`, test `mojo/tests/test_query.mojo`
 - [x] plan nodes in Mojo (Scan, Filter, Aggregate built; Project / Sort / Limit / Join kinds reserved), built by `Query(table).where().group_by(key, groups=).agg(...)`; expressions are flat post-order trees (`col`, `lit`, `+ - * // %`, unary `-`, `least` / `greatest`, comparisons, `between`, `& | ~`)
