@@ -28,6 +28,8 @@ referenced, so nothing links. On Linux both codecs work as before.
 """
 from std.ffi import external_call
 from std.sys import is_defined, CompilationTarget
+from std.bit import pop_count
+from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
@@ -759,17 +761,19 @@ def _plain(mut c: _Bytes, leaf: _Leaf, count: Int, mut t: Table, col: Int, mut o
 
 def read_parquet(path: String) raises -> ParquetResult:
     """Reads a Parquet file (written by MX frame, pyarrow, DuckDB, ...) into a Table, plus its "omx" metadata."""
-    var data: List[UInt8]
-    with open(path, "r") as f:
-        data = f.read_bytes()
-    var n = len(data)
-    if n < 12 or data[0] != 0x50 or data[1] != 0x41 or data[2] != 0x52 or data[3] != 0x31 or \
+    var file = _open_file(path)
+    var n = _file_size(file, path)
+    if n < 12:
+        raise Error("`" + path + "` is not a Parquet file (no PAR1 magic)")
+    var map = _Mapped(file._get_raw_fd(), 0, n, path)
+    var data = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=map.data)
+    if data[0] != 0x50 or data[1] != 0x41 or data[2] != 0x52 or data[3] != 0x31 or \
        data[n - 4] != 0x50 or data[n - 3] != 0x41 or data[n - 2] != 0x52 or data[n - 1] != 0x31:
         raise Error("`" + path + "` is not a Parquet file (no PAR1 magic)")
     var flen = Int(data[n - 8]) | (Int(data[n - 7]) << 8) | (Int(data[n - 6]) << 16) | (Int(data[n - 5]) << 24)
     if flen <= 0 or flen > n - 12:
         raise Error("`" + path + "`: the Parquet footer length is wrong (corrupt file)")
-    var base = Int(data.unsafe_ptr())
+    var base = map.data
     var r = ThriftReader(base + n - 8 - flen, flen)
 
     var footer = _read_footer(r)
@@ -778,15 +782,31 @@ def read_parquet(path: String) raises -> ParquetResult:
 
     var cols = List[_Leaf]()
     var t = _schema_table(path, leaves, cols)
-
+    var ids = List[Int]()
+    var bases = List[Int]()
+    var ns = List[Int]()
+    var gcols = List[Int]()
+    var total = 0
+    for c in range(len(cols)):
+        ids.append(c)
+        bases.append(base)
+        ns.append(n)
+        gcols.append(0)
+    for g in range(len(groups)):
+        if len(cols) > 0 and len(groups[g]) == len(cols):
+            total += groups[g][0].values
+    for c in range(len(cols)):                                  # room for every row: a hint, bounded by the file
+        t.cols[c].values.reserve(max(0, min(total, 64 * n + 1024)))
+    var row0 = 0
     for g in range(len(groups)):
         if len(groups[g]) != len(cols):
             raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(groups[g])) +
                         " columns, the schema " + String(len(cols)))
-        for c in range(len(cols)):
-            _read_chunk(base, n, groups[g][c], cols[c], t, c)
+        _decode_group(bases, ns, groups[g], ids, ids, gcols, cols, row0, t)
+        if len(cols) > 0:
+            row0 += groups[g][0].values
     t.check()
-    _ = data^
+    map.release()
     return ParquetResult(t^, footer.omx.copy())
 
 
@@ -984,13 +1004,367 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
     return chunks^
 
 
-def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, col: Int, words_only: Bool = False, gcol: Int = 0) raises:
-    """Appends one column chunk's values to column `col`. `words_only` (a TEXT column's file-wide dictionary): only the
-    words are added, in the order a full read adds them; dictionary-indexed data pages are not even decompressed."""
+# ── decoding a row group: pages in bulk, in parallel (F-141) ─────────────────────────────────────────
+#
+# A row group's chunks (one per column read) are decoded in three steps:
+#   1. walk: the page headers of every chunk, serially (cheap). A dictionary page is decoded here (its words become
+#      the file-wide codes, or are added to the table's own dictionary for `read_parquet`), a data page becomes a
+#      `_Page` job that knows its first row. The columns are then sized once, from the rows the pages add up to.
+#   2. TEXT pages that must ADD words to a table (PLAIN text under `read_parquet`) are decoded now, in file order,
+#      because adding words mutates the table.
+#   3. every other page is decoded in parallel straight into its slice of the column: decompress, unpack the
+#      definition levels into the page's validity bits, write the values (a PLAIN int64 is a copy, an int32 one
+#      widening loop, dictionary indices are gathered into codes in the same loop that unpacks them), spread the
+#      values over the null rows. The pages' validity bits are then merged into the column's bitmap in page order.
+# Nothing in the parallel step mutates shared state: a page only writes its own rows and its own `_Page` record.
+
+@fieldwise_init
+struct _Page(Copyable, Movable):
+    var addr: Int                    # the page body (compressed) in the file or its mapping
+    var csize: Int
+    var usize: Int
+    var nvals: Int
+    var encoding: Int
+    var v2: Bool
+    var def_len: Int
+    var def_enc: Int
+    var v2_compressed: Bool
+    var ctx: Int                     # its chunk's `_Ctx`
+    var row: Int                     # its first row in the output column
+    var serial: Bool                 # must run in file order on the calling thread (adds words to the table)
+    var nulls: Int
+    var bits: List[UInt8]            # validity bits of its rows (an OPTIONAL column with nulls on this page)
+    var err: String
+
+
+@fieldwise_init
+struct _Ctx(Copyable, Movable):
+    var leaf: Int                    # index into the leaves
+    var col: Int                     # the output column
+    var codec: Int
+    var optional: Bool
+    var gcol: Int                    # address of the file-wide TEXT `Column` to look words up in, 0: add to the table
+    var dict: List[Int64]            # the chunk's dictionary page as stored values (file-wide codes for TEXT)
+    var row0: Int                    # the chunk's first row in the output column
+    var rows: Int
+
+
+def _get_bit(p: UnsafePointer[UInt8, MutAnyOrigin], i: Int) -> Bool:
+    return (p[i >> 3] >> UInt8(i & 7)) & 1 == 1
+
+
+def _assign_bits(dst: UnsafePointer[UInt8, MutAnyOrigin], pos: Int, src: UnsafePointer[UInt8, MutAnyOrigin], nbits: Int):
+    """dst bits [pos, pos + nbits) = src bits [0, nbits) (least significant bit first, both)."""
+    var i = 0
+    while i < nbits and (pos + i) & 7 != 0:
+        var m = UInt8(1) << UInt8((pos + i) & 7)
+        if _get_bit(src, i):
+            dst[(pos + i) >> 3] |= m
+        else:
+            dst[(pos + i) >> 3] &= ~m
+        i += 1
+    while i + 8 <= nbits:
+        var sb = i >> 3
+        var sh = i & 7
+        var v = src[sb]
+        if sh != 0:
+            v = UInt8(((UInt16(src[sb]) | (UInt16(src[sb + 1]) << 8)) >> UInt16(sh)) & 0xFF)
+        dst[(pos + i) >> 3] = v
+        i += 8
+    while i < nbits:
+        var m = UInt8(1) << UInt8((pos + i) & 7)
+        if _get_bit(src, i):
+            dst[(pos + i) >> 3] |= m
+        else:
+            dst[(pos + i) >> 3] &= ~m
+        i += 1
+
+
+def _set_ones(dst: UnsafePointer[UInt8, MutAnyOrigin], pos: Int, count: Int):
+    var i = 0
+    while i < count and (pos + i) & 7 != 0:
+        dst[(pos + i) >> 3] |= UInt8(1) << UInt8((pos + i) & 7)
+        i += 1
+    while i + 8 <= count:
+        dst[(pos + i) >> 3] = 0xFF
+        i += 8
+    while i < count:
+        dst[(pos + i) >> 3] |= UInt8(1) << UInt8((pos + i) & 7)
+        i += 1
+
+
+def _count_bits(p: UnsafePointer[UInt8, MutAnyOrigin], nbits: Int) -> Int:
+    var n = 0
+    var full = nbits >> 3
+    for i in range(full):
+        n += Int(pop_count(p[i]))
+    if nbits & 7 != 0:
+        n += Int(pop_count(p[full] & ((UInt8(1) << UInt8(nbits & 7)) - 1)))
+    return n
+
+
+def _levels_to_bits(mut c: _Bytes, count: Int, bits: UnsafePointer[UInt8, MutAnyOrigin]) raises:
+    """`count` definition levels (RLE / bit-packed hybrid, width 1) into `bits`, already zero: bit i set = value i is
+    present. A bit-packed run of 1-bit values is a run of bitmap bits; a repeated 1 sets a range."""
+    var pos = 0
+    while pos < count:
+        var h = c.small()
+        var left = count - pos
+        if h & 1 == 1:
+            var groups = h >> 1
+            var take = left if groups >= (left + 7) // 8 else groups * 8
+            var nbytes = (take + 7) // 8
+            c.need(nbytes)
+            _assign_bits(bits, pos, UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos), take)
+            c.pos += nbytes
+            pos += take
+        else:
+            var v = c.le(1) & 1
+            var run = min(h >> 1, left)
+            if v == 1:
+                _set_ones(bits, pos, run)
+            pos += run
+
+
+def _page_bytes(codec: Int, src: Int, n: Int, size: Int, mut owner: List[UInt8]) raises -> Int:
+    """The address of `size` uncompressed bytes: the page itself when it is not compressed, else a decompressed copy
+    held in `owner`."""
+    if codec == UNCOMPRESSED:
+        if n != size or n < 0:
+            raise Error("an uncompressed Parquet page has two different sizes (corrupt file)")
+        return src
+    owner = _decompress(codec, src, n, size)
+    return Int(owner.unsafe_ptr())
+
+
+def _identity(leaf: _Leaf) -> Bool:
+    """A plain integer of this leaf is stored as it is (no timestamp-to-day, no unsigned handling)."""
+    return not _is_timestamp(leaf) and not (_is_unsigned(leaf) and leaf.logical != 5 and leaf.converted != CT_DECIMAL)
+
+
+def _plain_into(mut c: _Bytes, leaf: _Leaf, ctx: _Ctx, count: Int, dout: UnsafePointer[Int64, MutAnyOrigin], tbl: Int,
+                store: Bool) raises:
+    """`count` PLAIN values to dout[0..count). `store` False (a dictionary build): TEXT words are added, nothing written."""
+    if count < 0:
+        raise Error("column `" + leaf.name + "`: a page has a negative value count (corrupt file)")
+    if leaf.ptype == PT_BOOLEAN:
+        c.need((count + 7) // 8)
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
+        for i in range(count):
+            dout[i] = Int64((p[i >> 3] >> UInt8(i & 7)) & 1)
+        c.pos += (count + 7) // 8
+    elif leaf.ptype == PT_INT32:
+        if count > (c.n - c.pos) // 4:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos).bitcast[Int32]()
+        if _identity(leaf):
+            var i = 0
+            while i + 4 <= count:
+                dout.store[width=4, alignment=1](i, (p + i).load[width=4, alignment=1]().cast[DType.int64]())
+                i += 4
+            while i < count:
+                dout[i] = Int64((p + i).load[alignment=1]())
+                i += 1
+        else:
+            for i in range(count):
+                dout[i] = _to_stored(leaf, Int64((p + i).load[alignment=1]()))
+        c.pos += count * 4
+    elif leaf.ptype == PT_INT64:
+        if count > (c.n - c.pos) // 8:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos).bitcast[Int64]()
+        if _identity(leaf):
+            var i = 0
+            while i + 4 <= count:
+                dout.store[width=4, alignment=1](i, (p + i).load[width=4, alignment=1]())
+                i += 4
+            while i < count:
+                dout[i] = (p + i).load[alignment=1]()
+                i += 1
+        else:
+            for i in range(count):
+                dout[i] = _to_stored(leaf, (p + i).load[alignment=1]())
+        c.pos += count * 8
+    elif leaf.ptype == PT_BYTE_ARRAY:
+        for i in range(count):
+            var n = Int(c.le(4)) & 0xFFFFFFFF
+            c.need(n)
+            if not _valid_utf8(c.base + c.pos, n):
+                raise Error("column `" + leaf.name + "`: a text value is not valid UTF-8")
+            var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](
+                unsafe_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos), length=n))
+            c.pos += n
+            var code: Int
+            if ctx.gcol != 0:
+                code = UnsafePointer[Column, MutAnyOrigin](unsafe_from_address=ctx.gcol)[].codes.get(s, -1)
+                if code < 0:
+                    raise Error("column `" + leaf.name + "`: a word is missing from the file's dictionary (corrupt file)")
+            else:
+                code = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=tbl)[].add_word(ctx.col, s)
+            if store:
+                dout[i] = Int64(code)
+    elif leaf.ptype == PT_FIXED:                        # a big-endian two's-complement decimal
+        var w = leaf.type_length
+        if w < 1 or w > 16:
+            raise Error("column `" + leaf.name + "` has a fixed length of " + String(w) + " bytes (corrupt file)")
+        if count > (c.n - c.pos) // w:
+            raise Error("a Parquet page ends early (corrupt file)")
+        for i in range(count):
+            var v: Int64 = -1 if c.at(c.pos) >= 0x80 else 0
+            for k in range(w):
+                v = (v << 8) | Int64(c.at(c.pos + k))
+            c.pos += w
+            dout[i] = v
+    else:
+        raise Error("column `" + leaf.name + "`: its physical type cannot be read yet")
+
+
+def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: UnsafePointer[Int64, MutAnyOrigin]) raises:
+    """`count` dictionary indices (a bit width, then the RLE / bit-packed hybrid) gathered through `dict` into dout."""
+    var w = c.byte()
+    if w > 64:
+        raise Error("a Parquet page has a bit width of " + String(w) + " (corrupt file)")
+    var d = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(dict.unsafe_ptr()))
+    var dn = len(dict)
+    var got = 0
+    while got < count:
+        var h = c.small()
+        var left = count - got
+        if h & 1 == 1:
+            var groups = h >> 1
+            var take = left if groups >= (left + 7) // 8 else groups * 8
+            if w == 0:
+                if dn < 1:
+                    raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                for i in range(take):
+                    dout[got + i] = d[0]
+            elif w <= 32:
+                if take > ((c.n - c.pos) * 8) // w:
+                    raise Error("a Parquet page ends early (corrupt file)")
+                var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
+                var mask = (UInt64(1) << UInt64(w)) - 1
+                var acc: UInt64 = 0
+                var have = 0
+                var at = 0
+                for i in range(take):
+                    while have < w:
+                        acc |= UInt64(p[at]) << UInt64(have)
+                        at += 1
+                        have += 8
+                    var ix = Int(acc & mask)
+                    acc >>= UInt64(w)
+                    have -= w
+                    if ix >= dn:
+                        raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                    dout[got + i] = d[ix]
+                c.pos += (take * w + 7) // 8
+            else:
+                var idx = List[Int64]()
+                _unpack(c, w, take, idx)
+                for i in range(take):
+                    if idx[i] < 0 or Int(idx[i]) >= dn:
+                        raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                    dout[got + i] = d[Int(idx[i])]
+            got += take
+        else:
+            var v = c.le((w + 7) // 8) if w > 0 else 0
+            if w > 0 and w < 64:
+                v &= Int64((UInt64(1) << UInt64(w)) - 1)
+            if v < 0 or Int(v) >= dn:
+                raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+            var run = min(h >> 1, left)
+            var x = d[Int(v)]
+            for i in range(run):
+                dout[got + i] = x
+            got += run
+
+
+def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raises:
+    """Decodes one data page into the column slice at `dst` (0: only add the words of a TEXT page, store nothing)."""
+    var owner = List[UInt8]()
+    var c: _Bytes
+    var present = p.nvals
+    var nobits = List[UInt8](length=8, fill=0)
+    var bits_p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(nobits.unsafe_ptr()))
+    if ctx.optional:
+        p.bits = List[UInt8](length=(p.nvals + 7) // 8 + 1, fill=0)
+        bits_p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
+    if p.v2:
+        var lv = p.def_len
+        if lv < 0 or lv > p.csize or lv > p.usize:
+            raise Error("column `" + leaf.name + "`: the definition levels are longer than their page (corrupt file)")
+        if ctx.optional:
+            var lc = _Bytes(p.addr, lv)
+            _levels_to_bits(lc, p.nvals, bits_p)
+        var at = _page_bytes(ctx.codec if p.v2_compressed else UNCOMPRESSED, p.addr + lv, p.csize - lv, p.usize - lv, owner)
+        c = _Bytes(at, p.usize - lv)
+    else:
+        var at = _page_bytes(ctx.codec, p.addr, p.csize, p.usize, owner)
+        c = _Bytes(at, p.usize)
+        if ctx.optional:
+            if p.def_enc == ENC_BIT_PACKED:                      # deprecated: most significant bit first, no length
+                var nb = (p.nvals + 7) // 8
+                c.need(nb)
+                for i in range(p.nvals):
+                    if (c.at(c.pos + i // 8) >> (7 - i % 8)) & 1 == 1:
+                        bits_p[i >> 3] |= UInt8(1) << UInt8(i & 7)
+                c.pos += nb
+            elif p.def_enc == ENC_RLE:
+                var ln = Int(c.le(4)) & 0xFFFFFFFF
+                c.need(ln)
+                var lc = _Bytes(c.base + c.pos, ln)
+                _levels_to_bits(lc, p.nvals, bits_p)
+                c.pos += ln
+            else:
+                raise Error("column `" + leaf.name + "`: definition levels use encoding " + String(p.def_enc) + ", not supported")
+    if ctx.optional:
+        present = _count_bits(bits_p, p.nvals)
+    var store = dst != 0
+    var nowhere = List[Int64](length=8, fill=0)               # a words-only build stores nothing (a TEXT page never reaches this)
+    var dout = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=dst if store else Int(nowhere.unsafe_ptr()))
+    if p.encoding == ENC_PLAIN:
+        _plain_into(c, leaf, ctx, present, dout, tbl, store)
+    elif p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
+        _dict_into(c, leaf, ctx.dict, present, dout)
+    elif p.encoding == ENC_DELTA_BINARY_PACKED and (leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64):
+        var raw = List[Int64]()
+        _ = _delta_binary_packed(c, leaf.ptype == PT_INT32, present, raw)
+        if len(raw) < present:
+            raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
+        for i in range(present):
+            dout[i] = _to_stored(leaf, raw[i])
+    elif p.encoding == ENC_RLE and leaf.ptype == PT_BOOLEAN:
+        _ = c.le(4)                                       # a length prefix
+        var vals = List[Int64]()
+        _rle_hybrid(c, 1, present, vals)
+        if len(vals) < present:
+            raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
+        for i in range(present):
+            dout[i] = vals[i]
+    else:
+        raise Error("column `" + leaf.name + "`: Parquet encoding " + String(p.encoding) + " is not supported yet")
+    p.nulls = p.nvals - present
+    if p.nulls > 0 and store:                             # spread the values over the rows, backwards
+        var k = present - 1
+        for row in range(p.nvals - 1, -1, -1):
+            if _get_bit(bits_p, row):
+                dout[row] = dout[k]
+                k -= 1
+            else:
+                dout[row] = 0
+    elif p.nulls == 0:
+        p.bits = List[UInt8]()
+    _ = owner^
+    _ = nobits^
+    _ = nowhere^
+
+
+def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx, ctx_at: Int, mut t: Table,
+                mut pages: List[_Page], words_only: Bool) raises:
+    """Reads a chunk's page headers (`base` + file offset = the page's address; `n` bounds the offsets). A dictionary
+    page is decoded now; each data page is appended to `pages`."""
     var pos = meta.dict_off if meta.dict_off > 0 and meta.dict_off < meta.data_off else meta.data_off
-    var dictionary = List[Int64]()
     var done = 0
-    var optional = leaf.repetition == OPTIONAL
     comptime if NO_CODECS:
         if meta.codec == ZSTD or meta.codec == SNAPPY:
             raise Error("column `" + leaf.name + "` is " + ("zstd" if meta.codec == ZSTD else "snappy") +
@@ -1054,88 +1428,100 @@ def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, 
         if ptype == PAGE_DICTIONARY:
             var page = _decompress(meta.codec, base + body_at, csize, usize)
             var c = _Bytes(Int(page.unsafe_ptr()), len(page))
-            dictionary.clear()
-            _plain(c, leaf, nvals, t, col, dictionary, gcol)
+            ctx.dict.clear()
+            _plain(c, leaf, nvals, t, ctx.col, ctx.dict, ctx.gcol)
             _ = page^
             continue
         if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
             continue                                     # an index page: not needed
         if nvals > meta.values - done:
             raise Error("column `" + leaf.name + "`: a page holds more values than its column chunk (corrupt file)")
-        if words_only and (encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY):
+        var dict_coded = encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY
+        if words_only and dict_coded:
             done += nvals
             continue
-        var levels = List[Int64]()
-        var page: List[UInt8]
-        var c: _Bytes
-        if ptype == PAGE_DATA_V2:
-            var lv = def_len
-            if lv < 0 or lv > csize or lv > usize:
-                raise Error("column `" + leaf.name + "`: the definition levels are longer than their page (corrupt file)")
-            if optional:
-                var lc = _Bytes(base + body_at, lv)
-                _rle_hybrid(lc, 1, nvals, levels)
-            if v2_compressed:
-                page = _decompress(meta.codec, base + body_at + lv, csize - lv, usize - lv)
-            else:
-                page = _decompress(UNCOMPRESSED, base + body_at + lv, csize - lv, usize - lv)
-            c = _Bytes(Int(page.unsafe_ptr()), len(page))
-        else:
-            page = _decompress(meta.codec, base + body_at, csize, usize)
-            c = _Bytes(Int(page.unsafe_ptr()), len(page))
-            if optional:
-                if def_enc == ENC_BIT_PACKED:                   # deprecated: most significant bit first, no length
-                    var nb = (nvals + 7) // 8
-                    c.need(nb)
-                    for i in range(nvals):
-                        levels.append(Int64((c.at(c.pos + i // 8) >> (7 - i % 8)) & 1))
-                    c.pos += nb
-                elif def_enc == ENC_RLE:
-                    var ln = Int(c.le(4)) & 0xFFFFFFFF
-                    c.need(ln)
-                    var lc = _Bytes(c.base + c.pos, ln)
-                    _rle_hybrid(lc, 1, nvals, levels)
-                    c.pos += ln
-                else:
-                    raise Error("column `" + leaf.name + "`: definition levels use encoding " + String(def_enc) + ", not supported")
-        var present = nvals
-        if optional:
-            present = 0
-            for lvl in levels:
-                present += Int(lvl)
-        var vals = List[Int64]()
-        if encoding == ENC_PLAIN:
-            _plain(c, leaf, present, t, col, vals, gcol)
-        elif encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY:
-            var w = c.byte()
-            var idx = List[Int64]()
-            _rle_hybrid(c, w, present, idx)
-            for i in idx:
-                if i < 0 or Int(i) >= len(dictionary):
-                    raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
-                vals.append(dictionary[Int(i)])
-        elif encoding == ENC_DELTA_BINARY_PACKED and (leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64):
-            var raw = List[Int64]()
-            _ = _delta_binary_packed(c, leaf.ptype == PT_INT32, present, raw)
-            for v in raw:
-                vals.append(_to_stored(leaf, v))
-        elif encoding == ENC_RLE and leaf.ptype == PT_BOOLEAN:
-            _ = c.le(4)                                   # a length prefix
-            _rle_hybrid(c, 1, present, vals)
-        else:
-            raise Error("column `" + leaf.name + "`: Parquet encoding " + String(encoding) + " is not supported yet")
-        if len(vals) < present:
-            raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
-        if not words_only:
-            var k = 0
-            for i in range(nvals):
-                if optional and levels[i] == 0:
-                    t.append_null(col)
-                else:
-                    t.cols[col].push(vals[k], True)             # already checked: codes from add_word, 0 / 1 bits
-                    k += 1
+        var serial = leaf.ptype == PT_BYTE_ARRAY and ctx.gcol == 0 and encoding == ENC_PLAIN
+        pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
+                           v2_compressed, ctx_at, ctx.row0 + done, serial, 0, List[UInt8](), String()))
         done += nvals
-        _ = page^
+
+
+def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf_ids: List[Int], out_cols: List[Int],
+                  gcols: List[Int], leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False) raises:
+    """Decodes one row group: chunk k (`metas[k]`, at `bases[k]` / `ns[k]`, leaf `leaf_ids[k]`) becomes rows
+    row0.. of table column `out_cols[k]`, whose TEXT words come from `gcols[k]` (a file-wide dictionary) or are added
+    to the table (0). `words_only`: only the TEXT words are added to the table (a dictionary build)."""
+    if len(metas) == 0:
+        return
+    var ctxs = List[_Ctx]()
+    var pages = List[_Page]()
+    var rows = -1
+    for k in range(len(metas)):
+        ctxs.append(_Ctx(leaf_ids[k], out_cols[k], metas[k].codec, leaves[leaf_ids[k]].repetition == OPTIONAL, gcols[k],
+                         List[Int64](), row0, metas[k].values))
+        if rows < 0:
+            rows = metas[k].values
+        elif metas[k].values != rows:
+            raise Error("column `" + leaves[leaf_ids[k]].name + "` has " + String(metas[k].values) + " rows in this row group, column `" +
+                        leaves[leaf_ids[0]].name + "` has " + String(rows) + " (corrupt file)")
+        _walk_chunk(bases[k], ns[k], metas[k], leaves[leaf_ids[k]], ctxs[k], k, t, pages, words_only)
+    var tbl = Int(UnsafePointer(to=t))
+    if not words_only:
+        for k in range(len(out_cols)):                  # size the columns once: the pages add up to the rows
+            ref col = t.cols[out_cols[k]]
+            if len(col.values) != row0:
+                raise Error("column `" + col.name + "`: rows do not line up (corrupt file)")
+            col.values.resize(row0 + rows, 0)
+            if len(col.validity) > 0:                    # a bitmap that exists covers every row
+                col.validity.resize((row0 + rows + 7) // 8, 0xFF)
+    for i in range(len(pages)):                         # words are added in file order
+        if pages[i].serial:
+            ref ctx = ctxs[pages[i].ctx]
+            var dst = 0
+            if not words_only:
+                dst = Int(t.cols[ctx.col].values.unsafe_ptr()) + pages[i].row * 8
+            _decode_page(pages[i], ctx, leaves[ctx.leaf], dst, tbl)
+    if words_only:
+        return
+    var parallel = List[Int]()
+    for i in range(len(pages)):
+        if not pages[i].serial:
+            parallel.append(i)
+    var pa = Int(pages.unsafe_ptr())
+    var ca = Int(ctxs.unsafe_ptr())
+    var la = Int(leaves.unsafe_ptr())
+    var cola = Int(t.cols.unsafe_ptr())
+    var ja = Int(parallel.unsafe_ptr())
+    def job(j: Int) {imm}:
+        var page = Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa)
+        var i = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ja)[j]
+        ref p = (page + i)[]
+        ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+        ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
+        ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
+        try:
+            _decode_page(p, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+        except e:
+            p.err = String(e)
+    if len(parallel) == 1:
+        job(0)
+    elif len(parallel) > 1:
+        par_n(job, len(parallel), min(len(parallel), core_count()))
+    _ = parallel^
+    for i in range(len(pages)):
+        if pages[i].err.byte_length() > 0:
+            raise Error(pages[i].err)
+    for i in range(len(pages)):                         # nulls and validity bitmaps, in page order
+        ref p = pages[i]
+        ref col = t.cols[ctxs[p.ctx].col]
+        col.nulls += p.nulls
+        if p.nulls > 0:
+            if len(col.validity) == 0:
+                col.validity = List[UInt8](length=(len(col.values) + 7) // 8, fill=0xFF)
+            _assign_bits(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(col.validity.unsafe_ptr())), p.row,
+                         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr())), p.nvals)
+    _ = pages^
+    _ = ctxs^
 
 
 # ── scanning: a file bigger than memory, one row group at a time (F-140) ─────────────────────────────
@@ -1186,21 +1572,20 @@ def _file_size(file: FileHandle, path: String) raises -> Int:
     return size
 
 
-def _read_chunk_mapped(fd: Int, size: Int, path: String, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, col: Int,
-                       words_only: Bool = False, gcol: Int = 0) raises:
-    """One column chunk, read through a mapping of just its bytes (never the whole file). Known limit: if the file is
-    truncated while this mapping is being decoded, touching a vanished page is a bus error; a change between row
-    groups is caught by `_check_unchanged`."""
+def _chunk_source(fd: Int, size: Int, path: String, meta: _ChunkMeta, leaf: _Leaf, mut maps: List[_Mapped]) raises -> Tuple[Int, Int]:
+    """Maps one column chunk's bytes (never the whole file); returns the (base, bound) `_walk_chunk` takes: base + a
+    file offset is that byte's address, bound is the offset just past the chunk. Known limit: if the file is truncated
+    while the mapping is decoded, touching a vanished page is a bus error; a change between row groups is caught by
+    `_check_unchanged`."""
     if meta.values == 0:
-        return
+        return (0, 0)
     var lo = meta.dict_off if meta.dict_off > 0 and meta.dict_off < meta.data_off else meta.data_off
     if lo <= 0 or meta.size <= 0 or meta.size > size - lo:
         raise Error("column `" + leaf.name + "`: a column chunk lies outside the file (corrupt file)")
     var m = _Mapped(fd, lo, meta.size, path)
-    # the page walker takes file offsets: shift the base so that offset `lo` is the mapping's first byte; the
-    # chunk's end is the walker's bound
-    _read_chunk(m.data - lo, lo + meta.size, meta, leaf, t, col, words_only, gcol)
-    m.release()
+    var base = m.data - lo
+    maps.append(m^)
+    return (base, lo + meta.size)
 
 
 struct _ScanInfo(Movable):
@@ -1298,8 +1683,10 @@ struct ParquetScan(Copyable, Movable):
         ref info = self._info[]
         info.check_unchanged()
         for g in range(len(info.groups)):
-            _read_chunk_mapped(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c],
-                               info.dicts, c, words_only=True)
+            var maps = List[_Mapped]()
+            var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
+            _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [0], info.leaves, 0, info.dicts, words_only=True)
+            _ = maps^
         info.loaded[c] = True
 
     def word_count(self, c: Int) raises -> Int:
@@ -1324,12 +1711,23 @@ struct ParquetScan(Copyable, Movable):
         ref info = self._info[]
         info.check_unchanged()
         var t = Table.empty()
+        var maps = List[_Mapped]()
+        var bases = List[Int]()
+        var ns = List[Int]()
+        var metas = List[_ChunkMeta]()
+        var outs = List[Int]()
+        var gcols = List[Int]()
         for k in range(len(cols)):
             var c = cols[k]
             _ = t.add_column(self.schema.name(c), self.schema.kind(c), scale=self.schema.scale(c))
-            var gcol = Int(info.dicts.cols.unsafe_ptr() + c) if self.schema.kind(c) == TEXT else 0
-            _read_chunk_mapped(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], t, k,
-                               gcol=gcol)
+            var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
+            bases.append(src[0])
+            ns.append(src[1])
+            metas.append(info.groups[g][c].copy())
+            outs.append(k)
+            gcols.append(Int(info.dicts.cols.unsafe_ptr() + c) if self.schema.kind(c) == TEXT else 0)
+        _decode_group(bases, ns, metas, cols, outs, gcols, info.leaves, 0, t)
+        _ = maps^
         t.check()
         return t^
 
