@@ -28,7 +28,7 @@ from std.memory import Pointer
 from .table import SharedTable
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
-                   N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT)
+                   N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP
 from .kernels.pipeline_gpu import run_pipeline_gpu
 from .gpu import DeviceTable
@@ -397,14 +397,19 @@ def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
             var a = stack.pop()
             if not a.boolean:
                 raise Error("internal: int() of a number")
-            var r = p.reg()
-            p.emit(OP_F2I, r, a.reg)
-            stack.append(_Slot(r, False, -1))
+            p.emit(OP_F2I, a.reg, a.reg)                 # in place: an operator's result takes its operand's register
+            stack.append(_Slot(a.reg, False, -1))
+        elif n.op == N_SCALE_TO:                         # a formula's rescaled side: the value is already scaled up
+            var a = stack.pop()
+            if a.boolean:
+                raise Error("internal: a rescaled comparison")
+            stack.append(_Slot(a.reg, False, Int(n.value)))
         elif n.op == N_NEG or n.op == N_NOT:
             var a = stack.pop()
             if a.boolean != (n.op == N_NOT):
                 raise Error("`" + _op_name(n.op) + "` needs " + ("a comparison" if n.op == N_NOT else "a number") +
                             ", got " + ("a number" if n.op == N_NOT else "a comparison"))
+            p.temp_top = a.reg                           # operands are freed: the result takes the first one's register
             var r = p.reg()
             if n.op == N_NOT:
                 p.emit(OP_NOT, r, a.reg)
@@ -424,6 +429,7 @@ def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
                a.scale >= 0 and b.scale >= 0 and a.scale != b.scale:
                 raise Error("`" + _op_name(n.op) + "` meets values with " + String(a.scale) + " and " + String(b.scale) +
                             " decimal places: the stored integers would not line up (decimal-aware formulas: F-136)")
+            p.temp_top = a.reg                           # both operands are freed (a, b are the two newest registers)
             var r = p.reg()
             var scale = a.scale if a.scale >= 0 else b.scale
             if n.op == N_ADD:

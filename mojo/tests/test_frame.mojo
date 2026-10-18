@@ -174,6 +174,17 @@ def test_formulas_follow_the_apps_decimal_rules() raises:
     expect(len(deps) == 3, "cost is read by margin, mixed, big: got " + String(len(deps)))
     var sums = Query(f).agg(sum(col("mixed")), sum(col("taxed"))).compute()
     expect(sums.values(0)[0] == 1025 and sums.values(1)[0] == 156, "aggregations over formulas run in the kernel")
+    # a side brought to the other's scale (qty * 100) must still pass the query compiler's scale check
+    _ = f.formula("plain = revenue + qty")
+    _ = f.formula("less = cost - qty")
+    _ = f.formula("top = max(revenue, qty)")
+    var aligned = Query(f).agg(sum(col("plain")), sum(col("big")), sum(col("less")), sum(col("top"))).compute()
+    expect(aligned.values(0)[0] == 1550, "12.50 + 3 = 15.50, got " + String(aligned.values(0)[0]))
+    expect(aligned.values(1)[0] == 200, "big in a query, got " + String(aligned.values(1)[0]))
+    expect(aligned.values(2)[0] == 75, "3.75 - 3 = 0.75, got " + String(aligned.values(2)[0]))
+    expect(aligned.values(3)[0] == 1250, "max(12.50, 3), got " + String(aligned.values(3)[0]))
+    var scaled = Query(f).where(col("plain") > 1500).agg(count()).compute()
+    expect(scaled.counts[0] == 1, "a filter over an aligned formula")
 
 
 def test_formula_errors_are_readable() raises:
@@ -204,6 +215,50 @@ def test_formula_errors_are_readable() raises:
     expect(cycle, "a formula cycle raises")
 
 
+def test_a_refused_redefinition_leaves_the_frame_as_it_was() raises:
+    var t = Table.empty()
+    var a = t.add_column("a", INT)
+    t.append(a, 4)
+    var f = Frame(t^.share())
+    var p = f.formula("p = a + 1")
+    var q = f.formula("q = p * 2")
+    var edits = f.edits
+    var refused = False
+    try:
+        _ = f.formula("p = q + 1")
+    except e:
+        refused = "cycle" in String(e)
+    expect(refused and f.edits == edits and f.columns() == 3, "the cycle is refused and nothing moves")
+    expect(f.formula_text(p) == "p = a + 1" and f.get(p, 0) == 5 and f.get(q, 0) == 10, "p and q read as before")
+    var sums = Query(f).agg(sum(col("p")), sum(col("q"))).compute()
+    expect(sums.values(0)[0] == 5 and sums.values(1)[0] == 10, "queries over p and q still run")
+    var other = False
+    try:
+        _ = f.formula("p = nope + 1")
+    except e:
+        other = "not found" in String(e)
+    expect(other and f.get(p, 0) == 5, "an unknown column leaves p alone too")
+
+
+def test_redefining_a_formula_refreshes_what_reads_it() raises:
+    var t = Table.empty()
+    var r = t.add_column("revenue", DECIMAL, scale=2)
+    var q = t.add_column("qty", INT)
+    t.append(r, 1250)
+    t.append(q, 3)
+    var f = Frame(t^.share())
+    var a = f.formula("a = revenue")
+    var b = f.formula("b = a * qty")
+    var c = f.formula("c = b + a")
+    expect(f.scale(b) == 2 and f.get(b, 0) == 3750 and f.get(c, 0) == 5000, "before: 37.50 and 50.00")
+    _ = f.formula("a = qty")
+    expect(f.scale(a) == 0 and f.scale(b) == 0 and f.scale(c) == 0, "scales follow the new definition")
+    expect(f.get(b, 0) == 9 and f.get(c, 0) == 12, "3 * 3 and 9 + 3, got " + String(f.get(b, 0)) + " " + String(f.get(c, 0)))
+    expect(f.formula_text(b) == "b = a * qty", "the text is kept")
+    var s = Query(f).agg(sum(col("b")), sum(col("c"))).compute()
+    expect(s.values(0)[0] == 9 and s.values(1)[0] == 12, "queries use the new definition")
+
+
 def test_permutation_is_stable_alphabetical_and_sees_edits() raises:
     var t = Table.empty()
     var g = t.add_column("name", TEXT)
@@ -226,6 +281,65 @@ def test_permutation_is_stable_alphabetical_and_sees_edits() raises:
         expect(by_v[i] == want_v[i], "by v desc at " + String(i) + ": " + String(by_v[i]))
     f.remove(0)
     expect(len(f.permutation(1)) == 5, "removed rows are not in the order")
+
+
+def test_text_sorts_ignoring_case_with_bytes_as_the_tie_break() raises:
+    var t = Table.empty()
+    var g = t.add_column("name", TEXT)
+    var names: List[String] = ["Zebra", "apple", "banana", "Apple", "zebra", "Banana", "ab", "AB", "a"]
+    for n in names:
+        t.append_text(g, n)
+    var f = Frame(t^.share())
+    var order = f.permutation(0)
+    var want: List[String] = ["a", "AB", "ab", "Apple", "apple", "Banana", "banana", "Zebra", "zebra"]
+    for i in range(len(want)):
+        expect(names[order[i]] == want[i], "at " + String(i) + ": " + names[order[i]] + " instead of " + want[i])
+
+
+def test_the_null_marker_cannot_be_typed() raises:
+    var t = Table.empty()
+    var a = t.add_column("a", INT)
+    var d = t.add_column("d", DECIMAL, scale=2)
+    t.append(a, 1)
+    t.append(d, 100)
+    var f = Frame(t^.share())
+    var msgs = List[String]()
+    try:
+        f.set_text(a, 0, "-9223372036854775807")
+    except e:
+        msgs.append(String(e))
+    try:
+        f.set_text(d, 0, "-92233720368547758.07")
+    except e:
+        msgs.append(String(e))
+    try:
+        _ = f.append(["-9223372036854775807", ""])
+    except e:
+        msgs.append(String(e))
+    try:
+        _ = f.append(["1", "-92233720368547758.07"])
+    except e:
+        msgs.append(String(e))
+    expect(len(msgs) == 4 and "reserved" in msgs[0] and "reserved" in msgs[1] and "reserved" in msgs[2] and "reserved" in msgs[3],
+           "four refusals")
+    expect(f.rows() == 1 and f.get(a, 0) == 1 and not f.is_null(a, 0) and f.get(d, 0) == 100 and len(f.log) == 0,
+           "nothing was entered")
+    f.set_text(a, 0, "-9223372036854775806")
+    expect(f.get(a, 0) == -9223372036854775806, "the next value up is fine")
+
+
+def test_a_dead_row_does_not_leave_a_word_behind() raises:
+    var t = Table.empty()
+    var g = t.add_column("g", TEXT)
+    t.append_text(g, "x")
+    var f = Frame(t^.share())
+    f.remove(0)
+    var refused = False
+    try:
+        f.set_text(g, 0, "new")
+    except e:
+        refused = "does not exist" in String(e)
+    expect(refused and f.code_of(g, "new") == -1, "the word was not added")
 
 
 def test_edits_check_their_values() raises:
@@ -257,7 +371,123 @@ def test_edits_check_their_values() raises:
            "row 9 does not exist" in msgs[3], "messages")
 
 
+def words_table(n: Int, words: Int) raises -> SharedTable:
+    var t = Table.empty()
+    var g = t.add_column("name", TEXT)
+    var v = t.add_column("v", INT)
+    var d = t.add_column("cost", DECIMAL, scale=2)
+    for w in range(words):
+        _ = t.add_word(g, "w" + String(w))
+    var rng = Rng(3)
+    for _ in range(n):
+        t.append(g, Int64(rng.int(0, words - 1)))
+        t.append(v, Int64(rng.int(1, 50)))
+        t.append(d, Int64(rng.int(0, 100_00)))
+    return t^.share()
+
+
+def test_a_merge_of_many_values_queries_like_its_baked_table() raises:
+    var t = words_table(3000, 14)
+    var f = Frame(t)
+    var codes: List[Int64] = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    expect(f.merge(0, codes, 0) == 9, "nine values merged")
+    var again: List[Int64] = [0]
+    expect(f.merge(0, again, 12) == 1, "a merge that repoints the earlier ones")
+    var more: List[Int64] = [13, 10]
+    _ = f.merge(0, more, 11)
+    var baked = f.bake().share()
+    var got = Query(f).group_by(col("name"), groups=14).agg(sum(col("v")), count(), max_of(col("cost"))).compute()
+    var want = Query(baked).group_by(col("name"), groups=14).agg(sum(col("v")), count(), max_of(col("cost"))).compute()
+    same(got, want, "group by a many-times merged column")
+    expect(got.counts[12] > 0 and got.counts[0] == 0 and got.counts[5] == 0 and got.counts[13] == 0, "everything folded")
+    var g2 = Query(f).where(col("name") == 12).agg(sum(col("v")), count()).compute()
+    var w2 = Query(baked).where(col("name") == 12).agg(sum(col("v")), count()).compute()
+    same(g2, w2, "where on a merged column")
+    expect(g2.counts[0] > 0, "the filter finds the folded rows")
+
+
+def test_where_on_a_formula_equals_the_baked_table() raises:
+    var t = base_table(4000)
+    var f = Frame(t)
+    f.set(f.column("revenue"), 7, 9_000_00)
+    _ = f.append(["East", "3", "12.50", "1.00", "4"])
+    f.remove(9)
+    _ = f.formula("margin = revenue - cost")
+    var got = Query(f).where(col("margin") > 100000).group_by(col("region"), groups=8).agg(sum(col("qty")), count()).compute()
+    var baked = f.bake().share()
+    var want = Query(baked).where(col("revenue") - col("cost") > 100000).group_by(col("region"), groups=8).agg(
+        sum(col("qty")), count()).compute()
+    same(got, want, "where on a formula")
+    var total = 0
+    for g in range(8):
+        total += got.counts[g]
+    expect(total > 0, "some rows pass")
+
+
+def test_a_group_whose_shared_rows_are_all_edited() raises:
+    var t = Table.empty()
+    var g = t.add_column("g", INT)
+    var v = t.add_column("v", INT)
+    for i in range(6):
+        t.append(g, Int64(i % 2))
+        t.append(v, Int64(10 + i))
+    var f = Frame(t^.share())
+    for row in range(6):
+        if row % 2 == 1:
+            f.set(v, row, Int64(100 * (row + 1)))      # group 1: 200, 400, 600, all edited
+    var r = Query(f).group_by(col("g"), groups=2).agg(min_of(col("v")), max_of(col("v")), sum(col("v")), count()).compute()
+    expect(r.values(0)[0] == 10 and r.values(1)[0] == 14 and r.counts[0] == 3, "group 0 is untouched")
+    expect(r.values(0)[1] == 200 and r.values(1)[1] == 600 and r.values(2)[1] == 1200 and r.counts[1] == 3,
+           "group 1: min 200 max 600, got " + String(r.values(0)[1]) + " " + String(r.values(1)[1]))
+    var want = Query(f.bake().share()).group_by(col("g"), groups=2).agg(
+        min_of(col("v")), max_of(col("v")), sum(col("v")), count()).compute()
+    same(r, want, "baked")
+
+
+def test_a_frame_with_only_appended_rows() raises:
+    var t = base_table(5000)
+    var f = Frame(t)
+    _ = f.append(["East", "3", "12.50", "1.00", "4"])
+    _ = f.append(["West", "1", "", "2.00", "5"])
+    expect(len(f.overlay().mask) == 0, "no mask when no shared row changed")
+    var got = queries_on_frame(f)
+    var want = queries_on_table(f.bake().share())
+    for i in range(len(got)):
+        same(got[i], want[i], "appended-only query " + String(i))
+    f.remove(1)                                            # a shared row now: the mask appears
+    expect(len(f.overlay().mask) > 0, "a mask once a shared row changes")
+
+
+def test_a_group_nulled_only_by_edits_is_not_present() raises:
+    var t = Table.empty()
+    var g = t.add_column("g", INT)
+    var v = t.add_column("v", INT)
+    t.append(g, 0)
+    t.append(v, 5)
+    t.append(g, 1)
+    t.append(v, 6)
+    t.append(g, 1)
+    t.append(v, 7)
+    var f = Frame(t^.share())
+    f.set_null(v, 1)
+    f.set_null(v, 2)
+    var r = Query(f).group_by(col("g"), groups=2).agg(sum(col("v")), min_of(col("v")), count(), count(col("v"))).compute()
+    expect(r.present(0, 0) and r.values(0)[0] == 5 and r.counts[0] == 1, "group 0")
+    expect(not r.present(0, 1) and not r.present(1, 1), "group 1 has rows but every value is null")
+    expect(r.counts[1] == 2, "its rows still count")
+
+
 def main() raises:
+    test_a_refused_redefinition_leaves_the_frame_as_it_was()
+    test_redefining_a_formula_refreshes_what_reads_it()
+    test_text_sorts_ignoring_case_with_bytes_as_the_tie_break()
+    test_the_null_marker_cannot_be_typed()
+    test_a_dead_row_does_not_leave_a_word_behind()
+    test_a_merge_of_many_values_queries_like_its_baked_table()
+    test_where_on_a_formula_equals_the_baked_table()
+    test_a_group_whose_shared_rows_are_all_edited()
+    test_a_frame_with_only_appended_rows()
+    test_a_group_nulled_only_by_edits_is_not_present()
     test_formulas_follow_the_apps_decimal_rules()
     test_formula_errors_are_readable()
     test_permutation_is_stable_alphabetical_and_sees_edits()
