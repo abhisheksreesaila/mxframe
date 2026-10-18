@@ -3,6 +3,10 @@
 # failure). Usage: pixi run mojo-test [test files...]
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
+# Mojo's compiler writes its temporaries to TMPDIR; /tmp is a shared tmpfs that other projects fill (builds failed
+# with "Disk quota exceeded"), so use a disk-backed directory, as scripts/run_tests.sh does.
+export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
+mkdir -p "$TMPDIR"
 bash "$root/scripts/build_mojo_pkg.sh" > "$root/build/pkg-build.log" 2>&1 || { grep -E "error:" -A4 "$root/build/pkg-build.log" | head -40; echo "FAIL (package build)"; exit 1; }
 lib="$root/.pixi/envs/default/lib"
 out="$root/build/mojo-tests"
