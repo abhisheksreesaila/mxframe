@@ -1062,10 +1062,9 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             todo.append(g)
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var spare = List[List[Int64]]()          # the value buffers of finished groups, written into again by the next decode
     var cur = Table.empty()
     if len(todo) > 0:
-        cur = scan.read_group_reusing(todo[0], used, spare)
+        cur = scan.read_group(todo[0], used)
     for ix in range(len(todo)):
         for k in range(len(used)):
             nulls[k] += cur.null_count(k)
@@ -1085,7 +1084,6 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             var sp = Int(UnsafePointer(to=scan))
             var pp = Int(UnsafePointer(to=part))
             var up = Int(UnsafePointer(to=used))
-            var spp = Int(UnsafePointer(to=spare))
             var np_nodes = Int(UnsafePointer(to=nodes))
             var next_group = todo[ix + 1]
             def both(i: Int) {imm}:
@@ -1099,9 +1097,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
                 else:
                     try:
                         Pointer[Table, MutUntrackedOrigin](unsafe_from_address=np)[] = Pointer[ParquetScan, MutUntrackedOrigin](
-                            unsafe_from_address=sp)[].read_group_reusing(
-                            next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
-                            Pointer[List[List[Int64]], MutUntrackedOrigin](unsafe_from_address=spp)[])
+                            unsafe_from_address=sp)[].read_group(
+                            next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[])
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e1p)[] = String(e)
             par_n(both, 2, 2)
@@ -1110,10 +1107,6 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             pending = e1^                            # the next group's decode error waits until this group is merged
         else:
             r = _run_cpu(part, _lower(part, nodes, True, False), 0)
-        for k in range(len(used)):                   # this group's buffers go back for the group after next
-            var done = List[Int64]()
-            swap(done, part._table[].cols[k].values)
-            spare.append(done^)
         _ = part^
         cur = nxt^
         for s in range(shape.n_slots):
