@@ -1281,6 +1281,15 @@ Needs: F-131 · Spec §1 · `mojo/mxframe/table.mojo`, test `mojo/tests/test_tab
 Needs: F-132 · Spec §2 ("Later")
 - [ ] export a Table as an Arrow struct array (int64 columns zero-copy, validity bitmaps, TEXT as dictionary<int64, utf8>, DECIMAL as int64 with its scale in field metadata or a decimal128 copy: decide), import one back; round trip with pyarrow from a Python test through a C-ABI shared library built from the package
 
+
+## F-140 Mojo API: a query over a Parquet file bigger than RAM (streamed row groups) [todo]
+Needs: F-135, F-137 · Spec §2, §5 · `mojo/mxframe/parquet.mojo`, `query.mojo` · Owner asked 2026-10-17 ("step 1": the cheap half of a disk tier; spilling joins / big group-bys is a later ticket)
+- [ ] `Query(scan_parquet(path))` (name to settle) runs `where` / `group_by` / `agg` over the file one row group at a time: only the columns the query reads are decoded, each row group becomes a Table, the kernel runs on it, the partial results merge (sums and counts add, min / max combine, mean = merged sum / merged count, `present` and int64 overflow exactly as one in-memory run). Peak memory is one row group (per worker) plus the result, not the file
+- [ ] TEXT keys and filters read the same as an in-memory read of the file: each row group's dictionary is mapped onto one file-wide dictionary as it streams (a word keeps its code), so `group_by(col("region"))` and `where(col("region") == lit(code))` equal `read_parquet` + `Query`; the result carries the file-wide words. `groups=` known upfront or found by a first pass over the dictionaries only (decide; record)
+- [ ] equal to `read_parquet(path)` + the same query on CPU (exact: sums, counts, min / max, means, present) on files from pyarrow, DuckDB and our writer: several row groups, nulls, dictionary and plain pages, zstd / snappy / none, empty row groups, a row group with every value null
+- [ ] proof of the memory claim: a file several times a set memory limit (e.g. `ulimit -v` or a cgroup / RSS sampler as `scripts/bench_spill.py` does) runs to the right answer, and its peak RSS stays near one row group; the same query through `read_parquet` exceeds it
+- [ ] AUTO: CPU per row group (the GPU per row group is a later step); the result says where it ran. Works on the no-GPU / serial / no-codec builds (F-138b) where the codecs allow
+- [ ] open after this ticket: joins and group-bys whose state outgrows RAM (spill, as the Python engine's `spill.py` / `grace.py`), CSV streaming, Frame overlays on a streamed file
 ## F-133 M2: Query on a Mojo plan IR [done]
 Needs: F-132 · Spec §5 · `mojo/mxframe/expr.mojo`, `query.mojo`, test `mojo/tests/test_query.mojo`
 - [x] plan nodes in Mojo (Scan, Filter, Aggregate built; Project / Sort / Limit / Join kinds reserved), built by `Query(table).where().group_by(key, groups=).agg(...)`; expressions are flat post-order trees (`col`, `lit`, `+ - * // %`, unary `-`, `least` / `greatest`, comparisons, `between`, `& | ~`)
