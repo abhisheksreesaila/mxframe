@@ -792,18 +792,25 @@ struct Frame(Movable):
                     t.append(c, self.alias(c, raw))
         return t^
 
-    def save(self, path: String, metadata: String = "", compression: Int = ZSTD) raises:
+    def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False) raises:
         """Writes the edited rows to a new Parquet file (`metadata` under the key "omx"; the file replaces `path` by
         rename, so `path` may be the file this frame reads). A frame over a scan streams: one row group of the file at
         a time (all its columns decoded, edits applied, encoded and written; appended rows follow in groups of
         DEFAULT_ROW_GROUP), so the memory is one row group, the file's dictionaries and the edits, whatever the size.
         The saved row groups are the source's, less the removed rows. A frame over a table writes `bake()`. Formulas
-        are not stored."""
+        are not stored. The file's other key-value metadata is written back (not Arrow's schema, which describes the
+        source's types). A column that reading narrowed (TIMESTAMP held as DATE, DECIMAL(9, 2) as DECIMAL(18, 2), ENUM or
+        JSON as text) makes `save` raise, naming the column and what would be lost, unless `allow_narrowing`."""
         if not self.scan:
             write_parquet(path, self.bake(), metadata, compression)
             return
         ref scan = self.scan.value()
         var stored = self.stored()
+        if not allow_narrowing:
+            for c in range(stored):
+                var lost = scan.narrowing(c)
+                if lost.byte_length() > 0:
+                    raise Error("column `" + self.base.name(c) + "` is " + lost + ". Nothing was written; pass allow_narrowing=True to save anyway")
         var out = Table.empty()                              # one row group's rows at a time; its words are the file's
         var null_edit = List[Bool](length=stored, fill=False)
         for item in self.cells.items():
@@ -866,13 +873,14 @@ struct Frame(Movable):
                 if not self.alive(row):
                     continue
                 for c in range(stored):
-                    _push_value(out, c, self.added[row - self.nbase][c], remap[c])
+                    var hit = self.cells.get((row << 20) | c)        # an appended row can be edited too
+                    _push_value(out, c, hit.value() if hit else self.added[row - self.nbase][c], remap[c])
                 if out.rows() >= DEFAULT_ROW_GROUP:
                     w.write_group(out)
                     _clear_rows(out)
             if out.rows() > 0 or w.group_count() == 0:
                 w.write_group(out)
-            w.finish(metadata)
+            w.finish(metadata, scan.extra_metadata())
         except e:
             w.abort()
             raise e^
