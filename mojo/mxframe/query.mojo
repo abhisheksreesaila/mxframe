@@ -37,7 +37,7 @@ from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
-from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _new_context, _free_context
+from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext
 from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
 from .frame import text_ranks
 
@@ -1866,7 +1866,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
             why = "the plan runs " + String(ops_row) + " kernel instructions a row on " + String(core_count()) + " cores: cheaper on the CPU than moving the file to the GPU"
         else:
             use_gpu = True
-    var gctx = _new_context() if use_gpu else 0
+    var gown = _ScanContext(use_gpu)                          # frees the device context on every way out of this function
+    var gctx = gown.addr
     var gpu_groups = 0
     var ops = List[Int](length=shape.n_slots, fill=A_SUM)       # how each kernel slot merges
     for i in range(len(shape.kinds)):
@@ -2009,7 +2010,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         if out.kinds[i] == A_SUM:
             out.sums = out.slots[out.slot_of[i]].copy()
             break
-    _free_context(gctx)
+    _ = gown^                                                 # (kept alive to here: the groups above use its address)
     out.device = GPU if use_gpu and gpu_groups == len(todo_all) else CPU
     out.fallback_reason = why^
     out.milliseconds = Float64(perf_counter_ns() - t0) / 1e6

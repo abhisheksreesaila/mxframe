@@ -191,3 +191,15 @@ def _free_context(addr: Int):
             var p = UnsafePointer[DeviceContext, MutAnyOrigin](unsafe_from_address=addr)
             _ = p.take_pointee()
             p.free()
+
+
+struct _ScanContext(Movable):
+    """Owns the DeviceContext of one streamed GPU scan: `__del__` frees it, so every way out of the scan (a result, an
+    overflow, a decode error, a failed allocation) gives the CUDA context and its memory pool back."""
+    var addr: Int                    # the context's address, 0: none
+
+    def __init__(out self, want: Bool) raises:
+        self.addr = _new_context() if want else 0
+
+    def __del__(deinit self):
+        _free_context(self.addr)
