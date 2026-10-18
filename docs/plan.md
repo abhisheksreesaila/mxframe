@@ -1334,6 +1334,28 @@ Needs: F-133, F-136 · Spec §7 · `mojo/mxframe/gpu.mojo` (`DeviceTable`, `gpu_
 - Review round 1 fixes: scratch sized to the mode (only the small-group modes use it; 3M groups on AUTO run on the GPU), any device failure on AUTO falls back to the CPU (GPU raises), a 0-row DeviceTable no longer copies from a null pointer and `compute(GPU)` on 0 rows runs on the GPU, narrow-launch (30 aggregates) and cannot-take (44 aggregates) tests, no-re-upload proven by `uploads()` and unchanged buffer addresses, `DeviceTable` holds its table's handle so `mirrors` cannot match a reused address (it keeps the host columns alive while it lives), `release()` documented as not for use while a query runs
 - [ ] open: the register file lives in shared memory, so a program needing more than about 45 registers at 128 threads (or many groups with many aggregates) returns "needs more GPU shared memory" (AUTO falls back to the CPU); the whole table must fit on the device (no chunking yet); a sum whose partial totals pass int64 raises on the GPU as on the CPU, but the order of partials differs, so such borderline inputs may raise on one and not the other; the changed-rows mask is uploaded per query (rows / 8 bytes, not cached per edit count)
 
-## F-138 M7: omxplorer on MX frame [todo]
+## F-138 M7: omxplorer on MX frame [doing]
 Needs: F-134, F-135, F-136, F-137
 - [ ] omxplorer imports a CSV, edits, adds formulas, sorts, builds charts / pivots / a filtered Report, saves and reopens a `.omx` with `from mxframe import ...`; `scripts/check` passes with the same numbers; `scripts/build.sh omxplorer mac` links with no libpython
+
+- Split (2026-10-17) after a read-only map of the app (`examples/omxplorer`, `mojoui/sheetpage|reportpage|omxfile|csvio.mojo`): package gaps are F-138a and F-138b, the app's switch is F-138c. Done when all three are done and the acceptance check above holds
+
+## F-138a Package gaps the app needs: edited cells, word counts, a fast sort [todo]
+Needs: F-136 · `mojo/mxframe/frame.mojo`
+- [ ] `Frame.edited(c, row) -> Bool` (the DataGrid marks edited cells; today the app reads the private cell key) and `Frame.word_count(c)` (shared + session words)
+- [ ] `permutation(c, descending)` is a radix sort over Int64 keys (text: by alphabetical rank of each code, computed once over the words), with a fast path for a column with no edits through `values(c)`; still stable, nulls last, removed rows left out. 1M rows under 0.1 s (the app's budget is 1 s; the stand-in does 0.02 s)
+
+## F-138b The package links on the Mac with no GPU, Python or codecs [todo]
+Needs: F-137 · `query.mojo`, `gpu.mojo`, `kernels_aot/_fpenv.mojo`, `parquet.mojo`
+- [ ] GPU code compiled only where there is a GPU build (`comptime if` on the target, as the app's D-56): on other targets `DeviceTable` / `compute(GPU)` raise "no GPU on this build" and `AUTO` is the CPU
+- [ ] the CPU thread pool falls back to a serial loop where the Mojo async runtime is not linked (a build switch), so the Mac binary needs only libSystem
+- [ ] a no-codec build switch: Parquet saves UNCOMPRESSED and refuses to read zstd / snappy pages with a readable error; Linux keeps both
+- [ ] proof: an arm64-apple-macosx14.0 object of a small program over the package links against the app's `apple/sdk/*.tbd` with only the app's allowed symbols
+
+## F-138c omxplorer on the package (app repo, `mxapp/mojo-ui`) [todo]
+Needs: F-138a, F-138b (can start on Linux before them)
+- [ ] a `Sheet` in `mojoui/` (package `Frame` + column formats) implements `GridSource` and the formatting; nulls shown blank; `decimal_text` / `date_text` / `parse_decimal` move to `numformat.mojo`
+- [ ] aggregation through `Query(...).on_device(dt).compute(AUTO)`: status-bar totals, charts, pivots, bins, Report tiles and the West filter; averages use `count(col)`
+- [ ] CSV import through `read_csv`; BOOL shown; empty cells are nulls
+- [ ] `.omx` v2: `write_parquet(f.bake(), metadata=json)` / `read_parquet`; a small Mojo JSON reader; v1 files refused with a clear message (or migrated); Report filter stored as a word
+- [ ] `scripts/check` passes with the same numbers (checker needles and tests updated where the behaviour rightly changed, recorded in `docs/decisions.md`); the omxplorer Linux binary passes the no-libpython guard; mxstudio and the workbook keep the stand-in
