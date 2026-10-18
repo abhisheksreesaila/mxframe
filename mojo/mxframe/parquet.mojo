@@ -1401,14 +1401,14 @@ def _dict_runs(mut c: _Bytes, leaf: _Leaf, w: Int, dict: List[Int64], count: Int
             got += run
 
 
-def _decode_dict_page(mut p: _Page, mut ctx: _Ctx, leaf: _Leaf, tbl: Int) raises:
+def _decode_dict_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, tbl: Int) raises -> List[Int64]:
     """A dictionary page as stored values (file-wide codes for TEXT looked up in the finished dictionary)."""
     var owner = List[UInt8]()
     var c = _Bytes(_page_bytes(ctx.codec, p.addr, p.csize, p.usize, owner), p.usize)
     var d = List[Int64](unsafe_uninit_length=p.nvals)
     _plain_into(c, leaf, ctx, p.nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(d.unsafe_ptr())), tbl, True)
-    ctx.dict = d^
     _ = owner^
+    return d^
 
 
 def _open_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, mut owner: List[UInt8]) raises -> _Bytes:
@@ -1863,29 +1863,6 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                     col.values.resize(row0 + rows, 0)
             if 0 < len(col.validity) < (len(col.values) + 7) // 8:      # a bitmap that exists covers every row
                 col.validity.resize((len(col.values) + 7) // 8, 0xFF)
-    var pa = Int(pages.unsafe_ptr())
-    var ca = Int(ctxs.unsafe_ptr())
-    var la = Int(leaves.unsafe_ptr())
-    var cola = Int(t.cols.unsafe_ptr())
-    var dicts = List[Int]()                             # round 1: the dictionary pages, in parallel (the data pages need them)
-    for i in range(len(pages)):
-        if pages[i].is_dict:
-            dicts.append(i)
-    if len(dicts) > 0:
-        var da = Int(dicts.unsafe_ptr())
-        def dict_job(j: Int) {imm}:
-            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=da)[j])[]
-            ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
-            ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
-            try:
-                _decode_dict_page(p, ctx, leaf, tbl)
-            except e:
-                p.err = String(e)
-        if len(dicts) == 1:
-            dict_job(0)
-        else:
-            par_n(dict_job, len(dicts), min(len(dicts), core_count()))
-    _ = dicts^
     if core_count() > 1 and not words_only:             # big pages are decoded in slices (prepared by one job, then a job per slice)
         for i in range(len(pages)):
             ref p = pages[i]
@@ -1895,51 +1872,92 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
             if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY or \
                (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED)):
                 p.split = True
-    def job(j: Int) {imm}:
-        var page = Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa)
-        ref p = (page + j)[]
-        if p.is_dict:
-            return
-        ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
-        ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
-        ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
-        try:
-            if p.split:
-                _prep_page(p, ctx, leaf)
-            else:
-                _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
-        except e:
-            p.err = String(e)
-    if len(pages) == 1:
-        job(0)
-    elif len(pages) > 1:
-        par_n(job, len(pages), min(len(pages), core_count()))
-    var sp = List[Int]()                                # round 3: a job per slice of every prepared page
-    var sk = List[Int]()
+    # Two parallel rounds. A: the dictionary pages, the pages that need no dictionary (PLAIN, text that adds words) and
+    # the preparation of every big page (decompress, levels, where the slices start). B: what needs a finished
+    # dictionary or a prepared page: the small dictionary-indexed pages and one job per slice of the big ones.
+    var ja = List[Int]()
+    var jb = List[Int]()
+    var kb = List[Int]()
     for i in range(len(pages)):
+        if pages[i].is_dict:
+            ja.append(i)
+    for i in range(len(pages)):
+        ref p = pages[i]
+        if p.is_dict:
+            continue
+        if p.split or not (p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY):
+            ja.append(i)
+        else:
+            jb.append(i)
+            kb.append(-1)
+    var pa = Int(pages.unsafe_ptr())
+    var ca = Int(ctxs.unsafe_ptr())
+    var la = Int(leaves.unsafe_ptr())
+    var cola = Int(t.cols.unsafe_ptr())
+    var dstore = List[List[Int64]]()                    # round A's dictionaries, one slot per chunk (a job writes only its own)
+    for _ in range(len(ctxs)):
+        dstore.append(List[Int64]())
+    var dsa = Int(dstore.unsafe_ptr())
+    if len(ja) > 0:
+        var jaa = Int(ja.unsafe_ptr())
+        def job_a(j: Int) {imm}:
+            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=jaa)[j])[]
+            try:
+                if p.is_dict:
+                    # (its own binding: the dictionary is written into the chunk's `_Ctx`, which other jobs of this round
+                    # only read; one binding shared with them let the compiler write a stale copy of the struct back)
+                    ref wctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+                    ref wleaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + wctx.leaf)[]
+                    (Pointer[List[Int64], MutUntrackedOrigin](unsafe_from_address=dsa) + p.ctx)[] = _decode_dict_page(p, wctx, wleaf, tbl)
+                else:
+                    ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+                    ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
+                    ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
+                    if p.split:
+                        _prep_page(p, ctx, leaf)
+                    else:
+                        _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+            except e:
+                p.err = String(e)
+        if len(ja) == 1:
+            job_a(0)
+        else:
+            par_n(job_a, len(ja), min(len(ja), core_count()))
+    _ = ja^
+    for k in range(len(ctxs)):                          # the dictionaries are put in their chunks' contexts after the join
+        if len(dstore[k]) > 0:
+            swap(ctxs[k].dict, dstore[k])
+    _ = dstore^
+    for i in range(len(pages)):                         # a job per slice of every prepared page
         if pages[i].split and pages[i].err.byte_length() == 0:
             for k in range(len(pages[i].sl_v)):
-                sp.append(i)
-                sk.append(k)
-    if len(sp) > 0:
-        var spa = Int(sp.unsafe_ptr())
-        var ska = Int(sk.unsafe_ptr())
-        def slice_job(j: Int) {imm}:
-            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=spa)[j])[]
-            var k = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ska)[j]
+                jb.append(i)
+                kb.append(k)
+    if len(jb) > 0:
+        var jba = Int(jb.unsafe_ptr())
+        var kba = Int(kb.unsafe_ptr())
+        def job_b(j: Int) {imm}:
+            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=jba)[j])[]
+            var k = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=kba)[j]
             ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
             ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
             ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
             try:
-                _decode_slice(p, k, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8)
+                if k < 0:
+                    _decode_page(p, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+                else:
+                    _decode_slice(p, k, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8)
             except e:
-                p.sl_err[k] = String(e)
-        if len(sp) == 1:
-            slice_job(0)
+                if k < 0:
+                    p.err = String(e)
+                else:
+                    p.sl_err[k] = String(e)
+        if len(jb) == 1:
+            job_b(0)
         else:
-            par_n(slice_job, len(sp), min(len(sp), core_count()))
-    _ = sp^
-    _ = sk^
+            par_n(job_b, len(jb), min(len(jb), core_count()))
+    _ = jb^
+    _ = kb^
     for i in range(len(pages)):
         if pages[i].split and pages[i].err.byte_length() == 0:
             for k in range(len(pages[i].sl_err)):
