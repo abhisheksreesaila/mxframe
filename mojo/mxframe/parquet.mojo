@@ -1401,17 +1401,18 @@ def _dict_runs(mut c: _Bytes, leaf: _Leaf, w: Int, dict: List[Int64], count: Int
             got += run
 
 
-def _decode_dict_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, tbl: Int) raises -> List[Int64]:
-    """A dictionary page as stored values (file-wide codes for TEXT looked up in the finished dictionary)."""
+def _decode_dict_page(p: _Page, mut ctx: _Ctx, leaf: _Leaf, tbl: Int) raises:
+    """A dictionary page as stored values (file-wide codes for TEXT looked up in the finished dictionary), put into its
+    chunk's context. The only job of its round that writes a context; the others take theirs as plain (read) parameters."""
     var owner = List[UInt8]()
     var c = _Bytes(_page_bytes(ctx.codec, p.addr, p.csize, p.usize, owner), p.usize)
     var d = List[Int64](unsafe_uninit_length=p.nvals)
     _plain_into(c, leaf, ctx, p.nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(d.unsafe_ptr())), tbl, True)
+    ctx.dict = d^
     _ = owner^
-    return d^
 
 
-def _open_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, mut owner: List[UInt8]) raises -> _Bytes:
+def _open_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, mut owner: List[UInt8]) raises -> _Bytes:
     """Decompresses a data page (into `owner` when it is compressed), unpacks its definition levels into `p.bits` and
     returns a cursor on its values; `p.present` is the number of non-null values."""
     var c: _Bytes
@@ -1456,7 +1457,7 @@ def _open_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, mut owner: List[UInt8])
     return c^
 
 
-def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raises:
+def _decode_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raises:
     """Decodes one data page into the column slice at `dst` (0: only add the words of a TEXT page, store nothing)."""
     var owner = List[UInt8]()
     var c = _open_page(p, ctx, leaf, owner)
@@ -1548,7 +1549,7 @@ def _plan_dict_slices(mut c: _Bytes, w: Int, present: Int, step: Int, mut p: _Pa
                 next_t = v + step
 
 
-def _prep_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf) raises:
+def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf) raises:
     """The serial part of a big page: decompress, definition levels, and where the slices start; the values are decoded
     by `_decode_slice` jobs. The decompressed page stays in `p.keep` until they are done."""
     var owner = List[UInt8]()
@@ -1607,7 +1608,7 @@ def _prep_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf) raises:
     p.keep = owner^
 
 
-def _decode_slice(mut p: _Page, k: Int, ref ctx: _Ctx, leaf: _Leaf, dst: Int) raises:
+def _decode_slice(p: _Page, k: Int, ctx: _Ctx, leaf: _Leaf, dst: Int) raises:
     """Slice k of a prepared page: its values, then spread over its rows (a slice holds exactly the rows from its first
     value's row to the next slice's first value's row, so the spread never leaves it)."""
     var v1 = p.sl_v[k + 1] if k + 1 < len(p.sl_v) else p.present
@@ -1894,21 +1895,17 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
     var ca = Int(ctxs.unsafe_ptr())
     var la = Int(leaves.unsafe_ptr())
     var cola = Int(t.cols.unsafe_ptr())
-    var dstore = List[List[Int64]]()                    # round A's dictionaries, one slot per chunk (a job writes only its own)
-    for _ in range(len(ctxs)):
-        dstore.append(List[Int64]())
-    var dsa = Int(dstore.unsafe_ptr())
     if len(ja) > 0:
         var jaa = Int(ja.unsafe_ptr())
         def job_a(j: Int) {imm}:
             ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=jaa)[j])[]
             try:
                 if p.is_dict:
-                    # (its own binding: the dictionary is written into the chunk's `_Ctx`, which other jobs of this round
-                    # only read; one binding shared with them let the compiler write a stale copy of the struct back)
+                    # (the dictionary is written into the chunk's `_Ctx`; the other jobs of this round take it as a plain
+                    # parameter. With `ref ctx` parameters the write was lost: see docs/lessons.md)
                     ref wctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
                     ref wleaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + wctx.leaf)[]
-                    (Pointer[List[Int64], MutUntrackedOrigin](unsafe_from_address=dsa) + p.ctx)[] = _decode_dict_page(p, wctx, wleaf, tbl)
+                    _decode_dict_page(p, wctx, wleaf, tbl)
                 else:
                     ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
                     ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
@@ -1924,10 +1921,6 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
         else:
             par_n(job_a, len(ja), min(len(ja), core_count()))
     _ = ja^
-    for k in range(len(ctxs)):                          # the dictionaries are put in their chunks' contexts after the join
-        if len(dstore[k]) > 0:
-            swap(ctxs[k].dict, dstore[k])
-    _ = dstore^
     for i in range(len(pages)):                         # a job per slice of every prepared page
         if pages[i].split and pages[i].err.byte_length() == 0:
             for k in range(len(pages[i].sl_v)):
