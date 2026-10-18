@@ -1426,3 +1426,45 @@ def test_frame_edits_at_group_and_block_edges_of_a_pyarrow_file_with_odd_row_gro
             s, n = want.get(r, (0, 0))
             want[r] = (s + c, n + 1)
     assert {w: (s, n) for w, s, n in zip(got["words"], got["sums"], got["counts"]) if n} == want
+
+
+# ── F-146: the GPU for a streamed file ───────────────────────────────────────────────────────────────
+
+def _has_gpu():
+    import shutil
+    return shutil.which("nvidia-smi") is not None and subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode == 0
+
+
+def probe_device(prober, path, query, device, **extra):
+    env = {**__import__("os").environ, "MXFRAME_SCAN_DEVICE": device, **extra}
+    p = subprocess.run([str(prober), str(path), "scan", query], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout.strip().split("\n")[-1])
+
+
+def same_numbers(a, b):
+    for k in ("words", "kinds", "slot_of", "count_slot_of", "counts", "slots", "present"):
+        assert a[k] == b[k], k
+
+
+@pytest.mark.skipif(not _has_gpu(), reason="no GPU")
+@pytest.mark.parametrize("name", ["zstd-dict-v1", "snappy-dict-v2", "none-plain-v1", "small-pages"])
+def test_the_gpu_scan_equals_the_cpu_scan_and_duckdb_on_pyarrow_files(prober, tmp_path, name):
+    """Nulls (a whole row group of them), empty row groups, dictionary fallback to PLAIN text, every codec and page shape:
+    each query on the GPU gives, number for number, what the CPU scan, read_parquet and DuckDB give."""
+    path = tmp_path / "t.parquet"
+    write_with_empty_groups(path, scan_table(), **PYARROW_FILES[name])
+    for q in SCAN_QUERIES:
+        got = probe_device(prober, path, q, "gpu")
+        assert got["device"] == 1 and got["reason"] == "", (q, got["device"], got["reason"])
+        same_numbers(got, probe_device(prober, path, q, "cpu"))
+        same_numbers(got, probe(prober, path, "read", q))
+        check_against_duckdb(path, got, q)
+
+
+@pytest.mark.skipif(not _has_gpu(), reason="no GPU")
+def test_auto_on_a_small_file_is_the_cpu_and_says_why(prober, tmp_path):
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(), path, row_group_size=SCAN_GROUP)
+    got = probe_device(prober, path, "by_region", "auto")
+    assert got["device"] == 0 and "under AUTO's" in got["reason"], (got["device"], got["reason"])

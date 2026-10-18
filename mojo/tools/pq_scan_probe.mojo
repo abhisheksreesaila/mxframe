@@ -6,7 +6,7 @@
 from std.sys import argv
 from std.os import getenv
 from mxframe import (Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of, read_parquet, scan_parquet,
-                     CPU, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
+                     CPU, GPU, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
 
 
 
@@ -14,6 +14,12 @@ def _morsel_mode() -> Int:
     """The scan's morsel switch from the environment (this tool only: the library reads no environment)."""
     var m = getenv("MXFRAME_SCAN_MORSELS")
     return MORSELS_ON if m == "1" else MORSELS_OFF if m == "0" else MORSELS_AUTO
+
+
+def _device() -> Int:
+    """The scan's device from the environment (this tool only): MXFRAME_SCAN_DEVICE=gpu or cpu, else AUTO."""
+    var d = getenv("MXFRAME_SCAN_DEVICE")
+    return GPU if d == "gpu" else CPU if d == "cpu" else AUTO
 
 
 def _block_rows() raises -> Int:
@@ -68,7 +74,7 @@ def main() raises:
             east = max(scan.code_of(c, "East"), 0)
             for w in range(nreg):
                 words += scan.text_of(c, w) + "\x1f"
-        r = plan(Query(scan), which, nreg, east).morsels(_morsel_mode()).block_rows(_block_rows()).compute(AUTO)
+        r = plan(Query(scan), which, nreg, east).morsels(_morsel_mode()).block_rows(_block_rows()).compute(_device())
     else:
         var rp = read_parquet(path)
         var t = rp.take_table().share()
@@ -81,7 +87,7 @@ def main() raises:
             for w in range(nreg):
                 words += t.text_of(c, w) + "\x1f"
         r = plan(Query(t), which, nreg, east).compute(AUTO)
-    var out = String('{"words": "') + words.replace("\x1f", "|") + '", "device": ' + String(r.device) + ', "ms": ' + String(r.milliseconds)
+    var out = String('{"words": "') + words.replace("\x1f", "|") + '", "device": ' + String(r.device) + ', "reason": "' + r.fallback_reason.replace('"', "'") + '", "ms": ' + String(r.milliseconds)
     out += ', "peak_kb": ' + String(peak_kb()) + ', "kinds": ['
     for i in range(len(r.kinds)):
         out += ("" if i == 0 else ", ") + String(r.kinds[i])
