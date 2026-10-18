@@ -787,3 +787,17 @@ def test_an_unused_unique_id_text_column_costs_nothing(prober, tmp_path):
     same_answer(scanned, read)
     assert scanned["slots"][0][0] == n * (n - 1) // 2 and scanned["counts"][0] == n
     assert scanned["peak_kb"] < 90_000 and scanned["peak_kb"] * 4 < read["peak_kb"], (scanned["peak_kb"], read["peak_kb"])
+
+
+def test_the_serial_build_decodes_the_same_numbers_as_the_parallel_one(prober, tmp_path, monkeypatch):
+    """F-141: pages decode in parallel; the serial build (no thread pool) runs them in a loop. Many small pages, nulls,
+    dictionary and plain text: every answer is identical, streamed and whole-file."""
+    monkeypatch.setenv("MXFRAME_BUILD_FLAGS", "-D MXFRAME_SERIAL")
+    serial = tmp_path / "pq_scan_probe_serial"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_scan_probe.mojo"), str(serial)],
+                   check=True, capture_output=True, text=True)
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(), path, row_group_size=SCAN_GROUP, data_page_size=1_500, compression="snappy")
+    for q in SCAN_QUERIES:
+        for mode in ("scan", "read"):
+            same_answer(probe(prober, path, mode, q), probe(serial, path, mode, q))
