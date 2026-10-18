@@ -1062,16 +1062,16 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             todo.append(g)
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var spare = List[List[Int64]]()          # the value buffers of finished groups, written into again by the next decode
     var cur = Table.empty()
     if len(todo) > 0:
-        cur = scan.read_group_reusing(todo[0], used, spare)
+        cur = scan.read_group(todo[0], used)
     for ix in range(len(todo)):
         for k in range(len(used)):
             nulls[k] += cur.null_count(k)
         var part = cur^.share()
         var r = QueryResult()
         var nxt = Table.empty()
+        var pending = String()
         if ix + 1 < len(todo):
             # group ix + 1 decodes while the kernel aggregates group ix (two groups in memory); a serial build runs the
             # two tasks one after the other. The partials are still merged below in row-group order.
@@ -1084,7 +1084,6 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             var sp = Int(UnsafePointer(to=scan))
             var pp = Int(UnsafePointer(to=part))
             var up = Int(UnsafePointer(to=used))
-            var spp = Int(UnsafePointer(to=spare))
             var np_nodes = Int(UnsafePointer(to=nodes))
             var next_group = todo[ix + 1]
             def both(i: Int) {imm}:
@@ -1098,22 +1097,16 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
                 else:
                     try:
                         Pointer[Table, MutUntrackedOrigin](unsafe_from_address=np)[] = Pointer[ParquetScan, MutUntrackedOrigin](
-                            unsafe_from_address=sp)[].read_group_reusing(
-                            next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
-                            Pointer[List[List[Int64]], MutUntrackedOrigin](unsafe_from_address=spp)[])
+                            unsafe_from_address=sp)[].read_group(
+                            next_group, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[])
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e1p)[] = String(e)
             par_n(both, 2, 2)
             if e0.byte_length() > 0:                 # the earlier group's error comes first
                 raise Error(e0)
-            if e1.byte_length() > 0:
-                raise Error(e1)
+            pending = e1^                            # the next group's decode error waits until this group is merged
         else:
             r = _run_cpu(part, _lower(part, nodes, True, False), 0)
-        for k in range(len(used)):                   # this group's buffers go back for the group after next
-            var done = List[Int64]()
-            swap(done, part._table[].cols[k].values)
-            spare.append(done^)
         _ = part^
         cur = nxt^
         for s in range(shape.n_slots):
@@ -1131,6 +1124,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
                     acc.slots[s][x] = Int(y)
         for x in range(shape.groups):
             acc.counts[x] += r.counts[x]
+        if pending.byte_length() > 0:                # only now, after this group's partial was merged (its overflow comes first)
+            raise Error(pending)
     # the layout of a whole-file run: lowered over the columns with the null counts the file turned out to have
     var proto = Table.empty()
     for k in range(len(used)):
