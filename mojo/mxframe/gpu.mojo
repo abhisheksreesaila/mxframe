@@ -26,7 +26,7 @@ Why it looks like this:
 from std.memory import ArcPointer
 from std.memory.alloc import unsafe_alloc
 from std.sys import is_defined, CompilationTarget
-from max.gpu.host import DeviceContext, DeviceBuffer
+from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .table import SharedTable
 
 comptime HAS_GPU = CompilationTarget.is_linux() and not is_defined["MXFRAME_NO_GPU"]()
@@ -172,14 +172,45 @@ struct DeviceTable(ImplicitlyCopyable):
         s.live = False
 
 
+struct _ScanDevice(Movable):
+    """What one streamed GPU scan keeps on the device: its context and one set of column buffers (and validity bitmaps)
+    that every decoded row group is copied into in turn, grown when a group is bigger than the last, never freed between
+    groups (an allocation and free of the group's columns cost about as much as the copy). Built and used only inside
+    `comptime if HAS_GPU`."""
+    var ctx: DeviceContext
+    var data: List[DeviceBuffer[DType.int64]]
+    var data_cap: List[Int]
+    var valid: List[DeviceBuffer[DType.uint8]]
+    var valid_cap: List[Int]
+    var data_addr: List[Int]                         # of the group last loaded
+    var valid_addr: List[Int]                        # 0: that column has no nulls in it
+    var host: List[List[HostBuffer[DType.int64]]]    # two sets of pinned host buffers, one per column: a decoded row group
+    var host_cap: List[List[Int]]                    #   is written into one set while the other is copied to the device
+
+    def __init__(out self, var ctx: DeviceContext):
+        self.ctx = ctx^
+        self.data = List[DeviceBuffer[DType.int64]]()
+        self.data_cap = List[Int]()
+        self.valid = List[DeviceBuffer[DType.uint8]]()
+        self.valid_cap = List[Int]()
+        self.data_addr = List[Int]()
+        self.valid_addr = List[Int]()
+        self.host = List[List[HostBuffer[DType.int64]]]()
+        self.host_cap = List[List[Int]]()
+        for _ in range(2):
+            self.host.append(List[HostBuffer[DType.int64]]())
+            self.host_cap.append(List[Int]())
+
+
 def _new_context() raises -> Int:
-    """A DeviceContext on the default GPU, on the heap, by address (0 on a build without GPU code): a streamed scan makes
-    one and uploads each decoded row group on it, so no GPU symbol is named outside `comptime if HAS_GPU`."""
+    """The device side of a streamed scan (a DeviceContext on the default GPU and its reusable column buffers), on the
+    heap, by address; 0 on a build without GPU code or a machine without a GPU. No GPU symbol is named outside
+    `comptime if HAS_GPU`."""
     comptime if HAS_GPU:
         if not gpu_available():
             return 0
-        var mem = unsafe_alloc[DeviceContext](1)
-        mem.unsafe_write(DeviceContext())
+        var mem = unsafe_alloc[_ScanDevice](1)
+        mem.unsafe_write(_ScanDevice(DeviceContext()))
         return Int(mem)
     else:
         return 0
@@ -188,6 +219,101 @@ def _new_context() raises -> Int:
 def _free_context(addr: Int):
     comptime if HAS_GPU:
         if addr != 0:
-            var p = UnsafePointer[DeviceContext, MutAnyOrigin](unsafe_from_address=addr)
+            var p = UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)
+            try:
+                p[].ctx.synchronize()                    # nothing in flight when the buffers go
+            except:
+                pass
+            p[].host = List[List[HostBuffer[DType.int64]]]()       # the buffers first, then the context they hang off
+            p[].data = List[DeviceBuffer[DType.int64]]()
+            p[].valid = List[DeviceBuffer[DType.uint8]]()
             _ = p.take_pointee()
             p.free()
+
+
+def _scan_context(addr: Int) raises -> DeviceContext:
+    comptime if HAS_GPU:
+        return UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)[].ctx.copy()
+    else:
+        raise Error(NO_GPU_MESSAGE)
+
+
+def _pinned_prepare(addr: Int, which: Int, ncols: Int, rows: Int) raises -> List[Int]:
+    """Pinned host buffers of `rows` Int64 for `ncols` columns in set `which` (0 or 1), grown when too small (only a set the
+    device is not copying from may be asked for), and their addresses: a decoded row group is written straight into them
+    (`ParquetScan.read_group_into`) and copied to the device from there, at the bus's full speed and without a host copy."""
+    var out = List[Int]()
+    comptime if HAS_GPU:
+        ref m = UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)[]
+        for c in range(ncols):
+            if c >= len(m.host[which]):
+                m.host[which].append(m.ctx.enqueue_create_host_buffer[DType.int64](max(rows, 1)))
+                m.host_cap[which].append(max(rows, 1))
+            elif m.host_cap[which][c] < rows:
+                m.host[which][c] = m.ctx.enqueue_create_host_buffer[DType.int64](rows)
+                m.host_cap[which][c] = rows
+            out.append(Int(m.host[which][c].unsafe_ptr()))
+        m.ctx.synchronize()                              # (the buffers exist before anything is written into them)
+    return out^
+
+
+def _stage_load(addr: Int, table: SharedTable, ext: List[Int] = List[Int](), rows: Int = -1) raises:
+    """Copies the table's columns (and the validity bitmaps of those that have nulls) into the scan's device buffers,
+    growing them when the table has more rows than any before, and waits for the copies: the host columns may change after
+    this returns. `_stage_data` / `_stage_valid` then give the device addresses."""
+    comptime if HAS_GPU:
+        ref m = UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)[]
+        var n = table.rows() if rows < 0 else rows           # (ext: the values are in the caller's buffers, the table has none)
+        m.data_addr = List[Int]()
+        m.valid_addr = List[Int]()
+        for c in range(table.columns()):
+            if c >= len(m.data):                      # a column not seen before: its buffers
+                m.data.append(m.ctx.enqueue_create_buffer[DType.int64](max(n, 1)))
+                m.data_cap.append(max(n, 1))
+                m.valid.append(m.ctx.enqueue_create_buffer[DType.uint8](1))
+                m.valid_cap.append(1)
+            elif m.data_cap[c] < n:                    # a bigger group: a bigger buffer (the old one is idle)
+                m.data[c] = m.ctx.enqueue_create_buffer[DType.int64](n)
+                m.data_cap[c] = n
+            if n > 0:
+                if len(ext) > 0:
+                    m.ctx.enqueue_copy(dst_buf=m.data[c], src_ptr=UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=ext[c]))
+                else:
+                    m.ctx.enqueue_copy(dst_buf=m.data[c], src_ptr=table.values(c).unsafe_ptr())
+            m.data_addr.append(Int(m.data[c].unsafe_ptr()))
+            var nbytes = len(table._table[].cols[c].validity)
+            if nbytes > 0:
+                if m.valid_cap[c] < nbytes:
+                    m.valid[c] = m.ctx.enqueue_create_buffer[DType.uint8](nbytes)
+                    m.valid_cap[c] = nbytes
+                m.ctx.enqueue_copy(dst_buf=m.valid[c], src_ptr=table._table[].cols[c].validity.unsafe_ptr())
+                m.valid_addr.append(Int(m.valid[c].unsafe_ptr()))
+            else:
+                m.valid_addr.append(0)
+        m.ctx.synchronize()
+
+
+def _stage_data(addr: Int, c: Int) -> Int:
+    comptime if HAS_GPU:
+        return UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)[].data_addr[c]
+    else:
+        return 0
+
+
+def _stage_valid(addr: Int, c: Int) -> Int:
+    comptime if HAS_GPU:
+        return UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)[].valid_addr[c]
+    else:
+        return 0
+
+
+struct _ScanContext(Movable):
+    """Owns the device side of one streamed GPU scan: `__del__` frees it, so every way out of the scan (a result, an
+    overflow, a decode error, a failed allocation) gives the CUDA context and its buffers back."""
+    var addr: Int                    # the address of the `_ScanDevice`, 0: none
+
+    def __init__(out self, want: Bool) raises:
+        self.addr = _new_context() if want else 0
+
+    def __del__(deinit self):
+        _free_context(self.addr)

@@ -2023,10 +2023,14 @@ def _dedupe_misses(mut pages: List[_Page], ctx: Int, total: Int):
 
 
 def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf_ids: List[Int], out_cols: List[Int],
-                  widxs: List[Int], add_words: Bool, leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False) raises:
+                  widxs: List[Int], add_words: Bool, leaves: List[_Leaf], row0: Int, mut t: Table, words_only: Bool = False,
+                  ext: Int = 0) raises:
     """Decodes one row group: chunk k (`metas[k]`, at `bases[k]` / `ns[k]`, leaf `leaf_ids[k]`) becomes rows
     row0.. of table column `out_cols[k]`, whose TEXT words are found in `widxs[k]` (a `_WordIndex` over the table's
-    column) and, when `add_words`, added to it. `words_only`: only the TEXT words are added to the table (a dictionary build)."""
+    column) and, when `add_words`, added to it. `words_only`: only the TEXT words are added to the table (a dictionary build).
+    `ext` (F-146): the address of a List[Int] of one destination address per out column; the values are written there (host
+    memory of the caller's, e.g. pinned for the GPU) and the table's columns keep no values, only their validity bitmaps and
+    null counts."""
     if len(metas) == 0:
         return
     var tbl = Int(UnsafePointer(to=t))
@@ -2050,6 +2054,8 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
         _check_claim("row group", rows, len(out_cols))
         for k in range(len(out_cols)):                  # size the columns once: the pages add up to the rows
             ref col = t.cols[out_cols[k]]
+            if ext != 0:
+                continue
             if len(col.values) < row0:
                 raise Error("column `" + col.name + "`: rows do not line up (corrupt file)")
             if len(col.values) < row0 + rows:            # (read_parquet sizes the whole column up front)
@@ -2059,6 +2065,14 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                     col.values.resize(row0 + rows, 0)
             if 0 < len(col.validity) < (len(col.values) + 7) // 8:      # a bitmap that exists covers every row
                 col.validity.resize((len(col.values) + 7) // 8, 0xFF)
+    var ob = List[Int](length=len(t.cols), fill=0)      # where each out column's values are written
+    if not words_only:
+        for k in range(len(out_cols)):
+            if ext != 0:
+                ob[out_cols[k]] = UnsafePointer[List[Int], MutAnyOrigin](unsafe_from_address=ext)[][k]
+            else:
+                ob[out_cols[k]] = Int(t.cols[out_cols[k]].values.unsafe_ptr())
+    var oba = Int(ob.unsafe_ptr())
     if core_count() > 1 and not words_only:             # big pages are decoded in slices (prepared by one job, then a job per slice)
         for i in range(len(pages)):
             ref p = pages[i]
@@ -2112,7 +2126,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                     if p.split:
                         _prep_page(p, ctx, leaf, _step_cuts(p.nvals))
                     else:
-                        _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+                        _decode_page(p, ctx, leaf, 0 if words_only else Pointer[Int, MutUntrackedOrigin](unsafe_from_address=oba)[ctx.col] + p.row * 8, tbl)
             except e:
                 p.err = String(e)
         if len(ja) == 1:
@@ -2136,9 +2150,9 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
             ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
             try:
                 if k < 0:
-                    _decode_page(p, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+                    _decode_page(p, ctx, leaf, Pointer[Int, MutUntrackedOrigin](unsafe_from_address=oba)[ctx.col] + p.row * 8, tbl)
                 else:
-                    _decode_slice(p, k, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8)
+                    _decode_slice(p, k, ctx, leaf, Pointer[Int, MutUntrackedOrigin](unsafe_from_address=oba)[ctx.col] + p.row * 8)
             except e:
                 if k < 0:
                     p.err = String(e)
@@ -2204,7 +2218,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
             ref p = (page + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=fa)[j])[]
             ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
             ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
-            var dst = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(col.values.unsafe_ptr()) + p.row * 8)
+            var dst = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Pointer[Int, MutUntrackedOrigin](unsafe_from_address=oba)[ctx.col] + p.row * 8)
             var codes = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(p.miss.code.unsafe_ptr()))
             for r in range(p.nvals):
                 var v = dst[r]
@@ -2223,11 +2237,12 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
         col.nulls += p.nulls
         if p.nulls > 0:
             if len(col.validity) == 0:
-                col.validity = List[UInt8](length=(len(col.values) + 7) // 8, fill=0xFF)
+                col.validity = List[UInt8](length=((len(col.values) if ext == 0 else row0 + rows) + 7) // 8, fill=0xFF)
             _assign_bits(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(col.validity.unsafe_ptr())), p.row,
                          UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr())), p.nvals)
     _ = pages^
     _ = ctxs^
+    _ = ob^
 
 
 # ── scanning: a file bigger than memory, one row group at a time (F-140) ─────────────────────────────
@@ -2463,6 +2478,14 @@ struct ParquetScan(Copyable, Movable):
     def read_group(self, g: Int, cols: List[Int]) raises -> Table:
         """Row group `g` as a table of just the columns `cols` (in that order), decoded: a TEXT value is the code the
         whole-file read gives its word (looked up in the file-wide dictionary while the pages are decoded)."""
+        return self._read(g, cols, 0)
+
+    def read_group_into(self, g: Int, cols: List[Int], dest: List[Int]) raises -> Table:
+        """`read_group`, the values written to the addresses in `dest` (one buffer of `group_rows(g)` Int64 per column
+        read, the caller's, e.g. pinned memory) instead of into the table, which keeps only validity and null counts."""
+        return self._read(g, cols, Int(UnsafePointer(to=dest)))
+
+    def _read(self, g: Int, cols: List[Int], ext: Int) raises -> Table:
         for c in cols:
             self.ensure_words(c)
         ref info = self._info[]
@@ -2483,7 +2506,7 @@ struct ParquetScan(Copyable, Movable):
             metas.append(info.groups[g][c].copy())
             outs.append(k)
             widxs.append(Int(info.widx.unsafe_ptr() + c) if self.schema.kind(c) == TEXT else 0)
-        _decode_group(bases, ns, metas, cols, outs, widxs, False, info.leaves, 0, t)
+        _decode_group(bases, ns, metas, cols, outs, widxs, False, info.leaves, 0, t, ext=ext)
         _ = maps^
         t.check()
         return t^

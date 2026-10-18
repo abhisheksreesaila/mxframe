@@ -1478,3 +1478,35 @@ def test_auto_on_a_small_file_is_the_cpu_and_says_why(prober, tmp_path):
     pq.write_table(scan_table(), path, row_group_size=SCAN_GROUP)
     got = probe_device(prober, path, "by_region", "auto")
     assert got["device"] == 0 and "under AUTO's" in got["reason"], (got["device"], got["reason"])
+
+
+def _process_gpu_mib(pid):
+    out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                         capture_output=True, text=True).stdout
+    for line in out.strip().splitlines():
+        p, mem = [x.strip() for x in line.split(",")]
+        if p == str(pid):
+            return int(mem)
+    return 0
+
+
+@pytest.mark.skipif(not _has_gpu(), reason="no GPU")
+def test_gpu_scans_that_raise_give_their_device_context_back(tmp_path):
+    """Every way out of a GPU scan frees its DeviceContext: the GPU memory the process holds after 1,000 scans that raise (an
+    overflow in the kernel) is what it holds after one (the ~512 MiB CUDA context of the process is there either way; a scan
+    that kept its context grew by ~0.15 MiB each, 234 MiB over 1,500). nvidia-smi is the observer: the leak is invisible to
+    the process's own free-memory reading, the CUDA context being shared inside it."""
+    import time
+    probe = tmp_path / "gpu_leak_probe"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/gpu_leak_probe.mojo"), str(probe)],
+                   check=True, capture_output=True, text=True)
+    path = tmp_path / "ov.parquet"
+    pq.write_table(pa.table({"v": pa.array([2**62] * 8 + [1] * 1000, pa.int64())}), path, row_group_size=200)
+    held = {}
+    for n in (1, 1000):
+        pr = subprocess.Popen([str(probe), str(path), str(n)], stdout=subprocess.PIPE, text=True)
+        assert pr.stdout.readline().strip() == f"failed {n}"
+        time.sleep(0.5)
+        held[n] = _process_gpu_mib(pr.pid)
+        pr.wait()
+    assert held[1] > 0 and held[1000] - held[1] < 60, f"GPU MiB held after 1 failed scan {held[1]}, after 1000: {held[1000]}"
