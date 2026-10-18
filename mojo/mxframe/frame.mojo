@@ -133,6 +133,14 @@ struct Frame(Movable):
             return NULL_EDIT if self.base.is_null(c, row) else self.base.get(c, row)
         return self.added[row - n][c]
 
+    def edited(self, c: Int, row: Int) -> Bool:
+        """Does the cell hold a session edit (set, set_null or set_text) that undo has not taken back?"""
+        return ((row << 20) | c) in self.cells
+
+    def word_count(self, c: Int) -> Int:
+        """A TEXT column's words: the shared dictionary's plus this session's (codes run 0 up to this)."""
+        return len(self.base.dictionary(c)) + len(self.words[c])
+
     def is_null(self, c: Int, row: Int) raises -> Bool:
         if c < self.stored():
             return self._raw(c, row) == NULL_EDIT

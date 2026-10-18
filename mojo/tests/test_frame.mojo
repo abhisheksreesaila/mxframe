@@ -296,6 +296,169 @@ def test_text_sorts_ignoring_case_with_bytes_as_the_tie_break() raises:
         expect(names[order[i]] == want[i], "at " + String(i) + ": " + names[order[i]] + " instead of " + want[i])
 
 
+def test_edited_marks_session_edits_that_survive_undo() raises:
+    var t = Table.empty()
+    var g = t.add_column("name", TEXT)
+    var v = t.add_column("v", INT)
+    for w in ["a", "b", "c"]:
+        t.append_text(g, w)
+        t.append(v, 1)
+    var f = Frame(t^.share())
+    expect(not f.edited(1, 0) and not f.edited(0, 0), "a fresh frame has no edited cells")
+    f.set(1, 0, 5)
+    f.set_null(1, 1)
+    f.set_text(0, 2, "zed")
+    expect(f.edited(1, 0) and f.edited(1, 1) and f.edited(0, 2), "set, set_null and set_text mark the cell")
+    expect(not f.edited(0, 0) and not f.edited(1, 2), "other cells are not marked")
+    f.set(1, 0, 6)                                           # edited twice
+    _ = f.undo()
+    expect(f.edited(1, 0), "undoing the second edit leaves the first in place")
+    _ = f.undo()
+    _ = f.undo()
+    _ = f.undo()
+    _ = f.undo()
+    expect(not f.edited(1, 0) and not f.edited(1, 1) and not f.edited(0, 2), "undone edits are not marked")
+    expect(f.word_count(0) == 4, "3 shared + \"zed\" (a word stays after the undo): " + String(f.word_count(0)))
+    f.set_text(0, 0, "x")
+    f.set_text(0, 1, "y")
+    f.set_text(0, 2, "x")
+    expect(f.word_count(0) == 6, "3 shared + zed + x + y: " + String(f.word_count(0)))
+    expect(f.word_count(1) == 0, "an INT column has no words")
+
+
+# The old sort, kept as the oracle: a stable merge sort of the live rows over what `get` and `is_null` report.
+def ref_less(f: Frame, c: Int, a: Int, b: Int, descending: Bool) raises -> Bool:
+    var na = f.is_null(c, a)
+    var nb = f.is_null(c, b)
+    if na or nb:
+        return not na and nb
+    var x = f.get(c, a)
+    var y = f.get(c, b)
+    if c < f.stored() and f.kind(c) == TEXT:
+        var sx = f.text_of(c, x).as_bytes()
+        var sy = f.text_of(c, y).as_bytes()
+        var d = 0
+        for i in range(min(len(sx), len(sy))):
+            var lx = sx[i] + 32 if UInt8(65) <= sx[i] <= UInt8(90) else sx[i]
+            var ly = sy[i] + 32 if UInt8(65) <= sy[i] <= UInt8(90) else sy[i]
+            if lx != ly:
+                d = -1 if lx < ly else 1
+                break
+        if d == 0 and len(sx) != len(sy):
+            d = -1 if len(sx) < len(sy) else 1
+        if d == 0:
+            for i in range(len(sx)):
+                if sx[i] != sy[i]:
+                    d = -1 if sx[i] < sy[i] else 1
+                    break
+        return d > 0 if descending else d < 0
+    return x > y if descending else x < y
+
+
+def ref_permutation(f: Frame, c: Int, descending: Bool) raises -> List[Int]:
+    var cur = List[Int]()
+    for row in range(f.rows()):
+        if f.alive(row):
+            cur.append(row)
+    var n = len(cur)
+    var width = 1
+    while width < n:
+        var nxt = List[Int]()
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            while i < mid and j < hi:
+                if ref_less(f, c, cur[j], cur[i], descending):
+                    nxt.append(cur[j])
+                    j += 1
+                else:
+                    nxt.append(cur[i])
+                    i += 1
+            while i < mid:
+                nxt.append(cur[i])
+                i += 1
+            while j < hi:
+                nxt.append(cur[j])
+                j += 1
+            lo += 2 * width
+        cur = nxt^
+        width *= 2
+    return cur^
+
+
+def check_sorts(f: Frame, label: String) raises:
+    for c in range(f.columns()):
+        for d in range(2):
+            var got = f.permutation(c, descending=(d == 1))
+            var want = ref_permutation(f, c, descending=(d == 1))
+            expect(len(got) == len(want), label + ": length, column " + String(c))
+            for i in range(len(want)):
+                expect(got[i] == want[i], label + ": column " + String(c) + (" desc" if d == 1 else " asc") +
+                       " at " + String(i) + ": " + String(got[i]) + " instead of " + String(want[i]))
+
+
+def extremes_table(n: Int, seed: UInt64) raises -> SharedTable:
+    var t = Table.empty()
+    var g = t.add_column("name", TEXT)
+    var v = t.add_column("v", INT)
+    var d = t.add_column("d", DECIMAL, scale=2)
+    var words: List[String] = ["pear", "Apple", "apple", "fig", "", "Zed", "zed", "figs", "FIG", "\xc3\xa9a"]
+    for w in words:
+        _ = t.add_word(g, w)
+    var big: List[Int64] = [Int64.MIN, Int64.MIN + 2, -1, 0, 1, Int64.MAX, Int64.MAX - 1, -7, 7, 3]
+    var rng = Rng(seed)
+    for i in range(n):
+        if rng.int(0, 6) == 0:
+            t.append_null(g)
+        else:
+            t.append(g, Int64(rng.int(0, 9)))
+        if rng.int(0, 6) == 0:
+            t.append_null(v)
+        else:
+            t.append(v, big[rng.int(0, 9)] if rng.int(0, 2) > 0 else Int64(rng.int(-5, 5)))
+        t.append(d, Int64(rng.int(-300, 300)))
+    return t^.share()
+
+
+def test_permutation_equals_the_merge_sort_on_random_frames() raises:
+    for seed in range(1, 9):
+        var f = Frame(extremes_table(40 + seed * 37, UInt64(seed)))
+        check_sorts(f, "fresh " + String(seed))                    # the no-edit fast path
+        var rng = Rng(UInt64(seed) * 31)
+        for step in range(60):
+            var row = rng.int(0, f.rows() - 1)
+            while not f.alive(row):
+                row = rng.int(0, f.rows() - 1)
+            var what = rng.int(0, 7)
+            if what == 0:
+                f.set(1, row, Int64.MIN if step % 2 == 0 else Int64.MAX)
+            elif what == 1:
+                f.set_null(1, row)
+            elif what == 2:
+                f.set_text(0, row, "new" + String(step % 3) if step % 4 != 0 else "APPLE")
+            elif what == 3:
+                _ = f.append(["fig", "-4", "1.50"])
+            elif what == 4:
+                _ = f.append(["", "", ""])
+            elif what == 5:
+                f.remove(row)
+            elif what == 6:
+                f.set_null(0, row)
+            else:
+                f.set(2, row, Int64(rng.int(-300, 300)))
+        _ = f.merge(0, [Int64(2), Int64(8)], Int64(1))           # apple and FIG fold into Apple
+        _ = f.formula("m = d * 3 - 100")
+        _ = f.formula("q = m // 4")
+        check_sorts(f, "edited " + String(seed))
+        _ = f.undo()
+        check_sorts(f, "after an undo " + String(seed))
+        var empty = Frame(extremes_table(0, 1))
+        check_sorts(empty, "empty")
+
+
 def test_the_null_marker_cannot_be_typed() raises:
     var t = Table.empty()
     var a = t.add_column("a", INT)
@@ -492,5 +655,7 @@ def main() raises:
     test_formula_errors_are_readable()
     test_permutation_is_stable_alphabetical_and_sees_edits()
     test_edits_check_their_values()
+    test_edited_marks_session_edits_that_survive_undo()
+    test_permutation_equals_the_merge_sort_on_random_frames()
     test_undo_returns_to_the_shared_results()
     test_queries_over_edits_equal_queries_over_the_baked_table()
