@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import duckdb
 
 ROOT = Path(__file__).resolve().parent.parent
-D = Path.home() / ".cache/mxframe-bench/f143"
+D = Path.home() / ".cache/mxframe-bench/f145"
 
 
 def make_numeric(path, n, group, codec):

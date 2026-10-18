@@ -1005,6 +1005,8 @@ struct _Page(Copyable, Movable):
     var v2_compressed: Bool
     var ctx: Int                     # its chunk's `_Ctx`
     var row: Int                     # its first row in the output column
+    var present: Int                 # non-null values (set when the page is opened)
+    var is_dict: Bool                # a dictionary page: decoded into its chunk's `_Ctx.dict` in the first parallel round
     var defer: Bool                  # PLAIN text that may add words: misses are recorded, and coded in file order afterwards
     var nulls: Int
     var bits: List[UInt8]            # validity bits of its rows (an OPTIONAL column with nulls on this page)
@@ -1016,6 +1018,15 @@ struct _Page(Copyable, Movable):
     var miss_slots: List[Int32]      # a table over the misses (one entry per distinct word of the page)
     var miss_canon: List[Int]        # (big columns) per miss: page << 32 | miss number of the first page that missed the same word
     var keep: List[UInt8]            # the decompressed page, kept while its missed words are read
+    var split: Bool                  # a big page decoded in slices by row range (prepared, then one job per slice)
+    var vbase: Int                   # split: the value stream (base address, size, bit width or value width)
+    var vend: Int
+    var vwidth: Int
+    var sl_v: List[Int]              # per slice: its first non-null value, its row, its offset in the stream and, in a
+    var sl_row: List[Int]            #   bit-packed run entered mid-way, the groups of 8 still to read
+    var sl_pos: List[Int]
+    var sl_pend: List[Int]
+    var sl_err: List[String]
 
 
 @fieldwise_init
@@ -1326,11 +1337,20 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
     var w = c.byte()
     if w > 64:
         raise Error("a Parquet page has a bit width of " + String(w) + " (corrupt file)")
+    _dict_runs(c, leaf, w, dict, count, dout, 0)
+
+
+def _dict_runs(mut c: _Bytes, leaf: _Leaf, w: Int, dict: List[Int64], count: Int, dout: UnsafePointer[Int64, MutAnyOrigin],
+               pending: Int) raises:
+    """The runs of a dictionary-index page from the cursor, which is at a run header, or (`pending` > 0) inside a
+    bit-packed run with `pending` groups of 8 values still to read (a slice that starts mid-run)."""
     var d = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(dict.unsafe_ptr()))
     var dn = len(dict)
     var got = 0
+    var pend = pending
     while got < count:
-        var h = c.small()
+        var h = (pend << 1) | 1 if pend > 0 else c.small()
+        pend = 0
         var left = count - got
         if h & 1 == 1:
             var groups = h >> 1
@@ -1381,9 +1401,19 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
             got += run
 
 
-def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raises:
-    """Decodes one data page into the column slice at `dst` (0: only add the words of a TEXT page, store nothing)."""
+def _decode_dict_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, tbl: Int) raises -> List[Int64]:
+    """A dictionary page as stored values (file-wide codes for TEXT looked up in the finished dictionary)."""
     var owner = List[UInt8]()
+    var c = _Bytes(_page_bytes(ctx.codec, p.addr, p.csize, p.usize, owner), p.usize)
+    var d = List[Int64](unsafe_uninit_length=p.nvals)
+    _plain_into(c, leaf, ctx, p.nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(d.unsafe_ptr())), tbl, True)
+    _ = owner^
+    return d^
+
+
+def _open_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, mut owner: List[UInt8]) raises -> _Bytes:
+    """Decompresses a data page (into `owner` when it is compressed), unpacks its definition levels into `p.bits` and
+    returns a cursor on its values; `p.present` is the number of non-null values."""
     var c: _Bytes
     var present = p.nvals
     var nobits = List[UInt8](length=8, fill=0)
@@ -1421,6 +1451,18 @@ def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) r
                 raise Error("column `" + leaf.name + "`: definition levels use encoding " + String(p.def_enc) + ", not supported")
     if ctx.optional:
         present = _count_bits(bits_p, p.nvals)
+    p.present = present
+    _ = nobits^
+    return c^
+
+
+def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raises:
+    """Decodes one data page into the column slice at `dst` (0: only add the words of a TEXT page, store nothing)."""
+    var owner = List[UInt8]()
+    var c = _open_page(p, ctx, leaf, owner)
+    var present = p.present
+    var nobits = List[UInt8](length=8, fill=0)
+    var bits_p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr() if ctx.optional else nobits.unsafe_ptr()))
     var store = dst != 0
     if not store and not (p.encoding == ENC_PLAIN and leaf.ptype == PT_BYTE_ARRAY):
         # a words-only build (dst 0) only adds the words of PLAIN text; any other page would write through a null
@@ -1464,6 +1506,130 @@ def _decode_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) r
     else:
         _ = owner^
     _ = nobits^
+
+
+comptime SPLIT_MIN = 262_144        # a page with at least this many rows is decoded in slices by row range
+comptime SLICE_MIN = 65_536         # and no slice is smaller than this many values
+
+
+def _plan_dict_slices(mut c: _Bytes, w: Int, present: Int, step: Int, mut p: _Page) raises:
+    """One serial pass over a dictionary-index page's run headers (the cursor is after the bit width): every `step`
+    values or so a slice starts, at a run boundary or at a group of 8 values inside a bit-packed run."""
+    var v = 0
+    var next_t = step
+    while v < present and next_t < present:
+        var h = c.small()
+        if h & 1 == 1:
+            var groups = h >> 1
+            if w > 0 and groups > (c.n - c.pos) // w:
+                raise Error("a Parquet page ends early (corrupt file)")
+            var data = c.pos
+            var span = groups * 8
+            while next_t < v + span and next_t < present:
+                var g = (next_t - v + 7) // 8
+                var vv = v + g * 8
+                if vv >= v + span or vv >= present:
+                    break
+                p.sl_v.append(vv)
+                p.sl_pos.append(data + g * w)
+                p.sl_pend.append(groups - g)
+                next_t = vv + step
+            v += span
+            c.pos = data + groups * w
+        else:
+            var run = h >> 1
+            c.need((w + 7) // 8)
+            c.pos += (w + 7) // 8
+            v += run
+            if v < present and v >= next_t:
+                p.sl_v.append(v)
+                p.sl_pos.append(c.pos)
+                p.sl_pend.append(0)
+                next_t = v + step
+
+
+def _prep_page(mut p: _Page, ref ctx: _Ctx, leaf: _Leaf) raises:
+    """The serial part of a big page: decompress, definition levels, and where the slices start; the values are decoded
+    by `_decode_slice` jobs. The decompressed page stays in `p.keep` until they are done."""
+    var owner = List[UInt8]()
+    var c = _open_page(p, ctx, leaf, owner)
+    var present = p.present
+    var step = max(SLICE_MIN, (present + 2 * core_count() - 1) // (2 * core_count()))
+    p.sl_v.append(0)
+    p.sl_pos.append(0)
+    p.sl_pend.append(0)
+    if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
+        var w = c.byte()
+        if w > 64:
+            raise Error("a Parquet page has a bit width of " + String(w) + " (corrupt file)")
+        p.vwidth = w
+        p.sl_pos[0] = c.pos
+        _plan_dict_slices(c, w, present, step, p)
+    else:
+        var width = 4 if leaf.ptype == PT_INT32 else 8 if leaf.ptype == PT_INT64 else leaf.type_length
+        if width < 1 or width > 16:
+            raise Error("column `" + leaf.name + "` has a fixed length of " + String(width) + " bytes (corrupt file)")
+        if present > (c.n - c.pos) // width:
+            raise Error("a Parquet page ends early (corrupt file)")
+        p.vwidth = width
+        p.sl_pos[0] = c.pos
+        var v = step
+        while v < present:
+            p.sl_v.append(v)
+            p.sl_pos.append(c.pos + v * width)
+            p.sl_pend.append(0)
+            v += step
+    p.sl_row.append(0)                                   # the row of each later slice's first value
+    if present == p.nvals:
+        for k in range(1, len(p.sl_v)):
+            p.sl_row.append(p.sl_v[k])
+    else:
+        var bits = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
+        var k = 1
+        var seen = 0
+        for byte in range((p.nvals + 7) // 8):
+            var pc = Int(pop_count(bits[byte]))
+            while k < len(p.sl_v) and p.sl_v[k] < seen + pc:
+                var want = p.sl_v[k] - seen              # the want-th set bit of this byte
+                var row = byte * 8
+                for b in range(8):
+                    if (bits[byte] >> UInt8(b)) & 1 == 1:
+                        if want == 0:
+                            row = byte * 8 + b
+                            break
+                        want -= 1
+                p.sl_row.append(row)
+                k += 1
+            seen += pc
+    p.sl_err = List[String](length=len(p.sl_v), fill=String())
+    p.vbase = c.base
+    p.vend = c.n
+    p.keep = owner^
+
+
+def _decode_slice(mut p: _Page, k: Int, ref ctx: _Ctx, leaf: _Leaf, dst: Int) raises:
+    """Slice k of a prepared page: its values, then spread over its rows (a slice holds exactly the rows from its first
+    value's row to the next slice's first value's row, so the spread never leaves it)."""
+    var v1 = p.sl_v[k + 1] if k + 1 < len(p.sl_v) else p.present
+    var r1 = p.sl_row[k + 1] if k + 1 < len(p.sl_row) else p.nvals
+    var cnt = v1 - p.sl_v[k]
+    var r0 = p.sl_row[k]
+    var dout = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=dst + r0 * 8)
+    var c = _Bytes(p.vbase, p.vend)
+    c.pos = p.sl_pos[k]
+    if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
+        _dict_runs(c, leaf, p.vwidth, ctx.dict, cnt, dout, p.sl_pend[k])
+    else:
+        _plain_into(c, leaf, ctx, cnt, dout, 0, True, 0)
+    if r1 - r0 > cnt:
+        var bits = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
+        var j = cnt - 1
+        for row in range(r1 - r0 - 1, -1, -1):
+            if _get_bit(bits, r0 + row):
+                dout[row] = dout[j]
+                j -= 1
+            else:
+                dout[row] = 0
 
 
 def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx, ctx_at: Int, tbl: Int,
@@ -1538,12 +1704,18 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             ctx.dict_seen = True
             if nvals > 8 * usize + 8:
                 raise Error("column `" + leaf.name + "`: a dictionary page holds more values than its bytes can (corrupt file)")
-            var page = List[UInt8]()
-            var c = _Bytes(_page_bytes(meta.codec, base + body_at, csize, usize, page), usize)
-            ctx.dict = List[Int64](unsafe_uninit_length=nvals)
-            _plain_into(c, leaf, ctx, nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(ctx.dict.unsafe_ptr())),
-                        tbl, True)
-            _ = page^
+            if ctx.add and leaf.ptype == PT_BYTE_ARRAY:  # text words are added to the table here, in file order
+                var page = List[UInt8]()
+                var c = _Bytes(_page_bytes(meta.codec, base + body_at, csize, usize, page), usize)
+                ctx.dict = List[Int64](unsafe_uninit_length=nvals)
+                _plain_into(c, leaf, ctx, nvals, UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(ctx.dict.unsafe_ptr())),
+                            tbl, True)
+                _ = page^
+            else:                                        # a job of the first parallel round
+                pages.append(_Page(base + body_at, csize, usize, nvals, ENC_PLAIN, False, 0, ENC_RLE, True, ctx_at, 0, 0, True, False, 0,
+                                   List[UInt8](), String(), List[Int](), List[Int](), List[UInt64](), List[Int](), List[Int32](),
+                                   List[Int](), List[UInt8](), False, 0, 0, 0, List[Int](), List[Int](), List[Int](),
+                           List[Int](), List[String]()))
             continue
         if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
             continue                                     # an index page: not needed
@@ -1555,8 +1727,9 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             continue
         var defer = leaf.ptype == PT_BYTE_ARRAY and ctx.add and encoding == ENC_PLAIN
         pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
-                           v2_compressed, ctx_at, ctx.row0 + done, defer, 0, List[UInt8](), String(), List[Int](), List[Int](),
-                           List[UInt64](), List[Int](), List[Int32](), List[Int](), List[UInt8]()))
+                           v2_compressed, ctx_at, ctx.row0 + done, 0, False, defer, 0, List[UInt8](), String(), List[Int](), List[Int](),
+                           List[UInt64](), List[Int](), List[Int32](), List[Int](), List[UInt8](), False, 0, 0, 0, List[Int](), List[Int](), List[Int](),
+                           List[Int](), List[String]()))
         done += nvals
 
 
@@ -1690,24 +1863,111 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                     col.values.resize(row0 + rows, 0)
             if 0 < len(col.validity) < (len(col.values) + 7) // 8:      # a bitmap that exists covers every row
                 col.validity.resize((len(col.values) + 7) // 8, 0xFF)
+    if core_count() > 1 and not words_only:             # big pages are decoded in slices (prepared by one job, then a job per slice)
+        for i in range(len(pages)):
+            ref p = pages[i]
+            if p.is_dict or p.defer or p.nvals < SPLIT_MIN:
+                continue
+            var pt = leaves[ctxs[p.ctx].leaf].ptype
+            if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY or \
+               (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED)):
+                p.split = True
+    # Two parallel rounds. A: the dictionary pages, the pages that need no dictionary (PLAIN, text that adds words) and
+    # the preparation of every big page (decompress, levels, where the slices start). B: what needs a finished
+    # dictionary or a prepared page: the small dictionary-indexed pages and one job per slice of the big ones.
+    var ja = List[Int]()
+    var jb = List[Int]()
+    var kb = List[Int]()
+    for i in range(len(pages)):
+        if pages[i].is_dict:
+            ja.append(i)
+    for i in range(len(pages)):
+        ref p = pages[i]
+        if p.is_dict:
+            continue
+        if p.split or not (p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY):
+            ja.append(i)
+        else:
+            jb.append(i)
+            kb.append(-1)
     var pa = Int(pages.unsafe_ptr())
     var ca = Int(ctxs.unsafe_ptr())
     var la = Int(leaves.unsafe_ptr())
     var cola = Int(t.cols.unsafe_ptr())
-    def job(j: Int) {imm}:
-        var page = Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa)
-        ref p = (page + j)[]
-        ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
-        ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
-        ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
-        try:
-            _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
-        except e:
-            p.err = String(e)
-    if len(pages) == 1:
-        job(0)
-    elif len(pages) > 1:
-        par_n(job, len(pages), min(len(pages), core_count()))
+    var dstore = List[List[Int64]]()                    # round A's dictionaries, one slot per chunk (a job writes only its own)
+    for _ in range(len(ctxs)):
+        dstore.append(List[Int64]())
+    var dsa = Int(dstore.unsafe_ptr())
+    if len(ja) > 0:
+        var jaa = Int(ja.unsafe_ptr())
+        def job_a(j: Int) {imm}:
+            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=jaa)[j])[]
+            try:
+                if p.is_dict:
+                    # (its own binding: the dictionary is written into the chunk's `_Ctx`, which other jobs of this round
+                    # only read; one binding shared with them let the compiler write a stale copy of the struct back)
+                    ref wctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+                    ref wleaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + wctx.leaf)[]
+                    (Pointer[List[Int64], MutUntrackedOrigin](unsafe_from_address=dsa) + p.ctx)[] = _decode_dict_page(p, wctx, wleaf, tbl)
+                else:
+                    ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+                    ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
+                    ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
+                    if p.split:
+                        _prep_page(p, ctx, leaf)
+                    else:
+                        _decode_page(p, ctx, leaf, 0 if words_only else Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+            except e:
+                p.err = String(e)
+        if len(ja) == 1:
+            job_a(0)
+        else:
+            par_n(job_a, len(ja), min(len(ja), core_count()))
+    _ = ja^
+    for k in range(len(ctxs)):                          # the dictionaries are put in their chunks' contexts after the join
+        if len(dstore[k]) > 0:
+            swap(ctxs[k].dict, dstore[k])
+    _ = dstore^
+    for i in range(len(pages)):                         # a job per slice of every prepared page
+        if pages[i].split and pages[i].err.byte_length() == 0:
+            for k in range(len(pages[i].sl_v)):
+                jb.append(i)
+                kb.append(k)
+    if len(jb) > 0:
+        var jba = Int(jb.unsafe_ptr())
+        var kba = Int(kb.unsafe_ptr())
+        def job_b(j: Int) {imm}:
+            ref p = (Pointer[_Page, MutUntrackedOrigin](unsafe_from_address=pa) + Pointer[Int, MutUntrackedOrigin](unsafe_from_address=jba)[j])[]
+            var k = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=kba)[j]
+            ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
+            ref leaf = (Pointer[_Leaf, MutUntrackedOrigin](unsafe_from_address=la) + ctx.leaf)[]
+            ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
+            try:
+                if k < 0:
+                    _decode_page(p, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8, tbl)
+                else:
+                    _decode_slice(p, k, ctx, leaf, Int(col.values.unsafe_ptr()) + p.row * 8)
+            except e:
+                if k < 0:
+                    p.err = String(e)
+                else:
+                    p.sl_err[k] = String(e)
+        if len(jb) == 1:
+            job_b(0)
+        else:
+            par_n(job_b, len(jb), min(len(jb), core_count()))
+    _ = jb^
+    _ = kb^
+    for i in range(len(pages)):
+        if pages[i].split and pages[i].err.byte_length() == 0:
+            for k in range(len(pages[i].sl_err)):
+                if pages[i].sl_err[k].byte_length() > 0:
+                    pages[i].err = pages[i].sl_err[k]
+                    break
+            pages[i].nulls = pages[i].nvals - pages[i].present
+            if pages[i].nulls == 0:
+                pages[i].bits = List[UInt8]()
+            pages[i].keep = List[UInt8]()
     for i in range(len(pages)):
         if pages[i].err.byte_length() > 0:
             raise Error(pages[i].err)

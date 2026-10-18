@@ -1133,3 +1133,45 @@ def test_an_overflow_while_merging_a_group_beats_the_decode_error_of_the_next(pr
     path.write_bytes(raw)
     p = subprocess.run([str(prober), str(path), "scan", "sum_v"], capture_output=True, text=True)
     assert p.returncode == 1 and "a sum or an expression passed the int64 range" in p.stdout + p.stderr, p.stdout + p.stderr
+
+
+# ── F-145: big pages split by row range, dictionary pages decoded as parallel jobs ───────────────────
+
+def big_page_table(n, seed=9):
+    """One column per kind of splittable page: a dictionary-index page (low cardinality, with nulls), PLAIN int64 / int32
+    with nulls, PLAIN decimals of both widths, a dictionary text column, a required column and an all-null one."""
+    r = _random.Random(seed)
+    words = [f"w{j}" for j in range(30)]
+    return pa.table({
+        "lc": pa.array([None if r.random() < 0.07 else r.randint(0, 9) for _ in range(n)], pa.int64()),
+        "lc_req": pa.array([r.randint(-3, 400) for _ in range(n)], pa.int64()),
+        "i64": pa.array([None if r.random() < 0.2 else r.randint(-2**62, 2**62) for _ in range(n)], pa.int64()),
+        "i32": pa.array([None if i % 5 == 0 or (i // 7) % 11 == 0 else r.randint(-2**31, 2**31 - 1) for i in range(n)], pa.int32()),
+        "dec18": pa.array([_dec.Decimal(r.randint(-10**17, 10**17)).scaleb(-2) for _ in range(n)], pa.decimal128(18, 2)),
+        "dec12": pa.array([None if r.random() < 0.05 else _dec.Decimal(r.randint(-10**9, 10**9)).scaleb(-2) for _ in range(n)], pa.decimal128(12, 2)),
+        "txt": pa.array([None if r.random() < 0.1 else r.choice(words) for _ in range(n)], pa.string()),
+        "allnull": pa.array([None] * n, pa.int64()),
+    })
+
+
+@pytest.mark.parametrize("version", ["1.0", "2.0"])
+@pytest.mark.parametrize("codec", ["NONE", "SNAPPY"])
+def test_big_single_page_columns_slice_by_row_range_and_decode_the_same(cells, tmp_path, version, codec):
+    """700k-row pages (one page a column) are cut into slices at run boundaries and byte offsets, with nulls on either side
+    of the cuts: every cell equals pyarrow's, through read_parquet and the scan, in the parallel and the serial build."""
+    n = 700_000
+    t = big_page_table(n)
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=n, data_page_size=256 * 1024 * 1024, data_page_version=version, compression=codec,
+                   use_dictionary=["lc", "lc_req", "txt"])
+    md = pq.read_metadata(path).row_group(0)
+    assert md.column(0).encodings.count("RLE_DICTIONARY") and "PLAIN" in md.column(2).encodings
+    want = "".join("\t".join(cell_text(t.column(c)[i].as_py(), t.schema.field(c).type) for c in range(t.num_columns)) + "\n"
+                   for i in range(n))
+    serial = tmp_path / "pq_cells_serial"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_cells.mojo"), str(serial)],
+                   check=True, capture_output=True, text=True, env={**__import__("os").environ, "MXFRAME_BUILD_FLAGS": "-D MXFRAME_SERIAL"})
+    for binary in (cells, serial):
+        for mode in ("read", "scan"):
+            got = subprocess.run([str(binary), str(path), mode], capture_output=True, text=True, check=True).stdout
+            assert got == want, (binary.name, mode)
