@@ -20,7 +20,10 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
   scales (decimal-aware formulas: F-136);
 - the null rule for `|`: a filter reading a null cell is false as a whole, so `(a > 0) | (b == 1)` drops a row whose
   a is null even when b == 1 (SQL would keep it);
-- a total that passes int64 raises (the stand-in wrapped silently).
+- a total that passes int64 raises (the stand-in wrapped silently);
+- `count_distinct(e)`, `median(e)` / `percentile(e, p)` (DuckDB's quantile_disc) and `top_k(e, k)` (F-148) are exact
+  per group over a table, a Frame and a scan, ignore nulls, and run on the CPU: the kernel's per-block hook writes the
+  (group, value) pairs and holistic.mojo consumes them (`r.values(i)`, `r.present(i, g)`, `r.top(i, g)`).
 """
 from std.time import perf_counter_ns
 from std.atomic import Atomic

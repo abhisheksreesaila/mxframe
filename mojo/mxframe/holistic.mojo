@@ -551,8 +551,8 @@ def _dist_add(mut tab: List[Int64], mut cap: Int, used: Int, sv: LP, sg: IP, n: 
     next PREFETCH_AHEAD pairs are prefetched: with millions of distinct pairs every probe is a cache miss, and
     overlapping them is most of the speed."""
     var u = used
-    if cap * 6 < min_cap * 5:                    # well under the size the sketch asks for: at least double, so a scan whose
-        var target = max(min_cap, cap * 2)       # every row group brings new values rehashes O(log) times, not once a group
+    if cap * 6 < min_cap * 5:                    # well under the size the sketch asks for: at least 1.5 times, so a scan whose
+        var target = max(min_cap, cap * 3 // 2)   # every row group brings new values rehashes O(log) times, not once a group
         _dist_grow(tab, cap, target)
         cap = target
     var tp = _lp(Int(tab.unsafe_ptr()))
