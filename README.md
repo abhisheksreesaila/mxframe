@@ -2,20 +2,53 @@
 
 # MXFrame
 
-**A DataFrame engine written in Mojo: Polars-style API, faster than DuckDB on the TPC-H SF10 total.**
+**A data engine written in Mojo, for apps and agents: CPU, GPU and an auto mode that picks between them. Faster than DuckDB on the TPC-H SF10 total.**
 
-[![PyPI](https://img.shields.io/pypi/v/mxframe)](https://pypi.org/project/mxframe/)
-[![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml)
-[![Platform](https://img.shields.io/badge/platform-linux--x86__64-lightgrey)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml)
-[![Docs](https://img.shields.io/badge/docs-interactive-6C3E78)](https://abhisheksreesaila.github.io/mxframe/)
+[![PyPI](https://img.shields.io/pypi/v/mxframe?color=f97316)](https://pypi.org/project/mxframe/) [![Mojo](https://img.shields.io/badge/engine-Mojo%201.1-ff4f00)](https://github.com/abhisheksreesaila/mxframe/tree/main/mojo) [![Mojo API](https://img.shields.io/badge/Mojo%20API-no%20Python-22c55e)](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mxframe-mojo-api.md) [![GPU](https://img.shields.io/badge/GPU-NVIDIA-76b900)](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) [![Python](https://img.shields.io/badge/python-3.12%2B-3776ab)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml) [![Docs](https://img.shields.io/badge/docs-interactive-a855f7)](https://abhisheksreesaila.github.io/mxframe/)
 
 📖 **[Interactive docs](https://abhisheksreesaila.github.io/mxframe/)**: [benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) · [how `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [how it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html)
 
-## Why MXFrame?
+## 🔥 Two ways in
 
-- **Fast on one machine.** A query plan runs in one call into a native Mojo executor, on every CPU core. It ran all 22 TPC-H queries at SF10 in 3.15 s, against 5.08 s for DuckDB and 14.40 s for Polars.
-- **Nothing new to learn.** A lazy, Polars-style DataFrame API plus SQL, over Apache Arrow. Results come back as `pyarrow` tables.
-- **The GPU when you have one.** `compute(device="gpu")` runs the plan on the GPU; `device="auto"` picks a device from costs it measures on your machine (it doesn't use the 0.6.0 native executor yet, see below).
+| | 🐍 **Python package** (`pip install mxframe`) | 🔥 **Mojo API** (`from mxframe import ...`) |
+|---|---|---|
+| For | notebooks, pipelines, SQL | apps and agents compiled in Mojo, e.g. [omxplorer](https://github.com/abhisheksreesaila/mxapp) |
+| Python | Arrow in, Arrow out | **none**: no libpython, links on Linux and macOS (arm64) |
+| Devices | 🟦 CPU · 🟩 GPU · 🟪 auto (a cost model calibrated on your machine) | 🟦 CPU · 🟩 GPU · 🟪 AUTO (GPU when a device copy is attached, CPU fallback with its reason) |
+| Bigger than memory | 💾 streams files, spills big joins to disk (Grace hash join) | 🚧 streamed Parquet in progress (F-140); in memory today |
+| Data | Parquet, Arrow, SQL | CSV (parallel, typed, import report), Parquet (zstd / snappy), edits, undo, formulas |
+
+```mermaid
+flowchart LR
+  F[("📄 CSV · Parquet")]:::io --> T["🗃️ Table / SharedTable"]:::core
+  T --> E["✏️ Frame: edits · undo · merges · formulas"]:::core --> Q["⚡ Query: where · group_by · agg"]:::q
+  T --> Q
+  Q -- AUTO --> C["🟦 CPU kernel, every core"]:::cpu
+  Q -- AUTO --> G["🟩 GPU kernel, DeviceTable"]:::gpu
+  C & G --> R["📊 QueryResult"]:::out
+  classDef io fill:#0ea5e9,stroke:#0369a1,color:#fff
+  classDef core fill:#f97316,stroke:#c2410c,color:#fff
+  classDef q fill:#a855f7,stroke:#7e22ce,color:#fff
+  classDef cpu fill:#2563eb,stroke:#1e40af,color:#fff
+  classDef gpu fill:#16a34a,stroke:#166534,color:#fff
+  classDef out fill:#eab308,stroke:#a16207,color:#000
+```
+
+```mojo
+from mxframe import read_csv, CsvOptions, Query, Frame, col, sum, count, AUTO
+
+var csv = read_csv("orders.csv", CsvOptions())       # parallel, typed, with an import report
+var orders = csv.take_table().share()
+var region = orders.column("region")
+var out = (Query(orders).where(col("qty") > 2)
+           .group_by(col("region"), groups=len(orders.dictionary(region)))
+           .agg(sum(col("revenue")), count()).compute(AUTO))      # out.device: where it ran
+var f = Frame(orders)                                 # a session's edits over shared data, no copy
+f.set_text(f.column("revenue"), 0, "99.00"); f.formula("net = revenue - qty")
+print(Query(f).agg(sum(col("net"))).compute().values(0)[0])     # decimals are exact scaled integers
+```
+
+Runnable as [`mojo/tools/readme_example.mojo`](https://github.com/abhisheksreesaila/mxframe/blob/main/mojo/tools/readme_example.mojo) (checked by `pixi run mojo-test`). Reference: [Mojo API](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mxframe-mojo-api.md) · [build switches](https://github.com/abhisheksreesaila/mxframe/blob/main/mojo/README.md) · build the package with `pixi run bash scripts/build_mojo_pkg.sh` → `build/mxframe.mojoc`.
 
 ## Latest release: 0.6.0
 
@@ -40,24 +73,13 @@ pip install "mxframe[runtime,sql]"   # pixi: pixi add --pypi "mxframe[sql]" (MAX
 import mxframe as mx
 
 lf = mx.scan_parquet("lineitem.parquet")
-out = (lf.filter(mx.col("l_quantity") < 24)
-         .groupby("l_returnflag")
+out = (lf.filter(mx.col("l_quantity") < 24).groupby("l_returnflag")
          .agg(mx.col("l_extendedprice").sum().alias("revenue"))
-         .sort("l_returnflag")
-         .compute(device="cpu"))   # a pyarrow Table
+         .sort("l_returnflag").compute(device="cpu"))   # a pyarrow Table
 print(out.to_pandas())
 ```
 
-```
-  l_returnflag       revenue
-0            A  1.222429e+10      # TPC-H SF1 lineitem, 6M rows
-1            N  2.520421e+10
-2            R  1.223160e+10
-```
-
-Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`. The default, `device="auto"`, runs the same native executor whenever it decides on the CPU (no GPU, GPU not warm, data on the host, or the cost model says CPU). It switches to the older fused pipeline only when the cost model predicts a CPU+GPU split of a fused aggregate that beats the native CPU executor, or when you pass `gpu_fraction`. `explain(device="auto", costs=True)` says which. auto's speed against `device="cpu"` has not been re-measured since 0.6.0 (F-053).
-
-Extras: `runtime` (the MAX engine; pixi users get it from conda instead), `sql` (sqlglot, for `mx.sql`), `polars` (for `.to_polars()`). The GPU path is validated on NVIDIA; AMD and Apple Silicon aren't yet. On import, MXFrame caps the Mojo runtime's GPU memory pool at 25% (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`, process-wide); set it higher before importing if a kernel needs more.
+Nothing runs until `.compute()`; then the plan is optimized and executed in one native call. The 0.6.0 numbers above are `device="cpu"`; the default, `device="auto"`, runs the same native executor whenever it decides on the CPU, and `explain(device="auto", costs=True)` says why. On main (F-058, quiet machine) auto took 2.75 s against cpu 2.67 s on all of SF10. Extras: `runtime` (the MAX engine; pixi users get it from conda), `sql` (sqlglot), `polars`. The GPU path is validated on NVIDIA; MXFrame caps the Mojo runtime's GPU memory pool at 25% on import (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT`).
 
 ## API reference
 
@@ -110,15 +132,7 @@ SQL covers `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON` and
 
 ## More
 
-| | |
-|---|---|
-| [Benchmarks (interactive)](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) | Every TPC-H and random query, against DuckDB and Polars; full tables in [docs/benchmarks.md](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/benchmarks.md) |
-| [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) | The path a query takes, for porting or extending the engine |
-| [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) | Each optimization, and which wins are Mojo; long form in [docs/optimizations.md](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md) |
-| [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) | CPU, GPU or both, from costs measured on your machine |
-| [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) | The longer API page; design and internal layers |
-| [Kernel visualizer](https://abhisheksreesaila.github.io/mxframe/visualize/mxframe_pipeline.html) | Step-by-step GPU kernel plans for Q4, Q6, Q12, Q13, Q14 and Q21 |
-| [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.6.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md) · [0.5.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.5.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md) | Release history; dev setup and writing Mojo kernels |
+[Benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) ([tables](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/benchmarks.md)) · [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) ([long form](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md)) · [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) · [Kernel visualizer](https://abhisheksreesaila.github.io/mxframe/visualize/mxframe_pipeline.html) · [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.6.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md)
 
 Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`.
 
