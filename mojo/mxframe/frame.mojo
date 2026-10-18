@@ -483,42 +483,59 @@ struct Frame(Movable):
 
     def permutation(self, c: Int, descending: Bool = False) raises -> List[Int]:
         """The live rows in the column's order, stable (ties keep row order); text alphabetical (ignoring ASCII case, bytes break ties; merges
-        applied), nulls last either way. The data never moves."""
-        var keys = List[Int64]()
-        var nulls = List[Bool]()
-        var rows = List[Int]()
-        var rank = List[Int64]()
+        applied), nulls last either way. The data never moves. A radix sort over Int64 keys; a column with no edits
+        is read straight from the shared values."""
+        var n = self.base.rows()
         var text = c < self.stored() and self.base.kind(c) == TEXT
+        var rank = List[Int64]()
         if text:                                             # each code's place among the words, alphabetically
-            var n = len(self.base.dictionary(c)) + len(self.words[c])
-            var order = List[Int]()
-            for k in range(n):
-                order.append(k)
-            _merge_sort_by_text(order, self, c)
-            rank = List[Int64](length=n, fill=0)
-            for i in range(n):
-                rank[order[i]] = Int64(i)
-        var prog = self.program(c) if c >= self.stored() else Expr(0)
-        for row in range(self.rows()):
-            if not self.alive(row):
-                continue
-            rows.append(row)
-            if c >= self.stored():
-                var v = self.evaluate(prog, row)
-                keys.append(v[0])
-                nulls.append(v[1])
-            else:
-                var raw = self._raw(c, row)
-                nulls.append(raw == NULL_EDIT)
-                var v = self.alias(c, raw) if raw != NULL_EDIT else 0
-                keys.append(rank[Int(v)] if text and raw != NULL_EDIT else v)
-        var idx = List[Int]()
-        for i in range(len(rows)):
-            idx.append(i)
-        _merge_sort_rows(idx, keys, nulls, descending)
-        var out = List[Int]()
-        for i in idx:
-            out.append(rows[i])
+            rank = _text_ranks(self, c)
+        var keys = List[Int64]()
+        var rows = List[Int]()
+        var nulls = List[Int]()
+        keys.reserve(self.rows())
+        rows.reserve(self.rows())
+        if c >= self.stored():
+            var prog = self.program(c)
+            for row in range(self.rows()):
+                if self.alive(row):
+                    var v = self.evaluate(prog, row)
+                    if v[1]:
+                        nulls.append(row)
+                    else:
+                        keys.append(v[0])
+                        rows.append(row)
+        else:
+            var edited = False
+            for key in self.cells.keys():
+                if (key & 0xFFFFF) == c:
+                    edited = True
+                    break
+            var merged = text and len(self.aliases) > 0
+            var some_nulls = self.base.null_count(c) > 0
+            var has_removed = len(self.removed) > 0
+            var vals = self.base.values(c)
+            for row in range(self.rows()):
+                if has_removed and row in self.removed:
+                    continue
+                var raw: Int64
+                if edited:
+                    raw = self._raw(c, row)
+                elif row >= n:
+                    raw = self.added[row - n][c]
+                elif some_nulls and self.base.is_null(c, row):
+                    raw = NULL_EDIT
+                else:
+                    raw = vals[row]
+                if raw == NULL_EDIT:
+                    nulls.append(row)
+                    continue
+                if merged:
+                    raw = self.alias(c, raw)
+                keys.append(rank[Int(raw)] if text else raw)
+                rows.append(row)
+        var out = _radix_order(keys, rows, descending)
+        out.extend(nulls^)
         return out^
 
     # ── saving ──────────────────────────────────────────────────────────────────────────────────────
@@ -548,10 +565,55 @@ def _ascii_lower(b: UInt8) -> UInt8:
     return b + 32 if UInt8(65) <= b <= UInt8(90) else b
 
 
-def _text_less(f: Frame, c: Int, a: Int, b: Int) -> Bool:
+def _text_ranks(f: Frame, c: Int) -> List[Int64]:
+    """Every code's place among the column's words (shared and session), alphabetical ignoring ASCII case with
+    bytes as the tie-break: rank[code], computed once."""
+    var n = f.word_count(c)
+    var words = List[String]()
+    for k in range(n):
+        words.append(f.text_of(c, Int64(k)))
+    var order = List[Int](length=n, fill=0)
+    for k in range(n):
+        order[k] = k
+    var tmp = List[Int](length=n, fill=0)
+    var width = 1
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var i = lo
+            var j = mid
+            var k = lo
+            while i < mid and j < hi:
+                if _text_less(words[order[j]], words[order[i]]):
+                    tmp[k] = order[j]
+                    j += 1
+                else:
+                    tmp[k] = order[i]
+                    i += 1
+                k += 1
+            while i < mid:
+                tmp[k] = order[i]
+                i += 1
+                k += 1
+            while j < hi:
+                tmp[k] = order[j]
+                j += 1
+                k += 1
+            lo += 2 * width
+        swap(order, tmp)
+        width *= 2
+    var rank = List[Int64](length=n, fill=0)
+    for i in range(n):
+        rank[order[i]] = Int64(i)
+    return rank^
+
+
+def _text_less(a: String, b: String) -> Bool:
     """Alphabetical ignoring ASCII case ("apple" before "Zebra"); words equal that way fall back to byte order."""
-    var x = f.text_of(c, Int64(a)).as_bytes()
-    var y = f.text_of(c, Int64(b)).as_bytes()
+    var x = a.as_bytes()
+    var y = b.as_bytes()
     for i in range(min(len(x), len(y))):
         if _ascii_lower(x[i]) != _ascii_lower(y[i]):
             return _ascii_lower(x[i]) < _ascii_lower(y[i])
@@ -563,80 +625,46 @@ def _text_less(f: Frame, c: Int, a: Int, b: Int) -> Bool:
     return False
 
 
-def _merge_sort_by_text(mut idx: List[Int], f: Frame, c: Int):
-    var n = len(idx)
-    var tmp = List[Int](length=n, fill=0)
-    var width = 1
-    while width < n:
-        var lo = 0
-        while lo < n:
-            var mid = min(lo + width, n)
-            var hi = min(lo + 2 * width, n)
-            var i = lo
-            var j = mid
-            var k = lo
-            while i < mid and j < hi:
-                if _text_less(f, c, idx[j], idx[i]):
-                    tmp[k] = idx[j]
-                    j += 1
-                else:
-                    tmp[k] = idx[i]
-                    i += 1
-                k += 1
-            while i < mid:
-                tmp[k] = idx[i]
-                i += 1
-                k += 1
-            while j < hi:
-                tmp[k] = idx[j]
-                j += 1
-                k += 1
-            lo += 2 * width
-        for t in range(n):
-            idx[t] = tmp[t]
-        width *= 2
-
-
-def _before(keys: List[Int64], nulls: List[Bool], a: Int, b: Int, descending: Bool) -> Bool:
-    """Does row a sort strictly before row b? Nulls last; ties are not before (stability)."""
-    if nulls[a] or nulls[b]:
-        return not nulls[a] and nulls[b]
-    return keys[a] > keys[b] if descending else keys[a] < keys[b]
-
-
-def _merge_sort_rows(mut idx: List[Int], keys: List[Int64], nulls: List[Bool], descending: Bool):
-    """A stable bottom-up merge sort of row positions."""
-    var n = len(idx)
-    var tmp = List[Int](length=n, fill=0)
-    var width = 1
-    while width < n:
-        var lo = 0
-        while lo < n:
-            var mid = min(lo + width, n)
-            var hi = min(lo + 2 * width, n)
-            var i = lo
-            var j = mid
-            var k = lo
-            while i < mid and j < hi:
-                if _before(keys, nulls, idx[j], idx[i], descending):
-                    tmp[k] = idx[j]
-                    j += 1
-                else:
-                    tmp[k] = idx[i]
-                    i += 1
-                k += 1
-            while i < mid:
-                tmp[k] = idx[i]
-                i += 1
-                k += 1
-            while j < hi:
-                tmp[k] = idx[j]
-                j += 1
-                k += 1
-            lo += 2 * width
-        for t in range(n):
-            idx[t] = tmp[t]
-        width *= 2
+def _radix_order(keys: List[Int64], rows: List[Int], descending: Bool) -> List[Int]:
+    """`rows` ordered by `keys` (same length), stable. LSD radix sort, 16 bits a pass, only the passes the keys'
+    range needs; descending flips the keys, so equal keys still keep their order."""
+    var n = len(keys)
+    var u = List[UInt64](length=n, fill=0)
+    var lo = UInt64.MAX
+    var hi = UInt64(0)
+    for i in range(n):
+        var k = keys[i].cast[DType.uint64]() ^ (UInt64(1) << 63)      # signed order as unsigned order
+        if descending:
+            k = ~k
+        u[i] = k
+        lo = min(lo, k)
+        hi = max(hi, k)
+    var idx = List[Int](length=n, fill=0)
+    for i in range(n):
+        u[i] -= lo
+        idx[i] = rows[i]
+    var span = hi - lo if n > 0 else UInt64(0)
+    var u2 = List[UInt64](length=n, fill=0)
+    var i2 = List[Int](length=n, fill=0)
+    var counts = List[Int](length=65537, fill=0)
+    var shift = 0
+    while shift < 64 and (span >> UInt64(shift)) != 0:
+        for d in range(65537):
+            counts[d] = 0
+        for i in range(n):
+            counts[Int((u[i] >> UInt64(shift)) & 0xFFFF) + 1] += 1
+        for d in range(65536):
+            counts[d + 1] += counts[d]
+        for i in range(n):
+            var d = Int((u[i] >> UInt64(shift)) & 0xFFFF)
+            var at = counts[d]
+            counts[d] = at + 1
+            u2[at] = u[i]
+            i2[at] = idx[i]
+        swap(u, u2)
+        swap(idx, i2)
+        shift += 16
+    return idx^
 
 
 # ── the formula parser (the app's grammar and decimal rules) ──────────────────────────────────────────
