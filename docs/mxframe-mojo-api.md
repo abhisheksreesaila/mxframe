@@ -70,6 +70,8 @@ f.set(c, row, value); f.set_text(c, row, "West")     # set_text parses by kind; 
 f.append(values: List[String]) -> Int                # a new row, returns its number
 f.remove(row)                                        # a tombstone; f.alive(row)
 f.undo() -> Bool; f.edits -> Int                     # edit counter: hosts re-aggregate when it moves
+f.edited(c, row) -> Bool                              # the cell holds a session edit (grids mark it)
+f.word_count(c) -> Int                                # shared words + words this session added
 f.changed_rows() -> List[Int]                        # rows that differ from the shared base
 f.merge(c, codes, into) -> Int                       # fold text values into one (a cleaning step), undoable
 f.bake() -> Table                                    # edits applied, for saving
@@ -128,9 +130,10 @@ What omxplorer runs today, all through one call, `group_sum(frame, gf, key, valu
 ```mojo
 f.permutation(c, descending=False) -> List[Int]   # row order; the data never moves
 ```
-Stable, over any column including formulas and edited cells. Text should sort alphabetically; today it sorts by
-dictionary code (the order values first appeared), a known gap. Today: a radix sort, 0.02 s at 1M rows, 3.7 s at
-100M. Next: multi-column sort.
+Stable, over any column including formulas and edited cells; nulls last in both directions, removed rows left out.
+Text sorts alphabetically ignoring ASCII case, byte order breaking ties ("apple" before "Zebra"; pending the owner's
+review). A radix sort over Int64 keys: about 25-30 ms at 1M rows for text and narrow integers, 55-75 ms for full-range
+int64 (informal, F-138a). Next: multi-column sort.
 
 ## 7. GPU memory
 - A device copy of a table, **uploaded once per process**, shared by every session; `release()` to give it back when a document closes.

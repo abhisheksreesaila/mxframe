@@ -1341,10 +1341,11 @@ Needs: F-134, F-135, F-136, F-137
 
 - Split (2026-10-17) after a read-only map of the app (`examples/omxplorer`, `mojoui/sheetpage|reportpage|omxfile|csvio.mojo`): package gaps are F-138a and F-138b, the app's switch is F-138c. Done when all three are done and the acceptance check above holds
 
-## F-138a Package gaps the app needs: edited cells, word counts, a fast sort [review]
+## F-138a Package gaps the app needs: edited cells, word counts, a fast sort [done]
 Needs: F-136 · `mojo/mxframe/frame.mojo`
 - [x] `Frame.edited(c, row) -> Bool` (the DataGrid marks edited cells; today the app reads the private cell key) and `Frame.word_count(c)` (shared + session words)
 - [x] `permutation(c, descending)` is a radix sort over Int64 keys (text: by alphabetical rank of each code, computed once over the words), with a fast path for a column with no edits through `values(c)`; still stable, nulls last, removed rows left out. 1M rows under 0.1 s (the app's budget is 1 s; the stand-in does 0.02 s)
+- Review: PASS (29 random runs equal to the merge-sort oracle; full-range int64 at 1M rows is 53-74 ms, text 22-24 ms). Taken: a merge never touches a number column (`alias` keyed `(c << 32) | code` read an INT value of `1<<32 | 2` as a merged code; only text columns are looked up now, tested red then green); the API doc's sort and edit sections. Left: the random oracle's fast-path branches (append / remove / merge with no cell edits) are covered by the reviewer's probes, not the suite
 
 ## F-138b The package links on the Mac with no GPU, Python or codecs [todo]
 Needs: F-137 · `query.mojo`, `gpu.mojo`, `kernels_aot/_fpenv.mojo`, `parquet.mojo`

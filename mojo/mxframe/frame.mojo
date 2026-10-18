@@ -304,7 +304,7 @@ struct Frame(Movable):
 
     def alias(self, c: Int, code: Int64) -> Int64:
         """The code a text value reads as: itself, or the one it was merged into (never a chain)."""
-        if len(self.aliases) == 0:
+        if len(self.aliases) == 0 or self.base.kind(c) != TEXT:   # only text codes merge; a number is a value
             return code
         var hit = self.aliases.get(Self._alias_key(c, code))
         return hit.value() if hit else code

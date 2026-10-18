@@ -621,6 +621,27 @@ def test_a_frame_with_only_appended_rows() raises:
     expect(len(f.overlay().mask) > 0, "a mask once a shared row changes")
 
 
+def test_a_merge_never_touches_a_number_column() raises:
+    var t = Table.empty()
+    _ = t.add_column("big", INT)
+    _ = t.add_column("word", TEXT)
+    var collides = (Int64(1) << 32) | 2                    # the merge key of (column 1, code 2), held as a number
+    t.append(0, collides)
+    t.append_text(1, "a")
+    t.append(0, Int64(7))
+    t.append_text(1, "b")
+    t.append(0, Int64(1))
+    t.append_text(1, "c")
+    var f = Frame(t^.share())
+    _ = f.merge(1, [Int64(2)], Int64(0))                   # "c" folds into "a"
+    expect(f.get(0, 0) == collides, "a number is a value, never a merged code: " + String(f.get(0, 0)))
+    expect(f.bake().get(0, 0) == collides, "and bakes as itself")
+    var p = f.permutation(0, False)
+    expect(p[0] == 2 and p[1] == 1 and p[2] == 0, "sort and get agree")
+    var r = Query(f).agg(max_of(col("big"))).compute()
+    expect(Int64(r.values(0)[0]) == collides, "and a query reads it too")
+
+
 def test_a_group_nulled_only_by_edits_is_not_present() raises:
     var t = Table.empty()
     var g = t.add_column("g", INT)
@@ -641,6 +662,7 @@ def test_a_group_nulled_only_by_edits_is_not_present() raises:
 
 
 def main() raises:
+    test_a_merge_never_touches_a_number_column()
     test_a_refused_redefinition_leaves_the_frame_as_it_was()
     test_redefining_a_formula_refreshes_what_reads_it()
     test_text_sorts_ignoring_case_with_bytes_as_the_tie_break()
