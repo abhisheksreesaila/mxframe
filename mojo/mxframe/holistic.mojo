@@ -1110,7 +1110,7 @@ struct HolStates(Movable):
                         var lo = pct_of[spec.src].vals[q][g]
                         var hi = pct_of[spec.src].vals[q + 1][g]
                         var sum = Int64(lo) + Int64(hi)
-                        if ((Int64(lo) ^ sum) & (Int64(hi) ^ sum)) < 0 or sum > Int64.MAX // 5 or sum < Int64.MIN // 5:
+                        if ((Int64(lo) ^ sum) & (Int64(hi) ^ sum)) < 0 or sum > Int64.MAX // 5 or sum < -(Int64.MAX // 5):   # (Int64.MIN // 5 floors: one step too far)
                             raise Error("median: the middle of group " + String(g) + " is too large for its mean at one more decimal place in int64 (about 9.2e17 at the column's scale)")
                         m[g] = Int(sum * 5)
                     res.vals.append(m^)

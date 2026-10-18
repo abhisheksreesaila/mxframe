@@ -123,8 +123,8 @@ def compare(got, want, groups, which, label):
                     assert abs(exact - want_f) <= abs(want_f) * Fraction(1, 10**9), f"{tag}: {exact} != {want_f}"
                     if abs(want_f) < 2**50:
                         assert exact == want_f, f"{tag}: {exact} != {want_f}"
-                else:                                # a DECIMAL(18, 2): ours at scale 3 is exact, DuckDB's is rounded to scale 2
-                    assert abs(Fraction(a["vals"][gi], 1000) - Fraction(w)) <= Fraction(1, 200), f"{tag}: {a['vals'][gi]} vs {w}"
+                else:                                # a DECIMAL(18, 2): ours at scale 3 is exact; DuckDB floors it to scale 2
+                    assert a["vals"][gi] // 10 == int(Fraction(w) * 100), f"{tag}: {a['vals'][gi]} vs {w}"
             elif kind == "value":
                 assert (a["present"][gi] == 1) == (w is not None), f"{tag}: present {a['present'][gi]} vs {w}"
                 if w is None:

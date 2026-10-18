@@ -408,6 +408,22 @@ def test_a_median_too_large_for_one_more_decimal_place_raises() raises:
     except e:
         msg = String(e)
     expect("median" in msg and "too large" in msg, "an overflowing median says so: " + msg)
+    for v in [Int64(-922337203685477581), Int64(-922337203685477582)]:   # one step past the negative limit
+        var n = Table.empty()
+        var c = n.add_column("v", INT)
+        n.append(c, v)
+        var nmsg = String("")
+        try:
+            var r = Query(n^.share()).agg(median(col("v"))).compute()
+            nmsg = "returned " + String(r.values(0)[0])
+        except e:
+            nmsg = String(e)
+        expect("too large" in nmsg, "a negative median past the limit raises, never wraps: " + nmsg)
+    var edge = Table.empty()
+    var ec = edge.add_column("v", INT)
+    edge.append(ec, Int64(-922337203685477580))
+    var at = Query(edge^.share()).agg(median(col("v"))).compute()
+    expect(Int64(at.values(0)[0]) == Int64(-9223372036854775800), "the negative limit itself is exact")
 
 
 def test_a_huge_k_is_clamped_or_refused_never_wrapped() raises:
