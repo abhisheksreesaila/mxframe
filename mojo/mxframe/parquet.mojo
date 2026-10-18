@@ -78,6 +78,9 @@ comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
 comptime INT32_MAX = 2147483647
+# A page can claim at most this many values per byte (+ 8 bytes): a repeated RLE value, or an all-null level run, is the
+# densest thing a writer emits. Past it the file is refused instead of sizing a column for the claim.
+comptime MAX_VALUES_PER_BYTE = 1 << 20
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
 
 
@@ -1013,7 +1016,7 @@ struct _Ctx(Copyable, Movable):
     var add: Bool                    # new words are added to the table (else a word that is missing is a corrupt file)
     var dict: List[Int64]            # the chunk's dictionary page as stored values (file-wide codes for TEXT)
     var row0: Int                    # the chunk's first row in the output column
-    var rows: Int
+    var dict_seen: Bool              # its dictionary page was read (a second one is a corrupt file)
 
 
 struct _WordIndex(Movable):
@@ -1279,7 +1282,7 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
             var take = left if groups >= (left + 7) // 8 else groups * 8
             if w == 0:
                 if dn < 1:
-                    raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                    raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
                 for i in range(take):
                     dout[got + i] = d[0]
             elif w <= 32:
@@ -1299,7 +1302,7 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
                     acc >>= UInt64(w)
                     have -= w
                     if ix >= dn:
-                        raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                        raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
                     dout[got + i] = d[ix]
                 c.pos += (take * w + 7) // 8
             else:
@@ -1307,7 +1310,7 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
                 _unpack(c, w, take, idx)
                 for i in range(take):
                     if idx[i] < 0 or Int(idx[i]) >= dn:
-                        raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                        raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
                     dout[got + i] = d[Int(idx[i])]
             got += take
         else:
@@ -1315,7 +1318,7 @@ def _dict_into(mut c: _Bytes, leaf: _Leaf, dict: List[Int64], count: Int, dout: 
             if w > 0 and w < 64:
                 v &= Int64((UInt64(1) << UInt64(w)) - 1)
             if v < 0 or Int(v) >= dn:
-                raise Error("column `" + leaf.name + "`: a dictionary index is dout of range (corrupt file)")
+                raise Error("column `" + leaf.name + "`: a dictionary index is out of range (corrupt file)")
             var run = min(h >> 1, left)
             var x = d[Int(v)]
             for i in range(run):
@@ -1470,6 +1473,9 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             raise Error("column `" + leaf.name + "`: a page runs past the end of the file (corrupt file)")
         pos = body_at + csize
         if ptype == PAGE_DICTIONARY:
+            if ctx.dict_seen:
+                raise Error("column `" + leaf.name + "`: a chunk has two dictionary pages (corrupt file)")
+            ctx.dict_seen = True
             if nvals > 8 * usize + 8:
                 raise Error("column `" + leaf.name + "`: a dictionary page holds more values than its bytes can (corrupt file)")
             var page = List[UInt8]()
@@ -1483,6 +1489,9 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             continue                                     # an index page: not needed
         if nvals > meta.values - done:
             raise Error("column `" + leaf.name + "`: a page holds more values than its column chunk (corrupt file)")
+        if nvals > (usize + 8) * MAX_VALUES_PER_BYTE:           # the columns are sized from these claims: refuse what no page of that size holds
+            raise Error("column `" + leaf.name + "`: a page claims " + String(nvals) + " values in only " + String(usize) +
+                        " bytes (corrupt file)")
         var dict_coded = encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY
         if words_only and dict_coded:
             done += nvals
@@ -1506,7 +1515,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
     var rows = -1
     for k in range(len(metas)):
         ctxs.append(_Ctx(leaf_ids[k], out_cols[k], metas[k].codec, leaves[leaf_ids[k]].repetition == OPTIONAL, widxs[k],
-                         add_words, List[Int64](), row0, metas[k].values))
+                         add_words, List[Int64](), row0, False))
         if rows < 0:
             rows = metas[k].values
         elif metas[k].values != rows:
@@ -1531,8 +1540,14 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
             var dst = 0
             if not words_only:
                 dst = Int(t.cols[ctx.col].values.unsafe_ptr()) + pages[i].row * 8
-            _decode_page(pages[i], ctx, leaves[ctx.leaf], dst, tbl)
+            try:
+                _decode_page(pages[i], ctx, leaves[ctx.leaf], dst, tbl)
+            except e:
+                pages[i].err = String(e)                # reported with the others, in page order
     if words_only:
+        for i in range(len(pages)):
+            if pages[i].err.byte_length() > 0:
+                raise Error(pages[i].err)
         return
     var parallel = List[Int]()
     for i in range(len(pages)):
