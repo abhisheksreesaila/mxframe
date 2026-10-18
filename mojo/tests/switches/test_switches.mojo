@@ -5,7 +5,8 @@
 from std.sys import argv
 from std.os import getenv
 from mxframe import (Table, SharedTable, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
-                     gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY)
+                     gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY,
+                     count_distinct, median, percentile, top_k)
 from mxframe.query import AUTO_GPU_MIN_ROWS
 from mxframe.kernels._fpenv import core_count
 
@@ -54,6 +55,23 @@ def main() raises:
     for i in range(0, n, 3):
         want0 += i
     expect(auto.sums[0] == want0, "and sums them exactly: " + String(auto.sums[0]) + " vs " + String(want0))
+
+    # count_distinct / percentile / top_k with no thread pool (every task runs in a loop on this thread), against a hand count
+    var hol = Query(shared).group_by(col("k"), groups=3).agg(count_distinct(col("v") % 1000), median(col("v")), percentile(col("v"), 0.9),
+                                                             top_k(col("v"), 2)).compute(AUTO)
+    for g in range(3):
+        var m = (n - g + 2) // 3                                  # group g holds v = g, g + 3, g + 6, ... below n
+        var idx = Int(0.5 * Float64(m))
+        if Float64(idx) < 0.5 * Float64(m):
+            idx += 1
+        var idx9 = Int(0.9 * Float64(m))
+        if Float64(idx9) < 0.9 * Float64(m):
+            idx9 += 1
+        expect(hol.values(0)[g] == 1000, "count_distinct(v % 1000) of group " + String(g) + ": " + String(hol.values(0)[g]))
+        expect(hol.values(1)[g] == g + 3 * (idx - 1), "median of group " + String(g) + ": " + String(hol.values(1)[g]))
+        expect(hol.values(2)[g] == g + 3 * (idx9 - 1), "p90 of group " + String(g) + ": " + String(hol.values(2)[g]))
+        var top = hol.top(3, g)
+        expect(len(top) == 2 and top[0] == g + 3 * (m - 1) and top[1] == g + 3 * (m - 2), "top 2 of group " + String(g))
 
     # no thread pool: the parallel CSV reader runs its chunks one after the other
     var csv = String("/tmp/mxframe-switches.csv")
