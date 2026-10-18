@@ -2441,53 +2441,112 @@ struct ParquetScan(Copyable, Movable):
 
 # ── a row group read block by block (F-149) ──────────────────────────────────────────────────────────
 
-comptime MORSEL_UNSUPPORTED = "this row group has a page a block reader does not read"
-
-
-struct GroupReader(Movable):
-    """One row group of a scan, decoded a block of `block` rows at a time by the thread that owns it: the headers are
-    walked and the dictionaries decoded when it is opened, then `next_block` decodes the next rows of each column read
-    into the caller's table, pages one after the other (a page is decompressed when its first block is wanted and
-    dropped when its last block has been), so the working set is a block and the page being read per column. Only
-    dictionary-indexed pages and PLAIN fixed-width pages are cut into blocks; a page of another encoding (text,
-    booleans, delta) is decoded whole when its first block is wanted and copied block by block; nothing here uses the
-    thread pool."""
+struct GroupPlan(Movable):
+    """One row group of a scan, opened: the page headers of the columns read are walked and the dictionaries decoded.
+    Read only from then on, so any number of `GroupReader`s (the row-range morsels of the group) can share it."""
     var scan: ParquetScan
-    var maps: List[_Mapped]          # the chunks, while the headers are walked and the dictionaries decoded
-    var page_maps: List[_Mapped]     # per page: its bytes, mapped while its blocks are read (the resident set is a page)
+    var cols: List[Int]
     var ctxs: List[_Ctx]
     var pages: List[_Page]
     var of_col: List[List[Int]]      # per column read: its data pages, in row order
-    var cur: List[Int]               # per column read: the page of `of_col` being read
-    var cols: List[Int]
     var rows: Int
-    var block: Int
-    var at: Int                      # the first row of the next block
 
-    def __init__(out self, var scan: ParquetScan, cols: List[Int], block: Int):
+    def __init__(out self, var scan: ParquetScan, cols: List[Int]):
         self.scan = scan^
-        self.maps = List[_Mapped]()
-        self.page_maps = List[_Mapped]()
+        self.cols = cols.copy()
         self.ctxs = List[_Ctx]()
         self.pages = List[_Page]()
         self.of_col = List[List[Int]]()
-        self.cur = List[Int]()
-        self.cols = cols.copy()
         self.rows = 0
+
+
+def open_plan(scan: ParquetScan, g: Int, cols: List[Int]) raises -> GroupPlan:
+    """Opens row group `g`: its headers are walked and its dictionaries decoded here. The dictionaries of the TEXT
+    columns in `cols` must have been built (`ParquetScan.ensure_words`)."""
+    var plan = GroupPlan(scan.copy(), cols)
+    ref info = scan._info[]
+    info.check_unchanged()
+    var maps = List[_Mapped]()                           # the chunks, while the headers are walked and the dictionaries decoded
+    var rows = -1
+    for k in range(len(cols)):
+        var c = cols[k]
+        ref meta = info.groups[g][c]
+        var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, meta, info.leaves[c], maps)
+        plan.ctxs.append(_Ctx(c, k, meta.codec, info.leaves[c].repetition == OPTIONAL,
+                              Int(info.widx.unsafe_ptr() + c) if scan.schema.kind(c) == TEXT else 0, False, List[Int64](), 0, False))
+        if rows < 0:
+            rows = meta.values
+        elif meta.values != rows:
+            raise Error("column `" + info.leaves[c].name + "` has " + String(meta.values) + " rows in this row group, column `" +
+                        info.leaves[cols[0]].name + "` has " + String(rows) + " (corrupt file)")
+        if meta.group_rows >= 0 and meta.values != meta.group_rows:
+            raise Error("column `" + info.leaves[c].name + "` has " + String(meta.values) + " values in a row group of " +
+                        String(meta.group_rows) + " rows (corrupt file)")
+        _walk_chunk(src[0], src[1], meta, info.leaves[c], plan.ctxs[k], k, 0, plan.pages, False)
+        plan.of_col.append(List[Int]())
+    plan.rows = max(rows, 0)
+    for i in range(len(plan.pages)):
+        if plan.pages[i].is_dict:
+            var k = plan.pages[i].ctx
+            _decode_dict_page(plan.pages[i], plan.ctxs[k], info.leaves[cols[k]], 0)
+    _ = maps^                                            # the chunks are let go: pages are mapped one at a time from here
+    for i in range(len(plan.pages)):
+        ref p = plan.pages[i]
+        if p.is_dict:
+            continue
+        var pt = info.leaves[cols[p.ctx]].ptype
+        var dict_coded = p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY
+        if not (dict_coded or (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED))):
+            p.whole = True                               # text, booleans, delta: decoded whole, copied block by block
+        plan.of_col[p.ctx].append(i)
+    return plan^
+
+
+struct GroupReader(Movable):
+    """Rows [r0, r1) of a row group (a row-range morsel), decoded a block of `block` rows at a time by the thread that
+    owns it: `next_block` decodes the next rows of each column read into the caller's table, pages one after the other
+    (a page is mapped, decompressed and its levels unpacked when its first block is wanted, and dropped when its last
+    block has been), so the working set is a block and the page being read per column. Only dictionary-indexed and
+    PLAIN fixed-width pages are cut into blocks; a page of another encoding (text, booleans, delta) is decoded whole when
+    its first block is wanted and copied block by block. The reader has its own copy of the page descriptors and shares
+    the plan's dictionaries (read only); nothing here uses the thread pool. The plan must outlive the reader."""
+    var plan: Int                    # the address of the `GroupPlan`
+    var scan: ParquetScan
+    var cols: List[Int]
+    var pages: List[_Page]
+    var of_col: List[List[Int]]
+    var page_maps: List[_Mapped]     # per page: its bytes, mapped while its blocks are read (the resident set is a page)
+    var cur: List[Int]               # per column read: the page of `of_col` being read
+    var block: Int
+    var at: Int                      # the first row of the next block
+    var stop: Int                    # and the end of the range
+
+    def __init__(out self, plan: GroupPlan, r0: Int, r1: Int, block: Int):
+        self.plan = Int(UnsafePointer(to=plan))
+        self.scan = plan.scan.copy()
+        self.cols = plan.cols.copy()
+        self.pages = plan.pages.copy()
+        self.of_col = plan.of_col.copy()
+        self.page_maps = List[_Mapped]()
+        for _ in range(len(plan.pages)):
+            self.page_maps.append(_Mapped())
+        self.cur = List[Int](length=len(plan.cols), fill=0)
         self.block = block
-        self.at = 0
+        self.at = r0
+        self.stop = min(r1, plan.rows)
 
     def next_block(mut self, mut t: Table) raises -> Int:
         """Decodes the next block into rows 0.. of `t`'s columns (in the order of `cols`; each holds at least `block`
         values), sets their validity bitmaps and null counts, and returns the number of rows (0 at the end)."""
-        if self.at >= self.rows:
+        if self.at >= self.stop:
             return 0
         var b0 = self.at
-        var b1 = min(self.rows, b0 + self.block)
+        var b1 = min(self.stop, b0 + self.block)
         ref info = self.scan._info[]
+        ref plan = UnsafePointer[GroupPlan, MutAnyOrigin](unsafe_from_address=self.plan)[]
         for k in range(len(self.cols)):
             ref col = t.cols[k]
-            ref ctx = self.ctxs[k]
+            ref ctx = plan.ctxs[k]
             ref leaf = info.leaves[self.cols[k]]
             if ctx.optional:
                 col.validity.clear()
@@ -2535,7 +2594,9 @@ struct GroupReader(Movable):
                         g += self.block
                     _prep_page(p, ctx, leaf, cuts)
                 var sidx = p.sl.next
-                if p.row + p.sl.row[sidx] != max(b0, p.row):
+                while sidx < len(p.sl.row) and p.row + p.sl.row[sidx] < max(b0, p.row):      # (a range that starts mid-page)
+                    sidx += 1
+                if sidx >= len(p.sl.row) or p.row + p.sl.row[sidx] != max(b0, p.row):
                     raise Error("internal error: a block does not start at a slice")
                 _decode_slice(p, sidx, ctx, leaf, base + (p.row - b0) * 8)
                 var r0 = p.sl.row[sidx]
@@ -2559,50 +2620,6 @@ struct GroupReader(Movable):
             col.nulls = nulls
         self.at = b1
         return b1 - b0
-
-
-def open_group(scan: ParquetScan, g: Int, cols: List[Int], block: Int) raises -> GroupReader:
-    """Opens row group `g` for `next_block`: its headers are walked and its dictionaries decoded here. The dictionaries
-    of the TEXT columns in `cols` must have been built (`ParquetScan.ensure_words`)."""
-    var r = GroupReader(scan.copy(), cols, block)
-    ref info = scan._info[]
-    info.check_unchanged()
-    var rows = -1
-    for k in range(len(cols)):
-        var c = cols[k]
-        ref meta = info.groups[g][c]
-        var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, meta, info.leaves[c], r.maps)
-        r.ctxs.append(_Ctx(c, k, meta.codec, info.leaves[c].repetition == OPTIONAL,
-                           Int(info.widx.unsafe_ptr() + c) if scan.schema.kind(c) == TEXT else 0, False, List[Int64](), 0, False))
-        if rows < 0:
-            rows = meta.values
-        elif meta.values != rows:
-            raise Error("column `" + info.leaves[c].name + "` has " + String(meta.values) + " rows in this row group, column `" +
-                        info.leaves[cols[0]].name + "` has " + String(rows) + " (corrupt file)")
-        if meta.group_rows >= 0 and meta.values != meta.group_rows:
-            raise Error("column `" + info.leaves[c].name + "` has " + String(meta.values) + " values in a row group of " +
-                        String(meta.group_rows) + " rows (corrupt file)")
-        _walk_chunk(src[0], src[1], meta, info.leaves[c], r.ctxs[k], k, 0, r.pages, False)
-        r.of_col.append(List[Int]())
-        r.cur.append(0)
-    r.rows = max(rows, 0)
-    for i in range(len(r.pages)):
-        if r.pages[i].is_dict:
-            var k = r.pages[i].ctx
-            _decode_dict_page(r.pages[i], r.ctxs[k], info.leaves[cols[k]], 0)
-    r.maps = List[_Mapped]()                             # the chunks are let go: pages are mapped one at a time from here
-    for _ in range(len(r.pages)):
-        r.page_maps.append(_Mapped())
-    for i in range(len(r.pages)):
-        ref p = r.pages[i]
-        if p.is_dict:
-            continue
-        var pt = info.leaves[cols[p.ctx]].ptype
-        var dict_coded = p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY
-        if not (dict_coded or (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED))):
-            p.whole = True                               # text, booleans, delta: decoded whole, copied block by block
-        r.of_col[p.ctx].append(i)
-    return r^
 
 
 def scan_parquet(path: String) raises -> ParquetScan:

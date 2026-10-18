@@ -4,8 +4,21 @@
 # Usage: pq_scan_probe <path> <scan|read> <query>     (tests/test_mojo_parquet.py, scripts/bench_scan_memory.py)
 # The file has: region (string), carrier (int64), day (date), revenue (decimal(.., 2)), cost (int64).
 from std.sys import argv
+from std.os import getenv
 from mxframe import (Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of, read_parquet, scan_parquet,
-                     CPU, AUTO)
+                     CPU, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
+
+
+
+def _morsel_mode() -> Int:
+    """The scan's morsel switch from the environment (this tool only: the library reads no environment)."""
+    var m = getenv("MXFRAME_SCAN_MORSELS")
+    return MORSELS_ON if m == "1" else MORSELS_OFF if m == "0" else MORSELS_AUTO
+
+
+def _block_rows() raises -> Int:
+    var n = getenv("MXFRAME_MORSEL_ROWS")
+    return Int(n) if n.byte_length() > 0 else 0
 
 
 def plan(var q: Query, which: String, nreg: Int, east: Int) raises -> Query:
@@ -55,7 +68,7 @@ def main() raises:
             east = max(scan.code_of(c, "East"), 0)
             for w in range(nreg):
                 words += scan.text_of(c, w) + "\x1f"
-        r = plan(Query(scan), which, nreg, east).compute(AUTO)
+        r = plan(Query(scan), which, nreg, east).morsels(_morsel_mode()).block_rows(_block_rows()).compute(AUTO)
     else:
         var rp = read_parquet(path)
         var t = rp.take_table().share()
