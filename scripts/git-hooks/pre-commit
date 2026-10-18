@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Refuses a commit that changes a kernel source (kernels_aot/*.mojo) while a committed library is stale
+# (tests/test_kernel_hashes.py). Rebuild with `bash scripts/build_pipeline.sh` and stage the .so + .sources.json.
+# Installed by `git config core.hooksPath scripts/git-hooks`.
+set -euo pipefail
+if git diff --cached --name-only | grep -qE '^kernels_aot/.*\.mojo$'; then
+  if ! pixi run -q python -m pytest -q -p no:cacheprovider tests/test_kernel_hashes.py > /tmp/mxframe-kernel-hashes.log 2>&1; then
+    echo "pre-commit: a kernel source changed but its library was not rebuilt:" >&2
+    grep -E "stale|FAILED" /tmp/mxframe-kernel-hashes.log | head -10 >&2
+    echo "rebuild with: pixi run bash scripts/build_pipeline.sh  (then stage the .so and .sources.json files)" >&2
+    exit 1
+  fi
+fi

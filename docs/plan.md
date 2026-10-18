@@ -1347,7 +1347,7 @@ Needs: F-136 · `mojo/mxframe/frame.mojo`
 - [x] `permutation(c, descending)` is a radix sort over Int64 keys (text: by alphabetical rank of each code, computed once over the words), with a fast path for a column with no edits through `values(c)`; still stable, nulls last, removed rows left out. 1M rows under 0.1 s (the app's budget is 1 s; the stand-in does 0.02 s)
 - Review: PASS (29 random runs equal to the merge-sort oracle; full-range int64 at 1M rows is 53-74 ms, text 22-24 ms). Taken: a merge never touches a number column (`alias` keyed `(c << 32) | code` read an INT value of `1<<32 | 2` as a merged code; only text columns are looked up now, tested red then green); the API doc's sort and edit sections. Left: the random oracle's fast-path branches (append / remove / merge with no cell edits) are covered by the reviewer's probes, not the suite
 
-## F-138b The package links on the Mac with no GPU, Python or codecs [review]
+## F-138b The package links on the Mac with no GPU, Python or codecs [done]
 Needs: F-137 · `query.mojo`, `gpu.mojo`, `kernels_aot/_fpenv.mojo`, `parquet.mojo`
 - [x] GPU code compiled only where there is a GPU build (`comptime if` on the target, as the app's D-56): on other targets `DeviceTable` / `compute(GPU)` raise "no GPU on this build" and `AUTO` is the CPU
 - [x] the CPU thread pool falls back to a serial loop where the Mojo async runtime is not linked (a build switch), so the Mac binary needs only libSystem
@@ -1361,6 +1361,7 @@ Needs: F-137 · `query.mojo`, `gpu.mojo`, `kernels_aot/_fpenv.mojo`, `parquet.mo
 - Kernel libraries rebuilt (`_fpenv.mojo`, `pipeline_cpu.mojo`: cpu, exec, keys, join, kernels_aot); full suite `pixi run test -n 8`: 23,348 passed
 - Not done / open: a launch error on AUTO raising is by construction (no catch around the launch), not tested (no way to cause one); the Windows/Android targets are untested (Android is Linux to Mojo: it would need `-D MXFRAME_NO_GPU`)
 - Review: NEEDS WORK, fixed: the switch test now reads a quoted-newline CSV in 4 KB chunks on 4 "threads" and compares it cell for cell with one chunk, and checks `core_count() == 1` (a no-op serial loop now fails it: 20000 vs 0 rows; before, the test never ran `par`); Android (Mojo's Linux) needs all three `-D` flags, in the README; serial tasks must not wait on each other (in `_fpenv`); a no-codec build names the right reason for gzip / brotli; the unreachable -6 fallback dropped; `fallback_reason` and "no GPU on this build" in the API doc. Left (unsure, untested): a sticky CUDA error raised while allocating a later AUTO query's buffers would be labelled an allocation failure (its text is kept in `fallback_reason`)
+- Review round 2: NEEDS WORK (the `_fpenv` docstring left five CPU libraries stale: `test_kernel_hashes` 5 failed), fixed by rebuilding them; a pre-commit hook (`scripts/git-hooks/pre-commit`, `core.hooksPath`) now refuses a staged `kernels_aot/*.mojo` while a library is stale. Full suite: 23,348 passed, 288 skipped. Reviewer: PASS once rebuilt and green
 
 ## F-138c omxplorer on the package (app repo, `mxapp/mojo-ui`) [todo]
 Needs: F-138a, F-138b (can start on Linux before them)
