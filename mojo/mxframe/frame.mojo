@@ -467,6 +467,7 @@ struct Frame(Movable):
         var o = Overlay(self.base)
         o.formulas = self.formulas.copy()
         o.aliases = self.aliases.copy()
+        o.words = self.words.copy()
         var n = self.base.rows()
         var changed = self.changed_rows()
         if len(changed) > 0:
@@ -568,10 +569,16 @@ def _ascii_lower(b: UInt8) -> UInt8:
 def _text_ranks(f: Frame, c: Int) -> List[Int64]:
     """Every code's place among the column's words (shared and session), alphabetical ignoring ASCII case with
     bytes as the tie-break: rank[code], computed once."""
-    var n = f.word_count(c)
     var words = List[String]()
-    for k in range(n):
+    for k in range(f.word_count(c)):
         words.append(f.text_of(c, Int64(k)))
+    return text_ranks(words)
+
+
+def text_ranks(words: List[String]) -> List[Int64]:
+    """Every code's place among `words` (code order), alphabetical ignoring ASCII case with bytes as the tie-break:
+    rank[code]. The order of `permutation` and of a text percentile / top_k."""
+    var n = len(words)
     var order = List[Int](length=n, fill=0)
     for k in range(n):
         order[k] = k
@@ -827,9 +834,11 @@ struct Overlay(Copyable, Movable):
     var aliases: Dict[Int, Int64]
     var mask: List[UInt8]                # empty: no shared row changed; else bit 1 = the shared row is unchanged
     var delta: List[List[Int64]]         # the live changed and appended rows' stored values (NULL_EDIT: null)
+    var words: List[List[String]]        # per stored column: the words the session added (codes after the dictionary)
 
     def __init__(out self, base: SharedTable):
         self.base = base
+        self.words = List[List[String]]()
         self.formulas = List[Formula]()
         self.aliases = Dict[Int, Int64]()
         self.mask = List[UInt8]()

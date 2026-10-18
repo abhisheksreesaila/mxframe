@@ -4,7 +4,8 @@
 # and open). `mojo_entry` is the entry point the app's Mac build links with (`-e _mojo_entry`).
 from std.ffi import c_int
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
-                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD)
+                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
+                     count_distinct, median, percentile, top_k)
 
 
 def run() raises:
@@ -20,6 +21,8 @@ def run() raises:
     var q = Query(f).group_by(col("k"), 3).agg(sum(col("v")), count())
     var r = q.compute(AUTO)
     print(r.counts[0], r.device, gpu_available())
+    var h = Query(f).group_by(col("k"), 3).agg(count_distinct(col("v")), median(col("v")), percentile(col("v"), 0.9), top_k(col("v"), 2)).compute(AUTO)
+    print(h.values(0)[0], h.values(1)[0], h.top(3, 0).__len__())
     try:
         var d = DeviceTable(shared)                  # raises "no GPU on this build" off Linux
         _ = Query(shared).on_device(d).agg(count()).compute(GPU)
