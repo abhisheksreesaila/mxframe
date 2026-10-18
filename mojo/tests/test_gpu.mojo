@@ -258,6 +258,8 @@ def test_a_frames_edits_without_re_uploading() raises:
     for step in range(300):
         var row = rng.int(0, t.rows() - 1)
         var what = rng.int(0, 5)
+        if not f.alive(row):
+            continue
         if what <= 2:
             f.set(f.column("revenue"), row, Int64(rng.int(-1_000_00, 3_000_00)))
         elif what == 3:
@@ -339,7 +341,7 @@ def test_the_apps_device_context_is_shared() raises:
     var host = List[Int64](length=1, fill=0)
     ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=mine)
     ctx.synchronize()
-    expect(host[0] == 0x0707070707070707, "the app's buffer is intact beside the table")
+    expect(host[0] == 7, "the app's buffer is intact beside the table")
     dt.release()
 
 

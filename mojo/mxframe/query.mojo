@@ -869,6 +869,7 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
     ctx.enqueue_copy(dst_ptr=ovf.unsafe_ptr(), src_buf=d_ovf)
     ctx.synchronize()
     _ = code^, consts^, cols^, dtypes^, ident^
+    _ = dmask^, d_code^, d_consts^, d_cols^, d_dt^, d_ident^, d_set^, d_vals^, d_cnt^, d_scratch^, d_ovf^   # Mojo frees at last use: the device buffers must outlive the kernel
     if ovf[0] != 0:
         raise Error("a sum or an expression passed the int64 range (about 9.2e18)")
     return _make_result(p, out_vals, out_cnt)
