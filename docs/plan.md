@@ -1346,13 +1346,19 @@ Needs: F-136 · `mojo/mxframe/frame.mojo`
 - [ ] `Frame.edited(c, row) -> Bool` (the DataGrid marks edited cells; today the app reads the private cell key) and `Frame.word_count(c)` (shared + session words)
 - [ ] `permutation(c, descending)` is a radix sort over Int64 keys (text: by alphabetical rank of each code, computed once over the words), with a fast path for a column with no edits through `values(c)`; still stable, nulls last, removed rows left out. 1M rows under 0.1 s (the app's budget is 1 s; the stand-in does 0.02 s)
 
-## F-138b The package links on the Mac with no GPU, Python or codecs [todo]
+## F-138b The package links on the Mac with no GPU, Python or codecs [review]
 Needs: F-137 · `query.mojo`, `gpu.mojo`, `kernels_aot/_fpenv.mojo`, `parquet.mojo`
-- [ ] GPU code compiled only where there is a GPU build (`comptime if` on the target, as the app's D-56): on other targets `DeviceTable` / `compute(GPU)` raise "no GPU on this build" and `AUTO` is the CPU
-- [ ] the CPU thread pool falls back to a serial loop where the Mojo async runtime is not linked (a build switch), so the Mac binary needs only libSystem
-- [ ] a no-codec build switch: Parquet saves UNCOMPRESSED and refuses to read zstd / snappy pages with a readable error; Linux keeps both
-- [ ] from F-137 review: the AUTO fallback test no longer fills GPU 0 (capped or opt-in); AUTO falls back only on allocation failure or a declined program and records why on the result (a launch error or illegal address raises); drop `uploads()`
-- [ ] proof: an arm64-apple-macosx14.0 object of a small program over the package links against the app's `apple/sdk/*.tbd` with only the app's allowed symbols
+- [x] GPU code compiled only where there is a GPU build (`comptime if` on the target, as the app's D-56): on other targets `DeviceTable` / `compute(GPU)` raise "no GPU on this build" and `AUTO` is the CPU
+- [x] the CPU thread pool falls back to a serial loop where the Mojo async runtime is not linked (a build switch), so the Mac binary needs only libSystem
+- [x] a no-codec build switch: Parquet saves UNCOMPRESSED and refuses to read zstd / snappy pages with a readable error; Linux keeps both
+- [x] from F-137 review: the AUTO fallback test no longer fills GPU 0 (capped or opt-in); AUTO falls back only on allocation failure or a declined program and records why on the result (a launch error or illegal address raises); drop `uploads()`
+- [x] proof: an arm64-apple-macosx14.0 object of a small program over the package links against the app's `apple/sdk/*.tbd` with only the app's allowed symbols
+
+- Switches (`mojo/README.md`, last section): `MXFRAME_NO_GPU`, `MXFRAME_SERIAL`, `MXFRAME_NO_CODECS`, each on by default for every non-Linux target (GPU: the target, as D-56) and forced on Linux with `-D`; tested on Linux by `mojo/tests/switches/test_switches.mojo` (run by `pixi run mojo-test`)
+- Proof: `scripts/check_mac_link.sh` (probe over the package, `arm64-apple-macosx14.0`, linked with the app's `ld64.lld` line, tbd stubs and `mojo_rt` stand-ins). The app's libSystem stub and `ALLOWED` lack the file calls the package needs (`open read close lseek mmap munmap rename unlink stat lstat mkdir getpid strerror __error`): F-138c adds them. `madvise` is Linux-only now (the hugepage constant is not Darwin's)
+- AUTO fallback: only an allocation failure or a declined program (-5 / -6), with `QueryResult.fallback_reason`; `uploads()` dropped. The full-device test is opt-in (`MXFRAME_TEST_FILL_GPU=1`): a cap cannot work because the device allocator pools, so the piece that crosses any margin takes all the memory left
+- Kernel libraries rebuilt (`_fpenv.mojo`, `pipeline_cpu.mojo`: cpu, exec, keys, join, kernels_aot); full suite `pixi run test -n 8`: 23,348 passed
+- Not done / open: a launch error on AUTO raising is by construction (no catch around the launch), not tested (no way to cause one); the Windows/Android targets are untested (Android is Linux to Mojo: it would need `-D MXFRAME_NO_GPU`)
 
 ## F-138c omxplorer on the package (app repo, `mxapp/mojo-ui`) [todo]
 Needs: F-138a, F-138b (can start on Linux before them)
