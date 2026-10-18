@@ -1468,3 +1468,108 @@ Needs: F-138a, F-138b (can start on Linux before them)
 - [ ] `.omx` v2: `write_parquet(f.bake(), metadata=json)` / `read_parquet`; a small Mojo JSON reader; v1 files refused with a clear message (or migrated); Report filter stored as a word
 - [ ] `scripts/check` passes with the same numbers (checker needles and tests updated where the behaviour rightly changed, recorded in `docs/decisions.md`); the omxplorer Linux binary passes the no-libpython guard; mxstudio and the workbook keep the stand-in
 - Review round 1: NEEDS WORK (a lone JSON surrogate and a 0-column file aborted the app), fixed with a 40k-input JSON fuzz; round 2: PASS (360/360 blank-group cells against a row-by-row count, Mac M4 check real). Merged with the app's Goal 19 (agent host: omxplorer driven over MCP passes on the package). App main fast-forwarded to 93f6dbe (local, not pushed). Goals 14 / 15 / 17 / 19 pass; the only failure is goal 7 M2's Android emulator install (a debug-keystore mismatch, environmental). Owner calls pending: case-insensitive sort, (blank) group, uncompressed .omx (63 MB at 1M rows until Mac codecs)
+
+## M8: SQL and joins in the Mojo API (brief `docs/briefs/mojo-api.md` M8)
+Design (2026-10-18, Plan agent, read-only survey of query.mojo, the kernels the package carries, sql_frontend.py, join_engine.py, grace.py / spill.py, docs/design/partitioned-hash-join.md and omxplorer's needs-mxframe.md):
+- SQL text and the Query builder both lower to one logical plan (the PlanNode list, extended: source, right, how, keys, names, sort, limit, offset, distinct; groups=0 = unknown) → rule rewrites (folding, pushdown, pruning, OR common factor, IN / EXISTS → semi / anti, CTEs, decorrelation) → a physical planner behind a `Planner` trait that reads only `Stats` and records every decision with its reason; `PlannerOptions` forces each choice, so tests reach every path and assert which ran → an executor of Sources (Table, Frame mask + delta, ParquetScan morsels) × front operators (fused join probe) × Sinks (dense / hashed / holistic aggregate, rows, top-k, join build, spill)
+- every SQL result is an owned `Table` (`SqlResult`): HAVING, CTEs, Explore step caches and a workbook's second table compose from it; the builder keeps its documented rules (`QueryResult` unchanged, gains `to_table()`)
+- SQL gets its own lowering mode: three-valued logic, a NULL group, only non-empty groups, unknown key ranges, SUM / MIN / MAX / AVG of nothing is NULL
+- one hash-join kernel shared with the Python engine (`kernels_aot/hashjoin_cpu.mojo`, closing F-046a slice 1); fused FK→PK probes in `pipeline_fused`'s front stage (no joined rows written), materialized pairs otherwise
+- risks: the SQL parser / binder is the largest new code (a DuckDB subset; every unsupported form raises by name); 48 registers / 64 constants per program (IN lists through OP_IN_SET; past the registers a readable error, never a wrong answer); m:n expansion inside the fused stage; package compile time (split modules)
+Order: F-150 → F-151 → F-152 → F-153 → F-154 → F-155 (F-156 / F-157 in parallel after F-150) → F-158 → F-159 → F-160 → F-161 → F-162; F-163 / F-164 wait for the owner. Oracle: DuckDB on data it generates (DECIMAL / DATE TPC-H via `dbgen`, random tables with nulls, text, mixed-scale decimals), each SQL string through `mx` (from F-151) and DuckDB; every test asserts the path that ran. Sizes: S ≤ 2 days, M 3-5, L 1-2 weeks.
+
+## F-150 M8: SQL aggregate queries over one table (SELECT … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT), results as a Table, EXPLAIN [todo]
+Needs: F-133, F-148 · Size: L · new `mojo/mxframe/sql.mojo` (lexer, parser, AST), `bind.mojo` (Catalog, binder, typed expressions), `plan.mojo`, `planner.mojo` (`Planner` trait, `RulePlanner`, `Stats`, `PlannerOptions`), `query.mojo` (SQL lowering mode) · omxplorer Query mode (SQL cells, EXPLAIN, HAVING)
+- [ ] `sql(catalog, text) -> SqlResult` (`table`, `explain`, `ms`, `device`, `fallback_reason`, `notes`) over one table / Frame (overlay snapshot, version = `edits`) / ParquetScan registered by name; DuckDB dialect subset: SELECT list with aliases, WHERE (= != < <= > >= BETWEEN, AND / OR / NOT, IN lists, IS [NOT] NULL, text and DATE literals, decimal literals at the column's scale), GROUP BY columns / expressions / ordinals / aliases, HAVING, ORDER BY (keys, aggregates, aliases, ordinals; ASC / DESC; NULLS FIRST / LAST, NULLS LAST by default), LIMIT / OFFSET; SUM, COUNT(*), COUNT(x), COUNT(DISTINCT x), MIN, MAX, AVG, MEDIAN, QUANTILE_DISC; + - * // % on INT / DECIMAL (scales aligned as DuckDB). Anything else raises naming the construct and its line / column
+- [ ] SQL semantics, distinct from the builder's (unchanged): three-valued logic in WHERE / HAVING; NULL is a group; only groups with rows; SUM / MIN / MAX / AVG of no non-null value is NULL; a global aggregate over no rows returns one row; a word absent from the dictionary matches nothing; a sum past int64 raises (documented difference from DuckDB's HUGEINT)
+- [ ] group strategy chosen by the planner and shown in EXPLAIN: dense (word counts, BOOL, or a min / max pass cached per table version; mixed-radix composite with a NULL slot per nullable key) up to a bound, else hashed (`hashagg_cpu.hash_aggregate`; holistic over hashed keys in two passes); `PlannerOptions` forces either, tests run both
+- [ ] AVG and `/` results are FLOAT (result-only kind until F-157), AVG correctly rounded from the exact sum and count; HAVING and post-aggregate expressions run as a Query over the result table
+- [ ] `EXPLAIN <query>`: logical plan after rewrites and the physical plan with each decision, its reason and its numbers
+- [ ] equal to DuckDB on generated tables with nulls, mixed-scale decimals, dates, 8 / 10k / 1M groups, through a table, a Frame after 300 edits and a 13-row-group scan; ORDER BY without ties compared in order, else as sets; error messages for 20 unsupported or misspelled queries tested whole
+
+## F-151 M8: `mx`, the agent command line (SQL in, JSON / CSV / Parquet out, EXPLAIN, schema) [todo]
+Needs: F-150 · Size: M · `mojo/cli/mx.mojo`, `scripts/build_mx.sh` → `build/mx`; the libpython guard covers it
+- [ ] `mx sql "<SQL>" [-t name=path ...] [--format json|jsonl|csv|parquet --out f] [--max-rows N (default 1000)] [--device cpu|gpu|auto]`; `FROM 'x.parquet'` / `'x.csv'` read directly (Parquet streamed when over a quarter of memory)
+- [ ] `mx explain [--analyze] "<SQL>"`; `mx schema <file>`: columns, kinds, scales, rows, row groups, null counts, distinct words, first values
+- [ ] JSON `{"columns":[{"name","kind","scale"}],"rows":[[...]],"row_count","truncated","ms","device","notes"}`; DECIMAL as exact number text, DATE "yyyy-mm-dd", TEXT the word, null; errors `{"error":{"message","line","column","hint"}}`, exit 1 (query) / 2 (usage)
+- [ ] pytest oracle harness `tests/mx_oracle.py` (a SQL string through `build/mx` and DuckDB, typed values compared exactly); F-150's suite moved onto it; no libpython; Mac link check green
+
+## F-152 M8: SQL row queries: projections, SELECT *, DISTINCT, ORDER BY and top-k, OFFSET (Source x Sink executor) [todo]
+Needs: F-150 · Size: L · `exec.mojo` (new), `query.mojo` (reorganized as Source x Sink without behaviour change), `frame.mojo` (multi-key radix)
+- [ ] executor split into Sources and Sinks; every existing Mojo test and the pyarrow / DuckDB suites unchanged
+- [ ] materialize sink: the kernel's block hook writes selected rows and computed registers (the `_mat_hook` pattern), compacted by a prefix sum into an output Table; TEXT keeps source words (compact result dictionary)
+- [ ] ORDER BY on several keys (stable LSD radix; text by the decided SQL order), NULLS FIRST / LAST; ORDER BY + LIMIT k (+ OFFSET) as per-worker heaps in the hook; LIMIT alone stops a scan early; SELECT DISTINCT as a group-by on all selected columns
+- [ ] equal to DuckDB: `SELECT *`, expressions, WHERE + ORDER BY + LIMIT over 1M rows with ties, DISTINCT over text + int + null, OFFSET past the end, on table / frame / scan; informal timings vs DuckDB
+
+## F-153 M8: a second table and the inner equi-join (Catalog, hash join kernel, fused aggregate, row output) [todo]
+Needs: F-152 · Size: L · `kernels_aot/hashjoin_cpu.mojo` (new: int64-pointer API, shared with the Python engine), `bind.mojo`, `planner.mojo`, `exec.mojo`, `query.mojo` (`Query.join(other, on, how)`) · omxplorer: a second table, Explore's join step
+- [ ] Catalog with several named sources; qualified and aliased names, ambiguous bare names raise; `JOIN … ON a.k = b.k [AND …]`, comma joins with WHERE equalities, `USING`
+- [ ] hash table: keys normalized to one int64 (single column; composites packed when ranges fit, else tuple hash + column compare); direct array (CSR when keys repeat) when range ≤ max(8n, 2^20) and ≤ 2^28, else radix partitions sized from L2, linear probing, CSR rows in build order, parallel build without atomics; presence bitmap; group prefetch in the probe
+- [ ] fused probe for unique build keys (`pipeline_fused` front stage: probe filter, lookups, build columns gathered into block scratch, then the aggregate program); repeated keys or row output → materialized pairs (counted first; past the budget a readable error); build side = fewer rows after filters
+- [ ] exactness: NULL keys never match; TEXT keys across dictionaries by a once-per-dictionary code translation (byte-exact, session words included); DECIMAL across scales aligned; INT = scale 0; DATE vs INT, text vs number and narrowed columns refused readably; int64 keys past 2^53 exact
+- [ ] equal to DuckDB: FK-PK and many-to-many, composite keys, text keys with different dictionaries and case variants, mixed scales, null keys, empty sides, a hot key; aggregates and row output; through `Query.join` and SQL; tests assert fused vs materialized and the build side
+
+## F-154 M8: LEFT, SEMI and ANTI joins; IN / EXISTS / NOT IN / NOT EXISTS subqueries (uncorrelated) [todo]
+Needs: F-153 · Size: M
+- [ ] LEFT JOIN (null build columns, fused and row output); SEMI / ANTI; IN (SELECT) / EXISTS → semi, NOT EXISTS → anti, NOT IN → null-aware anti; RIGHT / FULL / CROSS raise by name
+- [ ] build side = the right for left / semi / anti; presence bitmap or mark flags for semi / anti
+- [ ] equal to DuckDB with nulls on both sides, empty sides, NOT IN with and without NULLs, a left join counted per left row (Q13's shape)
+
+## F-155 M8: multi-way joins and the cost-based planner (join order, build sides, EXPLAIN ANALYZE) [todo]
+Needs: F-154 · Size: L
+- [ ] join trees flattened to leaves + key edges + residuals (the `join_engine._flatten` model); leaf filters first, exact filtered counts; greedy order over every start leaf (port of `plan_order`); build side per join; star probes in one fused stage; cross-leaf residuals as soon as their leaves are joined; OR common factor
+- [ ] `PlannerOptions`: written order, forced build side, forced fused / materialized, memory budget; decisions in EXPLAIN, actual rows per operator in EXPLAIN ANALYZE
+- [ ] equal to DuckDB on 3-6 table joins (TPC-H Q3, Q5, Q7, Q8, Q9, Q10 shapes, dbgen SF0.1) and with every forced order; the planner's choice never slower than the written order beyond noise (informal)
+
+## F-156 M8: SQL expressions: CASE, COALESCE, CAST, text and date functions [todo]
+Needs: F-150 (parallel with F-153..F-155) · Size: M
+- [ ] CASE WHEN, COALESCE / IFNULL, NULLIF, exact CASTs, IN lists through OP_IN_SET, `IS DISTINCT FROM`
+- [ ] text functions once per dictionary word (a TEXTMAP: code remap or new dictionary): LIKE / ILIKE, starts_with, contains, lower / upper / trim / substr / length / ||
+- [ ] dates: EXTRACT, date_trunc, date ± INTERVAL, date differences in integer civil-date arithmetic
+- [ ] division / modulo by zero, decimal result scales, integer `/` → FLOAT as DuckDB; past the register limit a readable error, never a wrong answer; equal to DuckDB per function × nulls × case / accents × leap years and pre-1970 dates
+
+## F-157 M8: FLOAT64 as a column kind [todo, owner decision]
+Needs: F-150 (parallel) · Size: L · real files and the repo's own TPC-H Parquet (`float` money columns) are refused today
+- [ ] FLOAT kind (float64 bits in the Int64 column); Parquet FLOAT / DOUBLE read and written; CSV exponents and decimals past 4 places as FLOAT when asked
+- [ ] comparisons, arithmetic, SUM / AVG in float64 with a defined order (reproducible, F-064), MIN / MAX, group and join keys with -0.0 = 0.0 and one NaN, NaN ordered as DuckDB
+- [ ] equal to DuckDB (1e-12 relative; keys exact) on the repo's TPC-H SF1 Parquet for single-table queries
+
+## F-158 M8: joins and big GROUP BYs over streamed files and edited frames [todo]
+Needs: F-155 · Size: L
+- [ ] a ParquetScan probe streamed by F-149's morsels through the fused stage (build table shared read-only); a scan or Frame build side materialized from a projection (budget checked while it grows)
+- [ ] Frames on either side: mask + delta rows on the probe side; edits, appends, removes, merges and formulas on the build side
+- [ ] hashed GROUP BY over a scan: per-morsel partials merged across row groups (exact int64 sums)
+- [ ] equal to read_parquet + bake() and DuckDB; peak memory one build side + one row group per worker (measured)
+
+## F-159 M8: CTEs, derived tables and subqueries [todo]
+Needs: F-155, F-156 · Size: L
+- [ ] WITH and derived tables: inlined when referenced once, materialized once otherwise (in EXPLAIN); views
+- [ ] scalar subqueries (empty → NULL; more than one row raises); correlated subqueries decorrelated into join + aggregate or EXISTS with extra conditions (Q2, Q17, Q20, Q21, Q22 shapes); unsupported forms raise by name
+- [ ] UNION ALL (dictionaries merged); equal to DuckDB per form × empty inner × NULLs in the correlated column
+
+## F-160 M8: Explore mode support: named steps, step caching, previews [todo]
+Needs: F-158, F-159 · Size: M · omxplorer Explore mode
+- [ ] `catalog.view(name, sql | Query)`; steps read earlier steps by name; `catalog.preview(name, rows=100)` pushes LIMIT down
+- [ ] step cache keyed by canonical plan text + input versions (frame `edits`, file size and mtime, upstream keys); LRU by bytes; an upstream edit invalidates exactly the steps below it (tested by counting kernel runs)
+- [ ] clean steps as SQL over dictionaries (no per-row work); `COPY (query) TO 'f.parquet'` through `ParquetWriter`
+
+## F-161 M8: join speed: m:n inside the fused probe, radix-partitioned probe, runtime join filters [todo]
+Needs: F-155 · Size: L · engine-first; F-058's losses are joins
+- [ ] one-to-many expansion inside the front stage (no materialized pairs for aggregates over m:n joins)
+- [ ] radix-partitioned probe when the table is over L3 / 2 and the probe ≥ 4x the build; runtime join filter (a bitmap of surviving probe keys trims the build side)
+- [ ] the Python engine's joins call the same kernel (closing F-046a slice 1), suites green
+- [ ] informal timings on dbgen SF1 / SF10 (Q3, Q12, Q18 shapes, the random suite's join shape) through `mx` vs DuckDB, A/B against F-155
+
+## F-162 M8 gate: TPC-H 22 and the random suite through `mx sql` equal DuckDB [todo]
+Needs: F-157, F-159, F-161 · Size: M
+- [ ] the 22 TPC-H queries as DuckDB writes them on dbgen SF1 (DECIMAL / DATE) and the repo's SF1 Parquet (FLOAT), equal to DuckDB; the random suite through `mx` equal to DuckDB; EXPLAINs and timings recorded, not gated (benchmarks paused)
+- [ ] omxplorer runs a SQL cell, EXPLAIN, a two-table join and a cached Explore pipeline on the package (its own goal checks)
+
+## F-163 Grace hash join: build sides bigger than the memory budget [todo, owner decision]
+Needs: F-158 · Size: L · port of `grace.py` / `spill.py`; until then an oversized build raises a readable budget error before allocating
+- [ ] both sides hash-partitioned (salted; NULL keys in their own partition, still emitted for left / anti) into 16 raw column files (free-space check, removed on success and error); pairs joined one at a time with the rest of the plan; re-split with another salt to a max depth, then a readable error naming the hot key
+- [ ] equal to the in-memory join and DuckDB with a forced small budget; peak memory under the budget (measured)
+
+## F-164 `mx` Arrow IPC output [todo, owner decision]
+Needs: F-151 · Size: M
+- [ ] `--format arrow`: an Arrow IPC stream (int64, decimal128, date32, utf8 / dictionary, bool, float64, validity) that pyarrow and DuckDB read back exactly
