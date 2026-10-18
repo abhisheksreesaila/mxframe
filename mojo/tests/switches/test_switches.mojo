@@ -112,8 +112,9 @@ def main() raises:
     expect("`qty`" in s and "snappy" in s and "no zstd or snappy" in s, "a snappy file is refused: `" + s + "`")
     var scanned = String("")
     try:
-        _ = scan_parquet(String(args[1]))
+        var zs = scan_parquet(String(args[1]))        # opens (the footer); its text is read lazily
+        _ = zs.word_count(zs.index("region"))
     except e:
         scanned = String(e)
-    expect("zstd" in scanned and "no zstd or snappy" in scanned, "a zstd file cannot be scanned: `" + scanned + "`")
+    expect("zstd" in scanned and "no zstd or snappy" in scanned, "a zstd file's text cannot be scanned: `" + scanned + "`")
     print("ok")

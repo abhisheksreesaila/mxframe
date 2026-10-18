@@ -22,6 +22,8 @@ def plan(var q: Query, which: String, nreg: Int, east: Int) raises -> Query:
         return q^.group_by(least(col("day") // 30, lit(99)), groups=100).agg(count(), sum(col("cost")))
     if which == "global":
         return q^.agg(sum(col("cost")), count(), min_of(col("revenue")), max_of(col("revenue")), mean(col("cost")))
+    if which == "sum_v":                   # files with no region column (unique-id text + ints)
+        return q^.agg(sum(col("v")), count())
     if which == "big":                     # the memory proof: two columns of the file
         return q^.group_by(col("region"), groups=nreg).agg(sum(col("cost")), count())
     raise Error("unknown query " + which)
@@ -46,16 +48,26 @@ def main() raises:
     if mode == "scan":
         var scan = scan_parquet(path)
         var c = scan.index("region")
-        for w in range(scan.word_count(c)):
-            words += scan.text_of(c, w) + "\x1f"
-        r = plan(Query(scan), which, scan.word_count(c), max(scan.code_of(c, "East"), 0)).compute(AUTO)
+        var nreg = 1
+        var east = 0
+        if c >= 0:
+            nreg = scan.word_count(c)
+            east = max(scan.code_of(c, "East"), 0)
+            for w in range(nreg):
+                words += scan.text_of(c, w) + "\x1f"
+        r = plan(Query(scan), which, nreg, east).compute(AUTO)
     else:
         var rp = read_parquet(path)
         var t = rp.take_table().share()
         var c = t.index("region")
-        for w in range(len(t.dictionary(c))):
-            words += t.text_of(c, w) + "\x1f"
-        r = plan(Query(t), which, len(t.dictionary(c)), max(t.code_of(c, "East"), 0)).compute(AUTO)
+        var nreg = 1
+        var east = 0
+        if c >= 0:
+            nreg = len(t.dictionary(c))
+            east = max(t.code_of(c, "East"), 0)
+            for w in range(nreg):
+                words += t.text_of(c, w) + "\x1f"
+        r = plan(Query(t), which, nreg, east).compute(AUTO)
     var out = String('{"words": "') + words.replace("\x1f", "|") + '", "device": ' + String(r.device) + ', "ms": ' + String(r.milliseconds)
     out += ', "peak_kb": ' + String(peak_kb()) + ', "kinds": ['
     for i in range(len(r.kinds)):
