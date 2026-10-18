@@ -29,8 +29,7 @@ from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
 from .table import SharedTable, Table, TEXT
-from .parquet import ParquetScan, open_group, MORSEL_UNSUPPORTED
-from std.os import getenv
+from .parquet import ParquetScan, GroupPlan, GroupReader, open_plan
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
@@ -172,6 +171,8 @@ struct Query(Movable):
     var overlay: Overlay
     var device: Optional[DeviceTable]
     var scan: Optional[ParquetScan]      # a Parquet file streamed one row group at a time (`Query(scan)`)
+    var _morsels: Int                    # a Parquet scan by morsels: MORSELS_AUTO, MORSELS_ON or MORSELS_OFF (F-149)
+    var _block_rows: Int                 # ... in blocks of this many rows (0: SCAN_BLOCK_ROWS)
     var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
 
@@ -180,6 +181,8 @@ struct Query(Movable):
         self.device = None
         self.scan = None
         self._window_rows = 0
+        self._morsels = MORSELS_AUTO
+        self._block_rows = 0
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
         self.overlay = Overlay(table)
@@ -191,6 +194,8 @@ struct Query(Movable):
         self.table = scan.schema
         self.device = None
         self._window_rows = 0
+        self._morsels = MORSELS_AUTO
+        self._block_rows = 0
         self.scan = scan.copy()
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
@@ -200,6 +205,8 @@ struct Query(Movable):
         self.table = frame.base
         self.device = None
         self._window_rows = 0
+        self._morsels = MORSELS_AUTO
+        self._block_rows = 0
         self.scan = None
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
@@ -239,6 +246,17 @@ struct Query(Movable):
             self.nodes[at].aggs.append(a.copy())
         return self^
 
+    def morsels(var self, mode: Int) -> Self:
+        """How a Parquet scan runs: MORSELS_AUTO (by row-range morsels on all cores when the file is big enough),
+        MORSELS_ON (always: tests, timing) or MORSELS_OFF (a row group at a time). The answer is the same."""
+        self._morsels = mode
+        return self^
+
+    def block_rows(var self, rows: Int) -> Self:
+        """The rows a morsel worker decodes and aggregates at a time (default SCAN_BLOCK_ROWS)."""
+        self._block_rows = rows
+        return self^
+
     def on_device(var self, device_table: DeviceTable) raises -> Self:
         """Attaches the device copy of this query's table, so `compute(GPU)` (and AUTO, on a big table) can use it.
         Explicit rather than a process-wide registry: Mojo has no safe mutable globals, the app owns the one
@@ -256,7 +274,7 @@ struct Query(Movable):
         live DeviceTable is attached and the table has `AUTO_GPU_MIN_ROWS` rows or more, else the CPU). The result is
         the same either way, edits of a frame included."""
         if self.scan:
-            return _compute_scan(self.scan.value(), self.nodes, device)
+            return _compute_scan(self.scan.value(), self.nodes, device, self._morsels, self._block_rows)
         var holistic = False
         for node in self.nodes:
             for a in node.aggs:
@@ -1456,24 +1474,22 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
             break
 
 
-# ── a Parquet scan by morsels: a worker per row group, blocks of ~64k rows (F-149) ───────────────────
+# ── a Parquet scan by morsels: row ranges of row groups on every core, blocks of rows (F-149) ────────
 
 comptime SCAN_BLOCK_ROWS = 32768
+comptime MORSELS_AUTO = 0
+comptime MORSELS_ON = 1
+comptime MORSELS_OFF = 2
+comptime MORSELS_PER_WORKER = 3      # about this many row-range morsels a worker, so the last round is not a long tail
 
 
-def _morsel_env(name: String) -> String:
-    return getenv(name)
-
-
-def _use_morsels(groups: Int) -> Bool:
-    """Morsels when there are at least as many row groups as workers (fewer: the slicing of big pages keeps the cores
-    busy). MXFRAME_SCAN_MORSELS=1 forces them, =0 forbids them (tests, A/B timing)."""
-    var mode = _morsel_env("MXFRAME_SCAN_MORSELS")
-    if mode == "1":
-        return groups > 0
-    if mode == "0":
+def _use_morsels(mode: Int, rows: Int, block: Int) -> Bool:
+    """Morsels unless forbidden; on AUTO only when there is more than a few blocks of rows and more than one core."""
+    if mode == MORSELS_ON:
+        return rows > 0
+    if mode == MORSELS_OFF:
         return False
-    return core_count() > 1 and groups >= core_count()
+    return core_count() > 1 and rows >= 8 * block
 
 
 def _identity_partial(n_slots: Int, groups: Int, ops: List[Int]) -> QueryResult:
@@ -1486,26 +1502,31 @@ def _identity_partial(n_slots: Int, groups: Int, ops: List[Int]) -> QueryResult:
 
 
 struct _MorselRun(Movable):
-    var ok: Bool                     # False: a page the block reader does not read, the caller scans group by group
-    var parts: List[QueryResult]     # per row group, in order: its partial result (the layout of `_lower(.., force_counts)`)
-    var errs: List[String]           # per row group: its error, "" when none
-    var nulls: List[List[Int]]       # per row group: the nulls of each column read
+    var tgroup: List[Int]            # per morsel (in order: row group, then row range): its row group, as an index of `todo`
+    var parts: List[QueryResult]     # its partial result (the layout of `_lower(.., force_counts)`)
+    var derrs: List[String]          # its decode error ("" when none)
+    var kerrs: List[String]          # its first kernel error (the rest of its blocks are decoded but not aggregated)
+    var nulls: List[List[Int]]       # the nulls of each column it read
+    var gerrs: List[String]          # per row group: an error opening it
 
     def __init__(out self):
-        self.ok = True
+        self.tgroup = List[Int]()
         self.parts = List[QueryResult]()
-        self.errs = List[String]()
+        self.derrs = List[String]()
+        self.kerrs = List[String]()
         self.nulls = List[List[Int]]()
+        self.gerrs = List[String]()
 
 
-def _morsel_group(scan: ParquetScan, g: Int, used: List[Int], nodes: List[PlanNode], n_slots: Int, groups: Int,
-                  ops: List[Int], block: Int, mut part: QueryResult, mut tally: List[Int]) raises:
-    """One worker's row group: decode block after block, run the kernel (one thread) on each, fold the block's partial
-    into the group's in block order."""
-    var reader = open_group(scan, g, used, block)
+def _morsel_task(plan: GroupPlan, r0: Int, r1: Int, used: List[Int], nodes: List[PlanNode], n_slots: Int, groups: Int,
+                 ops: List[Int], block: Int, mut part: QueryResult, mut tally: List[Int], mut kernel_error: String) raises:
+    """Rows [r0, r1) of a row group on one worker: decode block after block, run the kernel (one thread) on each, fold the
+    block's partial into the morsel's in block order. A kernel error is kept and the remaining blocks are still decoded
+    (not aggregated), so a decode error later in the range is the one raised, as when the group was decoded first."""
+    var reader = GroupReader(plan, r0, r1, block)
     var bt = Table.empty()
     for k in range(len(used)):
-        _ = bt.add_column(scan.name(used[k]), scan.kind(used[k]), scale=scan.scale(used[k]))
+        _ = bt.add_column(plan.scan.name(used[k]), plan.scan.kind(used[k]), scale=plan.scan.scale(used[k]))
         bt.cols[k].values = List[Int64](unsafe_uninit_length=block)
     var shared = bt^.share()
     part = _identity_partial(n_slots, groups, ops)
@@ -1513,48 +1534,107 @@ def _morsel_group(scan: ParquetScan, g: Int, used: List[Int], nodes: List[PlanNo
         var rows = reader.next_block(shared._table[])
         if rows == 0:
             break
-        var r = _run_cpu(shared, _lower(shared, nodes, True, False), 0, 0, rows, 0, 1)
-        _merge_partial(part, r, ops)
-        for k in range(len(used)):
-            tally[k] += shared._table[].cols[k].nulls
+        if kernel_error.byte_length() > 0:
+            continue
+        try:
+            var r = _run_cpu(shared, _lower(shared, nodes, True, False), 0, 0, rows, 0, 1)
+            _merge_partial(part, r, ops)
+            for k in range(len(used)):
+                tally[k] += shared._table[].cols[k].nulls
+        except e:
+            kernel_error = String(e)
 
 
 def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], todo: List[Int], n_slots: Int, groups: Int,
-                  ops: List[Int]) raises -> _MorselRun:
-    """Every row group of `todo` on the workers, one task per group; the results per group, in order."""
+                  ops: List[Int], block: Int) raises -> _MorselRun:
+    """The row groups of `todo` in waves of one group per core: the wave's groups are opened in parallel (headers walked,
+    dictionaries decoded once and then shared read only), then cut into row-range morsels of whole blocks (about
+    MORSELS_PER_WORKER a worker) that all the cores take in turn. The morsels come back in (group, range) order."""
     var run = _MorselRun()
-    var block = SCAN_BLOCK_ROWS
-    var env_rows = _morsel_env("MXFRAME_MORSEL_ROWS")
-    if env_rows.byte_length() > 0:
-        block = max(64, Int(env_rows))
+    var workers = core_count()
+    var batch = max(1, workers)
     for _ in range(len(todo)):
-        run.parts.append(QueryResult())
-        run.errs.append(String())
-        run.nulls.append(List[Int](length=len(used), fill=0))
-    var sp = Int(UnsafePointer(to=scan))
-    var np = Int(UnsafePointer(to=nodes))
-    var up = Int(UnsafePointer(to=used))
-    var tp = Int(UnsafePointer(to=todo))
-    var op = Int(UnsafePointer(to=ops))
-    var pa = Int(run.parts.unsafe_ptr())
-    var ea = Int(run.errs.unsafe_ptr())
-    var na = Int(run.nulls.unsafe_ptr())
-    def task(i: Int) {imm}:
-        var g = Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=tp)[][i]
-        try:
-            _morsel_group(Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp)[],
-                          g, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
-                          Pointer[List[PlanNode], MutUntrackedOrigin](unsafe_from_address=np)[], n_slots, groups,
-                          Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=op)[], block,
-                          (Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=pa) + i)[],
-                          (Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=na) + i)[])
-        except e:
-            (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ea) + i)[] = String(e)
-    par_n(task, len(todo), min(len(todo), core_count()))
-    for i in range(len(todo)):
-        if run.errs[i] == MORSEL_UNSUPPORTED:
-            run.ok = False
-            break
+        run.gerrs.append(String())
+    var w0 = 0
+    while w0 < len(todo):
+        var nb = min(batch, len(todo) - w0)
+        var plans = List[GroupPlan]()
+        for _ in range(nb):
+            plans.append(GroupPlan(scan.copy(), used))
+        var sp = Int(UnsafePointer(to=scan))
+        var up = Int(UnsafePointer(to=used))
+        var tp = Int(UnsafePointer(to=todo))
+        var pl = Int(plans.unsafe_ptr())
+        var ge = Int(run.gerrs.unsafe_ptr())
+        var base = w0
+        def open_job(i: Int) {imm}:
+            try:
+                (Pointer[GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + i)[] = open_plan(
+                    Pointer[ParquetScan, MutUntrackedOrigin](unsafe_from_address=sp)[],
+                    Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=tp)[][base + i],
+                    Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[])
+            except e:
+                (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ge) + base + i)[] = String(e)
+        if nb == 1:
+            open_job(0)
+        else:
+            par_n(open_job, nb, min(nb, workers))
+        var tg = List[Int]()                             # the wave's morsels
+        var tr0 = List[Int]()
+        var tr1 = List[Int]()
+        var per_group = max(1, (MORSELS_PER_WORKER * workers + nb - 1) // nb)
+        for i in range(nb):
+            if run.gerrs[w0 + i].byte_length() > 0:
+                continue
+            var rows = plans[i].rows
+            var blocks = (rows + block - 1) // block
+            var n = max(1, min(per_group, blocks))
+            for j in range(n):
+                var lo = (blocks * j // n) * block
+                var hi = min(rows, (blocks * (j + 1) // n) * block)
+                if hi > lo:
+                    tg.append(i)
+                    tr0.append(lo)
+                    tr1.append(hi)
+        var nt = len(tg)
+        var first = len(run.parts)
+        for t in range(nt):
+            run.tgroup.append(w0 + tg[t])
+            run.parts.append(QueryResult())
+            run.derrs.append(String())
+            run.kerrs.append(String())
+            run.nulls.append(List[Int](length=len(used), fill=0))
+        var np = Int(UnsafePointer(to=nodes))
+        var op = Int(UnsafePointer(to=ops))
+        var pa = Int(run.parts.unsafe_ptr())
+        var de = Int(run.derrs.unsafe_ptr())
+        var ke = Int(run.kerrs.unsafe_ptr())
+        var na = Int(run.nulls.unsafe_ptr())
+        var tga = Int(tg.unsafe_ptr())
+        var r0a = Int(tr0.unsafe_ptr())
+        var r1a = Int(tr1.unsafe_ptr())
+        def task(t: Int) {imm}:
+            var gi = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=tga)[t]
+            var at = first + t
+            try:
+                _morsel_task((Pointer[GroupPlan, MutUntrackedOrigin](unsafe_from_address=pl) + gi)[],
+                             Pointer[Int, MutUntrackedOrigin](unsafe_from_address=r0a)[t],
+                             Pointer[Int, MutUntrackedOrigin](unsafe_from_address=r1a)[t],
+                             Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
+                             Pointer[List[PlanNode], MutUntrackedOrigin](unsafe_from_address=np)[], n_slots, groups,
+                             Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=op)[], block,
+                             (Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=pa) + at)[],
+                             (Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=na) + at)[],
+                             (Pointer[String, MutUntrackedOrigin](unsafe_from_address=ke) + at)[])
+            except e:
+                (Pointer[String, MutUntrackedOrigin](unsafe_from_address=de) + at)[] = String(e)
+        if nt > 0:
+            par_n(task, nt, min(nt, workers))
+        _ = tg^
+        _ = tr0^
+        _ = tr1^
+        _ = plans^
+        w0 += nb
     return run^
 
 
@@ -1568,7 +1648,7 @@ def _run_part(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates) raises -
 
 # ── a Parquet scan: one row group at a time (F-140) ──────────────────────────────────────────────────
 
-def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises -> QueryResult:
+def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, morsels: Int = 0, block_rows: Int = 0) raises -> QueryResult:
     """The plan over a file, a row group at a time: decode the columns the plan reads, run the CPU kernel on that
     group, merge its partial result into the running one (sums and counts add, min / max combine; a sum passing
     int64 raises, as one run does). Each group is lowered on its own table, so its null-free columns skip the null
@@ -1617,22 +1697,31 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
         scan.ensure_words(c)
     var hs = _build_states(nodes, nodes, scan.schema, List[List[String]](), Optional[ParquetScan](scan.copy()), scan.rows())    # (text order needs the words)
     # ---- F-149: morsel-driven scan (the one place the group-at-a-time loop below is bypassed) -----------------------
-    # With at least as many row groups as workers, each worker takes whole row groups and runs the kernel on blocks of
-    # them (`_scan_morsels`); the per-group partials come back in row-group order and are merged and raised in that order,
-    # exactly as the loop below would. A plan with holistic aggregates (distinct, percentile, top_k) keeps the loop below:
-    # its states are fed in row-group order.
-    if not shape.mat and _use_morsels(len(todo)):
-        var morsels = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops)
-        if morsels.ok:
-            for i in range(len(todo)):
-                if morsels.errs[i].byte_length() > 0:
-                    raise Error(morsels.errs[i])
-                _merge_partial(acc, morsels.parts[i], ops)
+    # The row groups are cut into row-range morsels that all the cores take (`_scan_morsels`); the morsels' partials come
+    # back in (row group, range) order and are merged and raised in that order, a row group at a time, as the loop below
+    # would: a group's decode error before its kernel error, an earlier group's error before a later group's. A plan with
+    # holistic aggregates (distinct, percentile, top_k) keeps the loop below: its states are fed in row-group order.
+    var block = block_rows if block_rows > 0 else SCAN_BLOCK_ROWS
+    if not shape.mat and _use_morsels(morsels, scan.rows(), block):
+        var run = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops, block)
+        var ti = 0
+        for i in range(len(todo)):
+            if run.gerrs[i].byte_length() > 0:
+                raise Error(run.gerrs[i])
+            var first = ti
+            while ti < len(run.tgroup) and run.tgroup[ti] == i:
+                ti += 1
+            for t in range(first, ti):                   # a decode error of the group comes before a kernel error of it
+                if run.derrs[t].byte_length() > 0:
+                    raise Error(run.derrs[t])
+            for t in range(first, ti):
+                if run.kerrs[t].byte_length() > 0:
+                    raise Error(run.kerrs[t])
+            for t in range(first, ti):
+                _merge_partial(acc, run.parts[t], ops)
                 for k in range(len(used)):
-                    nulls[k] += morsels.nulls[i][k]
-            todo = List[Int]()
-        elif _morsel_env("MXFRAME_SCAN_MORSELS") == "1":      # forced (tests): do not fall back quietly
-            raise Error(MORSEL_UNSUPPORTED)
+                    nulls[k] += run.nulls[t][k]
+        todo = List[Int]()
     # ---- end F-149 ------------------------------------------------------------------------------------------------
     var cur = Table.empty()
     if len(todo) > 0:

@@ -866,7 +866,7 @@ def test_every_cell_through_read_and_scan_with_odd_pages(cells, tmp_path, k, ver
         assert got == want, (mode, next(i for i, (a, b) in enumerate(zip(got.split("\n"), want.split("\n"))) if a != b))
 
 
-def multi_page_file(path, pages, ptype=2, rep=0, text=False, group_rows=None):
+def multi_page_file(path, pages, ptype=2, rep=0, text=False, group_rows=None, name=b"x"):
     """One INT64 column `x`, one row group, one chunk made of `pages`: (kind, nvals, encoding, body) with kind 0 a data
     page and 2 a dictionary page. Sizes are the body's."""
     data = b"PAR1"
@@ -889,14 +889,14 @@ def multi_page_file(path, pages, ptype=2, rep=0, text=False, group_rows=None):
     m = Compact()
     m.i32(1, 1); m.lst(2, 12, 2)
     m.el(); m.bin(4, b"schema"); m.i32(5, 1); m.end()
-    m.el(); m.i32(1, ptype); m.i32(3, rep); m.bin(4, b"x")
+    m.el(); m.i32(1, ptype); m.i32(3, rep); m.bin(4, name)
     if text:
         m.i32(6, 0)                                           # converted type UTF8
     m.end()
     m.i64(3, total); m.lst(4, 12, 1)
     m.el(); m.lst(1, 12, 1)
     m.el(); m.i64(2, off)
-    m.st(3); m.i32(1, ptype); m.lst(2, 5, 1); m.b += zz(0); m.lst(3, 8, 1); m.b += uv(1) + b"x"
+    m.st(3); m.i32(1, ptype); m.lst(2, 5, 1); m.b += zz(0); m.lst(3, 8, 1); m.b += uv(len(name)) + name
     m.i32(4, 0); m.i64(5, total); m.i64(6, len(chunk)); m.i64(7, len(chunk)); m.i64(9, off); m.end(); m.end()
     m.i64(2, len(chunk)); m.i64(3, total if group_rows is None else group_rows); m.end(); m.b.append(0)
     data += bytes(m.b) + struct.pack("<i", len(m.b)) + b"PAR1"
@@ -1219,3 +1219,20 @@ def test_morsels_cut_pages_inside_runs_and_over_nulls(prober, tmp_path):
     for rows in (700, 4096):
         for q in SCAN_QUERIES:
             same_answer(probe_morsels(prober, path, q, rows), probe(prober, path, "read", q))
+
+
+def test_a_decode_error_later_in_a_morsel_beats_an_earlier_blocks_kernel_error(prober, tmp_path):
+    """One chunk: block 1 (64 rows, all 2^62) overflows the sum in the kernel, a later page is corrupt (a bit width of 65):
+    the decode error is reported whatever the block size (the group is decoded before it is aggregated), and the serial
+    scan, the whole-file read path and the morsel scan with 64-row or 100,000-row blocks all say the same."""
+    path = tmp_path / "t.parquet"
+    d = struct.pack("<qq", 2**62, 1)
+    good = bytes([1]) + uv((8 << 1) | 1) + bytes(8)                     # 64 indices, all 0
+    bad = bytes([65]) + uv((1 << 1) | 1) + bytes(9)                     # a bit width of 65
+    multi_page_file(path, [(2, 2, 0, d), (0, 64, 8, good), (0, 8, 8, bad)], name=b"v")
+    for env_rows, mode in (("64", "1"), ("100000", "1"), ("", "0")):
+        env = {**__import__("os").environ, "MXFRAME_SCAN_MORSELS": mode}
+        if env_rows:
+            env["MXFRAME_MORSEL_ROWS"] = env_rows
+        p = subprocess.run([str(prober), str(path), "scan", "sum_v"], capture_output=True, text=True, env=env)
+        assert p.returncode == 1 and "a bit width of 65" in p.stdout + p.stderr, (env_rows, mode, p.stdout + p.stderr)

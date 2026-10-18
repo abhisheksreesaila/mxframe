@@ -3,9 +3,22 @@
 # Prints one JSON line: seconds for the decode+query (scan) or decode (read), the in-memory query's milliseconds, and a
 # checksum of the answer, so a before / after run can be compared.
 from std.sys import argv
+from std.os import getenv
 from std.time import perf_counter_ns
-from mxframe import Query, col, sum, count, min_of, max_of, read_parquet, scan_parquet, AUTO
+from mxframe import Query, col, sum, count, min_of, max_of, read_parquet, scan_parquet, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
 from mxframe.kernels._fpenv import core_count
+
+
+
+def _morsel_mode() -> Int:
+    """The scan's morsel switch from the environment (this tool only: the library reads no environment)."""
+    var m = getenv("MXFRAME_SCAN_MORSELS")
+    return MORSELS_ON if m == "1" else MORSELS_OFF if m == "0" else MORSELS_AUTO
+
+
+def _block_rows() raises -> Int:
+    var n = getenv("MXFRAME_MORSEL_ROWS")
+    return Int(n) if n.byte_length() > 0 else 0
 
 
 def plan(var q: Query, which: String) raises -> Query:
@@ -28,7 +41,7 @@ def main() raises:
     if mode == "scan":
         var scan = scan_parquet(path)
         rows = scan.rows()
-        var r = plan(Query(scan), which).compute(AUTO)
+        var r = plan(Query(scan), which).morsels(_morsel_mode()).block_rows(_block_rows()).compute(AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
         for s in range(len(r.slots)):
             for v in r.slots[s]:
                 check = check * 31 + v
