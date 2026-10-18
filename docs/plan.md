@@ -1301,6 +1301,18 @@ Needs: F-140 · `mojo/mxframe/parquet.mojo` · Engine-first (owner 2026-10-17: a
 - [x] measured, informal, 24-core machine with load average 4.5-5 (so noisy; `scripts/bench_parquet_decode.py`, snappy, 1M-row groups, files in /tmp): 20M-row numeric file (carrier, day, revenue decimal, cost; 346 MB): streamed query 2.79 s -> 0.75 s on one thread (serial build), 2.69 s -> 0.24 s on all cores; `read_parquet` 3.30 s -> 0.45 s one thread, 3.78 s -> 0.26 s all cores (in-memory kernel on the same query 0.18 s / 0.04 s). 5M-row text-heavy file (a 200k-word column that falls back to PLAIN pages): `read_parquet` 1.22 s -> 0.81 s one thread, 1.58 s -> 0.62 s all cores; streamed query on its two cheap columns 0.31 s -> 0.06 s / 0.02 s. Every checksum equals the pre-change answer. Uncompressed files: numeric `read_parquet` 0.46 s one thread (PLAIN no-null int64 columns alone decode at 2.5 GB/s, 0.12 s for 20M x 2 columns)
 - Target NOT met: "within 2x of the in-memory kernel for numeric columns" (streamed 0.24 s vs kernel 0.04 s on all cores, about 6x). What is left is snappy decompression of 346 MB (about 1 GB/s per core), first-touch page faults of the output, and a serial header walk plus a per-group kernel launch; the kernel itself is memory bandwidth. Next steps if the target matters: decode row group N+1 while the kernel runs on N, decode TEXT dictionary pages in parallel, parallel mapping, cache-sized pages
 - Tests: all existing oracles green (pyarrow / DuckDB files, 22 corrupt-file cases, random byte flips, `test_scan`, `test_switches`, `check_mac_link.sh`); new: the serial build gives identical answers on a file of many small pages with nulls, streamed and whole-file
+
+## F-142 Mojo API: text Parquet pages decoded in parallel (two-phase word codes) [todo]
+Needs: F-141 · `mojo/mxframe/parquet.mojo` · Text reads gain nothing from F-141's parallel pages (0.49 s to 0.48 s, 5M rows) and are 4x behind pyarrow (0.12 s), because PLAIN text pages that add words run serially
+- [ ] phase 1 in parallel: each page looks its words up in the frozen word index and records the ones it misses (offset + bytes); phase 2 serial: the missed words get codes in file order (the codes equal today's, first seen first); phase 3 in parallel: the misses' codes are filled in. read_parquet and the scan
+- [ ] every cell equal to today's codes and words on pyarrow / DuckDB files (dictionary fallback mid-column, all-unique ids, repeated words across pages, nulls, v1 / v2); serial build equal
+- [ ] measured against pyarrow on the 5M-row text file, one thread and all cores (target: at least pyarrow's all-core time)
+
+## F-143 Mojo API: a streamed query decodes the next row group while the kernel runs [todo]
+Needs: F-141 · `parquet.mojo`, `query.mojo` · Bar: within 1.5x of DuckDB on the streamed numeric query (0.19 s vs 0.10 s at 20M rows, F-141 review)
+- [ ] row group N+1 decodes (all cores minus the kernel's share, or alternating) while the kernel aggregates N; peak memory two row groups; partials still merged in row-group order (overflow behaves the same)
+- [ ] measured against DuckDB on the F-141 bench files; results equal; serial build runs them in turn
+
 ## F-133 M2: Query on a Mojo plan IR [done]
 Needs: F-132 · Spec §5 · `mojo/mxframe/expr.mojo`, `query.mojo`, test `mojo/tests/test_query.mojo`
 - [x] plan nodes in Mojo (Scan, Filter, Aggregate built; Project / Sort / Limit / Join kinds reserved), built by `Query(table).where().group_by(key, groups=).agg(...)`; expressions are flat post-order trees (`col`, `lit`, `+ - * // %`, unary `-`, `least` / `greatest`, comparisons, `between`, `& | ~`)
