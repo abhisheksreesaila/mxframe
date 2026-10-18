@@ -128,7 +128,7 @@ struct ThriftReader(Movable):
                 return v
             shift += 7
             if shift > 63:
-                raise Error("Parquet metadata has a bad varint")
+                raise Error("Parquet metadata has a bad varint (corrupt file)")
 
     def zigzag(mut self) raises -> Int64:
         var u = self.varint()
@@ -145,10 +145,16 @@ struct ThriftReader(Movable):
         self.last[len(self.last) - 1] = id
         return (id, type)
 
+    def length(mut self) raises -> Int:
+        """A length or count from a varint: never negative, never more bytes than are left (every element, string
+        byte or skipped item takes at least one byte, so this bounds the loops that follow)."""
+        var u = self.varint()
+        if u > UInt64(self.n - self.pos):
+            raise Error("Parquet metadata has a length past its end (corrupt file)")
+        return Int(u)
+
     def binary(mut self) raises -> String:
-        var n = Int(self.varint())
-        if self.pos + n > self.n:
-            raise Error("Parquet metadata has a string past its end")
+        var n = self.length()
         var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](
             unsafe_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=self.base + self.pos), length=n))
         self.pos += n
@@ -159,10 +165,14 @@ struct ThriftReader(Movable):
         var b = self.byte()
         var size = b >> 4
         if size == 15:
-            size = Int(self.varint())
+            size = self.length()
+        elif size > self.n - self.pos:
+            raise Error("Parquet metadata has a list past its end (corrupt file)")
         return (b & 0x0F, size)
 
-    def enter(mut self):
+    def enter(mut self) raises:
+        if len(self.last) > 64:
+            raise Error("Parquet metadata is nested too deeply (corrupt file)")
         self.last.append(0)
 
     def leave(mut self):
@@ -177,24 +187,29 @@ struct ThriftReader(Movable):
         elif type == T_I16 or type == T_I32 or type == T_I64:
             _ = self.varint()
         elif type == T_DOUBLE:
+            if self.pos + 8 > self.n:
+                raise Error("Parquet metadata ends early (corrupt or truncated file)")
             self.pos += 8
         elif type == T_BINARY:
-            var n = Int(self.varint())
-            self.pos += n
+            self.pos += self.length()
         elif type == T_LIST or type == T_SET:
             var h = self.list_header()
+            self.enter()                 # lists nest too: bound the recursion
             for _ in range(h[1]):
                 if h[0] == T_TRUE or h[0] == T_FALSE:
                     _ = self.byte()          # a bool list element is one byte
                 else:
                     self.skip(h[0])
+            self.leave()
         elif type == T_MAP:
-            var size = Int(self.varint())
+            var size = self.length()
             if size > 0:
                 var kv = self.byte()
+                self.enter()
                 for _ in range(size):
                     self.skip(kv >> 4)
                     self.skip(kv & 0x0F)
+                self.leave()
         elif type == T_STRUCT:
             self.enter()
             while True:
@@ -204,4 +219,4 @@ struct ThriftReader(Movable):
                 self.skip(f[1])
             self.leave()
         else:
-            raise Error("Parquet metadata has an unknown thrift type " + String(type))
+            raise Error("Parquet metadata has an unknown thrift type " + String(type) + " (corrupt file)")
