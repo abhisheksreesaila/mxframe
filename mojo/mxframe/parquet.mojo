@@ -992,7 +992,47 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
 #      values over the null rows. The pages' validity bits are then merged into the column's bitmap in page order.
 # Nothing in the parallel step mutates shared state: a page only writes its own rows and its own `_Page` record.
 
-@fieldwise_init
+struct _Misses(Copyable, Movable):
+    """A text page decoded in parallel against a frozen word index: the words it missed (F-142)."""
+    var at: List[Int]                # address, length and hash of each distinct missed word, in page order
+    var n: List[Int]
+    var h: List[UInt64]
+    var code: List[Int]              # their codes, given in file order by the serial phase
+    var slots: List[Int32]           # a table over them (one entry per distinct word of the page)
+    var canon: List[Int]             # (big columns) per miss: page << 32 | miss number of the first page that missed the word
+
+    def __init__(out self):
+        self.at = List[Int]()
+        self.n = List[Int]()
+        self.h = List[UInt64]()
+        self.code = List[Int]()
+        self.slots = List[Int32]()
+        self.canon = List[Int]()
+
+
+struct _Slices(Copyable, Movable):
+    """A big page decoded in slices by row range (F-145): the value stream, and per slice its first non-null value, its
+    row, its offset in the stream and, in a bit-packed run entered mid-way, the groups of 8 still to read."""
+    var base: Int                    # the value stream: base address, size, bit width or value width
+    var end: Int
+    var width: Int
+    var v: List[Int]
+    var row: List[Int]
+    var pos: List[Int]
+    var pend: List[Int]
+    var err: List[String]
+
+    def __init__(out self):
+        self.base = 0
+        self.end = 0
+        self.width = 0
+        self.v = List[Int]()
+        self.row = List[Int]()
+        self.pos = List[Int]()
+        self.pend = List[Int]()
+        self.err = List[String]()
+
+
 struct _Page(Copyable, Movable):
     var addr: Int                    # the page body (compressed) in the file or its mapping
     var csize: Int
@@ -1005,28 +1045,40 @@ struct _Page(Copyable, Movable):
     var v2_compressed: Bool
     var ctx: Int                     # its chunk's `_Ctx`
     var row: Int                     # its first row in the output column
-    var present: Int                 # non-null values (set when the page is opened)
     var is_dict: Bool                # a dictionary page: decoded into its chunk's `_Ctx.dict` in the first parallel round
     var defer: Bool                  # PLAIN text that may add words: misses are recorded, and coded in file order afterwards
+    var split: Bool                  # a big page decoded in slices by row range (prepared, then one job per slice)
+    var present: Int                 # non-null values (set when the page is opened)
     var nulls: Int
     var bits: List[UInt8]            # validity bits of its rows (an OPTIONAL column with nulls on this page)
     var err: String
-    var miss_at: List[Int]           # defer: the words the frozen index did not have (address, length, hash) in page order
-    var miss_n: List[Int]
-    var miss_h: List[UInt64]
-    var miss_code: List[Int]         # their codes, given in file order by the serial phase
-    var miss_slots: List[Int32]      # a table over the misses (one entry per distinct word of the page)
-    var miss_canon: List[Int]        # (big columns) per miss: page << 32 | miss number of the first page that missed the same word
-    var keep: List[UInt8]            # the decompressed page, kept while its missed words are read
-    var split: Bool                  # a big page decoded in slices by row range (prepared, then one job per slice)
-    var vbase: Int                   # split: the value stream (base address, size, bit width or value width)
-    var vend: Int
-    var vwidth: Int
-    var sl_v: List[Int]              # per slice: its first non-null value, its row, its offset in the stream and, in a
-    var sl_row: List[Int]            #   bit-packed run entered mid-way, the groups of 8 still to read
-    var sl_pos: List[Int]
-    var sl_pend: List[Int]
-    var sl_err: List[String]
+    var keep: List[UInt8]            # the decompressed page, kept while its missed words / slices are read
+    var miss: _Misses
+    var sl: _Slices
+
+    def __init__(out self, addr: Int, csize: Int, usize: Int, nvals: Int, encoding: Int, v2: Bool, def_len: Int,
+                 def_enc: Int, v2_compressed: Bool, ctx: Int, row: Int, is_dict: Bool = False, defer: Bool = False):
+        self.addr = addr
+        self.csize = csize
+        self.usize = usize
+        self.nvals = nvals
+        self.encoding = encoding
+        self.v2 = v2
+        self.def_len = def_len
+        self.def_enc = def_enc
+        self.v2_compressed = v2_compressed
+        self.ctx = ctx
+        self.row = row
+        self.is_dict = is_dict
+        self.defer = defer
+        self.split = False
+        self.present = 0
+        self.nulls = 0
+        self.bits = List[UInt8]()
+        self.err = String()
+        self.keep = List[UInt8]()
+        self.miss = _Misses()
+        self.sl = _Slices()
 
 
 @fieldwise_init
@@ -1208,16 +1260,16 @@ def _identity(leaf: _Leaf) -> Bool:
 def _note_miss(mut page: _Page, wp: UnsafePointer[UInt8, MutAnyOrigin], n: Int, h: UInt64) -> Int:
     """A word the frozen index lacks, seen by a page decoded in parallel: one entry per distinct word of the page, in
     first-seen order. Returns the placeholder -1 - (its miss number) for the value."""
-    if len(page.miss_slots) == 0:
-        page.miss_slots = List[Int32](length=1024, fill=-1)
-    var mask = len(page.miss_slots) - 1
+    if len(page.miss.slots) == 0:
+        page.miss.slots = List[Int32](length=1024, fill=-1)
+    var mask = len(page.miss.slots) - 1
     var j = Int(h) & mask
     while True:
-        var m = Int(page.miss_slots[j])
+        var m = Int(page.miss.slots[j])
         if m < 0:
             break
-        if page.miss_h[m] == h and page.miss_n[m] == n:
-            var q = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=page.miss_at[m])
+        if page.miss.h[m] == h and page.miss.n[m] == n:
+            var q = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=page.miss.at[m])
             var same = True
             for k in range(n):
                 if q[k] != wp[k]:
@@ -1226,21 +1278,21 @@ def _note_miss(mut page: _Page, wp: UnsafePointer[UInt8, MutAnyOrigin], n: Int, 
             if same:
                 return -1 - m
         j = (j + 1) & mask
-    var m = len(page.miss_at)
-    page.miss_at.append(Int(wp))
-    page.miss_n.append(n)
-    page.miss_h.append(h)
-    if (m + 1) * 2 > len(page.miss_slots):               # grow at half full and re-place every miss
-        var size = len(page.miss_slots) * 2
-        page.miss_slots = List[Int32](length=size, fill=-1)
+    var m = len(page.miss.at)
+    page.miss.at.append(Int(wp))
+    page.miss.n.append(n)
+    page.miss.h.append(h)
+    if (m + 1) * 2 > len(page.miss.slots):               # grow at half full and re-place every miss
+        var size = len(page.miss.slots) * 2
+        page.miss.slots = List[Int32](length=size, fill=-1)
         mask = size - 1
         for i in range(m + 1):
-            var k = Int(page.miss_h[i]) & mask
-            while page.miss_slots[k] >= 0:
+            var k = Int(page.miss.h[i]) & mask
+            while page.miss.slots[k] >= 0:
                 k = (k + 1) & mask
-            page.miss_slots[k] = Int32(i)
+            page.miss.slots[k] = Int32(i)
     else:
-        page.miss_slots[j] = Int32(m)
+        page.miss.slots[j] = Int32(m)
     return -1 - m
 
 
@@ -1502,7 +1554,7 @@ def _decode_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raise
                 dout[row] = 0
     elif p.nulls == 0:
         p.bits = List[UInt8]()
-    if len(p.miss_at) > 0:
+    if len(p.miss.at) > 0:
         p.keep = owner^                               # the missed words are read from it by the serial phase
     else:
         _ = owner^
@@ -1531,9 +1583,9 @@ def _plan_dict_slices(mut c: _Bytes, w: Int, present: Int, step: Int, mut p: _Pa
                 var vv = v + g * 8
                 if vv >= v + span or vv >= present:
                     break
-                p.sl_v.append(vv)
-                p.sl_pos.append(data + g * w)
-                p.sl_pend.append(groups - g)
+                p.sl.v.append(vv)
+                p.sl.pos.append(data + g * w)
+                p.sl.pend.append(groups - g)
                 next_t = vv + step
             v += span
             c.pos = data + groups * w
@@ -1543,9 +1595,9 @@ def _plan_dict_slices(mut c: _Bytes, w: Int, present: Int, step: Int, mut p: _Pa
             c.pos += (w + 7) // 8
             v += run
             if v < present and v >= next_t:
-                p.sl_v.append(v)
-                p.sl_pos.append(c.pos)
-                p.sl_pend.append(0)
+                p.sl.v.append(v)
+                p.sl.pos.append(c.pos)
+                p.sl.pend.append(0)
                 next_t = v + step
 
 
@@ -1556,15 +1608,15 @@ def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf) raises:
     var c = _open_page(p, ctx, leaf, owner)
     var present = p.present
     var step = max(SLICE_MIN, (present + 2 * core_count() - 1) // (2 * core_count()))
-    p.sl_v.append(0)
-    p.sl_pos.append(0)
-    p.sl_pend.append(0)
+    p.sl.v.append(0)
+    p.sl.pos.append(0)
+    p.sl.pend.append(0)
     if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
         var w = c.byte()
         if w > 64:
             raise Error("a Parquet page has a bit width of " + String(w) + " (corrupt file)")
-        p.vwidth = w
-        p.sl_pos[0] = c.pos
+        p.sl.width = w
+        p.sl.pos[0] = c.pos
         _plan_dict_slices(c, w, present, step, p)
     else:
         var width = 4 if leaf.ptype == PT_INT32 else 8 if leaf.ptype == PT_INT64 else leaf.type_length
@@ -1572,26 +1624,26 @@ def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf) raises:
             raise Error("column `" + leaf.name + "` has a fixed length of " + String(width) + " bytes (corrupt file)")
         if present > (c.n - c.pos) // width:
             raise Error("a Parquet page ends early (corrupt file)")
-        p.vwidth = width
-        p.sl_pos[0] = c.pos
+        p.sl.width = width
+        p.sl.pos[0] = c.pos
         var v = step
         while v < present:
-            p.sl_v.append(v)
-            p.sl_pos.append(c.pos + v * width)
-            p.sl_pend.append(0)
+            p.sl.v.append(v)
+            p.sl.pos.append(c.pos + v * width)
+            p.sl.pend.append(0)
             v += step
-    p.sl_row.append(0)                                   # the row of each later slice's first value
+    p.sl.row.append(0)                                   # the row of each later slice's first value
     if present == p.nvals:
-        for k in range(1, len(p.sl_v)):
-            p.sl_row.append(p.sl_v[k])
+        for k in range(1, len(p.sl.v)):
+            p.sl.row.append(p.sl.v[k])
     else:
         var bits = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
         var k = 1
         var seen = 0
         for byte in range((p.nvals + 7) // 8):
             var pc = Int(pop_count(bits[byte]))
-            while k < len(p.sl_v) and p.sl_v[k] < seen + pc:
-                var want = p.sl_v[k] - seen              # the want-th set bit of this byte
+            while k < len(p.sl.v) and p.sl.v[k] < seen + pc:
+                var want = p.sl.v[k] - seen              # the want-th set bit of this byte
                 var row = byte * 8
                 for b in range(8):
                     if (bits[byte] >> UInt8(b)) & 1 == 1:
@@ -1599,27 +1651,27 @@ def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf) raises:
                             row = byte * 8 + b
                             break
                         want -= 1
-                p.sl_row.append(row)
+                p.sl.row.append(row)
                 k += 1
             seen += pc
-    p.sl_err = List[String](length=len(p.sl_v), fill=String())
-    p.vbase = c.base
-    p.vend = c.n
+    p.sl.err = List[String](length=len(p.sl.v), fill=String())
+    p.sl.base = c.base
+    p.sl.end = c.n
     p.keep = owner^
 
 
 def _decode_slice(p: _Page, k: Int, ctx: _Ctx, leaf: _Leaf, dst: Int) raises:
     """Slice k of a prepared page: its values, then spread over its rows (a slice holds exactly the rows from its first
     value's row to the next slice's first value's row, so the spread never leaves it)."""
-    var v1 = p.sl_v[k + 1] if k + 1 < len(p.sl_v) else p.present
-    var r1 = p.sl_row[k + 1] if k + 1 < len(p.sl_row) else p.nvals
-    var cnt = v1 - p.sl_v[k]
-    var r0 = p.sl_row[k]
+    var v1 = p.sl.v[k + 1] if k + 1 < len(p.sl.v) else p.present
+    var r1 = p.sl.row[k + 1] if k + 1 < len(p.sl.row) else p.nvals
+    var cnt = v1 - p.sl.v[k]
+    var r0 = p.sl.row[k]
     var dout = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=dst + r0 * 8)
-    var c = _Bytes(p.vbase, p.vend)
-    c.pos = p.sl_pos[k]
+    var c = _Bytes(p.sl.base, p.sl.end)
+    c.pos = p.sl.pos[k]
     if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY:
-        _dict_runs(c, leaf, p.vwidth, ctx.dict, cnt, dout, p.sl_pend[k])
+        _dict_runs(c, leaf, p.sl.width, ctx.dict, cnt, dout, p.sl.pend[k])
     else:
         _plain_into(c, leaf, ctx, cnt, dout, 0, True, 0)
     if r1 - r0 > cnt:
@@ -1713,10 +1765,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
                             tbl, True)
                 _ = page^
             else:                                        # a job of the first parallel round
-                pages.append(_Page(base + body_at, csize, usize, nvals, ENC_PLAIN, False, 0, ENC_RLE, True, ctx_at, 0, 0, True, False, 0,
-                                   List[UInt8](), String(), List[Int](), List[Int](), List[UInt64](), List[Int](), List[Int32](),
-                                   List[Int](), List[UInt8](), False, 0, 0, 0, List[Int](), List[Int](), List[Int](),
-                           List[Int](), List[String]()))
+                pages.append(_Page(base + body_at, csize, usize, nvals, ENC_PLAIN, False, 0, ENC_RLE, True, ctx_at, 0, is_dict=True))
             continue
         if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
             continue                                     # an index page: not needed
@@ -1728,9 +1777,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             continue
         var defer = leaf.ptype == PT_BYTE_ARRAY and ctx.add and encoding == ENC_PLAIN
         pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
-                           v2_compressed, ctx_at, ctx.row0 + done, 0, False, defer, 0, List[UInt8](), String(), List[Int](), List[Int](),
-                           List[UInt64](), List[Int](), List[Int32](), List[Int](), List[UInt8](), False, 0, 0, 0, List[Int](), List[Int](), List[Int](),
-                           List[Int](), List[String]()))
+                           v2_compressed, ctx_at, ctx.row0 + done, defer=defer))
         done += nvals
 
 
@@ -1771,7 +1818,7 @@ def _dedupe_misses(mut pages: List[_Page], ctx: Int, total: Int):
     var parts = 64
     for i in range(len(pages)):
         if pages[i].ctx == ctx:
-            pages[i].miss_canon = List[Int](length=len(pages[i].miss_at), fill=0)
+            pages[i].miss.canon = List[Int](length=len(pages[i].miss.at), fill=0)
     var pa = Int(pages.unsafe_ptr())
     var np = len(pages)
     def part(w: Int) {imm}:
@@ -1785,21 +1832,21 @@ def _dedupe_misses(mut pages: List[_Page], ctx: Int, total: Int):
             ref p = (pg + i)[]
             if p.ctx != ctx:
                 continue
-            for m in range(len(p.miss_at)):
-                if Int((p.miss_h[m] >> 32) & UInt64(parts - 1)) != w:
+            for m in range(len(p.miss.at)):
+                if Int((p.miss.h[m] >> 32) & UInt64(parts - 1)) != w:
                     continue
                 var mask = size - 1
-                var j = Int(p.miss_h[m]) & mask
+                var j = Int(p.miss.h[m]) & mask
                 var found = -1
                 while slots[j] >= 0:
                     var r = slots[j]
                     ref q = (pg + (r >> 32))[]
                     var qm = r & 0xFFFFFFFF
-                    if q.miss_h[qm] == p.miss_h[m] and q.miss_n[qm] == p.miss_n[m]:
-                        var a = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=q.miss_at[qm])
-                        var b = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=p.miss_at[m])
+                    if q.miss.h[qm] == p.miss.h[m] and q.miss.n[qm] == p.miss.n[m]:
+                        var a = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=q.miss.at[qm])
+                        var b = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=p.miss.at[m])
                         var same = True
-                        for k in range(p.miss_n[m]):
+                        for k in range(p.miss.n[m]):
                             if a[k] != b[k]:
                                 same = False
                                 break
@@ -1808,9 +1855,9 @@ def _dedupe_misses(mut pages: List[_Page], ctx: Int, total: Int):
                             break
                     j = (j + 1) & mask
                 if found >= 0:
-                    p.miss_canon[m] = found
+                    p.miss.canon[m] = found
                 else:
-                    p.miss_canon[m] = (i << 32) | m
+                    p.miss.canon[m] = (i << 32) | m
                     slots[j] = (i << 32) | m
                     count += 1
                     if count * 2 > size:                 # a skewed partition: double the table and re-place its words
@@ -1818,7 +1865,7 @@ def _dedupe_misses(mut pages: List[_Page], ctx: Int, total: Int):
                         for e in range(size):
                             if slots[e] >= 0:
                                 ref q = (pg + (slots[e] >> 32))[]
-                                var k = Int(q.miss_h[slots[e] & 0xFFFFFFFF]) & (size * 2 - 1)
+                                var k = Int(q.miss.h[slots[e] & 0xFFFFFFFF]) & (size * 2 - 1)
                                 while bigger[k] >= 0:
                                     k = (k + 1) & (size * 2 - 1)
                                 bigger[k] = slots[e]
@@ -1879,14 +1926,18 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
     var ja = List[Int]()
     var jb = List[Int]()
     var kb = List[Int]()
+    var dict_job = List[Bool](length=len(ctxs), fill=False)     # chunks whose dictionary is a job of round A
     for i in range(len(pages)):
         if pages[i].is_dict:
             ja.append(i)
+            dict_job[pages[i].ctx] = True
     for i in range(len(pages)):
         ref p = pages[i]
         if p.is_dict:
             continue
-        if p.split or not (p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY):
+        # (a dictionary decoded while the headers were walked, as a text dictionary under read_parquet is, is already
+        # there: such a page needs no second round)
+        if p.split or not (p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY) or not dict_job[p.ctx]:
             ja.append(i)
         else:
             jb.append(i)
@@ -1923,7 +1974,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
     _ = ja^
     for i in range(len(pages)):                         # a job per slice of every prepared page
         if pages[i].split and pages[i].err.byte_length() == 0:
-            for k in range(len(pages[i].sl_v)):
+            for k in range(len(pages[i].sl.v)):
                 jb.append(i)
                 kb.append(k)
     if len(jb) > 0:
@@ -1944,7 +1995,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                 if k < 0:
                     p.err = String(e)
                 else:
-                    p.sl_err[k] = String(e)
+                    p.sl.err[k] = String(e)
         if len(jb) == 1:
             job_b(0)
         else:
@@ -1953,9 +2004,9 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
     _ = kb^
     for i in range(len(pages)):
         if pages[i].split and pages[i].err.byte_length() == 0:
-            for k in range(len(pages[i].sl_err)):
-                if pages[i].sl_err[k].byte_length() > 0:
-                    pages[i].err = pages[i].sl_err[k]
+            for k in range(len(pages[i].sl.err)):
+                if pages[i].sl.err[k].byte_length() > 0:
+                    pages[i].err = pages[i].sl.err[k]
                     break
             pages[i].nulls = pages[i].nvals - pages[i].present
             if pages[i].nulls == 0:
@@ -1971,30 +2022,30 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
         var total = 0
         for i in range(len(pages)):
             if pages[i].ctx == k:
-                total += len(pages[i].miss_at)
+                total += len(pages[i].miss.at)
         if total >= DEDUPE_MIN:
             _dedupe_misses(pages, k, total)
     for i in range(len(pages)):
-        if len(pages[i].miss_at) > 0:
+        if len(pages[i].miss.at) > 0:
             ref ctx = ctxs[pages[i].ctx]
             var wi = UnsafePointer[_WordIndex, MutAnyOrigin](unsafe_from_address=ctx.widx)
-            var deduped = len(pages[i].miss_canon) > 0
-            for m in range(len(pages[i].miss_at)):
+            var deduped = len(pages[i].miss.canon) > 0
+            for m in range(len(pages[i].miss.at)):
                 var code = -1
                 if deduped:
-                    var r = pages[i].miss_canon[m]
+                    var r = pages[i].miss.canon[m]
                     if r != (i << 32) | m:               # the same word was missed first elsewhere: its code is ready
-                        pages[i].miss_code.append(pages[r >> 32].miss_code[r & 0xFFFFFFFF])
+                        pages[i].miss.code.append(pages[r >> 32].miss.code[r & 0xFFFFFFFF])
                         continue
                 else:
-                    code = wi[].find(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=pages[i].miss_at[m]),
-                                     pages[i].miss_n[m], pages[i].miss_h[m])
+                    code = wi[].find(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=pages[i].miss.at[m]),
+                                     pages[i].miss.n[m], pages[i].miss.h[m])
                 if code < 0:
-                    var wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=pages[i].miss_at[m])
-                    var w = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](unsafe_ptr=wp, length=pages[i].miss_n[m]))
+                    var wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=pages[i].miss.at[m])
+                    var w = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](unsafe_ptr=wp, length=pages[i].miss.n[m]))
                     code = t.add_word(ctx.col, w)
-                    wi[].insert(pages[i].miss_h[m], code)
-                pages[i].miss_code.append(code)
+                    wi[].insert(pages[i].miss.h[m], code)
+                pages[i].miss.code.append(code)
             fixes.append(i)
     if words_only:
         return
@@ -2006,7 +2057,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
             ref ctx = (Pointer[_Ctx, MutUntrackedOrigin](unsafe_from_address=ca) + p.ctx)[]
             ref col = (Pointer[Column, MutUntrackedOrigin](unsafe_from_address=cola) + ctx.col)[]
             var dst = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(col.values.unsafe_ptr()) + p.row * 8)
-            var codes = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(p.miss_code.unsafe_ptr()))
+            var codes = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(p.miss.code.unsafe_ptr()))
             for r in range(p.nvals):
                 var v = dst[r]
                 if v < 0:
