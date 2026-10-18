@@ -30,6 +30,8 @@ from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP
+from .kernels.pipeline_gpu import run_pipeline_gpu
+from .gpu import DeviceTable
 
 # plan node kinds
 comptime P_SCAN = 0
@@ -52,6 +54,9 @@ comptime A_MEAN = 5
 comptime CPU = 0
 comptime GPU = 1
 comptime AUTO = 2
+# AUTO uses the GPU when a DeviceTable is attached and the table has at least this many rows: below it the CPU
+# kernel (all cores, no launch or copy-back) answers in about the time a GPU launch plus the result copy take.
+comptime AUTO_GPU_MIN_ROWS = 1_000_000
 
 # kernel opcodes (kernels_aot/pipeline_cpu.mojo, pipeline_program.py)
 comptime MAGIC = 0x4D585031
@@ -125,15 +130,18 @@ struct Query(Movable):
     var nodes: List[PlanNode]
     var framed: Bool
     var overlay: Overlay
+    var device: Optional[DeviceTable]
 
     def __init__(out self, table: SharedTable):
         self.table = table
+        self.device = None
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
         self.overlay = Overlay(table)
 
     def __init__(out self, frame: Frame) raises:
         self.table = frame.base
+        self.device = None
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
         self.overlay = frame.overlay()
@@ -172,10 +180,29 @@ struct Query(Movable):
             self.nodes[at].aggs.append(a.copy())
         return self^
 
+    def on_device(var self, device_table: DeviceTable) raises -> Self:
+        """Attaches the device copy of this query's table, so `compute(GPU)` (and AUTO, on a big table) can use it.
+        Explicit rather than a process-wide registry: Mojo has no safe mutable globals, the app owns the one
+        DeviceTable next to its SharedTable and hands it to each session's queries, and a handle that was made
+        from another table is refused here, not silently answered with the wrong data."""
+        if not device_table.mirrors(self.table):
+            raise Error("on_device: this DeviceTable was not made from the query's table")
+        self.device = device_table
+        return self^
+
     def compute(self, device: Int = AUTO) raises -> QueryResult:
-        """Runs the plan. `device`: CPU, GPU or AUTO (the GPU arrives in M6: GPU raises, AUTO runs on the CPU)."""
+        """Runs the plan. `device`: CPU, GPU (raises without a live attached DeviceTable) or AUTO (the GPU when a
+        live DeviceTable is attached and the table has `AUTO_GPU_MIN_ROWS` rows or more, else the CPU). The result is
+        the same either way, edits of a frame included."""
+        var use_gpu = False
         if device == GPU:
-            raise Error("device GPU: the GPU path of the Mojo API is not built yet (F-137); use CPU or AUTO")
+            if not self.device:
+                raise Error("device GPU: no DeviceTable is attached (Query.on_device(DeviceTable(table)))")
+            if not self.device.value().is_live():
+                raise Error("device GPU: the DeviceTable was released")
+            use_gpu = True
+        elif device == AUTO and self.device and self.device.value().is_live() and self.table.rows() >= AUTO_GPU_MIN_ROWS:
+            use_gpu = True
         var t0 = perf_counter_ns()
         var nodes = self.nodes.copy()
         if self.framed:                                  # formulas inlined, merges remapped
@@ -185,7 +212,16 @@ struct Query(Movable):
                 for k in range(len(nodes[i].aggs)):
                     nodes[i].aggs[k].arg = self.overlay.expand(nodes[i].aggs[k].arg)
         var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
-        var r = _run_cpu(self.table, prog, Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0)
+        var r = QueryResult()
+        var done = False
+        if use_gpu and self.table.rows() > 0:
+            var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU)
+            if g:
+                r = g.take()
+                r.device = GPU
+                done = True
+        if not done:
+            r = _run_cpu(self.table, prog, Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0)
         if self.framed and len(self.overlay.delta) > 0:
             _add_delta(r, self.table, nodes, self.overlay)
         r.milliseconds = Float64(perf_counter_ns() - t0) / 1e6
@@ -200,8 +236,10 @@ struct QueryResult(Movable):
     var counts: List[Int]           # rows per group (count(*))
     var sums: List[Int]             # the first sum's values (the spec's `r.sums`), else empty
     var milliseconds: Float64
+    var device: Int                 # CPU or GPU: where the kernel ran
 
     def __init__(out self):
+        self.device = CPU
         self.kinds = List[Int]()
         self.slot_of = List[Int]()
         self.count_slot_of = List[Int]()
@@ -679,6 +717,13 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int) raises -> QueryResult:
         raise Error("a sum or an expression passed the int64 range (about 9.2e18)")
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
+    var r = _make_result(p, out_vals, out_cnt)
+    _ = out_vals^
+    return r^
+
+
+def _make_result(p: Program, out_vals: List[Float64], out_cnt: List[Int64]) -> QueryResult:
+    """The kernel's output (slot words are int64 bits, per slot then group; counts per group) as a QueryResult."""
     var r = QueryResult()
     r.kinds = p.kinds.copy()
     r.slot_of = p.slot_of.copy()
@@ -695,8 +740,139 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int) raises -> QueryResult:
         if p.kinds[i] == A_SUM:
             r.sums = r.slots[p.slot_of[i]].copy()
             break
-    _ = out_vals^
     return r^
+
+
+# ── running on the GPU ───────────────────────────────────────────────────────────────────────────────
+
+def _reg_fields(op: Int) -> Int:
+    """Which of an instruction's operands d, a, b name registers: bit 0 = d, bit 1 = a, bit 2 = b."""
+    if op == OP_LOAD_CONST or op == OP_LOADI or op == OP_ISNULL:
+        return 1
+    if op == OP_F2I or op == OP_NOT:
+        return 3
+    if op >= OP_AGG_ISUM:
+        return 2                                          # an aggregate: d is the slot, a the value register
+    return 7
+
+
+def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
+    """The program uses registers 0 .. 47 (kept ones from the bottom, temporaries from the top). A GPU thread block
+    holds its registers in shared memory (256 rows x 8 bytes each), so renumber the registers actually used densely
+    in `code` (all instructions, predicate then body then aggregates). Returns (registers used, new predicate register)."""
+    var used = List[Bool](length=MAX_REGS, fill=False)
+    used[0] = True
+    if pred_reg >= 0:
+        used[pred_reg] = True
+    for i in range(len(code) // 5):
+        var f = _reg_fields(Int(code[i * 5]))
+        for k in range(3):
+            if (f >> k) & 1 != 0:
+                used[Int(code[i * 5 + 1 + k])] = True
+    var map = List[Int32](length=MAX_REGS, fill=0)
+    var n = 0
+    for r in range(MAX_REGS):
+        if used[r]:
+            map[r] = Int32(n)
+            n += 1
+    for i in range(len(code) // 5):
+        var f = _reg_fields(Int(code[i * 5]))
+        for k in range(3):
+            if (f >> k) & 1 != 0:
+                code[i * 5 + 1 + k] = map[Int(code[i * 5 + 1 + k])]
+    return (n, Int(map[pred_reg]) if pred_reg >= 0 else -1)
+
+
+def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool) raises -> Optional[QueryResult]:
+    """The lowered program on the device table (kernels/pipeline_gpu.mojo, keyed mode: the group id is register 0).
+    Same answers as `_run_cpu`: exact int64 totals, the overflow flag raises the same error. `strict` (device=GPU):
+    a program the kernel cannot take raises; otherwise (AUTO) it returns None and the CPU answers."""
+    var ctx = dt.context()
+    var ins = p.pred.copy()
+    ins.extend(p.body.copy())
+    ins.extend(p.aggs.copy())
+    var compact = _compact_registers(p.pred_reg, ins)
+    var n_regs = compact[0]
+    var code = List[Int32]()
+    var header: List[Int] = [MAGIC, n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
+                             compact[1], len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
+    for h in header:
+        code.append(Int32(h))
+    code.extend(ins^)
+    var consts = List[Float64](length=MAX_CONSTS, fill=0.0)
+    for k in range(len(p.consts)):                       # int64 bits in the float64 pool, copied exactly
+        consts[k] = Float64(from_bits=UInt64(p.consts[k]))
+    var dmask = ctx.enqueue_create_buffer[DType.uint8](max(len(mask), 1))
+    if len(mask) > 0:
+        ctx.enqueue_copy(dst_buf=dmask, src_ptr=mask.unsafe_ptr())
+    var cols = List[Int64]()
+    for c in p.cols:
+        if c >= 0:
+            cols.append(Int64(dt.data_address(c)))
+        elif c == -1_000_000 or c == -5_000_000:
+            cols.append(0)
+        elif c == -4_000_000:
+            cols.append(Int64(Int(dmask.unsafe_ptr())))
+        else:
+            cols.append(Int64(dt.validity_address(-1 - c)))
+    if len(cols) == 0:
+        cols.append(0)
+    var dtypes = p.dtypes.copy()
+    if len(dtypes) == 0:
+        dtypes.append(DT_I64)
+    var A = p.n_slots
+    var G = p.groups
+    var ident = List[Float64](length=A, fill=0.0)
+    for a in range(len(p.aggs) // 5):
+        var op = Int(p.aggs[a * 5])
+        var slot = Int(p.aggs[a * 5 + 1])
+        if op == OP_AGG_IMIN:
+            ident[slot] = Float64(from_bits=UInt64(Int64.MAX))
+        elif op == OP_AGG_IMAX:
+            ident[slot] = Float64(from_bits=UInt64(Int64.MIN))
+    var n_blocks = ctx.default_device_info.sm_count
+    var scratch_words = n_blocks * 8 * (A + 1) * G       # at most sm_count x 8 blocks, one row of (slots + 1) x groups each
+    var d_code = ctx.enqueue_create_buffer[DType.int32](len(code))
+    var d_consts = ctx.enqueue_create_buffer[DType.float64](MAX_CONSTS)
+    var d_cols = ctx.enqueue_create_buffer[DType.int64](len(cols))
+    var d_dt = ctx.enqueue_create_buffer[DType.int32](len(dtypes))
+    var d_ident = ctx.enqueue_create_buffer[DType.float64](A)
+    var d_set = ctx.enqueue_create_buffer[DType.int64](4)        # no string sets: a dummy
+    var d_vals = ctx.enqueue_create_buffer[DType.float64](A * G)
+    var d_cnt = ctx.enqueue_create_buffer[DType.int64](G)
+    var d_scratch = ctx.enqueue_create_buffer[DType.float64](scratch_words)
+    var d_ovf = ctx.enqueue_create_buffer[DType.int64](1)
+    ctx.enqueue_copy(dst_buf=d_code, src_ptr=code.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_consts, src_ptr=consts.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_cols, src_ptr=cols.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_dt, src_ptr=dtypes.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_ident, src_ptr=ident.unsafe_ptr())
+    ctx.enqueue_memset(d_set, 0)
+    ctx.enqueue_memset(d_ovf, 0)
+    var agg_base = (len(p.pred) + len(p.body)) // 5
+    var rc = run_pipeline_gpu(ctx, Int(d_code.unsafe_ptr()), Int(d_consts.unsafe_ptr()), Int(d_set.unsafe_ptr()),
+                              Int(d_set.unsafe_ptr()), Int(d_cols.unsafe_ptr()), Int(d_dt.unsafe_ptr()),
+                              -1 if p.keyed else 0, G, A, 0, t.rows(), Int(d_vals.unsafe_ptr()),
+                              Int(d_cnt.unsafe_ptr()), Int(d_ident.unsafe_ptr()), Int(d_scratch.unsafe_ptr()),
+                              n_regs, len(code), agg_base, n_blocks, 1, 0, Int(d_ovf.unsafe_ptr()), True)
+    if rc != 0:
+        if not strict and (rc == -5 or rc == -6):
+            return None                                   # more shared memory than a block has: the CPU answers
+        raise Error("the GPU kernel failed with code " + String(rc) +
+                    (" (the query needs more GPU shared memory than a block has: " + String(n_regs) + " registers, " + String(A) + " slots, " + String(G) + " groups)"
+                     if rc == -5 else ""))
+    var out_vals = List[Float64](length=A * G, fill=0.0)
+    var out_cnt = List[Int64](length=G, fill=0)
+    var ovf = List[Int64](length=1, fill=0)
+    ctx.enqueue_copy(dst_ptr=out_vals.unsafe_ptr(), src_buf=d_vals)
+    ctx.enqueue_copy(dst_ptr=out_cnt.unsafe_ptr(), src_buf=d_cnt)
+    ctx.enqueue_copy(dst_ptr=ovf.unsafe_ptr(), src_buf=d_ovf)
+    ctx.synchronize()
+    _ = code^, consts^, cols^, dtypes^, ident^
+    _ = dmask^, d_code^, d_consts^, d_cols^, d_dt^, d_ident^, d_set^, d_vals^, d_cnt^, d_scratch^, d_ovf^   # Mojo frees at last use: the device buffers must outlive the kernel
+    if ovf[0] != 0:
+        raise Error("a sum or an expression passed the int64 range (about 9.2e18)")
+    return _make_result(p, out_vals, out_cnt)
 
 
 # ── a frame's changed and appended rows, on the CPU ──────────────────────────────────────────────────

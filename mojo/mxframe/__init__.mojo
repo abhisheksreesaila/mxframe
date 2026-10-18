@@ -8,3 +8,4 @@ from .query import Query, QueryResult, Agg, sum, count, mean, min_of, max_of, CP
 from .parquet import write_parquet, read_parquet, ParquetResult, UNCOMPRESSED, SNAPPY, ZSTD
 from .csv import read_csv, CsvOptions, CsvResult, CsvColumn, FailedRow
 from .frame import Frame, Formula
+from .gpu import DeviceTable, gpu_available
