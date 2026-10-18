@@ -1021,6 +1021,7 @@ struct _Slices(Copyable, Movable):
     var pos: List[Int]
     var pend: List[Int]
     var skip: List[Int]              # values to drop from the start of the entry point (a cut inside a run)
+    var next: Int                    # the slice a block reader decodes next
     var err: List[String]
 
     def __init__(out self):
@@ -1032,6 +1033,7 @@ struct _Slices(Copyable, Movable):
         self.pos = List[Int]()
         self.pend = List[Int]()
         self.skip = List[Int]()
+        self.next = 0
         self.err = List[String]()
 
 
@@ -1050,6 +1052,8 @@ struct _Page(Copyable, Movable):
     var is_dict: Bool                # a dictionary page: decoded into its chunk's `_Ctx.dict` in the first parallel round
     var defer: Bool                  # PLAIN text that may add words: misses are recorded, and coded in file order afterwards
     var split: Bool                  # a big page decoded in slices by row range (prepared, then one job per slice)
+    var whole: Bool                  # a block reader decodes the whole page at once (an encoding it cannot cut)
+    var values: List[Int64]          # ... into this, from which its blocks are copied
     var present: Int                 # non-null values (set when the page is opened)
     var nulls: Int
     var bits: List[UInt8]            # validity bits of its rows (an OPTIONAL column with nulls on this page)
@@ -1074,6 +1078,8 @@ struct _Page(Copyable, Movable):
         self.is_dict = is_dict
         self.defer = defer
         self.split = False
+        self.whole = False
+        self.values = List[Int64]()
         self.present = 0
         self.nulls = 0
         self.bits = List[UInt8]()
@@ -1195,6 +1201,20 @@ def _assign_bits(dst: UnsafePointer[UInt8, MutAnyOrigin], pos: Int, src: UnsafeP
         else:
             dst[(pos + i) >> 3] &= ~m
         i += 1
+
+
+def _copy_bits(dst: UnsafePointer[UInt8, MutAnyOrigin], dpos: Int, src: UnsafePointer[UInt8, MutAnyOrigin], spos: Int, n: Int):
+    """dst bits [dpos, dpos + n) = src bits [spos, spos + n)."""
+    var i = 0
+    while i < n and (spos + i) & 7 != 0:
+        var m = UInt8(1) << UInt8((dpos + i) & 7)
+        if _get_bit(src, spos + i):
+            dst[(dpos + i) >> 3] |= m
+        else:
+            dst[(dpos + i) >> 3] &= ~m
+        i += 1
+    if i < n:
+        _assign_bits(dst, dpos + i, src + ((spos + i) >> 3), n - i)
 
 
 def _set_ones(dst: UnsafePointer[UInt8, MutAnyOrigin], pos: Int, count: Int):
@@ -2325,6 +2345,162 @@ struct ParquetScan(Copyable, Movable):
         _ = maps^
         t.check()
         return t^
+
+
+# ── a row group read block by block (F-149) ──────────────────────────────────────────────────────────
+
+comptime MORSEL_UNSUPPORTED = "this row group has a page a block reader does not read"
+
+
+struct GroupReader(Movable):
+    """One row group of a scan, decoded a block of `block` rows at a time by the thread that owns it: the headers are
+    walked and the dictionaries decoded when it is opened, then `next_block` decodes the next rows of each column read
+    into the caller's table, pages one after the other (a page is decompressed when its first block is wanted and
+    dropped when its last block has been), so the working set is a block and the page being read per column. Only
+    dictionary-indexed pages and PLAIN fixed-width pages are cut into blocks; a page of another encoding (text,
+    booleans, delta) is decoded whole when its first block is wanted and copied block by block; nothing here uses the
+    thread pool."""
+    var scan: ParquetScan
+    var maps: List[_Mapped]
+    var ctxs: List[_Ctx]
+    var pages: List[_Page]
+    var of_col: List[List[Int]]      # per column read: its data pages, in row order
+    var cur: List[Int]               # per column read: the page of `of_col` being read
+    var cols: List[Int]
+    var rows: Int
+    var block: Int
+    var at: Int                      # the first row of the next block
+
+    def __init__(out self, var scan: ParquetScan, cols: List[Int], block: Int):
+        self.scan = scan^
+        self.maps = List[_Mapped]()
+        self.ctxs = List[_Ctx]()
+        self.pages = List[_Page]()
+        self.of_col = List[List[Int]]()
+        self.cur = List[Int]()
+        self.cols = cols.copy()
+        self.rows = 0
+        self.block = block
+        self.at = 0
+
+    def next_block(mut self, mut t: Table) raises -> Int:
+        """Decodes the next block into rows 0.. of `t`'s columns (in the order of `cols`; each holds at least `block`
+        values), sets their validity bitmaps and null counts, and returns the number of rows (0 at the end)."""
+        if self.at >= self.rows:
+            return 0
+        var b0 = self.at
+        var b1 = min(self.rows, b0 + self.block)
+        ref info = self.scan._info[]
+        for k in range(len(self.cols)):
+            ref col = t.cols[k]
+            ref ctx = self.ctxs[k]
+            ref leaf = info.leaves[self.cols[k]]
+            if ctx.optional:
+                col.validity.clear()
+                col.validity.resize((self.block + 7) // 8, 0xFF)
+            var vptr = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(col.validity.unsafe_ptr()))
+            var base = Int(col.values.unsafe_ptr())
+            var nulls = 0
+            var ci = self.cur[k]
+            while ci < len(self.of_col[k]):
+                ref p = self.pages[self.of_col[k][ci]]
+                if p.row >= b1:
+                    break
+                if p.nvals == 0 or p.row + p.nvals <= b0:
+                    ci += 1
+                    continue
+                if p.whole:
+                    if len(p.values) == 0:               # first block of this page: decode all of it
+                        p.values = List[Int64](unsafe_uninit_length=p.nvals)
+                        _decode_page(p, ctx, leaf, Int(p.values.unsafe_ptr()), 0)
+                    var a0 = max(b0, p.row) - p.row
+                    var a1 = min(b1, p.row + p.nvals) - p.row
+                    for j in range(a0, a1):
+                        col.values[p.row + j - b0] = p.values[j]
+                    if p.nulls > 0:
+                        var bp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr()))
+                        _copy_bits(vptr, p.row + a0 - b0, bp, a0, a1 - a0)
+                        for j in range(a0, a1):
+                            if not _get_bit(bp, j):
+                                nulls += 1
+                    if p.row + p.nvals <= b1:            # the page's last block
+                        p.values = List[Int64]()
+                        p.bits = List[UInt8]()
+                        ci += 1
+                        continue
+                    break
+                if len(p.sl.v) == 0:                     # first block of this page: open it and plan a slice per block
+                    var cuts = List[Int]()
+                    var g = (p.row // self.block + 1) * self.block
+                    while g < p.row + p.nvals:
+                        cuts.append(g - p.row)
+                        g += self.block
+                    _prep_page(p, ctx, leaf, cuts)
+                var sidx = p.sl.next
+                if p.row + p.sl.row[sidx] != max(b0, p.row):
+                    raise Error("internal error: a block does not start at a slice")
+                _decode_slice(p, sidx, ctx, leaf, base + (p.row - b0) * 8)
+                var r0 = p.sl.row[sidx]
+                var r1 = p.sl.row[sidx + 1] if sidx + 1 < len(p.sl.row) else p.nvals
+                var cnt = (p.sl.v[sidx + 1] if sidx + 1 < len(p.sl.v) else p.present) - p.sl.v[sidx]
+                if r1 - r0 > cnt:
+                    nulls += r1 - r0 - cnt
+                    _copy_bits(vptr, p.row + r0 - b0, UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p.bits.unsafe_ptr())),
+                               r0, r1 - r0)
+                p.sl.next = sidx + 1
+                if p.sl.next >= len(p.sl.v):             # the page's last block: let go of it
+                    p.keep = List[UInt8]()
+                    p.bits = List[UInt8]()
+                    ci += 1
+                else:
+                    break
+            self.cur[k] = ci
+            if ctx.optional and nulls == 0:
+                col.validity.clear()
+            col.nulls = nulls
+        self.at = b1
+        return b1 - b0
+
+
+def open_group(scan: ParquetScan, g: Int, cols: List[Int], block: Int) raises -> GroupReader:
+    """Opens row group `g` for `next_block`: its headers are walked and its dictionaries decoded here. The dictionaries
+    of the TEXT columns in `cols` must have been built (`ParquetScan.ensure_words`)."""
+    var r = GroupReader(scan.copy(), cols, block)
+    ref info = scan._info[]
+    info.check_unchanged()
+    var rows = -1
+    for k in range(len(cols)):
+        var c = cols[k]
+        ref meta = info.groups[g][c]
+        var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, meta, info.leaves[c], r.maps)
+        r.ctxs.append(_Ctx(c, k, meta.codec, info.leaves[c].repetition == OPTIONAL,
+                           Int(info.widx.unsafe_ptr() + c) if scan.schema.kind(c) == TEXT else 0, False, List[Int64](), 0, False))
+        if rows < 0:
+            rows = meta.values
+        elif meta.values != rows:
+            raise Error("column `" + info.leaves[c].name + "` has " + String(meta.values) + " rows in this row group, column `" +
+                        info.leaves[cols[0]].name + "` has " + String(rows) + " (corrupt file)")
+        if meta.group_rows >= 0 and meta.values != meta.group_rows:
+            raise Error("column `" + info.leaves[c].name + "` has " + String(meta.values) + " values in a row group of " +
+                        String(meta.group_rows) + " rows (corrupt file)")
+        _walk_chunk(src[0], src[1], meta, info.leaves[c], r.ctxs[k], k, 0, r.pages, False)
+        r.of_col.append(List[Int]())
+        r.cur.append(0)
+    r.rows = max(rows, 0)
+    for i in range(len(r.pages)):
+        if r.pages[i].is_dict:
+            var k = r.pages[i].ctx
+            _decode_dict_page(r.pages[i], r.ctxs[k], info.leaves[cols[k]], 0)
+    for i in range(len(r.pages)):
+        ref p = r.pages[i]
+        if p.is_dict:
+            continue
+        var pt = info.leaves[cols[p.ctx]].ptype
+        var dict_coded = p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY
+        if not (dict_coded or (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED))):
+            p.whole = True                               # text, booleans, delta: decoded whole, copied block by block
+        r.of_col[p.ctx].append(i)
+    return r^
 
 
 def scan_parquet(path: String) raises -> ParquetScan:

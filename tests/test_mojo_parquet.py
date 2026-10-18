@@ -1175,3 +1175,47 @@ def test_big_single_page_columns_slice_by_row_range_and_decode_the_same(cells, t
         for mode in ("read", "scan"):
             got = subprocess.run([str(binary), str(path), mode], capture_output=True, text=True, check=True).stdout
             assert got == want, (binary.name, mode)
+
+
+# ── F-149: morsel-driven streamed scans (a worker per row group, blocks of rows) ─────────────────────
+
+def probe_morsels(prober, path, query, rows, mode="1"):
+    env = {**__import__("os").environ, "MXFRAME_SCAN_MORSELS": mode, "MXFRAME_MORSEL_ROWS": str(rows)}
+    p = subprocess.run([str(prober), str(path), "scan", query], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout.strip().split("\n")[-1])
+
+
+@pytest.mark.parametrize("name", ["zstd-dict-v1", "snappy-dict-v2", "none-plain-v1", "small-pages"])
+@pytest.mark.parametrize("rows", [1000, 3001])
+def test_morsels_equal_read_parquet_and_duckdb(prober, tmp_path, name, rows):
+    """Blocks of 1,000 and 3,001 rows cut across pages of every size, nulls (a whole row group of them), empty row groups,
+    dictionary fallback to PLAIN text: the answer of every query equals read_parquet's and DuckDB's."""
+    path = tmp_path / "t.parquet"
+    write_with_empty_groups(path, scan_table(), **PYARROW_FILES[name])
+    for q in SCAN_QUERIES:
+        got = probe_morsels(prober, path, q, rows)
+        same_answer(got, probe(prober, path, "read", q))
+        check_against_duckdb(path, got, q)
+
+
+def test_morsels_cut_pages_inside_runs_and_over_nulls(prober, tmp_path):
+    """Dictionary-index pages with long repeated runs and short bit-packed ones, nulls everywhere, and blocks that start in
+    the middle of a run: the groups sum to what read_parquet gives."""
+    r = _random.Random(3)
+    n = 60_000
+    vals = []
+    while len(vals) < n:                                              # runs of 1..3000 equal values, then noise
+        vals += [r.randint(0, 6)] * r.randint(1, 3000) if r.random() < 0.5 else [r.randint(0, 6) for _ in range(r.randint(1, 40))]
+    vals = vals[:n]
+    t = pa.table({"region": pa.array([f"w{v}" if r.random() > 0.1 else None for v in vals], pa.string()),
+                  "carrier": pa.array([None if r.random() < 0.2 else v for v in vals], pa.int64()),
+                  "day": pa.array([_dt.date(1970, 1, 1) + _dt.timedelta(days=9000 + v) for v in vals], pa.date32()),
+                  "revenue": pa.array([None if r.random() < 0.1 else _dec.Decimal(r.randint(-10**6, 10**6)).scaleb(-2) for _ in vals],
+                                      pa.decimal128(18, 2)),
+                  "cost": pa.array([r.randint(-5000, 5000) for _ in vals], pa.int64())})
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=15_000, data_page_size=20_000, compression="snappy")
+    for rows in (700, 4096):
+        for q in SCAN_QUERIES:
+            same_answer(probe_morsels(prober, path, q, rows), probe(prober, path, "read", q))
