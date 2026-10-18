@@ -52,11 +52,10 @@ File format decisions:
 """
 from std.ffi import external_call
 from std.memory import Pointer
-from std.sys.info import num_physical_cores
 from std.time import perf_counter_ns
 from std.collections import Dict
 from .table import Table, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
-from .kernels._fpenv import par_n
+from .kernels._fpenv import par_n, core_count
 
 comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
@@ -915,7 +914,7 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
                 scales[c] = 0
 
     # chunks: safe row boundaries found with a parallel pre-scan of the quote state machine
-    var workers = options.threads if options.threads > 0 else num_physical_cores()
+    var workers = options.threads if options.threads > 0 else core_count()
     var span = size - first_row
     var nch = 1
     if workers > 1 and span > 0:
@@ -1065,7 +1064,7 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
     if nch == 1:
         copy_chunk(0)
     else:
-        par_n(copy_chunk, nch, num_physical_cores())
+        par_n(copy_chunk, nch, core_count())
 
     for c in range(ncols):
         var report = CsvColumn(names[c], kind_of[c], scales[c])

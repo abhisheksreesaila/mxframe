@@ -25,4 +25,21 @@ for t in "${files[@]}"; do
   fi
   if "$out/$name" > "$out/$name.log" 2>&1; then echo "ok   $name"; else echo "FAIL $name"; tail -20 "$out/$name.log"; fail=1; fi
 done
+
+# F-138b: the same package built the way an app with no GPU, thread pool or codecs builds it (what every non-Linux
+# target gets by default, forced here with -D). Its inputs are a zstd and a snappy file from the normal build.
+if [ $# -eq 0 ]; then
+  sw="$root/mojo/tests/switches/test_switches"
+  if mojo build --disable-warnings "$root/mojo/tools/pq_write_sample.mojo" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy \
+       -Xlinker -rpath="$lib" -o "$out/pq_write_sample" > "$out/pq_write_sample.build.log" 2>&1 \
+     && "$out/pq_write_sample" "$out/switches-zstd.parquet" zstd 500 200 && "$out/pq_write_sample" "$out/switches-snappy.parquet" snappy 500 200 \
+     && mojo build --disable-warnings "$sw.mojo" -I "$root/build" -D MXFRAME_NO_GPU -D MXFRAME_SERIAL -D MXFRAME_NO_CODECS \
+       -o "$out/test_switches" > "$out/test_switches.build.log" 2>&1; then
+    if nm "$out/test_switches" | grep -E "ZSTD_|snappy_|AsyncRT_Device" > /dev/null; then
+      echo "FAIL test_switches links a codec or GPU symbol (the Linux main() still brings the CPU runtime; the Mac check proves none)"; fail=1
+    elif "$out/test_switches" "$out/switches-zstd.parquet" "$out/switches-snappy.parquet" > "$out/test_switches.log" 2>&1; then
+      echo "ok   test_switches (no GPU, serial, no codecs)"
+    else echo "FAIL test_switches"; tail -20 "$out/test_switches.log"; fail=1; fi
+  else echo "FAIL (build) test_switches"; tail -20 "$out/test_switches.build.log"; fail=1; fi
+fi
 exit $fail

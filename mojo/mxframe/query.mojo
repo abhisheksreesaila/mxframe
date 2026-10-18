@@ -23,15 +23,16 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 - a total that passes int64 raises (the stand-in wrapped silently).
 """
 from std.time import perf_counter_ns
-from std.sys.info import num_physical_cores
 from std.memory import Pointer
 from .table import SharedTable
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
+from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
-from .gpu import DeviceTable
+from max.gpu.host import DeviceContext, DeviceBuffer
+from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE
 
 # plan node kinds
 comptime P_SCAN = 0
@@ -196,6 +197,8 @@ struct Query(Movable):
         the same either way, edits of a frame included."""
         var use_gpu = False
         if device == GPU:
+            comptime if not HAS_GPU:
+                raise Error("device GPU: " + NO_GPU_MESSAGE)
             if not self.device:
                 raise Error("device GPU: no DeviceTable is attached (Query.on_device(DeviceTable(table)))")
             if not self.device.value().is_live():
@@ -214,14 +217,17 @@ struct Query(Movable):
         var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
         var r = QueryResult()
         var done = False
+        var fallback = String()
         if use_gpu:
-            var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU)
-            if g:
-                r = g.take()
-                r.device = GPU
-                done = True
+            comptime if HAS_GPU:
+                var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback)
+                if g:
+                    r = g.take()
+                    r.device = GPU
+                    done = True
         if not done:
             r = _run_cpu(self.table, prog, Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0)
+            r.fallback_reason = fallback^
         if self.framed and len(self.overlay.delta) > 0:
             _add_delta(r, self.table, nodes, self.overlay)
         r.milliseconds = Float64(perf_counter_ns() - t0) / 1e6
@@ -237,9 +243,11 @@ struct QueryResult(Movable):
     var sums: List[Int]             # the first sum's values (the spec's `r.sums`), else empty
     var milliseconds: Float64
     var device: Int                 # CPU or GPU: where the kernel ran
+    var fallback_reason: String     # AUTO chose the GPU and the CPU answered instead: why (else "")
 
     def __init__(out self):
         self.device = CPU
+        self.fallback_reason = String()
         self.kinds = List[Int]()
         self.slot_of = List[Int]()
         self.count_slot_of = List[Int]()
@@ -701,7 +709,7 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int) raises -> QueryResult:
         dtypes.append(DT_I64)
     var out_vals = List[Float64](length=p.n_slots * p.groups, fill=0.0)
     var out_cnt = List[Int64](length=p.groups, fill=0)
-    var threads = num_physical_cores()
+    var threads = core_count()
     var rc: Int
     if p.keyed:
         rc = pipeline_keyed[type_of(_key_from_reg0)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
@@ -786,21 +794,44 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
 comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (about 9.2e18)"
 
 
-def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool) raises -> Optional[QueryResult]:
-    """`_run_gpu_on`, and on AUTO (not `strict`) any failure of the device itself (out of memory for the output, a
-    launch error) returns None so the CPU answers; an int64 overflow is an answer and always raises."""
-    try:
-        return _run_gpu_on(dt, t, p, mask, strict)
-    except e:
-        if strict or OVERFLOW_MESSAGE in String(e):
-            raise e^
-        return None
+struct _QueryBuffers(Movable):
+    """The device buffers one GPU query needs. Making them is the only step that can fail for lack of memory, so
+    AUTO's fallback wraps exactly this constructor."""
+    var code: DeviceBuffer[DType.int32]
+    var consts: DeviceBuffer[DType.float64]
+    var cols: DeviceBuffer[DType.int64]
+    var dtypes: DeviceBuffer[DType.int32]
+    var ident: DeviceBuffer[DType.float64]
+    var set: DeviceBuffer[DType.int64]
+    var vals: DeviceBuffer[DType.float64]
+    var cnt: DeviceBuffer[DType.int64]
+    var scratch: DeviceBuffer[DType.float64]
+    var ovf: DeviceBuffer[DType.int64]
+    var mask: DeviceBuffer[DType.uint8]
+
+    def __init__(out self, ctx: DeviceContext, n_code: Int, n_cols: Int, n_dtypes: Int, slots: Int, groups: Int,
+                 scratch_words: Int, mask_len: Int) raises:
+        self.code = ctx.enqueue_create_buffer[DType.int32](n_code)
+        self.consts = ctx.enqueue_create_buffer[DType.float64](MAX_CONSTS)
+        self.cols = ctx.enqueue_create_buffer[DType.int64](n_cols)
+        self.dtypes = ctx.enqueue_create_buffer[DType.int32](n_dtypes)
+        self.ident = ctx.enqueue_create_buffer[DType.float64](slots)
+        self.set = ctx.enqueue_create_buffer[DType.int64](4)             # no string sets: a dummy
+        self.vals = ctx.enqueue_create_buffer[DType.float64](slots * groups)
+        self.cnt = ctx.enqueue_create_buffer[DType.int64](groups)
+        self.scratch = ctx.enqueue_create_buffer[DType.float64](scratch_words)
+        self.ovf = ctx.enqueue_create_buffer[DType.int64](1)
+        self.mask = ctx.enqueue_create_buffer[DType.uint8](max(mask_len, 1))
 
 
-def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool) raises -> Optional[QueryResult]:
+def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool, mut fallback: String) raises -> Optional[QueryResult]:
     """The lowered program on the device table (kernels/pipeline_gpu.mojo, keyed mode: the group id is register 0).
-    Same answers as `_run_cpu`: exact int64 totals, the overflow flag raises the same error. `strict` (device=GPU):
-    a program the kernel cannot take raises; otherwise (AUTO) it returns None and the CPU answers."""
+    Same answers as `_run_cpu`: exact int64 totals, the overflow flag raises the same error.
+
+    `strict` (device=GPU) raises on every failure. On AUTO only two things send the query to the CPU, and `fallback`
+    says which: the device cannot hold the query's buffers (an allocation failed), or the kernel declined the
+    program (needs more shared memory than a block has, or the reproducible mode's group table does not fit: -5 /
+    -6). A launch error, an illegal address or an int64 overflow is a bug or an answer: it always raises."""
     var ctx = dt.context()
     var ins = p.pred.copy()
     ins.extend(p.body.copy())
@@ -816,9 +847,34 @@ def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], 
     var consts = List[Float64](length=MAX_CONSTS, fill=0.0)
     for k in range(len(p.consts)):                       # int64 bits in the float64 pool, copied exactly
         consts[k] = Float64(from_bits=UInt64(p.consts[k]))
-    var dmask = ctx.enqueue_create_buffer[DType.uint8](max(len(mask), 1))
+    var A = p.n_slots
+    var G = p.groups
+    var n_blocks = ctx.default_device_info.sm_count
+    # the per-block partial rows exist only in the small-group modes (0, 3, 4): at most sm_count x 8 blocks, one row
+    # of (slots + 1) x groups each. Many groups run in the atomic modes, which write the output directly.
+    var mode = _choose_mode(G, A, n_regs, len(code), 0, True)
+    var scratch_words = n_blocks * 8 * (A + 1) * G if mode == 0 or mode == 3 or mode == 4 else 1
+    var made = Optional[_QueryBuffers](None)
+    try:
+        made = _QueryBuffers(ctx, len(code), max(len(p.cols), 1), max(len(p.dtypes), 1), A, G, scratch_words, len(mask))
+    except e:
+        if strict:
+            raise e^
+        fallback = "the GPU could not allocate the query's buffers: " + String(e)
+        return None
+    var b = made.take()
+    ref d_code = b.code
+    ref d_consts = b.consts
+    ref d_cols = b.cols
+    ref d_dt = b.dtypes
+    ref d_ident = b.ident
+    ref d_set = b.set
+    ref d_vals = b.vals
+    ref d_cnt = b.cnt
+    ref d_scratch = b.scratch
+    ref d_ovf = b.ovf
     if len(mask) > 0:
-        ctx.enqueue_copy(dst_buf=dmask, src_ptr=mask.unsafe_ptr())
+        ctx.enqueue_copy(dst_buf=b.mask, src_ptr=mask.unsafe_ptr())
     var cols = List[Int64]()
     for c in p.cols:
         if c >= 0:
@@ -826,7 +882,7 @@ def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], 
         elif c == -1_000_000 or c == -5_000_000:
             cols.append(0)
         elif c == -4_000_000:
-            cols.append(Int64(Int(dmask.unsafe_ptr())))
+            cols.append(Int64(Int(b.mask.unsafe_ptr())))
         else:
             cols.append(Int64(dt.validity_address(-1 - c)))
     if len(cols) == 0:
@@ -834,8 +890,6 @@ def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], 
     var dtypes = p.dtypes.copy()
     if len(dtypes) == 0:
         dtypes.append(DT_I64)
-    var A = p.n_slots
-    var G = p.groups
     var ident = List[Float64](length=A, fill=0.0)
     for a in range(len(p.aggs) // 5):
         var op = Int(p.aggs[a * 5])
@@ -844,21 +898,6 @@ def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], 
             ident[slot] = Float64(from_bits=UInt64(Int64.MAX))
         elif op == OP_AGG_IMAX:
             ident[slot] = Float64(from_bits=UInt64(Int64.MIN))
-    var n_blocks = ctx.default_device_info.sm_count
-    # the per-block partial rows exist only in the small-group modes (0, 3, 4): at most sm_count x 8 blocks, one row
-    # of (slots + 1) x groups each. Many groups run in the atomic modes, which write the output directly.
-    var mode = _choose_mode(G, A, n_regs, len(code), 0, True)
-    var scratch_words = n_blocks * 8 * (A + 1) * G if mode == 0 or mode == 3 or mode == 4 else 1
-    var d_code = ctx.enqueue_create_buffer[DType.int32](len(code))
-    var d_consts = ctx.enqueue_create_buffer[DType.float64](MAX_CONSTS)
-    var d_cols = ctx.enqueue_create_buffer[DType.int64](len(cols))
-    var d_dt = ctx.enqueue_create_buffer[DType.int32](len(dtypes))
-    var d_ident = ctx.enqueue_create_buffer[DType.float64](A)
-    var d_set = ctx.enqueue_create_buffer[DType.int64](4)        # no string sets: a dummy
-    var d_vals = ctx.enqueue_create_buffer[DType.float64](A * G)
-    var d_cnt = ctx.enqueue_create_buffer[DType.int64](G)
-    var d_scratch = ctx.enqueue_create_buffer[DType.float64](scratch_words)
-    var d_ovf = ctx.enqueue_create_buffer[DType.int64](1)
     ctx.enqueue_copy(dst_buf=d_code, src_ptr=code.unsafe_ptr())
     ctx.enqueue_copy(dst_buf=d_consts, src_ptr=consts.unsafe_ptr())
     ctx.enqueue_copy(dst_buf=d_cols, src_ptr=cols.unsafe_ptr())
@@ -874,7 +913,9 @@ def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], 
                               n_regs, len(code), agg_base, n_blocks, 1, 0, Int(d_ovf.unsafe_ptr()), True)
     if rc != 0:
         if not strict and (rc == -5 or rc == -6):
-            return None                                   # more shared memory than a block has: the CPU answers
+            fallback = "the GPU kernel declined the program (code " + String(rc) + ": " + (
+                "it needs more shared memory than a block has" if rc == -5 else "the group table does not fit") + ")"
+            return None                                   # the CPU answers
         raise Error("the GPU kernel failed with code " + String(rc) +
                     (" (the query needs more GPU shared memory than a block has: " + String(n_regs) + " registers, " + String(A) + " slots, " + String(G) + " groups)"
                      if rc == -5 else ""))
@@ -886,7 +927,7 @@ def _run_gpu_on(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], 
     ctx.enqueue_copy(dst_ptr=ovf.unsafe_ptr(), src_buf=d_ovf)
     ctx.synchronize()
     _ = code^, consts^, cols^, dtypes^, ident^
-    _ = dmask^, d_code^, d_consts^, d_cols^, d_dt^, d_ident^, d_set^, d_vals^, d_cnt^, d_scratch^, d_ovf^   # Mojo frees at last use: the device buffers must outlive the kernel
+    _ = b^   # Mojo frees at last use: the device buffers must outlive the kernel
     if ovf[0] != 0:
         raise Error(OVERFLOW_MESSAGE)
     return _make_result(p, out_vals, out_cnt)

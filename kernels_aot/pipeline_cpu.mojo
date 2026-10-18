@@ -48,8 +48,8 @@ Outputs: out_vals float64[n_aggs * n_groups] (sum/min/max per agg and group),
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero
-from _fpenv import par, par_n
-from std.sys import simd_width_of
+from _fpenv import par, par_n, start_pool
+from std.sys import simd_width_of, CompilationTarget
 from std.atomic import Atomic
 from std.math import floor
 from std.ffi import external_call
@@ -776,7 +776,8 @@ def big_alloc(n: Int) -> Int:
         return Int(unsafe_alloc[UInt8](max(n, 1), alignment=64))
     var size = (n + HUGE - 1) // HUGE * HUGE
     var b = unsafe_alloc[UInt8](size, alignment=HUGE)
-    _ = external_call["madvise", Int32](Int(b), size, Int32(14))     # MADV_HUGEPAGE
+    comptime if CompilationTarget.is_linux():                         # 14 is Linux's MADV_HUGEPAGE: not Darwin's
+        _ = external_call["madvise", Int32](Int(b), size, Int32(14))
     return Int(b)
 
 
@@ -1465,7 +1466,7 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
         else:
             # A host process (Python via ctypes) has no Mojo async runtime yet:
             # create the global CPU device (thread pool) once, then parallelize.
-            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+            start_pool()
             par(lworker, nthreads)
 
         # merge worker partials into the output (parallel over group ranges when there are many groups)
@@ -1709,7 +1710,7 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             cnt.free()
             touched.free()
 
-        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        start_pool()
         var wave0 = 0
         while wave0 < morsels and failed[0] == 0:
             ctl[0] = Int64(wave0)
@@ -1812,7 +1813,7 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     if nthreads > 1:
         # A host process (Python via ctypes) has no Mojo async runtime yet:
         # create the global CPU device (thread pool) once, then parallelize.
-        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        start_pool()
     var wave0 = 0
     while wave0 < morsels and failed[0] == 0:
         ctl[0] = Int64(wave0)

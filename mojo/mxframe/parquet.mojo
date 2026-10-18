@@ -20,8 +20,14 @@ or not, the stored instant is floored to a day since 1970 in UTC, never shifted 
 
 The file is untrusted input: every length, count, run and bit width is checked against what the page or footer can
 hold before anything is allocated or read, and a bad file raises "(corrupt file)", never crashes.
+
+F-138b, the no-codec build: zstd and snappy are C libraries. An Apple app links neither, so there (any target but
+Linux, or `-D MXFRAME_NO_CODECS` on Linux to test it) `write_parquet` saves UNCOMPRESSED whatever `compression` says,
+and `read_parquet` refuses a zstd or snappy column chunk with an error naming the column. No codec symbol is
+referenced, so nothing links. On Linux both codecs work as before.
 """
 from std.ffi import external_call
+from std.sys import is_defined, CompilationTarget
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
@@ -64,6 +70,8 @@ comptime SNAPPY = 1
 comptime GZIP = 2
 comptime ZSTD = 6
 
+comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()
+
 comptime DEFAULT_ROW_GROUP = 1 << 20
 comptime INT32_MAX = 2147483647
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
@@ -99,23 +107,26 @@ def _bit_width(max_value: Int) -> Int:
 def _compress(codec: Int, src: List[UInt8]) raises -> List[UInt8]:
     if codec == UNCOMPRESSED:
         return src.copy()
-    if codec == ZSTD:
-        var cap = external_call["ZSTD_compressBound", Int](len(src))
-        var out = List[UInt8](length=max(cap, 1), fill=0)
-        var n = external_call["ZSTD_compress", Int](out.unsafe_ptr(), cap, src.unsafe_ptr(), len(src), Int32(3))
-        if external_call["ZSTD_isError", UInt32](n) != 0:
-            raise Error("zstd compression failed")
-        out.resize(n, 0)
-        return out^
-    if codec == SNAPPY:
-        var cap = external_call["snappy_max_compressed_length", Int](len(src))
-        var out = List[UInt8](length=max(cap, 1), fill=0)
-        var n = cap
-        if external_call["snappy_compress", Int32](src.unsafe_ptr(), len(src), out.unsafe_ptr(), UnsafePointer(to=n)) != 0:
-            raise Error("snappy compression failed")
-        out.resize(n, 0)
-        return out^
-    raise Error("compression codec " + String(codec) + " is not supported (UNCOMPRESSED, SNAPPY, ZSTD)")
+    comptime if NO_CODECS:
+        raise Error("this build has no zstd or snappy: pages are saved UNCOMPRESSED")
+    else:
+        if codec == ZSTD:
+            var cap = external_call["ZSTD_compressBound", Int](len(src))
+            var out = List[UInt8](length=max(cap, 1), fill=0)
+            var n = external_call["ZSTD_compress", Int](out.unsafe_ptr(), cap, src.unsafe_ptr(), len(src), Int32(3))
+            if external_call["ZSTD_isError", UInt32](n) != 0:
+                raise Error("zstd compression failed")
+            out.resize(n, 0)
+            return out^
+        if codec == SNAPPY:
+            var cap = external_call["snappy_max_compressed_length", Int](len(src))
+            var out = List[UInt8](length=max(cap, 1), fill=0)
+            var n = cap
+            if external_call["snappy_compress", Int32](src.unsafe_ptr(), len(src), out.unsafe_ptr(), UnsafePointer(to=n)) != 0:
+                raise Error("snappy compression failed")
+            out.resize(n, 0)
+            return out^
+        raise Error("compression codec " + String(codec) + " is not supported (UNCOMPRESSED, SNAPPY, ZSTD)")
 
 
 def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
@@ -132,27 +143,30 @@ def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
             out[i] = p[i]
         out.resize(size, 0)
         return out^
-    if codec == ZSTD:
-        var stated = external_call["ZSTD_getFrameContentSize", UInt64](src, n)
-        if stated < (UInt64(1) << 62) and stated != UInt64(size):
-            raise Error("a zstd page did not decompress to its stated size (corrupt file)")
-        var out = List[UInt8](length=max(size, 1), fill=0)
-        var got = external_call["ZSTD_decompress", Int](out.unsafe_ptr(), size, src, n)
-        if external_call["ZSTD_isError", UInt32](got) != 0 or got != size:
-            raise Error("a zstd page did not decompress to its stated size (corrupt file)")
-        out.resize(size, 0)
-        return out^
-    if codec == SNAPPY:
-        var stated = 0
-        if external_call["snappy_uncompressed_length", Int32](src, n, UnsafePointer(to=stated)) != 0 or stated != size:
-            raise Error("a snappy page did not decompress to its stated size (corrupt file)")
-        var out = List[UInt8](length=max(size, 1), fill=0)
-        var got = size
-        if external_call["snappy_uncompress", Int32](src, n, out.unsafe_ptr(), UnsafePointer(to=got)) != 0 or got != size:
-            raise Error("a snappy page did not decompress to its stated size (corrupt file)")
-        out.resize(size, 0)
-        return out^
-    raise Error("compression codec " + String(codec) + " is not supported yet (UNCOMPRESSED, SNAPPY, ZSTD)")
+    comptime if NO_CODECS:
+        raise Error("this build has no zstd or snappy, so it cannot read this page")
+    else:
+        if codec == ZSTD:
+            var stated = external_call["ZSTD_getFrameContentSize", UInt64](src, n)
+            if stated < (UInt64(1) << 62) and stated != UInt64(size):
+                raise Error("a zstd page did not decompress to its stated size (corrupt file)")
+            var out = List[UInt8](length=max(size, 1), fill=0)
+            var got = external_call["ZSTD_decompress", Int](out.unsafe_ptr(), size, src, n)
+            if external_call["ZSTD_isError", UInt32](got) != 0 or got != size:
+                raise Error("a zstd page did not decompress to its stated size (corrupt file)")
+            out.resize(size, 0)
+            return out^
+        if codec == SNAPPY:
+            var stated = 0
+            if external_call["snappy_uncompressed_length", Int32](src, n, UnsafePointer(to=stated)) != 0 or stated != size:
+                raise Error("a snappy page did not decompress to its stated size (corrupt file)")
+            var out = List[UInt8](length=max(size, 1), fill=0)
+            var got = size
+            if external_call["snappy_uncompress", Int32](src, n, out.unsafe_ptr(), UnsafePointer(to=got)) != 0 or got != size:
+                raise Error("a snappy page did not decompress to its stated size (corrupt file)")
+            out.resize(size, 0)
+            return out^
+        raise Error("compression codec " + String(codec) + " is not supported yet (UNCOMPRESSED, SNAPPY, ZSTD)")
 
 
 # ── writing ──────────────────────────────────────────────────────────────────────────────────────────
@@ -301,7 +315,10 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
     return chunk^
 
 
-def _write(path: String, t: Table, metadata: String, codec: Int, row_group_rows: Int) raises:
+def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int) raises:
+    var codec = requested
+    comptime if NO_CODECS:
+        codec = UNCOMPRESSED                       # no zstd / snappy linked: whatever was asked for
     t.check()
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
@@ -931,6 +948,10 @@ def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, 
     var dictionary = List[Int64]()
     var done = 0
     var optional = leaf.repetition == OPTIONAL
+    comptime if NO_CODECS:
+        if meta.codec == ZSTD or meta.codec == SNAPPY:
+            raise Error("column `" + leaf.name + "` is " + ("zstd" if meta.codec == ZSTD else "snappy") +
+                        "-compressed, and this build has no zstd or snappy (save the file UNCOMPRESSED, or open it on a build with codecs)")
     if meta.values < 0:
         raise Error("column `" + leaf.name + "`: a column chunk has a negative value count (corrupt file)")
     while done < meta.values:
