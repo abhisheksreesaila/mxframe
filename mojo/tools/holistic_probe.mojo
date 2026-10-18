@@ -39,6 +39,8 @@ def aggregates(var q: Query, grouped: Bool, groups: Int) raises -> Query:
 
 
 def plan(var q: Query, which: String, groups: Int) raises -> Query:
+    if which == "topk":                    # top_k alone on its values: the kernel hook feeds per-worker heaps, no pairs written
+        return q^.group_by(col("g"), groups=groups).agg(count(), top_k(col("x"), 3), top_k(col("s"), 2))
     if which == "filtered":
         return aggregates(q^.where(col("x").between(-5000, 5000)), True, groups)
     return aggregates(q^, which != "global", groups)
@@ -91,7 +93,7 @@ def json_of(r: QueryResult, words: String, ms: Float64) -> String:
         out += ("" if i == 1 else ", ") + '{"present": ['
         for g in range(len(r.counts)):
             out += ("" if g == 0 else ", ") + ("1" if r.present(i, g) else "0")
-        if i == 5 or i == 8:                                                  # the top_k aggregates
+        if r.hol_of[i] >= 0 and len(r.htop_off[r.hol_of[i]]) > 0:             # the top_k aggregates
             out += '], "top": ['
             for g in range(len(r.counts)):
                 var t = r.top(i, g)

@@ -23,6 +23,7 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 - a total that passes int64 raises (the stand-in wrapped silently).
 """
 from std.time import perf_counter_ns
+from std.atomic import Atomic
 from std.memory import Pointer
 from .table import SharedTable, Table, TEXT
 from .parquet import ParquetScan
@@ -34,7 +35,7 @@ from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE
-from .holistic import HolStates, HolSpec, HolResult, window_blocks, A_DISTINCT, A_PCT, A_TOPK
+from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, A_DISTINCT, A_PCT, A_TOPK
 from .frame import text_ranks
 
 # plan node kinds
@@ -651,6 +652,7 @@ def _sources(aggs: List[Agg]) -> List[Int]:
 
 
 comptime CTL_REG = 1                     # the register holding the control block's address (see `_mat_hook`)
+comptime SRC_WORDS = 10                  # control block words per value source
 comptime CTL_PLACEHOLDER = Int64(0x5A5A5A5A5A5A5A5A)
 
 
@@ -851,13 +853,32 @@ def _key_from_reg0(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst
     return True
 
 
+@always_inline
+def _worker_slot(ctl: LP, regs: FP) -> Int:
+    """The calling worker's number (0, 1, 2 ... in the order workers first reach the hook): its register file's address
+    is its identity for the whole run, entered in a table in the control block the first time. -1 if the table is full."""
+    var table = LP(unsafe_from_address=Int(ctl[4]))
+    var counter = LP(unsafe_from_address=Int(ctl[3]))
+    var mine = Int64(Int(regs))
+    for i in range(min(Int(counter[0]), Int(ctl[5]))):
+        if table[i] == mine:
+            return i
+    var i = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+    if i >= Int(ctl[5]):
+        return -1
+    table[i] = mine
+    return i
+
+
 def _mat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
     """`_key_from_reg0`, and the materializing of the holistic aggregates' pairs. Register CTL_REG holds the address
-    of the control block (Int64 words): [0] sources, [1] first row of the window, [2] groups, then per source
-    [value register, validity register or -1, group ids address, values address, per-block counts address]. For each
-    source the block's selected rows whose group is in range and whose value is not null are written, packed, at
-    entry (row0 - window start) of the source's arrays, and their number at the block's place in the counts; block
-    b of the window starts at row `start + b * VEC`, so no two blocks (or threads) share an entry."""
+    of the control block (Int64 words): [0] sources, [1] first row of the window, [2] groups, [3] worker counter,
+    [4] worker table, [5] its size, then per source SRC_WORDS words: [value register, validity register or -1, group
+    ids address, values address, per-block counts address, direct, k, heaps address, sizes address, rank address].
+    For each source the block's selected rows whose group is in range and whose value is not null are written, packed,
+    at entry (row0 - window start) of the source's arrays, and their number at the block's place in the counts;
+    block b of the window starts at row `start + b * VEC`, so no two blocks (or threads) share an entry. A `direct`
+    source (one top_k, few groups) writes nothing: the values go straight into the calling worker's own heaps."""
     var key = LP(unsafe_from_address=Int(regs))
     for j in range(nsel):
         var v = key[j]
@@ -865,9 +886,33 @@ def _mat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP,
     var ctl = LP(unsafe_from_address=Int(LP(unsafe_from_address=Int(regs + CTL_REG * VEC))[0]))
     var groups = ctl[2]
     var base = row0 - Int(ctl[1])
+    var me = -2
     for s in range(Int(ctl[0])):
-        var c = ctl + (3 + 5 * s)
+        var c = ctl + (6 + SRC_WORDS * s)
         var vals = LP(unsafe_from_address=Int(regs + Int(c[0]) * VEC))
+        if c[5] != 0:
+            if me == -2:
+                me = _worker_slot(ctl, regs)
+            if me < 0:
+                return False
+            var k = Int(c[6])
+            var heap = LP(unsafe_from_address=Int(c[7])) + (me * Int(groups) + 0) * k
+            var size = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(c[8])) + me * Int(groups)
+            var rank = LP(unsafe_from_address=Int(c[9])) if c[9] != 0 else key
+            if c[1] < 0:
+                for j in range(nsel):
+                    var g = key[j]
+                    if g >= 0 and g < groups:
+                        var v = rank[Int(vals[j])] if c[9] != 0 else vals[j]
+                        size[Int(g)] = heap_offer(heap + Int(g) * k, size[Int(g)], k, v)
+            else:
+                var valid = LP(unsafe_from_address=Int(regs + Int(c[1]) * VEC))
+                for j in range(nsel):
+                    var g = key[j]
+                    if g >= 0 and g < groups and valid[j] != 0:
+                        var v = rank[Int(vals[j])] if c[9] != 0 else vals[j]
+                        size[Int(g)] = heap_offer(heap + Int(g) * k, size[Int(g)], k, v)
+            continue
         var gp = IP(unsafe_from_address=Int(c[2])) + base
         var vp = LP(unsafe_from_address=Int(c[3])) + base
         var o = 0
@@ -1023,6 +1068,10 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
     var rows = max(MORSEL_ROWS, (window_rows if window_rows > 0 else WINDOW_BYTES // (12 * p.n_src)) // MORSEL_ROWS * MORSEL_ROWS)
     var ops = _slot_ops(p)
     var acc = QueryResult()
+    var workers = core_count() + 4                       # register files the hook may meet (the kernel starts at most core_count())
+    var direct = List[Int](length=p.n_src, fill=-1)      # per source: its only top_k's number, when the hook feeds it directly
+    for s in range(p.n_src):
+        direct[s] = hs.direct_topk(s, workers)
     var done = 0
     var first = True
     while first or done < n:
@@ -1031,23 +1080,43 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
         var gids = List[List[Int32]]()
         var vals = List[List[Int64]]()
         var cnts = List[List[Int32]]()
+        var heaps = List[List[Int64]]()                  # per source: workers x groups x k words for a direct one
+        var sizes = List[List[Int]]()
+        var table = List[Int64](length=workers, fill=0)
+        var counter = List[Int64](length=1, fill=0)
         var ctl = List[Int64]()
         ctl.append(Int64(p.n_src))
         ctl.append(Int64(done))
         ctl.append(Int64(p.groups))
+        ctl.append(Int64(Int(counter.unsafe_ptr())))
+        ctl.append(Int64(Int(table.unsafe_ptr())))
+        ctl.append(Int64(workers))
         for s in range(p.n_src):
-            gids.append(List[Int32](unsafe_uninit_length=max(end - done, 1)))
-            vals.append(List[Int64](unsafe_uninit_length=max(end - done, 1)))
-            cnts.append(List[Int32](length=max(nblk, 1), fill=0))
+            var is_direct = direct[s] >= 0
+            var kk = hs.specs[direct[s]].k if is_direct else 0
+            gids.append(List[Int32](unsafe_uninit_length=1 if is_direct else max(end - done, 1)))
+            vals.append(List[Int64](unsafe_uninit_length=1 if is_direct else max(end - done, 1)))
+            cnts.append(List[Int32](length=1 if is_direct else max(nblk, 1), fill=0))
+            heaps.append(List[Int64](length=workers * p.groups * kk if is_direct else 1, fill=0))
+            sizes.append(List[Int](length=workers * p.groups if is_direct else 1, fill=0))
             ctl.append(Int64(p.src_vreg[s]))
             ctl.append(Int64(p.src_valid[s]))
             ctl.append(Int64(Int(gids[s].unsafe_ptr())))
             ctl.append(Int64(Int(vals[s].unsafe_ptr())))
             ctl.append(Int64(Int(cnts[s].unsafe_ptr())))
+            ctl.append(Int64(1 if is_direct else 0))
+            ctl.append(Int64(kk))
+            ctl.append(Int64(Int(heaps[s].unsafe_ptr())))
+            ctl.append(Int64(Int(sizes[s].unsafe_ptr())))
+            ctl.append(Int64(hs.rank_of(s) if is_direct else 0))
         var rw = _run_cpu(t, p, mask_addr, done, end, Int(ctl.unsafe_ptr()))
+        var used_workers = min(Int(counter[0]), workers)
         for s in range(p.n_src):
-            hs.absorb(s, window_blocks(Int(gids[s].unsafe_ptr()), Int(vals[s].unsafe_ptr()), Int(cnts[s].unsafe_ptr()), nblk, VEC))
-        _ = ctl^, gids^, vals^, cnts^                    # the kernel and the states read them by address
+            if direct[s] >= 0:
+                hs.merge_workers(direct[s], Int(heaps[s].unsafe_ptr()), Int(sizes[s].unsafe_ptr()), used_workers)
+            else:
+                hs.absorb(s, window_blocks(Int(gids[s].unsafe_ptr()), Int(vals[s].unsafe_ptr()), Int(cnts[s].unsafe_ptr()), nblk, VEC))
+        _ = ctl^, gids^, vals^, cnts^, heaps^, sizes^, table^, counter^     # the kernel and the states read them by address
         if first:
             acc = rw^
         else:
@@ -1095,8 +1164,9 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
                 if scan:
                     for k in range(scan.value().word_count(c)):
                         words.append(scan.value().text_of(c, k))
-                for w in base.dictionary(c):
-                    words.append(w)
+                else:
+                    for w in base.dictionary(c):
+                        words.append(w)
                 if c < len(extra):
                     for w in extra[c]:
                         words.append(w)

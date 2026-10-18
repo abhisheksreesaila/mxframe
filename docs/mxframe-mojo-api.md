@@ -61,7 +61,7 @@ var shared = r.take_table().share()             # moves the table out; the repor
 | Per-column import report | empty cells, distinct count (text), the first few raw values, rows that failed to parse (row number + text) |
 | Speed | today 1M rows: 0.5 s; 100M rows: 106 s on a loaded machine (pyarrow, multi-threaded). Parity or better, streaming (no full-file copy in memory). |
 | **Parquet read/write with key-value metadata** | the `.omx` document is one Parquet file; its JSON metadata holds formats, formulas, charts, pivots and the Report. Edits are baked into the columns on save (D-138). |
-| **Bigger than RAM** (F-140) | `var scan = scan_parquet(path)`; `Query(scan).where(...).group_by(col("region"), groups=scan.word_count(scan.index("region"))).agg(...).compute()` decodes one row group at a time (only the columns the plan reads) and equals `read_parquet` + the same query exactly; TEXT codes are the whole-file read's (`scan.code_of(c, word)`); CPU only |
+| **Bigger than RAM** (F-140) | `var scan = scan_parquet(path)`; `Query(scan).where(...).group_by(col("region"), groups=scan.word_count(scan.index("region"))).agg(...).compute()` decodes one row group at a time (only the columns the plan reads) and equals `read_parquet` + the same query exactly; TEXT codes are the whole-file read's (`scan.code_of(c, word)`); CPU only. `count_distinct` and `top_k` stream too, exactly, by merging their state per row group; `percentile` / `median` keep every non-null value (12 bytes a row), see §5 |
 | Later | XLSX, JSON lines, Arrow IPC; the Arrow C Data Interface both ways (zero-copy hand-over) |
 
 ## 3. Edits, rows and undo (a session's overlay on shared data)
@@ -121,11 +121,42 @@ What omxplorer runs today, all through one call, `group_sum(frame, gf, key, valu
 | Need | Detail |
 |---|---|
 | Group by an **integer key expression** with a known small group count (dense output, missing groups = 0) | covers text columns, pivots (combined keys) and bins |
-| Aggregates | sum (exact int64), count; next: min, max, mean, count distinct, percentiles |
+| Aggregates | sum (exact int64), count, count(e), min, max, mean, **count distinct, median / percentile, top-k** (below) |
 | Filters | `lo ≤ col ≤ hi` and `==` on any column (up to 8 today), ANDed; next: `is_in`, OR, nulls |
 | **Includes the session's edits and formula columns** | §3 and §4 |
 | Speed | today, 100M rows on the GPU: 19 ms for a sum, under 1 ms at 1M |
 | Next | several group-bys in one pass (`compute_many`); reuse a compiled query with new constants (slider drags) |
+
+### Count distinct, percentiles and top-k (F-148)
+
+Aggregates that need more than a running number per group, exact, over a table, a Frame with edits or a Parquet scan:
+
+```mojo
+var r = Query(f).where(col("day").between(0, 364))
+              .group_by(col("region"), groups=n)
+              .agg(count_distinct(col("customer")),          # r.values(0)[g]   distinct non-null values
+                   median(col("revenue")),                   # r.values(1)[g]   r.present(1, g)
+                   percentile(col("revenue"), 0.9),          # r.values(2)[g]
+                   top_k(col("revenue"), 3),                 # r.top(3, g)      List[Int], largest first
+                   sum(col("revenue")))                      # plain aggregates sit beside them, one pass
+              .compute()
+```
+
+| Aggregate | Meaning | Result |
+|---|---|---|
+| `count_distinct(e)` | the number of different non-null values of `e` in the group (text: different words; a merged spelling counts once) | `r.values(i)[g]`, 0 for a group with none |
+| `percentile(e, p)` | `p` in 0..1: the value at index `max(ceil(p * n) - 1, 0)` of the group's `n` non-null values sorted ascending. This is DuckDB's **`quantile_disc`** (checked against it), so the answer is always an actual value of the column, in the column's stored units (a DECIMAL(2) keeps its scale 2), and exact | `r.values(i)[g]`; `r.present(i, g)` is False for a group with no non-null value (its value is then 0) |
+| `median(e)` | `percentile(e, 0.5)`. For an even `n` it is the **lower** of the two middle values, not their mean: DuckDB's `quantile_disc(e, 0.5)`, not its `median` (which is `quantile_cont` and interpolates) | as above |
+| `top_k(e, k)` | the `k` largest non-null values of the group, repeats kept (`ORDER BY e DESC LIMIT k`; DuckDB's `max(e, k)`); fewer when the group has fewer | `r.top(i, g)`: `List[Int]`, largest first |
+
+- **Shape.** Distinct counts and percentile values are a number per group like the other aggregates (`values(i)`, `present(i, g)`). Top-k is a list per group (`top(i, g)`) because its size varies; it holds values, not row numbers: ties make "which row" ambiguous, and an app that wants the rows filters on `value >= top(i, g)[k-1]`. Several aggregates over the same expression share one pass over its values.
+- **Nulls** are ignored, as in SQL: a null value is not counted, not ranked, not listed. A row whose group is outside `0 .. groups-1`, or null, or that a filter drops, is left out as for every aggregate.
+- **Text** columns use their codes for `count_distinct`. For `percentile`, `median` and `top_k` the order is the words' alphabetical order (ASCII case ignored, bytes breaking ties: the order of `permutation` and "apple" before "Zebra"), not the codes'; the values come back as codes (`text_of`). They need the plain column: a text column inside an expression raises. In a Frame the order includes the words the session added, and merged spellings are one word.
+- **Algorithms** (all on every core, `holistic.mojo`). The query kernel's per-block hook writes the (group, value) pairs of the selected rows, packed; then: *count distinct* is a hash set of (group, value) pairs in 4 x cores hash partitions (scatter the pairs, then each partition inserts alone: no locks), tables sized from a HyperLogLog sketch of the pairs and probed with software prefetch; the first window is counted in tables that live one task, only a second window (a scan's next row group, or a table over 20M rows) turns them into persistent tables. *Percentile* groups the values with a parallel counting sort and **selects** instead of sorting: three-way quickselect for small groups, a parallel most-significant-byte radix select for groups of 262,144 values or more (two passes for values in a small range, eight at most). *Top-k* is a bounded min-heap of `k` values per group (one compare rejects most rows). When top-k is the only aggregate reading its values and the groups are few, the kernel's own hook offers each value to a heap private to the worker, so no pairs are written at all (20M rows, 8 groups: 17 ms, a plain sum is 15 ms); otherwise private heaps per core over the pairs when groups are few, and the pairs scattered by group when many.
+- **Streamed scans.** Distinct and top-k stay exact by merging state per row group (the hash set; the heaps), so they use memory for their state, not the file. **Percentiles need every value:** the state is the non-null (group, value) pairs of the whole file, 12 bytes a non-null row, plus 8 bytes a row while the answer is computed (a 100M-row column: about 2 GB). Distinct state is about 24 bytes per distinct (group, value) pair; top-k is `k` words a group (`groups * k` may not pass 268M).
+- **Tables and frames** run in windows of up to 256 MB of pairs (about 20M rows for one value source) so the transient pairs are bounded; the plain aggregates are merged across windows. A frame's changed and appended rows are added after the kernel pass (the shared rows they replace are skipped by the mask), as for the plain aggregates.
+- **GPU:** CPU only. These need every value, not a running number; the GPU kernel's per-group accumulators cannot hold them, and moving the pairs to the device and back costs more than the CPU's pass. `compute(AUTO)` runs them on the CPU and says why in `fallback_reason` when it would have used a device table; `compute(GPU)` raises.
+- **Also:** `percentile` raises for `p` outside 0..1, `top_k` for `k < 1`; a value that is a comparison raises as for any aggregate.
 
 ## 6. Sort
 

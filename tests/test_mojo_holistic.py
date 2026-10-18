@@ -77,8 +77,15 @@ AGGS = [  # (index in the probe's list, how DuckDB computes it, kind)
 ]
 
 
+TOPK_ONLY = [AGGS[4], AGGS[7]]
+
+
+def aggs_for(which):
+    return TOPK_ONLY if which == "topk" else AGGS
+
+
 def duckdb_rows(path, which, groups):
-    cols = ", ".join(sql for _, sql, _, _ in AGGS)
+    cols = ", ".join(sql for _, sql, _, _ in aggs_for(which))
     flt = "WHERE x BETWEEN -5000 AND 5000" if which == "filtered" else ""
     con = duckdb.connect()
     src = f"read_parquet('{path}')"
@@ -93,10 +100,10 @@ def duckdb_rows(path, which, groups):
 def compare(got, want, groups, which, label):
     words = got["words"].split("|")[:-1]
     n_groups = 1 if which == "global" else groups
-    assert len(got["aggs"]) == len(AGGS)
+    assert len(got["aggs"]) == len(aggs_for(which))
     for gi in range(n_groups):
         row = want.get(gi)
-        for k, (name, _, kind, ty) in enumerate(AGGS):
+        for k, (name, _, kind, ty) in enumerate(aggs_for(which)):
             a = got["aggs"][k]
             w = None if row is None else row[k]
             tag = f"{label}: group {gi} {name}"
@@ -138,7 +145,7 @@ CASES = [  # n, groups, options
 def test_equals_duckdb(probe, tmp_path, mode, n, groups, opts):
     path = tmp_path / "t.parquet"
     make_file(path, n, groups, seed=n + groups, **opts)
-    shapes = ["all", "filtered"] + (["global"] if groups <= 7 else [])
+    shapes = ["all", "filtered", "topk"] + (["global"] if groups <= 7 else [])
     for which in shapes:
         baked = tmp_path / f"baked_{which}.parquet"
         got = run_probe(probe, path, mode, which, groups, baked)

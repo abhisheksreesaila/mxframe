@@ -11,8 +11,10 @@ is not null, packed block by block (a `Window`). This file consumes those pairs:
   16 bytes a slot, about 1.5 slots per distinct (group, value) pair.
 - top-k: the k largest values of a group, duplicates kept (SQL `ORDER BY e DESC LIMIT k`): a bounded min-heap of k
   values per group (O(rows log k), almost all rows rejected by one compare with the heap's smallest). Few groups: every
-  task keeps private heaps over its blocks and they are merged; many groups: the pairs are scattered by group so that
-  one task owns each group's heap. The state is k values a group, and merging windows is just offering their values.
+  task keeps private heaps over its blocks and they are merged (when top-k is the only aggregate on its values, the
+  kernel hook feeds per-worker heaps directly and writes no pairs, query.mojo `_mat_hook`); many groups: the pairs are
+  scattered by group so that one task owns each group's heap. The state is k values a group, and merging windows is
+  just offering their values.
 - percentile: the value at index max(ceil(p * n) - 1, 0) of the group's sorted non-null values, which is DuckDB's
   `quantile_disc` (an actual value, exact in the stored integers; `median` is p = 0.5, the lower middle value for an
   even n, so it differs from DuckDB's `median`, which is `quantile_cont`). Exact percentiles need every value: the
@@ -549,9 +551,10 @@ def _dist_add(mut tab: List[Int64], mut cap: Int, used: Int, sv: LP, sg: IP, n: 
     next PREFETCH_AHEAD pairs are prefetched: with millions of distinct pairs every probe is a cache miss, and
     overlapping them is most of the speed."""
     var u = used
-    if cap < min_cap:
-        _dist_grow(tab, cap, min_cap)
-        cap = min_cap
+    if cap * 6 < min_cap * 5:                    # well under the size the sketch asks for: at least double, so a scan whose
+        var target = max(min_cap, cap * 2)       # every row group brings new values rehashes O(log) times, not once a group
+        _dist_grow(tab, cap, target)
+        cap = target
     var tp = _lp(Int(tab.unsafe_ptr()))
     for i in range(n):
         if (u + 1) * 5 > cap * 4:
@@ -730,7 +733,7 @@ def _insert(mut tabs: List[List[Int64]], mut used: List[Int], hll: List[UInt8], 
 # ── top-k ────────────────────────────────────────────────────────────────────────────────────────────
 
 @always_inline
-def _offer(h: LP, n: Int, k: Int, v: Int64) -> Int:
+def heap_offer(h: LP, n: Int, k: Int, v: Int64) -> Int:
     """Offer v to the min-heap of the n (at most k) largest values seen at h; returns the heap's new size."""
     if n < k:
         var i = n
@@ -769,7 +772,7 @@ def _offer_blocks(b: Blocks, k0: Int, k1: Int, heap: LP, size: NP, k: Int, rank:
             var v = vp[j]
             if rank != 0:
                 v = _lp(rank)[Int(v)]
-            size[g] = _offer(heap + g * k, size[g], k, v)
+            size[g] = heap_offer(heap + g * k, size[g], k, v)
 
 
 def _heap_sort_desc(h: LP, n: Int):
@@ -827,10 +830,7 @@ struct TopKState(Movable):
                 _offer_blocks(b, _cut(nb, tp, t), _cut(nb, tp, t + 1), _lp(ph_at) + t * G * k, _np(ps_at) + t * G, k, rank)
 
             par_n(mine, tp, tp)
-            for t in range(tp):
-                for g in range(G):
-                    for i in range(ps[t * G + g]):
-                        size[g] = _offer(heap + g * k, size[g], k, ph[(t * G + g) * k + i])
+            self.merge_workers(ph_at, ps_at, tp)
             _ = ph^
             _ = ps^
         else:
@@ -849,10 +849,22 @@ struct TopKState(Movable):
                 var s = _np(size_at)
                 for i in range(_np(seg_at)[p], _np(seg_at)[p + 1]):
                     var g = Int(gp[i])
-                    s[g] = _offer(h + g * k, s[g], k, vp[i])
+                    s[g] = heap_offer(h + g * k, s[g], k, vp[i])
 
             par_n(own, tp, tp)
             _ = sc^
+
+    def merge_workers(mut self, heaps: Int, sizes: Int, workers: Int):
+        """Offer every value in `workers` private sets of heaps (worker w's heap of group g is k words at
+        `heaps + (w * groups + g) * k` words, `sizes + w * groups + g` of them used) to the state's."""
+        var G = self.groups
+        var k = self.k
+        var heap = _lp(Int(self.heap.unsafe_ptr()))
+        var size = _np(Int(self.size.unsafe_ptr()))
+        for w in range(workers):
+            for g in range(G):
+                for i in range(_np(sizes)[w * G + g]):
+                    size[g] = heap_offer(heap + g * k, size[g], k, _lp(heaps)[(w * G + g) * k + i])
 
     def finish(mut self, unrank: Int) -> Tuple[List[Int], List[Int]]:
         """(values, offsets): group g's values, largest first, are `values[offsets[g] : offsets[g + 1]]`."""
@@ -999,8 +1011,27 @@ struct HolStates(Movable):
         self.specs = specs^
         self.ranks = ranks^
 
-    def _rank(self, s: Int) -> Int:
+    def rank_of(self, s: Int) -> Int:
+        """Address of source s's code -> place table (0: not text)."""
         return Int(self.ranks[s].unsafe_ptr()) if len(self.ranks[s]) > 0 else 0
+
+    def direct_topk(self, s: Int, workers: Int) -> Int:
+        """The top_k aggregate (its place among the holistic ones) when it is the only one reading source s and
+        `workers` private sets of its heaps fit PRIVATE_HEAPS: the kernel hook then offers the values to per-worker heaps
+        itself and writes no pairs. -1 otherwise."""
+        var found = -1
+        for h in range(len(self.specs)):
+            if self.specs[h].src == s:
+                if self.specs[h].kind != A_TOPK or found >= 0:
+                    return -1
+                found = h
+        if found >= 0 and workers * self.groups * self.specs[found].k > PRIVATE_HEAPS:
+            return -1
+        return found
+
+    def merge_workers(mut self, h: Int, heaps: Int, sizes: Int, workers: Int):
+        """Take the per-worker heaps the kernel hook filled for top_k aggregate h."""
+        self.topk[h].merge_workers(heaps, sizes, workers)
 
     def _unrank(self, s: Int) -> Int:
         return Int(self.unranks[s].unsafe_ptr()) if len(self.unranks[s]) > 0 else 0
@@ -1015,7 +1046,7 @@ struct HolStates(Movable):
             self.raw[s].absorb(b, self.threads)
         for h in range(len(self.specs)):
             if self.specs[h].kind == A_TOPK and self.specs[h].src == s:
-                self.topk[h].absorb(b, self._rank(s), self.threads)
+                self.topk[h].absorb(b, self.rank_of(s), self.threads)
 
     def absorb_rows(mut self, s: Int, gids: List[Int32], vals: List[Int64]):
         """The same for a few single pairs (a frame's changed and appended rows)."""
@@ -1038,7 +1069,7 @@ struct HolStates(Movable):
                 if spec.kind == A_PCT and spec.src == s:
                     ps.append(spec.p)
             if self.has_raw[s]:
-                pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, self._rank(s), self._unrank(s), self.threads))
+                pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, self.rank_of(s), self._unrank(s), self.threads))
             else:
                 pct_of.append(Percentiles())
         for h in range(len(self.specs)):

@@ -83,6 +83,7 @@ comptime V_COST = 2
 comptime V_REGION = 3
 comptime V_COST10 = 4        # cost // 10
 comptime V_COST2 = 5         # cost * 2 - 1
+comptime V_DAY = 6
 
 
 def key_of(t: SharedTable, row: Int, kk: Int) -> Tuple[Int, Bool]:
@@ -106,7 +107,7 @@ def key_of(t: SharedTable, row: Int, kk: Int) -> Tuple[Int, Bool]:
 
 def val_of(t: SharedTable, row: Int, vk: Int) -> Tuple[Int64, Bool]:
     """(value, usable): a null value is left out."""
-    var name = "cust" if vk == V_CUST else "revenue" if vk == V_REVENUE else "region" if vk == V_REGION else "cost"
+    var name = "cust" if vk == V_CUST else "revenue" if vk == V_REVENUE else "region" if vk == V_REGION else "day" if vk == V_DAY else "cost"
     var c = t.index(name)
     if t.is_null(c, row):
         return (0, False)
@@ -254,13 +255,15 @@ def plan(var q: Query, s: Int, nreg: Int) raises -> Query:
                                                           count_distinct(col("region")), percentile(col("region"), 0.0))
     if s == 3:
         return q^.group_by(col("region") * 7 + col("carrier"), groups=nreg * 7).agg(count_distinct(col("cust")))
+    if s == 5:                  # top_k alone on a source: the kernel hook feeds per-worker heaps, no pairs are written
+        return q^.group_by(col("carrier"), groups=7).agg(top_k(col("region"), 3), top_k(col("cust"), 2), count_distinct(col("day")))
     return q^.group_by(col("region"), groups=nreg).agg(count_distinct(col("cost") // 10), percentile(col("cost") * 2 - 1, 0.25),
                                                        top_k(col("cost") * 2 - 1, 4), count(), sum(col("day")))
 
 
 def table_results(t: SharedTable, nreg: Int, window_rows: Int) raises -> List[QueryResult]:
     var out = List[QueryResult]()
-    for s in range(5):
+    for s in range(6):
         var q = plan(Query(t), s, nreg)
         q.window_rows = window_rows
         out.append(q.compute())
@@ -293,6 +296,9 @@ def check_all(t: SharedTable, rs: List[QueryResult], label: String) raises:
     check_agg(rs[2], 1, "top", 0.0, 2, car_reg, rrank, label + " 2 top2(region)")
     check_agg(rs[2], 2, "distinct", 0.0, 0, car_reg, no_rank(), label + " 2 distinct(region)")
     check_agg(rs[2], 3, "pct", 0.0, 0, car_reg, rrank, label + " 2 p0(region)")
+    check_agg(rs[5], 0, "top", 0.0, 3, car_reg, rrank, label + " 5 top3(region), alone")
+    check_agg(rs[5], 1, "top", 0.0, 2, by_car_cust, no_rank(), label + " 5 top2(cust), alone")
+    check_agg(rs[5], 2, "distinct", 0.0, 0, gather(t, K_CARRIER, 7, False, V_DAY), no_rank(), label + " 5 distinct(day)")
     var piv = gather(t, K_PIVOT, nreg * 7, False, V_CUST)
     check_agg(rs[3], 0, "distinct", 0.0, 0, piv, no_rank(), label + " 3 pivot distinct(cust)")
     var by_reg_10 = gather(t, K_REGION, nreg, False, V_COST10)
@@ -461,7 +467,7 @@ def test_over_a_frame_with_edits() raises:
     var nreg = f.word_count(f.column("region"))
     var baked = f.bake().share()
     var got = List[QueryResult]()
-    for s in range(5):
+    for s in range(6):
         got.append(plan(Query(f), s, nreg).compute())
     check_all(baked, got, "frame")
     check_plain(baked, got, nreg, "frame")
@@ -473,7 +479,7 @@ def test_over_a_frame_with_edits() raises:
     while f.undo():                                                                # undoing every edit: the shared answers
         pass
     var back = List[QueryResult]()
-    for s in range(5):
+    for s in range(6):
         back.append(plan(Query(f), s, 5).compute())
     check_all(t, back, "frame after undo")
 
@@ -491,12 +497,12 @@ def test_over_a_scan_of_several_row_groups() raises:
     var whole = rp.take_table().share()                          # the oracle table: the file read whole (the scan shares its codes)
     expect(len(whole.dictionary(whole.index("region"))) == nreg, "same words")
     var got = List[QueryResult]()
-    for s in range(5):
+    for s in range(6):
         got.append(plan(Query(scan), s, nreg).compute())
     check_all(whole, got, "scan")
     check_plain(whole, got, nreg, "scan")
     var mm = table_results(whole, nreg, 0)
-    for s in range(5):
+    for s in range(6):
         for i in range(len(got[s].kinds)):
             if got[s].hol_of[i] >= 0:
                 for g in range(len(got[s].counts)):
