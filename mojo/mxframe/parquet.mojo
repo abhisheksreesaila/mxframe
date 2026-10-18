@@ -754,8 +754,10 @@ def read_parquet(path: String) raises -> ParquetResult:
         widxs.append(Int(widx.unsafe_ptr() + c))
     for g in range(len(groups)):
         if len(cols) > 0 and len(groups[g]) == len(cols):
-            total += groups[g][0].values
-    _check_claim("`" + path + "`", total, len(cols))
+            var n_g = groups[g][0].values
+            _check_claim("`" + path + "` row group " + String(g), n_g, len(cols))
+            total += n_g                                        # each part checked, so the sum cannot wrap
+            _check_claim("`" + path + "`", total, len(cols))
     for c in range(len(cols)):                                  # size every column once; the pages write every row
         t.cols[c].values = List[Int64](unsafe_uninit_length=total)
     var row0 = 0
@@ -1519,6 +1521,8 @@ def _check_claim(what: String, rows: Int, ncols: Int) raises:
     are sized from the counts a file states, so this is what stops a file of a few KB from asking for terabytes.
     Limits: a claim below the machine's memory (or an address-space cap lower than it) is still sized, untouched until
     its pages decode, and a corrupt page raises when it does."""
+    if rows < 0:
+        raise Error(what + " claims a negative row count (" + String(rows) + ") (corrupt file)")
     var ram = _physical_memory()
     if ram > 0 and rows > ram // (8 * max(ncols, 1)):
         var need = Float64(rows) * 8.0 * Float64(max(ncols, 1))

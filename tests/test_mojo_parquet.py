@@ -917,6 +917,45 @@ def refused_by_both(cells, path, message):
         assert message in p.stdout + p.stderr, (mode, p.stdout + p.stderr)
 
 
+def footer_counts_file(path, groups):
+    """One INT64 column; every row group's chunk points at the same 3-value PLAIN page and states `values` / `rows`
+    from `groups` (the footer is what lies, the page is fine)."""
+    h = Compact(); h.i32(1, 0); h.i32(2, 24); h.i32(3, 24)
+    h.st(5); h.i32(1, 3); h.i32(2, 0); h.i32(3, 3); h.i32(4, 3); h.end(); h.b.append(0)
+    data = b"PAR1"; off = len(data); chunk = bytes(h.b) + struct.pack("<qqq", 1, 2, 3); data += chunk
+    m = Compact(); m.i32(1, 1); m.lst(2, 12, 2)
+    m.el(); m.bin(4, b"schema"); m.i32(5, 1); m.end()
+    m.el(); m.i32(1, 2); m.i32(3, 0); m.bin(4, b"x"); m.end()
+    m.i64(3, sum(g[1] for g in groups) & ((1 << 63) - 1)); m.lst(4, 12, len(groups))
+    for vals, rows in groups:
+        m.el(); m.lst(1, 12, 1)
+        m.el(); m.i64(2, off)
+        m.st(3); m.i32(1, 2); m.lst(2, 5, 1); m.b += zz(0); m.lst(3, 8, 1); m.b += uv(1) + b"x"
+        m.i32(4, 0); m.i64(5, vals); m.i64(6, len(chunk)); m.i64(7, len(chunk)); m.i64(9, off); m.end(); m.end()
+        m.i64(2, len(chunk)); m.i64(3, rows); m.end()
+    m.b.append(0)
+    data += bytes(m.b) + struct.pack("<i", len(m.b)) + b"PAR1"
+    Path(path).write_bytes(data)
+
+
+@pytest.mark.parametrize("groups", [[(-5, -5)], [(-(1 << 40), 3), (3, 3)], [(1 << 62, 1 << 62)] * 2,
+                                    [(1 << 62, 1 << 62)] * 4],
+                         ids=["negative", "negative then good", "sum wraps x2", "sum wraps x4"])
+def test_footer_row_counts_that_are_negative_or_wrap_are_refused(cells, tmp_path, groups):
+    """read_parquet sums the footer's counts to size its columns: a negative count or a sum past int64 is refused (a
+    normal error exit, never an abort) under a 32 GB address-space cap, as the scan already was."""
+    import resource
+
+    def cap():
+        resource.setrlimit(resource.RLIMIT_AS, (32 << 30, 32 << 30))
+
+    path = tmp_path / "counts.parquet"
+    footer_counts_file(path, groups)
+    for mode in ("read", "scan"):
+        p = subprocess.run([str(cells), str(path), mode], capture_output=True, text=True, preexec_fn=cap)
+        assert p.returncode == 1, (mode, p.returncode, p.stderr[-300:])
+
+
 I31 = 2**31 - 1
 
 
