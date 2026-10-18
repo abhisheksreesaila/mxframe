@@ -31,18 +31,20 @@ def gpu_available() -> Bool:
 
 struct _DeviceState(Movable):
     var ctx: DeviceContext
-    var source: Int                                  # identity of the SharedTable this mirrors
+    var table: SharedTable                           # the table this mirrors, held so its identity cannot be reused
     var rows: Int
     var live: Bool
+    var uploads: Int                                 # columns uploaded since it was made (only the constructor does)
     var bytes: Int
     var data: List[DeviceBuffer[DType.int64]]
     var valid: List[DeviceBuffer[DType.uint8]]       # only the columns that have nulls
     var data_addr: List[Int]
     var valid_addr: List[Int]                        # 0: the column has no nulls
 
-    def __init__(out self, var ctx: DeviceContext, source: Int, rows: Int):
+    def __init__(out self, var ctx: DeviceContext, table: SharedTable, rows: Int):
         self.ctx = ctx^
-        self.source = source
+        self.table = table
+        self.uploads = 0
         self.rows = rows
         self.live = True
         self.bytes = 0
@@ -64,12 +66,14 @@ struct DeviceTable(ImplicitlyCopyable):
 
     def __init__(out self, table: SharedTable, ctx: DeviceContext) raises:
         """Uploads `table` on the app's `DeviceContext`: the app's buffers and these share one device."""
-        self._s = ArcPointer(_DeviceState(ctx.copy(), Int(table._table[].cols.unsafe_ptr()), table.rows()))
+        self._s = ArcPointer(_DeviceState(ctx.copy(), table, table.rows()))
         ref s = self._s[]
         var n = table.rows()
         for c in range(table.columns()):
             var buf = ctx.enqueue_create_buffer[DType.int64](max(n, 1))
-            ctx.enqueue_copy(dst_buf=buf, src_ptr=table.values(c).unsafe_ptr())
+            if n > 0:                                # an empty column has no host memory to copy from
+                ctx.enqueue_copy(dst_buf=buf, src_ptr=table.values(c).unsafe_ptr())
+            s.uploads += 1
             s.data_addr.append(Int(buf.unsafe_ptr()))
             s.data.append(buf^)
             s.bytes += 8 * max(n, 1)
@@ -90,6 +94,10 @@ struct DeviceTable(ImplicitlyCopyable):
     def rows(self) -> Int:
         return self._s[].rows
 
+    def uploads(self) -> Int:
+        """How many columns were uploaded in all: the constructor's, never a query's."""
+        return self._s[].uploads
+
     def bytes(self) -> Int:
         """Device memory held (0 after `release`)."""
         return self._s[].bytes if self._s[].live else 0
@@ -98,8 +106,9 @@ struct DeviceTable(ImplicitlyCopyable):
         return self._s[].live
 
     def mirrors(self, table: SharedTable) -> Bool:
-        """Was this made from `table` (the same shared columns, not merely an equal-looking table)?"""
-        return self._s[].source == Int(table._table[].cols.unsafe_ptr())
+        """Was this made from `table` (the same shared columns, not merely an equal-looking table)? The device table
+        holds the table's handle, so the columns it mirrors cannot be freed and their address reused by another."""
+        return Int(self._s[].table._table[].cols.unsafe_ptr()) == Int(table._table[].cols.unsafe_ptr())
 
     def data_address(self, c: Int) -> Int:
         return self._s[].data_addr[c]
@@ -108,7 +117,9 @@ struct DeviceTable(ImplicitlyCopyable):
         return self._s[].valid_addr[c]
 
     def release(self):
-        """Frees the device memory for every copy of this handle (the document closed)."""
+        """Frees the device memory for every copy of this handle (the document closed). Call it when no query on this
+        table is running: the app queries from one thread, so there is no lock, and a launch still in flight would
+        read freed memory."""
         ref s = self._s[]
         if not s.live:
             return
