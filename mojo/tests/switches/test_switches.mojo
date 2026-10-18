@@ -4,7 +4,7 @@
 # Everything an app does must still give the right answer; the three things that are gone must say so readably.
 from std.sys import argv
 from std.os import getenv
-from mxframe import (Table, SharedTable, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
+from mxframe import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
                      gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY,
                      count_distinct, median, percentile, top_k)
 from mxframe.query import AUTO_GPU_MIN_ROWS
@@ -121,6 +121,21 @@ def main() raises:
     var whole = Query(back.take_table().share()).agg(count(), min_of(col("x")), max_of(col("x"))).compute(AUTO)
     expect(streamed.device == CPU and streamed.counts[0] == 1000 and streamed.values(1)[0] == whole.values(1)[0] and
            streamed.values(2)[0] == whole.values(2)[0], "a streamed query gives the whole-file answer")
+
+    # an edited streamed file (F-147): the overlay, the sort and the save work with no pool and no codecs
+    var sframe = Frame(scan_parquet(path))
+    sframe.set(0, 5, 42)
+    sframe.remove(7)
+    var edited = Query(sframe).agg(count(), max_of(col("x"))).compute(AUTO)
+    var want_max = Int64.MIN
+    for i in range(1000):
+        if i != 7:
+            want_max = max(want_max, Int64(42) if i == 5 else Int64(i) * 0x9E3779B97F4A7C15)
+    expect(edited.counts[0] == 999 and edited.values(1)[0] == Int(want_max), "a scan frame's query sees its edits")
+    expect(sframe.get(0, 5) == 42 and sframe.permutation(0).__len__() == 999, "get and sort see them")
+    sframe.save(path + ".edited", "", ZSTD)
+    var resaved = read_parquet(path + ".edited")
+    expect(resaved.table.rows() == 999 and resaved.table.get(0, 5) == 42, "and the saved file holds them")
 
     # ... and refuses a compressed file, naming the column
     expect(len(args) >= 3, "run with a zstd file and a snappy file")

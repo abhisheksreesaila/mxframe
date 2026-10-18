@@ -322,31 +322,127 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
 
 
 def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int) raises:
-    var codec = requested
-    comptime if NO_CODECS:
-        codec = UNCOMPRESSED                       # no zstd / snappy linked: whatever was asked for
     t.check()
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
     if row_group_rows < 8 or row_group_rows % 8 != 0:
         raise Error("row_group_rows must be a positive multiple of 8, got " + String(row_group_rows))
-    var file: List[UInt8] = [0x50, 0x41, 0x52, 0x31]                 # "PAR1"
-    var n = t.rows()
-    var ncols = t.columns()
-    var groups = List[List[_Chunk]]()
-    var starts = List[Int]()
-    var lo = 0
-    while lo < n or (n == 0 and len(groups) == 0):
-        var hi = min(lo + row_group_rows, n)
-        var chunks = List[_Chunk]()
-        for c in range(ncols):
-            chunks.append(_column_pages(file, t.cols[c], lo, hi, t.cols[c].nulls > 0, codec))
-        groups.append(chunks^)
-        starts.append(lo)
-        if n == 0:
-            break
-        lo = hi
+    var optional = List[Bool]()
+    for c in range(t.columns()):
+        optional.append(t.cols[c].nulls > 0)
+    var w = ParquetWriter(path, t, optional, requested)
+    try:
+        var n = t.rows()
+        var lo = 0
+        while lo < n or (n == 0 and w.group_count() == 0):
+            var hi = min(lo + row_group_rows, n)
+            w.write_rows(t, lo, hi)
+            if n == 0:
+                break
+            lo = hi
+        w.finish(metadata)
+    except e:
+        w.abort()
+        raise e^
 
+
+struct ParquetWriter(Movable):
+    """A Parquet file written one row group at a time (F-147): the row groups go to a temporary file as they are
+    given, so the memory is one group, whatever the file's size; `finish` writes the footer and renames the file into
+    place (atomic: a crash or an error never loses an existing file; `abort` removes the temporary file).
+
+        var w = ParquetWriter(path, schema_table, optional, compression)
+        w.write_group(group_table)      # once per row group: the same columns, TEXT words and all
+        w.finish(metadata)
+
+    `optional[c]`: the column is written with definition levels (it may hold a null); a column not marked must hold
+    none. The TEXT dictionary of every group is the group table's words (each group page holds all of them)."""
+    var path: String
+    var tmp: String
+    var file: FileHandle
+    var offset: Int
+    var codec: Int
+    var schema: Table                    # the columns (name, kind, scale), no rows
+    var optional: List[Bool]
+    var groups: List[List[_Chunk]]
+    var rows: List[Int]
+    var total: Int
+
+    def __init__(out self, path: String, shape: Table, optional: List[Bool], compression: Int) raises:
+        self.codec = compression
+        comptime if NO_CODECS:
+            self.codec = UNCOMPRESSED                  # no zstd / snappy linked: whatever was asked for
+        self.path = path
+        # The temp name carries the process id, so two processes saving the same path never share a temp file.
+        self.tmp = path + "." + String(external_call["getpid", Int32]()) + ".tmp"
+        self.offset = 0
+        self.schema = Table()
+        for c in range(shape.columns()):
+            _ = self.schema.add_column(shape.cols[c].name, shape.cols[c].kind, scale=shape.cols[c].scale)
+        self.optional = optional.copy()
+        self.groups = List[List[_Chunk]]()
+        self.rows = List[Int]()
+        self.total = 0
+        try:
+            self.file = open(self.tmp, "w")
+        except:
+            raise Error("couldn't write `" + path + "`: no such folder, or no permission to write there")
+        var magic: List[UInt8] = [0x50, 0x41, 0x52, 0x31]                 # "PAR1"
+        self.file.write_bytes(Span(magic))
+        self.offset = 4
+
+    def group_count(self) -> Int:
+        return len(self.groups)
+
+    def write_group(mut self, t: Table) raises:
+        """Appends all of `t`'s rows as one row group (its columns are the writer's, in order)."""
+        self.write_rows(t, 0, t.rows())
+
+    def write_rows(mut self, t: Table, lo: Int, hi: Int) raises:
+        """Appends rows lo..hi of `t` as one row group."""
+        if t.columns() != self.schema.columns():
+            raise Error("a row group has " + String(t.columns()) + " columns, the file " + String(self.schema.columns()))
+        var buf = List[UInt8]()
+        var chunks = List[_Chunk]()
+        for c in range(t.columns()):
+            var ch = _column_pages(buf, t.cols[c], lo, hi, self.optional[c], self.codec)
+            ch.offset += self.offset                       # `buf` starts where the file stands
+            ch.data_offset += self.offset
+            if ch.dict_offset >= 0:
+                ch.dict_offset += self.offset
+            chunks.append(ch^)
+        self.file.write_bytes(Span(buf))
+        self.offset += len(buf)
+        self.groups.append(chunks^)
+        self.rows.append(hi - lo)
+        self.total += hi - lo
+
+    def abort(mut self):
+        try:
+            self.file.close()
+        except:
+            pass
+        _ = external_call["unlink", Int32](self.tmp.as_c_string_span().ptr())
+
+    def finish(mut self, metadata: String) raises:
+        var meta = _footer(self.schema, self.optional, self.total, self.groups, self.rows, metadata, self.codec)
+        var tail = List[UInt8]()
+        var footer = len(meta)
+        tail.extend(meta^)
+        _put32(tail, footer)
+        tail.extend([UInt8(0x50), UInt8(0x41), UInt8(0x52), UInt8(0x31)])
+        self.file.write_bytes(Span(tail))
+        self.file.close()
+        var dest = self.path
+        if external_call["rename", Int32](self.tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()) != 0:
+            _ = external_call["unlink", Int32](self.tmp.as_c_string_span().ptr())
+            raise Error("could not move `" + self.tmp + "` to `" + self.path + "`")
+
+
+def _footer(t: Table, optional: List[Bool], n: Int, groups: List[List[_Chunk]], rows_of: List[Int], metadata: String,
+            codec: Int) raises -> List[UInt8]:
+    """The file metadata (Thrift) for the row groups written: `t` supplies the columns' names, kinds and scales."""
+    var ncols = t.columns()
     var w = ThriftWriter()
     w.i32(1, 1)                                         # version
     w.list_header(2, T_STRUCT, ncols + 1)               # schema: the root, then one element per column
@@ -359,7 +455,7 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         w.begin_list_element_struct()
         var pt = PT_BYTE_ARRAY if col.kind == TEXT else PT_BOOLEAN if col.kind == BOOL else PT_INT32 if col.kind == DATE else PT_INT64
         w.i32(1, pt)
-        w.i32(3, OPTIONAL if col.nulls > 0 else REQUIRED)
+        w.i32(3, OPTIONAL if optional[c] else REQUIRED)
         w.binary(4, col.name)
         if col.kind == TEXT:
             w.i32(6, CT_UTF8)
@@ -387,7 +483,7 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
     w.i64(3, Int64(n))
     w.list_header(4, T_STRUCT, len(groups))             # row groups
     for g in range(len(groups)):
-        var rows = min(starts[g] + row_group_rows, n) - starts[g]
+        var rows = rows_of[g]
         var total = 0
         w.begin_list_element_struct()
         w.list_header(1, T_STRUCT, ncols)
@@ -431,23 +527,7 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         w.end_struct()
     w.binary(6, "MX frame version 0.6.0")
     w.end()
-    var meta = w^.take()
-    var footer = len(meta)
-    file.extend(meta^)
-    _put32(file, footer)
-    file.extend([UInt8(0x50), UInt8(0x41), UInt8(0x52), UInt8(0x31)])
-    # An atomic save: a crash never loses the existing file. The temp name carries the process id, so two
-    # processes saving the same path never write into one temp file; a failed write removes it.
-    var tmp = path + "." + String(external_call["getpid", Int32]()) + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            f.write_bytes(Span(file))
-        var dest = path
-        if external_call["rename", Int32](tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()) != 0:
-            raise Error("could not move `" + tmp + "` to `" + path + "`")
-    except e:
-        _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
-        raise e^
+    return w^.take()
 
 
 # ── reading ──────────────────────────────────────────────────────────────────────────────────────────
@@ -2274,6 +2354,10 @@ struct ParquetScan(Copyable, Movable):
     def metadata(self) -> String:
         """The file's "omx" key-value metadata, "" when there is none."""
         return self._info[].metadata
+
+    def nullable(self, c: Int) -> Bool:
+        """Column `c` is declared OPTIONAL in the file (it may hold nulls; a REQUIRED column holds none)."""
+        return self._info[].leaves[c].repetition == OPTIONAL
 
     def columns(self) -> Int:
         return self.schema.columns()

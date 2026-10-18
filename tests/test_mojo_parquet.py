@@ -1248,3 +1248,93 @@ def test_morsels_with_many_few_and_one_row_groups(prober, tmp_path, group):
         got = probe_morsels(prober, path, q, 1000)
         same_answer(got, probe(prober, path, "read", q))
         check_against_duckdb(path, got, q)
+
+
+# ── F-147: editing a streamed file (Frame over a scan) ───────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def editor(tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_edit_probe"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_edit_probe.mojo"), str(out)],
+                   check=True, capture_output=True, text=True)
+    return out
+
+
+def edit_script(rows):
+    """The probe's fixed edits (mojo/tools/pq_edit_probe.mojo), replayed here independently of the engine."""
+    sets = {}
+    for k in range(1000):
+        sets[(k * 1000003) % rows] = k * 3 - 1500
+    fresh = {(k * 7919 + 5) % rows for k in range(100)}
+    removed = {(k * 999983 + 17) % rows for k in range(200)}
+    return sets, fresh, removed
+
+
+def run_edit_probe(editor, path, out, cache_mib, *extra):
+    p = subprocess.run([str(editor), str(path), str(out), str(cache_mib), *extra], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout.strip().split("\n")[-1])
+
+
+def test_an_edited_streamed_file_equals_an_outside_replay_and_its_memory_stays_bounded(editor, tmp_path):
+    """A file several times bigger than the frame's cache: edits, a query, a grid-style walk and a save through a Frame over
+    a scan; the query, the walk and the saved file equal numpy/pyarrow/DuckDB replaying the same edits, and the peak resident
+    memory of every phase stays a fraction of the file."""
+    import sys
+    sys.path.insert(0, str(ROOT / "scripts"))
+    from bench_scan_memory import write_file
+    import numpy as np
+    rows, group, cache_mib = 12_000_000, 250_000, 4
+    path, out = tmp_path / "big.parquet", tmp_path / "edited.parquet"
+    write_file(str(path), rows, group)
+    size_kb = path.stat().st_size // 1024
+    res = run_edit_probe(editor, path, out, cache_mib)
+    assert res["rows"] == rows and res["row_groups"] == rows // group
+
+    # the replay
+    orig = pq.read_table(path, columns=["region", "cost"], read_dictionary=["region"])
+    cost = orig.column("cost").to_numpy().copy()
+    region = orig.column("region").unify_dictionaries()                  # row groups carry different dictionaries
+    dictionary = region.chunk(0).dictionary.to_pylist()
+    codes = np.concatenate([c.indices.to_numpy() for c in region.chunks]).astype(np.int64)
+    words = dictionary + ["Fresh", "Appended"]
+    sets, fresh, removed = edit_script(rows)
+    for row, v in sets.items():
+        cost[row] = v
+    for row in fresh:
+        codes[row] = len(dictionary)
+    alive = np.ones(rows, bool)
+    alive[list(removed)] = False
+    cost_all = np.concatenate([cost[alive], np.full(50, 77, np.int64)])
+    codes_all = np.concatenate([codes[alive], np.full(50, len(dictionary) + 1, np.int64)])
+    assert len(cost_all) == rows - len(removed) + 50
+
+    # the query over the frame, by word
+    got = {w: (s, n) for w, s, n in zip(res["words"], res["sums"], res["counts"]) if n}
+    want = {}
+    for k, w in enumerate(words):
+        sel = codes_all == k
+        if sel.any():
+            want[w] = (int(cost_all[sel].sum()), int(sel.sum()))
+    assert got == want
+
+    # the walk (a row every 997 through get / is_null)
+    walk = np.arange(0, rows, 997)
+    walk = walk[alive[walk]]
+    assert res["get_sum"] == int(cost[walk].sum())
+
+    # the saved file, read by pyarrow and DuckDB: every cost, in order, and the metadata
+    saved = pq.read_table(out)
+    assert saved.num_rows == len(cost_all)
+    assert np.array_equal(saved.column("cost").to_numpy(), cost_all)
+    assert json.loads(saved.schema.metadata[b"omx"]) == {"edited": True}
+    con = duckdb.connect()
+    rows_db = con.execute(f"SELECT region, sum(cost), count(*) FROM read_parquet('{out}') GROUP BY region").fetchall()
+    assert {r: (int(s), n) for r, s, n in rows_db} == want
+    assert saved.column("region").to_pylist()[-50:] == ["Appended"] * 50
+
+    # the memory: every phase under a third of the file (the process alone is ~20 MB; 83 MB at the save, 332 MB file), the cache within its limit
+    assert res["cache_held"] <= cache_mib * 2**20
+    for phase in ("edit_peak_kb", "query_peak_kb", "get_peak_kb", "save_peak_kb"):
+        assert res[phase] * 3 < size_kb, (phase, res[phase], size_kb)
+    assert res["save_peak_kb"] < 120_000, res["save_peak_kb"]
