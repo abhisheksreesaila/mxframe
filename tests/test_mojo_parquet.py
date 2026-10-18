@@ -1394,3 +1394,87 @@ def test_a_save_that_would_lose_what_reading_narrowed_is_refused_unless_allowed(
     run_edit_probe(editor, path, out, 4, "allow")
     saved = pq.read_table(out)
     assert saved.schema.field(column).type == (pa.date32() if column == "day" else pa.decimal128(18, 2))
+
+
+@pytest.fixture(scope="module")
+def edger(tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_edge_probe"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_edge_probe.mojo"), str(out)],
+                   check=True, capture_output=True, text=True)
+    return out
+
+
+EDGE_ROWS = [0, 1, 999, 1000, 1001, 4095, 4096, 4097, 13336, 13337, 13338, 26673, 26674, 26675, 40010]
+
+
+@pytest.mark.parametrize("mode,block", [(0, 0), (1, 1000), (1, 4096), (1, 64), (2, 0)])
+def test_frame_edits_at_group_and_block_edges_of_a_pyarrow_file_with_odd_row_groups(edger, tmp_path, mode, block):
+    """Three row groups of 13,337 rows (not a multiple of 8: the second and third start mid-byte), edits and removals on
+    either side of every group start and block edge, queried under every scan loop: three groups are fewer than the
+    cores of any machine that has more than three, so MORSELS_ON takes the row-range path there whatever the box, and the
+    group path and AUTO give what numpy replaying the same edits gives."""
+    t = scan_table(40_011)
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path, row_group_size=13_337, compression="snappy")
+    assert [pq.read_metadata(path).row_group(i).num_rows for i in range(3)] == [13_337, 13_337, 13_337]
+    p = subprocess.run([str(edger), str(path), str(mode), str(block)], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    got = json.loads(p.stdout.strip().split("\n")[-1])
+    region = t.column("region").to_pylist()
+    cost = t.column("cost").to_pylist()
+    alive = [True] * len(region)
+    for i, row in enumerate(EDGE_ROWS):
+        cost[row] = 10_000_000 + i
+        if i % 2 == 0:
+            region[row] = "Edge"
+    for i, row in enumerate(EDGE_ROWS):
+        if i % 4 == 1:
+            alive[row] = False
+    want = {}
+    for r, c, a in zip(region, cost, alive):
+        if a and r is not None:
+            s, n = want.get(r, (0, 0))
+            want[r] = (s + c, n + 1)
+    assert {w: (s, n) for w, s, n in zip(got["words"], got["sums"], got["counts"]) if n} == want
+
+
+# ── F-146: the GPU for a streamed file ───────────────────────────────────────────────────────────────
+
+def _has_gpu():
+    import shutil
+    return shutil.which("nvidia-smi") is not None and subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode == 0
+
+
+def probe_device(prober, path, query, device, **extra):
+    env = {**__import__("os").environ, "MXFRAME_SCAN_DEVICE": device, **extra}
+    p = subprocess.run([str(prober), str(path), "scan", query], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout.strip().split("\n")[-1])
+
+
+def same_numbers(a, b):
+    for k in ("words", "kinds", "slot_of", "count_slot_of", "counts", "slots", "present"):
+        assert a[k] == b[k], k
+
+
+@pytest.mark.skipif(not _has_gpu(), reason="no GPU")
+@pytest.mark.parametrize("name", ["zstd-dict-v1", "snappy-dict-v2", "none-plain-v1", "small-pages"])
+def test_the_gpu_scan_equals_the_cpu_scan_and_duckdb_on_pyarrow_files(prober, tmp_path, name):
+    """Nulls (a whole row group of them), empty row groups, dictionary fallback to PLAIN text, every codec and page shape:
+    each query on the GPU gives, number for number, what the CPU scan, read_parquet and DuckDB give."""
+    path = tmp_path / "t.parquet"
+    write_with_empty_groups(path, scan_table(), **PYARROW_FILES[name])
+    for q in SCAN_QUERIES:
+        got = probe_device(prober, path, q, "gpu")
+        assert got["device"] == 1 and got["reason"] == "", (q, got["device"], got["reason"])
+        same_numbers(got, probe_device(prober, path, q, "cpu"))
+        same_numbers(got, probe(prober, path, "read", q))
+        check_against_duckdb(path, got, q)
+
+
+@pytest.mark.skipif(not _has_gpu(), reason="no GPU")
+def test_auto_on_a_small_file_is_the_cpu_and_says_why(prober, tmp_path):
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(), path, row_group_size=SCAN_GROUP)
+    got = probe_device(prober, path, "by_region", "auto")
+    assert got["device"] == 0 and "under AUTO's" in got["reason"], (got["device"], got["reason"])

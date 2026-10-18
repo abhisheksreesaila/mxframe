@@ -170,3 +170,24 @@ struct DeviceTable(ImplicitlyCopyable):
         s.valid_addr = List[Int]()
         s.bytes = 0
         s.live = False
+
+
+def _new_context() raises -> Int:
+    """A DeviceContext on the default GPU, on the heap, by address (0 on a build without GPU code): a streamed scan makes
+    one and uploads each decoded row group on it, so no GPU symbol is named outside `comptime if HAS_GPU`."""
+    comptime if HAS_GPU:
+        if not gpu_available():
+            return 0
+        var mem = unsafe_alloc[DeviceContext](1)
+        mem.unsafe_write(DeviceContext())
+        return Int(mem)
+    else:
+        return 0
+
+
+def _free_context(addr: Int):
+    comptime if HAS_GPU:
+        if addr != 0:
+            var p = UnsafePointer[DeviceContext, MutAnyOrigin](unsafe_from_address=addr)
+            _ = p.take_pointee()
+            p.free()

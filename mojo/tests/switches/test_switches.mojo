@@ -122,6 +122,16 @@ def main() raises:
     expect(streamed.device == CPU and streamed.counts[0] == 1000 and streamed.values(1)[0] == whole.values(1)[0] and
            streamed.values(2)[0] == whole.values(2)[0], "a streamed query gives the whole-file answer")
 
+    # F-146: no GPU on this build: a streamed query on GPU says so, on AUTO it is the CPU with nothing to explain
+    var gmsg = String("")
+    try:
+        _ = Query(scan_parquet(path)).agg(count()).compute(GPU)
+    except e:
+        gmsg = String(e)
+    expect(gmsg == "device GPU: no GPU on this build", "a streamed query on GPU raises: `" + gmsg + "`")
+    var gauto = Query(scan_parquet(path)).auto_gpu_ops(0).agg(count()).compute(AUTO)
+    expect(gauto.device == CPU and gauto.fallback_reason == "" and gauto.counts[0] == 1000, "AUTO streams on the CPU")
+
     # an edited streamed file (F-147): the overlay, the sort and the save work with no pool and no codecs
     var sframe = Frame(scan_parquet(path))
     sframe.set(0, 5, 42)

@@ -4,7 +4,7 @@
 from std.ffi import external_call
 from mxframe import (Table, SharedTable, Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of,
                      INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ParquetScan, ZSTD, SNAPPY,
-                     UNCOMPRESSED, CPU, GPU, AUTO, MORSELS_ON, MORSELS_OFF)
+                     UNCOMPRESSED, CPU, GPU, AUTO, MORSELS_ON, MORSELS_OFF, gpu_available)
 
 
 struct Rng(Movable):
@@ -130,15 +130,16 @@ def check_all(path: String, mem: SharedTable, mode: Int = MORSELS_OFF) raises:
     same(Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(), Query(mem).agg(count()).compute(), "only count()")
     same(Query(scan).morsels(mode).block_rows(1500).where(col("cost") > 99999).group_by(col("carrier"), groups=7).agg(sum(col("revenue")), max_of(col("cost"))).compute(),
          Query(mem).where(col("cost") > 99999).group_by(col("carrier"), groups=7).agg(sum(col("revenue")), max_of(col("cost"))).compute(), "nothing kept")
-    # the result says where it ran
+    # the result says where it ran (a GPU, if there is one, is not worth this file: AUTO says so)
     var r = Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(AUTO)
-    expect(r.device == CPU and r.fallback_reason == "", "AUTO on a scan runs on the CPU")
-    var raised = False
-    try:
-        _ = Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(GPU)
-    except e:
-        raised = "CPU" in String(e)
-    expect(raised, "compute(GPU) on a scan says that a scan runs on the CPU")
+    expect(r.device == CPU and (r.fallback_reason == "" or "under AUTO's" in r.fallback_reason), "AUTO on a small scan runs on the CPU")
+    if not gpu_available():
+        var raised = False
+        try:
+            _ = Query(scan).morsels(mode).block_rows(1500).agg(count()).compute(GPU)
+        except e:
+            raised = "no GPU" in String(e)
+        expect(raised, "compute(GPU) on a scan says there is no GPU")
 
 
 def test_equals_read_parquet_for_every_codec() raises:

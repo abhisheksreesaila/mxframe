@@ -2491,9 +2491,9 @@ struct ParquetScan(Copyable, Movable):
 
 # ── a row group read block by block (F-149) ──────────────────────────────────────────────────────────
 
-struct GroupPlan(Movable):
+struct _GroupPlan(Movable):
     """One row group of a scan, opened: the page headers of the columns read are walked and the dictionaries decoded.
-    Read only from then on, so any number of `GroupReader`s (the row-range morsels of the group) can share it."""
+    Read only from then on, so any number of `_GroupReader`s (the row-range morsels of the group) can share it."""
     var scan: ParquetScan
     var cols: List[Int]
     var ctxs: List[_Ctx]
@@ -2510,10 +2510,10 @@ struct GroupPlan(Movable):
         self.rows = 0
 
 
-def open_plan(scan: ParquetScan, g: Int, cols: List[Int]) raises -> GroupPlan:
+def _open_plan(scan: ParquetScan, g: Int, cols: List[Int]) raises -> _GroupPlan:
     """Opens row group `g`: its headers are walked and its dictionaries decoded here. The dictionaries of the TEXT
     columns in `cols` must have been built (`ParquetScan.ensure_words`)."""
-    var plan = GroupPlan(scan.copy(), cols)
+    var plan = _GroupPlan(scan.copy(), cols)
     ref info = scan._info[]
     info.check_unchanged()
     var maps = List[_Mapped]()                           # the chunks, while the headers are walked and the dictionaries decoded
@@ -2552,15 +2552,16 @@ def open_plan(scan: ParquetScan, g: Int, cols: List[Int]) raises -> GroupPlan:
     return plan^
 
 
-struct GroupReader(Movable):
+struct _GroupReader(Movable):
     """Rows [r0, r1) of a row group (a row-range morsel), decoded a block of `block` rows at a time by the thread that
     owns it: `next_block` decodes the next rows of each column read into the caller's table, pages one after the other
     (a page is mapped, decompressed and its levels unpacked when its first block is wanted, and dropped when its last
     block has been), so the working set is a block and the page being read per column. Only dictionary-indexed and
     PLAIN fixed-width pages are cut into blocks; a page of another encoding (text, booleans, delta) is decoded whole when
     its first block is wanted and copied block by block. The reader has its own copy of the page descriptors and shares
-    the plan's dictionaries (read only); nothing here uses the thread pool. The plan must outlive the reader."""
-    var plan: Int                    # the address of the `GroupPlan`
+    the plan's dictionaries (read only); nothing here uses the thread pool. The plan must outlive the reader: that is why the plan and the reader are internal (underscore), used by the scan loops of
+    query.mojo, which keep the plan alive across every reader."""
+    var plan: Int                    # the address of the `_GroupPlan`
     var scan: ParquetScan
     var cols: List[Int]
     var pages: List[_Page]
@@ -2571,7 +2572,7 @@ struct GroupReader(Movable):
     var at: Int                      # the first row of the next block
     var stop: Int                    # and the end of the range
 
-    def __init__(out self, plan: GroupPlan, r0: Int, r1: Int, block: Int):
+    def __init__(out self, plan: _GroupPlan, r0: Int, r1: Int, block: Int):
         self.plan = Int(UnsafePointer(to=plan))
         self.scan = plan.scan.copy()
         self.cols = plan.cols.copy()
@@ -2593,7 +2594,7 @@ struct GroupReader(Movable):
         var b0 = self.at
         var b1 = min(self.stop, b0 + self.block)
         ref info = self.scan._info[]
-        ref plan = UnsafePointer[GroupPlan, MutAnyOrigin](unsafe_from_address=self.plan)[]
+        ref plan = UnsafePointer[_GroupPlan, MutAnyOrigin](unsafe_from_address=self.plan)[]
         for k in range(len(self.cols)):
             ref col = t.cols[k]
             ref ctx = plan.ctxs[k]

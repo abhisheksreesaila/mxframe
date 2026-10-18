@@ -5,7 +5,7 @@
 from std.sys import argv
 from std.os import getenv
 from std.time import perf_counter_ns
-from mxframe import Query, col, sum, count, min_of, max_of, read_parquet, scan_parquet, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
+from mxframe import Query, col, sum, count, mean, min_of, max_of, read_parquet, scan_parquet, AUTO, GPU, CPU, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF
 from mxframe.kernels._fpenv import core_count
 
 
@@ -16,6 +16,12 @@ def _morsel_mode() -> Int:
     return MORSELS_ON if m == "1" else MORSELS_OFF if m == "0" else MORSELS_AUTO
 
 
+def _device() -> Int:
+    """The scan's device from the environment (this tool only): MXFRAME_SCAN_DEVICE=gpu or cpu, else AUTO."""
+    var d = getenv("MXFRAME_SCAN_DEVICE")
+    return GPU if d == "gpu" else CPU if d == "cpu" else AUTO
+
+
 def _block_rows() raises -> Int:
     var n = getenv("MXFRAME_MORSEL_ROWS")
     return Int(n) if n.byte_length() > 0 else 0
@@ -24,6 +30,11 @@ def _block_rows() raises -> Int:
 def plan(var q: Query, which: String) raises -> Query:
     if which == "numeric":
         return q^.group_by(col("carrier"), groups=10).agg(sum(col("cost")), sum(col("revenue")), count(), max_of(col("day")))
+    if which == "heavy":                       # arithmetic-heavy: the CPU kernel does real work per row (GPU comparison)
+        return q^.where(col("day") > 9500).group_by(col("carrier"), groups=10).agg(
+            sum((col("cost") % 100000) * 3 + col("day") % 7), sum(((col("cost") % 100000) // 3) * (col("day") + 1)),
+            min_of(col("cost") - col("day")), max_of(col("cost") * 2 + col("carrier")), mean(col("cost") % 1000),
+            sum((col("cost") % 1000) * (col("cost") % 997) // 7), count())
     if which == "plain":
         return q^.group_by(col("carrier"), groups=10).agg(sum(col("cost")), count())
     return q^.group_by(col("region"), groups=8).agg(count(), sum(col("cost")))
@@ -41,7 +52,15 @@ def main() raises:
     if mode == "scan":
         var scan = scan_parquet(path)
         rows = scan.rows()
-        var r = plan(Query(scan), which).morsels(_morsel_mode()).block_rows(_block_rows()).compute(AUTO)
+        var r = plan(Query(scan), which).morsels(_morsel_mode()).block_rows(_block_rows()).compute(_device())
+        var again = getenv("MXFRAME_BENCH_REPEAT")                     # more runs in the same process (a warm GPU context)
+        if again.byte_length() > 0:
+            var times = String("")
+            for _ in range(Int(again)):
+                var t1 = perf_counter_ns()
+                r = plan(Query(scan), which).morsels(_morsel_mode()).block_rows(_block_rows()).compute(_device())
+                times += String(Float64(perf_counter_ns() - t1) / 1e9) + " "
+            print("repeat seconds:", times, "device", r.device, "reason:", r.fallback_reason)
         for s in range(len(r.slots)):
             for v in r.slots[s]:
                 check = check * 31 + v
