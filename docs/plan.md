@@ -1335,6 +1335,22 @@ Needs: F-143 · `mojo/mxframe/parquet.mojo` · F-143 review: decode is the criti
 - [ ] exact (all oracles, cell probes, serial build); measured against DuckDB, 1 thread and all cores
 - [ ] open (product call, not this ticket): DuckDB's model, a worker per row group scanning and aggregating in small vectors (decoded columns never hit memory), trades the two-group memory bound for speed
 
+
+## F-146 Mojo API: the GPU for a streamed Parquet file [todo]
+Needs: F-145 · `query.mojo`, `gpu.mojo`, `parquet.mojo` · omxplorer (goal 20) opens files bigger than memory streamed, CPU only (`docs/plans/needs-mxframe.md` in the app)
+- [ ] `Query(scan).compute(GPU / AUTO)`: each decoded row group is uploaded and aggregated on the GPU while the next decodes (F-143's overlap); partials merged in row-group order; equal to the CPU scan exactly; AUTO picks per file from row count and the GPU's state; device memory bounded by two row groups
+- [ ] no-GPU builds unchanged (raise / CPU); measured against the CPU scan and DuckDB
+
+## F-147 Mojo API: editing a streamed file (a Frame overlay on a scan) [todo]
+Needs: F-136, F-140 · `frame.mojo`, `query.mojo`, `parquet.mojo` · omxplorer's streamed sheet is read-only today
+- [ ] `Frame(scan)`: sparse edits, appends, removes, merges and formulas over a ParquetScan with the same API as `Frame(shared)`; `get` reads the row group holding the row (a small bounded cache); `Query(frame_over_scan)` streams with the overlay applied (mask + delta as F-136); `bake()` is refused or streams to a new Parquet file (decide)
+- [ ] equal to `read_parquet` + `Frame` + the same edits on files that fit; memory still bounded for files that do not
+
+## F-148 Mojo API: count distinct, percentiles and top-k as aggregates [todo]
+Needs: F-133 · `query.mojo`, kernels · omxplorer computes these in app code over group-by results today
+- [ ] `count_distinct(e)`, `percentile(e, p)` / `median(e)`, `top_k(e, k)` per group, over tables, frames and scans (streamed: exact for distinct and top-k by merging per-row-group state; percentiles exact, memory stated); CPU first, GPU where it pays
+- [ ] equal to DuckDB on random data with nulls, many groups, ties
+
 ## F-133 M2: Query on a Mojo plan IR [done]
 Needs: F-132 · Spec §5 · `mojo/mxframe/expr.mojo`, `query.mojo`, test `mojo/tests/test_query.mojo`
 - [x] plan nodes in Mojo (Scan, Filter, Aggregate built; Project / Sort / Limit / Join kinds reserved), built by `Query(table).where().group_by(key, groups=).agg(...)`; expressions are flat post-order trees (`col`, `lit`, `+ - * // %`, unary `-`, `least` / `greatest`, comparisons, `between`, `& | ~`)
