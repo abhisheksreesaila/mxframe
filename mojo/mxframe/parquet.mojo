@@ -456,6 +456,12 @@ struct ParquetResult(Movable):
         self.table = table^
         self.metadata = metadata^
 
+    def take_table(mut self) -> Table:
+        """The table, moved out (the result keeps an empty one), so `.share()` works while `metadata` is still read."""
+        var t = Table.empty()
+        swap(t, self.table)
+        return t^
+
 
 @fieldwise_init
 struct _Leaf(Copyable, Movable):

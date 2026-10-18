@@ -1,6 +1,7 @@
 # F-134 (M3): the CSV reader, docs/mxframe-mojo-api.md section 2.
 from std.os import makedirs
-from mxframe import read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL
+from mxframe import (read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet,
+                     read_parquet)
 
 comptime DIR = "/tmp/mxframe_csv_test/"
 
@@ -437,7 +438,21 @@ def test_stray_quotes_across_chunk_boundaries() raises:
     expect(b1.rows == 301 and b1.ragged_count == 1, "the unclosed quote at the end is reported once")
 
 
+def test_take_table_leaves_the_report_readable() raises:
+    var r = read_csv(write_file("take.csv", "a,b\n1,x\n2,y\n"))
+    var shared = r.take_table().share()
+    expect(shared.rows() == 2 and r.rows == 2 and r.columns[1].name == "b" and r.table.rows() == 0,
+           "the table moves out, the report stays")
+    var path = write_file("take.parquet", "")
+    write_parquet(path, shared, metadata="{\"omx\":2}")
+    var p = read_parquet(path)
+    var back = p.take_table().share()
+    expect(back.rows() == 2 and p.metadata == "{\"omx\":2}" and p.table.rows() == 0,
+           "and a Parquet result's table moves out with its metadata still there")
+
+
 def main() raises:
+    test_take_table_leaves_the_report_readable()
     test_integers()
     test_decimals()
     test_dates()

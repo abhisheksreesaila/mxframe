@@ -152,6 +152,12 @@ struct CsvResult(Movable):
         self.ragged = List[FailedRow]()
         self.ragged_count = 0
 
+    def take_table(mut self) -> Table:
+        """The table, moved out (the result keeps an empty one), so `.share()` works while the report is still read."""
+        var t = Table.empty()
+        swap(t, self.table)
+        return t^
+
 
 # ── cell parsers (bytes in, exact int64 out; no String, no float) ──────────────────────────────
 

@@ -52,6 +52,7 @@ r.table; r.rows; r.seconds
 for c in r.columns: c.name, c.kind, c.scale, c.empty, c.distinct, c.sample   # the Import step's preview
 write_parquet(path, table, metadata: String)    # metadata: one JSON string under a key ("omx")
 var p = read_parquet(path); p.table; p.metadata -> String
+var shared = r.take_table().share()             # moves the table out; the report / metadata stay readable
 ```
 
 | Need | Detail |
