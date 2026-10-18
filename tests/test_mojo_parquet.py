@@ -467,6 +467,7 @@ CORRUPT = {
     "delta miniblock width 65": dict(body=uv(128) + uv(4) + uv(3) + zz(0) + zz(0) + bytes([65, 0, 0, 0]) + b"\xff" * 300,
                                      nvals=3, usize=312, csize=312, enc=5),
     "more values in the page than in the column chunk": dict(body=OK3, nvals=3, usize=24, csize=24, chunk_values=2),
+    "column name that is not UTF-8": dict(body=OK3, nvals=3, usize=24, csize=24, name=b"\xff\xfe"),
     "unknown physical type 9": dict(body=OK3, nvals=3, usize=24, csize=24, ptype=9),
     "no physical type": dict(body=OK3, nvals=3, usize=24, csize=24, ptype=-1),
     "skipped binary of 2^64-1 bytes": dict(body=OK3, nvals=3, usize=24, csize=24, footer_extra=unknown_field("binary_len_max")),
@@ -561,7 +562,7 @@ def test_a_refused_write_leaves_the_existing_file_and_no_temp_file(edge_writer, 
     p = subprocess.run([str(edge_writer), "atomic", str(path)], capture_output=True, text=True, check=True)
     assert "refused: column `money`" in p.stdout
     assert pq.read_table(path).column("qty").to_pylist() == [41, 42]
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["keep.omx"]
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["keep.omx"]  # no temp file left, whatever its name
 
 
 def test_footer_names_the_writer_and_uncompressed_row_group_size(writer, tmp_path):

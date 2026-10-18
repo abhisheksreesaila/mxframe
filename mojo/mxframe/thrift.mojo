@@ -155,6 +155,8 @@ struct ThriftReader(Movable):
 
     def binary(mut self) raises -> String:
         var n = self.length()
+        if not _valid_utf8(self.base + self.pos, n):
+            raise Error("Parquet metadata has a name or value that is not valid UTF-8 (corrupt file)")
         var s = String(unsafe_from_utf8=Span[UInt8, MutAnyOrigin](
             unsafe_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=self.base + self.pos), length=n))
         self.pos += n
@@ -220,3 +222,37 @@ struct ThriftReader(Movable):
             self.leave()
         else:
             raise Error("Parquet metadata has an unknown thrift type " + String(type) + " (corrupt file)")
+
+
+def _valid_utf8(addr: Int, n: Int) -> Bool:
+    var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
+    var i = 0
+    while i < n:
+        var b = Int(p[i])
+        var extra = 0
+        var low = 0x80                                  # the smallest code point of this length (no overlong forms)
+        if b < 0x80:
+            i += 1
+            continue
+        elif b >= 0xC2 and b < 0xE0:
+            extra = 1
+        elif b >= 0xE0 and b < 0xF0:
+            extra = 2
+            low = 0x800
+        elif b >= 0xF0 and b < 0xF5:
+            extra = 3
+            low = 0x10000
+        else:
+            return False
+        if i + extra >= n:
+            return False
+        var cp = b & (0x3F >> extra)
+        for k in range(1, extra + 1):
+            var cb = Int(p[i + k])
+            if cb & 0xC0 != 0x80:
+                return False
+            cp = (cp << 6) | (cb & 0x3F)
+        if cp < low or cp > 0x10FFFF or (cp >= 0xD800 and cp < 0xE000):
+            return False
+        i += extra + 1
+    return True

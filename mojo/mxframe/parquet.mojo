@@ -23,7 +23,7 @@ hold before anything is allocated or read, and a bad file raises "(corrupt file)
 """
 from std.ffi import external_call
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
-from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP
+from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
 # Parquet enums (parquet.thrift)
 comptime PT_BOOLEAN = 0
@@ -413,12 +413,18 @@ def _write(path: String, t: Table, metadata: String, codec: Int, row_group_rows:
     file.extend(meta^)
     _put32(file, footer)
     file.extend([UInt8(0x50), UInt8(0x41), UInt8(0x52), UInt8(0x31)])
-    var tmp = path + ".tmp"                              # an atomic save: a crash never loses the existing file
-    with open(tmp, "w") as f:
-        f.write_bytes(Span(file))
-    var dest = path
-    if external_call["rename", Int32](tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()) != 0:
-        raise Error("could not move `" + tmp + "` to `" + path + "`")
+    # An atomic save: a crash never loses the existing file. The temp name carries the process id, so two
+    # processes saving the same path never write into one temp file; a failed write removes it.
+    var tmp = path + "." + String(external_call["getpid", Int32]()) + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write_bytes(Span(file))
+        var dest = path
+        if external_call["rename", Int32](tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()) != 0:
+            raise Error("could not move `" + tmp + "` to `" + path + "`")
+    except e:
+        _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
+        raise e^
 
 
 # ── reading ──────────────────────────────────────────────────────────────────────────────────────────
@@ -676,40 +682,6 @@ def _to_stored(leaf: _Leaf, raw: Int64) raises -> Int64:
             raise Error("column `" + leaf.name + "` is UINT_64 and holds " + String(UInt64(raw)) +
                         ", past the int64 range MX frame stores")
     return raw
-
-
-def _valid_utf8(addr: Int, n: Int) -> Bool:
-    var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
-    var i = 0
-    while i < n:
-        var b = Int(p[i])
-        var extra = 0
-        var low = 0x80                                  # the smallest code point of this length (no overlong forms)
-        if b < 0x80:
-            i += 1
-            continue
-        elif b >= 0xC2 and b < 0xE0:
-            extra = 1
-        elif b >= 0xE0 and b < 0xF0:
-            extra = 2
-            low = 0x800
-        elif b >= 0xF0 and b < 0xF5:
-            extra = 3
-            low = 0x10000
-        else:
-            return False
-        if i + extra >= n:
-            return False
-        var cp = b & (0x3F >> extra)
-        for k in range(1, extra + 1):
-            var cb = Int(p[i + k])
-            if cb & 0xC0 != 0x80:
-                return False
-            cp = (cp << 6) | (cb & 0x3F)
-        if cp < low or cp > 0x10FFFF or (cp >= 0xD800 and cp < 0xE000):
-            return False
-        i += extra + 1
-    return True
 
 
 def _plain(mut c: _Bytes, leaf: _Leaf, count: Int, mut t: Table, col: Int, mut out: List[Int64]) raises:
