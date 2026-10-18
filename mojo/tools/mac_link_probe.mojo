@@ -4,7 +4,7 @@
 # and open). `mojo_entry` is the entry point the app's Mac build links with (`-e _mojo_entry`).
 from std.ffi import c_int
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
-                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, UNCOMPRESSED, ZSTD)
+                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD)
 
 
 def run() raises:
@@ -32,6 +32,7 @@ def run() raises:
         print(e)
     var back = read_parquet("probe.parquet")
     print(back.table.rows())
+    print(Query(scan_parquet("probe.parquet")).group_by(col("k"), 3).agg(sum(col("v")), count()).compute(AUTO).counts[0])
     var c = read_csv("probe.csv")
     print(c.table.rows())
 

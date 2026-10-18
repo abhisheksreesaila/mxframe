@@ -573,3 +573,201 @@ def test_footer_names_the_writer_and_uncompressed_row_group_size(writer, tmp_pat
     for g in range(md.num_row_groups):
         rg = md.row_group(g)
         assert rg.total_byte_size == sum(rg.column(c).total_uncompressed_size for c in range(rg.num_columns))
+
+
+# ── F-140: a query streamed over row groups equals read_parquet + the same query ─────────────────────
+
+SCAN_WORDS = ["West", "East", "Nörth", "", "South-East", "Far", "Central", "Zed"]
+SCAN_ROWS, SCAN_GROUP = 36_000, 4_000
+
+
+def scan_table(n=SCAN_ROWS, group=SCAN_GROUP, many_words=False, seed=11):
+    """region (string; each row group draws from a different window of words, so row-group dictionaries differ from
+    each other and from the file's), carrier int64 -1..9 (null for the whole of row group 5), day date32, revenue
+    decimal(18, 2) (null for the whole of row group 2), cost int64."""
+    r = _random.Random(seed)
+    region, carrier, day, revenue, cost = [], [], [], [], []
+    for i in range(n):
+        rg = i // group
+        if many_words:
+            region.append(None if r.random() < 0.03 else f"w{r.randint(0, 2999)}")
+        else:
+            start = (rg * 3) % 8
+            region.append(None if r.random() < 0.05 else SCAN_WORDS[(start + r.randint(0, 2)) % 8])
+        carrier.append(None if rg == 5 or r.random() < 0.03 else r.randint(-1, 9))
+        day.append(_dt.date(1970, 1, 1) + _dt.timedelta(days=r.randint(9000, 15000)))
+        revenue.append(None if rg == 2 or r.random() < 0.1 else
+                       _dec.Decimal(5_000_000_000_000_000 + r.randint(0, 99) if i % 400 == 0 else r.randint(-10**6, 10**6)).scaleb(-2))
+        cost.append(r.randint(-5000, 5000))
+    return pa.table({
+        "region": pa.array(region, pa.string()), "carrier": pa.array(carrier, pa.int64()),
+        "day": pa.array(day, pa.date32()), "revenue": pa.array(revenue, pa.decimal128(18, 2)),
+        "cost": pa.array(cost, pa.int64()),
+    })
+
+
+@pytest.fixture(scope="module")
+def prober(tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_scan_probe"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_scan_probe.mojo"), str(out)],
+                   check=True, capture_output=True, text=True)
+    return out
+
+
+def probe(prober, path, mode, query):
+    p = subprocess.run([str(prober), str(path), mode, query], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout.strip().split("\n")[-1])
+
+
+SCAN_QUERIES = ["by_region", "filtered", "pivot", "bins", "global"]
+
+
+def same_answer(a, b):
+    """Every number a caller can read, exactly (not the time or the memory)."""
+    for k in ("words", "kinds", "slot_of", "count_slot_of", "counts", "slots", "present"):
+        assert a[k] == b[k], k
+    assert a["device"] == b["device"] == 0
+
+
+def agg_values(res, i, g):
+    kind, so, cso = res["kinds"][i], res["slot_of"][i], res["count_slot_of"][i]
+    if kind == 1:                                       # count()
+        return res["counts"][g]
+    if kind == 2:                                       # count(e)
+        return res["slots"][cso][g] if cso >= 0 else res["counts"][g]
+    return res["slots"][so][g]
+
+
+def check_against_duckdb(path, res, query):
+    """The query's numbers per group, from DuckDB on the same file."""
+    words = res["words"].split("|")
+    cents = "CAST(revenue * 100 AS BIGINT)"
+    day = "(CAST(day AS DATE) - DATE '1970-01-01')"
+    con = duckdb.connect()
+    src = f"read_parquet('{path}')"
+    if query == "by_region":
+        rows = con.execute(f"SELECT region, sum({cents}), count(*), count(revenue), min(cost), max(cost), min({cents}), max({cents}) "
+                           f"FROM {src} WHERE region IS NOT NULL GROUP BY region").fetchall()
+        for region, s, n, nv, lo, hi, rlo, rhi in rows:
+            g = words.index(region)
+            assert res["counts"][g] == n
+            assert agg_values(res, 1, g) == n and agg_values(res, 2, g) == nv
+            assert agg_values(res, 3, g) == lo and agg_values(res, 4, g) == hi
+            if nv:
+                assert agg_values(res, 0, g) == int(s)
+                assert agg_values(res, 6, g) == rlo and agg_values(res, 7, g) == rhi
+                assert agg_values(res, 5, g) == int(s)                       # mean's sum
+            assert res["present"][6][g] == (1 if nv else 0)
+        assert sum(res["counts"]) == sum(r[2] for r in rows)
+    elif query == "filtered":
+        rows = con.execute(f"SELECT carrier, sum({cents}), count(*), max(cost) FROM {src} "
+                           f"WHERE region = 'East' AND {day} BETWEEN 10000 AND 14000 AND carrier BETWEEN 0 AND 7 GROUP BY carrier").fetchall()
+        got = {c: (agg_values(res, 0, c), res["counts"][c], agg_values(res, 2, c)) for c in range(8) if res["counts"][c]}
+        assert got == {c: (int(s) if s is not None else 0, n, hi) for c, s, n, hi in rows}
+    elif query == "pivot":
+        rows = con.execute(f"SELECT region, carrier, sum(cost), count(revenue) FROM {src} WHERE region IS NOT NULL "
+                           f"AND carrier BETWEEN 0 AND 7 GROUP BY region, carrier").fetchall()
+        got = {g: (agg_values(res, 0, g), agg_values(res, 1, g)) for g in range(len(res["counts"])) if res["counts"][g]}
+        assert got == {words.index(r) * 8 + c: (s, nv) for r, c, s, nv in rows}
+    elif query == "bins":
+        rows = con.execute(f"SELECT least({day} // 30, 99), count(*), sum(cost) FROM {src} WHERE {day} IS NOT NULL GROUP BY 1").fetchall()
+        got = {g: (res["counts"][g], agg_values(res, 1, g)) for g in range(100) if res["counts"][g]}
+        assert got == {b: (n, s) for b, n, s in rows}
+    elif query == "global":
+        s, n, rlo, rhi = con.execute(f"SELECT sum(cost), count(*), min({cents}), max({cents}) FROM {src}").fetchone()
+        assert (agg_values(res, 0, 0), agg_values(res, 1, 0), agg_values(res, 2, 0), agg_values(res, 3, 0)) == (s, n, rlo, rhi)
+
+
+PYARROW_FILES = {
+    "zstd-dict-v1": dict(compression="zstd", use_dictionary=True, data_page_version="1.0"),
+    "snappy-dict-v2": dict(compression="snappy", use_dictionary=True, data_page_version="2.0"),
+    "none-plain-v1": dict(compression="none", use_dictionary=False, data_page_version="1.0"),
+    "zstd-plain-v2": dict(compression="zstd", use_dictionary=False, data_page_version="2.0"),
+    "small-pages": dict(compression="snappy", use_dictionary=True, data_page_size=2_000),
+}
+
+
+def write_with_empty_groups(path, table, **opts):
+    """Row groups of SCAN_GROUP rows, with an empty row group before the first, in the middle and after the last."""
+    w = pq.ParquetWriter(path, table.schema, **opts)
+    w.write_table(table.slice(0, 0))
+    for lo in range(0, table.num_rows, SCAN_GROUP):
+        w.write_table(table.slice(lo, SCAN_GROUP))
+        if lo == 3 * SCAN_GROUP:
+            w.write_table(table.slice(0, 0))
+    w.write_table(table.slice(0, 0))
+    w.close()
+
+
+@pytest.mark.parametrize("name", sorted(PYARROW_FILES))
+def test_streamed_query_equals_read_parquet_on_pyarrow_files(prober, tmp_path, name):
+    path = tmp_path / "t.parquet"
+    write_with_empty_groups(path, scan_table(), **PYARROW_FILES[name])
+    assert pq.read_metadata(path).num_row_groups == 12                   # 9 + 3 empty
+    for q in SCAN_QUERIES:
+        scanned, read = probe(prober, path, "scan", q), probe(prober, path, "read", q)
+        same_answer(scanned, read)
+        check_against_duckdb(path, scanned, q)
+
+
+def test_text_that_falls_back_to_plain_pages_streams_the_same_codes(prober, tmp_path):
+    """3,000 distinct words with a 1 KB dictionary limit: each chunk starts dictionary-encoded and finishes PLAIN."""
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(many_words=True), path, row_group_size=SCAN_GROUP, dictionary_pagesize_limit=1024)
+    encodings = pq.read_metadata(path).row_group(0).column(0).encodings
+    assert "PLAIN" in encodings and "RLE_DICTIONARY" in encodings
+    for q in ("by_region", "big"):
+        scanned, read = probe(prober, path, "scan", q), probe(prober, path, "read", q)
+        same_answer(scanned, read)
+    check_against_duckdb(path, probe(prober, path, "scan", "by_region"), "by_region")
+
+
+@pytest.mark.parametrize("codec", ["zstd", "snappy", "none"])
+def test_streamed_query_equals_read_parquet_on_duckdb_files(prober, tmp_path, codec):
+    src = tmp_path / "src.parquet"
+    pq.write_table(scan_table(), src)
+    path = tmp_path / "t.parquet"
+    duckdb.connect().execute(f"COPY (SELECT * FROM read_parquet('{src}')) TO '{path}' "
+                             f"(FORMAT parquet, ROW_GROUP_SIZE {SCAN_GROUP}, COMPRESSION {'uncompressed' if codec == 'none' else codec})")
+    assert pq.read_metadata(path).num_row_groups == 9
+    for q in SCAN_QUERIES:
+        scanned, read = probe(prober, path, "scan", q), probe(prober, path, "read", q)
+        same_answer(scanned, read)
+        check_against_duckdb(path, scanned, q)
+
+
+def test_a_file_with_no_rows_and_a_file_that_is_not_parquet(prober, tmp_path):
+    path = tmp_path / "e.parquet"
+    pq.write_table(scan_table(0), path)
+    same_answer(probe(prober, path, "scan", "global"), probe(prober, path, "read", "global"))
+    bad = tmp_path / "bad.parquet"
+    bad.write_bytes(b"not a parquet file at all")
+    p = subprocess.run([str(prober), str(bad), "scan", "global"], capture_output=True, text=True)
+    assert p.returncode != 0 and "not a Parquet file" in p.stdout + p.stderr
+
+
+def test_a_truncated_file_raises_instead_of_crashing(prober, tmp_path):
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(), path, row_group_size=SCAN_GROUP)
+    data = path.read_bytes()
+    for cut in (len(data) // 2, len(data) - 100, 20):
+        bad = tmp_path / f"cut{cut}.parquet"
+        bad.write_bytes(data[:cut])
+        p = subprocess.run([str(prober), str(bad), "scan", "by_region"], capture_output=True, text=True)
+        assert p.returncode == 1 and "Unhandled exception" in p.stdout + p.stderr, (cut, p.returncode)
+
+
+def test_random_byte_flips_never_crash_a_scan(prober, tmp_path):
+    path = tmp_path / "t.parquet"
+    pq.write_table(scan_table(8_000), path, row_group_size=2_000)
+    data = bytearray(path.read_bytes())
+    r = _random.Random(5)
+    for k in range(60):
+        flipped = bytearray(data)
+        for _ in range(3):
+            flipped[r.randrange(len(flipped))] ^= 1 << r.randrange(8)
+        bad = tmp_path / "flip.parquet"
+        bad.write_bytes(flipped)
+        p = subprocess.run([str(prober), str(bad), "scan", "by_region"], capture_output=True, text=True)
+        assert p.returncode in (0, 1), (k, p.returncode)                 # an answer or a readable error, never a signal

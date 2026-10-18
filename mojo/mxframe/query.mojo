@@ -24,7 +24,8 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 """
 from std.time import perf_counter_ns
 from std.memory import Pointer
-from .table import SharedTable
+from .table import SharedTable, Table
+from .parquet import ParquetScan
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
@@ -132,17 +133,31 @@ struct Query(Movable):
     var framed: Bool
     var overlay: Overlay
     var device: Optional[DeviceTable]
+    var scan: Optional[ParquetScan]      # a Parquet file streamed one row group at a time (`Query(scan)`)
 
     def __init__(out self, table: SharedTable):
         self.table = table
         self.device = None
+        self.scan = None
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = False
         self.overlay = Overlay(table)
 
+    def __init__(out self, scan: ParquetScan):
+        """A plan over a Parquet file that may be bigger than memory: `compute` reads one row group at a time (only the
+        columns the plan uses), runs the kernel on it on the CPU and merges the partial results, so the answer is
+        `read_parquet` + the same query, exactly, and the peak memory is one row group plus the result."""
+        self.table = scan.schema
+        self.device = None
+        self.scan = scan.copy()
+        self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
+        self.framed = False
+        self.overlay = Overlay(scan.schema)
+
     def __init__(out self, frame: Frame) raises:
         self.table = frame.base
         self.device = None
+        self.scan = None
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
         self.overlay = frame.overlay()
@@ -186,6 +201,8 @@ struct Query(Movable):
         Explicit rather than a process-wide registry: Mojo has no safe mutable globals, the app owns the one
         DeviceTable next to its SharedTable and hands it to each session's queries, and a handle that was made
         from another table is refused here, not silently answered with the wrong data."""
+        if self.scan:
+            raise Error("on_device: a Parquet scan runs on the CPU, one row group at a time")
         if not device_table.mirrors(self.table):
             raise Error("on_device: this DeviceTable was not made from the query's table")
         self.device = device_table
@@ -195,6 +212,8 @@ struct Query(Movable):
         """Runs the plan. `device`: CPU, GPU (raises without a live attached DeviceTable) or AUTO (the GPU when a
         live DeviceTable is attached and the table has `AUTO_GPU_MIN_ROWS` rows or more, else the CPU). The result is
         the same either way, edits of a frame included."""
+        if self.scan:
+            return _compute_scan(self.scan.value(), self.nodes, device)
         var use_gpu = False
         if device == GPU:
             comptime if not HAS_GPU:
@@ -992,3 +1011,96 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
         if r.kinds[i] == A_SUM:
             r.sums = r.slots[r.slot_of[i]].copy()
             break
+
+
+# ── a Parquet scan: one row group at a time (F-140) ──────────────────────────────────────────────────
+
+def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises -> QueryResult:
+    """The plan over a file, a row group at a time: decode the columns the plan reads, run the CPU kernel on that
+    group, merge its partial result into the running one (sums and counts add, min / max combine; a sum passing
+    int64 raises, as one run does). Each group is lowered on its own table, so its null-free columns skip the null
+    machinery; every group is lowered with a non-null count per aggregate (`force_counts`), so the partial results
+    all have one layout, and the merged result is laid out at the end as a whole-file run would have (a count slot
+    only for an aggregate over a column that holds a null anywhere in the file)."""
+    if device == GPU:
+        raise Error("device GPU: a Parquet scan runs on the CPU, one row group at a time")
+    var t0 = perf_counter_ns()
+    var names = List[String]()
+    for node in nodes:
+        for e in node.exprs:
+            for nm in e.columns():
+                if nm not in names:
+                    names.append(nm)
+        for a in node.aggs:
+            for nm in a.arg.columns():
+                if nm not in names:
+                    names.append(nm)
+    var used = List[Int]()                   # the file's columns the plan reads, in file order
+    for nm in names:
+        var c = scan.column(nm)
+        var at = len(used)
+        while at > 0 and used[at - 1] > c:
+            at -= 1
+        if at == 0 or used[at - 1] != c:
+            used.insert(at, c)
+    if len(used) == 0 and scan.columns() > 0:   # count() alone reads no column: a table's row count is its first column's
+        used.append(0)
+    var shape = _lower(scan.schema, nodes, True, False)         # the per-group layout; also raises plan errors up front
+    var ops = List[Int](length=shape.n_slots, fill=A_SUM)       # how each kernel slot merges
+    for i in range(len(shape.kinds)):
+        if shape.kinds[i] == A_MIN or shape.kinds[i] == A_MAX:
+            ops[shape.slot_of[i]] = shape.kinds[i]
+    var acc = QueryResult()
+    for s in range(shape.n_slots):
+        var ident = Int(Int64.MAX) if ops[s] == A_MIN else Int(Int64.MIN) if ops[s] == A_MAX else 0
+        acc.slots.append(List[Int](length=shape.groups, fill=ident))
+    acc.counts = List[Int](length=shape.groups, fill=0)
+    var nulls = List[Int](length=len(used), fill=0)
+    for g in range(scan.row_groups()):
+        if scan.group_rows(g) == 0:
+            continue
+        var rg = scan.read_group(g, used)
+        for k in range(len(used)):
+            nulls[k] += rg.null_count(k)
+        var part = rg^.share()
+        var r = _run_cpu(part, _lower(part, nodes, True, False), 0)
+        for s in range(shape.n_slots):
+            for x in range(shape.groups):
+                var a = acc.slots[s][x]
+                var b = r.slots[s][x]
+                if ops[s] == A_MIN:
+                    acc.slots[s][x] = min(a, b)
+                elif ops[s] == A_MAX:
+                    acc.slots[s][x] = max(a, b)
+                else:
+                    var y = Int64(a) + Int64(b)
+                    if ((Int64(a) ^ y) & (Int64(b) ^ y)) < 0:
+                        raise Error(OVERFLOW_MESSAGE)
+                    acc.slots[s][x] = Int(y)
+        for x in range(shape.groups):
+            acc.counts[x] += r.counts[x]
+    # the layout of a whole-file run: lowered over the columns with the null counts the file turned out to have
+    var proto = Table.empty()
+    for k in range(len(used)):
+        _ = proto.add_column(scan.name(used[k]), scan.kind(used[k]), scale=scan.scale(used[k]))
+        proto.cols[k].nulls = nulls[k]
+    var want = _lower(proto^.share(), nodes, False, False)
+    var out = QueryResult()
+    out.kinds = want.kinds.copy()
+    out.slot_of = want.slot_of.copy()
+    out.count_slot_of = want.count_slot_of.copy()
+    for _ in range(want.n_slots):
+        out.slots.append(List[Int](length=want.groups, fill=0))
+    for i in range(len(want.kinds)):
+        if want.slot_of[i] >= 0:
+            out.slots[want.slot_of[i]] = acc.slots[shape.slot_of[i]].copy()
+        if want.count_slot_of[i] >= 0:
+            out.slots[want.count_slot_of[i]] = acc.slots[shape.count_slot_of[i]].copy()
+    out.counts = acc.counts.copy()
+    for i in range(len(out.kinds)):
+        if out.kinds[i] == A_SUM:
+            out.sums = out.slots[out.slot_of[i]].copy()
+            break
+    out.device = CPU
+    out.milliseconds = Float64(perf_counter_ns() - t0) / 1e6
+    return out^

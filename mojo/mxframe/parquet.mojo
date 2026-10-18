@@ -28,6 +28,8 @@ referenced, so nothing links. On Linux both codecs work as before.
 """
 from std.ffi import external_call
 from std.sys import is_defined, CompilationTarget
+from std.collections import Dict
+from std.memory import ArcPointer
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
@@ -485,6 +487,7 @@ struct _ChunkMeta(Copyable, Movable):
     var values: Int
     var data_off: Int
     var dict_off: Int
+    var size: Int                    # total_compressed_size: the bytes of the chunk's pages (headers included)
 
 
 struct _Bytes:
@@ -762,6 +765,48 @@ def read_parquet(path: String) raises -> ParquetResult:
     var base = Int(data.unsafe_ptr())
     var r = ThriftReader(base + n - 8 - flen, flen)
 
+    var footer = _read_footer(r)
+    ref leaves = footer.leaves
+    ref groups = footer.groups
+
+    var cols = List[_Leaf]()
+    var t = _schema_table(path, leaves, cols)
+
+    for g in range(len(groups)):
+        if len(groups[g]) != len(cols):
+            raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(groups[g])) +
+                        " columns, the schema " + String(len(cols)))
+        for c in range(len(cols)):
+            _read_chunk(base, n, groups[g][c], cols[c], t, c)
+    t.check()
+    _ = data^
+    return ParquetResult(t^, footer.omx.copy())
+
+
+def _schema_table(path: String, leaves: List[_Leaf], mut cols: List[_Leaf]) raises -> Table:
+    """An empty table with the file's columns (a flat schema: a root, then one element per column); `cols` gets
+    their leaves."""
+    if len(leaves) == 0:
+        raise Error("`" + path + "`: the Parquet schema is empty")
+    var t = Table.empty()
+    for i in range(1, len(leaves)):
+        if leaves[i].children > 0 or leaves[i].repetition == REPEATED:
+            raise Error("column `" + leaves[i].name + "` is nested (a list or a struct): not supported yet")
+        var k = _kind_of(leaves[i])
+        _ = t.add_column(leaves[i].name, k[0], scale=k[1])
+        cols.append(leaves[i].copy())
+    return t^
+
+
+@fieldwise_init
+struct _Footer(Movable):
+    var leaves: List[_Leaf]
+    var groups: List[List[_ChunkMeta]]
+    var omx: String
+
+
+def _read_footer(mut r: ThriftReader) raises -> _Footer:
+    """The schema, the row groups' chunk metadata and the "omx" metadata from a Parquet footer."""
     var leaves = List[_Leaf]()
     var groups = List[List[_ChunkMeta]]()
     var omx = String("")
@@ -799,27 +844,7 @@ def read_parquet(path: String) raises -> ParquetResult:
         else:
             r.skip(f[1])
 
-    # the leaves: a flat schema (a root, then one element per column)
-    if len(leaves) == 0:
-        raise Error("`" + path + "`: the Parquet schema is empty")
-    var t = Table.empty()
-    var cols = List[_Leaf]()
-    for i in range(1, len(leaves)):
-        if leaves[i].children > 0 or leaves[i].repetition == REPEATED:
-            raise Error("column `" + leaves[i].name + "` is nested (a list or a struct): not supported yet")
-        var k = _kind_of(leaves[i])
-        _ = t.add_column(leaves[i].name, k[0], scale=k[1])
-        cols.append(leaves[i].copy())
-
-    for g in range(len(groups)):
-        if len(groups[g]) != len(cols):
-            raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(groups[g])) +
-                        " columns, the schema " + String(len(cols)))
-        for c in range(len(cols)):
-            _read_chunk(base, n, groups[g][c], cols[c], t, c)
-    t.check()
-    _ = data^
-    return ParquetResult(t^, omx^)
+    return _Footer(leaves^, groups^, omx^)
 
 
 def _read_schema_element(mut r: ThriftReader) raises -> _Leaf:
@@ -913,7 +938,7 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
         if f[0] == 1 and f[1] == T_LIST:
             var h = r.list_header()
             for _ in range(h[1]):
-                var meta = _ChunkMeta(-1, 0, 0, -1, -1)
+                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0)
                 r.enter()
                 while True:
                     var g = r.field()
@@ -933,6 +958,8 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
                                 meta.codec = Int(r.zigzag())
                             elif m[0] == 5 and m[1] == T_I64:
                                 meta.values = Int(r.zigzag())
+                            elif m[0] == 7 and m[1] == T_I64:
+                                meta.size = Int(r.zigzag())
                             elif m[0] == 9 and m[1] == T_I64:
                                 meta.data_off = Int(r.zigzag())
                             elif m[0] == 11 and m[1] == T_I64:
@@ -950,8 +977,9 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
     return chunks^
 
 
-def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, col: Int) raises:
-    """Appends one column chunk's values to column `col`."""
+def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, col: Int, words_only: Bool = False) raises:
+    """Appends one column chunk's values to column `col`. `words_only` (a TEXT column's file-wide dictionary): only the
+    words are added, in the order a full read adds them; dictionary-indexed data pages are not even decompressed."""
     var pos = meta.dict_off if meta.dict_off > 0 and meta.dict_off < meta.data_off else meta.data_off
     var dictionary = List[Int64]()
     var done = 0
@@ -1027,6 +1055,9 @@ def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, 
             continue                                     # an index page: not needed
         if nvals > meta.values - done:
             raise Error("column `" + leaf.name + "`: a page holds more values than its column chunk (corrupt file)")
+        if words_only and (encoding == ENC_RLE_DICTIONARY or encoding == ENC_PLAIN_DICTIONARY):
+            done += nvals
+            continue
         var levels = List[Int64]()
         var page: List[UInt8]
         var c: _Bytes
@@ -1088,12 +1119,235 @@ def _read_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, 
             raise Error("column `" + leaf.name + "`: Parquet encoding " + String(encoding) + " is not supported yet")
         if len(vals) < present:
             raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
-        var k = 0
-        for i in range(nvals):
-            if optional and levels[i] == 0:
-                t.append_null(col)
-            else:
-                t.cols[col].push(vals[k], True)             # already checked: codes from add_word, 0 / 1 bits
-                k += 1
+        if not words_only:
+            var k = 0
+            for i in range(nvals):
+                if optional and levels[i] == 0:
+                    t.append_null(col)
+                else:
+                    t.cols[col].push(vals[k], True)             # already checked: codes from add_word, 0 / 1 bits
+                    k += 1
         done += nvals
         _ = page^
+
+
+# ── scanning: a file bigger than memory, one row group at a time (F-140) ─────────────────────────────
+
+comptime _MAP_ALIGN = 16384          # mmap offsets must be page multiples: 4 KB (Linux x86), 16 KB (Apple arm64)
+
+
+struct _Mapped(Movable):
+    """A read-only mapping of `length` bytes of a file from `offset`; unmapped when released or dropped, so a
+    chunk's pages are in the process only while it is decoded."""
+    var addr: Int
+    var span: Int
+    var data: Int                    # the address of the byte at `offset`
+
+    def __init__(out self, fd: Int, offset: Int, length: Int, path: String) raises:
+        var start = offset - offset % _MAP_ALIGN
+        self.span = length + (offset - start)
+        self.addr = external_call["mmap", Int](Int(0), self.span, Int32(1), Int32(2), fd, start)
+        self.data = 0
+        if self.addr == -1:
+            self.span = 0
+            raise Error("couldn't read `" + path + "`: part of the file could not be mapped into memory")
+        self.data = self.addr + (offset - start)
+
+    def release(mut self):
+        if self.span > 0:
+            _ = external_call["munmap", Int32](self.addr, self.span)
+            self.span = 0
+
+    def __del__(deinit self):
+        if self.span > 0:
+            _ = external_call["munmap", Int32](self.addr, self.span)
+
+
+def _open_file(path: String) raises -> Tuple[FileHandle, Int]:
+    """The file and its size."""
+    var file: FileHandle
+    try:
+        file = open(path, "r")
+    except:
+        raise Error("couldn't open `" + path + "`: no such file, or no permission to read it")
+    var size = external_call["lseek", Int](file._get_raw_fd(), Int(0), Int32(2))
+    if size < 0:
+        file.close()
+        raise Error("couldn't read `" + path + "`: not a regular file")
+    return (file^, size)
+
+
+def _read_chunk_mapped(fd: Int, size: Int, path: String, meta: _ChunkMeta, leaf: _Leaf, mut t: Table, col: Int,
+                       words_only: Bool = False) raises:
+    """One column chunk, read through a mapping of just its bytes (never the whole file)."""
+    if meta.values == 0:
+        return
+    var lo = meta.dict_off if meta.dict_off > 0 and meta.dict_off < meta.data_off else meta.data_off
+    if lo <= 0 or meta.size <= 0 or meta.size > size - lo:
+        raise Error("column `" + leaf.name + "`: a column chunk lies outside the file (corrupt file)")
+    var m = _Mapped(fd, lo, meta.size, path)
+    # the page walker takes file offsets: shift the base so that offset `lo` is the mapping's first byte; the
+    # chunk's end is the walker's bound
+    _read_chunk(m.data - lo, lo + meta.size, meta, leaf, t, col, words_only)
+    m.release()
+
+
+struct _ScanInfo(Movable):
+    var path: String
+    var size: Int
+    var leaves: List[_Leaf]
+    var groups: List[List[_ChunkMeta]]
+    var rows_of: List[Int]
+    var metadata: String
+
+    def __init__(out self, path: String, size: Int, var leaves: List[_Leaf], var groups: List[List[_ChunkMeta]],
+                 var rows_of: List[Int], var metadata: String):
+        self.path = path
+        self.size = size
+        self.leaves = leaves^
+        self.groups = groups^
+        self.rows_of = rows_of^
+        self.metadata = metadata^
+
+
+struct ParquetScan(Copyable, Movable):
+    """A Parquet file opened for streaming: its footer, its columns and each TEXT column's file-wide dictionary, none
+    of the data. `Query(scan)` runs a query over it one row group at a time (query.mojo); copies share everything.
+
+    A TEXT code is the code `read_parquet` gives the word (first seen, in file order), so a filter literal or a
+    group count taken here is right for the query. The dictionaries are found by one pass over the dictionary pages
+    (a column whose pages are not all dictionary-encoded is read for those pages) when the scan is opened."""
+    var _info: ArcPointer[_ScanInfo]
+    var schema: SharedTable          # the columns, no rows; TEXT columns carry the file-wide words
+
+    def __init__(out self, var info: _ScanInfo, var schema: SharedTable):
+        self._info = ArcPointer(info^)
+        self.schema = schema^
+
+    def rows(self) -> Int:
+        var n = 0
+        for r in self._info[].rows_of:
+            n += r
+        return n
+
+    def row_groups(self) -> Int:
+        return len(self._info[].groups)
+
+    def group_rows(self, g: Int) -> Int:
+        return self._info[].rows_of[g]
+
+    def metadata(self) -> String:
+        """The file's "omx" key-value metadata, "" when there is none."""
+        return self._info[].metadata
+
+    def columns(self) -> Int:
+        return self.schema.columns()
+
+    def name(self, c: Int) -> String:
+        return self.schema.name(c)
+
+    def kind(self, c: Int) -> ColumnKind:
+        return self.schema.kind(c)
+
+    def scale(self, c: Int) -> Int:
+        return self.schema.scale(c)
+
+    def index(self, name: String) -> Int:
+        return self.schema.index(name)
+
+    def column(self, name: String) raises -> Int:
+        return self.schema.column(name)
+
+    def word_count(self, c: Int) -> Int:
+        """A TEXT column's number of words in the whole file: the `groups=` of a query keyed by it."""
+        return len(self.schema.dictionary(c))
+
+    def text_of(self, c: Int, code: Int) -> String:
+        return self.schema.text_of(c, code)
+
+    def code_of(self, c: Int, word: String) -> Int:
+        """The word's code, -1 when the file never holds it."""
+        return self.schema.code_of(c, word)
+
+    def read_group(self, g: Int, cols: List[Int]) raises -> Table:
+        """Row group `g` as a table of just the columns `cols` (in that order), decoded and mapped onto the file-wide
+        dictionaries: a TEXT value is the code the whole-file read gives its word."""
+        ref info = self._info[]
+        var opened = _open_file(info.path)
+        var fd = opened[0]._get_raw_fd()
+        var t = Table.empty()
+        for k in range(len(cols)):
+            var c = cols[k]
+            _ = t.add_column(self.schema.name(c), self.schema.kind(c), scale=self.schema.scale(c))
+            _read_chunk_mapped(fd, info.size, info.path, info.groups[g][c], info.leaves[c], t, k)
+            if self.schema.kind(c) == TEXT:
+                self._remap_words(t, k, c)
+        opened[0].close()
+        t.check()
+        return t^
+
+    def _remap_words(self, mut t: Table, k: Int, c: Int) raises:
+        """The chunk's own first-seen codes become the file-wide ones (one lookup per distinct word)."""
+        ref col = t.cols[k]
+        var to = List[Int64]()
+        for w in col.words:
+            var code = self.schema.code_of(c, w)
+            if code < 0:
+                raise Error("column `" + col.name + "`: a word is missing from the file's dictionary (corrupt file)")
+            to.append(Int64(code))
+        if col.nulls == 0:
+            for i in range(len(col.values)):
+                col.values[i] = to[Int(col.values[i])]
+        else:
+            for i in range(len(col.values)):
+                if not col.is_null(i):
+                    col.values[i] = to[Int(col.values[i])]
+        col.words = List[String]()
+        col.codes = Dict[String, Int]()
+
+
+def scan_parquet(path: String) raises -> ParquetScan:
+    """Opens a Parquet file for streaming (`Query(scan)`): reads the footer and each TEXT column's dictionary, no
+    column data. Peak memory of a query over it is one row group's columns, not the file."""
+    var opened = _open_file(path)
+    var size = opened[1]
+    var fd = opened[0]._get_raw_fd()
+    if size < 12:
+        opened[0].close()
+        raise Error("`" + path + "` is not a Parquet file (no PAR1 magic)")
+    var head = _Mapped(fd, 0, 4, path)
+    var tail = _Mapped(fd, size - 8, 8, path)
+    var hp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=head.data)
+    var tp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=tail.data)
+    if hp[0] != 0x50 or hp[1] != 0x41 or hp[2] != 0x52 or hp[3] != 0x31 or \
+       tp[4] != 0x50 or tp[5] != 0x41 or tp[6] != 0x52 or tp[7] != 0x31:
+        opened[0].close()
+        raise Error("`" + path + "` is not a Parquet file (no PAR1 magic)")
+    var flen = Int(tp[0]) | (Int(tp[1]) << 8) | (Int(tp[2]) << 16) | (Int(tp[3]) << 24)
+    head.release()
+    tail.release()
+    if flen <= 0 or flen > size - 12:
+        opened[0].close()
+        raise Error("`" + path + "`: the Parquet footer length is wrong (corrupt file)")
+    var fm = _Mapped(fd, size - 8 - flen, flen, path)
+    var r = ThriftReader(fm.data, flen)
+    var footer = _read_footer(r)
+    fm.release()
+    var cols = List[_Leaf]()
+    var schema = _schema_table(path, footer.leaves, cols)
+    var n_cols = len(cols)
+    var groups = List[List[_ChunkMeta]]()
+    var rows_of = List[Int]()
+    for g in range(len(footer.groups)):
+        if len(footer.groups[g]) != n_cols:
+            opened[0].close()
+            raise Error("`" + path + "`: row group " + String(g) + " has " + String(len(footer.groups[g])) +
+                        " columns, the schema " + String(n_cols))
+        rows_of.append(footer.groups[g][0].values if n_cols > 0 else 0)
+        groups.append(footer.groups[g].copy())
+    for c in range(n_cols):                       # each TEXT column's file-wide dictionary
+        if schema.kind(c) == TEXT:
+            for g in range(len(groups)):
+                _read_chunk_mapped(fd, size, path, groups[g][c], cols[c], schema, c, words_only=True)
+    opened[0].close()
+    return ParquetScan(_ScanInfo(path, size, cols^, groups^, rows_of^, footer.omx.copy()), schema^.share())
