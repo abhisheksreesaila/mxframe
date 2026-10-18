@@ -36,6 +36,11 @@ def run() raises:
     var back = read_parquet("probe.parquet")
     print(back.table.rows())
     print(Query(scan_parquet("probe.parquet")).group_by(col("k"), 3).agg(sum(col("v")), count()).compute(AUTO).counts[0])
+    var sf = Frame(scan_parquet("probe.parquet"))          # F-147: edits over a streamed file, queried, sorted, saved
+    sf.set(1, 2, Int64(9))
+    sf.remove(0)
+    print(Query(sf).group_by(col("k"), 3).agg(sum(col("v")), count()).compute(AUTO).counts[0], sf.permutation(1).__len__(), sf.get(1, 2))
+    sf.save("probe-edited.parquet", "{}", ZSTD)
     var c = read_csv("probe.csv")
     print(c.table.rows())
 

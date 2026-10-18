@@ -61,7 +61,7 @@ var shared = r.take_table().share()             # moves the table out; the repor
 | Per-column import report | empty cells, distinct count (text), the first few raw values, rows that failed to parse (row number + text) |
 | Speed | today 1M rows: 0.5 s; 100M rows: 106 s on a loaded machine (pyarrow, multi-threaded). Parity or better, streaming (no full-file copy in memory). |
 | **Parquet read/write with key-value metadata** | the `.omx` document is one Parquet file; its JSON metadata holds formats, formulas, charts, pivots and the Report. Edits are baked into the columns on save (D-138). |
-| **Bigger than RAM** (F-140) | `var scan = scan_parquet(path)`; `Query(scan).where(...).group_by(col("region"), groups=scan.word_count(scan.index("region"))).agg(...).compute()` decodes one row group at a time (only the columns the plan reads) and equals `read_parquet` + the same query exactly; TEXT codes are the whole-file read's (`scan.code_of(c, word)`); CPU only. `count_distinct` and `top_k` stream too, exactly, by merging their state per row group; `percentile` / `median` keep every non-null value (12 bytes a row), see §5 |
+| **Bigger than RAM** (F-140) | `var scan = scan_parquet(path)`; `Query(scan).where(...).group_by(col("region"), groups=scan.word_count(scan.index("region"))).agg(...).compute()` decodes one row group at a time (only the columns the plan reads) and equals `read_parquet` + the same query exactly; TEXT codes are the whole-file read's (`scan.code_of(c, word)`); CPU only. `count_distinct` and `top_k` stream too, exactly, by merging their state per row group; `percentile` / `median` keep every non-null value (12 bytes a row), see §5 | Edit it with `Frame(scan)` (§3, F-147) |
 | Later | XLSX, JSON lines, Arrow IPC; the Arrow C Data Interface both ways (zero-copy hand-over) |
 
 ## 3. Edits, rows and undo (a session's overlay on shared data)
@@ -76,7 +76,8 @@ f.edited(c, row) -> Bool                              # the cell holds a session
 f.word_count(c) -> Int                                # shared words + words this session added
 f.changed_rows() -> List[Int]                        # rows that differ from the shared base
 f.merge(c, codes, into) -> Int                       # fold text values into one (a cleaning step), undoable
-f.bake() -> Table                                    # edits applied, for saving
+f.bake() -> Table                                    # edits applied, for saving (refused over a scan: use save)
+f.save(path, metadata="", compression=ZSTD)          # the edited rows to a new Parquet file (F-147; below)
 ```
 
 | Need | Why |
@@ -84,6 +85,28 @@ f.bake() -> Table                                    # edits applied, for saving
 | Sparse cell edits, appended rows and removed rows over a read-only base | many sessions share one 100M-row table |
 | One undo log covering sets, appends, removes and merges | the toolbar's Undo |
 | **Edits visible to GPU aggregations without re-uploading** | today: the GPU sums the base, then the CPU applies each changed row as an exact delta (`group_sum` in `frame_gpu.mojo`). MX frame can do this its own way (patch kernel, dirty columns), as long as results include edits. |
+
+### Editing a file bigger than memory (F-147)
+
+```mojo
+var f = Frame(scan_parquet(path))      # the same API as Frame(shared): set, set_null, set_text, append, remove, merge,
+                                       # formula, undo, edited, word_count, text_of, code_of, get, is_null, permutation
+f.set_cache_limit(64 * 1024 * 1024)    # optional; 128 MiB by default
+var r = Query(f).where(...).group_by(...).agg(...).compute()     # streams the file with the edits applied
+f.save("edited.parquet", metadata)     # streams the edited rows out; the file may replace the one the frame reads
+```
+
+| What | How it behaves |
+|---|---|
+| **Exactness** | A query, `get`, `is_null`, `edited`, `permutation` and `save` give exactly what `Frame(read_parquet(path))` with the same edits gives (tested: random sets, nulls, typed text with new words, appends, removes, merges and formulas over a 13-row-group file, again after every undo). TEXT codes are `scan.code_of`'s; session words follow the file's dictionary, which is built on first use, so codes never move. |
+| **`get` / `is_null`** | Read the row group that holds the row through a cache of decoded **column chunks** (one column of one row group, 8 bytes a value plus its null bits). **The bound is `cache_limit` = 128 MiB by default** (`set_cache_limit(bytes)`, `cache_held()`, `cache_loads()`); least recently used chunks go first, and the chunk just read is always kept (so one chunk bigger than the limit still reads: the bound is `max(limit, one chunk)`). A screenful of rows of one group costs one decode per column shown, not per cell; a grid wider than `limit / chunk` columns decodes on every pass, so size the limit to `columns shown x rows per group x 8`. A formula cell reads only the columns it uses. |
+| **Queries** | `Query(frame)` streams the file as `Query(scan)` does (row groups on the workers by blocks, or group by group), each group or block skipping the rows the frame changed or removed (one bit per file row, 12.5 MB per 100M rows), and the changed and appended rows are added once at the end, exactly as for a frame over a table. Merges, formula columns, count_distinct, median, percentile and top_k work too (text order includes the session's words). CPU only. |
+| **`permutation`** | Streams the column one row group at a time but holds **O(rows) keys** (about 50 bytes a row: 20M rows peaked at 1.0 GB, 1.75 s). A formula column evaluates row by row through the cache. |
+| **`bake()`** | **Refused** over a scan ("a Frame over a streamed file cannot be baked into memory: save it to a new file with `save(path)`"). |
+| **`save(path, metadata="", compression=ZSTD)`** | Streams the edited rows into a temporary file and renames it over `path` (atomic; an error removes the temporary file). One output row group per input row group (less its removed rows; a group with none left is skipped), then the appended rows in groups of 1M rows; all the frame's columns of one group are decoded at once, so the memory is one row group's columns, the output group, the file's dictionaries and the edits. A column is written OPTIONAL when the file declared it so or an edit put a null in it. Merged spellings are written as the word they read as; each group's dictionary page holds all the column's words (as `write_parquet` does). Formulas are not stored (their texts go in `metadata`). Over a table, `save` writes `bake()`. |
+| **API change** | `Frame.word_count`, `text_of` and `code_of` now `raises` (a file's dictionary is built on first use and can fail to decode); `get`, `is_null`, `permutation` and `overlay` already did. |
+| **Measured** (12-core, 20M rows, 20 row groups, 567 MB file, 5 columns, 16 MiB cache) | edits 0.8 s for 1,350 edits (a cold chunk per set); query over the edited frame 0.1 s, 70 MB peak; a grid walk (1 row in 997, `get`) 25 ms, 88 MB; `save` 3.1 s, 180 MB peak (a 1M-row group is 40 MB decoded); the process alone is 21 MB. With 250k-row groups the save peaks at 84 MB on a 332 MB file. |
+
 
 ## 4. Formula columns
 
@@ -173,7 +196,7 @@ A scan of the same 20 row-group file (decode included): `sum` 107 ms, `count_dis
 ```mojo
 f.permutation(c, descending=False) -> List[Int]   # row order; the data never moves
 ```
-Stable, over any column including formulas and edited cells; nulls last in both directions, removed rows left out.
+Stable, over any column including formulas and edited cells; nulls last in both directions, removed rows left out. Over a `Frame(scan)` it streams the column but holds O(rows) keys (§3).
 Text sorts alphabetically ignoring ASCII case, byte order breaking ties ("apple" before "Zebra"; pending the owner's
 review). A radix sort over Int64 keys: about 25-30 ms at 1M rows for text and narrow integers, 55-75 ms for full-range
 int64 (informal, F-138a). Next: multi-column sort.

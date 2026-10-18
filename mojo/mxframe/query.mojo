@@ -29,7 +29,7 @@ from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
 from .table import SharedTable, Table, TEXT
-from .parquet import ParquetScan, open_group, MORSEL_UNSUPPORTED
+from .parquet import ParquetScan, open_group, MORSEL_UNSUPPORTED, _copy_bits, _count_bits
 from std.os import getenv
 from .frame import Frame, Overlay, _eval_row
 from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
@@ -200,7 +200,7 @@ struct Query(Movable):
         self.table = frame.base
         self.device = None
         self._window_rows = 0
-        self.scan = None
+        self.scan = frame.scan.copy()                    # a Frame over a scan streams the file with the overlay (F-147)
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
         self.overlay = frame.overlay()
@@ -256,7 +256,14 @@ struct Query(Movable):
         live DeviceTable is attached and the table has `AUTO_GPU_MIN_ROWS` rows or more, else the CPU). The result is
         the same either way, edits of a frame included."""
         if self.scan:
-            return _compute_scan(self.scan.value(), self.nodes, device)
+            var scan_nodes = self.nodes.copy()
+            if self.framed:                              # formulas inlined, merges remapped (as below)
+                for i in range(len(scan_nodes)):
+                    for k in range(len(scan_nodes[i].exprs)):
+                        scan_nodes[i].exprs[k] = self.overlay.expand(scan_nodes[i].exprs[k])
+                    for k in range(len(scan_nodes[i].aggs)):
+                        scan_nodes[i].aggs[k].arg = self.overlay.expand(scan_nodes[i].aggs[k].arg)
+            return _compute_scan(self.scan.value(), scan_nodes, device, self.nodes, self.overlay, self.framed)
         var holistic = False
         for node in self.nodes:
             for a in node.aggs:
@@ -1499,7 +1506,7 @@ struct _MorselRun(Movable):
 
 
 def _morsel_group(scan: ParquetScan, g: Int, used: List[Int], nodes: List[PlanNode], n_slots: Int, groups: Int,
-                  ops: List[Int], block: Int, mut part: QueryResult, mut tally: List[Int]) raises:
+                  ops: List[Int], block: Int, sm: _ScanMask, mut part: QueryResult, mut tally: List[Int]) raises:
     """One worker's row group: decode block after block, run the kernel (one thread) on each, fold the block's partial
     into the group's in block order."""
     var reader = open_group(scan, g, used, block)
@@ -1509,24 +1516,28 @@ def _morsel_group(scan: ParquetScan, g: Int, used: List[Int], nodes: List[PlanNo
         bt.cols[k].values = List[Int64](unsafe_uninit_length=block)
     var shared = bt^.share()
     part = _identity_partial(n_slots, groups, ops)
+    var gm = _group_mask(sm, g, reader.rows)         # F-147: the group's frame mask; a block starts at a multiple of 8
+    var gm_addr = Int(gm.unsafe_ptr()) if len(gm) > 0 else 0
     while True:
+        var b0 = reader.at
         var rows = reader.next_block(shared._table[])
         if rows == 0:
             break
-        var r = _run_cpu(shared, _lower(shared, nodes, True, False), 0, 0, rows, 0, 1)
+        var r = _run_cpu(shared, _lower(shared, nodes, True, gm_addr != 0), gm_addr + b0 // 8 if gm_addr != 0 else 0, 0, rows, 0, 1)
         _merge_partial(part, r, ops)
         for k in range(len(used)):
             tally[k] += shared._table[].cols[k].nulls
+    _ = gm^
 
 
 def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], todo: List[Int], n_slots: Int, groups: Int,
-                  ops: List[Int]) raises -> _MorselRun:
+                  ops: List[Int], sm: _ScanMask) raises -> _MorselRun:
     """Every row group of `todo` on the workers, one task per group; the results per group, in order."""
     var run = _MorselRun()
     var block = SCAN_BLOCK_ROWS
     var env_rows = _morsel_env("MXFRAME_MORSEL_ROWS")
     if env_rows.byte_length() > 0:
-        block = max(64, Int(env_rows))
+        block = max(64, Int(env_rows)) // 8 * 8      # a multiple of 8: a block's frame mask starts on a byte (F-147)
     for _ in range(len(todo)):
         run.parts.append(QueryResult())
         run.errs.append(String())
@@ -1536,6 +1547,7 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
     var up = Int(UnsafePointer(to=used))
     var tp = Int(UnsafePointer(to=todo))
     var op = Int(UnsafePointer(to=ops))
+    var mp = Int(UnsafePointer(to=sm))
     var pa = Int(run.parts.unsafe_ptr())
     var ea = Int(run.errs.unsafe_ptr())
     var na = Int(run.nulls.unsafe_ptr())
@@ -1546,6 +1558,7 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
                           g, Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=up)[],
                           Pointer[List[PlanNode], MutUntrackedOrigin](unsafe_from_address=np)[], n_slots, groups,
                           Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=op)[], block,
+                          Pointer[_ScanMask, MutUntrackedOrigin](unsafe_from_address=mp)[],
                           (Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=pa) + i)[],
                           (Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=na) + i)[])
         except e:
@@ -1558,23 +1571,57 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
     return run^
 
 
-def _run_part(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates) raises -> QueryResult:
-    """One row group of a scan: the plan lowered on its own table, run on the CPU (a holistic plan feeds `hs`)."""
-    var p = _lower(t, nodes, True, False)
+def _run_part(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, mask_addr: Int = 0) raises -> QueryResult:
+    """One row group of a scan: the plan lowered on its own table, run on the CPU (a holistic plan feeds `hs`).
+    `mask_addr` (F-147): the frame mask of this group's rows, 0 for none."""
+    var p = _lower(t, nodes, True, mask_addr != 0)
     if p.mat:
-        return _run_mat(t, p, 0, hs)
-    return _run_cpu(t, p, 0)
+        return _run_mat(t, p, mask_addr, hs)
+    return _run_cpu(t, p, mask_addr)
+
+
+# ---- F-147: a frame over a scan. The frame mask is one bitmap over the whole file; a row group (or a block of one)
+# takes its slice, copied to start at bit 0, and the changed rows' values are added once after the last group.
+
+struct _ScanMask(Copyable, Movable):
+    var addr: Int                    # the frame mask's address (bit i = file row i is unchanged), 0: no row changed
+    var starts: List[Int]            # the first file row of each row group
+
+    def __init__(out self):
+        self.addr = 0
+        self.starts = List[Int]()
+
+
+def _group_mask(m: _ScanMask, g: Int, rows: Int) -> List[UInt8]:
+    """Row group g's slice of the frame mask (empty: nothing in it changed or there is no mask), with 8 spare bytes
+    so a kernel reading a word past the last row stays inside."""
+    var out = List[UInt8]()
+    if m.addr == 0:
+        return out^
+    out = List[UInt8](length=(rows + 7) // 8 + 8, fill=0xFF)
+    var src = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=m.addr)
+    var dst = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(out.unsafe_ptr()))
+    _copy_bits(dst, 0, src, m.starts[g], rows)
+    if _count_bits(dst, rows) == rows:               # nothing in this group changed: no mask, no masked program
+        return List[UInt8]()
+    return out^
 
 
 # ── a Parquet scan: one row group at a time (F-140) ──────────────────────────────────────────────────
 
-def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises -> QueryResult:
+def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: List[PlanNode], o: Overlay,
+                  framed: Bool) raises -> QueryResult:
     """The plan over a file, a row group at a time: decode the columns the plan reads, run the CPU kernel on that
     group, merge its partial result into the running one (sums and counts add, min / max combine; a sum passing
     int64 raises, as one run does). Each group is lowered on its own table, so its null-free columns skip the null
     machinery; every group is lowered with a non-null count per aggregate (`force_counts`), so the partial results
     all have one layout, and the merged result is laid out at the end as a whole-file run would have (a count slot
-    only for an aggregate over a column that holds a null anywhere in the file)."""
+    only for an aggregate over a column that holds a null anywhere in the file).
+
+    F-147, a Frame over the scan (`framed`; `orig` is the plan as built, `nodes` with the frame's formulas and merges
+    expanded, `o` its overlay): each group (or block of one) skips the rows the frame changed or removed (its slice
+    of `o.mask`), and after the last group the frame's changed and appended rows are added (`_add_delta`), exactly as
+    `Query.compute` does for a Frame over a table."""
     if device == GPU:
         raise Error("device GPU: a Parquet scan runs on the CPU, one row group at a time")
     var t0 = perf_counter_ns()
@@ -1615,14 +1662,21 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             todo.append(g)
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var hs = _build_states(nodes, nodes, scan.schema, List[List[String]](), Optional[ParquetScan](scan.copy()), scan.rows())    # (text order needs the words)
+    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows())    # (text order needs the words)
+    var sm = _ScanMask()                                                      # F-147
+    if len(o.mask) > 0:
+        sm.addr = Int(o.mask.unsafe_ptr())
+        var at = 0
+        for g in range(scan.row_groups()):
+            sm.starts.append(at)
+            at += scan.group_rows(g)
     # ---- F-149: morsel-driven scan (the one place the group-at-a-time loop below is bypassed) -----------------------
     # With at least as many row groups as workers, each worker takes whole row groups and runs the kernel on blocks of
     # them (`_scan_morsels`); the per-group partials come back in row-group order and are merged and raised in that order,
     # exactly as the loop below would. A plan with holistic aggregates (distinct, percentile, top_k) keeps the loop below:
     # its states are fed in row-group order.
     if not shape.mat and _use_morsels(len(todo)):
-        var morsels = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops)
+        var morsels = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops, sm)
         if morsels.ok:
             for i in range(len(todo)):
                 if morsels.errs[i].byte_length() > 0:
@@ -1641,6 +1695,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
         for k in range(len(used)):
             nulls[k] += cur.null_count(k)
         var part = cur^.share()
+        var gm = _group_mask(sm, todo[ix], scan.group_rows(todo[ix]))        # F-147
+        var gm_addr = Int(gm.unsafe_ptr()) if len(gm) > 0 else 0
         var r = QueryResult()
         var nxt = Table.empty()
         var pending = String()
@@ -1665,7 +1721,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
                         var tbl = Pointer[SharedTable, MutUntrackedOrigin](unsafe_from_address=pp)[]
                         var nds = Pointer[List[PlanNode], MutUntrackedOrigin](unsafe_from_address=np_nodes)[].copy()
                         Pointer[QueryResult, MutUntrackedOrigin](unsafe_from_address=rp)[] = _run_part(
-                            tbl, nds, Pointer[HolStates, MutUntrackedOrigin](unsafe_from_address=hsp)[])
+                            tbl, nds, Pointer[HolStates, MutUntrackedOrigin](unsafe_from_address=hsp)[], gm_addr)
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e0p)[] = String(e)
                 else:
@@ -1680,8 +1736,9 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
                 raise Error(e0)
             pending = e1^                            # the next group's decode error waits until this group is merged
         else:
-            r = _run_part(part, nodes, hs)
+            r = _run_part(part, nodes, hs, gm_addr)
         _ = part^
+        _ = gm^
         cur = nxt^
         _merge_partial(acc, r, ops)
         if pending.byte_length() > 0:                # only now, after this group's partial was merged (its overflow comes first)
@@ -1691,7 +1748,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
     for k in range(len(used)):
         _ = proto.add_column(scan.name(used[k]), scan.kind(used[k]), scale=scan.scale(used[k]))
         proto.cols[k].nulls = nulls[k]
-    var want = _lower(proto^.share(), nodes, False, False)
+    var want = _lower(proto^.share(), nodes, framed, False)        # a frame's query always counts non-null rows (F-147)
     var out = QueryResult()
     out.kinds = want.kinds.copy()
     out.slot_of = want.slot_of.copy()
@@ -1705,6 +1762,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int) raises 
             out.slots[want.count_slot_of[i]] = acc.slots[shape.count_slot_of[i]].copy()
     out.counts = acc.counts.copy()
     out.hol_of = List[Int](length=len(out.kinds), fill=-1)
+    if framed and len(o.delta) > 0:                          # F-147: the frame's changed and appended rows
+        _add_delta(out, scan.schema, nodes, o, hs)
     if shape.mat:
         _finish_holistic(out, hs)
     for i in range(len(out.kinds)):
