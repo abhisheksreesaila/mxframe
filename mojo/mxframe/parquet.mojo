@@ -1039,6 +1039,7 @@ struct _Slices(Copyable, Movable):
 
 struct _Page(Copyable, Movable):
     var addr: Int                    # the page body (compressed) in the file or its mapping
+    var foff: Int                    # and its offset in the file
     var csize: Int
     var usize: Int
     var nvals: Int
@@ -1063,8 +1064,10 @@ struct _Page(Copyable, Movable):
     var sl: _Slices
 
     def __init__(out self, addr: Int, csize: Int, usize: Int, nvals: Int, encoding: Int, v2: Bool, def_len: Int,
-                 def_enc: Int, v2_compressed: Bool, ctx: Int, row: Int, is_dict: Bool = False, defer: Bool = False):
+                 def_enc: Int, v2_compressed: Bool, ctx: Int, row: Int, is_dict: Bool = False, defer: Bool = False,
+                 foff: Int = 0):
         self.addr = addr
+        self.foff = foff
         self.csize = csize
         self.usize = usize
         self.nvals = nvals
@@ -1816,7 +1819,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
                             tbl, True)
                 _ = page^
             else:                                        # a job of the first parallel round
-                pages.append(_Page(base + body_at, csize, usize, nvals, ENC_PLAIN, False, 0, ENC_RLE, True, ctx_at, 0, is_dict=True))
+                pages.append(_Page(base + body_at, csize, usize, nvals, ENC_PLAIN, False, 0, ENC_RLE, True, ctx_at, 0, is_dict=True, foff=body_at))
             continue
         if ptype != PAGE_DATA and ptype != PAGE_DATA_V2:
             continue                                     # an index page: not needed
@@ -1828,7 +1831,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
             continue
         var defer = leaf.ptype == PT_BYTE_ARRAY and ctx.add and encoding == ENC_PLAIN
         pages.append(_Page(base + body_at, csize, usize, nvals, encoding, ptype == PAGE_DATA_V2, def_len, def_enc,
-                           v2_compressed, ctx_at, ctx.row0 + done, defer=defer))
+                           v2_compressed, ctx_at, ctx.row0 + done, defer=defer, foff=body_at))
         done += nvals
 
 
@@ -2145,6 +2148,11 @@ struct _Mapped(Movable):
     var span: Int
     var data: Int                    # the address of the byte at `offset`
 
+    def __init__(out self):
+        self.addr = 0
+        self.span = 0
+        self.data = 0
+
     def __init__(out self, fd: Int, offset: Int, length: Int, path: String) raises:
         var start = offset - offset % _MAP_ALIGN
         self.span = length + (offset - start)
@@ -2361,7 +2369,8 @@ struct GroupReader(Movable):
     booleans, delta) is decoded whole when its first block is wanted and copied block by block; nothing here uses the
     thread pool."""
     var scan: ParquetScan
-    var maps: List[_Mapped]
+    var maps: List[_Mapped]          # the chunks, while the headers are walked and the dictionaries decoded
+    var page_maps: List[_Mapped]     # per page: its bytes, mapped while its blocks are read (the resident set is a page)
     var ctxs: List[_Ctx]
     var pages: List[_Page]
     var of_col: List[List[Int]]      # per column read: its data pages, in row order
@@ -2374,6 +2383,7 @@ struct GroupReader(Movable):
     def __init__(out self, var scan: ParquetScan, cols: List[Int], block: Int):
         self.scan = scan^
         self.maps = List[_Mapped]()
+        self.page_maps = List[_Mapped]()
         self.ctxs = List[_Ctx]()
         self.pages = List[_Page]()
         self.of_col = List[List[Int]]()
@@ -2409,6 +2419,9 @@ struct GroupReader(Movable):
                 if p.nvals == 0 or p.row + p.nvals <= b0:
                     ci += 1
                     continue
+                if p.csize > 0 and self.page_maps[self.of_col[k][ci]].span == 0:      # first block of the page: map its bytes
+                    self.page_maps[self.of_col[k][ci]] = _Mapped(info.file._get_raw_fd(), p.foff, p.csize, info.path)
+                    p.addr = self.page_maps[self.of_col[k][ci]].data
                 if p.whole:
                     if len(p.values) == 0:               # first block of this page: decode all of it
                         p.values = List[Int64](unsafe_uninit_length=p.nvals)
@@ -2426,6 +2439,7 @@ struct GroupReader(Movable):
                     if p.row + p.nvals <= b1:            # the page's last block
                         p.values = List[Int64]()
                         p.bits = List[UInt8]()
+                        self.page_maps[self.of_col[k][ci]] = _Mapped()
                         ci += 1
                         continue
                     break
@@ -2451,6 +2465,7 @@ struct GroupReader(Movable):
                 if p.sl.next >= len(p.sl.v):             # the page's last block: let go of it
                     p.keep = List[UInt8]()
                     p.bits = List[UInt8]()
+                    self.page_maps[self.of_col[k][ci]] = _Mapped()
                     ci += 1
                 else:
                     break
@@ -2491,6 +2506,9 @@ def open_group(scan: ParquetScan, g: Int, cols: List[Int], block: Int) raises ->
         if r.pages[i].is_dict:
             var k = r.pages[i].ctx
             _decode_dict_page(r.pages[i], r.ctxs[k], info.leaves[cols[k]], 0)
+    r.maps = List[_Mapped]()                             # the chunks are let go: pages are mapped one at a time from here
+    for _ in range(len(r.pages)):
+        r.page_maps.append(_Mapped())
     for i in range(len(r.pages)):
         ref p = r.pages[i]
         if p.is_dict:

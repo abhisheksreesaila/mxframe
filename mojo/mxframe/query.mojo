@@ -1016,7 +1016,7 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
 
 # ── a Parquet scan by morsels: a worker per row group, blocks of ~64k rows (F-149) ───────────────────
 
-comptime MORSEL_ROWS = 65536
+comptime MORSEL_ROWS = 32768
 
 
 def _morsel_env(name: String) -> String:
