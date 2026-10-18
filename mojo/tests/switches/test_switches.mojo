@@ -5,8 +5,9 @@
 from std.sys import argv
 from std.os import getenv
 from mxframe import (Table, SharedTable, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
-                     gpu_available, read_csv, write_parquet, read_parquet, ZSTD, SNAPPY)
+                     gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, ZSTD, SNAPPY)
 from mxframe.query import AUTO_GPU_MIN_ROWS
+from mxframe.kernels._fpenv import core_count
 
 
 def expect(cond: Bool, what: String) raises:
@@ -67,6 +68,23 @@ def main() raises:
     for i in range(r.table.rows()):
         total += Int(r.table.get(1, i))
     expect(total == 149_997, "read_csv values: " + String(total))      # 7142 full cycles of 0..6 (21 each) plus 0+1+2+3+4+5 = 15
+
+    # the serial `par` / `par_n` really run every chunk: many small chunks (quoted newlines across their edges)
+    # read cell for cell as one chunk does
+    expect(core_count() == 1, "core_count() is 1 on a serial build: " + String(core_count()))
+    var qcsv = String("/tmp/mxframe-switches-quoted.csv")
+    var qtext = String("id,note,n\n")
+    for i in range(20_000):
+        qtext += String(i) + ",\"line " + String(i) + "\nnext, " + String(i % 13) + "\"," + String(i % 5) + "\n"
+    with open(qcsv, "w") as f:
+        f.write(qtext)
+    var one = read_csv(qcsv, CsvOptions(threads=1))
+    var many = read_csv(qcsv, CsvOptions(threads=4, chunk_bytes=4096))
+    expect(one.table.rows() == 20_000 and many.table.rows() == 20_000,
+           "chunked rows: " + String(one.table.rows()) + " / " + String(many.table.rows()))
+    for i in range(20_000):
+        expect(many.table.get(0, i) == one.table.get(0, i) and many.table.get(2, i) == one.table.get(2, i) and
+               many.table.text_of(1, Int(many.table.get(1, i))) == one.table.text_of(1, Int(one.table.get(1, i))), "chunked read equals one chunk at row " + String(i))
 
     # no codecs: saves UNCOMPRESSED, whatever is asked for, and the file reads back
     var path = String("/tmp/mxframe-switches.parquet")

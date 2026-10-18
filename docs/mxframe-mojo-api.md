@@ -139,6 +139,8 @@ int64 (informal, F-138a). Next: multi-column sort.
 - A device copy of a table, **uploaded once per process**, shared by every session; `release()` to give it back when a document closes.
 - Values over 32 bits must not break it (today the stand-in uploads int32 and refuses to upload otherwise; a single amount over $21.4M, stored in cents, doesn't fit).
 - Share the app's `DeviceContext` so the app's own kernels (charts, point clouds) and MX frame's use the same device memory.
+- `compute(AUTO)` falls back to the CPU only when the device cannot hold the query's buffers or the kernel declines the program; `QueryResult.fallback_reason` says which ("" when it ran where it was sent). `compute(GPU)` never falls back.
+- A build without a GPU (every non-Linux target, or `-D MXFRAME_NO_GPU`): `gpu_available()` is False, `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build", AUTO is the CPU (see `mojo/README.md`, build switches).
 - Later: data bigger than GPU or host memory (chunked, streamed); Apple GPUs (Metal) without Python.
 
 ## 8. Later (Query and Explore modes)

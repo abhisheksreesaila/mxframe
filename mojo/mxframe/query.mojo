@@ -830,8 +830,7 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
 
     `strict` (device=GPU) raises on every failure. On AUTO only two things send the query to the CPU, and `fallback`
     says which: the device cannot hold the query's buffers (an allocation failed), or the kernel declined the
-    program (needs more shared memory than a block has, or the reproducible mode's group table does not fit: -5 /
-    -6). A launch error, an illegal address or an int64 overflow is a bug or an answer: it always raises."""
+    program (needs more shared memory than a block has: -5). A launch error, an illegal address or an int64 overflow is a bug or an answer: it always raises."""
     var ctx = dt.context()
     var ins = p.pred.copy()
     ins.extend(p.body.copy())
@@ -912,9 +911,8 @@ def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], str
                               Int(d_cnt.unsafe_ptr()), Int(d_ident.unsafe_ptr()), Int(d_scratch.unsafe_ptr()),
                               n_regs, len(code), agg_base, n_blocks, 1, 0, Int(d_ovf.unsafe_ptr()), True)
     if rc != 0:
-        if not strict and (rc == -5 or rc == -6):
-            fallback = "the GPU kernel declined the program (code " + String(rc) + ": " + (
-                "it needs more shared memory than a block has" if rc == -5 else "the group table does not fit") + ")"
+        if not strict and rc == -5:                       # (-6 is the reproducible mode's, which this API never asks for)
+            fallback = "the GPU kernel declined the program (code -5: it needs more shared memory than a block has)"
             return None                                   # the CPU answers
         raise Error("the GPU kernel failed with code " + String(rc) +
                     (" (the query needs more GPU shared memory than a block has: " + String(n_regs) + " registers, " + String(A) + " slots, " + String(G) + " groups)"

@@ -144,7 +144,9 @@ def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
         out.resize(size, 0)
         return out^
     comptime if NO_CODECS:
-        raise Error("this build has no zstd or snappy, so it cannot read this page")
+        if codec == ZSTD or codec == SNAPPY:
+            raise Error("this build has no zstd or snappy, so it cannot read this page")
+        raise Error("compression codec " + String(codec) + " is not supported (this build reads UNCOMPRESSED only)")
     else:
         if codec == ZSTD:
             var stated = external_call["ZSTD_getFrameContentSize", UInt64](src, n)

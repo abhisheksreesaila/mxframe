@@ -11,6 +11,8 @@ workers through `par` / `par_n` / `sync_par` below, which reset MXCSR to the IEE
 F-138b: the serial build. An Apple app (the omxplorer Mac build) links no Mojo async runtime, so every task runs in
 a plain loop on the calling thread and `core_count()` is 1. SERIAL is on for any target but Linux, and
 `-D MXFRAME_SERIAL` turns it on for Linux too (to test it). A Linux build with the switch off is unchanged.
+Tasks must never wait on one another (a barrier, a spin on another task's flag): in the serial build the waiting
+task runs first and never returns.
 """
 
 from max.algorithm import parallelize, sync_parallelize

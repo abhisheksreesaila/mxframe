@@ -21,7 +21,8 @@ the `-I` path (a consumer then fails with "unable to locate module"), and a shar
 
 Three compile-time switches, read when the app builds (`mojo build ... -D NAME`), not when the package is built. Each
 is **on for every target but Linux** (an Apple object needs no flags) and `-D` turns it on for Linux too, which is how
-`pixi run mojo-test` tests the other side (`mojo/tests/switches/test_switches.mojo`).
+`pixi run mojo-test` tests the other side (`mojo/tests/switches/test_switches.mojo`). **Android counts as Linux** to
+Mojo: an Android build gets the GPU code, the thread pool and the codecs unless it passes all three `-D` flags.
 
 | Switch | Off (Linux default) | On |
 |---|---|---|

@@ -27,7 +27,7 @@ def run() raises:
         print(e)
     write_parquet("probe.parquet", shared, "{}", UNCOMPRESSED)
     try:
-        write_parquet("probe-z.parquet", shared, "{}", ZSTD)     # refused with a readable error on a no-codec build
+        write_parquet("probe-z.parquet", shared, "{}", ZSTD)     # saved UNCOMPRESSED on a no-codec build
     except e:
         print(e)
     var back = read_parquet("probe.parquet")
