@@ -746,4 +746,6 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     out.set_meta = e.set_meta.copy()
     out.instr = (len(e.p.pred) + len(e.p.body) + len(e.p.aggs)) // 5
     out.p = e^.take_program()
+    out.p.set_bytes = out.set_bytes.copy()
+    out.p.set_meta = out.set_meta.copy()
     return out^
