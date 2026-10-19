@@ -1619,8 +1619,8 @@ omxcore = the core engine that apps (omxplorer, …) build on; nobody depends on
 - [ ] repo renamed (GitHub redirects old links), docs site URL, README / docs / internals pages, test names and paths that say mxframe; the app (omxplorer) told how to re-vendor
 - [ ] positioning everywhere: "a compute engine (CPU and GPU) with persistence to open Parquet files", never "a database"
 
-## M9 Open table formats: safe changes on plain Parquet (Delta Lake / Apache Iceberg) [todo]
-Owner, 2026-10-19 (first principles): no file format of our own; Parquet is the storage. When an app needs incremental saves, crash safety, versions or several writers, follow the open table formats: Parquet data files + a commit log / manifest. Order to decide (read first, then write):
+## M9 Open table formats: safe changes on plain Parquet (mimic Delta Lake) [parked: only when an app needs it]
+Owner, 2026-10-19 (first principles): if omxcore ever needs to be database-like, the work mimics Delta Lake (Parquet + its transaction log): no new format, and no database work until an app needs it; the focus stays on the core engine. No file format of our own; Parquet is the storage. When an app needs incremental saves, crash safety, versions or several writers, follow the open table formats: Parquet data files + a commit log / manifest. Order to decide (read first, then write):
 - [ ] read Delta Lake and Iceberg tables (the log / manifest → the live Parquet files, deletion vectors, schema evolution) as a streamed source; time travel by version
 - [ ] write: append and overwrite commits, then row-level changes as small new files + a commit (a Frame's edits become a commit, not a whole-file rewrite); optimistic concurrency for several writers
 - [ ] omxplorer-style apps get autosave and history from it, as a plugin over these primitives
