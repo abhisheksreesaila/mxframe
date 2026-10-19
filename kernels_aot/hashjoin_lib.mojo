@@ -4,6 +4,7 @@ caller that is not Mojo. The kernel itself is `hashjoin_cpu.mojo`; this file onl
 
     h = mx_hj_build(keys, ok, n, threads)              keys Int64[n], ok UInt8[n] or 0; a handle (> 0), or a negative error
     mx_hj_build_presence(keys, ok, n, threads)         the same, for a map only mx_hj_probe_select will read (a semi or anti join): cheaper to build
+    (a presence map answers mx_hj_probe_select only: the other probes return -34)
     mx_hj_info(h, out)                                 out Int64[4]: mode (0 empty, 1 direct array, 2 hash table), usable rows, 1 when keys are unique, bytes held
     mx_hj_probe_unique(h, keys, ok, n, out, threads)   unique-key maps: out Int32[n] gets each probe row's build row or -1
     mx_hj_probe_pairs(h, keys, ok, n, threads, budget_rows, out)
@@ -28,6 +29,7 @@ from hashjoin_cpu import JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_
 comptime ABI_VERSION = 1
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
 comptime HEADER = 16
+comptime E_PRESENCE = -34           # a presence-only map (`mx_hj_build_presence`) was asked for build rows
 comptime E_BAD_HANDLE = -33          # a handle that is not a map (0, or an error code from mx_hj_build)
 
 
@@ -128,6 +130,8 @@ def mx_hj_info(handle: Int, out_a: Int) abi("C") -> Int:
 def mx_hj_probe_unique(handle: Int, keys_a: Int, ok_a: Int, n: Int, out_a: Int, threads: Int) abi("C") -> Int:
     if handle <= 0:
         return E_BAD_HANDLE
+    if LP(unsafe_from_address=handle)[15] != 0:
+        return E_PRESENCE
     var m = _unbox(handle)
     var unique = m.unique
     if unique:
@@ -140,6 +144,8 @@ def mx_hj_probe_unique(handle: Int, keys_a: Int, ok_a: Int, n: Int, out_a: Int, 
 def mx_hj_probe_pairs(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int) abi("C") -> Int:
     if handle <= 0:
         return E_BAD_HANDLE
+    if LP(unsafe_from_address=handle)[15] != 0:
+        return E_PRESENCE
     var m = _unbox(handle)
     var rc = hj_probe_pairs(m, keys_a, ok_a, n, threads, budget_rows, out_a)
     _detach(m)
@@ -150,6 +156,8 @@ def mx_hj_probe_pairs(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int,
 def mx_hj_probe_pairs_outer(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int) abi("C") -> Int:
     if handle <= 0:
         return E_BAD_HANDLE
+    if LP(unsafe_from_address=handle)[15] != 0:
+        return E_PRESENCE
     var m = _unbox(handle)
     var rc = hj_probe_pairs(m, keys_a, ok_a, n, threads, budget_rows, out_a, True)
     _detach(m)

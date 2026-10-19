@@ -165,3 +165,17 @@ def test_a_presence_map_answers_semi_and_anti_selects(lib):
     assert run_select(lib, h, [5, 7, 9, 1000, 6, 4], 2) == [0, 2, 3, 4]
     assert run_select(lib, h, [5, 7, 9, 1000, 6, 4], 3) == [1, 5]
     lib.mx_hj_free(ctypes.c_long(h))
+
+
+def test_a_presence_map_refuses_probes_that_return_build_rows(lib):
+    k = array("q", [1, 2, 3])
+    h = lib.mx_hj_build_presence(ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(3), ctypes.c_long(1))
+    out3 = array("q", [0, 0, 0])
+    o = array("i", [0, 0, 0])
+    assert lib.mx_hj_probe_unique(ctypes.c_long(h), ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(3), ctypes.c_long(addr(o)), ctypes.c_long(1)) == -34
+    assert lib.mx_hj_probe_pairs(ctypes.c_long(h), ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(3), ctypes.c_long(1), ctypes.c_long(10),
+                                 ctypes.c_long(addr(out3))) == -34
+    assert lib.mx_hj_probe_pairs_outer(ctypes.c_long(h), ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(3), ctypes.c_long(1), ctypes.c_long(10),
+                                       ctypes.c_long(addr(out3))) == -34
+    assert run_select(lib, h, [1, 9], 2) == [0]                  # the select still works
+    lib.mx_hj_free(ctypes.c_long(h))

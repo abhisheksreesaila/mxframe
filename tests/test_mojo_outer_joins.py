@@ -214,6 +214,9 @@ IN_LISTS = [
     "SELECT ck FROM cust WHERE ck IN (SELECT ck FROM nothing)",
     "SELECT count(*) FROM nothing_c WHERE ck IN (SELECT ck FROM ords)",
     "SELECT count(*), sum(ck) FROM cust WHERE seg IN (SELECT seg FROM cust WHERE ck < 10)",           # the same table on both sides
+    "SELECT count(*) FROM cust c WHERE EXISTS (SELECT * FROM cust c2 WHERE c2.seg = c.seg AND c2.ck < 10)",
+    "SELECT count(*) FROM cust WHERE EXISTS (SELECT * FROM cust c2 WHERE c2.seg = cust.seg AND c2.ck < c2.seg)",
+    "SELECT count(*) FROM cust WHERE ck IN (SELECT c2.ck FROM cust c2 WHERE c2.seg = 3)",
     "SELECT count(*) FROM cust WHERE ck NOT IN (SELECT ck FROM cust WHERE seg > 20)",
 ]
 
@@ -234,6 +237,7 @@ NOT_IN = [
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM nothing)", "an empty list keeps a NULL probe key", "the list is empty"),
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM ords)", "ords.ck holds NULLs", "the list holds a NULL"),
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM ords WHERE ck IS NOT NULL)", "the NULLs filtered out of the list", "a NULL key is dropped"),
+    ("SELECT count(*) FROM cust c WHERE NOT EXISTS (SELECT * FROM cust c2 WHERE c2.seg = c.seg AND c2.ck < 10)", "the same table, own alias", "join: anti"),
     ("SELECT count(*) FROM nothing_c WHERE ck NOT IN (SELECT ck FROM nonull)", "an empty probe side", "join: anti (null-aware)"),
     ("SELECT s, count(*) FROM cust WHERE s NOT IN (SELECT tag FROM ords) GROUP BY s", "words the list lacks are kept, a NULL text key is dropped", "a NULL key is dropped"),
     ("SELECT s, count(*) FROM fact WHERE s NOT IN (SELECT tag FROM ords) GROUP BY s", "a word absent from the list's dictionary is not a NULL", "a NULL key is dropped"),
