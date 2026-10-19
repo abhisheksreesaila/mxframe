@@ -20,16 +20,16 @@ from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, D
 from .frame import NULL_EDIT, Overlay, text_ranks, _radix_order, _text_less
 from .parquet import ParquetScan
 from .query import (Program, QueryResult, _run_cpu, _run_mat, _merge_partial, _identity_partial, _ScanMask, _group_mask,
-                    OVERFLOW_MESSAGE, CPU, MAGIC, A_SUM, A_MIN, A_MAX)
+                    OVERFLOW_MESSAGE, CPU, MAGIC, A_SUM, A_MIN, A_MAX, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS)
 from .kernels._fpenv import core_count
-from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front
+from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
-from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN
+from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks
 from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, BExpr, AggSpec, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_QUANTILE, K_NULL, kind_name, pow10_checked)
 from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas)
-from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, bkey
+from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, bkey, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, eval_post, float_bits, ld_div
 
 
@@ -583,7 +583,17 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             var rows = acc.counts[g]
             var nonnull = rows - (acc.slots[ns][g] if ns >= 0 else 0)
             var f = sp_a.func
-            if f == F_COUNT_STAR:
+            if sp_a.hol:                                          # the holistic states: count(DISTINCT), median, quantile_disc, min / max of TEXT
+                var present = hres.counts[h][g] > 0
+                if f == F_COUNT_DISTINCT:
+                    vc.v[i] = Int64(hres.vals[h][g])
+                elif not present:
+                    vc.set_null(i)
+                elif f == F_MEDIAN and sp_a.kind == FLOAT.value:
+                    vc.v[i] = float_bits(Float64(hres.vals[h][g]) / 10.0)
+                else:
+                    vc.v[i] = Int64(hres.vals[h][g])
+            elif f == F_COUNT_STAR:
                 vc.v[i] = Int64(rows)
             elif f == F_COUNT:
                 vc.v[i] = Int64(nonnull)
@@ -598,16 +608,6 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                 else:
                     var den = UInt128(nonnull) * UInt128(Int(pow10_checked(q.rexprs[sp_a.arg].scale)))
                     vc.v[i] = float_bits(ld_div(Int64(acc.slots[vs][g]), den))
-            else:                                                 # count(DISTINCT), median, quantile_disc: the holistic states
-                var present = hres.counts[h][g] > 0
-                if f == F_COUNT_DISTINCT:
-                    vc.v[i] = Int64(hres.vals[h][g])
-                elif not present:
-                    vc.set_null(i)
-                elif f == F_MEDIAN and sp_a.kind == FLOAT.value:
-                    vc.v[i] = float_bits(Float64(hres.vals[h][g]) / 10.0)
-                else:
-                    vc.v[i] = Int64(hres.vals[h][g])
         if sp_a.kind == TEXT.value:
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
@@ -658,7 +658,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
 
 # ── running ──────────────────────────────────────────────────────────────────────────────────────────
 
-def _holistic_states(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, dicts: DictAccess, rows: Int) raises -> HolStates:
+def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAccess, rows: Int) raises -> HolStates:
     var specs = List[HolSpec]()
     var ranks = List[List[Int64]]()
     for _ in range(sp.n_src):
@@ -669,115 +669,91 @@ def _holistic_states(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, dicts: D
         ref sa = q.aggs[a]
         var kind = A_DISTINCT if sa.func == F_COUNT_DISTINCT else A_MEDIAN if sa.func == F_MEDIAN else A_PCT
         specs.append(HolSpec(a, kind, sa.p, 0, sp.agg_src[a]))
-        if sa.func == F_QUANTILE and q.rexprs[sa.arg].kind == TEXT.value and len(ranks[sp.agg_src[a]]) == 0:
+        if sa.func != F_COUNT_DISTINCT and q.rexprs[sa.arg].kind == TEXT.value and len(ranks[sp.agg_src[a]]) == 0:
             var c = Int(q.rexprs[sa.arg].value)
             var words = List[String]()
             for k in range(dicts.count(c)):
                 words.append(dicts.word(c, k))
             ranks[sp.agg_src[a]] = text_ranks(words)
-    return HolStates(plan.domain if plan.group == G_DENSE else 1, specs^, ranks^, rows)
+    return HolStates(groups, specs^, ranks^, rows)
 
 
 def _ones_mask(rows: Int) -> List[UInt8]:
     return List[UInt8](length=(rows + 7) // 8 + 8, fill=0xFF)
 
 
-def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
-             mut notes: List[String]) raises -> Table:
-    var n_cols = src.table.columns()
-    var used = collect_columns(q)
-    var scan_mode = src.kind == SRC_SCAN
-    # how the program sees the chunks: a table or frame as it is, a scan's row groups holding only the columns used
-    var pos = List[Int](length=n_cols, fill=-1)
-    var chunk_cols = n_cols
-    if scan_mode:
-        if len(used) == 0 and n_cols > 0:
-            used.append(0)
-        for k in range(len(used)):
-            pos[used[k]] = k
-        chunk_cols = len(used)
-    else:
-        for c in range(n_cols):
-            pos[c] = c
-    var nullable = List[Bool]()
-    for c in range(n_cols):
-        nullable.append(scan_mode or src.table.null_count(c) > 0 or _delta_nulls(src, c))
-    var masked = len(src.overlay.mask) > 0
-    var t_lower = perf_counter_ns()
-    var sp = lower_sql(q, plan, nullable^, pos.copy(), chunk_cols, DictAccess(src.table, src.scan, dicts.extra), _alias_lists(src), masked)
-    notes.append("kernel: " + String(sp.instr) + " instructions a row" + (", " + String(len(sp.set_meta) // 3) + " sets" if len(sp.set_meta) > 0 else "") +
-                 " (" + String(sp.p.n_slots) + (" slot" if sp.p.n_slots == 1 else " slots") + ")")
-    var ops = sp.slot_ops.copy()
-    var threads = opts.threads
-    var hs = _holistic_states(q, plan, sp, dicts, -1 if src.kind != SRC_TABLE else src.rows()) if sp.p.mat else HolStates(1, List[HolSpec](), List[List[Int64]]())
-    var domain = plan.domain if plan.group == G_DENSE else 1
-    var acc = Partial()
-    var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
-    var nchunks = 0
-    var delta_rows = len(src.overlay.delta)
+struct _Chunks(Movable):
+    """The chunks a source is read in, one at a time: a table (its rows, then the frame's changed rows), or a scan's row
+    groups (then the changed rows). `load(i)` gives chunk i and sets `mask_addr` for it."""
+    var groups: List[Int]            # a scan: the row groups with rows
+    var base: Bool                   # a table or frame: the shared table has rows
+    var has_delta: Bool
+    var scan_mode: Bool
+    var used: List[Int]              # the source columns the chunks hold (all of them for a table)
+    var sm: _ScanMask
+    var ones: List[UInt8]
+    var gm: List[UInt8]
+    var mask_addr: Int
+    var masked: Bool
 
-    if not scan_mode:
-        var mask_addr = Int(src.overlay.mask.unsafe_ptr()) if masked else 0
-        if src.table.rows() > 0:
-            _fold(sp, plan, src.table, mask_addr, hs, ops, threads, acc, dense_acc)
-            nchunks += 1
-        if delta_rows > 0:
-            var dcols = _all(n_cols)
-            var dt = delta_table(src, dcols)
-            var ones = _ones_mask(dt.rows())
-            _fold(sp, plan, dt, Int(ones.unsafe_ptr()) if masked else 0, hs, ops, threads, acc, dense_acc)
-            _ = ones^
-            nchunks += 1
-        if src.kind == SRC_FRAME:
-            notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
-                         commas(delta_rows) + " changed or appended rows")
-        else:
-            notes.append("ran: table " + src.name + ": 1 chunk of " + commas(src.table.rows()) + " rows")
-    else:
+    def __init__(out self):
+        self.groups = List[Int]()
+        self.base = False
+        self.has_delta = False
+        self.scan_mode = False
+        self.used = List[Int]()
+        self.sm = _ScanMask()
+        self.ones = List[UInt8]()
+        self.gm = List[UInt8]()
+        self.mask_addr = 0
+        self.masked = False
+
+    def n(self) -> Int:
+        return (len(self.groups) if self.scan_mode else (1 if self.base else 0)) + (1 if self.has_delta else 0)
+
+
+def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
+    var ch = _Chunks()
+    ch.scan_mode = src.kind == SRC_SCAN
+    ch.used = used.copy()
+    ch.masked = len(src.overlay.mask) > 0
+    ch.has_delta = len(src.overlay.delta) > 0
+    if ch.scan_mode:
         ref scan = src.scan.value()
-        for c in used:
-            if scan.kind(c) == TEXT:
-                scan.ensure_words(c)
-        var sm = _ScanMask()
-        if masked:
-            sm.addr = Int(src.overlay.mask.unsafe_ptr())
+        for g in range(scan.row_groups()):
+            if scan.group_rows(g) > 0:
+                ch.groups.append(g)
+        if ch.masked:
+            ch.sm.addr = Int(src.overlay.mask.unsafe_ptr())
             var at = 0
             for g in range(scan.row_groups()):
-                sm.starts.append(at)
+                ch.sm.starts.append(at)
                 at += scan.group_rows(g)
-        var big_ones = List[UInt8]()
-        if masked:
-            var mx = 0
+            var mx = len(src.overlay.delta)
             for g in range(scan.row_groups()):
                 mx = max(mx, scan.group_rows(g))
-            big_ones = _ones_mask(max(mx, delta_rows))
-        for g in range(scan.row_groups()):
-            if scan.group_rows(g) == 0:
-                continue
-            var chunk = scan.read_group(g, used)^.share()
-            var gm = _group_mask(sm, g, scan.group_rows(g)) if masked else List[UInt8]()
-            var mask_addr = Int(gm.unsafe_ptr()) if len(gm) > 0 else (Int(big_ones.unsafe_ptr()) if masked else 0)
-            _fold(sp, plan, chunk, mask_addr, hs, ops, threads, acc, dense_acc)
-            _ = gm^
-            nchunks += 1
-        if delta_rows > 0:
-            var dt = delta_table(src, used)
-            _fold(sp, plan, dt, Int(big_ones.unsafe_ptr()) if masked else 0, hs, ops, threads, acc, dense_acc)
-            nchunks += 1
-        notes.append("ran: scan " + src.name + ": " + String(nchunks - (1 if delta_rows > 0 else 0)) + " of " + String(scan.row_groups()) +
-                     " row groups read (" + String(len(used)) + (" column" if len(used) == 1 else " columns") + "), one chunk each" +
-                     ((", + " + commas(delta_rows) + " changed or appended rows") if delta_rows > 0 else ""))
-        _ = big_ones^
-    if plan.group != G_HASHED:
-        acc.slots = dense_acc.slots.copy()
-        acc.counts = dense_acc.counts.copy()
-    var hres = HolResult()
-    var hol_of = List[Int](length=len(q.aggs), fill=-1)
-    if sp.p.mat:
-        hres = hs.finish()
-        for h in range(len(hs.specs)):
-            hol_of[hs.specs[h].agg] = h
-    return _finish(q, plan, sp, acc, hres, hol_of, dicts)
+            ch.ones = _ones_mask(mx)
+    else:
+        ch.base = src.table.rows() > 0
+        if ch.masked:
+            ch.ones = _ones_mask(len(src.overlay.delta))
+    return ch^
+
+
+def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
+    var nb = len(ch.groups) if ch.scan_mode else (1 if ch.base else 0)
+    if i >= nb:                                                   # the frame's changed and appended rows
+        ch.mask_addr = Int(ch.ones.unsafe_ptr()) if ch.masked else 0
+        return delta_table(src, ch.used)
+    if not ch.scan_mode:
+        ch.mask_addr = Int(src.overlay.mask.unsafe_ptr()) if ch.masked else 0
+        return src.table
+    var g = ch.groups[i]
+    ref scan = src.scan.value()
+    var chunk = scan.read_group(g, ch.used)^.share()
+    ch.gm = _group_mask(ch.sm, g, scan.group_rows(g)) if ch.masked else List[UInt8]()
+    ch.mask_addr = Int(ch.gm.unsafe_ptr()) if len(ch.gm) > 0 else (Int(ch.ones.unsafe_ptr()) if ch.masked else 0)
+    return chunk^
 
 
 def _all(n: Int) -> List[Int]:
@@ -799,6 +775,261 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
     else:
         r = _run_cpu(chunk, sp.p, mask_addr, 0, -1, 0, threads)
     _merge_partial(dense_acc, r, ops)
+
+
+# ── hashed groups with holistic aggregates: a second pass maps each row to its group ─────────────────
+
+def _hmat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
+    """The group id of each selected row, found by its key words in the table of the groups pass 1 found (register 0 holds
+    the address of the control block, registers 1 .. nkw the key words), then the pairs of every holistic source, as
+    query.mojo's `_mat_hook` writes them."""
+    var ctl = LP(unsafe_from_address=Int(LP(unsafe_from_address=Int(regs))[0]))
+    var nsrc = Int(ctl[0])
+    var tail = 6 + SRC_WORDS * nsrc
+    var nkw = Int(ctl[tail])
+    var table = IP(unsafe_from_address=Int(ctl[tail + 1]))
+    var mask = UInt64(ctl[tail + 2])
+    var kwp = LP(unsafe_from_address=Int(ctl[tail + 3]))
+    for j in range(nsel):
+        var h = UInt64(0x9E3779B97F4A7C15)
+        for k in range(nkw):
+            h = _mix(h ^ UInt64(LP(unsafe_from_address=Int(regs + (1 + k) * VEC))[j]))
+        var pos = Int(h & mask)
+        var gid = -1
+        while True:
+            var g = Int(table[pos])
+            if g < 0:
+                break
+            var same = True
+            for k in range(nkw):
+                if LP(unsafe_from_address=Int(kwp[k]))[g] != LP(unsafe_from_address=Int(regs + (1 + k) * VEC))[j]:
+                    same = False
+                    break
+            if same:
+                gid = g
+                break
+            pos = (pos + 1) & Int(mask)
+        dst[j] = Int32(gid)
+    var groups = ctl[2]
+    var base = row0 - Int(ctl[1])
+    for s in range(nsrc):
+        var c = ctl + (6 + SRC_WORDS * s)
+        var vals = LP(unsafe_from_address=Int(regs + Int(c[0]) * VEC))
+        var gp = IP(unsafe_from_address=Int(c[2])) + base
+        var vp = LP(unsafe_from_address=Int(c[3])) + base
+        var o = 0
+        if c[1] < 0:
+            for j in range(nsel):
+                var g = Int64(dst[j])
+                gp[o] = Int32(g)
+                vp[o] = vals[j]
+                o += Int((g >= 0) & (g < groups))
+        else:
+            var valid = LP(unsafe_from_address=Int(regs + Int(c[1]) * VEC))
+            for j in range(nsel):
+                var g = Int64(dst[j])
+                gp[o] = Int32(g)
+                vp[o] = vals[j]
+                o += Int((g >= 0) & (g < groups) & (valid[j] != 0))
+        IP(unsafe_from_address=Int(c[4]))[base // VEC] = Int32(o)
+    return True
+
+
+struct _GroupLookup(Movable):
+    """The hash table from key words to group number, over the groups of pass 1."""
+    var table: List[Int32]
+    var kwp: List[Int]
+    var mask: Int
+    var nkw: Int
+    var groups: Int
+
+    def __init__(out self, acc: Partial):
+        self.groups = acc.groups()
+        self.nkw = len(acc.kw)
+        var cap = 16
+        while cap < 2 * max(self.groups, 1):
+            cap *= 2
+        self.table = List[Int32](length=cap, fill=-1)
+        self.mask = cap - 1
+        self.kwp = List[Int]()
+        for k in range(self.nkw):
+            self.kwp.append(Int(acc.kw[k].unsafe_ptr()))
+        for g in range(self.groups):
+            var pos = Int(_hash_group(acc.kw, g) & UInt64(self.mask))
+            while self.table[pos] >= 0:
+                pos = (pos + 1) & self.mask
+            self.table[pos] = Int32(g)
+
+
+def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_addr: Int, mut hs: HolStates, threads: Int) raises:
+    """Pass 2 over one chunk: the kernel runs the predicate and the key words, `_hmat_hook` finds each row's group and
+    writes the holistic sources' (group, value) pairs, which the states take in windows (as query.mojo's `_run_mat`)."""
+    ref p = sp.p
+    var n = t.rows()
+    var rows = max(MORSEL_ROWS, (WINDOW_BYTES // (12 * max(p.n_src, 1))) // MORSEL_ROWS * MORSEL_ROWS)
+    var code = List[Int32]()
+    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
+                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
+    for h in header:
+        code.append(Int32(h))
+    for w in p.pred:
+        code.append(w)
+    for w in p.body:
+        code.append(w)
+    for w in p.aggs:
+        code.append(w)
+    var set_bytes = sp.set_bytes.copy()
+    if len(set_bytes) == 0:
+        set_bytes.append(0)
+    var set_meta = sp.set_meta.copy()
+    if len(set_meta) == 0:
+        set_meta = [0, 0, 0]
+    var tbl = _table_addresses(t, p, mask_addr)
+    var dtypes = p.dtypes.copy()
+    if len(dtypes) == 0:
+        dtypes.append(1)
+    var done = 0
+    var first = True
+    var G = max(look.groups, 1)
+    while first or done < n:
+        var end = min(n, done + rows)
+        var nblk = (end - done + VEC - 1) // VEC
+        var gids = List[List[Int32]]()
+        var vals = List[List[Int64]]()
+        var cnts = List[List[Int32]]()
+        var ctl = List[Int64]()
+        ctl.append(Int64(p.n_src))
+        ctl.append(Int64(done))
+        ctl.append(Int64(look.groups))
+        ctl.append(0)
+        ctl.append(0)
+        ctl.append(0)
+        for s in range(p.n_src):
+            gids.append(List[Int32](unsafe_uninit_length=max(end - done, 1)))
+            vals.append(List[Int64](unsafe_uninit_length=max(end - done, 1)))
+            cnts.append(List[Int32](length=max(nblk, 1), fill=0))
+            ctl.append(Int64(p.src_vreg[s]))
+            ctl.append(Int64(p.src_valid[s]))
+            ctl.append(Int64(Int(gids[s].unsafe_ptr())))
+            ctl.append(Int64(Int(vals[s].unsafe_ptr())))
+            ctl.append(Int64(Int(cnts[s].unsafe_ptr())))
+            ctl.append(0)
+            ctl.append(0)
+            ctl.append(0)
+            ctl.append(0)
+            ctl.append(0)
+        ctl.append(Int64(look.nkw))
+        ctl.append(Int64(Int(look.table.unsafe_ptr())))
+        ctl.append(Int64(look.mask))
+        ctl.append(Int64(Int(look.kwp.unsafe_ptr())))
+        var consts = List[Float64]()
+        for v in p.consts:
+            consts.append(Float64(from_bits=UInt64(v)))
+        consts[p.ctl_const] = Float64(from_bits=UInt64(Int(ctl.unsafe_ptr())))
+        var out_vals = List[Float64](length=max(p.n_slots, 1) * G, fill=0.0)
+        var out_cnt = List[Int64](length=G, fill=0)
+        var rc = pipeline_keyed[type_of(_hmat_hook)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
+                                                     Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), G,
+                                                     done, end, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
+                                                     threads if threads > 0 else core_count(), _hmat_hook, False)
+        if rc == E_OVERFLOW:
+            raise Error(OVERFLOW_MESSAGE)
+        if rc != 0:
+            raise Error("the CPU kernel failed with code " + String(rc))
+        for s in range(p.n_src):
+            hs.absorb(s, window_blocks(Int(gids[s].unsafe_ptr()), Int(vals[s].unsafe_ptr()), Int(cnts[s].unsafe_ptr()), nblk, VEC))
+        _ = ctl^
+        _ = gids^
+        _ = vals^
+        _ = cnts^
+        _ = consts^
+        _ = out_vals^
+        _ = out_cnt^
+        first = False
+        done = end
+    _ = code^
+    _ = set_bytes^
+    _ = set_meta^
+    _ = tbl^
+    _ = dtypes^
+
+
+def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
+             mut notes: List[String]) raises -> Table:
+    var n_cols = src.table.columns()
+    var used = collect_columns(q)
+    var scan_mode = src.kind == SRC_SCAN
+    # how the program sees the chunks: a table or frame as it is, a scan's row groups holding only the columns used
+    var pos = List[Int](length=n_cols, fill=-1)
+    var chunk_cols = n_cols
+    if scan_mode:
+        if len(used) == 0 and n_cols > 0:
+            used.append(0)
+        for k in range(len(used)):
+            pos[used[k]] = k
+        chunk_cols = len(used)
+        for c in used:
+            if src.table.kind(c) == TEXT:
+                src.scan.value().ensure_words(c)
+    else:
+        for c in range(n_cols):
+            pos[c] = c
+        used = _all(n_cols)
+    var nullable = List[Bool]()
+    for c in range(n_cols):
+        nullable.append(scan_mode or src.table.null_count(c) > 0 or _delta_nulls(src, c))
+    var masked = len(src.overlay.mask) > 0
+    var two_pass = plan.group == G_HASHED and plan.holistic
+    var sp = lower_sql(q, plan, nullable.copy(), pos.copy(), chunk_cols, DictAccess(src.table, src.scan, dicts.extra), _alias_lists(src), masked,
+                       PHASE_PLAIN if two_pass else PHASE_ALL)
+    notes.append("kernel: " + String(sp.instr) + " instructions a row" + (", " + String(len(sp.set_meta) // 3) + " sets" if len(sp.set_meta) > 0 else "") +
+                 " (" + String(sp.p.n_slots) + (" slot" if sp.p.n_slots == 1 else " slots") + ")")
+    var ops = sp.slot_ops.copy()
+    var threads = opts.threads
+    var rows_total = -1 if src.kind != SRC_TABLE else src.rows()
+    var hs = _holistic_states(q, plan.domain if plan.group == G_DENSE else 1, sp, dicts, rows_total) if (sp.p.mat and not two_pass) else \
+             HolStates(1, List[HolSpec](), List[List[Int64]]())
+    var domain = plan.domain if plan.group == G_DENSE else 1
+    var acc = Partial()
+    var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
+    var ch = _open_chunks(src, used)
+    var delta_rows = len(src.overlay.delta)
+    for i in range(ch.n()):
+        var chunk = _load_chunk(src, ch, i)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc)
+    if src.kind == SRC_FRAME:
+        notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
+                     commas(delta_rows) + " changed or appended rows")
+    elif scan_mode:
+        notes.append("ran: scan " + src.name + ": " + String(len(ch.groups)) + " of " + String(src.scan.value().row_groups()) +
+                     " row groups read (" + String(len(used)) + (" column" if len(used) == 1 else " columns") + "), one chunk each" +
+                     ((", + " + commas(delta_rows) + " changed or appended rows") if delta_rows > 0 else ""))
+    else:
+        notes.append("ran: table " + src.name + ": 1 chunk of " + commas(src.table.rows()) + " rows")
+    if plan.group != G_HASHED:
+        acc.slots = dense_acc.slots.copy()
+        acc.counts = dense_acc.counts.copy()
+    var hres = HolResult()
+    var hol_of = List[Int](length=len(q.aggs), fill=-1)
+    if two_pass:
+        # pass 2: the groups are known, find each row's group again and feed the holistic states
+        var sp2 = lower_sql(q, plan, nullable^, pos^, chunk_cols, DictAccess(src.table, src.scan, dicts.extra), _alias_lists(src), masked, PHASE_HOL)
+        var look = _GroupLookup(acc)
+        var hs2 = _holistic_states(q, max(acc.groups(), 1), sp2, dicts, rows_total)
+        var ch2 = _open_chunks(src, used)
+        for i in range(ch2.n()):
+            var chunk = _load_chunk(src, ch2, i)
+            _run_hol_hashed(chunk, sp2, look, ch2.mask_addr, hs2, threads)
+        notes.append("holistic: a second pass over the " + String(ch2.n()) + (" chunk" if ch2.n() == 1 else " chunks") + " maps each row to one of " +
+                     commas(acc.groups()) + " groups")
+        hres = hs2.finish()
+        for h in range(len(hs2.specs)):
+            hol_of[hs2.specs[h].agg] = h
+    elif sp.p.mat:
+        hres = hs.finish()
+        for h in range(len(hs.specs)):
+            hol_of[hs.specs[h].agg] = h
+    return _finish(q, plan, sp, acc, hres, hol_of, dicts)
 
 
 def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises -> SqlResult:

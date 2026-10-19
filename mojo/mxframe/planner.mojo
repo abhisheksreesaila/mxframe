@@ -135,7 +135,7 @@ struct RulePlanner(Planner, Copyable, Movable):
         var plan = PhysicalPlan()
         plan.source_kind = st.kind
         for a in q.aggs:
-            if a.func == F_COUNT_DISTINCT or a.func == F_MEDIAN or a.func == F_QUANTILE:
+            if a.hol:
                 plan.holistic = True
         var what = "table" if st.kind == SRC_TABLE else "frame (the edits as a mask over the shared rows plus the changed rows)" if st.kind == SRC_FRAME \
                    else "Parquet scan, " + commas(st.row_groups) + " row groups"

@@ -190,8 +190,10 @@ struct AggSpec(Copyable, Movable):
     var scale: Int
     var name: String                 # as the output names it: sum(revenue), count_star()
     var canon: String
+    var hol: Bool                    # needs every value of its group: count(DISTINCT), median, quantile_disc, min / max of TEXT
 
-    def __init__(out self, func: Int, arg: Int, p: Float64, kind: Int, scale: Int, name: String, canon: String):
+    def __init__(out self, func: Int, arg: Int, p: Float64, kind: Int, scale: Int, name: String, canon: String, hol: Bool = False):
+        self.hol = hol
         self.func = func
         self.arg = arg
         self.p = p
@@ -853,6 +855,10 @@ struct _Binder(Movable):
             if func == F_COUNT and (a.op == B_LIT or a.op == B_STR):
                 func = F_COUNT_STAR
                 arg = -1
+        var hol = func == F_COUNT_DISTINCT or func == F_MEDIAN or func == F_QUANTILE
+        if (func == F_MIN or func == F_MAX) and rkind == TEXT.value:        # TEXT has no running min: the lowest / highest of its ranked values
+            hol = True
+            p = 0.0 if func == F_MIN else 1.0
         # dedupe: the same aggregate asked twice is computed once
         var canon = String(func) + ":" + ("*" if arg < 0 else self.canon(x.items[0])) + ":" + String(p)
         var shown: String
@@ -870,7 +876,7 @@ struct _Binder(Movable):
                 idx = k
                 break
         if idx < 0:
-            self.q.aggs.append(AggSpec(func, arg, p, rkind, rscale, shown, canon))
+            self.q.aggs.append(AggSpec(func, arg, p, rkind, rscale, shown, canon, hol))
             idx = len(self.q.aggs) - 1
         var n = self.mk(B_AGG, rkind, rscale, -1, -1, Int64(idx), shown, ast)
         self.q.pexprs[n].src = src

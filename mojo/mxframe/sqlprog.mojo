@@ -476,8 +476,13 @@ struct _Emitter(Movable):
         return self.with_unknown(r, v.nul)
 
 
+comptime PHASE_ALL = 0       # the plain aggregates and the holistic ones in one program
+comptime PHASE_PLAIN = 1     # hashed groups, pass 1: the plain aggregates, the key words out
+comptime PHASE_HOL = 2       # hashed groups, pass 2: only the holistic sources, each row mapped to its group by the hook
+
+
 def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var pos: List[Int], nchunk_cols: Int,
-              var dicts: DictAccess, var aliases: List[List[Int]], masked: Bool) raises -> SqlProgram:
+              var dicts: DictAccess, var aliases: List[List[Int]], masked: Bool, phase: Int = PHASE_ALL) raises -> SqlProgram:
     """The program for `q` under `plan`. `nullable[c]`: source column c may hold NULLs; `pos[c]`: its place in the chunk
     tables the program runs on; `aliases[c]`: a frame's merged TEXT codes; `masked`: a frame mask hides changed rows."""
     var e = _Emitter(Program(nchunk_cols), q.rexprs.copy(), nullable^, pos^, aliases^, dicts^)
@@ -485,24 +490,29 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     # which aggregates are holistic: their values go to the kernel hook, one source per distinct argument
     var holistic = False
     for a in sp_aggs:
-        if a.func == F_COUNT_DISTINCT or a.func == F_MEDIAN or a.func == F_QUANTILE:
+        if a.hol:
             holistic = True
+    if phase == PHASE_PLAIN:
+        holistic = False
     var nkw = 1 if plan.group != G_HASHED else plan.key_words()
     var key_regs = nkw
+    var key_base = 0                                              # the first register of the key
+    var ctl_reg = 1                                               # the register holding the control block of a holistic query
+    if phase == PHASE_HOL:                                        # hashed, pass 2: the control block first, then the key words
+        key_base = 1
+        ctl_reg = 0
     var out = SqlProgram(Program(0))
     e.p.mat = holistic
     e.p.groups = plan.domain if plan.group == G_DENSE else 1
     # registers: the key (dense: register 0, and register 1 the control block of a holistic query) or the key words
-    e.reserve(key_regs + (1 if (holistic and plan.group == G_DENSE) or (holistic and plan.group == G_NONE) else 0))
+    e.reserve(key_regs + (1 if holistic else 0))
     e.p.section = 1
     if holistic:
-        if plan.group == G_HASHED:
-            raise Error("count(DISTINCT ...), median() and quantile_disc() over hashed groups are not supported yet")
         e.p.ctl_const = len(e.p.consts)
         e.p.consts.append(CTL_PLACEHOLDER)
         var cr = e.tmp()
         e.ins(OP_LOAD_CONST, cr, e.p.ctl_const)
-        e.ins(OP_IMAX, 1, cr, cr)
+        e.ins(OP_IMAX, ctl_reg, cr, cr)
         e.free(cr)
     # the predicate: the WHERE (unknown is not true), then the frame mask
     e.p.section = 0
@@ -566,7 +576,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         e.free(acc)
     elif plan.group == G_HASHED:
         e.p.keyed = True
-        var at = 0
+        var at = key_base
         for k in range(len(plan.keys)):
             ref lay = plan.keys[k]
             var v = e.value(lay.expr)
@@ -600,12 +610,15 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     var src_vreg = List[Int]()
     var src_valid = List[Int]()
     for i in range(n_aggs):
+        if (phase == PHASE_PLAIN and sp_aggs[i].hol) or (phase == PHASE_HOL and not sp_aggs[i].hol):
+            done[i] = True                                        # the other pass computes it
         if done[i] or sp_aggs[i].arg < 0:
             continue
         var key = bkey(e.rx, sp_aggs[i].arg)
         var members = List[Int]()
         for j in range(i, n_aggs):
-            if not done[j] and sp_aggs[j].arg >= 0 and bkey(e.rx, sp_aggs[j].arg) == key:
+            var other_pass = (phase == PHASE_PLAIN and sp_aggs[j].hol) or (phase == PHASE_HOL and not sp_aggs[j].hol)
+            if not done[j] and not other_pass and sp_aggs[j].arg >= 0 and bkey(e.rx, sp_aggs[j].arg) == key:
                 members.append(j)
                 done[j] = True
         var need_sum = False
@@ -614,13 +627,11 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         var need_hol = False
         for j in members:
             var f = sp_aggs[j].func
-            need_sum = need_sum or f == F_SUM or f == F_AVG
-            need_min = need_min or f == F_MIN
-            need_max = need_max or f == F_MAX
-            need_hol = need_hol or f == F_COUNT_DISTINCT or f == F_MEDIAN or f == F_QUANTILE
-        var arg = e.rx[sp_aggs[i].arg].copy()
-        if arg.kind == TEXT.value and (need_min or need_max):
-            raise Error("min() and max() of TEXT are not supported yet")
+            var h = sp_aggs[j].hol
+            need_sum = need_sum or ((f == F_SUM or f == F_AVG) and not h)
+            need_min = need_min or (f == F_MIN and not h)
+            need_max = need_max or (f == F_MAX and not h)
+            need_hol = need_hol or h
         var v = e.value(sp_aggs[i].arg)
         var raw_kept = -1
         var sum_slot = -1
@@ -689,7 +700,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             e.p.section = 1
             out.slot_ops.append(A_MAX)
             n_slots += 1
-        if v.nul >= 0:                                            # the NULLs this argument skipped
+        if v.nul >= 0 and phase != PHASE_HOL:                     # the NULLs this argument skipped
             var ni = e.tmp()
             e.ins(OP_F2I, ni, v.nul)
             var kept_n = e.keep(ni)
@@ -718,13 +729,15 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         for j in members:
             var f = sp_aggs[j].func
             out.agg_nul_slot[j] = nul_slot
-            if f == F_SUM or f == F_AVG:
+            if sp_aggs[j].hol:
+                out.agg_src[j] = src
+            elif f == F_SUM or f == F_AVG:
                 out.agg_val_slot[j] = sum_slot
             elif f == F_MIN:
                 out.agg_val_slot[j] = min_slot
             elif f == F_MAX:
                 out.agg_val_slot[j] = max_slot
-            elif f == F_COUNT_DISTINCT or f == F_MEDIAN or f == F_QUANTILE:
+            elif sp_aggs[j].hol:
                 out.agg_src[j] = src
         e.free(v.reg)
         e.free(v.nul)
