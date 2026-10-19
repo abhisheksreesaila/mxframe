@@ -1095,14 +1095,14 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         var ast = b.st.group_by[g]
         var gx = b.st.exprs[ast].copy()
         var target = ast
-        if gx.kind == X_INT:
+        if gx.kind == X_INT and not b.distinct:
             var n = Int(parse_number(gx.text).value)
             if n < 1 or n > len(b.st.items):
                 raise b.err(ast, "GROUP BY " + gx.text + " is out of range: the select list has " + String(len(b.st.items)) + " items")
             target = b.st.items[n - 1].expr
             if _has_aggregate(b.st, target):
                 raise b.err(ast, "GROUP BY " + gx.text + " refers to an aggregate")
-        elif gx.kind == X_COL and gx.text2.byte_length() == 0:
+        elif gx.kind == X_COL and gx.text2.byte_length() == 0 and not b.distinct:
             var is_column = False
             for nm in b.src_names:
                 if lower_ascii(nm) == lower_ascii(gx.text):
@@ -1226,8 +1226,8 @@ def bind_rows(var b: _Binder) raises -> BoundQuery:
         if e < 0:
             e = b.value(oi.expr)
         var x = b.q.rexprs[e].copy()
-        if x.op == B_NULL or x.op == B_LIT or x.op == B_STR:
-            raise b.err(oi.expr, "ORDER BY a constant does nothing: remove it")
+        if x.op == B_NULL:
+            raise b.err(oi.expr, "ORDER BY a constant NULL does nothing: remove it")
         if x.kind == FLOAT.value:
             raise b.err(oi.expr, "ORDER BY a FLOAT in a row query is not supported before F-157")
         b.q.rorder.append(SortKey(e, oi.desc, oi.nulls == 1))

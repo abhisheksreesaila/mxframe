@@ -249,3 +249,76 @@ def test_a_frames_formula_columns_come_out_of_row_queries(probe, data, mode):
             assert Counter(map(_canon, got)) == Counter(map(_canon, want)), f"{mode}: {sql}"
     star = run_probe(probe, "SELECT * FROM t", {"t": ds.path}, mode=mode, edits=script)
     assert [c["name"] for c in star["columns"]] == [c[0] for c in COLS] + ["f1", "f2", "f3"]
+
+
+# ── random row queries ───────────────────────────────────────────────────────────────────────────────
+
+from test_mojo_sql import _Gen  # noqa: E402
+
+
+class _RowGen(_Gen):
+    """Random row queries: expressions and conditions from the aggregate generator, ORDER BY keys among the selected columns (ordinals,
+    with DESC and NULLS clauses), LIMIT / OFFSET, DISTINCT; seeded so a failure repeats."""
+
+    OUTS = ["id", "k", "x", "g", "d", "e", "dt", "b", "s"]
+
+    def typed(self, depth=0):
+        """Like the aggregate generator's, but `%` only between integers: DuckDB widens a product of decimals past 18 digits and takes the
+        remainder in doubles, where MX frame keeps the exact int64 decimal (the documented difference of decimal arithmetic past int64)."""
+        r = self.rng
+        if depth > 2 or r.random() < 0.35:
+            c = r.choice(self.INTS + self.DECS + [str(r.randint(-5, 9)), f"{r.randint(-300, 300) / 100:.2f}"])
+            return c, not (c in self.DECS or "." in c)
+        a, ai = self.typed(depth + 1)
+        b, bi = self.typed(depth + 1)
+        op = r.choice(["+", "-", "*", "+", "-", "//", "%"])
+        if op in ("//", "%") and not (ai and bi):
+            op = "+"
+        return f"({a} {op} {b})", ai and bi
+
+    def query(self):
+        r = self.rng
+        outs = r.sample(self.OUTS, r.randint(1, 4))
+        if r.random() < 0.5:
+            outs.append(self.num(1))
+        distinct = r.random() < 0.2
+        sql = f"SELECT {'DISTINCT ' if distinct else ''}{', '.join(outs)} FROM t"
+        if r.random() < 0.6:
+            sql += f" WHERE {self.cond()}"
+        keys = None
+        duck = sql
+        if r.random() < 0.7:
+            sortable = [i for i, o in enumerate(outs) if o != "s"]
+            if sortable:
+                picked = r.sample(sortable, min(len(sortable), r.randint(1, 3)))
+                terms, dterms = [], []
+                for i in picked:
+                    desc = r.random() < 0.4
+                    nulls = r.choice(["", " NULLS FIRST", " NULLS LAST"])
+                    terms.append(f"{i + 1}{' DESC' if desc else ''}{nulls}")
+                    dterms.append(f"{i + 1}{' DESC' if desc else ''}{nulls or ' NULLS LAST'}")
+                sql += " ORDER BY " + ", ".join(terms)
+                duck += " ORDER BY " + ", ".join(dterms)
+                keys = picked
+        limit = offset = None
+        if r.random() < 0.6:
+            limit = r.choice([0, 1, 5, 40, 300, 5000, 100000])
+            offset = r.choice([0, 0, 7, 600, 100000])
+        return Q(core=sql, duck=duck, keys=keys, limit=limit, offset=offset or 0)
+
+
+@pytest.mark.parametrize("mode", ["table", "scan", "frame"])
+@pytest.mark.parametrize("seed", [21, 22, 23, 24])
+def test_random_row_queries_equal_duckdb(mx, probe, data, mode, seed):
+    gen = _RowGen(seed * 100 + len(mode))
+    compared = 0
+    for _ in range(25):
+        q = gen.query()
+        try:
+            check_query(mode, data["g10k"] if seed % 2 else data["g8"], mx, probe, q)
+        except AssertionError as e:
+            if "passed the int64 range" in str(e):                     # a product of decimals past int64: MX frame raises where DuckDB widens
+                continue
+            raise
+        compared += 1
+    assert compared >= 15, f"only {compared} of 25 random queries ran"
