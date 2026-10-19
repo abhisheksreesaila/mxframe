@@ -3,9 +3,8 @@
     pixi run python scripts/make_engine_art.py          # writes docs/img/engine-*.svg
     pixi run python scripts/make_engine_art.py --check  # exit 1 if a committed SVG is stale
 
-Two looks, so the owner can pick (docs/design/engine-compare.html):
-  A "ledger"  dark Terminal Ledger with an accent glow  -> engine-hero.svg, engine-<chart>.svg
-  B "paper"   editorial light paper, a big serif number -> engine-hero-paper.svg, engine-<chart>-paper.svg
+The look is editorial paper (picked 2026-10-19 over a dark terminal glow): light ruled paper, one huge serif
+number, the docs site's paper tokens -> engine-hero.svg, engine-<chart>.svg
 
 GitHub renders SVG through <img>: no scripts, no web fonts, so every font is a system stack and every
 size is static. Text widths are estimated (no font metrics), with slack left for the widest system font.
@@ -26,9 +25,6 @@ SERIF = "Georgia, 'Times New Roman', Times, serif"
 
 # docs/site/site.css tokens; series colours validated with the dataviz validator (docs/design/docs-site.md)
 THEMES = {
-    "ledger": dict(bg="#0D0D14", surface="#13131E", surface2="#1A1A28", border="#252538", border_hi="#32324C",
-                   text="#F5F5FF", mid="#C0C0DC", dim="#8E8EAE", accent="#7C3AED", accent_hi="#9D5CF5",
-                   mx="#3987e5", dk="#199e70", pa="#c98500", slow="#e66767", grid="#252538"),
     "paper": dict(bg="#F2EFE7", surface="#FFFDF8", surface2="#F8F4EB", border="#D8D0C2", border_hi="#BEB4A4",
                   text="#20221F", mid="#4C5049", dim="#6E716A", accent="#6C3E78", accent_hi="#512B5C",
                   mx="#2a78d6", dk="#1baf7a", pa="#eda100", slow="#e34948", grid="#E4DDD0"),
@@ -117,61 +113,6 @@ def split_big(big):
     return num, unit
 
 
-def hero_ledger(data):
-    t = THEMES["ledger"]
-    W, H = 1200, 360
-    b = [f'''<defs>
-  <radialGradient id="g1" cx="0.12" cy="0.0" r="0.75"><stop offset="0" stop-color="{t['accent']}" stop-opacity=".55"/><stop offset="1" stop-color="{t['accent']}" stop-opacity="0"/></radialGradient>
-  <radialGradient id="g2" cx="0.92" cy="1.05" r="0.6"><stop offset="0" stop-color="{t['mx']}" stop-opacity=".30"/><stop offset="1" stop-color="{t['mx']}" stop-opacity="0"/></radialGradient>
-  <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity=".035"/></pattern>
-  <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="4" height="2" y="2" fill="#000" fill-opacity=".18"/></pattern>
-  <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="9" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
-  <clipPath id="clip"><rect width="{W}" height="{H}" rx="18"/></clipPath>
-</defs>
-<g clip-path="url(#clip)">
-<rect width="{W}" height="{H}" fill="{t['bg']}"/>
-<rect width="{W}" height="{H}" fill="url(#grid)"/>
-<rect width="{W}" height="{H}" fill="url(#g1)"/>
-<rect width="{W}" height="{H}" fill="url(#g2)"/>
-<rect width="{W}" height="{H}" fill="url(#scan)"/>''']
-    x = 56
-    b.append(text(x, 74, "// THE MOJO ENGINE · CPU · GPU · AUTO", 13, t["accent_hi"], MONO, 700, ls=2.5))
-    # wordmark: MX FRAME, the X glowing
-    b.append(f'<text x="{x}" y="146" font-family="{MONO}" font-size="66" font-weight="800" letter-spacing="8" fill="{t["text"]}">'
-             f'M<tspan fill="{t["accent_hi"]}" filter="url(#glow)">X</tspan> FRAME</text>')
-    for i, line in enumerate(wrap(data["vision_short"], 42)):
-        b.append(text(x, 196 + i * 30, line, 22, t["mid"], SANS, 500))
-    b.append(text(x, 282, "Aims to beat DuckDB and Polars, on CPU and GPU.", 14, t["text"], MONO, 700))
-    # legend + caveat, always visible
-    ly = 326
-    b.append(f'<rect x="{x}" y="{ly - 9}" width="10" height="10" rx="2" fill="{t["mx"]}"/>')
-    b.append(text(x + 16, ly, "MX frame", 12, t["mid"], MONO))
-    b.append(f'<rect x="{x + 96}" y="{ly - 9}" width="10" height="10" rx="2" fill="{t["dk"]}"/>')
-    b.append(text(x + 112, ly, "DuckDB", 12, t["mid"], MONO))
-    b.append(text(x + 180, ly, "informal: shared machine, see docs/mojo-engine.md", 12, t["dim"], MONO))
-    # 2x2 headline tiles
-    tw, th, gap, x0, y0 = 262, 128, 16, 612, 52
-    for i, h in enumerate(data["headline"]):
-        tx, ty = x0 + (i % 2) * (tw + gap), y0 + (i // 2) * (th + gap)
-        b.append(f'<rect x="{tx}" y="{ty}" width="{tw}" height="{th}" rx="12" fill="#ffffff" fill-opacity=".035" stroke="{t["border_hi"]}"/>')
-        b.append(f'<rect x="{tx}" y="{ty + 18}" width="3" height="18" rx="1.5" fill="{t["accent_hi"]}"/>')
-        b.append(text(tx + 16, ty + 32, h["label"].upper(), 11.5, t["dim"], MONO, 700, ls=0.6))
-        num, unit = split_big(h["big"])
-        b.append(f'<text x="{tx + 16}" y="{ty + 80}" font-family="{MONO}" font-weight="700" fill="{t["text"]}">'
-                 f'<tspan font-size="44">{escape(num)}</tspan><tspan font-size="20" fill="{t["mid"]}" dx="6">{escape(unit)}</tspan></text>')
-        b.append(text(tx + 16, ty + 102, h["vs"], 13, t["mid"], SANS, 500))
-        mx_v, other, other_name = headline_values(data, h)
-        full = tw - 32
-        top = max(mx_v, other)
-        other_fill = t["dk"] if other_name == "DuckDB" else t["dim"]
-        b.append(f'<rect x="{tx + 16}" y="{ty + 111}" width="{max(3, full * mx_v / top):.1f}" height="4" rx="2" fill="{t["mx"]}"/>')
-        b.append(f'<rect x="{tx + 16}" y="{ty + 117}" width="{max(3, full * other / top):.1f}" height="4" rx="2" fill="{other_fill}"/>')
-    b.append("</g>")
-    b.append(f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="18" fill="none" stroke="{t["border_hi"]}"/>')
-    return svg_doc(W, H, "\n".join(b), "MX frame: the Mojo engine",
-                   data["vision"] + " Headline numbers: " + "; ".join(f'{h["label"]}: {h["big"]} ({h["vs"]})' for h in data["headline"]) + ". " + data["caveat"])
-
-
 def hero_paper(data):
     t = THEMES["paper"]
     W, H = 1200, 360
@@ -230,7 +171,7 @@ def chart(theme, title, subtitle, legend, rows, scale, ticks, footer, value_col=
     heights = [max(len(r["bars"]) * step + 16, 52 if r.get("sub") else 0) for r in rows]
     H = head + sum(heights) + 58
     b = [f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="14" fill="{t["surface"]}" stroke="{t["border_hi"]}"/>',
-         text(LX, 36, "// MX FRAME · THE MOJO ENGINE", 11, t["accent_hi"] if theme == "ledger" else t["accent"], MONO, 700, ls=2),
+         text(LX, 36, "// MX FRAME · THE MOJO ENGINE", 11, t["accent"], MONO, 700, ls=2),
          text(LX, 64, title, 21, t["text"], SANS, 700),
          text(LX, 86, subtitle, 12, t["dim"], MONO)]
     lx = LX
@@ -339,10 +280,9 @@ def chart_behind(data, theme):
 
 def build():
     data = load()
-    files = {"engine-hero.svg": hero_ledger(data), "engine-hero-paper.svg": hero_paper(data)}
+    files = {"engine-hero.svg": hero_paper(data)}
     for name, fn in (("wins", chart_wins), ("read", chart_read), ("behind", chart_behind)):
-        files[f"engine-{name}.svg"] = fn(data, "ledger")[0]
-        files[f"engine-{name}-paper.svg"] = fn(data, "paper")[0]
+        files[f"engine-{name}.svg"] = fn(data, "paper")[0]
     return files
 
 

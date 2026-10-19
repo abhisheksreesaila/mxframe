@@ -1,92 +1,92 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="900" height="692" viewBox="0 0 900 692" role="img" aria-labelledby="t d">
 <title id="t">Where the Mojo engine leads DuckDB</title>
 <desc id="d">SQL, joins and aggregates · time, log scale · lower is faster. informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</desc>
-<rect x=".5" y=".5" width="899" height="691" rx="14" fill="#13131E" stroke="#32324C"/>
-<text x="32.0" y="36.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="700" fill="#9D5CF5" text-anchor="start" letter-spacing="2">// MX FRAME · THE MOJO ENGINE</text>
-<text x="32.0" y="64.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#F5F5FF" text-anchor="start">Where the Mojo engine leads DuckDB</text>
-<text x="32.0" y="86.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#8E8EAE" text-anchor="start">SQL, joins and aggregates · time, log scale · lower is faster</text>
-<rect x="32" y="100" width="10" height="10" rx="2" fill="#3987e5"/>
-<text x="48.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#C0C0DC" text-anchor="start">MX frame</text>
-<rect x="129.2" y="100" width="10" height="10" rx="2" fill="#199e70"/>
-<text x="145.2" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#C0C0DC" text-anchor="start">DuckDB 1.5.1</text>
-<path d="M290.0 130V640" stroke="#252538" stroke-width="1.5"/>
-<text x="290.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#8E8EAE" text-anchor="middle">1 ms</text>
-<path d="M420.5 130V640" stroke="#252538" stroke-width="1"/>
-<text x="420.5" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#8E8EAE" text-anchor="middle">10 ms</text>
-<path d="M551.0 130V640" stroke="#252538" stroke-width="1"/>
-<text x="551.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#8E8EAE" text-anchor="middle">100 ms</text>
-<path d="M681.4 130V640" stroke="#252538" stroke-width="1"/>
-<text x="681.4" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#8E8EAE" text-anchor="middle">1 s</text>
-<text x="868.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#8E8EAE" text-anchor="end" letter-spacing="1">FASTER</text>
-<text x="32.0" y="154.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">SQL · 1M groups, all rows out</text>
-<rect x="290" y="142" width="287.2" height="12" rx="3" fill="#3987e5"/>
-<text x="584.2" y="152.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">159 ms</text>
-<rect x="290" y="159" width="427.8" height="12" rx="3" fill="#199e70"/>
-<text x="724.8" y="169.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">1,900 ms</text>
-<text x="868.0" y="157.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">11.9x</text>
-<path d="M32 184H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="204.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">1M groups · median</text>
-<rect x="290" y="192" width="339.2" height="12" rx="3" fill="#3987e5"/>
-<text x="636.2" y="202.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">398 ms</text>
-<rect x="290" y="209" width="436.3" height="12" rx="3" fill="#199e70"/>
-<text x="733.3" y="219.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">2,208 ms</text>
-<text x="868.0" y="207.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">5.5x</text>
-<path d="M32 234H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="254.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">1M groups · top-k</text>
-<rect x="290" y="242" width="346.1" height="12" rx="3" fill="#3987e5"/>
-<text x="643.1" y="252.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">449 ms</text>
-<rect x="290" y="259" width="438.5" height="12" rx="3" fill="#199e70"/>
-<text x="735.5" y="269.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">2,295 ms</text>
-<text x="868.0" y="257.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">5.1x</text>
-<path d="M32 284H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="304.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">join · NOT EXISTS</text>
-<rect x="290" y="292" width="124.5" height="12" rx="3" fill="#3987e5"/>
-<text x="421.5" y="302.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">9 ms</text>
-<rect x="290" y="309" width="201.5" height="12" rx="3" fill="#199e70"/>
-<text x="498.5" y="319.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">35 ms</text>
-<text x="868.0" y="307.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">3.9x</text>
-<path d="M32 334H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="354.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">join · EXISTS</text>
-<rect x="290" y="342" width="169.8" height="12" rx="3" fill="#3987e5"/>
-<text x="466.8" y="352.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">20 ms</text>
-<rect x="290" y="359" width="240.8" height="12" rx="3" fill="#199e70"/>
-<text x="537.8" y="369.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">70 ms</text>
-<text x="868.0" y="357.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">3.5x</text>
-<path d="M32 384H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="404.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">SQL · SELECT DISTINCT s</text>
-<rect x="290" y="392" width="14.9" height="12" rx="3" fill="#3987e5"/>
-<text x="311.9" y="402.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">1.3 ms</text>
-<rect x="290" y="409" width="78.6" height="12" rx="3" fill="#199e70"/>
-<text x="375.6" y="419.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">4.0 ms</text>
-<text x="868.0" y="407.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">3.1x</text>
-<path d="M32 434H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="454.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">LEFT join + GROUP BY</text>
-<rect x="290" y="442" width="163.8" height="12" rx="3" fill="#3987e5"/>
-<text x="460.8" y="452.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">18 ms</text>
-<rect x="290" y="459" width="219.4" height="12" rx="3" fill="#199e70"/>
-<text x="516.4" y="469.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">48 ms</text>
-<text x="868.0" y="457.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">2.7x</text>
-<path d="M32 484H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="504.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">join · orders x customer</text>
-<rect x="290" y="492" width="72.6" height="12" rx="3" fill="#3987e5"/>
-<text x="369.6" y="502.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">3.6 ms</text>
-<rect x="290" y="509" width="106.9" height="12" rx="3" fill="#199e70"/>
-<text x="403.9" y="519.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">6.6 ms</text>
-<text x="868.0" y="507.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">1.8x</text>
-<path d="M32 534H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="554.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">1M groups · count distinct</text>
-<rect x="290" y="542" width="335.4" height="12" rx="3" fill="#3987e5"/>
-<text x="632.4" y="552.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">372 ms</text>
-<rect x="290" y="559" width="364.1" height="12" rx="3" fill="#199e70"/>
-<text x="661.1" y="569.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">617 ms</text>
-<text x="868.0" y="557.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">1.7x</text>
-<path d="M32 584H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="604.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#F5F5FF" text-anchor="start">join + group sum</text>
-<rect x="290" y="592" width="266.4" height="12" rx="3" fill="#3987e5"/>
-<text x="563.4" y="602.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">110 ms</text>
-<rect x="290" y="609" width="283.2" height="12" rx="3" fill="#199e70"/>
-<text x="580.2" y="619.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#C0C0DC" text-anchor="start">148 ms</text>
-<text x="868.0" y="607.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#F5F5FF" text-anchor="end">1.3x</text>
-<path d="M32 634H868" stroke="#252538" stroke-opacity=".7"/>
-<text x="32.0" y="670.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#8E8EAE" text-anchor="start">informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</text>
+<rect x=".5" y=".5" width="899" height="691" rx="14" fill="#FFFDF8" stroke="#BEB4A4"/>
+<text x="32.0" y="36.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="2">// MX FRAME · THE MOJO ENGINE</text>
+<text x="32.0" y="64.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#20221F" text-anchor="start">Where the Mojo engine leads DuckDB</text>
+<text x="32.0" y="86.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">SQL, joins and aggregates · time, log scale · lower is faster</text>
+<rect x="32" y="100" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="48.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#4C5049" text-anchor="start">MX frame</text>
+<rect x="129.2" y="100" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="145.2" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#4C5049" text-anchor="start">DuckDB 1.5.1</text>
+<path d="M290.0 130V640" stroke="#E4DDD0" stroke-width="1.5"/>
+<text x="290.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">1 ms</text>
+<path d="M420.5 130V640" stroke="#E4DDD0" stroke-width="1"/>
+<text x="420.5" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">10 ms</text>
+<path d="M551.0 130V640" stroke="#E4DDD0" stroke-width="1"/>
+<text x="551.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">100 ms</text>
+<path d="M681.4 130V640" stroke="#E4DDD0" stroke-width="1"/>
+<text x="681.4" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">1 s</text>
+<text x="868.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1">FASTER</text>
+<text x="32.0" y="154.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">SQL · 1M groups, all rows out</text>
+<rect x="290" y="142" width="287.2" height="12" rx="3" fill="#2a78d6"/>
+<text x="584.2" y="152.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">159 ms</text>
+<rect x="290" y="159" width="427.8" height="12" rx="3" fill="#1baf7a"/>
+<text x="724.8" y="169.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">1,900 ms</text>
+<text x="868.0" y="157.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">11.9x</text>
+<path d="M32 184H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="204.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">1M groups · median</text>
+<rect x="290" y="192" width="339.2" height="12" rx="3" fill="#2a78d6"/>
+<text x="636.2" y="202.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">398 ms</text>
+<rect x="290" y="209" width="436.3" height="12" rx="3" fill="#1baf7a"/>
+<text x="733.3" y="219.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">2,208 ms</text>
+<text x="868.0" y="207.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">5.5x</text>
+<path d="M32 234H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="254.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">1M groups · top-k</text>
+<rect x="290" y="242" width="346.1" height="12" rx="3" fill="#2a78d6"/>
+<text x="643.1" y="252.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">449 ms</text>
+<rect x="290" y="259" width="438.5" height="12" rx="3" fill="#1baf7a"/>
+<text x="735.5" y="269.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">2,295 ms</text>
+<text x="868.0" y="257.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">5.1x</text>
+<path d="M32 284H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="304.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · NOT EXISTS</text>
+<rect x="290" y="292" width="124.5" height="12" rx="3" fill="#2a78d6"/>
+<text x="421.5" y="302.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">9 ms</text>
+<rect x="290" y="309" width="201.5" height="12" rx="3" fill="#1baf7a"/>
+<text x="498.5" y="319.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">35 ms</text>
+<text x="868.0" y="307.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">3.9x</text>
+<path d="M32 334H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="354.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · EXISTS</text>
+<rect x="290" y="342" width="169.8" height="12" rx="3" fill="#2a78d6"/>
+<text x="466.8" y="352.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">20 ms</text>
+<rect x="290" y="359" width="240.8" height="12" rx="3" fill="#1baf7a"/>
+<text x="537.8" y="369.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">70 ms</text>
+<text x="868.0" y="357.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">3.5x</text>
+<path d="M32 384H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="404.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">SQL · SELECT DISTINCT s</text>
+<rect x="290" y="392" width="14.9" height="12" rx="3" fill="#2a78d6"/>
+<text x="311.9" y="402.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">1.3 ms</text>
+<rect x="290" y="409" width="78.6" height="12" rx="3" fill="#1baf7a"/>
+<text x="375.6" y="419.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">4.0 ms</text>
+<text x="868.0" y="407.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">3.1x</text>
+<path d="M32 434H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="454.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">LEFT join + GROUP BY</text>
+<rect x="290" y="442" width="163.8" height="12" rx="3" fill="#2a78d6"/>
+<text x="460.8" y="452.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">18 ms</text>
+<rect x="290" y="459" width="219.4" height="12" rx="3" fill="#1baf7a"/>
+<text x="516.4" y="469.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">48 ms</text>
+<text x="868.0" y="457.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">2.7x</text>
+<path d="M32 484H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="504.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · orders x customer</text>
+<rect x="290" y="492" width="72.6" height="12" rx="3" fill="#2a78d6"/>
+<text x="369.6" y="502.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">3.6 ms</text>
+<rect x="290" y="509" width="106.9" height="12" rx="3" fill="#1baf7a"/>
+<text x="403.9" y="519.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">6.6 ms</text>
+<text x="868.0" y="507.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">1.8x</text>
+<path d="M32 534H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="554.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">1M groups · count distinct</text>
+<rect x="290" y="542" width="335.4" height="12" rx="3" fill="#2a78d6"/>
+<text x="632.4" y="552.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">372 ms</text>
+<rect x="290" y="559" width="364.1" height="12" rx="3" fill="#1baf7a"/>
+<text x="661.1" y="569.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">617 ms</text>
+<text x="868.0" y="557.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">1.7x</text>
+<path d="M32 584H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="604.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join + group sum</text>
+<rect x="290" y="592" width="266.4" height="12" rx="3" fill="#2a78d6"/>
+<text x="563.4" y="602.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">110 ms</text>
+<rect x="290" y="609" width="283.2" height="12" rx="3" fill="#1baf7a"/>
+<text x="580.2" y="619.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="600" fill="#4C5049" text-anchor="start">148 ms</text>
+<text x="868.0" y="607.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15" font-weight="700" fill="#20221F" text-anchor="end">1.3x</text>
+<path d="M32 634H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="670.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</text>
 </svg>

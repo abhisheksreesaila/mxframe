@@ -42,5 +42,5 @@ Mockup: `design/docs-site.html` (options A, B and C; open it in a browser). Chos
 
 ## The Mojo engine page and README art (2026-10-19)
 - `docs/site/engine.html` and `docs/img/engine-*.svg` are drawn from one file, `docs/bench/engine-informal.json`, which quotes `docs/mojo-engine.md` (`tests/test_site_engine.py` checks every number). Regenerate the SVGs with `pixi run python scripts/make_engine_art.py`.
-- Two looks, compared in `docs/design/engine-compare.html`: **A** Terminal Ledger dark glow (default, `engine-*.svg`) and **B** editorial paper with a big serif number (`engine-*-paper.svg`).
-- The page hero is a dark focal card in both themes. The SVGs use system font stacks only (GitHub strips web fonts and scripts).
+- Look: **editorial paper** (picked 2026-10-19 over a dark Terminal Ledger glow; record in `docs/design/engine-compare.html`, the dark option is in commit `a0151ff`). Light ruled paper, one huge serif number (`--font-display`), the other headline numbers in a ruled ledger column, plum accent.
+- The page hero uses the site tokens, so it follows the light / dark toggle (dark uses `--accent-hi` for the serif units). The SVGs use system font stacks only (GitHub strips web fonts and scripts).
