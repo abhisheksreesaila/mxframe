@@ -1371,11 +1371,19 @@ struct _Emitter(Movable):
                 self.ins(OP_SELECT, v.reg, bad, z, v.reg)           # a failing row holds 0, so the conversion below reads a number
                 self.free(z)
                 self.ins(OP_F2I, v.reg, v.reg)
+                v.fl = False                                         # int64 bits now: a group key must not read -2 as a NaN
                 return self.cast_finish(v, bad, try_, String(self.rx[e].text))
             elif fk == INT.value or fk == DECIMAL.value or fk == BOOL.value:
                 var from_scale = fs if fk != BOOL.value else 0
                 if ts > from_scale:
-                    var k = self.const_i(pow10_checked(ts - from_scale))
+                    var m = pow10_checked(ts - from_scale)
+                    var cap = (pow10_checked(prec) - 1) // m if tk == DECIMAL.value else Int64.MAX // m
+                    var pre = self.out_of_range(v.reg, -cap, cap)     # a value that cannot fit after scaling fails before it overflows the multiplication
+                    var z0 = self.const_i(0)
+                    self.ins(OP_SELECT, v.reg, pre, z0, v.reg)
+                    self.free(z0)
+                    bad = pre
+                    var k = self.const_i(m)
                     self.ins(OP_IMUL, v.reg, v.reg, k)
                     self.free(k)
                 elif ts < from_scale:
@@ -2080,7 +2088,16 @@ struct _Emitter(Movable):
             return self.compare(x)
         if x.op == B_AND or x.op == B_OR:
             var a = self.boolean(x.a)
+            var decided = self.tmp()                                  # where the left side leaves the right one to matter: AND: not false, OR: not true
+            var kconst = self.const_f(0.0 if x.op == B_AND else 1.0)
+            self.ins(25, decided, a.reg, kconst, 0)
+            self.free(kconst)
+            var saved_guard = self.guard
+            self.guard = self.guard_with(decided)
             var b = self.boolean(x.b)
+            self.free(self.guard)
+            self.guard = saved_guard
+            self.free(decided)
             if not a.unk and not b.unk:
                 self.ins(OP_AND if x.op == B_AND else OP_OR, a.reg, a.reg, b.reg)
             else:                                                 # the minimum / the maximum
@@ -2333,6 +2350,12 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     # the predicate: the WHERE (unknown is not true), then the frame mask
     e.p.section = 0
     var pred = -1
+    var mask = -1
+    if masked:                                                    # a changed row of a frame is masked out: an error flag must not fire on its stale values
+        mask = e.tmp()
+        e.ins(OP_ISNULL, mask, _frame_mask(e.p))
+        e.ins(OP_NOT, mask, mask)
+        e.guard = mask
     if q.where >= 0:
         var w = e.boolean(q.where)
         if w.unk:
@@ -2340,15 +2363,13 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             e.ins(24, w.reg, w.reg, one)                         # == 1.0: unknown and false both drop the row
             e.free(one)
         pred = w.reg
+    e.guard = -1
     if masked:
-        var isnull = e.tmp()
-        e.ins(OP_ISNULL, isnull, _frame_mask(e.p))
-        e.ins(OP_NOT, isnull, isnull)
         if pred >= 0:
-            e.ins(OP_AND, pred, pred, isnull)
-            e.free(isnull)
+            e.ins(OP_AND, pred, pred, mask)
+            e.free(mask)
         else:
-            pred = isnull
+            pred = mask
     if pred >= 0:
         var k = e.keep(pred)
         e.free(pred)
@@ -2363,6 +2384,8 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         for k in range(len(plan.keys)):
             ref lay = plan.keys[k]
             var v = e.value(lay.expr)
+            if lay.nullable and v.nul < 0:                           # the planner says the key may be NULL (it is cautious about expressions): this one never is
+                v = V(v.reg, e.const_f(0.0), v.unk, v.fl)
             if lay.kind == TEXT.value or lay.kind == BOOL.value:
                 if lay.nullable:
                     var one = e.const_i(1)
@@ -2422,6 +2445,8 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         for k in range(len(plan.keys)):
             ref lay = plan.keys[k]
             var v = e.value(lay.expr)
+            if lay.nullable and v.nul < 0:                           # the planner says the key may be NULL (it is cautious about expressions): this one never is
+                v = V(v.reg, e.const_f(0.0), v.unk, v.fl)
             if v.fl:                                                  # -0.0 is 0.0 and every NaN is one value (F-077): one key word per value
                 var zero = e.const_f(0.0)
                 e.ins(OP_ADD, v.reg, v.reg, zero)                     # -0.0 + 0.0 is +0.0
@@ -2706,6 +2731,12 @@ def lower_rows(q: BoundQuery, computed: List[Int], var nullable: List[Bool], var
     e.free(cr)
     e.p.section = 0
     var pred = -1
+    var mask = -1
+    if masked:                                                    # a changed row of a frame is masked out: an error flag must not fire on its stale values
+        mask = e.tmp()
+        e.ins(OP_ISNULL, mask, _frame_mask(e.p))
+        e.ins(OP_NOT, mask, mask)
+        e.guard = mask
     if q.where >= 0:
         var w = e.boolean(q.where)
         if w.unk:
@@ -2713,15 +2744,13 @@ def lower_rows(q: BoundQuery, computed: List[Int], var nullable: List[Bool], var
             e.ins(24, w.reg, w.reg, one)
             e.free(one)
         pred = w.reg
+    e.guard = -1
     if masked:
-        var isnull = e.tmp()
-        e.ins(OP_ISNULL, isnull, _frame_mask(e.p))
-        e.ins(OP_NOT, isnull, isnull)
         if pred >= 0:
-            e.ins(OP_AND, pred, pred, isnull)
-            e.free(isnull)
+            e.ins(OP_AND, pred, pred, mask)
+            e.free(mask)
         else:
-            pred = isnull
+            pred = mask
     if pred >= 0:
         var k = e.keep(pred)
         e.free(pred)
