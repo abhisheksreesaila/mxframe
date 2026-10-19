@@ -25,6 +25,18 @@ def test_every_library_is_registered():
     assert LIBS == sorted(rbh.LIBRARIES)
 
 
+def test_every_registered_library_is_committed():
+    """kernels_aot/*.so is gitignored; each shipped library is force-added. A new one that was only built locally
+    passed every test in its worktree and was missing after the merge (F-153): `git add -f` it."""
+    import subprocess
+    p = subprocess.run(["git", "-C", str(ROOT), "ls-files", "kernels_aot"], capture_output=True, text=True)
+    if p.returncode != 0:
+        pytest.skip("not a git checkout")
+    tracked = {Path(f).name for f in p.stdout.split()}
+    missing = sorted(set(rbh.LIBRARIES) - tracked)
+    assert not missing, f"not committed (git add -f kernels_aot/<lib> and its .sources.json): {missing}"
+
+
 def test_source_sets_follow_imports():
     names = lambda lib: [p.name for p in rbh.sources(ROOT, lib)]
     assert names("libmxexec_cpu.so") == ["_fpenv.mojo", "executor_cpu.mojo", "hashagg_cpu.mojo", "pipeline_cpu.mojo"]
