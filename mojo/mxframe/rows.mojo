@@ -3,7 +3,7 @@
 A query with no aggregate returns rows: `SELECT a, b + 1 FROM t WHERE c > 3 ORDER BY a LIMIT 10`. The executor reads the source
 in chunks (`exec.mojo`) and for each chunk runs one kernel program (`sqlprog.lower_rows`) that evaluates the WHERE and computes
 the select list's expressions and the sort keys into registers. The kernel's block hook (`_rows_hook`, the pattern of
-query.mojo's `_mat_hook`) then writes, for each block of 4,096 rows, the numbers of the rows that passed and the values of
+query.mojo's `_mat_hook`) then writes, for each block of 1,024 rows, the numbers of the rows that passed and the values of
 the computed registers at the block's own place in output arrays, so no two workers write the same entry; a prefix sum over
 the blocks' counts compacts them. A plain column of the select list is not carried through registers: it is gathered from the
 chunk by the selected rows' numbers (so a wide `SELECT *` costs no registers). TEXT keeps the source's codes and the result's

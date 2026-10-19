@@ -17,14 +17,18 @@ Why the kernels are copied, not imported from `-I kernels_aot`: a `.mojoc` does 
 the `-I` path (a consumer then fails with "unable to locate module"), and a shared library that only re-imports
 `@export` functions exports nothing, so the `.so` builds must keep compiling the original files.
 
-## SQL (F-150)
+## SQL (F-150, F-152)
 
-`sql(catalog, "SELECT ...")` runs an aggregate query over one table, a Frame or a Parquet scan registered by name and returns an owned
-`Table` plus the planner's notes and EXPLAIN (`docs/mxframe-mojo-api.md` section 8). The modules: `sql.mojo` (lexer, parser, syntax tree),
-`bind.mojo` (Catalog, typed tree, binder), `planner.mojo` (`Planner` trait, `RulePlanner`, `Stats`, `PlannerOptions`), `sqlprog.mojo` (the
-kernel program in SQL's mode), `sqleval.mojo` (HAVING, ORDER BY and select expressions over the groups), `sqlexec.mojo` (chunks, partial
-results, the finish, `sql`). `mojo/tools/sql_probe.mojo` runs one SQL string over Parquet files and prints typed JSON (tests/test_mojo_sql.py
-compares it with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` run in `pixi run mojo-test`.
+`sql(catalog, "SELECT ...")` runs a query over one table, a Frame or a Parquet scan registered by name (aggregates, or rows: `SELECT *`,
+expressions, `DISTINCT`, `ORDER BY`, `LIMIT` / `OFFSET`) and returns an owned `Table` plus the planner's notes and EXPLAIN
+(`docs/mxframe-mojo-api.md` section 8). The modules, in the order a query passes them: `sql.mojo` (lexer, parser, syntax tree), `bind.mojo`
+(Catalog, typed tree, binder), `plan.mojo` (the logical plan: Scan, Filter, Aggregate, Project, Sort, Limit), `planner.mojo` (`Planner` trait,
+`RulePlanner`, `Stats`, `PlannerOptions`; the group strategy and the sink), `sqlprog.mojo` (the kernel program in SQL's mode), then the
+executor: `exec.mojo` (Sources: table, frame mask + delta, scan row groups; shared helpers), `sqlexec.mojo` (the aggregate Sinks: dense,
+hashed, holistic; `sql`), `rows.mojo` (the row Sinks: materialize through the kernel's block hook, top-k heaps), `post.mojo` (HAVING, the
+select list, ORDER BY and LIMIT after aggregation, run as a row query over the groups); `sqleval.mojo` holds the result column type and the
+exact AVG. `mojo/tools/sql_probe.mojo` runs one SQL string over Parquet files and prints typed JSON (tests/test_mojo_sql.py and
+tests/test_mojo_rows.py compare it, and `mx`, with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` run in `pixi run mojo-test`.
 
 ## `mx`, the agent command line (F-151)
 
