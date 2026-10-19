@@ -115,6 +115,25 @@ def main() raises:
     var dist = sql(cat, "SELECT DISTINCT k FROM t ORDER BY k")
     expect(dist.table.rows() == 3 and dist.table.get(0, 2) == 2, "SELECT DISTINCT")
 
+    # F-153: the inner join with no thread pool: unique keys fused, the same join materialized, and repeated keys (many to many)
+    var jf = sql(cat, "SELECT count(*), sum(b.k) FROM t a JOIN t b ON a.v = b.v")
+    var nofuse = PlannerOptions()
+    nofuse.fuse = False
+    var jm = sql(cat, "SELECT count(*), sum(b.k) FROM t a JOIN t b ON a.v = b.v", nofuse)
+    var fused = False
+    for note in jf.notes:
+        if note.startswith("join path: fused"):
+            fused = True
+    expect(fused and jf.table.get(0, 0) == Int64(n) and jm.table.get(0, 0) == Int64(n) and jf.table.get(1, 0) == jm.table.get(1, 0), "join, fused and materialized")
+    var mm = sql(cat, "SELECT count(*) FROM t a JOIN t b ON a.k = b.k WHERE a.v < 3000 AND b.v < 3000")      # 1,000 rows of each k on both sides
+    expect(mm.table.get(0, 0) == Int64(3_000_000), "join with repeated keys: " + String(mm.table.get(0, 0)) + " wanted 3000000")
+    var refused = False
+    try:
+        _ = sql(cat, "SELECT count(*) FROM t a JOIN t b ON a.k = b.k")
+    except e:
+        refused = "past the budget" in String(e)
+    expect(refused, "a join past the budget is refused before it allocates")
+
     # no thread pool: the parallel CSV reader runs its chunks one after the other
     var csv = String("mxframe-switches.csv")
     var text = String("a,b\n")

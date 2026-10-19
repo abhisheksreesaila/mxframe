@@ -59,6 +59,13 @@ def run() raises:
         var r2 = sql(cat, "SELECT DISTINCT k FROM " + name)
         var r3 = sql(cat, "SELECT * FROM " + name + " LIMIT 5")
         print(r1.table.rows(), r2.table.rows(), r3.table.rows())
+        # F-153: an inner join (fused, then materialized) of each source with the table, and the builder's join
+        var j1 = sql(cat, "SELECT a.k, count(*), sum(b.v) FROM " + name + " a JOIN t b ON a.v = b.v GROUP BY a.k")
+        var nofuse = PlannerOptions()
+        nofuse.fuse = False
+        var j2 = sql(cat, "SELECT a.k, b.v FROM " + name + " a JOIN t b ON a.v = b.v WHERE a.k = 1 ORDER BY 2 LIMIT 3", nofuse)
+        print(j1.table.rows(), j2.table.rows())
+    print(Query(shared).join(shared, ["v"], ["v"]).agg(count()).compute(AUTO).counts[0])
 
 
 @export("mojo_entry")
