@@ -1520,6 +1520,7 @@ Built (2026-10-18/19, branch worktree-agent-a27f985ecf9ff3560): `plan.mojo` (the
 
 ## F-153 M8: a second table and the inner equi-join (Catalog, hash join kernel, fused aggregate, row output) [todo]
 Needs: F-152 · Size: L · `kernels_aot/hashjoin_cpu.mojo` (new: int64-pointer API, shared with the Python engine), `bind.mojo`, `planner.mojo`, `exec.mojo`, `query.mojo` (`Query.join(other, on, how)`) · omxplorer: a second table, Explore's join step
+- [ ] first step (F-152 review): the executor walks the PlanNode IR (today plan.mojo only renders EXPLAIN; sqlexec / rows / post run from BoundQuery's single source); PlanNode gains a right input so two Scans and a Join form one plan
 - [ ] Catalog with several named sources; qualified and aliased names, ambiguous bare names raise; `JOIN … ON a.k = b.k [AND …]`, comma joins with WHERE equalities, `USING`
 - [ ] hash table: keys normalized to one int64 (single column; composites packed when ranges fit, else tuple hash + column compare); direct array (CSR when keys repeat) when range ≤ max(8n, 2^20) and ≤ 2^28, else radix partitions sized from L2, linear probing, CSR rows in build order, parallel build without atomics; presence bitmap; group prefetch in the probe
 - [ ] fused probe for unique build keys (`pipeline_fused` front stage: probe filter, lookups, build columns gathered into block scratch, then the aggregate program); repeated keys or row output → materialized pairs (counted first; past the budget a readable error); build side = fewer rows after filters
