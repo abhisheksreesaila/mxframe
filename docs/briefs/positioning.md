@@ -3,7 +3,7 @@
 Status: approved (owner, 2026-10-19)
 
 ## One line
-**DuckDB-class SQL that uses your GPU and links into any app with no Python.** omxcore is a compute engine (CPU and
+**DuckDB-class SQL that uses your GPU and links into any app with no Python. Plug and play with the CSV and Parquet files you already have.** omxcore is a compute engine (CPU and
 GPU, SQL, joins, streaming) with persistence to open Parquet files. It is the core that apps and agents build on, like
 SQLite. (Renamed from MX frame: F-165.)
 
@@ -34,6 +34,8 @@ engine becomes a generic core primitive any app can use.
 | **Classification / decision API** | label or route rows (rules, small models, embeddings vs examples), batched on the GPU | user-defined functions run per block; per-word text functions (F-156) |
 | **MCP server** (F-169) | `sql`, `explain`, `schema`, `search` as tools any agent can call | `mx` |
 | **Memory for agents** | append-only facts with time and source, queried like any table; versions later (M9, Delta-style) | Parquet + append; nothing new |
+
+**Plug and play:** every plugin works on the CSV and Parquet files you already have: point it at a file or folder and query, search or classify. No import, no new format, nothing to convert (`mx sql "… FROM 'tickets.csv'"` works today; vectors are a column in the same Parquet file).
 
 Rule: the core never learns about agents; it gains vectors, a top-k distance kernel and UDFs, and the agent features
 live in plugins over them.
