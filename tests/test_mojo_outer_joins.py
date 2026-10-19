@@ -252,6 +252,31 @@ def test_not_in_is_null_aware(mx, data, sql, why, expect_note):
     q(mx, data, sql, tables, extra=["--join", "materialize"])
 
 
+SCOPES = [
+    # a name in a subquery means the subquery's own table when it is that table's alias (or its name, with no alias); the outer query is reached only by what the subquery does not define
+    "SELECT count(*) FROM cust WHERE seg IN (SELECT seg FROM cust WHERE cust.ck > 300)",
+    "SELECT count(*) FROM cust c1 WHERE seg IN (SELECT seg FROM cust WHERE cust.ck > 300)",
+    "SELECT count(*) FROM cust c1 WHERE NOT EXISTS (SELECT * FROM cust WHERE cust.seg = c1.seg AND cust.ck > 300)",
+    "SELECT count(*) FROM cust c1 WHERE EXISTS (SELECT * FROM cust WHERE cust.seg = c1.seg AND cust.ck > 300)",
+    "SELECT count(*) FROM cust WHERE EXISTS (SELECT * FROM cust c2 WHERE c2.seg = cust.seg AND c2.ck > 300)",
+    "SELECT count(*) FROM cust WHERE NOT EXISTS (SELECT * FROM cust c2 WHERE c2.seg = cust.seg AND c2.ck > 300)",
+    "SELECT count(*) FROM cust AS cust WHERE cust.ck IN (SELECT ck FROM cust WHERE cust.seg < 10)",
+    "SELECT count(*) FROM cust c1 WHERE c1.ck IN (SELECT cust.ck FROM cust WHERE cust.seg < 10 AND cust.ck > 100)",
+    "SELECT count(*) FROM cust c1 WHERE c1.seg IN (SELECT cust.amt FROM ords cust WHERE cust.amt > 20)",
+    "SELECT count(*) FROM cust c1 WHERE c1.seg NOT IN (SELECT cust.amt FROM ords cust WHERE cust.amt > 20 AND cust.amt IS NOT NULL)",
+    "SELECT count(*) FROM cust c1 WHERE EXISTS (SELECT 1 FROM ords o WHERE o.ck = c1.ck AND o.amt > 50)",
+    "SELECT count(*) FROM cust WHERE EXISTS (SELECT 1 FROM ords WHERE ords.ck = cust.ck AND ords.amt > 50)",
+    "SELECT c1.s, count(*) FROM cust c1 WHERE NOT EXISTS (SELECT * FROM ords WHERE ords.ck = c1.ck AND amt > 50) GROUP BY c1.s",
+    "SELECT ck FROM cust WHERE seg IN (SELECT seg FROM cust c3 WHERE c3.ck < 20) AND cust.ck > 380",
+]
+
+
+@pytest.mark.parametrize("extra", [[], ["--join", "materialize"], ["--stream", "always"]])
+@pytest.mark.parametrize("sql", SCOPES)
+def test_subquery_names_resolve_innermost_scope_first(mx, data, sql, extra):
+    q(mx, data, sql, ["cust", "ords"], extra=extra)
+
+
 def test_presence_joins_over_a_multi_block_probe(mx, data):
     """30,000 fact rows are several blocks of the pipeline and several workers; the dimension has unique and the orders repeated keys."""
     for sql in [
