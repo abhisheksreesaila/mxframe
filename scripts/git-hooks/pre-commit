@@ -4,9 +4,10 @@
 # Installed by `git config core.hooksPath scripts/git-hooks`.
 set -euo pipefail
 if git diff --cached --name-only | grep -qE '^kernels_aot/.*\.mojo$'; then
-  if ! pixi run -q python -m pytest -q -p no:cacheprovider tests/test_kernel_hashes.py > /tmp/mxframe-kernel-hashes.log 2>&1; then
+  log="$HOME/.cache/mxframe-kernel-hashes.log"   # run_tests.sh shims the package, so this works in agent worktrees too
+  if ! pixi run -q bash scripts/run_tests.sh -q -p no:cacheprovider tests/test_kernel_hashes.py > "$log" 2>&1; then
     echo "pre-commit: a kernel source changed but its library was not rebuilt:" >&2
-    grep -E "stale|FAILED" /tmp/mxframe-kernel-hashes.log | head -10 >&2
+    grep -E "stale|FAILED" "$log" | head -10 >&2
     echo "rebuild with: pixi run bash scripts/build_pipeline.sh  (then stage the .so and .sources.json files)" >&2
     exit 1
   fi
