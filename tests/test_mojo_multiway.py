@@ -109,7 +109,7 @@ ORDERED = {"q3": True, "q3j": True, "q5": True, "q7": True, "q8": True, "q9": Tr
 def test_the_planners_choice_equals_duckdb(mx, tpch, name):
     res = q(mx, tpch, SHAPES[name], ordered=ORDERED[name])
     assert note(res, "join order:").startswith("join order: "), res["notes"]
-    assert any(n.startswith("last join:") for n in res["notes"]), res["notes"]
+    assert any(n.startswith("last join:") or n.startswith("star dimension") for n in res["notes"]), res["notes"]
     assert any(n.startswith("join path:") for n in res["notes"]), res["notes"]
 
 

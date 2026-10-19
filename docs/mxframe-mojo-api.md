@@ -301,7 +301,7 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 **A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
 `x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
 
-**Limits**: joins: inner, left, semi, anti, two tables, see 8b (multi-way: F-155); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
+**Limits**: joins: inner, left, semi, anti over two tables, inner over three or more (see 8b); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
 at most 48 registers (about 20 aggregates over different expressions) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
 Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
@@ -403,7 +403,7 @@ Things an agent should know:
   them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.
 - Text order is the owner's (case-insensitive, bytes as the tie-break), so `min(s)` / `ORDER BY s` on text differ from DuckDB's byte order; DECIMAL `median` has one more digit of scale than DuckDB.
 
-## 8b. Joins (F-153, F-154)
+## 8b. Joins (F-153, F-154, F-155)
 
 The equi-join (inner, left, semi, anti) is an engine feature: a catalog of named sources (tables, Frames, Parquet scans), the PlanNode IR with two Scans under a Join, a hash join
 kernel, and two ways to run it. It names no application; SQL, `Query.join`, and any other caller use the same code (the Python engine does not call the kernel yet: F-161). `Query.join` always materializes every column of both tables (it cannot know yet what the query after it reads): fusing it and carrying only the needed columns is F-161.
@@ -422,6 +422,28 @@ conditions on the subquery's table filter it. Shapes that need a residual predic
 left table alone, in the ON of a LEFT or ANTI join (F-155); one subquery per WHERE, joined to the rest by AND (F-155); a subquery with GROUP BY, a join, a scalar subquery or an EXISTS with no
 correlated equality (F-159). A LEFT join on keys too wide to pack into one int64 is refused (F-155).
 
+**Three or more tables (F-155)**: `FROM a, b, c WHERE ...` and `a JOIN b ON .. JOIN c ON ..` (inner joins; `USING` and the other kinds raise by name: a LEFT, SEMI or ANTI join with a third
+table is F-159). The WHERE and the ON conditions are one set of conjuncts: an equality between columns of two tables is an edge of the join graph (the tables must be connected by them: no
+cross product), a condition on one table filters that table first, a condition that reads several (an OR across tables, an inequality) is checked as soon as every table it reads is joined. The
+common factors of an OR come out first: `(A AND x) OR (A AND y)` is `A AND (x OR y)` (TPC-H Q19: the shared `p_partkey = l_partkey` becomes the join key). Names resolve as for two tables
+(an alias per use of a table; the same table twice needs two aliases).
+
+How it runs, in the order of `EXPLAIN`'s notes: every table runs its own filter first (a row query over its source), so the planner works from exact filtered row counts and sampled
+distinct counts of the join columns (`statistics:` notes; a table of 65,536 rows or more whose filter passes at least half of it is only counted and read unfiltered when it is the last join's
+probe side: its filter then runs in the pipeline and no filtered copy is written); `Planner.join_order(JoinStats, PlannerOptions) -> JoinPlan` picks the order and the build side of each join
+(the default `rule_join_order`: a greedy chain from every table as the start, the next table being the connected one that leaves the fewest rows by `rows x rows / max(distinct counts)`, the
+cheapest chain by hashing the smaller input twice, probing the larger once and producing the output once; the written order is kept when it connects and its cost is within 10% of the best);
+each join but the last gathers its pairs into a table that keeps only the columns later steps read; the last join runs with the rest of the query (aggregate, ORDER BY, LIMIT), fused when its build
+keys are unique. A tail of joins on dimensions with unique keys runs as one **star**: the probe rows meet every dimension's map in one pass of blocks (each map's partner row is kept per block row,
+so a miss in any drops the row), and no joined row or intermediate table is written; a dimension reached only through another (nation through supplier) is joined to it first. `PlannerOptions`
+forces each choice: `join_order` (the tables' positions in FROM), `written_order`, `build_side` (BUILD_LEFT / BUILD_RIGHT), `join_budget` (bytes of joined values a materialized join may take),
+`fuse` (False: no fused join, no star); `mx sql --order written|2,0,1  --build left|right  --join-budget BYTES  --join materialize`. A custom `Planner` overrides `join_order` and the executor does
+not change (`mojo/tests/test_multiway.mojo`).
+
+`EXPLAIN` shows the plan as written (a left-deep chain of the tables), then every decision with its numbers: the leaves' rows, the distinct counts, the chosen order and why, each join's hash side
+and estimated rows. `EXPLAIN ANALYZE` (also `mx explain --analyze`) runs the query and adds an `Actual` section: the rows and milliseconds of each scan, each join (actual rows next to the estimate), each
+filter across tables, the star, and the result.
+
 **Builder**: `Query(left).join(right: SharedTable, left_on, right_on, how)` (`how` = "inner", "left", "semi" or "anti") returns a query over the joined rows (this table's columns, then the other's; a repeated name gets a
 suffix `_1`). It must come first and works over plain tables; the rest of the builder's rules apply after it.
 
@@ -435,6 +457,7 @@ keys are packed into one int64 when the build side's ranges multiply to fewer th
   a scan's row groups and a one-side filter are all applied; an unfiltered plain table is read in place).
 - *fused*: the build keys are unique (aggregates, and row queries including top-k and ORDER BY / LIMIT). The probe table is scanned by the pipeline; each block's rows look their partner up (direct array or hash table, with prefetch) and
   the partner's columns are gathered into per-worker scratch. No joined row is written.
+- A **word dictionary is shared, not copied**: a join's gathered columns and the fused join's schema hold the source column's dictionary (an `ArcPointer`; the first `add_word` on a shared one copies it), so a join over a 150,000-word text column costs no per-word work.
 - *fused* LEFT: the same with unique build keys; an unmatched row stays in the block with its build columns NULL (validity bits clear). *Fused* SEMI / ANTI: any build keys (a presence-only
   map: one pass of marks, no repeated-key rows); the block's rows are kept or dropped by whether their key is present, and nothing is gathered.
 - *materialized*: repeated build keys, hashed composite keys, or holistic aggregates (median, percentiles, distinct): the matching (probe, build) pairs are counted
@@ -445,7 +468,7 @@ out. `hj_build` picks a direct array (range at most max(8n, 2^20) and 2^28; CSR 
 is parallel without atomics. `hj_probe_unique`, `hj_probe_pairs` (budgeted; `outer` adds a LEFT join's unmatched rows as build row -1) and `hj_probe_block` / `hj_probe_left_block` (fused) probe it; `hj_build(presence=True)` and `hj_probe_select` / `hj_filter_block` (modes semi, anti, null-aware anti, none) are the semi and anti joins' form. The engine-level steps (`normalize_keys`, `join_pairs`, `gather_join`) are in `joincore.mojo`.
 
 ## 9. Later (Query and Explore modes)
-RIGHT / FULL joins, multi-way joins, scalar subqueries, expression functions (M8: F-155 to F-162); pipelines with cached steps; versioned column
+RIGHT / FULL joins, LEFT / SEMI / ANTI with three tables, scalar subqueries, expression functions (M8: F-156 to F-162); pipelines with cached steps; versioned column
 chunks for a time machine and branches; TPC-H through SQL.
 
 ## Memory rules
