@@ -674,3 +674,15 @@ def test_random_queries_equal_duckdb(probe, data, mode, seed):
         want = ds.oracle(mode).execute(q).fetchall()
         assert_equal(got_rows(res), want, False, f"{mode}: {q}")
     assert compared >= 25, f"only {compared} of 40 random queries ran"
+
+
+@pytest.mark.parametrize("keys", ["g", "k", "dt", "k, b", "g, k", "d", "e", "x + 1", "k * 3 - 2", "x // 100, k"])
+def test_a_scans_statistics_plan_like_the_table(probe, data, keys):
+    """The row groups' min / max statistics give a streamed file the ranges a table gets from a pass over its column, so the
+    same keys get the same strategy with the same domain."""
+    sql = f"EXPLAIN SELECT {keys}, count(*) FROM t GROUP BY {keys}"
+    plans = []
+    for mode in ("table", "scan"):
+        lines = [r[0] for r in run_probe(probe, sql, {"t": data["g8"].path}, mode=mode)["rows"]]
+        plans.append(next(l for l in lines if l.startswith("  group:")))
+    assert plans[0] == plans[1], plans

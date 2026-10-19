@@ -584,9 +584,11 @@ struct _ChunkMeta(Copyable, Movable):
     var size: Int                    # total_compressed_size: the bytes of the chunk's pages (headers included)
     var group_rows: Int              # its row group's num_rows, -1 when the footer has none
     var nulls: Int                   # its Statistics' null_count, -1 when absent
-    var stat_min: Int64          # its Statistics' minimum and maximum (INT32 / INT64 columns), as the file stores them
-    var stat_max: Int64
-    var has_stats: Bool
+    var stat_n: Int                  # the byte length of its Statistics' minimum and maximum (0: it states none)
+    var min_le: Int64                # the minimum and maximum read little-endian (INT32 / INT64) and big-endian (a short decimal)
+    var max_le: Int64
+    var min_be: Int64
+    var max_be: Int64
 
 
 struct _Bytes:
@@ -1036,7 +1038,7 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
         if f[0] == 1 and f[1] == T_LIST:
             var h = r.list_header()
             for _ in range(h[1]):
-                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0, -1, -1, 0, 0, False)
+                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0, -1, -1, 0, 0, 0, 0, 0)
                 r.enter()
                 while True:
                     var g = r.field()
@@ -1064,10 +1066,8 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
                                 meta.dict_off = Int(r.zigzag())
                             elif m[0] == 12 and m[1] == T_STRUCT:      # Statistics (F-150: ranges and null counts for the planner)
                                 r.enter()
-                                var lo5 = (0, Int64(0))
-                                var hi5 = (0, Int64(0))
-                                var lo2 = (0, Int64(0))
-                                var hi2 = (0, Int64(0))
+                                var lo5 = (0, Int64(0), Int64(0))
+                                var hi5 = (0, Int64(0), Int64(0))
                                 while True:
                                     var st = r.field()
                                     if st[1] == T_STOP:
@@ -1075,25 +1075,18 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
                                     if st[0] == 3 and st[1] == T_I64:
                                         meta.nulls = Int(r.zigzag())
                                     elif st[0] == 5 and st[1] == T_BINARY:
-                                        hi5 = r.le_value()
+                                        hi5 = r.raw_value()
                                     elif st[0] == 6 and st[1] == T_BINARY:
-                                        lo5 = r.le_value()
-                                    elif st[0] == 1 and st[1] == T_BINARY:
-                                        hi2 = r.le_value()
-                                    elif st[0] == 2 and st[1] == T_BINARY:
-                                        lo2 = r.le_value()
+                                        lo5 = r.raw_value()
                                     else:
                                         r.skip(st[1])
                                 r.leave()
-                                var want = 4 if meta.ptype == PT_INT32 else 8
-                                if lo5[0] == want and hi5[0] == want:
-                                    meta.has_stats = True
-                                    meta.stat_min = lo5[1]
-                                    meta.stat_max = hi5[1]
-                                elif lo2[0] == want and hi2[0] == want:
-                                    meta.has_stats = True
-                                    meta.stat_min = lo2[1]
-                                    meta.stat_max = hi2[1]
+                                if lo5[0] == hi5[0] and lo5[0] > 0 and lo5[0] <= 8:
+                                    meta.stat_n = lo5[0]
+                                    meta.min_le = lo5[1]
+                                    meta.max_le = hi5[1]
+                                    meta.min_be = lo5[2]
+                                    meta.max_be = hi5[2]
                             else:
                                 r.skip(m[1])
                         r.leave()
@@ -2474,25 +2467,27 @@ struct ParquetScan(Copyable, Movable):
 
     def column_range(self, c: Int) -> Tuple[Bool, Int64, Int64]:
         """(known, lowest, highest) stored value of column `c` from the row groups' statistics, for INT, DECIMAL and DATE columns on
-        INT32 / INT64: `known` is False when a row group states none or the column is of another kind (and when there is no value at
-        all, known is True with lowest > highest)."""
+        INT32, INT64 or a short FIXED_LEN_BYTE_ARRAY decimal: `known` is False when a row group states none or the column is of another
+        kind (and when there is no value at all, known is True with lowest > highest)."""
         var k = self.schema.kind(c)
         if k != INT and k != DECIMAL and k != DATE:
             return (False, 0, 0)
         ref leaf = self._info[].leaves[c]
-        if (leaf.ptype != PT_INT32 and leaf.ptype != PT_INT64) or (_is_unsigned(leaf) and leaf.ptype == PT_INT64):
+        var fixed = leaf.ptype == PT_FIXED and k == DECIMAL and leaf.type_length >= 1 and leaf.type_length <= 8
+        if (leaf.ptype != PT_INT32 and leaf.ptype != PT_INT64 and not fixed) or (_is_unsigned(leaf) and leaf.ptype == PT_INT64):
             return (False, 0, 0)
+        var want = 4 if leaf.ptype == PT_INT32 else 8 if leaf.ptype == PT_INT64 else leaf.type_length
         var lo = Int64.MAX
         var hi = Int64.MIN
         for g in range(len(self._info[].groups)):
             ref ch = self._info[].groups[g][c]
             if ch.values == 0 or (ch.nulls >= 0 and ch.nulls == ch.values):          # no value in the chunk
                 continue
-            if not ch.has_stats:
+            if ch.stat_n != want:
                 return (False, 0, 0)
             try:
-                lo = min(lo, _to_stored(leaf, ch.stat_min))
-                hi = max(hi, _to_stored(leaf, ch.stat_max))
+                lo = min(lo, _to_stored(leaf, ch.min_be if fixed else ch.min_le))
+                hi = max(hi, _to_stored(leaf, ch.max_be if fixed else ch.max_le))
             except:
                 return (False, 0, 0)
         return (True, lo, hi)
