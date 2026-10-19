@@ -7,6 +7,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # with "Disk quota exceeded"), so use a disk-backed directory, as scripts/run_tests.sh does.
 export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
 mkdir -p "$TMPDIR"
+python3 "$root/scripts/check_list_lifetimes.py" || { echo "FAIL (a list whose address a kernel reads is freed too early: see scripts/check_list_lifetimes.py)"; exit 1; }
 # Each run gets a private working directory: the tests write their scratch files by relative path, so two runs at
 # once (agents in several worktrees) never read each other's half-written files.
 rundir="$(mktemp -d "$TMPDIR/mojo-test-run.XXXXXX")"

@@ -25,9 +25,16 @@ from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN
 from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
-from .planner import Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
+from .plan import LogicalPlan, build_plan
+from .post import run_post
+from .rows import RowStage, prepare_rows, execute_rows, _Item
+from .sqlprog import lower_rows
+from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
-from .sqleval import ValCol, eval_post, float_bits, ld_div
+from .sqleval import ValCol, float_bits, ld_div
+from .exec import (_table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
+                   delta_table, _gather, _sort_keys, _order_rows, _SortCols, _top_rows, _fill_column, _unique_name, _to_table, _ones_mask,
+                   _Chunks, _open_chunks, _load_chunk, LIE, _check_footer, _all, _Inputs, _inputs)
 
 
 struct SqlResult(Movable):
@@ -169,20 +176,6 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int], mut ix: _Key
         acc.counts[found] += other.counts[o]
 
 
-def _table_addresses(t: SharedTable, p: Program, mask_addr: Int) -> List[Int64]:
-    var tbl: List[Int64] = [0, Int64(t.rows())]
-    for c in p.cols:
-        if c >= 0:
-            tbl.append(Int64(Int(t.values(c).unsafe_ptr())))
-        elif c == -1_000_000 or c == -5_000_000:
-            tbl.append(0)
-        elif c == -4_000_000:
-            tbl.append(Int64(mask_addr))
-        else:
-            tbl.append(Int64(t._table[].cols[-1 - c].validity_address()))
-    return tbl^
-
-
 def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int) raises -> Partial:
     """The kernel with hashed groups (hashagg_cpu.hash_aggregate): each worker numbers the key tuples of its rows in a local
     table, the partitions are merged in parallel, and the result is the groups with their key words, slots and counts."""
@@ -264,210 +257,11 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
     return out^
 
 
-# ── sources: statistics, the delta table, the program's inputs ───────────────────────────────────────
-
-def _column_range(t: SharedTable, c: Int) -> Tuple[Bool, Int64, Int64]:
-    """The lowest and highest non-null value of a column (and whether there is one): in parallel over slices of the rows."""
-    var n = t.rows()
-    var tasks = max(1, min(core_count(), n // 65536))
-    var los = List[Int64](length=tasks, fill=Int64.MAX)
-    var his = List[Int64](length=tasks, fill=Int64.MIN)
-    var seen = List[Int64](length=tasks, fill=0)
-    var vp = Int(t.values(c).unsafe_ptr())
-    var valid = t._table[].cols[c].validity_address()
-    var lp = Int(los.unsafe_ptr())
-    var hp = Int(his.unsafe_ptr())
-    var sp = Int(seen.unsafe_ptr())
-
-    def work(i: Int) {imm}:
-        var vals = LP(unsafe_from_address=vp)
-        var bits = BP(unsafe_from_address=valid)
-        var lo = Int64.MAX
-        var hi = Int64.MIN
-        var any = Int64(0)
-        var a = n * i // tasks
-        var b = n * (i + 1) // tasks
-        if valid == 0:
-            for r in range(a, b):
-                var v = vals[r]
-                lo = min(lo, v)
-                hi = max(hi, v)
-            any = Int64(1) if b > a else Int64(0)
-        else:
-            for r in range(a, b):
-                if (bits[r >> 3] >> UInt8(r & 7)) & 1 != 0:
-                    var v = vals[r]
-                    lo = min(lo, v)
-                    hi = max(hi, v)
-                    any = 1
-        LP(unsafe_from_address=lp)[i] = lo
-        LP(unsafe_from_address=hp)[i] = hi
-        LP(unsafe_from_address=sp)[i] = any
-
-    if tasks == 1:
-        work(0)
-    else:
-        par_n(work, tasks, tasks)
-    var lo = Int64.MAX
-    var hi = Int64.MIN
-    var any = False
-    for i in range(tasks):
-        if seen[i] != 0:
-            lo = min(lo, los[i])
-            hi = max(hi, his[i])
-            any = True
-    return (any, lo, hi)
-
-
-def _is_range_kind(k: Int) -> Bool:
-    return k == INT.value or k == DECIMAL.value or k == DATE.value
-
-
-def _key_columns(q: BoundQuery, e: Int, mut out: List[Int]):
-    """The integer-like source columns a row-level expression reads."""
-    ref x = q.rexprs[e]
-    if x.op == B_COL and _is_range_kind(x.kind):
-        var c = Int(x.value)
-        for k in out:
-            if k == c:
-                return
-        out.append(c)
-    if x.a >= 0:
-        _key_columns(q, x.a, out)
-    if x.b >= 0:
-        _key_columns(q, x.b, out)
-
-
-def prepare_ranges(mut catalog: Catalog, q: BoundQuery) raises:
-    """Caches the value range of each integer-like column a group key reads: one pass over a table or frame's column (the frame's
-    changed rows included), the row groups' statistics for a scan (none when a row group states none, then it is hashed)."""
-    ref src = catalog.sources[q.source]
-    var cols = List[Int]()
-    for k in q.keys:
-        _key_columns(q, k.expr, cols)
-    for c in cols:
-        var cached = False
-        for x in src.range_cols:
-            if x == c:
-                cached = True
-        if cached:
-            continue
-        var r = _column_range(src.table, c) if src.kind != SRC_SCAN else src.scan.value().column_range(c)
-        if src.kind == SRC_SCAN and not r[0]:
-            continue                                       # no statistics: the planner will say so
-        var has = r[0] and r[1] <= r[2] if src.kind == SRC_SCAN else r[0]
-        var lo = r[1]
-        var hi = r[2]
-        for row in src.overlay.delta:                      # a frame's changed and appended rows
-            if row[c] != NULL_EDIT:
-                lo = min(lo, row[c])
-                hi = max(hi, row[c])
-                has = True
-        src.range_cols.append(c)
-        src.range_lo.append(lo)
-        src.range_hi.append(hi)
-        src.range_has.append(has)
-
-
-def _alias_lists(src: SqlSource) -> List[List[Int]]:
-    var out = List[List[Int]]()
-    for _ in range(src.table.columns()):
-        out.append(List[Int]())
-    for item in src.overlay.aliases.items():
-        var c = Int(item.key >> 32)
-        if c < len(out):
-            out[c].append(Int(item.key & 0xFFFFFFFF))
-            out[c].append(Int(item.value))
-    return out^
-
-
-def _delta_nulls(src: SqlSource, c: Int) -> Bool:
-    for row in src.overlay.delta:
-        if row[c] == NULL_EDIT:
-            return True
-    return False
-
-
-def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess, trust: Bool = True) raises -> Stats:
-    """`trust` False: a file's footer statistics are not used (every column may hold NULLs, no range is known)."""
-    var st = Stats(src.name, src.kind, src.rows() + (len(src.overlay.delta) if src.kind != SRC_SCAN else 0))
-    st.edits = len(src.overlay.delta)
-    st.version = src.version
-    st.distrusted = not trust
-    if src.scan:
-        st.row_groups = src.scan.value().row_groups()
-    for c in range(src.table.columns()):
-        var cs = ColStat(src.table.kind(c).value, src.table.scale(c))
-        if src.kind == SRC_SCAN:
-            cs.nullable = not trust or src.scan.value().null_count(c) != 0 or _delta_nulls(src, c)
-        else:
-            cs.nullable = src.table.null_count(c) > 0 or _delta_nulls(src, c)
-        if cs.kind == TEXT.value:
-            cs.words = dicts.count(c)
-        for i in range(len(src.range_cols)):
-            if src.range_cols[i] == c and src.range_has[i] and (trust or src.kind != SRC_SCAN):
-                cs.has_range = True
-                cs.lo = src.range_lo[i]
-                cs.hi = src.range_hi[i]
-        st.cols.append(cs^)
-    return st^
-
-
-def delta_table(src: SqlSource, cols: List[Int]) raises -> SharedTable:
-    """The frame's changed and appended rows as a small table of `cols` (merged TEXT codes applied)."""
-    var t = Table.empty()
-    for c in cols:
-        _ = t.add_column(src.table.name(c), src.table.kind(c), scale=src.table.scale(c))
-    for row in src.overlay.delta:
-        for k in range(len(cols)):
-            var raw = row[cols[k]]
-            if raw == NULL_EDIT:
-                t.cols[k].push(0, False)
-            else:
-                if src.table.kind(cols[k]) == TEXT:
-                    var hit = src.overlay.aliases.get((cols[k] << 32) | Int(raw))
-                    if hit:
-                        raw = hit.value()
-                t.cols[k].push(raw, True)
-    return t^.share()
-
-
 # ── text for EXPLAIN ─────────────────────────────────────────────────────────────────────────────────
 
-def _logical_text(q: BoundQuery, src: SqlSource) -> List[String]:
-    var lines = List[String]()
-    if q.limit >= 0 or q.offset > 0:
-        lines.append("Limit " + (String(q.limit) if q.limit >= 0 else "all") + (" offset " + String(q.offset) if q.offset > 0 else ""))
-    if len(q.order) > 0:
-        var s = String("Sort ")
-        for k in range(len(q.order_text)):
-            s += (", " if k > 0 else "") + q.order_text[k]
-        lines.append(s)
-    var proj = String("Project ")
-    for k in range(len(q.out_text)):
-        proj += (", " if k > 0 else "") + q.out_text[k]
-    lines.append(proj)
-    if q.having >= 0:
-        lines.append("Filter (HAVING) " + q.having_text)
-    var agg = String("Aggregate")
-    if len(q.keys) > 0:
-        agg += " keys=["
-        for k in range(len(q.keys)):
-            agg += (", " if k > 0 else "") + q.keys[k].name
-        agg += "]"
-    agg += " aggs=["
-    for k in range(len(q.aggs)):
-        agg += (", " if k > 0 else "") + q.aggs[k].name
-    lines.append(agg + "]")
-    if q.where >= 0:
-        lines.append("Filter (WHERE) " + q.where_text)
-    lines.append("Scan " + src.name)
-    return lines^
-
-
-def _explain_text(q: BoundQuery, src: SqlSource, notes: List[String]) -> String:
+def _explain_text(lp: LogicalPlan, notes: List[String]) -> String:
     var out = String("Logical plan\n")
-    var lines = _logical_text(q, src)
+    var lines = lp.lines()
     for i in range(len(lines)):
         out += "  " * (1 + i) + lines[i] + "\n"
     out += "Physical plan\n"
@@ -476,217 +270,8 @@ def _explain_text(q: BoundQuery, src: SqlSource, notes: List[String]) -> String:
     return out^
 
 
-# ── finishing: groups -> HAVING -> ORDER BY -> LIMIT -> the result table ─────────────────────────────
-
-def _gather(vc: ValCol, idx: List[Int]) -> ValCol:
-    var out = ValCol(vc.kind, vc.scale, len(idx))
-    out.src = vc.src
-    for i in range(len(idx)):
-        out.v[i] = vc.v[idx[i]]
-    if len(vc.nul) > 0:
-        out.nul = List[UInt8](length=len(idx), fill=0)
-        for i in range(len(idx)):
-            out.nul[i] = vc.nul[idx[i]]
-    return out^
-
-
-def _sort_keys(vc: ValCol, dicts: DictAccess) raises -> List[Int64]:
-    """Int64 keys whose signed order is the column's order: ints as they are, floats by their bits, TEXT by the place of
-    the word among the words present (alphabetical, ignoring ASCII case, bytes as the tie-break)."""
-    var n = vc.n()
-    var keys = List[Int64](length=n, fill=0)
-    if vc.kind == FLOAT.value:
-        for i in range(n):
-            keys[i] = float_key(vc.v[i])                  # -0.0 ties with 0.0 and every NaN with every NaN, above +inf (DuckDB's order)
-        return keys^
-    if vc.kind == TEXT.value:
-        var seen = List[Int](length=0, fill=0)
-        var present = List[Int]()
-        var index = List[Int]()
-        var mx = 0
-        for i in range(n):
-            if not vc.is_null(i):
-                mx = max(mx, Int(vc.v[i]))
-        var at = List[Int32](length=mx + 1, fill=-1)
-        for i in range(n):
-            if vc.is_null(i):
-                continue
-            var c = Int(vc.v[i])
-            if at[c] < 0:
-                at[c] = Int32(len(present))
-                present.append(c)
-        var words = List[String]()
-        for c in present:
-            words.append(dicts.word(vc.src, c))
-        var ranks = text_ranks(words)
-        for i in range(n):
-            if not vc.is_null(i):
-                keys[i] = ranks[Int(at[Int(vc.v[i])])]
-        return keys^
-    for i in range(n):
-        keys[i] = vc.v[i]
-    return keys^
-
-
-def _order_rows(cols: List[ValCol], order: List[SortKey], dicts: DictAccess, n: Int) raises -> List[Int]:
-    """The rows 0 .. n-1 sorted by the ORDER BY keys: stable LSD passes from the last key to the first (and, within a
-    key with NULLs, the values first and then the NULL flag, so NULLS LAST / FIRST holds whatever the direction)."""
-    var perm = List[Int](length=n, fill=0)
-    for i in range(n):
-        perm[i] = i
-    var k = len(order) - 1
-    while k >= 0:
-        var vc = cols[k].copy()
-        var keys = _sort_keys(vc, dicts)
-        var aligned = List[Int64](length=n, fill=0)
-        for i in range(n):
-            aligned[i] = keys[perm[i]]
-        perm = _radix_order(aligned, perm, order[k].desc)
-        if vc.has_nulls():
-            var flags = List[Int64](length=n, fill=0)
-            for i in range(n):
-                var isn = vc.is_null(perm[i])
-                flags[i] = Int64((0 if isn else 1) if order[k].nulls_first else (1 if isn else 0))
-            perm = _radix_order(flags, perm, False)
-        k -= 1
-    return perm^
-
-
-struct _SortCols(Movable):
-    """The ORDER BY keys of a set of rows as comparable numbers, for `_top_rows`."""
-    var keys: List[List[Int64]]
-    var nulls: List[List[UInt8]]
-    var desc: List[Bool]
-    var nulls_first: List[Bool]
-
-    def __init__(out self):
-        self.keys = List[List[Int64]]()
-        self.nulls = List[List[UInt8]]()
-        self.desc = List[Bool]()
-        self.nulls_first = List[Bool]()
-
-    def before(self, a: Int, b: Int) -> Bool:
-        """Row a sorts before row b (ties: the lower row number, as the stable radix order)."""
-        for k in range(len(self.keys)):
-            var an = len(self.nulls[k]) > 0 and self.nulls[k][a] != 0
-            var bn = len(self.nulls[k]) > 0 and self.nulls[k][b] != 0
-            if an or bn:
-                if an and bn:
-                    continue
-                return an == self.nulls_first[k]
-            var x = self.keys[k][a]
-            var y = self.keys[k][b]
-            if x != y:
-                return (x > y) if self.desc[k] else (x < y)
-        return a < b
-
-
-def _top_rows(cols: List[ValCol], order: List[SortKey], dicts: DictAccess, n: Int, want: Int) raises -> List[Int]:
-    """The first `want` rows of 0 .. n-1 in ORDER BY order, by a bounded heap: one pass, no full sort (a big result with a
-    small LIMIT)."""
-    var sc = _SortCols()
-    for k in range(len(order)):
-        sc.keys.append(_sort_keys(cols[k], dicts))
-        sc.nulls.append(cols[k].nul.copy())
-        sc.desc.append(order[k].desc)
-        sc.nulls_first.append(order[k].nulls_first)
-    var heap = List[Int]()                  # a max-heap: the worst of the best `want` rows on top
-    if want <= 0:
-        return heap^
-    for r in range(n):
-        if len(heap) < want:
-            heap.append(r)
-            var i = len(heap) - 1
-            while i > 0:
-                var parent = (i - 1) // 2
-                if sc.before(heap[parent], heap[i]):
-                    var t = heap[parent]
-                    heap[parent] = heap[i]
-                    heap[i] = t
-                    i = parent
-                else:
-                    break
-        elif sc.before(r, heap[0]):
-            heap[0] = r
-            var i = 0
-            while True:
-                var l = 2 * i + 1
-                var rr = l + 1
-                var worst = i
-                if l < len(heap) and sc.before(heap[worst], heap[l]):
-                    worst = l
-                if rr < len(heap) and sc.before(heap[worst], heap[rr]):
-                    worst = rr
-                if worst == i:
-                    break
-                var t = heap[worst]
-                heap[worst] = heap[i]
-                heap[i] = t
-                i = worst
-    # sort the survivors (insertion sort: `want` is small)
-    for i in range(1, len(heap)):
-        var j = i
-        while j > 0 and sc.before(heap[j], heap[j - 1]):
-            var t = heap[j]
-            heap[j] = heap[j - 1]
-            heap[j - 1] = t
-            j -= 1
-    return heap^
-
-
-def _fill_column(mut col: Column, vals: List[Int64], nul: List[UInt8]):
-    col.values = vals.copy()
-    if len(nul) > 0:
-        var n = len(vals)
-        col.validity = List[UInt8](length=(n + 7) // 8, fill=0xFF)
-        var nulls = 0
-        for i in range(n):
-            if nul[i] != 0:
-                col.validity[i // 8] &= ~(UInt8(1) << UInt8(i % 8))
-                nulls += 1
-        col.nulls = nulls
-        if nulls == 0:
-            col.validity = List[UInt8]()
-
-
-def _unique_name(t: Table, name: String) -> String:
-    if t.index(name) < 0:
-        return name
-    var i = 1
-    while t.index(name + "_" + String(i)) >= 0:
-        i += 1
-    return name + "_" + String(i)
-
-
-def _to_table(q: BoundQuery, outs: List[ValCol], dicts: DictAccess) raises -> Table:
-    var t = Table.empty()
-    for i in range(len(outs)):
-        ref vc = outs[i]
-        var kind = ColumnKind(vc.kind)
-        var c = t.add_column(_unique_name(t, q.out_names[i]), kind, scale=vc.scale)
-        if vc.kind == TEXT.value:
-            var n = vc.n()
-            var mx = 0
-            for r in range(n):
-                if not vc.is_null(r):
-                    mx = max(mx, Int(vc.v[r]))
-            var remap = List[Int32](length=mx + 1, fill=-1)
-            var codes = List[Int64](length=n, fill=0)
-            for r in range(n):
-                if vc.is_null(r):
-                    continue
-                var old = Int(vc.v[r])
-                if remap[old] < 0:
-                    remap[old] = Int32(t.add_word(c, dicts.word(vc.src, old)))
-                codes[r] = Int64(remap[old])
-            _fill_column(t.cols[c], codes, vc.nul)
-        else:
-            _fill_column(t.cols[c], vc.v, vc.nul)
-    return t^
-
-
 def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hres: HolResult, hol_of: List[Int],
-            dicts: DictAccess, mut notes: List[String]) raises -> Table:
+            dicts: DictAccess, opts: PlannerOptions, mut notes: List[String]) raises -> Table:
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
     var t_a = perf_counter_ns()
     var gids = List[Int]()
@@ -775,64 +360,10 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
     var t_c = perf_counter_ns()
-    # HAVING
-    var skeys = List[ValCol]()
-    var saggs = List[ValCol]()
-    if q.having >= 0:
-        var hv = eval_post(q, q.having, keys, aggs, dicts, n)
-        var sel = List[Int]()
-        for i in range(n):
-            if not hv.is_null(i) and hv.v[i] != 0:
-                sel.append(i)
-        for k in keys:
-            skeys.append(_gather(k, sel))
-        for a in aggs:
-            saggs.append(_gather(a, sel))
-    else:                                                       # nothing to filter: the columns move on as they are
-        skeys = keys^
-        saggs = aggs^
-    var m = n if q.having < 0 else (skeys[0].n() if len(skeys) > 0 else saggs[0].n() if len(saggs) > 0 else 0)
-    var t_d = perf_counter_ns()
-    # ORDER BY, OFFSET, LIMIT
-    var fin = List[Int]()
-    var notes_sort = String()
-    if len(q.order) > 0:
-        var ocols = List[ValCol]()
-        for o in q.order:
-            ocols.append(eval_post(q, o.expr, skeys, saggs, dicts, m))
-        var want = (q.offset + q.limit) if q.limit >= 0 else -1
-        if want >= 0 and want <= 4096 and m > 8 * want:
-            fin = _top_rows(ocols, q.order, dicts, m, want)
-            notes_sort = "top-" + String(want) + " by a bounded heap over " + commas(m) + " groups"
-        else:
-            fin = _order_rows(ocols, q.order, dicts, m)
-            notes_sort = "sorted " + commas(m) + " groups by " + String(len(q.order)) + (" key" if len(q.order) == 1 else " keys") + " (stable radix passes)"
-    else:
-        for i in range(m):
-            fin.append(i)
-    if notes_sort.byte_length() > 0:
-        notes.append("order: " + notes_sort)
-    if q.having >= 0:
-        notes.append("having: " + commas(m) + " of " + commas(n) + " groups kept")
-    var lo = min(q.offset, len(fin))
-    var hi = len(fin) if q.limit < 0 else min(len(fin), lo + q.limit)
-    var rows = List[Int]()
-    for i in range(lo, hi):
-        rows.append(fin[i])
-    var fkeys = List[ValCol]()
-    for k in skeys:
-        fkeys.append(_gather(k, rows))
-    var faggs = List[ValCol]()
-    for a in saggs:
-        faggs.append(_gather(a, rows))
-    var t_e = perf_counter_ns()
-    var outs = List[ValCol]()
-    for e in q.outputs:
-        var vc = eval_post(q, e, fkeys, faggs, dicts, len(rows))
-        outs.append(vc^)
-    var table = _to_table(q, outs, dicts)
-    notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, having " +
-                 _ms(Float64(t_d - t_c) / 1e6) + " ms, order " + _ms(Float64(t_e - t_d) / 1e6) + " ms, output " + _ms(Float64(perf_counter_ns() - t_e) / 1e6) + " ms")
+    # HAVING, the select list, ORDER BY, OFFSET and LIMIT: a row query over the groups (post.mojo)
+    var table = run_post(q, keys, aggs, dicts, opts, n, notes)
+    notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, then HAVING, ORDER BY and the select list over the groups " +
+                 _ms(Float64(perf_counter_ns() - t_c) / 1e6) + " ms")
     return table^
 
 
@@ -856,109 +387,6 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
                 words.append(dicts.word(c, k))
             ranks[sp.agg_src[a]] = text_ranks(words)
     return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy())
-
-
-def _ones_mask(rows: Int) -> List[UInt8]:
-    return List[UInt8](length=(rows + 7) // 8 + 8, fill=0xFF)
-
-
-struct _Chunks(Movable):
-    """The chunks a source is read in, one at a time: a table (its rows, then the frame's changed rows), or a scan's row
-    groups (then the changed rows). `load(i)` gives chunk i and sets `mask_addr` for it."""
-    var groups: List[Int]            # a scan: the row groups with rows
-    var base: Bool                   # a table or frame: the shared table has rows
-    var has_delta: Bool
-    var scan_mode: Bool
-    var used: List[Int]              # the source columns the chunks hold (all of them for a table)
-    var sm: _ScanMask
-    var ones: List[UInt8]
-    var gm: List[UInt8]
-    var mask_addr: Int
-    var masked: Bool
-
-    def __init__(out self):
-        self.groups = List[Int]()
-        self.base = False
-        self.has_delta = False
-        self.scan_mode = False
-        self.used = List[Int]()
-        self.sm = _ScanMask()
-        self.ones = List[UInt8]()
-        self.gm = List[UInt8]()
-        self.mask_addr = 0
-        self.masked = False
-
-    def n(self) -> Int:
-        return (len(self.groups) if self.scan_mode else (1 if self.base else 0)) + (1 if self.has_delta else 0)
-
-
-def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
-    var ch = _Chunks()
-    ch.scan_mode = src.kind == SRC_SCAN
-    ch.used = used.copy()
-    ch.masked = len(src.overlay.mask) > 0
-    ch.has_delta = len(src.overlay.delta) > 0
-    if ch.scan_mode:
-        ref scan = src.scan.value()
-        for g in range(scan.row_groups()):
-            if scan.group_rows(g) > 0:
-                ch.groups.append(g)
-        if ch.masked:
-            ch.sm.addr = Int(src.overlay.mask.unsafe_ptr())
-            var at = 0
-            for g in range(scan.row_groups()):
-                ch.sm.starts.append(at)
-                at += scan.group_rows(g)
-            var mx = len(src.overlay.delta)
-            for g in range(scan.row_groups()):
-                mx = max(mx, scan.group_rows(g))
-            ch.ones = _ones_mask(mx)
-    else:
-        ch.base = src.table.rows() > 0
-        if ch.masked:
-            ch.ones = _ones_mask(len(src.overlay.delta))
-    return ch^
-
-
-def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
-    var nb = len(ch.groups) if ch.scan_mode else (1 if ch.base else 0)
-    if i >= nb:                                                   # the frame's changed and appended rows
-        ch.mask_addr = Int(ch.ones.unsafe_ptr()) if ch.masked else 0
-        return delta_table(src, ch.used)
-    if not ch.scan_mode:
-        ch.mask_addr = Int(src.overlay.mask.unsafe_ptr()) if ch.masked else 0
-        return src.table
-    var g = ch.groups[i]
-    ref scan = src.scan.value()
-    var chunk = scan.read_group(g, ch.used)^.share()
-    ch.gm = _group_mask(ch.sm, g, scan.group_rows(g)) if ch.masked else List[UInt8]()
-    ch.mask_addr = Int(ch.gm.unsafe_ptr()) if len(ch.gm) > 0 else (Int(ch.ones.unsafe_ptr()) if ch.masked else 0)
-    return chunk^
-
-
-comptime LIE = "footer statistics wrong: "
-
-
-def _check_footer(src: SqlSource, ch: _Chunks, i: Int, chunk: SharedTable) raises:
-    """A trusted footer states each column chunk's null count: a decoded row group that holds another number shows the footer
-    cannot be believed (a NULL read as a value would otherwise be counted as 0)."""
-    if not ch.scan_mode or i >= len(ch.groups):
-        return
-    ref scan = src.scan.value()
-    for k in range(len(ch.used)):
-        var stated = scan.group_null_count(ch.groups[i], ch.used[k])
-        var real = chunk.null_count(k)
-        if stated >= 0 and stated != real:
-            raise Error(LIE + "row group " + String(ch.groups[i]) + " states " + String(stated) + (" null" if stated == 1 else " nulls") +
-                        " in column `" + scan.name(ch.used[k]) + "` and holds " + String(real))
-
-
-
-def _all(n: Int) -> List[Int]:
-    var out = List[Int]()
-    for i in range(n):
-        out.append(i)
-    return out^
 
 
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
@@ -1156,51 +584,6 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
     _ = dtypes^
 
 
-struct _Inputs(Movable):
-    """How the program sees the source: which columns the chunks hold and where, which can be NULL, whether a mask applies."""
-    var used: List[Int]
-    var pos: List[Int]
-    var chunk_cols: Int
-    var nullable: List[Bool]
-    var masked: Bool
-    var scan_mode: Bool
-
-    def __init__(out self):
-        self.used = List[Int]()
-        self.pos = List[Int]()
-        self.chunk_cols = 0
-        self.nullable = List[Bool]()
-        self.masked = False
-        self.scan_mode = False
-
-
-def _inputs(src: SqlSource, q: BoundQuery, trust: Bool = True) raises -> _Inputs:
-    var inp = _Inputs()
-    var n_cols = src.table.columns()
-    inp.used = collect_columns(q)
-    inp.scan_mode = src.kind == SRC_SCAN
-    # a table or frame is seen as it is; a scan's row groups hold only the columns used
-    inp.pos = List[Int](length=n_cols, fill=-1)
-    inp.chunk_cols = n_cols
-    if inp.scan_mode:
-        if len(inp.used) == 0 and n_cols > 0:
-            inp.used.append(0)
-        for k in range(len(inp.used)):
-            inp.pos[inp.used[k]] = k
-        inp.chunk_cols = len(inp.used)
-        for c in inp.used:
-            if src.table.kind(c) == TEXT:
-                src.scan.value().ensure_words(c)
-    else:
-        inp.used = _all(n_cols)
-        for c in range(n_cols):
-            inp.pos[c] = c
-    for c in range(n_cols):
-        inp.nullable.append((not trust or src.scan.value().null_count(c) != 0 if inp.scan_mode else src.table.null_count(c) > 0) or _delta_nulls(src, c))
-    inp.masked = len(src.overlay.mask) > 0
-    return inp^
-
-
 def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int) raises -> SqlProgram:
     try:
         return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
@@ -1293,7 +676,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         for h in range(len(hs.specs)):
             hol_of[hs.specs[h].agg] = h
     var t_fin = perf_counter_ns()
-    var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, notes)
+    var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, opts, notes)
     notes.append("time: " + ("decode " + _ms(ms_load) + " ms, " if scan_mode else "") + "kernel " + _ms(ms_run - ms_load) + " ms, holistic states " + _ms(Float64(t_fin - t_hol) / 1e6) + " ms, finish " + _ms(Float64(perf_counter_ns() - t_fin) / 1e6) + " ms")
     return table^
 
@@ -1315,15 +698,22 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
     var dicts = DictAccess(src.table, scan, extra)
     var st = make_stats(src, q, dicts, trust)
     var plan = planner.plan(q, st, opts)
+    var lp = build_plan(q, src.name)
+    plan_sinks(lp, q, st, opts, plan)
     var res = SqlResult()
     res.notes = plan.notes.copy()
     if lie.byte_length() > 0:
         res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
     var inp = _inputs(src, q, trust)
-    var sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
-    _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
+    var sp = SqlProgram(Program(0))
+    var stage = RowStage(SqlProgram(Program(0)), List[_Item]())
+    if q.rows:
+        stage = prepare_rows(src, q, plan, dicts, inp, res.notes, True)
+    else:
+        sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
+        _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
     if q.explain != EXPLAIN_NONE:
-        res.explain = _explain_text(q, src, res.notes)
+        res.explain = _explain_text(lp, res.notes)
         var t = Table.empty()
         var c = t.add_column("plan", TEXT)
         for line in res.explain.split("\n"):
@@ -1333,9 +723,12 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
     var notes = res.notes.copy()
-    res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
+    if q.rows:
+        res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust)
+    else:
+        res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
     res.notes = notes^
-    res.explain = _explain_text(q, src, res.notes)
+    res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
     return res^
 

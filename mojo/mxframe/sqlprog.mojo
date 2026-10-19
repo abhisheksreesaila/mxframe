@@ -96,6 +96,8 @@ struct SqlProgram(Movable):
     var n_src: Int
     var guard_slot: Int              # dense with a footer-stated range: the extra group that rows outside it land in, else -1
     var instr: Int                   # instructions a row runs (predicate, body, aggregates)
+    var row_vregs: List[Int]         # F-152, rows: per computed expression, the register holding its value (int64 bits) ...
+    var row_nregs: List[Int]         # ... and its NULL flag (1 where NULL), -1 when it can never be NULL
 
     def __init__(out self, var p: Program):
         self.p = p^
@@ -110,6 +112,8 @@ struct SqlProgram(Movable):
         self.n_src = 0
         self.guard_slot = -1
         self.instr = 0
+        self.row_vregs = List[Int]()
+        self.row_nregs = List[Int]()
 
 
 def bkey(rexprs: List[BExpr], e: Int) -> String:
@@ -923,6 +927,104 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     e.p.src_float = src_float^
     out.n_src = n_src
     out.key_regs = key_regs
+    out.set_bytes = e.set_bytes.copy()
+    out.set_meta = e.set_meta.copy()
+    out.instr = (len(e.p.pred) + len(e.p.body) + len(e.p.aggs)) // 5
+    out.p = e^.take_program()
+    out.p.set_bytes = out.set_bytes.copy()
+    out.p.set_meta = out.set_meta.copy()
+    return out^
+
+
+def lower_rows(q: BoundQuery, computed: List[Int], var nullable: List[Bool], var pos: List[Int], nchunk_cols: Int,
+               var dicts: DictAccess, var aliases: List[List[Int]], masked: Bool) raises -> SqlProgram:
+    """F-152: the program of a row query. It runs the WHERE (and the frame mask) and computes the expressions `computed` (row-level
+    expressions of the query) into registers that live to the end, so the executor's block hook (`rows.mojo`) can write them,
+    with the selected rows' numbers. Registers 0 and 1 are the group key (always 0: one group) and the hook's control block."""
+    var e = _Emitter(Program(nchunk_cols), q.rexprs.copy(), nullable^, pos^, aliases^, dicts^)
+    var out = SqlProgram(Program(0))
+    e.p.mat = False
+    e.p.groups = 1
+    e.reserve(2)
+    e.p.section = 1
+    e.p.ctl_const = len(e.p.consts)
+    e.p.consts.append(CTL_PLACEHOLDER)
+    var cr = e.tmp()
+    e.ins(OP_LOAD_CONST, cr, e.p.ctl_const)
+    e.ins(OP_IMAX, 1, cr, cr)
+    e.free(cr)
+    e.p.section = 0
+    var pred = -1
+    if q.where >= 0:
+        var w = e.boolean(q.where)
+        if w.unk:
+            var one = e.const_f(1.0)
+            e.ins(24, w.reg, w.reg, one)
+            e.free(one)
+        pred = w.reg
+    if masked:
+        var isnull = e.tmp()
+        e.ins(OP_ISNULL, isnull, _frame_mask(e.p))
+        e.ins(OP_NOT, isnull, isnull)
+        if pred >= 0:
+            e.ins(OP_AND, pred, pred, isnull)
+            e.free(isnull)
+        else:
+            pred = isnull
+    if pred >= 0:
+        var k = e.keep(pred)
+        e.free(pred)
+        pred = k
+    e.p.pred_reg = pred
+    e.p.section = 1
+    e.p.keyed = True
+    e.ins(OP_LOAD_CONST, 0, e.p.const(0))
+    for ci in computed:
+        var x = e.rx[ci].copy()
+        var vreg: Int
+        var nreg = -1
+        if x.kind == BOOL.value and x.op != B_COL and x.op != B_LIT:        # a condition: 1.0 true, 0.0 false, 0.5 unknown (NULL)
+            var b = e.boolean(ci)
+            var iv = b.reg
+            if b.unk:
+                var half = e.const_f(0.5)
+                var isn = e.tmp()
+                e.ins(24, isn, b.reg, half)
+                e.free(half)
+                var ni = e.tmp()
+                e.ins(OP_F2I, ni, isn)
+                e.free(isn)
+                nreg = e.keep(ni)
+                e.free(ni)
+                var one = e.const_f(1.0)
+                e.ins(24, b.reg, b.reg, one)
+                e.free(one)
+            var vi = e.tmp()
+            e.ins(OP_F2I, vi, b.reg)
+            e.free(b.reg)
+            vreg = e.keep(vi)
+            e.free(vi)
+        else:
+            var v = e.value(ci)
+            vreg = e.keep(v.reg)
+            e.free(v.reg)
+            if v.nul >= 0:
+                var ni = e.tmp()
+                e.ins(OP_F2I, ni, v.nul)
+                nreg = e.keep(ni)
+                e.free(ni)
+                e.free(v.nul)
+        out.row_vregs.append(vreg)
+        out.row_nregs.append(nreg)
+    var z = e.const_i(0)                                          # the kernel wants one aggregate: a dummy sum
+    var kz = e.keep(z)
+    e.free(z)
+    e.p.section = 2
+    e.ins(OP_AGG_ISUM, 0, kz)
+    out.slot_ops.append(A_SUM)
+    e.p.n_slots = 1
+    e.p.n_src = 0
+    out.key_regs = 1
     out.set_bytes = e.set_bytes.copy()
     out.set_meta = e.set_meta.copy()
     out.instr = (len(e.p.pred) + len(e.p.body) + len(e.p.aggs)) // 5

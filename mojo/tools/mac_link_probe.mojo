@@ -54,6 +54,11 @@ def run() raises:
         var a = sql(cat, "SELECT k, count(*), sum(v), avg(v) FROM " + name + " WHERE v > 0 GROUP BY k ORDER BY 2 DESC LIMIT 2")
         var b = sql(cat, "SELECT k, count(DISTINCT v), median(v), min(v) FROM " + name + " GROUP BY k HAVING count(*) > 1", hashed)
         print(a.table.rows(), b.table.rows(), a.notes[0], sql(cat, "EXPLAIN SELECT count(*) FROM " + name).explain)
+        # F-152: row queries: the materialize sink, a top-k, SELECT DISTINCT
+        var r1 = sql(cat, "SELECT k, v, v + 1 FROM " + name + " WHERE v > 0 ORDER BY v DESC LIMIT 3")
+        var r2 = sql(cat, "SELECT DISTINCT k FROM " + name)
+        var r3 = sql(cat, "SELECT * FROM " + name + " LIMIT 5")
+        print(r1.table.rows(), r2.table.rows(), r3.table.rows())
 
 
 @export("mojo_entry")
