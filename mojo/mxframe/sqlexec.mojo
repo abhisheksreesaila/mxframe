@@ -232,9 +232,9 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
 
 def _explain_text(lp: LogicalPlan, notes: List[String]) -> String:
     var out = String("Logical plan\n")
-    var lines = lp.lines()
+    var lines = lp.tree()
     for i in range(len(lines)):
-        out += "  " * (1 + i) + lines[i] + "\n"
+        out += "  " * (1 + lines[i][0]) + lines[i][1] + "\n"
     out += "Physical plan\n"
     for n in notes:
         out += "  " + n + "\n"

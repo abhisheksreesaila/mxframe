@@ -285,9 +285,28 @@ struct SqlStatement(Movable):
     var offset: Int
     var explain: Int
     var distinct: Bool          # F-152: SELECT DISTINCT
+    # F-153: a second table (`a JOIN b ON ...`, `a JOIN b USING (k)`, `a, b WHERE ...`)
+    var has_right: Bool
+    var right_table: String
+    var right_alias: String
+    var right_is_file: Bool
+    var right_line: Int
+    var right_col: Int
+    var join_on: Int            # the ON condition's expression, -1 for none
+    var join_using: List[String]
+    var comma_join: Bool
 
     def __init__(out self, text: String):
         self.distinct = False
+        self.has_right = False
+        self.right_table = String()
+        self.right_alias = String()
+        self.right_is_file = False
+        self.right_line = 0
+        self.right_col = 0
+        self.join_on = -1
+        self.join_using = List[String]()
+        self.comma_join = False
         self.text = text
         self.exprs = List[SqlExpr]()
         self.items = List[SelectItem]()
@@ -562,32 +581,13 @@ struct _Parser(Movable):
                 raise _tok_error(self.tok(), "SELECT without FROM is not supported yet (F-152)")
             raise self.expected("FROM")
         _ = self.advance()
-        var tt = self.tok()
-        if self.is_sym("("):
-            raise self.unsupported(tt, "a subquery in FROM", "F-159")
-        if tt.kind != T_IDENT and tt.kind != T_QIDENT and tt.kind != T_STR:
-            raise self.expected("a table name or 'file name'")
-        if tt.kind == T_IDENT and _reserved(tt.up):
-            raise self.expected("a table name")
-        _ = self.advance()
-        self.st.table = tt.text
-        self.st.table_is_file = tt.kind == T_STR
-        self.st.table_line = tt.line
-        self.st.table_col = tt.col
-        if self.is_sym("."):
-            raise self.unsupported(self.tok(), "a schema-qualified table name", "")
-        if self.is_kw("AS"):
-            _ = self.advance()
-            var a = self.tok()
-            if a.kind != T_IDENT and a.kind != T_QIDENT:
-                raise self.expected("a name after AS")
-            self.st.table_alias = a.text
-            _ = self.advance()
-        elif (self.tok().kind == T_IDENT and not _reserved(self.tok().up)) or self.tok().kind == T_QIDENT:
-            self.reject_misspelled_clause()
-            self.st.table_alias = self.tok().text
-            _ = self.advance()
-        self.reject_join()
+        var tr = self.table_ref()
+        self.st.table = tr[0]
+        self.st.table_is_file = tr[2]
+        self.st.table_line = tr[3]
+        self.st.table_col = tr[4]
+        self.st.table_alias = tr[1]
+        self.join_tail()
         if self.is_kw("WHERE"):
             _ = self.advance()
             self.st.where = self.expr()
@@ -680,14 +680,82 @@ struct _Parser(Movable):
             raise self.unsupported(self.tok(), "`" + what + "` as a percentage", "")
         return v
 
-    def reject_join(self) raises:
+    def table_ref(mut self) raises -> Tuple[String, String, Bool, Int, Int]:
+        """One table in FROM: (name, alias, is a file name, line, column)."""
+        var tt = self.tok()
+        if self.is_sym("("):
+            raise self.unsupported(tt, "a subquery in FROM", "F-159")
+        if tt.kind != T_IDENT and tt.kind != T_QIDENT and tt.kind != T_STR:
+            raise self.expected("a table name or 'file name'")
+        if tt.kind == T_IDENT and _reserved(tt.up):
+            raise self.expected("a table name")
+        _ = self.advance()
+        if self.is_sym("."):
+            raise self.unsupported(self.tok(), "a schema-qualified table name", "")
+        var alias = String()
+        if self.is_kw("AS"):
+            _ = self.advance()
+            var a = self.tok()
+            if a.kind != T_IDENT and a.kind != T_QIDENT:
+                raise self.expected("a name after AS")
+            alias = a.text
+            _ = self.advance()
+        elif (self.tok().kind == T_IDENT and not _reserved(self.tok().up)) or self.tok().kind == T_QIDENT:
+            self.reject_misspelled_clause()
+            alias = self.tok().text
+            _ = self.advance()
+        return (tt.text, alias, tt.kind == T_STR, tt.line, tt.col)
+
+    def join_tail(mut self) raises:
+        """After the first table: `, b`, `[INNER] JOIN b ON cond`, `[INNER] JOIN b USING (k, ...)`; every other join raises by name."""
         var t = self.tok()
         if self.is_sym(","):
-            raise self.unsupported(t, "more than one table in FROM (a comma join)", "F-153")
-        if t.kind == T_IDENT and (t.up == "JOIN" or t.up == "INNER" or t.up == "LEFT" or t.up == "RIGHT" or t.up == "FULL" or
-                                  t.up == "CROSS" or t.up == "NATURAL" or t.up == "ANTI" or t.up == "SEMI" or t.up == "ASOF" or
-                                  t.up == "POSITIONAL" or t.up == "LATERAL"):
-            raise self.unsupported(t, ("`" + t.up + " JOIN`") if t.up != "JOIN" else "`JOIN`", "F-153")
+            _ = self.advance()
+            var r = self.table_ref()
+            self.set_right(r)
+            self.st.comma_join = True
+        elif t.kind == T_IDENT and (t.up == "JOIN" or (t.up == "INNER" and self.is_kw("JOIN", 1))):
+            if t.up == "INNER":
+                _ = self.advance()
+            _ = self.advance()
+            var r = self.table_ref()
+            self.set_right(r)
+            if self.is_kw("ON"):
+                _ = self.advance()
+                self.st.join_on = self.expr()
+            elif self.is_kw("USING"):
+                _ = self.advance()
+                _ = self.expect_sym("(")
+                while True:
+                    var c = self.tok()
+                    if c.kind != T_IDENT and c.kind != T_QIDENT:
+                        raise self.expected("a column name")
+                    self.st.join_using.append(c.text)
+                    _ = self.advance()
+                    if self.is_sym(","):
+                        _ = self.advance()
+                        continue
+                    break
+                _ = self.expect_sym(")")
+            else:
+                raise self.expected("ON or USING after JOIN")
+        elif t.kind == T_IDENT and (t.up == "LEFT" or t.up == "RIGHT" or t.up == "FULL" or t.up == "CROSS" or t.up == "NATURAL" or
+                                    t.up == "ANTI" or t.up == "SEMI" or t.up == "ASOF" or t.up == "POSITIONAL" or t.up == "LATERAL" or
+                                    t.up == "INNER"):
+            raise self.unsupported(t, "`" + t.up + " JOIN`", "F-154" if (t.up == "LEFT" or t.up == "ANTI" or t.up == "SEMI") else "")
+        if self.st.has_right:                                                   # a third table
+            var u = self.tok()
+            if self.is_sym(",") or (u.kind == T_IDENT and (u.up == "JOIN" or u.up == "INNER" or u.up == "LEFT" or u.up == "RIGHT" or
+                                                          u.up == "FULL" or u.up == "CROSS" or u.up == "NATURAL")):
+                raise self.unsupported(u, "more than two tables in FROM", "F-155")
+
+    def set_right(mut self, r: Tuple[String, String, Bool, Int, Int]):
+        self.st.has_right = True
+        self.st.right_table = r[0]
+        self.st.right_alias = r[1]
+        self.st.right_is_file = r[2]
+        self.st.right_line = r[3]
+        self.st.right_col = r[4]
 
     # -- expressions, loosest first
     def expr(mut self) raises -> Int:

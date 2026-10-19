@@ -526,7 +526,7 @@ ERRORS = [
     ("SELECT count(*) FROM t WHERE", "SQL error at line 1, column 29: expected an expression, found the end of the statement"),
     ("SELECT count(*) FROM t WHERE s = 'oops", "SQL error at line 1, column 34: this string is never closed (expected a closing ')"),
     ("SELECT count(*) FROM t; SELECT 1", "SQL error at line 1, column 25: expected the end of the statement, found `SELECT`"),
-    ("SELECT sum(x) FROM t JOIN u ON t.id = u.id", "SQL error at line 1, column 22: `JOIN` is not supported yet (F-153)"),
+    ("SELECT sum(x) FROM t LEFT JOIN u ON t.id = u.id", "SQL error at line 1, column 22: `LEFT JOIN` is not supported yet (F-154)"),
     ("SELECT DISTINCT k, count(*) FROM t GROUP BY k", "SQL error at line 1, column 17: `SELECT DISTINCT` together with aggregates, GROUP BY or HAVING is not supported yet: use GROUP BY alone (it returns the same distinct rows), or DISTINCT without aggregates"),
     ("SELECT DISTINCT ON (k) k FROM t", "SQL error at line 1, column 8: `SELECT DISTINCT ON` is not supported yet"),
     ("SELECT z.* FROM t", "SQL error at line 1, column 8: unknown table or alias `z` in `z.*`"),

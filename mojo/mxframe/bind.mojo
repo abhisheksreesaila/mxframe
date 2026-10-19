@@ -248,12 +248,47 @@ struct BoundQuery(Movable):
     var order_text: List[String]
     var out_text: List[String]
     # F-152: row queries (no aggregate, no GROUP BY) and SELECT DISTINCT
+    # F-153: a join of two tables. Columns are numbered over both: the first table's, then the second's (`tab_start`).
+    var joined: Bool
+    var sources: List[Int]           # the catalog's sources, one per table of FROM
+    var tab_names: List[String]
+    var tab_alias: List[String]
+    var tab_start: List[Int]
+    var tab_cols: List[Int]
+    var jk_l: List[Int]              # the equi-join keys: a column of the first table ...
+    var jk_r: List[Int]              # ... and the column of the second that must equal it
+    var jk_l_names: List[String]
+    var jk_r_names: List[String]
+    var conj_l: List[Int]            # WHERE / ON conjuncts that read only the first table, only the second, or both
+    var conj_r: List[Int]
+    var conj_x: List[Int]
+    var conj_l_text: List[String]
+    var conj_r_text: List[String]
+    var conj_x_text: List[String]
+    var using_cols: List[String]
     var rows: Bool                   # a row query: `routs` and `rorder` hold its select list and ORDER BY (expressions of `rexprs`)
     var distinct: Bool               # SELECT DISTINCT (bound as a group-by on the select list)
     var routs: List[Int]
     var rorder: List[SortKey]
 
     def __init__(out self):
+        self.joined = False
+        self.sources = List[Int]()
+        self.tab_names = List[String]()
+        self.tab_alias = List[String]()
+        self.tab_start = List[Int]()
+        self.tab_cols = List[Int]()
+        self.jk_l = List[Int]()
+        self.jk_r = List[Int]()
+        self.jk_l_names = List[String]()
+        self.jk_r_names = List[String]()
+        self.conj_l = List[Int]()
+        self.conj_r = List[Int]()
+        self.conj_x = List[Int]()
+        self.conj_l_text = List[String]()
+        self.conj_r_text = List[String]()
+        self.conj_x_text = List[String]()
+        self.using_cols = List[String]()
         self.rows = False
         self.distinct = False
         self.routs = List[Int]()
@@ -431,8 +466,18 @@ struct _Binder(Movable):
     var n_stored: Int                 # the source's stored columns; the frame's formula columns follow them
     var formulas: List[Formula]
     var distinct: Bool
+    var tab_names: List[String]       # one per table of FROM (F-153)
+    var tab_alias: List[String]
+    var tab_start: List[Int]
+    var tab_cols: List[Int]
+    var using_cols: List[String]
 
     def __init__(out self, var st: SqlStatement):
+        self.tab_names = List[String]()
+        self.tab_alias = List[String]()
+        self.tab_start = List[Int]()
+        self.tab_cols = List[Int]()
+        self.using_cols = List[String]()
         self.distinct = False
         self.st = st^
         self.cat_names = List[String]()
@@ -468,31 +513,203 @@ struct _Binder(Movable):
         return sql_error(self.st.exprs[ast].line, self.st.exprs[ast].col, msg)
 
     # -- names
-    def find_column(self, ast: Int) raises -> Int:
+    def lookup(self, ast: Int) -> Tuple[Int, Int]:
+        """The column a name means, and how it went: 0 found, 1 unknown table or alias, 2 no such column, 3 ambiguous inside one table,
+        4 ambiguous between the two tables (a USING column is not: it means the first table's)."""
         ref x = self.st.exprs[ast]
+        var lo = 0
+        var hi = len(self.src_names)
         if x.text2.byte_length() > 0:
             var q = lower_ascii(x.text2)
-            if q != lower_ascii(self.table_name) and (self.table_alias.byte_length() == 0 or q != lower_ascii(self.table_alias)):
-                raise self.err(ast, "unknown table or alias `" + x.text2 + "` in `" + x.text2 + "." + x.text + "`")
+            var tab = -1
+            for t in range(len(self.tab_names)):
+                if q == lower_ascii(self.tab_names[t]) or (self.tab_alias[t].byte_length() > 0 and q == lower_ascii(self.tab_alias[t])):
+                    tab = t
+                    break
+            if tab < 0:
+                return (-1, 1)
+            lo = self.tab_start[tab]
+            hi = lo + self.tab_cols[tab]
         var key = lower_ascii(x.text)
         var found = -1
-        for c in range(len(self.src_names)):
+        var found_tab = -1
+        for c in range(lo, hi):
             if lower_ascii(self.src_names[c]) == key:
+                var t = 0
+                for u in range(len(self.tab_start)):
+                    if c >= self.tab_start[u]:
+                        t = u
                 if found >= 0:
-                    raise self.err(ast, "column `" + x.text + "` is ambiguous: `" + self.src_names[found] + "` and `" + self.src_names[c] + "`")
+                    if t == found_tab:
+                        return (found, 3)
+                    for un in self.using_cols:
+                        if lower_ascii(un) == key:
+                            return (found, 0)
+                    return (found, 4)
                 found = c
+                found_tab = t
         if found < 0:
+            return (-1, 2)
+        return (found, 0)
+
+    def find_column(self, ast: Int) raises -> Int:
+        ref x = self.st.exprs[ast]
+        var r = self.lookup(ast)
+        if r[1] == 1:
+            raise self.err(ast, "unknown table or alias `" + x.text2 + "` in `" + x.text2 + "." + x.text + "`")
+        if r[1] == 3:
+            var key = lower_ascii(x.text)
+            var first = -1
+            var second = -1
+            for c in range(len(self.src_names)):
+                if lower_ascii(self.src_names[c]) == key:
+                    if first < 0:
+                        first = c
+                    elif second < 0:
+                        second = c
+            raise self.err(ast, "column `" + x.text + "` is ambiguous: `" + self.src_names[first] + "` and `" + self.src_names[second] + "`")
+        if r[1] == 4:
+            raise self.err(ast, "column `" + x.text + "` is ambiguous: it is in both `" + self.tab_label(0) + "` and `" + self.tab_label(1) + "` (write " +
+                           self.tab_label(0) + "." + x.text + " or " + self.tab_label(1) + "." + x.text + ")")
+        if r[1] == 2:
             var hint = closest(x.text, self.src_names)
-            raise self.err(ast, "column `" + x.text + "` not found in table `" + self.table_name + "`" +
+            var where_ = ("table `" + self.table_name + "`") if len(self.tab_names) < 2 else ("`" + self.tab_label(0) + "` or `" + self.tab_label(1) + "`")
+            if x.text2.byte_length() > 0 and len(self.tab_names) > 1:
+                where_ = "`" + x.text2 + "`"
+            raise self.err(ast, "column `" + x.text + "` not found in " + where_ +
                            ((" (did you mean `" + hint + "`?)") if hint.byte_length() > 0 else ""))
-        return found
+        return r[0]
+
+    def split_and(self, e: Int, mut out: List[Int]):
+        """The conjuncts of an AND chain (syntax-tree indices)."""
+        ref x = self.st.exprs[e]
+        if x.kind == X_BIN and x.text == "AND":
+            var a = x.a
+            var b = x.b
+            self.split_and(a, out)
+            self.split_and(b, out)
+        else:
+            out.append(e)
+
+    def sides(self, e: Int) -> Int:
+        """Which tables a row-level expression reads: bit 1 the first, bit 2 the second."""
+        ref x = self.q.rexprs[e]
+        var m = 0
+        if x.op == B_COL:
+            return 1 << self.table_of(Int(x.value))
+        if x.a >= 0:
+            m |= self.sides(x.a)
+        if x.b >= 0:
+            m |= self.sides(x.b)
+        for it in x.items:
+            m |= self.sides(it)
+        return m
+
+    def key_pair_check(self, lc: Int, rc: Int, line: Int, col: Int) raises:
+        var lk = self.src_kinds[lc]
+        var rk = self.src_kinds[rc]
+        var ok = (_is_numeric(lk) and _is_numeric(rk)) or (lk == rk and (lk == DATE.value or lk == BOOL.value or lk == TEXT.value or lk == FLOAT.value))
+        if not ok:
+            raise sql_error(line, col, "cannot join " + self.tab_label(0) + "." + self.src_names[lc] + " (" + kind_name(lk, self.src_scales[lc]) + ") with " +
+                           self.tab_label(1) + "." + self.src_names[rc] + " (" + kind_name(rk, self.src_scales[rc]) + "): the two sides must be the same kind of value" +
+                           (" (a FLOAT is joined with a FLOAT only)" if lk == FLOAT.value or rk == FLOAT.value else ""))
+
+    def bind_where(mut self) raises:
+        """WHERE (and, for a join, ON): one table binds the whole condition; two tables split it into conjuncts: an equality between a
+        column of each table is an equi-join key, a conjunct that reads one table filters that table before the join, the rest is
+        checked on the joined rows."""
+        if self.st.where >= 0 and _has_aggregate(self.st, self.st.where):
+            raise self.err(self.st.where, "aggregate functions are not allowed in WHERE: filter the groups with HAVING")
+        if not self.q.joined:
+            if self.st.where >= 0:
+                var w = self.value(self.st.where)
+                self.q.where = self.boolean(w, self.st.where, "WHERE")
+                self.q.where_text = self.st.render(self.st.where)
+            return
+        var conj = List[Int]()
+        if self.st.join_on >= 0:
+            if _has_aggregate(self.st, self.st.join_on):
+                raise self.err(self.st.join_on, "aggregate functions are not allowed in ON")
+            self.split_and(self.st.join_on, conj)
+        if self.st.where >= 0:
+            self.split_and(self.st.where, conj)
+        # USING (k): the first table's k equals the second's
+        for name in self.st.join_using:
+            var lc = -1
+            var rc = -1
+            for c in range(self.tab_start[0], self.tab_start[0] + self.tab_cols[0]):
+                if lower_ascii(self.src_names[c]) == lower_ascii(name):
+                    lc = c
+            for c in range(self.tab_start[1], self.tab_start[1] + self.tab_cols[1]):
+                if lower_ascii(self.src_names[c]) == lower_ascii(name):
+                    rc = c
+            if lc < 0 or rc < 0:
+                raise sql_error(self.st.right_line, self.st.right_col, "USING (" + name + "): the column is not in " + ("`" + self.tab_label(0) + "`" if lc < 0 else "`" + self.tab_label(1) + "`"))
+            self.key_pair_check(lc, rc, self.st.right_line, self.st.right_col)
+            self.q.jk_l.append(lc)
+            self.q.jk_r.append(rc)
+            self.q.jk_l_names.append(self.src_names[lc])
+            self.q.jk_r_names.append(self.src_names[rc])
+        var residual = List[Int]()
+        for c in conj:
+            ref x = self.st.exprs[c]
+            if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL:
+                var ra = self.lookup(x.a)
+                var rb = self.lookup(x.b)
+                if ra[1] == 0 and rb[1] == 0 and self.table_of(ra[0]) != self.table_of(rb[0]):
+                    var lc = ra[0] if self.table_of(ra[0]) == 0 else rb[0]
+                    var rc = rb[0] if self.table_of(ra[0]) == 0 else ra[0]
+                    self.key_pair_check(lc, rc, x.line, x.col)
+                    self.q.jk_l.append(lc)
+                    self.q.jk_r.append(rc)
+                    self.q.jk_l_names.append(self.src_names[lc])
+                    self.q.jk_r_names.append(self.src_names[rc])
+                    continue
+            var e = self.boolean(self.value(c), c, "WHERE" if c >= 0 else "ON")
+            var m = self.sides(e)
+            if m == 1:
+                self.q.conj_l.append(e)
+                self.q.conj_l_text.append(self.st.render(c))
+            elif m == 2:
+                self.q.conj_r.append(e)
+                self.q.conj_r_text.append(self.st.render(c))
+            else:
+                self.q.conj_x.append(e)
+                self.q.conj_x_text.append(self.st.render(c))
+        if len(self.q.jk_l) == 0:
+            var at = self.st.right_line
+            raise sql_error(self.st.right_line, self.st.right_col, "the join has no equality between a column of `" + self.tab_label(0) + "` and a column of `" + self.tab_label(1) +
+                            "`: a join needs one in ON, USING or WHERE (a cross join is not supported)")
+        # the conjuncts that read both tables, and the constants, are checked on the joined rows: one AND chain
+        if len(self.q.conj_x) > 0:
+            var acc = self.q.conj_x[0]
+            for k in range(1, len(self.q.conj_x)):
+                self.q.rexprs.append(BExpr(B_AND, BOOL.value, 0, acc, self.q.conj_x[k], 0, "", 0, 0))
+                acc = len(self.q.rexprs) - 1
+            self.q.where = acc
+            var t = String()
+            for k in range(len(self.q.conj_x_text)):
+                t += (" AND " if k > 0 else "") + self.q.conj_x_text[k]
+            self.q.where_text = t
+
+    def tab_label(self, t: Int) -> String:
+        return self.tab_alias[t] if self.tab_alias[t].byte_length() > 0 else self.tab_names[t]
+
+    def table_of(self, col: Int) -> Int:
+        var t = 0
+        for u in range(len(self.tab_start)):
+            if col >= self.tab_start[u]:
+                t = u
+        return t
 
     def canon(self, e: Int) -> String:
         """The expression with names in lower case, to tell whether a select item is a GROUP BY key."""
         ref x = self.st.exprs[e]
         if x.kind == X_COL:
-            var nm = lower_ascii(x.text)
-            return nm
+            var r = self.lookup(e)
+            if r[1] == 0:
+                return "#" + String(r[0])
+            return lower_ascii(x.text2) + "." + lower_ascii(x.text)
         if x.kind == X_CALL:
             var s = lower_ascii(x.text) + "("
             if x.a == 1:
@@ -1105,6 +1322,23 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         raise sql_error(st.table_line, st.table_col, "table `" + st.table + "` not found" +
                         ((" (did you mean `" + hint + "`?)") if hint.byte_length() > 0 else
                          (" (the catalog has " + ", ".join(catalog.names()) + ")") if len(catalog.sources) > 0 else " (the catalog is empty)"))
+    var src2 = -1
+    if st.has_right:
+        src2 = catalog.find(st.right_table)
+        if src2 < 0:
+            var hint = closest(st.right_table, catalog.names())
+            if st.right_is_file:
+                raise sql_error(st.right_line, st.right_col, "the file '" + st.right_table + "' is not open: the `mx` command opens a file named in FROM; with the library, add it to the Catalog under that name")
+            raise sql_error(st.right_line, st.right_col, "table `" + st.right_table + "` not found" +
+                            ((" (did you mean `" + hint + "`?)") if hint.byte_length() > 0 else
+                             (" (the catalog has " + ", ".join(catalog.names()) + ")") if len(catalog.sources) > 0 else " (the catalog is empty)"))
+        if len(catalog.sources[src].overlay.formulas) > 0 or len(catalog.sources[src2].overlay.formulas) > 0:
+            raise sql_error(st.right_line, st.right_col, "a join over a frame's formula columns is not supported yet: bake the formulas first")
+        var same = lower_ascii(catalog.sources[src].name) == lower_ascii(catalog.sources[src2].name)
+        if same and (st.table_alias.byte_length() == 0 or st.right_alias.byte_length() == 0 or lower_ascii(st.table_alias) == lower_ascii(st.right_alias)):
+            raise sql_error(st.right_line, st.right_col, "joining `" + catalog.sources[src].name + "` with itself needs a different alias for each side (FROM t a JOIN t b ...)")
+        if not same and st.table_alias.byte_length() > 0 and lower_ascii(st.table_alias) == lower_ascii(st.right_alias):
+            raise sql_error(st.right_line, st.right_col, "the alias `" + st.right_alias + "` is used for both tables")
     var b = _Binder(st^)
     b.table_name = catalog.sources[src].name
     b.table_alias = b.st.table_alias
@@ -1113,6 +1347,30 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         b.src_kinds.append(catalog.sources[src].table.kind(c).value)
         b.src_scales.append(catalog.sources[src].table.scale(c))
     b.n_stored = len(b.src_names)
+    b.tab_names.append(b.table_name)
+    b.tab_alias.append(b.table_alias)
+    b.tab_start.append(0)
+    b.tab_cols.append(len(b.src_names))
+    b.q.sources.append(src)
+    if src2 >= 0:
+        b.q.joined = True
+        b.tab_names.append(catalog.sources[src2].name)
+        b.tab_alias.append(b.st.right_alias)
+        b.tab_start.append(len(b.src_names))
+        b.tab_cols.append(catalog.sources[src2].table.columns())
+        for c in range(catalog.sources[src2].table.columns()):
+            b.src_names.append(catalog.sources[src2].table.name(c))
+            b.src_kinds.append(catalog.sources[src2].table.kind(c).value)
+            b.src_scales.append(catalog.sources[src2].table.scale(c))
+        b.n_stored = len(b.src_names)
+        b.q.sources.append(src2)
+        for u in b.st.join_using:
+            b.using_cols.append(u)
+            b.q.using_cols.append(u)
+    b.q.tab_names = b.tab_names.copy()
+    b.q.tab_alias = b.tab_alias.copy()
+    b.q.tab_start = b.tab_start.copy()
+    b.q.tab_cols = b.tab_cols.copy()
     for f in catalog.sources[src].overlay.formulas:           # a frame's formula columns are columns too
         b.formulas.append(f.copy())
         b.src_names.append(f.name)
@@ -1134,13 +1392,37 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         if not it.star:
             items.append(it.copy())
             continue
+        var only = -1
         if it.alias.byte_length() > 0:
             var qual = lower_ascii(it.alias)
-            if qual != lower_ascii(b.table_name) and (b.table_alias.byte_length() == 0 or qual != lower_ascii(b.table_alias)):
+            for t in range(len(b.tab_names)):
+                if qual == lower_ascii(b.tab_names[t]) or (b.tab_alias[t].byte_length() > 0 and qual == lower_ascii(b.tab_alias[t])):
+                    only = t
+            if only < 0:
                 raise sql_error(it.line, it.col, "unknown table or alias `" + it.alias + "` in `" + it.alias + ".*`")
-        for nm in b.src_names:
-            b.st.exprs.append(SqlExpr(X_COL, nm, String(), -1, -1, -1, List[Int](), False, it.line, it.col))
-            items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
+        if len(b.tab_names) == 1:
+            for nm in b.src_names:
+                b.st.exprs.append(SqlExpr(X_COL, nm, String(), -1, -1, -1, List[Int](), False, it.line, it.col))
+                items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
+            continue
+        # two tables: a USING column once and first (the first table's), then the rest of each table; every name qualified
+        if only < 0:
+            for un in b.using_cols:
+                b.st.exprs.append(SqlExpr(X_COL, un, b.tab_label(0), -1, -1, -1, List[Int](), False, it.line, it.col))
+                items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
+        for t in range(2):
+            if only >= 0 and t != only:
+                continue
+            for c in range(b.tab_start[t], b.tab_start[t] + b.tab_cols[t]):
+                var skip = False
+                if only < 0:
+                    for un in b.using_cols:
+                        if lower_ascii(un) == lower_ascii(b.src_names[c]):
+                            skip = True
+                if skip:
+                    continue
+                b.st.exprs.append(SqlExpr(X_COL, b.src_names[c], b.tab_label(t), -1, -1, -1, List[Int](), False, it.line, it.col))
+                items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
     b.st.items = items^
     if len(b.st.items) == 0:
         raise sql_error(1, 1, "the select list is empty")
@@ -1166,13 +1448,8 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         b.distinct = True
     if not aggregating:
         return bind_rows(b^)
-    # WHERE
-    if b.st.where >= 0:
-        if _has_aggregate(b.st, b.st.where):
-            raise b.err(b.st.where, "aggregate functions are not allowed in WHERE: filter the groups with HAVING")
-        var w = b.value(b.st.where)
-        b.q.where = b.boolean(w, b.st.where, "WHERE")
-        b.q.where_text = b.st.render(b.st.where)
+    # WHERE (and a join's ON)
+    b.bind_where()
     # GROUP BY: ordinals and aliases name select items
     for g in range(len(b.st.group_by)):
         var ast = b.st.group_by[g]
@@ -1267,10 +1544,7 @@ def bind_rows(var b: _Binder) raises -> BoundQuery:
     """A query with no aggregate and no GROUP BY: it returns rows. The select list and ORDER BY are row-level expressions
     (`routs`, `rorder`); WHERE is bound as before."""
     b.q.rows = True
-    if b.st.where >= 0:
-        var w = b.value(b.st.where)
-        b.q.where = b.boolean(w, b.st.where, "WHERE")
-        b.q.where_text = b.st.render(b.st.where)
+    b.bind_where()
     for k in range(len(b.st.items)):
         var it = b.st.items[k].copy()
         var e = b.value(it.expr)
@@ -1310,3 +1584,50 @@ def bind_rows(var b: _Binder) raises -> BoundQuery:
         b.q.rorder.append(SortKey(e, oi.desc, oi.nulls == 1))
         b.q.order_text.append(b.st.render(oi.expr) + (" DESC" if oi.desc else "") + (" NULLS FIRST" if oi.nulls == 1 else ""))
     return b^.take()
+
+
+def copy_query(q: BoundQuery) -> BoundQuery:
+    """A copy of a bound query (the plan lowers a new one from its nodes and leaves the binder's alone)."""
+    var c = BoundQuery()
+    c.source = q.source
+    c.rexprs = q.rexprs.copy()
+    c.pexprs = q.pexprs.copy()
+    c.where = q.where
+    c.keys = q.keys.copy()
+    c.aggs = q.aggs.copy()
+    c.outputs = q.outputs.copy()
+    c.out_names = q.out_names.copy()
+    c.having = q.having
+    c.order = q.order.copy()
+    c.limit = q.limit
+    c.offset = q.offset
+    c.explain = q.explain
+    c.text = q.text
+    c.line = q.line
+    c.col = q.col
+    c.where_text = q.where_text
+    c.having_text = q.having_text
+    c.order_text = q.order_text.copy()
+    c.out_text = q.out_text.copy()
+    c.joined = q.joined
+    c.sources = q.sources.copy()
+    c.tab_names = q.tab_names.copy()
+    c.tab_alias = q.tab_alias.copy()
+    c.tab_start = q.tab_start.copy()
+    c.tab_cols = q.tab_cols.copy()
+    c.jk_l = q.jk_l.copy()
+    c.jk_r = q.jk_r.copy()
+    c.jk_l_names = q.jk_l_names.copy()
+    c.jk_r_names = q.jk_r_names.copy()
+    c.conj_l = q.conj_l.copy()
+    c.conj_r = q.conj_r.copy()
+    c.conj_x = q.conj_x.copy()
+    c.conj_l_text = q.conj_l_text.copy()
+    c.conj_r_text = q.conj_r_text.copy()
+    c.conj_x_text = q.conj_x_text.copy()
+    c.using_cols = q.using_cols.copy()
+    c.rows = q.rows
+    c.distinct = q.distinct
+    c.routs = q.routs.copy()
+    c.rorder = q.rorder.copy()
+    return c^
