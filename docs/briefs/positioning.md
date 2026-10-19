@@ -43,6 +43,13 @@ live in plugins over them.
 ## Why it can win
 - **GPU-native across vendors:** DuckDB is CPU-only by design; cuDF and Sirius are tied to NVIDIA, CUDA and Python.
   Mojo gives one codebase for NVIDIA, AMD and Apple Silicon.
+- **Modern algorithms, not a port of old ones:** morsel-driven parallelism (each core owns a block, no barriers),
+  radix-partitioned hash joins built without atomics, parallel radix sort and radix select, HyperLogLog-sized hash
+  sets, bounded top-k heaps, SIMD bulk Parquet decode, two-phase parallel dictionaries, planner choices from exact
+  statistics, reproducible float sums.
+- **A modern compiled language:** Mojo compiles ahead of time to native code with SIMD types, compile-time
+  specialisation and no garbage collector, and the same kernels run on CPU and GPU. Python's ease with C++'s speed,
+  in one codebase.
 - **No Python inside:** an app or agent links one library; nothing to install or break.
 - **Open files only:** no proprietary format, no lock-in. Anything omxcore writes, every other tool reads.
 
