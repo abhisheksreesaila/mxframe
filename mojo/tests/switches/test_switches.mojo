@@ -6,7 +6,7 @@ from std.sys import argv
 from std.os import getenv
 from mxframe import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
                      gpu_available, read_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, min_of, max_of, ZSTD, SNAPPY,
-                     count_distinct, median, percentile, top_k)
+                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql)
 from mxframe.query import AUTO_GPU_MIN_ROWS
 from mxframe.kernels._fpenv import core_count
 
@@ -72,6 +72,32 @@ def main() raises:
         expect(hol.values(2)[g] == g + 3 * (idx9 - 1), "p90 of group " + String(g) + ": " + String(hol.values(2)[g]))
         var top = hol.top(3, g)
         expect(len(top) == 2 and top[0] == g + 3 * (m - 1) and top[1] == g + 3 * (m - 2), "top 2 of group " + String(g))
+
+    # SQL with no thread pool: dense groups, hashed groups (hashagg's start_pool and its partitioned merge on this thread) and the
+    # two-pass holistic aggregates, against hand counts
+    var cat = Catalog()
+    cat.add_table("t", shared)
+    for strategy in [GROUP_DENSE, GROUP_HASHED]:
+        var po = PlannerOptions()
+        po.group = strategy
+        var r = sql(cat, "SELECT k, count(*), sum(v), count(DISTINCT v % 1000), median(v) FROM t GROUP BY k ORDER BY k", po)
+        var hashed = strategy == GROUP_HASHED
+        var seen = False
+        for note in r.notes:
+            if note.startswith("group: hashed" if hashed else "group: dense"):
+                seen = True
+        expect(seen, "SQL ran the " + ("hashed" if hashed else "dense") + " strategy")
+        expect(r.table.rows() == 3, "SQL gives three groups")
+        for g in range(3):
+            var m = (n - g + 2) // 3
+            expect(r.table.get(1, g) == Int64(m), "SQL count of group " + String(g) + ": " + String(r.table.get(1, g)))
+            expect(r.table.get(2, g) == Int64(m * g + 3 * (m * (m - 1) // 2)), "SQL sum of group " + String(g) + ": " + String(r.table.get(2, g)))
+            expect(r.table.get(3, g) == 1000, "SQL count(DISTINCT) of group " + String(g))
+            var idx = Int(0.5 * Float64(m))
+            if Float64(idx) < 0.5 * Float64(m):
+                idx += 1
+            var mid = Float64((g + 3 * (idx - 1)) + (g + 3 * (m // 2))) / 2.0
+            expect(Float64(from_bits=UInt64(r.table.get(4, g))) == mid, "SQL median of group " + String(g))
 
     # no thread pool: the parallel CSV reader runs its chunks one after the other
     var csv = String("/tmp/mxframe-switches.csv")

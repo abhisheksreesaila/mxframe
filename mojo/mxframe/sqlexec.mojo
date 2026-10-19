@@ -386,7 +386,8 @@ def _delta_nulls(src: SqlSource, c: Int) -> Bool:
     return False
 
 
-def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess) raises -> Stats:
+def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess, trust: Bool = True) raises -> Stats:
+    """`trust` False: a file's footer statistics are not used (every column may hold NULLs, no range is known)."""
     var st = Stats(src.name, src.kind, src.rows() + (len(src.overlay.delta) if src.kind != SRC_SCAN else 0))
     st.edits = len(src.overlay.delta)
     st.version = src.version
@@ -395,13 +396,13 @@ def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess) raises -> Stats
     for c in range(src.table.columns()):
         var cs = ColStat(src.table.kind(c).value, src.table.scale(c))
         if src.kind == SRC_SCAN:
-            cs.nullable = src.scan.value().null_count(c) != 0 or _delta_nulls(src, c)
+            cs.nullable = not trust or src.scan.value().null_count(c) != 0 or _delta_nulls(src, c)
         else:
             cs.nullable = src.table.null_count(c) > 0 or _delta_nulls(src, c)
         if cs.kind == TEXT.value:
             cs.words = dicts.count(c)
         for i in range(len(src.range_cols)):
-            if src.range_cols[i] == c and src.range_has[i]:
+            if src.range_cols[i] == c and src.range_has[i] and (trust or src.kind != SRC_SCAN):
                 cs.has_range = True
                 cs.lo = src.range_lo[i]
                 cs.hi = src.range_hi[i]
@@ -690,7 +691,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     if plan.group == G_NONE:
         gids.append(0)
     elif plan.group == G_DENSE:
-        for g in range(len(acc.counts)):
+        for g in range(plan.domain):
             if acc.counts[g] > 0:
                 gids.append(g)
     else:
@@ -924,6 +925,24 @@ def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
     return chunk^
 
 
+comptime LIE = "footer statistics wrong: "
+
+
+def _check_footer(src: SqlSource, ch: _Chunks, i: Int, chunk: SharedTable) raises:
+    """A trusted footer states each column chunk's null count: a decoded row group that holds another number shows the footer
+    cannot be believed (a NULL read as a value would otherwise be counted as 0)."""
+    if not ch.scan_mode or i >= len(ch.groups):
+        return
+    ref scan = src.scan.value()
+    for k in range(len(ch.used)):
+        var stated = scan.group_null_count(ch.groups[i], ch.used[k])
+        var real = chunk.null_count(k)
+        if stated >= 0 and stated != real:
+            raise Error(LIE + "row group " + String(ch.groups[i]) + " states " + String(stated) + (" null" if stated == 1 else " nulls") +
+                        " in column `" + scan.name(ch.used[k]) + "` and holds " + String(real))
+
+
+
 def _all(n: Int) -> List[Int]:
     var out = List[Int]()
     for i in range(n):
@@ -1140,7 +1159,7 @@ struct _Inputs(Movable):
         self.scan_mode = False
 
 
-def _inputs(src: SqlSource, q: BoundQuery) raises -> _Inputs:
+def _inputs(src: SqlSource, q: BoundQuery, trust: Bool = True) raises -> _Inputs:
     var inp = _Inputs()
     var n_cols = src.table.columns()
     inp.used = collect_columns(q)
@@ -1162,7 +1181,7 @@ def _inputs(src: SqlSource, q: BoundQuery) raises -> _Inputs:
         for c in range(n_cols):
             inp.pos[c] = c
     for c in range(n_cols):
-        inp.nullable.append((src.scan.value().null_count(c) != 0 if inp.scan_mode else src.table.null_count(c) > 0) or _delta_nulls(src, c))
+        inp.nullable.append((not trust or src.scan.value().null_count(c) != 0 if inp.scan_mode else src.table.null_count(c) > 0) or _delta_nulls(src, c))
     inp.masked = len(src.overlay.mask) > 0
     return inp^
 
@@ -1196,16 +1215,16 @@ def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: Dict
 
 
 def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
-             mut notes: List[String], inp: _Inputs, var sp: SqlProgram) raises -> Table:
+             mut notes: List[String], inp: _Inputs, var sp: SqlProgram, trust: Bool = True) raises -> Table:
     var used = inp.used.copy()
     var scan_mode = inp.scan_mode
     var two_pass = plan.group == G_HASHED and plan.holistic
     var ops = sp.slot_ops.copy()
     var threads = opts.threads
     var rows_total = -1 if src.kind != SRC_TABLE else src.rows()
-    var hs = _holistic_states(q, plan.domain if plan.group == G_DENSE else 1, sp, dicts, rows_total) if (sp.p.mat and not two_pass) else \
+    var hs = _holistic_states(q, sp.p.groups, sp, dicts, rows_total) if (sp.p.mat and not two_pass) else \
              HolStates(1, List[HolSpec](), List[List[Int64]]())
-    var domain = plan.domain if plan.group == G_DENSE else 1
+    var domain = sp.p.groups                                      # (a dense plan with a footer-stated range has one extra, for rows outside it)
     var acc = Partial()
     var ix = _KeyIndex()
     var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
@@ -1216,8 +1235,13 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     for i in range(ch.n()):
         var t_load = perf_counter_ns()
         var chunk = _load_chunk(src, ch, i)
+        if trust:
+            _check_footer(src, ch, i, chunk)
         ns_load += perf_counter_ns() - t_load
         _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix)
+    if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
+        raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
+                    " outside the range of a group key that the footer gave")
     var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
     var ms_load = Float64(ns_load) / 1e6
     if src.kind == SRC_FRAME:
@@ -1263,7 +1287,7 @@ def _ms(x: Float64) -> String:
     return String(Float64(Int(x * 100.0)) / 100.0)
 
 
-def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
+def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions, trust: Bool, lie: String) raises -> SqlResult:
     var t0 = perf_counter_ns()
     prepare_ranges(catalog, q)
     ref src = catalog.sources[q.source]
@@ -1274,11 +1298,13 @@ def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: P
                 scan.value().ensure_words(Int(e.value))
     var extra = src.overlay.words.copy()
     var dicts = DictAccess(src.table, scan, extra)
-    var st = make_stats(src, q, dicts)
+    var st = make_stats(src, q, dicts, trust)
     var plan = planner.plan(q, st, opts)
     var res = SqlResult()
     res.notes = plan.notes.copy()
-    var inp = _inputs(src, q)
+    if lie.byte_length() > 0:
+        res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
+    var inp = _inputs(src, q, trust)
     var sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
     _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
     if q.explain != EXPLAIN_NONE:
@@ -1292,11 +1318,24 @@ def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: P
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
     var notes = res.notes.copy()
-    res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^)
+    res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
     res.notes = notes^
     res.explain = _explain_text(q, src, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
     return res^
+
+
+def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
+    """Runs the query. A Parquet footer's min / max and null counts are a hint that lets the planner use dense groups and skip NULL
+    checks; they are verified as the row groups are read (a null count that is wrong, a row outside a stated range), and when one
+    is wrong the query runs again without the statistics, which the notes say."""
+    try:
+        return _run_sql_once(catalog, q, planner, opts, True, String())
+    except e:
+        var msg = String(e)
+        if not msg.startswith(LIE):
+            raise e^
+        return _run_sql_once(catalog, q, planner, opts, False, String(msg[byte=LIE.byte_length():]))
 
 
 def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:

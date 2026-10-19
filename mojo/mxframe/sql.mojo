@@ -197,6 +197,8 @@ def lex_sql(text: String) raises -> List[Token]:
     return out^
 
 
+comptime MAX_DEPTH = 256         # the deepest an expression may nest
+
 # ── the syntax tree ──────────────────────────────────────────────────────────────────────────────────
 
 comptime X_INT = 0          # text: the digits
@@ -380,10 +382,14 @@ struct _Parser(Movable):
     var toks: List[Token]
     var pos: Int
     var st: SqlStatement
+    var depths: List[Int]            # the depth of each expression of `st.exprs`
+    var level: Int                   # nesting of the recursive descent now
 
     def __init__(out self, var toks: List[Token], text: String):
         self.toks = toks^
         self.pos = 0
+        self.depths = List[Int]()
+        self.level = 0
         self.st = SqlStatement(text)
 
     def take(deinit self) -> SqlStatement:
@@ -442,11 +448,25 @@ struct _Parser(Movable):
             raise self.expected("`" + s + "`")
         return self.advance()
 
+    def enter(mut self, t: Token) raises:
+        """Counts one more level of nesting; the parser, the binder and the emitter recurse, so the depth is bounded."""
+        self.level += 1
+        if self.level > MAX_DEPTH:
+            raise _tok_error(t, "this expression is nested more than " + String(MAX_DEPTH) + " levels deep (parentheses, NOT or a minus sign repeated)")
+
     def add(mut self, var x: SqlExpr) -> Int:
         self.st.exprs.append(x^)
         return len(self.st.exprs) - 1
 
-    def node(mut self, kind: Int, text: String, a: Int, b: Int, c: Int, t: Token, flag: Bool = False) -> Int:
+    def node(mut self, kind: Int, text: String, a: Int, b: Int, c: Int, t: Token, flag: Bool = False) raises -> Int:
+        var d = 0
+        for k in [a, b, c]:
+            if k >= 0 and kind != X_CALL:                   # (a call's `a` is a flag, its arguments are items)
+                d = max(d, self.depths[k])
+        if d + 1 > MAX_DEPTH:
+            raise _tok_error(t, "this expression is " + String(d + 1) + " levels deep, more than the " + String(MAX_DEPTH) +
+                             " allowed (a chain of that many terms joined by `" + (text if text.byte_length() > 0 else "an operator") + "` counts)")
+        self.depths.append(d + 1)
         return self.add(SqlExpr(kind, text, String(), a, b, c, List[Int](), flag, t.line, t.col))
 
     # -- statement
@@ -640,7 +660,10 @@ struct _Parser(Movable):
 
     # -- expressions, loosest first
     def expr(mut self) raises -> Int:
-        return self.or_expr()
+        self.enter(self.tok())
+        var e = self.or_expr()
+        self.level -= 1
+        return e
 
     def or_expr(mut self) raises -> Int:
         var left = self.and_expr()
@@ -661,7 +684,9 @@ struct _Parser(Movable):
     def not_expr(mut self) raises -> Int:
         if self.is_kw("NOT") and not self.is_kw("EXISTS", 1):
             var t = self.advance()
+            self.enter(t)
             var a = self.not_expr()
+            self.level -= 1
             return self.node(X_NOT, "NOT", a, -1, -1, t)
         return self.cmp_expr()
 
@@ -741,7 +766,9 @@ struct _Parser(Movable):
     def unary(mut self) raises -> Int:
         if self.is_sym("-") or self.is_sym("+"):
             var t = self.advance()
+            self.enter(t)
             var a = self.unary()
+            self.level -= 1
             if t.text == "+":
                 return a
             ref x = self.st.exprs[a]

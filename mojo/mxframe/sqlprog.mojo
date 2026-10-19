@@ -21,7 +21,7 @@ from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL,
                     CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, _frame_mask, _null_mask)
 from .frame import _text_less
 from .bind import (BoundQuery, BExpr, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
-                   B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_LE, C_GT, C_EQ,
+                   B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
@@ -86,6 +86,7 @@ struct SqlProgram(Movable):
     var slot_ops: List[Int]          # per slot: how partial results merge (A_SUM, A_MIN or A_MAX)
     var key_regs: Int                # registers 0 .. key_regs-1 hold the group key (dense: 1)
     var n_src: Int
+    var guard_slot: Int              # dense with a footer-stated range: the extra group that rows outside it land in, else -1
     var instr: Int                   # instructions a row runs (predicate, body, aggregates)
 
     def __init__(out self, var p: Program):
@@ -98,6 +99,7 @@ struct SqlProgram(Movable):
         self.slot_ops = List[Int]()
         self.key_regs = 1
         self.n_src = 0
+        self.guard_slot = -1
         self.instr = 0
 
 
@@ -508,7 +510,12 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         ctl_reg = 0
     var out = SqlProgram(Program(0))
     e.p.mat = holistic
-    e.p.groups = plan.domain if plan.group == G_DENSE else 1
+    var guarded = False                                           # a dense key whose range a file's footer stated: one extra slot catches rows outside it
+    if plan.group == G_DENSE:
+        for lay in plan.keys:
+            guarded = guarded or lay.guarded
+    e.p.groups = (plan.domain + (1 if guarded else 0)) if plan.group == G_DENSE else 1
+    out.guard_slot = plan.domain if guarded else -1
     # registers: the key (dense: register 0, and register 1 the control block of a holistic query) or the key words
     e.reserve(key_regs + (1 if holistic else 0))
     e.p.section = 1
@@ -548,6 +555,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     if plan.group == G_DENSE:
         e.p.keyed = True
         var acc = -1
+        var anybad = -1
         for k in range(len(plan.keys)):
             ref lay = plan.keys[k]
             var v = e.value(lay.expr)
@@ -560,6 +568,26 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
                 var lo = e.const_i(lay.lo)
                 e.ins(OP_ISUB, v.reg, v.reg, lo)
                 e.free(lo)
+                if lay.guarded:                                   # a value below the range or past it is flagged (NULL is not a value)
+                    var zero = e.const_i(0)
+                    var bad = e.tmp()
+                    e.ins(OP_ICMP, bad, v.reg, zero, C_LT)
+                    e.free(zero)
+                    var span = e.const_i(Int64(lay.radix - (1 if lay.nullable else 0)))
+                    var past = e.tmp()
+                    e.ins(OP_ICMP, past, v.reg, span, C_GE)
+                    e.free(span)
+                    e.ins(OP_OR, bad, bad, past)
+                    e.free(past)
+                    if lay.nullable:
+                        var f0 = e.const_f(0.0)
+                        e.ins(OP_SELECT, bad, v.nul, f0, bad)
+                        e.free(f0)
+                    if anybad < 0:
+                        anybad = bad
+                    else:
+                        e.ins(OP_OR, anybad, anybad, bad)
+                        e.free(bad)
                 if lay.nullable:
                     var one = e.const_i(1)
                     e.ins(OP_IADD, v.reg, v.reg, one)
@@ -577,6 +605,11 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
                 e.ins(OP_IADD, acc, acc, v.reg)
                 e.free(rd)
                 e.free(v.reg)
+        if anybad >= 0:
+            var dom = e.const_i(Int64(plan.domain))
+            e.ins(OP_SELECT, acc, anybad, dom, acc)
+            e.free(dom)
+            e.free(anybad)
         e.ins(OP_IMAX, 0, acc, acc)
         e.free(acc)
     elif plan.group == G_HASHED:
