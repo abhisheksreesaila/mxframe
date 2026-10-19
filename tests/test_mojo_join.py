@@ -183,9 +183,16 @@ def test_empty_sides(mx, data):
 
 
 def test_a_hot_key(mx, data):
+    # the hot key is on the probe side: the build side (dims) has unique keys, so the join is fused
     res = q(mx, data, "SELECT count(*), sum(h.v) FROM hot h JOIN dims d ON h.k = d.k", ["hot", "dims"])
-    assert "repeated keys" in note(res, "join build side") or "unique keys" in note(res, "join build side")
-    q(mx, data, "SELECT h.v, count(*) FROM hot h JOIN hot g ON h.k = g.k WHERE h.hid < 400 AND g.hid < 400 GROUP BY h.v", ["hot"])
+    assert re.match(r"join build side: d \(2,000 rows, the smaller side\): direct array, unique keys", note(res, "join build side")), res["notes"]
+    assert note(res, "join path").startswith("join path: fused:"), res["notes"]
+    # the hot key on both sides: repeated build keys, materialized pairs
+    res = q(mx, data, "SELECT h.v, count(*) FROM hot h JOIN hot g ON h.k = g.k WHERE h.hid < 400 AND g.hid < 400 GROUP BY h.v", ["hot"])
+    assert "repeated keys (CSR rows)" in note(res, "join build side"), res["notes"]
+    assert note(res, "join path").startswith("join path: materialized:"), res["notes"]
+    res = q(mx, data, "SELECT count(*) FROM hot h JOIN hot g ON h.k = g.k", ["hot"])
+    assert "repeated keys" in note(res, "join build side") and note(res, "join path").startswith("join path: materialized:"), res["notes"]
 
 
 # ── the build side is the side with fewer rows after its filters ────────────────────────────────────
@@ -268,7 +275,14 @@ def test_unsupported_joins_say_so(mx, data):
 def test_keys_of_different_kinds_are_refused_readably(mx, data, sql, message):
     e = err(mx, data, sql, ["facts", "dims"])
     assert e["message"].startswith(message), e
-    assert (e["line"], e["column"]) == (1, 51) or e["line"] == 1, e
+    assert (e["line"], e["column"]) == (1, sql.index(" = ") + 2), e          # the `=` of the ON condition (1-based)
+
+
+def test_a_bad_on_condition_is_called_ON_not_WHERE(mx, data):
+    e = err(mx, data, "SELECT count(*) FROM facts f JOIN dims d ON f.k = d.k AND f.x + 1", ["facts", "dims"])
+    assert e["message"].startswith("ON needs a true / false value"), e
+    e = err(mx, data, "SELECT count(*) FROM facts f JOIN dims d ON f.k = d.k WHERE f.x + 1", ["facts", "dims"])
+    assert e["message"].startswith("WHERE needs a true / false value"), e
 
 
 def test_explain_shows_the_join_tree(mx, data):

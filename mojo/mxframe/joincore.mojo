@@ -251,12 +251,14 @@ def _pack_plain(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: List[
 def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: List[Int], mut keys: JoinKeys, threads: Int = 0) raises:
     """The keys of the build side `bt` and the probe side `pt`, columns `bcols[j]` and `pcols[j]` being compared pairwise."""
     var nk = len(bcols)
+    if bt.rows() >= (1 << 31) or pt.rows() >= (1 << 31):
+        raise Error("join: a side of 2^31 rows or more is not supported (the join's row numbers are 32-bit); filter or split the table first")
     if nk == 1:
         var kind = bt.kind(bcols[0]).value
         var bs = bt.scale(bcols[0])
         var ps = pt.scale(pcols[0])
         var numeric = kind == INT.value or kind == DECIMAL.value
-        if (numeric and bs == ps) or kind == DATE.value or kind == BOOL.value or (kind == TEXT.value and False):
+        if (numeric and bs == ps) or kind == DATE.value or kind == BOOL.value:
             # the key is the column itself: no pass over the rows, only the NULL flags (when there are any)
             keys.bk_addr = Int(bt.values(bcols[0]).unsafe_ptr())
             keys.pk_addr = Int(pt.values(pcols[0]).unsafe_ptr())

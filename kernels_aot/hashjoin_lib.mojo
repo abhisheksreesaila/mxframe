@@ -9,6 +9,9 @@ caller that is not Mojo. The kernel itself is `hashjoin_cpu.mojo`; this file onl
                                                        out Int64[3]: pair count, address of Int32 probe rows, address of Int32 build rows
                                                        (release each with mx_hj_release_array); -32 when the pairs pass the budget
     mx_hj_release_array(addr), mx_hj_free(h)
+
+A handle has one owner: `mx_hj_free` once, after the last probe (a second free, or a probe after the free, is the caller's error). A handle that is 0 or negative
+(`mx_hj_build`'s error code passed on by mistake) is refused with -33 by the other calls and ignored by `mx_hj_free`.
 """
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer
@@ -18,6 +21,7 @@ from hashjoin_cpu import JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_
 comptime ABI_VERSION = 1
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
 comptime HEADER = 15
+comptime E_BAD_HANDLE = -33          # a handle that is not a map (0, or an error code from mx_hj_build)
 
 
 def _box(var m: JoinMap) -> Int:
@@ -92,6 +96,8 @@ def mx_hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int) abi("C") -> Int:
 
 @export
 def mx_hj_info(handle: Int, out_a: Int) abi("C") -> Int:
+    if handle <= 0:
+        return E_BAD_HANDLE
     var h = LP(unsafe_from_address=handle)
     var out = LP(unsafe_from_address=out_a)
     out[0] = h[0]
@@ -103,6 +109,8 @@ def mx_hj_info(handle: Int, out_a: Int) abi("C") -> Int:
 
 @export
 def mx_hj_probe_unique(handle: Int, keys_a: Int, ok_a: Int, n: Int, out_a: Int, threads: Int) abi("C") -> Int:
+    if handle <= 0:
+        return E_BAD_HANDLE
     var m = _unbox(handle)
     var unique = m.unique
     if unique:
@@ -113,6 +121,8 @@ def mx_hj_probe_unique(handle: Int, keys_a: Int, ok_a: Int, n: Int, out_a: Int, 
 
 @export
 def mx_hj_probe_pairs(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int) abi("C") -> Int:
+    if handle <= 0:
+        return E_BAD_HANDLE
     var m = _unbox(handle)
     var rc = hj_probe_pairs(m, keys_a, ok_a, n, threads, budget_rows, out_a)
     _detach(m)
@@ -126,5 +136,7 @@ def mx_hj_release_array(addr: Int) abi("C"):
 
 @export
 def mx_hj_free(handle: Int) abi("C"):
+    if handle <= 0:                                  # like free(NULL): nothing to do
+        return
     var m = _unbox(handle)      # the map frees its memory when it goes out of scope here
     LP(unsafe_from_address=handle).free()
