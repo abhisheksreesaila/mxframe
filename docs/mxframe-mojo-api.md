@@ -233,7 +233,7 @@ int64 (informal, F-138a). Next: multi-column sort.
 - A build without a GPU (every non-Linux target, or `-D MXFRAME_NO_GPU`): `gpu_available()` is False, `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build", AUTO is the CPU (see `mojo/README.md`, build switches).
 - Later: data bigger than GPU or host memory (chunked, streamed); Apple GPUs (Metal) without Python.
 
-## 8. SQL over one table (F-150)
+## 8. SQL over one table (F-150, row queries F-152)
 
 ```mojo
 var cat = Catalog()
@@ -255,10 +255,10 @@ var h = sql(cat, "SELECT ...", o)
 | Part | Supported |
 |---|---|
 | Statement | `[EXPLAIN] SELECT ... FROM table [AS alias]` (table names and columns match without regard to case; `;` and `--` / `/* */` comments allowed) |
-| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number or date constant |
+| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number or date constant; with no aggregate and no `GROUP BY` the query returns rows (below): `*`, `t.*`, columns and expressions; `SELECT DISTINCT` |
 | `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` (numbers: up to 40; text: any number), `IS [NOT] NULL`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
 | `GROUP BY` | columns, expressions, ordinals (`GROUP BY 1`), select aliases; none at all (one group) |
-| `HAVING`, `ORDER BY` | aggregates and group keys in any expression; `ORDER BY` keys, aggregates, aliases, ordinals; `ASC` / `DESC`; `NULLS FIRST` / `LAST` (NULLS LAST by default, also for `DESC`, as DuckDB); `LIMIT n [OFFSET m]` |
+| `HAVING`, `ORDER BY` | aggregates and group keys in any expression (a row query: any column or expression, selected or not, several keys); `ORDER BY` keys, aggregates, aliases, ordinals; `ASC` / `DESC`; `NULLS FIRST` / `LAST` (NULLS LAST by default, also for `DESC`, as DuckDB); `LIMIT n [OFFSET m]` |
 | Aggregates | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `MIN`, `MAX` (also of TEXT), `AVG`, `MEDIAN`, `QUANTILE_DISC(x, p)` |
 
 **SQL's rules** (the Query builder above keeps its own; both run on the same kernels):
@@ -272,11 +272,15 @@ Text order everywhere (`ORDER BY`, `MIN` / `MAX`, `QUANTILE_DISC`, `<` and `BETW
 widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP, a kind MX frame does not have; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
 `//` and `%` on a FLOAT, and `//` on a DECIMAL (a floor of doubles in DuckDB), raise; the text order above; FLOAT64 in SQL follows the section below.
 
-**How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), planned from
-statistics only (`planner.mojo`: the `Planner` trait, `RulePlanner`, `Stats`, `PlannerOptions`), lowered to one kernel program in SQL's mode (`sqlprog.mojo`), run over the source's
-chunks, and finished in Mojo (`sqleval.mojo`, `sqlexec.mojo`: HAVING, ORDER BY, LIMIT, select expressions, the result Table). A table is one chunk; a frame is its shared table with
+**How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), turned into a
+logical plan (`plan.mojo`: Scan, Filter, Aggregate, Filter (HAVING), Project, Sort, Limit, with the rewrites that look at its shape), planned from statistics only (`planner.mojo`: the `Planner`
+trait, `RulePlanner`, `Stats`, `PlannerOptions`; it chooses the group strategy and the sink), lowered to one kernel program in SQL's mode (`sqlprog.mojo`), and run by the executor over the
+source's chunks (`exec.mojo`: the Sources; `sqlexec.mojo`: the aggregate Sinks; `rows.mojo`: the row Sinks; `post.mojo`: the stage after aggregation). A table is one chunk; a frame is its shared table with
 the changed rows masked out plus a small table of the changed and appended rows; a scan is one chunk per row group. The chunks' partial results (sums and counts add, min / max combine,
 hashed groups merge by key) fold into one.
+
+After aggregation the groups become a small table and HAVING, the select list's expressions, ORDER BY, OFFSET and LIMIT run over it as a row query, by the same executor and the same kernel
+program lowering as any other row query (there is no second expression evaluator; a FLOAT is a float register, a number that meets one is converted as DuckDB casts it).
 
 | Group strategy | When | How |
 |---|---|---|
@@ -297,7 +301,7 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 **A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
 `x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
 
-**Limits**: one table (joins: F-153); no row queries, `DISTINCT`, `SELECT *` (F-152); no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
+**Limits**: one table (joins: F-153); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
 at most 48 registers (about 20 aggregates over different expressions) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
 Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
@@ -319,6 +323,41 @@ fetched into Python; neither is a quiet-machine benchmark). Every result was che
 
 The same queries over the Parquet file (one chunk per row group) are decode-bound: 80 to 110 ms to decode the three columns of 50 row groups, plus the kernel. A scan with very many groups merges a
 partial result per row group (a dense partial per group is the whole domain), which is slow at 1M groups (1 to 2.5 s): batching row groups and the other big-GROUP-BY work over streamed files is F-158.
+
+### Row queries (F-152)
+
+A query with no aggregate and no `GROUP BY` returns rows: `SELECT *`, `SELECT t.*, x + 1 AS y`, `WHERE`, `ORDER BY` (several keys, ASC / DESC, NULLS FIRST / LAST, any expression), `LIMIT`, `OFFSET`, `SELECT DISTINCT`.
+The result is an owned Table, as always; a frame's formula columns are columns (and part of `*`); text keeps the source's words (the result's dictionary holds the words present). A select item can be a column, an
+arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical expression (a BOOL column of true / false / NULL) or a constant; a string constant and a bare `NULL` are refused by name; a FLOAT (a column of the file, or `/`) is selected, ordered and made distinct like any other kind, in DuckDB's order (NaN equal to itself and above +inf, -0.0 equal to 0.0).
+
+| Part | What runs |
+|---|---|
+| materialize (the sink) | each chunk runs one kernel program: the WHERE (and a frame's mask) and the expressions of the select list and ORDER BY that are not plain columns, into registers. The kernel's block hook (`rows._rows_hook`, the `_mat_hook` pattern) writes, per block of 1,024 rows, the numbers of the selected rows and the computed values at the block's own place, and a prefix sum over the blocks' counts compacts them. A plain column is not carried through registers: it is gathered from the chunk by the selected rows' numbers, so a wide `SELECT *` costs no registers |
+| `ORDER BY` | the collected rows are sorted by a stable LSD radix pass per key, from the last key to the first (text under the owner's order, NULLS FIRST / LAST per key); ties keep the source order (a table's rows, a frame's changed rows after them) |
+| `ORDER BY ... LIMIT k [OFFSET m]` | when `k + m` is at most 4,096 and the source has more than 8x that many rows, no row is materialized: each worker keeps its best `k + m` rows in a heap inside the hook (a first-key test drops most rows before anything is copied), the workers' heaps are merged with the best so far after each chunk, and the result is cut to `[m, m + k)`. Ties keep the source order. EXPLAIN says `order: top-K by per-worker heaps in the hook` and the notes `rows: the best K of N rows kept in per-worker heaps`; otherwise `order: all rows sorted (why)` |
+| `LIMIT n` with no `ORDER BY` | the scan stops once it has `n + offset` rows: a table is read in slices, a scan stops reading row groups (`ran: scan t: 1 of 13 row groups read`, `rows: N rows selected (stopped early: the LIMIT was met)`). Which rows come first is the source order |
+| `SELECT DISTINCT a, b` | the group-by of the select list (the binder rewrites it; EXPLAIN shows `Distinct keys=[a, b]`), so it takes the dense or hashed strategy with the reason; `DISTINCT` with aggregates or `GROUP BY` raises (use `GROUP BY`); its `ORDER BY` terms must be in the select list |
+
+Informal timings (F-152; the same 12-core Ryzen 9 5900X under a load average of about 5 from other jobs, so rough; the F-150 test generator's table of 1,200,000 rows and 9 columns written to Parquet; MX frame is the in-process
+`sql()` time reported by `mx` (the file read apart), best of 3 fresh processes, the result a Table; DuckDB 1.5.1 on a table it loaded, best of 3, the result an Arrow table; every result is checked against DuckDB in `tests/test_mojo_rows.py`):
+
+| query | rows out | MX frame | DuckDB |
+|---|---|---|---|
+| `SELECT id, x, d FROM t WHERE x > 500` | 275,347 | 12 ms | 9 ms |
+| `SELECT * FROM t` | 1,200,000 | 114 ms | 59 ms |
+| `SELECT id, x * 2 + 1 AS y, d + e AS de, dt FROM t WHERE k = 1` | 215,586 | 16 ms | 12 ms |
+| `... WHERE x > 0 LIMIT 100` (the scan stops early) | 100 | 0.2 ms | 0.2 ms |
+| `SELECT id, x FROM t ORDER BY x DESC, id LIMIT 10` (heaps) | 10 | 2.9 ms | 1.4 ms |
+| `SELECT id, s, dt FROM t ORDER BY s, dt DESC LIMIT 50 OFFSET 100` (heaps, text key) | 50 | 3.5 ms | 6.0 ms |
+| `SELECT id, x, s FROM t WHERE x IS NOT NULL ORDER BY x, id` (full sort) | 1,103,764 | 114 ms | 47 ms |
+| `SELECT id, s FROM t ORDER BY s, id` (full sort, text) | 1,200,000 | 116 ms | 104 ms |
+| `SELECT DISTINCT s FROM t` | 16 | 1.3 ms | 4.0 ms |
+| `SELECT DISTINCT k, b FROM t` | 21 | 2.4 ms | 3.5 ms |
+| `SELECT DISTINCT g FROM t` (hashed, 983,770 groups) | 983,770 | 45 ms | 22 ms |
+
+Aggregates after the move of HAVING / ORDER BY / the select list onto the executor (same data; 983,770 groups for `g`): `GROUP BY g ORDER BY 2 DESC, 1 LIMIT 10` 57 ms (DuckDB 20),
+`GROUP BY g` with all groups out 108 ms (61), `GROUP BY g HAVING count(*) > 1 ORDER BY sum(x) / count(*) DESC LIMIT 10` 67 ms (18), 7 groups 3.6 ms (2.0). DuckDB is faster where the result is a million rows or the query is a
+full sort; the heaps, the early stop and `DISTINCT` over few values are where this executor wins or ties.
 
 ### The `mx` command line (F-151, for agents)
 
@@ -355,8 +394,8 @@ Things an agent should know:
 
 - **A long OR chain fails.** The parser stops expressions nested 256 levels deep, and an `a OR b OR c ...` chain of about 255 terms is that deep. Write `x IN (a, b, c)` instead. A list of **numbers** in
   an IN takes at most 40 values (`the most is 40`); split a longer one into several queries or filter by a range. A list of text words has no such limit.
-- **A table is one file.** One table per query until joins (F-153); `FROM` is a registered name or a quoted file name. A query without an aggregate (a plain row list) is not supported before F-152:
-  add `count(*)` or a `GROUP BY`.
+- **A table is one file.** One table per query until joins (F-153); `FROM` is a registered name or a quoted file name. A row query (`SELECT *`, `WHERE`, `ORDER BY`, `LIMIT`) works; `--max-rows` caps what is printed
+  (default 1000, `row_count` is the real count).
 - **A Parquet file with a DOUBLE (or FLOAT) column opens (F-157).** FLOAT is a column kind: see "FLOAT64 (F-157)" in section 1 for the rules (NaN order, -0.0, the reproducible sum, a 32-bit column compared with a literal in 32 bits). A Parquet text value that is not UTF-8 is refused.
 - **A footer that lies.** When a Parquet footer's min / max or null count turns out wrong while reading, the query runs again without the statistics and the notes say `statistics: ... ran again without
   them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.

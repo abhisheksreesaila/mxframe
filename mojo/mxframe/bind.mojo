@@ -14,7 +14,7 @@ from .frame import Frame, Overlay, Formula
 from .expr import N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
 from .csv import days_from_civil, _days_in_month, parse_float_text, F_OK, F_RANGE
 from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE,
-                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE)
+                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE, SqlExpr, SelectItem)
 
 comptime K_NULL = 6          # the type of a bare NULL literal
 
@@ -247,8 +247,17 @@ struct BoundQuery(Movable):
     var having_text: String
     var order_text: List[String]
     var out_text: List[String]
+    # F-152: row queries (no aggregate, no GROUP BY) and SELECT DISTINCT
+    var rows: Bool                   # a row query: `routs` and `rorder` hold its select list and ORDER BY (expressions of `rexprs`)
+    var distinct: Bool               # SELECT DISTINCT (bound as a group-by on the select list)
+    var routs: List[Int]
+    var rorder: List[SortKey]
 
     def __init__(out self):
+        self.rows = False
+        self.distinct = False
+        self.routs = List[Int]()
+        self.rorder = List[SortKey]()
         self.source = -1
         self.rexprs = List[BExpr]()
         self.pexprs = List[BExpr]()
@@ -421,8 +430,10 @@ struct _Binder(Movable):
     var alias_expr: List[Int]         # post-aggregate expression of each select item, by item (-1 while unbound)
     var n_stored: Int                 # the source's stored columns; the frame's formula columns follow them
     var formulas: List[Formula]
+    var distinct: Bool
 
     def __init__(out self, var st: SqlStatement):
+        self.distinct = False
         self.st = st^
         self.cat_names = List[String]()
         self.src_names = List[String]()
@@ -845,6 +856,8 @@ struct _Binder(Movable):
                        and self.alias_expr[k] >= 0:
                         return self.alias_expr[k]
                 var c = self.find_column(ast)
+                if self.distinct:
+                    raise self.err(ast, "for SELECT DISTINCT, ORDER BY expressions must appear in the select list: `" + self.src_names[c] + "` does not")
                 raise self.err(ast, "column `" + self.src_names[c] + "` must appear in the GROUP BY clause or be used in an aggregate function")
             var c = self.find_column(ast)
             if c >= self.n_stored:
@@ -1115,6 +1128,22 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     for i in range(len(b.st.exprs)):                    # an unknown function is reported as that, before anything else
         if b.st.exprs[i].kind == X_CALL and not _is_aggregate_name(b.st.exprs[i].text):
             raise b.unknown_function(i)
+    # F-152: `*` and `t.*` become the source's columns (a frame's formula columns too)
+    var items = List[SelectItem]()
+    for it in b.st.items:
+        if not it.star:
+            items.append(it.copy())
+            continue
+        if it.alias.byte_length() > 0:
+            var qual = lower_ascii(it.alias)
+            if qual != lower_ascii(b.table_name) and (b.table_alias.byte_length() == 0 or qual != lower_ascii(b.table_alias)):
+                raise sql_error(it.line, it.col, "unknown table or alias `" + it.alias + "` in `" + it.alias + ".*`")
+        for nm in b.src_names:
+            b.st.exprs.append(SqlExpr(X_COL, nm, String(), -1, -1, -1, List[Int](), False, it.line, it.col))
+            items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
+    b.st.items = items^
+    if len(b.st.items) == 0:
+        raise sql_error(1, 1, "the select list is empty")
     # an aggregate query: GROUP BY, or an aggregate somewhere
     var aggregating = len(b.st.group_by) > 0
     for it in b.st.items:
@@ -1125,10 +1154,18 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     for o in b.st.order_by:
         if _has_aggregate(b.st, o.expr):
             aggregating = True
+    if b.st.distinct:
+        if aggregating:
+            raise sql_error(b.st.items[0].line, b.st.items[0].col, "`SELECT DISTINCT` together with aggregates, GROUP BY or HAVING is not supported yet: " +
+                            "use GROUP BY alone (it returns the same distinct rows), or DISTINCT without aggregates")
+        # SELECT DISTINCT a, b is the group-by of the select list: the same machinery runs it
+        for it in b.st.items:
+            b.st.group_by.append(it.expr)
+        aggregating = True
+        b.q.distinct = True
+        b.distinct = True
     if not aggregating:
-        var first = b.st.items[0].copy()
-        raise sql_error(first.line, first.col, "a query without aggregates returns rows, which is not supported yet (F-152): " +
-                        "add an aggregate such as count(*), or GROUP BY")
+        return bind_rows(b^)
     # WHERE
     if b.st.where >= 0:
         if _has_aggregate(b.st, b.st.where):
@@ -1141,14 +1178,14 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         var ast = b.st.group_by[g]
         var gx = b.st.exprs[ast].copy()
         var target = ast
-        if gx.kind == X_INT:
+        if gx.kind == X_INT and not b.distinct:
             var n = Int(parse_number(gx.text).value)
             if n < 1 or n > len(b.st.items):
                 raise b.err(ast, "GROUP BY " + gx.text + " is out of range: the select list has " + String(len(b.st.items)) + " items")
             target = b.st.items[n - 1].expr
             if _has_aggregate(b.st, target):
                 raise b.err(ast, "GROUP BY " + gx.text + " refers to an aggregate")
-        elif gx.kind == X_COL and gx.text2.byte_length() == 0:
+        elif gx.kind == X_COL and gx.text2.byte_length() == 0 and not b.distinct:
             var is_column = False
             for nm in b.src_names:
                 if lower_ascii(nm) == lower_ascii(gx.text):
@@ -1222,5 +1259,54 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         if pe.op == B_NULL:
             raise b.err(oi.expr, "ORDER BY a constant NULL does nothing: remove it")
         b.q.order.append(SortKey(e, oi.desc, oi.nulls == 1))
+        b.q.order_text.append(b.st.render(oi.expr) + (" DESC" if oi.desc else "") + (" NULLS FIRST" if oi.nulls == 1 else ""))
+    return b^.take()
+
+
+def bind_rows(var b: _Binder) raises -> BoundQuery:
+    """A query with no aggregate and no GROUP BY: it returns rows. The select list and ORDER BY are row-level expressions
+    (`routs`, `rorder`); WHERE is bound as before."""
+    b.q.rows = True
+    if b.st.where >= 0:
+        var w = b.value(b.st.where)
+        b.q.where = b.boolean(w, b.st.where, "WHERE")
+        b.q.where_text = b.st.render(b.st.where)
+    for k in range(len(b.st.items)):
+        var it = b.st.items[k].copy()
+        var e = b.value(it.expr)
+        var x = b.q.rexprs[e].copy()
+        if x.op == B_NULL and x.kind == K_NULL:
+            raise b.err(it.expr, "a bare NULL in the select list cannot be typed")
+        if x.op == B_STR:
+            raise b.err(it.expr, "a string constant in the select list is not supported yet")
+        b.q.routs.append(e)
+        var nm: String
+        if it.has_alias:
+            nm = it.alias
+        elif x.op == B_COL:
+            nm = x.text
+        else:
+            nm = b.st.render(it.expr)
+        b.q.out_names.append(nm)
+        b.q.out_text.append(b.st.render(it.expr))
+    for oi in b.st.order_by:
+        var ox = b.st.exprs[oi.expr].copy()
+        var e = -1
+        if ox.kind == X_INT:
+            var n = Int(parse_number(ox.text).value)
+            if n < 1 or n > len(b.st.items):
+                raise b.err(oi.expr, "ORDER BY " + ox.text + " is out of range: the select list has " + String(len(b.st.items)) + " items")
+            e = b.q.routs[n - 1]
+        elif ox.kind == X_COL and ox.text2.byte_length() == 0:
+            for k in range(len(b.st.items)):
+                if b.st.items[k].has_alias and lower_ascii(b.st.items[k].alias) == lower_ascii(ox.text):
+                    e = b.q.routs[k]
+                    break
+        if e < 0:
+            e = b.value(oi.expr)
+        var x = b.q.rexprs[e].copy()
+        if x.op == B_NULL:
+            raise b.err(oi.expr, "ORDER BY a constant NULL does nothing: remove it")
+        b.q.rorder.append(SortKey(e, oi.desc, oi.nulls == 1))
         b.q.order_text.append(b.st.render(oi.expr) + (" DESC" if oi.desc else "") + (" NULLS FIRST" if oi.nulls == 1 else ""))
     return b^.take()

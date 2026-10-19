@@ -707,7 +707,7 @@ struct DistinctState(Movable):
                     else:
                         tab = List[Int64](length=2 * cap, fill=0)
                     _ = _dist_add(tab, cap, 0, _lp(sv) + lo, _ip(sg) + lo, n, 0)
-                    _tally(_lp(Int(tab.unsafe_ptr())), cap, _ip(loc_at) + p * groups if dense else _ip(loc_at), _lp(acc_at), dense)
+                    _tally(_lp(Int(tab.unsafe_ptr())), cap, _ip(loc_at) + p * groups if dense else _ip(loc_at), _lp(acc_at), dense)    # lifetime: ok (the loop uses `tab` again)
 
             par_n(transient, workers, workers)
         else:

@@ -114,6 +114,35 @@ def test_32_bit_arithmetic_after_aggregation_raises_by_name(probe, data, sql):
     assert "32-bit" in res["error"] and "not supported" in res["error"]
 
 
+REAL_ROW_QUERIES = [
+    ("SELECT id, f, f * 2, f + i, f <= d, -f, f / 3, f + 0 <= 0.07, f <= 7e-2 FROM t ORDER BY id", True),
+    ("SELECT id, f FROM t WHERE f <= 0.07 AND f >= 0.05 ORDER BY id", True),
+    ("SELECT id, f FROM t WHERE f = d ORDER BY id", True),
+    ("SELECT id, f + y, f * 1e0 FROM t WHERE f - 0.01 >= 0.06 ORDER BY id", True),
+]
+REAL_POST_QUERIES = [
+    "SELECT g, max(f) <= 0.07, min(f) = 0.05, max(f) < 7e-2, max(f) <= max(y), sum(f) > 1 FROM t GROUP BY g ORDER BY g",
+    "SELECT g, count(*) FROM t GROUP BY g HAVING max(f) <= 0.07 AND min(f) >= 0.05 ORDER BY g",
+    "SELECT g, count(*) FROM t GROUP BY g ORDER BY max(f), g",
+    "SELECT g, max(f) FROM t GROUP BY g ORDER BY g",
+]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("q", range(len(REAL_ROW_QUERIES)), ids=[q[0] for q in REAL_ROW_QUERIES])
+def test_real_rules_hold_in_row_queries(probe, data, mode, q):
+    sql, ordered = REAL_ROW_QUERIES[q]
+    res, got, want = run(probe, data, sql, mode)
+    assert_rows(got, want, {5} if False else set(), ordered, f"{mode}: {sql}")
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("sql", REAL_POST_QUERIES)
+def test_real_rules_hold_after_aggregation(probe, data, mode, sql):
+    res, got, want = run(probe, data, sql, mode)
+    assert_rows(got, want, set(), True, f"{mode}: {sql}")
+
+
 # ── a Frame after edits ───────────────────────────────────────────────────────────────────────────────
 
 EDIT_TEXTS = ["1e3", "-2.5", "0", "-0.0", "nan", "inf", "-inf", "123456.789", "5e-324", "1.7976931348623157e308", "-7.25e-10", "42", ""]
