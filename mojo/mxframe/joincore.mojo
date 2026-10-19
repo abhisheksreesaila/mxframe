@@ -141,7 +141,114 @@ def _ok_bytes(t: SharedTable, c: Int, mut ok: List[UInt8]) -> Int:
     return Int(ok.unsafe_ptr())
 
 
-def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: List[Int], mut keys: JoinKeys) raises:
+def _pack_plain(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: List[Int], mut keys: JoinKeys, threads: Int) raises -> Bool:
+    """Several key columns that need no change (integers or decimals of one scale, dates, bools) and have no NULL: packed into one int64 straight
+    from the columns, in parallel slices (the build side's ranges, then both sides' keys). False when the columns are not that plain or the ranges
+    do not fit 2^62 values (the general path takes over)."""
+    var nk = len(bcols)
+    for j in range(nk):
+        var kind = bt.kind(bcols[j]).value
+        var plain = kind == DATE.value or kind == BOOL.value or ((kind == INT.value or kind == DECIMAL.value) and bt.scale(bcols[j]) == pt.scale(pcols[j]))
+        if not plain or bt.null_count(bcols[j]) != 0 or pt.null_count(pcols[j]) != 0:
+            return False
+    var nb = bt.rows()
+    var np = pt.rows()
+    var bsrc = List[Int](length=nk, fill=0)
+    var psrc = List[Int](length=nk, fill=0)
+    for j in range(nk):
+        bsrc[j] = Int(bt.values(bcols[j]).unsafe_ptr())
+        psrc[j] = Int(pt.values(pcols[j]).unsafe_ptr())
+    var T = max(1, min(threads if threads > 0 else core_count(), nb // 65536 + 1))
+    var mins = List[Int64](length=T * nk, fill=Int64.MAX)
+    var maxs = List[Int64](length=T * nk, fill=Int64.MIN)
+    var mnp = mins.unsafe_ptr()
+    var mxp = maxs.unsafe_ptr()
+
+    def ranges(t: Int) {imm}:
+        var a = nb * t // T
+        var b = nb * (t + 1) // T
+        for j in range(nk):
+            var src = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=bsrc[j])
+            var lo = Int64.MAX
+            var hi = Int64.MIN
+            for i in range(a, b):
+                var v = src[i]
+                lo = min(lo, v)
+                hi = max(hi, v)
+            mnp[t * nk + j] = lo
+            mxp[t * nk + j] = hi
+
+    par_n(ranges, T, T)
+    var los = List[Int64]()
+    var spans = List[UInt64]()
+    var strides = List[UInt64]()
+    var product = UInt64(1)
+    for j in range(nk):
+        var lo = Int64.MAX
+        var hi = Int64.MIN
+        for t in range(T):
+            lo = min(lo, mins[t * nk + j])
+            hi = max(hi, maxs[t * nk + j])
+        if lo > hi:
+            lo = 0
+            hi = 0
+        var span = UInt64(hi) - UInt64(lo) + 1
+        if span == 0 or product > (UInt64(1) << 62) // span:
+            return False
+        los.append(lo)
+        spans.append(span)
+        strides.append(product)
+        product *= span
+    keys.bkeys = List[Int64](unsafe_uninit_length=nb)
+    keys.pkeys = List[Int64](unsafe_uninit_length=np)
+    keys.pok = List[UInt8](unsafe_uninit_length=np)
+    var bk = keys.bkeys.unsafe_ptr()
+    var pk = keys.pkeys.unsafe_ptr()
+    var po = keys.pok.unsafe_ptr()
+    var TB = max(1, min(threads if threads > 0 else core_count(), nb // 65536 + 1))
+    var TP = max(1, min(threads if threads > 0 else core_count(), np // 65536 + 1))
+
+    def build_keys(t: Int) {imm}:
+        var a = nb * t // TB
+        var b = nb * (t + 1) // TB
+        for i in range(a, b):
+            bk[i] = 0
+        for j in range(nk):
+            var src = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=bsrc[j])
+            var lo = los[j]
+            var st = strides[j]
+            for i in range(a, b):
+                bk[i] = Int64(UInt64(bk[i]) + UInt64(src[i] - lo) * st)
+
+    def probe_keys(t: Int) {imm}:
+        var a = np * t // TP
+        var b = np * (t + 1) // TP
+        for i in range(a, b):
+            pk[i] = 0
+            po[i] = 1
+        for j in range(nk):
+            var src = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=psrc[j])
+            var lo = los[j]
+            var sp = spans[j]
+            var st = strides[j]
+            for i in range(a, b):
+                var d = UInt64(src[i] - lo)
+                if d >= sp:
+                    po[i] = 0                                         # outside the build side's range: it cannot match
+                else:
+                    pk[i] = Int64(UInt64(pk[i]) + d * st)
+
+    par_n(build_keys, TB, TB)
+    par_n(probe_keys, TP, TP)
+    keys.layout = String(nk) + " keys packed into one int64 (" + String(product) + " combinations)"
+    keys.bk_addr = Int(keys.bkeys.unsafe_ptr())
+    keys.pk_addr = Int(keys.pkeys.unsafe_ptr())
+    keys.bo_addr = 0
+    keys.po_addr = Int(keys.pok.unsafe_ptr())
+    return True
+
+
+def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: List[Int], mut keys: JoinKeys, threads: Int = 0) raises:
     """The keys of the build side `bt` and the probe side `pt`, columns `bcols[j]` and `pcols[j]` being compared pairwise."""
     var nk = len(bcols)
     if nk == 1:
@@ -157,6 +264,8 @@ def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: Li
             keys.po_addr = _ok_bytes(pt, pcols[0], keys.pok)
             keys.layout = "one key (the column itself)"
             return
+    if nk > 1 and _pack_plain(bt, pt, bcols, pcols, keys, threads):
+        return
     var bvals = List[List[Int64]]()
     var boks = List[List[UInt8]]()
     var pvals = List[List[Int64]]()

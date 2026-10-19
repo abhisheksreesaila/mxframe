@@ -350,9 +350,9 @@ struct Query(Movable):
         var left_builds = self.table.rows() < other.rows()
         var keys = JoinKeys()
         if left_builds:
-            normalize_keys(self.table, other, lcols, rcols, keys)
+            normalize_keys(self.table, other, lcols, rcols, keys, self._threads)
         else:
-            normalize_keys(other, self.table, rcols, lcols, keys)
+            normalize_keys(other, self.table, rcols, lcols, keys, self._threads)
         var nb = self.table.rows() if left_builds else other.rows()
         var np = other.rows() if left_builds else self.table.rows()
         var m = hj_build(keys.bk_addr, keys.bo_addr, nb, self._threads)

@@ -182,6 +182,23 @@ def main() raises:
     check(rows_of(b.table), rows_of(a.table), "the scan equals the table")
     has_note(b, "ran: scan filed: 2 of 2 row groups read")
 
+    # a join over a frame and over a streamed file: the frame's edits are seen, the file's row groups are read; text keys match by bytes ('east' is not 'East')
+    var rt = Table.empty()
+    var r_reg = rt.add_column("region", TEXT)
+    var r_w = rt.add_column("w", INT)
+    var r_names: List[String] = ["West", "North", "East"]
+    for i in range(3):
+        rt.append_text(r_reg, r_names[i])
+        rt.append(r_w, Int64(10 * (i + 1)))
+    cat.add_table("reg", rt^.share())
+    r = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM edited e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
+    check(rows_of(r.table), "10 4 105\n20 2 4\n30 1 1\n", "a join over a frame")
+    has_note(r, "join build side: r (3 rows")
+    var jt = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM orders e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
+    var js = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM filed e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
+    check(rows_of(js.table), rows_of(jt.table), "a join over a scan equals the join over the table")
+    check(rows_of(js.table), "10 4 8\n20 2 4\n", "the join over a scan")
+
     # any Planner can plan: this one always asks for hashed groups
     r = sql_with(cat, "SELECT region, count(*) FROM orders GROUP BY region ORDER BY region", AlwaysHashed())
     check(rows_of(r.table), "east 3\nNorth 2\nWest 4\nNULL 1\n", "a custom planner")

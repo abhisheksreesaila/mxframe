@@ -355,3 +355,13 @@ def test_fused_rows_over_many_workers(mx, data):
     q(mx, data, "SELECT b.fid, d.name FROM bigf b JOIN dims d ON b.k = d.k WHERE b.fid % 5000 = 3", ["bigf", "dims"])
     q(mx, data, "SELECT b.fid, d.w FROM bigf b JOIN dims d ON b.k = d.k ORDER BY d.w DESC, b.fid LIMIT 40", ["bigf", "dims"], ordered=True,
       duck_sql="SELECT b.fid, d.w FROM bigf b JOIN dims d ON b.k = d.k ORDER BY d.w DESC NULLS LAST, b.fid NULLS LAST LIMIT 40")
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT d.name, count(*), sum(f.x) FROM facts f JOIN dims d ON f.k = d.k GROUP BY d.name",
+    "SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k WHERE f.fid < 500",
+    "SELECT count(*) FROM facts f JOIN dims d ON f.g = d.kk",
+])
+def test_joins_over_streamed_parquet_scans_equal_duckdb(mx, data, sql):
+    """`--stream always` reads each file by row groups (7,000 rows each); the join sees the same rows."""
+    q(mx, data, sql, ["facts", "dims"], extra=["--stream", "always"])

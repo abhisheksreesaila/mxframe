@@ -745,9 +745,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var t_keys = perf_counter_ns()
     var keys = JoinKeys()
     if left_builds:
-        normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys)
+        normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, opts.threads)
     else:
-        normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys)
+        normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, opts.threads)
     var nb = lrows if left_builds else rrows
     var np = rrows if left_builds else lrows
     var t_build = perf_counter_ns()
