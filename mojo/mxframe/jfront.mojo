@@ -16,7 +16,7 @@ from .query import Program
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC
 from .kernels.hashjoin_cpu import JoinMap, MapView, hj_probe_block
 from .kargs import KernelRun
-from .join import JoinKeys
+from .joincore import JoinKeys
 
 comptime DT_NULLMASK = 7
 

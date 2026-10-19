@@ -27,7 +27,8 @@ from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
-from .join import (needed_columns, side_query, joined_query, JoinKeys, JoinSide, normalize_keys, join_pairs, gather_join, virtual_schema, JOIN_BUDGET_BYTES)
+from .join import needed_columns, side_query, joined_query, virtual_schema
+from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, gather_join, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
