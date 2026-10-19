@@ -56,7 +56,7 @@ def plan(var q: Query, which: String) raises -> Query:
         return q^.group_by(col("g"), groups=8).agg(
             sum(col("x") * 2.0 + col("y")), sum(col("d") * col("y")), sum(col("i") + col("y")), sum(col("x") / lit_float(4.0)),
             sum(-col("x")), max_of(col("x") - col("y")), sum(col("i") / col("y")), mean(col("i") * lit_float(0.5)), min_of(col("d") + col("x")),
-            sum(col("i") * col("d")), max_of(col("y") / col("i")))
+            sum(col("i") * col("d") * lit_float(1.0)), max_of(col("y") / col("i")))
     if which == "holistic":
         return q^.group_by(col("g"), groups=8).agg(count(), count_distinct(col("z")), median(col("z")), percentile(col("z"), 0.25),
                                                     percentile(col("z"), 1.0), median(col("x")), percentile(col("x"), 0.9), top_k(col("x"), 3),
@@ -127,7 +127,7 @@ def edit(mut f: Frame, seed: Int) raises:
         elif what == 6:
             f.set_null(y, row)
         elif what == 7:
-            _ = f.append([String(rng.int(0, 7)), String(rng.int(0, 9)), "-0.0", String(rng.int(-500, 500)), String(rng.int(1, 99)), "nan", "12.50", String(rng.int(-9, 9)), "1.5", "west"])
+            _ = f.append([String(rng.int(0, 7)), String(rng.int(0, 7)), "-0.0", String(rng.int(-500, 500)), String(rng.int(1, 99)), "nan", "12.50", String(rng.int(-9, 9)), "1.5", "west"])
         elif what == 8:
             f.remove(row)
         elif what == 9:
@@ -146,9 +146,7 @@ def json_of(r: QueryResult) -> String:
         out += ("" if g == 0 else ", ") + String(r.counts[g])
     out += '], "aggs": ['
     for i in range(len(r.kinds)):
-        var is_float = len(r.agg_float) > i and r.agg_float[i]
-        if r.hol_of[i] >= 0:
-            is_float = r.hfloat[r.hol_of[i]]
+        var is_float = r.is_float(i)
         out += ("" if i == 0 else ", ") + '{"float": ' + ("1" if is_float else "0") + ', "present": ['
         for g in range(len(r.counts)):
             out += ("" if g == 0 else ", ") + ("1" if r.present(i, g) else "0")

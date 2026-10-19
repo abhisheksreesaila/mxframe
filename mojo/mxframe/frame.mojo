@@ -34,7 +34,9 @@ comptime APPEND = 1
 comptime REMOVE = 2
 comptime MERGE = 3
 comptime REPOINT = 4
-comptime NULL_EDIT = Int64.MIN + 1        # an edited cell set to null: `set` refuses this one value
+comptime NULL_EDIT = Int64(0x7FF8000000000001)   # an edited cell set to null: `set` refuses this one value. A quiet NaN's bits (F-157: a
+                                                 # FLOAT cell can hold any other bit pattern, and a NaN's payload is not a value): a FLOAT cell
+                                                 # that holds exactly this NaN is read as the canonical NaN
 comptime CACHE_BYTES = 128 * 1024 * 1024  # the default bound of a scan frame's cache of decoded column chunks
 
 
@@ -279,7 +281,7 @@ struct Frame(Movable):
         """The file's (or shared table's) value of a base row, NULL_EDIT for null. A scan: from the rows the session
         touched, else from the cache, which decodes the column chunk of the row's group on a miss."""
         if not self.scan:
-            return NULL_EDIT if self.base.is_null(c, row) else self.base.get(c, row)
+            return NULL_EDIT if self.base.is_null(c, row) else self._clean(c, self.base.get(c, row))
         ref cache = self.cache[]
         if row in cache.rows:
             return cache.rows[row][c]
@@ -287,7 +289,13 @@ struct Frame(Movable):
         var i = cache.fetch(self.scan.value(), g, c)
         ref t = cache.tables[i]
         var r = row - self.starts[g]
-        return NULL_EDIT if t.is_null(0, r) else t.get(0, r)
+        return NULL_EDIT if t.is_null(0, r) else self._clean(c, t.get(0, r))
+
+    def _clean(self, c: Int, v: Int64) -> Int64:
+        """A FLOAT cell's value that equals the null marker (a NaN with that payload) is the canonical NaN."""
+        if v == NULL_EDIT and self.base.kind(c) == FLOAT:
+            return Int64(F_NAN_BITS)
+        return v
 
     def set_cache_limit(mut self, bytes: Int):
         """Bounds the decoded column chunks a scan frame keeps for `get` and `is_null` (8 bytes a value plus the null
@@ -687,7 +695,7 @@ struct Frame(Movable):
                 var t = self.scan.value().read_group(g, [c])
                 for k in range(len(need)):
                     var r = need[k] - self.starts[g]
-                    vals[k][c] = NULL_EDIT if t.is_null(0, r) else t.get(0, r)
+                    vals[k][c] = NULL_EDIT if t.is_null(0, r) else self._clean(c, t.get(0, r))
             for k in range(len(need)):
                 cache.rows[need[k]] = vals[k].copy()
 
@@ -781,7 +789,7 @@ struct Frame(Movable):
                     elif some_nulls and tbl.is_null(tc, row - lo):
                         raw = NULL_EDIT
                     else:
-                        raw = vals[row - lo]
+                        raw = self._clean(c, vals[row - lo])
                     if raw == NULL_EDIT:
                         nulls.append(row)
                         continue

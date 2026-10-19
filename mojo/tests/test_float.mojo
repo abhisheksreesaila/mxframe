@@ -287,6 +287,23 @@ def test_frame_floats() raises:
     expect(back.kind(0) == FLOAT and back.get_float(0, 1) == 100.0 and back.get_float(0, 2) == 15.0, "save writes the edited floats as DOUBLE")
 
 
+def test_the_smallest_negative_subnormal_is_not_a_null() raises:
+    """-5e-324 has the bits INT64_MIN + 1, which the Frame once used to mark a null edit: a float cell must keep it."""
+    var t = Table.empty()
+    var x = t.add_column("x", FLOAT)
+    t.append_float(x, -5e-324)
+    t.append_float(x, Float64(from_bits=UInt64(0x7FF8000000000001)))
+    t.append_null(x)
+    var f = Frame(t^.share())
+    expect(not f.is_null(0, 0) and f.get_float(0, 0) == -5e-324, "-5e-324 is a value")
+    expect(not f.is_null(0, 1) and is_nan(f.get_float(0, 1)), "the NaN with the marker's payload is a NaN, not a null")
+    expect(f.is_null(0, 2), "the null is a null")
+    var b = f.bake()
+    expect(not b.cols[0].is_null(0) and b.get_float(0, 0) == -5e-324 and not b.cols[0].is_null(1) and b.cols[0].is_null(2), "bake keeps them")
+    var r = Query(f).agg(count(col("x")), min_of(col("x"))).compute(CPU)
+    expect(r.values(0)[0] == 2 and r.floats(1)[0] == -5e-324, "a query counts them")
+
+
 def sql_table() raises -> Table:
     var t = Table.empty()
     var k = t.add_column("k", FLOAT)
@@ -357,5 +374,6 @@ def main() raises:
     test_the_sum_is_the_same_for_any_threads()
     test_holistic_floats()
     test_frame_floats()
+    test_the_smallest_negative_subnormal_is_not_a_null()
     test_sql_floats()
     print("ok")

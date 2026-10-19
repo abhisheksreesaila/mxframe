@@ -439,6 +439,12 @@ struct QueryResult(Movable):
             return out^
         return self.slots[self.slot_of[i]].copy()
 
+    def is_float(self, i: Int) -> Bool:
+        """Aggregate i's value is a float64 (`floats(i)`): a float sum, mean, min, max, median or quantile (not count_distinct)."""
+        if self.hol_of[i] >= 0:
+            return self.hfloat[self.hol_of[i]] and self.kinds[i] != A_DISTINCT
+        return len(self.agg_float) > i and self.agg_float[i]
+
     def floats(self, i: Int) -> List[Float64]:
         """Aggregate i's value per group as a float64 (F-157): a float sum, min, max (NaN is above every number: MAX is NaN when the
         group holds one, MIN only when it holds nothing else) or mean (NaN for a group with no value), a float median / percentile,
@@ -447,7 +453,7 @@ struct QueryResult(Movable):
         if self.hol_of[i] >= 0:
             var h = self.hol_of[i]
             for g in range(len(self.hvals[h])):
-                out.append(Float64(from_bits=UInt64(Int64(self.hvals[h][g]))) if self.hfloat[h] else Float64(self.hvals[h][g]))
+                out.append(Float64(from_bits=UInt64(Int64(self.hvals[h][g]))) if self.is_float(i) else Float64(self.hvals[h][g]))
             return out^
         if len(self.agg_float) > i and self.agg_float[i]:
             var s = self.slots[self.slot_of[i]].copy()
