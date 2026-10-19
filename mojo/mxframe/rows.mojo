@@ -318,7 +318,7 @@ def build_items(q: BoundQuery, keys_computed: Bool = False, partner: List[Bool] 
             for o in q.rorder:
                 if bkey(q.rexprs, o.expr) == bkey(q.rexprs, e):
                     force = True
-        if x.op == B_COL and Int(x.value) < len(partner) and partner[Int(x.value)]:      # a joined column the fused front stage gathers: through a register
+        if x.op == B_COL and Int(x.value) < len(partner) and partner[Int(x.value)]:      # a joined column the fused front stage gathers, or a merged TEXT column: through a register
             force = True
         if x.op == B_COL and not force:
             items.append(_Item(e, bkey(q.rexprs, e), Int(x.value), -1))
@@ -828,7 +828,15 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
                  report: Bool, partner: List[Bool] = List[Bool]()) raises -> RowStage:
     """Lowers a row query (the program computes what is not a plain column; a top-k also computes its sort keys) and, when `report`,
     says in the notes which columns it reads and what the kernel does."""
-    var built = build_items(q, plan.top_k > 0, partner)
+    # a plain column goes through a register (where the program applies a frame's merges) when it is a gathered partner column or a merged TEXT column
+    var through = partner.copy()
+    var merged = _alias_lists(src)
+    for c in range(len(merged)):
+        if len(merged[c]) > 0:
+            while len(through) <= c:
+                through.append(False)
+            through[c] = True
+    var built = build_items(q, plan.top_k > 0, through)
     var sp: SqlProgram
     try:
         sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
