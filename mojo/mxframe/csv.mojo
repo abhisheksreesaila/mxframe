@@ -60,6 +60,7 @@ File format decisions:
     non-UTF-8 encoding. The parsed columns are held twice for a moment while the chunks are stitched together.
 """
 from std.ffi import external_call
+from std.sys import CompilationTarget
 from std.memory import Pointer
 from std.time import perf_counter_ns
 from std.collections import Dict
@@ -391,7 +392,19 @@ def _parse_float(p: BP, n: Int, mut out: Float64) -> Int:
     var buf = List[UInt8](length=n + 1, fill=0)
     for k in range(n):
         buf[k] = p[k]
-    var v = external_call["strtod", Float64](Int(buf.unsafe_ptr()), Int(0))
+    # strtod follows LC_NUMERIC: a host that called setlocale (a comma for the point) would stop at the point. strtod_l with the "C" locale
+    # does not (glibc, bionic and libSystem all have newlocale / strtod_l; the numeric category's mask is 2 on glibc, 16 on Apple).
+    var name = List[UInt8](length=2, fill=0)
+    name[0] = 67
+    comptime NUMERIC_MASK = 2 if CompilationTarget.is_linux() else 16
+    var loc = external_call["newlocale", Int](Int32(NUMERIC_MASK), Int(name.unsafe_ptr()), Int(0))
+    var v: Float64
+    if loc != 0:
+        v = external_call["strtod_l", Float64](Int(buf.unsafe_ptr()), Int(0), loc)
+        external_call["freelocale", NoneType](loc)
+    else:
+        v = external_call["strtod", Float64](Int(buf.unsafe_ptr()), Int(0))     # (no locale object: the process locale, normally "C")
+    _ = name^
     _ = buf^
     if v - v != 0.0:                                    # inf: the text was past the largest float64
         return F_RANGE

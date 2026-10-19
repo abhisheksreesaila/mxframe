@@ -1,7 +1,9 @@
 # F-157 (M8): FLOAT64 as a column kind, from Mojo with no Python: tables, Parquet, CSV, Query, Frame and SQL, with exact expected values
 # (sums of multiples of 0.25 are exact in any order). tests/test_mojo_float*.py compare many more queries with DuckDB on random doubles.
 from std.os import makedirs
-from mxframe import (Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
+from std.ffi import external_call
+from std.sys import CompilationTarget
+from mxframe import (float_text, Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
                      sum, count, mean, min_of, max_of, count_distinct, median, percentile, sql, PlannerOptions, GROUP_DENSE,
                      read_parquet, write_parquet, scan_parquet, read_csv, CsvOptions, ZSTD, CPU, AUTO)
 
@@ -344,6 +346,48 @@ def test_marker_values_are_data_in_base_columns() raises:
     expect(order[0] == 1 and order[3] == 0 and order[4] == 3, "sorted: the old marker is the smallest, the new one the largest, nulls last")
 
 
+def test_digits_parse_in_the_c_locale_whatever_the_process_locale() raises:
+    """The slow path of the float parser (strtod_l with the C locale) must not follow LC_NUMERIC: a host that called setlocale with a comma
+    for the decimal point would otherwise stop every long number at its point. Tries the locales a machine may have (none installed here
+    means the parse is checked under "C" only)."""
+    makedirs(DIR, exist_ok=True)
+    var path = DIR + "locale.csv"
+    with open(path, "w") as f:
+        f.write("x\n1.00000000000000000000001e0\n123456789012345678901.5\n0.1\n")
+    var names: List[String] = ["de_DE.UTF-8", "fr_FR.UTF-8", "de_DE.utf8", "fr_FR.utf8", "de_DE", "fr_FR", "pt_BR.UTF-8", "ru_RU.UTF-8"]
+    comptime LC_NUMERIC = 1 if CompilationTarget.is_linux() else 4
+    var switched = 0
+    for n in names:
+        var c = List[UInt8](n.as_bytes())
+        c.append(0)
+        var got = external_call["setlocale", Int](Int32(LC_NUMERIC), Int(c.unsafe_ptr()))
+        if got != 0:
+            switched += 1
+            var r = read_csv(path)
+            expect(r.table.kind(0) == FLOAT and r.table.get_float(0, 0) == 1.0 and r.table.get_float(0, 1) == 123456789012345678901.5
+                   and r.table.get_float(0, 2) == 0.1, "a long number parses to the same float under " + n)
+            var c2 = List[UInt8](length=2, fill=0)
+            c2[0] = 67
+            _ = external_call["setlocale", Int](Int32(LC_NUMERIC), Int(c2.unsafe_ptr()))
+        _ = c^
+    var r = read_csv(path)
+    expect(r.table.kind(0) == FLOAT and r.table.get_float(0, 1) == 123456789012345678901.5, "and under C")
+
+
+def test_float_text_is_the_shortest_that_reads_back() raises:
+    expect(float_text(0.1) == "0.1" and float_text(0.30000000000000004) == "0.30000000000000004" and float_text(100.0) == "100.0", "plain values")
+    expect(float_text(1e-7) == "1e-07" and float_text(5e-324) == "5e-324" and float_text(-0.0) == "-0.0" and float_text(1e16) == "1e+16", "exponents")
+    # the double Mojo's own formatter prints with one digit too few (8.69563793934264e+17 reads back as the neighbour)
+    var x = Float64(from_bits=UInt64(0x4389E3C2C7D3B6A9))
+    var t = float_text(x)
+    var back = Float64(0.0)
+    var ok = False
+    with open(DIR + "t.csv", "w") as f:
+        f.write("x\n" + t + "\n1e0\n")
+    var rr = read_csv(DIR + "t.csv")
+    expect(rr.table.get_float(0, 0) == x, "it reads back: " + t)
+
+
 def sql_table() raises -> Table:
     var t = Table.empty()
     var k = t.add_column("k", FLOAT)
@@ -419,4 +463,6 @@ def main() raises:
     test_the_smallest_negative_subnormal_is_not_a_null()
     test_marker_values_are_data_in_base_columns()
     test_sql_floats()
+    test_digits_parse_in_the_c_locale_whatever_the_process_locale()
+    test_float_text_is_the_shortest_that_reads_back()
     print("ok")

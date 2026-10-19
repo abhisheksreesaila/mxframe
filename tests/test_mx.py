@@ -440,3 +440,26 @@ def test_a_parquet_double_column_opens_and_equals_duckdb(mx, con, tmp_path):
         check(mx, sql, con, ordered=ordered)
     out = run_mx(mx, ["schema", str(p)])
     assert [c["kind"] for c in out["columns"]] == ["INT", "INT", "FLOAT", "FLOAT"] if "columns" in out else True
+
+
+def test_a_float_is_written_as_the_shortest_text_that_reads_back(mx, tmp_path):
+    """F-157: 0.1 prints as 0.1 and every double reads back to its bits, in JSON and in CSV (Mojo's own formatter alone fails 1 in 1,000)."""
+    import random
+    r = random.Random(11)
+    vals = [0.1, 0.2, 0.30000000000000004, 1e-7, 5e-324, 1.7976931348623157e308, 123456789.123456789, 1e16, 1e15, 8.695637939342639e17, -3.3854499886543212e16,
+            100.0, 1e22, 2.5e-5, 0.0001]
+    vals += [struct.unpack("<d", struct.pack("<Q", r.getrandbits(64)))[0] for _ in range(20000)]
+    vals += [round(r.uniform(-1e6, 1e6), r.randint(0, 6)) for _ in range(5000)]
+    vals = sorted({v for v in vals if v == v and abs(v) != float("inf") and v != 0.0})
+    p = tmp_path / "f.parquet"
+    pq.write_table(pa.table({"x": pa.array(vals, pa.float64())}), p)
+    target = tmp_path / "x.csv"
+    run_mx(mx, ["sql", f"SELECT x, count(*) FROM '{p}' GROUP BY x ORDER BY x", "--format", "csv", "--out", str(target)])
+    lines = [l.split(",")[0] for l in target.read_text().splitlines()[1:]]
+    assert len(lines) == len(vals)
+    for v, t in zip(vals, lines):
+        assert float(t) == v and struct.pack("<d", float(t)) == struct.pack("<d", v), (v, t)
+        digits = lambda x: len(x.lower().split("e")[0].replace("-", "").replace(".", "").strip("0"))
+        assert digits(t) <= digits(repr(v)), (v, t)       # as short as Python's repr (which may pick another digit of the same length)
+        if digits(repr(v)) <= 15:
+            assert t == repr(v), (v, t)

@@ -9,6 +9,7 @@ from .query import (Query, QueryResult, Agg, sum, count, mean, min_of, max_of, c
 from .parquet import write_parquet, read_parquet, scan_parquet, ParquetResult, ParquetScan, ParquetWriter, UNCOMPRESSED, SNAPPY, ZSTD
 from .csv import read_csv, CsvOptions, CsvResult, CsvColumn, FailedRow
 from .frame import Frame, Formula
+from .floatfmt import float_text
 from .gpu import DeviceTable, gpu_available
 from .sql import parse_sql, SqlStatement
 from .bind import Catalog, SqlSource, BoundQuery, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN
