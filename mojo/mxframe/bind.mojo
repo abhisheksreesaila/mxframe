@@ -653,6 +653,8 @@ struct _Binder(Movable):
             lits.append(lit)
         if xa.kind == FLOAT.value:
             raise self.err(ast, "IN on a FLOAT value is not supported")
+        if xa.kind != TEXT.value and len(lits) > 40:
+            raise self.err(ast, "an IN list of " + String(len(lits)) + " numbers is not supported yet: the most is 40")
         if _is_numeric(xa.kind) and scale > xa.scale:
             a = self.rescale(a, scale, ast)
         if _is_numeric(xa.kind):
@@ -930,6 +932,9 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     b.q.explain = b.st.explain
     b.q.limit = b.st.limit
     b.q.offset = b.st.offset
+    for i in range(len(b.st.exprs)):                    # an unknown function is reported as that, before anything else
+        if b.st.exprs[i].kind == X_CALL and not _is_aggregate_name(b.st.exprs[i].text):
+            raise b.unknown_function(i)
     # an aggregate query: GROUP BY, or an aggregate somewhere
     var aggregating = len(b.st.group_by) > 0
     for it in b.st.items:

@@ -1,0 +1,565 @@
+"""F-150: SQL aggregate queries over one table in the Mojo API, equal to DuckDB.
+
+The Mojo side is mojo/tools/sql_probe.mojo run as a subprocess: it parses, binds, plans and runs one SQL string and prints the
+result as typed JSON (values exact: decimals as text, floats as their bits). Every query runs through
+
+- a table read whole (`table`),
+- a Frame after 300 random edits (`frame`: sets, nulls, new words, appended and removed rows, one merge; the oracle applies the
+  same edits to a DuckDB table),
+- a Parquet file streamed as 13 row groups (`scan`),
+
+on generated data with nulls, mixed-scale decimals, dates, a boolean and text with case variants, at 8, 10,000 and about
+1,000,000 groups, and equals DuckDB's answer: ORDER BY without ties compared in order, the rest as sets. Each test also asserts
+the path that ran (the planner's notes: dense or hashed groups and the reason, the kind of source, the chunks read), not only
+the answer. Text order is the owner's (alphabetical ignoring ASCII case, bytes as the tie-break), so the oracle orders and
+compares text under (lower(s), s).
+"""
+import datetime
+import fcntl
+import json
+import os
+import random
+import re
+import struct
+import subprocess
+from decimal import Decimal
+from pathlib import Path
+
+import duckdb
+import pyarrow.parquet as pq
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+BUILD = ROOT / "build"
+WORDS = ["west", "West", "WEST", "east", "East", "North", "NORTH", "south", "Apple", "apple", "banana", "Zebra", "zebra", "mango", "Mango"]
+N_EDITS = 300
+ROW_GROUPS = 13
+
+
+# ── the probe ────────────────────────────────────────────────────────────────────────────────────────
+
+def _newest(paths):
+    return max(p.stat().st_mtime for p in paths)
+
+
+@pytest.fixture(scope="session")
+def probe():
+    """Builds mojo/tools/sql_probe.mojo (once, even under xdist: the workers take a lock) and returns its path."""
+    BUILD.mkdir(exist_ok=True)
+    out = BUILD / "sql_probe"
+    sources = list((ROOT / "mojo/mxframe").glob("*.mojo")) + list((ROOT / "kernels_aot").glob("*.mojo")) + [ROOT / "mojo/tools/sql_probe.mojo"]
+    with open(BUILD / ".sql_probe.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not out.exists() or out.stat().st_mtime < _newest(sources):
+            subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/sql_probe.mojo"), str(out)],
+                           check=True, capture_output=True, text=True)
+    return out
+
+
+def run_probe(probe, sql, files, mode="table", group=None, edits=None, dense_limit=None, repeat=None, expect_error=False):
+    cmd = [str(probe), "--mode", mode]
+    if group:
+        cmd += ["--group", group]
+    if edits:
+        cmd += ["--edits", str(edits)]
+    if dense_limit:
+        cmd += ["--dense-limit", str(dense_limit)]
+    if repeat:
+        cmd += ["--repeat", str(repeat)]
+    cmd += [sql] + [f"{k}={v}" for k, v in files.items()]
+    p = subprocess.run(cmd, capture_output=True)
+    text = p.stdout.decode("utf-8")
+    out = json.loads(text) if text.strip() else {"error": "no output: " + p.stderr.decode("utf-8", "replace")[-400:]}
+    if "error" in out and not expect_error:
+        raise AssertionError(f"the probe failed on `{sql}`: {out['error']}")
+    return out
+
+
+# ── typed values ─────────────────────────────────────────────────────────────────────────────────────
+
+def got_rows(res):
+    kinds = [c["kind"] for c in res["columns"]]
+    rows = []
+    for r in res["rows"]:
+        out = []
+        for v, k in zip(r, kinds):
+            if v is None:
+                out.append(None)
+            elif k == "DECIMAL":
+                out.append(Decimal(v))
+            elif k == "DATE":
+                out.append(datetime.date.fromisoformat(v))
+            elif k == "FLOAT":
+                out.append(struct.unpack("<d", struct.pack("<Q", int(v, 16)))[0])
+            else:
+                out.append(v)
+        rows.append(tuple(out))
+    return rows
+
+
+def duck_kind(type_code):
+    t = str(type_code)
+    if t.startswith("DECIMAL"):
+        return "DECIMAL", int(t.split(",")[1].rstrip(")"))
+    if t in ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT"):
+        return "INT", 0
+    if t in ("DOUBLE", "FLOAT"):
+        return "FLOAT", 0
+    if t == "VARCHAR":
+        return "TEXT", 0
+    if t == "DATE":
+        return "DATE", 0
+    if t == "BOOLEAN":
+        return "BOOL", 0
+    return t, 0
+
+
+def sort_key(row):
+    return tuple((0, "") if v is None else (1, repr(v)) for v in row)
+
+
+def assert_equal(got, want, ordered, label):
+    g = list(got)
+    w = [tuple(r) for r in want]
+    assert len(g) == len(w), f"{label}: {len(g)} rows, DuckDB has {len(w)}"
+    if not ordered:
+        g = sorted(g, key=sort_key)
+        w = sorted(w, key=sort_key)
+    for i, (a, b) in enumerate(zip(g, w)):
+        assert a == b, f"{label}: row {i}: got {a}, DuckDB has {b}"
+        for x, y in zip(a, b):
+            assert type(x) is type(y) or x is None or y is None or (isinstance(x, (int, Decimal)) and isinstance(y, (int, Decimal))), \
+                f"{label}: row {i}: got {a!r} but DuckDB has {b!r} (a different type)"
+
+
+# ── generated data ───────────────────────────────────────────────────────────────────────────────────
+
+def make_source(con, n, groups, seed):
+    """The table `src` in DuckDB: rid (the row number), id, g (about `groups` values, 2% NULL), k (a few values, 10% NULL), x (BIGINT,
+    ties, negatives, 8% NULL), d DECIMAL(18,2), e DECIMAL(9,4), s (words with case variants), dt DATE, b BOOLEAN."""
+    con.execute("set threads=1")
+    con.execute(f"select setseed({(seed % 100) / 100})")
+    words = "[" + ", ".join(f"'{w}'" for w in WORDS) + "]"
+    con.execute(f"""
+        create table src as select
+          i::BIGINT as rid,
+          i::BIGINT as id,
+          case when random() < 0.02 then null else ((i * 2654435761) % {groups})::BIGINT end as g,
+          case when random() < 0.10 then null else (random() * 5)::int::BIGINT end as k,
+          case when random() < 0.08 then null else ((random() * 2000)::int - 1000)::BIGINT end as x,
+          case when random() < 0.10 then null else (((random() * 200000)::int - 100000) * 0.01)::decimal(18,2) end as d,
+          case when random() < 0.10 then null else (((random() * 2000000)::int - 1000000) * 0.0001)::decimal(9,4) end as e,
+          case when random() < 0.10 then null else {words}[1 + (random() * {len(WORDS) - 1})::int] end as s,
+          case when random() < 0.05 then null else date '2018-01-01' + (random() * 1800)::int end as dt,
+          case when random() < 0.05 then null else random() < 0.4 end as b
+        from range({n}) r(i)""")
+
+
+COLS = [("id", "int"), ("g", "int"), ("k", "int"), ("x", "int"), ("d", "dec2"), ("e", "dec4"), ("s", "text"), ("dt", "date"), ("b", "bool")]
+
+
+def make_edits(con, n_rows, groups, seed):
+    """A deterministic edit script (the probe's format) and the same edits applied to the DuckDB table `src`."""
+    rng = random.Random(seed)
+    lines = []
+    alive = set(range(n_rows))
+    next_rid = n_rows
+    names = [c for c, _ in COLS]
+    pool = WORDS + ["zzz-new", "aaa-new", "Mid", "q"]
+
+    def value(name, kind):
+        if kind == "int":
+            if name == "g":
+                return str(rng.randint(-5, groups + 5))
+            if name == "id":
+                return str(rng.randint(0, 10 * n_rows))
+            return str(rng.randint(-1200, 1200))
+        if kind == "dec2":
+            return f"{rng.randint(-100000, 100000) / 100:.2f}"
+        if kind == "dec4":
+            return f"{rng.randint(-1000000, 1000000) / 10000:.4f}"
+        if kind == "text":
+            return rng.choice(pool)
+        if kind == "date":
+            return (datetime.date(2017, 6, 1) + datetime.timedelta(days=rng.randint(0, 2200))).isoformat()
+        return rng.choice(["true", "false"])
+
+    def lit(kind, v):
+        if v == "":
+            return "NULL"
+        return v if kind in ("int", "dec2", "dec4", "bool") else "'" + v.replace("'", "''") + "'"
+
+    for step in range(N_EDITS):
+        what = rng.randint(0, 12)
+        if what <= 6:
+            row = rng.choice(sorted(alive)) if len(alive) < 5000 else rng.randrange(n_rows)
+            while row not in alive:
+                row = rng.randrange(n_rows)
+            name, kind = rng.choice(COLS[1:])
+            v = "" if what == 6 else value(name, kind)
+            lines.append(f"set\t{name}\t{row}\t{v}")
+            con.execute(f"update src set {name} = {lit(kind, v)} where rid = {row}")
+        elif what in (7, 8):
+            vals = ["" if rng.random() < 0.15 else value(name, kind) for name, kind in COLS]
+            lines.append("append\t" + "\t".join(vals))
+            con.execute(f"insert into src (rid, {', '.join(names)}) values ({next_rid}, {', '.join(lit(k, v) for (n, k), v in zip(COLS, vals))})")
+            alive.add(next_rid)
+            next_rid += 1
+        elif what == 9:
+            row = rng.randrange(n_rows)
+            if row in alive:
+                lines.append(f"remove\t{row}")
+                con.execute(f"delete from src where rid = {row}")
+                alive.discard(row)
+        else:
+            row = rng.randrange(n_rows)
+            while row not in alive:
+                row = rng.randrange(n_rows)
+            name, kind = rng.choice(COLS[1:])
+            v = value(name, kind)
+            lines.append(f"set\t{name}\t{row}\t{v}")
+            con.execute(f"update src set {name} = {lit(kind, v)} where rid = {row}")
+    lines.append("merge\ts\tWest\tzzz-new,Mid")                       # two words folded into one
+    con.execute("update src set s = 'West' where s in ('zzz-new', 'Mid')")
+    return "\n".join(lines) + "\n"
+
+
+class Dataset:
+    def __init__(self, name, n, groups, directory, seed):
+        self.name, self.n, self.groups = name, n, groups
+        self.path = directory / f"{name}.parquet"
+        self.edits_path = directory / f"{name}.edits"
+        group_rows = -(-n // ROW_GROUPS)
+        con = duckdb.connect()
+        make_source(con, n, groups, seed)
+        pq.write_table(con.execute("select * exclude (rid) from src order by rid").to_arrow_table(), self.path, row_group_size=group_rows)
+        self.table = duckdb.connect()
+        self.table.execute(f"create table t as select * from read_parquet('{self.path}')")
+        self.table.execute("set threads=4")
+        self.edited = duckdb.connect()
+        self.edited.execute(f"create table src as select row_number() over () - 1 as rid, * from read_parquet('{self.path}')")
+        self.edits_path.write_text(make_edits(self.edited, n, groups, seed + 1))
+        self.edited.execute("create view t as select * exclude (rid) from src")
+        self.edited.execute("set threads=4")
+
+    def oracle(self, mode):
+        return self.edited if mode in ("frame", "framescan") else self.table
+
+
+@pytest.fixture(scope="session")
+def data(tmp_path_factory):
+    d = tmp_path_factory.mktemp("sqldata")
+    return {
+        "g8": Dataset("g8", 20_000, 8, d, 1),
+        "g10k": Dataset("g10k", 200_000, 10_000, d, 2),
+        "g1m": Dataset("g1m", 1_200_000, 1_000_000, d, 3),
+    }
+
+
+# ── what the planner should have chosen ──────────────────────────────────────────────────────────────
+
+def expected_group(keys, ds, mode, kinds, con, rows):
+    """The strategy RulePlanner's documented rule picks: dense when every key is a column with a known range (a TEXT / BOOL column
+    always has one; an integer column only in a table or frame) and the domain is small or no more than 4x the rows."""
+    if not keys:
+        return "none"
+    domain = 1
+    for key in keys:
+        if key == "expr":
+            return "hashed"
+        kind = kinds[key]
+        if kind == "text":
+            n_words = con.execute(f"select count(distinct {key}) from t").fetchone()[0]
+            domain *= n_words + 1
+        elif kind == "bool":
+            domain *= 3
+        else:
+            if mode in ("scan", "framescan"):
+                return "hashed"
+            span = con.execute(f"select max({key}) - min({key}) from t").fetchone()[0]
+            domain *= (span + 1) + 1
+    return "dense" if domain <= 4_194_304 and (domain <= 65_536 or domain <= 4 * rows) else "hashed"
+
+
+# ── the queries ──────────────────────────────────────────────────────────────────────────────────────
+
+KINDS = {"g": "int", "k": "int", "x": "int", "dt": "date", "s": "text", "b": "bool", "id": "int"}
+
+
+class Q:
+    def __init__(self, sql, keys=(), ordered=False, duck=None, fix=None, skip=(), tag=None):
+        self.sql, self.keys, self.ordered, self.duck, self.fix, self.skip = sql, list(keys), ordered, duck, fix, set(skip)
+        self.tag = tag or sql
+
+
+def text_cmp(col, op, lit):
+    """`col op 'lit'` under the owner's text order: ignoring ASCII case, bytes as the tie-break."""
+    strict = ">" if op in (">", ">=") else "<"
+    return f"(lower({col}) {strict} lower('{lit}') OR (lower({col}) = lower('{lit}') AND {col} {op} '{lit}'))"
+
+
+def median_dec(rows, positions, extra_scale=1):
+    """DuckDB's median of a DECIMAL rounds to the column's scale; ours is exact at one more place, so the oracle asks for
+    median(d * 10) (exact at the column's scale) and the result is read back divided by ten."""
+    out = []
+    for r in rows:
+        r = list(r)
+        for p in positions:
+            if r[p] is not None:
+                r[p] = Decimal(r[p]) / 10
+        out.append(tuple(r))
+    return out
+
+
+QUERIES = [
+    Q("SELECT count(*), count(x), sum(x), min(x), max(x), avg(x) FROM t"),
+    Q("SELECT sum(d), min(d), max(d), avg(d), sum(e), avg(e), sum(d * e), sum(d + e), max(e - d) FROM t"),
+    Q("SELECT min(dt), max(dt), min(b), max(b), count(DISTINCT s), count(DISTINCT dt), count(DISTINCT d) FROM t"),
+    Q("SELECT min(s), max(s) FROM t", duck="SELECT arg_min(s, (lower(s), s)), arg_max(s, (lower(s), s)) FROM t"),
+    Q("SELECT count(*), sum(x), min(x), avg(x), max(s) FROM t WHERE x > 5000", duck="SELECT count(*), sum(x), min(x), avg(x), arg_max(s, (lower(s), s)) FROM t WHERE x > 5000"),
+    Q("SELECT median(x), quantile_disc(x, 0.9), quantile_disc(x, 0), quantile_disc(d, 0.25), count(DISTINCT x), median(d), quantile_disc(s, 0.5) FROM t",
+      duck="SELECT median(x), quantile_disc(x, 0.9), quantile_disc(x, 0), quantile_disc(d, 0.25), count(DISTINCT x), median(d * 10), "
+           "(list(s ORDER BY lower(s), s) FILTER (WHERE s IS NOT NULL))[greatest(ceil(0.5 * count(s))::int, 1)] FROM t",
+      fix=lambda rows: [r[:5] + (Decimal(r[5]) / 10 if r[5] is not None else None,) + r[6:] for r in rows]),
+    Q("SELECT g, count(*), sum(x), avg(d) FROM t GROUP BY g", keys=["g"], tag="by-g", skip=("g1m",)),
+    Q("SELECT g, count(*) AS n, sum(d) AS sd FROM t GROUP BY g ORDER BY n DESC, g LIMIT 20", keys=["g"], ordered=True),
+    Q("SELECT g, k, sum(x), min(e), max(e), count(DISTINCT s) FROM t GROUP BY g, k HAVING count(*) > 2", keys=["g", "k"], skip=("g1m",)),
+    Q("SELECT k, s, count(*), sum(d) FROM t WHERE x BETWEEN -500 AND 500 AND d IS NOT NULL GROUP BY k, s", keys=["k", "s"]),
+    Q("SELECT g, sum(x) FROM t GROUP BY g HAVING sum(x) > 100 AND count(*) > 2 AND g IS NOT NULL", keys=["g"]),
+    Q("SELECT s, count(*), avg(x), median(x), min(dt) FROM t GROUP BY s ORDER BY s",
+      keys=["s"], ordered=True, duck="SELECT s, count(*), avg(x), median(x), min(dt) FROM t GROUP BY s ORDER BY lower(s) NULLS LAST, s NULLS LAST"),
+    Q("SELECT dt, count(*) FROM t GROUP BY dt ORDER BY dt DESC LIMIT 5", keys=["dt"], ordered=True),
+    Q("SELECT b, count(*), sum(x), min(s) FROM t GROUP BY b", keys=["b"], duck="SELECT b, count(*), sum(x), arg_min(s, (lower(s), s)) FROM t GROUP BY b"),
+    Q("SELECT x % 10, x // 3, count(*) FROM t GROUP BY x % 10, x // 3", keys=["expr"], tag="expr-keys"),
+    Q("SELECT g, sum(x) / count(*), max(d) - min(d), sum(d) / sum(x), sum(x) + 1.5, count(*) * 2 FROM t GROUP BY g HAVING count(*) > 1",
+      keys=["g"], skip=("g1m",)),
+    Q("SELECT count(*), sum(x) FROM t WHERE s >= 'm' AND s < 'x'",
+      duck=f"SELECT count(*), sum(x) FROM t WHERE {text_cmp('s', '>=', 'm')} AND {text_cmp('s', '<', 'x')}"),
+    Q("SELECT s, count(*) FROM t WHERE s IN ('west', 'East', 'NORTH', 'nope') OR s = 'Zebra' GROUP BY s", keys=["s"]),
+    Q("SELECT s, count(*) FROM t WHERE s NOT IN ('west', 'East') GROUP BY s", keys=["s"]),
+    Q("SELECT k, count(*) FROM t WHERE dt >= '2020-01-01' AND dt < DATE '2021-01-01' AND NOT b GROUP BY k", keys=["k"]),
+    Q("SELECT k, count(*), sum(x) FROM t WHERE x > 0 OR d < 0 GROUP BY k", keys=["k"]),
+    Q("SELECT k, count(*) FROM t WHERE NOT (x > 0 AND d > 0) AND (b OR x IS NULL) GROUP BY k", keys=["k"]),
+    Q("SELECT count(*) FROM t WHERE x IN (1, 2, NULL) OR k NOT IN (1, 2, NULL)", tag="in-null"),
+    Q("SELECT count(*) FROM t WHERE (x > 0) IS NULL OR (b IS NOT NULL AND d IS NULL)", tag="is-null"),
+    Q("SELECT k, sum(x // (k - 2)), count(x % (k - 2)), sum(x % 7), min(x // 7) FROM t GROUP BY k", keys=["k"]),
+    Q("SELECT k, avg(x), avg(d), avg(e), avg(d * e) FROM t GROUP BY k", keys=["k"]),
+    Q("SELECT k, sum(x) AS sx FROM t GROUP BY k ORDER BY count(*) DESC, k NULLS FIRST LIMIT 4 OFFSET 1", keys=["k"], ordered=True),
+    Q("SELECT g AS grp, count(*) FROM t GROUP BY 1 ORDER BY 2 DESC, grp DESC NULLS FIRST LIMIT 7", keys=["g"], ordered=True),
+    Q("SELECT s, k, count(*), sum(d) FROM t GROUP BY s, k ORDER BY s DESC, k LIMIT 10", keys=["s", "k"], ordered=True,
+      duck="SELECT s, k, count(*), sum(d) FROM t GROUP BY s, k ORDER BY lower(s) DESC NULLS LAST, s DESC NULLS LAST, k LIMIT 10"),
+    Q("SELECT g, quantile_disc(x, 0.5), median(d), count(DISTINCT s), min(s) FROM t WHERE g < 50 GROUP BY g", keys=["g"], tag="holistic-by-g",
+      duck="SELECT g, quantile_disc(x, 0.5), median(d * 10), count(DISTINCT s), arg_min(s, (lower(s), s)) FROM t WHERE g < 50 GROUP BY g",
+      fix=lambda rows: [r[:2] + (Decimal(r[2]) / 10 if r[2] is not None else None,) + r[3:] for r in rows]),
+    Q("SELECT count(*), sum(x) FROM t WHERE x > 5000 GROUP BY k", keys=["k"], tag="empty-groups"),
+]
+
+
+def query_id(q):
+    return re.sub(r"[^A-Za-z0-9]+", "-", q.tag)[:48]
+
+
+MODES = ["table", "frame", "scan"]
+
+
+def run_case(probe, data, ds_name, mode, q, group=None, **kw):
+    ds = data[ds_name]
+    files = {"t": ds.path}
+    res = run_probe(probe, q.sql, files, mode=mode, group=group, edits=ds.edits_path if mode in ("frame", "framescan") else None, **kw)
+    con = ds.oracle(mode)
+    cur = con.execute(q.duck or q.sql)
+    want = cur.fetchall()
+    if q.fix:
+        want = q.fix(want)
+    got = got_rows(res)
+    kinds = [(c["kind"], c["scale"]) for c in res["columns"]]
+    if not q.fix:
+        for i, desc in enumerate(cur.description):
+            dk = duck_kind(desc[1])
+            assert kinds[i][0] == dk[0] and (dk[0] != "DECIMAL" or kinds[i][1] == dk[1]), \
+                f"column {i} of `{q.sql}`: got {kinds[i]}, DuckDB has {dk}"
+    assert_equal(got, want, q.ordered, f"{ds_name}/{mode}: {q.sql}")
+    return res, ds
+
+
+@pytest.mark.parametrize("ds_name", ["g8", "g10k", "g1m"])
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("q", QUERIES, ids=query_id)
+def test_equals_duckdb_and_path(probe, data, ds_name, mode, q):
+    if ds_name in q.skip:
+        pytest.skip("a result too big to compare row by row")
+    res, ds = run_case(probe, data, ds_name, mode, q)
+    notes = res["notes"]
+    # the path that ran
+    want = expected_group(q.keys, ds, mode, KINDS, ds.oracle(mode), ds.n)
+    group_note = next(n for n in notes if n.startswith("group:"))
+    assert group_note.startswith("group: " + want), f"{q.sql} on {ds_name}/{mode}: the planner said `{group_note}`, expected {want}"
+    source_note = next(n for n in notes if n.startswith("source:"))
+    ran_note = next(n for n in notes if n.startswith("ran:"))
+    if mode == "table":
+        assert "(table)" in source_note and ran_note.startswith("ran: table t: 1 chunk of")
+    elif mode == "frame":
+        assert "(frame" in source_note and ran_note.startswith("ran: frame t:") and "changed or appended rows" in ran_note
+    else:
+        assert "Parquet scan, 13 row groups" in source_note and ran_note.startswith(f"ran: scan t: 13 of 13 row groups read"), ran_note
+    assert any(n.startswith("kernel:") for n in notes)
+
+
+# ── forced paths, empty and edge cases ───────────────────────────────────────────────────────────────
+
+FORCED = [
+    Q("SELECT g, k, count(*), sum(x), min(d), max(dt), avg(e) FROM t GROUP BY g, k", keys=["g", "k"]),
+    Q("SELECT s, count(*), sum(d), count(DISTINCT x), median(x) FROM t GROUP BY s", keys=["s"]),
+    Q("SELECT b, k, count(*), quantile_disc(d, 0.4), min(s) FROM t GROUP BY b, k", keys=["b", "k"],
+      duck="SELECT b, k, count(*), quantile_disc(d, 0.4), arg_min(s, (lower(s), s)) FROM t GROUP BY b, k"),
+]
+
+
+@pytest.mark.parametrize("mode", ["table", "frame", "scan", "framescan"])
+@pytest.mark.parametrize("strategy", ["dense", "hashed"])
+@pytest.mark.parametrize("q", FORCED, ids=query_id)
+def test_forced_group_strategy_gives_the_same_answer(probe, data, mode, strategy, q):
+    """PlannerOptions force either strategy; the answer is DuckDB's whichever runs, and the notes say which did."""
+    if strategy == "dense" and mode in ("scan", "framescan") and any(KINDS[k] == "int" for k in q.keys):
+        res = run_probe(probe, q.sql, {"t": data["g8"].path}, mode=mode, group=strategy,
+                        edits=data["g8"].edits_path if mode == "framescan" else None, expect_error=True)
+        assert res["error"].startswith("cannot force dense groups: the range of `")
+        return
+    res, ds = run_case(probe, data, "g8", mode, q, group=strategy)
+    group_note = next(n for n in res["notes"] if n.startswith("group:"))
+    assert group_note.startswith(f"group: {strategy}") and group_note.endswith("forced by the options"), group_note
+    if strategy == "hashed" and any(a in q.sql for a in ("DISTINCT", "median", "quantile_disc", "min(s)")):
+        assert any(n.startswith("holistic: a second pass") for n in res["notes"]), res["notes"]
+
+
+def test_dense_limit_sends_a_wide_domain_to_hashed_groups(probe, data):
+    q = QUERIES[6]
+    res, _ = run_case(probe, data, "g10k", "table", q, dense_limit=500)
+    group_note = next(n for n in res["notes"] if n.startswith("group:"))
+    assert group_note == "group: hashed on 2 key words: the domain of 10,001 slots passes the dense limit of 500", group_note
+
+
+def test_forcing_dense_beyond_the_limit_raises(probe, data):
+    res = run_probe(probe, "SELECT g, count(*) FROM t GROUP BY g", {"t": data["g10k"].path}, group="dense", dense_limit=500, expect_error=True)
+    assert res["error"] == "cannot force dense groups: the domain of 10,001 slots passes the limit of 500"
+
+
+def test_sum_past_int64_raises_in_every_source(probe, data):
+    for mode in ["table", "scan"]:
+        res = run_probe(probe, "SELECT sum(id * id * id) FROM t", {"t": data["g1m"].path}, mode=mode, expect_error=True)
+        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
+        res = run_probe(probe, "SELECT k, sum(id * id * id) FROM t GROUP BY k", {"t": data["g1m"].path}, mode=mode, group="hashed", expect_error=True)
+        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
+
+
+def test_empty_inputs(probe, data):
+    for mode in MODES:
+        q = Q("SELECT count(*), count(x), sum(x), min(x), max(d), avg(e), median(x), count(DISTINCT s), min(s) FROM t WHERE id < 0",
+              duck="SELECT count(*), count(x), sum(x), min(x), max(d), avg(e), median(x), count(DISTINCT s), arg_min(s, (lower(s), s)) FROM t WHERE id < 0")
+        res, _ = run_case(probe, data, "g8", mode, q)
+        assert got_rows(res) == [(0, 0, None, None, None, None, None, 0, None)]
+        res, _ = run_case(probe, data, "g8", mode, Q("SELECT k, count(*) FROM t WHERE id < 0 GROUP BY k", keys=["k"]))
+        assert res["rows"] == []
+
+
+def test_null_is_a_group_of_its_own_and_sorts_last(probe, data):
+    q = Q("SELECT k, count(*) AS n FROM t GROUP BY k ORDER BY k", keys=["k"], ordered=True)
+    for mode in MODES:
+        res, _ = run_case(probe, data, "g8", mode, q)
+        rows = res["rows"]
+        assert rows[-1][0] is None and rows[-1][1] > 0 and all(r[0] is not None for r in rows[:-1]), rows
+        assert [r[0] for r in rows[:-1]] == sorted(r[0] for r in rows[:-1])
+
+
+def test_text_order_ignores_case_and_bytes_break_ties(probe, data):
+    res = run_probe(probe, "SELECT s, count(*) FROM t GROUP BY s ORDER BY s", {"t": data["g8"].path})
+    words = [r[0] for r in res["rows"] if r[0] is not None]
+    assert words == sorted(WORDS, key=lambda w: (w.lower(), w)), words
+    res = run_probe(probe, "SELECT s, count(*) FROM t GROUP BY s ORDER BY s DESC", {"t": data["g8"].path})
+    assert [r[0] for r in res["rows"] if r[0] is not None] == sorted(WORDS, key=lambda w: (w.lower(), w), reverse=True)
+    res = run_probe(probe, "SELECT min(s), max(s) FROM t", {"t": data["g8"].path})
+    assert res["rows"] == [["Apple", "zebra"]], res["rows"]
+
+
+def test_the_select_list_keeps_names_aliases_and_kinds(probe, data):
+    res = run_probe(probe, "SELECT k AS kk, count(*), sum(d) AS total, avg(x), min(dt), max(b) FROM t GROUP BY k LIMIT 1", {"t": data["g8"].path})
+    assert [c["name"] for c in res["columns"]] == ["kk", "count_star()", "total", "avg(x)", "min(dt)", "max(b)"]
+    assert [(c["kind"], c["scale"]) for c in res["columns"]] == [("INT", 0), ("INT", 0), ("DECIMAL", 2), ("FLOAT", 0), ("DATE", 0), ("BOOL", 0)]
+
+
+def test_explain_shows_the_logical_and_the_physical_plan(probe, data):
+    sql = "EXPLAIN SELECT s, k, sum(d) AS total FROM t WHERE x > 5 GROUP BY s, k HAVING count(*) > 2 ORDER BY total DESC LIMIT 3"
+    res = run_probe(probe, sql, {"t": data["g8"].path})
+    assert res["columns"] == [{"name": "plan", "kind": "TEXT", "scale": 0}]
+    lines = [r[0] for r in res["rows"]]
+    assert lines == [
+        "Logical plan",
+        "  Limit 3",
+        "    Sort total DESC",
+        "      Project s, k, sum(d)",
+        "        Filter (HAVING) count(*) > 2",
+        "          Aggregate keys=[s, k] aggs=[sum(d), count_star()]",
+        "            Filter (WHERE) x > 5",
+        "              Scan t",
+        "Physical plan",
+        "  source: t (table), 20,000 rows",
+        "  group: dense, 2 keys s 16 (with a NULL slot) x k 7 (with a NULL slot) = 112 slots: the domain of 112 slots is small",
+    ], lines
+    assert res["explain"] == "\n".join(lines) + "\n"
+    assert not any(n.startswith("ran:") for n in res["notes"]), "EXPLAIN does not run the query"
+
+
+def test_explain_of_a_hashed_plan_says_why(probe, data):
+    res = run_probe(probe, "EXPLAIN SELECT x % 7, count(*) FROM t GROUP BY x % 7", {"t": data["g8"].path})
+    assert "  group: hashed on 2 key words: `x % 7` is an expression, so its range is unknown" in [r[0] for r in res["rows"]]
+    res = run_probe(probe, "EXPLAIN SELECT g, count(*) FROM t GROUP BY g", {"t": data["g8"].path}, mode="scan")
+    assert "  group: hashed on 2 key words: the range of `g` is unknown (the source has no statistics on it)" in [r[0] for r in res["rows"]]
+
+
+ERRORS = [
+    ("SELECT sum(revenu) FROM t", "SQL error at line 1, column 12: column `revenu` not found in table `t`"),
+    ("SELECT sum(xx) FROM t", "SQL error at line 1, column 12: column `xx` not found in table `t` (did you mean `x`?)"),
+    ("SELECT sum(x) FROM tt", "SQL error at line 1, column 20: table `tt` not found (did you mean `t`?)"),
+    ("SELECT t.k, count(*) FROM u GROUP BY t.k", "SQL error at line 1, column 27: table `u` not found (the catalog has t)"),
+    ("SELCT sum(x) FROM t", "SQL error at line 1, column 1: expected SELECT or EXPLAIN, found `SELCT` (did you mean SELECT?)"),
+    ("SELECT sum(x) FORM t", "SQL error at line 1, column 15: expected FROM, found `FORM` (did you mean FROM?)"),
+    ("SELECT count(*) FROM t WHERE", "SQL error at line 1, column 29: expected an expression, found the end of the statement"),
+    ("SELECT count(*) FROM t WHERE s = 'oops", "SQL error at line 1, column 34: this string is never closed (expected a closing ')"),
+    ("SELECT count(*) FROM t; SELECT 1", "SQL error at line 1, column 25: expected the end of the statement, found `SELECT`"),
+    ("SELECT sum(x) FROM t JOIN u ON t.id = u.id", "SQL error at line 1, column 22: `JOIN` is not supported yet (F-153)"),
+    ("SELECT DISTINCT k FROM t", "SQL error at line 1, column 8: `SELECT DISTINCT` is not supported yet (F-152)"),
+    ("SELECT * FROM t", "SQL error at line 1, column 8: `*` in the select list is not supported yet (F-152)"),
+    ("SELECT x FROM t", "SQL error at line 1, column 8: a query without aggregates returns rows, which is not supported yet (F-152): add an aggregate such as count(*), or GROUP BY"),
+    ("SELECT CASE WHEN x > 1 THEN 1 END, count(*) FROM t GROUP BY 1", "SQL error at line 1, column 8: `CASE` is not supported yet (F-156)"),
+    ("EXPLAIN ANALYZE SELECT count(*) FROM t", "SQL error at line 1, column 9: `EXPLAIN ANALYZE` is not supported yet (F-155)"),
+    ("SELECT sum(x) FROM t WHERE s LIKE 'a%'", "SQL error at line 1, column 30: `LIKE` is not supported yet (F-156)"),
+    ("SELECT count(*) FROM t WHERE s IN (SELECT s FROM t)", "SQL error at line 1, column 36: a subquery in IN (...) is not supported yet (F-154)"),
+    ("SELECT sum(x) OVER () FROM t", "SQL error at line 1, column 15: `OVER` (window functions) is not supported yet"),
+    ("SELECT 1e3, count(*) FROM t", "SQL error at line 1, column 8: the number `1e3` has an exponent: floating-point literals are not supported yet (FLOAT arrives with F-157)"),
+    ("SELECT stddev(x) FROM t", "SQL error at line 1, column 8: function `stddev` is not supported: SQL here has the aggregates sum, count, min, max, avg, median, quantile_disc; scalar functions arrive with F-156"),
+    ("SELECT summ(x) FROM t", "SQL error at line 1, column 8: function `summ` is not supported (did you mean `sum`?)"),
+    ("SELECT sum(x), k FROM t", "SQL error at line 1, column 16: column `k` must appear in the GROUP BY clause or be used in an aggregate function"),
+    ("SELECT k, count(*) FROM t GROUP BY k HAVING x > 1", "SQL error at line 1, column 45: column `x` must appear in the GROUP BY clause or be used in an aggregate function"),
+    ("SELECT sum(sum(x)) FROM t", "SQL error at line 1, column 12: aggregate functions cannot be nested"),
+    ("SELECT count(*) FROM t WHERE sum(x) > 1", "SQL error at line 1, column 37: aggregate functions are not allowed in WHERE: filter the groups with HAVING"),
+    ("SELECT sum(s) FROM t", "SQL error at line 1, column 12: sum() needs numbers, found TEXT"),
+    ("SELECT median(s) FROM t", "SQL error at line 1, column 15: median() needs numbers, found TEXT"),
+    ("SELECT count(*) FROM t WHERE x = 'a'", "SQL error at line 1, column 32: cannot compare INT with TEXT (`=`)"),
+    ("SELECT count(*) FROM t WHERE s < d", "SQL error at line 1, column 32: cannot compare TEXT with DECIMAL(2) (`<`)"),
+    ("SELECT count(*) FROM t WHERE b + 1 > 2", "SQL error at line 1, column 32: cannot apply `+` to BOOL and INT"),
+    ("SELECT sum(x / 2) FROM t", "SQL error at line 1, column 14: `/` gives a FLOAT, which is a result-only kind until F-157: use it on aggregates, such as sum(a) / count(*)"),
+    ("SELECT sum(d // 2) FROM t", "SQL error at line 1, column 14: `//` on a DECIMAL gives a FLOAT in DuckDB, a result-only kind until F-157: use it on integers"),
+    ("SELECT count(*) FROM t WHERE dt > '2020-13-45'", "SQL error at line 1, column 33: cannot read '2020-13-45' as a DATE: write 'YYYY-MM-DD'"),
+    ("SELECT quantile_disc(x, 1.5) FROM t", "SQL error at line 1, column 25: the quantile must be between 0 and 1, found 1.5"),
+    ("SELECT count(*) FROM t LIMIT x", "SQL error at line 1, column 30: LIMIT needs a whole number, found `x` (expressions are not supported there)"),
+    ("SELECT count(*) FROM t GROUP BY 3", "SQL error at line 1, column 33: GROUP BY 3 is out of range: the select list has 1 items"),
+    ("SELECT count(*) FROM t WHERE x IN (" + ",".join(str(i) for i in range(41)) + ")",
+     "SQL error at line 1, column 32: an IN list of 41 numbers is not supported yet: the most is 40"),
+]
+
+
+@pytest.mark.parametrize("sql,message", ERRORS, ids=[e[0][:50] for e in ERRORS])
+def test_unsupported_and_misspelled_queries_say_what_and_where(probe, data, sql, message):
+    for mode in ("table", "scan"):
+        res = run_probe(probe, sql, {"t": data["g8"].path}, mode=mode, expect_error=True)
+        assert res.get("error") == message, f"{mode}: {res}"

@@ -456,10 +456,10 @@ struct _Parser(Movable):
             _ = self.advance()
             self.st.explain = EXPLAIN_PLAN
             if self.is_kw("ANALYZE"):
-                raise self.unsupported(self.tok(), "EXPLAIN ANALYZE", "F-155")
+                raise self.unsupported(self.tok(), "`EXPLAIN ANALYZE`", "F-155")
             t = self.tok()
         if t.kind == T_IDENT and t.up == "WITH":
-            raise self.unsupported(t, "WITH (common table expressions)", "F-159")
+            raise self.unsupported(t, "`WITH` (common table expressions)", "F-159")
         if t.kind == T_IDENT and t.up == "SELECT":
             self.select()
         elif t.kind == T_IDENT and (t.up == "INSERT" or t.up == "UPDATE" or t.up == "DELETE" or t.up == "CREATE" or t.up == "DROP" or
@@ -477,7 +477,7 @@ struct _Parser(Movable):
     def select(mut self) raises:
         _ = self.advance()                                                      # SELECT
         if self.is_kw("DISTINCT"):
-            raise self.unsupported(self.tok(), "SELECT DISTINCT", "F-152")
+            raise self.unsupported(self.tok(), "`SELECT DISTINCT`", "F-152")
         if self.is_kw("ALL"):
             _ = self.advance()
         while True:
@@ -514,7 +514,7 @@ struct _Parser(Movable):
         if self.is_sym("("):
             raise self.unsupported(tt, "a subquery in FROM", "F-159")
         if tt.kind == T_STR:
-            raise self.unsupported(tt, "a file name in FROM ('" + tt.text + "')", "F-151: the `mx` command reads files; here register the file with a Catalog")
+            raise self.unsupported(tt, "reading the file '" + tt.text + "' by name in FROM", "F-151")
         if tt.kind != T_IDENT and tt.kind != T_QIDENT:
             raise self.expected("a table name")
         if tt.kind == T_IDENT and _reserved(tt.up):
@@ -544,9 +544,9 @@ struct _Parser(Movable):
             _ = self.advance()
             _ = self.expect_kw("BY")
             if self.is_kw("ALL"):
-                raise self.unsupported(self.tok(), "GROUP BY ALL", "")
+                raise self.unsupported(self.tok(), "`GROUP BY ALL`", "")
             if self.is_kw("ROLLUP") or self.is_kw("CUBE") or self.is_kw("GROUPING"):
-                raise self.unsupported(self.tok(), "GROUP BY " + self.tok().up, "")
+                raise self.unsupported(self.tok(), "`GROUP BY " + self.tok().up + "`", "")
             while True:
                 self.st.group_by.append(self.expr())
                 if self.is_sym(","):
@@ -557,14 +557,14 @@ struct _Parser(Movable):
             _ = self.advance()
             self.st.having = self.expr()
         if self.is_kw("QUALIFY") or self.is_kw("WINDOW") or self.is_kw("TABLESAMPLE") or self.is_kw("SAMPLE"):
-            raise self.unsupported(self.tok(), self.tok().up, "")
+            raise self.unsupported(self.tok(), "`" + self.tok().up + "`", "")
         if self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT"):
-            raise self.unsupported(self.tok(), self.tok().up, "")
+            raise self.unsupported(self.tok(), "`" + self.tok().up + "`", "")
         if self.is_kw("ORDER"):
             _ = self.advance()
             _ = self.expect_kw("BY")
             if self.is_kw("ALL"):
-                raise self.unsupported(self.tok(), "ORDER BY ALL", "")
+                raise self.unsupported(self.tok(), "`ORDER BY ALL`", "")
             while True:
                 var e = self.expr()
                 var desc = False
@@ -597,7 +597,7 @@ struct _Parser(Movable):
                 _ = self.advance()
                 self.st.offset = self.count_literal("OFFSET")
         if self.is_kw("FETCH"):
-            raise self.unsupported(self.tok(), "FETCH", "use LIMIT")
+            raise self.unsupported(self.tok(), "`FETCH`", "use LIMIT")
 
     def reject_misspelled_clause(self) raises:
         """A word that is not a keyword but nearly is (`form`, `wher`), right before a name or a number, is a typo, not an alias."""
@@ -617,7 +617,7 @@ struct _Parser(Movable):
         var t = self.tok()
         if t.kind != T_INT:
             if t.kind == T_IDENT and t.up == "ALL" and what == "LIMIT":
-                raise self.unsupported(t, "LIMIT ALL", "")
+                raise self.unsupported(t, "`LIMIT ALL`", "")
             raise _tok_error(t, what + " needs a whole number, found " + self.describe(t) + " (expressions are not supported there)")
         _ = self.advance()
         if t.text.byte_length() > 18:
@@ -626,7 +626,7 @@ struct _Parser(Movable):
         for b in t.text.as_bytes():
             v = v * 10 + Int(b - 48)
         if self.is_sym("%") or self.is_kw("PERCENT"):
-            raise self.unsupported(self.tok(), what + " as a percentage", "")
+            raise self.unsupported(self.tok(), "`" + what + "` as a percentage", "")
         return v
 
     def reject_join(self) raises:
@@ -636,7 +636,7 @@ struct _Parser(Movable):
         if t.kind == T_IDENT and (t.up == "JOIN" or t.up == "INNER" or t.up == "LEFT" or t.up == "RIGHT" or t.up == "FULL" or
                                   t.up == "CROSS" or t.up == "NATURAL" or t.up == "ANTI" or t.up == "SEMI" or t.up == "ASOF" or
                                   t.up == "POSITIONAL" or t.up == "LATERAL"):
-            raise self.unsupported(t, (t.up + " JOIN") if t.up != "JOIN" else "JOIN", "F-153")
+            raise self.unsupported(t, ("`" + t.up + " JOIN`") if t.up != "JOIN" else "`JOIN`", "F-153")
 
     # -- expressions, loosest first
     def expr(mut self) raises -> Int:
@@ -672,7 +672,7 @@ struct _Parser(Movable):
                                 t.text == ">" or t.text == ">="):
             _ = self.advance()
             if self.is_kw("ANY") or self.is_kw("ALL") or self.is_kw("SOME"):
-                raise self.unsupported(self.tok(), self.tok().up + " (a quantified comparison)", "F-154")
+                raise self.unsupported(self.tok(), "`" + self.tok().up + "` (a quantified comparison)", "F-154")
             var right = self.add_expr()
             return self.node(X_BIN, "<>" if t.text == "!=" else t.text, left, right, -1, t)
         if t.kind == T_IDENT and t.up == "IS":
@@ -686,7 +686,7 @@ struct _Parser(Movable):
                 return self.node(X_ISNULL, "", left, -1, -1, t, neg)
             var u = self.tok()
             if u.kind == T_IDENT and (u.up == "TRUE" or u.up == "FALSE" or u.up == "DISTINCT" or u.up == "UNKNOWN"):
-                raise self.unsupported(u, "IS " + ("NOT " if neg else "") + u.up, "F-156")
+                raise self.unsupported(u, "`IS " + ("NOT " if neg else "") + u.up + "`", "F-156")
             raise self.expected("NULL after IS")
         var neg = False
         var at = t.copy()
@@ -717,7 +717,7 @@ struct _Parser(Movable):
             _ = self.expect_sym(")")
             return id
         if at.kind == T_IDENT and (at.up == "LIKE" or at.up == "ILIKE" or at.up == "GLOB" or at.up == "SIMILAR"):
-            raise self.unsupported(at, ("NOT " if neg else "") + at.up, "F-156")
+            raise self.unsupported(at, "`" + ("NOT " if neg else "") + at.up + "`", "F-156")
         return left
 
     def add_expr(mut self) raises -> Int:
@@ -807,15 +807,15 @@ struct _Parser(Movable):
             var next_string = self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == T_STR
             var next_paren = self.is_sym("(", 1)
             if w == "CASE":
-                raise self.unsupported(t, "CASE expressions", "F-156")
+                raise self.unsupported(t, "`CASE`", "F-156")
             if (w == "CAST" or w == "TRY_CAST" or w == "EXTRACT") and next_paren:
-                raise self.unsupported(t, w + "(...)", "F-156")
+                raise self.unsupported(t, "`" + w + "(...)`", "F-156")
             if (w == "TIMESTAMP" or w == "TIME" or w == "INTERVAL") and next_string:
-                raise self.unsupported(t, w + " literals", "F-156")
+                raise self.unsupported(t, "`" + w + "` literals", "F-156")
             if (w == "ARRAY" or w == "STRUCT" or w == "MAP" or w == "LIST") and next_paren:
-                raise self.unsupported(t, w + " values", "")
+                raise self.unsupported(t, "`" + w + "` values", "")
             if w == "EXISTS" or (w == "NOT" and self.is_kw("EXISTS", 1)):
-                raise self.unsupported(t, "EXISTS", "F-154")
+                raise self.unsupported(t, "`EXISTS`", "F-154")
             if _reserved(w) and w != "LEFT" and w != "RIGHT":
                 raise self.expected("an expression")
             _ = self.advance()
@@ -861,14 +861,14 @@ struct _Parser(Movable):
                         continue
                     break
             if self.is_kw("ORDER"):
-                raise self.unsupported(self.tok(), "ORDER BY inside " + name.up + "(...)", "")
+                raise self.unsupported(self.tok(), "`ORDER BY` inside " + name.up + "(...)", "")
             _ = self.expect_sym(")")
         if self.is_kw("OVER"):
-            raise self.unsupported(self.tok(), "window functions (OVER)", "")
+            raise self.unsupported(self.tok(), "`OVER` (window functions)", "")
         if self.is_kw("FILTER"):
-            raise self.unsupported(self.tok(), "FILTER (WHERE ...)", "")
+            raise self.unsupported(self.tok(), "`FILTER`", "")
         if self.is_kw("WITHIN"):
-            raise self.unsupported(self.tok(), "WITHIN GROUP", "")
+            raise self.unsupported(self.tok(), "`WITHIN GROUP`", "")
         return id
 
 

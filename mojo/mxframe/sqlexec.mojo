@@ -482,6 +482,86 @@ def _order_rows(cols: List[ValCol], order: List[SortKey], dicts: DictAccess, n: 
     return perm^
 
 
+struct _SortCols(Movable):
+    """The ORDER BY keys of a set of rows as comparable numbers, for `_top_rows`."""
+    var keys: List[List[Int64]]
+    var nulls: List[List[UInt8]]
+    var desc: List[Bool]
+    var nulls_first: List[Bool]
+
+    def __init__(out self):
+        self.keys = List[List[Int64]]()
+        self.nulls = List[List[UInt8]]()
+        self.desc = List[Bool]()
+        self.nulls_first = List[Bool]()
+
+    def before(self, a: Int, b: Int) -> Bool:
+        """Row a sorts before row b (ties: the lower row number, as the stable radix order)."""
+        for k in range(len(self.keys)):
+            var an = len(self.nulls[k]) > 0 and self.nulls[k][a] != 0
+            var bn = len(self.nulls[k]) > 0 and self.nulls[k][b] != 0
+            if an or bn:
+                if an and bn:
+                    continue
+                return an == self.nulls_first[k]
+            var x = self.keys[k][a]
+            var y = self.keys[k][b]
+            if x != y:
+                return (x > y) if self.desc[k] else (x < y)
+        return a < b
+
+
+def _top_rows(cols: List[ValCol], order: List[SortKey], dicts: DictAccess, n: Int, want: Int) raises -> List[Int]:
+    """The first `want` rows of 0 .. n-1 in ORDER BY order, by a bounded heap: one pass, no full sort (a big result with a
+    small LIMIT)."""
+    var sc = _SortCols()
+    for k in range(len(order)):
+        sc.keys.append(_sort_keys(cols[k], dicts))
+        sc.nulls.append(cols[k].nul.copy())
+        sc.desc.append(order[k].desc)
+        sc.nulls_first.append(order[k].nulls_first)
+    var heap = List[Int]()                  # a max-heap: the worst of the best `want` rows on top
+    for r in range(n):
+        if len(heap) < want:
+            heap.append(r)
+            var i = len(heap) - 1
+            while i > 0:
+                var parent = (i - 1) // 2
+                if sc.before(heap[parent], heap[i]):
+                    var t = heap[parent]
+                    heap[parent] = heap[i]
+                    heap[i] = t
+                    i = parent
+                else:
+                    break
+        elif sc.before(r, heap[0]):
+            heap[0] = r
+            var i = 0
+            while True:
+                var l = 2 * i + 1
+                var rr = l + 1
+                var worst = i
+                if l < len(heap) and sc.before(heap[worst], heap[l]):
+                    worst = l
+                if rr < len(heap) and sc.before(heap[worst], heap[rr]):
+                    worst = rr
+                if worst == i:
+                    break
+                var t = heap[worst]
+                heap[worst] = heap[i]
+                heap[i] = t
+                i = worst
+    # sort the survivors (insertion sort: `want` is small)
+    for i in range(1, len(heap)):
+        var j = i
+        while j > 0 and sc.before(heap[j], heap[j - 1]):
+            var t = heap[j]
+            heap[j] = heap[j - 1]
+            heap[j - 1] = t
+            j -= 1
+    return heap^
+
+
 def _fill_column(mut col: Column, vals: List[Int64], nul: List[UInt8]):
     col.values = vals.copy()
     if len(nul) > 0:
@@ -534,7 +614,7 @@ def _to_table(q: BoundQuery, outs: List[ValCol], dicts: DictAccess) raises -> Ta
 
 
 def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hres: HolResult, hol_of: List[Int],
-            dicts: DictAccess) raises -> Table:
+            dicts: DictAccess, mut notes: List[String]) raises -> Table:
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
     var gids = List[Int]()
     if plan.group == G_NONE:
@@ -630,14 +710,25 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     var m = len(sel)
     # ORDER BY, OFFSET, LIMIT
     var fin = List[Int]()
+    var notes_sort = String()
     if len(q.order) > 0:
         var ocols = List[ValCol]()
         for o in q.order:
             ocols.append(eval_post(q, o.expr, skeys, saggs, dicts, m))
-        fin = _order_rows(ocols, q.order, dicts, m)
+        var want = (q.offset + q.limit) if q.limit >= 0 else -1
+        if want >= 0 and want <= 4096 and m > 8 * want:
+            fin = _top_rows(ocols, q.order, dicts, m, want)
+            notes_sort = "top-" + String(want) + " by a bounded heap over " + commas(m) + " groups"
+        else:
+            fin = _order_rows(ocols, q.order, dicts, m)
+            notes_sort = "sorted " + commas(m) + " groups by " + String(len(q.order)) + (" key" if len(q.order) == 1 else " keys") + " (stable radix passes)"
     else:
         for i in range(m):
             fin.append(i)
+    if notes_sort.byte_length() > 0:
+        notes.append("order: " + notes_sort)
+    if q.having >= 0:
+        notes.append("having: " + commas(m) + " of " + commas(n) + " groups kept")
     var lo = min(q.offset, len(fin))
     var hi = len(fin) if q.limit < 0 else min(len(fin), lo + q.limit)
     var rows = List[Int]()
@@ -994,9 +1085,11 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
     var ch = _open_chunks(src, used)
     var delta_rows = len(src.overlay.delta)
+    var t_run = perf_counter_ns()
     for i in range(ch.n()):
         var chunk = _load_chunk(src, ch, i)
         _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc)
+    var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
     if src.kind == SRC_FRAME:
         notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
                      commas(delta_rows) + " changed or appended rows")
@@ -1011,6 +1104,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         acc.counts = dense_acc.counts.copy()
     var hres = HolResult()
     var hol_of = List[Int](length=len(q.aggs), fill=-1)
+    var t_hol = perf_counter_ns()
     if two_pass:
         # pass 2: the groups are known, find each row's group again and feed the holistic states
         var sp2 = lower_sql(q, plan, nullable^, pos^, chunk_cols, DictAccess(src.table, src.scan, dicts.extra), _alias_lists(src), masked, PHASE_HOL)
@@ -1029,7 +1123,14 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         hres = hs.finish()
         for h in range(len(hs.specs)):
             hol_of[hs.specs[h].agg] = h
-    return _finish(q, plan, sp, acc, hres, hol_of, dicts)
+    var t_fin = perf_counter_ns()
+    var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, notes)
+    notes.append("time: kernel " + _ms(ms_run) + " ms, holistic states " + _ms(Float64(t_fin - t_hol) / 1e6) + " ms, finish " + _ms(Float64(perf_counter_ns() - t_fin) / 1e6) + " ms")
+    return table^
+
+
+def _ms(x: Float64) -> String:
+    return String(Float64(Int(x * 100.0)) / 100.0)
 
 
 def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises -> SqlResult:
