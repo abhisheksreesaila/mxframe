@@ -14,7 +14,7 @@ rundir="$(mktemp -d "$TMPDIR/mojo-test-run.XXXXXX")"
 trap 'rm -rf "$rundir"' EXIT
 bash "$root/scripts/build_mojo_pkg.sh" > "$root/build/pkg-build.log" 2>&1 || { grep -E "error:" -A4 "$root/build/pkg-build.log" | head -40; echo "FAIL (package build)"; exit 1; }
 lib="$root/.pixi/envs/default/lib"
-out="$root/build/mojo-tests"
+out="$rundir/bin"   # per run: two runs in one checkout never rebuild a binary the other is running (failures print their log)
 mkdir -p "$out"
 files=("$@")
 [ ${#files[@]} -eq 0 ] && files=("$root"/mojo/tests/test_*.mojo)
