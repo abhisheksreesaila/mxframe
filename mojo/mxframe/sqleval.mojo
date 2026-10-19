@@ -8,6 +8,7 @@ registers work, with SQL's rules: three-valued logic, NULL in, NULL out, exact i
 A value is an Int64 per group (a FLOAT holds a float64's bits) and a flag per group for NULL; a boolean is 0 / 1 with
 the same flag for unknown.
 """
+from std.math import fma
 from .table import ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import _text_less
 from .bind import (BoundQuery, BExpr, B_COL, B_LIT, B_STR, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD, B_NEG, B_DIV, B_RESCALE,
@@ -301,21 +302,45 @@ def _compare(q: BoundQuery, x: BExpr, keys: List[ValCol], aggs: List[ValCol], di
 def ld_div(num: Int64, den: UInt128) -> Float64:
     """num / den as an x87 `long double` division rounded to a double, which is how DuckDB computes AVG: the quotient is
     rounded to a 64-bit mantissa, then to 53 bits. That is not always the correctly rounded quotient (about 1 average
-    in 20,000 differs by one ulp), and the oracle is DuckDB's, so this reproduces its rounding exactly. Beyond what
-    128-bit arithmetic holds (a divisor past 2^61) it falls back to a plain double division."""
+    in 20,000 differs by one ulp), and the oracle is DuckDB's, so this reproduces its rounding exactly.
+
+    The two roundings differ only when the 64-bit quotient lands exactly on a midpoint of the 53-bit grid, so unless the
+    exact quotient lies within 1/512 ulp of one, the plain double division (correctly rounded) is the answer: found
+    from the exact residual (an FMA). Otherwise, and for operands past 2^53, the quotient is computed bit by bit."""
     if num == 0:
         return 0.0
     var neg = num < 0
     var n = UInt64(0) - UInt64(num) if neg else UInt64(num)
+    if n < (UInt64(1) << 53) and den < (UInt128(1) << 53):
+        var nf = Float64(n)
+        var df = Float64(UInt64(den))
+        var q0 = nf / df
+        var r = fma(-q0, df, nf)
+        if r == 0.0:
+            return -q0 if neg else q0
+        var q0_bits = UInt64(q0.to_bits())
+        var neighbor = Float64(from_bits=q0_bits + 1 if r > 0.0 else q0_bits - 1)
+        var spacing = neighbor - q0 if r > 0.0 else q0 - neighbor
+        var frac = (r if r > 0.0 else -r) / df
+        var gap = frac - spacing * 0.5
+        if (gap if gap > 0.0 else -gap) > spacing * (1.0 / 512.0):
+            return -q0 if neg else q0
     var bn = _bitlen64(n)
     var bd = _bitlen128(den)
-    var s = 67 - bn + bd
-    if s < 0 or bn + s > 126:
-        var r = Float64(Int(n)) / Float64(Int(den & UInt128(0xFFFFFFFFFFFFFFFF)))
-        return -r if neg else r
-    var big = UInt128(n) << UInt128(s)
-    var q = big // den
-    var rem = big % den
+    var s = 67 - bn + bd                                        # (n << s) / den has 67 or 68 bits
+    var total = bn + s
+    var rem = UInt128(0)
+    var q = UInt128(0)
+    for i in range(total):
+        var idx = total - 1 - i
+        var bit = UInt128(0)
+        if idx >= s:
+            bit = UInt128((n >> UInt64(idx - s)) & 1)
+        rem = (rem << UInt128(1)) | bit
+        q = q << UInt128(1)
+        if rem >= den:
+            rem -= den
+            q |= UInt128(1)
     var bq = _bitlen128(q)
     var drop = bq - 64
     var low = q & ((UInt128(1) << UInt128(drop)) - UInt128(1))
@@ -329,8 +354,8 @@ def ld_div(num: Int64, den: UInt128) -> Float64:
     if low11 > UInt128(0x400) or (low11 == UInt128(0x400) and (m53 & UInt128(1)) != UInt128(0)):
         m53 += UInt128(1)
     exp += 11
-    var r = Float64(UInt64(m53)) * Float64(from_bits=UInt64((1023 + exp) << 52))
-    return -r if neg else r
+    var out = Float64(UInt64(m53)) * Float64(from_bits=UInt64((1023 + exp) << 52))
+    return -out if neg else out
 
 
 def _bitlen64(x: UInt64) -> Int:
