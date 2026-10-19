@@ -15,7 +15,8 @@ What it decides today: the group strategy.
 from .table import TEXT, BOOL, FLOAT
 from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
-                   B_NEG, B_RESCALE)
+                   B_NEG, B_RESCALE, B_CASE, B_COALESCE, B_DISTINCT, B_BOOLIS, B_CAST, B_TFN, B_CONCAT, B_STR,
+                   B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF)
 
 comptime GROUP_AUTO = 0
 comptime GROUP_DENSE = 1
@@ -140,6 +141,33 @@ def expr_nullable(q: BoundQuery, e: Int, st: Stats) -> Bool:
     if x.op == B_COL:
         return st.cols[Int(x.value)].nullable
     if x.op == B_NULL:
+        return True
+    # F-156: the expressions whose operands are not just `a` and `b`
+    if x.op == B_LIT or x.op == B_STR:
+        return False
+    if x.op == B_DISTINCT or x.op == B_BOOLIS:                     # never NULL: NULL is a value to them
+        return False
+    if x.op == B_CASE:                                             # the values (not the conditions): the THENs and the ELSE
+        var nw = Int(x.value)
+        for k in range(nw):
+            if expr_nullable(q, x.items[2 * k + 1], st):
+                return True
+        return expr_nullable(q, x.items[2 * nw], st)
+    if x.op == B_COALESCE:                                         # NULL only where every argument is
+        for it in x.items:
+            if not expr_nullable(q, it, st):
+                return False
+        return True
+    if x.op == B_CAST:                                             # a TRY_CAST can fail into NULL
+        return (Int(x.value) & 1) != 0 or expr_nullable(q, x.a, st)
+    if x.op == B_CONCAT and x.value != 0:                          # concat() reads NULL as ''
+        return False
+    if x.op == B_TFN or x.op == B_CONCAT or x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_ADDMONTHS or x.op == B_DATEDIFF:
+        var rr = expr_nullable(q, x.a, st)
+        if x.b >= 0:
+            rr = rr or expr_nullable(q, x.b, st)
+        return rr
+    if x.op >= 50 and x.op != B_CASE:                              # an operator this function does not know: it may be NULL
         return True
     var r = False
     if x.op == B_IDIV or x.op == B_IMOD:                           # a division is NULL where the divisor is zero: not by a nonzero constant

@@ -282,6 +282,14 @@ def test_conditional_aggregates_keys_filters_and_the_stage_after_aggregation(pro
         ("SELECT s, count(*) FROM t WHERE CASE WHEN s IS NULL THEN true ELSE s <> 'West' END GROUP BY s", None, False),
         ("SELECT id, x FROM t ORDER BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, x DESC, id LIMIT 40", None, True),
         ("SELECT 'a' AS k, count(*) FROM t", None, False),
+        ("SELECT CASE WHEN x > 0 THEN 'p' END AS k, count(*) FROM t GROUP BY 1", None, False),
+        ("SELECT NULLIF(x, 0) AS k, count(*) FROM t GROUP BY 1", None, False),
+        ("SELECT COALESCE(s, s2) AS k, count(*), sum(d) FROM t GROUP BY 1", None, False),
+        ("SELECT TRY_CAST(nsb AS INTEGER) AS k, count(*) FROM t WHERE nsb IN ('12', 'abc', '', '3.5', '-4') GROUP BY 1", None, False),
+        ("SELECT s || s2 AS k, count(*) FROM t GROUP BY 1", None, False),
+        ("SELECT EXTRACT(year FROM dt) AS k, count(*) FROM t GROUP BY 1", "SELECT CAST(EXTRACT(year FROM dt) AS BIGINT) AS k, count(*) FROM t GROUP BY 1", False),
+        ("SELECT dt + INTERVAL 1 MONTH AS k, count(*) FROM t WHERE id < 400 GROUP BY 1", "SELECT CAST(dt + INTERVAL 1 MONTH AS DATE) AS k, count(*) FROM t WHERE id < 400 GROUP BY 1", False),
+        ("SELECT b AS k, count(*) FROM t GROUP BY 1", None, False),
         ("SELECT id, 'tag' AS k FROM t WHERE id < 10 ORDER BY id", None, True),
     ]:
         run(probe, data, sql, mode, duck, ordered)
@@ -509,7 +517,9 @@ def test_text_in_filters_groups_aggregates_and_sorts(probe, data, mode):
 
 def test_text_equality_between_columns_of_two_tables_after_a_join(probe, data):
     files = {"t": data.path, "u": data.path}
-    for sql in ["SELECT count(*) FROM t JOIN u ON t.id = u.id WHERE t.s = u.s2",
+    for sql in ["SELECT CASE WHEN a.x > b.x THEN a.s ELSE b.s2 END AS k, count(*) FROM t a JOIN u b ON a.id = b.id GROUP BY 1",
+                "SELECT lower(b.s2) AS k, sum(a.d), count(*) FROM t a JOIN u b ON a.g = b.g AND a.y = b.y WHERE a.s LIKE '%a%' AND a.id < 500 GROUP BY 1",
+                "SELECT count(*) FROM t JOIN u ON t.id = u.id WHERE t.s = u.s2",
                 "SELECT count(*) FROM t a JOIN t b ON a.g = b.g AND a.y = b.y WHERE a.s <> b.s AND a.id < 300",
                 "SELECT a.g, count(*) FROM t a JOIN t b ON a.g = b.g AND a.y = b.y WHERE a.s = b.s2 AND a.id < 400 GROUP BY a.g",
                 "SELECT count(*) FROM t JOIN u ON t.id = u.id WHERE lower(t.s) = lower(u.s2)",
