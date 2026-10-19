@@ -198,17 +198,13 @@ def test_frames_after_300_edits_equal_duckdb(fprobe, fdata, mode, plan):
 
 
 def test_float_sums_are_the_same_bits_for_any_threads_morsels_and_block(fprobe, fdata):
-    first = None
-    for mode, extra in [("table", ["--threads", 1]), ("table", ["--threads", 2]), ("table", ["--threads", 7]), ("table", []),
-                        ("scan", ["--threads", 1]), ("scan", ["--threads", 4]), ("scan", ["--morsels", "off"]), ("scan", ["--morsels", "on"]),
-                        ("scan", ["--morsels", "on", "--block", 64]), ("scan", ["--block", 8192, "--threads", 3])]:
-        res = run(fprobe, fdata["path"], mode, "grouped", *extra)
-        sums = [a["vals"] for a in res["aggs"] if a["float"]]
-        if mode == "table":
-            ref_table = sums if first is None else ref_table
-            assert sums == ref_table, f"table {extra}: float sums differ from the first run"
-            first = True
-        else:
-            if "ref_scan" not in locals():
-                ref_scan = sums
-            assert sums == ref_scan, f"scan {extra}: float sums differ from the first scan run"
+    runs = {"table": [["--threads", 1], ["--threads", 2], ["--threads", 7], []],
+            "scan": [["--threads", 1], ["--threads", 4], ["--morsels", "off"], ["--morsels", "on"], ["--morsels", "on", "--block", 64],
+                     ["--block", 8192, "--threads", 3]]}
+    for mode, variants in runs.items():
+        seen = None
+        for extra in variants:
+            res = run(fprobe, fdata["path"], mode, "grouped", *extra)
+            sums = [a["vals"] for a in res["aggs"] if a["float"]]
+            seen = sums if seen is None else seen
+            assert sums == seen, f"{mode} {extra}: the float sums are other bits than the first run's"

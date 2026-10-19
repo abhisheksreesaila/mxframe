@@ -1540,11 +1540,15 @@ Needs: F-150 (parallel with F-153..F-155) · Size: M
 - [ ] dates: EXTRACT, date_trunc, date ± INTERVAL, date differences in integer civil-date arithmetic
 - [ ] division / modulo by zero, decimal result scales, integer `/` → FLOAT as DuckDB; past the register limit a readable error, never a wrong answer; equal to DuckDB per function × nulls × case / accents × leap years and pre-1970 dates
 
-## F-157 M8: FLOAT64 as a column kind [todo]
-Needs: F-150 (parallel) · Size: L · real files and the repo's own TPC-H Parquet (`float` money columns) are refused today
-- [ ] FLOAT kind (float64 bits in the Int64 column); Parquet FLOAT / DOUBLE read and written; CSV exponents and decimals past 4 places as FLOAT when asked
-- [ ] comparisons, arithmetic, SUM / AVG in float64 with a defined order (reproducible, F-064), MIN / MAX, group and join keys with -0.0 = 0.0 and one NaN, NaN ordered as DuckDB
-- [ ] equal to DuckDB (1e-12 relative; keys exact) on the repo's TPC-H SF1 Parquet for single-table queries
+## F-157 M8: FLOAT64 as a column kind [review]
+Needs: F-150 (parallel) · Size: L · real files and the repo's own TPC-H Parquet (`float` money columns) were refused before
+- [x] FLOAT kind (float64 bits in the Int64 column); Parquet FLOAT / DOUBLE read and written; CSV exponents and decimals past 4 places as FLOAT when asked
+- [x] comparisons, arithmetic, SUM / AVG in float64 with a defined order (reproducible, F-064), MIN / MAX, group and join keys with -0.0 = 0.0 and one NaN, NaN ordered as DuckDB
+- [x] equal to DuckDB (1e-12 relative; keys exact) on the repo's TPC-H SF1 Parquet for single-table queries
+
+Built (2026-10-18): rules in `docs/mxframe-mojo-api.md` ("FLOAT64 (F-157)"). Parquet DOUBLE / FLOAT (PLAIN, dictionary, BYTE_STREAM_SPLIT) read, FLOAT widened (its column keeps `scale == 32` so SQL compares it with a literal in 32 bits, as DuckDB does; without it TPC-H Q6 drops the 0.07 rows), written as DOUBLE; footer min / max of a float are never read. CSV: an exponent, more than 4 places or nan / inf in the first rows, or `CsvOptions(float_columns)`; correctly rounded (exact fast path, `strtod` for the rest; `_strtod` joins the libSystem list `check_mac_link.sh` prints). Builder (`Expr` float literals and `/`, `lit_float`, `lit_f32`, `Query.threads`, `QueryResult.floats / is_float`), SQL (exponent literals, row-level float arithmetic and compares, IN, SUM / AVG / MIN / MAX / median / quantile_disc / count distinct, hashed float keys with ORDER BY), Frame (`set_float`, float text, float formulas, sort, bake, save). SUM / AVG use the kernel's reproducible mode; a float-sum scan runs row group by row group so the order never depends on the cores; MIN / MAX leave NaN out of the kernel and count it. Changes you may not expect: a CSV column with more than 4 places is now FLOAT (it was a rounded DECIMAL); the Frame's null marker is a NaN (the old one, INT64_MIN + 1, is -5e-324); a float query never runs on the GPU.
+- Not done / limits: `//` and `%` on a FLOAT, `CAST` / `::` (F-156), float join keys (no joins yet: F-153; the key normalisation is `holistic.float_key` and the hashed group words), a float group key in the builder (dense integer keys only), an integer past 2^53 meeting a float raises, GPU. DuckDB does REAL arithmetic in 32 bits; MX frame widens first, so the tests cast to DOUBLE inside arithmetic.
+- Tests: `mojo/tests/test_float.mojo`; `tests/test_mojo_float_parquet.py`, `test_mojo_float_csv.py`, `test_mojo_float_sql.py`, `test_mojo_float_sql_paths.py` (frames after 250 edits, threads, 32-bit column, TPC-H SF1 Q1 / Q6 / by discount / median), `test_mojo_float_builder.py` (table, scan, frame, frame over a scan; bit-identical sums over threads / morsels / block size).
 
 ## F-158 M8: joins and big GROUP BYs over streamed files and edited frames [todo]
 Needs: F-155 · Size: L
