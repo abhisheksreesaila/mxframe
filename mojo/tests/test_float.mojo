@@ -426,6 +426,30 @@ def test_money_with_many_places_is_float_by_default_and_exact_on_request() raise
     expect(raised, "and the exact product sum raises readably (no int128 behind it)")
 
 
+def test_float_text_of_powers_of_two() raises:
+    """At a power of two the double below is twice as close as the one above, so the nearest 16 digits can fall outside the interval while a
+    neighbour of the last digit is inside (2^-77 is 6.617444900424222e-24, not ...2214e-24). Every power of two reads back; tests/test_mx.py compares each with Python repr."""
+    makedirs(DIR, exist_ok=True)
+    var path = DIR + "pow2.csv"
+    var texts = List[String]()
+    var xs = List[Float64]()
+    for e in range(-1022, 1024):
+        var x = Float64(from_bits=UInt64((e + 1023) << 52))          # 2^e: mantissa 0
+        xs.append(x)
+        texts.append(float_text(x))
+    with open(path, "w") as f:
+        f.write("x\n")
+        for t in texts:
+            f.write(t + "\n")
+    var opts = CsvOptions()
+    opts.float_columns.append("x")
+    var r = read_csv(path, opts)
+    for i in range(len(xs)):
+        expect(r.table.get_float(0, i) == xs[i], "2^e reads back from " + texts[i])
+    var tiny = Float64(from_bits=UInt64((1023 - 77) << 52))
+    expect(float_text(tiny) == "6.617444900424222e-24", "2^-77: " + float_text(tiny))
+
+
 def sql_table() raises -> Table:
     var t = Table.empty()
     var k = t.add_column("k", FLOAT)
@@ -503,5 +527,6 @@ def main() raises:
     test_sql_floats()
     test_digits_parse_in_the_c_locale_whatever_the_process_locale()
     test_float_text_is_the_shortest_that_reads_back()
+    test_float_text_of_powers_of_two()
     test_money_with_many_places_is_float_by_default_and_exact_on_request()
     print("ok")
