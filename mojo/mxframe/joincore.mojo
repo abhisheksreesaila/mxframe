@@ -14,10 +14,11 @@ call these.
   refuses past a budget before allocating.
 - `gather_join` makes the joined table from the pairs: the carried columns of each side at its rows, gathered in parallel.
 """
+from std.memory.alloc import unsafe_alloc
 from .table import Table, SharedTable, Column, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .holistic import float_key
 from .kernels._fpenv import par_n, core_count
-from .kernels.hashjoin_cpu import JoinMap, hj_build, hj_probe_pairs, hj_release, E_BUDGET
+from .kernels.hashjoin_cpu import JoinMap, hj_build, hj_probe_pairs, hj_probe_select, hj_release, E_BUDGET, PM_SEMI, PM_ANTI, PM_ANTI_NA
 
 comptime JOIN_BUDGET_BYTES = 3 << 30        # the joined rows a join may materialize (8 bytes a value); past it a readable error (spill is later)
 
@@ -398,12 +399,16 @@ struct JoinPairs(Movable):
         hj_release(self.build_a)
 
 
-def join_pairs(m: JoinMap, keys: JoinKeys, n_probe: Int, budget_rows: Int, threads: Int) raises -> JoinPairs:
+def join_pairs(m: JoinMap, keys: JoinKeys, n_probe: Int, budget_rows: Int, threads: Int, outer: Bool = False) raises -> JoinPairs:
+    """Every (probe row, build row) pair in probe-row order. `outer`: a probe row with no partner is one pair whose build row is -1 (a LEFT join)."""
     var out = JoinPairs()
     if n_probe == 0:
         return out^
+    if outer and keys.verify:
+        raise Error("a LEFT join on keys too wide to pack into one int64 (several columns whose value ranges multiply past 2^62) is not supported yet: " +
+                    "join on fewer or narrower keys, or write it as an inner join (F-155)")
     var info = List[Int64](length=4, fill=0)
-    var rc = hj_probe_pairs(m, keys.pk_addr, keys.po_addr, n_probe, threads, budget_rows, Int(info.unsafe_ptr()))
+    var rc = hj_probe_pairs(m, keys.pk_addr, keys.po_addr, n_probe, threads, budget_rows, Int(info.unsafe_ptr()), outer)
     if rc == E_BUDGET:
         raise Error("the join produces " + commas(Int(info[0])) + " rows, past the budget of " + commas(budget_rows) + " (the joined columns would take over " +
                     String(JOIN_BUDGET_BYTES >> 30) + " GiB): filter either side first, or join on a unique key (a join that spills to disk is not built yet)")
@@ -431,6 +436,51 @@ def join_pairs(m: JoinMap, keys: JoinKeys, n_probe: Int, budget_rows: Int, threa
     return out^
 
 
+def select_rows(m: JoinMap, keys: JoinKeys, n_probe: Int, fmode: Int, threads: Int) raises -> JoinPairs:
+    """The probe rows that pass a presence filter (`PM_SEMI`: a partner exists, `PM_ANTI`: none does, `PM_ANTI_NA`: none does and the key is not NULL,
+    `PM_NONE`: no row), in row order, as the `probe_a` rows of the result (`build_a` is 0). Hashed composite keys are verified against the columns."""
+    var out = JoinPairs()
+    if n_probe == 0:
+        return out^
+    if not keys.verify:
+        var info = List[Int64](length=2, fill=0)
+        _ = hj_probe_select(m, keys.pk_addr, keys.po_addr, n_probe, threads, fmode, Int(info.unsafe_ptr()))
+        out.n = Int(info[0])
+        out.probe_a = Int(info[1])
+        return out^
+    var pairs = join_pairs(m, keys, n_probe, 1 << 40, threads)
+    var mark = List[UInt8](length=n_probe, fill=0)
+    var pr = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=pairs.probe_a)
+    for i in range(pairs.n):
+        mark[Int(pr[i])] = 1
+    var po = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=keys.po_addr)
+    var count = 0
+    var keep = List[UInt8](length=n_probe, fill=0)
+    for i in range(n_probe):
+        var usable = keys.po_addr == 0 or po[i] != 0
+        var k = False
+        if fmode == PM_SEMI:
+            k = mark[i] != 0
+        elif fmode == PM_ANTI:
+            k = mark[i] == 0
+        elif fmode == PM_ANTI_NA:
+            k = mark[i] == 0 and usable
+        if k:
+            keep[i] = 1
+            count += 1
+    if count == 0:
+        return out^
+    var rows = unsafe_alloc[Int32](count)
+    var at = 0
+    for i in range(n_probe):
+        if keep[i] != 0:
+            rows[at] = Int32(i)
+            at += 1
+    out.n = count
+    out.probe_a = Int(rows)
+    return out^
+
+
 struct JoinSide(Movable):
     """One side of the join: its table, the table's columns the joined rows carry (the needed ones, in order) and the table's column of each
     join key. A side with no filter over a plain table is the source table itself (nothing is copied); any other side is the result of a row
@@ -448,7 +498,8 @@ struct JoinSide(Movable):
 
 
 def _gather_column(src: Int, valid: Int, rows_a: Int, n: Int, dst_a: Int, nul_a: Int, threads: Int):
-    """dst[i] = src[rows[i]] (and the NULL byte from the validity bits), over slices of the rows in parallel."""
+    """dst[i] = src[rows[i]] (and the NULL byte from the validity bits), over slices of the rows in parallel. A row number of -1 (a LEFT join's
+    unmatched row) is a NULL: the value 0 and a NULL byte."""
     var tasks = max(1, min(threads if threads > 0 else core_count(), n // 32768 + 1))
 
     def work(t: Int) {imm}:
@@ -458,20 +509,26 @@ def _gather_column(src: Int, valid: Int, rows_a: Int, n: Int, dst_a: Int, nul_a:
         var a = n * t // tasks
         var b = n * (t + 1) // tasks
         for i in range(a, b):
-            dst[i] = s[Int(rows[i])]
-        if nul_a != 0 and valid != 0:
+            var r = Int(rows[i])
+            dst[i] = s[r] if r >= 0 else 0
+        if nul_a != 0:
             var nd = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=nul_a)
             var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
             for i in range(a, b):
                 var r = Int(rows[i])
-                nd[i] = 1 - ((bits[r >> 3] >> UInt8(r & 7)) & 1)
+                if r < 0:
+                    nd[i] = 1
+                elif valid != 0:
+                    nd[i] = 1 - ((bits[r >> 3] >> UInt8(r & 7)) & 1)
+                else:
+                    nd[i] = 0
 
     par_n(work, tasks, tasks)
 
 
-def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: Bool, threads: Int) raises -> Table:
+def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: Bool, threads: Int, outer: Bool = False) raises -> Table:
     """The joined table: the carried columns of the left side at its rows of the pairs, then the right side's (the build side's rows are the
-    pairs' build rows, the probe side's the pairs' probe rows)."""
+    pairs' build rows, the probe side's the pairs' probe rows). `outer`: the build side's rows may be -1 (its columns are NULL there)."""
     var n = pairs.n
     var t = Table.empty()
     for side in range(2):
@@ -481,7 +538,7 @@ def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: 
             var kind = sd.table.kind(c)
             var col = t.add_column(_unique_name(t, sd.table.name(c)), kind, scale=sd.table.scale(c))
             var vals = List[Int64](unsafe_uninit_length=n)
-            var has_nulls = sd.table.null_count(c) > 0
+            var has_nulls = sd.table.null_count(c) > 0 or (outer and (side == 0) == left_builds)       # outer: the build side's columns hold NULLs for unmatched rows
             var nul = List[UInt8](length=n if has_nulls else 0, fill=0)
             _gather_column(Int(sd.table.values(c).unsafe_ptr()), _valid_bits(sd.table, c), rows_a, n, Int(vals.unsafe_ptr()),
                            Int(nul.unsafe_ptr()) if has_nulls else 0, threads)

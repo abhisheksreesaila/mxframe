@@ -14,7 +14,8 @@ from .frame import Frame, Overlay, Formula
 from .expr import N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
 from .csv import days_from_civil, _days_in_month, parse_float_text, F_OK, F_RANGE
 from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE,
-                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE, SqlExpr, SelectItem)
+                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE, SqlExpr, SelectItem,
+                  X_SUBIN, X_EXISTS, JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI, JK_ANTI_NA)
 
 comptime K_NULL = 6          # the type of a bare NULL literal
 
@@ -254,6 +255,7 @@ struct BoundQuery(Movable):
     # F-152: row queries (no aggregate, no GROUP BY) and SELECT DISTINCT
     # F-153: a join of two tables. Columns are numbered over both: the first table's, then the second's (`tab_start`).
     var joined: Bool
+    var join_kind: Int               # F-154: JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI, JK_ANTI_NA (a semi / anti join keeps only the first table's columns)
     var sources: List[Int]           # the catalog's sources, one per table of FROM
     var tab_names: List[String]
     var tab_alias: List[String]
@@ -277,6 +279,7 @@ struct BoundQuery(Movable):
 
     def __init__(out self):
         self.joined = False
+        self.join_kind = JK_INNER
         self.sources = List[Int]()
         self.tab_names = List[String]()
         self.tab_alias = List[String]()
@@ -475,8 +478,14 @@ struct _Binder(Movable):
     var tab_start: List[Int]
     var tab_cols: List[Int]
     var using_cols: List[String]
+    var jkind: Int                    # F-154: the kind of join
+    var in_on: Bool                   # binding an ON condition (a semi / anti join's right table is visible there only)
+    var inner_first: Bool             # the ON came from a subquery: a bare name means the subquery's table when it has the column
 
     def __init__(out self, var st: SqlStatement):
+        self.jkind = JK_INNER
+        self.in_on = False
+        self.inner_first = False
         self.tab_names = List[String]()
         self.tab_alias = List[String]()
         self.tab_start = List[Int]()
@@ -523,6 +532,9 @@ struct _Binder(Movable):
         ref x = self.st.exprs[ast]
         var lo = 0
         var hi = len(self.src_names)
+        var left_only = self.is_semi_anti() and not self.in_on        # after a semi / anti join only the first table has columns
+        if left_only:
+            hi = self.tab_start[1]
         if x.text2.byte_length() > 0:
             var q = lower_ascii(x.text2)
             var tab = -1
@@ -530,10 +542,17 @@ struct _Binder(Movable):
                 if q == lower_ascii(self.tab_names[t]) or (self.tab_alias[t].byte_length() > 0 and q == lower_ascii(self.tab_alias[t])):
                     tab = t
                     break
-            if tab < 0:
+            if tab < 0 or (left_only and tab == 1):
                 return (-1, 1)
             lo = self.tab_start[tab]
             hi = lo + self.tab_cols[tab]
+        elif self.inner_first and self.in_on and len(self.tab_start) > 1:
+            # a subquery's condition: a bare name is the subquery's column when its table has one, else the outer query's
+            var key1 = lower_ascii(x.text)
+            for c in range(self.tab_start[1], self.tab_start[1] + self.tab_cols[1]):
+                if lower_ascii(self.src_names[c]) == key1:
+                    return (c, 0)
+            hi = self.tab_start[1]
         var key = lower_ascii(x.text)
         var found = -1
         var found_tab = -1
@@ -555,6 +574,9 @@ struct _Binder(Movable):
         if found < 0:
             return (-1, 2)
         return (found, 0)
+
+    def is_semi_anti(self) -> Bool:
+        return self.jkind == JK_SEMI or self.jkind == JK_ANTI or self.jkind == JK_ANTI_NA
 
     def find_column(self, ast: Int) raises -> Int:
         ref x = self.st.exprs[ast]
@@ -656,6 +678,7 @@ struct _Binder(Movable):
         var residual = List[Int]()
         for ci in range(len(conj)):
             var c = conj[ci]
+            self.in_on = ci < n_on
             ref x = self.st.exprs[c]
             if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL:
                 var ra = self.lookup(x.a)
@@ -671,17 +694,25 @@ struct _Binder(Movable):
                     continue
             var e = self.boolean(self.value(c), c, "ON" if ci < n_on else "WHERE")
             var m = self.sides(e)
+            var from_on = ci < n_on
+            var inner = self.jkind == JK_INNER
+            if not inner and from_on and (m == 3 or (m == 1 and self.jkind != JK_SEMI) or (m == 0 and self.jkind != JK_SEMI)):
+                raise self.err(c, "a condition in ON that is not an equality between a column of each table (or a condition on the second table alone) is not supported in a " +
+                               self.join_name() + " yet (F-155)")
             if m == 1:
                 self.q.conj_l.append(e)
                 self.q.conj_l_text.append(self.st.render(c))
-            elif m == 2:
+            elif m == 2 and (inner or from_on):
                 self.q.conj_r.append(e)
                 self.q.conj_r_text.append(self.st.render(c))
             else:
                 self.q.conj_x.append(e)
                 self.q.conj_x_text.append(self.st.render(c))
+        self.in_on = False
         if len(self.q.jk_l) == 0:
-            var at = self.st.right_line
+            if self.st.from_subquery:
+                raise sql_error(self.st.right_line, self.st.right_col, "the subquery needs an equality between one of its columns and a column of the outer query (IN gives it; " +
+                                "an EXISTS without a correlated equality is a constant, which is not supported)")
             raise sql_error(self.st.right_line, self.st.right_col, "the join has no equality between a column of `" + self.tab_label(0) + "` and a column of `" + self.tab_label(1) +
                             "`: a join needs one in ON, USING or WHERE (a cross join is not supported)")
         # the conjuncts that read both tables, and the constants, are checked on the joined rows: one AND chain
@@ -695,6 +726,13 @@ struct _Binder(Movable):
             for k in range(len(self.q.conj_x_text)):
                 t += (" AND " if k > 0 else "") + self.q.conj_x_text[k]
             self.q.where_text = t
+
+    def join_name(self) -> String:
+        if self.jkind == JK_LEFT:
+            return "LEFT JOIN"
+        if self.jkind == JK_SEMI:
+            return "SEMI JOIN (or a subquery)"
+        return "ANTI JOIN (or NOT IN / NOT EXISTS)"
 
     def tab_label(self, t: Int) -> String:
         return self.tab_alias[t] if self.tab_alias[t].byte_length() > 0 else self.tab_names[t]
@@ -1134,6 +1172,9 @@ struct _Binder(Movable):
             if x.flag:
                 return self.mk(B_NOT, BOOL.value, 0, both, -1, 0, "", ast)
             return both
+        if kind == X_SUBIN or kind == X_EXISTS:
+            raise self.err(ast, "a subquery (IN, NOT IN, EXISTS, NOT EXISTS) is supported as a condition of WHERE joined to the others by AND, one per query: " +
+                           "it cannot be inside OR, NOT of a longer condition, the select list or HAVING (F-155)")
         if kind == X_IN:
             var n = self.in_list(ast)
             if x.flag and self.at(n).op != B_NULL:
@@ -1315,9 +1356,95 @@ def _has_aggregate(st: SqlStatement, e: Int) -> Bool:
     return False
 
 
+def _split_and_expr(st: SqlStatement, e: Int, mut out: List[Int]):
+    if e < 0:
+        return
+    ref x = st.exprs[e]
+    if x.kind == X_BIN and x.text == "AND":
+        var a = x.a
+        var b = x.b
+        _split_and_expr(st, a, out)
+        _split_and_expr(st, b, out)
+    else:
+        out.append(e)
+
+
+def _and_chain(mut st: SqlStatement, parts: List[Int]) -> Int:
+    """The conjunction of syntax-tree expressions (a new AND node per pair), -1 for none."""
+    if len(parts) == 0:
+        return -1
+    var acc = parts[0]
+    for k in range(1, len(parts)):
+        st.exprs.append(SqlExpr(X_BIN, "AND", String(), acc, parts[k], -1, List[Int](), False, st.exprs[parts[k]].line, st.exprs[parts[k]].col))
+        acc = len(st.exprs) - 1
+    return acc
+
+
+def _lift_subquery(mut st: SqlStatement, catalog: Catalog) raises:
+    """`WHERE ... AND x [NOT] IN (SELECT c FROM t [WHERE p])` and `... AND [NOT] EXISTS (SELECT ... FROM t WHERE p)` (F-154) become a semi or
+    anti join of the outer table with `t`: ON is the equality `x = c` (IN) and the subquery's conjuncts (the correlated equalities are the join keys,
+    the others filter `t`); the rest of the WHERE stays. NOT IN is the null-aware anti join. One such subquery per query, and none beside an explicit
+    join: more is multi-way (F-155). A subquery anywhere else is refused when its expression is bound."""
+    if len(st.subs) == 0:
+        return
+    var conj = List[Int]()
+    _split_and_expr(st, st.where, conj)
+    var at = -1
+    var neg = False
+    var node = -1
+    for i in range(len(conj)):
+        var e = conj[i]
+        var flip = False
+        if st.exprs[e].kind == X_NOT and (st.exprs[st.exprs[e].a].kind == X_SUBIN or st.exprs[st.exprs[e].a].kind == X_EXISTS):
+            e = st.exprs[e].a
+            flip = True
+        if st.exprs[e].kind == X_SUBIN or st.exprs[e].kind == X_EXISTS:
+            if at >= 0:
+                raise sql_error(st.exprs[e].line, st.exprs[e].col, "more than one subquery in WHERE is not supported yet (F-155)")
+            at = i
+            node = e
+            neg = st.exprs[e].flag != flip
+    if at < 0:
+        return
+    var x = st.exprs[node].copy()
+    if st.has_right:
+        raise sql_error(x.line, x.col, "a subquery in a query that also joins tables is not supported yet (F-155)")
+    var sub = st.subs[x.items[0]].copy()
+    if x.kind == X_SUBIN:
+        st.join_kind = JK_ANTI_NA if neg else JK_SEMI
+    else:
+        st.join_kind = JK_ANTI if neg else JK_SEMI
+    st.has_right = True
+    st.right_table = sub.table
+    st.right_alias = sub.alias
+    st.right_is_file = sub.is_file
+    st.right_line = sub.line
+    st.right_col = sub.col
+    st.from_subquery = True
+    var parts = List[Int]()
+    if x.kind == X_SUBIN:
+        if sub.sel < 0:
+            raise sql_error(sub.line, sub.col, "IN (SELECT *) needs one column: name it")
+        # each side of the equality names its own table: the outer expression's bare column is the outer table's, the subquery's column the subquery's
+        if st.exprs[x.a].kind == X_COL and st.exprs[x.a].text2.byte_length() == 0:
+            st.exprs[x.a].text2 = st.table_alias if st.table_alias.byte_length() > 0 else st.table
+        if st.exprs[sub.sel].kind == X_COL and st.exprs[sub.sel].text2.byte_length() == 0:
+            st.exprs[sub.sel].text2 = sub.alias if sub.alias.byte_length() > 0 else sub.table
+        st.exprs.append(SqlExpr(X_BIN, "=", String(), x.a, sub.sel, -1, List[Int](), False, x.line, x.col))
+        parts.append(len(st.exprs) - 1)
+    _split_and_expr(st, sub.where, parts)
+    st.join_on = _and_chain(st, parts)
+    var rest = List[Int]()
+    for i in range(len(conj)):
+        if i != at:
+            rest.append(conj[i])
+    st.where = _and_chain(st, rest)
+
+
 def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     """Parses and binds one statement against the catalog."""
     var st = parse_sql(text)
+    _lift_subquery(st, catalog)
     var src = catalog.find(st.table)
     if src < 0:
         var hint = closest(st.table, catalog.names())
@@ -1344,6 +1471,9 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         if not same and st.table_alias.byte_length() > 0 and lower_ascii(st.table_alias) == lower_ascii(st.right_alias):
             raise sql_error(st.right_line, st.right_col, "the alias `" + st.right_alias + "` is used for both tables")
     var b = _Binder(st^)
+    b.jkind = b.st.join_kind
+    b.inner_first = b.st.from_subquery
+    b.q.join_kind = b.st.join_kind
     b.table_name = catalog.sources[src].name
     b.table_alias = b.st.table_alias
     for c in range(catalog.sources[src].table.columns()):
@@ -1404,6 +1534,13 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
                     only = t
             if only < 0:
                 raise sql_error(it.line, it.col, "unknown table or alias `" + it.alias + "` in `" + it.alias + ".*`")
+        if b.is_semi_anti():                                   # a semi / anti join returns the first table's columns only
+            if only == 1:
+                raise sql_error(it.line, it.col, "unknown table or alias `" + it.alias + "` in `" + it.alias + ".*`: after a semi or anti join only the first table has columns")
+            for c in range(b.tab_start[0], b.tab_start[0] + b.tab_cols[0]):
+                b.st.exprs.append(SqlExpr(X_COL, b.src_names[c], String(), -1, -1, -1, List[Int](), False, it.line, it.col))
+                items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
+            continue
         if len(b.tab_names) == 1:
             for nm in b.src_names:
                 b.st.exprs.append(SqlExpr(X_COL, nm, String(), -1, -1, -1, List[Int](), False, it.line, it.col))
@@ -1612,6 +1749,7 @@ def copy_query(q: BoundQuery) -> BoundQuery:
     c.order_text = q.order_text.copy()
     c.out_text = q.out_text.copy()
     c.joined = q.joined
+    c.join_kind = q.join_kind
     c.sources = q.sources.copy()
     c.tab_names = q.tab_names.copy()
     c.tab_alias = q.tab_alias.copy()

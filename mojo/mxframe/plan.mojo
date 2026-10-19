@@ -162,7 +162,16 @@ def build_plan(q: BoundQuery, source_name: String) -> LogicalPlan:
         jn.right = sides[1]
         jn.keys = q.jk_l.copy()
         jn.keys2 = q.jk_r.copy()
-        var jt = String("Join (inner) on ")
+        var kname = String("inner")
+        if q.join_kind == 1:
+            kname = "left"
+        elif q.join_kind == 2:
+            kname = "semi"
+        elif q.join_kind == 3:
+            kname = "anti"
+        elif q.join_kind == 4:
+            kname = "anti, null-aware"
+        var jt = "Join (" + kname + ") on "
         var lab0 = q.tab_alias[0] if q.tab_alias[0].byte_length() > 0 else q.tab_names[0]
         var lab1 = q.tab_alias[1] if q.tab_alias[1].byte_length() > 0 else q.tab_names[1]
         for k in range(len(q.jk_l)):
