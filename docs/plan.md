@@ -1626,7 +1626,7 @@ Owner, 2026-10-19 (first principles): if omxcore ever needs to be database-like,
 - [ ] omxplorer-style apps get autosave and history from it, as a plugin over these primitives
 
 ## After M8 (positioning brief `docs/briefs/positioning.md`, approved 2026-10-19)
-Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 rename + 0.7.0 + F-169 → F-163, the SQL long tail.
+Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 rename + 0.7.0 + F-169 → M10 agent-native plugins (vector search on the GPU first) → F-163, the SQL long tail.
 
 ## F-166 Scoreboard: omxcore vs DuckDB and Polars, CPU and GPU, quiet machine [todo, needs the owner's go]
 - [ ] TPC-H SF1 / SF10 and the random suite through the Mojo engine (`mx`) and the Python package; CPU, GPU and AUTO; DuckDB and Polars on the same files; quiet machine (load < 2), engine-only first runs; published to the README and the docs site with every gap
@@ -1639,3 +1639,11 @@ Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 
 
 ## F-169 MCP server for `mx` [todo]
 - [ ] a small MCP server over the `mx` command (sql, explain, schema) so agents use omxcore as a data tool; no Python inside the engine
+
+## M10 Agent-native plugins (brief `docs/briefs/positioning.md`, owner 2026-10-19) [todo, after F-169]
+Plugins over generic core primitives; the core never learns about agents.
+- [ ] F-170 core: a fixed-size FLOAT vector column kind (Parquet FIXED_SIZE_LIST / list<float>), and a distance + top-k kernel (cosine, dot, L2) on CPU and GPU, usable in SQL (`ORDER BY distance(v, ?) LIMIT k` with filters) and the builder; exact first, equal to a brute-force oracle
+- [ ] F-171 plugin: vector search: embeddings beside the data, filtered k-nearest, then an approximate index (IVF or a graph) with recall measured against exact
+- [ ] F-172 plugin: agent search: keyword (per dictionary word) + vector + SQL filters in one call, rank fusion, results with why they matched
+- [ ] F-173 core: user-defined functions run per block (Mojo), and a plugin: classification / decision API (rules, embeddings vs labelled examples, small models), batched on the GPU
+- [ ] F-174 plugin: agent memory: append-only facts with time and source, queried as a table (versions via M9 when it exists)

@@ -22,6 +22,22 @@ SQLite. (Renamed from MX frame: F-165.)
 7. **Feature and ML data prep:** joins and group-bys feeding training data to the GPU, with zero-copy handoff to
    PyTorch and JAX through the Arrow C Data Interface (F-139).
 
+## Agent-native (owner, 2026-10-19)
+omxcore is built for agents first: `mx` speaks JSON, starts in 12 ms and needs no Python. On top of the core, a set of
+**plugins** makes it the place agents keep, search and reason over data. Each plugin is thin; what it needs from the
+engine becomes a generic core primitive any app can use.
+
+| Plugin | What agents get | Core primitive it needs |
+|---|---|---|
+| **Vector search** (GPU-native) | embeddings stored beside the data; `nearest(k)` with SQL filters in one query | a fixed-size float vector column; a distance + top-k kernel on CPU and GPU; an approximate index (IVF / graph) later |
+| **Agent search** | one call that mixes keyword, vector and SQL filters and returns ranked rows with reasons | text tokens per dictionary word (exists), vector top-k, rank fusion |
+| **Classification / decision API** | label or route rows (rules, small models, embeddings vs examples), batched on the GPU | user-defined functions run per block; per-word text functions (F-156) |
+| **MCP server** (F-169) | `sql`, `explain`, `schema`, `search` as tools any agent can call | `mx` |
+| **Memory for agents** | append-only facts with time and source, queried like any table; versions later (M9, Delta-style) | Parquet + append; nothing new |
+
+Rule: the core never learns about agents; it gains vectors, a top-k distance kernel and UDFs, and the agent features
+live in plugins over them.
+
 ## Why it can win
 - **GPU-native across vendors:** DuckDB is CPU-only by design; cuDF and Sirius are tied to NVIDIA, CUDA and Python.
   Mojo gives one codebase for NVIDIA, AMD and Apple Silicon.
@@ -49,5 +65,5 @@ SQLite. (Renamed from MX frame: F-165.)
 1. Finish M8 and pass the TPC-H 22 gate through `mx` (F-162).
 2. Quiet-machine scoreboard: omxcore against DuckDB and Polars, CPU and GPU, published with the gaps.
 3. Close the top gaps: join speed (F-161), sort and large outputs, then window functions.
-4. Rename (F-165), release 0.7.0, and an MCP server for `mx`.
+4. Rename (F-165), release 0.7.0, an MCP server for `mx` (F-169), and the agent-native plugins (M10: vector search on the GPU first).
 5. Then joins bigger than RAM and the SQL long tail.
