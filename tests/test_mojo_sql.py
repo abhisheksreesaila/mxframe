@@ -115,7 +115,12 @@ def duck_kind(type_code):
 
 
 def sort_key(row):
-    return tuple((0, "") if v is None else (1, repr(v)) for v in row)
+    return tuple((0, "") if v is None else (1, repr(v)) for v in row)  # (NaN and every other float sort by their text)
+
+
+def _same_row(a, b):
+    """Equal values, NaN equal to NaN (DuckDB's rule) and compared by value, not by type."""
+    return len(a) == len(b) and all(x == y or (isinstance(x, float) and isinstance(y, float) and x != x and y != y) for x, y in zip(a, b))
 
 
 def assert_equal(got, want, ordered, label):
@@ -126,7 +131,7 @@ def assert_equal(got, want, ordered, label):
         g = sorted(g, key=sort_key)
         w = sorted(w, key=sort_key)
     for i, (a, b) in enumerate(zip(g, w)):
-        assert a == b, f"{label}: row {i}: got {a}, DuckDB has {b}"
+        assert _same_row(a, b), f"{label}: row {i}: got {a}, DuckDB has {b}"
         for x, y in zip(a, b):
             assert type(x) is type(y) or x is None or y is None or (isinstance(x, (int, Decimal)) and isinstance(y, (int, Decimal))), \
                 f"{label}: row {i}: got {a!r} but DuckDB has {b!r} (a different type)"
@@ -356,6 +361,14 @@ QUERIES = [
       duck="SELECT g, quantile_disc(x, 0.5), median(d * 10), count(DISTINCT s), arg_min(s, (lower(s), s)) FROM t WHERE g < 50 GROUP BY g",
       fix=lambda rows: [r[:2] + (Decimal(r[2]) / 10 if r[2] is not None else None,) + r[3:] for r in rows]),
     Q("SELECT count(*), sum(x) FROM t WHERE x > 5000 GROUP BY k", keys=["k"], tag="empty-groups"),
+    Q("SELECT k, median(s), quantile_disc(s, 0.3), quantile_disc(dt, 0.5), quantile_disc(dt, 0.9), quantile_disc(b, 0.5) FROM t GROUP BY k", keys=["k"],
+      tag="median-text-date",
+      duck="SELECT k, (list(s ORDER BY lower(s), s) FILTER (WHERE s IS NOT NULL))[greatest(ceil(0.5 * count(s))::int, 1)], "
+           "(list(s ORDER BY lower(s), s) FILTER (WHERE s IS NOT NULL))[greatest(ceil(0.3 * count(s))::int, 1)], "
+           "quantile_disc(dt, 0.5), quantile_disc(dt, 0.9), quantile_disc(b, 0.5) FROM t GROUP BY k"),
+    Q("SELECT s, median(s), quantile_disc(dt, 0.5) FROM t WHERE x > 0 GROUP BY s", keys=["s"], tag="median-text-by-text",
+      duck="SELECT s, (list(s ORDER BY lower(s), s) FILTER (WHERE s IS NOT NULL))[greatest(ceil(0.5 * count(s))::int, 1)], quantile_disc(dt, 0.5) "
+           "FROM t WHERE x > 0 GROUP BY s"),
     Q("SELECT count(*), sum(x) FROM t WHERE d > x AND e < d AND x * d > e", tag="mixed-scales"),
     Q("SELECT k, count(*) FROM t WHERE d >= -12.5 AND e < 0.00005 AND x = 1.0 GROUP BY k", keys=["k"], tag="decimal-literals"),
     Q("SELECT k, max(dt) - min(dt), min(dt) + 7, count(*) FROM t WHERE dt + 30 > '2020-06-01' GROUP BY k", keys=["k"], tag="date-arithmetic"),
@@ -568,13 +581,15 @@ ERRORS = [
     ("SELECT sum(sum(x)) FROM t", "SQL error at line 1, column 12: aggregate functions cannot be nested"),
     ("SELECT count(*) FROM t WHERE sum(x) > 1", "SQL error at line 1, column 37: aggregate functions are not allowed in WHERE: filter the groups with HAVING"),
     ("SELECT sum(s) FROM t", "SQL error at line 1, column 12: sum() needs numbers, found TEXT"),
-    ("SELECT median(s) FROM t", "SQL error at line 1, column 15: median() needs numbers, found TEXT"),
+    ("SELECT median(dt) FROM t", "SQL error at line 1, column 15: median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which MX frame has no kind for yet (F-157): use quantile_disc(dt, 0.5)"),
+    ("SELECT count(*) FROM t WHERE dt = '1965-02-29'", "SQL error at line 1, column 33: cannot read '1965-02-29' as a DATE: the day 29 does not exist: February 1965 has 28 days"),
+    ("SELECT count(*) FROM t WHERE dt = DATE '2020-04-31'", "SQL error at line 1, column 35: `2020-04-31` is not a date: the day 31 does not exist: April 2020 has 30 days"),
     ("SELECT count(*) FROM t WHERE x = 'a'", "SQL error at line 1, column 32: cannot compare INT with TEXT (`=`)"),
     ("SELECT count(*) FROM t WHERE s < d", "SQL error at line 1, column 32: cannot compare TEXT with DECIMAL(2) (`<`)"),
     ("SELECT count(*) FROM t WHERE b + 1 > 2", "SQL error at line 1, column 32: cannot apply `+` to BOOL and INT"),
     ("SELECT sum(x / 2) FROM t", "SQL error at line 1, column 14: `/` gives a FLOAT, which is a result-only kind until F-157: use it on aggregates, such as sum(a) / count(*)"),
     ("SELECT sum(d // 2) FROM t", "SQL error at line 1, column 14: `//` on a DECIMAL gives a FLOAT in DuckDB, a result-only kind until F-157: use it on integers"),
-    ("SELECT count(*) FROM t WHERE dt > '2020-13-45'", "SQL error at line 1, column 33: cannot read '2020-13-45' as a DATE: write 'YYYY-MM-DD'"),
+    ("SELECT count(*) FROM t WHERE dt > '2020-13-45'", "SQL error at line 1, column 33: cannot read '2020-13-45' as a DATE: there is no month 13"),
     ("SELECT quantile_disc(x, 1.5) FROM t", "SQL error at line 1, column 25: the quantile must be between 0 and 1, found 1.5"),
     ("SELECT count(*) FROM t LIMIT x", "SQL error at line 1, column 30: LIMIT needs a whole number, found `x` (expressions are not supported there)"),
     ("SELECT count(*) FROM t GROUP BY 3", "SQL error at line 1, column 33: GROUP BY 3 is out of range: the select list has 1 items"),
@@ -748,3 +763,50 @@ def test_the_register_limit_is_an_sql_error(probe, data):
     res = run_probe(probe, f"SELECT k, {aggs} FROM t GROUP BY k", {"t": data["g8"].path}, expect_error=True)
     assert res["error"] == ("SQL error at line 1, column 8: the query is too big for one program (more than 48 registers): it holds too many "
                             "aggregates over different expressions (about 20); split the select list into two queries"), res
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_division_by_zero_is_ieee_like_duckdb(probe, data, mode):
+    """`/` is a double division: 1 / 0 is inf, -1 / 0 is -inf, 0 / 0 is NaN, 1.5 / 0 is inf; `//` and `%` by zero are NULL."""
+    for q in [Q("SELECT k, sum(x) / 0, -sum(x) / 0, sum(x) * 0 / 0, sum(d) / 0, sum(x) / sum(k - k), 1 / 0, -1 / 0, 0 / 0, 1.5 / 0 FROM t GROUP BY k", keys=["k"]),
+              Q("SELECT k, sum(x) // 0, sum(x) % 0, 7 // 0, 7 % 0 FROM t GROUP BY k", keys=["k"]),
+              Q("SELECT k, sum(x) / (sum(k) - sum(k)) AS r FROM t GROUP BY k ORDER BY r, k", keys=["k"], ordered=True),
+              Q("SELECT k, count(*) FROM t GROUP BY k HAVING sum(x) / 0 > 1e300 OR sum(x) * 0 / 0 = sum(x) * 0 / 0".replace("1e300", "1000000"), keys=["k"])]:
+        run_case(probe, data, "g8", mode, q)
+
+
+def test_constant_divisions_by_zero(probe, data):
+    res = run_probe(probe, "SELECT 1 / 0, -1 / 0, 0 / 0, 1.5 / 0, count(*) FROM t", {"t": data["g8"].path})
+    inf, ninf = float("inf"), float("-inf")
+    row = got_rows(res)[0]
+    assert (row[0], row[1], row[3], row[4]) == (inf, ninf, inf, 20000) and row[2] != row[2]
+
+
+# ── a limit on nesting: the parser, the binder and the program builder recurse ───────────────────────
+
+def _depth_error(probe, data, where):
+    res = run_probe(probe, f"SELECT count(*) FROM t WHERE {where}", {"t": data["g8"].path}, expect_error=True)
+    return res.get("error")
+
+
+def test_deeply_nested_expressions_raise_a_positioned_error_instead_of_crashing(probe, data):
+    prefix = len("SELECT count(*) FROM t WHERE ")
+    parens = _depth_error(probe, data, "(" * 300 + "x > 1" + ")" * 300)
+    assert parens == f"SQL error at line 1, column {prefix + 257}: this expression is nested more than 256 levels deep (parentheses, NOT or a minus sign repeated)", parens
+    nots = _depth_error(probe, data, "NOT " * 3000 + "b")
+    assert nots == f"SQL error at line 1, column {prefix + 4 * 255 + 1}: this expression is nested more than 256 levels deep (parentheses, NOT or a minus sign repeated)", nots
+    minus = _depth_error(probe, data, "x > " + "-" * 400 + "1")
+    assert minus.startswith("SQL error at line 1, column ") and "nested more than 256 levels deep" in minus, minus
+
+
+def test_long_chains_of_operators_are_capped_and_a_shorter_one_runs(probe, data):
+    prefix = len("SELECT count(*) FROM t WHERE ")
+    for op, make in [("OR", lambda n: " OR ".join(f"x = {i % 5}" for i in range(n))), ("AND", lambda n: " AND ".join(f"x <> {i % 5}" for i in range(n)))]:
+        msg = _depth_error(probe, data, make(3000))
+        assert msg.startswith("SQL error at line 1, column ") and f"more than the 256 allowed (a chain of that many terms joined by `{op}` counts)" in msg, msg
+        assert _depth_error(probe, data, make(200)) is None
+    res = run_probe(probe, "SELECT sum(" + " + ".join(["x"] * 4000) + ") FROM t", {"t": data["g8"].path}, expect_error=True)
+    assert res["error"].startswith("SQL error at line 1, column ") and "more than the 256 allowed (a chain of that many terms joined by `+` counts)" in res["error"], res
+    ok = run_probe(probe, "SELECT sum(" + " + ".join(["x"] * 200) + ") FROM t", {"t": data["g8"].path})
+    want = data["g8"].table.execute("SELECT sum(x) * 200 FROM t").fetchall()
+    assert_equal(got_rows(ok), want, False, "a 200-term sum")

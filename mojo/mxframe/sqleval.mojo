@@ -58,6 +58,14 @@ struct ValCol(Copyable, Movable):
         return Float64(self.v[i])
 
 
+def _fcmp(a: Float64, b: Float64) -> Int:
+    if a != a:
+        return 0 if b != b else 1
+    if b != b:
+        return -1
+    return -1 if a < b else 1 if a > b else 0
+
+
 def _p10(k: Int) -> Int64:
     var v: Int64 = 1
     for _ in range(k):
@@ -133,10 +141,7 @@ def eval_post(q: BoundQuery, e: Int, keys: List[ValCol], aggs: List[ValCol], dic
                     continue
                 var p = a.f(i)
                 var r: Float64
-                if op == B_DIV:
-                    if b.f(i) == 0.0:
-                        out.set_null(i)
-                        continue
+                if op == B_DIV:                                   # IEEE, as DuckDB: 1 / 0 is inf, -1 / 0 is -inf, 0 / 0 is NaN (any NaN is made the one positive NaN below, so it sorts after every number)
                     r = p / b.f(i)
                 elif op == B_ADD:
                     r = p + b.f(i)
@@ -144,6 +149,8 @@ def eval_post(q: BoundQuery, e: Int, keys: List[ValCol], aggs: List[ValCol], dic
                     r = p - b.f(i)
                 else:
                     r = p * b.f(i)
+                if r != r:
+                    r = Float64(from_bits=UInt64(0x7FF8000000000000))
                 out.v[i] = float_bits(r)
             return out^
         for i in range(n):
@@ -286,8 +293,9 @@ def _compare(q: BoundQuery, x: BExpr, keys: List[ValCol], aggs: List[ValCol], di
         if as_float:
             var p = a.f(i)
             var s = b.f(i)
-            r = (p == s) if code == C_EQ else (p != s) if code == C_NE else (p < s) if code == C_LT else \
-                (p <= s) if code == C_LE else (p > s) if code == C_GT else (p >= s)
+            var c3 = _fcmp(p, s)                          # DuckDB's order: NaN equals itself and is greater than every number
+            r = (c3 == 0) if code == C_EQ else (c3 != 0) if code == C_NE else (c3 < 0) if code == C_LT else \
+                (c3 <= 0) if code == C_LE else (c3 > 0) if code == C_GT else (c3 >= 0)
         else:
             var p = a.v[i]
             var s = b.v[i]

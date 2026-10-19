@@ -294,6 +294,28 @@ def _is_numeric(kind: Int) -> Bool:
     return kind == INT.value or kind == DECIMAL.value
 
 
+def date_problem(s: String) -> String:
+    """Why 'YYYY-MM-DD' text is not a date, "" when it is one."""
+    var b = s.as_bytes()
+    if len(b) != 10 or b[4] != UInt8(45) or b[7] != UInt8(45):
+        return "write it as YYYY-MM-DD"
+    var nums = List[Int]()
+    for rng in [(0, 4), (5, 7), (8, 10)]:
+        var v = 0
+        for i in range(rng[0], rng[1]):
+            if not (UInt8(48) <= b[i] <= UInt8(57)):
+                return "write it as YYYY-MM-DD"
+            v = v * 10 + Int(b[i] - 48)
+        nums.append(v)
+    if nums[1] < 1 or nums[1] > 12:
+        return "there is no month " + String(nums[1])
+    var days = _days_in_month(nums[0], nums[1])
+    if nums[2] < 1 or nums[2] > days:
+        var names: List[String] = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        return "the day " + String(nums[2]) + " does not exist: " + names[nums[1] - 1] + " " + String(s[byte=0:4]) + " has " + String(days) + " days"
+    return ""
+
+
 def parse_date_literal(s: String) -> Int:
     """Days since 1970-01-01 of 'YYYY-MM-DD', or Int.MIN when the text is not such a date."""
     var b = s.as_bytes()
@@ -519,7 +541,7 @@ struct _Binder(Movable):
             return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if x.kind == X_TRUE else 0), String(x.text), ast)
         var days = parse_date_literal(x.text)
         if days == Int.MIN:
-            raise self.err(ast, "`" + x.text + "` is not a date: write DATE 'YYYY-MM-DD'")
+            raise self.err(ast, "`" + x.text + "` is not a date: " + date_problem(x.text))
         return self.mk(B_LIT, DATE.value, 0, -1, -1, Int64(days), String(x.text), ast)
 
     # -- coercions between the two sides of an operator
@@ -542,7 +564,7 @@ struct _Binder(Movable):
         var x = self.at(e)
         var days = parse_date_literal(x.text)
         if days == Int.MIN:
-            raise self.err(ast, "cannot read '" + x.text + "' as a DATE: write 'YYYY-MM-DD'")
+            raise self.err(ast, "cannot read '" + x.text + "' as a DATE: " + date_problem(x.text))
         return self.mk(B_LIT, DATE.value, 0, -1, -1, Int64(days), String(x.text), ast)
 
     def align(mut self, mut a: Int, mut b: Int, ast: Int) raises:
@@ -900,6 +922,14 @@ struct _Binder(Movable):
                 src = a.src
                 if a.kind == TEXT.value and a.op != B_COL:
                     raise self.err(x.items[0], name.lower() + "() of TEXT needs the column itself")
+            elif func == F_MEDIAN and a.kind == TEXT.value:             # words have no mean: the lower middle word, in the text order, as DuckDB
+                if a.op != B_COL:
+                    raise self.err(x.items[0], "median() of TEXT needs the column itself")
+                rkind = TEXT.value
+                src = a.src
+            elif func == F_MEDIAN and a.kind == DATE.value:
+                raise self.err(x.items[0], "median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which MX frame has no kind for yet (F-157): use quantile_disc(" +
+                               self.st.render(x.items[0]) + ", 0.5)")
             elif func == F_MEDIAN:
                 if not _is_numeric(a.kind):
                     raise self.err(x.items[0], "median() needs numbers, found " + kind_name(a.kind, a.scale))
