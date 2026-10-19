@@ -38,7 +38,7 @@ t.dictionary(c) -> Span[String]; t.text_of(c, code) -> String; t.code_of(c, "Wes
 
 | Need | Today (stand-in) | Why |
 |---|---|---|
-| Kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days since 1970), BOOL | INT, DECIMAL, TEXT, DATE; bools import as 0/1 | the Import step and the format inspector branch on kind |
+| Kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days since 1970), BOOL; and FLOAT (float64 bits in the value slot), a result-only kind `sql()` returns for AVG and `/`, which no file, Frame or query input takes until F-157 | INT, DECIMAL, TEXT, DATE; bools import as 0/1 | the Import step and the format inspector branch on kind |
 | **Any number of columns** | 16 (`MAX_COLS`, a SIMD row vector) | wider CSVs lose columns past 16 today |
 | **Nulls per column** (a validity bitmap) | none: empty cells read as 0 or "" and are only counted | Delete on a number cell; honest averages and counts |
 | Column-major, contiguous int64 buffers the app can borrow as `Span[Int64]` | `List[Int64]` per column | the grid reads a screenful at a time; the GPU upload reads whole columns |
@@ -212,9 +212,89 @@ int64 (informal, F-138a). Next: multi-column sort.
 - A build without a GPU (every non-Linux target, or `-D MXFRAME_NO_GPU`): `gpu_available()` is False, `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build", AUTO is the CPU (see `mojo/README.md`, build switches).
 - Later: data bigger than GPU or host memory (chunked, streamed); Apple GPUs (Metal) without Python.
 
-## 8. Later (Query and Explore modes)
-More than one table and joins; a SQL front end (SQL cells, EXPLAIN); pipelines with cached steps; versioned column
-chunks for a time machine and branches; DuckDB as the test oracle and TPC-H.
+## 8. SQL over one table (F-150)
+
+```mojo
+var cat = Catalog()
+cat.add_table("orders", orders)              # a SharedTable
+cat.add_frame("edited", frame)               # a Frame, snapshotted now (its edit counter is `SqlSource.version`): add it again after more edits
+cat.add_scan("big", scan_parquet(path))      # a Parquet file, read a row group at a time (a Frame over a scan works too)
+var r = sql(cat, "SELECT region, sum(revenue) AS total FROM orders WHERE qty > 2 GROUP BY region HAVING count(*) > 5 ORDER BY total DESC LIMIT 10")
+r.table                                      # an owned Table: INT, DECIMAL, TEXT, DATE, BOOL and FLOAT (a result-only kind until F-157)
+r.notes                                      # what the planner decided and what ran, one line each
+r.explain; r.ms; r.device (CPU); r.fallback_reason ("")
+var e = sql(cat, "EXPLAIN SELECT ...")       # the plan as a one-column Table `plan` (also `e.explain`); nothing runs
+var o = PlannerOptions(); o.group = GROUP_HASHED          # GROUP_AUTO, GROUP_DENSE or GROUP_HASHED; o.dense_limit; o.threads
+var h = sql(cat, "SELECT ...", o)
+```
+
+**The dialect** is a subset of DuckDB's; anything else raises `SQL error at line L, column C: <what>`, naming the construct
+(`` `JOIN` is not supported yet (F-153) ``, `column `revenu` not found in table `orders` (did you mean `revenue`?)`).
+
+| Part | Supported |
+|---|---|
+| Statement | `[EXPLAIN] SELECT ... FROM table [AS alias]` (table names and columns match without regard to case; `;` and `--` / `/* */` comments allowed) |
+| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number or date constant |
+| `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` (numbers: up to 40; text: any number), `IS [NOT] NULL`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
+| `GROUP BY` | columns, expressions, ordinals (`GROUP BY 1`), select aliases; none at all (one group) |
+| `HAVING`, `ORDER BY` | aggregates and group keys in any expression; `ORDER BY` keys, aggregates, aliases, ordinals; `ASC` / `DESC`; `NULLS FIRST` / `LAST` (NULLS LAST by default, also for `DESC`, as DuckDB); `LIMIT n [OFFSET m]` |
+| Aggregates | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `MIN`, `MAX` (also of TEXT), `AVG`, `MEDIAN`, `QUANTILE_DISC(x, p)` |
+
+**SQL's rules** (the Query builder above keeps its own; both run on the same kernels):
+three-valued logic in `WHERE` / `HAVING` (a row is kept only when the condition is true; `x IN (1, NULL)` is true or unknown; `NOT` of unknown is unknown);
+NULL is a group of its own; only groups with rows exist (a global aggregate over no rows still returns its one row); `SUM` / `MIN` / `MAX` / `AVG` / `MEDIAN`
+of no non-null value are NULL, `COUNT` is 0; `x // 0` and `x % 0` are NULL and both truncate toward zero; a word the column never held matches nothing;
+`/` always gives a FLOAT, `AVG` gives a FLOAT that is exactly what DuckDB computes (its long-double division `sum / (count * 10^scale)`, reproduced bit for bit).
+Text order everywhere (`ORDER BY`, `MIN` / `MAX`, `QUANTILE_DISC`, `<` and `BETWEEN` against a literal) is alphabetical ignoring ASCII case, with byte order breaking ties; `=` and `IN` compare bytes.
+
+**Differences from DuckDB, on purpose**: a `SUM` (or any int64 arithmetic) past int64 raises `a sum or an expression passed the int64 range (about 9.2e18)` where DuckDB
+widens to HUGEINT (decimal `*` too); `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
+`//` on a DECIMAL and `/` below an aggregate raise (they are FLOATs until F-157); the text order above.
+
+**How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), planned from
+statistics only (`planner.mojo`: the `Planner` trait, `RulePlanner`, `Stats`, `PlannerOptions`), lowered to one kernel program in SQL's mode (`sqlprog.mojo`), run over the source's
+chunks, and finished in Mojo (`sqleval.mojo`, `sqlexec.mojo`: HAVING, ORDER BY, LIMIT, select expressions, the result Table). A table is one chunk; a frame is its shared table with
+the changed rows masked out plus a small table of the changed and appended rows; a scan is one chunk per row group. The chunks' partial results (sums and counts add, min / max combine,
+hashed groups merge by key) fold into one.
+
+| Group strategy | When | How |
+|---|---|---|
+| none | no `GROUP BY` | one group, the plain kernel |
+| dense | every key is a column whose values lie in a known range: a TEXT dictionary, BOOL, or the min / max of an INT / DECIMAL / DATE column of a table or frame (one pass, cached per source), and the domain (a NULL slot per nullable key, keys mixed-radix) is at most `dense_limit` (4,194,304) and either at most 65,536 or at most 4x the rows | the kernel adds into slot `g` directly |
+| hashed | a key is an expression, or has no known range (an INT column of a scan), or the domain is too wide or too sparse | `hashagg_cpu.hash_aggregate`: per-worker hash tables over the key words (the value, plus a NULL flag word for a nullable key), a partitioned merge |
+
+`count(DISTINCT)`, `MEDIAN`, `QUANTILE_DISC` and `MIN` / `MAX` of TEXT use the holistic states of §5; over hashed groups they take a second pass that maps each row to its group
+by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096` over more than 8x as many groups takes a bounded heap; otherwise stable radix passes, last key first.
+
+`r.notes` is the contract the tests assert: `source: ...`, `group: dense, 2 keys g 7 (with a NULL slot) x s 17 ... = 119 slots: <reason>` or `group: hashed on N key words: <reason>`
+(`forced by the options` when `PlannerOptions` said so), `kernel: N instructions a row (M slots)`, `ran: table|frame|scan ...: <chunks>`, `holistic: ...`, `order: ...`, `having: ...`, `time: ...`.
+
+**Limits**: one table (joins: F-153); no row queries, `DISTINCT`, `SELECT *` (F-152); no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only; a Frame with formula columns is refused;
+at most 48 registers (about 10 aggregates over different expressions) and 64 distinct constants in one program, said in words when passed; sums of an AVG argument past int64 raise.
+
+Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
+`sql()` on a table already in memory, best of 3 in one process, which includes planning and, the first time, the pass that finds a key's range; DuckDB 1.5.1 on a table it loaded, best of 3, its result
+fetched into Python; neither is a quiet-machine benchmark). Every result was checked against DuckDB first.
+
+| query | MX frame SQL | DuckDB | group strategy |
+|---|---|---|---|
+| `count(*), sum(v), avg(d), min(dt)` | 7 ms | 5 ms | none (one result row) |
+| 8 groups, 4 aggregates | 8 ms | 6 ms | dense |
+| `WHERE v > 100`, 2 keys (56 groups) | 8 ms | 11 ms | dense |
+| 10k groups, `ORDER BY 2 DESC, 1 LIMIT 10` | 9 ms | 13 ms | dense |
+| 1M groups, `ORDER BY 2 DESC, 1 LIMIT 10` | 133 ms | 92 ms | dense |
+| 1M groups, all 1M rows out | 159 ms | 1,900 ms | dense |
+| key `g % 100000` (an expression, bounded by interval arithmetic) | 21 ms | 70 ms | dense |
+| `count(DISTINCT)` + `median`, 8 groups | 82 ms | 44 ms | dense |
+| `quantile_disc`, 10k groups | 38 ms | 67 ms | dense |
+| 10k x 7 groups, hashed (forced) | 152 ms | 71 ms | hashed |
+
+The same queries over the Parquet file (one chunk per row group) are decode-bound: 80 to 110 ms to decode the three columns of 50 row groups, plus the kernel. A scan with very many groups merges a
+partial result per row group (a dense partial per group is the whole domain), which is slow at 1M groups (1 to 2.5 s): batching row groups and the other big-GROUP-BY work over streamed files is F-158.
+
+## 9. Later (Query and Explore modes)
+More than one table and joins, SQL row queries, expression functions (M8: F-151 to F-162); pipelines with cached steps; versioned column
+chunks for a time machine and branches; TPC-H through SQL.
 
 ## Memory rules
 - A shared `Table` is read-only once shared and outlives every `Frame` built on it.

@@ -688,6 +688,7 @@ def _to_table(q: BoundQuery, outs: List[ValCol], dicts: DictAccess) raises -> Ta
 def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hres: HolResult, hol_of: List[Int],
             dicts: DictAccess, mut notes: List[String]) raises -> Table:
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
+    var t_a = perf_counter_ns()
     var gids = List[Int]()
     if plan.group == G_NONE:
         gids.append(0)
@@ -699,6 +700,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
         for g in range(acc.groups()):
             gids.append(g)
     var n = len(gids)
+    var t_b = perf_counter_ns()
     # group keys
     var keys = List[ValCol]()
     var kwat = 0
@@ -763,23 +765,25 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
         if sp_a.kind == TEXT.value:
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
+    var t_c = perf_counter_ns()
     # HAVING
-    var sel = List[Int]()
+    var skeys = List[ValCol]()
+    var saggs = List[ValCol]()
     if q.having >= 0:
         var hv = eval_post(q, q.having, keys, aggs, dicts, n)
+        var sel = List[Int]()
         for i in range(n):
             if not hv.is_null(i) and hv.v[i] != 0:
                 sel.append(i)
-    else:
-        for i in range(n):
-            sel.append(i)
-    var skeys = List[ValCol]()
-    for k in keys:
-        skeys.append(_gather(k, sel))
-    var saggs = List[ValCol]()
-    for a in aggs:
-        saggs.append(_gather(a, sel))
-    var m = len(sel)
+        for k in keys:
+            skeys.append(_gather(k, sel))
+        for a in aggs:
+            saggs.append(_gather(a, sel))
+    else:                                                       # nothing to filter: the columns move on as they are
+        skeys = keys^
+        saggs = aggs^
+    var m = n if q.having < 0 else (skeys[0].n() if len(skeys) > 0 else saggs[0].n() if len(saggs) > 0 else 0)
+    var t_d = perf_counter_ns()
     # ORDER BY, OFFSET, LIMIT
     var fin = List[Int]()
     var notes_sort = String()
@@ -812,11 +816,15 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     var faggs = List[ValCol]()
     for a in saggs:
         faggs.append(_gather(a, rows))
+    var t_e = perf_counter_ns()
     var outs = List[ValCol]()
     for e in q.outputs:
         var vc = eval_post(q, e, fkeys, faggs, dicts, len(rows))
         outs.append(vc^)
-    return _to_table(q, outs, dicts)
+    var table = _to_table(q, outs, dicts)
+    notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, having " +
+                 _ms(Float64(t_d - t_c) / 1e6) + " ms, order " + _ms(Float64(t_e - t_d) / 1e6) + " ms, output " + _ms(Float64(perf_counter_ns() - t_e) / 1e6) + " ms")
+    return table^
 
 
 # ── running ──────────────────────────────────────────────────────────────────────────────────────────
