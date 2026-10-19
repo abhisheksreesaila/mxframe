@@ -1,7 +1,7 @@
 # F-153: the hash join kernel (kernels_aot/hashjoin_cpu.mojo) against a plain dictionary, on every layout it chooses.
 from std.collections import Dict
 from mxframe.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, MapView, hj_release, MODE_DIRECT, MODE_HASH,
-                                          MODE_EMPTY, E_BUDGET)
+                                          MODE_EMPTY, E_BUDGET, hj_probe_select, hj_filter_block, hj_probe_left_block, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE)
 from mxframe.kernels.hashjoin_cpu import IP, LP, BP
 
 
@@ -88,6 +88,66 @@ def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[I
         var small = List[Int64](length=4, fill=0)
         var rc2 = hj_probe_pairs(m, Int(probe.unsafe_ptr()), pok, np, threads, total - 1, Int(small.unsafe_ptr()))
         expect(rc2 == E_BUDGET and Int(small[0]) == total and Int(small[1]) == 0, name + ": budget refusal")
+    # outer pairs (a LEFT join): a row with no partner or no usable key is one pair with build row -1
+    var oo = List[Int64](length=4, fill=0)
+    var rco = hj_probe_pairs(m, Int(probe.unsafe_ptr()), pok, np, threads, 1 << 40, Int(oo.unsafe_ptr()), True)
+    expect(rco == 0, name + ": outer pairs rc " + String(rco))
+    var want_pr = List[Int]()
+    var want_br = List[Int]()
+    for i in range(np):
+        var usable = not (len(probe_ok) > 0 and probe_ok[i] == 0)
+        if usable and probe[i] in truth:
+            for b in truth[probe[i]]:
+                want_pr.append(i)
+                want_br.append(b)
+        else:
+            want_pr.append(i)
+            want_br.append(-1)
+    expect(Int(oo[0]) == len(want_pr), name + ": outer pairs " + String(Int(oo[0])) + " wanted " + String(len(want_pr)))
+    if len(want_pr) > 0:
+        var opr = IP(unsafe_from_address=Int(oo[1]))
+        var obr = IP(unsafe_from_address=Int(oo[2]))
+        for k in range(len(want_pr)):
+            expect(Int(opr[k]) == want_pr[k] and Int(obr[k]) == want_br[k], name + ": outer pair " + String(k))
+    hj_release(Int(oo[1]))
+    hj_release(Int(oo[2]))
+    # presence filters: semi, anti, null-aware anti, none; whole probe side and the fused block form over every second row
+    for fm in [PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE]:
+        var want_rows = List[Int]()
+        for i in range(np):
+            var usable = not (len(probe_ok) > 0 and probe_ok[i] == 0)
+            var present = usable and probe[i] in truth
+            var keep = False
+            if fm == PM_SEMI:
+                keep = present
+            elif fm == PM_ANTI:
+                keep = not present
+            elif fm == PM_ANTI_NA:
+                keep = usable and not present
+            if keep:
+                want_rows.append(i)
+        var so = List[Int64](length=2, fill=0)
+        _ = hj_probe_select(m, Int(probe.unsafe_ptr()), pok, np, threads, fm, Int(so.unsafe_ptr()))
+        expect(Int(so[0]) == len(want_rows), name + ": select mode " + String(fm) + " kept " + String(Int(so[0])) + " wanted " + String(len(want_rows)))
+        expect((Int(so[1]) == 0) == (len(want_rows) == 0), name + ": select mode " + String(fm) + " allocates only when rows are kept")
+        if len(want_rows) > 0:
+            var got = IP(unsafe_from_address=Int(so[1]))
+            for k in range(len(want_rows)):
+                expect(Int(got[k]) == want_rows[k], name + ": select mode " + String(fm) + " row " + String(k))
+        hj_release(Int(so[1]))
+        var bsel = List[Int32](length=np + 1, fill=0)
+        var bn = 0
+        for i in range(0, np, 2):
+            bsel[bn] = Int32(i)
+            bn += 1
+        var bkept = hj_filter_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                                    pok != 0, 0, IP(unsafe_from_address=Int(bsel.unsafe_ptr())), bn, fm)
+        var bq = 0
+        for k in range(len(want_rows)):
+            if want_rows[k] % 2 == 0:
+                expect(Int(bsel[bq]) == want_rows[k], name + ": filter block mode " + String(fm) + " row " + String(want_rows[k]))
+                bq += 1
+        expect(bkept == bq, name + ": filter block mode " + String(fm) + " kept " + String(bkept) + " wanted " + String(bq))
     # unique lookups
     if want_unique and want_mode != MODE_EMPTY:
         var res = List[Int32](length=np, fill=0)
@@ -115,6 +175,19 @@ def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[I
                 expect(Int(sel[q]) == i and Int(prow[q]) == want, name + ": block lookup of row " + String(i))
                 q += 1
         expect(kept == q, name + ": block kept " + String(kept) + " wanted " + String(q))
+        # the LEFT form: every row stays, its partner or -1
+        var lsel = List[Int32](length=np, fill=0)
+        for i in range(np):
+            lsel[i] = Int32(i)
+        var lrow = List[Int32](length=np, fill=7)
+        hj_probe_left_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                            pok != 0, 0, IP(unsafe_from_address=Int(lsel.unsafe_ptr())), np, IP(unsafe_from_address=Int(lrow.unsafe_ptr())))
+        expect(Int(lsel[np - 1]) == np - 1, name + ": left block leaves every row selected")
+        for i in range(np):
+            var want = -1
+            if not (len(probe_ok) > 0 and probe_ok[i] == 0) and probe[i] in truth:
+                want = truth[probe[i]][0]
+            expect(Int(lrow[i]) == want, name + ": left block row " + String(i) + ": " + String(Int(lrow[i])) + " wanted " + String(want))
     print("  ok", name, "->", m.kind())
 
 

@@ -8,6 +8,12 @@ caller that is not Mojo. The kernel itself is `hashjoin_cpu.mojo`; this file onl
     mx_hj_probe_pairs(h, keys, ok, n, threads, budget_rows, out)
                                                        out Int64[3]: pair count, address of Int32 probe rows, address of Int32 build rows
                                                        (release each with mx_hj_release_array; both are 0 when the count is 0); -32 when the pairs pass the budget
+    mx_hj_probe_pairs_outer(h, keys, ok, n, threads, budget_rows, out)
+                                                       as mx_hj_probe_pairs, and a probe row with no partner (or no usable key) is one pair whose build row is -1
+    mx_hj_probe_select(h, keys, ok, n, threads, mode, out)
+                                                       mode 2 semi (rows whose key is present), 3 anti (rows whose key is absent, a NULL key too), 4 null-aware
+                                                       anti (absent and not NULL), 5 none; out Int64[2]: how many, address of the Int32 rows (0 when none;
+                                                       release with mx_hj_release_array); the map may hold repeated keys
     mx_hj_release_array(addr), mx_hj_free(h)
 
 A handle has one owner: `mx_hj_free` once, after the last probe (a second free, or a probe after the free, is the caller's error). A handle that is 0 or negative
@@ -16,7 +22,7 @@ A handle has one owner: `mx_hj_free` once, after the last probe (a second free, 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer
 from std.ffi import external_call
-from hashjoin_cpu import JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_release
+from hashjoin_cpu import JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_select, hj_release
 
 comptime ABI_VERSION = 1
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
@@ -125,6 +131,28 @@ def mx_hj_probe_pairs(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int,
         return E_BAD_HANDLE
     var m = _unbox(handle)
     var rc = hj_probe_pairs(m, keys_a, ok_a, n, threads, budget_rows, out_a)
+    _detach(m)
+    return rc
+
+
+@export
+def mx_hj_probe_pairs_outer(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int) abi("C") -> Int:
+    if handle <= 0:
+        return E_BAD_HANDLE
+    var m = _unbox(handle)
+    var rc = hj_probe_pairs(m, keys_a, ok_a, n, threads, budget_rows, out_a, True)
+    _detach(m)
+    return rc
+
+
+@export
+def mx_hj_probe_select(handle: Int, keys_a: Int, ok_a: Int, n: Int, threads: Int, mode: Int, out_a: Int) abi("C") -> Int:
+    if handle <= 0:
+        return E_BAD_HANDLE
+    if mode < 2 or mode > 5:
+        return -1
+    var m = _unbox(handle)
+    var rc = hj_probe_select(m, keys_a, ok_a, n, threads, mode, out_a)
     _detach(m)
     return rc
 
