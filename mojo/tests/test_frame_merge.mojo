@@ -85,6 +85,8 @@ def main() raises:
         "SELECT l.s, r.s, count(*) FROM l LEFT JOIN r ON l.s = r.s GROUP BY l.s, r.s ORDER BY l.s, r.s",
         "SELECT l.k, l.s, r.s, r.y FROM l LEFT JOIN r ON l.k = r.k WHERE l.x > 400 ORDER BY l.k, l.s, r.y, r.s",
         "SELECT count(*), count(r.y) FROM l LEFT JOIN r ON l.k = r.k AND r.y < 2000",
+        "SELECT count(*), count(r.y) FROM l LEFT JOIN r ON l.k = r.k WHERE l.x = r.y",
+        "SELECT count(*), count(r.y) FROM l LEFT JOIN r ON l.s = r.s WHERE l.k = r.k",
         "SELECT count(*), sum(x) FROM l WHERE k IN (SELECT k FROM r)",
         "SELECT count(*) FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)",
         "SELECT s, count(*) FROM l WHERE s IN (SELECT s FROM r) GROUP BY s ORDER BY s",

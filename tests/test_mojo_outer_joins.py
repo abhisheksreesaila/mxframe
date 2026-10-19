@@ -142,6 +142,25 @@ def test_left_join_text_and_composite_keys(mx, data):
     q(mx, data, "SELECT c.s, o.tag, count(*) FROM cust c LEFT JOIN ords o ON c.s = o.tag GROUP BY c.s, o.tag", ["cust", "ords"])
 
 
+WHERE_EQUALITIES = [
+    # a WHERE equality between the two tables is a filter after a LEFT join (it removes the NULL-extended rows), not a join key
+    "SELECT count(*), count(d.name) FROM fact f LEFT JOIN dim d ON f.k = d.k WHERE f.g = d.k",
+    "SELECT count(*), count(o.oid) FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE c.seg = o.amt",
+    "SELECT count(*), count(d.name) FROM cust c LEFT JOIN dim d ON c.ck = d.k WHERE c.dt = d.dt",
+    "SELECT count(*) FROM cust c LEFT JOIN dim d ON c.seg = d.k WHERE c.dt = d.dt",
+    "SELECT c.ck, o.oid FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE c.seg = o.amt AND c.ck < 100",
+    "SELECT c.s, count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE o.amt = c.seg GROUP BY c.s",
+    "SELECT count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE c.ck = o.ck",
+    "SELECT count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck AND c.seg = o.amt WHERE o.oid = c.ck",
+]
+
+
+@pytest.mark.parametrize("extra", [[], ["--join", "materialize"], ["--stream", "always"], ["--threads", "1"]])
+@pytest.mark.parametrize("sql", WHERE_EQUALITIES)
+def test_a_where_equality_after_a_left_join_is_a_filter_not_a_key(mx, data, sql, extra):
+    q(mx, data, sql, ["cust", "ords", "dim", "fact"], extra=extra)
+
+
 # ── SEMI and ANTI JOIN, IN / NOT IN / EXISTS / NOT EXISTS ───────────────────────────────────────────
 
 PRESENCE = [
@@ -195,6 +214,9 @@ IN_LISTS = [
     "SELECT ck FROM cust WHERE ck IN (SELECT ck FROM nothing)",
     "SELECT count(*) FROM nothing_c WHERE ck IN (SELECT ck FROM ords)",
     "SELECT count(*), sum(ck) FROM cust WHERE seg IN (SELECT seg FROM cust WHERE ck < 10)",           # the same table on both sides
+    "SELECT count(*) FROM cust c WHERE EXISTS (SELECT * FROM cust c2 WHERE c2.seg = c.seg AND c2.ck < 10)",
+    "SELECT count(*) FROM cust WHERE EXISTS (SELECT * FROM cust c2 WHERE c2.seg = cust.seg AND c2.ck < c2.seg)",
+    "SELECT count(*) FROM cust WHERE ck IN (SELECT c2.ck FROM cust c2 WHERE c2.seg = 3)",
     "SELECT count(*) FROM cust WHERE ck NOT IN (SELECT ck FROM cust WHERE seg > 20)",
 ]
 
@@ -215,6 +237,7 @@ NOT_IN = [
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM nothing)", "an empty list keeps a NULL probe key", "the list is empty"),
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM ords)", "ords.ck holds NULLs", "the list holds a NULL"),
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM ords WHERE ck IS NOT NULL)", "the NULLs filtered out of the list", "a NULL key is dropped"),
+    ("SELECT count(*) FROM cust c WHERE NOT EXISTS (SELECT * FROM cust c2 WHERE c2.seg = c.seg AND c2.ck < 10)", "the same table, own alias", "join: anti"),
     ("SELECT count(*) FROM nothing_c WHERE ck NOT IN (SELECT ck FROM nonull)", "an empty probe side", "join: anti (null-aware)"),
     ("SELECT s, count(*) FROM cust WHERE s NOT IN (SELECT tag FROM ords) GROUP BY s", "words the list lacks are kept, a NULL text key is dropped", "a NULL key is dropped"),
     ("SELECT s, count(*) FROM fact WHERE s NOT IN (SELECT tag FROM ords) GROUP BY s", "a word absent from the list's dictionary is not a NULL", "a NULL key is dropped"),

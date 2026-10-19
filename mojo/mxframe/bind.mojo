@@ -680,7 +680,9 @@ struct _Binder(Movable):
             var c = conj[ci]
             self.in_on = ci < n_on
             ref x = self.st.exprs[c]
-            if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL:
+            # an equality between a column of each table is a join key: from ON (or USING, or the comma join's WHERE) always; a WHERE equality of a LEFT / SEMI /
+            # ANTI join is a filter on the joined rows (it removes a LEFT join's NULL-extended rows), so it is not a key there
+            if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL and (self.jkind == JK_INNER or ci < n_on):
                 var ra = self.lookup(x.a)
                 var rb = self.lookup(x.b)
                 if ra[1] == 0 and rb[1] == 0 and self.table_of(ra[0]) != self.table_of(rb[0]):
@@ -1414,10 +1416,13 @@ def _lift_subquery(mut st: SqlStatement, catalog: Catalog) raises:
         st.join_kind = JK_ANTI_NA if neg else JK_SEMI
     else:
         st.join_kind = JK_ANTI if neg else JK_SEMI
-    if lower_ascii(sub.table) == lower_ascii(st.table) and sub.alias.byte_length() == 0:
-        sub.alias = "_sub_" + sub.table                    # a subquery over the same table: the two sides need names (the outer one keeps its own, or the table's)
+    if lower_ascii(sub.table) == lower_ascii(st.table):
+        # a subquery over the same table: the two sides need names. The outer side keeps its alias, or is called by the table's name (so `t.k` means the
+        # outer row inside the subquery, as in SQL); the subquery keeps its alias, or gets an internal one
         if st.table_alias.byte_length() == 0:
             st.table_alias = st.table
+        if sub.alias.byte_length() == 0:
+            sub.alias = "_sub_" + sub.table
     st.has_right = True
     st.right_table = sub.table
     st.right_alias = sub.alias
