@@ -379,6 +379,7 @@ def run_case(probe, data, ds_name, mode, q, group=None, **kw):
     ds = data[ds_name]
     files = {"t": ds.path}
     res = run_probe(probe, q.sql, files, mode=mode, group=group, edits=ds.edits_path if mode in ("frame", "framescan") else None, **kw)
+    assert_source_path(res, mode)
     con = ds.oracle(mode)
     cur = con.execute(q.duck or q.sql)
     want = cur.fetchall()
@@ -407,15 +408,25 @@ def test_equals_duckdb_and_path(probe, data, ds_name, mode, q):
     want = expected_group(q.keys, ds, mode, KINDS, ds.oracle(mode), ds.n)
     group_note = next(n for n in notes if n.startswith("group:"))
     assert group_note.startswith("group: " + want), f"{q.sql} on {ds_name}/{mode}: the planner said `{group_note}`, expected {want}"
+    assert_source_path(res, mode)
+
+
+def assert_source_path(res, mode):
+    """The notes say which source ran how: a table in one chunk, a frame as its shared rows (changed ones masked) plus the changed rows,
+    a scan as every one of its 13 row groups; and the planner's strategy and the kernel's size are always there."""
+    notes = res["notes"]
     source_note = next(n for n in notes if n.startswith("source:"))
     ran_note = next(n for n in notes if n.startswith("ran:"))
     if mode == "table":
-        assert "(table)" in source_note and ran_note.startswith("ran: table t: 1 chunk of")
+        assert "(table)" in source_note and ran_note.startswith("ran: table t: 1 chunk of"), notes
     elif mode == "frame":
-        assert "(frame" in source_note and ran_note.startswith("ran: frame t:") and "changed or appended rows" in ran_note
+        assert "(frame at edit" in source_note and ran_note.startswith("ran: frame t:") and "changed or appended rows" in ran_note, notes
+    elif mode == "framescan":
+        assert "Parquet scan, 13 row groups" in source_note and ran_note.startswith("ran: scan t: 13 of 13 row groups read") and \
+               "changed or appended rows" in ran_note, notes
     else:
-        assert "Parquet scan, 13 row groups" in source_note and ran_note.startswith(f"ran: scan t: 13 of 13 row groups read"), ran_note
-    assert any(n.startswith("kernel:") for n in notes)
+        assert "Parquet scan, 13 row groups" in source_note and ran_note.startswith("ran: scan t: 13 of 13 row groups read"), notes
+    assert any(n.startswith("group:") for n in notes) and any(n.startswith("kernel:") for n in notes), notes
 
 
 # ── forced paths, empty and edge cases ───────────────────────────────────────────────────────────────
@@ -671,6 +682,7 @@ def test_random_queries_equal_duckdb(probe, data, mode, seed):
         if "error" in res:
             raise AssertionError(f"{mode}: `{q}`: {res['error']}")
         compared += 1
+        assert_source_path(res, mode)
         want = ds.oracle(mode).execute(q).fetchall()
         assert_equal(got_rows(res), want, False, f"{mode}: {q}")
     assert compared >= 25, f"only {compared} of 40 random queries ran"
@@ -721,6 +733,7 @@ def test_a_frames_formula_columns_are_columns(probe, data, mode):
     ]
     for sql, ordered in queries:
         res = run_probe(probe, sql, {"t": ds.path}, mode=mode, edits=script)
+        assert_source_path(res, mode)
         want = con.execute(sql.replace(" FROM t", " FROM tf")).fetchall()
         assert_equal(got_rows(res), want, ordered, f"{mode}: {sql}")
 

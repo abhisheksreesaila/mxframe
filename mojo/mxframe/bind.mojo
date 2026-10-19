@@ -8,16 +8,13 @@ The binder turns a parsed statement (`sql.mojo`) into a `BoundQuery`:
 It checks types the way DuckDB does for the subset (decimal scales aligned, a string literal read as a DATE next to a
 DATE) and raises with the position of the offending text. Nothing here reads data: the planner and the executor do.
 """
-from std.collections import Dict
-from std.memory import ArcPointer
 from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .parquet import ParquetScan
 from .frame import Frame, Overlay, Formula
-from .expr import (Expr, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO)
+from .expr import N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
 from .csv import days_from_civil, _days_in_month
-from .sql import (SqlStatement, SqlExpr, parse_sql, sql_error, closest, lower_ascii, upper_ascii,
-                  X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE, X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN,
-                  X_IN, X_CALL, EXPLAIN_NONE)
+from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE,
+                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, EXPLAIN_NONE)
 
 comptime K_NULL = 6          # the type of a bare NULL literal
 

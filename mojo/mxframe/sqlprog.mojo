@@ -14,17 +14,16 @@ rules, on the same `Program` type:
 - Every aggregate skips NULL: it is fed `SELECT(nul, identity, value)` and a count of the NULLs it skipped, so that
   SUM / MIN / MAX / AVG of nothing is NULL, which the finishing code reads off `rows - nulls`.
 """
-from std.collections import Dict
-from .table import ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, SharedTable
+from .table import TEXT, BOOL, SharedTable
 from .parquet import ParquetScan
 from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
-                    OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS, CTL_PLACEHOLDER,
-                    A_SUM, A_MIN, A_MAX, _frame_mask, _null_mask)
+                    OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
+                    CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, _frame_mask, _null_mask)
 from .frame import _text_less
-from .bind import (BoundQuery, BExpr, AggSpec, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_STR, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD, B_NEG, B_RESCALE,
-                   B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_LE, C_GT, C_GE, C_EQ, C_NE, F_COUNT_STAR, F_COUNT, F_SUM,
-                   F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_QUANTILE, pow10_checked)
-from .planner import PhysicalPlan, KeyLayout, G_NONE, G_DENSE, G_HASHED
+from .bind import (BoundQuery, BExpr, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
+                   B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_LE, C_GT, C_EQ,
+                   C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked)
+from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
 comptime OP_SUBF = 11        # float x - y
 comptime OP_I2F = 19

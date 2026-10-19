@@ -14,22 +14,19 @@ the changed and appended rows; a scan is one chunk per row group. Each chunk's p
 min / max combine; hashed groups merge by key) folds into one.
 """
 from std.time import perf_counter_ns
-from std.memory import Pointer
-from std.ffi import external_call
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .frame import NULL_EDIT, Overlay, text_ranks, _radix_order, _text_less
-from .parquet import ParquetScan
+from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import (Program, QueryResult, _run_cpu, _run_mat, _merge_partial, _identity_partial, _ScanMask, _group_mask,
-                    OVERFLOW_MESSAGE, CPU, MAGIC, A_SUM, A_MIN, A_MAX, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS)
+                    OVERFLOW_MESSAGE, CPU, MAGIC, A_MIN, A_MAX, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
 from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks
 from .sql import sql_error, EXPLAIN_NONE
-from .bind import (Catalog, SqlSource, BoundQuery, BExpr, AggSpec, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_QUANTILE, K_NULL, kind_name, pow10_checked)
-from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas)
-from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, bkey, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
+from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
+from .planner import Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
+from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, eval_post, float_bits, ld_div
 
 

@@ -12,9 +12,9 @@ What it decides today: the group strategy.
   the group directly: no hashing, the fastest path while the domain is not much bigger than the rows;
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
-from .table import ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
-from .bind import (BoundQuery, BExpr, SqlSource, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
-                   B_NEG, B_RESCALE, kind_name)
+from .table import TEXT, BOOL
+from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
+                   B_NEG, B_RESCALE)
 
 comptime GROUP_AUTO = 0
 comptime GROUP_DENSE = 1

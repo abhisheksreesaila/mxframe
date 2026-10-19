@@ -9,11 +9,10 @@ A value is an Int64 per group (a FLOAT holds a float64's bits) and a flag per gr
 the same flag for unknown.
 """
 from std.math import fma
-from .table import ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .table import INT, DECIMAL, TEXT, BOOL, FLOAT
 from .frame import _text_less
-from .bind import (BoundQuery, BExpr, B_COL, B_LIT, B_STR, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD, B_NEG, B_DIV, B_RESCALE,
-                   B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, B_AGG, B_KEY, C_LT, C_LE, C_GT, C_GE, C_EQ, C_NE, K_NULL, pow10_checked,
-                   kind_name)
+from .bind import (BoundQuery, BExpr, B_LIT, B_STR, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD, B_NEG, B_DIV, B_RESCALE,
+                   B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, B_AGG, B_KEY, C_LT, C_LE, C_GT, C_EQ, C_NE, K_NULL)
 from .sqlprog import DictAccess
 
 comptime OVERFLOW_TEXT = "a sum or an expression passed the int64 range (about 9.2e18)"
