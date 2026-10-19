@@ -299,6 +299,48 @@ fetched into Python; neither is a quiet-machine benchmark). Every result was che
 The same queries over the Parquet file (one chunk per row group) are decode-bound: 80 to 110 ms to decode the three columns of 50 row groups, plus the kernel. A scan with very many groups merges a
 partial result per row group (a dense partial per group is the whole domain), which is slow at 1M groups (1 to 2.5 s): batching row groups and the other big-GROUP-BY work over streamed files is F-158.
 
+### The `mx` command line (F-151, for agents)
+
+`mx` is the SQL of section 8 as one native program, built by `pixi run bash scripts/build_mx.sh` into `build/mx` (no Python in it; the script checks that). A cold `mx sql` on a small
+file starts, runs and exits in about 11 ms wall (20 fresh processes in a shell loop, process creation included).
+
+```
+mx sql "<SQL>" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]
+mx explain [--analyze] "<SQL>" [-t name=path ...] [--format text|json]
+mx schema <file> [--rows N]
+```
+
+- **Files.** `FROM 'orders.parquet'` and `FROM 'orders.csv'` open the file named in the query; `-t name=path` registers a file under a name (`FROM name`). A Parquet file is streamed a row group at a
+  time when it is over a quarter of the machine's memory (or `--stream always`; `--stream never` reads it whole; `--memory BYTES` changes the memory it compares with), otherwise read into memory.
+  The notes say which. A CSV is read whole. The advanced switches `--group auto|dense|hashed`, `--dense-limit N` and `--threads N` are F-150's `PlannerOptions`.
+- **Device.** SQL runs on the CPU. `--device gpu` is accepted and the notes say it ran on the CPU; `device` in the result is `"cpu"`.
+- **Result (stdout, one JSON object).**
+  `{"columns":[{"name","kind","scale"}],"rows":[[...]],"row_count","truncated","ms","device","notes"}`.
+  `kind` is INT, DECIMAL, TEXT, DATE, BOOL or FLOAT. An INT is a JSON integer. **A DECIMAL is a JSON number whose text is exact** (`1234.50`, scale digits kept): parse it with a decimal parser
+  (`json.loads(text, parse_float=Decimal)`), never a float one. A DATE is `"yyyy-mm-dd"`, TEXT is the word, BOOL is `true` / `false`, NULL is `null`. A FLOAT is its shortest round-trip number;
+  infinity and NaN, which JSON cannot hold, are the strings `"Infinity"`, `"-Infinity"` and `"NaN"`. `rows` holds at most `--max-rows` rows (default 1000; 0 means all); `row_count` is the true
+  count and `truncated` says whether `rows` is shorter. `notes` is the planner's account of what ran (section 8): read it to see the group strategy, the columns read, the chunks, any re-run.
+- **Other formats.** `jsonl` is one object per row (`{"k":0,"total":12.50}`), `csv` has a header, NULL is an empty cell, dates and decimals as in JSON. `--out file` writes every row to the file
+  (whatever `--max-rows` says) and prints the JSON summary (`columns`, `row_count`, `ms`, `notes`, `out`, no `rows`). `--format parquet` needs `--out`.
+- **Errors.** A query error (bad SQL, unknown column, unsupported form, a file that cannot be opened) prints `{"error":{"message","line","column","hint"}}` on stdout and exits **1**; `line` and `column`
+  are 1-based into the SQL text (null when the error is not about a position), `hint` carries the "did you mean" suggestion or what to do. A usage error (unknown command or option, wrong
+  number of arguments, a bad value) prints the same object with the usage text as the hint and exits **2**. Exit 0 is success.
+- **`mx explain`** prints the logical and physical plan as text (`--format json`: `{"plan":[lines],"analyzed","ms","notes"}`); `--analyze` also runs the SELECT and adds what ran and the time.
+  `mx sql "EXPLAIN SELECT ..."` works too.
+- **`mx schema file`** (Parquet or CSV): `{"file","format","bytes","rows","row_groups","columns":[{"name","kind","scale","nulls","distinct_words","first_values"}]}`; `distinct_words` is the size of a TEXT
+  column's dictionary (null for other kinds), `first_values` the first `--rows` values (default 5) in the result's JSON form. A Parquet file is read from its footer and a few row groups.
+
+Things an agent should know:
+
+- **A long OR chain fails.** The parser stops expressions nested 256 levels deep, and an `a OR b OR c ...` chain of about 255 terms is that deep. Write `x IN (a, b, c)` instead. A list of **numbers** in
+  an IN takes at most 40 values (`the most is 40`); split a longer one into several queries or filter by a range. A list of text words has no such limit.
+- **A table is one file.** One table per query until joins (F-153); `FROM` is a registered name or a quoted file name. A query without an aggregate (a plain row list) is not supported before F-152:
+  add `count(*)` or a `GROUP BY`.
+- **FLOAT columns in files are refused** (a Parquet DOUBLE column makes the open fail with `MX frame has no kind for it yet`) until F-157; FLOAT appears only as a result (`avg`, `/`, ...).
+- **A footer that lies.** When a Parquet footer's min / max or null count turns out wrong while reading, the query runs again without the statistics and the notes say `statistics: ... ran again without
+  them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.
+- Text order is the owner's (case-insensitive, bytes as the tie-break), so `min(s)` / `ORDER BY s` on text differ from DuckDB's byte order; DECIMAL `median` has one more digit of scale than DuckDB.
+
 ## 9. Later (Query and Explore modes)
 More than one table and joins, SQL row queries, expression functions (M8: F-151 to F-162); pipelines with cached steps; versioned column
 chunks for a time machine and branches; TPC-H through SQL.

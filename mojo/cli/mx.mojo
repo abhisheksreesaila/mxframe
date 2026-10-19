@@ -1,6 +1,6 @@
 # F-151: `mx`, the command line for agents (and people): SQL in, JSON / CSV / Parquet out, EXPLAIN, schema.
 #
-#   mx sql "<SQL>" [-t name=path ...] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|auto]
+#   mx sql "<SQL>" [-t name=path ...] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]
 #   mx explain [--analyze] "<SQL>" [-t name=path ...] [--format text|json]
 #   mx schema <file> [--rows N]
 #
@@ -13,7 +13,7 @@ from mxframe import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HAS
 from mxframe.output import (json_string, columns_json, rows_json, row_jsonl, csv_header, csv_row, cell_json, kind_text)
 from mxframe.parquet import physical_memory
 
-comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|auto]\n"
+comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
                   "       mx explain [--analyze] \"<SQL>\" [-t name=path ...] [--format text|json]\n"
                   "       mx schema <file> [--rows N]\n"
                   "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)")
@@ -54,7 +54,7 @@ def query_error(text: String) raises -> Int:
     elif "(the catalog is empty)" in message or "(the catalog has " in message or "is not open" in message:
         hint = "name the file in the query (FROM 'orders.parquet') or register it with -t name=path"
     elif "joined by `OR`" in message or "joined by `AND`" in message:
-        hint = "a chain of about 255 OR terms hits the depth limit: write x IN (a, b, c) instead"
+        hint = "a chain of about 255 OR terms hits the depth limit: write x IN (a, b, c) instead (a list of numbers takes up to 40 values; text lists are longer)"
     elif "levels deep" in message:
         hint = "flatten the parentheses or NOT chain"
     print(error_json(message, line, col, hint))
@@ -234,9 +234,7 @@ def query_text(args: Args, what: String) raises -> String:
 
 
 def check_device(args: Args):
-    if args.device == "gpu":
-        _ = usage_error("--device gpu: SQL runs on the CPU in this version; use cpu or auto")
-    elif args.device != "cpu" and args.device != "auto":
+    if args.device != "cpu" and args.device != "auto" and args.device != "gpu":
         _ = usage_error("--device is cpu, gpu or auto, found `" + args.device + "`")
 
 
@@ -264,6 +262,8 @@ def cmd_sql(args: Args) raises:
     var text = query_text(args, "mx sql")
     var cat = Catalog()
     var notes = List[String]()
+    if args.device == "gpu":
+        notes.append("device: --device gpu asked for; SQL runs on the CPU in this version")
     var r = SqlResult()
     try:
         open_tables(cat, args, text, notes)

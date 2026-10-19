@@ -76,9 +76,9 @@ def _float_text(v: Int64, quote_special: Bool) -> String:
     var x = Float64(from_bits=UInt64(v))
     if x != x:
         return '"NaN"' if quote_special else "NaN"
-    if x > Float64.MAX:
-        return '"Infinity"' if quote_special else "inf"
-    if x < -Float64.MAX:
+    if x - x != 0.0:                       # inf (Float64.MAX is not a bound: it is inf itself)
+        if x > 0.0:
+            return '"Infinity"' if quote_special else "inf"
         return '"-Infinity"' if quote_special else "-inf"
     return String(x)
 
