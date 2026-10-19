@@ -20,13 +20,17 @@ Kinds, by the first `infer_rows` rows, empty cells ignored:
                                                    (trailing zeros do not count), else scale 4. The stored value is
                                                    parsed from the digits (exact); extra digits round half away
                                                    from zero.
-  a decimal with 5 to 9 places (trailing zeros do      DECIMAL at that scale, exact, when every value in the
-  not count)                                            first rows fits int64 at it (money with more places)
   a number with an exponent (`1e5`, `2.5E-3`), nan /    FLOAT (float64, correctly rounded; every NaN is one NaN).
-  inf / -inf / infinity (any case) beside numbers,      A whole number or a decimal of up to 9 places stays INT /
-  more than 9 decimal places, or a number too wide      DECIMAL, which are exact. `CsvOptions(float_columns=[...])`
-  for int64 at its scale (DuckDB reads those as         reads the named columns as FLOAT whatever the first rows
-  DOUBLE)                                               show. A FLOAT cell that is not a number, or is past about
+  inf / -inf / infinity (any case) beside numbers,      A whole number or a decimal of up to 4 places stays INT /
+  more than 4 decimal places (trailing zeros do not     DECIMAL, which are exact. As DuckDB does, 5 or more places
+  count), or a number too wide for int64 at its scale   is a float: an exact DECIMAL at 5 to 9 places has no wider
+  (DuckDB reads those as DOUBLE)                        integer behind it, so `sum(rate * qty)` would raise
+                                                        "passed the int64 range" where DuckDB answers.
+                                                        `CsvOptions(float_columns=[...])` reads the named columns
+                                                        as FLOAT, `decimal_columns=[...]` as an exact DECIMAL at
+                                                        the scale the first rows need (every value of them checked
+                                                        to fit int64; a later value that does not fit is a failed
+                                                        cell). A FLOAT cell that is not a number, or is past about
                                                         1.8e308, is a failed cell (a null).
   YYYY-MM-DD, or an ISO timestamp                  DATE (days since 1970). A timestamp with a zone offset is
                                                    converted to UTC first, then floored to the day (as the Parquet
@@ -85,7 +89,7 @@ comptime _MAX_CHUNKS = 512
 struct CsvOptions(Copyable, Movable):
     """`delimiter`: one byte, "" picks a tab for `.tsv` / `.tab` files and a comma for the rest. `threads` 0 uses
     every core, 1 parses on one thread (the reference the tests compare to). `chunk_bytes`: the smallest piece
-    given to a thread (lower it only to test). `float_columns`: header names read as FLOAT whatever the first rows show."""
+    given to a thread (lower it only to test). `float_columns`: header names read as FLOAT whatever the first rows show. `decimal_columns`: header names read as an exact DECIMAL at the scale their first rows need (up to 18 places), raising when a value of the first rows is not a plain number or does not fit int64."""
 
     var delimiter: String
     var has_header: Bool
@@ -94,11 +98,13 @@ struct CsvOptions(Copyable, Movable):
     var threads: Int
     var chunk_bytes: Int
     var float_columns: List[String]
+    var decimal_columns: List[String]
 
     def __init__(out self, delimiter: String = "", has_header: Bool = True, max_columns: Int = 4096,
                  infer_rows: Int = 100_000, threads: Int = 0, chunk_bytes: Int = 1 << 22,
-                 var float_columns: List[String] = List[String]()):
+                 var float_columns: List[String] = List[String](), var decimal_columns: List[String] = List[String]()):
         self.float_columns = float_columns^
+        self.decimal_columns = decimal_columns^
         self.delimiter = delimiter
         self.has_header = has_header
         self.max_columns = max_columns
@@ -1125,8 +1131,18 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         var asked = False
         for name in options.float_columns:
             asked = asked or name == names[c]
+        var exact = False
+        for name in options.decimal_columns:
+            exact = exact or name == names[c]
+        if asked and exact:
+            raise Error("column `" + names[c] + "` is named in both float_columns and decimal_columns")
         if asked:
             kind = FLOAT.value
+        elif exact:
+            if s.nonempty > 0 and not s.can_dec:
+                raise Error("column `" + names[c] + "` cannot be read as an exact DECIMAL: a value in its first rows is not a plain number, or does not fit int64 (a DECIMAL holds at most 18 digits)")
+            kind = DECIMAL.value                                  # opt-in: exact at the scale its first rows need (2, 4, or the places up to 18)
+            scale = 2 if s.places <= 2 else 4 if s.places <= 4 else s.places
         elif s.nonempty > 0:
             if s.can_float and s.numeric and s.float_only:
                 kind = FLOAT.value                                # an exponent, nan / inf
@@ -1135,11 +1151,8 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
             elif s.can_dec and s.places <= 4:
                 kind = DECIMAL.value
                 scale = 2 if s.places <= 2 else 4
-            elif s.can_dec and s.places <= 9:
-                kind = DECIMAL.value                              # money with 5 to 9 places: exact at that scale (when every value fits int64)
-                scale = s.places
             elif s.can_float and s.numeric:
-                kind = FLOAT.value                                # more than 9 places, or a number too wide for int64 (DuckDB reads those as DOUBLE)
+                kind = FLOAT.value                                # more than 4 places, or a number too wide for int64 (DuckDB reads those as DOUBLE)
             elif s.can_date:
                 kind = DATE.value
             elif s.can_bool:
@@ -1154,6 +1167,9 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         _ = _walk(data, first_row, size, delim, options.infer_rows, fit)
         for c in range(ncols):
             if kinds[c] == DECIMAL.value and not fit.fits[c]:
+                for name in options.decimal_columns:
+                    if name == names[c]:
+                        raise Error("column `" + names[c] + "` cannot be read as an exact DECIMAL: a value in its first rows does not fit int64 at " + String(scales[c]) + " decimal places")
                 kinds[c] = FLOAT.value if infer.cols[c].can_float and infer.cols[c].numeric else TEXT.value     # too wide at its scale
                 scales[c] = 0
 

@@ -1721,6 +1721,20 @@ def _decode_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raise
             raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
         for i in range(present):
             dout[i] = _to_stored(leaf, raw[i])
+    elif p.encoding == ENC_BYTE_STREAM_SPLIT and leaf.ptype == PT_FIXED:
+        # a big-endian two's-complement decimal of type_length bytes, byte k of value i at k * count + i
+        var w = leaf.type_length
+        if w < 1 or w > 16:
+            raise Error("column `" + leaf.name + "` has a fixed length of " + String(w) + " bytes (corrupt file)")
+        if present > (c.n - c.pos) // w:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var src = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
+        for i in range(present):
+            var v: Int64 = -1 if src[i] >= 0x80 else 0
+            for k in range(max(0, w - 8), w):                 # only the last 8 bytes survive an int64
+                v = (v << 8) | Int64(src[k * present + i])
+            dout[i] = v
+        c.pos += present * w
     elif p.encoding == ENC_BYTE_STREAM_SPLIT and (leaf.ptype == PT_FLOAT or leaf.ptype == PT_DOUBLE or leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64):
         # byte k of value i is stored at k * count + i (the page's non-null values): gather the bytes back; a FLOAT is widened to
         # float64, an INT32 sign-extended (then converted as a PLAIN value is: timestamps, unsigned, decimals)
