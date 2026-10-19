@@ -246,8 +246,17 @@ struct BoundQuery(Movable):
     var having_text: String
     var order_text: List[String]
     var out_text: List[String]
+    # F-152: row queries (no aggregate, no GROUP BY) and SELECT DISTINCT
+    var rows: Bool                   # a row query: `routs` and `rorder` hold its select list and ORDER BY (expressions of `rexprs`)
+    var distinct: Bool               # SELECT DISTINCT (bound as a group-by on the select list)
+    var routs: List[Int]
+    var rorder: List[SortKey]
 
     def __init__(out self):
+        self.rows = False
+        self.distinct = False
+        self.routs = List[Int]()
+        self.rorder = List[SortKey]()
         self.source = -1
         self.rexprs = List[BExpr]()
         self.pexprs = List[BExpr]()

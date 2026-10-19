@@ -25,6 +25,7 @@ from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN
 from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
+from .plan import LogicalPlan, build_plan
 from .planner import Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, eval_post, float_bits, ld_div
@@ -432,40 +433,9 @@ def delta_table(src: SqlSource, cols: List[Int]) raises -> SharedTable:
 
 # ── text for EXPLAIN ─────────────────────────────────────────────────────────────────────────────────
 
-def _logical_text(q: BoundQuery, src: SqlSource) -> List[String]:
-    var lines = List[String]()
-    if q.limit >= 0 or q.offset > 0:
-        lines.append("Limit " + (String(q.limit) if q.limit >= 0 else "all") + (" offset " + String(q.offset) if q.offset > 0 else ""))
-    if len(q.order) > 0:
-        var s = String("Sort ")
-        for k in range(len(q.order_text)):
-            s += (", " if k > 0 else "") + q.order_text[k]
-        lines.append(s)
-    var proj = String("Project ")
-    for k in range(len(q.out_text)):
-        proj += (", " if k > 0 else "") + q.out_text[k]
-    lines.append(proj)
-    if q.having >= 0:
-        lines.append("Filter (HAVING) " + q.having_text)
-    var agg = String("Aggregate")
-    if len(q.keys) > 0:
-        agg += " keys=["
-        for k in range(len(q.keys)):
-            agg += (", " if k > 0 else "") + q.keys[k].name
-        agg += "]"
-    agg += " aggs=["
-    for k in range(len(q.aggs)):
-        agg += (", " if k > 0 else "") + q.aggs[k].name
-    lines.append(agg + "]")
-    if q.where >= 0:
-        lines.append("Filter (WHERE) " + q.where_text)
-    lines.append("Scan " + src.name)
-    return lines^
-
-
-def _explain_text(q: BoundQuery, src: SqlSource, notes: List[String]) -> String:
+def _explain_text(lp: LogicalPlan, notes: List[String]) -> String:
     var out = String("Logical plan\n")
-    var lines = _logical_text(q, src)
+    var lines = lp.lines()
     for i in range(len(lines)):
         out += "  " * (1 + i) + lines[i] + "\n"
     out += "Physical plan\n"
@@ -1305,11 +1275,12 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
     res.notes = plan.notes.copy()
     if lie.byte_length() > 0:
         res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
+    var lp = build_plan(q, src.name)
     var inp = _inputs(src, q, trust)
     var sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
     _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
     if q.explain != EXPLAIN_NONE:
-        res.explain = _explain_text(q, src, res.notes)
+        res.explain = _explain_text(lp, res.notes)
         var t = Table.empty()
         var c = t.add_column("plan", TEXT)
         for line in res.explain.split("\n"):
@@ -1321,7 +1292,7 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
     var notes = res.notes.copy()
     res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
     res.notes = notes^
-    res.explain = _explain_text(q, src, res.notes)
+    res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
     return res^
 
