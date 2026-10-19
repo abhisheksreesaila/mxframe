@@ -20,7 +20,10 @@ import os
 import re
 import sys
 
-TAKE = re.compile(r"(?<![\w.\])])([A-Za-z_]\w*)((?:\.\w+)*)((?:\[[^\]]*\])*)\.unsafe_ptr\(\)|(?<![\w.])([A-Za-z_]\w*)\.(?:i64|i32|u8)\(")
+# an address taken from a local: `xs.unsafe_ptr()`, `xs[i].unsafe_ptr()`, `run.i64(`, `UnsafePointer(to=x)`,
+# `s.as_bytes().unsafe_ptr()` (groups 1, 4, 5, 6 name the local)
+TAKE = re.compile(r"(?<![\w.\])])([A-Za-z_]\w*)((?:\.\w+)*)((?:\[[^\]]*\])*)\.unsafe_ptr\(\)|(?<![\w.])([A-Za-z_]\w*)\.(?:i64|i32|u8)\("
+                  r"|UnsafePointer\(to=([A-Za-z_]\w*)\)|(?<![\w.])([A-Za-z_]\w*)\.as_bytes\(\)\.unsafe_ptr\(\)")
 DEF = re.compile(r"^(\s*)def \w+")
 
 
@@ -83,17 +86,17 @@ def check(path):
             if "# lifetime: ok" in rbody[i]:
                 continue
             for m in TAKE.finditer(line):
-                root = m.group(1) or m.group(4)
+                root = m.group(1) or m.group(4) or m.group(5) or m.group(6)
                 if m.group(1) and m.group(2):                        # a field of something: `self.x`, `look.table` (the owner keeps it)
                     continue
-                last[root] = i
-        for name, at in last.items():
+                last[root] = (i, m.end())
+        for name, (at, col) in last.items():
             if name == "self":
                 continue
             declared = any(re.search(rf"\bvar {name}\b", l) for l in cbody[:at + 1])
             if not declared:                                         # a parameter or a `ref`: the caller owns it
                 continue
-            later = "\n".join(cbody[at + 1:])
+            later = cbody[at][col:] + "\n" + "\n".join(cbody[at + 1:])   # a use later on the same line counts (`f(UnsafePointer(to=n)) or n != 0`)
             if not re.search(rf"\b{name}\b", later):
                 bad.append((path, start + at + 1, name))
     return bad
