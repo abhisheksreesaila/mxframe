@@ -784,7 +784,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         right.cols = List[Int]()                                     # nothing of the right table is carried
         rneed = List[Int]()
     var t_build = perf_counter_ns()
-    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads)
+    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads, semi_anti)
     if fmode == PM_ANTI_NA:
         unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], lrows)
     var t_probe = perf_counter_ns()

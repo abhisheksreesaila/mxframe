@@ -107,7 +107,8 @@ struct JoinMap(Movable):
     var lo: Int64                    # the lowest and highest usable key
     var hi: Int64
     var span: Int                    # direct: hi - lo + 1
-    var unique: Bool                 # no key repeats
+    var unique: Bool                 # no key repeats (a presence-only map says True: it keeps one row per key)
+    var presence: Bool               # built by `hj_build(presence=True)` as a direct array of marks
     var pbits: Int                   # hash: 1 << pbits partitions
     var u: Int                       # direct, unique: Int32[span]  build row or -1
     var s: Int                       # direct, repeated: Int32[span]  end offset in r of each key's rows
@@ -125,6 +126,7 @@ struct JoinMap(Movable):
         self.hi = 0
         self.span = 0
         self.unique = True
+        self.presence = False
         self.pbits = 0
         self.u = 0
         self.s = 0
@@ -145,6 +147,8 @@ struct JoinMap(Movable):
     def kind(self) -> String:
         if self.mode == MODE_EMPTY:
             return "empty"
+        if self.presence:
+            return "direct array, presence marks only"
         var base = "direct array" if self.mode == MODE_DIRECT else "hash table (" + String(1 << self.pbits) + " partitions)"
         return base + (", unique keys" if self.unique else ", repeated keys (CSR rows)")
 
@@ -195,8 +199,10 @@ def _part_of(k: Int64, direct: Bool, base: Int64, pshift: Int, pbits: Int) -> In
 
 # ── build ────────────────────────────────────────────────────────────────────────────────────────────
 
-def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int) -> JoinMap:
-    """The map of the build side's keys. See the module doc for the layout it chooses."""
+def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = False) -> JoinMap:
+    """The map of the build side's keys. See the module doc for the layout it chooses. `presence`: the caller only asks whether a key is present (semi and
+    anti joins: `hj_probe_select`, `hj_filter_block`): keys that fit a direct array are then marked in one pass (any row of the key will do, no repeated-key
+    rows are kept), which is cheaper than the CSR build; the map answers presence lookups only (`hj_probe_unique` / `hj_probe_pairs` would see an arbitrary row)."""
     var m = JoinMap()
     m.n = n
     if n <= 0:
@@ -240,6 +246,29 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int) -> JoinMap:
     var span_u = UInt64(hi) - UInt64(lo)
     var direct = span_u < UInt64(DIRECT_MAX) and Int(span_u) + 1 <= max(DIRECT_FACTOR * nvalid, DIRECT_MIN_RANGE)
     var span = Int(span_u) + 1 if direct else 0
+    if presence and direct:
+        m.mode = MODE_DIRECT
+        m.span = span
+        m.unique = True
+        m.presence = True
+        var marks = IP(unsafe_from_address=_alloc(4 * span))
+        m.u = Int(marks)
+        m.bytes = 4 * span
+        var TS = max(1, min(T, (span + 65535) // 65536))
+
+        def clear(t: Int) {imm}:
+            for d in range(_slice(span, t, TS), _slice(span, t + 1, TS)):
+                marks[d] = -1
+
+        def mark(t: Int) {imm}:
+            for i in range(_slice(n, t, T), _slice(n, t + 1, T)):
+                if has_ok and oks[i] == 0:
+                    continue
+                marks[Int(keys[i] - lo)] = Int32(i)               # rows of one key race to write: whichever lands, the key is marked
+
+        par_n(clear, TS, TS)
+        par_n(mark, T, T)
+        return m^
     # ── the partitions: direct ones are runs of consecutive keys (a partition owns a stretch of the array), hash ones the hash's top bits
     var pshift = 0
     var P = 1

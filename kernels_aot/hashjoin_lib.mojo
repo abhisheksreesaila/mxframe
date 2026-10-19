@@ -3,6 +3,7 @@ F-153: the hash join kernel as a shared library (`libmxhashjoin_cpu.so`), C ABI 
 caller that is not Mojo. The kernel itself is `hashjoin_cpu.mojo`; this file only boxes a `JoinMap` behind an integer handle.
 
     h = mx_hj_build(keys, ok, n, threads)              keys Int64[n], ok UInt8[n] or 0; a handle (> 0), or a negative error
+    mx_hj_build_presence(keys, ok, n, threads)         the same, for a map only mx_hj_probe_select will read (a semi or anti join): cheaper to build
     mx_hj_info(h, out)                                 out Int64[4]: mode (0 empty, 1 direct array, 2 hash table), usable rows, 1 when keys are unique, bytes held
     mx_hj_probe_unique(h, keys, ok, n, out, threads)   unique-key maps: out Int32[n] gets each probe row's build row or -1
     mx_hj_probe_pairs(h, keys, ok, n, threads, budget_rows, out)
@@ -26,7 +27,7 @@ from hashjoin_cpu import JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_
 
 comptime ABI_VERSION = 1
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
-comptime HEADER = 15
+comptime HEADER = 16
 comptime E_BAD_HANDLE = -33          # a handle that is not a map (0, or an error code from mx_hj_build)
 
 
@@ -39,6 +40,7 @@ def _box(var m: JoinMap) -> Int:
     h[4] = m.hi
     h[5] = Int64(m.span)
     h[6] = 1 if m.unique else 0
+    h[15] = 1 if m.presence else 0
     h[7] = Int64(m.pbits)
     h[8] = Int64(m.u)
     h[9] = Int64(m.s)
@@ -71,6 +73,7 @@ def _unbox(handle: Int) -> JoinMap:
     m.hi = h[4]
     m.span = Int(h[5])
     m.unique = h[6] != 0
+    m.presence = h[15] != 0
     m.pbits = Int(h[7])
     m.u = Int(h[8])
     m.s = Int(h[9])
@@ -98,6 +101,14 @@ def mx_hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int) abi("C") -> Int:
     if n < 0 or n >= (1 << 31):
         return -31
     return _box(hj_build(keys_a, ok_a, n, threads))
+
+
+@export
+def mx_hj_build_presence(keys_a: Int, ok_a: Int, n: Int, threads: Int) abi("C") -> Int:
+    """A map for `mx_hj_probe_select` only (semi and anti joins): cheaper to build, its probes by build row are meaningless."""
+    if n < 0 or n >= (1 << 31):
+        return -31
+    return _box(hj_build(keys_a, ok_a, n, threads, True))
 
 
 @export

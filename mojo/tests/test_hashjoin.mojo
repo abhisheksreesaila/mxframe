@@ -111,43 +111,45 @@ def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[I
             expect(Int(opr[k]) == want_pr[k] and Int(obr[k]) == want_br[k], name + ": outer pair " + String(k))
     hj_release(Int(oo[1]))
     hj_release(Int(oo[2]))
-    # presence filters: semi, anti, null-aware anti, none; whole probe side and the fused block form over every second row
-    for fm in [PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE]:
-        var want_rows = List[Int]()
-        for i in range(np):
-            var usable = not (len(probe_ok) > 0 and probe_ok[i] == 0)
-            var present = usable and probe[i] in truth
-            var keep = False
-            if fm == PM_SEMI:
-                keep = present
-            elif fm == PM_ANTI:
-                keep = not present
-            elif fm == PM_ANTI_NA:
-                keep = usable and not present
-            if keep:
-                want_rows.append(i)
-        var so = List[Int64](length=2, fill=0)
-        _ = hj_probe_select(m, Int(probe.unsafe_ptr()), pok, np, threads, fm, Int(so.unsafe_ptr()))
-        expect(Int(so[0]) == len(want_rows), name + ": select mode " + String(fm) + " kept " + String(Int(so[0])) + " wanted " + String(len(want_rows)))
-        expect((Int(so[1]) == 0) == (len(want_rows) == 0), name + ": select mode " + String(fm) + " allocates only when rows are kept")
-        if len(want_rows) > 0:
-            var got = IP(unsafe_from_address=Int(so[1]))
+    # presence filters (on the regular map and on the presence-only map): semi, anti, null-aware anti, none; whole probe side and the fused block form over every second row
+    for pres in [False, True]:
+        var mm = hj_build(Int(build.unsafe_ptr()), bok, nb, threads, pres)
+        for fm in [PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE]:
+            var want_rows = List[Int]()
+            for i in range(np):
+                var usable = not (len(probe_ok) > 0 and probe_ok[i] == 0)
+                var present = usable and probe[i] in truth
+                var keep = False
+                if fm == PM_SEMI:
+                    keep = present
+                elif fm == PM_ANTI:
+                    keep = not present
+                elif fm == PM_ANTI_NA:
+                    keep = usable and not present
+                if keep:
+                    want_rows.append(i)
+            var so = List[Int64](length=2, fill=0)
+            _ = hj_probe_select(mm, Int(probe.unsafe_ptr()), pok, np, threads, fm, Int(so.unsafe_ptr()))
+            expect(Int(so[0]) == len(want_rows), name + ": select(pres=" + String(pres) + ") mode " + String(fm) + " kept " + String(Int(so[0])) + " wanted " + String(len(want_rows)))
+            expect((Int(so[1]) == 0) == (len(want_rows) == 0), name + ": select(pres=" + String(pres) + ") mode " + String(fm) + " allocates only when rows are kept")
+            if len(want_rows) > 0:
+                var got = IP(unsafe_from_address=Int(so[1]))
+                for k in range(len(want_rows)):
+                    expect(Int(got[k]) == want_rows[k], name + ": select(pres=" + String(pres) + ") mode " + String(fm) + " row " + String(k))
+            hj_release(Int(so[1]))
+            var bsel = List[Int32](length=np + 1, fill=0)
+            var bn = 0
+            for i in range(0, np, 2):
+                bsel[bn] = Int32(i)
+                bn += 1
+            var bkept = hj_filter_block(MapView(mm), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                                        pok != 0, 0, IP(unsafe_from_address=Int(bsel.unsafe_ptr())), bn, fm)
+            var bq = 0
             for k in range(len(want_rows)):
-                expect(Int(got[k]) == want_rows[k], name + ": select mode " + String(fm) + " row " + String(k))
-        hj_release(Int(so[1]))
-        var bsel = List[Int32](length=np + 1, fill=0)
-        var bn = 0
-        for i in range(0, np, 2):
-            bsel[bn] = Int32(i)
-            bn += 1
-        var bkept = hj_filter_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
-                                    pok != 0, 0, IP(unsafe_from_address=Int(bsel.unsafe_ptr())), bn, fm)
-        var bq = 0
-        for k in range(len(want_rows)):
-            if want_rows[k] % 2 == 0:
-                expect(Int(bsel[bq]) == want_rows[k], name + ": filter block mode " + String(fm) + " row " + String(want_rows[k]))
-                bq += 1
-        expect(bkept == bq, name + ": filter block mode " + String(fm) + " kept " + String(bkept) + " wanted " + String(bq))
+                if want_rows[k] % 2 == 0:
+                    expect(Int(bsel[bq]) == want_rows[k], name + ": filter block(pres=" + String(pres) + ") mode " + String(fm) + " row " + String(want_rows[k]))
+                    bq += 1
+            expect(bkept == bq, name + ": filter block(pres=" + String(pres) + ") mode " + String(fm) + " kept " + String(bkept) + " wanted " + String(bq))
     # unique lookups
     if want_unique and want_mode != MODE_EMPTY:
         var res = List[Int32](length=np, fill=0)

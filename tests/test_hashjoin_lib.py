@@ -11,7 +11,7 @@ LIB = Path(__file__).resolve().parent.parent / "kernels_aot" / "libmxhashjoin_cp
 @pytest.fixture(scope="module")
 def lib():
     L = ctypes.CDLL(str(LIB))
-    for name in ("mx_hj_build", "mx_hj_info", "mx_hj_probe_unique", "mx_hj_probe_pairs", "mx_hj_probe_pairs_outer", "mx_hj_probe_select", "mx_hj_abi_version", "mx_hj_init_runtime"):
+    for name in ("mx_hj_build", "mx_hj_build_presence", "mx_hj_info", "mx_hj_probe_unique", "mx_hj_probe_pairs", "mx_hj_probe_pairs_outer", "mx_hj_probe_select", "mx_hj_abi_version", "mx_hj_init_runtime"):
         getattr(L, name).restype = ctypes.c_long
     L.mx_hj_init_runtime()
     return L
@@ -154,4 +154,14 @@ def test_outer_pairs_give_every_unmatched_row_a_minus_one_partner(lib):
     assert list(zip(pr, br)) == [(0, 1), (0, 2), (1, -1), (2, 0)]
     lib.mx_hj_release_array(ctypes.c_long(out[1]))
     lib.mx_hj_release_array(ctypes.c_long(out[2]))
+    lib.mx_hj_free(ctypes.c_long(h))
+
+
+def test_a_presence_map_answers_semi_and_anti_selects(lib):
+    keys = [5, 5, 6, 9, 1000]
+    k = array("q", keys)
+    h = lib.mx_hj_build_presence(ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(5), ctypes.c_long(2))
+    assert h > 0
+    assert run_select(lib, h, [5, 7, 9, 1000, 6, 4], 2) == [0, 2, 3, 4]
+    assert run_select(lib, h, [5, 7, 9, 1000, 6, 4], 3) == [1, 5]
     lib.mx_hj_free(ctypes.c_long(h))
