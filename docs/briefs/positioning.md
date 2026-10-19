@@ -15,6 +15,9 @@ SQLite. (Renamed from MX frame: F-165.)
 3. **An embedded engine for apps:** a compiled library, no Python, callable from Mojo or any language through a C
    interface. The first app is omxplorer; others can follow (BI, spreadsheets, trading, IoT, on-device analytics on
    Mac and phones).
+   **Pairs with omxapp:** omxapp (the Mojo framework for building apps once and running them natively on Linux,
+   macOS, iPhone, Android and the web) + omxcore (the data engine) = a full stack for data apps with no Python and no
+   server: the app and its engine compile into one native binary. omxplorer is the first app built this way.
 4. **A data engine for AI agents:** `mx` returns JSON with exact errors, starts in 12 ms, and needs no Python
    environment. An MCP server around it makes omxcore the default data tool for agents.
 5. **The compute half of a lakehouse:** Parquet today; Delta Lake / Iceberg tables if apps need them (M9, parked).
