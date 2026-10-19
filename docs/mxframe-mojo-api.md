@@ -301,7 +301,7 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 **A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
 `x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
 
-**Limits**: one table (joins: F-153); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
+**Limits**: inner joins only, see 8b (the others: F-154); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
 at most 48 registers (about 20 aggregates over different expressions) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
 Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
@@ -396,15 +396,45 @@ Things an agent should know:
 
 - **A long OR chain fails.** The parser stops expressions nested 256 levels deep, and an `a OR b OR c ...` chain of about 255 terms is that deep. Write `x IN (a, b, c)` instead. A list of **numbers** in
   an IN takes at most 40 values (`the most is 40`); split a longer one into several queries or filter by a range. A list of text words has no such limit.
-- **A table is one file.** One table per query until joins (F-153); `FROM` is a registered name or a quoted file name. A row query (`SELECT *`, `WHERE`, `ORDER BY`, `LIMIT`) works; `--max-rows` caps what is printed
+- **A table is one file.** `FROM` is a registered name or a quoted file name; a second file is registered with another `-t name=path` or named in the query (joins: section 8b). A row query (`SELECT *`, `WHERE`, `ORDER BY`, `LIMIT`) works; `--max-rows` caps what is printed
   (default 1000, `row_count` is the real count).
 - **A Parquet file with a DOUBLE (or FLOAT) column opens (F-157).** FLOAT is a column kind: see "FLOAT64 (F-157)" in section 1 for the rules (NaN order, -0.0, the reproducible sum, a 32-bit column compared with a literal in 32 bits). A Parquet text value that is not UTF-8 is refused.
 - **A footer that lies.** When a Parquet footer's min / max or null count turns out wrong while reading, the query runs again without the statistics and the notes say `statistics: ... ran again without
   them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.
 - Text order is the owner's (case-insensitive, bytes as the tie-break), so `min(s)` / `ORDER BY s` on text differ from DuckDB's byte order; DECIMAL `median` has one more digit of scale than DuckDB.
 
+## 8b. Joins (F-153)
+
+The inner equi-join is an engine feature: a catalog of named sources (tables, Frames, Parquet scans), the PlanNode IR with two Scans under a Join, a hash join
+kernel, and two ways to run it. It names no application; SQL, `Query.join`, the Python engine and any other caller use the same code.
+
+**SQL**: `FROM a JOIN b ON a.k = b.k [AND ...]`, `JOIN ... USING (k)` (`SELECT *` keeps the left columns, then the right minus the USING columns), and a comma join
+whose WHERE has the equalities (`FROM a, b WHERE a.k = b.k`). A name is `alias.column` or a bare column that only one side has; a bare name both sides have raises
+(`ambiguous`), joining a table with itself needs two aliases. Only inner joins: `LEFT JOIN` and the others are refused by name (F-154). Non-equality conditions in ON
+and WHERE conditions over both sides run after the join. The aggregates, `GROUP BY`, `ORDER BY` and `LIMIT` of section 8 work over the joined rows.
+
+**Builder**: `Query(left).join(right: SharedTable, left_on, right_on)` returns a query over the joined rows (this table's columns, then the other's; a repeated name gets a
+suffix `_1`). It must come first and works over plain tables; the rest of the builder's rules apply after it.
+
+**Keys (exactness)**: a NULL key never matches. TEXT keys match by bytes across dictionaries (a once-per-dictionary translation of codes), so `West` is not `west`
+(only ordering ignores case). INT is a DECIMAL of scale 0 and scales are aligned (a value that overflows when aligned cannot equal anything). FLOAT keys follow
+DuckDB: -0.0 = 0.0 and NaN = NaN. int64 keys past 2^53 are exact. DATE against INT, text against a number and a narrowed column are refused with a message. Several
+keys are packed into one int64 when the build side's ranges multiply to fewer than 2^62 values; otherwise they are hashed and the candidate pairs are verified against the columns.
+
+**Paths** (the `notes` say which ran: `join build side:`, `join keys:`, `join path:`, `join time:`):
+- The build side is the side with fewer rows after its own filters (each side is first reduced to the columns the query needs, by a row query over its source, so a Frame's edits,
+  a scan's row groups and a one-side filter are all applied; an unfiltered plain table is read in place).
+- *fused*: the build keys are unique. The probe table is scanned by the aggregate pipeline; each block's rows look their partner up (direct array or hash table, with prefetch) and
+  the partner's columns are gathered into per-worker scratch. No joined row is written.
+- *materialized*: repeated build keys, hashed composite keys, holistic aggregates (median, percentiles, distinct, top-k) or a row query: the matching (probe, build) pairs are counted
+  first, gathered into a Table, and the query runs over that. Past the memory budget (3 GiB of joined values) it raises a readable error (spill is deferred). `mx --join materialize` forces it.
+
+**The kernel** (`kernels_aot/hashjoin_cpu.mojo`; Mojo API and `libmxhashjoin_cpu.so` with a C ABI over a handle, `hashjoin_lib.mojo`): int64 keys and an optional `ok` byte array in, build rows
+out. `hj_build` picks a direct array (range at most max(8n, 2^20) and 2^28; CSR rows when keys repeat) or radix partitions sized from L2 with linear probing and a presence bitmap; the build
+is parallel without atomics. `hj_probe_unique`, `hj_probe_pairs` (budgeted) and `hj_probe_block` (fused) probe it. The engine-level steps (`normalize_keys`, `join_pairs`, `gather_join`) are in `joincore.mojo`.
+
 ## 9. Later (Query and Explore modes)
-More than one table and joins, SQL row queries, expression functions (M8: F-151 to F-162); pipelines with cached steps; versioned column
+Outer joins and subqueries, multi-way joins, expression functions (M8: F-154 to F-162); pipelines with cached steps; versioned column
 chunks for a time machine and branches; TPC-H through SQL.
 
 ## Memory rules
