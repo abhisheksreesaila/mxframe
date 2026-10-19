@@ -225,6 +225,14 @@ comptime X_CALL = 14        # text: the function's name in upper case; items: it
 comptime X_FLT = 15         # text: digits with an exponent (a DOUBLE literal)
 comptime X_SUBIN = 16       # a IN (SELECT ...): a: the left side; items[0]: the subquery (`st.subs`); flag: NOT IN
 comptime X_EXISTS = 17      # EXISTS (SELECT ...): items[0]: the subquery; flag: NOT EXISTS
+# F-156: expressions
+comptime X_CASE = 18        # a: the operand of a simple CASE (-1 for a searched one); items: when, then, when, then ...; c: the ELSE (-1 for none)
+comptime X_CAST = 19        # a: the operand; text: the type name in upper case (INTEGER, BIGINT, SMALLINT, TINYINT, DECIMAL, DOUBLE, REAL, VARCHAR, DATE, BOOLEAN);
+                            # b: precision (-1 for none), c: scale (-1 for none); flag: TRY_CAST
+comptime X_LIKE = 20        # a: the value; b: the pattern; c: the ESCAPE (-1 for none); text: LIKE or ILIKE; flag: NOT
+comptime X_DISTINCT = 21    # a IS DISTINCT FROM b; flag: IS NOT DISTINCT FROM
+comptime X_INTERVAL = 22    # INTERVAL n unit: a: the amount; text: the unit (DAY, WEEK, MONTH, YEAR) in upper case
+comptime X_ISBOOL = 23      # a IS [NOT] TRUE / FALSE: a: the operand; text: TRUE or FALSE; flag: NOT
 
 comptime JK_INNER = 0       # the kinds of join (F-154); the semi and anti joins keep only the left table's rows and columns
 comptime JK_LEFT = 1
@@ -393,6 +401,30 @@ struct SqlStatement(Movable):
             return self.render_operand(x.a) + (" NOT IN (SELECT ...)" if x.flag else " IN (SELECT ...)")
         if x.kind == X_EXISTS:
             return "NOT EXISTS (SELECT ...)" if x.flag else "EXISTS (SELECT ...)"
+        if x.kind == X_CASE:
+            var s = String("CASE")
+            if x.a >= 0:
+                s += " " + self.render_operand(x.a)
+            var k = 0
+            while k + 1 < len(x.items):
+                s += " WHEN " + self.render(x.items[k]) + " THEN " + self.render(x.items[k + 1])
+                k += 2
+            if x.c >= 0:
+                s += " ELSE " + self.render(x.c)
+            return s + " END"
+        if x.kind == X_CAST:
+            var ty = x.text
+            if x.b >= 0:
+                ty += "(" + String(x.b) + ("," + String(x.c) if x.c >= 0 else "") + ")"
+            return ("TRY_CAST(" if x.flag else "CAST(") + self.render(x.a) + " AS " + ty + ")"
+        if x.kind == X_LIKE:
+            return self.render_operand(x.a) + (" NOT " if x.flag else " ") + x.text + " " + self.render_operand(x.b) + ((" ESCAPE " + self.render(x.c)) if x.c >= 0 else "")
+        if x.kind == X_DISTINCT:
+            return self.render_operand(x.a) + (" IS NOT DISTINCT FROM " if x.flag else " IS DISTINCT FROM ") + self.render_operand(x.b)
+        if x.kind == X_INTERVAL:
+            return "INTERVAL " + self.render_operand(x.a) + " " + x.text
+        if x.kind == X_ISBOOL:
+            return self.render_operand(x.a) + (" IS NOT " if x.flag else " IS ") + x.text
         var s = x.text.lower() + "("
         if x.a == 1:
             s += "*"
@@ -404,7 +436,7 @@ struct SqlStatement(Movable):
 
     def render_operand(self, e: Int) -> String:
         var k = self.exprs[e].kind
-        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG or k == X_SUBIN:
+        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG or k == X_SUBIN or k == X_LIKE or k == X_DISTINCT or k == X_ISBOOL:
             return "(" + self.render(e) + ")"
         return self.render(e)
 
@@ -544,6 +576,19 @@ struct _Parser(Movable):
                              " allowed (a chain of that many terms joined by `" + (text if text.byte_length() > 0 else "an operator") + "` counts)")
         self.depths.append(d + 1)
         return self.add(SqlExpr(kind, text, String(), a, b, c, List[Int](), flag, t.line, t.col))
+
+    def node_items(mut self, kind: Int, text: String, a: Int, b: Int, c: Int, var items: List[Int], t: Token, flag: Bool = False) raises -> Int:
+        """A node whose operands are a list (CASE): its depth counts its items too."""
+        var d = 0
+        for k in [a, b, c]:
+            if k >= 0:
+                d = max(d, self.depths[k])
+        for k in items:
+            d = max(d, self.depths[k])
+        if d + 1 > MAX_DEPTH:
+            raise _tok_error(t, "this expression is " + String(d + 1) + " levels deep, more than the " + String(MAX_DEPTH) + " allowed")
+        self.depths.append(d + 1)
+        return self.add(SqlExpr(kind, text, String(), a, b, c, items^, flag, t.line, t.col))
 
     # -- statement
     def statement(mut self) raises:
@@ -900,9 +945,18 @@ struct _Parser(Movable):
                 _ = self.advance()
                 return self.node(X_ISNULL, "", left, -1, -1, t, neg)
             var u = self.tok()
-            if u.kind == T_IDENT and (u.up == "TRUE" or u.up == "FALSE" or u.up == "DISTINCT" or u.up == "UNKNOWN"):
-                raise self.unsupported(u, "`IS " + ("NOT " if neg else "") + u.up + "`", "F-156")
-            raise self.expected("NULL after IS")
+            if u.kind == T_IDENT and u.up == "DISTINCT":
+                _ = self.advance()
+                _ = self.expect_kw("FROM")
+                var right = self.add_expr()
+                return self.node(X_DISTINCT, "", left, right, -1, t, neg)
+            if u.kind == T_IDENT and (u.up == "TRUE" or u.up == "FALSE"):
+                _ = self.advance()
+                return self.node(X_ISBOOL, u.up, left, -1, -1, t, neg)
+            if u.kind == T_IDENT and u.up == "UNKNOWN":                  # a boolean that is unknown is NULL
+                _ = self.advance()
+                return self.node(X_ISNULL, "", left, -1, -1, t, neg)
+            raise self.expected("NULL, TRUE, FALSE or DISTINCT FROM after IS")
         var neg = False
         var at = t.copy()
         if t.kind == T_IDENT and t.up == "NOT" and (self.is_kw("BETWEEN", 1) or self.is_kw("IN", 1) or self.is_kw("LIKE", 1) or
@@ -934,16 +988,22 @@ struct _Parser(Movable):
                 break
             _ = self.expect_sym(")")
             return id
-        if at.kind == T_IDENT and (at.up == "LIKE" or at.up == "ILIKE" or at.up == "GLOB" or at.up == "SIMILAR"):
-            raise self.unsupported(at, "`" + ("NOT " if neg else "") + at.up + "`", "F-156")
+        if at.kind == T_IDENT and (at.up == "LIKE" or at.up == "ILIKE"):
+            _ = self.advance()
+            var pat = self.add_expr()
+            var esc = -1
+            if self.is_kw("ESCAPE"):
+                _ = self.advance()
+                esc = self.add_expr()
+            return self.node(X_LIKE, at.up, left, pat, esc, at, neg)
+        if at.kind == T_IDENT and (at.up == "GLOB" or at.up == "SIMILAR"):
+            raise self.unsupported(at, "`" + ("NOT " if neg else "") + at.up + "`", "")
         return left
 
     def add_expr(mut self) raises -> Int:
         var left = self.mul_expr()
         while self.is_sym("+") or self.is_sym("-") or self.is_sym("||"):
             var t = self.advance()
-            if t.text == "||":
-                raise self.unsupported(t, "`||` (string concatenation)", "F-156")
             var right = self.mul_expr()
             left = self.node(X_BIN, t.text, left, right, -1, t)
         return left
@@ -976,9 +1036,72 @@ struct _Parser(Movable):
 
     def postfix(mut self) raises -> Int:
         var e = self.primary()
-        if self.is_sym("::"):
-            raise self.unsupported(self.tok(), "`::` (a cast)", "F-156")
+        while self.is_sym("::"):
+            var t = self.advance()
+            e = self.cast_node(e, t, False)
         return e
+
+    def type_spec(mut self) raises -> Tuple[String, Int, Int]:
+        """A type name for CAST: its canonical upper-case name, precision and scale (-1 for none)."""
+        var t = self.tok()
+        if t.kind != T_IDENT:
+            raise self.expected("a type name")
+        _ = self.advance()
+        var w = t.up
+        var name = String()
+        if w == "INT" or w == "INTEGER" or w == "INT4" or w == "SIGNED":
+            name = "INTEGER"
+        elif w == "BIGINT" or w == "INT8" or w == "LONG":
+            name = "BIGINT"
+        elif w == "SMALLINT" or w == "INT2" or w == "SHORT":
+            name = "SMALLINT"
+        elif w == "TINYINT" or w == "INT1":
+            name = "TINYINT"
+        elif w == "DECIMAL" or w == "NUMERIC":
+            name = "DECIMAL"
+        elif w == "DOUBLE" or w == "FLOAT8":
+            name = "DOUBLE"
+            if w == "DOUBLE" and self.is_kw("PRECISION"):
+                _ = self.advance()
+        elif w == "FLOAT" or w == "FLOAT4" or w == "REAL":
+            name = "REAL"
+        elif w == "VARCHAR" or w == "TEXT" or w == "STRING" or w == "CHAR" or w == "BPCHAR":
+            name = "VARCHAR"
+        elif w == "DATE":
+            name = "DATE"
+        elif w == "BOOLEAN" or w == "BOOL" or w == "LOGICAL":
+            name = "BOOLEAN"
+        else:
+            raise self.unsupported(t, "the type `" + t.text + "` in a cast (the casts are INTEGER, BIGINT, SMALLINT, TINYINT, DECIMAL(p, s), DOUBLE, REAL, VARCHAR, DATE and BOOLEAN)", "")
+        var prec = -1
+        var scale = -1
+        if self.is_sym("("):
+            _ = self.advance()
+            var a = self.tok()
+            if a.kind != T_INT:
+                raise self.expected("a number")
+            _ = self.advance()
+            prec = Int(a.text)
+            if self.is_sym(","):
+                _ = self.advance()
+                var b = self.tok()
+                if b.kind != T_INT:
+                    raise self.expected("a number")
+                _ = self.advance()
+                scale = Int(b.text)
+            _ = self.expect_sym(")")
+            if name != "DECIMAL" and name != "VARCHAR":
+                raise _tok_error(a, "the type " + name + " takes no size")
+            if name == "VARCHAR" and scale >= 0:
+                raise _tok_error(a, "VARCHAR takes one size")
+        return (name, prec, scale)
+
+    def cast_node(mut self, operand: Int, t: Token, try_: Bool) raises -> Int:
+        var ty = self.type_spec()
+        var id = self.node(X_CAST, ty[0], operand, -1, -1, t, try_)
+        self.st.exprs[id].b = ty[1]                                  # (not operands: the precision and scale)
+        self.st.exprs[id].c = ty[2]
+        return id
 
     def primary(mut self) raises -> Int:
         var t = self.tok()
@@ -1030,11 +1153,34 @@ struct _Parser(Movable):
             var next_string = self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == T_STR
             var next_paren = self.is_sym("(", 1)
             if w == "CASE":
-                raise self.unsupported(t, "`CASE`", "F-156")
-            if (w == "CAST" or w == "TRY_CAST" or w == "EXTRACT") and next_paren:
-                raise self.unsupported(t, "`" + w + "(...)`", "F-156")
-            if (w == "TIMESTAMP" or w == "TIME" or w == "INTERVAL") and next_string:
-                raise self.unsupported(t, "`" + w + "` literals", "F-156")
+                return self.case_expr()
+            if (w == "CAST" or w == "TRY_CAST") and next_paren:
+                _ = self.advance()
+                _ = self.advance()
+                var operand = self.expr()
+                _ = self.expect_kw("AS")
+                var cid = self.cast_node(operand, t, w == "TRY_CAST")
+                _ = self.expect_sym(")")
+                return cid
+            if w == "EXTRACT" and next_paren:
+                _ = self.advance()
+                _ = self.advance()
+                var pt = self.tok()
+                if pt.kind != T_IDENT and pt.kind != T_STR:
+                    raise self.expected("a date part (year, month, day, ...)")
+                _ = self.advance()
+                _ = self.expect_kw("FROM")
+                var arg = self.expr()
+                _ = self.expect_sym(")")
+                var part = self.node(X_STR, lower_ascii(pt.text), -1, -1, -1, pt)
+                var eid = self.node(X_CALL, "EXTRACT", 0, -1, -1, t)
+                self.st.exprs[eid].items.append(part)
+                self.st.exprs[eid].items.append(arg)
+                return eid
+            if w == "INTERVAL" and (next_string or self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == T_INT or next_paren):
+                return self.interval_expr()
+            if (w == "TIMESTAMP" or w == "TIME") and next_string:
+                raise self.unsupported(t, "`" + w + "` literals", "MX frame has no timestamp kind")
             if (w == "ARRAY" or w == "STRUCT" or w == "MAP" or w == "LIST") and next_paren:
                 raise self.unsupported(t, "`" + w + "` values", "")
             if w == "EXISTS" or (w == "NOT" and self.is_kw("EXISTS", 1)):
@@ -1056,6 +1202,80 @@ struct _Parser(Movable):
                 return self.call(t)
             return self.column_rest(t)
         raise self.expected("an expression")
+
+    def case_expr(mut self) raises -> Int:
+        var t = self.advance()                                                   # CASE
+        var operand = -1
+        if not self.is_kw("WHEN"):
+            operand = self.expr()
+        var items = List[Int]()
+        while self.is_kw("WHEN"):
+            _ = self.advance()
+            items.append(self.expr())
+            _ = self.expect_kw("THEN")
+            items.append(self.expr())
+        if len(items) == 0:
+            raise self.expected("WHEN")
+        var else_ = -1
+        if self.is_kw("ELSE"):
+            _ = self.advance()
+            else_ = self.expr()
+        _ = self.expect_kw("END")
+        return self.node_items(X_CASE, "", operand, -1, else_, items^, t)
+
+    def interval_expr(mut self) raises -> Int:
+        """`INTERVAL 3 DAY`, `INTERVAL '3' DAY`, `INTERVAL '3 days'`, `INTERVAL (n) MONTH`: a number of days, weeks, months or years (an operand of a date's + and -)."""
+        var t = self.advance()                                                   # INTERVAL
+        var amount = -1
+        var unit = String()
+        var u = self.tok()
+        if u.kind == T_STR:
+            _ = self.advance()
+            var parts = List[String]()
+            for part in u.text.split(" "):
+                if part.byte_length() > 0:
+                    parts.append(String(part))
+            if len(parts) == 0 or len(parts) > 2:
+                raise self.unsupported(u, "the interval '" + u.text + "' (write one amount and one unit: INTERVAL '3' MONTH)", "")
+            var digits = parts[0]
+            var db = digits.as_bytes()
+            var ok = len(db) > 0
+            for i in range(len(db)):
+                if not (_is_digit(db[i]) or (i == 0 and db[i] == UInt8(45) and len(db) > 1)):
+                    ok = False
+            if not ok:
+                raise self.unsupported(u, "the interval amount '" + digits + "' (a whole number)", "")
+            amount = self.node(X_INT, digits, -1, -1, -1, u)
+            if len(parts) == 2:
+                unit = upper_ascii(parts[1])
+            else:
+                var ut = self.tok()
+                if ut.kind != T_IDENT:
+                    raise self.expected("a unit (DAY, WEEK, MONTH or YEAR)")
+                _ = self.advance()
+                unit = ut.up
+        else:
+            if u.kind == T_INT:
+                _ = self.advance()
+                amount = self.node(X_INT, u.text, -1, -1, -1, u)
+            elif self.is_sym("("):
+                _ = self.advance()
+                amount = self.expr()
+                _ = self.expect_sym(")")
+            else:
+                raise self.expected("an interval amount (a number, a string such as '3', or an expression in parentheses)")
+            var ut = self.tok()
+            if ut.kind != T_IDENT:
+                raise self.expected("a unit (DAY, WEEK, MONTH or YEAR)")
+            _ = self.advance()
+            unit = ut.up
+        if unit.byte_length() > 1 and unit.as_bytes()[unit.byte_length() - 1] == UInt8(83):         # DAYS -> DAY
+            var cut = unit.byte_length() - 1
+            var trimmed = String(unit[byte=0:cut])
+            unit = trimmed^
+        if unit != "DAY" and unit != "WEEK" and unit != "MONTH" and unit != "YEAR":
+            raise self.unsupported(t, "an interval in " + unit.lower() + "s", "MX frame has no timestamp kind: days, weeks, months and years only")
+        return self.node(X_INTERVAL, unit, amount, -1, -1, t)
 
     def column_rest(mut self, first: Token) raises -> Int:
         if self.is_sym("."):
@@ -1092,6 +1312,14 @@ struct _Parser(Movable):
                     if self.is_sym(","):
                         _ = self.advance()
                         continue
+                    if (name.up == "SUBSTRING" or name.up == "SUBSTR") and len(self.st.exprs[id].items) == 1 and self.is_kw("FROM"):
+                        _ = self.advance()                                       # SUBSTRING(s FROM 2 FOR 3)
+                        var from_e = self.expr()
+                        self.st.exprs[id].items.append(from_e)
+                        if self.is_kw("FOR"):
+                            _ = self.advance()
+                            var for_e = self.expr()
+                            self.st.exprs[id].items.append(for_e)
                     break
             if self.is_kw("ORDER"):
                 raise self.unsupported(self.tok(), "`ORDER BY` inside " + name.up + "(...)", "")

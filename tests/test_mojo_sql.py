@@ -722,8 +722,8 @@ def test_a_duplicate_output_name_gets_a_suffix(probe, data):
 def test_the_register_limit_is_an_sql_error(probe, data):
     aggs = ", ".join(f"sum(x + {i})" for i in range(40))
     res = run_probe(probe, f"SELECT k, {aggs} FROM t GROUP BY k", {"t": data["g8"].path}, expect_error=True)
-    assert res["error"] == ("SQL error at line 1, column 8: the query is too big for one program (more than 48 registers): it holds too many "
-                            "aggregates over different expressions (about 20); split the select list into two queries"), res
+    assert res["error"] == ("SQL error at line 1, column 8: the query needs more than 48 registers (the select list's aggregates and expressions are too many "
+                            "or too long for one program: about 20 aggregates over different expressions, fewer when an expression is long); split it into two queries"), res
 
 
 # ── files whose footer statistics lie ────────────────────────────────────────────────────────────────

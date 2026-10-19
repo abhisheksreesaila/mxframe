@@ -242,7 +242,7 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
     else:
         rc = run.hashed(keyw, nkw, t.rows(), threads, res_r)
     if rc == -7 or rc == E_OVERFLOW:
-        raise Error(overflow_message(sp.p.has_float))
+        raise Error(overflow_message(sp.p.has_float, sp.p.conv_text()))
     if rc != 0:
         raise Error("the hashed group-by kernel failed with code " + String(rc))
     return _hashed_result(run, res_r, sp.p.n_slots, nkw)
@@ -283,7 +283,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     for k in range(len(plan.keys)):
         ref lay = plan.keys[k]
         var vc = ValCol(lay.kind, lay.scale, n)
-        vc.src = lay.src
+        vc.src = lay.src if lay.src >= 0 else q.rexprs[lay.expr].src          # a derived TEXT key (lower(s), CASE ...): its own dictionary
         for i in range(n):
             if plan.group == G_DENSE:
                 var part = (gids[i] // lay.stride) % lay.radix
@@ -374,7 +374,7 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
         var kind = A_DISTINCT if sa.func == F_COUNT_DISTINCT else A_MEDIAN if sa.func == F_MEDIAN else A_PCT
         specs.append(HolSpec(a, kind, sa.p, 0, sp.agg_src[a]))
         if sa.func != F_COUNT_DISTINCT and q.rexprs[sa.arg].kind == TEXT.value and len(ranks[sp.agg_src[a]]) == 0:
-            var c = Int(q.rexprs[sa.arg].value)
+            var c = q.rexprs[sa.arg].src                       # (a derived TEXT value: its own dictionary)
             var words = List[String]()
             for k in range(dicts.count(c)):
                 words.append(dicts.word(c, k))
@@ -397,7 +397,7 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
     else:
         rc = run.fused(_no_keys, front, fs.ws_bytes, False, 1, 0, t.rows(), threads)
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float))
+        raise Error(overflow_message(p.has_float, p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     return _make_result(p, run.out_vals, run.out_cnt)
@@ -551,7 +551,7 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
         run.control(ctl)
         var rc = run.keyed(_hmat_hook, G, done, end, threads)
         if rc == E_OVERFLOW:
-            raise Error(overflow_message(p.has_float))
+            raise Error(overflow_message(p.has_float, p.conv_text()))
         if rc != 0:
             raise Error("the CPU kernel failed with code " + String(rc))
         for s in range(p.n_src):
@@ -562,12 +562,12 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
 
 def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int) raises -> SqlProgram:
     try:
-        return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
+        return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, dicts.share(),
                          _alias_lists(src), inp.masked, phase)
     except e:
         var msg = String(e)
-        if msg.startswith("the query is too big for one program"):
-            raise sql_error(q.line, q.col, msg + ": it holds too many aggregates over different expressions (about 20); split the select list into two queries")
+        if msg.startswith("the query needs more than"):
+            raise sql_error(q.line, q.col, msg + " (the select list's aggregates and expressions are too many or too long for one program: about 20 aggregates over different expressions, fewer when an expression is long); split it into two queries")
         if msg.startswith("the query has more than"):
             raise sql_error(q.line, q.col, msg + " (a program holds 64 different numbers); split the query in two")
         raise e^
@@ -583,6 +583,9 @@ def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: Dict
     notes.append("columns read: " + (names if k > 0 else "none") + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
     notes.append("kernel: " + String(sp.instr) + " instructions a row" + (", " + String(len(sp.set_meta) // 3) + " sets" if len(sp.set_meta) > 0 else "") +
                  " (" + String(sp.p.n_slots) + (" slot" if sp.p.n_slots == 1 else " slots") + ")")
+    if sp.p.text_tabs > 0:
+        notes.append("text: " + String(sp.p.text_tabs) + " per-word " + ("table" if sp.p.text_tabs == 1 else "tables") + " over " + String(sp.p.text_words) +
+                     " dictionary words (each text function ran once per word, never per row)")
     if plan.group == G_HASHED and plan.holistic:
         notes.append("holistic: a second pass maps each row to its group for count(DISTINCT), median, quantile_disc and min / max of TEXT")
     notes.append("device: CPU (SQL runs on the CPU)")

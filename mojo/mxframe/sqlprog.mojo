@@ -14,16 +14,22 @@ rules, on the same `Program` type:
 - Every aggregate skips NULL: it is fed `SELECT(nul, identity, value)` and a count of the NULLs it skipped, so that
   SUM / MIN / MAX / AVG of nothing is NULL, which the finishing code reads off `rows - nulls`.
 """
-from .table import TEXT, BOOL, FLOAT, F32_COLUMN, SharedTable
+from std.collections import Dict
+from std.memory import ArcPointer
+from .table import TEXT, BOOL, FLOAT, INT, DECIMAL, DATE, F32_COLUMN, SharedTable
 from .parquet import ParquetScan
+from .kernels.pipeline_cpu import LP
 from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
                     CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, A_FSUM, A_FMIN, A_FMAX, _frame_mask, _null_mask,
                     OP_LOAD_COL, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX, NAN_AWARE)
-from .frame import _text_less
+from .frame import _text_less, text_ranks
 from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
-                   C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked)
+                   C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
+                   B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, DERIVED_BASE)
+from .sqlfn import (TFn, CaseTables, parse_text, TF_LOWER, TF_UPPER, TF_LIKE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
+                    DP_DECADE, DP_WEEK, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
 comptime OP_F32 = 34
@@ -31,18 +37,64 @@ comptime OP_SUBF = 11        # float x - y
 comptime OP_I2F = 19
 comptime OP_SELECT = 35
 comptime OP_IN_SET = 37
+comptime OP_FLOOR = 33
+comptime OP_TAB = 47            # F-156: dst = table[a - lo] (a TEXT function's answer per dictionary word)
+comptime OP_ISET = 48           # F-156: dst = 1.0 when the int64 is in a hash set (an IN list of any length)
+comptime OP_FLAG = 49           # F-156: the error flag, set where a cast met a value it cannot convert
+comptime CONCAT_LIMIT = 1 << 20     # the most pairs of words a || of two columns builds
+
+
+struct DerivedStore(Movable):
+    """The dictionaries a query's own TEXT expressions make (a text function's answers, a CASE over words, a constant word), by `src - DERIVED_BASE`.
+    Every DictAccess of one query shares it, so the words the program was lowered with are the words the result is read with."""
+    var words: List[List[String]]
+    var built: List[Bool]
+    var index: List[Dict[String, Int]]
+
+    def __init__(out self):
+        self.words = List[List[String]]()
+        self.built = List[Bool]()
+        self.index = List[Dict[String, Int]]()
+
+    def put(mut self, i: Int, var ws: List[String]):
+        while len(self.words) <= i:
+            self.words.append(List[String]())
+            self.built.append(False)
+            self.index.append(Dict[String, Int]())
+        var ix = Dict[String, Int]()
+        for k in range(len(ws)):
+            ix[ws[k]] = k
+        self.words[i] = ws^
+        self.index[i] = ix^
+        self.built[i] = True
 
 
 struct DictAccess(Movable):
-    """The words of a source's TEXT columns: a table's or a scan's dictionary, then the words a frame's session added."""
+    """The words of a source's TEXT columns: a table's or a scan's dictionary, then the words a frame's session added; and the dictionaries the query's own
+    TEXT expressions make (a `src` from DERIVED_BASE on)."""
     var table: SharedTable
     var scan: Optional[ParquetScan]
     var extra: List[List[String]]
+    var store: ArcPointer[DerivedStore]
 
     def __init__(out self, table: SharedTable, scan: Optional[ParquetScan], extra: List[List[String]]):
         self.table = table
         self.scan = scan.copy()
         self.extra = extra.copy()
+        self.store = ArcPointer(DerivedStore())
+
+    def share(self) -> DictAccess:
+        """The same words, and the same derived dictionaries (not a copy of them)."""
+        var d = DictAccess(self.table, self.scan, self.extra)
+        d.store = self.store
+        return d^
+
+    def has_derived(self, c: Int) -> Bool:
+        var i = c - DERIVED_BASE
+        return c >= DERIVED_BASE and i < len(self.store[].built) and self.store[].built[i]
+
+    def set_derived(self, c: Int, var words: List[String]):
+        self.store[].put(c - DERIVED_BASE, words^)
 
     def base_count(self, c: Int) raises -> Int:
         if self.scan:
@@ -50,15 +102,24 @@ struct DictAccess(Movable):
         return len(self.table.dictionary(c))
 
     def count(self, c: Int) raises -> Int:
+        if c >= DERIVED_BASE:
+            if not self.has_derived(c):
+                raise Error("internal: the dictionary of expression " + String(c - DERIVED_BASE) + " was read before it was made")
+            return len(self.store[].words[c - DERIVED_BASE])
         return self.base_count(c) + (len(self.extra[c]) if c < len(self.extra) else 0)
 
     def word(self, c: Int, code: Int) raises -> String:
+        if c >= DERIVED_BASE:
+            return self.store[].words[c - DERIVED_BASE][code]
         var b = self.base_count(c)
         if code < b:
             return self.scan.value().text_of(c, code) if self.scan else self.table.text_of(c, code)
         return self.extra[c][code - b]
 
     def code_of(self, c: Int, w: String) raises -> Int:
+        if c >= DERIVED_BASE:
+            var hit = self.store[].index[c - DERIVED_BASE].get(w)
+            return hit.value() if hit else -1
         var k = self.scan.value().code_of(c, w) if self.scan else self.table.code_of(c, w)
         if k >= 0:
             return k
@@ -155,6 +216,33 @@ def collect_columns(q: BoundQuery) -> List[Int]:
     return seen^
 
 
+struct TextUnion(Copyable, Movable):
+    """The dictionary of a CASE / COALESCE over words: its words once each, and for every value its codes in it (`tabs`), or the code of a constant (`lit`)."""
+    var words: List[String]
+    var index: Dict[String, Int]
+    var tabs: List[List[Int64]]
+    var lit: List[Int]
+    var identity: List[Bool]
+
+    def __init__(out self):
+        self.words = List[String]()
+        self.index = Dict[String, Int]()
+        self.tabs = List[List[Int64]]()
+        self.lit = List[Int]()
+        self.identity = List[Bool]()
+
+    def add(mut self, w: String) -> Int:
+        var hit = self.index.get(w)
+        if hit:
+            return hit.value()
+        self.index[w] = len(self.words)
+        self.words.append(w)
+        return len(self.words) - 1
+
+    def is_identity(self, j: Int) -> Bool:
+        return j < len(self.identity) and self.identity[j]
+
+
 struct _Emitter(Movable):
     var p: Program
     var rx: List[BExpr]
@@ -166,9 +254,17 @@ struct _Emitter(Movable):
     var dicts: DictAccess
     var set_bytes: List[UInt8]
     var set_meta: List[Int64]
+    var case_tabs: Optional[CaseTables]
+    var ents: Dict[Int, List[Int64]]     # F-156: per derived TEXT / INT node, its per-word table (code or answer per code of the dictionary it reads)
+    var unions: Dict[Int, TextUnion]     # ... and per CASE / COALESCE over words, its dictionary
+    var guard: Int                   # F-156: the register that says where the expression being emitted is live (a CASE branch), -1 for everywhere
 
     def __init__(out self, var p: Program, var rx: List[BExpr], var nullable: List[Bool], var pos: List[Int],
                  var aliases: List[List[Int]], var dicts: DictAccess):
+        self.case_tabs = None
+        self.ents = Dict[Int, List[Int64]]()
+        self.unions = Dict[Int, TextUnion]()
+        self.guard = -1
         self.p = p^
         self.rx = rx^
         self.nullable = nullable^
@@ -191,7 +287,7 @@ struct _Emitter(Movable):
                 self.live[r] = True
                 return r
             r -= 1
-        raise Error("the query is too big for one program (more than " + String(MAX_REGS) + " registers)")
+        raise Error("the query needs more than " + String(MAX_REGS) + " registers")
 
     def free(mut self, r: Int):
         if r >= self.kept_next and r < MAX_REGS:
@@ -206,7 +302,7 @@ struct _Emitter(Movable):
     def keep(mut self, r: Int) raises -> Int:
         """Copies register r into one that lives to the end of the program."""
         if self.kept_next >= MAX_REGS or self.live[self.kept_next]:
-            raise Error("the query is too big for one program (more than " + String(MAX_REGS) + " registers)")
+            raise Error("the query needs more than " + String(MAX_REGS) + " registers")
         var k = self.kept_next
         self.kept_next += 1
         self.live[k] = True
@@ -263,6 +359,27 @@ struct _Emitter(Movable):
                 nul = self.tmp()
                 self.ins(OP_ISNULL, nul, _null_mask(self.p, self.pos[c]))
             return V(r, nul, False, x.kind == FLOAT.value)
+        if x.op == B_STR:                                      # a constant word: a dictionary of one word, code 0
+            self.prep_dict(e)
+            return V(self.const_i(0), -1, False)
+        if x.op == B_CASE:
+            return self.case_generic(e, False)
+        if x.op == B_COALESCE:
+            return self.coalesce_generic(e, False)
+        if x.op == B_CAST:
+            return self.cast_value(e)
+        if x.op == B_TFN:
+            return self.tfn_value(e)
+        if x.op == B_CONCAT:
+            return self.concat_value(e)
+        if x.op == B_DATEPART:
+            return self.datepart_value(x)
+        if x.op == B_DATETRUNC:
+            return self.datetrunc_value(x)
+        if x.op == B_ADDMONTHS:
+            return self.addmonths_value(x)
+        if x.op == B_DATEDIFF:
+            return self.datediff_value(x)
         if x.op == B_LIT:
             return V(self.const_i(x.value), -1, False, x.kind == FLOAT.value)       # (a float literal's value is its bits: the constant pool holds bits)
         if x.op == B_NULL:
@@ -328,6 +445,1296 @@ struct _Emitter(Movable):
             self.free(b.reg)
             return V(a.reg, self.or_nul(a.nul, b.nul), False)
         raise Error("internal: expression kind " + String(x.op) + " is not a row-level value")
+
+    # ── F-156: tables, text, CASE, CAST, dates ────────────────────────────────────────────────────────────
+
+    def map_case(mut self, w: String, up: Bool) raises -> String:
+        if not self.case_tabs:
+            self.case_tabs = CaseTables()
+        return self.case_tabs.value().map(w, up)
+
+    def add_tab(mut self, entries: List[Int64], lo: Int) -> Int:
+        """A table for OP_TAB: `entries` as 8-byte words in the program's set bytes (8-aligned); returns its set number."""
+        var at = len(self.set_bytes)
+        var off = (at + 7) // 8 * 8
+        self.set_bytes.resize(off + 8 * max(len(entries), 1), 0)
+        var base = LP(unsafe_from_address=Int(self.set_bytes.unsafe_ptr()) + off)
+        for i in range(len(entries)):
+            base[i] = entries[i]
+        self.set_meta.append(Int64(off))
+        self.set_meta.append(Int64(len(entries)))
+        self.set_meta.append(Int64(lo))
+        return len(self.set_meta) // 3 - 1
+
+    def tab(mut self, reg: Int, entries: List[Int64], lo: Int = 0):
+        """reg = entries[reg - lo], in place (0 outside the table)."""
+        var s = self.add_tab(entries, lo)
+        self.ins(OP_TAB, reg, reg, s)
+
+    def dict_has(self, d: Int) -> Bool:
+        return self.dicts.has_derived(d)
+
+    def truth(mut self, cond: Int) raises -> Int:
+        """A register that is 1.0 where the condition is true and 0.0 where it is false or unknown."""
+        var w = self.boolean(cond)
+        if w.unk:
+            var one = self.const_f(1.0)
+            self.ins(24, w.reg, w.reg, one)
+            self.free(one)
+        return w.reg
+
+    def blend(mut self, mask: Int, a: V, b: V) raises -> V:
+        """mask != 0 ? a : b, value and NULL flag. Frees a and b; the mask stays."""
+        var r = self.tmp()
+        self.ins(OP_SELECT, r, mask, a.reg, b.reg)
+        var nul = -1
+        if a.nul >= 0 or b.nul >= 0:
+            nul = self.tmp()
+            var za = a.nul
+            var zb = b.nul
+            var zero = -1
+            if za < 0 or zb < 0:
+                zero = self.const_f(0.0)
+            self.ins(OP_SELECT, nul, mask, za if za >= 0 else zero, zb if zb >= 0 else zero)
+            if zero >= 0:
+                self.free(zero)
+        self.free(a.reg)
+        self.free(b.reg)
+        self.free(a.nul)
+        self.free(b.nul)
+        return V(r, nul, a.unk or b.unk, a.fl or b.fl)
+
+    def guard_with(mut self, take: Int) raises -> Int:
+        """The register that says where an expression is live: the outer guard AND `take` (a fresh register; -1 for no guard)."""
+        if take < 0:
+            return self.guard
+        var g = self.tmp()
+        if self.guard >= 0:
+            self.ins(OP_AND, g, self.guard, take)
+        else:
+            self.p.emit(OP_IMAX, g, take, take)
+        return g
+
+    def flag_errors(mut self, bad: Int, nul: Int, why: String) raises:
+        """Where `bad` is 1.0 on a row that is live (and not NULL) the query fails: the kernel's error flag (OP_FLAG)."""
+        var t = self.tmp()
+        if nul >= 0:
+            var z = self.const_f(0.0)
+            self.ins(OP_SELECT, t, nul, z, bad)
+            self.free(z)
+        else:
+            self.p.emit(OP_IMAX, t, bad, bad)
+        if self.guard >= 0:
+            self.ins(OP_AND, t, t, self.guard)
+        self.ins(OP_FLAG, t, t)
+        self.free(t)
+        self.p.add_conv(why)
+
+    # -- text values
+    # -- text values: the dictionary of a derived TEXT node is made once, before anything reads it
+    def derive_words(mut self, node: Int, var words: List[String]):
+        self.dicts.set_derived(self.rx[node].src, words^)
+
+    def make_tfn(self, x: BExpr) -> TFn:
+        var strs = List[String]()
+        var ints = List[Int]()
+        for it in x.items:
+            if self.rx[it].op == B_STR:
+                strs.append(self.rx[it].text)
+            else:
+                ints.append(Int(self.rx[it].value))
+        return TFn(Int(x.value) & 0xFF, Int(x.value) >> 8, strs, ints)
+
+    def tfn_word(mut self, t: TFn, w: String) raises -> String:
+        if t.func == TF_LOWER or t.func == TF_UPPER:
+            return self.map_case(w, t.func == TF_UPPER)
+        return t.to_text(w)
+
+    def prep_dict(mut self, e: Int) raises:
+        """Makes the dictionary of TEXT node e when it is a derived one (a constant word, a text function's answers, a ||, a CASE over words), and first the
+        dictionaries of the nodes it reads. Idempotent: a node used twice is made once."""
+        var x = self.rx[e].copy()
+        if x.kind != TEXT.value:
+            return
+        if x.op == B_STR:
+            if not self.dicts.has_derived(x.src):
+                var ws = List[String]()
+                ws.append(x.text)
+                self.derive_words(e, ws^)
+            return
+        if x.op == B_TFN:
+            if e in self.ents:
+                return
+            self.prep_dict(x.a)
+            var t = self.make_tfn(x)
+            var d = self.rx[x.a].src
+            var n = self.dicts.count(d)
+            var ents = List[Int64](length=n, fill=0)
+            var words = List[String]()
+            var seen = Dict[String, Int]()
+            for k in range(n):
+                var w = self.tfn_word(t, self.dicts.word(d, k))
+                var hit = seen.get(w)
+                if hit:
+                    ents[k] = Int64(hit.value())
+                else:
+                    seen[w] = len(words)
+                    ents[k] = Int64(len(words))
+                    words.append(w)
+            self.derive_words(e, words^)
+            self.ents[e] = ents^
+            self.p.text_tabs += 1
+            self.p.text_words += n
+            return
+        if x.op == B_CONCAT:
+            if e in self.ents:
+                return
+            self.prep_concat(e, x)
+            return
+        if x.op == B_CASE or x.op == B_COALESCE:
+            if e in self.unions:
+                return
+            var vals = List[Int]()
+            if x.op == B_CASE:
+                var nw = Int(x.value)
+                for k in range(nw):
+                    vals.append(x.items[2 * k + 1])
+                vals.append(x.items[2 * nw])
+            else:
+                vals = x.items.copy()
+            for v in vals:
+                self.prep_dict(v)
+            var u = self.make_union(vals)
+            self.derive_words(e, u.words.copy())
+            self.unions[e] = u^
+            return
+        if x.op == B_CAST:                                         # a boolean as text: 'false' and 'true' are the codes 0 and 1
+            if not self.dicts.has_derived(x.src):
+                var ws = List[String]()
+                ws.append("false")
+                ws.append("true")
+                self.derive_words(e, ws^)
+            return
+
+    def prep_concat(mut self, e: Int, x: BExpr) raises:
+        var skip = x.value != 0
+        var xa = self.rx[x.a].copy()
+        var xb = self.rx[x.b].copy()
+        var a_lit = xa.op == B_STR
+        var b_lit = xb.op == B_STR
+        var words = List[String]()
+        var seen = Dict[String, Int]()
+        var plus = 1 if skip else 0                               # concat(): a NULL word is '' (one more entry)
+        if a_lit and b_lit:
+            raise Error("internal: a || of two constants reached the program")
+        if a_lit != b_lit:                                        # one value and one constant
+            var vn = x.b if a_lit else x.a
+            self.prep_dict(vn)
+            var lit = xa.text if a_lit else xb.text
+            var d = self.rx[vn].src
+            var n = self.dicts.count(d)
+            var ents = List[Int64](length=n + plus, fill=0)
+            for k in range(n + plus):
+                var w = self.dicts.word(d, k) if k < n else String()
+                var s = lit + w if a_lit else w + lit
+                var hit = seen.get(s)
+                if hit:
+                    ents[k] = Int64(hit.value())
+                else:
+                    seen[s] = len(words)
+                    ents[k] = Int64(len(words))
+                    words.append(s)
+            self.p.text_words += n
+            self.derive_words(e, words^)
+            self.ents[e] = ents^
+            self.p.text_tabs += 1
+            return
+        self.prep_dict(x.a)
+        self.prep_dict(x.b)
+        var da = self.rx[x.a].src
+        var db = self.rx[x.b].src
+        var na = self.dicts.count(da)
+        var nb = self.dicts.count(db)
+        var total = (na + plus) * (nb + plus)
+        if total > CONCAT_LIMIT:
+            raise Error("concatenating two columns whose dictionaries hold " + String(na) + " and " + String(nb) + " distinct words needs " + String(total) +
+                        " combinations (the most is " + String(CONCAT_LIMIT) + "): MX frame builds the result's words once per pair of words, never per row")
+        var ents = List[Int64](length=max(total, 1), fill=0)
+        for i in range(na + plus):
+            var wa = self.dicts.word(da, i) if i < na else String()
+            for j in range(nb + plus):
+                var s = wa + (self.dicts.word(db, j) if j < nb else String())
+                var hit = seen.get(s)
+                var k = i * (nb + plus) + j
+                if hit:
+                    ents[k] = Int64(hit.value())
+                else:
+                    seen[s] = len(words)
+                    ents[k] = Int64(len(words))
+                    words.append(s)
+        self.p.text_words += na + nb
+        self.derive_words(e, words^)
+        self.ents[e] = ents^
+        self.p.text_tabs += 1
+
+    def make_union(mut self, vals: List[Int]) raises -> TextUnion:
+        """The dictionary of a CASE / COALESCE over words: every constant word and every word of each value's dictionary, once; per value the codes in it."""
+        var u = TextUnion()
+        for j in range(len(vals)):
+            var x = self.rx[vals[j]].copy()
+            if x.op == B_NULL:
+                u.tabs.append(List[Int64]())
+                u.lit.append(-1)
+                u.identity.append(False)
+                continue
+            if x.op == B_STR:
+                u.tabs.append(List[Int64]())
+                u.lit.append(u.add(x.text))
+                u.identity.append(False)
+                continue
+            var d = x.src
+            var n = self.dicts.count(d)
+            var tab = List[Int64](length=n, fill=0)
+            var identity = True
+            for k in range(n):
+                var c = u.add(self.dicts.word(d, k))
+                tab[k] = Int64(c)
+                identity = identity and c == k
+            u.tabs.append(tab^)
+            u.lit.append(-1)
+            u.identity.append(identity)
+        return u^
+
+    def tfn_value(mut self, e: Int) raises -> V:
+        """A text function over a TEXT value: evaluated on each word of the value's dictionary once, the answers a table the kernel looks the codes up in."""
+        var x = self.rx[e].copy()
+        if x.kind == TEXT.value:
+            self.prep_dict(e)
+        elif e not in self.ents:
+            self.prep_dict(x.a)
+            var t = self.make_tfn(x)
+            var d = self.rx[x.a].src
+            var n = self.dicts.count(d)
+            var ents = List[Int64](length=n, fill=0)
+            for k in range(n):
+                ents[k] = Int64(t.to_int(self.dicts.word(d, k)))
+            self.ents[e] = ents^
+            self.p.text_tabs += 1
+            self.p.text_words += n
+        var v = self.value(x.a)
+        self.tab(v.reg, self.ents[e].copy())
+        return V(v.reg, v.nul, False)
+
+    def tfn_bool(mut self, e: Int) raises -> V:
+        var x = self.rx[e].copy()
+        self.prep_dict(x.a)
+        var t = self.make_tfn(x)
+        var d = self.rx[x.a].src
+        var n = self.dicts.count(d)
+        var v = self.value(x.a)
+        var bytes = List[UInt8](length=max(n, 1), fill=0)
+        var ilike = t.func == TF_LIKE and (t.flags & 1) != 0
+        for k in range(n):
+            var w = self.dicts.word(d, k)
+            if ilike:
+                w = self.map_case(w, False)
+            bytes[k] = 1 if t.to_bool(w) else 0
+        var r = self.tmp()
+        self.ins(OP_I2F, r, v.reg)
+        self.free(v.reg)
+        var set_at = self.add_set(bytes, 0)
+        self.ins(OP_IN_SET, r, r, set_at)
+        self.p.text_tabs += 1
+        self.p.text_words += n
+        return self.with_unknown(r, v.nul)
+
+    def concat_value(mut self, e: Int) raises -> V:
+        """a || b: each pair of words is one word of the result's dictionary (one side a constant: one entry per word of the other)."""
+        var x = self.rx[e].copy()
+        self.prep_dict(e)
+        var skip = x.value != 0
+        var a_lit = self.rx[x.a].op == B_STR
+        var b_lit = self.rx[x.b].op == B_STR
+        var plus = 1 if skip else 0
+        if a_lit != b_lit:
+            var vn = x.b if a_lit else x.a
+            var n = self.dicts.count(self.rx[vn].src)
+            var v = self.value(vn)
+            var nul = v.nul
+            if skip and v.nul >= 0:                               # a NULL reads as the one more entry
+                var nc = self.const_i(Int64(n))
+                self.ins(OP_SELECT, v.reg, v.nul, nc, v.reg)
+                self.free(nc)
+                self.free(v.nul)
+                nul = -1
+            self.tab(v.reg, self.ents[e].copy())
+            return V(v.reg, nul, False)
+        var na = self.dicts.count(self.rx[x.a].src)
+        var nb = self.dicts.count(self.rx[x.b].src)
+        var va = self.value(x.a)
+        var vb = self.value(x.b)
+        var nul = -1
+        if skip:
+            if va.nul >= 0:
+                var nc = self.const_i(Int64(na))
+                self.ins(OP_SELECT, va.reg, va.nul, nc, va.reg)
+                self.free(nc)
+                self.free(va.nul)
+            if vb.nul >= 0:
+                var nc2 = self.const_i(Int64(nb))
+                self.ins(OP_SELECT, vb.reg, vb.nul, nc2, vb.reg)
+                self.free(nc2)
+                self.free(vb.nul)
+        else:
+            nul = self.or_nul(va.nul, vb.nul)
+        var m = self.const_i(Int64(nb + plus))
+        self.ins(OP_IMUL, va.reg, va.reg, m)
+        self.free(m)
+        self.ins(OP_IADD, va.reg, va.reg, vb.reg)
+        self.free(vb.reg)
+        self.tab(va.reg, self.ents[e].copy())
+        return V(va.reg, nul, False)
+
+    def branch(mut self, node: Int, j: Int, u: TextUnion, text: Bool, as_bool: Bool) raises -> V:
+        """The value of one result of a CASE / COALESCE, in the node's type (a TEXT value in the union's codes)."""
+        if as_bool:
+            return self.boolean(node)
+        var x = self.rx[node].copy()
+        if not text or x.op == B_NULL:
+            if x.op == B_NULL:
+                return V(self.const_i(0), self.const_f(1.0), False, x.kind == FLOAT.value)
+            return self.value(node)
+        if x.op == B_STR:
+            return V(self.const_i(Int64(u.lit[j])), -1, False)
+        var v = self.value(node)
+        if not u.is_identity(j):
+            self.tab(v.reg, u.tabs[j])
+            self.p.text_tabs += 1
+            self.p.text_words += len(u.tabs[j])
+        return v^
+
+    def case_generic(mut self, e: Int, as_bool: Bool) raises -> V:
+        var x = self.rx[e].copy()
+        var nw = Int(x.value)
+        var vals = List[Int]()
+        for k in range(nw):
+            vals.append(x.items[2 * k + 1])
+        vals.append(x.items[2 * nw])
+        var text = x.kind == TEXT.value
+        if text:
+            self.prep_dict(e)
+        var u = self.unions[e].copy() if text else TextUnion()
+        var saved = self.guard
+        var done = -1
+        var acc = V(-1, -1, False)
+        for k in range(nw):
+            var c = self.truth(x.items[2 * k])
+            var take = c
+            var own_take = False
+            if done >= 0:                                          # a row that an earlier WHEN took is not this WHEN's
+                var nd = self.tmp()
+                self.ins(OP_NOT, nd, done)
+                take = self.tmp()
+                self.ins(OP_AND, take, c, nd)
+                self.free(nd)
+                own_take = True
+            self.guard = self.guard_with(take)
+            var tv = self.branch(vals[k], k, u, text, as_bool)
+            self.free(self.guard)
+            self.guard = saved
+            if k == 0:
+                acc = tv.copy()
+                done = self.tmp()
+                self.p.emit(OP_IMAX, done, c, c)
+            else:
+                acc = self.blend(take, tv, acc)
+                self.ins(OP_OR, done, done, c)
+            self.free(c)
+            if own_take:
+                self.free(take)
+        var nd3 = self.tmp()
+        self.ins(OP_NOT, nd3, done)
+        self.guard = self.guard_with(nd3)
+        var ev = self.branch(vals[nw], nw, u, text, as_bool)
+        self.free(self.guard)
+        self.guard = saved
+        self.free(nd3)
+        var out = self.blend(done, acc, ev)
+        self.free(done)
+        return out^
+
+    def coalesce_generic(mut self, e: Int, as_bool: Bool) raises -> V:
+        var x = self.rx[e].copy()
+        var text = x.kind == TEXT.value
+        if text:
+            self.prep_dict(e)
+        var u = self.unions[e].copy() if text else TextUnion()
+        var saved = self.guard
+        var acc = self.branch(x.items[0], 0, u, text, as_bool)
+        for j in range(1, len(x.items)):
+            var null_mask = acc.nul
+            var made = False
+            if as_bool:                                            # a boolean is NULL where it is unknown (0.5)
+                made = True
+                null_mask = self.tmp()
+                var half = self.const_f(0.5)
+                self.ins(24, null_mask, acc.reg, half)
+                self.free(half)
+            elif acc.nul < 0:
+                break                                              # never NULL: the rest is never read
+            self.guard = self.guard_with(null_mask)
+            var vj = self.branch(x.items[j], j, u, text, as_bool)
+            self.free(self.guard)
+            self.guard = saved
+            var res = self.tmp()
+            self.ins(OP_SELECT, res, null_mask, vj.reg, acc.reg)
+            var nul = -1
+            if not as_bool and vj.nul >= 0:
+                nul = self.tmp()
+                self.ins(OP_AND, nul, acc.nul, vj.nul)
+            self.free(acc.reg)
+            self.free(vj.reg)
+            if not as_bool:
+                self.free(acc.nul)
+            self.free(vj.nul)
+            if made:
+                self.free(null_mask)
+            acc = V(res, nul, acc.unk or vj.unk, acc.fl or vj.fl)
+        return acc^
+
+    # -- comparisons
+    def cmp_raw(mut self, a_node: Int, b_node: Int, op: Int) raises -> Tuple[Int, Int, Int]:
+        """a <op> b over definite values: (r, na, nb), r 1.0 where it holds, na / nb the NULL flags of the operands (-1: never NULL)."""
+        var lhs = self.rx[a_node].copy()
+        if lhs.kind == TEXT.value:
+            return self.text_cmp_raw(a_node, b_node, op)
+        var a = self.value(a_node)
+        var b = self.value(b_node)
+        var r = a.reg
+        if a.fl:                                               # DuckDB's order: NaN equals itself and is above every number; -0.0 equals 0.0
+            self.ins(op, r, a.reg, b.reg, NAN_AWARE)
+        else:
+            self.ins(OP_ICMP, r, a.reg, b.reg, op)
+        self.free(b.reg)
+        return (r, a.nul, b.nul)
+
+    def text_cmp_raw(mut self, a_node: Int, b_node: Int, op: Int) raises -> Tuple[Int, Int, Int]:
+        var xb = self.rx[b_node].copy()
+        self.prep_dict(a_node)
+        if xb.op != B_STR:
+            self.prep_dict(b_node)
+        var d = self.rx[a_node].src
+        var v = self.value(a_node)
+        var r = v.reg
+        if xb.op == B_STR:                                     # a word of the dictionary: its code, or the codes of the words in range
+            var lit = xb.text
+            if op == C_EQ or op == C_NE:
+                var code = self.dicts.code_of(d, lit)
+                var k = self.const_i(Int64(code))              # -1: no row holds the word
+                self.ins(OP_ICMP, r, r, k, op)
+                self.free(k)
+            else:
+                var n = self.dicts.count(d)
+                var bytes = List[UInt8](length=max(n, 1), fill=0)
+                for code in range(n):
+                    var w = self.dicts.word(d, code)
+                    var hit: Bool
+                    if op == C_LT:
+                        hit = _text_less(w, lit)
+                    elif op == C_GT:
+                        hit = _text_less(lit, w)
+                    elif op == C_LE:
+                        hit = not _text_less(lit, w)
+                    else:
+                        hit = not _text_less(w, lit)
+                    bytes[code] = 1 if hit else 0
+                var f = self.tmp()
+                self.ins(OP_I2F, f, r)
+                self.free(r)
+                r = f
+                var set_at = self.add_set(bytes, 0)
+                self.ins(OP_IN_SET, r, r, set_at)
+            return (r, v.nul, -1)
+        # two values: their codes are in different dictionaries, so one is translated into the other's (equality), or both into the words' common ranks
+        var db = self.rx[b_node].src
+        var b = self.value(b_node)
+        if op == C_EQ or op == C_NE:
+            if d != db:
+                var nb = self.dicts.count(db)
+                var tb = List[Int64](length=nb, fill=0)
+                for kb in range(nb):
+                    var ca = self.dicts.code_of(d, self.dicts.word(db, kb))
+                    tb[kb] = Int64(ca) if ca >= 0 else Int64(-2 - kb)         # a word the other side lacks equals nothing (a negative that is nobody's code)
+                self.tab(b.reg, tb)
+                self.p.text_tabs += 1
+                self.p.text_words += nb
+            self.ins(OP_ICMP, r, r, b.reg, op)
+        else:
+            var union_words = List[String]()
+            var at = Dict[String, Int]()
+            var na = self.dicts.count(d)
+            var ia = List[Int](length=na, fill=0)
+            for k in range(na):
+                var w = self.dicts.word(d, k)
+                var hit = at.get(w)
+                if hit:
+                    ia[k] = hit.value()
+                else:
+                    at[w] = len(union_words)
+                    ia[k] = len(union_words)
+                    union_words.append(w)
+            var nb = self.dicts.count(db)
+            var ib = List[Int](length=nb, fill=0)
+            for k in range(nb):
+                var w = self.dicts.word(db, k)
+                var hit = at.get(w)
+                if hit:
+                    ib[k] = hit.value()
+                else:
+                    at[w] = len(union_words)
+                    ib[k] = len(union_words)
+                    union_words.append(w)
+            var ranks = text_ranks(union_words)
+            var ta = List[Int64](length=na, fill=0)
+            for k in range(na):
+                ta[k] = ranks[ia[k]]
+            var tb2 = List[Int64](length=nb, fill=0)
+            for k in range(nb):
+                tb2[k] = ranks[ib[k]]
+            self.tab(r, ta)
+            self.tab(b.reg, tb2)
+            self.p.text_tabs += 2
+            self.p.text_words += na + nb
+            self.ins(OP_ICMP, r, r, b.reg, op)
+        self.free(b.reg)
+        return (r, v.nul, b.nul)
+
+    def distinct_bool(mut self, x: BExpr) raises -> V:
+        """a IS [NOT] DISTINCT FROM b: NULL is a value, so two NULLs are not distinct, a NULL and a value are, two values are when they differ."""
+        var t = self.cmp_raw(x.a, x.b, C_NE)
+        var r = t[0]
+        var na = t[1]
+        var nb = t[2]
+        if na >= 0 or nb >= 0:
+            var anyn = self.or_nul_copy(na, nb)
+            var differ = self.tmp()                              # exactly one is NULL
+            var zero = self.const_f(0.0)
+            self.ins(25, differ, na if na >= 0 else zero, nb if nb >= 0 else zero, 0)
+            self.free(zero)
+            self.ins(OP_SELECT, r, anyn, differ, r)
+            self.free(differ)
+            self.free(anyn)
+            self.free(na)
+            self.free(nb)
+        if x.value != 0:                                         # IS NOT DISTINCT FROM
+            self.ins(OP_NOT, r, r)
+        return V(r, -1, False)
+
+    def or_nul_copy(mut self, a: Int, b: Int) raises -> Int:
+        """A new register holding a OR b (a and b stay)."""
+        var r = self.tmp()
+        if a >= 0 and b >= 0:
+            self.ins(OP_OR, r, a, b)
+        elif a >= 0:
+            self.p.emit(OP_IMAX, r, a, a)
+        else:
+            self.p.emit(OP_IMAX, r, b, b)
+        return r
+
+    # -- numbers
+    def fconst(mut self, x: Float64) raises -> Int:
+        return self.const_f(x)
+
+    def round_half_away(mut self, r: Int) raises:
+        """r = the float r rounded to a whole number, halves away from zero (in place; exact: the fraction of a double is exact)."""
+        var neg = self.tmp()
+        var zero = self.const_f(0.0)
+        self.ins(C_LT, neg, r, zero, 0)
+        var a = self.tmp()
+        self.ins(OP_SUBF, a, zero, r)                            # -r
+        self.ins(OP_SELECT, a, neg, a, r)                        # |r|
+        var f = self.tmp()
+        self.ins(OP_FLOOR, f, a)
+        var fr = self.tmp()
+        self.ins(OP_SUBF, fr, a, f)
+        var half = self.const_f(0.5)
+        var up = self.tmp()
+        self.ins(C_GE, up, fr, half, 0)
+        var one = self.const_f(1.0)
+        self.ins(OP_ADD, a, f, one)
+        self.ins(OP_SELECT, f, up, a, f)                         # |r| rounded
+        self.ins(OP_SUBF, a, zero, f)
+        self.ins(OP_SELECT, r, neg, a, f)
+        self.free(neg)
+        self.free(zero)
+        self.free(a)
+        self.free(f)
+        self.free(fr)
+        self.free(half)
+        self.free(up)
+        self.free(one)
+
+    def round_half_even(mut self, r: Int) raises:
+        """r = the float r rounded to a whole number, halves to the even one (in place)."""
+        var f = self.tmp()
+        self.ins(OP_FLOOR, f, r)
+        var fr = self.tmp()
+        self.ins(OP_SUBF, fr, r, f)
+        var half = self.const_f(0.5)
+        var gt = self.tmp()
+        self.ins(C_GT, gt, fr, half, 0)
+        var eq = self.tmp()
+        self.ins(C_EQ, eq, fr, half, 0)
+        var h2 = self.const_f(0.5)
+        var q = self.tmp()
+        self.ins(OP_MUL, q, f, h2)
+        self.ins(OP_FLOOR, q, q)
+        var two = self.const_f(2.0)
+        self.ins(OP_MUL, q, q, two)                              # 2 * floor(f / 2)
+        var odd = self.tmp()
+        self.ins(C_NE, odd, q, f, 0)
+        self.ins(OP_AND, eq, eq, odd)
+        self.ins(OP_OR, gt, gt, eq)
+        var one = self.const_f(1.0)
+        self.ins(OP_ADD, q, f, one)
+        self.ins(OP_SELECT, r, gt, q, f)
+        self.free(f)
+        self.free(fr)
+        self.free(half)
+        self.free(gt)
+        self.free(eq)
+        self.free(h2)
+        self.free(q)
+        self.free(two)
+        self.free(odd)
+        self.free(one)
+
+    def iabs_into(mut self, r: Int) raises -> Tuple[Int, Int]:
+        """(|r|, the register that is 1.0 where r is negative): new registers; r stays."""
+        var neg = self.tmp()
+        var zero = self.const_i(0)
+        self.ins(OP_ICMP, neg, r, zero, C_LT)
+        var a = self.tmp()
+        self.ins(OP_ISUB, a, zero, r)
+        self.ins(OP_SELECT, a, neg, a, r)
+        self.free(zero)
+        return (a, neg)
+
+    def idiv_round_away(mut self, r: Int, p: Int64) raises:
+        """r = r / p rounded to the nearest whole number, halves away from zero (in place; int registers)."""
+        var ab = self.iabs_into(r)
+        var a = ab[0]
+        var neg = ab[1]
+        var half = self.const_i(p // 2)
+        self.ins(OP_IADD, a, a, half)
+        self.free(half)
+        var pc = self.const_i(p)
+        self.ins(OP_IDIV, a, a, pc)
+        self.free(pc)
+        var zero = self.const_i(0)
+        var na = self.tmp()
+        self.ins(OP_ISUB, na, zero, a)
+        self.ins(OP_SELECT, r, neg, na, a)
+        self.free(zero)
+        self.free(na)
+        self.free(a)
+        self.free(neg)
+
+    def out_of_range(mut self, r: Int, lo: Int64, hi: Int64) raises -> Int:
+        """A new register: 1.0 where the int register r is below lo or above hi."""
+        var l = self.const_i(lo)
+        var bad = self.tmp()
+        self.ins(OP_ICMP, bad, r, l, C_LT)
+        self.free(l)
+        var h = self.const_i(hi)
+        var over = self.tmp()
+        self.ins(OP_ICMP, over, r, h, C_GT)
+        self.free(h)
+        self.ins(OP_OR, bad, bad, over)
+        self.free(over)
+        return bad
+
+    def cast_finish(mut self, v: V, bad: Int, try_: Bool, why: String) raises -> V:
+        """A cast that can fail: TRY_CAST makes the failing rows NULL, CAST makes them an error."""
+        if bad < 0:
+            return v.copy()
+        if try_:
+            var nul = self.or_nul(v.nul, bad)
+            return V(v.reg, nul, False, v.fl)
+        self.flag_errors(bad, v.nul, why)
+        self.free(bad)
+        return v.copy()
+
+    def cast_value(mut self, e: Int) raises -> V:
+        var x = self.rx[e].copy()
+        var src = self.rx[x.a].copy()
+        var fk = src.kind
+        var fs = src.scale
+        var tk = x.kind
+        var ts = x.scale
+        var flags = Int(x.value)
+        var try_ = (flags & 1) != 0
+        var bits = (flags >> 1) & 0x7F
+        var prec = flags >> 8
+        if fk == TEXT.value:
+            return self.cast_from_text(e, x)
+        var v = self.value(x.a)
+        var bad = -1
+        if tk == TEXT.value:                                       # a boolean: 'false' and 'true' are codes 0 and 1
+            var ws = List[String]()
+            ws.append("false")
+            ws.append("true")
+            self.derive_words(e, ws^)
+            return v^
+        if tk == INT.value or tk == DECIMAL.value:
+            if fk == FLOAT.value:
+                if ts > 0:
+                    var k = self.const_f(Float64(Int(pow10_checked(ts))))
+                    self.ins(OP_MUL, v.reg, v.reg, k)
+                    self.free(k)
+                if tk == DECIMAL.value:
+                    self.round_half_away(v.reg)
+                else:
+                    self.round_half_even(v.reg)
+                var limit = Float64(Int(pow10_checked(prec))) if tk == DECIMAL.value else (9223372036854775808.0 if bits >= 64 else Float64(Int(1) << (bits - 1)))
+                var lo = self.const_f(-limit)
+                var hi = self.const_f(limit)
+                var fin = self.tmp()                                # in range (NaN is neither): everything else is a failure
+                var ge = self.tmp()
+                self.ins(C_GE, ge, v.reg, lo, 0)
+                self.ins(C_LT, fin, v.reg, hi, 0)
+                self.ins(OP_AND, fin, fin, ge)
+                self.free(ge)
+                self.free(lo)
+                self.free(hi)
+                if tk == DECIMAL.value:                              # a DECIMAL(p, s) holds at most 10^p - 1: the limit itself is out too
+                    var lo2 = self.const_f(-limit)
+                    var gt = self.tmp()
+                    self.ins(C_GT, gt, v.reg, lo2, 0)
+                    self.ins(OP_AND, fin, fin, gt)
+                    self.free(gt)
+                    self.free(lo2)
+                bad = self.tmp()
+                self.ins(OP_NOT, bad, fin)
+                self.free(fin)
+                var z = self.const_f(0.0)
+                self.ins(OP_SELECT, v.reg, bad, z, v.reg)           # a failing row holds 0, so the conversion below reads a number
+                self.free(z)
+                self.ins(OP_F2I, v.reg, v.reg)
+                return self.cast_finish(v, bad, try_, String(self.rx[e].text))
+            elif fk == INT.value or fk == DECIMAL.value or fk == BOOL.value:
+                var from_scale = fs if fk != BOOL.value else 0
+                if ts > from_scale:
+                    var k = self.const_i(pow10_checked(ts - from_scale))
+                    self.ins(OP_IMUL, v.reg, v.reg, k)
+                    self.free(k)
+                elif ts < from_scale:
+                    self.idiv_round_away(v.reg, pow10_checked(from_scale - ts))
+            if tk == DECIMAL.value and prec < 18:
+                var lim = pow10_checked(prec)
+                var b2 = self.out_of_range(v.reg, -(lim - 1), lim - 1)
+                bad = b2 if bad < 0 else self.or_nul(bad, b2)
+            elif tk == INT.value and bits < 64:
+                var lim2 = Int64(1) << Int64(bits - 1)
+                var b3 = self.out_of_range(v.reg, -lim2, lim2 - 1)
+                bad = b3 if bad < 0 else self.or_nul(bad, b3)
+            return self.cast_finish(v, bad, try_, String(self.rx[e].text))
+        if tk == FLOAT.value:
+            if fk == FLOAT.value:
+                var fbad = -1
+                if ts == F32_COLUMN and fs != F32_COLUMN:           # a finite double past the largest 32-bit float is a failure (inf and NaN stay)
+                    var ab = self.tmp()
+                    var zero = self.const_f(0.0)
+                    self.ins(OP_SUBF, ab, zero, v.reg)
+                    var neg = self.tmp()
+                    self.ins(C_LT, neg, v.reg, zero, 0)
+                    self.ins(OP_SELECT, ab, neg, ab, v.reg)         # |x|
+                    var big = self.const_f(3.4028235677973366e38)   # the midpoint to the next float: what rounds to inf
+                    var over = self.tmp()
+                    self.ins(C_GE, over, ab, big, 0)
+                    var inf = self.const_f(Float64(from_bits=UInt64(0x7FF0000000000000)))
+                    var fin = self.tmp()
+                    self.ins(C_LT, fin, ab, inf, 0)
+                    self.ins(OP_AND, over, over, fin)
+                    fbad = over
+                    self.free(ab)
+                    self.free(zero)
+                    self.free(neg)
+                    self.free(big)
+                    self.free(inf)
+                    self.free(fin)
+                    var zf = self.const_f(0.0)
+                    self.ins(OP_SELECT, v.reg, over, zf, v.reg)
+                    self.free(zf)
+                    self.ins(OP_F32, v.reg, v.reg)
+                return self.cast_finish(V(v.reg, v.nul, False, True), fbad, try_, String(self.rx[e].text))
+            raise Error("internal: a cast of " + String(fk) + " to FLOAT reached the program")
+        raise Error("internal: a cast from " + String(fk) + " to " + String(tk) + " reached the program")
+
+    def cast_from_text(mut self, e: Int, x: BExpr) raises -> V:
+        """A word's value as a number, date or boolean, parsed once per word of the dictionary; a word that does not read as one is an error where a row holds it
+        (TRY_CAST: NULL)."""
+        self.prep_dict(x.a)
+        var d = self.rx[x.a].src
+        var n = self.dicts.count(d)
+        var flags = Int(x.value)
+        var try_ = (flags & 1) != 0
+        var bits = (flags >> 1) & 0x7F
+        var prec = flags >> 8
+        var v = self.value(x.a)
+        var ents = List[Int64](length=n, fill=0)
+        var badb = List[UInt8](length=max(n, 1), fill=0)
+        var any_bad = False
+        for k in range(n):
+            var r = parse_text(self.dicts.word(d, k), x.kind, x.scale, bits, prec)
+            ents[k] = r.value
+            if not r.ok:
+                badb[k] = 1
+                any_bad = True
+        var fl = -1
+        if any_bad:                                                  # the codes of the words that do not read, tested before the codes are replaced by values
+            fl = self.tmp()
+            self.ins(OP_I2F, fl, v.reg)
+            var set_at = self.add_set(badb, 0)
+            self.ins(OP_IN_SET, fl, fl, set_at)
+        self.tab(v.reg, ents)
+        self.p.text_tabs += 1
+        self.p.text_words += n
+        return self.cast_finish(V(v.reg, v.nul, False, x.kind == FLOAT.value), fl, try_, String(self.rx[e].text))
+
+    # -- dates
+    def civil(mut self, z: Int) raises -> Tuple[Int, Int, Int]:
+        """(year, month, day) registers of the day-number register z (floor divisions: right for dates before 1970). z stays."""
+        var t = self.tmp()
+        var c = self.const_i(719468)
+        self.ins(OP_IADD, t, z, c)
+        self.free(c)
+        var era = self.tmp()
+        var k = self.const_i(146097)
+        self.ins(OP_IDIV, era, t, k)
+        var doe = self.tmp()
+        self.ins(OP_IMUL, doe, era, k)
+        self.ins(OP_ISUB, doe, t, doe)
+        self.free(k)
+        self.free(t)
+        var a = self.tmp()
+        var b = self.tmp()
+        var yoe = self.tmp()
+        var k1 = self.const_i(1460)
+        self.ins(OP_IDIV, a, doe, k1)
+        self.free(k1)
+        self.ins(OP_ISUB, yoe, doe, a)
+        var k2 = self.const_i(36524)
+        self.ins(OP_IDIV, a, doe, k2)
+        self.free(k2)
+        self.ins(OP_IADD, yoe, yoe, a)
+        var k3 = self.const_i(146096)
+        self.ins(OP_IDIV, a, doe, k3)
+        self.free(k3)
+        self.ins(OP_ISUB, yoe, yoe, a)
+        var k4 = self.const_i(365)
+        self.ins(OP_IDIV, yoe, yoe, k4)                           # yoe
+        var doy = self.tmp()
+        self.ins(OP_IMUL, a, yoe, k4)
+        self.free(k4)
+        var k5 = self.const_i(4)
+        self.ins(OP_IDIV, b, yoe, k5)
+        self.free(k5)
+        self.ins(OP_IADD, a, a, b)
+        var k6 = self.const_i(100)
+        self.ins(OP_IDIV, b, yoe, k6)
+        self.free(k6)
+        self.ins(OP_ISUB, a, a, b)
+        self.ins(OP_ISUB, doy, doe, a)                            # doy
+        self.free(doe)
+        var y = self.tmp()
+        var k7 = self.const_i(400)
+        self.ins(OP_IMUL, y, era, k7)
+        self.free(k7)
+        self.free(era)
+        self.ins(OP_IADD, y, y, yoe)                              # year before the month shift
+        self.free(yoe)
+        var mp = self.tmp()
+        var k8 = self.const_i(5)
+        self.ins(OP_IMUL, mp, doy, k8)
+        self.free(k8)
+        var k9 = self.const_i(2)
+        self.ins(OP_IADD, mp, mp, k9)
+        self.free(k9)
+        var k10 = self.const_i(153)
+        self.ins(OP_IDIV, mp, mp, k10)                            # mp
+        var d = self.tmp()
+        self.ins(OP_IMUL, a, mp, k10)
+        self.free(k10)
+        var k11 = self.const_i(2)
+        self.ins(OP_IADD, a, a, k11)
+        self.free(k11)
+        var k12 = self.const_i(5)
+        self.ins(OP_IDIV, a, a, k12)
+        self.free(k12)
+        self.ins(OP_ISUB, d, doy, a)
+        var one = self.const_i(1)
+        self.ins(OP_IADD, d, d, one)                              # day
+        self.free(doy)
+        var m = self.tmp()
+        var ten = self.const_i(10)
+        var ge = self.tmp()
+        self.ins(OP_ICMP, ge, mp, ten, C_GE)
+        self.free(ten)
+        self.ins(OP_F2I, ge, ge)                                  # 1 where mp >= 10
+        var k13 = self.const_i(12)
+        self.ins(OP_IMUL, b, ge, k13)
+        self.free(k13)
+        var three = self.const_i(3)
+        self.ins(OP_IADD, m, mp, three)
+        self.free(three)
+        self.ins(OP_ISUB, m, m, b)                                # month
+        self.free(ge)
+        self.free(mp)
+        var two = self.const_i(2)
+        var le2 = self.tmp()
+        self.ins(OP_ICMP, le2, m, two, C_LE)
+        self.free(two)
+        self.ins(OP_F2I, le2, le2)
+        self.ins(OP_IADD, y, y, le2)                              # year
+        self.free(le2)
+        self.free(one)
+        self.free(a)
+        self.free(b)
+        return (y, m, d)
+
+    def days_from_civil_regs(mut self, y: Int, m: Int, d: Int) raises -> Int:
+        """The day-number register of the date in registers y, m, d (they stay)."""
+        var two = self.const_i(2)
+        var le2 = self.tmp()
+        self.ins(OP_ICMP, le2, m, two, C_LE)
+        self.free(two)
+        self.ins(OP_F2I, le2, le2)                                # 1 where m <= 2
+        var yy = self.tmp()
+        self.ins(OP_ISUB, yy, y, le2)
+        var era = self.tmp()
+        var k400 = self.const_i(400)
+        self.ins(OP_IDIV, era, yy, k400)
+        var yoe = self.tmp()
+        self.ins(OP_IMUL, yoe, era, k400)
+        self.free(k400)
+        self.ins(OP_ISUB, yoe, yy, yoe)
+        self.free(yy)
+        var t = self.tmp()                                        # m - 3 + 12 * (m <= 2)
+        var k12 = self.const_i(12)
+        self.ins(OP_IMUL, t, le2, k12)
+        self.free(k12)
+        self.free(le2)
+        self.ins(OP_IADD, t, t, m)
+        var k3 = self.const_i(3)
+        self.ins(OP_ISUB, t, t, k3)
+        self.free(k3)
+        var doy = self.tmp()
+        var k153 = self.const_i(153)
+        self.ins(OP_IMUL, doy, t, k153)
+        self.free(k153)
+        self.free(t)
+        var k2 = self.const_i(2)
+        self.ins(OP_IADD, doy, doy, k2)
+        self.free(k2)
+        var k5 = self.const_i(5)
+        self.ins(OP_IDIV, doy, doy, k5)
+        self.free(k5)
+        self.ins(OP_IADD, doy, doy, d)
+        var one = self.const_i(1)
+        self.ins(OP_ISUB, doy, doy, one)
+        self.free(one)
+        var doe = self.tmp()
+        var k365 = self.const_i(365)
+        self.ins(OP_IMUL, doe, yoe, k365)
+        self.free(k365)
+        var q = self.tmp()
+        var k4 = self.const_i(4)
+        self.ins(OP_IDIV, q, yoe, k4)
+        self.free(k4)
+        self.ins(OP_IADD, doe, doe, q)
+        var k100 = self.const_i(100)
+        self.ins(OP_IDIV, q, yoe, k100)
+        self.free(k100)
+        self.ins(OP_ISUB, doe, doe, q)
+        self.ins(OP_IADD, doe, doe, doy)
+        self.free(q)
+        self.free(yoe)
+        self.free(doy)
+        var k146 = self.const_i(146097)
+        self.ins(OP_IMUL, era, era, k146)
+        self.free(k146)
+        self.ins(OP_IADD, era, era, doe)
+        self.free(doe)
+        var k719 = self.const_i(719468)
+        self.ins(OP_ISUB, era, era, k719)
+        self.free(k719)
+        return era
+
+    def date_operand_value(mut self, node: Int) raises -> V:
+        """A DATE operand's day numbers, a NULL row's garbage replaced by 0 so the arithmetic after it reads numbers."""
+        var v = self.value(node)
+        if v.nul >= 0:
+            var z = self.const_i(0)
+            self.ins(OP_SELECT, v.reg, v.nul, z, v.reg)
+            self.free(z)
+        return v^
+
+    def datepart_value(mut self, x: BExpr) raises -> V:
+        var v = self.date_operand_value(x.a)
+        var part = Int(x.value)
+        if part == DP_DOW or part == DP_ISODOW:
+            var k = self.const_i(Int64(4 if part == DP_DOW else 3))
+            self.ins(OP_IADD, v.reg, v.reg, k)
+            self.free(k)
+            var seven = self.const_i(7)
+            self.ins(OP_IMOD, v.reg, v.reg, seven)
+            self.free(seven)
+            if part == DP_ISODOW:
+                var one = self.const_i(1)
+                self.ins(OP_IADD, v.reg, v.reg, one)
+                self.free(one)
+            return v^
+        if part == DP_EPOCH:
+            var k = self.const_i(86400)
+            self.ins(OP_IMUL, v.reg, v.reg, k)
+            self.free(k)
+            return v^
+        var c = self.civil(v.reg)
+        var y = c[0]
+        var m = c[1]
+        var d = c[2]
+        var out = self.tmp()
+        if part == DP_YEAR:
+            self.p.emit(OP_IMAX, out, y, y)
+        elif part == DP_MONTH:
+            self.p.emit(OP_IMAX, out, m, m)
+        elif part == DP_DAY:
+            self.p.emit(OP_IMAX, out, d, d)
+        elif part == DP_QUARTER:
+            var one = self.const_i(1)
+            self.ins(OP_ISUB, out, m, one)
+            var three = self.const_i(3)
+            self.ins(OP_IDIV, out, out, three)
+            self.ins(OP_IADD, out, out, one)
+            self.free(one)
+            self.free(three)
+        elif part == DP_DOY:
+            var one = self.const_i(1)
+            var jan = self.days_from_civil_regs(y, one, one)
+            self.ins(OP_ISUB, out, v.reg, jan)
+            self.ins(OP_IADD, out, out, one)
+            self.free(jan)
+            self.free(one)
+        elif part == DP_DECADE:
+            var ten = self.const_i(10)
+            self.ins(OP_IDIV, out, y, ten)
+            self.free(ten)
+        elif part == DP_CENTURY or part == DP_MILLENNIUM:
+            # (y + 99) // 100 for a positive year, y // 100 below (the years 1 to 9999 in practice)
+            var k = self.const_i(Int64(100 if part == DP_CENTURY else 1000))
+            var off = self.const_i(Int64(99 if part == DP_CENTURY else 999))
+            self.ins(OP_IADD, out, y, off)
+            self.ins(OP_IDIV, out, out, k)
+            self.free(k)
+            self.free(off)
+        self.free(y)
+        self.free(m)
+        self.free(d)
+        self.free(v.reg)
+        return V(out, v.nul, False)
+
+    def datetrunc_value(mut self, x: BExpr) raises -> V:
+        var v = self.date_operand_value(x.a)
+        var part = Int(x.value)
+        if part == DP_WEEK:                                       # back to Monday: z - (z + 3) mod 7
+            var t = self.tmp()
+            var three = self.const_i(3)
+            self.ins(OP_IADD, t, v.reg, three)
+            self.free(three)
+            var seven = self.const_i(7)
+            self.ins(OP_IMOD, t, t, seven)
+            self.free(seven)
+            self.ins(OP_ISUB, v.reg, v.reg, t)
+            self.free(t)
+            return v^
+        var c = self.civil(v.reg)
+        var y = c[0]
+        var m = c[1]
+        var d = c[2]
+        self.free(v.reg)
+        var one = self.const_i(1)
+        var ty = y
+        var tm = one
+        var td = one
+        var own_y = False
+        var own_m = False
+        if part == DP_MONTH:
+            tm = m
+        elif part == DP_QUARTER:
+            tm = self.tmp()
+            own_m = True
+            self.ins(OP_ISUB, tm, m, one)
+            var three = self.const_i(3)
+            self.ins(OP_IDIV, tm, tm, three)
+            self.ins(OP_IMUL, tm, tm, three)
+            self.free(three)
+            self.ins(OP_IADD, tm, tm, one)
+        elif part == DP_DECADE or part == DP_CENTURY or part == DP_MILLENNIUM:
+            ty = self.tmp()
+            own_y = True
+            if part == DP_DECADE:
+                var ten = self.const_i(10)
+                self.ins(OP_IDIV, ty, y, ten)
+                self.ins(OP_IMUL, ty, ty, ten)
+                self.free(ten)
+            else:                                                  # DuckDB: the year divided by 100 (1000) and floored, not the calendar century
+                var k = self.const_i(Int64(100 if part == DP_CENTURY else 1000))
+                self.ins(OP_IDIV, ty, y, k)
+                self.ins(OP_IMUL, ty, ty, k)
+                self.free(k)
+        var res = self.days_from_civil_regs(ty, tm, td)
+        if own_y:
+            self.free(ty)
+        if own_m:
+            self.free(tm)
+        self.free(one)
+        self.free(y)
+        self.free(m)
+        self.free(d)
+        return V(res, v.nul, False)
+
+    def addmonths_value(mut self, x: BExpr) raises -> V:
+        var v = self.date_operand_value(x.a)
+        var n = self.value(x.b)
+        if n.nul >= 0:
+            var z = self.const_i(0)
+            self.ins(OP_SELECT, n.reg, n.nul, z, n.reg)
+            self.free(z)
+        var c = self.civil(v.reg)
+        var y = c[0]
+        var m = c[1]
+        var d = c[2]
+        self.free(v.reg)
+        var total = self.tmp()                                    # y * 12 + (m - 1) + n
+        var k12 = self.const_i(12)
+        self.ins(OP_IMUL, total, y, k12)
+        self.ins(OP_IADD, total, total, m)
+        var one = self.const_i(1)
+        self.ins(OP_ISUB, total, total, one)
+        self.ins(OP_IADD, total, total, n.reg)
+        self.free(n.reg)
+        var y2 = self.tmp()
+        self.ins(OP_IDIV, y2, total, k12)
+        var m2 = self.tmp()
+        self.ins(OP_IMUL, m2, y2, k12)
+        self.ins(OP_ISUB, m2, total, m2)
+        self.ins(OP_IADD, m2, m2, one)
+        self.free(total)
+        self.free(k12)
+        # days in the target month: a table of 12, plus 1 for February of a leap year
+        var base = List[Int64]()
+        for dm in [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]:
+            base.append(Int64(dm))
+        var dim = self.tmp()
+        self.p.emit(OP_IMAX, dim, m2, m2)
+        self.tab(dim, base, 1)
+        var two = self.const_i(2)
+        var feb = self.tmp()
+        self.ins(OP_ICMP, feb, m2, two, C_EQ)
+        self.free(two)
+        var k4 = self.const_i(4)
+        var r4 = self.tmp()
+        self.ins(OP_IMOD, r4, y2, k4)
+        self.free(k4)
+        var zero = self.const_i(0)
+        var leap = self.tmp()
+        self.ins(OP_ICMP, leap, r4, zero, C_EQ)
+        var k100 = self.const_i(100)
+        self.ins(OP_IMOD, r4, y2, k100)
+        self.free(k100)
+        var c100 = self.tmp()
+        self.ins(OP_ICMP, c100, r4, zero, C_NE)
+        var k400 = self.const_i(400)
+        self.ins(OP_IMOD, r4, y2, k400)
+        self.free(k400)
+        var c400 = self.tmp()
+        self.ins(OP_ICMP, c400, r4, zero, C_EQ)
+        self.ins(OP_OR, c100, c100, c400)
+        self.ins(OP_AND, leap, leap, c100)
+        self.ins(OP_AND, leap, leap, feb)
+        self.ins(OP_F2I, leap, leap)
+        self.ins(OP_IADD, dim, dim, leap)
+        self.free(feb)
+        self.free(r4)
+        self.free(zero)
+        self.free(leap)
+        self.free(c100)
+        self.free(c400)
+        self.ins(OP_IMIN, d, d, dim)
+        self.free(dim)
+        var res = self.days_from_civil_regs(y2, m2, d)
+        self.free(y)
+        self.free(m)
+        self.free(d)
+        self.free(y2)
+        self.free(m2)
+        self.free(one)
+        return V(res, self.or_nul(v.nul, n.nul), False)
+
+    def total_months(mut self, z: Int) raises -> Int:
+        """y * 12 + (m - 1) of the day-number register z (a new register)."""
+        var c = self.civil(z)
+        var t = self.tmp()
+        var k12 = self.const_i(12)
+        self.ins(OP_IMUL, t, c[0], k12)
+        self.free(k12)
+        self.ins(OP_IADD, t, t, c[1])
+        var one = self.const_i(1)
+        self.ins(OP_ISUB, t, t, one)
+        self.free(one)
+        self.free(c[0])
+        self.free(c[1])
+        self.free(c[2])
+        return t
+
+    def datediff_value(mut self, x: BExpr) raises -> V:
+        var a = self.date_operand_value(x.a)
+        var b = self.date_operand_value(x.b)
+        var part = Int(x.value)
+        var res = self.tmp()
+        if part == DP_DAY or part == DP_WEEK:
+            self.ins(OP_ISUB, res, b.reg, a.reg)
+            if part == DP_WEEK:                                   # whole weeks, truncated toward zero
+                var neg = self.tmp()
+                var zero = self.const_i(0)
+                self.ins(OP_ICMP, neg, res, zero, C_LT)
+                var ab = self.tmp()
+                self.ins(OP_ISUB, ab, zero, res)
+                self.ins(OP_SELECT, ab, neg, ab, res)
+                var seven = self.const_i(7)
+                self.ins(OP_IDIV, ab, ab, seven)
+                self.ins(OP_ISUB, res, zero, ab)
+                self.ins(OP_SELECT, res, neg, res, ab)
+                self.free(neg)
+                self.free(zero)
+                self.free(ab)
+                self.free(seven)
+        else:
+            var ma = self.total_months(a.reg)
+            var mb = self.total_months(b.reg)
+            if part == DP_QUARTER or part == DP_YEAR or part == DP_DECADE or part == DP_CENTURY or part == DP_MILLENNIUM:
+                var k = 3 if part == DP_QUARTER else 12 if part == DP_YEAR else 120 if part == DP_DECADE else 1200 if part == DP_CENTURY else 12000
+                var kc = self.const_i(Int64(k))
+                self.ins(OP_IDIV, ma, ma, kc)
+                self.ins(OP_IDIV, mb, mb, kc)
+                self.free(kc)
+            self.ins(OP_ISUB, res, mb, ma)
+            self.free(ma)
+            self.free(mb)
+        self.free(a.reg)
+        self.free(b.reg)
+        return V(res, self.or_nul(a.nul, b.nul), False)
 
     def divmod(mut self, x: BExpr) raises -> V:
         """a // b or a % b truncating toward zero (DuckDB's), from the kernel's floor division: the quotient is one more
@@ -418,6 +1825,23 @@ struct _Emitter(Movable):
             return V(self.const_f(0.0), -1, False)
         if x.op == B_IN:
             return self.in_list(x)
+        if x.op == B_TFN:
+            return self.tfn_bool(e)
+        if x.op == B_CASE:
+            return self.case_generic(e, True)
+        if x.op == B_COALESCE:
+            return self.coalesce_generic(e, True)
+        if x.op == B_DISTINCT:
+            return self.distinct_bool(x)
+        if x.op == B_BOOLIS:
+            var a = self.boolean(x.a)
+            var code = Int(x.value)
+            var k = self.const_f(1.0 if code < 2 else 0.0)
+            self.ins(24 if code % 2 == 0 else 25, a.reg, a.reg, k)
+            self.free(k)
+            return V(a.reg, -1, False)
+        if x.op == B_CAST:
+            return self.cast_bool(e)
         if x.op == B_NULL:
             return V(self.const_f(0.5), -1, True)
         if x.op == B_LIT:
@@ -431,53 +1855,27 @@ struct _Emitter(Movable):
         raise Error("internal: expression kind " + String(x.op) + " is not a condition")
 
     def compare(mut self, x: BExpr) raises -> V:
-        var lhs = self.rx[x.a].copy()
-        if lhs.kind == TEXT.value:
-            return self.text_compare(x)
-        var a = self.value(x.a)
-        var b = self.value(x.b)
-        var r = a.reg
-        if a.fl:                                               # DuckDB's order: NaN equals itself and is above every number; -0.0 equals 0.0
-            self.ins(Int(x.value), r, a.reg, b.reg, NAN_AWARE)
-        else:
-            self.ins(OP_ICMP, r, a.reg, b.reg, Int(x.value))
-        self.free(b.reg)
-        return self.with_unknown(r, self.or_nul(a.nul, b.nul))
+        var t = self.cmp_raw(x.a, x.b, Int(x.value))
+        return self.with_unknown(t[0], self.or_nul(t[1], t[2]))
 
-    def text_compare(mut self, x: BExpr) raises -> V:
-        """A TEXT column against a string literal: the codes of the words that satisfy it, in the dictionary, as a set."""
-        var col = self.rx[x.a].copy()
-        var lit = self.rx[x.b].text
-        var op = Int(x.value)
+    def cast_bool(mut self, e: Int) raises -> V:
+        """CAST(x AS BOOLEAN): true where the number is not zero; a word is read once per dictionary word."""
+        var x = self.rx[e].copy()
+        var src = self.rx[x.a].copy()
+        var r = self.tmp()
+        if src.kind == TEXT.value:
+            var v = self.cast_from_text(e, x)
+            self.ins(OP_I2F, r, v.reg)
+            self.free(v.reg)
+            return self.with_unknown(r, v.nul)
         var v = self.value(x.a)
-        var c = Int(col.value)
-        var r = v.reg
-        if op == C_EQ or op == C_NE:
-            var code = self.dicts.code_of(c, lit)
-            var k = self.const_i(Int64(code))                       # -1: no row holds the word
-            self.ins(OP_ICMP, r, r, k, op)
-            self.free(k)
+        var zero = self.const_i(0) if not v.fl else self.const_f(0.0)
+        if v.fl:
+            self.ins(25, r, v.reg, zero, 0)                    # != (IEEE: NaN is not zero)
         else:
-            var n = self.dicts.count(c)
-            var bytes = List[UInt8](length=max(n, 1), fill=0)
-            for code in range(n):
-                var w = self.dicts.word(c, code)
-                var hit: Bool
-                if op == C_LT:
-                    hit = _text_less(w, lit)
-                elif op == C_GT:
-                    hit = _text_less(lit, w)
-                elif op == C_LE:
-                    hit = not _text_less(lit, w)
-                else:
-                    hit = not _text_less(w, lit)
-                bytes[code] = 1 if hit else 0
-            var f = self.tmp()
-            self.ins(OP_I2F, f, r)
-            self.free(r)
-            r = f
-            var set_at = self.add_set(bytes, 0)
-            self.ins(OP_IN_SET, r, r, set_at)
+            self.ins(OP_ICMP, r, v.reg, zero, C_NE)
+        self.free(zero)
+        self.free(v.reg)
         return self.with_unknown(r, v.nul)
 
     def add_set(mut self, bytes: List[UInt8], lo: Int) -> Int:
@@ -488,12 +1886,68 @@ struct _Emitter(Movable):
         self.set_meta.append(Int64(lo))
         return len(self.set_meta) // 3 - 1
 
+    def int_set(mut self, r: Int, v: V, items: List[Int]) raises:
+        """r = 1.0 where the value is one of the constants, by a hash set of int64 keys (a float's bits, with -0.0 as 0.0 and one NaN)."""
+        var keys = List[Int64]()
+        for it in items:
+            var k = self.rx[it].value
+            if v.fl:
+                var f = Float64(from_bits=UInt64(k))
+                if f != f:
+                    k = Int64(0x7FF8000000000000)
+                elif f == 0.0:
+                    k = 0
+            keys.append(k)
+        var cap = 16
+        while cap < 2 * len(keys):
+            cap *= 2
+        var lg = 0
+        while (1 << lg) < cap:
+            lg += 1
+        var table = List[Int64](length=cap, fill=Int64.MIN)
+        var has_min = Int64(0)
+        for k in keys:
+            if k == Int64.MIN:
+                has_min = 1
+                continue
+            var h = Int((UInt64(k) * UInt64(0x9E3779B97F4A7C15)) >> UInt64(64 - lg))
+            while table[h] != Int64.MIN and table[h] != k:
+                h = (h + 1) & (cap - 1)
+            table[h] = k
+        var off = (len(self.set_bytes) + 7) // 8 * 8
+        self.set_bytes.resize(off + 8 * cap, 0)
+        var base = LP(unsafe_from_address=Int(self.set_bytes.unsafe_ptr()) + off)
+        for i in range(cap):
+            base[i] = table[i]
+        self.set_meta.append(Int64(off))
+        self.set_meta.append(Int64(cap))
+        self.set_meta.append(has_min)
+        var at = len(self.set_meta) // 3 - 1
+        var probe = v.reg
+        if v.fl:                                                   # -0.0 + 0.0 is +0.0; every NaN is the one NaN
+            probe = self.tmp()
+            var zero = self.const_f(0.0)
+            self.ins(OP_ADD, probe, v.reg, zero)
+            self.free(zero)
+            var nanf = self.tmp()
+            self.ins(25, nanf, probe, probe, 0)
+            var canon = self.const_f(Float64(from_bits=UInt64(0x7FF8000000000000)))
+            self.ins(OP_SELECT, probe, nanf, canon, probe)
+            self.free(canon)
+            self.free(nanf)
+        self.ins(OP_ISET, r, probe, at)
+        if v.fl:
+            self.free(probe)
+        self.free(v.reg)
+
     def in_list(mut self, x: BExpr) raises -> V:
         var lhs = self.rx[x.a].copy()
+        if lhs.kind == TEXT.value:
+            self.prep_dict(x.a)
         var v = self.value(x.a)
         var r: Int
         if lhs.kind == TEXT.value:
-            var c = Int(lhs.value)
+            var c = lhs.src
             var n = self.dicts.count(c)
             var bytes = List[UInt8](length=max(n, 1), fill=0)
             for it in x.items:
@@ -506,29 +1960,29 @@ struct _Emitter(Movable):
             var set_at = self.add_set(bytes, 0)
             self.ins(OP_IN_SET, r, r, set_at)
         else:
-            if len(x.items) > 40:
-                self.free(v.reg)
-                raise Error("an IN list of more than 40 numbers is not supported yet")
             r = self.tmp()
-            if len(x.items) == 0:
-                self.ins(OP_LOAD_CONST, r, self.p.const(Int64(0)))
-            for i in range(len(x.items)):
-                var k = self.const_i(self.rx[x.items[i]].value)
-                if i == 0:
-                    if v.fl:
-                        self.ins(C_EQ, r, v.reg, k, NAN_AWARE)
+            if len(x.items) > 8:                                   # a long list: the kernel's hash set
+                self.int_set(r, v, x.items)
+            else:
+                if len(x.items) == 0:
+                    self.ins(OP_LOAD_CONST, r, self.p.const(Int64(0)))
+                for i in range(len(x.items)):
+                    var k = self.const_i(self.rx[x.items[i]].value)
+                    if i == 0:
+                        if v.fl:
+                            self.ins(C_EQ, r, v.reg, k, NAN_AWARE)
+                        else:
+                            self.ins(OP_ICMP, r, v.reg, k, C_EQ)
                     else:
-                        self.ins(OP_ICMP, r, v.reg, k, C_EQ)
-                else:
-                    var t = self.tmp()
-                    if v.fl:
-                        self.ins(C_EQ, t, v.reg, k, NAN_AWARE)
-                    else:
-                        self.ins(OP_ICMP, t, v.reg, k, C_EQ)
-                    self.ins(OP_OR, r, r, t)
-                    self.free(t)
-                self.free(k)
-            self.free(v.reg)
+                        var t = self.tmp()
+                        if v.fl:
+                            self.ins(C_EQ, t, v.reg, k, NAN_AWARE)
+                        else:
+                            self.ins(OP_ICMP, t, v.reg, k, C_EQ)
+                        self.ins(OP_OR, r, r, t)
+                        self.free(t)
+                    self.free(k)
+                self.free(v.reg)
         if x.value != 0:                                           # the list holds a NULL: a miss is unknown, not false
             var one = self.const_f(1.0)
             var h = self.const_f(0.5)
