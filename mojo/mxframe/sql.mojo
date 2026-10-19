@@ -1,0 +1,882 @@
+"""SQL text: the lexer, the parser and the syntax tree (F-150).
+
+    var st = parse_sql("SELECT region, sum(revenue) FROM orders WHERE qty > 2 GROUP BY region ORDER BY 2 DESC LIMIT 5")
+
+The dialect is a subset of DuckDB's: one SELECT over one named table (WHERE, GROUP BY, HAVING, ORDER BY, LIMIT,
+OFFSET), optionally behind EXPLAIN. Everything else raises, naming the construct and its place in the text:
+
+    SQL error at line 1, column 21: JOIN is not supported yet (joins arrive with F-153)
+
+Lines and columns count from 1; a column counts characters, not bytes. The parser only builds the tree; the binder
+(`bind.mojo`) gives names and types their meaning and raises for unknown columns and functions.
+"""
+
+# ── tokens ───────────────────────────────────────────────────────────────────────────────────────────
+
+comptime T_EOF = 0
+comptime T_IDENT = 1        # a word: a keyword or a name, as written (`up` is its upper case)
+comptime T_QIDENT = 2       # "a quoted name"
+comptime T_INT = 3          # digits
+comptime T_DEC = 4          # digits with a point: 12.50, .5
+comptime T_STR = 5          # 'text' (quotes removed, '' unescaped)
+comptime T_SYM = 6          # ( ) , . * + - / // % = <> != < <= > >= ; :: || ? $n
+
+
+@fieldwise_init
+struct Token(Copyable, Movable):
+    var kind: Int
+    var text: String
+    var up: String
+    var line: Int
+    var col: Int
+
+
+def sql_error(line: Int, col: Int, message: String) -> Error:
+    """Every error of the SQL front end has this shape, so a caller (the `mx` command) can read the position back."""
+    return Error("SQL error at line " + String(line) + ", column " + String(col) + ": " + message)
+
+
+def _tok_error(t: Token, message: String) -> Error:
+    return sql_error(t.line, t.col, message)
+
+
+def _is_letter(b: UInt8) -> Bool:
+    return (UInt8(97) <= b <= UInt8(122)) or (UInt8(65) <= b <= UInt8(90)) or b == UInt8(95) or b >= UInt8(128)
+
+
+def _is_digit(b: UInt8) -> Bool:
+    return UInt8(48) <= b <= UInt8(57)
+
+
+def _sub(src: Span[UInt8, _], a: Int, b: Int) -> String:
+    return String(unsafe_from_utf8=src[a:b])
+
+
+def upper_ascii(s: String) -> String:
+    var out = String()
+    for b in s.as_bytes():
+        out += chr(Int(b - 32)) if UInt8(97) <= b <= UInt8(122) else chr(Int(b))
+    return out^
+
+
+def lower_ascii(s: String) -> String:
+    var out = String()
+    for b in s.as_bytes():
+        out += chr(Int(b + 32)) if UInt8(65) <= b <= UInt8(90) else chr(Int(b))
+    return out^
+
+
+def lex_sql(text: String) raises -> List[Token]:
+    """The tokens of `text`, ending with a T_EOF. Raises for an unterminated string or comment, a character SQL does not
+    use, and a number written with an exponent."""
+    var src = text.as_bytes()
+    var n = len(src)
+    var out = List[Token]()
+    var i = 0
+    var line = 1
+    var col = 1
+    while i < n:
+        var b = src[i]
+        var start = i
+        var l0 = line
+        var c0 = col
+        if b == UInt8(10):
+            line += 1
+            col = 1
+            i += 1
+            continue
+        if b == UInt8(32) or b == UInt8(9) or b == UInt8(13):
+            i += 1
+            col += 1
+            continue
+        if b == UInt8(45) and i + 1 < n and src[i + 1] == UInt8(45):             # -- comment
+            while i < n and src[i] != UInt8(10):
+                i += 1
+            continue
+        if b == UInt8(47) and i + 1 < n and src[i + 1] == UInt8(42):             # /* comment */
+            i += 2
+            col += 2
+            var closed = False
+            while i < n:
+                if src[i] == UInt8(42) and i + 1 < n and src[i + 1] == UInt8(47):
+                    i += 2
+                    col += 2
+                    closed = True
+                    break
+                if src[i] == UInt8(10):
+                    line += 1
+                    col = 1
+                elif (src[i] & UInt8(0xC0)) != UInt8(0x80):
+                    col += 1
+                i += 1
+            if not closed:
+                raise sql_error(l0, c0, "this comment is never closed (expected */)")
+            continue
+        if _is_letter(b):
+            while i < n and (_is_letter(src[i]) or _is_digit(src[i]) or src[i] == UInt8(36)):
+                if (src[i] & UInt8(0xC0)) != UInt8(0x80):
+                    col += 1
+                i += 1
+            var w = _sub(src, start, i)
+            out.append(Token(T_IDENT, w, upper_ascii(w), l0, c0))
+            continue
+        if _is_digit(b) or (b == UInt8(46) and i + 1 < n and _is_digit(src[i + 1])):
+            var dot = False
+            while i < n and (_is_digit(src[i]) or (src[i] == UInt8(46) and not dot and i + 1 < n and _is_digit(src[i + 1]))):
+                if src[i] == UInt8(46):
+                    dot = True
+                i += 1
+                col += 1
+            if i < n and (src[i] == UInt8(101) or src[i] == UInt8(69)) and i + 1 < n and \
+               (_is_digit(src[i + 1]) or ((src[i + 1] == UInt8(43) or src[i + 1] == UInt8(45)) and i + 2 < n and _is_digit(src[i + 2]))):
+                var j = i + 2
+                while j < n and _is_digit(src[j]):
+                    j += 1
+                raise sql_error(l0, c0, "the number `" + _sub(src, start, j) +
+                                "` has an exponent: floating-point literals are not supported yet (FLOAT arrives with F-157)")
+            if i < n and _is_letter(src[i]):
+                raise sql_error(l0, c0, "the number `" + _sub(src, start, i) + "` runs into the letters after it")
+            var w = _sub(src, start, i)
+            out.append(Token(T_DEC if dot else T_INT, w, w, l0, c0))
+            continue
+        if b == UInt8(39) or b == UInt8(34):                                        # 'string' or "name"
+            var q = b
+            i += 1
+            col += 1
+            var s = String()
+            var closed = False
+            while i < n:
+                if src[i] == q:
+                    if i + 1 < n and src[i + 1] == q:
+                        s += chr(Int(q))
+                        i += 2
+                        col += 2
+                        continue
+                    i += 1
+                    col += 1
+                    closed = True
+                    break
+                var seq = i
+                i += 1
+                while i < n and (src[i] & UInt8(0xC0)) == UInt8(0x80):
+                    i += 1
+                if src[seq] == UInt8(10):
+                    line += 1
+                    col = 1
+                else:
+                    col += 1
+                s += _sub(src, seq, i)
+            if not closed:
+                raise sql_error(l0, c0, "this " + ("string" if q == UInt8(39) else "quoted name") + " is never closed (expected a closing " +
+                                ("'" if q == UInt8(39) else "\"") + ")")
+            out.append(Token(T_STR if q == UInt8(39) else T_QIDENT, s, s, l0, c0))
+            continue
+        # symbols
+        var two = String()
+        if i + 1 < n:
+            two = _sub(src, i, i + 2)
+        if two == "<>" or two == "!=" or two == "<=" or two == ">=" or two == "//" or two == "::" or two == "||":
+            out.append(Token(T_SYM, two, two, l0, c0))
+            i += 2
+            col += 2
+            continue
+        var one = _sub(src, i, i + 1)
+        if one == "(" or one == ")" or one == "," or one == "." or one == "*" or one == "+" or one == "-" or one == "/" or \
+           one == "%" or one == "=" or one == "<" or one == ">" or one == ";" or one == "?":
+            out.append(Token(T_SYM, one, one, l0, c0))
+            i += 1
+            col += 1
+            continue
+        if one == "$":
+            raise sql_error(l0, c0, "parameters (`$1`) are not supported")
+        var j = i + 1
+        while j < n and (src[j] & UInt8(0xC0)) == UInt8(0x80):
+            j += 1
+        raise sql_error(l0, c0, "unexpected character `" + _sub(src, i, j) + "`")
+    out.append(Token(T_EOF, "", "", line, col))
+    return out^
+
+
+# ── the syntax tree ──────────────────────────────────────────────────────────────────────────────────
+
+comptime X_INT = 0          # text: the digits
+comptime X_DEC = 1          # text: digits with a point
+comptime X_STR = 2          # text: the string
+comptime X_NULL = 3
+comptime X_TRUE = 4
+comptime X_FALSE = 5
+comptime X_DATE = 6         # DATE '2024-01-31': text: the string
+comptime X_COL = 7          # text: the name; text2: its qualifier ("" for none)
+comptime X_NEG = 8          # a: operand
+comptime X_BIN = 9          # text: + - * / // % = <> < <= > >= AND OR; a, b
+comptime X_NOT = 10         # a
+comptime X_ISNULL = 11      # a; flag: IS NOT NULL
+comptime X_BETWEEN = 12     # a BETWEEN b AND c; flag: NOT BETWEEN
+comptime X_IN = 13          # a IN (items); flag: NOT IN
+comptime X_CALL = 14        # text: the function's name in upper case; items: its arguments; flag: DISTINCT; a: 1 for (*)
+
+
+@fieldwise_init
+struct SqlExpr(Copyable, Movable):
+    var kind: Int
+    var text: String
+    var text2: String
+    var a: Int
+    var b: Int
+    var c: Int
+    var items: List[Int]
+    var flag: Bool
+    var line: Int
+    var col: Int
+
+
+@fieldwise_init
+struct SelectItem(Copyable, Movable):
+    var expr: Int
+    var alias: String
+    var has_alias: Bool
+    var line: Int
+    var col: Int
+
+
+@fieldwise_init
+struct OrderItem(Copyable, Movable):
+    var expr: Int
+    var desc: Bool
+    var nulls: Int              # -1 the default (last), 0 NULLS LAST, 1 NULLS FIRST
+
+
+comptime EXPLAIN_NONE = 0
+comptime EXPLAIN_PLAN = 1
+
+
+struct SqlStatement(Movable):
+    """A parsed SELECT (or EXPLAIN SELECT). Expressions live in `exprs`, referred to by index."""
+    var text: String
+    var exprs: List[SqlExpr]
+    var items: List[SelectItem]
+    var table: String
+    var table_alias: String
+    var table_line: Int
+    var table_col: Int
+    var where: Int              # -1 for none
+    var group_by: List[Int]
+    var having: Int
+    var order_by: List[OrderItem]
+    var limit: Int              # -1 for none
+    var offset: Int
+    var explain: Int
+
+    def __init__(out self, text: String):
+        self.text = text
+        self.exprs = List[SqlExpr]()
+        self.items = List[SelectItem]()
+        self.table = String()
+        self.table_alias = String()
+        self.table_line = 0
+        self.table_col = 0
+        self.where = -1
+        self.group_by = List[Int]()
+        self.having = -1
+        self.order_by = List[OrderItem]()
+        self.limit = -1
+        self.offset = 0
+        self.explain = EXPLAIN_NONE
+
+    def render(self, e: Int) -> String:
+        """The expression as SQL text (names as written, operators spaced), for column names and EXPLAIN."""
+        ref x = self.exprs[e]
+        if x.kind == X_INT or x.kind == X_DEC:
+            return x.text
+        if x.kind == X_STR:
+            return "'" + x.text.replace("'", "''") + "'"
+        if x.kind == X_NULL:
+            return "NULL"
+        if x.kind == X_TRUE:
+            return "true"
+        if x.kind == X_FALSE:
+            return "false"
+        if x.kind == X_DATE:
+            return "DATE '" + x.text + "'"
+        if x.kind == X_COL:
+            return (x.text2 + "." if x.text2.byte_length() > 0 else "") + x.text
+        if x.kind == X_NEG:
+            return "-" + self.render_operand(x.a)
+        if x.kind == X_BIN:
+            return self.render_operand(x.a) + " " + x.text + " " + self.render_operand(x.b)
+        if x.kind == X_NOT:
+            return "NOT " + self.render_operand(x.a)
+        if x.kind == X_ISNULL:
+            return self.render_operand(x.a) + (" IS NOT NULL" if x.flag else " IS NULL")
+        if x.kind == X_BETWEEN:
+            return self.render_operand(x.a) + (" NOT BETWEEN " if x.flag else " BETWEEN ") + self.render_operand(x.b) + " AND " + self.render_operand(x.c)
+        if x.kind == X_IN:
+            var s = self.render_operand(x.a) + (" NOT IN (" if x.flag else " IN (")
+            for k in range(len(x.items)):
+                s += (", " if k > 0 else "") + self.render(x.items[k])
+            return s + ")"
+        var s = x.text.lower() + "("
+        if x.a == 1:
+            s += "*"
+        elif x.flag:
+            s += "DISTINCT "
+        for k in range(len(x.items)):
+            s += (", " if k > 0 else "") + self.render(x.items[k])
+        return s + ")"
+
+    def render_operand(self, e: Int) -> String:
+        var k = self.exprs[e].kind
+        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG:
+            return "(" + self.render(e) + ")"
+        return self.render(e)
+
+
+# ── the parser ───────────────────────────────────────────────────────────────────────────────────────
+
+def _reserved(w: String) -> Bool:
+    """Words that end a select item or a table name, so they are never taken for an alias."""
+    return (w == "FROM" or w == "WHERE" or w == "GROUP" or w == "HAVING" or w == "ORDER" or w == "LIMIT" or w == "OFFSET" or
+            w == "UNION" or w == "INTERSECT" or w == "EXCEPT" or w == "WINDOW" or w == "QUALIFY" or w == "JOIN" or
+            w == "INNER" or w == "LEFT" or w == "RIGHT" or w == "FULL" or w == "CROSS" or w == "NATURAL" or w == "ON" or
+            w == "USING" or w == "AS" or w == "AND" or w == "OR" or w == "NOT" or w == "IN" or w == "IS" or w == "BETWEEN" or
+            w == "LIKE" or w == "ILIKE" or w == "SELECT" or w == "ASC" or w == "DESC" or w == "NULLS" or w == "FETCH" or
+            w == "TABLESAMPLE" or w == "SAMPLE" or w == "FILTER" or w == "OVER" or w == "WITHIN" or w == "THEN" or
+            w == "ELSE" or w == "END" or w == "WHEN" or w == "ESCAPE" or w == "SIMILAR" or w == "GLOB" or w == "ANTI" or
+            w == "SEMI" or w == "ASOF" or w == "POSITIONAL" or w == "LATERAL")
+
+
+def edit_distance(a: String, b: String) -> Int:
+    """Levenshtein distance of two strings (bytes), for the "did you mean" hints."""
+    var x = a.as_bytes()
+    var y = b.as_bytes()
+    var prev = List[Int](length=len(y) + 1, fill=0)
+    var cur = List[Int](length=len(y) + 1, fill=0)
+    for j in range(len(y) + 1):
+        prev[j] = j
+    for i in range(len(x)):
+        cur[0] = i + 1
+        for j in range(len(y)):
+            var cost = 0 if x[i] == y[j] else 1
+            cur[j + 1] = min(min(prev[j + 1] + 1, cur[j] + 1), prev[j] + cost)
+        swap(prev, cur)
+    return prev[len(y)]
+
+
+def closest(word: String, candidates: List[String]) -> String:
+    """The candidate nearest to `word` (case ignored) when it is near enough to be a typo, else ""."""
+    var best = String()
+    var best_d = 1000
+    var w = lower_ascii(word)
+    for c in candidates:
+        var d = edit_distance(w, lower_ascii(c))
+        if d < best_d:
+            best_d = d
+            best = c
+    var limit = 1 if w.byte_length() <= 3 else 2 if w.byte_length() <= 7 else 3
+    return best if best_d <= limit and best_d < w.byte_length() else String()
+
+
+struct _Parser(Movable):
+    var toks: List[Token]
+    var pos: Int
+    var st: SqlStatement
+
+    def __init__(out self, var toks: List[Token], text: String):
+        self.toks = toks^
+        self.pos = 0
+        self.st = SqlStatement(text)
+
+    def take(deinit self) -> SqlStatement:
+        return self.st^
+
+    # -- cursor
+    def tok(self) -> Token:
+        return self.toks[self.pos].copy()
+
+    def peek_up(self, ahead: Int = 0) -> String:
+        var at = min(self.pos + ahead, len(self.toks) - 1)
+        return self.toks[at].up if self.toks[at].kind == T_IDENT else String()
+
+    def is_sym(self, s: String, ahead: Int = 0) -> Bool:
+        var at = min(self.pos + ahead, len(self.toks) - 1)
+        return self.toks[at].kind == T_SYM and self.toks[at].text == s
+
+    def is_kw(self, w: String, ahead: Int = 0) -> Bool:
+        return self.peek_up(ahead) == w
+
+    def advance(mut self) -> Token:
+        var t = self.toks[self.pos].copy()
+        if self.pos < len(self.toks) - 1:
+            self.pos += 1
+        return t^
+
+    def describe(self, t: Token) -> String:
+        if t.kind == T_EOF:
+            return "the end of the statement"
+        if t.kind == T_STR:
+            return "the string '" + t.text + "'"
+        if t.kind == T_QIDENT:
+            return "the name \"" + t.text + "\""
+        return "`" + t.text + "`"
+
+    def expected(self, what: String) -> Error:
+        var t = self.tok()
+        var msg = "expected " + what + ", found " + self.describe(t)
+        if t.kind == T_IDENT and what.byte_length() > 0 and UInt8(65) <= what.as_bytes()[0] <= UInt8(90):
+            var hints: List[String] = ["SELECT", "FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "AND", "OR", "AS", "BY"]
+            var near = closest(t.text, hints)
+            if near.byte_length() > 0:
+                msg += " (did you mean " + near + "?)"
+        return _tok_error(t, msg)
+
+    def unsupported(self, t: Token, what: String, when: String) -> Error:
+        return _tok_error(t, what + " is not supported yet" + ((" (" + when + ")") if when.byte_length() > 0 else ""))
+
+    def expect_kw(mut self, w: String) raises -> Token:
+        if not self.is_kw(w):
+            raise self.expected(w)
+        return self.advance()
+
+    def expect_sym(mut self, s: String) raises -> Token:
+        if not self.is_sym(s):
+            raise self.expected("`" + s + "`")
+        return self.advance()
+
+    def add(mut self, var x: SqlExpr) -> Int:
+        self.st.exprs.append(x^)
+        return len(self.st.exprs) - 1
+
+    def node(mut self, kind: Int, text: String, a: Int, b: Int, c: Int, t: Token, flag: Bool = False) -> Int:
+        return self.add(SqlExpr(kind, text, String(), a, b, c, List[Int](), flag, t.line, t.col))
+
+    # -- statement
+    def statement(mut self) raises:
+        var t = self.tok()
+        if t.kind == T_IDENT and t.up == "EXPLAIN":
+            _ = self.advance()
+            self.st.explain = EXPLAIN_PLAN
+            if self.is_kw("ANALYZE"):
+                raise self.unsupported(self.tok(), "EXPLAIN ANALYZE", "F-155")
+            t = self.tok()
+        if t.kind == T_IDENT and t.up == "WITH":
+            raise self.unsupported(t, "WITH (common table expressions)", "F-159")
+        if t.kind == T_IDENT and t.up == "SELECT":
+            self.select()
+        elif t.kind == T_IDENT and (t.up == "INSERT" or t.up == "UPDATE" or t.up == "DELETE" or t.up == "CREATE" or t.up == "DROP" or
+                                    t.up == "ALTER" or t.up == "COPY" or t.up == "VALUES" or t.up == "SET" or t.up == "PRAGMA" or
+                                    t.up == "ATTACH" or t.up == "DESCRIBE" or t.up == "SHOW" or t.up == "PIVOT" or t.up == "FROM" or
+                                    t.up == "TABLE"):
+            raise _tok_error(t, "`" + t.up + "` statements are not supported: only SELECT (and EXPLAIN SELECT) is")
+        else:
+            raise self.expected("SELECT" if self.st.explain != EXPLAIN_NONE else "SELECT or EXPLAIN")
+        if self.is_sym(";"):
+            _ = self.advance()
+        if self.tok().kind != T_EOF:
+            raise self.expected("the end of the statement")
+
+    def select(mut self) raises:
+        _ = self.advance()                                                      # SELECT
+        if self.is_kw("DISTINCT"):
+            raise self.unsupported(self.tok(), "SELECT DISTINCT", "F-152")
+        if self.is_kw("ALL"):
+            _ = self.advance()
+        while True:
+            var t = self.tok()
+            if self.is_sym("*"):
+                raise self.unsupported(t, "`*` in the select list", "F-152")
+            var e = self.expr()
+            var alias = String()
+            var has = False
+            if self.is_kw("AS"):
+                _ = self.advance()
+                var a = self.tok()
+                if a.kind != T_IDENT and a.kind != T_QIDENT and a.kind != T_STR:
+                    raise self.expected("a name after AS")
+                alias = a.text
+                has = True
+                _ = self.advance()
+            elif (self.tok().kind == T_IDENT and not _reserved(self.tok().up)) or self.tok().kind == T_QIDENT:
+                self.reject_misspelled_clause()
+                alias = self.tok().text
+                has = True
+                _ = self.advance()
+            self.st.items.append(SelectItem(e, alias, has, t.line, t.col))
+            if self.is_sym(","):
+                _ = self.advance()
+                continue
+            break
+        if not self.is_kw("FROM"):
+            if self.tok().kind == T_EOF or self.is_sym(";"):
+                raise _tok_error(self.tok(), "SELECT without FROM is not supported yet (F-152)")
+            raise self.expected("FROM")
+        _ = self.advance()
+        var tt = self.tok()
+        if self.is_sym("("):
+            raise self.unsupported(tt, "a subquery in FROM", "F-159")
+        if tt.kind == T_STR:
+            raise self.unsupported(tt, "a file name in FROM ('" + tt.text + "')", "F-151: the `mx` command reads files; here register the file with a Catalog")
+        if tt.kind != T_IDENT and tt.kind != T_QIDENT:
+            raise self.expected("a table name")
+        if tt.kind == T_IDENT and _reserved(tt.up):
+            raise self.expected("a table name")
+        _ = self.advance()
+        self.st.table = tt.text
+        self.st.table_line = tt.line
+        self.st.table_col = tt.col
+        if self.is_sym("."):
+            raise self.unsupported(self.tok(), "a schema-qualified table name", "")
+        if self.is_kw("AS"):
+            _ = self.advance()
+            var a = self.tok()
+            if a.kind != T_IDENT and a.kind != T_QIDENT:
+                raise self.expected("a name after AS")
+            self.st.table_alias = a.text
+            _ = self.advance()
+        elif (self.tok().kind == T_IDENT and not _reserved(self.tok().up)) or self.tok().kind == T_QIDENT:
+            self.reject_misspelled_clause()
+            self.st.table_alias = self.tok().text
+            _ = self.advance()
+        self.reject_join()
+        if self.is_kw("WHERE"):
+            _ = self.advance()
+            self.st.where = self.expr()
+        if self.is_kw("GROUP"):
+            _ = self.advance()
+            _ = self.expect_kw("BY")
+            if self.is_kw("ALL"):
+                raise self.unsupported(self.tok(), "GROUP BY ALL", "")
+            if self.is_kw("ROLLUP") or self.is_kw("CUBE") or self.is_kw("GROUPING"):
+                raise self.unsupported(self.tok(), "GROUP BY " + self.tok().up, "")
+            while True:
+                self.st.group_by.append(self.expr())
+                if self.is_sym(","):
+                    _ = self.advance()
+                    continue
+                break
+        if self.is_kw("HAVING"):
+            _ = self.advance()
+            self.st.having = self.expr()
+        if self.is_kw("QUALIFY") or self.is_kw("WINDOW") or self.is_kw("TABLESAMPLE") or self.is_kw("SAMPLE"):
+            raise self.unsupported(self.tok(), self.tok().up, "")
+        if self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT"):
+            raise self.unsupported(self.tok(), self.tok().up, "")
+        if self.is_kw("ORDER"):
+            _ = self.advance()
+            _ = self.expect_kw("BY")
+            if self.is_kw("ALL"):
+                raise self.unsupported(self.tok(), "ORDER BY ALL", "")
+            while True:
+                var e = self.expr()
+                var desc = False
+                var nulls = -1
+                if self.is_kw("ASC"):
+                    _ = self.advance()
+                elif self.is_kw("DESC"):
+                    _ = self.advance()
+                    desc = True
+                if self.is_kw("NULLS"):
+                    _ = self.advance()
+                    if self.is_kw("FIRST"):
+                        nulls = 1
+                    elif self.is_kw("LAST"):
+                        nulls = 0
+                    else:
+                        raise self.expected("FIRST or LAST after NULLS")
+                    _ = self.advance()
+                self.st.order_by.append(OrderItem(e, desc, nulls))
+                if self.is_sym(","):
+                    _ = self.advance()
+                    continue
+                break
+        # LIMIT and OFFSET in either order
+        for _ in range(2):
+            if self.is_kw("LIMIT") and self.st.limit < 0:
+                _ = self.advance()
+                self.st.limit = self.count_literal("LIMIT")
+            elif self.is_kw("OFFSET") and self.st.offset == 0:
+                _ = self.advance()
+                self.st.offset = self.count_literal("OFFSET")
+        if self.is_kw("FETCH"):
+            raise self.unsupported(self.tok(), "FETCH", "use LIMIT")
+
+    def reject_misspelled_clause(self) raises:
+        """A word that is not a keyword but nearly is (`form`, `wher`), right before a name or a number, is a typo, not an alias."""
+        var t = self.tok()
+        if t.kind != T_IDENT:
+            return
+        var nxt = self.toks[min(self.pos + 1, len(self.toks) - 1)].copy()
+        if nxt.kind == T_EOF or (nxt.kind == T_SYM and nxt.text != "(") or (nxt.kind == T_IDENT and _reserved(nxt.up)):
+            return
+        var clauses: List[String] = ["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET"]
+        var near = closest(t.text, clauses)
+        if near.byte_length() > 0:
+            raise _tok_error(t, "expected " + ("FROM" if self.st.table.byte_length() == 0 else "a keyword or the end of the statement") +
+                             ", found `" + t.text + "` (did you mean " + near + "?)")
+
+    def count_literal(mut self, what: String) raises -> Int:
+        var t = self.tok()
+        if t.kind != T_INT:
+            if t.kind == T_IDENT and t.up == "ALL" and what == "LIMIT":
+                raise self.unsupported(t, "LIMIT ALL", "")
+            raise _tok_error(t, what + " needs a whole number, found " + self.describe(t) + " (expressions are not supported there)")
+        _ = self.advance()
+        if t.text.byte_length() > 18:
+            raise _tok_error(t, what + " " + t.text + " is too large")
+        var v = 0
+        for b in t.text.as_bytes():
+            v = v * 10 + Int(b - 48)
+        if self.is_sym("%") or self.is_kw("PERCENT"):
+            raise self.unsupported(self.tok(), what + " as a percentage", "")
+        return v
+
+    def reject_join(self) raises:
+        var t = self.tok()
+        if self.is_sym(","):
+            raise self.unsupported(t, "more than one table in FROM (a comma join)", "F-153")
+        if t.kind == T_IDENT and (t.up == "JOIN" or t.up == "INNER" or t.up == "LEFT" or t.up == "RIGHT" or t.up == "FULL" or
+                                  t.up == "CROSS" or t.up == "NATURAL" or t.up == "ANTI" or t.up == "SEMI" or t.up == "ASOF" or
+                                  t.up == "POSITIONAL" or t.up == "LATERAL"):
+            raise self.unsupported(t, (t.up + " JOIN") if t.up != "JOIN" else "JOIN", "F-153")
+
+    # -- expressions, loosest first
+    def expr(mut self) raises -> Int:
+        return self.or_expr()
+
+    def or_expr(mut self) raises -> Int:
+        var left = self.and_expr()
+        while self.is_kw("OR"):
+            var t = self.advance()
+            var right = self.and_expr()
+            left = self.node(X_BIN, "OR", left, right, -1, t)
+        return left
+
+    def and_expr(mut self) raises -> Int:
+        var left = self.not_expr()
+        while self.is_kw("AND"):
+            var t = self.advance()
+            var right = self.not_expr()
+            left = self.node(X_BIN, "AND", left, right, -1, t)
+        return left
+
+    def not_expr(mut self) raises -> Int:
+        if self.is_kw("NOT") and not self.is_kw("EXISTS", 1):
+            var t = self.advance()
+            var a = self.not_expr()
+            return self.node(X_NOT, "NOT", a, -1, -1, t)
+        return self.cmp_expr()
+
+    def cmp_expr(mut self) raises -> Int:
+        var left = self.add_expr()
+        var t = self.tok()
+        if t.kind == T_SYM and (t.text == "=" or t.text == "<>" or t.text == "!=" or t.text == "<" or t.text == "<=" or
+                                t.text == ">" or t.text == ">="):
+            _ = self.advance()
+            if self.is_kw("ANY") or self.is_kw("ALL") or self.is_kw("SOME"):
+                raise self.unsupported(self.tok(), self.tok().up + " (a quantified comparison)", "F-154")
+            var right = self.add_expr()
+            return self.node(X_BIN, "<>" if t.text == "!=" else t.text, left, right, -1, t)
+        if t.kind == T_IDENT and t.up == "IS":
+            _ = self.advance()
+            var neg = False
+            if self.is_kw("NOT"):
+                _ = self.advance()
+                neg = True
+            if self.is_kw("NULL"):
+                _ = self.advance()
+                return self.node(X_ISNULL, "", left, -1, -1, t, neg)
+            var u = self.tok()
+            if u.kind == T_IDENT and (u.up == "TRUE" or u.up == "FALSE" or u.up == "DISTINCT" or u.up == "UNKNOWN"):
+                raise self.unsupported(u, "IS " + ("NOT " if neg else "") + u.up, "F-156")
+            raise self.expected("NULL after IS")
+        var neg = False
+        var at = t.copy()
+        if t.kind == T_IDENT and t.up == "NOT" and (self.is_kw("BETWEEN", 1) or self.is_kw("IN", 1) or self.is_kw("LIKE", 1) or
+                                                   self.is_kw("ILIKE", 1) or self.is_kw("GLOB", 1) or self.is_kw("SIMILAR", 1)):
+            neg = True
+            _ = self.advance()
+            at = self.tok()
+        if at.kind == T_IDENT and at.up == "BETWEEN":
+            _ = self.advance()
+            var lo = self.add_expr()
+            _ = self.expect_kw("AND")
+            var hi = self.add_expr()
+            return self.node(X_BETWEEN, "", left, lo, hi, at, neg)
+        if at.kind == T_IDENT and at.up == "IN":
+            _ = self.advance()
+            _ = self.expect_sym("(")
+            if self.is_kw("SELECT") or self.is_kw("WITH") or self.is_kw("FROM"):
+                raise self.unsupported(self.tok(), "a subquery in IN (...)", "F-154")
+            var id = self.node(X_IN, "", left, -1, -1, at, neg)
+            while True:
+                var item = self.add_expr()
+                self.st.exprs[id].items.append(item)
+                if self.is_sym(","):
+                    _ = self.advance()
+                    continue
+                break
+            _ = self.expect_sym(")")
+            return id
+        if at.kind == T_IDENT and (at.up == "LIKE" or at.up == "ILIKE" or at.up == "GLOB" or at.up == "SIMILAR"):
+            raise self.unsupported(at, ("NOT " if neg else "") + at.up, "F-156")
+        return left
+
+    def add_expr(mut self) raises -> Int:
+        var left = self.mul_expr()
+        while self.is_sym("+") or self.is_sym("-") or self.is_sym("||"):
+            var t = self.advance()
+            if t.text == "||":
+                raise self.unsupported(t, "`||` (string concatenation)", "F-156")
+            var right = self.mul_expr()
+            left = self.node(X_BIN, t.text, left, right, -1, t)
+        return left
+
+    def mul_expr(mut self) raises -> Int:
+        var left = self.unary()
+        while self.is_sym("*") or self.is_sym("/") or self.is_sym("//") or self.is_sym("%"):
+            var t = self.advance()
+            var right = self.unary()
+            left = self.node(X_BIN, t.text, left, right, -1, t)
+        return left
+
+    def unary(mut self) raises -> Int:
+        if self.is_sym("-") or self.is_sym("+"):
+            var t = self.advance()
+            var a = self.unary()
+            if t.text == "+":
+                return a
+            ref x = self.st.exprs[a]
+            if x.kind == X_INT or x.kind == X_DEC:                               # -5 is one literal
+                if x.text.byte_length() > 0 and x.text.as_bytes()[0] != UInt8(45):
+                    self.st.exprs[a].text = "-" + x.text
+                    self.st.exprs[a].line = t.line
+                    self.st.exprs[a].col = t.col
+                    return a
+            return self.node(X_NEG, "-", a, -1, -1, t)
+        return self.postfix()
+
+    def postfix(mut self) raises -> Int:
+        var e = self.primary()
+        if self.is_sym("::"):
+            raise self.unsupported(self.tok(), "`::` (a cast)", "F-156")
+        return e
+
+    def primary(mut self) raises -> Int:
+        var t = self.tok()
+        if t.kind == T_INT:
+            _ = self.advance()
+            return self.node(X_INT, t.text, -1, -1, -1, t)
+        if t.kind == T_DEC:
+            _ = self.advance()
+            return self.node(X_DEC, t.text, -1, -1, -1, t)
+        if t.kind == T_STR:
+            _ = self.advance()
+            return self.node(X_STR, t.text, -1, -1, -1, t)
+        if t.kind == T_SYM:
+            if t.text == "(":
+                _ = self.advance()
+                if self.is_kw("SELECT") or self.is_kw("WITH") or self.is_kw("FROM"):
+                    raise self.unsupported(self.tok(), "a subquery", "F-154")
+                var e = self.expr()
+                if self.is_sym(","):
+                    raise self.unsupported(self.tok(), "a row value `(a, b)`", "")
+                _ = self.expect_sym(")")
+                return e
+            if t.text == "?":
+                raise _tok_error(t, "parameters (`?`) are not supported")
+            if t.text == "*":
+                raise _tok_error(t, "`*` can only be used as COUNT(*)")
+            raise self.expected("an expression")
+        if t.kind == T_QIDENT:
+            _ = self.advance()
+            return self.column_rest(t)
+        if t.kind == T_IDENT:
+            var w = t.up
+            if w == "NULL":
+                _ = self.advance()
+                return self.node(X_NULL, "NULL", -1, -1, -1, t)
+            if w == "TRUE":
+                _ = self.advance()
+                return self.node(X_TRUE, "true", -1, -1, -1, t)
+            if w == "FALSE":
+                _ = self.advance()
+                return self.node(X_FALSE, "false", -1, -1, -1, t)
+            if w == "DATE" and self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == T_STR:
+                _ = self.advance()
+                var s = self.advance()
+                return self.node(X_DATE, s.text, -1, -1, -1, t)
+            var next_string = self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == T_STR
+            var next_paren = self.is_sym("(", 1)
+            if w == "CASE":
+                raise self.unsupported(t, "CASE expressions", "F-156")
+            if (w == "CAST" or w == "TRY_CAST" or w == "EXTRACT") and next_paren:
+                raise self.unsupported(t, w + "(...)", "F-156")
+            if (w == "TIMESTAMP" or w == "TIME" or w == "INTERVAL") and next_string:
+                raise self.unsupported(t, w + " literals", "F-156")
+            if (w == "ARRAY" or w == "STRUCT" or w == "MAP" or w == "LIST") and next_paren:
+                raise self.unsupported(t, w + " values", "")
+            if w == "EXISTS" or (w == "NOT" and self.is_kw("EXISTS", 1)):
+                raise self.unsupported(t, "EXISTS", "F-154")
+            if _reserved(w) and w != "LEFT" and w != "RIGHT":
+                raise self.expected("an expression")
+            _ = self.advance()
+            if self.is_sym("("):
+                return self.call(t)
+            return self.column_rest(t)
+        raise self.expected("an expression")
+
+    def column_rest(mut self, first: Token) raises -> Int:
+        if self.is_sym("."):
+            _ = self.advance()
+            if self.is_sym("*"):
+                raise self.unsupported(self.tok(), "`" + first.text + ".*`", "F-152")
+            var nm = self.tok()
+            if nm.kind != T_IDENT and nm.kind != T_QIDENT:
+                raise self.expected("a column name after `.`")
+            _ = self.advance()
+            if self.is_sym("."):
+                raise self.unsupported(self.tok(), "a qualified name with more than two parts", "")
+            var id = self.node(X_COL, nm.text, -1, -1, -1, first)
+            self.st.exprs[id].text2 = first.text
+            return id
+        return self.node(X_COL, first.text, -1, -1, -1, first)
+
+    def call(mut self, name: Token) raises -> Int:
+        _ = self.advance()                                                      # (
+        var id = self.node(X_CALL, name.up, 0, -1, -1, name)
+        if self.is_sym(")"):
+            _ = self.advance()
+        else:
+            if self.is_kw("DISTINCT"):
+                _ = self.advance()
+                self.st.exprs[id].flag = True
+            if self.is_sym("*"):
+                _ = self.advance()
+                self.st.exprs[id].a = 1
+            else:
+                while True:
+                    var arg = self.expr()
+                    self.st.exprs[id].items.append(arg)
+                    if self.is_sym(","):
+                        _ = self.advance()
+                        continue
+                    break
+            if self.is_kw("ORDER"):
+                raise self.unsupported(self.tok(), "ORDER BY inside " + name.up + "(...)", "")
+            _ = self.expect_sym(")")
+        if self.is_kw("OVER"):
+            raise self.unsupported(self.tok(), "window functions (OVER)", "")
+        if self.is_kw("FILTER"):
+            raise self.unsupported(self.tok(), "FILTER (WHERE ...)", "")
+        if self.is_kw("WITHIN"):
+            raise self.unsupported(self.tok(), "WITHIN GROUP", "")
+        return id
+
+
+def parse_sql(text: String) raises -> SqlStatement:
+    """The syntax tree of one SELECT or EXPLAIN SELECT statement; raises `SQL error at line L, column C: ...`."""
+    var toks = lex_sql(text)
+    if len(toks) == 1:
+        raise sql_error(1, 1, "the statement is empty")
+    var p = _Parser(toks^, text)
+    p.statement()
+    return p^.take()
