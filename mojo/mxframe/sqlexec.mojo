@@ -583,6 +583,9 @@ def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: Dict
     notes.append("columns read: " + (names if k > 0 else "none") + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
     notes.append("kernel: " + String(sp.instr) + " instructions a row" + (", " + String(len(sp.set_meta) // 3) + " sets" if len(sp.set_meta) > 0 else "") +
                  " (" + String(sp.p.n_slots) + (" slot" if sp.p.n_slots == 1 else " slots") + ")")
+    if sp.p.day_tabs > 0:
+        notes.append("dates: " + String(sp.p.day_tabs) + " per-day " + ("table" if sp.p.day_tabs == 1 else "tables") + " over " + String(sp.p.day_days) +
+                     " days (each date function of a column ran once per day of its range, never per row)")
     if sp.p.text_tabs > 0:
         notes.append("text: " + String(sp.p.text_tabs) + " per-word " + ("table" if sp.p.text_tabs == 1 else "tables") + " over " + String(sp.p.text_words) +
                      " dictionary words in " + _ms(Float64(sp.p.text_ns) / 1e6) + " ms (each text function ran once per word, never per row)")
@@ -887,7 +890,8 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
                 scan.value().ensure_words(Int(e.value))
     var extra = src.overlay.words.copy()
     var dicts = DictAccess(src.table, scan, extra)
-    dicts.set_ranges(src.range_cols, src.range_lo, src.range_hi, src.range_has)
+    if trust or src.kind != SRC_SCAN:                        # (a footer's range that was found wrong is not used the second time)
+        dicts.set_ranges(src.range_cols, src.range_lo, src.range_hi, src.range_has, src.rows() + (len(src.overlay.delta) if src.kind != SRC_SCAN else 0), src.kind != SRC_SCAN)
     var st = make_stats(src, q, dicts, trust)
     var plan = planner.plan(q, st, opts)
     plan_sinks(lp, q, st, opts, plan)

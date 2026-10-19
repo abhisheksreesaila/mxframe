@@ -16,7 +16,7 @@ from test_mojo_sql import probe, run_probe, got_rows  # noqa: F401  (probe is a 
 
 DAY_PARTS = ["year", "month", "day", "dow", "isodow", "doy", "quarter", "epoch", "decade", "century", "millennium"]
 DATE_EXPRS = (
-    {f"x_{p}": (f"EXTRACT({p} FROM dt)", f"CAST(EXTRACT({p} FROM dt) AS BIGINT)") for p in DAY_PARTS}
+    {f"x_{p}": (f"EXTRACT({p} FROM dt)", f"EXTRACT({p} FROM dt)" if p == "epoch" else f"CAST(EXTRACT({p} FROM dt) AS BIGINT)") for p in DAY_PARTS}
     | {f"t_{p}": (f"date_trunc('{p}', dt)", f"CAST(date_trunc('{p}', dt) AS DATE)") for p in ("year", "quarter", "month", "week", "day", "decade", "century", "millennium")}
     | {f"m_{n}_{u}".replace("-", "n"): (f"dt + INTERVAL '{n}' {u}", f"CAST(dt + INTERVAL '{n}' {u} AS DATE)") for n, u in [(1, "MONTH"), (-1, "MONTH"), (13, "MONTH"), (12, "MONTH"), (1, "YEAR"), (-4, "YEAR"),
                                                                                                    (30, "DAY"), (-366, "DAY"), (2, "WEEK"), (100, "YEAR")]}
@@ -114,3 +114,39 @@ def test_reverse_of_a_word_that_duckdb_reverses_by_grapheme_clusters_is_an_error
     assert "reverses by grapheme clusters" in res["error"], res
     ok = run_probe(probe, "SELECT reverse(w) FROM t WHERE w = 'abc'", {"t": path})
     assert got_rows(ok) == [("cba",)]
+
+
+def test_a_footer_that_lies_about_a_date_range_cannot_change_an_answer(probe, tmp_path):
+    """The per-day table is built from a file's footer min / max; a row outside it is the footer lying: the query runs again without the statistics (and says so)."""
+    import struct
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    n = 20000
+    days = [datetime.date(2020, 1, 1) + datetime.timedelta(days=(i * 7) % 300) for i in range(n)]
+    days[15500] = datetime.date(2022, 6, 15)                                   # one date far past the others, in the last row group
+    tbl = pa.table({"dt": pa.array(days, pa.date32()), "x": pa.array(range(n), pa.int64())})
+    honest = tmp_path / "honest.parquet"
+    pq.write_table(tbl, honest, row_group_size=5000, write_page_index=False)
+    raw = bytearray(honest.read_bytes())
+    flen = struct.unpack("<I", raw[-8:-4])[0]
+    start = len(raw) - 8 - flen
+    foot = bytes(raw[start:-8])
+    big = (datetime.date(2022, 6, 15) - datetime.date(1970, 1, 1)).days
+    smaller = (datetime.date(2020, 10, 25) - datetime.date(1970, 1, 1)).days
+    assert foot.count(struct.pack("<i", big)) >= 1
+    lying = tmp_path / "lying.parquet"
+    lying.write_bytes(bytes(raw[:start]) + foot.replace(struct.pack("<i", big), struct.pack("<i", smaller)) + bytes(raw[-8:]))
+    con = duckdb.connect()
+    for sql in ["SELECT EXTRACT(year FROM dt) AS y, count(*), sum(x) FROM t GROUP BY 1", "SELECT count(*), sum(datediff('day', dt, DATE '2023-01-01')) FROM t",
+                "SELECT EXTRACT(month FROM dt + INTERVAL 1 YEAR) AS m, count(*) FROM t GROUP BY 1"]:
+        want = con.execute(sql.replace("FROM t", f"FROM read_parquet('{honest}')")).fetchall()
+        for file in (honest, lying):
+            for mode in ("scan", "framescan"):
+                res = run_probe(probe, sql, {"t": file}, mode=mode)
+                assert sorted(got_rows(res)) == sorted(want), (file.name, mode, sql, got_rows(res), want)
+                again = [n for n in res["notes"] if n.startswith("statistics:")]
+                assert bool(again) == (file is lying), (file.name, mode, res["notes"])
+                if file is lying:
+                    assert "ran again without them" in again[0], again
+                else:
+                    assert any(n.startswith("dates:") for n in res["notes"]), res["notes"]

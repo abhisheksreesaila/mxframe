@@ -21,7 +21,7 @@ from .table import TEXT, BOOL, FLOAT, INT, DECIMAL, DATE, F32_COLUMN, SharedTabl
 from .parquet import ParquetScan
 from .kernels.pipeline_cpu import LP
 from .kernels._fpenv import core_count, par_n
-from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
+from .query import (Program, FOOTER_LIE, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
                     CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, A_FSUM, A_FMIN, A_FMAX, _frame_mask, _null_mask,
                     OP_LOAD_COL, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX, NAN_AWARE)
@@ -30,7 +30,7 @@ from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_G
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
                    B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, DERIVED_BASE)
-from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
+from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, date_part, date_trunc_days, add_months, date_diff_days, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
                     DP_DECADE, DP_WEEK, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
@@ -47,29 +47,41 @@ comptime CONCAT_LIMIT = 1 << 20     # the most pairs of words a || of two column
 comptime CAST_TEXT_LIMIT = 1 << 22  # the most values a CAST of a column to text writes the words of
 
 
+
 struct DerivedStore(Movable):
     """The dictionaries a query's own TEXT expressions make (a text function's answers, a CASE over words, a constant word), by `src - DERIVED_BASE`.
     Every DictAccess of one query shares it, so the words the program was lowered with are the words the result is read with."""
     var words: List[List[String]]
     var built: List[Bool]
-    var index: List[Dict[String, Int]]
+    var index: List[Dict[String, Int]]       # word -> code, made when a word is first looked up (a dictionary of millions is rarely asked)
+    var indexed: List[Bool]
 
     def __init__(out self):
         self.words = List[List[String]]()
         self.built = List[Bool]()
         self.index = List[Dict[String, Int]]()
+        self.indexed = List[Bool]()
 
     def put(mut self, i: Int, var ws: List[String]):
         while len(self.words) <= i:
             self.words.append(List[String]())
             self.built.append(False)
             self.index.append(Dict[String, Int]())
-        var ix = Dict[String, Int]()
-        for k in range(len(ws)):
-            ix[ws[k]] = k
+            self.indexed.append(False)
         self.words[i] = ws^
-        self.index[i] = ix^
+        self.index[i] = Dict[String, Int]()
+        self.indexed[i] = False
         self.built[i] = True
+
+    def lookup(mut self, i: Int, w: String) -> Int:
+        if not self.indexed[i]:
+            var ix = Dict[String, Int]()
+            for k in range(len(self.words[i])):
+                ix[self.words[i][k]] = k
+            self.index[i] = ix^
+            self.indexed[i] = True
+        var hit = self.index[i].get(w)
+        return hit.value() if hit else -1
 
 
 struct DictAccess(Movable):
@@ -83,8 +95,12 @@ struct DictAccess(Movable):
     var range_lo: List[Int64]
     var range_hi: List[Int64]
     var range_has: List[Bool]
+    var rows: Int                        # how many rows the source holds (a per-day table pays off over this many)
+    var range_exact: Bool                # the ranges were found by a pass over the data (False: a Parquet footer's statistics, a hint a row may contradict)
 
     def __init__(out self, table: SharedTable, scan: Optional[ParquetScan], extra: List[List[String]]):
+        self.rows = 0
+        self.range_exact = False
         self.table = table
         self.scan = scan.copy()
         self.extra = extra.copy()
@@ -94,7 +110,9 @@ struct DictAccess(Movable):
         self.range_hi = List[Int64]()
         self.range_has = List[Bool]()
 
-    def set_ranges(mut self, cols: List[Int], lo: List[Int64], hi: List[Int64], has: List[Bool]):
+    def set_ranges(mut self, cols: List[Int], lo: List[Int64], hi: List[Int64], has: List[Bool], rows: Int = 0, exact: Bool = True):
+        self.rows = rows
+        self.range_exact = exact
         self.range_cols = cols.copy()
         self.range_lo = lo.copy()
         self.range_hi = hi.copy()
@@ -104,7 +122,7 @@ struct DictAccess(Movable):
         """The same words, and the same derived dictionaries (not a copy of them)."""
         var d = DictAccess(self.table, self.scan, self.extra)
         d.store = self.store
-        d.set_ranges(self.range_cols, self.range_lo, self.range_hi, self.range_has)
+        d.set_ranges(self.range_cols, self.range_lo, self.range_hi, self.range_has, self.rows, self.range_exact)
         return d^
 
     def range_of(self, c: Int) -> Tuple[Bool, Int64, Int64]:
@@ -155,8 +173,7 @@ struct DictAccess(Movable):
 
     def code_of(self, c: Int, w: String) raises -> Int:
         if c >= DERIVED_BASE:
-            var hit = self.store[].index[c - DERIVED_BASE].get(w)
-            return hit.value() if hit else -1
+            return self.store[].lookup(c - DERIVED_BASE, w)
         var k = self.scan.value().code_of(c, w) if self.scan else self.table.code_of(c, w)
         if k >= 0:
             return k
@@ -457,13 +474,16 @@ struct _Emitter(Movable):
             return self.tfn_value(e)
         if x.op == B_CONCAT:
             return self.concat_value(e)
-        if x.op == B_DATEPART:
-            return self.datepart_value(x)
-        if x.op == B_DATETRUNC:
-            return self.datetrunc_value(x)
-        if x.op == B_ADDMONTHS:
-            return self.addmonths_value(x)
-        if x.op == B_DATEDIFF:
+        if x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_ADDMONTHS or x.op == B_DATEDIFF:
+            var by_day = self.day_table(e)
+            if by_day:
+                return by_day.value().copy()
+            if x.op == B_DATEPART:
+                return self.datepart_value(x)
+            if x.op == B_DATETRUNC:
+                return self.datetrunc_value(x)
+            if x.op == B_ADDMONTHS:
+                return self.addmonths_value(x)
             return self.datediff_value(x)
         if x.op == B_LIT:
             return V(self.const_i(x.value), -1, False, x.kind == FLOAT.value)       # (a float literal's value is its bits: the constant pool holds bits)
@@ -1673,6 +1693,80 @@ struct _Emitter(Movable):
             self.free(z)
         return v^
 
+    def day_leaf(self, e: Int, mut col: Int, mut leaf: Int) -> Bool:
+        """Whether expression e is a function of the days of one DATE column and constants (date functions, + and - of days): then its answer can be made once per
+        day of the column's range. `col` is the column, `leaf` the node that reads it."""
+        var x = self.rx[e].copy()
+        if x.op == B_COL:
+            if x.kind != DATE.value:
+                return False
+            if col < 0:
+                col = Int(x.value)
+                leaf = e
+            return col == Int(x.value)
+        if x.op == B_LIT:
+            return x.kind == INT.value or x.kind == DATE.value
+        if x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_NEG:
+            return self.day_leaf(x.a, col, leaf)
+        if x.op == B_ADDMONTHS or x.op == B_DATEDIFF or x.op == B_ADD or x.op == B_SUB:
+            return self.day_leaf(x.a, col, leaf) and self.day_leaf(x.b, col, leaf)
+        return False
+
+    def day_eval(self, e: Int, day: Int) -> Int64:
+        """The value of a day_leaf expression for one day: the same functions the constants are folded with (`sqlfn.mojo`)."""
+        var x = self.rx[e].copy()
+        if x.op == B_COL:
+            return Int64(day)
+        if x.op == B_LIT:
+            return x.value
+        if x.op == B_NEG:
+            return -self.day_eval(x.a, day)
+        if x.op == B_DATEPART:
+            var v = date_part(Int(self.day_eval(x.a, day)), Int(x.value))
+            return Int64(Float64(v).to_bits()) if x.kind == FLOAT.value else Int64(v)
+        if x.op == B_DATETRUNC:
+            return Int64(date_trunc_days(Int(self.day_eval(x.a, day)), Int(x.value)))
+        if x.op == B_ADDMONTHS:
+            return Int64(add_months(Int(self.day_eval(x.a, day)), Int(self.day_eval(x.b, day))))
+        if x.op == B_DATEDIFF:
+            return Int64(date_diff_days(Int(self.day_eval(x.a, day)), Int(self.day_eval(x.b, day)), Int(x.value)))
+        if x.op == B_ADD:
+            return self.day_eval(x.a, day) + self.day_eval(x.b, day)
+        return self.day_eval(x.a, day) - self.day_eval(x.b, day)
+
+    def day_table(mut self, e: Int) raises -> Optional[V]:
+        """A date function of one DATE column, answered once per day of the column's range (a table the kernel looks the day up in) instead of in civil-date
+        arithmetic on every row, when the range is short against the rows (the table costs about what 20 rows do). A footer's range is a hint: a row outside
+        it is the footer lying (the query then runs again without statistics)."""
+        var col = -1
+        var leaf = -1
+        if not self.day_leaf(e, col, leaf) or col < 0:
+            return None
+        var r = self.dicts.range_of(col)
+        if not r[0]:
+            return None
+        var span = Int(r[2]) - Int(r[1]) + 1
+        if span <= 0 or span > CAST_TEXT_LIMIT or span * 20 > self.dicts.rows:
+            return None
+        var lo = r[1]
+        var ents = List[Int64](length=span, fill=0)
+        for k in range(span):
+            ents[k] = self.day_eval(e, Int(lo) + k)
+        var v = self.value(leaf)
+        var lc = self.const_i(lo)
+        self.ins(OP_ISUB, v.reg, v.reg, lc)
+        self.free(lc)
+        if not self.dicts.range_exact:
+            var bad = self.out_of_range(v.reg, 0, Int64(span - 1))
+            self.flag_errors(bad, v.nul, FOOTER_LIE + "a date outside the range the footer gave")
+            self.free(bad)
+        self.tab(v.reg, ents)
+        self.p.day_tabs += 1
+        self.p.day_days += span
+        if self.rx[e].kind == FLOAT.value:
+            self.p.has_float = True
+        return V(v.reg, v.nul, False, self.rx[e].kind == FLOAT.value)
+
     def datepart_value(mut self, x: BExpr) raises -> V:
         var v = self.date_operand_value(x.a)
         var part = Int(x.value)
@@ -1688,11 +1782,13 @@ struct _Emitter(Movable):
                 self.ins(OP_IADD, v.reg, v.reg, one)
                 self.free(one)
             return v^
-        if part == DP_EPOCH:
+        if part == DP_EPOCH:                                         # seconds, as the FLOAT DuckDB answers
             var k = self.const_i(86400)
             self.ins(OP_IMUL, v.reg, v.reg, k)
             self.free(k)
-            return v^
+            self.p.has_float = True
+            self.ins(OP_I2F, v.reg, v.reg)
+            return V(v.reg, v.nul, False, True)
         var c = self.civil(v.reg)
         var y = c[0]
         var m = c[1]

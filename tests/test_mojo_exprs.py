@@ -40,7 +40,7 @@ SPECIAL_DATES = ["1900-02-28", "1900-03-01", "2000-02-29", "2004-02-29", "2100-0
                  "1996-02-29", "1800-12-31", "2400-02-29", "1582-10-15", "2023-03-31", "2023-05-31", "1971-01-31"]
 FLOATS = ["0.0", "-0.0", "1.5", "-2.25", "'NaN'", "'Infinity'", "'-Infinity'", "1e300", "5e-324", "123456.789", "0.1", "-7.0", "2.5", "3.5", "-2.5"]
 COLS = [("id", "int"), ("g", "int"), ("x", "int"), ("y", "int"), ("d", "dec2"), ("e", "dec4"), ("f", "float"), ("s", "text"), ("s2", "text"), ("nums", "text"),
-        ("nsb", "text"), ("dt", "date"), ("dt2", "date"), ("b", "bool")]
+        ("nsb", "text"), ("dt", "date"), ("dt2", "date"), ("dtn", "date"), ("b", "bool")]
 EDITABLE = [c for c in COLS if c[0] not in ("id", "g", "f")]
 
 
@@ -66,6 +66,7 @@ def make_source(con):
           case when i % 43 = 0 then null else {sql_list(NSB)}[1 + (i * 11) % {len(NSB)}] end as nsb,
           case when i % 41 = 0 then null when i < {len(SPECIAL_DATES)} then {specials}[1 + i]::DATE else date '1896-01-01' + ((i * 977) % 80000)::int end as dt,
           case when i % 47 = 0 then null else date '1950-01-01' + ((i * 613) % 30000)::int end as dt2,
+          case when i % 53 = 0 then null else date '2019-12-15' + ((i * 13) % 120)::int end as dtn,
           case when i % 14 = 0 then null else (i % 3 = 0) end as b
         from range({N}) r(i)""")
 
@@ -92,6 +93,8 @@ def make_edits(con):
                 return rng.choice([w for w in NSB if w == w.strip()])
             return rng.choice(pool)
         if kind == "date":
+            if name == "dtn":                                               # inside the column's range: a per-day table stays valid after the edits
+                return (datetime.date(2019, 12, 20) + datetime.timedelta(days=rng.randint(0, 100))).isoformat()
             return (datetime.date(1900, 1, 1) + datetime.timedelta(days=rng.randint(0, 80000))).isoformat()
         return rng.choice(["true", "false"])
 
@@ -413,7 +416,7 @@ CAST_DATE = ("date_trunc(", "INTERVAL")
 def date_duck(expr):
     if expr.startswith("date_trunc(") or "INTERVAL" in expr:
         return f"CAST({expr} AS DATE)"
-    if expr.startswith("EXTRACT(") or expr.startswith("date_part("):
+    if (expr.startswith("EXTRACT(") or expr.startswith("date_part(")) and "epoch" not in expr:
         return f"CAST({expr} AS BIGINT)"
     return expr
 
@@ -422,6 +425,34 @@ def date_duck(expr):
 @pytest.mark.parametrize("expr", DATE_EXPRS)
 def test_dates_as_duckdb(probe, data, mode, expr):
     run(probe, data, ROW.format(expr), mode, duck=f"SELECT id, {date_duck(expr)} AS v FROM t ORDER BY id", ordered=True)
+
+
+# (the engine's expression, DuckDB's, whether the kernel gets a per-day table: the top of the expression is a date function of the one column dtn)
+DTN_EXPRS = (
+    [(f"EXTRACT({p} FROM dtn)", None, True) for p in ("year", "month", "day", "dow", "isodow", "doy", "quarter", "epoch", "decade")] + [("year(dtn)", None, True), ("dayofweek(dtn)", None, True)]
+    + [(f"date_trunc('{p}', dtn)", f"CAST(date_trunc('{p}', dtn) AS DATE)", p != "day") for p in ("year", "quarter", "month", "week", "day")]
+    + [("dtn + INTERVAL 1 MONTH", "CAST(dtn + INTERVAL 1 MONTH AS DATE)", True), ("dtn - INTERVAL '2' YEAR", "CAST(dtn - INTERVAL '2' YEAR AS DATE)", True),
+       ("dtn + INTERVAL 45 DAY", "CAST(dtn + INTERVAL 45 DAY AS DATE)", False), ("dtn + INTERVAL 3 WEEK", "CAST(dtn + INTERVAL 3 WEEK AS DATE)", False)]
+    + [("datediff('day', dtn, DATE '2020-03-01')", None, True), ("datediff('month', DATE '2019-01-31', dtn)", None, True), ("datediff('week', dtn, DATE '2021-01-01')", None, True),
+       ("datediff('year', dtn, DATE '2025-06-01')", None, True), ("dtn - DATE '2020-01-01'", None, False), ("dtn + 30", None, False), ("dtn - 100", None, False),
+       ("EXTRACT(year FROM date_trunc('month', dtn + 30))", None, True), ("EXTRACT(dow FROM dtn + INTERVAL 1 MONTH)", "CAST(EXTRACT(dow FROM CAST(dtn + INTERVAL 1 MONTH AS DATE)) AS BIGINT)", True),
+       ("date_trunc('year', dtn - INTERVAL 400 DAY)", "CAST(date_trunc('year', CAST(dtn - INTERVAL 400 DAY AS DATE)) AS DATE)", True),
+       ("datediff('month', dtn, dt2)", None, False), ("EXTRACT(month FROM dtn) * 100 + EXTRACT(day FROM dtn)", None, True)]
+)
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("expr,duck,by_day", DTN_EXPRS, ids=[e[0] for e in DTN_EXPRS])
+def test_a_date_function_of_one_column_is_answered_once_per_day(probe, data, mode, expr, duck, by_day):
+    """A column whose dates span 120 days over 3,000 rows: the function is a table the kernel looks the day up in (the notes say `dates: ... per-day`), and the answer is DuckDB's.
+    An expression that reads two columns, or is only `dtn + 30`, stays arithmetic."""
+    duck_sql = f"SELECT id, {duck or date_duck(expr)} AS v FROM t ORDER BY id"
+    res = run(probe, data, ROW.format(expr), mode, duck=duck_sql, ordered=True)
+    notes = res["notes"]
+    if by_day:
+        assert any(n.startswith("dates: ") and "per-day" in n and "never per row" in n for n in notes), notes
+    else:
+        assert not any(n.startswith("dates:") for n in notes), notes
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -436,6 +467,17 @@ def test_dates_in_filters_groups_and_aggregates(probe, data, mode):
         ("SELECT g, CASE WHEN EXTRACT(year FROM dt) < 1970 THEN 'old' ELSE 'new' END AS era, count(*) FROM t GROUP BY 1, 2", None),
     ]:
         run(probe, data, sql, mode, duck)
+
+
+@pytest.mark.parametrize("mode", ["table", "frame", "scan"])
+def test_a_group_key_that_is_a_date_part_is_dense_when_the_column_range_is_known(probe, data, mode):
+    """The planner bounds EXTRACT / date_trunc / date + INTERVAL of a column by the column's range: grouping by them needs no hash table."""
+    for sql, duck in [("SELECT EXTRACT(month FROM dtn) AS k, count(*), sum(x) FROM t GROUP BY 1", "SELECT CAST(EXTRACT(month FROM dtn) AS BIGINT) AS k, count(*), sum(x) FROM t GROUP BY 1"),
+                      ("SELECT EXTRACT(year FROM dtn) AS k, EXTRACT(dow FROM dtn) AS d, count(*) FROM t GROUP BY 1, 2", "SELECT CAST(EXTRACT(year FROM dtn) AS BIGINT) AS k, CAST(EXTRACT(dow FROM dtn) AS BIGINT) AS d, count(*) FROM t GROUP BY 1, 2"),
+                      ("SELECT date_trunc('month', dtn) AS k, count(*) FROM t GROUP BY 1", "SELECT CAST(date_trunc('month', dtn) AS DATE) AS k, count(*) FROM t GROUP BY 1"),
+                      ("SELECT dtn + INTERVAL 1 MONTH AS k, count(*) FROM t GROUP BY 1", "SELECT CAST(dtn + INTERVAL 1 MONTH AS DATE) AS k, count(*) FROM t GROUP BY 1")]:
+        res = run(probe, data, sql, mode, duck)
+        assert next(n for n in res["notes"] if n.startswith("group:")).startswith("group: dense"), res["notes"]
 
 
 def test_date_constants_are_folded(probe, data):

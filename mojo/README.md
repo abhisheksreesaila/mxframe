@@ -45,6 +45,18 @@ Rules and paths: `docs/mxframe-mojo-api.md` section 8b.
 `mojo/tools/float_probe.mojo` runs builder plans for `tests/test_mojo_float_builder.py`; `mojo/tests/test_float.mojo` is the pure-Mojo test.
 `strtod` (libSystem) parses the digits a fast path cannot: `check_mac_link.sh` lists it for the app's stub.
 
+## SQL expressions (F-156)
+
+CASE, COALESCE / NULLIF, IS DISTINCT FROM, CAST, LIKE, text functions, dates and intervals, IN lists of any length (rules and the table of what is supported: `docs/mxframe-mojo-api.md`,
+"Expressions"). The parser (`sql.mojo`) and binder (`bind.mojo`, a marked section: types shared by the branches, derived TEXT dictionaries, the date and interval rules) make typed nodes;
+`sqlprog.mojo` emits them: a text function is evaluated **once per distinct dictionary word** (`DictAccess` holds the query's derived dictionaries in a shared `DerivedStore`; the kernel
+looks codes up with `OP_TAB`, predicates use `OP_IN_SET`), dates are integer civil-date arithmetic in the integer opcodes, a long `IN` is the kernel's hash set (`OP_ISET`), and a failing CAST sets
+the kernel's error flag (`OP_FLAG`), gated by the CASE branch it sits in. The three opcodes are in `kernels_aot/pipeline_cpu.mojo` (the committed `libmxpipeline_cpu.so` / `libmxexec_cpu.so` carry them).
+`sqlfn.mojo` has the scalar functions as plain functions on values (what DuckDB answers for one word or one day, including its quirks), `unicase.mojo` is DuckDB's case mapping
+(`scripts/gen_unicase.py` asks DuckDB for it). Tests: `tests/test_mojo_exprs.py` (every function over a table, an edited frame, a streamed file and a frame over it), `test_mojo_expr_scale.py`
+(every day 1800-2400 and 60,000 UTF-8 words, value by value), `test_mojo_expr_fuzz.py` (random expressions), `test_mojo_cast_fuzz.py` (`mojo/tools/cast_probe.mojo`: how every text cast reads
+thousands of generated words, against DuckDB's TRY_CAST), `test_mx_exprs.py` (through `build/mx`). No 128-bit division in the package: Apple's libSystem has none (`scripts/check_mac_link.sh`).
+
 ## `mx`, the agent command line (F-151)
 
 `mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error

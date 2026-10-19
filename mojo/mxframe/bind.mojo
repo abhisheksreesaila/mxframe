@@ -18,7 +18,7 @@ from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_IN
                   X_SUBIN, X_EXISTS, JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI, JK_ANTI_NA,
                   X_CASE, X_CAST, X_LIKE, X_DISTINCT, X_INTERVAL, X_ISBOOL)
 from .sqlfn import (TFn, CaseTables, parse_text, ascii_case, tf_kind, char_count, decimal_text, date_text, date_part, date_trunc_days, date_diff_days, add_months, part_code,
-                    DP_DAY, TF_LOWER, TF_UPPER, TF_TRIM, TF_SUBSTR, TF_LENGTH, TF_STARTS, TF_ENDS, TF_CONTAINS, TF_LIKE, TF_STRPOS, TF_LEFT, TF_RIGHT,
+                    DP_DAY, DP_EPOCH, TF_LOWER, TF_UPPER, TF_TRIM, TF_SUBSTR, TF_LENGTH, TF_STARTS, TF_ENDS, TF_CONTAINS, TF_LIKE, TF_STRPOS, TF_LEFT, TF_RIGHT,
                     TF_REVERSE, TF_REPLACE)
 from .frame import _text_less
 
@@ -973,10 +973,6 @@ struct _Binder(Movable):
         b = self.to_float(b, ast, real)
         return real
 
-    def text_node(mut self, e: Int) -> Bool:
-        var op = self.at(e).op
-        return op == B_COL or op == B_KEY or op == B_AGG
-
     def compare(mut self, code: Int, left: Int, right: Int, ast: Int) raises -> Int:
         var a = left
         var b = right
@@ -1668,6 +1664,10 @@ struct _Binder(Movable):
         var dx = self.at(d)
         if dx.op == B_NULL:
             return self.null_of(INT.value, 0, ast)
+        if part == DP_EPOCH:                                         # DuckDB's epoch is a DOUBLE
+            if dx.op == B_LIT:
+                return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(Float64(date_part(Int(dx.value), part)).to_bits()), "", ast)
+            return self.mk(B_DATEPART, FLOAT.value, 0, d, -1, Int64(part), "", ast)
         if dx.op == B_LIT:
             return self.lit_int(date_part(Int(dx.value), part), ast)
         return self.mk(B_DATEPART, INT.value, 0, d, -1, Int64(part), "", ast)
