@@ -244,11 +244,11 @@ var h = sql(cat, "SELECT ...", o)
 three-valued logic in `WHERE` / `HAVING` (a row is kept only when the condition is true; `x IN (1, NULL)` is true or unknown; `NOT` of unknown is unknown);
 NULL is a group of its own; only groups with rows exist (a global aggregate over no rows still returns its one row); `SUM` / `MIN` / `MAX` / `AVG` / `MEDIAN`
 of no non-null value are NULL, `COUNT` is 0; `x // 0` and `x % 0` are NULL and both truncate toward zero; a word the column never held matches nothing;
-`/` always gives a FLOAT, `AVG` gives a FLOAT that is exactly what DuckDB computes (its long-double division `sum / (count * 10^scale)`, reproduced bit for bit).
+`/` always gives a FLOAT with IEEE division by zero as DuckDB (`1 / 0` is inf, `-1 / 0` is -inf, `0 / 0` is NaN; NaN equals itself and sorts after every number), `AVG` gives a FLOAT that is exactly what DuckDB computes (its long-double division `sum / (count * 10^scale)`, reproduced bit for bit).
 Text order everywhere (`ORDER BY`, `MIN` / `MAX`, `QUANTILE_DISC`, `<` and `BETWEEN` against a literal) is alphabetical ignoring ASCII case, with byte order breaking ties; `=` and `IN` compare bytes.
 
 **Differences from DuckDB, on purpose**: a `SUM` (or any int64 arithmetic) past int64 raises `a sum or an expression passed the int64 range (about 9.2e18)` where DuckDB
-widens to HUGEINT (decimal `*` too); `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
+widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP: F-157; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
 `//` on a DECIMAL and `/` below an aggregate raise (they are FLOATs until F-157); the text order above.
 
 **How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), planned from
@@ -268,6 +268,10 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 
 `r.notes` is the contract the tests assert: `source: ...`, `group: dense, 2 keys g 7 (with a NULL slot) x s 17 ... = 119 slots: <reason>` or `group: hashed on N key words: <reason>`
 (`forced by the options` when `PlannerOptions` said so), `kernel: N instructions a row (M slots)`, `ran: table|frame|scan ...: <chunks>`, `holistic: ...`, `order: ...`, `having: ...`, `time: ...`.
+
+**A file's footer statistics are a hint, not a promise.** The planner uses a Parquet footer's min / max (dense groups for an integer key) and null counts (no NULL checks) but every row group is verified as it is read: a decoded group whose null count differs from the stated one, or a row outside a stated range (dense keys over a file carry one extra group that such rows fall into), makes the query run again without the statistics (hashed groups, every column nullable) and `notes` has `statistics: the footer of `t` cannot be believed (...); ran again without them`.
+
+**Nesting**: an expression may nest 256 levels deep (parentheses, `NOT`, a repeated minus, or a chain of that many terms joined by one operator); more raises a positioned error.
 
 **A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
 `x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
