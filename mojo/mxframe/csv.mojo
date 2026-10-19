@@ -20,11 +20,13 @@ Kinds, by the first `infer_rows` rows, empty cells ignored:
                                                    (trailing zeros do not count), else scale 4. The stored value is
                                                    parsed from the digits (exact); extra digits round half away
                                                    from zero.
-  a number with an exponent (`1e5`, `2.5E-3`), or more  FLOAT (float64, correctly rounded; every NaN is one NaN).
-  than 4 decimal places (trailing zeros do not count),  A whole number or a decimal of up to 4 places stays INT /
-  or nan / inf / -inf / infinity (any case) beside      DECIMAL, which are exact. `CsvOptions(float_columns=[...])`
-  numbers                                               reads the named columns as FLOAT whatever the first rows
-                                                        show. A FLOAT cell that is not a number, or is past about
+  a decimal with 5 to 9 places (trailing zeros do      DECIMAL at that scale, exact, when every value in the
+  not count)                                            first rows fits int64 at it (money with more places)
+  a number with an exponent (`1e5`, `2.5E-3`), nan /    FLOAT (float64, correctly rounded; every NaN is one NaN).
+  inf / -inf / infinity (any case) beside numbers,      A whole number or a decimal of up to 9 places stays INT /
+  more than 9 decimal places, or a number too wide      DECIMAL, which are exact. `CsvOptions(float_columns=[...])`
+  for int64 at its scale (DuckDB reads those as         reads the named columns as FLOAT whatever the first rows
+  DOUBLE)                                               show. A FLOAT cell that is not a number, or is past about
                                                         1.8e308, is a failed cell (a null).
   YYYY-MM-DD, or an ISO timestamp                  DATE (days since 1970). A timestamp with a zone offset is
                                                    converted to UTC first, then floored to the day (as the Parquet
@@ -58,6 +60,7 @@ File format decisions:
     non-UTF-8 encoding. The parsed columns are held twice for a moment while the chunks are stitched together.
 """
 from std.ffi import external_call
+from std.sys import CompilationTarget
 from std.memory import Pointer
 from std.time import perf_counter_ns
 from std.collections import Dict
@@ -389,7 +392,19 @@ def _parse_float(p: BP, n: Int, mut out: Float64) -> Int:
     var buf = List[UInt8](length=n + 1, fill=0)
     for k in range(n):
         buf[k] = p[k]
-    var v = external_call["strtod", Float64](Int(buf.unsafe_ptr()), Int(0))
+    # strtod follows LC_NUMERIC: a host that called setlocale (a comma for the point) would stop at the point. strtod_l with the "C" locale
+    # does not (glibc, bionic and libSystem all have newlocale / strtod_l; the numeric category's mask is 2 on glibc, 16 on Apple).
+    var name = List[UInt8](length=2, fill=0)
+    name[0] = 67
+    comptime NUMERIC_MASK = 2 if CompilationTarget.is_linux() else 16
+    var loc = external_call["newlocale", Int](Int32(NUMERIC_MASK), Int(name.unsafe_ptr()), Int(0))
+    var v: Float64
+    if loc != 0:
+        v = external_call["strtod_l", Float64](Int(buf.unsafe_ptr()), Int(0), loc)
+        external_call["freelocale", NoneType](loc)
+    else:
+        v = external_call["strtod", Float64](Int(buf.unsafe_ptr()), Int(0))     # (no locale object: the process locale, normally "C")
+    _ = name^
     _ = buf^
     if v - v != 0.0:                                    # inf: the text was past the largest float64
         return F_RANGE
@@ -777,7 +792,7 @@ struct InferCol(Copyable, Movable):
     var can_date: Bool
     var can_bool: Bool
     var can_float: Bool
-    var float_only: Bool     # a value only a float can be: an exponent, nan / inf, or a number past int64
+    var float_only: Bool     # a value only a float can be: an exponent, nan / inf (a number too wide for int64 is decided in `_parse`)
     var numeric: Bool        # some value had a digit
     var places: Int
     var nonempty: Int
@@ -1111,13 +1126,18 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         if asked:
             kind = FLOAT.value
         elif s.nonempty > 0:
-            if s.can_int and not s.float_only:
+            if s.can_float and s.numeric and s.float_only:
+                kind = FLOAT.value                                # an exponent, nan / inf
+            elif s.can_int:
                 kind = INT.value
-            elif s.can_dec and s.places <= 4 and not s.float_only:
+            elif s.can_dec and s.places <= 4:
                 kind = DECIMAL.value
                 scale = 2 if s.places <= 2 else 4
-            elif s.can_float and s.numeric and (s.float_only or s.places > 4):
-                kind = FLOAT.value
+            elif s.can_dec and s.places <= 9:
+                kind = DECIMAL.value                              # money with 5 to 9 places: exact at that scale (when every value fits int64)
+                scale = s.places
+            elif s.can_float and s.numeric:
+                kind = FLOAT.value                                # more than 9 places, or a number too wide for int64 (DuckDB reads those as DOUBLE)
             elif s.can_date:
                 kind = DATE.value
             elif s.can_bool:
@@ -1132,7 +1152,7 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         _ = _walk(data, first_row, size, delim, options.infer_rows, fit)
         for c in range(ncols):
             if kinds[c] == DECIMAL.value and not fit.fits[c]:
-                kinds[c] = TEXT.value
+                kinds[c] = FLOAT.value if infer.cols[c].can_float and infer.cols[c].numeric else TEXT.value     # too wide at its scale
                 scales[c] = 0
 
     # chunks: safe row boundaries found with a parallel pre-scan of the quote state machine

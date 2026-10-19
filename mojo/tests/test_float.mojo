@@ -1,7 +1,9 @@
 # F-157 (M8): FLOAT64 as a column kind, from Mojo with no Python: tables, Parquet, CSV, Query, Frame and SQL, with exact expected values
 # (sums of multiples of 0.25 are exact in any order). tests/test_mojo_float*.py compare many more queries with DuckDB on random doubles.
 from std.os import makedirs
-from mxframe import (Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
+from std.ffi import external_call
+from std.sys import CompilationTarget
+from mxframe import (float_text, Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
                      sum, count, mean, min_of, max_of, count_distinct, median, percentile, sql, PlannerOptions, GROUP_DENSE,
                      read_parquet, write_parquet, scan_parquet, read_csv, CsvOptions, ZSTD, CPU, AUTO)
 
@@ -114,13 +116,13 @@ def test_csv_rule() raises:
     makedirs(DIR, exist_ok=True)
     var path = DIR + "f.csv"
     with open(path, "w") as f:
-        f.write("a,b,c,d,e\n1,1.5,1.25,1e3,x\n2,2.25,2.5001,2.5E-3,y\n3,,3.123456,-7,z\n")
+        f.write("a,b,c,d,e\n1,1.5,1.25,1e3,x\n2,2.25,2.5001,2.5E-3,y\n3,,3.1234567890123,-7,z\n")
     var r = read_csv(path)
     expect(r.table.kind(0) == INT, "whole numbers stay INT")
     expect(r.table.kind(1) == DECIMAL and r.table.scale(1) == 2, "up to 2 places: DECIMAL(2)")
-    expect(r.table.kind(2) == FLOAT, "more than 4 places in the first rows: FLOAT")
+    expect(r.table.kind(2) == FLOAT, "more than 9 places in the first rows: FLOAT")
     expect(r.table.kind(3) == FLOAT, "an exponent: FLOAT")
-    expect(r.table.get_float(0 + 2, 2) == 3.123456 and r.table.get_float(3, 1) == 0.0025 and r.table.get_float(3, 2) == -7.0, "the values are parsed exactly")
+    expect(r.table.get_float(2, 2) == 3.1234567890123 and r.table.get_float(3, 1) == 0.0025 and r.table.get_float(3, 2) == -7.0, "the values are parsed exactly")
     expect(r.table.get_float(2, 1) == 2.5001, "2.5001 (4 places) in a FLOAT column is the double 2.5001")
     var opts = CsvOptions()
     opts.float_columns.append("b")
@@ -304,6 +306,88 @@ def test_the_smallest_negative_subnormal_is_not_a_null() raises:
     expect(r.values(0)[0] == 2 and r.floats(1)[0] == -5e-324, "a query counts them")
 
 
+def test_marker_values_are_data_in_base_columns() raises:
+    """The Frame marks an edited null with a NaN's bits (9221120237041090561), but a base cell is null by its validity bit only: an INT or
+    DECIMAL cell may hold that value, or the previous marker (-9223372036854775807), as data."""
+    var new_marker = Int64(0x7FF8000000000001)
+    var old_marker = Int64.MIN + 1
+    var t = Table.empty()
+    var n = t.add_column("n", INT)
+    var d = t.add_column("d", DECIMAL, scale=2)
+    var g = t.add_column("g", INT)
+    var vals: List[Int64] = [new_marker, old_marker, 7, new_marker, 5]
+    for i in range(5):
+        t.append(n, vals[i])
+        t.append(d, new_marker if i % 2 == 0 else Int64(100))
+        t.append(g, Int64(i % 2))
+    t.append_null(n)
+    t.append(d, 3)
+    t.append(g, 0)
+    var shared = t^.share()
+    var f = Frame(shared)
+    for i in range(5):
+        expect(not f.is_null(0, i) and f.get(0, i) == vals[i], "a base cell holding a marker value is data")
+    expect(f.is_null(0, 5), "the null is a null")
+    var r0 = Query(f).agg(count(col("n")), min_of(col("n")), max_of(col("n"))).compute(CPU)
+    expect(r0.values(0)[0] == 5 and Int64(r0.values(1)[0]) == old_marker and Int64(r0.values(2)[0]) == new_marker, "a query over the frame counts them")
+    f.set(2, 1, 9)                                            # an edit puts the row in the delta, with its marker-valued cells
+    f.set_null(0, 3)
+    f.set(1, 4, 11)
+    var r1 = Query(f).group_by(col("g"), groups=2).agg(count(col("n")), max_of(col("n")), min_of(col("d"))).compute(CPU)
+    expect(r1.values(0)[0] == 3 and r1.values(0)[1] == 0, "counts of the non-null cells after the edits")
+    expect(Int64(r1.values(1)[0]) == new_marker and r1.values(2)[0] == 3, "a marker-valued base cell survives in the delta rows")
+    var cat = Catalog()
+    cat.add_frame("t", f)
+    var s = sql(cat, "SELECT count(n), max(n), min(n) FROM t")
+    expect(s.table.get(0, 0) == 4 and s.table.get(1, 0) == new_marker and s.table.get(2, 0) == old_marker, "SQL over the frame sees them as data")
+    var b = f.bake()
+    expect(b.get(0, 0) == new_marker and b.get(0, 1) == old_marker and b.cols[0].is_null(3) and b.cols[0].is_null(5), "bake keeps them")
+    var order = f.permutation(0)
+    expect(order[0] == 1 and order[3] == 0 and order[4] == 3, "sorted: the old marker is the smallest, the new one the largest, nulls last")
+
+
+def test_digits_parse_in_the_c_locale_whatever_the_process_locale() raises:
+    """The slow path of the float parser (strtod_l with the C locale) must not follow LC_NUMERIC: a host that called setlocale with a comma
+    for the decimal point would otherwise stop every long number at its point. Tries the locales a machine may have (none installed here
+    means the parse is checked under "C" only)."""
+    makedirs(DIR, exist_ok=True)
+    var path = DIR + "locale.csv"
+    with open(path, "w") as f:
+        f.write("x\n1.00000000000000000000001e0\n123456789012345678901.5\n0.1\n")
+    var names: List[String] = ["de_DE.UTF-8", "fr_FR.UTF-8", "de_DE.utf8", "fr_FR.utf8", "de_DE", "fr_FR", "pt_BR.UTF-8", "ru_RU.UTF-8"]
+    comptime LC_NUMERIC = 1 if CompilationTarget.is_linux() else 4
+    var switched = 0
+    for n in names:
+        var c = List[UInt8](n.as_bytes())
+        c.append(0)
+        var got = external_call["setlocale", Int](Int32(LC_NUMERIC), Int(c.unsafe_ptr()))
+        if got != 0:
+            switched += 1
+            var r = read_csv(path)
+            expect(r.table.kind(0) == FLOAT and r.table.get_float(0, 0) == 1.0 and r.table.get_float(0, 1) == 123456789012345678901.5
+                   and r.table.get_float(0, 2) == 0.1, "a long number parses to the same float under " + n)
+            var c2 = List[UInt8](length=2, fill=0)
+            c2[0] = 67
+            _ = external_call["setlocale", Int](Int32(LC_NUMERIC), Int(c2.unsafe_ptr()))
+        _ = c^
+    var r = read_csv(path)
+    expect(r.table.kind(0) == FLOAT and r.table.get_float(0, 1) == 123456789012345678901.5, "and under C")
+
+
+def test_float_text_is_the_shortest_that_reads_back() raises:
+    expect(float_text(0.1) == "0.1" and float_text(0.30000000000000004) == "0.30000000000000004" and float_text(100.0) == "100.0", "plain values")
+    expect(float_text(1e-7) == "1e-07" and float_text(5e-324) == "5e-324" and float_text(-0.0) == "-0.0" and float_text(1e16) == "1e+16", "exponents")
+    # the double Mojo's own formatter prints with one digit too few (8.69563793934264e+17 reads back as the neighbour)
+    var x = Float64(from_bits=UInt64(0x4389E3C2C7D3B6A9))
+    var t = float_text(x)
+    var back = Float64(0.0)
+    var ok = False
+    with open(DIR + "t.csv", "w") as f:
+        f.write("x\n" + t + "\n1e0\n")
+    var rr = read_csv(DIR + "t.csv")
+    expect(rr.table.get_float(0, 0) == x, "it reads back: " + t)
+
+
 def sql_table() raises -> Table:
     var t = Table.empty()
     var k = t.add_column("k", FLOAT)
@@ -363,7 +447,9 @@ def test_sql_floats() raises:
     var m = sql(cat, "SELECT count(*) FROM t WHERE f <= 0.07")
     expect(cell(m.table, 0, 0) == "9", "a 32-bit float column is compared with a literal in 32 bits: the five 0.07 rows are kept")
     var m2 = sql(cat, "SELECT count(*) FROM t WHERE f + 0 <= 0.07")
-    expect(cell(m2.table, 0, 0) == "4", "arithmetic makes it a double: the double 0.07 is below the float 0.07, so those five rows are out")
+    expect(cell(m2.table, 0, 0) == "9", "REAL arithmetic stays REAL (rounded to 32 bits), so the literal is a REAL too")
+    var m3 = sql(cat, "SELECT count(*) FROM t WHERE f <= 7e-2")
+    expect(cell(m3.table, 0, 0) == "4", "an exponent literal is a DOUBLE: the double 0.07 is below the float 0.07, so those five rows are out")
 
 
 def main() raises:
@@ -375,5 +461,8 @@ def main() raises:
     test_holistic_floats()
     test_frame_floats()
     test_the_smallest_negative_subnormal_is_not_a_null()
+    test_marker_values_are_data_in_base_columns()
     test_sql_floats()
+    test_digits_parse_in_the_c_locale_whatever_the_process_locale()
+    test_float_text_is_the_shortest_that_reads_back()
     print("ok")

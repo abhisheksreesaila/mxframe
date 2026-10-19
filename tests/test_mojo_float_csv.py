@@ -44,14 +44,19 @@ def test_the_rule_exponent_or_more_than_four_places_or_asked(dump_tool, tmp_path
         "two places": (["1.5", "2.25", "3"], "DECIMAL", 2),
         "four places": (["1.5", "2.2501", "3"], "DECIMAL", 4),
         "four places and zeros": (["1.5", "2.250000", "3"], "DECIMAL", 2),
-        "five places": (["1.5", "2.25001", "3"], "FLOAT", 0),
+        "five places": (["1.5", "2.25001", "3"], "DECIMAL", 5),
+        "nine places": (["1.5", "2.123456789", "3"], "DECIMAL", 9),
+        "ten places": (["1.5", "2.1234567891", "3"], "FLOAT", 0),
+        "nine places that do not fit at their scale": (["1.5", "2.123456789", "99999999999"], "FLOAT", 0),
         "an exponent": (["1", "2e3", "3"], "FLOAT", 0),
         "an upper case exponent": (["1.5E-3", "2", ""], "FLOAT", 0),
         "nan beside numbers": (["1.5", "nan", "3"], "FLOAT", 0),
         "inf beside numbers": (["1", "-Inf", "+infinity"], "FLOAT", 0),
         "only the word nan": (["nan", "NaN"], "TEXT", 0),
         "words": (["abc", "1e5"], "TEXT", 0),
-        "an integer past int64": (["123456789012345678901234", "1"], "TEXT", 0),
+        "an integer past int64": (["123456789012345678901234", "1"], "FLOAT", 0),
+        "a decimal past int64": (["123456789012345678901234.5", "1"], "FLOAT", 0),
+        "only a wide integer": (["123456789012345678901234"], "FLOAT", 0),
     }
     for name, (cells, kind, scale) in cases.items():
         head, rows = dump(write(tmp_path, "x", cells))

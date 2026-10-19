@@ -7,6 +7,7 @@ exact: read it with a decimal parser, not a float one), a DATE as "yyyy-mm-dd", 
 """
 from .utf8 import utf8_seq_len
 from .table import Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .floatfmt import float_text
 
 
 def civil_date(days: Int) -> String:
@@ -118,7 +119,7 @@ def _float_text(v: Int64, quote_special: Bool) -> String:
         if x > 0.0:
             return '"Infinity"' if quote_special else "inf"
         return '"-Infinity"' if quote_special else "-inf"
-    return String(x)
+    return float_text(x)
 
 
 def cell_json(t: Table, c: Int, r: Int) -> String:

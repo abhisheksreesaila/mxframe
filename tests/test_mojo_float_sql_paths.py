@@ -60,26 +60,87 @@ def test_sql_float_sums_are_the_same_bits_for_any_threads(probe, data, mode):
 
 # ── a 32-bit float column ─────────────────────────────────────────────────────────────────────────────
 
+def _same(sql, rel=()):
+    return (sql, sql, set(rel))
+
+
 F32_QUERIES = [
-    ("SELECT count(*) FROM t WHERE f <= 7.07", "SELECT count(*) FROM t WHERE f <= 7.07"),
-    ("SELECT count(*) FROM t WHERE f >= 0.07", "SELECT count(*) FROM t WHERE f >= 0.07"),
-    ("SELECT count(*) FROM t WHERE f = 0.1", "SELECT count(*) FROM t WHERE f = 0.1"),
-    ("SELECT count(*) FROM t WHERE f BETWEEN 0.05 AND 0.07", "SELECT count(*) FROM t WHERE f BETWEEN 0.05 AND 0.07"),
-    ("SELECT count(*) FROM t WHERE f IN (0.1, 0.25, 5)", "SELECT count(*) FROM t WHERE f IN (0.1, 0.25, 5)"),
-    ("SELECT count(*) FROM t WHERE 0.3 < f", "SELECT count(*) FROM t WHERE 0.3 < f"),
-    ("SELECT sum(f), avg(f), min(f), max(f) FROM t", "SELECT sum(f::DOUBLE), avg(f::DOUBLE), min(f), max(f) FROM t"),
-    ("SELECT f, count(*), sum(y) FROM t GROUP BY f ORDER BY f", "SELECT f, count(*), sum(y) FROM t GROUP BY f ORDER BY f"),
-    ("SELECT g, sum(f * y) FROM t GROUP BY g ORDER BY g", "SELECT g, sum(f::DOUBLE * y) FROM t GROUP BY g ORDER BY g"),
+    _same("SELECT count(*) FROM t WHERE f <= 7.07"),
+    _same("SELECT count(*) FROM t WHERE f >= 0.07"),
+    _same("SELECT count(*) FROM t WHERE f = 0.1"),
+    _same("SELECT count(*) FROM t WHERE f BETWEEN 0.05 AND 0.07"),
+    _same("SELECT count(*) FROM t WHERE f IN (0.1, 0.25, 5)"),
+    _same("SELECT count(*) FROM t WHERE 0.3 < f"),
+    # the reviewer's forms: DOUBLE next to REAL is DOUBLE, DECIMAL next to REAL is REAL, REAL arithmetic stays REAL
+    _same("SELECT count(*) FROM t WHERE f <= 7e-2"),
+    _same("SELECT count(*) FROM t WHERE f = 7e-2"),
+    _same("SELECT count(*) FROM t WHERE f = d"),
+    _same("SELECT count(*) FROM t WHERE f <= d"),
+    _same("SELECT count(*) FROM t WHERE -f >= -0.07"),
+    _same("SELECT count(*) FROM t WHERE f + 0 <= 0.07"),
+    _same("SELECT count(*) FROM t WHERE f * 2 <= 0.14"),
+    _same("SELECT count(*) FROM t WHERE f - 0.01 >= 0.06"),
+    _same("SELECT count(*) FROM t WHERE f / 3 > 0.02"),
+    _same("SELECT count(*) FROM t WHERE f + i < 3.5"),
+    _same("SELECT count(*) FROM t WHERE f <= i"),
+    _same("SELECT count(*) FROM t WHERE f <= y"),
+    _same("SELECT count(*) FROM t WHERE f <= x"),
+    _same("SELECT count(*) FROM t WHERE f + y <= 0.07"),
+    _same("SELECT count(*) FROM t WHERE f * 1e0 <= 0.07"),
+    _same("SELECT count(*) FROM t WHERE f IN (0.07, 7e-2)"),
+    _same("SELECT count(*) FROM t WHERE f IN (7e-2)"),
+    _same("SELECT count(*) FROM t WHERE 0.07 >= f"),
+    _same("SELECT count(*) FROM t WHERE 7e-2 >= f"),
+    _same("SELECT count(*) FROM t WHERE f <> 0.07 AND f < 0.5 + 0.02"),
+    ("SELECT sum(f), avg(f), min(f), max(f) FROM t", "SELECT sum(f::DOUBLE), avg(f::DOUBLE), min(f), max(f) FROM t", {0, 1}),
+    _same("SELECT f, count(*), sum(y) FROM t GROUP BY f ORDER BY f", {2}),
+    ("SELECT g, sum(f * y) FROM t GROUP BY g ORDER BY g", "SELECT g, sum(f::DOUBLE * y) FROM t GROUP BY g ORDER BY g", {1}),
+    _same("SELECT g, sum(f * 3), sum(f + i), sum(f / 7) FROM t GROUP BY g ORDER BY g", {1, 2, 3}),
+    _same("SELECT g, count(*) FROM t GROUP BY g HAVING max(f) <= 0.07 ORDER BY g"),
 ]
 
 
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("q", range(len(F32_QUERIES)), ids=[q[0] for q in F32_QUERIES])
 def test_a_32_bit_float_column_follows_duckdb(probe, data, mode, q):
-    sql, duck = F32_QUERIES[q]
+    sql, duck, rel = F32_QUERIES[q]
     res, got, want = run(probe, data, sql, mode, duck)
-    rel = {0, 1} if sql.startswith("SELECT sum(f)") else {1, 2} if "sum(y)" in sql else {1} if "sum(f * y)" in sql else set()
     assert_rows(got, want, rel, "ORDER BY" in sql, f"{mode}: {sql}")
+
+
+@pytest.mark.parametrize("sql", ["SELECT max(f) + min(f) FROM t", "SELECT max(f) + i FROM t GROUP BY i", "SELECT max(f) * 2 FROM t"])
+def test_32_bit_arithmetic_after_aggregation_raises_by_name(probe, data, sql):
+    res = run_probe(probe, sql, {"t": data["path"]}, expect_error=True)
+    assert "32-bit" in res["error"] and "not supported" in res["error"]
+
+
+REAL_ROW_QUERIES = [
+    ("SELECT id, f, f * 2, f + i, f <= d, -f, f / 3, f + 0 <= 0.07, f <= 7e-2 FROM t ORDER BY id", True),
+    ("SELECT id, f FROM t WHERE f <= 0.07 AND f >= 0.05 ORDER BY id", True),
+    ("SELECT id, f FROM t WHERE f = d ORDER BY id", True),
+    ("SELECT id, f + y, f * 1e0 FROM t WHERE f - 0.01 >= 0.06 ORDER BY id", True),
+]
+REAL_POST_QUERIES = [
+    "SELECT g, max(f) <= 0.07, min(f) = 0.05, max(f) < 7e-2, max(f) <= max(y), sum(f) > 1 FROM t GROUP BY g ORDER BY g",
+    "SELECT g, count(*) FROM t GROUP BY g HAVING max(f) <= 0.07 AND min(f) >= 0.05 ORDER BY g",
+    "SELECT g, count(*) FROM t GROUP BY g ORDER BY max(f), g",
+    "SELECT g, max(f) FROM t GROUP BY g ORDER BY g",
+]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("q", range(len(REAL_ROW_QUERIES)), ids=[q[0] for q in REAL_ROW_QUERIES])
+def test_real_rules_hold_in_row_queries(probe, data, mode, q):
+    sql, ordered = REAL_ROW_QUERIES[q]
+    res, got, want = run(probe, data, sql, mode)
+    assert_rows(got, want, {5} if False else set(), ordered, f"{mode}: {sql}")
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("sql", REAL_POST_QUERIES)
+def test_real_rules_hold_after_aggregation(probe, data, mode, sql):
+    res, got, want = run(probe, data, sql, mode)
+    assert_rows(got, want, set(), True, f"{mode}: {sql}")
 
 
 # ── a Frame after edits ───────────────────────────────────────────────────────────────────────────────
@@ -169,33 +230,23 @@ def test_a_frame_after_250_float_edits_equals_duckdb(probe, data, edited, mode, 
 
 TPCH = Path(os.environ.get("MXFRAME_TPCH_DATA", "/home/abhisheksreesaila/Projects/mxframe/data")) / "tpch_sf1" / "lineitem.parquet"
 
-# Predicates stay native in DuckDB (a REAL column against a literal is compared as REAL, as the engine does); arithmetic is cast to DOUBLE,
-# because the engine widens a 32-bit column to float64 when it reads it.
+# DuckDB runs the SQL as written, on the REAL columns: the engine models REAL (32-bit) arithmetic and comparisons the same way.
 TPCH_QUERIES = [
     ("Q1",
      "SELECT l_returnflag, l_linestatus, sum(l_quantity), sum(l_extendedprice), sum(l_extendedprice * (1 - l_discount)), "
      "sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)), avg(l_quantity), avg(l_extendedprice), avg(l_discount), count(*) "
      "FROM lineitem WHERE l_shipdate <= 10471 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
-     "SELECT l_returnflag, l_linestatus, sum(l_quantity::DOUBLE), sum(l_extendedprice::DOUBLE), sum(l_extendedprice::DOUBLE * (1 - l_discount::DOUBLE)), "
-     "sum(l_extendedprice::DOUBLE * (1 - l_discount::DOUBLE) * (1 + l_tax::DOUBLE)), avg(l_quantity::DOUBLE), avg(l_extendedprice::DOUBLE), "
-     "avg(l_discount::DOUBLE), count(*) FROM lineitem WHERE l_shipdate <= 10471 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus",
      {2, 3, 4, 5, 6, 7, 8}),
     ("Q6",
      "SELECT sum(l_extendedprice * l_discount) FROM lineitem WHERE l_shipdate >= 8766 AND l_shipdate < 9131 "
-     "AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24",
-     "SELECT sum(l_extendedprice::DOUBLE * l_discount::DOUBLE) FROM lineitem WHERE l_shipdate >= 8766 AND l_shipdate < 9131 "
      "AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24", {0}),
     ("by discount",
-     "SELECT l_discount, count(*), sum(l_extendedprice), min(l_quantity), max(l_tax) FROM lineitem GROUP BY l_discount ORDER BY l_discount",
-     "SELECT l_discount, count(*), sum(l_extendedprice::DOUBLE), min(l_quantity), max(l_tax) FROM lineitem GROUP BY l_discount ORDER BY l_discount", {2}),
+     "SELECT l_discount, count(*), sum(l_extendedprice), min(l_quantity), max(l_tax) FROM lineitem GROUP BY l_discount ORDER BY l_discount", {2}),
     ("float filter and key",
      "SELECT l_tax, count(*), avg(l_extendedprice / l_quantity) FROM lineitem WHERE l_quantity >= 10.5 AND l_extendedprice > 50000.5 "
-     "GROUP BY l_tax ORDER BY l_tax",
-     "SELECT l_tax, count(*), avg(l_extendedprice::DOUBLE / l_quantity::DOUBLE) FROM lineitem WHERE l_quantity >= 10.5 AND l_extendedprice > 50000.5 "
      "GROUP BY l_tax ORDER BY l_tax", {2}),
     ("median",
      "SELECT l_returnflag, median(l_extendedprice), quantile_disc(l_quantity, 0.9), count(DISTINCT l_extendedprice) FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag",
-     "SELECT l_returnflag, median(l_extendedprice::DOUBLE), quantile_disc(l_quantity, 0.9), count(DISTINCT l_extendedprice) FROM lineitem GROUP BY l_returnflag ORDER BY l_returnflag",
      set()),
 ]
 
@@ -213,8 +264,8 @@ def tpch_con():
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("q", range(len(TPCH_QUERIES)), ids=[q[0] for q in TPCH_QUERIES])
 def test_tpch_sf1_single_table_queries_equal_duckdb(probe, tpch_con, mode, q):
-    name, sql, duck, rel = TPCH_QUERIES[q]
+    name, sql, rel = TPCH_QUERIES[q]
     res = run_probe(probe, sql, {"lineitem": TPCH}, mode=mode)
     got = got_rows(res)
-    want = tpch_con.execute(duck).fetchall()
+    want = tpch_con.execute(sql).fetchall()
     assert_rows(got, want, rel, True, f"{mode} {name}")
