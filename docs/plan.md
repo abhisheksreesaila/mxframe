@@ -1612,3 +1612,15 @@ Needs: F-158 · Size: L · port of `grace.py` / `spill.py`; until then an oversi
 ## F-164 `mx` Arrow IPC output [todo, owner decision]
 Needs: F-151 · Size: M
 - [ ] `--format arrow`: an Arrow IPC stream (int64, decimal128, date32, utf8 / dictionary, bool, float64, validity) that pyarrow and DuckDB read back exactly
+
+## F-165 Rename to omxcore [todo, owner decision 2026-10-19: name chosen; timing and PyPI publish need the owner's yes]
+omxcore = the core engine that apps (omxplorer, …) build on; nobody depends on `mxframe` yet. Done in one pass at a clean point (after an M8 slice lands):
+- [ ] PyPI `omxcore` (and `mxframe` as a one-line forwarding package); `import omxcore as mx` (the alias keeps code short); the Mojo package `omxcore.mojoc` and `from omxcore import …`; the `mx` CLI keeps its name
+- [ ] repo renamed (GitHub redirects old links), docs site URL, README / docs / internals pages, test names and paths that say mxframe; the app (omxplorer) told how to re-vendor
+- [ ] positioning everywhere: "a compute engine (CPU and GPU) with persistence to open Parquet files", never "a database"
+
+## M9 Open table formats: safe changes on plain Parquet (Delta Lake / Apache Iceberg) [todo]
+Owner, 2026-10-19 (first principles): no file format of our own; Parquet is the storage. When an app needs incremental saves, crash safety, versions or several writers, follow the open table formats: Parquet data files + a commit log / manifest. Order to decide (read first, then write):
+- [ ] read Delta Lake and Iceberg tables (the log / manifest → the live Parquet files, deletion vectors, schema evolution) as a streamed source; time travel by version
+- [ ] write: append and overwrite commits, then row-level changes as small new files + a commit (a Frame's edits become a commit, not a whole-file rewrite); optimistic concurrency for several writers
+- [ ] omxplorer-style apps get autosave and history from it, as a plugin over these primitives
