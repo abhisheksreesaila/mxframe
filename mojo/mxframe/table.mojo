@@ -30,7 +30,7 @@ struct ColumnKind(Equatable, ImplicitlyCopyable, Writable):
         return self.value != other.value
 
     def write_to(self, mut writer: Some[Writer]):
-        var names: List[String] = ["INT", "DECIMAL", "TEXT", "DATE", "BOOL"]
+        var names: List[String] = ["INT", "DECIMAL", "TEXT", "DATE", "BOOL", "FLOAT"]
         writer.write(names[self.value] if 0 <= self.value < len(names) else "kind " + String(self.value))
 
 
@@ -39,6 +39,8 @@ comptime DECIMAL = ColumnKind(1)
 comptime TEXT = ColumnKind(2)
 comptime DATE = ColumnKind(3)
 comptime BOOL = ColumnKind(4)
+comptime FLOAT = ColumnKind(5)     # a result-only kind (F-150): the value slot holds a float64's bits; AVG and `/` produce it,
+                                   # no file or Frame takes it until F-157 makes it a full column kind
 
 
 struct Column(Movable):
@@ -103,7 +105,7 @@ struct Table(Movable):
         """Adds an empty column; returns its index. A DECIMAL's scale is its number of decimal places."""
         if name in self.by_name:
             raise Error("column `" + name + "` already exists")
-        if kind.value < 0 or kind.value > 4:
+        if kind.value < 0 or kind.value > 5:
             raise Error("column `" + name + "`: unknown kind " + String(kind.value))
         if scale < 0 or scale > 18:
             raise Error("column `" + name + "`: scale " + String(scale) + " is outside 0..18")

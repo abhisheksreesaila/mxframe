@@ -32,7 +32,7 @@ from std.bit import pop_count, byte_swap
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
 # Parquet enums (parquet.thrift)
@@ -327,6 +327,9 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         raise Error("a table with no columns cannot be written as Parquet")
     if row_group_rows < 8 or row_group_rows % 8 != 0:
         raise Error("row_group_rows must be a positive multiple of 8, got " + String(row_group_rows))
+    for c in range(t.columns()):
+        if t.cols[c].kind == FLOAT:
+            raise Error("column `" + t.cols[c].name + "` is FLOAT, a result-only kind: it cannot be written to Parquet yet (F-157)")
     var optional = List[Bool]()
     for c in range(t.columns()):
         optional.append(t.cols[c].nulls > 0)
@@ -580,6 +583,12 @@ struct _ChunkMeta(Copyable, Movable):
     var dict_off: Int
     var size: Int                    # total_compressed_size: the bytes of the chunk's pages (headers included)
     var group_rows: Int              # its row group's num_rows, -1 when the footer has none
+    var nulls: Int                   # its Statistics' null_count, -1 when absent
+    var stat_n: Int                  # the byte length of its Statistics' minimum and maximum (0: it states none)
+    var min_le: Int64                # the minimum and maximum read little-endian (INT32 / INT64) and big-endian (a short decimal)
+    var max_le: Int64
+    var min_be: Int64
+    var max_be: Int64
 
 
 struct _Bytes:
@@ -1029,7 +1038,7 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
         if f[0] == 1 and f[1] == T_LIST:
             var h = r.list_header()
             for _ in range(h[1]):
-                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0, -1)
+                var meta = _ChunkMeta(-1, 0, 0, -1, -1, 0, -1, -1, 0, 0, 0, 0, 0)
                 r.enter()
                 while True:
                     var g = r.field()
@@ -1055,6 +1064,29 @@ def _read_row_group(mut r: ThriftReader) raises -> List[_ChunkMeta]:
                                 meta.data_off = Int(r.zigzag())
                             elif m[0] == 11 and m[1] == T_I64:
                                 meta.dict_off = Int(r.zigzag())
+                            elif m[0] == 12 and m[1] == T_STRUCT:      # Statistics (F-150: ranges and null counts for the planner)
+                                r.enter()
+                                var lo5 = (0, Int64(0), Int64(0))
+                                var hi5 = (0, Int64(0), Int64(0))
+                                while True:
+                                    var st = r.field()
+                                    if st[1] == T_STOP:
+                                        break
+                                    if st[0] == 3 and st[1] == T_I64:
+                                        meta.nulls = Int(r.zigzag())
+                                    elif st[0] == 5 and st[1] == T_BINARY:
+                                        hi5 = r.raw_value()
+                                    elif st[0] == 6 and st[1] == T_BINARY:
+                                        lo5 = r.raw_value()
+                                    else:
+                                        r.skip(st[1])
+                                r.leave()
+                                if lo5[0] == hi5[0] and lo5[0] > 0 and lo5[0] <= 8:
+                                    meta.stat_n = lo5[0]
+                                    meta.min_le = lo5[1]
+                                    meta.max_le = hi5[1]
+                                    meta.min_be = lo5[2]
+                                    meta.max_be = hi5[2]
                             else:
                                 r.skip(m[1])
                         r.leave()
@@ -2419,6 +2451,46 @@ struct ParquetScan(Copyable, Movable):
         if leaf.converted == CT_JSON or leaf.logical == 12:
             return "JSON in the file: saving would write plain text"
         return ""
+
+    def null_count(self, c: Int) -> Int:
+        """The nulls column `c` holds according to the file's statistics, -1 when a row group states none (or the column is
+        REQUIRED, which holds none: 0)."""
+        if self._info[].leaves[c].repetition != OPTIONAL:
+            return 0
+        var total = 0
+        for g in range(len(self._info[].groups)):
+            ref ch = self._info[].groups[g][c]
+            if ch.nulls < 0:
+                return -1
+            total += ch.nulls
+        return total
+
+    def column_range(self, c: Int) -> Tuple[Bool, Int64, Int64]:
+        """(known, lowest, highest) stored value of column `c` from the row groups' statistics, for INT, DECIMAL and DATE columns on
+        INT32, INT64 or a short FIXED_LEN_BYTE_ARRAY decimal: `known` is False when a row group states none or the column is of another
+        kind (and when there is no value at all, known is True with lowest > highest)."""
+        var k = self.schema.kind(c)
+        if k != INT and k != DECIMAL and k != DATE:
+            return (False, 0, 0)
+        ref leaf = self._info[].leaves[c]
+        var fixed = leaf.ptype == PT_FIXED and k == DECIMAL and leaf.type_length >= 1 and leaf.type_length <= 8
+        if (leaf.ptype != PT_INT32 and leaf.ptype != PT_INT64 and not fixed) or (_is_unsigned(leaf) and leaf.ptype == PT_INT64):
+            return (False, 0, 0)
+        var want = 4 if leaf.ptype == PT_INT32 else 8 if leaf.ptype == PT_INT64 else leaf.type_length
+        var lo = Int64.MAX
+        var hi = Int64.MIN
+        for g in range(len(self._info[].groups)):
+            ref ch = self._info[].groups[g][c]
+            if ch.values == 0 or (ch.nulls >= 0 and ch.nulls == ch.values):          # no value in the chunk
+                continue
+            if ch.stat_n != want:
+                return (False, 0, 0)
+            try:
+                lo = min(lo, _to_stored(leaf, ch.min_be if fixed else ch.min_le))
+                hi = max(hi, _to_stored(leaf, ch.max_be if fixed else ch.max_le))
+            except:
+                return (False, 0, 0)
+        return (True, lo, hi)
 
     def nullable(self, c: Int) -> Bool:
         """Column `c` is declared OPTIONAL in the file (it may hold nulls; a REQUIRED column holds none)."""

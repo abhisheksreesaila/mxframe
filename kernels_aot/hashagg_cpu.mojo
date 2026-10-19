@@ -43,7 +43,7 @@ Return: 0 ok, -1 bad program, -3 too many registers, -5 `keyw` failed (invalid d
 
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, bitcast
-from _fpenv import par, par_n
+from _fpenv import par, par_n, start_pool
 from std.atomic import Atomic
 from std.ffi import external_call
 
@@ -411,7 +411,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
     if nt == 1:
         worker(0)
     else:
-        _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+        start_pool()
         par(worker, nt)
 
     var over = False
@@ -549,7 +549,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         if nm == 1:
             merge_part(0)
         else:
-            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+            start_pool()
             par(merge_part, nm)
 
     if rc == 0 and ovf[0] != 0:
@@ -603,7 +603,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
         if nm == 1:
             copy_part(0)
         else:
-            _ = external_call["KGEN_CompilerRT_AsyncRT_GetOrCreateCPUDevice", Int]()
+            start_pool()
             par(copy_part, nm)
 
     for i in range(nparts):

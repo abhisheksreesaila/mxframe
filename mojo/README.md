@@ -17,6 +17,15 @@ Why the kernels are copied, not imported from `-I kernels_aot`: a `.mojoc` does 
 the `-I` path (a consumer then fails with "unable to locate module"), and a shared library that only re-imports
 `@export` functions exports nothing, so the `.so` builds must keep compiling the original files.
 
+## SQL (F-150)
+
+`sql(catalog, "SELECT ...")` runs an aggregate query over one table, a Frame or a Parquet scan registered by name and returns an owned
+`Table` plus the planner's notes and EXPLAIN (`docs/mxframe-mojo-api.md` section 8). The modules: `sql.mojo` (lexer, parser, syntax tree),
+`bind.mojo` (Catalog, typed tree, binder), `planner.mojo` (`Planner` trait, `RulePlanner`, `Stats`, `PlannerOptions`), `sqlprog.mojo` (the
+kernel program in SQL's mode), `sqleval.mojo` (HAVING, ORDER BY and select expressions over the groups), `sqlexec.mojo` (chunks, partial
+results, the finish, `sql`). `mojo/tools/sql_probe.mojo` runs one SQL string over Parquet files and prints typed JSON (tests/test_mojo_sql.py
+compares it with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` run in `pixi run mojo-test`.
+
 ## Build switches (F-138b): the package on an app with no GPU, thread pool or codecs
 
 Three compile-time switches, read when the app builds (`mojo build ... -D NAME`), not when the package is built. Each

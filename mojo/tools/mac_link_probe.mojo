@@ -5,7 +5,7 @@
 from std.ffi import c_int
 from mxframe import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
-                     count_distinct, median, percentile, top_k)
+                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql)
 
 
 def run() raises:
@@ -43,6 +43,17 @@ def run() raises:
     sf.save("probe-edited.parquet", "{}", ZSTD)
     var c = read_csv("probe.csv")
     print(c.table.rows())
+    # F-150: SQL over a table, a frame and a scan, dense and hashed groups, the two-pass holistic aggregates
+    var cat = Catalog()
+    cat.add_table("t", shared)
+    cat.add_frame("f", f)
+    cat.add_scan("s", scan_parquet("probe.parquet"))
+    var hashed = PlannerOptions()
+    hashed.group = GROUP_HASHED
+    for name in ["t", "f", "s"]:
+        var a = sql(cat, "SELECT k, count(*), sum(v), avg(v) FROM " + name + " WHERE v > 0 GROUP BY k ORDER BY 2 DESC LIMIT 2")
+        var b = sql(cat, "SELECT k, count(DISTINCT v), median(v), min(v) FROM " + name + " GROUP BY k HAVING count(*) > 1", hashed)
+        print(a.table.rows(), b.table.rows(), a.notes[0], sql(cat, "EXPLAIN SELECT count(*) FROM " + name).explain)
 
 
 @export("mojo_entry")

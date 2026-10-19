@@ -456,6 +456,8 @@ struct Program(Movable):
     var section: Int                 # where `emit` writes: 0 predicate, 1 body, 2 aggregates
     var next_keep: Int               # registers 1 .. next_keep-1 hold values that must live on (the predicate's
     var temp_top: Int                # running AND, each aggregate's value); temporaries come down from the top
+    var set_bytes: List[UInt8]       # F-150 (SQL): the byte sets OP_IN_SET reads and their (offset, length, lowest) triples; the builder has none
+    var set_meta: List[Int64]
 
     def __init__(out self, n_table_cols: Int):
         self.pred = List[Int32]()
@@ -482,6 +484,8 @@ struct Program(Movable):
         self.src_valid = List[Int]()
         self.ctl_const = -1
         self.section = 0
+        self.set_bytes = List[UInt8]()
+        self.set_meta = List[Int64]()
 
     def emit(mut self, op: Int, d: Int, a: Int = 0, b: Int = 0, c: Int = 0):
         var ins: List[Int32] = [Int32(op), Int32(d), Int32(a), Int32(b), Int32(c)]
@@ -1000,8 +1004,8 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: In
         consts.append(0.0)
     if ctl_addr != 0:
         consts[p.ctl_const] = Float64(from_bits=UInt64(ctl_addr))
-    var set_bytes: List[UInt8] = [0]
-    var set_meta: List[Int64] = [0, 0, 0]
+    var set_bytes: List[UInt8] = p.set_bytes.copy() if len(p.set_bytes) > 0 else [0]      # (F-150: a SQL program's IN sets)
+    var set_meta: List[Int64] = p.set_meta.copy() if len(p.set_meta) > 0 else [0, 0, 0]
     var tbl: List[Int64] = [0, Int64(n)]
     for c in p.cols:
         if c >= 0:
