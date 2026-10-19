@@ -618,6 +618,7 @@ struct Program(Movable):
     var conv: List[String]           # F-156: the casts that can fail (OP_FLAG): what the error says when one does
     var text_tabs: Int               # F-156: the per-word tables the program carries (a text function answered once per dictionary word)
     var text_words: Int              # ... and how many words they were evaluated on
+    var text_ns: Int                 # ... and how long that took
 
     def __init__(out self, n_table_cols: Int):
         self.pred = List[Int32]()
@@ -654,6 +655,7 @@ struct Program(Movable):
         self.conv = List[String]()
         self.text_tabs = 0
         self.text_words = 0
+        self.text_ns = 0
 
     def add_conv(mut self, why: String):
         for c in self.conv:

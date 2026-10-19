@@ -254,12 +254,16 @@ struct LikePattern(Copyable, Movable):
     var lo: List[Int]
     var hi: List[Int]
     var lit: List[UInt8]
+    var shape: Int             # 0 general, 1 `lit`, 2 `lit%`, 3 `%lit`, 4 `%lit%`, 5 `%` (anything): the shapes that need no backtracking
+    var needle: List[UInt8]    # the literal of shapes 1 to 4
 
     def __init__(out self, pattern: String, escape: String, has_escape: Bool):
         self.kind = List[Int]()
         self.lo = List[Int]()
         self.hi = List[Int]()
         self.lit = List[UInt8]()
+        self.shape = 0
+        self.needle = List[UInt8]()
         var b = pattern.as_bytes()
         var e = -1
         if has_escape and escape.byte_length() > 0:
@@ -296,10 +300,51 @@ struct LikePattern(Copyable, Movable):
                     self.lit.append(b[i + j])
                 self.hi.append(len(self.lit))
             i += k
+        var first = 0
+        var last = len(self.kind)
+        while first < last and self.kind[first] == 0:
+            first += 1
+        while last > first and self.kind[last - 1] == 0:
+            last -= 1
+        var plain = True
+        for t in range(first, last):
+            plain = plain and self.kind[t] == 2
+        if plain:
+            if len(self.kind) > 0 and first == last:
+                self.shape = 5                                   # only `%`
+            else:
+                var lead = first > 0
+                var trail = last < len(self.kind)
+                self.shape = 4 if (lead and trail) else 3 if lead else 2 if trail else 1
+                for t in range(first, last):
+                    for j in range(self.lo[t], self.hi[t]):
+                        self.needle.append(self.lit[j])
 
     def matches(self, s: String) -> Bool:
-        var b = s.as_bytes()
+        return self.matches_bytes(s.as_bytes())
+
+    def matches_bytes(self, b: Span[UInt8, _]) -> Bool:
         var n = len(b)
+        var sh = self.shape
+        if sh != 0:
+            var m = len(self.needle)
+            if sh == 5:
+                return True
+            if sh == 1:
+                return n == m and self._eq_at(b, 0)
+            if sh == 2:
+                return n >= m and self._eq_at(b, 0)
+            if sh == 3:
+                return n >= m and self._eq_at(b, n - m)
+            if m == 0:
+                return True
+            var first = self.needle[0]
+            var i = 0
+            while i + m <= n:
+                if b[i] == first and self._eq_at(b, i):
+                    return True
+                i += 1
+            return False
         var m = len(self.kind)
         var si = 0
         var pi = 0
@@ -325,6 +370,12 @@ struct LikePattern(Copyable, Movable):
         while pi < m and self.kind[pi] == 0:
             pi += 1
         return pi == m
+
+    def _eq_at(self, b: Span[UInt8, _], at: Int) -> Bool:
+        for j in range(len(self.needle)):
+            if b[at + j] != self.needle[j]:
+                return False
+        return True
 
     def _lit_at(self, b: Span[UInt8, _], si: Int, pi: Int) -> Bool:
         var k = self.hi[pi] - self.lo[pi]
@@ -640,9 +691,8 @@ def _unscore(t: List[UInt8], hexdigits: Bool, mut out: List[UInt8]) -> Bool:
 struct _Num(Movable):
     var ok: Bool
     var neg: Bool
-    var mant: UInt128          # all the digits as one number (leading zeros dropped)
-    var digits: Int            # how many significant digits it has
-    var e10: Int               # the value is mant * 10^e10
+    var dig: List[UInt8]       # the significant digits (leading zeros dropped), at most 38
+    var e10: Int               # the value is dig * 10^e10
     var has_exp: Bool
     var odd: Bool              # a number whose exponent has no digits (`1e`, `5e-`): DuckDB reads some of those and not others
 
@@ -650,8 +700,7 @@ struct _Num(Movable):
         self.odd = False
         self.ok = False
         self.neg = False
-        self.mant = UInt128(0)
-        self.digits = 0
+        self.dig = List[UInt8]()
         self.e10 = 0
         self.has_exp = False
 
@@ -678,13 +727,12 @@ def _scan_number(t: List[UInt8]) -> _Num:
         if not _is_digit_b(c):
             break
         digits_seen += 1
-        if r.digits == 0 and c == UInt8(48):
+        if len(r.dig) == 0 and c == UInt8(48):
             pass                                             # a leading zero carries no weight
         else:
-            if r.digits >= 38:
+            if len(r.dig) >= 38:
                 return r^                                    # more digits than this reads
-            r.mant = r.mant * UInt128(10) + UInt128(Int(c) - 48)
-            r.digits += 1
+            r.dig.append(c - 48)
         if in_frac:
             frac += 1
         i += 1
@@ -717,32 +765,37 @@ def _scan_number(t: List[UInt8]) -> _Num:
 
 
 def _scaled(r: _Num, scale: Int, mut out: Int64) -> Bool:
-    """The number times 10^scale as an int64, halves rounded away from zero; False when it does not fit."""
+    """The number times 10^scale as an int64, halves rounded away from zero (the first dropped digit decides); False when it does not fit. (No 128-bit
+    arithmetic: the package is linked into apps whose C library has no 128-bit division.)"""
+    var n = len(r.dig)
     var k = r.e10 + scale
-    var m = r.mant
-    if m == UInt128(0):
+    if n == 0:
         out = 0
         return True
-    if k >= 0:
-        if k > 19:
-            return False
-        for _ in range(k):
-            if m > UInt128(9223372036854775808):
-                return False
-            m = m * UInt128(10)
-    else:
-        if -k > 38:
+    var keep = n
+    var round_up = False
+    if k < 0:
+        var drop = -k
+        if drop > n:
             out = 0
             return True
-        var p = UInt128(10) ** UInt128(-k)
-        var q = m // p
-        var rem = m - q * p
-        if rem * UInt128(2) >= p:
-            q += UInt128(1)
-        m = q
-    if m > (UInt128(9223372036854775808) if r.neg else UInt128(9223372036854775807)):
+        keep = n - drop
+        round_up = r.dig[keep] >= UInt8(5)
+    var total = keep + (k if k > 0 else 0)
+    if total > 19:
         return False
-    out = (Int64.MIN if m == UInt128(9223372036854775808) else Int64(0) - Int64(m)) if r.neg else Int64(m)
+    var limit = UInt64(9223372036854775808) if r.neg else UInt64(9223372036854775807)
+    var v = UInt64(0)
+    for j in range(total):
+        var d = UInt64(r.dig[j]) if j < keep else UInt64(0)
+        if v > (limit - d) // 10:
+            return False
+        v = v * 10 + d
+    if round_up:
+        if v >= limit:
+            return False
+        v += 1
+    out = (Int64.MIN if v == UInt64(9223372036854775808) else Int64(0) - Int64(v)) if r.neg else Int64(v)
     return True
 
 
@@ -754,7 +807,8 @@ def _parse_radix(t: List[UInt8], radix: Int, bits: Int) -> Parsed:
         body.append(t[k])
     if not _unscore(body, radix == 16, digits) or len(digits) == 0:
         return Parsed(False)
-    var v = UInt128(0)
+    var v = UInt64(0)
+    var limit = UInt64(9223372036854775807)
     for d in digits:
         var x = 0
         if _is_digit_b(d):
@@ -765,10 +819,10 @@ def _parse_radix(t: List[UInt8], radix: Int, bits: Int) -> Parsed:
             return Parsed(False)
         if x >= radix:
             return Parsed(False)
-        v = v * UInt128(radix) + UInt128(x)
-        if v > UInt128(9223372036854775807):
+        if v > (limit - UInt64(x)) // UInt64(radix):
             return Parsed(False)
-    if bits < 64 and v >= (UInt128(1) << UInt128(bits - 1)):
+        v = v * UInt64(radix) + UInt64(x)
+    if bits < 64 and v >= (UInt64(1) << UInt64(bits - 1)):
         return Parsed(False)
     return Parsed(True, Int64(v))
 
@@ -793,7 +847,7 @@ def parse_text(w: String, kind: Int, scale: Int, bits: Int, prec: Int) -> Parsed
         var r = _scan_number(u)
         if not r.ok:
             return Parsed(False, 0, r.odd)
-        if r.has_exp and (kind == DECIMAL.value or r.digits > 18 or r.e10 > 30 or r.e10 < -30):
+        if r.has_exp and (kind == DECIMAL.value or len(r.dig) > 18 or r.e10 > 30 or r.e10 < -30):
             return Parsed(False, 0, True)                     # DuckDB's exponents on decimals round oddly; a long mantissa with one overflows differently
         var v = Int64(0)
         if not _scaled(r, scale, v):

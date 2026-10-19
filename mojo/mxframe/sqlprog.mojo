@@ -16,9 +16,11 @@ rules, on the same `Program` type:
 """
 from std.collections import Dict
 from std.memory import ArcPointer
+from std.time import perf_counter_ns
 from .table import TEXT, BOOL, FLOAT, INT, DECIMAL, DATE, F32_COLUMN, SharedTable
 from .parquet import ParquetScan
 from .kernels.pipeline_cpu import LP
+from .kernels._fpenv import core_count, par_n
 from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
                     CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, A_FSUM, A_FMIN, A_FMAX, _frame_mask, _null_mask,
@@ -110,6 +112,19 @@ struct DictAccess(Movable):
             if self.range_cols[i] == c:
                 return (self.range_has[i], self.range_lo[i], self.range_hi[i])
         return (False, Int64(0), Int64(0))
+
+    def word_ptrs(self, c: Int) raises -> Tuple[Int, Int, Int, Int]:
+        """Where a dictionary's words are, for a loop over them in parallel: (the address of the base words, how many, the address of the frame's added words, how many)."""
+        if c >= DERIVED_BASE:
+            var i = c - DERIVED_BASE
+            if not self.has_derived(c):
+                raise Error("internal: the dictionary of expression " + String(i) + " was read before it was made")
+            return (Int(self.store[].words[i].unsafe_ptr()), len(self.store[].words[i]), 0, 0)
+        var base = self.scan.value().words_address(c) if self.scan else Int(self.table.dictionary(c).unsafe_ptr())
+        var nbase = self.base_count(c)
+        if c < len(self.extra) and len(self.extra[c]) > 0:
+            return (base, nbase, Int(self.extra[c].unsafe_ptr()), len(self.extra[c]))
+        return (base, nbase, 0, 0)
 
     def has_derived(self, c: Int) -> Bool:
         var i = c - DERIVED_BASE
@@ -236,6 +251,52 @@ def collect_columns(q: BoundQuery) -> List[Int]:
             seen[j - 1] = t
             j -= 1
     return seen^
+
+
+def _words_bool(t: TFn, base: Int, nbase: Int, extra: Int, nextra: Int, out_addr: Int):
+    """out[k] = whether the text function (a predicate) holds for word k, in parallel over the words (read-only: no String is made)."""
+    var n = nbase + nextra
+    var tasks = max(1, min(core_count(), n // 16384))
+
+    def work(i: Int) {imm}:
+        var a = n * i // tasks
+        var b = n * (i + 1) // tasks
+        var bp = UnsafePointer[String, MutAnyOrigin](unsafe_from_address=base)
+        var ep = UnsafePointer[String, MutAnyOrigin](unsafe_from_address=extra)
+        var outp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=out_addr)
+        for k in range(a, b):
+            if k < nbase:
+                outp[k] = UInt8(1) if t.to_bool(bp[k]) else UInt8(0)
+            else:
+                outp[k] = UInt8(1) if t.to_bool(ep[k - nbase]) else UInt8(0)
+
+    if tasks == 1:
+        work(0)
+    else:
+        par_n(work, tasks, tasks)
+
+
+def _words_int(t: TFn, base: Int, nbase: Int, extra: Int, nextra: Int, out_addr: Int):
+    """out[k] = the integer the text function (length, strpos) answers for word k, in parallel over the words."""
+    var n = nbase + nextra
+    var tasks = max(1, min(core_count(), n // 16384))
+
+    def work(i: Int) {imm}:
+        var a = n * i // tasks
+        var b = n * (i + 1) // tasks
+        var bp = UnsafePointer[String, MutAnyOrigin](unsafe_from_address=base)
+        var ep = UnsafePointer[String, MutAnyOrigin](unsafe_from_address=extra)
+        var outp = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=out_addr)
+        for k in range(a, b):
+            if k < nbase:
+                outp[k] = Int64(t.to_int(bp[k]))
+            else:
+                outp[k] = Int64(t.to_int(ep[k - nbase]))
+
+    if tasks == 1:
+        work(0)
+    else:
+        par_n(work, tasks, tasks)
 
 
 struct TextUnion(Copyable, Movable):
@@ -589,6 +650,7 @@ struct _Emitter(Movable):
         if x.op == B_TFN:
             if e in self.ents:
                 return
+            var t0 = perf_counter_ns()
             self.prep_dict(x.a)
             var t = self.make_tfn(x)
             var d = self.rx[x.a].src
@@ -617,6 +679,7 @@ struct _Emitter(Movable):
                 self.undecided[e] = unk^
             self.p.text_tabs += 1
             self.p.text_words += n
+            self.p.text_ns += Int(perf_counter_ns() - t0)
             return
         if x.op == B_CONCAT:
             if e in self.ents:
@@ -751,8 +814,8 @@ struct _Emitter(Movable):
             var d = self.rx[x.a].src
             var n = self.dicts.count(d)
             var ents = List[Int64](length=n, fill=0)
-            for k in range(n):
-                ents[k] = Int64(t.to_int(self.dicts.word(d, k)))
+            var wp = self.dicts.word_ptrs(d)
+            _words_int(t, wp[0], wp[1], wp[2], wp[3], Int(ents.unsafe_ptr()))
             self.ents[e] = ents^
             self.p.text_tabs += 1
             self.p.text_words += n
@@ -769,6 +832,7 @@ struct _Emitter(Movable):
 
     def tfn_bool(mut self, e: Int) raises -> V:
         var x = self.rx[e].copy()
+        var t0 = perf_counter_ns()
         self.prep_dict(x.a)
         var t = self.make_tfn(x)
         var d = self.rx[x.a].src
@@ -776,11 +840,14 @@ struct _Emitter(Movable):
         var v = self.value(x.a)
         var bytes = List[UInt8](length=max(n, 1), fill=0)
         var ilike = t.func == TF_LIKE and (t.flags & 1) != 0
-        for k in range(n):
-            var w = self.dicts.word(d, k)
-            if ilike:
-                w = self.map_case(w, False)
-            bytes[k] = 1 if t.to_bool(w) else 0
+        if ilike:
+            for k in range(n):
+                var w = self.map_case(self.dicts.word(d, k), False)
+                bytes[k] = 1 if t.to_bool(w) else 0
+        else:
+            var wp = self.dicts.word_ptrs(d)
+            _words_bool(t, wp[0], wp[1], wp[2], wp[3], Int(bytes.unsafe_ptr()))
+            _ = bytes.unsafe_ptr()                                   # (the list lives to here: the loop above wrote through its address)
         var r = self.tmp()
         self.ins(OP_I2F, r, v.reg)
         self.free(v.reg)
@@ -788,6 +855,7 @@ struct _Emitter(Movable):
         self.ins(OP_IN_SET, r, r, set_at)
         self.p.text_tabs += 1
         self.p.text_words += n
+        self.p.text_ns += Int(perf_counter_ns() - t0)
         return self.with_unknown(r, v.nul)
 
     def concat_value(mut self, e: Int) raises -> V:

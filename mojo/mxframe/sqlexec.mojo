@@ -585,7 +585,7 @@ def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: Dict
                  " (" + String(sp.p.n_slots) + (" slot" if sp.p.n_slots == 1 else " slots") + ")")
     if sp.p.text_tabs > 0:
         notes.append("text: " + String(sp.p.text_tabs) + " per-word " + ("table" if sp.p.text_tabs == 1 else "tables") + " over " + String(sp.p.text_words) +
-                     " dictionary words (each text function ran once per word, never per row)")
+                     " dictionary words in " + _ms(Float64(sp.p.text_ns) / 1e6) + " ms (each text function ran once per word, never per row)")
     if plan.group == G_HASHED and plan.holistic:
         notes.append("holistic: a second pass maps each row to its group for count(DISTINCT), median, quantile_disc and min / max of TEXT")
     notes.append("device: CPU (SQL runs on the CPU)")
