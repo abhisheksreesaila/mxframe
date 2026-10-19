@@ -1624,3 +1624,18 @@ Owner, 2026-10-19 (first principles): if omxcore ever needs to be database-like,
 - [ ] read Delta Lake and Iceberg tables (the log / manifest → the live Parquet files, deletion vectors, schema evolution) as a streamed source; time travel by version
 - [ ] write: append and overwrite commits, then row-level changes as small new files + a commit (a Frame's edits become a commit, not a whole-file rewrite); optimistic concurrency for several writers
 - [ ] omxplorer-style apps get autosave and history from it, as a plugin over these primitives
+
+## After M8 (positioning brief `docs/briefs/positioning.md`, approved 2026-10-19)
+Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 rename + 0.7.0 + F-169 → F-163, the SQL long tail.
+
+## F-166 Scoreboard: omxcore vs DuckDB and Polars, CPU and GPU, quiet machine [todo, needs the owner's go]
+- [ ] TPC-H SF1 / SF10 and the random suite through the Mojo engine (`mx`) and the Python package; CPU, GPU and AUTO; DuckDB and Polars on the same files; quiet machine (load < 2), engine-only first runs; published to the README and the docs site with every gap
+
+## F-167 Sort and large outputs at DuckDB speed [todo]
+- [ ] full multi-key sorts and million-row results (today ~2x DuckDB): parallel radix sort with merge, column gather without per-row work, streamed output
+
+## F-168 Window functions [todo]
+- [ ] `OVER (PARTITION BY … ORDER BY …)`: row_number, rank, dense_rank, lag / lead, running and framed sums, first / last value; equal to DuckDB
+
+## F-169 MCP server for `mx` [todo]
+- [ ] a small MCP server over the `mx` command (sql, explain, schema) so agents use omxcore as a data tool; no Python inside the engine

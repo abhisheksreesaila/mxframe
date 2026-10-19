@@ -1,0 +1,53 @@
+# omxcore: positioning
+
+Status: approved (owner, 2026-10-19)
+
+## One line
+**DuckDB-class SQL that uses your GPU and links into any app with no Python.** omxcore is a compute engine (CPU and
+GPU, SQL, joins, streaming) with persistence to open Parquet files. It is the core that apps and agents build on, like
+SQLite. (Renamed from MX frame: F-165.)
+
+## What omxcore can be
+1. **A faster drop-in for DuckDB** in notebooks, ETL and agents: SQL over Parquet and CSV, Arrow out, GPU when there
+   is one.
+2. **The GPU-native analytics engine for one machine:** many laptops and workstations have a GPU that DuckDB and
+   Polars never use, and AUTO puts each query on the faster device. "Spark-cluster answers on one box."
+3. **An embedded engine for apps:** a compiled library, no Python, callable from Mojo or any language through a C
+   interface. The first app is omxplorer; others can follow (BI, spreadsheets, trading, IoT, on-device analytics on
+   Mac and phones).
+4. **A data engine for AI agents:** `mx` returns JSON with exact errors, starts in 12 ms, and needs no Python
+   environment. An MCP server around it makes omxcore the default data tool for agents.
+5. **The compute half of a lakehouse:** Parquet today; Delta Lake / Iceberg tables if apps need them (M9, parked).
+6. **Live dataframes for simulations and real-time state:** edits, undo and formulas, queryable fast on CPU or GPU.
+7. **Feature and ML data prep:** joins and group-bys feeding training data to the GPU, with zero-copy handoff to
+   PyTorch and JAX through the Arrow C Data Interface (F-139).
+
+## Why it can win
+- **GPU-native across vendors:** DuckDB is CPU-only by design; cuDF and Sirius are tied to NVIDIA, CUDA and Python.
+  Mojo gives one codebase for NVIDIA, AMD and Apple Silicon.
+- **No Python inside:** an app or agent links one library; nothing to install or break.
+- **Open files only:** no proprietary format, no lock-in. Anything omxcore writes, every other tool reads.
+
+## Principles (owner)
+- **The engine is the kernel.** Apps (omxplorer, future ones) and Python are plugins; an app's request becomes a
+  generic engine feature, never app-specific code in the core.
+- **Beat DuckDB and Polars on CPU and GPU,** on general workloads, not benchmark tricks. Honest about every gap.
+- **Not a database.** If database-like features are ever needed, they mimic Delta Lake (Parquet + its transaction
+  log): no new format, and no database work until an app needs it.
+
+## What "replace DuckDB" requires
+| Must have | Status (2026-10-19) |
+|---|---|
+| Correct answers on real SQL (TPC-H 22, then TPC-DS and the long tail) | M8 in progress; the gate is F-162 |
+| Faster on CPU alone (most users have no big GPU) | wins on many joins and aggregates; behind on sorts, big outputs, filtered and one-to-many joins |
+| Clearly faster on GPU where one exists | works in memory and streamed; needs scoreboard proof |
+| Window functions, more types (timestamps, lists, structs) | not started |
+| Joins bigger than RAM (spill) | deferred (F-163) |
+| Simple install and Arrow interop | Python package exists; Arrow C interface is F-139 |
+
+## Path
+1. Finish M8 and pass the TPC-H 22 gate through `mx` (F-162).
+2. Quiet-machine scoreboard: omxcore against DuckDB and Polars, CPU and GPU, published with the gaps.
+3. Close the top gaps: join speed (F-161), sort and large outputs, then window functions.
+4. Rename (F-165), release 0.7.0, and an MCP server for `mx`.
+5. Then joins bigger than RAM and the SQL long tail.
