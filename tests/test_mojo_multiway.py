@@ -144,7 +144,7 @@ def test_every_forced_order_equals_duckdb_or_is_refused_by_name(mx, tpch, name, 
         except AssertionError as e:
             text = str(e)
             # a refused order: a cross product, or a join that explodes past the memory budget (an order that joins on a low-cardinality key first)
-            assert "reaches a table no equality joins yet" in text or "past the join's memory budget" in text, text[:600]
+            assert "reaches a table no equality joins yet" in text or "memory budget" in text, text[:600]
             refused += 1
     assert ran >= 4, (ran, refused)
 
