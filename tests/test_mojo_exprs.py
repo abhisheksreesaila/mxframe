@@ -358,10 +358,6 @@ CASTS = [
 ]
 
 
-def duck_cast_sql(expr):
-    return expr
-
-
 def test_a_float_remainder_is_refused_by_name(probe, data):
     res = run_probe(probe, "SELECT f % 3 FROM t", {"t": data.path}, expect_error=True)
     assert "`%` on a FLOAT value is not supported" in res["error"], res
@@ -410,7 +406,6 @@ DATE_EXPRS = (
     + ["dt - dt2", "dt - 100", "dt + 7", "dt2 - dt"] + [f"datediff('{p}', dt, dt2)" for p in ("day", "week", "month", "quarter", "year", "decade", "century")]
     + [f"date_diff('{p}', dt2, dt)" for p in ("day", "week", "month")] + ["EXTRACT(year FROM dt) * 100 + EXTRACT(month FROM dt)", "date_trunc('month', dt + INTERVAL 1 MONTH)"]
 )
-CAST_DATE = ("date_trunc(", "INTERVAL")
 
 
 def date_duck(expr):
@@ -498,13 +493,6 @@ TEXT_VALUE = [
     "starts_with(s, 'W')", "contains(s, 'a')", "ends_with(s, 'a')", "prefix(s, 'É')", "suffix(s, 'b')",
     "s = s2", "s <> s2", "s = lower(s)", "s = upper(s)", "s IN ('West', 'east', 'xx')", "lower(s) IN ('west', 'east')", "upper(s) NOT IN ('WEST', 'EAST', 'ÉA')",
 ]
-
-
-def text_duck(expr):
-    out = expr
-    for a, op, b in [("s", "<", "s2"), ("s2", ">", "s")]:
-        pass
-    return out
 
 
 @pytest.mark.parametrize("mode", MODES)
