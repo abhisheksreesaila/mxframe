@@ -27,7 +27,7 @@ SERIF = "Georgia, 'Times New Roman', Times, serif"
 THEMES = {
     "paper": dict(bg="#F2EFE7", surface="#FFFDF8", surface2="#F8F4EB", border="#D8D0C2", border_hi="#BEB4A4",
                   text="#20221F", mid="#4C5049", dim="#6E716A", accent="#6C3E78", accent_hi="#512B5C",
-                  mx="#2a78d6", dk="#1baf7a", pa="#eda100", slow="#e34948", grid="#E4DDD0"),
+                  mx="#2a78d6", dk="#1baf7a", pa="#eda100", slow="#e34948", grid="#E4DDD0", green="#18704F"),
 }
 SERIES = {"mx": "MX frame", "dk": "DuckDB", "pa": "pyarrow"}
 
@@ -278,9 +278,204 @@ def chart_behind(data, theme):
                  [("slow", "MX frame time / DuckDB time")], rows, lambda v: (v - 1) / 2.6, ticks, FOOT)
 
 
+def paper_frame(t, W, H, kicker, right):
+    """The editorial paper sheet every roadmap band shares: ruled paper, wordmark, kicker, a rule."""
+    return [f'''<defs>
+  <pattern id="rule" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 23.5H24" stroke="{t['border']}" stroke-opacity=".45"/></pattern>
+  <clipPath id="clip"><rect width="{W}" height="{H}" rx="18"/></clipPath>
+</defs>
+<g clip-path="url(#clip)">
+<rect width="{W}" height="{H}" fill="{t['bg']}"/>
+<rect y="72" width="{W}" height="{H}" fill="url(#rule)"/>''',
+            f'<text x="56" y="46" font-family="{MONO}" font-size="16" font-weight="800" letter-spacing="5" fill="{t["text"]}">'
+            f'M<tspan fill="{t["accent"]}">X</tspan> FRAME</text>',
+            text(206, 46, kicker, 12, t["dim"], MONO, 700, ls=3),
+            text(W - 56, 46, right, 12, t["dim"], MONO, 700, "end", ls=1),
+            f'<path d="M56 64H{W - 56}" stroke="{t["text"]}" stroke-width="1.5"/>']
+
+
+def paper_close(t, W, H, b):
+    b.append("</g>")
+    b.append(f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="18" fill="none" stroke="{t["border_hi"]}"/>')
+    return "\n".join(b)
+
+
+def lines_at(b, x, y, s, chars, size, fill, family=SANS, weight=400, lh=None, extra=""):
+    """Wrapped text; returns the baseline after the last line."""
+    lh = lh or round(size * 1.35)
+    for line in wrap(s, chars):
+        b.append(text(x, y, line, size, fill, family, weight, extra=extra))
+        y += lh
+    return y
+
+
+STATUS = {"today": ("TODAY", "green"), "with 0.7.0": ("WITH 0.7.0", "accent"), "planned": ("PLANNED · M10", "dim")}
+
+
+def roadmap(data):
+    """The vision, what omxcore can be, the path with a marker at where we are, and the agent-native band
+    (docs/briefs/positioning.md). Nothing in the band is drawn as done unless its status says today."""
+    t, rm = THEMES["paper"], data["roadmap"]
+    W, X0, X1 = 1200, 56, 1144
+    b = []
+    y = 122
+    for line in wrap(rm["vision"] + ".", 56):
+        b.append(text(X0, y, line, 38, t["text"], SERIF, 400, extra=' font-style="italic"'))
+        y += 46
+    b.append(text(X0, y + 2, rm["vision_2"] + ".", 24, t["accent"], SERIF, 400))
+    # what it can be: numbered, four across
+    y += 52
+    b.append(text(X0, y, f"WHAT {rm['name'].upper()} CAN BE", 12, t["accent"], MONO, 700, ls=3))
+    cw, y0 = (X1 - X0) / 4, y + 18
+    for i, item in enumerate(rm["can_be"]):
+        cx, cy = X0 + (i % 4) * cw, y0 + (i // 4) * 58
+        b.append(text(cx, cy + 30, str(i + 1), 34, t["accent"], SERIF, 400, extra=' font-style="italic"'))
+        lines_at(b, cx + 34, cy + 16, item, 24, 15.5, t["text"], SANS, 500, lh=19)
+    y = y0 + 2 * 58 + 30
+    # the path: solid up to where we are, dashed after
+    b.append(text(X0, y, "THE PATH", 12, t["accent"], MONO, 700, ls=3))
+    steps, now = rm["path"], next(i for i, s in enumerate(rm["path"]) if s["id"] == rm["now"])
+    sw, ly = (X1 - X0) / len(steps), y + 62
+    sx = [X0 + 10 + i * sw for i in range(len(steps))]
+    b.append(f'<path d="M{sx[0]} {ly}H{X1 - 8}" stroke="{t["border_hi"]}" stroke-width="2" stroke-dasharray="6 6"/>')
+    b.append(f'<path d="M{sx[0]} {ly}H{sx[now] + sw * 0.45}" stroke="{t["accent"]}" stroke-width="3"/>')
+    b.append(f'<path d="M{X1 - 12} {ly - 6}l10 6l-10 6" fill="none" stroke="{t["border_hi"]}" stroke-width="2"/>')
+    bottom = 0
+    for i, s in enumerate(steps):
+        x = sx[i]
+        if i == now:
+            b.append(f'<circle cx="{x}" cy="{ly}" r="16" fill="{t["accent"]}" fill-opacity=".15"/>')
+            b.append(f'<circle cx="{x}" cy="{ly}" r="8" fill="{t["accent"]}"/>')
+            b.append(f'<rect x="{x - 10}" y="{ly - 50}" width="112" height="24" rx="12" fill="{t["accent"]}"/>')
+            b.append(text(x + 46, ly - 33.5, "WE ARE HERE", 11, t["surface"], MONO, 700, "middle", ls=1.2))
+        else:
+            b.append(f'<circle cx="{x}" cy="{ly}" r="7" fill="{t["surface"]}" stroke="{t["border_hi"]}" stroke-width="2"/>')
+        tx = x - 10
+        b.append(text(tx, ly + 34, f"{i + 1} · {s['tag']}", 10.5, t["accent"], MONO, 700))
+        ty = lines_at(b, tx, ly + 56, s["title"], 18, 15, t["text"], SANS, 700, lh=18) + 3
+        if "done" in s:
+            ty = lines_at(b, tx, ty, f"done: {s['done']}", 26, 12.5, t["mid"], lh=17)
+            ty = lines_at(b, tx, ty, f"building: {s['building']}", 26, 12.5, t["dim"], lh=17)
+        else:
+            ty = lines_at(b, tx, ty, s["detail"], 26, 12.5, t["mid"], lh=17)
+        bottom = max(bottom, ty)
+    # the agent-native band: a highlight, honest about what is planned
+    ag = rm["agents"]
+    by = bottom + 20
+    band = []
+    lx, ly2 = X0, by + 52
+    band.append(text(lx, ly2, ag["title"], 34, t["text"], SERIF, 400, extra=' font-style="italic"'))
+    band.append(text(lx, ly2 + 26, ag["when"], 10.5, t["accent"], MONO, 700, ls=1))
+    yy = lines_at(band, lx, ly2 + 62, ag["lead"], 32, 18, t["text"], SANS, 700, lh=23)
+    yy = lines_at(band, lx, yy + 4, ag["lead_line"], 50, 13, t["mid"], lh=18)
+    yy = lines_at(band, lx, yy + 8, ag["note"], 54, 11.5, t["dim"], lh=16)
+    gx0, gcw = 470, (X1 - 470) / 3
+    gy = by + 36
+    for i, it in enumerate(ag["items"]):
+        cx, cy = gx0 + (i % 3) * gcw, gy + (i // 3) * 112
+        label, tone = STATUS[it["status"]]
+        col = t[tone] if tone != "accent" else t["accent"]
+        w = len(label) * 6.6 + 18
+        if it["status"] == "today":
+            band.append(f'<rect x="{cx}" y="{cy}" width="{w:.0f}" height="20" rx="10" fill="{col}"/>')
+            band.append(text(cx + w / 2, cy + 14, label, 10, t["surface"], MONO, 700, "middle", ls=.6))
+        else:
+            band.append(f'<rect x="{cx + .5}" y="{cy + .5}" width="{w:.0f}" height="19" rx="9.5" fill="none" stroke="{col}" stroke-dasharray="{"0" if tone == "accent" else "3 2"}"/>')
+            band.append(text(cx + w / 2, cy + 14, label, 10, col, MONO, 700, "middle", ls=.6))
+        ny = lines_at(band, cx, cy + 42, it["name"], 26, 15, t["text"], SANS, 700, lh=18)
+        lines_at(band, cx, ny, it["line"], 34, 12.5, t["mid"], lh=17)
+    bh = max(yy, gy + 2 * 112) - by + 8
+    b.append(f'<rect x="32" y="{by}" width="{W - 64}" height="{bh}" rx="16" fill="{t["accent"]}" fill-opacity=".07" stroke="{t["accent"]}" stroke-opacity=".35"/>')
+    b.append(f'<path d="M{gx0 - 30} {by + 24}V{by + bh - 24}" stroke="{t["accent"]}" stroke-opacity=".3"/>')
+    b += band
+    H = int(by + bh + 50)
+    b.append(text(X0, H - 20, "informal timings: shared machine, see docs/mojo-engine.md · plugins are planned, not built", 11, t["dim"], MONO))
+    head = paper_frame(t, W, H, f"THE ROADMAP · SOON {rm['name'].upper()}", rm["source"])
+    body = paper_close(t, W, H, head + b)
+    desc = (f"Vision: {rm['vision']}. {rm['vision_2']}. What {rm['name']} can be: " + "; ".join(rm["can_be"]) + ". The path: " +
+            "; ".join(f"{i + 1}. {s['title']}" + (" (we are here)" if i == now else "") for i, s in enumerate(steps)) +
+            f". {ag['title']} ({ag['when'].lower()}): {ag['lead']}. " +
+            "; ".join(f"{it['name']} ({it['status']}): {it['line']}" for it in ag["items"]) + ".")
+    return svg_doc(W, H, body, f"MX frame roadmap: the path to {rm['name']}", desc)
+
+
+def hood(data):
+    """Modern algorithms (built and in use today) x a modern compiled language."""
+    t, h = THEMES["paper"], data["hood"]
+    W, X0, X1 = 1200, 56, 1144
+    b = []
+    left, right = h["title"].split(": ", 1)
+    b.append(text(X0, 116, right[0].upper() + right[1:] + ".", 32, t["text"], SERIF, 400, extra=' font-style="italic"'))
+    b.append(text(X0, 156, f"ALGORITHMS · {h['algorithms_when']}", 11.5, t["accent"], MONO, 700, ls=2))
+    cw = (790 - X0) / 3
+    bottom = 0
+    for i, a in enumerate(h["algorithms"]):
+        cx, cy = X0 + (i % 3) * cw, 186 + (i // 3) * 64
+        b.append(f'<rect x="{cx}" y="{cy - 12}" width="3" height="34" rx="1.5" fill="{t["accent"]}" fill-opacity=".55"/>')
+        yy = lines_at(b, cx + 12, cy, a["name"], 30, 14, t["text"], SANS, 700, lh=17)
+        bottom = max(bottom, lines_at(b, cx + 12, yy, a["line"], 34, 12, t["dim"], lh=16))
+    m = h["mojo"]
+    px, py, pw = 826, 96, X1 - 826
+    ph = bottom - py + 4
+    b.append(f'<rect x="{px}" y="{py}" width="{pw}" height="{ph}" rx="14" fill="{t["accent"]}" fill-opacity=".07" stroke="{t["accent"]}" stroke-opacity=".35"/>')
+    b.append(text(px + 24, py + 50, m["name"], 40, t["text"], SERIF, 400))
+    yy = py + 84
+    for p in m["points"]:
+        b.append(f'<rect x="{px + 24}" y="{yy - 5}" width="10" height="2" fill="{t["accent"]}"/>')
+        yy = lines_at(b, px + 42, yy, p, 36, 13.5, t["text"], SANS, 500, lh=18) + 6
+    lines_at(b, px + 24, yy + 12, m["tagline"], 34, 17, t["accent"], SERIF, 400, lh=22, extra=' font-style="italic"')
+    H = int(bottom + 22)
+    head = paper_frame(t, W, H, left.upper(), h["source"])
+    desc = f"{h['title']}. Algorithms, {h['algorithms_when'].lower()}: " + "; ".join(f"{a['name']} ({a['line']})" for a in h["algorithms"]) + \
+        f". {m['name']}: " + "; ".join(m["points"]) + f". {m['tagline']}"
+    return svg_doc(W, H, paper_close(t, W, H, head + b), h["title"], desc)
+
+
+def family(data):
+    """omxapp over omxcore over your files, with omxplorer as the example app: one native binary."""
+    t, f = THEMES["paper"], data["family"]
+    W, X0 = 1200, 56
+    b = []
+    names = [l["name"] for l in f["layers"][:2]]
+    b.append(text(X0, 128, f"{names[0]} + {names[1]}", 44, t["text"], SERIF, 400, extra=' font-style="italic"'))
+    yy = lines_at(b, X0, 172, f["line"], 52, 17, t["mid"], SANS, 400, lh=24)
+    ex = f["example"]
+    b.append(text(X0, yy + 14, f"{ex['name']} is {ex['line']}.", 15, t["accent"], SANS, 700))
+    sx, sw, y = 600, 470, 92
+    # the example app, dashed: it sits on the stack
+    b.append(f'<rect x="{sx + .5}" y="{y + .5}" width="{sw}" height="40" rx="10" fill="none" stroke="{t["border_hi"]}" stroke-dasharray="5 4"/>')
+    b.append(text(sx + 18, y + 26, ex["name"], 18, t["text"], SERIF, 400, extra=' font-style="italic"'))
+    b.append(text(sx + sw - 16, y + 25, "EXAMPLE APP", 10.5, t["dim"], MONO, 700, "end", ls=1.5))
+    y += 50
+    top = y
+    for l in f["layers"]:
+        core, files = l.get("core"), l["name"] == "your files"
+        hgt = 60
+        fill, ink, sub = (t["accent"], t["surface"], t["surface"]) if core else (t["surface"], t["text"], t["mid"])
+        b.append(f'<rect x="{sx}" y="{y}" width="{sw}" height="{hgt}" rx="10" fill="{fill}" stroke="{t["accent"] if core else t["border_hi"]}"'
+                 f'{" stroke-dasharray=\"2 3\"" if files else ""}/>')
+        b.append(text(sx + 18, y + 27, l["name"], 22, ink, SERIF, 400))
+        b.append(text(sx + sw - 16, y + 26, l["role"].upper(), 10.5, sub, MONO, 700, "end", ls=1.5))
+        b.append(text(sx + 18, y + 47, l["line"], 12.5, sub, SANS, 400, extra=' fill-opacity=".9"' if core else ""))
+        if not files:
+            mid = y + hgt
+        y += hgt + 10
+    # one native binary: a bracket over the app and the engine
+    bx = sx + sw + 18
+    b.append(f'<path d="M{bx} {top - 50}h8V{mid}h-8" fill="none" stroke="{t["accent"]}" stroke-width="1.5"/>')
+    b.append(f'<text x="{bx + 26}" y="{(top - 50 + mid) / 2}" font-family="{MONO}" font-size="10.5" font-weight="700" fill="{t["accent"]}" '
+             f'letter-spacing="1.5" text-anchor="middle" transform="rotate(90 {bx + 26} {(top - 50 + mid) / 2})">ONE NATIVE BINARY</text>')
+    H = int(y + 16)
+    head = paper_frame(t, W, H, f["title"].upper(), f["layers"][0]["repo"])
+    desc = f"{f['title']}: " + " over ".join(f"{l['name']} ({l['role']}: {l['line']})" for l in f["layers"]) + \
+        f". {f['line']} {ex['name']} is {ex['line']}."
+    return svg_doc(W, H, paper_close(t, W, H, head + b), f"{f['title']}: {names[0]} + {names[1]}", desc)
+
+
 def build():
     data = load()
-    files = {"engine-hero.svg": hero_paper(data)}
+    files = {"engine-hero.svg": hero_paper(data), "engine-roadmap.svg": roadmap(data),
+             "engine-hood.svg": hood(data), "engine-family.svg": family(data)}
     for name, fn in (("wins", chart_wins), ("read", chart_read), ("behind", chart_behind)):
         files[f"engine-{name}.svg"] = fn(data, "paper")[0]
     return files

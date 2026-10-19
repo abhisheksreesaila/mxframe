@@ -93,5 +93,90 @@
     {"from": ["sql", "8 groups, 4 aggregates"], "next": ""},
     {"from": ["streaming", "morsels, 20 row groups"], "next": "faster with few row groups"}
   ],
-  "next": "Multi-table joins with a cost-based join order (F-155), SQL expressions (F-156), CTEs and correlated subqueries (F-159), then the gate: all 22 TPC-H queries through mx equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on CPU and GPU."
+  "next": "Multi-table joins with a cost-based join order (F-155), SQL expressions (F-156), CTEs and correlated subqueries (F-159), then the gate: all 22 TPC-H queries through mx equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on CPU and GPU.",
+
+  "roadmap": {
+    "source": "docs/briefs/positioning.md",
+    "name": "omxcore",
+    "vision": "DuckDB-class SQL that uses your GPU and links into any app with no Python",
+    "vision_2": "Plug and play with the CSV and Parquet files you already have",
+    "can_be": [
+      "A faster drop-in for DuckDB",
+      "GPU-native analytics on one machine",
+      "An embedded engine for apps",
+      "The data engine for AI agents",
+      "The compute half of a lakehouse",
+      "Live dataframes for simulation",
+      "ML data prep"
+    ],
+    "now": "M8",
+    "path": [
+      {"id": "M8", "tag": "M8 · F-162", "title": "SQL and joins, then the TPC-H 22 gate",
+       "done": "SQL, row queries, inner / left / semi / anti joins", "building": "multi-table planner and expressions"},
+      {"id": "scoreboard", "tag": "F-166", "title": "Quiet-machine scoreboard",
+       "detail": "against DuckDB and Polars, on CPU and GPU, published with the gaps"},
+      {"id": "gaps", "tag": "F-161 · F-167 · F-168", "title": "Close the gaps",
+       "detail": "join speed, sort and large outputs, window functions"},
+      {"id": "omxcore", "tag": "F-165 · F-169", "title": "omxcore 0.7.0",
+       "detail": "the rename, plus an MCP server so agents reach for it first"},
+      {"id": "agents", "tag": "M10", "title": "Agent-native plugins",
+       "detail": "vector search on the GPU first, then agent search, decisions and memory"},
+      {"id": "bigger", "tag": "F-163", "title": "Bigger than RAM, the long tail",
+       "detail": "joins that spill to disk, and the SQL long tail"}
+    ],
+    "agents": {
+      "title": "Built for agents",
+      "lead": "Plug and play: point it at your CSV and Parquet files",
+      "lead_line": "Query, search or classify a file or folder. No import, no new format, nothing to convert; vectors are just a column in the same Parquet file.",
+      "when": "PLUGINS ON THE CORE · PLANNED · M10, AFTER 0.7.0",
+      "note": "The core never learns about agents: it gains vectors, a top-k distance kernel and UDFs; agent features live in plugins.",
+      "items": [
+        {"name": "mx", "status": "today", "line": "speaks JSON, starts in 12 ms, no Python"},
+        {"name": "Vector search, GPU-native", "status": "planned", "line": "embeddings beside your data; nearest-k with SQL filters in one query"},
+        {"name": "Agent search", "status": "planned", "line": "keyword + vector + SQL in one ranked call, with why each row matched"},
+        {"name": "Classification and decision API", "status": "planned", "line": "label or route rows, batched on the GPU"},
+        {"name": "MCP server", "status": "with 0.7.0", "line": "every agent gets sql / explain / schema / search as tools"},
+        {"name": "Agent memory", "status": "planned", "line": "facts with time and source, queried like any table"}
+      ]
+    }
+  },
+
+  "hood": {
+    "source": "docs/briefs/positioning.md",
+    "title": "Under the hood: modern algorithms × a modern compiled language",
+    "algorithms_when": "ALL BUILT AND IN USE TODAY",
+    "algorithms": [
+      {"name": "Morsel-driven parallelism", "line": "each core owns a block, no barriers"},
+      {"name": "Radix-partitioned hash joins", "line": "built in parallel without atomics"},
+      {"name": "Parallel radix sort and select", "line": "percentiles and sorts on every core"},
+      {"name": "HyperLogLog-sized hash sets", "line": "count distinct at 1M groups"},
+      {"name": "Bounded top-k heaps", "line": "ORDER BY … LIMIT without a full sort"},
+      {"name": "SIMD bulk Parquet decode", "line": "a column written in place, every core in a row group"},
+      {"name": "Two-phase parallel dictionaries", "line": "text codes in file order, found in parallel"},
+      {"name": "Planner from exact statistics", "line": "dense or hashed, heap or sort; EXPLAIN says why"},
+      {"name": "Reproducible float sums", "line": "the same bits on any core count"}
+    ],
+    "mojo": {
+      "name": "Mojo",
+      "points": [
+        "compiled ahead of time to native code",
+        "SIMD types and compile-time specialisation",
+        "no garbage collector",
+        "the same kernels on CPU and GPU"
+      ],
+      "tagline": "Python's ease with C++'s speed, in one codebase."
+    }
+  },
+
+  "family": {
+    "source": "docs/briefs/positioning.md",
+    "title": "The omx family",
+    "line": "A full stack for data apps with no Python and no server: the app and its engine compile into one native binary.",
+    "example": {"name": "omxplorer", "line": "the first app built this way", "url": "https://github.com/abhisheksreesaila/mxapp"},
+    "layers": [
+      {"name": "omxapp", "role": "UI, built once", "line": "native on Linux, macOS, iPhone, Android and the web", "repo": "github.com/abhisheksreesaila/mxapp"},
+      {"name": "omxcore", "role": "the data engine", "line": "SQL, joins, streaming; CPU and GPU; this repo", "core": true},
+      {"name": "your files", "role": "CSV and Parquet", "line": "open formats; nothing to import or convert"}
+    ]
+  }
 }
