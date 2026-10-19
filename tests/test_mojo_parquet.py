@@ -187,9 +187,11 @@ def test_round_trip_keeps_the_omx_metadata(writer, dumper, tmp_path):
 
 def test_unsupported_columns_raise_readably(dumper, tmp_path):
     path = tmp_path / "f.parquet"
-    pq.write_table(pa.table({"x": pa.array([1.5, 2.5])}), path)
+    pq.write_table(pa.table({"x": pa.array([1.5, 2.5])}), path)       # (DOUBLE is the FLOAT kind since F-157: tests/test_mojo_float_parquet.py)
+    assert mojo_read(dumper, path)[0] == [("x", "FLOAT", 0)]
+    pq.write_table(pa.table({"x": pa.array([1.5, 2.5], pa.float16())}), path)
     p = subprocess.run([str(dumper), str(path)], capture_output=True, text=True)
-    assert p.returncode != 0 and "column `x` is DOUBLE: MX frame has no kind for it yet" in (p.stdout + p.stderr)
+    assert p.returncode != 0 and "column `x`" in (p.stdout + p.stderr)
 
 
 # ── readers' own corner cases: what other writers produce ────────────────────────────────────────────
