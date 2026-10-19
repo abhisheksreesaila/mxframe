@@ -99,6 +99,22 @@ def main() raises:
             var mid = Float64((g + 3 * (idx - 1)) + (g + 3 * (m // 2))) / 2.0
             expect(Float64(from_bits=UInt64(r.table.get(4, g))) == mid, "SQL median of group " + String(g))
 
+    # F-152: row queries on this thread: the materialize sink (WHERE + ORDER BY), the top-k heaps (a small LIMIT), SELECT DISTINCT
+    var top_v = (n - 1) - ((n - 1 - 7) % 100)                     # the largest v below n with v % 100 == 7
+    var rr = sql(cat, "SELECT k, v FROM t WHERE v % 100 = 7 ORDER BY v DESC")
+    expect(rr.table.rows() == (n - 1 - 7) // 100 + 1, "row query: " + String(rr.table.rows()) + " rows")
+    expect(rr.table.get(1, 0) == Int64(top_v) and rr.table.get(1, 1) == Int64(top_v - 100) and rr.table.get(0, 0) == Int64(top_v % 3), "row query ORDER BY v DESC")
+    var tk = sql(cat, "SELECT k, v FROM t WHERE v % 100 = 7 ORDER BY v DESC LIMIT 2 OFFSET 1")
+    expect(tk.table.rows() == 2 and tk.table.get(1, 0) == Int64(top_v - 100) and tk.table.get(1, 1) == Int64(top_v - 200), "top-k rows")
+    var heaps = False
+    var topk3 = sql(cat, "SELECT v FROM t ORDER BY v DESC LIMIT 3")
+    for note in topk3.notes:
+        if note.startswith("order: top-3 by per-worker heaps"):
+            heaps = True
+    expect(heaps and topk3.table.get(0, 0) == Int64(n - 1), "a small LIMIT over many rows keeps its best rows in per-worker heaps")
+    var dist = sql(cat, "SELECT DISTINCT k FROM t ORDER BY k")
+    expect(dist.table.rows() == 3 and dist.table.get(0, 2) == 2, "SELECT DISTINCT")
+
     # no thread pool: the parallel CSV reader runs its chunks one after the other
     var csv = String("/tmp/mxframe-switches.csv")
     var text = String("a,b\n")
