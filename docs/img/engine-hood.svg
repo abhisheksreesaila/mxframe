@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="402" viewBox="0 0 1200 402" role="img" aria-labelledby="t d">
+<title id="t">Under the hood: modern algorithms × a modern compiled language</title>
+<desc id="d">Under the hood: modern algorithms × a modern compiled language. Algorithms, all built and in use today: Morsel-driven parallelism (each core owns a block, no barriers); Radix-partitioned hash joins (built in parallel without atomics); Parallel radix sort and select (percentiles and sorts on every core); HyperLogLog-sized hash sets (count distinct at 1M groups); Bounded top-k heaps (ORDER BY … LIMIT without a full sort); SIMD bulk Parquet decode (a column written in place, every core in a row group); Two-phase parallel dictionaries (text codes in file order, found in parallel); Planner from exact statistics (dense or hashed, heap or sort; EXPLAIN says why); Reproducible float sums (the same bits on any core count). Mojo: compiled ahead of time to native code; SIMD types and compile-time specialisation; no garbage collector; the same kernels on CPU and GPU. Python&#x27;s ease with C++&#x27;s speed, in one codebase.</desc>
+<defs>
+  <pattern id="rule" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 23.5H24" stroke="#D8D0C2" stroke-opacity=".45"/></pattern>
+  <clipPath id="clip"><rect width="1200" height="402" rx="18"/></clipPath>
+</defs>
+<g clip-path="url(#clip)">
+<rect width="1200" height="402" fill="#F2EFE7"/>
+<rect y="72" width="1200" height="402" fill="url(#rule)"/>
+<text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">M<tspan fill="#6C3E78">X</tspan> FRAME</text>
+<text x="206.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="start" letter-spacing="3">UNDER THE HOOD</text>
+<text x="1144.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1">docs/briefs/positioning.md</text>
+<path d="M56 64H1144" stroke="#20221F" stroke-width="1.5"/>
+<text x="56.0" y="116.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="32" font-weight="400" fill="#20221F" text-anchor="start" font-style="italic">Modern algorithms × a modern compiled language.</text>
+<text x="56.0" y="156.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="2">ALGORITHMS · ALL BUILT AND IN USE TODAY</text>
+<rect x="56.0" y="174" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="68.0" y="186.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Morsel-driven parallelism</text>
+<text x="68.0" y="203.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">each core owns a block, no</text>
+<text x="68.0" y="219.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">barriers</text>
+<rect x="300.66666666666663" y="174" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="312.7" y="186.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Radix-partitioned hash joins</text>
+<text x="312.7" y="203.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">built in parallel without atomics</text>
+<rect x="545.3333333333333" y="174" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="557.3" y="186.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Parallel radix sort and select</text>
+<text x="557.3" y="203.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">percentiles and sorts on every</text>
+<text x="557.3" y="219.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">core</text>
+<rect x="56.0" y="238" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="68.0" y="250.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">HyperLogLog-sized hash sets</text>
+<text x="68.0" y="267.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">count distinct at 1M groups</text>
+<rect x="300.66666666666663" y="238" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="312.7" y="250.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Bounded top-k heaps</text>
+<text x="312.7" y="267.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">ORDER BY … LIMIT without a full</text>
+<text x="312.7" y="283.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">sort</text>
+<rect x="545.3333333333333" y="238" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="557.3" y="250.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">SIMD bulk Parquet decode</text>
+<text x="557.3" y="267.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">a column written in place, every</text>
+<text x="557.3" y="283.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">core in a row group</text>
+<rect x="56.0" y="302" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="68.0" y="314.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Two-phase parallel</text>
+<text x="68.0" y="331.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">dictionaries</text>
+<text x="68.0" y="348.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">text codes in file order, found in</text>
+<text x="68.0" y="364.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">parallel</text>
+<rect x="300.66666666666663" y="302" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="312.7" y="314.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Planner from exact statistics</text>
+<text x="312.7" y="331.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">dense or hashed, heap or sort;</text>
+<text x="312.7" y="347.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">EXPLAIN says why</text>
+<rect x="545.3333333333333" y="302" width="3" height="34" rx="1.5" fill="#6C3E78" fill-opacity=".55"/>
+<text x="557.3" y="314.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#20221F" text-anchor="start">Reproducible float sums</text>
+<text x="557.3" y="331.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">the same bits on any core count</text>
+<rect x="826" y="96" width="318" height="288" rx="14" fill="#6C3E78" fill-opacity=".07" stroke="#6C3E78" stroke-opacity=".35"/>
+<text x="850.0" y="146.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="40" font-weight="400" fill="#20221F" text-anchor="start">Mojo</text>
+<rect x="850" y="175" width="10" height="2" fill="#6C3E78"/>
+<text x="868.0" y="180.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#20221F" text-anchor="start">compiled ahead of time to native</text>
+<text x="868.0" y="198.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#20221F" text-anchor="start">code</text>
+<rect x="850" y="217" width="10" height="2" fill="#6C3E78"/>
+<text x="868.0" y="222.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#20221F" text-anchor="start">SIMD types and compile-time</text>
+<text x="868.0" y="240.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#20221F" text-anchor="start">specialisation</text>
+<rect x="850" y="259" width="10" height="2" fill="#6C3E78"/>
+<text x="868.0" y="264.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#20221F" text-anchor="start">no garbage collector</text>
+<rect x="850" y="283" width="10" height="2" fill="#6C3E78"/>
+<text x="868.0" y="288.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="500" fill="#20221F" text-anchor="start">the same kernels on CPU and GPU</text>
+<text x="850.0" y="324.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="17" font-weight="400" fill="#6C3E78" text-anchor="start" font-style="italic">Python&#x27;s ease with C++&#x27;s speed, in</text>
+<text x="850.0" y="346.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="17" font-weight="400" fill="#6C3E78" text-anchor="start" font-style="italic">one codebase.</text>
+</g>
+<rect x=".5" y=".5" width="1199" height="401" rx="18" fill="none" stroke="#BEB4A4"/>
+</svg>

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="368" viewBox="0 0 1200 368" role="img" aria-labelledby="t d">
+<title id="t">The omx family: omxapp + omxcore</title>
+<desc id="d">The omx family: omxapp (UI, built once: native on Linux, macOS, iPhone, Android and the web) over omxcore (the data engine: SQL, joins, streaming; CPU and GPU; this repo) over your files (CSV and Parquet: open formats; nothing to import or convert). A full stack for data apps with no Python and no server: the app and its engine compile into one native binary. omxplorer is the first app built this way.</desc>
+<defs>
+  <pattern id="rule" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 23.5H24" stroke="#D8D0C2" stroke-opacity=".45"/></pattern>
+  <clipPath id="clip"><rect width="1200" height="368" rx="18"/></clipPath>
+</defs>
+<g clip-path="url(#clip)">
+<rect width="1200" height="368" fill="#F2EFE7"/>
+<rect y="72" width="1200" height="368" fill="url(#rule)"/>
+<text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">M<tspan fill="#6C3E78">X</tspan> FRAME</text>
+<text x="206.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="start" letter-spacing="3">THE OMX FAMILY</text>
+<text x="1144.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1">github.com/abhisheksreesaila/mxapp</text>
+<path d="M56 64H1144" stroke="#20221F" stroke-width="1.5"/>
+<text x="56.0" y="128.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="44" font-weight="400" fill="#20221F" text-anchor="start" font-style="italic">omxapp + omxcore</text>
+<text x="56.0" y="172.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="17" font-weight="400" fill="#4C5049" text-anchor="start">A full stack for data apps with no Python and no</text>
+<text x="56.0" y="196.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="17" font-weight="400" fill="#4C5049" text-anchor="start">server: the app and its engine compile into one</text>
+<text x="56.0" y="220.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="17" font-weight="400" fill="#4C5049" text-anchor="start">native binary.</text>
+<text x="56.0" y="258.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#6C3E78" text-anchor="start">omxplorer is the first app built this way.</text>
+<rect x="600.5" y="92.5" width="470" height="40" rx="10" fill="none" stroke="#BEB4A4" stroke-dasharray="5 4"/>
+<text x="618.0" y="118.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="18" font-weight="400" fill="#20221F" text-anchor="start" font-style="italic">omxplorer</text>
+<text x="1054.0" y="117.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1.5">EXAMPLE APP</text>
+<rect x="600" y="142" width="470" height="60" rx="10" fill="#FFFDF8" stroke="#BEB4A4"/>
+<text x="618.0" y="169.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="22" font-weight="400" fill="#20221F" text-anchor="start">omxapp</text>
+<text x="1054.0" y="168.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#4C5049" text-anchor="end" letter-spacing="1.5">UI, BUILT ONCE</text>
+<text x="618.0" y="189.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">native on Linux, macOS, iPhone, Android and the web</text>
+<rect x="600" y="212" width="470" height="60" rx="10" fill="#6C3E78" stroke="#6C3E78"/>
+<text x="618.0" y="239.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="22" font-weight="400" fill="#FFFDF8" text-anchor="start">omxcore</text>
+<text x="1054.0" y="238.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#FFFDF8" text-anchor="end" letter-spacing="1.5">THE DATA ENGINE</text>
+<text x="618.0" y="259.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#FFFDF8" text-anchor="start" fill-opacity=".9">SQL, joins, streaming; CPU and GPU; this repo</text>
+<rect x="600" y="282" width="470" height="60" rx="10" fill="#FFFDF8" stroke="#BEB4A4" stroke-dasharray="2 3"/>
+<text x="618.0" y="309.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="22" font-weight="400" fill="#20221F" text-anchor="start">your files</text>
+<text x="1054.0" y="308.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#4C5049" text-anchor="end" letter-spacing="1.5">CSV AND PARQUET</text>
+<text x="618.0" y="329.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">open formats; nothing to import or convert</text>
+<path d="M1088 92h8V272h-8" fill="none" stroke="#6C3E78" stroke-width="1.5"/>
+<text x="1114" y="182.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" letter-spacing="1.5" text-anchor="middle" transform="rotate(90 1114 182.0)">ONE NATIVE BINARY</text>
+</g>
+<rect x=".5" y=".5" width="1199" height="367" rx="18" fill="none" stroke="#BEB4A4"/>
+</svg>

@@ -87,7 +87,9 @@ def test_svgs_render_on_github(name):
     s = (IMG / name).read_text()
     assert "<script" not in s and "@import" not in s and "@font-face" not in s and "http://" not in s.replace("http://www.w3.org/2000/svg", "")
     assert "<title" in s and "<desc" in s, "an accessible name and description"
-    assert "informal" in s.lower(), "every engine SVG keeps the informal caveat"
+    shown = re.sub(r"<desc.*?</desc>", "", s, flags=re.S)
+    if re.search(r">[^<]*\d\s?(?:ms|s)\b", shown):
+        assert "informal" in s.lower(), "every engine SVG that shows a timing keeps the informal caveat"
 
 
 def test_page_is_in_the_nav_and_reads_the_one_data_file():
@@ -106,3 +108,36 @@ def test_readme_shows_the_engine_art_and_links_the_page():
     for n in used:
         assert (IMG / n).is_file(), n
     assert "engine.html" in readme and "docs/mojo-engine.md" in readme
+
+
+BRIEF = (ROOT / "docs" / "briefs" / "positioning.md").read_text()
+PLAN = (ROOT / "docs" / "plan.md").read_text()
+
+
+def test_roadmap_says_what_the_approved_brief_says():
+    rm = DATA["roadmap"]
+    one_line = " ".join(BRIEF.split())
+    assert f"{rm['vision']}. {rm['vision_2']}." in one_line
+    assert len(rm["can_be"]) == 7
+    assert sum(1 for s in rm["path"] if s["id"] == rm["now"]) == 1
+
+
+def test_roadmap_steps_name_real_plan_items():
+    for s in DATA["roadmap"]["path"]:
+        for ref in re.findall(r"\b(?:F-\d+|M\d+)\b", s["tag"]):
+            assert re.search(rf"^## {ref}\b", PLAN, re.M), f"{ref} is not a heading in docs/plan.md"
+
+
+def test_agent_features_are_not_shown_as_done():
+    """Only what ships today may say so; the plugins are planned (M10)."""
+    items = DATA["roadmap"]["agents"]["items"]
+    assert {i["status"] for i in items} <= {"today", "with 0.7.0", "planned"}
+    assert [i["name"] for i in items if i["status"] == "today"] == ["mx"]
+    assert "PLANNED" in DATA["roadmap"]["agents"]["when"]
+
+
+def test_readme_names_omxcore_and_shows_the_roadmap():
+    readme = (ROOT / "README.md").read_text()
+    assert "omxcore" in readme and "docs/briefs/positioning.md" in readme
+    for n in ("engine-roadmap.svg", "engine-hood.svg", "engine-family.svg"):
+        assert f"docs/img/{n}" in readme, n
