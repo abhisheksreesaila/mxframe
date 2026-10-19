@@ -25,8 +25,10 @@ from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN
 from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
-from .plan import LogicalPlan, build_plan
+from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
+from .join import (needed_columns, side_query, joined_query, JoinKeys, normalize_keys, join_pairs, gather_join, JOIN_BUDGET_BYTES)
+from .kernels.hashjoin_cpu import hj_build
 from .kargs import KernelRun
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sqlprog import lower_rows
@@ -53,6 +55,12 @@ struct SqlResult(Movable):
         self.device = CPU
         self.fallback_reason = String()
         self.notes = List[String]()
+
+    def take_table(mut self) -> Table:
+        """The result table, moved out (the result keeps an empty one)."""
+        var t = self.table^
+        self.table = Table.empty()
+        return t^
 
 
 # ── partial results ──────────────────────────────────────────────────────────────────────────────────
@@ -618,8 +626,90 @@ def _ms(x: Float64) -> String:
     return String(Float64(Int(x * 100.0)) / 100.0)
 
 
-def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions, trust: Bool, lie: String) raises -> SqlResult:
+def _side_names(q: BoundQuery, t: Int) -> String:
+    return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
+
+
+def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
+                                t0: Int) raises -> SqlResult:
+    """A query over two tables: each side is reduced to the rows and columns the query needs (a row query over its source, with the filter
+    that reads only it), the smaller side is the build side of the hash join (`kernels/hashjoin_cpu.mojo`), the matching pairs are gathered
+    into one table, and the rest of the query (the filter that reads both sides, aggregates, ORDER BY, LIMIT) runs over that table."""
+    var res = SqlResult()
+    if q.explain != EXPLAIN_NONE:
+        res.notes.append("join: inner, on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + " (the build side is the side with fewer rows after its filter: decided when the query runs)")
+        res.explain = _explain_text(lp, res.notes)
+        var t = Table.empty()
+        var c = t.add_column("plan", TEXT)
+        for line in res.explain.split("\n"):
+            if line.byte_length() > 0:
+                t.append_text(c, String(line))
+        res.table = t^
+        res.ms = Float64(perf_counter_ns() - t0) / 1e6
+        return res^
+    var lneed = needed_columns(q, 0)
+    var rneed = needed_columns(q, 1)
+    var t_sides = perf_counter_ns()
+    var lq = side_query(catalog, q, 0, lneed)
+    var rq = side_query(catalog, q, 1, rneed)
+    var lres = _run_sql_once(catalog, lq, planner, opts, trust, String())
+    var rres = _run_sql_once(catalog, rq, planner, opts, trust, String())
+    var lt = lres.take_table().share()
+    var rt = rres.take_table().share()
+    var ms_sides = Float64(perf_counter_ns() - t_sides) / 1e6
+    var left_builds = lt.rows() < rt.rows()
+    var bt = lt if left_builds else rt
+    var pt = rt if left_builds else lt
+    var bneed = lneed.copy() if left_builds else rneed.copy()
+    var pneed = rneed.copy() if left_builds else lneed.copy()
+    var bkeyc = q.jk_l.copy() if left_builds else q.jk_r.copy()
+    var pkeyc = q.jk_r.copy() if left_builds else q.jk_l.copy()
+    var bcols = List[Int]()
+    var pcols = List[Int]()
+    for k in range(len(bkeyc)):
+        for i in range(len(bneed)):
+            if bneed[i] == bkeyc[k]:
+                bcols.append(i)
+        for i in range(len(pneed)):
+            if pneed[i] == pkeyc[k]:
+                pcols.append(i)
+    var t_keys = perf_counter_ns()
+    var keys = JoinKeys()
+    normalize_keys(bt, pt, bcols, pcols, keys)
+    var t_build = perf_counter_ns()
+    var m = hj_build(Int(keys.bkeys.unsafe_ptr()), Int(keys.bok.unsafe_ptr()), bt.rows(), opts.threads)
+    var t_probe = perf_counter_ns()
+    var ncols = len(lneed) + len(rneed)
+    var budget = JOIN_BUDGET_BYTES // (8 * max(ncols, 1))
+    var pairs = join_pairs(m, keys, budget, opts.threads)
+    var t_gather = perf_counter_ns()
+    var jt = gather_join(lt, rt, pairs, left_builds, opts.threads)
+    var ms_gather = Float64(perf_counter_ns() - t_gather) / 1e6
+    res.notes.append("join: inner on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lt.rows()) + " rows of " + _side_names(q, 0) +
+                     " and " + commas(rt.rows()) + " rows of " + _side_names(q, 1) + " after their filters")
+    res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(bt.rows()) + " rows, the smaller side): " + m.kind())
+    res.notes.append("join keys: " + keys.layout)
+    res.notes.append("join path: materialized: " + commas(pairs.n) + " matching pairs gathered into one table of " + String(ncols) + " columns")
+    res.notes.append("join time: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build " + _ms(Float64(t_probe - t_build) / 1e6) +
+                     " ms, probe " + _ms(Float64(t_gather - t_probe) / 1e6) + " ms, gather " + _ms(ms_gather) + " ms")
+    var cat2 = Catalog()
+    cat2.add_table("join", jt^.share())
+    var jq = joined_query(q, lneed, rneed)
+    var inner = _run_sql_once(cat2, jq, planner, opts, trust, lie)
+    for n in inner.notes:
+        res.notes.append(n)
+    res.table = inner.take_table()
+    res.explain = _explain_text(lp, res.notes)
+    res.ms = Float64(perf_counter_ns() - t0) / 1e6
+    return res^
+
+
+def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, opts: PlannerOptions, trust: Bool, lie: String) raises -> SqlResult:
     var t0 = perf_counter_ns()
+    var lp = build_plan(q0, catalog.sources[q0.source].name)         # the plan; the executor lowers its query from the nodes
+    var q = executable(lp, q0)
+    if q.joined:
+        return _run_join_query(catalog, q, lp, planner, opts, trust, lie, t0)
     prepare_ranges(catalog, q)
     ref src = catalog.sources[q.source]
     var scan = src.scan.copy()
@@ -631,7 +721,6 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
     var dicts = DictAccess(src.table, scan, extra)
     var st = make_stats(src, q, dicts, trust)
     var plan = planner.plan(q, st, opts)
-    var lp = build_plan(q, src.name)
     plan_sinks(lp, q, st, opts, plan)
     var res = SqlResult()
     res.notes = plan.notes.copy()

@@ -618,8 +618,6 @@ struct _Binder(Movable):
         """WHERE (and, for a join, ON): one table binds the whole condition; two tables split it into conjuncts: an equality between a
         column of each table is an equi-join key, a conjunct that reads one table filters that table before the join, the rest is
         checked on the joined rows."""
-        if self.st.where >= 0 and _has_aggregate(self.st, self.st.where):
-            raise self.err(self.st.where, "aggregate functions are not allowed in WHERE: filter the groups with HAVING")
         if not self.q.joined:
             if self.st.where >= 0:
                 var w = self.value(self.st.where)
@@ -1449,6 +1447,8 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     if not aggregating:
         return bind_rows(b^)
     # WHERE (and a join's ON)
+    if b.st.where >= 0 and _has_aggregate(b.st, b.st.where):
+        raise b.err(b.st.where, "aggregate functions are not allowed in WHERE: filter the groups with HAVING")
     b.bind_where()
     # GROUP BY: ordinals and aliases name select items
     for g in range(len(b.st.group_by)):

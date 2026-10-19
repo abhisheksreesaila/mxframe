@@ -210,6 +210,8 @@ def open_tables(mut cat: Catalog, args: Args, text: String, mut notes: List[Stri
         var st = parse_sql(text)
         if st.table_is_file and cat.find(st.table) < 0:
             load_file(cat, st.table, st.table, args.stream, args.memory, notes)
+        if st.has_right and st.right_is_file and cat.find(st.right_table) < 0:
+            load_file(cat, st.right_table, st.right_table, args.stream, args.memory, notes)
     except e:
         _ = query_error(String(e))
 
