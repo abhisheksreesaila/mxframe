@@ -140,7 +140,56 @@ def build_plan(q: BoundQuery, source_name: String) -> LogicalPlan:
     var lp = LogicalPlan()
     lp.rows = q.rows
     var at: Int
-    if q.joined:
+    if q.joined and len(q.sources) > 2:
+        # three or more tables: the plan as written, a left-deep chain; the join order the planner picks is decided when the leaves' filters have run
+        # (EXPLAIN shows it) and is not part of this tree
+        var sides = List[Int]()
+        for t in range(len(q.sources)):
+            var sc = PlanNode(P_SCAN, -1)
+            sc.source = q.sources[t]
+            sc.text = "Scan " + q.tab_names[t] + (" AS " + q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else "")
+            var node = lp.add(sc^)
+            if len(q.leaf_conj[t]) > 0:
+                var f = PlanNode(P_FILTER, node)
+                f.conj = q.leaf_conj[t].copy()
+                var ft = String("Filter ")
+                for k in range(len(q.leaf_conj_text[t])):
+                    ft += (" AND " if k > 0 else "") + q.leaf_conj_text[t][k]
+                f.text = ft
+                node = lp.add(f^)
+            sides.append(node)
+        var acc = sides[0]
+        for t in range(1, len(q.sources)):
+            var jn = PlanNode(P_JOIN, acc)
+            jn.right = sides[t]
+            var jt = String("Join (inner) on ")
+            var first = True
+            for k in range(len(q.edge_a)):
+                var ta = 0
+                var tb = 0
+                for u in range(len(q.tab_start)):
+                    if q.edge_a[k] >= q.tab_start[u]:
+                        ta = u
+                    if q.edge_b[k] >= q.tab_start[u]:
+                        tb = u
+                if (ta == t and tb < t) or (tb == t and ta < t):
+                    var la = q.tab_alias[ta] if q.tab_alias[ta].byte_length() > 0 else q.tab_names[ta]
+                    var lb = q.tab_alias[tb] if q.tab_alias[tb].byte_length() > 0 else q.tab_names[tb]
+                    jt += ("" if first else " AND ") + la + "." + q.src_name(q.edge_a[k]) + " = " + lb + "." + q.src_name(q.edge_b[k])
+                    first = False
+            if first:
+                jt += "(no equality to the tables before it: the order is the planner's to change)"
+            jn.text = jt
+            acc = lp.add(jn^)
+        at = acc
+        if len(q.resid) > 0:
+            var f = PlanNode(P_FILTER, at)
+            var ft = String("Filter (across tables) ")
+            for k in range(len(q.resid_text)):
+                ft += (" AND " if k > 0 else "") + q.resid_text[k]
+            f.text = ft
+            at = lp.add(f^)
+    elif q.joined:
         var sides = List[Int]()
         for t in range(2):
             var sc = PlanNode(P_SCAN, -1)

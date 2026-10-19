@@ -236,7 +236,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
     var start = len(file)
     if col.kind == TEXT:                                # the dictionary page: every word, PLAIN
         var d = List[UInt8]()
-        for word in col.words:
+        for word in col.dict[].words:
             var bytes = word.as_bytes()
             _put32(d, len(bytes))
             for c in bytes:
@@ -244,7 +244,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
         var cd = _compress(codec, d)
         _check_page(col, len(d), len(cd))
         chunk.dict_offset = len(file)
-        _page_header(file, PAGE_DICTIONARY, len(d), len(cd), len(col.words), ENC_PLAIN)
+        _page_header(file, PAGE_DICTIONARY, len(d), len(cd), len(col.dict[].words), ENC_PLAIN)
         chunk.uncompressed += len(file) - chunk.dict_offset + len(d)       # header + page, uncompressed
         file.extend(cd^)
     var body = List[UInt8]()
@@ -263,7 +263,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
         _put32(body, len(levels))
         body.extend(levels^)
     if col.kind == TEXT:                                # dictionary indices: bit width, then bit-packed runs
-        var w = max(_bit_width(len(col.words) - 1), 1)
+        var w = max(_bit_width(len(col.dict[].words) - 1), 1)
         body.append(UInt8(w))
         var idx = List[Int64]()
         for row in range(lo, hi):
@@ -1250,7 +1250,7 @@ struct _WordIndex(Movable):
         self.mask = 1023
 
     def find(self, p: UnsafePointer[UInt8, MutAnyOrigin], n: Int, h: UInt64) -> Int:
-        var words = UnsafePointer[Column, MutAnyOrigin](unsafe_from_address=self.col)[].words.unsafe_ptr()
+        var words = UnsafePointer[Column, MutAnyOrigin](unsafe_from_address=self.col)[].dict[].words.unsafe_ptr()
         var i = Int(h) & self.mask
         while True:
             var code = Int(self.slots[i])

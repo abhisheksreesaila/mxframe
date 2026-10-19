@@ -13,7 +13,7 @@ from .floatfmt import float_text
 from .gpu import DeviceTable, gpu_available
 from .sql import parse_sql, SqlStatement
 from .bind import Catalog, SqlSource, BoundQuery, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN
-from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED,
+from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, JoinStats, JoinPlan, JoinStep, rule_join_order,
                       G_NONE, G_DENSE, G_HASHED)
 from .plan import LogicalPlan, PlanNode, build_plan
 from .sqlexec import sql, sql_with, SqlResult

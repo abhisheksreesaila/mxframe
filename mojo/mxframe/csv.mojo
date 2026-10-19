@@ -1352,7 +1352,7 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
                     report.failed.append(FailedRow(offsets[i] + cc.fails[k].row + 1, cc.fails[k].text,
                                                    cc.fails[k].reason))
         if kinds[c] == TEXT.value:
-            report.distinct = len(col.words)
+            report.distinct = len(col.dict[].words)
         result.columns.append(report^)
     for i in range(nch):
         result.ragged_count += sinks[i].ragged_count

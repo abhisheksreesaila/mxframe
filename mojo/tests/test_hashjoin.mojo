@@ -177,6 +177,19 @@ def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[I
                 expect(Int(sel[q]) == i and Int(prow[q]) == want, name + ": block lookup of row " + String(i))
                 q += 1
         expect(kept == q, name + ": block kept " + String(kept) + " wanted " + String(q))
+        # the same by row: the partner of block row r is prow[r], whatever later compaction of sel does
+        var sel2 = List[Int32](length=np, fill=0)
+        var nsel2 = 0
+        for i in range(0, np, 2):
+            sel2[nsel2] = Int32(i)
+            nsel2 += 1
+        var prow2 = List[Int32](length=np, fill=-5)
+        var kept2 = hj_probe_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                                   pok != 0, 0, IP(unsafe_from_address=Int(sel2.unsafe_ptr())), nsel2, IP(unsafe_from_address=Int(prow2.unsafe_ptr())), True)
+        expect(kept2 == kept, name + ": by-row block kept " + String(kept2))
+        for t in range(kept2):
+            var row = Int(sel2[t])
+            expect(Int(prow2[row]) == truth[probe[row]][0], name + ": by-row partner of row " + String(row))
         # the LEFT form: every row stays, its partner or -1
         var lsel = List[Int32](length=np, fill=0)
         for i in range(np):

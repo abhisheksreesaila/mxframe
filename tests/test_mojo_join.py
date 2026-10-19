@@ -262,8 +262,8 @@ def test_unsupported_joins_say_so(mx, data):
     assert e["message"].startswith("the join has no equality between a column of `f` and a column of `d`"), e
     e = err(mx, data, "SELECT count(*) FROM facts f RIGHT JOIN dims d ON f.k = d.k", ["facts", "dims"])
     assert e["message"] == "`RIGHT JOIN` is not supported yet", e
-    e = err(mx, data, "SELECT count(*) FROM facts f JOIN dims d ON f.k = d.k JOIN hot h ON h.k = d.k", ["facts", "dims", "hot"])
-    assert e["message"] == "more than two tables in FROM is not supported yet (F-155)", e
+    e = err(mx, data, "SELECT count(*) FROM facts f LEFT JOIN dims d ON f.k = d.k JOIN hot h ON h.k = d.k", ["facts", "dims", "hot"])
+    assert e["message"] == "a `LEFT JOIN` together with a third table is not supported yet (F-159)", e
 
 
 @pytest.mark.parametrize("sql,message", [

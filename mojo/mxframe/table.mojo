@@ -45,6 +45,17 @@ comptime F32_COLUMN = 32           # a FLOAT's `scale` when the file stored 32-b
                                    # literal in 32 bits, as DuckDB does (`l_discount <= 0.07` keeps the rows holding 0.07). 0 for a float64 column.
 
 
+struct WordDict(Movable):
+    """A TEXT column's dictionary: the words by code and the code of each word. Columns hold it through an `ArcPointer`, so a table made from another's
+    columns (a join's gather, a query's result) shares the dictionary instead of copying it; the first `add_word` on a shared one copies it first."""
+    var words: List[String]            # by code
+    var codes: Dict[String, Int]       # word -> code
+
+    def __init__(out self):
+        self.words = List[String]()
+        self.codes = Dict[String, Int]()
+
+
 struct Column(Movable):
     var name: String
     var kind: ColumnKind
@@ -52,8 +63,7 @@ struct Column(Movable):
     var values: List[Int64]
     var validity: List[UInt8]          # empty: no nulls
     var nulls: Int
-    var words: List[String]            # TEXT: the dictionary, by code
-    var codes: Dict[String, Int]       # TEXT: word -> code
+    var dict: ArcPointer[WordDict]     # TEXT: the dictionary (shared between columns that hold the same words)
 
     def __init__(out self, name: String, kind: ColumnKind, scale: Int):
         self.name = name
@@ -62,8 +72,7 @@ struct Column(Movable):
         self.values = List[Int64]()
         self.validity = List[UInt8]()
         self.nulls = 0
-        self.words = List[String]()
-        self.codes = Dict[String, Int]()
+        self.dict = ArcPointer(WordDict())
 
     def push(mut self, value: Int64, valid: Bool):
         var i = len(self.values)
@@ -159,9 +168,9 @@ struct Table(Movable):
         """Appends a stored value (scaled for a DECIMAL, a code for TEXT, days for DATE, 0 / 1 for BOOL). A TEXT
         code must be one of the column's words (`add_word`), a BOOL 0 or 1."""
         ref col = self.cols[c]
-        if col.kind == TEXT and (value < 0 or value >= Int64(len(col.words))):
+        if col.kind == TEXT and (value < 0 or value >= Int64(len(col.dict[].words))):
             raise Error("column `" + col.name + "`: code " + String(value) + " is not one of its " +
-                        String(len(col.words)) + " words")
+                        String(len(col.dict[].words)) + " words")
         if col.kind == BOOL and value != 0 and value != 1:
             raise Error("column `" + col.name + "` is BOOL: " + String(value) + " is not 0 or 1")
         col.push(value, True)
@@ -180,11 +189,16 @@ struct Table(Movable):
         dictionary once, then `append` codes."""
         if self.cols[c].kind != TEXT:
             raise Error("column `" + self.cols[c].name + "` is " + String(self.cols[c].kind) + ", not TEXT")
-        var code = self.cols[c].codes.get(word, -1)
+        var code = self.cols[c].dict[].codes.get(word, -1)
         if code < 0:
-            code = len(self.cols[c].words)
-            self.cols[c].words.append(word)
-            self.cols[c].codes[word] = code
+            if self.cols[c].dict.count() > 1:                       # shared with another column: this one gets a copy before it changes
+                var own = WordDict()
+                own.words = self.cols[c].dict[].words.copy()
+                own.codes = self.cols[c].dict[].codes.copy()
+                self.cols[c].dict = ArcPointer(own^)
+            code = len(self.cols[c].dict[].words)
+            self.cols[c].dict[].words.append(word)
+            self.cols[c].dict[].codes[word] = code
         return code
 
     def append_text(mut self, c: Int, word: String) raises:
@@ -215,15 +229,19 @@ struct Table(Movable):
 
     def dictionary(self, c: Int) -> Span[String, origin_of(self)]:
         """A TEXT column's words, by code, read-only."""
-        var p = Pointer[String, origin_of(self)](unsafe_from_address=Int(self.cols[c].words.unsafe_ptr()))
-        return Span[String, origin_of(self)](unsafe_ptr=p, length=len(self.cols[c].words))
+        var p = Pointer[String, origin_of(self)](unsafe_from_address=Int(self.cols[c].dict[].words.unsafe_ptr()))
+        return Span[String, origin_of(self)](unsafe_ptr=p, length=len(self.cols[c].dict[].words))
+
+    def share_dictionary(mut self, c: Int, other: SharedTable, oc: Int):
+        """TEXT column `c` takes column `oc` of `other` as its dictionary (no word is copied: the two share it until one of them adds a word)."""
+        self.cols[c].dict = other._table[].cols[oc].dict
 
     def text_of(self, c: Int, code: Int) -> String:
-        return self.cols[c].words[code]
+        return self.cols[c].dict[].words[code]
 
     def code_of(self, c: Int, word: String) -> Int:
         """The word's code, or -1 when the column has never held it."""
-        return self.cols[c].codes.get(word, -1)
+        return self.cols[c].dict[].codes.get(word, -1)
 
     def share(deinit self) -> SharedTable:
         """Hands the table over as a read-only table every session can hold (no copy)."""
@@ -279,8 +297,8 @@ struct SharedTable(ImplicitlyCopyable):
 
     def dictionary(self, c: Int) -> Span[String, origin_of(self)]:
         """A TEXT column's words, by code, read-only."""
-        var p = Pointer[String, origin_of(self)](unsafe_from_address=Int(self._table[].cols[c].words.unsafe_ptr()))
-        return Span[String, origin_of(self)](unsafe_ptr=p, length=len(self._table[].cols[c].words))
+        var p = Pointer[String, origin_of(self)](unsafe_from_address=Int(self._table[].cols[c].dict[].words.unsafe_ptr()))
+        return Span[String, origin_of(self)](unsafe_ptr=p, length=len(self._table[].cols[c].dict[].words))
 
     def text_of(self, c: Int, code: Int) -> String:
         return self._table[].text_of(c, code)

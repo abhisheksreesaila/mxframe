@@ -271,6 +271,22 @@ struct OrderItem(Copyable, Movable):
     var nulls: Int              # -1 the default (last), 0 NULLS LAST, 1 NULLS FIRST
 
 
+struct TableRef(Copyable, Movable):
+    """A table of FROM beyond the second (F-155): `a JOIN b ON .. JOIN c ON ..`, `a, b, c WHERE ..`."""
+    var name: String
+    var alias: String
+    var is_file: Bool
+    var line: Int
+    var col: Int
+
+    def __init__(out self, name: String, alias: String, is_file: Bool, line: Int, col: Int):
+        self.name = name
+        self.alias = alias
+        self.is_file = is_file
+        self.line = line
+        self.col = col
+
+
 struct SubQuery(Copyable, Movable):
     """`(SELECT item FROM table [alias] [WHERE cond])`: the only subquery shape (F-154). Its expressions live in the statement's pool."""
     var table: String
@@ -293,6 +309,7 @@ struct SubQuery(Copyable, Movable):
 
 comptime EXPLAIN_NONE = 0
 comptime EXPLAIN_PLAN = 1
+comptime EXPLAIN_ANALYZE = 2   # F-155: the query runs and the plan shows the actual rows and milliseconds of each operator
 
 
 struct SqlStatement(Movable):
@@ -325,6 +342,7 @@ struct SqlStatement(Movable):
     var comma_join: Bool
     var join_kind: Int          # F-154: JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI
     var subs: List[SubQuery]    # F-154: the subqueries of WHERE conditions
+    var extra: List[TableRef]   # F-155: the third table of FROM and the ones after it (inner joins only)
     var from_subquery: Bool     # set by the binder when it turned a WHERE subquery into the right table of a semi / anti join
 
     def __init__(out self, text: String):
@@ -340,6 +358,7 @@ struct SqlStatement(Movable):
         self.comma_join = False
         self.join_kind = JK_INNER
         self.subs = List[SubQuery]()
+        self.extra = List[TableRef]()
         self.from_subquery = False
         self.text = text
         self.exprs = List[SqlExpr]()
@@ -552,7 +571,8 @@ struct _Parser(Movable):
             _ = self.advance()
             self.st.explain = EXPLAIN_PLAN
             if self.is_kw("ANALYZE"):
-                raise self.unsupported(self.tok(), "`EXPLAIN ANALYZE`", "F-155")
+                _ = self.advance()
+                self.st.explain = EXPLAIN_ANALYZE
             t = self.tok()
         if t.kind == T_IDENT and t.up == "WITH":
             raise self.unsupported(t, "`WITH` (common table expressions)", "F-159")
@@ -745,32 +765,66 @@ struct _Parser(Movable):
         return (tt.text, alias, tt.kind == T_STR, tt.line, tt.col)
 
     def join_tail(mut self) raises:
-        """After the first table: `, b`, `[INNER] JOIN b ON cond`, `[INNER] JOIN b USING (k, ...)`; every other join raises by name."""
-        var t = self.tok()
-        if self.is_sym(","):
-            _ = self.advance()
-            var r = self.table_ref()
-            self.set_right(r)
-            self.st.comma_join = True
-        elif t.kind == T_IDENT and (t.up == "JOIN" or ((t.up == "INNER" or t.up == "LEFT" or t.up == "SEMI" or t.up == "ANTI") and
-                                                       (self.is_kw("JOIN", 1) or (t.up == "LEFT" and self.is_kw("OUTER", 1) and self.is_kw("JOIN", 2))))):
-            if t.up == "LEFT":
-                self.st.join_kind = JK_LEFT
-            elif t.up == "SEMI":
-                self.st.join_kind = JK_SEMI
-            elif t.up == "ANTI":
-                self.st.join_kind = JK_ANTI
-            if t.up == "INNER" or t.up == "LEFT" or t.up == "SEMI" or t.up == "ANTI":
+        """After the first table: `, b`, `[INNER] JOIN b ON cond`, `[INNER] JOIN b USING (k, ...)`, `LEFT [OUTER] / SEMI / ANTI JOIN b ON ..`, and (F-155) more of
+        the inner kinds after them: `a JOIN b ON .. JOIN c ON ..`, `a, b, c WHERE ..`. Every other join raises by name."""
+        while True:
+            var t = self.tok()
+            var inner_kw = t.kind == T_IDENT and (t.up == "JOIN" or (t.up == "INNER" and self.is_kw("JOIN", 1)))
+            var outer_kw = t.kind == T_IDENT and ((t.up == "LEFT" or t.up == "SEMI" or t.up == "ANTI") and
+                                                  (self.is_kw("JOIN", 1) or (t.up == "LEFT" and self.is_kw("OUTER", 1) and self.is_kw("JOIN", 2))))
+            var is_comma = self.is_sym(",")
+            if not (is_comma or inner_kw or outer_kw):
+                if t.kind == T_IDENT and (t.up == "RIGHT" or t.up == "FULL" or t.up == "CROSS" or t.up == "NATURAL" or
+                                          t.up == "ASOF" or t.up == "POSITIONAL" or t.up == "LATERAL" or t.up == "INNER" or t.up == "LEFT" or
+                                          t.up == "SEMI" or t.up == "ANTI"):
+                    var named = t.up
+                    if (t.up == "RIGHT" or t.up == "FULL") and self.is_kw("OUTER", 1):
+                        named += " OUTER"
+                    raise self.unsupported(t, "`" + named + " JOIN`", "")
+                return
+            if self.st.has_right and (outer_kw or self.st.join_kind != JK_INNER):
+                raise self.unsupported(t, "a `" + ("LEFT" if self.st.join_kind == JK_LEFT else "SEMI" if self.st.join_kind == JK_SEMI else "ANTI" if self.st.join_kind == JK_ANTI else t.up) +
+                                       " JOIN` together with a third table", "F-159")
+            if is_comma:
+                _ = self.advance()
+                var r = self.table_ref()
+                if self.st.has_right:
+                    self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4]))
+                else:
+                    self.set_right(r)
+                    self.st.comma_join = True
+                continue
+            if outer_kw:
+                if t.up == "LEFT":
+                    self.st.join_kind = JK_LEFT
+                elif t.up == "SEMI":
+                    self.st.join_kind = JK_SEMI
+                else:
+                    self.st.join_kind = JK_ANTI
                 _ = self.advance()
                 if self.is_kw("OUTER"):
                     _ = self.advance()
-            _ = self.advance()
+            elif t.up == "INNER":
+                _ = self.advance()
+            _ = self.advance()                                                  # JOIN
             var r = self.table_ref()
-            self.set_right(r)
+            var more = self.st.has_right
+            if more:
+                self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4]))
+            else:
+                self.set_right(r)
             if self.is_kw("ON"):
                 _ = self.advance()
-                self.st.join_on = self.expr()
+                var on = self.expr()
+                if self.st.join_on >= 0:                                        # the ON conditions of an inner join chain are conjuncts of one condition
+                    self.st.exprs.append(SqlExpr(X_BIN, "AND", String(), self.st.join_on, on, -1, List[Int](), False, t.line, t.col))
+                    self.depths.append(max(self.depths[self.st.join_on], self.depths[on]) + 1)
+                    self.st.join_on = len(self.st.exprs) - 1
+                else:
+                    self.st.join_on = on
             elif self.is_kw("USING"):
+                if more:
+                    raise self.unsupported(self.tok(), "`USING` in a join of more than two tables", "write ON")
                 _ = self.advance()
                 _ = self.expect_sym("(")
                 while True:
@@ -786,18 +840,6 @@ struct _Parser(Movable):
                 _ = self.expect_sym(")")
             else:
                 raise self.expected("ON or USING after JOIN")
-        elif t.kind == T_IDENT and (t.up == "RIGHT" or t.up == "FULL" or t.up == "CROSS" or t.up == "NATURAL" or
-                                    t.up == "ASOF" or t.up == "POSITIONAL" or t.up == "LATERAL" or t.up == "INNER" or t.up == "LEFT" or
-                                    t.up == "SEMI" or t.up == "ANTI"):
-            var named = t.up
-            if (t.up == "RIGHT" or t.up == "FULL") and self.is_kw("OUTER", 1):
-                named += " OUTER"
-            raise self.unsupported(t, "`" + named + " JOIN`", "")
-        if self.st.has_right:                                                   # a third table
-            var u = self.tok()
-            if self.is_sym(",") or (u.kind == T_IDENT and (u.up == "JOIN" or u.up == "INNER" or u.up == "LEFT" or u.up == "RIGHT" or
-                                                          u.up == "FULL" or u.up == "CROSS" or u.up == "NATURAL" or u.up == "SEMI" or u.up == "ANTI")):
-                raise self.unsupported(u, "more than two tables in FROM", "F-155")
 
     def subquery(mut self) raises -> Int:
         """After `(`: `SELECT [DISTINCT] item | * FROM table [alias] [WHERE cond] )`. Returns its index in `st.subs`."""

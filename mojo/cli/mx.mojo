@@ -9,7 +9,7 @@
 from std.sys import argv, exit
 from std.time import perf_counter_ns
 from std.os.path import dirname, isdir
-from mxframe import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
+from mxframe import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
                      read_parquet, scan_parquet, write_parquet, ZSTD, parse_sql, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
 from mxframe.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
 from mxframe.parquet import physical_memory
@@ -17,7 +17,7 @@ from mxframe.parquet import physical_memory
 comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
                   "       mx explain [--analyze] \"<SQL>\" [-t name=path ...] [--format text|json]\n"
                   "       mx schema <file> [--rows N]\n"
-                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)")
+                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)  --order written|P,P,P (the order to join three or more tables in: the written one, or the tables' positions in FROM, 0 first; default: the planner's)  --build left|right (the side of each hash join the table is built on; default: the smaller)  --join-budget BYTES (the bytes of joined values a materialized join may take)")
 
 
 # ── errors ───────────────────────────────────────────────────────────────────────────────────────────
@@ -80,6 +80,9 @@ struct Args(Movable):
     var stream: String
     var memory: Int
     var join: String
+    var order: String
+    var build: String
+    var join_budget: Int
     var analyze: Bool
     var rows: Int
     var query_file: String
@@ -97,6 +100,9 @@ struct Args(Movable):
         self.stream = "auto"
         self.memory = 0
         self.join = "auto"
+        self.order = String()
+        self.build = "auto"
+        self.join_budget = 0
         self.analyze = False
         self.rows = 5
         self.query_file = String()
@@ -121,7 +127,7 @@ def parse_args(first: Int) raises -> Args:
     while i < len(all):
         var arg = String(all[i])
         var takes = arg == "-t" or arg == "--table" or arg == "--format" or arg == "--out" or arg == "--max-rows" or arg == "--device" or \
-                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
+                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--order" or arg == "--build" or arg == "--join-budget" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
         if takes:
             if i + 1 >= len(all):
                 _ = usage_error(arg + " needs a value")
@@ -151,6 +157,14 @@ def parse_args(first: Int) raises -> Args:
                 if v != "auto" and v != "materialize":
                     _ = usage_error("--join is auto or materialize, found `" + v + "`")
                 a.join = v
+            elif arg == "--order":
+                a.order = v
+            elif arg == "--build":
+                if v != "auto" and v != "left" and v != "right":
+                    _ = usage_error("--build is auto, left or right, found `" + v + "`")
+                a.build = v
+            elif arg == "--join-budget":
+                a.join_budget = parse_int("--join-budget", v)
             elif arg == "--stream":
                 if v != "auto" and v != "always" and v != "never":
                     _ = usage_error("--stream is auto, always or never, found `" + v + "`")
@@ -222,7 +236,7 @@ def open_tables(mut cat: Catalog, args: Args, text: String, mut notes: List[Stri
         _ = query_error(String(e))
 
 
-def options_of(args: Args) -> PlannerOptions:
+def options_of(args: Args) raises -> PlannerOptions:
     var o = PlannerOptions()
     if args.group == "dense":
         o.group = GROUP_DENSE
@@ -234,6 +248,16 @@ def options_of(args: Args) -> PlannerOptions:
         o.dense_limit = args.dense_limit
     o.threads = args.threads
     o.fuse = args.join != "materialize"
+    if args.order == "written":
+        o.written_order = True
+    elif args.order.byte_length() > 0:
+        for part in args.order.split(","):
+            o.join_order.append(parse_int("--order", String(part)))
+    if args.build == "left":
+        o.build_side = BUILD_LEFT
+    elif args.build == "right":
+        o.build_side = BUILD_RIGHT
+    o.join_budget = args.join_budget
     return o^
 
 
@@ -393,15 +417,13 @@ def cmd_explain(args: Args) raises:
     var r = SqlResult()
     try:
         open_tables(cat, args, body, notes)
-        r = sql(cat, body if args.analyze else "EXPLAIN " + body, options_of(args))
+        r = sql(cat, ("EXPLAIN ANALYZE " if args.analyze else "EXPLAIN ") + body, options_of(args))
     except e:
         _ = query_error(String(e))
     for n in r.notes:
         notes.append(n)
     if fmt == "text":
         print(r.explain.rstrip("\n"))
-        if args.analyze:
-            print("  rows returned: " + String(r.table.rows()) + ", " + String(r.ms) + " ms")
         return
     var lines = String("[")
     var first = True

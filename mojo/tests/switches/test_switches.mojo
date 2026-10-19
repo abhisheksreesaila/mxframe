@@ -131,7 +131,7 @@ def main() raises:
     try:
         _ = sql(cat, "SELECT count(*) FROM t a JOIN t b ON a.k = b.k")
     except e:
-        refused = "past the budget" in String(e)
+        refused = "memory budget" in String(e)
     expect(refused, "a join past the budget is refused before it allocates")
 
     # no thread pool: the parallel CSV reader runs its chunks one after the other
