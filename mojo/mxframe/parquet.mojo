@@ -1961,7 +1961,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
         done += nvals
 
 
-def _physical_memory() -> Int:
+def physical_memory() -> Int:
     """The machine's physical memory in bytes (sysconf), 0 when it cannot be told."""
     comptime if CompilationTarget.is_linux():
         var pages = external_call["sysconf", Int](Int32(85))         # _SC_PHYS_PAGES
@@ -1980,7 +1980,7 @@ def _check_claim(what: String, rows: Int, ncols: Int) raises:
     its pages decode, and a corrupt page raises when it does."""
     if rows < 0:
         raise Error(what + " claims a negative row count (" + String(rows) + ") (corrupt file)")
-    var ram = _physical_memory()
+    var ram = physical_memory()
     if ram > 0 and rows > ram // (8 * max(ncols, 1)):
         var need = Float64(rows) * 8.0 * Float64(max(ncols, 1))
         raise Error(what + " claims " + String(rows) + " rows: " + String(need / 1e9) + " GB for " + String(ncols) +
@@ -2464,6 +2464,10 @@ struct ParquetScan(Copyable, Movable):
                 return -1
             total += ch.nulls
         return total
+
+    def file_bytes(self) -> Int:
+        """The size of the file in bytes."""
+        return self._info[].size
 
     def group_null_count(self, g: Int, c: Int) -> Int:
         """The nulls row group `g` states for column `c` in its Statistics, -1 when it states none."""
