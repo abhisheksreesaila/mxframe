@@ -138,3 +138,85 @@ BIG = [q for q in QUERIES if q.limit is not None or q.tag.startswith("distinct")
 @pytest.mark.parametrize("q", [q for q in BIG if q.tag not in ("distinct-star",)], ids=Q.id)
 def test_row_queries_over_a_million_rows_with_ties_equal_duckdb(mx, probe, data, mode, q):
     check_query(mode, data["g1m"], mx, probe, q)
+
+
+# ── the path that ran: the planner's notes ───────────────────────────────────────────────────────────
+
+def notes_of(mode, ds, mx, probe, sql):
+    return fetch(mode, ds, mx, probe, sql)[2]
+
+
+def has(notes, prefix):
+    return any(n.startswith(prefix) for n in notes)
+
+
+@pytest.mark.parametrize("mode", ["table", "scan", "frame"])
+def test_a_small_limit_over_many_rows_keeps_its_best_rows_in_heaps(mx, probe, data, mode):
+    ds = data["g10k"]
+    notes = notes_of(mode, ds, mx, probe, "SELECT id, x FROM t ORDER BY x DESC, id LIMIT 10")
+    assert has(notes, "sink: rows"), notes
+    assert has(notes, "order: top-10 by per-worker heaps in the hook ("), notes
+    assert any(n.startswith("rows: the best 10 of ") and n.endswith("rows kept in per-worker heaps, 2 keys") for n in notes), notes
+    assert not has(notes, "order: sorted"), notes
+
+
+def test_a_limit_the_heaps_do_not_pay_for_sorts_all_the_rows(mx, probe, data):
+    notes = notes_of("table", data["g8"], mx, probe, "SELECT id, x FROM t ORDER BY x, id LIMIT 3000")           # 20,000 rows are not 8x 3,000
+    assert has(notes, "order: all rows sorted (top-3,000 wanted but the source has no more than 8x that many rows)"), notes
+    assert any(n.startswith("order: sorted ") and n.endswith(" rows by 2 keys (stable radix passes)") for n in notes), notes
+    notes = notes_of("table", data["g10k"], mx, probe, "SELECT id, x FROM t ORDER BY x, id LIMIT 5000")        # past the heaps' bound of 4,096
+    assert has(notes, "order: all rows sorted (top-5,000 wanted but more than 4,096)"), notes
+
+
+@pytest.mark.parametrize("mode", ["table", "scan"])
+def test_a_limit_with_no_order_by_stops_the_scan_early(mx, probe, data, mode):
+    notes = notes_of(mode, data["g1m"], mx, probe, "SELECT id, x FROM t WHERE x > 0 LIMIT 5")
+    assert has(notes, "limit: no ORDER BY, so the scan stops once it has 5 rows"), notes
+    selected = next(n for n in notes if n.startswith("rows: ") and " rows selected" in n)
+    assert "stopped early" in selected, selected
+    assert int(selected.split()[1].replace(",", "")) < 100_000, selected                       # not the 600,000 rows that qualify
+    if mode == "scan":
+        assert any(n.startswith("ran: scan t: 1 of 13 row groups read") for n in notes), notes
+
+
+def test_ties_keep_the_source_order(mx, probe, data):
+    ds = data["g10k"]
+    for sql in ["SELECT id, k FROM t ORDER BY k", "SELECT id, k FROM t ORDER BY k LIMIT 300", "SELECT id, k FROM t ORDER BY k DESC NULLS FIRST LIMIT 3000"]:
+        for mode in ["table", "scan"]:
+            rows, _, _ = fetch(mode, ds, mx, probe, sql)
+            for (i1, k1), (i2, k2) in zip(rows, rows[1:]):
+                if k1 == k2:
+                    assert i1 < i2, f"{mode}: {sql}: ids {i1}, {i2} of k = {k1} are out of source order"
+
+
+def test_explain_of_a_row_query_shows_the_logical_plan_and_the_decisions(mx, probe, data):
+    ds = data["g10k"]
+    out = run_mx(mx, ["sql", "EXPLAIN SELECT id, x + 1 AS y FROM t WHERE k = 2 ORDER BY y DESC LIMIT 10 OFFSET 5"], {"t": ds.path})
+    lines = [r[0] for r in out["rows"]]
+    assert lines[:8] == ["Logical plan", "  Limit 10 offset 5", "    Sort y DESC", "      Project id, x + 1", "        Filter (WHERE) k = 2", "          Scan t",
+                         "Physical plan", "  source: t (table), 200,000 rows"], lines
+    assert "  sink: rows (the kernel's block hook writes the selected rows; text keeps its words)" in lines
+    assert "  order: top-15 by per-worker heaps in the hook (200,000 rows, 15 wanted)" in lines
+    out = run_mx(mx, ["sql", "EXPLAIN SELECT DISTINCT s, k FROM t"], {"t": ds.path})
+    lines = [r[0] for r in out["rows"]]
+    assert lines[1:4] == ["  Project s, k", "    Distinct keys=[s, k]", "      Scan t"], lines
+    assert any(l.startswith("  group: dense, 2 keys s ") for l in lines), lines
+
+
+ROW_ERRORS = [
+    ("SELECT 'a' FROM t", "SQL error at line 1, column 8: a string constant in the select list is not supported yet"),
+    ("SELECT NULL FROM t", "SQL error at line 1, column 8: a bare NULL in the select list cannot be typed"),
+    ("SELECT id FROM t ORDER BY 3", "SQL error at line 1, column 27: ORDER BY 3 is out of range: the select list has 1 items"),
+    ("SELECT x / 2 FROM t", "SQL error at line 1, column 10: `/` gives a FLOAT, which is a result-only kind until F-157: use it on aggregates, such as sum(a) / count(*)"),
+    ("SELECT DISTINCT s FROM t ORDER BY x", "SQL error at line 1, column 35: for SELECT DISTINCT, ORDER BY expressions must appear in the select list: `x` does not"),
+    ("SELECT idd FROM t", "SQL error at line 1, column 8: column `idd` not found in table `t` (did you mean `id`?)"),
+    ("SELECT id FROM t ORDER BY idd", "SQL error at line 1, column 27: column `idd` not found in table `t` (did you mean `id`?)"),
+    ("SELECT id FROM t WHERE sum(x) > 3", "SQL error at line 1, column 24: aggregate function sum() is not allowed here: aggregates belong in the select list, HAVING and ORDER BY"),
+    ("SELECT z.* FROM t", "SQL error at line 1, column 8: unknown table or alias `z` in `z.*`"),
+]
+
+
+@pytest.mark.parametrize("sql,message", ROW_ERRORS, ids=[e[0][:40] for e in ROW_ERRORS])
+def test_row_query_errors_say_what_and_where(probe, data, sql, message):
+    res = run_probe(probe, sql, {"t": data["g8"].path}, expect_error=True)
+    assert res.get("error") == message, res
