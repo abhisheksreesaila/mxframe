@@ -5,6 +5,7 @@ exact: read it with a decimal parser, not a float one), a DATE as "yyyy-mm-dd", 
 (CSV: an empty cell). A FLOAT is its shortest round-trip text; inf, -inf and NaN, which JSON cannot hold, are the strings "Infinity",
 "-Infinity" and "NaN".
 """
+from .utf8 import utf8_seq_len
 from .table import Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 
 
@@ -46,8 +47,45 @@ def _hex(d: Int) -> String:
     return String(digits[byte=d:d + 1])
 
 
-def json_string(s: String) -> String:
-    """`s` as a JSON string (UTF-8 kept, quotes, backslashes and control characters escaped)."""
+def _utf8_cleaned(s: String) -> String:
+    """`s`, with each byte that is not well-formed UTF-8 replaced by U+FFFD (a valid string comes back unchanged)."""
+    var b = s.as_bytes()
+    var n = len(b)
+    var bad = False
+    var i = 0
+    while i < n:
+        if b[i] < UInt8(0x80):
+            i += 1
+            continue
+        var k = utf8_seq_len(b[i], b[i + 1] if i + 1 < n else UInt8(0), b[i + 2] if i + 2 < n else UInt8(0), b[i + 3] if i + 3 < n else UInt8(0), n - i)
+        if k == 0:
+            bad = True
+            break
+        i += k
+    if not bad:
+        return s
+    var out = List[UInt8]()
+    i = 0
+    while i < n:
+        var k = 1
+        if b[i] >= UInt8(0x80):
+            k = utf8_seq_len(b[i], b[i + 1] if i + 1 < n else UInt8(0), b[i + 2] if i + 2 < n else UInt8(0), b[i + 3] if i + 3 < n else UInt8(0), n - i)
+        if k == 0:
+            out.append(UInt8(0xEF))
+            out.append(UInt8(0xBF))
+            out.append(UInt8(0xBD))
+            i += 1
+        else:
+            for j in range(k):
+                out.append(b[i + j])
+            i += k
+    return String(unsafe_from_utf8=out)
+
+
+def json_string(text: String) -> String:
+    """`text` as a JSON string (UTF-8 kept, quotes, backslashes and control characters escaped; a byte that is not UTF-8, which
+    the readers refuse, would still come out as U+FFFD, so the output is always valid JSON)."""
+    var s = _utf8_cleaned(text)
     var b = s.as_bytes()
     var out = String('"')
     var start = 0
@@ -119,10 +157,14 @@ def cell_csv(t: Table, c: Int, r: Int) -> String:
     return csv_quote(t.text_of(c, Int(v)))
 
 
-def csv_quote(s: String) -> String:
-    var b = s.as_bytes()
+def csv_quote(text: String) -> String:
+    """A CSV cell as DuckDB writes it: quoted when it holds a comma, a quote or a line break, and the empty string as two quotes (a
+    NULL is an empty cell, so the two stay apart)."""
+    var s = _utf8_cleaned(text)
+    if s.byte_length() == 0:
+        return '""'
     var plain = True
-    for x in b:
+    for x in s.as_bytes():
         if x == UInt8(44) or x == UInt8(34) or x == UInt8(10) or x == UInt8(13):
             plain = False
     if plain:
@@ -142,15 +184,19 @@ def columns_json(t: Table) -> String:
     return out + "]"
 
 
+def rows_json_one(t: Table, r: Int) -> String:
+    """One row as a JSON array."""
+    var out = String("[")
+    for c in range(t.columns()):
+        out += ("," if c > 0 else "") + cell_json(t, c, r)
+    return out + "]"
+
+
 def rows_json(t: Table, rows: Int) -> String:
     """The first `rows` rows as a JSON array of arrays."""
     var out = String("[")
     for r in range(rows):
-        out += "," if r > 0 else ""
-        out += "["
-        for c in range(t.columns()):
-            out += ("," if c > 0 else "") + cell_json(t, c, r)
-        out += "]"
+        out += ("," if r > 0 else "") + rows_json_one(t, r)
     return out + "]"
 
 

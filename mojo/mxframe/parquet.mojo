@@ -7,6 +7,7 @@ How MX frame's kinds are stored (any Parquet reader understands them):
   DECIMAL  INT64 with the DECIMAL(18, scale) logical type (the stored value is the scaled integer, as in memory)
   DATE     INT32 with the DATE logical type (days since 1970)
   BOOL     BOOLEAN
+  FLOAT    DOUBLE (a result-only kind: it is written, but a file with a DOUBLE column cannot be read until F-157)
   TEXT     BYTE_ARRAY (STRING): a dictionary page with the column's words, data pages of dictionary indices
 A column with nulls is OPTIONAL: its definition levels are the validity bitmap's bits (Parquet packs them the same
 way, least significant first), written as bit-packed runs. Pages are compressed with zstd (default), snappy or not
@@ -303,7 +304,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
                 if v < Int64(Int32.MIN) or v > Int64(Int32.MAX):
                     raise Error("column `" + col.name + "`: day " + String(v) + " does not fit a Parquet DATE")
                 _put32(body, Int(v))
-    else:                                               # INT, DECIMAL: PLAIN int64
+    else:                                               # INT, DECIMAL, FLOAT: PLAIN int64 (a FLOAT's bits are the DOUBLE's)
         for row in range(lo, hi):
             if not col.is_null(row):
                 var v = col.values[row]
@@ -327,9 +328,6 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         raise Error("a table with no columns cannot be written as Parquet")
     if row_group_rows < 8 or row_group_rows % 8 != 0:
         raise Error("row_group_rows must be a positive multiple of 8, got " + String(row_group_rows))
-    for c in range(t.columns()):
-        if t.cols[c].kind == FLOAT:
-            raise Error("column `" + t.cols[c].name + "` is FLOAT, a result-only kind: it cannot be written to Parquet yet (F-157)")
     var optional = List[Bool]()
     for c in range(t.columns()):
         optional.append(t.cols[c].nulls > 0)
@@ -458,7 +456,7 @@ def _footer(t: Table, optional: List[Bool], n: Int, groups: List[List[_Chunk]], 
     for c in range(ncols):
         ref col = t.cols[c]
         w.begin_list_element_struct()
-        var pt = PT_BYTE_ARRAY if col.kind == TEXT else PT_BOOLEAN if col.kind == BOOL else PT_INT32 if col.kind == DATE else PT_INT64
+        var pt = PT_BYTE_ARRAY if col.kind == TEXT else PT_BOOLEAN if col.kind == BOOL else PT_INT32 if col.kind == DATE else PT_DOUBLE if col.kind == FLOAT else PT_INT64
         w.i32(1, pt)
         w.i32(3, OPTIONAL if optional[c] else REQUIRED)
         w.binary(4, col.name)
@@ -499,7 +497,7 @@ def _footer(t: Table, optional: List[Bool], n: Int, groups: List[List[_Chunk]], 
             w.begin_list_element_struct()
             w.i64(2, Int64(ch.offset))
             w.begin_struct(3)                           # ColumnMetaData
-            var pt = PT_BYTE_ARRAY if col.kind == TEXT else PT_BOOLEAN if col.kind == BOOL else PT_INT32 if col.kind == DATE else PT_INT64
+            var pt = PT_BYTE_ARRAY if col.kind == TEXT else PT_BOOLEAN if col.kind == BOOL else PT_INT32 if col.kind == DATE else PT_DOUBLE if col.kind == FLOAT else PT_INT64
             w.i32(1, pt)
             if col.kind == TEXT:
                 w.list_header(2, T_I32, 3)

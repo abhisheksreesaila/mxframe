@@ -312,7 +312,7 @@ mx schema <file> [--rows N]
 
 - **Files.** `FROM 'orders.parquet'` and `FROM 'orders.csv'` open the file named in the query; `-t name=path` registers a file under a name (`FROM name`). A Parquet file is streamed a row group at a
   time when it is over a quarter of the machine's memory (or `--stream always`; `--stream never` reads it whole; `--memory BYTES` changes the memory it compares with), otherwise read into memory.
-  The notes say which. A CSV is read whole. The advanced switches `--group auto|dense|hashed`, `--dense-limit N` and `--threads N` are F-150's `PlannerOptions`.
+  The notes say which. A CSV is read whole, and as UTF-8 only: a file with a byte that is not UTF-8 (Latin-1 `caf\xe9`) or a UTF-16 byte order mark is an error naming the byte and line, with a hint to re-save it (`iconv -f LATIN1 -t UTF-8`); a UTF-8 byte order mark is skipped. The result is therefore always valid UTF-8. The advanced switches `--group auto|dense|hashed`, `--dense-limit N` and `--threads N` are F-150's `PlannerOptions`.
 - **Device.** SQL runs on the CPU. `--device gpu` is accepted and the notes say it ran on the CPU; `device` in the result is `"cpu"`.
 - **Result (stdout, one JSON object).**
   `{"columns":[{"name","kind","scale"}],"rows":[[...]],"row_count","truncated","ms","device","notes"}`.
@@ -320,8 +320,8 @@ mx schema <file> [--rows N]
   (`json.loads(text, parse_float=Decimal)`), never a float one. A DATE is `"yyyy-mm-dd"`, TEXT is the word, BOOL is `true` / `false`, NULL is `null`. A FLOAT is its shortest round-trip number;
   infinity and NaN, which JSON cannot hold, are the strings `"Infinity"`, `"-Infinity"` and `"NaN"`. `rows` holds at most `--max-rows` rows (default 1000; 0 means all); `row_count` is the true
   count and `truncated` says whether `rows` is shorter. `notes` is the planner's account of what ran (section 8): read it to see the group strategy, the columns read, the chunks, any re-run.
-- **Other formats.** `jsonl` is one object per row (`{"k":0,"total":12.50}`), `csv` has a header, NULL is an empty cell, dates and decimals as in JSON. `--out file` writes every row to the file
-  (whatever `--max-rows` says) and prints the JSON summary (`columns`, `row_count`, `ms`, `notes`, `out`, no `rows`). `--format parquet` needs `--out`.
+- **Other formats.** `jsonl` is one object per row (`{"k":0,"total":12.50}`), `csv` has a header and is written as DuckDB writes it: a cell is quoted when it holds a comma, a quote or a line break, **the empty string is `""` and NULL is an empty cell**, dates and decimals as in JSON. `--out file` writes every row to the file
+  (whatever `--max-rows` says) and prints the JSON summary (`columns`, `row_count`, `ms`, `notes`, `out`, no `rows`). `--format parquet` needs `--out` (a FLOAT result column is written as Parquet DOUBLE). `--out` never creates directories: a missing one is an exit-1 error `couldn't write ...`; JSON, JSON lines and CSV are written in chunks of about a megabyte.
 - **Errors.** A query error (bad SQL, unknown column, unsupported form, a file that cannot be opened) prints `{"error":{"message","line","column","hint"}}` on stdout and exits **1**; `line` and `column`
   are 1-based into the SQL text (null when the error is not about a position), `hint` carries the "did you mean" suggestion or what to do. A usage error (unknown command or option, wrong
   number of arguments, a bad value) prints the same object with the usage text as the hint and exits **2**. Exit 0 is success.
@@ -336,7 +336,7 @@ Things an agent should know:
   an IN takes at most 40 values (`the most is 40`); split a longer one into several queries or filter by a range. A list of text words has no such limit.
 - **A table is one file.** One table per query until joins (F-153); `FROM` is a registered name or a quoted file name. A query without an aggregate (a plain row list) is not supported before F-152:
   add `count(*)` or a `GROUP BY`.
-- **FLOAT columns in files are refused** (a Parquet DOUBLE column makes the open fail with `MX frame has no kind for it yet`) until F-157; FLOAT appears only as a result (`avg`, `/`, ...).
+- **A Parquet file with a DOUBLE (or FLOAT) column cannot be opened until F-157** (FLOAT64 as a column kind), the most common failure: the error names the column (`column `price` is DOUBLE: MX frame has no kind for it yet`) and its hint says to write the file again without it or with it cast to DECIMAL(18, 4), or to use a CSV. FLOAT appears only as a result (`avg`, `/`, ...). A Parquet text value that is not UTF-8 is refused too.
 - **A footer that lies.** When a Parquet footer's min / max or null count turns out wrong while reading, the query runs again without the statistics and the notes say `statistics: ... ran again without
   them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.
 - Text order is the owner's (case-insensitive, bytes as the tie-break), so `min(s)` / `ORDER BY s` on text differ from DuckDB's byte order; DECIMAL `median` has one more digit of scale than DuckDB.

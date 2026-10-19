@@ -8,9 +8,10 @@
 # Every answer is a JSON object on stdout (an error too: {"error": {...}}); the exit status is 0, 1 for a query error and 2 for a usage error.
 from std.sys import argv, exit
 from std.time import perf_counter_ns
+from std.os.path import dirname, isdir
 from mxframe import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
                      read_parquet, scan_parquet, write_parquet, ZSTD, parse_sql, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
-from mxframe.output import (json_string, columns_json, rows_json, row_jsonl, csv_header, csv_row, cell_json, kind_text)
+from mxframe.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
 from mxframe.parquet import physical_memory
 
 comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
@@ -57,6 +58,14 @@ def query_error(text: String) raises -> Int:
         hint = "a chain of about 255 OR terms hits the depth limit: write x IN (a, b, c) instead (a list of numbers takes up to 40 values; text lists are longer)"
     elif "levels deep" in message:
         hint = "flatten the parentheses or NOT chain"
+    elif "not valid UTF-8" in message or "is UTF-16" in message:
+        hint = "mx reads UTF-8 only: re-save the file as UTF-8 (for example iconv -f LATIN1 -t UTF-8 in.csv > out.csv)"
+    elif ("` is DOUBLE: MX frame has no kind" in message) or ("` is FLOAT: MX frame has no kind" in message):
+        var open_q = message.find("`")
+        var close_q = message.find("`", open_q + 1) if open_q >= 0 else -1
+        var which = String(message[byte=open_q + 1:close_q]) if close_q > open_q else String("a column")
+        hint = ("a Parquet file with a DOUBLE (or FLOAT) column cannot be opened until F-157 adds FLOAT64 as a column kind; `" + which +
+                "` is one. Write the file again without that column, or with it cast to DECIMAL(18, 4) (CAST(x AS DECIMAL(18, 4))), or export it as CSV")
     print(error_json(message, line, col, hint))
     exit(1)
     return 1
@@ -135,12 +144,16 @@ def parse_args(first: Int) raises -> Args:
             elif arg == "--device":
                 a.device = v
             elif arg == "--group":
+                if v != "auto" and v != "dense" and v != "hashed":
+                    _ = usage_error("--group is auto, dense or hashed, found `" + v + "`")
                 a.group = v
             elif arg == "--dense-limit":
                 a.dense_limit = parse_int("--dense-limit", v)
             elif arg == "--threads":
                 a.threads = parse_int("--threads", v)
             elif arg == "--stream":
+                if v != "auto" and v != "always" and v != "never":
+                    _ = usage_error("--stream is auto, always or never, found `" + v + "`")
                 a.stream = v
             elif arg == "--rows":
                 a.rows = parse_int("--rows", v)
@@ -245,9 +258,52 @@ def notes_json(notes: List[String]) -> String:
     return out + "]"
 
 
-def write_text(path: String, text: String) raises:
-    with open(path, "w") as fh:
-        fh.write(text)
+comptime FLUSH_AT = 1 << 20
+
+
+def check_out_directory(path: String) raises:
+    """`path`'s directory must exist: mx never creates directories (Mojo's open would)."""
+    var dir = dirname(path)
+    if dir.byte_length() > 0 and not isdir(dir):
+        raise Error("couldn't write `" + path + "`: the directory `" + dir + "` does not exist")
+
+
+def open_for_write(path: String) raises -> FileHandle:
+    """Opens `path` for writing."""
+    check_out_directory(path)
+    try:
+        return open(path, "w")
+    except:
+        raise Error("couldn't write `" + path + "`: no such directory, or no permission to write there")
+
+
+def put(mut fh: FileHandle, mut buf: String, piece: String) raises:
+    """Adds to the buffer and writes it out in chunks of about a megabyte, so a big result never sits in one String."""
+    buf += piece
+    if buf.byte_length() >= FLUSH_AT:
+        fh.write(buf)
+        buf = String()
+
+
+def write_rows(path: String, t: Table, fmt: String) raises:
+    """All rows of `t` to `path` as json, jsonl or csv."""
+    var fh = open_for_write(path)
+    var buf = String()
+    var n = t.rows()
+    if fmt == "csv":
+        put(fh, buf, csv_header(t) + "\n")
+        for i in range(n):
+            put(fh, buf, csv_row(t, i) + "\n")
+    elif fmt == "jsonl":
+        for i in range(n):
+            put(fh, buf, row_jsonl(t, i) + "\n")
+    else:
+        put(fh, buf, '{"columns":' + columns_json(t) + ',"rows":[')
+        for i in range(n):
+            put(fh, buf, ("," if i > 0 else "") + rows_json_one(t, i))
+        put(fh, buf, "]}\n")
+    fh.write(buf)
+    fh.close()
 
 
 # ── commands ─────────────────────────────────────────────────────────────────────────────────────────
@@ -278,21 +334,13 @@ def cmd_sql(args: Args) raises:
     if to_file:
         try:
             if fmt == "parquet":
+                check_out_directory(args.out)
                 write_parquet(args.out, r.table, "", ZSTD)
-            elif fmt == "csv":
-                var s = csv_header(r.table) + "\n"
-                for i in range(total):
-                    s += csv_row(r.table, i) + "\n"
-                write_text(args.out, s)
-            elif fmt == "jsonl":
-                var s = String()
-                for i in range(total):
-                    s += row_jsonl(r.table, i) + "\n"
-                write_text(args.out, s)
             else:
-                write_text(args.out, '{"columns":' + columns_json(r.table) + ',"rows":' + rows_json(r.table, total) + "}\n")
+                write_rows(args.out, r.table, fmt)
         except e:
-            _ = query_error(String(e))
+            var why = String(e)
+            _ = query_error(why if args.out in why else "couldn't write `" + args.out + "`: " + why)
         notes.append("wrote " + String(total) + " rows to " + args.out + " as " + fmt)
     if fmt == "jsonl" and not to_file:
         for i in range(shown):
@@ -309,31 +357,40 @@ def cmd_sql(args: Args) raises:
           (',"out":' + json_string(args.out) if to_file else "") + "}")
 
 
+def without_explain(text: String) -> String:
+    """`text` without a leading EXPLAIN [ANALYZE] (any case), so the SELECT itself can be opened and run."""
+    var b = text.as_bytes()
+    var n = len(b)
+    var i = 0
+    for word in ["explain", "analyze"]:
+        var j = i
+        while j < n and (b[j] == UInt8(32) or b[j] == UInt8(9) or b[j] == UInt8(10) or b[j] == UInt8(13)):
+            j += 1
+        var k = 0
+        var w = word.as_bytes()
+        while k < len(w) and j + k < n and (b[j + k] | UInt8(32)) == w[k]:
+            k += 1
+        var ends = j + k >= n or b[j + k] == UInt8(32) or b[j + k] == UInt8(9) or b[j + k] == UInt8(10) or b[j + k] == UInt8(13)
+        if k == len(w) and ends:
+            i = j + k
+        elif word == "explain":
+            return text
+    return String(text[byte=i:])
+
+
 def cmd_explain(args: Args) raises:
     check_device(args)
     var fmt = args.format if args.format.byte_length() > 0 else "text"
     if fmt != "text" and fmt != "json":
         _ = usage_error("mx explain: --format is text or json, found `" + fmt + "`")
     var text = query_text(args, "mx explain")
+    var body = without_explain(text)              # EXPLAIN [ANALYZE] SELECT ... is accepted: the SELECT is what is opened and run
     var cat = Catalog()
     var notes = List[String]()
     var r = SqlResult()
     try:
-        open_tables(cat, args, text, notes)
-        var body = text
-        var up = String()
-        for b in text.as_bytes()[:20]:
-            up += chr(Int(b - 32)) if UInt8(97) <= b <= UInt8(122) else chr(Int(b))
-        var stripped = String(up.strip())
-        if args.analyze:
-            if stripped.startswith("EXPLAIN"):                      # EXPLAIN [ANALYZE] SELECT ...: run the SELECT
-                var at = body.lower().find("select")
-                body = String(body[byte=at:]) if at >= 0 else body
-            r = sql(cat, body, options_of(args))
-        else:
-            if not stripped.startswith("EXPLAIN"):
-                body = "EXPLAIN " + body
-            r = sql(cat, body, options_of(args))
+        open_tables(cat, args, body, notes)
+        r = sql(cat, body if args.analyze else "EXPLAIN " + body, options_of(args))
     except e:
         _ = query_error(String(e))
     for n in r.notes:

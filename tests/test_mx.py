@@ -7,6 +7,7 @@ import csv
 import datetime
 import io
 import json
+import re
 import struct
 import subprocess
 from decimal import Decimal
@@ -103,7 +104,7 @@ def test_decimals_are_exact_number_text_and_text_is_escaped(mx, files):
     raw = p.stdout.decode("utf-8")
     assert '"Q\\"uo\\\\te"' in raw and '"new\\nline"' in raw and '"ünï"' in raw
     assert json.loads(raw)["rows"][-1][0] is None                                    # NULL text sorts last
-    assert ",1234567.80]" in raw or "." in raw.split('"rows":')[1]                    # a number, never a quoted string
+    assert re.search(r",\d+\.\d\d\]", raw) and not re.search(r',"\d+\.\d\d"', raw)      # a number, never a quoted string
     for row in json.loads(raw, parse_float=Decimal)["rows"]:
         assert row[1] is None or isinstance(row[1], Decimal)
 
@@ -281,3 +282,153 @@ def _time(mx, files):
     t = time.perf_counter()
     subprocess.run([str(mx), "sql", "SELECT count(*) FROM t", "-t", f"t={files['parquet']}"], capture_output=True, check=True)
     return time.perf_counter() - t
+
+
+# ── F-151 review: text encodings, CSV output, --out, flags ───────────────────────────────────────────
+
+def test_a_latin1_csv_is_refused_as_not_utf8_never_passed_through(mx, tmp_path):
+    p = tmp_path / "latin.csv"
+    p.write_bytes("id,city\n1,caf\xe9\n2,plain\n".encode("latin-1"))
+    for args in (["sql", f"SELECT city, count(*) FROM '{p}' GROUP BY city"], ["schema", str(p)]):
+        out = run_mx(mx, args, expect_exit=1)
+        assert "not valid UTF-8" in out["error"]["message"] and "byte 13" in out["error"]["message"] and "line 2" in out["error"]["message"]
+        assert "UTF-8" in out["error"]["hint"]
+
+
+def test_a_utf16_csv_is_refused_by_its_byte_order_mark(mx, tmp_path):
+    p = tmp_path / "wide.csv"
+    p.write_bytes("id,city\n1,x\n".encode("utf-16"))
+    out = run_mx(mx, ["schema", str(p)], expect_exit=1)
+    assert "UTF-16" in out["error"]["message"] and "UTF-8" in out["error"]["hint"]
+
+
+def test_a_non_utf8_column_name_is_refused(mx, tmp_path):
+    p = tmp_path / "head.csv"
+    p.write_bytes(b"id,caf\xe9\n1,2\n")
+    out = run_mx(mx, ["schema", str(p)], expect_exit=1)
+    assert "not valid UTF-8" in out["error"]["message"] and "line 1" in out["error"]["message"]
+
+
+def test_a_utf8_csv_with_a_byte_order_mark_and_accents_reads(mx, tmp_path):
+    p = tmp_path / "ok.csv"
+    p.write_bytes(b"\xef\xbb\xbfid,city\n1,caf\xc3\xa9\n2,\xe2\x82\xac\n")
+    out = run_mx(mx, ["sql", f"SELECT city, count(*) c FROM '{p}' GROUP BY city ORDER BY city"])
+    assert [r[0] for r in out["rows"]] == ["café", "€"]
+
+
+def test_bad_utf8_in_a_parquet_text_value_is_refused(mx, tmp_path):
+    p = tmp_path / "bad.parquet"
+    pq.write_table(pa.table({"w": pa.array(["cafe", "ok"], pa.string()), "n": [1, 2]}), p, compression="none")
+    p.write_bytes(p.read_bytes().replace(b"cafe", b"caf\xe9"))                         # not UTF-8, as a careless writer leaves it
+    for args in (["sql", f"SELECT w, count(*) FROM '{p}' GROUP BY w"], ["schema", str(p)]):
+        out = run_mx(mx, args, expect_exit=1)
+        assert "not valid UTF-8" in out["error"]["message"] and "`w`" in out["error"]["message"] and "UTF-8" in out["error"]["hint"]
+
+
+HOSTILE = ["", " ", "a,b", 'say "hi"', "line\nbreak", "cr\rhere", "crlf\r\nx", "ünï €", " lead", "trail ", "NULL", "null", "\\N", "tab\there", ",", '"', "plain"]
+
+
+@pytest.fixture(scope="session")
+def hostile(tmp_path_factory):
+    d = tmp_path_factory.mktemp("hostile")
+    ids = list(range(len(HOSTILE) + 1))
+    p = d / "h.parquet"
+    pq.write_table(pa.table({"id": ids, "w": pa.array(HOSTILE + [None], pa.string())}), p)
+    return p
+
+
+@pytest.mark.parametrize("to_file", [False, True])
+def test_csv_output_is_byte_for_byte_what_duckdb_writes(mx, con, hostile, tmp_path, to_file):
+    sql = f"SELECT id, w, count(*) c FROM '{hostile}' GROUP BY id, w ORDER BY id"
+    want_file = tmp_path / "duck.csv"
+    con.execute(f"COPY ({sql}) TO '{want_file}' (FORMAT csv, HEADER)")
+    want = want_file.read_bytes()
+    if to_file:
+        out = tmp_path / "mx.csv"
+        run_mx(mx, ["sql", sql, "--format", "csv", "--out", str(out)])
+        got = out.read_bytes()
+    else:
+        got = subprocess.run([str(mx), "sql", sql, "--format", "csv", "--max-rows", "0"], capture_output=True, check=True).stdout
+    assert got.replace(b"\r\n", b"\n") == want.replace(b"\r\n", b"\n"), (got, want)
+
+
+def test_csv_output_tells_null_from_the_empty_string(mx, hostile):
+    got = subprocess.run([str(mx), "sql", f"SELECT id, w, count(*) c FROM '{hostile}' GROUP BY id, w ORDER BY id", "--format", "csv", "--max-rows", "0"],
+                         capture_output=True, check=True).stdout.decode()
+    lines = got.split("\n")
+    assert lines[1] == '0,"",1'                                                        # the empty string is two quotes
+    assert lines[-2] == f"{len(HOSTILE)},,1"                                           # NULL is an empty cell
+
+
+def test_parquet_output_writes_a_float_as_double(mx, con, files, tmp_path):
+    sql = "SELECT k, avg(d) a, count(*) c FROM t GROUP BY k ORDER BY k"
+    out = tmp_path / "f.parquet"
+    run_mx(mx, ["sql", sql, "--format", "parquet", "--out", str(out)], {"t": files["parquet"]})
+    t = pq.read_table(out)
+    assert str(t.schema.field("a").type) == "double"
+    want = con.execute(sql.replace("FROM t", f"FROM read_parquet('{files['parquet']}')")).fetchall()
+    assert [(r["k"], r["a"], r["c"]) for r in t.to_pylist()] == want
+
+
+def test_a_directory_named_like_a_csv_is_an_error(mx, tmp_path):
+    d = tmp_path / "x.csv"
+    d.mkdir()
+    out = run_mx(mx, ["sql", f"SELECT count(*) FROM '{d}'"], expect_exit=1)
+    assert "not a regular file" in out["error"]["message"]
+    out = run_mx(mx, ["schema", str(d)], expect_exit=1)
+    assert "not a regular file" in out["error"]["message"]
+
+
+def test_an_unknown_stream_or_group_value_is_a_usage_error(mx, files):
+    for flag, val in (("--stream", "sometimes"), ("--group", "maybe")):
+        out = run_mx(mx, ["sql", "SELECT count(*) FROM t", flag, val], {"t": files["parquet"]}, expect_exit=2)
+        assert flag in out["error"]["message"] and val in out["error"]["message"]
+
+
+def test_explain_accepts_an_explain_prefix_and_a_file_name(mx, files):
+    p = files["parquet"]
+    for analyze, text in ((True, f"EXPLAIN ANALYZE SELECT k, count(*) FROM '{p}' GROUP BY k"),
+                          (False, f"EXPLAIN SELECT k, count(*) FROM '{p}' GROUP BY k"),
+                          (True, f"explain select k, count(*) FROM '{p}' GROUP BY k")):
+        r = subprocess.run([str(mx), "explain"] + (["--analyze"] if analyze else []) + [text], capture_output=True)
+        assert r.returncode == 0, r.stdout
+        assert b"Logical plan" in r.stdout and b"group: dense" in r.stdout
+        assert (b"rows returned: 7" in r.stdout) == analyze
+
+
+def test_sql_with_an_explain_prefix_over_a_file_name_runs(mx, files):
+    out = run_mx(mx, ["sql", f"EXPLAIN SELECT k, count(*) FROM '{files['parquet']}' GROUP BY k"])
+    assert out["rows"][0] == ["Logical plan"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv", "jsonl", "parquet"])
+def test_out_to_an_unwritable_path_is_a_clean_error_and_creates_no_directories(mx, files, tmp_path, fmt):
+    target = tmp_path / "missing" / "deeper" / "o.out"
+    out = run_mx(mx, ["sql", "SELECT k, count(*) FROM t GROUP BY k", "--format", fmt, "--out", str(target)], {"t": files["parquet"]}, expect_exit=1)
+    assert str(target) in out["error"]["message"]
+    assert not (tmp_path / "missing").exists()
+    out = run_mx(mx, ["sql", "SELECT k, count(*) FROM t GROUP BY k", "--format", fmt, "--out", "/proc/nope/o.out"], {"t": files["parquet"]}, expect_exit=1)
+    assert "/proc/nope/o.out" in out["error"]["message"]
+
+
+@pytest.mark.parametrize("fmt", ["json", "csv", "jsonl"])
+def test_a_big_out_file_is_complete(mx, files, tmp_path, fmt):
+    target = tmp_path / f"big.{fmt}"
+    res = run_mx(mx, ["sql", "SELECT id, s, count(*) c FROM t GROUP BY id, s", "--format", fmt, "--out", str(target)], {"t": files["parquet"]})
+    assert res["row_count"] == 5000
+    text = target.read_text()
+    if fmt == "json":
+        assert len(json.loads(text)["rows"]) == 5000
+    elif fmt == "jsonl":
+        assert len([json.loads(l) for l in text.splitlines()]) == 5000
+    else:
+        assert len(list(csv.reader(io.StringIO(text, newline="")))) == 5001
+
+
+def test_a_parquet_double_column_error_says_what_to_do(mx, tmp_path):
+    p = tmp_path / "dbl.parquet"
+    pq.write_table(pa.table({"id": [1, 2], "price": pa.array([1.5, 2.5], pa.float64())}), p)
+    for args in (["sql", f"SELECT count(*) FROM '{p}'"], ["schema", str(p)]):
+        out = run_mx(mx, args, expect_exit=1)
+        assert "`price`" in out["error"]["message"]
+        assert "price" in out["error"]["hint"] and "DOUBLE" in out["error"]["hint"] and "F-157" in out["error"]["hint"]

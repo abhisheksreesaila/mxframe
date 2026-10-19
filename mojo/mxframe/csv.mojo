@@ -54,6 +54,7 @@ from std.ffi import external_call
 from std.memory import Pointer
 from std.time import perf_counter_ns
 from std.collections import Dict
+from .utf8 import utf8_seq_len
 from .table import Table, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
 from .kernels._fpenv import par_n, core_count
 
@@ -346,6 +347,33 @@ def _parse_bool(p: BP, n: Int, mut out: Int64) -> Bool:
 
 
 # ── small helpers ───────────────────────────────────────────────────────────────────────────────
+
+def first_invalid_utf8(p: BP, n: Int) -> Int:
+    """The byte offset of the first byte that is not well-formed UTF-8, or -1 when all of it is."""
+    var i = 0
+    while i < n:
+        var b = p[i]
+        if b < 0x80:
+            i += 1
+            continue
+        var k = utf8_seq_len(b, p[i + 1] if i + 1 < n else 0, p[i + 2] if i + 2 < n else 0, p[i + 3] if i + 3 < n else 0, n - i)
+        if k == 0:
+            return i
+        i += k
+    return -1
+
+
+def _check_text_encoding(p: BP, n: Int, path: String) raises:
+    """A CSV is read as UTF-8 and nothing else: a UTF-16 byte order mark or a byte that is not UTF-8 (Latin-1 `caf\\xe9`) raises, naming the byte and line."""
+    if n >= 2 and ((p[0] == 0xFF and p[1] == 0xFE) or (p[0] == 0xFE and p[1] == 0xFF)):
+        raise Error("`" + path + "` is UTF-16 (it starts with a byte order mark), and MX frame reads UTF-8 only")
+    var bad = first_invalid_utf8(p, n)
+    if bad >= 0:
+        var line = 1
+        for i in range(bad):
+            if p[i] == 10:
+                line += 1
+        raise Error("`" + path + "` is not valid UTF-8 (byte " + String(bad) + ", line " + String(line) + ")")
 
 
 def _str(p: BP, n: Int) -> String:
@@ -819,6 +847,10 @@ def read_csv(path: String, options: CsvOptions = CsvOptions()) raises -> CsvResu
     except:
         raise Error("couldn't open `" + path + "`: no such file, or no permission to read it")
     var fd = file._get_raw_fd()
+    var one = List[UInt8](length=1, fill=0)
+    if external_call["read", Int](fd, one.unsafe_ptr(), Int(1)) < 0:      # a directory opens, but cannot be read
+        file.close()
+        raise Error("couldn't read `" + path + "`: not a regular file")
     var size = external_call["lseek", Int](fd, Int(0), Int32(2))
     if size < 0:
         file.close()
@@ -830,6 +862,7 @@ def read_csv(path: String, options: CsvOptions = CsvOptions()) raises -> CsvResu
         if addr == -1:
             raise Error("couldn't read `" + path + "`: the file could not be mapped into memory")
         try:
+            _check_text_encoding(BP(unsafe_from_address=addr), size, path)
             _parse(BP(unsafe_from_address=addr), size, delim, options, result)
         except e:
             _ = external_call["munmap", Int32](addr, size)
