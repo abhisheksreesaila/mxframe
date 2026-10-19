@@ -2,8 +2,8 @@
 # planner's notes (which path ran), EXPLAIN and the error messages. (tests/test_mojo_sql.py compares many more queries with
 # DuckDB on generated data.)
 from std.sys import argv
-from mxframe import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql, SqlResult, INT, DECIMAL, TEXT,
-                     DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD)
+from mxframe import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
+                     DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD, Planner, RulePlanner, PhysicalPlan, Stats, BoundQuery)
 
 
 def fail(msg: String) raises:
@@ -85,6 +85,18 @@ def orders() raises -> SharedTable:
     return t^.share()
 
 
+struct AlwaysHashed(Planner, Copyable, Movable):
+    def __init__(out self):
+        pass
+
+    def plan(self, q: BoundQuery, st: Stats, opts: PlannerOptions) raises -> PhysicalPlan:
+        var o = opts.copy()
+        o.group = GROUP_HASHED
+        var p = RulePlanner().plan(q, st, o)
+        p.notes.append("planner: AlwaysHashed")
+        return p^
+
+
 def main() raises:
     var cat = Catalog()
     cat.add_table("orders", orders())
@@ -148,7 +160,8 @@ def main() raises:
     r = sql(cat, "EXPLAIN SELECT region, sum(price) FROM orders WHERE qty > 1 GROUP BY region")
     check(rows_of(r.table),
           "Logical plan\n  Project region, sum(price)\n    Aggregate keys=[region] aggs=[sum(price)]\n      Filter (WHERE) qty > 1\n        Scan orders\n"
-          "Physical plan\n  source: orders (table), 10 rows\n  group: dense, 1 key region 4 (with a NULL slot) = 4 slots: the domain of 4 slots is small\n",
+          "Physical plan\n  source: orders (table), 10 rows\n  group: dense, 1 key region 4 (with a NULL slot) = 4 slots: the domain of 4 slots is small\n"
+          "  columns read: region, qty, price (3 of 5)\n  kernel: 19 instructions a row (1 slot)\n  device: CPU (SQL runs on the CPU)\n",
           "EXPLAIN")
 
     # a frame: the edits are seen (a changed row, an appended row, a removed row)
@@ -168,6 +181,24 @@ def main() raises:
     var b = sql(cat, "SELECT region, count(*), sum(price), min(day) FROM filed GROUP BY region ORDER BY region")
     check(rows_of(b.table), rows_of(a.table), "the scan equals the table")
     has_note(b, "ran: scan filed: 2 of 2 row groups read")
+
+    # any Planner can plan: this one always asks for hashed groups
+    r = sql_with(cat, "SELECT region, count(*) FROM orders GROUP BY region ORDER BY region", AlwaysHashed())
+    check(rows_of(r.table), "east 3\nNorth 2\nWest 4\nNULL 1\n", "a custom planner")
+    has_note(r, "planner: AlwaysHashed")
+    has_note(r, "group: hashed on 2 key words: forced by the options")
+
+    # a frame's formula columns are columns: the builder's rules (floor division, x // 0 is 0, min / max) and exact decimals
+    var ff = Frame(orders())
+    _ = ff.formula("net = price - qty")                         # DECIMAL(2) minus INT: qty brought to cents
+    _ = ff.formula("half = qty // 2")
+    _ = ff.formula("lo = min(qty, 3)")
+    ff.set_text(ff.column("qty"), 0, "100")
+    cat.add_frame("sheet", ff)
+    r = sql(cat, "SELECT region, sum(net), sum(half), max(lo), count(net) FROM sheet GROUP BY region ORDER BY region")
+    check(rows_of(r.table), "east 140.45 7 3 3\nNorth 5.99 2 3 1\nWest -68.75 52 3 4\nNULL 1.00 3 3 1\n", "formula columns")
+    r = sql(cat, "SELECT sum(net) FROM sheet WHERE half > 1 AND net IS NOT NULL")
+    check(rows_of(r.table), "72.19\n", "a formula in WHERE")
 
     # errors say what and where
     try:

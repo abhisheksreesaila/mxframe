@@ -1171,8 +1171,16 @@ def _inputs(src: SqlSource, q: BoundQuery) raises -> _Inputs:
 
 
 def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int) raises -> SqlProgram:
-    return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
-                     _alias_lists(src), inp.masked, phase)
+    try:
+        return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
+                         _alias_lists(src), inp.masked, phase)
+    except e:
+        var msg = String(e)
+        if msg.startswith("the query is too big for one program"):
+            raise sql_error(q.line, q.col, msg + ": it holds too many aggregates over different expressions (about 20); split the select list into two queries")
+        if msg.startswith("the query has more than"):
+            raise sql_error(q.line, q.col, msg + " (a program holds 64 different numbers); split the query in two")
+        raise e^
 
 
 def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, sp: SqlProgram, mut notes: List[String]):
@@ -1258,7 +1266,7 @@ def _ms(x: Float64) -> String:
     return String(Float64(Int(x * 100.0)) / 100.0)
 
 
-def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises -> SqlResult:
+def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
     var t0 = perf_counter_ns()
     prepare_ranges(catalog, q)
     ref src = catalog.sources[q.source]
@@ -1270,7 +1278,6 @@ def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises ->
     var extra = src.overlay.words.copy()
     var dicts = DictAccess(src.table, scan, extra)
     var st = make_stats(src, q, dicts)
-    var planner = RulePlanner()
     var plan = planner.plan(q, st, opts)
     var res = SqlResult()
     res.notes = plan.notes.copy()
@@ -1295,7 +1302,12 @@ def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises ->
     return res^
 
 
-def sql(mut catalog: Catalog, text: String, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
-    """Runs one SELECT (or EXPLAIN SELECT) over the catalog's sources. The result owns its table."""
+def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
+    """`sql` with the physical planner of your choice (anything that implements `Planner`)."""
     var q = bind_sql(catalog, text)
-    return run_sql(catalog, q, options)
+    return run_sql(catalog, q, planner, options)
+
+
+def sql(mut catalog: Catalog, text: String, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
+    """Runs one SELECT (or EXPLAIN SELECT) over the catalog's sources with the rule-based planner. The result owns its table."""
+    return sql_with(catalog, text, RulePlanner(), options)

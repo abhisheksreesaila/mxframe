@@ -5,7 +5,7 @@
 #
 # --mode  table: read the file whole; scan: stream it a row group at a time; frame: read it whole, then apply the edit script
 #         to a Frame over it; framescan: the same over a streamed file. The edits go to the first file.
-# --edits a tab-separated script: `set COL ROW TEXT`, `append V1 V2 ...` (one per column, empty = NULL), `remove ROW`,
+# --edits a tab-separated script: `set COL ROW TEXT`, `append V1 V2 ...` (one per column, empty = NULL), `remove ROW`, `formula name = expr`,
 #         `merge COL INTO W1,W2,...` (words folded into INTO).
 # Output, one JSON object: {"columns":[{"name","kind","scale"}], "rows":[[...]], "notes":[...], "explain":"...", "ms":x, "times":[...]}
 # values: INT a number, DECIMAL / DATE / TEXT a string (a decimal as exact text, a date as yyyy-mm-dd), BOOL true / false,
@@ -147,6 +147,8 @@ def apply_edits(mut f: Frame, path: String) raises:
             for i in range(1, len(p)):
                 vals.append(p[i])
             _ = f.append(vals)
+        elif p[0] == "formula":
+            _ = f.formula(p[1])
         elif p[0] == "remove":
             f.remove(Int(p[1]))
         elif p[0] == "merge":

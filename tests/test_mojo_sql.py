@@ -686,3 +686,52 @@ def test_a_scans_statistics_plan_like_the_table(probe, data, keys):
         lines = [r[0] for r in run_probe(probe, sql, {"t": data["g8"].path}, mode=mode)["rows"]]
         plans.append(next(l for l in lines if l.startswith("  group:")))
     assert plans[0] == plans[1], plans
+
+
+def test_a_decimal_product_past_int64_raises(probe, data):
+    for mode in ("table", "scan"):
+        res = run_probe(probe, "SELECT sum(d * e * x * id) FROM t", {"t": data["g1m"].path}, mode=mode, expect_error=True)
+        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
+
+
+def test_names_are_case_insensitive_quoted_names_and_aliases_work(probe, data):
+    ds = data["g8"]
+    sql = 'SELECT a."K" AS "My Group", COUNT(*) AS "Total Rows", SUM(A.X) FROM "T" AS a WHERE a.D IS NOT NULL GROUP BY a.k ORDER BY 2 DESC, 1'
+    res = run_probe(probe, sql, {"T": ds.path})
+    assert [c["name"] for c in res["columns"]] == ["My Group", "Total Rows", "sum(A.X)"]
+    want = ds.table.execute('SELECT k, COUNT(*), SUM(x) FROM t WHERE d IS NOT NULL GROUP BY k ORDER BY 2 DESC, 1').fetchall()
+    assert_equal(got_rows(res), want, True, sql)
+
+
+@pytest.mark.parametrize("mode", ["frame", "framescan"])
+def test_a_frames_formula_columns_are_columns(probe, data, mode):
+    """f1 = d - x (a decimal minus an integer, brought to one scale), f2 = f1 * 2 (a formula over a formula), f3 = d + e (two scales):
+    the frame's formulas, after its 300 edits, queried like stored columns, equal the same expressions in DuckDB."""
+    ds = data["g8"]
+    script = ds.edits_path.with_suffix(".formulas")
+    script.write_text(ds.edits_path.read_text() + "formula\tf1 = d - x\nformula\tf2 = f1 * 2\nformula\tf3 = d + e\n")
+    con = ds.edited
+    con.execute("create or replace view tf as select *, d - x as f1, (d - x) * 2 as f2, d + e as f3 from (select * exclude (rid) from src)")
+    queries = [
+        ("SELECT k, sum(f1), min(f2), max(f3), count(f1), avg(f3) FROM t GROUP BY k", False),
+        ("SELECT count(*), sum(f3), min(f1) FROM t WHERE f1 > f3 OR f2 IS NULL", False),
+        ("SELECT f2, count(*) FROM t WHERE k = 1 GROUP BY f2 HAVING count(*) > 1", False),
+        ("SELECT s, sum(f2 + 1), sum(f3 - f1) FROM t WHERE f3 BETWEEN -50 AND 50 GROUP BY s", False),
+        ("SELECT k, sum(f1) AS total FROM t GROUP BY k ORDER BY total DESC NULLS LAST, k", True),
+    ]
+    for sql, ordered in queries:
+        res = run_probe(probe, sql, {"t": ds.path}, mode=mode, edits=script)
+        want = con.execute(sql.replace(" FROM t", " FROM tf")).fetchall()
+        assert_equal(got_rows(res), want, ordered, f"{mode}: {sql}")
+
+
+def test_a_duplicate_output_name_gets_a_suffix(probe, data):
+    res = run_probe(probe, "SELECT k, k, count(*) AS k FROM t GROUP BY k", {"t": data["g8"].path})
+    assert [c["name"] for c in res["columns"]] == ["k", "k_1", "k_2"]
+
+
+def test_the_register_limit_is_an_sql_error(probe, data):
+    aggs = ", ".join(f"sum(x + {i})" for i in range(40))
+    res = run_probe(probe, f"SELECT k, {aggs} FROM t GROUP BY k", {"t": data["g8"].path}, expect_error=True)
+    assert res["error"] == ("SQL error at line 1, column 8: the query is too big for one program (more than 48 registers): it holds too many "
+                            "aggregates over different expressions (about 20); split the select list into two queries"), res

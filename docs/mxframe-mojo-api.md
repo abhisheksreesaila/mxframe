@@ -269,8 +269,11 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 `r.notes` is the contract the tests assert: `source: ...`, `group: dense, 2 keys g 7 (with a NULL slot) x s 17 ... = 119 slots: <reason>` or `group: hashed on N key words: <reason>`
 (`forced by the options` when `PlannerOptions` said so), `kernel: N instructions a row (M slots)`, `ran: table|frame|scan ...: <chunks>`, `holistic: ...`, `order: ...`, `having: ...`, `time: ...`.
 
-**Limits**: one table (joins: F-153); no row queries, `DISTINCT`, `SELECT *` (F-152); no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only; a Frame with formula columns is refused;
-at most 48 registers (about 10 aggregates over different expressions) and 64 distinct constants in one program, said in words when passed; sums of an AVG argument past int64 raise.
+**A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
+`x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
+
+**Limits**: one table (joins: F-153); no row queries, `DISTINCT`, `SELECT *` (F-152); no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
+at most 48 registers (about 20 aggregates over different expressions) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
 Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
 `sql()` on a table already in memory, best of 3 in one process, which includes planning and, the first time, the pass that finds a key's range; DuckDB 1.5.1 on a table it loaded, best of 3, its result

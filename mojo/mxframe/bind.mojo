@@ -12,7 +12,8 @@ from std.collections import Dict
 from std.memory import ArcPointer
 from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .parquet import ParquetScan
-from .frame import Frame, Overlay
+from .frame import Frame, Overlay, Formula
+from .expr import (Expr, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO)
 from .csv import days_from_civil, _days_in_month
 from .sql import (SqlStatement, SqlExpr, parse_sql, sql_error, closest, lower_ascii, upper_ascii,
                   X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE, X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN,
@@ -95,8 +96,6 @@ struct Catalog(Movable):
         s.overlay = frame.overlay()
         s.framed = True
         s.version = frame.edits
-        if len(frame.formulas) > 0:
-            raise Error("table `" + name + "`: a frame with formula columns cannot be queried with SQL yet")
         self._put(s^)
 
     def find(self, name: String) -> Int:
@@ -127,6 +126,10 @@ comptime B_IMOD = 14         # remainder with the dividend's sign; x % 0 is NULL
 comptime B_NEG = 15
 comptime B_DIV = 16          # `/`: a FLOAT, after aggregation only
 comptime B_RESCALE = 17      # a times 10^value: the same number with `value` more decimal places
+comptime B_FDIV = 18         # a frame formula's `//`: floor division, x // 0 is 0 (the builder's rule, not SQL's)
+comptime B_FMOD = 19         # a frame formula's `%`: the divisor's sign, x % 0 is 0
+comptime B_LEAST = 26        # a frame formula's min(a, b)
+comptime B_GREATEST = 27     # a frame formula's max(a, b)
 comptime B_CMP = 20          # value: 20 <, 21 <=, 22 >, 23 >=, 24 =, 25 <> (the kernel's own codes)
 comptime B_AND = 30
 comptime B_OR = 31
@@ -240,6 +243,8 @@ struct BoundQuery(Movable):
     var offset: Int
     var explain: Int
     var text: String                 # the SQL
+    var line: Int                    # where its select list starts (for errors that belong to the whole query)
+    var col: Int
     var where_text: String
     var having_text: String
     var order_text: List[String]
@@ -260,6 +265,8 @@ struct BoundQuery(Movable):
         self.offset = 0
         self.explain = EXPLAIN_NONE
         self.text = String()
+        self.line = 1
+        self.col = 1
         self.where_text = String()
         self.having_text = String()
         self.order_text = List[String]()
@@ -366,6 +373,8 @@ struct _Binder(Movable):
     var in_post: Bool
     var key_canons: List[String]
     var alias_expr: List[Int]         # post-aggregate expression of each select item, by item (-1 while unbound)
+    var n_stored: Int                 # the source's stored columns; the frame's formula columns follow them
+    var formulas: List[Formula]
 
     def __init__(out self, var st: SqlStatement):
         self.st = st^
@@ -379,6 +388,8 @@ struct _Binder(Movable):
         self.in_post = False
         self.key_canons = List[String]()
         self.alias_expr = List[Int]()
+        self.n_stored = 0
+        self.formulas = List[Formula]()
 
     def take(deinit self) -> BoundQuery:
         return self.q^
@@ -450,6 +461,50 @@ struct _Binder(Movable):
         if x.kind == X_STR:
             return "'" + x.text + "'"
         return x.text
+
+    # -- a frame's formula column: its expression over stored columns, bound as the builder evaluates it
+    def formula_column(mut self, fi: Int, ast: Int, depth: Int) raises -> Int:
+        if depth > 32:
+            raise self.err(ast, "formulas refer to each other in a cycle")
+        var stack = List[Int]()
+        var nodes = self.formulas[fi].expr.nodes.copy()
+        var fname = self.formulas[fi].name
+        var fscale = self.formulas[fi].scale
+        for n in nodes:
+            if n.op == N_COL:
+                var found = -1
+                for c in range(len(self.src_names)):
+                    if self.src_names[c] == n.name:
+                        found = c
+                        break
+                if found < 0:
+                    raise self.err(ast, "formula `" + fname + "` reads column `" + n.name + "`, which is not there")
+                if found >= self.n_stored:
+                    stack.append(self.formula_column(found - self.n_stored, ast, depth + 1))
+                else:
+                    var node = self.mk(B_COL, self.src_kinds[found], self.src_scales[found], -1, -1, Int64(found), String(self.src_names[found]), ast)
+                    if self.src_kinds[found] == TEXT.value:
+                        self.q.rexprs[node].src = found
+                    stack.append(node)
+            elif n.op == N_LIT:
+                stack.append(self.mk(B_LIT, INT.value, 0, -1, -1, n.value, "", ast))
+            elif n.op == N_SCALE_TO:
+                pass                                              # the child already holds the scaled number
+            elif n.op == N_NEG:
+                var a = stack.pop()
+                stack.append(self.mk(B_NEG, INT.value, 0, a, -1, 0, "", ast))
+            else:
+                var b = stack.pop()
+                var a = stack.pop()
+                var op = B_ADD if n.op == N_ADD else B_SUB if n.op == N_SUB else B_MUL if n.op == N_MUL else B_FDIV if n.op == N_FLOORDIV else \
+                         B_FMOD if n.op == N_MOD else B_LEAST if n.op == N_LEAST else B_GREATEST if n.op == N_GREATEST else -1
+                if op < 0:
+                    raise self.err(ast, "formula `" + fname + "` uses an operator SQL cannot read yet")
+                stack.append(self.mk(op, INT.value, 0, a, b, 0, "", ast))
+        var top = stack.pop()
+        self.q.rexprs[top].kind = DECIMAL.value if fscale > 0 else INT.value
+        self.q.rexprs[top].scale = fscale
+        return top
 
     # -- literals
     def literal(mut self, ast: Int) raises -> Int:
@@ -691,6 +746,8 @@ struct _Binder(Movable):
                 var c = self.find_column(ast)
                 raise self.err(ast, "column `" + self.src_names[c] + "` must appear in the GROUP BY clause or be used in an aggregate function")
             var c = self.find_column(ast)
+            if c >= self.n_stored:
+                return self.formula_column(c - self.n_stored, ast, 0)
             var n = self.mk(B_COL, self.src_kinds[c], self.src_scales[c], -1, -1, Int64(c), String(self.src_names[c]), ast)
             if self.src_kinds[c] == TEXT.value:
                 self.q.rexprs[n].src = c
@@ -930,8 +987,16 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         b.src_names.append(catalog.sources[src].table.name(c))
         b.src_kinds.append(catalog.sources[src].table.kind(c).value)
         b.src_scales.append(catalog.sources[src].table.scale(c))
+    b.n_stored = len(b.src_names)
+    for f in catalog.sources[src].overlay.formulas:           # a frame's formula columns are columns too
+        b.formulas.append(f.copy())
+        b.src_names.append(f.name)
+        b.src_kinds.append(DECIMAL.value if f.scale > 0 else INT.value)
+        b.src_scales.append(f.scale)
     b.q.source = src
     b.q.text = text
+    b.q.line = b.st.items[0].line
+    b.q.col = b.st.items[0].col
     b.q.explain = b.st.explain
     b.q.limit = b.st.limit
     b.q.offset = b.st.offset

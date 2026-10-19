@@ -14,4 +14,4 @@ from .sql import parse_sql, SqlStatement
 from .bind import Catalog, SqlSource, BoundQuery, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN
 from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED,
                       G_NONE, G_DENSE, G_HASHED)
-from .sqlexec import sql, SqlResult
+from .sqlexec import sql, sql_with, SqlResult
