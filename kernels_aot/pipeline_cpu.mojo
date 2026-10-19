@@ -114,6 +114,12 @@ comptime OP_CMPC = 38
 comptime OP_ROWID = 39      # the row's number in the whole input (SELECT DISTINCT: first appearance, F-033)
 comptime OP_STR = 40        # a plain utf8 column LIKE a pattern (F-034)
 comptime OP_ISNULL = 41     # the column's validity bit is clear (F-097)
+# F-156 (the Mojo API's SQL expressions; the Python compiler does not emit them): a table lookup, a hash set and an error flag.
+comptime OP_TAB = 47        # dst = table[a - lo]: an "int" register in, int64 bits out (a float's bits too); out of range gives 0. Set s holds the 8-byte entries
+                            # (set_meta[s*3] = their byte offset in set_bytes, 8-aligned; [s*3+1] = how many; [s*3+2] = lo): a TEXT function's answer per dictionary word
+comptime OP_ISET = 48       # dst = 1.0 if the int64 in register a is in the hash set s, else 0.0 (an IN list of any length). Set s: set_meta[s*3] = the table's byte offset
+                            # (8-aligned), [s*3+1] = its capacity (a power of two), [s*3+2] = 1 when the set holds INT64_MIN; the table's slots hold keys, empty = INT64_MIN
+comptime OP_FLAG = 49       # *ovf = 1 when any of the first n lanes of register a is not 0.0 (a CAST met a value it cannot convert)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -613,6 +619,45 @@ def _between(d: FP, x: FP, lo: FP, hi: FP, n: Int):
         d.store(i, (v.ge(lo.load[width=W](i)) & v.le(hi.load[width=W](i))).select(one, zero))
         i += W
 
+def _tab(d: FP, a: FP, bytes: BP, off: Int, length: Int, lo: Int, n: Int):
+    """OP_TAB: dst = table[a - lo] for the first n lanes ("int" registers: the bits are the values), 0 outside the table."""
+    var xa = _ibits(a)
+    var dd = _ibits(d)
+    var tab = LP(unsafe_from_address=Int(bytes) + off)
+    var base = Int64(lo)
+    var len_u = UInt64(length)
+    for i in range(n):
+        var k = xa[i] - base
+        dd[i] = tab[Int(k)] if UInt64(k) < len_u else Int64(0)
+
+
+def _iset(d: FP, a: FP, bytes: BP, off: Int, cap: Int, has_min: Int, n: Int):
+    """OP_ISET: dst = 1.0 where the int64 in `a` is in the hash set (open addressing, linear probing, a multiplicative hash)."""
+    var xa = _ibits(a)
+    var tab = LP(unsafe_from_address=Int(bytes) + off)
+    var lg = 0
+    while (1 << lg) < cap:
+        lg += 1
+    var shift = UInt64(64 - lg)
+    var mask = cap - 1
+    for i in range(n):
+        var x = xa[i]
+        var hit = False
+        if x == Int64.MIN:
+            hit = has_min != 0
+        else:
+            var h = Int((UInt64(x) * UInt64(0x9E3779B97F4A7C15)) >> shift)
+            while True:
+                var y = tab[h]
+                if y == x:
+                    hit = True
+                    break
+                if y == Int64.MIN:
+                    break
+                h = (h + 1) & mask
+        d[i] = 1.0 if hit else 0.0
+
+
 def _in_set(d: FP, a: FP, bytes: BP, off: Int, length: Int, lo: Int, n: Int):
     for i in range(n):
         var x = a[i] - Float64(lo)
@@ -930,6 +975,19 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             var s = Int(ins[3])
             _in_set(d, regs + Int(ins[2]) * VEC, p.set_bytes, Int(p.set_meta[s * 3]),
                     Int(p.set_meta[s * 3 + 1]), Int(p.set_meta[s * 3 + 2]), n)
+        elif op == OP_TAB:
+            var s = Int(ins[3])
+            _tab(d, regs + Int(ins[2]) * VEC, p.set_bytes, Int(p.set_meta[s * 3]),
+                 Int(p.set_meta[s * 3 + 1]), Int(p.set_meta[s * 3 + 2]), n)
+        elif op == OP_ISET:
+            var s = Int(ins[3])
+            _iset(d, regs + Int(ins[2]) * VEC, p.set_bytes, Int(p.set_meta[s * 3]),
+                  Int(p.set_meta[s * 3 + 1]), Int(p.set_meta[s * 3 + 2]), n)
+        elif op == OP_FLAG:
+            var ra = regs + Int(ins[2]) * VEC
+            for i in range(n):
+                if ra[i] != 0.0:
+                    p.ovf[0] = 1
 
 
 def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
