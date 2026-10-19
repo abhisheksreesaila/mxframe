@@ -575,3 +575,100 @@ def test_unsupported_and_misspelled_queries_say_what_and_where(probe, data, sql,
     for mode in ("table", "scan"):
         res = run_probe(probe, sql, {"t": data["g8"].path}, mode=mode, expect_error=True)
         assert res.get("error") == message, f"{mode}: {res}"
+
+
+# ── random queries ───────────────────────────────────────────────────────────────────────────────────
+
+class _Gen:
+    """Random aggregate queries over the generated columns (conditions with AND / OR / NOT and NULLs, expressions with
+    + - * // %, mixed decimal scales, several group keys, HAVING), seeded so a failure repeats."""
+
+    INTS = ["x", "k", "g", "id"]
+    DECS = ["d", "e"]
+
+    def __init__(self, seed):
+        self.rng = random.Random(seed)
+
+    def typed(self, depth=0):
+        """(an expression, whether it is an integer): `//` is only generated between integers (on a DECIMAL it is a FLOAT in DuckDB)."""
+        r = self.rng
+        if depth > 2 or r.random() < 0.35:
+            c = r.choice(self.INTS + self.DECS + [str(r.randint(-5, 9)), f"{r.randint(-300, 300) / 100:.2f}"])
+            return c, not (c in self.DECS or "." in c)
+        a, ai = self.typed(depth + 1)
+        b, bi = self.typed(depth + 1)
+        op = r.choice(["+", "-", "*", "+", "-", "//", "%"])
+        if op == "//" and not (ai and bi):
+            op = "+"
+        return f"({a} {op} {b})", ai and bi
+
+    def num(self, depth=0):
+        return self.typed(depth)[0]
+
+    def cond(self, depth=0):
+        r = self.rng
+        if depth > 2 or r.random() < 0.4:
+            t = r.random()
+            if t < 0.55:
+                a, b = self.num(1), self.num(1)
+                return f"{a} {r.choice(['=', '<>', '<', '<=', '>', '>='])} {b}"
+            if t < 0.65:
+                return f"{r.choice(['x', 'k', 'd', 'e', 's', 'dt', 'b'])} IS {r.choice(['', 'NOT '])}NULL"
+            if t < 0.75:
+                items = ", ".join(str(r.randint(-3, 5)) for _ in range(r.randint(1, 4))) + (", NULL" if r.random() < 0.2 else "")
+                return f"{r.choice(self.INTS)} {r.choice(['', 'NOT '])}IN ({items})"
+            if t < 0.82:
+                items = ", ".join(repr(r.choice(WORDS + ["zz"])) for _ in range(r.randint(1, 3)))
+                return f"s {r.choice(['', 'NOT '])}IN ({items})"
+            if t < 0.88:
+                return f"s {r.choice(['=', '<>'])} {repr(r.choice(WORDS + ['zz']))}"
+            if t < 0.94:
+                return f"dt {r.choice(['<', '>=', '='])} DATE '20{r.randint(18, 22)}-{r.randint(1, 12):02d}-{r.randint(1, 28):02d}'"
+            return r.choice(["b", "NOT b", "b = true", "b <> false"])
+        c = f"({self.cond(depth + 1)} {r.choice(['AND', 'OR'])} {self.cond(depth + 1)})"
+        return f"NOT {c}" if r.random() < 0.15 else c
+
+    def agg(self):
+        r = self.rng
+        f = r.choice(["sum", "sum", "count", "min", "max", "avg", "count", "countstar", "countd", "median", "q"])
+        e = self.num(1)
+        if f == "countstar":
+            return "count(*)"
+        if f == "countd":
+            return f"count(DISTINCT {r.choice(self.INTS + self.DECS + ['s', 'dt', 'b'])})"
+        if f in ("min", "max") and r.random() < 0.3:
+            return f"{f}({r.choice(['dt', 'b', 'd', 'x'])})"
+        if f == "median":
+            return f"median({r.choice(self.INTS)})"
+        if f == "q":
+            return f"quantile_disc({r.choice(self.INTS + self.DECS)}, {r.choice([0.1, 0.5, 0.9, 0, 1])})"
+        return f"{f}({e})"
+
+    def query(self):
+        r = self.rng
+        keys = r.choice([[], ["k"], ["s"], ["b"], ["k", "s"], ["g"], ["dt"], ["x % 5"], ["k", "b"], ["x // 100"], ["s", "k", "b"]])
+        q = f"SELECT {', '.join(keys + [self.agg() for _ in range(r.randint(1, 4))])} FROM t"
+        if r.random() < 0.6:
+            q += f" WHERE {self.cond()}"
+        if keys:
+            q += " GROUP BY " + ", ".join(keys)
+        if keys and r.random() < 0.25:
+            q += f" HAVING count(*) > {r.randint(0, 5)}"
+        return q
+
+
+@pytest.mark.parametrize("mode", ["table", "frame", "scan"])
+@pytest.mark.parametrize("seed", [11, 12])
+def test_random_queries_equal_duckdb(probe, data, mode, seed):
+    ds = data["g8"]
+    gen = _Gen(seed * 100 + len(mode))
+    compared = 0
+    for _ in range(40):
+        q = gen.query()
+        res = run_probe(probe, q, {"t": ds.path}, mode=mode, edits=ds.edits_path if mode == "frame" else None, expect_error=True)
+        if "error" in res:
+            raise AssertionError(f"{mode}: `{q}`: {res['error']}")
+        compared += 1
+        want = ds.oracle(mode).execute(q).fetchall()
+        assert_equal(got_rows(res), want, False, f"{mode}: {q}")
+    assert compared >= 25, f"only {compared} of 40 random queries ran"
