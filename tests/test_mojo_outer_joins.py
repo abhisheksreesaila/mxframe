@@ -142,6 +142,25 @@ def test_left_join_text_and_composite_keys(mx, data):
     q(mx, data, "SELECT c.s, o.tag, count(*) FROM cust c LEFT JOIN ords o ON c.s = o.tag GROUP BY c.s, o.tag", ["cust", "ords"])
 
 
+WHERE_EQUALITIES = [
+    # a WHERE equality between the two tables is a filter after a LEFT join (it removes the NULL-extended rows), not a join key
+    "SELECT count(*), count(d.name) FROM fact f LEFT JOIN dim d ON f.k = d.k WHERE f.g = d.k",
+    "SELECT count(*), count(o.oid) FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE c.seg = o.amt",
+    "SELECT count(*), count(d.name) FROM cust c LEFT JOIN dim d ON c.ck = d.k WHERE c.dt = d.dt",
+    "SELECT count(*) FROM cust c LEFT JOIN dim d ON c.seg = d.k WHERE c.dt = d.dt",
+    "SELECT c.ck, o.oid FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE c.seg = o.amt AND c.ck < 100",
+    "SELECT c.s, count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE o.amt = c.seg GROUP BY c.s",
+    "SELECT count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck WHERE c.ck = o.ck",
+    "SELECT count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck AND c.seg = o.amt WHERE o.oid = c.ck",
+]
+
+
+@pytest.mark.parametrize("extra", [[], ["--join", "materialize"], ["--stream", "always"], ["--threads", "1"]])
+@pytest.mark.parametrize("sql", WHERE_EQUALITIES)
+def test_a_where_equality_after_a_left_join_is_a_filter_not_a_key(mx, data, sql, extra):
+    q(mx, data, sql, ["cust", "ords", "dim", "fact"], extra=extra)
+
+
 # ── SEMI and ANTI JOIN, IN / NOT IN / EXISTS / NOT EXISTS ───────────────────────────────────────────
 
 PRESENCE = [

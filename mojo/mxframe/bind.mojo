@@ -680,7 +680,9 @@ struct _Binder(Movable):
             var c = conj[ci]
             self.in_on = ci < n_on
             ref x = self.st.exprs[c]
-            if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL:
+            # an equality between a column of each table is a join key: from ON (or USING, or the comma join's WHERE) always; a WHERE equality of a LEFT / SEMI /
+            # ANTI join is a filter on the joined rows (it removes a LEFT join's NULL-extended rows), so it is not a key there
+            if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL and (self.jkind == JK_INNER or ci < n_on):
                 var ra = self.lookup(x.a)
                 var rb = self.lookup(x.b)
                 if ra[1] == 0 and rb[1] == 0 and self.table_of(ra[0]) != self.table_of(rb[0]):
