@@ -27,6 +27,7 @@ from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan
 from .post import run_post
+from .kargs import KernelRun
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sqlprog import lower_rows
 from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
@@ -176,67 +177,15 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int], mut ix: _Key
         acc.counts[found] += other.counts[o]
 
 
-def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int) raises -> Partial:
-    """The kernel with hashed groups (hashagg_cpu.hash_aggregate): each worker numbers the key tuples of its rows in a local
-    table, the partitions are merged in parallel, and the result is the groups with their key words, slots and counts."""
-    ref p = sp.p
-    var n = t.rows()
-    var code = List[Int32]()
-    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
-                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
-    for h in header:
-        code.append(Int32(h))
-    for w in p.pred:
-        code.append(w)
-    for w in p.body:
-        code.append(w)
-    for w in p.aggs:
-        code.append(w)
-    var consts = List[Float64]()
-    for v in p.consts:
-        consts.append(Float64(from_bits=UInt64(v)))
-    if len(consts) == 0:
-        consts.append(0.0)
-    var set_bytes = sp.set_bytes.copy()
-    if len(set_bytes) == 0:
-        set_bytes.append(0)
-    var set_meta = sp.set_meta.copy()
-    if len(set_meta) == 0:
-        set_meta = [0, 0, 0]
-    var tbl = _table_addresses(t, p, mask_addr)
-    var dtypes = p.dtypes.copy()
-    if len(dtypes) == 0:
-        dtypes.append(1)
-    var res = List[Int64](length=3 + max(nkw, 1), fill=0)
-
-    def keyw(c: Int, i0: Int, sl: IP, nsel: Int, use_sel: Bool, dst: LP, rg: FP, wsp: BP) {imm} -> Bool:
-        for k in range(nkw):
-            var src = LP(unsafe_from_address=Int(rg) + k * VEC * 8)
-            var o = dst + k * VEC
-            for j in range(nsel):
-                o[j] = src[j]
-        return True
-
-    var rc = hash_aggregate[fused=False](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
-                                         Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), nkw, n,
-                                         threads if threads > 0 else core_count(), sp.p.repro, keyw, _no_front, 0,
-                                         LP(unsafe_from_address=Int(res.unsafe_ptr())), 0)
-    _ = code^
-    _ = consts^
-    _ = set_bytes^
-    _ = set_meta^
-    _ = tbl^
-    _ = dtypes^
-    if rc == -7 or rc == E_OVERFLOW:
-        raise Error(overflow_message(sp.p.has_float))
-    if rc != 0:
-        raise Error("the hashed group-by kernel failed with code " + String(rc))
+def _hashed_result(run: KernelRun, res_r: Int, n_slots: Int, nkw: Int) -> Partial:
+    """The groups hash_aggregate found, from the addresses it left in the run's result region (the run is a parameter: alive here)."""
+    var res = run.i64(res_r)
     var out = Partial()
     var g = Int(res[0])
     var stride = max(g, 1)
     var vals = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(res[1]))
     var cnt = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(res[2]))
-    for s in range(p.n_slots):
+    for s in range(n_slots):
         var col = List[Int]()
         col.reserve(g)
         for x in range(g):
@@ -255,6 +204,28 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
     vals.free()
     cnt.free()
     return out^
+
+
+def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int) raises -> Partial:
+    """The kernel with hashed groups (hashagg_cpu.hash_aggregate): each worker numbers the key tuples of its rows in a local
+    table, the partitions are merged in parallel, and the result is the groups with their key words, slots and counts."""
+    var run = KernelRun(sp.p, sp.set_bytes, sp.set_meta, t, mask_addr)
+    var res_r = run.region(3 + max(nkw, 1))
+
+    def keyw(c: Int, i0: Int, sl: IP, nsel: Int, use_sel: Bool, dst: LP, rg: FP, wsp: BP) {imm} -> Bool:
+        for k in range(nkw):
+            var src = LP(unsafe_from_address=Int(rg) + k * VEC * 8)
+            var o = dst + k * VEC
+            for j in range(nsel):
+                o[j] = src[j]
+        return True
+
+    var rc = run.hashed(keyw, nkw, t.rows(), threads, res_r)
+    if rc == -7 or rc == E_OVERFLOW:
+        raise Error(overflow_message(sp.p.has_float))
+    if rc != 0:
+        raise Error("the hashed group-by kernel failed with code " + String(rc))
+    return _hashed_result(run, res_r, sp.p.n_slots, nkw)
 
 
 # ── text for EXPLAIN ─────────────────────────────────────────────────────────────────────────────────
@@ -490,98 +461,58 @@ struct _GroupLookup(Movable):
             self.table[pos] = Int32(g)
 
 
+def _absorb_window(run: KernelRun, mut hs: HolStates, s: Int, g_r: Int, v_r: Int, c_r: Int, nblk: Int) raises:
+    """The window's pairs of source s into the states (the run is a parameter: the regions stay alive while the states read them)."""
+    hs.absorb(s, window_blocks(Int(run.i32(g_r)), Int(run.i64(v_r)), Int(run.i32(c_r)), nblk, VEC))
+
+
 def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_addr: Int, mut hs: HolStates, threads: Int) raises:
     """Pass 2 over one chunk: the kernel runs the predicate and the key words, `_hmat_hook` finds each row's group and
     writes the holistic sources' (group, value) pairs, which the states take in windows (as query.mojo's `_run_mat`)."""
     ref p = sp.p
     var n = t.rows()
     var rows = max(MORSEL_ROWS, (WINDOW_BYTES // (12 * max(p.n_src, 1))) // MORSEL_ROWS * MORSEL_ROWS)
-    var code = List[Int32]()
-    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
-                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
-    for h in header:
-        code.append(Int32(h))
-    for w in p.pred:
-        code.append(w)
-    for w in p.body:
-        code.append(w)
-    for w in p.aggs:
-        code.append(w)
-    var set_bytes = sp.set_bytes.copy()
-    if len(set_bytes) == 0:
-        set_bytes.append(0)
-    var set_meta = sp.set_meta.copy()
-    if len(set_meta) == 0:
-        set_meta = [0, 0, 0]
-    var tbl = _table_addresses(t, p, mask_addr)
-    var dtypes = p.dtypes.copy()
-    if len(dtypes) == 0:
-        dtypes.append(1)
     var done = 0
     var first = True
     var G = max(look.groups, 1)
     while first or done < n:
         var end = min(n, done + rows)
         var nblk = (end - done + VEC - 1) // VEC
-        var gids = List[List[Int32]]()
-        var vals = List[List[Int64]]()
-        var cnts = List[List[Int32]]()
-        var ctl = List[Int64]()
-        ctl.append(Int64(p.n_src))
-        ctl.append(Int64(done))
-        ctl.append(Int64(look.groups))
-        ctl.append(0)
-        ctl.append(0)
-        ctl.append(0)
+        var run = KernelRun(p, sp.set_bytes, sp.set_meta, t, mask_addr, G)
+        var ctl = run.region(6 + SRC_WORDS * p.n_src + 4)
+        var cw = run.i64(ctl)
+        cw[0] = Int64(p.n_src)
+        cw[1] = Int64(done)
+        cw[2] = Int64(look.groups)
+        var g_r = List[Int]()
+        var v_r = List[Int]()
+        var c_r = List[Int]()
         for s in range(p.n_src):
-            gids.append(List[Int32](unsafe_uninit_length=max(end - done, 1)))
-            vals.append(List[Int64](unsafe_uninit_length=max(end - done, 1)))
-            cnts.append(List[Int32](length=max(nblk, 1), fill=0))
-            ctl.append(Int64(p.src_vreg[s]))
-            ctl.append(Int64(p.src_valid[s]))
-            ctl.append(Int64(Int(gids[s].unsafe_ptr())))
-            ctl.append(Int64(Int(vals[s].unsafe_ptr())))
-            ctl.append(Int64(Int(cnts[s].unsafe_ptr())))
-            ctl.append(0)
-            ctl.append(0)
-            ctl.append(0)
-            ctl.append(0)
-            ctl.append(0)
-            ctl.append(Int64(1 if p.src_float[s] else 0))
-        ctl.append(Int64(look.nkw))
-        ctl.append(Int64(Int(look.table.unsafe_ptr())))
-        ctl.append(Int64(look.mask))
-        ctl.append(Int64(Int(look.kwp.unsafe_ptr())))
-        var consts = List[Float64]()
-        for v in p.consts:
-            consts.append(Float64(from_bits=UInt64(v)))
-        consts[p.ctl_const] = Float64(from_bits=UInt64(Int(ctl.unsafe_ptr())))
-        var out_vals = List[Float64](length=max(p.n_slots, 1) * G, fill=0.0)
-        var out_cnt = List[Int64](length=G, fill=0)
-        var rc = pipeline_keyed[type_of(_hmat_hook)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
-                                                     Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), G,
-                                                     done, end, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
-                                                     threads if threads > 0 else core_count(), _hmat_hook, False)
+            g_r.append(run.bytes_region(4 * max(end - done, 1), False))
+            v_r.append(run.region(max(end - done, 1), False))
+            c_r.append(run.bytes_region(4 * max(nblk, 1)))
+            var w = cw + (6 + SRC_WORDS * s)
+            w[0] = Int64(p.src_vreg[s])
+            w[1] = Int64(p.src_valid[s])
+            w[2] = Int64(Int(run.i32(g_r[s])))
+            w[3] = Int64(Int(run.i64(v_r[s])))
+            w[4] = Int64(Int(run.i32(c_r[s])))
+            w[10] = Int64(1 if p.src_float[s] else 0)
+        var tail = cw + (6 + SRC_WORDS * p.n_src)
+        tail[0] = Int64(look.nkw)
+        tail[1] = Int64(Int(look.table.unsafe_ptr()))
+        tail[2] = Int64(look.mask)
+        tail[3] = Int64(Int(look.kwp.unsafe_ptr()))
+        run.control(ctl)
+        var rc = run.keyed(_hmat_hook, G, done, end, threads)
         if rc == E_OVERFLOW:
-            raise Error(OVERFLOW_MESSAGE)
+            raise Error(overflow_message(p.has_float))
         if rc != 0:
             raise Error("the CPU kernel failed with code " + String(rc))
         for s in range(p.n_src):
-            hs.absorb(s, window_blocks(Int(gids[s].unsafe_ptr()), Int(vals[s].unsafe_ptr()), Int(cnts[s].unsafe_ptr()), nblk, VEC))
-        _ = ctl^
-        _ = gids^
-        _ = vals^
-        _ = cnts^
-        _ = consts^
-        _ = out_vals^
-        _ = out_cnt^
+            _absorb_window(run, hs, s, g_r[s], v_r[s], c_r[s], nblk)
         first = False
         done = end
-    _ = code^
-    _ = set_bytes^
-    _ = set_meta^
-    _ = tbl^
-    _ = dtypes^
 
 
 def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int) raises -> SqlProgram:

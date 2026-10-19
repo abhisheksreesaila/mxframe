@@ -721,7 +721,7 @@ def _walk[S: CellSink](data: BP, start: Int, end: Int, delim: UInt8, max_rows: I
             else:
                 if len(scratch) < fend - fstart:
                     scratch.resize(fend - fstart, 0)
-                var out = scratch.unsafe_ptr()
+                var out = scratch.unsafe_ptr()    # lifetime: ok (`scratch` lives through the enclosing loop)
                 var n = 0
                 var q = _A
                 for i in range(fstart, fend):
@@ -1024,7 +1024,9 @@ def read_csv(path: String, options: CsvOptions = CsvOptions()) raises -> CsvResu
         raise Error("couldn't open `" + path + "`: no such file, or no permission to read it")
     var fd = file._get_raw_fd()
     var one = List[UInt8](length=1, fill=0)
-    if external_call["read", Int](fd, one.unsafe_ptr(), Int(1)) < 0:      # a directory opens, but cannot be read
+    var got = external_call["read", Int](fd, one.unsafe_ptr(), Int(1))
+    _ = one^
+    if got < 0:                                                       # a directory opens, but cannot be read
         file.close()
         raise Error("couldn't read `" + path + "`: not a regular file")
     var size = external_call["lseek", Int](fd, Int(0), Int32(2))

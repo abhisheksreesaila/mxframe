@@ -18,7 +18,7 @@ from std.time import perf_counter_ns
 from std.atomic import Atomic
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import text_ranks, _radix_order
-from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE
+from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE, overflow_message
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
 from .sql import sql_error
@@ -26,6 +26,7 @@ from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, pow10
 from .planner import PhysicalPlan, PlannerOptions, commas
 from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey, collect_columns
 from .sqleval import ValCol
+from .kargs import KernelRun
 from .holistic import float_key
 from .exec import (_table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
@@ -78,103 +79,94 @@ struct RowChunk(Movable):
         self.n = 0
 
 
-def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: Int, threads: Int) raises -> RowChunk:
-    """The kernel over rows [start, stop) of one chunk; the selected rows and the computed values, in row order."""
-    ref p = sp.p
-    var total = stop - start
-    var out = RowChunk()
-    if total <= 0:
-        for _ in range(len(sp.row_vregs)):
-            out.vals.append(List[Int64]())
-            out.nuls.append(List[UInt8]())
-        return out^
-    var nblk = (total + VEC - 1) // VEC
-    var ncomp = len(sp.row_vregs)
-    var ids = List[Int32](unsafe_uninit_length=total)
-    var cnt = List[Int32](length=nblk, fill=0)
-    var vals = List[List[Int64]]()
-    var nuls = List[List[UInt8]]()
-    var ctl = List[Int64]()
-    ctl.append(Int64(ncomp))
-    ctl.append(Int64(start))
-    ctl.append(Int64(Int(ids.unsafe_ptr())))
-    ctl.append(Int64(Int(cnt.unsafe_ptr())))
+def _compact_rows(run: KernelRun, ids_r: Int, cnt_r: Int, val_r: List[Int], nul_r: List[Int], nblk: Int, mut out: RowChunk):
+    """The blocks' entries, packed at each block's own place in the run's regions, copied down over the gaps the filter left. (The run is
+    a parameter: it is alive for the whole function, so the pointers taken from it stay good.)"""
+    var ncomp = len(val_r)
+    var cp = run.i32(cnt_r)
+    var n_sel = 0
+    for b in range(nblk):
+        n_sel += Int(cp[b])
+    out.ids = List[Int32](unsafe_uninit_length=n_sel)
     for c in range(ncomp):
-        vals.append(List[Int64](unsafe_uninit_length=total))
-        nuls.append(List[UInt8](length=total, fill=0) if sp.row_nregs[c] >= 0 else List[UInt8]())
-        ctl.append(Int64(Int(vals[c].unsafe_ptr())))
-        ctl.append(Int64(Int(nuls[c].unsafe_ptr())) if sp.row_nregs[c] >= 0 else Int64(0))
-        ctl.append(Int64(sp.row_vregs[c]))
-        ctl.append(Int64(sp.row_nregs[c]))
-    var code = List[Int32]()
-    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
-                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
-    for h in header:
-        code.append(Int32(h))
-    for w in p.pred:
-        code.append(w)
-    for w in p.body:
-        code.append(w)
-    for w in p.aggs:
-        code.append(w)
-    var consts = List[Float64]()
-    for v in p.consts:
-        consts.append(Float64(from_bits=UInt64(v)))
-    consts[p.ctl_const] = Float64(from_bits=UInt64(Int(ctl.unsafe_ptr())))
-    var set_bytes = sp.set_bytes.copy()
-    if len(set_bytes) == 0:
-        set_bytes.append(0)
-    var set_meta = sp.set_meta.copy()
-    if len(set_meta) == 0:
-        set_meta = [0, 0, 0]
-    var tbl = _table_addresses(t, p, mask_addr)
-    var dtypes = p.dtypes.copy()
-    if len(dtypes) == 0:
-        dtypes.append(1)
-    var out_vals = List[Float64](length=max(p.n_slots, 1), fill=0.0)
-    var out_cnt = List[Int64](length=1, fill=0)
-    var rc = pipeline_keyed[type_of(_rows_hook)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
-                                                 Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), 1,
-                                                 start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
-                                                 threads if threads > 0 else core_count(), _rows_hook, False)
-    _ = code^
-    _ = consts^
-    _ = set_bytes^
-    _ = set_meta^
-    _ = tbl^
-    _ = dtypes^
-    _ = out_vals^
-    _ = out_cnt^
-    _ = ctl^
-    if rc == E_OVERFLOW:
-        raise Error(OVERFLOW_MESSAGE)
-    if rc != 0:
-        raise Error("the CPU kernel failed with code " + String(rc))
-    # compact: the blocks' entries move down over the gaps the filter left (a block never moves up)
+        out.vals[c] = List[Int64](unsafe_uninit_length=n_sel)
+        if nul_r[c] >= 0:
+            out.nuls[c] = List[UInt8](unsafe_uninit_length=n_sel)
     var at = 0
-    var idp = ids.unsafe_ptr()
-    var cp = cnt.unsafe_ptr()
+    var idp = run.i32(ids_r)
     for b in range(nblk):
         var m = Int(cp[b])
         var from_ = b * VEC
         if m == 0:
             continue
-        if from_ != at:
+        for j in range(m):
+            out.ids[at + j] = idp[from_ + j]
+        for c in range(ncomp):
+            var vp = run.i64(val_r[c])
             for j in range(m):
-                idp[at + j] = idp[from_ + j]
-            for c in range(ncomp):
-                var vp = vals[c].unsafe_ptr()
+                out.vals[c][at + j] = vp[from_ + j]
+            if nul_r[c] >= 0:
+                var np = run.u8(nul_r[c])
                 for j in range(m):
-                    vp[at + j] = vp[from_ + j]
-                if len(nuls[c]) > 0:
-                    var np = nuls[c].unsafe_ptr()
-                    for j in range(m):
-                        np[at + j] = np[from_ + j]
+                    out.nuls[c][at + j] = np[from_ + j]
         at += m
-    out.n = at
-    out.ids = ids^
-    out.vals = vals^
-    out.nuls = nuls^
+    out.n = n_sel
+
+
+def _read_heaps(run: KernelRun, counter_r: Int, sizes_r: Int, vals_r: Int, nuls_r: Int, ids_r: Int, maxw: Int, K: Int, ns: Int, mut out: RowChunk):
+    """The workers' heaps as plain lists (the run is a parameter, alive for the whole function)."""
+    var counter = run.i64(counter_r)
+    var sizes = run.i64(sizes_r)
+    var vals = run.i64(vals_r)
+    var nuls = run.u8(nuls_r)
+    var ids = run.i32(ids_r)
+    for w in range(min(Int(counter[0]), maxw)):
+        for e in range(Int(sizes[w])):
+            var at = w * (K + 1) + e
+            out.ids.append(ids[at])
+            for s in range(ns):
+                out.vals[s].append(vals[at * ns + s])
+                out.nuls[s].append(nuls[at * ns + s])
+    out.n = len(out.ids)
+
+
+def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: Int, threads: Int) raises -> RowChunk:
+    """The kernel over rows [start, stop) of one chunk; the selected rows and the computed values, in row order."""
+    ref p = sp.p
+    var total = stop - start
+    var out = RowChunk()
+    var ncomp = len(sp.row_vregs)
+    for _ in range(ncomp):
+        out.vals.append(List[Int64]())
+        out.nuls.append(List[UInt8]())
+    if total <= 0:
+        return out^
+    var nblk = (total + VEC - 1) // VEC
+    var run = KernelRun(p, sp.set_bytes, sp.set_meta, t, mask_addr)
+    var ids_r = run.bytes_region(4 * total, False)
+    var cnt_r = run.bytes_region(4 * nblk)
+    var val_r = List[Int]()
+    var nul_r = List[Int]()
+    var ctl = run.region(4 + 4 * ncomp)
+    var cw = run.i64(ctl)
+    cw[0] = Int64(ncomp)
+    cw[1] = Int64(start)
+    cw[2] = Int64(Int(run.i32(ids_r)))
+    cw[3] = Int64(Int(run.i32(cnt_r)))
+    for c in range(ncomp):
+        val_r.append(run.region(total, False))
+        nul_r.append(run.bytes_region(total) if sp.row_nregs[c] >= 0 else -1)
+        cw[4 + 4 * c] = Int64(Int(run.i64(val_r[c])))
+        cw[5 + 4 * c] = Int64(Int(run.u8(nul_r[c]))) if nul_r[c] >= 0 else Int64(0)
+        cw[6 + 4 * c] = Int64(sp.row_vregs[c])
+        cw[7 + 4 * c] = Int64(sp.row_nregs[c])
+    run.control(ctl)
+    var rc = run.keyed(_rows_hook, 1, start, stop, threads)
+    if rc == E_OVERFLOW:
+        raise Error(overflow_message(p.has_float))
+    if rc != 0:
+        raise Error("the CPU kernel failed with code " + String(rc))
+    _compact_rows(run, ids_r, cnt_r, val_r, nul_r, nblk, out)
     return out^
 
 
@@ -477,88 +469,44 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
     var ns = len(sp.row_vregs)
     var nk = len(key_slot)
     var maxw = (threads if threads > 0 else core_count()) + 4
-    var vals = List[Int64](length=maxw * (K + 1) * ns + 1, fill=0)
-    var nuls = List[UInt8](length=maxw * (K + 1) * ns + 1, fill=0)
-    var ids = List[Int32](length=maxw * (K + 1) + 1, fill=0)
-    var sizes = List[Int64](length=maxw, fill=0)
-    var table = List[Int64](length=maxw, fill=0)
-    var counter = List[Int64](length=1, fill=0)
-    var ctl = List[Int64]()
-    ctl.append(Int64(ns))
-    ctl.append(Int64(nk))
-    ctl.append(Int64(K))
-    ctl.append(Int64(Int(counter.unsafe_ptr())))
-    ctl.append(Int64(Int(table.unsafe_ptr())))
-    ctl.append(Int64(maxw))
-    ctl.append(Int64(Int(vals.unsafe_ptr())))
-    ctl.append(Int64(Int(nuls.unsafe_ptr())))
-    ctl.append(Int64(Int(ids.unsafe_ptr())))
-    ctl.append(Int64(Int(sizes.unsafe_ptr())))
+    var run = KernelRun(p, sp.set_bytes, sp.set_meta, t, mask_addr)
+    var vals_r = run.region(maxw * (K + 1) * ns + 1)
+    var nuls_r = run.bytes_region(maxw * (K + 1) * ns + 1)
+    var ids_r = run.bytes_region(4 * (maxw * (K + 1) + 1))
+    var sizes_r = run.region(maxw)
+    var table_r = run.region(maxw)
+    var counter_r = run.region(1)
+    var ctl = run.region(10 + 4 * nk + 2 * ns)
+    var cw = run.i64(ctl)
+    cw[0] = Int64(ns)
+    cw[1] = Int64(nk)
+    cw[2] = Int64(K)
+    cw[3] = Int64(Int(run.i64(counter_r)))
+    cw[4] = Int64(Int(run.i64(table_r)))
+    cw[5] = Int64(maxw)
+    cw[6] = Int64(Int(run.i64(vals_r)))
+    cw[7] = Int64(Int(run.u8(nuls_r)))
+    cw[8] = Int64(Int(run.i32(ids_r)))
+    cw[9] = Int64(Int(run.i64(sizes_r)))
     for k in range(nk):
-        ctl.append(Int64(key_slot[k]))
-        ctl.append(Int64(1 if key_desc[k] else 0))
-        ctl.append(Int64(1 if key_nf[k] else 0))
-        ctl.append(Int64(key_rank[k]))
+        cw[10 + 4 * k] = Int64(key_slot[k])
+        cw[11 + 4 * k] = Int64(1 if key_desc[k] else 0)
+        cw[12 + 4 * k] = Int64(1 if key_nf[k] else 0)
+        cw[13 + 4 * k] = Int64(key_rank[k])
     for s in range(ns):
-        ctl.append(Int64(sp.row_vregs[s]))
-        ctl.append(Int64(sp.row_nregs[s]))
-    var code = List[Int32]()
-    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
-                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
-    for h in header:
-        code.append(Int32(h))
-    for w in p.pred:
-        code.append(w)
-    for w in p.body:
-        code.append(w)
-    for w in p.aggs:
-        code.append(w)
-    var consts = List[Float64]()
-    for v in p.consts:
-        consts.append(Float64(from_bits=UInt64(v)))
-    consts[p.ctl_const] = Float64(from_bits=UInt64(Int(ctl.unsafe_ptr())))
-    var set_bytes = sp.set_bytes.copy()
-    if len(set_bytes) == 0:
-        set_bytes.append(0)
-    var set_meta = sp.set_meta.copy()
-    if len(set_meta) == 0:
-        set_meta = [0, 0, 0]
-    var tbl = _table_addresses(t, p, mask_addr)
-    var dtypes = p.dtypes.copy()
-    if len(dtypes) == 0:
-        dtypes.append(1)
-    var out_vals = List[Float64](length=max(p.n_slots, 1), fill=0.0)
-    var out_cnt = List[Int64](length=1, fill=0)
-    var rc = pipeline_keyed[type_of(_topk_hook)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
-                                                 Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), 1,
-                                                 0, t.rows(), Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
-                                                 threads if threads > 0 else core_count(), _topk_hook, False)
-    _ = code^
-    _ = consts^
-    _ = set_bytes^
-    _ = set_meta^
-    _ = tbl^
-    _ = dtypes^
-    _ = out_vals^
-    _ = out_cnt^
-    _ = ctl^
-    _ = table^                                                # (the hook reads these through addresses: keep them alive past the call)
+        cw[10 + 4 * nk + 2 * s] = Int64(sp.row_vregs[s])
+        cw[11 + 4 * nk + 2 * s] = Int64(sp.row_nregs[s])
+    run.control(ctl)
+    var rc = run.keyed(_topk_hook, 1, 0, t.rows(), threads)
     if rc == E_OVERFLOW:
-        raise Error(OVERFLOW_MESSAGE)
+        raise Error(overflow_message(p.has_float))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var out = RowChunk()
     for s in range(ns):
         out.vals.append(List[Int64]())
         out.nuls.append(List[UInt8]())
-    for w in range(min(Int(counter[0]), maxw)):
-        for e in range(Int(sizes[w])):
-            var at = w * (K + 1) + e
-            out.ids.append(ids[at])
-            for s in range(ns):
-                out.vals[s].append(vals[at * ns + s])
-                out.nuls[s].append(nuls[at * ns + s])
-    out.n = len(out.ids)
+    _read_heaps(run, counter_r, sizes_r, vals_r, nuls_r, ids_r, maxw, K, ns, out)
     return out^
 
 
@@ -671,6 +619,8 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
 
 def _ms(x: Float64) -> String:
     return String(Float64(Int(x * 100.0)) / 100.0)
+
+
 
 
 def _concat(a: ValCol, b: ValCol) -> ValCol:

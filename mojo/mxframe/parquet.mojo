@@ -1257,7 +1257,7 @@ struct _WordIndex(Movable):
             if code < 0:
                 return -1
             if self.hashes[code] == h and words[code].byte_length() == n:
-                var q = words[code].unsafe_ptr()
+                var q = words[code].unsafe_ptr()    # lifetime: ok (`words` points into the column, which the table owns)
                 var same = True
                 for k in range(n):
                     if q[k] != p[k]:
