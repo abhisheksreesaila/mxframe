@@ -23,7 +23,8 @@ independent reviewer with adversarial inputs before it counted as done (ticket n
 | 📊 Aggregates | sum, count, min, max, mean, count distinct, median, percentile, top-k | count distinct and median 1.5-5x DuckDB at 1M groups |
 | 🔢 Types | INT, DECIMAL (exact), TEXT, DATE, BOOL, FLOAT64 | float sums reproducible on any core count |
 | 🧮 SQL | SELECT … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT, EXPLAIN | 1M groups out in 159 ms (DuckDB 1.9 s); top-k 126 ms → 3 ms |
-| 🔗 Joins | inner, LEFT, SEMI, ANTI; IN / EXISTS / NOT IN subqueries | join + group sum 110 ms (DuckDB 148); NOT EXISTS 9 ms (35) |
+| 🔗 Joins | inner, LEFT, SEMI, ANTI; IN / EXISTS / NOT IN; 3-9 tables with a cost-based planner | join + group sum 110 ms (DuckDB 148); NOT EXISTS 9 ms (35); TPC-H Q9 73 ms (112) |
+| 🧩 Expressions | CASE, CAST, text functions once per word, dates and intervals | date_trunc group 4.3 ms (DuckDB 20.6) |
 | 🤖 `mx` | SQL in, JSON / CSV / Parquet out, for agents | 12 ms cold start, no Python |
 
 ## 📄 Reading Parquet at memory speed (F-140, F-141, F-145)
@@ -159,6 +160,41 @@ NaN matches NaN.
 | filter on the probe side | 34 ms | 22 ms |
 | one-to-many LEFT | 34 ms | 13 ms |
 
+### Many tables and a planner (F-155)
+
+Three to nine tables in one query (`JOIN … ON` chains or comma joins). Each table's filter runs first, so the planner
+orders the joins from exact row counts and sampled distinct counts; a fact table with several unique-key dimensions
+(a star) probes them all in one fused pass with nothing written in between. `EXPLAIN ANALYZE` shows actual rows and
+milliseconds per step beside the estimates. Every TPC-H join shape equals DuckDB under the planner's order and up to
+24 forced orders.
+
+| TPC-H SF1 | MX frame | DuckDB |
+|---|---|---|
+| Q9 | **73 ms** | 112 ms |
+| Q19 | 24 ms | 23 ms |
+| star: lineitem with orders, part and supplier | **39 ms** | 80 ms |
+| Q3 | 32 ms | 27 ms |
+| Q5 | 41 ms | 13 ms |
+| Q7 | 72 ms | 16 ms |
+
+Q5 and Q7 lose because the plan joins one table at a time and writes out 1.2-1.8M rows between steps; a star-aware
+planner that probes every dimension in one pass is the next step (F-161).
+
+## 🧩 Expressions (F-156)
+
+`CASE`, `COALESCE`, `NULLIF`, `CAST` / `TRY_CAST` with DuckDB's rounding and range rules, `IN` lists of any length,
+text functions (`lower`, `upper`, `trim`, `substr`, `replace`, `LIKE` / `ILIKE`, `||`, …) evaluated **once per distinct
+word, never per row**, and dates (`EXTRACT`, `date_trunc`, `± INTERVAL`, date differences).
+
+| 6M rows | MX frame | DuckDB |
+|---|---|---|
+| `date_trunc` + GROUP BY | **4.3 ms** | 20.6 ms |
+| `date + INTERVAL` filter | **3.7 ms** | 18.8 ms |
+| `l_comment LIKE '%special%'` (3.6M distinct words) | 23.7 ms | 12.7 ms |
+| `count(DISTINCT lower(h))` (1M distinct words) | 336 ms | 58 ms |
+
+The last row builds new words on one thread; parallel per-word building is on the speed list.
+
 ## 🤖 `mx`, for agents (F-151)
 
 ```sh
@@ -180,9 +216,9 @@ big files stream automatically. 12 ms cold start, 21 MB, no Python.
 
 ## Still behind DuckDB (next)
 
-- Joins with a filter on the probe side, two-column keys and one-to-many LEFT joins (1.5-3x): F-161 moves the filter
-  into the join and expands matches inside the kernel.
-- Full sorts and million-row outputs (~2x).
-- Multi-table joins with a cost-based join order (F-155), SQL expressions (F-156), CTEs and correlated subqueries
-  (F-159), then the gate: all 22 TPC-H queries through `mx` equal to DuckDB (F-162), and the quiet-machine scoreboard
-  against DuckDB and Polars on CPU and GPU.
+- Multi-table joins that write intermediate rows (TPC-H Q5, Q7, Q10: 2-4x) and one-to-many LEFT joins: F-161, a
+  star-aware planner that probes every dimension in one pass, filters kept inside the join.
+- Full sorts and million-row outputs (~2x), and text functions that build new words over huge dictionaries (F-167).
+- Still to build: joins over streamed files (F-158), CTEs and correlated subqueries (F-159), then the gate: all 22
+  TPC-H queries through `mx` equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on
+  CPU and GPU.
