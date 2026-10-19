@@ -406,7 +406,7 @@ Things an agent should know:
 ## 8b. Joins (F-153)
 
 The inner equi-join is an engine feature: a catalog of named sources (tables, Frames, Parquet scans), the PlanNode IR with two Scans under a Join, a hash join
-kernel, and two ways to run it. It names no application; SQL, `Query.join`, the Python engine and any other caller use the same code.
+kernel, and two ways to run it. It names no application; SQL, `Query.join`, and any other caller use the same code (the Python engine does not call the kernel yet: F-161). `Query.join` always materializes every column of both tables (it cannot know yet what the query after it reads): fusing it and carrying only the needed columns is F-161.
 
 **SQL**: `FROM a JOIN b ON a.k = b.k [AND ...]`, `JOIN ... USING (k)` (`SELECT *` keeps the left columns, then the right minus the USING columns), and a comma join
 whose WHERE has the equalities (`FROM a, b WHERE a.k = b.k`). A name is `alias.column` or a bare column that only one side has; a bare name both sides have raises
@@ -424,9 +424,9 @@ keys are packed into one int64 when the build side's ranges multiply to fewer th
 **Paths** (the `notes` say which ran: `join build side:`, `join keys:`, `join path:`, `join time:`):
 - The build side is the side with fewer rows after its own filters (each side is first reduced to the columns the query needs, by a row query over its source, so a Frame's edits,
   a scan's row groups and a one-side filter are all applied; an unfiltered plain table is read in place).
-- *fused*: the build keys are unique. The probe table is scanned by the aggregate pipeline; each block's rows look their partner up (direct array or hash table, with prefetch) and
+- *fused*: the build keys are unique (aggregates, and row queries including top-k and ORDER BY / LIMIT). The probe table is scanned by the pipeline; each block's rows look their partner up (direct array or hash table, with prefetch) and
   the partner's columns are gathered into per-worker scratch. No joined row is written.
-- *materialized*: repeated build keys, hashed composite keys, holistic aggregates (median, percentiles, distinct, top-k) or a row query: the matching (probe, build) pairs are counted
+- *materialized*: repeated build keys, hashed composite keys, or holistic aggregates (median, percentiles, distinct): the matching (probe, build) pairs are counted
   first, gathered into a Table, and the query runs over that. Past the memory budget (3 GiB of joined values) it raises a readable error (spill is deferred). `mx --join materialize` forces it.
 
 **The kernel** (`kernels_aot/hashjoin_cpu.mojo`; Mojo API and `libmxhashjoin_cpu.so` with a C ABI over a handle, `hashjoin_lib.mojo`): int64 keys and an optional `ok` byte array in, build rows

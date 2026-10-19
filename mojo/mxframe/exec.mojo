@@ -7,6 +7,7 @@ opens them, `_load_chunk` gives chunk i and the address of its mask, `_check_foo
 in `sqlexec.mojo` (dense, hashed and holistic aggregates) and `rows.mojo` (materialized rows, top-k); both finish through the
 generic helpers at the end of this file (`_order_rows`, `_top_rows`, `_to_table`), which work on columns of values (`ValCol`).
 """
+from .joincore import _fill_column_owned
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import Program, _ScanMask, _group_mask
@@ -409,22 +410,6 @@ def _put_column(mut t: Table, name: String, vc: ValCol, dicts: DictAccess) raise
         _fill_column(t.cols[c], codes, vc.nul)
     else:
         _fill_column(t.cols[c], vc.v, vc.nul)
-
-
-def _fill_column_owned(mut col: Column, var vals: List[Int64], var nul: List[UInt8]):
-    """`_fill_column` taking the values and the NULL bytes over instead of copying them."""
-    col.values = vals^
-    if len(nul) > 0:
-        var n = len(col.values)
-        col.validity = List[UInt8](length=(n + 7) // 8, fill=0xFF)
-        var nulls = 0
-        for i in range(n):
-            if nul[i] != 0:
-                col.validity[i // 8] &= ~(UInt8(1) << UInt8(i % 8))
-                nulls += 1
-        col.nulls = nulls
-        if nulls == 0:
-            col.validity = List[UInt8]()
 
 
 def _put_column_owned(mut t: Table, name: String, mut vc: ValCol, dicts: DictAccess) raises:

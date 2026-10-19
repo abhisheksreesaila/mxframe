@@ -88,3 +88,22 @@ def test_pairs_past_the_budget_are_refused_with_minus_32(lib):
                                ctypes.c_long(1000), ctypes.c_long(addr(out)))
     assert rc == -32 and out[0] == 10000
     lib.mx_hj_free(ctypes.c_long(h))
+
+
+def test_a_handle_that_is_not_a_map_is_refused_or_ignored_not_a_crash(lib):
+    lib.mx_hj_free(ctypes.c_long(0))                         # like free(NULL)
+    lib.mx_hj_free(ctypes.c_long(-31))
+    info = array("q", [0] * 4)
+    assert lib.mx_hj_info(ctypes.c_long(-31), ctypes.c_long(addr(info))) == -33
+    assert lib.mx_hj_info(ctypes.c_long(0), ctypes.c_long(addr(info))) == -33
+    k = array("q", [1])
+    out = array("q", [0, 0, 0])
+    assert lib.mx_hj_probe_pairs(ctypes.c_long(0), ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(1), ctypes.c_long(1),
+                                 ctypes.c_long(10), ctypes.c_long(addr(out))) == -33
+    o = array("i", [0])
+    assert lib.mx_hj_probe_unique(ctypes.c_long(-1), ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(1), ctypes.c_long(addr(o)),
+                                  ctypes.c_long(1)) == -33
+
+
+def test_a_build_of_2_pow_31_rows_is_refused_with_minus_31(lib):
+    assert lib.mx_hj_build(ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(1 << 31), ctypes.c_long(1)) == -31

@@ -633,6 +633,7 @@ struct _Binder(Movable):
             if _has_aggregate(self.st, self.st.join_on):
                 raise self.err(self.st.join_on, "aggregate functions are not allowed in ON")
             self.split_and(self.st.join_on, conj)
+        var n_on = len(conj)                                  # the first n_on conjuncts are the ON condition's
         if self.st.where >= 0:
             self.split_and(self.st.where, conj)
         # USING (k): the first table's k equals the second's
@@ -653,7 +654,8 @@ struct _Binder(Movable):
             self.q.jk_l_names.append(self.src_names[lc])
             self.q.jk_r_names.append(self.src_names[rc])
         var residual = List[Int]()
-        for c in conj:
+        for ci in range(len(conj)):
+            var c = conj[ci]
             ref x = self.st.exprs[c]
             if x.kind == X_BIN and x.text == "=" and self.st.exprs[x.a].kind == X_COL and self.st.exprs[x.b].kind == X_COL:
                 var ra = self.lookup(x.a)
@@ -667,7 +669,7 @@ struct _Binder(Movable):
                     self.q.jk_l_names.append(self.src_names[lc])
                     self.q.jk_r_names.append(self.src_names[rc])
                     continue
-            var e = self.boolean(self.value(c), c, "WHERE" if c >= 0 else "ON")
+            var e = self.boolean(self.value(c), c, "ON" if ci < n_on else "WHERE")
             var m = self.sides(e)
             if m == 1:
                 self.q.conj_l.append(e)
