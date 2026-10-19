@@ -2608,6 +2608,11 @@ struct ParquetScan(Copyable, Movable):
         self.ensure_words(c)
         return self._info[].dicts.text_of(c, code)
 
+    def words_address(self, c: Int) raises -> Int:
+        """The address of TEXT column `c`'s file-wide words (an array of `word_count(c)` Strings), for a reader that goes through them in parallel."""
+        self.ensure_words(c)
+        return Int(self._info[].dicts.dictionary(c).unsafe_ptr())
+
     def code_of(self, c: Int, word: String) raises -> Int:
         """The word's code, -1 when the file never holds it."""
         self.ensure_words(c)

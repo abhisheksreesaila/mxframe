@@ -62,6 +62,14 @@ def main() raises:
     renders("select \"My Col\" from \"T 1\" where d >= DATE '2024-01-31' /* c */ limit 1 offset 2", "My Col FROM T 1 WHERE d >= DATE '2024-01-31' LIMIT 1 OFFSET 2")
     renders("select t.a from t where t.a = -5 and b = - 2.50", "t.a FROM t WHERE (t.a = -5) AND (b = -2.50)")
 
+    renders("select case when a > 1 then 'x' when a < 0 then 'y' end, case a when 1 then 2 else 3 end from t", "CASE WHEN a > 1 THEN 'x' WHEN a < 0 THEN 'y' END, CASE a WHEN 1 THEN 2 ELSE 3 END FROM t")
+    renders("select cast(a as int), try_cast(b as decimal(10, 2)), c::double, d::varchar(20) from t", "CAST(a AS INTEGER), TRY_CAST(b AS DECIMAL(10,2)), CAST(c AS DOUBLE), CAST(d AS VARCHAR(20)) FROM t")
+    renders("select a from t where b like 'x%' and c not ilike 'y_' escape '!' and d is distinct from e and f is not distinct from 1 and g is true and h is not false",
+            "a FROM t WHERE (((((b LIKE 'x%') AND (c NOT ILIKE 'y_' ESCAPE '!')) AND (d IS DISTINCT FROM e)) AND (f IS NOT DISTINCT FROM 1)) AND (g IS TRUE)) AND (h IS NOT FALSE)")
+    renders("select 'a' || b || 'c', extract(year from d), date_part('dow', d), d + interval '3' month, d - interval 2 day, d + interval (n) year from t",
+            "('a' || b) || 'c', extract('year', d), date_part('dow', d), d + INTERVAL 3 MONTH, d - INTERVAL 2 DAY, d + INTERVAL n YEAR FROM t")
+    renders("select substring(s from 2 for 3), substr(s, 2), trim(s), coalesce(a, b, 0), nullif(a, 0) from t", "substring(s, 2, 3), substr(s, 2), trim(s), coalesce(a, b, 0), nullif(a, 0) FROM t")
+
     fails("", "SQL error at line 1, column 1: the statement is empty")
     fails("selct a from t", "SQL error at line 1, column 1: expected SELECT or EXPLAIN, found `selct` (did you mean SELECT?)")
     fails("select a form t", "SQL error at line 1, column 10: expected FROM, found `form` (did you mean FROM?)")
@@ -78,10 +86,12 @@ def main() raises:
     fails("select a, t.* + 1 from t", "SQL error at line 1, column 15: expected FROM, found `+`")
     fails("select a from (select 1) x", "SQL error at line 1, column 15: a subquery in FROM is not supported yet (F-159)")
     fails("with x as (select 1) select * from x", "SQL error at line 1, column 1: `WITH` (common table expressions) is not supported yet (F-159)")
-    fails("select case when a then 1 end from t", "SQL error at line 1, column 8: `CASE` is not supported yet (F-156)")
-    fails("select cast(a as int) from t", "SQL error at line 1, column 8: `CAST(...)` is not supported yet (F-156)")
-    fails("select a from t where b like 'x%'", "SQL error at line 1, column 25: `LIKE` is not supported yet (F-156)")
-    fails("select a::int from t", "SQL error at line 1, column 9: `::` (a cast) is not supported yet (F-156)")
+    fails("select a from t where b glob 'x*'", "SQL error at line 1, column 25: `GLOB` is not supported yet")
+    fails("select timestamp '2024-01-01 10:00:00' from t", "SQL error at line 1, column 8: `TIMESTAMP` literals is not supported yet (MX frame has no timestamp kind)")
+    fails("select a from t where b like 'x%' escape", "SQL error at line 1, column 41: expected an expression, found the end of the statement")
+    fails("select cast(a as hugeint) from t", "SQL error at line 1, column 18: the type `hugeint` in a cast (the casts are INTEGER, BIGINT, SMALLINT, TINYINT, DECIMAL(p, s), DOUBLE, REAL, VARCHAR, DATE and BOOLEAN) is not supported yet")
+    fails("select a + interval '3' hour from t", "SQL error at line 1, column 12: an interval in hours is not supported yet (MX frame has no timestamp kind: days, weeks, months and years only)")
+    fails("select case when a then 1 from t", "SQL error at line 1, column 27: expected END, found `from` (did you mean FROM?)")
     fails("select a from t where b in (select 1)", "SQL error at line 1, column 37: expected FROM, found `)`")
     renders("select 1e3, 2.5E-3, 7e+2 from t", "1e3, 2.5E-3, 7e+2 FROM t")                       # (F-157: a number with an exponent is a DOUBLE literal)
     fails("select 1e3x from t", "SQL error at line 1, column 8: the number `1e3` runs into the letters after it")

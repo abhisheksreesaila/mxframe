@@ -30,10 +30,14 @@ def runpath(path: Path) -> list:
     return out
 
 
-def test_all_seven_libraries_are_there():
-    assert [p.name for p in LIBS] == [
-        "libmxexec_cpu.so", "libmxgroupkeys_cpu.so", "libmxjoin_cpu.so", "libmxkernels_aot.so",
-        "libmxkernels_aot_gpu.so", "libmxpipeline_cpu.so", "libmxpipeline_gpu.so"]
+def test_every_registered_library_is_there():
+    """The list lives once, in scripts/record_build_hash.py (a new kernel library is registered there; a hand-kept
+    list here went stale when libmxhashjoin_cpu.so arrived)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rbh", KERNELS.parent / "scripts" / "record_build_hash.py")
+    rbh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rbh)
+    assert [p.name for p in LIBS] == sorted(rbh.LIBRARIES)
 
 
 @pytest.mark.parametrize("lib", LIBS, ids=lambda p: p.name)

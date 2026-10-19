@@ -174,7 +174,7 @@ def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: 
     else:
         rc = run.keyed(_rows_hook, 1, start, stop, threads)
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float))
+        raise Error(overflow_message(p.has_float, p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     _compact_rows(run, ids_r, cnt_r, val_r, nul_r, nblk, out)
@@ -521,7 +521,7 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
     else:
         rc = run.keyed(_topk_hook, 1, 0, t.rows(), threads)
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float))
+        raise Error(overflow_message(p.has_float, p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var out = RowChunk()
@@ -839,12 +839,12 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
     var built = build_items(q, plan.top_k > 0, through)
     var sp: SqlProgram
     try:
-        sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
+        sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, dicts.share(),
                         _alias_lists(src), inp.masked)
     except e:
         var msg = String(e)
-        if msg.startswith("the query is too big for one program"):
-            raise sql_error(q.line, q.col, msg + ": it computes too many different expressions (about 20 in the select list and ORDER BY); split it in two")
+        if msg.startswith("the query needs more than"):
+            raise sql_error(q.line, q.col, msg + " (it computes too many different expressions or too long ones: about 20 in the select list and ORDER BY); split it in two")
         if msg.startswith("the query has more than"):
             raise sql_error(q.line, q.col, msg + " (a program holds 64 different numbers); split the query in two")
         raise e^
@@ -856,6 +856,12 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
         notes.append("columns read: " + names + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
         notes.append("kernel: " + String(sp.instr) + " instructions a row, " + String(len(built[1])) + " computed " + ("value" if len(built[1]) == 1 else "values") +
                      ", " + String(len(built[0]) - len(built[1])) + " plain " + ("column" if len(built[0]) - len(built[1]) == 1 else "columns") + " gathered")
+        if sp.p.day_tabs > 0:
+            notes.append("dates: " + String(sp.p.day_tabs) + " per-day " + ("table" if sp.p.day_tabs == 1 else "tables") + " over " + String(sp.p.day_days) +
+                         " days (each date function of a column ran once per day of its range, never per row)")
+        if sp.p.text_tabs > 0:
+            notes.append("text: " + String(sp.p.text_tabs) + " per-word " + ("table" if sp.p.text_tabs == 1 else "tables") + " over " + String(sp.p.text_words) +
+                         " dictionary words in " + _ms(Float64(sp.p.text_ns) / 1e6) + " ms (each text function ran once per word, never per row)")
         notes.append("device: CPU (SQL runs on the CPU)")
     return RowStage(sp^, built[0].copy())
 

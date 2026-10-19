@@ -206,7 +206,6 @@ def test_explain_of_a_row_query_shows_the_logical_plan_and_the_decisions(mx, pro
 
 
 ROW_ERRORS = [
-    ("SELECT 'a' FROM t", "SQL error at line 1, column 8: a string constant in the select list is not supported yet"),
     ("SELECT NULL FROM t", "SQL error at line 1, column 8: a bare NULL in the select list cannot be typed"),
     ("SELECT id FROM t ORDER BY 3", "SQL error at line 1, column 27: ORDER BY 3 is out of range: the select list has 1 items"),
     ("SELECT DISTINCT s FROM t ORDER BY x", "SQL error at line 1, column 35: for SELECT DISTINCT, ORDER BY expressions must appear in the select list: `x` does not"),

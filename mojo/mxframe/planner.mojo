@@ -15,7 +15,9 @@ What it decides today: the group strategy.
 from .table import TEXT, BOOL, FLOAT
 from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
-                   B_NEG, B_RESCALE)
+                   B_NEG, B_RESCALE, B_CASE, B_COALESCE, B_DISTINCT, B_BOOLIS, B_CAST, B_TFN, B_CONCAT, B_STR,
+                   B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF)
+from .sqlfn import date_part, date_trunc_days, add_months, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_DECADE, DP_CENTURY, DP_MILLENNIUM
 
 comptime BUILD_AUTO = 0
 comptime BUILD_LEFT = 1
@@ -160,6 +162,33 @@ def expr_nullable(q: BoundQuery, e: Int, st: Stats) -> Bool:
         return st.cols[Int(x.value)].nullable
     if x.op == B_NULL:
         return True
+    # F-156: the expressions whose operands are not just `a` and `b`
+    if x.op == B_LIT or x.op == B_STR:
+        return False
+    if x.op == B_DISTINCT or x.op == B_BOOLIS:                     # never NULL: NULL is a value to them
+        return False
+    if x.op == B_CASE:                                             # the values (not the conditions): the THENs and the ELSE
+        var nw = Int(x.value)
+        for k in range(nw):
+            if expr_nullable(q, x.items[2 * k + 1], st):
+                return True
+        return expr_nullable(q, x.items[2 * nw], st)
+    if x.op == B_COALESCE:                                         # NULL only where every argument is
+        for it in x.items:
+            if not expr_nullable(q, it, st):
+                return False
+        return True
+    if x.op == B_CAST:                                             # a TRY_CAST can fail into NULL
+        return (Int(x.value) & 1) != 0 or expr_nullable(q, x.a, st)
+    if x.op == B_CONCAT and x.value != 0:                          # concat() reads NULL as ''
+        return False
+    if x.op == B_TFN or x.op == B_CONCAT or x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_ADDMONTHS or x.op == B_DATEDIFF:
+        var rr = expr_nullable(q, x.a, st)
+        if x.b >= 0:
+            rr = rr or expr_nullable(q, x.b, st)
+        return rr
+    if x.op >= 50 and x.op != B_CASE:                              # an operator this function does not know: it may be NULL
+        return True
     var r = False
     if x.op == B_IDIV or x.op == B_IMOD:                           # a division is NULL where the divisor is zero: not by a nonzero constant
         if not (q.rexprs[x.b].op == B_LIT and q.rexprs[x.b].value != 0):
@@ -204,6 +233,35 @@ def interval(q: BoundQuery, e: Int, st: Stats) -> Interval:
         if x.kind == BOOL.value:
             return Interval(True, 0, 1)
         return Interval(cs.has_range and _in_bound(cs.lo) and _in_bound(cs.hi), cs.lo, cs.hi)
+    if x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_ADDMONTHS:
+        # F-156: a date function of a column whose range is known stays in a range: the part of a date has a fixed one (month 1..12), a year, a truncated date or
+        # a date moved by a constant number of months grows with the date, so the ends of the range give the ends of the answer: GROUP BY EXTRACT(year ...) is dense
+        var da = interval(q, x.a, st)
+        if not da.ok or da.lo < -719162 or da.hi > 2932896:
+            return Interval(False)
+        var part = Int(x.value)
+        if x.op == B_DATEPART:
+            if part == DP_MONTH:
+                return Interval(True, 1, 12)
+            if part == DP_DAY:
+                return Interval(True, 1, 31)
+            if part == DP_DOW:
+                return Interval(True, 0, 6)
+            if part == DP_ISODOW:
+                return Interval(True, 1, 7)
+            if part == DP_QUARTER:
+                return Interval(True, 1, 4)
+            if part == DP_DOY:
+                return Interval(True, 1, 366)
+            if part == DP_YEAR or part == DP_DECADE or part == DP_CENTURY or part == DP_MILLENNIUM:
+                return Interval(True, Int64(date_part(Int(da.lo), part)), Int64(date_part(Int(da.hi), part)))
+            return Interval(False)
+        if x.op == B_DATETRUNC:
+            return Interval(True, Int64(date_trunc_days(Int(da.lo), part)), Int64(date_trunc_days(Int(da.hi), part)))
+        ref n = q.rexprs[x.b]
+        if n.op != B_LIT or n.value > 1000000 or n.value < -1000000:
+            return Interval(False)
+        return Interval(True, Int64(add_months(Int(da.lo), Int(n.value))), Int64(add_months(Int(da.hi), Int(n.value))))
     if x.op == B_NEG or x.op == B_RESCALE:
         var a = interval(q, x.a, st)
         if not a.ok:

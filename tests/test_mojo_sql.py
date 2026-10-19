@@ -530,12 +530,12 @@ ERRORS = [
     ("SELECT DISTINCT k, count(*) FROM t GROUP BY k", "SQL error at line 1, column 17: `SELECT DISTINCT` together with aggregates, GROUP BY or HAVING is not supported yet: use GROUP BY alone (it returns the same distinct rows), or DISTINCT without aggregates"),
     ("SELECT DISTINCT ON (k) k FROM t", "SQL error at line 1, column 8: `SELECT DISTINCT ON` is not supported yet"),
     ("SELECT z.* FROM t", "SQL error at line 1, column 8: unknown table or alias `z` in `z.*`"),
-    ("SELECT CASE WHEN x > 1 THEN 1 END, count(*) FROM t GROUP BY 1", "SQL error at line 1, column 8: `CASE` is not supported yet (F-156)"),
-    ("SELECT sum(x) FROM t WHERE s LIKE 'a%'", "SQL error at line 1, column 30: `LIKE` is not supported yet (F-156)"),
+    ("SELECT sum(x) FROM t WHERE s GLOB 'a*'", "SQL error at line 1, column 30: `GLOB` is not supported yet"),
+    ("SELECT sum(x) FROM t WHERE s SIMILAR TO 'a'", "SQL error at line 1, column 30: `SIMILAR` is not supported yet"),
     ("SELECT count(*) FROM t WHERE s IN (SELECT s, x FROM t)", "SQL error at line 1, column 44: a subquery with more than one column is not supported yet"),
     ("SELECT sum(x) OVER () FROM t", "SQL error at line 1, column 15: `OVER` (window functions) is not supported yet"),
     ("SELECT 1e3x, count(*) FROM t", "SQL error at line 1, column 8: the number `1e3` runs into the letters after it"),
-    ("SELECT stddev(x) FROM t", "SQL error at line 1, column 8: function `stddev` is not supported: SQL here has the aggregates sum, count, min, max, avg, median, quantile_disc; scalar functions arrive with F-156"),
+    ("SELECT stddev(x) FROM t", "SQL error at line 1, column 8: function `stddev` is not supported: SQL here has the aggregates sum, count, min, max, avg, median, quantile_disc and the scalar functions coalesce, ifnull, nvl, nullif, lower, upper, trim, ltrim, rtrim, substr, substring, length, starts_with, ends_with, contains, strpos, instr, left, right, reverse, replace, concat, extract, date_part, year, month, day, quarter, dayofweek, isodow, dayofyear, date_trunc, datediff, date_diff"),
     ("SELECT summ(x) FROM t", "SQL error at line 1, column 8: function `summ` is not supported (did you mean `sum`?)"),
     ("SELECT sum(x), k FROM t", "SQL error at line 1, column 16: column `k` must appear in the GROUP BY clause or be used in an aggregate function"),
     ("SELECT k, count(*) FROM t GROUP BY k HAVING x > 1", "SQL error at line 1, column 45: column `x` must appear in the GROUP BY clause or be used in an aggregate function"),
@@ -548,13 +548,10 @@ ERRORS = [
     ("SELECT count(*) FROM t WHERE x = 'a'", "SQL error at line 1, column 32: cannot compare INT with TEXT (`=`)"),
     ("SELECT count(*) FROM t WHERE s < d", "SQL error at line 1, column 32: cannot compare TEXT with DECIMAL(2) (`<`)"),
     ("SELECT count(*) FROM t WHERE b + 1 > 2", "SQL error at line 1, column 32: cannot apply `+` to BOOL and INT"),
-    ("SELECT sum(d // 2) FROM t", "SQL error at line 1, column 14: `//` on a DECIMAL gives a FLOAT in DuckDB (a floor of doubles), which MX frame does not do yet: use it on integers"),
     ("SELECT count(*) FROM t WHERE dt > '2020-13-45'", "SQL error at line 1, column 33: cannot read '2020-13-45' as a DATE: there is no month 13"),
     ("SELECT quantile_disc(x, 1.5) FROM t", "SQL error at line 1, column 25: the quantile must be between 0 and 1, found 1.5"),
     ("SELECT count(*) FROM t LIMIT x", "SQL error at line 1, column 30: LIMIT needs a whole number, found `x` (expressions are not supported there)"),
     ("SELECT count(*) FROM t GROUP BY 3", "SQL error at line 1, column 33: GROUP BY 3 is out of range: the select list has 1 items"),
-    ("SELECT count(*) FROM t WHERE x IN (" + ",".join(str(i) for i in range(41)) + ")",
-     "SQL error at line 1, column 32: an IN list of 41 numbers is not supported yet: the most is 40"),
 ]
 
 
@@ -721,8 +718,8 @@ def test_a_duplicate_output_name_gets_a_suffix(probe, data):
 def test_the_register_limit_is_an_sql_error(probe, data):
     aggs = ", ".join(f"sum(x + {i})" for i in range(40))
     res = run_probe(probe, f"SELECT k, {aggs} FROM t GROUP BY k", {"t": data["g8"].path}, expect_error=True)
-    assert res["error"] == ("SQL error at line 1, column 8: the query is too big for one program (more than 48 registers): it holds too many "
-                            "aggregates over different expressions (about 20); split the select list into two queries"), res
+    assert res["error"] == ("SQL error at line 1, column 8: the query needs more than 48 registers (the select list's aggregates and expressions are too many "
+                            "or too long for one program: about 20 aggregates over different expressions, fewer when an expression is long); split it into two queries"), res
 
 
 # ── files whose footer statistics lie ────────────────────────────────────────────────────────────────

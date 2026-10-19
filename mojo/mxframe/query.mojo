@@ -615,6 +615,12 @@ struct Program(Movable):
     var agg_float: List[Bool]        # per aggregate: its value is a float64 (sum, mean, min, max of a float expression)
     var nan_slot_of: List[Int]       # per float min / max: the slot counting the NaNs it left out (NaN is above every number), else -1
     var src_float: List[Bool]        # per holistic source: it reads float64 values (the hook turns them into order-preserving keys)
+    var conv: List[String]           # F-156: the casts that can fail (OP_FLAG): what the error says when one does
+    var text_tabs: Int               # F-156: the per-word tables the program carries (a text function answered once per dictionary word)
+    var text_words: Int              # ... and how many words they were evaluated on
+    var text_ns: Int                 # ... and how long that took
+    var day_tabs: Int                # F-156: the per-day tables (a date function of one column, answered once per day of the column's range)
+    var day_days: Int                # ... over how many days
 
     def __init__(out self, n_table_cols: Int):
         self.pred = List[Int32]()
@@ -648,6 +654,24 @@ struct Program(Movable):
         self.agg_float = List[Bool]()
         self.nan_slot_of = List[Int]()
         self.src_float = List[Bool]()
+        self.conv = List[String]()
+        self.text_tabs = 0
+        self.text_words = 0
+        self.text_ns = 0
+        self.day_tabs = 0
+        self.day_days = 0
+
+    def add_conv(mut self, why: String):
+        for c in self.conv:
+            if c == why:
+                return
+        if why.startswith(FOOTER_LIE):                              # a lying footer is reported as itself, first: the query then runs again without statistics
+            self.conv.insert(0, why)
+        else:
+            self.conv.append(why)
+
+    def conv_text(self) -> String:
+        return "; ".join(self.conv)
 
     def emit(mut self, op: Int, d: Int, a: Int = 0, b: Int = 0, c: Int = 0):
         var ins: List[Int32] = [Int32(op), Int32(d), Int32(a), Int32(b), Int32(c)]
@@ -1331,7 +1355,7 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: In
                             0, 1, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()), threads, p.repro)
     _ = code^, consts^, set_bytes^, set_meta^, tbl^, dtypes^      # the kernel read them: keep them past the call
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float))
+        raise Error(overflow_message(p.has_float, p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var r = _make_result(p, out_vals, out_cnt)
@@ -1603,14 +1627,20 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
 
 
 comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (about 9.2e18)"
+comptime FOOTER_LIE = "footer statistics wrong: "              # the prefix `run_sql` reads to run a query again without a file's statistics
 
 
-def overflow_message(has_float: Bool) -> String:
+def overflow_message(has_float: Bool, conv: String = "") -> String:
     """The kernel's overflow flag: an int64 total or result past its range, and, when the program holds float64 values, an integer past
-    2^53 meeting one (it is not exact as a double)."""
+    2^53 meeting one (it is not exact as a double); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
+    var base = OVERFLOW_MESSAGE
     if has_float:
-        return "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)"
-    return OVERFLOW_MESSAGE
+        base = "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)"
+    if conv.startswith(FOOTER_LIE):
+        return conv
+    if conv.byte_length() > 0:
+        return "a value could not be converted (" + conv + "), or: " + base
+    return base
 
 
 struct _QueryBuffers(Movable):

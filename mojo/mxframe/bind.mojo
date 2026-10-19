@@ -15,7 +15,12 @@ from .expr import N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLO
 from .csv import days_from_civil, _days_in_month, parse_float_text, F_OK, F_RANGE
 from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE,
                   X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE, SqlExpr, SelectItem,
-                  X_SUBIN, X_EXISTS, JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI, JK_ANTI_NA)
+                  X_SUBIN, X_EXISTS, JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI, JK_ANTI_NA,
+                  X_CASE, X_CAST, X_LIKE, X_DISTINCT, X_INTERVAL, X_ISBOOL)
+from .sqlfn import (TFn, CaseTables, parse_text, ascii_case, tf_kind, char_count, decimal_text, date_text, date_part, date_trunc_days, date_diff_days, add_months, part_code,
+                    DP_DAY, DP_EPOCH, TF_LOWER, TF_UPPER, TF_TRIM, TF_SUBSTR, TF_LENGTH, TF_STARTS, TF_ENDS, TF_CONTAINS, TF_LIKE, TF_STRPOS, TF_LEFT, TF_RIGHT,
+                    TF_REVERSE, TF_REPLACE)
+from .frame import _text_less
 
 comptime K_NULL = 6          # the type of a bare NULL literal
 
@@ -141,6 +146,19 @@ comptime B_ISNULL = 33
 comptime B_IN = 34           # a IN (items), the items literals; value 1: the list holds a NULL
 comptime B_AGG = 40          # value: the aggregate's number (after aggregation)
 comptime B_KEY = 41          # value: the group key's number (after aggregation)
+# F-156: expressions. A node whose value is TEXT and not a column or a literal belongs to a dictionary of its own: `src` = DERIVED_BASE + the node's number.
+comptime B_CASE = 50         # items: cond, then, cond, then, ..., else (an ELSE the query left out is a B_NULL); value: the number of WHENs
+comptime B_COALESCE = 51     # items: the arguments, all of the node's type
+comptime B_DISTINCT = 52     # a, b: two operands of one type; value 1: IS NOT DISTINCT FROM, 0: IS DISTINCT FROM (never NULL)
+comptime B_CAST = 53         # a: the operand; kind, scale: the target; value: 1 TRY_CAST | bits << 1 (the integer's width) | precision << 8
+comptime B_DATEPART = 54     # a: a DATE; value: the part (DP_*); INT
+comptime B_DATETRUNC = 55    # a: a DATE; value: the part; DATE
+comptime B_ADDMONTHS = 56    # a: a DATE; b: an INT number of months; DATE (the day clamps to the end of the month)
+comptime B_DATEDIFF = 57     # a, b: DATEs; value: the part; INT
+comptime B_BOOLIS = 58       # a: a BOOL; value 0: IS TRUE, 1: IS NOT TRUE, 2: IS FALSE, 3: IS NOT FALSE
+comptime B_TFN = 60          # a function of a TEXT value and constants (`items`: B_STR / B_LIT nodes): value = TF_* | flags << 8; its kind says what it answers
+comptime B_CONCAT = 61       # a || b over TEXT; value 1: concat() (a NULL reads as '')
+comptime DERIVED_BASE = 1 << 20      # a `src` from here on names the dictionary of node (src - DERIVED_BASE) of the pool it is in
 
 comptime C_LT = 20
 comptime C_LE = 21
@@ -502,8 +520,10 @@ struct _Binder(Movable):
     var jkind: Int                    # F-154: the kind of join
     var in_on: Bool                   # binding an ON condition (a semi / anti join's right table is visible there only)
     var inner_first: Bool             # the ON came from a subquery: a bare name means the subquery's table when it has the column
+    var cases: Optional[CaseTables]   # F-156: the case-mapping tables, built when a constant needs them
 
     def __init__(out self, var st: SqlStatement):
+        self.cases = None
         self.jkind = JK_INNER
         self.in_on = False
         self.inner_first = False
@@ -963,6 +983,21 @@ struct _Binder(Movable):
             return s + ")"
         if x.kind == X_STR:
             return "'" + x.text + "'"
+        if x.kind == X_CASE:
+            var s = "case(" + (self.canon(x.a) if x.a >= 0 else "")
+            for k in range(len(x.items)):
+                s += "," + self.canon(x.items[k])
+            return s + ";" + (self.canon(x.c) if x.c >= 0 else "") + ")"
+        if x.kind == X_CAST:
+            return ("trycast(" if x.flag else "cast(") + self.canon(x.a) + ":" + x.text + String(x.b) + "," + String(x.c) + ")"
+        if x.kind == X_LIKE:
+            return "like(" + x.text + ("not" if x.flag else "") + "," + self.canon(x.a) + "," + self.canon(x.b) + "," + (self.canon(x.c) if x.c >= 0 else "") + ")"
+        if x.kind == X_DISTINCT:
+            return "distinct" + ("not" if x.flag else "") + "(" + self.canon(x.a) + "," + self.canon(x.b) + ")"
+        if x.kind == X_INTERVAL:
+            return "interval(" + self.canon(x.a) + "," + x.text + ")"
+        if x.kind == X_ISBOOL:
+            return "isbool" + x.text + ("not" if x.flag else "") + "(" + self.canon(x.a) + ")"
         return x.text
 
     # -- a frame's formula column: its expression over stored columns, bound as the builder evaluates it
@@ -1030,7 +1065,7 @@ struct _Binder(Movable):
                 raise self.err(ast, "the number " + x.text + " is past the largest float64 (about 1.8e308)")
             return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(f.to_bits()), String(x.text), ast)
         if x.kind == X_STR:
-            return self.mk(B_STR, TEXT.value, 0, -1, -1, 0, String(x.text), ast)
+            return self.lit_str(String(x.text), ast)
         if x.kind == X_NULL:
             return self.mk(B_NULL, K_NULL, 0, -1, -1, 0, "", ast)
         if x.kind == X_TRUE or x.kind == X_FALSE:
@@ -1109,10 +1144,6 @@ struct _Binder(Movable):
         b = self.to_float(b, ast, real)
         return real
 
-    def text_node(mut self, e: Int) -> Bool:
-        var op = self.at(e).op
-        return op == B_COL or op == B_KEY or op == B_AGG
-
     def compare(mut self, code: Int, left: Int, right: Int, ast: Int) raises -> Int:
         var a = left
         var b = right
@@ -1132,15 +1163,17 @@ struct _Binder(Movable):
         if x.kind == TEXT.value or y.kind == TEXT.value:
             if x.kind != TEXT.value or y.kind != TEXT.value:
                 raise self.err(ast, "cannot compare " + kind_name(x.kind, x.scale) + " with " + kind_name(y.kind, y.scale) + " (`" + opname + "`)")
-            if x.op == B_STR and y.op == B_STR:
-                raise self.err(ast, "comparing two string literals is not supported (it is a constant)")
-            if x.op == B_STR:                                  # the column goes first: `'a' < c` is `c > 'a'`
+            if x.op == B_STR and y.op == B_STR:                # two constants: answered now (= and <> by bytes, the order ignoring case)
+                var l = x.text
+                var r = y.text
+                var res = (l == r) if code == C_EQ else (l != r) if code == C_NE else _text_less(l, r) if code == C_LT else _text_less(r, l) if code == C_GT else \
+                          (not _text_less(r, l)) if code == C_LE else (not _text_less(l, r))
+                return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if res else 0), "", ast)
+            if x.op == B_STR:                                  # the value goes first: `'a' < c` is `c > 'a'`
                 var t = a
                 a = b
                 b = t
                 op = C_GT if code == C_LT else C_GE if code == C_LE else C_LT if code == C_GT else C_LE if code == C_GE else code
-            if not self.text_node(a) or self.at(b).op != B_STR:
-                raise self.err(ast, "TEXT can only be compared with a string literal (a column, a group key or MIN / MAX of one on the other side)")
         elif _is_numeric(x.kind) and _is_numeric(y.kind):
             self.align(a, b, ast)
         elif (x.kind == FLOAT.value and _is_num(y.kind)) or (y.kind == FLOAT.value and _is_num(x.kind)):
@@ -1181,16 +1214,25 @@ struct _Binder(Movable):
             if real_div and self.in_post:
                 raise self.err(ast, "arithmetic on 32-bit floats after aggregation is not supported: DuckDB does it in 32 bits")
             return self.mk(B_DIV, FLOAT.value, F32_COLUMN if real_div else 0, a, b, 0, "", ast)
+        if op == "//" and (x.kind != INT.value or y.kind != INT.value):
+            # DuckDB: `//` of a float or a decimal is a division of doubles (not floored), and a zero divisor is NULL
+            var real_div = self.float_pair(a, b, ast)
+            if real_div:
+                raise self.err(ast, "`//` on a 32-bit float (REAL) is not supported: DuckDB does it in 32 bits")
+            var div = self.mk(B_DIV, FLOAT.value, 0, a, b, 0, "", ast)
+            var zero = self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(Float64(0.0).to_bits()), "", ast)
+            var is_zero = self.compare(C_EQ, b, zero, ast)
+            var conds: List[Int] = [is_zero]
+            var vals: List[Int] = [self.null_of(FLOAT.value, 0, ast)]
+            return self.make_case(conds, vals, div, ast)
         if x.kind == FLOAT.value or y.kind == FLOAT.value:
-            if op == "//" or op == "%":
-                raise self.err(ast, "`" + op + "` on a FLOAT value is not supported")
+            if op == "%":
+                raise self.err(ast, "`%` on a FLOAT value is not supported: the remainder of doubles is C's fmod, which the kernel's floored remainder does not give exactly")
             var real_op = self.float_pair(a, b, ast)
             if real_op and self.in_post:
                 raise self.err(ast, "arithmetic on 32-bit floats after aggregation is not supported: DuckDB does it in 32 bits")
             return self.mk(B_ADD if op == "+" else B_SUB if op == "-" else B_MUL, FLOAT.value, F32_COLUMN if real_op else 0, a, b, 0, "", ast)
         if op == "//":
-            if x.kind != INT.value or y.kind != INT.value:
-                raise self.err(ast, "`//` on a DECIMAL gives a FLOAT in DuckDB (a floor of doubles), which MX frame does not do yet: use it on integers")
             return self.mk(B_IDIV, INT.value, 0, a, b, 0, "", ast)
         if op == "*":
             var scale = x.scale + y.scale
@@ -1230,6 +1272,20 @@ struct _Binder(Movable):
         var xa = self.at(a)
         if xa.op == B_NULL:
             return self.mk(B_NULL, BOOL.value, 0, -1, -1, 0, "", ast)
+        if xa.op == B_STR:                                         # a constant against a list: answered now
+            var found = False
+            var unknown = False
+            for it in xi.items:
+                var lit = self.at(self.value(it))
+                if lit.op == B_NULL:
+                    unknown = True
+                elif lit.op == B_STR and lit.text == xa.text:
+                    found = True
+            if found:
+                return self.mk(B_LIT, BOOL.value, 0, -1, -1, 1, "", ast)
+            if unknown:
+                return self.mk(B_NULL, BOOL.value, 0, -1, -1, 0, "", ast)
+            return self.mk(B_LIT, BOOL.value, 0, -1, -1, 0, "", ast)
         var lits = List[Int]()
         var has_null = False
         var scale = xa.scale
@@ -1253,8 +1309,6 @@ struct _Binder(Movable):
             if xa.kind == TEXT.value:
                 if l.op != B_STR:
                     raise self.err(it, "cannot compare TEXT with " + kind_name(l.kind, l.scale) + " in an IN list")
-                if not self.text_node(a):
-                    raise self.err(ast, "TEXT can only be tested against a list when it is a plain column")
             elif xa.kind == FLOAT.value and _is_num(l.kind):
                 lit = self.to_float(lit, it, xa.scale == F32_COLUMN and not any_double)
             elif _is_numeric(xa.kind) and l.kind == FLOAT.value:
@@ -1266,8 +1320,6 @@ struct _Binder(Movable):
             else:
                 raise self.err(it, "cannot compare " + kind_name(xa.kind, xa.scale) + " with " + kind_name(l.kind, l.scale) + " in an IN list")
             lits.append(lit)
-        if xa.kind != TEXT.value and len(lits) > 40:
-            raise self.err(ast, "an IN list of " + String(len(lits)) + " numbers is not supported yet: the most is 40")
         if _is_numeric(xa.kind) and scale > xa.scale:
             a = self.rescale(a, scale, ast)
         if _is_numeric(xa.kind):
@@ -1279,6 +1331,640 @@ struct _Binder(Movable):
         else:
             self.q.rexprs[node].items = lits^
         return node
+
+    # ── F-156: expressions (CASE, COALESCE, CAST, text and date functions) ─────────────────────────────────
+
+    def set_items(mut self, e: Int, var items: List[Int]):
+        if self.in_post:
+            self.q.pexprs[e].items = items^
+        else:
+            self.q.rexprs[e].items = items^
+
+    def set_src(mut self, e: Int, src: Int):
+        if self.in_post:
+            self.q.pexprs[e].src = src
+        else:
+            self.q.rexprs[e].src = src
+
+    def retype(mut self, e: Int, kind: Int, scale: Int):
+        if self.in_post:
+            self.q.pexprs[e].kind = kind
+            self.q.pexprs[e].scale = scale
+        else:
+            self.q.rexprs[e].kind = kind
+            self.q.rexprs[e].scale = scale
+
+    def mk_text(mut self, op: Int, a: Int, b: Int, value: Int64, text: String, ast: Int) -> Int:
+        """A node whose value is a word of a dictionary of its own (a TEXT function's answer, a CASE over words): `src` says which."""
+        var e = self.mk(op, TEXT.value, 0, a, b, value, text, ast)
+        self.set_src(e, DERIVED_BASE + e)
+        return e
+
+    def lit_str(mut self, s: String, ast: Int) -> Int:
+        return self.mk_text(B_STR, -1, -1, 0, s, ast)
+
+    def lit_int(mut self, v: Int, ast: Int) -> Int:
+        return self.mk(B_LIT, INT.value, 0, -1, -1, Int64(v), String(v), ast)
+
+    def null_of(mut self, kind: Int, scale: Int, ast: Int) -> Int:
+        var e = self.mk(B_NULL, kind, scale, -1, -1, 0, "", ast)
+        if kind == TEXT.value:
+            self.set_src(e, DERIVED_BASE + e)
+        return e
+
+    def common_type(mut self, mut ids: List[Int], ast: Int, what: String) raises -> Tuple[Int, Int]:
+        """The type the values of a CASE or COALESCE share, as DuckDB gives it: a DECIMAL with the most decimal places, a FLOAT when one value is (an INT or DECIMAL
+        is converted: 32-bit when every float is REAL), a string next to DATEs is a date. Converts `ids` in place; a NULL takes the type. Returns (kind, scale)."""
+        var has_text = False
+        var has_float = False
+        var has_num = False
+        var has_date = False
+        var has_bool = False
+        var any_real = False
+        var any_double = False
+        var max_scale = 0
+        var any_value = False
+        var all_str = True
+        for id in ids:
+            var x = self.at(id)
+            if x.op == B_NULL:
+                continue
+            any_value = True
+            if x.kind == TEXT.value:
+                has_text = True
+                all_str = all_str and x.op == B_STR
+            elif x.kind == FLOAT.value:
+                has_float = True
+                if x.scale == F32_COLUMN:
+                    any_real = True
+                else:
+                    any_double = True
+            elif x.kind == INT.value or x.kind == DECIMAL.value:
+                has_num = True
+                max_scale = max(max_scale, x.scale)
+            elif x.kind == DATE.value:
+                has_date = True
+            elif x.kind == BOOL.value:
+                has_bool = True
+        if not any_value:
+            raise self.err(ast, what + ": every result is NULL, so its type cannot be known")
+        if has_text and has_date and all_str:                       # a string next to a date is that date
+            for k in range(len(ids)):
+                if self.at(ids[k]).op == B_STR:
+                    ids[k] = self.string_as_date(ids[k], ast)
+            has_text = False
+        var kinds = (1 if has_text else 0) + (1 if has_float or has_num else 0) + (1 if has_date else 0) + (1 if has_bool else 0)
+        if kinds > 1:
+            var names = List[String]()
+            for id in ids:
+                var x = self.at(id)
+                if x.op != B_NULL:
+                    var nm = kind_name(x.kind, x.scale)
+                    var seen = False
+                    for s in names:
+                        seen = seen or s == nm
+                    if not seen:
+                        names.append(nm)
+            raise self.err(ast, what + " mixes " + " and ".join(names) + ": cast them to one type")
+        if has_float:
+            var real = any_real and not any_double
+            for k in range(len(ids)):
+                var x = self.at(ids[k])
+                if x.op == B_NULL:
+                    self.retype(ids[k], FLOAT.value, F32_COLUMN if real else 0)
+                elif x.kind != FLOAT.value:
+                    ids[k] = self.to_float(ids[k], ast, real)
+            return (FLOAT.value, F32_COLUMN if real else 0)
+        if has_num:
+            for k in range(len(ids)):
+                var x = self.at(ids[k])
+                if x.op == B_NULL:
+                    self.retype(ids[k], DECIMAL.value if max_scale > 0 else INT.value, max_scale)
+                else:
+                    ids[k] = self.rescale(ids[k], max_scale, ast)
+            return (DECIMAL.value if max_scale > 0 else INT.value, max_scale)
+        var kind = TEXT.value if has_text else DATE.value if has_date else BOOL.value
+        for k in range(len(ids)):
+            if self.at(ids[k]).op == B_NULL:
+                self.retype(ids[k], kind, 0)
+                if kind == TEXT.value:
+                    self.set_src(ids[k], DERIVED_BASE + ids[k])
+        return (kind, 0)
+
+    def make_case(mut self, conds: List[Int], vals: List[Int], else_: Int, ast: Int) raises -> Int:
+        var all_vals = vals.copy()
+        all_vals.append(else_)
+        var t = self.common_type(all_vals, ast, "CASE")
+        var items = List[Int]()
+        for k in range(len(conds)):
+            items.append(conds[k])
+            items.append(all_vals[k])
+        items.append(all_vals[len(conds)])
+        var e: Int
+        if t[0] == TEXT.value:
+            e = self.mk_text(B_CASE, -1, -1, Int64(len(conds)), "", ast)
+        else:
+            e = self.mk(B_CASE, t[0], t[1], -1, -1, Int64(len(conds)), "", ast)
+        self.set_items(e, items^)
+        return e
+
+    def case_expr(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        var operand = -1
+        if x.a >= 0:
+            operand = self.value(x.a)
+        var conds = List[Int]()
+        var vals = List[Int]()
+        var k = 0
+        while k + 1 < len(x.items):
+            var w = self.value(x.items[k])
+            var cond: Int
+            if operand >= 0:
+                cond = self.compare(C_EQ, operand, w, x.items[k])
+            else:
+                cond = self.boolean(w, x.items[k], "CASE WHEN")
+            conds.append(cond)
+            vals.append(self.value(x.items[k + 1]))
+            k += 2
+        var else_ = self.value(x.c) if x.c >= 0 else self.null_of(K_NULL, 0, ast)
+        return self.make_case(conds, vals, else_, ast)
+
+    def coalesce_expr(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        if len(x.items) == 0:
+            raise self.err(ast, x.text.lower() + "() needs at least one argument")
+        var ids = List[Int]()
+        for it in x.items:
+            ids.append(self.value(it))
+        if len(ids) == 1:
+            return ids[0]
+        var t = self.common_type(ids, ast, x.text.lower() + "()")
+        var e: Int
+        if t[0] == TEXT.value:
+            e = self.mk_text(B_COALESCE, -1, -1, 0, "", ast)
+        else:
+            e = self.mk(B_COALESCE, t[0], t[1], -1, -1, 0, "", ast)
+        self.set_items(e, ids^)
+        return e
+
+    def nullif_expr(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        if len(x.items) != 2:
+            raise self.err(ast, "nullif() takes two arguments, found " + String(len(x.items)))
+        var a = self.value(x.items[0])
+        var b = self.value(x.items[1])
+        if self.at(a).op == B_NULL or self.at(b).op == B_NULL:
+            return a
+        var cond = self.compare(C_EQ, a, b, ast)
+        var xa = self.at(a)
+        var nul = self.null_of(xa.kind, xa.scale, ast)
+        var items: List[Int] = [cond, nul, a]
+        var e: Int
+        if xa.kind == TEXT.value:
+            e = self.mk_text(B_CASE, -1, -1, 1, "", ast)
+        else:
+            e = self.mk(B_CASE, xa.kind, xa.scale, -1, -1, 1, "", ast)
+        self.set_items(e, items^)
+        return e
+
+    def distinct_expr(mut self, ast: Int) raises -> Int:
+        """a IS [NOT] DISTINCT FROM b: a comparison that treats NULL as a value (never NULL itself)."""
+        var x = self.st.exprs[ast].copy()
+        var a = self.value(x.a)
+        var b = self.value(x.b)
+        var xa = self.at(a)
+        var xb = self.at(b)
+        if xa.op == B_NULL and xb.op == B_NULL:
+            return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if x.flag else 0), "", ast)
+        if xa.op == B_NULL or xb.op == B_NULL:                      # x IS DISTINCT FROM NULL is x IS NOT NULL
+            var other = b if xa.op == B_NULL else a
+            var n = self.mk(B_ISNULL, BOOL.value, 0, other, -1, 0, "", ast)
+            if x.flag:
+                return n
+            return self.mk(B_NOT, BOOL.value, 0, n, -1, 0, "", ast)
+        var cmp = self.compare(C_EQ, a, b, ast)
+        var c = self.at(cmp)
+        if c.op == B_LIT:                                           # two constants
+            var same = c.value != 0
+            return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if same == x.flag else 0), "", ast)
+        return self.mk(B_DISTINCT, BOOL.value, 0, c.a, c.b, Int64(1 if x.flag else 0), "", ast)
+
+    def isbool_expr(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        var a = self.boolean(self.value(x.a), x.a, "IS " + x.text)
+        if self.at(a).op == B_NULL:                                 # NULL IS TRUE is false, NULL IS NOT TRUE is true
+            var t = x.flag
+            return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if t else 0), "", ast)
+        var code = (0 if x.text == "TRUE" else 2) + (1 if x.flag else 0)
+        return self.mk(B_BOOLIS, BOOL.value, 0, a, -1, Int64(code), "", ast)
+
+    # -- CAST
+    def cast_expr(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        var a = self.value(x.a)
+        var ax = self.at(a)
+        var kind = INT.value
+        var scale = 0
+        var bits = 64
+        var prec = 18
+        var tname = x.text
+        if tname == "INTEGER":
+            bits = 32
+        elif tname == "SMALLINT":
+            bits = 16
+        elif tname == "TINYINT":
+            bits = 8
+        elif tname == "DECIMAL":
+            kind = DECIMAL.value
+            prec = x.b if x.b >= 0 else 18
+            scale = x.c if x.c >= 0 else (3 if x.b < 0 else 0)
+            if prec < 1 or prec > 18:
+                raise self.err(ast, "DECIMAL(" + String(prec) + ", " + String(scale) + "): MX frame stores a decimal in an int64, so the precision is 1 to 18")
+            if scale > prec:
+                raise self.err(ast, "DECIMAL(" + String(prec) + ", " + String(scale) + "): the scale is more than the precision")
+        elif tname == "DOUBLE":
+            kind = FLOAT.value
+        elif tname == "REAL":
+            kind = FLOAT.value
+            scale = F32_COLUMN
+        elif tname == "VARCHAR":
+            kind = TEXT.value
+        elif tname == "DATE":
+            kind = DATE.value
+        elif tname == "BOOLEAN":
+            kind = BOOL.value
+        if ax.op == B_NULL:
+            return self.null_of(kind, scale, ast)
+        if ax.op == B_STR and kind != TEXT.value:                    # a string constant is read now
+            var pr = parse_text(ax.text, kind, scale, bits, prec)
+            if pr.ok:
+                return self.mk(B_LIT, kind, scale, -1, -1, pr.value, "", ast)
+            if x.flag:
+                return self.null_of(kind, scale, ast)
+            raise self.err(ast, "cannot cast '" + ax.text + "' to " + tname + ((" (" + String(prec) + ", " + String(scale) + ")") if tname == "DECIMAL" else ""))
+        var fk = ax.kind
+        var ok = False
+        if fk == TEXT.value:
+            ok = True
+        elif fk == INT.value or fk == DECIMAL.value:
+            ok = kind == INT.value or kind == DECIMAL.value or kind == FLOAT.value or kind == BOOL.value or kind == TEXT.value
+        elif fk == FLOAT.value:
+            ok = kind == INT.value or kind == DECIMAL.value or kind == FLOAT.value or kind == BOOL.value
+        elif fk == DATE.value:
+            ok = kind == DATE.value or kind == TEXT.value
+        elif fk == BOOL.value:
+            ok = kind == BOOL.value or kind == INT.value or kind == DECIMAL.value or kind == FLOAT.value or kind == TEXT.value
+        if not ok:
+            raise self.err(ast, "cannot cast " + kind_name(fk, ax.scale) + " to " + tname + (" (DuckDB refuses it too)" if fk == DATE.value or kind == DATE.value else
+                           (": a float's text is its shortest form per row, which MX frame does not make" if fk == FLOAT.value and kind == TEXT.value else "")))
+        if kind == TEXT.value and fk != TEXT.value and fk != BOOL.value and ax.op != B_COL:
+            raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " needs a column, not an expression: MX frame writes the text of every value between the column's lowest and highest once, and knows that range for a column only")
+        if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value):      # the same type: nothing to do
+            return a
+        if fk == BOOL.value and kind == BOOL.value:
+            return a
+        if (fk == INT.value or fk == DECIMAL.value or fk == BOOL.value) and kind == FLOAT.value:
+            if fk == BOOL.value and ax.op != B_COL and ax.op != B_LIT:
+                pass
+            else:
+                return self.mk(B_I2F, FLOAT.value, scale, a, -1, Int64(ax.scale if fk != BOOL.value else 0), "", ast)
+        if fk == BOOL.value and ax.op != B_COL and ax.op != B_LIT:     # a condition as a number or text: CASE WHEN b THEN 1 WHEN NOT b THEN 0 END
+            var one: Int
+            var zero: Int
+            if kind == TEXT.value:
+                one = self.lit_str("true", ast)
+                zero = self.lit_str("false", ast)
+            elif kind == FLOAT.value:
+                one = self.mk(B_LIT, FLOAT.value, scale, -1, -1, Int64(Float64(1.0).to_bits()), "", ast)
+                zero = self.mk(B_LIT, FLOAT.value, scale, -1, -1, Int64(Float64(0.0).to_bits()), "", ast)
+            else:
+                var m = pow10_checked(scale)
+                one = self.mk(B_LIT, kind, scale, -1, -1, m, "", ast)
+                zero = self.mk(B_LIT, kind, scale, -1, -1, 0, "", ast)
+            var neg = self.mk(B_NOT, BOOL.value, 0, a, -1, 0, "", ast)
+            var conds: List[Int] = [a, neg]
+            var vals: List[Int] = [one, zero]
+            return self.make_case(conds, vals, self.null_of(kind, scale, ast), ast)
+        var value = (1 if x.flag else 0) | (bits << 1) | (prec << 8)
+        var text = self.st.render(ast)
+        if kind == TEXT.value:
+            return self.mk_text(B_CAST, a, -1, Int64(value), text, ast)
+        return self.mk(B_CAST, kind, scale, a, -1, Int64(value), text, ast)
+
+    # -- text
+    def const_text(mut self, arg: Int, what: String) raises -> String:
+        var x = self.at(self.value(arg))
+        if x.op != B_STR:
+            raise self.err(arg, what + " must be a string constant")
+        return x.text
+
+    def const_int(mut self, arg: Int, what: String) raises -> Int:
+        var x = self.at(self.value(arg))
+        if x.op != B_LIT or x.kind != INT.value:
+            raise self.err(arg, what + " must be a whole number constant")
+        return Int(x.value)
+
+    def text_operand(mut self, arg: Int, what: String) raises -> Int:
+        var e = self.value(arg)
+        var x = self.at(e)
+        if x.op != B_NULL and x.kind != TEXT.value:
+            raise self.err(arg, what + " needs TEXT, found " + kind_name(x.kind, x.scale) + " (CAST it AS VARCHAR first)")
+        return e
+
+    def fold_cases(mut self, s: String, up: Bool) raises -> String:
+        var ascii = True
+        for b in s.as_bytes():
+            if b >= UInt8(0x80):
+                ascii = False
+        if not ascii and not self.cases:
+            self.cases = CaseTables()
+        if ascii:
+            return ascii_case(s, up)
+        return self.cases.value().map(s, up)
+
+    def text_function(mut self, ast: Int, func: Int, flags: Int, lo: Int, hi: Int, name: String) raises -> Int:
+        """A function of one TEXT value and constants, evaluated once per word of the dictionary the value comes from (or at once when the value is a constant)."""
+        var x = self.st.exprs[ast].copy()
+        var n = len(x.items) - 1
+        if len(x.items) == 0 or n < lo or n > hi:
+            raise self.err(ast, name + "() takes " + (String(lo + 1) if lo == hi else String(lo + 1) + " or " + String(hi + 1)) + " argument" + ("s" if hi > 0 else "") + ", found " + String(len(x.items)))
+        var a = self.text_operand(x.items[0], name + "()")
+        var strs = List[String]()
+        var ints = List[Int]()
+        var has_len = False
+        var args = List[Int]()
+        for k in range(1, len(x.items)):
+            var ak = x.items[k]
+            var wants_int = func == TF_SUBSTR or func == TF_LEFT or func == TF_RIGHT
+            if wants_int:
+                var v = self.const_int(ak, "the argument " + String(k + 1) + " of " + name + "()")
+                ints.append(v)
+                args.append(self.lit_int(v, ak))
+            else:
+                var s = self.const_text(ak, "the argument " + String(k + 1) + " of " + name + "()")
+                strs.append(s)
+                args.append(self.lit_str(s, ak))
+        var ax = self.at(a)
+        var result_kind = tf_kind(func)
+        if ax.op == B_NULL:
+            return self.null_of(result_kind, 0, ast)
+        var t = TFn(func, flags, strs, ints)
+        if ax.op == B_STR:                                           # all constants: answered now
+            if result_kind == TEXT.value:
+                return self.lit_str(self.tf_text(t, ax.text), ast)
+            if result_kind == INT.value:
+                return self.lit_int(t.to_int(ax.text), ast)
+            return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if t.to_bool(ax.text) else 0), "", ast)
+        var e: Int
+        if result_kind == TEXT.value:
+            e = self.mk_text(B_TFN, a, -1, Int64(func | (flags << 8)), "", ast)
+        else:
+            e = self.mk(B_TFN, result_kind, 0, a, -1, Int64(func | (flags << 8)), "", ast)
+        self.set_items(e, args^)
+        return e
+
+    def tf_text(mut self, t: TFn, w: String) raises -> String:
+        if t.func == TF_LOWER or t.func == TF_UPPER:
+            return self.fold_cases(w, t.func == TF_UPPER)
+        return t.to_text(w)
+
+    def like_expr(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        var a = self.text_operand(x.a, x.text + "'s left side")
+        var pe = self.value(x.b)
+        var px = self.at(pe)
+        var esc = String()
+        var has_esc = False
+        if x.c >= 0:
+            esc = self.const_text(x.c, "the ESCAPE of " + x.text)
+            has_esc = esc.byte_length() > 0
+            if char_count(esc) > 1:
+                raise self.err(x.c, "the ESCAPE of " + x.text + " is one character, found '" + esc + "'")
+            if esc == "%" or esc == "_":
+                raise self.err(x.c, "the ESCAPE character cannot be % or _")
+        if px.op == B_NULL or self.at(a).op == B_NULL:
+            return self.null_of(BOOL.value, 0, ast)
+        if px.op != B_STR:
+            raise self.err(x.b, "the pattern of " + x.text + " must be a string constant")
+        var pattern = px.text
+        var ilike = x.text == "ILIKE"
+        if ilike:
+            pattern = self.fold_cases(pattern, False)
+            if has_esc:
+                esc = self.fold_cases(esc, False)
+        var strs = List[String]()
+        strs.append(pattern)
+        strs.append(esc if has_esc else "")
+        var t = TFn(TF_LIKE, (1 if ilike else 0) | (2 if has_esc else 0), strs, List[Int]())
+        var ax = self.at(a)
+        var node: Int
+        if ax.op == B_STR:
+            var w = self.fold_cases(ax.text, False) if ilike else ax.text
+            node = self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if t.to_bool(w) else 0), "", ast)
+        else:
+            node = self.mk(B_TFN, BOOL.value, 0, a, -1, Int64(TF_LIKE | (t.flags << 8)), "", ast)
+            var args = List[Int]()
+            args.append(self.lit_str(pattern, x.b))
+            args.append(self.lit_str(esc if has_esc else "", x.b))
+            self.set_items(node, args^)
+        if x.flag:
+            if self.at(node).op == B_LIT:
+                return self.mk(B_LIT, BOOL.value, 0, -1, -1, Int64(1 if self.at(node).value == 0 else 0), "", ast)
+            return self.mk(B_NOT, BOOL.value, 0, node, -1, 0, "", ast)
+        return node
+
+    def concat_operand(mut self, arg: Int, what: String) raises -> Int:
+        """A value of `||` / concat(): TEXT, or a constant number, date or boolean read as the text DuckDB would make of it."""
+        var e = self.value(arg)
+        var x = self.at(e)
+        if x.op == B_NULL or x.kind == TEXT.value:
+            return e
+        if x.op == B_LIT:
+            if x.kind == INT.value or x.kind == DECIMAL.value:
+                return self.lit_str(decimal_text(x.value, x.scale), arg)
+            if x.kind == DATE.value:
+                return self.lit_str(date_text(Int(x.value)), arg)
+            if x.kind == BOOL.value:
+                return self.lit_str("true" if x.value != 0 else "false", arg)
+        raise self.err(arg, what + " needs TEXT, found " + kind_name(x.kind, x.scale) + " (CAST it AS VARCHAR first)")
+
+    def concat_values(mut self, ids: List[Int], ast: Int, null_skips: Bool) raises -> Int:
+        """a || b || ...: NULL when a value is NULL; concat(a, b, ...) reads a NULL as the empty string."""
+        var acc = -1
+        for id in ids:
+            var x = self.at(id)
+            if x.op == B_NULL:
+                if null_skips:
+                    continue
+                return self.null_of(TEXT.value, 0, ast)
+            if acc < 0:
+                acc = id
+                continue
+            var xa = self.at(acc)
+            if xa.op == B_STR and x.op == B_STR:
+                acc = self.lit_str(xa.text + x.text, ast)
+            else:
+                acc = self.mk_text(B_CONCAT, acc, id, Int64(1 if null_skips else 0), "", ast)
+        if acc < 0:
+            return self.lit_str("", ast)
+        if null_skips and self.at(acc).op != B_STR:                  # concat() of one value: a NULL is ''
+            var only = acc
+            if self.at(only).op != B_CONCAT:
+                acc = self.mk_text(B_CONCAT, only, self.lit_str("", ast), Int64(1), "", ast)
+        return acc
+
+    # -- dates
+    def date_operand(mut self, arg: Int, what: String) raises -> Int:
+        var e = self.value(arg)
+        var x = self.at(e)
+        if x.op == B_STR:
+            return self.string_as_date(e, arg)
+        if x.op != B_NULL and x.kind != DATE.value:
+            raise self.err(arg, what + " needs a DATE, found " + kind_name(x.kind, x.scale))
+        return e
+
+    def part_arg(mut self, arg: Int, what: String, allowed: String) raises -> Int:
+        var name = lower_ascii(self.const_text(arg, "the date part of " + what))
+        var code = part_code(name)
+        if code < 0 or (" " + allowed + " ").find(" " + name + " ") < 0:
+            raise self.err(arg, "`" + name + "` is not a date part " + what + " takes (" + allowed.replace(" ", ", ") + ")")
+        return code
+
+    def date_part_expr(mut self, ast: Int, part: Int, date_arg: Int, what: String) raises -> Int:
+        var d = self.date_operand(date_arg, what)
+        var dx = self.at(d)
+        if dx.op == B_NULL:
+            return self.null_of(INT.value, 0, ast)
+        if part == DP_EPOCH:                                         # DuckDB's epoch is a DOUBLE
+            if dx.op == B_LIT:
+                return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(Float64(date_part(Int(dx.value), part)).to_bits()), "", ast)
+            return self.mk(B_DATEPART, FLOAT.value, 0, d, -1, Int64(part), "", ast)
+        if dx.op == B_LIT:
+            return self.lit_int(date_part(Int(dx.value), part), ast)
+        return self.mk(B_DATEPART, INT.value, 0, d, -1, Int64(part), "", ast)
+
+    def scalar_call(mut self, ast: Int) raises -> Int:
+        var x = self.st.exprs[ast].copy()
+        var name = x.text
+        var n = len(x.items)
+        if name == "COALESCE" or name == "IFNULL" or name == "NVL":
+            if name != "COALESCE" and n != 2:
+                raise self.err(ast, name.lower() + "() takes two arguments, found " + String(n))
+            return self.coalesce_expr(ast)
+        if name == "NULLIF":
+            return self.nullif_expr(ast)
+        if name == "LOWER" or name == "LCASE":
+            return self.text_function(ast, TF_LOWER, 0, 0, 0, "lower")
+        if name == "UPPER" or name == "UCASE":
+            return self.text_function(ast, TF_UPPER, 0, 0, 0, "upper")
+        if name == "TRIM":
+            return self.text_function(ast, TF_TRIM, 3, 0, 1, "trim")
+        if name == "LTRIM":
+            return self.text_function(ast, TF_TRIM, 1, 0, 1, "ltrim")
+        if name == "RTRIM":
+            return self.text_function(ast, TF_TRIM, 2, 0, 1, "rtrim")
+        if name == "SUBSTR" or name == "SUBSTRING":
+            return self.text_function(ast, TF_SUBSTR, 0, 1, 2, name.lower())
+        if name == "LENGTH" or name == "LEN" or name == "CHAR_LENGTH" or name == "CHARACTER_LENGTH":
+            return self.text_function(ast, TF_LENGTH, 0, 0, 0, name.lower())
+        if name == "STARTS_WITH" or name == "PREFIX":
+            return self.text_function(ast, TF_STARTS, 0, 1, 1, name.lower())
+        if name == "ENDS_WITH" or name == "SUFFIX":
+            return self.text_function(ast, TF_ENDS, 0, 1, 1, name.lower())
+        if name == "CONTAINS":
+            return self.text_function(ast, TF_CONTAINS, 0, 1, 1, "contains")
+        if name == "STRPOS" or name == "INSTR":
+            return self.text_function(ast, TF_STRPOS, 0, 1, 1, name.lower())
+        if name == "LEFT":
+            return self.text_function(ast, TF_LEFT, 0, 1, 1, "left")
+        if name == "RIGHT":
+            return self.text_function(ast, TF_RIGHT, 0, 1, 1, "right")
+        if name == "REVERSE":
+            return self.text_function(ast, TF_REVERSE, 0, 0, 0, "reverse")
+        if name == "REPLACE":
+            return self.text_function(ast, TF_REPLACE, 0, 2, 2, "replace")
+        if name == "CONCAT":
+            if n == 0:
+                raise self.err(ast, "concat() needs at least one argument")
+            var ids = List[Int]()
+            for it in x.items:
+                ids.append(self.concat_operand(it, "concat()"))
+            return self.concat_values(ids, ast, True)
+        if name == "EXTRACT" or name == "DATE_PART" or name == "DATEPART":
+            if n != 2:
+                raise self.err(ast, name.lower() + "() takes a part and a date, found " + String(n) + " argument" + ("" if n == 1 else "s"))
+            var part = self.part_arg(x.items[0], name.lower(), "year month day dow dayofweek isodow doy dayofyear quarter epoch decade century millennium")
+            return self.date_part_expr(ast, part, x.items[1], name.lower())
+        if name == "YEAR" or name == "MONTH" or name == "DAY" or name == "QUARTER" or name == "DAYOFWEEK" or name == "ISODOW" or name == "DAYOFYEAR" or name == "DECADE":
+            if n != 1:
+                raise self.err(ast, name.lower() + "() takes one date, found " + String(n) + " arguments")
+            return self.date_part_expr(ast, part_code(name.lower()), x.items[0], name.lower())
+        if name == "DATE_TRUNC" or name == "DATETRUNC":
+            if n != 2:
+                raise self.err(ast, "date_trunc() takes a part and a date, found " + String(n) + " argument" + ("" if n == 1 else "s"))
+            var part = self.part_arg(x.items[0], "date_trunc", "year quarter month week day decade century millennium")
+            var d = self.date_operand(x.items[1], "date_trunc()")
+            var dx = self.at(d)
+            if dx.op == B_NULL:
+                return self.null_of(DATE.value, 0, ast)
+            if dx.op == B_LIT:
+                return self.mk(B_LIT, DATE.value, 0, -1, -1, Int64(date_trunc_days(Int(dx.value), part)), "", ast)
+            if part == DP_DAY:
+                return d
+            return self.mk(B_DATETRUNC, DATE.value, 0, d, -1, Int64(part), "", ast)
+        if name == "DATEDIFF" or name == "DATE_DIFF":
+            if n != 3:
+                raise self.err(ast, name.lower() + "() takes a part and two dates, found " + String(n) + " arguments")
+            var part = self.part_arg(x.items[0], name.lower(), "year quarter month week day decade century millennium")
+            var a = self.date_operand(x.items[1], name.lower() + "()")
+            var b = self.date_operand(x.items[2], name.lower() + "()")
+            var ax = self.at(a)
+            var bx = self.at(b)
+            if ax.op == B_NULL or bx.op == B_NULL:
+                return self.null_of(INT.value, 0, ast)
+            if ax.op == B_LIT and bx.op == B_LIT:
+                return self.lit_int(date_diff_days(Int(ax.value), Int(bx.value), part), ast)
+            return self.mk(B_DATEDIFF, INT.value, 0, a, b, Int64(part), "", ast)
+        raise self.unknown_function(ast)
+
+    def date_interval(mut self, ast: Int) raises -> Int:
+        """`date + INTERVAL n unit` and `date - INTERVAL n unit` (and `INTERVAL n unit + date`): days and weeks add to the day number; months and years move
+        the month and clamp the day to the end of the target month, as DuckDB does (DuckDB's result is a TIMESTAMP at midnight; here it is the DATE)."""
+        var x = self.st.exprs[ast].copy()
+        var iv_ast = x.b if self.st.exprs[x.b].kind == X_INTERVAL else x.a
+        var d_ast = x.a if iv_ast == x.b else x.b
+        if iv_ast == x.a and x.text == "-":
+            raise self.err(ast, "an interval cannot be subtracted from: write date - INTERVAL ...")
+        if self.st.exprs[d_ast].kind == X_INTERVAL:
+            raise self.err(ast, "two intervals cannot be added: add them to a date one after the other")
+        var iv = self.st.exprs[iv_ast].copy()
+        var d = self.date_operand(d_ast, "an interval's date")
+        var dx = self.at(d)
+        var amount = self.value(iv.a)
+        var ax = self.at(amount)
+        if ax.op != B_NULL and ax.kind != INT.value:
+            raise self.err(iv.a, "the amount of an INTERVAL is a whole number, found " + kind_name(ax.kind, ax.scale))
+        if dx.op == B_NULL or ax.op == B_NULL:
+            return self.null_of(DATE.value, 0, ast)
+        var neg = x.text == "-"
+        var unit = iv.text
+        if unit == "DAY" or unit == "WEEK":
+            if unit == "WEEK":
+                amount = self.arith("*", amount, self.lit_int(7, iv.a), iv.a)
+                ax = self.at(amount)
+            if dx.op == B_LIT and ax.op == B_LIT:
+                var days = Int(dx.value) + (-1 if neg else 1) * Int(ax.value)
+                return self.mk(B_LIT, DATE.value, 0, -1, -1, Int64(days), "", ast)
+            return self.mk(B_SUB if neg else B_ADD, DATE.value, 0, d, amount, 0, "", ast)
+        if unit == "YEAR":
+            amount = self.arith("*", amount, self.lit_int(12, iv.a), iv.a)
+            ax = self.at(amount)
+        if neg:
+            amount = self.mk(B_NEG, INT.value, 0, amount, -1, 0, "", ast) if ax.op != B_LIT else self.lit_int(-Int(ax.value), ast)
+            ax = self.at(amount)
+        if dx.op == B_LIT and ax.op == B_LIT:
+            return self.mk(B_LIT, DATE.value, 0, -1, -1, Int64(add_months(Int(dx.value), Int(ax.value))), "", ast)
+        return self.mk(B_ADDMONTHS, DATE.value, 0, d, amount, 0, "", ast)
 
     def value(mut self, ast: Int) raises -> Int:
         var x = self.st.exprs[ast].copy()
@@ -1326,8 +2012,27 @@ struct _Binder(Movable):
                     raise self.err(ast, "the number passes the int64 range")
                 return self.mk(B_LIT, xa.kind, xa.scale, -1, -1, -xa.value, "", ast)
             return self.mk(B_NEG, xa.kind, xa.scale, a, -1, 0, "", ast)
+        if kind == X_CASE:
+            return self.case_expr(ast)
+        if kind == X_CAST:
+            return self.cast_expr(ast)
+        if kind == X_LIKE:
+            return self.like_expr(ast)
+        if kind == X_DISTINCT:
+            return self.distinct_expr(ast)
+        if kind == X_ISBOOL:
+            return self.isbool_expr(ast)
+        if kind == X_INTERVAL:
+            raise self.err(ast, "an INTERVAL can only be added to or subtracted from a DATE (date + INTERVAL 3 MONTH)")
         if kind == X_BIN:
             var op = x.text
+            if (op == "+" or op == "-") and (self.st.exprs[x.a].kind == X_INTERVAL or self.st.exprs[x.b].kind == X_INTERVAL):
+                return self.date_interval(ast)
+            if op == "||":
+                var parts = List[Int]()
+                parts.append(self.concat_operand(x.a, "`||`"))
+                parts.append(self.concat_operand(x.b, "`||`"))
+                return self.concat_values(parts, ast, False)
             if op == "AND" or op == "OR":
                 var l = self.boolean(self.value(x.a), x.a, "`" + op + "`")
                 var r = self.boolean(self.value(x.b), x.b, "`" + op + "`")
@@ -1369,7 +2074,7 @@ struct _Binder(Movable):
             return n
         # a function call
         if not _is_aggregate_name(x.text):
-            raise self.unknown_function(ast)
+            return self.scalar_call(ast)
         if not self.in_post:
             raise self.err(ast, "aggregate function " + x.text.lower() + "() is not allowed here: aggregates belong in the select list, HAVING and ORDER BY")
         return self.aggregate(ast)
@@ -1377,11 +2082,13 @@ struct _Binder(Movable):
     def unknown_function(self, ast: Int) -> Error:
         var name = self.st.exprs[ast].text
         var names = _aggregate_names()
+        for sn in _scalar_names():
+            names.append(sn)
         var hint = closest(name, names)
         if hint.byte_length() > 0:
             return self.err(ast, "function `" + name.lower() + "` is not supported (did you mean `" + hint + "`?)")
-        return self.err(ast, "function `" + name.lower() + "` is not supported: SQL here has the aggregates " + ", ".join(names) +
-                        "; scalar functions arrive with F-156")
+        return self.err(ast, "function `" + name.lower() + "` is not supported: SQL here has the aggregates " + ", ".join(_aggregate_names()) +
+                        " and the scalar functions " + ", ".join(_scalar_names()))
 
     def aggregate(mut self, ast: Int) raises -> Int:
         var x = self.st.exprs[ast].copy()
@@ -1446,8 +2153,8 @@ struct _Binder(Movable):
             if a.kind == BOOL.value and a.op != B_COL and a.op != B_LIT:
                 raise self.err(x.items[0], name.lower() + "() needs a value, found a comparison")
             if func == F_COUNT or func == F_COUNT_DISTINCT:
-                if a.kind == TEXT.value and a.op != B_COL:
-                    raise self.err(x.items[0], name.lower() + "() of TEXT needs the column itself")
+                if a.kind == TEXT.value and a.op == B_STR and func == F_COUNT_DISTINCT:
+                    raise self.err(x.items[0], name.lower() + "() of a constant word is not supported")
             elif func == F_SUM:
                 if a.kind == BOOL.value:                              # DuckDB sums a BOOLEAN as 0 / 1
                     rkind = INT.value
@@ -1464,11 +2171,11 @@ struct _Binder(Movable):
                 rkind = a.kind
                 rscale = a.scale
                 src = a.src
-                if a.kind == TEXT.value and a.op != B_COL:
-                    raise self.err(x.items[0], name.lower() + "() of TEXT needs the column itself")
+                if a.kind == TEXT.value and a.op == B_STR:
+                    raise self.err(x.items[0], name.lower() + "() of a constant word is not supported")
             elif func == F_MEDIAN and a.kind == TEXT.value:             # words have no mean: the lower middle word, in the text order, as DuckDB
-                if a.op != B_COL:
-                    raise self.err(x.items[0], "median() of TEXT needs the column itself")
+                if a.op == B_STR:
+                    raise self.err(x.items[0], "median() of a constant word is not supported")
                 rkind = TEXT.value
                 src = a.src
             elif func == F_MEDIAN and a.kind == DATE.value:
@@ -1521,6 +2228,21 @@ def _aggregate_names() -> List[String]:
     return ["sum", "count", "min", "max", "avg", "median", "quantile_disc"]
 
 
+def _scalar_names() -> List[String]:
+    return ["coalesce", "ifnull", "nvl", "nullif", "lower", "upper", "trim", "ltrim", "rtrim", "substr", "substring", "length", "starts_with", "ends_with", "contains",
+            "strpos", "instr", "left", "right", "reverse", "replace", "concat", "extract", "date_part", "year", "month", "day", "quarter", "dayofweek", "isodow",
+            "dayofyear", "date_trunc", "datediff", "date_diff"]
+
+
+def _is_scalar_name(up: String) -> Bool:
+    var low = up.lower()
+    for n in _scalar_names():
+        if n == low:
+            return True
+    return up == "LCASE" or up == "UCASE" or up == "LEN" or up == "CHAR_LENGTH" or up == "CHARACTER_LENGTH" or up == "PREFIX" or up == "SUFFIX" or \
+           up == "DATEPART" or up == "DATETRUNC" or up == "DECADE"
+
+
 def _is_aggregate_name(up: String) -> Bool:
     return up == "SUM" or up == "COUNT" or up == "MIN" or up == "MAX" or up == "AVG" or up == "MEAN" or up == "MEDIAN" or up == "QUANTILE_DISC"
 
@@ -1529,11 +2251,14 @@ def _has_aggregate(st: SqlStatement, e: Int) -> Bool:
     ref x = st.exprs[e]
     if x.kind == X_CALL and _is_aggregate_name(x.text):
         return True
-    if x.kind == X_CALL or x.kind == X_IN:
+    if x.kind == X_CALL or x.kind == X_IN or x.kind == X_CASE:
         for it in x.items:
             if _has_aggregate(st, it):
                 return True
-    if x.kind == X_IN or x.kind == X_BIN or x.kind == X_NEG or x.kind == X_NOT or x.kind == X_ISNULL or x.kind == X_BETWEEN:
+    if x.kind == X_CAST:                                               # (its b and c are the precision and scale)
+        return _has_aggregate(st, x.a)
+    if x.kind == X_IN or x.kind == X_BIN or x.kind == X_NEG or x.kind == X_NOT or x.kind == X_ISNULL or x.kind == X_BETWEEN or x.kind == X_CASE or \
+       x.kind == X_LIKE or x.kind == X_DISTINCT or x.kind == X_INTERVAL or x.kind == X_ISBOOL:
         if x.a >= 0 and _has_aggregate(st, x.a):
             return True
         if x.b >= 0 and _has_aggregate(st, x.b):
@@ -1752,7 +2477,7 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     b.q.limit = b.st.limit
     b.q.offset = b.st.offset
     for i in range(len(b.st.exprs)):                    # an unknown function is reported as that, before anything else
-        if b.st.exprs[i].kind == X_CALL and not _is_aggregate_name(b.st.exprs[i].text):
+        if b.st.exprs[i].kind == X_CALL and not _is_aggregate_name(b.st.exprs[i].text) and not _is_scalar_name(b.st.exprs[i].text):
             raise b.unknown_function(i)
     # F-152: `*` and `t.*` become the source's columns (a frame's formula columns too)
     var items = List[SelectItem]()
@@ -1872,8 +2597,6 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         var pe = b.q.pexprs[e].copy()
         if pe.op == B_NULL and pe.kind == K_NULL:
             raise b.err(it.expr, "a bare NULL in the select list cannot be typed")
-        if pe.op == B_STR:
-            raise b.err(it.expr, "a string constant in the select list is not supported yet")
         b.q.outputs.append(e)
         var nm: String
         if it.has_alias:
@@ -1924,8 +2647,6 @@ def bind_rows(var b: _Binder) raises -> BoundQuery:
         var x = b.q.rexprs[e].copy()
         if x.op == B_NULL and x.kind == K_NULL:
             raise b.err(it.expr, "a bare NULL in the select list cannot be typed")
-        if x.op == B_STR:
-            raise b.err(it.expr, "a string constant in the select list is not supported yet")
         b.q.routs.append(e)
         var nm: String
         if it.has_alias:

@@ -13,7 +13,7 @@ from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import Program, _ScanMask, _group_mask
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP
-from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL
+from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_NEG, B_ADD, B_SUB
 from .planner import Stats, ColStat
 from .sqlprog import DictAccess, collect_columns
 from .sqleval import ValCol
@@ -111,6 +111,18 @@ def _key_columns(q: BoundQuery, e: Int, mut out: List[Int]):
         _key_columns(q, x.b, out)
 
 
+def _date_leaves(q: BoundQuery, e: Int, mut out: List[Int]):
+    """The DATE columns a date function's operands read through date functions, + and - (a per-day table is made for them: `sqlprog._Emitter.day_table`)."""
+    ref x = q.rexprs[e]
+    if x.op == B_COL and x.kind == DATE.value:
+        out.append(Int(x.value))
+    elif x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_NEG:
+        _date_leaves(q, x.a, out)
+    elif x.op == B_ADDMONTHS or x.op == B_DATEDIFF or x.op == B_ADD or x.op == B_SUB:
+        _date_leaves(q, x.a, out)
+        _date_leaves(q, x.b, out)
+
+
 def prepare_ranges(mut catalog: Catalog, q: BoundQuery) raises:
     """Caches the value range of each integer-like column a group key reads: one pass over a table or frame's column (the frame's
     changed rows included), the row groups' statistics for a scan (none when a row group states none, then it is hashed)."""
@@ -118,6 +130,27 @@ def prepare_ranges(mut catalog: Catalog, q: BoundQuery) raises:
     var cols = List[Int]()
     for k in q.keys:
         _key_columns(q, k.expr, cols)
+    for x in q.rexprs:                                     # F-156: a CAST of a column to text writes the words of its range; a date function of a column answers once per day of it
+        var cc = -1
+        if x.op == B_CAST and x.kind == TEXT.value and q.rexprs[x.a].op == B_COL and _is_range_kind(q.rexprs[x.a].kind):
+            cc = Int(q.rexprs[x.a].value)
+        elif x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_ADDMONTHS or x.op == B_DATEDIFF:
+            var leaves = List[Int]()
+            _date_leaves(q, x.a, leaves)
+            if x.b >= 0:
+                _date_leaves(q, x.b, leaves)
+            for lc in leaves:
+                var seen_leaf = False
+                for k in cols:
+                    seen_leaf = seen_leaf or k == lc
+                if not seen_leaf:
+                    cols.append(lc)
+        if cc >= 0:
+            var seen = False
+            for k in cols:
+                seen = seen or k == cc
+            if not seen:
+                cols.append(cc)
     for c in cols:
         var cached = False
         for x in src.range_cols:

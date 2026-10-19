@@ -55,7 +55,7 @@ query compares, groups or counts them.
 | **Parquet** | DOUBLE is read as it is, FLOAT (32-bit) is widened to float64 exactly (its column has `scale == F32_COLUMN` (32), see "a 32-bit column" below); PLAIN, dictionary and BYTE_STREAM_SPLIT pages (BYTE_STREAM_SPLIT is read on INT32, INT64 and fixed-length DECIMAL columns too). Written as DOUBLE (PLAIN, no statistics): every bit survives a round trip. A float column's footer min / max are never read (`ParquetScan.column_range` says "unknown" for a FLOAT), so NaN in a footer cannot reach the planner's dense-group logic; null counts are used as for any column. |
 | **CSV** | A column is FLOAT when its first `infer_rows` rows show a number with an exponent (`1e5`, `2.5E-3`), `nan` / `inf` / `-inf` / `infinity` (any case) beside numbers, **more than 4 decimal places** (trailing zeros do not count), or a number too wide for int64 at its scale (DuckDB reads those as DOUBLE too); or when named in `CsvOptions(float_columns=[...])`. Up to 4 places stays an exact DECIMAL (scale 2, or 4). Five or more places are a float by default because an exact DECIMAL(6) has no wider integer behind it: `sum(rate * qty)` over a six-place rate would raise "passed the int64 range" where DuckDB answers. The exact path is an opt-in, `CsvOptions(decimal_columns=[...])`: the named columns are an exact DECIMAL at the scale their first rows need (2, 4, or their number of places, up to 18); every value of the first rows is checked to fit int64 at it and the read raises, naming the column, when one is not a plain number or does not fit (a later value that does not fit is a failed cell); arithmetic on such a column still raises "passed the int64 range" when a total does, and `rounded` counts values with more places than the scale. The value of a FLOAT cell is the correctly rounded float64 (an exact fast path, `strtod_l` in the C locale for the rest, whatever locale the host set); every NaN is the one positive quiet NaN; a cell that is not a number, or is past 1.8e308, is a failed cell (null). Past the window an exponent in an INT or DECIMAL column is a failed cell. |
 | **Comparisons** | DuckDB's order: NaN equals itself and is above every number (+inf included); -0.0 equals 0.0; NULL is unknown (SQL) or false (builder). |
-| **Arithmetic** | INT and DECIMAL next to a FLOAT become float64 as DuckDB casts them: `float(v) / 10^scale` (an integer past 2^53 raises: it is not exact as a double). `+ - *` and `/` (always a division of doubles, IEEE: `x / 0` is inf, -inf or NaN); `//` and `%` on a FLOAT are not supported. A literal with an exponent is a DOUBLE; a decimal literal next to a FLOAT is read as `float(v) / 10^scale`. |
+| **Arithmetic** | INT and DECIMAL next to a FLOAT become float64 as DuckDB casts them: `float(v) / 10^scale` (an integer past 2^53 raises: it is not exact as a double). `+ - *` and `/` (always a division of doubles, IEEE: `x / 0` is inf, -inf or NaN); `%` on a FLOAT is not supported (`//` is a division with NULL for a zero divisor, F-156). A literal with an exponent is a DOUBLE; a decimal literal next to a FLOAT is read as `float(v) / 10^scale`. |
 | **SUM / AVG** | float64 in a defined order, the kernel's reproducible mode (F-064): within one run, each 65,536-row morsel adds its rows in order and the morsels' totals are added in order, so the bits do **not** depend on the number of threads (`Query.threads(n)`, `PlannerOptions.threads`), the morsel setting or the block size (tested). They do depend on the **plan and the source layout**, because those change which additions happen in which order: (1) dense and hashed groups give different last bits for the same query (a dense run keeps up to 4 partial sums per group below 1,025 groups, a hashed run one per morsel: `PlannerOptions.group` forces one); (2) a table read whole is one run over its rows, whereas a Parquet scan is one run per row group folded in file order (morsels restart at each group's first row), so `read_parquet` + a query and `scan_parquet` + the same query can differ in the last bits (the exact integers, counts, min, max and medians never do); (3) a Frame is its shared rows, then the changed rows added one by one; (4) the SIMD width of the machine sets the lanes of a global sum, so two machines may differ. The same query on the same data, plan and machine gives the same bits every run. A scan with a float sum always runs row group by row group, never by row-range morsels (those are cut by the number of cores). The tests compare with DuckDB to 1e-12 relative. AVG is the float sum over the count. |
 | **MIN / MAX** | NaN is the largest value: MAX is NaN when the group holds one, MIN is NaN only when it holds nothing else (a hidden count of the NaNs, so the kernel never compares one). |
 | **Group keys** | SQL only (the builder's key is a dense integer): hashed, never dense. -0.0 and 0.0 are one group, every NaN is one group (reported as the canonical NaN), NULL is its own group; ORDER BY puts NaN after +inf and NULLs last. `PlannerOptions(group=GROUP_DENSE)` on a FLOAT key raises and says why. |
@@ -255,8 +255,8 @@ var h = sql(cat, "SELECT ...", o)
 | Part | Supported |
 |---|---|
 | Statement | `[EXPLAIN] SELECT ... FROM table [AS alias]` (table names and columns match without regard to case; `;` and `--` / `/* */` comments allowed) |
-| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number or date constant; with no aggregate and no `GROUP BY` the query returns rows (below): `*`, `t.*`, columns and expressions; `SELECT DISTINCT` |
-| `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` (numbers: up to 40; text: any number), `IS [NOT] NULL`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
+| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number, date or string constant; `CASE`, `COALESCE`, `CAST`, text and date functions (see Expressions below); with no aggregate and no `GROUP BY` the query returns rows (below): `*`, `t.*`, columns and expressions; `SELECT DISTINCT` |
+| `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` of any length, `LIKE` / `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
 | `GROUP BY` | columns, expressions, ordinals (`GROUP BY 1`), select aliases; none at all (one group) |
 | `HAVING`, `ORDER BY` | aggregates and group keys in any expression (a row query: any column or expression, selected or not, several keys); `ORDER BY` keys, aggregates, aliases, ordinals; `ASC` / `DESC`; `NULLS FIRST` / `LAST` (NULLS LAST by default, also for `DESC`, as DuckDB); `LIMIT n [OFFSET m]` |
 | Aggregates | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `MIN`, `MAX` (also of TEXT), `AVG`, `MEDIAN`, `QUANTILE_DISC(x, p)` |
@@ -270,7 +270,7 @@ Text order everywhere (`ORDER BY`, `MIN` / `MAX`, `QUANTILE_DISC`, `<` and `BETW
 
 **Differences from DuckDB, on purpose**: a `SUM` (or any int64 arithmetic) past int64 raises `a sum or an expression passed the int64 range (about 9.2e18)` where DuckDB
 widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP, a kind MX frame does not have; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
-`//` and `%` on a FLOAT, and `//` on a DECIMAL (a floor of doubles in DuckDB), raise; the text order above; FLOAT64 in SQL follows the section below.
+`%` on a FLOAT raises (F-156: `//` of a DECIMAL or FLOAT is DuckDB's, a division with NULL for a zero divisor); the text order above; FLOAT64 in SQL follows the section below.
 
 **How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), turned into a
 logical plan (`plan.mojo`: Scan, Filter, Aggregate, Filter (HAVING), Project, Sort, Limit, with the rewrites that look at its shape), planned from statistics only (`planner.mojo`: the `Planner`
@@ -301,8 +301,8 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 **A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
 `x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
 
-**Limits**: joins: inner, left, semi, anti over two tables, inner over three or more (see 8b); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
-at most 48 registers (about 20 aggregates over different expressions) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
+**Limits**: joins: inner, left, semi, anti over two tables, inner over three or more (see 8b); `DISTINCT` only without aggregates; expressions as in "Expressions (F-156)"; CPU only;
+at most 48 registers (about 20 aggregates over different expressions, fewer when an expression is long: `the query needs more than 48 registers`) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
 Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
 `sql()` on a table already in memory, best of 3 in one process, which includes planning and, the first time, the pass that finds a key's range; DuckDB 1.5.1 on a table it loaded, best of 3, its result
@@ -324,11 +324,72 @@ fetched into Python; neither is a quiet-machine benchmark). Every result was che
 The same queries over the Parquet file (one chunk per row group) are decode-bound: 80 to 110 ms to decode the three columns of 50 row groups, plus the kernel. A scan with very many groups merges a
 partial result per row group (a dense partial per group is the whole domain), which is slow at 1M groups (1 to 2.5 s): batching row groups and the other big-GROUP-BY work over streamed files is F-158.
 
+### Expressions (F-156)
+
+CASE, COALESCE, CAST, text and date functions run in the same kernel program as the arithmetic, in a select list, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, an aggregate's argument, and
+after aggregation (`CASE WHEN count(*) > 5 THEN 'big' ELSE 'small' END`). Every one is checked against DuckDB value by value (`tests/test_mojo_exprs.py`: table, edited frame, streamed file,
+edited frame over a file; `test_mojo_expr_scale.py`: every day from 1800 to 2400 and 60,000 UTF-8 words; `test_mojo_expr_fuzz.py`: 1,500 random expressions; `test_mojo_cast_fuzz.py`: thousands of
+generated words per text cast).
+
+| Part | Supported |
+|---|---|
+| Conditional | `CASE WHEN c THEN v ... [ELSE v] END` and `CASE x WHEN v THEN ...`; `COALESCE(a, b, ...)`, `IFNULL`, `NVL`, `NULLIF(a, b)`; `a IS [NOT] DISTINCT FROM b` (NULL is a value, NaN equals NaN); `b IS [NOT] TRUE / FALSE`. The results share one type as DuckDB's rule gives it: a DECIMAL with the most places, a FLOAT when one is (32-bit when all are REAL), a string next to dates is a date; mixing text with numbers raises. Only the branch a row takes can fail: a CAST in an untaken branch never raises |
+| `IN` | any number of literals (INT, DECIMAL, DATE, TEXT, FLOAT: -0.0 is 0.0, one NaN); more than 8 numbers go through the kernel's hash set (`OP_ISET`), text and a short list through `OP_IN_SET` / compares |
+| `CAST(x AS t)`, `TRY_CAST`, `x::t` | to INTEGER, BIGINT, SMALLINT, TINYINT (range checked), DECIMAL(p, s) (p up to 18), DOUBLE, REAL, VARCHAR, DATE, BOOLEAN. INT / DECIMAL / FLOAT / BOOL convert as DuckDB does (DECIMAL to INT or to fewer places and FLOAT to DECIMAL round halves away from zero, DOUBLE to INT rounds halves to even, DOUBLE to REAL past the 32-bit range fails); a value that does not fit raises `a value could not be converted (CAST(...))` (TRY_CAST: NULL). **TEXT to INT / DECIMAL / DOUBLE / REAL / DATE / BOOLEAN** reads each distinct word once, as DuckDB reads it (spaces around, `+` and `-`, `1_000`, `0x1F`, `.5`, exponents for integers and doubles, `YYYY-M-D` with `-` `/` ` ` or `\` as separators and trailing text, the boolean words); a word that is not one is an error where a row holds it (TRY_CAST: NULL). **To VARCHAR**: BOOLEAN, and an INT, DECIMAL or DATE *column* (the words of its lowest-to-highest range, up to 4,194,304 values, are made once). DATE to anything but VARCHAR, INT to DATE and FLOAT to VARCHAR are refused (DuckDB refuses the first two) |
+| Text functions | `lower`, `upper` (DuckDB's own case mapping, generated from it: `İ` lowers to `i`, `ß` uppers to `ẞ`), `trim`, `ltrim`, `rtrim` (spaces, or the characters given), `substr` / `substring` (also `FROM .. FOR ..`; DuckDB's window rules: a negative start counts from the end, a negative length reads backwards), `length` (code points), `left`, `right`, `reverse`, `replace`, `strpos` / `instr`, `starts_with` / `prefix`, `ends_with` / `suffix`, `contains`, `concat` and `\|\|` (`\|\|` is NULL with a NULL, `concat` reads it as ''), `LIKE` / `ILIKE` / `NOT LIKE` with `_`, `%` and `ESCAPE` (no escape character unless named; the pattern is a constant), `IN` lists of words |
+| Text compared with text | `=`, `<>` between two columns or expressions compare bytes (a word is translated into the other's code space once); `<`, `<=`, `>`, `>=` compare in the owner's order (ignoring ASCII case, bytes break ties) through one ranking of the words of both; across the two tables of a join too |
+| Dates | `EXTRACT(part FROM d)`, `date_part('part', d)`, `year()`, `month()`, `day()`, `quarter()`, `dayofweek()`, `isodow()`, `dayofyear()`, `decade()` (parts: year month day dow isodow doy quarter epoch decade century millennium); `date_trunc(part, d)` (year quarter month week day decade century millennium); `date + INTERVAL n DAY / WEEK / MONTH / YEAR` and `date - INTERVAL ...` (the amount a constant or an INT expression; months clamp to the end of the month: Jan 31 + 1 month is Feb 28 / 29); `date - date` (days), `datediff(part, a, b)` / `date_diff` (day, week, month, quarter, year, decade, century, millennium: DuckDB's boundary counting). Constants fold at bind time (`DATE '1998-12-01' - INTERVAL '90' DAY` is one DATE). `EXTRACT(epoch ...)` is a FLOAT, as DuckDB's. All in integer civil-date arithmetic (floor divisions: right before 1970) in the existing opcodes; a date function of one column is instead answered once per day of the column's range (a table the kernel looks the day up in) when that range is short against the rows, and `GROUP BY` of a date part, a truncated date or a date moved by months is dense when the range is known |
+| Arithmetic | as before, plus: `//` of a DECIMAL or FLOAT is a division of doubles with a zero divisor NULL (DuckDB's, not a floor), `x // 0` and `x % 0` on integers and decimals are NULL, `/` is always a FLOAT, decimal sums and products keep DuckDB's scales (a product past 18 places raises) |
+
+**How the text functions run.** A TEXT column is a dictionary and codes; a function of it is evaluated **once per distinct word**, not per row, and the kernel looks the codes up (`OP_TAB`: a table of
+the answer per code; a predicate such as `LIKE` is the byte set `OP_IN_SET`). A function that gives text makes a new dictionary of its own (a TEXTMAP): the distinct answers, in the order met, and the
+table that maps each input code to its answer's code; `lower(s)` is therefore a group key of integers, and the result table holds only the words present. `CASE` / `COALESCE` over words, `||` and a
+cast to VARCHAR work the same way (a union of the branches' words, or one word per pair of words: two columns whose dictionaries multiply past 1,048,576 pairs raise instead). `r.notes` says it
+ran: `text: 2 per-word tables over 11 dictionary words in 0.23 ms (each text function ran once per word, never per row)`. The tables of predicates and of `length` are built in parallel over the
+words, and the `LIKE` shapes `lit`, `lit%`, `%lit`, `%lit%` need no backtracking: 3,610,733 distinct comments are searched for `%special%` in 20 ms.
+
+**Differences from DuckDB, on purpose** (each raises or is documented, none answers differently):
+- `date + INTERVAL` and `date_trunc` give a DATE (DuckDB: a TIMESTAMP at midnight; MX frame has no timestamp kind). The oracle casts them to DATE. Intervals in hours, minutes or seconds raise.
+- `%` on a FLOAT raises (the kernel's remainder is floored and stepped back, not C's fmod: exact only below 2^53 quotients); `//` on REAL (32-bit) raises.
+- `reverse` of a word with combining marks, joiners, variation selectors, regional indicators or an Indic script raises: DuckDB reverses by grapheme clusters, MX frame by code points, which agree only for words whose every character stands alone.
+- A text word that DuckDB reads by a quirk this engine does not (`infinity`, `epoch`, `now` and their abbreviations as dates; BC dates; years past 9999; an exponent on a DECIMAL, whose rounding is odd; a long mantissa with an exponent) is an error in a CAST *and* a TRY_CAST (never a NULL or a guess); `tests/test_mojo_cast_fuzz.py` bounds how many such words there are.
+- `CAST(expr AS VARCHAR)` needs a column of INT, DECIMAL or DATE (or a BOOLEAN): the words come from the column's range; a date before year 1 or after year 9999 is an error where a row holds it.
+- A `LIKE` pattern is a constant (a column as the pattern would need the product of two dictionaries); `||` of an INT needs `CAST(.. AS VARCHAR)` (DuckDB casts for you), unless it is a constant; `concat` and `||` of two columns need the dictionaries' product to be at most 1,048,576.
+- An integer overflow or a failing CAST in a branch the row does not take: the conversion flags are gated by the branch, but an int64 overflow is not (it raises as it always did).
+- DuckDB's own wrong answer: it treats `INTERVAL '30' DAY` and `INTERVAL '1' MONTH` as equal in its common-subexpression elimination, so a SELECT holding both gives the month's result for the day's column; the test oracle turns the optimizer off.
+
+Informal timings (F-156; the 12-core Ryzen 9 5900X under a load average of 6 to 10 from other jobs, so rough; MX frame is `sql()` on a table in memory, best of 3 runs in one process, planning included; DuckDB 1.5.1 on
+a table it loaded, best of 3, its result fetched into Python; every result was checked against DuckDB first). 5,000,000 generated rows (a DATE over 9,000 days, 400 words with case and accents, 1,000,003 distinct words, a number as text),
+and TPC-H SF1 `lineitem` (6,001,215 rows):
+
+| query | MX frame | DuckDB |
+|---|---|---|
+| `EXTRACT(year FROM dt)` group, count, sum | 4.9 ms | 3.6 ms |
+| `date_trunc('month', dt)` group | 4.3 ms | 20.6 ms |
+| `dt + INTERVAL 3 MONTH > DATE ... AND EXTRACT(dow FROM dt) = 1` | 3.7 ms | 18.8 ms |
+| `sum(datediff('month', dt, DATE '2024-01-01'))` | 2.6 ms | 7.7 ms |
+| `sum(CASE WHEN x > 0 THEN dd ELSE 0 END), count(CASE WHEN ...)` | 5.0 ms | 4.8 ms |
+| `lower(s)` group (400 words) | 5.8 ms | 16.5 ms |
+| `s LIKE '%a%'` (400 words) | 2.4 ms | 5.5 ms |
+| `s \|\| '-' \|\| s2` group | 7.5 ms | 21.8 ms |
+| `substr(s, 1, 2)` group, `sum(length(s))` | 5.6 ms | 24.9 ms |
+| `sum(CAST(num AS INTEGER))` (1,000 words) | 2.5 ms | 6.1 ms |
+| `id IN (1,000 numbers)` | 2.9 ms | 6.5 ms |
+| `h LIKE '%99%'` (1,000,003 distinct words) | 4.6 ms | 8.4 ms |
+| `count(DISTINCT lower(h))` (1,000,003 distinct words) | 336 ms | 58 ms |
+| lineitem: `sum(CASE WHEN l_discount > 0.05 THEN ... ELSE 0 END), count(CASE ...)` | 6.4 ms | 9.4 ms |
+| lineitem: Q12's `CASE` pair per ship mode | 8.4 ms | 16.3 ms |
+| lineitem: `l_comment LIKE '%special%'` (3,610,733 distinct words) | 23.7 ms | 12.7 ms |
+
+A date function of a column is answered once per *day of the column's range* when the range is short against the rows (a per-day table the kernel looks up: `dates: 2 per-day tables over 9,000 days`), and the planner
+bounds the date parts by that range, so `GROUP BY EXTRACT(year ...)` is dense. The slow row is a text function that *makes text* over a million distinct words: it builds each answer once (about 0.3 µs a word, one thread)
+and merges equal answers into one code; a predicate or `length` over the same words is built in parallel and takes 2 ms.
+
 ### Row queries (F-152)
 
 A query with no aggregate and no `GROUP BY` returns rows: `SELECT *`, `SELECT t.*, x + 1 AS y`, `WHERE`, `ORDER BY` (several keys, ASC / DESC, NULLS FIRST / LAST, any expression), `LIMIT`, `OFFSET`, `SELECT DISTINCT`.
 The result is an owned Table, as always; a frame's formula columns are columns (and part of `*`); text keeps the source's words (the result's dictionary holds the words present). A select item can be a column, an
-arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical expression (a BOOL column of true / false / NULL) or a constant; a string constant and a bare `NULL` are refused by name; a FLOAT (a column of the file, or `/`) is selected, ordered and made distinct like any other kind, in DuckDB's order (NaN equal to itself and above +inf, -0.0 equal to 0.0).
+arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical expression (a BOOL column of true / false / NULL) or a constant; a string constant is a one-word TEXT column (F-156) and a bare `NULL` is refused by name; a FLOAT (a column of the file, or `/`) is selected, ordered and made distinct like any other kind, in DuckDB's order (NaN equal to itself and above +inf, -0.0 equal to 0.0).
 
 | Part | What runs |
 |---|---|
