@@ -13,6 +13,7 @@ What it decides today: the group strategy.
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
 from .table import TEXT, BOOL
+from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
                    B_NEG, B_RESCALE)
 
@@ -22,6 +23,10 @@ comptime GROUP_HASHED = 2
 comptime G_NONE = 0          # a plan's strategy: one group
 comptime G_DENSE = 1
 comptime G_HASHED = 2
+comptime S_AGG = 0           # a plan's sink (F-152): the aggregate sinks (dense, hashed, holistic), or ...
+comptime S_ROWS = 1          # ... materialized rows (a row query)
+comptime TOPK_MAX = 4096     # the most rows a top-k keeps in per-worker heaps; past it the rows are sorted whole
+comptime TOPK_FACTOR = 8     # a top-k pays off when the source has more than this many times the rows wanted
 
 comptime DEFAULT_DENSE_LIMIT = 4_194_304     # the most group slots a dense layout may take
 comptime SPARSE_FACTOR = 4                   # past this many slots a row, the domain is too sparse for dense (unless small)
@@ -100,8 +105,14 @@ struct PhysicalPlan(Movable):
     var holistic: Bool
     var source_kind: Int
     var notes: List[String]
+    var sink: Int                    # S_AGG or S_ROWS
+    var top_k: Int                   # rows: the rows wanted when per-worker heaps replace the full sort (0: sort them all, or no ORDER BY)
+    var early_stop: Bool             # rows: no ORDER BY, so the scan stops once it has limit + offset rows
 
     def __init__(out self):
+        self.sink = S_AGG
+        self.top_k = 0
+        self.early_stop = False
         self.group = G_NONE
         self.keys = List[KeyLayout]()
         self.domain = 1
@@ -245,6 +256,9 @@ struct RulePlanner(Planner, Copyable, Movable):
         var what = "table" if st.kind == SRC_TABLE else "frame at edit " + String(st.version) + ": the edits as a mask over the shared rows plus " + \
                    commas(st.edits) + " changed or appended rows" if st.kind == SRC_FRAME else "Parquet scan, " + commas(st.row_groups) + " row groups"
         plan.notes.append("source: " + st.source + " (" + what + "), " + commas(st.rows) + " rows")
+        if q.rows:
+            plan.sink = S_ROWS
+            return plan^
         if len(q.keys) == 0:
             plan.group = G_NONE
             plan.notes.append("group: none (one result row)")
@@ -350,3 +364,26 @@ struct RulePlanner(Planner, Copyable, Movable):
             plan.domain = 0
             plan.notes.append("group: hashed on " + String(plan.key_words()) + " key " + ("word" if plan.key_words() == 1 else "words") + ": " + reason)
         return plan^
+
+
+def plan_sinks(lp: LogicalPlan, q: BoundQuery, st: Stats, opts: PlannerOptions, mut plan: PhysicalPlan):
+    """F-152: what the logical plan's shape says about the sink. A row query materializes its rows; a Sort under a Limit
+    keeps a top-k in per-worker heaps when few rows are wanted out of many, otherwise sorts them all; a Limit with no Sort
+    stops the scan early. (An aggregate query's order is decided where its groups are known: the finish.)"""
+    if not q.rows:
+        return
+    plan.notes.append("sink: rows (the kernel's block hook writes the selected rows; text keeps its words)")
+    var srt = lp.find(P_SORT)
+    if srt >= 0:
+        var want = lp.nodes[srt].limit
+        if lp.top_k and want > 0 and want <= TOPK_MAX and st.rows > TOPK_FACTOR * want:
+            plan.top_k = want
+            plan.notes.append("order: top-" + commas(want) + " by per-worker heaps in the hook (" + commas(st.rows) + " rows, " + commas(want) + " wanted)")
+        elif lp.top_k and want > 0:
+            plan.notes.append("order: all rows sorted (" + ("top-" + commas(want) + " wanted but " + ("more than " + commas(TOPK_MAX) if want > TOPK_MAX else "the source has no more than " + String(TOPK_FACTOR) + "x that many rows") + ")"))
+        else:
+            plan.notes.append("order: all rows sorted")
+    elif lp.early_stop:
+        plan.early_stop = True
+        ref lim = lp.nodes[lp.find(P_LIMIT)]
+        plan.notes.append("limit: no ORDER BY, so the scan stops once it has " + commas(lim.limit + lim.offset) + " rows")

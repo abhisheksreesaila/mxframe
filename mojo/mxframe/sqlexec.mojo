@@ -26,7 +26,9 @@ from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan
-from .planner import Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
+from .rows import build_items, run_rows, _Item
+from .sqlprog import lower_rows
+from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, eval_post, float_bits, ld_div
 from .exec import (_table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
@@ -734,14 +736,37 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
     var dicts = DictAccess(src.table, scan, extra)
     var st = make_stats(src, q, dicts, trust)
     var plan = planner.plan(q, st, opts)
+    var lp = build_plan(q, src.name)
+    plan_sinks(lp, q, st, opts, plan)
     var res = SqlResult()
     res.notes = plan.notes.copy()
     if lie.byte_length() > 0:
         res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
-    var lp = build_plan(q, src.name)
     var inp = _inputs(src, q, trust)
-    var sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
-    _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
+    var sp = SqlProgram(Program(0))
+    var built = build_items(q) if q.rows else (List[_Item](), List[Int]())
+    if q.rows:
+        try:
+            sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
+                            _alias_lists(src), inp.masked)
+        except e:
+            var msg = String(e)
+            if msg.startswith("the query is too big for one program"):
+                raise sql_error(q.line, q.col, msg + ": it computes too many different expressions (about 20 in the select list and ORDER BY); split it in two")
+            if msg.startswith("the query has more than"):
+                raise sql_error(q.line, q.col, msg + " (a program holds 64 different numbers); split the query in two")
+            raise e^
+        var names = String()
+        var read = collect_columns(q)
+        for k in range(len(read)):
+            names += (", " if k > 0 else "") + src.table.name(read[k])
+        res.notes.append("columns read: " + names + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
+        res.notes.append("kernel: " + String(sp.instr) + " instructions a row, " + String(len(built[1])) + " computed " + ("value" if len(built[1]) == 1 else "values") +
+                         ", " + String(len(built[0]) - len(built[1])) + " plain " + ("column" if len(built[0]) - len(built[1]) == 1 else "columns") + " gathered")
+        res.notes.append("device: CPU (SQL runs on the CPU)")
+    else:
+        sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
+        _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
     if q.explain != EXPLAIN_NONE:
         res.explain = _explain_text(lp, res.notes)
         var t = Table.empty()
@@ -753,7 +778,10 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
     var notes = res.notes.copy()
-    res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
+    if q.rows:
+        res.table = run_rows(src, q, plan, opts, dicts, notes, inp, sp^, built[0], trust)
+    else:
+        res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
     res.notes = notes^
     res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
