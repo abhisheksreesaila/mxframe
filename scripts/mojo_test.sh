@@ -7,6 +7,10 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # with "Disk quota exceeded"), so use a disk-backed directory, as scripts/run_tests.sh does.
 export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
 mkdir -p "$TMPDIR"
+# Each run gets a private working directory: the tests write their scratch files by relative path, so two runs at
+# once (agents in several worktrees) never read each other's half-written files.
+rundir="$(mktemp -d "$TMPDIR/mojo-test-run.XXXXXX")"
+trap 'rm -rf "$rundir"' EXIT
 bash "$root/scripts/build_mojo_pkg.sh" > "$root/build/pkg-build.log" 2>&1 || { grep -E "error:" -A4 "$root/build/pkg-build.log" | head -40; echo "FAIL (package build)"; exit 1; }
 lib="$root/.pixi/envs/default/lib"
 out="$root/build/mojo-tests"
@@ -27,7 +31,7 @@ for t in "${files[@]}"; do
      || strings "$out/$name" | grep -E "^Py_Initialize" > /dev/null; then
     echo "FAIL $name uses Python (libpython linked or Mojo Python interop)"; fail=1; continue
   fi
-  if "$out/$name" > "$out/$name.log" 2>&1; then echo "ok   $name"; else echo "FAIL $name"; tail -20 "$out/$name.log"; fail=1; fi
+  if (cd "$rundir" && "$out/$name") > "$out/$name.log" 2>&1; then echo "ok   $name"; else echo "FAIL $name"; tail -20 "$out/$name.log"; fail=1; fi
 done
 
 # F-138b: the same package built the way an app with no GPU, thread pool or codecs builds it (what every non-Linux
@@ -41,7 +45,7 @@ if [ $# -eq 0 ]; then
        -o "$out/test_switches" > "$out/test_switches.build.log" 2>&1; then
     if nm "$out/test_switches" | grep -E "ZSTD_|snappy_|AsyncRT_Device" > /dev/null; then
       echo "FAIL test_switches links a codec or GPU symbol (the Linux main() still brings the CPU runtime; the Mac check proves none)"; fail=1
-    elif "$out/test_switches" "$out/switches-zstd.parquet" "$out/switches-snappy.parquet" > "$out/test_switches.log" 2>&1; then
+    elif (cd "$rundir" && "$out/test_switches" "$out/switches-zstd.parquet" "$out/switches-snappy.parquet") > "$out/test_switches.log" 2>&1; then
       echo "ok   test_switches (no GPU, serial, no codecs)"
     else echo "FAIL test_switches"; tail -20 "$out/test_switches.log"; fail=1; fi
   else echo "FAIL (build) test_switches"; tail -20 "$out/test_switches.build.log"; fail=1; fi

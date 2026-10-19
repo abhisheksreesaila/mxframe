@@ -1,5 +1,6 @@
 """F-157: the CSV reader's FLOAT kind. A column becomes FLOAT when the first rows show an exponent, more than 4 decimal places,
 or nan / inf beside numbers, or when the caller names it; the value is the correctly rounded float64 (compared with Python's float())."""
+import os
 import json
 import random
 import struct
@@ -12,7 +13,7 @@ from f157_data import bits
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
-DUMP = BUILD / "csv_dump"
+DUMP = BUILD / f"csv_dump{os.environ.get('PYTEST_XDIST_WORKER', '')}"   # one per xdist worker: never rebuilt while another runs it
 
 
 @pytest.fixture(scope="module")

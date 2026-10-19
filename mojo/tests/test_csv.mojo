@@ -3,7 +3,7 @@ from std.os import makedirs
 from mxframe import (read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet,
                      read_parquet)
 
-comptime DIR = "/tmp/mxframe_csv_test/"
+comptime DIR = "mxframe_csv_test/"
 
 
 def expect(cond: Bool, what: String) raises:
@@ -243,7 +243,7 @@ def test_empty_and_odd_files() raises:
     var one_cell = read("one.csv", "n\n5")
     expect(one_cell.rows == 1 and one_cell.table.get(0, 0) == 5, "one cell, no newline")
     try:
-        _ = read_csv("/tmp/mxframe_csv_test/does-not-exist.csv")
+        _ = read_csv("mxframe_csv_test/does-not-exist.csv")
         raise Error("FAILED: a missing file did not raise")
     except e:
         expect("couldn't open" in String(e) and "does-not-exist.csv" in String(e), String(e))

@@ -35,10 +35,9 @@ comptime GROUP = 1_600           # 12.5 row groups: the last holds 800 rows
 
 
 def scratch(name: String) raises -> String:
-    """Under ~/.cache, never /tmp (a shared tmpfs with a quota)."""
-    var dir = getenv("HOME") + "/.cache/mxframe-test-tmp"
-    makedirs(dir, exist_ok=True)
-    return dir + "/f147_" + name
+    """In the working directory, which scripts/mojo_test.sh makes private to each run (two runs at once never share a
+    file), under ~/.cache, never /tmp (a shared tmpfs with a quota)."""
+    return "f147_" + name
 
 
 def make_table(n: Int) raises -> SharedTable:

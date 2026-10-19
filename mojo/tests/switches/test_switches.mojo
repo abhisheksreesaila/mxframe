@@ -100,7 +100,7 @@ def main() raises:
             expect(Float64(from_bits=UInt64(r.table.get(4, g))) == mid, "SQL median of group " + String(g))
 
     # no thread pool: the parallel CSV reader runs its chunks one after the other
-    var csv = String("/tmp/mxframe-switches.csv")
+    var csv = String("mxframe-switches.csv")
     var text = String("a,b\n")
     for i in range(50_000):
         text += String(i) + "," + String(i % 7) + "\n"
@@ -116,7 +116,7 @@ def main() raises:
     # the serial `par` / `par_n` really run every chunk: many small chunks (quoted newlines across their edges)
     # read cell for cell as one chunk does
     expect(core_count() == 1, "core_count() is 1 on a serial build: " + String(core_count()))
-    var qcsv = String("/tmp/mxframe-switches-quoted.csv")
+    var qcsv = String("mxframe-switches-quoted.csv")
     var qtext = String("id,note,n\n")
     for i in range(20_000):
         qtext += String(i) + ",\"line " + String(i) + "\nnext, " + String(i % 13) + "\"," + String(i % 5) + "\n"
@@ -131,7 +131,7 @@ def main() raises:
                many.table.text_of(1, Int(many.table.get(1, i))) == one.table.text_of(1, Int(one.table.get(1, i))), "chunked read equals one chunk at row " + String(i))
 
     # no codecs: saves UNCOMPRESSED, whatever is asked for, and the file reads back
-    var path = String("/tmp/mxframe-switches.parquet")
+    var path = String("mxframe-switches.parquet")
     var big = Table.empty()
     var x = big.add_column("x", INT)
     for i in range(1000):

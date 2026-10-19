@@ -75,8 +75,8 @@ def same(a: QueryResult, b: QueryResult, label: String) raises:
 
 
 def test_the_gpu_scan_equals_the_cpu_scan() raises:
-    write_parquet("/tmp/f146_scan.parquet", make_table(), "", ZSTD, GROUP)
-    var scan = scan_parquet("/tmp/f146_scan.parquet")
+    write_parquet("f146_scan.parquet", make_table(), "", ZSTD, GROUP)
+    var scan = scan_parquet("f146_scan.parquet")
     var nreg = scan.word_count(scan.index("region"))
     var far = scan.code_of(scan.index("region"), "Far")
     # (CPU: the group-at-a-time loop and the morsels; GPU: the same file on the device)
@@ -101,7 +101,7 @@ def test_the_gpu_scan_equals_the_cpu_scan() raises:
 
 
 def test_auto_says_why_it_chose_the_cpu_and_can_choose_the_gpu() raises:
-    var scan = scan_parquet("/tmp/f146_scan.parquet")
+    var scan = scan_parquet("f146_scan.parquet")
     var small = Query(scan).group_by(col("carrier"), groups=7).agg(sum(col("cost")), count()).compute(AUTO)
     expect(small.device == CPU and "under AUTO's" in small.fallback_reason, "a small file: the CPU, and why: `" + small.fallback_reason + "`")
     var cheap = Query(scan).auto_gpu_ops(8).group_by(col("carrier"), groups=7).agg(sum(col("cost")), count()).compute(AUTO)
@@ -112,7 +112,7 @@ def test_auto_says_why_it_chose_the_cpu_and_can_choose_the_gpu() raises:
 
 
 def test_holistic_aggregates_stay_on_the_cpu_with_a_reason() raises:
-    var scan = scan_parquet("/tmp/f146_scan.parquet")
+    var scan = scan_parquet("f146_scan.parquet")
     var r = Query(scan).auto_gpu_ops(0).group_by(col("carrier"), groups=7).agg(count_distinct(col("cost")), sum(col("cost"))).compute(AUTO)
     expect(r.device == CPU and "count_distinct" in r.fallback_reason, "AUTO: holistic on the CPU, and why: `" + r.fallback_reason + "`")
     var msg = String("")
@@ -125,7 +125,7 @@ def test_holistic_aggregates_stay_on_the_cpu_with_a_reason() raises:
 
 def test_a_frame_over_the_scan_on_the_gpu() raises:
     """The frame's mask is uploaded with each row group; its changed and appended rows are added on the CPU after."""
-    var scan = scan_parquet("/tmp/f146_scan.parquet")
+    var scan = scan_parquet("f146_scan.parquet")
     var f = Frame(scan)
     var cost = f.column("cost")
     var region = f.column("region")
@@ -149,15 +149,15 @@ def test_overflow_raises_the_same_error() raises:
     var v = t.add_column("v", INT)
     for _ in range(64):
         t.append(v, Int64.MAX // 8)
-    write_parquet("/tmp/f146_ovf.parquet", t, "", ZSTD, 8)
+    write_parquet("f146_ovf.parquet", t, "", ZSTD, 8)
     var msg = String("")
     try:
-        _ = Query(scan_parquet("/tmp/f146_ovf.parquet")).agg(sum(col("v"))).compute(GPU)
+        _ = Query(scan_parquet("f146_ovf.parquet")).agg(sum(col("v"))).compute(GPU)
     except e:
         msg = String(e)
     var want = String("")
     try:
-        _ = Query(scan_parquet("/tmp/f146_ovf.parquet")).agg(sum(col("v"))).compute(CPU)
+        _ = Query(scan_parquet("f146_ovf.parquet")).agg(sum(col("v"))).compute(CPU)
     except e:
         want = String(e)
     expect(want != "" and msg == want, "overflow on the GPU: `" + msg + "` vs `" + want + "`")
