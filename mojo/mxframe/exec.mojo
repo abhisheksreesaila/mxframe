@@ -20,16 +20,19 @@ from .holistic import float_key
 
 
 def _table_addresses(t: SharedTable, p: Program, mask_addr: Int) -> List[Int64]:
+    """The program's column table: a pointer per program column. A column the table does not have (a join's build-side column, which the
+    fused front stage supplies per block) is a placeholder 0."""
     var tbl: List[Int64] = [0, Int64(t.rows())]
+    var n = t.columns()
     for c in p.cols:
         if c >= 0:
-            tbl.append(Int64(Int(t.values(c).unsafe_ptr())))
+            tbl.append(Int64(Int(t.values(c).unsafe_ptr())) if c < n else Int64(0))
         elif c == -1_000_000 or c == -5_000_000:
             tbl.append(0)
         elif c == -4_000_000:
             tbl.append(Int64(mask_addr))
         else:
-            tbl.append(Int64(t._table[].cols[-1 - c].validity_address()))
+            tbl.append(Int64(t._table[].cols[-1 - c].validity_address()) if -1 - c < n else Int64(0))
     return tbl^
 
 
@@ -408,6 +411,36 @@ def _put_column(mut t: Table, name: String, vc: ValCol, dicts: DictAccess) raise
         _fill_column(t.cols[c], vc.v, vc.nul)
 
 
+def _fill_column_owned(mut col: Column, var vals: List[Int64], var nul: List[UInt8]):
+    """`_fill_column` taking the values and the NULL bytes over instead of copying them."""
+    col.values = vals^
+    if len(nul) > 0:
+        var n = len(col.values)
+        col.validity = List[UInt8](length=(n + 7) // 8, fill=0xFF)
+        var nulls = 0
+        for i in range(n):
+            if nul[i] != 0:
+                col.validity[i // 8] &= ~(UInt8(1) << UInt8(i % 8))
+                nulls += 1
+        col.nulls = nulls
+        if nulls == 0:
+            col.validity = List[UInt8]()
+
+
+def _put_column_owned(mut t: Table, name: String, mut vc: ValCol, dicts: DictAccess) raises:
+    """`_put_column` for a column nobody needs afterwards: its values move into the table (a TEXT column's codes are remapped as before)."""
+    if vc.kind == TEXT.value:
+        _put_column(t, name, vc, dicts)
+        return
+    var kind = ColumnKind(vc.kind)
+    var c = t.add_column(_unique_name(t, name), kind, scale=vc.scale)
+    var vals = List[Int64]()
+    var nul = List[UInt8]()
+    swap(vals, vc.v)
+    swap(nul, vc.nul)
+    _fill_column_owned(t.cols[c], vals^, nul^)
+
+
 def _to_table(q: BoundQuery, outs: List[ValCol], dicts: DictAccess) raises -> Table:
     var t = Table.empty()
     for i in range(len(outs)):
@@ -432,10 +465,12 @@ struct _Chunks(Movable):
     var gm: List[UInt8]
     var mask_addr: Int
     var masked: Bool
+    var override: Optional[SharedTable]   # a fused join: the probe table is the chunk (the source's own table is only the joined schema)
     var starts: List[Int]            # a scan: the frame row where each of `groups` starts
     var delta_first: Bool            # read the changed rows' chunk before the shared ones (a LIMIT that stops early needs them all)
 
     def __init__(out self):
+        self.override = None
         self.starts = List[Int]()
         self.delta_first = False
         self.groups = List[Int]()
@@ -495,7 +530,7 @@ def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
                 mx = max(mx, scan.group_rows(g))
             ch.ones = _ones_mask(mx)
     else:
-        ch.base = src.table.rows() > 0
+        ch.base = src.rows() > 0
         if ch.masked:
             ch.ones = _ones_mask(len(src.overlay.delta))
     return ch^
@@ -508,6 +543,8 @@ def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
         return delta_table(src, ch.used)
     if not ch.scan_mode:
         ch.mask_addr = Int(src.overlay.mask.unsafe_ptr()) if ch.masked else 0
+        if ch.override:
+            return ch.override.value()
         return src.table
     var g = ch.groups[i]
     ref scan = src.scan.value()

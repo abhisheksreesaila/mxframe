@@ -15,6 +15,7 @@ chunks stop being read once enough rows are in hand (`early_stop`). With ORDER B
 best rows in per-worker heaps inside the hook and never materializes the rest.
 """
 from std.time import perf_counter_ns
+from std.memory import ArcPointer
 from std.atomic import Atomic
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import text_ranks, _radix_order
@@ -27,8 +28,9 @@ from .planner import PhysicalPlan, PlannerOptions, commas
 from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey, collect_columns
 from .sqleval import ValCol
 from .kargs import KernelRun
+from .jfront import FusedJoin, front_spec, jf_front
 from .holistic import float_key
-from .exec import (_table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
+from .exec import (_put_column_owned, _table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
 
 
@@ -130,7 +132,7 @@ def _read_heaps(run: KernelRun, counter_r: Int, sizes_r: Int, vals_r: Int, nuls_
     out.n = len(out.ids)
 
 
-def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: Int, threads: Int) raises -> RowChunk:
+def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: Int, threads: Int, fj: Optional[ArcPointer[FusedJoin]]) raises -> RowChunk:
     """The kernel over rows [start, stop) of one chunk; the selected rows and the computed values, in row order."""
     ref p = sp.p
     var total = stop - start
@@ -161,7 +163,16 @@ def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: 
         cw[6 + 4 * c] = Int64(sp.row_vregs[c])
         cw[7 + 4 * c] = Int64(sp.row_nregs[c])
     run.control(ctl)
-    var rc = run.keyed(_rows_hook, 1, start, stop, threads)
+    var rc: Int
+    if fj:
+        var fs = front_spec(run, fj.value()[], p)
+
+        def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
+            return jf_front(fs, i0, n, sel, ws)
+
+        rc = run.fused(_rows_hook, front, fs.ws_bytes, True, 1, start, stop, threads)
+    else:
+        rc = run.keyed(_rows_hook, 1, start, stop, threads)
     if rc == E_OVERFLOW:
         raise Error(overflow_message(p.has_float))
     if rc != 0:
@@ -284,7 +295,7 @@ def _item_of(items: List[_Item], q: BoundQuery, e: Int) -> Int:
     return -1
 
 
-def build_items(q: BoundQuery, keys_computed: Bool = False) -> Tuple[List[_Item], List[Int]]:
+def build_items(q: BoundQuery, keys_computed: Bool = False, partner: List[Bool] = List[Bool]()) -> Tuple[List[_Item], List[Int]]:
     """The columns the rows are collected into (the select list's, then the sort keys' that are not in it) and, of those, the
     expressions the program computes (everything that is not a plain column). `keys_computed` (top-k): the sort keys go through
     registers even when they are plain columns, because the heaps compare them in the hook."""
@@ -307,6 +318,8 @@ def build_items(q: BoundQuery, keys_computed: Bool = False) -> Tuple[List[_Item]
             for o in q.rorder:
                 if bkey(q.rexprs, o.expr) == bkey(q.rexprs, e):
                     force = True
+        if x.op == B_COL and Int(x.value) < len(partner) and partner[Int(x.value)]:      # a joined column the fused front stage gathers: through a register
+            force = True
         if x.op == B_COL and not force:
             items.append(_Item(e, bkey(q.rexprs, e), Int(x.value), -1))
         else:
@@ -462,7 +475,7 @@ def _topk_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
 
 
 def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: List[Int], key_desc: List[Bool], key_nf: List[Bool],
-              key_rank: List[Int], threads: Int) raises -> RowChunk:
+              key_rank: List[Int], threads: Int, fj: Optional[ArcPointer[FusedJoin]]) raises -> RowChunk:
     """The kernel over the whole chunk with each worker keeping its best K rows; the union of the heaps (at most workers x K rows,
     unordered), as the row numbers and the values of every slot."""
     ref p = sp.p
@@ -497,7 +510,16 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
         cw[10 + 4 * nk + 2 * s] = Int64(sp.row_vregs[s])
         cw[11 + 4 * nk + 2 * s] = Int64(sp.row_nregs[s])
     run.control(ctl)
-    var rc = run.keyed(_topk_hook, 1, 0, t.rows(), threads)
+    var rc: Int
+    if fj:
+        var fs = front_spec(run, fj.value()[], p)
+
+        def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
+            return jf_front(fs, i0, n, sel, ws)
+
+        rc = run.fused(_topk_hook, front, fs.ws_bytes, True, 1, 0, t.rows(), threads)
+    else:
+        rc = run.keyed(_topk_hook, 1, 0, t.rows(), threads)
     if rc == E_OVERFLOW:
         raise Error(overflow_message(p.has_float))
     if rc != 0:
@@ -511,10 +533,12 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
 
 
 def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-             inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
+             inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool, fj: Optional[ArcPointer[FusedJoin]]) raises -> Table:
     """Reads the chunks, collects the selected rows (ordered, cut) and makes the result table."""
     var used = inp.used.copy()
     var ch = _open_chunks(src, used)
+    if fj:
+        ch.override = fj.value()[].probe
     var cols = List[ValCol]()
     for it in items:
         ref x = q.rexprs[it.expr]
@@ -554,7 +578,7 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
                 stop_early = True
                 break
             var end = min(n_rows, at + step)
-            var rc = _run_rows(chunk, sp, ch.mask_addr, at, end, opts.threads)
+            var rc = _run_rows(chunk, sp, ch.mask_addr, at, end, opts.threads, fj)
             if has_delta:
                 var is_d = ch.is_delta(i)
                 var rb = 0 if is_d else ch.row_base(i)
@@ -599,19 +623,34 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             kc.append(cols[_item_of(items, q, o.expr)].copy())
         fin = _order_rows(kc, q.rorder, dicts, rows_in)
         notes.append("order: sorted " + commas(rows_in) + " rows by " + String(len(q.rorder)) + (" key" if len(q.rorder) == 1 else " keys") + " (stable radix passes)")
-    else:
+    elif offset > 0 or limit >= 0:
         fin = List[Int](length=rows_in, fill=0)
         for i in range(rows_in):
             fin[i] = i
-    var lo = min(offset, len(fin))
-    var hi = len(fin) if limit < 0 else min(len(fin), lo + limit)
-    var pick = List[Int]()
-    for i in range(lo, hi):
-        pick.append(fin[i])
-    var outs = List[ValCol]()
-    for e in q.routs:
-        outs.append(_gather(cols[_item_of(items, q, e)], pick))
-    var table = _to_table(q, outs, dicts)
+    var table: Table
+    if len(q.rorder) == 0 and offset == 0 and limit < 0:
+        # every row, in the order collected: the collected columns become the result's (the last use of a column moves it)
+        table = Table.empty()
+        var last = List[Int](length=len(items), fill=-1)
+        for k in range(len(q.routs)):
+            last[_item_of(items, q, q.routs[k])] = k
+        for k in range(len(q.routs)):
+            var it = _item_of(items, q, q.routs[k])
+            if last[it] == k:
+                _put_column_owned(table, q.out_names[k], cols[it], dicts)
+            else:
+                var dup = cols[it].copy()
+                _put_column_owned(table, q.out_names[k], dup, dicts)
+    else:
+        var lo = min(offset, len(fin))
+        var hi = len(fin) if limit < 0 else min(len(fin), lo + limit)
+        var pick = List[Int]()
+        for i in range(lo, hi):
+            pick.append(fin[i])
+        var outs = List[ValCol]()
+        for e in q.routs:
+            outs.append(_gather(cols[_item_of(items, q, e)], pick))
+        table = _to_table(q, outs, dicts)
     notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if inp.scan_mode else "") + "kernel " + _ms(ms_run - Float64(ns_load) / 1e6) +
                  " ms, order and output " + _ms(Float64(perf_counter_ns() - t_ord) / 1e6) + " ms")
     return table^
@@ -638,11 +677,13 @@ def _concat(a: ValCol, b: ValCol) -> ValCol:
 
 
 def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-                  inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
+                  inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool, fj: Optional[ArcPointer[FusedJoin]]) raises -> Table:
     """ORDER BY with a small LIMIT: each chunk's kernel run keeps the best K = limit + offset rows in per-worker heaps; the candidates
     (at most workers x K) are merged with the best so far and cut to K again, so the rest of the rows are never materialized."""
     var used = inp.used.copy()
     var ch = _open_chunks(src, used)
+    if fj:
+        ch.override = fj.value()[].probe
     var K = plan.top_k
     var nk = len(q.rorder)
     var key_slot = List[Int]()
@@ -687,7 +728,7 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
         scanned += chunk.rows()
         if chunk.rows() == 0:
             continue
-        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads)
+        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads, fj)
         if rc.n == 0:
             continue
         # the candidates, in the order of their rows in the chunk (ties between equal keys keep the source order)
@@ -784,10 +825,10 @@ struct RowStage(Movable):
 
 
 def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, mut notes: List[String],
-                 report: Bool) raises -> RowStage:
+                 report: Bool, partner: List[Bool] = List[Bool]()) raises -> RowStage:
     """Lowers a row query (the program computes what is not a plain column; a top-k also computes its sort keys) and, when `report`,
     says in the notes which columns it reads and what the kernel does."""
-    var built = build_items(q, plan.top_k > 0)
+    var built = build_items(q, plan.top_k > 0, partner)
     var sp: SqlProgram
     try:
         sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
@@ -812,7 +853,7 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
 
 
 def execute_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-                 inp: _Inputs, var stage: RowStage, trust: Bool) raises -> Table:
+                 inp: _Inputs, var stage: RowStage, trust: Bool, fj: Optional[ArcPointer[FusedJoin]] = None) raises -> Table:
     if plan.top_k > 0:
-        return run_topk_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust)
-    return run_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust)
+        return run_topk_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj)
+    return run_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj)

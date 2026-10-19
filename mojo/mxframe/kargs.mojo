@@ -14,7 +14,7 @@ run (`region`, `bytes_region`, handed back as an index), the control block is on
 from .table import SharedTable
 from .query import Program, MAGIC
 from .kernels._fpenv import core_count
-from .kernels.pipeline_cpu import IP, LP, FP, BP, pipeline_keyed, _no_front
+from .kernels.pipeline_cpu import IP, LP, FP, BP, pipeline_keyed, pipeline_fused, _no_front
 from .kernels.hashagg_cpu import hash_aggregate
 from .exec import _table_addresses
 
@@ -108,3 +108,30 @@ struct KernelRun(Movable):
                                            Int(self.set_meta.unsafe_ptr()), Int(self.tbl.unsafe_ptr()), 1, Int(self.dtypes.unsafe_ptr()), nkw, n_rows,
                                            threads if threads > 0 else core_count(), self.repro, keyw, _no_front, 0,
                                            LP(unsafe_from_address=Int(self.regions[res].unsafe_ptr())), 0)
+
+    def table_address(self) -> Int:
+        """The program's column table (valid while the run is)."""
+        return Int(self.tbl.unsafe_ptr())
+
+    def fused[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, FR: def(Int, Int, Int, IP, BP) -> Int](
+            mut self, encode: E, front: FR, ws_bytes: Int, keyed: Bool, n_groups: Int, start: Int, stop: Int, threads: Int) -> Int:
+        """`pipeline_fused`: the program over the rows `front` lets through (a join probe: see jfront.mojo)."""
+        if self.ctl >= 0:
+            self.consts[self.ctl_const] = Float64(from_bits=UInt64(Int(self.regions[self.ctl].unsafe_ptr())))
+        if keyed:
+            return pipeline_fused[E, FR, True](Int(self.code.unsafe_ptr()), Int(self.consts.unsafe_ptr()), Int(self.set_bytes.unsafe_ptr()),
+                                               Int(self.set_meta.unsafe_ptr()), Int(self.tbl.unsafe_ptr()), 1, Int(self.dtypes.unsafe_ptr()), n_groups,
+                                               start, stop, Int(self.out_vals.unsafe_ptr()), Int(self.out_cnt.unsafe_ptr()),
+                                               threads if threads > 0 else core_count(), encode, front, ws_bytes, self.repro)
+        return pipeline_fused[E, FR, False](Int(self.code.unsafe_ptr()), Int(self.consts.unsafe_ptr()), Int(self.set_bytes.unsafe_ptr()),
+                                            Int(self.set_meta.unsafe_ptr()), Int(self.tbl.unsafe_ptr()), 1, Int(self.dtypes.unsafe_ptr()), n_groups,
+                                            start, stop, Int(self.out_vals.unsafe_ptr()), Int(self.out_cnt.unsafe_ptr()),
+                                            threads if threads > 0 else core_count(), encode, front, ws_bytes, self.repro)
+
+    def hashed_fused[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool, FR: def(Int, Int, Int, IP, BP) -> Int](
+            mut self, keyw: KW, front: FR, ws_bytes: Int, nkw: Int, n_rows: Int, threads: Int, res: Int) -> Int:
+        """`hash_aggregate` over the rows `front` lets through."""
+        return hash_aggregate[fused=True](Int(self.code.unsafe_ptr()), Int(self.consts.unsafe_ptr()), Int(self.set_bytes.unsafe_ptr()),
+                                          Int(self.set_meta.unsafe_ptr()), Int(self.tbl.unsafe_ptr()), 1, Int(self.dtypes.unsafe_ptr()), nkw, n_rows,
+                                          threads if threads > 0 else core_count(), self.repro, keyw, front, ws_bytes,
+                                          LP(unsafe_from_address=Int(self.regions[res].unsafe_ptr())), 0)

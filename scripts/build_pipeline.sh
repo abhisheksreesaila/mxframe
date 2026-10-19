@@ -7,6 +7,7 @@
 #   gpu     libmxpipeline_gpu.so
 #   keys    libmxgroupkeys_cpu.so
 #   join    libmxjoin_cpu.so
+#   hashjoin libmxhashjoin_cpu.so (the hash join kernel's C ABI: hashjoin_lib.mojo over hashjoin_cpu.mojo)
 #   aot     libmxkernels_aot.so and libmxkernels_aot_gpu.so (Mojo's default target, as in release.sh)
 #   all     every library
 #
@@ -37,7 +38,7 @@ build() {
 }
 V3=(--target-cpu x86-64-v3)
 
-case "$WHICH" in all|cpu|exec|gpu|keys|join|aot) ;; *) echo "unknown target: $WHICH" >&2; exit 2 ;; esac
+case "$WHICH" in all|cpu|exec|gpu|keys|join|hashjoin|aot) ;; *) echo "unknown target: $WHICH" >&2; exit 2 ;; esac
 
 if [[ "$WHICH" == "all" || "$WHICH" == "cpu" ]]; then
     build pipeline_cpu libmxpipeline_cpu "${V3[@]}"
@@ -54,6 +55,9 @@ if [[ "$WHICH" == "all" || "$WHICH" == "keys" ]]; then
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "join" ]]; then
     build joinsemi_cpu libmxjoin_cpu "${V3[@]}"
+fi
+if [[ "$WHICH" == "all" || "$WHICH" == "hashjoin" ]]; then
+    build hashjoin_lib libmxhashjoin_cpu "${V3[@]}"
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "aot" ]]; then
     build kernels_aot libmxkernels_aot

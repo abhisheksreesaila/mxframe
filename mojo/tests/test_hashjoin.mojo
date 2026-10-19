@@ -1,0 +1,181 @@
+# F-153: the hash join kernel (kernels_aot/hashjoin_cpu.mojo) against a plain dictionary, on every layout it chooses.
+from std.collections import Dict
+from mxframe.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, MapView, hj_release, MODE_DIRECT, MODE_HASH,
+                                          MODE_EMPTY, E_BUDGET)
+from mxframe.kernels.hashjoin_cpu import IP, LP, BP
+
+
+def expect(ok: Bool, what: String) raises:
+    if not ok:
+        raise Error("FAILED: " + what)
+
+
+struct Rng(Movable):
+    var s: UInt64
+
+    def __init__(out self, seed: UInt64):
+        self.s = seed
+
+    def next(mut self) -> UInt64:
+        self.s = self.s * 6364136223846793005 + 1442695040888963407
+        var x = self.s
+        x ^= x >> 33
+        return x
+
+    def below(mut self, n: Int) -> Int:
+        return Int(self.next() % UInt64(n))
+
+
+def make_keys(mut rng: Rng, n: Int, distinct: Int, base: Int64, step: Int64, unique: Bool) -> List[Int64]:
+    var out = List[Int64](length=n, fill=0)
+    if unique:
+        # distinct keys in a shuffled order
+        for i in range(n):
+            out[i] = base + Int64(i) * step
+        for i in range(n - 1, 0, -1):
+            var j = rng.below(i + 1)
+            var t = out[i]
+            out[i] = out[j]
+            out[j] = t
+    else:
+        for i in range(n):
+            out[i] = base + Int64(rng.below(distinct)) * step
+    return out^
+
+
+def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[Int64], probe_ok: List[UInt8], want_mode: Int, want_unique: Bool, threads: Int) raises:
+    var nb = len(build)
+    var np = len(probe)
+    var truth = Dict[Int64, List[Int]]()
+    for i in range(nb):
+        if len(build_ok) > 0 and build_ok[i] == 0:
+            continue
+        if build[i] not in truth:
+            truth[build[i]] = List[Int]()
+        truth[build[i]].append(i)
+    var bok = Int(build_ok.unsafe_ptr()) if len(build_ok) > 0 else 0
+    var pok = Int(probe_ok.unsafe_ptr()) if len(probe_ok) > 0 else 0
+    var m = hj_build(Int(build.unsafe_ptr()), bok, nb, threads)
+    expect(m.mode == want_mode, name + ": layout " + m.kind() + " (wanted mode " + String(want_mode) + ")")
+    if want_mode != MODE_EMPTY:
+        expect(m.unique == want_unique, name + ": unique is " + String(m.unique))
+    # pairs
+    var out = List[Int64](length=4, fill=0)
+    var rc = hj_probe_pairs(m, Int(probe.unsafe_ptr()), pok, np, threads, 1 << 40, Int(out.unsafe_ptr()))
+    expect(rc == 0, name + ": probe_pairs rc " + String(rc))
+    var total = 0
+    for i in range(np):
+        if len(probe_ok) > 0 and probe_ok[i] == 0:
+            continue
+        if probe[i] in truth:
+            total += len(truth[probe[i]])
+    expect(Int(out[0]) == total, name + ": pairs " + String(Int(out[0])) + " wanted " + String(total))
+    var pr = IP(unsafe_from_address=Int(out[1]))
+    var br = IP(unsafe_from_address=Int(out[2]))
+    var at = 0
+    for i in range(np):
+        if len(probe_ok) > 0 and probe_ok[i] == 0:
+            continue
+        if probe[i] in truth:
+            for b in truth[probe[i]]:
+                expect(Int(pr[at]) == i and Int(br[at]) == b, name + ": pair " + String(at) + " is (" + String(Int(pr[at])) + ", " + String(Int(br[at])) + ") wanted (" + String(i) + ", " + String(b) + ")")
+                at += 1
+    expect(at == total, name + ": pairs walked")
+    hj_release(Int(out[1]))
+    hj_release(Int(out[2]))
+    # a budget below the count refuses without allocating
+    if total > 0:
+        var small = List[Int64](length=4, fill=0)
+        var rc2 = hj_probe_pairs(m, Int(probe.unsafe_ptr()), pok, np, threads, total - 1, Int(small.unsafe_ptr()))
+        expect(rc2 == E_BUDGET and Int(small[0]) == total and Int(small[1]) == 0, name + ": budget refusal")
+    # unique lookups
+    if want_unique and want_mode != MODE_EMPTY:
+        var res = List[Int32](length=np, fill=0)
+        hj_probe_unique(m, Int(probe.unsafe_ptr()), pok, np, Int(res.unsafe_ptr()), threads)
+        for i in range(np):
+            var want = -1
+            if not (len(probe_ok) > 0 and probe_ok[i] == 0) and probe[i] in truth:
+                want = truth[probe[i]][0]
+            expect(Int(res[i]) == want, name + ": unique lookup " + String(i) + ": " + String(Int(res[i])) + " wanted " + String(want))
+        # the fused form: every second row selected
+        var sel = List[Int32](length=np, fill=0)
+        var nsel = 0
+        for i in range(0, np, 2):
+            sel[nsel] = Int32(i)
+            nsel += 1
+        var prow = List[Int32](length=np, fill=0)
+        var kept = hj_probe_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                                  pok != 0, 0, IP(unsafe_from_address=Int(sel.unsafe_ptr())), nsel, IP(unsafe_from_address=Int(prow.unsafe_ptr())))
+        var q = 0
+        for i in range(0, np, 2):
+            var want = -1
+            if not (len(probe_ok) > 0 and probe_ok[i] == 0) and probe[i] in truth:
+                want = truth[probe[i]][0]
+            if want >= 0:
+                expect(Int(sel[q]) == i and Int(prow[q]) == want, name + ": block lookup of row " + String(i))
+                q += 1
+        expect(kept == q, name + ": block kept " + String(kept) + " wanted " + String(q))
+    print("  ok", name, "->", m.kind())
+
+
+def main() raises:
+    var rng = Rng(12345)
+    var none_b = List[UInt8]()
+    var none_p = List[UInt8]()
+    for threads in [1, 4]:
+        # direct, unique (dense primary keys), probe with hits and misses
+        var b1 = make_keys(rng, 5000, 0, 100, 1, True)
+        var p1 = make_keys(rng, 20000, 6500, 0, 1, False)
+        check("dense unique t" + String(threads), b1, none_b, p1, none_p, MODE_DIRECT, True, threads)
+        # direct, repeated (many to many)
+        var b2 = make_keys(rng, 8000, 700, -50, 2, False)
+        var p2 = make_keys(rng, 9000, 900, -60, 2, False)
+        check("dense repeated t" + String(threads), b2, none_b, p2, none_p, MODE_DIRECT, False, threads)
+        # hash, unique: keys spread over a huge range
+        var b3 = make_keys(rng, 6000, 0, -4000000000000, 1000003, True)
+        var p3 = List[Int64]()
+        for i in range(15000):
+            p3.append(b3[rng.below(6000)] + Int64(rng.below(2)))
+        check("sparse unique t" + String(threads), b3, none_b, p3, none_p, MODE_HASH, True, threads)
+        # hash, repeated, enough rows for several partitions and the bitmap
+        var b4 = make_keys(rng, 60000, 9000, 1000000, 100003, False)
+        var p4 = make_keys(rng, 50000, 12000, 1000000, 100003, False)
+        check("sparse repeated t" + String(threads), b4, none_b, p4, none_p, MODE_HASH, False, threads)
+        # extreme int64 keys (past 2^53) stay exact
+        var b5 = List[Int64]()
+        b5.append(Int64.MAX)
+        b5.append(Int64.MAX - 1)
+        b5.append(Int64.MIN)
+        b5.append(9007199254740993)
+        b5.append(9007199254740992)
+        b5.append(0)
+        var p5 = List[Int64]()
+        var cands: List[Int64] = [Int64(9007199254740993), Int64(9007199254740992), Int64(9007199254740994), Int64.MAX, Int64.MAX - 1, Int64.MIN + 1, Int64.MIN, Int64(1)]
+        for k in cands:
+            p5.append(k)
+        check("past 2^53 t" + String(threads), b5, none_b, p5, none_p, MODE_HASH, True, threads)
+        # a hot key: half the build rows share one key
+        var b6 = make_keys(rng, 20000, 500, 0, 1, False)
+        for i in range(0, 20000, 2):
+            b6[i] = 7
+        var p6 = make_keys(rng, 3000, 600, 0, 1, False)
+        check("hot key t" + String(threads), b6, none_b, p6, none_p, MODE_DIRECT, False, threads)
+        # unusable rows on both sides (NULL keys never match)
+        var b7 = make_keys(rng, 7000, 900, 10, 1, False)
+        var bok7 = List[UInt8](length=7000, fill=1)
+        for i in range(0, 7000, 5):
+            bok7[i] = 0
+        var p7 = make_keys(rng, 7000, 900, 10, 1, False)
+        var pok7 = List[UInt8](length=7000, fill=1)
+        for i in range(0, 7000, 3):
+            pok7[i] = 0
+        check("null keys t" + String(threads), b7, bok7, p7, pok7, MODE_DIRECT, False, threads)
+        # nothing to build
+        var b8 = make_keys(rng, 100, 10, 0, 1, False)
+        var bok8 = List[UInt8](length=100, fill=0)
+        check("empty build t" + String(threads), b8, bok8, make_keys(rng, 50, 10, 0, 1, False), none_p, MODE_EMPTY, True, threads)
+        # one row each
+        var one = List[Int64]()
+        one.append(42)
+        check("one row t" + String(threads), one, none_b, one, none_p, MODE_DIRECT, True, threads)
+    print("ok test_hashjoin")

@@ -28,7 +28,7 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
-from .table import SharedTable, Table, TEXT, FLOAT
+from .table import SharedTable, Table, TEXT, FLOAT, INT, DECIMAL
 from .parquet import ParquetScan, _GroupPlan, _GroupReader, _open_plan, _copy_bits, _count_bits
 from .frame import Frame, Overlay, _eval_row, _eval_row_t
 from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
@@ -39,6 +39,8 @@ from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
 from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
+from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, gather_join, JOIN_BUDGET_BYTES
+from .kernels.hashjoin_cpu import hj_build
 from .frame import text_ranks
 
 # plan node kinds
@@ -305,6 +307,64 @@ struct Query(Movable):
             raise Error("on_device: this DeviceTable was not made from the query's table")
         self.device = device_table
         return self^
+
+    def join(var self, other: SharedTable, left_on: List[String], right_on: List[String], how: String = "inner") raises -> Self:
+        """The inner equi-join of this query's table with `other` on `left_on[i] = right_on[i]`, as a new query over the joined rows (this table's
+        columns, then `other`'s; a repeated name gets a suffix). The builder's own rules apply from there on (`where`, `group_by`, `agg`).
+        The join is the engine's (the same kernel and key rules as SQL): a NULL key never matches, TEXT keys match by bytes whatever the
+        dictionaries, DECIMAL scales are aligned (INT is scale 0), FLOAT keys follow DuckDB (-0.0 = 0.0, NaN = NaN), int64 keys past 2^53 are
+        exact, and the smaller table is the one the hash table is built on. Only `how="inner"` exists (F-154 adds the others); the join must
+        come first, over a plain table (bake a Frame, read a file, first)."""
+        if how != "inner":
+            raise Error("a `" + how + "` join is not supported yet (F-154): only inner")
+        if len(self.nodes) > 1:
+            raise Error("join must come first: filters and aggregates come after it")
+        if self.framed or self.scan:
+            raise Error("join: a Frame or a Parquet scan is not joined by the builder: bake the frame or read the file into a table first (SQL joins them as they are)")
+        if len(left_on) == 0 or len(left_on) != len(right_on):
+            raise Error("join: `left_on` and `right_on` name the same number of columns, at least one")
+        var lcols = List[Int]()
+        var rcols = List[Int]()
+        for k in range(len(left_on)):
+            var l = self.table.index(left_on[k])
+            var r = other.index(right_on[k])
+            if l < 0:
+                raise Error("join: no column `" + left_on[k] + "` in this query's table")
+            if r < 0:
+                raise Error("join: no column `" + right_on[k] + "` in the other table")
+            var lk = self.table.kind(l).value
+            var rk = other.kind(r).value
+            var numeric = (lk == INT.value or lk == DECIMAL.value) and (rk == INT.value or rk == DECIMAL.value)
+            if not (numeric or lk == rk):
+                raise Error("join: cannot join `" + left_on[k] + "` with `" + right_on[k] + "`: the two columns are different kinds of value")
+            lcols.append(l)
+            rcols.append(r)
+        var lc = List[Int]()
+        for c in range(self.table.columns()):
+            lc.append(c)
+        var rc = List[Int]()
+        for c in range(other.columns()):
+            rc.append(c)
+        var left = JoinSide(self.table, lc^, lcols.copy(), True)
+        var right = JoinSide(other, rc^, rcols.copy(), True)
+        var left_builds = self.table.rows() < other.rows()
+        var keys = JoinKeys()
+        if left_builds:
+            normalize_keys(self.table, other, lcols, rcols, keys, self._threads)
+        else:
+            normalize_keys(other, self.table, rcols, lcols, keys, self._threads)
+        var nb = self.table.rows() if left_builds else other.rows()
+        var np = other.rows() if left_builds else self.table.rows()
+        var m = hj_build(keys.bk_addr, keys.bo_addr, nb, self._threads)
+        var ncols = self.table.columns() + other.columns()
+        var pairs = join_pairs(m, keys, np, JOIN_BUDGET_BYTES // (8 * max(ncols, 1)), self._threads)
+        var joined = gather_join(left, right, pairs, left_builds, self._threads)
+        var out = Query(joined^.share())
+        out._threads = self._threads
+        out._morsels = self._morsels
+        out._block_rows = self._block_rows
+        out._window_rows = self._window_rows
+        return out^
 
     def compute(self, device: Int = AUTO) raises -> QueryResult:
         """Runs the plan. `device`: CPU, GPU (raises without a live attached DeviceTable) or AUTO (the GPU when a
