@@ -7,6 +7,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # with "Disk quota exceeded"), so use a disk-backed directory, as scripts/run_tests.sh does.
 export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
 mkdir -p "$TMPDIR"
+python3 "$root/scripts/check_list_lifetimes.py" || { echo "FAIL (a list whose address a kernel reads is freed too early: see scripts/check_list_lifetimes.py)"; exit 1; }
 bash "$root/scripts/build_mojo_pkg.sh" > "$root/build/pkg-build.log" 2>&1 || { grep -E "error:" -A4 "$root/build/pkg-build.log" | head -40; echo "FAIL (package build)"; exit 1; }
 lib="$root/.pixi/envs/default/lib"
 out="$root/build/mojo-tests"

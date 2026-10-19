@@ -120,6 +120,8 @@ QUERIES = [
     Q("SELECT id FROM t ORDER BY id", duck="SELECT id FROM t ORDER BY id NULLS LAST", keys=[0], limit=0, tag="limit-zero"),
     Q("SELECT id, x FROM t WHERE x > 0", limit=17, tag="limit-alone"),
     Q("SELECT id, x FROM t WHERE x > 0", limit=5, offset=3, tag="limit-offset-alone"),
+    Q("SELECT id, x FROM t WHERE x > 0", limit=0, tag="limit-zero-alone"),
+    Q("SELECT id FROM t ORDER BY id", duck="SELECT id FROM t ORDER BY id NULLS LAST", keys=[0], offset=19990, tag="offset-without-limit"),
     Q("SELECT DISTINCT s FROM t ORDER BY s", duck="SELECT DISTINCT s FROM t ORDER BY lower(s) NULLS LAST, s", keys=[0], limit=4, tag="distinct-order-limit"),
 ]
 
