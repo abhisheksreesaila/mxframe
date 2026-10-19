@@ -17,7 +17,7 @@ from mxframe.parquet import physical_memory
 comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
                   "       mx explain [--analyze] \"<SQL>\" [-t name=path ...] [--format text|json]\n"
                   "       mx schema <file> [--rows N]\n"
-                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)")
+                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)")
 
 
 # ── errors ───────────────────────────────────────────────────────────────────────────────────────────
@@ -79,6 +79,7 @@ struct Args(Movable):
     var threads: Int
     var stream: String
     var memory: Int
+    var join: String
     var analyze: Bool
     var rows: Int
     var query_file: String
@@ -95,6 +96,7 @@ struct Args(Movable):
         self.threads = 0
         self.stream = "auto"
         self.memory = 0
+        self.join = "auto"
         self.analyze = False
         self.rows = 5
         self.query_file = String()
@@ -119,7 +121,7 @@ def parse_args(first: Int) raises -> Args:
     while i < len(all):
         var arg = String(all[i])
         var takes = arg == "-t" or arg == "--table" or arg == "--format" or arg == "--out" or arg == "--max-rows" or arg == "--device" or \
-                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
+                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
         if takes:
             if i + 1 >= len(all):
                 _ = usage_error(arg + " needs a value")
@@ -145,6 +147,10 @@ def parse_args(first: Int) raises -> Args:
                 a.dense_limit = parse_int("--dense-limit", v)
             elif arg == "--threads":
                 a.threads = parse_int("--threads", v)
+            elif arg == "--join":
+                if v != "auto" and v != "materialize":
+                    _ = usage_error("--join is auto or materialize, found `" + v + "`")
+                a.join = v
             elif arg == "--stream":
                 if v != "auto" and v != "always" and v != "never":
                     _ = usage_error("--stream is auto, always or never, found `" + v + "`")
@@ -227,6 +233,7 @@ def options_of(args: Args) -> PlannerOptions:
     if args.dense_limit > 0:
         o.dense_limit = args.dense_limit
     o.threads = args.threads
+    o.fuse = args.join != "materialize"
     return o^
 
 

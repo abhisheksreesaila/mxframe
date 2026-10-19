@@ -52,10 +52,12 @@ def data(tmp_path_factory):
                    union all select 9223372036854775807::bigint, 1000 union all select (-9223372036854775808)::bigint, 1001 union all select null::bigint, 1002""")
     con.execute("""create table bigk_b as select (9007199254740992 + i)::bigint as k, i as b from range(8) r(i)
                    union all select 9223372036854775807::bigint, 100 union all select (-9223372036854775808)::bigint, 101 union all select 0::bigint, 102""")
+    con.execute("""create table bigf as select i as fid, case when i % 101 = 0 then null else (i * 37) % 2600 end as k, i % 11 as g, (i % 1000) - 500 as x,
+        ((i % 700) * 0.01)::decimal(10,2) as m from range(600000) r(i)""")
     con.execute("create table nothing as select * from dims where false")
     con.execute("create table wide as select i as a, ((i::hugeint * 4503599627370449) % 9007199254740881)::bigint as b, i % 7 as g from range(3000) r(i)")
     con.execute("create table wide2 as select i as a, ((i::hugeint * 4503599627370449) % 9007199254740881)::bigint as b, i * 2 as v from range(2000) r(i)")
-    tables = ["facts", "dims", "hot", "bigk_a", "bigk_b", "nothing", "wide", "wide2"]
+    tables = ["facts", "dims", "hot", "bigk_a", "bigk_b", "nothing", "wide", "wide2", "bigf"]
     paths = {}
     for t in tables:
         paths[t] = d / f"{t}.parquet"
@@ -63,8 +65,8 @@ def data(tmp_path_factory):
     return {"con": con, "paths": paths}
 
 
-def q(mx, data, sql, tables, ordered=False, duck_sql=None):
-    return check(mx, sql, data["con"], files={t: data["paths"][t] for t in tables}, ordered=ordered, duck_sql=duck_sql)
+def q(mx, data, sql, tables, ordered=False, duck_sql=None, extra=()):
+    return check(mx, sql, data["con"], files={t: data["paths"][t] for t in tables}, ordered=ordered, duck_sql=duck_sql, extra=extra)
 
 
 def note(res, prefix):
@@ -87,10 +89,16 @@ FK_PK = [
 ]
 
 
+@pytest.mark.parametrize("join", ["auto", "materialize"])
 @pytest.mark.parametrize("sql", FK_PK)
-def test_fk_to_pk_joins_equal_duckdb(mx, data, sql):
-    res = q(mx, data, sql, ["facts", "dims"])
+def test_fk_to_pk_joins_equal_duckdb(mx, data, sql, join):
+    """Unique build keys run fused (the probe inside the aggregate pipeline); `--join materialize` writes the pairs and the joined table first."""
+    res = q(mx, data, sql, ["facts", "dims"], extra=["--join", join])
     assert re.match(r"join build side: d \([\d,]+ rows, the smaller side\): direct array, unique keys", note(res, "join build side")), res["notes"]
+    if join == "auto":
+        assert note(res, "join path").startswith("join path: fused:"), res["notes"]
+    else:
+        assert note(res, "join path").startswith("join path: materialized:"), res["notes"]
 
 
 MANY_TO_MANY = [
@@ -271,3 +279,79 @@ def test_explain_shows_the_join_tree(mx, data):
                           "        Join (inner) on f.k = d.k", "          Filter f.g = 3", "            Scan facts AS f", "          Filter d.kk < 20",
                           "            Scan dims AS d", "Physical plan", lines[10]], lines
     assert lines[10].startswith("  join: inner, on k = k"), lines
+
+
+# ── the fused path in detail ─────────────────────────────────────────────────────────────────────────
+
+FUSED = [
+    # the build side's columns of every kind come through the block scratch: TEXT, DECIMAL, DATE, BOOL, FLOAT, with NULLs
+    "SELECT d.s, d.b, count(*), sum(d.w), min(d.dt), max(d.f) FROM facts f JOIN dims d ON f.k = d.k GROUP BY d.s, d.b",
+    "SELECT f.g, d.name, sum(d.d4 + f.d) FROM facts f JOIN dims d ON f.k = d.k WHERE d.dt > DATE '2020-06-01' GROUP BY f.g, d.name",
+    "SELECT count(*), sum(f.x), avg(d.w) FROM facts f JOIN dims d ON f.k = d.k",
+    # rows: partner columns through registers, probe columns gathered
+    "SELECT f.fid, d.name, d.w, d.s, d.b, d.f FROM facts f JOIN dims d ON f.k = d.k WHERE f.fid < 5000",
+    "SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k WHERE d.k < 100",
+    "SELECT d.k, d.name, f.fid FROM facts f JOIN dims d ON f.k = d.k WHERE f.x > 400",
+    # keys that are expressions of the partner's columns
+    "SELECT d.kk % 7, count(*) FROM facts f JOIN dims d ON f.k = d.k GROUP BY d.kk % 7",
+    "SELECT count(*) FROM facts f JOIN dims d ON f.k = d.k WHERE d.name <> 'name3' AND f.s = 'North'",
+    # the probe side is the left table or the right one
+    "SELECT d.kk, sum(f.x) FROM dims d JOIN facts f ON d.k = f.k GROUP BY d.kk",
+]
+
+
+@pytest.mark.parametrize("sql", FUSED)
+def test_fused_joins_equal_duckdb(mx, data, sql):
+    res = q(mx, data, sql, ["facts", "dims"])
+    assert note(res, "join path").startswith("join path: fused:"), res["notes"]
+
+
+def test_fused_row_queries_order_limit_and_stop_early(mx, data):
+    for sql, duck in [
+        ("SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k ORDER BY f.fid DESC, d.name LIMIT 30",
+         "SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k ORDER BY f.fid DESC NULLS LAST, lower(d.name), d.name LIMIT 30"),
+        ("SELECT f.fid, d.w FROM facts f JOIN dims d ON f.k = d.k ORDER BY d.w DESC, f.fid LIMIT 30 OFFSET 5",
+         "SELECT f.fid, d.w FROM facts f JOIN dims d ON f.k = d.k ORDER BY d.w DESC NULLS LAST, f.fid NULLS LAST LIMIT 30 OFFSET 5"),
+        ("SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k ORDER BY d.name, f.fid",
+         "SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k ORDER BY lower(d.name), d.name, f.fid"),
+    ]:
+        res = q(mx, data, sql, ["facts", "dims"], ordered=True, duck_sql=duck)
+        assert note(res, "join path").startswith("join path: fused:"), res["notes"]
+    res = run_mx(mx, ["sql", "--max-rows", "0", "SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k LIMIT 7"],
+                 {"facts": data["paths"]["facts"], "dims": data["paths"]["dims"]})
+    assert len(res["rows"]) == 7 and note(res, "join path").startswith("join path: fused:")
+    want = {tuple(r) for r in data["con"].execute("SELECT f.fid, d.name FROM facts f JOIN dims d ON f.k = d.k").fetchall()}
+    assert all((r[0], r[1]) in want for r in res["rows"])
+
+
+def test_an_aggregate_that_needs_every_row_materializes(mx, data):
+    res = q(mx, data, "SELECT d.kk, count(DISTINCT f.x), median(f.x) FROM facts f JOIN dims d ON f.k = d.k GROUP BY d.kk", ["facts", "dims"])
+    assert note(res, "join path").startswith("join path: materialized:") and "holistic" in note(res, "join path"), res["notes"]
+
+
+def test_a_filter_can_flip_the_sides(mx, data):
+    res = q(mx, data, "SELECT count(*), sum(d.w) FROM facts f JOIN dims d ON f.k = d.k WHERE f.fid < 100", ["facts", "dims"])
+    assert note(res, "join build side").startswith("join build side: f (100 rows"), res["notes"]
+
+
+BIG = [
+    "SELECT count(*), sum(b.x), sum(d.w) FROM bigf b JOIN dims d ON b.k = d.k",
+    "SELECT d.s, count(*), sum(b.m) FROM bigf b JOIN dims d ON b.k = d.k GROUP BY d.s",
+    "SELECT d.kk, b.g, count(*), min(b.x), max(d.dt) FROM bigf b JOIN dims d ON b.k = d.k WHERE b.x > -200 GROUP BY d.kk, b.g",
+    "SELECT d.name, sum(b.m) FROM bigf b JOIN dims d ON b.k = d.k GROUP BY d.name",
+]
+
+
+@pytest.mark.parametrize("sql", BIG)
+def test_fused_joins_over_many_blocks_and_workers_equal_duckdb(mx, data, sql):
+    """600,000 probe rows are ten morsels of the pipeline: every worker has its own scratch."""
+    res = q(mx, data, sql, ["bigf", "dims"])
+    assert note(res, "join path").startswith("join path: fused:"), res["notes"]
+    q(mx, data, sql, ["bigf", "dims"], extra=["--join", "materialize"])
+    q(mx, data, sql, ["bigf", "dims"], extra=["--threads", "1"])
+
+
+def test_fused_rows_over_many_workers(mx, data):
+    q(mx, data, "SELECT b.fid, d.name FROM bigf b JOIN dims d ON b.k = d.k WHERE b.fid % 5000 = 3", ["bigf", "dims"])
+    q(mx, data, "SELECT b.fid, d.w FROM bigf b JOIN dims d ON b.k = d.k ORDER BY d.w DESC, b.fid LIMIT 40", ["bigf", "dims"], ordered=True,
+      duck_sql="SELECT b.fid, d.w FROM bigf b JOIN dims d ON b.k = d.k ORDER BY d.w DESC NULLS LAST, b.fid NULLS LAST LIMIT 40")
