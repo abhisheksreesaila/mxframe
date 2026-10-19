@@ -1721,9 +1721,10 @@ def _decode_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raise
             raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
         for i in range(present):
             dout[i] = _to_stored(leaf, raw[i])
-    elif p.encoding == ENC_BYTE_STREAM_SPLIT and (leaf.ptype == PT_FLOAT or leaf.ptype == PT_DOUBLE):
-        # byte k of value i is stored at k * count + i (the page's non-null values): gather the bytes back, widen a FLOAT
-        var w = 4 if leaf.ptype == PT_FLOAT else 8
+    elif p.encoding == ENC_BYTE_STREAM_SPLIT and (leaf.ptype == PT_FLOAT or leaf.ptype == PT_DOUBLE or leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64):
+        # byte k of value i is stored at k * count + i (the page's non-null values): gather the bytes back; a FLOAT is widened to
+        # float64, an INT32 sign-extended (then converted as a PLAIN value is: timestamps, unsigned, decimals)
+        var w = 4 if (leaf.ptype == PT_FLOAT or leaf.ptype == PT_INT32) else 8
         if present > (c.n - c.pos) // w:
             raise Error("a Parquet page ends early (corrupt file)")
         var src = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
@@ -1731,10 +1732,13 @@ def _decode_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raise
             var v: UInt64 = 0
             for k in range(w):
                 v |= UInt64(src[k * present + i]) << UInt64(8 * k)
-            if w == 4:
+            if leaf.ptype == PT_FLOAT:
                 dout[i] = Int64(Float64(Float32(from_bits=UInt32(v))).to_bits())
             else:
-                dout[i] = Int64(v)
+                var x = Int64(v)
+                if leaf.ptype == PT_INT32 and v >= 0x80000000:
+                    x -= 0x100000000
+                dout[i] = _to_stored(leaf, x)
         c.pos += present * w
     elif p.encoding == ENC_RLE and leaf.ptype == PT_BOOLEAN:
         _ = c.le(4)                                       # a length prefix

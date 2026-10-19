@@ -20,11 +20,13 @@ Kinds, by the first `infer_rows` rows, empty cells ignored:
                                                    (trailing zeros do not count), else scale 4. The stored value is
                                                    parsed from the digits (exact); extra digits round half away
                                                    from zero.
-  a number with an exponent (`1e5`, `2.5E-3`), or more  FLOAT (float64, correctly rounded; every NaN is one NaN).
-  than 4 decimal places (trailing zeros do not count),  A whole number or a decimal of up to 4 places stays INT /
-  or nan / inf / -inf / infinity (any case) beside      DECIMAL, which are exact. `CsvOptions(float_columns=[...])`
-  numbers                                               reads the named columns as FLOAT whatever the first rows
-                                                        show. A FLOAT cell that is not a number, or is past about
+  a decimal with 5 to 9 places (trailing zeros do      DECIMAL at that scale, exact, when every value in the
+  not count)                                            first rows fits int64 at it (money with more places)
+  a number with an exponent (`1e5`, `2.5E-3`), nan /    FLOAT (float64, correctly rounded; every NaN is one NaN).
+  inf / -inf / infinity (any case) beside numbers,      A whole number or a decimal of up to 9 places stays INT /
+  more than 9 decimal places, or a number too wide      DECIMAL, which are exact. `CsvOptions(float_columns=[...])`
+  for int64 at its scale (DuckDB reads those as         reads the named columns as FLOAT whatever the first rows
+  DOUBLE)                                               show. A FLOAT cell that is not a number, or is past about
                                                         1.8e308, is a failed cell (a null).
   YYYY-MM-DD, or an ISO timestamp                  DATE (days since 1970). A timestamp with a zone offset is
                                                    converted to UTC first, then floored to the day (as the Parquet
@@ -777,7 +779,7 @@ struct InferCol(Copyable, Movable):
     var can_date: Bool
     var can_bool: Bool
     var can_float: Bool
-    var float_only: Bool     # a value only a float can be: an exponent, nan / inf, or a number past int64
+    var float_only: Bool     # a value only a float can be: an exponent, nan / inf (a number too wide for int64 is decided in `_parse`)
     var numeric: Bool        # some value had a digit
     var places: Int
     var nonempty: Int
@@ -1111,13 +1113,18 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         if asked:
             kind = FLOAT.value
         elif s.nonempty > 0:
-            if s.can_int and not s.float_only:
+            if s.can_float and s.numeric and s.float_only:
+                kind = FLOAT.value                                # an exponent, nan / inf
+            elif s.can_int:
                 kind = INT.value
-            elif s.can_dec and s.places <= 4 and not s.float_only:
+            elif s.can_dec and s.places <= 4:
                 kind = DECIMAL.value
                 scale = 2 if s.places <= 2 else 4
-            elif s.can_float and s.numeric and (s.float_only or s.places > 4):
-                kind = FLOAT.value
+            elif s.can_dec and s.places <= 9:
+                kind = DECIMAL.value                              # money with 5 to 9 places: exact at that scale (when every value fits int64)
+                scale = s.places
+            elif s.can_float and s.numeric:
+                kind = FLOAT.value                                # more than 9 places, or a number too wide for int64 (DuckDB reads those as DOUBLE)
             elif s.can_date:
                 kind = DATE.value
             elif s.can_bool:
@@ -1132,7 +1139,7 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         _ = _walk(data, first_row, size, delim, options.infer_rows, fit)
         for c in range(ncols):
             if kinds[c] == DECIMAL.value and not fit.fits[c]:
-                kinds[c] = TEXT.value
+                kinds[c] = FLOAT.value if infer.cols[c].can_float and infer.cols[c].numeric else TEXT.value     # too wide at its scale
                 scales[c] = 0
 
     # chunks: safe row boundaries found with a parallel pre-scan of the quote state machine

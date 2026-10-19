@@ -118,3 +118,25 @@ def test_byte_stream_split_doubles_and_floats_read(dumper, tmp_path):
     want = t.to_pydict()
     for i, row in enumerate(rows):
         assert row[1] == as_bits(want["d"][i]) and row[2] == as_bits(want["f"][i])
+
+
+def test_byte_stream_split_integers_read(dumper, tmp_path):
+    import datetime
+    import random
+    r = random.Random(4)
+    n = 3000
+    t = pa.table({
+        "i64": pa.array([None if r.random() < 0.1 else r.randint(-2**63, 2**63 - 1) for _ in range(n)], pa.int64()),
+        "i32": pa.array([None if r.random() < 0.1 else r.randint(-2**31, 2**31 - 1) for _ in range(n)], pa.int32()),
+        "d": pa.array([datetime.date(1990, 1, 1) + datetime.timedelta(days=r.randint(0, 20000)) for _ in range(n)], pa.date32()),
+        "f": pa.array([r.uniform(-1, 1) for _ in range(n)], pa.float64()),
+    })
+    path = tmp_path / "bss_int.parquet"
+    pq.write_table(t, path, use_dictionary=False, use_byte_stream_split=["i64", "i32", "d", "f"])
+    cols, rows = mojo_read(dumper, path)
+    assert cols == [("i64", "INT", 0), ("i32", "INT", 0), ("d", "DATE", 0), ("f", "FLOAT", 0)]
+    want = t.to_pydict()
+    for i, row in enumerate(rows):
+        assert row[0] == want["i64"][i] and row[1] == want["i32"][i], i
+        assert row[2] == (want["d"][i] - datetime.date(1970, 1, 1)).days
+        assert row[3] == as_bits(want["f"][i])

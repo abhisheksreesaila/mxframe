@@ -61,7 +61,7 @@ def test_integers() raises:
     expect(r.table.get(0, 3) == 9_007_199_254_740_993, "exact past 2^53")
     expect(r.table.get(0, 4) == Int64.MIN and r.table.get(0, 5) == Int64.MAX, "the int64 limits")
     var big = read("bigint.csv", "n\n1\n9223372036854775808\n")
-    expect(big.table.kind(0) == TEXT, "a number past int64 fits no numeric kind: text")
+    expect(big.table.kind(0) == FLOAT, "a number past int64 is FLOAT (DuckDB reads it as DOUBLE)")
 
 
 def test_decimals() raises:
@@ -73,8 +73,13 @@ def test_decimals() raises:
     check_row(r, 1, "200;25000;-7;50")
     check_row(r, 2, "-325;1;150;600")
     var wide = read("dec2.csv", "x\n0.123456\n-0.123456\n")
-    expect(wide.table.kind(0) == FLOAT and wide.table.get_float(0, 0) == 0.123456 and wide.table.get_float(0, 1) == -0.123456,
-           "more than 4 places: FLOAT (F-157), correctly rounded")
+    expect(wide.table.kind(0) == DECIMAL and wide.table.scale(0) == 6 and wide.table.get(0, 0) == 123456 and wide.table.get(0, 1) == -123456,
+           "5 to 9 places: an exact DECIMAL at that scale (F-157)")
+    var long = read("dec2b.csv", "x\n0.1234567891\n-1.5\n")
+    expect(long.table.kind(0) == FLOAT and long.table.get_float(0, 0) == 0.1234567891 and long.table.get_float(0, 1) == -1.5,
+           "more than 9 places: FLOAT, correctly rounded")
+    var big = read("dec2c.csv", "x\n123456789012.123456789\n1\n")
+    expect(big.table.kind(0) == FLOAT, "a value too wide for int64 at its scale: FLOAT")
     var past = read_csv(write_file("dec4.csv", "x\n0.5\n0.25\n0.12345\n"), CsvOptions(infer_rows=2))
     expect(past.table.kind(0) == DECIMAL and past.table.scale(0) == 4 and past.table.get(0, 2) == 1235 and past.columns[0].rounded == 1,
            "past the window a DECIMAL column keeps its kind: it widens to 4 places and rounds the rest")
@@ -413,10 +418,10 @@ def test_decimal_widens_to_scale_4() raises:
            "a widened INT64_MIN is written with one minus sign")
 
 
-def test_overflow_inside_the_window_is_text() raises:
+def test_overflow_inside_the_window_is_float() raises:
     var r = read("overflow.csv", "x\n92233720368547758.08\n1.5\n")
-    expect(r.table.kind(0) == TEXT and r.columns[0].failed_count == 0, "a column that cannot hold its own values is text")
-    check_row(r, 0, "92233720368547758.08")
+    expect(r.table.kind(0) == FLOAT and r.columns[0].failed_count == 0, "a column whose values do not fit int64 at their scale is FLOAT (F-157), not text")
+    expect(r.table.get_float(0, 0) == 92233720368547758.08 and r.table.get_float(0, 1) == 1.5, "the values are doubles")
     var fits = read("fits.csv", "x\n92233720368547758.07\n1.5\n")
     expect(fits.table.kind(0) == DECIMAL and fits.table.get(0, 0) == Int64.MAX, "the largest value that fits")
 
@@ -478,6 +483,6 @@ def main() raises:
     test_unclosed_quote_is_reported()
     test_timestamp_zones_convert_to_utc()
     test_decimal_widens_to_scale_4()
-    test_overflow_inside_the_window_is_text()
+    test_overflow_inside_the_window_is_float()
     test_stray_quotes_across_chunk_boundaries()
     print("ok")

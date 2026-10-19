@@ -114,13 +114,13 @@ def test_csv_rule() raises:
     makedirs(DIR, exist_ok=True)
     var path = DIR + "f.csv"
     with open(path, "w") as f:
-        f.write("a,b,c,d,e\n1,1.5,1.25,1e3,x\n2,2.25,2.5001,2.5E-3,y\n3,,3.123456,-7,z\n")
+        f.write("a,b,c,d,e\n1,1.5,1.25,1e3,x\n2,2.25,2.5001,2.5E-3,y\n3,,3.1234567890123,-7,z\n")
     var r = read_csv(path)
     expect(r.table.kind(0) == INT, "whole numbers stay INT")
     expect(r.table.kind(1) == DECIMAL and r.table.scale(1) == 2, "up to 2 places: DECIMAL(2)")
-    expect(r.table.kind(2) == FLOAT, "more than 4 places in the first rows: FLOAT")
+    expect(r.table.kind(2) == FLOAT, "more than 9 places in the first rows: FLOAT")
     expect(r.table.kind(3) == FLOAT, "an exponent: FLOAT")
-    expect(r.table.get_float(0 + 2, 2) == 3.123456 and r.table.get_float(3, 1) == 0.0025 and r.table.get_float(3, 2) == -7.0, "the values are parsed exactly")
+    expect(r.table.get_float(2, 2) == 3.1234567890123 and r.table.get_float(3, 1) == 0.0025 and r.table.get_float(3, 2) == -7.0, "the values are parsed exactly")
     expect(r.table.get_float(2, 1) == 2.5001, "2.5001 (4 places) in a FLOAT column is the double 2.5001")
     var opts = CsvOptions()
     opts.float_columns.append("b")
