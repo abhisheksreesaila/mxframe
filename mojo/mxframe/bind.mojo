@@ -1403,17 +1403,13 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
                 b.st.exprs.append(SqlExpr(X_COL, nm, String(), -1, -1, -1, List[Int](), False, it.line, it.col))
                 items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
             continue
-        # two tables: a USING column once and first (the first table's), then the rest of each table; every name qualified
-        if only < 0:
-            for un in b.using_cols:
-                b.st.exprs.append(SqlExpr(X_COL, un, b.tab_label(0), -1, -1, -1, List[Int](), False, it.line, it.col))
-                items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
+        # two tables: the first table's columns, then the second's without a USING column (it is the first's); every name qualified
         for t in range(2):
             if only >= 0 and t != only:
                 continue
             for c in range(b.tab_start[t], b.tab_start[t] + b.tab_cols[t]):
                 var skip = False
-                if only < 0:
+                if only < 0 and t == 1:
                     for un in b.using_cols:
                         if lower_ascii(un) == lower_ascii(b.src_names[c]):
                             skip = True
