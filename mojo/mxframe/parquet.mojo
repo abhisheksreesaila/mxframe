@@ -2465,6 +2465,10 @@ struct ParquetScan(Copyable, Movable):
             total += ch.nulls
         return total
 
+    def group_null_count(self, g: Int, c: Int) -> Int:
+        """The nulls row group `g` states for column `c` in its Statistics, -1 when it states none."""
+        return self._info[].groups[g][c].nulls
+
     def column_range(self, c: Int) -> Tuple[Bool, Int64, Int64]:
         """(known, lowest, highest) stored value of column `c` from the row groups' statistics, for INT, DECIMAL and DATE columns on
         INT32, INT64 or a short FIXED_LEN_BYTE_ARRAY decimal: `known` is False when a row group states none or the column is of another

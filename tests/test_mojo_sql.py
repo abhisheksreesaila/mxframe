@@ -765,6 +765,77 @@ def test_the_register_limit_is_an_sql_error(probe, data):
                             "aggregates over different expressions (about 20); split the select list into two queries"), res
 
 
+# ── files whose footer statistics lie ────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def lying(tmp_path_factory):
+    """Four row groups of 500 rows. `honest.parquet` has g in 0..9 except one 1000 in row group 3 and one NULL in `gn` there. In
+    the lying copies the footer says that row group's maximum is 9 (`lie_max`), and also that it holds no NULL (`lie_both`)."""
+    import struct
+    import pyarrow as pa
+    d = tmp_path_factory.mktemp("lying")
+    rng = random.Random(5)
+    n = 2000
+    g = [rng.randint(0, 9) for _ in range(n)]
+    k = [rng.randint(0, 3) for _ in range(n)]
+    g[1500] = 1000
+    gn = list(g)
+    gn[1700] = None
+    tbl = pa.table({"g": pa.array(g, pa.int64()), "k": pa.array(k, pa.int64()), "gn": pa.array(gn, pa.int64())})
+    honest = d / "honest.parquet"
+    pq.write_table(tbl, honest, row_group_size=500, write_page_index=False)
+    raw = bytearray(honest.read_bytes())
+    flen = struct.unpack("<I", raw[-8:-4])[0]
+    start = len(raw) - 8 - flen
+    foot = bytes(raw[start:-8])
+    assert foot.count(struct.pack("<q", 1000)) >= 2                       # the maxima of g and gn in row group 3
+    foot = foot.replace(struct.pack("<q", 1000), struct.pack("<q", 9))
+    (d / "lie_max.parquet").write_bytes(bytes(raw[:start]) + foot + bytes(raw[-8:]))
+    nulls = bytearray(foot)
+    patched = 0
+    for i in range(len(nulls) - 1):
+        if nulls[i] == 0x16 and nulls[i + 1] == 0x02:                      # Statistics.null_count = 1 (zigzag 2)
+            nulls[i + 1] = 0x00
+            patched += 1
+    assert patched >= 1
+    (d / "lie_both.parquet").write_bytes(bytes(raw[:start]) + bytes(nulls) + bytes(raw[-8:]))
+    m = pq.ParquetFile(d / "lie_both.parquet").metadata
+    assert m.row_group(3).column(2).statistics.null_count == 0 and m.row_group(3).column(0).statistics.max == 9
+    return {"honest": honest, "lie_max": d / "lie_max.parquet", "lie_both": d / "lie_both.parquet", "con": duckdb.connect()}
+
+
+LIES = [      # (the query, whether `lie_max` makes it run again, whether `lie_both` does)
+    ("SELECT g, count(*) FROM t GROUP BY g", True, True),
+    ("SELECT k, g, count(*) FROM t GROUP BY k, g", True, True),            # a key past its range used to land in the next key's slot
+    ("SELECT g % 4, count(*), sum(g) FROM t GROUP BY g % 4", False, False),   # `g % 4` stays in 0..3 whatever g's range
+    ("SELECT gn, count(*) FROM t GROUP BY gn", True, True),
+    ("SELECT k, gn, count(*) FROM t GROUP BY k, gn", True, True),
+    ("SELECT count(*), count(gn), sum(gn), min(gn), max(gn) FROM t", False, True),     # a NULL read as 0 without the null count's check
+]
+
+
+@pytest.mark.parametrize("mode", ["scan", "framescan"])
+@pytest.mark.parametrize("file", ["honest", "lie_max", "lie_both"])
+@pytest.mark.parametrize("sql,again_max,again_both", LIES)
+def test_a_footer_that_lies_cannot_change_an_answer(probe, lying, mode, file, sql, again_max, again_both):
+    """The statistics are a hint, checked as the row groups are read: a maximum that is not one, or a null count that is too small,
+    makes the query run again without them (hashed groups, every column nullable), and the notes say so. The answer is DuckDB's on
+    the honest file's data either way."""
+    want = lying["con"].execute(sql.replace("FROM t", f"FROM read_parquet('{lying['honest']}')")).fetchall()
+    res = run_probe(probe, sql, {"t": lying[file]}, mode=mode)
+    assert_equal(got_rows(res), want, False, f"{file}/{mode}: {sql}")
+    again = [n for n in res["notes"] if n.startswith("statistics:")]
+    expect = {"honest": False, "lie_max": again_max, "lie_both": again_both}[file]
+    if expect:
+        assert len(again) == 1 and "ran again without them" in again[0], res["notes"]
+        if "GROUP BY" in sql:
+            assert next(n for n in res["notes"] if n.startswith("group:")).startswith("group: hashed"), res["notes"]
+    else:
+        assert not again, again
+    if file == "honest" and "GROUP BY" in sql and "% 4" not in sql:
+        assert next(n for n in res["notes"] if n.startswith("group:")).startswith("group: dense"), res["notes"]    # the statistics were used
+
+
 @pytest.mark.parametrize("mode", MODES)
 def test_division_by_zero_is_ieee_like_duckdb(probe, data, mode):
     """`/` is a double division: 1 / 0 is inf, -1 / 0 is -inf, 0 / 0 is NaN, 1.5 / 0 is inf; `//` and `%` by zero are NULL."""
@@ -795,8 +866,16 @@ def test_deeply_nested_expressions_raise_a_positioned_error_instead_of_crashing(
     assert parens == f"SQL error at line 1, column {prefix + 257}: this expression is nested more than 256 levels deep (parentheses, NOT or a minus sign repeated)", parens
     nots = _depth_error(probe, data, "NOT " * 3000 + "b")
     assert nots == f"SQL error at line 1, column {prefix + 4 * 255 + 1}: this expression is nested more than 256 levels deep (parentheses, NOT or a minus sign repeated)", nots
-    minus = _depth_error(probe, data, "x > " + "-" * 400 + "1")
+    minus = _depth_error(probe, data, "x > " + "- " * 400 + "1")
     assert minus.startswith("SQL error at line 1, column ") and "nested more than 256 levels deep" in minus, minus
+
+
+def test_expressions_at_the_limit_run(probe, data):
+    ds = data["g8"]
+    for where, want_sql in [("(" * 250 + "x > 1" + ")" * 250, "x > 1"), ("NOT " * 250 + "b", "b"), (" OR ".join(["x = 1"] * 255), "x = 1"),
+                            ("x + " * 254 + "1 > 5", "x * 254 + 1 > 5")]:
+        res = run_probe(probe, f"SELECT count(*) FROM t WHERE {where}", {"t": ds.path})
+        assert got_rows(res) == ds.table.execute(f"SELECT count(*) FROM t WHERE {want_sql}").fetchall(), want_sql
 
 
 def test_long_chains_of_operators_are_capped_and_a_shorter_one_runs(probe, data):

@@ -88,6 +88,7 @@ struct KeyLayout(Copyable, Movable):
     var stride: Int              # dense: the slot step of this key
     var src: Int                 # the source column of a plain-column key, else -1
     var words: Int               # hashed: key words (the value, and a NULL flag when nullable)
+    var guarded: Bool            # dense: its range came from a file's footer statistics, so rows outside it are looked for
 
 
 struct PhysicalPlan(Movable):
@@ -254,7 +255,7 @@ struct RulePlanner(Planner, Copyable, Movable):
         for k in range(len(q.keys)):
             var e = q.rexprs[q.keys[k].expr].copy()
             var kind = e.kind
-            var layout = KeyLayout(q.keys[k].expr, kind, e.scale, True, 0, 1, 1, -1, 1)
+            var layout = KeyLayout(q.keys[k].expr, kind, e.scale, True, 0, 1, 1, -1, 1, False)
             if e.op == B_COL:
                 var c = Int(e.value)
                 layout.src = c
@@ -298,6 +299,7 @@ struct RulePlanner(Planner, Copyable, Movable):
                     radix += 1
                 layout.radix = radix
             layout.words = 1 + (1 if layout.nullable else 0)
+            layout.guarded = st.kind == SRC_SCAN and kind != TEXT.value and kind != BOOL.value
             if dense_ok:
                 if domain > (1 << 40) // max(layout.radix, 1):
                     dense_ok = False
