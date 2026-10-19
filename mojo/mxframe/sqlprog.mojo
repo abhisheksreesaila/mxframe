@@ -14,7 +14,7 @@ rules, on the same `Program` type:
 - Every aggregate skips NULL: it is fed `SELECT(nul, identity, value)` and a count of the NULLs it skipped, so that
   SUM / MIN / MAX / AVG of nothing is NULL, which the finishing code reads off `rows - nulls`.
 """
-from .table import TEXT, BOOL, FLOAT, SharedTable
+from .table import TEXT, BOOL, FLOAT, F32_COLUMN, SharedTable
 from .parquet import ParquetScan
 from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
@@ -26,6 +26,7 @@ from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_G
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
+comptime OP_F32 = 34
 comptime OP_SUBF = 11        # float x - y
 comptime OP_I2F = 19
 comptime OP_SELECT = 35
@@ -272,10 +273,15 @@ struct _Emitter(Movable):
             var a = self.value(x.a)
             self.p.has_float = True
             self.ins(OP_I2F, a.reg, a.reg)
+            var real = x.scale == F32_COLUMN                       # cast to a 32-bit float (DuckDB's REAL): rounded after each step
+            if real:
+                self.ins(OP_F32, a.reg, a.reg)
             if x.value > 0:
                 var k = self.const_f(Float64(Int(pow10_checked(Int(x.value)))))
                 self.ins(OP_DIV, a.reg, a.reg, k)
                 self.free(k)
+                if real:
+                    self.ins(OP_F32, a.reg, a.reg)
             return V(a.reg, a.nul, False, True)
         if x.op == B_NEG:
             var a = self.value(x.a)
@@ -293,6 +299,8 @@ struct _Emitter(Movable):
             var b = self.value(x.b)
             if x.kind == FLOAT.value:
                 self.ins(OP_ADD if x.op == B_ADD else OP_SUB if x.op == B_SUB else OP_MUL if x.op == B_MUL else OP_DIV, a.reg, a.reg, b.reg)
+                if x.scale == F32_COLUMN:                          # REAL arithmetic: the double result rounded to 32 bits is the 32-bit result
+                    self.ins(OP_F32, a.reg, a.reg)
                 self.free(b.reg)
                 return V(a.reg, self.or_nul(a.nul, b.nul), False, True)
             self.ins(OP_IADD if x.op == B_ADD else OP_ISUB if x.op == B_SUB else OP_IMUL, a.reg, a.reg, b.reg)

@@ -618,28 +618,39 @@ struct _Binder(Movable):
             b = self.rescale(b, x.scale, ast)
 
 
-    def to_float(mut self, e: Int, ast: Int, as_f32: Bool = False) raises -> Int:
-        """The operand as a FLOAT (before aggregation: after it the evaluator reads INT and DECIMAL values as floats itself). A literal
-        is folded; `as_f32`: a literal is rounded to a 32-bit float, to meet a column the file stored as one."""
+    def to_float(mut self, e: Int, ast: Int, real: Bool = False) raises -> Int:
+        """The operand as a FLOAT. `real`: in a 32-bit context (DuckDB's REAL: the other side is a 32-bit float), so an INT or DECIMAL is
+        cast to REAL: a literal is folded to a 32-bit float, anything else is converted and rounded to 32 bits. A FLOAT stays as it is
+        (an exponent literal is a DOUBLE and is never re-rounded). After aggregation the evaluator reads INT and DECIMAL as doubles
+        itself, so only a literal is folded there and a 32-bit context with anything else raises."""
         var x = self.at(e)
-        if x.kind == FLOAT.value or self.in_post:
-            if x.kind == FLOAT.value and x.op == B_LIT and as_f32:
-                return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(Float64(Float32(Float64(from_bits=UInt64(x.value)))).to_bits()), x.text, ast)
+        if x.kind == FLOAT.value:
             return e
         if x.op == B_LIT:
-            var f = decimal_to_f32(x.value, x.scale) if as_f32 else decimal_to_float(x.value, x.scale)
+            var f = decimal_to_f32(x.value, x.scale) if real else decimal_to_float(x.value, x.scale)
             return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(f.to_bits()), x.text, ast)
-        return self.mk(B_I2F, FLOAT.value, 0, e, -1, Int64(x.scale), "", ast)
+        if self.in_post:
+            if real:
+                raise self.err(ast, "a 32-bit float (a REAL column, or min / max of one) meeting an INT or DECIMAL value that is not a literal, after aggregation, is not supported: DuckDB does it in 32 bits")
+            return e
+        if real and x.scale > 10:
+            raise self.err(ast, "a DECIMAL with more than 10 places meeting a 32-bit float is not supported")
+        return self.mk(B_I2F, FLOAT.value, F32_COLUMN if real else 0, e, -1, Int64(x.scale), "", ast)
 
-    def float_pair(mut self, mut a: Int, mut b: Int, ast: Int, compare: Bool) raises:
-        """Both operands as FLOATs. Comparing a column the file stored as 32-bit floats with a literal reads the literal as a 32-bit
-        float too (DuckDB's rule: `l_discount <= 0.07` keeps the rows holding 0.07)."""
+    def float_pair(mut self, mut a: Int, mut b: Int, ast: Int) raises -> Bool:
+        """Both operands as FLOATs, in DuckDB's type for the pair: a 32-bit float (REAL: a Parquet FLOAT column, min / max of one, its
+        negation or arithmetic) next to REAL, INT or DECIMAL is REAL (`l_discount <= 0.07` keeps the rows holding 0.07; `f = d` casts the
+        DECIMAL to REAL); next to a DOUBLE (a double column, an exponent literal such as 7e-2) it is DOUBLE. Returns True for REAL."""
         var x = self.at(a)
         var y = self.at(b)
-        var f32_a = compare and x.kind == FLOAT.value and x.op == B_COL and x.scale == F32_COLUMN and y.op == B_LIT
-        var f32_b = compare and y.kind == FLOAT.value and y.op == B_COL and y.scale == F32_COLUMN and x.op == B_LIT
-        a = self.to_float(a, ast, f32_b)
-        b = self.to_float(b, ast, f32_a)
+        var xr = x.kind == FLOAT.value and x.scale == F32_COLUMN
+        var yr = y.kind == FLOAT.value and y.scale == F32_COLUMN
+        var xd = x.kind == FLOAT.value and x.scale != F32_COLUMN
+        var yd = y.kind == FLOAT.value and y.scale != F32_COLUMN
+        var real = (xr or yr) and not xd and not yd
+        a = self.to_float(a, ast, real)
+        b = self.to_float(b, ast, real)
+        return real
 
     def text_node(mut self, e: Int) -> Bool:
         var op = self.at(e).op
@@ -676,7 +687,7 @@ struct _Binder(Movable):
         elif _is_numeric(x.kind) and _is_numeric(y.kind):
             self.align(a, b, ast)
         elif (x.kind == FLOAT.value and _is_num(y.kind)) or (y.kind == FLOAT.value and _is_num(x.kind)):
-            self.float_pair(a, b, ast, True)
+            _ = self.float_pair(a, b, ast)
         elif x.kind == y.kind and (x.kind == DATE.value or x.kind == BOOL.value):
             pass
         else:
@@ -708,14 +719,18 @@ struct _Binder(Movable):
             raise self.err(ast, "cannot apply `" + op + "` to " + kind_name(x.kind, x.scale) + " and " + kind_name(y.kind, y.scale))
         if not _is_num(x.kind) or not _is_num(y.kind):
             raise self.err(ast, "cannot apply `" + op + "` to " + kind_name(x.kind, x.scale) + " and " + kind_name(y.kind, y.scale))
-        if op == "/":                                          # DuckDB's `/` is a division of doubles
-            self.float_pair(a, b, ast, False)
-            return self.mk(B_DIV, FLOAT.value, 0, a, b, 0, "", ast)
+        if op == "/":                                          # DuckDB's `/` is a division of doubles (of 32-bit floats next to REAL)
+            var real_div = self.float_pair(a, b, ast)
+            if real_div and self.in_post:
+                raise self.err(ast, "arithmetic on 32-bit floats after aggregation is not supported: DuckDB does it in 32 bits")
+            return self.mk(B_DIV, FLOAT.value, F32_COLUMN if real_div else 0, a, b, 0, "", ast)
         if x.kind == FLOAT.value or y.kind == FLOAT.value:
             if op == "//" or op == "%":
                 raise self.err(ast, "`" + op + "` on a FLOAT value is not supported")
-            self.float_pair(a, b, ast, False)
-            return self.mk(B_ADD if op == "+" else B_SUB if op == "-" else B_MUL, FLOAT.value, 0, a, b, 0, "", ast)
+            var real_op = self.float_pair(a, b, ast)
+            if real_op and self.in_post:
+                raise self.err(ast, "arithmetic on 32-bit floats after aggregation is not supported: DuckDB does it in 32 bits")
+            return self.mk(B_ADD if op == "+" else B_SUB if op == "-" else B_MUL, FLOAT.value, F32_COLUMN if real_op else 0, a, b, 0, "", ast)
         if op == "//":
             if x.kind != INT.value or y.kind != INT.value:
                 raise self.err(ast, "`//` on a DECIMAL gives a FLOAT in DuckDB (a floor of doubles), which MX frame does not do yet: use it on integers")
@@ -761,6 +776,9 @@ struct _Binder(Movable):
         var lits = List[Int]()
         var has_null = False
         var scale = xa.scale
+        var any_double = False                                    # one DOUBLE in the list makes the whole list DOUBLE, as DuckDB's common type
+        for it in xi.items:
+            any_double = any_double or self.st.exprs[it].kind == X_FLT
         for it in xi.items:
             var ik = self.st.exprs[it].kind
             if ik == X_COL or ik == X_CALL:
@@ -781,7 +799,7 @@ struct _Binder(Movable):
                 if not self.text_node(a):
                     raise self.err(ast, "TEXT can only be tested against a list when it is a plain column")
             elif xa.kind == FLOAT.value and _is_num(l.kind):
-                lit = self.to_float(lit, it, xa.op == B_COL and xa.scale == F32_COLUMN)
+                lit = self.to_float(lit, it, xa.scale == F32_COLUMN and not any_double)
             elif _is_numeric(xa.kind) and l.kind == FLOAT.value:
                 raise self.err(it, "an IN list with a FLOAT value needs a FLOAT on the left: " + kind_name(xa.kind, xa.scale) + " IN (a float) compares as doubles")
             elif _is_numeric(xa.kind) and _is_numeric(l.kind):
@@ -999,6 +1017,7 @@ struct _Binder(Movable):
                     raise self.err(x.items[0], "median() needs numbers, found " + kind_name(a.kind, a.scale))
                 if a.kind == INT.value or a.kind == FLOAT.value:
                     rkind = FLOAT.value
+                    rscale = a.scale if a.kind == FLOAT.value else 0       # a median of REAL is REAL
                 else:
                     if a.scale + 1 > 18:
                         raise self.err(x.items[0], "median() of a DECIMAL with " + String(a.scale) + " places needs " + String(a.scale + 1) + ", past the 18 a value can hold")

@@ -14,7 +14,7 @@ the changed and appended rows; a scan is one chunk per row group. Each chunk's p
 min / max combine; hashed groups merge by key) folds into one.
 """
 from std.time import perf_counter_ns
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import (Program, QueryResult, _run_cpu, _run_mat, _merge_partial, _identity_partial, _ScanMask, _group_mask,
                     OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
@@ -746,6 +746,8 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                     vc.set_null(i)
                 elif f == F_MEDIAN and sp_a.kind == FLOAT.value and not arg_float:
                     vc.v[i] = float_bits(Float64(hres.vals[h][g]) / 10.0)
+                elif f == F_MEDIAN and arg_float and q.rexprs[sp_a.arg].scale == F32_COLUMN:       # median of REAL is a REAL: the interpolation rounded to 32 bits
+                    vc.v[i] = float_bits(Float64(Float32(Float64(from_bits=UInt64(Int64(hres.vals[h][g]))))))
                 else:
                     vc.v[i] = Int64(hres.vals[h][g])
             elif f == F_COUNT_STAR:
