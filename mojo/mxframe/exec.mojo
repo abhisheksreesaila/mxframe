@@ -13,7 +13,7 @@ from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import Program, _ScanMask, _group_mask
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP
-from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL
+from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_CAST
 from .planner import Stats, ColStat
 from .sqlprog import DictAccess, collect_columns
 from .sqleval import ValCol
@@ -118,6 +118,14 @@ def prepare_ranges(mut catalog: Catalog, q: BoundQuery) raises:
     var cols = List[Int]()
     for k in q.keys:
         _key_columns(q, k.expr, cols)
+    for x in q.rexprs:                                     # F-156: a CAST of a column to text writes the words of its range
+        if x.op == B_CAST and x.kind == TEXT.value and q.rexprs[x.a].op == B_COL and _is_range_kind(q.rexprs[x.a].kind):
+            var cc = Int(q.rexprs[x.a].value)
+            var seen = False
+            for k in cols:
+                seen = seen or k == cc
+            if not seen:
+                cols.append(cc)
     for c in cols:
         var cached = False
         for x in src.range_cols:

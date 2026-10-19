@@ -28,7 +28,7 @@ from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_G
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
                    B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, DERIVED_BASE)
-from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
+from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
                     DP_DECADE, DP_WEEK, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
@@ -42,6 +42,7 @@ comptime OP_TAB = 47            # F-156: dst = table[a - lo] (a TEXT function's 
 comptime OP_ISET = 48           # F-156: dst = 1.0 when the int64 is in a hash set (an IN list of any length)
 comptime OP_FLAG = 49           # F-156: the error flag, set where a cast met a value it cannot convert
 comptime CONCAT_LIMIT = 1 << 20     # the most pairs of words a || of two columns builds
+comptime CAST_TEXT_LIMIT = 1 << 22  # the most values a CAST of a column to text writes the words of
 
 
 struct DerivedStore(Movable):
@@ -76,18 +77,39 @@ struct DictAccess(Movable):
     var scan: Optional[ParquetScan]
     var extra: List[List[String]]
     var store: ArcPointer[DerivedStore]
+    var range_cols: List[Int]            # the lowest and highest value of integer-like columns (the planner's cache), for a CAST of a column to text
+    var range_lo: List[Int64]
+    var range_hi: List[Int64]
+    var range_has: List[Bool]
 
     def __init__(out self, table: SharedTable, scan: Optional[ParquetScan], extra: List[List[String]]):
         self.table = table
         self.scan = scan.copy()
         self.extra = extra.copy()
         self.store = ArcPointer(DerivedStore())
+        self.range_cols = List[Int]()
+        self.range_lo = List[Int64]()
+        self.range_hi = List[Int64]()
+        self.range_has = List[Bool]()
+
+    def set_ranges(mut self, cols: List[Int], lo: List[Int64], hi: List[Int64], has: List[Bool]):
+        self.range_cols = cols.copy()
+        self.range_lo = lo.copy()
+        self.range_hi = hi.copy()
+        self.range_has = has.copy()
 
     def share(self) -> DictAccess:
         """The same words, and the same derived dictionaries (not a copy of them)."""
         var d = DictAccess(self.table, self.scan, self.extra)
         d.store = self.store
+        d.set_ranges(self.range_cols, self.range_lo, self.range_hi, self.range_has)
         return d^
+
+    def range_of(self, c: Int) -> Tuple[Bool, Int64, Int64]:
+        for i in range(len(self.range_cols)):
+            if self.range_cols[i] == c:
+                return (self.range_has[i], self.range_lo[i], self.range_hi[i])
+        return (False, Int64(0), Int64(0))
 
     def has_derived(self, c: Int) -> Bool:
         var i = c - DERIVED_BASE
@@ -618,12 +640,15 @@ struct _Emitter(Movable):
             self.derive_words(e, u.words.copy())
             self.unions[e] = u^
             return
-        if x.op == B_CAST:                                         # a boolean as text: 'false' and 'true' are the codes 0 and 1
-            if not self.dicts.has_derived(x.src):
-                var ws = List[String]()
-                ws.append("false")
-                ws.append("true")
-                self.derive_words(e, ws^)
+        if x.op == B_CAST:                                         # a boolean as text: 'false' and 'true' are the codes 0 and 1; a number or a date column: its range's words
+            if self.rx[x.a].kind == BOOL.value:
+                if not self.dicts.has_derived(x.src):
+                    var ws = List[String]()
+                    ws.append("false")
+                    ws.append("true")
+                    self.derive_words(e, ws^)
+            elif e not in self.ents:
+                self.prep_number_text(e, x)
             return
 
     def prep_concat(mut self, e: Int, x: BExpr) raises:
@@ -1216,13 +1241,12 @@ struct _Emitter(Movable):
         var prec = flags >> 8
         if fk == TEXT.value:
             return self.cast_from_text(e, x)
+        if tk == TEXT.value and fk != BOOL.value:
+            return self.cast_number_text(e, x)
         var v = self.value(x.a)
         var bad = -1
         if tk == TEXT.value:                                       # a boolean: 'false' and 'true' are codes 0 and 1
-            var ws = List[String]()
-            ws.append("false")
-            ws.append("true")
-            self.derive_words(e, ws^)
+            self.prep_dict(e)
             return v^
         if tk == INT.value or tk == DECIMAL.value:
             if fk == FLOAT.value:
@@ -1308,6 +1332,57 @@ struct _Emitter(Movable):
                 return self.cast_finish(V(v.reg, v.nul, False, True), fbad, try_, String(self.rx[e].text))
             raise Error("internal: a cast of " + String(fk) + " to FLOAT reached the program")
         raise Error("internal: a cast from " + String(fk) + " to " + String(tk) + " reached the program")
+
+    def prep_number_text(mut self, e: Int, x: BExpr) raises:
+        """The words of CAST(column AS VARCHAR) for an INT, DECIMAL or DATE column: the text of every value from the column's lowest to its highest (known from
+        its statistics or one pass), made once; a date outside years 1 to 9999 (DuckDB writes `(BC)` and five digits) is marked, an error where a row holds it."""
+        var src = self.rx[x.a].copy()
+        var c = Int(src.value)
+        var r = self.dicts.range_of(c)
+        if not r[0]:
+            raise Error("CAST(" + src.text + " AS VARCHAR) needs the lowest and highest value of the column: they are not known here (a file without statistics, or a joined column)")
+        var span = Int(r[2]) - Int(r[1]) + 1
+        if span > CAST_TEXT_LIMIT:
+            raise Error("CAST(" + src.text + " AS VARCHAR): the column spans " + String(span) + " values, and the words of all of them are made once (the most is " + String(CAST_TEXT_LIMIT) + ")")
+        var words = List[String]()
+        var bad = List[UInt8](length=max(span, 1), fill=0)
+        var any_bad = False
+        for k in range(span):
+            var v = Int(r[1]) + k
+            if src.kind == DATE.value:
+                if v < -719162 or v > 2932896:
+                    words.append(String())
+                    bad[k] = 1
+                    any_bad = True
+                else:
+                    words.append(date_text(v))
+            else:
+                words.append(decimal_text(Int64(v), src.scale))
+        self.derive_words(e, words^)
+        if any_bad:
+            self.undecided[e] = bad^
+        var base = List[Int64]()
+        base.append(r[1])
+        self.ents[e] = base^                                       # (the lowest value: the code of a value is the value less this)
+        self.p.text_tabs += 1
+        self.p.text_words += span
+
+    def cast_number_text(mut self, e: Int, x: BExpr) raises -> V:
+        self.prep_dict(e)
+        var src = self.rx[x.a].copy()
+        var lo = self.ents[e][0]
+        var v = self.value(x.a)
+        var lc = self.const_i(lo)
+        self.ins(OP_ISUB, v.reg, v.reg, lc)
+        self.free(lc)
+        if e in self.undecided:
+            var fl = self.tmp()
+            self.ins(OP_I2F, fl, v.reg)
+            var set_at = self.add_set(self.undecided[e].copy(), 0)
+            self.ins(OP_IN_SET, fl, fl, set_at)
+            self.flag_errors(fl, v.nul, "CAST(" + src.text + " AS VARCHAR) of a date before year 1 or after year 9999 (DuckDB writes those with `(BC)` or five digits)")
+            self.free(fl)
+        return V(v.reg, v.nul, False)
 
     def cast_from_text(mut self, e: Int, x: BExpr) raises -> V:
         """A word's value as a number, date or boolean, parsed once per word of the dictionary; a word that does not read as one is an error where a row holds it

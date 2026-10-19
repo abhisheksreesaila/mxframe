@@ -338,7 +338,8 @@ CASTS = [
     "TRY_CAST(d AS DECIMAL(4,1))", "TRY_CAST(d AS TINYINT)", "TRY_CAST(x * 1000 AS TINYINT)", "TRY_CAST(x * 1000 AS SMALLINT)", "TRY_CAST(d * 1000000 AS DECIMAL(5,2))",
     "TRY_CAST(f AS INTEGER)", "TRY_CAST(f AS DECIMAL(10,2))", "TRY_CAST(f AS BIGINT)", "TRY_CAST(f AS SMALLINT)", "TRY_CAST(f AS REAL)", "CAST(f AS DOUBLE)", "CAST(f AS BOOLEAN)",
     "CAST(CASE WHEN f BETWEEN -1e30 AND 1e30 THEN f END AS REAL)", "CAST(CAST(CASE WHEN f BETWEEN -1e30 AND 1e30 THEN f END AS REAL) AS DOUBLE)", "CAST(b AS INTEGER)", "CAST(b AS DOUBLE)", "CAST(b AS DECIMAL(5,1))", "CAST(b AS VARCHAR)",
-    "CAST(dt AS DATE)", "CAST(s AS VARCHAR)", "CAST(x > 5 AS INTEGER)", "CAST(x > 5 AS VARCHAR)", "x::DECIMAL(8,2)", "d::INTEGER", "(x + 1)::DOUBLE", "x::BOOLEAN",
+    "CAST(dt AS DATE)", "CAST(s AS VARCHAR)", "CAST(x AS VARCHAR)", "CAST(y AS VARCHAR)", "CAST(d AS VARCHAR)", "CAST(e AS VARCHAR)", "CAST(dt AS VARCHAR)", "dt::VARCHAR || '!'", "CAST(x AS VARCHAR) || ':' || s",
+    "CAST(y AS VARCHAR) = '0'", "CAST(dt AS VARCHAR) LIKE '19%'", "length(CAST(d AS VARCHAR))", "CAST(x > 5 AS INTEGER)", "CAST(x > 5 AS VARCHAR)", "x::DECIMAL(8,2)", "d::INTEGER", "(x + 1)::DOUBLE", "x::BOOLEAN",
     "CAST(nums AS INTEGER)", "CAST(nums AS DECIMAL(10,2))", "CAST(nums AS DOUBLE)", "CAST(nums AS REAL)", "CAST(nums AS DECIMAL(7,1))",
     "TRY_CAST(nsb AS INTEGER)", "TRY_CAST(nsb AS BIGINT)", "TRY_CAST(CASE WHEN nsb <> '1e2' THEN nsb END AS DECIMAL(10,2))", "TRY_CAST(nsb AS DOUBLE)", "TRY_CAST(CASE WHEN nsb NOT IN ('NaN', 'inf', 'No', 'true') THEN nsb END AS DATE)", "TRY_CAST(nsb AS BOOLEAN)",
     "TRY_CAST(nsb AS TINYINT)", "TRY_CAST(s AS INTEGER)", "TRY_CAST(CASE WHEN s IN ('West', 'WEST', 'Éa') THEN s END AS DATE)", "TRY_CAST(s AS DOUBLE)",
@@ -359,7 +360,7 @@ def test_a_float_remainder_is_refused_by_name(probe, data):
 @pytest.mark.parametrize("expr", CASTS)
 def test_casts_as_duckdb(probe, data, mode, expr):
     res = run(probe, data, ROW.format(expr), mode, ordered=True)
-    if "nums" in expr or "nsb" in expr or "(s AS INTEGER" in expr or "s END AS DATE" in expr or "(s AS DOUBLE" in expr:
+    if "nums" in expr or "nsb" in expr or "(s AS INTEGER" in expr or "s END AS DATE" in expr or "(s AS DOUBLE" in expr or "AS VARCHAR" in expr and "(b AS" not in expr and "(s AS" not in expr and "> 5 AS" not in expr or "::VARCHAR" in expr:
         ran_per_word(res)
 
 
@@ -496,6 +497,11 @@ def test_text_in_filters_groups_aggregates_and_sorts(probe, data, mode):
         ("SELECT g, upper(s) AS u, count(*) FROM t GROUP BY g, u", None, False),
         ("SELECT s, upper(s) AS u, length(s) FROM t GROUP BY s", None, False),
         ("SELECT upper(s), count(*) FROM t GROUP BY s", None, False),
+        ("SELECT g, min(lower(s)), max(upper(s)), count(DISTINCT lower(s)), count(lower(s)) FROM t GROUP BY g",
+         "SELECT g, arg_min(lower(s), (alower(lower(s)), lower(s))), arg_max(upper(s), (alower(upper(s)), upper(s))), count(DISTINCT lower(s)), count(lower(s)) FROM t GROUP BY g", False),
+        ("SELECT median(lower(s)), quantile_disc(upper(s), 0.3) FROM t",
+         "SELECT (list(lower(s) ORDER BY alower(lower(s)), lower(s)) FILTER (WHERE s IS NOT NULL))[greatest(ceil(0.5 * count(s))::int, 1)], "
+         "(list(upper(s) ORDER BY alower(upper(s)), upper(s)) FILTER (WHERE s IS NOT NULL))[greatest(ceil(0.3 * count(s))::int, 1)] FROM t", False),
         ("SELECT g, length(min(s)) FROM t GROUP BY g", "SELECT g, length(arg_min(s, (lower(s), s))) FROM t GROUP BY g", False),
     ]:
         res = run(probe, data, sql, mode, duck, ordered)
@@ -525,3 +531,8 @@ def test_past_the_register_limit_the_query_says_so(probe, data):
     parts = ", ".join(f"sum(CASE WHEN x > {i} THEN d * {i + 1} + COALESCE(y, {i}) ELSE e END)" for i in range(40))
     res = run_probe(probe, f"SELECT {parts} FROM t", {"t": data.path}, expect_error=True)
     assert "the query needs more than 48 registers" in res["error"], res
+
+
+def test_two_big_dictionaries_are_not_multiplied_silently(probe, data):
+    res = run_probe(probe, "SELECT CAST(dt AS VARCHAR) || CAST(dt2 AS VARCHAR) FROM t", {"t": data.path}, expect_error=True)
+    assert "combinations" in res["error"] and "never per row" in res["error"], res

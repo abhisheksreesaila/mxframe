@@ -887,6 +887,7 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
                 scan.value().ensure_words(Int(e.value))
     var extra = src.overlay.words.copy()
     var dicts = DictAccess(src.table, scan, extra)
+    dicts.set_ranges(src.range_cols, src.range_lo, src.range_hi, src.range_has)
     var st = make_stats(src, q, dicts, trust)
     var plan = planner.plan(q, st, opts)
     plan_sinks(lp, q, st, opts, plan)

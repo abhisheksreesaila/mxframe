@@ -1450,8 +1450,8 @@ struct _Binder(Movable):
         if not ok:
             raise self.err(ast, "cannot cast " + kind_name(fk, ax.scale) + " to " + tname + (" (DuckDB refuses it too)" if fk == DATE.value or kind == DATE.value else
                            (": a float's text is its shortest form per row, which MX frame does not make" if fk == FLOAT.value and kind == TEXT.value else "")))
-        if kind == TEXT.value and fk != TEXT.value and fk != BOOL.value:
-            raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " is not supported yet: MX frame writes the text of a number or a date once per distinct value, and has no range for this one")
+        if kind == TEXT.value and fk != TEXT.value and fk != BOOL.value and ax.op != B_COL:
+            raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " needs a column, not an expression: MX frame writes the text of every value between the column's lowest and highest once, and knows that range for a column only")
         if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value):      # the same type: nothing to do
             return a
         if fk == BOOL.value and kind == BOOL.value:
