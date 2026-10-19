@@ -32,7 +32,7 @@ from std.bit import pop_count, byte_swap
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
 # Parquet enums (parquet.thrift)
@@ -327,6 +327,9 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         raise Error("a table with no columns cannot be written as Parquet")
     if row_group_rows < 8 or row_group_rows % 8 != 0:
         raise Error("row_group_rows must be a positive multiple of 8, got " + String(row_group_rows))
+    for c in range(t.columns()):
+        if t.cols[c].kind == FLOAT:
+            raise Error("column `" + t.cols[c].name + "` is FLOAT, a result-only kind: it cannot be written to Parquet yet (F-157)")
     var optional = List[Bool]()
     for c in range(t.columns()):
         optional.append(t.cols[c].nulls > 0)
