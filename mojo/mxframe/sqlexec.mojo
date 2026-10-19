@@ -26,11 +26,12 @@ from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan
-from .rows import build_items, run_rows, run_topk_rows, _Item
+from .post import run_post
+from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sqlprog import lower_rows
 from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
-from .sqleval import ValCol, eval_post, float_bits, ld_div
+from .sqleval import ValCol, float_bits, ld_div
 from .exec import (_table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
                    delta_table, _gather, _sort_keys, _order_rows, _SortCols, _top_rows, _fill_column, _unique_name, _to_table, _ones_mask,
                    _Chunks, _open_chunks, _load_chunk, LIE, _check_footer, _all, _Inputs, _inputs)
@@ -268,7 +269,7 @@ def _explain_text(lp: LogicalPlan, notes: List[String]) -> String:
 
 
 def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hres: HolResult, hol_of: List[Int],
-            dicts: DictAccess, mut notes: List[String]) raises -> Table:
+            dicts: DictAccess, opts: PlannerOptions, mut notes: List[String]) raises -> Table:
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
     var t_a = perf_counter_ns()
     var gids = List[Int]()
@@ -348,64 +349,10 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
     var t_c = perf_counter_ns()
-    # HAVING
-    var skeys = List[ValCol]()
-    var saggs = List[ValCol]()
-    if q.having >= 0:
-        var hv = eval_post(q, q.having, keys, aggs, dicts, n)
-        var sel = List[Int]()
-        for i in range(n):
-            if not hv.is_null(i) and hv.v[i] != 0:
-                sel.append(i)
-        for k in keys:
-            skeys.append(_gather(k, sel))
-        for a in aggs:
-            saggs.append(_gather(a, sel))
-    else:                                                       # nothing to filter: the columns move on as they are
-        skeys = keys^
-        saggs = aggs^
-    var m = n if q.having < 0 else (skeys[0].n() if len(skeys) > 0 else saggs[0].n() if len(saggs) > 0 else 0)
-    var t_d = perf_counter_ns()
-    # ORDER BY, OFFSET, LIMIT
-    var fin = List[Int]()
-    var notes_sort = String()
-    if len(q.order) > 0:
-        var ocols = List[ValCol]()
-        for o in q.order:
-            ocols.append(eval_post(q, o.expr, skeys, saggs, dicts, m))
-        var want = (q.offset + q.limit) if q.limit >= 0 else -1
-        if want >= 0 and want <= 4096 and m > 8 * want:
-            fin = _top_rows(ocols, q.order, dicts, m, want)
-            notes_sort = "top-" + String(want) + " by a bounded heap over " + commas(m) + " groups"
-        else:
-            fin = _order_rows(ocols, q.order, dicts, m)
-            notes_sort = "sorted " + commas(m) + " groups by " + String(len(q.order)) + (" key" if len(q.order) == 1 else " keys") + " (stable radix passes)"
-    else:
-        for i in range(m):
-            fin.append(i)
-    if notes_sort.byte_length() > 0:
-        notes.append("order: " + notes_sort)
-    if q.having >= 0:
-        notes.append("having: " + commas(m) + " of " + commas(n) + " groups kept")
-    var lo = min(q.offset, len(fin))
-    var hi = len(fin) if q.limit < 0 else min(len(fin), lo + q.limit)
-    var rows = List[Int]()
-    for i in range(lo, hi):
-        rows.append(fin[i])
-    var fkeys = List[ValCol]()
-    for k in skeys:
-        fkeys.append(_gather(k, rows))
-    var faggs = List[ValCol]()
-    for a in saggs:
-        faggs.append(_gather(a, rows))
-    var t_e = perf_counter_ns()
-    var outs = List[ValCol]()
-    for e in q.outputs:
-        var vc = eval_post(q, e, fkeys, faggs, dicts, len(rows))
-        outs.append(vc^)
-    var table = _to_table(q, outs, dicts)
-    notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, having " +
-                 _ms(Float64(t_d - t_c) / 1e6) + " ms, order " + _ms(Float64(t_e - t_d) / 1e6) + " ms, output " + _ms(Float64(perf_counter_ns() - t_e) / 1e6) + " ms")
+    # HAVING, the select list, ORDER BY, OFFSET and LIMIT: a row query over the groups (post.mojo)
+    var table = run_post(q, keys, aggs, dicts, opts, n, notes)
+    notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, then HAVING, ORDER BY and the select list over the groups " +
+                 _ms(Float64(perf_counter_ns() - t_c) / 1e6) + " ms")
     return table^
 
 
@@ -714,7 +661,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         for h in range(len(hs.specs)):
             hol_of[hs.specs[h].agg] = h
     var t_fin = perf_counter_ns()
-    var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, notes)
+    var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, opts, notes)
     notes.append("time: " + ("decode " + _ms(ms_load) + " ms, " if scan_mode else "") + "kernel " + _ms(ms_run - ms_load) + " ms, holistic states " + _ms(Float64(t_fin - t_hol) / 1e6) + " ms, finish " + _ms(Float64(perf_counter_ns() - t_fin) / 1e6) + " ms")
     return table^
 
@@ -744,26 +691,9 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
     var inp = _inputs(src, q, trust)
     var sp = SqlProgram(Program(0))
-    var built = build_items(q, plan.top_k > 0) if q.rows else (List[_Item](), List[Int]())
+    var stage = RowStage(SqlProgram(Program(0)), List[_Item]())
     if q.rows:
-        try:
-            sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
-                            _alias_lists(src), inp.masked)
-        except e:
-            var msg = String(e)
-            if msg.startswith("the query is too big for one program"):
-                raise sql_error(q.line, q.col, msg + ": it computes too many different expressions (about 20 in the select list and ORDER BY); split it in two")
-            if msg.startswith("the query has more than"):
-                raise sql_error(q.line, q.col, msg + " (a program holds 64 different numbers); split the query in two")
-            raise e^
-        var names = String()
-        var read = collect_columns(q)
-        for k in range(len(read)):
-            names += (", " if k > 0 else "") + src.table.name(read[k])
-        res.notes.append("columns read: " + names + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
-        res.notes.append("kernel: " + String(sp.instr) + " instructions a row, " + String(len(built[1])) + " computed " + ("value" if len(built[1]) == 1 else "values") +
-                         ", " + String(len(built[0]) - len(built[1])) + " plain " + ("column" if len(built[0]) - len(built[1]) == 1 else "columns") + " gathered")
-        res.notes.append("device: CPU (SQL runs on the CPU)")
+        stage = prepare_rows(src, q, plan, dicts, inp, res.notes, True)
     else:
         sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
         _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
@@ -779,10 +709,7 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         return res^
     var notes = res.notes.copy()
     if q.rows:
-        if plan.top_k > 0:
-            res.table = run_topk_rows(src, q, plan, opts, dicts, notes, inp, sp^, built[0], trust)
-        else:
-            res.table = run_rows(src, q, plan, opts, dicts, notes, inp, sp^, built[0], trust)
+        res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust)
     else:
         res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
     res.notes = notes^

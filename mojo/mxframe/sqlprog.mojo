@@ -14,18 +14,21 @@ rules, on the same `Program` type:
 - Every aggregate skips NULL: it is fed `SELECT(nul, identity, value)` and a count of the NULLs it skipped, so that
   SUM / MIN / MAX / AVG of nothing is NULL, which the finishing code reads off `rows - nulls`.
 """
-from .table import TEXT, BOOL, SharedTable
+from .table import TEXT, BOOL, FLOAT, SharedTable
 from .parquet import ParquetScan
 from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
                     CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, _frame_mask, _null_mask)
 from .frame import _text_less
 from .bind import (BoundQuery, BExpr, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
-                   B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
+                   B_IDIV, B_IMOD, B_NEG, B_DIV, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
+comptime OP_ADDF = 10        # float x + y
 comptime OP_SUBF = 11        # float x - y
+comptime OP_MULF = 12
+comptime OP_DIVF = 13        # IEEE: x / 0 is inf, -inf or NaN
 comptime OP_I2F = 19
 comptime OP_SELECT = 35
 comptime OP_IN_SET = 37
@@ -253,6 +256,8 @@ struct _Emitter(Movable):
             return V(self.const_i(x.value), -1, False)
         if x.op == B_NULL:
             return V(self.const_i(0), self.const_f(1.0), False)
+        if x.kind == FLOAT.value:                                  # F-152: a float expression (after aggregation): float registers
+            return self.float_value(x)
         if x.op == B_RESCALE:
             var a = self.value(x.a)
             var k = self.const_i(pow10_checked(Int(x.value)))
@@ -280,6 +285,78 @@ struct _Emitter(Movable):
             self.free(b.reg)
             return V(a.reg, self.or_nul(a.nul, b.nul), False)
         raise Error("internal: expression kind " + String(x.op) + " is not a row-level value")
+
+    def as_float(mut self, e: Int) raises -> V:
+        """The expression as a float register: a FLOAT as it is; an INT or DECIMAL converted the way DuckDB casts it (the stored
+        integer as a double, divided by 10^scale). A conversion of an integer past 2^53 stops the kernel (the executor says so)."""
+        var x = self.rx[e].copy()
+        if x.kind == FLOAT.value:
+            return self.value(e)
+        var v = self.value(e)
+        self.ins(OP_I2F, v.reg, v.reg)
+        if x.scale > 0:
+            var k = self.const_f(Float64(Int(pow10_checked(x.scale))))
+            self.ins(OP_DIVF, v.reg, v.reg, k)
+            self.free(k)
+        return v^
+
+    def float_value(mut self, x: BExpr) raises -> V:
+        if x.op == B_NEG:
+            var a = self.as_float(x.a)
+            var m = self.const_f(-1.0)
+            self.ins(OP_MULF, a.reg, a.reg, m)
+            self.free(m)
+            return a^
+        if x.op == B_ADD or x.op == B_SUB or x.op == B_MUL or x.op == B_DIV:
+            var a = self.as_float(x.a)
+            var b = self.as_float(x.b)
+            self.ins(OP_ADDF if x.op == B_ADD else OP_SUBF if x.op == B_SUB else OP_MULF if x.op == B_MUL else OP_DIVF, a.reg, a.reg, b.reg)
+            self.free(b.reg)
+            return V(a.reg, self.or_nul(a.nul, b.nul), False)
+        raise Error("internal: expression kind " + String(x.op) + " is not a float value")
+
+    def float_compare(mut self, x: BExpr) raises -> V:
+        """A comparison with a FLOAT side, in DuckDB's order: NaN equals NaN and is greater than every number."""
+        var a = self.as_float(x.a)
+        var b = self.as_float(x.b)
+        var code = Int(x.value)
+        var na = self.tmp()
+        self.ins(C_NE, na, a.reg, a.reg)                          # 1.0 where a is NaN
+        var nb = self.tmp()
+        self.ins(C_NE, nb, b.reg, b.reg)
+        var eq = self.tmp()
+        self.ins(C_EQ, eq, a.reg, b.reg)
+        var both = self.tmp()
+        self.ins(OP_AND, both, na, nb)
+        self.ins(OP_OR, eq, eq, both)                             # equal, or both NaN
+        var res: Int
+        if code == C_EQ or code == C_NE:
+            res = eq
+            if code == C_NE:
+                self.ins(OP_NOT, eq, eq)
+            self.free(both)
+        else:
+            var strict = self.tmp()
+            var extra = both                                      # the NaN case: a < b if only b is NaN; a > b if only a is NaN
+            if code == C_LT or code == C_LE:
+                self.ins(C_LT, strict, a.reg, b.reg)
+                self.ins(OP_NOT, extra, na)
+                self.ins(OP_AND, extra, extra, nb)
+            else:
+                self.ins(C_GT, strict, a.reg, b.reg)
+                self.ins(OP_NOT, extra, nb)
+                self.ins(OP_AND, extra, extra, na)
+            self.ins(OP_OR, strict, strict, extra)
+            self.free(extra)
+            if code == C_LE or code == C_GE:
+                self.ins(OP_OR, strict, strict, eq)
+            self.free(eq)
+            res = strict
+        self.free(na)
+        self.free(nb)
+        self.free(a.reg)
+        self.free(b.reg)
+        return self.with_unknown(res, self.or_nul(a.nul, b.nul))
 
     def divmod(mut self, x: BExpr) raises -> V:
         """a // b or a % b truncating toward zero (DuckDB's), from the kernel's floor division: the quotient is one more
@@ -386,6 +463,8 @@ struct _Emitter(Movable):
         var lhs = self.rx[x.a].copy()
         if lhs.kind == TEXT.value:
             return self.text_compare(x)
+        if lhs.kind == FLOAT.value or self.rx[x.b].kind == FLOAT.value:
+            return self.float_compare(x)
         var a = self.value(x.a)
         var b = self.value(x.b)
         var r = a.reg

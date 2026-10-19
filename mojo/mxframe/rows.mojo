@@ -18,13 +18,13 @@ from std.time import perf_counter_ns
 from std.atomic import Atomic
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import text_ranks, _radix_order
-from .query import Program, MAGIC, SRC_WORDS, CTL_REG
+from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
 from .sql import sql_error
 from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, pow10_checked
 from .planner import PhysicalPlan, PlannerOptions, commas
-from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey
+from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey, collect_columns
 from .sqleval import ValCol
 from .exec import (_table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
@@ -145,6 +145,8 @@ def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: 
     _ = out_vals^
     _ = out_cnt^
     _ = ctl^
+    if rc == E_OVERFLOW:
+        raise Error(OVERFLOW_MESSAGE)
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     # compact: the blocks' entries move down over the gaps the filter left (a block never moves up)
@@ -182,8 +184,13 @@ def _append_run(mut dst: ValCol, p: LP, nul: BP, has_nul: Bool, m: Int):
     var at = len(dst.v)
     dst.v.resize(at + m, 0)
     var d = dst.v.unsafe_ptr() + at
-    for j in range(m):
-        d[j] = p[j]
+    if dst.kind == FLOAT.value:                                  # every NaN is the one NaN (DuckDB's: equal to itself, past every number)
+        for j in range(m):
+            var x = Float64(from_bits=UInt64(p[j]))
+            d[j] = p[j] if x == x else Int64(0x7FF8000000000000)
+    else:
+        for j in range(m):
+            d[j] = p[j]
     if has_nul:
         if len(dst.nul) == 0:
             dst.nul = List[UInt8](length=at, fill=0)
@@ -277,6 +284,15 @@ def build_items(q: BoundQuery, keys_computed: Bool = False) -> Tuple[List[_Item]
 # ── top-k: per-worker heaps in the hook ──────────────────────────────────────────────────────────────
 
 @always_inline
+def _float_order(bits: Int64) -> Int64:
+    """A float64's bits as an integer whose signed order is the number's order, NaN (any) above every number."""
+    var f = Float64(from_bits=UInt64(bits))
+    if f != f:
+        return Int64.MAX
+    return bits ^ ((bits >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
+
+
+@always_inline
 def _before(ctl: LP, nk: Int, av: LP, an: BP, aid: Int, bv: LP, bn: BP, bid: Int) -> Bool:
     """Row a sorts before row b: by each key (NULLS FIRST / LAST, descending, TEXT through its ranks), ties by row number."""
     for k in range(nk):
@@ -290,7 +306,10 @@ def _before(ctl: LP, nk: Int, av: LP, an: BP, aid: Int, bv: LP, bn: BP, bid: Int
             return x_null == (w[2] != 0)
         var x = av[slot]
         var y = bv[slot]
-        if w[3] != 0:
+        if w[3] == -1:                                           # a FLOAT: its bits in the order of the numbers, every NaN last
+            x = _float_order(x)
+            y = _float_order(y)
+        elif w[3] != 0:
             var rk = LP(unsafe_from_address=Int(w[3]))
             x = rk[Int(x)]
             y = rk[Int(y)]
@@ -365,13 +384,16 @@ def _topk_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
     var k0_v = LP(unsafe_from_address=Int(regs + Int(slots[2 * k0_slot]) * VEC))
     var k0_has_null = slots[2 * k0_slot + 1] >= 0
     var k0_n = LP(unsafe_from_address=Int(regs + Int(slots[2 * k0_slot + 1]) * VEC)) if k0_has_null else k0_v
-    var k0_rank = LP(unsafe_from_address=Int(k0[3])) if k0[3] != 0 else k0_v
+    var k0_rank = LP(unsafe_from_address=Int(k0[3])) if k0[3] > 0 else k0_v
     for j in range(nsel):
         var row = row0 + (Int(sel[j]) if use_sel else j)
         if Int(size_p[0]) == K and not (k0_has_null and k0_n[j] != 0) and nuls[k0_slot] == 0:
             var x = k0_v[j]
             var y = vals[k0_slot]
-            if k0[3] != 0:
+            if k0[3] == -1:
+                x = _float_order(x)
+                y = _float_order(y)
+            elif k0[3] != 0:
                 x = k0_rank[Int(x)]
                 y = k0_rank[Int(y)]
             if x != y and ((x < y) if k0[1] != 0 else (x > y)):
@@ -487,6 +509,8 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
     _ = out_cnt^
     _ = ctl^
     _ = table^                                                # (the hook reads these through addresses: keep them alive past the call)
+    if rc == E_OVERFLOW:
+        raise Error(OVERFLOW_MESSAGE)
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var out = RowChunk()
@@ -505,7 +529,7 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
 
 
 def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-             inp: _Inputs, var sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
+             inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
     """Reads the chunks, collects the selected rows (ordered, cut) and makes the result table."""
     var used = inp.used.copy()
     var ch = _open_chunks(src, used)
@@ -612,7 +636,7 @@ def _concat(a: ValCol, b: ValCol) -> ValCol:
 
 
 def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-                  inp: _Inputs, var sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
+                  inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
     """ORDER BY with a small LIMIT: each chunk's kernel run keeps the best K = limit + offset rows in per-worker heaps; the candidates
     (at most workers x K) are merged with the best so far and cut to K again, so the rest of the rows are never materialized."""
     var used = inp.used.copy()
@@ -635,6 +659,8 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
                 words.append(dicts.word(x.src, c))
             ranks.append(text_ranks(words))
             key_rank.append(Int(ranks[len(ranks) - 1].unsafe_ptr()))
+        elif x.kind == FLOAT.value:
+            key_rank.append(-1)
         else:
             key_rank.append(0)
     var best = List[ValCol]()
@@ -718,3 +744,48 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
     notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if inp.scan_mode else "") + "kernel and merge " + _ms(ms_run - Float64(ns_load) / 1e6) +
                  " ms, output " + _ms(Float64(perf_counter_ns() - t_out) / 1e6) + " ms")
     return table^
+
+
+struct RowStage(Movable):
+    """A row query ready to run: its kernel program and the columns it collects."""
+    var sp: SqlProgram
+    var items: List[_Item]
+
+    def __init__(out self, var sp: SqlProgram, var items: List[_Item]):
+        self.sp = sp^
+        self.items = items^
+
+
+def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, mut notes: List[String],
+                 report: Bool) raises -> RowStage:
+    """Lowers a row query (the program computes what is not a plain column; a top-k also computes its sort keys) and, when `report`,
+    says in the notes which columns it reads and what the kernel does."""
+    var built = build_items(q, plan.top_k > 0)
+    var sp: SqlProgram
+    try:
+        sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
+                        _alias_lists(src), inp.masked)
+    except e:
+        var msg = String(e)
+        if msg.startswith("the query is too big for one program"):
+            raise sql_error(q.line, q.col, msg + ": it computes too many different expressions (about 20 in the select list and ORDER BY); split it in two")
+        if msg.startswith("the query has more than"):
+            raise sql_error(q.line, q.col, msg + " (a program holds 64 different numbers); split the query in two")
+        raise e^
+    if report:
+        var names = String()
+        var read = collect_columns(q)
+        for k in range(len(read)):
+            names += (", " if k > 0 else "") + src.table.name(read[k])
+        notes.append("columns read: " + names + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
+        notes.append("kernel: " + String(sp.instr) + " instructions a row, " + String(len(built[1])) + " computed " + ("value" if len(built[1]) == 1 else "values") +
+                     ", " + String(len(built[0]) - len(built[1])) + " plain " + ("column" if len(built[0]) - len(built[1]) == 1 else "columns") + " gathered")
+        notes.append("device: CPU (SQL runs on the CPU)")
+    return RowStage(sp^, built[0].copy())
+
+
+def execute_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
+                 inp: _Inputs, var stage: RowStage, trust: Bool) raises -> Table:
+    if plan.top_k > 0:
+        return run_topk_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust)
+    return run_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust)

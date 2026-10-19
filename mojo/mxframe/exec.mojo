@@ -222,7 +222,7 @@ def _sort_keys(vc: ValCol, dicts: DictAccess) raises -> List[Int64]:
     if vc.kind == FLOAT.value:
         for i in range(n):
             var b = vc.v[i]
-            keys[i] = b ^ ((b >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
+            keys[i] = 0 if vc.is_null(i) else b ^ ((b >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
         return keys^
     if vc.kind == TEXT.value:
         var seen = List[Int](length=0, fill=0)
@@ -249,7 +249,7 @@ def _sort_keys(vc: ValCol, dicts: DictAccess) raises -> List[Int64]:
                 keys[i] = ranks[Int(at[Int(vc.v[i])])]
         return keys^
     for i in range(n):
-        keys[i] = vc.v[i]
+        keys[i] = 0 if vc.is_null(i) else vc.v[i]                  # (a NULL's stored value means nothing: NULLs tie, whatever the kernel left there)
     return keys^
 
 
@@ -383,30 +383,34 @@ def _unique_name(t: Table, name: String) -> String:
     return name + "_" + String(i)
 
 
+def _put_column(mut t: Table, name: String, vc: ValCol, dicts: DictAccess) raises:
+    """Adds `vc` to the table as a column called `name`; a TEXT column gets a compact dictionary of the words actually present."""
+    var kind = ColumnKind(vc.kind)
+    var c = t.add_column(_unique_name(t, name), kind, scale=vc.scale)
+    if vc.kind == TEXT.value:
+        var n = vc.n()
+        var mx = 0
+        for r in range(n):
+            if not vc.is_null(r):
+                mx = max(mx, Int(vc.v[r]))
+        var remap = List[Int32](length=mx + 1, fill=-1)
+        var codes = List[Int64](length=n, fill=0)
+        for r in range(n):
+            if vc.is_null(r):
+                continue
+            var old = Int(vc.v[r])
+            if remap[old] < 0:
+                remap[old] = Int32(t.add_word(c, dicts.word(vc.src, old)))
+            codes[r] = Int64(remap[old])
+        _fill_column(t.cols[c], codes, vc.nul)
+    else:
+        _fill_column(t.cols[c], vc.v, vc.nul)
+
+
 def _to_table(q: BoundQuery, outs: List[ValCol], dicts: DictAccess) raises -> Table:
     var t = Table.empty()
     for i in range(len(outs)):
-        ref vc = outs[i]
-        var kind = ColumnKind(vc.kind)
-        var c = t.add_column(_unique_name(t, q.out_names[i]), kind, scale=vc.scale)
-        if vc.kind == TEXT.value:
-            var n = vc.n()
-            var mx = 0
-            for r in range(n):
-                if not vc.is_null(r):
-                    mx = max(mx, Int(vc.v[r]))
-            var remap = List[Int32](length=mx + 1, fill=-1)
-            var codes = List[Int64](length=n, fill=0)
-            for r in range(n):
-                if vc.is_null(r):
-                    continue
-                var old = Int(vc.v[r])
-                if remap[old] < 0:
-                    remap[old] = Int32(t.add_word(c, dicts.word(vc.src, old)))
-                codes[r] = Int64(remap[old])
-            _fill_column(t.cols[c], codes, vc.nul)
-        else:
-            _fill_column(t.cols[c], vc.v, vc.nul)
+        _put_column(t, q.out_names[i], outs[i], dicts)
     return t^
 
 
