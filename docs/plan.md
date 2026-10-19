@@ -1550,7 +1550,7 @@ Needs: F-150 (parallel with F-153..F-155) · Size: M
 - [ ] dates: EXTRACT, date_trunc, date ± INTERVAL, date differences in integer civil-date arithmetic
 - [ ] division / modulo by zero, decimal result scales, integer `/` → FLOAT as DuckDB; past the register limit a readable error, never a wrong answer; equal to DuckDB per function × nulls × case / accents × leap years and pre-1970 dates
 
-## F-157 M8: FLOAT64 as a column kind [review]
+## F-157 M8: FLOAT64 as a column kind [done]
 Needs: F-150 (parallel) · Size: L · real files and the repo's own TPC-H Parquet (`float` money columns) were refused before
 - [x] FLOAT kind (float64 bits in the Int64 column); Parquet FLOAT / DOUBLE read and written; CSV exponents and decimals past 4 places as FLOAT when asked
 - [x] comparisons, arithmetic, SUM / AVG in float64 with a defined order (reproducible, F-064), MIN / MAX, group and join keys with -0.0 = 0.0 and one NaN, NaN ordered as DuckDB
@@ -1560,6 +1560,7 @@ Built (2026-10-18): rules in `docs/mxframe-mojo-api.md` ("FLOAT64 (F-157)"). Par
 - Review round 1 fixes: DuckDB's REAL model in SQL (REAL with INT / DECIMAL / REAL is 32-bit, with a DOUBLE or an exponent literal 64-bit, REAL arithmetic rounded to 32 bits, unmodelled forms raise by name; TPC-H is now compared with native DuckDB); a base cell is null by its validity bit only (any value, the old and the new marker included, is data); CSV: more than 4 places is FLOAT by default (as DuckDB: an exact DECIMAL(6) has no int128 behind it, so `sum(rate * qty)` would raise), exact DECIMAL is the opt-in `CsvOptions(decimal_columns)`, wider than int64 is FLOAT; BYTE_STREAM_SPLIT for INT32 / INT64; `strtod_l` in the C locale; FLOAT text is the shortest that reads back (`floatfmt.mojo`); the float-sum bits' dependence on plan and source layout is documented (not removed).
 - Not done / limits: `//` and `%` on a FLOAT, `CAST` / `::` (F-156), float join keys (no joins yet: F-153; the key normalisation is `holistic.float_key` and the hashed group words), a float group key in the builder (dense integer keys only), an integer past 2^53 meeting a float raises, GPU. DuckDB does REAL arithmetic in 32 bits; MX frame widens first, so the tests cast to DOUBLE inside arithmetic.
 - Tests: `mojo/tests/test_float.mojo`; `tests/test_mojo_float_parquet.py`, `test_mojo_float_csv.py`, `test_mojo_float_sql.py`, `test_mojo_float_sql_paths.py` (frames after 250 edits, threads, 32-bit column, TPC-H SF1 Q1 / Q6 / by discount / median), `test_mojo_float_builder.py` (table, scan, frame, frame over a scan; bit-identical sums over threads / morsels / block size).
+- Reviews: round 1 NEEDS WORK (REAL compared by expression shape: silent wrong counts), round 2 (exact DECIMAL for 5-9 CSV places overflowed ordinary products without int128), round 3 (shortest text at powers of two), all fixed; round 4 PASS (1,999,738 doubles print exactly as Python repr; 15,600 + 3,000 fuzz runs; TPC-H SF1 equal to DuckDB). Final rules: REAL typed through expressions as DuckDB; CSV past 4 places or wider than int64 is FLOAT, `CsvOptions(decimal_columns=)` opts into exact DECIMAL; base nulls from validity bits; strtod_l in the C locale; float sum bits documented as depending on plan / streaming / grouping
 
 ## F-158 M8: joins and big GROUP BYs over streamed files and edited frames [todo]
 Needs: F-155 · Size: L
