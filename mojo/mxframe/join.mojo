@@ -15,14 +15,14 @@ gets a compact dictionary), and the rows and columns that survive are the side's
 
 Nothing here knows an application: the sides are `SharedTable`s and the output is a Table.
 """
-from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .table import Table, SharedTable, Column, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .bind import (BoundQuery, BExpr, Catalog, KeySpec, AggSpec, SortKey, copy_query, B_COL, B_LIT, B_AND, pow10_checked)
 from .holistic import float_key
 from .kernels._fpenv import par_n, core_count
 from .kernels.hashjoin_cpu import JoinMap, hj_build, hj_probe_pairs, hj_probe_unique, hj_release, E_BUDGET
 from .sqlprog import DictAccess
 from .sqleval import ValCol
-from .exec import _put_column
+from .exec import _put_column, _unique_name
 from .planner import commas
 
 comptime JOIN_BUDGET_BYTES = 3 << 30        # the joined rows a join may materialize (8 bytes a value); past it a readable error (spill is later)
@@ -209,8 +209,16 @@ struct JoinKeys(Movable):
     var bcomp: List[List[Int64]]     # verify: each key column's normalized values
     var pcomp: List[List[Int64]]
     var layout: String               # for the notes: how several keys became one
+    var bk_addr: Int                 # the arrays the kernel reads: the lists above, or a column's own values when no key had to change
+    var bo_addr: Int                 # (a `ok` address of 0: every row may match)
+    var pk_addr: Int
+    var po_addr: Int
 
     def __init__(out self):
+        self.bk_addr = 0
+        self.bo_addr = 0
+        self.pk_addr = 0
+        self.po_addr = 0
         self.bkeys = List[Int64]()
         self.bok = List[UInt8]()
         self.pkeys = List[Int64]()
@@ -267,9 +275,35 @@ def _column_keys(t: SharedTable, c: Int, kind: Int, mul: Int64, translate: List[
             vp[i] = v
 
 
+def _ok_bytes(t: SharedTable, c: Int, mut ok: List[UInt8]) -> Int:
+    """The `ok` bytes of a column's validity (0 when it has no NULL: every row may match)."""
+    if t.null_count(c) == 0:
+        return 0
+    var n = t.rows()
+    ok = List[UInt8](unsafe_uninit_length=n)
+    var valid = _valid_bits(t, c)
+    var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
+    for i in range(n):
+        ok[i] = (bits[i >> 3] >> UInt8(i & 7)) & 1
+    return Int(ok.unsafe_ptr())
+
+
 def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: List[Int], mut keys: JoinKeys) raises:
     """The keys of the build side `bt` and the probe side `pt`, columns `bcols[j]` and `pcols[j]` being compared pairwise."""
     var nk = len(bcols)
+    if nk == 1:
+        var kind = bt.kind(bcols[0]).value
+        var bs = bt.scale(bcols[0])
+        var ps = pt.scale(pcols[0])
+        var numeric = kind == INT.value or kind == DECIMAL.value
+        if (numeric and bs == ps) or kind == DATE.value or kind == BOOL.value or (kind == TEXT.value and False):
+            # the key is the column itself: no pass over the rows, only the NULL flags (when there are any)
+            keys.bk_addr = Int(bt.values(bcols[0]).unsafe_ptr())
+            keys.pk_addr = Int(pt.values(pcols[0]).unsafe_ptr())
+            keys.bo_addr = _ok_bytes(bt, bcols[0], keys.bok)
+            keys.po_addr = _ok_bytes(pt, pcols[0], keys.pok)
+            keys.layout = "one key (the column itself)"
+            return
     var bvals = List[List[Int64]]()
     var boks = List[List[UInt8]]()
     var pvals = List[List[Int64]]()
@@ -316,6 +350,10 @@ def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: Li
         keys.bkeys = bvals[0].copy()
         keys.pkeys = pvals[0].copy()
         keys.layout = "one key"
+        keys.bk_addr = Int(keys.bkeys.unsafe_ptr())
+        keys.pk_addr = Int(keys.pkeys.unsafe_ptr())
+        keys.bo_addr = Int(keys.bok.unsafe_ptr())
+        keys.po_addr = Int(keys.pok.unsafe_ptr())
         return
     # several keys: packed into one int64 when the build side's ranges multiply to fewer than 2^62 values
     var los = List[Int64]()
@@ -353,6 +391,10 @@ def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: Li
                 else:
                     keys.pkeys[i] = Int64(UInt64(keys.pkeys[i]) + UInt64(pvals[j][i] - los[j]) * stride)
             stride *= spans[j]
+        keys.bk_addr = Int(keys.bkeys.unsafe_ptr())
+        keys.pk_addr = Int(keys.pkeys.unsafe_ptr())
+        keys.bo_addr = Int(keys.bok.unsafe_ptr())
+        keys.po_addr = Int(keys.pok.unsafe_ptr())
         return
     keys.verify = True
     keys.layout = String(nk) + " keys hashed to one int64 (their ranges are too wide to pack), pairs verified against the columns"
@@ -368,29 +410,36 @@ def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: Li
         keys.pkeys[i] = Int64(h)
     keys.bcomp = bvals^
     keys.pcomp = pvals^
+    keys.bk_addr = Int(keys.bkeys.unsafe_ptr())
+    keys.pk_addr = Int(keys.pkeys.unsafe_ptr())
+    keys.bo_addr = Int(keys.bok.unsafe_ptr())
+    keys.po_addr = Int(keys.pok.unsafe_ptr())
 
 
 # ── the pairs ────────────────────────────────────────────────────────────────────────────────────────
 
 struct JoinPairs(Movable):
-    """The matching (probe row, build row) pairs, in probe-row order."""
+    """The matching (probe row, build row) pairs, in probe-row order: two Int32 arrays the kernel allocated (freed with the pairs)."""
     var n: Int
-    var probe: List[Int32]
-    var build: List[Int32]
+    var probe_a: Int
+    var build_a: Int
 
     def __init__(out self):
         self.n = 0
-        self.probe = List[Int32]()
-        self.build = List[Int32]()
+        self.probe_a = 0
+        self.build_a = 0
+
+    def __del__(deinit self):
+        hj_release(self.probe_a)
+        hj_release(self.build_a)
 
 
-def join_pairs(m: JoinMap, keys: JoinKeys, budget_rows: Int, threads: Int) raises -> JoinPairs:
+def join_pairs(m: JoinMap, keys: JoinKeys, n_probe: Int, budget_rows: Int, threads: Int) raises -> JoinPairs:
     var out = JoinPairs()
-    var np = len(keys.pkeys)
-    if np == 0:
+    if n_probe == 0:
         return out^
     var info = List[Int64](length=4, fill=0)
-    var rc = hj_probe_pairs(m, Int(keys.pkeys.unsafe_ptr()), Int(keys.pok.unsafe_ptr()), np, threads, budget_rows, Int(info.unsafe_ptr()))
+    var rc = hj_probe_pairs(m, keys.pk_addr, keys.po_addr, n_probe, threads, budget_rows, Int(info.unsafe_ptr()))
     if rc == E_BUDGET:
         raise Error("the join produces " + commas(Int(info[0])) + " rows, past the budget of " + commas(budget_rows) + " (the joined columns would take over " +
                     String(JOIN_BUDGET_BYTES >> 30) + " GiB): filter either side first, or join on a unique key (a join that spills to disk is not built yet)")
@@ -413,71 +462,100 @@ def join_pairs(m: JoinMap, keys: JoinKeys, budget_rows: Int, threads: Int) raise
                 kept += 1
         n = kept
     out.n = n
-    out.probe = List[Int32](unsafe_uninit_length=n)
-    out.build = List[Int32](unsafe_uninit_length=n)
-    for i in range(n):
-        out.probe[i] = pr[i]
-        out.build[i] = br[i]
-    hj_release(Int(info[1]))
-    hj_release(Int(info[2]))
+    out.probe_a = Int(info[1])
+    out.build_a = Int(info[2])
     return out^
 
 
-def gather_join(lt: SharedTable, rt: SharedTable, pairs: JoinPairs, left_builds: Bool, threads: Int) raises -> Table:
-    """The joined table: every column of `lt` at its rows of the pairs, then every column of `rt` at its rows (the build side's rows are
-    the pairs' `build`, the probe side's the pairs' `probe`)."""
-    var n = pairs.n
-    var ncols = lt.columns() + rt.columns()
-    var cols = List[ValCol]()
-    for c in range(lt.columns()):
-        var vc = ValCol(lt.kind(c).value, lt.scale(c), n)
-        vc.src = c
-        cols.append(vc^)
-    for c in range(rt.columns()):
-        var vc = ValCol(rt.kind(c).value, rt.scale(c), n)
-        vc.src = c
-        cols.append(vc^)
-    var nl = lt.columns()
-    var tasks = max(1, min(threads if threads > 0 else core_count(), ncols))
-    # one task per column, workers taking columns round-robin
-    var vptrs = List[Int]()
-    var nptrs = List[Int]()
-    for c in range(ncols):
-        if lt.columns() + rt.columns() > 0:
-            if (lt.null_count(c) > 0) if c < nl else (rt.null_count(c - nl) > 0):
-                cols[c].nul = List[UInt8](length=n, fill=0)
-        vptrs.append(Int(cols[c].v.unsafe_ptr()))
-        nptrs.append(Int(cols[c].nul.unsafe_ptr()) if len(cols[c].nul) > 0 else 0)
-    var lp = Int(pairs.build.unsafe_ptr()) if left_builds else Int(pairs.probe.unsafe_ptr())
-    var rp = Int(pairs.probe.unsafe_ptr()) if left_builds else Int(pairs.build.unsafe_ptr())
+struct JoinSide(Movable):
+    """One side of the join: its table, the table's columns the joined rows carry (the needed ones, in order) and the table's column of each
+    join key. A side with no filter over a plain table is the source table itself (nothing is copied); any other side is the result of a row
+    query over its source."""
+    var table: SharedTable
+    var cols: List[Int]
+    var key_cols: List[Int]
+    var zero_copy: Bool
 
-    def work(w: Int) {imm}:
-        var c = w
-        while c < ncols:
-            var side = c < nl
-            var sc = c if side else c - nl
-            var src = (lt.values(sc) if side else rt.values(sc)).unsafe_ptr()
-            var valid = _valid_bits(lt, sc) if side else _valid_bits(rt, sc)
-            var rows = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=lp if side else rp)
-            var dst = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=vptrs[c])
-            for i in range(n):
-                dst[i] = src[Int(rows[i])]
-            if nptrs[c] != 0 and valid != 0:
-                var nd = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=nptrs[c])
-                var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
-                for i in range(n):
-                    var r = Int(rows[i])
-                    if (bits[r >> 3] >> UInt8(r & 7)) & 1 == 0:
-                        nd[i] = 1
-            c += tasks
+    def __init__(out self, table: SharedTable, var cols: List[Int], var key_cols: List[Int], zero_copy: Bool):
+        self.table = table
+        self.cols = cols^
+        self.key_cols = key_cols^
+        self.zero_copy = zero_copy
+
+
+def _gather_column(src: Int, valid: Int, rows_a: Int, n: Int, dst_a: Int, nul_a: Int, threads: Int):
+    """dst[i] = src[rows[i]] (and the NULL byte from the validity bits), over slices of the rows in parallel."""
+    var tasks = max(1, min(threads if threads > 0 else core_count(), n // 32768 + 1))
+
+    def work(t: Int) {imm}:
+        var s = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=src)
+        var rows = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=rows_a)
+        var dst = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=dst_a)
+        var a = n * t // tasks
+        var b = n * (t + 1) // tasks
+        for i in range(a, b):
+            dst[i] = s[Int(rows[i])]
+        if nul_a != 0 and valid != 0:
+            var nd = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=nul_a)
+            var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
+            for i in range(a, b):
+                var r = Int(rows[i])
+                nd[i] = 1 - ((bits[r >> 3] >> UInt8(r & 7)) & 1)
 
     par_n(work, tasks, tasks)
+
+
+def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: Bool, threads: Int) raises -> Table:
+    """The joined table: the carried columns of the left side at its rows of the pairs, then the right side's (the build side's rows are the
+    pairs' build rows, the probe side's the pairs' probe rows)."""
+    var n = pairs.n
     var t = Table.empty()
-    var ldicts = DictAccess(lt, None, List[List[String]]())
-    var rdicts = DictAccess(rt, None, List[List[String]]())
-    for c in range(ncols):
-        if c < nl:
-            _put_column(t, lt.name(c), cols[c], ldicts)
-        else:
-            _put_column(t, rt.name(c - nl), cols[c], rdicts)
+    for side in range(2):
+        ref sd = left if side == 0 else right
+        var rows_a = (pairs.build_a if left_builds else pairs.probe_a) if side == 0 else (pairs.probe_a if left_builds else pairs.build_a)
+        for c in sd.cols:
+            var kind = sd.table.kind(c)
+            var col = t.add_column(_unique_name(t, sd.table.name(c)), kind, scale=sd.table.scale(c))
+            var vals = List[Int64](unsafe_uninit_length=n)
+            var has_nulls = sd.table.null_count(c) > 0
+            var nul = List[UInt8](length=n if has_nulls else 0, fill=0)
+            _gather_column(Int(sd.table.values(c).unsafe_ptr()), _valid_bits(sd.table, c), rows_a, n, Int(vals.unsafe_ptr()),
+                           Int(nul.unsafe_ptr()) if has_nulls else 0, threads)
+            if kind == TEXT:                                          # the side's whole dictionary, codes unchanged
+                var words = sd.table.dictionary(c)
+                for w in range(len(words)):
+                    _ = t.add_word(col, String(words[w]))
+            _fill_column_owned(t.cols[col], vals^, nul^)
+    return t^
+
+
+def _fill_column_owned(mut col: Column, var vals: List[Int64], var nul: List[UInt8]):
+    col.values = vals^
+    if len(nul) > 0:
+        var n = len(col.values)
+        col.validity = List[UInt8](length=(n + 7) // 8, fill=0xFF)
+        var nulls = 0
+        for i in range(n):
+            if nul[i] != 0:
+                col.validity[i // 8] &= ~(UInt8(1) << UInt8(i % 8))
+                nulls += 1
+        col.nulls = nulls
+        if nulls == 0:
+            col.validity = List[UInt8]()
+
+
+def virtual_schema(left: JoinSide, right: JoinSide) raises -> Table:
+    """A table with no rows that has the joined columns' names, kinds, scales, dictionaries and NULL counts: what the planner and the
+    program's lowering read of the joined source when the join is fused (the rows come from the probe table and the build side's gather)."""
+    var t = Table.empty()
+    for side in range(2):
+        ref sd = left if side == 0 else right
+        for c in sd.cols:
+            var kind = sd.table.kind(c)
+            var col = t.add_column(_unique_name(t, sd.table.name(c)), kind, scale=sd.table.scale(c))
+            if kind == TEXT:
+                var words = sd.table.dictionary(c)
+                for w in range(len(words)):
+                    _ = t.add_word(col, String(words[w]))
+            t.cols[col].nulls = sd.table.null_count(c)
     return t^

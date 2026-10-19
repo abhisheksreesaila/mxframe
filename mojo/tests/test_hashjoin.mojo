@@ -1,6 +1,6 @@
 # F-153: the hash join kernel (kernels_aot/hashjoin_cpu.mojo) against a plain dictionary, on every layout it chooses.
 from std.collections import Dict
-from mxframe.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, hj_release, MODE_DIRECT, MODE_HASH,
+from mxframe.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, MapView, hj_release, MODE_DIRECT, MODE_HASH,
                                           MODE_EMPTY, E_BUDGET)
 from mxframe.kernels.hashjoin_cpu import IP, LP, BP
 
@@ -104,7 +104,7 @@ def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[I
             sel[nsel] = Int32(i)
             nsel += 1
         var prow = List[Int32](length=np, fill=0)
-        var kept = hj_probe_block(m, LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+        var kept = hj_probe_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
                                   pok != 0, 0, IP(unsafe_from_address=Int(sel.unsafe_ptr())), nsel, IP(unsafe_from_address=Int(prow.unsafe_ptr())))
         var q = 0
         for i in range(0, np, 2):

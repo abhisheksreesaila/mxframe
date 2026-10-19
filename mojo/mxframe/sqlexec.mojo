@@ -16,10 +16,10 @@ min / max combine; hashed groups merge by key) folds into one.
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .frame import NULL_EDIT, text_ranks, _radix_order
-from .query import (Program, QueryResult, _run_cpu, _run_mat, _merge_partial, _identity_partial, _ScanMask, _group_mask,
+from .query import (Program, QueryResult, _run_cpu, _run_mat, _key_from_reg0, _make_result, _merge_partial, _identity_partial, _ScanMask, _group_mask,
                     OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
 from .kernels._fpenv import core_count, par_n
-from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, pipeline_keyed
+from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
 from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks, float_key
 from .sql import sql_error, EXPLAIN_NONE
@@ -27,9 +27,11 @@ from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
-from .join import (needed_columns, side_query, joined_query, JoinKeys, normalize_keys, join_pairs, gather_join, JOIN_BUDGET_BYTES)
+from .join import (needed_columns, side_query, joined_query, JoinKeys, JoinSide, normalize_keys, join_pairs, gather_join, virtual_schema, JOIN_BUDGET_BYTES)
 from .kernels.hashjoin_cpu import hj_build
 from .kargs import KernelRun
+from .jfront import FusedJoin, front_spec, jf_front
+from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sqlprog import lower_rows
 from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
@@ -214,7 +216,7 @@ def _hashed_result(run: KernelRun, res_r: Int, n_slots: Int, nkw: Int) -> Partia
     return out^
 
 
-def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int) raises -> Partial:
+def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, threads: Int, fj: Optional[ArcPointer[FusedJoin]]) raises -> Partial:
     """The kernel with hashed groups (hashagg_cpu.hash_aggregate): each worker numbers the key tuples of its rows in a local
     table, the partitions are merged in parallel, and the result is the groups with their key words, slots and counts."""
     var run = KernelRun(sp.p, sp.set_bytes, sp.set_meta, t, mask_addr)
@@ -228,7 +230,16 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
                 o[j] = src[j]
         return True
 
-    var rc = run.hashed(keyw, nkw, t.rows(), threads, res_r)
+    var rc: Int
+    if fj:
+        var fs = front_spec(run, fj.value()[], sp.p)
+
+        def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
+            return jf_front(fs, i0, n, sel, ws)
+
+        rc = run.hashed_fused(keyw, front, fs.ws_bytes, nkw, t.rows(), threads, res_r)
+    else:
+        rc = run.hashed(keyw, nkw, t.rows(), threads, res_r)
     if rc == -7 or rc == E_OVERFLOW:
         raise Error(overflow_message(sp.p.has_float))
     if rc != 0:
@@ -370,14 +381,37 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
     return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy())
 
 
+def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: Int, fj: ArcPointer[FusedJoin]) raises -> QueryResult:
+    """The dense / global aggregate over the rows the join's front stage lets through (the kernel call of query.mojo's `_run_cpu`, fused)."""
+    ref p = sp.p
+    var run = KernelRun(p, sp.set_bytes, sp.set_meta, t, mask_addr, p.groups)
+    var fs = front_spec(run, fj[], p)
+
+    def front(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
+        return jf_front(fs, i0, n, sel, ws)
+
+    var rc: Int
+    if p.keyed:
+        rc = run.fused(_key_from_reg0, front, fs.ws_bytes, True, p.groups, 0, t.rows(), threads)
+    else:
+        rc = run.fused(_no_keys, front, fs.ws_bytes, False, 1, 0, t.rows(), threads)
+    if rc == E_OVERFLOW:
+        raise Error(overflow_message(p.has_float))
+    if rc != 0:
+        raise Error("the CPU kernel failed with code " + String(rc))
+    return _make_result(p, run.out_vals, run.out_cnt)
+
+
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex) raises:
+          mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex, fj: Optional[ArcPointer[FusedJoin]]) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator."""
     if plan.group == G_HASHED:
-        _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads), ops, ix)
+        _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, ix)
         return
     var r: QueryResult
-    if sp.p.mat:
+    if fj:
+        r = _run_dense_fused(chunk, sp, mask_addr, threads, fj.value())
+    elif sp.p.mat:
         r = _run_mat(chunk, sp.p, mask_addr, hs, 0)
     else:
         r = _run_cpu(chunk, sp.p, mask_addr, 0, -1, 0, threads)
@@ -554,7 +588,7 @@ def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: Dict
 
 
 def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
-             mut notes: List[String], inp: _Inputs, var sp: SqlProgram, trust: Bool = True) raises -> Table:
+             mut notes: List[String], inp: _Inputs, var sp: SqlProgram, trust: Bool = True, fj: Optional[ArcPointer[FusedJoin]] = None) raises -> Table:
     var used = inp.used.copy()
     var scan_mode = inp.scan_mode
     var two_pass = plan.group == G_HASHED and plan.holistic
@@ -568,6 +602,8 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var ix = _KeyIndex()
     var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
     var ch = _open_chunks(src, used)
+    if fj:
+        ch.override = fj.value()[].probe
     var delta_rows = len(src.overlay.delta)
     var t_run = perf_counter_ns()
     var ns_load = 0
@@ -577,7 +613,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if trust:
             _check_footer(src, ch, i, chunk)
         ns_load += perf_counter_ns() - t_load
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix, fj)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
                     " outside the range of a group key that the footer gave")
@@ -626,8 +662,57 @@ def _ms(x: Float64) -> String:
     return String(Float64(Int(x * 100.0)) / 100.0)
 
 
+def _fuse_inputs(mut inp: _Inputs, fj: FusedJoin):
+    """The program of a fused join reads the probe table's own columns where the joined column is one, and placeholder columns after them
+    (the front stage points those at the gathered build-side values)."""
+    var np = fj.probe.columns()
+    for v in range(fj.virtual_columns()):
+        inp.pos[v] = fj.vreal[v] if fj.vprobe[v] else np + fj.vpartner[v]
+    inp.chunk_cols = np + len(fj.partner)
+
+
+def _prefill_ranges(mut src: SqlSource, jq: BoundQuery, pt: SharedTable, bt: SharedTable, vprobe: List[Bool], vreal: List[Int]):
+    """The value range of each integer-like joined column a group key reads, from the real tables (the schema holds no rows to scan)."""
+    var cols = List[Int]()
+    for k in jq.keys:
+        _key_columns(jq, k.expr, cols)
+    for c in cols:
+        var r = _column_range(pt if vprobe[c] else bt, vreal[c])
+        src.range_cols.append(c)
+        src.range_lo.append(r[1])
+        src.range_hi.append(r[2])
+        src.range_has.append(r[0])
+
+
 def _side_names(q: BoundQuery, t: Int) -> String:
     return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
+
+
+def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool) raises -> JoinSide:
+    """Side `t` of the join: the source table itself when nothing filters it and it is a plain table, else the result of a row query."""
+    ref src = catalog.sources[q.sources[t]]
+    var start = q.tab_start[t]
+    var conj = q.conj_l.copy() if t == 0 else q.conj_r.copy()
+    var keycols = q.jk_l.copy() if t == 0 else q.jk_r.copy()
+    if len(conj) == 0 and src.kind == SRC_TABLE and len(src.overlay.mask) == 0 and len(src.overlay.delta) == 0:
+        var cols = List[Int]()
+        for g in needed:
+            cols.append(g - start)
+        var kc = List[Int]()
+        for g in keycols:
+            kc.append(g - start)
+        return JoinSide(src.table, cols^, kc^, True)
+    var sq = side_query(catalog, q, t, needed)
+    var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
+    var cols = List[Int]()
+    for i in range(len(needed)):
+        cols.append(i)
+    var kc = List[Int]()
+    for g in keycols:
+        for i in range(len(needed)):
+            if needed[i] == g:
+                kc.append(i)
+    return JoinSide(r.take_table().share(), cols^, kc^, False)
 
 
 def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
@@ -650,52 +735,71 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var lneed = needed_columns(q, 0)
     var rneed = needed_columns(q, 1)
     var t_sides = perf_counter_ns()
-    var lq = side_query(catalog, q, 0, lneed)
-    var rq = side_query(catalog, q, 1, rneed)
-    var lres = _run_sql_once(catalog, lq, planner, opts, trust, String())
-    var rres = _run_sql_once(catalog, rq, planner, opts, trust, String())
-    var lt = lres.take_table().share()
-    var rt = rres.take_table().share()
+    var left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
+    var right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
     var ms_sides = Float64(perf_counter_ns() - t_sides) / 1e6
-    var left_builds = lt.rows() < rt.rows()
-    var bt = lt if left_builds else rt
-    var pt = rt if left_builds else lt
-    var bneed = lneed.copy() if left_builds else rneed.copy()
-    var pneed = rneed.copy() if left_builds else lneed.copy()
-    var bkeyc = q.jk_l.copy() if left_builds else q.jk_r.copy()
-    var pkeyc = q.jk_r.copy() if left_builds else q.jk_l.copy()
-    var bcols = List[Int]()
-    var pcols = List[Int]()
-    for k in range(len(bkeyc)):
-        for i in range(len(bneed)):
-            if bneed[i] == bkeyc[k]:
-                bcols.append(i)
-        for i in range(len(pneed)):
-            if pneed[i] == pkeyc[k]:
-                pcols.append(i)
+    var lrows = left.table.rows()
+    var rrows = right.table.rows()
+    var left_builds = lrows < rrows
     var t_keys = perf_counter_ns()
     var keys = JoinKeys()
-    normalize_keys(bt, pt, bcols, pcols, keys)
+    if left_builds:
+        normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys)
+    else:
+        normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys)
+    var nb = lrows if left_builds else rrows
+    var np = rrows if left_builds else lrows
     var t_build = perf_counter_ns()
-    var m = hj_build(Int(keys.bkeys.unsafe_ptr()), Int(keys.bok.unsafe_ptr()), bt.rows(), opts.threads)
+    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads)
     var t_probe = perf_counter_ns()
     var ncols = len(lneed) + len(rneed)
     var budget = JOIN_BUDGET_BYTES // (8 * max(ncols, 1))
-    var pairs = join_pairs(m, keys, budget, opts.threads)
-    var t_gather = perf_counter_ns()
-    var jt = gather_join(lt, rt, pairs, left_builds, opts.threads)
-    var ms_gather = Float64(perf_counter_ns() - t_gather) / 1e6
-    res.notes.append("join: inner on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lt.rows()) + " rows of " + _side_names(q, 0) +
-                     " and " + commas(rt.rows()) + " rows of " + _side_names(q, 1) + " after their filters")
-    res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(bt.rows()) + " rows, the smaller side): " + m.kind())
+    res.notes.append("join: inner on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lrows) + " rows of " + _side_names(q, 0) +
+                     " and " + commas(rrows) + " rows of " + _side_names(q, 1) + " after their filters" +
+                     (" (" + _side_names(q, 0) + " read in place)" if left.zero_copy else "") + (" (" + _side_names(q, 1) + " read in place)" if right.zero_copy else ""))
+    res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(nb) + " rows, the smaller side): " + m.kind())
     res.notes.append("join keys: " + keys.layout)
-    res.notes.append("join path: materialized: " + commas(pairs.n) + " matching pairs gathered into one table of " + String(ncols) + " columns")
-    res.notes.append("join time: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build " + _ms(Float64(t_probe - t_build) / 1e6) +
-                     " ms, probe " + _ms(Float64(t_gather - t_probe) / 1e6) + " ms, gather " + _ms(ms_gather) + " ms")
-    var cat2 = Catalog()
-    cat2.add_table("join", jt^.share())
+    res.notes.append("join time: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build " + _ms(Float64(t_probe - t_build) / 1e6) + " ms")
+    var any_holistic = False
+    for a in q.aggs:
+        if a.hol:
+            any_holistic = True
     var jq = joined_query(q, lneed, rneed)
-    var inner = _run_sql_once(cat2, jq, planner, opts, trust, lie)
+    var cat2 = Catalog()
+    var inner: SqlResult
+    if m.unique and not keys.verify and not any_holistic and opts.fuse:
+        # fused: no joined row is written; the pipeline probes block by block and gathers the build side's columns into scratch
+        var vprobe = List[Bool]()
+        var vreal = List[Int]()
+        for c in left.cols:
+            vprobe.append(not left_builds)
+            vreal.append(c)
+        for c in right.cols:
+            vprobe.append(left_builds)
+            vreal.append(c)
+        var pside_cols = right.cols.copy() if left_builds else left.cols.copy()
+        var vt = virtual_schema(left, right)
+        cat2.add_table("join", vt^.share())
+        cat2.sources[0].fixed_rows = np
+        var pt = right.table if left_builds else left.table
+        var bt = left.table if left_builds else right.table
+        _prefill_ranges(cat2.sources[0], jq, pt, bt, vprobe, vreal)
+        var kind_text = m.kind()
+        var fj = ArcPointer(FusedJoin(pt, bt, vprobe^, vreal^, m^, keys^))
+        res.notes.append("join path: fused: " + commas(np) + " probe rows look their partner up in blocks of 1,024 and " + String(len(fj[].partner)) +
+                         " build-side " + ("column is" if len(fj[].partner) == 1 else "columns are") + " gathered into per-worker scratch (no joined row is written)")
+        inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
+    else:
+        var t_gather = perf_counter_ns()
+        var pairs = join_pairs(m, keys, np, budget, opts.threads)
+        var jt = gather_join(left, right, pairs, left_builds, opts.threads)
+        var ms_gather = Float64(perf_counter_ns() - t_gather) / 1e6
+        res.notes.append("join path: materialized: " + commas(pairs.n) + " matching pairs gathered into one table of " + String(ncols) + " columns" +
+                         ("" if opts.fuse else " (fusing is off in the options)") + ("" if (not m.unique or keys.verify or not any_holistic) else " (a holistic aggregate needs every joined row)") +
+                         (" (the keys are hashed tuples, verified per pair)" if keys.verify else "") + ("" if m.unique else " (the build side's keys repeat)"))
+        res.notes.append("join time: gather " + _ms(ms_gather) + " ms")
+        cat2.add_table("join", jt^.share())
+        inner = _run_sql_once(cat2, jq, planner, opts, trust, lie)
     for n in inner.notes:
         res.notes.append(n)
     res.table = inner.take_table()
@@ -704,7 +808,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     return res^
 
 
-def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, opts: PlannerOptions, trust: Bool, lie: String) raises -> SqlResult:
+def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
+                              fj: Optional[ArcPointer[FusedJoin]] = None) raises -> SqlResult:
     var t0 = perf_counter_ns()
     var lp = build_plan(q0, catalog.sources[q0.source].name)         # the plan; the executor lowers its query from the nodes
     var q = executable(lp, q0)
@@ -727,10 +832,15 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
     if lie.byte_length() > 0:
         res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
     var inp = _inputs(src, q, trust)
+    var partner = List[Bool]()
+    if fj:                                                           # the fused join: the program's table columns are the probe table's, then placeholders
+        for v in fj.value()[].vprobe:
+            partner.append(not v)
+        _fuse_inputs(inp, fj.value()[])
     var sp = SqlProgram(Program(0))
     var stage = RowStage(SqlProgram(Program(0)), List[_Item]())
     if q.rows:
-        stage = prepare_rows(src, q, plan, dicts, inp, res.notes, True)
+        stage = prepare_rows(src, q, plan, dicts, inp, res.notes, True, partner)
     else:
         sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
         _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
@@ -746,9 +856,9 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
         return res^
     var notes = res.notes.copy()
     if q.rows:
-        res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust)
+        res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust, fj)
     else:
-        res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
+        res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust, fj)
     res.notes = notes^
     res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6

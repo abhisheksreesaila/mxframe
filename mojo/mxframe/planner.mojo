@@ -37,8 +37,10 @@ struct PlannerOptions(Copyable, Movable):
     var group: Int                           # GROUP_AUTO, GROUP_DENSE or GROUP_HASHED
     var dense_limit: Int
     var threads: Int                         # 0: every core
+    var fuse: Bool                           # a join with unique build keys is fused into the pipeline (False: its pairs are materialized)
 
     def __init__(out self):
+        self.fuse = True
         self.group = GROUP_AUTO
         self.dense_limit = DEFAULT_DENSE_LIMIT
         self.threads = 0

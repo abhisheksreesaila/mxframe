@@ -20,16 +20,19 @@ from .holistic import float_key
 
 
 def _table_addresses(t: SharedTable, p: Program, mask_addr: Int) -> List[Int64]:
+    """The program's column table: a pointer per program column. A column the table does not have (a join's build-side column, which the
+    fused front stage supplies per block) is a placeholder 0."""
     var tbl: List[Int64] = [0, Int64(t.rows())]
+    var n = t.columns()
     for c in p.cols:
         if c >= 0:
-            tbl.append(Int64(Int(t.values(c).unsafe_ptr())))
+            tbl.append(Int64(Int(t.values(c).unsafe_ptr())) if c < n else Int64(0))
         elif c == -1_000_000 or c == -5_000_000:
             tbl.append(0)
         elif c == -4_000_000:
             tbl.append(Int64(mask_addr))
         else:
-            tbl.append(Int64(t._table[].cols[-1 - c].validity_address()))
+            tbl.append(Int64(t._table[].cols[-1 - c].validity_address()) if -1 - c < n else Int64(0))
     return tbl^
 
 
@@ -432,10 +435,12 @@ struct _Chunks(Movable):
     var gm: List[UInt8]
     var mask_addr: Int
     var masked: Bool
+    var override: Optional[SharedTable]   # a fused join: the probe table is the chunk (the source's own table is only the joined schema)
     var starts: List[Int]            # a scan: the frame row where each of `groups` starts
     var delta_first: Bool            # read the changed rows' chunk before the shared ones (a LIMIT that stops early needs them all)
 
     def __init__(out self):
+        self.override = None
         self.starts = List[Int]()
         self.delta_first = False
         self.groups = List[Int]()
@@ -495,7 +500,7 @@ def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
                 mx = max(mx, scan.group_rows(g))
             ch.ones = _ones_mask(mx)
     else:
-        ch.base = src.table.rows() > 0
+        ch.base = src.rows() > 0
         if ch.masked:
             ch.ones = _ones_mask(len(src.overlay.delta))
     return ch^
@@ -508,6 +513,8 @@ def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
         return delta_table(src, ch.used)
     if not ch.scan_mode:
         ch.mask_addr = Int(src.overlay.mask.unsafe_ptr()) if ch.masked else 0
+        if ch.override:
+            return ch.override.value()
         return src.table
     var g = ch.groups[i]
     ref scan = src.scan.value()

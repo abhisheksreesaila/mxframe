@@ -37,8 +37,10 @@ struct SqlSource(Copyable, Movable):
     var range_lo: List[Int64]
     var range_hi: List[Int64]
     var range_has: List[Bool]
+    var fixed_rows: Int              # F-153: the rows of a joined schema whose table holds none (the probe side's); -1 otherwise
 
     def __init__(out self, name: String, table: SharedTable):
+        self.fixed_rows = -1
         self.name = name
         self.kind = SRC_TABLE
         self.table = table
@@ -56,6 +58,8 @@ struct SqlSource(Copyable, Movable):
 
     def rows(self) -> Int:
         """Rows in the source as registered (a frame: its base rows plus appended, removed rows included)."""
+        if self.fixed_rows >= 0:
+            return self.fixed_rows
         if self.scan:
             return self.scan.value().rows()
         return self.table.rows()

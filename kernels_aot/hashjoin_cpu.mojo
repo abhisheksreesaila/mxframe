@@ -145,6 +145,35 @@ struct JoinMap(Movable):
         return base + (", unique keys" if self.unique else ", repeated keys (CSR rows)")
 
 
+struct MapView(ImplicitlyCopyable, Movable):
+    """The addresses and numbers a lookup needs, as plain values: a copy a closure can capture (a map keeps its memory; the view must
+    not outlive it)."""
+    var mode: Int
+    var unique: Bool
+    var lo: Int64
+    var hi: Int64
+    var u: Int
+    var s: Int
+    var r: Int
+    var ent: Int
+    var eoff: Int
+    var pbits: Int
+    var bitmap: Int
+
+    def __init__(out self, m: JoinMap):
+        self.mode = m.mode
+        self.unique = m.unique
+        self.lo = m.lo
+        self.hi = m.hi
+        self.u = m.u
+        self.s = m.s
+        self.r = m.r
+        self.ent = m.ent
+        self.eoff = m.eoff
+        self.pbits = m.pbits
+        self.bitmap = m.bitmap
+
+
 @always_inline
 def _slice(n: Int, t: Int, T: Int) -> Int:
     return n * t // T
@@ -677,20 +706,19 @@ def hj_release(addr: Int):
     _free(addr)
 
 
-def hj_probe_block(m: JoinMap, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, nsel: Int, prow: IP) -> Int:
+def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, nsel: Int, prow: IP) -> Int:
     """The fused form (a map with unique keys): for the block rows `sel[0..nsel)` (row = i0 + sel[j]) look the key up; rows with a partner stay
     in `sel` (compacted in place, in order) and `prow[q]` is the partner's build row of the q-th kept row. Returns how many are kept."""
-    if m.mode == MODE_EMPTY:
+    if v.mode == MODE_EMPTY:
         return 0
-    var mode = m.mode
-    var lo = m.lo
-    var hi = m.hi
-    var span = m.span
-    var u = m.u
-    var ent = m.ent
-    var eoff = LP(unsafe_from_address=m.eoff)
-    var pbits = m.pbits
-    var bitmap = m.bitmap
+    var mode = v.mode
+    var lo = v.lo
+    var hi = v.hi
+    var u = v.u
+    var ent = v.ent
+    var eoff = LP(unsafe_from_address=v.eoff)
+    var pbits = v.pbits
+    var bitmap = v.bitmap
     var kept = 0
     var i = 0
     while i < nsel:
@@ -698,7 +726,7 @@ def hj_probe_block(m: JoinMap, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP,
         for j in range(g):
             var row = i0 + Int(sel[i + j])
             if (not has_ok) or ok[row] != 0:
-                _prefetch_key(mode, lo, hi, span, True, u, 0, ent, eoff, pbits, bitmap, keys[row])
+                _prefetch_key(mode, lo, hi, 0, True, u, 0, ent, eoff, pbits, bitmap, keys[row])
         for j in range(g):
             var s0 = sel[i + j]
             var row = i0 + Int(s0)
