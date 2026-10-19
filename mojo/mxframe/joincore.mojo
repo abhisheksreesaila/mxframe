@@ -129,6 +129,51 @@ def _column_keys(t: SharedTable, c: Int, kind: Int, mul: Int64, translate: List[
             vp[i] = v
 
 
+def column_ndv(t: SharedTable, c: Int, threads: Int = 0) -> Int:
+    """The number of distinct non-NULL values of a column (the join planner's statistic), from an even sample of at most 32,768 rows (every row of a
+    smaller table). The sample's repeated values give the estimate: m sampled rows of d equally frequent values collide in about m(m-1) / (2d) pairs, so
+    d is about m(m-1) / (2 x pairs) (a key that never collides is taken as unique; the estimate is at least the distinct values seen and at most the rows).
+    Exact for a table that fits the sample; an order of magnitude is what the join order needs."""
+    var n = t.rows()
+    if n == 0:
+        return 0
+    var src = t.values(c).unsafe_ptr()
+    var valid = _valid_bits(t, c)
+    var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
+    var step = max(1, n // 32768)
+    var m = 0
+    var slots = 1 << 17
+    var keys = List[Int64](length=slots, fill=0)
+    var counts = List[Int32](length=slots, fill=0)
+    var distinct = 0
+    var pairs = 0
+    var i = 0
+    while i < n:
+        if valid == 0 or (bits[i >> 3] >> UInt8(i & 7)) & 1 != 0:
+            var v = src[i]
+            var h = Int(_mix(UInt64(v)) >> 47) & (slots - 1)
+            while counts[h] != 0 and keys[h] != v:
+                h = (h + 1) & (slots - 1)
+            if counts[h] == 0:
+                keys[h] = v
+                distinct += 1
+            else:
+                pairs += Int(counts[h])                            # a new row of a value seen `counts[h]` times collides with each of them
+            counts[h] += 1
+            m += 1
+        i += step
+    if m == 0:
+        return 0
+    if step == 1:
+        return distinct                                            # every row was looked at: exact
+    var est = distinct
+    if pairs == 0:
+        est = n
+    else:
+        est = Int(Float64(m) * Float64(m - 1) / (2.0 * Float64(pairs)))
+    return max(min(est, n), distinct)
+
+
 def unmatchable_not_null(mut keys: JoinKeys, lo: Int64, hi: Int64, probe: SharedTable, c: Int, n: Int):
     """NOT IN: a probe row whose value can equal no build key (a TEXT word the build side lacks, a decimal that overflows when aligned) is not a NULL key,
     and a NULL key is the only one NOT IN drops. `ok` cannot tell the two apart, so such a row becomes an ordinary key outside the build map's range
@@ -558,10 +603,8 @@ def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: 
             var nul = List[UInt8](length=n if has_nulls else 0, fill=0)
             _gather_column(Int(sd.table.values(c).unsafe_ptr()), _valid_bits(sd.table, c), rows_a, n, Int(vals.unsafe_ptr()),
                            Int(nul.unsafe_ptr()) if has_nulls else 0, threads)
-            if kind == TEXT:                                          # the side's whole dictionary, codes unchanged
-                var words = sd.table.dictionary(c)
-                for w in range(len(words)):
-                    _ = t.add_word(col, String(words[w]))
+            if kind == TEXT:                                          # the side's whole dictionary, codes unchanged (shared, not copied)
+                t.share_dictionary(col, sd.table, c)
             _fill_column_owned(t.cols[col], vals^, nul^)
     return t^
 

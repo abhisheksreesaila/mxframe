@@ -196,9 +196,7 @@ def virtual_schema(left: JoinSide, right: JoinSide, outer_right: Bool = False) r
             var kind = sd.table.kind(c)
             var col = t.add_column(_unique_name(t, sd.table.name(c)), kind, scale=sd.table.scale(c))
             if kind == TEXT:
-                var words = sd.table.dictionary(c)
-                for w in range(len(words)):
-                    _ = t.add_word(col, String(words[w]))
+                t.share_dictionary(col, sd.table, c)
             t.cols[col].nulls = sd.table.null_count(c)
             if outer_right and side == 1:
                 t.cols[col].nulls = max(t.cols[col].nulls, 1)         # a LEFT join: an unmatched row is NULL here, so the program checks

@@ -28,7 +28,7 @@ from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query
-from .joincore import JoinKeys, JoinSide, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
+from .joincore import JoinKeys, JoinSide, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
@@ -955,9 +955,18 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         res.actuals.append("scan " + _label(q, t) + ": " + commas(base_rows) + " rows, " + commas(rows) + " after " + ("its filter" if len(q.leaf_conj[t]) > 0 else "no filter") +
                            " (" + String(len(gcols)) + " columns kept), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
         leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows))
+    var t_ndv = perf_counter_ns()
     for k in range(len(q.edge_a)):
-        js.edge_a.append(table_of_column(q, q.edge_a[k]))
-        js.edge_b.append(table_of_column(q, q.edge_b[k]))
+        var ta = table_of_column(q, q.edge_a[k])
+        var tb = table_of_column(q, q.edge_b[k])
+        js.edge_a.append(ta)
+        js.edge_b.append(tb)
+        js.ndv_a.append(column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads))
+        js.ndv_b.append(column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads))
+    for k in range(len(q.edge_a)):
+        res.notes.append("statistics: " + _label(q, js.edge_a[k]) + "." + q.src_name(q.edge_a[k]) + " has " + commas(js.ndv_a[k]) + " distinct values in " + commas(js.rows[js.edge_a[k]]) +
+                         " rows, " + _label(q, js.edge_b[k]) + "." + q.src_name(q.edge_b[k]) + " " + commas(js.ndv_b[k]) + " in " + commas(js.rows[js.edge_b[k]]))
+    res.actuals.append("distinct counts of the join columns: " + _ms(Float64(perf_counter_ns() - t_ndv) / 1e6) + " ms")
     var jp = planner.join_order(js, opts)
     for nt in jp.notes:
         res.notes.append(nt)

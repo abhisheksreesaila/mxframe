@@ -263,6 +263,8 @@ struct JoinStats(Copyable, Movable):
     var rows: List[Int]
     var edge_a: List[Int]            # the leaves an equality joins
     var edge_b: List[Int]
+    var ndv_a: List[Int]             # the distinct values of the equality's column in each of the two leaves (after their filters), -1 unknown
+    var ndv_b: List[Int]
 
     def __init__(out self):
         self.names = List[String]()
@@ -270,6 +272,8 @@ struct JoinStats(Copyable, Movable):
         self.rows = List[Int]()
         self.edge_a = List[Int]()
         self.edge_b = List[Int]()
+        self.ndv_a = List[Int]()
+        self.ndv_b = List[Int]()
 
     def connected(self, a: Int, b: Int) -> Bool:
         for k in range(len(self.edge_a)):
@@ -309,26 +313,37 @@ def _min_int(a: Int, b: Int) -> Int:
 
 
 def _step_estimate(js: JoinStats, in_set: List[Bool], acc_rows: Int, leaf: Int) -> Int:
-    """The rows after joining `leaf` to the rows joined so far: each equality to a table already joined is a foreign key into the smaller of the two base
-    tables (the key's domain), so a row of the larger side finds a partner with probability (filtered rows / base rows) of the smaller; the most selective
-    equality counts (a composite key is at least that selective). Never more than the product."""
-    var best_div = 1
-    var found = False
+    """The rows after joining `leaf` to the rows joined so far. Each equality to a table already joined gives rows x leaf rows / the larger of the two
+    columns' distinct counts (the rows joined so far hold at most `acc_rows` distinct values of theirs); with no distinct counts known, the smaller of
+    the two base tables stands for the key's domain (a foreign key into the smaller). The most selective equality counts (a composite key is at least
+    that selective). Never more than the product."""
+    var best = -1
+    var f = js.rows[leaf]
     for k in range(len(js.edge_a)):
         var other = -1
+        var d_leaf = -1
+        var d_other = -1
         if js.edge_a[k] == leaf and in_set[js.edge_b[k]]:
             other = js.edge_b[k]
+            d_leaf = js.ndv_a[k]
+            d_other = js.ndv_b[k]
         elif js.edge_b[k] == leaf and in_set[js.edge_a[k]]:
             other = js.edge_a[k]
-        if other >= 0:
-            found = True
-            var dom = _min_int(max(js.base_rows[other], 1), max(js.base_rows[leaf], 1))
-            best_div = max(best_div, dom)
-    if not found:
+            d_leaf = js.ndv_b[k]
+            d_other = js.ndv_a[k]
+        if other < 0:
+            continue
+        var div: Int
+        if d_leaf >= 0 and d_other >= 0:
+            div = max(max(d_leaf, _min_int(d_other, max(acc_rows, 1))), 1)
+        else:
+            div = _min_int(max(js.base_rows[other], 1), max(js.base_rows[leaf], 1))
+        var est = Int(Float64(acc_rows) * Float64(f) / Float64(div))
+        if best < 0 or est < best:
+            best = est
+    if best < 0:
         return -1
-    var f = js.rows[leaf]
-    var est = Int(Float64(acc_rows) * Float64(f) / Float64(best_div))
-    return max(min(est, acc_rows * f), 1 if (acc_rows > 0 and f > 0) else 0)
+    return max(min(best, acc_rows * f), 1 if (acc_rows > 0 and f > 0) else 0)
 
 
 def _step_cost(acc_rows: Int, leaf_rows: Int, out_rows: Int) -> Int:
