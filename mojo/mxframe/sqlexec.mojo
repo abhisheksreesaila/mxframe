@@ -26,7 +26,7 @@ from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan
-from .rows import build_items, run_rows, _Item
+from .rows import build_items, run_rows, run_topk_rows, _Item
 from .sqlprog import lower_rows
 from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
@@ -744,7 +744,7 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         res.notes.append("statistics: the footer of `" + src.name + "` cannot be believed (" + lie + "); ran again without them: hashed groups, every column nullable")
     var inp = _inputs(src, q, trust)
     var sp = SqlProgram(Program(0))
-    var built = build_items(q) if q.rows else (List[_Item](), List[Int]())
+    var built = build_items(q, plan.top_k > 0) if q.rows else (List[_Item](), List[Int]())
     if q.rows:
         try:
             sp = lower_rows(q, built[1], inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
@@ -779,7 +779,10 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         return res^
     var notes = res.notes.copy()
     if q.rows:
-        res.table = run_rows(src, q, plan, opts, dicts, notes, inp, sp^, built[0], trust)
+        if plan.top_k > 0:
+            res.table = run_topk_rows(src, q, plan, opts, dicts, notes, inp, sp^, built[0], trust)
+        else:
+            res.table = run_rows(src, q, plan, opts, dicts, notes, inp, sp^, built[0], trust)
     else:
         res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust)
     res.notes = notes^

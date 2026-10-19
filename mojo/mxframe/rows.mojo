@@ -15,8 +15,9 @@ chunks stop being read once enough rows are in hand (`early_stop`). With ORDER B
 best rows in per-worker heaps inside the hook and never materializes the rest.
 """
 from std.time import perf_counter_ns
+from std.atomic import Atomic
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .frame import text_ranks
+from .frame import text_ranks, _radix_order
 from .query import Program, MAGIC, SRC_WORDS, CTL_REG
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
@@ -242,24 +243,265 @@ def _item_of(items: List[_Item], q: BoundQuery, e: Int) -> Int:
     return -1
 
 
-def build_items(q: BoundQuery) -> Tuple[List[_Item], List[Int]]:
+def build_items(q: BoundQuery, keys_computed: Bool = False) -> Tuple[List[_Item], List[Int]]:
     """The columns the rows are collected into (the select list's, then the sort keys' that are not in it) and, of those, the
-    expressions the program computes (everything that is not a plain column)."""
+    expressions the program computes (everything that is not a plain column). `keys_computed` (top-k): the sort keys go through
+    registers even when they are plain columns, because the heaps compare them in the hook."""
     var items = List[_Item]()
     var computed = List[Int]()
-    var exprs = q.routs.copy()
+    var exprs = List[Int]()
+    if keys_computed:
+        for o in q.rorder:
+            exprs.append(o.expr)
+    for e in q.routs:
+        exprs.append(e)
     for o in q.rorder:
         exprs.append(o.expr)
     for e in exprs:
         if _item_of(items, q, e) >= 0:
             continue
         ref x = q.rexprs[e]
-        if x.op == B_COL:
+        var force = False
+        if keys_computed:
+            for o in q.rorder:
+                if bkey(q.rexprs, o.expr) == bkey(q.rexprs, e):
+                    force = True
+        if x.op == B_COL and not force:
             items.append(_Item(e, bkey(q.rexprs, e), Int(x.value), -1))
         else:
             computed.append(e)
             items.append(_Item(e, bkey(q.rexprs, e), -1, len(computed) - 1))
     return (items^, computed^)
+
+
+# ── top-k: per-worker heaps in the hook ──────────────────────────────────────────────────────────────
+
+@always_inline
+def _before(ctl: LP, nk: Int, av: LP, an: BP, aid: Int, bv: LP, bn: BP, bid: Int) -> Bool:
+    """Row a sorts before row b: by each key (NULLS FIRST / LAST, descending, TEXT through its ranks), ties by row number."""
+    for k in range(nk):
+        var w = ctl + (10 + 4 * k)
+        var slot = Int(w[0])
+        var x_null = an[slot] != 0
+        var y_null = bn[slot] != 0
+        if x_null or y_null:
+            if x_null and y_null:
+                continue
+            return x_null == (w[2] != 0)
+        var x = av[slot]
+        var y = bv[slot]
+        if w[3] != 0:
+            var rk = LP(unsafe_from_address=Int(w[3]))
+            x = rk[Int(x)]
+            y = rk[Int(y)]
+        if x != y:
+            return (x > y) if w[1] != 0 else (x < y)
+    return aid < bid
+
+
+@always_inline
+def _copy_entry(ns: Int, dv: LP, dn: BP, sv: LP, sn: BP):
+    for s in range(ns):
+        dv[s] = sv[s]
+        dn[s] = sn[s]
+
+
+@always_inline
+def _swap_entries(ns: Int, vals: LP, nuls: BP, ids: IP, a: Int, b: Int):
+    for t in range(ns):
+        var x = vals[a * ns + t]
+        vals[a * ns + t] = vals[b * ns + t]
+        vals[b * ns + t] = x
+        var y = nuls[a * ns + t]
+        nuls[a * ns + t] = nuls[b * ns + t]
+        nuls[b * ns + t] = y
+    var tid = ids[a]
+    ids[a] = ids[b]
+    ids[b] = tid
+
+
+def _topk_worker(ctl: LP, regs: FP) -> Int:
+    """The calling worker's number: its register file's address is its identity, entered in the control block's table the first time."""
+    var table = LP(unsafe_from_address=Int(ctl[4]))
+    var counter = LP(unsafe_from_address=Int(ctl[3]))
+    var mine = Int64(Int(regs))
+    for i in range(min(Int(counter[0]), Int(ctl[5]))):
+        if table[i] == mine:
+            return i
+    var i = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
+    if i >= Int(ctl[5]):
+        return -1
+    table[i] = mine
+    return i
+
+
+def _topk_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
+    """Offers each selected row to the calling worker's heap of the best K rows so far. Control block (Int64 words): [0] value slots,
+    [1] sort keys, [2] K, [3] worker counter, [4] worker table, [5] its size, [6] values (Int64), [7] NULL flags (UInt8), [8] row numbers
+    (Int32), [9] heap sizes (Int64) -- the arrays hold K + 1 entries per worker, the last one a scratch for the row on offer -- then
+    per key [slot, descending, nulls first, rank table address or 0] from word 10, then per slot [value register, flag register or -1]."""
+    for j in range(nsel):
+        dst[j] = 0
+    var ctl = LP(unsafe_from_address=Int(LP(unsafe_from_address=Int(regs + CTL_REG * VEC))[0]))
+    var me = _topk_worker(ctl, regs)
+    if me < 0:
+        return False
+    var ns = Int(ctl[0])
+    var nk = Int(ctl[1])
+    var K = Int(ctl[2])
+    if K == 0:
+        return True
+    var slots = ctl + (10 + 4 * nk)
+    var vals = LP(unsafe_from_address=Int(ctl[6])) + me * (K + 1) * ns
+    var nuls = BP(unsafe_from_address=Int(ctl[7])) + me * (K + 1) * ns
+    var ids = IP(unsafe_from_address=Int(ctl[8])) + me * (K + 1)
+    var size_p = LP(unsafe_from_address=Int(ctl[9])) + me
+    var sv = vals + K * ns
+    var sn = nuls + K * ns
+    # the first key decides almost every row once the heap is full: read it straight from its register and drop a row that is
+    # strictly worse than the heap's worst before anything is copied
+    var k0 = ctl + 10
+    var k0_slot = Int(k0[0])
+    var k0_v = LP(unsafe_from_address=Int(regs + Int(slots[2 * k0_slot]) * VEC))
+    var k0_has_null = slots[2 * k0_slot + 1] >= 0
+    var k0_n = LP(unsafe_from_address=Int(regs + Int(slots[2 * k0_slot + 1]) * VEC)) if k0_has_null else k0_v
+    var k0_rank = LP(unsafe_from_address=Int(k0[3])) if k0[3] != 0 else k0_v
+    for j in range(nsel):
+        var row = row0 + (Int(sel[j]) if use_sel else j)
+        if Int(size_p[0]) == K and not (k0_has_null and k0_n[j] != 0) and nuls[k0_slot] == 0:
+            var x = k0_v[j]
+            var y = vals[k0_slot]
+            if k0[3] != 0:
+                x = k0_rank[Int(x)]
+                y = k0_rank[Int(y)]
+            if x != y and ((x < y) if k0[1] != 0 else (x > y)):
+                continue
+        for s in range(ns):
+            var w = slots + 2 * s
+            sv[s] = LP(unsafe_from_address=Int(regs + Int(w[0]) * VEC))[j]
+            sn[s] = UInt8(LP(unsafe_from_address=Int(regs + Int(w[1]) * VEC))[j]) if w[1] >= 0 else UInt8(0)
+        var size = Int(size_p[0])
+        if size < K:
+            _copy_entry(ns, vals + size * ns, nuls + size * ns, sv, sn)
+            ids[size] = Int32(row)
+            var i = size
+            size += 1
+            size_p[0] = Int64(size)
+            while i > 0:                                         # sift up: the worst of the kept rows stays on top
+                var parent = (i - 1) // 2
+                if _before(ctl, nk, vals + parent * ns, nuls + parent * ns, Int(ids[parent]), vals + i * ns, nuls + i * ns, Int(ids[i])):
+                    _swap_entries(ns, vals, nuls, ids, parent, i)
+                    i = parent
+                else:
+                    break
+        elif _before(ctl, nk, sv, sn, row, vals, nuls, Int(ids[0])):
+            _copy_entry(ns, vals, nuls, sv, sn)
+            ids[0] = Int32(row)
+            var i = 0
+            while True:
+                var l = 2 * i + 1
+                var r = l + 1
+                var worst = i
+                if l < size and _before(ctl, nk, vals + worst * ns, nuls + worst * ns, Int(ids[worst]), vals + l * ns, nuls + l * ns, Int(ids[l])):
+                    worst = l
+                if r < size and _before(ctl, nk, vals + worst * ns, nuls + worst * ns, Int(ids[worst]), vals + r * ns, nuls + r * ns, Int(ids[r])):
+                    worst = r
+                if worst == i:
+                    break
+                _swap_entries(ns, vals, nuls, ids, worst, i)
+                i = worst
+    return True
+
+
+def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: List[Int], key_desc: List[Bool], key_nf: List[Bool],
+              key_rank: List[Int], threads: Int) raises -> RowChunk:
+    """The kernel over the whole chunk with each worker keeping its best K rows; the union of the heaps (at most workers x K rows,
+    unordered), as the row numbers and the values of every slot."""
+    ref p = sp.p
+    var ns = len(sp.row_vregs)
+    var nk = len(key_slot)
+    var maxw = (threads if threads > 0 else core_count()) + 4
+    var vals = List[Int64](length=maxw * (K + 1) * ns + 1, fill=0)
+    var nuls = List[UInt8](length=maxw * (K + 1) * ns + 1, fill=0)
+    var ids = List[Int32](length=maxw * (K + 1) + 1, fill=0)
+    var sizes = List[Int64](length=maxw, fill=0)
+    var table = List[Int64](length=maxw, fill=0)
+    var counter = List[Int64](length=1, fill=0)
+    var ctl = List[Int64]()
+    ctl.append(Int64(ns))
+    ctl.append(Int64(nk))
+    ctl.append(Int64(K))
+    ctl.append(Int64(Int(counter.unsafe_ptr())))
+    ctl.append(Int64(Int(table.unsafe_ptr())))
+    ctl.append(Int64(maxw))
+    ctl.append(Int64(Int(vals.unsafe_ptr())))
+    ctl.append(Int64(Int(nuls.unsafe_ptr())))
+    ctl.append(Int64(Int(ids.unsafe_ptr())))
+    ctl.append(Int64(Int(sizes.unsafe_ptr())))
+    for k in range(nk):
+        ctl.append(Int64(key_slot[k]))
+        ctl.append(Int64(1 if key_desc[k] else 0))
+        ctl.append(Int64(1 if key_nf[k] else 0))
+        ctl.append(Int64(key_rank[k]))
+    for s in range(ns):
+        ctl.append(Int64(sp.row_vregs[s]))
+        ctl.append(Int64(sp.row_nregs[s]))
+    var code = List[Int32]()
+    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
+                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
+    for h in header:
+        code.append(Int32(h))
+    for w in p.pred:
+        code.append(w)
+    for w in p.body:
+        code.append(w)
+    for w in p.aggs:
+        code.append(w)
+    var consts = List[Float64]()
+    for v in p.consts:
+        consts.append(Float64(from_bits=UInt64(v)))
+    consts[p.ctl_const] = Float64(from_bits=UInt64(Int(ctl.unsafe_ptr())))
+    var set_bytes = sp.set_bytes.copy()
+    if len(set_bytes) == 0:
+        set_bytes.append(0)
+    var set_meta = sp.set_meta.copy()
+    if len(set_meta) == 0:
+        set_meta = [0, 0, 0]
+    var tbl = _table_addresses(t, p, mask_addr)
+    var dtypes = p.dtypes.copy()
+    if len(dtypes) == 0:
+        dtypes.append(1)
+    var out_vals = List[Float64](length=max(p.n_slots, 1), fill=0.0)
+    var out_cnt = List[Int64](length=1, fill=0)
+    var rc = pipeline_keyed[type_of(_topk_hook)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
+                                                 Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), 1,
+                                                 0, t.rows(), Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
+                                                 threads if threads > 0 else core_count(), _topk_hook, False)
+    _ = code^
+    _ = consts^
+    _ = set_bytes^
+    _ = set_meta^
+    _ = tbl^
+    _ = dtypes^
+    _ = out_vals^
+    _ = out_cnt^
+    _ = ctl^
+    _ = table^                                                # (the hook reads these through addresses: keep them alive past the call)
+    if rc != 0:
+        raise Error("the CPU kernel failed with code " + String(rc))
+    var out = RowChunk()
+    for s in range(ns):
+        out.vals.append(List[Int64]())
+        out.nuls.append(List[UInt8]())
+    for w in range(min(Int(counter[0]), maxw)):
+        for e in range(Int(sizes[w])):
+            var at = w * (K + 1) + e
+            out.ids.append(ids[at])
+            for s in range(ns):
+                out.vals[s].append(vals[at * ns + s])
+                out.nuls[s].append(nuls[at * ns + s])
+    out.n = len(out.ids)
+    return out^
 
 
 def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
@@ -353,3 +595,126 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
 
 def _ms(x: Float64) -> String:
     return String(Float64(Int(x * 100.0)) / 100.0)
+
+
+def _concat(a: ValCol, b: ValCol) -> ValCol:
+    var out = ValCol(a.kind, a.scale, 0)
+    out.src = a.src
+    out.v = a.v.copy()
+    out.v.extend(b.v.copy())
+    if len(a.nul) > 0 or len(b.nul) > 0:
+        out.nul = List[UInt8](length=len(a.v), fill=0)
+        for i in range(len(a.nul)):
+            out.nul[i] = a.nul[i]
+        for i in range(len(b.v)):
+            out.nul.append(b.nul[i] if len(b.nul) > 0 else UInt8(0))
+    return out^
+
+
+def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
+                  inp: _Inputs, var sp: SqlProgram, items: List[_Item], trust: Bool) raises -> Table:
+    """ORDER BY with a small LIMIT: each chunk's kernel run keeps the best K = limit + offset rows in per-worker heaps; the candidates
+    (at most workers x K) are merged with the best so far and cut to K again, so the rest of the rows are never materialized."""
+    var used = inp.used.copy()
+    var ch = _open_chunks(src, used)
+    var K = plan.top_k
+    var nk = len(q.rorder)
+    var key_slot = List[Int]()
+    var key_desc = List[Bool]()
+    var key_nf = List[Bool]()
+    var key_rank = List[Int]()
+    var ranks = List[List[Int64]]()                                 # alive until the kernel has run
+    for o in q.rorder:
+        key_slot.append(items[_item_of(items, q, o.expr)].computed)
+        key_desc.append(o.desc)
+        key_nf.append(o.nulls_first)
+        ref x = q.rexprs[o.expr]
+        if x.kind == TEXT.value:
+            var words = List[String]()
+            for c in range(dicts.count(x.src)):
+                words.append(dicts.word(x.src, c))
+            ranks.append(text_ranks(words))
+            key_rank.append(Int(ranks[len(ranks) - 1].unsafe_ptr()))
+        else:
+            key_rank.append(0)
+    var best = List[ValCol]()
+    for it in items:
+        ref x = q.rexprs[it.expr]
+        var vc = ValCol(x.kind, x.scale, 0)
+        vc.src = x.src
+        best.append(vc^)
+    var scanned = 0
+    var chunks_read = 0
+    var t_run = perf_counter_ns()
+    var ns_load = 0
+    for i in range(ch.n()):
+        var t_load = perf_counter_ns()
+        var chunk = _load_chunk(src, ch, i)
+        if trust:
+            _check_footer(src, ch, i, chunk)
+        ns_load += perf_counter_ns() - t_load
+        chunks_read += 1
+        scanned += chunk.rows()
+        if chunk.rows() == 0:
+            continue
+        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads)
+        if rc.n == 0:
+            continue
+        # the candidates, in the order of their rows in the chunk (ties between equal keys keep the source order)
+        var by_row = List[Int64](length=rc.n, fill=0)
+        for j in range(rc.n):
+            by_row[j] = Int64(rc.ids[j])
+        var ident = List[Int](length=rc.n, fill=0)
+        for j in range(rc.n):
+            ident[j] = j
+        var perm = _radix_order(by_row, ident, False)
+        var comb = List[ValCol]()
+        for k in range(len(items)):
+            ref it = items[k]
+            ref x = q.rexprs[it.expr]
+            var cand = ValCol(x.kind, x.scale, 0)
+            cand.src = x.src
+            if it.computed >= 0:
+                var vp = LP(unsafe_from_address=Int(rc.vals[it.computed].unsafe_ptr()))
+                var has_nul = sp.row_nregs[it.computed] >= 0
+                var np = BP(unsafe_from_address=Int(rc.nuls[it.computed].unsafe_ptr()) if has_nul else Int(vp))
+                _append_run(cand, vp, np, has_nul, rc.n)
+            else:
+                _append_gathered(cand, chunk, inp.pos[it.col], IP(unsafe_from_address=Int(rc.ids.unsafe_ptr())), rc.n)
+            comb.append(_concat(best[k], _gather(cand, perm)))
+        var n = len(comb[0].v)
+        var kc = List[ValCol]()
+        for o in q.rorder:
+            kc.append(comb[_item_of(items, q, o.expr)].copy())
+        var ord = _order_rows(kc, q.rorder, dicts, n)
+        var keep = List[Int]()
+        for j in range(min(K, n)):
+            keep.append(ord[j])
+        for k in range(len(items)):
+            best[k] = _gather(comb[k], keep)
+    var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
+    _ = ranks^
+    if src.kind == SRC_FRAME:
+        notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
+                     commas(len(src.overlay.delta)) + " changed or appended rows")
+    elif inp.scan_mode:
+        notes.append("ran: scan " + src.name + ": " + String(chunks_read) + " of " + String(src.scan.value().row_groups()) + " row groups read (" +
+                     String(len(used)) + (" column" if len(used) == 1 else " columns") + "), one chunk each" +
+                     ((", + " + commas(len(src.overlay.delta)) + " changed or appended rows") if len(src.overlay.delta) > 0 else ""))
+    else:
+        notes.append("ran: table " + src.name + ": " + String(chunks_read) + " chunk of " + commas(src.table.rows()) + " rows")
+    var kept = len(best[0].v) if len(best) > 0 else 0
+    notes.append("rows: the best " + commas(kept) + " of " + commas(scanned) + " rows kept in per-worker heaps, " + String(nk) + (" key" if nk == 1 else " keys"))
+    var lo = min(q.offset, kept)
+    var hi = kept if q.limit < 0 else min(kept, lo + q.limit)
+    var pick = List[Int]()
+    for i in range(lo, hi):
+        pick.append(i)
+    var outs = List[ValCol]()
+    for e in q.routs:
+        outs.append(_gather(best[_item_of(items, q, e)], pick))
+    var t_out = perf_counter_ns()
+    var table = _to_table(q, outs, dicts)
+    notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if inp.scan_mode else "") + "kernel and merge " + _ms(ms_run - Float64(ns_load) / 1e6) +
+                 " ms, output " + _ms(Float64(perf_counter_ns() - t_out) / 1e6) + " ms")
+    return table^
