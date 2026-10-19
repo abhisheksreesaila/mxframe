@@ -130,25 +130,43 @@ def _column_keys(t: SharedTable, c: Int, kind: Int, mul: Int64, translate: List[
 
 
 def column_ndv(t: SharedTable, c: Int, threads: Int = 0) -> Int:
-    """The number of distinct non-NULL values of a column (the join planner's statistic), from an even sample of at most 32,768 rows (every row of a
-    smaller table). The sample's repeated values give the estimate: m sampled rows of d equally frequent values collide in about m(m-1) / (2d) pairs, so
-    d is about m(m-1) / (2 x pairs) (a key that never collides is taken as unique; the estimate is at least the distinct values seen and at most the rows).
-    Exact for a table that fits the sample; an order of magnitude is what the join order needs."""
+    """The number of distinct non-NULL values of a column (the join planner's statistic), from a sample of 32,768 distinct rows chosen at random (every row of
+    a smaller table: exact). Rows are drawn at random positions, not at a stride: a column that is clustered (sorted keys, each repeated on neighbouring
+    rows) would otherwise show no repeats. The sample's repeated values give the estimate: m rows of d equally frequent values collide in about m(m-1) / (2d)
+    pairs, so d is about m(m-1) / (2 x pairs) (a key that never collides is taken as unique; the estimate is at least the distinct values seen and at most
+    the rows). An order of magnitude is what the join order needs."""
     var n = t.rows()
     if n == 0:
         return 0
     var src = t.values(c).unsafe_ptr()
     var valid = _valid_bits(t, c)
     var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
-    var step = max(1, n // 32768)
-    var m = 0
+    var target = min(n, 32768)
     var slots = 1 << 17
     var keys = List[Int64](length=slots, fill=0)
     var counts = List[Int32](length=slots, fill=0)
+    var seen_rows = List[Int32](length=slots, fill=-1)              # the rows drawn so far (each is drawn once)
     var distinct = 0
     var pairs = 0
-    var i = 0
-    while i < n:
+    var m = 0
+    var drawn = 0
+    var seed = UInt64(0x9E3779B97F4A7C15)
+    while drawn < target:
+        var i = drawn
+        if target < n:
+            seed = _mix(seed)
+            i = Int(seed % UInt64(n))
+            var rh = Int(_mix(UInt64(i)) >> 47) & (slots - 1)
+            var dup = False
+            while seen_rows[rh] >= 0:
+                if Int(seen_rows[rh]) == i:
+                    dup = True
+                    break
+                rh = (rh + 1) & (slots - 1)
+            if dup:
+                continue
+            seen_rows[rh] = Int32(i)
+        drawn += 1
         if valid == 0 or (bits[i >> 3] >> UInt8(i & 7)) & 1 != 0:
             var v = src[i]
             var h = Int(_mix(UInt64(v)) >> 47) & (slots - 1)
@@ -161,15 +179,12 @@ def column_ndv(t: SharedTable, c: Int, threads: Int = 0) -> Int:
                 pairs += Int(counts[h])                            # a new row of a value seen `counts[h]` times collides with each of them
             counts[h] += 1
             m += 1
-        i += step
     if m == 0:
         return 0
-    if step == 1:
+    if target == n:
         return distinct                                            # every row was looked at: exact
-    var est = distinct
-    if pairs == 0:
-        est = n
-    else:
+    var est = n
+    if pairs > 0:
         est = Int(Float64(m) * Float64(m - 1) / (2.0 * Float64(pairs)))
     return max(min(est, n), distinct)
 

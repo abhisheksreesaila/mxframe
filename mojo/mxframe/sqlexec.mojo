@@ -28,11 +28,11 @@ from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
-                   with_probe_filter)
+                   with_probe_filter, final_needed, virtual_schema_multi, star_query)
 from .joincore import JoinKeys, JoinSide, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
-from .jfront import FusedJoin, front_spec, jf_front
+from .jfront import FusedJoin, StageData, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sqlprog import lower_rows
@@ -773,6 +773,51 @@ def _plain_side(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> J
     return JoinSide(src.table, cols^, kc^, True)
 
 
+def _prefill_ranges_n(mut src: SqlSource, jq: BoundQuery, tabs: List[SharedTable], vtab: List[Int], vreal: List[Int]):
+    """`_prefill_ranges` for a star: virtual column c is column `vreal[c]` of table `tabs[vtab[c]]`."""
+    var cols = List[Int]()
+    for k in jq.keys:
+        _key_columns(jq, k.expr, cols)
+    for c in cols:
+        var r = _column_range(tabs[vtab[c]], vreal[c])
+        src.range_cols.append(c)
+        src.range_lo.append(r[1])
+        src.range_hi.append(r[2])
+        src.range_has.append(r[0])
+
+
+def _star_valid(q: BoundQuery, jp: JoinPlan, s0: Int) -> Bool:
+    """Steps `s0` to the last can run as one star: each joins a table the hash table is built on, and every equality of that table to the tables joined
+    before it reaches one joined before step `s0` (so its keys are columns of the probe table, not of another dimension)."""
+    var before = 1 << jp.start
+    for j in range(s0):
+        before |= 1 << jp.steps[j].leaf
+    var tail = 0
+    for j in range(s0, len(jp.steps)):
+        var lf = jp.steps[j].leaf
+        if not jp.steps[j].build_new:
+            return False
+        var has_edge = False
+        for k in range(len(q.edge_a)):
+            var ta = table_of_column(q, q.edge_a[k])
+            var tb = table_of_column(q, q.edge_b[k])
+            var other = -1
+            if ta == lf:
+                other = tb
+            elif tb == lf:
+                other = ta
+            if other < 0:
+                continue
+            if (before >> other) & 1 != 0:
+                has_edge = True
+            elif (tail >> other) & 1 != 0:
+                return False
+        if not has_edge:
+            return False
+        tail |= 1 << lf
+    return True
+
+
 def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
                                 t0: Int) raises -> SqlResult:
     """A query over two tables: each side is reduced to the rows and columns the query needs (a row query over its source, with the filter
@@ -1018,6 +1063,110 @@ def _label(q: BoundQuery, t: Int) -> String:
     return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
 
 
+def _read_filtered[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut leaves: List[_Leaf], planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises:
+    """A leaf that was only counted: its filtered rows, as a table of the columns later steps read."""
+    var t_m = perf_counter_ns()
+    var sq = side_query(catalog, q, t, leaves[t].gcols)
+    var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
+    var tab = r.take_table().share()
+    var cols2 = List[Int]()
+    for i in range(len(leaves[t].gcols)):
+        cols2.append(i)
+    var gt = leaves[t].gcols.copy()
+    var gc = leaves[t].gcols.copy()
+    leaves[t] = _Leaf(tab, cols2^, gc^, gt^, tab.rows(), leaves[t].base_rows, False)
+    res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
+
+
+def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int], done: List[Bool],
+                          planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
+    """Steps `s0` to the last as one star: the probe table (the rows joined so far, or a table read unfiltered whose filter `conj0` runs in the pipeline) meets each
+    dimension through a map built on the dimension's unique keys, all in one pass over the probe rows (no joined row is written, no intermediate table).
+    False (nothing changed but notes) when a dimension's keys are not unique or are hashed: the steps run one by one."""
+    var threads = opts.threads
+    var t_star = perf_counter_ns()
+    var stages = List[StageData]()
+    var dim_tabs = List[SharedTable]()
+    var dim_leaf = List[Int]()
+    for j in range(s0, len(jp.steps)):
+        var lf = jp.steps[j].leaf
+        var lkey = List[Int]()
+        var rkey = List[Int]()
+        for k in range(len(q.edge_a)):
+            var ga = q.edge_a[k]
+            var gb = q.edge_b[k]
+            var ta = table_of_column(q, ga)
+            var tb = table_of_column(q, gb)
+            if ta == lf and (before >> tb) & 1 != 0:
+                lkey.append(_position(probe_gt, gb))
+                rkey.append(_position(leaves[lf].gtable, ga))
+            elif tb == lf and (before >> ta) & 1 != 0:
+                lkey.append(_position(probe_gt, ga))
+                rkey.append(_position(leaves[lf].gtable, gb))
+        var keys = JoinKeys()
+        normalize_keys(leaves[lf].table, probe, rkey, lkey, keys, threads)
+        var m = hj_build(keys.bk_addr, keys.bo_addr, leaves[lf].table.rows(), threads)
+        if keys.verify or not m.unique:
+            res.notes.append("star: " + _label(q, lf) + " has " + ("hashed keys" if keys.verify else "repeated keys") + ": the joins run one by one")
+            return False
+        res.notes.append("star dimension " + _label(q, lf) + ": " + commas(leaves[lf].table.rows()) + " rows, " + m.kind() + ", " + keys.layout)
+        stages.append(StageData(m^, keys^))
+        dim_tabs.append(leaves[lf].table)
+        dim_leaf.append(lf)
+    var conj = conj0.copy()
+    for k in range(len(q.resid)):
+        if not done[k]:
+            conj.append(q.resid[k])
+    var need = final_needed(q, conj)
+    var tabs = List[SharedTable]()
+    var colsets = List[List[Int]]()
+    var vglobal = List[Int]()
+    var vstage = List[Int]()
+    var vreal = List[Int]()
+    var vtab = List[Int]()
+    tabs.append(probe)
+    var pc = List[Int]()
+    for c in range(probe.columns()):
+        if probe_gt[c] >= 0 and need[probe_gt[c]]:
+            pc.append(c)
+            vglobal.append(probe_gt[c])
+            vstage.append(-1)
+            vreal.append(c)
+            vtab.append(0)
+    colsets.append(pc^)
+    var n_dim_cols = 0
+    for si in range(len(dim_tabs)):
+        var lf = dim_leaf[si]
+        tabs.append(dim_tabs[si])
+        var dc = List[Int]()
+        for c in range(dim_tabs[si].columns()):
+            var g = leaves[lf].gtable[c]
+            if g >= 0 and need[g]:
+                dc.append(c)
+                vglobal.append(g)
+                vstage.append(si)
+                vreal.append(c)
+                vtab.append(si + 1)
+                n_dim_cols += 1
+        colsets.append(dc^)
+    var vt = virtual_schema_multi(tabs, colsets)
+    var cat2 = Catalog()
+    cat2.add_table("join", vt^.share())
+    cat2.sources[0].fixed_rows = probe.rows()
+    var jq = star_query(q, vglobal, conj)
+    _prefill_ranges_n(cat2.sources[0], jq, tabs, vtab, vreal)
+    var names = String()
+    for si in range(len(dim_leaf)):
+        names += (", " if si > 0 else "") + _label(q, dim_leaf[si])
+    res.notes.append("join path: fused: a star: " + commas(probe.rows()) + " probe rows meet " + String(len(dim_leaf)) + " dimensions (" + names + ") with unique keys in one pass of blocks of 1,024; " +
+                     String(n_dim_cols) + " dimension columns are gathered into per-worker scratch (no joined row and no intermediate table is written)" +
+                     (" (the probe table's filter runs in the pipeline)" if len(conj0) > 0 else ""))
+    var fj = ArcPointer(FusedJoin(probe, dim_tabs^, vstage^, vreal^, stages^))
+    out = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
+    res.actuals.append("star (" + names + "): " + commas(probe.rows()) + " probe rows, " + _ms(Float64(perf_counter_ns() - t_star) / 1e6) + " ms including the aggregate")
+    return True
+
+
 def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
                               t0: Int) raises -> SqlResult:
     """Three or more tables joined by equalities (inner joins). Each table runs its own filter first (a row query over its source), so the planner works
@@ -1101,28 +1250,55 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         res.table = tb^
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
+    # a tail of joins on dimensions with unique keys runs as one star (one pass over the probe rows probing every dimension), when it is at least two joins
+    var star_s0 = -1
+    if opts.fuse and not _any_hol(q):
+        for s0 in range(len(jp.steps) - 1):
+            if _star_valid(q, jp, s0):
+                star_s0 = s0
+                break
     # a leaf that was only counted is read filtered now, unless it is the last join's probe side (its filter then runs in that join's pipeline)
     var last_leaf = jp.steps[len(jp.steps) - 1].leaf
     for t in range(n):
-        if leaves[t].deferred and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new):
-            var t_m = perf_counter_ns()
-            var sq = side_query(catalog, q, t, leaves[t].gcols)
-            var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
-            var tab = r.take_table().share()
-            var cols2 = List[Int]()
-            for i in range(len(leaves[t].gcols)):
-                cols2.append(i)
-            var gt = leaves[t].gcols.copy()
-            var gc = leaves[t].gcols.copy()
-            leaves[t] = _Leaf(tab, cols2^, gc^, gt^, tab.rows(), leaves[t].base_rows, False)
-            res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
+        if leaves[t].deferred and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new) and not (t == jp.start and star_s0 == 0):
+            _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
     # the steps
     var done = List[Bool](length=len(q.resid), fill=False)
     var joined = 1 << jp.start
     var cur_table = leaves[jp.start].table
     var cur_g = leaves[jp.start].gcols.copy()
     var cur_pos = leaves[jp.start].cols.copy()
-    for si in range(len(jp.steps) - 1):
+    var si = -1
+    while si + 1 < len(jp.steps) - 1:
+        si += 1
+        if si == star_s0:
+            # the probe table: the rows joined so far, or (the star starts at the start table) that table itself
+            var sp_table = cur_table
+            var sp_gt = cur_g.copy()
+            var sp_conj = List[Int]()
+            var sp_conj_text = List[String]()
+            if si == 0:
+                sp_table = leaves[jp.start].table
+                sp_gt = leaves[jp.start].gtable.copy()
+                if leaves[jp.start].deferred:
+                    sp_conj = q.leaf_conj[jp.start].copy()
+                    sp_conj_text = q.leaf_conj_text[jp.start].copy()
+            var star_out = SqlResult()
+            if _run_star[P](q, leaves, jp, si, joined, sp_table, sp_gt, sp_conj, done, planner, opts, trust, lie, res, star_out):
+                for nt in star_out.notes:
+                    res.notes.append(nt)
+                for a in star_out.actuals:
+                    res.actuals.append(a)
+                res.table = star_out.take_table()
+                res.explain = _explain_text(lp, res.notes)
+                res.ms = Float64(perf_counter_ns() - t0) / 1e6
+                return res^
+            star_s0 = -1
+            if si == 0 and leaves[jp.start].deferred:
+                _read_filtered[P](catalog, q, jp.start, leaves, planner, opts, trust, res)
+                cur_table = leaves[jp.start].table
+                cur_g = leaves[jp.start].gcols.copy()
+                cur_pos = leaves[jp.start].cols.copy()
         var t_step = perf_counter_ns()
         ref step = jp.steps[si]
         var lf = step.leaf

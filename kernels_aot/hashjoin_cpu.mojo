@@ -181,6 +181,36 @@ struct MapView(ImplicitlyCopyable, Movable):
         self.pbits = m.pbits
         self.bitmap = m.bitmap
 
+    def store(self, w: LP):
+        """The view as 11 words (a front stage keeps several maps' views in one array)."""
+        w[0] = Int64(self.mode)
+        w[1] = 1 if self.unique else 0
+        w[2] = self.lo
+        w[3] = self.hi
+        w[4] = Int64(self.u)
+        w[5] = Int64(self.s)
+        w[6] = Int64(self.r)
+        w[7] = Int64(self.ent)
+        w[8] = Int64(self.eoff)
+        w[9] = Int64(self.pbits)
+        w[10] = Int64(self.bitmap)
+
+
+def load_view(w: LP) -> MapView:
+    var v = MapView(JoinMap())
+    v.mode = Int(w[0])
+    v.unique = w[1] != 0
+    v.lo = w[2]
+    v.hi = w[3]
+    v.u = Int(w[4])
+    v.s = Int(w[5])
+    v.r = Int(w[6])
+    v.ent = Int(w[7])
+    v.eoff = Int(w[8])
+    v.pbits = Int(w[9])
+    v.bitmap = Int(w[10])
+    return v^
+
 
 @always_inline
 def _slice(n: Int, t: Int, T: Int) -> Int:
@@ -862,9 +892,10 @@ def hj_release(addr: Int):
     _free(addr)
 
 
-def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, nsel: Int, prow: IP) -> Int:
+def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, nsel: Int, prow: IP, by_row: Bool = False) -> Int:
     """The fused form (a map with unique keys): for the block rows `sel[0..nsel)` (row = i0 + sel[j]) look the key up; rows with a partner stay
-    in `sel` (compacted in place, in order) and `prow[q]` is the partner's build row of the q-th kept row. Returns how many are kept."""
+    in `sel` (compacted in place, in order) and `prow[q]` is the partner's build row of the q-th kept row (`by_row`: of the row `sel[q]`, so a later
+    probe of another map may compact `sel` again without moving this one: a star of dimensions probed one after the other). Returns how many are kept."""
     if v.mode == MODE_EMPTY:
         return 0
     var mode = v.mode
@@ -900,7 +931,10 @@ def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP,
                     b = IP(unsafe_from_address=e + 12)[0]
             if b >= 0:
                 sel[kept] = s0
-                prow[kept] = b
+                if by_row:
+                    prow[Int(s0)] = b
+                else:
+                    prow[kept] = b
                 kept += 1
         i += g
     return kept

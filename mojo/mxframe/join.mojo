@@ -473,3 +473,74 @@ def with_probe_filter(q: BoundQuery, t: Int) -> BoundQuery:
             q2.rexprs.append(BExpr(B_AND, BOOL.value, 0, q2.where, c, 0, "", 0, 0))
             q2.where = len(q2.rexprs) - 1
     return q2^
+
+
+# ── a star: one probe table, several dimensions with unique keys, one pass (F-155) ──────────────────────────────────
+
+def final_needed(q: BoundQuery, conj: List[Int]) -> List[Bool]:
+    """The global columns the rest of the query reads over the joined rows: the live expressions and the conjuncts `conj` across tables."""
+    var cols = List[Bool](length=total_columns(q), fill=False)
+    var seen = List[Bool](length=len(q.rexprs), fill=False)
+    for r in multi_roots(q):
+        _mark(q, r, cols, seen)
+    for e in conj:
+        _mark(q, e, cols, seen)
+    return cols^
+
+
+def virtual_schema_multi(tabs: List[SharedTable], cols: List[List[Int]]) raises -> Table:
+    """A table with no rows that has the star's columns (the probe table's, then each dimension's): names, kinds, scales, dictionaries and NULL counts."""
+    var t = Table.empty()
+    for s in range(len(tabs)):
+        for c in cols[s]:
+            var kind = tabs[s].kind(c)
+            var col = t.add_column(_unique_name(t, tabs[s].name(c)), kind, scale=tabs[s].scale(c))
+            if kind == TEXT:
+                t.share_dictionary(col, tabs[s], c)
+            t.cols[col].nulls = tabs[s].null_count(c)
+    return t^
+
+
+def star_query(q: BoundQuery, vglobal: List[Int], conj: List[Int]) -> BoundQuery:
+    """The single-source query over a star's virtual columns (`vglobal[i]` is the global column that virtual column i is): the rest of the query, with the
+    conjuncts `conj` across tables (and the probe table's own filter) as its WHERE."""
+    var sq = copy_query(q)
+    var colmap = List[Int](length=total_columns(q), fill=-1)
+    for i in range(len(vglobal)):
+        colmap[vglobal[i]] = i
+    var roots = live_roots(q)
+    for e in conj:
+        roots.append(e)
+    _remap_columns(sq, colmap, roots)
+    sq.joined = False
+    sq.join_kind = 0
+    sq.explain = 0
+    sq.sources = List[Int]()
+    sq.sources.append(0)
+    sq.source = 0
+    sq.tab_names = List[String]()
+    sq.tab_names.append("join")
+    sq.tab_alias = List[String]()
+    sq.tab_alias.append(String())
+    sq.tab_start = List[Int]()
+    sq.tab_start.append(0)
+    sq.tab_cols = List[Int]()
+    sq.tab_cols.append(len(vglobal))
+    sq.jk_l = List[Int]()
+    sq.jk_r = List[Int]()
+    sq.conj_l = List[Int]()
+    sq.conj_r = List[Int]()
+    sq.conj_x = List[Int]()
+    sq.leaf_conj = List[List[Int]]()
+    sq.edge_a = List[Int]()
+    sq.edge_b = List[Int]()
+    sq.resid = List[Int]()
+    sq.where = -1
+    if len(conj) > 0:
+        var acc = conj[0]
+        for k in range(1, len(conj)):
+            sq.rexprs.append(BExpr(B_AND, BOOL.value, 0, acc, conj[k], 0, "", 0, 0))
+            acc = len(sq.rexprs) - 1
+        sq.where = acc
+    sq.where_text = "the conditions across the tables"
+    return sq^
