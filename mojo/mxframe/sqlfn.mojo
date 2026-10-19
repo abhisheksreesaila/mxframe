@@ -95,15 +95,20 @@ struct CaseTables(Movable):
             if x >= UInt8(0x80):
                 ascii = False
                 break
-        var out = List[UInt8]()
+        var out = List[UInt8](capacity=len(b) + 4)
         if ascii:
+            var changed = False
             for x in b:
                 if not up and UInt8(65) <= x <= UInt8(90):
                     out.append(x + 32)
+                    changed = True
                 elif up and UInt8(97) <= x <= UInt8(122):
                     out.append(x - 32)
+                    changed = True
                 else:
                     out.append(x)
+            if not changed:
+                return s
             return String(unsafe_from_utf8=out)
         ref tab = self.upper if up else self.lower
         for cp in decode(s):
