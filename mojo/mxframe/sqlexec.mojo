@@ -786,35 +786,67 @@ def _prefill_ranges_n(mut src: SqlSource, jq: BoundQuery, tabs: List[SharedTable
         src.range_has.append(r[0])
 
 
+def _tail_components(q: BoundQuery, tail: List[Int]) -> List[List[Int]]:
+    """The dimensions of a star's tail grouped by the equalities between them: a dimension reached only through another (nation through supplier) is joined to
+    it first, and the group probes the fact table as one."""
+    var group = List[Int](length=len(tail), fill=-1)
+    var n_groups = 0
+    for i in range(len(tail)):
+        if group[i] < 0:
+            group[i] = n_groups
+            var grew = True
+            while grew:
+                grew = False
+                for j in range(len(tail)):
+                    if group[j] >= 0:
+                        continue
+                    for k in range(len(q.edge_a)):
+                        var ta = table_of_column(q, q.edge_a[k])
+                        var tb = table_of_column(q, q.edge_b[k])
+                        for i2 in range(len(tail)):
+                            if group[i2] == n_groups and ((ta == tail[j] and tb == tail[i2]) or (tb == tail[j] and ta == tail[i2])):
+                                group[j] = n_groups
+                                grew = True
+            n_groups += 1
+    var out = List[List[Int]]()
+    for g in range(n_groups):
+        var l = List[Int]()
+        for i in range(len(tail)):
+            if group[i] == g:
+                l.append(tail[i])
+        out.append(l^)
+    return out^
+
+
 def _star_valid(q: BoundQuery, jp: JoinPlan, s0: Int) -> Bool:
-    """Steps `s0` to the last can run as one star: each joins a table the hash table is built on, and every equality of that table to the tables joined
-    before it reaches one joined before step `s0` (so its keys are columns of the probe table, not of another dimension)."""
+    """Steps `s0` to the last can run as one star: the tables they join form dimension groups (each held together by equalities between its tables), every
+    group reaches the tables joined before step `s0` by an equality (its keys are columns of the probe table), and a group of one table is a table the planner
+    builds the hash table on. A group of several is joined first (small) and then probes as one."""
     var before = 1 << jp.start
     for j in range(s0):
         before |= 1 << jp.steps[j].leaf
-    var tail = 0
+    var tail = List[Int]()
     for j in range(s0, len(jp.steps)):
-        var lf = jp.steps[j].leaf
-        if not jp.steps[j].build_new:
-            return False
-        var has_edge = False
+        tail.append(jp.steps[j].leaf)
+    var comps = _tail_components(q, tail)
+    if len(comps) < 2 and not (len(comps) == 1 and len(comps[0]) >= 2):
+        return False
+    for c in comps:
+        var bits = 0
+        for lf in c:
+            bits |= 1 << lf
+        var reaches = False
         for k in range(len(q.edge_a)):
             var ta = table_of_column(q, q.edge_a[k])
             var tb = table_of_column(q, q.edge_b[k])
-            var other = -1
-            if ta == lf:
-                other = tb
-            elif tb == lf:
-                other = ta
-            if other < 0:
-                continue
-            if (before >> other) & 1 != 0:
-                has_edge = True
-            elif (tail >> other) & 1 != 0:
-                return False
-        if not has_edge:
+            if ((bits >> ta) & 1 != 0 and (before >> tb) & 1 != 0) or ((bits >> tb) & 1 != 0 and (before >> ta) & 1 != 0):
+                reaches = True
+        if not reaches:
             return False
-        tail |= 1 << lf
+        for lf in c:                                                  # every table of a dimension group is one the planner builds the hash table on (a hub like the fact table is not)
+            for j in range(s0, len(jp.steps)):
+                if jp.steps[j].leaf == lf and not jp.steps[j].build_new:
+                    return False
     return True
 
 
@@ -1078,18 +1110,38 @@ def _read_filtered[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut 
     res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
 
 
-def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int], done: List[Bool],
-                          planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
-    """Steps `s0` to the last as one star: the probe table (the rows joined so far, or a table read unfiltered whose filter `conj0` runs in the pipeline) meets each
-    dimension through a map built on the dimension's unique keys, all in one pass over the probe rows (no joined row is written, no intermediate table).
-    False (nothing changed but notes) when a dimension's keys are not unique or are hashed: the steps run one by one."""
-    var threads = opts.threads
-    var t_star = perf_counter_ns()
-    var stages = List[StageData]()
-    var dim_tabs = List[SharedTable]()
-    var dim_leaf = List[Int]()
-    for j in range(s0, len(jp.steps)):
-        var lf = jp.steps[j].leaf
+def _copy_leaf(l: _Leaf) -> _Leaf:
+    return _Leaf(l.table, l.cols.copy(), l.gcols.copy(), l.gtable.copy(), l.rows, l.base_rows, l.deferred)
+
+
+def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, cluster: List[Int], keep: List[Int], planner: P, opts: PlannerOptions, threads: Int,
+                               budget_bytes: Int, mut res: SqlResult) raises -> _Leaf:
+    """The tables of a dimension group joined with each other (the planner orders them), keeping the global columns `keep`: one table to build a star's hash table on."""
+    var sub = JoinStats()
+    for lf in cluster:
+        sub.names.append(js.names[lf])
+        sub.base_rows.append(js.base_rows[lf])
+        sub.rows.append(js.rows[lf])
+    for k in range(len(js.edge_a)):
+        var ia = _position(cluster, js.edge_a[k])
+        var ib = _position(cluster, js.edge_b[k])
+        if ia >= 0 and ib >= 0:
+            sub.edge_a.append(ia)
+            sub.edge_b.append(ib)
+            sub.ndv_a.append(js.ndv_a[k])
+            sub.ndv_b.append(js.ndv_b[k])
+    var o = opts.copy()
+    o.join_order = List[Int]()
+    o.written_order = False
+    var sp = planner.join_order(sub, o)
+    var first = cluster[sp.start]
+    var cur_table = leaves[first].table
+    var cur_g = leaves[first].gcols.copy()
+    var cur_pos = leaves[first].cols.copy()
+    var joined = 1 << first
+    for i in range(len(sp.steps)):
+        var t_step = perf_counter_ns()
+        var lf = cluster[sp.steps[i].leaf]
         var lkey = List[Int]()
         var rkey = List[Int]()
         for k in range(len(q.edge_a)):
@@ -1097,27 +1149,94 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], jp: JoinPlan, s0: 
             var gb = q.edge_b[k]
             var ta = table_of_column(q, ga)
             var tb = table_of_column(q, gb)
-            if ta == lf and (before >> tb) & 1 != 0:
-                lkey.append(_position(probe_gt, gb))
-                rkey.append(_position(leaves[lf].gtable, ga))
-            elif tb == lf and (before >> ta) & 1 != 0:
-                lkey.append(_position(probe_gt, ga))
-                rkey.append(_position(leaves[lf].gtable, gb))
-        var keys = JoinKeys()
-        normalize_keys(leaves[lf].table, probe, rkey, lkey, keys, threads)
-        var m = hj_build(keys.bk_addr, keys.bo_addr, leaves[lf].table.rows(), threads)
-        if keys.verify or not m.unique:
-            res.notes.append("star: " + _label(q, lf) + " has " + ("hashed keys" if keys.verify else "repeated keys") + ": the joins run one by one")
-            return False
-        res.notes.append("star dimension " + _label(q, lf) + ": " + commas(leaves[lf].table.rows()) + " rows, " + m.kind() + ", " + keys.layout)
-        stages.append(StageData(m^, keys^))
-        dim_tabs.append(leaves[lf].table)
-        dim_leaf.append(lf)
+            if ta == lf and (joined >> tb) & 1 != 0:
+                lkey.append(cur_pos[_position(cur_g, gb)])
+                rkey.append(leaves[lf].cols[_position(leaves[lf].gcols, ga)])
+            elif tb == lf and (joined >> ta) & 1 != 0:
+                lkey.append(cur_pos[_position(cur_g, ga)])
+                rkey.append(leaves[lf].cols[_position(leaves[lf].gcols, gb)])
+        var stepped = _join_step(q, cur_table, cur_g, cur_pos, leaves[lf], keep, lkey^, rkey^, sp.steps[i].build_new, sp.steps[i].est_rows, _label(q, lf),
+                                 "star dimension group, join " + String(i + 1), threads, budget_bytes, res, t_step)
+        cur_g = stepped[1].copy()
+        cur_table = stepped[0]
+        cur_pos = List[Int]()
+        for c in range(len(cur_g)):
+            cur_pos.append(c)
+        joined |= 1 << lf
+    var ident = List[Int]()
+    for c in range(len(cur_g)):
+        ident.append(c)
+    return _Leaf(cur_table, ident^, cur_g.copy(), cur_g.copy(), cur_table.rows(), 0, False)
+
+
+def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int],
+                          done: List[Bool], planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
+    """Steps `s0` to the last as one star: the probe table (the rows joined so far, or a table read unfiltered whose filter `conj0` runs in the pipeline) meets each
+    dimension (a table, or a group of tables joined with each other first) through a map built on the dimension's unique keys, all in one pass over the probe rows
+    (no joined row is written, no intermediate table). False (nothing changed but notes) when a dimension's keys are not unique or are hashed: the steps run one by one."""
+    var threads = opts.threads
+    var budget_bytes = opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES
+    var t_star = perf_counter_ns()
     var conj = conj0.copy()
     for k in range(len(q.resid)):
         if not done[k]:
             conj.append(q.resid[k])
     var need = final_needed(q, conj)
+    var tail = List[Int]()
+    for j in range(s0, len(jp.steps)):
+        tail.append(jp.steps[j].leaf)
+    var comps = _tail_components(q, tail)
+    var stages = List[StageData]()
+    var dim_tabs = List[SharedTable]()
+    var dim_gt = List[List[Int]]()
+    var dim_name = List[String]()
+    for cl in comps:
+        var bits = 0
+        var label = String()
+        for lf in cl:
+            bits |= 1 << lf
+            label += ("+" if label.byte_length() > 0 else "") + _label(q, lf)
+        var stage_leaf: _Leaf
+        if len(cl) == 1:
+            stage_leaf = _copy_leaf(leaves[cl[0]])
+        else:
+            # the columns the group keeps: what the query reads, the keys to the probe table, and the keys that join its own tables
+            var keep = List[Int]()
+            for g in range(len(need)):
+                if need[g] and (bits >> table_of_column(q, g)) & 1 != 0:
+                    keep.append(g)
+            for k in range(len(q.edge_a)):
+                var ta = table_of_column(q, q.edge_a[k])
+                var tb = table_of_column(q, q.edge_b[k])
+                if (bits >> ta) & 1 != 0 and _position(keep, q.edge_a[k]) < 0:
+                    keep.append(q.edge_a[k])
+                if (bits >> tb) & 1 != 0 and _position(keep, q.edge_b[k]) < 0:
+                    keep.append(q.edge_b[k])
+            stage_leaf = _build_cluster[P](q, leaves, js, cl, keep, planner, opts, threads, budget_bytes, res)
+        var lkey = List[Int]()
+        var rkey = List[Int]()
+        for k in range(len(q.edge_a)):
+            var ga = q.edge_a[k]
+            var gb = q.edge_b[k]
+            var ta = table_of_column(q, ga)
+            var tb = table_of_column(q, gb)
+            if (bits >> ta) & 1 != 0 and (before >> tb) & 1 != 0:
+                lkey.append(_position(probe_gt, gb))
+                rkey.append(_position(stage_leaf.gtable, ga))
+            elif (bits >> tb) & 1 != 0 and (before >> ta) & 1 != 0:
+                lkey.append(_position(probe_gt, ga))
+                rkey.append(_position(stage_leaf.gtable, gb))
+        var keys = JoinKeys()
+        normalize_keys(stage_leaf.table, probe, rkey, lkey, keys, threads)
+        var m = hj_build(keys.bk_addr, keys.bo_addr, stage_leaf.table.rows(), threads)
+        if keys.verify or not m.unique:
+            res.notes.append("star: " + label + " has " + ("hashed keys" if keys.verify else "repeated keys") + ": the joins run one by one")
+            return False
+        res.notes.append("star dimension " + label + ": " + commas(stage_leaf.table.rows()) + " rows, " + m.kind() + ", " + keys.layout)
+        stages.append(StageData(m^, keys^))
+        dim_tabs.append(stage_leaf.table)
+        dim_gt.append(stage_leaf.gtable.copy())
+        dim_name.append(label)
     var tabs = List[SharedTable]()
     var colsets = List[List[Int]]()
     var vglobal = List[Int]()
@@ -1136,11 +1255,10 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], jp: JoinPlan, s0: 
     colsets.append(pc^)
     var n_dim_cols = 0
     for si in range(len(dim_tabs)):
-        var lf = dim_leaf[si]
         tabs.append(dim_tabs[si])
         var dc = List[Int]()
         for c in range(dim_tabs[si].columns()):
-            var g = leaves[lf].gtable[c]
+            var g = dim_gt[si][c]
             if g >= 0 and need[g]:
                 dc.append(c)
                 vglobal.append(g)
@@ -1156,15 +1274,57 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], jp: JoinPlan, s0: 
     var jq = star_query(q, vglobal, conj)
     _prefill_ranges_n(cat2.sources[0], jq, tabs, vtab, vreal)
     var names = String()
-    for si in range(len(dim_leaf)):
-        names += (", " if si > 0 else "") + _label(q, dim_leaf[si])
-    res.notes.append("join path: fused: a star: " + commas(probe.rows()) + " probe rows meet " + String(len(dim_leaf)) + " dimensions (" + names + ") with unique keys in one pass of blocks of 1,024; " +
+    for si in range(len(dim_name)):
+        names += (", " if si > 0 else "") + dim_name[si]
+    res.notes.append("join path: fused: a star: " + commas(probe.rows()) + " probe rows meet " + String(len(dim_name)) + " dimensions (" + names + ") with unique keys in one pass of blocks of 1,024; " +
                      String(n_dim_cols) + " dimension columns are gathered into per-worker scratch (no joined row and no intermediate table is written)" +
                      (" (the probe table's filter runs in the pipeline)" if len(conj0) > 0 else ""))
     var fj = ArcPointer(FusedJoin(probe, dim_tabs^, vstage^, vreal^, stages^))
     out = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
     res.actuals.append("star (" + names + "): " + commas(probe.rows()) + " probe rows, " + _ms(Float64(perf_counter_ns() - t_star) / 1e6) + " ms including the aggregate")
     return True
+
+
+def _join_step(q: BoundQuery, cur_table: SharedTable, cur_g: List[Int], cur_pos: List[Int], leaf: _Leaf, keep: List[Int], var lkey: List[Int], var rkey: List[Int],
+               build_new: Bool, est: Int, label: String, title: String, threads: Int, budget_bytes: Int, mut res: SqlResult, t_step: Int) raises -> Tuple[SharedTable, List[Int]]:
+    """One join of the rows joined so far (`cur_table`, global column of each table column in `cur_g`, the table column of each in `cur_pos`) with a leaf on the key
+    columns `lkey` / `rkey` (table columns), keeping the global columns `keep`; the pairs are gathered into a new table. Returns it and the global column of each of its
+    columns."""
+    var lkeep = List[Int]()                                          # the table columns each side carries on
+    var lkeep_g = List[Int]()
+    for i in range(len(cur_g)):
+        if _position(keep, cur_g[i]) >= 0:
+            lkeep.append(cur_pos[i])
+            lkeep_g.append(cur_g[i])
+    var rkeep = List[Int]()
+    var rkeep_g = List[Int]()
+    for i in range(len(leaf.gcols)):
+        if _position(keep, leaf.gcols[i]) >= 0:
+            rkeep.append(leaf.cols[i])
+            rkeep_g.append(leaf.gcols[i])
+    var left = JoinSide(cur_table, lkeep^, lkey^, False)
+    var right = JoinSide(leaf.table, rkeep^, rkey^, False)
+    var left_builds = not build_new
+    var keys = JoinKeys()
+    if left_builds:
+        normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, threads)
+    else:
+        normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, threads)
+    var nb = left.table.rows() if left_builds else right.table.rows()
+    var np = right.table.rows() if left_builds else left.table.rows()
+    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, threads)
+    var build_kind = m.kind()
+    var pairs = join_pairs(m, keys, np, budget_bytes // (8 * max(len(lkeep_g) + len(rkeep_g), 1)), threads)
+    var jt = gather_join(left, right, pairs, left_builds, threads)
+    var out_rows = jt.rows()
+    res.notes.append(title + ": " + commas(left.table.rows()) + " rows with " + commas(right.table.rows()) + " rows of " + label + " on " + String(len(left.key_cols)) +
+                     (" key (" if len(left.key_cols) == 1 else " keys (") + keys.layout + "), hash table on " + commas(nb) + " rows: " + build_kind + ", " + commas(out_rows) + " rows out (estimated " + commas(est) + ")")
+    res.actuals.append(title + " (" + label + "): " + commas(left.table.rows()) + " x " + commas(right.table.rows()) + " -> " + commas(out_rows) + " rows (estimated " +
+                       commas(est) + "), build " + commas(nb) + " rows, " + _ms(Float64(perf_counter_ns() - t_step) / 1e6) + " ms")
+    var new_g = lkeep_g^
+    for g in rkeep_g:
+        new_g.append(g)
+    return (jt^.share(), new_g^)
 
 
 def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
@@ -1284,7 +1444,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
                     sp_conj = q.leaf_conj[jp.start].copy()
                     sp_conj_text = q.leaf_conj_text[jp.start].copy()
             var star_out = SqlResult()
-            if _run_star[P](q, leaves, jp, si, joined, sp_table, sp_gt, sp_conj, done, planner, opts, trust, lie, res, star_out):
+            if _run_star[P](q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, done, planner, opts, trust, lie, res, star_out):
                 for nt in star_out.notes:
                     res.notes.append(nt)
                 for a in star_out.actuals:
@@ -1304,18 +1464,6 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         var lf = step.leaf
         var after = joined | (1 << lf)
         var keep = needed_after(q, after, done)
-        var lkeep = List[Int]()                                      # the table columns each side carries on
-        var lkeep_g = List[Int]()
-        for i in range(len(cur_g)):
-            if _position(keep, cur_g[i]) >= 0:
-                lkeep.append(cur_pos[i])
-                lkeep_g.append(cur_g[i])
-        var rkeep = List[Int]()
-        var rkeep_g = List[Int]()
-        for i in range(len(leaves[lf].gcols)):
-            if _position(keep, leaves[lf].gcols[i]) >= 0:
-                rkeep.append(leaves[lf].cols[i])
-                rkeep_g.append(leaves[lf].gcols[i])
         var lkey = List[Int]()
         var rkey = List[Int]()
         for k in range(len(q.edge_a)):
@@ -1329,29 +1477,10 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
             elif tb == lf and (joined >> ta) & 1 != 0:
                 lkey.append(cur_pos[_position(cur_g, ga)])
                 rkey.append(leaves[lf].cols[_position(leaves[lf].gcols, gb)])
-        var left = JoinSide(cur_table, lkeep^, lkey^, False)
-        var right = JoinSide(leaves[lf].table, rkeep^, rkey^, False)
-        var left_builds = not step.build_new
-        var keys = JoinKeys()
-        if left_builds:
-            normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, threads)
-        else:
-            normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, threads)
-        var nb = left.table.rows() if left_builds else right.table.rows()
-        var np = right.table.rows() if left_builds else left.table.rows()
-        var m = hj_build(keys.bk_addr, keys.bo_addr, nb, threads)
-        var build_kind = m.kind()
-        var pairs = join_pairs(m, keys, np, budget_bytes // (8 * max(len(lkeep_g) + len(rkeep_g), 1)), threads)
-        var jt = gather_join(left, right, pairs, left_builds, threads)
-        var out_rows = jt.rows()
-        res.notes.append("join step " + String(si + 1) + ": " + commas(left.table.rows()) + " rows with " + commas(right.table.rows()) + " rows of " + _label(q, lf) + " on " + String(len(left.key_cols)) +
-                         (" key (" if len(left.key_cols) == 1 else " keys (") + keys.layout + "), hash table on " + commas(nb) + " rows: " + build_kind + ", " + commas(out_rows) + " rows out (estimated " + commas(step.est_rows) + ")")
-        res.actuals.append("join step " + String(si + 1) + " (" + _label(q, lf) + "): " + commas(left.table.rows()) + " x " + commas(right.table.rows()) + " -> " + commas(out_rows) + " rows (estimated " +
-                           commas(step.est_rows) + "), build " + commas(nb) + " rows, " + _ms(Float64(perf_counter_ns() - t_step) / 1e6) + " ms")
-        cur_g = lkeep_g^
-        for g in rkeep_g:
-            cur_g.append(g)
-        cur_table = jt^.share()
+        var stepped = _join_step(q, cur_table, cur_g, cur_pos, leaves[lf], keep, lkey^, rkey^, step.build_new, step.est_rows, _label(q, lf), "join step " + String(si + 1),
+                                 threads, budget_bytes, res, t_step)
+        cur_g = stepped[1].copy()
+        cur_table = stepped[0]
         cur_pos = List[Int]()
         for i in range(len(cur_g)):
             cur_pos.append(i)

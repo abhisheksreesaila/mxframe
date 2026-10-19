@@ -244,3 +244,60 @@ def test_the_join_budget_is_a_readable_error(mx, tpch):
     files = {t: tpch["paths"][t] for t in tables_of(Q10)}
     e = run_mx(mx, ["sql", Q10, "--join-budget", "100000", "--join", "materialize"], files, expect_exit=1)["error"]
     assert "past the join's memory budget" in e["message"], e
+
+
+# ── a star: the fact table probes several dimensions with unique keys in one pass ─────────────────────
+
+STAR3 = """SELECT o_orderpriority, p_brand, count(*), sum(l_extendedprice * (1 - l_discount))
+FROM lineitem, orders, part, supplier
+WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_suppkey = s_suppkey AND p_size < 20 AND s_acctbal > 0
+GROUP BY o_orderpriority, p_brand"""
+
+STAR_FACT_FILTER = """SELECT s_nationkey, p_brand, count(*), sum(l_quantity), min(o_orderdate), max(p_retailprice)
+FROM lineitem, part, supplier, orders
+WHERE l_partkey = p_partkey AND l_suppkey = s_suppkey AND l_orderkey = o_orderkey AND l_quantity > 10 AND l_discount < 0.09 AND o_orderstatus <> 'P'
+GROUP BY s_nationkey, p_brand"""
+
+SNOWFLAKE = """SELECT n_name, p_brand, count(*), sum(l_extendedprice)
+FROM lineitem, orders, part, supplier, nation
+WHERE l_orderkey = o_orderkey AND l_partkey = p_partkey AND l_suppkey = s_suppkey AND s_nationkey = n_nationkey AND o_totalprice > 100000
+GROUP BY n_name, p_brand"""
+
+STAR_ROWS = """SELECT l_orderkey, l_linenumber, p_brand, s_name, o_orderdate
+FROM lineitem, part, supplier, orders
+WHERE l_partkey = p_partkey AND l_suppkey = s_suppkey AND l_orderkey = o_orderkey AND p_size = 7 AND s_acctbal > 9000 AND l_quantity > 45
+ORDER BY l_orderkey, l_linenumber LIMIT 50"""
+
+
+@pytest.mark.parametrize("sql,extra", [(STAR3, []), (STAR_FACT_FILTER, []), (SNOWFLAKE, ["--order", "written"])])
+def test_a_star_runs_in_one_fused_pass_and_equals_duckdb(mx, tpch, sql, extra):
+    """The fact table first (the written order): every other table is a dimension with unique keys; nation, reached through supplier, is joined to it first."""
+    ordered = "LIMIT" in sql
+    res = q(mx, tpch, sql, ordered=ordered, extra=extra)
+    path = note(res, "join path")
+    assert path.startswith("join path: fused: a star:"), res["notes"]
+    assert any(n.startswith("star dimension") for n in res["notes"]), res["notes"]
+    if sql == SNOWFLAKE:
+        assert any("supplier+nation" in n for n in res["notes"]), res["notes"]
+
+
+@pytest.mark.parametrize("sql", [STAR3, STAR_FACT_FILTER, SNOWFLAKE, STAR_ROWS])
+def test_a_star_equals_duckdb_when_materialized_and_on_one_thread_and_streamed(mx, tpch, sql):
+    ordered = "LIMIT" in sql
+    res = q(mx, tpch, sql, ordered=ordered, extra=["--join", "materialize", "--order", "written"])
+    assert "star" not in note(res, "join path"), res["notes"]
+    q(mx, tpch, sql, ordered=ordered, extra=["--threads", "1", "--order", "written"])
+    q(mx, tpch, sql, ordered=ordered, extra=["--stream", "always", "--order", "written"])
+
+
+def test_a_star_with_the_facts_filter_in_the_pipeline_says_so(mx, tpch):
+    res = q(mx, tpch, STAR_FACT_FILTER, extra=["--order", "written"])
+    assert "the probe table's filter runs in the pipeline" in note(res, "join path"), res["notes"]
+
+
+@pytest.mark.parametrize("order", ["0,1,2,3", "1,0,2,3", "2,1,0,3", "3,0,1,2"])
+def test_a_star_under_forced_orders_equals_duckdb(mx, tpch, order):
+    try:
+        q(mx, tpch, STAR3, extra=["--order", order])
+    except AssertionError as e:
+        assert "reaches a table no equality joins yet" in str(e) or "memory budget" in str(e), str(e)[:400]
