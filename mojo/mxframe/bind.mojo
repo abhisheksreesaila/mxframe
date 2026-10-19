@@ -827,10 +827,13 @@ struct _Binder(Movable):
                 if a.kind == TEXT.value and a.op != B_COL:
                     raise self.err(x.items[0], name.lower() + "() of TEXT needs the column itself")
             elif func == F_SUM:
-                if not _is_numeric(a.kind):
+                if a.kind == BOOL.value:                              # DuckDB sums a BOOLEAN as 0 / 1
+                    rkind = INT.value
+                elif not _is_numeric(a.kind):
                     raise self.err(x.items[0], "sum() needs numbers, found " + kind_name(a.kind, a.scale))
-                rkind = a.kind
-                rscale = a.scale
+                else:
+                    rkind = a.kind
+                    rscale = a.scale
             elif func == F_AVG:
                 if not _is_numeric(a.kind):
                     raise self.err(x.items[0], "avg() needs numbers, found " + kind_name(a.kind, a.scale))
@@ -1007,6 +1010,8 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         var pe = b.q.pexprs[e].copy()
         if pe.op == B_NULL and pe.kind == K_NULL:
             raise b.err(it.expr, "a bare NULL in the select list cannot be typed")
+        if pe.op == B_STR:
+            raise b.err(it.expr, "a string constant in the select list is not supported yet")
         b.q.outputs.append(e)
         var nm: String
         if it.has_alias:

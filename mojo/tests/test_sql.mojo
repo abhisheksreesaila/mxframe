@@ -138,7 +138,7 @@ def main() raises:
     r = sql(cat, "SELECT region, count(*), sum(price), count(DISTINCT qty), median(qty) FROM orders GROUP BY region ORDER BY region", hashed)
     check(rows_of(r.table), "east 3 157.45 3 7.0\nNorth 2 9.99 1 4.0\nWest 4 36.25 4 2.5\nNULL 1 7.00 1 6.0\n", "hashed groups, holistic aggregates")
     has_note(r, "group: hashed on 2 key words: forced by the options")
-    has_note(r, "holistic: a second pass")
+    has_note(r, "ran: holistic second pass")
     var dense = PlannerOptions()
     dense.group = GROUP_DENSE
     r = sql(cat, "SELECT region, count(*), sum(price), count(DISTINCT qty), median(qty) FROM orders GROUP BY region ORDER BY region", dense)

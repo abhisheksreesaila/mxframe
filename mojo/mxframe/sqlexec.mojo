@@ -21,7 +21,7 @@ from .frame import NULL_EDIT, Overlay, text_ranks, _radix_order, _text_less
 from .parquet import ParquetScan
 from .query import (Program, QueryResult, _run_cpu, _run_mat, _merge_partial, _identity_partial, _ScanMask, _group_mask,
                     OVERFLOW_MESSAGE, CPU, MAGIC, A_SUM, A_MIN, A_MAX, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS)
-from .kernels._fpenv import core_count
+from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
 from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks
@@ -244,25 +244,55 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
 # ── sources: statistics, the delta table, the program's inputs ───────────────────────────────────────
 
 def _column_range(t: SharedTable, c: Int) -> Tuple[Bool, Int64, Int64]:
+    """The lowest and highest non-null value of a column (and whether there is one): in parallel over slices of the rows."""
     var n = t.rows()
-    var vals = t.values(c)
-    var has_nulls = t.null_count(c) > 0
+    var tasks = max(1, min(core_count(), n // 65536))
+    var los = List[Int64](length=tasks, fill=Int64.MAX)
+    var his = List[Int64](length=tasks, fill=Int64.MIN)
+    var seen = List[Int64](length=tasks, fill=0)
+    var vp = Int(t.values(c).unsafe_ptr())
+    var valid = t._table[].cols[c].validity_address()
+    var lp = Int(los.unsafe_ptr())
+    var hp = Int(his.unsafe_ptr())
+    var sp = Int(seen.unsafe_ptr())
+
+    def work(i: Int) {imm}:
+        var vals = LP(unsafe_from_address=vp)
+        var bits = BP(unsafe_from_address=valid)
+        var lo = Int64.MAX
+        var hi = Int64.MIN
+        var any = Int64(0)
+        var a = n * i // tasks
+        var b = n * (i + 1) // tasks
+        if valid == 0:
+            for r in range(a, b):
+                var v = vals[r]
+                lo = min(lo, v)
+                hi = max(hi, v)
+            any = Int64(1) if b > a else Int64(0)
+        else:
+            for r in range(a, b):
+                if (bits[r >> 3] >> UInt8(r & 7)) & 1 != 0:
+                    var v = vals[r]
+                    lo = min(lo, v)
+                    hi = max(hi, v)
+                    any = 1
+        LP(unsafe_from_address=lp)[i] = lo
+        LP(unsafe_from_address=hp)[i] = hi
+        LP(unsafe_from_address=sp)[i] = any
+
+    if tasks == 1:
+        work(0)
+    else:
+        par_n(work, tasks, tasks)
     var lo = Int64.MAX
     var hi = Int64.MIN
     var any = False
-    if not has_nulls:
-        for i in range(n):
-            var v = vals[i]
-            lo = min(lo, v)
-            hi = max(hi, v)
-        any = n > 0
-    else:
-        for i in range(n):
-            if not t.is_null(c, i):
-                var v = vals[i]
-                lo = min(lo, v)
-                hi = max(hi, v)
-                any = True
+    for i in range(tasks):
+        if seen[i] != 0:
+            lo = min(lo, los[i])
+            hi = max(hi, his[i])
+            any = True
     return (any, lo, hi)
 
 
@@ -323,6 +353,7 @@ def _delta_nulls(src: SqlSource, c: Int) -> Bool:
 def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess) raises -> Stats:
     var st = Stats(src.name, src.kind, src.rows() + (len(src.overlay.delta) if src.kind != SRC_SCAN else 0))
     st.edits = len(src.overlay.delta)
+    st.version = src.version
     if src.scan:
         st.row_groups = src.scan.value().row_groups()
     for c in range(src.table.columns()):
@@ -521,6 +552,8 @@ def _top_rows(cols: List[ValCol], order: List[SortKey], dicts: DictAccess, n: In
         sc.desc.append(order[k].desc)
         sc.nulls_first.append(order[k].nulls_first)
     var heap = List[Int]()                  # a max-heap: the worst of the best `want` rows on top
+    if want <= 0:
+        return heap^
     for r in range(n):
         if len(heap) < want:
             heap.append(r)
@@ -1045,36 +1078,76 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
     _ = dtypes^
 
 
-def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
-             mut notes: List[String]) raises -> Table:
+struct _Inputs(Movable):
+    """How the program sees the source: which columns the chunks hold and where, which can be NULL, whether a mask applies."""
+    var used: List[Int]
+    var pos: List[Int]
+    var chunk_cols: Int
+    var nullable: List[Bool]
+    var masked: Bool
+    var scan_mode: Bool
+
+    def __init__(out self):
+        self.used = List[Int]()
+        self.pos = List[Int]()
+        self.chunk_cols = 0
+        self.nullable = List[Bool]()
+        self.masked = False
+        self.scan_mode = False
+
+
+def _inputs(src: SqlSource, q: BoundQuery) raises -> _Inputs:
+    var inp = _Inputs()
     var n_cols = src.table.columns()
-    var used = collect_columns(q)
-    var scan_mode = src.kind == SRC_SCAN
-    # how the program sees the chunks: a table or frame as it is, a scan's row groups holding only the columns used
-    var pos = List[Int](length=n_cols, fill=-1)
-    var chunk_cols = n_cols
-    if scan_mode:
-        if len(used) == 0 and n_cols > 0:
-            used.append(0)
-        for k in range(len(used)):
-            pos[used[k]] = k
-        chunk_cols = len(used)
-        for c in used:
+    inp.used = collect_columns(q)
+    inp.scan_mode = src.kind == SRC_SCAN
+    # a table or frame is seen as it is; a scan's row groups hold only the columns used
+    inp.pos = List[Int](length=n_cols, fill=-1)
+    inp.chunk_cols = n_cols
+    if inp.scan_mode:
+        if len(inp.used) == 0 and n_cols > 0:
+            inp.used.append(0)
+        for k in range(len(inp.used)):
+            inp.pos[inp.used[k]] = k
+        inp.chunk_cols = len(inp.used)
+        for c in inp.used:
             if src.table.kind(c) == TEXT:
                 src.scan.value().ensure_words(c)
     else:
+        inp.used = _all(n_cols)
         for c in range(n_cols):
-            pos[c] = c
-        used = _all(n_cols)
-    var nullable = List[Bool]()
+            inp.pos[c] = c
     for c in range(n_cols):
-        nullable.append(scan_mode or src.table.null_count(c) > 0 or _delta_nulls(src, c))
-    var masked = len(src.overlay.mask) > 0
-    var two_pass = plan.group == G_HASHED and plan.holistic
-    var sp = lower_sql(q, plan, nullable.copy(), pos.copy(), chunk_cols, DictAccess(src.table, src.scan, dicts.extra), _alias_lists(src), masked,
-                       PHASE_PLAIN if two_pass else PHASE_ALL)
+        inp.nullable.append(inp.scan_mode or src.table.null_count(c) > 0 or _delta_nulls(src, c))
+    inp.masked = len(src.overlay.mask) > 0
+    return inp^
+
+
+def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int) raises -> SqlProgram:
+    return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, DictAccess(src.table, src.scan, dicts.extra),
+                     _alias_lists(src), inp.masked, phase)
+
+
+def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, sp: SqlProgram, mut notes: List[String]):
+    var names = String()
+    var k = 0
+    var read = collect_columns(q)
+    for c in read:
+        names += (", " if k > 0 else "") + src.table.name(c)
+        k += 1
+    notes.append("columns read: " + (names if k > 0 else "none") + " (" + String(len(read)) + " of " + String(src.table.columns()) + ")")
     notes.append("kernel: " + String(sp.instr) + " instructions a row" + (", " + String(len(sp.set_meta) // 3) + " sets" if len(sp.set_meta) > 0 else "") +
                  " (" + String(sp.p.n_slots) + (" slot" if sp.p.n_slots == 1 else " slots") + ")")
+    if plan.group == G_HASHED and plan.holistic:
+        notes.append("holistic: a second pass maps each row to its group for count(DISTINCT), median, quantile_disc and min / max of TEXT")
+    notes.append("device: CPU (SQL runs on the CPU)")
+
+
+def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
+             mut notes: List[String], inp: _Inputs, var sp: SqlProgram) raises -> Table:
+    var used = inp.used.copy()
+    var scan_mode = inp.scan_mode
+    var two_pass = plan.group == G_HASHED and plan.holistic
     var ops = sp.slot_ops.copy()
     var threads = opts.threads
     var rows_total = -1 if src.kind != SRC_TABLE else src.rows()
@@ -1107,14 +1180,14 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var t_hol = perf_counter_ns()
     if two_pass:
         # pass 2: the groups are known, find each row's group again and feed the holistic states
-        var sp2 = lower_sql(q, plan, nullable^, pos^, chunk_cols, DictAccess(src.table, src.scan, dicts.extra), _alias_lists(src), masked, PHASE_HOL)
+        var sp2 = _lower(src, q, plan, dicts, inp, PHASE_HOL)
         var look = _GroupLookup(acc)
         var hs2 = _holistic_states(q, max(acc.groups(), 1), sp2, dicts, rows_total)
         var ch2 = _open_chunks(src, used)
         for i in range(ch2.n()):
             var chunk = _load_chunk(src, ch2, i)
             _run_hol_hashed(chunk, sp2, look, ch2.mask_addr, hs2, threads)
-        notes.append("holistic: a second pass over the " + String(ch2.n()) + (" chunk" if ch2.n() == 1 else " chunks") + " maps each row to one of " +
+        notes.append("ran: holistic second pass over the " + String(ch2.n()) + (" chunk" if ch2.n() == 1 else " chunks") + " mapped each row to one of " +
                      commas(acc.groups()) + " groups")
         hres = hs2.finish()
         for h in range(len(hs2.specs)):
@@ -1149,6 +1222,9 @@ def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises ->
     var plan = planner.plan(q, st, opts)
     var res = SqlResult()
     res.notes = plan.notes.copy()
+    var inp = _inputs(src, q)
+    var sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
+    _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
     if q.explain != EXPLAIN_NONE:
         res.explain = _explain_text(q, src, res.notes)
         var t = Table.empty()
@@ -1160,7 +1236,7 @@ def run_sql(mut catalog: Catalog, q: BoundQuery, opts: PlannerOptions) raises ->
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
     var notes = res.notes.copy()
-    res.table = _execute(src, q, plan, opts, dicts, notes)
+    res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^)
     res.notes = notes^
     res.explain = _explain_text(q, src, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6

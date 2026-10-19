@@ -13,8 +13,7 @@ What it decides today: the group strategy.
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
 from .table import ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
-from .bind import (BoundQuery, BExpr, SqlSource, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_DISTINCT, F_MEDIAN, F_QUANTILE,
-                   kind_name)
+from .bind import (BoundQuery, BExpr, SqlSource, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_NULL, B_IDIV, B_IMOD, kind_name)
 
 comptime GROUP_AUTO = 0
 comptime GROUP_DENSE = 1
@@ -64,7 +63,8 @@ struct Stats(Movable):
     var rows: Int
     var cols: List[ColStat]
     var row_groups: Int
-    var edits: Int               # a frame: shared rows changed + appended, how many go through the delta
+    var edits: Int               # a frame: the changed and appended rows that go through the delta
+    var version: Int             # a frame: its edit counter when it was registered
 
     def __init__(out self, source: String, kind: Int, rows: Int):
         self.source = source
@@ -73,6 +73,7 @@ struct Stats(Movable):
         self.cols = List[ColStat]()
         self.row_groups = 0
         self.edits = 0
+        self.version = 0
 
 
 @fieldwise_init
@@ -116,6 +117,21 @@ trait Planner:
         ...
 
 
+def expr_nullable(q: BoundQuery, e: Int, st: Stats) -> Bool:
+    """Can the row-level expression be NULL? (a nullable column, a NULL literal, a division that may meet zero)"""
+    ref x = q.rexprs[e]
+    if x.op == B_COL:
+        return st.cols[Int(x.value)].nullable
+    if x.op == B_NULL or x.op == B_IDIV or x.op == B_IMOD:
+        return True
+    var r = False
+    if x.a >= 0:
+        r = r or expr_nullable(q, x.a, st)
+    if x.b >= 0:
+        r = r or expr_nullable(q, x.b, st)
+    return r
+
+
 def commas(n: Int) -> String:
     var s = String(n if n >= 0 else -n)
     var out = String()
@@ -137,8 +153,8 @@ struct RulePlanner(Planner, Copyable, Movable):
         for a in q.aggs:
             if a.hol:
                 plan.holistic = True
-        var what = "table" if st.kind == SRC_TABLE else "frame (the edits as a mask over the shared rows plus the changed rows)" if st.kind == SRC_FRAME \
-                   else "Parquet scan, " + commas(st.row_groups) + " row groups"
+        var what = "table" if st.kind == SRC_TABLE else "frame at edit " + String(st.version) + ": the edits as a mask over the shared rows plus " + \
+                   commas(st.edits) + " changed or appended rows" if st.kind == SRC_FRAME else "Parquet scan, " + commas(st.row_groups) + " row groups"
         plan.notes.append("source: " + st.source + " (" + what + "), " + commas(st.rows) + " rows")
         if len(q.keys) == 0:
             plan.group = G_NONE
@@ -183,7 +199,7 @@ struct RulePlanner(Planner, Copyable, Movable):
                 dense_ok = False
                 if why_not.byte_length() == 0:
                     why_not = "`" + q.keys[k].name + "` is an expression, so its range is unknown"
-                layout.nullable = True
+                layout.nullable = expr_nullable(q, q.keys[k].expr, st)
             layout.words = 1 + (1 if layout.nullable else 0)
             if dense_ok:
                 if domain > (1 << 40) // max(layout.radix, 1):
@@ -195,6 +211,10 @@ struct RulePlanner(Planner, Copyable, Movable):
             plan.keys.append(layout^)
         var use_dense = False
         var reason = String()
+        var est_slots = 1 + 2 * len(q.aggs)                         # the dense kernel holds a word per slot per group
+        if dense_ok and domain > (1 << 27) // est_slots:
+            dense_ok = False
+            why_not = "the domain of " + commas(domain) + " slots times " + String(est_slots) + " accumulators passes the memory bound"
         if opts.group == GROUP_DENSE:
             if not dense_ok:
                 raise Error("cannot force dense groups: " + why_not)

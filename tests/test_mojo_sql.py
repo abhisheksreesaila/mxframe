@@ -352,6 +352,15 @@ QUERIES = [
       duck="SELECT g, quantile_disc(x, 0.5), median(d * 10), count(DISTINCT s), arg_min(s, (lower(s), s)) FROM t WHERE g < 50 GROUP BY g",
       fix=lambda rows: [r[:2] + (Decimal(r[2]) / 10 if r[2] is not None else None,) + r[3:] for r in rows]),
     Q("SELECT count(*), sum(x) FROM t WHERE x > 5000 GROUP BY k", keys=["k"], tag="empty-groups"),
+    Q("SELECT count(*), sum(x) FROM t WHERE d > x AND e < d AND x * d > e", tag="mixed-scales"),
+    Q("SELECT k, count(*) FROM t WHERE d >= -12.5 AND e < 0.00005 AND x = 1.0 GROUP BY k", keys=["k"], tag="decimal-literals"),
+    Q("SELECT k, max(dt) - min(dt), min(dt) + 7, count(*) FROM t WHERE dt + 30 > '2020-06-01' GROUP BY k", keys=["k"], tag="date-arithmetic"),
+    Q("SELECT k, sum(x) FROM t GROUP BY k ORDER BY -sum(x), k LIMIT 5", keys=["k"], ordered=True, tag="order-by-expression"),
+    Q("SELECT 1, 2.5, count(*), sum(1.5) FROM t WHERE TRUE", tag="constants"),
+    Q("SELECT count(*), sum(x) FROM t WHERE FALSE OR x > NULL OR NULL", tag="constant-conditions"),
+    Q("SELECT k, count(*) FROM t GROUP BY k ORDER BY k LIMIT 0", keys=["k"], ordered=True, tag="limit-0"),
+    Q("SELECT k, count(*) FROM t GROUP BY k ORDER BY k OFFSET 100", keys=["k"], ordered=True, tag="offset-past-the-end"),
+    Q("SELECT k, sum(b), min(b), max(b), count(b) FROM t GROUP BY k", keys=["k"], tag="bool-aggregates"),
 ]
 
 
@@ -429,7 +438,7 @@ def test_forced_group_strategy_gives_the_same_answer(probe, data, mode, strategy
     group_note = next(n for n in res["notes"] if n.startswith("group:"))
     assert group_note.startswith(f"group: {strategy}") and group_note.endswith("forced by the options"), group_note
     if strategy == "hashed" and any(a in q.sql for a in ("DISTINCT", "median", "quantile_disc", "min(s)")):
-        assert any(n.startswith("holistic: a second pass") for n in res["notes"]), res["notes"]
+        assert any(n.startswith("ran: holistic second pass") for n in res["notes"]), res["notes"]
 
 
 def test_dense_limit_sends_a_wide_domain_to_hashed_groups(probe, data):
@@ -504,6 +513,9 @@ def test_explain_shows_the_logical_and_the_physical_plan(probe, data):
         "Physical plan",
         "  source: t (table), 20,000 rows",
         "  group: dense, 2 keys s 16 (with a NULL slot) x k 7 (with a NULL slot) = 112 slots: the domain of 112 slots is small",
+        "  columns read: k, x, d, s (4 of 9)",
+        "  kernel: 36 instructions a row (2 slots)",
+        "  device: CPU (SQL runs on the CPU)",
     ], lines
     assert res["explain"] == "\n".join(lines) + "\n"
     assert not any(n.startswith("ran:") for n in res["notes"]), "EXPLAIN does not run the query"
