@@ -22,10 +22,11 @@ would hold the file) and `save(path)` streams the edited file out, a row group a
 """
 from std.collections import Dict, Set
 from std.memory import ArcPointer
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
-from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG,
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
-from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool
+from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool, _parse_float, F_OK, F_RANGE, F_NAN_BITS
+from .holistic import float_key
 from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP
 
 comptime SET = 0
@@ -33,7 +34,9 @@ comptime APPEND = 1
 comptime REMOVE = 2
 comptime MERGE = 3
 comptime REPOINT = 4
-comptime NULL_EDIT = Int64.MIN + 1        # an edited cell set to null: `set` refuses this one value
+comptime NULL_EDIT = Int64(0x7FF8000000000001)   # an edited cell set to null: `set` refuses this one value. A quiet NaN's bits (F-157: a
+                                                 # FLOAT cell can hold any other bit pattern, and a NaN's payload is not a value): a FLOAT cell
+                                                 # that holds exactly this NaN is read as the canonical NaN
 comptime CACHE_BYTES = 128 * 1024 * 1024  # the default bound of a scan frame's cache of decoded column chunks
 
 
@@ -228,10 +231,13 @@ struct Frame(Movable):
     def kind(self, c: Int) -> ColumnKind:
         if c < self.stored():
             return self.base.kind(c)
-        return DECIMAL if self.formulas[c - self.stored()].scale > 0 else INT
+        var fs = self.formulas[c - self.stored()].scale
+        return FLOAT if fs < 0 else DECIMAL if fs > 0 else INT
 
     def scale(self, c: Int) -> Int:
-        return self.base.scale(c) if c < self.stored() else self.formulas[c - self.stored()].scale
+        """A stored column's scale (a DECIMAL's places; a FLOAT's 0, or 32 for a column the file stored as 32-bit floats), a formula's
+        places (0 for a FLOAT formula)."""
+        return self.base.scale(c) if c < self.stored() else max(self.formulas[c - self.stored()].scale, 0)
 
     def index(self, name: String) -> Int:
         var c = self.base.index(name)
@@ -275,7 +281,7 @@ struct Frame(Movable):
         """The file's (or shared table's) value of a base row, NULL_EDIT for null. A scan: from the rows the session
         touched, else from the cache, which decodes the column chunk of the row's group on a miss."""
         if not self.scan:
-            return NULL_EDIT if self.base.is_null(c, row) else self.base.get(c, row)
+            return NULL_EDIT if self.base.is_null(c, row) else self._clean(c, self.base.get(c, row))
         ref cache = self.cache[]
         if row in cache.rows:
             return cache.rows[row][c]
@@ -283,7 +289,13 @@ struct Frame(Movable):
         var i = cache.fetch(self.scan.value(), g, c)
         ref t = cache.tables[i]
         var r = row - self.starts[g]
-        return NULL_EDIT if t.is_null(0, r) else t.get(0, r)
+        return NULL_EDIT if t.is_null(0, r) else self._clean(c, t.get(0, r))
+
+    def _clean(self, c: Int, v: Int64) -> Int64:
+        """A FLOAT cell's value that equals the null marker (a NaN with that payload) is the canonical NaN."""
+        if v == NULL_EDIT and self.base.kind(c) == FLOAT:
+            return Int64(F_NAN_BITS)
+        return v
 
     def set_cache_limit(mut self, bytes: Int):
         """Bounds the decoded column chunks a scan frame keeps for `get` and `is_null` (8 bytes a value plus the null
@@ -327,6 +339,10 @@ struct Frame(Movable):
             return 0 if v == NULL_EDIT else self.alias(c, v)
         return self.evaluate(self.program(c), row)[0]
 
+    def get_float(self, c: Int, row: Int) raises -> Float64:
+        """A FLOAT cell (or a FLOAT formula's value) as a float64 (0.0 for a null: ask `is_null`)."""
+        return Float64(from_bits=UInt64(self.get(c, row)))
+
     def text_of(self, c: Int, code: Int64) raises -> String:
         """The word of a TEXT code: the shared dictionary's, then this session's."""
         var n = self._shared_words(c)
@@ -360,6 +376,15 @@ struct Frame(Movable):
         var out: Int64 = 0
         var places = 0
         var ok: Bool
+        if kind == FLOAT:
+            var x = Float64(0.0)
+            var st = _parse_float(p, n, x)
+            _ = s.byte_length()
+            if st == F_RANGE:
+                raise Error("column `" + self.base.name(c) + "`: `" + s + "` is past the largest float64 (about 1.8e308)")
+            if st != F_OK:
+                raise Error("column `" + self.base.name(c) + "`: `" + s + "` isn't a number")
+            return Int64(x.to_bits())
         if kind == DATE:
             ok = _parse_date(p, n, out)
         elif kind == BOOL:
@@ -384,6 +409,14 @@ struct Frame(Movable):
         if value == NULL_EDIT:
             raise Error("the value " + String(value) + " is reserved for null; use set_null")
         self._set(c, row, value)
+
+    def set_float(mut self, c: Int, row: Int, value: Float64) raises:
+        """Sets a FLOAT cell. The bits are kept as given (-0.0, a NaN's payload), except the one NaN that marks a null edit."""
+        self._check_cell(c, row)
+        if self.base.kind(c) != FLOAT:
+            raise Error("column `" + self.base.name(c) + "` is " + String(self.base.kind(c)) + ", not FLOAT")
+        var bits = Int64(value.to_bits())
+        self._set(c, row, Int64(F_NAN_BITS) if bits == NULL_EDIT else bits)
 
     def _check_cell(self, c: Int, row: Int) raises:
         if c < 0 or c >= self.stored():
@@ -662,7 +695,7 @@ struct Frame(Movable):
                 var t = self.scan.value().read_group(g, [c])
                 for k in range(len(need)):
                     var r = need[k] - self.starts[g]
-                    vals[k][c] = NULL_EDIT if t.is_null(0, r) else t.get(0, r)
+                    vals[k][c] = NULL_EDIT if t.is_null(0, r) else self._clean(c, t.get(0, r))
             for k in range(len(need)):
                 cache.rows[need[k]] = vals[k].copy()
 
@@ -697,6 +730,7 @@ struct Frame(Movable):
         is read straight from the shared values."""
         var n = self.nbase
         var text = c < self.stored() and self.base.kind(c) == TEXT
+        var isfloat = self.kind(c) == FLOAT
         var rank = List[Int64]()
         if text:                                             # each code's place among the words, alphabetically
             rank = _text_ranks(self, c)
@@ -713,7 +747,7 @@ struct Frame(Movable):
                     if v[1]:
                         nulls.append(row)
                     else:
-                        keys.append(v[0])
+                        keys.append(float_key(v[0]) if isfloat else v[0])
                         rows.append(row)
         else:
             var edited = False
@@ -755,13 +789,13 @@ struct Frame(Movable):
                     elif some_nulls and tbl.is_null(tc, row - lo):
                         raw = NULL_EDIT
                     else:
-                        raw = vals[row - lo]
+                        raw = self._clean(c, vals[row - lo])
                     if raw == NULL_EDIT:
                         nulls.append(row)
                         continue
                     if merged:
                         raw = self.alias(c, raw)
-                    keys.append(rank[Int(raw)] if text else raw)
+                    keys.append(rank[Int(raw)] if text else float_key(raw) if isfloat else raw)
                     rows.append(row)
         var out = _radix_order(keys, rows, descending)
         out.extend(nulls^)
@@ -1055,7 +1089,7 @@ struct _FormulaParser:
         self.scales = List[Int]()
         for c in range(f.columns()):
             self.names.append(f.name(c))
-            self.scales.append(f.scale(c))
+            self.scales.append(-1 if f.kind(c) == FLOAT else f.scale(c))      # -1: a float64
 
     def peek(mut self) -> String:
         while self.pos < self.text.byte_length() and String(self.text[byte=self.pos:self.pos + 1]) == " ":
@@ -1081,6 +1115,10 @@ struct _FormulaParser:
             if c == "*":
                 self.pos += 1
                 var right = self.factor()
+                if left[1] < 0 or right[1] < 0:
+                    var fa = _align(left^, right^)
+                    left = (fa[0] * fa[1], -1)
+                    continue
                 var e = left[0] * right[0]
                 var s = left[1] + right[1]
                 if s > 2:                                    # keep money at cents
@@ -1092,10 +1130,16 @@ struct _FormulaParser:
                 if self.pos < self.text.byte_length() and String(self.text[byte=self.pos:self.pos + 1]) == "/":
                     self.pos += 1
                     var right = self.factor()
+                    if left[1] < 0 or right[1] < 0:
+                        raise Error("`//` on a FLOAT is not supported in a formula: use `/`")
                     var a = _align(left^, right^)
                     left = (a[0] // a[1], 0)
                 else:
                     var right = self.factor()
+                    if left[1] < 0 or right[1] < 0:           # a division of float64s (IEEE: x / 0 is inf, -inf or NaN)
+                        var fa = _align(left^, right^)
+                        left = (fa[0] / fa[1], -1)
+                        continue
                     var k = 2 - left[1] + right[1]           # (a * 10^k) // b has 2 decimal places
                     var num = left[0] * Expr(Int(_pow10(k))) if k > 0 else left[0].copy()
                     var den = right[0] * Expr(Int(_pow10(-k))) if k < 0 else right[0].copy()
@@ -1103,6 +1147,8 @@ struct _FormulaParser:
             elif c == "%":
                 self.pos += 1
                 var right = self.factor()
+                if left[1] < 0 or right[1] < 0:
+                    raise Error("`%` on a FLOAT is not supported in a formula")
                 var a = _align(left^, right^)
                 left = (a[0] % a[1], a[2])
             else:
@@ -1132,6 +1178,23 @@ struct _FormulaParser:
                     self.pos += 1
                 else:
                     break
+            if self.pos + 1 < self.text.byte_length() and (String(self.text[byte=self.pos:self.pos + 1]) == "e" or String(self.text[byte=self.pos:self.pos + 1]) == "E"):
+                var q = self.pos + 1                          # an exponent makes a float64 literal: 1.5e-3
+                var sg = String(self.text[byte=q:q + 1])
+                if (sg == "+" or sg == "-") and q + 1 < self.text.byte_length():
+                    q += 1
+                if q < self.text.byte_length() and ord("0") <= ord(String(self.text[byte=q:q + 1])) <= ord("9"):
+                    while q < self.text.byte_length() and ord("0") <= ord(String(self.text[byte=q:q + 1])) <= ord("9"):
+                        q += 1
+                    var ftext = String(self.text[byte=start:q])
+                    self.pos = q
+                    var fv = Float64(0.0)
+                    var fp = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(ftext.unsafe_ptr()))
+                    var st = _parse_float(fp, ftext.byte_length(), fv)
+                    _ = ftext.byte_length()
+                    if st != F_OK:
+                        raise Error("`" + ftext + "` isn't a number the formula can hold")
+                    return (Expr(fv), -1)
             var num = String(self.text[byte=start:self.pos])
             var dot = num.find(".")
             var scale = 0 if dot < 0 else num.byte_length() - dot - 1
@@ -1181,8 +1244,17 @@ def _scaled_up(e: Expr, places: Int, scale: Int) -> Expr:
     return out^
 
 
+def _floaty(e: Expr, scale: Int) -> Expr:
+    """An INT or DECIMAL expression (with `scale` decimal places) read as a float64."""
+    var out = e.copy()
+    out.nodes.append(Node(N_I2F, Int64(max(scale, 0)), ""))
+    return out^
+
+
 def _align(var a: Tuple[Expr, Int], var b: Tuple[Expr, Int]) -> Tuple[Expr, Expr, Int]:
-    """Both sides at one scale: the one with fewer decimal places is multiplied up."""
+    """Both sides at one scale: the one with fewer decimal places is multiplied up. A float64 side (scale -1) makes both float64s."""
+    if a[1] < 0 or b[1] < 0:
+        return (a[0].copy() if a[1] < 0 else _floaty(a[0], a[1]), b[0].copy() if b[1] < 0 else _floaty(b[0], b[1]), -1)
     if a[1] < b[1]:
         return (_scaled_up(a[0], b[1] - a[1], b[1]), b[0].copy(), b[1])
     if b[1] < a[1]:
@@ -1265,32 +1337,116 @@ def _overflow() -> Error:
 
 
 def _eval_row(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int64, Bool]:
-    """(value, null) of an expression over stored columns on one row's values (NULL_EDIT: null), with the kernel's
-    semantics: exact int64 (overflow raises), Mojo's floor // and %, x // 0 = x % 0 = 0. A null operand makes the
-    result null, through comparisons and logic too (a filter reading a null is false as a whole)."""
+    """(value, null) of an expression over stored columns on one row's values (see `_eval_row_t`; a FLOAT result is its bits)."""
+    var r = _eval_row_t(e, base, raw)
+    return (r[0], r[1])
+
+
+def _fcmp(a: Float64, b: Float64) -> Int:
+    """DuckDB's order of doubles: NaN equals itself and is above every number (-0.0 equals 0.0, as IEEE)."""
+    if a != a:
+        return 0 if b != b else 1
+    if b != b:
+        return -1
+    return -1 if a < b else 1 if a > b else 0
+
+
+def _p10f(k: Int) -> Float64:
+    var f = Float64(1.0)
+    for _ in range(k):
+        f *= 10.0
+    return f
+
+
+def _eval_row_t(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int64, Bool, Bool]:
+    """(value, null, is a float64) of an expression over stored columns on one row's values (NULL_EDIT: null), with the kernel's
+    semantics: exact int64 (overflow raises), Mojo's floor // and %, x // 0 = x % 0 = 0. A null operand makes the result null,
+    through comparisons and logic too (a filter reading a null is false as a whole). A FLOAT column or float literal makes a
+    float64 (the value is its bits): an INT or DECIMAL beside it is converted as DuckDB casts it (float(v) / 10^scale; past 2^53 it
+    raises, as the kernel does), `/` divides doubles (IEEE), comparisons use DuckDB's order of doubles."""
     var vals = List[Int64]()
     var nulls = List[Bool]()
+    var fls = List[Bool]()
+    var scales = List[Int]()
     for n in e.nodes:
         if n.op == N_COL:
-            var v = raw[base.column(n.name)]
+            var c = base.column(n.name)
+            var v = raw[c]
             vals.append(0 if v == NULL_EDIT else v)
             nulls.append(v == NULL_EDIT)
-        elif n.op == N_LIT:
+            fls.append(base.kind(c) == FLOAT)
+            scales.append(-1 if base.kind(c) == FLOAT else base.scale(c))
+        elif n.op == N_LIT or n.op == N_LITF:
             vals.append(n.value)
             nulls.append(False)
-        elif n.op == N_NEG or n.op == N_NOT or n.op == N_BOOL2INT or n.op == N_SCALE_TO:
+            fls.append(n.op == N_LITF)
+            scales.append(-1)
+        elif n.op == N_NEG or n.op == N_NOT or n.op == N_BOOL2INT or n.op == N_SCALE_TO or n.op == N_I2F:
             var a = vals.pop()
             var an = nulls.pop()
-            if n.op == N_NEG and a == Int64.MIN:
-                raise _overflow()
-            vals.append(-a if n.op == N_NEG else Int64(a == 0) if n.op == N_NOT else a)
+            var af = fls.pop()
+            var asc = scales.pop()
+            if n.op == N_I2F:
+                if not af:
+                    a = _to_float_bits(a, Int(n.value))
+                vals.append(a)
+                nulls.append(an)
+                fls.append(True)
+                scales.append(-1)
+                continue
+            if n.op == N_NEG and af:
+                vals.append(Int64((-Float64(from_bits=UInt64(a))).to_bits()))
+            else:
+                if n.op == N_NEG and a == Int64.MIN:
+                    raise _overflow()
+                vals.append(-a if n.op == N_NEG else Int64(a == 0) if n.op == N_NOT else a)
             nulls.append(an)
+            fls.append(af and (n.op == N_NEG or n.op == N_SCALE_TO))
+            scales.append(Int(n.value) if n.op == N_SCALE_TO else asc if n.op == N_NEG else -1)
         else:
             var b = vals.pop()
             var a = vals.pop()
             var bn = nulls.pop()
             var an = nulls.pop()
+            var bf = fls.pop()
+            var af = fls.pop()
+            var bs = scales.pop()
+            var as_ = scales.pop()
             var v: Int64 = 0
+            var logical = n.op == N_AND or n.op == N_OR
+            var compare = n.op >= N_LT and n.op <= N_NE
+            if (af or bf or n.op == N_DIV) and not logical:
+                if n.op == N_FLOORDIV or n.op == N_MOD:
+                    raise Error("`//` and `%` on a FLOAT are not supported")
+                if not an and not af:
+                    a = _to_float_bits(a, as_ if as_ > 0 else 0)
+                if not bn and not bf:
+                    b = _to_float_bits(b, bs if bs > 0 else 0)
+                var x = Float64(from_bits=UInt64(a))
+                var y = Float64(from_bits=UInt64(b))
+                var out_fl = True
+                if n.op == N_ADD:
+                    v = Int64((x + y).to_bits())
+                elif n.op == N_SUB:
+                    v = Int64((x - y).to_bits())
+                elif n.op == N_MUL:
+                    v = Int64((x * y).to_bits())
+                elif n.op == N_DIV:
+                    v = Int64((x / y).to_bits())
+                elif n.op == N_LEAST:
+                    v = a if _fcmp(x, y) <= 0 else b
+                elif n.op == N_GREATEST:
+                    v = a if _fcmp(x, y) >= 0 else b
+                else:
+                    var c3 = _fcmp(x, y)
+                    out_fl = False
+                    v = Int64((c3 < 0) if n.op == N_LT else (c3 <= 0) if n.op == N_LE else (c3 > 0) if n.op == N_GT else
+                              (c3 >= 0) if n.op == N_GE else (c3 == 0) if n.op == N_EQ else (c3 != 0))
+                vals.append(v)
+                nulls.append(an or bn)
+                fls.append(out_fl)
+                scales.append(-1)
+                continue
             if n.op == N_ADD:
                 v = a + b
                 if ((a ^ v) & (b ^ v)) < 0:
@@ -1331,4 +1487,21 @@ def _eval_row(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int6
                 v = Int64(a != 0 or b != 0)
             vals.append(v)
             nulls.append(an or bn)
-    return (vals[0], nulls[0])
+            fls.append(False)
+            var sc = as_ if as_ >= 0 else bs
+            if n.op == N_MUL:
+                sc = as_ + bs if as_ >= 0 and bs >= 0 else sc
+            if n.op == N_FLOORDIV or compare or logical:
+                sc = -1
+            scales.append(sc)
+    return (vals[0], nulls[0], fls[0])
+
+
+def _to_float_bits(a: Int64, scale: Int) raises -> Int64:
+    """An INT or DECIMAL value as the bits of a float64, as the kernel's conversion does (exact up to 2^53, else it raises)."""
+    if a > Int64(1) << 53 or a < -(Int64(1) << 53):
+        raise Error("an integer past 2^53 cannot be read as a float64 exactly")
+    var f = Float64(a)
+    if scale > 0:
+        f = f / _p10f(scale)
+    return Int64(f.to_bits())

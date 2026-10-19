@@ -38,11 +38,32 @@ t.dictionary(c) -> Span[String]; t.text_of(c, code) -> String; t.code_of(c, "Wes
 
 | Need | Today (stand-in) | Why |
 |---|---|---|
-| Kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days since 1970), BOOL; and FLOAT (float64 bits in the value slot), a result-only kind `sql()` returns for AVG and `/`, which no file, Frame or query input takes until F-157 | INT, DECIMAL, TEXT, DATE; bools import as 0/1 | the Import step and the format inspector branch on kind |
+| Kinds INT, DECIMAL(scale), TEXT (dictionary), DATE (days since 1970), BOOL; and FLOAT (float64 bits in the value slot; `append_float`, `get_float`; F-157, the section below) | INT, DECIMAL, TEXT, DATE; bools import as 0/1 | the Import step and the format inspector branch on kind |
 | **Any number of columns** | 16 (`MAX_COLS`, a SIMD row vector) | wider CSVs lose columns past 16 today |
 | **Nulls per column** (a validity bitmap) | none: empty cells read as 0 or "" and are only counted | Delete on a number cell; honest averages and counts |
 | Column-major, contiguous int64 buffers the app can borrow as `Span[Int64]` | `List[Int64]` per column | the grid reads a screenful at a time; the GPU upload reads whole columns |
 | Shared, read-only base data across sessions (web: many tabs, one table in memory) | `share()` returns an address; `release_columns()` empties it | the web host serves one process to many sessions |
+
+### FLOAT64 (F-157)
+
+FLOAT is a full column kind: the float64's bits in the Int64 value slot, the validity layout unchanged (`t.append_float(c, x)`, `t.get_float(c, row)`;
+`Frame.set_float`, `Frame.get_float`). Bits are kept as given (-0.0, a NaN's payload, subnormals) in storage; the rules below make them one value where a
+query compares, groups or counts them.
+
+| Where | Rule |
+|---|---|
+| **Parquet** | DOUBLE is read as it is, FLOAT (32-bit) is widened to float64 exactly (its column has `scale == F32_COLUMN` (32), see "a 32-bit column" below); PLAIN, dictionary and BYTE_STREAM_SPLIT pages. Written as DOUBLE (PLAIN, no statistics): every bit survives a round trip. A float column's footer min / max are never read (`ParquetScan.column_range` says "unknown" for a FLOAT), so NaN in a footer cannot reach the planner's dense-group logic; null counts are used as for any column. |
+| **CSV** | A column is FLOAT when its first `infer_rows` rows show a number with an exponent (`1e5`, `2.5E-3`), a number with more than 4 decimal places (trailing zeros do not count), or `nan` / `inf` / `-inf` / `infinity` (any case) beside numbers; or when named in `CsvOptions(float_columns=[...])`. Up to 4 places stays DECIMAL (exact). The value is the correctly rounded float64 (the C library's `strtod` for what the exact fast path cannot take); every NaN is the one positive quiet NaN; a cell that is not a number, or is past 1.8e308, is a failed cell (null) in a FLOAT column. Past the window an exponent in an INT / DECIMAL column is a failed cell, and a DECIMAL column keeps rounding (counted in `rounded`). |
+| **Comparisons** | DuckDB's order: NaN equals itself and is above every number (+inf included); -0.0 equals 0.0; NULL is unknown (SQL) or false (builder). |
+| **Arithmetic** | INT and DECIMAL next to a FLOAT become float64 as DuckDB casts them: `float(v) / 10^scale` (an integer past 2^53 raises: it is not exact as a double). `+ - *` and `/` (always a division of doubles, IEEE: `x / 0` is inf, -inf or NaN); `//` and `%` on a FLOAT are not supported. A literal with an exponent is a DOUBLE; a decimal literal next to a FLOAT is read as `float(v) / 10^scale`. |
+| **SUM / AVG** | float64, in a defined order: the kernel's reproducible mode (F-064): per 65,536-row morsel, rows in order, then the morsels' totals in order; a table, a Frame and each Parquet row group are separate runs folded in order (the chunk order of a source). The same bits for any number of threads (`Query.threads(n)`, `PlannerOptions.threads`), any morsel setting and any block size: a scan with a float sum always runs row group by row group, never by row-range morsels, because those are cut by the number of cores. Not the same bits as another machine with another SIMD width, nor as another engine's order; the tests compare with DuckDB to 1e-12 relative. AVG is the float sum over the count. |
+| **MIN / MAX** | NaN is the largest value: MAX is NaN when the group holds one, MIN is NaN only when it holds nothing else (a hidden count of the NaNs, so the kernel never compares one). |
+| **Group keys** | SQL only (the builder's key is a dense integer): hashed, never dense. -0.0 and 0.0 are one group, every NaN is one group (reported as the canonical NaN), NULL is its own group; ORDER BY puts NaN after +inf and NULLs last. `PlannerOptions(group=GROUP_DENSE)` on a FLOAT key raises and says why. |
+| **count distinct, median, quantile_disc, top_k** | on order-preserving keys (-0.0 = 0.0, one NaN above +inf): `median` is the middle value, or for an even count `lo * 0.5 + hi * 0.5` (DuckDB's interpolation); `quantile_disc` is an actual value. `QueryResult.floats(i)` gives a float aggregate's values as Float64 (`is_float(i)`); `values(i)` and `top(i, g)` give their bits. |
+| **Frame** | `set_float`, `set_text` (`"1e3"`, `"nan"`, `"-0.0"`, `""` is null), `append` strings; a formula with a float (an exponent literal, a FLOAT column, `/` of a FLOAT) is a FLOAT formula column (`+ - * /`, `min`, `max`; `//` and `%` are refused); `permutation` orders floats (NaN last, nulls last either way); `bake` and `save` write DOUBLE. The Frame's null marker is the NaN `0x7FF8000000000001` (it was INT64_MIN + 1, which is the bits of -5e-324, a float value): a FLOAT cell holding exactly that NaN reads as the canonical NaN, and an INT cell cannot be set to 9221120237041090561. |
+| **A 32-bit column** | Parquet FLOAT is read widened, so `l_discount <= 0.07` would drop the rows holding 0.07 (the double 0.07 is below the float 0.07). SQL therefore compares such a column (`scale == 32`) with a literal in 32 bits, as DuckDB does (DuckDB also does arithmetic on two REAL columns in 32 bits; here arithmetic is in float64, so sums differ from DuckDB's by ~1e-7 unless it casts to DOUBLE, which the tests do). The builder has `lit_float(x)` (a double) and `lit_f32(x)` (rounded to 32 bits). |
+| **GPU** | A query that reads a FLOAT column or does float arithmetic runs on the CPU: `compute(GPU)` raises, AUTO says why in `fallback_reason` (a float64 sum has one defined order there). |
+| **Builder** | `col("x") * 1.5 + col("y") / col("n")`, `lit_float`, `lit_f32`, `Query.threads(n)`; a float group key is refused (use SQL). Aggregates: `sum`, `mean`, `min_of`, `max_of`, `count_distinct`, `median`, `percentile`, `top_k`; read them with `r.floats(i)`. |
 
 ## 2. Reading and writing files (the biggest gap: Python today)
 
@@ -57,7 +78,7 @@ var shared = r.take_table().share()             # moves the table out; the repor
 
 | Need | Detail |
 |---|---|
-| **CSV/TSV reader** with type inference | integers → INT; decimals → DECIMAL with scale 2 if every value has ≤ 2 places, else 4; ISO dates and timestamps → DATE; true/false → BOOL; else TEXT. Quoting, embedded newlines, BOM, `\r\n`. |
+| **CSV/TSV reader** with type inference | integers → INT; decimals → DECIMAL with scale 2 if every value has ≤ 2 places, else 4; an exponent, more than 4 places or nan / inf → FLOAT (F-157); ISO dates and timestamps → DATE; true/false → BOOL; else TEXT. Quoting, embedded newlines, BOM, `\r\n`. |
 | Per-column import report | empty cells, distinct count (text), the first few raw values, rows that failed to parse (row number + text) |
 | Speed | today 1M rows: 0.5 s; 100M rows: 106 s on a loaded machine (pyarrow, multi-threaded). Parity or better, streaming (no full-file copy in memory). |
 | **Parquet read/write with key-value metadata** | the `.omx` document is one Parquet file; its JSON metadata holds formats, formulas, charts, pivots and the Report. Edits are baked into the columns on save (D-138). |
@@ -220,7 +241,7 @@ cat.add_table("orders", orders)              # a SharedTable
 cat.add_frame("edited", frame)               # a Frame, snapshotted now (its edit counter is `SqlSource.version`): add it again after more edits
 cat.add_scan("big", scan_parquet(path))      # a Parquet file, read a row group at a time (a Frame over a scan works too)
 var r = sql(cat, "SELECT region, sum(revenue) AS total FROM orders WHERE qty > 2 GROUP BY region HAVING count(*) > 5 ORDER BY total DESC LIMIT 10")
-r.table                                      # an owned Table: INT, DECIMAL, TEXT, DATE, BOOL and FLOAT (a result-only kind until F-157)
+r.table                                      # an owned Table: INT, DECIMAL, TEXT, DATE, BOOL and FLOAT
 r.notes                                      # what the planner decided and what ran, one line each
 r.explain; r.ms; r.device (CPU); r.fallback_reason ("")
 var e = sql(cat, "EXPLAIN SELECT ...")       # the plan as a one-column Table `plan` (also `e.explain`); nothing runs
@@ -248,8 +269,8 @@ of no non-null value are NULL, `COUNT` is 0; `x // 0` and `x % 0` are NULL and b
 Text order everywhere (`ORDER BY`, `MIN` / `MAX`, `QUANTILE_DISC`, `<` and `BETWEEN` against a literal) is alphabetical ignoring ASCII case, with byte order breaking ties; `=` and `IN` compare bytes.
 
 **Differences from DuckDB, on purpose**: a `SUM` (or any int64 arithmetic) past int64 raises `a sum or an expression passed the int64 range (about 9.2e18)` where DuckDB
-widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP: F-157; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
-`//` on a DECIMAL and `/` below an aggregate raise (they are FLOATs until F-157); the text order above.
+widens to HUGEINT (decimal `*` too); `MEDIAN` of TEXT is the lower middle word (DuckDB's, in the text order), `MEDIAN` of a DATE raises (DuckDB's is a TIMESTAMP, a kind MX frame does not have; use `quantile_disc(d, 0.5)`), `MEDIAN` of a DECIMAL is exact at one more decimal place (DuckDB rounds to the column's scale; the median of integers is a FLOAT, as DuckDB's DOUBLE);
+`//` and `%` on a FLOAT, and `//` on a DECIMAL (a floor of doubles in DuckDB), raise; the text order above; FLOAT64 in SQL follows the section below.
 
 **How a query runs.** The statement is parsed (`sql.mojo`), bound to a typed tree (`bind.mojo`: types, scales, which expressions run per row and which after aggregation), turned into a
 logical plan (`plan.mojo`: Scan, Filter, Aggregate, Filter (HAVING), Project, Sort, Limit, with the rewrites that look at its shape), planned from statistics only (`planner.mojo`: the `Planner`
@@ -307,7 +328,7 @@ partial result per row group (a dense partial per group is the whole domain), wh
 
 A query with no aggregate and no `GROUP BY` returns rows: `SELECT *`, `SELECT t.*, x + 1 AS y`, `WHERE`, `ORDER BY` (several keys, ASC / DESC, NULLS FIRST / LAST, any expression), `LIMIT`, `OFFSET`, `SELECT DISTINCT`.
 The result is an owned Table, as always; a frame's formula columns are columns (and part of `*`); text keeps the source's words (the result's dictionary holds the words present). A select item can be a column, an
-arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical expression (a BOOL column of true / false / NULL) or a constant; a string constant, a bare `NULL` and `/` (a FLOAT, until F-157) are refused by name.
+arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical expression (a BOOL column of true / false / NULL) or a constant; a string constant and a bare `NULL` are refused by name; a FLOAT (a column of the file, or `/`) is selected, ordered and made distinct like any other kind, in DuckDB's order (NaN equal to itself and above +inf, -0.0 equal to 0.0).
 
 | Part | What runs |
 |---|---|
@@ -375,7 +396,7 @@ Things an agent should know:
   an IN takes at most 40 values (`the most is 40`); split a longer one into several queries or filter by a range. A list of text words has no such limit.
 - **A table is one file.** One table per query until joins (F-153); `FROM` is a registered name or a quoted file name. A row query (`SELECT *`, `WHERE`, `ORDER BY`, `LIMIT`) works; `--max-rows` caps what is printed
   (default 1000, `row_count` is the real count).
-- **A Parquet file with a DOUBLE (or FLOAT) column cannot be opened until F-157** (FLOAT64 as a column kind), the most common failure: the error names the column (`column `price` is DOUBLE: MX frame has no kind for it yet`) and its hint says to write the file again without it or with it cast to DECIMAL(18, 4), or to use a CSV. FLOAT appears only as a result (`avg`, `/`, ...). A Parquet text value that is not UTF-8 is refused too.
+- **A Parquet file with a DOUBLE (or FLOAT) column opens (F-157).** FLOAT is a column kind: see "FLOAT64 (F-157)" in section 1 for the rules (NaN order, -0.0, the reproducible sum, a 32-bit column compared with a literal in 32 bits). A Parquet text value that is not UTF-8 is refused.
 - **A footer that lies.** When a Parquet footer's min / max or null count turns out wrong while reading, the query runs again without the statistics and the notes say `statistics: ... ran again without
   them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.
 - Text order is the owner's (case-insensitive, bytes as the tie-break), so `min(s)` / `ORDER BY s` on text differ from DuckDB's byte order; DECIMAL `median` has one more digit of scale than DuckDB.

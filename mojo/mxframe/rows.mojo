@@ -26,6 +26,7 @@ from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, pow10
 from .planner import PhysicalPlan, PlannerOptions, commas
 from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey, collect_columns
 from .sqleval import ValCol
+from .holistic import float_key
 from .exec import (_table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
 
@@ -283,14 +284,6 @@ def build_items(q: BoundQuery, keys_computed: Bool = False) -> Tuple[List[_Item]
 
 # ── top-k: per-worker heaps in the hook ──────────────────────────────────────────────────────────────
 
-@always_inline
-def _float_order(bits: Int64) -> Int64:
-    """A float64's bits as an integer whose signed order is the number's order, NaN (any) above every number."""
-    var f = Float64(from_bits=UInt64(bits))
-    if f != f:
-        return Int64.MAX
-    return bits ^ ((bits >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
-
 
 @always_inline
 def _before(ctl: LP, nk: Int, av: LP, an: BP, aid: Int, bv: LP, bn: BP, bid: Int) -> Bool:
@@ -307,8 +300,8 @@ def _before(ctl: LP, nk: Int, av: LP, an: BP, aid: Int, bv: LP, bn: BP, bid: Int
         var x = av[slot]
         var y = bv[slot]
         if w[3] == -1:                                           # a FLOAT: its bits in the order of the numbers, every NaN last
-            x = _float_order(x)
-            y = _float_order(y)
+            x = float_key(x)
+            y = float_key(y)
         elif w[3] != 0:
             var rk = LP(unsafe_from_address=Int(w[3]))
             x = rk[Int(x)]
@@ -391,8 +384,8 @@ def _topk_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
             var x = k0_v[j]
             var y = vals[k0_slot]
             if k0[3] == -1:
-                x = _float_order(x)
-                y = _float_order(y)
+                x = float_key(x)
+                y = float_key(y)
             elif k0[3] != 0:
                 x = k0_rank[Int(x)]
                 y = k0_rank[Int(y)]

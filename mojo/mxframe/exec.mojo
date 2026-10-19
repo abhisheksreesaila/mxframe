@@ -16,6 +16,7 @@ from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME,
 from .planner import Stats, ColStat
 from .sqlprog import DictAccess, collect_columns
 from .sqleval import ValCol
+from .holistic import float_key
 
 
 def _table_addresses(t: SharedTable, p: Program, mask_addr: Int) -> List[Int64]:
@@ -222,7 +223,7 @@ def _sort_keys(vc: ValCol, dicts: DictAccess) raises -> List[Int64]:
     if vc.kind == FLOAT.value:
         for i in range(n):
             var b = vc.v[i]
-            keys[i] = 0 if vc.is_null(i) else b ^ ((b >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
+            keys[i] = 0 if vc.is_null(i) else float_key(b)       # -0.0 ties with 0.0 and every NaN with every NaN, above +inf
         return keys^
     if vc.kind == TEXT.value:
         var seen = List[Int](length=0, fill=0)

@@ -4,7 +4,7 @@
     r.table; r.rows; r.seconds
     for c in r.columns: c.name, c.kind, c.scale, c.empty, c.distinct, c.sample, c.failed
 
-How it reads (no Python, no float anywhere):
+How it reads (no Python; a float is parsed from its digits, correctly rounded, F-157):
   1. The file is memory-mapped (no copy of the whole file); a UTF-8 byte order mark is skipped.
   2. The header row and then the first `infer_rows` rows choose each column's kind (below).
   3. Rows are split at safe boundaries so threads can parse in parallel. A newline ends a row only outside quotes, and
@@ -20,6 +20,12 @@ Kinds, by the first `infer_rows` rows, empty cells ignored:
                                                    (trailing zeros do not count), else scale 4. The stored value is
                                                    parsed from the digits (exact); extra digits round half away
                                                    from zero.
+  a number with an exponent (`1e5`, `2.5E-3`), or more  FLOAT (float64, correctly rounded; every NaN is one NaN).
+  than 4 decimal places (trailing zeros do not count),  A whole number or a decimal of up to 4 places stays INT /
+  or nan / inf / -inf / infinity (any case) beside      DECIMAL, which are exact. `CsvOptions(float_columns=[...])`
+  numbers                                               reads the named columns as FLOAT whatever the first rows
+                                                        show. A FLOAT cell that is not a number, or is past about
+                                                        1.8e308, is a failed cell (a null).
   YYYY-MM-DD, or an ISO timestamp                  DATE (days since 1970). A timestamp with a zone offset is
                                                    converted to UTC first, then floored to the day (as the Parquet
                                                    reader does); one without is taken as written.
@@ -47,7 +53,8 @@ File format decisions:
     scale is TEXT.
   - Also: a file truncated while it is mapped can crash the reader (SIGBUS); the delimiter is chosen by file
     extension only; leading zeros are lost in numbers (`007` is 7).
-  - Not supported yet: exponent numbers (`1e5` is TEXT), thousands separators, a lone `\\r` as a line end, a
+  - Past the window, an exponent in an INT or DECIMAL column is a failed cell (its kind is already chosen).
+  - Not supported yet: thousands separators, a lone `\\r` as a line end, a
     non-UTF-8 encoding. The parsed columns are held twice for a moment while the chunks are stitched together.
 """
 from std.ffi import external_call
@@ -55,7 +62,7 @@ from std.memory import Pointer
 from std.time import perf_counter_ns
 from std.collections import Dict
 from .utf8 import utf8_seq_len
-from .table import Table, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
+from .table import Table, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .kernels._fpenv import par_n, core_count
 
 comptime BP = Pointer[UInt8, MutUntrackedOrigin]
@@ -75,7 +82,7 @@ comptime _MAX_CHUNKS = 512
 struct CsvOptions(Copyable, Movable):
     """`delimiter`: one byte, "" picks a tab for `.tsv` / `.tab` files and a comma for the rest. `threads` 0 uses
     every core, 1 parses on one thread (the reference the tests compare to). `chunk_bytes`: the smallest piece
-    given to a thread (lower it only to test)."""
+    given to a thread (lower it only to test). `float_columns`: header names read as FLOAT whatever the first rows show."""
 
     var delimiter: String
     var has_header: Bool
@@ -83,9 +90,12 @@ struct CsvOptions(Copyable, Movable):
     var infer_rows: Int
     var threads: Int
     var chunk_bytes: Int
+    var float_columns: List[String]
 
     def __init__(out self, delimiter: String = "", has_header: Bool = True, max_columns: Int = 4096,
-                 infer_rows: Int = 100_000, threads: Int = 0, chunk_bytes: Int = 1 << 22):
+                 infer_rows: Int = 100_000, threads: Int = 0, chunk_bytes: Int = 1 << 22,
+                 var float_columns: List[String] = List[String]()):
+        self.float_columns = float_columns^
         self.delimiter = delimiter
         self.has_header = has_header
         self.max_columns = max_columns
@@ -245,6 +255,146 @@ def _parse_decimal(p: BP, n: Int, scale: Int, mut out: Int64, mut places: Int) -
     else:
         out = Int64(v)
     return True
+
+
+comptime F_BAD = 0          # _parse_float: not a number
+comptime F_OK = 1
+comptime F_RANGE = 2        # a number past about 1.8e308 (or an exponent too long to be one)
+comptime F_NAN_BITS = 0x7FF8000000000000
+
+
+@always_inline
+def _pow10(k: Int) -> Float64:
+    """10^k for 0 <= k <= 22, exact (every partial product is below 1e22, whose odd part fits 53 bits)."""
+    var r = Float64(1.0)
+    if k & 1 != 0:
+        r *= 1e1
+    if k & 2 != 0:
+        r *= 1e2
+    if k & 4 != 0:
+        r *= 1e4
+    if k & 8 != 0:
+        r *= 1e8
+    if k & 16 != 0:
+        r *= 1e16
+    return r
+
+
+@always_inline
+def _lower(p: BP, at: Int) -> Int:
+    return Int(p[at] | 32)
+
+
+def _special(p: BP, i: Int, n: Int) -> Int:
+    """What the bytes from i are: 1 `nan`, 2 `inf` or `infinity` (any case), 0 neither."""
+    var m = n - i
+    if m == 3 and _lower(p, i) == 110 and _lower(p, i + 1) == 97 and _lower(p, i + 2) == 110:
+        return 1
+    if m == 3 and _lower(p, i) == 105 and _lower(p, i + 1) == 110 and _lower(p, i + 2) == 102:
+        return 2
+    if m == 8 and _lower(p, i) == 105 and _lower(p, i + 1) == 110 and _lower(p, i + 2) == 102 and _lower(p, i + 3) == 105 \
+       and _lower(p, i + 4) == 110 and _lower(p, i + 5) == 105 and _lower(p, i + 6) == 116 and _lower(p, i + 7) == 121:
+        return 2
+    return 0
+
+
+def _parse_float(p: BP, n: Int, mut out: Float64) -> Int:
+    """A float64 from its text: [+-] digits [. digits] [e|E [+-] digits], or nan / inf / infinity with an optional sign (any
+    case). Correctly rounded: a mantissa that fits 53 bits with an exponent within +-22 is one exact multiplication or
+    division (Clinger), everything else goes to the C library's strtod on a NUL-terminated copy. Every NaN is the one
+    positive quiet NaN. Returns F_OK, F_BAD (not a number) or F_RANGE (past the largest float64)."""
+    var i = 0
+    var neg = False
+    if n > 0 and (p[0] == 45 or p[0] == 43):
+        neg = p[0] == 45
+        i = 1
+    if i >= n:
+        return F_BAD
+    var c0 = Int(p[i]) | 32
+    if c0 == 110 or c0 == 105:                          # n, i: nan, inf, infinity
+        var sp = _special(p, i, n)
+        if sp == 0:
+            return F_BAD
+        out = Float64(from_bits=UInt64(F_NAN_BITS if sp == 1 else (0xFFF0000000000000 if neg else 0x7FF0000000000000)))
+        return F_OK
+    var w = UInt64(0)
+    var kept = 0            # significant digits folded into w
+    var dropped = 0         # integer-part digits past the 19th (each one is a factor of 10 lost)
+    var inexact = False     # a nonzero digit was dropped
+    var digits = 0
+    var frac = 0            # fraction digits folded into w
+    var in_frac = False
+    var started = False     # a nonzero digit has been seen
+    while i < n:
+        var c = Int(p[i])
+        if c == 46:
+            if in_frac:
+                return F_BAD
+            in_frac = True
+            i += 1
+            continue
+        var d = c - 48
+        if d < 0 or d > 9:
+            break
+        digits += 1
+        i += 1
+        if d != 0:
+            started = True
+        if not started:                 # leading zeros carry no weight (but a fraction's still shift the exponent)
+            if in_frac:
+                frac += 1
+            continue
+        if kept < 19:
+            w = w * 10 + UInt64(d)
+            kept += 1
+            if in_frac:
+                frac += 1
+        else:
+            if d != 0:
+                inexact = True
+            if not in_frac:
+                dropped += 1
+    if digits == 0:
+        return F_BAD
+    var ex = 0
+    if i < n:
+        if (p[i] | 32) != 101:
+            return F_BAD
+        i += 1
+        var eneg = False
+        if i < n and (p[i] == 45 or p[i] == 43):
+            eneg = p[i] == 45
+            i += 1
+        if i >= n:
+            return F_BAD
+        var ed = 0
+        while i < n:
+            var d = Int(p[i]) - 48
+            if d < 0 or d > 9:
+                return F_BAD
+            if ed < 100000:
+                ed = ed * 10 + d
+            i += 1
+        ex = -ed if eneg else ed
+    var e10 = ex - frac + dropped
+    if w == 0:
+        out = -Float64(0.0) if neg else Float64(0.0)
+        return F_OK
+    if not inexact and w <= (UInt64(1) << 53) and -22 <= e10 <= 22:
+        var f = Float64(w)
+        f = f * _pow10(e10) if e10 >= 0 else f / _pow10(-e10)
+        out = -f if neg else f
+        return F_OK
+    # the general case: strtod, which rounds correctly (glibc, libSystem), on a NUL-terminated copy
+    var buf = List[UInt8](length=n + 1, fill=0)
+    for k in range(n):
+        buf[k] = p[k]
+    var v = external_call["strtod", Float64](Int(buf.unsafe_ptr()), Int(0))
+    _ = buf^
+    if v - v != 0.0:                                    # inf: the text was past the largest float64
+        return F_RANGE
+    out = v
+    return F_OK
 
 
 @always_inline
@@ -425,7 +575,7 @@ def _scaled_text(v: Int64, scale: Int) -> String:
 def _reason(kind: Int) -> String:
     if kind == INT.value:
         return "isn't a whole number"
-    if kind == DECIMAL.value:
+    if kind == DECIMAL.value or kind == FLOAT.value:
         return "isn't a number"
     if kind == DATE.value:
         return "isn't a date (YYYY-MM-DD)"
@@ -626,6 +776,9 @@ struct InferCol(Copyable, Movable):
     var can_dec: Bool
     var can_date: Bool
     var can_bool: Bool
+    var can_float: Bool
+    var float_only: Bool     # a value only a float can be: an exponent, nan / inf, or a number past int64
+    var numeric: Bool        # some value had a digit
     var places: Int
     var nonempty: Int
     var sample: List[String]
@@ -635,6 +788,9 @@ struct InferCol(Copyable, Movable):
         self.can_dec = True
         self.can_date = True
         self.can_bool = True
+        self.can_float = True
+        self.float_only = False
+        self.numeric = False
         self.places = 0
         self.nonempty = 0
         self.sample = List[String]()
@@ -675,6 +831,17 @@ struct InferSink(CellSink, Movable):
             s.can_date = False
         if s.can_bool and not _parse_bool(p, n, v):
             s.can_bool = False
+        if s.can_float:
+            var f = Float64(0.0)
+            if _parse_float(p, n, f) == F_BAD:               # (a number past float64 is still a number: its cell fails later)
+                s.can_float = False
+            else:
+                var plain = _special(p, 1 if (p[0] == 45 or p[0] == 43) else 0, n) == 0
+                s.numeric = s.numeric or plain
+                for k in range(n):                       # an exponent, or nan / inf: only a float reads it
+                    if (p[k] | 32) == 101 or not plain:
+                        s.float_only = True
+                        break
 
     def end_row(mut self, ncells: Int, row: BP, row_len: Int):
         pass
@@ -783,6 +950,7 @@ struct ChunkSink(CellSink, Movable):
             return
         var v = Int64(0)
         var ok = True
+        var reason = String()
         if c.kind == TEXT.value:
             v = Int64(c.words.code_of(p, n))
         elif c.kind == INT.value:
@@ -801,6 +969,14 @@ struct ChunkSink(CellSink, Movable):
                     c.rounded += 1
         elif c.kind == DATE.value:
             ok = _parse_date(p, n, v)
+        elif c.kind == FLOAT.value:
+            var f = Float64(0.0)
+            var st = _parse_float(p, n, f)
+            ok = st == F_OK
+            if ok:
+                v = Int64(f.to_bits())
+            elif st == F_RANGE:
+                reason = "is too big for a float64 (about 1.8e308)"
         else:
             ok = _parse_bool(p, n, v)
         if ok:
@@ -810,7 +986,7 @@ struct ChunkSink(CellSink, Movable):
             c.nulls.append(self.rows)
             c.fail_count += 1
             if len(c.fails) < _MAX_FAILED:
-                c.fails.append(_Fail(self.rows, _clip(p, n, 200), _reason(c.kind)))
+                c.fails.append(_Fail(self.rows, _clip(p, n, 200), reason if reason.byte_length() > 0 else _reason(c.kind)))
 
     def end_row(mut self, ncells: Int, row: BP, row_len: Int):
         for col in range(ncells, self.ncols):  # a short row: the missing cells are empty
@@ -929,12 +1105,19 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         ref s = infer.cols[c]
         var kind = TEXT.value
         var scale = 0
-        if s.nonempty > 0:
-            if s.can_int:
+        var asked = False
+        for name in options.float_columns:
+            asked = asked or name == names[c]
+        if asked:
+            kind = FLOAT.value
+        elif s.nonempty > 0:
+            if s.can_int and not s.float_only:
                 kind = INT.value
-            elif s.can_dec:
+            elif s.can_dec and s.places <= 4 and not s.float_only:
                 kind = DECIMAL.value
                 scale = 2 if s.places <= 2 else 4
+            elif s.can_float and s.numeric and (s.float_only or s.places > 4):
+                kind = FLOAT.value
             elif s.can_date:
                 kind = DATE.value
             elif s.can_bool:
@@ -1140,3 +1323,11 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
                 result.ragged.append(FailedRow(offsets[i] + sinks[i].ragged[k].row + 1, sinks[i].ragged[k].text,
                                                sinks[i].ragged[k].reason))
     result.rows = total
+
+
+def parse_float_text(text: String, mut out: Float64) -> Int:
+    """`_parse_float` over a String (a SQL literal): F_OK, F_BAD or F_RANGE."""
+    var n = text.byte_length()
+    if n == 0:
+        return F_BAD
+    return _parse_float(BP(unsafe_from_address=Int(text.unsafe_ptr())), n, out)

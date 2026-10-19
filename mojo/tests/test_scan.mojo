@@ -146,7 +146,7 @@ def test_equals_read_parquet_for_every_codec() raises:
     var mem = make_table()
     var codecs: List[Int] = [ZSTD, SNAPPY, UNCOMPRESSED]
     for c in codecs:
-        var path = String("/tmp/f140_scan_") + String(c) + ".parquet"
+        var path = String("f140_scan_") + String(c) + ".parquet"
         write_parquet(path, mem, "{}", c, GROUP)
         var rp = read_parquet(path)
         var read = rp.take_table().share()
@@ -159,8 +159,8 @@ def test_equals_read_parquet_for_every_codec() raises:
 
 def test_errors_are_readable() raises:
     var mem = make_table()
-    write_parquet("/tmp/f140_scan_err.parquet", mem, "", ZSTD, GROUP)
-    var scan = scan_parquet("/tmp/f140_scan_err.parquet")
+    write_parquet("f140_scan_err.parquet", mem, "", ZSTD, GROUP)
+    var scan = scan_parquet("f140_scan_err.parquet")
     var msg = String("")
     try:
         _ = Query(scan).group_by(col("nope"), groups=3).agg(count()).compute()
@@ -169,7 +169,7 @@ def test_errors_are_readable() raises:
     expect(msg == "column `nope` not found", "unknown column: " + msg)
     msg = ""
     try:
-        _ = scan_parquet("/tmp/f140_does_not_exist.parquet")
+        _ = scan_parquet("f140_does_not_exist.parquet")
     except e:
         msg = String(e)
     expect("f140_does_not_exist" in msg, "a missing file names the file: " + msg)
@@ -181,7 +181,7 @@ def test_overflow_raises_like_the_in_memory_run() raises:
     for _ in range(64):
         t.append(v, Int64.MAX // 8)
     var mem = t^.share()
-    write_parquet("/tmp/f140_scan_ovf.parquet", mem, "", ZSTD, 8)       # 8 row groups: each fits, the total does not
+    write_parquet("f140_scan_ovf.parquet", mem, "", ZSTD, 8)       # 8 row groups: each fits, the total does not
     var want = String("")
     try:
         _ = Query(mem).agg(sum(col("v"))).compute()
@@ -189,7 +189,7 @@ def test_overflow_raises_like_the_in_memory_run() raises:
         want = String(e)
     var got = String("")
     try:
-        _ = Query(scan_parquet("/tmp/f140_scan_ovf.parquet")).agg(sum(col("v"))).compute()
+        _ = Query(scan_parquet("f140_scan_ovf.parquet")).agg(sum(col("v"))).compute()
     except e:
         got = String(e)
     expect(want != "" and got == want, "overflow: " + got + " vs " + want)
@@ -200,12 +200,12 @@ def test_a_file_that_changes_after_it_was_opened_is_refused() raises:
     pages that vanish would be a bus error). A file replaced by rename leaves the open file as it was: the answer is
     the one for the file that was opened."""
     var mem = make_table()
-    var path = String("/tmp/f140_scan_chg.parquet")
+    var path = String("f140_scan_chg.parquet")
     write_parquet(path, mem, "", ZSTD, GROUP)
     var want = Query(mem).agg(sum(col("cost")), count()).compute()
     var scan = scan_parquet(path)
-    write_parquet("/tmp/f140_scan_chg_other.parquet", make_table(), "", ZSTD, GROUP // 2)
-    _ = external_call["rename", Int32]("/tmp/f140_scan_chg_other.parquet".as_c_string_span().ptr(), path.as_c_string_span().ptr())
+    write_parquet("f140_scan_chg_other.parquet", make_table(), "", ZSTD, GROUP // 2)
+    _ = external_call["rename", Int32]("f140_scan_chg_other.parquet".as_c_string_span().ptr(), path.as_c_string_span().ptr())
     var got = Query(scan).agg(sum(col("cost")), count()).compute()
     expect(got.sums[0] == want.sums[0] and got.counts[0] == want.counts[0], "a renamed-over file: the opened file is read")
     var scan2 = scan_parquet(path)
@@ -221,8 +221,8 @@ def test_a_file_that_changes_after_it_was_opened_is_refused() raises:
 
 def test_a_text_column_nobody_reads_is_never_decoded() raises:
     var mem = make_table()
-    write_parquet("/tmp/f140_scan_lazy.parquet", mem, "", ZSTD, GROUP)
-    var scan = scan_parquet("/tmp/f140_scan_lazy.parquet")
+    write_parquet("f140_scan_lazy.parquet", mem, "", ZSTD, GROUP)
+    var scan = scan_parquet("f140_scan_lazy.parquet")
     var region = scan.index("region")
     var note = scan.index("note")
     expect(not scan.dictionary_loaded(region) and not scan.dictionary_loaded(note), "nothing is built when the file is opened")

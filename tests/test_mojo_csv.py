@@ -3,6 +3,7 @@
 A small Mojo program (mojo/tools/csv_dump.mojo), built against the Python-free package, prints the parsed table as
 JSON lines; pyarrow's reader is the oracle. Run with `pixi run pytest tests/test_mojo_csv.py`.
 """
+import os
 import json
 import subprocess
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
-DUMP = BUILD / "csv_dump"
+DUMP = BUILD / f"csv_dump{os.environ.get('PYTEST_XDIST_WORKER', '')}"   # one per xdist worker: never rebuilt while another runs it
 
 
 @pytest.fixture(scope="session")

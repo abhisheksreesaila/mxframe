@@ -30,6 +30,13 @@ select list, ORDER BY and LIMIT after aggregation, run as a row query over the g
 exact AVG. `mojo/tools/sql_probe.mojo` runs one SQL string over Parquet files and prints typed JSON (tests/test_mojo_sql.py and
 tests/test_mojo_rows.py compare it, and `mx`, with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` run in `pixi run mojo-test`.
 
+## FLOAT64 (F-157)
+
+`FLOAT` is a full column kind (float64 bits in the Int64 slot): Parquet DOUBLE / FLOAT, CSV exponents, the builder (`lit_float`, `Query.threads`,
+`QueryResult.floats`), SQL, Frames. The rules (NaN order, -0.0, the reproducible sum, the 32-bit column) are in `docs/mxframe-mojo-api.md`.
+`mojo/tools/float_probe.mojo` runs builder plans for `tests/test_mojo_float_builder.py`; `mojo/tests/test_float.mojo` is the pure-Mojo test.
+`strtod` (libSystem) parses the digits a fast path cannot: `check_mac_link.sh` lists it for the app's stub.
+
 ## `mx`, the agent command line (F-151)
 
 `mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error

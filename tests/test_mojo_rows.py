@@ -209,7 +209,6 @@ ROW_ERRORS = [
     ("SELECT 'a' FROM t", "SQL error at line 1, column 8: a string constant in the select list is not supported yet"),
     ("SELECT NULL FROM t", "SQL error at line 1, column 8: a bare NULL in the select list cannot be typed"),
     ("SELECT id FROM t ORDER BY 3", "SQL error at line 1, column 27: ORDER BY 3 is out of range: the select list has 1 items"),
-    ("SELECT x / 2 FROM t", "SQL error at line 1, column 10: `/` gives a FLOAT, which is a result-only kind until F-157: use it on aggregates, such as sum(a) / count(*)"),
     ("SELECT DISTINCT s FROM t ORDER BY x", "SQL error at line 1, column 35: for SELECT DISTINCT, ORDER BY expressions must appear in the select list: `x` does not"),
     ("SELECT idd FROM t", "SQL error at line 1, column 8: column `idd` not found in table `t` (did you mean `id`?)"),
     ("SELECT id FROM t ORDER BY idd", "SQL error at line 1, column 27: column `idd` not found in table `t` (did you mean `id`?)"),
@@ -324,3 +323,51 @@ def test_random_row_queries_equal_duckdb(mx, probe, data, mode, seed):
             raise
         compared += 1
     assert compared >= 15, f"only {compared} of 25 random queries ran"
+
+
+# ── FLOAT in row queries (F-157 made it a column kind) ───────────────────────────────────────────────
+
+FLOAT_QUERIES = [
+    Q("SELECT id, x / 2 AS h, d / 3 AS t3, x * 1.5 AS m FROM t WHERE x IS NOT NULL", tag="float-expressions"),
+    Q("SELECT id, x / 3 AS q FROM t ORDER BY q DESC, id", duck="SELECT id, x / 3 AS q FROM t ORDER BY q DESC NULLS LAST, id NULLS LAST", keys=[1, 0], limit=40,
+      tag="order-by-a-float-expression-top-k"),
+    Q("SELECT id, d / e AS r FROM t ORDER BY r NULLS FIRST, id", duck="SELECT id, d / e AS r FROM t ORDER BY r NULLS FIRST, id NULLS LAST", keys=[1, 0],
+      tag="order-by-a-float-expression-full-sort"),
+    Q("SELECT DISTINCT x / 7 AS q FROM t", tag="distinct-float"),
+    Q("SELECT id, x / 0 AS inf, 0 * (x / 0) AS nan FROM t WHERE x IS NOT NULL AND id < 2000", tag="inf-and-nan"),
+    Q("SELECT id FROM t WHERE x / 4 > d / 3", tag="float-comparison"),
+]
+
+
+@pytest.mark.parametrize("mode", ["table", "scan", "frame"])
+@pytest.mark.parametrize("q", FLOAT_QUERIES, ids=Q.id)
+def test_float_expressions_in_row_queries_equal_duckdb(mx, probe, data, mode, q):
+    check_query(mode, data["g8"], mx, probe, q)
+
+
+def test_a_float_column_is_selected_ordered_and_distinct(mx, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import duckdb
+    vals = [1.5, -0.0, 0.0, None, float("nan"), float("inf"), float("-inf"), 2.25, 1.5, -7.0, float("nan"), None, 3.0] * 400
+    ids = list(range(len(vals)))
+    path = tmp_path / "f.parquet"
+    pq.write_table(pa.table({"id": ids, "f": pa.array(vals, pa.float64())}), path, row_group_size=900)
+    con = duckdb.connect()
+    for sql, duck, keys in [
+        ("SELECT * FROM t", None, None),
+        ("SELECT f, id FROM t ORDER BY f, id", "SELECT f, id FROM t ORDER BY f NULLS LAST, id", [0, 1]),
+        ("SELECT f, id FROM t ORDER BY f DESC NULLS FIRST, id LIMIT 30", "SELECT f, id FROM t ORDER BY f DESC NULLS FIRST, id", [0, 1]),
+        ("SELECT DISTINCT f FROM t", None, None),
+        ("SELECT id, f + 1 AS g FROM t WHERE f > 1", None, None),
+    ]:
+        for stream in ("never", "always"):
+            out = run_mx(mx, ["sql", "--max-rows", "0", "--stream", stream, sql], {"t": path})
+            got = typed_rows(out)
+            want = con.execute((duck or sql).replace(" FROM t", f" FROM read_parquet('{path}')")).fetchall()
+            if " LIMIT " in sql:
+                want = want[:30]
+            if keys is not None:
+                assert [_canon(r) for r in got] == [_canon(r) for r in want], f"{stream}: {sql}"
+            else:
+                assert Counter(map(_canon, got)) == Counter(map(_canon, want)), f"{stream}: {sql}"

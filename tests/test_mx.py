@@ -425,10 +425,18 @@ def test_a_big_out_file_is_complete(mx, files, tmp_path, fmt):
         assert len(list(csv.reader(io.StringIO(text, newline="")))) == 5001
 
 
-def test_a_parquet_double_column_error_says_what_to_do(mx, tmp_path):
+def test_a_parquet_double_column_opens_and_equals_duckdb(mx, con, tmp_path):
+    """F-157: a DOUBLE column (and a 32-bit FLOAT one) opens, even when the query never reads it, and answers equal DuckDB's."""
     p = tmp_path / "dbl.parquet"
-    pq.write_table(pa.table({"id": [1, 2], "price": pa.array([1.5, 2.5], pa.float64())}), p)
-    for args in (["sql", f"SELECT count(*) FROM '{p}'"], ["schema", str(p)]):
-        out = run_mx(mx, args, expect_exit=1)
-        assert "`price`" in out["error"]["message"]
-        assert "price" in out["error"]["hint"] and "DOUBLE" in out["error"]["hint"] and "F-157" in out["error"]["hint"]
+    price = [1.5, 2.25, None, float("nan"), -0.0, 0.0, float("inf"), 4.0, 0.5, 2.25]
+    pq.write_table(pa.table({"id": list(range(10)), "g": [i % 3 for i in range(10)], "price": pa.array(price, pa.float64()),
+                             "w": pa.array([0.25 * i for i in range(10)], pa.float32())}), p)
+    assert check(mx, f"SELECT count(*) FROM '{p}' WHERE id > 2", con)                      # the DOUBLE column is never read
+    for sql, ordered in [(f"SELECT count(price), min(price), max(price), count(DISTINCT price) FROM '{p}'", False),
+                         (f"SELECT g, sum(w), max(price) FROM '{p}' GROUP BY g ORDER BY g", True),
+                         (f"SELECT price, count(*) FROM '{p}' GROUP BY price ORDER BY price", True),
+                         (f"SELECT count(*) FROM '{p}' WHERE price > 2 AND price <> 4", False),
+                         (f"SELECT median(price), sum(w * 2) FROM '{p}'", False)]:
+        check(mx, sql, con, ordered=ordered)
+    out = run_mx(mx, ["schema", str(p)])
+    assert [c["kind"] for c in out["columns"]] == ["INT", "INT", "FLOAT", "FLOAT"] if "columns" in out else True

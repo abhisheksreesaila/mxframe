@@ -11,7 +11,7 @@ column (its value converted to a double here, exactly as DuckDB casts it), so an
 integer-to-float conversion.
 """
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .bind import (BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG)
+from .bind import (BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F)
 from .plan import build_plan
 from .planner import RulePlanner, PlannerOptions, commas, Stats, plan_sinks
 from .sqlprog import DictAccess
@@ -41,11 +41,15 @@ struct _Shadows(Movable):
 
 
 def _shadow(mut q2: BoundQuery, mut sh: _Shadows, ncols: Int, operand: Int) -> Int:
-    """The node to read for `operand` in a FLOAT context: for a leaf holding an integer or decimal, a FLOAT column holding the same
-    number converted to a double; anything else is read as it is."""
+    """The node to read for `operand` in a FLOAT context (after aggregation the binder leaves integers and decimals unconverted): for a leaf
+    holding an integer or decimal, a FLOAT column holding the same number converted to a double; for another integer or decimal expression, the
+    kernel's conversion (`B_I2F`); a FLOAT is read as it is."""
     var leaf = q2.rexprs[operand].copy()
-    if leaf.op != B_COL or not _is_number(leaf.kind):
+    if not _is_number(leaf.kind):
         return operand
+    if leaf.op != B_COL:                                          # an expression: the program converts it (float(v) / 10^scale)
+        q2.rexprs.append(BExpr(B_I2F, FLOAT.value, 0, operand, -1, Int64(leaf.scale), "", leaf.line, leaf.col))
+        return len(q2.rexprs) - 1
     var col = Int(leaf.value)
     for i in range(len(sh.of_col)):
         if sh.of_col[i] == col:

@@ -468,27 +468,27 @@ def test_the_null_marker_cannot_be_typed() raises:
     var f = Frame(t^.share())
     var msgs = List[String]()
     try:
-        f.set_text(a, 0, "-9223372036854775807")
+        f.set_text(a, 0, "9221120237041090561")
     except e:
         msgs.append(String(e))
     try:
-        f.set_text(d, 0, "-92233720368547758.07")
+        f.set_text(d, 0, "92211202370410905.61")
     except e:
         msgs.append(String(e))
     try:
-        _ = f.append(["-9223372036854775807", ""])
+        _ = f.append(["9221120237041090561", ""])
     except e:
         msgs.append(String(e))
     try:
-        _ = f.append(["1", "-92233720368547758.07"])
+        _ = f.append(["1", "92211202370410905.61"])
     except e:
         msgs.append(String(e))
     expect(len(msgs) == 4 and "reserved" in msgs[0] and "reserved" in msgs[1] and "reserved" in msgs[2] and "reserved" in msgs[3],
            "four refusals")
     expect(f.rows() == 1 and f.get(a, 0) == 1 and not f.is_null(a, 0) and f.get(d, 0) == 100 and len(f.log) == 0,
            "nothing was entered")
-    f.set_text(a, 0, "-9223372036854775806")
-    expect(f.get(a, 0) == -9223372036854775806, "the next value up is fine")
+    f.set_text(a, 0, "9221120237041090560")
+    expect(f.get(a, 0) == 9221120237041090560, "the next value up is fine")
 
 
 def test_a_dead_row_does_not_leave_a_word_behind() raises:

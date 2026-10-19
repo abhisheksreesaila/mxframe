@@ -1,9 +1,9 @@
 # F-134 (M3): the CSV reader, docs/mxframe-mojo-api.md section 2.
 from std.os import makedirs
-from mxframe import (read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet,
+from mxframe import (read_csv, CsvOptions, CsvResult, FailedRow, Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet,
                      read_parquet)
 
-comptime DIR = "/tmp/mxframe_csv_test/"
+comptime DIR = "mxframe_csv_test/"
 
 
 def expect(cond: Bool, what: String) raises:
@@ -65,16 +65,19 @@ def test_integers() raises:
 
 
 def test_decimals() raises:
-    var r = read("dec.csv", "a,b,c,d\n1.5,1.234,12345678901234.56,5\n2,2.5,-0.07,.5\n-3.25,0.00005,1.50,6.\n")
+    var r = read("dec.csv", "a,b,c,d\n1.5,1.234,12345678901234.56,5\n2,2.5,-0.07,.5\n-3.25,0.0001,1.50,6.\n")
     expect(r.table.kind(0) == DECIMAL and r.table.scale(0) == 2, "at most 2 places: scale 2")
     expect(r.table.kind(1) == DECIMAL and r.table.scale(1) == 4, "3 or 4 places: scale 4")
     expect(r.table.scale(2) == 2, "trailing zeros do not count as places")
     check_row(r, 0, "150;12340;1234567890123456;500")
     check_row(r, 1, "200;25000;-7;50")
-    check_row(r, 2, "-325;1;150;600")       # 0.00005 rounds half away from zero at 4 places
+    check_row(r, 2, "-325;1;150;600")
     var wide = read("dec2.csv", "x\n0.123456\n-0.123456\n")
-    expect(wide.table.scale(0) == 4 and wide.table.get(0, 0) == 1235 and wide.table.get(0, 1) == -1235,
-           "more than 4 places: scale 4, rounded from the digits")
+    expect(wide.table.kind(0) == FLOAT and wide.table.get_float(0, 0) == 0.123456 and wide.table.get_float(0, 1) == -0.123456,
+           "more than 4 places: FLOAT (F-157), correctly rounded")
+    var past = read_csv(write_file("dec4.csv", "x\n0.5\n0.25\n0.12345\n"), CsvOptions(infer_rows=2))
+    expect(past.table.kind(0) == DECIMAL and past.table.scale(0) == 4 and past.table.get(0, 2) == 1235 and past.columns[0].rounded == 1,
+           "past the window a DECIMAL column keeps its kind: it widens to 4 places and rounds the rest")
     var exact = read("dec3.csv", "x\n0.1\n0.2\n0.30\n1234567890123456.78\n")
     expect(exact.table.get(0, 3) == 123_456_789_012_345_678, "a decimal is exact (no float): 17 digits kept")
 
@@ -240,7 +243,7 @@ def test_empty_and_odd_files() raises:
     var one_cell = read("one.csv", "n\n5")
     expect(one_cell.rows == 1 and one_cell.table.get(0, 0) == 5, "one cell, no newline")
     try:
-        _ = read_csv("/tmp/mxframe_csv_test/does-not-exist.csv")
+        _ = read_csv("mxframe_csv_test/does-not-exist.csv")
         raise Error("FAILED: a missing file did not raise")
     except e:
         expect("couldn't open" in String(e) and "does-not-exist.csv" in String(e), String(e))

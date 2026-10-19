@@ -60,12 +60,6 @@ def query_error(text: String) raises -> Int:
         hint = "flatten the parentheses or NOT chain"
     elif "not valid UTF-8" in message or "is UTF-16" in message:
         hint = "mx reads UTF-8 only: re-save the file as UTF-8 (for example iconv -f LATIN1 -t UTF-8 in.csv > out.csv)"
-    elif ("` is DOUBLE: MX frame has no kind" in message) or ("` is FLOAT: MX frame has no kind" in message):
-        var open_q = message.find("`")
-        var close_q = message.find("`", open_q + 1) if open_q >= 0 else -1
-        var which = String(message[byte=open_q + 1:close_q]) if close_q > open_q else String("a column")
-        hint = ("a Parquet file with a DOUBLE (or FLOAT) column cannot be opened until F-157 adds FLOAT64 as a column kind; `" + which +
-                "` is one. Write the file again without that column, or with it cast to DECIMAL(18, 4) (CAST(x AS DECIMAL(18, 4))), or export it as CSV")
     print(error_json(message, line, col, hint))
     exit(1)
     return 1
