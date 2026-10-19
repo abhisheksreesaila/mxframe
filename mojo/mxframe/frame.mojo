@@ -720,6 +720,7 @@ struct Frame(Movable):
             self._load_base_rows(live)                       # a scan: the file's rows, a chunk at a time, once
             for row in live:
                 o.delta.append(self.raw_row(row))
+                o.delta_rows.append(row)
         return o^
 
     # ── sort ────────────────────────────────────────────────────────────────────────────────────────
@@ -1272,6 +1273,7 @@ struct Overlay(Copyable, Movable):
     var aliases: Dict[Int, Int64]
     var mask: List[UInt8]                # empty: no shared row changed; else bit 1 = the shared row is unchanged
     var delta: List[List[Int64]]         # the live changed and appended rows' stored values (NULL_EDIT: null)
+    var delta_rows: List[Int]            # the frame's row number of each delta row (ascending): where a query puts it among the shared rows
     var words: List[List[String]]        # per stored column: the words the session added (codes after the dictionary)
 
     def __init__(out self, base: SharedTable):
@@ -1281,6 +1283,7 @@ struct Overlay(Copyable, Movable):
         self.aliases = Dict[Int, Int64]()
         self.mask = List[UInt8]()
         self.delta = List[List[Int64]]()
+        self.delta_rows = List[Int]()
 
     def expand(self, e: Expr) raises -> Expr:
         return _expand(e, self.base, self.formulas, self.aliases, 0)

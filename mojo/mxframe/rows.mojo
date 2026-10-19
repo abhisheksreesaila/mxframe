@@ -243,6 +243,47 @@ struct _Item(Copyable, Movable):
         self.computed = computed
 
 
+def _merge_by_row(ords: List[Int64]) -> List[Int]:
+    """The positions that put rows in the order of their frame row numbers, or an empty list when they already are. The rows were
+    collected as two ascending runs (the shared rows, the changed rows), so this is a merge, not a sort; anything else is sorted."""
+    var n = len(ords)
+    var d = -1
+    var descents = 0
+    for i in range(1, n):
+        if ords[i] < ords[i - 1]:
+            descents += 1
+            if d < 0:
+                d = i
+    if descents == 0:
+        return List[Int]()
+    var out = List[Int](length=n, fill=0)
+    if descents > 1:
+        var ident = List[Int](length=n, fill=0)
+        for i in range(n):
+            ident[i] = i
+        return _radix_order(ords, ident, False)
+    var a = 0
+    var b = d
+    var k = 0
+    while a < d and b < n:
+        if ords[b] < ords[a]:
+            out[k] = b
+            b += 1
+        else:
+            out[k] = a
+            a += 1
+        k += 1
+    while a < d:
+        out[k] = a
+        a += 1
+        k += 1
+    while b < n:
+        out[k] = b
+        b += 1
+        k += 1
+    return out^
+
+
 def _item_of(items: List[_Item], q: BoundQuery, e: Int) -> Int:
     var k = bkey(q.rexprs, e)
     for i in range(len(items)):
@@ -536,12 +577,17 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var offset = q.offset
     var need = offset + limit
     var rows_in = 0
+    var base_in = 0                                              # rows from the shared chunks (a LIMIT counts those: the changed rows may come later)
     var chunks_read = 0
     var t_run = perf_counter_ns()
     var ns_load = 0
     var stop_early = False
-    for i in range(ch.n()):
-        if plan.early_stop and rows_in >= need:
+    var has_delta = ch.has_delta
+    ch.delta_first = plan.early_stop
+    var ords = List[Int64]()                                     # the frame row number of each collected row (an edited frame only)
+    for kc in range(ch.n()):
+        var i = ch.pick(kc)
+        if plan.early_stop and (base_in if has_delta else rows_in) >= need:
             stop_early = True
             break
         var t_load = perf_counter_ns()
@@ -556,11 +602,18 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             step = max(VEC * 16, ((need * 4) // VEC + 1) * VEC)
         var at = 0
         while at < n_rows:
-            if plan.early_stop and rows_in >= need:
+            if plan.early_stop and (base_in if has_delta else rows_in) >= need:
                 stop_early = True
                 break
             var end = min(n_rows, at + step)
             var rc = _run_rows(chunk, sp, ch.mask_addr, at, end, opts.threads)
+            if has_delta:
+                var is_d = ch.is_delta(i)
+                var rb = 0 if is_d else ch.row_base(i)
+                for j in range(rc.n):
+                    ords.append(Int64(src.overlay.delta_rows[Int(rc.ids[j])] if is_d else rb + Int(rc.ids[j])))
+                if not is_d:
+                    base_in += rc.n
             for k in range(len(items)):
                 ref it = items[k]
                 if it.computed >= 0:
@@ -583,6 +636,12 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     else:
         notes.append("ran: table " + src.name + ": " + String(chunks_read) + " chunk of " + commas(src.table.rows()) + " rows")
     notes.append("rows: " + commas(rows_in) + " rows selected" + (" (stopped early: the LIMIT was met)" if stop_early else ""))
+    # a frame's rows are in the frame's order: the changed rows go back to their places among the shared ones
+    if has_delta:
+        var by_row = _merge_by_row(ords)
+        if len(by_row) > 0:
+            for k in range(len(cols)):
+                cols[k] = _gather(cols[k], by_row)
     # order, offset, limit
     var t_ord = perf_counter_ns()
     var fin = List[Int]()
@@ -666,6 +725,8 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
     var chunks_read = 0
     var t_run = perf_counter_ns()
     var ns_load = 0
+    var has_delta = ch.has_delta
+    var best_ord = List[Int64]()                                 # an edited frame: the frame row of each kept row (ties go to the earlier row)
     for i in range(ch.n()):
         var t_load = perf_counter_ns()
         var chunk = _load_chunk(src, ch, i)
@@ -687,6 +748,13 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
         for j in range(rc.n):
             ident[j] = j
         var perm = _radix_order(by_row, ident, False)
+        var cand_ord = List[Int64]()
+        if has_delta:
+            var is_d = ch.is_delta(i)
+            var rb = 0 if is_d else ch.row_base(i)
+            for j in range(rc.n):
+                var id = Int(rc.ids[perm[j]])
+                cand_ord.append(Int64(src.overlay.delta_rows[id] if is_d else rb + id))
         var comb = List[ValCol]()
         for k in range(len(items)):
             ref it = items[k]
@@ -702,6 +770,18 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
                 _append_gathered(cand, chunk, inp.pos[it.col], IP(unsafe_from_address=Int(rc.ids.unsafe_ptr())), rc.n)
             comb.append(_concat(best[k], _gather(cand, perm)))
         var n = len(comb[0].v)
+        var comb_ord = List[Int64]()
+        if has_delta:                                            # best + candidates back in frame order, so equal keys keep it
+            comb_ord = best_ord.copy()
+            comb_ord.extend(cand_ord^)
+            var by_row2 = _merge_by_row(comb_ord)
+            if len(by_row2) > 0:
+                for k in range(len(items)):
+                    comb[k] = _gather(comb[k], by_row2)
+                var re_ord = List[Int64](length=n, fill=0)
+                for j in range(n):
+                    re_ord[j] = comb_ord[by_row2[j]]
+                comb_ord = re_ord^
         var kc = List[ValCol]()
         for o in q.rorder:
             kc.append(comb[_item_of(items, q, o.expr)].copy())
@@ -711,6 +791,10 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
             keep.append(ord[j])
         for k in range(len(items)):
             best[k] = _gather(comb[k], keep)
+        if has_delta:
+            best_ord = List[Int64]()
+            for j in keep:
+                best_ord.append(comb_ord[j])
     var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
     _ = ranks^
     if src.kind == SRC_FRAME:
