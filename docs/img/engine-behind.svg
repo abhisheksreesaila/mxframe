@@ -1,52 +1,68 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="537" viewBox="0 0 900 537" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="641" viewBox="0 0 900 641" role="img" aria-labelledby="t d">
 <title id="t">Where we&#x27;re still behind DuckDB</title>
 <desc id="d">how many times slower than DuckDB · 1x is a tie · shorter is better. informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</desc>
-<rect x=".5" y=".5" width="899" height="536" rx="14" fill="#FFFDF8" stroke="#BEB4A4"/>
+<rect x=".5" y=".5" width="899" height="640" rx="14" fill="#FFFDF8" stroke="#BEB4A4"/>
 <text x="32.0" y="36.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="2">// MX FRAME · THE MOJO ENGINE</text>
 <text x="32.0" y="64.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#20221F" text-anchor="start">Where we&#x27;re still behind DuckDB</text>
 <text x="32.0" y="86.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">how many times slower than DuckDB · 1x is a tie · shorter is better</text>
 <rect x="32" y="100" width="10" height="10" rx="2" fill="#e34948"/>
 <text x="48.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#4C5049" text-anchor="start">MX frame time / DuckDB time</text>
-<path d="M290.0 130V485" stroke="#E4DDD0" stroke-width="1.5"/>
+<path d="M290.0 130V589" stroke="#E4DDD0" stroke-width="1.5"/>
 <text x="290.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">1x</text>
-<path d="M501.5 130V485" stroke="#E4DDD0" stroke-width="1"/>
-<text x="501.5" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">2x</text>
-<path d="M713.1 130V485" stroke="#E4DDD0" stroke-width="1"/>
-<text x="713.1" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">3x</text>
-<text x="32.0" y="154.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · one-to-many LEFT</text>
-<text x="32.0" y="170.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161 expands matches inside the kernel</text>
-<rect x="290" y="142" width="341.7" height="12" rx="3" fill="#e34948"/>
-<text x="638.7" y="152.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">2.6x<tspan font-weight="400" fill="#4C5049" dx="10">34 ms vs 13 ms</tspan></text>
+<path d="M365.7 130V589" stroke="#E4DDD0" stroke-width="1"/>
+<text x="365.7" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">2x</text>
+<path d="M441.5 130V589" stroke="#E4DDD0" stroke-width="1"/>
+<text x="441.5" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">3x</text>
+<path d="M517.2 130V589" stroke="#E4DDD0" stroke-width="1"/>
+<text x="517.2" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">4x</text>
+<path d="M592.9 130V589" stroke="#E4DDD0" stroke-width="1"/>
+<text x="592.9" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">5x</text>
+<path d="M668.7 130V589" stroke="#E4DDD0" stroke-width="1"/>
+<text x="668.7" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">6x</text>
+<text x="32.0" y="154.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">count(DISTINCT lower(h))</text>
+<text x="32.0" y="170.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-167 builds new words in parallel</text>
+<rect x="290" y="142" width="363.0" height="12" rx="3" fill="#e34948"/>
+<text x="660.0" y="152.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">5.8x<tspan font-weight="400" fill="#4C5049" dx="10">336 ms vs 58 ms</tspan></text>
 <path d="M32 186H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="206.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">SQL · full sort, 1.1M rows</text>
-<text x="32.0" y="222.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: full sorts and million-row outputs</text>
-<rect x="290" y="194" width="301.6" height="12" rx="3" fill="#e34948"/>
-<text x="598.6" y="204.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">2.4x<tspan font-weight="400" fill="#4C5049" dx="10">114 ms vs 47 ms</tspan></text>
+<text x="32.0" y="206.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">TPC-H Q7</text>
+<text x="32.0" y="222.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161: a star-aware planner, one pass over every dimension</text>
+<rect x="290" y="194" width="265.1" height="12" rx="3" fill="#e34948"/>
+<text x="562.1" y="204.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">4.5x<tspan font-weight="400" fill="#4C5049" dx="10">72 ms vs 16 ms</tspan></text>
 <path d="M32 238H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="258.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">SQL · ORDER BY … LIMIT 10</text>
-<text x="32.0" y="274.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: already 3 ms, was 126</text>
-<rect x="290" y="246" width="241.8" height="12" rx="3" fill="#e34948"/>
-<text x="538.8" y="256.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">2.1x<tspan font-weight="400" fill="#4C5049" dx="10">3 ms vs 1.4 ms</tspan></text>
+<text x="32.0" y="258.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">TPC-H Q5</text>
+<text x="32.0" y="274.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161: no intermediate rows written between joins</text>
+<rect x="290" y="246" width="163.1" height="12" rx="3" fill="#e34948"/>
+<text x="460.1" y="256.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">3.2x<tspan font-weight="400" fill="#4C5049" dx="10">41 ms vs 13 ms</tspan></text>
 <path d="M32 290H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="310.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · filter on the probe side</text>
-<text x="32.0" y="326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161 moves the filter into the join</text>
-<rect x="290" y="298" width="115.4" height="12" rx="3" fill="#e34948"/>
-<text x="412.4" y="308.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.5x<tspan font-weight="400" fill="#4C5049" dx="10">34 ms vs 22 ms</tspan></text>
+<text x="32.0" y="310.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · one-to-many LEFT</text>
+<text x="32.0" y="326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161 expands matches inside the kernel</text>
+<rect x="290" y="298" width="122.3" height="12" rx="3" fill="#e34948"/>
+<text x="419.3" y="308.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">2.6x<tspan font-weight="400" fill="#4C5049" dx="10">34 ms vs 13 ms</tspan></text>
 <path d="M32 342H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="362.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">streamed · morsels, 20 row groups</text>
-<text x="32.0" y="378.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: faster with few row groups</text>
-<rect x="290" y="350" width="63.5" height="12" rx="3" fill="#e34948"/>
-<rect x="353.5" y="350" width="30.6" height="12" rx="3" fill="#e34948" fill-opacity=".4"/>
-<text x="391.0" y="360.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.3–1.4x<tspan font-weight="400" fill="#4C5049" dx="10">0.13 s vs 0.09–0.10 s</tspan></text>
+<text x="32.0" y="362.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">SQL · full sort, 1.1M rows</text>
+<text x="32.0" y="378.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-167: full sorts and million-row outputs</text>
+<rect x="290" y="350" width="108.0" height="12" rx="3" fill="#e34948"/>
+<text x="405.0" y="360.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">2.4x<tspan font-weight="400" fill="#4C5049" dx="10">114 ms vs 47 ms</tspan></text>
 <path d="M32 394H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="414.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · two-column key</text>
-<text x="32.0" y="430.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161</text>
-<rect x="290" y="402" width="84.6" height="12" rx="3" fill="#e34948"/>
-<text x="381.6" y="412.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.4x<tspan font-weight="400" fill="#4C5049" dx="10">49 ms vs 35 ms</tspan></text>
-<path d="M32 446H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="466.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">SQL · 8 groups, 4 aggregates</text>
-<rect x="290" y="454" width="70.5" height="12" rx="3" fill="#e34948"/>
-<text x="367.5" y="464.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.3x<tspan font-weight="400" fill="#4C5049" dx="10">8 ms vs 6 ms</tspan></text>
+<text x="32.0" y="414.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">LIKE &#x27;%special%&#x27;, 3.6M words</text>
+<rect x="290" y="402" width="65.6" height="12" rx="3" fill="#e34948"/>
+<text x="362.6" y="412.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.9x<tspan font-weight="400" fill="#4C5049" dx="10">23.7 ms vs 12.7 ms</tspan></text>
+<path d="M32 427H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="447.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · filter on the probe side</text>
+<text x="32.0" y="463.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161 keeps the filter inside the join</text>
+<rect x="290" y="435" width="41.3" height="12" rx="3" fill="#e34948"/>
+<text x="338.3" y="445.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.5x<tspan font-weight="400" fill="#4C5049" dx="10">34 ms vs 22 ms</tspan></text>
 <path d="M32 479H868" stroke="#E4DDD0" stroke-opacity=".7"/>
-<text x="32.0" y="515.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</text>
+<text x="32.0" y="499.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">streamed · morsels, 20 row groups</text>
+<text x="32.0" y="515.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: faster with few row groups</text>
+<rect x="290" y="487" width="22.7" height="12" rx="3" fill="#e34948"/>
+<rect x="312.7" y="487" width="10.9" height="12" rx="3" fill="#e34948" fill-opacity=".4"/>
+<text x="330.7" y="497.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.3–1.4x<tspan font-weight="400" fill="#4C5049" dx="10">0.13 s vs 0.09–0.10 s</tspan></text>
+<path d="M32 531H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="551.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" fill="#20221F" text-anchor="start">join · two-column key</text>
+<text x="32.0" y="567.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">next: F-161</text>
+<rect x="290" y="539" width="30.3" height="12" rx="3" fill="#e34948"/>
+<text x="327.3" y="549.5" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#20221F">1.4x<tspan font-weight="400" fill="#4C5049" dx="10">49 ms vs 35 ms</tspan></text>
+<path d="M32 583H868" stroke="#E4DDD0" stroke-opacity=".7"/>
+<text x="32.0" y="619.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</text>
 </svg>

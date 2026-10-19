@@ -4,97 +4,456 @@
   "caveat_short": "informal timings: shared 12-core Ryzen + RTX 3090, other work running; quiet-machine scoreboard not run yet",
   "vision": "The Mojo engine is the core: it links into any app the way SQLite does, and aims to beat DuckDB and Polars on CPU and GPU. Python and apps are plugins.",
   "vision_short": "A data engine kernel in Mojo. Apps and agents build on it; Python is a plugin.",
-
   "headline": [
-    {"ref": ["streaming", "morsels, 4 row groups"], "big": "0.14 s", "vs": "DuckDB 0.18 s", "label": "streamed 20M-row query"},
-    {"ref": ["joins", "NOT EXISTS"], "focus": true, "big": "9 ms", "vs": "DuckDB 35 ms", "label": "NOT EXISTS, 6M x 1.5M rows"},
-    {"ref": ["aggregates", "median"], "big": "398 ms", "vs": "DuckDB 2,208 ms", "label": "median, 20M rows, 1M groups"},
-    {"ref": ["memory"], "big": "1.6 GB", "vs": "in 72 MB of memory", "label": "bigger-than-RAM file, streamed"}
+    {
+      "ref": [
+        "streaming",
+        "morsels, 4 row groups"
+      ],
+      "big": "0.14 s",
+      "vs": "DuckDB 0.18 s",
+      "label": "streamed 20M-row query"
+    },
+    {
+      "ref": [
+        "joins",
+        "NOT EXISTS"
+      ],
+      "focus": true,
+      "big": "9 ms",
+      "vs": "DuckDB 35 ms",
+      "label": "NOT EXISTS, 6M x 1.5M rows"
+    },
+    {
+      "ref": [
+        "aggregates",
+        "median"
+      ],
+      "big": "398 ms",
+      "vs": "DuckDB 2,208 ms",
+      "label": "median, 20M rows, 1M groups"
+    },
+    {
+      "ref": [
+        "memory"
+      ],
+      "big": "1.6 GB",
+      "vs": "in 72 MB of memory",
+      "label": "bigger-than-RAM file, streamed"
+    }
   ],
-
   "areas": [
-    {"id": "parquet", "name": "Reading Parquet", "what": "bulk, parallel, SIMD decode; lazy dictionaries", "big": "0.15 s", "line": "numeric read, 20M rows (pyarrow 0.25 s)", "tickets": "F-140, F-141, F-145"},
-    {"id": "text", "name": "Reading text", "what": "words found in parallel, codes in file order", "big": "0.17 s", "line": "5M-row text read (was 1.29 s)", "tickets": "F-142"},
-    {"id": "stream", "name": "Bigger than RAM", "what": "streamed a row group at a time, a block per core", "big": "72 MB", "line": "to query a 1.6 GB file", "tickets": "F-140, F-143, F-149"},
-    {"id": "edits", "name": "Edits on big files", "what": "the edit layer over a streamed file; streamed save", "big": "0.8 s", "line": "1,350 edits on 20M rows; save 3.1 s at 180 MB", "tickets": "F-147"},
-    {"id": "gpu", "name": "GPU", "what": "in-memory and streamed; AUTO picks the device", "big": "2.7x", "line": "GPU over CPU on 2 cores; AUTO keeps the CPU on 12", "tickets": "F-137, F-146"},
-    {"id": "aggs", "name": "Aggregates", "what": "count distinct, median, percentile, top-k and more", "big": "398 ms", "line": "median at 1M groups (DuckDB 2,208 ms)", "tickets": "F-133, F-148"},
-    {"id": "types", "name": "Types", "what": "INT, DECIMAL (exact), TEXT, DATE, BOOL, FLOAT64", "big": "same bits", "line": "float sums reproducible on any core count", "tickets": "F-157"},
-    {"id": "sql", "name": "SQL", "what": "SELECT … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT, EXPLAIN", "big": "159 ms", "line": "1M groups out (DuckDB 1.9 s)", "tickets": "F-150, F-152"},
-    {"id": "joins", "name": "Joins", "what": "inner, LEFT, SEMI, ANTI; IN / EXISTS / NOT IN", "big": "9 ms", "line": "NOT EXISTS (DuckDB 35 ms)", "tickets": "F-153, F-154"},
-    {"id": "mx", "name": "mx, for agents", "what": "SQL in, JSON / CSV / Parquet out", "big": "12 ms", "line": "cold start, 21 MB, no Python", "tickets": "F-151"}
+    {
+      "id": "parquet",
+      "name": "Reading Parquet",
+      "what": "bulk, parallel, SIMD decode; lazy dictionaries",
+      "big": "0.15 s",
+      "line": "numeric read, 20M rows (pyarrow 0.25 s)",
+      "tickets": "F-140, F-141, F-145"
+    },
+    {
+      "id": "text",
+      "name": "Reading text",
+      "what": "words found in parallel, codes in file order",
+      "big": "0.17 s",
+      "line": "5M-row text read (was 1.29 s)",
+      "tickets": "F-142"
+    },
+    {
+      "id": "stream",
+      "name": "Bigger than RAM",
+      "what": "streamed a row group at a time, a block per core",
+      "big": "72 MB",
+      "line": "to query a 1.6 GB file",
+      "tickets": "F-140, F-143, F-149"
+    },
+    {
+      "id": "edits",
+      "name": "Edits on big files",
+      "what": "the edit layer over a streamed file; streamed save",
+      "big": "0.8 s",
+      "line": "1,350 edits on 20M rows; save 3.1 s at 180 MB",
+      "tickets": "F-147"
+    },
+    {
+      "id": "gpu",
+      "name": "GPU",
+      "what": "in-memory and streamed; AUTO picks the device",
+      "big": "2.7x",
+      "line": "GPU over CPU on 2 cores; AUTO keeps the CPU on 12",
+      "tickets": "F-137, F-146"
+    },
+    {
+      "id": "aggs",
+      "name": "Aggregates",
+      "what": "count distinct, median, percentile, top-k and more",
+      "big": "398 ms",
+      "line": "median at 1M groups (DuckDB 2,208 ms)",
+      "tickets": "F-133, F-148"
+    },
+    {
+      "id": "types",
+      "name": "Types",
+      "what": "INT, DECIMAL (exact), TEXT, DATE, BOOL, FLOAT64",
+      "big": "same bits",
+      "line": "float sums reproducible on any core count",
+      "tickets": "F-157"
+    },
+    {
+      "id": "sql",
+      "name": "SQL",
+      "what": "SELECT … WHERE … GROUP BY … HAVING … ORDER BY … LIMIT, EXPLAIN",
+      "big": "159 ms",
+      "line": "1M groups out (DuckDB 1.9 s)",
+      "tickets": "F-150, F-152"
+    },
+    {
+      "id": "joins",
+      "name": "Joins",
+      "what": "inner, LEFT, SEMI, ANTI; IN / EXISTS; 3-9 tables with a cost-based planner",
+      "big": "73 ms",
+      "line": "TPC-H Q9, planner-ordered (DuckDB 112 ms)",
+      "tickets": "F-153, F-154, F-155"
+    },
+    {
+      "id": "exprs",
+      "name": "Expressions",
+      "what": "CASE, CAST, text functions once per word, dates and intervals",
+      "big": "4.3 ms",
+      "line": "date_trunc group (DuckDB 20.6 ms)",
+      "tickets": "F-156"
+    },
+    {
+      "id": "mx",
+      "name": "mx, for agents",
+      "what": "SQL in, JSON / CSV / Parquet out",
+      "big": "12 ms",
+      "line": "cold start, 21 MB, no Python",
+      "tickets": "F-151"
+    }
   ],
-
-  "memory": {"file_gb": 1.6, "peak_mb": 72},
-
-  "parquet": {"title": "read_parquet, numeric, 20M rows, all cores", "unit": "s",
-    "rows": [{"label": "before", "mx": 3.78}, {"label": "after", "mx": 0.15, "pyarrow": 0.25}]},
-
-  "text": {"title": "5M-row text file, all cores", "unit": "s",
-    "rows": [{"label": "before", "mx": 1.29}, {"label": "after", "mx": 0.17, "pyarrow": [0.5, 0.6], "duckdb": 0.16}],
-    "note": "pyarrow gives the same output; DuckDB's 0.16 s is its whole query, hashing every word."},
-
-  "streaming": {"title": "Streamed numeric query, 20M rows", "unit": "s",
-    "steps": [
-      {"ticket": "F-140", "label": "one row group at a time", "mx": 2.69, "memory": "72 MB for a 1.6 GB file"},
-      {"ticket": "F-141", "label": "bulk decode", "mx": 0.24, "duckdb": 0.10},
-      {"ticket": "F-143, F-145", "label": "overlap + parallel pages", "mx": 0.150, "duckdb": 0.07, "memory": "~2 row groups"},
-      {"ticket": "F-149", "label": "morsels, 20 row groups", "mx": 0.13, "duckdb": [0.09, 0.10], "memory": "142 MB"}
+  "memory": {
+    "file_gb": 1.6,
+    "peak_mb": 72
+  },
+  "parquet": {
+    "title": "read_parquet, numeric, 20M rows, all cores",
+    "unit": "s",
+    "rows": [
+      {
+        "label": "before",
+        "mx": 3.78
+      },
+      {
+        "label": "after",
+        "mx": 0.15,
+        "pyarrow": 0.25
+      }
+    ]
+  },
+  "text": {
+    "title": "5M-row text file, all cores",
+    "unit": "s",
+    "rows": [
+      {
+        "label": "before",
+        "mx": 1.29
+      },
+      {
+        "label": "after",
+        "mx": 0.17,
+        "pyarrow": [
+          0.5,
+          0.6
+        ],
+        "duckdb": 0.16
+      }
     ],
-    "few_groups": {"ticket": "F-149", "label": "morsels, 4 row groups", "mx": 0.14, "duckdb": 0.18, "memory": "143 MB (was 448)"}},
-
-  "edits": {"title": "Editing a 20M-row, 567 MB file", "rows": [
-    {"label": "1,350 edits", "s": 0.8, "peak_mb": 56},
-    {"label": "a query over the edited file", "s": 0.1, "peak_mb": 70},
-    {"label": "saved", "s": 3.1, "peak_mb": 180}]},
-
-  "gpu": {"title": "20M-row streamed query: CPU, GPU and what AUTO picks", "unit": "s", "rows": [
-    {"cores": 12, "plan": "light", "cpu": 0.109, "gpu": 0.132, "auto": "CPU"},
-    {"cores": 4, "plan": "heavy", "cpu": 0.366, "gpu": 0.178, "auto": "GPU"},
-    {"cores": 2, "plan": "heavy", "cpu": 0.597, "gpu": 0.220, "auto": "GPU"}]},
-
-  "aggregates": {"title": "Holistic aggregates, 20M rows, 1M groups", "unit": "ms", "rows": [
-    {"label": "count distinct", "groups8": 148, "mx": 372, "duckdb": 617},
-    {"label": "median", "groups8": 120, "mx": 398, "duckdb": 2208},
-    {"label": "top-k", "groups8": 19, "mx": 449, "duckdb": 2295}]},
-
-  "sql": {"title": "SQL in Mojo, 5M / 1.2M rows", "unit": "ms", "rows": [
-    {"label": "8 groups, 4 aggregates", "mx": 8, "duckdb": 6},
-    {"label": "1M groups, all rows out", "mx": 159, "duckdb": 1900},
-    {"label": "ORDER BY … LIMIT 10", "mx": 3, "was": 126, "duckdb": 1.4},
-    {"label": "SELECT DISTINCT s", "mx": 1.3, "duckdb": 4.0},
-    {"label": "full sort, 1.1M rows", "mx": 114, "duckdb": 47}]},
-
-  "joins": {"title": "Joins, 6M x 1.5M x 150k rows", "unit": "ms", "rows": [
-    {"label": "join + group sum", "mx": 110, "duckdb": 148},
-    {"label": "orders x customer", "mx": 3.6, "duckdb": 6.6},
-    {"label": "LEFT join + GROUP BY", "mx": 18, "duckdb": 48},
-    {"label": "EXISTS", "mx": 20, "duckdb": 70},
-    {"label": "NOT EXISTS", "mx": 9, "duckdb": 35},
-    {"label": "two-column key", "mx": 49, "duckdb": 35},
-    {"label": "filter on the probe side", "mx": 34, "duckdb": 22},
-    {"label": "one-to-many LEFT", "mx": 34, "duckdb": 13}]},
-
-  "mx_cli": {"cold_start_ms": 12, "size_mb": 21},
-
+    "note": "pyarrow gives the same output; DuckDB's 0.16 s is its whole query, hashing every word."
+  },
+  "streaming": {
+    "title": "Streamed numeric query, 20M rows",
+    "unit": "s",
+    "steps": [
+      {
+        "ticket": "F-140",
+        "label": "one row group at a time",
+        "mx": 2.69,
+        "memory": "72 MB for a 1.6 GB file"
+      },
+      {
+        "ticket": "F-141",
+        "label": "bulk decode",
+        "mx": 0.24,
+        "duckdb": 0.1
+      },
+      {
+        "ticket": "F-143, F-145",
+        "label": "overlap + parallel pages",
+        "mx": 0.15,
+        "duckdb": 0.07,
+        "memory": "~2 row groups"
+      },
+      {
+        "ticket": "F-149",
+        "label": "morsels, 20 row groups",
+        "mx": 0.13,
+        "duckdb": [
+          0.09,
+          0.1
+        ],
+        "memory": "142 MB"
+      }
+    ],
+    "few_groups": {
+      "ticket": "F-149",
+      "label": "morsels, 4 row groups",
+      "mx": 0.14,
+      "duckdb": 0.18,
+      "memory": "143 MB (was 448)"
+    }
+  },
+  "edits": {
+    "title": "Editing a 20M-row, 567 MB file",
+    "rows": [
+      {
+        "label": "1,350 edits",
+        "s": 0.8,
+        "peak_mb": 56
+      },
+      {
+        "label": "a query over the edited file",
+        "s": 0.1,
+        "peak_mb": 70
+      },
+      {
+        "label": "saved",
+        "s": 3.1,
+        "peak_mb": 180
+      }
+    ]
+  },
+  "gpu": {
+    "title": "20M-row streamed query: CPU, GPU and what AUTO picks",
+    "unit": "s",
+    "rows": [
+      {
+        "cores": 12,
+        "plan": "light",
+        "cpu": 0.109,
+        "gpu": 0.132,
+        "auto": "CPU"
+      },
+      {
+        "cores": 4,
+        "plan": "heavy",
+        "cpu": 0.366,
+        "gpu": 0.178,
+        "auto": "GPU"
+      },
+      {
+        "cores": 2,
+        "plan": "heavy",
+        "cpu": 0.597,
+        "gpu": 0.22,
+        "auto": "GPU"
+      }
+    ]
+  },
+  "aggregates": {
+    "title": "Holistic aggregates, 20M rows, 1M groups",
+    "unit": "ms",
+    "rows": [
+      {
+        "label": "count distinct",
+        "groups8": 148,
+        "mx": 372,
+        "duckdb": 617
+      },
+      {
+        "label": "median",
+        "groups8": 120,
+        "mx": 398,
+        "duckdb": 2208
+      },
+      {
+        "label": "top-k",
+        "groups8": 19,
+        "mx": 449,
+        "duckdb": 2295
+      }
+    ]
+  },
+  "sql": {
+    "title": "SQL in Mojo, 5M / 1.2M rows",
+    "unit": "ms",
+    "rows": [
+      {
+        "label": "8 groups, 4 aggregates",
+        "mx": 8,
+        "duckdb": 6
+      },
+      {
+        "label": "1M groups, all rows out",
+        "mx": 159,
+        "duckdb": 1900
+      },
+      {
+        "label": "ORDER BY … LIMIT 10",
+        "mx": 3,
+        "was": 126,
+        "duckdb": 1.4
+      },
+      {
+        "label": "SELECT DISTINCT s",
+        "mx": 1.3,
+        "duckdb": 4.0
+      },
+      {
+        "label": "full sort, 1.1M rows",
+        "mx": 114,
+        "duckdb": 47
+      }
+    ]
+  },
+  "joins": {
+    "title": "Joins, 6M x 1.5M x 150k rows",
+    "unit": "ms",
+    "rows": [
+      {
+        "label": "join + group sum",
+        "mx": 110,
+        "duckdb": 148
+      },
+      {
+        "label": "orders x customer",
+        "mx": 3.6,
+        "duckdb": 6.6
+      },
+      {
+        "label": "LEFT join + GROUP BY",
+        "mx": 18,
+        "duckdb": 48
+      },
+      {
+        "label": "EXISTS",
+        "mx": 20,
+        "duckdb": 70
+      },
+      {
+        "label": "NOT EXISTS",
+        "mx": 9,
+        "duckdb": 35
+      },
+      {
+        "label": "two-column key",
+        "mx": 49,
+        "duckdb": 35
+      },
+      {
+        "label": "filter on the probe side",
+        "mx": 34,
+        "duckdb": 22
+      },
+      {
+        "label": "one-to-many LEFT",
+        "mx": 34,
+        "duckdb": 13
+      }
+    ]
+  },
+  "mx_cli": {
+    "cold_start_ms": 12,
+    "size_mb": 21
+  },
   "correct": [
-    {"big": "every ticket", "line": "attacked by an independent reviewer with adversarial inputs before it counted as done"},
-    {"big": "DuckDB / pyarrow", "line": "every answer checked against them: thousands of generated queries, corrupt and lying files, fuzzed SQL"},
-    {"big": "never crash", "line": "crafted and byte-flipped Parquet files get a readable error; malformed SQL raises with its line and column"},
-    {"big": "KernelRun", "line": "an owner object makes 'a buffer freed before the kernel reads it' impossible; a lint catches the rest"}
+    {
+      "big": "every ticket",
+      "line": "attacked by an independent reviewer with adversarial inputs before it counted as done"
+    },
+    {
+      "big": "DuckDB / pyarrow",
+      "line": "every answer checked against them: thousands of generated queries, corrupt and lying files, fuzzed SQL"
+    },
+    {
+      "big": "never crash",
+      "line": "crafted and byte-flipped Parquet files get a readable error; malformed SQL raises with its line and column"
+    },
+    {
+      "big": "KernelRun",
+      "line": "an owner object makes 'a buffer freed before the kernel reads it' impossible; a lint catches the rest"
+    }
   ],
-
   "behind": [
-    {"from": ["joins", "one-to-many LEFT"], "next": "F-161 expands matches inside the kernel"},
-    {"from": ["sql", "full sort, 1.1M rows"], "next": "full sorts and million-row outputs"},
-    {"from": ["sql", "ORDER BY … LIMIT 10"], "next": "already 3 ms, was 126"},
-    {"from": ["joins", "filter on the probe side"], "next": "F-161 moves the filter into the join"},
-    {"from": ["joins", "two-column key"], "next": "F-161"},
-    {"from": ["sql", "8 groups, 4 aggregates"], "next": ""},
-    {"from": ["streaming", "morsels, 20 row groups"], "next": "faster with few row groups"}
+    {
+      "from": [
+        "exprs",
+        "count(DISTINCT lower(h)) (1M distinct words)"
+      ],
+      "label": "count(DISTINCT lower(h))",
+      "next": "F-167 builds new words in parallel"
+    },
+    {
+      "from": [
+        "multiway",
+        "Q7"
+      ],
+      "label": "TPC-H Q7",
+      "next": "F-161: a star-aware planner, one pass over every dimension"
+    },
+    {
+      "from": [
+        "multiway",
+        "Q5"
+      ],
+      "label": "TPC-H Q5",
+      "next": "F-161: no intermediate rows written between joins"
+    },
+    {
+      "from": [
+        "joins",
+        "one-to-many LEFT"
+      ],
+      "next": "F-161 expands matches inside the kernel"
+    },
+    {
+      "from": [
+        "sql",
+        "full sort, 1.1M rows"
+      ],
+      "next": "F-167: full sorts and million-row outputs"
+    },
+    {
+      "from": [
+        "exprs",
+        "LIKE '%special%' (3.6M distinct words)"
+      ],
+      "label": "LIKE '%special%', 3.6M words",
+      "next": ""
+    },
+    {
+      "from": [
+        "joins",
+        "filter on the probe side"
+      ],
+      "next": "F-161 keeps the filter inside the join"
+    },
+    {
+      "from": [
+        "joins",
+        "two-column key"
+      ],
+      "next": "F-161"
+    },
+    {
+      "from": [
+        "streaming",
+        "morsels, 20 row groups"
+      ],
+      "next": "faster with few row groups"
+    }
   ],
-  "next": "Multi-table joins with a cost-based join order (F-155), SQL expressions (F-156), CTEs and correlated subqueries (F-159), then the gate: all 22 TPC-H queries through mx equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on CPU and GPU.",
-
+  "next": "Joins over streamed files (F-158), CTEs and correlated subqueries (F-159), then the gate: all 22 TPC-H queries through mx equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on CPU and GPU.",
   "roadmap": {
     "source": "docs/briefs/positioning.md",
     "name": "omxcore",
@@ -111,18 +470,43 @@
     ],
     "now": "M8",
     "path": [
-      {"id": "M8", "tag": "M8 · F-162", "title": "SQL and joins, then the TPC-H 22 gate",
-       "done": "SQL, row queries, inner / left / semi / anti joins", "building": "multi-table planner and expressions"},
-      {"id": "scoreboard", "tag": "F-166", "title": "Quiet-machine scoreboard",
-       "detail": "against DuckDB and Polars, on CPU and GPU, published with the gaps"},
-      {"id": "gaps", "tag": "F-161 · F-167 · F-168", "title": "Close the gaps",
-       "detail": "join speed, sort and large outputs, window functions"},
-      {"id": "omxcore", "tag": "F-165 · F-169", "title": "omxcore 0.7.0",
-       "detail": "the rename, plus an MCP server so agents reach for it first"},
-      {"id": "agents", "tag": "M10", "title": "Agent-native plugins",
-       "detail": "vector search on the GPU first, then agent search, decisions and memory"},
-      {"id": "bigger", "tag": "F-163", "title": "Bigger than RAM, the long tail",
-       "detail": "joins that spill to disk, and the SQL long tail"}
+      {
+        "id": "M8",
+        "tag": "M8 · F-162",
+        "title": "SQL and joins, then the TPC-H 22 gate",
+        "done": "SQL, row queries, inner / left / semi / anti and 3–9-table joins with a planner, expressions",
+        "building": "joins over streamed files and CTEs"
+      },
+      {
+        "id": "scoreboard",
+        "tag": "F-166",
+        "title": "Quiet-machine scoreboard",
+        "detail": "against DuckDB and Polars, on CPU and GPU, published with the gaps"
+      },
+      {
+        "id": "gaps",
+        "tag": "F-161 · F-167 · F-168",
+        "title": "Close the gaps",
+        "detail": "join speed, sort and large outputs, window functions"
+      },
+      {
+        "id": "omxcore",
+        "tag": "F-165 · F-169",
+        "title": "omxcore 0.7.0",
+        "detail": "the rename, plus an MCP server so agents reach for it first"
+      },
+      {
+        "id": "agents",
+        "tag": "M10",
+        "title": "Agent-native plugins",
+        "detail": "vector search on the GPU first, then agent search, decisions and memory"
+      },
+      {
+        "id": "bigger",
+        "tag": "F-163",
+        "title": "Bigger than RAM, the long tail",
+        "detail": "joins that spill to disk, and the SQL long tail"
+      }
     ],
     "agents": {
       "title": "Built for agents",
@@ -131,30 +515,80 @@
       "when": "PLUGINS ON THE CORE · PLANNED · M10, AFTER 0.7.0",
       "note": "The core never learns about agents: it gains vectors, a top-k distance kernel and UDFs; agent features live in plugins.",
       "items": [
-        {"name": "mx", "status": "today", "line": "speaks JSON, starts in 12 ms, no Python"},
-        {"name": "Vector search, GPU-native", "status": "planned", "line": "embeddings beside your data; nearest-k with SQL filters in one query"},
-        {"name": "Agent search", "status": "planned", "line": "keyword + vector + SQL in one ranked call, with why each row matched"},
-        {"name": "Classification and decision API", "status": "planned", "line": "label or route rows, batched on the GPU"},
-        {"name": "MCP server", "status": "with 0.7.0", "line": "every agent gets sql / explain / schema / search as tools"},
-        {"name": "Agent memory", "status": "planned", "line": "facts with time and source, queried like any table"}
+        {
+          "name": "mx",
+          "status": "today",
+          "line": "speaks JSON, starts in 12 ms, no Python"
+        },
+        {
+          "name": "Vector search, GPU-native",
+          "status": "planned",
+          "line": "embeddings beside your data; nearest-k with SQL filters in one query"
+        },
+        {
+          "name": "Agent search",
+          "status": "planned",
+          "line": "keyword + vector + SQL in one ranked call, with why each row matched"
+        },
+        {
+          "name": "Classification and decision API",
+          "status": "planned",
+          "line": "label or route rows, batched on the GPU"
+        },
+        {
+          "name": "MCP server",
+          "status": "with 0.7.0",
+          "line": "every agent gets sql / explain / schema / search as tools"
+        },
+        {
+          "name": "Agent memory",
+          "status": "planned",
+          "line": "facts with time and source, queried like any table"
+        }
       ]
     }
   },
-
   "hood": {
     "source": "docs/briefs/positioning.md",
     "title": "Under the hood: modern algorithms × a modern compiled language",
     "algorithms_when": "ALL BUILT AND IN USE TODAY",
     "algorithms": [
-      {"name": "Morsel-driven parallelism", "line": "each core owns a block, no barriers"},
-      {"name": "Radix-partitioned hash joins", "line": "built in parallel without atomics"},
-      {"name": "Parallel radix sort and select", "line": "percentiles and sorts on every core"},
-      {"name": "HyperLogLog-sized hash sets", "line": "count distinct at 1M groups"},
-      {"name": "Bounded top-k heaps", "line": "ORDER BY … LIMIT without a full sort"},
-      {"name": "SIMD bulk Parquet decode", "line": "a column written in place, every core in a row group"},
-      {"name": "Two-phase parallel dictionaries", "line": "text codes in file order, found in parallel"},
-      {"name": "Planner from exact statistics", "line": "dense or hashed, heap or sort; EXPLAIN says why"},
-      {"name": "Reproducible float sums", "line": "the same bits on any core count"}
+      {
+        "name": "Morsel-driven parallelism",
+        "line": "each core owns a block, no barriers"
+      },
+      {
+        "name": "Radix-partitioned hash joins",
+        "line": "built in parallel without atomics"
+      },
+      {
+        "name": "Parallel radix sort and select",
+        "line": "percentiles and sorts on every core"
+      },
+      {
+        "name": "HyperLogLog-sized hash sets",
+        "line": "count distinct at 1M groups"
+      },
+      {
+        "name": "Bounded top-k heaps",
+        "line": "ORDER BY … LIMIT without a full sort"
+      },
+      {
+        "name": "SIMD bulk Parquet decode",
+        "line": "a column written in place, every core in a row group"
+      },
+      {
+        "name": "Two-phase parallel dictionaries",
+        "line": "text codes in file order, found in parallel"
+      },
+      {
+        "name": "Planner from exact statistics",
+        "line": "dense or hashed, heap or sort; EXPLAIN says why"
+      },
+      {
+        "name": "Reproducible float sums",
+        "line": "the same bits on any core count"
+      }
     ],
     "mojo": {
       "name": "Mojo",
@@ -167,16 +601,165 @@
       "tagline": "Python's ease with C++'s speed, in one codebase."
     }
   },
-
   "family": {
     "source": "docs/briefs/positioning.md",
     "title": "The omx family",
     "line": "A full stack for data apps with no Python and no server: the app and its engine compile into one native binary.",
-    "example": {"name": "omxplorer", "line": "the first app built this way", "url": "https://github.com/abhisheksreesaila/mxapp"},
+    "example": {
+      "name": "omxplorer",
+      "line": "the first app built this way",
+      "url": "https://github.com/abhisheksreesaila/mxapp"
+    },
     "layers": [
-      {"name": "omxapp", "role": "UI, built once", "line": "native on Linux, macOS, iPhone, Android and the web", "repo": "github.com/abhisheksreesaila/mxapp"},
-      {"name": "omxcore", "role": "the data engine", "line": "SQL, joins, streaming; CPU and GPU; this repo", "core": true},
-      {"name": "your files", "role": "CSV and Parquet", "line": "open formats; nothing to import or convert"}
+      {
+        "name": "omxapp",
+        "role": "UI, built once",
+        "line": "native on Linux, macOS, iPhone, Android and the web",
+        "repo": "github.com/abhisheksreesaila/mxapp"
+      },
+      {
+        "name": "omxcore",
+        "role": "the data engine",
+        "line": "SQL, joins, streaming; CPU and GPU; this repo",
+        "core": true
+      },
+      {
+        "name": "your files",
+        "role": "CSV and Parquet",
+        "line": "open formats; nothing to import or convert"
+      }
     ]
-  }
+  },
+  "multiway": {
+    "title": "Many tables and a planner, TPC-H SF1",
+    "unit": "ms",
+    "rows": [
+      {
+        "label": "Q9",
+        "mx": 73,
+        "duckdb": 112
+      },
+      {
+        "label": "Q19",
+        "mx": 24,
+        "duckdb": 23
+      },
+      {
+        "label": "star: lineitem with orders, part and supplier",
+        "mx": 39,
+        "duckdb": 80
+      },
+      {
+        "label": "Q3",
+        "mx": 32,
+        "duckdb": 27
+      },
+      {
+        "label": "Q5",
+        "mx": 41,
+        "duckdb": 13
+      },
+      {
+        "label": "Q7",
+        "mx": 72,
+        "duckdb": 16
+      }
+    ]
+  },
+  "exprs": {
+    "title": "Expressions, 6M rows",
+    "unit": "ms",
+    "rows": [
+      {
+        "label": "date_trunc + GROUP BY",
+        "mx": 4.3,
+        "duckdb": 20.6
+      },
+      {
+        "label": "date + INTERVAL filter",
+        "mx": 3.7,
+        "duckdb": 18.8
+      },
+      {
+        "label": "LIKE '%special%' (3.6M distinct words)",
+        "mx": 23.7,
+        "duckdb": 12.7
+      },
+      {
+        "label": "count(DISTINCT lower(h)) (1M distinct words)",
+        "mx": 336,
+        "duckdb": 58
+      }
+    ]
+  },
+  "wins": [
+    {
+      "from": [
+        "sql",
+        "1M groups, all rows out"
+      ]
+    },
+    {
+      "from": [
+        "aggregates",
+        "median"
+      ]
+    },
+    {
+      "from": [
+        "aggregates",
+        "top-k"
+      ]
+    },
+    {
+      "from": [
+        "exprs",
+        "date + INTERVAL filter"
+      ]
+    },
+    {
+      "from": [
+        "exprs",
+        "date_trunc + GROUP BY"
+      ]
+    },
+    {
+      "from": [
+        "joins",
+        "NOT EXISTS"
+      ]
+    },
+    {
+      "from": [
+        "joins",
+        "EXISTS"
+      ]
+    },
+    {
+      "from": [
+        "sql",
+        "SELECT DISTINCT s"
+      ]
+    },
+    {
+      "from": [
+        "joins",
+        "LEFT join + GROUP BY"
+      ]
+    },
+    {
+      "from": [
+        "multiway",
+        "star: lineitem with orders, part and supplier"
+      ],
+      "label": "star join, 4 tables"
+    },
+    {
+      "from": [
+        "multiway",
+        "Q9"
+      ],
+      "label": "TPC-H Q9"
+    }
+  ]
 }

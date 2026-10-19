@@ -52,8 +52,11 @@ def test_every_number_is_quoted_from_mojo_engine_md():
                 assert n in MD_NUMS, f"{path}: {n} in {v!r} is not in docs/mojo-engine.md"
 
 
-def test_ten_areas_four_headlines_and_a_visible_caveat():
-    assert len(DATA["areas"]) == 10 and len(DATA["headline"]) == 4
+def test_one_tile_per_glance_row_four_headlines_and_a_visible_caveat():
+    glance = MD[MD.index("## At a glance"):].split("\n## ", 1)[0]
+    rows = [l for l in glance.splitlines() if l.startswith("| ") and not l.startswith("| Area")]
+    assert len(DATA["areas"]) == len(rows), "one tile per row of the doc's At a glance table"
+    assert len(DATA["headline"]) == 4
     assert "informal" in DATA["caveat"].lower() and "quiet-machine scoreboard" in DATA["caveat"]
     assert sum(1 for h in DATA["headline"] if h.get("focus")) == 1
 

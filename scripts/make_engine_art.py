@@ -62,7 +62,7 @@ def fmt(v, unit):
         d = max(len(f"{x:g}".partition(".")[2]) for x in v)
         return f"{v[0]:.{d}f}–{v[1]:.{d}f} {unit}".strip()
     if unit == "ms":
-        s = f"{v:,.0f}" if v >= 10 or isinstance(v, int) else f"{v:.1f}"
+        s = f"{v:,}" if isinstance(v, int) else f"{v:.1f}" if v.is_integer() else f"{v:g}"  # as written: 2,208 / 4.0 / 20.6
     else:  # seconds under 1 keep two decimals, as docs/mojo-engine.md writes them (0.10 s)
         s = f"{v:.2f}" if v < 1 and len(f"{v:g}".partition(".")[2]) < 2 else f"{v:g}" if v < 10 else f"{v:,.0f}"
     return f"{s} {unit}".strip()
@@ -219,22 +219,29 @@ def log_scale(a, z):
     return lambda v: (math.log10(v) - math.log10(a)) / (math.log10(z) - math.log10(a))
 
 
-AREA = {"joins": "join", "sql": "SQL", "streaming": "streamed", "aggregates": "1M groups"}
+AREA = {"joins": "join", "sql": "SQL", "streaming": "streamed", "aggregates": "1M groups", "multiway": "join", "exprs": "expr"}
 FOOT = "informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md"
 
 
+def named(g, r):
+    """A row's chart label: the list's own label, else the row's, prefixed with its area when that helps."""
+    if g.get("label"):
+        return g["label"]
+    prefix = AREA[g["from"][0]]
+    return r["label"] if prefix.lower() in r["label"].lower() else f"{prefix} · {r['label']}"
+
+
 def chart_wins(data, theme):
+    """The strongest wins, as listed in the data file (every one is a row docs/mojo-engine.md measured)."""
     rows = []
-    for sec, prefix in (("joins", "join"), ("sql", "SQL"), ("aggregates", "1M groups")):
-        for r in data[sec]["rows"]:
-            if r["mx"] < r["duckdb"]:
-                name = r["label"] if prefix.lower() in r["label"].lower() else f"{prefix} · {r['label']}"
-                rows.append(dict(label=name, ratio=r["duckdb"] / r["mx"],
-                                 bars=[("mx", r["mx"], fmt(r["mx"], "ms")), ("dk", r["duckdb"], fmt(r["duckdb"], "ms"))],
-                                 right=ratio_text(r["duckdb"], r["mx"])))
+    for w in data["wins"]:
+        r = lookup(data, w["from"])
+        rows.append(dict(label=named(w, r), ratio=r["duckdb"] / r["mx"],
+                         bars=[("mx", r["mx"], fmt(r["mx"], "ms")), ("dk", r["duckdb"], fmt(r["duckdb"], "ms"))],
+                         right=ratio_text(r["duckdb"], r["mx"])))
     rows.sort(key=lambda r: -r["ratio"])
     ticks = [(1, "1 ms"), (10, "10 ms"), (100, "100 ms"), (1000, "1 s")]
-    return chart(theme, "Where the Mojo engine leads DuckDB", "SQL, joins and aggregates · time, log scale · lower is faster",
+    return chart(theme, "Where the Mojo engine leads DuckDB", "SQL, joins, expressions and aggregates · time, log scale · lower is faster",
                  [("mx", "MX frame"), ("dk", "DuckDB 1.5.1")], rows, log_scale(1, 4000), ticks, FOOT, "FASTER")
 
 
@@ -262,7 +269,7 @@ def gaps(data):
     for g in data["behind"]:
         r = lookup(data, g["from"])
         unit = data[g["from"][0]]["unit"]
-        out.append(dict(label=r["label"], area=g["from"][0], mx=r["mx"], dk=r["duckdb"], unit=unit,
+        out.append(dict(label=named(g, r), mx=r["mx"], dk=r["duckdb"], unit=unit,
                         lo=lo(r["mx"]) / hi(r["duckdb"]), hi=hi(r["mx"]) / lo(r["duckdb"]), next=g["next"]))
     return sorted(out, key=lambda g: -g["hi"])
 
@@ -271,11 +278,13 @@ def chart_behind(data, theme):
     rows = []
     for g in gaps(data):
         v = [g["lo"], g["hi"]] if g["hi"] - g["lo"] >= 0.05 else g["lo"]
-        rows.append(dict(label=f"{AREA[g['area']]} · {g['label']}", sub=(f"next: {g['next']}" if g["next"] else ""),
+        rows.append(dict(label=g["label"], sub=(f"next: {g['next']}" if g["next"] else ""),
                          bars=[("slow", v, (ratio_text(g['mx'], g['dk']), f"{fmt(g['mx'], g['unit'])} vs {fmt(g['dk'], g['unit'])}"))]))
-    ticks = [(1, "1x"), (2, "2x"), (3, "3x")]
+    top = max(g["hi"] for g in gaps(data))
+    ticks = [(v, f"{v}x") for v in range(1, int(top) + 2)]
+    # leave room right of the longest bar for its "5.8x  336 ms vs 58 ms" label
     return chart(theme, "Where we're still behind DuckDB", "how many times slower than DuckDB · 1x is a tie · shorter is better",
-                 [("slow", "MX frame time / DuckDB time")], rows, lambda v: (v - 1) / 2.6, ticks, FOOT)
+                 [("slow", "MX frame time / DuckDB time")], rows, lambda v: (v - 1) / ((top - 1) / 0.66), ticks, FOOT)
 
 
 def paper_frame(t, W, H, kicker, right):
