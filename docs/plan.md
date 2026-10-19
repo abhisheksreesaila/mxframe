@@ -1588,7 +1588,8 @@ Needs: F-158, F-159 · Size: M · core: `catalog.view` and a result cache keyed 
 Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 - [ ] one-to-many expansion inside the front stage (no materialized pairs for aggregates over m:n joins)
 - [ ] radix-partitioned probe when the table is over L3 / 2 and the probe ≥ 4x the build; runtime join filter (a bitmap of surviving probe keys trims the build side)
-- [ ] the Python engine's joins call the same kernel (closing F-046a slice 1), suites green
+- [ ] the Python engine's joins call the same kernel (closing F-046a slice 1; `libmxhashjoin_cpu.so` and its C ABI exist since F-153, nothing in Python calls them yet: "shared with the Python engine" is open), suites green
+- [ ] `Query.join` (F-153 review): it gathers every column of both tables and never fuses, so a big fact-to-dimension join hits the 3 GiB budget through the builder while the same join runs fused in SQL; carry only the columns the query after it reads and fuse where SQL does
 - [ ] informal timings on dbgen SF1 / SF10 (Q3, Q12, Q18 shapes, the random suite's join shape) through `mx` vs DuckDB, A/B against F-155
 
 ## F-162 M8 gate: TPC-H 22 and the random suite through `mx sql` equal DuckDB [todo]
