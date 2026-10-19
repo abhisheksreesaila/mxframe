@@ -1601,7 +1601,7 @@ struct _Binder(Movable):
                 return self.mk(B_LIT, kind, scale, -1, -1, pr.value, "", ast)
             if x.flag:
                 return self.null_of(kind, scale, ast)
-            raise self.err(ast, "cannot cast '" + ax.text + "' to " + tname + ((" (" + String(prec) + ", " + String(scale) + ")") if tname == "DECIMAL" else ""))
+            # not folded: the cast stays in the program, where the word is an error for a row that reaches it (a branch no row takes never raises)
         var fk = ax.kind
         var ok = False
         if fk == TEXT.value:

@@ -576,3 +576,53 @@ def test_past_the_register_limit_the_query_says_so(probe, data):
 def test_two_big_dictionaries_are_not_multiplied_silently(probe, data):
     res = run_probe(probe, "SELECT CAST(dt AS VARCHAR) || CAST(dt2 AS VARCHAR) FROM t", {"t": data.path}, expect_error=True)
     assert "combinations" in res["error"] and "never per row" in res["error"], res
+
+
+# ── review round: a converted float is an integer (its bits must not read as a NaN), casts that must not raise ──────────────────────────────
+
+FLOAT_KEYS = ["CAST(f AS BIGINT)", "TRY_CAST(f AS BIGINT)", "CAST(f AS DECIMAL(10,1))", "CAST(f AS INTEGER)", "COALESCE(CAST(f AS BIGINT), 7)", "CASE WHEN b THEN CAST(f AS BIGINT) END"]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("key", FLOAT_KEYS)
+def test_cast_float_results_as_keys_and_in_aggregates(probe, data, mode, key):
+    """Negative halfway floats (-2.5 is -2, -1.5 is -2, -0.5 is 0) as a group key, a DISTINCT key, a second key, MIN / MAX, median and count(DISTINCT):
+    -2 as int64 bits is a NaN pattern, which a float key would have merged with every NaN."""
+    guard = "f BETWEEN -1e15 AND 1e15"
+    k = f"CASE WHEN {guard} THEN {key} END"
+    for sql in [f"SELECT {k} AS k, count(*) FROM t GROUP BY 1", f"SELECT DISTINCT {k} FROM t", f"SELECT g, {k} AS k, count(*) FROM t GROUP BY 1, 2",
+                f"SELECT g, min({k}), max({k}), count(DISTINCT {k}), sum({k}) FROM t GROUP BY g",
+                f"SELECT min({k}), max({k}), count(DISTINCT {k}) FROM t"] + ([] if "DECIMAL" in key else [f"SELECT g, median({k}) FROM t GROUP BY g", f"SELECT median({k}) FROM t"]):
+        run(probe, data, sql, mode)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_try_cast_that_would_overflow_while_scaling_is_null(probe, data, mode):
+    big = "SELECT id, TRY_CAST({e} AS DECIMAL(18,4)) FROM t ORDER BY id"
+    for e in ["x * 100000000000000", "CAST(x AS BIGINT) * 99999999999999", "x * 1000000000000"]:
+        run(probe, data, big.format(e=e), mode, ordered=True)
+    res = run_probe(probe, "SELECT CAST(x * 100000000000000 AS DECIMAL(18,4)) FROM t", {"t": data.path}, mode=mode, edits=data.edits_path if mode in ("frame", "framescan") else None, expect_error=True)
+    assert "could not be converted" in res["error"], res
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_failing_cast_on_a_constant_waits_for_a_row_that_reaches_it(probe, data, mode):
+    run(probe, data, "SELECT id, CASE WHEN id < 0 THEN CAST('zz' AS INTEGER) ELSE x END AS v FROM t ORDER BY id", mode, ordered=True)
+    run(probe, data, "SELECT count(*) FROM t WHERE CASE WHEN id < 0 THEN CAST('zz' AS DATE) IS NULL ELSE true END", mode)
+    res = run_probe(probe, "SELECT CAST('zz' AS INTEGER) FROM t", {"t": data.path}, mode=mode, edits=data.edits_path if mode in ("frame", "framescan") else None, expect_error=True)
+    assert "could not be converted" in res["error"], res
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_cast_in_a_condition_only_runs_on_the_rows_the_earlier_conditions_keep(probe, data, mode):
+    """DuckDB stops at the first false conjunct: f = 1e300 never reaches CAST(f AS BIGINT). AND / OR gate the error flags by the left side, a frame's mask by the mask."""
+    for sql in ["SELECT count(*) FROM t WHERE f > -100 AND f < 100 AND CAST(f AS BIGINT) = -2",
+                "SELECT count(*) FROM t WHERE f BETWEEN -100 AND 100 AND CAST(f AS BIGINT) = -2 AND x > 0",
+                "SELECT count(*) FROM t WHERE NOT (f BETWEEN -100 AND 100) OR CAST(f AS BIGINT) = -2",
+                "SELECT count(*) FROM t WHERE f > 1e17 OR f < 1e17 AND CAST(f AS BIGINT) = 2"]:
+        try:
+            run(probe, data, sql, mode)
+        except Exception as e:
+            if "NOT (f BETWEEN" in sql or "f > 1e17" in sql:
+                continue                                                  # (DuckDB itself may evaluate the right side first there)
+            raise

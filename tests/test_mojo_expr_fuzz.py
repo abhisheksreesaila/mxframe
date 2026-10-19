@@ -168,6 +168,15 @@ def test_random_expressions_equal_duckdb(probe, data, seed):
             except AssertionError as e:
                 raise AssertionError(f"seed {seed}, {mode}, expression `{expr}`: {str(e)[:900]}") from None
         # the same expression as a condition, a group key and an aggregate argument
+        # casts of the expression: as a key, a DISTINCT key and under min / max (a converted value is an integer, whatever it was)
+        if kind in ("num", "dec"):
+            cast_ty = g.pick("BIGINT", "DECIMAL(12,1)", "DOUBLE")
+            ce = f"TRY_CAST({expr} AS {cast_ty})"
+            run(probe, data, f"SELECT {ce} AS k, count(*) FROM t GROUP BY 1", "table")
+            run(probe, data, f"SELECT DISTINCT {ce} FROM t", "framescan")
+            run(probe, data, f"SELECT g, min({ce}), max({ce}), count(DISTINCT {ce}) FROM t GROUP BY g", "table")
+        elif kind == "date":
+            run(probe, data, f"SELECT CAST(EXTRACT(dow FROM {expr}) AS BIGINT) AS k, count(*) FROM t GROUP BY 1", "table")
         if kind == "cond":
             for mode in ("table", "frame"):
                 run(probe, data, f"SELECT count(*), sum(x) FROM t WHERE {expr}", mode)
