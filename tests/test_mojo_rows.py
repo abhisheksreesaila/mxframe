@@ -19,7 +19,7 @@ from typing import List, Optional
 import pytest
 
 from mx_oracle import duck_kind, mx_binary, run_mx, typed_rows
-from test_mojo_sql import Dataset, data, probe, run_probe, got_rows, ROW_GROUPS  # noqa: F401  (fixtures)
+from test_mojo_sql import Dataset, data, probe, run_probe, got_rows, ROW_GROUPS, COLS  # noqa: F401  (fixtures)
 
 
 @pytest.fixture(scope="session")
@@ -51,8 +51,8 @@ class Q:
 
 def fetch(mode, ds, mx, probe, sql):
     """(rows, columns) of `sql` over the dataset in the given mode, typed."""
-    if mode == "frame":
-        res = run_probe(probe, sql, {"t": ds.path}, mode="frame", edits=ds.edits_path)
+    if mode in ("frame", "framescan"):
+        res = run_probe(probe, sql, {"t": ds.path}, mode=mode, edits=ds.edits_path)
         return got_rows(res), res["columns"], res["notes"]
     out = run_mx(mx, ["sql", "--max-rows", "0", "--stream", "always" if mode == "scan" else "never", sql], {"t": ds.path})
     return typed_rows(out), out["columns"], out["notes"]
@@ -125,7 +125,7 @@ QUERIES = [
 
 
 @pytest.mark.parametrize("ds_name", ["g8", "g10k"])
-@pytest.mark.parametrize("mode", ["table", "scan", "frame"])
+@pytest.mark.parametrize("mode", ["table", "scan", "frame", "framescan"])
 @pytest.mark.parametrize("q", QUERIES, ids=Q.id)
 def test_row_queries_equal_duckdb(mx, probe, data, ds_name, mode, q):
     check_query(mode, data[ds_name], mx, probe, q)
@@ -220,3 +220,32 @@ ROW_ERRORS = [
 def test_row_query_errors_say_what_and_where(probe, data, sql, message):
     res = run_probe(probe, sql, {"t": data["g8"].path}, expect_error=True)
     assert res.get("error") == message, res
+
+
+@pytest.mark.parametrize("mode", ["frame", "framescan"])
+def test_a_frames_formula_columns_come_out_of_row_queries(probe, data, mode):
+    """Formulas (f1 = d - x, f2 = f1 * 2, f3 = d + e) after 300 edits: selected, filtered and ordered like stored columns, and part of `*`."""
+    ds = data["g8"]
+    script = ds.edits_path.with_suffix(".rowformulas")
+    script.write_text(ds.edits_path.read_text() + "formula\tf1 = d - x\nformula\tf2 = f1 * 2\nformula\tf3 = d + e\n")
+    con = ds.edited
+    con.execute("create or replace view tf as select *, d - x as f1, (d - x) * 2 as f2, d + e as f3 from (select * exclude (rid) from src)")
+    queries = [
+        ("SELECT id, f1, f2, f3 FROM t WHERE f1 > 0", None),
+        ("SELECT * FROM t", None),
+        ("SELECT id, f2 FROM t ORDER BY f3 DESC NULLS LAST, id LIMIT 20", "SELECT id, f2 FROM tf ORDER BY f3 DESC NULLS LAST, id NULLS LAST LIMIT 20"),
+        ("SELECT DISTINCT k, f3 FROM t WHERE f3 BETWEEN -5 AND 5", None),
+    ]
+    for sql, duck in queries:
+        res = run_probe(probe, sql, {"t": ds.path}, mode=mode, edits=script)
+        got = got_rows(res)
+        cur = con.execute(duck or sql.replace(" FROM t", " FROM tf"))
+        want = cur.fetchall()
+        ordered = "ORDER BY" in sql
+        if ordered:
+            assert [tuple(r) for r in got] == [tuple(r) for r in want] or sorted(map(_canon, got), key=repr) == sorted(map(_canon, want), key=repr), f"{mode}: {sql}"
+            assert [r[0] for r in got] == [r[0] for r in want], f"{mode}: {sql}: order"
+        else:
+            assert Counter(map(_canon, got)) == Counter(map(_canon, want)), f"{mode}: {sql}"
+    star = run_probe(probe, "SELECT * FROM t", {"t": ds.path}, mode=mode, edits=script)
+    assert [c["name"] for c in star["columns"]] == [c[0] for c in COLS] + ["f1", "f2", "f3"]
