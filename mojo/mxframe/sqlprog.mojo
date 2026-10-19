@@ -1230,7 +1230,7 @@ struct _Emitter(Movable):
                     self.free(k)
                 elif ts < from_scale:
                     self.idiv_round_away(v.reg, pow10_checked(from_scale - ts))
-            if tk == DECIMAL.value and prec < 18:
+            if tk == DECIMAL.value:
                 var lim = pow10_checked(prec)
                 var b2 = self.out_of_range(v.reg, -(lim - 1), lim - 1)
                 bad = b2 if bad < 0 else self.or_nul(bad, b2)
@@ -1284,11 +1284,16 @@ struct _Emitter(Movable):
         var v = self.value(x.a)
         var ents = List[Int64](length=n, fill=0)
         var badb = List[UInt8](length=max(n, 1), fill=0)
+        var unsb = List[UInt8](length=max(n, 1), fill=0)
         var any_bad = False
+        var any_unsure = False
         for k in range(n):
             var r = parse_text(self.dicts.word(d, k), x.kind, x.scale, bits, prec)
             ents[k] = r.value
-            if not r.ok:
+            if r.unsure:
+                unsb[k] = 1
+                any_unsure = True
+            elif not r.ok:
                 badb[k] = 1
                 any_bad = True
         var fl = -1
@@ -1297,6 +1302,13 @@ struct _Emitter(Movable):
             self.ins(OP_I2F, fl, v.reg)
             var set_at = self.add_set(badb, 0)
             self.ins(OP_IN_SET, fl, fl, set_at)
+        if any_unsure:                                               # words whose meaning in DuckDB is a quirk: an error even for TRY_CAST
+            var fu = self.tmp()
+            self.ins(OP_I2F, fu, v.reg)
+            var set_u = self.add_set(unsb, 0)
+            self.ins(OP_IN_SET, fu, fu, set_u)
+            self.flag_errors(fu, v.nul, "the word is one of DuckDB's text quirks that MX frame does not read (a date such as `infinity`, a BC date, a decimal with an exponent): " + String(self.rx[e].text))
+            self.free(fu)
         self.tab(v.reg, ents)
         self.p.text_tabs += 1
         self.p.text_words += n

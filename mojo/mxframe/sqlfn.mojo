@@ -565,104 +565,138 @@ struct TFn(Copyable, Movable):
 
 
 # ── reading a word as a number, a date or a boolean (CAST from TEXT), once per word ────────────────────
+#
+# DuckDB's text casts have quirks (digit separators, hex and binary integers, a doubled sign on doubles, date words like `inf`, exponents on decimals
+# that round the wrong way), found by comparing against DuckDB word for word (tests/test_mojo_cast_fuzz.py). A word is read in one of three ways:
+# it reads (`ok`), it certainly does not (a TRY_CAST makes it NULL, a CAST fails), or its meaning in DuckDB is a quirk not reproduced here (`unsure`: a
+# CAST and a TRY_CAST both fail, so no answer is ever wrong).
 
 struct Parsed(Copyable, Movable):
-    """`ok`: the word reads as the type; `value`: its stored value (an integer, a scaled decimal, a day number, 0 / 1, a float's bits)."""
+    """`ok`: the word reads as the type; `value`: its stored value (an integer, a scaled decimal, a day number, 0 / 1, a float's bits); `unsure`: not decided."""
     var ok: Bool
     var value: Int64
+    var unsure: Bool
 
-    def __init__(out self, ok: Bool, value: Int64 = 0):
+    def __init__(out self, ok: Bool, value: Int64 = 0, unsure: Bool = False):
         self.ok = ok
         self.value = value
+        self.unsure = unsure
 
 
 def _is_space(b: UInt8) -> Bool:
     return b == UInt8(32) or (b >= UInt8(9) and b <= UInt8(13))
 
 
+def _is_digit_b(b: UInt8) -> Bool:
+    return b >= UInt8(48) and b <= UInt8(57)
+
+
+def _is_hex_b(b: UInt8) -> Bool:
+    return _is_digit_b(b) or (b >= UInt8(97) and b <= UInt8(102)) or (b >= UInt8(65) and b <= UInt8(70))
+
+
+def _trimmed(w: String) -> List[UInt8]:
+    var b = w.as_bytes()
+    var i = 0
+    var end = len(b)
+    while i < end and _is_space(b[i]):
+        i += 1
+    while end > i and _is_space(b[end - 1]):
+        end -= 1
+    var out = List[UInt8]()
+    for k in range(i, end):
+        out.append(b[k])
+    return out^
+
+
+def _unscore(t: List[UInt8], hexdigits: Bool, mut out: List[UInt8]) -> Bool:
+    """t without its digit separators: an underscore is one only between two digits (hex digits for a hex number); any other underscore is False."""
+    for i in range(len(t)):
+        if t[i] == UInt8(95):
+            var ok = i > 0 and i + 1 < len(t)
+            if ok:
+                ok = (_is_hex_b(t[i - 1]) and _is_hex_b(t[i + 1])) if hexdigits else (_is_digit_b(t[i - 1]) and _is_digit_b(t[i + 1]))
+            if not ok:
+                return False
+            continue
+        out.append(t[i])
+    return True
+
+
 struct _Num(Movable):
     var ok: Bool
     var neg: Bool
-    var mant: UInt128          # the significant digits (leading zeros dropped; at most 38 are kept)
+    var mant: UInt128          # all the digits as one number (leading zeros dropped)
+    var digits: Int            # how many significant digits it has
     var e10: Int               # the value is mant * 10^e10
-    var huge: Bool             # an integer digit was dropped: the value is at least 10^38
+    var has_exp: Bool
+    var odd: Bool              # a number whose exponent has no digits (`1e`, `5e-`): DuckDB reads some of those and not others
 
     def __init__(out self):
+        self.odd = False
         self.ok = False
         self.neg = False
         self.mant = UInt128(0)
+        self.digits = 0
         self.e10 = 0
-        self.huge = False
+        self.has_exp = False
 
 
-def _scan_number(w: String) -> _Num:
-    """`[ws] [+-] digits [. digits] [e [+-] digits] [ws]` (at least one digit before the exponent)."""
+def _scan_number(t: List[UInt8]) -> _Num:
+    """`[+-] digits [. digits] [e [+-] digits]` with at least one digit before the exponent (underscores already removed)."""
     var r = _Num()
-    var b = w.as_bytes()
-    var n = len(b)
+    var n = len(t)
     var i = 0
-    while i < n and _is_space(b[i]):
-        i += 1
-    var end = n
-    while end > i and _is_space(b[end - 1]):
-        end -= 1
-    if i >= end:
-        return r^
-    if b[i] == UInt8(45) or b[i] == UInt8(43):
-        r.neg = b[i] == UInt8(45)
-        i += 1
-    var digits = 0
+    if n > 0 and (t[0] == UInt8(45) or t[0] == UInt8(43)):
+        r.neg = t[0] == UInt8(45)
+        i = 1
+    var digits_seen = 0
     var frac = 0
     var in_frac = False
-    var kept = 0
-    var limit = UInt128(10) ** UInt128(37)
-    while i < end:
-        var c = b[i]
+    while i < n:
+        var c = t[i]
         if c == UInt8(46):
             if in_frac:
                 return r^
             in_frac = True
             i += 1
             continue
-        if c < UInt8(48) or c > UInt8(57):
+        if not _is_digit_b(c):
             break
-        digits += 1
-        var d = UInt128(Int(c) - 48)
-        if kept == 0 and d == UInt128(0):                      # a leading zero
-            if in_frac:
-                frac += 1
-        elif r.mant < limit:
-            r.mant = r.mant * UInt128(10) + d
-            kept += 1
-            if in_frac:
-                frac += 1
+        digits_seen += 1
+        if r.digits == 0 and c == UInt8(48):
+            pass                                             # a leading zero carries no weight
         else:
-            if not in_frac:
-                r.huge = True
-                frac -= 1                                      # a dropped integer digit is a factor of ten
+            if r.digits >= 38:
+                return r^                                    # more digits than this reads
+            r.mant = r.mant * UInt128(10) + UInt128(Int(c) - 48)
+            r.digits += 1
+        if in_frac:
+            frac += 1
         i += 1
-    if digits == 0:
+    if digits_seen == 0:
         return r^
     var ex = 0
-    if i < end:
-        if (b[i] | UInt8(32)) != UInt8(101):
+    if i < n:
+        if (t[i] | UInt8(32)) != UInt8(101):
             return r^
         i += 1
         var eneg = False
-        if i < end and (b[i] == UInt8(45) or b[i] == UInt8(43)):
-            eneg = b[i] == UInt8(45)
+        if i < n and (t[i] == UInt8(45) or t[i] == UInt8(43)):
+            eneg = t[i] == UInt8(45)
             i += 1
-        if i >= end:
+        if i >= n:
+            r.odd = True
             return r^
         var ed = 0
-        while i < end:
-            var d = Int(b[i]) - 48
-            if d < 0 or d > 9:
+        while i < n:
+            if not _is_digit_b(t[i]):
                 return r^
             if ed < 100000:
-                ed = ed * 10 + d
+                ed = ed * 10 + Int(t[i]) - 48
             i += 1
         ex = -ed if eneg else ed
+        r.has_exp = True
     r.e10 = ex - frac
     r.ok = True
     return r^
@@ -670,8 +704,6 @@ def _scan_number(w: String) -> _Num:
 
 def _scaled(r: _Num, scale: Int, mut out: Int64) -> Bool:
     """The number times 10^scale as an int64, halves rounded away from zero; False when it does not fit."""
-    if r.huge:
-        return False
     var k = r.e10 + scale
     var m = r.mant
     if m == UInt128(0):
@@ -696,17 +728,59 @@ def _scaled(r: _Num, scale: Int, mut out: Int64) -> Bool:
         m = q
     if m > (UInt128(9223372036854775808) if r.neg else UInt128(9223372036854775807)):
         return False
-    out = Int64(0) - Int64(m) if r.neg and m != UInt128(9223372036854775808) else (Int64.MIN if r.neg else Int64(m))
+    out = (Int64.MIN if m == UInt128(9223372036854775808) else Int64(0) - Int64(m)) if r.neg else Int64(m)
     return True
+
+
+def _parse_radix(t: List[UInt8], radix: Int, bits: Int) -> Parsed:
+    """`0x1F_FF` / `0b1010`: an unsigned number of the integer type (underscores between digits)."""
+    var digits = List[UInt8]()
+    var body = List[UInt8]()
+    for k in range(2, len(t)):
+        body.append(t[k])
+    if not _unscore(body, radix == 16, digits) or len(digits) == 0:
+        return Parsed(False)
+    var v = UInt128(0)
+    for d in digits:
+        var x = 0
+        if _is_digit_b(d):
+            x = Int(d) - 48
+        elif radix == 16 and _is_hex_b(d):
+            x = (Int(d | UInt8(32)) - 97) + 10
+        else:
+            return Parsed(False)
+        if x >= radix:
+            return Parsed(False)
+        v = v * UInt128(radix) + UInt128(x)
+        if v > UInt128(9223372036854775807):
+            return Parsed(False)
+    if bits < 64 and v >= (UInt128(1) << UInt128(bits - 1)):
+        return Parsed(False)
+    return Parsed(True, Int64(v))
 
 
 def parse_text(w: String, kind: Int, scale: Int, bits: Int, prec: Int) -> Parsed:
     """The word as a value of `kind` (a ColumnKind value): INT (its width in `bits`), DECIMAL (`scale` places, at most `prec` digits), FLOAT (`scale` is
-    F32_COLUMN for a 32-bit float), DATE or BOOL; not ok when it is not one."""
+    F32_COLUMN for a 32-bit float), DATE or BOOL; see the note above for `unsure`."""
     if kind == INT.value or kind == DECIMAL.value:
-        var r = _scan_number(w)
-        if not r.ok:
+        var t = _trimmed(w)
+        if len(t) == 0:
             return Parsed(False)
+        var plain = len(t) == len(w.as_bytes())                   # (hex and binary only without spaces around)
+        if kind == INT.value and len(t) > 2 and t[0] == UInt8(48) and plain:
+            var c1 = t[1] | UInt8(32)
+            if c1 == UInt8(120):
+                return _parse_radix(t, 16, bits)
+            if c1 == UInt8(98):
+                return _parse_radix(t, 2, bits)
+        var u = List[UInt8]()
+        if not _unscore(t, False, u):
+            return Parsed(False)
+        var r = _scan_number(u)
+        if not r.ok:
+            return Parsed(False, 0, r.odd)
+        if r.has_exp and (kind == DECIMAL.value or r.digits > 18 or r.e10 > 30 or r.e10 < -30):
+            return Parsed(False, 0, True)                     # DuckDB's exponents on decimals round oddly; a long mantissa with one overflows differently
         var v = Int64(0)
         if not _scaled(r, scale, v):
             return Parsed(False)
@@ -714,7 +788,7 @@ def parse_text(w: String, kind: Int, scale: Int, bits: Int, prec: Int) -> Parsed
             var lim = Int64(1) << Int64(bits - 1)
             if v < -lim or v >= lim:
                 return Parsed(False)
-        if kind == DECIMAL.value and prec < 18:
+        if kind == DECIMAL.value:
             var p = Int64(1)
             for _ in range(prec):
                 p *= 10
@@ -722,20 +796,22 @@ def parse_text(w: String, kind: Int, scale: Int, bits: Int, prec: Int) -> Parsed
                 return Parsed(False)
         return Parsed(True, v)
     if kind == FLOAT.value:
-        var b = w.as_bytes()
-        var i = 0
-        var end = len(b)
-        while i < end and _is_space(b[i]):
-            i += 1
-        while end > i and _is_space(b[end - 1]):
-            end -= 1
-        if i >= end:
+        var t = _trimmed(w)
+        if len(t) == 0:
             return Parsed(False)
-        var t = String(unsafe_from_utf8=b[i:end])
+        var u = List[UInt8]()
+        if not _unscore(t, False, u):
+            return Parsed(False)
+        var at = 0
+        if u[0] == UInt8(43):                                # DuckDB skips one plus sign itself, and the parser then reads an optional minus
+            at = 1
+            if len(u) == 1 or u[1] == UInt8(43):
+                return Parsed(False)
+        var text = String(unsafe_from_utf8=u[at:])
         var f = Float64(0.0)
-        var st = parse_float_text(t, f)
+        var st = parse_float_text(text, f)
         if st == F_RANGE:
-            f = Float64(from_bits=UInt64(0xFFF0000000000000 if t.startswith("-") else 0x7FF0000000000000))
+            f = Float64(from_bits=UInt64(0xFFF0000000000000 if text.startswith("-") else 0x7FF0000000000000))
         elif st != F_OK:
             return Parsed(False)
         if scale == F32_COLUMN:
@@ -754,39 +830,76 @@ def parse_text(w: String, kind: Int, scale: Int, bits: Int, prec: Int) -> Parsed
 
 
 def _parse_date_word(w: String) -> Parsed:
-    """`[ws] YYYY-M-D [ws]`: a year of 4 digits, a month and a day of 1 or 2."""
+    """DuckDB's date reader: leading spaces, [-] year digits, one of ` - / \\` twice, a month and a day of one or two digits, then anything that does not start
+    with a digit (a time, text). The words that mean other dates (`infinity`, `epoch`, `now`, `today`, ... and their abbreviations), BC dates and years past 9999
+    are not decided here."""
     var b = w.as_bytes()
-    var i = 0
-    var end = len(b)
-    while i < end and _is_space(b[i]):
-        i += 1
-    while end > i and _is_space(b[end - 1]):
-        end -= 1
-    var parts = List[Int]()
-    var digits = List[Int]()
-    var cur = 0
-    var nd = 0
-    while i <= end:
-        if i == end or b[i] == UInt8(45):
-            if nd == 0:
-                return Parsed(False)
-            parts.append(cur)
-            digits.append(nd)
-            cur = 0
-            nd = 0
-        elif b[i] >= UInt8(48) and b[i] <= UInt8(57):
-            cur = cur * 10 + Int(b[i]) - 48
-            nd += 1
-            if nd > 4:
-                return Parsed(False)
-        else:
+    var n = len(b)
+    var pos = 0
+    while pos < n and _is_space(b[pos]):
+        pos += 1
+    if pos >= n:
+        return Parsed(False)
+    var neg = False
+    if b[pos] == UInt8(45):
+        neg = True
+        pos += 1
+        if pos >= n:
             return Parsed(False)
-        i += 1
-    if len(parts) != 3 or digits[0] != 4 or digits[1] > 2 or digits[2] > 2:
+    var c0 = b[pos] | UInt8(32)
+    if c0 >= UInt8(97) and c0 <= UInt8(122):                  # a word: the specials (infinity, epoch, now, today, tomorrow, yesterday) or not a date
+        if c0 == UInt8(105) or c0 == UInt8(101) or c0 == UInt8(110) or c0 == UInt8(116) or c0 == UInt8(121):
+            return Parsed(False, 0, True)
         return Parsed(False)
-    var y = parts[0]
-    var m = parts[1]
-    var d = parts[2]
-    if y < 1 or m < 1 or m > 12 or d < 1 or d > _days_in_month(y, m):
+    var year = 0
+    var ydigits = 0
+    while pos < n and _is_digit_b(b[pos]):
+        year = year * 10 + Int(b[pos]) - 48
+        ydigits += 1
+        pos += 1
+        if year > 99999999:
+            return Parsed(False)
+    if pos >= n or ydigits == 0:
         return Parsed(False)
-    return Parsed(True, Int64(days_from_civil(y, m, d)))
+    var sep = b[pos]
+    pos += 1
+    if sep != UInt8(32) and sep != UInt8(45) and sep != UInt8(47) and sep != UInt8(92):
+        return Parsed(False)
+    var month = 0
+    var md = 0
+    while pos < n and md < 2 and _is_digit_b(b[pos]):
+        month = month * 10 + Int(b[pos]) - 48
+        md += 1
+        pos += 1
+    if md == 0 or pos >= n or b[pos] != sep:
+        return Parsed(False)
+    pos += 1
+    var day = 0
+    var dd = 0
+    while pos < n and dd < 2 and _is_digit_b(b[pos]):
+        day = day * 10 + Int(b[pos]) - 48
+        dd += 1
+        pos += 1
+    if dd == 0:
+        return Parsed(False)
+    if pos < n and _is_digit_b(b[pos]):
+        return Parsed(False)
+    var y = -year if neg else year
+    if month < 1 or month > 12 or day < 1:
+        return Parsed(False)
+    if y < 1 or y > 9999:
+        # a valid date in DuckDB's range that this engine's text and arithmetic do not cover (BC dates, five-digit years), else not a date
+        if day <= 31 and y > -5900000 and y <= 5900000:
+            return Parsed(False, 0, True)
+        return Parsed(False)
+    if day > _days_in_month(y, month):
+        return Parsed(False)
+    # a BC marker after the day changes the year: not decided
+    var rest = pos
+    while rest < n and _is_space(b[rest]):
+        rest += 1
+    if rest + 1 < n and (b[rest] | UInt8(32)) == UInt8(98) and (b[rest + 1] | UInt8(32)) == UInt8(99):
+        return Parsed(False, 0, True)
+    if rest < n and b[rest] == UInt8(40):
+        return Parsed(False, 0, True)
+    return Parsed(True, Int64(days_from_civil(y, month, day)))

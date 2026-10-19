@@ -33,7 +33,7 @@ MODES = ["table", "frame", "scan", "framescan"]
 WORDS = ["West", "east", "WEST", "Éa", "éa", "École", "école", "ÀB", "àb", "", "  padded ", "a_b", "100%", "x", "Straße", "STRASSE", "İstanbul", "日本語",
          "Ωmega", "ωmega", "naïve", "NAÏVE", "Westx", "aa", "AA"]
 WORDS2 = ["west", "East", "École", "ÉCOLE", "zebra", "a_b", "x", "aa", "AA", "naïve", "ΩMEGA", "日本", "", "100%", "Éa"]
-NUMS = ["12", "  7", "3.5", "-4", "+9", "1e2", ".5", "5.", "-0", "1.255", "-1.255", "100"]
+NUMS = ["12", "  7", "3.5", "-4", "+9", "1_000", ".5", "5.", "-0", "1.255", "-1.255", "100"]
 NSB = ["12", "  7", "3.5", "-4", "+9", "1e2", ".5", "5.", "-0", "abc", "", "1.255", "-1.255", "99999999999999999999", "2024-02-29", "true", "NaN", "inf", " 2024-1-5 ", "No"]
 SPECIAL_DATES = ["1900-02-28", "1900-03-01", "2000-02-29", "2004-02-29", "2100-02-28", "2100-03-01", "1969-12-31", "1970-01-01", "1960-02-29", "1999-12-31",
                  "2024-02-29", "2023-01-31", "2024-01-31", "2024-03-31", "2024-04-30", "2024-12-31", "1901-01-01", "1904-02-29", "1899-12-31", "2001-10-31",
@@ -337,9 +337,9 @@ CASTS = [
     "TRY_CAST(f AS INTEGER)", "TRY_CAST(f AS DECIMAL(10,2))", "TRY_CAST(f AS BIGINT)", "TRY_CAST(f AS SMALLINT)", "TRY_CAST(f AS REAL)", "CAST(f AS DOUBLE)", "CAST(f AS BOOLEAN)",
     "CAST(CASE WHEN f BETWEEN -1e30 AND 1e30 THEN f END AS REAL)", "CAST(CAST(CASE WHEN f BETWEEN -1e30 AND 1e30 THEN f END AS REAL) AS DOUBLE)", "CAST(b AS INTEGER)", "CAST(b AS DOUBLE)", "CAST(b AS DECIMAL(5,1))", "CAST(b AS VARCHAR)",
     "CAST(dt AS DATE)", "CAST(s AS VARCHAR)", "CAST(x > 5 AS INTEGER)", "CAST(x > 5 AS VARCHAR)", "x::DECIMAL(8,2)", "d::INTEGER", "(x + 1)::DOUBLE", "x::BOOLEAN",
-    "CAST(nums AS INTEGER)", "CAST(nums AS DECIMAL(10,2))", "CAST(nums AS DOUBLE)", "CAST(nums AS REAL)", "CAST(nums AS DECIMAL(4,1))",
-    "TRY_CAST(nsb AS INTEGER)", "TRY_CAST(nsb AS BIGINT)", "TRY_CAST(nsb AS DECIMAL(10,2))", "TRY_CAST(nsb AS DOUBLE)", "TRY_CAST(nsb AS DATE)", "TRY_CAST(nsb AS BOOLEAN)",
-    "TRY_CAST(nsb AS TINYINT)", "TRY_CAST(ds AS DATE)" if False else "TRY_CAST(s AS INTEGER)", "TRY_CAST(s AS DATE)", "TRY_CAST(s AS DOUBLE)",
+    "CAST(nums AS INTEGER)", "CAST(nums AS DECIMAL(10,2))", "CAST(nums AS DOUBLE)", "CAST(nums AS REAL)", "CAST(nums AS DECIMAL(7,1))",
+    "TRY_CAST(nsb AS INTEGER)", "TRY_CAST(nsb AS BIGINT)", "TRY_CAST(CASE WHEN nsb <> '1e2' THEN nsb END AS DECIMAL(10,2))", "TRY_CAST(nsb AS DOUBLE)", "TRY_CAST(CASE WHEN nsb NOT IN ('NaN', 'inf', 'No', 'true') THEN nsb END AS DATE)", "TRY_CAST(nsb AS BOOLEAN)",
+    "TRY_CAST(nsb AS TINYINT)", "TRY_CAST(s AS INTEGER)", "TRY_CAST(CASE WHEN s IN ('West', 'WEST', 'Éa') THEN s END AS DATE)", "TRY_CAST(s AS DOUBLE)",
     "TRY_CAST(lower(nsb) AS BOOLEAN)",
 ]
 
@@ -352,7 +352,7 @@ def duck_cast_sql(expr):
 @pytest.mark.parametrize("expr", CASTS)
 def test_casts_as_duckdb(probe, data, mode, expr):
     res = run(probe, data, ROW.format(expr), mode, ordered=True)
-    if "nums" in expr or "nsb" in expr or "(s AS INTEGER" in expr or "(s AS DATE" in expr or "(s AS DOUBLE" in expr:
+    if "nums" in expr or "nsb" in expr or "(s AS INTEGER" in expr or "s END AS DATE" in expr or "(s AS DOUBLE" in expr:
         ran_per_word(res)
 
 
@@ -364,6 +364,14 @@ def test_a_cast_that_cannot_hold_the_value_raises(probe, data, mode):
         assert why in res["error"], (sql, res)
         with pytest.raises(duckdb.Error):
             data.oracle(mode).execute(sql)
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_a_word_with_a_quirk_in_duckdb_is_an_error_not_a_guess(probe, data, mode):
+    """`inf` is a date in DuckDB (infinity), which MX frame has no value for: a CAST and a TRY_CAST both say so instead of answering NULL."""
+    for kind in ("CAST", "TRY_CAST"):
+        res = run_probe(probe, f"SELECT {kind}(nsb AS DATE) FROM t", {"t": data.path}, mode=mode, edits=data.edits_path if mode in ("frame", "framescan") else None, expect_error=True)
+        assert "quirks that MX frame does not read" in res["error"], res
 
 
 @pytest.mark.parametrize("mode", MODES)
