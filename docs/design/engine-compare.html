@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Mojo engine story: chosen look (B, editorial paper)</title>
+<link rel="stylesheet" href="../site/site.css">
+<style>
+  body { background: var(--bg); }
+  .wrap { max-width: 1480px; margin: 0 auto; padding: 28px 28px 80px; }
+  h1 { font-size: 28px; margin: 6px 0 6px; }
+  .lead { max-width: 900px; margin: 0 0 22px; }
+  .lab { font: 11px var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); margin: 18px 0 6px; }
+  .gh { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 14px; }
+  .gh.dark { background: #0d1117; border-color: #30363d; }
+  .gh img, .charts img { display: block; width: 100%; height: auto; border-radius: 14px; }
+  .pair, .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-items: start; }
+  .frames { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 22px; align-items: start; margin-top: 10px; }
+  .browser { border: 1px solid var(--border-hi); border-radius: 12px; overflow: hidden; background: var(--surface); box-shadow: var(--shadow-md); }
+  .browser .bar { display: flex; gap: 6px; align-items: center; padding: 9px 12px; background: var(--surface-2); border-bottom: 1px solid var(--border); font: 11px var(--font-mono); color: var(--text-dim); }
+  .browser .bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--border-hi); display: inline-block; }
+  .browser .bar span { margin-left: 10px; }
+  .browser img, .phone img { display: block; width: 100%; height: auto; }
+  .phone { border: 10px solid #1b1b22; border-radius: 34px; overflow: hidden; background: #000; box-shadow: var(--shadow-md); }
+  @media (max-width: 980px) { .pair, .charts, .frames { grid-template-columns: minmax(0, 1fr); } .phone { max-width: 320px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="read"><b>Decided 2026-10-19</b>The owner picked <b style="display:inline;font:inherit;letter-spacing:0;text-transform:none">B, editorial paper</b>: light ruled paper, one huge serif number (NOT EXISTS, 9 ms against DuckDB's 35), the other headline numbers in a ruled ledger column. It is now the only look, in the README and on <a href="../site/engine.html">engine.html</a>. The rejected option, A (a dark Terminal Ledger card with a violet glow and four equal headline tiles), was removed; it is in commit <code>a0151ff</code> if it is ever wanted again.</div>
+  <span class="kick">// design record · the Mojo engine</span>
+  <h1>B: editorial paper, one big serif number</h1>
+  <p class="lead">Every image is drawn by <code>scripts/make_engine_art.py</code> from <code>docs/bench/engine-informal.json</code>, which quotes <code>docs/mojo-engine.md</code>. Images are scaled down here; GitHub shows the hero about 830 px wide.</p>
+
+  <div class="pair">
+    <div><div class="lab">README hero, on GitHub light</div><div class="gh"><a href="../img/engine-hero.svg"><img src="../img/engine-hero.svg" alt="README hero"></a></div></div>
+    <div><div class="lab">README hero, on GitHub dark</div><div class="gh dark"><a href="../img/engine-hero.svg"><img src="../img/engine-hero.svg" alt="README hero on dark"></a></div></div>
+  </div>
+  <div class="lab">Charts (the README uses "leads" and "still behind")</div>
+  <div class="charts">
+    <a href="../img/engine-wins.svg"><img src="../img/engine-wins.svg" alt="Where the engine leads DuckDB"></a>
+    <a href="../img/engine-behind.svg"><img src="../img/engine-behind.svg" alt="Where the engine is still behind DuckDB"></a>
+    <a href="../img/engine-read.svg"><img src="../img/engine-read.svg" alt="Reading files at memory speed"></a>
+  </div>
+
+  <h2 style="margin-top:36px">The page: docs/site/engine.html</h2>
+  <p>1440 × 900 in light and dark (the hero follows the theme toggle), and a phone at 390 wide. The live page loads its JSON, so open it through a server (<code>python -m http.server -d docs</code>) or on GitHub Pages.</p>
+  <div class="frames">
+    <div style="display:grid;gap:18px">
+      <div class="browser"><div class="bar"><i></i><i></i><i></i><span>abhisheksreesaila.github.io/mxframe/engine.html · light</span></div><img src="img/engine-page-1440.png" alt="engine.html at 1440 wide, light"></div>
+      <div class="browser"><div class="bar"><i></i><i></i><i></i><span>abhisheksreesaila.github.io/mxframe/engine.html · dark</span></div><img src="img/engine-page-1440-dark.png" alt="engine.html at 1440 wide, dark"></div>
+    </div>
+    <div class="phone"><img src="img/engine-page-390.png" alt="engine.html on a phone"></div>
+  </div>
+</div>
+</body>
+</html>

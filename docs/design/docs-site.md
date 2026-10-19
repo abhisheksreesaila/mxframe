@@ -16,8 +16,10 @@ Mockup: `design/docs-site.html` (options A, B and C; open it in a browser). Chos
   | MXFrame `--mx` | `#2a78d6` | `#3987e5` |
   | DuckDB `--dk` | `#1baf7a` | `#199e70` |
   | Polars `--pl` | `#eb6834` | `#d95926` |
+  | pyarrow `--pa` (engine page) | `#eda100` | `#c98500` |
 
-  - Light mode warns that DuckDB's green is below 3:1 contrast, so every chart has a legend and a data-table view.
+  - MX, DuckDB and pyarrow together pass `--pairs all` on both surfaces (2026-10-19); violet failed against MX blue, so pyarrow is slot 4 yellow.
+  - Light mode warns that DuckDB's green (and pyarrow's yellow) is below 3:1 contrast, so every chart has a legend and a data-table view.
   - Speedup chart: `--fast` = MXFrame's blue, `--slow` = `#e34948` light / `#e66767` dark, `--mid` = `#8f8e88` for the 1x line.
 
 ## Components
@@ -37,3 +39,8 @@ Mockup: `design/docs-site.html` (options A, B and C; open it in a browser). Chos
   - the sidebar becomes a top menu;
   - grids collapse to one column;
   - the dot plot keeps its log axis, with the chart scrolling sideways at a fixed minimum width of 560px.
+
+## The Mojo engine page and README art (2026-10-19)
+- `docs/site/engine.html` and `docs/img/engine-*.svg` are drawn from one file, `docs/bench/engine-informal.json`, which quotes `docs/mojo-engine.md` (`tests/test_site_engine.py` checks every number). Regenerate the SVGs with `pixi run python scripts/make_engine_art.py`.
+- Look: **editorial paper** (picked 2026-10-19 over a dark Terminal Ledger glow; record in `docs/design/engine-compare.html`, the dark option is in commit `a0151ff`). Light ruled paper, one huge serif number (`--font-display`), the other headline numbers in a ruled ledger column, plum accent.
+- The page hero uses the site tokens, so it follows the light / dark toggle (dark uses `--accent-hi` for the serif units). The SVGs use system font stacks only (GitHub strips web fonts and scripts).

@@ -1,4 +1,4 @@
-<img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/visualize/mx-spark.svg" alt="MXFrame MX lightning mark" width="72">
+<img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-hero.svg" alt="MX frame, the Mojo engine: a data engine kernel apps and agents build on. Streamed 20M-row query 0.14 s (DuckDB 0.18 s); NOT EXISTS 9 ms (DuckDB 35 ms); median at 1M groups 398 ms (DuckDB 2,208 ms); a 1.6 GB file in 72 MB. Informal timings on a shared machine." width="100%">
 
 # MXFrame
 
@@ -6,6 +6,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/mxframe?color=f97316)](https://pypi.org/project/mxframe/) [![Mojo](https://img.shields.io/badge/engine-Mojo%201.1-ff4f00)](https://github.com/abhisheksreesaila/mxframe/tree/main/mojo) [![Mojo API](https://img.shields.io/badge/Mojo%20API-no%20Python-22c55e)](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mxframe-mojo-api.md) [![GPU](https://img.shields.io/badge/GPU-NVIDIA-76b900)](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) [![Python](https://img.shields.io/badge/python-3.12%2B-3776ab)](https://github.com/abhisheksreesaila/mxframe/blob/main/pyproject.toml) [![Docs](https://img.shields.io/badge/docs-interactive-a855f7)](https://abhisheksreesaila.github.io/mxframe/)
 
+🔥 **[The Mojo engine: what it does and how it got fast →](https://abhisheksreesaila.github.io/mxframe/engine.html)** ([long form](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mojo-engine.md): every number, and where it is still behind)<br>
 📖 **[Interactive docs](https://abhisheksreesaila.github.io/mxframe/)**: [benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) · [how `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [how it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html)
 
 ## 🔥 Two ways in
@@ -15,8 +16,10 @@
 | For | notebooks, pipelines, SQL | apps and agents compiled in Mojo, e.g. [omxplorer](https://github.com/abhisheksreesaila/mxapp) |
 | Python | Arrow in, Arrow out | **none**: no libpython, links on Linux and macOS (arm64) |
 | Devices | 🟦 CPU · 🟩 GPU · 🟪 auto (a cost model calibrated on your machine) | 🟦 CPU · 🟩 GPU · 🟪 AUTO (GPU when a device copy is attached, CPU fallback with its reason) |
-| Bigger than memory | 💾 streams files, spills big joins to disk (Grace hash join) | 🚧 streamed Parquet in progress (F-140); in memory today |
+| Bigger than memory | 💾 streams files, spills big joins to disk (Grace hash join) | 💾 streams Parquet a row group at a time: a 1.6 GB file in 72 MB, with edits and save over it |
 | Data | Parquet, Arrow, SQL | CSV (parallel, typed, import report), Parquet (zstd / snappy), edits, undo, formulas |
+
+<img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-wins.svg" alt="Where the Mojo engine leads DuckDB: SQL, joins and aggregates, from 11.9x (1M groups out) to 1.3x (join + group sum). Informal timings." width="100%"> <img src="https://raw.githubusercontent.com/abhisheksreesaila/mxframe/main/docs/img/engine-behind.svg" alt="Where the Mojo engine is still behind DuckDB: one-to-many LEFT join 2.6x, full sort 2.4x, ORDER BY LIMIT 2.1x, probe-side filter 1.5x, streamed with 20 row groups 1.3-1.4x, two-column key 1.4x, 8 groups 1.3x. Informal timings." width="100%">
 
 ```mermaid
 flowchart LR
@@ -134,6 +137,4 @@ SQL covers `SELECT`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN … ON` and
 
 [Benchmarks](https://abhisheksreesaila.github.io/mxframe/benchmarks.html) ([tables](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/benchmarks.md)) · [Behind the scenes](https://abhisheksreesaila.github.io/mxframe/internals.html) · [How it got fast](https://abhisheksreesaila.github.io/mxframe/how-it-got-fast.html) ([long form](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md)) · [How `device="auto"` decides](https://abhisheksreesaila.github.io/mxframe/auto-mode.html) · [API notes](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/api.md) · [Architecture](https://github.com/abhisheksreesaila/mxframe/blob/main/docs/vision-and-architecture.md) · [Kernel visualizer](https://abhisheksreesaila.github.io/mxframe/visualize/mxframe_pipeline.html) · [Changelog](https://github.com/abhisheksreesaila/mxframe/blob/main/CHANGELOG.md) · [0.6.0 notes](https://github.com/abhisheksreesaila/mxframe/blob/main/RELEASE_NOTES_0.6.0.md) · [Contributing](https://github.com/abhisheksreesaila/mxframe/blob/main/CONTRIBUTING.md)
 
-Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`.
-
-License: [Apache-2.0](https://github.com/abhisheksreesaila/mxframe/blob/main/LICENSE).
+Build from source with [pixi](https://pixi.sh): `git clone https://github.com/abhisheksreesaila/mxframe && cd mxframe && pixi install && pixi run test`. License: [Apache-2.0](https://github.com/abhisheksreesaila/mxframe/blob/main/LICENSE).
