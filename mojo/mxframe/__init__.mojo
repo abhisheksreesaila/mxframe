@@ -10,3 +10,6 @@ from .parquet import write_parquet, read_parquet, scan_parquet, ParquetResult, P
 from .csv import read_csv, CsvOptions, CsvResult, CsvColumn, FailedRow
 from .frame import Frame, Formula
 from .gpu import DeviceTable, gpu_available
+from .bind import Catalog
+from .planner import PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED
+from .sqlexec import sql, SqlResult

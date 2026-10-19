@@ -35,6 +35,10 @@ struct SqlSource(Copyable, Movable):
     var overlay: Overlay             # a frame's edits as of registration (empty otherwise)
     var framed: Bool
     var version: Int                 # a frame's edit counter when it was registered: stats are cached per version
+    var range_cols: List[Int]        # the planner's cache of integer-like column ranges: column, lowest, highest, has values
+    var range_lo: List[Int64]
+    var range_hi: List[Int64]
+    var range_has: List[Bool]
 
     def __init__(out self, name: String, table: SharedTable):
         self.name = name
@@ -44,6 +48,10 @@ struct SqlSource(Copyable, Movable):
         self.overlay = Overlay(table)
         self.framed = False
         self.version = 0
+        self.range_cols = List[Int]()
+        self.range_lo = List[Int64]()
+        self.range_hi = List[Int64]()
+        self.range_has = List[Bool]()
 
     def columns(self) -> Int:
         return self.table.columns()
