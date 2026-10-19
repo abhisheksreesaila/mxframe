@@ -13,7 +13,8 @@ What it decides today: the group strategy.
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
 from .table import ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL
-from .bind import (BoundQuery, BExpr, SqlSource, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_NULL, B_IDIV, B_IMOD, kind_name)
+from .bind import (BoundQuery, BExpr, SqlSource, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
+                   B_NEG, B_RESCALE, kind_name)
 
 comptime GROUP_AUTO = 0
 comptime GROUP_DENSE = 1
@@ -122,14 +123,99 @@ def expr_nullable(q: BoundQuery, e: Int, st: Stats) -> Bool:
     ref x = q.rexprs[e]
     if x.op == B_COL:
         return st.cols[Int(x.value)].nullable
-    if x.op == B_NULL or x.op == B_IDIV or x.op == B_IMOD:
+    if x.op == B_NULL:
         return True
     var r = False
+    if x.op == B_IDIV or x.op == B_IMOD:                           # a division is NULL where the divisor is zero: not by a nonzero constant
+        if not (q.rexprs[x.b].op == B_LIT and q.rexprs[x.b].value != 0):
+            r = True
     if x.a >= 0:
         r = r or expr_nullable(q, x.a, st)
     if x.b >= 0:
         r = r or expr_nullable(q, x.b, st)
     return r
+
+
+struct Interval(Copyable, Movable):
+    """The values an integer-like expression can take, when the statistics bound them."""
+    var ok: Bool
+    var lo: Int64
+    var hi: Int64
+
+    def __init__(out self, ok: Bool, lo: Int64 = 0, hi: Int64 = 0):
+        self.ok = ok
+        self.lo = lo
+        self.hi = hi
+
+
+comptime _BOUND = Int64(1) << 60             # intervals past this are given up on (the arithmetic stays far from int64's edge)
+
+
+def _in_bound(x: Int64) -> Bool:
+    return -_BOUND < x < _BOUND
+
+
+def interval(q: BoundQuery, e: Int, st: Stats) -> Interval:
+    """Interval arithmetic over a row-level expression from the columns' ranges: a key such as `x % 10`, `x // 100` or `a + 1` then
+    has a known domain and can use the dense strategy. Not ok when a column has no range, or the expression is a division by a
+    non-constant."""
+    ref x = q.rexprs[e]
+    if x.op == B_LIT:
+        return Interval(True, x.value, x.value)
+    if x.op == B_COL:
+        ref cs = st.cols[Int(x.value)]
+        if x.kind == TEXT.value:
+            return Interval(True, 0, Int64(max(cs.words - 1, 0)))
+        if x.kind == BOOL.value:
+            return Interval(True, 0, 1)
+        return Interval(cs.has_range and _in_bound(cs.lo) and _in_bound(cs.hi), cs.lo, cs.hi)
+    if x.op == B_NEG or x.op == B_RESCALE:
+        var a = interval(q, x.a, st)
+        if not a.ok:
+            return Interval(False)
+        if x.op == B_NEG:
+            return Interval(True, -a.hi, -a.lo)
+        var m = Int64(1)
+        for _ in range(Int(x.value)):
+            m *= 10
+        if not (_in_bound(a.lo) and _in_bound(a.hi)) or (a.hi != 0 and abs(a.hi) > _BOUND // m) or (a.lo != 0 and abs(a.lo) > _BOUND // m):
+            return Interval(False)
+        return Interval(True, a.lo * m, a.hi * m)
+    if x.op == B_ADD or x.op == B_SUB or x.op == B_MUL or x.op == B_IDIV or x.op == B_IMOD:
+        var a = interval(q, x.a, st)
+        var b = interval(q, x.b, st)
+        if not a.ok or not b.ok:
+            return Interval(False)
+        if x.op == B_ADD:
+            return Interval(_in_bound(a.lo + b.lo) and _in_bound(a.hi + b.hi), a.lo + b.lo, a.hi + b.hi)
+        if x.op == B_SUB:
+            return Interval(_in_bound(a.lo - b.hi) and _in_bound(a.hi - b.lo), a.lo - b.hi, a.hi - b.lo)
+        if x.op == B_MUL:
+            var corners = [a.lo, a.hi]
+            var lo = Int64.MAX
+            var hi = Int64.MIN
+            for u in corners:
+                for v in [b.lo, b.hi]:
+                    var big = Float64(u) * Float64(v)
+                    if big > 1.0e18 or big < -1.0e18:
+                        return Interval(False)
+                    lo = min(lo, u * v)
+                    hi = max(hi, u * v)
+            return Interval(_in_bound(lo) and _in_bound(hi), lo, hi)
+        if b.lo != b.hi or b.lo == 0:                                # a division by a constant only
+            return Interval(False)
+        var c = b.lo
+        if x.op == B_IDIV:
+            var p = a.lo // c if (a.lo >= 0) == (c > 0) or a.lo % c == 0 else a.lo // c + 1     # truncating
+            var r = a.hi // c if (a.hi >= 0) == (c > 0) or a.hi % c == 0 else a.hi // c + 1
+            return Interval(True, min(p, r), max(p, r))
+        var m = (abs(c) - 1)
+        if a.lo >= 0:
+            return Interval(True, 0, m)
+        if a.hi <= 0:
+            return Interval(True, -m, 0)
+        return Interval(True, -m, m)
+    return Interval(False)
 
 
 def commas(n: Int) -> String:
@@ -196,10 +282,21 @@ struct RulePlanner(Planner, Copyable, Movable):
                     radix += 1
                 layout.radix = radix
             else:
-                dense_ok = False
-                if why_not.byte_length() == 0:
-                    why_not = "`" + q.keys[k].name + "` is an expression, so its range is unknown"
                 layout.nullable = expr_nullable(q, q.keys[k].expr, st)
+                var iv = interval(q, q.keys[k].expr, st)
+                var radix = -1
+                if iv.ok:
+                    layout.lo = iv.lo
+                    var span = Int(iv.hi) - Int(iv.lo)
+                    radix = span + 1 if span >= 0 and span < (1 << 40) else -1
+                if radix < 0:
+                    dense_ok = False
+                    if why_not.byte_length() == 0:
+                        why_not = "the range of `" + q.keys[k].name + "` is " + ("too wide" if iv.ok else "unknown: it is not a column or an expression the statistics bound")
+                    radix = 1
+                if layout.nullable:
+                    radix += 1
+                layout.radix = radix
             layout.words = 1 + (1 if layout.nullable else 0)
             if dense_ok:
                 if domain > (1 << 40) // max(layout.radix, 1):

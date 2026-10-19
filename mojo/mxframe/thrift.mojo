@@ -162,6 +162,21 @@ struct ThriftReader(Movable):
         self.pos += n
         return s^
 
+    def le_value(mut self) raises -> Tuple[Int, Int64]:
+        """A binary field read as a little-endian signed integer (how Parquet statistics store an INT32 or INT64 minimum and
+        maximum, no UTF-8 check): (its length in bytes, the value; 0 unless the length is 4 or 8)."""
+        var n = self.length()
+        var v = Int64(0)
+        if n == 4 or n == 8:
+            var u = UInt64(0)
+            for i in range(n):
+                u |= UInt64(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=self.base + self.pos)[i]) << UInt64(8 * i)
+            if n == 4 and (u >> 31) & 1 == 1:
+                u |= ~UInt64(0) << 32
+            v = Int64(u)
+        self.pos += n
+        return (n, v)
+
     def list_header(mut self) raises -> Tuple[Int, Int]:
         """(element type, size)."""
         var b = self.byte()

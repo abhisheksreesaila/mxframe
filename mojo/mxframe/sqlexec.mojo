@@ -91,7 +91,39 @@ def _hash_group(kw: List[List[Int64]], g: Int) -> UInt64:
     return h
 
 
-def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int]) raises:
+struct _KeyIndex(Movable):
+    """The hash table from key words to group number over an accumulator's groups, kept across the merges of a scan's row
+    groups: it grows when the groups do, and only the groups added since it last looked are inserted."""
+    var table: List[Int32]
+    var mask: UInt64
+    var indexed: Int
+
+    def __init__(out self):
+        self.table = List[Int32](length=16, fill=-1)
+        self.mask = 15
+        self.indexed = 0
+
+    def insert(mut self, acc: Partial, g: Int):
+        var pos = Int(_hash_group(acc.kw, g) & self.mask)
+        while self.table[pos] >= 0:
+            pos = (pos + 1) & Int(self.mask)
+        self.table[pos] = Int32(g)
+
+    def sync(mut self, acc: Partial, room: Int):
+        """Makes room for `room` more groups and indexes the groups acc gained since."""
+        var cap = len(self.table)
+        if 2 * (acc.groups() + room) > cap:
+            while cap < 2 * (acc.groups() + room):
+                cap *= 2
+            self.table = List[Int32](length=cap, fill=-1)
+            self.mask = UInt64(cap - 1)
+            self.indexed = 0
+        for g in range(self.indexed, acc.groups()):
+            self.insert(acc, g)
+        self.indexed = acc.groups()
+
+
+def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int], mut ix: _KeyIndex) raises:
     """Folds `other`'s groups into `acc` by key."""
     var og = other.groups()
     if og == 0:
@@ -101,21 +133,12 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int]) raises:
         acc.counts = other.counts.copy()
         acc.kw = other.kw.copy()
         return
-    var cap = 16
-    while cap < 2 * (acc.groups() + og):
-        cap *= 2
-    var table = List[Int32](length=cap, fill=-1)
-    var mask = UInt64(cap - 1)
-    for g in range(acc.groups()):
-        var pos = Int(_hash_group(acc.kw, g) & mask)
-        while table[pos] >= 0:
-            pos = (pos + 1) & Int(mask)
-        table[pos] = Int32(g)
+    ix.sync(acc, og)
     for o in range(og):
-        var pos = Int(_hash_group(other.kw, o) & mask)
+        var pos = Int(_hash_group(other.kw, o) & ix.mask)
         var found = -1
-        while table[pos] >= 0:
-            var g = Int(table[pos])
+        while ix.table[pos] >= 0:
+            var g = Int(ix.table[pos])
             var same = True
             for k in range(len(acc.kw)):
                 if acc.kw[k][g] != other.kw[k][o]:
@@ -124,7 +147,7 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int]) raises:
             if same:
                 found = g
                 break
-            pos = (pos + 1) & Int(mask)
+            pos = (pos + 1) & Int(ix.mask)
         if found < 0:
             found = acc.groups()
             for s in range(len(acc.slots)):
@@ -132,7 +155,8 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int]) raises:
             acc.counts.append(other.counts[o])
             for k in range(len(acc.kw)):
                 acc.kw[k].append(other.kw[k][o])
-            table[pos] = Int32(found)
+            ix.table[pos] = Int32(found)
+            ix.indexed = acc.groups()
             continue
         for s in range(len(acc.slots)):
             var a = acc.slots[s][found]
@@ -300,24 +324,39 @@ def _is_range_kind(k: Int) -> Bool:
     return k == INT.value or k == DECIMAL.value or k == DATE.value
 
 
+def _key_columns(q: BoundQuery, e: Int, mut out: List[Int]):
+    """The integer-like source columns a row-level expression reads."""
+    ref x = q.rexprs[e]
+    if x.op == B_COL and _is_range_kind(x.kind):
+        var c = Int(x.value)
+        for k in out:
+            if k == c:
+                return
+        out.append(c)
+    if x.a >= 0:
+        _key_columns(q, x.a, out)
+    if x.b >= 0:
+        _key_columns(q, x.b, out)
+
+
 def prepare_ranges(mut catalog: Catalog, q: BoundQuery) raises:
-    """Caches the value range of each integer-like column the query groups by (a table or frame source; a scan has none)."""
+    """Caches the value range of each integer-like column a group key reads: one pass over a table or frame's column (the frame's
+    changed rows included), the row groups' statistics for a scan (none when a row group states none, then it is hashed)."""
     ref src = catalog.sources[q.source]
-    if src.kind == SRC_SCAN:
-        return
+    var cols = List[Int]()
     for k in q.keys:
-        var e = q.rexprs[k.expr].copy()
-        if e.op != B_COL or not _is_range_kind(e.kind):
-            continue
-        var c = Int(e.value)
+        _key_columns(q, k.expr, cols)
+    for c in cols:
         var cached = False
         for x in src.range_cols:
             if x == c:
                 cached = True
         if cached:
             continue
-        var r = _column_range(src.table, c)
-        var has = r[0]
+        var r = _column_range(src.table, c) if src.kind != SRC_SCAN else src.scan.value().column_range(c)
+        if src.kind == SRC_SCAN and not r[0]:
+            continue                                       # no statistics: the planner will say so
+        var has = r[0] and r[1] <= r[2] if src.kind == SRC_SCAN else r[0]
         var lo = r[1]
         var hi = r[2]
         for row in src.overlay.delta:                      # a frame's changed and appended rows
@@ -359,7 +398,7 @@ def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess) raises -> Stats
     for c in range(src.table.columns()):
         var cs = ColStat(src.table.kind(c).value, src.table.scale(c))
         if src.kind == SRC_SCAN:
-            cs.nullable = True
+            cs.nullable = src.scan.value().null_count(c) != 0 or _delta_nulls(src, c)
         else:
             cs.nullable = src.table.null_count(c) > 0 or _delta_nulls(src, c)
         if cs.kind == TEXT.value:
@@ -888,10 +927,10 @@ def _all(n: Int) -> List[Int]:
 
 
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut acc: Partial, mut dense_acc: QueryResult) raises:
+          mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator."""
     if plan.group == G_HASHED:
-        _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads), ops)
+        _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads), ops, ix)
         return
     var r: QueryResult
     if sp.p.mat:
@@ -1118,7 +1157,7 @@ def _inputs(src: SqlSource, q: BoundQuery) raises -> _Inputs:
         for c in range(n_cols):
             inp.pos[c] = c
     for c in range(n_cols):
-        inp.nullable.append(inp.scan_mode or src.table.null_count(c) > 0 or _delta_nulls(src, c))
+        inp.nullable.append((src.scan.value().null_count(c) != 0 if inp.scan_mode else src.table.null_count(c) > 0) or _delta_nulls(src, c))
     inp.masked = len(src.overlay.mask) > 0
     return inp^
 
@@ -1155,14 +1194,19 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
              HolStates(1, List[HolSpec](), List[List[Int64]]())
     var domain = plan.domain if plan.group == G_DENSE else 1
     var acc = Partial()
+    var ix = _KeyIndex()
     var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
     var ch = _open_chunks(src, used)
     var delta_rows = len(src.overlay.delta)
     var t_run = perf_counter_ns()
+    var ns_load = 0
     for i in range(ch.n()):
+        var t_load = perf_counter_ns()
         var chunk = _load_chunk(src, ch, i)
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc)
+        ns_load += perf_counter_ns() - t_load
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix)
     var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
+    var ms_load = Float64(ns_load) / 1e6
     if src.kind == SRC_FRAME:
         notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
                      commas(delta_rows) + " changed or appended rows")
@@ -1198,7 +1242,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             hol_of[hs.specs[h].agg] = h
     var t_fin = perf_counter_ns()
     var table = _finish(q, plan, sp, acc, hres, hol_of, dicts, notes)
-    notes.append("time: kernel " + _ms(ms_run) + " ms, holistic states " + _ms(Float64(t_fin - t_hol) / 1e6) + " ms, finish " + _ms(Float64(perf_counter_ns() - t_fin) / 1e6) + " ms")
+    notes.append("time: " + ("decode " + _ms(ms_load) + " ms, " if scan_mode else "") + "kernel " + _ms(ms_run - ms_load) + " ms, holistic states " + _ms(Float64(t_fin - t_hol) / 1e6) + " ms, finish " + _ms(Float64(perf_counter_ns() - t_fin) / 1e6) + " ms")
     return table^
 
 

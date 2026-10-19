@@ -232,7 +232,10 @@ class Dataset:
         group_rows = -(-n // ROW_GROUPS)
         con = duckdb.connect()
         make_source(con, n, groups, seed)
-        pq.write_table(con.execute("select * exclude (rid) from src order by rid").to_arrow_table(), self.path, row_group_size=group_rows)
+        table = con.execute("select * exclude (rid) from src order by rid").to_arrow_table()
+        pq.write_table(table, self.path, row_group_size=group_rows)
+        self.nostats = directory / f"{name}.nostats.parquet"
+        pq.write_table(table, self.nostats, row_group_size=group_rows, write_statistics=False)
         self.table = duckdb.connect()
         self.table.execute(f"create table t as select * from read_parquet('{self.path}')")
         self.table.execute("set threads=4")
@@ -260,13 +263,16 @@ def data(tmp_path_factory):
 
 def expected_group(keys, ds, mode, kinds, con, rows):
     """The strategy RulePlanner's documented rule picks: dense when every key is a column with a known range (a TEXT / BOOL column
-    always has one; an integer column only in a table or frame) and the domain is small or no more than 4x the rows."""
+    always has one; an integer column has the table's, the frame's or the row groups' statistics) and the domain is small or no more
+    than 4x the rows. An expression key is hashed here (the planner bounds some of them: the tests that use one say what they expect)."""
     if not keys:
         return "none"
     domain = 1
     for key in keys:
         if key == "expr":
             return "hashed"
+        if key == "dense":                           # an expression the planner bounds from the columns' ranges (x % 10, x // 3)
+            continue
         kind = kinds[key]
         if kind == "text":
             n_words = con.execute(f"select count(distinct {key}) from t").fetchone()[0]
@@ -274,8 +280,6 @@ def expected_group(keys, ds, mode, kinds, con, rows):
         elif kind == "bool":
             domain *= 3
         else:
-            if mode in ("scan", "framescan"):
-                return "hashed"
             span = con.execute(f"select max({key}) - min({key}) from t").fetchone()[0]
             domain *= (span + 1) + 1
     return "dense" if domain <= 4_194_304 and (domain <= 65_536 or domain <= 4 * rows) else "hashed"
@@ -330,7 +334,7 @@ QUERIES = [
       keys=["s"], ordered=True, duck="SELECT s, count(*), avg(x), median(x), min(dt) FROM t GROUP BY s ORDER BY lower(s) NULLS LAST, s NULLS LAST"),
     Q("SELECT dt, count(*) FROM t GROUP BY dt ORDER BY dt DESC LIMIT 5", keys=["dt"], ordered=True),
     Q("SELECT b, count(*), sum(x), min(s) FROM t GROUP BY b", keys=["b"], duck="SELECT b, count(*), sum(x), arg_min(s, (lower(s), s)) FROM t GROUP BY b"),
-    Q("SELECT x % 10, x // 3, count(*) FROM t GROUP BY x % 10, x // 3", keys=["expr"], tag="expr-keys"),
+    Q("SELECT x % 10, x // 3, count(*) FROM t GROUP BY x % 10, x // 3", keys=["dense"], tag="expr-keys"),
     Q("SELECT g, sum(x) / count(*), max(d) - min(d), sum(d) / sum(x), sum(x) + 1.5, count(*) * 2 FROM t GROUP BY g HAVING count(*) > 1",
       keys=["g"], skip=("g1m",)),
     Q("SELECT count(*), sum(x) FROM t WHERE s >= 'm' AND s < 'x'",
@@ -429,11 +433,6 @@ FORCED = [
 @pytest.mark.parametrize("q", FORCED, ids=query_id)
 def test_forced_group_strategy_gives_the_same_answer(probe, data, mode, strategy, q):
     """PlannerOptions force either strategy; the answer is DuckDB's whichever runs, and the notes say which did."""
-    if strategy == "dense" and mode in ("scan", "framescan") and any(KINDS[k] == "int" for k in q.keys):
-        res = run_probe(probe, q.sql, {"t": data["g8"].path}, mode=mode, group=strategy,
-                        edits=data["g8"].edits_path if mode == "framescan" else None, expect_error=True)
-        assert res["error"].startswith("cannot force dense groups: the range of `")
-        return
     res, ds = run_case(probe, data, "g8", mode, q, group=strategy)
     group_note = next(n for n in res["notes"] if n.startswith("group:"))
     assert group_note.startswith(f"group: {strategy}") and group_note.endswith("forced by the options"), group_note
@@ -522,10 +521,13 @@ def test_explain_shows_the_logical_and_the_physical_plan(probe, data):
 
 
 def test_explain_of_a_hashed_plan_says_why(probe, data):
-    res = run_probe(probe, "EXPLAIN SELECT x % 7, count(*) FROM t GROUP BY x % 7", {"t": data["g8"].path})
-    assert "  group: hashed on 2 key words: `x % 7` is an expression, so its range is unknown" in [r[0] for r in res["rows"]]
-    res = run_probe(probe, "EXPLAIN SELECT g, count(*) FROM t GROUP BY g", {"t": data["g8"].path}, mode="scan")
-    assert "  group: hashed on 2 key words: the range of `g` is unknown (the source has no statistics on it)" in [r[0] for r in res["rows"]]
+    lines = lambda sql, mode="table", name="g8": [r[0] for r in run_probe(probe, sql, {"t": getattr(data[name], "path" if mode != "nostats" else "nostats")},
+                                                                         mode="scan" if mode == "nostats" else mode)["rows"]]
+    assert "  group: hashed on 2 key words: the domain of 2,000,002 slots is sparse for 20,000 rows" in lines("EXPLAIN SELECT x * x, count(*) FROM t GROUP BY x * x")
+    assert "  group: dense, 1 key x % 7 14 (with a NULL slot) = 14 slots: the domain of 14 slots is small" in lines("EXPLAIN SELECT x % 7, count(*) FROM t GROUP BY x % 7")
+    # a file written without statistics has no ranges to plan from
+    assert "  group: hashed on 2 key words: the range of `g` is unknown (the source has no statistics on it)" in lines("EXPLAIN SELECT g, count(*) FROM t GROUP BY g", "nostats")
+    assert "  group: dense, 1 key g 9 (with a NULL slot) = 9 slots: the domain of 9 slots is small" in lines("EXPLAIN SELECT g, count(*) FROM t GROUP BY g", "scan")
 
 
 ERRORS = [
