@@ -446,7 +446,8 @@ def test_a_float_is_written_as_the_shortest_text_that_reads_back(mx, tmp_path):
     """F-157: 0.1 prints as 0.1 and every double reads back to its bits, in JSON and in CSV (Mojo's own formatter alone fails 1 in 1,000)."""
     import random
     r = random.Random(11)
-    vals = [2.0 ** 49 + 0.25, 2.0 ** 50 + 0.5, 4503599627370497.5, 0.1, 0.2, 0.30000000000000004, 1e-7, 5e-324, 1.7976931348623157e308, 123456789.123456789, 1e16, 1e15, 8.695637939342639e17, -3.3854499886543212e16,
+    vals = [2.0 ** e for e in range(-1074, 1024)] + [-(2.0 ** e) for e in range(-1074, 1024, 7)]      # every power of two: the gap below is half the gap above
+    vals += [2.0 ** 49 + 0.25, 2.0 ** 50 + 0.5, 4503599627370497.5, 0.1, 0.2, 0.30000000000000004, 1e-7, 5e-324, 1.7976931348623157e308, 123456789.123456789, 1e16, 1e15, 8.695637939342639e17, -3.3854499886543212e16,
             100.0, 1e22, 2.5e-5, 0.0001]
     vals += [struct.unpack("<d", struct.pack("<Q", r.getrandbits(64)))[0] for _ in range(4000)]
     vals += [round(r.uniform(-1e6, 1e6), r.randint(0, 6)) for _ in range(5000)]

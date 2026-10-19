@@ -83,6 +83,36 @@ def _round_digits(digits: List[UInt8], n: Int) -> Tuple[List[UInt8], Int]:
     return (out^, carried)
 
 
+def _bump(digits: List[UInt8], delta: Int) -> Tuple[List[UInt8], Int]:
+    """The digits as an integer plus delta (1 or -1), same length; the second value is +1 when 999.. became 1000.. (the exponent rises) and -1
+    when 1000.. became 999.. (it falls)."""
+    var out = digits.copy()
+    var i = len(out) - 1
+    if delta > 0:
+        while i >= 0:
+            if out[i] == 9:
+                out[i] = 0
+                i -= 1
+            else:
+                out[i] += 1
+                return (out^, 0)
+        out.insert(0, 1)
+        out.pop()
+        return (out^, 1)
+    while i >= 0:
+        if out[i] == 0:
+            out[i] = 9
+            i -= 1
+        else:
+            out[i] -= 1
+            break
+    if out[0] == 0:                       # 1000.. became 0999..: shift to 999..9 one exponent down
+        _ = out.pop(0)
+        out.append(9)
+        return (out^, -1)
+    return (out^, 0)
+
+
 def _layout(neg: Bool, digits: List[UInt8], exp10: Int) -> String:
     """Digits d1 d2 ... (trailing zeros dropped) and x = d1.d2... * 10^exp10 as text in Python's repr layout."""
     var n = len(digits)
@@ -142,9 +172,16 @@ def float_text(x: Float64) -> String:
         return text^
     var neg = x < 0.0
     var ex = _exact_digits(-x if neg else x)
-    for n in [16, 17]:
-        var r = _round_digits(ex[0], n)
-        var cand = _layout(neg, r[0], ex[1] + r[1])
+    var r16 = _round_digits(ex[0], 16)
+    var cand16 = _layout(neg, r16[0], ex[1] + r16[1])
+    if parse_float_text(cand16, back) == F_OK and UInt64(back.to_bits()) == UInt64(x.to_bits()):
+        return cand16^
+    # The nearest 16 digits do not read back. At a power of two the gap to the double below is half the gap above, so the nearest rounding can
+    # fall below x outside that narrow gap while the neighbour one last digit up (or down) is inside: try both before using 17 digits.
+    for delta in [1, -1]:
+        var nb = _bump(r16[0], delta)
+        var cand = _layout(neg, nb[0], ex[1] + r16[1] + nb[1])
         if parse_float_text(cand, back) == F_OK and UInt64(back.to_bits()) == UInt64(x.to_bits()):
             return cand^
-    return _layout(neg, _round_digits(ex[0], 17)[0], ex[1])        # (unreachable: 17 digits always read back)
+    var r17 = _round_digits(ex[0], 17)
+    return _layout(neg, r17[0], ex[1] + r17[1])
