@@ -2,6 +2,7 @@
 // Every page includes this file and a <nav class="side"></nav>; pages are listed once, here.
 const PAGES = [
   ["index.html", "Overview"],
+  ["engine.html", "The Mojo engine"],
   ["benchmarks.html", "Benchmarks"],
   ["auto-mode.html", "How auto decides"],
   ["internals.html", "Behind the scenes"],

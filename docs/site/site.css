@@ -14,7 +14,7 @@
   --text: #20221F; --text-mid: #4C5049; --text-dim: #6E716A;
   --shadow-md: 0 8px 24px rgba(32,34,31,.12);
   /* chart series, validated with the dataviz validator on both surfaces */
-  --mx: #2a78d6; --dk: #1baf7a; --pl: #eb6834; --fast: #2a78d6; --slow: #e34948; --mid: #8f8e88;
+  --mx: #2a78d6; --dk: #1baf7a; --pl: #eb6834; --pa: #eda100; --fast: #2a78d6; --slow: #e34948; --mid: #8f8e88;
 }
 :root[data-theme="dark"] {
   --bg: #0D0D14; --surface: #13131E; --surface-2: #1A1A28; --surface-3: #1F1F30;
@@ -24,7 +24,7 @@
   --green-dim: rgba(52,211,153,.15); --red-dim: rgba(248,113,113,.15); --yellow-dim: rgba(251,191,36,.15);
   --text: #F5F5FF; --text-mid: #C0C0DC; --text-dim: #8E8EAE;
   --shadow-md: 0 8px 28px rgba(0,0,0,.32), 0 0 0 1px rgba(255,255,255,.05);
-  --mx: #3987e5; --dk: #199e70; --pl: #d95926; --fast: #3987e5; --slow: #e66767;
+  --mx: #3987e5; --dk: #199e70; --pl: #d95926; --pa: #c98500; --fast: #3987e5; --slow: #e66767;
 }
 
 * { box-sizing: border-box; }

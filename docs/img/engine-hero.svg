@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="t d">
+<title id="t">MX frame: the Mojo engine</title>
+<desc id="d">The Mojo engine is the core: it links into any app the way SQLite does, and aims to beat DuckDB and Polars on CPU and GPU. Python and apps are plugins. Headline numbers: streamed 20M-row query: 0.14 s (DuckDB 0.18 s); NOT EXISTS, 6M x 1.5M rows: 9 ms (DuckDB 35 ms); median, 20M rows, 1M groups: 398 ms (DuckDB 2,208 ms); bigger-than-RAM file, streamed: 1.6 GB (in 72 MB of memory). Informal: a shared 12-core / 24-thread Ryzen with an RTX 3090 while other work ran (load 2 to 10), best or median of a few runs, DuckDB 1.5.1 and pyarrow on the same files in the same minute. The quiet-machine scoreboard has not been run yet.</desc>
+<defs>
+  <radialGradient id="g1" cx="0.12" cy="0.0" r="0.75"><stop offset="0" stop-color="#7C3AED" stop-opacity=".55"/><stop offset="1" stop-color="#7C3AED" stop-opacity="0"/></radialGradient>
+  <radialGradient id="g2" cx="0.92" cy="1.05" r="0.6"><stop offset="0" stop-color="#3987e5" stop-opacity=".30"/><stop offset="1" stop-color="#3987e5" stop-opacity="0"/></radialGradient>
+  <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity=".035"/></pattern>
+  <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="4" height="2" y="2" fill="#000" fill-opacity=".18"/></pattern>
+  <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="9" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  <clipPath id="clip"><rect width="1200" height="360" rx="18"/></clipPath>
+</defs>
+<g clip-path="url(#clip)">
+<rect width="1200" height="360" fill="#0D0D14"/>
+<rect width="1200" height="360" fill="url(#grid)"/>
+<rect width="1200" height="360" fill="url(#g1)"/>
+<rect width="1200" height="360" fill="url(#g2)"/>
+<rect width="1200" height="360" fill="url(#scan)"/>
+<text x="56.0" y="74.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="13" font-weight="700" fill="#9D5CF5" text-anchor="start" letter-spacing="2.5">// THE MOJO ENGINE · CPU · GPU · AUTO</text>
+<text x="56" y="146" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="66" font-weight="800" letter-spacing="8" fill="#F5F5FF">M<tspan fill="#9D5CF5" filter="url(#glow)">X</tspan> FRAME</text>
+<text x="56.0" y="196.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="22" font-weight="500" fill="#C0C0DC" text-anchor="start">A data engine kernel in Mojo. Apps and</text>
+<text x="56.0" y="226.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="22" font-weight="500" fill="#C0C0DC" text-anchor="start">agents build on it; Python is a plugin.</text>
+<text x="56.0" y="282.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="14" font-weight="700" fill="#F5F5FF" text-anchor="start">Aims to beat DuckDB and Polars, on CPU and GPU.</text>
+<rect x="56" y="317" width="10" height="10" rx="2" fill="#3987e5"/>
+<text x="72.0" y="326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#C0C0DC" text-anchor="start">MX frame</text>
+<rect x="152" y="317" width="10" height="10" rx="2" fill="#199e70"/>
+<text x="168.0" y="326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#C0C0DC" text-anchor="start">DuckDB</text>
+<text x="236.0" y="326.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#8E8EAE" text-anchor="start">informal: shared machine, see docs/mojo-engine.md</text>
+<rect x="612" y="52" width="262" height="128" rx="12" fill="#ffffff" fill-opacity=".035" stroke="#32324C"/>
+<rect x="612" y="70" width="3" height="18" rx="1.5" fill="#9D5CF5"/>
+<text x="628.0" y="84.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#8E8EAE" text-anchor="start" letter-spacing="0.6">STREAMED 20M-ROW QUERY</text>
+<text x="628" y="132" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-weight="700" fill="#F5F5FF"><tspan font-size="44">0.14</tspan><tspan font-size="20" fill="#C0C0DC" dx="6">s</tspan></text>
+<text x="628.0" y="154.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#C0C0DC" text-anchor="start">DuckDB 0.18 s</text>
+<rect x="628" y="163" width="178.9" height="4" rx="2" fill="#3987e5"/>
+<rect x="628" y="169" width="230.0" height="4" rx="2" fill="#199e70"/>
+<rect x="890" y="52" width="262" height="128" rx="12" fill="#ffffff" fill-opacity=".035" stroke="#32324C"/>
+<rect x="890" y="70" width="3" height="18" rx="1.5" fill="#9D5CF5"/>
+<text x="906.0" y="84.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#8E8EAE" text-anchor="start" letter-spacing="0.6">NOT EXISTS, 6M X 1.5M ROWS</text>
+<text x="906" y="132" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-weight="700" fill="#F5F5FF"><tspan font-size="44">9</tspan><tspan font-size="20" fill="#C0C0DC" dx="6">ms</tspan></text>
+<text x="906.0" y="154.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#C0C0DC" text-anchor="start">DuckDB 35 ms</text>
+<rect x="906" y="163" width="59.1" height="4" rx="2" fill="#3987e5"/>
+<rect x="906" y="169" width="230.0" height="4" rx="2" fill="#199e70"/>
+<rect x="612" y="196" width="262" height="128" rx="12" fill="#ffffff" fill-opacity=".035" stroke="#32324C"/>
+<rect x="612" y="214" width="3" height="18" rx="1.5" fill="#9D5CF5"/>
+<text x="628.0" y="228.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#8E8EAE" text-anchor="start" letter-spacing="0.6">MEDIAN, 20M ROWS, 1M GROUPS</text>
+<text x="628" y="276" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-weight="700" fill="#F5F5FF"><tspan font-size="44">398</tspan><tspan font-size="20" fill="#C0C0DC" dx="6">ms</tspan></text>
+<text x="628.0" y="298.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#C0C0DC" text-anchor="start">DuckDB 2,208 ms</text>
+<rect x="628" y="307" width="41.5" height="4" rx="2" fill="#3987e5"/>
+<rect x="628" y="313" width="230.0" height="4" rx="2" fill="#199e70"/>
+<rect x="890" y="196" width="262" height="128" rx="12" fill="#ffffff" fill-opacity=".035" stroke="#32324C"/>
+<rect x="890" y="214" width="3" height="18" rx="1.5" fill="#9D5CF5"/>
+<text x="906.0" y="228.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11.5" font-weight="700" fill="#8E8EAE" text-anchor="start" letter-spacing="0.6">BIGGER-THAN-RAM FILE, STREAMED</text>
+<text x="906" y="276" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-weight="700" fill="#F5F5FF"><tspan font-size="44">1.6</tspan><tspan font-size="20" fill="#C0C0DC" dx="6">GB</tspan></text>
+<text x="906.0" y="298.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="500" fill="#C0C0DC" text-anchor="start">in 72 MB of memory</text>
+<rect x="906" y="307" width="10.3" height="4" rx="2" fill="#3987e5"/>
+<rect x="906" y="313" width="230.0" height="4" rx="2" fill="#8E8EAE"/>
+</g>
+<rect x=".5" y=".5" width="1199" height="359" rx="18" fill="none" stroke="#32324C"/>
+</svg>

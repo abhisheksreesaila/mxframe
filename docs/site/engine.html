@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Mojo engine: what it does and how it got fast</title>
+<meta name="description" content="MX frame's Mojo engine, the core that apps and agents build on: Parquet, text, bigger-than-RAM streams, GPU AUTO, aggregates, SQL and joins, with every number against DuckDB and pyarrow, including where it is still behind.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script src="site.js"></script>
+<style>
+  /* the hero is the page's focal card: dark Terminal Ledger in both themes */
+  .hero { --h-text: #F5F5FF; --h-mid: #C0C0DC; --h-dim: #8E8EAE; --h-acc: #9D5CF5; --h-line: #32324C;
+    position: relative; overflow: hidden; border-radius: 16px; border: 1px solid var(--h-line); color: var(--h-text);
+    background: radial-gradient(60% 90% at 8% 0%, rgba(124,58,237,.50), transparent 70%),
+                radial-gradient(45% 70% at 95% 105%, rgba(57,135,229,.28), transparent 70%), #0D0D14;
+    padding: 30px 32px 24px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 28px; margin: 0 0 8px; }
+  .hero::before { content: ''; position: absolute; inset: 0; pointer-events: none;
+    background: linear-gradient(#fff1 1px, transparent 1px) 0 0 / 32px 32px, linear-gradient(90deg, #fff1 1px, transparent 1px) 0 0 / 32px 32px; opacity: .35; }
+  .hero > * { position: relative; }
+  .hero .kick { color: var(--h-acc); }
+  .hero h1 { font: 800 50px/1.05 var(--font-mono); letter-spacing: .12em; margin: 12px 0 14px; color: var(--h-text); }
+  .hero h1 .x { color: var(--h-acc); text-shadow: 0 0 22px rgba(157,92,245,.9); }
+  .hero p { color: var(--h-mid); font-size: 17px; line-height: 1.5; margin: 0 0 12px; }
+  .hero .aim { font: 700 13px var(--font-mono); color: var(--h-text); }
+  .hero .cav { font: 11.5px/1.5 var(--font-mono); color: var(--h-dim); margin: 14px 0 0; }
+  .hero .cav a { color: var(--h-acc); }
+  .htiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-content: center; }
+  .htile { border: 1px solid var(--h-line); border-radius: 12px; background: rgba(255,255,255,.035); padding: 14px 16px 12px; }
+  .htile .l { min-height: 2.9em; font: 700 10px var(--font-mono); letter-spacing: .1em; text-transform: uppercase; color: var(--h-dim); border-left: 3px solid var(--h-acc); padding-left: 8px; }
+  .htile .n { font: 700 36px/1.1 var(--font-mono); margin: 8px 0 2px; color: var(--h-text); font-variant-numeric: tabular-nums; }
+  .htile .n small { font-size: 17px; color: var(--h-mid); margin-left: 4px; }
+  .htile .v { font-size: 13px; color: var(--h-mid); }
+  .htile .bars { margin-top: 8px; display: grid; gap: 3px; }
+  .htile .bars i { display: block; height: 4px; border-radius: 2px; min-width: 3px; }
+  .hleg { display: flex; gap: 14px; font: 11.5px var(--font-mono); color: var(--h-mid); margin: 10px 0 0; flex-wrap: wrap; }
+  .hleg i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+  .glance { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+  .gt { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 12px 14px; display: flex; flex-direction: column; gap: 3px; }
+  .gt .i { font: 700 10px var(--font-mono); color: var(--accent); letter-spacing: .1em; }
+  .gt .nm { font: 600 13.5px var(--font-sans); color: var(--text); }
+  .gt .n { font: 700 24px/1.15 var(--font-mono); color: var(--text); margin: 6px 0 0; font-variant-numeric: tabular-nums; }
+  .gt .ln { font-size: 12.5px; line-height: 1.4; color: var(--text-mid); }
+  .gt .tk { font: 10px var(--font-mono); color: var(--text-dim); margin-top: auto; padding-top: 6px; }
+
+  .card-h .sp { flex: 1; }
+  .card-h { flex-wrap: wrap; }
+  .card-b > p.note { font-size: 13px; margin: 8px 0 0; }
+  .ch svg { display: block; width: 100%; height: auto; }
+  .ch svg text { font: 11px var(--font-mono); fill: var(--text-dim); }
+  .ch svg text.lab { font: 600 13px var(--font-sans); fill: var(--text); }
+  .ch svg text.val { fill: var(--text-mid); font-weight: 700; }
+  .ch svg text.big { fill: var(--text); font-weight: 700; font-size: 13px; }
+  .ch svg text.tick { font-size: 10.5px; }
+  .areas { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  .areas .wide { grid-column: 1 / -1; }
+  .stats3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .stats3 div { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--surface-2); }
+  .stats3 b { display: block; font: 700 22px var(--font-mono); color: var(--text); }
+  .stats3 span { font-size: 12.5px; color: var(--text-mid); }
+
+  .strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); }
+  .strip div { padding: 14px 16px; border-left: 1px solid var(--border); }
+  .strip div:first-child { border-left: 0; }
+  .strip b { display: block; font: 700 13px var(--font-mono); color: var(--green); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 4px; }
+  .strip b::before { content: '✓ '; }
+  .strip span { font-size: 13px; color: var(--text-mid); line-height: 1.45; display: block; }
+  .behind-card { border-color: var(--red-dim); }
+  .behind-card .card-h { background: var(--red-dim); }
+  .cav-line { font: 12px/1.6 var(--font-mono); color: var(--text-dim); border-top: 1px solid var(--border); padding-top: 14px; margin-top: 36px; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .fade { animation: fade .35s ease-out both; }
+    @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  }
+  @media (max-width: 1100px) { .hero { grid-template-columns: minmax(0, 1fr); } .glance { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 820px) {
+    .hero { padding: 22px 18px 18px; } .hero h1 { font-size: 34px; }
+    .htile .n { font-size: 28px; }
+    .glance { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .areas, .stats3 { grid-template-columns: minmax(0, 1fr); }
+    .strip { grid-template-columns: minmax(0, 1fr); } .strip div { border-left: 0; border-top: 1px solid var(--border); } .strip div:first-child { border-top: 0; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+<nav class="side"></nav>
+<main id="main">
+  <div class="read"><b>What you're looking at</b>What MX frame's Mojo engine does and how each part got fast, area by area, against DuckDB 1.5.1 and pyarrow on the same files. Bars are times: shorter is faster. Hover a bar or dot for its numbers; every chart has a data table under it. All numbers come from one file, <a href="bench/engine-informal.json">bench/engine-informal.json</a>, which quotes <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mojo-engine.md">docs/mojo-engine.md</a>. They are <b style="display:inline;font:inherit;text-transform:none;letter-spacing:0">informal</b>: measured on a shared machine while other work ran.</div>
+
+  <section class="hero fade" id="hero"><div class="status">loading bench/engine-informal.json…</div></section>
+
+  <h2>At a glance</h2>
+  <div class="glance fade" id="glance"></div>
+
+  <h2>How it got fast: one streamed query</h2>
+  <div class="card fade">
+    <div class="card-h">Streamed numeric query · 20M rows · time, log scale · lower is faster</div>
+    <div class="card-b">
+      <div class="legend" id="steps-legend"></div>
+      <div class="ch" id="steps"></div>
+      <p class="note" id="steps-note"></p>
+      <details><summary class="label">Data table</summary><div id="steps-table"></div></details>
+    </div>
+  </div>
+
+  <h2>Area by area</h2>
+  <div class="areas" id="areas"></div>
+
+  <h2>Built to stay correct</h2>
+  <div class="strip fade" id="correct"></div>
+
+  <h2>Still behind DuckDB</h2>
+  <div class="card behind-card fade">
+    <div class="card-h">MX frame time / DuckDB time · 1x is a tie · shorter is better</div>
+    <div class="card-b">
+      <div class="ch" id="behind"></div>
+      <p class="note" id="next"></p>
+      <details><summary class="label">Data table</summary><div id="behind-table"></div></details>
+    </div>
+  </div>
+
+  <p class="cav-line" id="caveat"></p>
+</main>
+</div>
+
+<script>
+const DATA = "bench/engine-informal.json";
+const $ = (id) => document.getElementById(id);
+const SER = { mx: ["--mx", "MX frame"], dk: ["--dk", "DuckDB 1.5.1"], pa: ["--pa", "pyarrow"], cpu: ["--mx", "CPU"], gpu: ["--accent", "GPU"], slow: ["--slow", "MX frame time / DuckDB time"] };
+const AREA = { joins: "join", sql: "SQL", streaming: "streamed", aggregates: "1M groups" };
+let D;
+
+const lo = (v) => (Array.isArray(v) ? Math.min(...v) : v);
+const hi = (v) => (Array.isArray(v) ? Math.max(...v) : v);
+const dec = (x) => (String(x).split(".")[1] || "").length;
+function fmt(v, unit) {
+  if (Array.isArray(v)) { const d = Math.max(...v.map(dec)); return `${v[0].toFixed(d)}–${v[1].toFixed(d)} ${unit}`; }
+  // seconds under 1 keep two decimals, as docs/mojo-engine.md writes them (0.10 s, not 0.1 s)
+  const s = unit === "ms" ? (v >= 10 ? v.toLocaleString("en-US", { maximumFractionDigits: 0 }) : String(v)) : (v < 1 && dec(v) < 2 ? v.toFixed(2) : String(v));
+  return `${s} ${unit}`;
+}
+function ratio(a, b) { // a / b, either may be a range
+  const r1 = lo(a) / hi(b), r2 = hi(a) / lo(b);
+  return Math.abs(r2 - r1) < 0.05 ? `${((r1 + r2) / 2).toFixed(1)}x` : `${r1.toFixed(1)}–${r2.toFixed(1)}x`;
+}
+function lookup(ref) {
+  const sec = D[ref[0]];
+  if (ref.length === 1) return sec;
+  const rows = [...(sec.rows || []), ...(sec.steps || []), ...(sec.few_groups ? [sec.few_groups] : [])];
+  return rows.find((r) => r.label === ref[1]);
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const legendHTML = (keys) => keys.map((k) => `<span><i class="sq" style="background:var(${SER[k][0]})"></i>${SER[k][1]}</span>`).join("");
+const tableHTML = (head, rows) => `<table class="t"><tr>${head.map((h, i) => `<th${i ? ' class="r"' : ""}>${h}</th>`).join("")}</tr>` +
+  rows.map((r) => `<tr>${r.map((c, i) => `<td${i ? ' class="r mono"' : ""}>${esc(c ?? "")}</td>`).join("")}</tr>`).join("") + "</table>";
+
+/* grouped horizontal bars. rows: {label, sub, bars: [{s, v, text, ring}], right}. o: {scale, domain, ticks, rightHead} */
+function hbars(el, rows, o) {
+  const W = Math.max(300, el.clientWidth || 600), narrow = W < 520;
+  const LW = narrow ? 0 : Math.min(220, Math.round(W * 0.32)), RW = o.rightHead ? 64 : 0;
+  const px0 = narrow ? 0 : LW + 10, px1 = W - RW - (o.pad ?? 120), step = 16, head = 22;
+  const [a, b] = o.domain;
+  const X = o.scale === "log" ? (v) => px0 + (px1 - px0) * (Math.log10(v) - Math.log10(a)) / (Math.log10(b) - Math.log10(a))
+                              : (v) => px0 + (px1 - px0) * (v - a) / (b - a);
+  const hs = rows.map((r) => narrow ? 20 + (r.sub ? 15 : 0) + r.bars.length * step + 12 : Math.max(r.bars.length * step + 14, r.sub ? 46 : 28));
+  const H = head + hs.reduce((s, h) => s + h, 0) + 4;
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": o.title || "" });
+  for (const [v, t] of o.ticks) {
+    s.appendChild(svg("line", { x1: X(v), x2: X(v), y1: head - 4, y2: H - 4, stroke: cssVar("--border"), "stroke-width": v === o.ticks[0][0] ? 1.5 : 1 }));
+    s.appendChild(svg("text", { x: X(v), y: 12, "text-anchor": X(v) < 16 ? "start" : X(v) > W - 16 ? "end" : "middle", class: "tick" }, t));
+  }
+  if (o.rightHead) s.appendChild(svg("text", { x: W, y: 12, "text-anchor": "end", class: "tick" }, o.rightHead));
+  let y = head;
+  rows.forEach((r, i) => {
+    let by = y + 4;
+    if (narrow) { s.appendChild(svg("text", { x: 0, y: y + 15, class: "lab" }, r.label)); by = y + 22;
+      if (r.sub) { s.appendChild(svg("text", { x: 0, y: y + 32 }, r.sub)); by += 15; } }
+    else { s.appendChild(svg("text", { x: 0, y: y + 16, class: "lab" }, r.label)); if (r.sub) s.appendChild(svg("text", { x: 0, y: y + 33 }, r.sub)); }
+    for (const bar of r.bars) {
+      const fill = cssVar(SER[bar.s][0]), x1 = X(lo(bar.v)), g = svg("g");
+      g.appendChild(svg("rect", { x: px0, y: by, width: Math.max(2, x1 - px0), height: 12, rx: 3, fill }));
+      let end = x1;
+      if (Array.isArray(bar.v)) { end = X(hi(bar.v)); g.appendChild(svg("rect", { x: x1, y: by, width: Math.max(2, end - x1), height: 12, rx: 3, fill, "fill-opacity": 0.4 })); }
+      if (bar.ring) g.appendChild(svg("rect", { x: px0 - 2, y: by - 2, width: end - px0 + 4, height: 16, rx: 4, fill: "none", stroke: cssVar("--text"), "stroke-width": 1.5 }));
+      const t = svg("text", { x: end + 7, y: by + 10.5, class: "val" }, bar.text);
+      if (bar.more) t.appendChild(svg("tspan", { dx: 8, style: "font-weight:400" }, bar.more));
+      g.appendChild(t);
+      g.appendChild(svg("rect", { x: 0, y: by - 2, width: W, height: 16, fill: "transparent" }));
+      hover(g, `<b>${esc(r.label)}</b><br>${SER[bar.s][1]}: ${esc(bar.text)}${bar.more ? " · " + esc(bar.more) : ""}`);
+      s.appendChild(g);
+      by += step;
+    }
+    if (r.right) s.appendChild(svg("text", { x: W, y: y + (narrow ? 15 : 17), "text-anchor": "end", class: "big" }, r.right));
+    y += hs[i];
+    if (i < rows.length - 1) s.appendChild(svg("line", { x1: 0, x2: W, y1: y - 5, y2: y - 5, stroke: cssVar("--border"), "stroke-opacity": 0.7 }));
+  });
+  el.replaceChildren(s);
+}
+
+function card(id, title, keys, wide) {
+  return `<div class="card fade${wide ? " wide" : ""}"><div class="card-h">${title}</div><div class="card-b">` +
+    (keys ? `<div class="legend">${legendHTML(keys)}</div>` : "") +
+    `<div class="ch" id="${id}"></div><p class="note" id="${id}-note"></p><details><summary class="label">Data table</summary><div id="${id}-table"></div></details></div></div>`;
+}
+
+function drawHero() {
+  const tiles = D.headline.map((h) => {
+    const r = lookup(h.ref), mem = h.ref[0] === "memory";
+    const a = mem ? r.peak_mb : lo(r.mx), b = mem ? r.file_gb * 1000 : hi(r.duckdb), top = Math.max(a, b);
+    const [num, unit] = h.big.split(" ");
+    return `<div class="htile"><div class="l">${esc(h.label)}</div><div class="n">${num}<small>${unit}</small></div><div class="v">${esc(h.vs)}</div>` +
+      `<div class="bars" aria-hidden="true"><i style="width:${(100 * a / top).toFixed(1)}%;background:#3987e5"></i><i style="width:${(100 * b / top).toFixed(1)}%;background:${mem ? "#8E8EAE" : "#199e70"}"></i></div></div>`;
+  }).join("");
+  $("hero").innerHTML = `<div><span class="kick">// the Mojo engine · CPU · GPU · AUTO</span><h1>M<span class="x">X</span> FRAME</h1>` +
+    `<p>${esc(D.vision)}</p><div class="aim">Aims to beat DuckDB and Polars, on CPU and GPU.</div>` +
+    `<div class="hleg"><span><i style="background:#3987e5"></i>MX frame</span><span><i style="background:#199e70"></i>DuckDB</span><span><i style="background:#8E8EAE"></i>file size</span></div>` +
+    `<p class="cav">${esc(D.caveat)} <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/mojo-engine.md">docs/mojo-engine.md ↗</a></p></div>` +
+    `<div class="htiles">${tiles}</div>`;
+}
+
+function drawGlance() {
+  $("glance").innerHTML = D.areas.map((a, i) => `<div class="gt" title="${esc(a.what)}"><span class="i">${String(i + 1).padStart(2, "0")}</span>` +
+    `<span class="nm">${esc(a.name)}</span><span class="n">${esc(a.big)}</span><span class="ln">${esc(a.line)}</span><span class="tk">${esc(a.tickets)}</span></div>`).join("");
+}
+
+function drawSteps() {
+  const el = $("steps"), st = D.streaming, cols = [...st.steps, st.few_groups];
+  const W = Math.max(320, el.clientWidth || 800), narrow = W < 600, H = narrow ? 300 : 320;
+  const m = { l: 52, r: 12, t: 26, b: narrow ? 36 : 78 }, cw = (W - m.l - m.r) / cols.length;
+  const CX = (i) => m.l + cw * (i + 0.5), [y0, y1] = [0.05, 4];
+  const Y = (v) => m.t + (1 - (Math.log10(v) - Math.log10(y0)) / (Math.log10(y1) - Math.log10(y0))) * (H - m.t - m.b);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": st.title });
+  const c = { mx: cssVar("--mx"), dk: cssVar("--dk"), grid: cssVar("--border"), surf: cssVar("--surface") };
+  for (const v of [0.05, 0.1, 0.2, 0.5, 1, 2]) {
+    s.appendChild(svg("line", { x1: m.l, x2: W - m.r, y1: Y(v), y2: Y(v), stroke: c.grid }));
+    s.appendChild(svg("text", { x: m.l - 8, y: Y(v) + 4, "text-anchor": "end", class: "tick" }, `${v} s`));
+  }
+  // the extra column is a different file (4 row groups): set apart by a dashed rule
+  const sep = m.l + cw * (cols.length - 1);
+  s.appendChild(svg("line", { x1: sep, x2: sep, y1: m.t - 14, y2: H - 8, stroke: cssVar("--border-hi"), "stroke-dasharray": "4 4" }));
+  s.appendChild(svg("text", { x: sep + 6, y: m.t - 6, class: "tick" }, narrow ? "4 groups" : "same query, 4 row groups"));
+  // MX: a step line through the milestones
+  let d = `M${CX(0)} ${Y(st.steps[0].mx)}`;
+  st.steps.forEach((p, i) => { if (i) d += ` H${CX(i) - cw / 2} V${Y(p.mx)} H${CX(i)}`; });
+  s.appendChild(svg("path", { d, fill: "none", stroke: c.mx, "stroke-width": 2.5 }));
+  // DuckDB, measured alongside from F-141 on
+  const dk = st.steps.map((p, i) => [i, p.duckdb]).filter(([, v]) => v !== undefined);
+  s.appendChild(svg("path", { d: dk.map(([i, v], k) => `${k ? "L" : "M"}${CX(i)} ${Y(hi(v))}`).join(" "), fill: "none", stroke: c.dk, "stroke-width": 2, "stroke-dasharray": "5 4" }));
+  const dot = (i, v, col, up, label, tip) => {
+    const g = svg("g");
+    if (Array.isArray(v)) g.appendChild(svg("line", { x1: CX(i), x2: CX(i), y1: Y(v[0]), y2: Y(v[1]), stroke: col, "stroke-width": 9, "stroke-linecap": "round" }));
+    g.appendChild(svg("circle", { cx: CX(i), cy: Y(hi(v)), r: 5.5, fill: col, stroke: c.surf, "stroke-width": 2 }));
+    g.appendChild(svg("text", { x: CX(i), y: up ? Y(hi(v)) - 11 : Y(lo(v)) + 19, "text-anchor": "middle", class: up ? "big" : "val" }, narrow ? label.replace(" s", "") : label));
+    g.appendChild(svg("circle", { cx: CX(i), cy: Y(hi(v)), r: 14, fill: "transparent" }));
+    hover(g, tip);
+    s.appendChild(g);
+  };
+  cols.forEach((p, i) => {
+    const mxUp = p.duckdb === undefined || p.mx > hi(p.duckdb);
+    dot(i, p.mx, c.mx, mxUp, fmt(p.mx, "s"), `<b>${p.ticket}: ${esc(p.label)}</b><br>MX frame ${fmt(p.mx, "s")}${p.memory ? "<br>memory: " + esc(p.memory) : ""}`);
+    if (p.duckdb !== undefined) dot(i, p.duckdb, c.dk, !mxUp, fmt(p.duckdb, "s"), `<b>${p.ticket}: ${esc(p.label)}</b><br>DuckDB ${fmt(p.duckdb, "s")}, same file, same minute`);
+    const tx = svg("text", { x: CX(i), y: H - m.b + 22, "text-anchor": "middle" });
+    tx.appendChild(svg("tspan", { x: CX(i), style: `fill:${cssVar("--accent")};font-weight:700` }, narrow ? p.ticket.replace(", F-1", "/") : p.ticket));
+    const words = narrow ? [] : wrapWords(p.label, Math.max(10, Math.floor(cw / 7)));
+    words.forEach((w) => tx.appendChild(svg("tspan", { x: CX(i), dy: 15, style: `fill:${cssVar("--text")};font-family:var(--font-sans);font-size:12px` }, w)));
+    if (p.memory && !narrow) tx.appendChild(svg("tspan", { x: CX(i), dy: 15 }, p.memory));
+    s.appendChild(tx);
+  });
+  el.replaceChildren(s);
+  const first = st.steps[0], last = st.steps[st.steps.length - 1];
+  $("steps-note").innerHTML = `${fmt(first.mx, "s")} to ${fmt(last.mx, "s")}: about ${Math.round(first.mx / last.mx)}x faster across four tickets, in ${esc(first.memory)}. ` +
+    `On 20 row groups DuckDB is still ${ratio(last.mx, last.duckdb)} ahead; on a file with 4 row groups the engine wins, ${fmt(st.few_groups.mx, "s")} to ${fmt(st.few_groups.duckdb, "s")}.`;
+  $("steps-table").innerHTML = tableHTML(["step", "ticket", "MX frame", "DuckDB", "memory"], cols.map((p) => [p.label, p.ticket, fmt(p.mx, "s"), p.duckdb !== undefined ? fmt(p.duckdb, "s") : "", p.memory || ""]));
+}
+function wrapWords(s, n) {
+  const out = []; let cur = "";
+  for (const w of s.split(" ")) { if (cur && (cur + " " + w).length > n) { out.push(cur); cur = w; } else cur = (cur + " " + w).trim(); }
+  return cur ? [...out, cur] : out;
+}
+
+const LOGMS = [[1, "1 ms"], [10, "10 ms"], [100, "100 ms"], [1000, "1 s"]];
+const speedRows = (sec, prefix) => D[sec].rows.map((r) => ({
+  label: r.label, bars: [{ s: "mx", v: r.mx, text: fmt(r.mx, "ms") }, { s: "dk", v: r.duckdb, text: fmt(r.duckdb, "ms") }],
+  right: ratio(r.duckdb, r.mx), sub: r.was ? `was ${r.was} ms` : r.groups8 ? `8 groups: ${r.groups8} ms` : "" }));
+const speedTable = (sec) => tableHTML(["", "MX frame (ms)", "DuckDB (ms)", "speedup"], D[sec].rows.map((r) => [r.label, r.mx, r.duckdb, ratio(r.duckdb, r.mx)]));
+
+function drawAreas() {
+  const p = D.parquet.rows, t = D.text.rows, st = D.streaming, ed = D.edits.rows;
+  hbars($("a-parquet"), [
+    { label: "before", bars: [{ s: "mx", v: p[0].mx, text: fmt(p[0].mx, "s") }] },
+    { label: "after", bars: [{ s: "mx", v: p[1].mx, text: fmt(p[1].mx, "s") }, { s: "pa", v: p[1].pyarrow, text: fmt(p[1].pyarrow, "s") }] },
+  ], { scale: "log", domain: [0.1, 5], ticks: [[0.1, "0.1 s"], [1, "1 s"], [5, "5 s"]], title: D.parquet.title, pad: 70 });
+  $("a-parquet-note").textContent = `${ratio(p[0].mx, p[1].mx)} faster than before: bulk decode, every core inside a row group, lazy dictionaries.`;
+  $("a-parquet-table").innerHTML = tableHTML(["", "MX frame", "pyarrow"], p.map((r) => [r.label, fmt(r.mx, "s"), r.pyarrow ? fmt(r.pyarrow, "s") : ""]));
+
+  hbars($("a-text"), [
+    { label: "before", bars: [{ s: "mx", v: t[0].mx, text: fmt(t[0].mx, "s") }] },
+    { label: "after", bars: [{ s: "mx", v: t[1].mx, text: fmt(t[1].mx, "s") }, { s: "dk", v: t[1].duckdb, text: fmt(t[1].duckdb, "s"), more: "whole query" }, { s: "pa", v: t[1].pyarrow, text: fmt(t[1].pyarrow, "s") }] },
+  ], { scale: "log", domain: [0.1, 2], ticks: [[0.1, "0.1 s"], [0.5, "0.5 s"], [1, "1 s"], [2, "2 s"]], title: D.text.title, pad: 110 });
+  $("a-text-note").textContent = D.text.note;
+  $("a-text-table").innerHTML = tableHTML(["", "MX frame", "DuckDB", "pyarrow"], t.map((r) => [r.label, fmt(r.mx, "s"), r.duckdb ? fmt(r.duckdb, "s") : "", r.pyarrow ? fmt(r.pyarrow, "s") : ""]));
+
+  const many = st.steps[st.steps.length - 1], few = st.few_groups;
+  hbars($("a-stream"), [many, few].map((r) => ({ label: r.label.replace("morsels, ", ""), sub: r.memory,
+    bars: [{ s: "mx", v: r.mx, text: fmt(r.mx, "s") }, { s: "dk", v: r.duckdb, text: fmt(r.duckdb, "s") }] })),
+    { scale: "lin", domain: [0, 0.25], ticks: [[0, "0"], [0.1, "0.1 s"], [0.2, "0.2 s"]], title: st.title, pad: 80 });
+  $("a-stream-note").textContent = `A ${D.memory.file_gb} GB file is queried in ${D.memory.peak_mb} MB, one row group at a time. Each core owns a row group and walks it in 32k-row blocks; files with fewer row groups than cores are cut into row ranges.`;
+  $("a-stream-table").innerHTML = tableHTML(["", "MX frame", "DuckDB", "memory"], [many, few].map((r) => [r.label, fmt(r.mx, "s"), fmt(r.duckdb, "s"), r.memory]));
+
+  hbars($("a-gpu"), D.gpu.rows.map((r) => ({ label: `${r.cores} cores · ${r.plan} plan`, right: `AUTO: ${r.auto}`,
+    bars: [{ s: "cpu", v: r.cpu, text: fmt(r.cpu, "s"), ring: r.auto === "CPU" }, { s: "gpu", v: r.gpu, text: fmt(r.gpu, "s"), ring: r.auto === "GPU" }] })),
+    { scale: "lin", domain: [0, 0.7], ticks: [[0, "0 s"], [0.2, "0.2 s"], [0.4, "0.4 s"], [0.6, "0.6 s"]], title: D.gpu.title, rightHead: "PICK", pad: 70 });
+  $("a-gpu-note").textContent = "The ringed bar is the device AUTO chose. On a big CPU, streaming from disk is decode-bound, so the CPU wins; the GPU pays where cores are few. Results equal the CPU exactly.";
+  $("a-gpu-table").innerHTML = tableHTML(["cores, plan", "CPU", "GPU", "AUTO"], D.gpu.rows.map((r) => [`${r.cores}, ${r.plan}`, fmt(r.cpu, "s"), fmt(r.gpu, "s"), r.auto]));
+
+  hbars($("a-aggs"), speedRows("aggregates"), { scale: "lin", domain: [0, 2600], ticks: [[0, "0"], [1000, "1 s"], [2000, "2 s"]], title: D.aggregates.title, rightHead: "SPEEDUP", pad: 80 });
+  $("a-aggs-note").textContent = "count distinct with HyperLogLog-sized hash sets, percentiles with quickselect or a parallel radix select, top-k with bounded heaps. median matches DuckDB exactly.";
+  $("a-aggs-table").innerHTML = speedTable("aggregates");
+
+  hbars($("a-sql"), speedRows("sql"), { scale: "log", domain: [1, 4000], ticks: LOGMS, title: D.sql.title, rightHead: "SPEEDUP", pad: 80 });
+  $("a-sql-note").textContent = "Speedup is DuckDB's time over MX frame's: above 1x the engine is faster. A planner reading only statistics picks dense or hashed grouping, top-k heaps or a full sort; EXPLAIN shows why.";
+  $("a-sql-table").innerHTML = speedTable("sql");
+
+  hbars($("a-joins"), speedRows("joins"), { scale: "log", domain: [1, 400], ticks: [[1, "1 ms"], [10, "10 ms"], [100, "100 ms"]], title: D.joins.title, rightHead: "SPEEDUP", pad: 80 });
+  $("a-joins-note").textContent = "A hash-join kernel with a C interface any language can call: a direct array for dense keys, radix partitions otherwise, unique build keys joined inside the aggregation kernel.";
+  $("a-joins-table").innerHTML = speedTable("joins");
+
+  $("a-edits").innerHTML = `<div class="stats3">${ed.map((r) => `<div><b>${r.s} s</b><span>${esc(r.label)} · ${r.peak_mb} MB peak</span></div>`).join("")}</div>`;
+  $("a-edits-note").textContent = "Sets, nulls, appends, removes, merges of spellings, formulas and undo over a streamed file; save streams the edited file out and replaces it atomically.";
+  $("a-edits-table").innerHTML = tableHTML(["", "time", "peak memory"], ed.map((r) => [r.label, `${r.s} s`, `${r.peak_mb} MB`]));
+}
+
+function drawBehind() {
+  const gaps = D.behind.map((g) => { const r = lookup(g.from), u = D[g.from[0]].unit;
+    return { ...g, r, u, lo: lo(r.mx) / hi(r.duckdb), hi: hi(r.mx) / lo(r.duckdb) }; }).sort((a, b) => b.hi - a.hi);
+  hbars($("behind"), gaps.map((g) => ({ label: `${AREA[g.from[0]]} · ${g.r.label}`, sub: g.next ? `next: ${g.next}` : "",
+    bars: [{ s: "slow", v: g.hi - g.lo >= 0.05 ? [g.lo, g.hi] : g.lo, text: ratio(g.r.mx, g.r.duckdb), more: `${fmt(g.r.mx, g.u)} vs ${fmt(g.r.duckdb, g.u)}` }] })),
+    { scale: "lin", domain: [1, 3.2], ticks: [[1, "1x"], [2, "2x"], [3, "3x"]], title: "Still behind DuckDB", pad: 170 });
+  $("next").textContent = "Next: " + D.next;
+  $("behind-table").innerHTML = tableHTML(["", "MX frame", "DuckDB", "slower by", "next"], gaps.map((g) => [g.r.label, fmt(g.r.mx, g.u), fmt(g.r.duckdb, g.u), ratio(g.r.mx, g.r.duckdb), g.next]));
+}
+
+function drawAll() { drawSteps(); drawAreas(); drawBehind(); }
+
+document.addEventListener("DOMContentLoaded", async () => {
+  try { D = await loadJSON(DATA); } catch (e) { showError($("hero"), DATA, e); return; }
+  drawHero(); drawGlance();
+  $("steps-legend").innerHTML = legendHTML(["mx", "dk"]);
+  $("areas").innerHTML = card("a-parquet", "Reading Parquet · 20M rows, numeric", ["mx", "pa"]) + card("a-text", "Reading text · 5M rows", ["mx", "dk", "pa"]) +
+    card("a-stream", "Bigger than RAM · streamed, 20M rows", ["mx", "dk"]) + card("a-gpu", "GPU · AUTO picks by cost, 20M rows streamed", ["cpu", "gpu"]) +
+    card("a-aggs", "Aggregates · 20M rows, 1M groups", ["mx", "dk"]) + card("a-edits", "Edits on a 20M-row, 567 MB file", null) +
+    card("a-sql", "SQL in Mojo · 5M / 1.2M rows · log scale", ["mx", "dk"], true) + card("a-joins", "Joins · 6M x 1.5M x 150k rows · log scale", ["mx", "dk"], true);
+  $("correct").innerHTML = D.correct.map((c) => `<div><b>${esc(c.big)}</b><span>${esc(c.line)}</span></div>`).join("");
+  $("caveat").textContent = D.caveat;
+  drawAll();
+  let t; addEventListener("resize", () => { clearTimeout(t); t = setTimeout(drawAll, 120); });
+  document.addEventListener("themechange", drawAll);
+});
+</script>
+</body>
+</html>
