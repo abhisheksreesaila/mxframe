@@ -238,9 +238,9 @@ def test_schema_of_a_csv_file(mx, files):
 def test_explain_prints_both_plans_and_analyze_runs_it(mx, files):
     base = [str(mx), "explain", "SELECT k, sum(d) FROM t GROUP BY k", "-t", f"t={files['parquet']}"]
     text = subprocess.run(base, capture_output=True, check=True).stdout.decode()
-    assert text.startswith("Logical plan\n") and "Physical plan" in text and "group: dense" in text and "rows returned" not in text
+    assert text.startswith("Logical plan\n") and "Physical plan" in text and "group: dense" in text and "result:" not in text
     ran = subprocess.run(base[:2] + ["--analyze"] + base[2:], capture_output=True, check=True).stdout.decode()
-    assert "rows returned: 7" in ran and "ran:" in ran
+    assert "result: 7 rows in" in ran and "Actual" in ran and "ran:" in ran
     js = run_mx(mx, ["explain", "--format", "json", "SELECT k, sum(d) FROM t GROUP BY k"], {"t": files["parquet"]})
     assert js["analyzed"] is False and js["plan"][0] == "Logical plan" and any(l.strip().startswith("group: dense") for l in js["plan"])
 
@@ -393,7 +393,7 @@ def test_explain_accepts_an_explain_prefix_and_a_file_name(mx, files):
         r = subprocess.run([str(mx), "explain"] + (["--analyze"] if analyze else []) + [text], capture_output=True)
         assert r.returncode == 0, r.stdout
         assert b"Logical plan" in r.stdout and b"group: dense" in r.stdout
-        assert (b"rows returned: 7" in r.stdout) == analyze
+        assert (b"result: 7 rows in" in r.stdout) == analyze
 
 
 def test_sql_with_an_explain_prefix_over_a_file_name_runs(mx, files):

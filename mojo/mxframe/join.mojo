@@ -7,7 +7,7 @@ aggregates, ORDER BY, LIMIT) runs over the joined rows: a table made from the pa
 the build side's columns gathered per block inside the pipeline (`jfront.mojo`).
 """
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .bind import (BoundQuery, BExpr, Catalog, KeySpec, AggSpec, SortKey, copy_query, B_COL, B_LIT, B_AND)
+from .bind import (BoundQuery, BExpr, Catalog, KeySpec, AggSpec, SortKey, copy_query, B_COL, B_LIT, B_AND, B_AGG, F_COUNT_STAR)
 from .joincore import JoinSide, _unique_name
 
 
@@ -79,6 +79,7 @@ def side_query(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> Bo
     """The row query that delivers side `t`: its needed columns, filtered by the conjuncts that read only that side."""
     var sq = copy_query(q)
     var start = q.tab_start[t]
+    sq.explain = 0                                                  # the side runs, whatever the query is asked for
     sq.joined = False
     sq.sources = List[Int]()
     sq.sources.append(q.sources[t])
@@ -369,7 +370,8 @@ def filter_query(q: BoundQuery, conj: List[Int], gcols: List[Int], t: SharedTabl
     return fq^
 
 
-def final_query(q: BoundQuery, left: List[Int], right: List[Int], lt: SharedTable, rt: SharedTable, key_l: List[Int], key_r: List[Int], conj: List[Int]) -> BoundQuery:
+def final_query(q: BoundQuery, left: List[Int], right: List[Int], lt: SharedTable, rt: SharedTable, key_l: List[Int], key_r: List[Int], conj: List[Int],
+                rconj: List[Int] = List[Int](), rconj_text: List[String] = List[String]()) -> BoundQuery:
     """The two-table query that runs the last step of a join order: the rows joined so far (`lt`, whose columns are the global columns `left`) and the
     last table (`rt`, the global columns `right`), joined on the pairs `key_l[i] = key_r[i]` (global numbers), then the rest of the query. `conj`: the conjuncts
     across tables still to check, now over the joined rows."""
@@ -382,6 +384,8 @@ def final_query(q: BoundQuery, left: List[Int], right: List[Int], lt: SharedTabl
         colmap[right[i]] = len(left) + i
     var roots = live_roots(q)
     for e in conj:
+        roots.append(e)
+    for e in rconj:
         roots.append(e)
     _remap_columns(fq, colmap, roots)
     fq.joined = True
@@ -413,10 +417,10 @@ def final_query(q: BoundQuery, left: List[Int], right: List[Int], lt: SharedTabl
         fq.jk_l_names.append(lt.name(colmap[key_l[k]]))
         fq.jk_r_names.append(rt.name(colmap[key_r[k]] - len(left)))
     fq.conj_l = List[Int]()
-    fq.conj_r = List[Int]()
+    fq.conj_r = rconj.copy()
     fq.conj_x = List[Int]()
     fq.conj_l_text = List[String]()
-    fq.conj_r_text = List[String]()
+    fq.conj_r_text = rconj_text.copy()
     fq.conj_x_text = List[String]()
     fq.where = -1
     if len(conj) > 0:
@@ -434,3 +438,38 @@ def final_query(q: BoundQuery, left: List[Int], right: List[Int], lt: SharedTabl
     fq.resid = List[Int]()
     fq.using_cols = List[String]()
     return fq^
+
+
+# ── a side's filter left to the pipeline, and counted (F-155) ────────────────────────────────────────────────────────
+
+def count_query(catalog: Catalog, q: BoundQuery, t: Int) -> BoundQuery:
+    """`SELECT count(*)` over side `t` with the conjuncts that read only it: its exact filtered row count without writing the rows."""
+    var cq = side_query(catalog, q, t, List[Int]())
+    cq.rows = False
+    cq.routs = List[Int]()
+    cq.keys = List[KeySpec]()
+    cq.aggs = List[AggSpec]()
+    cq.aggs.append(AggSpec(F_COUNT_STAR, -1, 0.0, INT.value, 0, "count_star()", "count_star:*:0"))
+    cq.pexprs = List[BExpr]()
+    cq.pexprs.append(BExpr(B_AGG, INT.value, 0, -1, -1, 0, "count_star()", 0, 0))
+    cq.outputs = List[Int]()
+    cq.outputs.append(0)
+    cq.out_names = List[String]()
+    cq.out_names.append("n")
+    cq.out_text = List[String]()
+    cq.out_text.append("count(*)")
+    return cq^
+
+
+def with_probe_filter(q: BoundQuery, t: Int) -> BoundQuery:
+    """The query with side `t`'s own conjuncts added to the filter that runs on the joined rows: the probe side is read unfiltered and the pipeline applies
+    its filter (no filtered copy of it is written)."""
+    var q2 = copy_query(q)
+    var conj = q.conj_l.copy() if t == 0 else q.conj_r.copy()
+    for c in conj:
+        if q2.where < 0:
+            q2.where = c
+        else:
+            q2.rexprs.append(BExpr(B_AND, BOOL.value, 0, q2.where, c, 0, "", 0, 0))
+            q2.where = len(q2.rexprs) - 1
+    return q2^

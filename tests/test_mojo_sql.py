@@ -531,7 +531,6 @@ ERRORS = [
     ("SELECT DISTINCT ON (k) k FROM t", "SQL error at line 1, column 8: `SELECT DISTINCT ON` is not supported yet"),
     ("SELECT z.* FROM t", "SQL error at line 1, column 8: unknown table or alias `z` in `z.*`"),
     ("SELECT CASE WHEN x > 1 THEN 1 END, count(*) FROM t GROUP BY 1", "SQL error at line 1, column 8: `CASE` is not supported yet (F-156)"),
-    ("EXPLAIN ANALYZE SELECT count(*) FROM t", "SQL error at line 1, column 9: `EXPLAIN ANALYZE` is not supported yet (F-155)"),
     ("SELECT sum(x) FROM t WHERE s LIKE 'a%'", "SQL error at line 1, column 30: `LIKE` is not supported yet (F-156)"),
     ("SELECT count(*) FROM t WHERE s IN (SELECT s, x FROM t)", "SQL error at line 1, column 44: a subquery with more than one column is not supported yet"),
     ("SELECT sum(x) OVER () FROM t", "SQL error at line 1, column 15: `OVER` (window functions) is not supported yet"),

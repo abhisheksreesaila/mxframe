@@ -27,9 +27,10 @@ from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
-from .join import needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query
+from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
+                   with_probe_filter)
 from .joincore import JoinKeys, JoinSide, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
-from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
+from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
 from std.memory import ArcPointer
@@ -731,6 +732,47 @@ def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
     return JoinSide(r.take_table().share(), cols^, kc^, False)
 
 
+comptime DEFER_PASS_DEN = 2          # ... and when at least 1 row in this many passes its filter (else the few rows that pass are written: cheaper than probing them all)
+comptime DEFER_MIN_ROWS = 65536      # a filtered table of at least this many rows is counted first and read unfiltered when it is the probe side of a fused join
+
+
+def _can_defer(catalog: Catalog, q: BoundQuery, t: Int, allow: Bool) -> Bool:
+    """Side `t` has a filter, is a plain table (no edits) of enough rows: its filtered rows need not be written when its join is fused (the pipeline filters)."""
+    if not allow:
+        return False
+    var conj = (q.conj_l.copy() if t == 0 else q.conj_r.copy()) if len(q.sources) == 2 else q.leaf_conj[t].copy()
+    if len(conj) == 0:
+        return False
+    ref src = catalog.sources[q.sources[t]]
+    return src.kind == SRC_TABLE and len(src.overlay.mask) == 0 and len(src.overlay.delta) == 0 and src.table.rows() >= DEFER_MIN_ROWS
+
+
+def _count_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, planner: P, opts: PlannerOptions, trust: Bool) raises -> Int:
+    var r = _run_sql_once(catalog, count_query(catalog, q, t), planner, opts, trust, String())
+    return Int(r.table.get(0, 0))
+
+
+def _any_hol(q: BoundQuery) -> Bool:
+    for a in q.aggs:
+        if a.hol:
+            return True
+    return False
+
+
+def _plain_side(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> JoinSide:
+    """Side `t` as its source table itself (nothing filtered: the filter, if any, runs in the pipeline)."""
+    ref src = catalog.sources[q.sources[t]]
+    var start = q.tab_start[t]
+    var keycols = q.jk_l.copy() if t == 0 else q.jk_r.copy()
+    var cols = List[Int]()
+    for g in needed:
+        cols.append(g - start)
+    var kc = List[Int]()
+    for g in keycols:
+        kc.append(g - start)
+    return JoinSide(src.table, cols^, kc^, True)
+
+
 def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
                                 t0: Int) raises -> SqlResult:
     """A query over two tables: each side is reduced to the rows and columns the query needs (a row query over its source, with the filter
@@ -754,64 +796,128 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var lneed = needed_columns(q, 0)
     var rneed = needed_columns(q, 1)                                 # a semi / anti join: the key columns only (the right table has no columns after it)
     var t_sides = perf_counter_ns()
-    var left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
-    var right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
-    var ms_sides = Float64(perf_counter_ns() - t_sides) / 1e6
-    var lrows = left.table.rows()
-    var rrows = right.table.rows()
+    var any_holistic = False
+    for a in q.aggs:
+        if a.hol:
+            any_holistic = True
+    # a big plain table with a filter, on the side that will probe, is counted first: when the join is fused its filter runs in the pipeline and no filtered
+    # copy of it is written. A left, semi or anti join probes with its left table; an inner join with the larger side.
+    var may0 = _can_defer(catalog, q, 0, opts.fuse and not any_holistic)
+    var may1 = kind == 0 and _can_defer(catalog, q, 1, opts.fuse and not any_holistic)
+    var left = _plain_side(catalog, q, 0, lneed)
+    var right = _plain_side(catalog, q, 1, rneed)
+    var lrows = 0
+    var rrows = 0
+    if may0:
+        lrows = _count_side[P](catalog, q, 0, planner, opts, trust)
+        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all
+            may0 = False
+            left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
+    else:
+        left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
+        lrows = left.table.rows()
+    if may1:
+        rrows = _count_side[P](catalog, q, 1, planner, opts, trust)
+        if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
+            may1 = False
+            right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+    else:
+        right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+        rrows = right.table.rows()
     var left_builds = kind == 0 and lrows < rrows                    # left, semi and anti joins build on the right table
     if kind == 0 and opts.build_side == BUILD_LEFT:
         left_builds = True
     elif kind == 0 and opts.build_side == BUILD_RIGHT:
         left_builds = False
+    var defer_probe = -1                                             # the side whose filter is left to the pipeline, or -1
+    if may0 and left_builds:
+        left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)       # the build side is read
+    elif may0:
+        defer_probe = 0
+    if may1 and not left_builds:
+        right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+    elif may1:
+        defer_probe = 1
+    var qe = copy_query(q)
+    if defer_probe >= 0:
+        qe = with_probe_filter(q, defer_probe)
+        if defer_probe == 0:
+            lneed = needed_columns(qe, 0)
+            left = _plain_side(catalog, qe, 0, lneed)
+        else:
+            rneed = needed_columns(qe, 1)
+            right = _plain_side(catalog, qe, 1, rneed)
+    var ms_sides = Float64(perf_counter_ns() - t_sides) / 1e6
     var t_keys = perf_counter_ns()
     var keys = JoinKeys()
-    if left_builds:
-        normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, opts.threads)
-    else:
-        normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, opts.threads)
-    var nb = lrows if left_builds else rrows
-    var np = rrows if left_builds else lrows
+    var m = JoinMap()
     var fmode = 0                                                    # the front stage's mode: 0 inner, 1 left, else a presence filter
     var na_note = String()
-    if kind == 1:
-        fmode = 1
-    elif semi_anti:
-        fmode = PM_SEMI if kind == 2 else PM_ANTI
-        if kind == 4:                                                # NOT IN: an empty list keeps every row; a NULL in the list keeps none; else a NULL key is dropped
-            if rrows == 0:
-                na_note = " (the list is empty: every row is kept, a NULL key too)"
-            elif right.table.null_count(right.key_cols[0]) > 0:
-                fmode = PM_NONE
-                na_note = " (the list holds a NULL: no row passes)"
+    var t_build = perf_counter_ns()
+    var t_probe = perf_counter_ns()
+    var fusable = False
+    var pass_no = 0
+    while True:
+        pass_no += 1
+        keys = JoinKeys()
+        if left_builds:
+            normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, opts.threads)
+        else:
+            normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, opts.threads)
+        var nb0 = left.table.rows() if left_builds else right.table.rows()
+        fmode = 0
+        na_note = String()
+        if kind == 1:
+            fmode = 1
+        elif semi_anti:
+            fmode = PM_SEMI if kind == 2 else PM_ANTI
+            if kind == 4:                                            # NOT IN: an empty list keeps every row; a NULL in the list keeps none; else a NULL key is dropped
+                if rrows == 0:
+                    na_note = " (the list is empty: every row is kept, a NULL key too)"
+                elif right.table.null_count(right.key_cols[0]) > 0:
+                    fmode = PM_NONE
+                    na_note = " (the list holds a NULL: no row passes)"
+                else:
+                    fmode = PM_ANTI_NA
+                    na_note = " (a NULL key is dropped)"
+        t_build = perf_counter_ns()
+        m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti)
+        if fmode == PM_ANTI_NA:
+            unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], left.table.rows())
+        t_probe = perf_counter_ns()
+        fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti)
+        if defer_probe >= 0 and not fusable and pass_no == 1:
+            # the join cannot be fused after all (repeated build keys, hashed keys): read the probe side filtered, as before
+            if defer_probe == 0:
+                lneed = needed_columns(q, 0)
+                left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
             else:
-                fmode = PM_ANTI_NA
-                na_note = " (a NULL key is dropped)"
+                rneed = needed_columns(q, 1)
+                right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+            qe = copy_query(q)
+            defer_probe = -1
+            continue
+        break
+    var nb = left.table.rows() if left_builds else right.table.rows()
+    var np = right.table.rows() if left_builds else left.table.rows()
     if semi_anti:
         right.cols = List[Int]()                                     # nothing of the right table is carried
         rneed = List[Int]()
-    var t_build = perf_counter_ns()
-    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads, semi_anti)
-    if fmode == PM_ANTI_NA:
-        unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], lrows)
-    var t_probe = perf_counter_ns()
     var ncols = len(lneed) + len(rneed)
     var budget = (opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES) // (8 * max(ncols, 1))
     res.notes.append("join: " + _kind_name(kind) + " on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lrows) + " rows of " + _side_names(q, 0) +
                      " and " + commas(rrows) + " rows of " + _side_names(q, 1) + " after their filters" +
                      (" (" + _side_names(q, 0) + " read in place)" if left.zero_copy else "") + (" (" + _side_names(q, 1) + " read in place)" if right.zero_copy else "") + na_note)
+    if defer_probe >= 0:
+        res.notes.append("join probe filter: the filter of " + _side_names(q, defer_probe) + " runs in the pipeline (" + commas(left.table.rows() if defer_probe == 0 else right.table.rows()) +
+                         " rows read, " + commas(lrows if defer_probe == 0 else rrows) + " pass): no filtered copy of it is written")
     res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(nb) + " rows, " +
                      ("the smaller side" if (kind == 0 and opts.build_side == BUILD_AUTO) else "forced by the options" if kind == 0 else "the right side: a " + _kind_name(kind) + " join builds on it") + "): " + m.kind())
     res.notes.append("join keys: " + keys.layout)
     res.notes.append("join time: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build " + _ms(Float64(t_probe - t_build) / 1e6) + " ms")
-    var any_holistic = False
-    for a in q.aggs:
-        if a.hol:
-            any_holistic = True
-    var jq = joined_query(q, lneed, rneed)
+    var jq = joined_query(qe, lneed, rneed)
     var cat2 = Catalog()
     var inner: SqlResult
-    var fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti)
     if fusable:
         # fused: no joined row is written; the pipeline probes block by block (keeps or drops the rows by the join's rule) and gathers the build side's columns into scratch
         var vprobe = List[Bool]()
@@ -889,8 +995,10 @@ struct _Leaf(Movable):
     var gtable: List[Int]            # the global column of each of the table's columns (-1: not one of the query's)
     var rows: Int
     var base_rows: Int
+    var deferred: Bool               # a big plain table whose filter has only been counted: `table` is the unfiltered source (read filtered when it is the last join's probe side)
 
-    def __init__(out self, table: SharedTable, var cols: List[Int], var gcols: List[Int], var gtable: List[Int], rows: Int, base_rows: Int):
+    def __init__(out self, table: SharedTable, var cols: List[Int], var gcols: List[Int], var gtable: List[Int], rows: Int, base_rows: Int, deferred: Bool = False):
+        self.deferred = deferred
         self.table = table
         self.cols = cols^
         self.gcols = gcols^
@@ -930,31 +1038,44 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         for g in needed:
             if table_of_column(q, g) == t:
                 gcols.append(g)
-        ref src = catalog.sources[q.sources[t]]
-        var base_rows = src.table.rows()
-        var table: SharedTable
+        var src_table = catalog.sources[q.sources[t]].table
+        var plain = catalog.sources[q.sources[t]].kind == SRC_TABLE and len(catalog.sources[q.sources[t]].overlay.mask) == 0 and len(catalog.sources[q.sources[t]].overlay.delta) == 0
+        var base_rows = src_table.rows()
+        var table = src_table
         var cols = List[Int]()
         var gtable = List[Int]()
-        if len(q.leaf_conj[t]) == 0 and src.kind == SRC_TABLE and len(src.overlay.mask) == 0 and len(src.overlay.delta) == 0:
-            table = src.table
+        var is_deferred = False
+        var counted = -1
+        if len(q.leaf_conj[t]) == 0 and plain:
+            table = src_table
             for g in gcols:
                 cols.append(g - start)
-            for c in range(src.table.columns()):
+            for c in range(src_table.columns()):
                 gtable.append(start + c)
-        else:
+        elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
+            counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
+            is_deferred = counted * DEFER_PASS_DEN >= base_rows
+            table = src_table
+            for g in gcols:
+                cols.append(g - start)
+            for c in range(src_table.columns()):
+                gtable.append(start + c)
+        if not (len(q.leaf_conj[t]) == 0 and plain) and not is_deferred:
+            cols = List[Int]()
+            gtable = List[Int]()
             var sq = side_query(catalog, q, t, gcols)
             var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
             table = r.take_table().share()
             for i in range(len(gcols)):
                 cols.append(i)
                 gtable.append(gcols[i])
-        var rows = table.rows()
+        var rows = counted if is_deferred else table.rows()
         js.names.append(_label(q, t))
         js.base_rows.append(base_rows)
         js.rows.append(rows)
         res.actuals.append("scan " + _label(q, t) + ": " + commas(base_rows) + " rows, " + commas(rows) + " after " + ("its filter" if len(q.leaf_conj[t]) > 0 else "no filter") +
-                           " (" + String(len(gcols)) + " columns kept), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
-        leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows))
+                           " (" + String(len(gcols)) + " columns kept" + (", counted: its filter may run in the last join's pipeline" if is_deferred else "") + "), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
+        leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows, is_deferred))
     var t_ndv = perf_counter_ns()
     for k in range(len(q.edge_a)):
         var ta = table_of_column(q, q.edge_a[k])
@@ -980,6 +1101,21 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         res.table = tb^
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
+    # a leaf that was only counted is read filtered now, unless it is the last join's probe side (its filter then runs in that join's pipeline)
+    var last_leaf = jp.steps[len(jp.steps) - 1].leaf
+    for t in range(n):
+        if leaves[t].deferred and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new):
+            var t_m = perf_counter_ns()
+            var sq = side_query(catalog, q, t, leaves[t].gcols)
+            var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
+            var tab = r.take_table().share()
+            var cols2 = List[Int]()
+            for i in range(len(leaves[t].gcols)):
+                cols2.append(i)
+            var gt = leaves[t].gcols.copy()
+            var gc = leaves[t].gcols.copy()
+            leaves[t] = _Leaf(tab, cols2^, gc^, gt^, tab.rows(), leaves[t].base_rows, False)
+            res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
     # the steps
     var done = List[Bool](length=len(q.resid), fill=False)
     var joined = 1 << jp.start
@@ -1082,7 +1218,12 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     for k in range(len(q.resid)):
         if not done[k]:
             rest.append(q.resid[k])
-    var fq = final_query(q, cur_g, leaves[lf].gtable, cur_table, leaves[lf].table, key_l, key_r, rest)
+    var rconj = List[Int]()
+    var rtext = List[String]()
+    if leaves[lf].deferred:
+        rconj = q.leaf_conj[lf].copy()
+        rtext = q.leaf_conj_text[lf].copy()
+    var fq = final_query(q, cur_g, leaves[lf].gtable, cur_table, leaves[lf].table, key_l, key_r, rest, rconj, rtext)
     var cat3 = Catalog()
     cat3.add_table("rows joined so far", cur_table)
     cat3.add_table(_label(q, lf), leaves[lf].table)

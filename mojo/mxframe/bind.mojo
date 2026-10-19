@@ -644,7 +644,7 @@ struct _Binder(Movable):
                            self.tab_label(ta) + "." + x.text + " or " + self.tab_label(tb) + "." + x.text + ")")
         if r[1] == 2:
             var hint = closest(x.text, self.src_names)
-            var where_ = ("table `" + self.table_name + "`") if len(self.tab_names) < 2 else (", ".join(self.tab_labels()))
+            var where_ = ("table `" + self.table_name + "`") if len(self.tab_names) < 2 else (" or ".join(self.tab_labels()))
             if x.text2.byte_length() > 0 and len(self.tab_names) > 1:
                 where_ = "`" + x.text2 + "`"
             raise self.err(ast, "column `" + x.text + "` not found in " + where_ +
