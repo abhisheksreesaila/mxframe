@@ -66,6 +66,7 @@ struct Stats(Movable):
     var row_groups: Int
     var edits: Int               # a frame: the changed and appended rows that go through the delta
     var version: Int             # a frame: its edit counter when it was registered
+    var distrusted: Bool         # a file's footer statistics were found wrong in this query: none is used
 
     def __init__(out self, source: String, kind: Int, rows: Int):
         self.source = source
@@ -75,6 +76,7 @@ struct Stats(Movable):
         self.row_groups = 0
         self.edits = 0
         self.version = 0
+        self.distrusted = False
 
 
 @fieldwise_init
@@ -280,7 +282,7 @@ struct RulePlanner(Planner, Copyable, Movable):
                     dense_ok = False
                     if why_not.byte_length() == 0:
                         why_not = ("`" + q.keys[k].name + "` is a FLOAT: floats are grouped by hashing, never by a dense range" if kind == FLOAT.value else
-                                   "the range of `" + q.keys[k].name + "` is " + ("too wide" if cs.has_range else "unknown (the source has no statistics on it)"))
+                                   "the range of `" + q.keys[k].name + "` is " + ("too wide" if cs.has_range else "unknown (" + ("statistics not believed" if st.distrusted else "the source has no statistics on it") + ")"))
                     radix = 1
                 if layout.nullable:
                     radix += 1

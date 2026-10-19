@@ -266,6 +266,7 @@ struct SqlStatement(Movable):
     var items: List[SelectItem]
     var table: String
     var table_alias: String
+    var table_is_file: Bool     # FROM 'orders.parquet': the name is a file path
     var table_line: Int
     var table_col: Int
     var where: Int              # -1 for none
@@ -282,6 +283,7 @@ struct SqlStatement(Movable):
         self.items = List[SelectItem]()
         self.table = String()
         self.table_alias = String()
+        self.table_is_file = False
         self.table_line = 0
         self.table_col = 0
         self.where = -1
@@ -540,14 +542,13 @@ struct _Parser(Movable):
         var tt = self.tok()
         if self.is_sym("("):
             raise self.unsupported(tt, "a subquery in FROM", "F-159")
-        if tt.kind == T_STR:
-            raise self.unsupported(tt, "reading the file '" + tt.text + "' by name in FROM", "F-151")
-        if tt.kind != T_IDENT and tt.kind != T_QIDENT:
-            raise self.expected("a table name")
+        if tt.kind != T_IDENT and tt.kind != T_QIDENT and tt.kind != T_STR:
+            raise self.expected("a table name or 'file name'")
         if tt.kind == T_IDENT and _reserved(tt.up):
             raise self.expected("a table name")
         _ = self.advance()
         self.st.table = tt.text
+        self.st.table_is_file = tt.kind == T_STR
         self.st.table_line = tt.line
         self.st.table_col = tt.col
         if self.is_sym("."):

@@ -29,6 +29,8 @@ import duckdb
 import pyarrow.parquet as pq
 import pytest
 
+from mx_oracle import assert_equal, duck_kind, sort_key
+
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
 WORDS = ["west", "West", "WEST", "east", "East", "North", "NORTH", "south", "Apple", "apple", "banana", "Zebra", "zebra", "mango", "Mango"]
@@ -95,46 +97,6 @@ def got_rows(res):
                 out.append(v)
         rows.append(tuple(out))
     return rows
-
-
-def duck_kind(type_code):
-    t = str(type_code)
-    if t.startswith("DECIMAL"):
-        return "DECIMAL", int(t.split(",")[1].rstrip(")"))
-    if t in ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT"):
-        return "INT", 0
-    if t in ("DOUBLE", "FLOAT"):
-        return "FLOAT", 0
-    if t == "VARCHAR":
-        return "TEXT", 0
-    if t == "DATE":
-        return "DATE", 0
-    if t == "BOOLEAN":
-        return "BOOL", 0
-    return t, 0
-
-
-def sort_key(row):
-    return tuple((0, "") if v is None else (1, repr(v)) for v in row)  # (NaN and every other float sort by their text)
-
-
-def _same_row(a, b):
-    """Equal values, NaN equal to NaN (DuckDB's rule) and compared by value, not by type."""
-    return len(a) == len(b) and all(x == y or (isinstance(x, float) and isinstance(y, float) and x != x and y != y) for x, y in zip(a, b))
-
-
-def assert_equal(got, want, ordered, label):
-    g = list(got)
-    w = [tuple(r) for r in want]
-    assert len(g) == len(w), f"{label}: {len(g)} rows, DuckDB has {len(w)}"
-    if not ordered:
-        g = sorted(g, key=sort_key)
-        w = sorted(w, key=sort_key)
-    for i, (a, b) in enumerate(zip(g, w)):
-        assert _same_row(a, b), f"{label}: row {i}: got {a}, DuckDB has {b}"
-        for x, y in zip(a, b):
-            assert type(x) is type(y) or x is None or y is None or (isinstance(x, (int, Decimal)) and isinstance(y, (int, Decimal))), \
-                f"{label}: row {i}: got {a!r} but DuckDB has {b!r} (a different type)"
 
 
 # ── generated data ───────────────────────────────────────────────────────────────────────────────────

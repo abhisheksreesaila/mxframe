@@ -33,6 +33,13 @@ compares it with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` r
 `mojo/tools/float_probe.mojo` runs builder plans for `tests/test_mojo_float_builder.py`; `mojo/tests/test_float.mojo` is the pure-Mojo test.
 `strtod` (libSystem) parses the digits a fast path cannot: `check_mac_link.sh` lists it for the app's stub.
 
+## `mx`, the agent command line (F-151)
+
+`mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error
+(`docs/mxframe-mojo-api.md`, "The `mx` command line"). `mojo/mxframe/output.mojo` writes a Table as JSON, JSON lines or CSV (exact decimals,
+ISO dates). Build: `pixi run bash scripts/build_mx.sh` → `build/mx` (it fails if libpython or Mojo's Python interop is linked). tests/mx_oracle.py
+runs a SQL string through `build/mx` and DuckDB and compares typed values; tests/test_mx.py uses it.
+
 ## Build switches (F-138b): the package on an app with no GPU, thread pool or codecs
 
 Three compile-time switches, read when the app builds (`mojo build ... -D NAME`), not when the package is built. Each

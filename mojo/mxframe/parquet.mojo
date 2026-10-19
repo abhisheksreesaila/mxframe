@@ -7,6 +7,7 @@ How MX frame's kinds are stored (any Parquet reader understands them):
   DECIMAL  INT64 with the DECIMAL(18, scale) logical type (the stored value is the scaled integer, as in memory)
   DATE     INT32 with the DATE logical type (days since 1970)
   BOOL     BOOLEAN
+  FLOAT    DOUBLE (read: DOUBLE, and FLOAT widened to float64)
   TEXT     BYTE_ARRAY (STRING): a dictionary page with the column's words, data pages of dictionary indices
 A column with nulls is OPTIONAL: its definition levels are the validity bitmap's bits (Parquet packs them the same
 way, least significant first), written as bit-packed runs. Pages are compressed with zstd (default), snappy or not
@@ -304,7 +305,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
                 if v < Int64(Int32.MIN) or v > Int64(Int32.MAX):
                     raise Error("column `" + col.name + "`: day " + String(v) + " does not fit a Parquet DATE")
                 _put32(body, Int(v))
-    else:                                               # INT, DECIMAL: PLAIN int64
+    else:                                               # INT, DECIMAL, FLOAT: PLAIN int64 (a FLOAT's bits are the DOUBLE's)
         for row in range(lo, hi):
             if not col.is_null(row):
                 var v = col.values[row]
@@ -1998,7 +1999,7 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
         done += nvals
 
 
-def _physical_memory() -> Int:
+def physical_memory() -> Int:
     """The machine's physical memory in bytes (sysconf), 0 when it cannot be told."""
     comptime if CompilationTarget.is_linux():
         var pages = external_call["sysconf", Int](Int32(85))         # _SC_PHYS_PAGES
@@ -2017,7 +2018,7 @@ def _check_claim(what: String, rows: Int, ncols: Int) raises:
     its pages decode, and a corrupt page raises when it does."""
     if rows < 0:
         raise Error(what + " claims a negative row count (" + String(rows) + ") (corrupt file)")
-    var ram = _physical_memory()
+    var ram = physical_memory()
     if ram > 0 and rows > ram // (8 * max(ncols, 1)):
         var need = Float64(rows) * 8.0 * Float64(max(ncols, 1))
         raise Error(what + " claims " + String(rows) + " rows: " + String(need / 1e9) + " GB for " + String(ncols) +
@@ -2503,6 +2504,10 @@ struct ParquetScan(Copyable, Movable):
                 return -1
             total += ch.nulls
         return total
+
+    def file_bytes(self) -> Int:
+        """The size of the file in bytes."""
+        return self._info[].size
 
     def group_null_count(self, g: Int, c: Int) -> Int:
         """The nulls row group `g` states for column `c` in its Statistics, -1 when it states none."""
