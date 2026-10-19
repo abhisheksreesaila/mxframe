@@ -30,7 +30,7 @@ from .sqleval import ValCol
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
 from .holistic import float_key
-from .exec import (_table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
+from .exec import (_put_column_owned, _table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
 
 
@@ -623,19 +623,34 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             kc.append(cols[_item_of(items, q, o.expr)].copy())
         fin = _order_rows(kc, q.rorder, dicts, rows_in)
         notes.append("order: sorted " + commas(rows_in) + " rows by " + String(len(q.rorder)) + (" key" if len(q.rorder) == 1 else " keys") + " (stable radix passes)")
-    else:
+    elif offset > 0 or limit >= 0:
         fin = List[Int](length=rows_in, fill=0)
         for i in range(rows_in):
             fin[i] = i
-    var lo = min(offset, len(fin))
-    var hi = len(fin) if limit < 0 else min(len(fin), lo + limit)
-    var pick = List[Int]()
-    for i in range(lo, hi):
-        pick.append(fin[i])
-    var outs = List[ValCol]()
-    for e in q.routs:
-        outs.append(_gather(cols[_item_of(items, q, e)], pick))
-    var table = _to_table(q, outs, dicts)
+    var table: Table
+    if len(q.rorder) == 0 and offset == 0 and limit < 0:
+        # every row, in the order collected: the collected columns become the result's (the last use of a column moves it)
+        table = Table.empty()
+        var last = List[Int](length=len(items), fill=-1)
+        for k in range(len(q.routs)):
+            last[_item_of(items, q, q.routs[k])] = k
+        for k in range(len(q.routs)):
+            var it = _item_of(items, q, q.routs[k])
+            if last[it] == k:
+                _put_column_owned(table, q.out_names[k], cols[it], dicts)
+            else:
+                var dup = cols[it].copy()
+                _put_column_owned(table, q.out_names[k], dup, dicts)
+    else:
+        var lo = min(offset, len(fin))
+        var hi = len(fin) if limit < 0 else min(len(fin), lo + limit)
+        var pick = List[Int]()
+        for i in range(lo, hi):
+            pick.append(fin[i])
+        var outs = List[ValCol]()
+        for e in q.routs:
+            outs.append(_gather(cols[_item_of(items, q, e)], pick))
+        table = _to_table(q, outs, dicts)
     notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if inp.scan_mode else "") + "kernel " + _ms(ms_run - Float64(ns_load) / 1e6) +
                  " ms, order and output " + _ms(Float64(perf_counter_ns() - t_ord) / 1e6) + " ms")
     return table^

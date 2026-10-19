@@ -411,6 +411,36 @@ def _put_column(mut t: Table, name: String, vc: ValCol, dicts: DictAccess) raise
         _fill_column(t.cols[c], vc.v, vc.nul)
 
 
+def _fill_column_owned(mut col: Column, var vals: List[Int64], var nul: List[UInt8]):
+    """`_fill_column` taking the values and the NULL bytes over instead of copying them."""
+    col.values = vals^
+    if len(nul) > 0:
+        var n = len(col.values)
+        col.validity = List[UInt8](length=(n + 7) // 8, fill=0xFF)
+        var nulls = 0
+        for i in range(n):
+            if nul[i] != 0:
+                col.validity[i // 8] &= ~(UInt8(1) << UInt8(i % 8))
+                nulls += 1
+        col.nulls = nulls
+        if nulls == 0:
+            col.validity = List[UInt8]()
+
+
+def _put_column_owned(mut t: Table, name: String, mut vc: ValCol, dicts: DictAccess) raises:
+    """`_put_column` for a column nobody needs afterwards: its values move into the table (a TEXT column's codes are remapped as before)."""
+    if vc.kind == TEXT.value:
+        _put_column(t, name, vc, dicts)
+        return
+    var kind = ColumnKind(vc.kind)
+    var c = t.add_column(_unique_name(t, name), kind, scale=vc.scale)
+    var vals = List[Int64]()
+    var nul = List[UInt8]()
+    swap(vals, vc.v)
+    swap(nul, vc.nul)
+    _fill_column_owned(t.cols[c], vals^, nul^)
+
+
 def _to_table(q: BoundQuery, outs: List[ValCol], dicts: DictAccess) raises -> Table:
     var t = Table.empty()
     for i in range(len(outs)):
