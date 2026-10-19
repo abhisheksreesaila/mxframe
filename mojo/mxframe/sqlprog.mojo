@@ -28,7 +28,7 @@ from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_G
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
                    B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, DERIVED_BASE)
-from .sqlfn import (TFn, CaseTables, parse_text, TF_LOWER, TF_UPPER, TF_LIKE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
+from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
                     DP_DECADE, DP_WEEK, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
@@ -256,6 +256,7 @@ struct _Emitter(Movable):
     var set_meta: List[Int64]
     var case_tabs: Optional[CaseTables]
     var ents: Dict[Int, List[Int64]]     # F-156: per derived TEXT / INT node, its per-word table (code or answer per code of the dictionary it reads)
+    var undecided: Dict[Int, List[UInt8]]    # ... and per node whose function DuckDB does not answer by code points (reverse), the words it is not decided for
     var unions: Dict[Int, TextUnion]     # ... and per CASE / COALESCE over words, its dictionary
     var guard: Int                   # F-156: the register that says where the expression being emitted is live (a CASE branch), -1 for everywhere
 
@@ -263,6 +264,7 @@ struct _Emitter(Movable):
                  var aliases: List[List[Int]], var dicts: DictAccess):
         self.case_tabs = None
         self.ents = Dict[Int, List[Int64]]()
+        self.undecided = Dict[Int, List[UInt8]]()
         self.unions = Dict[Int, TextUnion]()
         self.guard = -1
         self.p = p^
@@ -572,8 +574,14 @@ struct _Emitter(Movable):
             var ents = List[Int64](length=n, fill=0)
             var words = List[String]()
             var seen = Dict[String, Int]()
+            var unk = List[UInt8](length=max(n, 1), fill=0)
+            var any_unk = False
             for k in range(n):
-                var w = self.tfn_word(t, self.dicts.word(d, k))
+                var src_word = self.dicts.word(d, k)
+                if t.func == TF_REVERSE and not reverse_is_exact(src_word):
+                    unk[k] = 1
+                    any_unk = True
+                var w = self.tfn_word(t, src_word)
                 var hit = seen.get(w)
                 if hit:
                     ents[k] = Int64(hit.value())
@@ -583,6 +591,8 @@ struct _Emitter(Movable):
                     words.append(w)
             self.derive_words(e, words^)
             self.ents[e] = ents^
+            if any_unk:
+                self.undecided[e] = unk^
             self.p.text_tabs += 1
             self.p.text_words += n
             return
@@ -722,6 +732,13 @@ struct _Emitter(Movable):
             self.p.text_tabs += 1
             self.p.text_words += n
         var v = self.value(x.a)
+        if e in self.undecided:                                      # words DuckDB answers by grapheme clusters: an error where a row holds one
+            var fu = self.tmp()
+            self.ins(OP_I2F, fu, v.reg)
+            var set_u = self.add_set(self.undecided[e].copy(), 0)
+            self.ins(OP_IN_SET, fu, fu, set_u)
+            self.flag_errors(fu, v.nul, "reverse() of a word with combining marks, joiners or an emoji sequence: DuckDB reverses by grapheme clusters, MX frame by code points")
+            self.free(fu)
         self.tab(v.reg, self.ents[e].copy())
         return V(v.reg, v.nul, False)
 
@@ -903,13 +920,34 @@ struct _Emitter(Movable):
         return acc^
 
     # -- comparisons
+    def operand_value(mut self, node: Int) raises -> V:
+        """A comparison's operand as a value register: a condition (BOOL, not a column or a constant) is 0 / 1 where it is true / false and NULL where unknown."""
+        var x = self.rx[node].copy()
+        if x.kind == BOOL.value and x.op != B_COL and x.op != B_LIT:
+            var b = self.boolean(node)
+            var nul = -1
+            var r = b.reg
+            if b.unk:
+                var half = self.const_f(0.5)
+                nul = self.tmp()
+                self.ins(24, nul, b.reg, half)
+                self.free(half)
+                var one = self.const_f(1.0)
+                self.ins(24, b.reg, b.reg, one)
+                self.free(one)
+            var iv = self.tmp()
+            self.ins(OP_F2I, iv, r)
+            self.free(r)
+            return V(iv, nul, False)
+        return self.value(node)
+
     def cmp_raw(mut self, a_node: Int, b_node: Int, op: Int) raises -> Tuple[Int, Int, Int]:
         """a <op> b over definite values: (r, na, nb), r 1.0 where it holds, na / nb the NULL flags of the operands (-1: never NULL)."""
         var lhs = self.rx[a_node].copy()
         if lhs.kind == TEXT.value:
             return self.text_cmp_raw(a_node, b_node, op)
-        var a = self.value(a_node)
-        var b = self.value(b_node)
+        var a = self.operand_value(a_node)
+        var b = self.operand_value(b_node)
         var r = a.reg
         if a.fl:                                               # DuckDB's order: NaN equals itself and is above every number; -0.0 equals 0.0
             self.ins(op, r, a.reg, b.reg, NAN_AWARE)

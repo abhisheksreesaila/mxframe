@@ -196,6 +196,20 @@ def reverse_of(s: String) -> String:
     return String(unsafe_from_utf8=out)
 
 
+def reverse_is_exact(s: String) -> Bool:
+    """DuckDB reverses a word by grapheme clusters (a letter and its combining marks, an emoji sequence, a flag stay together); reversing code points is the same
+    answer when every character stands alone. True when every code point is one that always does: below U+0300, the Latin, Greek, Cyrillic, Hangul-syllable,
+    kana and CJK letters, and the emoji faces. Anything else (combining marks, joiners, variation selectors, regional indicators, Indic scripts ...) is not decided."""
+    for c in decode(s):
+        if c < 0x300:
+            continue
+        var ok = (0x370 <= c <= 0x482) or (0x48A <= c <= 0x52F) or (0x1E00 <= c <= 0x1EFF) or (0x3041 <= c <= 0x3096) or (0x30A1 <= c <= 0x30FA) or \
+                 (0x4E00 <= c <= 0x9FFF) or (0xAC00 <= c <= 0xD7A3) or (0x1F600 <= c <= 0x1F64F)
+        if not ok:
+            return False
+    return True
+
+
 def trim_chars(s: String, chars: String, left: Bool, right: Bool) -> String:
     """trim / ltrim / rtrim with a set of characters (DuckDB's default is the space only)."""
     var cps = decode(s)

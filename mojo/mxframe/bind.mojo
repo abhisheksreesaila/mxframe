@@ -1047,16 +1047,25 @@ struct _Binder(Movable):
             if real_div and self.in_post:
                 raise self.err(ast, "arithmetic on 32-bit floats after aggregation is not supported: DuckDB does it in 32 bits")
             return self.mk(B_DIV, FLOAT.value, F32_COLUMN if real_div else 0, a, b, 0, "", ast)
+        if op == "//" and (x.kind != INT.value or y.kind != INT.value):
+            # DuckDB: `//` of a float or a decimal is a division of doubles (not floored), and a zero divisor is NULL
+            var real_div = self.float_pair(a, b, ast)
+            if real_div:
+                raise self.err(ast, "`//` on a 32-bit float (REAL) is not supported: DuckDB does it in 32 bits")
+            var div = self.mk(B_DIV, FLOAT.value, 0, a, b, 0, "", ast)
+            var zero = self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(Float64(0.0).to_bits()), "", ast)
+            var is_zero = self.compare(C_EQ, b, zero, ast)
+            var conds: List[Int] = [is_zero]
+            var vals: List[Int] = [self.null_of(FLOAT.value, 0, ast)]
+            return self.make_case(conds, vals, div, ast)
         if x.kind == FLOAT.value or y.kind == FLOAT.value:
-            if op == "//" or op == "%":
-                raise self.err(ast, "`" + op + "` on a FLOAT value is not supported")
+            if op == "%":
+                raise self.err(ast, "`%` on a FLOAT value is not supported: the remainder of doubles is C's fmod, which the kernel's floored remainder does not give exactly")
             var real_op = self.float_pair(a, b, ast)
             if real_op and self.in_post:
                 raise self.err(ast, "arithmetic on 32-bit floats after aggregation is not supported: DuckDB does it in 32 bits")
             return self.mk(B_ADD if op == "+" else B_SUB if op == "-" else B_MUL, FLOAT.value, F32_COLUMN if real_op else 0, a, b, 0, "", ast)
         if op == "//":
-            if x.kind != INT.value or y.kind != INT.value:
-                raise self.err(ast, "`//` on a DECIMAL gives a FLOAT in DuckDB (a floor of doubles), which MX frame does not do yet: use it on integers")
             return self.mk(B_IDIV, INT.value, 0, a, b, 0, "", ast)
         if op == "*":
             var scale = x.scale + y.scale

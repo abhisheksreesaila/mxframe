@@ -318,6 +318,8 @@ def test_a_long_in_list_runs_through_the_kernels_hash_set(probe, data):
 ARITH = [
     "x / y", "x // y", "x % y", "d / y", "d % y", "d % e", "d + e", "d - e", "d * e", "d * y", "d / e", "x / 0", "x % 0", "x // 0", "7 / x", "7.5 / x", "7 // x", "7 % x",
     "-x // y", "-x % y", "x * y", "x + d", "d % 3", "d % 0", "e % d", "f / y", "f / 0", "f * x", "f + d", "y / y", "x // -3", "x % -3", "d % -3", "(x + y) % 4",
+    "f // y", "f // 0", "f // 0.5", "d // y", "d // 3", "d // 0", "x // d", "7.5 // x", "x // 2.0", "d // e",
+    "CASE WHEN y <> 0 THEN x / y END",
 ]
 
 
@@ -346,6 +348,11 @@ CASTS = [
 
 def duck_cast_sql(expr):
     return expr
+
+
+def test_a_float_remainder_is_refused_by_name(probe, data):
+    res = run_probe(probe, "SELECT f % 3 FROM t", {"t": data.path}, expect_error=True)
+    assert "`%` on a FLOAT value is not supported" in res["error"], res
 
 
 @pytest.mark.parametrize("mode", MODES)
