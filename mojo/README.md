@@ -26,6 +26,13 @@ kernel program in SQL's mode), `sqleval.mojo` (HAVING, ORDER BY and select expre
 results, the finish, `sql`). `mojo/tools/sql_probe.mojo` runs one SQL string over Parquet files and prints typed JSON (tests/test_mojo_sql.py
 compares it with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` run in `pixi run mojo-test`.
 
+## `mx`, the agent command line (F-151)
+
+`mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error
+(`docs/mxframe-mojo-api.md`, "The `mx` command line"). `mojo/mxframe/output.mojo` writes a Table as JSON, JSON lines or CSV (exact decimals,
+ISO dates). Build: `pixi run bash scripts/build_mx.sh` → `build/mx` (it fails if libpython or Mojo's Python interop is linked). tests/mx_oracle.py
+runs a SQL string through `build/mx` and DuckDB and compares typed values; tests/test_mx.py uses it.
+
 ## Build switches (F-138b): the package on an app with no GPU, thread pool or codecs
 
 Three compile-time switches, read when the app builds (`mojo build ... -D NAME`), not when the package is built. Each

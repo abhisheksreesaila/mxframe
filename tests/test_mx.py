@@ -1,0 +1,283 @@
+"""F-151: the `mx` agent command line (build/mx), checked as a user runs it: arguments in, JSON / text / files out, exit codes.
+
+Answers are compared with DuckDB through tests/mx_oracle.py (typed values, exact decimals); the rest checks the shape an agent
+reads: the JSON keys, errors with line / column / hint and exit 1, usage errors with exit 2, output formats, `schema`, `explain`.
+"""
+import csv
+import datetime
+import io
+import json
+import struct
+import subprocess
+from decimal import Decimal
+
+import duckdb
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+from mx_oracle import check, mx_binary, run_mx, typed_rows
+
+
+@pytest.fixture(scope="session")
+def mx():
+    return mx_binary()
+
+
+@pytest.fixture(scope="session")
+def con():
+    return duckdb.connect()
+
+
+@pytest.fixture(scope="session")
+def files(tmp_path_factory, con):
+    d = tmp_path_factory.mktemp("mxdata")
+    con.execute("""create table src as select i as id, (i % 7)::bigint as k,
+        case when i % 11 = 0 then null else ((i * 37) % 100000)::decimal(12,2) end as d,
+        date '2020-01-01' + (i % 400)::int as dt,
+        case i % 5 when 0 then 'a b' when 1 then 'Q"uo\\te' when 2 then 'new' || chr(10) || 'line' when 3 then 'ünï' else null end as s,
+        i % 3 = 0 as b
+        from range(0, 5000) r(i)""")
+    pq_path = d / "t.parquet"
+    pq.write_table(con.execute("select * from src").to_arrow_table(), pq_path, row_group_size=700)
+    csv_path = d / "c.csv"
+    con.execute(f"copy (select id, k, s from src where s is not null and s not like '%' || chr(10) || '%') to '{csv_path}' (header)")
+    return {"parquet": pq_path, "csv": csv_path, "dir": d}
+
+
+QUERIES = [
+    "SELECT count(*), sum(d), min(dt), max(dt), avg(d), count(s) FROM t",
+    "SELECT k, count(*), sum(d), avg(d) FROM t GROUP BY k ORDER BY k",
+    "SELECT s, count(*) c FROM t GROUP BY s ORDER BY c DESC, s",
+    "SELECT b, k, max(dt), count(d) FROM t GROUP BY b, k",
+    "SELECT k, sum(d) s FROM t GROUP BY k HAVING sum(d) > 1000000 ORDER BY k",
+    "SELECT k % 3 m, count(*) FROM t WHERE d IS NOT NULL AND s <> 'ünï' GROUP BY k % 3",
+    "SELECT count(*), avg(d) / 0, sum(id) // 0 FROM t",
+    "SELECT k, quantile_disc(dt, 0.5), count(DISTINCT s) FROM t GROUP BY k",
+]
+
+
+@pytest.mark.parametrize("sql", QUERIES)
+def test_a_query_equals_duckdb_by_table_name_and_by_file_name(mx, con, files, sql):
+    check(mx, sql, con, files={"t": files["parquet"]}, duck_sql=sql.replace("FROM t", f"FROM read_parquet('{files['parquet']}')"))
+    quoted = sql.replace("FROM t", f"FROM '{files['parquet']}'")
+    check(mx, quoted, con, duck_sql=quoted)
+
+
+@pytest.mark.parametrize("sql", QUERIES[:4])
+def test_streaming_and_reading_whole_give_the_same_answer(mx, con, files, sql):
+    want = sql.replace("FROM t", f"FROM read_parquet('{files['parquet']}')")
+    streamed = check(mx, sql, con, files={"t": files["parquet"]}, duck_sql=want, extra=["--stream", "always"])
+    whole = check(mx, sql, con, files={"t": files["parquet"]}, duck_sql=want, extra=["--stream", "never"])
+    assert any("streamed a row group at a time (8 row groups, 5000 rows)" in n for n in streamed["notes"]), streamed["notes"]
+    assert any("read into memory (5000 rows" in n for n in whole["notes"]), whole["notes"]
+
+
+def test_a_parquet_file_over_a_quarter_of_memory_streams(mx, files):
+    size = files["parquet"].stat().st_size
+    small = run_mx(mx, ["sql", "SELECT count(*) FROM t", "--memory", str(size * 3)], {"t": files["parquet"]})
+    big = run_mx(mx, ["sql", "SELECT count(*) FROM t", "--memory", str(size * 5)], {"t": files["parquet"]})
+    assert small["rows"] == [[5000]] and any("streamed" in n for n in small["notes"]), small["notes"]
+    assert big["rows"] == [[5000]] and any("read into memory" in n for n in big["notes"]), big["notes"]
+
+
+def test_a_csv_file_is_read_by_name(mx, con, files):
+    path = files["csv"]
+    sql = f"SELECT k, count(*), min(id), max(s) FROM '{path}' GROUP BY k"
+    check(mx, sql, con, duck_sql=sql)
+
+
+def test_the_json_shape(mx, files):
+    out = run_mx(mx, ["sql", "SELECT k, sum(d) total, min(dt) first_day FROM t GROUP BY k ORDER BY k LIMIT 2"], {"t": files["parquet"]})
+    assert list(out) == ["columns", "rows", "row_count", "truncated", "ms", "device", "notes"]
+    assert out["columns"] == [{"name": "k", "kind": "INT", "scale": 0}, {"name": "total", "kind": "DECIMAL", "scale": 2},
+                              {"name": "first_day", "kind": "DATE", "scale": 0}]
+    assert out["row_count"] == 2 and out["truncated"] is False and out["device"] == "cpu"
+    assert isinstance(out["ms"], Decimal) and all(isinstance(n, str) for n in out["notes"])
+    k0 = out["rows"][0]
+    assert k0[0] == 0 and isinstance(k0[1], Decimal) and k0[2] == "2020-01-01"
+
+
+def test_decimals_are_exact_number_text_and_text_is_escaped(mx, files):
+    p = subprocess.run([str(mx), "sql", "SELECT s, sum(d) FROM t GROUP BY s ORDER BY s", "-t", f"t={files['parquet']}"], capture_output=True)
+    raw = p.stdout.decode("utf-8")
+    assert '"Q\\"uo\\\\te"' in raw and '"new\\nline"' in raw and '"ünï"' in raw
+    assert json.loads(raw)["rows"][-1][0] is None                                    # NULL text sorts last
+    assert ",1234567.80]" in raw or "." in raw.split('"rows":')[1]                    # a number, never a quoted string
+    for row in json.loads(raw, parse_float=Decimal)["rows"]:
+        assert row[1] is None or isinstance(row[1], Decimal)
+
+
+def test_device_gpu_is_accepted_and_the_notes_say_it_ran_on_the_cpu(mx, files):
+    out = run_mx(mx, ["sql", "SELECT count(*) FROM t", "--device", "gpu"], {"t": files["parquet"]})
+    assert out["rows"] == [[5000]] and out["device"] == "cpu"
+    assert "device: --device gpu asked for; SQL runs on the CPU in this version" in out["notes"]
+
+
+def test_max_rows_truncates_and_says_so(mx, files):
+    out = run_mx(mx, ["sql", "SELECT id, count(*) FROM t GROUP BY id ORDER BY id", "--max-rows", "3"], {"t": files["parquet"]})
+    assert out["rows"] == [[0, 1], [1, 1], [2, 1]] and out["row_count"] == 5000 and out["truncated"] is True
+    default = run_mx(mx, ["sql", "SELECT id, count(*) FROM t GROUP BY id ORDER BY id"], {"t": files["parquet"]})
+    assert len(default["rows"]) == 1000 and default["row_count"] == 5000 and default["truncated"] is True
+    everything = run_mx(mx, ["sql", "SELECT id, count(*) FROM t GROUP BY id", "--max-rows", "0"], {"t": files["parquet"]})
+    assert len(everything["rows"]) == 5000 and everything["truncated"] is False
+
+
+def test_jsonl_and_csv_output(mx, files):
+    sql = "SELECT k, sum(d) total, min(dt) day, min(s) s FROM t GROUP BY k ORDER BY k LIMIT 2"
+    base = [str(mx), "sql", sql, "-t", f"t={files['parquet']}"]
+    lines = subprocess.run(base + ["--format", "jsonl"], capture_output=True, check=True).stdout.decode().splitlines()
+    first = json.loads(lines[0], parse_float=Decimal)
+    assert len(lines) == 2 and list(first) == ["k", "total", "day", "s"] and first["day"] == "2020-01-01" and isinstance(first["total"], Decimal)
+    text = subprocess.run(base + ["--format", "csv"], capture_output=True, check=True).stdout.decode()
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[0] == ["k", "total", "day", "s"] and len(rows) == 3 and rows[1][2] == "2020-01-01"
+
+
+def test_parquet_output_writes_every_row_and_reads_back(mx, con, files):
+    out = files["dir"] / "out.parquet"
+    summary = run_mx(mx, ["sql", "SELECT k, sum(d) total, min(dt) day FROM t GROUP BY k", "--format", "parquet", "--out", str(out)], {"t": files["parquet"]})
+    assert summary["row_count"] == 7 and summary["out"] == str(out)
+    got = con.execute(f"select k, total, day from read_parquet('{out}') order by k").fetchall()
+    want = con.execute(f"select k, sum(d), min(dt) from read_parquet('{files['parquet']}') group by k order by k").fetchall()
+    assert got == want
+    assert len(want) == 7
+
+
+def test_json_out_writes_the_file_and_prints_a_summary(mx, files):
+    out = files["dir"] / "out.json"
+    summary = run_mx(mx, ["sql", "SELECT k, count(*) FROM t GROUP BY k ORDER BY k", "--out", str(out)], {"t": files["parquet"]})
+    assert summary["row_count"] == 7 and summary["out"] == str(out)
+    assert len(json.loads(out.read_text())["rows"]) == 7
+
+
+def test_float_specials_are_strings_in_json(mx, files):
+    out = run_mx(mx, ["sql", "SELECT avg(d) / 0, 0 * (avg(d) / 0), -avg(d) / 0 FROM t"], {"t": files["parquet"]})
+    assert out["rows"] == [["Infinity", "NaN", "-Infinity"]], out["rows"]
+    f = typed_rows(out)[0]
+    assert f[0] == float("inf") and f[1] != f[1] and f[2] == float("-inf")
+
+
+# ── errors ───────────────────────────────────────────────────────────────────────────────────────────
+
+def test_a_query_error_is_json_with_position_and_exit_1(mx, files):
+    out = run_mx(mx, ["sql", "SELECT k, sum(dd) FROM t GROUP BY k"], {"t": files["parquet"]}, expect_exit=1)
+    e = out["error"]
+    assert list(e) == ["message", "line", "column", "hint"]
+    assert (e["line"], e["column"]) == (1, 15) and "dd" in e["message"] and "column" in e["message"]
+    assert "did you mean" not in e["message"]
+    multi = run_mx(mx, ["sql", "SELECT k,\n  sum(d)\nFROM t\nGROUP BY kk"], {"t": files["parquet"]}, expect_exit=1)
+    assert multi["error"]["line"] == 4
+
+
+def test_a_near_miss_gets_a_hint(mx, files):
+    out = run_mx(mx, ["sql", "SELECT sum(dt2) FROM t"], {"t": files["parquet"]}, expect_exit=1)
+    assert out["error"]["hint"] and "dt" in out["error"]["hint"]
+
+
+def test_a_missing_table_names_what_is_open(mx, files):
+    out = run_mx(mx, ["sql", "SELECT count(*) FROM orders"], {"t": files["parquet"]}, expect_exit=1)
+    assert "orders" in out["error"]["message"] and "t" in out["error"]["hint"]
+    none = run_mx(mx, ["sql", "SELECT count(*) FROM orders"], expect_exit=1)
+    assert none["error"]["hint"] and "-t" in none["error"]["hint"]
+
+
+def test_a_missing_file_is_a_query_error(mx, files):
+    out = run_mx(mx, ["sql", "SELECT count(*) FROM '/nonexistent/x.parquet'"], expect_exit=1)
+    assert "/nonexistent/x.parquet" in out["error"]["message"] and "no such file" in out["error"]["message"]
+
+
+@pytest.mark.parametrize("args", [
+    ["sql"],
+    ["sql", "SELECT 1", "SELECT 2"],
+    ["sql", "SELECT count(*) FROM t", "--format", "xml"],
+    ["sql", "SELECT count(*) FROM t", "--max-rows", "many"],
+    ["sql", "SELECT count(*) FROM t", "--bogus"],
+    ["sql", "SELECT count(*) FROM t", "--device", "fpga"],
+    ["sql", "SELECT count(*) FROM t", "--format", "parquet"],
+    ["frobnicate"],
+    [],
+])
+def test_a_usage_error_is_json_with_the_usage_and_exit_2(mx, files, args):
+    out = run_mx(mx, args, {"t": files["parquet"]}, expect_exit=2)
+    assert out["error"]["message"] and out["error"]["line"] is None and "mx sql" in out["error"]["hint"]
+
+
+def test_a_long_or_chain_hits_the_depth_limit_and_in_is_the_way(mx, con, files):
+    chain = " OR ".join(f"k = {i}" for i in range(300))
+    out = run_mx(mx, ["sql", f"SELECT count(*) FROM t WHERE {chain}"], {"t": files["parquet"]}, expect_exit=1)
+    assert "IN" in out["error"]["hint"], out["error"]
+    ints = ", ".join(str(i) for i in range(40))
+    check(mx, f"SELECT count(*) FROM t WHERE k IN ({ints})", con, files={"t": files["parquet"]},
+          duck_sql=f"SELECT count(*) FROM read_parquet('{files['parquet']}') WHERE k IN ({ints})")
+    words = ", ".join(f"'w{i}'" for i in range(300)) + ", 'ünï'"
+    check(mx, f"SELECT count(*) FROM t WHERE s IN ({words})", con, files={"t": files["parquet"]},
+          duck_sql=f"SELECT count(*) FROM read_parquet('{files['parquet']}') WHERE s IN ({words})")
+
+
+# ── schema and explain ───────────────────────────────────────────────────────────────────────────────
+
+def test_schema_of_a_parquet_file(mx, files):
+    out = run_mx(mx, ["schema", str(files["parquet"]), "--rows", "2"])
+    assert out["format"] == "parquet" and out["rows"] == 5000 and out["row_groups"] == 8
+    cols = {c["name"]: c for c in out["columns"]}
+    assert list(cols) == ["id", "k", "d", "dt", "s", "b"]
+    assert cols["d"]["kind"] == "DECIMAL" and cols["d"]["scale"] == 2 and cols["d"]["nulls"] == 455
+    assert cols["s"]["kind"] == "TEXT" and cols["s"]["nulls"] == 1000 and cols["s"]["distinct_words"] == 4
+    assert cols["id"]["first_values"] == [0, 1] and cols["id"]["nulls"] == 0 and cols["dt"]["first_values"][0] == "2020-01-01"
+    assert cols["b"]["kind"] == "BOOL"
+
+
+def test_schema_of_a_csv_file(mx, files):
+    out = run_mx(mx, ["schema", str(files["csv"])])
+    assert out["format"] == "csv" and [c["name"] for c in out["columns"]] == ["id", "k", "s"]
+    assert [c["kind"] for c in out["columns"]] == ["INT", "INT", "TEXT"]
+
+
+def test_explain_prints_both_plans_and_analyze_runs_it(mx, files):
+    base = [str(mx), "explain", "SELECT k, sum(d) FROM t GROUP BY k", "-t", f"t={files['parquet']}"]
+    text = subprocess.run(base, capture_output=True, check=True).stdout.decode()
+    assert text.startswith("Logical plan\n") and "Physical plan" in text and "group: dense" in text and "rows returned" not in text
+    ran = subprocess.run(base[:2] + ["--analyze"] + base[2:], capture_output=True, check=True).stdout.decode()
+    assert "rows returned: 7" in ran and "ran:" in ran
+    js = run_mx(mx, ["explain", "--format", "json", "SELECT k, sum(d) FROM t GROUP BY k"], {"t": files["parquet"]})
+    assert js["analyzed"] is False and js["plan"][0] == "Logical plan" and any(l.strip().startswith("group: dense") for l in js["plan"])
+
+
+def test_explain_of_a_bad_query_is_an_error(mx, files):
+    out = run_mx(mx, ["explain", "SELECT nope FROM t GROUP BY nope"], {"t": files["parquet"]}, expect_exit=1)
+    assert out["error"]["line"] == 1
+
+
+# ── a footer that lies ───────────────────────────────────────────────────────────────────────────────
+
+def test_a_lying_footer_runs_again_and_the_note_says_statistics_not_believed(mx, con, tmp_path):
+    n = 2000
+    g = [i % 10 for i in range(n)]
+    g[1500] = 1000
+    honest = tmp_path / "honest.parquet"
+    pq.write_table(pa.table({"g": pa.array(g, pa.int64())}), honest, row_group_size=500, write_page_index=False)
+    raw = bytearray(honest.read_bytes())
+    flen = struct.unpack("<I", raw[-8:-4])[0]
+    start = len(raw) - 8 - flen
+    foot = bytes(raw[start:-8]).replace(struct.pack("<q", 1000), struct.pack("<q", 9))
+    lie = tmp_path / "lie.parquet"
+    lie.write_bytes(bytes(raw[:start]) + foot + bytes(raw[-8:]))
+    sql = "SELECT g, count(*) FROM t GROUP BY g"
+    out = check(mx, sql, con, files={"t": lie}, duck_sql=sql.replace("FROM t", f"FROM read_parquet('{honest}')"), extra=["--stream", "always"])
+    notes = "\n".join(out["notes"])
+    assert "statistics: " in notes and "ran again without them" in notes
+    assert "the range of `g` is unknown (statistics not believed)" in notes or "group: hashed" in notes
+
+
+def test_cold_start_is_fast(mx, files):
+    import time
+    best = min(_time(mx, files) for _ in range(5))
+    assert best < 0.25, f"a cold `mx sql` took {best * 1000:.0f} ms"
+
+
+def _time(mx, files):
+    import time
+    t = time.perf_counter()
+    subprocess.run([str(mx), "sql", "SELECT count(*) FROM t", "-t", f"t={files['parquet']}"], capture_output=True, check=True)
+    return time.perf_counter() - t

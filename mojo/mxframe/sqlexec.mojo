@@ -391,6 +391,7 @@ def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess, trust: Bool = T
     var st = Stats(src.name, src.kind, src.rows() + (len(src.overlay.delta) if src.kind != SRC_SCAN else 0))
     st.edits = len(src.overlay.delta)
     st.version = src.version
+    st.distrusted = not trust
     if src.scan:
         st.row_groups = src.scan.value().row_groups()
     for c in range(src.table.columns()):

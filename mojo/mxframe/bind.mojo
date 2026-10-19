@@ -1004,6 +1004,8 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     var src = catalog.find(st.table)
     if src < 0:
         var hint = closest(st.table, catalog.names())
+        if st.table_is_file:
+            raise sql_error(st.table_line, st.table_col, "the file '" + st.table + "' is not open: the `mx` command opens a file named in FROM; with the library, add it to the Catalog under that name")
         raise sql_error(st.table_line, st.table_col, "table `" + st.table + "` not found" +
                         ((" (did you mean `" + hint + "`?)") if hint.byte_length() > 0 else
                          (" (the catalog has " + ", ".join(catalog.names()) + ")") if len(catalog.sources) > 0 else " (the catalog is empty)"))
