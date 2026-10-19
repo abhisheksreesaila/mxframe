@@ -1647,3 +1647,12 @@ Plugins over generic core primitives; the core never learns about agents.
 - [ ] F-172 plugin: agent search: keyword (per dictionary word) + vector + SQL filters in one call, rank fusion, results with why they matched
 - [ ] F-173 core: user-defined functions run per block (Mojo), and a plugin: classification / decision API (rules, embeddings vs labelled examples, small models), batched on the GPU
 - [ ] F-174 plugin: agent memory: append-only facts with time and source, queried as a table (versions via M9 when it exists)
+
+## M11 Linux fast path + an Omarchy edition [parked: after the core is stable with omxapp; owner 2026-10-19]
+Owner: "if you want the absolute best performance, we ship Omarchy Linux with these things" (and, later, the bigger economics of shipping our own hardware with the software). The core stays portable: a Linux fast path behind build switches (as F-138b's), on automatically where the kernel supports it, with a fallback. Measure first (F-166 shows where the time goes; today streamed queries are bound by decompression on the CPU, not the disk).
+- [ ] GPUDirect Storage (NVIDIA cuFile): file bytes from NVMe straight into GPU memory, skipping host RAM (the upload was 8 of every 8.75 ms per row group in F-146: the step most likely to make the GPU win on big machines too)
+- [ ] io_uring with registered buffers for cold reads (many small row groups, files not in the page cache)
+- [ ] huge pages for the page cache (large folios, readahead tuned), CPU pinning and NUMA placement of workers, then sched_ext experiments for barrier idle time
+- [ ] build tuning: profile-guided optimisation and post-link layout, native CPU targets per release
+- [ ] an Omarchy package: a tuned profile (performance governor, transparent huge pages, isolated cores), kernel flags, GPU drivers with GPUDirect Storage, so omxcore runs at full speed out of the box
+- [ ] later, a business decision: a reference box (NVMe + GPU + Omarchy + omxcore) as a data appliance

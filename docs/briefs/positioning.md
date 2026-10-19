@@ -79,3 +79,5 @@ live in plugins over them.
 3. Close the top gaps: join speed (F-161), sort and large outputs, then window functions.
 4. Rename (F-165), release 0.7.0, an MCP server for `mx` (F-169), and the agent-native plugins (M10: vector search on the GPU first).
 5. Then joins bigger than RAM and the SQL long tail.
+
+First priority (owner, 2026-10-19): **stabilise the core together with omxapp** (M8 and its gate, apps on omxcore working end to end). Then, for the absolute best performance, **M11: a Linux fast path and an Omarchy edition** (GPUDirect Storage, io_uring, huge pages, CPU pinning, a tuned Omarchy profile), and later the economics of shipping it on our own hardware.
