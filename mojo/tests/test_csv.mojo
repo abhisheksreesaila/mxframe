@@ -73,8 +73,29 @@ def test_decimals() raises:
     check_row(r, 1, "200;25000;-7;50")
     check_row(r, 2, "-325;1;150;600")
     var wide = read("dec2.csv", "x\n0.123456\n-0.123456\n")
-    expect(wide.table.kind(0) == DECIMAL and wide.table.scale(0) == 6 and wide.table.get(0, 0) == 123456 and wide.table.get(0, 1) == -123456,
-           "5 to 9 places: an exact DECIMAL at that scale (F-157)")
+    expect(wide.table.kind(0) == FLOAT and wide.table.get_float(0, 0) == 0.123456 and wide.table.get_float(0, 1) == -0.123456,
+           "more than 4 places: FLOAT, as DuckDB reads it (F-157)")
+    var exact_opts = CsvOptions()
+    exact_opts.decimal_columns.append("x")
+    var opt_in = read_csv(write_file("dec2d.csv", "x\n0.123456\n-0.123456\n7\n"), exact_opts)
+    expect(opt_in.table.kind(0) == DECIMAL and opt_in.table.scale(0) == 6 and opt_in.table.get(0, 0) == 123456 and opt_in.table.get(0, 1) == -123456
+           and opt_in.table.get(0, 2) == 7000000, "decimal_columns: an exact DECIMAL at the scale the first rows need")
+    var refused = False
+    try:
+        var o2 = CsvOptions()
+        o2.decimal_columns.append("x")
+        _ = read_csv(write_file("dec2e.csv", "x\n123456789012.123456789\n"), o2)
+    except e:
+        refused = String(e).find("cannot be read as an exact DECIMAL") >= 0
+    expect(refused, "decimal_columns on a value that does not fit int64 raises, naming the column")
+    refused = False
+    try:
+        var o3 = CsvOptions()
+        o3.decimal_columns.append("x")
+        _ = read_csv(write_file("dec2f.csv", "x\n1e5\n"), o3)
+    except e:
+        refused = String(e).find("cannot be read as an exact DECIMAL") >= 0
+    expect(refused, "and on a value that is not a plain number")
     var long = read("dec2b.csv", "x\n0.1234567891\n-1.5\n")
     expect(long.table.kind(0) == FLOAT and long.table.get_float(0, 0) == 0.1234567891 and long.table.get_float(0, 1) == -1.5,
            "more than 9 places: FLOAT, correctly rounded")

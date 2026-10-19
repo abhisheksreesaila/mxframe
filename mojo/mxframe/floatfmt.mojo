@@ -23,16 +23,21 @@ def _exact_digits(x: Float64) -> Tuple[List[UInt8], Int]:
         dig.append(UInt8(m % 10))
         m //= 10
     var times = e2 if e2 >= 0 else -e2
-    var factor = UInt32(2) if e2 >= 0 else UInt32(5)
-    for _ in range(times):
-        var carry = UInt32(0)
+    var base = UInt64(2) if e2 >= 0 else UInt64(5)
+    while times > 0:                            # in chunks: 2^16 or 5^8 at a time
+        var k = min(times, 16 if e2 >= 0 else 8)
+        var factor = UInt64(1)
+        for _ in range(k):
+            factor *= base
+        var carry = UInt64(0)
         for i in range(len(dig)):
-            var v = UInt32(dig[i]) * factor + carry
+            var v = UInt64(dig[i]) * factor + carry
             dig[i] = UInt8(v % 10)
             carry = v // 10
         while carry > 0:
             dig.append(UInt8(carry % 10))
             carry //= 10
+        times -= k
     var out = List[UInt8]()
     var i = len(dig) - 1
     while i >= 0:
@@ -118,7 +123,22 @@ def float_text(x: Float64) -> String:
         return "-0.0" if UInt64(x.to_bits()) >> 63 != 0 else "0.0"
     var text = String(x)
     var back = Float64(0.0)
-    if parse_float_text(text, back) == F_OK and UInt64(back.to_bits()) == UInt64(x.to_bits()):
+    var sig = 0                                  # significant digits of Mojo's text
+    var seen_nonzero = False
+    var count = 0
+    for ch in text.as_bytes():
+        if ch == 101 or ch == 69:                # the exponent
+            break
+        if ch >= 48 and ch <= 57:
+            if ch != 48:
+                seen_nonzero = True
+            if seen_nonzero:
+                count += 1
+                if ch != 48:
+                    sig = count                  # (trailing zeros are not significant)
+    # up to 15 digits the shortest text is unique and Mojo's is it; with 16 or 17 Mojo may pick a digit that is not the nearest on an exact tie
+    # (or one too few that does not read back), so those are rebuilt from the exact expansion, rounding half to even as Python's repr does
+    if sig <= 15 and parse_float_text(text, back) == F_OK and UInt64(back.to_bits()) == UInt64(x.to_bits()):
         return text^
     var neg = x < 0.0
     var ex = _exact_digits(-x if neg else x)

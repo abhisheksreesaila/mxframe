@@ -388,6 +388,44 @@ def test_float_text_is_the_shortest_that_reads_back() raises:
     expect(rr.table.get_float(0, 0) == x, "it reads back: " + t)
 
 
+def test_money_with_many_places_is_float_by_default_and_exact_on_request() raises:
+    """fx.csv: rate has 6 places and qty is large. Read as DuckDB does (FLOAT) `sum(rate * qty)` answers; as an exact DECIMAL(6) the product
+    passes int64 and raises readably, while `sum(rate)` is exact."""
+    makedirs(DIR, exist_ok=True)
+    var path = DIR + "fx.csv"
+    var rng = Rng(3)
+    var exact_total = Int64(0)
+    var float_total = Float64(0.0)
+    with open(path, "w") as f:
+        f.write("rate,qty\n")
+        for _ in range(200_000):
+            var micro = rng.int(1_000_000, 999_999_999)
+            var qty = rng.int(100_000, 1_000_000)
+            exact_total += Int64(micro)
+            float_total += Float64(micro) / 1.0e6 * Float64(qty)
+            f.write(String(micro // 1_000_000) + "." + String(1_000_000 + micro % 1_000_000)[byte=1:] + "," + String(qty) + "\n")
+    var by_default = read_csv(path)
+    expect(by_default.table.kind(0) == FLOAT, "6 places: FLOAT by default")
+    var cat = Catalog()
+    cat.add_table("fx", by_default.take_table().share())
+    var r = sql(cat, "SELECT sum(rate * qty), sum(rate) FROM fx")
+    expect(r.table.get_float(0, 0) > 1.0e13 and abs(r.table.get_float(0, 0) / float_total - 1.0) < 1e-9, "the product sum answers, as DuckDB's does")
+    var opts = CsvOptions()
+    opts.decimal_columns.append("rate")
+    var exact = read_csv(path, opts)
+    expect(exact.table.kind(0) == DECIMAL and exact.table.scale(0) == 6, "decimal_columns: DECIMAL(6)")
+    var cat2 = Catalog()
+    cat2.add_table("fx", exact.take_table().share())
+    var s1 = sql(cat2, "SELECT sum(rate) FROM fx")
+    expect(s1.table.get(0, 0) == exact_total, "the exact sum of the six-place rates, to the last digit")
+    var raised = False
+    try:
+        _ = sql(cat2, "SELECT sum(rate * qty) FROM fx")
+    except e:
+        raised = String(e).find("passed the int64 range") >= 0
+    expect(raised, "and the exact product sum raises readably (no int128 behind it)")
+
+
 def sql_table() raises -> Table:
     var t = Table.empty()
     var k = t.add_column("k", FLOAT)
@@ -465,4 +503,5 @@ def main() raises:
     test_sql_floats()
     test_digits_parse_in_the_c_locale_whatever_the_process_locale()
     test_float_text_is_the_shortest_that_reads_back()
+    test_money_with_many_places_is_float_by_default_and_exact_on_request()
     print("ok")

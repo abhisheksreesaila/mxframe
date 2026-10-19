@@ -446,10 +446,11 @@ def test_a_float_is_written_as_the_shortest_text_that_reads_back(mx, tmp_path):
     """F-157: 0.1 prints as 0.1 and every double reads back to its bits, in JSON and in CSV (Mojo's own formatter alone fails 1 in 1,000)."""
     import random
     r = random.Random(11)
-    vals = [0.1, 0.2, 0.30000000000000004, 1e-7, 5e-324, 1.7976931348623157e308, 123456789.123456789, 1e16, 1e15, 8.695637939342639e17, -3.3854499886543212e16,
+    vals = [2.0 ** 49 + 0.25, 2.0 ** 50 + 0.5, 4503599627370497.5, 0.1, 0.2, 0.30000000000000004, 1e-7, 5e-324, 1.7976931348623157e308, 123456789.123456789, 1e16, 1e15, 8.695637939342639e17, -3.3854499886543212e16,
             100.0, 1e22, 2.5e-5, 0.0001]
-    vals += [struct.unpack("<d", struct.pack("<Q", r.getrandbits(64)))[0] for _ in range(20000)]
+    vals += [struct.unpack("<d", struct.pack("<Q", r.getrandbits(64)))[0] for _ in range(4000)]
     vals += [round(r.uniform(-1e6, 1e6), r.randint(0, 6)) for _ in range(5000)]
+    vals += [r.randint(2**48, 2**52) + r.choice([0.25, 0.5, 0.75, 0.125]) for _ in range(5000)]      # exact ties at 16-17 digits
     vals = sorted({v for v in vals if v == v and abs(v) != float("inf") and v != 0.0})
     p = tmp_path / "f.parquet"
     pq.write_table(pa.table({"x": pa.array(vals, pa.float64())}), p)
@@ -461,5 +462,18 @@ def test_a_float_is_written_as_the_shortest_text_that_reads_back(mx, tmp_path):
         assert float(t) == v and struct.pack("<d", float(t)) == struct.pack("<d", v), (v, t)
         digits = lambda x: len(x.lower().split("e")[0].replace("-", "").replace(".", "").strip("0"))
         assert digits(t) <= digits(repr(v)), (v, t)       # as short as Python's repr (which may pick another digit of the same length)
-        if digits(repr(v)) <= 15:
-            assert t == repr(v), (v, t)
+        assert t == repr(v), (v, t)                       # round half to even on exact ties: Python's repr, digit for digit
+
+
+def test_a_csv_of_money_with_many_places_answers_like_duckdb(mx, con, tmp_path):
+    """F-157: more than 4 decimal places is FLOAT (DuckDB's DOUBLE): `sum(rate * qty)` answers, where an exact DECIMAL(6) would pass int64."""
+    import random
+    r = random.Random(5)
+    p = tmp_path / "fx.csv"
+    p.write_text("rate,qty,price9\n" + "".join(f"{r.uniform(1, 999):.6f},{r.randint(100000, 1000000)},{r.uniform(1, 3000):.9f}\n" for _ in range(100000)))
+    sql = f"SELECT sum(rate * qty), sum(rate), avg(price9), count(*), max(qty) FROM '{p}'"
+    out = run_mx(mx, ["sql", sql])
+    assert [c["kind"] for c in out["columns"]] == ["FLOAT", "FLOAT", "FLOAT", "INT", "INT"]
+    want = con.execute(sql).fetchone()
+    for got, w in zip(typed_rows(out)[0], want):
+        assert abs(float(got) - float(w)) <= 1e-9 * abs(float(w)), (got, w)

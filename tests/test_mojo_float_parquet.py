@@ -140,3 +140,19 @@ def test_byte_stream_split_integers_read(dumper, tmp_path):
         assert row[0] == want["i64"][i] and row[1] == want["i32"][i], i
         assert row[2] == (want["d"][i] - datetime.date(1970, 1, 1)).days
         assert row[3] == as_bits(want["f"][i])
+
+
+def test_byte_stream_split_decimals_read(dumper, tmp_path):
+    import decimal
+    import random
+    r = random.Random(8)
+    n = 2000
+    vals = [None if r.random() < 0.1 else decimal.Decimal(r.randint(-10**11, 10**11)).scaleb(-2) for _ in range(n)]
+    vals9 = [decimal.Decimal(r.randint(-10**17, 10**17)).scaleb(-4) for _ in range(n)]
+    t = pa.table({"a": pa.array(vals, pa.decimal128(12, 2)), "b": pa.array(vals9, pa.decimal128(18, 4))})
+    path = tmp_path / "bss_dec.parquet"
+    pq.write_table(t, path, use_dictionary=False, use_byte_stream_split=["a", "b"])
+    cols, rows = mojo_read(dumper, path)
+    assert cols == [("a", "DECIMAL", 2), ("b", "DECIMAL", 4)]
+    for i, row in enumerate(rows):
+        assert row[0] == (None if vals[i] is None else int(vals[i].scaleb(2))) and row[1] == int(vals9[i].scaleb(4)), i
