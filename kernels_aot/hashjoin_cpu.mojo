@@ -611,7 +611,7 @@ def _match(mode: Int, unique: Bool, lo: Int64, hi: Int64, u: Int, s: Int, ent: I
 
 def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int) -> Int:
     """Every (probe row, build row) pair, in probe-row order. `out` (4 words): [0] the number of pairs, [1] address of Int32 probe rows,
-    [2] address of Int32 build rows (both from `_alloc`: release with `hj_release`). Returns 0, or E_BUDGET when the pairs would pass
+    [2] address of Int32 build rows (both from `_alloc`: release with `hj_release`; both are 0, nothing to release, when there are no pairs). Returns 0, or E_BUDGET when the pairs would pass
     `budget_rows` (nothing is allocated, out[0] says how many there would be)."""
     var out = LP(unsafe_from_address=out_a)
     out[0] = 0
@@ -665,8 +665,11 @@ def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, bud
     if all > budget_rows:
         _free(Int(totals))
         return E_BUDGET
-    var pr = IP(unsafe_from_address=_alloc(4 * max(all, 1)))
-    var br = IP(unsafe_from_address=_alloc(4 * max(all, 1)))
+    if all == 0:                                     # nothing matched: no arrays (out[1] and out[2] stay 0), nothing to release
+        _free(Int(totals))
+        return 0
+    var pr = IP(unsafe_from_address=_alloc(4 * all))
+    var br = IP(unsafe_from_address=_alloc(4 * all))
 
     def fill_pass(t: Int) {imm}:
         var at = Int(totals[t])

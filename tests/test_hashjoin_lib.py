@@ -37,6 +37,8 @@ def probe_pairs(lib, h, keys, ok=None):
                                ctypes.c_long(2), ctypes.c_long(10**9), ctypes.c_long(addr(out)))
     assert rc == 0
     n = out[0]
+    if n == 0:
+        assert out[1] == 0 and out[2] == 0          # no pairs: no arrays to release
     pr = (ctypes.c_int32 * n).from_address(out[1]) if n else []
     br = (ctypes.c_int32 * n).from_address(out[2]) if n else []
     pairs = list(zip(pr, br))
@@ -107,3 +109,9 @@ def test_a_handle_that_is_not_a_map_is_refused_or_ignored_not_a_crash(lib):
 
 def test_a_build_of_2_pow_31_rows_is_refused_with_minus_31(lib):
     assert lib.mx_hj_build(ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(1 << 31), ctypes.c_long(1)) == -31
+
+
+def test_no_matching_pair_returns_no_arrays(lib):
+    h = build(lib, [1, 2, 3])
+    assert probe_pairs(lib, h, [10, 20]) == []
+    lib.mx_hj_free(ctypes.c_long(h))

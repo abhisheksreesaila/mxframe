@@ -7,7 +7,7 @@ caller that is not Mojo. The kernel itself is `hashjoin_cpu.mojo`; this file onl
     mx_hj_probe_unique(h, keys, ok, n, out, threads)   unique-key maps: out Int32[n] gets each probe row's build row or -1
     mx_hj_probe_pairs(h, keys, ok, n, threads, budget_rows, out)
                                                        out Int64[3]: pair count, address of Int32 probe rows, address of Int32 build rows
-                                                       (release each with mx_hj_release_array); -32 when the pairs pass the budget
+                                                       (release each with mx_hj_release_array; both are 0 when the count is 0); -32 when the pairs pass the budget
     mx_hj_release_array(addr), mx_hj_free(h)
 
 A handle has one owner: `mx_hj_free` once, after the last probe (a second free, or a probe after the free, is the caller's error). A handle that is 0 or negative
