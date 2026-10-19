@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Mojo frees a value at its last use. A List whose address goes to a kernel or a hook (`Int(xs.unsafe_ptr())` written into a control
-block, a table of addresses) is no longer used as far as the compiler can tell, so it is freed before the kernel reads it, and the
-kernel reads freed memory (F-148, F-152: twice). Keep it alive past the call with `_ = xs^`.
+"""Mojo frees a value at its last use. A List whose address is handed to a kernel or a hook has no use the compiler can see after that,
+so it is freed before the kernel reads it, and the kernel reads freed memory (F-148, F-152 twice, F-152 review: a third time).
 
-This checks every function in the given Mojo files: for each local name whose address is taken with `Int(<name>.unsafe_ptr())`,
-the name must appear again after the last line that takes its address (the keep-alive `_ = name^`, or a later real use).
+The structural fix is `mojo/mxframe/kargs.py`'s `KernelRun`: it owns the lists of a kernel call, hands out their addresses and makes the
+call itself, so no list's address leaves its owner. This check covers whatever the owner does not: for every function (a method, a nested
+function too) it finds each local value whose address is taken --
+
+    xs.unsafe_ptr()          ranks[i].unsafe_ptr()          run.i64(r) / run.i32(r) / run.u8(r)   (a pointer into a KernelRun)
+
+(also when the pointer is first held in a variable, or goes through Int(...)) -- and requires the name to appear again in the code
+after the last such line: a real use, or the keep-alive `_ = xs^`. A mention in a comment or a string does not count. Parameters, fields
+(`self.x`, `look.table`) and `ref` bindings belong to the caller and are not checked. A line that is inside a loop which uses the list
+again can say `# lifetime: ok`.
+
 Usage: python3 scripts/check_list_lifetimes.py [files...]   (default: mojo/mxframe/*.mojo mojo/cli/*.mojo mojo/tools/*.mojo)
 """
 import glob
@@ -12,46 +20,92 @@ import os
 import re
 import sys
 
-ADDR = re.compile(r"Int\((\w+)\.unsafe_ptr\(\)\)")
-DEF = re.compile(r"^def \w+")
+TAKE = re.compile(r"(?<![\w.\])])([A-Za-z_]\w*)((?:\.\w+)*)((?:\[[^\]]*\])*)\.unsafe_ptr\(\)|(?<![\w.])([A-Za-z_]\w*)\.(?:i64|i32|u8)\(")
+DEF = re.compile(r"^(\s*)def \w+")
 
 
-def functions(lines):
-    start = None
-    for i, line in enumerate(lines):
-        if DEF.match(line):
-            if start is not None:
-                yield start, lines[start:i]
-            start = i
-    if start is not None:
-        yield start, lines[start:]
+def strip(lines):
+    """The lines with comments and string literals (docstrings too) blanked, same line numbers."""
+    out = []
+    in_triple = None
+    for line in lines:
+        res = []
+        i = 0
+        while i < len(line):
+            if in_triple:
+                j = line.find(in_triple, i)
+                if j < 0:
+                    i = len(line)
+                else:
+                    i = j + 3
+                    in_triple = None
+                continue
+            c = line[i]
+            if line.startswith('"""', i) or line.startswith("'''", i):
+                in_triple = line[i:i + 3]
+                i += 3
+                continue
+            if c == '"' or c == "'":
+                j = i + 1
+                while j < len(line) and line[j] != c:
+                    j += 2 if line[j] == "\\" else 1
+                i = j + 1
+                res.append('""')
+                continue
+            if c == "#":
+                break
+            res.append(c)
+            i += 1
+        out.append("".join(res))
+    return out
+
+
+def functions(raw, code):
+    n = len(raw)
+    for i in range(n):
+        m = DEF.match(raw[i])
+        if not m:
+            continue
+        indent = len(m.group(1))
+        j = i + 1
+        while j < n and (raw[j].strip() == "" or len(raw[j]) - len(raw[j].lstrip()) > indent):
+            j += 1
+        yield i, raw[i:j], code[i:j]
 
 
 def check(path):
+    raw = open(path).read().split("\n")
+    code = strip(raw)
     bad = []
-    lines = open(path).read().split("\n")
-    for start, body in functions(lines):
-        last_addr = {}
-        for i, line in enumerate(body):
-            if "# lifetime: ok" in line:                            # a loop that uses the list again, which a line check cannot see
+    for start, rbody, cbody in functions(raw, code):
+        last = {}
+        for i, line in enumerate(cbody):
+            if "# lifetime: ok" in rbody[i]:
                 continue
-            for name in ADDR.findall(line):
-                last_addr[name] = i
-        for name, at in last_addr.items():
-            declared = any(re.search(rf"\bvar {name}\b", l) for l in body[:at + 1])
-            if not declared:                                        # a parameter or a field: the caller owns it
+            for m in TAKE.finditer(line):
+                root = m.group(1) or m.group(4)
+                if m.group(1) and m.group(2):                        # a field of something: `self.x`, `look.table` (the owner keeps it)
+                    continue
+                last[root] = i
+        for name, at in last.items():
+            if name == "self":
                 continue
-            later = "\n".join(body[at + 1:])
+            declared = any(re.search(rf"\bvar {name}\b", l) for l in cbody[:at + 1])
+            if not declared:                                         # a parameter or a `ref`: the caller owns it
+                continue
+            later = "\n".join(cbody[at + 1:])
             if not re.search(rf"\b{name}\b", later):
                 bad.append((path, start + at + 1, name))
     return bad
 
 
-root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-files = sys.argv[1:] or sorted(glob.glob(root + "/mojo/mxframe/*.mojo") + glob.glob(root + "/mojo/cli/*.mojo") + glob.glob(root + "/mojo/tools/*.mojo"))
-problems = []
-for f in files:
-    problems += check(f)
-for path, line, name in problems:
-    print(f"{path}:{line}: `{name}` has its address taken here and is not used afterwards: it is freed before the kernel reads it (add `_ = {name}^` after the call)")
-sys.exit(1 if problems else 0)
+if __name__ == "__main__":
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    files = sys.argv[1:] or sorted(glob.glob(root + "/mojo/mxframe/*.mojo") + glob.glob(root + "/mojo/cli/*.mojo") + glob.glob(root + "/mojo/tools/*.mojo"))
+    problems = []
+    for f in files:
+        problems += check(f)
+    for path, line, name in problems:
+        print(f"{path}:{line}: `{name}` has its address taken here and is not used afterwards: it is freed before the kernel reads it "
+              f"(own it in a KernelRun, or add `_ = {name}^` after the call)")
+    sys.exit(1 if problems else 0)

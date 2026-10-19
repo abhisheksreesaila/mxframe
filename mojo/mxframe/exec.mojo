@@ -432,8 +432,12 @@ struct _Chunks(Movable):
     var gm: List[UInt8]
     var mask_addr: Int
     var masked: Bool
+    var starts: List[Int]            # a scan: the frame row where each of `groups` starts
+    var delta_first: Bool            # read the changed rows' chunk before the shared ones (a LIMIT that stops early needs them all)
 
     def __init__(out self):
+        self.starts = List[Int]()
+        self.delta_first = False
         self.groups = List[Int]()
         self.base = False
         self.has_delta = False
@@ -448,6 +452,23 @@ struct _Chunks(Movable):
     def n(self) -> Int:
         return (len(self.groups) if self.scan_mode else (1 if self.base else 0)) + (1 if self.has_delta else 0)
 
+    def shared(self) -> Int:
+        """How many chunks hold the shared rows (the delta chunk, when there is one, comes after them in numbering)."""
+        return len(self.groups) if self.scan_mode else (1 if self.base else 0)
+
+    def pick(self, k: Int) -> Int:
+        """The k-th chunk to read: in numbering order, or the delta chunk first."""
+        if self.delta_first and self.has_delta:
+            return self.shared() if k == 0 else k - 1
+        return k
+
+    def is_delta(self, i: Int) -> Bool:
+        return i >= self.shared()
+
+    def row_base(self, i: Int) -> Int:
+        """The frame row at which chunk i's rows start (a shared chunk)."""
+        return self.starts[i] if self.scan_mode else 0
+
 
 def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
     var ch = _Chunks()
@@ -457,9 +478,12 @@ def _open_chunks(src: SqlSource, used: List[Int]) raises -> _Chunks:
     ch.has_delta = len(src.overlay.delta) > 0
     if ch.scan_mode:
         ref scan = src.scan.value()
+        var at0 = 0
         for g in range(scan.row_groups()):
             if scan.group_rows(g) > 0:
                 ch.groups.append(g)
+                ch.starts.append(at0)
+            at0 += scan.group_rows(g)
         if ch.masked:
             ch.sm.addr = Int(src.overlay.mask.unsafe_ptr())
             var at = 0

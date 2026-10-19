@@ -371,3 +371,29 @@ def test_a_float_column_is_selected_ordered_and_distinct(mx, tmp_path):
                 assert [_canon(r) for r in got] == [_canon(r) for r in want], f"{stream}: {sql}"
             else:
                 assert Counter(map(_canon, got)) == Counter(map(_canon, want)), f"{stream}: {sql}"
+
+
+# ── an edited Frame's rows come in the frame's order ─────────────────────────────────────────────────
+
+FRAME_ORDER = [
+    ("SELECT id, k, x FROM t", "SELECT id, k, x FROM src ORDER BY rid"),
+    ("SELECT id, k, x FROM t WHERE x > 0", "SELECT id, k, x FROM src WHERE x > 0 ORDER BY rid"),
+    ("SELECT id, k, x FROM t LIMIT 25", "SELECT id, k, x FROM src ORDER BY rid LIMIT 25"),
+    ("SELECT id, k, x FROM t LIMIT 12 OFFSET 20000", "SELECT id, k, x FROM src ORDER BY rid LIMIT 12 OFFSET 20000"),
+    ("SELECT id, k, x FROM t ORDER BY k", "SELECT id, k, x FROM src ORDER BY k NULLS LAST, rid"),
+    ("SELECT id, k, x FROM t ORDER BY k LIMIT 50 OFFSET 7", "SELECT id, k, x FROM src ORDER BY k NULLS LAST, rid LIMIT 50 OFFSET 7"),
+    ("SELECT id, k, x FROM t ORDER BY k DESC NULLS FIRST LIMIT 4000 OFFSET 96", "SELECT id, k, x FROM src ORDER BY k DESC NULLS FIRST, rid LIMIT 4000 OFFSET 96"),
+    ("SELECT id, k, x FROM t ORDER BY k LIMIT 4097", "SELECT id, k, x FROM src ORDER BY k NULLS LAST, rid LIMIT 4097"),
+]
+
+
+@pytest.mark.parametrize("mode", ["frame", "framescan"])
+@pytest.mark.parametrize("sql,duck", FRAME_ORDER, ids=[q[0][:60] for q in FRAME_ORDER])
+def test_an_edited_frames_rows_come_in_the_frames_order(probe, data, mode, sql, duck):
+    """After 300 edits (sets, nulls, appended and removed rows) a query with no ORDER BY lists the rows as the frame holds them (a changed
+    row where it was, an appended row at the end), and equal sort keys keep that order -- exactly DuckDB's `ORDER BY rid`."""
+    ds = data["g8"]
+    res = run_probe(probe, sql, {"t": ds.path}, mode=mode, edits=ds.edits_path)
+    want = ds.edited.execute(duck).fetchall()
+    got = got_rows(res)
+    assert [_canon(r) for r in got] == [_canon(r) for r in want], f"{mode}: {sql}"
