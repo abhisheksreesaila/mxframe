@@ -1505,6 +1505,7 @@ Needs: F-150 · Size: M · `mojo/cli/mx.mojo`, `scripts/build_mx.sh` → `build/
 
 ## F-152 M8: SQL row queries: projections, SELECT *, DISTINCT, ORDER BY and top-k, OFFSET (Source x Sink executor) [todo]
 Needs: F-150 · Size: L · `exec.mojo` (new), `query.mojo` (reorganized as Source x Sink without behaviour change), `frame.mojo` (multi-key radix)
+- [ ] first step (F-150 review): the logical plan as a real IR (`plan.mojo`, the PlanNode list of the M8 design) between the binder and the planner; `sqlexec.mojo` lowers from it, `sqleval` folded into the shared expression path, so F-153's second table plugs in without growing sqlexec
 - [ ] executor split into Sources and Sinks; every existing Mojo test and the pyarrow / DuckDB suites unchanged
 - [ ] materialize sink: the kernel's block hook writes selected rows and computed registers (the `_mat_hook` pattern), compacted by a prefix sum into an output Table; TEXT keeps source words (compact result dictionary)
 - [ ] ORDER BY on several keys (stable LSD radix; text by the decided SQL order), NULLS FIRST / LAST; ORDER BY + LIMIT k (+ OFFSET) as per-worker heaps in the hook; LIMIT alone stops a scan early; SELECT DISTINCT as a group-by on all selected columns
