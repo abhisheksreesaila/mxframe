@@ -304,6 +304,46 @@ def test_the_smallest_negative_subnormal_is_not_a_null() raises:
     expect(r.values(0)[0] == 2 and r.floats(1)[0] == -5e-324, "a query counts them")
 
 
+def test_marker_values_are_data_in_base_columns() raises:
+    """The Frame marks an edited null with a NaN's bits (9221120237041090561), but a base cell is null by its validity bit only: an INT or
+    DECIMAL cell may hold that value, or the previous marker (-9223372036854775807), as data."""
+    var new_marker = Int64(0x7FF8000000000001)
+    var old_marker = Int64.MIN + 1
+    var t = Table.empty()
+    var n = t.add_column("n", INT)
+    var d = t.add_column("d", DECIMAL, scale=2)
+    var g = t.add_column("g", INT)
+    var vals: List[Int64] = [new_marker, old_marker, 7, new_marker, 5]
+    for i in range(5):
+        t.append(n, vals[i])
+        t.append(d, new_marker if i % 2 == 0 else Int64(100))
+        t.append(g, Int64(i % 2))
+    t.append_null(n)
+    t.append(d, 3)
+    t.append(g, 0)
+    var shared = t^.share()
+    var f = Frame(shared)
+    for i in range(5):
+        expect(not f.is_null(0, i) and f.get(0, i) == vals[i], "a base cell holding a marker value is data")
+    expect(f.is_null(0, 5), "the null is a null")
+    var r0 = Query(f).agg(count(col("n")), min_of(col("n")), max_of(col("n"))).compute(CPU)
+    expect(r0.values(0)[0] == 5 and Int64(r0.values(1)[0]) == old_marker and Int64(r0.values(2)[0]) == new_marker, "a query over the frame counts them")
+    f.set(2, 1, 9)                                            # an edit puts the row in the delta, with its marker-valued cells
+    f.set_null(0, 3)
+    f.set(1, 4, 11)
+    var r1 = Query(f).group_by(col("g"), groups=2).agg(count(col("n")), max_of(col("n")), min_of(col("d"))).compute(CPU)
+    expect(r1.values(0)[0] == 3 and r1.values(0)[1] == 0, "counts of the non-null cells after the edits")
+    expect(Int64(r1.values(1)[0]) == new_marker and r1.values(2)[0] == 3, "a marker-valued base cell survives in the delta rows")
+    var cat = Catalog()
+    cat.add_frame("t", f)
+    var s = sql(cat, "SELECT count(n), max(n), min(n) FROM t")
+    expect(s.table.get(0, 0) == 4 and s.table.get(1, 0) == new_marker and s.table.get(2, 0) == old_marker, "SQL over the frame sees them as data")
+    var b = f.bake()
+    expect(b.get(0, 0) == new_marker and b.get(0, 1) == old_marker and b.cols[0].is_null(3) and b.cols[0].is_null(5), "bake keeps them")
+    var order = f.permutation(0)
+    expect(order[0] == 1 and order[3] == 0 and order[4] == 3, "sorted: the old marker is the smallest, the new one the largest, nulls last")
+
+
 def sql_table() raises -> Table:
     var t = Table.empty()
     var k = t.add_column("k", FLOAT)
@@ -363,7 +403,9 @@ def test_sql_floats() raises:
     var m = sql(cat, "SELECT count(*) FROM t WHERE f <= 0.07")
     expect(cell(m.table, 0, 0) == "9", "a 32-bit float column is compared with a literal in 32 bits: the five 0.07 rows are kept")
     var m2 = sql(cat, "SELECT count(*) FROM t WHERE f + 0 <= 0.07")
-    expect(cell(m2.table, 0, 0) == "4", "arithmetic makes it a double: the double 0.07 is below the float 0.07, so those five rows are out")
+    expect(cell(m2.table, 0, 0) == "9", "REAL arithmetic stays REAL (rounded to 32 bits), so the literal is a REAL too")
+    var m3 = sql(cat, "SELECT count(*) FROM t WHERE f <= 7e-2")
+    expect(cell(m3.table, 0, 0) == "4", "an exponent literal is a DOUBLE: the double 0.07 is below the float 0.07, so those five rows are out")
 
 
 def main() raises:
@@ -375,5 +417,6 @@ def main() raises:
     test_holistic_floats()
     test_frame_floats()
     test_the_smallest_negative_subnormal_is_not_a_null()
+    test_marker_values_are_data_in_base_columns()
     test_sql_floats()
     print("ok")

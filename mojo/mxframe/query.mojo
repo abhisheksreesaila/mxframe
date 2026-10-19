@@ -1724,7 +1724,7 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
     for raw in o.delta:
         var keep = True
         for f in filters:
-            var v = _eval_row(f, t, raw)
+            var v = _eval_row(f, t, raw, o.null_marker)
             if v[1] or v[0] == 0:
                 keep = False
                 break
@@ -1732,20 +1732,20 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
             continue
         var g = 0
         if keyed:
-            var k = _eval_row(key, t, raw)
+            var k = _eval_row(key, t, raw, o.null_marker)
             if k[1] or k[0] < 0 or k[0] >= Int64(groups):
                 continue
             g = Int(k[0])
         r.counts[g] += 1
         for sidx in range(len(first_of)):
-            var hv = _eval_row(aggs[first_of[sidx]].arg, t, raw)
+            var hv = _eval_row(aggs[first_of[sidx]].arg, t, raw, o.null_marker)
             if not hv[1]:
                 pair_g[sidx].append(Int32(g))
                 pair_v[sidx].append(float_key(hv[0]) if hs.floats[sidx] else hv[0])
         for i in range(len(aggs)):
             if aggs[i].kind == A_COUNT or aggs[i].kind >= A_DISTINCT:
                 continue
-            var v = _eval_row_t(aggs[i].arg, t, raw)
+            var v = _eval_row_t(aggs[i].arg, t, raw, o.null_marker)
             if v[1]:
                 continue
             if r.count_slot_of[i] >= 0:

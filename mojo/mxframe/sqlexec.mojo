@@ -359,7 +359,7 @@ def prepare_ranges(mut catalog: Catalog, q: BoundQuery) raises:
         var lo = r[1]
         var hi = r[2]
         for row in src.overlay.delta:                      # a frame's changed and appended rows
-            if row[c] != NULL_EDIT:
+            if row[c] != src.overlay.null_marker:
                 lo = min(lo, row[c])
                 hi = max(hi, row[c])
                 has = True
@@ -383,7 +383,7 @@ def _alias_lists(src: SqlSource) -> List[List[Int]]:
 
 def _delta_nulls(src: SqlSource, c: Int) -> Bool:
     for row in src.overlay.delta:
-        if row[c] == NULL_EDIT:
+        if row[c] == src.overlay.null_marker:
             return True
     return False
 
@@ -421,7 +421,7 @@ def delta_table(src: SqlSource, cols: List[Int]) raises -> SharedTable:
     for row in src.overlay.delta:
         for k in range(len(cols)):
             var raw = row[cols[k]]
-            if raw == NULL_EDIT:
+            if raw == src.overlay.null_marker:
                 t.cols[k].push(0, False)
             else:
                 if src.table.kind(cols[k]) == TEXT:

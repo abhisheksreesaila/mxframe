@@ -34,9 +34,11 @@ comptime APPEND = 1
 comptime REMOVE = 2
 comptime MERGE = 3
 comptime REPOINT = 4
-comptime NULL_EDIT = Int64(0x7FF8000000000001)   # an edited cell set to null: `set` refuses this one value. A quiet NaN's bits (F-157: a
-                                                 # FLOAT cell can hold any other bit pattern, and a NaN's payload is not a value): a FLOAT cell
-                                                 # that holds exactly this NaN is read as the canonical NaN
+comptime NULL_EDIT = Int64(0x7FF8000000000001)   # marks an EDITED cell or an APPENDED value that is null (never a base cell: those are null by the
+                                                 # validity bitmap, so a base INT / DECIMAL / DATE / FLOAT value may be any int64, this one too). `set`
+                                                 # refuses it as a value. A quiet NaN's bits, so a FLOAT cell edited to exactly this NaN is stored as the
+                                                 # canonical NaN. In the rows of an `Overlay` a query reads, nulls are marked with `Overlay.null_marker`,
+                                                 # which is this value unless some changed row holds it as data.
 comptime CACHE_BYTES = 128 * 1024 * 1024  # the default bound of a scan frame's cache of decoded column chunks
 
 
@@ -82,7 +84,7 @@ struct _ChunkCache(Movable):
     var held: Int                    # bytes in `tables`
     var limit: Int
     var loads: Int                   # chunks decoded so far
-    var rows: Dict[Int, List[Int64]] # touched row -> its stored values from the file (NULL_EDIT: null)
+    var rows: Dict[Int, List[Int64]] # touched row -> its stored values from the file, then one 0 / 1 per column: the cell is null
 
     def __init__(out self):
         self.slot_of = Dict[Int, Int]()
@@ -257,13 +259,10 @@ struct Frame(Movable):
     # ── values ──────────────────────────────────────────────────────────────────────────────────────
 
     def _raw(self, c: Int, row: Int) raises -> Int64:
-        """A stored column's value as edited (NULL_EDIT for null), before merges."""
-        var hit = self.cells.get((row << 20) | c)
-        if hit:
-            return hit.value()
-        if row < self.nbase:
-            return self._base_value(c, row)
-        return self.added[row - self.nbase][c]
+        """A stored column's value as edited (NULL_EDIT for null), before merges. Only for an edit's undo record and `raw_row`: a base value
+        equal to NULL_EDIT is indistinguishable here, so everything that decides on nullness uses `_cell`."""
+        var cell = self._cell(c, row)
+        return NULL_EDIT if cell[1] else cell[0]
 
     def _group_of(self, row: Int) -> Int:
         """The row group of a scan that holds `row`."""
@@ -277,25 +276,29 @@ struct Frame(Movable):
                 hi = mid - 1
         return lo
 
-    def _base_value(self, c: Int, row: Int) raises -> Int64:
-        """The file's (or shared table's) value of a base row, NULL_EDIT for null. A scan: from the rows the session
-        touched, else from the cache, which decodes the column chunk of the row's group on a miss."""
+    def _base_cell(self, c: Int, row: Int) raises -> Tuple[Int64, Bool]:
+        """(value, null) of a base row from the file (or shared table): nulls come from the validity bitmap, never from the value. A scan: from
+        the rows the session touched, else from the cache, which decodes the column chunk of the row's group on a miss."""
         if not self.scan:
-            return NULL_EDIT if self.base.is_null(c, row) else self._clean(c, self.base.get(c, row))
+            return (Int64(0), True) if self.base.is_null(c, row) else (self.base.get(c, row), False)
         ref cache = self.cache[]
         if row in cache.rows:
-            return cache.rows[row][c]
+            return (cache.rows[row][c], cache.rows[row][self.stored() + c] != 0)
         var g = self._group_of(row)
         var i = cache.fetch(self.scan.value(), g, c)
         ref t = cache.tables[i]
         var r = row - self.starts[g]
-        return NULL_EDIT if t.is_null(0, r) else self._clean(c, t.get(0, r))
+        return (Int64(0), True) if t.is_null(0, r) else (t.get(0, r), False)
 
-    def _clean(self, c: Int, v: Int64) -> Int64:
-        """A FLOAT cell's value that equals the null marker (a NaN with that payload) is the canonical NaN."""
-        if v == NULL_EDIT and self.base.kind(c) == FLOAT:
-            return Int64(F_NAN_BITS)
-        return v
+    def _cell(self, c: Int, row: Int) raises -> Tuple[Int64, Bool]:
+        """(value, null) of a stored column's cell as edited, before merges."""
+        var hit = self.cells.get((row << 20) | c)
+        if hit:
+            return (Int64(0), True) if hit.value() == NULL_EDIT else (hit.value(), False)
+        if row < self.nbase:
+            return self._base_cell(c, row)
+        var v = self.added[row - self.nbase][c]
+        return (Int64(0), True) if v == NULL_EDIT else (v, False)
 
     def set_cache_limit(mut self, bytes: Int):
         """Bounds the decoded column chunks a scan frame keeps for `get` and `is_null` (8 bytes a value plus the null
@@ -329,14 +332,14 @@ struct Frame(Movable):
 
     def is_null(self, c: Int, row: Int) raises -> Bool:
         if c < self.stored():
-            return self._raw(c, row) == NULL_EDIT
+            return self._cell(c, row)[1]
         return self.evaluate(self.program(c), row)[1]
 
     def get(self, c: Int, row: Int) raises -> Int64:
         """The value as this session sees it: edited, merged; a formula evaluated (0 for a null: ask `is_null`)."""
         if c < self.stored():
-            var v = self._raw(c, row)
-            return 0 if v == NULL_EDIT else self.alias(c, v)
+            var cell = self._cell(c, row)
+            return 0 if cell[1] else self.alias(c, cell[0])
         return self.evaluate(self.program(c), row)[0]
 
     def get_float(self, c: Int, row: Int) raises -> Float64:
@@ -404,8 +407,8 @@ struct Frame(Movable):
     # ── edits ───────────────────────────────────────────────────────────────────────────────────────
 
     def set(mut self, c: Int, row: Int, value: Int64) raises:
-        """Sets a stored cell (a TEXT code, a scaled DECIMAL, days for a DATE). INT64_MIN + 1 is reserved (it marks a
-        null edit: use `set_null`)."""
+        """Sets a stored cell (a TEXT code, a scaled DECIMAL, days for a DATE, a FLOAT's bits). The value 9221120237041090561
+        (0x7FF8000000000001, `NULL_EDIT`) is reserved as the mark of a null edit: use `set_null`. A base cell may hold it as data.""" 
         if value == NULL_EDIT:
             raise Error("the value " + String(value) + " is reserved for null; use set_null")
         self._set(c, row, value)
@@ -660,10 +663,17 @@ struct Frame(Movable):
     def evaluate(self, e: Expr, row: Int) raises -> Tuple[Int64, Bool]:
         """(value, null) of an expression over stored columns (as `expand` gives) on one row."""
         var raw = List[Int64](length=self.stored(), fill=0)
+        var nulls = List[Int](length=self.stored(), fill=0)
         for name in e.columns():                             # only the columns the expression reads (over a scan each is a chunk)
             var c = self.base.column(name)
-            raw[c] = self._raw(c, row)
-        return _eval_row(e, self.base, raw)
+            var cell = self._cell(c, row)
+            raw[c] = cell[0]
+            nulls[c] = 1 if cell[1] else 0
+        var marker = pick_marker(raw, nulls)
+        for c in range(self.stored()):
+            if nulls[c] != 0:
+                raw[c] = marker
+        return _eval_row(e, self.base, raw, marker)
 
     def raw_row(self, row: Int) raises -> List[Int64]:
         """The row's stored values as edited (NULL_EDIT for null), before merges."""
@@ -690,12 +700,15 @@ struct Frame(Movable):
                 continue
             var vals = List[List[Int64]]()
             for _ in range(len(need)):
-                vals.append(List[Int64](length=self.stored(), fill=0))
+                vals.append(List[Int64](length=2 * self.stored(), fill=0))
             for c in range(self.stored()):
                 var t = self.scan.value().read_group(g, [c])
                 for k in range(len(need)):
                     var r = need[k] - self.starts[g]
-                    vals[k][c] = NULL_EDIT if t.is_null(0, r) else self._clean(c, t.get(0, r))
+                    if t.is_null(0, r):
+                        vals[k][self.stored() + c] = 1
+                    else:
+                        vals[k][c] = t.get(0, r)
             for k in range(len(need)):
                 cache.rows[need[k]] = vals[k].copy()
 
@@ -718,8 +731,28 @@ struct Frame(Movable):
                 if self.alive(row):
                     live.append(row)
             self._load_base_rows(live)                       # a scan: the file's rows, a chunk at a time, once
+            var rows_v = List[List[Int64]]()
+            var rows_n = List[List[Int]]()
             for row in live:
-                o.delta.append(self.raw_row(row))
+                var vs = List[Int64]()
+                var ns = List[Int]()
+                for c in range(self.stored()):
+                    var cell = self._cell(c, row)
+                    vs.append(cell[0])
+                    ns.append(1 if cell[1] else 0)
+                rows_v.append(vs^)
+                rows_n.append(ns^)
+            var all_v = List[Int64]()
+            var all_n = List[Int]()
+            for k in range(len(rows_v)):
+                all_v.extend(rows_v[k].copy())
+                all_n.extend(rows_n[k].copy())
+            o.null_marker = pick_marker(all_v, all_n)
+            for k in range(len(rows_v)):
+                for c in range(self.stored()):
+                    if rows_n[k][c] != 0:
+                        rows_v[k][c] = o.null_marker
+                o.delta.append(rows_v[k].copy())
         return o^
 
     # ── sort ────────────────────────────────────────────────────────────────────────────────────────
@@ -779,18 +812,22 @@ struct Frame(Movable):
                     if has_removed and row in self.removed:
                         continue
                     var raw: Int64
+                    var is_null = False
                     var hit = Optional[Int64](None)
                     if edited:
                         hit = self.cells.get((row << 20) | c)
                     if hit:
                         raw = hit.value()
+                        is_null = raw == NULL_EDIT
                     elif row >= n:
                         raw = self.added[row - n][c]
+                        is_null = raw == NULL_EDIT
                     elif some_nulls and tbl.is_null(tc, row - lo):
-                        raw = NULL_EDIT
+                        raw = 0
+                        is_null = True
                     else:
-                        raw = self._clean(c, vals[row - lo])
-                    if raw == NULL_EDIT:
+                        raw = vals[row - lo]
+                    if is_null:
                         nulls.append(row)
                         continue
                     if merged:
@@ -819,11 +856,11 @@ struct Frame(Movable):
             if not self.alive(row):
                 continue
             for c in range(self.stored()):
-                var raw = self._raw(c, row)
-                if raw == NULL_EDIT:
+                var cell = self._cell(c, row)
+                if cell[1]:
                     t.append_null(c)
                 else:
-                    t.append(c, self.alias(c, raw))
+                    t.append(c, self.alias(c, cell[0]))
         return t^
 
     def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False) raises:
@@ -1271,11 +1308,13 @@ struct Overlay(Copyable, Movable):
     var formulas: List[Formula]
     var aliases: Dict[Int, Int64]
     var mask: List[UInt8]                # empty: no shared row changed; else bit 1 = the shared row is unchanged
-    var delta: List[List[Int64]]         # the live changed and appended rows' stored values (NULL_EDIT: null)
+    var delta: List[List[Int64]]         # the live changed and appended rows' stored values (`null_marker`: null)
     var words: List[List[String]]        # per stored column: the words the session added (codes after the dictionary)
+    var null_marker: Int64               # in `delta`, a null cell holds this value (NULL_EDIT unless a changed row holds it as data)
 
     def __init__(out self, base: SharedTable):
         self.base = base
+        self.null_marker = NULL_EDIT
         self.words = List[List[String]]()
         self.formulas = List[Formula]()
         self.aliases = Dict[Int, Int64]()
@@ -1336,9 +1375,25 @@ def _overflow() -> Error:
     return Error("a sum or an expression passed the int64 range (about 9.2e18)")
 
 
-def _eval_row(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int64, Bool]:
+def pick_marker(vals: List[Int64], nulls: List[Int]) -> Int64:
+    """A value to mark null cells with among rows whose non-null cells are `vals` (`nulls[i]` 1 where cell i is null): NULL_EDIT, or the
+    next value up that no non-null cell holds."""
+    var m = NULL_EDIT
+    var clash = True
+    while clash:
+        clash = False
+        for i in range(len(vals)):
+            if nulls[i] == 0 and vals[i] == m:
+                clash = True
+                break
+        if clash:
+            m += 1
+    return m
+
+
+def _eval_row(e: Expr, base: SharedTable, raw: List[Int64], marker: Int64 = NULL_EDIT) raises -> Tuple[Int64, Bool]:
     """(value, null) of an expression over stored columns on one row's values (see `_eval_row_t`; a FLOAT result is its bits)."""
-    var r = _eval_row_t(e, base, raw)
+    var r = _eval_row_t(e, base, raw, marker)
     return (r[0], r[1])
 
 
@@ -1358,7 +1413,7 @@ def _p10f(k: Int) -> Float64:
     return f
 
 
-def _eval_row_t(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[Int64, Bool, Bool]:
+def _eval_row_t(e: Expr, base: SharedTable, raw: List[Int64], marker: Int64 = NULL_EDIT) raises -> Tuple[Int64, Bool, Bool]:
     """(value, null, is a float64) of an expression over stored columns on one row's values (NULL_EDIT: null), with the kernel's
     semantics: exact int64 (overflow raises), Mojo's floor // and %, x // 0 = x % 0 = 0. A null operand makes the result null,
     through comparisons and logic too (a filter reading a null is false as a whole). A FLOAT column or float literal makes a
@@ -1372,8 +1427,8 @@ def _eval_row_t(e: Expr, base: SharedTable, raw: List[Int64]) raises -> Tuple[In
         if n.op == N_COL:
             var c = base.column(n.name)
             var v = raw[c]
-            vals.append(0 if v == NULL_EDIT else v)
-            nulls.append(v == NULL_EDIT)
+            vals.append(0 if v == marker else v)
+            nulls.append(v == marker)
             fls.append(base.kind(c) == FLOAT)
             scales.append(-1 if base.kind(c) == FLOAT else base.scale(c))
         elif n.op == N_LIT or n.op == N_LITF:
