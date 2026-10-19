@@ -223,6 +223,14 @@ comptime X_BETWEEN = 12     # a BETWEEN b AND c; flag: NOT BETWEEN
 comptime X_IN = 13          # a IN (items); flag: NOT IN
 comptime X_CALL = 14        # text: the function's name in upper case; items: its arguments; flag: DISTINCT; a: 1 for (*)
 comptime X_FLT = 15         # text: digits with an exponent (a DOUBLE literal)
+comptime X_SUBIN = 16       # a IN (SELECT ...): a: the left side; items[0]: the subquery (`st.subs`); flag: NOT IN
+comptime X_EXISTS = 17      # EXISTS (SELECT ...): items[0]: the subquery; flag: NOT EXISTS
+
+comptime JK_INNER = 0       # the kinds of join (F-154); the semi and anti joins keep only the left table's rows and columns
+comptime JK_LEFT = 1
+comptime JK_SEMI = 2
+comptime JK_ANTI = 3
+comptime JK_ANTI_NA = 4     # NOT IN (SELECT ...): an anti join that is null-aware (a NULL on either side removes the row)
 
 
 @fieldwise_init
@@ -263,6 +271,26 @@ struct OrderItem(Copyable, Movable):
     var nulls: Int              # -1 the default (last), 0 NULLS LAST, 1 NULLS FIRST
 
 
+struct SubQuery(Copyable, Movable):
+    """`(SELECT item FROM table [alias] [WHERE cond])`: the only subquery shape (F-154). Its expressions live in the statement's pool."""
+    var table: String
+    var alias: String
+    var is_file: Bool
+    var line: Int
+    var col: Int
+    var sel: Int                # the selected expression, -1 for `*`
+    var where: Int              # -1 for none
+
+    def __init__(out self):
+        self.table = String()
+        self.alias = String()
+        self.is_file = False
+        self.line = 0
+        self.col = 0
+        self.sel = -1
+        self.where = -1
+
+
 comptime EXPLAIN_NONE = 0
 comptime EXPLAIN_PLAN = 1
 
@@ -295,6 +323,9 @@ struct SqlStatement(Movable):
     var join_on: Int            # the ON condition's expression, -1 for none
     var join_using: List[String]
     var comma_join: Bool
+    var join_kind: Int          # F-154: JK_INNER, JK_LEFT, JK_SEMI, JK_ANTI
+    var subs: List[SubQuery]    # F-154: the subqueries of WHERE conditions
+    var from_subquery: Bool     # set by the binder when it turned a WHERE subquery into the right table of a semi / anti join
 
     def __init__(out self, text: String):
         self.distinct = False
@@ -307,6 +338,9 @@ struct SqlStatement(Movable):
         self.join_on = -1
         self.join_using = List[String]()
         self.comma_join = False
+        self.join_kind = JK_INNER
+        self.subs = List[SubQuery]()
+        self.from_subquery = False
         self.text = text
         self.exprs = List[SqlExpr]()
         self.items = List[SelectItem]()
@@ -355,6 +389,10 @@ struct SqlStatement(Movable):
             for k in range(len(x.items)):
                 s += (", " if k > 0 else "") + self.render(x.items[k])
             return s + ")"
+        if x.kind == X_SUBIN:
+            return self.render_operand(x.a) + (" NOT IN (SELECT ...)" if x.flag else " IN (SELECT ...)")
+        if x.kind == X_EXISTS:
+            return "NOT EXISTS (SELECT ...)" if x.flag else "EXISTS (SELECT ...)"
         var s = x.text.lower() + "("
         if x.a == 1:
             s += "*"
@@ -366,7 +404,7 @@ struct SqlStatement(Movable):
 
     def render_operand(self, e: Int) -> String:
         var k = self.exprs[e].kind
-        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG:
+        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG or k == X_SUBIN:
             return "(" + self.render(e) + ")"
         return self.render(e)
 
@@ -382,7 +420,7 @@ def _reserved(w: String) -> Bool:
             w == "LIKE" or w == "ILIKE" or w == "SELECT" or w == "ASC" or w == "DESC" or w == "NULLS" or w == "FETCH" or
             w == "TABLESAMPLE" or w == "SAMPLE" or w == "FILTER" or w == "OVER" or w == "WITHIN" or w == "THEN" or
             w == "ELSE" or w == "END" or w == "WHEN" or w == "ESCAPE" or w == "SIMILAR" or w == "GLOB" or w == "ANTI" or
-            w == "SEMI" or w == "ASOF" or w == "POSITIONAL" or w == "LATERAL")
+            w == "SEMI" or w == "ASOF" or w == "POSITIONAL" or w == "LATERAL" or w == "OUTER")
 
 
 def edit_distance(a: String, b: String) -> Int:
@@ -714,9 +752,18 @@ struct _Parser(Movable):
             var r = self.table_ref()
             self.set_right(r)
             self.st.comma_join = True
-        elif t.kind == T_IDENT and (t.up == "JOIN" or (t.up == "INNER" and self.is_kw("JOIN", 1))):
-            if t.up == "INNER":
+        elif t.kind == T_IDENT and (t.up == "JOIN" or ((t.up == "INNER" or t.up == "LEFT" or t.up == "SEMI" or t.up == "ANTI") and
+                                                       (self.is_kw("JOIN", 1) or (t.up == "LEFT" and self.is_kw("OUTER", 1) and self.is_kw("JOIN", 2))))):
+            if t.up == "LEFT":
+                self.st.join_kind = JK_LEFT
+            elif t.up == "SEMI":
+                self.st.join_kind = JK_SEMI
+            elif t.up == "ANTI":
+                self.st.join_kind = JK_ANTI
+            if t.up == "INNER" or t.up == "LEFT" or t.up == "SEMI" or t.up == "ANTI":
                 _ = self.advance()
+                if self.is_kw("OUTER"):
+                    _ = self.advance()
             _ = self.advance()
             var r = self.table_ref()
             self.set_right(r)
@@ -739,15 +786,59 @@ struct _Parser(Movable):
                 _ = self.expect_sym(")")
             else:
                 raise self.expected("ON or USING after JOIN")
-        elif t.kind == T_IDENT and (t.up == "LEFT" or t.up == "RIGHT" or t.up == "FULL" or t.up == "CROSS" or t.up == "NATURAL" or
-                                    t.up == "ANTI" or t.up == "SEMI" or t.up == "ASOF" or t.up == "POSITIONAL" or t.up == "LATERAL" or
-                                    t.up == "INNER"):
-            raise self.unsupported(t, "`" + t.up + " JOIN`", "F-154" if (t.up == "LEFT" or t.up == "ANTI" or t.up == "SEMI") else "")
+        elif t.kind == T_IDENT and (t.up == "RIGHT" or t.up == "FULL" or t.up == "CROSS" or t.up == "NATURAL" or
+                                    t.up == "ASOF" or t.up == "POSITIONAL" or t.up == "LATERAL" or t.up == "INNER" or t.up == "LEFT" or
+                                    t.up == "SEMI" or t.up == "ANTI"):
+            var named = t.up
+            if (t.up == "RIGHT" or t.up == "FULL") and self.is_kw("OUTER", 1):
+                named += " OUTER"
+            raise self.unsupported(t, "`" + named + " JOIN`", "")
         if self.st.has_right:                                                   # a third table
             var u = self.tok()
             if self.is_sym(",") or (u.kind == T_IDENT and (u.up == "JOIN" or u.up == "INNER" or u.up == "LEFT" or u.up == "RIGHT" or
-                                                          u.up == "FULL" or u.up == "CROSS" or u.up == "NATURAL")):
+                                                          u.up == "FULL" or u.up == "CROSS" or u.up == "NATURAL" or u.up == "SEMI" or u.up == "ANTI")):
                 raise self.unsupported(u, "more than two tables in FROM", "F-155")
+
+    def subquery(mut self) raises -> Int:
+        """After `(`: `SELECT [DISTINCT] item | * FROM table [alias] [WHERE cond] )`. Returns its index in `st.subs`."""
+        var at = self.tok()
+        if not self.is_kw("SELECT"):
+            raise self.unsupported(at, "a subquery that starts with `" + at.up + "`", "F-159")
+        _ = self.advance()
+        if self.is_kw("DISTINCT"):
+            _ = self.advance()
+        elif self.is_kw("ALL"):
+            _ = self.advance()
+        var sub = SubQuery()
+        sub.line = at.line
+        sub.col = at.col
+        if self.is_sym("*"):
+            _ = self.advance()
+        else:
+            sub.sel = self.expr()
+        if self.is_sym(","):
+            raise self.unsupported(self.tok(), "a subquery with more than one column", "")
+        if not self.is_kw("FROM"):
+            raise self.expected("FROM")
+        _ = self.advance()
+        var tr = self.table_ref()
+        sub.table = tr[0]
+        sub.alias = tr[1]
+        sub.is_file = tr[2]
+        var u = self.tok()
+        if self.is_sym(",") or (u.kind == T_IDENT and (u.up == "JOIN" or u.up == "INNER" or u.up == "LEFT" or u.up == "RIGHT" or u.up == "FULL" or
+                                                      u.up == "CROSS" or u.up == "NATURAL" or u.up == "SEMI" or u.up == "ANTI")):
+            raise self.unsupported(u, "a join inside a subquery", "F-155")
+        if self.is_kw("WHERE"):
+            _ = self.advance()
+            sub.where = self.expr()
+        var v = self.tok()
+        if v.kind == T_IDENT and (v.up == "GROUP" or v.up == "HAVING" or v.up == "ORDER" or v.up == "LIMIT" or v.up == "OFFSET" or v.up == "UNION" or
+                                  v.up == "INTERSECT" or v.up == "EXCEPT" or v.up == "QUALIFY" or v.up == "WINDOW"):
+            raise self.unsupported(v, "`" + v.up + "` in a subquery", "F-159")
+        _ = self.expect_sym(")")
+        self.st.subs.append(sub^)
+        return len(self.st.subs) - 1
 
     def set_right(mut self, r: Tuple[String, String, Bool, Int, Int]):
         self.st.has_right = True
@@ -829,7 +920,10 @@ struct _Parser(Movable):
             _ = self.advance()
             _ = self.expect_sym("(")
             if self.is_kw("SELECT") or self.is_kw("WITH") or self.is_kw("FROM"):
-                raise self.unsupported(self.tok(), "a subquery in IN (...)", "F-154")
+                var si = self.subquery()
+                var sid = self.node(X_SUBIN, "", left, -1, -1, at, neg)
+                self.st.exprs[sid].items.append(si)
+                return sid
             var id = self.node(X_IN, "", left, -1, -1, at, neg)
             while True:
                 var item = self.add_expr()
@@ -904,7 +998,7 @@ struct _Parser(Movable):
             if t.text == "(":
                 _ = self.advance()
                 if self.is_kw("SELECT") or self.is_kw("WITH") or self.is_kw("FROM"):
-                    raise self.unsupported(self.tok(), "a subquery", "F-154")
+                    raise self.unsupported(self.tok(), "a scalar subquery", "F-159")
                 var e = self.expr()
                 if self.is_sym(","):
                     raise self.unsupported(self.tok(), "a row value `(a, b)`", "")
@@ -944,7 +1038,17 @@ struct _Parser(Movable):
             if (w == "ARRAY" or w == "STRUCT" or w == "MAP" or w == "LIST") and next_paren:
                 raise self.unsupported(t, "`" + w + "` values", "")
             if w == "EXISTS" or (w == "NOT" and self.is_kw("EXISTS", 1)):
-                raise self.unsupported(t, "`EXISTS`", "F-154")
+                var neg = w == "NOT"
+                if neg:
+                    _ = self.advance()
+                _ = self.advance()
+                _ = self.expect_sym("(")
+                if not self.is_kw("SELECT"):
+                    raise self.expected("SELECT")
+                var si = self.subquery()
+                var eid = self.node(X_EXISTS, "", -1, -1, -1, t, neg)
+                self.st.exprs[eid].items.append(si)
+                return eid
             if _reserved(w) and w != "LEFT" and w != "RIGHT":
                 raise self.expected("an expression")
             _ = self.advance()

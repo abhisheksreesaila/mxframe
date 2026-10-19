@@ -39,8 +39,8 @@ from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
 from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
-from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, gather_join, JOIN_BUDGET_BYTES
-from .kernels.hashjoin_cpu import hj_build
+from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
+from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
 
 # plan node kinds
@@ -313,10 +313,12 @@ struct Query(Movable):
         columns, then `other`'s; a repeated name gets a suffix). The builder's own rules apply from there on (`where`, `group_by`, `agg`).
         The join is the engine's (the same kernel and key rules as SQL): a NULL key never matches, TEXT keys match by bytes whatever the
         dictionaries, DECIMAL scales are aligned (INT is scale 0), FLOAT keys follow DuckDB (-0.0 = 0.0, NaN = NaN), int64 keys past 2^53 are
-        exact, and the smaller table is the one the hash table is built on. Only `how="inner"` exists (F-154 adds the others); the join must
-        come first, over a plain table (bake a Frame, read a file, first)."""
-        if how != "inner":
-            raise Error("a `" + how + "` join is not supported yet (F-154): only inner")
+        exact, and for an inner join the smaller table is the one the hash table is built on. `how`: "inner"; "left" (every row of this table; the
+        other's columns are NULL where nothing matches); "semi" (this table's rows that have a partner, this table's columns only); "anti" (the rows
+        that have none: a NULL key has none). A left, semi or anti join builds on `other`. The join must come first, over a plain table (bake a
+        Frame, read a file, first)."""
+        if how != "inner" and how != "left" and how != "semi" and how != "anti":
+            raise Error("a `" + how + "` join is not supported: how is inner, left, semi or anti")
         if len(self.nodes) > 1:
             raise Error("join must come first: filters and aggregates come after it")
         if self.framed or self.scan:
@@ -346,8 +348,8 @@ struct Query(Movable):
         for c in range(other.columns()):
             rc.append(c)
         var left = JoinSide(self.table, lc^, lcols.copy(), True)
-        var right = JoinSide(other, rc^, rcols.copy(), True)
-        var left_builds = self.table.rows() < other.rows()
+        var right = JoinSide(other, rc^ if (how == "inner" or how == "left") else List[Int](), rcols.copy(), True)
+        var left_builds = how == "inner" and self.table.rows() < other.rows()
         var keys = JoinKeys()
         if left_builds:
             normalize_keys(self.table, other, lcols, rcols, keys, self._threads)
@@ -355,10 +357,15 @@ struct Query(Movable):
             normalize_keys(other, self.table, rcols, lcols, keys, self._threads)
         var nb = self.table.rows() if left_builds else other.rows()
         var np = other.rows() if left_builds else self.table.rows()
-        var m = hj_build(keys.bk_addr, keys.bo_addr, nb, self._threads)
-        var ncols = self.table.columns() + other.columns()
-        var pairs = join_pairs(m, keys, np, JOIN_BUDGET_BYTES // (8 * max(ncols, 1)), self._threads)
-        var joined = gather_join(left, right, pairs, left_builds, self._threads)
+        var m = hj_build(keys.bk_addr, keys.bo_addr, nb, self._threads, how == "semi" or how == "anti")
+        var joined: Table
+        if how == "semi" or how == "anti":
+            var pick = select_rows(m, keys, np, PM_SEMI if how == "semi" else PM_ANTI, self._threads)
+            joined = gather_join(left, right, pick, False, self._threads)
+        else:
+            var ncols = self.table.columns() + other.columns()
+            var pairs = join_pairs(m, keys, np, JOIN_BUDGET_BYTES // (8 * max(ncols, 1)), self._threads, how == "left")
+            joined = gather_join(left, right, pairs, left_builds, self._threads, how == "left")
         var out = Query(joined^.share())
         out._threads = self._threads
         out._morsels = self._morsels

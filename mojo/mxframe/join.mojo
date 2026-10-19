@@ -181,7 +181,7 @@ def joined_query(q: BoundQuery, lneeded: List[Int], rneeded: List[Int]) -> Bound
     return jq^
 
 
-def virtual_schema(left: JoinSide, right: JoinSide) raises -> Table:
+def virtual_schema(left: JoinSide, right: JoinSide, outer_right: Bool = False) raises -> Table:
     """A table with no rows that has the joined columns' names, kinds, scales, dictionaries and NULL counts: what the planner and the
     program's lowering read of the joined source when the join is fused (the rows come from the probe table and the build side's gather)."""
     var t = Table.empty()
@@ -195,4 +195,6 @@ def virtual_schema(left: JoinSide, right: JoinSide) raises -> Table:
                 for w in range(len(words)):
                     _ = t.add_word(col, String(words[w]))
             t.cols[col].nulls = sd.table.null_count(c)
+            if outer_right and side == 1:
+                t.cols[col].nulls = max(t.cols[col].nulls, 1)         # a LEFT join: an unmatched row is NULL here, so the program checks
     return t^

@@ -57,6 +57,10 @@ comptime GROUP = 16                     # keys looked up per prefetch group
 comptime HUGE = 1 << 21
 comptime E_TOO_MANY_ROWS = -31          # 2^31 rows or more on a side
 comptime E_BUDGET = -32                 # the pairs would pass the caller's budget
+comptime PM_SEMI = 2                    # filter modes (`hj_probe_select`, `hj_filter_block`): keep the rows that have a partner
+comptime PM_ANTI = 3                    # ... the rows that have none (a NULL key has none)
+comptime PM_ANTI_NA = 4                 # ... the rows that have none and a usable key (NOT IN: a NULL key is not kept)
+comptime PM_NONE = 5                    # ... no row (NOT IN against a list that holds a NULL)
 
 
 @always_inline
@@ -103,7 +107,8 @@ struct JoinMap(Movable):
     var lo: Int64                    # the lowest and highest usable key
     var hi: Int64
     var span: Int                    # direct: hi - lo + 1
-    var unique: Bool                 # no key repeats
+    var unique: Bool                 # no key repeats (a presence-only map says True: it keeps one row per key)
+    var presence: Bool               # built by `hj_build(presence=True)` as a direct array of marks
     var pbits: Int                   # hash: 1 << pbits partitions
     var u: Int                       # direct, unique: Int32[span]  build row or -1
     var s: Int                       # direct, repeated: Int32[span]  end offset in r of each key's rows
@@ -121,6 +126,7 @@ struct JoinMap(Movable):
         self.hi = 0
         self.span = 0
         self.unique = True
+        self.presence = False
         self.pbits = 0
         self.u = 0
         self.s = 0
@@ -141,6 +147,8 @@ struct JoinMap(Movable):
     def kind(self) -> String:
         if self.mode == MODE_EMPTY:
             return "empty"
+        if self.presence:
+            return "direct array, presence marks only"
         var base = "direct array" if self.mode == MODE_DIRECT else "hash table (" + String(1 << self.pbits) + " partitions)"
         return base + (", unique keys" if self.unique else ", repeated keys (CSR rows)")
 
@@ -191,8 +199,10 @@ def _part_of(k: Int64, direct: Bool, base: Int64, pshift: Int, pbits: Int) -> In
 
 # ── build ────────────────────────────────────────────────────────────────────────────────────────────
 
-def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int) -> JoinMap:
-    """The map of the build side's keys. See the module doc for the layout it chooses."""
+def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = False) -> JoinMap:
+    """The map of the build side's keys. See the module doc for the layout it chooses. `presence`: the caller only asks whether a key is present (semi and
+    anti joins: `hj_probe_select`, `hj_filter_block`): keys that fit a direct array are then marked in one pass (any row of the key will do, no repeated-key
+    rows are kept), which is cheaper than the CSR build; the map answers presence lookups only (`hj_probe_unique` / `hj_probe_pairs` would see an arbitrary row)."""
     var m = JoinMap()
     m.n = n
     if n <= 0:
@@ -236,6 +246,29 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int) -> JoinMap:
     var span_u = UInt64(hi) - UInt64(lo)
     var direct = span_u < UInt64(DIRECT_MAX) and Int(span_u) + 1 <= max(DIRECT_FACTOR * nvalid, DIRECT_MIN_RANGE)
     var span = Int(span_u) + 1 if direct else 0
+    if presence and direct:
+        m.mode = MODE_DIRECT
+        m.span = span
+        m.unique = True
+        m.presence = True
+        var marks = IP(unsafe_from_address=_alloc(4 * span))
+        m.u = Int(marks)
+        m.bytes = 4 * span
+        var TS = max(1, min(T, (span + 65535) // 65536))
+
+        def clear(t: Int) {imm}:
+            for d in range(_slice(span, t, TS), _slice(span, t + 1, TS)):
+                marks[d] = -1
+
+        def mark(t: Int) {imm}:
+            for i in range(_slice(n, t, T), _slice(n, t + 1, T)):
+                if has_ok and oks[i] == 0:
+                    continue
+                marks[Int(keys[i] - lo)] = Int32(i)               # rows of one key race to write: whichever lands, the key is marked
+
+        par_n(clear, TS, TS)
+        par_n(mark, T, T)
+        return m^
     # ── the partitions: direct ones are runs of consecutive keys (a partition owns a stretch of the array), hash ones the hash's top bits
     var pshift = 0
     var P = 1
@@ -609,15 +642,38 @@ def _match(mode: Int, unique: Bool, lo: Int64, hi: Int64, u: Int, s: Int, ent: I
         count = 1 if unique else Int(IP(unsafe_from_address=e + 8)[0])
 
 
-def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int) -> Int:
+@always_inline
+def _lookup(mode: Int, unique: Bool, lo: Int64, hi: Int64, u: Int, s: Int, ent: Int, eoff: LP, pbits: Int, bitmap: Int, k: Int64,
+            mut start: Int, mut count: Int):
+    """`_match`, and nothing found in an empty map."""
+    if mode == MODE_EMPTY:
+        start = 0
+        count = 0
+        return
+    _match(mode, unique, lo, hi, u, s, ent, eoff, pbits, bitmap, k, start, count)
+
+
+@always_inline
+def _keep(fmode: Int, usable: Bool, present: Bool) -> Bool:
+    if fmode == PM_SEMI:
+        return present
+    if fmode == PM_ANTI:
+        return not present
+    if fmode == PM_ANTI_NA:
+        return usable and not present
+    return False
+
+
+def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, budget_rows: Int, out_a: Int, outer: Bool = False) -> Int:
     """Every (probe row, build row) pair, in probe-row order. `out` (4 words): [0] the number of pairs, [1] address of Int32 probe rows,
-    [2] address of Int32 build rows (both from `_alloc`: release with `hj_release`). Returns 0, or E_BUDGET when the pairs would pass
-    `budget_rows` (nothing is allocated, out[0] says how many there would be)."""
+    [2] address of Int32 build rows (both from `_alloc`: release with `hj_release`; both are 0, nothing to release, when there are no pairs). Returns 0, or E_BUDGET when the pairs would pass
+    `budget_rows` (nothing is allocated, out[0] says how many there would be). `outer`: a probe row with no partner (or no usable key) is
+    one pair whose build row is -1 (a LEFT join's unmatched row)."""
     var out = LP(unsafe_from_address=out_a)
     out[0] = 0
     out[1] = 0
     out[2] = 0
-    if m.mode == MODE_EMPTY or n <= 0:
+    if n <= 0 or (m.mode == MODE_EMPTY and not outer):
         return 0
     var T = max(1, min(threads if threads > 0 else core_count(), (n + 16383) // 16384))
     var keys = LP(unsafe_from_address=keys_a)
@@ -643,15 +699,16 @@ def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, bud
         var end = _slice(n, t + 1, T)
         while i < end:
             var g = min(GROUP, end - i)
+            if mode != MODE_EMPTY:
+                for j in range(g):
+                    if (not has_ok) or oks[i + j] != 0:
+                        _prefetch_key(mode, lo, hi, span, uniq, u, s, ent, eoff, pbits, bitmap, keys[i + j])
             for j in range(g):
-                if (not has_ok) or oks[i + j] != 0:
-                    _prefetch_key(mode, lo, hi, span, uniq, u, s, ent, eoff, pbits, bitmap, keys[i + j])
-            for j in range(g):
+                var c = 0
                 if (not has_ok) or oks[i + j] != 0:
                     var st = 0
-                    var c = 0
-                    _match(mode, uniq, lo, hi, u, s, ent, eoff, pbits, bitmap, keys[i + j], st, c)
-                    total += c
+                    _lookup(mode, uniq, lo, hi, u, s, ent, eoff, pbits, bitmap, keys[i + j], st, c)
+                total += c if (c > 0 or not outer) else 1
             i += g
         totals[t] = Int64(total)
 
@@ -665,8 +722,11 @@ def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, bud
     if all > budget_rows:
         _free(Int(totals))
         return E_BUDGET
-    var pr = IP(unsafe_from_address=_alloc(4 * max(all, 1)))
-    var br = IP(unsafe_from_address=_alloc(4 * max(all, 1)))
+    if all == 0:                                     # nothing matched: no arrays (out[1] and out[2] stay 0), nothing to release
+        _free(Int(totals))
+        return 0
+    var pr = IP(unsafe_from_address=_alloc(4 * all))
+    var br = IP(unsafe_from_address=_alloc(4 * all))
 
     def fill_pass(t: Int) {imm}:
         var at = Int(totals[t])
@@ -674,30 +734,126 @@ def hj_probe_pairs(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, bud
         var end = _slice(n, t + 1, T)
         while i < end:
             var g = min(GROUP, end - i)
+            if mode != MODE_EMPTY:
+                for j in range(g):
+                    if (not has_ok) or oks[i + j] != 0:
+                        _prefetch_key(mode, lo, hi, span, uniq, u, s, ent, eoff, pbits, bitmap, keys[i + j])
             for j in range(g):
+                var st = 0
+                var c = 0
                 if (not has_ok) or oks[i + j] != 0:
-                    _prefetch_key(mode, lo, hi, span, uniq, u, s, ent, eoff, pbits, bitmap, keys[i + j])
-            for j in range(g):
-                if (not has_ok) or oks[i + j] != 0:
-                    var st = 0
-                    var c = 0
-                    _match(mode, uniq, lo, hi, u, s, ent, eoff, pbits, bitmap, keys[i + j], st, c)
-                    if uniq:
-                        if c == 1:
-                            pr[at] = Int32(i + j)
-                            br[at] = Int32(st)
-                            at += 1
-                    else:
-                        for q in range(c):
-                            pr[at] = Int32(i + j)
-                            br[at] = r[st + q]
-                            at += 1
+                    _lookup(mode, uniq, lo, hi, u, s, ent, eoff, pbits, bitmap, keys[i + j], st, c)
+                if c == 0:
+                    if outer:
+                        pr[at] = Int32(i + j)
+                        br[at] = -1
+                        at += 1
+                elif uniq:
+                    pr[at] = Int32(i + j)
+                    br[at] = Int32(st)
+                    at += 1
+                else:
+                    for q in range(c):
+                        pr[at] = Int32(i + j)
+                        br[at] = r[st + q]
+                        at += 1
             i += g
 
     par_n(fill_pass, T, T)
     _free(Int(totals))
     out[1] = Int64(Int(pr))
     out[2] = Int64(Int(br))
+    return 0
+
+
+def hj_probe_select(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, threads: Int, fmode: Int, out_a: Int) -> Int:
+    """The probe rows that pass a presence filter (`PM_SEMI`, `PM_ANTI`, `PM_ANTI_NA`, `PM_NONE`), in row order; the map may hold repeated keys
+    (only whether a key is present matters). `out` (2 words): [0] how many, [1] the address of an Int32 array of them (from `_alloc`: release
+    with `hj_release`; 0 when none). Returns 0."""
+    var out = LP(unsafe_from_address=out_a)
+    out[0] = 0
+    out[1] = 0
+    if n <= 0 or fmode == PM_NONE:
+        return 0
+    var T = max(1, min(threads if threads > 0 else core_count(), (n + 16383) // 16384))
+    var keys = LP(unsafe_from_address=keys_a)
+    var has_ok = ok_a != 0
+    var oks = BP(unsafe_from_address=ok_a)
+    var mode = m.mode
+    var lo = m.lo
+    var hi = m.hi
+    var span = m.span
+    var u = m.u
+    var s = m.s
+    var ent = m.ent
+    var eoff = LP(unsafe_from_address=m.eoff)
+    var pbits = m.pbits
+    var bitmap = m.bitmap
+    var uniq = m.unique
+    var totals = LP(unsafe_from_address=_alloc(8 * (T + 1)))
+
+    def count_pass(t: Int) {imm}:
+        var total = 0
+        var i = _slice(n, t, T)
+        var end = _slice(n, t + 1, T)
+        while i < end:
+            var g = min(GROUP, end - i)
+            if mode != MODE_EMPTY:
+                for j in range(g):
+                    if (not has_ok) or oks[i + j] != 0:
+                        _prefetch_key(mode, lo, hi, span, uniq, u, s, ent, eoff, pbits, bitmap, keys[i + j])
+            for j in range(g):
+                var usable = (not has_ok) or oks[i + j] != 0
+                var present = False
+                if usable:
+                    var st = 0
+                    var c = 0
+                    _lookup(mode, uniq, lo, hi, u, s, ent, eoff, pbits, bitmap, keys[i + j], st, c)
+                    present = c > 0
+                if _keep(fmode, usable, present):
+                    total += 1
+            i += g
+        totals[t] = Int64(total)
+
+    par_n(count_pass, T, T)
+    var all = 0
+    for t in range(T):
+        var c = Int(totals[t])
+        totals[t] = Int64(all)
+        all += c
+    out[0] = Int64(all)
+    if all == 0:
+        _free(Int(totals))
+        return 0
+    var rows_a = _alloc(4 * all)
+    var rows = IP(unsafe_from_address=rows_a)
+
+    def fill_pass(t: Int) {imm}:
+        var at = Int(totals[t])
+        var i = _slice(n, t, T)
+        var end = _slice(n, t + 1, T)
+        while i < end:
+            var g = min(GROUP, end - i)
+            if mode != MODE_EMPTY:
+                for j in range(g):
+                    if (not has_ok) or oks[i + j] != 0:
+                        _prefetch_key(mode, lo, hi, span, uniq, u, s, ent, eoff, pbits, bitmap, keys[i + j])
+            for j in range(g):
+                var usable = (not has_ok) or oks[i + j] != 0
+                var present = False
+                if usable:
+                    var st = 0
+                    var c = 0
+                    _lookup(mode, uniq, lo, hi, u, s, ent, eoff, pbits, bitmap, keys[i + j], st, c)
+                    present = c > 0
+                if _keep(fmode, usable, present):
+                    rows[at] = Int32(i + j)
+                    at += 1
+            i += g
+
+    par_n(fill_pass, T, T)
+    _free(Int(totals))
+    out[1] = Int64(rows_a)
     return 0
 
 
@@ -748,3 +904,68 @@ def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP,
                 kept += 1
         i += g
     return kept
+
+
+def hj_filter_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, nsel: Int, fmode: Int) -> Int:
+    """The fused form of a semi / anti join (any map): the block rows `sel[0..nsel)` (row = i0 + sel[j]) that pass the presence filter stay in
+    `sel`, compacted in place, in order. Returns how many are kept."""
+    if fmode == PM_NONE:
+        return 0
+    var mode = v.mode
+    var kept = 0
+    var i = 0
+    var eoff = LP(unsafe_from_address=v.eoff)
+    while i < nsel:
+        var g = min(GROUP, nsel - i)
+        if mode != MODE_EMPTY:
+            for j in range(g):
+                var row = i0 + Int(sel[i + j])
+                if (not has_ok) or ok[row] != 0:
+                    _prefetch_key(mode, v.lo, v.hi, 0, v.unique, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[row])
+        for j in range(g):
+            var s0 = sel[i + j]
+            var row = i0 + Int(s0)
+            var usable = (not has_ok) or ok[row] != 0
+            var present = False
+            if usable:
+                var st = 0
+                var c = 0
+                _lookup(mode, v.unique, v.lo, v.hi, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[row], st, c)
+                present = c > 0
+            if _keep(fmode, usable, present):
+                sel[kept] = s0
+                kept += 1
+        i += g
+    return kept
+
+
+def hj_probe_left_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, nsel: Int, prow: IP):
+    """The fused form of a LEFT join (a map with unique keys): every block row stays in `sel`; `prow[q]` is the build row of the q-th row, or -1
+    when it has no partner (or no usable key)."""
+    var mode = v.mode
+    var eoff = LP(unsafe_from_address=v.eoff)
+    if mode == MODE_EMPTY:
+        for q in range(nsel):
+            prow[q] = -1
+        return
+    var i = 0
+    while i < nsel:
+        var g = min(GROUP, nsel - i)
+        for j in range(g):
+            var row = i0 + Int(sel[i + j])
+            if (not has_ok) or ok[row] != 0:
+                _prefetch_key(mode, v.lo, v.hi, 0, True, v.u, 0, v.ent, eoff, v.pbits, v.bitmap, keys[row])
+        for j in range(g):
+            var row = i0 + Int(sel[i + j])
+            var b = Int32(-1)
+            if (not has_ok) or ok[row] != 0:
+                var k = keys[row]
+                if k >= v.lo and k <= v.hi:
+                    if mode == MODE_DIRECT:
+                        b = IP(unsafe_from_address=v.u)[Int(k - v.lo)]
+                    elif v.bitmap == 0 or _has_bit(BP(unsafe_from_address=v.bitmap), Int(k - v.lo)):
+                        var e = _hash_entry(v.ent, eoff, v.pbits, k)
+                        if e != 0:
+                            b = IP(unsafe_from_address=e + 12)[0]
+            prow[i + j] = b
+        i += g

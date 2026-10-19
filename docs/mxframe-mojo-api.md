@@ -301,7 +301,7 @@ by key (`holistic: a second pass ...`). `ORDER BY` with `LIMIT + OFFSET <= 4096`
 **A frame's formula columns** (§4) are columns of the table: the query reads the formula's expression over the stored columns, inlined, with the builder's own rules for it (floor `//` and `%`,
 `x // 0` is 0, `min` / `max`) and exact decimals; they work in `WHERE`, `GROUP BY` (hashed) and the aggregates, over a table frame and a frame over a scan.
 
-**Limits**: inner joins only, see 8b (the others: F-154); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
+**Limits**: joins: inner, left, semi, anti, two tables, see 8b (multi-way: F-155); `DISTINCT` only without aggregates; no `CASE`, `CAST`, `LIKE`, text or date functions (F-156); CPU only;
 at most 48 registers (about 20 aggregates over different expressions) and 64 distinct constants in one program, said as an SQL error when passed; an AVG whose exact sum passes int64 raises like SUM.
 
 Informal timings (F-150; 12-core Ryzen 9 5900X under a load average of about 6 from other jobs, so read them as rough; 5,000,000 rows generated with 8 / 10,000 / 1,000,000 groups; MX frame is
@@ -403,17 +403,26 @@ Things an agent should know:
   them`; an EXPLAIN of that run says `statistics not believed` where a file with no statistics says `the source has no statistics on it`.
 - Text order is the owner's (case-insensitive, bytes as the tie-break), so `min(s)` / `ORDER BY s` on text differ from DuckDB's byte order; DECIMAL `median` has one more digit of scale than DuckDB.
 
-## 8b. Joins (F-153)
+## 8b. Joins (F-153, F-154)
 
-The inner equi-join is an engine feature: a catalog of named sources (tables, Frames, Parquet scans), the PlanNode IR with two Scans under a Join, a hash join
+The equi-join (inner, left, semi, anti) is an engine feature: a catalog of named sources (tables, Frames, Parquet scans), the PlanNode IR with two Scans under a Join, a hash join
 kernel, and two ways to run it. It names no application; SQL, `Query.join`, and any other caller use the same code (the Python engine does not call the kernel yet: F-161). `Query.join` always materializes every column of both tables (it cannot know yet what the query after it reads): fusing it and carrying only the needed columns is F-161.
 
 **SQL**: `FROM a JOIN b ON a.k = b.k [AND ...]`, `JOIN ... USING (k)` (`SELECT *` keeps the left columns, then the right minus the USING columns), and a comma join
 whose WHERE has the equalities (`FROM a, b WHERE a.k = b.k`). A name is `alias.column` or a bare column that only one side has; a bare name both sides have raises
-(`ambiguous`), joining a table with itself needs two aliases. Only inner joins: `LEFT JOIN` and the others are refused by name (F-154). Non-equality conditions in ON
-and WHERE conditions over both sides run after the join. The aggregates, `GROUP BY`, `ORDER BY` and `LIMIT` of section 8 work over the joined rows.
+(`ambiguous`), joining a table with itself needs two aliases. `RIGHT`, `FULL` and `CROSS` joins are refused by name (`RIGHT JOIN is not supported yet`). Non-equality conditions in ON
+and WHERE conditions over both sides run after the join (inner joins only: see below for the other kinds). The aggregates, `GROUP BY`, `ORDER BY` and `LIMIT` of section 8 work over the joined rows.
 
-**Builder**: `Query(left).join(right: SharedTable, left_on, right_on)` returns a query over the joined rows (this table's columns, then the other's; a repeated name gets a
+**LEFT, SEMI, ANTI (F-154)**: `a LEFT [OUTER] JOIN b ON ...` keeps every row of `a`; where nothing matches, `b`'s columns are NULL (a NULL key matches nothing). `a SEMI JOIN b ON ...`
+keeps the rows of `a` that have a partner, `a ANTI JOIN b ON ...` the rows that have none; both return `a`'s columns only (`b`'s are visible in ON, nowhere after it). All three build on the
+right table. Subqueries are these joins: `x IN (SELECT c FROM t [WHERE p])` and `EXISTS (SELECT .. FROM t WHERE t.k = outer.k [AND p])` are semi joins, `NOT EXISTS` is an anti join,
+`x NOT IN (SELECT c FROM t [WHERE p])` is a null-aware anti join: it keeps no row when the list holds a NULL, keeps every row (a NULL key too) when the list is empty, and drops a row whose key
+is NULL otherwise. In a subquery's WHERE a bare name is the subquery table's column when it has one, else the outer table's; an equality between a column of each is the join key, the other
+conditions on the subquery's table filter it. Shapes that need a residual predicate during the match are refused by name: a non-equality condition across the tables, or a condition on the
+left table alone, in the ON of a LEFT or ANTI join (F-155); one subquery per WHERE, joined to the rest by AND (F-155); a subquery with GROUP BY, a join, a scalar subquery or an EXISTS with no
+correlated equality (F-159). A LEFT join on keys too wide to pack into one int64 is refused (F-155).
+
+**Builder**: `Query(left).join(right: SharedTable, left_on, right_on, how)` (`how` = "inner", "left", "semi" or "anti") returns a query over the joined rows (this table's columns, then the other's; a repeated name gets a
 suffix `_1`). It must come first and works over plain tables; the rest of the builder's rules apply after it.
 
 **Keys (exactness)**: a NULL key never matches. TEXT keys match by bytes across dictionaries (a once-per-dictionary translation of codes), so `West` is not `west`
@@ -426,15 +435,17 @@ keys are packed into one int64 when the build side's ranges multiply to fewer th
   a scan's row groups and a one-side filter are all applied; an unfiltered plain table is read in place).
 - *fused*: the build keys are unique (aggregates, and row queries including top-k and ORDER BY / LIMIT). The probe table is scanned by the pipeline; each block's rows look their partner up (direct array or hash table, with prefetch) and
   the partner's columns are gathered into per-worker scratch. No joined row is written.
+- *fused* LEFT: the same with unique build keys; an unmatched row stays in the block with its build columns NULL (validity bits clear). *Fused* SEMI / ANTI: any build keys (a presence-only
+  map: one pass of marks, no repeated-key rows); the block's rows are kept or dropped by whether their key is present, and nothing is gathered.
 - *materialized*: repeated build keys, hashed composite keys, or holistic aggregates (median, percentiles, distinct): the matching (probe, build) pairs are counted
-  first, gathered into a Table, and the query runs over that. Past the memory budget (3 GiB of joined values) it raises a readable error (spill is deferred). `mx --join materialize` forces it.
+  first, gathered into a Table, and the query runs over that (a LEFT join's unmatched rows are pairs with build row -1; a semi / anti join gathers the selected left rows). Past the memory budget (3 GiB of joined values) it raises a readable error (spill is deferred). `mx --join materialize` forces it.
 
 **The kernel** (`kernels_aot/hashjoin_cpu.mojo`; Mojo API and `libmxhashjoin_cpu.so` with a C ABI over a handle, `hashjoin_lib.mojo`): int64 keys and an optional `ok` byte array in, build rows
 out. `hj_build` picks a direct array (range at most max(8n, 2^20) and 2^28; CSR rows when keys repeat) or radix partitions sized from L2 with linear probing and a presence bitmap; the build
-is parallel without atomics. `hj_probe_unique`, `hj_probe_pairs` (budgeted) and `hj_probe_block` (fused) probe it. The engine-level steps (`normalize_keys`, `join_pairs`, `gather_join`) are in `joincore.mojo`.
+is parallel without atomics. `hj_probe_unique`, `hj_probe_pairs` (budgeted; `outer` adds a LEFT join's unmatched rows as build row -1) and `hj_probe_block` / `hj_probe_left_block` (fused) probe it; `hj_build(presence=True)` and `hj_probe_select` / `hj_filter_block` (modes semi, anti, null-aware anti, none) are the semi and anti joins' form. The engine-level steps (`normalize_keys`, `join_pairs`, `gather_join`) are in `joincore.mojo`.
 
 ## 9. Later (Query and Explore modes)
-Outer joins and subqueries, multi-way joins, expression functions (M8: F-154 to F-162); pipelines with cached steps; versioned column
+RIGHT / FULL joins, multi-way joins, scalar subqueries, expression functions (M8: F-155 to F-162); pipelines with cached steps; versioned column
 chunks for a time machine and branches; TPC-H through SQL.
 
 ## Memory rules

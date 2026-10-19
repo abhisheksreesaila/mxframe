@@ -11,7 +11,7 @@ LIB = Path(__file__).resolve().parent.parent / "kernels_aot" / "libmxhashjoin_cp
 @pytest.fixture(scope="module")
 def lib():
     L = ctypes.CDLL(str(LIB))
-    for name in ("mx_hj_build", "mx_hj_info", "mx_hj_probe_unique", "mx_hj_probe_pairs", "mx_hj_abi_version", "mx_hj_init_runtime"):
+    for name in ("mx_hj_build", "mx_hj_build_presence", "mx_hj_info", "mx_hj_probe_unique", "mx_hj_probe_pairs", "mx_hj_probe_pairs_outer", "mx_hj_probe_select", "mx_hj_abi_version", "mx_hj_init_runtime"):
         getattr(L, name).restype = ctypes.c_long
     L.mx_hj_init_runtime()
     return L
@@ -37,6 +37,8 @@ def probe_pairs(lib, h, keys, ok=None):
                                ctypes.c_long(2), ctypes.c_long(10**9), ctypes.c_long(addr(out)))
     assert rc == 0
     n = out[0]
+    if n == 0:
+        assert out[1] == 0 and out[2] == 0          # no pairs: no arrays to release
     pr = (ctypes.c_int32 * n).from_address(out[1]) if n else []
     br = (ctypes.c_int32 * n).from_address(out[2]) if n else []
     pairs = list(zip(pr, br))
@@ -107,3 +109,59 @@ def test_a_handle_that_is_not_a_map_is_refused_or_ignored_not_a_crash(lib):
 
 def test_a_build_of_2_pow_31_rows_is_refused_with_minus_31(lib):
     assert lib.mx_hj_build(ctypes.c_long(0), ctypes.c_long(0), ctypes.c_long(1 << 31), ctypes.c_long(1)) == -31
+
+
+def test_no_matching_pair_returns_no_arrays(lib):
+    h = build(lib, [1, 2, 3])
+    assert probe_pairs(lib, h, [10, 20]) == []
+    lib.mx_hj_free(ctypes.c_long(h))
+
+
+def run_select(lib, h, keys, mode, ok=None):
+    k = array("q", keys)
+    o = array("B", ok) if ok is not None else None
+    out = array("q", [0, 0])
+    rc = lib.mx_hj_probe_select(ctypes.c_long(h), ctypes.c_long(addr(k)), ctypes.c_long(addr(o) if o else 0), ctypes.c_long(len(k)),
+                                ctypes.c_long(2), ctypes.c_long(mode), ctypes.c_long(addr(out)))
+    assert rc == 0
+    rows = list((ctypes.c_int32 * out[0]).from_address(out[1])) if out[0] else []
+    assert (out[1] == 0) == (out[0] == 0)
+    if out[0]:
+        lib.mx_hj_release_array(ctypes.c_long(out[1]))
+    return rows
+
+
+def test_semi_and_anti_select_by_presence_whatever_repeats(lib):
+    h = build(lib, [5, 5, 6, 9], ok=[1, 1, 1, 0])        # key 9 is a NULL build key: absent
+    probe = [5, 7, 9, 6, 5]
+    ok = [1, 1, 1, 1, 0]                                  # the last probe key is NULL
+    assert run_select(lib, h, probe, 2, ok) == [0, 3]                 # semi: 5 and 6 (the NULL 5 does not match)
+    assert run_select(lib, h, probe, 3, ok) == [1, 2, 4]              # anti: 7, 9, and the NULL key
+    assert run_select(lib, h, probe, 4, ok) == [1, 2]                 # null-aware anti: the NULL key is not kept
+    assert run_select(lib, h, probe, 5, ok) == []
+    lib.mx_hj_free(ctypes.c_long(h))
+
+
+def test_outer_pairs_give_every_unmatched_row_a_minus_one_partner(lib):
+    h = build(lib, [1, 2, 2])
+    k = array("q", [2, 3, 1])
+    out = array("q", [0, 0, 0])
+    rc = lib.mx_hj_probe_pairs_outer(ctypes.c_long(h), ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(3), ctypes.c_long(1),
+                                     ctypes.c_long(10**9), ctypes.c_long(addr(out)))
+    assert rc == 0 and out[0] == 4
+    pr = list((ctypes.c_int32 * 4).from_address(out[1]))
+    br = list((ctypes.c_int32 * 4).from_address(out[2]))
+    assert list(zip(pr, br)) == [(0, 1), (0, 2), (1, -1), (2, 0)]
+    lib.mx_hj_release_array(ctypes.c_long(out[1]))
+    lib.mx_hj_release_array(ctypes.c_long(out[2]))
+    lib.mx_hj_free(ctypes.c_long(h))
+
+
+def test_a_presence_map_answers_semi_and_anti_selects(lib):
+    keys = [5, 5, 6, 9, 1000]
+    k = array("q", keys)
+    h = lib.mx_hj_build_presence(ctypes.c_long(addr(k)), ctypes.c_long(0), ctypes.c_long(5), ctypes.c_long(2))
+    assert h > 0
+    assert run_select(lib, h, [5, 7, 9, 1000, 6, 4], 2) == [0, 2, 3, 4]
+    assert run_select(lib, h, [5, 7, 9, 1000, 6, 4], 3) == [1, 5]
+    lib.mx_hj_free(ctypes.c_long(h))

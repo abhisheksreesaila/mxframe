@@ -1,4 +1,4 @@
-"""The fused probe of an inner join (F-153): the join runs inside the pipeline that aggregates (or lists) its rows.
+"""The fused probe of a join (F-153, F-154): the join runs inside the pipeline that aggregates (or lists) its rows.
 
 When the build side's keys are unique, each probe row has at most one partner, so no joined row needs to exist: the kernel's front stage
 (`pipeline_fused`) takes each 1,024-row block of the probe table, looks every row's key up (`hj_probe_block`: prefetched, a miss drops
@@ -14,11 +14,16 @@ both alive for the whole kernel call.
 from .table import SharedTable
 from .query import Program
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC
-from .kernels.hashjoin_cpu import JoinMap, MapView, hj_probe_block
+from .kernels.hashjoin_cpu import JoinMap, MapView, hj_probe_block, hj_probe_left_block, hj_filter_block
 from .kargs import KernelRun
 from .joincore import JoinKeys
 
 comptime DT_NULLMASK = 7
+
+# how the front stage treats a probe row (F-154): the inner join drops rows without a partner; a LEFT join keeps them (their build columns are NULL);
+# a semi / anti join keeps or drops rows by whether the key is present and gathers nothing (the numbers are the kernel's `PM_*` modes)
+comptime FM_INNER = 0
+comptime FM_LEFT = 1
 
 
 struct FusedJoin(Movable):
@@ -30,8 +35,10 @@ struct FusedJoin(Movable):
     var partner: List[Int]           # the build table's columns the front stage gathers, in partner order
     var map: JoinMap
     var keys: JoinKeys               # the probe side's normalized keys (and the build side's, which built the map)
+    var fmode: Int                   # FM_INNER, FM_LEFT, or a presence filter mode (semi / anti: no partner columns)
 
-    def __init__(out self, probe: SharedTable, build: SharedTable, var vprobe: List[Bool], var vreal: List[Int], var map: JoinMap, var keys: JoinKeys):
+    def __init__(out self, probe: SharedTable, build: SharedTable, var vprobe: List[Bool], var vreal: List[Int], var map: JoinMap, var keys: JoinKeys, fmode: Int = 0):
+        self.fmode = fmode
         self.probe = probe
         self.build = build
         self.vpartner = List[Int]()
@@ -68,8 +75,10 @@ struct FrontSpec(ImplicitlyCopyable, Movable):
     var off_vals: Int
     var off_bits: Int
     var ws_bytes: Int
+    var fmode: Int
 
     def __init__(out self):
+        self.fmode = 0
         self.view = MapView(JoinMap())
         self.keys_a = 0
         self.ok_a = 0
@@ -96,6 +105,7 @@ def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpe
     regions (alive as long as the run, which the kernel call is a method of)."""
     var fs = FrontSpec()
     fs.view = MapView(fj.map)
+    fs.fmode = fj.fmode
     fs.keys_a = fj.keys.pk_addr
     fs.ok_a = fj.keys.po_addr
     fs.n_words = len(p.cols)
@@ -143,7 +153,16 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
     for j in range(n):
         sel[j] = Int32(j)
     var prow = IP(unsafe_from_address=Int(ws) + fs.off_prow)
-    var kept = hj_probe_block(fs.view, LP(unsafe_from_address=fs.keys_a), BP(unsafe_from_address=fs.ok_a if fs.ok_a != 0 else Int(ws)), fs.ok_a != 0, i0, sel, n, prow)
+    var keys = LP(unsafe_from_address=fs.keys_a)
+    var okp = BP(unsafe_from_address=fs.ok_a if fs.ok_a != 0 else Int(ws))
+    var kept: Int
+    if fs.fmode == FM_INNER:
+        kept = hj_probe_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, prow)
+    elif fs.fmode == FM_LEFT:
+        hj_probe_left_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, prow)
+        kept = n
+    else:
+        kept = hj_filter_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, fs.fmode)
     if kept == 0:
         return 0
     var lc = LP(unsafe_from_address=Int(ws))
@@ -157,15 +176,22 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
         var q = Int(dat[2 * e + 1])
         var dst = LP(unsafe_from_address=Int(ws) + fs.off_vals + u * VEC * 8)
         var src = LP(unsafe_from_address=Int(bv[2 * u]))
-        for t in range(kept):
-            dst[Int(sel[t])] = src[Int(prow[t])]
+        if fs.fmode == FM_LEFT:
+            for t in range(kept):
+                var r = Int(prow[t])
+                if r >= 0:
+                    dst[Int(sel[t])] = src[r]                         # an unmatched row's value is never read: its validity bit is clear
+        else:
+            for t in range(kept):
+                dst[Int(sel[t])] = src[Int(prow[t])]
         lc[q] = Int64(Int(dst)) - Int64(i0 * 8)
     var vd = LP(unsafe_from_address=fs.valid_a)
     for e in range(fs.n_valid):
         var u = Int(vd[2 * e])
         var slot = Int(vd[2 * e + 1])
         var valid_bits = Int(bv[2 * u + 1])
-        if valid_bits == 0:
+        var left = fs.fmode == FM_LEFT
+        if valid_bits == 0 and not left:
             continue                                                  # the build column has no NULL: the program reads it as always valid
         var bits = BP(unsafe_from_address=Int(ws) + fs.off_bits + u * (VEC // 8))
         for z in range(VEC // 8):
@@ -173,7 +199,9 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
         var src = BP(unsafe_from_address=valid_bits)
         for t in range(kept):
             var r = Int(prow[t])
-            if (src[r >> 3] >> UInt8(r & 7)) & 1 != 0:
+            if r < 0:
+                continue                                              # a LEFT join's unmatched row: NULL
+            if valid_bits == 0 or (src[r >> 3] >> UInt8(r & 7)) & 1 != 0:
                 var b = Int(sel[t])
                 bits[b >> 3] = bits[b >> 3] | (UInt8(1) << UInt8(b & 7))
         lc[slot] = Int64(Int(bits))

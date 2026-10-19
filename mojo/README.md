@@ -30,12 +30,12 @@ select list, ORDER BY and LIMIT after aggregation, run as a row query over the g
 exact AVG. `mojo/tools/sql_probe.mojo` runs one SQL string over Parquet files and prints typed JSON (tests/test_mojo_sql.py and
 tests/test_mojo_rows.py compare it, and `mx`, with DuckDB); `mojo/tests/test_sql.mojo` and `test_sql_parse.mojo` run in `pixi run mojo-test`.
 
-## Joins (F-153)
+## Joins (F-153, F-154)
 
-The inner equi-join: `joincore.mojo` (key normalization, pairs, gather: tables in, a table out, no query language), `join.mojo` (the SQL side: what each side must
+The equi-join (inner, left, semi, anti; IN / EXISTS subqueries are lifted to semi and anti joins by the binder): `joincore.mojo` (key normalization, pairs, gather: tables in, a table out, no query language), `join.mojo` (the SQL side: what each side must
 deliver, the queries around the join), `jfront.mojo` (the fused front stage for unique build keys), `Query.join` in `query.mojo`, and the kernel
 `kernels_aot/hashjoin_cpu.mojo` (int64 pointers in, rows out; `libmxhashjoin_cpu.so` is its C ABI for the Python engine). Tests: `mojo/tests/test_hashjoin.mojo` (kernel against a
-brute-force loop), `test_join_api.mojo` (`Query.join`), `tests/test_mojo_join.py` (SQL against DuckDB: fused vs materialized, the build side, every key rule), `tests/test_hashjoin_lib.py`.
+brute-force loop), `test_join_api.mojo` (`Query.join`), `tests/test_mojo_join.py` (SQL against DuckDB: fused vs materialized, the build side, every key rule), `tests/test_hashjoin_lib.py`, `tests/test_mojo_outer_joins.py` (LEFT / SEMI / ANTI / subqueries against DuckDB), `mojo/tests/test_frame_merge.mojo` (edited Frames against their baked tables).
 Rules and paths: `docs/mxframe-mojo-api.md` section 8b.
 
 ## FLOAT64 (F-157)

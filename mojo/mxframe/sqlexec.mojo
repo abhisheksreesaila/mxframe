@@ -28,8 +28,8 @@ from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE,
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import needed_columns, side_query, joined_query, virtual_schema
-from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, gather_join, JOIN_BUDGET_BYTES
-from .kernels.hashjoin_cpu import hj_build
+from .joincore import JoinKeys, JoinSide, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
+from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
 from std.memory import ArcPointer
@@ -689,6 +689,18 @@ def _side_names(q: BoundQuery, t: Int) -> String:
     return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
 
 
+def _kind_name(k: Int) -> String:
+    if k == 1:
+        return "left"
+    if k == 2:
+        return "semi"
+    if k == 3:
+        return "anti"
+    if k == 4:
+        return "anti (null-aware)"
+    return "inner"
+
+
 def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool) raises -> JoinSide:
     """Side `t` of the join: the source table itself when nothing filters it and it is a plain table, else the result of a row query."""
     ref src = catalog.sources[q.sources[t]]
@@ -723,7 +735,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     into one table, and the rest of the query (the filter that reads both sides, aggregates, ORDER BY, LIMIT) runs over that table."""
     var res = SqlResult()
     if q.explain != EXPLAIN_NONE:
-        res.notes.append("join: inner, on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + " (the build side is the side with fewer rows after its filter: decided when the query runs)")
+        res.notes.append("join: " + _kind_name(q.join_kind) + ", on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) +
+                         (" (the build side is the side with fewer rows after its filter: decided when the query runs)" if q.join_kind == 0 else " (the build side is the right table)"))
         res.explain = _explain_text(lp, res.notes)
         var t = Table.empty()
         var c = t.add_column("plan", TEXT)
@@ -733,15 +746,17 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         res.table = t^
         res.ms = Float64(perf_counter_ns() - t0) / 1e6
         return res^
+    var kind = q.join_kind
+    var semi_anti = kind >= 2
     var lneed = needed_columns(q, 0)
-    var rneed = needed_columns(q, 1)
+    var rneed = needed_columns(q, 1)                                 # a semi / anti join: the key columns only (the right table has no columns after it)
     var t_sides = perf_counter_ns()
     var left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
     var right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
     var ms_sides = Float64(perf_counter_ns() - t_sides) / 1e6
     var lrows = left.table.rows()
     var rrows = right.table.rows()
-    var left_builds = lrows < rrows
+    var left_builds = kind == 0 and lrows < rrows                    # left, semi and anti joins build on the right table
     var t_keys = perf_counter_ns()
     var keys = JoinKeys()
     if left_builds:
@@ -750,15 +765,36 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, opts.threads)
     var nb = lrows if left_builds else rrows
     var np = rrows if left_builds else lrows
+    var fmode = 0                                                    # the front stage's mode: 0 inner, 1 left, else a presence filter
+    var na_note = String()
+    if kind == 1:
+        fmode = 1
+    elif semi_anti:
+        fmode = PM_SEMI if kind == 2 else PM_ANTI
+        if kind == 4:                                                # NOT IN: an empty list keeps every row; a NULL in the list keeps none; else a NULL key is dropped
+            if rrows == 0:
+                na_note = " (the list is empty: every row is kept, a NULL key too)"
+            elif right.table.null_count(right.key_cols[0]) > 0:
+                fmode = PM_NONE
+                na_note = " (the list holds a NULL: no row passes)"
+            else:
+                fmode = PM_ANTI_NA
+                na_note = " (a NULL key is dropped)"
+    if semi_anti:
+        right.cols = List[Int]()                                     # nothing of the right table is carried
+        rneed = List[Int]()
     var t_build = perf_counter_ns()
-    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads)
+    var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads, semi_anti)
+    if fmode == PM_ANTI_NA:
+        unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], lrows)
     var t_probe = perf_counter_ns()
     var ncols = len(lneed) + len(rneed)
     var budget = JOIN_BUDGET_BYTES // (8 * max(ncols, 1))
-    res.notes.append("join: inner on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lrows) + " rows of " + _side_names(q, 0) +
+    res.notes.append("join: " + _kind_name(kind) + " on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lrows) + " rows of " + _side_names(q, 0) +
                      " and " + commas(rrows) + " rows of " + _side_names(q, 1) + " after their filters" +
-                     (" (" + _side_names(q, 0) + " read in place)" if left.zero_copy else "") + (" (" + _side_names(q, 1) + " read in place)" if right.zero_copy else ""))
-    res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(nb) + " rows, the smaller side): " + m.kind())
+                     (" (" + _side_names(q, 0) + " read in place)" if left.zero_copy else "") + (" (" + _side_names(q, 1) + " read in place)" if right.zero_copy else "") + na_note)
+    res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(nb) + " rows, " +
+                     ("the smaller side" if kind == 0 else "the right side: a " + _kind_name(kind) + " join builds on it") + "): " + m.kind())
     res.notes.append("join keys: " + keys.layout)
     res.notes.append("join time: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build " + _ms(Float64(t_probe - t_build) / 1e6) + " ms")
     var any_holistic = False
@@ -768,8 +804,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var jq = joined_query(q, lneed, rneed)
     var cat2 = Catalog()
     var inner: SqlResult
-    if m.unique and not keys.verify and not any_holistic and opts.fuse:
-        # fused: no joined row is written; the pipeline probes block by block and gathers the build side's columns into scratch
+    var fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti)
+    if fusable:
+        # fused: no joined row is written; the pipeline probes block by block (keeps or drops the rows by the join's rule) and gathers the build side's columns into scratch
         var vprobe = List[Bool]()
         var vreal = List[Int]()
         for c in left.cols:
@@ -778,26 +815,48 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         for c in right.cols:
             vprobe.append(left_builds)
             vreal.append(c)
-        var pside_cols = right.cols.copy() if left_builds else left.cols.copy()
-        var vt = virtual_schema(left, right)
+        var vt = virtual_schema(left, right, kind == 1)
         cat2.add_table("join", vt^.share())
         cat2.sources[0].fixed_rows = np
         var pt = right.table if left_builds else left.table
         var bt = left.table if left_builds else right.table
         _prefill_ranges(cat2.sources[0], jq, pt, bt, vprobe, vreal)
-        var kind_text = m.kind()
-        var fj = ArcPointer(FusedJoin(pt, bt, vprobe^, vreal^, m^, keys^))
-        res.notes.append("join path: fused: " + commas(np) + " probe rows look their partner up in blocks of 1,024 and " + String(len(fj[].partner)) +
-                         " build-side " + ("column is" if len(fj[].partner) == 1 else "columns are") + " gathered into per-worker scratch (no joined row is written)")
+        var fj = ArcPointer(FusedJoin(pt, bt, vprobe^, vreal^, m^, keys^, fmode))
+        if semi_anti:
+            res.notes.append("join path: fused: " + commas(np) + " probe rows are " +
+                             ("kept when their key is present in the build side" if kind == 2 else "dropped when their key is present in the build side" if kind == 3 else "kept when their key is absent from the list") +
+                             ", in blocks of 1,024 (" + _kind_name(kind) + " join: no build-side column is gathered, no joined row is written)")
+        else:
+            res.notes.append("join path: fused: " + commas(np) + " probe rows look their partner up in blocks of 1,024 and " + String(len(fj[].partner)) +
+                             " build-side " + ("column is" if len(fj[].partner) == 1 else "columns are") + " gathered into per-worker scratch (no joined row is written)" +
+                             (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else ""))
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
     else:
         var t_gather = perf_counter_ns()
-        var pairs = join_pairs(m, keys, np, budget, opts.threads)
-        var jt = gather_join(left, right, pairs, left_builds, opts.threads)
+        var jt: Table
+        var n_out: Int
+        if semi_anti:
+            var pick = select_rows(m, keys, np, fmode, opts.threads)
+            n_out = pick.n
+            jt = gather_join(left, right, pick, False, opts.threads)
+        else:
+            var pairs = join_pairs(m, keys, np, budget, opts.threads, kind == 1)
+            n_out = pairs.n
+            jt = gather_join(left, right, pairs, left_builds, opts.threads, kind == 1)
         var ms_gather = Float64(perf_counter_ns() - t_gather) / 1e6
-        res.notes.append("join path: materialized: " + commas(pairs.n) + " matching pairs gathered into one table of " + String(ncols) + " columns" +
-                         ("" if opts.fuse else " (fusing is off in the options)") + ("" if (not m.unique or keys.verify or not any_holistic) else " (a holistic aggregate needs every joined row)") +
-                         (" (the keys are hashed tuples, verified per pair)" if keys.verify else "") + ("" if m.unique else " (the build side's keys repeat)"))
+        var why = String()
+        if not opts.fuse:
+            why = " (fusing is off in the options)"
+        elif any_holistic:
+            why = " (a holistic aggregate needs every joined row)"
+        elif keys.verify:
+            why = " (the keys are hashed tuples, verified per pair)"
+        elif not m.unique and not semi_anti:
+            why = " (the build side's keys repeat)"
+        if semi_anti:
+            res.notes.append("join path: materialized: " + commas(n_out) + " of " + commas(np) + " rows pass the " + _kind_name(kind) + " join and are gathered into one table of " + String(ncols) + " columns" + why)
+        else:
+            res.notes.append("join path: materialized: " + commas(n_out) + (" pairs (unmatched rows included)" if kind == 1 else " matching pairs") + " gathered into one table of " + String(ncols) + " columns" + why)
         res.notes.append("join time: gather " + _ms(ms_gather) + " ms")
         cat2.add_table("join", jt^.share())
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie)

@@ -94,10 +94,36 @@ def main() raises:
     # refusals by name
     var refused = False
     try:
-        _ = Query(left).join(right, ["k"], ["k"], "left")
+        _ = Query(left).join(right, ["k"], ["k"], "full")
     except e:
-        refused = "F-154" in String(e)
-    expect(refused, "a left join is refused by name")
+        refused = "a `full` join is not supported" in String(e)
+    expect(refused, "a full join is refused by name")
+    # left: every left row; the right's columns are NULL where nothing matches. By hand: the NULL keys and the keys without a partner give one row each
+    var no_partner = 0
+    var null_keys = 0
+    for i in range(n_left):
+        if i % 7 == 6:
+            null_keys += 1
+            continue
+        var k = (i * 31) % 400
+        var has = False
+        for j in range(n_right):
+            if (j * 13) % 300 == k:
+                has = True
+                break
+        if not has:
+            no_partner += 1
+    var lj = Query(left).join(right, ["k"], ["k"], "left")
+    expect(lj.table.rows() == pairs + no_partner + null_keys, "left join rows: " + String(lj.table.rows()) + " wanted " + String(pairs + no_partner + null_keys))
+    expect(lj.table.null_count(5) == no_partner + null_keys, "the right's columns are NULL where nothing matches: " + String(lj.table.null_count(5)))
+    var rl = Query(left).join(right, ["k"], ["k"], "left").agg(count(), sum(col("id"))).compute()
+    expect(rl.counts[0] == pairs + no_partner + null_keys, "a left join counted")
+    # semi and anti: this table's columns only; a NULL key has no partner (so anti keeps it)
+    var sj = Query(left).join(right, ["k"], ["k"], "semi")
+    var aj = Query(left).join(right, ["k"], ["k"], "anti")
+    expect(sj.table.columns() == 4 and aj.table.columns() == 4, "semi and anti keep this table's columns")
+    expect(aj.table.rows() == no_partner + null_keys, "anti rows: " + String(aj.table.rows()))
+    expect(sj.table.rows() + aj.table.rows() == n_left, "semi and anti split the rows")
     refused = False
     try:
         _ = Query(left).where(col("id") > 3).join(right, ["k"], ["k"])
