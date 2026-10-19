@@ -1535,11 +1535,15 @@ Needs: F-152 · Size: L · `kernels_aot/hashjoin_cpu.mojo` (new: int64-pointer A
 - Informal timings (24 threads, SF1-shaped lineitem 6M x orders 1.5M, mx ms vs DuckDB ms): FK->PK sum with group 110 vs 148; orders x customer 3.6 vs 6.6; composite 2-key 49 vs 35; filtered orders side 34 vs 22 (the sub-query of the probe side is the remaining gap, with the row output tail).
 - Review round 1: NEEDS WORK (a Frame's merge was skipped for base rows in the row sink, so joins on a merged TEXT key were wrong), fixed in the sink (merged TEXT columns through registers), plus C ABI handle guards, a 2^31-row refusal and tests; the main session committed `libmxhashjoin_cpu.so` (gitignored, never force-added) and a test that every registered library is committed. Round 2: PASS (359 adversarial SQL runs and 718 in round 1 equal DuckDB across table / scan / frame / framescan / fused / materialized; kernel fuzz 119 cases + the 2^28 boundary, 0 bad; 20,000 ABI cycles without a leak). Open: `hj_probe_pairs` returns two 1-element arrays when nothing matches (release them always, or return 0: F-154); builder `Query.join` fusion and the Python engine on this kernel (F-161)
 
-## F-154 M8: LEFT, SEMI and ANTI joins; IN / EXISTS / NOT IN / NOT EXISTS subqueries (uncorrelated) [todo]
+## F-154 M8: LEFT, SEMI and ANTI joins; IN / EXISTS / NOT IN / NOT EXISTS subqueries (uncorrelated) [review]
 Needs: F-153 · Size: M
-- [ ] LEFT JOIN (null build columns, fused and row output); SEMI / ANTI; IN (SELECT) / EXISTS → semi, NOT EXISTS → anti, NOT IN → null-aware anti; RIGHT / FULL / CROSS raise by name
-- [ ] build side = the right for left / semi / anti; presence bitmap or mark flags for semi / anti
-- [ ] equal to DuckDB with nulls on both sides, empty sides, NOT IN with and without NULLs, a left join counted per left row (Q13's shape)
+- [x] LEFT JOIN (null build columns, fused and row output); SEMI / ANTI; IN (SELECT) / EXISTS → semi, NOT EXISTS → anti, NOT IN → null-aware anti; RIGHT / FULL / CROSS raise by name
+- [x] build side = the right for left / semi / anti; presence bitmap or mark flags for semi / anti
+- [x] equal to DuckDB with nulls on both sides, empty sides, NOT IN with and without NULLs, a left join counted per left row (Q13's shape)
+- Built: `JK_*` join kinds through parser (`sql.mojo`: LEFT [OUTER] / SEMI / ANTI JOIN, `SubQuery`, X_SUBIN / X_EXISTS), binder (`_lift_subquery`: a WHERE subquery becomes the right table of a semi / anti join, scope rules, ON classification), plan (`Join (left|semi|anti|anti, null-aware)`), executor (`sqlexec.mojo`), `jfront.mojo` (`FM_LEFT`, presence filters), kernel (`hj_probe_pairs(outer)`, `hj_probe_select`, `hj_filter_block`, `hj_probe_left_block`, `hj_build(presence)`; C ABI `mx_hj_probe_pairs_outer`, `mx_hj_probe_select`, `mx_hj_build_presence`), `Query.join(how=left|semi|anti)`.
+- Review round (F-153): `hj_probe_pairs` returns no arrays when nothing matches.
+- Deviations: EXISTS needs a correlated equality (an uncorrelated EXISTS is a constant: refused, F-159); one subquery per query and none beside an explicit join (F-155); ON conditions that are not key equalities or right-only filters raise in LEFT / ANTI joins (a left-only condition is also refused in ANTI / LEFT, allowed in SEMI as a left filter); a LEFT join on hashed composite keys raises; a LEFT join with repeated build keys is materialized (the one-to-many expansion inside the fused probe is F-161); NOT IN is single-key (the null-aware rule is per key). NOT IN found one bug through the frame test: a probe value that cannot equal any build key (a TEXT word the list lacks) was treated as NULL.
+- Informal timings (24 threads, lineitem 6M, orders 1.5M, customer 150k; mx ms vs DuckDB ms): lineitem LEFT JOIN orders GROUP BY 18 vs 48; lineitem IN (SELECT ..) 11 vs 15; NOT IN 12 vs 14; orders EXISTS (lineitem) 20 vs 70; orders NOT EXISTS 9 vs 35; customer NOT EXISTS (orders) 3 vs 7.5 (presence-only build: 11 ms to 2.4); customer LEFT JOIN orders (one-to-many, materialized) 34 vs 13: the gap F-161 closes.
 
 ## F-155 M8: multi-way joins and the cost-based planner (join order, build sides, EXPLAIN ANALYZE) [todo]
 Needs: F-154 · Size: L
@@ -1587,7 +1591,7 @@ Needs: F-158, F-159 · Size: M · core: `catalog.view` and a result cache keyed 
 
 ## F-161 M8: join speed: m:n inside the fused probe, radix-partitioned probe, runtime join filters [todo]
 Needs: F-155 · Size: L · engine-first; F-058's losses are joins
-- [ ] one-to-many expansion inside the front stage (no materialized pairs for aggregates over m:n joins)
+- [ ] one-to-many expansion inside the front stage (no materialized pairs for aggregates over m:n joins), a LEFT join with repeated build keys included (F-154: customer LEFT JOIN orders GROUP BY runs 34 ms materialized vs DuckDB 13)
 - [ ] radix-partitioned probe when the table is over L3 / 2 and the probe ≥ 4x the build; runtime join filter (a bitmap of surviving probe keys trims the build side)
 - [ ] the Python engine's joins call the same kernel (closing F-046a slice 1; `libmxhashjoin_cpu.so` and its C ABI exist since F-153, nothing in Python calls them yet: "shared with the Python engine" is open), suites green
 - [ ] `Query.join` (F-153 review): it gathers every column of both tables and never fuses, so a big fact-to-dimension join hits the 3 GiB budget through the builder while the same join runs fused in SQL; carry only the columns the query after it reads and fuse where SQL does

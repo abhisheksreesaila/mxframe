@@ -1414,6 +1414,10 @@ def _lift_subquery(mut st: SqlStatement, catalog: Catalog) raises:
         st.join_kind = JK_ANTI_NA if neg else JK_SEMI
     else:
         st.join_kind = JK_ANTI if neg else JK_SEMI
+    if lower_ascii(sub.table) == lower_ascii(st.table) and sub.alias.byte_length() == 0:
+        sub.alias = "_sub_" + sub.table                    # a subquery over the same table: the two sides need names (the outer one keeps its own, or the table's)
+        if st.table_alias.byte_length() == 0:
+            st.table_alias = st.table
     st.has_right = True
     st.right_table = sub.table
     st.right_alias = sub.alias

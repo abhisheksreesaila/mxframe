@@ -194,6 +194,8 @@ IN_LISTS = [
     "SELECT ck FROM cust WHERE ck IN (SELECT ck FROM withnull)",
     "SELECT ck FROM cust WHERE ck IN (SELECT ck FROM nothing)",
     "SELECT count(*) FROM nothing_c WHERE ck IN (SELECT ck FROM ords)",
+    "SELECT count(*), sum(ck) FROM cust WHERE seg IN (SELECT seg FROM cust WHERE ck < 10)",           # the same table on both sides
+    "SELECT count(*) FROM cust WHERE ck NOT IN (SELECT ck FROM cust WHERE seg > 20)",
 ]
 
 
@@ -201,7 +203,7 @@ IN_LISTS = [
 def test_in_subquery_equals_duckdb(mx, data, sql):
     tables = ["cust", "ords", "withnull", "nothing", "nothing_c"]
     res = q(mx, data, sql, tables)
-    assert "semi join" in note(res, "join path") or "semi" in note(res, "join: "), res["notes"]
+    assert ("semi" if "NOT IN" not in sql else "anti") in note(res, "join: "), res["notes"]
 
 
 NOT_IN = [

@@ -823,8 +823,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         _prefill_ranges(cat2.sources[0], jq, pt, bt, vprobe, vreal)
         var fj = ArcPointer(FusedJoin(pt, bt, vprobe^, vreal^, m^, keys^, fmode))
         if semi_anti:
-            res.notes.append("join path: fused: " + commas(np) + " probe rows are " + ("kept when" if kind == 2 else "dropped when" if kind == 3 else "kept when none of the list's values equals") +
-                             " their key is present in the build side, in blocks of 1,024 (" + _kind_name(kind) + " join: no build-side column is gathered, no joined row is written)")
+            res.notes.append("join path: fused: " + commas(np) + " probe rows are " +
+                             ("kept when their key is present in the build side" if kind == 2 else "dropped when their key is present in the build side" if kind == 3 else "kept when their key is absent from the list") +
+                             ", in blocks of 1,024 (" + _kind_name(kind) + " join: no build-side column is gathered, no joined row is written)")
         else:
             res.notes.append("join path: fused: " + commas(np) + " probe rows look their partner up in blocks of 1,024 and " + String(len(fj[].partner)) +
                              " build-side " + ("column is" if len(fj[].partner) == 1 else "columns are") + " gathered into per-worker scratch (no joined row is written)" +

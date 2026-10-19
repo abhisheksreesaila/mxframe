@@ -260,8 +260,8 @@ def test_unknown_names_say_where(mx, data):
 def test_unsupported_joins_say_so(mx, data):
     e = err(mx, data, "SELECT count(*) FROM facts f JOIN dims d ON f.x > d.k", ["facts", "dims"])
     assert e["message"].startswith("the join has no equality between a column of `f` and a column of `d`"), e
-    e = err(mx, data, "SELECT count(*) FROM facts f LEFT JOIN dims d ON f.k = d.k", ["facts", "dims"])
-    assert e["message"] == "`LEFT JOIN` is not supported yet (F-154)", e
+    e = err(mx, data, "SELECT count(*) FROM facts f RIGHT JOIN dims d ON f.k = d.k", ["facts", "dims"])
+    assert e["message"] == "`RIGHT JOIN` is not supported yet", e
     e = err(mx, data, "SELECT count(*) FROM facts f JOIN dims d ON f.k = d.k JOIN hot h ON h.k = d.k", ["facts", "dims", "hot"])
     assert e["message"] == "more than two tables in FROM is not supported yet (F-155)", e
 
