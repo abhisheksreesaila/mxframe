@@ -17,6 +17,9 @@ from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
                    B_NEG, B_RESCALE)
 
+comptime BUILD_AUTO = 0
+comptime BUILD_LEFT = 1
+comptime BUILD_RIGHT = 2
 comptime GROUP_AUTO = 0
 comptime GROUP_DENSE = 1
 comptime GROUP_HASHED = 2
@@ -38,8 +41,19 @@ struct PlannerOptions(Copyable, Movable):
     var dense_limit: Int
     var threads: Int                         # 0: every core
     var fuse: Bool                           # a join with unique build keys is fused into the pipeline (False: its pairs are materialized)
+    # F-155: joins. Each choice the planner makes can be forced, so a test reaches every order and path
+    var written_order: Bool                  # join the tables in the order FROM writes them (an error when that order meets a table no equality reaches yet)
+    var join_order: List[Int]                # the tables' positions in FROM, in the order to join them (empty: the planner chooses)
+    var build_side: Int                      # BUILD_AUTO, BUILD_LEFT (the rows joined so far / the first table) or BUILD_RIGHT (the table joined in / the second)
+    var join_budget: Int                     # the bytes of joined values a materialized join may take (0: the engine's default)
+    var stay_within: Float64                 # the written order is kept when the best order's estimated cost is not this much cheaper
 
     def __init__(out self):
+        self.written_order = False
+        self.join_order = List[Int]()
+        self.build_side = BUILD_AUTO
+        self.join_budget = 0
+        self.stay_within = 0.10
         self.fuse = True
         self.group = GROUP_AUTO
         self.dense_limit = DEFAULT_DENSE_LIMIT
@@ -132,6 +146,11 @@ struct PhysicalPlan(Movable):
 trait Planner:
     def plan(self, q: BoundQuery, st: Stats, opts: PlannerOptions) raises -> PhysicalPlan:
         ...
+
+    def join_order(self, js: JoinStats, opts: PlannerOptions) raises -> JoinPlan:
+        """The order to join three or more tables in, and the build side of each join, from the tables' statistics alone. The default is the greedy
+        rule `rule_join_order`; a planner with a better search (DPccp, sampled selectivities) overrides it and the executor does not change."""
+        return rule_join_order(js, opts)
 
 
 def expr_nullable(q: BoundQuery, e: Int, st: Stats) -> Bool:
@@ -232,6 +251,231 @@ def interval(q: BoundQuery, e: Int, st: Stats) -> Interval:
             return Interval(True, -m, 0)
         return Interval(True, -m, m)
     return Interval(False)
+
+
+# ── join order (F-155) ───────────────────────────────────────────────────────────────────────────────
+
+struct JoinStats(Copyable, Movable):
+    """What a join order is chosen from: the tables (leaves) of FROM in written order with their base rows and their rows after their own filters (exact:
+    the leaf's filter has run), and the equalities between them (one entry per pair of columns)."""
+    var names: List[String]
+    var base_rows: List[Int]
+    var rows: List[Int]
+    var edge_a: List[Int]            # the leaves an equality joins
+    var edge_b: List[Int]
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.base_rows = List[Int]()
+        self.rows = List[Int]()
+        self.edge_a = List[Int]()
+        self.edge_b = List[Int]()
+
+    def connected(self, a: Int, b: Int) -> Bool:
+        for k in range(len(self.edge_a)):
+            if (self.edge_a[k] == a and self.edge_b[k] == b) or (self.edge_a[k] == b and self.edge_b[k] == a):
+                return True
+        return False
+
+
+struct JoinStep(Copyable, Movable):
+    var leaf: Int                    # the table joined in
+    var build_new: Bool              # the hash table is built on the table joined in (else on the rows joined so far)
+    var est_rows: Int                # the estimated rows after the step
+    var cost: Int                    # the estimated cost of the step (rows hashed twice, probed once, produced once)
+
+    def __init__(out self, leaf: Int, build_new: Bool, est_rows: Int, cost: Int):
+        self.leaf = leaf
+        self.build_new = build_new
+        self.est_rows = est_rows
+        self.cost = cost
+
+
+struct JoinPlan(Movable):
+    var start: Int
+    var steps: List[JoinStep]
+    var cost: Int
+    var notes: List[String]          # every decision with its numbers: EXPLAIN prints them
+
+    def __init__(out self):
+        self.start = 0
+        self.steps = List[JoinStep]()
+        self.cost = 0
+        self.notes = List[String]()
+
+
+def _min_int(a: Int, b: Int) -> Int:
+    return a if a < b else b
+
+
+def _step_estimate(js: JoinStats, in_set: List[Bool], acc_rows: Int, leaf: Int) -> Int:
+    """The rows after joining `leaf` to the rows joined so far: each equality to a table already joined is a foreign key into the smaller of the two base
+    tables (the key's domain), so a row of the larger side finds a partner with probability (filtered rows / base rows) of the smaller; the most selective
+    equality counts (a composite key is at least that selective). Never more than the product."""
+    var best_div = 1
+    var found = False
+    for k in range(len(js.edge_a)):
+        var other = -1
+        if js.edge_a[k] == leaf and in_set[js.edge_b[k]]:
+            other = js.edge_b[k]
+        elif js.edge_b[k] == leaf and in_set[js.edge_a[k]]:
+            other = js.edge_a[k]
+        if other >= 0:
+            found = True
+            var dom = _min_int(max(js.base_rows[other], 1), max(js.base_rows[leaf], 1))
+            best_div = max(best_div, dom)
+    if not found:
+        return -1
+    var f = js.rows[leaf]
+    var est = Int(Float64(acc_rows) * Float64(f) / Float64(best_div))
+    return max(min(est, acc_rows * f), 1 if (acc_rows > 0 and f > 0) else 0)
+
+
+def _step_cost(acc_rows: Int, leaf_rows: Int, out_rows: Int) -> Int:
+    var small = _min_int(acc_rows, leaf_rows)
+    var big = max(acc_rows, leaf_rows)
+    return 2 * small + big + out_rows
+
+
+def _plan_from(js: JoinStats, order: List[Int], opts: PlannerOptions) -> JoinPlan:
+    """Costs a given order (it must connect: every table after the first has an equality to one before it; `ok` of the caller checks)."""
+    var plan = JoinPlan()
+    var n = len(js.names)
+    var in_set = List[Bool](length=n, fill=False)
+    plan.start = order[0]
+    in_set[order[0]] = True
+    var acc = js.rows[order[0]]
+    for i in range(1, len(order)):
+        var leaf = order[i]
+        var est = _step_estimate(js, in_set, acc, leaf)
+        var build_new = js.rows[leaf] <= acc
+        if opts.build_side == BUILD_LEFT:
+            build_new = False
+        elif opts.build_side == BUILD_RIGHT:
+            build_new = True
+        var c = _step_cost(acc, js.rows[leaf], max(est, 0))
+        plan.steps.append(JoinStep(leaf, build_new, est, c))
+        plan.cost += c
+        in_set[leaf] = True
+        acc = max(est, 0)
+    return plan^
+
+
+def _order_connects(js: JoinStats, order: List[Int]) -> Bool:
+    var n = len(js.names)
+    var in_set = List[Bool](length=n, fill=False)
+    in_set[order[0]] = True
+    for i in range(1, len(order)):
+        var ok = False
+        for k in range(len(js.edge_a)):
+            if (js.edge_a[k] == order[i] and in_set[js.edge_b[k]]) or (js.edge_b[k] == order[i] and in_set[js.edge_a[k]]):
+                ok = True
+        if not ok:
+            return False
+        in_set[order[i]] = True
+    return True
+
+
+def _greedy_from(js: JoinStats, start: Int) -> List[Int]:
+    """From `start`, the connected table that gives the fewest rows next (ties: the smaller table), until all are joined."""
+    var n = len(js.names)
+    var in_set = List[Bool](length=n, fill=False)
+    var order = List[Int]()
+    order.append(start)
+    in_set[start] = True
+    var acc = js.rows[start]
+    while len(order) < n:
+        var best = -1
+        var best_est = 0
+        for leaf in range(n):
+            if in_set[leaf]:
+                continue
+            var est = _step_estimate(js, in_set, acc, leaf)
+            if est < 0:
+                continue
+            if best < 0 or est < best_est or (est == best_est and js.rows[leaf] < js.rows[best]):
+                best = leaf
+                best_est = est
+        if best < 0:
+            break
+        order.append(best)
+        in_set[best] = True
+        acc = max(best_est, 0)
+    return order^
+
+
+def _join_names(js: JoinStats, order: List[Int]) -> String:
+    var s = String()
+    for i in range(len(order)):
+        s += (" > " if i > 0 else "") + js.names[order[i]]
+    return s
+
+
+def rule_join_order(js: JoinStats, opts: PlannerOptions) raises -> JoinPlan:
+    """The rule-based join order: every table is tried as the start of a greedy chain (the next table is the connected one that leaves the fewest rows), the
+    cheapest chain by the cost model wins, and the written order is kept when it connects and costs within `stay_within` of the best. The build side of
+    each step is the smaller input (hash table on the table joined in when it has fewer rows than the rows joined so far). Forced: `join_order`,
+    `written_order`, `build_side`."""
+    var n = len(js.names)
+    var written = List[Int]()
+    for i in range(n):
+        written.append(i)
+    var notes = List[String]()
+    var plan: JoinPlan
+    if len(opts.join_order) > 0:
+        if len(opts.join_order) != n:
+            raise Error("join order: it names " + String(len(opts.join_order)) + " tables, the query joins " + String(n))
+        var seen = List[Bool](length=n, fill=False)
+        for t in opts.join_order:
+            if t < 0 or t >= n or seen[t]:
+                raise Error("join order: each of the " + String(n) + " tables (0 to " + String(n - 1) + ") appears once")
+            seen[t] = True
+        if not _order_connects(js, opts.join_order):
+            raise Error("join order " + _join_names(js, opts.join_order) + " reaches a table no equality joins yet (a cross product): choose another order")
+        plan = _plan_from(js, opts.join_order, opts)
+        notes.append("join order: " + _join_names(js, opts.join_order) + " (forced by the options)")
+    elif opts.written_order and _order_connects(js, written):
+        plan = _plan_from(js, written, opts)
+        notes.append("join order: " + _join_names(js, written) + " (the written order, forced by the options)")
+    else:
+        var best_order = List[Int]()
+        var best_cost = -1
+        for start in range(n):
+            var o = _greedy_from(js, start)
+            if len(o) != n:
+                continue
+            var c = _plan_from(js, o, opts).cost
+            if best_cost < 0 or c < best_cost:
+                best_cost = c
+                best_order = o^
+        if best_cost < 0:
+            raise Error("the tables are not all reached by equalities: a cross join is not supported")
+        var wcost = -1
+        if _order_connects(js, written):
+            wcost = _plan_from(js, written, opts).cost
+        if opts.written_order:
+            notes.append("the written order meets a table no equality reaches yet: the planner chose the order")
+        if wcost >= 0 and Float64(wcost) <= Float64(best_cost) * (1.0 + opts.stay_within):
+            plan = _plan_from(js, written, opts)
+            notes.append("join order: " + _join_names(js, written) + " (the written order: its cost " + commas(wcost) + " is within " + String(Int(opts.stay_within * 100.0)) +
+                         "% of the best found, " + _join_names(js, best_order) + " at " + commas(best_cost) + ")")
+        else:
+            plan = _plan_from(js, best_order, opts)
+            notes.append("join order: " + _join_names(js, best_order) + " (greedy from every start table, cost " + commas(best_cost) + "" +
+                         ((", the written order costs " + commas(wcost)) if wcost >= 0 else ", the written order meets a table no equality reaches yet") + ")")
+    for nt in notes:
+        plan.notes.append(nt)
+    plan.notes.append("join start: " + js.names[plan.start] + " (" + commas(js.rows[plan.start]) + " of " + commas(js.base_rows[plan.start]) + " rows after its filter)")
+    var acc_names = js.names[plan.start]
+    var acc_rows = js.rows[plan.start]
+    for i in range(len(plan.steps)):
+        ref st = plan.steps[i]
+        plan.notes.append("join " + String(i + 1) + ": " + acc_names + " (" + commas(acc_rows) + " rows) with " + js.names[st.leaf] + " (" + commas(js.rows[st.leaf]) + " of " +
+                          commas(js.base_rows[st.leaf]) + " rows): hash table on " + (js.names[st.leaf] if st.build_new else "the rows joined so far") +
+                          (", forced" if opts.build_side != BUILD_AUTO else ", the smaller side") + "; estimated " + commas(st.est_rows) + " rows, cost " + commas(st.cost))
+        acc_names += " + " + js.names[st.leaf]
+        acc_rows = st.est_rows
+    return plan^
 
 
 def commas(n: Int) -> String:

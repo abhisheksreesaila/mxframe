@@ -36,6 +36,11 @@ def _mark_rows(q: BoundQuery, e: Int, mut seen: List[Bool]):
         _mark_rows(q, it, seen)
 
 
+def total_columns(q: BoundQuery) -> Int:
+    """The columns of all the tables of FROM, numbered one after the other."""
+    return q.tab_start[len(q.tab_start) - 1] + q.tab_cols[len(q.tab_cols) - 1]
+
+
 def live_roots(q: BoundQuery) -> List[Int]:
     """The row-level expressions that still run on the joined rows: the filter the sides leave, the group keys, the aggregates'
     arguments, the select list and ORDER BY of a row query."""
@@ -55,7 +60,7 @@ def live_roots(q: BoundQuery) -> List[Int]:
 def needed_columns(q: BoundQuery, t: Int) -> List[Int]:
     """The global columns of table `t` the joined rows must carry: what the live expressions read, and the join keys."""
     var total = len(q.rexprs)
-    var cols = List[Bool](length=q.tab_start[1] + q.tab_cols[1], fill=False)
+    var cols = List[Bool](length=total_columns(q), fill=False)
     var seen = List[Bool](length=total, fill=False)
     for r in live_roots(q):
         _mark(q, r, cols, seen)
@@ -100,7 +105,7 @@ def side_query(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> Bo
                 sq.rexprs[i].value = Int64(g - start)
                 if sq.rexprs[i].kind == TEXT.value:
                     sq.rexprs[i].src = g - start
-    var conj = q.conj_l.copy() if t == 0 else q.conj_r.copy()
+    var conj = (q.conj_l.copy() if t == 0 else q.conj_r.copy()) if len(q.sources) == 2 else q.leaf_conj[t].copy()
     sq.where = -1
     if len(conj) > 0:
         var acc = conj[0]
@@ -125,7 +130,7 @@ def side_query(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> Bo
     sq.order_text = List[String]()
     # the other table's columns (and everything else this query does not read) are not this query's: nothing of them is left
     var seen = List[Bool](length=len(sq.rexprs), fill=False)
-    var cols = List[Bool](length=q.tab_start[1] + q.tab_cols[1], fill=False)
+    var cols = List[Bool](length=total_columns(q), fill=False)
     _mark_rows(sq, sq.where, seen)
     for e in sq.routs:
         _mark_rows(sq, e, seen)
@@ -144,7 +149,7 @@ def side_query(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> Bo
 def joined_query(q: BoundQuery, lneeded: List[Int], rneeded: List[Int]) -> BoundQuery:
     """The query that runs over the joined table (a single source whose columns are the left side's needed columns, then the right's)."""
     var jq = copy_query(q)
-    var total = q.tab_start[1] + q.tab_cols[1]
+    var total = total_columns(q)
     var jmap = List[Int](length=total, fill=-1)
     for i in range(len(lneeded)):
         jmap[lneeded[i]] = i
@@ -198,3 +203,236 @@ def virtual_schema(left: JoinSide, right: JoinSide, outer_right: Bool = False) r
             if outer_right and side == 1:
                 t.cols[col].nulls = max(t.cols[col].nulls, 1)         # a LEFT join: an unmatched row is NULL here, so the program checks
     return t^
+
+
+# ── three or more tables (F-155): what each step of a join order needs, and the two-table query the last step runs ──────────────────────────
+
+def table_of_column(q: BoundQuery, g: Int) -> Int:
+    var t = 0
+    for u in range(len(q.tab_start)):
+        if g >= q.tab_start[u]:
+            t = u
+    return t
+
+
+def multi_roots(q: BoundQuery) -> List[Int]:
+    """The row-level expressions of a join of three or more tables that read columns after the leaves' own filters: the group keys, the aggregates'
+    arguments, the select list, ORDER BY of a row query. (The conjuncts that read several tables are `q.resid`; checked apart.)"""
+    return live_roots(q)
+
+
+def needed_after(q: BoundQuery, joined: Int, applied: List[Bool]) -> List[Int]:
+    """The global columns, of the tables in the bit set `joined`, that later steps read: the select list's expressions, the conjuncts across tables not yet
+    checked (`applied[k]` False), and the keys of the equalities to tables not joined yet."""
+    var total = total_columns(q)
+    var cols = List[Bool](length=total, fill=False)
+    var seen = List[Bool](length=len(q.rexprs), fill=False)
+    for r in multi_roots(q):
+        _mark(q, r, cols, seen)
+    for k in range(len(q.resid)):
+        if not applied[k]:
+            _mark(q, q.resid[k], cols, seen)
+    for k in range(len(q.edge_a)):
+        var ta = table_of_column(q, q.edge_a[k])
+        var tb = table_of_column(q, q.edge_b[k])
+        var ina = (joined >> ta) & 1 != 0
+        var inb = (joined >> tb) & 1 != 0
+        if ina and not inb:
+            cols[q.edge_a[k]] = True
+        if inb and not ina:
+            cols[q.edge_b[k]] = True
+    var out = List[Int]()
+    for g in range(total):
+        if cols[g] and (joined >> table_of_column(q, g)) & 1 != 0:
+            out.append(g)
+    return out^
+
+
+def all_needed(q: BoundQuery) -> List[Int]:
+    """Every global column some operator reads: the live expressions, the conjuncts across tables, the equalities' keys (not the leaves' own filters:
+    their side queries read what they filter)."""
+    var total = total_columns(q)
+    var cols = List[Bool](length=total, fill=False)
+    var seen = List[Bool](length=len(q.rexprs), fill=False)
+    for r in multi_roots(q):
+        _mark(q, r, cols, seen)
+    for e in q.resid:
+        _mark(q, e, cols, seen)
+    for g in q.edge_a:
+        cols[g] = True
+    for g in q.edge_b:
+        cols[g] = True
+    var out = List[Int]()
+    for g in range(total):
+        if cols[g]:
+            out.append(g)
+    return out^
+
+
+def _neutral(mut x: BExpr):
+    x.op = B_LIT
+    x.kind = INT.value
+    x.scale = 0
+    x.value = 0
+    x.a = -1
+    x.b = -1
+    x.items = List[Int]()
+
+
+def _remap_columns(mut jq: BoundQuery, colmap: List[Int], roots: List[Int]):
+    """The expressions reachable from `roots` read columns by their new numbers (`colmap[old]`); everything else is neutral."""
+    var seen = List[Bool](length=len(jq.rexprs), fill=False)
+    for r in roots:
+        _mark_rows(jq, r, seen)
+    for i in range(len(jq.rexprs)):
+        if not seen[i]:
+            _neutral(jq.rexprs[i])
+            continue
+        if jq.rexprs[i].op == B_COL:
+            var g = Int(jq.rexprs[i].value)
+            jq.rexprs[i].value = Int64(colmap[g])
+            if jq.rexprs[i].kind == TEXT.value:
+                jq.rexprs[i].src = colmap[g]
+
+
+def filter_query(q: BoundQuery, conj: List[Int], gcols: List[Int], t: SharedTable) -> BoundQuery:
+    """The row query that keeps the rows of table `t` (whose columns are the global columns `gcols`, in order) that pass the conjuncts `conj`: every column
+    comes out. Used for a condition across tables as soon as the tables it reads are joined."""
+    var fq = copy_query(q)
+    var total = total_columns(q)
+    var colmap = List[Int](length=total, fill=-1)
+    for i in range(len(gcols)):
+        colmap[gcols[i]] = i
+    fq.joined = False
+    fq.sources = List[Int]()
+    fq.sources.append(0)
+    fq.source = 0
+    fq.rows = True
+    fq.distinct = False
+    fq.keys = List[KeySpec]()
+    fq.aggs = List[AggSpec]()
+    fq.outputs = List[Int]()
+    fq.order = List[SortKey]()
+    fq.rorder = List[SortKey]()
+    fq.having = -1
+    fq.limit = -1
+    fq.offset = 0
+    fq.explain = 0
+    fq.jk_l = List[Int]()
+    fq.jk_r = List[Int]()
+    fq.conj_l = List[Int]()
+    fq.conj_r = List[Int]()
+    fq.conj_x = List[Int]()
+    fq.leaf_conj = List[List[Int]]()
+    fq.edge_a = List[Int]()
+    fq.edge_b = List[Int]()
+    fq.resid = List[Int]()
+    fq.tab_names = List[String]()
+    fq.tab_names.append("rows")
+    fq.tab_alias = List[String]()
+    fq.tab_alias.append(String())
+    fq.tab_start = List[Int]()
+    fq.tab_start.append(0)
+    fq.tab_cols = List[Int]()
+    fq.tab_cols.append(len(gcols))
+    var acc = conj[0]
+    for k in range(1, len(conj)):
+        fq.rexprs.append(BExpr(B_AND, BOOL.value, 0, acc, conj[k], 0, "", 0, 0))
+        acc = len(fq.rexprs) - 1
+    fq.where = acc
+    var roots = List[Int]()
+    roots.append(acc)
+    fq.routs = List[Int]()
+    fq.out_names = List[String]()
+    fq.out_text = List[String]()
+    for i in range(len(gcols)):
+        fq.rexprs.append(BExpr(B_COL, t.kind(i).value, t.scale(i), -1, -1, Int64(i), t.name(i), 0, 0))
+        var at = len(fq.rexprs) - 1
+        if t.kind(i).value == TEXT.value:
+            fq.rexprs[at].src = i
+        fq.routs.append(at)
+        roots.append(at)
+        fq.out_names.append(t.name(i))
+        fq.out_text.append(t.name(i))
+    # the conjuncts' own columns by the new numbers (the columns just added are already in them)
+    var seen = List[Bool](length=len(fq.rexprs), fill=False)
+    _mark_rows(fq, acc, seen)
+    for i in range(len(fq.rexprs) - len(gcols)):
+        if not seen[i]:
+            _neutral(fq.rexprs[i])
+            continue
+        if fq.rexprs[i].op == B_COL:
+            var g = Int(fq.rexprs[i].value)
+            fq.rexprs[i].value = Int64(colmap[g])
+            if fq.rexprs[i].kind == TEXT.value:
+                fq.rexprs[i].src = colmap[g]
+    fq.where_text = "the condition across the tables joined so far"
+    fq.order_text = List[String]()
+    return fq^
+
+
+def final_query(q: BoundQuery, left: List[Int], right: List[Int], lt: SharedTable, rt: SharedTable, key_l: List[Int], key_r: List[Int], conj: List[Int]) -> BoundQuery:
+    """The two-table query that runs the last step of a join order: the rows joined so far (`lt`, whose columns are the global columns `left`) and the
+    last table (`rt`, the global columns `right`), joined on the pairs `key_l[i] = key_r[i]` (global numbers), then the rest of the query. `conj`: the conjuncts
+    across tables still to check, now over the joined rows."""
+    var fq = copy_query(q)
+    var total = total_columns(q)
+    var colmap = List[Int](length=total, fill=-1)
+    for i in range(len(left)):
+        colmap[left[i]] = i
+    for i in range(len(right)):
+        colmap[right[i]] = len(left) + i
+    var roots = live_roots(q)
+    for e in conj:
+        roots.append(e)
+    _remap_columns(fq, colmap, roots)
+    fq.joined = True
+    fq.join_kind = 0
+    fq.explain = 0
+    fq.sources = List[Int]()
+    fq.sources.append(0)
+    fq.sources.append(1)
+    fq.source = 0
+    fq.tab_names = List[String]()
+    fq.tab_names.append("rows joined so far")
+    fq.tab_names.append("last table")
+    fq.tab_alias = List[String]()
+    fq.tab_alias.append(String())
+    fq.tab_alias.append(String())
+    fq.tab_start = List[Int]()
+    fq.tab_start.append(0)
+    fq.tab_start.append(len(left))
+    fq.tab_cols = List[Int]()
+    fq.tab_cols.append(len(left))
+    fq.tab_cols.append(len(right))
+    fq.jk_l = List[Int]()
+    fq.jk_r = List[Int]()
+    fq.jk_l_names = List[String]()
+    fq.jk_r_names = List[String]()
+    for k in range(len(key_l)):
+        fq.jk_l.append(colmap[key_l[k]])
+        fq.jk_r.append(colmap[key_r[k]])
+        fq.jk_l_names.append(lt.name(colmap[key_l[k]]))
+        fq.jk_r_names.append(rt.name(colmap[key_r[k]] - len(left)))
+    fq.conj_l = List[Int]()
+    fq.conj_r = List[Int]()
+    fq.conj_x = List[Int]()
+    fq.conj_l_text = List[String]()
+    fq.conj_r_text = List[String]()
+    fq.conj_x_text = List[String]()
+    fq.where = -1
+    if len(conj) > 0:
+        var acc = conj[0]
+        fq.conj_x.append(conj[0])
+        for k in range(1, len(conj)):
+            fq.conj_x.append(conj[k])
+            fq.rexprs.append(BExpr(B_AND, BOOL.value, 0, acc, conj[k], 0, "", 0, 0))
+            acc = len(fq.rexprs) - 1
+        fq.where = acc
+    fq.where_text = "the conditions across the tables"
+    fq.leaf_conj = List[List[Int]]()
+    fq.edge_a = List[Int]()
+    fq.edge_b = List[Int]()
+    fq.resid = List[Int]()
+    fq.using_cols = List[String]()
+    return fq^

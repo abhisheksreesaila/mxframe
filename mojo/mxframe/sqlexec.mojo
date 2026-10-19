@@ -22,12 +22,12 @@ from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
 from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks, float_key
-from .sql import sql_error, EXPLAIN_NONE
-from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
+from .sql import sql_error, EXPLAIN_NONE, EXPLAIN_ANALYZE
+from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
-from .join import needed_columns, side_query, joined_query, virtual_schema
+from .join import needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query
 from .joincore import JoinKeys, JoinSide, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
@@ -35,7 +35,8 @@ from .jfront import FusedJoin, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sqlprog import lower_rows
-from .planner import plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas
+from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan,
+                      BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, float_bits, ld_div
 from .exec import (_table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
@@ -50,8 +51,10 @@ struct SqlResult(Movable):
     var device: Int                  # CPU (the SQL path runs on the CPU in F-150)
     var fallback_reason: String
     var notes: List[String]          # what the planner decided and what ran, one line each: tests assert them
+    var actuals: List[String]        # F-155: what each operator really did (rows, milliseconds), one line each: EXPLAIN ANALYZE prints them
 
     def __init__(out self):
+        self.actuals = List[String]()
         self.table = Table.empty()
         self.explain = String()
         self.ms = 0.0
@@ -757,6 +760,10 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var lrows = left.table.rows()
     var rrows = right.table.rows()
     var left_builds = kind == 0 and lrows < rrows                    # left, semi and anti joins build on the right table
+    if kind == 0 and opts.build_side == BUILD_LEFT:
+        left_builds = True
+    elif kind == 0 and opts.build_side == BUILD_RIGHT:
+        left_builds = False
     var t_keys = perf_counter_ns()
     var keys = JoinKeys()
     if left_builds:
@@ -789,12 +796,12 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], lrows)
     var t_probe = perf_counter_ns()
     var ncols = len(lneed) + len(rneed)
-    var budget = JOIN_BUDGET_BYTES // (8 * max(ncols, 1))
+    var budget = (opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES) // (8 * max(ncols, 1))
     res.notes.append("join: " + _kind_name(kind) + " on " + ", ".join(q.jk_l_names) + " = " + ", ".join(q.jk_r_names) + ": " + commas(lrows) + " rows of " + _side_names(q, 0) +
                      " and " + commas(rrows) + " rows of " + _side_names(q, 1) + " after their filters" +
                      (" (" + _side_names(q, 0) + " read in place)" if left.zero_copy else "") + (" (" + _side_names(q, 1) + " read in place)" if right.zero_copy else "") + na_note)
     res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(nb) + " rows, " +
-                     ("the smaller side" if kind == 0 else "the right side: a " + _kind_name(kind) + " join builds on it") + "): " + m.kind())
+                     ("the smaller side" if (kind == 0 and opts.build_side == BUILD_AUTO) else "forced by the options" if kind == 0 else "the right side: a " + _kind_name(kind) + " join builds on it") + "): " + m.kind())
     res.notes.append("join keys: " + keys.layout)
     res.notes.append("join time: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build " + _ms(Float64(t_probe - t_build) / 1e6) + " ms")
     var any_holistic = False
@@ -862,6 +869,223 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie)
     for n in inner.notes:
         res.notes.append(n)
+    res.actuals.append("join (" + _kind_name(kind) + "): " + commas(lrows) + " rows of " + _side_names(q, 0) + " and " + commas(rrows) + " rows of " + _side_names(q, 1) +
+                       " after their filters: sides " + _ms(ms_sides) + " ms, keys " + _ms(Float64(t_build - t_keys) / 1e6) + " ms, build on " + commas(nb) + " rows " +
+                       _ms(Float64(t_probe - t_build) / 1e6) + " ms")
+    for a in inner.actuals:
+        res.actuals.append(a)
+    res.table = inner.take_table()
+    res.explain = _explain_text(lp, res.notes)
+    res.ms = Float64(perf_counter_ns() - t0) / 1e6
+    return res^
+
+
+struct _Leaf(Movable):
+    """One table of a multi-way join after its own filters: the table (the source itself when nothing filters it, else a row query's result), the column of it
+    that each needed global column is, and the global number of each of its columns."""
+    var table: SharedTable
+    var cols: List[Int]              # the table's column of each needed global column (ascending)
+    var gcols: List[Int]             # ... those global columns
+    var gtable: List[Int]            # the global column of each of the table's columns (-1: not one of the query's)
+    var rows: Int
+    var base_rows: Int
+
+    def __init__(out self, table: SharedTable, var cols: List[Int], var gcols: List[Int], var gtable: List[Int], rows: Int, base_rows: Int):
+        self.table = table
+        self.cols = cols^
+        self.gcols = gcols^
+        self.gtable = gtable^
+        self.rows = rows
+        self.base_rows = base_rows
+
+
+def _position(g: List[Int], col: Int) -> Int:
+    for i in range(len(g)):
+        if g[i] == col:
+            return i
+    return -1
+
+
+def _label(q: BoundQuery, t: Int) -> String:
+    return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
+
+
+def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
+                              t0: Int) raises -> SqlResult:
+    """Three or more tables joined by equalities (inner joins). Each table runs its own filter first (a row query over its source), so the planner works
+    from exact row counts; the planner (`Planner.join_order`) picks the order and the build side of each join; every join but the last materializes its pairs
+    (each keeps only the columns later steps read, and the conditions across tables are checked as soon as the tables they read are joined); the last is the
+    two-table join of `_run_join_query` with the rest of the query (aggregates, ORDER BY, LIMIT), fused when the build side's keys are unique."""
+    var res = SqlResult()
+    var n = len(q.sources)
+    var threads = opts.threads
+    var budget_bytes = opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES
+    var needed = all_needed(q)
+    var leaves = List[_Leaf]()
+    var js = JoinStats()
+    for t in range(n):
+        var t_leaf = perf_counter_ns()
+        var start = q.tab_start[t]
+        var gcols = List[Int]()
+        for g in needed:
+            if table_of_column(q, g) == t:
+                gcols.append(g)
+        ref src = catalog.sources[q.sources[t]]
+        var base_rows = src.table.rows()
+        var table: SharedTable
+        var cols = List[Int]()
+        var gtable = List[Int]()
+        if len(q.leaf_conj[t]) == 0 and src.kind == SRC_TABLE and len(src.overlay.mask) == 0 and len(src.overlay.delta) == 0:
+            table = src.table
+            for g in gcols:
+                cols.append(g - start)
+            for c in range(src.table.columns()):
+                gtable.append(start + c)
+        else:
+            var sq = side_query(catalog, q, t, gcols)
+            var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
+            table = r.take_table().share()
+            for i in range(len(gcols)):
+                cols.append(i)
+                gtable.append(gcols[i])
+        var rows = table.rows()
+        js.names.append(_label(q, t))
+        js.base_rows.append(base_rows)
+        js.rows.append(rows)
+        res.actuals.append("scan " + _label(q, t) + ": " + commas(base_rows) + " rows, " + commas(rows) + " after " + ("its filter" if len(q.leaf_conj[t]) > 0 else "no filter") +
+                           " (" + String(len(gcols)) + " columns kept), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
+        leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows))
+    for k in range(len(q.edge_a)):
+        js.edge_a.append(table_of_column(q, q.edge_a[k]))
+        js.edge_b.append(table_of_column(q, q.edge_b[k]))
+    var jp = planner.join_order(js, opts)
+    for nt in jp.notes:
+        res.notes.append(nt)
+    if q.explain != EXPLAIN_NONE and q.explain != EXPLAIN_ANALYZE:
+        res.explain = _explain_text(lp, res.notes)
+        var tb = Table.empty()
+        var c = tb.add_column("plan", TEXT)
+        for line in res.explain.split("\n"):
+            if line.byte_length() > 0:
+                tb.append_text(c, String(line))
+        res.table = tb^
+        res.ms = Float64(perf_counter_ns() - t0) / 1e6
+        return res^
+    # the steps
+    var done = List[Bool](length=len(q.resid), fill=False)
+    var joined = 1 << jp.start
+    var cur_table = leaves[jp.start].table
+    var cur_g = leaves[jp.start].gcols.copy()
+    var cur_pos = leaves[jp.start].cols.copy()
+    for si in range(len(jp.steps) - 1):
+        var t_step = perf_counter_ns()
+        ref step = jp.steps[si]
+        var lf = step.leaf
+        var after = joined | (1 << lf)
+        var keep = needed_after(q, after, done)
+        var lkeep = List[Int]()                                      # the table columns each side carries on
+        var lkeep_g = List[Int]()
+        for i in range(len(cur_g)):
+            if _position(keep, cur_g[i]) >= 0:
+                lkeep.append(cur_pos[i])
+                lkeep_g.append(cur_g[i])
+        var rkeep = List[Int]()
+        var rkeep_g = List[Int]()
+        for i in range(len(leaves[lf].gcols)):
+            if _position(keep, leaves[lf].gcols[i]) >= 0:
+                rkeep.append(leaves[lf].cols[i])
+                rkeep_g.append(leaves[lf].gcols[i])
+        var lkey = List[Int]()
+        var rkey = List[Int]()
+        for k in range(len(q.edge_a)):
+            var ga = q.edge_a[k]
+            var gb = q.edge_b[k]
+            var ta = table_of_column(q, ga)
+            var tb = table_of_column(q, gb)
+            if ta == lf and (joined >> tb) & 1 != 0:
+                lkey.append(cur_pos[_position(cur_g, gb)])
+                rkey.append(leaves[lf].cols[_position(leaves[lf].gcols, ga)])
+            elif tb == lf and (joined >> ta) & 1 != 0:
+                lkey.append(cur_pos[_position(cur_g, ga)])
+                rkey.append(leaves[lf].cols[_position(leaves[lf].gcols, gb)])
+        var left = JoinSide(cur_table, lkeep^, lkey^, False)
+        var right = JoinSide(leaves[lf].table, rkeep^, rkey^, False)
+        var left_builds = not step.build_new
+        var keys = JoinKeys()
+        if left_builds:
+            normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, threads)
+        else:
+            normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, threads)
+        var nb = left.table.rows() if left_builds else right.table.rows()
+        var np = right.table.rows() if left_builds else left.table.rows()
+        var m = hj_build(keys.bk_addr, keys.bo_addr, nb, threads)
+        var build_kind = m.kind()
+        var pairs = join_pairs(m, keys, np, budget_bytes // (8 * max(len(lkeep_g) + len(rkeep_g), 1)), threads)
+        var jt = gather_join(left, right, pairs, left_builds, threads)
+        var out_rows = jt.rows()
+        res.notes.append("join step " + String(si + 1) + ": " + commas(left.table.rows()) + " rows with " + commas(right.table.rows()) + " rows of " + _label(q, lf) + " on " + String(len(left.key_cols)) +
+                         (" key (" if len(left.key_cols) == 1 else " keys (") + keys.layout + "), hash table on " + commas(nb) + " rows: " + build_kind + ", " + commas(out_rows) + " rows out (estimated " + commas(step.est_rows) + ")")
+        res.actuals.append("join step " + String(si + 1) + " (" + _label(q, lf) + "): " + commas(left.table.rows()) + " x " + commas(right.table.rows()) + " -> " + commas(out_rows) + " rows (estimated " +
+                           commas(step.est_rows) + "), build " + commas(nb) + " rows, " + _ms(Float64(perf_counter_ns() - t_step) / 1e6) + " ms")
+        cur_g = lkeep_g^
+        for g in rkeep_g:
+            cur_g.append(g)
+        cur_table = jt^.share()
+        cur_pos = List[Int]()
+        for i in range(len(cur_g)):
+            cur_pos.append(i)
+        joined = after
+        # the conditions across tables whose tables are all joined now
+        var conj = List[Int]()
+        var ctext = List[String]()
+        for k in range(len(q.resid)):
+            if not done[k] and (q.resid_mask[k] & ~joined) == 0:
+                conj.append(q.resid[k])
+                ctext.append(q.resid_text[k])
+                done[k] = True
+        if len(conj) > 0:
+            var t_f = perf_counter_ns()
+            var fq = filter_query(q, conj, cur_g, cur_table)
+            var tmp = Catalog()
+            tmp.add_table("rows", cur_table)
+            var fr = _run_sql_once(tmp, fq, planner, opts, trust, String())
+            var before = cur_table.rows()
+            cur_table = fr.take_table().share()
+            res.notes.append("conditions across tables checked after join step " + String(si + 1) + ": " + " AND ".join(ctext) + ": " + commas(before) + " rows to " + commas(cur_table.rows()))
+            res.actuals.append("filter across tables (" + " AND ".join(ctext) + "): " + commas(before) + " -> " + commas(cur_table.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_f) / 1e6) + " ms")
+    # the last join, with the rest of the query
+    ref last = jp.steps[len(jp.steps) - 1]
+    var lf = last.leaf
+    var key_l = List[Int]()
+    var key_r = List[Int]()
+    for k in range(len(q.edge_a)):
+        var ga = q.edge_a[k]
+        var gb = q.edge_b[k]
+        var ta = table_of_column(q, ga)
+        var tb = table_of_column(q, gb)
+        if ta == lf and (joined >> tb) & 1 != 0:
+            key_l.append(gb)
+            key_r.append(ga)
+        elif tb == lf and (joined >> ta) & 1 != 0:
+            key_l.append(ga)
+            key_r.append(gb)
+    var rest = List[Int]()
+    for k in range(len(q.resid)):
+        if not done[k]:
+            rest.append(q.resid[k])
+    var fq = final_query(q, cur_g, leaves[lf].gtable, cur_table, leaves[lf].table, key_l, key_r, rest)
+    var cat3 = Catalog()
+    cat3.add_table("rows joined so far", cur_table)
+    cat3.add_table(_label(q, lf), leaves[lf].table)
+    var o2 = opts.copy()
+    o2.build_side = BUILD_RIGHT if last.build_new else BUILD_LEFT
+    var lp2 = build_plan(fq, "rows joined so far")
+    var inner = _run_join_query(cat3, fq, lp2, planner, o2, trust, lie, perf_counter_ns())
+    res.notes.append("last join: the rows joined so far (" + commas(cur_table.rows()) + ") with " + _label(q, lf) + " (" + commas(leaves[lf].table.rows()) + " rows), estimated " + commas(last.est_rows) + " rows out")
+    for nt in inner.notes:
+        res.notes.append(nt)
+    for a in inner.actuals:
+        res.actuals.append(a)
     res.table = inner.take_table()
     res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
@@ -872,6 +1096,8 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
                               fj: Optional[ArcPointer[FusedJoin]] = None) raises -> SqlResult:
     var t0 = perf_counter_ns()
     var lp = build_plan(q0, catalog.sources[q0.source].name)         # the plan; the executor lowers its query from the nodes
+    if q0.joined and len(q0.sources) > 2:
+        return _run_multiway(catalog, q0, lp, planner, opts, trust, lie, t0)
     var q = executable(lp, q0)
     if q.joined:
         return _run_join_query(catalog, q, lp, planner, opts, trust, lie, t0)
@@ -929,6 +1155,8 @@ def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: P
     """Runs the query. A Parquet footer's min / max and null counts are a hint that lets the planner use dense groups and skip NULL
     checks; they are verified as the row groups are read (a null count that is wrong, a row outside a stated range), and when one
     is wrong the query runs again without the statistics, which the notes say."""
+    if q.explain == EXPLAIN_ANALYZE:
+        return _explain_analyze(catalog, q, planner, opts)
     try:
         return _run_sql_once(catalog, q, planner, opts, True, String())
     except e:
@@ -936,6 +1164,39 @@ def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: P
         if not msg.startswith(LIE):
             raise e^
         return _run_sql_once(catalog, q, planner, opts, False, String(msg[byte=LIE.byte_length():]))
+
+
+def _explain_analyze[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
+    """EXPLAIN ANALYZE: the query runs, and the plan comes back with what each operator really did (rows, milliseconds) after the planner's decisions."""
+    var q = copy_query(q0)
+    q.explain = EXPLAIN_NONE
+    var r: SqlResult
+    try:
+        r = _run_sql_once(catalog, q, planner, opts, True, String())
+    except e:
+        var msg = String(e)
+        if not msg.startswith(LIE):
+            raise e^
+        r = _run_sql_once(catalog, q, planner, opts, False, String(msg[byte=LIE.byte_length():]))
+    var text = r.explain.rstrip("\n") + "\nActual\n"
+    for a in r.actuals:
+        text += "  " + a + "\n"
+    for nt in r.notes:
+        if nt.startswith("time:") or nt.startswith("join time:") or nt.startswith("ran:"):
+            text += "  " + nt + "\n"
+    text += "  result: " + commas(r.table.rows()) + " rows in " + _ms(r.ms) + " ms\n"
+    var out = SqlResult()
+    out.notes = r.notes.copy()
+    out.actuals = r.actuals.copy()
+    out.explain = text
+    out.ms = r.ms
+    var t = Table.empty()
+    var c = t.add_column("plan", TEXT)
+    for line in text.split("\n"):
+        if line.byte_length() > 0:
+            t.append_text(c, String(line))
+    out.table = t^
+    return out^
 
 
 def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:

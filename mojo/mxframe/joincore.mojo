@@ -426,8 +426,8 @@ def join_pairs(m: JoinMap, keys: JoinKeys, n_probe: Int, budget_rows: Int, threa
     var info = List[Int64](length=4, fill=0)
     var rc = hj_probe_pairs(m, keys.pk_addr, keys.po_addr, n_probe, threads, budget_rows, Int(info.unsafe_ptr()), outer)
     if rc == E_BUDGET:
-        raise Error("the join produces " + commas(Int(info[0])) + " rows, past the budget of " + commas(budget_rows) + " (the joined columns would take over " +
-                    String(JOIN_BUDGET_BYTES >> 30) + " GiB): filter either side first, or join on a unique key (a join that spills to disk is not built yet)")
+        raise Error("the join produces " + commas(Int(info[0])) + " rows, past the join's memory budget of " + commas(budget_rows) + " rows: filter either side first, " +
+                    "join on a unique key, or raise the budget (`PlannerOptions.join_budget`, `mx --join-budget`); a join that spills to disk is not built yet")
     if rc != 0:
         raise Error("the hash join failed with code " + String(rc))
     var n = Int(info[0])
