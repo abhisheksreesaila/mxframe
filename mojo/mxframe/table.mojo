@@ -41,6 +41,8 @@ comptime TEXT = ColumnKind(2)
 comptime DATE = ColumnKind(3)
 comptime BOOL = ColumnKind(4)
 comptime FLOAT = ColumnKind(5)     # float64 (F-157): the value slot holds the float64's bits; the validity layout is the others'
+comptime F32_COLUMN = 32           # a FLOAT's `scale` when the file stored 32-bit floats (read widened to float64): SQL compares such a column with a
+                                   # literal in 32 bits, as DuckDB does (`l_discount <= 0.07` keeps the rows holding 0.07). 0 for a float64 column.
 
 
 struct Column(Movable):
@@ -107,9 +109,12 @@ struct Table(Movable):
             raise Error("column `" + name + "` already exists")
         if kind.value < 0 or kind.value > 5:
             raise Error("column `" + name + "`: unknown kind " + String(kind.value))
-        if scale < 0 or scale > 18:
+        if kind == FLOAT:
+            if scale != 0 and scale != F32_COLUMN:
+                raise Error("column `" + name + "`: a FLOAT's scale is 0 (float64) or " + String(F32_COLUMN) + " (a column the file stored as 32-bit floats)")
+        elif scale < 0 or scale > 18:
             raise Error("column `" + name + "`: scale " + String(scale) + " is outside 0..18")
-        if kind != DECIMAL and scale != 0:
+        elif kind != DECIMAL and scale != 0:
             raise Error("column `" + name + "`: only a DECIMAL has a scale")
         self.by_name[name] = len(self.cols)
         self.cols.append(Column(name, kind, scale))

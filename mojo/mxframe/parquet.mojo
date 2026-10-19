@@ -32,7 +32,7 @@ from std.bit import pop_count, byte_swap
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
 # Parquet enums (parquet.thrift)
@@ -792,8 +792,10 @@ def _kind_of(leaf: _Leaf) raises -> Tuple[ColumnKind, Int]:
         return (DATE, 0)                                # a timestamp becomes its UTC day (the CSV reader's rule)
     if leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64:
         return (INT, 0)
-    if leaf.ptype == PT_FLOAT or leaf.ptype == PT_DOUBLE:
-        return (FLOAT, 0)                               # a 32-bit float is widened to float64 (exact); saved as DOUBLE
+    if leaf.ptype == PT_FLOAT:
+        return (FLOAT, F32_COLUMN)                      # widened to float64 (exact); the scale remembers the 32 bits; saved as DOUBLE
+    if leaf.ptype == PT_DOUBLE:
+        return (FLOAT, 0)
     raise Error("column `" + leaf.name + "` is " + _ptype_name(leaf.ptype) + ": MX frame has no kind for it yet")
 
 

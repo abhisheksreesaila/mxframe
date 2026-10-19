@@ -1290,3 +1290,11 @@ def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], m
                 result.ragged.append(FailedRow(offsets[i] + sinks[i].ragged[k].row + 1, sinks[i].ragged[k].text,
                                                sinks[i].ragged[k].reason))
     result.rows = total
+
+
+def parse_float_text(text: String, mut out: Float64) -> Int:
+    """`_parse_float` over a String (a SQL literal): F_OK, F_BAD or F_RANGE."""
+    var n = text.byte_length()
+    if n == 0:
+        return F_BAD
+    return _parse_float(BP(unsafe_from_address=Int(text.unsafe_ptr())), n, out)

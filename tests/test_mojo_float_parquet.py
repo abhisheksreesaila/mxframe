@@ -67,7 +67,7 @@ def test_mojo_reads_pyarrow_doubles_and_floats_bit_for_bit(dumper, tmp_path, opt
     path = tmp_path / "f.parquet"
     pq.write_table(t, path, **opts)
     cols, rows = mojo_read(dumper, path)
-    assert cols == [("id", "INT", 0), ("d", "FLOAT", 0), ("f", "FLOAT", 0)]
+    assert cols == [("id", "INT", 0), ("d", "FLOAT", 0), ("f", "FLOAT", 32)]
     want = t.to_pydict()
     assert len(rows) == 5000
     for i, row in enumerate(rows):

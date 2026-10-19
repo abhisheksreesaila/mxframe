@@ -14,13 +14,14 @@ rules, on the same `Program` type:
 - Every aggregate skips NULL: it is fed `SELECT(nul, identity, value)` and a count of the NULLs it skipped, so that
   SUM / MIN / MAX / AVG of nothing is NULL, which the finishing code reads off `rows - nulls`.
 """
-from .table import TEXT, BOOL, SharedTable
+from .table import TEXT, BOOL, FLOAT, SharedTable
 from .parquet import ParquetScan
 from .query import (Program, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
-                    CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, _frame_mask, _null_mask)
+                    CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, A_FSUM, A_FMIN, A_FMAX, _frame_mask, _null_mask,
+                    OP_LOAD_COL, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX, NAN_AWARE)
 from .frame import _text_less
-from .bind import (BoundQuery, BExpr, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
+from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
@@ -67,13 +68,19 @@ struct DictAccess(Movable):
         return -1
 
 
-@fieldwise_init
 struct V(Copyable, Movable):
     """An emitted expression: its register, the float register that is 1.0 where it is NULL (-1: never), and for a
-    boolean whether it can hold the unknown 0.5."""
+    boolean whether it can hold the unknown 0.5; `fl`: the register holds a float64 (F-157), not int64 bits."""
     var reg: Int
     var nul: Int
     var unk: Bool
+    var fl: Bool
+
+    def __init__(out self, reg: Int, nul: Int, unk: Bool, fl: Bool = False):
+        self.reg = reg
+        self.nul = nul
+        self.unk = unk
+        self.fl = fl
 
 
 struct SqlProgram(Movable):
@@ -82,6 +89,7 @@ struct SqlProgram(Movable):
     var set_meta: List[Int64]
     var agg_val_slot: List[Int]      # per aggregate: its kernel slot, -1 for none
     var agg_nul_slot: List[Int]      # per aggregate: the slot counting the NULLs it skipped, -1 when its argument has none
+    var agg_nan_slot: List[Int]      # per float min / max: the slot counting the NaNs it left out (NaN is above every number), else -1
     var agg_src: List[Int]           # per aggregate: its holistic value source, -1 for a plain one
     var slot_ops: List[Int]          # per slot: how partial results merge (A_SUM, A_MIN or A_MAX)
     var key_regs: Int                # registers 0 .. key_regs-1 hold the group key (dense: 1)
@@ -95,6 +103,7 @@ struct SqlProgram(Movable):
         self.set_meta = List[Int64]()
         self.agg_val_slot = List[Int]()
         self.agg_nul_slot = List[Int]()
+        self.agg_nan_slot = List[Int]()
         self.agg_src = List[Int]()
         self.slot_ops = List[Int]()
         self.key_regs = 1
@@ -227,7 +236,11 @@ struct _Emitter(Movable):
         if x.op == B_COL:
             var c = Int(x.value)
             var r = self.tmp()
-            self.ins(OP_LOADI, r, self.p.column(self.pos[c]))
+            if x.kind == FLOAT.value:
+                self.p.has_float = True
+                self.ins(OP_LOAD_COL, r, self.p.column_f64(self.pos[c]))
+            else:
+                self.ins(OP_LOADI, r, self.p.column(self.pos[c]))
             if x.kind == TEXT.value and len(self.aliases[c]) > 0:
                 var k = 0
                 while k < len(self.aliases[c]):
@@ -244,9 +257,9 @@ struct _Emitter(Movable):
             if self.nullable[c]:
                 nul = self.tmp()
                 self.ins(OP_ISNULL, nul, _null_mask(self.p, self.pos[c]))
-            return V(r, nul, False)
+            return V(r, nul, False, x.kind == FLOAT.value)
         if x.op == B_LIT:
-            return V(self.const_i(x.value), -1, False)
+            return V(self.const_i(x.value), -1, False, x.kind == FLOAT.value)       # (a float literal's value is its bits: the constant pool holds bits)
         if x.op == B_NULL:
             return V(self.const_i(0), self.const_f(1.0), False)
         if x.op == B_RESCALE:
@@ -255,20 +268,47 @@ struct _Emitter(Movable):
             self.ins(OP_IMUL, a.reg, a.reg, k)
             self.free(k)
             return a^
+        if x.op == B_I2F:                                      # an INT or DECIMAL read as a float: float(v) / 10^scale, as DuckDB casts it
+            var a = self.value(x.a)
+            self.p.has_float = True
+            self.ins(OP_I2F, a.reg, a.reg)
+            if x.value > 0:
+                var k = self.const_f(Float64(Int(pow10_checked(Int(x.value)))))
+                self.ins(OP_DIV, a.reg, a.reg, k)
+                self.free(k)
+            return V(a.reg, a.nul, False, True)
         if x.op == B_NEG:
             var a = self.value(x.a)
+            if a.fl:                                           # times -1.0: the sign of zero, inf and NaN flips too
+                var m1 = self.const_f(-1.0)
+                self.ins(OP_MUL, a.reg, a.reg, m1)
+                self.free(m1)
+                return a^
             var z = self.const_i(0)
             self.ins(OP_ISUB, a.reg, z, a.reg)
             self.free(z)
             return a^
-        if x.op == B_ADD or x.op == B_SUB or x.op == B_MUL:
+        if x.op == B_ADD or x.op == B_SUB or x.op == B_MUL or x.op == B_DIV:
             var a = self.value(x.a)
             var b = self.value(x.b)
+            if x.kind == FLOAT.value:
+                self.ins(OP_ADD if x.op == B_ADD else OP_SUB if x.op == B_SUB else OP_MUL if x.op == B_MUL else OP_DIV, a.reg, a.reg, b.reg)
+                self.free(b.reg)
+                return V(a.reg, self.or_nul(a.nul, b.nul), False, True)
             self.ins(OP_IADD if x.op == B_ADD else OP_ISUB if x.op == B_SUB else OP_IMUL, a.reg, a.reg, b.reg)
             self.free(b.reg)
             return V(a.reg, self.or_nul(a.nul, b.nul), False)
         if x.op == B_IDIV or x.op == B_IMOD:
             return self.divmod(x)
+        if (x.op == B_LEAST or x.op == B_GREATEST) and x.kind == FLOAT.value:         # NaN is above every number: least skips it, greatest is it
+            var a = self.value(x.a)
+            var b = self.value(x.b)
+            var pick = self.tmp()
+            self.ins(C_LT if x.op == B_LEAST else C_GT, pick, a.reg, b.reg, NAN_AWARE)
+            self.ins(OP_SELECT, a.reg, pick, a.reg, b.reg)
+            self.free(pick)
+            self.free(b.reg)
+            return V(a.reg, self.or_nul(a.nul, b.nul), False, True)
         if x.op == B_FDIV or x.op == B_FMOD or x.op == B_LEAST or x.op == B_GREATEST:      # a frame formula's operators: the kernel's own
             var a = self.value(x.a)
             var b = self.value(x.b)
@@ -385,7 +425,10 @@ struct _Emitter(Movable):
         var a = self.value(x.a)
         var b = self.value(x.b)
         var r = a.reg
-        self.ins(OP_ICMP, r, a.reg, b.reg, Int(x.value))
+        if a.fl:                                               # DuckDB's order: NaN equals itself and is above every number; -0.0 equals 0.0
+            self.ins(Int(x.value), r, a.reg, b.reg, NAN_AWARE)
+        else:
+            self.ins(OP_ICMP, r, a.reg, b.reg, Int(x.value))
         self.free(b.reg)
         return self.with_unknown(r, self.or_nul(a.nul, b.nul))
 
@@ -460,10 +503,16 @@ struct _Emitter(Movable):
             for i in range(len(x.items)):
                 var k = self.const_i(self.rx[x.items[i]].value)
                 if i == 0:
-                    self.ins(OP_ICMP, r, v.reg, k, C_EQ)
+                    if v.fl:
+                        self.ins(C_EQ, r, v.reg, k, NAN_AWARE)
+                    else:
+                        self.ins(OP_ICMP, r, v.reg, k, C_EQ)
                 else:
                     var t = self.tmp()
-                    self.ins(OP_ICMP, t, v.reg, k, C_EQ)
+                    if v.fl:
+                        self.ins(C_EQ, t, v.reg, k, NAN_AWARE)
+                    else:
+                        self.ins(OP_ICMP, t, v.reg, k, C_EQ)
                     self.ins(OP_OR, r, r, t)
                     self.free(t)
                 self.free(k)
@@ -618,6 +667,16 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         for k in range(len(plan.keys)):
             ref lay = plan.keys[k]
             var v = e.value(lay.expr)
+            if v.fl:                                                  # -0.0 is 0.0 and every NaN is one value (F-077): one key word per value
+                var zero = e.const_f(0.0)
+                e.ins(OP_ADD, v.reg, v.reg, zero)                     # -0.0 + 0.0 is +0.0
+                e.free(zero)
+                var nanf = e.tmp()
+                e.ins(25, nanf, v.reg, v.reg, 0)
+                var canon = e.const_f(Float64(from_bits=UInt64(0x7FF8000000000000)))
+                e.ins(OP_SELECT, v.reg, nanf, canon, v.reg)
+                e.free(canon)
+                e.free(nanf)
             if lay.nullable:
                 var z = e.const_i(0)
                 var ni = e.tmp()
@@ -641,12 +700,14 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     for _ in range(n_aggs):
         out.agg_val_slot.append(-1)
         out.agg_nul_slot.append(-1)
+        out.agg_nan_slot.append(-1)
         out.agg_src.append(-1)
     var done = List[Bool](length=n_aggs, fill=False)
     var n_slots = 0
     var n_src = 0
     var src_vreg = List[Int]()
     var src_valid = List[Int]()
+    var src_float = List[Bool]()
     for i in range(n_aggs):
         if (phase == PHASE_PLAIN and sp_aggs[i].hol) or (phase == PHASE_HOL and not sp_aggs[i].hol):
             done[i] = True                                        # the other pass computes it
@@ -699,11 +760,32 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
                 e.free(m)
             sum_slot = n_slots
             e.p.section = 2
-            e.ins(OP_AGG_ISUM, sum_slot, kept)
+            e.ins(OP_AGG_SUM if v.fl else OP_AGG_ISUM, sum_slot, kept)
             e.p.section = 1
-            out.slot_ops.append(A_SUM)
+            out.slot_ops.append(A_FSUM if v.fl else A_SUM)
+            if v.fl:
+                e.p.repro = True                                      # a float sum has one defined order (F-064)
             n_slots += 1
-        if need_min:
+        var isn = -1                                                  # float min / max: 1.0 where the value is NaN
+        if v.fl and (need_min or need_max):
+            isn = e.tmp()
+            e.ins(25, isn, v.reg, v.reg, 0)                           # != (IEEE): true only for NaN
+        if need_min and v.fl:
+            var ident = e.const_f(Float64(from_bits=UInt64(0x7FF0000000000000)))
+            var m = e.tmp()
+            e.ins(OP_SELECT, m, isn, ident, v.reg)                    # a NaN is left out: it is above every number
+            if v.nul >= 0:
+                e.ins(OP_SELECT, m, v.nul, ident, m)
+            var kept = e.keep(m)
+            e.free(m)
+            e.free(ident)
+            min_slot = n_slots
+            e.p.section = 2
+            e.ins(OP_AGG_MIN, min_slot, kept)
+            e.p.section = 1
+            out.slot_ops.append(A_FMIN)
+            n_slots += 1
+        elif need_min:
             var kept: Int
             if v.nul < 0 and raw_kept >= 0:
                 kept = raw_kept
@@ -725,7 +807,22 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             e.p.section = 1
             out.slot_ops.append(A_MIN)
             n_slots += 1
-        if need_max:
+        if need_max and v.fl:
+            var ident = e.const_f(Float64(from_bits=UInt64(0xFFF0000000000000)))
+            var m = e.tmp()
+            e.ins(OP_SELECT, m, isn, ident, v.reg)
+            if v.nul >= 0:
+                e.ins(OP_SELECT, m, v.nul, ident, m)
+            var kept = e.keep(m)
+            e.free(m)
+            e.free(ident)
+            max_slot = n_slots
+            e.p.section = 2
+            e.ins(OP_AGG_MAX, max_slot, kept)
+            e.p.section = 1
+            out.slot_ops.append(A_FMAX)
+            n_slots += 1
+        elif need_max:
             var kept: Int
             if v.nul < 0 and raw_kept >= 0:
                 kept = raw_kept
@@ -747,6 +844,27 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             e.p.section = 1
             out.slot_ops.append(A_MAX)
             n_slots += 1
+        var nan_slot = -1
+        if isn >= 0 and phase != PHASE_HOL:                           # the NaNs a float min / max left out (a NaN is a value: MAX is NaN when there is one)
+            var nf = isn
+            if v.nul >= 0:
+                nf = e.tmp()
+                var zf = e.const_i(0)
+                e.ins(OP_SELECT, nf, v.nul, zf, isn)                  # a NULL row is not a NaN
+                e.free(zf)
+            var ni2 = e.tmp()
+            e.ins(OP_F2I, ni2, nf)
+            var kept_nan = e.keep(ni2)
+            e.free(ni2)
+            if nf != isn:
+                e.free(nf)
+            nan_slot = n_slots
+            e.p.section = 2
+            e.ins(OP_AGG_ISUM, nan_slot, kept_nan)
+            e.p.section = 1
+            out.slot_ops.append(A_SUM)
+            n_slots += 1
+        e.free(isn)
         if v.nul >= 0 and phase != PHASE_HOL:                     # the NULLs this argument skipped
             var ni = e.tmp()
             e.ins(OP_F2I, ni, v.nul)
@@ -773,9 +891,11 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
                 e.free(nv)
             src_vreg.append(kept_v)
             src_valid.append(kept_valid)
+            src_float.append(v.fl)
         for j in members:
             var f = sp_aggs[j].func
             out.agg_nul_slot[j] = nul_slot
+            out.agg_nan_slot[j] = nan_slot
             if sp_aggs[j].hol:
                 out.agg_src[j] = src
             elif f == F_SUM or f == F_AVG:
@@ -800,6 +920,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     e.p.n_src = n_src
     e.p.src_vreg = src_vreg^
     e.p.src_valid = src_valid^
+    e.p.src_float = src_float^
     out.n_src = n_src
     out.key_regs = key_regs
     out.set_bytes = e.set_bytes.copy()

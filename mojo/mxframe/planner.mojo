@@ -12,7 +12,7 @@ What it decides today: the group strategy.
   the group directly: no hashing, the fastest path while the domain is not much bigger than the rows;
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
-from .table import TEXT, BOOL
+from .table import TEXT, BOOL, FLOAT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
                    B_NEG, B_RESCALE)
 
@@ -274,10 +274,13 @@ struct RulePlanner(Planner, Copyable, Movable):
                     radix = span + 1 if span >= 0 and span < (1 << 40) else -1
                 else:
                     radix = -1
+                if kind == FLOAT.value:                         # a float has no range to address by: its min / max (a footer's too) are never used
+                    radix = -1
                 if radix < 0:
                     dense_ok = False
                     if why_not.byte_length() == 0:
-                        why_not = "the range of `" + q.keys[k].name + "` is " + ("too wide" if cs.has_range else "unknown (the source has no statistics on it)")
+                        why_not = ("`" + q.keys[k].name + "` is a FLOAT: floats are grouped by hashing, never by a dense range" if kind == FLOAT.value else
+                                   "the range of `" + q.keys[k].name + "` is " + ("too wide" if cs.has_range else "unknown (the source has no statistics on it)"))
                     radix = 1
                 if layout.nullable:
                     radix += 1
@@ -290,10 +293,13 @@ struct RulePlanner(Planner, Copyable, Movable):
                     layout.lo = iv.lo
                     var span = Int(iv.hi) - Int(iv.lo)
                     radix = span + 1 if span >= 0 and span < (1 << 40) else -1
+                if kind == FLOAT.value:
+                    radix = -1
                 if radix < 0:
                     dense_ok = False
                     if why_not.byte_length() == 0:
-                        why_not = "the range of `" + q.keys[k].name + "` is " + ("too wide" if iv.ok else "unknown: it is not a column or an expression the statistics bound")
+                        why_not = ("`" + q.keys[k].name + "` is a FLOAT: floats are grouped by hashing, never by a dense range" if kind == FLOAT.value else
+                                   "the range of `" + q.keys[k].name + "` is " + ("too wide" if iv.ok else "unknown: it is not a column or an expression the statistics bound"))
                     radix = 1
                 if layout.nullable:
                     radix += 1

@@ -573,7 +573,7 @@ ERRORS = [
     ("SELECT sum(x) FROM t WHERE s LIKE 'a%'", "SQL error at line 1, column 30: `LIKE` is not supported yet (F-156)"),
     ("SELECT count(*) FROM t WHERE s IN (SELECT s FROM t)", "SQL error at line 1, column 36: a subquery in IN (...) is not supported yet (F-154)"),
     ("SELECT sum(x) OVER () FROM t", "SQL error at line 1, column 15: `OVER` (window functions) is not supported yet"),
-    ("SELECT 1e3, count(*) FROM t", "SQL error at line 1, column 8: the number `1e3` has an exponent: floating-point literals are not supported yet (FLOAT arrives with F-157)"),
+    ("SELECT 1e3x, count(*) FROM t", "SQL error at line 1, column 8: the number `1e3` runs into the letters after it"),
     ("SELECT stddev(x) FROM t", "SQL error at line 1, column 8: function `stddev` is not supported: SQL here has the aggregates sum, count, min, max, avg, median, quantile_disc; scalar functions arrive with F-156"),
     ("SELECT summ(x) FROM t", "SQL error at line 1, column 8: function `summ` is not supported (did you mean `sum`?)"),
     ("SELECT sum(x), k FROM t", "SQL error at line 1, column 16: column `k` must appear in the GROUP BY clause or be used in an aggregate function"),

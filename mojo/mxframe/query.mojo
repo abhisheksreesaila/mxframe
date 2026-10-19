@@ -28,17 +28,17 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
-from .table import SharedTable, Table, TEXT
+from .table import SharedTable, Table, TEXT, FLOAT
 from .parquet import ParquetScan, _GroupPlan, _GroupReader, _open_plan, _copy_bits, _count_bits
-from .frame import Frame, Overlay, _eval_row
-from .expr import (Expr, Node, N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
+from .frame import Frame, Overlay, _eval_row, _eval_row_t
+from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
-from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
+from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
 from .frame import text_ranks
 
 # plan node kinds
@@ -66,29 +66,46 @@ comptime AUTO = 2
 # kernel (all cores, no launch or copy-back) answers in about the time a GPU launch plus the result copy take.
 comptime AUTO_GPU_MIN_ROWS = 1_000_000
 
+# how a kernel slot merges across partial results (a morsel, a row group, a chunk): the integer ones above, and the float64 ones (F-157)
+comptime A_FSUM = 20         # float64 addition, in the order the partial results are folded (chunk order: the sum is reproducible)
+comptime A_FMIN = 21         # float64 minimum (NaN never reaches it: the lowering swaps it for the identity and counts it)
+comptime A_FMAX = 22
+
 # kernel opcodes (kernels_aot/pipeline_cpu.mojo, pipeline_program.py)
 comptime MAGIC = 0x4D585031
+comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
 comptime OP_LOADI = 3
+comptime OP_ADD = 10
+comptime OP_SUB = 11
+comptime OP_MUL = 12
+comptime OP_DIV = 13
 comptime OP_IADD = 15
 comptime OP_ISUB = 16
 comptime OP_IMUL = 17
 comptime OP_F2I = 18
+comptime OP_I2F = 19
 comptime OP_AND = 30
 comptime OP_OR = 31
 comptime OP_NOT = 32
+comptime OP_SELECT = 35
 comptime OP_ISNULL = 41
 comptime OP_IDIV = 42
 comptime OP_IMOD = 43
 comptime OP_IMIN = 44
 comptime OP_IMAX = 45
 comptime OP_ICMP = 46
+comptime OP_AGG_SUM = 50
+comptime OP_AGG_MIN = 51
+comptime OP_AGG_MAX = 52
 comptime OP_AGG_ISUM = 53
 comptime OP_AGG_IMIN = 54
 comptime OP_AGG_IMAX = 55
 comptime MAX_REGS = 48
 comptime MAX_CONSTS = 64
 comptime DT_I64 = 1
+comptime DT_F64 = 3
+comptime NAN_AWARE = 1       # the last operand of a float compare: NaN equals itself and is above every number, as DuckDB
 comptime DT_NULLMASK = 7
 
 
@@ -176,12 +193,14 @@ struct Query(Movable):
     var _gpu_ops: Int                    # AUTO sends a streamed file to the GPU above this many kernel instructions a row per core per column read
     var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
+    var _threads: Int                    # worker threads the CPU kernel starts (0: one a core); a float64 sum is the same for any number
 
     def __init__(out self, table: SharedTable):
         self.table = table
         self.device = None
         self.scan = None
         self._window_rows = 0
+        self._threads = 0
         self._morsels = MORSELS_AUTO
         self._block_rows = 0
         self._gpu_ops = AUTO_GPU_OPS_PER_CORE_COLUMN
@@ -196,6 +215,7 @@ struct Query(Movable):
         self.table = scan.schema
         self.device = None
         self._window_rows = 0
+        self._threads = 0
         self._morsels = MORSELS_AUTO
         self._block_rows = 0
         self._gpu_ops = AUTO_GPU_OPS_PER_CORE_COLUMN
@@ -208,6 +228,7 @@ struct Query(Movable):
         self.table = frame.base
         self.device = None
         self._window_rows = 0
+        self._threads = 0
         self._morsels = MORSELS_AUTO
         self._block_rows = 0
         self._gpu_ops = AUTO_GPU_OPS_PER_CORE_COLUMN
@@ -262,6 +283,12 @@ struct Query(Movable):
         self._gpu_ops = ops_per_core_column
         return self^
 
+    def threads(var self, n: Int) -> Self:
+        """The CPU kernel's worker threads (default: one a core). Only the time changes: a float64 sum has one defined order
+        (per 65,536-row morsel in row order, the morsels' totals in order), whatever the number of threads or the block size."""
+        self._threads = max(n, 0)
+        return self^
+
     def block_rows(var self, rows: Int) -> Self:
         """The rows a morsel worker decodes and aggregates at a time (default SCAN_BLOCK_ROWS)."""
         self._block_rows = rows
@@ -292,7 +319,7 @@ struct Query(Movable):
                     for k in range(len(scan_nodes[i].aggs)):
                         scan_nodes[i].aggs[k].arg = self.overlay.expand(scan_nodes[i].aggs[k].arg)
             return _compute_scan(self.scan.value(), scan_nodes, device, self.nodes, self.overlay, self.framed,
-                                 self._morsels, self._block_rows, self._gpu_ops)
+                                 self._morsels, self._block_rows, self._gpu_ops, self._threads)
         var holistic = False
         for node in self.nodes:
             for a in node.aggs:
@@ -323,9 +350,14 @@ struct Query(Movable):
                 for k in range(len(nodes[i].aggs)):
                     nodes[i].aggs[k].arg = self.overlay.expand(nodes[i].aggs[k].arg)
         var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
+        if use_gpu and prog.has_float:
+            if device == GPU:
+                raise Error("device GPU: a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)")
+            use_gpu = False
+            fallback = "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
         var hs = HolStates(1, List[HolSpec](), List[List[Int64]]())
         if prog.mat:
-            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows())
+            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows(), prog.src_float.copy())
         var r = QueryResult()
         var done = False
         if use_gpu:
@@ -338,9 +370,9 @@ struct Query(Movable):
         if not done:
             var mask_addr = Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0
             if prog.mat:
-                r = _run_mat(self.table, prog, mask_addr, hs, self._window_rows)
+                r = _run_mat(self.table, prog, mask_addr, hs, self._window_rows, self._threads)
             else:
-                r = _run_cpu(self.table, prog, mask_addr)
+                r = _run_cpu(self.table, prog, mask_addr, 0, -1, 0, self._threads)
             r.fallback_reason = fallback^
         if self.framed and len(self.overlay.delta) > 0:
             _add_delta(r, self.table, nodes, self.overlay, hs)
@@ -366,6 +398,9 @@ struct QueryResult(Movable):
     var htop: List[List[Int]]       # per holistic aggregate: top_k values, group after group, largest first
     var htop_off: List[List[Int]]   # per holistic aggregate: group g's values are htop[off[g] : off[g + 1]]
     var hcount: List[List[Int]]     # per holistic aggregate: per group, how many values it saw (non-null rows)
+    var agg_float: List[Bool]       # per aggregate: its value is a float64 (`floats(i)`; `values(i)` holds its bits)
+    var nan_slot_of: List[Int]      # per float min / max: the slot counting the NaNs the kernel left out, else -1
+    var hfloat: List[Bool]          # per holistic aggregate: its source is float64 (median, quantile_disc, top_k give float bits)
 
     def __init__(out self):
         self.device = CPU
@@ -374,6 +409,9 @@ struct QueryResult(Movable):
         self.htop = List[List[Int]]()
         self.htop_off = List[List[Int]]()
         self.hcount = List[List[Int]]()
+        self.agg_float = List[Bool]()
+        self.nan_slot_of = List[Int]()
+        self.hfloat = List[Bool]()
         self.fallback_reason = String()
         self.kinds = List[Int]()
         self.slot_of = List[Int]()
@@ -393,10 +431,51 @@ struct QueryResult(Movable):
             return self.counts.copy()
         if self.kinds[i] == A_COUNT_OF:
             return self.slots[self.count_slot_of[i]].copy() if self.count_slot_of[i] >= 0 else self.counts.copy()
+        if len(self.agg_float) > i and self.agg_float[i]:             # a float64 aggregate: the bits of `floats(i)`
+            var f = self.floats(i)
+            var out = List[Int]()
+            for g in range(len(f)):
+                out.append(Int(Int64(f[g].to_bits())))
+            return out^
         return self.slots[self.slot_of[i]].copy()
+
+    def floats(self, i: Int) -> List[Float64]:
+        """Aggregate i's value per group as a float64 (F-157): a float sum, min, max (NaN is above every number: MAX is NaN when the
+        group holds one, MIN only when it holds nothing else) or mean (NaN for a group with no value), a float median / percentile,
+        or any other aggregate's number converted. A group with no value holds 0.0 (`present` says)."""
+        var out = List[Float64]()
+        if self.hol_of[i] >= 0:
+            var h = self.hol_of[i]
+            for g in range(len(self.hvals[h])):
+                out.append(Float64(from_bits=UInt64(Int64(self.hvals[h][g]))) if self.hfloat[h] else Float64(self.hvals[h][g]))
+            return out^
+        if len(self.agg_float) > i and self.agg_float[i]:
+            var s = self.slots[self.slot_of[i]].copy()
+            var n = self.slots[self.count_slot_of[i]].copy() if self.count_slot_of[i] >= 0 else self.counts.copy()
+            for g in range(len(s)):
+                var x = Float64(from_bits=UInt64(Int64(s[g])))
+                if self.kinds[i] == A_MEAN:
+                    out.append(x / Float64(n[g]) if n[g] > 0 else Float64(from_bits=UInt64(0x7FF8000000000000)))
+                elif self.kinds[i] == A_SUM:
+                    out.append(x)
+                else:
+                    var nans = self.slots[self.nan_slot_of[i]][g]
+                    var nan = Float64(from_bits=UInt64(0x7FF8000000000000))
+                    if self.kinds[i] == A_MAX and nans > 0:
+                        out.append(nan)
+                    elif self.kinds[i] == A_MIN and n[g] > 0 and n[g] - nans == 0:
+                        out.append(nan)
+                    else:
+                        out.append(x if n[g] > 0 else 0.0)
+            return out^
+        for v in self.values(i):
+            out.append(Float64(v))
+        return out^
 
     def means(self, i: Int) -> List[Float64]:
         """Aggregate i's mean per group: its exact sum over its count (NaN for a group with none)."""
+        if len(self.agg_float) > i and self.agg_float[i]:
+            return self.floats(i)
         var s = self.slots[self.slot_of[i]].copy()
         var n = self.slots[self.count_slot_of[i]].copy() if self.count_slot_of[i] >= 0 else self.counts.copy()
         var out = List[Float64]()
@@ -458,6 +537,11 @@ struct Program(Movable):
     var temp_top: Int                # running AND, each aggregate's value); temporaries come down from the top
     var set_bytes: List[UInt8]       # F-150 (SQL): the byte sets OP_IN_SET reads and their (offset, length, lowest) triples; the builder has none
     var set_meta: List[Int64]
+    var repro: Bool                  # F-157: the program sums float64 (OP_AGG_SUM): the kernel runs in its reproducible mode (F-064)
+    var has_float: Bool              # it reads a float64 column, a float literal or converts to float64: it runs on the CPU only
+    var agg_float: List[Bool]        # per aggregate: its value is a float64 (sum, mean, min, max of a float expression)
+    var nan_slot_of: List[Int]       # per float min / max: the slot counting the NaNs it left out (NaN is above every number), else -1
+    var src_float: List[Bool]        # per holistic source: it reads float64 values (the hook turns them into order-preserving keys)
 
     def __init__(out self, n_table_cols: Int):
         self.pred = List[Int32]()
@@ -486,6 +570,11 @@ struct Program(Movable):
         self.section = 0
         self.set_bytes = List[UInt8]()
         self.set_meta = List[Int64]()
+        self.repro = False
+        self.has_float = False
+        self.agg_float = List[Bool]()
+        self.nan_slot_of = List[Int]()
+        self.src_float = List[Bool]()
 
     def emit(mut self, op: Int, d: Int, a: Int = 0, b: Int = 0, c: Int = 0):
         var ins: List[Int32] = [Int32(op), Int32(d), Int32(a), Int32(b), Int32(c)]
@@ -532,9 +621,18 @@ struct Program(Movable):
         self.dtypes.append(DT_I64)
         return len(self.cols) - 1
 
+    def column_f64(mut self, table_col: Int) -> Int:
+        """The program column that reads a FLOAT table column as float64 (OP_LOAD_COL)."""
+        for k in range(len(self.cols)):
+            if self.cols[k] == table_col and Int(self.dtypes[k]) == DT_F64:
+                return k
+        self.cols.append(table_col)
+        self.dtypes.append(DT_F64)
+        return len(self.cols) - 1
+
 
 def _op_name(op: Int) -> String:
-    var names: List[String] = ["+", "-", "*", "//", "%", "-", "least", "greatest", "", "", "<", "<=", ">", ">=",
+    var names: List[String] = ["+", "-", "*", "//", "%", "-", "least", "greatest", "/", "", "<", "<=", ">", ">=",
                                "==", "!=", "", "", "", "", "&", "|", "~"]
     return names[op - N_ADD] if N_ADD <= op <= N_NOT else "operator " + String(op)
 
@@ -544,34 +642,74 @@ struct _Slot(Copyable, Movable):
     var reg: Int
     var boolean: Bool       # a comparison's 1.0 / 0.0 (float) rather than an int64 value
     var scale: Int          # a column's decimal places; -1 for a literal or a mix that has none
+    var fl: Bool            # the register holds a float64 (F-157), not int64 bits
+
+
+def _to_float(mut p: Program, mut a: _Slot) raises:
+    """Reads an int register as a float64, in place: float(v) / 10^scale, as DuckDB casts an INT or DECIMAL to DOUBLE. A value past
+    +-2^53 is not exact as a double: the kernel flags it and the query raises."""
+    if a.fl:
+        return
+    p.emit(OP_I2F, a.reg, a.reg)
+    if a.scale > 0:
+        var f = Float64(1.0)
+        for _ in range(a.scale):
+            f *= 10.0
+        var k = p.reg()
+        p.emit(OP_LOAD_CONST, k, p.const(Int64(f.to_bits())))
+        p.emit(OP_DIV, a.reg, a.reg, k)
+    a.fl = True
+    a.scale = -1
+    p.has_float = True
 
 
 def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
-    """Emits e; returns its register: an int register for a value, a float (1.0 / 0.0) for a boolean. Raises when an
-    operator gets the wrong kind (a number where a comparison is due, or the reverse) or when + - and comparisons
-    meet columns of different decimal scales (decimal-aware formulas are F-136: values are the stored integers)."""
+    """Emits e; returns its register: an int register for a value, a float (1.0 / 0.0) for a boolean (see `_compile_typed`)."""
+    return _compile_typed(p, e, t).reg
+
+
+def _compile_typed(mut p: Program, e: Expr, t: SharedTable) raises -> _Slot:
+    """Emits e; returns its slot: an int register for a value, a float64 register (`fl`) for a FLOAT value, a float (1.0 / 0.0) for a
+    boolean. Raises when an operator gets the wrong kind (a number where a comparison is due, or the reverse) or when + - and
+    comparisons meet columns of different decimal scales (decimal-aware formulas are F-136: values are the stored integers). An INT or
+    DECIMAL meeting a float64 is converted to one (`_to_float`)."""
     var stack = List[_Slot]()
     for n in e.nodes:
         if n.op == N_COL:
             var c = t.column(n.name)
             var r = p.reg()
-            p.emit(OP_LOADI, r, p.column(c))
-            stack.append(_Slot(r, False, t.scale(c)))
+            if t.kind(c) == FLOAT:
+                p.emit(OP_LOAD_COL, r, p.column_f64(c))
+                p.has_float = True
+                stack.append(_Slot(r, False, -1, True))
+            else:
+                p.emit(OP_LOADI, r, p.column(c))
+                stack.append(_Slot(r, False, t.scale(c), False))
         elif n.op == N_LIT:
             var r = p.reg()
             p.emit(OP_LOAD_CONST, r, p.const(n.value))
-            stack.append(_Slot(r, False, -1))
+            stack.append(_Slot(r, False, -1, False))
+        elif n.op == N_LITF:                             # the constant pool holds bits
+            var r = p.reg()
+            p.emit(OP_LOAD_CONST, r, p.const(n.value))
+            p.has_float = True
+            stack.append(_Slot(r, False, -1, True))
+        elif n.op == N_I2F:
+            var a = stack.pop()
+            a.scale = Int(n.value)
+            _to_float(p, a)
+            stack.append(a^)
         elif n.op == N_BOOL2INT:                         # a comparison as the number 1 / 0 (merges)
             var a = stack.pop()
             if not a.boolean:
                 raise Error("internal: int() of a number")
             p.emit(OP_F2I, a.reg, a.reg)                 # in place: an operator's result takes its operand's register
-            stack.append(_Slot(a.reg, False, -1))
+            stack.append(_Slot(a.reg, False, -1, False))
         elif n.op == N_SCALE_TO:                         # a formula's rescaled side: the value is already scaled up
             var a = stack.pop()
             if a.boolean:
                 raise Error("internal: a rescaled comparison")
-            stack.append(_Slot(a.reg, False, Int(n.value)))
+            stack.append(_Slot(a.reg, False, Int(n.value), a.fl))
         elif n.op == N_NEG or n.op == N_NOT:
             var a = stack.pop()
             if a.boolean != (n.op == N_NOT):
@@ -581,11 +719,15 @@ def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
             var r = p.reg()
             if n.op == N_NOT:
                 p.emit(OP_NOT, r, a.reg)
+            elif a.fl:                                   # times -1.0: the sign of zero, inf and NaN flips too
+                var m1 = p.reg()
+                p.emit(OP_LOAD_CONST, m1, p.const(Int64(Float64(-1.0).to_bits())))
+                p.emit(OP_MUL, r, a.reg, m1)
             else:
                 var z = p.reg()
                 p.emit(OP_LOAD_CONST, z, p.const(0))
                 p.emit(OP_ISUB, r, z, a.reg)
-            stack.append(_Slot(r, n.op == N_NOT, a.scale))
+            stack.append(_Slot(r, n.op == N_NOT, a.scale, a.fl and n.op == N_NEG))
         else:
             var b = stack.pop()
             var a = stack.pop()
@@ -593,13 +735,38 @@ def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
             if a.boolean != logical or b.boolean != logical:
                 raise Error("`" + _op_name(n.op) + "` needs " + ("comparisons" if logical else "numbers") + " on both sides")
             var compare = n.op >= N_LT and n.op <= N_NE
-            if (n.op == N_ADD or n.op == N_SUB or n.op == N_LEAST or n.op == N_GREATEST or compare) and \
-               a.scale >= 0 and b.scale >= 0 and a.scale != b.scale:
+            var fl = (a.fl or b.fl or n.op == N_DIV) and not logical
+            if fl:
+                if n.op == N_FLOORDIV or n.op == N_MOD:
+                    raise Error("`" + _op_name(n.op) + "` on a FLOAT is not supported: use `/` for a division of floats")
+                _to_float(p, a)
+                _to_float(p, b)
+            elif (n.op == N_ADD or n.op == N_SUB or n.op == N_LEAST or n.op == N_GREATEST or compare) and \
+                 a.scale >= 0 and b.scale >= 0 and a.scale != b.scale:
                 raise Error("`" + _op_name(n.op) + "` meets values with " + String(a.scale) + " and " + String(b.scale) +
                             " decimal places: the stored integers would not line up (decimal-aware formulas: F-136)")
             p.temp_top = a.reg                           # both operands are freed (a, b are the two newest registers)
             var r = p.reg()
             var scale = a.scale if a.scale >= 0 else b.scale
+            if fl:
+                if n.op == N_ADD:
+                    p.emit(OP_ADD, r, a.reg, b.reg)
+                elif n.op == N_SUB:
+                    p.emit(OP_SUB, r, a.reg, b.reg)
+                elif n.op == N_MUL:
+                    p.emit(OP_MUL, r, a.reg, b.reg)
+                elif n.op == N_DIV:
+                    p.emit(OP_DIV, r, a.reg, b.reg)
+                elif n.op == N_LEAST or n.op == N_GREATEST:    # NaN is above every number: least skips it, greatest is it
+                    var pick = p.reg()
+                    p.emit(N_LT if n.op == N_LEAST else N_GT, pick, a.reg, b.reg, NAN_AWARE)
+                    p.emit(OP_SELECT, r, pick, a.reg, b.reg)
+                elif compare:
+                    p.emit(n.op, r, a.reg, b.reg, NAN_AWARE)  # N_LT .. N_NE are the kernel's OP_LT .. OP_NE
+                else:
+                    raise Error("unknown expression operator " + String(n.op))
+                stack.append(_Slot(r, compare, -1, not compare))
+                continue
             if n.op == N_ADD:
                 p.emit(OP_IADD, r, a.reg, b.reg)
             elif n.op == N_SUB:
@@ -624,10 +791,10 @@ def _compile_expr(mut p: Program, e: Expr, t: SharedTable) raises -> Int:
                 p.emit(OP_OR, r, a.reg, b.reg)
             else:
                 raise Error("unknown expression operator " + String(n.op))
-            stack.append(_Slot(r, compare or logical, -1 if compare or logical else scale))
+            stack.append(_Slot(r, compare or logical, -1 if compare or logical else scale, False))
     if len(stack) != 1:
         raise Error("malformed expression")
-    return stack[0].reg
+    return stack[0].copy()
 
 
 def _null_mask(mut p: Program, table_col: Int) -> Int:
@@ -700,7 +867,7 @@ def _sources(aggs: List[Agg]) -> List[Int]:
 
 
 comptime CTL_REG = 1                     # the register holding the control block's address (see `_mat_hook`)
-comptime SRC_WORDS = 10                  # control block words per value source
+comptime SRC_WORDS = 11                  # control block words per value source
 comptime CTL_PLACEHOLDER = Int64(0x5A5A5A5A5A5A5A5A)
 
 
@@ -731,6 +898,7 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
     p.mat = p.n_src > 0
     p.src_vreg = List[Int](length=p.n_src, fill=-1)
     p.src_valid = List[Int](length=p.n_src, fill=-1)
+    p.src_float = List[Bool](length=p.n_src, fill=False)
     if p.mat:                                            # register 1: the address of the control block the hook reads
         p.section = 1
         p.ctl_const = len(p.consts)
@@ -771,7 +939,10 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
         # row the filters left out, so it cannot raise there)
         # the body: the key into register 0, where `_key_from_reg0` reads it per block
         p.section = 1
-        var kb = _compile_expr(p, key, t)
+        var kslot = _compile_typed(p, key, t)
+        if kslot.fl:
+            raise Error("a group key must be a whole number 0 .. groups-1: a FLOAT has no dense numbering (group by a float with SQL, which hashes it)")
+        var kb = kslot.reg
         p.emit(OP_IMAX, 0, kb, kb)
         p.reset_temps()
         p.section = 0
@@ -796,6 +967,8 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
         p.kinds.append(a.kind)
         p.slot_of.append(-1)
         p.count_slot_of.append(-1)
+        p.agg_float.append(False)
+        p.nan_slot_of.append(-1)
         var i = len(p.kinds) - 1
         if a.kind == A_COUNT:
             continue
@@ -808,8 +981,9 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
                 var hv = _valid_of(p, a.arg, t)
                 if hv >= 0:
                     p.src_valid[src] = p.keep(hv, False)
-                var vr = _compile_expr(p, a.arg, t)
-                p.src_vreg[src] = p.keep(vr, False)
+                var vs = _compile_typed(p, a.arg, t)
+                p.src_vreg[src] = p.keep(vs.reg, False)
+                p.src_float[src] = vs.fl
                 p.reset_temps()
             continue
         p.section = 1
@@ -827,9 +1001,50 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
             if a.kind == A_COUNT_OF:
                 p.reset_temps()
                 continue
-        var v = _compile_expr(p, a.arg, t)
+        var vslot = _compile_typed(p, a.arg, t)
+        var v = vslot.reg
         if a.arg.is_bool():
             raise Error("an aggregate needs a value, not a comparison")
+        if vslot.fl:                                     # a float64 value (F-157)
+            p.agg_float[i] = True
+            var vf = -1                                  # 1.0 where the value is non-null
+            if valid >= 0:
+                vf = p.reg()
+                p.emit(OP_I2F, vf, valid)
+            if a.kind == A_SUM or a.kind == A_MEAN:      # null rows add 0.0; the kernel's float sum has one defined order (F-064)
+                var m = v
+                if vf >= 0:
+                    var z = _const_reg(p, 0)
+                    m = p.reg()
+                    p.emit(OP_SELECT, m, vf, v, z)
+                var kept = p.keep(m, False)
+                p.reset_temps()
+                p.section = 2
+                p.emit(OP_AGG_SUM, p.n_slots, kept)
+                p.repro = True
+            else:                                        # min / max: a NaN and a null row are swapped for the identity; the NaNs are counted
+                var ident = _const_reg(p, Int64(Float64(from_bits=UInt64(0x7FF0000000000000) if a.kind == A_MIN else UInt64(0xFFF0000000000000)).to_bits()))
+                var isn = p.reg()
+                p.emit(25, isn, v, v, 0)                 # != (IEEE): 1.0 only for NaN
+                var m = p.reg()
+                p.emit(OP_SELECT, m, isn, ident, v)
+                if vf >= 0:
+                    p.emit(OP_SELECT, m, vf, m, ident)
+                    var zero = _const_reg(p, 0)
+                    p.emit(OP_SELECT, isn, vf, isn, zero)    # a null row is not a NaN
+                var ni = p.reg()
+                p.emit(OP_F2I, ni, isn)
+                var kept = p.keep(m, False)
+                var kept_nan = p.keep(ni, False)
+                p.reset_temps()
+                p.section = 2
+                p.emit(OP_AGG_ISUM, p.n_slots, kept_nan)
+                p.nan_slot_of[i] = p.n_slots
+                p.n_slots += 1
+                p.emit(OP_AGG_MIN if a.kind == A_MIN else OP_AGG_MAX, p.n_slots, kept)
+            p.slot_of[i] = p.n_slots
+            p.n_slots += 1
+            continue
         if valid >= 0:                                   # skip null rows: value * valid (+ the identity * isnull)
             var kept = p.reg()
             p.emit(OP_IMUL, kept, v, valid)
@@ -922,7 +1137,7 @@ def _mat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP,
     """`_key_from_reg0`, and the materializing of the holistic aggregates' pairs. Register CTL_REG holds the address
     of the control block (Int64 words): [0] sources, [1] first row of the window, [2] groups, [3] worker counter,
     [4] worker table, [5] its size, then per source SRC_WORDS words: [value register, validity register or -1, group
-    ids address, values address, per-block counts address, direct, k, heaps address, sizes address, rank address].
+    ids address, values address, per-block counts address, direct, k, heaps address, sizes address, rank address, float].
     For each source the block's selected rows whose group is in range and whose value is not null are written, packed,
     at entry (row0 - window start) of the source's arrays, and their number at the block's place in the counts;
     block b of the window starts at row `start + b * VEC`, so no two blocks (or threads) share an entry. A `direct`
@@ -947,18 +1162,19 @@ def _mat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP,
             var heap = LP(unsafe_from_address=Int(c[7])) + (me * Int(groups) + 0) * k
             var size = Pointer[Int, MutUntrackedOrigin](unsafe_from_address=Int(c[8])) + me * Int(groups)
             var rank = LP(unsafe_from_address=Int(c[9])) if c[9] != 0 else key
+            var isf = c[10] != 0
             if c[1] < 0:
                 for j in range(nsel):
                     var g = key[j]
                     if g >= 0 and g < groups:
-                        var v = rank[Int(vals[j])] if c[9] != 0 else vals[j]
+                        var v = rank[Int(vals[j])] if c[9] != 0 else float_key(vals[j]) if isf else vals[j]
                         size[Int(g)] = heap_offer(heap + Int(g) * k, size[Int(g)], k, v)
             else:
                 var valid = LP(unsafe_from_address=Int(regs + Int(c[1]) * VEC))
                 for j in range(nsel):
                     var g = key[j]
                     if g >= 0 and g < groups and valid[j] != 0:
-                        var v = rank[Int(vals[j])] if c[9] != 0 else vals[j]
+                        var v = rank[Int(vals[j])] if c[9] != 0 else float_key(vals[j]) if isf else vals[j]
                         size[Int(g)] = heap_offer(heap + Int(g) * k, size[Int(g)], k, v)
             continue
         var gp = IP(unsafe_from_address=Int(c[2])) + base
@@ -977,6 +1193,9 @@ def _mat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP,
                 gp[o] = Int32(g)
                 vp[o] = vals[j]
                 o += Int((g >= 0) & (g < groups) & (valid[j] != 0))
+        if c[10] != 0:                                   # float64 values: held as order-preserving keys from here on
+            for q in range(o):
+                vp[q] = float_key(vp[q])
         IP(unsafe_from_address=Int(c[4]))[base // VEC] = Int32(o)
     return True
 
@@ -1027,19 +1246,19 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: In
         rc = pipeline_keyed[type_of(_mat_hook)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
                                             Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()),
                                             p.groups, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
-                                            threads, _mat_hook, False)
+                                            threads, _mat_hook, p.repro)
     elif p.keyed:
         rc = pipeline_keyed[type_of(_key_from_reg0)](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
                                             Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()),
                                             p.groups, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()),
-                                            threads, _key_from_reg0, False)
+                                            threads, _key_from_reg0, p.repro)
     else:
         rc = pipeline_plain(Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
                             Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()),
-                            0, 1, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()), threads, False)
+                            0, 1, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()), threads, p.repro)
     _ = code^, consts^, set_bytes^, set_meta^, tbl^, dtypes^      # the kernel read them: keep them past the call
     if rc == E_OVERFLOW:
-        raise Error("a sum or an expression passed the int64 range (about 9.2e18)")
+        raise Error(overflow_message(p.has_float))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var r = _make_result(p, out_vals, out_cnt)
@@ -1053,6 +1272,8 @@ def _make_result(p: Program, out_vals: List[Float64], out_cnt: List[Int64]) -> Q
     r.kinds = p.kinds.copy()
     r.slot_of = p.slot_of.copy()
     r.count_slot_of = p.count_slot_of.copy()
+    r.agg_float = p.agg_float.copy()
+    r.nan_slot_of = p.nan_slot_of.copy()
     r.hol_of = List[Int](length=len(p.kinds), fill=-1)
     var bits = out_vals.unsafe_ptr().bitcast[Int64]()
     for s in range(p.n_slots):
@@ -1084,7 +1305,34 @@ def _slot_ops(p: Program) -> List[Int]:
             ops[Int(p.aggs[k * 5 + 1])] = A_MIN
         elif op == OP_AGG_IMAX:
             ops[Int(p.aggs[k * 5 + 1])] = A_MAX
+        elif op == OP_AGG_SUM:
+            ops[Int(p.aggs[k * 5 + 1])] = A_FSUM
+        elif op == OP_AGG_MIN:
+            ops[Int(p.aggs[k * 5 + 1])] = A_FMIN
+        elif op == OP_AGG_MAX:
+            ops[Int(p.aggs[k * 5 + 1])] = A_FMAX
     return ops^
+
+
+def fold_float(op: Int, a: Int, b: Int) -> Int:
+    """Two float64 slot words (their bits) combined: A_FSUM adds, A_FMIN / A_FMAX take the smaller / larger."""
+    var x = Float64(from_bits=UInt64(Int64(a)))
+    var y = Float64(from_bits=UInt64(Int64(b)))
+    var r = x + y if op == A_FSUM else (y if y < x else x) if op == A_FMIN else (y if y > x else x)
+    return Int(Int64(r.to_bits()))
+
+
+def slot_identity(op: Int) -> Int:
+    """A slot's starting word for its merge op: 0 for sums, the extreme values (as int64, or +-inf as float64 bits) for extremes."""
+    if op == A_MIN:
+        return Int(Int64.MAX)
+    if op == A_MAX:
+        return Int(Int64.MIN)
+    if op == A_FMIN:
+        return Int(Int64(Float64(from_bits=UInt64(0x7FF0000000000000)).to_bits()))
+    if op == A_FMAX:
+        return Int(Int64(Float64(from_bits=UInt64(0xFFF0000000000000)).to_bits()))
+    return 0
 
 
 def _merge_partial(mut acc: QueryResult, r: QueryResult, ops: List[Int]) raises:
@@ -1094,7 +1342,9 @@ def _merge_partial(mut acc: QueryResult, r: QueryResult, ops: List[Int]) raises:
         for x in range(len(acc.slots[s])):
             var a = acc.slots[s][x]
             var b = r.slots[s][x]
-            if ops[s] == A_MIN:
+            if ops[s] >= A_FSUM:
+                acc.slots[s][x] = fold_float(ops[s], a, b)
+            elif ops[s] == A_MIN:
                 acc.slots[s][x] = min(a, b)
             elif ops[s] == A_MAX:
                 acc.slots[s][x] = max(a, b)
@@ -1107,7 +1357,7 @@ def _merge_partial(mut acc: QueryResult, r: QueryResult, ops: List[Int]) raises:
         acc.counts[x] += r.counts[x]
 
 
-def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, window_rows: Int = 0) raises -> QueryResult:
+def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, window_rows: Int = 0, threads: Int = 0) raises -> QueryResult:
     """A query with count_distinct / percentile / top_k over `t`: the kernel runs over windows of rows, aggregating
     the plain aggregates as always (partial results merged) and, through `_mat_hook`, writing the (group, value) pairs
     of each value source, which `hs` takes in (the states keep what later windows must merge with). A window is as many
@@ -1157,7 +1407,8 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
             ctl.append(Int64(Int(heaps[s].unsafe_ptr())))
             ctl.append(Int64(Int(sizes[s].unsafe_ptr())))
             ctl.append(Int64(hs.rank_of(s) if is_direct else 0))
-        var rw = _run_cpu(t, p, mask_addr, done, end, Int(ctl.unsafe_ptr()))
+            ctl.append(Int64(1 if p.src_float[s] else 0))
+        var rw = _run_cpu(t, p, mask_addr, done, end, Int(ctl.unsafe_ptr()), threads)
         var used_workers = min(Int(counter[0]), workers)
         for s in range(p.n_src):
             if direct[s] >= 0:
@@ -1179,7 +1430,7 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
 
 
 def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable, extra: List[List[String]],
-                  scan: Optional[ParquetScan] = None, max_rows: Int = -1) raises -> HolStates:
+                  scan: Optional[ParquetScan] = None, max_rows: Int = -1, var floats: List[Bool] = List[Bool]()) raises -> HolStates:
     """The states for the plan's holistic aggregates (none: an empty set). `nodes` are the plan with a frame's formulas
     and merges expanded (they decide which aggregates share a value source), `orig` the plan as built (to see which
     values are a plain TEXT column, whose percentile / top_k order is the words' alphabetical order, not the codes').
@@ -1223,7 +1474,7 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
                     for w in extra[c]:
                         words.append(w)
                 ranks[src_of[i]] = text_ranks(words)
-    return HolStates(nodes[at].groups, specs^, ranks^, max_rows)
+    return HolStates(nodes[at].groups, specs^, ranks^, max_rows, floats^)
 
 
 def _finish_holistic(mut r: QueryResult, mut hs: HolStates) raises:
@@ -1235,6 +1486,7 @@ def _finish_holistic(mut r: QueryResult, mut hs: HolStates) raises:
     r.hcount = res.counts.copy()
     for h in range(len(hs.specs)):
         r.hol_of[hs.specs[h].agg] = h
+        r.hfloat.append(hs.floats[hs.specs[h].src])
 
 
 # ── running on the GPU ───────────────────────────────────────────────────────────────────────────────
@@ -1278,6 +1530,14 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
 
 
 comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (about 9.2e18)"
+
+
+def overflow_message(has_float: Bool) -> String:
+    """The kernel's overflow flag: an int64 total or result past its range, and, when the program holds float64 values, an integer past
+    2^53 meeting one (it is not exact as a double)."""
+    if has_float:
+        return "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)"
+    return OVERFLOW_MESSAGE
 
 
 struct _QueryBuffers(Movable):
@@ -1475,11 +1735,11 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
             var hv = _eval_row(aggs[first_of[sidx]].arg, t, raw)
             if not hv[1]:
                 pair_g[sidx].append(Int32(g))
-                pair_v[sidx].append(hv[0])
+                pair_v[sidx].append(float_key(hv[0]) if hs.floats[sidx] else hv[0])
         for i in range(len(aggs)):
             if aggs[i].kind == A_COUNT or aggs[i].kind >= A_DISTINCT:
                 continue
-            var v = _eval_row(aggs[i].arg, t, raw)
+            var v = _eval_row_t(aggs[i].arg, t, raw)
             if v[1]:
                 continue
             if r.count_slot_of[i] >= 0:
@@ -1487,6 +1747,18 @@ def _add_delta(mut r: QueryResult, t: SharedTable, nodes: List[PlanNode], o: Ove
             if aggs[i].kind == A_COUNT_OF:
                 continue
             var s = r.slot_of[i]
+            if len(r.agg_float) > i and r.agg_float[i]:                    # a float64 aggregate: the delta rows fold in row order
+                var fx = Float64(from_bits=UInt64(Int64(r.slots[s][g])))
+                var fv = Float64(from_bits=UInt64(v[0]))
+                if aggs[i].kind == A_SUM or aggs[i].kind == A_MEAN:
+                    r.slots[s][g] = Int(Int64((fx + fv).to_bits()))
+                elif fv != fv:                                              # a NaN is counted, not folded (it is above every number)
+                    r.slots[r.nan_slot_of[i]][g] += 1
+                elif aggs[i].kind == A_MIN and fv < fx:
+                    r.slots[s][g] = Int(v[0])
+                elif aggs[i].kind == A_MAX and fv > fx:
+                    r.slots[s][g] = Int(v[0])
+                continue
             var x = Int64(r.slots[s][g])
             if aggs[i].kind == A_MIN:
                 r.slots[s][g] = Int(min(x, v[0]))
@@ -1535,8 +1807,7 @@ def _use_morsels(mode: Int, rows: Int, block: Int) -> Bool:
 def _identity_partial(n_slots: Int, groups: Int, ops: List[Int]) -> QueryResult:
     var acc = QueryResult()
     for s in range(n_slots):
-        var ident = Int(Int64.MAX) if ops[s] == A_MIN else Int(Int64.MIN) if ops[s] == A_MAX else 0
-        acc.slots.append(List[Int](length=groups, fill=ident))
+        acc.slots.append(List[Int](length=groups, fill=slot_identity(ops[s])))
     acc.counts = List[Int](length=groups, fill=0)
     return acc^
 
@@ -1758,7 +2029,7 @@ def _run_part_gpu(t: SharedTable, nodes: List[PlanNode], gm: List[UInt8], strict
 
 
 def _run_part_dev(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, gm: List[UInt8], use_gpu: Bool, strict: Bool,
-                  ctx_addr: Int, mut fallback: String, mut gpu_groups: Int, rows: Int, ext: List[Int]) raises -> QueryResult:
+                  ctx_addr: Int, mut fallback: String, mut gpu_groups: Int, rows: Int, ext: List[Int], threads: Int = 0) raises -> QueryResult:
     """A scan's row group on the GPU when the scan runs there (the CPU when the group falls back), else on the CPU. `ext`:
     the group's values are in these pinned buffers (`read_group_into`), not in `t`, which a CPU run then gets them in."""
     if use_gpu:
@@ -1772,16 +2043,16 @@ def _run_part_dev(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, gm: 
             for i in range(rows):
                 v[i] = src[i]
             t._table[].cols[c].values = v^
-    return _run_part(t, nodes, hs, Int(gm.unsafe_ptr()) if len(gm) > 0 else 0)
+    return _run_part(t, nodes, hs, Int(gm.unsafe_ptr()) if len(gm) > 0 else 0, threads)
 
 
-def _run_part(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, mask_addr: Int = 0) raises -> QueryResult:
+def _run_part(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, mask_addr: Int = 0, threads: Int = 0) raises -> QueryResult:
     """One row group of a scan: the plan lowered on its own table, run on the CPU (a holistic plan feeds `hs`).
     `mask_addr` (F-147): the frame mask of this group's rows, 0 for none."""
     var p = _lower(t, nodes, True, mask_addr != 0)
     if p.mat:
-        return _run_mat(t, p, mask_addr, hs)
-    return _run_cpu(t, p, mask_addr)
+        return _run_mat(t, p, mask_addr, hs, 0, threads)
+    return _run_cpu(t, p, mask_addr, 0, -1, 0, threads)
 
 
 # ---- F-147: a frame over a scan. The frame mask is one bitmap over the whole file; a row group (or a block of one)
@@ -1829,7 +2100,7 @@ def _range_mask(m: _ScanMask, g: Int, r0: Int, r1: Int) -> List[UInt8]:
 # ── a Parquet scan: one row group at a time (F-140) ──────────────────────────────────────────────────
 
 def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: List[PlanNode], o: Overlay,
-                  framed: Bool, morsels: Int = 0, block_rows: Int = 0, gpu_ops: Int = AUTO_GPU_OPS_PER_CORE_COLUMN) raises -> QueryResult:
+                  framed: Bool, morsels: Int = 0, block_rows: Int = 0, gpu_ops: Int = AUTO_GPU_OPS_PER_CORE_COLUMN, threads: Int = 0) raises -> QueryResult:
     """The plan over a file, a row group at a time: decode the columns the plan reads, run the CPU kernel on that
     group, merge its partial result into the running one (sums and counts add, min / max combine; a sum passing
     int64 raises, as one run does). Each group is lowered on its own table, so its null-free columns skip the null
@@ -1878,9 +2149,13 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
             raise Error("device GPU: no GPU found")
         if shape.mat:
             raise Error("device GPU: count_distinct / percentile / top_k run on the CPU")
+        if shape.has_float:
+            raise Error("device GPU: a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)")
         use_gpu = True
     elif device == AUTO and gpu_available():
-        if shape.mat:
+        if shape.has_float:
+            why = "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
+        elif shape.mat:
             why = "count_distinct / percentile / top_k run on the CPU"
         elif scan.rows() < AUTO_GPU_SCAN_MIN_ROWS and gpu_ops > 0:
             why = "the file has " + String(scan.rows()) + " rows, under AUTO's " + String(AUTO_GPU_SCAN_MIN_ROWS) + " for the GPU"
@@ -1891,14 +2166,10 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     var gown = _ScanContext(use_gpu)                          # frees the device context on every way out of this function
     var gctx = gown.addr
     var gpu_groups = 0
-    var ops = List[Int](length=shape.n_slots, fill=A_SUM)       # how each kernel slot merges
-    for i in range(len(shape.kinds)):
-        if shape.kinds[i] == A_MIN or shape.kinds[i] == A_MAX:
-            ops[shape.slot_of[i]] = shape.kinds[i]
+    var ops = _slot_ops(shape)                                  # how each kernel slot merges
     var acc = QueryResult()
     for s in range(shape.n_slots):
-        var ident = Int(Int64.MAX) if ops[s] == A_MIN else Int(Int64.MIN) if ops[s] == A_MAX else 0
-        acc.slots.append(List[Int](length=shape.groups, fill=ident))
+        acc.slots.append(List[Int](length=shape.groups, fill=slot_identity(ops[s])))
     acc.counts = List[Int](length=shape.groups, fill=0)
     var nulls = List[Int](length=len(used), fill=0)
     var todo = List[Int]()                   # the row groups with rows, in file order
@@ -1908,7 +2179,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     var todo_all = todo.copy()
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows())    # (text order needs the words)
+    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows(), shape.src_float.copy())    # (text order needs the words)
     var sm = _ScanMask()                                                      # F-147
     if len(o.mask) > 0:
         sm.addr = Int(o.mask.unsafe_ptr())
@@ -1923,7 +2194,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     # holistic aggregates (distinct, percentile, top_k) keeps the loop below: its states are fed in row-group order.
     var block = (block_rows if block_rows > 0 else SCAN_BLOCK_ROWS) // 8 * 8      # a multiple of 8: a block's frame mask slice starts on a byte (F-147)
     block = max(block, 64)
-    if not shape.mat and not use_gpu and _use_morsels(morsels, scan.rows(), block):
+    if not shape.mat and not use_gpu and not shape.repro and _use_morsels(morsels, scan.rows(), block):      # (a float64 sum is folded row group by row group, in file order: the one order that does not depend on the cores)
         var run = _scan_morsels(scan, nodes, used, todo, shape.n_slots, shape.groups, ops, block, sm)
         var ti = 0
         for i in range(len(todo)):
@@ -1995,7 +2266,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
                             Pointer[List[UInt8], MutUntrackedOrigin](unsafe_from_address=gmp)[], use_gpu, device == GPU, gctx,
                             Pointer[String, MutUntrackedOrigin](unsafe_from_address=whyp)[],
                             Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ggp)[], rows_cur,
-                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=extc)[])
+                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=extc)[], threads)
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e0p)[] = String(e)
                 else:
@@ -2016,7 +2287,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
                 raise Error(e0)
             pending = e1^                            # the next group's decode error waits until this group is merged
         else:
-            r = _run_part_dev(part, nodes, hs, gm, use_gpu, device == GPU, gctx, why, gpu_groups, rows_cur, ext_cur)
+            r = _run_part_dev(part, nodes, hs, gm, use_gpu, device == GPU, gctx, why, gpu_groups, rows_cur, ext_cur, threads)
         _ = part^
         _ = gm^
         cur = nxt^
@@ -2034,6 +2305,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     out.kinds = want.kinds.copy()
     out.slot_of = want.slot_of.copy()
     out.count_slot_of = want.count_slot_of.copy()
+    out.agg_float = want.agg_float.copy()
+    out.nan_slot_of = want.nan_slot_of.copy()
     for _ in range(want.n_slots):
         out.slots.append(List[Int](length=want.groups, fill=0))
     for i in range(len(want.kinds)):
@@ -2041,6 +2314,8 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
             out.slots[want.slot_of[i]] = acc.slots[shape.slot_of[i]].copy()
         if want.count_slot_of[i] >= 0:
             out.slots[want.count_slot_of[i]] = acc.slots[shape.count_slot_of[i]].copy()
+        if want.nan_slot_of[i] >= 0:
+            out.slots[want.nan_slot_of[i]] = acc.slots[shape.nan_slot_of[i]].copy()
     out.counts = acc.counts.copy()
     out.hol_of = List[Int](length=len(out.kinds), fill=-1)
     if framed and len(o.delta) > 0:                          # F-147: the frame's changed and appended rows
