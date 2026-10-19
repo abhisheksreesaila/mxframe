@@ -232,13 +232,21 @@ struct SqlExpr(Copyable, Movable):
     var col: Int
 
 
-@fieldwise_init
 struct SelectItem(Copyable, Movable):
     var expr: Int
     var alias: String
     var has_alias: Bool
     var line: Int
     var col: Int
+    var star: Bool       # F-152: `*` or `t.*` (expr is -1; `alias` holds the qualifier of `t.*`)
+
+    def __init__(out self, expr: Int, alias: String, has_alias: Bool, line: Int, col: Int, star: Bool = False):
+        self.expr = expr
+        self.alias = alias
+        self.has_alias = has_alias
+        self.line = line
+        self.col = col
+        self.star = star
 
 
 @fieldwise_init
@@ -269,8 +277,10 @@ struct SqlStatement(Movable):
     var limit: Int              # -1 for none
     var offset: Int
     var explain: Int
+    var distinct: Bool          # F-152: SELECT DISTINCT
 
     def __init__(out self, text: String):
+        self.distinct = False
         self.text = text
         self.exprs = List[SqlExpr]()
         self.items = List[SelectItem]()
@@ -499,13 +509,26 @@ struct _Parser(Movable):
     def select(mut self) raises:
         _ = self.advance()                                                      # SELECT
         if self.is_kw("DISTINCT"):
-            raise self.unsupported(self.tok(), "`SELECT DISTINCT`", "F-152")
-        if self.is_kw("ALL"):
+            if self.is_kw("ON", 1):
+                raise self.unsupported(self.tok(), "`SELECT DISTINCT ON`", "")
+            _ = self.advance()
+            self.st.distinct = True
+        elif self.is_kw("ALL"):
             _ = self.advance()
         while True:
             var t = self.tok()
-            if self.is_sym("*"):
-                raise self.unsupported(t, "`*` in the select list", "F-152")
+            if self.is_sym("*") or ((t.kind == T_IDENT or t.kind == T_QIDENT) and self.is_sym(".", 1) and self.is_sym("*", 2)):
+                var qual = String()
+                if not self.is_sym("*"):
+                    qual = t.text
+                    _ = self.advance()
+                    _ = self.advance()
+                _ = self.advance()
+                self.st.items.append(SelectItem(-1, qual, False, t.line, t.col, True))
+                if self.is_sym(","):
+                    _ = self.advance()
+                    continue
+                break
             var e = self.expr()
             var alias = String()
             var has = False
@@ -856,7 +879,7 @@ struct _Parser(Movable):
         if self.is_sym("."):
             _ = self.advance()
             if self.is_sym("*"):
-                raise self.unsupported(self.tok(), "`" + first.text + ".*`", "F-152")
+                raise self.unsupported(self.tok(), "`" + first.text + ".*` outside the select list", "")
             var nm = self.tok()
             if nm.kind != T_IDENT and nm.kind != T_QIDENT:
                 raise self.expected("a column name after `.`")
