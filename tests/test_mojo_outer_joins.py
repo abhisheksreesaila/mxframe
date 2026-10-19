@@ -22,7 +22,7 @@ def data(tmp_path_factory):
     d = tmp_path_factory.mktemp("outer")
     con = duckdb.connect()
     # customers: unique ck; seg with NULLs; text; decimal; date
-    con.execute("""create table cust as select i as ck, case when i % 7 = 0 then null else i % 50 end as seg, ['West','east','North','South','NORTH'][1 + i % 5] as s,
+    con.execute("""create table cust as select i as ck, case when i % 7 = 0 then null else i % 50 end as seg, case when i % 23 = 0 then null else ['West','east','North','South','NORTH'][1 + i % 5] end as s,
         ((i % 40) * 0.25)::decimal(10,2) as bal, date '2021-01-01' + (i % 300)::int as dt from range(400) r(i)""")
     # orders: ck NULL every 11th, many keys that miss (up to 460), keys repeat (3 orders a key at most more); amt with NULLs
     con.execute("""create table ords as select i as oid, case when i % 11 = 0 then null else (i * 3) % 460 end as ck,
@@ -214,12 +214,14 @@ NOT_IN = [
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM ords)", "ords.ck holds NULLs", "the list holds a NULL"),
     ("SELECT count(*) FROM cust WHERE seg NOT IN (SELECT ck FROM ords WHERE ck IS NOT NULL)", "the NULLs filtered out of the list", "a NULL key is dropped"),
     ("SELECT count(*) FROM nothing_c WHERE ck NOT IN (SELECT ck FROM nonull)", "an empty probe side", "join: anti (null-aware)"),
+    ("SELECT s, count(*) FROM cust WHERE s NOT IN (SELECT tag FROM ords) GROUP BY s", "words the list lacks are kept, a NULL text key is dropped", "a NULL key is dropped"),
+    ("SELECT s, count(*) FROM fact WHERE s NOT IN (SELECT tag FROM ords) GROUP BY s", "a word absent from the list's dictionary is not a NULL", "a NULL key is dropped"),
 ]
 
 
 @pytest.mark.parametrize("sql,why,expect_note", NOT_IN)
 def test_not_in_is_null_aware(mx, data, sql, why, expect_note):
-    tables = ["cust", "ords", "withnull", "nonull", "nothing", "nothing_c"]
+    tables = ["cust", "ords", "withnull", "nonull", "nothing", "nothing_c", "fact"]
     res = q(mx, data, sql, tables)
     assert any(expect_note in n for n in res["notes"]), (why, res["notes"])
     q(mx, data, sql, tables, extra=["--join", "materialize"])

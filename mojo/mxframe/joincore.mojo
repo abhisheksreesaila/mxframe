@@ -129,6 +129,22 @@ def _column_keys(t: SharedTable, c: Int, kind: Int, mul: Int64, translate: List[
             vp[i] = v
 
 
+def unmatchable_not_null(mut keys: JoinKeys, lo: Int64, hi: Int64, probe: SharedTable, c: Int, n: Int):
+    """NOT IN: a probe row whose value can equal no build key (a TEXT word the build side lacks, a decimal that overflows when aligned) is not a NULL key,
+    and a NULL key is the only one NOT IN drops. `ok` cannot tell the two apart, so such a row becomes an ordinary key outside the build map's range
+    (it is present nowhere). Only keys the normalization built itself are touched (a column's own values are never changed, and have no such rows)."""
+    if keys.po_addr == 0 or len(keys.pkeys) != n:
+        return
+    var sentinel = hi + 1 if hi < Int64.MAX else lo - 1
+    var valid = _valid_bits(probe, c)
+    var po = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=keys.po_addr)
+    var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
+    for i in range(n):
+        if po[i] == 0 and (valid == 0 or (bits[i >> 3] >> UInt8(i & 7)) & 1 != 0):
+            po[i] = 1
+            keys.pkeys[i] = sentinel
+
+
 def _ok_bytes(t: SharedTable, c: Int, mut ok: List[UInt8]) -> Int:
     """The `ok` bytes of a column's validity (0 when it has no NULL: every row may match)."""
     if t.null_count(c) == 0:

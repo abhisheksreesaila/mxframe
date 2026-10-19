@@ -81,6 +81,18 @@ def main() raises:
         "SELECT l.k, l.s, r.s, r.y FROM l JOIN r ON l.k = r.k WHERE l.x > 400 AND r.y < 2000 ORDER BY l.k, l.s, r.y, r.s",
         "SELECT l.k, r.y FROM l JOIN r ON l.k = r.k WHERE r.s = 'brand-new' OR l.s = 'brand-new' ORDER BY 1, 2",
         "SELECT count(*) FROM l JOIN r ON l.s = r.s WHERE r.s = 'north'",
+        "SELECT count(*), count(r.y), sum(l.x), sum(r.y) FROM l LEFT JOIN r ON l.k = r.k",
+        "SELECT l.s, r.s, count(*) FROM l LEFT JOIN r ON l.s = r.s GROUP BY l.s, r.s ORDER BY l.s, r.s",
+        "SELECT l.k, l.s, r.s, r.y FROM l LEFT JOIN r ON l.k = r.k WHERE l.x > 400 ORDER BY l.k, l.s, r.y, r.s",
+        "SELECT count(*), count(r.y) FROM l LEFT JOIN r ON l.k = r.k AND r.y < 2000",
+        "SELECT count(*), sum(x) FROM l WHERE k IN (SELECT k FROM r)",
+        "SELECT count(*) FROM l WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = l.k)",
+        "SELECT s, count(*) FROM l WHERE s IN (SELECT s FROM r) GROUP BY s ORDER BY s",
+        "SELECT s, count(*) FROM l WHERE s NOT IN (SELECT s FROM r) GROUP BY s ORDER BY s",
+        "SELECT count(*) FROM l WHERE k NOT IN (SELECT k FROM r)",
+        "SELECT count(*) FROM l WHERE k NOT IN (SELECT k FROM r WHERE k IS NOT NULL)",
+        "SELECT k, s FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.s = l.s AND r.y > 2900) ORDER BY k, s LIMIT 100",
+        "SELECT count(*) FROM r WHERE s IN (SELECT s FROM l WHERE x > 100)",
     ]
     var bad = 0
     for q in Q:
@@ -91,6 +103,8 @@ def main() raises:
             var ga = rows_of(a.table); var gb = rows_of(b.table)
             if ga != gb:
                 bad += 1
+                for n in a.notes:
+                    print("   note: " + n)
                 print("DIFF fuse=" + String(fuse == 0) + " " + q + "\n frames: " + ga[byte=:min(400, ga.byte_length())] + "\n baked:  " + gb[byte=:min(400, gb.byte_length())])
     if bad > 0:
         raise Error("FAILED: " + String(bad) + " queries over frames differ from the same queries over the baked tables")

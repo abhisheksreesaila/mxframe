@@ -28,7 +28,7 @@ from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE,
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import needed_columns, side_query, joined_query, virtual_schema
-from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
+from .joincore import JoinKeys, JoinSide, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .jfront import FusedJoin, front_spec, jf_front
@@ -785,6 +785,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         rneed = List[Int]()
     var t_build = perf_counter_ns()
     var m = hj_build(keys.bk_addr, keys.bo_addr, nb, opts.threads)
+    if fmode == PM_ANTI_NA:
+        unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], lrows)
     var t_probe = perf_counter_ns()
     var ncols = len(lneed) + len(rneed)
     var budget = JOIN_BUDGET_BYTES // (8 * max(ncols, 1))
