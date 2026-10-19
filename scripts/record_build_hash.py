@@ -23,6 +23,7 @@ LIBRARIES = {
     "libmxexec_cpu.so": ("executor_cpu.mojo", "exec"),
     "libmxgroupkeys_cpu.so": ("groupkeys_cpu.mojo", "keys"),
     "libmxjoin_cpu.so": ("joinsemi_cpu.mojo", "join"),
+    "libmxhashjoin_cpu.so": ("hashjoin_lib.mojo", "hashjoin"),
     "libmxkernels_aot.so": ("kernels_aot.mojo", "aot"),
     "libmxkernels_aot_gpu.so": ("kernels_aot_gpu.mojo", "aot"),
     "libmxpipeline_cpu.so": ("pipeline_cpu.mojo", "cpu"),

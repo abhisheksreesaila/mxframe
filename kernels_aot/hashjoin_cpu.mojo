@@ -3,7 +3,7 @@ F-153: the hash join kernel of the MX frame engine (CPU).
 
 A generic engine kernel: it knows int64 keys and row numbers, nothing about tables, SQL or any application. Every entry point takes
 addresses (Int) of plain int64 / int32 / byte arrays, so the Mojo API, the SQL layer, the Python engine (ctypes, through the C entry
-points at the end) and anything built on the engine call the same code.
+points of hashjoin_lib.mojo, libmxhashjoin_cpu.so) and anything built on the engine call the same code.
 
     keys  Int64[n]   the normalized key of each row (the caller makes every kind of column one int64: integers as they are, scaled
                      decimals aligned, dates, bools, dictionary codes translated to one dictionary, floats by their ordered bits,
