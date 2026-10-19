@@ -207,8 +207,8 @@ def main() raises:
     except e:
         check(String(e), "SQL error at line 1, column 12: column `qtty` not found in table `orders` (did you mean `qty`?)", "misspelled column")
     try:
-        _ = sql(cat, "SELECT region FROM orders JOIN other ON 1")
-        fail("a JOIN should raise")
+        _ = sql(cat, "SELECT region FROM orders LEFT JOIN other ON 1")
+        fail("a LEFT JOIN should raise")
     except e:
-        check(String(e), "SQL error at line 1, column 27: `JOIN` is not supported yet (F-153)", "join")
+        check(String(e), "SQL error at line 1, column 27: `LEFT JOIN` is not supported yet (F-154)", "join")
     print("ok")
