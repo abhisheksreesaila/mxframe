@@ -1,7 +1,8 @@
 # Test tool (tests/test_mojo_csv.py): reads a CSV with mxframe's reader and prints the table as JSON lines, so an
 # independent reader (pyarrow) can be compared with it. First line: [[name, kind, scale], ...]; then one array per
 # row: INT / DECIMAL / DATE / BOOL as their stored integers, TEXT as strings, null as null.
-# Usage: csv_dump <path> [threads] [chunk_bytes] [infer_rows]
+# Usage: csv_dump <path> [threads] [chunk_bytes] [infer_rows] [float_columns, comma separated]
+# (a FLOAT cell is printed as its float64 bits, a signed integer)
 from std.sys import argv
 from mxframe import read_csv, CsvOptions, TEXT
 
@@ -41,6 +42,9 @@ def main() raises:
         options.chunk_bytes = Int(String(args[3]))
     if len(args) > 4:
         options.infer_rows = Int(String(args[4]))
+    if len(args) > 5:
+        for name in String(args[5]).split(","):
+            options.float_columns.append(String(name))
     var r = read_csv(String(args[1]), options)
     var head = String("[")
     for c in range(r.table.columns()):

@@ -2,8 +2,8 @@
 
 Build: `bash scripts/build_mojo_pkg.sh` -> build/mxframe.mojoc. Tests: `pixi run mojo-test`.
 """
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .expr import Expr, col, lit, least, greatest
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
+from .expr import Expr, col, lit, lit_float, lit_f32, least, greatest
 from .query import (Query, QueryResult, Agg, sum, count, mean, min_of, max_of, count_distinct, percentile, median, top_k,
                     CPU, GPU, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
 from .parquet import write_parquet, read_parquet, scan_parquet, ParquetResult, ParquetScan, ParquetWriter, UNCOMPRESSED, SNAPPY, ZSTD

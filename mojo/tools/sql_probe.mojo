@@ -1,7 +1,7 @@
 # F-150: runs one SQL string over Parquet files and prints the result as typed JSON (tests/test_mojo_sql.py compares it with DuckDB).
 #
 #   sql_probe [--mode table|scan|frame|framescan] [--edits FILE] [--group auto|dense|hashed] [--dense-limit N]
-#             [--repeat N] "<SQL>" name=path.parquet [name=path.parquet ...]
+#             [--threads N] [--repeat N] "<SQL>" name=path.parquet [name=path.parquet ...]
 #
 # --mode  table: read the file whole; scan: stream it a row group at a time; frame: read it whole, then apply the edit script
 #         to a Frame over it; framescan: the same over a streamed file. The edits go to the first file.
@@ -186,6 +186,9 @@ def main() raises:
             i += 2
         elif a == "--dense-limit":
             opts.dense_limit = Int(String(args[i + 1]))
+            i += 2
+        elif a == "--threads":
+            opts.threads = Int(String(args[i + 1]))
             i += 2
         elif a == "--repeat":
             repeat = Int(String(args[i + 1]))

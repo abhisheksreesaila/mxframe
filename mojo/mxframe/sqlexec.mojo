@@ -17,11 +17,11 @@ from std.time import perf_counter_ns
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import (Program, QueryResult, _run_cpu, _run_mat, _merge_partial, _identity_partial, _ScanMask, _group_mask,
-                    OVERFLOW_MESSAGE, CPU, MAGIC, A_MIN, A_MAX, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS)
+                    OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
-from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks
+from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks, float_key
 from .sql import sql_error, EXPLAIN_NONE
 from .bind import (Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
@@ -158,7 +158,9 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int], mut ix: _Key
         for s in range(len(acc.slots)):
             var a = acc.slots[s][found]
             var b = other.slots[s][o]
-            if ops[s] == A_MIN:
+            if ops[s] >= A_FSUM:
+                acc.slots[s][found] = fold_float(ops[s], a, b)
+            elif ops[s] == A_MIN:
                 acc.slots[s][found] = min(a, b)
             elif ops[s] == A_MAX:
                 acc.slots[s][found] = max(a, b)
@@ -224,7 +226,7 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
 
     var rc = hash_aggregate[fused=False](Int(code.unsafe_ptr()), Int(consts.unsafe_ptr()), Int(set_bytes.unsafe_ptr()),
                                          Int(set_meta.unsafe_ptr()), Int(tbl.unsafe_ptr()), 1, Int(dtypes.unsafe_ptr()), nkw, n,
-                                         threads if threads > 0 else core_count(), False, keyw, _no_front, 0,
+                                         threads if threads > 0 else core_count(), sp.p.repro, keyw, _no_front, 0,
                                          LP(unsafe_from_address=Int(res.unsafe_ptr())), 0)
     _ = code^
     _ = consts^
@@ -233,7 +235,7 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
     _ = tbl^
     _ = dtypes^
     if rc == -7 or rc == E_OVERFLOW:
-        raise Error(OVERFLOW_MESSAGE)
+        raise Error(overflow_message(sp.p.has_float))
     if rc != 0:
         raise Error("the hashed group-by kernel failed with code " + String(rc))
     var out = Partial()
@@ -495,8 +497,7 @@ def _sort_keys(vc: ValCol, dicts: DictAccess) raises -> List[Int64]:
     var keys = List[Int64](length=n, fill=0)
     if vc.kind == FLOAT.value:
         for i in range(n):
-            var b = vc.v[i]
-            keys[i] = b ^ ((b >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
+            keys[i] = float_key(vc.v[i])                  # -0.0 ties with 0.0 and every NaN with every NaN, above +inf (DuckDB's order)
         return keys^
     if vc.kind == TEXT.value:
         var seen = List[Int](length=0, fill=0)
@@ -736,13 +737,14 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             var rows = acc.counts[g]
             var nonnull = rows - (acc.slots[ns][g] if ns >= 0 else 0)
             var f = sp_a.func
+            var arg_float = sp_a.arg >= 0 and q.rexprs[sp_a.arg].kind == FLOAT.value
             if sp_a.hol:                                          # the holistic states: count(DISTINCT), median, quantile_disc, min / max of TEXT
                 var present = hres.counts[h][g] > 0
                 if f == F_COUNT_DISTINCT:
                     vc.v[i] = Int64(hres.vals[h][g])
                 elif not present:
                     vc.set_null(i)
-                elif f == F_MEDIAN and sp_a.kind == FLOAT.value:
+                elif f == F_MEDIAN and sp_a.kind == FLOAT.value and not arg_float:
                     vc.v[i] = float_bits(Float64(hres.vals[h][g]) / 10.0)
                 else:
                     vc.v[i] = Int64(hres.vals[h][g])
@@ -753,11 +755,19 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             elif f == F_SUM or f == F_MIN or f == F_MAX:
                 if nonnull == 0:
                     vc.set_null(i)
+                elif arg_float and f != F_SUM:                       # NaN is above every number: MAX is NaN when there is one, MIN only when there is nothing else
+                    var nans = acc.slots[sp.agg_nan_slot[a]][g]
+                    if (f == F_MAX and nans > 0) or (f == F_MIN and nonnull - nans == 0):
+                        vc.v[i] = Int64(0x7FF8000000000000)
+                    else:
+                        vc.v[i] = Int64(acc.slots[vs][g])
                 else:
                     vc.v[i] = Int64(acc.slots[vs][g])
             elif f == F_AVG:
                 if nonnull == 0:
                     vc.set_null(i)
+                elif arg_float:                                      # a sum of doubles over the count, in doubles
+                    vc.v[i] = float_bits(Float64(from_bits=UInt64(Int64(acc.slots[vs][g]))) / Float64(nonnull))
                 else:
                     var den = UInt128(nonnull) * UInt128(Int(pow10_checked(q.rexprs[sp_a.arg].scale)))
                     vc.v[i] = float_bits(ld_div(Int64(acc.slots[vs][g]), den))
@@ -845,7 +855,7 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
             for k in range(dicts.count(c)):
                 words.append(dicts.word(c, k))
             ranks[sp.agg_src[a]] = text_ranks(words)
-    return HolStates(groups, specs^, ranks^, rows)
+    return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy())
 
 
 def _ones_mask(rows: Int) -> List[UInt8]:
@@ -1019,6 +1029,9 @@ def _hmat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
                 gp[o] = Int32(g)
                 vp[o] = vals[j]
                 o += Int((g >= 0) & (g < groups) & (valid[j] != 0))
+        if c[10] != 0:
+            for q in range(o):
+                vp[q] = float_key(vp[q])
         IP(unsafe_from_address=Int(c[4]))[base // VEC] = Int32(o)
     return True
 
@@ -1106,6 +1119,7 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
             ctl.append(0)
             ctl.append(0)
             ctl.append(0)
+            ctl.append(Int64(1 if p.src_float[s] else 0))
         ctl.append(Int64(look.nkw))
         ctl.append(Int64(Int(look.table.unsafe_ptr())))
         ctl.append(Int64(look.mask))

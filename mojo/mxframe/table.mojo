@@ -7,6 +7,7 @@ the kernels read it as an int64 column with no conversion:
   TEXT     a dictionary code (0, 1, ... in first-seen order); the words are the column's dictionary
   DATE     days since 1970-01-01
   BOOL     0 or 1
+  FLOAT    a float64's bits (F-157): `append_float`, `get_float`; -0.0, NaN payloads and subnormals are kept as given
 A null is a cleared bit in the column's validity bitmap (Arrow's layout: bit i of byte i // 8, least significant
 first); its value slot holds 0. A column with no nulls has no bitmap.
 
@@ -39,8 +40,9 @@ comptime DECIMAL = ColumnKind(1)
 comptime TEXT = ColumnKind(2)
 comptime DATE = ColumnKind(3)
 comptime BOOL = ColumnKind(4)
-comptime FLOAT = ColumnKind(5)     # a result-only kind (F-150): the value slot holds a float64's bits; AVG and `/` produce it,
-                                   # no file or Frame takes it until F-157 makes it a full column kind
+comptime FLOAT = ColumnKind(5)     # float64 (F-157): the value slot holds the float64's bits; the validity layout is the others'
+comptime F32_COLUMN = 32           # a FLOAT's `scale` when the file stored 32-bit floats (read widened to float64): SQL compares such a column with a
+                                   # literal in 32 bits, as DuckDB does (`l_discount <= 0.07` keeps the rows holding 0.07). 0 for a float64 column.
 
 
 struct Column(Movable):
@@ -107,9 +109,12 @@ struct Table(Movable):
             raise Error("column `" + name + "` already exists")
         if kind.value < 0 or kind.value > 5:
             raise Error("column `" + name + "`: unknown kind " + String(kind.value))
-        if scale < 0 or scale > 18:
+        if kind == FLOAT:
+            if scale != 0 and scale != F32_COLUMN:
+                raise Error("column `" + name + "`: a FLOAT's scale is 0 (float64) or " + String(F32_COLUMN) + " (a column the file stored as 32-bit floats)")
+        elif scale < 0 or scale > 18:
             raise Error("column `" + name + "`: scale " + String(scale) + " is outside 0..18")
-        if kind != DECIMAL and scale != 0:
+        elif kind != DECIMAL and scale != 0:
             raise Error("column `" + name + "`: only a DECIMAL has a scale")
         self.by_name[name] = len(self.cols)
         self.cols.append(Column(name, kind, scale))
@@ -161,6 +166,12 @@ struct Table(Movable):
             raise Error("column `" + col.name + "` is BOOL: " + String(value) + " is not 0 or 1")
         col.push(value, True)
 
+    def append_float(mut self, c: Int, value: Float64) raises:
+        """Appends a FLOAT value (its bits are stored as they are: -0.0 and every NaN payload keep their bits)."""
+        if self.cols[c].kind != FLOAT:
+            raise Error("column `" + self.cols[c].name + "` is " + String(self.cols[c].kind) + ", not FLOAT")
+        self.cols[c].push(Int64(value.to_bits()), True)
+
     def append_null(mut self, c: Int):
         self.cols[c].push(0, False)
 
@@ -186,6 +197,10 @@ struct Table(Movable):
     def get(self, c: Int, row: Int) -> Int64:
         """The stored value (0 for a null: ask `is_null`). Not range-checked (the hot path): c and row must exist."""
         return self.cols[c].values[row]
+
+    def get_float(self, c: Int, row: Int) -> Float64:
+        """A FLOAT cell (a null reads 0.0: ask `is_null`)."""
+        return Float64(from_bits=UInt64(self.cols[c].values[row]))
 
     def is_null(self, c: Int, row: Int) -> Bool:
         return self.cols[c].is_null(row)
@@ -246,6 +261,9 @@ struct SharedTable(ImplicitlyCopyable):
 
     def get(self, c: Int, row: Int) -> Int64:
         return self._table[].get(c, row)
+
+    def get_float(self, c: Int, row: Int) -> Float64:
+        return self._table[].get_float(c, row)
 
     def is_null(self, c: Int, row: Int) -> Bool:
         return self._table[].is_null(c, row)

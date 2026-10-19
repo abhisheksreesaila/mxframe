@@ -54,6 +54,33 @@ comptime MAX_TOPK_WORDS = 1 << 28    # groups x k a top-k state may hold (2 GiB)
 comptime SIGN = UInt64(1) << 63
 
 
+@always_inline
+def float_key(bits: Int64) -> Int64:
+    """A float64's bits as an int64 whose signed order is the float order DuckDB uses: -0.0 equal to 0.0, every NaN one value
+    above +inf, negative numbers below positive ones (F-157). Equal keys are equal values, so count distinct works on them."""
+    var x = Float64(from_bits=UInt64(bits))
+    var b = bits
+    if x != x:
+        b = Int64(0x7FF8000000000000)
+    elif x == 0.0:
+        b = 0
+    return b ^ ((b >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
+
+
+@always_inline
+def float_unkey(k: Int64) -> Int64:
+    """The float64 bits of a `float_key`."""
+    return k ^ ((k >> 63) & Int64(0x7FFFFFFFFFFFFFFF))
+
+
+def median_of_floats(lo: Float64, hi: Float64, n: Int) -> Float64:
+    """DuckDB's `median` of doubles from the two middle values of n sorted ones: the middle value for an odd n, else
+    lo * 0.5 + hi * 0.5 (its interpolation: it neither overflows for two huge values nor loses the sign of an infinity)."""
+    if n % 2 == 1:
+        return lo
+    return lo * 0.5 + hi * 0.5
+
+
 def _lp(a: Int) -> LP:
     return LP(unsafe_from_address=a)
 
@@ -970,6 +997,7 @@ struct HolStates(Movable):
     var threads: Int
     var specs: List[HolSpec]
     var ranks: List[List[Int64]]         # per source: code -> its place in the text order (empty: not text)
+    var floats: List[Bool]               # per source: its values are float64s, held as `float_key`s (the kernel hook made them)
     var unranks: List[List[Int64]]       # per source: the place -> code
     var has_distinct: List[Bool]
     var has_raw: List[Bool]
@@ -977,8 +1005,12 @@ struct HolStates(Movable):
     var raw: List[RawState]              # per source
     var topk: List[TopKState]            # per spec (k = 0 for the others)
 
-    def __init__(out self, groups: Int, var specs: List[HolSpec], var ranks: List[List[Int64]], max_rows: Int = -1) raises:
+    def __init__(out self, groups: Int, var specs: List[HolSpec], var ranks: List[List[Int64]], max_rows: Int = -1,
+                 var floats: List[Bool] = List[Bool]()) raises:
         self.groups = groups
+        while len(floats) < len(ranks):
+            floats.append(False)
+        self.floats = floats^
         self.threads = core_count()
         var nsrc = len(ranks)
         self.has_distinct = List[Bool](length=nsrc, fill=False)
@@ -1103,7 +1135,18 @@ struct HolStates(Movable):
                 for h2 in range(h):
                     if self.specs[h2].src == spec.src:
                         q += self._entries(h2)
-                if self._entries(h) == 2:
+                if self._entries(h) == 2 and self.floats[spec.src]:
+                    # a median of doubles: the middle value, or the interpolation of the two middle ones (their float bits are the answer)
+                    var m = List[Int](length=G, fill=0)
+                    for g in range(G):
+                        var n = pct_of[spec.src].counts[g]
+                        if n == 0:
+                            continue
+                        var lo = Float64(from_bits=UInt64(float_unkey(Int64(pct_of[spec.src].vals[q][g]))))
+                        var hi = Float64(from_bits=UInt64(float_unkey(Int64(pct_of[spec.src].vals[q + 1][g]))))
+                        m[g] = Int(Int64(median_of_floats(lo, hi, n).to_bits()))
+                    res.vals.append(m^)
+                elif self._entries(h) == 2:
                     # mean of the two middle values at scale + 1: 10 * (a + b) / 2 = 5 * (a + b), exact
                     var m = List[Int](length=G, fill=0)
                     for g in range(G):
@@ -1114,6 +1157,11 @@ struct HolStates(Movable):
                             raise Error("median: the middle of group " + String(g) + " is too large for its mean at one more decimal place in int64 (about 9.2e17 at the column's scale)")
                         m[g] = Int(sum * 5)
                     res.vals.append(m^)
+                elif self.floats[spec.src]:
+                    var m = pct_of[spec.src].vals[q].copy()
+                    for g in range(G):
+                        m[g] = Int(float_unkey(Int64(m[g])))
+                    res.vals.append(m^)
                 else:
                     res.vals.append(pct_of[spec.src].vals[q].copy())
                 res.counts.append(pct_of[spec.src].counts.copy())
@@ -1123,6 +1171,12 @@ struct HolStates(Movable):
                 var t = self.topk[h].finish(self._unrank(spec.src))
                 res.counts.append(self.topk[h].size.copy())
                 res.vals.append(List[Int](length=G, fill=0))
-                res.top.append(t[0].copy())
+                if self.floats[spec.src]:
+                    var tv = t[0].copy()
+                    for i in range(len(tv)):
+                        tv[i] = Int(float_unkey(Int64(tv[i])))
+                    res.top.append(tv^)
+                else:
+                    res.top.append(t[0].copy())
                 res.top_off.append(t[1].copy())
         return res^

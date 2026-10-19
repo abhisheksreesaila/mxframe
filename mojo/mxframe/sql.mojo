@@ -20,6 +20,7 @@ comptime T_INT = 3          # digits
 comptime T_DEC = 4          # digits with a point: 12.50, .5
 comptime T_STR = 5          # 'text' (quotes removed, '' unescaped)
 comptime T_SYM = 6          # ( ) , . * + - / // % = <> != < <= > >= ; :: || ? $n
+comptime T_FLT = 7          # digits with an exponent: 1e5, 2.5E-3 (a DOUBLE, as DuckDB reads it)
 
 
 @fieldwise_init
@@ -132,8 +133,13 @@ def lex_sql(text: String) raises -> List[Token]:
                 var j = i + 2
                 while j < n and _is_digit(src[j]):
                     j += 1
-                raise sql_error(l0, c0, "the number `" + _sub(src, start, j) +
-                                "` has an exponent: floating-point literals are not supported yet (FLOAT arrives with F-157)")
+                col += j - i
+                i = j
+                if i < n and _is_letter(src[i]):
+                    raise sql_error(l0, c0, "the number `" + _sub(src, start, i) + "` runs into the letters after it")
+                var fw = _sub(src, start, i)
+                out.append(Token(T_FLT, fw, fw, l0, c0))
+                continue
             if i < n and _is_letter(src[i]):
                 raise sql_error(l0, c0, "the number `" + _sub(src, start, i) + "` runs into the letters after it")
             var w = _sub(src, start, i)
@@ -216,6 +222,7 @@ comptime X_ISNULL = 11      # a; flag: IS NOT NULL
 comptime X_BETWEEN = 12     # a BETWEEN b AND c; flag: NOT BETWEEN
 comptime X_IN = 13          # a IN (items); flag: NOT IN
 comptime X_CALL = 14        # text: the function's name in upper case; items: its arguments; flag: DISTINCT; a: 1 for (*)
+comptime X_FLT = 15         # text: digits with an exponent (a DOUBLE literal)
 
 
 @fieldwise_init
@@ -290,7 +297,7 @@ struct SqlStatement(Movable):
     def render(self, e: Int) -> String:
         """The expression as SQL text (names as written, operators spaced), for column names and EXPLAIN."""
         ref x = self.exprs[e]
-        if x.kind == X_INT or x.kind == X_DEC:
+        if x.kind == X_INT or x.kind == X_DEC or x.kind == X_FLT:
             return x.text
         if x.kind == X_STR:
             return "'" + x.text.replace("'", "''") + "'"
@@ -773,7 +780,7 @@ struct _Parser(Movable):
             if t.text == "+":
                 return a
             ref x = self.st.exprs[a]
-            if x.kind == X_INT or x.kind == X_DEC:                               # -5 is one literal
+            if x.kind == X_INT or x.kind == X_DEC or x.kind == X_FLT:            # -5 is one literal
                 if x.text.byte_length() > 0 and x.text.as_bytes()[0] != UInt8(45):
                     self.st.exprs[a].text = "-" + x.text
                     self.st.exprs[a].line = t.line
@@ -796,6 +803,9 @@ struct _Parser(Movable):
         if t.kind == T_DEC:
             _ = self.advance()
             return self.node(X_DEC, t.text, -1, -1, -1, t)
+        if t.kind == T_FLT:
+            _ = self.advance()
+            return self.node(X_FLT, t.text, -1, -1, -1, t)
         if t.kind == T_STR:
             _ = self.advance()
             return self.node(X_STR, t.text, -1, -1, -1, t)

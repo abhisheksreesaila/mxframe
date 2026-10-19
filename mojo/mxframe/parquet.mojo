@@ -7,7 +7,7 @@ How MX frame's kinds are stored (any Parquet reader understands them):
   DECIMAL  INT64 with the DECIMAL(18, scale) logical type (the stored value is the scaled integer, as in memory)
   DATE     INT32 with the DATE logical type (days since 1970)
   BOOL     BOOLEAN
-  FLOAT    DOUBLE (a result-only kind: it is written, but a file with a DOUBLE column cannot be read until F-157)
+  FLOAT    DOUBLE (read: DOUBLE, and FLOAT widened to float64)
   TEXT     BYTE_ARRAY (STRING): a dictionary page with the column's words, data pages of dictionary indices
 A column with nulls is OPTIONAL: its definition levels are the validity bitmap's bits (Parquet packs them the same
 way, least significant first), written as bit-packed runs. Pages are compressed with zstd (default), snappy or not
@@ -33,7 +33,7 @@ from std.bit import pop_count, byte_swap
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
-from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
 # Parquet enums (parquet.thrift)
@@ -65,6 +65,7 @@ comptime ENC_RLE = 3
 comptime ENC_BIT_PACKED = 4
 comptime ENC_DELTA_BINARY_PACKED = 5
 comptime ENC_RLE_DICTIONARY = 8
+comptime ENC_BYTE_STREAM_SPLIT = 9
 comptime PAGE_DATA = 0
 comptime PAGE_DICTIONARY = 2
 comptime PAGE_DATA_V2 = 3
@@ -792,6 +793,10 @@ def _kind_of(leaf: _Leaf) raises -> Tuple[ColumnKind, Int]:
         return (DATE, 0)                                # a timestamp becomes its UTC day (the CSV reader's rule)
     if leaf.ptype == PT_INT32 or leaf.ptype == PT_INT64:
         return (INT, 0)
+    if leaf.ptype == PT_FLOAT:
+        return (FLOAT, F32_COLUMN)                      # widened to float64 (exact); the scale remembers the 32 bits; saved as DOUBLE
+    if leaf.ptype == PT_DOUBLE:
+        return (FLOAT, 0)
     raise Error("column `" + leaf.name + "` is " + _ptype_name(leaf.ptype) + ": MX frame has no kind for it yet")
 
 
@@ -1488,6 +1493,26 @@ def _plain_into(mut c: _Bytes, leaf: _Leaf, ctx: _Ctx, count: Int, dout: UnsafeP
             for i in range(count):
                 dout[i] = _to_stored(leaf, (p + i).load[alignment=1]())
         c.pos += count * 8
+    elif leaf.ptype == PT_DOUBLE:                         # float64 bits, stored as they are
+        if count > (c.n - c.pos) // 8:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos).bitcast[Int64]()
+        var i = 0
+        while i + 4 <= count:
+            dout.store[width=4, alignment=1](i, (p + i).load[width=4, alignment=1]())
+            i += 4
+        while i < count:
+            dout[i] = (p + i).load[alignment=1]()
+            i += 1
+        c.pos += count * 8
+    elif leaf.ptype == PT_FLOAT:                          # widened to float64 (exact), stored as its bits
+        if count > (c.n - c.pos) // 4:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var p = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos).bitcast[Float32]()
+        var q = UnsafePointer[Float64, MutAnyOrigin](unsafe_from_address=Int(dout))
+        for i in range(count):
+            q[i] = Float64((p + i).load[alignment=1]())
+        c.pos += count * 4
     elif leaf.ptype == PT_BYTE_ARRAY:
         for i in range(count):
             var n = Int(c.le(4)) & 0xFFFFFFFF
@@ -1696,6 +1721,21 @@ def _decode_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, dst: Int, tbl: Int) raise
             raise Error("column `" + leaf.name + "`: a page holds fewer values than its levels say (corrupt file)")
         for i in range(present):
             dout[i] = _to_stored(leaf, raw[i])
+    elif p.encoding == ENC_BYTE_STREAM_SPLIT and (leaf.ptype == PT_FLOAT or leaf.ptype == PT_DOUBLE):
+        # byte k of value i is stored at k * count + i (the page's non-null values): gather the bytes back, widen a FLOAT
+        var w = 4 if leaf.ptype == PT_FLOAT else 8
+        if present > (c.n - c.pos) // w:
+            raise Error("a Parquet page ends early (corrupt file)")
+        var src = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=c.base + c.pos)
+        for i in range(present):
+            var v: UInt64 = 0
+            for k in range(w):
+                v |= UInt64(src[k * present + i]) << UInt64(8 * k)
+            if w == 4:
+                dout[i] = Int64(Float64(Float32(from_bits=UInt32(v))).to_bits())
+            else:
+                dout[i] = Int64(v)
+        c.pos += present * w
     elif p.encoding == ENC_RLE and leaf.ptype == PT_BOOLEAN:
         _ = c.le(4)                                       # a length prefix
         var vals = List[Int64]()
@@ -1820,7 +1860,7 @@ def _prep_page(mut p: _Page, ctx: _Ctx, leaf: _Leaf, cut_rows: List[Int]) raises
         p.sl.pend.append(0)
         _plan_dict_cuts(c, w, present, vts, p)
     else:
-        var width = 4 if leaf.ptype == PT_INT32 else 8 if leaf.ptype == PT_INT64 else leaf.type_length
+        var width = 4 if (leaf.ptype == PT_INT32 or leaf.ptype == PT_FLOAT) else 8 if (leaf.ptype == PT_INT64 or leaf.ptype == PT_DOUBLE) else leaf.type_length
         if width < 1 or width > 16:
             raise Error("column `" + leaf.name + "` has a fixed length of " + String(width) + " bytes (corrupt file)")
         if present > (c.n - c.pos) // width:
@@ -2110,7 +2150,7 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
                 continue
             var pt = leaves[ctxs[p.ctx].leaf].ptype
             if p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY or \
-               (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED)):
+               (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED or pt == PT_FLOAT or pt == PT_DOUBLE)):
                 p.split = True
     # Two parallel rounds. A: the dictionary pages, the pages that need no dictionary (PLAIN, text that adds words) and
     # the preparation of every big page (decompress, levels, where the slices start). B: what needs a finished
@@ -2441,6 +2481,8 @@ struct ParquetScan(Copyable, Movable):
             return ("an unsigned " if _is_unsigned(leaf) else "a ") + "32-bit or narrower integer in the file: saving writes a signed 64-bit one"
         if leaf.ptype == PT_INT64 and _is_unsigned(leaf):
             return "an unsigned 64-bit integer in the file: saving writes a signed one"
+        if leaf.ptype == PT_FLOAT:
+            return "a 32-bit float in the file: saving writes a 64-bit DOUBLE (every value is kept exactly)"
         if (leaf.converted == CT_DECIMAL or leaf.logical == 5) and leaf.precision > 0 and leaf.precision != 18:
             return "DECIMAL(" + String(leaf.precision) + ", " + String(leaf.scale) + ") in the file: saving would write DECIMAL(18, " + \
                    String(leaf.scale) + ")"
@@ -2647,7 +2689,7 @@ def _open_plan(scan: ParquetScan, g: Int, cols: List[Int]) raises -> _GroupPlan:
             continue
         var pt = info.leaves[cols[p.ctx]].ptype
         var dict_coded = p.encoding == ENC_RLE_DICTIONARY or p.encoding == ENC_PLAIN_DICTIONARY
-        if not (dict_coded or (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED))):
+        if not (dict_coded or (p.encoding == ENC_PLAIN and (pt == PT_INT32 or pt == PT_INT64 or pt == PT_FIXED or pt == PT_FLOAT or pt == PT_DOUBLE))):
             p.whole = True                               # text, booleans, delta: decoded whole, copied block by block
         plan.of_col[p.ctx].append(i)
     return plan^

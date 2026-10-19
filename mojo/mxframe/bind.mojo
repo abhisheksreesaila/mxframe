@@ -8,13 +8,13 @@ The binder turns a parsed statement (`sql.mojo`) into a `BoundQuery`:
 It checks types the way DuckDB does for the subset (decimal scales aligned, a string literal read as a DATE next to a
 DATE) and raises with the position of the offending text. Nothing here reads data: the planner and the executor do.
 """
-from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .parquet import ParquetScan
 from .frame import Frame, Overlay, Formula
-from .expr import N_COL, N_LIT, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
-from .csv import days_from_civil, _days_in_month
+from .expr import N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
+from .csv import days_from_civil, _days_in_month, parse_float_text, F_OK, F_RANGE
 from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE,
-                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, EXPLAIN_NONE)
+                  X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE)
 
 comptime K_NULL = 6          # the type of a bare NULL literal
 
@@ -121,7 +121,8 @@ comptime B_MUL = 12
 comptime B_IDIV = 13         # integer division, truncating toward zero; x // 0 is NULL
 comptime B_IMOD = 14         # remainder with the dividend's sign; x % 0 is NULL
 comptime B_NEG = 15
-comptime B_DIV = 16          # `/`: a FLOAT, after aggregation only
+comptime B_DIV = 16          # `/`: a FLOAT (the operands are FLOATs before aggregation)
+comptime B_I2F = 28          # an INT or DECIMAL as a FLOAT (a = the operand, value = its decimal places), as DuckDB casts: float(v) / 10^scale
 comptime B_RESCALE = 17      # a times 10^value: the same number with `value` more decimal places
 comptime B_FDIV = 18         # a frame formula's `//`: floor division, x // 0 is 0 (the builder's rule, not SQL's)
 comptime B_FMOD = 19         # a frame formula's `%`: the divisor's sign, x % 0 is 0
@@ -292,6 +293,32 @@ def kind_name(kind: Int, scale: Int = 0) -> String:
 
 def _is_numeric(kind: Int) -> Bool:
     return kind == INT.value or kind == DECIMAL.value
+
+
+def _is_num(kind: Int) -> Bool:
+    """A number the arithmetic takes: INT, DECIMAL or FLOAT."""
+    return kind == INT.value or kind == DECIMAL.value or kind == FLOAT.value
+
+
+def decimal_to_float(v: Int64, scale: Int) -> Float64:
+    """A stored decimal as a float64, as DuckDB casts DECIMAL to DOUBLE: the integer as a double, divided by the power of ten."""
+    if scale == 0:
+        return Float64(v)
+    var p = Float64(1.0)
+    for _ in range(scale):
+        p *= 10.0                     # exact up to 10^22
+    return Float64(v) / p
+
+
+def decimal_to_f32(v: Int64, scale: Int) -> Float64:
+    """A stored decimal as a 32-bit float (widened), as DuckDB casts DECIMAL to REAL: the integer as a float32 divided by the power
+    of ten in float32 (exact for up to ten places and 24 bits of integer), else the float64 value rounded to float32."""
+    if scale <= 10 and v > -16777216 and v < 16777216:
+        var p = Float32(1.0)
+        for _ in range(scale):
+            p *= 10.0
+        return Float64(Float32(Float64(v)) / p)
+    return Float64(Float32(decimal_to_float(v, scale)))
 
 
 def date_problem(s: String) -> String:
@@ -507,22 +534,28 @@ struct _Binder(Movable):
                     stack.append(node)
             elif n.op == N_LIT:
                 stack.append(self.mk(B_LIT, INT.value, 0, -1, -1, n.value, "", ast))
+            elif n.op == N_LITF:
+                stack.append(self.mk(B_LIT, FLOAT.value, 0, -1, -1, n.value, "", ast))
+            elif n.op == N_I2F:
+                var a = stack.pop()
+                stack.append(self.mk(B_I2F, FLOAT.value, 0, a, -1, n.value, "", ast))
             elif n.op == N_SCALE_TO:
                 pass                                              # the child already holds the scaled number
             elif n.op == N_NEG:
                 var a = stack.pop()
-                stack.append(self.mk(B_NEG, INT.value, 0, a, -1, 0, "", ast))
+                stack.append(self.mk(B_NEG, self.at(a).kind, 0, a, -1, 0, "", ast))
             else:
                 var b = stack.pop()
                 var a = stack.pop()
                 var op = B_ADD if n.op == N_ADD else B_SUB if n.op == N_SUB else B_MUL if n.op == N_MUL else B_FDIV if n.op == N_FLOORDIV else \
-                         B_FMOD if n.op == N_MOD else B_LEAST if n.op == N_LEAST else B_GREATEST if n.op == N_GREATEST else -1
+                         B_FMOD if n.op == N_MOD else B_LEAST if n.op == N_LEAST else B_GREATEST if n.op == N_GREATEST else B_DIV if n.op == N_DIV else -1
                 if op < 0:
                     raise self.err(ast, "formula `" + fname + "` uses an operator SQL cannot read yet")
-                stack.append(self.mk(op, INT.value, 0, a, b, 0, "", ast))
+                var float_op = self.at(a).kind == FLOAT.value or self.at(b).kind == FLOAT.value or n.op == N_DIV
+                stack.append(self.mk(op, FLOAT.value if float_op else INT.value, 0, a, b, 0, "", ast))
         var top = stack.pop()
-        self.q.rexprs[top].kind = DECIMAL.value if fscale > 0 else INT.value
-        self.q.rexprs[top].scale = fscale
+        self.q.rexprs[top].kind = FLOAT.value if fscale < 0 else DECIMAL.value if fscale > 0 else INT.value
+        self.q.rexprs[top].scale = max(fscale, 0)
         return top
 
     # -- literals
@@ -533,6 +566,12 @@ struct _Binder(Movable):
             if not n.ok:
                 raise self.err(ast, "the number " + x.text + " does not fit: integers must fit 64 bits and decimals 18 places")
             return self.mk(B_LIT, INT.value if x.kind == X_INT else DECIMAL.value, n.scale, -1, -1, n.value, String(x.text), ast)
+        if x.kind == X_FLT:
+            var f = Float64(0.0)
+            var st = parse_float_text(x.text, f)
+            if st == F_RANGE:
+                raise self.err(ast, "the number " + x.text + " is past the largest float64 (about 1.8e308)")
+            return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(f.to_bits()), String(x.text), ast)
         if x.kind == X_STR:
             return self.mk(B_STR, TEXT.value, 0, -1, -1, 0, String(x.text), ast)
         if x.kind == X_NULL:
@@ -579,6 +618,29 @@ struct _Binder(Movable):
             b = self.rescale(b, x.scale, ast)
 
 
+    def to_float(mut self, e: Int, ast: Int, as_f32: Bool = False) raises -> Int:
+        """The operand as a FLOAT (before aggregation: after it the evaluator reads INT and DECIMAL values as floats itself). A literal
+        is folded; `as_f32`: a literal is rounded to a 32-bit float, to meet a column the file stored as one."""
+        var x = self.at(e)
+        if x.kind == FLOAT.value or self.in_post:
+            if x.kind == FLOAT.value and x.op == B_LIT and as_f32:
+                return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(Float64(Float32(Float64(from_bits=UInt64(x.value)))).to_bits()), x.text, ast)
+            return e
+        if x.op == B_LIT:
+            var f = decimal_to_f32(x.value, x.scale) if as_f32 else decimal_to_float(x.value, x.scale)
+            return self.mk(B_LIT, FLOAT.value, 0, -1, -1, Int64(f.to_bits()), x.text, ast)
+        return self.mk(B_I2F, FLOAT.value, 0, e, -1, Int64(x.scale), "", ast)
+
+    def float_pair(mut self, mut a: Int, mut b: Int, ast: Int, compare: Bool) raises:
+        """Both operands as FLOATs. Comparing a column the file stored as 32-bit floats with a literal reads the literal as a 32-bit
+        float too (DuckDB's rule: `l_discount <= 0.07` keeps the rows holding 0.07)."""
+        var x = self.at(a)
+        var y = self.at(b)
+        var f32_a = compare and x.kind == FLOAT.value and x.op == B_COL and x.scale == F32_COLUMN and y.op == B_LIT
+        var f32_b = compare and y.kind == FLOAT.value and y.op == B_COL and y.scale == F32_COLUMN and x.op == B_LIT
+        a = self.to_float(a, ast, f32_b)
+        b = self.to_float(b, ast, f32_a)
+
     def text_node(mut self, e: Int) -> Bool:
         var op = self.at(e).op
         return op == B_COL or op == B_KEY or op == B_AGG
@@ -613,8 +675,8 @@ struct _Binder(Movable):
                 raise self.err(ast, "TEXT can only be compared with a string literal (a column, a group key or MIN / MAX of one on the other side)")
         elif _is_numeric(x.kind) and _is_numeric(y.kind):
             self.align(a, b, ast)
-        elif (x.kind == FLOAT.value and (_is_numeric(y.kind) or y.kind == FLOAT.value)) or (y.kind == FLOAT.value and _is_numeric(x.kind)):
-            pass
+        elif (x.kind == FLOAT.value and _is_num(y.kind)) or (y.kind == FLOAT.value and _is_num(x.kind)):
+            self.float_pair(a, b, ast, True)
         elif x.kind == y.kind and (x.kind == DATE.value or x.kind == BOOL.value):
             pass
         else:
@@ -623,7 +685,7 @@ struct _Binder(Movable):
 
     def numeric_result(self, x: BExpr, y: BExpr, ast: Int) raises -> Bool:
         """Both operands are numbers (INT, DECIMAL or, after aggregation, FLOAT)."""
-        var ok = (_is_numeric(x.kind) or x.kind == FLOAT.value) and (_is_numeric(y.kind) or y.kind == FLOAT.value)
+        var ok = _is_num(x.kind) and _is_num(y.kind)
         if not ok and x.kind != K_NULL and y.kind != K_NULL:
             raise self.err(ast, "cannot apply `" + self.st.exprs[ast].text + "` to " + kind_name(x.kind, x.scale) + " and " + kind_name(y.kind, y.scale))
         return ok
@@ -644,19 +706,19 @@ struct _Binder(Movable):
                (op == "-" and x.kind == DATE.value and y.kind == INT.value):
                 return self.mk(B_ADD if op == "+" else B_SUB, DATE.value, 0, a, b, 0, "", ast)
             raise self.err(ast, "cannot apply `" + op + "` to " + kind_name(x.kind, x.scale) + " and " + kind_name(y.kind, y.scale))
-        if not (_is_numeric(x.kind) or x.kind == FLOAT.value) or not (_is_numeric(y.kind) or y.kind == FLOAT.value):
+        if not _is_num(x.kind) or not _is_num(y.kind):
             raise self.err(ast, "cannot apply `" + op + "` to " + kind_name(x.kind, x.scale) + " and " + kind_name(y.kind, y.scale))
-        if op == "/":
-            if not self.in_post:
-                raise self.err(ast, "`/` gives a FLOAT, which is a result-only kind until F-157: use it on aggregates, such as sum(a) / count(*)")
+        if op == "/":                                          # DuckDB's `/` is a division of doubles
+            self.float_pair(a, b, ast, False)
             return self.mk(B_DIV, FLOAT.value, 0, a, b, 0, "", ast)
         if x.kind == FLOAT.value or y.kind == FLOAT.value:
             if op == "//" or op == "%":
                 raise self.err(ast, "`" + op + "` on a FLOAT value is not supported")
+            self.float_pair(a, b, ast, False)
             return self.mk(B_ADD if op == "+" else B_SUB if op == "-" else B_MUL, FLOAT.value, 0, a, b, 0, "", ast)
         if op == "//":
             if x.kind != INT.value or y.kind != INT.value:
-                raise self.err(ast, "`//` on a DECIMAL gives a FLOAT in DuckDB, a result-only kind until F-157: use it on integers")
+                raise self.err(ast, "`//` on a DECIMAL gives a FLOAT in DuckDB (a floor of doubles), which MX frame does not do yet: use it on integers")
             return self.mk(B_IDIV, INT.value, 0, a, b, 0, "", ast)
         if op == "*":
             var scale = x.scale + y.scale
@@ -718,6 +780,10 @@ struct _Binder(Movable):
                     raise self.err(it, "cannot compare TEXT with " + kind_name(l.kind, l.scale) + " in an IN list")
                 if not self.text_node(a):
                     raise self.err(ast, "TEXT can only be tested against a list when it is a plain column")
+            elif xa.kind == FLOAT.value and _is_num(l.kind):
+                lit = self.to_float(lit, it, xa.op == B_COL and xa.scale == F32_COLUMN)
+            elif _is_numeric(xa.kind) and l.kind == FLOAT.value:
+                raise self.err(it, "an IN list with a FLOAT value needs a FLOAT on the left: " + kind_name(xa.kind, xa.scale) + " IN (a float) compares as doubles")
             elif _is_numeric(xa.kind) and _is_numeric(l.kind):
                 scale = max(scale, l.scale)
             elif xa.kind == l.kind and (xa.kind == DATE.value or xa.kind == BOOL.value):
@@ -725,8 +791,6 @@ struct _Binder(Movable):
             else:
                 raise self.err(it, "cannot compare " + kind_name(xa.kind, xa.scale) + " with " + kind_name(l.kind, l.scale) + " in an IN list")
             lits.append(lit)
-        if xa.kind == FLOAT.value:
-            raise self.err(ast, "IN on a FLOAT value is not supported")
         if xa.kind != TEXT.value and len(lits) > 40:
             raise self.err(ast, "an IN list of " + String(len(lits)) + " numbers is not supported yet: the most is 40")
         if _is_numeric(xa.kind) and scale > xa.scale:
@@ -753,7 +817,7 @@ struct _Binder(Movable):
                     self.q.pexprs[n].src = ke.src
                     return n
         var kind = x.kind
-        if kind == X_INT or kind == X_DEC or kind == X_STR or kind == X_NULL or kind == X_TRUE or kind == X_FALSE or kind == X_DATE:
+        if kind == X_INT or kind == X_DEC or kind == X_FLT or kind == X_STR or kind == X_NULL or kind == X_TRUE or kind == X_FALSE or kind == X_DATE:
             return self.literal(ast)
         if kind == X_COL:
             if self.in_post:
@@ -776,8 +840,10 @@ struct _Binder(Movable):
             var xa = self.at(a)
             if xa.op == B_NULL:
                 return a
-            if not (_is_numeric(xa.kind) or xa.kind == FLOAT.value):
+            if not _is_num(xa.kind):
                 raise self.err(ast, "cannot negate " + kind_name(xa.kind, xa.scale))
+            if xa.op == B_LIT and xa.kind == FLOAT.value:
+                return self.mk(B_LIT, FLOAT.value, xa.scale, -1, -1, Int64((-Float64(from_bits=UInt64(xa.value))).to_bits()), "-" + xa.text, ast)
             if xa.op == B_LIT:
                 if xa.value == Int64.MIN:
                     raise self.err(ast, "the number passes the int64 range")
@@ -905,18 +971,16 @@ struct _Binder(Movable):
             elif func == F_SUM:
                 if a.kind == BOOL.value:                              # DuckDB sums a BOOLEAN as 0 / 1
                     rkind = INT.value
-                elif not _is_numeric(a.kind):
+                elif not _is_num(a.kind):
                     raise self.err(x.items[0], "sum() needs numbers, found " + kind_name(a.kind, a.scale))
                 else:
                     rkind = a.kind
-                    rscale = a.scale
+                    rscale = 0 if a.kind == FLOAT.value else a.scale
             elif func == F_AVG:
-                if not _is_numeric(a.kind):
+                if not _is_num(a.kind):
                     raise self.err(x.items[0], "avg() needs numbers, found " + kind_name(a.kind, a.scale))
                 rkind = FLOAT.value
             elif func == F_MIN or func == F_MAX or func == F_QUANTILE:
-                if a.kind == FLOAT.value:
-                    raise self.err(x.items[0], name.lower() + "() of a FLOAT is not supported")
                 rkind = a.kind
                 rscale = a.scale
                 src = a.src
@@ -931,9 +995,9 @@ struct _Binder(Movable):
                 raise self.err(x.items[0], "median() of a DATE is a TIMESTAMP in DuckDB (the middle of two dates can be half a day), which MX frame has no kind for yet (F-157): use quantile_disc(" +
                                self.st.render(x.items[0]) + ", 0.5)")
             elif func == F_MEDIAN:
-                if not _is_numeric(a.kind):
+                if not _is_num(a.kind):
                     raise self.err(x.items[0], "median() needs numbers, found " + kind_name(a.kind, a.scale))
-                if a.kind == INT.value:
+                if a.kind == INT.value or a.kind == FLOAT.value:
                     rkind = FLOAT.value
                 else:
                     if a.scale + 1 > 18:
@@ -1020,8 +1084,8 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     for f in catalog.sources[src].overlay.formulas:           # a frame's formula columns are columns too
         b.formulas.append(f.copy())
         b.src_names.append(f.name)
-        b.src_kinds.append(DECIMAL.value if f.scale > 0 else INT.value)
-        b.src_scales.append(f.scale)
+        b.src_kinds.append(FLOAT.value if f.scale < 0 else DECIMAL.value if f.scale > 0 else INT.value)
+        b.src_scales.append(max(f.scale, 0))
     b.q.source = src
     b.q.text = text
     b.q.line = b.st.items[0].line
@@ -1090,8 +1154,6 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
             raise b.err(target, "GROUP BY NULL cannot be typed")
         if ke.kind == BOOL.value and ke.op != B_COL:
             raise b.err(target, "grouping by a comparison is not supported yet: group by a column")
-        if ke.kind == FLOAT.value:
-            raise b.err(target, "grouping by a FLOAT is not supported")
         b.q.keys.append(KeySpec(e, b.src_names[Int(ke.value)] if ke.op == B_COL else b.st.render(target), cn))
         b.key_canons.append(cn)
     # select items, HAVING, ORDER BY: after aggregation
