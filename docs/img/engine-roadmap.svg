@@ -1,13 +1,13 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1042" viewBox="0 0 1200 1042" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1059" viewBox="0 0 1200 1059" role="img" aria-labelledby="t d">
 <title id="t">MX frame roadmap: the path to omxcore</title>
 <desc id="d">Vision: DuckDB-class SQL that uses your GPU and links into any app with no Python. Plug and play with the CSV and Parquet files you already have. What omxcore can be: A faster drop-in for DuckDB; GPU-native analytics on one machine; An embedded engine for apps; The data engine for AI agents; The compute half of a lakehouse; Live dataframes for simulation; ML data prep. The path: 1. SQL and joins, then the TPC-H 22 gate (we are here); 2. Quiet-machine scoreboard; 3. Close the gaps; 4. omxcore 0.7.0; 5. Agent-native plugins; 6. Bigger than RAM, the long tail. Built for agents (plugins on the core · planned · m10, after 0.7.0): Plug and play: point it at your CSV and Parquet files. mx (today): speaks JSON, starts in 12 ms, no Python; Vector search, GPU-native (planned): embeddings beside your data; nearest-k with SQL filters in one query; Agent search (planned): keyword + vector + SQL in one ranked call, with why each row matched; Classification and decision API (planned): label or route rows, batched on the GPU; MCP server (with 0.7.0): every agent gets sql / explain / schema / search as tools; Agent memory (planned): facts with time and source, queried like any table.</desc>
 <defs>
   <pattern id="rule" width="24" height="24" patternUnits="userSpaceOnUse"><path d="M0 23.5H24" stroke="#D8D0C2" stroke-opacity=".45"/></pattern>
-  <clipPath id="clip"><rect width="1200" height="1042" rx="18"/></clipPath>
+  <clipPath id="clip"><rect width="1200" height="1059" rx="18"/></clipPath>
 </defs>
 <g clip-path="url(#clip)">
-<rect width="1200" height="1042" fill="#F2EFE7"/>
-<rect y="72" width="1200" height="1042" fill="url(#rule)"/>
+<rect width="1200" height="1059" fill="#F2EFE7"/>
+<rect y="72" width="1200" height="1059" fill="url(#rule)"/>
 <text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">M<tspan fill="#6C3E78">X</tspan> FRAME</text>
 <text x="206.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="start" letter-spacing="3">THE ROADMAP · SOON OMXCORE</text>
 <text x="1144.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1">docs/briefs/positioning.md</text>
@@ -50,9 +50,10 @@
 <text x="56.0" y="584.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">gate</text>
 <text x="56.0" y="605.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">done: SQL, row queries,</text>
 <text x="56.0" y="622.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">inner / left / semi / anti</text>
-<text x="56.0" y="639.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">joins</text>
-<text x="56.0" y="656.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#6E716A" text-anchor="start">building: multi-table</text>
-<text x="56.0" y="673.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#6E716A" text-anchor="start">planner and expressions</text>
+<text x="56.0" y="639.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">and 3–9-table joins with a</text>
+<text x="56.0" y="656.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">planner, expressions</text>
+<text x="56.0" y="673.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#6E716A" text-anchor="start">building: joins over</text>
+<text x="56.0" y="690.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#6E716A" text-anchor="start">streamed files and CTEs</text>
 <circle cx="247.33333333333334" cy="492" r="7" fill="#FFFDF8" stroke="#BEB4A4" stroke-width="2"/>
 <text x="237.3" y="526.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" text-anchor="start">2 · F-166</text>
 <text x="237.3" y="548.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Quiet-machine</text>
@@ -84,52 +85,52 @@
 <text x="962.7" y="566.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">the long tail</text>
 <text x="962.7" y="587.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">joins that spill to disk,</text>
 <text x="962.7" y="604.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">and the SQL long tail</text>
-<rect x="32" y="710" width="1136" height="282" rx="16" fill="#6C3E78" fill-opacity=".07" stroke="#6C3E78" stroke-opacity=".35"/>
-<path d="M440 734V968" stroke="#6C3E78" stroke-opacity=".3"/>
-<text x="56.0" y="762.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="34" font-weight="400" fill="#20221F" text-anchor="start" font-style="italic">Built for agents</text>
-<text x="56.0" y="788.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="1">PLUGINS ON THE CORE · PLANNED · M10, AFTER 0.7.0</text>
-<text x="56.0" y="824.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#20221F" text-anchor="start">Plug and play: point it at your</text>
-<text x="56.0" y="847.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#20221F" text-anchor="start">CSV and Parquet files</text>
-<text x="56.0" y="874.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4C5049" text-anchor="start">Query, search or classify a file or folder. No</text>
-<text x="56.0" y="892.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4C5049" text-anchor="start">import, no new format, nothing to convert; vectors</text>
-<text x="56.0" y="910.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4C5049" text-anchor="start">are just a column in the same Parquet file.</text>
-<text x="56.0" y="936.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#6E716A" text-anchor="start">The core never learns about agents: it gains vectors,</text>
-<text x="56.0" y="952.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#6E716A" text-anchor="start">a top-k distance kernel and UDFs; agent features live</text>
-<text x="56.0" y="968.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#6E716A" text-anchor="start">in plugins.</text>
-<rect x="470.0" y="746" width="51" height="20" rx="10" fill="#18704F"/>
-<text x="495.5" y="760.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#FFFDF8" text-anchor="middle" letter-spacing="0.6">TODAY</text>
-<text x="470.0" y="788.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">mx</text>
-<text x="470.0" y="806.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">speaks JSON, starts in 12 ms, no</text>
-<text x="470.0" y="823.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">Python</text>
-<rect x="695.1666666666666" y="746.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
-<text x="746.6" y="760.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
-<text x="694.7" y="788.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Vector search, GPU-native</text>
-<text x="694.7" y="806.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">embeddings beside your data;</text>
-<text x="694.7" y="823.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">nearest-k with SQL filters in one</text>
-<text x="694.7" y="840.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">query</text>
-<rect x="919.8333333333333" y="746.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
-<text x="971.2" y="760.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
-<text x="919.3" y="788.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Agent search</text>
-<text x="919.3" y="806.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">keyword + vector + SQL in one</text>
-<text x="919.3" y="823.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">ranked call, with why each row</text>
-<text x="919.3" y="840.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">matched</text>
-<rect x="470.5" y="858.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
-<text x="521.9" y="872.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
-<text x="470.0" y="900.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Classification and</text>
-<text x="470.0" y="918.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">decision API</text>
-<text x="470.0" y="936.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">label or route rows, batched on</text>
-<text x="470.0" y="953.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">the GPU</text>
-<rect x="695.1666666666666" y="858.5" width="84" height="19" rx="9.5" fill="none" stroke="#6C3E78" stroke-dasharray="0"/>
-<text x="736.7" y="872.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6C3E78" text-anchor="middle" letter-spacing="0.6">WITH 0.7.0</text>
-<text x="694.7" y="900.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">MCP server</text>
-<text x="694.7" y="918.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">every agent gets sql / explain /</text>
-<text x="694.7" y="935.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">schema / search as tools</text>
-<rect x="919.8333333333333" y="858.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
-<text x="971.2" y="872.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
-<text x="919.3" y="900.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Agent memory</text>
-<text x="919.3" y="918.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">facts with time and source,</text>
-<text x="919.3" y="935.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">queried like any table</text>
-<text x="56.0" y="1022.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">informal timings: shared machine, see docs/mojo-engine.md · plugins are planned, not built</text>
+<rect x="32" y="727" width="1136" height="282" rx="16" fill="#6C3E78" fill-opacity=".07" stroke="#6C3E78" stroke-opacity=".35"/>
+<path d="M440 751V985" stroke="#6C3E78" stroke-opacity=".3"/>
+<text x="56.0" y="779.0" font-family="Georgia, 'Times New Roman', Times, serif" font-size="34" font-weight="400" fill="#20221F" text-anchor="start" font-style="italic">Built for agents</text>
+<text x="56.0" y="805.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="1">PLUGINS ON THE CORE · PLANNED · M10, AFTER 0.7.0</text>
+<text x="56.0" y="841.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#20221F" text-anchor="start">Plug and play: point it at your</text>
+<text x="56.0" y="864.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700" fill="#20221F" text-anchor="start">CSV and Parquet files</text>
+<text x="56.0" y="891.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4C5049" text-anchor="start">Query, search or classify a file or folder. No</text>
+<text x="56.0" y="909.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4C5049" text-anchor="start">import, no new format, nothing to convert; vectors</text>
+<text x="56.0" y="927.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13" font-weight="400" fill="#4C5049" text-anchor="start">are just a column in the same Parquet file.</text>
+<text x="56.0" y="953.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#6E716A" text-anchor="start">The core never learns about agents: it gains vectors,</text>
+<text x="56.0" y="969.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#6E716A" text-anchor="start">a top-k distance kernel and UDFs; agent features live</text>
+<text x="56.0" y="985.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="11.5" font-weight="400" fill="#6E716A" text-anchor="start">in plugins.</text>
+<rect x="470.0" y="763" width="51" height="20" rx="10" fill="#18704F"/>
+<text x="495.5" y="777.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#FFFDF8" text-anchor="middle" letter-spacing="0.6">TODAY</text>
+<text x="470.0" y="805.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">mx</text>
+<text x="470.0" y="823.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">speaks JSON, starts in 12 ms, no</text>
+<text x="470.0" y="840.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">Python</text>
+<rect x="695.1666666666666" y="763.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
+<text x="746.6" y="777.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
+<text x="694.7" y="805.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Vector search, GPU-native</text>
+<text x="694.7" y="823.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">embeddings beside your data;</text>
+<text x="694.7" y="840.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">nearest-k with SQL filters in one</text>
+<text x="694.7" y="857.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">query</text>
+<rect x="919.8333333333333" y="763.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
+<text x="971.2" y="777.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
+<text x="919.3" y="805.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Agent search</text>
+<text x="919.3" y="823.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">keyword + vector + SQL in one</text>
+<text x="919.3" y="840.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">ranked call, with why each row</text>
+<text x="919.3" y="857.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">matched</text>
+<rect x="470.5" y="875.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
+<text x="521.9" y="889.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
+<text x="470.0" y="917.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Classification and</text>
+<text x="470.0" y="935.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">decision API</text>
+<text x="470.0" y="953.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">label or route rows, batched on</text>
+<text x="470.0" y="970.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">the GPU</text>
+<rect x="695.1666666666666" y="875.5" width="84" height="19" rx="9.5" fill="none" stroke="#6C3E78" stroke-dasharray="0"/>
+<text x="736.7" y="889.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6C3E78" text-anchor="middle" letter-spacing="0.6">WITH 0.7.0</text>
+<text x="694.7" y="917.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">MCP server</text>
+<text x="694.7" y="935.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">every agent gets sql / explain /</text>
+<text x="694.7" y="952.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">schema / search as tools</text>
+<rect x="919.8333333333333" y="875.5" width="104" height="19" rx="9.5" fill="none" stroke="#6E716A" stroke-dasharray="3 2"/>
+<text x="971.2" y="889.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10" font-weight="700" fill="#6E716A" text-anchor="middle" letter-spacing="0.6">PLANNED · M10</text>
+<text x="919.3" y="917.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="15" font-weight="700" fill="#20221F" text-anchor="start">Agent memory</text>
+<text x="919.3" y="935.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">facts with time and source,</text>
+<text x="919.3" y="952.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="12.5" font-weight="400" fill="#4C5049" text-anchor="start">queried like any table</text>
+<text x="56.0" y="1039.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="400" fill="#6E716A" text-anchor="start">informal timings: shared machine, see docs/mojo-engine.md · plugins are planned, not built</text>
 </g>
-<rect x=".5" y=".5" width="1199" height="1041" rx="18" fill="none" stroke="#BEB4A4"/>
+<rect x=".5" y=".5" width="1199" height="1058" rx="18" fill="none" stroke="#BEB4A4"/>
 </svg>
