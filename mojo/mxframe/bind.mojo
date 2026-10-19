@@ -538,10 +538,24 @@ struct _Binder(Movable):
         if x.text2.byte_length() > 0:
             var q = lower_ascii(x.text2)
             var tab = -1
-            for t in range(len(self.tab_names)):
-                if q == lower_ascii(self.tab_names[t]) or (self.tab_alias[t].byte_length() > 0 and q == lower_ascii(self.tab_alias[t])):
-                    tab = t
-                    break
+            if self.inner_first and self.in_on and len(self.tab_names) > 1:
+                # a subquery's condition: names resolve innermost scope first. A qualifier is the subquery table's when it is that table's alias, or its name
+                # when it has no alias; only then the outer table's (`#0` and `#1` are the binder's own handles for the two sides)
+                if q == "#0":
+                    tab = 0
+                elif q == "#1":
+                    tab = 1
+                else:
+                    for t in [1, 0]:
+                        var shown = lower_ascii(self.tab_alias[t]) if self.tab_alias[t].byte_length() > 0 else lower_ascii(self.tab_names[t])
+                        if q == shown:
+                            tab = t
+                            break
+            if tab < 0:
+                for t in range(len(self.tab_names)):
+                    if q == lower_ascii(self.tab_names[t]) or (self.tab_alias[t].byte_length() > 0 and q == lower_ascii(self.tab_alias[t])):
+                        tab = t
+                        break
             if tab < 0 or (left_only and tab == 1):
                 return (-1, 1)
             lo = self.tab_start[tab]
@@ -1416,13 +1430,6 @@ def _lift_subquery(mut st: SqlStatement, catalog: Catalog) raises:
         st.join_kind = JK_ANTI_NA if neg else JK_SEMI
     else:
         st.join_kind = JK_ANTI if neg else JK_SEMI
-    if lower_ascii(sub.table) == lower_ascii(st.table):
-        # a subquery over the same table: the two sides need names. The outer side keeps its alias, or is called by the table's name (so `t.k` means the
-        # outer row inside the subquery, as in SQL); the subquery keeps its alias, or gets an internal one
-        if st.table_alias.byte_length() == 0:
-            st.table_alias = st.table
-        if sub.alias.byte_length() == 0:
-            sub.alias = "_sub_" + sub.table
     st.has_right = True
     st.right_table = sub.table
     st.right_alias = sub.alias
@@ -1434,11 +1441,16 @@ def _lift_subquery(mut st: SqlStatement, catalog: Catalog) raises:
     if x.kind == X_SUBIN:
         if sub.sel < 0:
             raise sql_error(sub.line, sub.col, "IN (SELECT *) needs one column: name it")
-        # each side of the equality names its own table: the outer expression's bare column is the outer table's, the subquery's column the subquery's
-        if st.exprs[x.a].kind == X_COL and st.exprs[x.a].text2.byte_length() == 0:
-            st.exprs[x.a].text2 = st.table_alias if st.table_alias.byte_length() > 0 else st.table
-        if st.exprs[sub.sel].kind == X_COL and st.exprs[sub.sel].text2.byte_length() == 0:
-            st.exprs[sub.sel].text2 = sub.alias if sub.alias.byte_length() > 0 else sub.table
+        # each side of the equality is bound to its own table by the binder's handles `#0` (outer) and `#1` (subquery), whatever the two tables are called
+        # (a qualifier the user wrote that names neither table is left to be reported)
+        var outer_shown = lower_ascii(st.table_alias) if st.table_alias.byte_length() > 0 else lower_ascii(st.table)
+        var inner_shown = lower_ascii(sub.alias) if sub.alias.byte_length() > 0 else lower_ascii(sub.table)
+        if st.exprs[x.a].kind == X_COL and (st.exprs[x.a].text2.byte_length() == 0 or lower_ascii(st.exprs[x.a].text2) == outer_shown or
+                                            lower_ascii(st.exprs[x.a].text2) == lower_ascii(st.table)):
+            st.exprs[x.a].text2 = "#0"
+        if st.exprs[sub.sel].kind == X_COL and (st.exprs[sub.sel].text2.byte_length() == 0 or lower_ascii(st.exprs[sub.sel].text2) == inner_shown or
+                                                lower_ascii(st.exprs[sub.sel].text2) == lower_ascii(sub.table)):
+            st.exprs[sub.sel].text2 = "#1"
         st.exprs.append(SqlExpr(X_BIN, "=", String(), x.a, sub.sel, -1, List[Int](), False, x.line, x.col))
         parts.append(len(st.exprs) - 1)
     _split_and_expr(st, sub.where, parts)
@@ -1475,9 +1487,9 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
         if len(catalog.sources[src].overlay.formulas) > 0 or len(catalog.sources[src2].overlay.formulas) > 0:
             raise sql_error(st.right_line, st.right_col, "a join over a frame's formula columns is not supported yet: bake the formulas first")
         var same = lower_ascii(catalog.sources[src].name) == lower_ascii(catalog.sources[src2].name)
-        if same and (st.table_alias.byte_length() == 0 or st.right_alias.byte_length() == 0 or lower_ascii(st.table_alias) == lower_ascii(st.right_alias)):
+        if same and not st.from_subquery and (st.table_alias.byte_length() == 0 or st.right_alias.byte_length() == 0 or lower_ascii(st.table_alias) == lower_ascii(st.right_alias)):
             raise sql_error(st.right_line, st.right_col, "joining `" + catalog.sources[src].name + "` with itself needs a different alias for each side (FROM t a JOIN t b ...)")
-        if not same and st.table_alias.byte_length() > 0 and lower_ascii(st.table_alias) == lower_ascii(st.right_alias):
+        if not same and not st.from_subquery and st.table_alias.byte_length() > 0 and lower_ascii(st.table_alias) == lower_ascii(st.right_alias):
             raise sql_error(st.right_line, st.right_col, "the alias `" + st.right_alias + "` is used for both tables")
     var b = _Binder(st^)
     b.jkind = b.st.join_kind
