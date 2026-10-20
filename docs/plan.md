@@ -1672,3 +1672,26 @@ Owner: "if you want the absolute best performance, we ship Omarchy Linux with th
 - [ ] build tuning: profile-guided optimisation and post-link layout, native CPU targets per release
 - [ ] an Omarchy package: a tuned profile (performance governor, transparent huge pages, isolated cores), kernel flags, GPU drivers with GPUDirect Storage, so omxcore runs at full speed out of the box
 - [ ] later, a business decision: a reference box (NVMe + GPU + Omarchy + omxcore) as a data appliance
+
+## App requests (omxplorer, GitHub issues #6-#18, 2026-10-20): generic engine features; app-only parts stay in the app or a plugin
+
+## F-175 Background queries: a handle, done / callback, cancel, progress [todo] (mxframe #6)
+- [ ] start a query (builder, SQL, scan, frame) off the caller's thread and get a handle: `poll()` / `wait()` / an optional completion callback, `cancel()` (checked between morsels / row groups / blocks, no partial result), `progress()` (rows done of rows, per stage); CSV / Parquet open and save as jobs too; cancelling frees everything (lifetime lint); equal results to the synchronous call
+
+## F-176 Range aggregates and block reads over a sort order [todo] (mxframe #8, #9)
+- [ ] sum / count / mean / min / max over rows a..b of a permutation (or a row list) for a set of columns, exact at each column's scale, without per-cell calls
+- [ ] read rows a..b (in a permutation) of n columns in one call: typed values and null flags into caller buffers
+
+## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [todo] (mxframe #10, #11)
+- [ ] `stddev` / `stddev_pop` / `variance` / `var_pop` per group and whole column, as DuckDB (numerically stable, float result); quantile bins (`ntile`-style edges from exact quantiles) as group keys; ISO week and ISO year
+
+## F-178 Streamed CSV [todo] (mxframe #13)
+- [ ] a CSV bigger than memory queried a block at a time (the scan model of F-140 / F-149), types inferred from a sample with a failed-row report; edits and save over it as F-147
+
+## F-179 Undo that covers formula columns [todo] (mxframe #15)
+- [ ] adding, changing or removing a formula is an undo step in the Frame's edit log (one log for cells, merges and formulas)
+
+## F-180 Compressed Parquet writes on every platform [todo] (mxframe #16)
+- [ ] zstd (and snappy) built into the package for macOS and other no-codec targets (vendored static C sources or a Mojo port), so `.omx` files are compressed everywhere; the Mac link check stays green
+
+Mapped to existing tickets: #7 result cache → F-160; #12 count distinct / median on the GPU and streamed in parallel, approximate or spilling → F-167 (+ F-163 for spill); #14 sort that spills (multi-key sort exists since F-152) → F-167 / F-163; #17 window functions → F-168; #18 versions and the time machine → M9 (parked, Delta-Lake style).
