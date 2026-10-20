@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>MXFrame — Query to GPU Kernel</title>
+  <title>omxcore — Query to GPU Kernel</title>
   <link rel="icon" href="mx-spark.svg" type="image/svg+xml" />
   <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
@@ -894,7 +894,7 @@ function getSteps(qid) {
   return [
     {
       label:"The Query",
-      desc:"You write a Polars-style lazy DataFrame API. No SQL, no schema declarations — MXFrame infers the plan.",
+      desc:"You write a Polars-style lazy DataFrame API. No SQL, no schema declarations — omxcore infers the plan.",
       code: 0,                // show no lines yet (act as intro)
       nodeIds: [],
       dispatchCount: 0,
@@ -942,7 +942,7 @@ function getSteps(qid) {
     },
     {
       label:"Result in Python",
-      desc:`Done! ${q.result.rows} row${q.result.rows!==1?"s":""} returned as a PyArrow table. MXFrame did the heavy lifting on GPU.`,
+      desc:`Done! ${q.result.rows} row${q.result.rows!==1?"s":""} returned as a PyArrow table. omxcore did the heavy lifting on GPU.`,
       code: q.code.length,
       nodeIds: allNodeIds,
       dispatchCount: q.dispatch.length,
@@ -972,9 +972,9 @@ function App() {
         padding:"14px 28px", display:"flex", alignItems:"center", gap:20, flexWrap:"wrap"
       }}>
         <div style={{display:"flex",alignItems:"center"}}>
-          <img src="mx-spark.svg" alt="MXFrame" width="34" height="34" style={{marginRight:9}} />
+          <img src="mx-spark.svg" alt="omxcore" width="34" height="34" style={{marginRight:9}} />
           <span style={{fontWeight:900, fontSize:20, color:"#00ff88", letterSpacing:1}}>
-            MXFrame
+            omxcore
           </span>
           <span style={{fontSize:13, color:"#8b949e", marginLeft:10}}>
             Query → Logical Plan → GPU Kernel

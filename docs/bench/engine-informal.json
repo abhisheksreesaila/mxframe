@@ -3,7 +3,7 @@
   "caveat": "Informal: a shared 12-core / 24-thread Ryzen with an RTX 3090 while other work ran (load 2 to 10), best or median of a few runs, DuckDB 1.5.1 and pyarrow on the same files in the same minute. The quiet-machine scoreboard has not been run yet.",
   "caveat_short": "informal timings: shared 12-core Ryzen + RTX 3090, other work running; quiet-machine scoreboard not run yet",
   "vision": "The Mojo engine is the core: it links into any app the way SQLite does, and aims to beat DuckDB and Polars on CPU and GPU. Python and apps are plugins.",
-  "vision_short": "A data engine kernel in Mojo. Apps and agents build on it; Python is a plugin.",
+  "vision_short": "A compute engine (CPU and GPU) with persistence to open Parquet files, in Mojo. Apps and agents build on it; Python is a plugin.",
   "headline": [
     {
       "ref": [
@@ -491,9 +491,9 @@
       },
       {
         "id": "omxcore",
-        "tag": "F-165 · F-169",
+        "tag": "F-169",
         "title": "omxcore 0.7.0",
-        "detail": "the rename, plus an MCP server so agents reach for it first"
+        "detail": "an MCP server so agents reach for it first (the rename is done)"
       },
       {
         "id": "agents",

@@ -127,7 +127,7 @@ def hero_paper(data):
 <rect y="72" width="{W}" height="{H - 72}" fill="url(#rule)"/>''']
     x = 56
     b.append(f'<text x="{x}" y="46" font-family="{MONO}" font-size="16" font-weight="800" letter-spacing="5" fill="{t["text"]}">'
-             f'M<tspan fill="{t["accent"]}">X</tspan> FRAME</text>')
+             f'OM<tspan fill="{t["accent"]}">X</tspan>CORE</text>')
     b.append(text(x + 150, 46, "THE MOJO ENGINE", 12, t["dim"], MONO, 700, ls=3))
     b.append(text(W - 56, 46, "INFORMAL NUMBERS · SHARED MACHINE", 12, t["dim"], MONO, 700, "end", ls=2))
     b.append(f'<path d="M{x} 64H{W - 56}" stroke="{t["text"]}" stroke-width="1.5"/>')
@@ -171,7 +171,7 @@ def chart(theme, title, subtitle, legend, rows, scale, ticks, footer, value_col=
     heights = [max(len(r["bars"]) * step + 16, 52 if r.get("sub") else 0) for r in rows]
     H = head + sum(heights) + 58
     b = [f'<rect x=".5" y=".5" width="{W - 1}" height="{H - 1}" rx="14" fill="{t["surface"]}" stroke="{t["border_hi"]}"/>',
-         text(LX, 36, "// MX FRAME · THE MOJO ENGINE", 11, t["accent"], MONO, 700, ls=2),
+         text(LX, 36, "// OMXCORE · THE MOJO ENGINE", 11, t["accent"], MONO, 700, ls=2),
          text(LX, 64, title, 21, t["text"], SANS, 700),
          text(LX, 86, subtitle, 12, t["dim"], MONO)]
     lx = LX
@@ -297,7 +297,7 @@ def paper_frame(t, W, H, kicker, right):
 <rect width="{W}" height="{H}" fill="{t['bg']}"/>
 <rect y="72" width="{W}" height="{H}" fill="url(#rule)"/>''',
             f'<text x="56" y="46" font-family="{MONO}" font-size="16" font-weight="800" letter-spacing="5" fill="{t["text"]}">'
-            f'M<tspan fill="{t["accent"]}">X</tspan> FRAME</text>',
+            f'OM<tspan fill="{t["accent"]}">X</tspan>CORE</text>',
             text(206, 46, kicker, 12, t["dim"], MONO, 700, ls=3),
             text(W - 56, 46, right, 12, t["dim"], MONO, 700, "end", ls=1),
             f'<path d="M56 64H{W - 56}" stroke="{t["text"]}" stroke-width="1.5"/>']
@@ -399,7 +399,7 @@ def roadmap(data):
     b += band
     H = int(by + bh + 50)
     b.append(text(X0, H - 20, "informal timings: shared machine, see docs/mojo-engine.md · plugins are planned, not built", 11, t["dim"], MONO))
-    head = paper_frame(t, W, H, f"THE ROADMAP · SOON {rm['name'].upper()}", rm["source"])
+    head = paper_frame(t, W, H, f"THE ROADMAP · {rm['name'].upper()}", rm["source"])
     body = paper_close(t, W, H, head + b)
     desc = (f"Vision: {rm['vision']}. {rm['vision_2']}. What {rm['name']} can be: " + "; ".join(rm["can_be"]) + ". The path: " +
             "; ".join(f"{i + 1}. {s['title']}" + (" (we are here)" if i == now else "") for i, s in enumerate(steps)) +

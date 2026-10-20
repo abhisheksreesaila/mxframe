@@ -8,7 +8,7 @@
 <g clip-path="url(#clip)">
 <rect width="1200" height="402" fill="#F2EFE7"/>
 <rect y="72" width="1200" height="402" fill="url(#rule)"/>
-<text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">M<tspan fill="#6C3E78">X</tspan> FRAME</text>
+<text x="56" y="46" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="16" font-weight="800" letter-spacing="5" fill="#20221F">OM<tspan fill="#6C3E78">X</tspan>CORE</text>
 <text x="206.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="start" letter-spacing="3">UNDER THE HOOD</text>
 <text x="1144.0" y="46.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="700" fill="#6E716A" text-anchor="end" letter-spacing="1">docs/briefs/positioning.md</text>
 <path d="M56 64H1144" stroke="#20221F" stroke-width="1.5"/>

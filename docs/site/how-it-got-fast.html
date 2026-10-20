@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How MXFrame got fast</title>
+<title>How omxcore got fast</title>
 <meta name="description" content="The CPU engine's optimizations one at a time: what was slow, what changed, the before and after numbers, and which wins come from Mojo and which are ordinary engineering.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -40,10 +40,10 @@
 <div class="shell">
 <nav class="side"></nav>
 <main>
-  <div class="read"><b>What you're looking at</b>The story of the CPU engine, one optimization at a time. The chart shows the total time of all 22 TPC-H queries after each milestone, with Polars and DuckDB as flat reference lines (lower is faster). Hover a dot for the milestone, its total and the benchmark file it came from; click it to jump to that optimization's card. Each card says what was slow, what the engine does now, the before and after numbers with where they come from, and whether the win relies on a Mojo feature or is ordinary engineering. Totals are computed in your browser from the CSV files in <a href="https://github.com/abhisheksreesaila/mxframe/tree/main/docs/bench">docs/bench</a>; numbers on the cards are quoted from <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/optimizations.md">docs/optimizations.md</a>.</div>
+  <div class="read"><b>What you're looking at</b>The story of the CPU engine, one optimization at a time. The chart shows the total time of all 22 TPC-H queries after each milestone, with Polars and DuckDB as flat reference lines (lower is faster). Hover a dot for the milestone, its total and the benchmark file it came from; click it to jump to that optimization's card. Each card says what was slow, what the engine does now, the before and after numbers with where they come from, and whether the win relies on a Mojo feature or is ordinary engineering. Totals are computed in your browser from the CSV files in <a href="https://github.com/abhisheksreesaila/omxcore/tree/main/docs/bench">docs/bench</a>; numbers on the cards are quoted from <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/optimizations.md">docs/optimizations.md</a>.</div>
 
   <span class="kick">// the optimization story</span>
-  <h1>How MXFrame got fast</h1>
+  <h1>How omxcore got fast</h1>
   <p>The same 22 TPC-H queries, run again after every optimization: each in a fresh Python process, data already in memory, no warm-up, the clock covering only the query and its materialized result, every result checked against DuckDB. The page is also an argument that Mojo is a good language for a data engine, so each card says which Mojo feature it relies on, and says so plainly when the win is ordinary engineering that any language would get.</p>
 
   <h2>Progress, milestone by milestone</h2>
@@ -63,7 +63,7 @@
       </details>
     </div>
   </div>
-  <p style="font-size:13px">Polars and DuckDB are drawn from the latest run (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>), the same as the progress chart in the README; MXFrame is measured at each milestone. Earlier runs of DuckDB included DuckDB's own pyarrow import (see the F-044 card), which is why the reference lines are not taken from the early files.</p>
+  <p style="font-size:13px">Polars and DuckDB are drawn from the latest run (<a href="bench/m2s-engine.csv">m2s-engine.csv</a>), the same as the progress chart in the README; omxcore is measured at each milestone. Earlier runs of DuckDB included DuckDB's own pyarrow import (see the F-044 card), which is why the reference lines are not taken from the early files.</p>
 
   <h2>Which Mojo features the engine uses</h2>
   <div class="card"><div class="card-b" style="padding:6px 16px">
@@ -84,9 +84,9 @@
   </div>
   <div class="grid" id="cards"></div>
 
-  <h2>Per query: where MXFrame beats DuckDB</h2>
+  <h2>Per query: where omxcore beats DuckDB</h2>
   <div class="card">
-    <div class="card-h">MXFrame speed against DuckDB, per TPC-H query · log scale · before and after the latest milestone</div>
+    <div class="card-h">omxcore speed against DuckDB, per TPC-H query · log scale · before and after the latest milestone</div>
     <div class="card-b">
       <div class="btns" id="pq-btns" role="group" aria-label="Scale factor">
         <button class="btn on" type="button" data-sf="10">SF10</button>
@@ -101,12 +101,12 @@
       </details>
     </div>
   </div>
-  <p style="font-size:13px">A dot to the right of the 1x line means MXFrame was faster than DuckDB on that query. "Before" is the F-043 run, "after" is the F-046 run; each run measured MXFrame and DuckDB together in one session. Speed is DuckDB's time divided by MXFrame's time.</p>
+  <p style="font-size:13px">A dot to the right of the 1x line means omxcore was faster than DuckDB on that query. "Before" is the F-043 run, "after" is the F-046 run; each run measured omxcore and DuckDB together in one session. Speed is DuckDB's time divided by omxcore's time.</p>
 
   <h2>Read these numbers honestly</h2>
   <ul>
-    <li><b>The lead over DuckDB rests on Q21.</b> Leaving it out, DuckDB's SF10 total is lower than MXFrame's (the per-query chart above shows how many queries DuckDB still wins). Q21 benefits from TPC-H's stored order.</li>
-    <li><b>Engine-only is the headline.</b> Loading data is outside the clock. MXFrame still reads Parquet through PyArrow, which the user-felt scoreboard in the benchmarks document includes.</li>
+    <li><b>The lead over DuckDB rests on Q21.</b> Leaving it out, DuckDB's SF10 total is lower than omxcore's (the per-query chart above shows how many queries DuckDB still wins). Q21 benefits from TPC-H's stored order.</li>
+    <li><b>Engine-only is the headline.</b> Loading data is outside the clock. omxcore still reads Parquet through PyArrow, which the user-felt scoreboard in the benchmarks document includes.</li>
     <li><b>Not every win is Mojo.</b> Cards badged "plain engineering" are algorithms or fixed costs any engine could fix. The Mojo-specific part is everything that loops over rows, compiled ahead of time from code that reads like Python.</li>
     <li><b>SF1 queries take a few milliseconds,</b> so single SF1 figures can move by 10 to 20 percent between runs.</li>
   </ul>
@@ -200,7 +200,7 @@
     {"id": "m2f", "tag": "M2f", "section": "M2f", "title": "Not importing pyarrow.compute",
      "badges": [{"kind": "plain"}],
      "slow": "Importing <code>pyarrow.compute</code> costs about 22 ms per process (a docstring for each of roughly 270 functions). Arrow's own methods, such as <code>Array.cast</code> and <code>Table.filter</code>, import it as a side effect, so 15 of the 22 queries paid that inside their first run.",
-     "now": "MXFrame calls Arrow's compute core directly.",
+     "now": "omxcore calls Arrow's compute core directly.",
      "nums": [{"label": "Q17, SF1", "before": "41", "after": "17", "unit": "ms", "source": "optimizations.md, section M2f"},
               {"label": "Q11, SF1", "before": "32", "after": "13", "unit": "ms", "source": "optimizations.md, section M2f"}],
      "detail": ["Not a Mojo win. It shows that at small scale, fixed costs matter as much as kernels do."]},
@@ -227,7 +227,7 @@
      "detail": ["More parallelism isn't free. Polars took 134 ms on this query in the same note."]},
     {"id": "m2j", "tag": "M2j", "section": "M2j", "title": "Semi and anti joins in the API",
      "badges": [{"kind": "plain"}],
-     "slow": "TPC-H Q22 (customers who never ordered) could not be written in MXFrame alone, so it dropped to PyArrow.",
+     "slow": "TPC-H Q22 (customers who never ordered) could not be written in omxcore alone, so it dropped to PyArrow.",
      "now": "<code>join(..., how=\"semi\" | \"anti\")</code> and <code>col(...).str_slice(offset, length)</code> let Q22 stay inside the engine.",
      "nums": [{"label": "Q22, SF1", "before": "34", "after": "18", "unit": "ms", "source": "optimizations.md, section M2j"}],
      "detail": ["An API addition, not a Mojo feature."]},
@@ -262,7 +262,7 @@
      "nums": [{"label": "Q21, SF10", "before": "3.44", "after": "0.95", "unit": "s", "source": "optimizations.md, section M2n"},
               {"label": "Q21, SF1", "before": "279", "after": "102", "unit": "ms", "source": "optimizations.md, section M2n"},
               {"label": "SF10 total of 22 queries", "before": "6.45", "after": "3.82", "unit": "s", "source": "bench/m2l-engine.csv, bench/m2n-engine.csv"}],
-     "detail": ["Polars and DuckDB use the same idea when they know a column is sorted; MXFrame checks at run time. In the same run Polars took 3.93 s and DuckDB 2.81 s on Q21.",
+     "detail": ["Polars and DuckDB use the same idea when they know a column is sorted; omxcore checks at run time. In the same run Polars took 3.93 s and DuckDB 2.81 s on Q21.",
                 "Caveat: this relies on TPC-H's stored order. On shuffled rows it does not apply (see F-046 below)."],
      "honest": "Almost all of this step's gain comes from one query: Q21 alone saves 2.49 s (3.44 to 0.95) of the 2.63 s the total drops (6.45 to 3.82), and it depends on the way TPC-H happens to store its rows."},
     {"id": "f043", "tag": "F-043", "section": "F-043", "title": "Four general fixes for the queries DuckDB led",
@@ -279,9 +279,9 @@
     {"id": "f044", "tag": "F-044", "section": "F-044", "title": "Random queries, and a fairness bug in our own benchmark",
      "badges": [{"kind": "mojo", "name": "closures inlined into parallelize"}],
      "slow": "To check that none of this is TPC-H tuning, a seeded generator writes random queries over the TPC-H tables. It found two blind spots: ORDER BY ... LIMIT had no fast path, and WHERE-only queries were filtered by Arrow.",
-     "now": "A native top-k keeps a heap of the best k rows per worker, and WHERE-only queries go through the native filter. All 250 MXFrame results on the random queries matched DuckDB.",
+     "now": "A native top-k keeps a heap of the best k rows per worker, and WHERE-only queries go through the native filter. All 250 omxcore results on the random queries matched DuckDB.",
      "nums": [{"label": "one ORDER BY ... LIMIT query", "before": "543", "after": "14", "unit": "ms", "source": "optimizations.md, section F-044"}],
-     "detail": ["The same work found a bug in the benchmark that favoured MXFrame: DuckDB imports pyarrow inside its first <code>.arrow()</code> call, about 70 ms per process, and that had been counted in every DuckDB time. It explained most of the earlier \"faster than DuckDB on 22/22 at SF1\". The import is now staging, like MXFrame's own."],
+     "detail": ["The same work found a bug in the benchmark that favoured omxcore: DuckDB imports pyarrow inside its first <code>.arrow()</code> call, about 70 ms per process, and that had been counted in every DuckDB time. It explained most of the earlier \"faster than DuckDB on 22/22 at SF1\". The import is now staging, like omxcore's own."],
      "honest": "Earlier DuckDB figures (the first files on the chart) include that import; the DuckDB reference lines on this page do not."},
     {"id": "f046", "tag": "F-046", "section": "F-046", "title": "Closing the gaps the random queries found",
      "badges": [{"kind": "plain"}, {"kind": "mojo", "name": "closures inlined into parallelize"}],
@@ -350,7 +350,7 @@ function drawProgress() {
   const ymax = Math.max(...vals, ref.polars, ref.duckdb) * 1.08, step = niceStep(ymax);
   const x = (i) => L + (i * pw) / (pts.length - 1), y = (v) => T + ph - (v / ymax) * ph;
   const css = { mx: cssVar("--mx"), dk: cssVar("--dk"), pl: cssVar("--pl"), grid: cssVar("--border"), axis: cssVar("--border-hi"), bg: cssVar("--surface"), txt: cssVar("--text") };
-  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": `MXFrame SF${sf} total of 22 TPC-H queries per milestone, against Polars and DuckDB` });
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: "img", "aria-label": `omxcore SF${sf} total of 22 TPC-H queries per milestone, against Polars and DuckDB` });
   for (let v = 0; v <= ymax; v += step) {
     s.append(svg("line", { x1: L, x2: L + pw, y1: y(v), y2: y(v), stroke: v === 0 ? css.axis : css.grid, "stroke-width": 1 }));
     s.append(svg("text", { x: L - 8, y: y(v) + 3.5, "text-anchor": "end" }, +v.toFixed(2)));
@@ -378,7 +378,7 @@ function drawProgress() {
     s.append(hit);
   });
   host.replaceChildren(s);
-  legend(document.getElementById("progress-legend"), [["--mx", "MXFrame (CPU) at each milestone"], ["--pl", "Polars, latest run"], ["--dk", "DuckDB, latest run"]]);
+  legend(document.getElementById("progress-legend"), [["--mx", "omxcore (CPU) at each milestone"], ["--pl", "Polars, latest run"], ["--dk", "DuckDB, latest run"]]);
   const first = vals[0], last = vals[vals.length - 1];
   const steps = pts.slice(1).map((p, i) => ({ id: p.id, d: vals[i] - vals[i + 1] })).sort((a, b) => b.d - a.d).slice(0, 2);
   document.getElementById("progress-note").innerHTML = `<b>SF${sf}: ${fmtS(first)} → ${fmtS(last)}</b> (${(first / last).toFixed(1)}x faster than before the executor). ` +
@@ -415,12 +415,12 @@ function drawPerQuery() {
   const lo = Math.floor(Math.log2(Math.min(...all, 0.5))), hi = Math.ceil(Math.log2(Math.max(...all, 2)));
   const x = (r) => L + ((Math.log2(r) - lo) / (hi - lo)) * pw;
   const css = { mx: cssVar("--mx"), grid: cssVar("--border"), mid: cssVar("--mid"), bg: cssVar("--surface"), txt: cssVar("--text") };
-  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `Per-query speed of MXFrame against DuckDB at SF${sf}, before and after ${DATA.perquery.after.label}` });
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": `Per-query speed of omxcore against DuckDB at SF${sf}, before and after ${DATA.perquery.after.label}` });
   for (let k = lo; k <= hi; k++) {
     s.append(svg("line", { x1: x(2 ** k), x2: x(2 ** k), y1: T - 8, y2: T + rowH * rows.length, stroke: k === 0 ? css.mid : css.grid, "stroke-width": k === 0 ? 1.5 : 1 }));
     s.append(svg("text", { x: x(2 ** k), y: T + rowH * rows.length + 16, "text-anchor": "middle" }, k >= 0 ? `${2 ** k}x` : `1/${2 ** -k}x`));
   }
-  s.append(svg("text", { x: x(1) + 6, y: T - 16 }, "MXFrame faster →"));
+  s.append(svg("text", { x: x(1) + 6, y: T - 16 }, "omxcore faster →"));
   s.append(svg("text", { x: x(1) - 6, y: T - 16, "text-anchor": "end" }, "← DuckDB faster"));
   rows.forEach((r, i) => {
     const yy = T + i * rowH + rowH / 2;
@@ -429,8 +429,8 @@ function drawPerQuery() {
     s.append(svg("circle", { cx: x(r.rb), cy: yy, r: 4.5, fill: css.bg, stroke: css.mx, "stroke-width": 2 }));
     s.append(svg("circle", { cx: x(r.ra), cy: yy, r: 5, fill: css.mx, stroke: css.bg, "stroke-width": 1.5 }));
     const hit = svg("rect", { class: "hit", x: 0, y: yy - rowH / 2, width: W, height: rowH });
-    hover(hit, () => `<b>Q${r.q} ${r.title}</b><br>${DATA.perquery.before.label}: MXFrame ${fmtMs(r.mb)}, DuckDB ${fmtMs(r.db)} (${r.rb.toFixed(2)}x)` +
-      `<br>${DATA.perquery.after.label}: MXFrame ${fmtMs(r.ma)}, DuckDB ${fmtMs(r.da)} (<b>${r.ra.toFixed(2)}x</b>)<br><span class="src">source: bench/${DATA.perquery.before.file}, bench/${DATA.perquery.after.file}</span>`);
+    hover(hit, () => `<b>Q${r.q} ${r.title}</b><br>${DATA.perquery.before.label}: omxcore ${fmtMs(r.mb)}, DuckDB ${fmtMs(r.db)} (${r.rb.toFixed(2)}x)` +
+      `<br>${DATA.perquery.after.label}: omxcore ${fmtMs(r.ma)}, DuckDB ${fmtMs(r.da)} (<b>${r.ra.toFixed(2)}x</b>)<br><span class="src">source: bench/${DATA.perquery.before.file}, bench/${DATA.perquery.after.file}</span>`);
     s.append(hit);
   });
   host.replaceChildren(s);
@@ -438,12 +438,12 @@ function drawPerQuery() {
   const wins = (k) => rows.filter((r) => r[k] > 1).length, tot = (f) => rows.reduce((s, r) => s + r[f], 0) / 1000;
   const gained = rows.filter((r) => r.rb <= 1 && r.ra > 1).map((r) => "Q" + r.q), lost = rows.filter((r) => r.rb > 1 && r.ra <= 1).map((r) => "Q" + r.q);
   const duckLeads = rows.filter((r) => r.ra <= 1).sort((p, q) => p.ra - q.ra).slice(0, 4).map((r) => `Q${r.q} (${r.ra.toFixed(2)}x)`);
-  document.getElementById("pq-note").innerHTML = `<b>MXFrame is faster than DuckDB on ${wins("rb")} of ${rows.length} queries before, ${wins("ra")} after</b> at SF${sf}.` +
+  document.getElementById("pq-note").innerHTML = `<b>omxcore is faster than DuckDB on ${wins("rb")} of ${rows.length} queries before, ${wins("ra")} after</b> at SF${sf}.` +
     (gained.length ? ` Newly won: ${gained.join(", ")}.` : "") + (lost.length ? ` Newly lost: ${lost.join(", ")}.` : "") +
     (duckLeads.length ? ` DuckDB still leads most on ${duckLeads.join(", ")}.` : "");
-  document.getElementById("pq-table").innerHTML = `<table class="t"><tr><th>Query</th><th class="r">MXFrame before</th><th class="r">DuckDB before</th><th class="r">MXFrame after</th><th class="r">DuckDB after</th><th class="r">Speed before / after</th></tr>` +
+  document.getElementById("pq-table").innerHTML = `<table class="t"><tr><th>Query</th><th class="r">omxcore before</th><th class="r">DuckDB before</th><th class="r">omxcore after</th><th class="r">DuckDB after</th><th class="r">Speed before / after</th></tr>` +
     rows.map((r) => `<tr><td>Q${r.q} ${r.title}</td><td class="r num">${fmtMs(r.mb)}</td><td class="r num">${fmtMs(r.db)}</td><td class="r num">${fmtMs(r.ma)}</td><td class="r num">${fmtMs(r.da)}</td><td class="r num">${r.rb.toFixed(2)}x / ${r.ra.toFixed(2)}x</td></tr>`).join("") +
-    `</table><p class="src">Sources: bench/${DATA.perquery.before.file} (before), bench/${DATA.perquery.after.file} (after). Speed is DuckDB's time divided by MXFrame's.</p>`;
+    `</table><p class="src">Sources: bench/${DATA.perquery.before.file} (before), bench/${DATA.perquery.after.file} (after). Speed is DuckDB's time divided by omxcore's.</p>`;
 }
 
 // ---------- cards ----------

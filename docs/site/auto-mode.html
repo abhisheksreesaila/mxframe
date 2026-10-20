@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>How device="auto" decides · MXFrame</title>
-<meta name="description" content="What MXFrame does when you call compute(device=&quot;auto&quot;): the rules in order, a session replay you can change, the measured results, and the limits.">
+<title>How device="auto" decides · omxcore</title>
+<meta name="description" content="What omxcore does when you call compute(device=&quot;auto&quot;): the rules in order, a session replay you can change, the measured results, and the limits.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="site.css">
 <script src="site.js"></script>
 <style>
-/* page-local: device colours come from the shared tokens (cpu = MXFrame blue, gpu = accent, auto = green) */
+/* page-local: device colours come from the shared tokens (cpu = omxcore blue, gpu = accent, auto = green) */
 :root { --d-cpu: var(--mx); --d-gpu: var(--accent); --d-auto: var(--green); }
 .ctl { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 6px 14px; align-items: center; margin: 0 0 10px; }
 .ctl > .label { padding-top: 2px; }
@@ -49,7 +49,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
 <main>
   <div class="read"><b>What you're looking at</b>How <code>compute(device="auto")</code> picks the CPU, the GPU, or both, and what it has measured. <b style="margin-top:8px">How to read it</b>Part 1 replays the planner's rules in order. Change the inputs (query shape, size, GPU state, the gap between your queries) and watch which rule stops the search; every threshold in it is read from the code. Part 2 plots the benchmark files it came from, loaded in your browser. Part 3 lists what <code>auto</code> does not do yet.</div>
 
-  <span class="kick">// device="auto" · MXFrame 0.6.0</span>
+  <span class="kick">// device="auto" · omxcore 0.6.0</span>
   <h1>How <code style="font-size:.8em">device="auto"</code> decides</h1>
   <p>With a CPU and a GPU, <code>compute(device="auto")</code> chooses a device for the <b>whole query</b> from costs it has measured on your machine. It does not stream every query's rows to both devices: on this hardware the link from host memory to the GPU is slower than the CPU cores reading the data in place. Instead it runs the first scan of a table on the CPU, copies that table's columns to the GPU in the background, and once they are there, splits an aggregate's rows between the two.</p>
 
@@ -169,7 +169,7 @@ main, .grid > *, .card, .card-b { min-width: 0; }
       <p>The three-way runs include the read in the clock (F-021 is the native reader). At SF1 a run takes 50 to 400 ms, so one run varies by about 10% either way, which is why the SF1 verdict is a median of four runs and the single runs are shown too.</p>
     </div>
   </div>
-  <p class="sub" style="margin-top:22px">Design notes and the research behind them: <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/spec-auto-mode.md">spec-auto-mode.md</a> · text version: <a href="https://github.com/abhisheksreesaila/mxframe/blob/main/docs/auto-mode.md">auto-mode.md</a>.</p>
+  <p class="sub" style="margin-top:22px">Design notes and the research behind them: <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/spec-auto-mode.md">spec-auto-mode.md</a> · text version: <a href="https://github.com/abhisheksreesaila/omxcore/blob/main/docs/auto-mode.md">auto-mode.md</a>.</p>
 </main>
 </div>
 

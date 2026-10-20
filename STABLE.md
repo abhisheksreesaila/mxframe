@@ -1,8 +1,8 @@
 # Stable engine version for apps
 
-Apps that vendor the Mojo package (`mxframe.mojoc`, soon `omxcore`) read this file to know which commit to build from.
+Apps that vendor the Mojo package (`omxcore.mojoc`, called `mxframe.mojoc` until the F-165 rename) read this file to know which commit to build from.
 Scripts read the one-line file `STABLE` (just the commit). When a new version becomes stable, an issue labelled
-`mxframe` is also opened on the app's repo (abhisheksreesaila/mxapp), and the app's scheduled check updates itself.
+`mxframe` (the label keeps its name) is also opened on the app's repo (abhisheksreesaila/mxapp), and the app's scheduled check updates itself.
 Only commits listed here are stable: every ticket in them passed adversarial review, and the full test suites were
 green. Anything newer on `main` may still be in review: don't vendor it.
 
@@ -12,10 +12,16 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ```sh
 # build the package from a clean copy of the stable commit (never from a working checkout)
-git -C <mxframe> archive 23edc59 | tar -x -C <scratch>
-cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/mxframe.mojoc
+git -C <omxcore> archive 23edc59 | tar -x -C <scratch>
+cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/mxframe.mojoc (this commit predates the rename)
 cp build/mxframe.mojoc <app>/vendor/ && echo 23edc59 > <app>/vendor/MXFRAME_COMMIT
 ```
+
+**The rename (F-165, omxcore).** From the first stable commit after the rename, the same command builds both
+`build/omxcore.mojoc` (`from omxcore import ...`) and `build/mxframe.mojoc` (the same source under the old package
+name, so existing `from mxframe import ...` code keeps compiling) for one stable release; then only `omxcore.mojoc`
+remains. To switch an app: copy `build/omxcore.mojoc` to `vendor/` and run
+`sed -i 's/\bfrom mxframe\b/from omxcore/' $(grep -rl 'from mxframe' --include='*.mojo' .)`.
 
 ## What changed since the previous stable (321870f), for apps
 

@@ -1,7 +1,7 @@
 # The Mojo engine: what it does and how it got fast
 
-MX frame's core is a Mojo engine: no Python, it links into any app (Linux, macOS arm64) the way SQLite does, and it
-aims to beat DuckDB and Polars on CPU and GPU. Python (`pip install mxframe`) and apps such as
+omxcore's core is a Mojo engine: no Python, it links into any app (Linux, macOS arm64) the way SQLite does, and it
+aims to beat DuckDB and Polars on CPU and GPU. Python (`pip install mxframe`, `import omxcore`) and apps such as
 [omxplorer](https://github.com/abhisheksreesaila/mxapp) are plugins on top of it. This page records what the engine
 does and how each part got fast, with the numbers, including where it is still behind.
 
@@ -130,7 +130,7 @@ NULLs (three-valued logic, a NULL group, aggregates of nothing are NULL); text s
 between the parser and the executor, and a planner behind a trait (reading only statistics) picks dense or hashed
 grouping, top-k heaps or a full sort, and early stops; `EXPLAIN` shows every decision and why.
 
-| 5M / 1.2M rows | MX frame | DuckDB |
+| 5M / 1.2M rows | omxcore | DuckDB |
 |---|---|---|
 | 8 groups, 4 aggregates | 8 ms | 6 ms |
 | 1M groups, all rows out | **159 ms** | 1.9 s |
@@ -149,7 +149,7 @@ aggregation kernel (no joined row is written); repeated keys or row output mater
 Keys follow SQL and DuckDB exactly: NULL never matches, text matches byte for byte across tables, decimals are aligned,
 NaN matches NaN.
 
-| 6M x 1.5M x 150k rows | MX frame | DuckDB |
+| 6M x 1.5M x 150k rows | omxcore | DuckDB |
 |---|---|---|
 | join + group sum | **110 ms** | 148 ms |
 | orders x customer | **3.6 ms** | 6.6 ms |
@@ -168,7 +168,7 @@ orders the joins from exact row counts and sampled distinct counts; a fact table
 milliseconds per step beside the estimates. Every TPC-H join shape equals DuckDB under the planner's order and up to
 24 forced orders.
 
-| TPC-H SF1 | MX frame | DuckDB |
+| TPC-H SF1 | omxcore | DuckDB |
 |---|---|---|
 | Q9 | **73 ms** | 112 ms |
 | Q19 | 24 ms | 23 ms |
@@ -186,7 +186,7 @@ planner that probes every dimension in one pass is the next step (F-161).
 text functions (`lower`, `upper`, `trim`, `substr`, `replace`, `LIKE` / `ILIKE`, `||`, …) evaluated **once per distinct
 word, never per row**, and dates (`EXTRACT`, `date_trunc`, `± INTERVAL`, date differences).
 
-| 6M rows | MX frame | DuckDB |
+| 6M rows | omxcore | DuckDB |
 |---|---|---|
 | `date_trunc` + GROUP BY | **4.3 ms** | 20.6 ms |
 | `date + INTERVAL` filter | **3.7 ms** | 18.8 ms |

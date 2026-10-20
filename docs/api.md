@@ -1,12 +1,12 @@
-# MXFrame API notes
+# omxcore API notes
 
 The quick reference is the [API reference tables in the README](../README.md#api-reference). Every example there is run by `tests/test_readme_api.py`. This page covers what the tables leave out: arguments, inspection, SQL limits, devices and the source layout.
 
 ## Building a query
 
 ```python
-import mxframe as mx
-from mxframe import col, lit, when
+import omxcore as mx
+from omxcore import col, lit, when
 
 lf = mx.scan_parquet("lineitem.parquet")   # lazy; a file or a directory of Parquet files
 lf = mx.LazyFrame(arrow_table)             # or wrap a pyarrow.Table
@@ -89,11 +89,11 @@ big = (base.groupby("part").agg((col("cost") * col("qty")).sum().alias("value"))
 | `lf.explain(optimized=True, validate=False, include_runtime=False, device=None, costs=False)` | The plan as text; `device="auto", costs=True` adds the device decision and per-operator estimates without running it |
 | `lf.last_compile_provenance` | After `compute()`: which path ran (`"native"`, `"fused_pipeline_cpu"`, `"cpu_aot"`, ...) and timings |
 | `lf.last_auto_decision` | After an auto `compute()`: the chosen device, the estimates and the reason |
-| `from mxframe import native_exec; native_exec.last_decline()` | Why the native executor declined the last plan, if it did |
+| `from omxcore import native_exec; native_exec.last_decline()` | Why the native executor declined the last plan, if it did |
 | `lf.schema` | The output schema without computing the result (a property) |
 | `lf.describe()` | count, mean, std, min, quartiles and max of the numeric columns |
 
-The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/internals.html) explains each path and the environment switches.
+The [behind-the-scenes page](https://abhisheksreesaila.github.io/omxcore/internals.html) explains each path and the environment switches.
 
 ## SQL
 
@@ -101,7 +101,7 @@ The [behind-the-scenes page](https://abhisheksreesaila.github.io/mxframe/interna
 
 Supported: `SELECT`, `FROM` (tables, `WITH` names, derived tables), `WHERE`, `GROUP BY` (also `ALL`), `HAVING`, `ORDER BY`, `LIMIT`, `JOIN … ON` / `USING` (inner, left, semi, anti), comma joins (`FROM a, b WHERE a.k = b.k`: the key equalities in `WHERE`, also one every branch of an `OR` has), `CASE WHEN`, aggregates (also `COUNT(DISTINCT x)`) and arithmetic, `DATE '…'` with `± INTERVAL 'n' DAY | MONTH | YEAR` (a day number: dates are int32 days since 1970-01-01, as in the TPC-H Parquet files), `EXTRACT(YEAR FROM x)`, `SUBSTRING(x FROM a FOR n)`, `LIKE 'prefix%'` and `LIKE '%substring%'`.
 
-**COALESCE, NULLIF, ABS, CAST (F-100).** `COALESCE(a, b, ...)` / `IFNULL` / `NVL`: the first non-NULL argument, of the common type of the arguments as in CASE (a `float32` column next to an integer or a DECIMAL literal stays `float32`, only a DOUBLE widens it; text mixed with numbers raises). `NULLIF(a, b)` is `CASE WHEN a = b THEN NULL ELSE a END` (type of `a`). `ABS(x)` keeps the type of `x` (an integer minimum raises). `CAST(x AS FLOAT | DOUBLE | TINYINT | SMALLINT | INT | BIGINT)` on a number only (a string, date or dictionary column raises `NotImplementedError`): a float rounds half to even into an integer, an expression DuckDB types as DECIMAL (`i * 0.5`, a DECIMAL literal with integers) half away from zero, a value that does not fit raises. `expr IS [NOT] NULL` works over any of them. A test or function of constants only (`COALESCE(NULL, 5)`) has no column to size the result and raises. In Python: `mxframe.lazy_expr.coalesce(...)`, `Expr.abs()`, `Expr.cast("float32")`.
+**COALESCE, NULLIF, ABS, CAST (F-100).** `COALESCE(a, b, ...)` / `IFNULL` / `NVL`: the first non-NULL argument, of the common type of the arguments as in CASE (a `float32` column next to an integer or a DECIMAL literal stays `float32`, only a DOUBLE widens it; text mixed with numbers raises). `NULLIF(a, b)` is `CASE WHEN a = b THEN NULL ELSE a END` (type of `a`). `ABS(x)` keeps the type of `x` (an integer minimum raises). `CAST(x AS FLOAT | DOUBLE | TINYINT | SMALLINT | INT | BIGINT)` on a number only (a string, date or dictionary column raises `NotImplementedError`): a float rounds half to even into an integer, an expression DuckDB types as DECIMAL (`i * 0.5`, a DECIMAL literal with integers) half away from zero, a value that does not fit raises. `expr IS [NOT] NULL` works over any of them. A test or function of constants only (`COALESCE(NULL, 5)`) has no column to size the result and raises. In Python: `omxcore.lazy_expr.coalesce(...)`, `Expr.abs()`, `Expr.cast("float32")`.
 
 **Timestamps (F-108).** `TIMESTAMP '2024-01-01 10:00:00.5'`, `CAST('..' AS TIMESTAMP)` and `TIMESTAMP_S / _MS / _NS '..'` literals (microseconds for plain TIMESTAMP; digits finer than the type are cut; a bad or out-of-range text is a `ValueError`; a zone offset in the text and `TIMESTAMPTZ` raise `NotImplementedError`). A timestamp column is compared with one in the finer of the two units, so nanoseconds past 2^53 stay exact; a `DATE` next to a timestamp is a timestamp (also in CASE / COALESCE, where two timestamps take the finer unit and a zoned and a naive one do not mix, as in DuckDB). **Time zones: DuckDB's session zone is assumed to be UTC.** A naive literal against a zoned column is an instant in UTC, and an interval is a fixed length in UTC (a day is 24 hours, also across a daylight-saving change). `ts_or_date +/- INTERVAL n DAY | HOUR | MINUTE | SECOND | MILLISECOND | MICROSECOND` on a column gives a TIMESTAMP in microseconds in the column's zone, like DuckDB (a constant `DATE '..' + INTERVAL ..` stays a day number); `MONTH` / `YEAR` on a column raise `NotImplementedError`. A zoned column keeps its own unit (DuckDB has one zoned type, microseconds). `MIN` / `MAX` of a computed text, date, timestamp or integer value (CASE, COALESCE, NULLIF, `abs`, `cast`, `+ - *`, `d + INTERVAL`) keeps that type. Not supported: a string next to a timestamp (`ts > '2024-01-02'`), `date + 1`.
 
@@ -131,7 +131,7 @@ value, and a NaN among the valid values propagates. `count` is not a window func
 
 - `device="gpu"` needs the MAX runtime (`pip install "mxframe[runtime]"`, or `pixi` with Modular's conda channel). The GPU path is validated on NVIDIA.
 - `lf.to_gpu()` uploads the numeric columns once and returns a `GPUFrame`, so repeated queries on the same data skip the copy.
-- On import, MXFrame sets `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=25` unless you set it yourself, so the Mojo runtime doesn't reserve most of the GPU's memory. The setting is process-wide.
+- On import, omxcore sets `MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE_PERCENT=25` unless you set it yourself, so the Mojo runtime doesn't reserve most of the GPU's memory. The setting is process-wide.
 
 ## Tests
 

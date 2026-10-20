@@ -2,11 +2,11 @@
 <title id="t">Where we&#x27;re still behind DuckDB</title>
 <desc id="d">how many times slower than DuckDB · 1x is a tie · shorter is better. informal: shared 12-core Ryzen, other work running · source: docs/mojo-engine.md</desc>
 <rect x=".5" y=".5" width="899" height="640" rx="14" fill="#FFFDF8" stroke="#BEB4A4"/>
-<text x="32.0" y="36.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="2">// MX FRAME · THE MOJO ENGINE</text>
+<text x="32.0" y="36.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="11" font-weight="700" fill="#6C3E78" text-anchor="start" letter-spacing="2">// OMXCORE · THE MOJO ENGINE</text>
 <text x="32.0" y="64.0" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="21" font-weight="700" fill="#20221F" text-anchor="start">Where we&#x27;re still behind DuckDB</text>
 <text x="32.0" y="86.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#6E716A" text-anchor="start">how many times slower than DuckDB · 1x is a tie · shorter is better</text>
 <rect x="32" y="100" width="10" height="10" rx="2" fill="#e34948"/>
-<text x="48.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#4C5049" text-anchor="start">MX frame time / DuckDB time</text>
+<text x="48.0" y="109.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="12" font-weight="400" fill="#4C5049" text-anchor="start">omxcore time / DuckDB time</text>
 <path d="M290.0 130V589" stroke="#E4DDD0" stroke-width="1.5"/>
 <text x="290.0" y="124.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="10.5" font-weight="400" fill="#6E716A" text-anchor="middle">1x</text>
 <path d="M365.7 130V589" stroke="#E4DDD0" stroke-width="1"/>
