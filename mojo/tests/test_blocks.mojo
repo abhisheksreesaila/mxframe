@@ -629,36 +629,53 @@ def test_scan() raises:
     print("ok   scan: the cache serves a repeated window (" + String(loads) + " chunks held)")
 
 
+def best_ms(label: String, runs: Int, mut fn_ms: List[Float64]) -> Float64:
+    var best = 1e9
+    for x in fn_ms:
+        best = min(best, x)
+    print("time " + label + ": " + String(best) + " ms")
+    return best
+
+
 def test_timings() raises:
+    """Informal timings (best of several runs; printed, not asserted)."""
     var n = 1_000_000
     var t = make_table(n, 5, False)
-    var f = Frame(t)
     var rng = Rng(9)
     var order = shuffled(n, rng)
-    var cols: List[Int] = [I, D2, FL]
-    var best = 1e9
-    for _ in range(5):
+    var names: List[String] = ["INT (10% null)", "DECIMAL(2)", "DECIMAL(4)", "FLOAT", "TEXT (13 words)", "DATE", "BOOL"]
+    for c in range(7):
+        var one: List[Int] = [c]
+        var shuf = List[Float64]()
+        var seq = List[Float64]()
+        for _ in range(7):
+            var t0 = perf_counter_ns()
+            var r = range_aggregate(t, order, one, 0, n)
+            shuf.append(Float64(perf_counter_ns() - t0) / 1e6)
+            expect(r.columns[0].count > 0, "timing run")
+            t0 = perf_counter_ns()
+            r = range_aggregate(t, one, 0, n)
+            seq.append(Float64(perf_counter_ns() - t0) / 1e6)
+        _ = best_ms("1M rows, " + names[c] + ", random order", 7, shuf)
+        _ = best_ms("1M rows, " + names[c] + ", table order", 7, seq)
+    var five: List[Int] = [I, D2, D4, FL, TX]
+    var five_t = List[Float64]()
+    for _ in range(7):
         var t0 = perf_counter_ns()
-        var r = range_aggregate(t, order, cols, 0, n)
-        best = min(best, Float64(perf_counter_ns() - t0) / 1e6)
-        expect(r.columns[0].count > 0, "timing run")
-    print("time range sum+count+min+max+mean of 3 columns over 1M rows in a random order (table): " + String(best) + " ms")
-    var one: List[Int] = [D2]
-    best = 1e9
-    for _ in range(5):
+        _ = range_aggregate(t, order, five, 0, n)
+        five_t.append(Float64(perf_counter_ns() - t0) / 1e6)
+    _ = best_ms("1M rows, 5 columns (INT, DECIMAL x2, FLOAT, TEXT), random order", 7, five_t)
+    var big = make_table(10_000_000, 6, False)
+    var big_order = shuffled(10_000_000, rng)
+    var three: List[Int] = [I, D2, FL]
+    var big_t = List[Float64]()
+    for _ in range(3):
         var t0 = perf_counter_ns()
-        var r = range_aggregate(t, order, one, 0, n)
-        best = min(best, Float64(perf_counter_ns() - t0) / 1e6)
-        expect(r.columns[0].count > 0, "timing run")
-    print("time one DECIMAL column over 1M rows, random order (table): " + String(best) + " ms")
-    best = 1e9
-    for _ in range(5):
-        var t0 = perf_counter_ns()
-        var r = range_aggregate(t, one, 0, n)
-        best = min(best, Float64(perf_counter_ns() - t0) / 1e6)
-        expect(r.columns[0].count > 0, "timing run")
-    print("time one DECIMAL column over 1M rows in table order (table): " + String(best) + " ms")
-    var wide = Table.empty()                                     # a grid window: 40 columns
+        _ = range_aggregate(big, big_order, three, 0, 10_000_000)
+        big_t.append(Float64(perf_counter_ns() - t0) / 1e6)
+    _ = best_ms("10M rows, 3 columns (INT, DECIMAL, FLOAT), random order", 3, big_t)
+    # a grid window: 50 rows x 40 columns
+    var wide = Table.empty()
     for c in range(40):
         _ = wide.add_column("c" + String(c), INT if c % 3 == 0 else DECIMAL, scale=0 if c % 3 == 0 else 2)
     for r in range(200_000):
@@ -672,22 +689,57 @@ def test_timings() raises:
     var wcols = all_columns(40)
     var values = List[Int64](length=40 * 50, fill=0)
     var nulls = List[UInt8](length=40 * 50, fill=0)
-    best = 1e9
+    var win = List[Float64]()
     for i in range(200):
         var t0 = perf_counter_ns()
         read_block(ws, wo, wcols, 1000 + i, 1050 + i, values, nulls)
-        best = min(best, Float64(perf_counter_ns() - t0) / 1e6)
-    print("time block read 50 rows x 40 columns (table, random order): " + String(best) + " ms")
+        win.append(Float64(perf_counter_ns() - t0) / 1e6)
+    _ = best_ms("block read 50 rows x 40 columns (table, random order)", 200, win)
+    var med = win.copy()
+    sort(med)
+    print("time   (median " + String(med[100]) + " ms, worst " + String(med[199]) + " ms)")
     var wf = Frame(ws)
     wf.set(0, 5, Int64(1))
     wf.set_null(1, 9)
-    best = 1e9
+    for j in range(300):
+        wf.set(0, 100 + j * 600, Int64(7))
+    win = List[Float64]()
     for i in range(200):
         var t0 = perf_counter_ns()
         read_block(wf, wo, wcols, 1000 + i, 1050 + i, values, nulls)
-        best = min(best, Float64(perf_counter_ns() - t0) / 1e6)
-    print("time block read 50 rows x 40 columns (frame with two edits, random order): " + String(best) + " ms")
-    _ = f.rows()
+        win.append(Float64(perf_counter_ns() - t0) / 1e6)
+    med = win.copy()
+    sort(med)
+    print("time block read 50 rows x 40 columns (frame with 302 edited rows, random order): best " + String(med[0]) + " ms, median " + String(med[100]) + " ms, worst " + String(med[199]) + " ms")
+    # a window of a Frame over a file: the first read decodes the chunks it needs, the next ones read the cache
+    var path = "f176_timing.parquet"
+    var sc = Table.empty()
+    for c in range(40):
+        _ = sc.add_column("c" + String(c), INT if c % 3 == 0 else DECIMAL, scale=0 if c % 3 == 0 else 2)
+    for r in range(200_000):
+        for c in range(40):
+            sc.append(c, Int64(r * 7 + c))
+    write_parquet(path, sc, "", ZSTD, 20_000)
+    var sf = Frame(scan_parquet(path))
+    sf.set_cache_limit(512 * 1024 * 1024)
+    var t0 = perf_counter_ns()
+    read_block(sf, wo, wcols, 1000, 1050, values, nulls)
+    print("time block read 50 rows x 40 columns (frame over a 10-row-group file, random order), first: " + String(Float64(perf_counter_ns() - t0) / 1e6) + " ms, " + String(sf.cache_loads()) + " chunks decoded")
+    win = List[Float64]()
+    for i in range(200):
+        t0 = perf_counter_ns()
+        read_block(sf, wo, wcols, 1001 + i, 1051 + i, values, nulls)
+        win.append(Float64(perf_counter_ns() - t0) / 1e6)
+    med = win.copy()
+    sort(med)
+    print("time   then, cache hot: best " + String(med[0]) + " ms, median " + String(med[100]) + " ms, worst " + String(med[199]) + " ms (" + String(sf.cache_loads()) + " chunks decoded in all)")
+    var four: List[Int] = [0, 1, 2, 3]
+    var sagg = List[Float64]()
+    for _ in range(5):
+        t0 = perf_counter_ns()
+        _ = range_aggregate(sf, wo, four, 0, 200_000)
+        sagg.append(Float64(perf_counter_ns() - t0) / 1e6)
+    _ = best_ms("200k rows, 4 columns, random order (frame over a file, cache hot)", 5, sagg)
 
 
 def main() raises:

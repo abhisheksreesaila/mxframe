@@ -167,7 +167,7 @@ def _check_range(a: Int, b: Int, n: Int, order: Bool) raises:
         raise Error("the range " + String(a) + ".." + String(b) + " goes past the end: " + what + _words_noun(n))
 
 
-def _prep_table(t: SharedTable, cols: List[Int]) raises -> _Prep:
+def _prep_table(t: SharedTable, cols: List[Int], need_seen: Bool) raises -> _Prep:
     _check_columns(cols, t.columns(), "the table")
     var p = _Prep()
     p.cols = cols.copy()
@@ -177,7 +177,7 @@ def _prep_table(t: SharedTable, cols: List[Int]) raises -> _Prep:
         var c = cols[k]
         p.kinds.append(t.kind(c).value)
         p.scales.append(t.scale(c))
-        var w = len(t.dictionary(c)) if t.kind(c) == TEXT else 0
+        var w = len(t.dictionary(c)) if t.kind(c) == TEXT and need_seen else 0
         p.words.append(w)
         p.seen.append(List[UInt8](length=max(w, 1), fill=0))
         p.meta.append(Int(t.values(c).unsafe_ptr()))
@@ -191,7 +191,38 @@ def _prep_table(t: SharedTable, cols: List[Int]) raises -> _Prep:
     return p^
 
 
-def _prep_frame(f: Frame, cols: List[Int]) raises -> _Prep:
+def _touched_rows(f: Frame, cols: List[Int], order: List[Int], identity: Bool, a: Int, b: Int) -> List[Int]:
+    """The rows among positions a..b whose cells the session changed (edited in one of `cols`, appended, or removed), ascending and once each.
+    A window no longer than 4x the frame's edits probes each of its rows (`len(cols)` lookups a row), so a grid's read costs the same
+    with 3 edits or 300,000; a longer range takes every changed row of the frame, which costs less than reading the range does."""
+    var out = List[Int]()
+    var edits = len(f.cells) + len(f.removed) + len(f.added)
+    if edits == 0:
+        return out^
+    if b - a > 4 * edits:
+        return f.changed_rows()
+    var total = f.rows()
+    for p in range(a, b):
+        var r = p if identity else order[p]
+        if r < 0 or r >= total:
+            continue
+        var hit = r >= f.nbase or r in f.removed
+        if not hit:
+            for c in cols:
+                if ((r << 20) | c) in f.cells:
+                    hit = True
+                    break
+        if hit:
+            out.append(r)
+    sort(out)
+    var uniq = List[Int]()
+    for r in out:
+        if len(uniq) == 0 or uniq[len(uniq) - 1] != r:
+            uniq.append(r)
+    return uniq^
+
+
+def _prep_frame(f: Frame, cols: List[Int], order: List[Int], identity: Bool, a: Int, b: Int, need_seen: Bool) raises -> _Prep:
     for c in cols:
         if c >= f.stored() and c < f.columns():
             raise Error("column `" + f.name(c) + "` is a formula: ranges read the stored columns")
@@ -201,24 +232,25 @@ def _prep_frame(f: Frame, cols: List[Int]) raises -> _Prep:
     p.nbase = f.nbase
     p.total = f.rows()
     var ncols = len(cols)
-    var changed = f.changed_rows()
+    var changed = _touched_rows(f, cols, order, identity, a, b)
     var nrow = len(changed)
     if nrow > 0:
-        p.touched = List[UInt8](length=(f.nbase + 7) // 8 + 1, fill=0)
+        if nrow > 64:                                        # many changed rows: a bitmap rejects the untouched ones before the binary search
+            p.touched = List[UInt8](length=(f.nbase + 7) // 8 + 1, fill=0)
+            for row in changed:
+                if row < f.nbase:
+                    p.touched[row >> 3] |= UInt8(1) << UInt8(row & 7)
         for row in changed:
-            if row < f.nbase:
-                p.touched[row >> 3] |= UInt8(1) << UInt8(row & 7)
             p.crow.append(row)
             p.palive.append(UInt8(1) if f.alive(row) else UInt8(0))
         p.pvals = List[Int64](length=ncols * nrow, fill=0)
         p.pnull = List[UInt8](length=ncols * nrow, fill=0)
-    var from_to = List[Tuple[Int64, Int64]]()
     for k in range(ncols):
         var c = cols[k]
         var kind = f.base.kind(c)
         p.kinds.append(kind.value)
         p.scales.append(f.base.scale(c))
-        var w = f.word_count(c) if kind == TEXT else 0
+        var w = f.word_count(c) if kind == TEXT and need_seen else 0
         p.words.append(w)
         p.seen.append(List[UInt8](length=max(w, 1), fill=0))
         for j in range(nrow):
@@ -285,7 +317,8 @@ def _gather_mem(d: Int, k: Int, order: Int, lo: Int, hi: Int, vout: LP, nout: BP
     var dp = NP(unsafe_from_address=d)
     var nbase = dp[0]
     var total = dp[1]
-    var touched = BP(unsafe_from_address=dp[3])
+    var tbits = dp[3]
+    var touched = BP(unsafe_from_address=tbits)
     var ncrow = dp[5]
     var crow = NP(unsafe_from_address=dp[4])
     var palive = BP(unsafe_from_address=dp[6])
@@ -305,7 +338,14 @@ def _gather_mem(d: Int, k: Int, order: Int, lo: Int, hi: Int, vout: LP, nout: BP
         var i = p - lo
         if r < 0 or r >= total:
             return p
-        if r < nbase and (not patched or (touched[r >> 3] >> UInt8(r & 7)) & 1 == 0):
+        var j = 0
+        var hit = False
+        if patched and (r >= nbase or tbits == 0 or (touched[r >> 3] >> UInt8(r & 7)) & 1 != 0):
+            j = _lower_bound(crow, ncrow, r)
+            hit = j < ncrow and crow[j] == r
+        if not hit and r >= nbase:
+            return p
+        if not hit:
             if vaddr != 0 and (valid[r >> 3] >> UInt8(r & 7)) & 1 == 0:
                 vout[i] = 0
                 nout[i] = 1
@@ -316,7 +356,6 @@ def _gather_mem(d: Int, k: Int, order: Int, lo: Int, hi: Int, vout: LP, nout: BP
                 vout[i] = v
                 nout[i] = 0
         else:
-            var j = _lower_bound(crow, ncrow, r)
             if palive[j] == 0:
                 return p
             vout[i] = pvals[j]
@@ -332,7 +371,8 @@ def _gather_scan(f: Frame, cols: List[Int], d: Int, order: Int, lo: Int, hi: Int
     var nbase = dp[0]
     var total = dp[1]
     var ncols = dp[2]
-    var touched = BP(unsafe_from_address=dp[3])
+    var tbits = dp[3]
+    var touched = BP(unsafe_from_address=tbits)
     var ncrow = dp[5]
     var crow = NP(unsafe_from_address=dp[4])
     var palive = BP(unsafe_from_address=dp[6])
@@ -351,12 +391,18 @@ def _gather_scan(f: Frame, cols: List[Int], d: Int, order: Int, lo: Int, hi: Int
         var i = p - lo
         if r < 0 or r >= total:
             return p
-        if r < nbase and (ncrow == 0 or (touched[r >> 3] >> UInt8(r & 7)) & 1 == 0):
+        var j = 0
+        var hit = False
+        if ncrow > 0 and (r >= nbase or tbits == 0 or (touched[r >> 3] >> UInt8(r & 7)) & 1 != 0):
+            j = _lower_bound(crow, ncrow, r)
+            hit = j < ncrow and crow[j] == r
+        if not hit and r >= nbase:
+            return p
+        if not hit:
             var g = f._group_of(r)
             gs[i] = g
             counts[g + 1] += 1
         else:
-            var j = _lower_bound(crow, ncrow, r)
             if palive[j] == 0:
                 return p
             for k in range(ncols):
@@ -664,7 +710,7 @@ def _text_extent_frame(f: Frame, p: _Prep, mut r: RangeResult) raises:
 
 def _aggregate_table(t: SharedTable, order: List[Int], identity: Bool, cols: List[Int], a: Int, b: Int) raises -> RangeResult:
     _check_range(a, b, t.rows() if identity else len(order), not identity)
-    var p = _prep_table(t, cols)
+    var p = _prep_table(t, cols, True)
     var names = List[String]()
     for c in cols:
         names.append(t.name(c))
@@ -678,7 +724,7 @@ def _aggregate_table(t: SharedTable, order: List[Int], identity: Bool, cols: Lis
 
 def _aggregate_frame(f: Frame, order: List[Int], identity: Bool, cols: List[Int], a: Int, b: Int) raises -> RangeResult:
     _check_range(a, b, f.rows() if identity else len(order), not identity)
-    var p = _prep_frame(f, cols)
+    var p = _prep_frame(f, cols, order, identity, a, b, True)
     var names = List[String]()
     for c in cols:
         names.append(f.name(c))
@@ -748,14 +794,14 @@ def _check_buffers(values: List[Int64], nulls: List[UInt8], need: Int) raises:
 
 
 def _read_table(t: SharedTable, order: List[Int], identity: Bool, cols: List[Int], a: Int, b: Int, vaddr: Int, naddr: Int) raises:
-    var p = _prep_table(t, cols)
+    var p = _prep_table(t, cols, False)
     var bad = _read_mem(p, 0 if identity else Int(order.unsafe_ptr()), a, b, vaddr, naddr)
     if bad >= 0:
         raise _bad_position(p.total, order, identity, bad, False)
 
 
 def _read_frame(f: Frame, order: List[Int], identity: Bool, cols: List[Int], a: Int, b: Int, vaddr: Int, naddr: Int) raises:
-    var p = _prep_frame(f, cols)
+    var p = _prep_frame(f, cols, order, identity, a, b, False)
     var oa = 0 if identity else Int(order.unsafe_ptr())
     var bad = -1
     if b > a:
