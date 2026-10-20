@@ -6,31 +6,32 @@
 <title>The Mojo engine: what it does and how it got fast</title>
 <meta name="description" content="omxcore's Mojo engine, the core that apps and agents build on: Parquet, text, bigger-than-RAM streams, GPU AUTO, aggregates, SQL and joins, with every number against DuckDB and pyarrow, including where it is still behind.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="site.css">
 <script src="site.js"></script>
 <style>
-  /* the hero is the page's focal card: editorial paper, one huge serif number (picked 2026-10-19); follows the theme */
-  .hero { border: 1px solid var(--border-hi); border-radius: 16px; padding: 20px 32px 16px; margin: 0 0 8px; color: var(--text);
-    background: repeating-linear-gradient(180deg, transparent 0 23px, color-mix(in srgb, var(--border) 55%, transparent) 23px 24px) 0 70px / 100% calc(100% - 70px) no-repeat, var(--surface); }
-  .hero .top { display: flex; align-items: baseline; gap: 18px; padding-bottom: 12px; border-bottom: 1.5px solid var(--text); flex-wrap: wrap; }
-  .hero .wm { font: 800 16px var(--font-mono); letter-spacing: .3em; color: var(--text); }
+  /* the hero is the page's focal card: one big number (picked 2026-10-19), now in the Universal Language: an opaque
+     surface with one soft shadow, the number in mono; follows the theme */
+  .hero { border: 1px solid var(--border); border-radius: var(--radius-md); padding: 22px 32px 18px; margin: 0 0 8px; color: var(--text);
+    background: var(--surface); box-shadow: var(--shadow-1); }
+  .hero .top { display: flex; align-items: baseline; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .hero .wm { font: 700 16px var(--font-sans); letter-spacing: -.01em; color: var(--text); }
   .hero .top .sp { flex: 1; }
   .hero .body { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr); gap: 28px; padding-top: 20px; }
   .hero .focus { display: flex; align-items: flex-end; gap: 26px; flex-wrap: wrap; }
-  .hero .big { font: 400 168px/.8 var(--font-display); letter-spacing: -.04em; color: var(--text); }
-  .hero em, .hero .wm .x { font-style: italic; color: var(--accent); }
+  .hero .big { font: 600 144px/.85 var(--font-mono); letter-spacing: -.05em; color: var(--text); }
+  .hero em, .hero .wm .x { font-style: normal; color: var(--accent); }
   .hero .wm .x { font-style: normal; }
   .hero .big em { font-size: 56px; letter-spacing: 0; margin-left: 10px; }
-  .hero .fl { font: italic 24px/1.3 var(--font-display); color: var(--text); margin: 0 0 4px; }
-  .hero .fv { font: 24px/1.3 var(--font-display); color: var(--text-mid); margin: 0 0 10px; }
+  .hero .fl { font: 600 22px/1.3 var(--font-sans); color: var(--text); margin: 0 0 4px; }
+  .hero .fv { font: 20px/1.3 var(--font-mono); color: var(--text-mid); margin: 0 0 10px; }
   .hero .fr { font: 700 14px var(--font-mono); color: var(--accent); letter-spacing: .06em; }
-  .hero .vision { font: 21px/1.45 var(--font-display); color: var(--text-mid); margin: 22px 0 8px; max-width: 640px; }
+  .hero .vision { font: 19px/1.55 var(--font-sans); color: var(--text-mid); margin: 22px 0 8px; max-width: 640px; }
   .hero .aim { font: 700 13px var(--font-mono); color: var(--text); }
   .hero .ledger { border-left: 1px solid var(--border-hi); padding-left: 26px; display: flex; flex-direction: column; justify-content: center; }
   .hero .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
   .hero .row:last-child { border-bottom: 0; }
-  .hero .row .n { font: 44px/1 var(--font-display); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .hero .row .n { font: 600 36px/1 var(--font-mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .hero .row .n em { font-size: 20px; margin-left: 6px; }
   .hero .row .t { text-align: right; font-size: 13px; color: var(--text-dim); }
   .hero .row .t b { display: block; color: var(--text); font-weight: 600; }
@@ -212,7 +213,7 @@ function drawHero() {
   const val = (h) => { const r = lookup(h.ref); return h.ref[0] === "memory" ? [r.peak_mb, r.file_gb * 1000] : [lo(r.mx), hi(r.duckdb)]; };
   const focus = D.headline.find((h) => h.focus), rest = D.headline.filter((h) => h !== focus);
   const [num, unit] = focus.big.split(" "), [a, b] = val(focus);
-  $("hero").innerHTML = `<div class="top"><span class="wm">OM<span class="x">X</span>CORE</span><span class="label">The Mojo engine · CPU · GPU · AUTO</span>` +
+  $("hero").innerHTML = `<div class="top"><span class="wm"><span class="x">omx</span>core</span><span class="label">The Mojo engine · CPU · GPU · AUTO</span>` +
     `<span class="sp"></span><span class="label">informal numbers · shared machine</span></div>` +
     `<div class="body"><div><div class="focus"><div class="big">${esc(num)}<em>${esc(unit)}</em></div>` +
     `<div><p class="fl">${esc(focus.label)}</p><p class="fv">${esc(focus.vs)}.</p><span class="fr">${ratio(b, a)} faster</span></div></div>` +

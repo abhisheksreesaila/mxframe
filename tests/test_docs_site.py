@@ -48,7 +48,10 @@ def test_bench_link_reaches_benchmark_files():
     assert (SITE / "bench" / "m2s-engine.csv").is_file()
 
 
-@pytest.mark.parametrize("page", PAGES, ids=lambda p: p.name)
+LANDING = {"story.html"}   # the landing page: its own top bar instead of the docs sidebar, the same tokens (below)
+
+
+@pytest.mark.parametrize("page", [p for p in PAGES if p.name not in LANDING], ids=lambda p: p.name)
 def test_page_shell(page):
     p = _parse(page)
     assert p.theme == "light", "light is the default theme"
@@ -99,3 +102,16 @@ def test_pages_workflow_publishes_the_kernel_visualizer():
     assert "cp -r visualize _site/visualize" in wf
     assert (ROOT / "visualize" / "omxcore_pipeline.html").is_file()
     assert "visualize/omxcore_pipeline.html" in (SITE / "site.js").read_text()
+
+
+def test_landing_page_and_docs_share_one_design_language():
+    """Story and docs are one product: the same Ledger / Graphite colours, the same two fonts, no gradients."""
+    story = (SITE / "story.html").read_text()
+    css = (SITE / "site.css").read_text()
+    for value in ["#eef0f3", "#ffffff", "#e1e4e8", "#1b1f24", "#0e7c86",            # Ledger: page, surface, line, ink, accent
+                  "#161618", "#1d1e21", "#ececee", "#3fb8c2",                       # Graphite (night)
+                  "JetBrains Mono", "Inter"]:
+        assert value in story and value in css, value
+    assert "gradient(" not in css.split("*/", 1)[1] and "Space Mono" not in css
+    for page in PAGES:
+        assert "Space+Mono" not in page.read_text(), page.name

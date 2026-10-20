@@ -331,10 +331,12 @@
 
 <script>
   // light / night: follows the system until someone chooses
+  // the docs site's choice (localStorage "mx-theme") carries over in both directions
   const root = document.documentElement, btn = document.getElementById("theme");
+  const saved = localStorage.getItem("mx-theme"); if (saved) root.dataset.theme = saved;
   const dark = () => root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
   const label = () => { btn.textContent = dark() ? "Light" : "Night"; };
-  btn.addEventListener("click", () => { root.dataset.theme = dark() ? "light" : "dark"; label(); });
+  btn.addEventListener("click", () => { root.dataset.theme = dark() ? "light" : "dark"; localStorage.setItem("mx-theme", root.dataset.theme); label(); });
   label();
   // new content settles in once
   const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { e.target.classList.add("in-view"); io.unobserve(e.target); } }), { threshold: .12 });

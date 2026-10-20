@@ -28,7 +28,7 @@ function renderNav() {
   const nav = document.querySelector("nav.side");
   if (!nav) return;
   const here = location.pathname.split("/").pop() || "index.html";
-  nav.innerHTML = `<a class="brand" href="index.html">OM<span class="x">X</span>CORE</a>` +
+  nav.innerHTML = `<a class="brand" href="index.html"><span class="x">omx</span>core</a>` +
     PAGES.map(([href, name]) => `<a class="nav${href === here ? " on" : ""}" href="${href}"${href === here ? ' aria-current="page"' : ""}>${name}</a>`).join("") +
     `<a class="nav" href="visualize/omxcore_pipeline.html">Kernel visualizer ↗</a>` +  // copied in by pages.yml
     `<a class="nav" href="${REPO}#api-reference">API reference ↗</a>` +
