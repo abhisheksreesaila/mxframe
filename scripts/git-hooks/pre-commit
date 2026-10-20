@@ -5,7 +5,10 @@
 set -euo pipefail
 if git diff --cached --name-only | grep -qE '^kernels_aot/.*\.mojo$'; then
   log="$HOME/.cache/mxframe-kernel-hashes.log"   # run_tests.sh shims the package, so this works in agent worktrees too
-  if ! pixi run -q bash scripts/run_tests.sh -q -p no:cacheprovider tests/test_kernel_hashes.py > "$log" 2>&1; then
+  # The hook lives in the main checkout (core.hooksPath); a fresh agent worktree may have no pixi environment of its
+  # own, so run this checkout's tests with the main checkout's environment.
+  env_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+  if ! pixi run -q --manifest-path "$env_root/pixi.toml" bash "$PWD/scripts/run_tests.sh" -q -p no:cacheprovider tests/test_kernel_hashes.py > "$log" 2>&1; then
     echo "pre-commit: a kernel source changed but its library was not rebuilt:" >&2
     grep -E "stale|FAILED" "$log" | head -10 >&2
     echo "rebuild with: pixi run bash scripts/build_pipeline.sh  (then stage the .so and .sources.json files)" >&2

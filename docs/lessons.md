@@ -98,3 +98,4 @@ Claude reads this at the start of each session. -->
 
 - 2026-10-19 · Mojo 1.1 function types (`def(Int) -> None`) are traits: not a struct field, not a default value, not a `[cb: ...]` value parameter that becomes a C function pointer. A callback is a struct that implements a trait (`JobDone`); the generic entry for `pthread_create` is `_entry[Body, Callback]` (F-175).
 - 2026-10-19 · A save that can be cancelled must decide "cancelled or committed" with one atomic compare-and-swap (`JobCtl.commit()` before the rename, `Job.cancel()` loses to it), not two flag reads: otherwise a job could say cancelled over a file that was replaced (F-175).
+- The pre-commit hook works in agent worktrees (it uses the main checkout's pixi environment and the worktree's tests): never commit with --no-verify; if it fails, fix the cause.
