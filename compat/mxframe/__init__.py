@@ -31,7 +31,10 @@ class _AliasLoader(importlib.abc.Loader):
 class _AliasFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
         if name.startswith("mxframe."):
-            return importlib.util.spec_from_loader(name, _AliasLoader("omxcore." + name[len("mxframe."):]))
+            real = "omxcore." + name[len("mxframe."):]
+            if importlib.util.find_spec(real) is None:   # an optional submodule that doesn't exist answers None, as usual
+                return None
+            return importlib.util.spec_from_loader(name, _AliasLoader(real))
         return None
 
 

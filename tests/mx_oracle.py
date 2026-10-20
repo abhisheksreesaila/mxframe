@@ -12,6 +12,7 @@ import json
 import subprocess
 from decimal import Decimal
 from pathlib import Path
+from engine_sources import engine_sources
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -21,7 +22,7 @@ def mx_binary():
     """Builds build/mx with scripts/build_mx.sh when a source is newer (once, even under xdist) and returns its path."""
     BUILD.mkdir(exist_ok=True)
     out = BUILD / "mx"
-    sources = list((ROOT / "mojo/mxframe").glob("*.mojo")) + list((ROOT / "kernels_aot").glob("*.mojo")) + [ROOT / "mojo/cli/mx.mojo", ROOT / "scripts/build_mx.sh"]
+    sources = engine_sources(ROOT / "mojo/cli/mx.mojo", ROOT / "scripts/build_mx.sh")
     with open(BUILD / ".mx.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not out.exists() or out.stat().st_mtime < max(p.stat().st_mtime for p in sources):

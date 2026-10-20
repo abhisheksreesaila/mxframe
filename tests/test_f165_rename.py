@@ -74,3 +74,22 @@ def test_old_import_name_still_runs_a_query():
         "r = mx.LazyFrame(mx.Scan(t)).groupby('k').agg(mx.col('v').sum().alias('s')).compute(device='cpu').sort_by('k')\n"
         "print(json.dumps(r.to_pydict()))\n")
     assert json.loads(out) == {"k": [1, 2], "s": [30, 30]}
+
+
+def test_rebuild_checks_see_the_engine_sources():
+    """The probes rebuild when an engine source is newer; a moved package directory must fail loudly, not match nothing."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from engine_sources import engine_sources
+    src = engine_sources()
+    assert any(p.parent.name == "omxcore" for p in src) and any(p.parent.name == "kernels_aot" for p in src)
+    for f in ["mx_oracle.py", "test_mojo_sql.py", "test_mojo_range.py", "test_mojo_cast_fuzz.py"]:
+        text = (Path(__file__).parent / f).read_text()
+        assert "engine_sources(" in text and "mojo/mxframe" not in text, f
+
+
+def test_find_spec_of_a_missing_submodule_is_none():
+    import importlib.util
+    import mxframe  # noqa: F401
+    assert importlib.util.find_spec("mxframe.no_such_module") is None
+    assert importlib.util.find_spec("mxframe.lazy_frame") is not None

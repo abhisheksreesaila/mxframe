@@ -30,6 +30,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from mx_oracle import assert_equal, duck_kind, sort_key
+from engine_sources import engine_sources
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / "build"
@@ -49,7 +50,7 @@ def probe():
     """Builds mojo/tools/sql_probe.mojo (once, even under xdist: the workers take a lock) and returns its path."""
     BUILD.mkdir(exist_ok=True)
     out = BUILD / "sql_probe"
-    sources = list((ROOT / "mojo/mxframe").glob("*.mojo")) + list((ROOT / "kernels_aot").glob("*.mojo")) + [ROOT / "mojo/tools/sql_probe.mojo"]
+    sources = engine_sources(ROOT / "mojo/tools/sql_probe.mojo")
     with open(BUILD / ".sql_probe.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not out.exists() or out.stat().st_mtime < _newest(sources):
